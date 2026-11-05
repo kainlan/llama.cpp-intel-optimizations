@@ -253,7 +253,14 @@ PARAM_FIELD = "uint32_t n_ctx_hint; uint32_t n_ubatch_hint; };"
 MODEL_DEFAULT_RE = re.compile(r"/\*\.n_ctx_hint\s*=\*/\s*0,\s*/\*\.n_ubatch_hint\s*=\*/\s*0,\s*\};")
 INVENTORY_SET = "inventory.n_ubatch_context = n_ubatch_hint;"
 CALLER_PASSES = "hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());"
-BACKEND_COPY = "g_placement_kv_info.n_ubatch_context = inventory->n_ubatch_context;"
+# The backend copies the inventory into its KV inputs through the one KV intake the plan dry run also uses
+# (llama.cpp-4zup), written over the KV inputs it is handed; the stage hands it g_placement_kv_info.
+STAGE_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
+             "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info & kv, "
+              "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
+BACKEND_COPY = "kv.n_ubatch_context = inventory->n_ubatch_context;"
 OFFSET_PIN = "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188,"
 # The header's own pins, compiled by both sides of the dlopen boundary (libllama fills the struct, libggml-sycl reads it).
 HEADER_SIZE_PIN = ('static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, '
@@ -427,7 +434,7 @@ def claim_transport_names_no_micro_batch_for_auto(llama_h: str, model_cpp: str, 
     bench_hint = body(bench, BENCH_HINT_SIG)
     return (PARAM_FIELD in norm(llama_h) and len(MODEL_DEFAULT_RE.findall(model_cpp)) == 1
             and INVENTORY_SET in body(model, POPULATE_SIG) and model.count(CALLER_PASSES) == 2
-            and BACKEND_COPY in sycl and OFFSET_PIN in sycl
+            and BACKEND_COPY in body(sycl, INTAKE_SIG) and INTAKE_CALL in body(sycl, STAGE_SIG) and OFFSET_PIN in sycl
             and HEADER_SIZE_PIN in norm(sycl_h) and HEADER_OFFSET_PIN in norm(sycl_h)
             and COMMON_NONE in norm(common_cpp)
             and bool(bench_hint) and bench_hint.lstrip("{ ").startswith(BENCH_NONE)
@@ -982,6 +989,12 @@ def test_mutant_header_layout_unpinned_fails():
 def test_mutant_backend_ignores_the_field_fails():
     assert not claim_transport_names_no_micro_batch_for_auto(
         LLAMA_H, MODEL_CPP, _once(SYCL_CPP, BACKEND_COPY, ""), COMMON_CPP, BENCH_CPP)
+
+
+def test_mutant_stage_skips_the_intake_fails():
+    """The stage stops handing g_placement_kv_info to the intake: the copy still exists, and reaches no KV input."""
+    assert not claim_transport_names_no_micro_batch_for_auto(
+        LLAMA_H, MODEL_CPP, _once(SYCL_CPP, INTAKE_CALL, ""), COMMON_CPP, BENCH_CPP)
 
 
 def test_mutant_default_hint_dropped_fails():

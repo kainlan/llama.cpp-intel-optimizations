@@ -90,6 +90,7 @@ CACHE_HPP_REL = "ggml/src/ggml-sycl/unified-cache.hpp"
 ROOM_COST_REL = "ggml/src/ggml-sycl/kv-room-cost.hpp"
 FATTN_REL = "ggml/src/ggml-sycl/fattn.cpp"
 BENCH_REL = "tools/llama-bench/llama-bench.cpp"
+TOOL_REL = "tools/sycl-plan-dry-run/sycl-plan-dry-run.cpp"
 
 
 def read_or_empty(rel: str) -> str:
@@ -108,6 +109,7 @@ SYCL = read(SYCL_REL)
 CACHE = read(CACHE_REL)
 CACHE_HPP = read(CACHE_HPP_REL)
 ROOM_COST = read_or_empty(ROOM_COST_REL)
+TOOL = read(TOOL_REL)
 # Every C/C++ source of the SYCL backend, by path from the repository root: where a second reader of the provenance
 # would hide.
 BACKEND_TREE = {
@@ -205,8 +207,11 @@ def claim_api_defines_the_default(llama_h: str) -> bool:
 
 
 COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_params & params)"
-COMMON_HINT = ("mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : "
-               "params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;")
+# common maps -c to the hint in one function, which common_model_params_to_llama and every tool that takes -c ask, so
+# the sentinel keeps one setter (llama.cpp-h187: the plan dry run mapped -c itself).
+COMMON_HINT_SIG = "uint32_t common_n_ctx_hint(int32_t n_ctx)"
+COMMON_HINT = "return n_ctx > 0 ? (uint32_t) n_ctx : n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;"
+COMMON_HINT_CALL = "mparams.n_ctx_hint = common_n_ctx_hint(params.n_ctx);"
 COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
 COMMON_FIT_REFRESH = "if (params.n_ctx >= 0 && cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
 COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
@@ -221,7 +226,9 @@ def claim_common_asks_for_the_default(common: str) -> bool:
     signed -c gates the refresh. Those are the only two setters."""
     n = norm(common)
     b = body(n, COMMON_SIG)
-    return (bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
+    hint = body(n, COMMON_HINT_SIG)
+    return (bool(b) and bool(hint) and hint == "{ " + COMMON_HINT + " }" and COMMON_HINT_CALL in b
+            and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
             and n.count("mparams.n_ctx_hint =") == 2 and n.count(SENTINEL) == 1)
 
 
@@ -338,6 +345,24 @@ def claim_sentinel_has_one_reader(tree: dict[str, str], value_tree: dict[str, st
     return counts == SENTINEL_OWNERS and backend_never_spells_the_value(value_tree)
 
 
+TOOL_MAIN_SIG = "int main(int argc, char ** argv)"
+TOOL_HINT = "params.n_ctx_hint = common_n_ctx_hint(args.n_ctx);"
+# Every write to the hint: plain and compound assignment, and increment or decrement either side of it.
+HINT_WRITE_RE = re.compile(r"\bn_ctx_hint\s*(?:<<|>>|[-+*/%|&^])?=(?!=)"
+                           r"|\bn_ctx_hint\s*(?:\+\+|--)"
+                           r"|(?:\+\+|--)\s*(?:\w+\s*(?:\.|->)\s*)*n_ctx_hint\b")
+
+
+def claim_tool_asks_common(tool: str) -> bool:
+    """The plan dry run keeps -c as given and maps it to the load's hint by asking common_n_ctx_hint, in main, and
+    writes the hint nowhere else in the tool: a raw cast would plan no room for the default context (0 is not the
+    sentinel) and a negative -c would plan a context of four billion cells (llama.cpp-h187). The args test checks the
+    mapping only by calling common, so this is the tool's one witness."""
+    n = norm(tool)
+    main = body(n, TOOL_MAIN_SIG)
+    return bool(main) and TOOL_HINT in main and len(HINT_WRITE_RE.findall(n)) == 1
+
+
 # ---- the backend ----------------------------------------------------------------------------------------------------
 
 
@@ -355,24 +380,32 @@ SIZE_PINS = (
 )
 FILL_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
             "const ggml_sycl_tensor_inventory * inventory)")
-COPY_CTX = "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;"
-COPY_DEFAULT = "g_placement_kv_info.n_ctx_context_is_default = inventory->n_ctx_context_is_default;"
+# The stage fills g_placement_kv_info through the one KV intake the plan dry run also uses (llama.cpp-4zup), so the copy
+# is written once, in the intake, over the KV inputs it is handed.
+INTAKE_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info & kv, "
+              "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
+COPY_CTX = "kv.n_ctx_context = inventory->n_ctx_context;"
+COPY_DEFAULT = "kv.n_ctx_context_is_default = inventory->n_ctx_context_is_default;"
 KV_FIELD = "bool n_ctx_context_is_default = false;"
 
 
 def claim_backend_carries_the_source(sycl_h: str, sycl: str, cache_hpp: str) -> bool:
     """The inventory ends with the provenance, appended after the indexer widths with the size pins moved to match;
-    the backend copies it once, next to the context, into a KV input that defaults to a named context."""
+    the backend copies it once, next to the context, into a KV input that defaults to a named context: the copy is in
+    the KV intake, and the stage hands the intake g_placement_kv_info."""
     h = norm(sycl_h)
     at = h.find(INVENTORY_STRUCT)
     inv = body(h[at:], "struct ggml_sycl_tensor_inventory") if at >= 0 else ""
     s = norm(sycl)
     fill = body(s, FILL_SIG)
+    intake = body(s, INTAKE_SIG)
     hpp = norm(cache_hpp)
     kv_at = hpp.find("struct placement_kv_info {")
     kv = body(hpp[kv_at:], "struct placement_kv_info") if kv_at >= 0 else ""
-    return (inv.endswith(INV_TAIL) and all(p in s for p in SIZE_PINS) and bool(fill)
-            and ordered(fill, COPY_CTX, COPY_DEFAULT) and s.count(COPY_DEFAULT) == 1 and KV_FIELD in kv)
+    return (inv.endswith(INV_TAIL) and all(p in s for p in SIZE_PINS) and bool(fill) and INTAKE_CALL in fill
+            and bool(intake) and ordered(intake, COPY_CTX, COPY_DEFAULT) and s.count(COPY_DEFAULT) == 1
+            and KV_FIELD in kv)
 
 
 ROOM_LOG_SIG = "static void log_kv_context_room(const kv_context_room & room,"
@@ -465,6 +498,10 @@ def test_sentinel_has_one_reader():
     assert claim_sentinel_has_one_reader(TREE, VALUE_TREE)
 
 
+def test_tool_asks_common():
+    assert claim_tool_asks_common(TOOL)
+
+
 def test_backend_carries_the_source():
     assert claim_backend_carries_the_source(SYCL_H, SYCL, CACHE_HPP)
 
@@ -521,15 +558,20 @@ def test_mutant_api_field_undocumented_fails():
 def test_mutant_common_keeps_zero_without_c_fails():
     """master's line: without -c the hint is 0 and no room is held for the context llama then creates."""
     assert not claim_common_asks_for_the_default(
-        _once(COMMON, COMMON_HINT, "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : 0;"))
+        _once(COMMON, COMMON_HINT, "return n_ctx > 0 ? (uint32_t) n_ctx : 0;"))
 
 
 def test_mutant_common_negative_c_asks_for_the_default_fails():
     """A negative -c, which names no context, asks for the default: the load would hold the training context's room
     for a context llama_context cannot create."""
     assert not claim_common_asks_for_the_default(
-        _once(COMMON, COMMON_HINT,
-              "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : LLAMA_N_CTX_HINT_DEFAULT;"))
+        _once(COMMON, COMMON_HINT, "return n_ctx > 0 ? (uint32_t) n_ctx : LLAMA_N_CTX_HINT_DEFAULT;"))
+
+
+def test_mutant_common_load_skips_the_mapping_fails():
+    """common_model_params_to_llama sets the hint some other way: the mapping is still right, and unasked."""
+    assert not claim_common_asks_for_the_default(
+        _once(COMMON, COMMON_HINT_CALL, "mparams.n_ctx_hint = (uint32_t) params.n_ctx;"))
 
 
 def test_mutant_common_fit_refresh_unguarded_fails():
@@ -686,6 +728,38 @@ def _value_tree_with(rel: str, text: str) -> dict[str, str]:
     return tree
 
 
+def test_mutant_tool_casts_c_itself_fails():
+    """The tool hands -c to the load as a raw cast instead of asking common."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, "params.n_ctx_hint = (uint32_t) args.n_ctx;"))
+
+
+def test_mutant_tool_overwrites_the_hint_fails():
+    """The tool asks common, then sets the hint a second time."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " params.n_ctx_hint = 0;"))
+
+
+def test_mutant_tool_adjusts_the_hint_after_asking_fails():
+    """The tool asks common, then adjusts the hint with a compound assignment."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " params.n_ctx_hint += 1;"))
+
+
+def test_mutant_tool_increments_the_hint_after_asking_fails():
+    """The tool asks common, then increments the hint."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " params.n_ctx_hint++;"))
+
+
+def test_mutant_tool_decrements_the_hint_before_use_fails():
+    """The tool asks common, then pre-decrements the hint."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " --params.n_ctx_hint;"))
+
+
+def test_mutant_tool_asks_outside_main_fails():
+    """The call moves out of main into a helper nothing calls, and main leaves the default hint."""
+    text = _once(TOOL, TOOL_HINT, "") + "\nstatic void h187_mutant(llama_model_params & params, " \
+        "const sycl_plan_dry_run_args & args) { " + TOOL_HINT + " }\n"
+    assert not claim_tool_asks_common(text)
+
+
 def test_mutant_backend_compares_the_context_to_all_ones_fails():
     """The planner recognises the default by its value: the inventory's flag would have a second source."""
     text = CACHE + ("\nstatic bool g_7fmt_mutant(const ggml_sycl::placement_kv_info & k) "
@@ -708,6 +782,11 @@ def test_mutant_backend_names_the_value_fails():
 
 def test_mutant_backend_drops_the_provenance_fails():
     assert not claim_backend_carries_the_source(SYCL_H, _once(SYCL, COPY_DEFAULT, ""), CACHE_HPP)
+
+
+def test_mutant_stage_skips_the_intake_fails():
+    """The stage stops handing g_placement_kv_info to the intake: the copy still exists, and reaches no KV input."""
+    assert not claim_backend_carries_the_source(SYCL_H, _once(SYCL, INTAKE_CALL, ""), CACHE_HPP)
 
 
 def test_mutant_inventory_without_the_field_fails():

@@ -8285,6 +8285,126 @@ else()
         LABELS "sycl;expert-predict;41bs;hostonly;not-built")
 endif()
 
+# Host zone routing, host-allocation lifetimes, the host SCRATCH demand ledger and the host holder plan
+# (docs/design/sycl-mmap-host-tier.md §4.4). host-zone-plan.cpp includes no SYCL header and is also globbed into
+# libggml-sycl, where it is the production copy; these targets compile it host-only, with no -fsycl, and link
+# ggml-base (plus ggml-cpu for the real-scheduler test). None constructs a unified_cache or initializes SYCL, so all
+# four are `sycl;host`.
+#
+# Each MUTANTS pair is a positive control: a macro that plants one defect the design names (in host-zone-plan.cpp or in
+# the test) and the failure text the test prints when it does. Each builds its own executable and ctest, which passes
+# only when that text appears. Three plant their defect in the test's own re-enactment of an order, so they score the
+# fixture's model of the order, not production: HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND and
+# HOST_ZONE_SELECT_MUTANT_MODEL_CHECK_AT_BUFFER_FREE (the fake registry's releases and checks) and
+# HOST_STAGING_PLAN_MUTANT_FA_AFTER_STAGING (simulate_host_fa). The production order is pinned by
+# tests/test-sycl-host-zone-boundary-owner-source.py (its pins O1-O6 and D1-D3).
+function(ggml_sycl_host_zone_plan_test stem)
+    cmake_parse_arguments(HZP "" "" "LIBS;MUTANTS" ${ARGN})
+    set(_variants "${stem}" "")
+    list(LENGTH HZP_MUTANTS _n)
+    if (_n GREATER 0)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 2)
+            list(GET HZP_MUTANTS ${_i} _macro)
+            string(REGEX REPLACE "^.*_MUTANT_" "" _suffix "${_macro}")
+            string(TOLOWER "${_suffix}" _suffix)
+            string(REPLACE "_" "-" _suffix "${_suffix}")
+            list(APPEND _variants "${stem}-mutant-${_suffix}" "${_macro}")
+        endforeach()
+    endif()
+    list(LENGTH _variants _nv)
+    math(EXPR _lastv "${_nv} - 1")
+    foreach (_i RANGE 0 ${_lastv} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _variants ${_i} _name)
+        list(GET _variants ${_j} _macro)
+        add_executable(test-sycl-${_name} tests/test-sycl-${stem}.cpp host-zone-plan.cpp)
+        target_include_directories(test-sycl-${_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_link_libraries(test-sycl-${_name} PRIVATE ggml-base ${HZP_LIBS})
+        set_target_properties(test-sycl-${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME sycl-${_name} COMMAND test-sycl-${_name})
+        if (_macro STREQUAL "")
+            set_tests_properties(sycl-${_name} PROPERTIES LABELS "sycl;host" TIMEOUT 60)
+        else()
+            target_compile_definitions(test-sycl-${_name} PRIVATE ${_macro}=1)
+            math(EXPR _k "${_i} - 1")
+            list(GET HZP_MUTANTS ${_k} _regex)
+            set_tests_properties(sycl-${_name} PROPERTIES
+                LABELS "sycl;host;mutant"
+                TIMEOUT 60
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endif()
+    endforeach()
+endfunction()
+
+ggml_sycl_host_zone_plan_test(host-zone-select MUTANTS
+    HOST_ZONE_PLAN_MUTANT_OWNER_BY_LIFETIME
+        "the owner check fired on another context's or model's live record"
+    HOST_ZONE_PLAN_MUTANT_DEVICE_CHECK_EVERY_FREE
+        "the DEVICE check fired at a non-last backend's free while a second backend is live"
+    HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND
+        "llama_context's destruction order printed 2 leaked-record WARN"
+    HOST_ZONE_SELECT_MUTANT_MODEL_CHECK_AT_BUFFER_FREE
+        "the MODEL boundary printed 2 leaked-record WARN")
+
+ggml_sycl_host_zone_plan_test(host-scratch-demand MUTANTS
+    HOST_ZONE_PLAN_MUTANT_LEDGER_ACCUMULATE
+        "demand 420.0 MiB after \\(100, 10\\) then \\(300, 10\\), expected 310.0 MiB"
+    HOST_SCRATCH_DEMAND_MUTANT_PER_BACKEND
+        "a two-backend context's demand is 2400.0 MiB with grow_zone called 2 times"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_ADDITIVE_GROW
+        "a replacing notify within capacity grew again: grow_zone called 2 times, expected 1"
+    HOST_ZONE_PLAN_MUTANT_NOTIFY_DEVICE0
+        "with the host buft on device 1, the notify grew device 1 0 time\\(s\\) and device 0 1"
+    HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE
+        "with the host buft on device 0, a device-1 backend's notify grew device 0 0 time\\(s\\) and device 1 1"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_NO_ROLLBACK
+        "after a failed grow, the next notify for the same deficit grew 0 time\\(s\\), expected 1"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_NO_RESERVE
+        "two notifies for one deficit grew 2 time\\(s\\), expected 1")
+
+if (NOT GGML_BACKEND_DL)
+    # The real ggml-base scheduler over two CPU backend instances; ggml-cpu is a MODULE under GGML_BACKEND_DL.
+    ggml_sycl_host_zone_plan_test(plan-walk-sched LIBS ggml-cpu)
+endif()
+
+ggml_sycl_host_zone_plan_test(attn-host-staging-plan MUTANTS
+    HOST_ZONE_PLAN_MUTANT_WALK_TG_REPLACES_PP
+        "committed q=1048512 expected 9437120[^~]*committed D=10 expected D=5120"
+    HOST_STAGING_PLAN_MUTANT_NO_BEGIN
+        "backend B committed a plan its reserve never walked"
+    HOST_ZONE_PLAN_MUTANT_CAPACITY_HIGH_WATER
+        "an auto-n_ubatch trial settled on 512 ends at Q capacity 34602944, expected 9437120"
+    HOST_STAGING_PLAN_MUTANT_FA_AFTER_STAGING
+        "a refused host FLASH_ATTN_EXT reads fa=0 refusals=1, expected fa=1 refusals=1"
+    HOST_ZONE_PLAN_MUTANT_FAIL_CLOSED_ASSERTS
+        "the fail-closed helper killed the process: rc 134"
+    HOST_ZONE_PLAN_MUTANT_POOLS_OWN_SCAN
+        "the pools initialized at D=32, expected the plan's D=16"
+    HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_REMOVED
+        "no `exceeds its planned` line for graph needs D=32"
+    HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_STORAGE_SCAN
+        "an all-device plan printed the over-plan WARN"
+    HOST_ZONE_PLAN_MUTANT_POOLS_GATE_IS_HOST
+        "pool demand 0.3 MiB for an all-device src0"
+    HOST_ZONE_PLAN_MUTANT_POOLS_INIT_ONCE
+        "pools hold D=16 below committed high-water D=32"
+    HOST_ZONE_PLAN_MUTANT_DISPATCH_GROW
+        "the over-plan request recorded an allocation"
+    HOST_ZONE_PLAN_MUTANT_PLAN_IGNORES_SWITCH
+        "with the host dispatch off the plan allocated [1-9][0-9]* slot"
+    HOST_ZONE_PLAN_MUTANT_PREDICATE_IS_HOST
+        "the walk counted 2 host-KV node\\(s\\), expected 1 \\(the view\\)"
+    HOST_ZONE_PLAN_MUTANT_HELPER_DEVICE
+        "device 1's slots are unplanned"
+    HOST_ZONE_PLAN_MUTANT_UNPLANNED_REFUSES
+        "an unplanned device refused a dispatch"
+    HOST_ZONE_PLAN_MUTANT_FREE_RELEASES_PLANNED
+        "after an unrelated backend's free, device 1 did not admit by its plan")
+
 endif() # BUILD_TESTING (llama.cpp-9goq, opened right after the production
         # GGML_SYCL_DEVICE_ARCH block near the top of this file)
 

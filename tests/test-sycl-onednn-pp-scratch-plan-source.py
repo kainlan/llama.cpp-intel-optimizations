@@ -407,11 +407,18 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     # ---- a row-gather tensor is no MUL_MAT operand (llama.cpp-8ony): producer, carrier, plumbing, classifier ----
     results["the adapter hands the classifier the loader's gather-only role"] = \
         adapter is not None and re.search(r"desc\.get_rows_only\s*=\s*item\.get_rows_only\s*;", adapter) is not None
-    detail_loop = function_body(backend, r"for \(size_t i = 0; i < inventory->count; i\+\+\)\s*\{")
-    results["anchor: the inventory copy loop exists"] = detail_loop is not None
-    if detail_loop is not None:
+    # The planner's per-tensor view is built in one helper the stage and the plan dry run both call (llama.cpp-4zup),
+    # and the stage publishes it as the inventory the planner sees.
+    detail_builder = function_body(backend, r"static std::vector<ggml_sycl::placement_tensor_info> "
+                                            r"ggml_sycl_inventory_planner_detail\([^)]*\)\s*\{")
+    results["anchor: the inventory copy loop exists"] = detail_builder is not None
+    if detail_builder is not None:
         results["the backend copies the role into the inventory the planner sees"] = \
-            re.search(r"info\.get_rows_only\s*=\s*inventory->tensors\[i\]\.get_rows_only\s*;", detail_loop) is not None
+            re.search(r"const ggml_sycl_tensor_info\s*&\s*t\s*=\s*inventory->tensors\[i\]\s*;",
+                      detail_builder) is not None and \
+            re.search(r"info\.get_rows_only\s*=\s*t\.get_rows_only\s*;", detail_builder) is not None and \
+            re.search(r"g_tensor_inventory_detail\s*=\s*ggml_sycl_inventory_planner_detail\(inventory\)\s*;",
+                      backend) is not None
     results["the planner's tensor description carries the role"] = \
         re.search(r"struct placement_tensor_info \{.*?\bbool\s+get_rows_only\b.*?placement_tensor_info\(\) = default", cache_hpp,
                   re.S) is not None
@@ -439,12 +446,18 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
             "tensor.get_rows_only = !tied_head" in mark_norm
         results["the file's head is the loader's own output name over its own tensor set"] = \
             re.search(r"ml\.weights_map\.find\(\s*tn\(LLM_TENSOR_OUTPUT", mark) is not None
-    for fname, sig in (("early plan", r"static void llama_model_sycl_compute_early_plan\([^)]*\)\s*\{"),
-                       ("late inventory", r"static void llama_model_sycl_set_late_inventory\([^)]*\)\s*\{")):
+    # The early plan builds its inventory in llama_model_sycl_build_early_inventory(), which the plan dry run's header
+    # read also calls (llama.cpp-4zup), from the builder's output struct.
+    early_plan = function_body(model, r"static void llama_model_sycl_compute_early_plan\([^)]*\)\s*\{")
+    results["the early plan builds its inventory through the early-inventory builder"] = \
+        early_plan is not None and "llama_model_sycl_build_early_inventory(" in early_plan
+    for fname, sig, tensors in (
+            ("early plan", r"static bool llama_model_sycl_build_early_inventory\([^)]*\)\s*\{", "out.tensors"),
+            ("late inventory", r"static void llama_model_sycl_set_late_inventory\([^)]*\)\s*\{", "tensors")):
         fbody = function_body(model, sig)
         results["anchor: the %s exists" % fname] = fbody is not None
         if fbody is not None:
-            at = fbody.find("llama_model_sycl_mark_get_rows_only(tensors, ml)")
+            at = fbody.find("llama_model_sycl_mark_get_rows_only(%s, ml)" % tensors)
             results["the %s marks the role before it builds the inventory" % fname] = \
                 0 <= at < fbody.find("llama_model_sycl_populate_inventory(")
     # ---- ONE source for "which weight types the unified kernel serves" (llama.cpp-8ony) ----
@@ -797,7 +810,9 @@ if args.self_test and not failed:
          (backend, mutate_in_func(cache, adapter_sig, "desc.get_rows_only = item.get_rows_only", "desc.get_rows_only = false"),
           cache_hpp)),
         ("backend drops the role copy", "the backend copies the role into the inventory the planner sees",
-         (mutate(backend, "info.get_rows_only = inventory->tensors[i].get_rows_only", "info.get_rows_only = false"), cache,
+         (mutate(backend, "info.get_rows_only = t.get_rows_only", "info.get_rows_only = false"), cache, cache_hpp)),
+        ("stage publishes another view", "the backend copies the role into the inventory the planner sees",
+         (mutate(backend, "= ggml_sycl_inventory_planner_detail(inventory);", "= h187_other_detail(inventory);"), cache,
           cache_hpp)),
         ("planner description loses the role", "the planner's tensor description carries the role",
          (backend, cache, mutate(cache_hpp, "bool        get_rows_only", "bool        XXXX"))),
@@ -815,8 +830,12 @@ if args.self_test and not failed:
          (backend, cache, cache_hpp, zone_sizing, mutate(model, "weights_map.find(", "XXXX.find("), header)),
         ("early plan forgets the role", "the early plan marks the role before it builds the inventory",
          (backend, cache, cache_hpp, zone_sizing,
+          mutate_in_func(model, r"static bool llama_model_sycl_build_early_inventory\(",
+                         "llama_model_sycl_mark_get_rows_only(out.tensors, ml)", "(void) 0"), header)),
+        ("early plan skips the builder", "the early plan builds its inventory through the early-inventory builder",
+         (backend, cache, cache_hpp, zone_sizing,
           mutate_in_func(model, r"static void llama_model_sycl_compute_early_plan\(",
-                         "llama_model_sycl_mark_get_rows_only(tensors, ml)", "(void) 0"), header)),
+                         "llama_model_sycl_build_early_inventory(", "h187_inline_build("), header)),
         ("late inventory forgets the role", "the late inventory marks the role before it builds the inventory",
          (backend, cache, cache_hpp, zone_sizing,
           mutate_in_func(model, r"static void llama_model_sycl_set_late_inventory\(",

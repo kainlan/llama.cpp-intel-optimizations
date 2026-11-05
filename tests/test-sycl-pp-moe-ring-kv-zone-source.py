@@ -351,9 +351,17 @@ def cache_violations(cache_cpp: str) -> list[str]:
     return found
 
 
+# The load publishes the ring through the one helper the stage and the plan dry run both call (llama.cpp-4zup), and the
+# helper hands the unified cache the planned ring.
+PUBLISH_SIGNATURE = "static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_inputs("
+
+
 def load_plan_violations(sycl_cpp: str) -> list[str]:
     code = strip_comments(sycl_cpp)
-    load = re.search(r"unified_cache_set_planned_pp_moe_onednn_scratch\(\s*ctx->device\s*,[^;]*;(.*?)"
+    publish = code_of(sycl_cpp, PUBLISH_SIGNATURE)
+    if publish is None or not re.search(r"unified_cache_set_planned_pp_moe_onednn_scratch\(\s*device\s*,", publish):
+        return ["a model load does not publish the planned ring"]
+    load = re.search(r"ggml_sycl_inventory_publish_planner_inputs\(\s*ctx->device\s*,\s*inventory\s*\)\s*;(.*?)"
                      r"ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots\(\s*ctx->device\s*,\s*false"
                      r"\s*,\s*false\s*\)\s*;", code, re.S)
     if load is None:
@@ -491,6 +499,10 @@ MUTATIONS = [
     ("load keeps a KV-zone ring", "sycl",
      "if (ring_cache && ring_cache->release_pp_moe_onednn_scratch_ring()) {", "if (false) {",
      "a model load keeps a previous context's ring in the KV zone"),
+    ("load publishes no ring", "sycl",
+     "        device, in.pp_moe_onednn_weight_slot_bytes,",
+     "        h187_other_device, in.pp_moe_onednn_weight_slot_bytes,",
+     "a model load does not publish the planned ring"),
     ("load keeps the placement", "sycl",
      "    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(ctx->device, false, false);\n", "",
      "a model load keeps a previous context's KV-zone placement"),

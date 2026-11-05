@@ -2275,6 +2275,9 @@ void ggml_sycl_cpu_retained_init(int device, sycl::queue * gpu_q) {
         req.intent.role                                   = ggml_sycl::alloc_role::COMPUTE;
         req.intent.category                               = ggml_sycl::runtime_category::HOST_COMPUTE;
         req.intent.cohort_id                              = "cpu_offload";
+        // A file-scope holder no backend context owns yet: the interim UNOWNED, which select_zone sends to WEIGHT,
+        // where it landed before routing by role (docs/design/sycl-mmap-host-tier.md §4.4 site table).
+        req.intent.lifetime                               = ggml_sycl::alloc_lifetime::UNOWNED;
         req.intent.constraints.must_host_pinned           = true;
         req.intent.constraints.prefer_same_tier_as_cohort = true;
         if (ggml_sycl::acquire_offload_buffer(req, &g_retained_scratch_lease)) {

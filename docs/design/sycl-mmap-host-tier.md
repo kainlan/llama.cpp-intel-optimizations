@@ -1,13 +1,108 @@
 # SYCL file-mapped host tier (mmap as a unified-cache tier)
 
-*Status: DESIGN rev 3o, not implemented. rev 3o is a new commit on rev 3n
-(`714081770`). It folds design-5efe-r11 (`6b674097e..714081770`,
-0C/0I/7m/3n) under the lead's r11 orders and the §M69 (b) amendments 1-4
-(an entry guard on the record function, a fourth case pinned to the
+*Status: DESIGN rev 3aa, not implemented. rev 3aa is a new commit on rev 3z
+(`9c0ee6941`). design-5efe-r21 passed rev 3z with two nits, folded here: the
+single-slot overload's signature gate is the name plus exactly one `&`, and
+`auto & vec` is at `pp:1057`. rev 3z is a new commit on rev 3y
+(`12839f154`). It folds design-5efe-r20 (`00ffc08fb..12839f154`,
+0C/0I/2m/4n): the lease-drop no-allocation ban now covers `free_chunk_owner`
+and the accessor, the gate's scanned-body list names every frame it bans,
+and the single-slot core overload is selected by signature (the vector
+overload is exempt); clause 10's allow-list is per mention (body, ordinal,
+statement kind) with exact counts, plus a presence check that each decision
+body calls `footprint_locked()`; the vector declaration is the `vector<`
+token; the ordinal counts every mention; and `comment mention flagged` is a
+negative control. Appendix B's "design-5efe-r20" table keys each item. rev 3y
+is a new commit on rev 3x
+(`00ffc08fb`). It folds design-5efe-r19 (`02d766337..00ffc08fb`,
+0C/0I/2m/4n) under §M110: clause 7's no-allocation list covers every
+frame on the lease-drop path (including the single-slot core overload
+and `release_zone_chunk`) with a planted control in the overload; clause
+10 allow-lists the destructor's reset (`pp:163`), scans comment-stripped
+source and asserts that the nine cited log lines are the only exempt
+mentions; and the nits (clause 5 names the public form's inline slot,
+Appendix B's reserve-position rows are marked as moved, and clause 11
+gains a control for the explicit `bad_alloc` catch). Appendix B's
+"design-5efe-r19" table keys each item. rev 3x is a new commit on rev 3w
+(`02d766337`). It folds design-5efe-r18 (`0ee6ad375..02d766337`,
+0C/0I/3m/6n) under §M104: the lease-drop path is non-allocating (the
+public release holds one inline carrier slot, never a vector) and its
+callers and the blocking free are stated; `footprint_locked()` has its
+own gate control and clause 10's log-only exemption is a mechanical
+form; the stranded RED scores the WARN text the code prints; and the
+six nits (sync/async sides, `pp:661`, the carrier count's last-statement
+decrement, "equals nine" with the abort string in the design, GONE and
+the §M97 cite, the lease-drop lookup scope and a status-order RED line).
+Appendix B's "design-5efe-r18" table keys each item. rev 3w is a new
+commit on rev 3v
+(`0ee6ad375`). It folds design-5efe-r17 (`858b74433..0ee6ad375`,
+0C/1I/5m/5n) under the lead's r17 rulings: every decision read of the
+pool's footprint goes through one `footprint_locked()` helper that
+reconciles first; the stranded reserve is made once, in `grow_into`,
+before the chunk is added, and the prune is in place; the lease's last
+drop releases an orphaned chunk (event-driven, no begin needed); the
+no-outstanding-carrier assertion is placed and counted; and the gate,
+the REDs and the nits follow. Appendix B's "design-5efe-r17" table keys
+each item. rev 3v is a new commit on rev 3u
+(`8cc6013e4`) that applies the lead's stranded-bound ruling: the stranded
+list is reserved to the pool's chunk count wherever a chunk is added
+(rev 3w: once, in `grow_into`, before the add), so
+the carrier's append never allocates (no terminate path), the destructor
+asserts capacity before it, and gate clause 11 pins the reserve; Appendix
+B's "The stranded list's bound" table keys it. rev 3u is a new commit on
+rev 3t
+(`ce6226443`, which is `ab79c0f0d` plus the follow-up that moved
+`test-sycl-scratch-trial-return` to `level_zero:1`). It folds
+design-5efe-r16 (`858b74433..ce6226443`, 0C/1I/6m/6n) under §M92, which
+corrects §M88 (1): a registry-refused free is a scheduled retry, not a
+leak, so the carrier strands its footprint on a pool list and the
+registry is the one source that reconciles it (the footprint leaves when
+the memory does); the drop path is stated against canon 1612-1619 and the
+gate pins the collect-then-release rule; the chunk's `alloc_metadata`
+capture and the carrier's back-pointer are named; the status is mapped
+per caller, with a one-call owner-end release; the registry accessor and
+the reconcile have their own gate clauses and REDs; and the REDs' cleanup,
+recipes and entry checks are fixed. Appendix B's "design-5efe-r16" table
+keys each item. rev 3t is a new commit on rev 3s
+(`8c61488b1`). It applies §M88 (the lead's answers to rev 3s's questions):
+the footprint leaves `total_allocated_` only when the allocation is
+actually gone, decided by a read-only registry query by the allocation's
+stable identity, and a refused free keeps it with the ownerless-lease
+WARN and the strict abort (superseded in rev 3u: §M92 makes it a stranded
+entry reconciled from the registry, with a retry WARN and no abort); and
+`test-sycl-configure-refusal` pins `level_zero:1`. Appendix B's
+"§M88 (rev 3t)" table keys each item. rev 3s is a new commit on rev 3r
+(`858b74433`). It folds design-5efe-r15 (`4db80fa62..858b74433`,
+0C/1I/5m/4n) under the lead's r15 rulings (the release carrier is RAII,
+so a dropped carrier releases and accounts; `release_zone_chunk` returns
+a status; every caller that holds the marked set's lock uses the `_locked`
+core; the lock-order gate pins the call forms, the destructor and
+`deferred_frees_mutex_`; the orphaned-free claims are stated at the
+callers; the strict-abort children inherit the driver's environment; and
+the footprint seam's instant and build are named); Appendix B's
+"design-5efe-r15" table keys each item to r15's IDs. rev 3r is a new
+commit on rev 3q (`4db80fa62`). It folds design-5efe-r14 (`02ba5ed6a..4db80fa62`,
+0C/1I/8m/2n) under the lead's r14 rulings (the held-lock claims derived
+from the callers, the release carrier and its two forms, the footprint
+that leaves with the memory, the census row, one planted control per
+gate clause, and the strict-abort test's construction); Appendix B's
+"design-5efe-r14" table keys each item to r14's IDs. rev 3q is a new
+commit on rev 3p (`02ba5ed6a`). It folds design-5efe-r13 (`40110fd66..02ba5ed6a`,
+0C/0I/5m/4n) under §M81 (c)-(e) (the marked set's lock census and order,
+its insert side, and the strict-abort arm's own test); Appendix B's
+"design-5efe-r13" table keys each item to r13's IDs. rev 3p is a new
+commit on rev 3o (`40110fd66`). It folds design-5efe-r12 (`714081770..40110fd66`,
+0C/0I/6m/4n) under the lead's r12 orders (where the kept executables are
+freed, the refusal's plumbing, the buildable stale-vectors case, mutants
+that print before they abort, and the marked set's lock); Appendix B's
+"design-5efe-r12" table keys each item to r12's IDs. rev 3o is a new
+commit on rev 3n (`714081770`). It folds design-5efe-r11
+(`6b674097e..714081770`, 0C/0I/7m/3n) under the lead's r11 orders (an
+entry guard on the record function, a fourth case pinned to the
 moe_after site, split RETURN_TO_MARK mutants, a marked-set entry that
 leaves with its chunk, and `configure_zones` refusing over a withdrawn
-chunk); Appendix B's "design-5efe-r11" table keys each item to r11's IDs.
-rev 3n is a new commit on rev 3m
+chunk) and the §M69 (b) amendments 1-4; Appendix B's "design-5efe-r11"
+table keys each item to r11's IDs. rev 3n is a new commit on rev 3m
 (`6b674097e`). It folds design-5efe-r10 (`a68508606..6b674097e`,
 0C/1I/5m/8n) under the lead's r10 rulings, including the §M69 (b)
 fourth amendment (submitted executables outlive the throw); Appendix B's
@@ -752,9 +847,8 @@ and held by `llama_model_loader`.
       full" WARN (`lml:1252-1253`) moves to the pre-fill. It prints for a
       declared row whose bit is clear because `SUPPORTED` is false off the
       taker.
-  - `any()` and `has()` answer from that membership. As built (C1 review N2)
-    there is no `for_file(idx)`: it had no production caller, and the record's
-    `deferred_for_file(idx)` is the sorted, merged form of the same ranges.
+  - `any()` and `has()` answer from that membership. `for_file(idx)` returns
+    the record's ranges for its members only.
   - Its private `ranges` map is deleted.
   - So under `taker`, where eligible rows are `STORAGE`, `any()` stays false,
     and `init_mappings` does not map every shard with `use_mmap` cleared
@@ -886,46 +980,10 @@ tests link it alone (§7).
   same-size-replacement gap (r1 m-5). The owner keeps the fd, because
   `POSIX_FADV_DONTNEED` after staging needs it (§4.6), and closes it at
   release.
-- `unified_cache_raw_lock_file_segments(mapping, lock_segments)`,
-  `unified_cache_raw_advise_file_segments(mapping, segments, advice)` and
-  `unified_cache_raw_unmap_file(mapping)` are the only lock, advise and
-  release. As built (C2 review, C3 review m6), each takes the `file_mapping`
-  the map call filled in, not a bare base address; the lock and the advise
-  validate every segment inside the reservation, page aligned, before the
-  first syscall and never widen one, so a refused set locks and advises
-  nothing. The release is **one `munmap` of the whole reservation** (r1 I-2),
-  issued from one wrapper function so that a second `munmap` anywhere in the
-  TU is a gate failure and a counter the test reads.
-  - **`WILLNEED` is advised in chunks of 128 KiB**, never one call per
-    segment. The kernel caps each `MADV_WILLNEED` at
-    `max(bdi io_pages, ra_pages)` pages, which is a property of the block
-    device (`max_sectors_kb`, `read_ahead_kb`), not of the tier: a 56 MiB
-    segment advised in one call populated 128 pages, and in 1 MiB chunks
-    half of it, on this host (C3 review M1). 128 KiB is the default
-    `read_ahead_kb` and at most `io_pages` for any `max_sectors_kb >= 128`,
-    and the chunk is at least one page. The residency test requires 95 % of
-    each host segment resident after `WILLNEED`, and fails a one-call and a
-    1 MiB-chunk mutant.
-  - **Windows SYCL stays in scope**, because the repo keeps a Windows CI VM
-    (C2 review M2). `file-mapping.cpp` is compiled on every platform (the
-    backend globs its sources); its POSIX body sits under
-    `#if !defined(_WIN32)` and a refusing stub stands in where it is not:
-    map, lock and advise answer `UNSUPPORTED` and touch nothing, release is a
-    no-op, `file_mapping_supported()` is false (the fact C4's
-    `load_maps_files` reads, §4.3 m-19), and the pure segment plan below is
-    outside the guard. The tests that need POSIX (`test-sycl-file-mapping-host`,
-    `-residency`, `test-sycl-file-mapped-tier`) are registered only on Linux;
-    `test-sycl-file-mapping-unsupported` compiles the stub with `_WIN32`
-    defined and runs it on the Linux host.
-  - **No raw fd accessor.** C2 shipped `unified_lookup_file_mapping_fd(base,
-    fd)`, which handed out the owner's dup keyed by a raw base pointer; it had
-    no production caller and is removed (C2 review m3). The step that adds
-    `POSIX_FADV_DONTNEED` (§4.6, "After staging") must reach the fd through a
-    `mem_handle` (or a handle-bound accessor), never through an address, and
-    must add `posix_fadvise` and the other calls the allowlist gate does not
-    yet police (`posix_madvise`, `mlock2`, `munlock`, `mremap`) to that gate
-    first (C3 review n4).
-- All the wrappers are added to the canonical contract §3 allowlist, next to
+- `unified_cache_raw_lock_file_segments(base, lock_segments)` and
+  `unified_cache_raw_unmap_file(reservation)` are the only lock and release.
+  The release is **one `munmap` of the whole reservation** (r1 I-2).
+- All three are added to the canonical contract §3 allowlist, next to
   `unified_cache_raw_malloc_host` and th32's `HOST_CPU` wrapper.
 - A new source gate, `test-sycl-raw-mmap-allowlist-source`, makes that
   enforceable, which the allowlist entry alone is not (r1 m-11). It fails on
@@ -1181,11 +1239,10 @@ owns role-based routing of **host** non-weight requests).
   `EXPERT_CACHE` to the WEIGHT zone, whatever its role (`uc:15368-15370`).
 - `SYCL_Host` buffers allocate with role `WEIGHT` whenever
   `weights_evictable` holds, even after the load (`gs:42650-42651`).
-- Those tenants fitted, unseen, in the ~20 GB of headroom that the former
-  1.2x ratio left over 100 GB of pinned experts. rnh3 removed the ratio: the
-  WEIGHT zone is now its named terms only, and after the split it is 64 MiB.
-  So they would grow zone 0 one ≥ 2048 MB chunk per miss (`uc:15418-15437`),
-  which is what zone 0 did in run2 (`run2.log:2965`, `:2968`).
+- Those tenants fitted, unseen, in the ~20 GB of 1.2x headroom over 100 GB of
+  pinned experts. After the split the WEIGHT zone is 64 MiB. So they would
+  grow zone 0 one ≥ 2048 MB chunk per miss (`uc:15418-15437`), which is what
+  zone 0 did in run2 (`run2.log:2965`, `:2968`).
 - The known tenants are:
   - llama-context's CPU-backend compute buffer, which uses the first
     device's host buft, i.e. `SYCL_Host` (`src/llama-context.cpp:889-895`);
@@ -1263,28 +1320,42 @@ created") describes a path that does not run.
     beside the host-KV figure is withdrawn.
 - **The demotion counts the indexer** (lead ruling on r3 B: the indexer is
   in the printed figure).
-  - The merge onto master replaced this section's scalar width with
-    master's per-layer one, so the indexer has a field. The inventory
-    carries `kv_idx_k_width_per_layer` (`ggml-sycl.h`), filled by
-    `llama_model_sycl_build_kv_layer_arrays` beside `kv_k_width_per_layer`,
-    `kv_v_width_per_layer` and `kv_layer_kind`, and the plan copies it into
-    `placement_plan::layer_idx_k_width`. The field was appended and grew
-    the struct from 176 to 184 bytes (192 bytes with master's later
-    fields; `ggml-sycl.h` pins the size), so `libllama` and
-    `libggml-sycl` rebuild together; a stale pairing is unsupported.
-  - `placement_plan::kv_size_for_layer(l)` is the layer's K/V buffer
-    (`kv_main_size_for_layer(l)`) plus its indexer keys
-    (`kv_idx_size_for_layer(l)`, from that layer's width, and 0 on a layer
-    without one).
-  - One accessor, `placement_plan::kv_demand_for_layer(l)`, is what both
-    demotion sites read (the demotion input and the residency re-fit). It
-    delegates to `kv_size_for_layer(l)`, because a second indexer term
-    would count the indexer twice. The printed `X MB host KV` is the
-    demotion's own total of those bytes (`host_kv_bytes_added`), so it
-    counts the indexer. On the device the `idx_` tensors are not remapped
-    into a layer slab (`[KV-REMAP]` matches only `cache_k_l`/`cache_v_l`).
-    How the device accounts for them is outside 5efe's scope, and is
-    ticketed as llama.cpp-ka9c (addendum 11 (5); r4 m-11).
+  - Today the demotion's per-layer bytes come from
+    `placement_plan::kv_size_for_layer(l)` (`uch:1033`), at both the demotion
+    input (`gs:17089-17092`) and the residency re-fit (`gs:18037-18042`).
+    Its per-layer truth comes from `llama_model_sycl_build_kv_layer_arrays`
+    (`lm:350-365`) through the inventory's `kv_k_width_per_layer`,
+    `kv_v_width_per_layer` and `kv_layer_kind` (`ggml-sycl.h:323-326`). No
+    field carries the indexer, so the printed `X MB host KV` omits 768 MiB
+    that the load then pins.
+  - C4 adds **`uint32_t kv_idx_width`** to `ggml_sycl_tensor_inventory`,
+    filled from `hparams.indexer_head_size` when the model's memory is
+    `llama_memory_hybrid_idx` and 0 otherwise. Measured with a standalone
+    compile against this tree's header: the struct is 176 bytes, 8-aligned,
+    with `kv_layer_count` at offset 168, so a `uint32_t` after it lands at
+    offset 172, in the tail padding, and `sizeof` stays 176, so it never
+    shifts another field (memory:
+    extending-a-struct-that-crosses-the-backend-dlopen-boundary).
+    - **What is relied on** (r4 n-1). In-tree, `kv_idx_width` is a declared
+      member, zeroed by every construction (`lm:653`, `:705`,
+      `tests/test-tiered-dispatch.cpp:35`,
+      `tests/test-sycl-lifecycle-runtime-wrapper.cpp:1388`, `:1426`, each
+      `= {}`), and C4 sets it explicitly at both `lm` sites. That is the
+      whole guarantee.
+    - For a stale `libllama` the field is tail padding, whose value the
+      standard leaves unspecified, so rev 3e's "a stale libllama leaves the
+      byte zero" is withdrawn. That pairing is unsupported, as for the
+      notify below: the commit message states that both libraries rebuild
+      together.
+  - One accessor, `placement_plan::kv_demand_for_layer(l)` =
+    `kv_size_for_layer(l)` + `kv_idx_width` x the layer's cells x the K
+    element size, for every layer the plan counts as carrying KV. Both
+    demotion sites read it, and so does `rec.host_bytes`, the printed
+    figure. `kv_size_for_layer` itself, which sizes the device per-layer
+    slabs, is unchanged: on the device the `idx_` tensors are not remapped
+    into a layer slab (`[KV-REMAP]` matches only `cache_k_l`/`cache_v_l`,
+    `gs:38575-38583`). How the device accounts for them is outside 5efe's
+    scope, and is ticketed as llama.cpp-ka9c (addendum 11 (5); r4 m-11).
   - So the Qwen no-`-c` line prints 12 x (512 + 64) = **6912.0 MB** of host
     KV (§7 C4 step 3).
 - **One intent builder per host buft, shared by its `get_max_size` and its
@@ -1952,9 +2023,10 @@ created") describes a path that does not run.
       - the owning context's next begin, if its allocators are empty then;
       - its owner's end. `ggml_backend_sycl_free` (`gs:83943`) runs the
         owner-end step before `delete sycl_ctx` (`gs:84119`): it releases
-        each of its owner's entries whose allocators are empty and sets
-        `orphaned` on the rest. The free that empties an orphaned chunk
-        releases it.
+        each of its owner's entries whose allocators are empty and that
+        hold no lease, and sets `orphaned` on the rest. The free that
+        empties an orphaned chunk releases it, and so does the drop of its
+        last lease (r17 M-4).
 
       **Where the two flags live** (r10 n-2). `withdrawn` and `orphaned`
       are the only per-chunk states, and both live on the chunk's
@@ -1974,17 +2046,240 @@ created") describes a path that does not run.
       `release_marked_chunk(dev, chunk_idx)`: it calls
       `release_zone_chunk` and erases that chunk's entry from the set in
       the same step, and no code calls `release_zone_chunk` for a marked
-      chunk any other way. Its callers are the begin entry,
-      `RETURN` and `RETURN_TO_MARK`'s immediate release, the owner's end,
-      and the orphaned chunk's emptying free: `zone_free` hands the
-      chunk's index back to its caller (above), the cache's host-zone free
-      path, where the cache is reachable, and that caller calls the same
-      function after the pool's lock drops. So a released chunk is a
-      tombstone in `chunks_` and absent from the marked set at the same
-      moment, and no entry for a tombstone survives for a later begin to
-      meet. A begin's walk also skips an entry whose chunk is already a
-      tombstone, with no print, so a stale entry could not become a null
-      release or a bogus `SCRATCH return refused`.
+      chunk any other way. It has two forms (r14 M-2), and the form is
+      chosen by what the caller holds (r15 M-1): **a caller that already
+      holds `marked_set_mutex_` calls the core and never the public form**,
+      because the lock is a plain mutex and the public form takes it. The
+      core, `release_marked_chunk_locked(dev, chunk_idx, out)`, is called
+      with `marked_set_mutex_` held. It calls `release_zone_chunk` and acts
+      on the status that returns (below). On a release it erases the entry
+      and moves the returned `released_chunk` into `out`: a vector the
+      caller owns and has reserved (the walks) or, in the core's
+      **single-slot overload**, an inline `released_chunk` with no vector
+      at all (the public form; r18 M-1). The public `release_marked_chunk(dev,
+      chunk_idx)` is for a caller that holds neither the set's lock nor the
+      pool's: it holds one inline `released_chunk` slot (no vector and no
+      allocation; r18 M-1), takes the lock, calls the single-slot core,
+      drops the lock, and lets the slot's carrier release
+      (`release_chunk_backing`, below). Four callers hold the set's lock
+      and use the core, each in **one scope** that collects into a local
+      vector reserved for its candidate count and releases every collected
+      backing after the scope closes:
+      - the begin's walk;
+      - `configure_host_zones`'s release of the empty marked chunks;
+      - the owner-end walk (`ggml_backend_sycl_free`'s step): for each
+        entry of its owner, the core with `orphan_if_live` set (r16 M-4).
+        The pool call decides under one hold of its `mutex_`: it releases
+        the chunk if its allocators are empty and no lease is held, and
+        otherwise (a live allocation is checked first, then a lease) sets
+        `orphaned` and returns ORPHANED. A free cannot slip between the
+        check and the flag, so an emptying free either sees `orphaned` and
+        releases the chunk, or the walk saw the chunk empty and released
+        it. An orphaned chunk is then released by whichever comes last of
+        the free that empties it and the drop of its last lease (below),
+        so no begin is needed;
+      - `RETURN` and `RETURN_TO_MARK`: the filing (made after the pool's
+        lock has dropped, since withdrawal itself runs under it) and the
+        immediate release of the chunks that are already empty share one
+        scope, so an empty chunk is never visible in the set between its
+        filing and its release.
+
+      Two empty chunks released by one begin, or by one owner's end, are
+      both freed after the lock. The **callers of the public form** are
+      the orphaned chunk's two release events (r17 M-4): the emptying
+      free, where `zone_free` hands the chunk's index back to its caller,
+      the cache's host-zone free path, and the last lease's drop, where
+      `release_chunk_lease` hands it back to `host_release_chunk_lease`
+      (below). Each holds neither lock and calls the public form after the
+      pool's lock drops. So a released chunk is a tombstone in `chunks_`
+      and absent
+      from the marked set at the same moment, and no entry for a tombstone
+      survives for a later begin to meet; its backing footprint leaves
+      `total_allocated_` when the memory is freed (below). A begin's walk
+      also skips an entry whose chunk is already a tombstone, with no
+      print, so a stale entry could not become a null release or a bogus
+      `SCRATCH return refused`.
+      **The set's lock and the lock census** (r12 M-5; r13 M-2, M-3; r14
+      I-1, M-4, M-5; §M81 (c), (d)). The orphaned-free caller runs on the
+      thread that frees the scheduler's buffer, while another context's
+      begin walks the same set, and both can pick the same empty chunk. So
+      **every access to the set holds one per-device lock of the device
+      cache, `marked_set_mutex_`**: the filing at `RETURN` and
+      `RETURN_TO_MARK` (made after the pool's lock has dropped, since
+      withdrawal itself runs under it), the begin's walk, the owner-end
+      walk by owner, `release_marked_chunk_locked`'s erase, and the test
+      accessor `marked_entries`.
+      - **Census** (canon §12.5, where an unclassified lock is a failing
+        census item): `marked_set_mutex_` is **L4**, cache registries and
+        metadata, last in L4's ordinal list. `pinned_chunk_pool::mutex_`
+        (`pinned-pool.hpp:313`), which the table does not list, is **L5**,
+        placed **first** in L5's list, before `vram_zone::alloc_mutex`:
+        `grow` already nests `g_runtime_alloc_mutex` under it (`grow_into`
+        to `allocate_pinned_chunk_owner` to
+        `unified_allocate_owner_backing`, `pp:939`, `uc:15578`), and that
+        nesting is conforming under this row, and so is the reconcile's registry
+        query (below). Any nesting under the pool's `mutex_` other than
+        those two is pre-existing, tracked as llama.cpp-uilv, and not
+        C4's. C4 adds both rows to canon §12.5 in the same commit, **and a
+        third for `deferred_frees_mutex_`** (r15 M-2 (c)): the order
+        argument below depends on nothing under `marked_set_mutex_` or the
+        pool's `mutex_` taking it, and `process_deferred_frees_locked`
+        holds it around owner releases (`uc:12667`) while the enqueue paths
+        take it (`uc:12453-12557`), so it must be classified. It is L4,
+        listed after `rw_mutex_` and before `marked_set_mutex_`; its exact
+        ordinal among the other L4 locks is decided in that commit, by
+        its author against the enqueue paths and reviewed there with the
+        two rows above, and the gate reads it from the table once it is
+        there. The
+        canon's retained-handle-store row and its "last in L5" paragraph
+        exist only at `d8a67422d` (canon:1458, :1502-1525, added by
+        llama.cpp-uwlx); this doc does not rely on them. The order is L4
+        then L5.
+      - **Who takes `marked_set_mutex_`, and what each holds, derived from
+        the callers at e2461d4fb** (r14 I-1). Only a caller that gets a
+        chunk index back, or that releases marked chunks by design, takes
+        it. The `orphaned` flag lives only on SCRATCH `zone_chunk_state`s,
+        so only a SCRATCH free returns an index.
+        - The begin entry and the trial's `RETURN`/`KEEP` entry are called
+          from `sched_reserve` and `try_candidate`, with no cache lock.
+        - The owner-end step runs in `ggml_backend_sycl_free` before
+          `delete sycl_ctx` (`gs:84119`); `g_pipeline_copy_queue_mutex`
+          (`gs:83957`) is a block-scoped guard that closes at `gs:83968`,
+          so none is held. The planner's `backend_guard` (`gs:16818`)
+          calls the same free with no census mutex held (its `module_guard`
+          is a counter).
+        - `configure_host_zones` is reached through
+          `ggml_sycl_configure_host_zones_for_plan`. Its callers at
+          e2461d4fb: the guarded path (`gs:16850`), after the inventory
+          lock's scope has closed (`gs:16843-16851`); `gs:33366`, inside
+          `ggml_sycl_preload_moe_experts` (`gs:33353`), a static function
+          with no caller, so **not a production caller**; and `gs:33893`,
+          the only other live site, inside
+          `ggml_sycl_preload_model_weights` (`gs:33520`), reached from
+          `ggml_sycl_model_loading_effects` (`gs:12476`) and
+          `model_load_end` (`gs:13124`), which hold a
+          `sycl_module_mutation_guard` (a counter, `gs:12234-12255`) and
+          registry effect scopes, none a census mutex; its only
+          `lock_guard` (`gs:33547`) is in a closed block.
+        - The orphaned free, stated at its callers (r15 M-3). SCRATCH
+          frees reach `host_zone_free` through `unified_free_record`
+          (`uc:14806`), from (i) `release_registered_allocation_owned`'s
+          detached release (`uc:16423`), whose own lock block
+          (`uc:16373-16413`) has closed; it is reached from the registry
+          release paths and from `process_deferred_frees_locked`
+          (`uc:12689`, `:12714`, `:12748`, `:12760`), which runs under
+          `rw_mutex_` (unique) and `deferred_frees_mutex_` (`uc:12667`);
+          (ii) `unified_cache::deallocate` (`uc:20672`), whose only caller
+          is the free wrapper `unified_cache_deallocate(int, void *,
+          size_t, lifetime)` (`uc:21288`), and that wrapper has no caller
+          in `ggml/` or `tests/` at e2461d4fb (the two-argument overload a
+          policy fixture uses is a different function), so this path has no
+          production caller today; (iii) the allocation-rollback calls
+          (`uc:15558`, `:15572`, `:15601`), made by the allocation
+          functions after their own `g_runtime_alloc_mutex` block (it
+          closes at `uc:15599`); the callers of those allocation functions
+          are many and are not enumerated here. A rollback record can lie
+          in a withdrawn chunk, so this is a **lock-state** claim, not an
+          exclusion. **For (i) and (iii) the rule stands in place of a
+          census of callers**, because the gate sees bodies and not
+          callers: a SCRATCH final-owner destruction, or a SCRATCH
+          allocation that can roll back, made while the caller holds an L5
+          lock is non-conforming under canon §12.5 (a final `mem_handle`
+          destruction under a listed lock, canon:1612-1619 at e2461d4fb)
+          and would put `marked_set_mutex_` (L4) under an L5 lock. Any such
+          site is pre-existing and outside C4, and belongs to
+          llama.cpp-uilv with the pool's other nesting; C4 adds no site,
+          and the order below covers every site that follows the rule.
+        - **The deferred-free path and SCRATCH.** No producer enqueues a
+          SCRATCH host allocation on the deferred lists today:
+          `enqueue_deferred_free` is fed by weight-cache and expert-stage
+          slots (`uc:6155`, `:6651`, `:6962`, `:12368-12369`, `:12412`,
+          `:13056`), DMA staging slots (`uc:13885`, `:13892`) and the
+          oneDNN scratch replacement (`uc:17646`), and `defer_host_free`
+          has no caller. The order below nevertheless covers the case: if a
+          SCRATCH owner ever reaches `process_deferred_frees_locked`,
+          `marked_set_mutex_` is taken under `rw_mutex_` and
+          `deferred_frees_mutex_` (the latter is not in canon §12.5's
+          table today; C4's census commit adds it, above).
+        - **The WEIGHT frees** reach `host_zone_free` with caller-held
+          locks and never return an orphaned index, so they never take
+          `marked_set_mutex_`; they are listed because they free through
+          the same function. `release_entry_allocation_locked` has 15 call
+          sites at e2461d4fb (16 grep hits, the 16th being its definition
+          at `uc:12345`). `uc:4925` (`shutdown_resources`, whose
+          production caller is `~unified_cache`, `uc:4639`, with no lock
+          held) takes `rw_mutex_` nowhere and holds no cache lock. These
+          take `rw_mutex_` (unique) inside the
+          function: `ensure_cached` (`uc:5648`, lock `:5430`),
+          `direct_stage_weight` (`:6243`, `:6209`), `direct_stage_expert`
+          (`:6589`, `:6750`, `cache_lock` `:6552`, `:6718`),
+          `direct_stage_expert_tensor` (`:7045`, `:6982`),
+          `drop_expert_entry` (`:7558`, `:7506`),
+          `drop_expert_entries_for_tensor_layout` (`:8029`, `:7998`),
+          `allocate_slot` (`:8678`, `:8637`), `remove` (`:9869`, `:9828`),
+          `note_buffer_owner_dead` (`:13128`, `:13097`) and
+          `ensure_cached_alloc` (`:20067`, `:19910`);
+          `finalize_evictions_locked` (`:10710`) is called under
+          `rw_mutex_` from `finalize_evictions` (`:10746`) and from
+          `process_deferred_frees_locked` (`:12660`); `evict_one`
+          (`:10626`) and `finalize_retired_entries_locked` (`:12624`)
+          take it from their callers by contract only.
+      - **The order.** `rw_mutex_` (and `deferred_frees_mutex_` where
+        held) then `marked_set_mutex_` then the pool's `mutex_`. So
+        `marked_set_mutex_` may be taken under `rw_mutex_` and other L4
+        locks ranked before it, never under an L5 lock. Nothing under
+        `marked_set_mutex_` or the pool's `mutex_`, in the functions C4
+        touches, takes an L4 lock (the gate pins it), so no cycle exists.
+        `release_marked_chunk_locked` holds `marked_set_mutex_` and takes
+        the pool's `mutex_` inside `release_zone_chunk`, and nothing else.
+        The pool's `mutex_` is a leaf **for these functions only**,
+        because the owner moves out of the pool's scope (the release
+        bullet above) and is released after both locks drop. No function
+        that holds the pool's `mutex_` calls `release_marked_chunk` or
+        takes `marked_set_mutex_`. The pool's other nesting is unchanged
+        and is not C4's (`configure_zones` calls `grow`, and the
+        destructor frees chunk owners, with `mutex_` held,
+        `pp:309-328`, `pp:141-162`).
+      - **The owner's release can run under a caller's L4 locks** (r14
+        I-1 (c)). `release_chunk_backing` runs after both new locks drop
+        but not after the caller's: a free arriving through
+        `process_deferred_frees_locked` runs it under `rw_mutex_` and
+        `deferred_frees_mutex_`. That is legal by the order above and by
+        a non-taking property: the owner's release for a host-pinned
+        record takes `g_runtime_alloc_mutex` in
+        `release_registered_allocation_owned` and then frees
+        (`uc:14932-14946`), and takes none of `rw_mutex_`,
+        `direct_stage_mutex_` or `deferred_frees_mutex_`, so no cycle and
+        no self-deadlock. It is pre-existing in kind (a final-owner
+        destruction under a listed lock, canon 1612-1619) and no worse
+        than today's frees through those callers.
+      - **The state re-read** (r13 M-3). A chunk's state lives in
+        `chunks_` and `zone_chunk_state`, which the pool's `mutex_`
+        guards, so the re-read is a pool call: `release_zone_chunk` takes
+        the pool's `mutex_`, finds the chunk and its flags under it, and
+        returns a **status** (r15 I-1; r16 M-4), of type
+        `pinned_chunk_release`. `release_marked_chunk_locked` takes
+        ALREADY as no effect: no print and no second erase. Only DONE
+        appends to `out`. A refusal leaves the entry in the set. The
+        begin's tombstone skip uses the same pool query. The `released`
+        and `return refused` lines print after both locks are dropped.
+        **What each caller does with each status** (r16 M-4):
+
+        | caller | DONE | ALREADY | REFUSED_LIVE | REFUSED_LEASE |
+        |---|---|---|---|---|
+        | begin's walk | erase, collect, `released` line | skip, silent | silent for another owner's chunk, entry kept (a live scheduler buffer; its owner's end or a later begin releases it); the owning context's own begin prints `SCRATCH return refused dev chunk reason=live` (r10 m-3) | silent for another owner's chunk, entry kept, retried at the next begin; the owning begin prints the line with `reason=lease` |
+        | `RETURN` / `RETURN_TO_MARK` | as the begin | skip, silent | `SCRATCH return refused dev chunk reason=live`, entry kept (the chunk was judged empty at the check, so it is reported by name) | the same line with `reason=lease`, entry kept, retried at the next begin |
+        | owner-end walk (`orphan_if_live`) | as the begin | skip, silent | returns ORPHANED: `orphaned` set under the same hold, released by the emptying free or the last lease's drop | returns ORPHANED too (live is checked first, then lease): released by the last lease's drop, or by the emptying free if that comes last |
+        | `configure_host_zones` | as the begin | skip, silent | the chunk stays withdrawn, so `configure_zones` refuses by name and returns false (clause 6's strict read applies) | as REFUSED_LIVE |
+        | orphaned emptying free (public form) | as the begin | silent (a begin released it first) | cannot occur: the free just emptied it; if it does, silent, and a later free offers it again | silent, entry kept; the last lease's drop releases it |
+        | last lease's drop (public form) | as the begin | silent | silent, entry kept; the emptying free releases it | cannot occur: this is the last lease; if it does, silent |
+
+        A lease on a chunk whose allocators are empty is transient: a
+        raw-pointer lease outlives its allocation by the dispatch's own
+        window. For the begin, `RETURN` and configure rows its retry point
+        is the next begin of the live owner. For an orphaned chunk it is
+        the lease's own drop (below), so a dying owner never leaves a
+        chunk withdrawn until pool destruction.
 
       **A begin and a live owner** (r10 m-3). A begin releases every empty
       chunk in the device's marked set, whatever its owner. It leaves a
@@ -2052,18 +2347,260 @@ created") describes a path that does not run.
       `zone_allocators_` (`pinned-pool.cpp:613-712`), and chunks are freed
       only in the pool's destructor (`:141-162`). C4 adds
       `pinned_chunk_pool::release_zone_chunk(host_zone_id zone, size_t
-      chunk_idx)` (r8 n-4 closes four gaps in rev 3k's text):
+      chunk_idx, released_chunk & out, bool orphan_if_live = false)`, which
+      returns a `pinned_chunk_release` status (r15 I-1, r16 M-4; below)
+      (r8 n-4 closes four gaps in rev 3k's text):
       - it requires the chunk's zone allocator to be wholly free, **and**
         the chunk's own per-chunk `allocator` (`pinned-pool.hpp:246`) to be
         unused, and its lease count 0;
       - it requires the chunk to be withdrawn, removes its span and zone
         allocator, and does **not** change the zone's capacity, which the
-        withdrawal already reduced (r9 m-3). It subtracts the chunk's
-        **backing** size, usable plus the `DEFAULT_ALIGNMENT` header that
-        `grow_into` commits (`chunk_footprint_for`, `pp:798-803`), from
-        `total_allocated_`, the pool's footprint, a different fact;
-      - it releases the chunk through `free_chunk_owner` (`:778-791`),
-        whose `mem_handle` release is the only release point (P2);
+        withdrawal already reduced (r9 m-3). It does **not** touch
+        `total_allocated_` either (r14 M-3): the pool's footprint counts
+        the chunk's **backing** size, usable plus the `DEFAULT_ALIGNMENT`
+        header that `grow_into` commits (`chunk_footprint_for`,
+        `pp:798-803`), a different fact from the zone's capacity, and it
+        keeps counting it until the memory is physically freed (below);
+      - **the status** (r15 I-1; r16 M-4, N-4): `release_zone_chunk`
+        returns a `pinned_chunk_release`, one of `PINNED_CHUNK_RELEASE_DONE`,
+        `PINNED_CHUNK_RELEASE_ALREADY` (the chunk is a tombstone),
+        `PINNED_CHUNK_RELEASE_REFUSED_LIVE` (the zone's or the chunk's
+        allocator is not empty), `PINNED_CHUNK_RELEASE_REFUSED_LEASE` (lease
+        count above 0) and `PINNED_CHUNK_RELEASE_ORPHANED`, which only a call
+        with `orphan_if_live` set returns, in place of REFUSED_LIVE or
+        REFUSED_LEASE (a live allocation is checked first, then a lease),
+        after setting `orphaned` in the same hold. It fills `out` only on
+        DONE. It
+        decides the status under the pool's lock, with the chunk's state, so
+        a caller can tell a no-effect release from a refusal;
+      - **the lease-drop trigger** (r17 M-4; r18 M-1, N-6).
+        `release_chunk_lease` (`pp:1049`) returns a chunk-index hint (an
+        invalid value when there is none). The lookup runs only when a
+        drop takes a chunk's count to zero, the chunk is in `chunks_` (not
+        `runtime_chunks_`), and it scans only `zone_allocators_[SCRATCH]`'s
+        `zone_chunk_state`s for that index, the `zone_free_unlocked` shape
+        (`pp:526-545`); every other drop pays one atomic and one
+        comparison and nothing more. When that state has `orphaned` set and
+        empty allocators, the call returns the index, as `zone_free` does
+        for the last free. Its one cache-side caller,
+        `unified_cache::host_release_chunk_lease` (`uc:24107-24111`, reached
+        from `mem-handle.cpp:1142`), calls the **public**
+        `release_marked_chunk` with the index after the pool's lock
+        drops, and C4 declares it `noexcept`, because its only
+        caller is `mem_handle::release_lease_state`, itself `noexcept`
+        (`mem-handle.cpp:1102`). So the path is non-allocating by
+        construction: the public form holds its one carrier in an inline
+        slot, never a vector; the erase from the marked set and the pool's
+        unlink are in place; the carrier's destructor appends to the
+        already-reserved `stranded_`; and the plain mutex locks are the kind
+        `release_chunk_lease` already takes in this `noexcept` chain today
+        (`pp:1056`). The path contains no throwing allocation, so it has no
+        failure to report. The release is event-driven: no host wait and no
+        polling.
+        **Callers** (r18 M-1): `release_lease_state` is reached at
+        `mem-handle.cpp:982`, `:1004` and `:1067` (the resolve
+        refreshes), `:1166` (`release_lease()`, which `~mem_handle` calls
+        at `:1387-1388`), and `:1665` and `:1773` (the two assignment
+        forms). Each takes the state under the handle's leaf lock and
+        releases it after that lock's scope has closed (the assignment
+        forms say so at `:1664`, "Release the old leases and allocation
+        owner outside the lock"), so no handle lock is held. What is new is the exposure. Before C4 a
+        handle drop took only the pool's leaf `mutex_` (`pp:1056`); now a
+        drop that closes the last lease on an orphaned empty SCRATCH chunk
+        takes `marked_set_mutex_` (L4), nests the pool's `mutex_` (L5)
+        inside it, drops both, and then the carrier makes a blocking
+        `sycl::free` and takes the registry lock. The order is L4 then L5,
+        with no inversion. The blocking free is acceptable in each source
+        for two reasons: it runs after every lock the path took has
+        dropped, and a final `mem_handle` drop making a blocking free is
+        pre-existing in kind (`~mem_handle` drops `owned_alloc_` and
+        reaches `unified_free`, `mem-handle.cpp:1387` onward). Only a
+        handle holding a lease on a withdrawn, orphaned SCRATCH chunk can
+        reach the branch. A caller that drops a handle while holding an L5
+        lock is non-conforming under canon 1612-1619 and outside C4
+        (llama.cpp-uilv), the orphaned free's rule;
+      - **the carrier** (r14 M-1, M-3; r15 I-1, N-3). On a release, under
+        the pool's lock, it unlinks the span and the zone allocator, sets
+        the tombstone in `chunks_` (base null, size 0), and moves the
+        removed chunk's base, backing size and owner into `out`, a
+        `pinned_chunk_pool::released_chunk`. It needs no
+        `wait_for_chunk_drain`: lease count 0 at the check is enough
+        because no lease can be taken afterwards, since
+        `acquire_chunk_lease` and `find_chunk_handle` skip a null base
+        under the same `mutex_` (`pp:1026-1047`) and the tombstone is set
+        under that lock;
+      - **`released_chunk` is the release, and it is RAII** (r15 I-1;
+        §M88 (1); §M92; r16 M-2). It is a nested class of the pool,
+        move-only, constructed only by `release_zone_chunk`. It holds the
+        chunk's base, backing size, owner `mem_handle`, the owner's
+        `alloc_metadata`, and a back-pointer to its pool (the destructor
+        calls the non-static `free_chunk_owner` and takes `mutex_`). A
+        carrier never outlives its pool: the pool is the device cache's and
+        is destroyed after every caller of the release path.
+        `~pinned_chunk_pool` enforces it with an atomic count of **owning**
+        carriers, and its **first statement** asserts the count is 0
+        (`released_chunk outstanding at pool destruction`), before the
+        `lock_guard` and the free loops (`pp:141-146`). The count rises
+        when `release_zone_chunk` builds an owning carrier and falls when
+        an owning carrier is destroyed or consumed; a move transfers
+        ownership and leaves the count unchanged, and a moved-from or
+        default-constructed carrier holds no owner and is never counted.
+        The decrement is the carrier destructor's **last** statement,
+        after step 4 has released `mutex_`, so a concurrent
+        `~pinned_chunk_pool` cannot pass its assertion while a carrier
+        still touches the pool.
+        **The metadata's source.** `mem_handle` exposes no `ptr`/`key()`
+        accessor (`debug_info()` only), and `metadata()` exists only on
+        `alloc_owner` (`mem-handle.hpp:60`). So
+        `allocate_pinned_chunk_owner` (`pp:84-113`) reads
+        `allocation.owner.metadata()` before `mem_handle::from_owned_alloc`
+        consumes the owner, and returns it with the handle in a small
+        struct, `pinned_chunk_backing {mem_handle owner; alloc_metadata
+        metadata;}`. `grow_into` stores both on the `chunk` (a new field,
+        `owner_metadata`), on the synchronous path and on the `std::async`
+        path (`pp:904-926`, whose future now returns the struct).
+        `release_zone_chunk` moves the field into the carrier with the owner.
+        **Its destructor is the release.** A carrier that still holds an
+        owner runs four steps, with no lock held at the first three:
+        1. it takes the recorded `alloc_metadata` (`uch:5710`: `ptr` and
+           `key()`, the two fields the registry's own exact checks compare,
+           `uc:16428` and `:16553-16554`), before the reset;
+        2. it calls the private `free_chunk_owner` (`pp:778-791`) on the
+           removed chunk, whose `mem_handle` reset is the only release
+           point (P2). The carrier keeps the non-null base (the null base
+           that makes `free_chunk_owner` return early, `pp:779-781`, is
+           the `chunks_` entry's), so the missing-owner `GGML_ASSERT`
+           (`pp:788-790`) still guards the release;
+        3. it asks the registry, read-only, whether that exact row is
+           still registered, through a new shipped accessor,
+           `unified_allocation_registered_exact(const alloc_metadata &)
+           noexcept`, in the cache. It takes `g_runtime_alloc_mutex` alone,
+           finds the row by `ptr`, compares `key()` and writes nothing, and
+           returns the row's own state: GONE, LIVE or RELEASING (§M97: the
+           accessor reports its own row and the WARN claims no cause,
+           since naming one would need a second source, the retry list).
+           The existing `allocation_registry_test_contains(ptr)`
+           (`uc:16534`) is test-only and answers by pointer alone, which
+           a reused address would satisfy, so it is not the accessor;
+        4. under the pool's `mutex_`, in one short section: if the answer
+           is GONE, it subtracts the backing size from `total_allocated_`;
+           otherwise it appends `{metadata, backing size}` to the pool's
+           `stranded_` list **without subtracting**, and prints
+           `[PINNED-POOL] released chunk backing %.1f MB: release not yet
+           complete after the owner reset (registry row %s); footprint
+           stranded until the registry drops it` (WARN), where `%s` is LIVE
+           or RELEASING. The row cannot say why the release is pending (a
+           scheduled retry, other references on the control, or the
+           shutdown abandon), so the line does not claim a cause.
+           **The append never allocates, and the reserve comes first.** At
+           most one stranded entry exists per chunk (a chunk is released
+           once, and its carrier strands once), so the list never needs
+           more entries than the pool has chunks. Every chunk is added in
+           one place, `grow_into` (`pp:922` on the async path, `pp:945` on
+           the synchronous path); `configure_zones`, `allocate_segmented`
+           and `grow_zone` reach it through `grow`/`grow_into` and add
+           none. `grow_into` therefore reserves `stranded_` to
+           `chunks_.size() + runtime_chunks_.size() + 1` after its budget
+           check (`pp:892`) and **before it allocates the chunk owner**, so
+           a failed reserve never creates and releases a registered owner,
+           and a chunk never exists uncounted or without room for its
+           stranded entry. A `bad_alloc` from the reserve maps to `return
+           false` through an explicit catch placed ahead of both paths (the
+           async path catches `std::exception` at `pp:930`, the synchronous
+           path only `sycl::exception` at `pp:950`). The size never
+           decreases: chunks are only tombstoned (the sole clear is the
+           pool's destructor, `pp:161-162`), and the reconcile prunes **in
+           place** (`std::remove_if` and `erase`), which never shrinks
+           capacity; a rebuild, swap or `shrink_to_fit` is forbidden. The
+           destructor asserts `stranded_.size() < stranded_.capacity()`
+           before its `emplace_back`, with the message `stranded_ capacity
+           %zu exhausted at %zu entries`, so a violated invariant is a named
+           abort and never a silent reallocation or a terminate from
+           `bad_alloc`.
+
+        **A refused free is a scheduled retry** (r16 I-1; §M92), not a
+        leak. `alloc_owner_control::release_ref` (`uc:857-862`) calls the
+        coordinator's `retire` (`uc:995-1019`), whose `release_physical`
+        (`uc:983-993`) maps every status but RELEASED to RETRY_SCHEDULED
+        and pushes the control on the retry list; `process_retries`
+        (`uc:1031-1056`) frees it later, when whatever refused has gone.
+        Production causes exist: `unified_free_record` returns false on a
+        `sycl::exception` from `sycl::free` (`uc:14947-14960`) and on a
+        `zone_free` refusal (`uc:14827-14829`). So the registry, not the
+        pool, knows when the memory goes, and the pool reads that one fact
+        instead of keeping a second. **`footprint_locked()`** is one
+        private helper that, under `mutex_`, runs
+        `reconcile_stranded_locked()` (it asks
+        `unified_allocation_registered_exact` for each stranded entry and
+        prunes the ones now GONE, subtracting their bytes at that moment)
+        and returns `total_allocated_`. **Every decision read of the
+        footprint goes through it** (r17 I-1): `allocate_segmented`
+        (`pp:186`), `pre_allocate` (`pp:242`), `configure_zones`
+        (`pp:323`), `grow_zone` (`pp:661`), `allocate_from_chunks`
+        (`pp:827`, which serves `allocate_runtime` and the zone-base path),
+        `grow_into` (`pp:892`), and the getter `allocated()` (`pp:768`).
+        Several of these test before they call `grow_into`, so a reconcile
+        at `pp:892` alone would never be reached. Log-only reads are
+        exempt. When `stranded_` is empty the reconcile is a size test and
+        takes no registry lock. `stranded_` and `total_allocated_` are
+        `mutable`, since `allocated()` is `const` (`pph:206`).
+        `allocated()`'s external callers are `uch:4140`
+        (`pinned_pool_committed`), reached from `gs:5688`, and
+        `mem-ops.cpp:392` (`stage_trace_sample`, reached from
+        `mem-ops.cpp:434`, `:509`, `:518` and `gs:107656-107659`); none
+        holds `g_runtime_alloc_mutex`, so the two-lock call is acyclic. The
+        reconcile nests `g_runtime_alloc_mutex` under `mutex_`, the nesting
+        the census row above already makes conforming (`pp:939`,
+        `uc:15578`). The footprint therefore leaves exactly when the memory
+        does. **Teardown:** `~pinned_chunk_pool` reconciles once and prints
+        `[PINNED-POOL] stranded chunk backing %.1f MB still registered at
+        pool destruction` (WARN) for each entry that is still registered.
+        The registry's shutdown branch (`uc:1005-1008`) abandons a control
+        with its row registered and schedules no retry, so that line is
+        the report for it when the pool outlives the abandon. A strict
+        abort applies only through the registry's own ownerless
+        classification, unchanged; the carrier's destructor never names
+        `ggml_sycl_strict_enabled`, and the gate pins that.
+
+        A moved-from carrier holds no owner, and its destructor does
+        nothing. The public `release_chunk_backing(released_chunk &&)`
+        consumes a carrier early: it moves it into a local that leaves
+        scope at once. There is one release path, and the accounting rides
+        on it. So a carrier dropped anywhere, by an early return or an
+        exception, releases and accounts exactly as a consumed one does,
+        and cannot leak the footprint or free the memory on a path the
+        design does not name. Callers still reserve `out` for their
+        candidate count before the first release, and the append is a
+        `noexcept` move into reserved storage, so nothing that can throw
+        follows a release and the drop path is a backstop. The backstop is
+        **not conforming**: a carrier destroyed while a caller holds
+        `marked_set_mutex_` would destroy a final `mem_handle` and make a
+        blocking device call (`sycl::free`) under a listed lock, which
+        canon §12.5 forbids (canon:1612-1619 at e2461d4fb). Lock order is a
+        different property and does not excuse it. It is reachable only if
+        a caller breaks the collect-then-release rule, and gate clause 5
+        pins that rule, including that each collecting vector is declared
+        before its scope's lock statement, so an unwinding scope destroys
+        it after the unlock. The registry query of step 3 takes
+        `g_runtime_alloc_mutex` after the owner's release has dropped it,
+        and step 4's section is not nested under it. The carrier is never
+        destroyed under the pool's `mutex_`, since it leaves the pool's
+        scope in `out`. The destructor is `noexcept`;
+      - **the footprint and its window.** The footprint leaves
+        `total_allocated_` **only when the allocation is actually gone**
+        (§M88 (1); §M92), after the physical free, in step 4 or at a later
+        reconcile. A concurrent grow (`configure_zones`, `grow_zone`,
+        `allocate_segmented`) is therefore admitted (`pp:892`) only
+        against a footprint that still counts a chunk whose memory is not
+        yet freed, never against room that is not there (P4, plan ==
+        reality). The visible cost: for the duration of one free the chunk
+        is a tombstone and unmarked while its backing is still counted,
+        and a concurrent grow can be refused against the still-counted
+        chunk, returning false like any budget refusal, bounded by that
+        one free; after a registry refusal the bound is the scheduled
+        retry. The pool's lock is held across neither the free nor the
+        set's lock. This applies to the release path only; the pool's
+        destructor and `grow` still free or allocate under `mutex_`;
       - the `chunks_` entry stays as a tombstone (base null, size 0), so
         no other chunk's index moves: the indices in `flat_spans_`, in
         every `zone_chunk_state` and in the lease handles
@@ -2073,7 +2610,7 @@ created") describes a path that does not run.
         rebuilds the spans from `chunks_`, for example at `llama-bench`'s
         model switch), `pre_allocate`'s free-capacity sum (`pp:228-230`)
         and `allocate_segmented`'s search (`pp:176-181`). The destructor
-        already skips a null base (`pp:150`). The release also resets the
+        already skips a null base (`pp:141-162`). The release also resets the
         chunk's per-chunk `allocator`, so a loop that missed the rule
         fails on a null allocator instead of reporting capacity that does
         not exist;
@@ -2085,20 +2622,40 @@ created") describes a path that does not run.
         (`pp:389-417`: `zone_allocators_[z].clear()` and fresh
         `zone_chunk_state`s), so it presumes no live zone allocation, and
         a fresh state carries neither flag. The cache's
-        `configure_host_zones` (`uc:20415-20434`) first releases every
+        `configure_host_zones` (`uc:20415-20436`) first releases every
         chunk in the device's marked set whose allocators are empty. A
         chunk that is not empty is still withdrawn, and
         `configure_zones` **refuses the rebuild**: under its lock, before
         it touches any state, it scans the zones' `zone_chunk_state`s
         and, if any has `withdrawn` set, prints `[HOST-ARENA]
         configure_zones refused: chunk %zu still withdrawn, %zu B
-        allocated` (WARN) and returns false. C4 changes its return type
-        from `void` to `bool`; `configure_host_zones` returns without
-        writing `host_zone_reserved_bytes_` when it gets false. A refusal
-        therefore changes nothing: the pool's zones, every flag, the marked
-        set and the reserved figures stay one consistent state. The load
-        that asked for the reconfigure fails with that line and nothing
-        re-routes (P3).
+        allocated` (ERROR) and returns false. **The plumbing** (r12 M-6):
+        C4 changes both `configure_zones` and the cache's
+        `configure_host_zones` (`uc:20415`, `void` today) to return
+        `bool`. The bool is false **only** for this refusal. The scan is
+        the first thing `configure_zones` does, before the capacity growth
+        (`pp:318-328`) and the shortfall check (`pp:330-358`), so a false
+        return can never skip a zeroing that call owes. The capacity
+        shortfall keeps today's behaviour exactly: zones unconfigured,
+        every zone size 0, `configure_zones` returning true, and
+        `configure_host_zones` then zeroing the reserved figures
+        (`uc:20428-20430`) and returning true. `configure_host_zones`
+        keeps the two returns separate: on false from the pool it returns
+        false at once, before and without touching
+        `host_zone_reserved_bytes_` or reading `zones_configured()`; under
+        `ggml_sycl_strict_enabled()` (`uch:7259` at `d8a67422d`, added by
+        llama.cpp-uwlx after this doc's base) it first `GGML_ABORT`s with
+        the same line, since the refusal is a defensive invariant and not
+        a capacity outcome. A refusal therefore changes nothing: the
+        pool's zones, every flag, the marked set and the reserved figures
+        stay one consistent state. **Callers:** a caller that gets false
+        fails its load with that line and re-routes nothing (P3). No
+        production caller receives it today, and the doc claims no
+        production load failure: the one production caller, the void
+        `ggml_sycl_configure_host_zones_for_plan` (`gs:5615`), returns
+        before the call whenever zones are configured (`gs:5621-5623`);
+        a future caller must propagate the false rather than log "Zones
+        configured" with sizes the pool did not take.
         **Why refusing is the sound choice.** The flag's one home is the
         `zone_chunk_state` (above), so the scan reads the one fact and the
         cache's marked set is not consulted (P4). A rebuild would discard
@@ -2281,7 +2838,7 @@ created") describes a path that does not run.
       the retirement drains only when a retention epoch was published:
       `moe_graph_retention_retire_exact` returns true at once at epoch 0
       (`gs:96545-96548`), and a graph with `moe_segments` but no
-      `moe_dispatch_graphs` publishes none (`gs:97357-97359`). So not
+      `moe_dispatch_graphs` publishes none (`gs:97361`). So not
       every destruction site drains first (r11 m-7): the invalidate at
       `gs:107202` and the exit at `gs:97363` (below) do not. This replaces
       rev 3m's "unverified". So:
@@ -2302,10 +2859,32 @@ created") describes a path that does not run.
         (WARN) and `return false`, the caller's existing fallback (the
         disabled flag is already set). **The invariant: the handler, and
         the success path's move (`gs:97355-97356`), move into empty
-        vectors.** Neither destroys an old executable, and an old
-        executable is destroyed only by a successful retire or by the
-        cleanup step after the waits. The guard also repairs the success
-        path's same defect, which `gs:97355-97356` has today;
+        vectors.** Neither destroys an old executable. The guard also
+        repairs the success path's same defect, which `gs:97355-97356`
+        has today. **Where the kept executables are finally freed** (r12
+        M-1): after the guard's `return false` the caller (`gs:107214`)
+        retries `invalidate_moe_segments`, and a retry that succeeds
+        destroys them after its retire drained (a retire can only have
+        failed at epoch != 0, so a later success has waited the retention
+        terminals' streams, `gs:96551-96553`). If the retry fails too,
+        `moe_graphs_disabled` is sticky (nothing in the tree resets it
+        but the context's construction, `common.hpp:6114`) and gates the
+        graph path off (`gs:106423-106426`), so nothing **records** again
+        (the segmented block runs only under `use_sycl_graph`). Invalidation
+        still happens: the catch's cleanup step (below) and every
+        `sycl_exec_graph_clear_active` caller, which calls
+        `invalidate_moe_segments` (`gs:99565`; callers include `gs:15773`
+        at context drain, `gs:99579` at model teardown, `gs:105417` and
+        `:105558` at a phase change), each retry the retire. A retry that
+        succeeds destroys the executables after its drain; one that fails
+        keeps them, and they are freed in `~ggml_backend_sycl_context`
+        (`gs:43877`), which waits every queue of every device
+        (`gs:43880-43892`) before its own invalidate (`gs:43917`) and
+        before the member destructors run. **Every destruction point
+        drains.** So an old executable is destroyed only by a successful
+        retire after its drain (the caller's retry, the cleanup step's
+        invalidate, or a clear), by the cleanup step after the waits, or by
+        the context's destructor after its queue waits;
       - C4 wraps the record loop, after the two locals' declaration, in
         `try { ... } catch (...) { ...; throw; }`. The handler moves both
         locals into `sycl_ctx->moe_segments` and `moe_dispatch_graphs`
@@ -2330,8 +2909,10 @@ created") describes a path that does not run.
         drain but never calls `invalidate_moe_segments`. The moved
         executables then stay in the context, `moe_segments_valid` false,
         until the next record's invalidate (`gs:107202`), which runs after
-        those waits. That is safe and is the cost of not widening those
-        catches; the cleanup step below is the fallback-error path's;
+        those waits, or until the context's destructor, which waits every
+        queue first (`gs:43880-43892`). That is safe and is the cost of
+        not widening those catches; the cleanup step below is the
+        fallback-error path's;
       - no wait at the throw site: it would precede th32's cancel step;
       - `graph_compute`'s catch destroys them in its cleanup step (next
         bullet), after th32's cancel step and after its own waits.
@@ -2346,8 +2927,7 @@ created") describes a path that does not run.
       failed, and `invalidate_moe_segments` then runs a retire that is a
       no-op returning true at epoch 0 (`gs:96545-96548`), so the vectors
       clear without a drain. All three are pre-existing on master, out of
-      scope here, and tracked as **llama.cpp-7l45** (pre-existing; tracked
-      as llama.cpp-7l45); none is a 5efe fold. 5efe adds no path into any
+      scope here, and tracked as **llama.cpp-7l45**; none is a 5efe fold. 5efe adds no path into any
       of them: its six throw sites throw `ggml_sycl_fallback_error`,
       which the inner `std::exception` catch rethrows (it is not a
       `sycl::exception`, `common.hpp:94`).
@@ -2399,8 +2979,10 @@ created") describes a path that does not run.
       precede this step. The retirement is an extra drain when an epoch
       exists, not the safety argument. If retirement fails it keeps the
       vectors and sets the disabled flag rather than destroy an executable
-      whose submission may be outstanding (`common.hpp:6234-6238`), and
-      the next record's entry guard refuses to record over them. All of
+      whose submission may be outstanding (`common.hpp:6234-6238`). The
+      context then records no more (the disabled flag is sticky,
+      `gs:106423-106426`), and the vectors are freed as the entry guard's
+      bullet states. All of
       these waits run after th32's cancel step, and the leases and leaf
       staging are released only after the CPU drains (P2). A whole graph
       cached for another phase is dropped and re-recorded at its next
@@ -2840,15 +3422,10 @@ created") describes a path that does not run.
 - Host experts are all AOS, registered in place (`gs:33442-33462`), so
   `weight_host_bytes` = 0 and `host_cpu_owned_bytes` = 0. The host total is
   experts only: 61671 host tensors = 20557 groups x 3 (`run2.log:2824`).
-- `host_zone_weight_bytes = host_weights + host_compute_reserve +
-  layout_copies + tlsf_bound` (`placement_plan_host_weight_zone_terms()`).
-  Its walk counts the entries `weight_host_bytes` charges, those backed
-  `PINNED` or `HOST_CPU`
-  (`placement_plan::host_backing_sizes_weight_zone()`). Here that is none,
-  so host_weights is 0 and no host blocks remain: the zone is the 64 MiB
-  `host_compute_reserve` plus a TLSF bound of 0, and nothing else reaches
-  WEIGHT. So `[HOST-ARENA] configured zones: WEIGHT=` reads **64.0 MB**,
-  against 122924.2 MB in the baseline (`run2.log:2893`).
+- `host_zone_weight_bytes = 0 x 1.2 + k_host_runtime_reserve_bytes (64 MiB,
+  uc:27103)`, and nothing else reaches WEIGHT. So `[HOST-ARENA] configured
+  zones: WEIGHT=` reads **64.0 MB**, against 122924.2 MB in the baseline
+  (`run2.log:2893`).
 - **The pre-size is two pools, and the "Committed" line counts both**
   (`gs:5615-5688`). Run2's 68 chunks were 65 + 3 (`run2.log:2892`, `:2897`,
   `:2900`). Every figure here is on run2's vehicle, `llama-completion`
@@ -2884,17 +3461,15 @@ created") describes a path that does not run.
     With r2 m-2 missed, the DMA term still leaves SCRATCH, since addendum 11 (1)
     removes it by its own rule; it stays only in the runtime need.
 - **Falsifiers.**
-  - A WEIGHT zone above 64.0 MB must equal 64 MiB + the reordered-expert
-    bytes + their TLSF bound (one 256-byte grain per block), and the
-    `[HOST-PLAN]` line must print those terms. Otherwise the split missed an
-    accumulation site.
+  - A WEIGHT zone above 64.0 MB must equal 64 MiB + 1.2 x the reordered-expert
+    bytes, and the placement report must print that sum. Otherwise the split
+    missed an accumulation site.
   - A base working set other than 3579.2 MB (±0.2) names the zone that
     moved, from the `configured zones` line.
 - **Re-checked against the early-plan fix** (§F2a I-9 addendum 2).
   - The configured zones come from the late plan: `configured zones`
     (`:2893`) follows the late `Totals` (`:2821`) and equals
-    1.2 x 102383.5 + 64, the formula of the ratio in force for run2. The late
-    plan already excluded the table.
+    1.2 x 102383.5 + 64. The late plan already excluded the table.
   - What the record changes is the early plan (§3.1): the early STAGING
     `per_inflight` falls to about 1702 MB, and the early host total to
     102383.5 MB before the split.
@@ -3026,16 +3601,14 @@ lifts it into `host_ledger_budget()`.
   ineligible table is not in the set, and is mapped and prefetched as the
   ordinary weight it is.
 - **Three segment sets, one pure function** (r1 I-2, §F2; defined exactly per
-  r2 m-16). `file_mapping_segments(tensor_ranges, lazy_ranges, page, random_window)`
-  (four arguments as built, C3 review m6: `random_window` is `W` of the
-  edge-window row, from `file_mapping_random_window(read_ahead, page)`), where
+  r2 m-16). `file_mapping_segments(tensor_ranges, lazy_ranges, page)`, where
   `tensor_ranges` is the byte ranges of the tensors in this `SYCL_Mapped`
   buffer and `lazy_ranges` is `excluded_for_file(idx)`, returns:
 
   | set | definition | rounding | bound on lazy bytes |
   |---|---|---|---|
   | map segments | the union of `tensor_ranges`, each range rounded **outward** to pages, then merged. It is **not** a complement: bytes that belong to no tensor of this buffer are never mapped | outward, including at a lazy boundary (GGUF alignment is 32 B, so a lazy and a non-lazy tensor can share a page) | at most one page of lazy bytes mapped per lazy edge (the shared page) |
-  | `WILLNEED` segments | the host-executed subset of `tensor_ranges`, **merged across a gap shorter than a page that holds no lazy byte and no byte of a device-only tensor of this buffer** (GGUF pads tensors to 32 B, so consecutive host tensors usually leave a few bytes between them and the page they straddle would otherwise be advised and locked by no one; C3 review m4), each rounded **inward**, minus every page that holds a lazy byte | inward | 0 |
+  | `WILLNEED` segments | the host-executed subset of `tensor_ranges`, each rounded **inward**, minus every page that holds a lazy byte | inward | 0 |
   | lock segments | as `WILLNEED`, under `-lm mmap+mlock` only | inward | 0 |
   | `MADV_RANDOM` edge windows | for each lazy range, `[lazy_begin - W, lazy_begin)` and `[lazy_end, lazy_end + W)` intersected with the map segments, plus the shared pages | inward from each lazy boundary | n/a (advice only) |
 
@@ -3140,12 +3713,7 @@ lifts it into `host_ledger_budget()`.
     `llama_mlock::lock_range(offs, size)` instead, which locks the tensor's own
     range: outward to pages, except inward at any end whose page holds a
     record-deferred byte. `llama_mlock` records the ranges it has locked, and
-    `grow_to` remains only for whole-buffer locks (`mlock_bufs`). Both go
-    through one gap computation, so `grow_to(n)` after a `lock_range` locks
-    `[0, n)` minus what is already locked (it used to read the byte sum as a
-    prefix length); the ranges are kept sorted and merged by an ordered insert.
-    Locks end when the mapping is unmapped: `llama_mlock` never unlocks, so the
-    remembered ranges only dedupe.
+    `grow_to` remains only for whole-buffer locks (`mlock_bufs`).
   - Qwen is immune (its table is all of shard 3). DeepSeek's layouts are
     exposed (Q3_K_M shard 2; Q2_K shards 1 and 4), which is why both lock REDs
     put a lazy range before a locked range.
@@ -3214,17 +3782,6 @@ lifts it into `host_ledger_budget()`.
     - Each has a **control twin** with no edge advice, which must read
       resident pages in the edge band. This shows the arm could fail.
     - A mutant that advises only the segment tail fails arm 6.
-  - **Arm 7 (`WILLNEED` reaches the whole segment; C3 review M1).** Map the
-    plan, advise its `WILLNEED` segments, and poll up to 10 s: **every** host
-    segment must read at least 95 % resident. Arms 1 and 2 only read the
-    interior as 0, so they would pass if the advice never ran; arm 3 stops at
-    "some pages". Two mutants advise the same segments in one call and in 1 MiB
-    chunks and must read **below** 95 %; on a host whose per-call cap does not
-    stop one of them the arm exits 77 instead of passing, since it then cannot
-    discriminate. Every advice status in this test is checked: a refused advice
-    fails its arm. `evict()` retries for a few seconds (readahead the previous
-    arm started can land late) and requires the interior to read 0 first; the
-    edge arms read their band before the fault.
   - **Arm 4 (synchronous positive control) runs last**, on its own freshly
     evicted fixture. `pread` 1 MiB inside the interior, then the probe over
     that MiB must read resident. There is no polling and no `WILLNEED` race.
@@ -3252,10 +3809,6 @@ lifts it into `host_ledger_budget()`.
     range through `llama_mlock::lock_range`; the interior must read 0. The
     mutant is `grow_to`, the whole-prefix lock, which must read resident. The
     test exits 77 if `RLIMIT_MEMLOCK` is below the fixture size.
-    Four small cases over a 16-page anonymous mapping read the kernel's
-    per-VMA `VM_LOCKED` flag, one character per page: two neighbours sharing a
-    non-lazy page, a lazy range at offset 0, a tensor ending on a page boundary
-    against a lazy range, and `grow_to` after `lock_range`.
   - **On Qwen** the lead gate is `fincore` on shard 3, which holds only the
     table (§2.5), against the bound pre-registered in §7 C4.
 
@@ -3276,10 +3829,9 @@ lifts it into `host_ledger_budget()`.
     today) moves out of step 2 into `host_mapped_bytes` under `-lm mmap`.
     Under `-lm mmap+mlock` it stays.
   - "Other host weights (`token_embd`)" moves the same way.
-  - The WEIGHT zone term shrinks to the reordered experts' exact bytes plus
-    rnh3's named terms: the 64 MiB `host_compute_reserve` and the TLSF bound.
-    Non-weight host requests move to SCRATCH (§4.4). For Qwen the WEIGHT zone
-    is 64.0 MB (§4.4).
+  - The WEIGHT zone term shrinks to 1.2 x the reordered experts, plus rnh3's
+    named terms, plus the 64 MiB reserve. Non-weight host requests move to
+    SCRATCH (§4.4). For Qwen the WEIGHT zone is 64.0 MB (§4.4).
   - Every "`MemAvailable_pre` needed" row drops by the moved bytes.
     - For Qwen after (s), a HOST table would need about
       180.9 - 99.3 = 81.6 GiB of `MemAvailable_pre` for step 2 plus the table,
@@ -3686,14 +4238,10 @@ The lead's GPU runs share one protocol (r1 I-7):
     remove it. **C4 amends that clause** to the narrowed form of §4.3
     (r2 m-8).
 - **The record** lands in C1, with these host-only tests (`host;lazy`,
-  `tests/`, libllama only, no device). A host test drives three pure
-  functions without a device:
-  - the AUTO resolver, `llama_lazy_auto_enabled(caps, n)`
-    (`src/llama-lazy-mode.h`): AUTO falls to `OFF` when a device has no
-    mmap support and does not own placement. The merge onto master
-    replaced the `llama_lazy_mode_resolve(mode, caps)` this design
-    factored out with master's resolver, which the loader's AUTO block
-    calls;
+  `tests/`, libllama only, no device). C1 factors three pure functions out of
+  `load_tensors` so that a host test can drive them without a device:
+  - `llama_lazy_mode_resolve(mode, caps)`: the moved fallback block, over a
+    list of device caps;
   - the pre-fill: (declaration, `weights_map`, `hparams`, `mode_pre`,
     `mode_post`, `taker`, `SUPPORTED`) to a record;
   - the early plan's inventory filter.
@@ -3719,11 +4267,10 @@ The lead's GPU runs share one protocol (r1 I-7):
       - `deferral != EAGER` iff `lazy_eligible`, asserted on every row of
         every cell.
     - **The required witness** (addendum 4). With `AUTO`, a caps list holding
-      one device with `mmap_support = false` that does not own placement,
-      and `taker`, the sparse row's bit is set, its `deferral` is `STORAGE`,
-      and the early plan's filter excludes it. `llama_lazy_auto_enabled`
-      does turn `mode_post` to `OFF` for that device, which is what makes
-      this cell discriminate. **RED mutant:** the fill
+      one device with `mmap_support = false`, and `taker`, the sparse row's
+      bit is set, its `deferral` is `STORAGE`, and the early plan's filter
+      excludes it. `llama_lazy_mode_resolve` does turn `mode_post` to `OFF`,
+      which is what makes this cell discriminate. **RED mutant:** the fill
       reads `mode_post` for the taker (a post-fallback fill). The bit is then
       clear and the filter includes the table.
     - **The `-ngl 0` witness** (addendum 5). A SYCL-registered load whose
@@ -3841,8 +4388,7 @@ The lead's GPU runs share one protocol (r1 I-7):
       a constant `true` wherever `_POSIX_MEMLOCK_RANGE` or `_WIN32` is
       defined (`src/llama-mmap.cpp:711-715`), so on Linux and Windows no
       runtime test can tell either mutant from GREEN;
-    - `mode_pre` is captured before the AUTO block calls
-      `llama_lazy_auto_enabled`, and
+    - `mode_pre` is captured before the call to `llama_lazy_mode_resolve`, and
       the pre-fill runs after the guard and before
       `llama_model_sycl_compute_early_plan`;
     - `create_tensor`'s `TENSOR_READ_LAZY` branch checks the record and does
@@ -4031,9 +4577,10 @@ I-5, §F2). It is the commit that changes every SYCL load.
       and `RETURN` on both loss paths. The begin entry follows each
       scheduler creation. The pinned pool frees a chunk only in its
       destructor and in `release_zone_chunk`, and `release_zone_chunk` is
-      reached only from the begin entry, the returns (for an empty chunk;
-      r10 m-3) and the owner's end (`ggml_backend_sycl_free` and an
-      orphaned chunk's emptying free; r9 m-5). The gate also pins the
+      reached only from `release_marked_chunk`, whose callers are the
+      begin entry, the returns (for an empty chunk; r10 m-3), the owner's
+      end (`ggml_backend_sycl_free` and an orphaned chunk's emptying free;
+      r9 m-5) and `configure_host_zones` (r13 M-4). The gate also pins the
       wiring positively (r10 m-5): `ggml_backend_sycl_free` calls the
       owner-end step before `delete sycl_ctx` (`gs:84119`), and
       `sched_reserve` calls `RETURN` on its own transaction's throw path
@@ -4044,6 +4591,223 @@ I-5, §F2). It is the commit that changes every SYCL load.
       m-3), and only on the flag's false-to-true transition (r10 m-4).
       `sched_reserve` calls `MARK` before its measure and `RETURN_TO_MARK`
       before the pipeline-parallel retry (r9 n-6).
+    - **The lock-order gate** (r13 M-2; r14 I-1, M-6; r15 I-1, M-2;
+      §M81 (c)). `test-sycl-marked-set-lock-order-gate` is a pure-Python
+      source gate that allocates nothing, registered `sycl;host;source-contract`
+      like its sibling `test-sycl-mmap-support-caps-source`. It checks the
+      scopes of the listed bodies only, and does not claim that callers
+      hold no lock. In the bodies of the begin entry, `RETURN` and
+      `RETURN_TO_MARK`'s filing and immediate release, the owner-end walk,
+      `release_marked_chunk` and its `_locked` core, `release_zone_chunk`,
+      `release_chunk_backing`, `host_release_chunk_lease`,
+      `release_chunk_lease`, `free_chunk_owner`, the `released_chunk` destructor,
+      `footprint_locked`, `reconcile_stranded_locked`,
+      `unified_allocation_registered_exact`, `grow_into`,
+      `~pinned_chunk_pool`, `configure_host_zones`'s release and
+      `marked_entries`, it pins twelve clauses, each with at least one
+      **planted control** in the gate's
+      own fixtures; each fixture must make the gate fail with its quoted
+      reason, except the one marked a negative control, which must pass,
+      and the correct tree must pass:
+      1. every access to the marked set sits in a scope holding
+         `marked_set_mutex_` (the core's body has no lock statement; its
+         calls are checked by clause 7). Control: `marked_entries` reading
+         the set with no lock (`marked set access outside
+         marked_set_mutex_`);
+      2. that lock is taken before any pool call. Control: a pool call
+         before the lock (`pool call before marked_set_mutex_`);
+      3. no function that holds the pool's `mutex_` calls
+         `release_marked_chunk` or names `marked_set_mutex_`. Control: a
+         pool function that does (`pool mutex_ held across
+         release_marked_chunk`);
+      4. no lock named in canon §12.5's table, or `deferred_frees_mutex_`,
+         is named inside a scope holding either lock, other than the pool's
+         `mutex_` inside `marked_set_mutex_`. The gate reads the table from
+         the canon file and adds `deferred_frees_mutex_` to its list by
+         name (r15 M-2 (c)), because that lock is held around owner
+         releases (`uc:12667`) and taken by the enqueue paths
+         (`uc:12453-12557`) and is not in the table until C4's census
+         commit adds it; afterwards the two lists coincide. Controls:
+         `rw_mutex_` named inside the `marked_set_mutex_` scope (`census
+         lock rw_mutex_ under marked_set_mutex_`), and
+         `deferred_frees_mutex_` named there (`census lock
+         deferred_frees_mutex_ under marked_set_mutex_`);
+      5. `release_chunk_backing` is called only outside both scopes, in
+         the cache-side bodies and in the collected-vector release loop of
+         the begin's, owner-end's, `RETURN`'s and `configure_host_zones`'s
+         walk, which sits after its scope's closing brace, and each of
+         those collecting vectors is declared before its scope's lock
+         statement, so an unwinding scope destroys it after the unlock (r16
+         M-1). The public form's inline `released_chunk` slot has the same
+         duty (r19 N-1): it is declared before the lock statement, and its
+         carrier is destroyed after the unlock by its destructor (no
+         `release_chunk_backing` call is involved, so the controls below
+         that name that call cannot see it). The cache-side bodies cannot
+         name the pool's private
+         `free_chunk_owner`, so the controls name what they can:
+         `release_chunk_backing` called inside the `marked_set_mutex_`
+         scope (`backing release under
+         marked_set_mutex_`); the begin's collected-vector loop moved inside
+         its locked scope (`collected backings released under
+         marked_set_mutex_`); `release_chunk_backing` called in a pool
+         body that holds `mutex_` (`backing release under pool mutex_`);
+         a collecting vector declared inside the lock's scope
+         (`collected vector declared inside the marked_set_mutex_
+         scope`); and the public form's slot declared inside its scope
+         (`released_chunk slot declared inside the marked_set_mutex_
+         scope`);
+      6. `configure_host_zones` reads `ggml_sycl_strict_enabled()` between
+         the pool's false and its return. Control: a copy without the read
+         (`configure_host_zones returns the refusal without the strict
+         read`);
+      7. the call forms (r15 M-2 (a); r18 M-1): every call of
+         `release_marked_chunk_locked` sits in a scope holding
+         `marked_set_mutex_`, and no call of the public
+         `release_marked_chunk` does (a self-deadlock on the non-recursive
+         lock); the public form's body is the only body that takes the lock
+         and then calls the core; and `host_release_chunk_lease` calls the
+         public form, never the core, and the lease-drop path contains no
+         allocation. The path is every frame the drop runs through (r19
+         M-1; r20 M-1; §M110): `host_release_chunk_lease`,
+         `release_chunk_lease`, the public `release_marked_chunk`, the
+         single-slot overload of `release_marked_chunk_locked`,
+         `release_zone_chunk` (shared with the walks, so the ban costs them
+         nothing), the `released_chunk` destructor, and the two frames the
+         destructor calls, `free_chunk_owner` (`pp:778-791`) and
+         `unified_allocation_registered_exact`. The frames above
+         `host_release_chunk_lease` (`release_lease_state` and
+         `get_existing_unified_cache_for_device`) are unchanged by C4 and
+         are outside the gate. None of those bodies contains `reserve`,
+         `resize`, `push_back` or a vector declaration, detected by the
+         type token `vector<` (a reference such as `auto & vec` at
+         `pp:1057` is not one). The single-slot overload is selected by
+         signature: the name `release_marked_chunk_locked` whose out
+         parameter is a `released_chunk` with exactly one `&`, never `&&`
+         (`release_chunk_backing`'s `released_chunk &&` and
+         `release_zone_chunk`'s own out parameter must not match it);
+         the vector overload necessarily appends to its caller's vector and
+         is exempt from the ban. Controls:
+         the begin's walk calling the public form inside its scope
+         (`release_marked_chunk called under marked_set_mutex_`); a core
+         call outside any scope (`release_marked_chunk_locked called
+         without marked_set_mutex_`); `host_release_chunk_lease` calling
+         the core (`lease drop calls release_marked_chunk_locked`); and a
+         `reserve` in the public form (`lease-drop path allocates`); the
+         single-slot overload written as a wrapper over the vector core,
+         `std::vector<released_chunk> v; v.reserve(1);` (`single-slot core
+         overload builds a vector`, reason `lease-drop path allocates`);
+         and the same two lines in `release_zone_chunk`, in
+         `release_chunk_lease`, in `free_chunk_owner` and in
+         `unified_allocation_registered_exact` (`lease-drop path
+         allocates`);
+      8. the carrier's destructor (r15 I-1 (4); §M88 (1); §M92) takes the
+         metadata the carrier holds, calls `free_chunk_owner`, calls
+         `unified_allocation_registered_exact`, and then, under the pool's
+         `mutex_`, subtracts `total_allocated_` only on the branch where
+         the answer is GONE and appends to `stranded_`, without
+         subtracting, on the other; it never names
+         `ggml_sycl_strict_enabled`; and no other body writes
+         `total_allocated_` for a release except
+         `reconcile_stranded_locked` (`release_zone_chunk` and
+         `release_chunk_backing` contain no such write). Controls: a
+         destructor with the subtraction removed (`released_chunk
+         destructor does not subtract the footprint`); `release_zone_chunk`
+         subtracting (`footprint subtracted outside the released_chunk
+         destructor`); the subtraction with no registry query
+         (`released_chunk destructor subtracts without the registry
+         query`); the subtraction on the registered branch (`released_chunk
+         destructor subtracts on the registered branch`); the kept branch
+         without the append (`released_chunk kept branch does not strand
+         the footprint`); the strict abort restored on the kept path
+         (`released_chunk destructor names ggml_sycl_strict_enabled`); and
+         a WARN format string that names a cause, any of retry, scheduled,
+         leak or ownerless (`released_chunk WARN names a cause`, §M97);
+      9. the accessor `unified_allocation_registered_exact` (r16 M-3): its
+         body holds exactly one lock statement, on `g_runtime_alloc_mutex`,
+         compares `key()` as well as `ptr`, and writes nothing in the
+         registry (no `erase`, `emplace`, `operator[]` or assignment
+         through the found row). Controls: a ptr-only compare (`accessor
+         compares ptr only`) and a body that erases (`accessor writes the
+         registry`);
+      10. the reconcile (§M92; r17 I-1; r18 M-2; r20 M-2): the gate
+          matches the **comment-stripped** source of the `pinned-pool.cpp`
+          bodies, so `configure_zones`'s comment that quotes the budget test
+          (`pp:334-335`) is not a mention. The allow-list is **per
+          mention**, not per body, and each entry is recorded as body,
+          ordinal and statement kind, the ordinal counting **every**
+          mention of `total_allocated_` in that body in source order,
+          exempt or not (r20 N-2). On the correct tree it holds exactly:
+          `footprint_locked`, one, its return; `reconcile_stranded_locked`,
+          one, its subtraction; the carrier destructor, one, its
+          subtraction; `grow_into`, four, ordinals 1, 3 and 4 the log reads
+          (`pp:894`, `:971`, `:988`) and ordinal 2 the `+=` commit
+          (`pp:967`); `~pinned_chunk_pool`, one, the reset
+          `total_allocated_ = 0` (`pp:163`). The one exemption beyond those
+          is mechanical: a mention is exempt only as the numerator of a
+          division inside the argument list of a `GGML_LOG_*` call, the
+          form of every existing log read (`pp:256`, `:352`, `:666`,
+          `:814`, `:829`, `:835`, `:894`, `:971`, `:988`). Anything else, a
+          comparison, a local copy or a write, is outside the allow-list.
+          The gate asserts that these nine are the **only** exempt
+          mentions and that the five allow-listed mentions are the only
+          others, so a tenth log read, a lost one, or a second mention in
+          an allowed body (`grow_into` re-reading the member at
+          `pp:892`) fails it by name. It also asserts a **positive
+          presence**: each of the seven decision bodies contains a call of
+          `footprint_locked()` (`allocate_segmented`, `pre_allocate`,
+          `configure_zones`, `grow_zone`, `allocate_from_chunks`,
+          `grow_into`, `allocated()`), which is what makes dropping the
+          reconcile from a body red. `footprint_locked`
+          calls `reconcile_stranded_locked` before it returns, and that
+          function subtracts an entry's bytes only where
+          `unified_allocation_registered_exact` answers GONE. One planted
+          control per body, each dropping the reconcile from that body:
+          `allocate_segmented`, `pre_allocate`, `configure_zones`,
+          `grow_zone`, `allocate_from_chunks`, `grow_into` and
+          `allocated()` (`<body> does not call footprint_locked`; for
+          `grow_into` the mutant re-reads `total_allocated_ +
+          backing_size > budget_` at `pp:892`, and fails on the presence
+          check and on the per-mention count); the helper itself returning the
+          member
+          without the reconcile (`footprint_locked returns total_allocated_
+          without reconcile_stranded_locked`); a local copy in `grow_zone`
+          (`grow_zone reads total_allocated_ outside a log call`); a
+          write to the member in a decision body (`total_allocated_
+          written outside the allow-list`); a tenth exempt-form log read
+          (`exempt log mentions are not exactly nine`); a second
+          mention in an allowed body (`allow-listed mention count
+          differs`); a **negative control**, which must pass: a comment
+          that quotes the member must not make the gate fail with
+          `comment mention flagged`; and a prune with no registry query
+          (`stranded prune without registry query`);
+      11. the reserve and the bound (r17 M-1, M-2, M-3; r18 N-1, N-4):
+          `grow_into` reserves `stranded_` after its budget check and
+          before it allocates the chunk owner, sized by the chunk count
+          (`chunks_.size()` and `runtime_chunks_.size()`, never a
+          constant), and returns false on a failed reserve; the carrier's
+          destructor asserts `size < capacity` before its append, with the
+          message `stranded_ capacity %zu exhausted at %zu entries`, and
+          the append is an `emplace_back` into reserved storage and nothing
+          else; and the reconcile prunes in place. Controls: `grow_into`
+          with no reserve (`chunk added without stranded reserve`); a
+          constant reserve (`stranded reserve not sized by the chunk
+          count`); a reserve after the owner allocation (`stranded reserve
+          after the owner allocation`); the assertion missing or after the
+          append (`capacity assertion missing or after the append`); a
+          destructor that reserves (`released_chunk destructor
+          allocates`); a reserve whose `bad_alloc` is not caught and mapped
+          to `return false`, which on the synchronous path would escape
+          because only `sycl::exception` is caught there (`stranded reserve
+          without bad_alloc catch`); and a reconcile that rebuilds the list
+          (`reconcile rebuilds stranded_`);
+      12. the carrier count (r17 M-5; r18 N-3): `~pinned_chunk_pool`'s
+          first statement asserts that no owning carrier is outstanding,
+          before its `lock_guard` and the free loops (`pp:141-146`), and the
+          carrier destructor's count decrement is its last statement.
+          Controls: the assertion placed after the free loop (`carrier
+          assertion after the free loop`); the assertion absent (`carrier
+          assertion absent`); and the decrement before step 4 (`carrier
+          count lowered before the footprint section`).
     - The pools' gate calls `ggml_sycl_moe_plan_has_host_experts`, and the
       plan walk never calls `ggml_backend_buffer_is_host` (r7 I-2).
     - The helper **throws `ggml_sycl_fallback_error`** at each of the six
@@ -4097,10 +4861,8 @@ I-5, §F2). It is the commit that changes every SYCL load.
     - `runtime_bytes` in `ggml_sycl_configure_host_zones_for_plan` names
       neither `pp_pipeline_scratch_bytes` nor `pp_moe_onednn_scratch_bytes`
       (r3 m3).
-    - The inventory carries the indexer width per layer, as master's
-      `kv_idx_k_width_per_layer` (the merge onto master replaced this
-      design's scalar `kv_idx_width` with it), and both demotion sites read
-      `kv_demand_for_layer` (r3 B).
+    - The inventory's `kv_idx_width` is declared after `kv_layer_count`,
+      and both demotion sites read `kv_demand_for_layer` (r3 B).
     - The notify takes an opaque backend handle plus scalars and returns
       `bool`: no other pointer and no struct in its signature, in either the
       header or the `llama_context` function pointer type (the dlopen
@@ -4392,8 +5154,25 @@ I-5, §F2). It is the commit that changes every SYCL load.
       which counts the CPU and `SYCL_Host` K nodes and misses the view
       (`NULL` buffer); the helper's device for every slot, which leaves
       device 1's slots unplanned.
-  - RED `test-sycl-scratch-trial-return` (`sycl;host`; §M75). A host
-    fixture: the fixture cache's pinned pool with its chunk size set to 64
+  - RED `test-sycl-scratch-trial-return` (`sycl;cache;mem-handle`,
+    `level_zero:1`, lead-run; §M75; r14 M-8 (c); r15 M-4, M-5; §M88 (2)). Its
+    pinned chunks come from `unified_allocate_owner_backing` on a real
+    queue (`pp:84-113`), so it touches a device and is registered,
+    labelled and pinned like the device REDs, and form 2 excludes it. The
+    registration sets `ONEAPI_DEVICE_SELECTOR=level_zero:1` through the
+    ctest `ENVIRONMENT` property (one pool on one queue), so it does not
+    see the iGPU. **Build and link** (r15 M-5): a private-fixtures test,
+    like `test-unified-cache-bugs` (`GGML_SYCL_PRIVATE_TESTING=1` and
+    `target_link_libraries(... PRIVATE ggml-sycl-private-fixtures)`,
+    `ggml/src/ggml-sycl/CMakeLists.txt:2242-2244` at e2461d4fb), and
+    never linked with libllama (§M82: the private fixtures embed their own
+    backend objects and must not be mixed with an ordinary libggml). It
+    drives the pool, the device cache and the trial entry points
+    directly, with no model load, so §M82 case (2) applies, not the
+    compile-time mutation case (3): the pinned pool's release path, the
+    guard it scores, is reachable at backend level. There is no
+    new link recipe and no second backend build. The fixture is the
+    fixture cache's pinned pool with its chunk size set to 64
     MiB (`GGML_SYCL_PINNED_CHUNK_MB=64`, read by `resolve_chunk_size`,
     `pinned-pool.cpp:49-63`), SCRATCH configured at 64 MiB, and a plan
     term `host_zone_scratch_bytes` of 0, so the ensure target is the sum
@@ -4458,11 +5237,23 @@ I-5, §F2). It is the commit that changes every SYCL load.
       reserve follows. A second context's begin on the device then leaves
       the chunk and prints no `SCRATCH return refused` line; the chunk is
       still withdrawn, and capacity still excludes it;
-    - **configure over a withdrawn chunk** (r11 m-6): in the same state,
-      `configure_host_zones` with new sizes refuses by name and returns
-      false; capacity, `chunk_count`, the chunk's `withdrawn` flag, the
-      marked set and `host_zone_reserved_bytes_` read as before the call.
-      After the stand-in's free and a begin, the same call succeeds;
+    - **configure over a withdrawn chunk** (r11 m-6; r13 M-4, M-5): these
+      checks run in the plain child of `test-sycl-configure-refusal`
+      (below), not in this test, because they need the strict variable
+      absent from the process environment and the accessor latches it.
+      In the same state as the runtime throw, `configure_host_zones` with
+      new sizes refuses by name and returns false; capacity,
+      `chunk_count`, the chunk's `withdrawn` flag, the marked set and
+      `host_zone_reserved_bytes_` read as before the call. After the
+      stand-in's free and a begin, the same call, with sizes that fit the
+      capacity left once the chunk is released, succeeds. **configure's own
+      release**: in a second run, a marked chunk that is already empty when
+      `configure_host_zones` runs is released by it, the `released` line
+      prints and the marked set is empty after. A **shortfall control**
+      runs after that success call has configured the zones (otherwise it
+      is a fixture error, since the scan would return false first): sizes
+      above the capacity the pool can grow to return true as today, with
+      zones unconfigured and the reserved figures zeroed (r12 M-6);
     - **the retry's truncation** (r10 m-4): `MARK`, one chunk grown (A)
       with a stand-in live in it, `RETURN_TO_MARK`, then one more chunk
       grown (B). Right after `RETURN_TO_MARK` the transaction holds 0
@@ -4516,14 +5307,110 @@ I-5, §F2). It is the commit that changes every SYCL load.
     - **Release only at a begin** (r10 m-3): the empty-return case fails
       with `chunk_count <n+1> right after RETURN, expected <n>: empty
       returned chunk <idx> not released`.
+    - **The footprint leaves with the memory** (r14 M-3; r15 I-1, M-5): a
+      test-only seam in the carrier's destructor, compiled only under
+      `GGML_SYCL_PRIVATE_TESTING` (the same guard as the hold at
+      `uc:16415-16421`, so it is absent from the shipped libggml-sycl),
+      samples `allocated()` **after `free_chunk_owner` returns and before
+      the registry query and the last section**, the instant of "freed but
+      still counted". The
+      case reads it during an empty return's release: it still includes
+      the chunk's backing size, and after the release completes it is back
+      to the pre-reserve value. Mutant: the backing size subtracted in
+      `release_zone_chunk`, before the free; it fails with `allocated()
+      <x> MiB at the free point, expected <x+b> MiB: footprint decremented
+      before the free`.
+    - **A dropped carrier** (r15 I-1): the fixture calls
+      `release_zone_chunk` on an empty withdrawn chunk and lets the
+      `released_chunk` leave scope without `release_chunk_backing`, as an
+      early return or a failed append in a caller would. The seam fires
+      once, `allocated()` is back to the pre-reserve value, and nothing
+      aborts. Mutant: a destructor that does nothing, which leaves the
+      footprint over-counted; it fails with `allocated() <x> MiB after a
+      dropped released_chunk, expected <x-b> MiB: footprint leaked by a
+      dropped carrier`. A second mutant has the moved-from carrier's
+      destructor release again; a chunk consumed by
+      `release_chunk_backing` then fails with `allocated() <y> MiB after
+      release_chunk_backing, expected <x-b> MiB: footprint subtracted
+      twice`.
+    - **A registry-refused free is stranded, then reconciled** (§M88 (1);
+      §M92; r16 M-5, M-6). The arm's entry check exits 77 if
+      `GGML_SYCL_STRICT_LEASES` is set: the registry's own strict
+      classification could abort the held row, which would read as a mutant
+      failure. The fixture holds the chunk's registry row through two new
+      `GGML_SYCL_PRIVATE_TESTING` hooks:
+      `allocation_registry_test_hold_physical_release(metadata)`, which
+      sets the row's `test_no_physical_release` and takes one exact test
+      lease (`uc:16420`, `:16518`, `:16555`), and its inverse
+      `allocation_registry_test_unhold_physical_release(metadata)`, which
+      drops that lease (`uc:16559-16565`) and clears the flag. With the hold
+      the release is refused, the row returns to LIVE (`uc:16425-16438`) and
+      the registry schedules a retry (`uc:983-993`). Then:
+      - right after the empty return's release, `allocated()` still
+        includes the chunk's backing size, `stranded_` holds one entry (a
+        test accessor), and the line `release not yet complete after the owner
+        reset (registry row LIVE)` has printed exactly once; nothing
+        aborts;
+      - a second `allocated()` call, still held, reads the same (the
+        reconcile finds the row and prunes nothing) and prints no further
+        line;
+      - the fixture unholds and calls the owner's release coordinator's
+        `process_retries()` (`uc:1031-1056`), which frees the row; its
+        `retry_count()` reads 0 (`uc:953-957`), so nothing stays on the
+        retry list;
+      - the next `allocated()` reads the pre-release value less the chunk's
+        backing size, and `stranded_` is empty.
+
+      Mutants, each with one fault: no prune, which fails with `allocated()
+      <x> MiB after the retry completed, expected <x-b> MiB: stranded
+      footprint never reconciled`; a prune without the query, which fails
+      with `allocated() <x-b> MiB at the first reconcile while the
+      allocation is still registered, expected <x> MiB`; and the subtraction
+      made at the refusal, which fails with `allocated() <x-b> MiB after a
+      refused free, expected <x> MiB: footprint left while the allocation
+      is still registered`.
+    - **Teardown reports a stranded entry** (§M92): a second run holds
+      the row, releases the chunk, and destroys the pool with the hold
+      still in place; the destructor prints `stranded chunk backing <b>
+      MiB still registered at pool destruction`. The fixture then unholds
+      and calls `process_retries()`. Mutant: the destructor without the
+      report, which fails with `no teardown line for the stranded entry`.
+    - **The accessor compares the key** (r16 M-3): the fixture publishes
+      a row with `allocation_registry_test_publish` (`uc:16511-16518`);
+      `unified_allocation_registered_exact` answers true for its metadata,
+      false for the same `ptr` with a different id, and false for an absent
+      row, and `allocation_registry_test_size()` is unchanged after the
+      three calls. Mutant: a ptr-only compare, which fails with
+      `registered_exact answered true for ptr <p> with id <j>, the row
+      holds id <i>`. The published row answers LIVE. The fixture removes
+      the row at the end with `allocation_registry_test_erase`
+      (`uch:6073`), so the registry is left as it was found (r17 N-5).
+    - **More than eight chunks strand** (r17 M-2): the fixture grows nine
+      64 MiB chunks (576 MiB of host pinned memory), holds and releases
+      every one, and asserts that all nine strand with no abort and that
+      `stranded_.size()` equals nine, a literal and not a figure read back
+      from the pool's own chunk count. It then unholds every
+      row, calls `process_retries()`, and `allocated()` drops all nine.
+      Mutant: `reserve(8)`, which stops at the named assertion
+      `stranded_ capacity <c> exhausted at <n> entries` before the abort;
+      the lead-run script scores that line from the log.
+    - **The status order** (r18 N-6): the owning context's begin on a
+      chunk that is both live and leased prints `SCRATCH return refused
+      dev chunk reason=live` (a live allocation is checked before a lease;
+      with `orphan_if_live` both end in ORPHANED, so only a non-orphan call
+      makes the order observable). Mutant: the lease checked first, which
+      fails with `reason=lease` for a chunk that holds a live allocation.
     - **A begin refuses any owner's chunk** (r10 m-3): the runtime-throw
       case fails on the second context's `SCRATCH return refused dev=0
       chunk=<idx>` line.
     - **`RETURN_TO_MARK` mutants** (r10 m-4, r11 m-4), each with one
       fault, none depending on a second fault the design's own rules
-      forbid. The host fixture reads the transaction's chunk count and
+      forbid. The fixture reads the transaction's chunk count and
       each chunk's marked-set entry count (`marked_entries(dev,
-      chunk_idx)`) through test accessors:
+      chunk_idx)`) through test accessors. The RED evaluates every
+      ending and prints every failing check rather than stopping at the
+      first, and the marked set stores (chunk, owner) entries with no
+      dedupe at insertion, so a second filing is observable (r12 N-4):
       - (i) *chunks left in the set only* (the transition guard and the
         `KEEP` rule intact): right after `RETURN_TO_MARK` the transaction
         still holds A, and the test fails first with `transaction holds
@@ -4536,8 +5423,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
         A twice and fails with `SCRATCH capacity <wrapped> MiB exceeds the
         pool's allocated() <x> MiB`. It carries two faults by
         construction, and is named so;
-      - (iii) *`KEEP` clears the withdrawn flag*: the `KEEP` ending
-        un-withdraws A, which no begin then releases, and fails with
+      - (iii) *`KEEP` walks the device's marked set and clears
+        `withdrawn` on every chunk in it* (r12 M-4), with the
+        transaction's truncation intact: B is the transaction's only
+        chunk, but the walk reaches A through the marked set. The `KEEP`
+        ending un-withdraws A, which no begin's release can then free
+        (`release_zone_chunk` requires the flag), and fails with
         `chunk_count <n+2> after the begin, expected <n+1>`.
     - **A release leaves no marked-set entry** (r11 m-5): after the empty
       return's release, the cache-path window's begin release and the
@@ -4546,10 +5437,66 @@ I-5, §F2). It is the commit that changes every SYCL load.
       and moves no chunk. Mutant: `release_marked_chunk` not erasing the
       entry. It fails with `marked set holds <n> entry(ies) after the
       release of chunk <idx>, expected 0`.
-    - **Configure over a withdrawn chunk** (r11 m-6) mutant:
-      `configure_zones` rebuilds anyway. It fails with `configure_zones
+    - **Configure over a withdrawn chunk** (r11 m-6) mutants:
+      `configure_zones` rebuilds anyway, which fails with `configure_zones
       rebuilt over withdrawn chunk <idx>: capacity <c> after, <c0>
-      before, marked set holds <n>`.
+      before, marked set holds <n>`; and `configure_host_zones` calling
+      `release_zone_chunk` directly, leaving the entry behind, which fails
+      configure's own-release run with `marked set holds <n> entry(ies)
+      after the release of chunk <idx>, expected 0` (r13 M-4).
+    - **The refusal's two arms** (r13 M-5; r14 M-8; §M81 (e)). RED
+      `test-sycl-configure-refusal` (`sycl;cache;mem-handle`, lead-run). Its
+      children build a unified cache and a pinned pool, whose chunks come
+      from `unified_allocate_owner_backing` on a real queue (`pp:84-113`),
+      so they touch a device: the test carries the `cache;mem-handle`
+      labels, which form 2 excludes, and its registration sets
+      `ONEAPI_DEVICE_SELECTOR=level_zero:1` through the ctest
+      `ENVIRONMENT` property (§M88 (2): one pool on one queue, like every
+      other 5efe device RED). It is a private-fixtures test too (r16 M-6):
+      it reads `marked_entries`, a `GGML_SYCL_PRIVATE_TESTING` accessor, so
+      it is built and linked like `test-sycl-scratch-trial-return` above
+      (`ggml-sycl-private-fixtures`, never libllama, §M82 case (2)). The
+      parent is a driver that never touches a device. It spawns its own
+      binary three times with `fork` and `execve`, giving each child its
+      environment through the **`envp` argument**, built as a copy of the
+      driver's own `environ` (which carries the
+      registration's `ONEAPI_DEVICE_SELECTOR` and `LD_LIBRARY_PATH`) with
+      `GGML_SYCL_STRICT_LEASES=1` set for the strict child and the
+      variable erased for the plain child (r15 M-4). A fresh `envp` would
+      drop the pin, and the child would enumerate the iGPU or find no
+      device. It never calls `setenv` in a child,
+      because `ggml_sycl_strict_enabled()` latches the environment in a
+      function-local static on first call, and the fixture's cache
+      construction reaches it first. No `ENVIRONMENT_MODIFICATION` is used
+      (it needs CMake 3.22, and the minimum is 3.14).
+      - **Strict child**: sets `RLIMIT_CORE` to 0 first (a core-dumping
+        abort holds pinned memory past its exit message), builds the
+        withdrawn-chunk state, calls `configure_host_zones`, and must
+        abort. The driver scores it with `waitpid`: `WIFSIGNALED` and
+        `WTERMSIG == SIGABRT`, plus the `configure_zones refused: chunk`
+        ERROR line on the child's stderr before the abort.
+      - **Plain child**: asserts `ggml_sycl_strict_enabled()` is false at
+        entry, runs the configure cases above, frees its stand-in and
+        finishes cleanly (the pool's destructor waits 5 s and asserts on
+        outstanding leases, `pp:1086-1109`, so a child left with a live
+        stand-in could abort and make the two mutants
+        indistinguishable). The driver scores `WIFEXITED` and
+        `WEXITSTATUS == 0`.
+      - **Outstanding-carrier child** (r17 M-5): it sets `RLIMIT_CORE` to
+        0, releases an empty withdrawn chunk into a `released_chunk` and
+        keeps the carrier alive, then destroys the pool. It must abort:
+        `WIFSIGNALED`, `WTERMSIG == SIGABRT`, plus the `released_chunk
+        outstanding at pool destruction` line on its stderr. Its envp is
+        the plain child's. Mutant: the assertion removed, or placed after
+        the free loop, scored `outstanding-carrier child exited <s>,
+        expected SIGABRT`.
+      - **VOID exits 77**: a child whose entry check finds the strict
+        variable set (plain) or unset (strict), finds
+        `ONEAPI_DEVICE_SELECTOR` unset, or finds no device, exits 77, and
+        the driver exits 77, so a VOID case never reads as a pass.
+      - Mutants: the abort dropped (`strict child exited <s>, expected
+        SIGABRT`), and the abort taken in non-strict mode (`plain child
+        died by signal <n>, expected exit 0`).
   - RED `test-sycl-scratch-owner-end` (r9 m-5, r10 m-5; device,
     `sycl;cache;mem-handle`, `level_zero:1`, lead-run, loads no model). It
     creates a real backend with `ggml_backend_sycl_init`, drives its
@@ -4569,8 +5516,30 @@ I-5, §F2). It is the commit that changes every SYCL load.
     - **empty at free**: the stand-in is freed first, and then
       `ggml_backend_free` releases the chunk itself.
 
-    Both cases also assert, right after the release, that the device's
-    marked set is empty and that a following begin on the device prints
+    **A third case, two empty chunks** (r15 M-1): an owner whose
+    transaction grew two chunks, both empty when `ggml_backend_free`
+    runs, releases both after the walk's lock drops. Both `released`
+    lines print, and `chunk_count` and `allocated()` are back to their
+    pre-reserve values. The walk calls the core under one hold of the lock
+    and frees every collected backing after its scope.
+
+    **A fourth case, a lease at the owner's end** (r17 M-4): the
+    stand-in's host pointer is leased through `host_acquire_chunk_lease`
+    (`uc:24100-24104`), then `RETURN`, then `ggml_backend_free`, and each
+    order ends with the lease's drop through `host_release_chunk_lease`
+    (`uc:24107-24111`) as the last event. (a) The stand-in is freed before
+    the backend, so the chunk is empty with a lease held: the owner-end
+    walk orphans it and releases nothing (`chunk_count` is still `<n+1>`),
+    and the lease's drop releases it, so the `released` line prints at the
+    drop, `chunk_count` and `allocated()` are back to their pre-reserve
+    values and the marked set is empty. (b) The stand-in is live at the
+    backend's free, so a live allocation and a lease coexist: the walk
+    orphans it (live is checked first), the stand-in's free finds the
+    lease held and releases nothing, and the lease's drop releases it.
+
+    Both orphaned and empty-at-free cases also assert, right after the
+    release, that the device's marked set is empty and that a following
+    begin on the device prints
     nothing (r11 m-5): the orphaned chunk's emptying free reaches the same
     `release_marked_chunk` as every other release.
 
@@ -4581,15 +5550,20 @@ I-5, §F2). It is the commit that changes every SYCL load.
     the context is freed, expected <n>: withdrawn chunk <idx> idle until
     pool destruction`; and the entry left in the set by the orphaned
     free's release, which fails the orphaned case with `marked set holds
-    <n> entry(ies) after the release of chunk <idx>, expected 0`.
+    <n> entry(ies) after the release of chunk <idx>, expected 0`; and the
+    owner-end walk freeing only its first collected backing, which fails
+    the third case with `chunk_count <n+1> after the context is freed,
+    expected <n>: owner-end freed one of two chunks`. A walk that called
+    the public form inside its scope is the self-deadlock that gate
+    clause 7 pins; and the lease's drop not handing the index back, which
+    fails the fourth case with `chunk_count <n+1> after the lease dropped,
+    expected <n>: withdrawn chunk <idx> waits for a begin`.
   - `test-sycl-kv-demand-idx` (`sycl;host`, r3 B). A pure test of
     `kv_demand_for_layer` on a 48-layer plan with Qwen's shape: 12 FULL
-    layers of 512 MiB at 262144 cells, an indexer width of 128 on each
-    (`layer_idx_k_width`). Each carries 576 MiB, `kv_demand_for_layer`
-    equals `kv_size_for_layer`, and a 0 width gives 512. Fed to
-    `plan_runtime_kv_demotion` with 287.8 MB of room, it demotes 12 layers,
-    3..47, with 6912.0 MB of host KV. Control and mutant: the demotion input
-    reading the K/V buffer alone (`kv_main_size_for_layer`), which prints
+    layers of 512 MiB at 262144 cells, `kv_idx_width` 128. Each carries 576
+    MiB, and a 0 width gives 512. Fed to `plan_runtime_kv_demotion` with 287.8
+    MB of room, it demotes 12 layers, 3..47, with 6912.0 MB of host KV.
+    Mutant: the demotion input reading `kv_size_for_layer`, which prints
     6144.0.
   - `test-sycl-getrows-refusal-terminal` (`sycl;host`, a fake `stream_dma`,
     r2 m-5). One refusal gives one call, one counted refusal, no
@@ -4620,6 +5594,10 @@ I-5, §F2). It is the commit that changes every SYCL load.
     Otherwise it is registered `sycl;cache;mem-handle`, `level_zero:1`, and is
     lead-run.
 - Device REDs (`sycl;cache;mem-handle`, `level_zero:1`, lead-run):
+  - The two REDs registered with the C4 tests above,
+    `test-sycl-scratch-trial-return` and `test-sycl-configure-refusal`,
+    belong to this list and pin `level_zero:1` like the rest (§M88 (2);
+    r15 M-4, N-1).
   - RED `test-sycl-seg-refusal-cleanup` (r8 I-1; §M69 (b) third
     amendment; r9 m-1). A small MoE graph on the segmented path, run
     through `ggml_backend_sycl_graph_compute`, with a refusal forced at a
@@ -4705,9 +5683,26 @@ I-5, §F2). It is the commit that changes every SYCL load.
         `graph_compute` on the same context can crash before the test
         prints the predicted message. **E:** at s1, `moe_segments` holds
         every executable the throw had recorded: none was destroyed in the
-        unwind. The others: s2 equals s1 (nothing was destroyed before the
-        cleanup step, so none before th32's cancel step or either wait),
-        and s3 is 0.
+        unwind. The rest of E's group runs before 2-5 as well (r12 M-3
+        (a)): s2 equals s1 (nothing was destroyed before the cleanup
+        step, so none before th32's cancel step or either wait), then s3
+        is 0.
+      - **The seam keeps the mutants measurable** (r12 M-3 (b), (c); r13
+        N-3). Both mutants destroy an executable whose `gs:97311`
+        submission is outstanding (`gs:99522-99538`), which can abort
+        inside `graph_compute` before any message exists. So the seam,
+        which is test-only and runs at the refusal site before the throw,
+        first waits the stream. **This wait is the fourth case's seam
+        only**: its refusal is at a `moe_after`, outside any capture
+        (`gs:97315`). In cases 1-3 the refusal is a recording node inside
+        `begin_recording`, where the queue is recording and a wait on it is
+        an error, so those seams take none; the destruction then cannot crash, and the test
+        measures where it happens, which is the property under test. That
+        wait is a test-seam action and is not in the production catch,
+        where a wait at the throw site is still forbidden. The seam also
+        prints each sample (`s1=<n>`, `s2=<n>`, `s3=<n>`) as it is taken,
+        before any later step, so the line a mutant's message quotes
+        exists even if a later step dies.
       - **Mutants, each failing alone with its derived message; the test
         asserts that the message quotes it:**
         - the local unwind restored (no move): fails E with `executables
@@ -4721,13 +5716,34 @@ I-5, §F2). It is the commit that changes every SYCL load.
           destruction before it is seen, and th32's step needs no sample
           point of its own.
     - A fifth case, **stale vectors** (r11 m-1), pins the entry guard. A
-      first `graph_compute` records K >= 1 executables. A seam then makes
-      `moe_graph_retention_retire_exact` fail (test binary only), so the
-      next call's `invalidate_moe_segments` (`gs:107202`) refuses, keeps
-      the vectors and sets `moe_graphs_disabled`, and the call reaches the
-      record function. **Preconditions; each failure is a fixture error:**
-      the seam's snapshot at the record function's entry shows K >= 1
-      segments, the disabled flag set, and the K executables' identities.
+      first `graph_compute` records K >= 1 executables. **Reaching the
+      record function** (r12 M-2): the second call must miss
+      `segments_match` (`gs:107184-107186`: valid, same `n_nodes`, same
+      phase), or it replays and never invalidates. So it runs a graph with
+      a different `n_nodes`, and **no whole-graph record has set
+      `active_exec_graph.valid`**, so that the phase-change clears
+      (`gs:105417`, `:105558`) do not invalidate first and set the sticky
+      flag before `gs:107202`. **The optional-layout clear has its own
+      precondition** (r14 M-7): `gs:106124` gates it on the context's
+      `optional_layout_epoch` differing from the global
+      `g_ggml_sycl_optional_layout_epoch`, and only then (`gs:106125`) on
+      `exec_graph`, `moe_segments_valid` or `moe_block_graphs`, a second
+      condition that holds on this fixture after the first record. So the
+      two epochs must be equal at the second call, with no optional-layout
+      retirement between the two calls, and the fixture-error check reads
+      both. **The retire seam**
+      makes `moe_graph_retention_retire_exact` fail on **every** call until
+      the test clears it, not once: the caller's own retry at `gs:107214`
+      is a second retire, and a one-shot seam would let it succeed and
+      clear the K executables on the correct implementation. With the seam
+      failing, the call's `invalidate_moe_segments` (`gs:107202`) refuses,
+      keeps the vectors and sets `moe_graphs_disabled`, and the call
+      reaches the record function. The test clears the seam before the
+      context's destruction. **Preconditions; each failure is a fixture
+      error:** the second call missed `segments_match`, the seam failed at
+      `gs:107202` and again at `gs:107214`, and the seam's snapshot at the
+      record function's entry shows K >= 1 segments, the disabled flag
+      set, and the K executables' identities.
       **Assertions:** the `[SYCL-SEG] record refused` WARN printed once and
       quoting K; the call returned through the caller's fallback, with no
       throw; and `moe_segments` still holds the same K identities after
@@ -5044,8 +6060,8 @@ I-5, §F2). It is the commit that changes every SYCL load.
        Mistral the likely post-`OPEN` losses, `compute buffers did not
        fit` (`lc:1620`) and `compute buffer fell back to host`
        (`lc:1628`), need not grow SCRATCH at all, so this sub-criterion
-       may VOID on Mistral. The binding evidence for §M75 is the host RED
-       `test-sycl-scratch-trial-return`.
+       may VOID on Mistral. The binding evidence for §M75 is the lead-run
+       device RED `test-sycl-scratch-trial-return`.
   5. The GPT-OSS gate on `:1`, in two arms, each under `timeout 60`, **with
      `-lv 4` added** to the canonical command (r3 C; §7 preamble), stdout and
      stderr captured to separate files, and scored with `grep -cx '1, 2, 3,
@@ -5309,7 +6325,7 @@ Rows marked "superseded in part" did not hold as written at rev 3a (design-5efe-
 | m-6 equivalent tier mutant | Fixed: the mutants are the record registered as `HOST_MALLOC`, and the `FILE_MAPPED` branch moved after `zone_managed` into the `sycl::free` fallthrough. | §7 C2 |
 | m-7 preload site | Fixed: `gs:34701-34735` is added to the §4.3 site table and §5.3, and the loader source test pins it. | §4.3, §5.3 |
 | m-8 C1 test vs C4 deletion | Fixed: C4 narrows `lm:2693` to the no-tier case and amends the C1 caps test. | §4.3, §7 C1, C4 |
-| m-9 pre-fill `no_alloc` | Fixed: under `no_alloc` the pre-fill still runs (rows are metadata) and `lazy_read.any()` is false. As built (C1 review N8), `init_mappings` passes the record's excluded ranges to `llama_mmap` whenever `use_mmap` is true, the fit pass included, so the fit pass does not `WILLNEED` a lazy table either. | §3.1, §7 C1 |
+| m-9 pre-fill `no_alloc` | Fixed: under `no_alloc` the pre-fill still runs (rows are metadata), `lazy_read.any()` is false, and no range reaches `llama_mmap`. | §3.1, §7 C1 |
 | m-10 `SYCL_Mapped` `alloc_buffer` | Fixed: size 0 returns a dummy buffer, and any other size aborts naming the buft. | §4.3 |
 | m-11 `memory_tier::MMAP` | Fixed: listed in §2.7 and renamed `UNRESOLVED` in §4.8. The census gate covers all four legacy names. `alloc_type::MMAP` is split into `HOST_MALLOC` (`::free`) and `HOST_OWNED_ELSEWHERE` (the KV synthetic base, gs:39620-39624, :39641-39642, released at :38408-38415). | §2.7, §4.8, §7 C2 |
 | m-12 allowlist tokenizer | Fixed: comments and strings are stripped, `mmap (` is matched with a fixture, and a non-listed-file mutant is added. | §4.1, §7 C2 |
@@ -5529,7 +6545,7 @@ r8 rulings and the §M69 (b) third amendment, folded in rev 3l:
 | n-1 the gate's begin placement | Fixed: right after each scheduler creation (`lc:2019-2022`, `lc:2061-2064`); a begin before the creation fails the gate. | §7 C4 source gate |
 | n-2 the fixture's top-K | Fixed: top-10, `n_seq_max` 1, pp 512, so D = 5120 against 10. | §7 C4 tests |
 | n-3 tg `n_tokens` | Fixed: `n_seqs` = `n_seq_max` (`lc:2080`), 1 on every lead arm. | §4.4 staging plan, §7 C4 tests |
-| n-4 `release_zone_chunk` gaps | Fixed: subtracts the backing size (`chunk_footprint_for`, `pp:798-803`) from `total_allocated_`; requires the per-chunk `allocator` (`pinned-pool.hpp:246`) unused; `configure_zones` (`pp:361-418`) skips tombstones; the `pinned-pool.hpp:112` comment is rewritten. | §4.4 staging plan |
+| n-4 `release_zone_chunk` gaps | Fixed: subtracts the backing size (`chunk_footprint_for`, `pp:798-803`) from `total_allocated_` (superseded in rev 3r and rev 3s: the footprint is subtracted by the released carrier's destructor after the physical free, design-5efe-r14 M-3, design-5efe-r15 I-1); requires the per-chunk `allocator` (`pinned-pool.hpp:246`) unused; `configure_zones` (`pp:361-418`) skips tombstones; the `pinned-pool.hpp:112` comment is rewritten. | §4.4 staging plan |
 | n-5 one cause of `known == false` | Fixed: the WARN names both causes (`gs:26007-26024`), usage not `MOE_EXPERT_WEIGHT` or no placement plan. | §4.4 sizing |
 | n-6 the pipeline-parallel retry's growth | Fixed: `sched_reserve` opens its own transaction when no trial is open, `KEEP`s on success, and `RETURN`s before the retry (`lc:2055-2065`), whose scheduler creation (`lc:2061`) frees the buffers and whose begin releases. | §4.4 staging plan, §7 C4 source gate |
 | n-7 §M74 list | Fixed: the §M75 lines (`trial ... kept` or `returned`, `released`, `return refused`, `DEVICE pools ... resized`) are in the always-compiled list. | §4.4 staging plan |
@@ -5580,7 +6596,9 @@ folded in rev 3n:
 | n-8 the cleanup step's scope | Fixed: it applies to all 38 throw sites (37 in `ggml-sycl.cpp`, one at `getrows.cpp:291`), and that is intended. | §4.4 staging plan |
 
 **design-5efe-r11** (`6b674097e..714081770`, 0C/0I/7m/3n), with the lead's
-r11 orders and the §M69 (b) amendments 1-4, folded in rev 3o:
+r11 orders (an entry guard, a pinned fourth case, split mutants, a marked-set
+entry that leaves with its chunk, and `configure_zones` refusing) and the
+§M69 (b) amendments 1-4, folded in rev 3o:
 
 | finding | disposition | where |
 |---|---|---|
@@ -5594,3 +6612,165 @@ r11 orders and the §M69 (b) amendments 1-4, folded in rev 3o:
 | n-1 Appendix row cite | Fixed: the r9 m-1 row cites `gs:99517-99567` and notes the supersession in rev 3n. | Appendix B |
 | n-2 the K filler | Fixed: freed at 1024's simulated scheduler destruction, before the settle's begin. | §7 C4 tests |
 | n-3 the return-false paragraph | Fixed: the two inner exits and `gs:97363` (publish failure, then a no-op retire at epoch 0) are listed as pre-existing, tracked as llama.cpp-7l45, not 5efe folds; the "before the fallback" wording now says before the caller's block-graphlet and per-op fallback. | §4.4 staging plan |
+
+**design-5efe-r12** (`714081770..40110fd66`, 0C/0I/6m/4n, P1-P4 PASS), with
+the lead's r12 orders, folded in rev 3p:
+
+| finding | disposition | where |
+|---|---|---|
+| M-1 where the kept executables are freed | Fixed: after the guard's `return false` the caller's retry (`gs:107214`) destroys them after a drain, or, if it fails too, the sticky `moe_graphs_disabled` (`gs:106423-106426`) stops all recording and `~ggml_backend_sycl_context` (`gs:43877`) frees them after waiting every queue (`gs:43880-43892`), before its own invalidate (`gs:43917`) and the member destructors. "The next record's entry guard" is withdrawn; the non-fallback exception types' text names the destructor too. | §4.4 staging plan |
+| M-2 the fifth case is not buildable | Fixed: the second call misses `segments_match` (a different `n_nodes` or the opposite phase), and the retire seam fails every retire, including the caller's retry at `gs:107214`, until the test clears it before the context's destruction; each is a precondition. | §7 C4 tests |
+| M-3 the mutants may abort before printing | Fixed: the s2 and s3 checks belong to E's group and run before 2-5; the test-only seam waits the stream at the refusal site, so the destruction cannot crash, and prints each sample as taken. The wait is not in the production catch. | §7 C4 tests |
+| M-4 mutant (iii) is a no-op | Fixed: `KEEP` walks the device's marked set and clears `withdrawn` on every chunk in it, which reaches A with the truncation intact. | §7 C4 tests |
+| M-5 the caller list and the set's lock | Fixed: `configure_host_zones` is a caller of `release_marked_chunk`; the set's walk, the release and the erase run under `marked_set_mutex_`, ordered before the pool's lock, with a state re-read, a no-effect release of a tombstone, and the log lines printed after the lock drops. | §4.4 staging plan |
+| M-6 the refusal's plumbing | Fixed: `configure_zones` and `configure_host_zones` both return `bool`, false only for the refusal; the scan runs before the growth and the shortfall check, so no zeroing is skipped; the shortfall keeps today's behaviour; ERROR with the named line, then `GGML_ABORT` under `ggml_sycl_strict_enabled()` in the cache wrapper; no production caller receives it today, and a future caller must propagate it. The test's second call uses sizes that fit, with a shortfall control. | §4.4 staging plan, §7 C4 tests |
+| N-1 the publish cite | Fixed: `gs:97361`. | §4.4 staging plan |
+| N-2 the doubled parenthetical | Fixed. | §4.4 staging plan |
+| N-3 the header | Fixed: the r11 items are the lead's r11 orders, separate from the §M69 (b) amendments; the Appendix B r11 heading likewise. | header, Appendix B |
+| N-4 the run-on messages | Fixed: the host RED evaluates every ending and prints every failing check, and the marked set stores entries without a dedupe, so a second filing is observable. | §7 C4 tests |
+
+**design-5efe-r13** (`40110fd66..02ba5ed6a`, 0C/0I/5m/4n), with §M81 (c)-(e),
+folded in rev 3q:
+
+| finding | disposition | where |
+|---|---|---|
+| M-1 "nothing records or invalidates again" | Fixed: nothing records again, but invalidation still happens at the catch's cleanup step and every `sycl_exec_graph_clear_active` caller (`gs:99565`, `:99579`, `:105417`, `:15773`), each retrying the retire; a success destroys after its drain, a failure keeps them for `~ggml_backend_sycl_context`. "Every destruction point drains." | §4.4 staging plan |
+| M-2 the lock census and order | Fixed: `marked_set_mutex_` is L4 (last ordinal) and the pool's `mutex_` L5, both added to canon §12.5 in C4's commit; callers' held locks are named from source (superseded in rev 3r: derived from the callers, design-5efe-r14 I-1); the owner moves out of the pool's scope and is released after both locks drop, so the pool's lock is a leaf for these functions; new lock-order gate with two planted controls. | §4.4 staging plan, §7 C4 source gate |
+| M-3 the insert side and the re-read | Fixed: every access (filing, begin's walk, owner-end walk, erase, `marked_entries`) holds `marked_set_mutex_`; the re-read is a pool call under the pool's `mutex_` returning "already released" for a tombstone. | §4.4 staging plan |
+| M-4 gate and test for configure's release | Fixed: `configure_host_zones` is in the gate's `release_zone_chunk` caller list; a configure own-release run and a direct-`release_zone_chunk` mutant. | §7 C4 source gate and tests |
+| M-5 the strict-abort arm | Fixed: own subprocess RED `test-sycl-configure-refusal-abort` (renamed `test-sycl-configure-refusal` in rev 3r, design-5efe-r14 M-8) (strict child: SIGABRT and the ERROR line; plain child: rc 0), two mutants; the non-strict test unsets the variable and is VOID unless `ggml_sycl_strict_enabled()` is false at entry; the gate pins the strict read. | §7 C4 tests and source gate |
+| N-1 the shortfall control | Fixed: runs after the success call. | §7 C4 tests |
+| N-2 the uc range | Fixed: `uc:20415-20436`. | §4.4 staging plan |
+| N-3 the seam's wait | Fixed: scoped to the fourth case. | §7 C4 tests |
+| N-4 "opposite phase" | Fixed: dropped; the precondition names a different `n_nodes` and no whole-graph record having set `active_exec_graph.valid` (`gs:105417`, `:105558`, `:106126` verified as clears). | §7 C4 tests |
+
+**design-5efe-r14** (`02ba5ed6a..4db80fa62`, 0C/1I/8m/2n, P2 and P4 residues), with
+the lead's r14 rulings, folded in rev 3r:
+
+| finding | disposition | where |
+|---|---|---|
+| I-1 the held-lock claims were not derived from callers | Fixed: every caller of `marked_set_mutex_` is named with the locks it holds at e2461d4fb (begin and trial entries, the owner-end step, `configure_host_zones`' callers with the unreferenced static `gs:33353` noted, the orphaned-free paths including `process_deferred_frees_locked` under `rw_mutex_` and `deferred_frees_mutex_`); the 15 `release_entry_allocation_locked` sites are tabulated (`uc:4925` holds none); no SCRATCH producer reaches the deferred lists today, with cites, and the order covers it anyway; the order is `rw_mutex_` (and `deferred_frees_mutex_`), then `marked_set_mutex_`, then the pool's `mutex_`; the owner release can run under a caller's L4 lock, legally and without cycle; the "unpublished record cannot lie in a withdrawn chunk" reason is replaced by "holds no lock". The gate checks the listed bodies' scopes only. | §4.4 staging plan, §7 C4 source gate |
+| M-1 the carrier | Fixed: `release_zone_chunk` returns an opaque move-only `released_chunk` (base, size, owner); a public `release_chunk_backing(released_chunk &&)` calls the private `free_chunk_owner` on it with no lock, so the null-base early return (`pp:779-781`) cannot swallow it and the missing-owner assert still guards it; no drain wait since lease count was 0 (superseded in rev 3s: the carrier is RAII and its destructor is the release, design-5efe-r15 I-1). | §4.4 staging plan |
+| M-2 the non-recursive lock | Fixed: `release_marked_chunk_locked` core (lock held, collects into a vector) and a public wrapper; the begin's walk and configure's release run in one scope and free every collected backing after it closes (extended in rev 3s: the owner-end walk and `RETURN` are core users too, design-5efe-r15 M-1). | §4.4 staging plan, §7 C4 source gate |
+| M-3 the footprint decremented before the free | Fixed: `total_allocated_` is subtracted in a second short pool-lock section after the physical free; a concurrent grow never sees room that is not there (superseded in rev 3t and rev 3u: the subtraction is conditional on the registry query, and a refused free is reconciled from a stranded list, §M88 (1), §M92). New seam case and a decrement-before-free mutant. | §4.4 staging plan, §7 C4 tests |
+| M-4 the pool's census row | Fixed: first in L5, so `grow`'s nesting of `g_runtime_alloc_mutex` (`pp:939`, `uc:15578`) conforms; other nesting is llama.cpp-uilv; the retained-store row is cited at `d8a67422d`; "never nests" is limited to the release path. | §4.4 staging plan |
+| M-5 the configure cites | Fixed: `gs:33366` (unreferenced static, not production) and `gs:33893` (the live site, via `gs:12476` and `gs:13124`, no census mutex). | §4.4 staging plan |
+| M-6 controls per clause | Fixed: six clauses, six planted controls, each with a quoted reason. | §7 C4 source gate |
+| M-7 `gs:106126` | Fixed: its own precondition on the two optional-layout epochs. | §7 C4 tests |
+| M-8 the strict test's construction | Fixed: children get the environment through `execve` `envp` (the accessor latches); no `ENVIRONMENT_MODIFICATION`; `waitpid` scoring with `SIGABRT`; `RLIMIT_CORE` 0; VOID exits 77; the plain child frees its stand-in; the device-touching fixture is labelled `sycl;cache;mem-handle` and pinned, for this test and `test-sycl-scratch-trial-return`; the configure cases move into the plain child. | §7 C4 tests |
+| N-1 the owner-end cite | Fixed: `gs:84119`, with `gs:16818` as a second path. | §4.4 staging plan |
+| N-2 the destructor cite | Fixed: `pp:141-162`. | §4.4 staging plan |
+
+**design-5efe-r15** (`4db80fa62..858b74433`, 0C/1I/5m/4n, P2 residue and P4
+residues), with the lead's r15 rulings, folded in rev 3s:
+
+| finding | disposition | where |
+|---|---|---|
+| I-1 the carrier's lifetime and return shape | Fixed: `released_chunk` is a move-only nested class constructed only by `release_zone_chunk`, and its destructor is the release (the `mem_handle` reset, then the footprint subtraction under the pool's `mutex_`); a moved-from carrier is a no-op; `release_chunk_backing(released_chunk &&)` only consumes it early, so one path serves a consumed and a dropped carrier; callers reserve `out` before the first release; `release_zone_chunk` returns a four-valued status (released, already released, refused live, refused lease) with the carrier as an out-parameter, and the core keys its behaviour on it; a registry-refused free still lets the footprint leave, with the registry's leak diagnosis as the evidence (superseded in rev 3t: the footprint leaves only when the allocation is gone, §M88 (1); and in rev 3u: a refused free is a scheduled retry reconciled from a stranded list, §M92); gate clause 8 and a planted control pin the destructor; a dropped-carrier case with a do-nothing-destructor mutant and a double-subtract mutant. | §4.4 staging plan, §7 C4 source gate and tests |
+| M-1 the owner-end walk and `RETURN` | Fixed: a caller holding `marked_set_mutex_` calls the core and never the public form; the begin, configure, owner-end walk and `RETURN`/`RETURN_TO_MARK` (filing and immediate release in one scope) are the four core users, each releasing its collected backings after its scope; the one public-form caller is the orphaned chunk's emptying free. A two-empty-chunks owner-end case and a one-of-two mutant. | §4.4 staging plan, §7 C4 tests |
+| M-2 four gate holes | Fixed: clause 7 pins the call forms (core called only inside a held scope, public form never inside one), with two controls; clause 5's controls name `release_chunk_backing` and the collected-vector loop instead of the private `free_chunk_owner`; clause 4 names `deferred_frees_mutex_` and C4's census commit adds it to canon §12.5; the gate is registered `sycl;host;source-contract` like `test-sycl-mmap-support-caps-source`. | §4.4 staging plan, §7 C4 source gate |
+| M-3 callee-scoped held-lock claims | Fixed: `unified_cache::deallocate`'s only caller is the wrapper at `uc:21288`, which has no production caller; for the registry release and rollback paths the rule is stated (a SCRATCH final-owner destruction or rollback under an L5 lock is non-conforming under canon 1612-1619, outside C4, llama.cpp-uilv), and "hold no lock" is deleted for (iii); `uc:4639` is `shutdown_resources`' production caller. | §4.4 staging plan |
+| M-4 the strict test's environment and the pins | Fixed: each child's `envp` is a copy of the driver's `environ` with the strict variable set or erased; a child with no selector or no device exits 77; both moved REDs pin `level_zero:0,1` as the lead ruled (the reviewer proposed `level_zero:1` for the configure test; superseded in rev 3t: both pin `level_zero:1`, §M88 (2) and the lead's follow-up), and the Device REDs list cross-references them. | §7 C4 tests |
+| M-5 the footprint seam | Fixed: the seam samples after `free_chunk_owner` returns and before the second section; it is `GGML_SYCL_PRIVATE_TESTING`-compiled and absent from the shipped library; the RED is a private-fixtures test linked like `test-unified-cache-bugs` and never with libllama (§M82 case (2)). | §7 C4 tests |
+| N-1 stale vocabulary and placement | Fixed: "host fixture" and "host RED" replaced; the two REDs are cross-referenced under the Device REDs header; the registration is reflowed. | §7 C4 tests, §7 C4 step 4 |
+| N-2 Appendix B row n-4 | Fixed: superseded markers on the row that quoted the old footprint arrangement, and on the r14 M-1 and M-2 rows. | Appendix B |
+| N-3 the lease-0 half | Fixed: no lease can be taken after the tombstone, because `acquire_chunk_lease` and `find_chunk_handle` skip a null base under the same `mutex_` (`pp:1026-1047`). | §4.4 staging plan |
+| N-4 two wording points | Fixed: "15 call sites (16 grep hits including the definition at `uc:12345`)"; the window's consequence (a concurrent grow can be refused for the duration of one free) is stated. | §4.4 staging plan |
+
+**§M88** (the lead's answers to rev 3s's questions), applied in rev 3t:
+
+| ruling | disposition | where |
+|---|---|---|
+| (1) the footprint leaves only when the allocation is gone | Applied in rev 3t: the carrier's destructor takes the owner's `alloc_metadata` before the reset, resets through `free_chunk_owner`, then asks the registry read-only by exact (`ptr`, `key()`) through a new shipped accessor `unified_allocation_registered_exact`; gone subtracts. The "still registered" branch (keep, ownerless-lease WARN, strict abort, a strict refused-free child) is superseded in rev 3u by §M92: a refusal is a scheduled retry, so the footprint is stranded on a pool list and reconciled from the registry, with a retry WARN and no abort. | §4.4 staging plan, §7 C4 source gate and tests |
+| (2) selector | Applied: `test-sycl-configure-refusal` pins `level_zero:1`. `test-sycl-scratch-trial-return` first stayed `level_zero:0,1` (§M88 named only the configure test) and now pins `level_zero:1` too, on the lead's follow-up ruling: the same one-pool-one-queue argument applies. | §7 C4 tests |
+| (3) ticket | llama.cpp-uilv stands for the L5-held SCRATCH destruction and rollback sites; no change. | §4.4 staging plan |
+
+**design-5efe-r16** (`858b74433..ce6226443`, 0C/1I/6m/6n, P4 FAIL), with §M92,
+folded in rev 3u:
+
+| finding | disposition | where |
+|---|---|---|
+| I-1 a kept footprint is never reconciled | Fixed (§M92): a refusal is a scheduled retry (`uc:857-862`, `:983-993`, `:995-1019`, `:1031-1056`), so the carrier appends `{metadata, backing size}` to the pool's `stranded_` list without subtracting and prints a retry WARN; `allocated()` and every admission test run `reconcile_stranded_locked` first and subtract each entry the registry no longer holds; teardown WARNs for entries still registered; the "ownerless lease" wording and the strict abort are dropped on this path. RED: keep, `process_retries()`, then the next `allocated()` drops it, with three mutants; a teardown case; gate clause 10. | §4.4 staging plan, §7 C4 source gate and tests |
+| M-1 the drop path under a listed lock | Fixed: stated as non-conforming under canon 1612-1619, reachable only if a caller breaks the collect-then-release rule; clause 5 pins that each collecting vector is declared before its scope's lock statement, with a control. | §4.4 staging plan, §7 C4 source gate |
+| M-2 the metadata's source | Fixed: `allocate_pinned_chunk_owner` reads `alloc_owner::metadata()` before `from_owned_alloc` consumes the owner and returns a `pinned_chunk_backing`; `grow_into` stores it on the chunk on both paths; the carrier holds a back-pointer and never outlives its pool (`~pinned_chunk_pool` asserts none outstanding). | §4.4 staging plan |
+| M-3 the accessor and clause 8's polarity | Fixed: an accessor RED case (same `ptr`, different id, absent row; ptr-only mutant), gate clause 9 (one lock, compares `key()`, no writes) with two controls, and clause 8's inverted-branch control. | §4.4 staging plan, §7 C4 source gate and tests |
+| M-4 the status per caller | Fixed: a per-caller status table with a REFUSED_LEASE handler at every row and a fifth value, ORPHANED, returned by `release_zone_chunk` with `orphan_if_live` so the owner-end walk is one pool call (extended in rev 3w: also in place of REFUSED_LEASE, with the lease's drop as a release event, r17 M-4). | §4.4 staging plan |
+| M-5 the RED's cleanup | Fixed: the hooks come as a hold and an unhold; the fixture unholds, calls `process_retries()` and scores `retry_count()` 0. | §7 C4 tests |
+| M-6 the recipes and entry checks | Fixed: `test-sycl-configure-refusal` is a private-fixtures test (it reads `marked_entries`), built like trial-return; the refused-free arm exits 77 when `GGML_SYCL_STRICT_LEASES` is set; the strict refused-free child is removed with the strict abort. | §7 C4 tests |
+| N-1 two cites | Fixed: `uc:16553-16554`, `uc:16534`. | §4.4 staging plan |
+| N-2 one canon range | Fixed: canon 1612-1619 throughout. | §4.4 staging plan |
+| N-3 the 114-column line | Fixed: the recipe paragraph is reflowed. | §7 C4 tests |
+| N-4 the enum type | Fixed: `pinned_chunk_release`. | §4.4 staging plan |
+| N-5 markers, header, ordinal | Fixed: the r14 M-3 row is marked superseded; the header names the trial-return pin move; `deferred_frees_mutex_`'s ordinal is decided in C4's census commit and the gate reads it from the table. | Appendix B, status block, §4.4 staging plan |
+| N-6 "leaked lease" | Fixed: the wording is gone from the live text; it survives only inside superseded markers (the status block and the §M88 row). | §4.4 staging plan, Appendix B |
+
+
+**The stranded list's bound** (the lead's follow-up to §M92), applied in rev 3v:
+
+| ruling | disposition | where |
+|---|---|---|
+| no terminate path for the stranded append | Fixed: the first draft reserved 8 entries and let a failed allocation terminate inside the `noexcept` destructor. Now `stranded_` is reserved to the pool's chunk count wherever a chunk is added (superseded in rev 3w: once, in `grow_into`, before the add, r17 M-1) (at most one stranded entry exists per chunk), the destructor asserts `size < capacity` before the append, and gate clause 11 pins the reserve-at-grow and the allocation-free append. | §4.4 staging plan, §7 C4 source gate |
+
+**design-5efe-r17** (`858b74433..0ee6ad375`, 0C/1I/5m/5n, P4 FAIL), with the
+lead's r17 rulings, folded in rev 3w:
+
+| finding | disposition | where |
+|---|---|---|
+| I-1 the reconcile misses three admission tests | Fixed: one private `footprint_locked()` reconciles and returns the footprint, and every decision read goes through it: `allocate_segmented` (`pp:186`), `pre_allocate` (`pp:242`), `configure_zones` (`pp:323`), `grow_zone` (`pp:661`), `allocate_from_chunks` (`pp:827`), `grow_into` (`pp:892`) and `allocated()`; an empty list skips the registry lock; the two members are `mutable`; `allocated()`'s external callers (`uch:4140` from `gs:5688`, `mem-ops.cpp:392`) hold no registry lock. Clause 10 now names no body but the reconcile, the destructor and `grow_into`'s commit, with one control per body. | §4.4 staging plan, §7 C4 source gate |
+| M-1 the reserve is after the add and is three sites | Fixed: one site, `grow_into`, which reserves to `chunks_.size() + runtime_chunks_.size() + 1` before the `emplace_back` (moved by r18 N-1 to before the owner allocation) and maps `bad_alloc` to `return false`; `configure_zones`, `allocate_segmented` and `grow_zone` add no chunk. | §4.4 staging plan, §7 C4 source gate |
+| M-2 the reserve's value and the assertion are unpinned | Fixed: controls for a constant reserve, a reserve after the add (replaced in rev 3x by a reserve after the owner allocation, r18 N-1), and a missing or late assertion; the append is an `emplace_back` into reserved storage; a RED strands nine 64 MiB chunks, with a `reserve(8)` mutant that stops at the named assertion. | §7 C4 source gate and tests |
+| M-3 the prune can drop the reserve | Fixed: the prune is in place (`std::remove_if` and `erase`), never shrinking capacity; a control for a rebuild. | §4.4 staging plan, §7 C4 source gate |
+| M-4 REFUSED_LEASE has no release trigger | Fixed: the lease's last drop is an event-driven release (`release_chunk_lease` hands the index back, `host_release_chunk_lease` calls the public form; no host wait, no polling); `orphan_if_live` orphans for a live allocation first and then a lease; a fourth owner-end case drives both orders with a mutant. | §4.4 staging plan, §7 C4 tests |
+| M-5 the carrier-count assertion | Fixed: it is `~pinned_chunk_pool`'s first statement, counts owning carriers only (a move transfers, a moved-from carrier is not counted); gate clause 12 with a control; an outstanding-carrier child in `test-sycl-configure-refusal`. | §4.4 staging plan, §7 C4 source gate and tests |
+| N-1 the `release_ref` cite | Fixed: `uc:857-862`. | §4.4 staging plan, Appendix B |
+| N-2 two over-wide lines | Fixed: reflowed. | §7 C4 source gate and tests |
+| N-3 the census sentence | Fixed: it now names the reconcile's registry query beside `grow_into`'s allocation. | §4.4 staging plan |
+| N-4 Appendix B N-6 | Fixed: "gone from the live text; kept only inside superseded markers". | Appendix B |
+| N-5 the WARN and the accessor RED | Fixed: the accessor returns the row's own state (GONE, LIVE or RELEASING) and the WARN names it without claiming a cause (the row cannot tell a scheduled retry from retained references or the shutdown abandon); the accessor RED erases its published row with `allocation_registry_test_erase` (the accepted deviation is §M97). | §4.4 staging plan, §7 C4 tests |
+
+**design-5efe-r18** (`0ee6ad375..02d766337`, 0C/0I/3m/6n), with §M104,
+folded in rev 3x:
+
+| finding | disposition | where |
+|---|---|---|
+| M-1 the lease-drop path from a `noexcept` frame | Fixed: the public form holds one inline `released_chunk` slot and the core has a single-slot overload, so no vector or allocation is on the path; `host_release_chunk_lease` is `noexcept`; the six `release_lease_state` call sites (`mem-handle.cpp:982`, `:1004`, `:1067`, `:1166`, `:1665`, `:1773`) are stated, all after the handle's leaf lock; the new exposure (L4 then L5, then a blocking `sycl::free` and the registry lock, with no inversion, acceptable as a final `mem_handle` drop already frees) is stated; clause 7 pins that the lease drop calls the public form and does not allocate, with two controls. | §4.4 staging plan, §7 C4 source gate |
+| M-2 the helper has no control | Fixed: clause 10's allow-list names `footprint_locked`'s return, the log-only exemption is mechanical (the numerator of a division inside a `GGML_LOG_*` call), and there are controls for the helper without its reconcile and for a local copy in `grow_zone`. | §7 C4 source gate |
+| M-3 a stale WARN score | Fixed: the RED scores `release not yet complete after the owner reset (registry row LIVE)` exactly once and no further line on a second call; clause 8 gains a control that the WARN names no cause. | §7 C4 tests and source gate |
+| N-1 the sync/async labels | Fixed: `pp:922` is the async path, `pp:945` the synchronous path (catch `pp:950`); the reserve moves before the owner allocation, with an explicit catch. | §4.4 staging plan, §7 C4 source gate |
+| N-2 `grow_zone`'s cite | Fixed: `pp:661`. | §4.4 staging plan, Appendix B |
+| N-3 the carrier count's decrement | Fixed: the last statement of the destructor, with `assertion absent` and early-decrement controls. | §4.4 staging plan, §7 C4 source gate |
+| N-4 "equals the chunk count" | Fixed: "equals nine"; the abort string is in §4.4 and clause 11. | §4.4 staging plan, §7 C4 tests and source gate |
+| N-5 GONE and §M97 | Fixed: upper case in clause 8; §M97 cited at the accessor and the Appendix B N-5 row. | §4.4 staging plan, Appendix B |
+| N-6 the lease-drop lookup scope and the status order | Fixed: the lookup runs only on a drop to zero on a `chunks_` chunk and scans only the SCRATCH zone's states; a status-order RED line (the owning begin on a live and leased chunk prints `reason=live`) with a mutant; the begin row of the status table now records that the owning begin prints. | §4.4 staging plan, §7 C4 tests |
+
+**design-5efe-r19** (`02d766337..00ffc08fb`, 0C/0I/2m/4n), with §M110,
+folded in rev 3y:
+
+| finding | disposition | where |
+|---|---|---|
+| M-1 clause 7's path list misses frames | Fixed: the lease-drop path is every frame the drop runs through: `host_release_chunk_lease`, `release_chunk_lease`, the public form, the single-slot core overload, `release_zone_chunk` and the carrier destructor; a control plants `vector v; v.reserve(1)` in the overload (and in `release_zone_chunk` and `release_chunk_lease`). | §7 C4 source gate |
+| M-2 clause 10 fails the correct tree | Fixed: `~pinned_chunk_pool`'s reset (`pp:163`) is allow-listed by name; the gate scans comment-stripped source (so the `pp:334-335` comment is not a mention); the nine cited log lines are asserted to be the only exempt mentions; controls for a write outside the allow-list, a tenth log read and a comment that must not trip. | §7 C4 source gate |
+| N-1 clause 5 and the inline slot | Fixed: clause 5 names the public form's slot and plants `released_chunk slot declared inside the marked_set_mutex_ scope`. | §7 C4 source gate |
+| N-2 the llama.cpp-uilv ticket text | Not a doc change: the lead adds the ticket comment naming the lease-drop callers; the doc cites the ticket. | llama.cpp-uilv |
+| N-3 Appendix B reserve position | Fixed: the r17 M-1 and M-2 rows are marked as moved by r18 N-1. | Appendix B |
+| N-4 the explicit `bad_alloc` catch | Fixed: clause 11 gains `stranded reserve without bad_alloc catch`. | §7 C4 source gate |
+
+**design-5efe-r20** (`00ffc08fb..12839f154`, 0C/0I/2m/4n), with the lead's
+r20 relay, folded in rev 3z:
+
+| finding | disposition | where |
+|---|---|---|
+| M-1 frames missing from clause 7 | Fixed: the ban list adds `free_chunk_owner` and `unified_allocation_registered_exact`; the scanned-body list adds `host_release_chunk_lease`, `release_chunk_lease` and `free_chunk_owner`; the single-slot overload is selected by signature and the vector overload is exempt; frames above `host_release_chunk_lease` are stated unchanged and outside the gate; `vector v; v.reserve(1)` is planted in `free_chunk_owner` and the accessor. | §7 C4 source gate |
+| M-2 the grow_into control was unfalsifiable | Fixed: the allow-list is per mention (body, ordinal, statement kind) with exact counts (5 allowed, 9 exempt); a positive presence check that each of the seven decision bodies calls `footprint_locked()`; the `grow_into` mutant re-reads the member at `pp:892` and fails both. | §7 C4 source gate |
+| N-1 vector detection | Fixed: the `vector<` token (`auto & vec` at `pp:1057` is not one). | §7 C4 source gate |
+| N-2 the ordinal | Fixed: it counts every mention in the body. | §7 C4 source gate |
+| N-3 the llama.cpp-uilv comment | Not a doc change: the lead extends the ticket. | llama.cpp-uilv |
+| N-4 `comment mention flagged` | Fixed: marked a negative control that must pass, and the clause intro says so. | §7 C4 source gate |
+
+**design-5efe-r21** (`12839f154..9c0ee6941`, PASS with 2 nits), with §M114,
+folded in rev 3aa:
+
+| finding | disposition | where |
+|---|---|---|
+| N-1 the signature selector | Fixed: the gate selects the single-slot overload by the name `release_marked_chunk_locked` plus exactly one `&`, never `&&`. | §7 C4 source gate |
+| N-2 `auto & vec` cite | Fixed: `pp:1057` (in clause 7 and the r20 N-1 row). | §7 C4 source gate, Appendix B |

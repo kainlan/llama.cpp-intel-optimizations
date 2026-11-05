@@ -138,7 +138,9 @@ INSTALL_SIG = r"\bstatic\s+bool\s+ggml_sycl_host_tenants_install\s*\("
 RESERVE_SIG = r"\bstatic\s+bool\s+ggml_sycl_reserve_host_tenants\s*\("
 SLOT_OF_SIG = r"\bstatic\s+ggml_sycl_host_tenant_slot\s*\*\s*ggml_sycl_host_tenant_slot_of\s*\("
 SLOT_MAKE_SIG = r"\bstatic\s+ggml_sycl::kv_region_handle\s+ggml_sycl_host_tenant_slot_make\s*\("
-ALLOC_SIG = r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_type_alloc_buffer\s*\("
+# The host bufts' one allocation path (design 5efe section 4.4): SYCL_Host's and SYCL_KV_Host's alloc_buffer delegate
+# to it with their builder's intent, so the claim-before-allocation shape lives there.
+ALLOC_SIG = r"\bstatic\s+ggml_backend_buffer_t\s+ggml_sycl_host_buft_alloc\s*\("
 CLAIM_SLOT_SIG = r"\bstatic\s+bool\s+ggml_backend_sycl_host_buffer_claim_slot\s*\("
 WRAP_SIG = r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_wrap\s*\("
 FREE_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_host_buffer_free_buffer\s*\("
@@ -425,7 +427,7 @@ def host_tier_pins(source, alloc, freeb, reserve, fails):
     if alloc is not None:
         pin(fails, alloc,
             r"if \(ggml_sycl::tenant_claim_scope::active\(\)\) \{[^}]*if \(!ggml_backend_sycl_host_buffer_claim_slot\([^)]*\)\) \{"
-            r"\s*return nullptr;\s*\}\s*return ggml_backend_sycl_host_buffer_wrap\([^;]*std::move\(claim\)\);\s*\}\s*auto \* exact_cache",
+            r"\s*return nullptr;\s*\}\s*return ggml_backend_sycl_host_buffer_wrap\([^;]*std::move\(claim\)[^;]*\);\s*\}\s*auto \* exact_cache",
             "L4 host tier: a refused claim in a scope falls through to the legacy allocator (or the claim branch no longer "
             "ends in its own return)")
     claim_slot = function_body(source, r"\bstatic\s+bool\s+ggml_backend_sycl_host_buffer_claim_slot\s*\(")
@@ -444,7 +446,7 @@ def host_tier_pins(source, alloc, freeb, reserve, fails):
     if wrap is None:
         fails.append("L4 host tier: ggml_backend_sycl_host_buffer_wrap not found")
     else:
-        pin(fails, wrap, r"std::unique_ptr<ggml_sycl::tenant_claim> claim\) \{",
+        pin(fails, wrap, r"std::unique_ptr<ggml_sycl::tenant_claim> claim,",
             "L4 host tier: wrap does not take its claim by value (an early return would leave it live)")
         pin(fails, wrap, r"new \(std::nothrow\) sycl_host_buf_ctx\{[^;]*\};\s*if \(!ctx\) \{\s*ggml_backend_buffer_free\(buffer\);\s*return nullptr;",
             "L4 host tier: a failed context allocation does not free the CPU buffer it built and answer null")
@@ -1161,7 +1163,7 @@ def check(header_raw, source):
         fails.append("L4 host tier: the first publish does not reserve before L1, or does not install once before the inner transaction")
 
     # the buffer type: claim before any allocation, release on free
-    alloc = function_body(source, r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_type_alloc_buffer\s*\(")
+    alloc = function_body(source, ALLOC_SIG)
     if alloc is None:
         fails.append("L4 host tier: the SYCL_Host alloc_buffer not found")
     else:
@@ -1550,7 +1552,7 @@ def mutations(header_raw, source):
          "        return false;\n    }\n    const ggml_sycl_host_tenant_slot * slot",
          "        (void) ggml_sycl::tenant_claim_scope::release(*made, 0);\n        return false;\n    }\n    const ggml_sycl_host_tenant_slot * slot"),
         ("wrap takes the claim by reference", "wrap does not take its claim by value", WRAP_SIG,
-         "std::unique_ptr<ggml_sycl::tenant_claim> claim) {", "std::unique_ptr<ggml_sycl::tenant_claim> & claim) {"),
+         "std::unique_ptr<ggml_sycl::tenant_claim> claim,", "std::unique_ptr<ggml_sycl::tenant_claim> & claim,"),
         ("wrap's failed context allocation leaks the CPU buffer", "a failed context allocation does not free the CPU buffer", WRAP_SIG,
          "    if (!ctx) {\n        ggml_backend_buffer_free(buffer);\n        return nullptr;\n    }", "    if (!ctx) {\n        return nullptr;\n    }"),
         ("wrap's refused set_type leaks the context", "a refused set_type does not free the buffer", WRAP_SIG,
@@ -1622,7 +1624,7 @@ def mutations(header_raw, source):
         ("a publish for an unbound context is silent", "a publish for an unbound context is silent",
          r"\bstatic\s+void\s+ggml_sycl_published_section_set\s*\(", "        if (section) {\n            GGML_LOG_WARN(", "        if (false) {\n            GGML_LOG_WARN("),
         ("the claim after the allocation", "does not claim inside a scope before it allocates",
-         r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_type_alloc_buffer\s*\(",
+         ALLOC_SIG,
          "    if (ggml_sycl::tenant_claim_scope::active()) {",
          "    { ggml_sycl::alloc_handle early{}; (void) ggml_sycl::unified_alloc({}, &early); }\n    if (ggml_sycl::tenant_claim_scope::active()) {"),
         ("the unbound-context return dropped from the section set", "goes on to the registry with key 0",

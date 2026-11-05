@@ -1648,6 +1648,10 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
+uint32_t common_n_ctx_hint(int32_t n_ctx) {
+    return n_ctx > 0 ? (uint32_t) n_ctx : n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;
+}
+
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
@@ -1684,12 +1688,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
-    // the context the caller will create (llama.cpp-ak0p): -c, or without it (or with -c 0) the model's default
-    // context, which llama_context creates as n_ctx_train, so the SYCL load holds that context's KV room as it does
-    // for an explicit -c (llama.cpp-7fmt). A negative -c names no context, so it asks for no room (0). The hint is the
-    // context's whole cell count, which llama_context divides among the slots when the KV is not unified
-    // (llama-server --parallel), so it is never multiplied by n_parallel.
-    mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;
+    // the context the caller will create (llama.cpp-ak0p), as common_n_ctx_hint maps -c. The hint is the context's whole
+    // cell count, which llama_context divides among the slots when the KV is not unified (llama-server --parallel), so
+    // it is never multiplied by n_parallel.
+    mparams.n_ctx_hint = common_n_ctx_hint(params.n_ctx);
 
     // the micro-batch the caller will create the context with: an n_ubatch of 0 is n_batch, and n_batch is at most -c
     // when -c is set (the default context, n_ctx 0, is the training context and bounds nothing here). The clamp by -c

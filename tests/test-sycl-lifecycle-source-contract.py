@@ -1125,11 +1125,16 @@ checks = {
     and "if (sycl_model_backend)" in llama
     and "if (ml.no_alloc)" in llama
     and "defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)" in llama,
+    # The host bufts' alloc_buffer delegates to one shared allocator (design 5efe section 4.4), so both bodies are
+    # read, and the device statement is matched across the alignment the formatter gives it.
     "exact-device host allocation": "ggml_backend_sycl_host_buffer_type_for_device" in public
-    and "req.device = exact_device" in backend
-    and "get_current_device_id()" not in re.search(
-        r"ggml_backend_sycl_host_buffer_type_alloc_buffer\(.*?\n\}", backend, re.S
-    ).group(0),
+    and re.search(r"\breq\.device\s*=\s*exact_device;", re.search(
+        r"static ggml_backend_buffer_t ggml_sycl_host_buft_alloc\(.*?\n\}", backend, re.S
+    ).group(0)) is not None
+    and all("get_current_device_id()" not in re.search(sig + r"\(.*?\n\}", backend, re.S).group(0) for sig in (
+        r"ggml_backend_sycl_host_buffer_type_alloc_buffer",
+        r"static ggml_backend_buffer_t ggml_sycl_host_buft_alloc",
+    )),
     "DL KV and compute parity": all(f'strcmp(name, "{name}")' in backend for name in (
         "ggml_backend_sycl_kv_buffer_type_from_dev",
         "ggml_backend_sycl_push_kv_layer_mask_from_dev",

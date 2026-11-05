@@ -1,5 +1,6 @@
-// The command line of llama-sycl-plan-dry-run. Header-only and host-only: it includes llama.h for the context hint's
-// default and the lazy modes, and nothing else, so its host test touches no backend, device or model.
+// The command line of llama-sycl-plan-dry-run. Header-only and host-only: it includes llama.h for the lazy modes, and
+// nothing else, so its host test touches no backend, device or model. -c is kept as given; the tool maps it to the
+// load's hint with common_n_ctx_hint, as every tool that takes -c does (llama.cpp-h187).
 #pragma once
 
 #include "llama.h"
@@ -18,8 +19,8 @@ struct sycl_plan_dry_run_args {
     uint64_t             mem_available_bytes = 0;      // the sample's MemAvailable in place of the live reading
     uint32_t             n_device_budgets    = 0;      // device_budget_bytes[0..n) are read; 0 keeps a device's own
     uint64_t             device_budget_bytes[SYCL_PLAN_DRY_RUN_ARGS_MAX_DEVICES] = {};
-    uint32_t             n_ctx         = LLAMA_N_CTX_HINT_DEFAULT;  // -c: the context the load would plan room for
-    bool                 lazy_mode_set = false;                     // -lzm given
+    int32_t              n_ctx         = 0;            // -c as given: 0 (the default) names the model's default context
+    bool                 lazy_mode_set = false;        // -lzm given
     enum llama_lazy_mode lazy_mode     = LLAMA_LAZY_MODE_AUTO;
     bool                 help          = false;
 };
@@ -127,11 +128,11 @@ inline bool sycl_plan_dry_run_parse_args(int                      argc,
                 return false;
             }
             uint64_t n_ctx = 0;
-            if (!sycl_plan_dry_run_parse_uint(v, LLAMA_N_CTX_HINT_DEFAULT - 1, n_ctx)) {
+            if (!sycl_plan_dry_run_parse_uint(v, INT32_MAX, n_ctx)) {
                 err = "-c takes a context length (0: the model's default), got '" + std::string(v) + "'";
                 return false;
             }
-            args.n_ctx = n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : static_cast<uint32_t>(n_ctx);
+            args.n_ctx = static_cast<int32_t>(n_ctx);
         } else if (opt == "-lzm" || opt == "--lazy-mode") {
             if (!value(v)) {
                 return false;

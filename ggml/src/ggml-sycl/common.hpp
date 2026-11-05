@@ -16,6 +16,7 @@
 #include "alloc-registry.hpp"
 #include "cpu-dispatch-buffers.hpp"
 #include "dpct/helper.hpp"
+#include "fallback-error.hpp"
 #include "ggml-sycl.h"
 #include "graph-prestage-decline-memo.hpp"
 #include "graph-safe-memcpy-width.hpp"
@@ -48,6 +49,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -60,7 +62,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <exception>
 
 struct ggml_backend_sycl_context;
 bool ggml_sycl_retire_moe_graph_epoch(ggml_backend_sycl_context * ctx) noexcept;
@@ -112,13 +113,7 @@ struct ggml_sycl_fa_graph_snapshot {
     int32_t      max_blocks_per_seq     = 0;
 };
 
-class ggml_sycl_fallback_error final : public std::exception {
-public:
-    explicit ggml_sycl_fallback_error(const char * reason) noexcept : reason_(reason ? reason : "SYCL fallback failed") {}
-    const char * what() const noexcept override { return reason_; }
-private:
-    const char * reason_;
-};
+// ggml_sycl_fallback_error lives in fallback-error.hpp, SYCL-free, so the fail-closed helper can throw it.
 
 bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const char * reason);
 
@@ -7899,6 +7894,11 @@ struct ggml_backend_sycl_context {
     void *                readback_staging      = nullptr;
     size_t                readback_staging_size = 0;
     ggml_sycl::mem_handle readback_staging_handle;
+
+    // This backend context's owner serial (docs/design/sycl-mmap-host-tier.md §4.4 "Lifetimes"): the owner its member
+    // allocations carry (CONTEXT lifetime, checked after `delete` in ggml_backend_sycl_free), and the key of its host
+    // SCRATCH demand and its host holder plan. Never 0.
+    uint64_t host_zone_owner_id = ggml_sycl::host_zone_owner_next_id();
 
     // Persistent host-pinned staging buffer for MMVQ/DMMV/MMQ weight streaming.
     // Eliminates per-token sycl::malloc_host in the mmap-source scatter-gather path.
