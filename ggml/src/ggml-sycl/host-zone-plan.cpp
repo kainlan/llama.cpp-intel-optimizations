@@ -218,7 +218,12 @@ host_scratch_ensure_result host_scratch_ledger::ensure_locked_then_grow(std::uni
     const size_t covered = std::max(r.capacity_before, reserved_target_);
     if (covered < r.target) {
         reserved_increment = r.target - covered;
-        reserved_target_   = r.target;
+#    if defined(HOST_ZONE_PLAN_MUTANT_LEDGER_NO_RESERVE)
+        // Positive control: the deficit is not reserved before the unlock, so a notify that arrives while this grow
+        // runs sees the same deficit and grows for it again.
+#    else
+        reserved_target_ = r.target;
+#    endif
         // One grow_zone call for the deficit plus one alignment of slack per buffer the demands split into, the same
         // slack rule as the miss path. The pool commits one chunk of max(2048 MB, align_up(request)).
         r.request          = reserved_increment + n_buffers * ops.alignment;
@@ -1041,10 +1046,17 @@ host_pool_init_decision host_pools_init_from_plan(int                           
     (void) graph;
     (void) host_experts;
 #    else
+#        if defined(HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_STORAGE_SCAN)
+    // Positive control: the check reads moe_hybrid_init_once's storage scan again, every MUL_MAT_ID whose src0 has
+    // storage, not the nodes the plan folded, so an all-device plan warns.
+    (void) host_experts;
+    const host_pool_dims graph_needs = host_pool_scan(graph, host_pool_has_storage, nullptr);
+#        else
     host_placed_scan s;
     s.host_experts                   = host_experts;
     s.device                         = device;
     const host_pool_dims graph_needs = host_pool_scan(graph, scan_host_placed, &s);
+#        endif
     const bool           exceeds =
         graph_needs.D > state.pools.D || graph_needs.K > state.pools.K || graph_needs.N > state.pools.N;
     if (exceeds && !warnings.over_plan.exchange(true)) {

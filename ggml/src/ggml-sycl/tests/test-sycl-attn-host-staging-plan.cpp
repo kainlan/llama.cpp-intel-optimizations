@@ -17,6 +17,7 @@
 //   HOST_ZONE_PLAN_MUTANT_FAIL_CLOSED_ASSERTS     the fail-closed helper asserting
 //   HOST_ZONE_PLAN_MUTANT_POOLS_OWN_SCAN          the pools sized from their own graph
 //   HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_REMOVED     the over-plan check removed
+//   HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_STORAGE_SCAN the over-plan check reading the storage scan again
 //   HOST_ZONE_PLAN_MUTANT_POOLS_GATE_IS_HOST      ggml_backend_buffer_is_host as the pools' gate
 //   HOST_ZONE_PLAN_MUTANT_POOLS_INIT_ONCE         init-once kept
 //   HOST_ZONE_PLAN_MUTANT_DISPATCH_GROW           the dispatch-time grow restored

@@ -10,6 +10,7 @@
 //   HOST_ZONE_PLAN_MUTANT_NOTIFY_DEVICE0       (host-zone-plan.cpp) the device-0 resolve
 //   HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE    (host-zone-plan.cpp) the notifying backend's ctx->device
 //   HOST_ZONE_PLAN_MUTANT_LEDGER_NO_ROLLBACK   (host-zone-plan.cpp) a failed grow keeps its reservation
+//   HOST_ZONE_PLAN_MUTANT_LEDGER_NO_RESERVE    (host-zone-plan.cpp) the deficit is not reserved before the unlock
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation

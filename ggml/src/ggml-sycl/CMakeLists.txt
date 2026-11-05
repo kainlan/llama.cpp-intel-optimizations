@@ -8212,7 +8212,9 @@ ggml_sycl_host_zone_plan_test(host-scratch-demand MUTANTS
     HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE
         "with the host buft on device 0, a device-1 backend's notify grew device 0 0 time\\(s\\) and device 1 1"
     HOST_ZONE_PLAN_MUTANT_LEDGER_NO_ROLLBACK
-        "after a failed grow, the next notify for the same deficit grew 0 time\\(s\\), expected 1")
+        "after a failed grow, the next notify for the same deficit grew 0 time\\(s\\), expected 1"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_NO_RESERVE
+        "two notifies for one deficit grew 2 time\\(s\\), expected 1")
 
 if (NOT GGML_BACKEND_DL)
     # The real ggml-base scheduler over two CPU backend instances; ggml-cpu is a MODULE under GGML_BACKEND_DL.
@@ -8234,6 +8236,8 @@ ggml_sycl_host_zone_plan_test(attn-host-staging-plan MUTANTS
         "the pools initialized at D=32, expected the plan's D=16"
     HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_REMOVED
         "no `exceeds its planned` line for graph needs D=32"
+    HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_STORAGE_SCAN
+        "an all-device plan printed the over-plan WARN"
     HOST_ZONE_PLAN_MUTANT_POOLS_GATE_IS_HOST
         "pool demand 0.3 MiB for an all-device src0"
     HOST_ZONE_PLAN_MUTANT_POOLS_INIT_ONCE
