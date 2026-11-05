@@ -18,8 +18,9 @@ Windows) or that a rebase of upstream code would silently restore:
 4. T6a's third argument is exactly `taker ? true : <SUPPORTED>`: the taker reads
    through its own O_DIRECT fd and never through a mapping, the non-taker through
    lazy_read, which cannot map without mmap. The pre-fill takes SUPPORTED as its
-   `mmap_supported` argument and load_tensors() passes llama_mmap::SUPPORTED, so the
-   clause is pinned in two places. The mode argument is `taker ? mode_pre : mode_post`.
+   `mmap_supported` argument and load_tensors()'s pre-fill wrapper,
+   llama_model_prefill_lazy_record(), passes llama_mmap::SUPPORTED and the taker
+   load_tensors() hands it, so the clause is pinned in two places. The mode argument is `taker ? mode_pre : mode_post`.
    Always-SUPPORTED and always-true each fail it;
 5. mode_pre is captured before the AUTO resolver llama_lazy_auto_enabled()
    (src/llama-lazy-mode.h, the one resolver load_tensors() calls), the pre-fill runs
@@ -31,7 +32,8 @@ Windows) or that a rebase of upstream code would silently restore:
    row, through llama_lazy_range_check_storage() as the first statement of the branch
    and before buft_for_tensor() can make it an ordinary weight (the refusal's
    behaviour is driven by test-llama-lazy-range-prefill);
-7. the early plan's weights_map loop consults the record.
+7. the early plan's weights_map loop consults the record (the loop is in
+   llama_model_sycl_build_early_inventory(), which the early plan calls).
 
 8. load_all_data() locks each tensor with llama_mlock::lock_range, passing the record's excluded ranges, and never with the
    prefix lock grow_to (which locks contiguously from the mapping's base, so a tensor after a lazy range locks the range
@@ -109,6 +111,26 @@ def load_tensors_body() -> str:
     return function_body(read_code(MODEL_CPP), r"bool\s+llama_model_base::load_tensors\s*\([^)]*\)")
 
 
+# load_tensors() runs the pre-fill through llama_model_prefill_lazy_record(), which the plan dry run's header read also
+# calls (llama.cpp-4zup): the wrapper forwards load_tensors()'s mode_pre and taker and adds the loader's own inputs.
+PREFILL_WRAPPER_RE = r"static void llama_model_prefill_lazy_record\s*\((?:[^()]|\([^()]*\))*\)"
+
+
+def prefill_wrapper_body() -> str:
+    return function_body(read_code(MODEL_CPP), PREFILL_WRAPPER_RE)
+
+
+def prefill_wrapper_params() -> list[str]:
+    m = re.search(PREFILL_WRAPPER_RE, read_code(MODEL_CPP))
+    assert m, "llama_model_prefill_lazy_record() not found"
+    params = m.group(0)[m.group(0).index("(") + 1 : -1]
+    return [re.sub(r"\s+", " ", a.strip()) for a in params.split(",")]
+
+
+def split_args(text: str, call: re.Match) -> list[str]:
+    return [a.strip() for a in re.split(r",(?![^(]*\))", balanced(text, call.end() - 1, "(", ")"))]
+
+
 def create_tensor_body() -> str:
     return function_body(read_code(LOADER_CPP), r"struct ggml_tensor \*\s*llama_model_loader::create_tensor\s*\((?:[^()]|\([^()]*\))*\)")
 
@@ -149,10 +171,16 @@ def test_taker_is_the_loading_guard_not_the_process_level_hooks():
     assert rhs, "load_tensors() does not assign `lazy_taker`"
     assert any(r == "sycl_model_loading_guard.active" for r in rhs), f"`taker` is assigned from {rhs}, never from the loading guard"
     assert not any("hooks_enabled" in r for r in rhs), f"`taker` is assigned from the process-level hooks: {rhs}"
-    call = re.search(r"llama_lazy_range_record_prefill\s*\(", body)
+    call = re.search(r"llama_model_prefill_lazy_record\s*\(", body)
     assert call, "load_tensors() does not call the pre-fill"
     args = balanced(body, call.end() - 1, "(", ")")
     assert "llama_model_sycl_hooks_enabled" not in args, "a pre-fill input names llama_model_sycl_hooks_enabled (process-level)"
+    wrapper = prefill_wrapper_body()
+    inner = re.search(r"llama_lazy_range_record_prefill\s*\(", wrapper)
+    assert inner, "llama_model_prefill_lazy_record() does not call the pre-fill"
+    assert "llama_model_sycl_hooks_enabled" not in balanced(wrapper, inner.end() - 1, "(", ")"), (
+        "a pre-fill input names llama_model_sycl_hooks_enabled (process-level)"
+    )
 
 
 # ---- 4. T6a's arguments ----
@@ -170,12 +198,23 @@ def test_eligibility_arguments_are_pinned():
         "the mode is not `taker ? mode_pre : mode_post`"
     )
     assert args[0] == "mode", f"the first argument is `{args[0]}`, not the mode chosen above"
+    wrapper = prefill_wrapper_body()
+    pre = re.search(r"llama_lazy_range_record_prefill\s*\(", wrapper)
+    assert pre, "llama_model_prefill_lazy_record() does not call the pre-fill"
+    outer = split_args(wrapper, pre)
+    assert outer[-1] == "llama_mmap::SUPPORTED", (
+        f"the pre-fill wrapper passes `{outer[-1]}` as mmap_supported, not llama_mmap::SUPPORTED"
+    )
+    assert outer[-2] == "lazy_taker", f"the pre-fill wrapper passes `{outer[-2]}` as taker"
+    # the wrapper's lazy_taker is load_tensors()'s own
+    params = prefill_wrapper_params()
+    assert params[-1] == "bool lazy_taker", f"the pre-fill wrapper's last parameter is `{params[-1]}`, not the taker"
     lt = load_tensors_body()
-    pre = re.search(r"llama_lazy_range_record_prefill\s*\(", lt)
-    assert pre, "load_tensors() does not call the pre-fill"
-    outer = [a.strip() for a in re.split(r",(?![^(]*\))", balanced(lt, pre.end() - 1, "(", ")"))]
-    assert outer[-1] == "llama_mmap::SUPPORTED", f"load_tensors() passes `{outer[-1]}` as mmap_supported, not llama_mmap::SUPPORTED"
-    assert outer[-2] == "lazy_taker", f"load_tensors() passes `{outer[-2]}` as taker"
+    call = re.search(r"llama_model_prefill_lazy_record\s*\(", lt)
+    assert call, "load_tensors() does not call the pre-fill"
+    passed = split_args(lt, call)
+    assert len(passed) == len(params), f"load_tensors() passes {passed} to the pre-fill wrapper's {params}"
+    assert passed[-1] == "lazy_taker", f"load_tensors() passes `{passed[-1]}` as taker"
 
 
 # ---- 5. order ----
@@ -187,7 +226,7 @@ def test_mode_pre_is_captured_before_the_fallback_and_the_prefill_precedes_the_e
     capture = re.search(r"\blazy_mode_pre\s*=\s*ml\.lazy\.mode\s*;", body)
     assert capture, "load_tensors() does not capture mode_pre from ml.lazy.mode"
     resolve = body.index("llama_lazy_auto_enabled(")
-    prefill = body.index("llama_lazy_range_record_prefill(")
+    prefill = body.index("llama_model_prefill_lazy_record(")
     assert body.count("llama_model_sycl_compute_early_plan(") == 1, "load_tensors() calls the early plan more than once"
     early = body.index("llama_model_sycl_compute_early_plan(")
     assert guard < capture.start() < resolve < prefill < early, (
@@ -254,8 +293,14 @@ def test_the_per_tensor_lock_is_ranged_and_reads_the_record():
 
 
 def test_early_plan_consults_the_record():
+    # the early plan builds its inventory through llama_model_sycl_build_early_inventory(), which the plan dry run's
+    # header read also calls (llama.cpp-4zup): the weights_map loop lives there
     code = read_code(MODEL_CPP)
-    body = function_body(code, r"static void llama_model_sycl_compute_early_plan\s*\((?:[^()]|\([^()]*\))*\)")
+    plan = function_body(code, r"static void llama_model_sycl_compute_early_plan\s*\((?:[^()]|\([^()]*\))*\)")
+    assert re.search(r"\bllama_model_sycl_build_early_inventory\s*\(", plan), (
+        "the early plan does not build its inventory through llama_model_sycl_build_early_inventory()"
+    )
+    body = function_body(code, r"static bool llama_model_sycl_build_early_inventory\s*\((?:[^()]|\([^()]*\))*\)")
     loop = re.search(r"for\s*\(\s*auto\s*&\s*weight\s*:\s*ml\.weights_map\s*\)\s*\{(.*?)\n    \}", body, flags=re.DOTALL)
     assert loop, "the early plan's weights_map loop is gone"
     assert "llama_lazy_early_plan_excludes" in loop.group(1), "the early plan's weights_map loop does not consult the record"

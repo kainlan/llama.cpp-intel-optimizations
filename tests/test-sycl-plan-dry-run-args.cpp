@@ -5,6 +5,7 @@
 // one tensor) it hands the callback the inventory the load's own builder makes of the header: one call, one tensor.
 // Host-only: no backend is initialised, and no device or model is touched.
 
+#include "common.h"
 #include "sycl-plan-dry-run-args.h"
 
 // The tool's header read, an undecorated libllama internal reached the way tests/test-llama-lazy-range-prefill.cpp
@@ -199,7 +200,9 @@ int main() {
         check(p.args.model == "/models/x.gguf", "the model path is '" + p.args.model + "'");
         check(!p.args.mem_available_set, "MemAvailable is overridden without --mem-available");
         check(p.args.n_device_budgets == 0, "device budgets are set without --device-budget");
-        check(p.args.n_ctx == LLAMA_N_CTX_HINT_DEFAULT, "the context is not the default without -c");
+        check(p.args.n_ctx == 0, "-c is not 0 without -c");
+        check(common_n_ctx_hint(p.args.n_ctx) == LLAMA_N_CTX_HINT_DEFAULT,
+              "the load's hint is not the model's default context without -c");
         check(!p.args.lazy_mode_set, "the lazy mode is set without -lzm");
         check(!p.args.help, "help is set without -h");
     }
@@ -238,11 +241,15 @@ int main() {
     // -c: 0 is the default context, as for llama-cli
     {
         const parsed p = parse({ "-m", "x", "-c", "4096" });
-        check(p.ok && p.args.n_ctx == 4096, "-c 4096 is not 4096");
+        check(p.ok && p.args.n_ctx == 4096 && common_n_ctx_hint(p.args.n_ctx) == 4096, "-c 4096 is not 4096");
         const parsed z = parse({ "-m", "x", "-c", "0" });
-        check(z.ok && z.args.n_ctx == LLAMA_N_CTX_HINT_DEFAULT, "-c 0 is not the default context");
+        check(z.ok && z.args.n_ctx == 0 && common_n_ctx_hint(z.args.n_ctx) == LLAMA_N_CTX_HINT_DEFAULT,
+              "-c 0 is not the default context");
+        const parsed top = parse({ "-m", "x", "-c", "2147483647" });
+        check(top.ok && top.args.n_ctx == INT32_MAX, "-c INT32_MAX is refused");
     }
     refused({ "-m", "x", "-c", "-1" }, "-c -1");
+    refused({ "-m", "x", "-c", "2147483648" }, "-c past INT32_MAX");
     refused({ "-m", "x", "-c", "abc" }, "-c abc");
     // -lzm on|auto|off, as for llama-cli
     {
