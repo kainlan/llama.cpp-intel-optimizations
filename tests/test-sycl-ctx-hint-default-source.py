@@ -205,8 +205,11 @@ def claim_api_defines_the_default(llama_h: str) -> bool:
 
 
 COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_params & params)"
-COMMON_HINT = ("mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : "
-               "params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;")
+# common maps -c to the hint in one function, which common_model_params_to_llama and every tool that takes -c ask, so
+# the sentinel keeps one setter (llama.cpp-h187: the plan dry run mapped -c itself).
+COMMON_HINT_SIG = "uint32_t common_n_ctx_hint(int32_t n_ctx)"
+COMMON_HINT = "return n_ctx > 0 ? (uint32_t) n_ctx : n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;"
+COMMON_HINT_CALL = "mparams.n_ctx_hint = common_n_ctx_hint(params.n_ctx);"
 COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
 COMMON_FIT_REFRESH = "if (params.n_ctx >= 0 && cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
 COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
@@ -221,7 +224,9 @@ def claim_common_asks_for_the_default(common: str) -> bool:
     signed -c gates the refresh. Those are the only two setters."""
     n = norm(common)
     b = body(n, COMMON_SIG)
-    return (bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
+    hint = body(n, COMMON_HINT_SIG)
+    return (bool(b) and bool(hint) and hint == "{ " + COMMON_HINT + " }" and COMMON_HINT_CALL in b
+            and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
             and n.count("mparams.n_ctx_hint =") == 2 and n.count(SENTINEL) == 1)
 
 
@@ -527,15 +532,20 @@ def test_mutant_api_field_undocumented_fails():
 def test_mutant_common_keeps_zero_without_c_fails():
     """master's line: without -c the hint is 0 and no room is held for the context llama then creates."""
     assert not claim_common_asks_for_the_default(
-        _once(COMMON, COMMON_HINT, "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : 0;"))
+        _once(COMMON, COMMON_HINT, "return n_ctx > 0 ? (uint32_t) n_ctx : 0;"))
 
 
 def test_mutant_common_negative_c_asks_for_the_default_fails():
     """A negative -c, which names no context, asks for the default: the load would hold the training context's room
     for a context llama_context cannot create."""
     assert not claim_common_asks_for_the_default(
-        _once(COMMON, COMMON_HINT,
-              "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : LLAMA_N_CTX_HINT_DEFAULT;"))
+        _once(COMMON, COMMON_HINT, "return n_ctx > 0 ? (uint32_t) n_ctx : LLAMA_N_CTX_HINT_DEFAULT;"))
+
+
+def test_mutant_common_load_skips_the_mapping_fails():
+    """common_model_params_to_llama sets the hint some other way: the mapping is still right, and unasked."""
+    assert not claim_common_asks_for_the_default(
+        _once(COMMON, COMMON_HINT_CALL, "mparams.n_ctx_hint = (uint32_t) params.n_ctx;"))
 
 
 def test_mutant_common_fit_refresh_unguarded_fails():
