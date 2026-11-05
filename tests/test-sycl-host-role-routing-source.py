@@ -1427,17 +1427,27 @@ def clause_withdrawal(texts: dict) -> list:
 
 
 def clause_notify_device(texts: dict) -> list:
-    """§4.4 "One source for the host bufts' device" (I-D): the notify grows the host buft's device's SCRATCH."""
+    """§4.4 "One source for the host bufts' device" (I-D), r3 I-1: the notify grows the host buft's device's SCRATCH
+    through the ledger's ensure call, and its growth path resolves the ledger of that device, not device 0's."""
     fails = []
     notify = _body(texts, GS, "ggml_backend_sycl_notify_host_buffer_sizes")
     if not re.search(r"env\s*\.\s*host_buft_device\s*=\s*ggml_sycl_notify_host_buft_device\s*;", notify):
         fails.append("notify device: the notify's device is not ggml_sycl_notify_host_buft_device")
+    if not re.search(r"env\s*\.\s*ledger_of\s*=\s*ggml_sycl_notify_ledger_of\s*;", notify) or \
+            not re.search(r"return\s+ggml_sycl::host_scratch_notify\s*\(\s*env\s*,\s*backend\s*,", notify):
+        fails.append("notify device: the notify does not grow through host_scratch_notify, the ledger's "
+                     "ensure-capacity call, with ggml_sycl_notify_ledger_of as its growth path")
+    ledger = _body(texts, GS, "ggml_sycl_notify_ledger_of")
+    if not re.search(r"\bunified_cache_host_scratch_ledger\s*\(\s*device\s*,", ledger):
+        fails.append("notify device: ggml_sycl_notify_ledger_of does not resolve the ledger of the device "
+                     "host_scratch_notify hands it")
     dev = _body(texts, GS, "ggml_sycl_notify_host_buft_device")
     if not re.search(r"return\s+ggml_sycl_host_buft_device\s*\(\s*ggml_backend_dev_host_buffer_type\s*\(\s*"
                      r"ggml_backend_get_device\s*\(\s*backend\s*\)\s*\)\s*\)\s*;", dev):
         fails.append("notify device: the notify's device is not the host buft's (the buft llama_context allocates "
                      "from)")
-    for fn in ("ggml_backend_sycl_notify_host_buffer_sizes", "ggml_sycl_notify_host_buft_device"):
+    for fn in ("ggml_backend_sycl_notify_host_buffer_sizes", "ggml_sycl_notify_host_buft_device",
+               "ggml_sycl_notify_ledger_of"):
         b = _body(texts, GS, fn)
         if re.search(r"backend\s*->\s*context\s*\)\s*->\s*device|ctx\s*->\s*device|get_current_device_id|"
                      r"grow_(?:host_)?scratch_zone|\(\s*0\s*\)", b):
@@ -1715,6 +1725,11 @@ _SCHED_SITES = [
     "#ifdef GGML_USE_SYCL\n    llama_context_sycl_attach_sched_plan(state.sched.get(), backends);\n",
 ]
 _RETRY_BEGIN = "                hooks.begin_host_holders(state.sched.get());\n"
+_BEGIN = "    hooks.begin_host_holders(state.sched.get());\n"
+_SCHED_NEW_0 = ("    state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), "
+                "backend_ptrs.size(), max_nodes,\n")
+_ARENA_RESERVED = ("        GGML_ABORT(\"[SYCL-PLAN] compute arena reserve smaller than scheduler requirement\");\n"
+                   "    }\n")
 _MEASURED = ("            return { sched_reserve_status::FAILED, format(\"failed to measure graph %zu of %zu\", gi, "
              "graphs.size()) };\n        }\n")
 _OPEN_TRIAL = (UC, None, "\nsize_t unified_cache::host_scratch_trial(host_scratch_trial_op op, uint64_t owner) {\n"
@@ -1765,9 +1780,9 @@ FIXTURES = {
     ],
     "context-wiring": [
         (LC, _HOOKS_AT, _HOOKS_AT + _WIRING_HOOKS),
-        (LC, _SCHED_SITES[0], _SCHED_SITES[0] + "    hooks.begin_host_holders(state.sched.get());\n"),
+        (LC, _SCHED_SITES[0], _SCHED_SITES[0] + _BEGIN),
         (LC, _SCHED_SITES[1], _SCHED_SITES[1] + _RETRY_BEGIN),
-        (LC, _SCHED_SITES[2], _SCHED_SITES[2] + "    hooks.begin_host_holders(state.sched.get());\n"),
+        (LC, _SCHED_SITES[2], _SCHED_SITES[2] + _BEGIN),
         (LC, _MEASURED, _MEASURED + "        hooks.plan_host_holders(state.sched.get(), gf);\n"),
     ],
     "trial-ops": [
@@ -1933,6 +1948,22 @@ MUTANTS = [
     ("notify-backend-device", "notify-device",
      [(GS, _NOTIFY_DEVICE, "    return static_cast<const ggml_backend_sycl_context *>(backend->context)->device;\n")],
      "ggml_sycl_notify_host_buft_device resolves the notifying backend's device"),
+    ("notify-additive-grow", "notify-device",
+     [(GS, "    return ggml_sycl::host_scratch_notify(env, backend, host_compute_bytes, host_output_bytes);\n",
+       "    (void) env;\n"
+       "    return ggml_sycl::unified_cache_grow_scratch_zone(ggml_sycl_notify_host_buft_device(backend),\n"
+       "                                                      host_compute_bytes + host_output_bytes);\n")],
+     "the notify does not grow through host_scratch_notify"),
+    ("notify-growth-device0", "notify-device",
+     [(GS, "    return ggml_sycl::unified_cache_host_scratch_ledger(device, "
+           "ggml_backend_sycl_host_buffer_type_chunk_cap(), ledger,\n",
+       "    (void) device;\n"
+       "    return ggml_sycl::unified_cache_host_scratch_ledger(0, "
+       "ggml_backend_sycl_host_buffer_type_chunk_cap(), ledger,\n")],
+     "ggml_sycl_notify_ledger_of does not resolve the ledger of the device"),
+    ("grow-host-scratch-called", "grow-host-scratch-gone",
+     [(GS, _ARENA_RESERVED, _ARENA_RESERVED + "    ggml_sycl::unified_cache_grow_host_scratch_zone(total_bytes);\n")],
+     "ggml/src/ggml-sycl/ggml-sycl.cpp defines or calls unified_cache_grow_host_scratch_zone"),
     ("grow-host-scratch-defined", "grow-host-scratch-gone",
      [(UC, None, "\nvoid unified_cache_grow_host_scratch_zone(int device, size_t bytes) {\n"
                  "    (void) device;\n"
@@ -1951,6 +1982,10 @@ MUTANTS = [
      "the pools' init is sized from"),
     ("wiring-retry-unbegun", "context-wiring", [(LC, _RETRY_BEGIN, "")],
      "creates a scheduler and reserves before the begin entry"),
+    ("wiring-begin-before-creation", "context-wiring",
+     [(LC, _SCHED_NEW_0 + _SCHED_SITES[0] + _BEGIN,
+       _BEGIN + _SCHED_NEW_0 + _SCHED_SITES[0])],
+     "sched_reserve_impl creates a scheduler and reserves before the begin entry"),
     ("wiring-plan-after-full-reserve", "context-wiring",
      [(LC, "graph_mctx, true, sizes.data());", "graph_mctx, false, sizes.data());")],
      "calls the plan entry not right after a split_only graph_reserve"),
