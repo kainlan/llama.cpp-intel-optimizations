@@ -2736,10 +2736,16 @@ static auto * const                 g_host_pool_held    = new ggml_sycl::host_po
 static auto * const g_host_pool_init_warnings           = new ggml_sycl::host_pool_init_warnings[GGML_SYCL_MAX_DEVICES];
 
 // The pools' one init: `device`'s PinnedBufferPool at `dims` on `queue`, for moe_hybrid_init_once's primary and
-// secondary devices and for the host holder plan's sink. It records the figures the pool now holds: `dims` when the
-// pool is up, none when the init failed, so a later commit compares its plan against what the pool really has.
+// secondary devices and for the host holder plan's sink. It records the figures the pool now holds, so a later commit
+// compares its plan against what the pool really has: `dims` when this init brings the pool up, none when the init
+// fails. A pool already up keeps its figures and their record: PinnedBufferPool::init returns at once on it, which is
+// why a resize goes through the sink's shutdown first. moe_hybrid_init_once runs again after a MoE owner switch while
+// the previous owner's pools are still up.
 static void ggml_sycl_host_pool_init(sycl::queue & queue, int device, const ggml_sycl::host_pool_dims & dims) {
     ggml_sycl::PinnedBufferPool & pool = g_pinned_buffer_pools[device];
+    if (pool.is_initialized()) {
+        return;
+    }
     pool.init(queue, device, static_cast<size_t>(dims.D), static_cast<size_t>(dims.K), static_cast<size_t>(dims.N));
     g_host_pool_held[device] = pool.is_initialized() ? dims : ggml_sycl::host_pool_dims{};
 }
