@@ -20,13 +20,13 @@
 // like a FAIL. Every arm runs, so one failure does not hide the rest.
 //
 // --mutant predicate-too-broad runs the buffer-type table alone with ggml_backend_sycl_buffer_is_lazy also claiming
-// the SYCL device type, and the table must FAIL on that row: the registered positive control of an arm whose RED
-// cannot fail (with no descriptor test, no other type's answer can change).
+// the SYCL device type, and the table must FAIL on that row: its registered positive control. Without the descriptor
+// test no other type's answer can change, so the table needs a mutant to show it can fail.
 //
 // --mutant read-whole-window runs arm (2) alone with its end-of-file table built by a read that asks for the whole
-// O_DIRECT window, and the arm must FAIL naming that geometry: the registered positive control of a sub-check the
-// stub cannot fail for the right reason (a read that stops at the table's last byte and one that does not differ only
-// when the window runs past the end of the file).
+// O_DIRECT window, and the arm must FAIL naming that geometry: the end-of-file sub-check's registered positive
+// control. A read that stops at the table's last byte and one that reads the whole window differ only when the window
+// runs past the end of the file, so the sub-check needs a mutant to show it can fail.
 
 #include "../common.hpp"
 #include "../host-cpu-mapping.hpp"
@@ -58,6 +58,7 @@ extern char ** environ;
 using namespace host_ledger_test_harness;
 using namespace lazy_table_test;
 using ggml_sycl::host_cpu_mapped_size;
+using ggml_sycl::LAZY_IO_BLOCK_BYTES;
 using ggml_sycl::lazy_residency;
 using ggml_sycl::lazy_table_create_host;
 using ggml_sycl::lazy_table_create_storage;
@@ -183,6 +184,11 @@ lazy_table_desc fixture_desc(const char *   name,
 uint64_t host_cpu_live() {
     uint64_t live = 0;
     return ggml_sycl_test_host_cpu_live_bytes(&live) ? live : UINT64_MAX;
+}
+
+// The status a materialization returned, by its printed name.
+std::string status_name(const lazy_table_result & t) {
+    return ggml_sycl::lazy_table_status_name(t.status);
 }
 
 // A refusal the environment caused, not the table: no O_DIRECT, or a lock limit below the body.
@@ -339,7 +345,7 @@ void expect_eof_table_reads(arm_result & r) {
                                  ", " + num(k_table_a_bytes) + " B, the window " + num(k_eof_past_end) +
                                  " B past the end of the file)";
     expect(r,
-           k_eof_offset + k_table_a_bytes == k_eof_file_bytes && k_eof_file_bytes % 4096 != 0 &&
+           k_eof_offset + k_table_a_bytes == k_eof_file_bytes && k_eof_file_bytes % LAZY_IO_BLOCK_BYTES != 0 &&
                lazy_table_host_body_request_bytes(k_eof_offset, k_table_a_bytes) == k_eof_window_bytes &&
                k_eof_window_bytes - k_eof_file_bytes == k_eof_past_end,
            "the end-of-file fixture is not the geometry the hand figures assume");
@@ -409,7 +415,7 @@ arm_result arm_host_eager_read() {
         return r;
     }
     expect(r, !rows.resolve(0), "a device was handed the HOST_CPU rows: resolve(0) is not empty");
-    expect(r, reinterpret_cast<uintptr_t>(view.ptr) % ggml_sycl::LAZY_IO_BLOCK_BYTES == k_table_offset % 4096,
+    expect(r, reinterpret_cast<uintptr_t>(view.ptr) % LAZY_IO_BLOCK_BYTES == k_table_offset % LAZY_IO_BLOCK_BYTES,
            "the rows do not sit at the window's head inside the body");
     const size_t bad = first_mismatch(static_cast<const uint8_t *>(view.ptr), k_table_offset, k_table_a_bytes);
     expect(r, bad == SIZE_MAX, "row byte " + num(bad) + " differs from the file's");
@@ -478,7 +484,10 @@ arm_result arm_last_reference_releases() {
             expect(r, t.table->ref_count() == 2, "a copied reference counts " + num(t.table->ref_count()));
         }
         expect(r, t.table->ref_count() == 1, "the dropped copy left " + num(t.table->ref_count()) + " references");
-        expect(r, host_cpu_live() - before == k_mapped_a_bytes, "a dropped copy released the body");
+        const uint64_t live_after_copy = host_cpu_live() - before;
+        expect(r, live_after_copy == k_mapped_a_bytes,
+               "a dropped copy released the body: the live HOST_CPU rows are " + num(live_after_copy) +
+                   " B above the start, want " + num(k_mapped_a_bytes));
     }
     expect(r, host_cpu_live() == before,
            "the last reference left " + num(host_cpu_live() - before) + " HOST_CPU bytes live, want 0");
@@ -548,7 +557,7 @@ arm_result arm_storage_holds_its_descriptor() {
 arm_result arm_source_short_refuses() {
     arm_result     r;
     const uint64_t before = host_cpu_live();
-    const uint64_t offset = k_file_bytes - 4096;  // the table runs past the end of the file
+    const uint64_t offset = k_file_bytes - LAZY_IO_BLOCK_BYTES;  // the table runs past the end of the file
     log_clear();
     lazy_table_result t = lazy_table_create_host(fixture_desc("short.lazy", offset, k_rows_a, lazy_residency::HOST, 0));
     if (t.status == lazy_table_status::OPEN_FAILED) {
@@ -577,15 +586,20 @@ arm_result arm_invalid_desc_refuses() {
     arm_result      r;
     lazy_table_desc d = fixture_desc("invalid.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, 0);
     d.row_size += 1;
-    expect(r, lazy_table_create_host(d).status == lazy_table_status::INVALID_DESC, "a wrong row_size was accepted");
+    const lazy_table_result row = lazy_table_create_host(d);
+    expect(r, row.status == lazy_table_status::INVALID_DESC,
+           "a wrong row_size gave " + status_name(row) + ", want lazy-table-invalid-desc");
     d           = fixture_desc("invalid.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, 0);
     d.file_path = "/nonexistent/path/that/is/never/opened";
     d.table_bytes += 1;
-    expect(r, lazy_table_create_host(d).status == lazy_table_status::INVALID_DESC,
-           "a table_bytes that is not row_size * n_rows reached the open");
+    const lazy_table_result bytes = lazy_table_create_host(d);
+    expect(r, bytes.status == lazy_table_status::INVALID_DESC,
+           "a table_bytes that is not row_size * n_rows gave " + status_name(bytes) + ", want lazy-table-invalid-desc");
     d = fixture_desc("invalid.lazy", k_table_offset, k_rows_a, lazy_residency::STORAGE, 0);
-    expect(r, lazy_table_create_host(d).status == lazy_table_status::INVALID_DESC,
-           "the HOST constructor built a table the plan made STORAGE");
+    const lazy_table_result storage = lazy_table_create_host(d);
+    expect(r, storage.status == lazy_table_status::INVALID_DESC,
+           "the HOST constructor gave " + status_name(storage) +
+               " for a table the plan made STORAGE, want lazy-table-invalid-desc");
 
     // Arm (1)'s saturated window: 2^62 - 1009 F32 rows of 4 B at offset 4032 end 4 B short of 2^64, so offset + size
     // fits, but the window rounds past 2^64.
@@ -602,15 +616,13 @@ arm_result arm_invalid_desc_refuses() {
            "the saturated case is not a window past size_t over an offset + size that fits");
     const lazy_table_result window = lazy_table_create_host(d);
     expect(r, window.status == lazy_table_status::INVALID_DESC,
-           std::string("a window no size_t holds gave ") + ggml_sycl::lazy_table_status_name(window.status) +
-               ", want lazy-table-invalid-desc");
+           "a window no size_t holds gave " + status_name(window) + ", want lazy-table-invalid-desc");
 
     d                             = fixture_desc("invalid.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, -7);
     d.file_path                   = "/nonexistent/path/that/is/never/opened";
     const lazy_table_result other = lazy_table_create_host(d);
     expect(r, other.status == lazy_table_status::INVALID_DESC,
-           std::string("consumer_device=-7 gave ") + ggml_sycl::lazy_table_status_name(other.status) +
-               ", want lazy-table-invalid-desc");
+           "consumer_device=-7 gave " + status_name(other) + ", want lazy-table-invalid-desc");
     return r;
 }
 
@@ -735,11 +747,16 @@ arm_result arm_bound_tensor_keeps_extra_null() {
             continue;
         }
         ggml_tensor * tensor = new_table_tensor(ctx, f.form);
-        expect(r, t.table->ref_count() == 2, std::string("the ") + f.form + " descriptor holds no reference");
-        expect(r, ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
-               std::string("the ") + f.form + " descriptor's usage is not WEIGHTS");
+        expect(r, t.table->ref_count() == 2,
+               std::string("the ") + f.form + " descriptor holds no reference: the table counts " +
+                   num(t.table->ref_count()) + ", want 2");
+        const ggml_backend_buffer_usage usage = ggml_backend_buffer_get_usage(buffer);
+        expect(r, usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
+               std::string("the ") + f.form + " descriptor's usage is " + std::to_string((int) usage) +
+                   ", want WEIGHTS (" + std::to_string((int) GGML_BACKEND_BUFFER_USAGE_WEIGHTS) + ")");
         expect(r, ggml_backend_buffer_get_size(buffer) == k_table_a_bytes,
-               std::string("the ") + f.form + " descriptor's size is not the table's");
+               std::string("the ") + f.form + " descriptor's size is " + num(ggml_backend_buffer_get_size(buffer)) +
+                   " B, want the table's " + num(k_table_a_bytes));
         expect(r, !ggml_backend_buffer_is_host(buffer), std::string("the ") + f.form + " descriptor is host");
         expect(r,
                reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(buffer)) == ggml_sycl::LAZY_TABLE_SENTINEL_BASE,
@@ -751,7 +768,9 @@ arm_result arm_bound_tensor_keeps_extra_null() {
         expect(r, st == GGML_STATUS_SUCCESS, std::string("the ") + f.form + " binding failed");
         expect(r, tensor->extra == nullptr, std::string("the ") + f.form + " binding set tensor->extra");
         ggml_backend_buffer_free(buffer);
-        expect(r, t.table->ref_count() == 1, std::string("the ") + f.form + " descriptor's free kept its reference");
+        expect(r, t.table->ref_count() == 1,
+               std::string("the ") + f.form + " descriptor's free kept its reference: the table counts " +
+                   num(t.table->ref_count()) + ", want 1");
     }
     ggml_free(ctx);
     return r;
@@ -785,8 +804,9 @@ arm_result arm_descriptor_guard() {
 }
 
 // A context whose bytes the fixture controls: zero, so today's read of it is DEVICE_VRAM (alloc_tier 0) for every
-// buffer type, and a descriptor test that fired on a type would flip that type's answer to false. Larger than any
-// SYCL buffer context, so the read stays inside it.
+// buffer type, and a descriptor test that fired on a type would flip that type's answer to false. It is smaller than a
+// SYCL buffer context, which holds GGML_SYCL_MAX_DEVICES mem_handles and their metadata. The read stays inside it
+// because it touches only managed_meta.tier, which lies within the first 128 bytes of ggml_backend_sycl_buffer_context.
 alignas(64) unsigned char g_zero_context[4096] = {};
 
 struct buft_row {
@@ -885,9 +905,9 @@ std::vector<buft_row> exposed_bufts() {
 
 // (13) No other buffer type's is_device_vram_buffer answer changes, over every type the backend exposes:
 // each row's buffer carries a zeroed context, so today's read is true for every type and the descriptor test is the
-// only thing that can make the answer false. Its RED cannot fail, since without the descriptor test no answer can
-// change; --mutant predicate-too-broad is its positive control. Engagement: every factory returned a type and
-// today's read of every row is true.
+// only thing that can make the answer false. Without the descriptor test no answer can change, so the arm alone
+// cannot show it can fail; --mutant predicate-too-broad is its positive control. Engagement: every factory returned a
+// type and today's read of every row is true.
 arm_result arm_vram_answer_unchanged_for_other_types() {
     arm_result r;
     for (const buft_row & row : exposed_bufts()) {
