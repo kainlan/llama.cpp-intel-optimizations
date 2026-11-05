@@ -114,13 +114,15 @@ texts = {
         window=30000),
     "setter_fn": function_window(
         sycl_cpp,
-        "void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {"),
+        "void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, "
+        "const ggml_sycl_tensor_inventory * inventory) {"),
     "get_max_size_fn": function_window(
         sycl_cpp,
         "static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {"),
     "alloc_buffer_fn": function_window(
         sycl_cpp,
-        "static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,"),
+        "static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer("
+        "ggml_backend_buffer_type_t buft,"),
     "intent_fn": function_window(
         sycl_cpp, "static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind kind) {"),
     "host_zone_fn": function_window(
@@ -132,10 +134,12 @@ texts = {
     "host_alloc_fn": function_window(
         sycl_cpp, "static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_t buft,"),
     "kv_get_max_size_fn": function_window(
-        sycl_cpp, "static size_t ggml_backend_sycl_kv_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {"),
+        sycl_cpp,
+        "static size_t ggml_backend_sycl_kv_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {"),
     "kv_alloc_buffer_fn": function_window(
         sycl_cpp,
-        "static ggml_backend_buffer_t ggml_backend_sycl_kv_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,"),
+        "static ggml_backend_buffer_t ggml_backend_sycl_kv_host_buffer_type_alloc_buffer("
+        "ggml_backend_buffer_type_t buft,"),
     "kv_buft_fn": function_window(sycl_cpp, "ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type() {"),
     "hc_get_max_size_fn": function_window(
         sycl_cpp,
