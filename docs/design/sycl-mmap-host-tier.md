@@ -5463,7 +5463,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
         chunk, but the walk reaches A through the marked set. The `KEEP`
         ending un-withdraws A, which no begin's release can then free
         (`release_zone_chunk` requires the flag), and fails with
-        `chunk_count <n+2> after the begin, expected <n+1>`.
+        `chunk_count <n+2> after the begin, expected <n+1>`. The landed
+        `release_zone_chunk` asserts the flag instead of refusing, so
+        that begin aborts before its line prints, and the registered arm
+        scores the check this fault fails first: `chunk <idx> not
+        withdrawn after KEEP: KEEP reaches only the transaction's
+        chunks`, printed by the `KEEP` endings before the begin.
     - **A release leaves no marked-set entry** (r11 m-5): after the empty
       return's release, the cache-path window's begin release and the
       retry endings' releases, the device's marked set is empty
