@@ -363,6 +363,7 @@ static void pp_scratch_profile_end() {
 #include "ggml-sycl/moe-xmx-fused.hpp"
 #include "ggml-sycl/moe-xmx.hpp"
 #include "ggml-sycl/quantized-comm.hpp"
+#include "ggml-sycl/scratch-test-mutant.hpp"
 #include "ggml-sycl/sycl-profiling.hpp"
 #include "ggml-sycl/tensor-types.hpp"
 #include "ggml-sycl/tiered-plan-clear.hpp"
@@ -98477,6 +98478,21 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     }
     const int      freed_device   = sycl_ctx ? sycl_ctx->device : -1;
     const uint64_t freed_owner_id = sycl_ctx ? sycl_ctx->host_zone_owner_id : 0;
+    // The owner's end, before the context is deleted (§4.4 "Every withdrawn chunk has an owner and a bounded
+    // release"): an open transaction is returned, empty marked chunks are released and the rest are orphaned. It runs
+    // on the host buft's device, where the context's notify grew SCRATCH and its transaction filed the chunks.
+    const int      owner_end_device = ggml_sycl_notify_host_buft_device(backend);
+    bool           owner_end        = freed_owner_id != 0;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    using ggml_sycl::scratch_test_mutant;
+    using ggml_sycl::scratch_test_mutant_on;
+    if (scratch_test_mutant_on(scratch_test_mutant::OWNER_END_REMOVED)) {
+        owner_end = false;
+    }
+#endif
+    if (owner_end) {
+        (void) ggml_sycl::unified_cache_host_scratch_owner_end(owner_end_device, freed_owner_id);
+    }
     delete sycl_ctx;
     // The backend-member check (§4.4 "Lifetimes", §M57 (b)): after the context's destructor has released its members,
     // no CONTEXT record of this backend may remain. Then the context's notified SCRATCH demand and its host holder plan

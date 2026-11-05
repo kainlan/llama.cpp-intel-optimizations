@@ -55,8 +55,11 @@ ARMS = {
 
 FREE_SIG = "static void ggml_backend_sycl_free(ggml_backend_t backend) {"
 OWNER_END = "ggml_sycl::unified_cache_host_scratch_owner_end("
-OWNER_END_ARGS = re.compile(r"ggml_sycl::unified_cache_host_scratch_owner_end\((sycl_ctx->device|freed_device), "
-                            r"(sycl_ctx->host_zone_owner_id|freed_owner_id)\)")
+OWNER_END_ARGS = re.compile(r"ggml_sycl::unified_cache_host_scratch_owner_end\(([^,()]+(?:\(backend\))?), "
+                            r"(?:sycl_ctx->host_zone_owner_id|freed_owner_id)\)")
+# The device the owner's end runs on: the host buft's, where the context's notify grew SCRATCH and its transaction
+# filed the chunks. SYCL_Host is one buft on reg device 0, so the context's own device walks another marked set.
+HOST_BUFT_DEVICE = "ggml_sycl_notify_host_buft_device(backend)"
 REMOVED = "scratch_test_mutant_on(scratch_test_mutant::OWNER_END_REMOVED)"
 DELETE = "    delete sycl_ctx;\n"
 # The wiring the design names, planted by the production controls when the tree does not yet make the call. The
@@ -64,14 +67,17 @@ DELETE = "    delete sycl_ctx;\n"
 WIRING = """\
     // The owner's end, before the context is deleted (§4.4 "Every withdrawn chunk has an owner and a bounded
     // release"): an open transaction is returned, empty marked chunks are released and the rest are orphaned.
-    bool owner_end = freed_owner_id != 0;
+    const int owner_end_device = ggml_sycl_notify_host_buft_device(backend);
+    bool      owner_end        = freed_owner_id != 0;
 #if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    using ggml_sycl::scratch_test_mutant;
+    using ggml_sycl::scratch_test_mutant_on;
     if (scratch_test_mutant_on(scratch_test_mutant::OWNER_END_REMOVED)) {
         owner_end = false;
     }
 #endif
     if (owner_end) {
-        (void) ggml_sycl::unified_cache_host_scratch_owner_end(freed_device, freed_owner_id);
+        (void) ggml_sycl::unified_cache_host_scratch_owner_end(owner_end_device, freed_owner_id);
     }
 """
 
@@ -321,8 +327,14 @@ def production_problems(texts: dict) -> list:
         return [f"ggml_backend_sycl_free does not end the owner's SCRATCH ({OWNER_END}) before the context is deleted"]
     if raw.count(OWNER_END) != 1:
         fails.append(f"ggml_backend_sycl_free makes {raw.count(OWNER_END)} owner-end calls, expected one")
-    if not OWNER_END_ARGS.search(built):
-        fails.append("the owner-end call does not end this context's owner on its device")
+    m = OWNER_END_ARGS.search(built)
+    device = m.group(1) if m else ""
+    bound = re.fullmatch(r"\w+", device) is not None and f"{device} = {HOST_BUFT_DEVICE};" in built[:m.start()]
+    if not m:
+        fails.append("the owner-end call does not end this context's owner")
+    elif device != HOST_BUFT_DEVICE and not bound:
+        fails.append(f"the owner-end call runs on {device!r}, not the host buft's device ({HOST_BUFT_DEVICE}) where "
+                     "the context's transaction filed its chunks")
     at = raw.find(REMOVED)
     if at < 0:
         return fails + ["ggml_backend_sycl_free has no OWNER_END_REMOVED planted-fault block"]
@@ -392,19 +404,27 @@ def test_production_accepts_the_wiring():
 
 
 def test_production_rejects_a_missing_or_late_call():
-    call = "        (void) ggml_sycl::unified_cache_host_scratch_owner_end(freed_device, freed_owner_id);\n"
+    call = "        (void) ggml_sycl::unified_cache_host_scratch_owner_end(owner_end_device, freed_owner_id);\n"
     rejects("production", planted(GS, call, "", wired()), "before the context is deleted")
     late = planted(GS, call, "", wired())
-    late = planted(GS, DELETE, DELETE + "    (void) ggml_sycl::unified_cache_host_scratch_owner_end(freed_device, "
+    late = planted(GS, DELETE, DELETE + "    (void) ggml_sycl::unified_cache_host_scratch_owner_end(owner_end_device, "
                                         "freed_owner_id);\n", late)
     rejects("production", late, "before the context is deleted")
-    rejects("production", planted(GS, "owner_end(freed_device, freed_owner_id)", "owner_end(freed_device, 0)",
+    rejects("production", planted(GS, "owner_end(owner_end_device, freed_owner_id)", "owner_end(owner_end_device, 0)",
                                   wired()),
             "does not end this context's owner")
+    rejects("production", planted(GS, "owner_end(owner_end_device, freed_owner_id)",
+                                  "owner_end(freed_device, freed_owner_id)", wired()),
+            "runs on 'freed_device', not the host buft's device")
+    rejects("production", planted(GS, "owner_end_device = ggml_sycl_notify_host_buft_device(backend);",
+                                  "owner_end_device = freed_device;", wired()),
+            "runs on 'owner_end_device', not the host buft's device")
 
 
 def test_production_rejects_a_lost_or_misplaced_block():
     block = ("#if defined(GGML_SYCL_SCRATCH_MUTANTS)\n"
+             "    using ggml_sycl::scratch_test_mutant;\n"
+             "    using ggml_sycl::scratch_test_mutant_on;\n"
              "    if (scratch_test_mutant_on(scratch_test_mutant::OWNER_END_REMOVED)) {\n"
              "        owner_end = false;\n    }\n#endif\n")
     rejects("production", planted(GS, block, "", wired()), "has no OWNER_END_REMOVED planted-fault block")

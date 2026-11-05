@@ -1965,6 +1965,7 @@ CLAUSES = [
     ("notify-compute-unused", REQUIRED, clause_notify_compute_unused, None, None),
     ("dlopen-header", REQUIRED, clause_dlopen_header, None, None),
     ("open-touches-no-set", REQUIRED, clause_open_touches_no_set, None, None),
+    ("owner-end-wired", REQUIRED, clause_owner_end_wired, None, None),
     ("slot-growth-plan-only", EXPECTED_RED, clause_slot_growth_plan_only, "Task 7",
      "slot_replace is called by ['host_staging_slots::admit'"),
     ("pools-from-plan", EXPECTED_RED, clause_pools_from_plan, "Task 7",
@@ -1977,8 +1978,6 @@ CLAUSES = [
      "llama_context does not resolve ggml_backend_sycl_notify_host_buffer_sizes"),
     ("dlopen-context", EXPECTED_RED, clause_dlopen_context, "Task 7",
      "llama_context does not resolve ggml_backend_sycl_notify_host_buffer_sizes"),
-    ("owner-end-wired", EXPECTED_RED, clause_owner_end_wired, "Task 7",
-     "ggml_backend_sycl_free does not call the owner's end"),
     ("scratch-fold", EXPECTED_RED, clause_scratch_fold, "Task 7", "beyond the four host terms (§M62 (A))"),
     ("runtime-term", EXPECTED_RED, clause_runtime_term, "Task 7",
      "names ['pp_pipeline_scratch_bytes', 'pp_moe_onednn_scratch_bytes']"),
@@ -2019,8 +2018,8 @@ _FOLD = ("    for (size_t bytes : { plan.max_tensor_bytes, k_scratch_headroom, p
 _FOLD_FOUR = "{ plan.max_tensor_bytes, k_scratch_headroom, moe_host_scratch }"
 _RUNTIME_FOUR = "    terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;\n"
 _HOOKS_AT = "        ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_has_active_placement_plan\"));\n"
-_OWNER_END = ("    if (freed_owner_id != 0) {\n"
-              "        ggml_sycl::unified_cache_host_scratch_owner_end(freed_device, freed_owner_id);\n"
+_OWNER_END = ("    if (owner_end) {\n"
+              "        (void) ggml_sycl::unified_cache_host_scratch_owner_end(owner_end_device, freed_owner_id);\n"
               "    }\n")
 _TRIAL = "hooks.host_scratch_trial(GGML_SYCL_HOST_SCRATCH_TRIAL_"
 _TRIAL_OPEN = "        " + _TRIAL + "OPEN);\n"
@@ -2159,10 +2158,6 @@ FIXTURES = {
     "dlopen-context": [
         (LC, _HOOKS_AT, _HOOKS_AT + _hook("notify_host_buffer_sizes") + _hook("plan_host_holders")),
         (LC, _HAS_PLAN_MEMBER, _HAS_PLAN_MEMBER + _NOTIFY_MEMBER + _PLAN_MEMBER),
-    ],
-    "owner-end-wired": [
-        (GS, "    delete sycl_ctx;\n    // The backend-member check",
-         _OWNER_END + "    delete sycl_ctx;\n    // The backend-member check"),
     ],
     "scratch-fold": [(UC, _FOLD, "    for (size_t bytes : " + _FOLD_FOUR + ") {\n")],
     "runtime-term": [
@@ -2487,9 +2482,6 @@ GONE = {
     "trial-ops": _GONE_LC,
     "notify-position": _GONE_LC,
     "dlopen-context": _GONE_LC,
-    "owner-end-wired": ([(GS, "static void ggml_backend_sycl_free(ggml_backend_t backend) {",
-                          "static void ggml_backend_sycl_free_moved(ggml_backend_t backend) {")],
-                        "ggml_backend_sycl_free is gone"),
     "scratch-fold": ([(UC, "    plan.host_zone_scratch_bytes = std::max<size_t>(k_min_zone_bytes, host_scratch_total);",
                        "    plan.host_zone_scratch_bytes = host_scratch_total;")],
                      "the host SCRATCH zone sum is not found"),
