@@ -5,9 +5,11 @@
 //
 // Every decision here is a pure function or a small state object over ggml-base types and caller-supplied callbacks,
 // so the four host-only tests (test-sycl-host-zone-select, test-sycl-host-scratch-demand, test-sycl-plan-walk-sched,
-// test-sycl-attn-host-staging-plan) drive exactly the code the backend runs. The backend supplies the real
-// allocator, unified cache and placement plan through the callbacks; the tests supply fakes. No SYCL header is
-// included, and this TU is also globbed into libggml-sycl, where it is the production copy.
+// test-sycl-attn-host-staging-plan) call the same functions the backend calls. The backend supplies the real
+// allocator, unified cache and placement plan through the callbacks; the tests supply fakes. A few exports exist only
+// for the tests, to score one step alone or read state the backend keeps. They sit under the heading "Test seams:
+// production never calls these": the free functions at the end of this header, the members in their own classes. No
+// SYCL header is included, and this TU is also globbed into libggml-sycl, where it is the production copy.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -76,9 +78,6 @@ struct host_zone_record_view {
 // Whether a row counts at the SCRATCH/STAGING graph-boundary check: only GRAPH rows do. A CONTEXT-lifetime compute
 // buffer, a MODEL row, a DEVICE holder and an UNOWNED holder are live there by design.
 bool host_zone_lifetime_counts_at_graph_boundary(alloc_lifetime lifetime);
-
-// The rows of `zone` the graph-boundary check counts.
-size_t host_zone_graph_boundary_live(const host_zone_record_view * records, size_t n, host_zone_id zone);
 
 // Whether `record` belongs to the owner whose boundary is being checked: the same lifetime AND the same owner. A row of
 // another context or model with the same lifetime is not this owner's, which is the multi-model case.
@@ -149,8 +148,10 @@ class host_scratch_ledger {
                                              const host_scratch_zone_ops & ops);
     // Drops the context's demand at its owner boundary. Capacity is never returned.
     void                       drop_context(uint64_t context_key);
-    size_t                     total() const;
-    size_t                     context_demand(uint64_t context_key) const;
+
+    // Test seams: production never calls these (diagnostics and tests).
+    size_t total() const;
+    size_t context_demand(uint64_t context_key) const;
 
   private:
     struct demand {
@@ -220,19 +221,6 @@ struct host_plan_attribution {
     int attributed = 0;  // nodes passing node_pred whose scheduler backend passes is_target
     int matched    = 0;  // nodes passing node_pred, whatever their backend
 };
-
-// Reads the scheduler's node-to-backend map, which exists only between a split and the next reset:
-// ggml_backend_sched_reserve_size leaves it live, ggml_backend_sched_reserve resets at its end. For every node
-// passing `node_pred` it asks ggml_backend_sched_get_tensor_backend and calls `visit` for those whose backend passes
-// `is_target` (production passes ggml_backend_is_sycl). `user` goes to both callbacks. With `warn_zero`, an attribution of zero prints
-// `[ATTN-HOST] plan attributed 0 host-KV nodes to a SYCL backend (%d matched the predicate)` at WARN.
-host_plan_attribution host_plan_attribute(ggml_backend_sched_t   sched,
-                                          ggml_cgraph *          graph,
-                                          host_plan_backend_pred is_target,
-                                          host_plan_node_pred    node_pred,
-                                          host_plan_visit        visit,
-                                          void *                 user,
-                                          bool                   warn_zero);
 
 // ---------------------------------------------------------------------------------------------------------------
 // The host holder plan: attention host staging slots and the CPU-expert pools, planned per backend context and
@@ -314,9 +302,11 @@ class host_holder_plans {
     // The device's merged committed figures, as commit and drop last folded them. Reads under the leaf mutex and merges
     // nothing, so dispatch admission (host_staging_slots::planned) pays one copy.
     host_holder_device_state device_state(int device) const;
-    // Whether the context holds a pending plan (diagnostics and tests).
-    bool                     has_pending(uint64_t key) const;
-    bool                     has_committed(uint64_t key) const;
+
+    // Test seams: production never calls these (diagnostics and tests). Whether the context holds a pending plan, and
+    // whether it holds a committed one.
+    bool has_pending(uint64_t key) const;
+    bool has_committed(uint64_t key) const;
 
   private:
     struct entry {
@@ -384,10 +374,12 @@ class host_staging_slots {
     void   release_unplanned(const host_staging_allocator & alloc);
     // Releases every slot (module teardown).
     void   release_all(const host_staging_allocator & alloc);
-    size_t capacity(int device, int kind) const;
     // Whether `device` has a committed plan, asked of the plans.
     bool   planned(int device) const;
     const host_staging_block & block(int device, int kind) const;
+
+    // Test seams: production never calls these (diagnostics and tests).
+    size_t capacity(int device, int kind) const;
 
   private:
     const host_holder_plans & plans_;
@@ -473,10 +465,12 @@ class attn_host_dispatch_counters {
   public:
     // One interception: the entry into the host dispatch of `op`, counted before any staging is asked for. The first
     // per device prints `[ATTN-HOST] first host dispatch dev=%d op=%s` at WARN.
-    void   intercept(int device, ggml_op op);
-    void   refusal(int device);
+    void intercept(int device, ggml_op op);
+    void refusal(int device);
     // `[ATTN-HOST] host dispatches dev=%d fa=%zu set_rows=%zu refusals=%zu` at WARN.
-    void   print(int device) const;
+    void print(int device) const;
+
+    // Test seams: production never calls these (diagnostics and tests). print reads the counts directly.
     size_t fa(int device) const;
     size_t set_rows(int device) const;
     size_t refusals(int device) const;
@@ -496,5 +490,28 @@ void host_dispatch_fail_closed(bool                                ok,
                                int                                 device,
                                const ggml_tensor *                 node,
                                const char *                        role);
+
+// ---------------------------------------------------------------------------------------------------------------
+// Test seams: production never calls these (diagnostics and tests). Each runs, alone, a step a production call runs
+// inside a larger one, so a host-only test can score that step.
+// ---------------------------------------------------------------------------------------------------------------
+
+// The rows of `zone` the graph-boundary check counts: host_zone_lifetime_counts_at_graph_boundary, the predicate the
+// unified cache's boundary check asks, over a list of rows.
+size_t host_zone_graph_boundary_live(const host_zone_record_view * records, size_t n, host_zone_id zone);
+
+// The walk's attribution step (host_holder_plans::walk runs the same code with its environment's lookup). Reads the
+// scheduler's node-to-backend map, which exists only between a split and the next reset:
+// ggml_backend_sched_reserve_size leaves it live, ggml_backend_sched_reserve resets at its end. For every node passing
+// `node_pred` it asks ggml_backend_sched_get_tensor_backend and calls `visit` for those whose backend passes
+// `is_target` (the walk passes ggml_backend_is_sycl). `user` goes to both callbacks. With `warn_zero`, an attribution
+// of zero prints `[ATTN-HOST] plan attributed 0 host-KV nodes to a SYCL backend (%d matched the predicate)` at WARN.
+host_plan_attribution host_plan_attribute(ggml_backend_sched_t   sched,
+                                          ggml_cgraph *          graph,
+                                          host_plan_backend_pred is_target,
+                                          host_plan_node_pred    node_pred,
+                                          host_plan_visit        visit,
+                                          void *                 user,
+                                          bool                   warn_zero);
 
 }  // namespace ggml_sycl
