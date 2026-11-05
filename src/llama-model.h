@@ -920,6 +920,23 @@ const std::vector<std::string> & llama_model_lazy_tensor_names(llm_arch arch);
 // static, because two loaded models may have different hparams.
 llama_lazy_tensor_attrs llama_model_lazy_tensor_attrs(llm_arch arch, const llama_hparams & hparams, const std::string & name);
 
+struct ggml_sycl_tensor_inventory;
+struct ggml_sycl_placement_envelope;
+
+// The early plan's inventory for the model in `fname`, read from its GGUF header alone, for the host-only plan dry run
+// (tools/sycl-plan-dry-run, th32 §4.2): the loader reads the header with no_alloc, the model reads its hparams, the
+// lazy-range record is pre-filled, and the inventory is built by the function the load's early plan builds it with.
+// No tensor data is read, no load is opened and nothing is applied. `callback` sees the inventory and the envelope
+// the load would stage, valid for the call only. False when the header cannot be read or no weight is planned.
+// Defined where libllama carries the SYCL hooks (GGML_USE_SYCL or GGML_BACKEND_DL).
+typedef void (*llama_model_sycl_header_inventory_cb)(const ggml_sycl_tensor_inventory *   inventory,
+                                                     const ggml_sycl_placement_envelope * envelope,
+                                                     void *                               user_data);
+bool llama_model_sycl_header_inventory(const char *                         fname,
+                                       const llama_model_params &           params,
+                                       llama_model_sycl_header_inventory_cb callback,
+                                       void *                               user_data);
+
 // For internal test use
 // TODO: remove
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);

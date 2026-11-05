@@ -180,10 +180,14 @@ PHASE_WAIT = ("if (moe_pp_batched_phases_reuse_buffers(f16_groups) && !half_read
 COMPARE_HEAD = "if (batched_compare && !active_experts.empty()) {"
 # A host wait, spelled as the stream-enqueue gate spells it.
 ANY_WAIT_RE = re.compile(r"\bwait\s*\(|\bwait_and_throw\s*\(")
-# The planner site: the inventory's ring sizes become the backend's globals and the unified cache's planned scratch.
-PLAN_SITE_HEAD = "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;"
-PLAN_SITE_CALL = ("unified_cache_set_planned_pp_moe_onednn_scratch( ctx->device, "
-                  "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes,")
+# The planner site: the inventory's ring sizes become the unified cache's planned scratch, in the one publish helper the
+# stage and the plan dry run both call (llama.cpp-4zup), and the stage keeps what the helper published as its globals.
+PUBLISH_FN = "ggml_sycl_inventory_publish_planner_inputs"
+PLAN_SITE_HEAD = "in.pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;"
+PLAN_SITE_CALL = "unified_cache_set_planned_pp_moe_onednn_scratch( device, in.pp_moe_onednn_weight_slot_bytes,"
+STAGE_PUBLISH = ("const ggml_sycl_inventory_planner_inputs published = "
+                 "ggml_sycl_inventory_publish_planner_inputs(ctx->device, inventory);")
+STAGE_KEEPS = "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = published.pp_moe_onednn_weight_slot_bytes;"
 # The device test's capped cases: one Q4_0 case per cap, each in its own process.
 GROUP_CAPS = "constexpr int k_group_caps[] = { 1, 3 };"
 GROUP_EXACT = "groups != want_groups || group_experts != size_t(group_cap) || buffers != 2"
@@ -774,19 +778,32 @@ def claim_i_slot(s):
                  "g_tensor_inventory_pp_moe_onednn_scratch_bytes"):
         if gone in sycl:
             fails.append(f"{gone} is still in ggml-sycl.cpp: the planned weight slot must not be widened")
-    # Every write to the planned weight slot's global is a reset or the inventory's own value.
+    # Every write to the planned weight slot's global is a reset or the inventory's own value: directly, or as the
+    # publish helper returned it to the stage, and every write to the helper's slot is the inventory's own value.
+    publish = one_definition(sycl, PUBLISH_FN) or ""
+    kept = ["0", "inventory->pp_moe_onednn_weight_slot_bytes"]
+    if STAGE_PUBLISH in sycl:
+        kept.append("published.pp_moe_onednn_weight_slot_bytes")
     writes = re.finditer(r"\bg_tensor_inventory_pp_moe_onednn_weight_slot_bytes ?([-+*/|&^]?=)(?!=) ?([^;]*);", sycl)
     for m in writes:
-        if m.group(1) != "=" or m.group(2).strip() not in ("0", "inventory->pp_moe_onednn_weight_slot_bytes"):
+        if m.group(1) != "=" or m.group(2).strip() not in kept:
             fails.append(f"the planned weight slot is written as `{m.group(0)}`, not reset or taken from the inventory")
+    if STAGE_KEEPS not in sycl:
+        fails.append("the stage does not keep the weight slot the publish helper took from the inventory")
+    helper_writes = list(re.finditer(r"\bin\.pp_moe_onednn_weight_slot_bytes ?([-+*/|&^]?=)(?!=) ?([^;]*);", publish))
+    if not helper_writes:
+        fails.append("the publish helper does not take the weight slot from the inventory")
+    for m in helper_writes:
+        if m.group(1) != "=" or m.group(2).strip() != "inventory->pp_moe_onednn_weight_slot_bytes":
+            fails.append(f"the publish helper writes the weight slot as `{m.group(0)}`, not the inventory's own value")
     # The planner site publishes the inventory's slot, with no formula of its own between the two.
-    head = sycl.find(PLAN_SITE_HEAD)
-    call = sycl.find("unified_cache_set_planned_pp_moe_onednn_scratch(", head) if head >= 0 else -1
-    site = statement(sycl, None, start=call) if call >= 0 else None
+    head = publish.find(PLAN_SITE_HEAD)
+    call = publish.find("unified_cache_set_planned_pp_moe_onednn_scratch(", head) if head >= 0 else -1
+    site = statement(publish, None, start=call) if call >= 0 else None
     if head < 0 or site is None:
         fails.append("the planner site that takes the weight slot from the inventory and plans the ring was not found")
     else:
-        site = sycl[head:call] + site
+        site = publish[head:call] + site
         if PLAN_SITE_CALL not in site:
             fails.append("the unified cache's planned scratch is not given the inventory's weight slot")
         for formula in ("n_expert", "255", "sizeof(sycl::half)"):
@@ -1240,9 +1257,14 @@ MUTANTS = [
      "ggml_sycl_moe_pp_onednn_batched_claims_tensor("),
     ("h", "sycl", " && !ggml_sycl_moe_pp_batched_admits_op(op, device)) {", ") {"),
     # The widening back, the admission asked for every expert, and the groups sized from the request, not the slot.
-    ("i", "sycl", "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;",
-     "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(inventory->pp_moe_onednn_weight_slot_bytes, "
+    ("i", "sycl", PLAN_SITE_HEAD,
+     "in.pp_moe_onednn_weight_slot_bytes = std::max(inventory->pp_moe_onednn_weight_slot_bytes, "
      "size_t(inventory->n_expert) << 20);"),
+    # The stage widens what the helper published, or keeps a value of its own instead.
+    ("i", "sycl", STAGE_KEEPS,
+     "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(published.pp_moe_onednn_weight_slot_bytes, "
+     "size_t(inventory->n_expert) << 20);"),
+    ("i", "sycl", STAGE_PUBLISH, "const ggml_sycl_inventory_planner_inputs published = {};"),
     ("i", "sycl", "weight_bytes = f16_expert_bytes;", "weight_bytes = f16_expert_bytes * active_count;"),
     ("i", "sycl", "moe_pp_batched_f16_plan_groups(reserved.weight_size, ",
      "moe_pp_batched_f16_plan_groups(weight_bytes * active_count, "),

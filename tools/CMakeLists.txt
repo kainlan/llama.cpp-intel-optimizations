@@ -66,6 +66,11 @@ else()
         add_subdirectory(sycl-mxfp4-moe-bench)
         add_subdirectory(onednn-woq-repro)
     endif()
+    if (GGML_SYCL)
+        # Outside the guard above: it links only llama and resolves the backend's dry run through the registry's
+        # proc table, so it builds and runs under GGML_BACKEND_DL as well.
+        add_subdirectory(sycl-plan-dry-run)
+    endif()
     # Host-only STREAM bench: no SYCL dependency, so it is outside the SYCL guard.
     add_subdirectory(cpu-expert-bench)
     add_subdirectory(fit-params)

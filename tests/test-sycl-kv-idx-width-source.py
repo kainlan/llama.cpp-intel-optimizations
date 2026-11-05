@@ -8,10 +8,11 @@ host-KV figure short by the indexer, and so that no second source of the width c
 
 1. `ggml_sycl_tensor_inventory` carries the per-layer `kv_idx_k_width_per_layer` array and no scalar `kv_idx_width`;
 2. the llama layer fills the array in ONE place, `llama_model_sycl_populate_inventory`, from its parameter, and BOTH of
-   its callers (early plan and late inventory) pass `kv_layer_arrays.idx_k_width.get()`, which the memory's layer
-   owners fill; no helper derives the width from the architecture a second time;
+   its callers (early plan, through llama_model_sycl_build_early_inventory, and late inventory) pass
+   `kv_layer_arrays.idx_k_width.get()`, which the memory's layer owners fill; no helper derives the width from the
+   architecture a second time;
 3. `ggml_backend_sycl_stage_load_inventory_plan`'s apply step copies the array into the planner's
-   `g_placement_kv_info.layer_idx_k_width`, and both plan builders mirror it into the persisted plan, beside the
+   `g_placement_kv_info.layer_idx_k_width` (through the KV intake ggml_sycl_inventory_fill_kv_info), and both plan builders mirror it into the persisted plan, beside the
    per-layer truth;
 4. `placement_plan::kv_size_for_layer` adds `kv_idx_size_for_layer` on its per-layer branch, and
    `kv_demand_for_layer` returns `kv_size_for_layer(layer_id)` and reads no width itself (a second sum would count the
@@ -74,6 +75,11 @@ CACHE_CPP = "ggml/src/ggml-sycl/unified-cache.cpp"
 
 POPULATE = r"static\s+void\s+llama_model_sycl_populate_inventory\s*\("
 EARLY = r"static\s+void\s+llama_model_sycl_compute_early_plan\s*\("
+# The early plan builds its inventory through llama_model_sycl_build_early_inventory(), which the plan dry run's header
+# read also calls (llama.cpp-4zup), so the early caller of populate_inventory is that builder, holding the arrays in its
+# output struct.
+EARLY_BUILD = r"static\s+bool\s+llama_model_sycl_build_early_inventory\s*\("
+OWNER_ARRAY = r"(?:\bout\s*\.\s*)?\bkv_layer_arrays\s*\.\s*idx_k_width\s*\.\s*get\s*\(\s*\)"
 LATE = r"static\s+void\s+llama_model_sycl_set_late_inventory\s*\("
 DEMAND = r"size_t\s+kv_demand_for_layer\s*\(\s*uint32_t\s+layer_id\s*\)\s*const"
 SIZE = r"size_t\s+kv_size_for_layer\s*\(\s*uint32_t\s+layer_id\s*\)\s*const"
@@ -126,13 +132,15 @@ def test_populate_inventory_sets_the_array_once_from_its_parameter():
 
 def callers_pass_the_owner_array(text: str) -> list:
     bad = []
-    for name, sig in (("early plan", EARLY), ("late inventory", LATE)):
+    if not re.search(r"\bllama_model_sycl_build_early_inventory\s*\(", function_body(text, EARLY)):
+        bad.append("early plan: does not build its inventory through llama_model_sycl_build_early_inventory()")
+    for name, sig in (("early plan", EARLY_BUILD), ("late inventory", LATE)):
         body = function_body(text, sig)
         call = re.search(r"llama_model_sycl_populate_inventory\s*\(([^;]*)\)\s*;", body, flags=re.DOTALL)
         if not call:
             bad.append(f"{name}: no populate_inventory call")
             continue
-        if not re.search(r"kv_layer_arrays\s*\.\s*idx_k_width\s*\.\s*get\s*\(\s*\)", call.group(1)):
+        if not re.search(OWNER_ARRAY, call.group(1)):
             bad.append(f"{name}: the call does not pass kv_layer_arrays.idx_k_width.get()")
     return bad
 
@@ -143,23 +151,64 @@ def test_both_callers_pass_the_owner_array():
 
 def test_mutation_witness_a_caller_passing_null_is_caught():
     code = read(LLAMA_MODEL)
-    mutated = code.replace("kv_layer_arrays.idx_k_width.get()", "nullptr", 1)
-    assert mutated != code, "mutation did not apply"
+    for owner in ("out.kv_layer_arrays.idx_k_width.get()", "kv_layer_arrays.idx_k_width.get(),"):
+        assert code.count(owner) >= 1, f"mutation anchor {owner!r} moved"
+    # the early caller (the builder, through its output struct)
+    mutated = code.replace("out.kv_layer_arrays.idx_k_width.get()", "nullptr", 1)
+    assert len(callers_pass_the_owner_array(mutated)) == 1
+    # the late caller
+    late = function_body(code, LATE)
+    assert late.count("kv_layer_arrays.idx_k_width.get()") == 1, "the late caller's argument moved"
+    mutated = code.replace(late, late.replace("kv_layer_arrays.idx_k_width.get()", "nullptr"), 1)
+    assert len(callers_pass_the_owner_array(mutated)) == 1
+
+
+def test_mutation_witness_the_early_plan_skipping_the_builder_is_caught():
+    code = read(LLAMA_MODEL)
+    plan = function_body(code, EARLY)
+    assert plan.count("llama_model_sycl_build_early_inventory(") == 1, "the early plan's builder call moved"
+    mutated = code.replace(plan, plan.replace("llama_model_sycl_build_early_inventory(", "h187_mutant_build("), 1)
     assert len(callers_pass_the_owner_array(mutated)) == 1
 
 
 # ---- 3. the planner ----
 
 
-def test_the_apply_step_copies_the_array_into_the_planner():
-    text = read(BACKEND)
-    assert re.search(
-        r"g_placement_kv_info\s*\.\s*layer_idx_k_width\s*\.\s*assign\s*\("
+# The apply step fills g_placement_kv_info through the one KV intake the plan dry run also uses (llama.cpp-4zup), written
+# over the KV inputs it is handed.
+STAGE_FILL = r"static\s+void\s+populate_inventory_globals\s*\("
+INTAKE = r"static\s+void\s+ggml_sycl_inventory_fill_kv_info\s*\("
+INTAKE_CALL = r"\bggml_sycl_inventory_fill_kv_info\s*\(\s*g_placement_kv_info\s*,\s*inventory\s*\)\s*;"
+
+
+def apply_step_copies_the_array(text: str) -> bool:
+    intake = function_body(text, INTAKE)
+    return bool(re.search(INTAKE_CALL, function_body(text, STAGE_FILL))) and bool(re.search(
+        r"\bkv\s*\.\s*layer_idx_k_width\s*\.\s*assign\s*\("
         r"\s*inventory\s*->\s*kv_idx_k_width_per_layer\s*,"
         r"\s*inventory\s*->\s*kv_idx_k_width_per_layer\s*\+\s*inventory\s*->\s*kv_layer_count\s*\)",
-        text,
-    ), "the apply step does not copy inventory->kv_idx_k_width_per_layer into g_placement_kv_info.layer_idx_k_width"
+        intake,
+    )) and not re.search(r"\bkv\s*\.\s*kv_idx_width\b", intake)
+
+
+def test_the_apply_step_copies_the_array_into_the_planner():
+    text = read(BACKEND)
+    assert apply_step_copies_the_array(text), (
+        "the apply step does not copy inventory->kv_idx_k_width_per_layer into g_placement_kv_info.layer_idx_k_width "
+        "(through the KV intake)"
+    )
     assert not re.search(r"g_placement_kv_info\s*\.\s*kv_idx_width\b", text), "the planner still carries a scalar width"
+
+
+def test_mutation_witness_the_apply_step_dropping_the_copy_is_caught():
+    text = read(BACKEND)
+    intake = function_body(text, INTAKE)
+    copy = re.search(r"kv\s*\.\s*layer_idx_k_width\s*\.\s*assign\s*\([^;]*;", intake)
+    assert copy, "the intake's copy moved"
+    assert not apply_step_copies_the_array(text.replace(intake, intake.replace(copy.group(0), ""), 1))
+    call = re.search(INTAKE_CALL, text)
+    assert call, "the stage's intake call moved"
+    assert not apply_step_copies_the_array(text[:call.start()] + text[call.end():])
 
 
 def test_both_plan_builders_mirror_the_width_beside_the_per_layer_truth():

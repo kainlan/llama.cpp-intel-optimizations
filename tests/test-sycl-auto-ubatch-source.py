@@ -2072,21 +2072,32 @@ def _brace_block(code: str, open_idx: int) -> str:
 
 
 _PLANNER_FN = "static void compute_and_store_plan_for_inventory("
-_PLANNER_GATE = "if (info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()) {"
+# The planner asks the one multi-device gate the plan dry run also asks (llama.cpp-4zup), and that gate is the GPU count
+# and ggml_backend_sycl_moe_multi_gpu_requested(), nothing else.
+_GATE_FN = "static bool ggml_sycl_plan_multi_device() {"
+_GATE_RETURN = "return ggml_sycl_info().total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested();"
+_PLANNER_GATE = "if (ggml_sycl_plan_multi_device()) {"
 
 
 def _assert_planner_branches_on_the_gate(code: str) -> None:
     """compute_and_store_plan_for_inventory() must reach
     compute_multi_device_plan() only inside the branch taken on
     ggml_backend_sycl_moe_multi_gpu_requested() -- the predicate the key
-    reads to decide |plan=multi."""
+    reads to decide |plan=multi. The branch asks ggml_sycl_plan_multi_device(),
+    whose whole body is the GPU count and that predicate."""
+    gate_fn = code.find(_GATE_FN)
+    gate_fn_body = _brace_block(code, gate_fn + len(_GATE_FN) - 1).strip() if gate_fn != -1 else ""
+    assert gate_fn_body == _GATE_RETURN, (
+        "ggml_sycl_plan_multi_device(), the planner's multi-device gate, must branch on "
+        "`ggml_sycl_info().total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()` and nothing else"
+    )
     fn = code.find(_PLANNER_FN)
     assert fn != -1, "could not find compute_and_store_plan_for_inventory()"
     fn_body = _brace_block(code, code.index("{", fn))
     gate = fn_body.find(_PLANNER_GATE)
     assert gate != -1, (
         "compute_and_store_plan_for_inventory() must branch on "
-        "`info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()`"
+        "`ggml_sycl_plan_multi_device()`"
     )
     gate_block = _brace_block(fn_body, gate + len(_PLANNER_GATE) - 1)
     assert "compute_multi_device_plan(" in gate_block, (
@@ -2103,9 +2114,18 @@ def test_planner_gate_check_has_a_mutation_witness():
     condition must fail it, since the key would then describe a plan the
     planner no longer gates the same way."""
     raw = GGML_SYCL_CPP
+    fn = raw.find(_GATE_FN)
+    assert fn != -1, "mutation target not found -- update this witness to match the real source"
+    target = "    return ggml_sycl_info().total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested();\n"
+    at = raw.find(target, fn)
+    assert at != -1, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw[:at] + "    return ggml_sycl_info().total_gpu_count >= 2;\n" + raw[at + len(target):]
+    with pytest.raises(AssertionError, match="must branch on"):
+        _assert_planner_branches_on_the_gate(_normalize_ws(strip_comments(mutated_raw)))
+    # The planner stops asking the gate and branches on the GPU count alone: the gate is still right, and unasked.
     fn = raw.find(_PLANNER_FN)
     assert fn != -1, "mutation target not found -- update this witness to match the real source"
-    target = "    if (info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()) {\n"
+    target = "    if (ggml_sycl_plan_multi_device()) {\n"
     at = raw.find(target, fn)
     assert at != -1, "mutation target not found -- update this witness to match the real source"
     mutated_raw = raw[:at] + "    if (info.total_gpu_count >= 2) {\n" + raw[at + len(target):]

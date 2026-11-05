@@ -132,7 +132,14 @@ HELPER_SUM = "if (l < member.size() && member[l] != 0 && layer_owner[l] == devic
 # test-sycl-explicit-ubatch-placement-source), so the struct no longer ends here.
 FIELD = ("uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; bool n_ctx_context_is_default; "
          "bool use_mmap_resolved; bool use_mlock_resolved; bool host_weight_layout_cpu; uint32_t n_ubatch_context; };")
-READ = ("g_placement_kv_info.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer, "
+# The backend copies the inventory into its KV inputs through the one KV intake the plan dry run also uses
+# (llama.cpp-4zup), written over the KV inputs it is handed; the stage hands it g_placement_kv_info.
+STAGE_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
+             "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info & kv, "
+              "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
+READ = ("kv.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer, "
         "inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);")
 LAYOUT = (
     "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",
@@ -158,9 +165,11 @@ HOT_ENV = "const char * hot_layers_env = std::getenv(\"GGML_SYCL_KV_HOT_LAYERS\"
 
 def claim_inventory_carries_the_indexer_width(header: str, sycl_cpp: str) -> bool:
     """The field follows n_ctx_context (with the context's provenance, libllama's resolved storage inputs and the
-    named micro-batch after it), the backend copies it, and the consumer pins the layout."""
+    named micro-batch after it), the backend copies it (in the KV intake, which the stage hands g_placement_kv_info),
+    and the consumer pins the layout."""
     n = norm(sycl_cpp)
-    return FIELD in norm(header) and READ in n and all(a in n for a in LAYOUT)
+    return (FIELD in norm(header) and READ in body(n, INTAKE_SIG) and INTAKE_CALL in body(n, STAGE_SIG)
+            and all(a in n for a in LAYOUT))
 
 
 def claim_budgets_add_the_indexer(cache_hpp: str, cache_cpp: str, sycl_cpp: str) -> bool:
@@ -257,6 +266,11 @@ def test_mutant_helper_ignores_membership_fails():
 
 def test_mutant_backend_ignores_the_field_fails():
     assert not claim_inventory_carries_the_indexer_width(HEADER, _once(SYCL_CPP, READ, ""))
+
+
+def test_mutant_stage_skips_the_intake_fails():
+    """The stage stops handing g_placement_kv_info to the intake: the copy still exists, and reaches no KV input."""
+    assert not claim_inventory_carries_the_indexer_width(HEADER, _once(SYCL_CPP, INTAKE_CALL, ""))
 
 
 def test_mutant_layout_unpinned_fails():

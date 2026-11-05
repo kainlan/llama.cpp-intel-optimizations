@@ -4500,7 +4500,7 @@ offload_phase offload_stats_phase() {
 // the offload stats.  The depth and the outermost kind are one thread-local
 // state, written only by ggml_sycl_replan_token's constructor and destructor.
 //
-// The audit of the fourteen public C entries that hold L0 (ggml-sycl.cpp), and
+// The audit of the fifteen public C entries that hold L0 (ggml-sycl.cpp), and
 // the acquisition order every one of them follows.  A lock may be taken only
 // while holding locks that are EARLIER in this list:
 //
@@ -4519,15 +4519,17 @@ offload_phase offload_stats_phase() {
 // takes no lock):
 //   TRANSACTION  set_runtime_context, set_runtime_context_for_model (the second
 //                calls the first: a same-kind nested hold)
-//   LOAD         model_load_begin, stage_load_inventory_plan, model_load_end
+//   LOAD         model_load_begin, stage_load_inventory_plan, model_load_end,
+//                plan_dry_run
 //   LIFECYCLE    model_unloaded_token, activate_model_plan,
 //                probe_runtime_context_for_model,
 //                recheck_runtime_context_flash_attn, can_unload (try-lock: it
 //                reports busy instead of waiting), complete_unload,
 //                commit_reactivate, rollback_reactivate, shutdown
-// Locks the entries take under L0: model_load_end, activate_model_plan,
-// set_runtime_context_for_model and recheck_runtime_context_flash_attn take the
-// inventory lock (2); set_runtime_context_for_model nests the binding lock and
+// Locks the entries take under L0: model_load_end, plan_dry_run,
+// activate_model_plan, set_runtime_context_for_model and
+// recheck_runtime_context_flash_attn take the inventory lock (2);
+// set_runtime_context_for_model nests the binding lock and
 // then the execution-state lock inside it (2, then 3).  No entry calls an entry
 // of another kind, so the only nesting is that same-kind one.  graph_compute and
 // the backend's execution-bound paths take no L0 (witnessed at graph_compute's
@@ -18102,6 +18104,23 @@ static unified_cache * get_existing_cache_for_device(int device_id) {
 unified_cache * get_existing_unified_cache_for_device(int device_id) {
     std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
     return get_existing_cache_for_device(device_id);
+}
+
+// The cache whose arena reservations compute_multi_device_plan subtracts from device_id's budget, or nullptr when it
+// subtracts none; see multi_device_plan_subtracts_arena. In GLOBAL mode there is one physical arena, and a multi-device
+// plan may be built from synthetic budgets in unit tests, so the global device-0 arena is not reused for every device.
+// Takes no lock, as the planner's own lookup did.
+static unified_cache * multi_device_plan_arena_cache(int device_id) {
+    if (!vram_arena_enabled() || get_effective_mode() == unified_cache_mode::GLOBAL) {
+        return nullptr;
+    }
+    unified_cache * cache = get_existing_cache_for_device(device_id);
+    return cache != nullptr && cache->arena_active() ? cache : nullptr;
+}
+
+bool multi_device_plan_subtracts_arena(int device_id) {
+    std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+    return multi_device_plan_arena_cache(device_id) != nullptr;
 }
 
 // The pinned share of the host budget (th32 §4.2): the bytes the pinned pools hold, summed over the caches that exist,
@@ -36366,28 +36385,20 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         size_t runtime_reserve = 0;
 
         // Subtract arena scratch + oneDNN + runtime zone reservations from
-        // per-device budget so weights don't fill space needed for compute.
-        // In GLOBAL cache mode there is only one physical cache/arena.  A
-        // multi-device plan may still be built from synthetic budgets in unit
-        // tests, so do not reuse the global device-0 arena capacity for every
-        // requested device.
-        if (vram_arena_enabled()) {
-            auto * cache = get_effective_mode() == unified_cache_mode::GLOBAL ?
-                               nullptr :
-                               get_existing_cache_for_device(device_budgets[d].device_id);
-            if (cache && cache->arena_active()) {
-                arena_total     = cache->arena_total_size();
-                scratch_reserve = cache->zone_capacity(vram_zone_id::SCRATCH);
-                onednn_reserve  = cache->zone_capacity(vram_zone_id::ONEDNN);
-                runtime_reserve = cache->zone_capacity(vram_zone_id::RUNTIME);
-                // Match the actual allocation surface used by planned
-                // materialization. The WEIGHT zone is the shared KV+weight
-                // allocator; packing against the larger VRAM budget can create
-                // planned entries that cannot be staged.
-                remaining[d] =
-                    unified_cache_kv_weight_capacity(device_budgets[d].device_id, device_budgets[d].vram_budget,
-                                                     /*multi_device=*/true);
-            }
+        // per-device budget so weights don't fill space needed for compute,
+        // on the devices multi_device_plan_arena_cache names (no GLOBAL-mode
+        // arena is lent to every device).
+        if (unified_cache * cache = multi_device_plan_arena_cache(device_budgets[d].device_id)) {
+            arena_total     = cache->arena_total_size();
+            scratch_reserve = cache->zone_capacity(vram_zone_id::SCRATCH);
+            onednn_reserve  = cache->zone_capacity(vram_zone_id::ONEDNN);
+            runtime_reserve = cache->zone_capacity(vram_zone_id::RUNTIME);
+            // Match the actual allocation surface used by planned
+            // materialization. The WEIGHT zone is the shared KV+weight
+            // allocator; packing against the larger VRAM budget can create
+            // planned entries that cannot be staged.
+            remaining[d] = unified_cache_kv_weight_capacity(device_budgets[d].device_id, device_budgets[d].vram_budget,
+                                                            /*multi_device=*/true);
         }
 
         log_moe_device_policy("MOE-POLICY-MULTI", device_budgets[d].device_id, device_budgets[d].vram_budget,

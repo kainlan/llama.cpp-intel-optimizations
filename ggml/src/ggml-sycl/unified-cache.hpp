@@ -6942,6 +6942,12 @@ unified_cache * get_unified_cache_for_device(int device_id);
 // re-enter allocator/static teardown.
 unified_cache * get_existing_unified_cache_for_device(int device_id);
 
+// Whether compute_multi_device_plan subtracts the arena's SCRATCH, ONEDNN and RUNTIME reservations from the budget of
+// physical device `device_id`: the VRAM arena is enabled, the cache mode is not GLOBAL (one physical arena, which the
+// planner never lends to every device), and the device's existing cache has an active arena. The planner and the plan
+// dry run's caveat ask the same rule. Reads the existing cache and creates none.
+bool multi_device_plan_subtracts_arena(int device_id);
+
 // The MoE join queue for a CPU expert job whose scatter goes on `stream`, or nullptr to join on `stream`
 // (llama.cpp-wfsl); see unified_cache::get_moe_join_queue() and moe_join_queue_after() for *after. It is used
 // only while every host task of the process has been submitted on one cache's queue_, so that the latest one

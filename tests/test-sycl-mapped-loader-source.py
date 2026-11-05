@@ -35,9 +35,11 @@ The fact and the ABI
   F5. libllama resolves the renamed staging proc and the two mapped-buffer procs by name, and never the old name; its
       loading guard refuses, naming the proc, a backend that lacks them (the reverse stale pair); and the hooks' enable
       test does not require the staging proc, so that backend is refused instead of loaded as a non-SYCL model;
-  F6. the staging path derives the fact once: populate_inventory_globals sets load_maps_files =
+  F6. the staging path derives the fact once: ggml_sycl_inventory_fill_kv_info, which fills a plan's kv_info from
+      an inventory for the staged load and the plan dry run alike, sets load_maps_files =
       inventory->use_mmap_resolved && file_mapping_supported(), load_locks_files = load_maps_files &&
-      inventory->use_mlock_resolved, and copies host_weight_layout_cpu; nothing else reads use_mmap_resolved;
+      inventory->use_mlock_resolved, and copies host_weight_layout_cpu; populate_inventory_globals fills the staged
+      load's kv_info through it; nothing else reads use_mmap_resolved;
   F7. planned_host_backing answers from the bound load's staged plan only: the plan's fact first
       (host_backing_maps_files), then the dense entry's backing, then the transaction default FILE_MAPPED. A plan
       another model published never answers for this load;
@@ -326,22 +328,28 @@ def clause_f5_libllama_refuses_an_old_backend(t: dict) -> list:
 
 
 POPULATE_SIG = r"static\s+void\s+populate_inventory_globals\s*\("
+FILL_KV_INFO_SIG = r"static\s+void\s+ggml_sycl_inventory_fill_kv_info\s*\("
 
 
 def clause_f6_fact_derived_once(t: dict) -> list:
     pop = body_of(t[GS], POPULATE_SIG)
     if not pop:
         return ["populate_inventory_globals was not found"]
+    fill = body_of(t[GS], FILL_KV_INFO_SIG)
+    if not fill:
+        return ["ggml_sycl_inventory_fill_kv_info was not found"]
     problems = []
-    if not re.search(r"g_placement_kv_info\s*\.\s*load_maps_files\s*=\s*inventory\s*->\s*use_mmap_resolved\s*&&\s*"
-                     r"(?:ggml_sycl::)?file_mapping_supported\s*\(\s*\)\s*;", pop):
+    if not re.search(r"\bggml_sycl_inventory_fill_kv_info\s*\(\s*g_placement_kv_info\s*,\s*inventory\s*\)\s*;", pop):
+        problems.append("populate_inventory_globals does not fill the staged load's kv_info from its inventory")
+    if not re.search(r"\bkv\s*\.\s*load_maps_files\s*=\s*inventory\s*->\s*use_mmap_resolved\s*&&\s*"
+                     r"(?:ggml_sycl::)?file_mapping_supported\s*\(\s*\)\s*;", fill):
         problems.append("the staging path does not derive load_maps_files = use_mmap_resolved && "
                         "file_mapping_supported()")
-    if not re.search(r"g_placement_kv_info\s*\.\s*load_locks_files\s*=\s*g_placement_kv_info\s*\.\s*load_maps_files\s*"
-                     r"&&\s*inventory\s*->\s*use_mlock_resolved\s*;", pop):
+    if not re.search(r"\bkv\s*\.\s*load_locks_files\s*=\s*kv\s*\.\s*load_maps_files\s*"
+                     r"&&\s*inventory\s*->\s*use_mlock_resolved\s*;", fill):
         problems.append("the staging path does not derive load_locks_files = load_maps_files && use_mlock_resolved")
-    if not re.search(r"g_placement_kv_info\s*\.\s*host_weight_layout_cpu\s*=\s*"
-                     r"inventory\s*->\s*host_weight_layout_cpu\s*;", pop):
+    if not re.search(r"\bkv\s*\.\s*host_weight_layout_cpu\s*=\s*"
+                     r"inventory\s*->\s*host_weight_layout_cpu\s*;", fill):
         problems.append("the staging path does not copy libllama's resolved host_weight_layout_cpu")
     # A string literal is not a read: the layout static_assert's message names the field it pins.
     code = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', t[GS])
@@ -984,8 +992,11 @@ MUTANTS = [
      lambda t: _mut(t, GS, r"inventory\s*->\s*use_mmap_resolved\s*&&\s*"
                            r"(?:ggml_sycl::)?file_mapping_supported\s*\(\s*\)", "inventory->use_mmap_resolved")),
     ("a second backend site reads the fact", "F6",
-     lambda t: _mut(t, GS, r"(g_placement_kv_info\s*\.\s*load_maps_files\s*=[^;]*;)",
+     lambda t: _mut(t, GS, r"(\bkv\s*\.\s*load_maps_files\s*=[^;]*;)",
                     r"\1 (void) inventory->use_mmap_resolved;")),
+    ("the staged load's kv_info is filled without the fact", "F6",
+     lambda t: _mut(t, GS, r"\bggml_sycl_inventory_fill_kv_info\s*\(\s*g_placement_kv_info\s*,\s*inventory\s*\)\s*;",
+                    "g_placement_kv_info.n_layer = inventory->n_layer;")),
     ("planned_host_backing answers from the published plan", "F7",
      lambda t: _mut(t, GS, r"(ggml_backend_sycl_planned_host_backing\s*\(\s*const\s+char\s*\*\s*\w+\s*\)\s*\{.*?)"
                            r"ggml_sycl_bound_load_candidate\s*\(\s*\)", r"\1ggml_sycl_global_plan_owner()")),

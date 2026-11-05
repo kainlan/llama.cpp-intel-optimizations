@@ -30,6 +30,7 @@
 #include "ggml-sycl.h"
 #include "host-ledger-commit-oracle.hpp"
 #include "host-ledger-test-harness.hpp"
+#include "host-plan-shaped-inventory.hpp"
 #include "sycl-test-skip.hpp"
 
 #include <sys/resource.h>
@@ -978,115 +979,12 @@ int strict_child(const char * mode) {
     return 3;
 }
 
-// --- a Q2_K-shaped MoE inventory, small enough for a test, in the planner's form and the loader's ---
+// --- the T2 shaped inventory (host-plan-shaped-inventory.hpp), in the planner's form and the loader's ---
 
-struct inventory_row {
-    std::string name;
-    ggml_type   type;
-    int64_t     ne[3];
-};
+using host_plan_shaped_inventory::loader_inventory;
+using host_plan_shaped_inventory::planner_inventory;
 
-constexpr int     k_layers  = 2;
-constexpr int     k_experts = 8;
-constexpr int64_t k_embd    = 1024;
-constexpr int64_t k_ffn     = 512;
-constexpr int64_t k_vocab   = 4096;
-
-std::vector<inventory_row> q2k_rows() {
-    std::vector<inventory_row> rows;
-    rows.push_back({
-        "token_embd.weight", GGML_TYPE_Q2_K, { k_embd, k_vocab, 1 }
-    });
-    for (int l = 0; l < k_layers; ++l) {
-        const std::string blk = "blk." + std::to_string(l) + ".";
-        rows.push_back({
-            blk + "attn_norm.weight", GGML_TYPE_F32, { k_embd, 1, 1 }
-        });
-        rows.push_back({
-            blk + "attn_q.weight", GGML_TYPE_Q2_K, { k_embd, k_embd, 1 }
-        });
-        rows.push_back({
-            blk + "attn_k.weight", GGML_TYPE_Q2_K, { k_embd, k_embd, 1 }
-        });
-        rows.push_back({
-            blk + "attn_v.weight", GGML_TYPE_Q2_K, { k_embd, k_embd, 1 }
-        });
-        rows.push_back({
-            blk + "attn_output.weight", GGML_TYPE_Q2_K, { k_embd, k_embd, 1 }
-        });
-        rows.push_back({
-            blk + "ffn_norm.weight", GGML_TYPE_F32, { k_embd, 1, 1 }
-        });
-        rows.push_back({
-            blk + "ffn_gate_inp.weight", GGML_TYPE_F32, { k_embd, k_experts, 1 }
-        });
-        rows.push_back({
-            blk + "ffn_gate_exps.weight", GGML_TYPE_Q2_K, { k_embd, k_ffn, k_experts }
-        });
-        rows.push_back({
-            blk + "ffn_up_exps.weight", GGML_TYPE_Q2_K, { k_embd, k_ffn, k_experts }
-        });
-        rows.push_back({
-            blk + "ffn_down_exps.weight", GGML_TYPE_Q2_K, { k_ffn, k_embd, k_experts }
-        });
-    }
-    rows.push_back({
-        "output_norm.weight", GGML_TYPE_F32, { k_embd, 1, 1 }
-    });
-    rows.push_back({
-        "output.weight", GGML_TYPE_Q2_K, { k_embd, k_vocab, 1 }
-    });
-    return rows;
-}
-
-size_t row_bytes(const inventory_row & row) {
-    return ggml_row_size(row.type, row.ne[0]) * static_cast<size_t>(row.ne[1]) * static_cast<size_t>(row.ne[2]);
-}
-
-std::vector<placement_tensor_info> planner_inventory() {
-    std::vector<placement_tensor_info> inv;
-    for (const inventory_row & row : q2k_rows()) {
-        placement_tensor_info t(row.name, row_bytes(row));
-        t.type  = row.type;
-        t.ne[0] = row.ne[0];
-        t.ne[1] = row.ne[1];
-        t.ne[2] = row.ne[2];
-        t.ne[3] = 1;
-        inv.push_back(t);
-    }
-    return inv;
-}
-
-// The loader's form. The rows own the name strings the tensor infos point at.
-struct loader_inventory {
-    std::vector<inventory_row>         rows = q2k_rows();
-    std::vector<ggml_sycl_tensor_info> tensors;
-    ggml_sycl_tensor_inventory         inv{};
-
-    loader_inventory() {
-        size_t total = 0;
-        for (const inventory_row & row : rows) {
-            ggml_sycl_tensor_info t{};
-            t.name  = row.name.c_str();
-            t.size  = row_bytes(row);
-            t.type  = row.type;
-            t.ne[0] = row.ne[0];
-            t.ne[1] = row.ne[1];
-            t.ne[2] = row.ne[2];
-            t.ne[3] = 1;
-            total += t.size;
-            tensors.push_back(t);
-        }
-        inv.tensors       = tensors.data();
-        inv.count         = tensors.size();
-        inv.total_size    = total;
-        inv.n_expert      = k_experts;
-        inv.n_expert_used = 2;
-        inv.n_layer       = k_layers;
-        inv.n_ctx         = 16;
-        inv.n_ubatch      = 1;
-    }
-};
+constexpr int k_experts = host_plan_shaped_inventory::q2k_shape.experts;
 
 // The over-budget fixture of th32 §11 T2, phase (a): a plan whose host bytes exceed the stored budget logs one
 // would-refuse WARN carrying the plan's number and each of its terms, and the load proceeds: the plan comes back whole
@@ -1380,10 +1278,11 @@ std::string list(const std::vector<size_t> & v) {
 // and the late plans read the early value less the injected bytes); a store per planner call, inside the stage run's
 // device loop (the transaction stores at least once per stage run, so twice, and the late plans read the early value
 // less the injected bytes); no current_active_token() check (the direct entry inside the transaction stores); id 0
-// writing the stored transaction (the second direct entry skips its store). A dry run is not in this tree, so the
-// last leg is the planner called outside any scope with a budget other than the stored B0: the planner takes the
-// budget as an input (design §4.2), so the plan records the one it was passed and nothing is stored. Mutant: the
-// planner's record reading the stored budget instead of its input (the plan records B0).
+// writing the stored transaction (the second direct entry skips its store). That a plan dry run leaves the stored
+// budget at B0 is test-sycl-plan-dry-run's arm (c); the last leg here is the planner the dry run calls, called outside
+// any scope with a budget other than the stored B0: the planner takes the budget as an input (design §4.2), so the
+// plan records the one it was passed and nothing is stored. Mutant: the planner's record reading the stored budget
+// instead of its input (the plan records B0).
 arm_result arm_j_store_order() {
     arm_result   r;
     const size_t n_dev = static_cast<size_t>(ggml_backend_sycl_get_device_count());  // the stage runs' device loop
