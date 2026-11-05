@@ -41,27 +41,12 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, 
 
     // Allocate activation pool via unified_alloc with pinned host constraint.
     //
-    // role=COMPUTE, not EXPERT_STAGING (llama.cpp-cg8j): this pool is a
-    // lazy-once singleton allocated on the first MUL_MAT_ID graph and held
-    // for the process lifetime (see shutdown() -- released only at module
-    // shutdown), not a per-graph ephemeral staging buffer. alloc_role::
-    // EXPERT_STAGING is force-routed to the host SCRATCH zone by
-    // unified_alloc_host_zone() specifically so that genuinely short-lived EXPERT_STAGING
-    // leaks stay visible to host_zone_boundary_check()'s per-graph live scan
-    // (that routing exists on purpose -- see 9a0670712 / llama.cpp-0igs /
-    // llama.cpp-7f2e, which fixed the opposite bug of persistent allocations
-    // being silently hidden in the unswept WEIGHT zone). A handle that is
-    // deliberately retained forever is not what that scan is meant to catch:
-    // every visit finds it live, host_zone_boundary_check(SCRATCH) refuses
-    // forever, and the Phase-0 audit logs it as a permanent "NEW-ESCAPE"
-    // even though there is no leak (single alloc_id, freed once at shutdown
-    // via the WEIGHT zone's own per-allocation host_zone_free() TLSF reclaim).
-    // role=COMPUTE + category=EXPERT_CACHE mirrors the existing
-    // g_retained_scratch precedent in cpu-dispatch.cpp (role=COMPUTE,
-    // category=HOST_COMPUTE): both hit unified_alloc_host_zone()'s category-based WEIGHT
-    // branch, which is never swept by host_zone_settle(), while leaving the
-    // EXPERT_STAGING-role-first SCRATCH routing that 0igs/7f2e protect
-    // untouched for every other (genuinely ephemeral) EXPERT_STAGING caller.
+    // role=COMPUTE, not EXPERT_STAGING: this pool is held across graphs, not a per-graph ephemeral staging buffer, so
+    // it must not be counted by the SCRATCH graph-boundary check (host_zone_boundary_check). Its lifetime says so: it
+    // is a DEVICE holder, shared by every context on the device and owned by the last live backend there
+    // (docs/design/sycl-mmap-host-tier.md §4.4 "Lifetimes", §M62 (D)). select_zone sends role COMPUTE with category
+    // EXPERT_CACHE to SCRATCH, sized by the holder's demand on the device's SCRATCH ledger, and the boundary check
+    // counts only GRAPH rows.
     alloc_request req_act{};
     req_act.queue                               = &q;
     req_act.device                              = device_id;
@@ -69,6 +54,8 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, 
     req_act.intent.role                         = alloc_role::COMPUTE;
     req_act.intent.category                     = runtime_category::EXPERT_CACHE;
     req_act.intent.cohort_id                    = "moe_act_pool";
+    req_act.intent.lifetime                     = alloc_lifetime::DEVICE;
+    req_act.intent.owner                        = { alloc_owner_kind::DEVICE, static_cast<uint64_t>(device_id) };
     req_act.intent.constraints.must_host_pinned = true;
 
     act_handle_ = unified_allocate(req_act);

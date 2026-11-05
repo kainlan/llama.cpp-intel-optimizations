@@ -452,6 +452,9 @@ ggml_sycl::mem_handle ggml_sycl_get_staged_handle_device(const void *       src,
         req.intent.role                         = ggml_sycl::alloc_role::STAGING;
         req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
         req.intent.cohort_id                    = "runtime_staging_cache";
+        // A file-scope holder no backend context owns yet: the interim UNOWNED, which select_zone sends to WEIGHT,
+        // where it landed before routing by role (docs/design/sycl-mmap-host-tier.md §4.4 site table).
+        req.intent.lifetime                     = ggml_sycl::alloc_lifetime::UNOWNED;
         req.intent.constraints.must_host_pinned = true;
         req.intent.constraints.use_pinned_pool  = true;
         ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
@@ -1999,6 +2002,10 @@ float * ggml_sycl_tp_ensure_host_staging(size_t size, queue_ptr stream) {
     req.size                                = new_capacity;
     req.intent.role                         = ggml_sycl::alloc_role::TP_TMP;
     req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+    // A file-scope holder no backend context owns yet: the interim UNOWNED, which select_zone sends to WEIGHT, where it
+    // landed before routing by role (docs/design/sycl-mmap-host-tier.md §4.4 site table).
+    req.intent.cohort_id                    = "tp_host_staging";
+    req.intent.lifetime                     = ggml_sycl::alloc_lifetime::UNOWNED;
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = true;
     ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
@@ -2112,6 +2119,10 @@ static void ggml_sycl_tp_init_quant_comm_buffers_locked(size_t initial_size) {
     host_req.device                              = dpct::dev_mgr::instance().current_device_id();
     host_req.intent.role                         = ggml_sycl::alloc_role::TP_TMP;
     host_req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+    // A file-scope holder no backend context owns yet: the interim UNOWNED, which select_zone sends to WEIGHT, where it
+    // landed before routing by role (docs/design/sycl-mmap-host-tier.md §4.4 site table).
+    host_req.intent.cohort_id                    = "tp_quant_comm_bufs";
+    host_req.intent.lifetime                     = ggml_sycl::alloc_lifetime::UNOWNED;
     host_req.intent.constraints.must_host_pinned = true;
     host_req.intent.constraints.use_pinned_pool  = true;
 
@@ -2308,6 +2319,10 @@ float * ggml_sycl_tp_ensure_shared_reduce_buffer(size_t bytes) {
     req.size                                = bytes;
     req.intent.role                         = ggml_sycl::alloc_role::TP_TMP;
     req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+    // A file-scope holder no backend context owns yet: the interim UNOWNED, which select_zone sends to WEIGHT, where it
+    // landed before routing by role (docs/design/sycl-mmap-host-tier.md §4.4 site table).
+    req.intent.cohort_id                    = "tp_shared_reduce";
+    req.intent.lifetime                     = ggml_sycl::alloc_lifetime::UNOWNED;
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = true;
     ggml_sycl::alloc_handle shared_reduce_owner{};
@@ -2357,6 +2372,10 @@ void ggml_sycl_tp_get_host_reduce_buffers(size_t bytes, float ** buf0, float ** 
     req.size                                = alloc_size;
     req.intent.role                         = ggml_sycl::alloc_role::TP_TMP;
     req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+    // A file-scope holder no backend context owns yet: the interim UNOWNED, which select_zone sends to WEIGHT, where it
+    // landed before routing by role (docs/design/sycl-mmap-host-tier.md §4.4 site table).
+    req.intent.cohort_id                    = "tp_host_bufs";
+    req.intent.lifetime                     = ggml_sycl::alloc_lifetime::UNOWNED;
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = true;
     ggml_sycl::alloc_handle alloc0{};

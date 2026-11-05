@@ -4240,10 +4240,11 @@ I-5, §F2). It is the commit that changes every SYCL load.
     demand ledger behind `ggml_backend_sycl_notify_host_buffer_sizes`, over a
     fake zone that records `grow_zone` calls:
     - a context's second notify replaces its first: (100, 10) then (300, 10)
-      leaves a demand of 310, not 410, so the target is the plan's SCRATCH
-      plus 310; with the fake capacity below that target the ensure call
-      grows by the deficit, rounded to one chunk, and at or above it
-      nothing grows;
+      leaves a demand of 310, not 420 (accumulating would count the output
+      term on both notifies: 100 + 10 + 300 + 10), so the target is the
+      plan's SCRATCH plus 310; with the fake capacity below that target
+      the ensure call grows by the deficit, rounded to one chunk, and at
+      or above it nothing grows;
     - two contexts sum, and one `grow_zone` call is made per notify whose
       target exceeds SCRATCH's capacity; the same notify repeated ten times,
       as `sched_reserve`'s sites repeat it, grows once; a context's demand

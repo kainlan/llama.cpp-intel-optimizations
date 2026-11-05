@@ -34,6 +34,8 @@ bool test_plan_has_cpu_work(const placement_plan & plan);
 void test_set_layout_override(ggml_layout_mode layout);
 void test_clear_layout_override();
 bool test_get_layout_override(ggml_layout_mode * out);
+// Sets the model-load flag the SYCL_Host buffer type reads to choose its role and lifetime.
+void test_set_in_model_load(bool loading);
 #endif
 void               test_clear_host_weight_registry();
 bool               test_backend_supports_graphs(ggml_backend_t backend);

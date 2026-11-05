@@ -7,6 +7,7 @@
 #ifndef GGML_SYCL_PINNED_POOL_HPP
 #define GGML_SYCL_PINNED_POOL_HPP
 
+#include "host-zone-kinds.hpp"
 #include "mem-handle.hpp"
 #include "tlsf-allocator.hpp"
 
@@ -58,15 +59,7 @@ struct pool_atomic_u32 {
     void store(uint32_t x) { v.store(x, std::memory_order_release); }
 };
 
-// Host memory zone identifiers. Mirrors the VRAM arena zoning model.
-enum class host_zone_id : uint8_t {
-    WEIGHT  = 0,
-    KV      = 1,
-    STAGING = 2,
-    SCRATCH = 3,
-    COUNT   = 4,
-};
-
+// host_zone_id lives in host-zone-kinds.hpp.
 const char * host_zone_name(host_zone_id zone);
 
 struct host_zone {

@@ -7,9 +7,14 @@ skipped op, which is wrong tokens, not a refusal. This gate pins the fix:
 
 1. the six sites go through ONE helper, `ggml_sycl_segment_forward_or_throw`, and no other `ggml_sycl_compute_forward`
    call remains in `moe_graph_record_segments` or `moe_graph_replay_segments`; each call names its role, in order;
-2. the helper prints the ordinary loop's unsupported-node line and throws `ggml_sycl_fallback_error` with a string
-   literal (the type stores the pointer, and the catch prints `what()` after the unwind). It never asserts, aborts or
-   returns on a refusal: a refusal is a capability refusal and the throw is what reaches `graph_compute`'s cleanup;
+2. the helper hands the forward result, unconditionally, to `ggml_sycl::host_dispatch_fail_closed` in
+   host-zone-plan.cpp, and prints and throws nothing itself: one function owns the refusal, the same one the host-only
+   test `test-sycl-attn-host-staging-plan` and its fail-closed-asserts mutant score, so the production path cannot
+   drift from what they check. That function returns only when the forward succeeded, prints the device's counter line
+   and then the ordinary loop's unsupported-node line, and throws `ggml_sycl_fallback_error` with a string literal (the
+   type stores the pointer, and the catch prints `what()` after the unwind). Outside its mutant blocks it never
+   asserts, aborts or returns on a refusal: a refusal is a capability refusal and the throw is what reaches
+   `graph_compute`'s cleanup;
 3. `moe_graph_record_segments` refuses to record over a context that still holds segments after a failed retire (its
    entry guard), and scopes its record loop under a handover whose destructor, only while an exception leaves the
    block, moves the executables it has recorded into the context rather than letting the unwind destroy them while
@@ -149,32 +154,102 @@ def helper_body() -> str:
     return function_body(code(), HELPER)
 
 
-def test_the_helper_prints_the_unsupported_node_line_and_throws_a_literal():
-    body = helper_body()
-    assert len(RAW_CALL.findall(body)) == 1, "the helper does not make the one forward call"
-    assert re.search(
-        r'fprintf\s*\(\s*stderr\s*,\s*"\[SYCL\] graph compute unsupported node', body
-    ), "the helper does not print the ordinary loop's unsupported-node line"
-    throws = re.findall(r"\bthrow\s+ggml_sycl_fallback_error\s*\(\s*(.*?)\s*\)\s*;", body, flags=re.DOTALL)
-    assert len(throws) == 1, f"the helper throws ggml_sycl_fallback_error {len(throws)} times, expected 1"
-    assert re.fullmatch(r'"[^"\\]*"', throws[0]), f"the throw argument is not a string literal: {throws[0]!r}"
+PLAN_SRC = SYCL / "host-zone-plan.cpp"
+FAIL_CLOSED = r"\bvoid\s+host_dispatch_fail_closed\s*\("
+FAIL_CLOSED_CALL = re.compile(r"\bggml_sycl::host_dispatch_fail_closed\s*\(([^;]*?)\)\s*;", flags=re.DOTALL)
+# a positive control planted in the function under its own macro; the production build never defines one
+MUTANT_BLOCK = re.compile(r"#\s*if\s+defined\s*\(\s*HOST_ZONE_PLAN_MUTANT_\w+\s*\).*?#\s*endif", flags=re.DOTALL)
+ENDS_PROCESS = (
+    r"\bGGML_ASSERT\b",
+    r"\bGGML_ABORT\b",
+    r"\babort\s*\(",
+    r"\bstd::abort\b",
+    r"\bexit\s*\(",
+    r"\breturn\s+false\b",
+)
 
 
-def test_the_helper_never_asserts_aborts_or_returns_on_a_refusal():
-    body = helper_body()
-    for bad in (
-        r"\bGGML_ASSERT\b",
-        r"\bGGML_ABORT\b",
-        r"\babort\s*\(",
-        r"\bstd::abort\b",
-        r"\bexit\s*\(",
-        r"\breturn\s+false\b",
-    ):
-        assert not re.search(bad, body), f"the helper has {bad}: a refusal must throw, not end the process or return"
-    assert re.search(
-        r"if\s*\(\s*ggml_sycl_compute_forward\s*\([^)]*\)\s*\)\s*\{?\s*return\s*;", body
-    ), "the helper does not return only when the forward succeeded"
-    assert body.index("fprintf") < body.index("throw"), "the throw comes before the unsupported-node line"
+def delegate_problems(body: str) -> list:
+    """What keeps `body` (the segment helper) from handing every refusal to the one fail-closed function."""
+    out = []
+    forward = re.search(r"\bconst\s+bool\s+(\w+)\s*=\s*ggml_sycl_compute_forward\s*\(\s*ctx\s*,\s*node\s*\)\s*;", body)
+    if len(RAW_CALL.findall(body)) != 1 or not forward:
+        out.append("the helper does not make the one forward call into a bool")
+    calls = list(FAIL_CLOSED_CALL.finditer(body))
+    if len(calls) != 1:
+        out.append(f"the helper calls ggml_sycl::host_dispatch_fail_closed {len(calls)} times, expected 1")
+    elif forward:
+        args = [a.strip() for a in calls[0].group(1).split(",")]
+        if len(args) != 5 or args[0] != forward.group(1) or args[2:] != ["ctx.device", "node", "role"]:
+            out.append(f"the fail-closed call does not pass the forward result, ctx.device, node and role: {args}")
+        if calls[0].start() < forward.end():
+            out.append("the fail-closed call comes before the forward")
+    for own, why in (
+        (r"\bif\s*\(", "a condition: the fail-closed call must be unconditional"),
+        (r"\breturn\b", "a return: the refusal must reach the fail-closed function"),
+        (r"\bfprintf\s*\(", "its own print: the fail-closed function owns the line"),
+        (r"\bthrow\b", "its own throw: the fail-closed function owns it"),
+    ) + tuple((bad, "a process-ending or false-returning call") for bad in ENDS_PROCESS):
+        if re.search(own, body):
+            out.append(f"the helper has {why} ({own})")
+    return out
+
+
+def fail_closed_problems(text: str) -> list:
+    """What keeps host_dispatch_fail_closed in `text` (host-zone-plan.cpp) from failing the graph by a throw."""
+    body = function_body(MUTANT_BLOCK.sub("", strip_comments(text)), FAIL_CLOSED)
+    out = []
+    if not re.match(r"\s*if\s*\(\s*ok\s*\)\s*\{?\s*return\s*;", body):
+        out.append("the function does not open by returning only when the forward succeeded")
+    if len(re.findall(r"\breturn\b", body)) != 1:
+        out.append("the function returns somewhere other than on success")
+    for bad in ENDS_PROCESS:
+        if re.search(bad, body):
+            out.append(f"the function has {bad}: a refusal must throw, not end the process or return")
+    line = re.search(r'fprintf\s*\(\s*stderr\s*,\s*"\[SYCL\] graph compute unsupported node', body)
+    counter = re.search(r"if\s*\(\s*counters\s*\)\s*\{?\s*counters\s*->\s*print\s*\(\s*device\s*\)\s*;", body)
+    throws = list(re.finditer(r"\bthrow\s+ggml_sycl_fallback_error\s*\(\s*(.*?)\s*\)\s*;", body, flags=re.DOTALL))
+    if not line:
+        out.append("the function does not print the ordinary loop's unsupported-node line")
+    if not counter:
+        out.append("the function does not print the device's counter line when it has the counters")
+    if len(throws) != 1:
+        out.append(f"the function throws ggml_sycl_fallback_error {len(throws)} times, expected 1")
+    elif not re.fullmatch(r'"[^"\\]*"', throws[0].group(1)):
+        out.append(f"the throw argument is not a string literal: {throws[0].group(1)!r}")
+    if line and counter and not counter.start() < line.start():
+        out.append("the counter line prints after the unsupported-node line: it must survive the failed graph first")
+    if line and throws and not line.start() < throws[0].start():
+        out.append("the throw comes before the unsupported-node line")
+    return out
+
+
+def test_the_helper_hands_every_refusal_to_the_one_fail_closed_function():
+    problems = delegate_problems(helper_body())
+    assert not problems, "; ".join(problems)
+
+
+def test_the_fail_closed_function_prints_then_throws_a_literal_and_never_ends_the_process():
+    problems = fail_closed_problems(PLAN_SRC.read_text())
+    assert not problems, "; ".join(problems)
+
+
+def test_the_two_readers_flag_a_reordered_print_and_a_helper_that_prints_its_own_line():
+    # positive controls: the production text with the throw moved above the print, and the old two-copy helper
+    real = PLAN_SRC.read_text()
+    throw_line = '    throw ggml_sycl_fallback_error("segmented graph node refused");\n'
+    assert real.count(throw_line) == 1, "the control cannot find the throw line to move"
+    moved = real.replace(throw_line, "")
+    anchor = "    // The counter line first, so it survives the failed graph.\n"
+    assert moved.count(anchor) == 1, "the control cannot find the counter print to move the throw above"
+    moved = moved.replace(anchor, throw_line + anchor)
+    assert "the throw comes before the unsupported-node line" in fail_closed_problems(moved)
+    twin = (
+        "{ if (ggml_sycl_compute_forward(ctx, node)) { return; }"
+        ' fprintf(stderr, "[SYCL] graph compute unsupported node"); throw ggml_sycl_fallback_error("x"); }'
+    )
+    flagged = " ".join(delegate_problems(twin))
+    assert "fail_closed" in flagged and "its own print" in flagged and "a return" in flagged
 
 
 # ---- 3. the record function ----

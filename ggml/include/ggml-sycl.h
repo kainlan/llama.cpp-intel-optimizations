@@ -855,15 +855,40 @@ GGML_BACKEND_API bool ggml_backend_sycl_has_tensor_cache(ggml_backend_t backend)
 // the unified cache zone planner.  Call once per context, after graph_reserve() completes
 // and backend_buf_exp_size[] has been populated, but BEFORE the first graph_compute call.
 // VRAM arena zones are a fixed pre-allocated block — they cannot grow after creation.
-// This function pre-sizes the compute arena and host SCRATCH zone using the true
-// scheduler-derived sizes, replacing the heuristic defaults set at model load time.
-// - Updates the VRAM compute arena reservation with the actual scheduler requirement.
-// - Grows the host pinned SCRATCH zone for host-side compute buffers (oneDNN reorder, etc.).
+// This function pre-sizes the compute arena using the true scheduler-derived sizes,
+// replacing the heuristic defaults set at model load time: it updates the VRAM compute
+// arena reservation with the actual scheduler requirement. It does not grow the host
+// pinned SCRATCH zone; ggml_backend_sycl_notify_host_buffer_sizes does that.
 // sizes[i] is the compute buffer size for backend i; n_sizes is the length of sizes[].
 // NULL sizes or n_sizes == 0 is a no-op.
 GGML_BACKEND_API void ggml_backend_sycl_notify_compute_buffer_sizes(ggml_backend_t backend,
                                                                     const size_t * sizes,
                                                                     int            n_sizes);
+
+// Records one llama_context's host buffer demand and grows the host pinned SCRATCH zone to
+// cover it. Returns false if the zone could not grow to cover it, or if backend is not a SYCL
+// backend (which is refused with a WARN before anything else is read). The demand replaces the
+// context's previous one; the zone is the device of the host buffer type of backend's device.
+// Scalars only, so no struct crosses the dlopen boundary; look it up by name through the
+// registry's proc address.
+// Proc name: "ggml_backend_sycl_notify_host_buffer_sizes".
+GGML_BACKEND_API bool ggml_backend_sycl_notify_host_buffer_sizes(ggml_backend_t backend,
+                                                                 size_t         host_compute_bytes,
+                                                                 size_t         host_output_bytes);
+
+// The host holder plan: the attention host staging slots and the CPU-expert pools, sized from
+// the reserve graphs. begin clears the pending plan of every SYCL backend in sched; plan walks
+// one graph while sched's split is live (after ggml_backend_sched_reserve_size, before the next
+// reserve) and merges its figures into the pending plans as a maximum; commit makes backend's
+// pending plan its committed one, which re-sizes the slots and the pools of its device. The
+// SYCL side keeps neither sched nor graph past the call. Look each up by name through the
+// registry's proc address.
+// Proc name: "ggml_backend_sycl_begin_host_holders".
+GGML_BACKEND_API void ggml_backend_sycl_begin_host_holders(ggml_backend_sched_t sched);
+// Proc name: "ggml_backend_sycl_plan_host_holders".
+GGML_BACKEND_API bool ggml_backend_sycl_plan_host_holders(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+// Proc name: "ggml_backend_sycl_commit_host_holders".
+GGML_BACKEND_API bool ggml_backend_sycl_commit_host_holders(ggml_backend_t backend);
 
 // Get cache hit/miss statistics (stub — returns zeros).
 // hits/misses may be NULL if caller doesn't need that stat.

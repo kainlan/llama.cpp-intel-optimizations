@@ -931,8 +931,9 @@ if (Python3_Interpreter_FOUND)
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # The input marker's word is a persistent owner in the WEIGHT host zone, never in the boundary-swept STAGING or
     # SCRATCH zones, and a refused host-zone boundary check walks the allocation registry only for the diagnostics it
-    # still prints or an active zone audit (llama.cpp-nqbe). Run WITH --self-test so each pin is proven to catch its
-    # mutant.
+    # still prints or an active zone audit (llama.cpp-nqbe). The five host-zone owner checks run in their boundary
+    # functions after their owners' releases, and the two host dispatch intercepts count before any staging
+    # (llama.cpp-xfj3). Run WITH --self-test so each pin is proven to catch its mutant.
     add_test(NAME test-sycl-host-zone-boundary-owner-source
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-zone-boundary-owner-source.py --self-test)

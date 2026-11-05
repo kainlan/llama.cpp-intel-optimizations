@@ -2009,7 +2009,12 @@ static address_range_index g_runtime_alloc_index;
 //   g_runtime_span_irregular_rows   rows the index cannot answer a key-in-span question for: the key is not the base the
 //                                   row is indexed at (no extent, or handle.ptr != key). Always 0 in practice; while it is
 //                                   not, runtime_registry_span_live_locked() scans, so it keeps the old answer.
+//   g_runtime_host_zone_graph_rows[z]
+//                                   the rows of g_runtime_host_zone_rows[z] whose lifetime is GRAPH: the only rows the
+//                                   SCRATCH/STAGING graph-boundary check counts (§4.4 "Lifetimes"). A CONTEXT compute
+//                                   buffer, a DEVICE holder, a MODEL row or an UNOWNED holder is live there by design.
 static size_t g_runtime_host_zone_rows[static_cast<size_t>(host_zone_id::COUNT)];
+static size_t g_runtime_host_zone_graph_rows[static_cast<size_t>(host_zone_id::COUNT)];
 static size_t g_runtime_span_irregular_rows = 0;
 
 // Keep cache owners later in declaration order than the registry they call from
@@ -2071,6 +2076,15 @@ static void runtime_registry_count_row_locked(const void * key, const alloc_meta
             GGML_ASSERT(rows > 0 && "host-zone row counter lost a registered row");
             rows--;
         }
+        if (host_zone_lifetime_counts_at_graph_boundary(h.lifetime)) {
+            size_t & graph_rows = g_runtime_host_zone_graph_rows[static_cast<size_t>(h.host_zone)];
+            if (add) {
+                graph_rows++;
+            } else {
+                GGML_ASSERT(graph_rows > 0 && "host-zone GRAPH row counter lost a registered row");
+                graph_rows--;
+            }
+        }
     }
     if (!runtime_registry_row_span_regular(key, h)) {
         if (add) {
@@ -2082,10 +2096,17 @@ static void runtime_registry_count_row_locked(const void * key, const alloc_meta
     }
 }
 
-// Is any registry row in host zone `zone`? What host_zone_settle() decides on. O(1); see the counters' comment.
+// Is any registry row in host zone `zone` that the zone's settle counts? What host_zone_settle() decides on. O(1); see
+// the counters' comment. SCRATCH and STAGING, the graph-boundary zones, count only GRAPH rows; KV, whose settle really
+// resets the zone, counts every row.
 static bool runtime_registry_host_zone_live_locked(host_zone_id zone) noexcept {
-    return static_cast<size_t>(zone) < static_cast<size_t>(host_zone_id::COUNT) &&
-           g_runtime_host_zone_rows[static_cast<size_t>(zone)] != 0;
+    if (static_cast<size_t>(zone) >= static_cast<size_t>(host_zone_id::COUNT)) {
+        return false;
+    }
+    if (zone == host_zone_id::SCRATCH || zone == host_zone_id::STAGING) {
+        return g_runtime_host_zone_graph_rows[static_cast<size_t>(zone)] != 0;
+    }
+    return g_runtime_host_zone_rows[static_cast<size_t>(zone)] != 0;
 }
 
 // Is any registry row's key in [lo, hi)? What zone_settle() decides on. The index answers in O(log n) while every row is
@@ -2228,17 +2249,21 @@ static bool runtime_registry_index_consistent_locked() noexcept {
         return false;
     }
     // The settle counters equal a recount of the registry (llama.cpp-rriv).
-    size_t zone_rows[static_cast<size_t>(host_zone_id::COUNT)] = {};
-    size_t irregular                                           = 0;
+    size_t zone_rows[static_cast<size_t>(host_zone_id::COUNT)]       = {};
+    size_t zone_graph_rows[static_cast<size_t>(host_zone_id::COUNT)] = {};
+    size_t irregular                                                 = 0;
     for (const auto & kv : g_runtime_alloc_registry) {
         const alloc_metadata & h = kv.second.handle;
         if (static_cast<size_t>(h.host_zone) < static_cast<size_t>(host_zone_id::COUNT)) {
             zone_rows[static_cast<size_t>(h.host_zone)]++;
+            if (host_zone_lifetime_counts_at_graph_boundary(h.lifetime)) {
+                zone_graph_rows[static_cast<size_t>(h.host_zone)]++;
+            }
         }
         irregular += runtime_registry_row_span_regular(kv.first, h) ? 0 : 1;
     }
     for (size_t z = 0; z < static_cast<size_t>(host_zone_id::COUNT); z++) {
-        if (zone_rows[z] != g_runtime_host_zone_rows[z]) {
+        if (zone_rows[z] != g_runtime_host_zone_rows[z] || zone_graph_rows[z] != g_runtime_host_zone_graph_rows[z]) {
             return false;
         }
     }
@@ -19775,38 +19800,16 @@ static size_t unified_alloc_total_vram(int device, sycl::queue & queue) {
     return total;
 }
 
-// The host zone a zone-managed host-pinned request lands in, by its owner's lifetime. KV spills and KV go to KV.
-// Owners that outlive a graph go to WEIGHT, which host_zone_settle() never sweeps: permanent weight data, persistent
-// host-compute owners, expert-cache pools, and any request that declares a persistent owner
-// (alloc_constraints::persistent_owner, llama.cpp-nqbe). Transient EXPERT_STAGING goes to SCRATCH and must be released
-// by its scoped smart-handle owner before the graph boundary. Everything else goes to STAGING, which must be empty at
-// every graph boundary. The KV and EXPERT_STAGING choices come first, so a persistent owner with either role would never
-// reach WEIGHT: that combination is asserted against rather than routed.
-//
-// Role decides before category: role == EXPERT_STAGING must route to SCRATCH even when category == HOST_COMPUTE
-// (e.g. a MoE CPU fallback's expert staging slab, which is both). The WEIGHT branch's category disjuncts were added to
-// route persistent host-compute/expert-cache owners to WEIGHT (9a0670712), but being checked first meant they shadowed
-// EXPERT_STAGING's role for any request that also carried HOST_COMPUTE/EXPERT_CACHE, silently overriding the "must be
-// released by scoped smart-handle owners before reset" contract above with a zone that is *not* swept by
-// host_zone_settle() -- llama.cpp-0igs / llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
+// The host zone of a zone-managed host-pinned request is select_zone()'s (host-zone-plan.hpp, §4.4 "Route by role, in
+// select_zone, the one place"): role KV or a KV spill to KV, role WEIGHT to WEIGHT, EXPERT_STAGING to SCRATCH, the
+// interim UNOWNED lifetime or a persistent owner to WEIGHT, every other HOST_COMPUTE or EXPERT_CACHE request to
+// SCRATCH, and anything else to STAGING. No category selects WEIGHT. Role decides before category, so an
+// EXPERT_STAGING request that is also HOST_COMPUTE still reaches SCRATCH, which the graph boundary checks.
 static host_zone_id unified_alloc_host_zone(const alloc_request & req,
                                             runtime_category      cat,
                                             bool                  kv_spill_to_host) noexcept {
-    // persistent_owner is a lifetime claim, not a routing preference. WEIGHT is the one host zone that holds an owner
-    // outliving every graph, so a persistent request that would land in KV or SCRATCH is a defect.
-    GGML_ASSERT(!req.intent.constraints.persistent_owner || (!kv_spill_to_host && req.intent.role != alloc_role::KV &&
-                                                             req.intent.role != alloc_role::EXPERT_STAGING));
-    if (kv_spill_to_host || req.intent.role == alloc_role::KV) {
-        return host_zone_id::KV;
-    }
-    if (req.intent.role == alloc_role::EXPERT_STAGING) {
-        return host_zone_id::SCRATCH;
-    }
-    if (req.intent.role == alloc_role::WEIGHT || cat == runtime_category::HOST_COMPUTE ||
-        cat == runtime_category::EXPERT_CACHE || req.intent.constraints.persistent_owner) {
-        return host_zone_id::WEIGHT;
-    }
-    return host_zone_id::STAGING;
+    return select_zone(req.intent.role, cat, req.intent.lifetime, req.intent.constraints.persistent_owner,
+                       kv_spill_to_host);
 }
 
 bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
@@ -20007,6 +20010,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             rec.handle.vram_zone    = zid;
             rec.handle.zone_managed  = true;
             rec.handle.cache_backing = cache_backing;
+            rec.handle.lifetime      = req.intent.lifetime;
+            rec.handle.owner         = req.intent.owner;
             rec.queue                = req.queue;
             if (req.queue) rec.queue_keepalive = *req.queue;
             rec.zone_managed = true;
@@ -20476,6 +20481,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         rec.handle.zone_managed     = output_metadata.zone_managed;
         rec.handle.cache_backing    = cache_backing;
         rec.handle.host_zone        = output_metadata.host_zone;
+        rec.handle.lifetime         = req.intent.lifetime;
+        rec.handle.owner            = req.intent.owner;
         rec.queue                   = req.queue;
         if (tier == alloc_tier::HOST_CPU) {
             // the row takes the owner entry's charge here; from now on the row's free credits it (th32 §4.2)
@@ -25721,11 +25728,15 @@ static size_t runtime_registry_scan_host_zone_locked(host_zone_id            zon
                                                      bool                    epoch_tracked,
                                                      zone_audit_site_visit & audit,
                                                      uint64_t &              oldest_epoch) {
-    size_t detail_lines     = 0;
-    size_t live_allocations = 0;
+    size_t     detail_lines     = 0;
+    size_t     live_allocations = 0;
+    // The rows the zone's settle counts (runtime_registry_host_zone_live_locked): GRAPH rows only on the
+    // graph-boundary zones.
+    const bool graph_only       = zone == host_zone_id::SCRATCH || zone == host_zone_id::STAGING;
     for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
         runtime_registry_note_row_scanned_locked();
-        if (it->second.handle.host_zone == zone) {
+        if (it->second.handle.host_zone == zone &&
+            (!graph_only || host_zone_lifetime_counts_at_graph_boundary(it->second.handle.lifetime))) {
             if (log_detail && detail_lines < 8) {
                 runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
                 detail_lines++;
@@ -26032,13 +26043,40 @@ bool unified_cache::host_zones_configured() const {
     return host_arena_ && host_arena_->zones_configured();
 }
 
-void unified_cache::grow_scratch_zone(size_t additional_bytes) {
-    if (!host_arena_ || !host_arena_->zones_configured() || additional_bytes == 0) {
-        return;
+bool unified_cache::grow_scratch_zone(size_t request_bytes) {
+    if (!host_arena_ || !host_arena_->zones_configured() || request_bytes == 0) {
+        return false;
     }
-    host_arena_->grow_zone(host_zone_id::SCRATCH, additional_bytes);
+    const size_t before = host_arena_->zone_capacity(host_zone_id::SCRATCH);
+    if (!host_arena_->grow_zone(host_zone_id::SCRATCH, request_bytes)) {
+        return false;
+    }
+    const size_t after = host_arena_->zone_capacity(host_zone_id::SCRATCH);
     GGML_LOG_INFO("[HOST-ARENA] SCRATCH zone grown by %.1f MB for compute buffers\n",
-                  additional_bytes / (1024.0 * 1024.0));
+                  (after - before) / (1024.0 * 1024.0));
+    return true;
+}
+
+bool unified_cache::host_scratch_ledger_ops(size_t                  chunk_cap,
+                                            host_scratch_ledger **  ledger,
+                                            host_scratch_zone_ops * ops) {
+    if (!host_arena_ || !host_arena_->zones_configured() || ledger == nullptr || ops == nullptr) {
+        return false;
+    }
+    *ledger       = &host_scratch_ledger_;
+    *ops          = host_scratch_zone_ops{};
+    ops->user     = this;
+    ops->capacity = [](void * user) -> size_t {
+        return static_cast<unified_cache *>(user)->host_zone_capacity(host_zone_id::SCRATCH);
+    };
+    ops->grow = [](void * user, size_t request) -> bool {
+        return static_cast<unified_cache *>(user)->grow_scratch_zone(request);
+    };
+    // The plan's SCRATCH reserve, as configure_host_zones() recorded it: the demands sit on top of it.
+    ops->plan_scratch_bytes = host_zone_reserved_capacity(host_zone_id::SCRATCH);
+    ops->chunk_cap          = chunk_cap;
+    ops->alignment          = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+    return true;
 }
 
 bool unified_cache::contains_pinned(const void * ptr) const {
@@ -27534,11 +27572,67 @@ bool unified_cache_allocate_moe_q8_1_graph_scratch(int                          
     return true;
 }
 
-void unified_cache_grow_host_scratch_zone(size_t additional_bytes) {
-    auto * cache = get_unified_cache_for_device(resolve_effective_device(0));
-    if (cache) {
-        cache->grow_scratch_zone(additional_bytes);
+bool unified_cache_host_scratch_ledger(int                     device,
+                                       size_t                  chunk_cap,
+                                       host_scratch_ledger **  ledger,
+                                       host_scratch_zone_ops * ops) {
+    unified_cache * cache = get_unified_cache_for_device(device);
+    return cache != nullptr && cache->host_scratch_ledger_ops(chunk_cap, ledger, ops);
+}
+
+void unified_cache_host_scratch_drop_context(uint64_t context_key) {
+    if (context_key == 0) {
+        return;
     }
+    // The caches are collected under the map's read lock and their ledgers touched after it is released, so the
+    // ledger's leaf mutex is never taken under g_cache_rw_mutex. A cache lives until module shutdown.
+    std::vector<unified_cache *> caches;
+    {
+        std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
+        caches.reserve(g_device_caches.size());
+        for (const auto & entry : g_device_caches) {
+            if (entry.second) {
+                caches.push_back(entry.second.get());
+            }
+        }
+    }
+    for (unified_cache * cache : caches) {
+        host_scratch_ledger * ledger = nullptr;
+        host_scratch_zone_ops ops{};
+        if (cache->host_scratch_ledger_ops(0, &ledger, &ops)) {
+            ledger->drop_context(context_key);
+        }
+    }
+}
+
+size_t unified_cache_host_zone_owner_check(alloc_lifetime lifetime, alloc_owner_ref owner) {
+    // Copied under the registry mutex, reported after it is released: the report prints, and may abort. A row already
+    // RELEASING is on its way out through its owner's own release, so only LIVE rows count as leaked.
+    std::vector<host_zone_record_view> owned;
+    std::vector<std::string>           cohorts;
+    {
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        for (const auto & kv : g_runtime_alloc_registry) {
+            if (kv.second.state != runtime_alloc_state::LIVE) {
+                continue;
+            }
+            const alloc_metadata & h = kv.second.handle;
+            host_zone_record_view  view;
+            view.zone     = h.host_zone;
+            view.lifetime = h.lifetime;
+            view.owner    = h.owner;
+            view.bytes    = h.size;
+            if (!host_zone_record_owned_by(view, lifetime, owner)) {
+                continue;
+            }
+            owned.push_back(view);
+            cohorts.push_back(kv.second.cohort_id);
+        }
+    }
+    for (size_t i = 0; i < owned.size(); i++) {
+        owned[i].cohort = cohorts[i].c_str();
+    }
+    return host_zone_owner_boundary_check(owned.data(), owned.size(), lifetime, owner, strict_lease_checks_enabled());
 }
 
 void * unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment) {
@@ -33244,11 +33338,10 @@ size_t placement_entry_host_weight_bytes(const placement_entry & entry) {
 }
 
 host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan) {
-    // llama.cpp-glkg: the WEIGHT zone is where every runtime HOST_COMPUTE
-    // request lands (unified_alloc_host_zone() routes role==WEIGHT OR
-    // cat==HOST_COMPUTE OR cat==EXPERT_CACHE to host_zone_id::WEIGHT), and
-    // that includes llama_context::output_reserve()'s logits/embd host
-    // buffer plus the server's prompt-checkpoint reads after model load.
+    // Besides the host weights, the WEIGHT zone holds what select_zone() still sends there: the interim UNOWNED
+    // holders (§4.4's site table; on a MoE graph only routing_indices_cache, one ubatch's routing ids) and any
+    // role-WEIGHT host request. Post-load host compute and output buffers no longer land here: they route to SCRATCH,
+    // sized by the notified demand (§4.4 "The notify path"), and host KV to KV.
     // Add 64 MiB of consumable sizing slack beyond the host weights' exact
     // bytes. This is not an earmarked context reservation: other
     // WEIGHT-zone owners can consume it before a context requests memory.
@@ -34012,8 +34105,8 @@ static void populate_host_zone_sizing(placement_plan &                          
     // VRAM RUNTIME fields (moe/tp/dma) are folded here as conservative zone budgeting —
     // the actual allocations live in the VRAM RUNTIME zone, but the host SCRATCH zone
     // grows proportionally to ensure the planner accounts for peak VRAM usage.
-    // Actual compute buffer needs are fed back via unified_cache_grow_host_scratch_zone()
-    // after the ggml scheduler is created.
+    // A context's host compute and output buffers are not folded here: they are notified demands on the cache's
+    // host SCRATCH ledger (unified_cache_host_scratch_ledger()), which covers them before each allocation.
     // Note: onednn_scratchpad_bytes goes to the ONEDNN zone (separate 256 MB allocation),
     // not counted here.
     size_t host_scratch_total = 0;

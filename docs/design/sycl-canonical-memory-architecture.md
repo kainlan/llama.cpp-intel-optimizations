@@ -1520,7 +1520,7 @@ The target lock inventory and mandatory order is concrete:
 | L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
 | L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
 | L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()` | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
-| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
+| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, the host SCRATCH demand ledger's `host_scratch_ledger::mutex_` and the host holder plan's `host_holder_plans::mutex_` (both `host-zone-plan.hpp`), and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, the zone-reset audit's `zone_audit_state::mutex` (`unified-cache.cpp`), and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
@@ -1609,6 +1609,34 @@ That ordering is invisible at the call site and reads as a stray declaration, so
 it is gated by `tests/test-sycl-zone-reset-audit-source.py`, which asserts the
 guard precedes the lock at each of the four sites and carries positive-control
 mutants that reorder them.
+
+The host SCRATCH demand ledger's `host_scratch_ledger::mutex_` and the host
+holder plan's `host_holder_plans::mutex_` (`host-zone-plan.hpp`;
+docs/design/sycl-mmap-host-tier.md §4.4) guard, respectively, the per-context
+and per-holder SCRATCH demands of one device, and the pending and committed host
+holder plans of every backend context. Both sit at L5 with the allocation
+bookkeeping they size, and both are **strictly leaf: never held while any other
+lock is acquired, and no allocation, device work, callback or logging happens
+under either.** The ledger reads the zone's capacity before taking its lock.
+Under the lock it computes its target and reserves the deficit, so a notify that
+arrives while the grow runs finds the deficit covered and does not grow for it
+again. It releases the lock before the one `grow_zone` call, which takes the
+pinned pool's own locks, and retakes it only to give back a failed grow's
+reservation. A notify's `ok` reports its own grow only. A notify that finds the
+deficit covered by another notify's grow in flight makes no grow and returns
+`ok`, even if that grow then fails. The notify whose grow failed is the one that
+reports it: it returns false, and the pool WARNs for that one failed `grow_zone`
+call. The reservation it gives back is grown by the next notify, or by the miss
+path. Making the covered notify wait for the other grow's outcome would be a
+host wait, which the design forbids. The ledger's demand line prints after the
+release. The plan walk gathers each reserve graph's figures with no lock held,
+because the placement fact it asks for takes the inventory's L1 lock, and only
+then merges them under `host_holder_plans::mutex_`. `commit` and `drop`, the
+only writers of a committed plan, fold each changed device's committed plans
+into its merged state under that lock. `device_state`, which dispatch admission
+reads, copies one device's merged state under it and merges nothing. `commit`
+prints after releasing it. The slot re-size and the pools' re-size that follow a
+commit run with neither lock held.
 
 The MoE CONTROL reservation ledger's `g_mutex` (`moe-control-plan.cpp`, `dimc`)
 guards the per-(device, plan) reservation table, the conversion generations, and
