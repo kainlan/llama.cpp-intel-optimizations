@@ -4840,7 +4840,9 @@ class unified_cache {
     // Returns pinned_chunk_pool::INVALID_CHUNK_HANDLE (UINT64_MAX) on miss.
     // Safe to call even when host_arena_ is null (returns miss).
     uint64_t host_acquire_chunk_lease(const void * ptr);
-    void     host_release_chunk_lease(uint64_t handle);
+    // noexcept: its one caller, mem_handle::release_lease_state, is. A drop that empties an orphaned SCRATCH chunk's
+    // last lease releases the chunk through release_marked_chunk(), which allocates nothing.
+    void     host_release_chunk_lease(uint64_t handle) noexcept;
 
     // Destroy arena (free all chunks).
     bool arena_destroy();
@@ -5520,7 +5522,10 @@ class unified_cache {
     // phase gate or pool budget blocks growth. Callers should treat a false
     // return as a hard failure and fall back to non-pinned allocation.
     bool   host_zone_grow(host_zone_id zone, size_t additional_bytes);
-    void   configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
+    // Releases the device's empty marked SCRATCH chunks first. False only when a withdrawn chunk survives, so the pool
+    // refused the rebuild by name (under GGML_SYCL_STRICT it aborts instead); a capacity shortfall returns true with
+    // the zones unconfigured and the reserved figures zeroed, as before.
+    bool   configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
     bool   host_zones_configured() const;
     // One grow_zone(SCRATCH, request) call, the host SCRATCH demand ledger's only growth (§4.4 "Ensure capacity").
     // Prints `[HOST-ARENA] SCRATCH zone grown by %.1f MB for compute buffers` when it grows.
@@ -5529,6 +5534,29 @@ class unified_cache {
     // host buffer chunk cap the demands split at (GGML_SYCL_HOST_BUFFER_CHUNK_MB). False when host zones are not
     // configured, so there is no SCRATCH zone to ensure.
     bool   host_scratch_ledger_ops(size_t chunk_cap, host_scratch_ledger ** ledger, host_scratch_zone_ops * ops);
+
+    // === The SCRATCH marked set (docs/design/sycl-mmap-host-tier.md §4.4) ===
+    // The chunks a transaction returned: withdrawn from zone allocation and filed here, each with the owner whose
+    // transaction returned it, until a release frees them. Every release goes through release_marked_chunk() or its
+    // _locked core, which erases the chunk's entries in the same step. Lock order (canon §12.5): marked_set_mutex_
+    // (L4, last) and then the pool's mutex_ (L5, first); no backing is released under either, and
+    // tests/test-sycl-marked-set-lock-order-gate.py pins it.
+    //
+    // RETURN / RETURN_TO_MARK: withdraw and file `chunk_idxs`, and release at once each one already empty.
+    size_t               host_scratch_return_chunks(const std::vector<size_t> & chunk_idxs, uint64_t owner);
+    // The begin entry, right after a scheduler creation: release every empty marked chunk, whatever its owner. Only a
+    // chunk of `owner` that is still in use is reported by name.
+    size_t               host_scratch_begin_release(uint64_t owner);
+    // The owner's end, before its backend context is deleted: release each of its empty chunks and mark the rest
+    // orphaned, so the free that empties one, or its last lease's drop, releases it.
+    size_t               host_scratch_owner_end(uint64_t owner);
+    // The public form, for a caller holding neither lock: the orphaned chunk's emptying free and last lease's drop.
+    pinned_chunk_release release_marked_chunk(size_t chunk_idx) noexcept;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Test accessors: the set's entries, and those for one chunk.
+    size_t marked_entries() const;
+    size_t marked_entries(size_t chunk_idx) const;
+#endif
 
     size_t pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
 
@@ -6961,6 +6989,35 @@ class unified_cache {
     mutable std::shared_mutex           rw_mutex_;
     mutable std::condition_variable_any entry_cv_;
 
+    // The SCRATCH marked set's entries, and the walk's record of a chunk it could not release.
+    struct marked_chunk_entry {
+        size_t   chunk_idx;
+        uint64_t owner;
+    };
+
+    struct marked_chunk_refusal {
+        size_t               chunk_idx;
+        pinned_chunk_release status;
+    };
+
+    // The core, called with marked_set_mutex_ held: release_zone_chunk(), and on DONE erase the chunk's entries and
+    // hand over its carrier. The vector form appends to a vector its caller reserved; the single-slot form is the
+    // public form's, and allocates nothing.
+    pinned_chunk_release release_marked_chunk_locked(size_t                                           chunk_idx,
+                                                     std::vector<pinned_chunk_pool::released_chunk> & out,
+                                                     bool                                             orphan_if_live);
+    pinned_chunk_release release_marked_chunk_locked(size_t chunk_idx, pinned_chunk_pool::released_chunk & out);
+    // A walk's candidates: one per chunk, in set order, owned by `owner` when any of the chunk's entries is.
+    static void          marked_candidate_note(std::vector<marked_chunk_entry> & candidates,
+                                               const marked_chunk_entry &        entry,
+                                               uint64_t                          owner);
+    // The `released` and `return refused` lines, printed after both locks have dropped.
+    void                 print_marked_released(size_t n_released, size_t released_bytes);
+    void                 print_marked_refusals(const std::vector<marked_chunk_refusal> & refusals);
+
+    mutable std::mutex              marked_set_mutex_;
+    std::vector<marked_chunk_entry> marked_set_;
+
     // Host memory arena (pinned_chunk_pool).
     // Bypasses Intel Level Zero's ~11GB per-allocation limit via 2GB chunks.
     // Initialized with capped budget (128 GB) to prevent unbounded growth.
@@ -7723,6 +7780,18 @@ struct allocation_result {
 
     explicit operator bool() const noexcept { return error == allocation_error::NONE && static_cast<bool>(owner); }
 };
+
+// Whether the registry still holds the exact row `metadata` names (found by ptr, compared by key()): GONE when no row
+// has that pointer or the row there is another allocation, else the row's own state. It takes g_runtime_alloc_mutex
+// alone and writes nothing. The pinned pool's released-chunk carrier and its stranded reconcile read it to move the
+// footprint only when the memory is gone (docs/design/sycl-mmap-host-tier.md §4.4, §M92, §M97).
+enum allocation_registered_state {
+    ALLOCATION_REGISTERED_GONE,
+    ALLOCATION_REGISTERED_LIVE,
+    ALLOCATION_REGISTERED_RELEASING,
+};
+
+allocation_registered_state unified_allocation_registered_exact(const alloc_metadata & metadata) noexcept;
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 struct allocation_owner_test_fixture {
@@ -8949,6 +9018,10 @@ bool unified_cache_host_scratch_ledger(int                     device,
                                        size_t                  chunk_cap,
                                        host_scratch_ledger **  ledger,
                                        host_scratch_zone_ops * ops);
+
+// The begin entry's release of `device`'s marked SCRATCH chunks for `owner`
+// (unified_cache::host_scratch_begin_release). Returns the chunks released; 0 when the device has no cache.
+size_t unified_cache_host_scratch_begin_release(int device, uint64_t owner);
 
 // The owner-boundary check (§4.4 "Each lifetime keeps a leak check at its owner's boundary", §M57 (b)): every live
 // registry row with this lifetime and owner prints `[HOST-ZONE] leaked <lifetime> record: ...` at WARN, and under

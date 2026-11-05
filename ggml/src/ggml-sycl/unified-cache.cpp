@@ -21461,6 +21461,32 @@ mem_handle alloc_handle::as_mem_handle() const {
                                    tier == alloc_tier::DEVICE_VRAM ? device : mem_handle::HOST_DEVICE, size);
 }
 
+allocation_registered_state unified_allocation_registered_exact(const alloc_metadata & metadata) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto                  row = g_runtime_alloc_registry.find(metadata.ptr);
+    // A reused address answers GONE: the row there is another allocation unless its whole release key matches.
+    if (row == g_runtime_alloc_registry.end() || !(row->second.handle.key() == metadata.key())) {
+        return ALLOCATION_REGISTERED_GONE;
+    }
+    return row->second.state == runtime_alloc_state::RELEASING ? ALLOCATION_REGISTERED_RELEASING :
+                                                                 ALLOCATION_REGISTERED_LIVE;
+}
+
+// The cohort of the registry row that starts first inside [lo, hi), for the SCRATCH return-refused line; "unregistered"
+// when no row starts there.
+static std::string runtime_registry_cohort_in_span(uintptr_t lo, uintptr_t hi) {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    address_range_index::entry  first{};
+    if (lo >= hi || !g_runtime_alloc_index.find_first_base_in(lo, hi, &first)) {
+        return "unregistered";
+    }
+    const auto row = g_runtime_alloc_registry.find(first.key);
+    if (row == g_runtime_alloc_registry.end()) {
+        return "unregistered";
+    }
+    return row->second.cohort_id.empty() ? "unnamed" : row->second.cohort_id;
+}
+
 bool unified_lookup(void * ptr, alloc_metadata * out) {
     if (out == nullptr) {
         return false;
@@ -25987,7 +26013,11 @@ void unified_cache::host_zone_free(host_zone_id zone, void * ptr) {
         fprintf(stderr, "[HOST-ZONE-ALLOC] where=free dev=? zone=%s ptr=%p\n", host_zone_name(zone), ptr);
     }
     const zone_audit_timer audit_timer(zone_audit_host_timing(zone), true);
-    host_arena_->zone_free(zone, ptr);
+    const size_t           orphaned_chunk = host_arena_->zone_free(zone, ptr);
+    // The free that empties an orphaned chunk releases it, after the pool's lock has dropped (§4.4).
+    if (orphaned_chunk != pinned_chunk_pool::NO_CHUNK) {
+        (void) release_marked_chunk(orphaned_chunk);
+    }
 }
 
 size_t unified_cache::host_zone_used(host_zone_id zone) const {
@@ -26035,27 +26065,311 @@ bool unified_cache::host_zone_grow(host_zone_id zone, size_t additional_bytes) {
     return grew;
 }
 
-void unified_cache::configure_host_zones(size_t weight_bytes,
+bool unified_cache::configure_host_zones(size_t weight_bytes,
                                          size_t kv_bytes,
                                          size_t staging_bytes,
                                          size_t scratch_bytes) {
     if (!host_arena_) {
         host_zone_reserved_bytes_.fill(0);
-        return;
+        return true;
     }
     auto align_zone = [](size_t bytes) {
         const size_t alignment = pinned_chunk_pool::DEFAULT_ALIGNMENT;
         return (bytes + alignment - 1) & ~(alignment - 1);
     };
-    host_arena_->configure_zones(weight_bytes, kv_bytes, staging_bytes, scratch_bytes);
+    // First the device's empty marked chunks go (§4.4 "configure_zones refuses while a withdrawn chunk survives"). A
+    // chunk still in use stays withdrawn, so the pool refuses the rebuild below by name. Collected before the lock and
+    // released after it, so no backing is freed under marked_set_mutex_.
+    std::vector<pinned_chunk_pool::released_chunk> released;
+    std::vector<marked_chunk_entry>                candidates;
+    {
+        std::lock_guard<std::mutex> lock(marked_set_mutex_);
+        try {
+            released.reserve(marked_set_.size());
+            candidates.reserve(marked_set_.size());
+            for (const marked_chunk_entry & entry : marked_set_) {
+                marked_candidate_note(candidates, entry, 0);
+            }
+        } catch (const std::bad_alloc &) {
+            // Nothing released: a surviving withdrawn chunk then makes the pool refuse, which is the safe answer.
+            candidates.clear();
+        }
+        for (const marked_chunk_entry & candidate : candidates) {
+            (void) release_marked_chunk_locked(candidate.chunk_idx, released, false);
+        }
+    }
+    size_t released_bytes = 0;
+    for (auto & carrier : released) {
+        released_bytes += carrier.usable_size();
+        pinned_chunk_pool::release_chunk_backing(std::move(carrier));
+    }
+    print_marked_released(released.size(), released_bytes);
+
+    // The refusal changes nothing: the zones, every flag, the marked set and the reserved figures stay one state.
+    if (!host_arena_->configure_zones(weight_bytes, kv_bytes, staging_bytes, scratch_bytes)) {
+        if (ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives (GGML_SYCL_STRICT)");
+        }
+        return false;
+    }
     if (!host_arena_->zones_configured()) {
         host_zone_reserved_bytes_.fill(0);
-        return;
+        return true;
     }
     host_zone_reserved_bytes_[static_cast<size_t>(host_zone_id::WEIGHT)]  = align_zone(weight_bytes);
     host_zone_reserved_bytes_[static_cast<size_t>(host_zone_id::KV)]      = align_zone(kv_bytes);
     host_zone_reserved_bytes_[static_cast<size_t>(host_zone_id::STAGING)] = align_zone(staging_bytes);
     host_zone_reserved_bytes_[static_cast<size_t>(host_zone_id::SCRATCH)] = align_zone(scratch_bytes);
+    return true;
+}
+
+void unified_cache::marked_candidate_note(std::vector<marked_chunk_entry> & candidates,
+                                          const marked_chunk_entry &        entry,
+                                          uint64_t                          owner) {
+    for (marked_chunk_entry & candidate : candidates) {
+        if (candidate.chunk_idx == entry.chunk_idx) {
+            if (entry.owner == owner) {
+                candidate.owner = owner;
+            }
+            return;
+        }
+    }
+    candidates.push_back(entry);
+}
+
+size_t unified_cache::host_scratch_return_chunks(const std::vector<size_t> & chunk_idxs, uint64_t owner) {
+    if (!host_arena_ || chunk_idxs.empty()) {
+        return 0;
+    }
+    // The device the WARNs below name, read before the lock: the lookup can take the device manager's mutex.
+    const int dev = ggml_sycl_get_device_id_from_queue(queue_);
+
+    // Declared before the lock: an unwinding scope destroys them after the unlock, so no backing is released under
+    // marked_set_mutex_ (canon §12.5).
+    std::vector<pinned_chunk_pool::released_chunk> released;
+    std::vector<marked_chunk_refusal>              refusals;
+    {
+        std::lock_guard<std::mutex> lock(marked_set_mutex_);
+        try {
+            marked_set_.reserve(marked_set_.size() + chunk_idxs.size());
+            released.reserve(chunk_idxs.size());
+            refusals.reserve(chunk_idxs.size());
+        } catch (const std::bad_alloc &) {
+            GGML_LOG_WARN(
+                "[HOST-ARENA] SCRATCH return not filed dev=%d chunks=%zu: no room in the marked set; they stay "
+                "ordinary capacity\n",
+                dev, chunk_idxs.size());
+            return 0;
+        }
+        // Withdrawal, filing and the release of an already-empty chunk share this one scope, so an empty chunk is
+        // never visible in the set between its filing and its release (§4.4).
+        for (const size_t chunk_idx : chunk_idxs) {
+            if (!host_arena_->withdraw_zone_chunk(host_zone_id::SCRATCH, chunk_idx)) {
+                GGML_LOG_WARN(
+                    "[HOST-ARENA] SCRATCH return skipped dev=%d chunk=%zu: not a chunk of the SCRATCH zone alone\n",
+                    dev, chunk_idx);
+                continue;
+            }
+            marked_set_.push_back({ chunk_idx, owner });
+            // A losing scheduler's buffers still in the chunk keep it: its owner's next begin or its end releases it.
+            if (host_arena_->zone_chunk_usage(host_zone_id::SCRATCH, chunk_idx).used != 0) {
+                continue;
+            }
+            const pinned_chunk_release status = release_marked_chunk_locked(chunk_idx, released, false);
+            if (status == PINNED_CHUNK_RELEASE_REFUSED_LIVE || status == PINNED_CHUNK_RELEASE_REFUSED_LEASE) {
+                refusals.push_back({ chunk_idx, status });
+            }
+        }
+    }
+    size_t released_bytes = 0;
+    for (auto & carrier : released) {
+        released_bytes += carrier.usable_size();
+        pinned_chunk_pool::release_chunk_backing(std::move(carrier));
+    }
+    print_marked_released(released.size(), released_bytes);
+    print_marked_refusals(refusals);
+    return released.size();
+}
+
+size_t unified_cache::host_scratch_begin_release(uint64_t owner) {
+    if (!host_arena_) {
+        return 0;
+    }
+    // The device the WARNs below name, read before the lock: the lookup can take the device manager's mutex.
+    const int dev = ggml_sycl_get_device_id_from_queue(queue_);
+
+    // Declared before the lock, for the reason host_scratch_return_chunks gives.
+    std::vector<pinned_chunk_pool::released_chunk> released;
+    std::vector<marked_chunk_entry>                candidates;
+    std::vector<marked_chunk_refusal>              refusals;
+    {
+        std::lock_guard<std::mutex> lock(marked_set_mutex_);
+        if (marked_set_.empty()) {
+            return 0;
+        }
+        try {
+            released.reserve(marked_set_.size());
+            candidates.reserve(marked_set_.size());
+            refusals.reserve(marked_set_.size());
+        } catch (const std::bad_alloc &) {
+            GGML_LOG_WARN(
+                "[HOST-ARENA] SCRATCH begin release skipped dev=%d: no room to walk %zu marked entries; the next "
+                "begin retries\n",
+                dev, marked_set_.size());
+            return 0;
+        }
+        for (const marked_chunk_entry & entry : marked_set_) {
+            marked_candidate_note(candidates, entry, owner);
+        }
+        for (const marked_chunk_entry & candidate : candidates) {
+            const pinned_chunk_release status = release_marked_chunk_locked(candidate.chunk_idx, released, false);
+            // Another owner's chunk still in use is left silently: it holds that context's scheduler buffers (§4.4
+            // "A begin and a live owner"). Only the owning context's own begin names it.
+            if ((status == PINNED_CHUNK_RELEASE_REFUSED_LIVE || status == PINNED_CHUNK_RELEASE_REFUSED_LEASE) &&
+                candidate.owner == owner) {
+                refusals.push_back({ candidate.chunk_idx, status });
+            }
+        }
+    }
+    size_t released_bytes = 0;
+    for (auto & carrier : released) {
+        released_bytes += carrier.usable_size();
+        pinned_chunk_pool::release_chunk_backing(std::move(carrier));
+    }
+    print_marked_released(released.size(), released_bytes);
+    print_marked_refusals(refusals);
+    return released.size();
+}
+
+size_t unified_cache::host_scratch_owner_end(uint64_t owner) {
+    if (!host_arena_) {
+        return 0;
+    }
+    // The device the WARNs below name, read before the lock: the lookup can take the device manager's mutex.
+    const int dev = ggml_sycl_get_device_id_from_queue(queue_);
+
+    // Declared before the lock, for the reason host_scratch_return_chunks gives.
+    std::vector<pinned_chunk_pool::released_chunk> released;
+    std::vector<marked_chunk_entry>                candidates;
+    {
+        std::lock_guard<std::mutex> lock(marked_set_mutex_);
+        if (marked_set_.empty()) {
+            return 0;
+        }
+        try {
+            released.reserve(marked_set_.size());
+            candidates.reserve(marked_set_.size());
+        } catch (const std::bad_alloc &) {
+            GGML_LOG_WARN(
+                "[HOST-ARENA] SCRATCH owner end skipped dev=%d: no room to walk %zu marked entries; the owner's "
+                "chunks stay marked\n",
+                dev, marked_set_.size());
+            return 0;
+        }
+        for (const marked_chunk_entry & entry : marked_set_) {
+            if (entry.owner == owner) {
+                marked_candidate_note(candidates, entry, owner);
+            }
+        }
+        // A chunk still in use is marked orphaned under the pool's same hold, so a free cannot slip between the check
+        // and the flag: the emptying free or the last lease's drop releases it.
+        for (const marked_chunk_entry & candidate : candidates) {
+            (void) release_marked_chunk_locked(candidate.chunk_idx, released, true);
+        }
+    }
+    size_t released_bytes = 0;
+    for (auto & carrier : released) {
+        released_bytes += carrier.usable_size();
+        pinned_chunk_pool::release_chunk_backing(std::move(carrier));
+    }
+    print_marked_released(released.size(), released_bytes);
+    return released.size();
+}
+
+pinned_chunk_release unified_cache::release_marked_chunk(size_t chunk_idx) noexcept {
+    if (!host_arena_) {
+        return PINNED_CHUNK_RELEASE_ALREADY;
+    }
+    // One inline slot, no vector: this runs on the lease-drop path, which allocates nothing. Declared before the lock,
+    // so the backing is released after the unlock.
+    pinned_chunk_pool::released_chunk released;
+    pinned_chunk_release              status = PINNED_CHUNK_RELEASE_ALREADY;
+    {
+        std::lock_guard<std::mutex> lock(marked_set_mutex_);
+        status = release_marked_chunk_locked(chunk_idx, released);
+    }
+    if (status == PINNED_CHUNK_RELEASE_DONE) {
+        const size_t released_bytes = released.usable_size();
+        pinned_chunk_pool::release_chunk_backing(std::move(released));
+        print_marked_released(1, released_bytes);
+    }
+    return status;
+}
+
+pinned_chunk_release unified_cache::release_marked_chunk_locked(size_t chunk_idx,
+                                                                std::vector<pinned_chunk_pool::released_chunk> & out,
+                                                                bool orphan_if_live) {
+    pinned_chunk_pool::released_chunk carrier;
+    const pinned_chunk_release        status =
+        host_arena_->release_zone_chunk(host_zone_id::SCRATCH, chunk_idx, carrier, orphan_if_live);
+    if (status == PINNED_CHUNK_RELEASE_DONE) {
+        marked_set_.erase(
+            std::remove_if(marked_set_.begin(), marked_set_.end(),
+                           [chunk_idx](const marked_chunk_entry & e) { return e.chunk_idx == chunk_idx; }),
+            marked_set_.end());
+        out.emplace_back(std::move(carrier));
+    }
+    return status;
+}
+
+pinned_chunk_release unified_cache::release_marked_chunk_locked(size_t                              chunk_idx,
+                                                                pinned_chunk_pool::released_chunk & out) {
+    const pinned_chunk_release status = host_arena_->release_zone_chunk(host_zone_id::SCRATCH, chunk_idx, out, false);
+    if (status == PINNED_CHUNK_RELEASE_DONE) {
+        marked_set_.erase(
+            std::remove_if(marked_set_.begin(), marked_set_.end(),
+                           [chunk_idx](const marked_chunk_entry & e) { return e.chunk_idx == chunk_idx; }),
+            marked_set_.end());
+    }
+    return status;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+size_t unified_cache::marked_entries() const {
+    std::lock_guard<std::mutex> lock(marked_set_mutex_);
+    return marked_set_.size();
+}
+
+size_t unified_cache::marked_entries(size_t chunk_idx) const {
+    std::lock_guard<std::mutex> lock(marked_set_mutex_);
+    return static_cast<size_t>(
+        std::count_if(marked_set_.begin(), marked_set_.end(),
+                      [chunk_idx](const marked_chunk_entry & e) { return e.chunk_idx == chunk_idx; }));
+}
+#endif
+
+void unified_cache::print_marked_released(size_t n_released, size_t released_bytes) {
+    if (n_released == 0) {
+        return;
+    }
+    GGML_LOG_INFO("[HOST-ARENA] SCRATCH released %.1f MB (%zu chunk(s)); capacity %.1f MB\n",
+                  released_bytes / (1024.0 * 1024.0), n_released,
+                  host_arena_->zone_capacity(host_zone_id::SCRATCH) / (1024.0 * 1024.0));
+}
+
+void unified_cache::print_marked_refusals(const std::vector<marked_chunk_refusal> & refusals) {
+    if (refusals.empty()) {
+        return;
+    }
+    const int dev = ggml_sycl_get_device_id_from_queue(queue_);
+    for (const marked_chunk_refusal & refusal : refusals) {
+        const pinned_chunk_usage usage  = host_arena_->zone_chunk_usage(host_zone_id::SCRATCH, refusal.chunk_idx);
+        const std::string        cohort = runtime_registry_cohort_in_span(usage.lo, usage.hi);
+        GGML_LOG_WARN(
+            "[HOST-ARENA] SCRATCH return refused dev=%d chunk=%zu reason=%s: %zu B still allocated (cohort %s)\n", dev,
+            refusal.chunk_idx, refusal.status == PINNED_CHUNK_RELEASE_REFUSED_LEASE ? "lease" : "live", usage.used,
+            cohort.c_str());
+    }
 }
 
 bool unified_cache::host_zones_configured() const {
@@ -27597,6 +27911,11 @@ bool unified_cache_host_scratch_ledger(int                     device,
                                        host_scratch_zone_ops * ops) {
     unified_cache * cache = get_unified_cache_for_device(device);
     return cache != nullptr && cache->host_scratch_ledger_ops(chunk_cap, ledger, ops);
+}
+
+size_t unified_cache_host_scratch_begin_release(int device, uint64_t owner) {
+    unified_cache * cache = get_existing_unified_cache_for_device(device);
+    return cache != nullptr ? cache->host_scratch_begin_release(owner) : 0;
 }
 
 void unified_cache_host_scratch_drop_context(uint64_t context_key) {
@@ -30128,11 +30447,16 @@ uint64_t unified_cache::host_acquire_chunk_lease(const void * ptr) {
     return host_arena_->acquire_chunk_lease(ptr);
 }
 
-void unified_cache::host_release_chunk_lease(uint64_t handle) {
+void unified_cache::host_release_chunk_lease(uint64_t handle) noexcept {
     if (!host_arena_ || handle == pinned_chunk_pool::INVALID_CHUNK_HANDLE) {
         return;
     }
-    host_arena_->release_chunk_lease(handle);
+    // The drop of an orphaned, empty SCRATCH chunk's last lease releases it, after the pool's lock has dropped (§4.4
+    // "the lease-drop trigger"), through the public form, which allocates nothing.
+    const size_t orphaned_chunk = host_arena_->release_chunk_lease(handle);
+    if (orphaned_chunk != pinned_chunk_pool::NO_CHUNK) {
+        (void) release_marked_chunk(orphaned_chunk);
+    }
 }
 
 void unified_cache::arena_abandon() {

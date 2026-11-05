@@ -201,6 +201,49 @@ def strip_comments(src: str) -> str:
     return _LEXEME_RE.sub(repl, src)
 
 
+def _spaces(s: str) -> str:
+    return re.sub(r"[^\n]", " ", s)
+
+
+def views(raw: str):
+    """`raw` as (code, bare): `code` blanks comments and keeps string and character literals, and `bare` also blanks
+    each literal's inside, keeping its quotes. Unlike strip_comments, which drops a comment's columns, both keep every
+    offset and line break of `raw`, so a position means the same thing in all three."""
+    code, bare, at = [], [], 0
+    for m in _LEXEME_RE.finditer(raw):
+        code.append(raw[at:m.start()])
+        bare.append(raw[at:m.start()])
+        tok = m.group(0)
+        if tok[0] in "\"'":
+            code.append(tok)
+            bare.append(tok[0] + _spaces(tok[1:-1]) + tok[-1])
+        else:
+            code.append(_spaces(tok))
+            bare.append(_spaces(tok))
+        at = m.end()
+    code.append(raw[at:])
+    bare.append(raw[at:])
+    return "".join(code), "".join(bare)
+
+
+_BRACKET_RE = {"(": re.compile(r"[()]"), "{": re.compile(r"[{}]"), "[": re.compile(r"[\[\]]")}
+
+
+def match_close(text: str, open_at: int) -> int:
+    """The offset of the bracket closing the one at `open_at`, or -1. Only that bracket kind is counted, so pass a bare
+    view, where no literal holds a bracket."""
+    opener = text[open_at]
+    depth = 0
+    for m in _BRACKET_RE[opener].finditer(text, open_at):
+        if m.group(0) == opener:
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                return m.start()
+    return -1
+
+
 def norm(text: str) -> str:
     """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so neither a clang-format
     re-wrap nor a re-split format string can turn a claim red. Idempotent, so a mutant built on normalized text is
