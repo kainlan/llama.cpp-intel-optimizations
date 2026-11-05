@@ -970,13 +970,13 @@ using common_init_result_ptr = std::unique_ptr<common_init_result>;
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
+struct llama_context_params common_context_params_to_llama(const common_params & params);
 
 // The model load's n_ctx_hint for a -c value (llama.cpp-ak0p): the context itself when -c names one; without -c, or
 // with -c 0, the model's default context, which llama_context creates as n_ctx_train, so the SYCL load holds that
 // context's KV room as it does for an explicit -c (llama.cpp-7fmt); and no room (0) for a negative -c, which names no
 // context. Every tool that maps -c to the hint asks this, so the default context's sentinel has one setter.
 uint32_t common_n_ctx_hint(int32_t n_ctx);
-struct llama_context_params common_context_params_to_llama(const common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
