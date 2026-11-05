@@ -1625,8 +1625,12 @@ pinned pool's own locks, and retakes it only to give back a failed grow's
 reservation. Its demand line prints after the release. The plan walk gathers
 each reserve graph's figures with no lock held, because the placement fact it
 asks for takes the inventory's L1 lock, and only then merges them under
-`host_holder_plans::mutex_`; `commit` prints after releasing it. The slot
-re-size and the pools' re-size that follow a commit run with neither lock held.
+`host_holder_plans::mutex_`. `commit` and `drop`, the only writers of a
+committed plan, fold each changed device's committed plans into its merged state
+under that lock. `device_state`, which dispatch admission reads, copies one
+device's merged state under it and merges nothing. `commit` prints after
+releasing it. The slot re-size and the pools' re-size that follow a commit run
+with neither lock held.
 
 The MoE CONTROL reservation ledger's `g_mutex` (`moe-control-plan.cpp`, `dimc`)
 guards the per-(device, plan) reservation table, the conversion generations, and

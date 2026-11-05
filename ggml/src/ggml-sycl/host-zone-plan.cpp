@@ -709,6 +709,14 @@ bool host_holder_plans::commit(uint64_t key, int * device_out, int * previous_ou
         e.pending         = host_holder_plan{};
         e.pending_valid   = false;
         device            = e.committed_valid ? e.committed.device : -1;
+        // The merge happens here, once per commit, for both devices whose figures changed.
+        merge_device_locked(device);
+        if (previous != device) {
+            merge_device_locked(previous);
+        }
+        if (device >= 0 && device < host_zone_max_devices) {
+            state = merged_[device];
+        }
     }
     if (device_out) {
         *device_out = device;
@@ -717,7 +725,6 @@ bool host_holder_plans::commit(uint64_t key, int * device_out, int * previous_ou
         *previous_out = previous;
     }
     if (device >= 0) {
-        state = device_state(device);
         GGML_LOG_INFO("[HOST-ARENA] DEVICE pools dev=%d committed D=%lld K=%lld N=%lld host_expert_nodes=%d\n", device,
                       (long long) state.pools.D, (long long) state.pools.K, (long long) state.pools.N,
                       state.pools.host_expert_nodes);
@@ -750,16 +757,19 @@ void host_holder_plans::drop(uint64_t key, int * device_out) {
 #else
         entries_.erase(it);
 #endif
+        merge_device_locked(device);
     }
     if (device_out) {
         *device_out = device;
     }
 }
 
-host_holder_device_state host_holder_plans::device_state(int device) const {
-    host_holder_device_state    s;
-    std::lock_guard<std::mutex> lock(mutex_);
-    host_holder_plan            high{};
+void host_holder_plans::merge_device_locked(int device) {
+    if (device < 0 || device >= host_zone_max_devices) {
+        return;
+    }
+    host_holder_device_state s;
+    host_holder_plan         high{};
     for (const auto & kv : entries_) {
         const entry & e = kv.second;
         if (!e.committed_valid || e.committed.device != device) {
@@ -772,8 +782,16 @@ host_holder_device_state host_holder_plans::device_state(int device) const {
         s.slot_capacity[k] = host_staging_slot_capacity(high.staging[k]);
         s.slot_bytes[k]    = host_staging_slot_bytes(high.staging[k]);
     }
-    s.pools = high.pools;
-    return s;
+    s.pools         = high.pools;
+    merged_[device] = s;
+}
+
+host_holder_device_state host_holder_plans::device_state(int device) const {
+    if (device < 0 || device >= host_zone_max_devices) {
+        return host_holder_device_state{};
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    return merged_[device];
 }
 
 bool host_holder_plans::has_pending(uint64_t key) const {

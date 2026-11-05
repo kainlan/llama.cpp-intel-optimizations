@@ -311,6 +311,8 @@ class host_holder_plans {
     // Drops the context's pending and committed plans at its owner boundary. *device_out is the device its committed
     // plan was on, or -1.
     void                     drop(uint64_t key, int * device_out);
+    // The device's merged committed figures, as commit and drop last folded them. Reads under the leaf mutex and merges
+    // nothing, so dispatch admission (host_staging_slots::planned) pays one copy.
     host_holder_device_state device_state(int device) const;
     // Whether the context holds a pending plan (diagnostics and tests).
     bool                     has_pending(uint64_t key) const;
@@ -324,8 +326,13 @@ class host_holder_plans {
         host_holder_plan committed{};
     };
 
+    // Folds every committed plan on `device` into merged_[device]. Runs with mutex_ held, from commit and drop, the
+    // only two writers of a committed plan.
+    void merge_device_locked(int device);
+
     mutable std::mutex        mutex_;  // leaf; never held across an allocation, a grow or a callback
     std::map<uint64_t, entry> entries_;
+    host_holder_device_state  merged_[host_zone_max_devices]{};  // per device; written and read under mutex_
     std::atomic<bool>         staging_off_warned_{ false };
 };
 
