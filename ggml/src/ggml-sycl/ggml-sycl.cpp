@@ -18479,6 +18479,19 @@ static ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan_stale_l
     return GGML_SYCL_LIFECYCLE_UNSUPPORTED;
 }
 
+// A plan whose lazy-table decision refused (th32 §4.3 step 4) refuses the load: one WARN names the reason and its
+// figures, and the stage returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED, before the probe plan is staged from it and before
+// the late pass configures a host zone for it. The planner stays exception-free, so a direct early call leaves the
+// refused candidate staged with no table.
+static bool ggml_sycl_stage_lazy_refused(const ggml_sycl::placement_plan * plan, bool early) {
+    if (plan == nullptr || plan->lazy_refusal.empty()) {
+        return false;
+    }
+    GGML_LOG_WARN("[HOST-PLAN] load refused: %s %s (early=%d)\n", plan->lazy_refusal.c_str(),
+                  plan->lazy_refusal_detail.c_str(), early ? 1 : 0);
+    return true;
+}
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
                                                                        const ggml_sycl_placement_envelope * envelope,
                                                                        bool                                 early) {
@@ -18556,6 +18569,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 if (!candidate_is_current()) {
                     throw std::runtime_error("stale host provisioning candidate before allocation");
                 }
+                if (ggml_sycl_stage_lazy_refused(snapshot->plan.get(), early)) {
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
 
                 // The inventory lock has been released. Keep module_guard, effect
                 // and the backend alive across physical provisioning; do not
@@ -18580,6 +18596,13 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 throw std::runtime_error("deterministic stage_load_inventory_plan failure");
             }
 #endif
+        }
+        // The early candidate is read once every device has planned it, and a refused one is never staged as the probe
+        // plan; the late pass refuses per device before it configures that device's host zones.
+        const auto early_candidate =
+            early ? ggml_sycl::lifecycle_find_candidate_placement_plan(effect.owner.load.value) : nullptr;
+        if (early_candidate && ggml_sycl_stage_lazy_refused(early_candidate->plan.get(), early)) {
+            return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
         }
         if (early) {
             // llama.cpp-p6i0: the early plan is the load's probe placement. Stage a copy for the PROBE-stage
