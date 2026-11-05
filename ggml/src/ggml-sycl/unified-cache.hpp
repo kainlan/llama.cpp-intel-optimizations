@@ -627,6 +627,15 @@ inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
         [](int32_t, int64_t n_elements) { return static_cast<size_t>(n_elements) * sizeof(ggml_fp16_t); });
 }
 
+// The micro-batch a load plans at when its inventory names none (n_ubatch 0): the loader's default.
+constexpr uint32_t PLACEMENT_LOAD_N_UBATCH_DEFAULT = 512;
+
+// The micro-batch a load plans at: the inventory's n_ubatch, or PLACEMENT_LOAD_N_UBATCH_DEFAULT when it names none. The
+// one rule the stage's dense scratch and the lazy tables' cache floor both read.
+inline uint32_t placement_load_n_ubatch(uint32_t n_ubatch) {
+    return n_ubatch != 0 ? n_ubatch : PLACEMENT_LOAD_N_UBATCH_DEFAULT;
+}
+
 // Explicit planner inputs used for KV sizing and placement.
 struct placement_kv_info {
     uint32_t              n_layer      = 0;

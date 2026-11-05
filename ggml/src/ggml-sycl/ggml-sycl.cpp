@@ -17439,7 +17439,7 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // adapter marked (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch will not supply), in the same
     // RUNTIME zone (ggml_sycl_plan_load_dense_scratch).
     {
-        const uint32_t                        dense_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
+        const uint32_t                        dense_n_ubatch = ggml_sycl::placement_load_n_ubatch(inventory->n_ubatch);
         const ggml_sycl_dense_scratch_planned dense_planned =
             owned ? ggml_sycl_plan_load_dense_scratch(ctx->device, plan_owner, inventory_maxima, dense_n_ubatch) :
                     ggml_sycl_dense_scratch_planned{};

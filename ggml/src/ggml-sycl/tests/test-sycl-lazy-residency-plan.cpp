@@ -465,6 +465,43 @@ arm_result arm_f_cold_class_refuses() {
     return r;
 }
 
+// (i) A load whose inventory names no micro-batch (n_ubatch 0) floors each cache at the load's default micro-batch,
+// PLACEMENT_LOAD_N_UBATCH_DEFAULT, through placement_load_n_ubatch, the rule the stage's dense scratch reads: at arm
+// (b)'s reading DeepSeek's tables are both STORAGE at the floors that default gives.
+// Engagement: the same tables at the same reading with n_ubatch set to the default carry those floors, so they are the
+// plan's own figure for a named micro-batch.
+// Mutant: the decision reading kv_info.n_ubatch raw (both floors are 0 slots).
+arm_result arm_i_an_unnamed_micro_batch_floors_at_the_default() {
+    arm_result                                   r;
+    const lazy_test_coverage_pin                 pin    = ggml_sycl_test_make_coverage_pin(0);
+    const std::vector<placement_lazy_table_info> tables = deepseek_tables();
+    size_t                                       step2  = 0;
+    if (!step2_of(r, ds_shape, pin.pin(), step2)) {
+        return r;
+    }
+    const size_t      reading       = step2 + mapped(tables[0].table_bytes) + k_p3_margin - 1 * GiB;
+    placement_kv_info named         = kv_with(tables, reading);
+    named.n_ubatch                  = PLACEMENT_LOAD_N_UBATCH_DEFAULT;
+    placement_kv_info unnamed       = kv_with(tables, reading);
+    unnamed.n_ubatch                = 0;
+    const placement_plan at_default = plan_for(ds_shape, named, pin.pin());
+    const placement_plan at_zero    = plan_for(ds_shape, unnamed, pin.pin());
+    for (const placement_lazy_table_info & t : tables) {
+        const placement_lazy_table * d    = find_table(at_default, t.name);
+        const size_t                 want = 2ull * PLACEMENT_LOAD_N_UBATCH_DEFAULT * t.rows_per_token;
+        if (d == nullptr || d->cache_floor_slots != want) {
+            fail(r, "engagement: at n_ubatch " + num(PLACEMENT_LOAD_N_UBATCH_DEFAULT) + " " + t.name +
+                        (d == nullptr ? " is not in the plan (refusal '" + at_default.lazy_refusal + "')" :
+                                        " floors at " + num(d->cache_floor_slots) + " slots") +
+                        ", want " + num(want));
+            return r;
+        }
+        expect_storage(r, at_zero, t, named, "at n_ubatch 0: ");
+    }
+    expect_pin_held(r, pin);
+    return r;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -494,12 +531,13 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<named_arm> arms = {
-        { "(a) the tables stay out of every zone maximum",   arm_a_tables_stay_out_of_the_zone_maxima },
-        { "(b) DeepSeek: both tables STORAGE below P3",      arm_b_deepseek_both_storage              },
-        { "(c) DeepSeek: blk.1 HOST, blk.14 STORAGE",        arm_c_deepseek_one_host                  },
-        { "(d) Qwen PLE flips at its P3 threshold",          arm_d_qwen_flip                          },
-        { "(e) a null pin refuses lazy-table-ring-unpinned", arm_e_null_pin_refuses                   },
-        { "(f) a cold expert class refuses by name",         arm_f_cold_class_refuses                 },
+        { "(a) the tables stay out of every zone maximum",    arm_a_tables_stay_out_of_the_zone_maxima           },
+        { "(b) DeepSeek: both tables STORAGE below P3",       arm_b_deepseek_both_storage                        },
+        { "(c) DeepSeek: blk.1 HOST, blk.14 STORAGE",         arm_c_deepseek_one_host                            },
+        { "(d) Qwen PLE flips at its P3 threshold",           arm_d_qwen_flip                                    },
+        { "(e) a null pin refuses lazy-table-ring-unpinned",  arm_e_null_pin_refuses                             },
+        { "(f) a cold expert class refuses by name",          arm_f_cold_class_refuses                           },
+        { "(i) an unnamed micro-batch floors at the default", arm_i_an_unnamed_micro_batch_floors_at_the_default },
     };
     if (g_devices == 1) {
         arms.push_back(

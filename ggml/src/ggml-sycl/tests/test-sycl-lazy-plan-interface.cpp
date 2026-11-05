@@ -179,8 +179,7 @@ arm_result arm_b_the_slot_reaches_the_planner() {
     ggml_sycl_lazy_table_info table = lazy_table("blk.14.engram_embd.weight", static_cast<int64_t>((1024 * GiB) / 34));
     inv.inv.lazy_tables             = &table;
     inv.inv.lazy_table_count        = 1;
-    const size_t floor_raw =
-        2ull * (inv.inv.n_ubatch != 0 ? inv.inv.n_ubatch : 512) * table.rows_per_token * table.row_size;
+    const size_t floor_raw          = 2ull * inv.inv.n_ubatch * table.rows_per_token * table.row_size;
 
     ggml_sycl_load_txn txn{};
     if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {

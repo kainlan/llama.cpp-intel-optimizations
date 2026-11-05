@@ -33394,13 +33394,14 @@ static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_la
 // max(2 GiB, 1% of the budget). The tables are taken in ascending consumer_layer (ties to the larger table, then the
 // name). A table is HOST when its mapped body fits what the budget leaves (the planner's fit) and P3 holds with it
 // resident (MemAvailable_pre - expected_host - 5 >= 24 GiB, against everything decided before it); otherwise it is
-// STORAGE when the coverage pin makes it eligible, at its cache floor of 2 x n_ubatch x rows_per_token slots; otherwise
-// the plan refuses, naming the ring: lazy-table-ring-unpinned with no pin, lazy-table-ring-too-narrow when the live
-// ring's slot is narrower than the table's read span. After the pass the block ring is sized over the STORAGE tables
-// and charged unless the live ring holds it; the floors and the ring must fit both the budget and P3, or the plan
-// refuses as lazy-table-cache-below-floor. What both leave above that is the STORAGE caches' yieldable share (§6.4),
-// split in proportion to table_bytes x rows_per_token. A cold expert class refuses as cold-set-not-implemented. A
-// refused plan carries no table and no ring, and host_planned_bytes is then the zone total.
+// STORAGE when the coverage pin makes it eligible, at its cache floor of 2 x n_ubatch x rows_per_token slots, n_ubatch
+// read through placement_load_n_ubatch as the stage reads it; otherwise the plan refuses, naming the ring:
+// lazy-table-ring-unpinned with no pin, lazy-table-ring-too-narrow when the live ring's slot is narrower than the
+// table's read span. After the pass the block ring is sized over the STORAGE tables and charged unless the live ring
+// holds it; the floors and the ring must fit both the budget and P3, or the plan refuses as
+// lazy-table-cache-below-floor. What both leave above that is the STORAGE caches' yieldable share (§6.4), split in
+// proportion to table_bytes x rows_per_token. A cold expert class refuses as cold-set-not-implemented. A refused plan
+// carries no table and no ring, and host_planned_bytes is then the zone total.
 static void placement_plan_decide_lazy_residency(placement_plan &          plan,
                                                  const placement_kv_info & kv_info,
                                                  const ring_lease *        coverage_pin) {
@@ -33474,7 +33475,7 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
         t.name              = info.name;
         t.table_bytes       = info.table_bytes;
         t.consumer_device   = lazy_consumer_device(plan, info.consumer_layer);
-        t.cache_floor_slots = 2ull * kv_info.n_ubatch * info.rows_per_token;
+        t.cache_floor_slots = 2ull * placement_load_n_ubatch(kv_info.n_ubatch) * info.rows_per_token;
         const size_t body   = host_cpu_mapped_size(info.table_bytes);
         const size_t with   = host_ledger_sat_add(used, body);
         const size_t span   = lazy_block_ring_span(info.row_size);
