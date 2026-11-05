@@ -53177,16 +53177,16 @@ static ggml_backend_buffer_t ggml_backend_sycl_kv_host_buffer_type_alloc_buffer(
 }
 
 // Dedicated pinned-host buft for runtime-demoted KV layers: SYCL_Host's buffer type with three slots overridden, its
-// own alloc_buffer and get_max_size over the host builder with role KV (above), and its own .get_name. Every other
-// slot is the generic host buft's, and its buffers are the same wrapped CPU buffers (same free/clear/accessors). A copy
-// that left alloc_buffer or get_max_size as SYCL_Host's would allocate or chunk host KV with SYCL_Host's role and
-// route it to SCRATCH (§M57 (a)). The distinct identity matters
-// twice. The structural residency decline (ggml_sycl_tensor_is_in_kv_host_buft) and any diagnostics key on exactly
-// this buft and never perturb other pinned-host consumers (e.g. the pinned-host overflow branch of
-// ggml_sycl_select_buffer_for_tensor, which must keep resolving to the generic host buft). The keying mechanism is the
-// .get_name FUNCTION POINTER, not buft-struct identity: ggml_backend_sycl_device_supports_buft (and the analogous
-// checks near it) compare `buft->iface.get_name == ggml_backend_sycl_host_buffer_type_name`, so a buft that reused
-// the generic name function would silently defeat the decline.
+// own alloc_buffer and get_max_size over the host builder with role KV (above), and its own .get_name. Every other slot
+// is the generic host buft's, and its buffers are the same wrapped CPU buffers (same free/clear/accessors). A copy that
+// left alloc_buffer or get_max_size as SYCL_Host's would allocate or chunk host KV with SYCL_Host's role and route it
+// to SCRATCH (§M57 (a)). The distinct identity matters twice. The structural residency decline
+// (ggml_sycl_tensor_is_in_kv_host_buft) and any diagnostics key on exactly this buft and never perturb other
+// pinned-host consumers (e.g. the pinned-host overflow branch of ggml_sycl_select_buffer_for_tensor, which must keep
+// resolving to the generic host buft). The keying mechanism is the .get_name FUNCTION POINTER, not buft-struct
+// identity: ggml_backend_sycl_device_supports_buft (and the analogous checks near it) compare
+// `buft->iface.get_name == ggml_backend_sycl_host_buffer_type_name`, so a buft that reused the generic name function
+// would silently defeat the decline.
 ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type() {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return nullptr;
