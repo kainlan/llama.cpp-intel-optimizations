@@ -21,8 +21,9 @@
 // from the plan's own zone terms (step 2 of §4.3), so the arms decide the same way on any host. The budget is 4 TiB so
 // the planner's fit never binds and P3 alone decides.
 //
-// Every arm names its engagement check and the mutant it kills. An arm whose engagement check fails is VOID, and a VOID
-// arm fails the binary like a FAIL. Every arm runs, so one failure does not hide the rest.
+// Every arm names its engagement check and the mutant it kills. An arm whose engagement check fails FAILS: each check is
+// derived from the plan's own terms, so a miss is a defect in the planner or the fixture, never an unmet precondition.
+// Every arm runs, so one failure does not hide the rest.
 
 #include "../host-cpu-mapping.hpp"
 #include "../lazy-io-pool.hpp"
@@ -220,7 +221,7 @@ bool step2_of(arm_result & r, const moe_shape & shape, const ring_lease * pin, s
     const placement_plan bare = plan_for(shape, kv_with({}, 0), pin, delegate);
     step2                     = bare.host_zone_terms.total();
     if (bare.entries.empty() || bare.weight_host_bytes == 0) {
-        void_arm(r, "the plan with no table put no weight on the host, so step 2 is not the host zones it sizes");
+        fail(r, "the plan with no table put no weight on the host, so step 2 is not the host zones it sizes");
         return false;
     }
     if (!bare.lazy_tables.empty() || !bare.lazy_refusal.empty()) {
@@ -233,8 +234,8 @@ bool step2_of(arm_result & r, const moe_shape & shape, const ring_lease * pin, s
 
 void expect_same_step2(arm_result & r, const placement_plan & plan, size_t step2, const std::string & at) {
     if (plan.host_zone_terms.total() != step2) {
-        void_arm(r, at + "the zone terms moved between plans: " + num(plan.host_zone_terms.total()) + " vs step 2 " +
-                        num(step2));
+        fail(r, at + "the zone terms moved between plans: " + num(plan.host_zone_terms.total()) + " vs step 2 " +
+                    num(step2));
     }
 }
 
@@ -373,7 +374,7 @@ arm_result arm_c_deepseek_one_host() {
     std::printf("  deepseek one-HOST: step2=%zu threshold_one=%zu threshold_both=%zu reading=%zu\n", step2,
                 threshold_one, threshold_both, reading);
     if (reading >= threshold_both) {
-        void_arm(r, "the reading is not below threshold_both");
+        fail(r, "the reading is not below threshold_both");
         return r;
     }
     const placement_kv_info kv   = kv_with(tables, reading);
