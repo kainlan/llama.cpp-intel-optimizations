@@ -25,6 +25,9 @@
 //   HOST_ZONE_PLAN_MUTANT_HELPER_DEVICE           the notify helper's device for every slot
 //   HOST_ZONE_PLAN_MUTANT_UNPLANNED_REFUSES       an unplanned device refusing instead of growing at dispatch
 //   HOST_ZONE_PLAN_MUTANT_FREE_RELEASES_PLANNED   a backend's free releasing a planned device's slots too
+// HOST_STAGING_PLAN_MUTANT_FA_AFTER_STAGING moves the count in simulate_host_fa, this file's re-enactment of the
+// dispatch's entry, so it scores the fixture's model of the order, not production. Production's order is pinned by
+// tests/test-sycl-host-zone-boundary-owner-source.py (D1-D3).
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -668,7 +671,8 @@ void test_auto_ubatch_trial() {
               h.slots.capacity(1, HOST_STAGING_Q), host_staging_slot_capacity(q_bytes(512)));
 }
 
-// The host FLASH_ATTN_EXT dispatch's entry: the interception counts before any staging is asked for.
+// This fixture's model of the host FLASH_ATTN_EXT dispatch's entry: the interception counts before any staging is
+// asked for. Production's entry is in ggml_sycl_compute_forward_impl, pinned by D1 of the boundary-owner pin.
 bool simulate_host_fa(attn_host_dispatch_counters & counters, host_staging_slots & slots, int device, size_t q) {
 #if !defined(HOST_STAGING_PLAN_MUTANT_FA_AFTER_STAGING)
     counters.intercept(device, GGML_OP_FLASH_ATTN_EXT);

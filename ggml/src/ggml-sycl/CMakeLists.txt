@@ -8143,7 +8143,11 @@ endif()
 #
 # Each MUTANTS pair is a positive control: a macro that plants one defect the design names (in host-zone-plan.cpp or in
 # the test) and the failure text the test prints when it does. Each builds its own executable and ctest, which passes
-# only when that text appears.
+# only when that text appears. Three plant their defect in the test's own re-enactment of an order, so they score the
+# fixture's model of the order, not production: HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND and
+# HOST_ZONE_SELECT_MUTANT_MODEL_CHECK_AT_BUFFER_FREE (the fake registry's releases and checks) and
+# HOST_STAGING_PLAN_MUTANT_FA_AFTER_STAGING (simulate_host_fa). The production order is pinned by
+# tests/test-sycl-host-zone-boundary-owner-source.py (its pins O1-O6 and D1-D3).
 function(ggml_sycl_host_zone_plan_test stem)
     cmake_parse_arguments(HZP "" "" "LIBS;MUTANTS" ${ARGN})
     set(_variants "${stem}" "")

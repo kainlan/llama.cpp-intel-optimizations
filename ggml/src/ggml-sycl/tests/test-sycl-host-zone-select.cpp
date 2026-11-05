@@ -9,6 +9,9 @@
 //   HOST_ZONE_PLAN_MUTANT_DEVICE_CHECK_EVERY_FREE  (host-zone-plan.cpp) the DEVICE check at every backend free
 //   HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND (this file) the buffer-owned check moved to backend destruction
 //   HOST_ZONE_SELECT_MUTANT_MODEL_CHECK_AT_BUFFER_FREE (this file) the MODEL check at the first weight buffer's free
+// The two in this file move a check in the fake registry's order, so they score the fixture's model of the order, not
+// production. Where production runs each owner check is pinned by tests/test-sycl-host-zone-boundary-owner-source.py
+// (O1-O6).
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -239,7 +242,7 @@ void test_destruction_order() {
     leaked += reg.check(alloc_lifetime::CONTEXT, backend);
 #if defined(HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND)
     // Positive control: the buffer-owned check taken at backend-context destruction, while the compute and KV buffers
-    // are still live.
+    // are still live. It moves the check in this fixture's order only; O6 of the boundary-owner pin scores production.
     leaked += reg.check(alloc_lifetime::CONTEXT, compute);
     leaked += reg.check(alloc_lifetime::CONTEXT, kv);
 #endif
@@ -282,6 +285,7 @@ void test_model_boundary_at_slot_release() {
         reg.release_row(model_5, 1024);  // weight buffer 1's free_buffer releases its extras
 #if defined(HOST_ZONE_SELECT_MUTANT_MODEL_CHECK_AT_BUFFER_FREE)
         // Positive control: the check at the first weight buffer's free, keyed by the model id its siblings share.
+        // It moves the check in this fixture's order only; O6 of the boundary-owner pin scores production.
         leaked += reg.check(alloc_lifetime::MODEL, model_5);
 #endif
         reg.release_row(model_5, 2048);                       // weight buffer 2's

@@ -56,6 +56,33 @@ THE CONTRACT.  With comments and string literals blanked:
       stops at the WARN budget, and `scan = log_detail || warn || audit_active`.  So past the eighth refusal of a zone
       a refusal reads one counter and returns, unless a zone audit is active.
 
+THE OWNER BOUNDARIES AND THE DISPATCH COUNTER (llama.cpp-xfj3).  test-sycl-host-zone-select and
+test-sycl-attn-host-staging-plan run the owner-boundary check and the dispatch counter host-only.  Three of their
+positive controls (HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND, HOST_ZONE_SELECT_MUTANT_MODEL_CHECK_AT_BUFFER_FREE
+and HOST_STAGING_PLAN_MUTANT_FA_AFTER_STAGING) move a step in the fixture's model of the order, not in production.
+Where production runs each step is what these pins read, in ggml-sycl.cpp (docs/design/sycl-mmap-host-tier.md §4.4
+"Lifetimes" and "The dispatch counter"):
+  O1. ggml_sycl_release_model_slot_resources runs the MODEL check (alloc_lifetime::MODEL, owner kind MODEL) after
+      ggml_sycl_release_host_weight_extras_for_owner(owner) and ggml_sycl_release_graph_leases_for_owner(owner).
+  O2. ~ggml_backend_sycl_buffer_context runs the device buffer's check (alloc_lifetime::CONTEXT, owner kind BUFFER)
+      after `managed_handle = {};` and the loop that resets every handle in tp_handles.
+  O3. ggml_backend_sycl_host_buffer_free_buffer runs the host buffer's check (ctx->lifetime, owner kind BUFFER) after
+      `ctx->buffer_handle = {};` and before `delete ctx;`.
+  O4. ggml_backend_sycl_free runs the BACKEND check (alloc_lifetime::CONTEXT, owner kind BACKEND) after
+      `delete sycl_ctx;`.
+  O5. ggml_backend_sycl_free runs the DEVICE check (alloc_lifetime::DEVICE, owner kind DEVICE) after
+      `delete sycl_ctx;`, inside `if (ggml_sycl::host_zone_device_check_due(...)) {`.
+  O6. Across every .cpp and .hpp under ggml/src/ggml-sycl/ outside tests/, the calls to
+      unified_cache_host_zone_owner_check are exactly those five, each named by its enclosing function, its lifetime
+      and its owner kind.  A buffer check at the backend's free, or a MODEL check at a weight buffer's free, is a
+      sixth.
+  D1. In ggml_sycl_compute_forward_impl, the one `if` block that calls ggml_sycl_dispatch_host_flash_attn tests
+      GGML_OP_FLASH_ATTN_EXT and ggml_sycl_node_is_host_dispatched(dst), and calls
+      g_attn_host_dispatch_counters->intercept(ctx.device, dst->op) before that dispatch asks for any staging.
+  D2. The same for GGML_OP_SET_ROWS and ggml_sycl_dispatch_host_set_rows_sync.
+  D3. Across the same sources, the counter's intercept is called exactly twice, both in
+      ggml_sycl_compute_forward_impl.
+
 NOT COVERED: this reads text.  The decision table itself runs in test-sycl-runtime-registry-containment (host-only, the
 hook allocation_registry_test_host_zone_refusals), and a device run is what shows the boundary no longer refuses: on
 2026-10-18 the B70 run without -c and with the knob on, traced (GGML_SYCL_MOE_IDS_COPY_TRACE=1, about 8% below
@@ -65,13 +92,16 @@ std::exchange or a whole-struct copy from a constraints object that has it set, 
 initialisation of alloc_constraints, which sets the field without naming it (unlikely: it would have to spell out every
 field declared before it), and a write inside a constructor with a member initialiser list is named by its last
 initialiser, which fails closed.  Nor is this a census of the process-lifetime CONTROL owners that do not set the flag:
-those still land in STAGING (llama.cpp-bvq7 is one).
+those still land in STAGING (llama.cpp-bvq7 is one).  O1-O6 and D1-D3 read the order of statements: that a release
+before a check freed its row is what the host-only fixtures and a device run show, and a check or an intercept reached
+through a function pointer or a wrapper is not seen.
 
 Run with --self-test: each mutant is written to a copy of the sources in a temporary directory and must fail on its
 own pin, and the unmodified tree must pass.  --root DIR checks another tree (the directory holding ggml/).
 """
 
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -82,8 +112,39 @@ FILES = {
     "cache": "ggml/src/ggml-sycl/unified-cache.cpp",
     "header": "ggml/src/ggml-sycl/unified-cache.hpp",
     "plan": "ggml/src/ggml-sycl/host-zone-plan.cpp",
+    "sycl": "ggml/src/ggml-sycl/ggml-sycl.cpp",
 }
 SYCL_DIR = "ggml/src/ggml-sycl"
+XFJ3_TAG = "(llama.cpp-xfj3)"
+OWNER_CHECK = "unified_cache_host_zone_owner_check"
+OWNER_CHECK_CALL = re.compile(r"\b" + OWNER_CHECK + r"\s*\(")
+INTERCEPT_CALL = re.compile(r"(?:\.|->)\s*intercept\s*\(")
+# O1-O5: each owner check's boundary function, lifetime and owner kind, the statements that release the owner's rows
+# before it, the statements that must follow it, and the `if` it must sit in.  O6 compares the census to this table.
+OWNER_SITES = [
+    # The model's slot release: after its weight buffers' frees, its host-registered extras and its graph leases.
+    ("O1", "ggml_sycl_release_model_slot_resources", "alloc_lifetime::MODEL", "MODEL",
+     ["ggml_sycl_release_host_weight_extras_for_owner(owner);", "ggml_sycl_release_graph_leases_for_owner(owner);"],
+     [], None),
+    # A device buffer's destruction, once the shared host allocation's handles are released.
+    ("O2", "~ggml_backend_sycl_buffer_context", "alloc_lifetime::CONTEXT", "BUFFER",
+     ["managed_handle = {};", "for (auto & handle : tp_handles) { handle = {}; }"], [], None),
+    # A host buffer's free_buffer, once its handle is released and while its context is still alive.
+    ("O3", "ggml_backend_sycl_host_buffer_free_buffer", "ctx->lifetime", "BUFFER", ["ctx->buffer_handle = {};"],
+     ["delete ctx;"], None),
+    # The backend's free, after the context's destructor has released its members.
+    ("O4", "ggml_backend_sycl_free", "alloc_lifetime::CONTEXT", "BACKEND", ["delete sycl_ctx;"], [], None),
+    # The backend's free, only when it was the device's last live backend.
+    ("O5", "ggml_backend_sycl_free", "alloc_lifetime::DEVICE", "DEVICE", ["delete sycl_ctx;"], [],
+     "ggml_sycl::host_zone_device_check_due("),
+]
+# D1-D2: the op each host-dispatched branch tests and the dispatch it returns.  D3 allows only these two intercepts.
+INTERCEPT_FN = "ggml_sycl_compute_forward_impl"
+INTERCEPT_STMT = "g_attn_host_dispatch_counters->intercept(ctx.device, dst->op);"
+INTERCEPT_SITES = [
+    ("D1", "GGML_OP_FLASH_ATTN_EXT", "ggml_sycl_dispatch_host_flash_attn"),
+    ("D2", "GGML_OP_SET_ROWS", "ggml_sycl_dispatch_host_set_rows_sync"),
+]
 FLAG = "persistent_owner"
 # Z5: the functions that may set the flag, with the reason each owner outlives every graph.
 SETTERS_ALLOWED = {
@@ -185,8 +246,8 @@ SETTLE_SIG = r"void\s+unified_cache::host_zone_settle\s*\(\s*host_zone_id\s+zone
 TAKE_SIG = (r"static\s+host_zone_refusal_report\s+host_zone_refusal_take\s*\(\s*std::atomic<int>\s*&\s*refusals\s*,\s*"
             r"bool\s+audit_active\s*\)\s*noexcept\s*\{")
 ZONE_CALL = "unified_alloc_host_zone(req, cat, kv_spill_to_host)"
-ZONE_FORWARD = ("return select_zone(req.intent.role, cat, req.intent.lifetime, req.intent.constraints.persistent_owner, "
-                "kv_spill_to_host);")
+ZONE_FORWARD = ("return select_zone(req.intent.role, cat, req.intent.lifetime, "
+                "req.intent.constraints.persistent_owner, kv_spill_to_host);")
 SELECT_SIG = (r"\nhost_zone_id\s+select_zone\s*\(\s*alloc_role\s+role\s*,\s*runtime_category\s+category\s*,\s*"
               r"alloc_lifetime\s+lifetime\s*,\s*bool\s+persistent_owner\s*,\s*bool\s+kv_spill_to_host\s*\)\s*\{")
 SELECT_ASSERT = ("GGML_ASSERT(!persistent_owner || (!kv_spill_to_host && role != alloc_role::KV && "
@@ -346,7 +407,7 @@ def head_name(head: str):
     a lambda, a class or a namespace."""
     h = re.sub(r"\s*->\s*[\w:<>,\s*&]+$", "", head.rstrip())
     while True:
-        h2 = re.sub(r"\s*\b(?:const|override|final|mutable|noexcept(?:\s*\([^()]*\))?)\s*$", "", h)
+        h2 = re.sub(r"\s*\b(?:const|override|final|mutable|try|noexcept(?:\s*\([^()]*\))?)\s*$", "", h)
         if h2 == h:
             break
         h = h2
@@ -369,7 +430,8 @@ def head_name(head: str):
     return m.group(1)
 
 
-def enclosing_function(code: str, pos: int):
+def enclosing_block(code: str, pos: int):
+    """(name, index of its `{`) of the function whose body holds pos, or (None, None)."""
     stack = []
     for m in re.finditer(r"[{}]", code[:pos]):
         if m.group(0) == "{":
@@ -380,8 +442,12 @@ def enclosing_function(code: str, pos: int):
         start = max(code.rfind(";", 0, open_idx), code.rfind("{", 0, open_idx), code.rfind("}", 0, open_idx)) + 1
         name = head_name(code[start:open_idx])
         if name:
-            return name
-    return None
+            return name, open_idx
+    return None, None
+
+
+def enclosing_function(code: str, pos: int):
+    return enclosing_block(code, pos)[0]
 
 
 def check_setters(census: dict, fails: list) -> None:
@@ -398,6 +464,117 @@ def check_setters(census: dict, fails: list) -> None:
                             f"{', '.join(fn for _, fn in allowed)}: the flag sends a request to the WEIGHT host zone, "
                             "which no graph boundary checks, so set on a transient request it hides exactly the "
                             "STAGING leak the boundary check exists to catch"))
+
+
+def call_args(code: str, open_paren: int) -> list:
+    """The top-level arguments, without whitespace, of the call whose `(` is at open_paren."""
+    args, depth, cur = [], 0, ""
+    for c in code[open_paren:]:
+        if c in "([{":
+            depth += 1
+            if depth == 1:
+                continue
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                break
+        if depth == 1 and c == ",":
+            args.append(nospace(cur))
+            cur = ""
+            continue
+        cur += c
+    args.append(nospace(cur))
+    return args
+
+
+def find_stmt(body: str, stmt: str) -> int:
+    """Where stmt starts in body, matched with any whitespace between its characters; -1 when absent."""
+    m = re.search(r"\s*".join(re.escape(c) for c in nospace(stmt)), body)
+    return m.start() if m else -1
+
+
+def boundary_calls(census: dict, pattern) -> list:
+    """(file, enclosing function, `{` of that function, call position, blanked file) of every call that matches pattern
+    and is not a declaration, across the census files."""
+    out = []
+    for rel in sorted(census):
+        code = blank(census[rel])
+        for m in pattern.finditer(code):
+            if re.search(r"\b(?:size_t|void)\s*(?:\w+::)*$", code[max(0, m.start() - 64) : m.start()]):
+                continue
+            name, open_idx = enclosing_block(code, m.start())
+            out.append((rel, name, open_idx, m.start(), code))
+    return out
+
+
+def owner_check_row(call) -> tuple:
+    rel, name, _, pos, code = call
+    args = call_args(code, code.index("(", pos))
+    kind = re.search(r"alloc_owner_kind::(\w+)", args[1]) if len(args) == 2 else None
+    return (rel, name, args[0].replace("ggml_sycl::", ""), kind.group(1) if kind else None)
+
+
+def check_owner_sites(census: dict, fails: list) -> None:
+    calls = boundary_calls(census, OWNER_CHECK_CALL)
+    rows = [owner_check_row(c) for c in calls]
+    for pin, fn, lifetime, kind, before, after, gate in OWNER_SITES:
+        here = [(c, r) for c, r in zip(calls, rows) if r[0] == FILES["sycl"] and r[1] == fn and r[3] == kind]
+        if len(here) != 1:
+            fails.append((pin, f"{fn} runs {len(here)} {OWNER_CHECK} with owner kind {kind}; want one"))
+            continue
+        (_, _, open_idx, pos, code), row = here[0]
+        if row[2] != lifetime:
+            fails.append((pin, f"{fn}'s {kind} check passes lifetime {row[2]}; want {lifetime}"))
+        body, start = block_at(code, open_idx)
+        at = pos - start
+        for stmt in before:
+            i = find_stmt(body, stmt)
+            if i < 0 or i > at:
+                fails.append((pin, f"{fn}'s {kind} check does not follow `{stmt}`: the check would find the owner's "
+                                   "own rows still live and report them as leaked"))
+        for stmt in after:
+            i = find_stmt(body, stmt)
+            if i < 0 or i < at:
+                fails.append((pin, f"{fn}'s {kind} check does not precede `{stmt}`"))
+        if gate:
+            gates = [(b, s) for c, b, s in if_blocks(body) if nospace(c).startswith(nospace(gate))]
+            if not any(s <= at < s + len(b) for b, s in gates):
+                fails.append((pin, f"{fn}'s {kind} check is not inside `if ({gate}...)) {{`: a second live backend on "
+                                   "the device still shares every DEVICE holder"))
+    want = sorted((FILES["sycl"], fn, lifetime, kind) for _, fn, lifetime, kind, _, _, _ in OWNER_SITES)
+    if sorted(rows) != want:
+        got = ", ".join(f"{r[0]}:{r[1] or '<no function>'}({r[2]}, {r[3]})" for r in rows) or "none"
+        fails.append(("O6", f"the calls to {OWNER_CHECK} are [{got}]; want exactly the five of O1-O5: a check run "
+                            "before its owner's last release reports a live row as leaked, and aborts under "
+                            "GGML_SYCL_STRICT_LEASES=1"))
+
+
+def check_intercepts(census: dict, sycl: str, fails: list) -> None:
+    body = definition(sycl, r"\bbool\s+" + INTERCEPT_FN + r"\s*\([^)]*\)\s*try\s*\{")
+    if body is None:
+        fails.append(("D1", f"{INTERCEPT_FN} is not defined as a function-try-block"))
+        return
+    for pin, op, dispatch in INTERCEPT_SITES:
+        call = re.compile(r"\b" + dispatch + r"\s*\(")
+        blocks = [g for g in if_blocks(body) if call.search(g[1])]
+        if not blocks:
+            fails.append((pin, f"{INTERCEPT_FN} has no `if` block that calls {dispatch}"))
+            continue
+        cond, block, _ = min(blocks, key=lambda g: len(g[1]))
+        if op not in cond or "ggml_sycl_node_is_host_dispatched(dst)" not in nospace(cond):
+            fails.append((pin, f"the block that calls {dispatch} does not test {op} and "
+                               "ggml_sycl_node_is_host_dispatched(dst)"))
+        i = find_stmt(block, INTERCEPT_STMT)
+        if i < 0 or i > call.search(block).start():
+            fails.append((pin, f"the block that calls {dispatch} does not call `{INTERCEPT_STMT}` before it: an "
+                               "interception whose staging is refused would not be counted"))
+    calls = boundary_calls(census, INTERCEPT_CALL)
+    got = [(rel, name) for rel, name, _, _, _ in calls]
+    if got != [(FILES["sycl"], INTERCEPT_FN)] * 2:
+        listed = ", ".join(f"{rel}:{name or '<no function>'}" for rel, name in got) or "none"
+        fails.append(("D3", f"the dispatch counter's intercept is called at [{listed}]; want exactly twice, in "
+                            f"{INTERCEPT_FN}: a second count of one interception, or a count of an op the host did "
+                            "not take"))
 
 
 def check_header(header: str, fails: list) -> None:
@@ -418,6 +595,8 @@ def check(sources: dict) -> list:
     check_settle(code, fails)
     check_take(code, fails)
     check_setters(sources["census"], fails)
+    check_owner_sites(sources["boundary_census"], fails)
+    check_intercepts(sources["boundary_census"], blank(sources["sycl"]), fails)
     return fails
 
 
@@ -432,7 +611,14 @@ def sycl_sources(root: Path) -> dict:
 
 def read_sources(root: Path) -> dict:
     sources = {k: (root / v).read_text() for k, v in FILES.items()}
-    sources["census"] = {rel: text for rel, text in sycl_sources(root).items() if FLAG in text}
+    every = sycl_sources(root)
+    sources["census"] = {rel: text for rel, text in every.items() if FLAG in text}
+    # O6 and D3: the production sources that could call the owner check or the intercept, outside tests/.
+    sources["boundary_census"] = {
+        rel: text
+        for rel, text in every.items()
+        if not rel.startswith(SYCL_DIR + "/tests/") and (OWNER_CHECK in text or "intercept" in text)
+    }
     return sources
 
 
@@ -441,6 +627,26 @@ def sub(pattern: str, repl: str, count: int = 1):
         return re.sub(pattern, repl, text, count=count)
 
     return f
+
+
+def then(*edits):
+    def f(text: str) -> str:
+        for edit in edits:
+            text = edit(text)
+        return text
+
+    return f
+
+
+SYCL = FILES["sycl"]
+MODEL_CHECK = (r"\n\s*ggml_sycl::unified_cache_host_zone_owner_check\(ggml_sycl::alloc_lifetime::MODEL,\s*"
+               r"\{ ggml_sycl::alloc_owner_kind::MODEL, owner\.model\.value \}\);")
+HOST_BUFFER_CHECK = (r"\n    if \(ctx->owner_id != 0\) \{\n"
+                     r"\s*ggml_sycl::unified_cache_host_zone_owner_check\(ctx->lifetime,"
+                     r"\s*\{ ggml_sycl::alloc_owner_kind::BUFFER, ctx->owner_id \}\);\n    \}")
+HOST_BUFFER_CHECK_TEXT = (r"\n    if (ctx->owner_id != 0) {\n"
+                          r"        ggml_sycl::unified_cache_host_zone_owner_check(ctx->lifetime, "
+                          r"{ ggml_sycl::alloc_owner_kind::BUFFER, ctx->owner_id });\n    }")
 
 
 def mutants():
@@ -493,6 +699,80 @@ def mutants():
              r"if (true) {\n\1index = refusals.fetch_add")),
         ("S2", "cache", "the WARN budget is unbounded",
          sub(r"constexpr int warn_budget\s*= 8;", r"constexpr int warn_budget = 1 << 30;")),
+        ("O1", SYCL, "the MODEL check is gone", sub(MODEL_CHECK, "")),
+        ("O1", SYCL, "the MODEL check passes the CONTEXT lifetime",
+         sub(r"unified_cache_host_zone_owner_check\(ggml_sycl::alloc_lifetime::MODEL,",
+             r"unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::CONTEXT,")),
+        ("O1", SYCL, "the MODEL check runs before the host-registered extras are released",
+         then(sub(MODEL_CHECK, ""),
+              sub(r"(\n    const size_t\s+rows\s+= ggml_sycl_release_host_weight_extras_for_owner\(owner\);)",
+                  r"\n    ggml_sycl::unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::MODEL, "
+                  r"{ ggml_sycl::alloc_owner_kind::MODEL, owner.model.value });\1"))),
+        ("O2", SYCL, "the device buffer's check is gone",
+         sub(r"\n\s*ggml_sycl::unified_cache_host_zone_owner_check\(ggml_sycl::alloc_lifetime::CONTEXT,\s*"
+             r"\{ ggml_sycl::alloc_owner_kind::BUFFER, host_owner_id \}\);", "")),
+        ("O2", SYCL, "the device buffer's check runs with the managed handle still held",
+         sub(r"(if \(host_owner_id != 0\) \{(?:\n\s*//[^\n]*)*)\n\s*managed_handle = \{\};", r"\1")),
+        ("O3", SYCL, "the host buffer's check is gone", sub(HOST_BUFFER_CHECK, "")),
+        ("O3", SYCL, "the host buffer's check runs before its handle is released",
+         then(sub(HOST_BUFFER_CHECK, ""),
+              sub(r"(\n    ctx->buffer_handle = \{\};)", HOST_BUFFER_CHECK_TEXT + r"\1"))),
+        ("O3", SYCL, "the host buffer's check runs after its context is deleted",
+         then(sub(HOST_BUFFER_CHECK, ""),
+              sub(r"(\n    ctx->buffer_handle = \{\};(?:\n\s*//[^\n]*)*\n    delete ctx;)",
+                  r"\1" + HOST_BUFFER_CHECK_TEXT))),
+        ("O4", SYCL, "the BACKEND check is gone",
+         sub(r"\n\s*ggml_sycl::unified_cache_host_zone_owner_check\(ggml_sycl::alloc_lifetime::CONTEXT,\s*"
+             r"\{ ggml_sycl::alloc_owner_kind::BACKEND, freed_owner_id \}\);", "")),
+        ("O4", SYCL, "the BACKEND check runs before the context is deleted",
+         then(sub(r"(\n    const uint64_t freed_owner_id = sycl_ctx \? sycl_ctx->host_zone_owner_id : 0;)"
+                  r"\n    delete sycl_ctx;", r"\1"),
+              sub(r"(\n    if \(freed_device >= 0 && freed_device < GGML_SYCL_MAX_DEVICES\) \{)",
+                  r"\n    delete sycl_ctx;\1"))),
+        ("O5", SYCL, "the DEVICE check is gone",
+         sub(r"\n\s*ggml_sycl::unified_cache_host_zone_owner_check\(\s*ggml_sycl::alloc_lifetime::DEVICE,\s*"
+             r"\{[^}]*\}\);", "")),
+        ("O5", SYCL, "the DEVICE check runs before the context is deleted",
+         then(sub(r"(\n    const uint64_t freed_owner_id = sycl_ctx \? sycl_ctx->host_zone_owner_id : 0;)"
+                  r"\n    delete sycl_ctx;", r"\1"),
+              sub(r"(\n    delete backend;\n    g_sycl_backend_refcount\.fetch_sub)", r"\n    delete sycl_ctx;\1"))),
+        ("O5", SYCL, "the DEVICE check runs at every backend's free",
+         sub(r"if \(ggml_sycl::host_zone_device_check_due\(static_cast<int>\(live_on_device\)\)\) \{",
+             r"if (true) {")),
+        ("O6", SYCL, "a buffer-owned check runs at the backend's free",
+         sub(r"(\{ ggml_sycl::alloc_owner_kind::BACKEND, freed_owner_id \}\);)",
+             r"\1\n        ggml_sycl::unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::CONTEXT, "
+             r"{ ggml_sycl::alloc_owner_kind::BUFFER, freed_owner_id });")),
+        ("O6", SYCL, "a MODEL check runs at a weight buffer's free",
+         sub(r"(\{ ggml_sycl::alloc_owner_kind::BUFFER, host_owner_id \}\);)",
+             r"\1\n            ggml_sycl::unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::MODEL, "
+             r"{ ggml_sycl::alloc_owner_kind::MODEL, host_owner_id });")),
+        ("O6", "cache", "the settle runs an owner check of its own",
+         sub(r"(void unified_cache::host_zone_settle\(host_zone_id zone\) \{)",
+             r"\1\n    (void) unified_cache_host_zone_owner_check(alloc_lifetime::CONTEXT, "
+             r"{ alloc_owner_kind::BACKEND, 0 });")),
+        ("D1", SYCL, "the FLASH_ATTN_EXT intercept is gone",
+         sub(r"\n\s*g_attn_host_dispatch_counters->intercept\(ctx\.device, dst->op\);"
+             r"(\n\s*return ggml_sycl_dispatch_host_flash_attn\(ctx, dst\);)", r"\1")),
+        ("D1", SYCL, "the FLASH_ATTN_EXT intercept counts only after the staging succeeds",
+         sub(r"\n(\s*)g_attn_host_dispatch_counters->intercept\(ctx\.device, dst->op\);\n\s*"
+             r"return ggml_sycl_dispatch_host_flash_attn\(ctx, dst\);",
+             r"\n\1const bool host_fa_ok = ggml_sycl_dispatch_host_flash_attn(ctx, dst);\n\1if (host_fa_ok) {\n\1"
+             r"    g_attn_host_dispatch_counters->intercept(ctx.device, dst->op);\n\1}\n\1return host_fa_ok;")),
+        ("D1", SYCL, "the FLASH_ATTN_EXT intercept counts every op",
+         sub(r"(\n(\s*)if \(dst && dst->op == GGML_OP_FLASH_ATTN_EXT && ggml_sycl_node_is_host_dispatched\(dst\)\) "
+             r"\{(?:\n\s*//[^\n]*)*)\n\s*g_attn_host_dispatch_counters->intercept\(ctx\.device, dst->op\);",
+             r"\n\2g_attn_host_dispatch_counters->intercept(ctx.device, dst->op);\1")),
+        ("D1", SYCL, "the FLASH_ATTN_EXT host branch does not test the host dispatch",
+         sub(r"if \(dst && dst->op == GGML_OP_FLASH_ATTN_EXT && ggml_sycl_node_is_host_dispatched\(dst\)\) \{",
+             r"if (dst && dst->op == GGML_OP_FLASH_ATTN_EXT) {")),
+        ("D2", SYCL, "the SET_ROWS intercept is gone",
+         sub(r"\n\s*g_attn_host_dispatch_counters->intercept\(ctx\.device, dst->op\);"
+             r"(\n\s*return ggml_sycl_dispatch_host_set_rows_sync\(ctx, dst\);)", r"\1")),
+        ("D3", SYCL, "the FLASH_ATTN_EXT dispatch counts its interception again",
+         sub(r"(static bool ggml_sycl_dispatch_host_flash_attn\(ggml_backend_sycl_context & ctx, "
+             r"ggml_tensor \* dst\) \{)",
+             r"\1\n    g_attn_host_dispatch_counters->intercept(ctx.device, dst->op);")),
     ]
 
 
@@ -509,14 +789,15 @@ def self_test(root: Path) -> int:
                 failures.append(f"mutant '{name}' did not apply")
                 print(f"  self-test: mutant '{name}' did not apply")
                 continue
-            # The copy holds the checked files, every source that names the flag, and the mutated file; the census
-            # of the copy then sees what a census of the whole mutated tree would.
+            # The copy holds the checked files, every source that names the flag, the owner check or an intercept,
+            # and the mutated file; the censuses of the copy then see what a census of the whole mutated tree would.
             copy = Path(tmp) / name.replace(" ", "_").replace("'", "")
-            for rel in set(FILES.values()) | set(base["census"]) | {rel_mutated}:
+            for rel in set(FILES.values()) | set(base["census"]) | set(base["boundary_census"]) | {rel_mutated}:
                 dst = copy / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_text(mutated if rel == rel_mutated else every[rel])
             got = check(read_sources(copy))
+            shutil.rmtree(copy)  # each copy holds ggml-sycl.cpp, about 7 MB of tmpfs
             pins = {p for p, _ in got}
             if pin in pins:
                 caught += 1
@@ -550,12 +831,14 @@ def main(argv: list) -> int:
             return rc
     fails = check(read_sources(root))
     for pin, why in fails:
-        print(f"FAIL [pin {pin}]: {why} {TAG}")
+        print(f"FAIL [pin {pin}]: {why} {XFJ3_TAG if pin[0] in 'OD' else TAG}")
     if fails:
         return 1
     print("PASS: the CPU job input marker's word is a persistent owner in the WEIGHT host zone, which no graph "
-          "boundary checks, only arm_cpu_job_input_marker sets that flag, and a refused host-zone boundary check walks the registry only for its first 8 refusals "
-          f"per zone or an active zone audit {TAG}")
+          "boundary checks, only arm_cpu_job_input_marker sets that flag, and a refused host-zone boundary check walks "
+          f"the registry only for its first 8 refusals per zone or an active zone audit {TAG}")
+    print("PASS: the five host-zone owner checks run in their boundary functions after their owners' releases, and the "
+          f"two host dispatch intercepts count before any staging {XFJ3_TAG}")
     return 0
 
 
