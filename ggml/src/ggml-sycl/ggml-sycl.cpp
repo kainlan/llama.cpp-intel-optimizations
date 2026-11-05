@@ -98486,11 +98486,12 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     }
     const int      freed_device   = sycl_ctx ? sycl_ctx->device : -1;
     const uint64_t freed_owner_id = sycl_ctx ? sycl_ctx->host_zone_owner_id : 0;
+
     // The owner's end, before the context is deleted (§4.4 "Every withdrawn chunk has an owner and a bounded
     // release"): an open transaction is returned, empty marked chunks are released and the rest are orphaned. It runs
     // on the host buft's device, where the context's notify grew SCRATCH and its transaction filed the chunks.
-    const int      owner_end_device = ggml_sycl_notify_host_buft_device(backend);
-    bool           owner_end        = freed_owner_id != 0;
+    const int owner_end_device = ggml_sycl_notify_host_buft_device(backend);
+    bool      owner_end        = freed_owner_id != 0;
 #if defined(GGML_SYCL_SCRATCH_MUTANTS)
     using ggml_sycl::scratch_test_mutant;
     using ggml_sycl::scratch_test_mutant_on;
