@@ -29,7 +29,13 @@ cannot see:
 7. the dry run leaves no trace: every per-device planner global the stage planners write (in their recording
    definitions and the static functions those reach within two calls) or the shared planner-input publish writes is
    written again by the destructor of the dry run's saved state, so a later load reads what it would have read
-   without the dry run.
+   without the dry run;
+8. the residency decision's §10 plan lines, which the dry run's planner call prints, carry every field T3 can print,
+   each from the plan's own terms: a STORAGE [PLACEMENT] line its cache's index bytes, a HOST one the host budget,
+   the planned bytes and the leftover, and the [HOST-PLAN] lazy line the budget's source, the host weights, rnh3's
+   named terms, the host KV and the caches carving the zones. The budget's source is a planner input beside the
+   budget: the load copies the ledger's flag stored with its budget, the dry run its own sample's, and the decision
+   reads neither the ledger nor the environment.
 
 Plain file I/O, comment-stripped text.
 """
@@ -338,6 +344,173 @@ def test_the_lazy_checks_see_each_dropped_piece():
     assert lazy_sum_gaps(report, hpp.replace("placement_plan_lazy_host_bytes(p)", "0")), (
         "the sum check passes a host_planned_bytes that does not count the lazy terms"
     )
+
+
+# ---- 8. the residency decision's plan lines ----
+
+# The fields each line must carry, keyed as host-ledger-test-harness.hpp's printed() reads them (" name="). locked,
+# output_slot, landing and cold_set wait for the rows that make them true.
+PLAN_LINE_FIELDS = {
+    "STORAGE": (" index=",),
+    "HOST": (" host_budget=", " host_planned=", " leftover="),
+    "PLAN": (" source=", " weights=", " named_terms=", " kv=", " caches_carving="),
+}
+
+# Where each value comes from: the one helper or plan term that holds it.
+PLAN_LINE_SOURCES = (
+    (r"(?<![\w.])lazy_row_cache_index_bytes\s*\(", "the index bytes are not lazy_row_cache_index_bytes"),
+    (r"(?<![\w.])placement_plan_host_weight_zone_terms\s*\(", "the weights are not placement_plan_host_weight_zone_terms"),
+    (r"host_zone_terms\s*\.\s*kv\b", "the KV is not the plan's host_zone_terms.kv"),
+    (r"kv_info\s*\.\s*host_budget_overridden\b", "the source is not the planner input kv_info.host_budget_overridden"),
+    (r"\bdevices\s*\.\s*size\s*\(", "the caches carving is not counted from the plan's devices"),
+)
+
+
+def log_formats(text: str) -> list:
+    """The format string of every GGML_LOG_INFO and GGML_LOG_WARN call, adjacent literals joined."""
+    return [
+        "".join(re.findall(r'"((?:\\.|[^"\\])*)"', m.group(1)))
+        for m in re.finditer(r"GGML_LOG_(?:INFO|WARN)\s*\(\s*((?:\"(?:\\.|[^\"\\])*\"\s*)+)", text)
+    ]
+
+
+def plan_line_gaps(decide: str) -> list:
+    """What the residency decision's plan lines lack; empty when they hold."""
+    gaps = []
+    formats = log_formats(decide)
+    groups = {
+        "STORAGE": [f for f in formats if f.startswith("[PLACEMENT] lazy ") and " residency=STORAGE " in f],
+        "HOST": [f for f in formats if f.startswith("[PLACEMENT] lazy ") and " residency=HOST " in f],
+        "PLAN": [f for f in formats if f.startswith("[HOST-PLAN] lazy ")],
+    }
+    for group, lines in groups.items():
+        if not lines:
+            gaps.append(f"no {group} plan line with a literal residency or prefix")
+        for line in lines:
+            for field in PLAN_LINE_FIELDS[group]:
+                if line.count(field) != 1:
+                    gaps.append(f"the {group} line prints {field.strip()} {line.count(field)} times, want once")
+            tail = line.find(" refusal=")
+            for field in PLAN_LINE_FIELDS[group]:
+                if tail >= 0 and line.find(field) > tail:
+                    gaps.append(f"the {group} line prints {field.strip()} after its refusal")
+    for pattern, gap in PLAN_LINE_SOURCES:
+        if not re.search(pattern, decide):
+            gaps.append(gap)
+    for reader in ("host_ledger_budget_overridden", "host_ledger_budget", "getenv"):
+        if calls(decide, reader):
+            gaps.append(f"the decision calls {reader}: the budget's source is an input, not read here")
+    return gaps
+
+
+def budget_source_gaps(store: str, accessor: str, load: str, closure: str) -> list:
+    """The budget's source travels with the budget: stored beside it from the same sample, copied by the load, and
+    taken by the dry run from its own sample."""
+    gaps = []
+    if not re.search(r"g_host_ledger_budget_overridden\s*\.\s*store\s*\(", store) or "OVERRIDE" not in store:
+        gaps.append("host_ledger_store_budget does not store the override flag beside the budget")
+    if not re.search(r"g_host_ledger_budget_overridden\s*\.\s*load\s*\(", accessor):
+        gaps.append("host_ledger_budget_overridden does not read the stored flag")
+    if not re.search(
+        r"g_placement_kv_info\s*\.\s*host_budget_overridden\s*=\s*(?:ggml_sycl::)?host_ledger_budget_overridden\s*\(",
+        load,
+    ):
+        gaps.append("the load does not copy the stored flag into its planner input")
+    if not re.search(r"\bkv\s*\.\s*host_budget_overridden\s*=", closure):
+        gaps.append("the dry run does not set its planner input's budget source")
+    if calls(closure, "host_ledger_budget_overridden"):
+        gaps.append("the dry run reads the ledger's stored flag, not its own sample's")
+    return gaps
+
+
+def test_the_plan_lines_carry_every_printable_field():
+    decide = body(read(SYCL / "unified-cache.cpp"), "placement_plan_decide_lazy_residency")
+    gaps = plan_line_gaps(decide)
+    assert not gaps, "; ".join(gaps)
+
+
+def test_the_budget_source_is_a_planner_input():
+    uc = read(SYCL / "unified-cache.cpp")
+    cpp = sycl_cpp()
+    gaps = budget_source_gaps(
+        body(uc, "host_ledger_store_budget"),
+        body(uc, "host_ledger_budget_overridden"),
+        body(cpp, "compute_and_store_plan_for_inventory"),
+        dry_run_closure(cpp),
+    )
+    assert not gaps, "; ".join(gaps)
+
+
+def test_the_plan_line_checks_see_each_dropped_piece():
+    # Positive controls on synthetic text shaped like the real one: each check passes it and fails each mutant.
+    decide = strip_comments(
+        "void d(placement_plan & plan, const placement_kv_info & kv_info) {\n"
+        "  const host_weight_zone_terms wt = placement_plan_host_weight_zone_terms(plan);\n"
+        "  const size_t carving = plan.multi_device ? plan.devices.size() : 1;\n"
+        "  if (storage) {\n"
+        '    GGML_LOG_WARN("[PLACEMENT] lazy %s residency=STORAGE table=%zu cache_slots=%zu index=%zu "\n'
+        '                  "off=%zu\\n", n, t, s, lazy_row_cache_index_bytes(s), o);\n'
+        "  } else {\n"
+        '    GGML_LOG_WARN("[PLACEMENT] lazy %s residency=HOST table=%zu off=%zu host_budget=%zu "\n'
+        '                  "host_planned=%zu leftover=%zu\\n", n, t, o, b, p, l);\n'
+        "  }\n"
+        '  GGML_LOG_WARN("[HOST-PLAN] lazy device=%d budget=%zu source=%s planned=%zu weights=%zu named_terms=%zu "\n'
+        '                "kv=%zu zones=%zu caches_carving=%zu refusal=%s\\n", d, b,\n'
+        '                kv_info.host_budget_overridden ? "GGML_SYCL_HOST_RESERVE_MB" : "computed", p,\n'
+        "                wt.host_weights, wt.tlsf_bound, plan.host_zone_terms.kv, z, carving, r);\n"
+        "}\n"
+    )
+    assert plan_line_gaps(decide) == [], plan_line_gaps(decide)
+    decide_mutants = {
+        "the index dropped": decide.replace(" index=%zu", ""),
+        "the host budget dropped": decide.replace(" host_budget=%zu", ""),
+        "the leftover dropped": decide.replace(" leftover=%zu", ""),
+        "the source dropped": decide.replace(" source=%s", ""),
+        "the weights dropped": decide.replace(" weights=%zu", ""),
+        "the named terms dropped": decide.replace(" named_terms=%zu", ""),
+        "the KV dropped": decide.replace('"kv=%zu ', '"'),
+        "the carving dropped": decide.replace(" caches_carving=%zu", ""),
+        "a field after the refusal": decide.replace(" caches_carving=%zu refusal=%s", " refusal=%s caches_carving=%zu"),
+        "a field printed twice": decide.replace(" zones=%zu", " zones=%zu kv=%zu"),
+        "the residency a conversion": decide.replace("residency=STORAGE", "residency=%s"),
+        "the index from elsewhere": decide.replace("lazy_row_cache_index_bytes(s)", "4 * s"),
+        "the weights from elsewhere": decide.replace("placement_plan_host_weight_zone_terms(plan)", "{}"),
+        "the KV from elsewhere": decide.replace("plan.host_zone_terms.kv", "plan.host_zone_kv_bytes"),
+        "the source from the ledger": decide.replace(
+            "kv_info.host_budget_overridden", "host_ledger_budget_overridden()"
+        ),
+        "the source from the environment": decide.replace(
+            "kv_info.host_budget_overridden", 'getenv("GGML_SYCL_HOST_RESERVE_MB")'
+        ),
+        "the carving a constant": decide.replace("plan.multi_device ? plan.devices.size() : 1", "1"),
+    }
+    for name, mutant in decide_mutants.items():
+        assert mutant != decide, f"mutant '{name}' changed nothing"
+        assert plan_line_gaps(mutant), f"the plan line check passes with {name}"
+
+    store = (
+        "g_host_ledger_mem_available.store(sample.available_bytes);\n"
+        "g_host_ledger_budget_overridden.store(sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE);\n"
+    )
+    accessor = "return g_host_ledger_budget_overridden.load(std::memory_order_acquire);\n"
+    load = "g_placement_kv_info.host_budget_overridden = ggml_sycl::host_ledger_budget_overridden();\n"
+    closure = "kv.host_mem_available_pre = mem_available;\nkv.host_budget_overridden = budget_overridden;\n"
+    assert budget_source_gaps(store, accessor, load, closure) == [], budget_source_gaps(store, accessor, load, closure)
+    source_mutants = {
+        "the flag not stored": (store.replace("g_host_ledger_budget_overridden.store", "(void)"), accessor, load,
+                                closure),
+        "the flag stored from no override test": (store.replace("::OVERRIDE", "::AUTO").replace("OVERRIDE", "AUTO"),
+                                                  accessor, load, closure),
+        "the accessor reads nothing": (store, "return false;\n", load, closure),
+        "the load copies nothing": (store, accessor, "", closure),
+        "the dry run sets nothing": (store, accessor, load, "kv.host_mem_available_pre = mem_available;\n"),
+        "the dry run reads the ledger": (
+            store, accessor, load, closure.replace("budget_overridden;", "ggml_sycl::host_ledger_budget_overridden();")
+        ),
+    }
+    for name, args in source_mutants.items():
+        assert args != (store, accessor, load, closure), f"mutant '{name}' changed nothing"
+        assert budget_source_gaps(*args), f"the budget source check passes with {name}"
 
 
 # ---- 3. nothing stored ----

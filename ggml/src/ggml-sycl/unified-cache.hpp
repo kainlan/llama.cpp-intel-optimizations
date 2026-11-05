@@ -764,6 +764,9 @@ struct placement_kv_info {
     // MemAvailable_pre - expected_host - 5 >= 24 GiB), from the same sample as the budget. 0 = no sample: P3 cannot
     // hold, so a plan that carries lazy tables refuses.
     size_t                                 host_mem_available_pre = 0;
+    // Whether the budget this plan is made against is GGML_SYCL_HOST_RESERVE_MB's override, from the same sample as
+    // the budget (host_ledger_budget_overridden() for a load): the source the [HOST-PLAN] lazy line prints (§10).
+    bool                                   host_budget_overridden = false;
     // A cold expert class is selected (§4.3 step 4): the cold set is not implemented, so a plan that carries lazy
     // tables refuses it rather than plan a set it cannot hold.
     bool                                   cold_expert_class      = false;
@@ -7841,15 +7844,18 @@ host_budget_sample host_ledger_sample();
 // below `committed`, which refuses the next charge by name. An accepted GGML_SYCL_HOST_RESERVE_MB is the whole budget.
 size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed);
 
-// Computes against the live committed bytes and stores the result, and stores the sample's MemAvailable beside it. The
-// one writer of the stored budget besides the test setter, which leaves the MemAvailable as it was; it counts its
-// stores, the setter does not.
+// Computes against the live committed bytes and stores the result, and stores the sample's MemAvailable and whether
+// GGML_SYCL_HOST_RESERVE_MB's override set the budget beside it. The one writer of the stored budget besides the test
+// setter, which leaves the MemAvailable and the override flag as they were; it counts its stores, the setter does not.
 size_t host_ledger_store_budget(const host_budget_sample & sample);
 
 size_t host_ledger_budget();           // one atomic load of the stored budget
 size_t host_ledger_mem_available();    // one atomic load of the stored budget's sample MemAvailable (0: none stored)
 size_t host_ledger_committed();        // one atomic load of the committed bytes
 size_t host_ledger_yieldable_bytes();  // one atomic load of the yieldable bytes
+
+// One atomic load: whether the stored budget is GGML_SYCL_HOST_RESERVE_MB's override (false: computed, or none stored).
+bool host_ledger_budget_overridden();
 
 // A cache's yieldable chunk appears (add) or goes (sub). One call is one chunk: a yield makes at most one round per
 // chunk counted at its first shortfall.

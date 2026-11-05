@@ -1016,8 +1016,8 @@ thread_local bool g_allocating_cache_backing = false;
 // starts at 0, at which host_ledger_try_charge refuses every charge until the first store. Phase (a)'s owner entry
 // passes warn_only, so its charge there logs a would-refuse WARN and is made.
 //
-// The committed bytes, the stored budget, its sample's MemAvailable and the two yieldable counters publish no other
-// data: each is read for its own value alone, so the acquire, release and acq_rel orders on them order nothing else.
+// The committed bytes, the stored budget, its sample's MemAvailable and override flag, and the two yieldable counters
+// publish no other data: each is read for its own value alone, so the acquire, release and acq_rel orders on them order nothing else.
 // The orders are kept as documentation of intent, not relaxed. The yielder slots below are different: their handshake
 // orders the callback.
 static std::atomic<size_t> g_host_ledger_committed{ 0 };
@@ -1025,6 +1025,9 @@ static std::atomic<size_t> g_host_ledger_budget{ 0 };
 // The MemAvailable of the sample the stored budget was computed from, stored by the same writer beside it, so a load's
 // P3 reading (th32 §4.3 step 4) is the same sample as its budget, once per load transaction.
 static std::atomic<size_t> g_host_ledger_mem_available{ 0 };
+// Whether that budget is GGML_SYCL_HOST_RESERVE_MB's override rather than the computed one, stored by the same writer
+// from the same sample, so the plan lines (th32 §10) name the source of the budget they print.
+static std::atomic<bool>   g_host_ledger_budget_overridden{ false };
 static std::atomic<size_t> g_host_ledger_yieldable_bytes{ 0 };
 // The yieldable chunks behind those bytes: a yield makes at most one round per chunk counted at its first shortfall.
 static std::atomic<size_t> g_host_ledger_yieldable_chunks{ 0 };
@@ -1092,6 +1095,10 @@ size_t host_ledger_committed() {
 
 size_t host_ledger_mem_available() {
     return g_host_ledger_mem_available.load(std::memory_order_acquire);
+}
+
+bool host_ledger_budget_overridden() {
+    return g_host_ledger_budget_overridden.load(std::memory_order_acquire);
 }
 
 size_t host_ledger_yieldable_bytes() {
@@ -1188,6 +1195,8 @@ size_t host_ledger_store_budget(const host_budget_sample & sample) {
     const size_t committed = g_host_ledger_committed.load(std::memory_order_acquire);
     const size_t budget    = host_ledger_compute_budget(sample, committed);
     g_host_ledger_mem_available.store(sample.available_bytes, std::memory_order_release);
+    g_host_ledger_budget_overridden.store(sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE,
+                                          std::memory_order_release);
     g_host_ledger_budget.store(budget, std::memory_order_release);
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     g_test_host_ledger_stores.fetch_add(1, std::memory_order_acq_rel);
@@ -33304,21 +33313,23 @@ bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_b
     return false;
 }
 
+// A STORAGE row cache's index row at `slots` slots (th32 §3.3, §6.3): 4 B slot ids at load factor 0.75 plus one 8 B
+// key word per slot, counted at host_cpu_mapped_size as the ledger charges it; 0 for no slots.
+static size_t lazy_row_cache_index_bytes(size_t slots) {
+    const size_t index = 4 * ((4 * slots + 2) / 3) + 8 * slots;
+    return index != 0 ? host_cpu_mapped_size(index) : 0;
+}
+
 // A STORAGE row cache's resident bytes at `slots` slots (th32 §3.3, §6.3): the slab of slots x row_size in 256 MiB
-// chunks and the index row (4 B slot ids at load factor 0.75 plus one 8 B key word per slot), each allocation counted
-// at host_cpu_mapped_size, as the ledger charges it.
+// chunks and the index row, each allocation counted at host_cpu_mapped_size, as the ledger charges it.
 static size_t lazy_row_cache_resident_bytes(size_t slots, size_t row_size) {
     constexpr size_t chunk = 256ull << 20;
     const size_t     slab  = slots * row_size;
-    const size_t     index = 4 * ((4 * slots + 2) / 3) + 8 * slots;
     size_t           bytes = (slab / chunk) * host_cpu_mapped_size(chunk);
     if (slab % chunk != 0) {
         bytes += host_cpu_mapped_size(slab % chunk);
     }
-    if (index != 0) {
-        bytes += host_cpu_mapped_size(index);
-    }
-    return bytes;
+    return bytes + lazy_row_cache_index_bytes(slots);
 }
 
 // The most slots, from `floor_slots` up to `max_slots`, whose cache stays within `bytes`. The resident bytes never
@@ -33495,10 +33506,13 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
     }
     plan.host_planned_bytes = placement_plan_host_planned_bytes(plan);
 
-    // The plan lines (§10), WARN so a normal run shows them: one per planned table and one for the plan.
-    size_t lazy_resident = 0;
-    size_t yieldable     = 0;
-    size_t n_host        = 0;
+    // The plan lines (§10), WARN so a normal run shows them: one per planned table and one for the plan. They print
+    // every field the plan holds today; locked, output_slot, landing and cold_set wait for the rows that make them true.
+    const size_t planned       = plan.host_planned_bytes;
+    const size_t leftover      = host_ledger_sat_sub(budget, host_ledger_sat_add(planned, reserve + envelope));
+    size_t       lazy_resident = 0;
+    size_t       yieldable     = 0;
+    size_t       n_host        = 0;
     for (size_t i = 0; i < plan.lazy_tables.size(); ++i) {
         const placement_lazy_table &      t       = plan.lazy_tables[i];
         const placement_lazy_table_info & info    = *table_info[i];
@@ -33509,20 +33523,36 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
         yieldable += t.host_resident_bytes - floor_res;
         n_host += storage ? 0 : 1;
         const std::string device = t.consumer_device >= 0 ? std::to_string(t.consumer_device) : "CPU";
-        GGML_LOG_WARN(
-            "[PLACEMENT] lazy %s residency=%s table=%zu resident=%zu cache_slots=%zu floor_slots=%zu yieldable=%zu "
-            "consumer_layer=%d device=%s rows_per_token=%u file=%u off=%zu\n",
-            t.name.c_str(), storage ? "STORAGE" : "HOST", t.table_bytes, t.host_resident_bytes, t.cache_slots,
-            t.cache_floor_slots, t.host_resident_bytes - floor_res, info.consumer_layer, device.c_str(),
-            info.rows_per_token, info.file_index, info.file_offset);
+        if (storage) {
+            GGML_LOG_WARN(
+                "[PLACEMENT] lazy %s residency=STORAGE table=%zu resident=%zu cache_slots=%zu index=%zu "
+                "floor_slots=%zu yieldable=%zu consumer_layer=%d device=%s rows_per_token=%u file=%u off=%zu\n",
+                t.name.c_str(), t.table_bytes, t.host_resident_bytes, t.cache_slots,
+                lazy_row_cache_index_bytes(t.cache_slots), t.cache_floor_slots, t.host_resident_bytes - floor_res,
+                info.consumer_layer, device.c_str(), info.rows_per_token, info.file_index, info.file_offset);
+        } else {
+            GGML_LOG_WARN(
+                "[PLACEMENT] lazy %s residency=HOST table=%zu resident=%zu cache_slots=%zu floor_slots=%zu "
+                "yieldable=%zu consumer_layer=%d device=%s rows_per_token=%u file=%u off=%zu host_budget=%zu "
+                "host_planned=%zu leftover=%zu\n",
+                t.name.c_str(), t.table_bytes, t.host_resident_bytes, t.cache_slots, t.cache_floor_slots,
+                t.host_resident_bytes - floor_res, info.consumer_layer, device.c_str(), info.rows_per_token,
+                info.file_index, info.file_offset, budget, planned, leftover);
+        }
     }
-    const size_t planned = plan.host_planned_bytes;
+    // weights= is the host weights at their exact bytes and named_terms= rnh3's named terms beside them, the two parts
+    // of the WEIGHT zone (§4.2); caches_carving= counts the caches that each build a zone set from this plan, every
+    // participating device's until llama.cpp-sgc5 lands.
+    const host_weight_zone_terms weight_terms   = placement_plan_host_weight_zone_terms(plan);
+    const size_t                 named_terms    = weight_terms.total() - weight_terms.host_weights;
+    const size_t                 caches_carving = plan.multi_device ? std::max<size_t>(1, plan.devices.size()) : 1;
     GGML_LOG_WARN(
-        "[HOST-PLAN] lazy device=%d budget=%zu planned=%zu zones=%zu envelope=%zu lazy_resident=%zu ring=%zu "
-        "reserve=%zu leftover=%zu mem_available_pre=%zu p3_post_load=%zu yieldable=%zu tables=%zu host=%zu "
-        "storage=%zu refusal=%s%s%s\n",
-        plan.device_id, budget, planned, step2, envelope, lazy_resident, plan.block_ring_charge, reserve,
-        host_ledger_sat_sub(budget, host_ledger_sat_add(planned, reserve + envelope)), mem_pre,
+        "[HOST-PLAN] lazy device=%d budget=%zu source=%s planned=%zu weights=%zu named_terms=%zu kv=%zu zones=%zu "
+        "caches_carving=%zu envelope=%zu lazy_resident=%zu ring=%zu reserve=%zu leftover=%zu mem_available_pre=%zu "
+        "p3_post_load=%zu yieldable=%zu tables=%zu host=%zu storage=%zu refusal=%s%s%s\n",
+        plan.device_id, budget, kv_info.host_budget_overridden ? "GGML_SYCL_HOST_RESERVE_MB" : "computed", planned,
+        weight_terms.host_weights, named_terms, plan.host_zone_terms.kv, step2, caches_carving, envelope, lazy_resident,
+        plan.block_ring_charge, reserve, leftover, mem_pre,
         host_ledger_sat_sub(mem_pre, host_ledger_sat_add(planned, p3_runtime)), yieldable, kv_info.lazy_tables.size(),
         n_host, plan.lazy_tables.size() - n_host, plan.lazy_refusal.empty() ? "none" : plan.lazy_refusal.c_str(),
         plan.lazy_refusal_detail.empty() ? "" : " ", plan.lazy_refusal_detail.c_str());
