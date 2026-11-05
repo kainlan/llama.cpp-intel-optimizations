@@ -31,9 +31,15 @@ Plain file I/O, not the codescout index, which is blind in ggml-sycl.cpp.
 """
 
 import re
+import sys
 from pathlib import Path
 
 import pytest
+
+# sycl_gate sits beside this file. `python3 -I` leaves the script's directory off sys.path, so it is appended
+# here; appended rather than prepended, a file in tests/ never shadows a standard module.
+sys.path.append(str(Path(__file__).resolve().parent))
+from sycl_gate import match_close, views  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -43,52 +49,10 @@ CANON = "docs/design/sycl-canonical-memory-architecture.md"
 SYCL_DIR = "ggml/src/ggml-sycl"
 
 # ---------------------------------------------------------------------------------------------------------------
-# Text views. `code` blanks comments and keeps string literals; `bare` also blanks the inside of string and character
-# literals. Both keep every offset and line break of the raw text, so a position means the same thing in all three.
+# Text views, from sycl_gate: `code` blanks comments and keeps string literals; `bare` also blanks the inside of string
+# and character literals. Both keep every offset and line break of the raw text, so a position means the same thing in
+# all three.
 # ---------------------------------------------------------------------------------------------------------------
-
-_LEXEME_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', re.DOTALL)
-
-
-def _spaces(s: str) -> str:
-    return re.sub(r"[^\n]", " ", s)
-
-
-def views(raw: str):
-    code = []
-    bare = []
-    at = 0
-    for m in _LEXEME_RE.finditer(raw):
-        code.append(raw[at:m.start()])
-        bare.append(raw[at:m.start()])
-        tok = m.group(0)
-        if tok[0] in "\"'":
-            code.append(tok)
-            bare.append(tok[0] + _spaces(tok[1:-1]) + tok[-1])
-        else:
-            code.append(_spaces(tok))
-            bare.append(_spaces(tok))
-        at = m.end()
-    code.append(raw[at:])
-    bare.append(raw[at:])
-    return "".join(code), "".join(bare)
-
-
-def match_close(text: str, open_at: int) -> int:
-    """Index of the bracket closing the one at `open_at` (in a bare view, so literals hold no brackets); -1 if none."""
-    pairs = {"(": ")", "{": "}", "[": "]"}
-    opener = text[open_at]
-    closer = pairs[opener]
-    depth = 0
-    for i in range(open_at, len(text)):
-        c = text[i]
-        if c == opener:
-            depth += 1
-        elif c == closer:
-            depth -= 1
-            if depth == 0:
-                return i
-    return -1
 
 
 def block_end(text: str, start: int) -> int:

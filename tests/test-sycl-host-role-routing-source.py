@@ -34,10 +34,17 @@ ggml-sycl.cpp.
 """
 
 import re
+import sys
 import warnings
 from pathlib import Path
 
 import pytest
+
+# sycl_gate sits beside this file. `python3 -I` leaves the script's directory off sys.path, so it is appended
+# here; appended rather than prepended, a file in tests/ never shadows a standard module.
+sys.path.append(str(Path(__file__).resolve().parent))
+from sycl_gate import match_close, views  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SYCL_DIR = "ggml/src/ggml-sycl"
@@ -63,15 +70,11 @@ class ExpectedRed(UserWarning):
 # ---------------------------------------------------------------------------------------------------------------
 # Text views. The source is read with its compile-time positive controls resolved (every `#if defined(..._MUTANT_...)`
 # block evaluated with no mutant macro defined, as the production build compiles it), then with comments blanked
-# (`code`) and with string and character literals blanked too (`bare`). Every view keeps the raw text's offsets.
+# (`code`) and with string and character literals blanked too (`bare`), by sycl_gate's views. Every view keeps the raw
+# text's offsets.
 # ---------------------------------------------------------------------------------------------------------------
 
-_LEXEME_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', re.DOTALL)
 _DIRECTIVE_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
-
-
-def _spaces(s: str) -> str:
-    return re.sub(r"[^\n]", " ", s)
 
 
 def _mutant_condition(kw: str, rest: str) -> bool:
@@ -128,41 +131,6 @@ def resolve_mutants(raw: str) -> str:
             continue
         out.append(line if active(stack) else "")
     return "\n".join(out)
-
-
-def views(raw: str):
-    code, bare, at = [], [], 0
-    for m in _LEXEME_RE.finditer(raw):
-        code.append(raw[at:m.start()])
-        bare.append(raw[at:m.start()])
-        tok = m.group(0)
-        if tok[0] in "\"'":
-            code.append(tok)
-            bare.append(tok[0] + _spaces(tok[1:-1]) + tok[-1])
-        else:
-            code.append(_spaces(tok))
-            bare.append(_spaces(tok))
-        at = m.end()
-    code.append(raw[at:])
-    bare.append(raw[at:])
-    return "".join(code), "".join(bare)
-
-
-_BRACKET_RE = {"(": re.compile(r"[()]"), "{": re.compile(r"[{}]"), "[": re.compile(r"[\[\]]")}
-
-
-def match_close(text: str, open_at: int) -> int:
-    """The offset of the bracket closing the one at `open_at`, or -1; only bracket characters are visited."""
-    opener = text[open_at]
-    depth = 0
-    for m in _BRACKET_RE[opener].finditer(text, open_at):
-        if m.group(0) == opener:
-            depth += 1
-        else:
-            depth -= 1
-            if depth == 0:
-                return m.start()
-    return -1
 
 
 _KEYWORDS = r"(?:if|for|while|switch|catch|return|else|do|sizeof|case|new|delete|throw|static_assert|alignof|decltype)"
@@ -841,7 +809,6 @@ NEW_ROWS = {
     (_GS, "ggml_sycl_moe_hybrid_decode_table_allocate", 1): "the MoE hybrid decode table: MODEL, owned by its MODEL, "
                                                             "landed after the table",
 }
-DOC_TABLE_CLASSES = {"GRAPH", "CONTEXT", "MODEL", "BUILDER", "DEVICE", "UNOWNED", "CALLERS"}
 
 # The doc's per-class counts that the tree no longer matches: (phrase in the doc, class, role, the tree's count).
 DOC_COUNT_DRIFT = [
@@ -1057,7 +1024,7 @@ def clause_doc_table(texts: dict) -> list:
         fails.append(f"doc table: stale drift entry {item}: §4.4 and the tree agree there now")
     mapped = {key for targets, _ in DOC_ROW_MAP.values() for key, _ in targets}
     for key, row in sorted(want.items()):
-        if row["cls"] in DOC_TABLE_CLASSES and key not in mapped and key not in NEW_ROWS:
+        if row["cls"] in HOLDER_CLASSES and key not in mapped and key not in NEW_ROWS:
             fails.append(f"doc table: {key} ({row['cls']}) is in neither §4.4's table nor NEW_ROWS")
     for key in sorted(set(NEW_ROWS) & mapped):
         fails.append(f"doc table: stale NEW_ROWS entry {key}: §4.4's table has it")
