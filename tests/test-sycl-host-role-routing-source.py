@@ -865,9 +865,9 @@ def _production(texts: dict):
     return [rel for rel in sorted(texts) if rel.startswith(SYCL_DIR + "/") and rel.endswith((".cpp", ".hpp"))]
 
 
-def _calls(texts: dict, rels, name_re: str):
-    """(file, enclosing function name or None, line) of each call matching `name_re` followed by `(`; definition
-    heads are not calls."""
+def _call_sites(texts: dict, rels, name_re: str):
+    """(file, Source, enclosing function or None, call start, opening bracket) of each call matching `name_re`
+    followed by `(`; definition heads and namespace-scope declarations are not calls."""
     out = []
     for rel in rels:
         if not re.search(name_re, texts[rel]):
@@ -881,8 +881,13 @@ def _calls(texts: dict, rels, name_re: str):
             f = s.enclosing(m.start())
             if f is None and re.search(r"[\w*&>]\s*$", s.bare[max(0, m.start() - 200):m.start()]):
                 continue  # a declaration at namespace scope: a type precedes the name
-            out.append((rel, f["name"] if f else None, s.line(m.start())))
+            out.append((rel, s, f, m.start(), m.end() - 1))
     return out
+
+
+def _calls(texts: dict, rels, name_re: str):
+    """(file, enclosing function name or None, line) of each call matching `name_re` followed by `(`."""
+    return [(rel, f["name"] if f else None, s.line(at)) for rel, s, f, at, _ in _call_sites(texts, rels, name_re)]
 
 
 def _rows_by_key(texts: dict) -> dict:
@@ -1323,6 +1328,31 @@ def clause_pool_dims(texts: dict) -> list:
     if re.search(r"\bggml_backend_buffer_is_host\s*\(", placed) or \
             not re.search(r"return\s+host_experts\s*&&\s*host_experts\s*\(", placed):
         fails.append("pool dims: the pools' eligibility is not placement's executor fact (r7 I-2)")
+    # The pointer pool_host_placed calls is that fact only if every binding of it names the function that reads
+    # the MoE plan: the walk env's member and the pools' init argument.
+    fact = "ggml_sycl_host_holder_host_experts"
+    binds = []
+    for rel in prod:
+        if "host_experts" in texts[rel]:
+            s = _src(texts, rel)
+            binds += [(f"{rel}:{s.line(m.start())}", m.group(1))
+                      for m in re.finditer(r"\.\s*host_experts\s*=(?!=)\s*(\w+)\s*;", s.bare)
+                      if m.group(1) != "host_experts"]  # the plan's state copying its own parameter
+    if not binds or any(v != fact for _, v in binds):
+        fails.append(f"pool dims: the walk env's host_experts is bound to {binds}, not to {fact} alone (r7 I-2)")
+    inits = _call_sites(texts, prod, r"(?:ggml_sycl::)?host_pools_init_from_plan")
+    for rel, s, _, at, lp in inits:
+        args = [s.bare[a:b].strip() for a, b in call_args(s.bare, lp)]
+        if len(args) < 4 or args[3] != fact:
+            fails.append(f"pool dims: {rel}:{s.line(at)} passes host_pools_init_from_plan the host-experts fact "
+                         f"{args[3] if len(args) > 3 else None!r}, not {fact} (r7 I-2)")
+    if not inits:
+        fails.append("pool dims: nothing calls host_pools_init_from_plan")
+    reads = _body(texts, GS, fact)
+    if not re.search(r"\bggml_sycl_moe_plan_has_host_experts\s*\(", reads) or \
+            re.search(r"\bggml_backend_buffer_is_host\s*\(", reads):
+        fails.append(f"pool dims: {fact} does not read ggml_sycl_moe_plan_has_host_experts, placement's plan "
+                     f"(r7 I-2)")
     return fails
 
 
@@ -1853,6 +1883,19 @@ MUTANTS = [
      [(PLAN, "    return host_experts && host_experts(src0, device, known, cause);\n",
        "    return src0->buffer && ggml_backend_buffer_is_host(src0->buffer);\n")],
      "the pools' eligibility is not placement's executor fact"),
+    ("pool-fact-reads-buffer", "pool-dims",
+     [(GS, "    const bool host       = ggml_sycl_moe_plan_has_host_experts(src0, device, &fact_known);\n",
+       "    const bool host       = src0->buffer && ggml_backend_buffer_is_host(src0->buffer);\n"
+       "    fact_known            = true;\n")],
+     "ggml_sycl_host_holder_host_experts does not read ggml_sycl_moe_plan_has_host_experts"),
+    ("pool-walk-fact-rebound", "pool-dims",
+     [(GS, "    env.host_experts     = ggml_sycl_host_holder_host_experts;\n",
+       "    env.host_experts     = ggml_sycl_routing_gate_planted_is_host;\n")],
+     "the walk env's host_experts is bound to"),
+    ("pool-init-fact-rebound", "pool-dims",
+     [(GS, "ggml_sycl_host_holder_host_experts, g_host_pool_init_warnings[device]",
+       "ggml_sycl_routing_gate_planted_is_host, g_host_pool_init_warnings[device]")],
+     "passes host_pools_init_from_plan the host-experts fact 'ggml_sycl_routing_gate_planted_is_host'"),
     ("pool-init-registers-demand", "pool-dims", [(GS, _INIT_SCAN, _INIT_SCAN + "    holder_demand(graph_needs);\n")],
      "moe_hybrid_init_once registers SCRATCH demand"),
     ("pool-scan-new-caller", "pool-dims",
