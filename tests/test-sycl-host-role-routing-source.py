@@ -1662,8 +1662,10 @@ def _sched_path(texts: dict):
 
 def clause_context_wiring(texts: dict) -> list:
     """r6 I-1, r7 I-1, r7 m-1: llama_context resolves the notify, begin, plan and commit entries; each begin follows
-    a scheduler creation before any graph_reserve, each plan call follows a split_only graph_reserve, and the commit
-    calls run at the end of sched_reserve on its success, or in try_candidate after its host-fallback check."""
+    a scheduler creation before any graph_reserve, and each plan call follows a split_only graph_reserve. The commit
+    calls run at the end of sched_reserve on its success for every caller except the auto-n_ubatch trial, so that
+    commit sits under an if whose condition reads, negated, a flag the trial sets; the trial's try_candidate commits
+    instead, after its host-fallback check (design :4571-4574, :1932-1943)."""
     lc = texts.get(LC, "")
     if not lc:
         return ["context wiring: src/llama-context.cpp is missing"]
@@ -1693,10 +1695,36 @@ def clause_context_wiring(texts: dict) -> list:
     cand = _lambda_span(s.bare, "try_candidate")
     fallback = re.search(r"\breturn\s+\"compute buffer fell back to host\"\s*;", s.code[cand[0]:cand[1]]) \
         if cand else None
+    trial_fn = s.enclosing(cand[0]) if cand else None
+    trial_body = s.bare[trial_fn["open"]:trial_fn["close"]] if trial_fn else ""
+    trial_sets = {m.group(1) for m in re.finditer(r"([A-Za-z_]\w*)\s*(?:=(?!=)|\+=|\+\+)", trial_body)}
+    trial_sets |= {m.group(1) for m in re.finditer(r"\+\+\s*([A-Za-z_]\w*)", trial_body)}
+
+    def trial_excepted(p):
+        """Whether `p` sits in a block of sched_reserve guarded by an if whose condition reads, negated, a flag
+        the trial's function sets."""
+        for m in re.finditer(r"\bif\s*\(", s.bare[sr["open"]:p]):
+            lp = sr["open"] + m.end() - 1
+            rp = match_close(s.bare, lp)
+            k = rp + 1
+            while k < p and s.bare[k].isspace():
+                k += 1
+            if s.bare[k] != "{" or not k < p < match_close(s.bare, k):
+                continue
+            cond = s.bare[lp + 1:rp]
+            negated = set(re.findall(r"!\s*(?:this\s*->\s*)?([A-Za-z_]\w*)\b(?!\s*\()", cond))
+            negated |= set(re.findall(r"\b([A-Za-z_]\w*)\s*==\s*(?:0|false)\b", cond))
+            if negated & trial_sets:
+                return True
+        return False
     at_end = at_trial = 0
     for p in _pointer_calls(s, ptr["commit_host_holders"]):
         if sr and sr["open"] < p < sr["close"] and all(t < p for t in throws):
             at_end += 1
+            if not trial_excepted(p):
+                fails.append(f"context wiring: sched_reserve's end commit at line {s.line(p)} is not under an if "
+                             f"that excepts the auto-n_ubatch trial (a negated read of a flag "
+                             f"{trial_fn['name'] if trial_fn else 'the trial'} sets)")
         elif cand and fallback and cand[0] + fallback.end() < p < cand[1]:
             at_trial += 1
         else:
@@ -2073,6 +2101,8 @@ _SR_COMMIT = ("    if (!sycl_ubatch_trial_active) {\n"
               "        }\n"
               "    }\n")
 _SPILL_OK = "        hold_spill_validated_ub = hold_spill_fn ? c : 0;\n"
+_CANDIDATE = "    auto try_candidate = [&](uint32_t c) -> const char * {\n"
+_TRIAL_FLAG = "    sycl_ubatch_trial_active = true;\n"
 _TRIAL_COMMIT = ("        for (auto & sb : sycl_backends) {\n"
                  "            hooks.commit_host_holders(sb.backend);\n"
                  "        }\n")
@@ -2144,6 +2174,7 @@ FIXTURES = {
         (LC, _MEASURED, _MEASURED + "        hooks.plan_host_holders(state.sched.get(), gf);\n"),
         (LC, _SR_TAIL_OPEN + _SR_TAIL_CLOSE, _SR_TAIL_OPEN + _SR_COMMIT + _SR_TAIL_CLOSE),
         (LC, _SPILL_OK, _SPILL_OK + _TRIAL_COMMIT),
+        (LC, _CANDIDATE, _TRIAL_FLAG + _CANDIDATE),
     ],
     "trial-ops": [
         (LC, _HOOKS_AT, _HOOKS_AT + _hook("host_scratch_trial") + _hook("commit_host_holders")),
@@ -2387,6 +2418,13 @@ MUTANTS = [
      [(LC, _SR_TAIL_OPEN + _SR_COMMIT, _SR_TAIL_OPEN),
       (LC, _PP_MEASURE, _SR_COMMIT + _PP_MEASURE)],
      "llama_context::sched_reserve_impl calls the commit entry"),
+    ("wiring-end-commit-unguarded", "context-wiring",
+     [(LC, _SR_COMMIT, "    for (auto & backend : backends) {\n"
+                       "        hooks.commit_host_holders(backend.get());\n"
+                       "    }\n")],
+     "is not under an if that excepts the auto-n_ubatch trial"),
+    ("wiring-end-commit-flag-unset", "context-wiring", [(LC, _TRIAL_FLAG + _CANDIDATE, _CANDIDATE)],
+     "is not under an if that excepts the auto-n_ubatch trial"),
     ("wiring-trial-commit-before-fallback", "context-wiring",
      [(LC, _SPILL_OK + _TRIAL_COMMIT, _SPILL_OK),
       (LC, _RESERVED_OK, _RESERVED_OK + _TRIAL_COMMIT)],
