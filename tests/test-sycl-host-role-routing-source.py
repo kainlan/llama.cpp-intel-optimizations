@@ -1444,11 +1444,6 @@ def clause_dlopen_header(texts: dict) -> list:
     return fails
 
 
-# ---------------------------------------------------------------------------------------------------------------
-# EXPECTED-RED clauses: each names the task that turns it green.
-# ---------------------------------------------------------------------------------------------------------------
-
-
 def clause_slot_growth_plan_only(texts: dict) -> list:
     """§M62 (E): a slot grows only under the committed plan: slot_replace is called from host_staging_slots::apply
     alone, so the unplanned admission refuses rather than growing at dispatch."""
@@ -2099,9 +2094,8 @@ CLAUSES = [
     ("trial-ops", REQUIRED, clause_trial_ops, None, None),
     ("notify-position", REQUIRED, clause_notify_position, None, None),
     ("dlopen-context", REQUIRED, clause_dlopen_context, None, None),
-    ("scratch-fold", EXPECTED_RED, clause_scratch_fold, "Task 7", "beyond the four host terms (§M62 (A))"),
-    ("runtime-term", EXPECTED_RED, clause_runtime_term, "Task 7",
-     "names ['pp_pipeline_scratch_bytes', 'pp_moe_onednn_scratch_bytes']"),
+    ("scratch-fold", REQUIRED, clause_scratch_fold, None, None),
+    ("runtime-term", REQUIRED, clause_runtime_term, None, None),
 ]
 
 
@@ -2131,11 +2125,6 @@ _PLANNED_GROW = (PLAN, _PLANNED_FIT,
                                 "        return slot.ptr;\n    }\n")
 _IDLE = "    if (idle_slots && ggml_sycl_attn_host_staging_enabled(kind)) {\n"
 _INIT_SCAN = "        ggml_sycl::host_pool_scan(cgraph, ggml_sycl::host_pool_has_storage, nullptr);\n"
-_FOLD = ("    for (size_t bytes : { plan.max_tensor_bytes, k_scratch_headroom, plan.onednn_reorder_bytes,\n"
-         "                          plan.moe_q8_workspace_bytes, moe_host_scratch, plan.moe_vram_runtime_bytes,\n"
-         "                          plan.tp_vram_runtime_bytes, plan.dma_staging_pool_bytes, "
-         "plan.pp_pipeline_scratch_bytes,\n"
-         "                          plan.pp_moe_onednn_scratch_bytes }) {\n")
 _FOLD_FOUR = "{ plan.max_tensor_bytes, k_scratch_headroom, moe_host_scratch }"
 _RUNTIME_FOUR = "    terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;\n"
 _HOOKS_AT = "        ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_has_active_placement_plan\"));\n"
@@ -2297,14 +2286,7 @@ _TENANT_LIFETIME = "        req.intent.lifetime                     = ggml_sycl:
 _TENANT_OWNER = ("        req.intent.owner = { ggml_sycl::alloc_owner_kind::EXECUTION_CONTEXT, "
                  "ggml_sycl_context_execution_id(ctx) };\n")
 
-FIXTURES = {
-    "scratch-fold": [(UC, _FOLD, "    for (size_t bytes : " + _FOLD_FOUR + ") {\n")],
-    "runtime-term": [
-        (UCH, "    terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes + "
-              "plan.pp_pipeline_scratch_bytes +\n"
-              "                    plan.pp_moe_onednn_scratch_bytes;\n", _RUNTIME_FOUR),
-    ],
-}
+FIXTURES = {}
 
 # (id, clause, edits, the reason its clause must fail with)
 MUTANTS = [
@@ -2342,8 +2324,7 @@ MUTANTS = [
                  "}\n")],
      "(routing_gate_planted_lifetime) stamps UNOWNED outside the site table's 12 lines"),
     ("unsized-term-unfolded", "unsized-ratchet",
-     [(UC, "    for (size_t bytes : { plan.max_tensor_bytes, k_scratch_headroom, plan.onednn_reorder_bytes,\n",
-       "    for (size_t bytes : { k_scratch_headroom, plan.onednn_reorder_bytes,\n")],
+     [(UC, _FOLD_FOUR, "{ k_scratch_headroom, moe_host_scratch }")],
      "maps to max_tensor_bytes, which the host SCRATCH sum does not read"),
     ("unsized-graph-row", "unsized-ratchet", [_PLANTED_SITE],
      "maps to no plan term and is not one of the UNSIZED rows"),
@@ -2628,7 +2609,7 @@ MUTANTS = [
      [(UC, "            return host_scratch_trial_open(owner, n_ubatch);\n",
        "            return host_scratch_return_chunks(host_scratch_trial_chunks(owner), owner);\n")],
      "touches the marked set in its OPEN step"),
-    # Planted on the EXPECTED-RED clauses' fixtures.
+    # The host SCRATCH fold and the runtime term.
     ("fold-device-term", "scratch-fold",
      [(UC, _FOLD_FOUR, _FOLD_FOUR.replace(" }", ", plan.pp_moe_onednn_scratch_bytes }"))],
      "reads ['pp_moe_onednn_scratch_bytes'] beyond the four host terms"),
@@ -2642,12 +2623,7 @@ MUTANTS = [
 # A target-gone control removes what an EXPECTED-RED clause inspects. The clause must then fail with a distinct
 # reason and never with its recorded one, so a tree that deletes the target does not score as still waiting for its
 # landing task. A clause whose red state is its target's absence itself goes in NO_GONE instead.
-GONE = {
-    "scratch-fold": ([(UC, "    plan.host_zone_scratch_bytes = std::max<size_t>(k_min_zone_bytes, host_scratch_total);",
-                       "    plan.host_zone_scratch_bytes = host_scratch_total;")],
-                     "the host SCRATCH zone sum is not found"),
-    "runtime-term": ([(UCH, "    terms.runtime = ", "    terms.runtime_moved = ")], "sets no runtime term"),
-}
+GONE = {}
 NO_GONE = ()
 
 # An edit that changes no clause's subject: every REQUIRED clause must still hold, so a mutant's failure is its edit's.

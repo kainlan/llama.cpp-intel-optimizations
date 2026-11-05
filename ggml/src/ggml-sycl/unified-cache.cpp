@@ -35100,12 +35100,12 @@ static void populate_host_zone_sizing(placement_plan &                          
     plan.host_zone_staging_bytes = std::max<size_t>(k_min_zone_bytes, host_staging_total);
     GGML_LOG_INFO("[SYCL-PLAN] Host staging zone: s1_window=%zu per_inflight=%.1f MB total=%.1f MB\n", s1_in_flight,
                   s1_per_inflight_bytes / (1024.0 * 1024.0), plan.host_zone_staging_bytes / (1024.0 * 1024.0));
-    // SCRATCH zone: baseline (max_tensor + headroom) plus oneDNN reorder, MoE Q8_1 workspace,
-    // PP CPU expert act/out staging, MoE device routing buffers (expert pointer tables),
-    // TP compute buffers, and DMA staging pool (device double-buffer for weight streaming).
-    // VRAM RUNTIME fields (moe/tp/dma) are folded here as conservative zone budgeting —
-    // the actual allocations live in the VRAM RUNTIME zone, but the host SCRATCH zone
-    // grows proportionally to ensure the planner accounts for peak VRAM usage.
+    // SCRATCH zone: what a term sizes decides whether host SCRATCH reads it, not its label (§4.4 "Host SCRATCH reads
+    // no term that sizes a device allocation", §M62 (A)). Two host tenants are left: the single-tensor staging
+    // copies, bounded by max_tensor_bytes plus k_scratch_headroom, and the MoE PP CPU-island act/out staging, bounded
+    // by moe_cpu_expert_staging_bytes plus moe_host_recipe_workspace_bytes. The oneDNN reorder, the MoE Q8_1
+    // workspace, the MoE pointer tables, the TP compute buffers, the DMA staging pool and the two PP terms each size a
+    // device allocation, so none of them is folded here: a host reservation for them would sit idle.
     // A context's host compute and output buffers are not folded here: they are notified demands on the cache's
     // host SCRATCH ledger (unified_cache_host_scratch_ledger()), which covers them before each allocation.
     // Note: onednn_scratchpad_bytes goes to the ONEDNN zone (separate 256 MB allocation),
@@ -35117,10 +35117,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     if (moe_host_scratch < plan.moe_cpu_expert_staging_bytes) {
         host_scratch_valid = false;
     }
-    for (size_t bytes : { plan.max_tensor_bytes, k_scratch_headroom, plan.onednn_reorder_bytes,
-                          plan.moe_q8_workspace_bytes, moe_host_scratch, plan.moe_vram_runtime_bytes,
-                          plan.tp_vram_runtime_bytes, plan.dma_staging_pool_bytes, plan.pp_pipeline_scratch_bytes,
-                          plan.pp_moe_onednn_scratch_bytes }) {
+    for (size_t bytes : { plan.max_tensor_bytes, k_scratch_headroom, moe_host_scratch }) {
         size_t next = 0;
         if (!moe_mmid_checked_zone_total(host_scratch_total, bytes, &next)) {
             host_scratch_valid = false;

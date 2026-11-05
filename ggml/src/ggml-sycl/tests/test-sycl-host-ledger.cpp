@@ -747,17 +747,20 @@ void expect_terms(arm_result & r, const char * name, const placement_plan & plan
 }
 
 // The commit terms are the bytes configuring the plan's zones commits on a fresh pool, term by term, and total() is
-// the pool's growth. Three plans: one below both floors with every runtime term set, one whose 64-byte zone alignment
-// carries it over a chunk boundary, and one with no entries. The first plan also carries CPU quant buffer bytes,
-// which are in no term: they are diagnostic only and no allocation is sized from them (design §4.2, "Two terms are
-// deliberately absent"), so its terms must equal those of the same plan with the field zeroed.
-// Engagement: the oracle's figures are nonzero, the first plan's runtime bytes take a chunk of their own, its CPU quant
-// field is nonzero, and the second plan's alignment adds a chunk its unaligned sum would not, so each mutant below
-// moves a figure.
+// the pool's growth. Three plans: one below both floors with both runtime terms set, one whose 64-byte zone alignment
+// carries it over a chunk boundary, and one with no entries. The first plan also sets the two PP terms, VRAM
+// allocations that neither host pool carries (design §4.4, "The runtime pre-allocate stops carrying the same two
+// terms"), and CPU quant buffer bytes, which are in no term: they are diagnostic only and no allocation is sized from
+// them (design §4.2, "Two terms are deliberately absent"), so its terms must equal those of the same plan with the
+// field zeroed.
+// Engagement: the oracle's figures are nonzero, the first plan's runtime bytes take a chunk of their own, its PP terms
+// and CPU quant field are nonzero, and the second plan's alignment adds a chunk its unaligned sum would not, so each
+// mutant below moves a figure.
 // Mutants: a term left out of total() or zones(); a floor dropped (the first plan's kv or scratch moves); no 64-byte
 // alignment (the second plan loses a chunk); the runtime bytes folded into the zones' chunks (the first plan loses
-// one); cpu_quant_buffer_bytes added to a term (the runtime or a zone term differs from the zeroed copy's); a plan with
-// no entries charged.
+// one); a PP term added back to the runtime bytes (the first plan's runtime is not the oracle's);
+// cpu_quant_buffer_bytes added to a term (the runtime or a zone term differs from the zeroed copy's); a plan with no
+// entries charged.
 arm_result leg_t() {
     arm_result     r;
     placement_plan floors              = plan_with_zones(5 * GiB + 7, 1 * MiB, 3 * MiB + 1, 0, 100 * MiB);

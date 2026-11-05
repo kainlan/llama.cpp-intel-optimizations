@@ -984,8 +984,7 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
         plan.max_tensor_bytes + 32 * mib);
     const size_t host_zones = plan.host_zone_weight_bytes + std::max(plan.host_zone_kv_bytes, 64 * mib) +
                              plan.host_zone_staging_bytes + host_scratch;
-    const size_t host_runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes +
-                                plan.pp_pipeline_scratch_bytes + plan.pp_moe_onednn_scratch_bytes;
+    const size_t host_runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;
     TEST_ASSERT(host_zones <= 1536 * mib && host_runtime <= 128 * mib,
                 "planned host footprint exceeds fixture bound; do not call late inventory");
     constexpr size_t chunk = 16 * mib;

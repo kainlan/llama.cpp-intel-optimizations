@@ -1206,7 +1206,7 @@ arm_result fixture_plan_against_committed() {
                name + ": host_planned_bytes " + num(plan.host_planned_bytes) + " is not the zone terms' total " +
                    num(planned));
         if (device == 1) {
-            plan.pp_pipeline_scratch_bytes += chunk;  // one more runtime chunk, outside the plan's figure
+            plan.dma_staging_pool_bytes += chunk;  // one more runtime chunk, outside the plan's figure
         }
         const uint64_t before = cache->pinned_pool_committed();
         log_clear();
