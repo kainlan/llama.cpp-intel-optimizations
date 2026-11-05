@@ -33575,9 +33575,9 @@ static void record_host_ledger_plan(placement_plan &          plan,
         g_total_gpu_count > 0 ? get_existing_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
     const size_t onednn_live =
         cache ? cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() : 0;
-    const size_t chunk               = cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
-    plan.host_budget                 = host_budget;
-    plan.host_zone_terms             = placement_plan_host_zone_commit_terms(plan, onednn_live, chunk);
+    const size_t chunk   = cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
+    plan.host_budget     = host_budget;
+    plan.host_zone_terms = placement_plan_host_zone_commit_terms(plan, onednn_live, chunk);
     placement_plan_decide_lazy_residency(plan, kv_info, coverage_pin);
     const host_zone_commit_terms & t = plan.host_zone_terms;
     GGML_LOG_INFO(
