@@ -66,6 +66,30 @@ PATTERN='sycl::malloc_(device|host|shared)\s*\(|sycl_aligned_malloc_device\s*\(|
 ALLOW_RE='^ggml/src/ggml-sycl/unified-cache\.cpp$'
 HOST_ALLOC_PATTERN='std::(malloc|calloc|realloc|aligned_alloc|free)\s*\(|(^|[^[:alnum:]_:])(malloc|calloc|aligned_alloc)\s*\('
 VM_ALLOC_PATTERN='(^|[^[:alnum:]_:])(posix_memalign|mmap|munmap)\s*\('
+TIER_MAPPING_RE='^(ggml/src/ggml-sycl|tests/sycl-alloc-policy-fixtures/[^/]+)/(file-mapping|host-cpu-mapping)\.cpp$'
+# file|enclosing function|call -> allowed count (tests/test-sycl-raw-mmap-allowlist-source.py pins the same per-file
+# totals: host-cpu-mapping.cpp 1 mmap + 1 munmap, file-mapping.cpp 2 mmap + 1 munmap)
+declare -A TIER_MAPPING_SITES=(
+    ["host-cpu-mapping.cpp|unified_cache_raw_alloc_host_cpu|mmap"]=1
+    ["host-cpu-mapping.cpp|host_cpu_munmap|munmap"]=1
+    ["file-mapping.cpp|unified_cache_raw_map_file|mmap"]=2
+    ["file-mapping.cpp|file_map_munmap|munmap"]=1
+)
+declare -A TIER_MAPPING_SEEN=()
+
+# Name of the function whose definition most recently opened (at column 0) at or before line $2 of file $1.
+enclosing_function() {
+    awk -v target="$2" '
+        NR > target { exit }
+        /^[A-Za-z_][^;=]*[ *&][A-Za-z_0-9]+\(/ && !/;[[:space:]]*$/ {
+            head = $0
+            sub(/\(.*/, "", head)
+            n = split(head, parts, /[ *&]+/)
+            fn = parts[n]
+        }
+        END { print fn }
+    ' "$1"
+}
 RAW_CACHE_API_PATTERN='unified_cache_(allocate|deallocate)\s*\('
 RAW_CACHE_API_ALLOW_RE='^ggml/src/ggml-sycl/unified-cache\.(cpp|hpp)$'
 RAW_ZONE_API_PATTERN='unified_cache_zone_(alloc|free)\s*\('
@@ -373,6 +397,25 @@ while IFS= read -r match; do
             continue
         fi
         if [[ "$code" == *"munmap(header->mapping_base, header->mapping_size)"* ]]; then
+            continue
+        fi
+    fi
+    # Clause (q) of the canonical contract: the two device-free tier TUs own three mmap and two munmap sites, pinned
+    # by file, enclosing function and count (a further call in the same function, or one in another function, is a
+    # new site). The fixture directories carry same-named copies so the negative controls exercise this path.
+    if [[ "$rel" =~ $TIER_MAPPING_RE ]]; then
+        line="${match#*:}"
+        line="${line%%:*}"
+        call="mmap"
+        if [[ "$code" =~ (^|[^[:alnum:]_:])munmap[[:space:]]*\( ]]; then
+            call="munmap"
+        fi
+        fn="$(enclosing_function "$ROOT_DIR/$rel" "$line")"
+        key="${rel##*/}|$fn|$call"
+        limit="${TIER_MAPPING_SITES[$key]:-0}"
+        seen="${TIER_MAPPING_SEEN[$rel|$fn|$call]:-0}"
+        if [[ "$seen" -lt "$limit" ]]; then
+            TIER_MAPPING_SEEN["$rel|$fn|$call"]=$((seen + 1))
             continue
         fi
     fi
