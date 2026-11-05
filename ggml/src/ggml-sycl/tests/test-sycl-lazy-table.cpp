@@ -322,7 +322,11 @@ arm_result arm_body_request_window() {
            "an aligned one-block table's window is not 4096");
     expect(r, lazy_table_host_body_request_bytes(0, 1) == 4096, "a one-byte table's window is not one block");
     expect(r, lazy_table_host_body_request_bytes(4095, 2) == 8192, "a table straddling a block is not two blocks");
-    expect(r, lazy_table_host_body_request_bytes(1, SIZE_MAX - 4096) == SIZE_MAX,
+    // Both sides of the size_t edge: 1 + (SIZE_MAX - 4096) is 2^64 - 4096, a whole number of blocks and the largest
+    // window size_t holds, so it is exact; one byte more rounds up to 2^64, which saturates.
+    expect(r, lazy_table_host_body_request_bytes(1, SIZE_MAX - 4096) == SIZE_MAX - 4095,
+           "the largest window size_t holds is not exact");
+    expect(r, lazy_table_host_body_request_bytes(1, SIZE_MAX - 4095) == SIZE_MAX,
            "an overflowing window does not saturate");
     return r;
 }
