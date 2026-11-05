@@ -350,8 +350,10 @@ def claim_api_carries_the_hint(llama_h: str, model: str) -> bool:
 
 
 COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_params & params)"
-COMMON_HINT = ("mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : "
-               "params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;")
+# common maps -c to the hint in common_n_ctx_hint, which common_model_params_to_llama asks (llama.cpp-h187).
+COMMON_HINT_SIG = "uint32_t common_n_ctx_hint(int32_t n_ctx)"
+COMMON_HINT = "return n_ctx > 0 ? (uint32_t) n_ctx : n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;"
+COMMON_HINT_CALL = "mparams.n_ctx_hint = common_n_ctx_hint(params.n_ctx);"
 COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
 FIT_REFRESH = "mparams.n_ctx_hint = cparams.n_ctx;"
 COMMON_FIT_REFRESH = "if (params.n_ctx >= 0 && cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
@@ -365,8 +367,8 @@ def claim_common_hands_the_requested_context(common: str) -> bool:
     fit is a no-op) keeps the default, and a negative -c keeps no room."""
     n = norm(common)
     b = body(n, COMMON_SIG)
-    return (bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
-            and n.count(FIT_REFRESH) == 1)
+    return (bool(b) and body(n, COMMON_HINT_SIG) == "{ " + COMMON_HINT + " }" and COMMON_HINT_CALL in b
+            and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD) and n.count(FIT_REFRESH) == 1)
 
 
 BENCH_CTX = "uint32_t n_ctx() const { return n_prompt + n_gen + n_depth; }"
@@ -662,7 +664,12 @@ def test_mutant_api_hint_not_last_fails():
 
 
 def test_mutant_common_drops_the_hint_fails():
-    assert not claim_common_hands_the_requested_context(_once(COMMON, COMMON_HINT, ""))
+    assert not claim_common_hands_the_requested_context(_once(COMMON, COMMON_HINT_CALL, ""))
+
+
+def test_mutant_common_default_context_asks_no_room_fails():
+    assert not claim_common_hands_the_requested_context(
+        _once(COMMON, COMMON_HINT, "return n_ctx > 0 ? (uint32_t) n_ctx : 0;"))
 
 
 def test_mutant_common_fit_keeps_the_unfitted_hint_fails():
