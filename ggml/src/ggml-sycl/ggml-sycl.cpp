@@ -32603,7 +32603,7 @@ static bool ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test() {
 // The descriptor guard (th32 §3.2, T4). A lazy table's tensor, or a view of one, has no bytes behind its sentinel data
 // pointer, and the gather node is its only reader (§7.2), so a caller here is a plan bug nobody found. It fails closed,
 // before the layer-streaming registration below and before any device call, instead of registering the sentinel.
-static void ggml_sycl_get_data_ptr_refuse_lazy(const ggml_tensor * tensor, int device) {
+static void ggml_sycl_get_data_ptr_guard_lazy(const ggml_tensor * tensor, int device) {
     const ggml_tensor * root = tensor;
     while (root->view_src != nullptr) {
         root = root->view_src;
@@ -32625,7 +32625,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
     if (tensor == nullptr) {
         return nullptr;
     }
-    ggml_sycl_get_data_ptr_refuse_lazy(tensor, device);
+    ggml_sycl_get_data_ptr_guard_lazy(tensor, device);
 
     // Views must resolve through the root on the requested physical device
     // before any cached per-view direct handle can win.
@@ -54535,8 +54535,10 @@ ggml_backend_buffer_type_t ggml_backend_sycl_lazy_host_buffer_type() {
 
 ggml_backend_buffer_t ggml_backend_sycl_lazy_buffer_init(ggml_backend_buffer_type_t buft,
                                                          ggml_sycl::lazy_table_ref  table) {
-    if (!ggml_sycl_buft_is_lazy(buft) || !table) {
-        GGML_LOG_WARN("[LAZY-TABLE] a descriptor binds a table to a lazy buffer type: buft=%s table=%s\n",
+    const bool lazy_buft = ggml_sycl_buft_is_lazy(buft);
+    if (!lazy_buft || !table) {
+        GGML_LOG_WARN("[LAZY-TABLE] lazy_buffer_init refused: %s: buft=%s table=%s\n",
+                      lazy_buft ? "the table reference is empty" : "the buffer type is not a descriptor type",
                       buft != nullptr ? buft->iface.get_name(buft) : "(none)", table ? table->name() : "(none)");
         return nullptr;
     }
