@@ -274,6 +274,64 @@ arm_result arm_c_the_stage_refuses_a_refused_plan() {
     return arr;
 }
 
+// (e) An inventory naming lazy tables with no array behind the count is refused at the stage as a null tensor array is,
+// with NULL_OUTPUT, before anything reads it (th32 §4.1).
+// Engagement: the same inventory with the array present, staged with no load open, is refused for the transaction
+// (WRONG_TRANSACTION), so the stage's inventory check is what returns NULL_OUTPUT.
+// Mutant: the stage's check not reading the lazy array (the inventory reaches the transaction check and returns
+// WRONG_TRANSACTION).
+arm_result arm_e_stage_refuses_a_count_with_no_array() {
+    arm_result                arr;
+    loader_inventory          inv;
+    ggml_sycl_lazy_table_info table = lazy_table("blk.1.engram_embd.weight", (64 * MiB) / 34);
+    inv.inv.lazy_tables             = &table;
+    inv.inv.lazy_table_count        = 1;
+
+    const ggml_sycl_placement_envelope envelope{ inv.inv.n_ctx, inv.inv.n_ubatch, 1, -1 };
+
+    const ggml_sycl_lifecycle_result whole = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, true);
+    if (whole != GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION) {
+        void_arm(arr, "with the array present and no load open the stage returned " + num(whole) +
+                          ", want WRONG_TRANSACTION (" + num(GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION) + ")");
+        return arr;
+    }
+    inv.inv.lazy_tables                 = nullptr;
+    const ggml_sycl_lifecycle_result rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, true);
+    expect(arr, rc == GGML_SYCL_LIFECYCLE_NULL_OUTPUT,
+           "the stage returned " + num(rc) + " for a lazy count of 1 with no array, want NULL_OUTPUT (" +
+               num(GGML_SYCL_LIFECYCLE_NULL_OUTPUT) + ")");
+    return arr;
+}
+
+// (f) The dry run refuses the same inventory with NULL_OUTPUT. It runs last: with its check dropped the intake reads
+// the null array, so the binary faults after every other arm has printed its verdict.
+// Engagement: the same call with the array present returns OK, so the result header and the host's state let the dry
+// run plan, and the inventory check is what returns NULL_OUTPUT.
+// Mutant: the dry run's check not reading the lazy array (the intake dereferences the null array and the binary faults
+// with no summary line, which fails the registration).
+arm_result arm_f_dry_run_refuses_a_count_with_no_array() {
+    arm_result                arr;
+    loader_inventory          inv;
+    ggml_sycl_lazy_table_info table = lazy_table("blk.1.engram_embd.weight", (64 * MiB) / 34);
+    inv.inv.lazy_tables             = &table;
+    inv.inv.lazy_table_count        = 1;
+
+    ggml_sycl_plan_dry_run_result result{};
+    result.struct_size                     = sizeof(result);
+    result.version                         = GGML_SYCL_PLAN_DRY_RUN_VERSION;
+    const ggml_sycl_lifecycle_result whole = ggml_backend_sycl_plan_dry_run(&inv.inv, nullptr, &result);
+    if (whole != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(arr, "with the array present the dry run returned " + num(whole) + ", want OK");
+        return arr;
+    }
+    inv.inv.lazy_tables                 = nullptr;
+    const ggml_sycl_lifecycle_result rc = ggml_backend_sycl_plan_dry_run(&inv.inv, nullptr, &result);
+    expect(arr, rc == GGML_SYCL_LIFECYCLE_NULL_OUTPUT,
+           "the dry run returned " + num(rc) + " for a lazy count of 1 with no array, want NULL_OUTPUT (" +
+               num(GGML_SYCL_LIFECYCLE_NULL_OUTPUT) + ")");
+    return arr;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -308,9 +366,12 @@ int main(int argc, char ** argv) {
     g_backend0 = backends.front().get();
 
     const std::vector<named_arm> arms = {
-        { "(a) a table through the stage, the publish and the unload", arm_a_through_the_stage                },
-        { "(b) the thread's plan slot reaches the planner",            arm_b_the_slot_reaches_the_planner     },
-        { "(c) a refused plan refuses the load at the stage",          arm_c_the_stage_refuses_a_refused_plan },
+        { "(a) a table through the stage, the publish and the unload", arm_a_through_the_stage                     },
+        { "(b) the thread's plan slot reaches the planner",            arm_b_the_slot_reaches_the_planner          },
+        { "(c) a refused plan refuses the load at the stage",          arm_c_the_stage_refuses_a_refused_plan      },
+        { "(e) the stage refuses a lazy count with no array",          arm_e_stage_refuses_a_count_with_no_array   },
+        // Last: with its check dropped the dry run faults the binary.
+        { "(f) the dry run refuses a lazy count with no array",        arm_f_dry_run_refuses_a_count_with_no_array },
     };
     return run_arms(arms, "lazy plan interface arms (--devices " + std::to_string(g_devices) + ")");
 }

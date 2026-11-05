@@ -464,11 +464,12 @@ struct ggml_sycl_tensor_inventory {
     uint32_t                       n_ubatch_context;
     // th32 §4.1: the lazy tables [lazy_table_count], an inventory class of their own: the planner decides each one's
     // residency (§4.3 step 4) and none enters `tensors`, so max_tensor and every zone maximum leave them out. NULL with
-    // a count of 0 is a model with none, which every `= {}` inventory libllama builds reads as. Appended: the struct
-    // grew from 192 to 208 bytes, which the static_asserts below and ggml-sycl.cpp pin. The struct carries no size
-    // field, so a libllama built before these fields passes a 192-byte object: libggml-sycl then reads these 16 bytes
-    // past the end of the caller's object, and with a nonzero count dereferences whatever lies there as an array of
-    // tables. libllama and libggml-sycl must be rebuilt together.
+    // a count of 0 is a model with none, which every `= {}` inventory libllama builds reads as. A nonzero count with
+    // NULL is refused as a null `tensors` is: the stage and the dry run return GGML_SYCL_LIFECYCLE_NULL_OUTPUT, and the
+    // two direct entries plan nothing. Appended: the struct grew from 192 to 208 bytes, which the static_asserts below
+    // and ggml-sycl.cpp pin. The struct carries no size field, so a libllama built before these fields passes a
+    // 192-byte object: libggml-sycl then reads these 16 bytes past the end of the caller's object, and with a nonzero
+    // count dereferences whatever lies there as an array of tables. libllama and libggml-sycl must be rebuilt together.
     const struct ggml_sycl_lazy_table_info * lazy_tables;
     uint32_t                                 lazy_table_count;
 };
@@ -2096,11 +2097,11 @@ GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_opts) == 160 || sizeof(void *
 GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_plan) == 184, "dry run plan layout changed");
 GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_result) == 3136, "dry run result layout changed");
 
-// OK with the result written; NULL_OUTPUT for a null inventory or result, or a struct header this backend does not
-// read (a caller built against another layout, whose struct_size differs; a [PLAN-DRY-RUN] refused WARN names both
-// sizes and versions); LOAD_BUSY while a load is open or a model is live; BUSY while the module is being mutated;
-// NOT_FOUND with no SYCL device; EFFECT_FAILED when planning threw. On every status but OK the result is left as the
-// caller wrote it.
+// OK with the result written; NULL_OUTPUT for a null inventory or result, an inventory whose tensor or lazy-table count
+// has no array behind it, or a struct header this backend does not read (a caller built against another layout, whose
+// struct_size differs; a [PLAN-DRY-RUN] refused WARN names both sizes and versions); LOAD_BUSY while a load is open or
+// a model is live; BUSY while the module is being mutated; NOT_FOUND with no SYCL device; EFFECT_FAILED when planning
+// threw. On every status but OK the result is left as the caller wrote it.
 // Proc name: "ggml_backend_sycl_plan_dry_run".
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(
     const struct ggml_sycl_tensor_inventory *  inventory,

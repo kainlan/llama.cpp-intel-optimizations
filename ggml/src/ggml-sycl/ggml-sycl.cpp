@@ -17263,6 +17263,14 @@ static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_in
     return in;
 }
 
+// An inventory no entry point reads: absent, or naming tensors or lazy tables with no array behind the count. The four
+// entry points (the early and the late direct entries, the stage and the dry run) refuse it before anything reads it,
+// so the intake below copies whatever the counts name.
+static bool ggml_sycl_inventory_malformed(const ggml_sycl_tensor_inventory * inventory) {
+    return inventory == nullptr || (inventory->count > 0 && inventory->tensors == nullptr) ||
+           (inventory->lazy_table_count > 0 && inventory->lazy_tables == nullptr);
+}
+
 // The planner's KV and cost inputs from an inventory, written over `kv`, which keeps every field the inventory does not
 // carry (n_seq_max is a runtime-context input). The stage fills g_placement_kv_info; the plan dry run fills a copy.
 static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     kv,
@@ -17345,26 +17353,26 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
     kv.moe_stream_group_cap    = ggml_sycl_moe_pp_f16_group_experts_max();
     kv.n_expert_used           = inventory->n_expert_used;
     // The lazy tables (th32 §4.1), an inventory class of their own: copied here, the one intake, and never into the
-    // tensor rows, so no table enters g_tensor_inventory_detail and no zone maximum the rows size ever counts it.
+    // tensor rows, so no table enters g_tensor_inventory_detail and no zone maximum the rows size ever counts it. Every
+    // entry point refuses a count with no array (ggml_sycl_inventory_malformed), so the copy reads what the count
+    // names.
     kv.lazy_tables.clear();
-    if (inventory->lazy_table_count > 0 && inventory->lazy_tables != nullptr) {
-        kv.lazy_tables.reserve(inventory->lazy_table_count);
-        for (uint32_t i = 0; i < inventory->lazy_table_count; ++i) {
-            const ggml_sycl_lazy_table_info &    src = inventory->lazy_tables[i];
-            ggml_sycl::placement_lazy_table_info t;
-            t.name = src.name != nullptr ? src.name : "";
-            t.type = src.type;
-            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-                t.ne[d] = src.ne[d];
-            }
-            t.row_size       = src.row_size;
-            t.rows_per_token = src.rows_per_token;
-            t.consumer_layer = src.consumer_layer;
-            t.file_index     = src.file_index;
-            t.file_offset    = src.file_offset;
-            t.table_bytes    = src.size;
-            kv.lazy_tables.push_back(std::move(t));
+    kv.lazy_tables.reserve(inventory->lazy_table_count);
+    for (uint32_t i = 0; i < inventory->lazy_table_count; ++i) {
+        const ggml_sycl_lazy_table_info &    src = inventory->lazy_tables[i];
+        ggml_sycl::placement_lazy_table_info t;
+        t.name = src.name != nullptr ? src.name : "";
+        t.type = src.type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            t.ne[d] = src.ne[d];
         }
+        t.row_size       = src.row_size;
+        t.rows_per_token = src.rows_per_token;
+        t.consumer_layer = src.consumer_layer;
+        t.file_index     = src.file_index;
+        t.file_offset    = src.file_offset;
+        t.table_bytes    = src.size;
+        kv.lazy_tables.push_back(std::move(t));
     }
 }
 
@@ -18139,7 +18147,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
 // headroom reserve) that depend on state populated by create_tensor.
 void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t                     backend,
                                                     const ggml_sycl_tensor_inventory * inventory) {
-    if (!backend || !inventory || (inventory->count > 0 && !inventory->tensors)) {
+    if (!backend || ggml_sycl_inventory_malformed(inventory)) {
         return;
     }
     ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
@@ -18183,7 +18191,7 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
 
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(
     ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
-    if (!backend || !inventory || (inventory->count > 0 && !inventory->tensors)) {
+    if (!backend || ggml_sycl_inventory_malformed(inventory)) {
         return {};
     }
     ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
@@ -18503,7 +18511,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
     ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
-    if (!inventory || (inventory->count > 0 && !inventory->tensors)) {
+    if (ggml_sycl_inventory_malformed(inventory)) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
     try {
@@ -18960,7 +18968,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
     if (!module_guard) {
         return GGML_SYCL_LIFECYCLE_BUSY;
     }
-    if (!inventory || (inventory->count > 0 && !inventory->tensors) || !result) {
+    if (ggml_sycl_inventory_malformed(inventory) || !result) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
     // A caller built against another layout sends another struct_size. The size gate refuses it before anything is
