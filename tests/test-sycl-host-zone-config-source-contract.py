@@ -123,6 +123,8 @@ texts = {
         "static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,"),
     "intent_fn": function_window(
         sycl_cpp, "static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind kind) {"),
+    "host_zone_fn": function_window(
+        sycl_cpp, "static ggml_sycl::host_zone_id ggml_sycl_host_buft_zone(ggml_sycl_host_buft_kind kind) {"),
     "host_max_size_fn": function_window(
         sycl_cpp,
         "static size_t ggml_sycl_host_buft_max_size(ggml_backend_buffer_type_t buft, int device, "
@@ -250,14 +252,17 @@ def witness_a3(t):
 # WEIGHT because every HOST_COMPUTE request routed there; after C4 a post-load SYCL_Host buffer is a context's and
 # routes to SCRATCH, so a get_max_size that names its own zone chunks against the wrong one (the glkg shape). Each
 # buft's get_max_size therefore builds the same intent its alloc_buffer builds and asks select_zone, on the buft's
-# own device.
+# own device. The select_zone call over the builder's intent is written once, in ggml_sycl_host_buft_zone, and each
+# get_max_size asks that helper for its own kind. Whitespace is flattened, so alignment never decides a check.
 HOST_INTENT = "ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::HOST)"
 KV_INTENT = "ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::KV_HOST)"
-TP_INTENT = "ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::HOST_COMPUTE_TP)"
-SELECT_FROM_INTENT = ("ggml_sycl::select_zone(intent.role, intent.category, intent.lifetime,\n"
-                      "                                                                  "
-                      "intent.constraints.persistent_owner, false);")
-HOST_DEVICE = "const int                     device = ggml_sycl_host_buft_device(buft);"
+HOST_ZONE = "ggml_sycl_host_buft_zone(ggml_sycl_host_buft_kind::HOST)"
+KV_ZONE = "ggml_sycl_host_buft_zone(ggml_sycl_host_buft_kind::KV_HOST)"
+TP_ZONE = "ggml_sycl_host_buft_zone(ggml_sycl_host_buft_kind::HOST_COMPUTE_TP)"
+ZONE_FROM_INTENT = ("const ggml_sycl::alloc_intent intent = ggml_sycl_host_buft_intent(kind); "
+                    "return ggml_sycl::select_zone(intent.role, intent.category, intent.lifetime, "
+                    "intent.constraints.persistent_owner, false);")
+HOST_DEVICE = "const int device = ggml_sycl_host_buft_device(buft);"
 
 
 def flat_ws(text):
@@ -265,24 +270,25 @@ def flat_ws(text):
 
 
 def check_b_host_builder(t):
-    size_fn, alloc_fn = t["get_max_size_fn"], t["alloc_buffer_fn"]
+    size_fn, alloc_fn = flat_ws(t["get_max_size_fn"]), t["alloc_buffer_fn"]
     return (
         bool(size_fn) and bool(alloc_fn)
-        and HOST_INTENT in size_fn and SELECT_FROM_INTENT in size_fn and HOST_DEVICE in size_fn
+        and ZONE_FROM_INTENT in flat_ws(t["host_zone_fn"])
+        and HOST_ZONE in size_fn and HOST_DEVICE in size_fn
         and "return ggml_sycl_host_buft_alloc(buft, size, " + HOST_INTENT + ");" in alloc_fn
     )
 
 
 def witness_b_host_builder(t):
     # SYCL_Host's get_max_size with WEIGHT hard-coded again.
-    t["get_max_size_fn"] = t["get_max_size_fn"].replace(SELECT_FROM_INTENT, "ggml_sycl::host_zone_id::WEIGHT;")
+    t["get_max_size_fn"] = t["get_max_size_fn"].replace(HOST_ZONE, "ggml_sycl::host_zone_id::WEIGHT")
     return t
 
 
 # No host get_max_size names a zone or calls get_current_device_id(), and SYCL_Host's and SYCL_KV_Host's paths take
-# the device from ggml_sycl_host_buft_device and nowhere else (no ctx->device on those paths). The shared helper the
-# three answer through takes the zone as a parameter and names none.
-HOST_SIZE_WINDOWS = ("get_max_size_fn", "kv_get_max_size_fn", "hc_get_max_size_fn", "host_max_size_fn")
+# the device from ggml_sycl_host_buft_device and nowhere else (no ctx->device on those paths). The shared helpers the
+# three answer through take the kind or the zone as a parameter and name none.
+HOST_SIZE_WINDOWS = ("get_max_size_fn", "kv_get_max_size_fn", "hc_get_max_size_fn", "host_zone_fn", "host_max_size_fn")
 
 
 def check_b_no_zone_no_current_device(t):
@@ -303,26 +309,31 @@ def witness_b_no_zone_no_current_device(t):
     return t
 
 
-# SYCL_KV_Host has its own iface: its own get_name, and its alloc_buffer and get_max_size slots call the builder with
-# role KV. A copy of SYCL_Host's iface would allocate host KV with SYCL_Host's role (design 5efe section M57 (a)).
+# SYCL_KV_Host is SYCL_Host's buffer type with three slots overridden: its own get_name, and alloc_buffer and
+# get_max_size slots that call the builder with role KV. A copy that kept SYCL_Host's alloc_buffer would allocate host
+# KV with SYCL_Host's role (design 5efe section M57 (a)).
+KV_OVERRIDES = (
+    "t.iface.get_name = ggml_backend_sycl_kv_host_buffer_type_name;",
+    "t.iface.alloc_buffer = ggml_backend_sycl_kv_host_buffer_type_alloc_buffer;",
+    "t.iface.get_max_size = ggml_backend_sycl_kv_host_buffer_type_get_max_size;",
+)
+
+
 def check_b_kv_own_iface(t):
     buft = flat_ws(t["kv_buft_fn"])
     return (
-        "/* .get_name = */ ggml_backend_sycl_kv_host_buffer_type_name," in buft
-        and "/* .alloc_buffer = */ ggml_backend_sycl_kv_host_buffer_type_alloc_buffer," in buft
-        and "/* .get_max_size = */ ggml_backend_sycl_kv_host_buffer_type_get_max_size," in buft
-        and "ggml_backend_sycl_host_buffer_type()->iface" not in buft
-        and KV_INTENT in t["kv_get_max_size_fn"] and SELECT_FROM_INTENT in t["kv_get_max_size_fn"]
+        "ggml_backend_buffer_type t = *ggml_backend_sycl_host_buffer_type();" in buft
+        and all(o in buft for o in KV_OVERRIDES)
+        and KV_ZONE in flat_ws(t["kv_get_max_size_fn"])
         and "return ggml_sycl_host_buft_alloc(buft, size, " + KV_INTENT + ");" in t["kv_alloc_buffer_fn"]
         and "intent.role      = ggml_sycl::alloc_role::KV;" in t["intent_fn"]
     )
 
 
 def witness_b_kv_own_iface(t):
-    # SYCL_KV_Host back on the copied SYCL_Host iface.
+    # SYCL_KV_Host copied from SYCL_Host with its alloc_buffer left as SYCL_Host's.
     t["kv_buft_fn"] = t["kv_buft_fn"].replace(
-        "ggml_backend_sycl_kv_host_buffer_type_alloc_buffer,",
-        "ggml_backend_sycl_host_buffer_type()->iface.alloc_buffer,")
+        "t.iface.alloc_buffer       = ggml_backend_sycl_kv_host_buffer_type_alloc_buffer;\n", "")
     return t
 
 
@@ -334,7 +345,7 @@ def check_b_host_compute(t):
         "/* .get_max_size     = */ ggml_backend_sycl_host_compute_buffer_type_get_max_size," in t["hc_iface"]
         and "if (!ggml_sycl_host_compute_is_tp()) {\n        return ggml_backend_sycl_buffer_type_get_max_size(buft);"
         in fn
-        and TP_INTENT in fn and SELECT_FROM_INTENT.replace("\n" + " " * 66, "\n" + " " * 68) in fn
+        and TP_ZONE in flat_ws(fn)
         and "if (ggml_sycl_host_compute_is_tp()) {" in t["hc_alloc_fn"]
     )
 
@@ -591,7 +602,7 @@ checks = [
      check_b_host_builder, witness_b_host_builder),
     ("B: no host get_max_size names a zone or calls get_current_device_id; the device is the buft's",
      check_b_no_zone_no_current_device, witness_b_no_zone_no_current_device),
-    ("B: SYCL_KV_Host has its own iface whose slots call the builder with role KV",
+    ("B: SYCL_KV_Host is SYCL_Host's buffer type with its own get_name, alloc_buffer and get_max_size (role KV)",
      check_b_kv_own_iface, witness_b_kv_own_iface),
     ("B: SYCL_HostCompute's own get_max_size asks the TP predicate and delegates to the device buft outside TP",
      check_b_host_compute, witness_b_host_compute),
