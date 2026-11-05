@@ -279,6 +279,63 @@ if (BUILD_TESTING)
         set_tests_properties(test-sycl-host-cpu-mapping PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 60)
     endif()
 
+    # The lazy tables' IO pool registry (th32 §3.3, §11 T3): the counted lease, clone, park, DYING, the FULL reap, the
+    # coverage wrapper, the helper guard and shut-down. lazy-io-pool.cpp includes no SYCL header, so this target links
+    # it alone with ggml-base for the abort and the log: no device, no unified cache, no SYCL module. Its abort legs
+    # re-execute the binary through fork and /proc/self/exe, so it is Linux-only.
+    #
+    # Each MUTANTS pair is a positive control: a macro that plants one defect in lazy-io-pool.cpp, and the FAIL line the
+    # test prints when it does. Each builds its own executable, test-sycl-lazy-io-pool-host-mutant-<macro suffix>, and a
+    # ctest of that name which passes only when that line appears.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(_lazy_io_pool_host_mutants
+            LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP
+                "FAIL the wrapper reaps before its take and after its drop: the take snapshot [0-9]+ reaps run, want [0-9]+: the entry reap did not run before the take"
+            LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP
+                "FAIL the wrapper reaps before its take and after its drop: after the scope: 0 live pools, 0 leases, 1 parked, want its pool reaped by its closing reap"
+            LAZY_IO_POOL_MUTANT_INSTALL_ON_EMPTY_SLOT
+                "FAIL a take installs only on a generation match: take A's pool shares generation [0-9]+ with the pool installed and parked during its build")
+        set(_lazy_io_pool_host_variants test-sycl-lazy-io-pool-host "" "")
+        list(LENGTH _lazy_io_pool_host_mutants _n)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 2)
+            math(EXPR _j "${_i} + 1")
+            list(GET _lazy_io_pool_host_mutants ${_i} _macro)
+            list(GET _lazy_io_pool_host_mutants ${_j} _regex)
+            string(REGEX REPLACE "^LAZY_IO_POOL_MUTANT_" "" _suffix "${_macro}")
+            string(TOLOWER "${_suffix}" _suffix)
+            string(REPLACE "_" "-" _suffix "${_suffix}")
+            list(APPEND _lazy_io_pool_host_variants test-sycl-lazy-io-pool-host-mutant-${_suffix} "${_macro}" "${_regex}")
+        endforeach()
+        list(LENGTH _lazy_io_pool_host_variants _n)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 3)
+            math(EXPR _j "${_i} + 1")
+            math(EXPR _k "${_i} + 2")
+            list(GET _lazy_io_pool_host_variants ${_i} _name)
+            list(GET _lazy_io_pool_host_variants ${_j} _macro)
+            list(GET _lazy_io_pool_host_variants ${_k} _regex)
+            add_executable(${_name}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-pool-host.cpp
+                lazy-io-pool.cpp)
+            target_include_directories(${_name} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+            target_compile_definitions(${_name} PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+            target_link_libraries(${_name} PRIVATE ggml-base Threads::Threads)
+            set_target_properties(${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+            add_test(NAME ${_name} COMMAND ${_name})
+            if (_macro STREQUAL "")
+                set_tests_properties(${_name} PROPERTIES LABELS "sycl;host" TIMEOUT 120)
+            else()
+                target_compile_definitions(${_name} PRIVATE ${_macro}=1)
+                set_tests_properties(${_name} PROPERTIES
+                    LABELS "sycl;host;mutant"
+                    TIMEOUT 120
+                    PASS_REGULAR_EXPRESSION "${_regex}")
+            endif()
+        endforeach()
+    endif()
+
     # The tier on a build without it (llama.cpp-th32 T1a): host-cpu-mapping.cpp and the test are compiled with _WIN32
     # defined, so the refusing stub Windows gets is built and run on the host. Both are portable C++.
     add_executable(test-sycl-host-cpu-unsupported
@@ -7938,6 +7995,80 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         TIMEOUT 300)
+
+    # The lazy tables' residency (th32 §4.3 step 4, §11 T3): the DeepSeek-shaped tables both STORAGE and one HOST at
+    # thresholds derived from the plan's own zone terms, the Qwen PLE flip, the tables kept out of every zone maximum,
+    # and the null-pin and cold-class refusals. One binary, two registrations: --devices 1 plans through
+    # compute_placement_plan and the one-budget delegation on the B70 alone, --devices 2 through
+    # compute_multi_device_plan on both cards and exits 77 below two GPUs. The planner initialises SYCL and reads each
+    # device's cache, so both carry the OOM-family labels and run alone. Lead-run.
+    add_executable(test-sycl-lazy-residency-plan
+        tests/test-sycl-lazy-residency-plan.cpp)
+    target_link_libraries(test-sycl-lazy-residency-plan PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-residency-plan PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-residency-plan-1dev COMMAND test-sycl-lazy-residency-plan --devices 1)
+    set_tests_properties(test-sycl-lazy-residency-plan-1dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+    add_test(NAME test-sycl-lazy-residency-plan-2dev COMMAND test-sycl-lazy-residency-plan --devices 2)
+    set_tests_properties(test-sycl-lazy-residency-plan-2dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+
+    # The lazy tables' backend interface (th32 §11 T3): a table enters through the inventory, rides the early and the
+    # late stage into the published plan and leaves with the model, all read through the model token; a direct entry
+    # with a pin on the thread's plan slot plans a table STORAGE that only a pinned plan can hold; and a plan that
+    # refuses its table refuses the load at the stage, with one WARN. --devices 1
+    # runs on the B70 alone, where the planner caller takes its single-device path; --devices 2 runs on both cards,
+    # where it takes the multi-device path, and exits 77 below two GPUs. The stage builds every device's cache, so both
+    # carry the OOM-family labels and run alone. Lead-run.
+    add_executable(test-sycl-lazy-plan-interface
+        tests/test-sycl-lazy-plan-interface.cpp)
+    target_link_libraries(test-sycl-lazy-plan-interface PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-plan-interface PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-plan-interface-1dev COMMAND test-sycl-lazy-plan-interface --devices 1)
+    set_tests_properties(test-sycl-lazy-plan-interface-1dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+    add_test(NAME test-sycl-lazy-plan-interface-2dev COMMAND test-sycl-lazy-plan-interface --devices 2)
+    set_tests_properties(test-sycl-lazy-plan-interface-2dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+
+    # The coverage wrapper (th32 §3.3, §11 T3): lazy_coverage_scope runs its entry FULL reap before its take and its
+    # closing FULL reap after its drop, scored by the registry's take-time snapshots with the guard's reap held in the
+    # hook. The registry lives in the backend's objects, so the binary links the private fixtures; it initialises no
+    # device, but it is registered gpu-serial and serial with the selector pinned like the other lazy-table tests.
+    # Lead-run.
+    add_executable(test-sycl-lazy-coverage-wrapper
+        tests/test-sycl-lazy-coverage-wrapper.cpp)
+    target_link_libraries(test-sycl-lazy-coverage-wrapper PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-coverage-wrapper PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-coverage-wrapper COMMAND test-sycl-lazy-coverage-wrapper)
+    set_tests_properties(test-sycl-lazy-coverage-wrapper PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120)
 
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and

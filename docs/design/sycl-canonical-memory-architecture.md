@@ -1520,7 +1520,7 @@ The target lock inventory and mandatory order is concrete:
 | L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
 | L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
 | L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `unified_cache::deferred_frees_mutex_` (held around owner releases and taken by the enqueue paths), `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()`, and, last, the device cache's SCRATCH marked set `unified_cache::marked_set_mutex_` (taken before any pool call; the pinned pool's `mutex_` is the one listed lock named inside it) | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
-| L5 | allocation/pool/work locks: first, the pinned host pool's `pinned_chunk_pool::mutex_` (`pinned-pool.hpp`; `grow_into` and the footprint reconcile nest `g_runtime_alloc_mutex` under it); current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, the host SCRATCH demand ledger's `host_scratch_ledger::mutex_` and the host holder plan's `host_holder_plans::mutex_` (both `host-zone-plan.hpp`), and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
+| L5 | allocation/pool/work locks: first, the pinned host pool's `pinned_chunk_pool::mutex_` (`pinned-pool.hpp`; `grow_into` and the footprint reconcile nest `g_runtime_alloc_mutex` under it); current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, the host SCRATCH demand ledger's `host_scratch_ledger::mutex_` and the host holder plan's `host_holder_plans::mutex_` (both `host-zone-plan.hpp`), the placement plans' `g_lifecycle_plan_mutex` (`unified-cache.cpp`), the lazy IO pool registry's `g_lazy_registry_mutex` (`lazy-io-pool.cpp`), and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, the zone-reset audit's `zone_audit_state::mutex` (`unified-cache.cpp`), and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
@@ -1659,6 +1659,57 @@ because it runs from `moe_control_conversion_guard`'s destructor on the failure
 path. `tests/test-sycl-moe-control-plan-contract.py` gates the noexcept rollback
 and the generation stamping; `test-moe-control-plan` proves the commit/rollback
 state machine.
+
+The lazy IO pool registry's `g_lazy_registry_mutex` (`lazy-io-pool.cpp`, th32
+T3; design `sycl-storage-tier-lazy-tables.md` §3.3) guards the registry's pool
+slot and generation, the reap list, every pool's lease count and DYING flag, the
+reap-run and parked counters with their take-time snapshots, and the
+PRIVATE_TESTING hold hook. It sits at L5 and is a **true leaf: nothing is taken
+under it.** No lock is acquired, nothing is allocated, freed or waited on, and
+nothing is logged while it is held. A take that finds no pool reserves the next
+generation under it, builds its pool and reap node after the unlock, and
+installs them under it only if the generation still matches, that is, if no take
+installed a pool meanwhile. A take that lost joins the pool installed meanwhile,
+or takes again when that pool has already parked; either way it destroys its own
+pool after the unlock. The drop that reaches zero marks the pool DYING and links
+the pool's preallocated node into the reap list, which allocates nothing. A
+`FULL` reap swaps the list out under it and frees the parked pools after the
+unlock. The hold hook, armed at the reap or at the take, runs with no lock held.
+A clone that finds its pool DYING unlocks before it logs and aborts. It may be
+taken while a non-leaf lock is held, as a clone under `g_tensor_inventory_mutex`
+will be. It is never taken while another global L5 lock is held:
+`g_lifecycle_plan_mutex` and the retained-handle store's mutex are never held
+when it is taken, and it is never held when they are taken, so the three have no
+order. Once `lazy_io_pool_mark_shut_down()` has run, a lease's drop decrements
+without taking it, so a lease destroyed during static destruction never touches
+it. The host SCRATCH ledger's and holder plan's mutexes are strict leaves, so
+they have no order with it either. No production path takes it yet: the load's
+stage and the plan dry run plan with a null coverage pin until the IO engine
+adopts the coverage wrapper.
+
+`g_lifecycle_plan_mutex` (`unified-cache.cpp`) guards the placement plans' three
+maps: the load candidates, the probe plans, and the published plans by model and
+load. It is ranked by what is held when it is taken, and that reaches L4:
+`unified_cache_note_model_load_end()` holds the global `g_cache_rw_mutex` shared
+while the load-end dump capture reads the candidate, and an allocation under a
+cache's `rw_mutex_` reads the bound load's candidate plan through
+`coherent_cache_placement_plan_owner()`. The stage and activation paths take it
+under the L1 `g_tensor_inventory_mutex`. No rank below L5 is consistent with
+those holders. Its critical sections are map lookups, inserts and erases and
+`shared_ptr` copies. A snapshot displaced or erased under it frees only heap
+memory, because a placement plan holds no allocation handle.
+
+One path is **not conforming**, and it is recorded here rather than implied
+away. `lifecycle_replace_placement_plan()` calls the MoE MMID workspace
+registry's `replace_plan()` under it, which takes that registry's
+`state::mutex` and, on the prepared-replacement branch, each old pool's
+`registry_pool_state::mutex` (`moe-mmid-workspace.cpp`). This table does not
+list either lock. On that branch an idle old context can be destroyed before
+those locks are released, and the final `mem_handle` of its pool blobs releases
+through `g_runtime_alloc_mutex`. That is a second global L5 lock co-held with
+this one, and a final destructor under a listed lock, both forbidden in this
+section. It stays a failing census item until the old context is moved out and
+destroyed after the unlocks and the MMID registry's locks are ranked.
 
 PP MoE oneDNN scratch admission (`moe-scratch-admission.hpp`, `ijla`) adds **no
 lock at all**, and that is a load-bearing property rather than an omission. The

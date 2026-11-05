@@ -18,6 +18,7 @@
 #include "host-reserve-env.hpp"
 #include "kv-region-registry.hpp"
 #include "kv-tier-manager.hpp"
+#include "lazy-io-pool.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
@@ -1015,11 +1016,18 @@ thread_local bool g_allocating_cache_backing = false;
 // starts at 0, at which host_ledger_try_charge refuses every charge until the first store. Phase (a)'s owner entry
 // passes warn_only, so its charge there logs a would-refuse WARN and is made.
 //
-// The committed bytes, the stored budget and the two yieldable counters publish no other data: each is read for its
-// own value alone, so the acquire, release and acq_rel orders on them order nothing else. The orders are kept as
-// documentation of intent, not relaxed. The yielder slots below are different: their handshake orders the callback.
+// The committed bytes, the stored budget, its sample's MemAvailable and override flag, and the two yieldable counters
+// publish no other data: each is read for its own value alone, so the acquire, release and acq_rel orders on them order
+// nothing else. The orders are kept as documentation of intent, not relaxed. The yielder slots below are different:
+// their handshake orders the callback.
 static std::atomic<size_t> g_host_ledger_committed{ 0 };
 static std::atomic<size_t> g_host_ledger_budget{ 0 };
+// The MemAvailable of the sample the stored budget was computed from, stored by the same writer beside it, so a load's
+// P3 reading (th32 §4.3 step 4) is the same sample as its budget, once per load transaction.
+static std::atomic<size_t> g_host_ledger_mem_available{ 0 };
+// Whether that budget is GGML_SYCL_HOST_RESERVE_MB's override rather than the computed one, stored by the same writer
+// from the same sample, so the plan lines (th32 §10) name the source of the budget they print.
+static std::atomic<bool>   g_host_ledger_budget_overridden{ false };
 static std::atomic<size_t> g_host_ledger_yieldable_bytes{ 0 };
 // The yieldable chunks behind those bytes: a yield makes at most one round per chunk counted at its first shortfall.
 static std::atomic<size_t> g_host_ledger_yieldable_chunks{ 0 };
@@ -1083,6 +1091,14 @@ size_t host_ledger_budget() {
 
 size_t host_ledger_committed() {
     return g_host_ledger_committed.load(std::memory_order_acquire);
+}
+
+size_t host_ledger_mem_available() {
+    return g_host_ledger_mem_available.load(std::memory_order_acquire);
+}
+
+bool host_ledger_budget_overridden() {
+    return g_host_ledger_budget_overridden.load(std::memory_order_acquire);
 }
 
 size_t host_ledger_yieldable_bytes() {
@@ -1178,6 +1194,9 @@ size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t comm
 size_t host_ledger_store_budget(const host_budget_sample & sample) {
     const size_t committed = g_host_ledger_committed.load(std::memory_order_acquire);
     const size_t budget    = host_ledger_compute_budget(sample, committed);
+    g_host_ledger_mem_available.store(sample.available_bytes, std::memory_order_release);
+    g_host_ledger_budget_overridden.store(sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE,
+                                          std::memory_order_release);
     g_host_ledger_budget.store(budget, std::memory_order_release);
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     g_test_host_ledger_stores.fetch_add(1, std::memory_order_acq_rel);
@@ -27951,7 +27970,10 @@ size_t unified_cache_host_zone_owner_check(alloc_lifetime lifetime, alloc_owner_
     for (size_t i = 0; i < owned.size(); i++) {
         owned[i].cohort = cohorts[i].c_str();
     }
-    return host_zone_owner_boundary_check(owned.data(), owned.size(), lifetime, owner, strict_lease_checks_enabled());
+    if (ggml_sycl_strict_enabled()) {
+        return host_zone_owner_boundary_check(owned.data(), owned.size(), lifetime, owner, /*strict=*/true);
+    }
+    return host_zone_owner_boundary_check(owned.data(), owned.size(), lifetime, owner, /*strict=*/false);
 }
 
 void * unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment) {
@@ -33711,23 +33733,296 @@ bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_b
     return false;
 }
 
-// Records the plan's host figures (th32 §4.2): the budget the planner's caller passed, its commit terms and their
-// total, read once populate_host_zone_sizing() has set every term. The budget is an input, never read here: a load
+// A STORAGE row cache's index row at `slots` slots (th32 §3.3, §6.3), lazy_row_cache_index_raw_bytes counted at
+// host_cpu_mapped_size as the ledger charges it; 0 for no slots.
+static size_t lazy_row_cache_index_bytes(size_t slots) {
+    const size_t index = lazy_row_cache_index_raw_bytes(slots);
+    return index != 0 ? host_cpu_mapped_size(index) : 0;
+}
+
+// A STORAGE row cache's resident bytes at `slots` slots (th32 §3.3, §6.3): the slab of slots x row_size in
+// LAZY_ROW_CACHE_CHUNK_BYTES chunks and the index row, each allocation counted at host_cpu_mapped_size, as the ledger
+// charges it.
+static size_t lazy_row_cache_resident_bytes(size_t slots, size_t row_size) {
+    const size_t slab  = slots * row_size;
+    size_t       bytes = (slab / LAZY_ROW_CACHE_CHUNK_BYTES) * host_cpu_mapped_size(LAZY_ROW_CACHE_CHUNK_BYTES);
+    if (slab % LAZY_ROW_CACHE_CHUNK_BYTES != 0) {
+        bytes += host_cpu_mapped_size(slab % LAZY_ROW_CACHE_CHUNK_BYTES);
+    }
+    return bytes + lazy_row_cache_index_bytes(slots);
+}
+
+// The most slots, from `floor_slots` up to `max_slots`, whose cache stays within `bytes`. The resident bytes never
+// fall as the slots grow, so a bisection finds it; the floor is returned when even it exceeds `bytes`.
+static size_t lazy_row_cache_slots_within(size_t floor_slots, size_t max_slots, size_t row_size, size_t bytes) {
+    size_t lo = floor_slots;
+    size_t hi = std::max(floor_slots, max_slots);
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo + 1) / 2;
+        if (lazy_row_cache_resident_bytes(mid, row_size) <= bytes) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+// A lazy table's yieldable bytes (th32 §6.4): what a STORAGE cache holds above its floor. A HOST table yields nothing.
+static size_t lazy_table_yieldable_bytes(const placement_lazy_table & table, size_t row_size) {
+    if (table.residency != lazy_residency::STORAGE) {
+        return 0;
+    }
+    return table.host_resident_bytes - lazy_row_cache_resident_bytes(table.cache_floor_slots, row_size);
+}
+
+std::string placement_lazy_table_fields(const placement_lazy_table & table, const placement_lazy_table_info * info) {
+    const std::string device = table.consumer_device >= 0 ? std::to_string(table.consumer_device) : "CPU";
+    std::string       fields = "table=" + std::to_string(table.table_bytes) +
+                         " resident=" + std::to_string(table.host_resident_bytes) +
+                         " cache_slots=" + std::to_string(table.cache_slots) +
+                         " floor_slots=" + std::to_string(table.cache_floor_slots) + " consumer_device=" + device;
+    if (info != nullptr) {
+        fields += " yieldable=" + std::to_string(lazy_table_yieldable_bytes(table, info->row_size)) +
+                  " consumer_layer=" + std::to_string(info->consumer_layer) +
+                  " rows_per_token=" + std::to_string(info->rows_per_token) +
+                  " file=" + std::to_string(info->file_index) + " off=" + std::to_string(info->file_offset);
+    }
+    return fields;
+}
+
+std::string placement_lazy_refusal_text(const placement_plan & plan) {
+    if (plan.lazy_refusal.empty()) {
+        return "none";
+    }
+    return plan.lazy_refusal_detail.empty() ? plan.lazy_refusal : plan.lazy_refusal + " " + plan.lazy_refusal_detail;
+}
+
+// The device that runs a lazy table's consumer layer: the device of a dense entry of that layer placed on a device,
+// -1 when the layer's dense weights are on the host, so the CPU runs it.
+static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_layer) {
+    for (const placement_entry & e : plan.entries) {
+        if (e.layer_id == consumer_layer && e.expert_id < 0 && e.on_device) {
+            return e.target_device >= 0 ? e.target_device : plan.device_id;
+        }
+    }
+    return -1;
+}
+
+// The lazy tables' residency (th32 §4.3 step 4), decided once the zone terms are set, so their total is step 2. Step 3
+// sets aside the context envelope, a named 0 until the SYCL_Host compute buffer is a planned tenant, and host_reserve =
+// max(2 GiB, 1% of the budget). The tables are taken in ascending consumer_layer (ties to the larger table, then the
+// name). A table is HOST when its mapped body fits what the budget leaves (the planner's fit) and P3 holds with it
+// resident (MemAvailable_pre - expected_host - 5 >= 24 GiB, against everything decided before it); otherwise it is
+// STORAGE when the coverage pin makes it eligible, at its cache floor of 2 x n_ubatch x rows_per_token slots, n_ubatch
+// read through placement_load_n_ubatch as the stage reads it; otherwise the plan refuses, naming the ring:
+// lazy-table-ring-unpinned with no pin, lazy-table-ring-too-narrow when the live ring's slot is narrower than the
+// table's read span. After the pass the block ring is sized over the STORAGE tables and charged unless the live ring
+// holds it; the floors and the ring must fit both the budget and P3, or the plan refuses as
+// lazy-table-cache-below-floor. What both leave above that is the STORAGE caches' yieldable share (§6.4), split in
+// proportion to table_bytes x rows_per_token. A cold expert class refuses as cold-set-not-implemented. A refused plan
+// carries no table and no ring, and host_planned_bytes is then the zone total.
+static void placement_plan_decide_lazy_residency(placement_plan &          plan,
+                                                 const placement_kv_info & kv_info,
+                                                 const ring_lease *        coverage_pin) {
+    constexpr size_t p3_floor   = 24ull << 30;            // P3: the MemAvailable a load must leave
+    constexpr size_t p3_runtime = 5ull << 30;             // P3's runtime allowance above expected_host
+    constexpr size_t p3_margin  = p3_floor + p3_runtime;  // expected_host + 29 GiB <= MemAvailable_pre
+    constexpr size_t envelope   = 0;                      // step 3's context envelope: no planned term exists yet
+
+    constexpr size_t reserve_floor = 2ull << 30;          // step 3: host_reserve's floor
+    constexpr size_t reserve_pct   = 1;                   // step 3: host_reserve's share of the budget, in percent
+    plan.lazy_tables.clear();
+    plan.lazy_refusal.clear();
+    plan.lazy_refusal_detail.clear();
+    plan.block_ring_qd       = 0;
+    plan.block_ring_span_max = 0;
+    plan.block_ring_need     = 0;
+    plan.block_ring_charge   = 0;
+    if (kv_info.lazy_tables.empty()) {
+        plan.host_planned_bytes = placement_plan_host_planned_bytes(plan);
+        return;
+    }
+
+    const size_t   step2      = plan.host_zone_terms.total();
+    const size_t   budget     = plan.host_budget;
+    const size_t   reserve    = std::max<size_t>(reserve_floor, budget / 100 * reserve_pct);
+    const size_t   mem_pre    = kv_info.host_mem_available_pre;
+    const size_t   fit_room   = host_ledger_sat_sub(budget, host_ledger_sat_add(step2, reserve + envelope));
+    const size_t   p3_room    = host_ledger_sat_sub(mem_pre, host_ledger_sat_add(step2, p3_margin));
+    const uint64_t ring_bytes = coverage_pin != nullptr ? coverage_pin->ring_bytes() : 0;
+
+    std::vector<size_t> order(kv_info.lazy_tables.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        const placement_lazy_table_info & x = kv_info.lazy_tables[a];
+        const placement_lazy_table_info & y = kv_info.lazy_tables[b];
+        if (x.consumer_layer != y.consumer_layer) {
+            return x.consumer_layer < y.consumer_layer;
+        }
+        if (x.table_bytes != y.table_bytes) {
+            return x.table_bytes > y.table_bytes;
+        }
+        return x.name < y.name;
+    });
+
+    // Each planned table's inputs, beside plan.lazy_tables, for the yieldable share and the plan lines.
+    std::vector<const placement_lazy_table_info *> table_info;
+    bool                                           any_storage = false;
+    size_t                                         used        = 0;  // the bytes decided so far: HOST bodies, floors
+
+    const auto refuse = [&](const char * reason, const std::string & detail) {
+        plan.lazy_tables.clear();
+        table_info.clear();
+        plan.block_ring_qd       = 0;
+        plan.block_ring_span_max = 0;
+        plan.block_ring_need     = 0;
+        plan.block_ring_charge   = 0;
+        plan.lazy_refusal        = reason;
+        plan.lazy_refusal_detail = detail;
+    };
+
+    if (kv_info.cold_expert_class) {
+        refuse("cold-set-not-implemented",
+               "tables=" + std::to_string(kv_info.lazy_tables.size()) +
+                   " (a cold expert class needs the joint cold-set placement, which is not implemented)");
+    }
+    for (size_t i = 0; i < order.size() && plan.lazy_refusal.empty(); ++i) {
+        const placement_lazy_table_info & info = kv_info.lazy_tables[order[i]];
+        placement_lazy_table              t;
+        t.name              = info.name;
+        t.table_bytes       = info.table_bytes;
+        t.consumer_device   = lazy_consumer_device(plan, info.consumer_layer);
+        t.cache_floor_slots = 2ull * placement_load_n_ubatch(kv_info.n_ubatch) * info.rows_per_token;
+        const size_t body   = host_cpu_mapped_size(info.table_bytes);
+        const size_t with   = host_ledger_sat_add(used, body);
+        const size_t span   = lazy_block_ring_span(info.row_size);
+        if (body != 0 && with <= fit_room && with <= p3_room) {
+            t.residency           = lazy_residency::HOST;
+            t.host_resident_bytes = body;
+            used                  = with;
+        } else if (coverage_pin != nullptr && (ring_bytes == 0 || span <= ring_bytes / LAZY_BLOCK_RING_QD)) {
+            t.residency              = lazy_residency::STORAGE;
+            t.cache_slots            = t.cache_floor_slots;
+            t.host_resident_bytes    = lazy_row_cache_resident_bytes(t.cache_slots, info.row_size);
+            used                     = host_ledger_sat_add(used, t.host_resident_bytes);
+            plan.block_ring_span_max = std::max(plan.block_ring_span_max, span);
+            any_storage              = true;
+        } else {
+            refuse(coverage_pin == nullptr ? "lazy-table-ring-unpinned" : "lazy-table-ring-too-narrow",
+                   "table=" + info.name + " mapped=" + std::to_string(body) + " fit_room=" + std::to_string(fit_room) +
+                       " p3_room=" + std::to_string(p3_room) + " decided=" + std::to_string(used) +
+                       " span=" + std::to_string(span) + " ring_bytes=" + std::to_string(ring_bytes));
+            break;
+        }
+        plan.lazy_tables.push_back(t);
+        table_info.push_back(&info);
+    }
+
+    if (plan.lazy_refusal.empty() && plan.block_ring_span_max != 0) {
+        plan.block_ring_qd     = LAZY_BLOCK_RING_QD;
+        plan.block_ring_need   = LAZY_BLOCK_RING_QD * plan.block_ring_span_max;
+        plan.block_ring_charge = ring_bytes >= plan.block_ring_need ? 0 : host_cpu_mapped_size(plan.block_ring_need);
+    }
+    const size_t needed = host_ledger_sat_add(used, plan.block_ring_charge);
+    if (plan.lazy_refusal.empty() && (needed > fit_room || needed > p3_room)) {
+        refuse("lazy-table-cache-below-floor",
+               "floors_and_bodies=" + std::to_string(used) + " ring_charge=" + std::to_string(plan.block_ring_charge) +
+                   " fit_room=" + std::to_string(fit_room) + " p3_room=" + std::to_string(p3_room));
+    }
+
+    if (plan.lazy_refusal.empty() && any_storage) {
+        const size_t avail  = std::min(fit_room, p3_room) - needed;
+        long double  weight = 0;
+        for (size_t i = 0; i < plan.lazy_tables.size(); ++i) {
+            if (plan.lazy_tables[i].residency == lazy_residency::STORAGE) {
+                weight += static_cast<long double>(table_info[i]->table_bytes) * table_info[i]->rows_per_token;
+            }
+        }
+        size_t given = 0;
+        for (size_t i = 0; i < plan.lazy_tables.size(); ++i) {
+            placement_lazy_table & t = plan.lazy_tables[i];
+            if (t.residency != lazy_residency::STORAGE) {
+                continue;
+            }
+            const placement_lazy_table_info & info  = *table_info[i];
+            const long double                 w     = static_cast<long double>(info.table_bytes) * info.rows_per_token;
+            size_t                            share = weight > 0 ? static_cast<size_t>(avail * (w / weight)) : 0;
+            share                                   = std::min(share, avail - given);
+            const size_t rows                       = info.row_size != 0 ? info.table_bytes / info.row_size : 0;
+            const size_t floor_res                  = t.host_resident_bytes;
+            t.cache_slots = lazy_row_cache_slots_within(t.cache_floor_slots, rows, info.row_size, floor_res + share);
+            t.host_resident_bytes = lazy_row_cache_resident_bytes(t.cache_slots, info.row_size);
+            given += t.host_resident_bytes - floor_res;
+        }
+    }
+    plan.host_planned_bytes = placement_plan_host_planned_bytes(plan);
+
+    // The plan lines (§10), WARN so a normal run shows them: one per planned table and one for the plan. They print
+    // every field the plan holds today, a table's through placement_lazy_table_fields and the refusal through
+    // placement_lazy_refusal_text, the formatters the dry run prints with; locked, output_slot, landing and cold_set
+    // wait for the rows that add them.
+    const size_t planned       = plan.host_planned_bytes;
+    const size_t leftover      = host_ledger_sat_sub(budget, host_ledger_sat_add(planned, reserve + envelope));
+    size_t       lazy_resident = 0;
+    size_t       yieldable     = 0;
+    size_t       n_host        = 0;
+    for (size_t i = 0; i < plan.lazy_tables.size(); ++i) {
+        const placement_lazy_table &      t      = plan.lazy_tables[i];
+        const placement_lazy_table_info & info   = *table_info[i];
+        const std::string                 fields = placement_lazy_table_fields(t, &info);
+        lazy_resident += t.host_resident_bytes;
+        yieldable += lazy_table_yieldable_bytes(t, info.row_size);
+        if (t.residency == lazy_residency::STORAGE) {
+            GGML_LOG_WARN("[PLACEMENT] lazy %s residency=STORAGE %s index=%zu\n", t.name.c_str(), fields.c_str(),
+                          lazy_row_cache_index_bytes(t.cache_slots));
+        } else {
+            ++n_host;
+            GGML_LOG_WARN("[PLACEMENT] lazy %s residency=HOST %s host_budget=%zu host_planned=%zu leftover=%zu\n",
+                          t.name.c_str(), fields.c_str(), budget, planned, leftover);
+        }
+    }
+    // weights= is the host weights at their exact bytes and named_terms= the zone's named terms, the two parts of the
+    // WEIGHT zone (§4.2); caches_carving= counts the caches that each build a zone set from this plan: every
+    // participating device's, until each plan builds one zone set (design §4.2, One zone set per plan).
+    const host_weight_zone_terms weight_terms   = placement_plan_host_weight_zone_terms(plan);
+    const size_t                 named_terms    = weight_terms.total() - weight_terms.host_weights;
+    const size_t                 caches_carving = plan.multi_device ? std::max<size_t>(1, plan.devices.size()) : 1;
+    const std::string            refusal        = placement_lazy_refusal_text(plan);
+    GGML_LOG_WARN(
+        "[HOST-PLAN] lazy device=%d budget=%zu source=%s planned=%zu weights=%zu named_terms=%zu kv=%zu zones=%zu "
+        "caches_carving=%zu envelope=%zu lazy_resident=%zu ring=%zu reserve=%zu leftover=%zu mem_available_pre=%zu "
+        "p3_post_load=%zu yieldable=%zu tables=%zu host=%zu storage=%zu refusal=%s\n",
+        plan.device_id, budget, kv_info.host_budget_overridden ? "GGML_SYCL_HOST_RESERVE_MB" : "computed", planned,
+        weight_terms.host_weights, named_terms, plan.host_zone_terms.kv, step2, caches_carving, envelope, lazy_resident,
+        plan.block_ring_charge, reserve, leftover, mem_pre,
+        host_ledger_sat_sub(mem_pre, host_ledger_sat_add(planned, p3_runtime)), yieldable, kv_info.lazy_tables.size(),
+        n_host, plan.lazy_tables.size() - n_host, refusal.c_str());
+}
+
+// Records the plan's host figures (th32 §4.2): the budget the planner's caller passed, its commit terms, and
+// host_planned_bytes, their total plus the lazy tables' terms the residency decision sets, read once
+// populate_host_zone_sizing() has set every term. The budget is an input, never read here: a load
 // passes the value its transaction stored, and a caller planning against another budget passes that one. One INFO
 // line names them. A plan whose host bytes exceed the budget logs one would-refuse WARN carrying each term and is kept
 // whole: phase (a) of th32 T2 refuses nothing. The cache supplies the live oneDNN scratch and the chunk size, which
 // the terms keep so a re-plan re-records from the same inputs; a plan made before any cache exists counts the default
 // chunk. A lookup before the device count is known would enumerate the devices, so it is skipped. The lookup creates
 // no cache and holds the cache lock shared once, for the find alone.
-static void record_host_ledger_plan(placement_plan & plan, size_t host_budget) {
+static void record_host_ledger_plan(placement_plan &          plan,
+                                    const placement_kv_info & kv_info,
+                                    size_t                    host_budget,
+                                    const ring_lease *        coverage_pin) {
     unified_cache * cache =
         g_total_gpu_count > 0 ? get_existing_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
     const size_t onednn_live =
         cache ? cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() : 0;
-    const size_t chunk               = cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
-    plan.host_budget                 = host_budget;
-    plan.host_zone_terms             = placement_plan_host_zone_commit_terms(plan, onednn_live, chunk);
-    plan.host_planned_bytes          = plan.host_zone_terms.total();
+    const size_t chunk   = cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
+    plan.host_budget     = host_budget;
+    plan.host_zone_terms = placement_plan_host_zone_commit_terms(plan, onednn_live, chunk);
+    placement_plan_decide_lazy_residency(plan, kv_info, coverage_pin);
     const host_zone_commit_terms & t = plan.host_zone_terms;
     GGML_LOG_INFO(
         "[HOST-LEDGER] device=%d plan host_budget=%zu host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu "
@@ -34611,9 +34906,10 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                                       const placement_kv_info &                           kv_info,
                                       const ggml_sycl_placement_envelope *                envelope,
                                       int                                                 n_experts,
-                                      size_t                                              host_budget) {
+                                      size_t                                              host_budget,
+                                      const ring_lease *                                  coverage_pin) {
     return compute_placement_plan(placement_tensor_inventory_from_pairs(tensor_inventory), vram_budget, device_id,
-                                  kv_info, envelope, n_experts, host_budget);
+                                  kv_info, envelope, n_experts, host_budget, coverage_pin);
 }
 
 // The KV phase's per-layer charge (llama.cpp-8ecj): each layer whose dense weights the dense pass put on `device_id`
@@ -35161,7 +35457,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                                       const placement_kv_info &                  kv_info,
                                       const ggml_sycl_placement_envelope *       envelope,
                                       int                                        n_experts,
-                                      size_t                                     host_budget) {
+                                      size_t                                     host_budget,
+                                      const ring_lease *                         coverage_pin) {
     if (envelope != nullptr) {
         GGML_LOG_INFO(
             "[PLACEMENT] envelope (from sycl-snapshot): n_ctx=%u n_ubatch=%u n_seq_max=%u flash_attn_type=%s\n",
@@ -35701,7 +35998,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     }
     placement_mark_device_entries_file_mapped(plan);
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
-    record_host_ledger_plan(plan, host_budget);
+    record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
 
     // Build the name->index lookup for O(1) queries
     plan.build_index();
@@ -36616,9 +36913,10 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          const placement_kv_info &                           kv_info,
                                          const ggml_sycl_placement_envelope *                envelope,
                                          int                                                 n_experts,
-                                         size_t                                              host_budget) {
+                                         size_t                                              host_budget,
+                                         const ring_lease *                                  coverage_pin) {
     return compute_multi_device_plan(device_budgets, placement_tensor_inventory_from_pairs(tensor_inventory), n_layers,
-                                     mode, kv_info, envelope, n_experts, host_budget);
+                                     mode, kv_info, envelope, n_experts, host_budget, coverage_pin);
 }
 
 placement_plan compute_multi_device_plan(const std::vector<device_budget> &         device_budgets,
@@ -36628,12 +36926,14 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          const placement_kv_info &                  kv_info,
                                          const ggml_sycl_placement_envelope *       envelope,
                                          int                                        n_experts,
-                                         size_t                                     host_budget) {
+                                         size_t                                     host_budget,
+                                         const ring_lease *                         coverage_pin) {
     // Single device: delegate to existing P4 path
     if (device_budgets.size() <= 1) {
         const int    dev    = device_budgets.empty() ? 0 : device_budgets[0].device_id;
         const size_t budget = device_budgets.empty() ? 0 : device_budgets[0].vram_budget;
-        return compute_placement_plan(tensor_inventory, budget, dev, kv_info, envelope, n_experts, host_budget);
+        return compute_placement_plan(tensor_inventory, budget, dev, kv_info, envelope, n_experts, host_budget,
+                                      coverage_pin);
     }
 
     const size_t n_devs = device_budgets.size();
@@ -37747,7 +38047,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     }
     placement_mark_device_entries_file_mapped(plan);
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
-    record_host_ledger_plan(plan, host_budget);
+    record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
 
     plan.build_index();
     publish_moe_host_scatter_term(plan, tensor_inventory, n_experts, kv_info.n_expert_used);

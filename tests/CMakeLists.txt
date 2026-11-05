@@ -4089,6 +4089,14 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-plan-dry-run-source.py
         LABEL "sycl;host;python;source-contract"
         TIMEOUT 120)
+    # th32 §3.2, §4.3 step 4: the coverage pin reaches every planner path, from the thread's plan slot at both stage
+    # calls through the pair overloads and the one-device delegation to the residency decision, and only the slot's
+    # scope writes the slot. A dropped forward compiles (the parameter defaults to nullptr), so one mutant per forward.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-lazy-plan-slot-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lazy-plan-slot-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
     # Host-resident weights are one published fact, and the loader binds SYCL_Mapped from it (design 5efe §4.3). A
     # plain script: --self-test requires each witness mutant to be caught, so an anchor that stops matching fails
     # instead of passing vacuously.

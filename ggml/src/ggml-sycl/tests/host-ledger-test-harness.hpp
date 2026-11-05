@@ -83,15 +83,20 @@ inline void log_clear() {
 }
 
 // The captured lines that contain `a`, and `b` too when it is given.
-inline size_t log_count_with(const char * a, const char * b = nullptr) {
+inline std::vector<std::string> log_lines_containing(const char * a, const char * b = nullptr) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
-    size_t                      n = 0;
+    std::vector<std::string>    out;
     for (const std::string & line : g_log_lines) {
         if (line.find(a) != std::string::npos && (b == nullptr || line.find(b) != std::string::npos)) {
-            ++n;
+            out.push_back(line);
         }
     }
-    return n;
+    return out;
+}
+
+// How many captured lines contain `a`, and `b` too when it is given.
+inline size_t log_count_with(const char * a, const char * b = nullptr) {
+    return log_lines_containing(a, b).size();
 }
 
 // The value printed after " <name>=" on the line, or SIZE_MAX when the name is absent.
