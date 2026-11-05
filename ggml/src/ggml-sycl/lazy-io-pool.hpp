@@ -91,14 +91,15 @@ enum class lazy_reap_scope : uint8_t {
 void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept;
 
 // Marks the registry shut down: from then on a take returns an empty lease and a lease's drop only decrements, so a
-// lease destroyed during static destruction never touches the registry's mutex. The lease drain at backend shutdown
-// sets it after its own FULL reap.
+// lease destroyed during static destruction never touches the registry's mutex. No production caller sets it yet: the
+// T5 engine (design §11 row T5) adds the lease drain at backend shutdown, which sets it after its own FULL reap.
 void lazy_io_pool_mark_shut_down() noexcept;
 
 // The one wrapper a planner caller holds around its planning (§3.3): its constructor runs the entry FULL reap, take_if
 // takes the provisional lease, pin() hands it to the planners, and its destructor drops the lease and then runs the
 // closing FULL reap, by member order (the reap guard is declared before the lease, so it is built first and destroyed
-// last). Declared in an unlocked context. It holds only the lease and pin().
+// last). Declared in an unlocked context. It holds only the lease and pin(). No production caller builds this scope
+// yet; the T5 engine (design §11 row T5) adds it.
 class lazy_coverage_scope {
   public:
     lazy_coverage_scope() noexcept                               = default;

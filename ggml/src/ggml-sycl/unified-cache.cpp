@@ -33375,7 +33375,7 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
                                                  const placement_kv_info & kv_info,
                                                  const ring_lease *        coverage_pin) {
     constexpr size_t p3_floor   = 24ull << 30;            // P3: the MemAvailable a load must leave
-    constexpr size_t p3_runtime = 5ull << 30;             // 9g22's runtime allowance above expected_host
+    constexpr size_t p3_runtime = 5ull << 30;             // P3's runtime allowance above expected_host
     constexpr size_t p3_margin  = p3_floor + p3_runtime;  // expected_host + 29 GiB <= MemAvailable_pre
     constexpr size_t envelope   = 0;                      // step 3's context envelope: no planned term exists yet
     plan.lazy_tables.clear();

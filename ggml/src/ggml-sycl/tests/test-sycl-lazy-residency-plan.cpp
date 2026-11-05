@@ -52,7 +52,7 @@ namespace {
 constexpr uint64_t MiB = 1024ull * 1024ull;
 constexpr uint64_t GiB = 1024ull * MiB;
 
-// P3's margin over expected_host: 24 GiB left after load, plus 9g22's 5 GiB (§4.3 step 4).
+// P3's margin over expected_host: 24 GiB left after load, plus P3's 5 GiB runtime allowance (§4.3 step 4).
 constexpr uint64_t k_p3_margin = 29 * GiB;
 // The budget the planner is handed: far above every plan here, so the fit never decides.
 constexpr uint64_t k_budget    = 4096 * GiB;

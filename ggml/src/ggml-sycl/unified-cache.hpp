@@ -2222,13 +2222,6 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
     return terms;
 }
 
-// Re-records `plan`'s host figures after a re-plan moved one of its zone terms past the record (th32 §4.2): the commit
-// terms, from the inputs the record took, and their total, host_planned_bytes. Each writer that moves a term after the
-// record re-records what it moved: the KV refresh when it raises host_zone_kv_bytes, and the runtime MMID re-plan when
-// its host pool grows host_zone_scratch_bytes. Any other write after the record records nothing, so configuring that
-// plan names the bytes it does not count (§10's zone check). A plan never recorded holds no chunk, so its terms stay
-// empty. Nothing is logged: the would-refuse line is the planner pass's own, and the runtime transaction re-plans on
-// every probe.
 // The lazy tables' part of host_planned_bytes (th32 §4.3 step 4): each table's host_resident_bytes and the block ring's
 // charge, the bytes the zone terms do not hold.
 inline size_t placement_plan_lazy_host_bytes(const placement_plan & plan) {
@@ -2245,6 +2238,13 @@ inline size_t placement_plan_host_planned_bytes(const placement_plan & plan) {
     return plan.host_zone_terms.total() + placement_plan_lazy_host_bytes(plan);
 }
 
+// Re-records `plan`'s host figures after a re-plan moved one of its zone terms past the record (th32 §4.2): the commit
+// terms, from the inputs the record took, and their total, host_planned_bytes. Each writer that moves a term after the
+// record re-records what it moved: the KV refresh when it raises host_zone_kv_bytes, and the runtime MMID re-plan when
+// its host pool grows host_zone_scratch_bytes. Any other write after the record records nothing, so configuring that
+// plan names the bytes it does not count (§10's zone check). A plan never recorded holds no chunk, so its terms stay
+// empty. Nothing is logged: the would-refuse line is the planner pass's own, and the runtime transaction re-plans on
+// every probe.
 inline void placement_plan_rerecord_host_zone_terms(placement_plan & plan) {
     plan.host_zone_terms =
         placement_plan_host_zone_commit_terms(plan, plan.host_zone_terms.onednn_live, plan.host_zone_terms.chunk);

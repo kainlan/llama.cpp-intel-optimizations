@@ -2481,10 +2481,11 @@ GGML_BACKEND_API bool ggml_sycl_test_host_cpu_live_bytes(uint64_t * live_bytes);
 // The lazy tables' planning seams (th32 §3.3, §11 T3), for a fixture that calls a planner entry directly.
 // plan_effect_begin makes `load_txn_id` this thread's staged-load transaction, as the stage does around its planner
 // calls, so the entry stages its plan as that load's candidate; it returns the id it replaced, which plan_effect_end
-// restores. coverage_pin_make takes a coverage pin through the IO pool's registry (ring_bytes 0 only: lazy-io-pool.hpp)
-// and coverage_pin_release drops it and runs the closing reap. lazy_slot_begin publishes a pin on this thread's plan
-// slot, the one the planner caller reads, and returns the scope lazy_slot_end closes. Each pair nests: close them in
-// reverse order, on the thread that opened them.
+// restores. It sets the transaction only, not the owner token the stage sets beside it, so a plan made under it skips
+// the dense scratch planning, which is keyed by that owner. coverage_pin_make takes a coverage pin through the IO
+// pool's registry (ring_bytes 0 only: lazy-io-pool.hpp) and coverage_pin_release drops it and runs the closing reap.
+// lazy_slot_begin publishes a pin on this thread's plan slot, the one the planner caller reads, and returns the scope
+// lazy_slot_end closes. Each pair nests: close them in reverse order, on the thread that opened them.
 GGML_BACKEND_API uint64_t ggml_sycl_test_plan_effect_begin(uint64_t load_txn_id);
 GGML_BACKEND_API void     ggml_sycl_test_plan_effect_end(uint64_t previous_txn_id);
 GGML_BACKEND_API void *   ggml_sycl_test_coverage_pin_make(uint64_t ring_bytes);

@@ -261,7 +261,8 @@ arm_result arm_b_the_slot_reaches_the_planner() {
 // Engagement: the planner's [HOST-PLAN] lazy line carries refusal=lazy-table-ring-unpinned, so the stage was shown a
 // refused plan.
 // Mutants: the stage's refusal check dropped (the early stage returns OK and the load goes on with a plan that holds no
-// table); the WARN printed once per device or at both checks (the count is not 1).
+// table); the WARN printed at both checks (the count is not 1). A WARN printed once per device is not among them: both
+// registrations expose one device to the backend (see the header), so it would still print once.
 arm_result arm_c_the_stage_refuses_a_refused_plan() {
     arm_result                arr;
     loader_inventory          inv;

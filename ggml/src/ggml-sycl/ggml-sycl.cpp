@@ -17761,15 +17761,18 @@ static size_t ggml_sycl_plan_single_device_budget(int device, size_t vram_budget
 
 thread_local uint64_t g_sycl_plan_load_effect_txn = 0;
 
-// The lazy tables' coverage pin for the plan this thread is building (th32 §3.3): the planner caller publishes the pin
-// of its lazy_coverage_scope here through lazy_plan_slot_scope, and compute_and_store_plan_for_inventory reads it at
-// its planner calls, so a planning entry reached through any caller plans against the lease that caller holds. Null
-// outside such a scope: a plan made then makes no lazy table STORAGE-eligible.
+// The lazy tables' coverage pin for the plan this thread is building (th32 §3.3): a planner caller publishes the pin of
+// its lazy_coverage_scope here through lazy_plan_slot_scope, and compute_and_store_plan_for_inventory reads it at its
+// planner calls, so a planning entry reached through any caller plans against the lease that caller holds. Null outside
+// such a scope: a plan made then makes no lazy table STORAGE-eligible. No production caller builds the scope yet; the
+// T5 engine (design §11 row T5) adds it. Until then the slot is null on every load, so a table that fails the HOST test
+// refuses the plan as lazy-table-ring-unpinned.
 thread_local const ggml_sycl::ring_lease * g_sycl_lazy_plan_slot = nullptr;
 
 // Publishes a coverage pin on this thread's plan slot for the scope's lifetime and restores the previous slot after it,
-// so scopes nest. The production constructor takes the caller's lazy_coverage_scope, so the slot only ever names a
-// lease a live scope holds; the testing one takes a fixture's pin guard, which holds its lease the same way.
+// so scopes nest. The constructor that takes a lazy_coverage_scope is the one a planner caller uses, so the slot only
+// ever names a lease a live scope holds; nothing in production constructs it yet (T5 adds that caller). The testing one
+// takes a fixture's pin guard, which holds its lease the same way.
 class lazy_plan_slot_scope {
   public:
     explicit lazy_plan_slot_scope(const ggml_sycl::lazy_coverage_scope & coverage) noexcept :

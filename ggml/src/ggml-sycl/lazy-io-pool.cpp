@@ -152,8 +152,8 @@ void ring_lease::reset() noexcept {
 // that lost joins the pool the winner installed; when that pool has already parked, the loser destroys its own after
 // the unlock and takes again. So a loser never installs, and no two pools carry one generation.
 //
-// LAZY_IO_POOL_MUTANT_INSTALL_ON_EMPTY_SLOT installs on an empty slot instead, the rule this replaced: a take whose
-// generation another take installed and parked during its build then installs a second pool of that generation. Only
+// LAZY_IO_POOL_MUTANT_INSTALL_ON_EMPTY_SLOT installs on an empty slot whatever the generation: a take whose generation
+// another take installed and parked during its build then installs a second pool of that generation. Only
 // test-sycl-lazy-io-pool-host's mutant target defines it.
 ring_lease lazy_io_pool_take() {
     for (;;) {
