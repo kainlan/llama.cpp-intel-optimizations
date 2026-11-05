@@ -274,6 +274,71 @@ arm_result arm_c_the_stage_refuses_a_refused_plan() {
     return arr;
 }
 
+// (d) The late pass refuses on its own check (th32 §4.3 step 4): the early stage, with a fixture's pin on the thread's
+// plan slot, plans a ~1 TiB table STORAGE and returns OK; with the slot closed, the late stage's plan cannot hold the
+// table (no pin, and it exceeds the budget), so it refuses as lazy-table-ring-unpinned, and the late stage returns
+// PLAN_REJECTED with exactly one load-refused WARN, the late check's (early=0), and none from the early check.
+// Engagement: the pin holds a lease, the early stage returns OK with its candidate carrying the table, and the late
+// plan's [HOST-PLAN] lazy line carries refusal=lazy-table-ring-unpinned.
+// Mutant: the late pass's refusal check dropped (the late stage configures the refused plan's host zones and returns
+// OK).
+arm_result arm_d_the_late_pass_refuses() {
+    arm_result                arr;
+    loader_inventory          inv;
+    ggml_sycl_lazy_table_info table = lazy_table("blk.14.engram_embd.weight", static_cast<int64_t>((1024 * GiB) / 34));
+    inv.inv.lazy_tables             = &table;
+    inv.inv.lazy_table_count        = 1;
+
+    const ggml_sycl_placement_envelope envelope{ inv.inv.n_ctx, inv.inv.n_ubatch, 1, -1 };
+
+    ggml_sycl_load_txn txn{};
+    if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(arr, "the load transaction did not begin");
+        return arr;
+    }
+    const ggml_sycl::lazy_registry_state before = registry();
+    void *                               pin    = ggml_sycl_test_coverage_pin_make(0);
+    const ggml_sycl::lazy_registry_state after  = registry();
+    if (pin == nullptr || after.live_leases <= before.live_leases) {
+        ggml_sycl_test_coverage_pin_release(pin);
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        void_arm(arr, "the pin holds no lease: the registry's live leases went from " + num(before.live_leases) +
+                          " to " + num(after.live_leases) + " across coverage_pin_make");
+        return arr;
+    }
+    log_clear();
+    void *                           slot     = ggml_sycl_test_lazy_slot_begin(pin);
+    const ggml_sycl_lifecycle_result early_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, true);
+    ggml_sycl_test_lazy_slot_end(slot);
+    const lazy_reading early = read_candidate(txn);
+    if (early_rc != GGML_SYCL_LIFECYCLE_OK || !early.ok || early.count != 1) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        ggml_sycl_test_coverage_pin_release(pin);
+        void_arm(arr, "the early stage with a pin on the slot returned " + num(early_rc) + " with " +
+                          (early.ok ? num(early.count) + " lazy tables" : std::string("no candidate")) +
+                          ", want OK with 1");
+        return arr;
+    }
+    const ggml_sycl_lifecycle_result late_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, false);
+    (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    ggml_sycl_test_coverage_pin_release(pin);
+
+    if (log_lines_containing("[HOST-PLAN] lazy ", "refusal=lazy-table-ring-unpinned").empty()) {
+        void_arm(arr, "no plan line carries refusal=lazy-table-ring-unpinned, so the late stage saw no refused plan");
+        return arr;
+    }
+    expect(arr, late_rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
+           "the late stage returned " + num(late_rc) + ", want PLAN_REJECTED (" +
+               num(GGML_SYCL_LIFECYCLE_PLAN_REJECTED) + ")");
+    const size_t late_warned =
+        log_lines_containing("[HOST-PLAN] load refused: lazy-table-ring-unpinned ", "(early=0)").size();
+    const size_t early_warned = log_lines_containing("[HOST-PLAN] load refused: ", "(early=1)").size();
+    expect(arr, late_warned == 1 && early_warned == 0,
+           "the two stages logged " + num(late_warned) + " late and " + num(early_warned) +
+               " early load-refused lines, want 1 late naming lazy-table-ring-unpinned and no early one");
+    return arr;
+}
+
 // (e) An inventory naming lazy tables with no array behind the count is refused at the stage as a null tensor array is,
 // with NULL_OUTPUT, before anything reads it (th32 §4.1).
 // Engagement: the same inventory with the array present, staged with no load open, is refused for the transaction
@@ -369,6 +434,7 @@ int main(int argc, char ** argv) {
         { "(a) a table through the stage, the publish and the unload", arm_a_through_the_stage                     },
         { "(b) the thread's plan slot reaches the planner",            arm_b_the_slot_reaches_the_planner          },
         { "(c) a refused plan refuses the load at the stage",          arm_c_the_stage_refuses_a_refused_plan      },
+        { "(d) the late pass refuses a plan the early pass held",      arm_d_the_late_pass_refuses                 },
         { "(e) the stage refuses a lazy count with no array",          arm_e_stage_refuses_a_count_with_no_array   },
         // Last: with its check dropped the dry run faults the binary.
         { "(f) the dry run refuses a lazy count with no array",        arm_f_dry_run_refuses_a_count_with_no_array },

@@ -34,6 +34,7 @@
 #include "lazy-table-test-util.hpp"
 #include "sycl-test-skip.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -115,21 +116,23 @@ size_t floor_upper_bytes(const placement_lazy_table_info & t, const placement_kv
 
 // The plan for `shape` and `kv` against the --devices count: every device gets a 1 MiB VRAM budget, so the weights are
 // host-resident and step 2 is the host zones they size. `delegate` routes a one-device plan through
-// compute_multi_device_plan's one-budget delegation instead of compute_placement_plan.
+// compute_multi_device_plan's one-budget delegation instead of compute_placement_plan; `host_budget` is the host
+// budget the planner is handed.
 placement_plan plan_for(const moe_shape &         shape,
                         const placement_kv_info & kv,
                         const ring_lease *        pin,
-                        bool                      delegate = false) {
+                        bool                      delegate    = false,
+                        uint64_t                  host_budget = k_budget) {
     const std::vector<placement_tensor_info> inventory = planner_inventory(shape);
     if (g_devices == 1 && !delegate) {
-        return compute_placement_plan(inventory, 1 * MiB, 0, kv, nullptr, shape.experts, k_budget, pin);
+        return compute_placement_plan(inventory, 1 * MiB, 0, kv, nullptr, shape.experts, host_budget, pin);
     }
     std::vector<device_budget> budgets;
     for (int d = 0; d < g_devices; ++d) {
         budgets.push_back({ d, 1 * MiB, 16ull * 1024ull * MiB, 1.0, true });
     }
     return compute_multi_device_plan(budgets, inventory, shape.layers, multi_gpu_mode::HYBRID, kv, nullptr,
-                                     shape.experts, k_budget, pin);
+                                     shape.experts, host_budget, pin);
 }
 
 placement_kv_info kv_with(const std::vector<placement_lazy_table_info> & tables, size_t reading) {
@@ -465,6 +468,113 @@ arm_result arm_f_cold_class_refuses() {
     return r;
 }
 
+// The block ring's mapped charge over `tables` when all are STORAGE and the pool has no ring: QD x the widest span.
+size_t ring_charge_upper(const std::vector<placement_lazy_table_info> & tables) {
+    size_t span = 0;
+    for (const placement_lazy_table_info & t : tables) {
+        span = std::max(span, lazy_block_ring_span(t.row_size));
+    }
+    return mapped(LAZY_BLOCK_RING_QD * span);
+}
+
+// (g) The planner's fit decides a table's residency as well as P3: with the host budget at step 2 plus blk.1's mapping,
+// what it leaves after host_reserve holds neither table, so at a reading where P3 holds both HOST, both are STORAGE.
+// Engagement: the same tables at the same reading against the 4 TiB budget are both HOST, so the budget moved them,
+// and what the tight budget leaves after host_reserve holds both floors and the ring.
+// Mutant: the HOST test without its fit half (both pass P3 HOST, their bodies overflow what the budget leaves, and the
+// plan refuses as lazy-table-cache-below-floor with no table).
+arm_result arm_g_the_fit_decides() {
+    arm_result                                   r;
+    const lazy_test_coverage_pin                 pin    = ggml_sycl_test_make_coverage_pin(0);
+    const std::vector<placement_lazy_table_info> tables = deepseek_tables();
+    size_t                                       step2  = 0;
+    if (!step2_of(r, ds_shape, pin.pin(), step2)) {
+        return r;
+    }
+    const size_t            reading  = step2 + 512 * GiB;
+    const size_t            budget   = step2 + mapped(tables[0].table_bytes);
+    const placement_kv_info kv       = kv_with(tables, reading);
+    // host_reserve = max(2 GiB, 1% of the budget), as the decision sets it aside (§4.3 step 3).
+    const size_t            fit_room = budget - step2 - std::max<size_t>(2 * GiB, budget / 100);
+    const size_t            floors =
+        floor_upper_bytes(tables[0], kv) + floor_upper_bytes(tables[1], kv) + ring_charge_upper(tables);
+    std::printf("  fit: step2=%zu budget=%zu fit_room=%zu floors=%zu reading=%zu\n", step2, budget, fit_room, floors,
+                reading);
+    const placement_plan open = plan_for(ds_shape, kv, pin.pin());
+    for (const placement_lazy_table_info & t : tables) {
+        const placement_lazy_table * h = find_table(open, t.name);
+        if (h == nullptr || h->residency != lazy_residency::HOST) {
+            fail(r, "engagement: against the 4 TiB budget " + t.name + " is " +
+                        (h == nullptr ? "not in the plan (refusal '" + placement_lazy_refusal_text(open) + "')" :
+                                        std::string(residency_name(h->residency))) +
+                        ", want HOST");
+            return r;
+        }
+    }
+    if (fit_room < floors) {
+        fail(r, "engagement: what the tight budget leaves after host_reserve, " + num(fit_room) +
+                    ", does not hold both floors and the ring, " + num(floors));
+        return r;
+    }
+    const placement_plan tight = plan_for(ds_shape, kv, pin.pin(), false, budget);
+    expect_same_step2(r, tight, step2, "at the tight budget: ");
+    expect(r, tight.lazy_refusal.empty(),
+           "at the tight budget the plan refused: " + placement_lazy_refusal_text(tight));
+    for (const placement_lazy_table_info & t : tables) {
+        expect_storage(r, tight, t, kv, "at the tight budget: ");
+    }
+    expect_pin_held(r, pin);
+    return r;
+}
+
+// (h) The floors must fit P3: at a reading that leaves half of blk.1's floor slab above step 2 and the margin, neither
+// table can be HOST and the two floors cannot both be held, so the plan refuses as lazy-table-cache-below-floor, naming
+// the P3 room it had, and carries no table and no ring.
+// Engagement: at a reading that leaves both floors' upper bounds, the ring's mapping and 1 GiB above step 2 and the
+// margin, both tables are STORAGE and the plan refuses nothing.
+// Mutant: the below-floor refusal dropped (the plan carries both tables at floors P3 cannot hold).
+arm_result arm_h_floors_past_p3_refuse() {
+    arm_result                                   r;
+    const lazy_test_coverage_pin                 pin    = ggml_sycl_test_make_coverage_pin(0);
+    const std::vector<placement_lazy_table_info> tables = deepseek_tables();
+    size_t                                       step2  = 0;
+    if (!step2_of(r, ds_shape, pin.pin(), step2)) {
+        return r;
+    }
+    const placement_kv_info sizing     = kv_with(tables, 0);
+    const size_t            short_room = floor_raw_bytes(tables[0], sizing) / 2;
+    const size_t            full_room  = floor_upper_bytes(tables[0], sizing) + floor_upper_bytes(tables[1], sizing) +
+                             ring_charge_upper(tables) + 1 * GiB;
+    std::printf("  below floor: step2=%zu short_room=%zu full_room=%zu\n", step2, short_room, full_room);
+
+    const placement_plan fits = plan_for(ds_shape, kv_with(tables, step2 + k_p3_margin + full_room), pin.pin());
+    for (const placement_lazy_table_info & t : tables) {
+        const placement_lazy_table * s = find_table(fits, t.name);
+        if (!fits.lazy_refusal.empty() || s == nullptr || s->residency != lazy_residency::STORAGE) {
+            fail(r, "engagement: with " + num(full_room) + " bytes of P3 room " + t.name + " is " +
+                        (s == nullptr ? std::string("not in the plan") : std::string(residency_name(s->residency))) +
+                        " and the refusal '" + placement_lazy_refusal_text(fits) + "', want STORAGE and none");
+            return r;
+        }
+    }
+    const placement_plan plan = plan_for(ds_shape, kv_with(tables, step2 + k_p3_margin + short_room), pin.pin());
+    expect_same_step2(r, plan, step2, "");
+    expect(r, plan.lazy_refusal == "lazy-table-cache-below-floor",
+           "with " + num(short_room) + " bytes of P3 room the refusal is '" + placement_lazy_refusal_text(plan) +
+               "', want lazy-table-cache-below-floor");
+    expect(r, plan.lazy_refusal_detail.find("p3_room=" + num(short_room)) != std::string::npos,
+           "the refusal's figures '" + plan.lazy_refusal_detail + "' do not name p3_room=" + num(short_room));
+    expect(r, plan.lazy_tables.empty(), "a refused plan carries " + num(plan.lazy_tables.size()) + " tables");
+    expect(
+        r, plan.block_ring_need == 0 && plan.block_ring_charge == 0,
+        "a refused plan carries a ring: need " + num(plan.block_ring_need) + ", charge " + num(plan.block_ring_charge));
+    expect(r, plan.host_planned_bytes == plan.host_zone_terms.total(),
+           "a refused plan's host figure " + num(plan.host_planned_bytes) + " is not its zone total " +
+               num(plan.host_zone_terms.total()));
+    expect_pin_held(r, pin);
+    return r;
+}
+
 // (i) A load whose inventory names no micro-batch (n_ubatch 0) floors each cache at the load's default micro-batch,
 // PLACEMENT_LOAD_N_UBATCH_DEFAULT, through placement_load_n_ubatch, the rule the stage's dense scratch reads: at arm
 // (b)'s reading DeepSeek's tables are both STORAGE at the floors that default gives.
@@ -537,6 +647,8 @@ int main(int argc, char ** argv) {
         { "(d) Qwen PLE flips at its P3 threshold",           arm_d_qwen_flip                                    },
         { "(e) a null pin refuses lazy-table-ring-unpinned",  arm_e_null_pin_refuses                             },
         { "(f) a cold expert class refuses by name",          arm_f_cold_class_refuses                           },
+        { "(g) the planner's fit keeps both tables STORAGE",  arm_g_the_fit_decides                              },
+        { "(h) floors past P3 refuse as cache-below-floor",   arm_h_floors_past_p3_refuse                        },
         { "(i) an unnamed micro-batch floors at the default", arm_i_an_unnamed_micro_batch_floors_at_the_default },
     };
     if (g_devices == 1) {
