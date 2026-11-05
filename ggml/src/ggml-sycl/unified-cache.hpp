@@ -2238,6 +2238,17 @@ inline size_t placement_plan_host_planned_bytes(const placement_plan & plan) {
     return plan.host_zone_terms.total() + placement_plan_lazy_host_bytes(plan);
 }
 
+// One lazy table's fields as every lazy line prints them (th32 §10), so the planner's [PLACEMENT] lazy lines and the
+// dry run's [PLAN-DRY-RUN] LAZY lines name each alike: table=, resident=, cache_slots=, floor_slots= and
+// consumer_device=, the consumer's device or CPU. Given the table's inventory record `info`, it appends what only that
+// record holds: yieldable=, the STORAGE cache's bytes above its floor (0 for HOST), consumer_layer=, rows_per_token=,
+// file= and off=.
+std::string placement_lazy_table_fields(const placement_lazy_table & table, const placement_lazy_table_info * info);
+
+// The plan's lazy refusal as every lazy line prints it: none, or the reason followed by the figures the planner
+// recorded with it.
+std::string placement_lazy_refusal_text(const placement_plan & plan);
+
 // Re-records `plan`'s host figures after a re-plan moved one of its zone terms past the record (th32 §4.2): the commit
 // terms, from the inputs the record took, and their total, host_planned_bytes. Each writer that moves a term after the
 // record re-records what it moved: the KV refresh when it raises host_zone_kv_bytes, and the runtime MMID re-plan when

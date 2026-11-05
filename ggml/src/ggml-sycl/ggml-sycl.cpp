@@ -18492,8 +18492,8 @@ static bool ggml_sycl_stage_refuse_lazy_plan(const ggml_sycl::placement_plan * p
     if (plan == nullptr || plan->lazy_refusal.empty()) {
         return false;
     }
-    GGML_LOG_WARN("[HOST-PLAN] load refused: %s %s (early=%d)\n", plan->lazy_refusal.c_str(),
-                  plan->lazy_refusal_detail.c_str(), early ? 1 : 0);
+    GGML_LOG_WARN("[HOST-PLAN] load refused: %s (early=%d)\n", ggml_sycl::placement_lazy_refusal_text(*plan).c_str(),
+                  early ? 1 : 0);
     return true;
 }
 
@@ -18750,27 +18750,22 @@ static void ggml_sycl_plan_dry_run_residency(uint32_t                          i
 }
 
 // The lazy tables of `plan` as the plan decided them (th32 §4.3 step 4, §10): one LAZY line per table carrying the
-// plan's fields for it, named as on the planner's [PLACEMENT] lazy line, then one LAZY line for the plan: its tables'
-// host_resident_bytes, the block ring's need and charge, and its refusal, `none` or the reason with the figures the
-// planner recorded. A refused plan holds no table, so its refusal is the whole of its lazy report. Nothing is decided
-// here.
+// plan's fields for it through placement_lazy_table_fields, the formatter the planner's [PLACEMENT] lazy lines use,
+// then one LAZY line for the plan: its tables' host_resident_bytes, the block ring's need and charge, and its refusal
+// through placement_lazy_refusal_text. A refused plan holds no table, so its refusal is the whole of its lazy report.
+// Nothing is decided here.
 static void ggml_sycl_plan_dry_run_lazy(uint32_t index, const ggml_sycl::placement_plan & plan) {
     size_t resident = 0;
     for (const ggml_sycl::placement_lazy_table & t : plan.lazy_tables) {
-        const bool        storage = t.residency == ggml_sycl::lazy_residency::STORAGE;
-        const std::string device  = t.consumer_device >= 0 ? std::to_string(t.consumer_device) : "CPU";
         resident += t.host_resident_bytes;
-        GGML_LOG_INFO(
-            "[PLAN-DRY-RUN] plan=%u device=%d LAZY %s residency=%s table=%zu resident=%zu cache_slots=%zu "
-            "floor_slots=%zu consumer_device=%s\n",
-            index, plan.device_id, t.name.c_str(), storage ? "STORAGE" : "HOST", t.table_bytes, t.host_resident_bytes,
-            t.cache_slots, t.cache_floor_slots, device.c_str());
+        GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d LAZY %s residency=%s %s\n", index, plan.device_id,
+                      t.name.c_str(), t.residency == ggml_sycl::lazy_residency::STORAGE ? "STORAGE" : "HOST",
+                      ggml_sycl::placement_lazy_table_fields(t, nullptr).c_str());
     }
     GGML_LOG_INFO(
-        "[PLAN-DRY-RUN] plan=%u device=%d LAZY tables=%zu lazy_resident=%zu ring_need=%zu ring=%zu refusal=%s%s%s\n",
-        index, plan.device_id, plan.lazy_tables.size(), resident, plan.block_ring_need, plan.block_ring_charge,
-        plan.lazy_refusal.empty() ? "none" : plan.lazy_refusal.c_str(), plan.lazy_refusal_detail.empty() ? "" : " ",
-        plan.lazy_refusal_detail.c_str());
+        "[PLAN-DRY-RUN] plan=%u device=%d LAZY tables=%zu lazy_resident=%zu ring_need=%zu ring=%zu refusal=%s\n", index,
+        plan.device_id, plan.lazy_tables.size(), resident, plan.block_ring_need, plan.block_ring_charge,
+        ggml_sycl::placement_lazy_refusal_text(plan).c_str());
 }
 
 // Reports plan `index`: every host term from the plan's own record, each printed on its own line under its name. The

@@ -12,8 +12,8 @@ cannot see:
    terms from `placement_plan_host_weight_zone_terms`, reports expected_host as the plan's `host_planned_bytes`, sizes
    the commit terms from the plan's own `host_zone_terms` inputs, and shares the stage's inventory and budget helpers
    rather than restating them; it prints the plan's lazy tables, each one's residency, and the plan's refusal on
-   [PLAN-DRY-RUN] LAZY lines from the plan's own fields, and its host_planned_bytes check counts the lazy terms through
-   the helper the plan's sum uses;
+   [PLAN-DRY-RUN] LAZY lines from the plan's own fields, through the two formatters the planner's lines print with,
+   and its host_planned_bytes check counts the lazy terms through the helper the plan's sum uses;
 3. the dry run stores nothing: no `host_ledger_store_budget`, no `host_budget_pass_scope`, no zone configuration, no
    cache construction, no backend or queue initialisation, no write of the inventory globals; the shared helpers store
    nothing either;
@@ -35,7 +35,9 @@ cannot see:
    the planned bytes and the leftover, and the [HOST-PLAN] lazy line the budget's source, the host weights, the WEIGHT
    zone's named terms, the host KV and the caches carving the zones. The budget's source is a planner input beside the
    budget: the load copies the ledger's flag stored with its budget, the dry run its own sample's, and the decision
-   reads neither the ledger nor the environment.
+   reads neither the ledger nor the environment. Every lazy line prints a table's fields through
+   placement_lazy_table_fields and a refusal through placement_lazy_refusal_text, so no line builds the consumer's
+   device name or the refusal text itself.
 
 Plain file I/O, comment-stripped text.
 """
@@ -259,25 +261,63 @@ def test_the_residency_seam_is_named():
 
 # The lazy tables (th32 §4.3 step 4, §10): the plan decides each table's residency and records a refusal, and the dry
 # run prints what the plan holds, never a second computation: one LAZY line per table with its residency and resident
-# bytes, and one for the plan carrying its refusal and the figures behind it.
+# bytes, and one for the plan carrying its refusal and the figures behind it. Both print through the formatters the
+# planner's own lines print with, so the dry run and the planner name every field alike.
 LAZY_FIELDS = ("lazy_tables", "lazy_refusal", "lazy_refusal_detail", "residency", "host_resident_bytes")
+LAZY_FORMATTERS = ("placement_lazy_table_fields", "placement_lazy_refusal_text")
+# What only the formatters build: the consumer's device name and the refusal with its optional detail.
+LAZY_RESTATED = (
+    (r'"CPU"', "builds the consumer's device name itself"),
+    (r"refusal=%s%s%s", "builds the refusal text itself"),
+)
+# The fields the table formatter prints, as host-ledger-test-harness.hpp's printed() reads them, found in its string
+# literals joined, so a formatter built by concatenation and one built from one format string both show them.
+LAZY_TABLE_FIELDS = ("table=", " resident=", " cache_slots=", " floor_slots=", " consumer_device=")
 
 
-def lazy_report_gaps(closure: str) -> list:
-    """What the dry run's lazy report lacks; empty when it holds."""
-    gaps = []
-    formats = [
+def log_formats(text: str) -> list:
+    """The format string of every GGML_LOG_INFO and GGML_LOG_WARN call, adjacent literals joined."""
+    return [
         "".join(re.findall(r'"((?:\\.|[^"\\])*)"', m.group(1)))
-        for m in re.finditer(r"GGML_LOG_(?:INFO|WARN)\s*\(\s*((?:\"(?:\\.|[^\"\\])*\"\s*)+)", closure)
+        for m in re.finditer(r"GGML_LOG_(?:INFO|WARN)\s*\(\s*((?:\"(?:\\.|[^\"\\])*\"\s*)+)", text)
     ]
-    lazy = [f for f in formats if f.startswith("[PLAN-DRY-RUN]") and " LAZY " in f]
-    if not any(" residency=" in f and " resident=" in f for f in lazy):
-        gaps.append("no [PLAN-DRY-RUN] LAZY line prints a table's residency and resident bytes")
-    if not any(" refusal=" in f for f in lazy):
-        gaps.append("no [PLAN-DRY-RUN] LAZY line prints the plan's refusal")
+
+
+def formatter_bodies(uc: str) -> str:
+    return "\n".join(body(uc, name) for name in LAZY_FORMATTERS)
+
+
+def formatter_gaps(formatters: str) -> list:
+    """What the two formatters lack; empty when they print every field from the plan's own record."""
+    literals = "".join(re.findall(r'"((?:\\.|[^"\\])*)"', formatters))
+    gaps = [
+        f"the table formatter does not print {field.strip()}" for field in LAZY_TABLE_FIELDS if field not in literals
+    ]
+    if not re.search(r"\.\s*host_resident_bytes\b", formatters):
+        gaps.append("the table formatter does not read the table's host_resident_bytes")
+    if not re.search(r"\.\s*lazy_refusal_detail\b", formatters):
+        gaps.append("the refusal formatter drops the refusal's detail")
+    if '"none"' not in formatters:
+        gaps.append("the refusal formatter prints no 'none' for a plan that did not refuse")
+    return gaps
+
+
+def restated_gaps(text: str, where: str) -> list:
+    return [f"{where} {gap}" for pattern, gap in LAZY_RESTATED if re.search(pattern, text)]
+
+
+def lazy_report_gaps(closure: str, formatters: str) -> list:
+    """What the dry run's lazy report lacks; empty when it holds. `formatters` is the bodies of LAZY_FORMATTERS."""
+    gaps = []
+    lazy = [f for f in log_formats(closure) if f.startswith("[PLAN-DRY-RUN]") and " LAZY " in f]
+    if not any(" residency=" in f for f in lazy) or not calls(closure, "placement_lazy_table_fields"):
+        gaps.append("no [PLAN-DRY-RUN] LAZY line prints a table's residency and its fields through the table formatter")
+    if not any(" refusal=" in f for f in lazy) or not calls(closure, "placement_lazy_refusal_text"):
+        gaps.append("no [PLAN-DRY-RUN] LAZY line prints the plan's refusal through the refusal formatter")
     for field in LAZY_FIELDS:
-        if not re.search(rf"(?:\.|->)\s*{field}\b", closure):
+        if not re.search(rf"(?:\.|->)\s*{field}\b", closure + formatters):
             gaps.append(f"the dry run never reads the plan's {field}")
+    gaps += restated_gaps(closure, "the dry run")
     for decider in ("placement_plan_decide_lazy_residency", "record_host_ledger_plan"):
         if calls(closure, decider):
             gaps.append(f"the dry run calls {decider}: a second computation of the decision")
@@ -298,7 +338,7 @@ def lazy_sum_gaps(closure: str, hpp: str) -> list:
 
 
 def test_the_dry_run_prints_the_lazy_decision():
-    gaps = lazy_report_gaps(dry_run_closure(sycl_cpp()))
+    gaps = lazy_report_gaps(dry_run_closure(sycl_cpp()), formatter_bodies(read(SYCL / "unified-cache.cpp")))
     assert not gaps, "; ".join(gaps)
 
 
@@ -312,14 +352,24 @@ def test_the_lazy_checks_see_each_dropped_piece():
     report = strip_comments(
         "void r(const placement_plan & plan) {\n"
         "  for (const placement_lazy_table & t : plan.lazy_tables) {\n"
-        '    GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u LAZY %s residency=%s "\n'
-        '                  "resident=%zu\\n", 0, t.name.c_str(), t.residency == S ? "a" : "b",\n'
-        "                  t.host_resident_bytes);\n"
+        '    GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u LAZY %s residency=%s %s\\n", 0, t.name.c_str(),\n'
+        '                  t.residency == S ? "a" : "b", placement_lazy_table_fields(t, nullptr).c_str());\n'
         "  }\n"
-        '  GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u LAZY tables=%zu refusal=%s%s\\n", 0, plan.lazy_tables.size(),\n'
-        "                plan.lazy_refusal.c_str(), plan.lazy_refusal_detail.c_str());\n"
+        '  GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u LAZY tables=%zu refusal=%s\\n", 0, plan.lazy_tables.size(),\n'
+        "                placement_lazy_refusal_text(plan).c_str());\n"
         "  const size_t lazy = placement_plan_lazy_host_bytes(plan);\n"
         "  if (terms.total() + lazy != plan.host_planned_bytes) {}\n"
+        "}\n"
+    )
+    formatters = strip_comments(
+        "std::string placement_lazy_table_fields(const placement_lazy_table & t) {\n"
+        '  return "table=" + std::to_string(t.table_bytes) + " resident=" + std::to_string(t.host_resident_bytes) +\n'
+        '         " cache_slots=" + std::to_string(t.cache_slots) +\n'
+        '         " floor_slots=" + std::to_string(t.cache_floor_slots) +\n'
+        '         " consumer_device=" + (t.consumer_device >= 0 ? std::to_string(t.consumer_device) : "CPU");\n'
+        "}\n"
+        "std::string placement_lazy_refusal_text(const placement_plan & plan) {\n"
+        '  return plan.lazy_refusal.empty() ? "none" : plan.lazy_refusal + " " + plan.lazy_refusal_detail;\n'
         "}\n"
     )
     hpp = (
@@ -327,18 +377,37 @@ def test_the_lazy_checks_see_each_dropped_piece():
         "  return placement_plan_lazy_host_bytes(p);\n"
         "}\n"
     )
-    assert lazy_report_gaps(report) == [], lazy_report_gaps(report)
+    assert lazy_report_gaps(report, formatters) == [], lazy_report_gaps(report, formatters)
+    assert formatter_gaps(formatters) == [], formatter_gaps(formatters)
     assert lazy_sum_gaps(report, hpp) == [], lazy_sum_gaps(report, hpp)
     mutants = {
-        "the refusal dropped from its line": report.replace(" refusal=%s%s", ""),
-        "the per-table line dropped": report.replace("residency=%s ", ""),
-        "the detail not read": report.replace("plan.lazy_refusal_detail.c_str()", '""'),
-        "the resident bytes not read": report.replace("t.host_resident_bytes", "0"),
-        "a second decision": report.replace("const size_t lazy", "record_host_ledger_plan(plan); const size_t lazy"),
+        "the refusal dropped from its line": (report.replace(" refusal=%s", ""), formatters),
+        "the per-table line dropped": (report.replace("residency=%s ", ""), formatters),
+        "the fields not through the formatter": (
+            report.replace("placement_lazy_table_fields(t, nullptr).c_str()", "t.name.c_str()"), formatters
+        ),
+        "the refusal not through its formatter": (
+            report.replace("placement_lazy_refusal_text(plan).c_str()", "plan.lazy_refusal.c_str()"), formatters
+        ),
+        "the detail not read": (report, formatters.replace(" + plan.lazy_refusal_detail", "")),
+        "the resident bytes not read": (report, formatters.replace("t.host_resident_bytes", "0")),
+        "the device name restated": (report.replace("t.name.c_str(),", 't.name.c_str(), "CPU",'), formatters),
+        "the refusal text restated": (report.replace(" refusal=%s", " refusal=%s%s%s"), formatters),
+        "a second decision": (
+            report.replace("const size_t lazy", "record_host_ledger_plan(plan); const size_t lazy"), formatters
+        ),
     }
-    for name, mutant in mutants.items():
-        assert mutant != report, f"mutant '{name}' changed nothing"
-        assert lazy_report_gaps(mutant), f"the lazy report check passes with {name}"
+    for name, (mutant, mutant_formatters) in mutants.items():
+        assert (mutant, mutant_formatters) != (report, formatters), f"mutant '{name}' changed nothing"
+        assert lazy_report_gaps(mutant, mutant_formatters), f"the lazy report check passes with {name}"
+    formatter_mutants = {
+        "the resident bytes not printed": formatters.replace('" resident="', '" r="'),
+        "the device not printed": formatters.replace('" consumer_device="', '" d="'),
+        "no none": formatters.replace('"none"', '""'),
+    }
+    for name, mutant in formatter_mutants.items():
+        assert mutant != formatters, f"mutant '{name}' changed nothing"
+        assert formatter_gaps(mutant), f"the formatter check passes with {name}"
     bare = report.replace("terms.total() + lazy != plan.host_planned_bytes", "terms.total() != plan.host_planned_bytes")
     assert bare != report and lazy_sum_gaps(bare, hpp), "the sum check passes a bare zone-terms comparison"
     assert lazy_sum_gaps(report, hpp.replace("placement_plan_lazy_host_bytes(p)", "0")), (
@@ -364,14 +433,6 @@ PLAN_LINE_SOURCES = (
     (r"kv_info\s*\.\s*host_budget_overridden\b", "the source is not the planner input kv_info.host_budget_overridden"),
     (r"\bdevices\s*\.\s*size\s*\(", "the caches carving is not counted from the plan's devices"),
 )
-
-
-def log_formats(text: str) -> list:
-    """The format string of every GGML_LOG_INFO and GGML_LOG_WARN call, adjacent literals joined."""
-    return [
-        "".join(re.findall(r'"((?:\\.|[^"\\])*)"', m.group(1)))
-        for m in re.finditer(r"GGML_LOG_(?:INFO|WARN)\s*\(\s*((?:\"(?:\\.|[^\"\\])*\"\s*)+)", text)
-    ]
 
 
 def plan_line_gaps(decide: str) -> list:
@@ -400,6 +461,10 @@ def plan_line_gaps(decide: str) -> list:
     for reader in ("host_ledger_budget_overridden", "host_ledger_budget", "getenv"):
         if calls(decide, reader):
             gaps.append(f"the decision calls {reader}: the budget's source is an input, not read here")
+    for name in LAZY_FORMATTERS:
+        if not calls(decide, name):
+            gaps.append(f"the decision does not print through {name}")
+    gaps += restated_gaps(decide, "the decision")
     return gaps
 
 
@@ -424,8 +489,8 @@ def budget_source_gaps(store: str, accessor: str, load: str, closure: str) -> li
 
 
 def test_the_plan_lines_carry_every_printable_field():
-    decide = body(read(SYCL / "unified-cache.cpp"), "placement_plan_decide_lazy_residency")
-    gaps = plan_line_gaps(decide)
+    uc = read(SYCL / "unified-cache.cpp")
+    gaps = plan_line_gaps(body(uc, "placement_plan_decide_lazy_residency")) + formatter_gaps(formatter_bodies(uc))
     assert not gaps, "; ".join(gaps)
 
 
@@ -447,17 +512,19 @@ def test_the_plan_line_checks_see_each_dropped_piece():
         "void d(placement_plan & plan, const placement_kv_info & kv_info) {\n"
         "  const host_weight_zone_terms wt = placement_plan_host_weight_zone_terms(plan);\n"
         "  const size_t carving = plan.multi_device ? plan.devices.size() : 1;\n"
+        "  const std::string fields = placement_lazy_table_fields(t, &info);\n"
         "  if (storage) {\n"
-        '    GGML_LOG_WARN("[PLACEMENT] lazy %s residency=STORAGE table=%zu cache_slots=%zu index=%zu "\n'
-        '                  "off=%zu\\n", n, t, s, lazy_row_cache_index_bytes(s), o);\n'
+        '    GGML_LOG_WARN("[PLACEMENT] lazy %s residency=STORAGE %s index=%zu\\n", n, fields.c_str(),\n'
+        "                  lazy_row_cache_index_bytes(s));\n"
         "  } else {\n"
-        '    GGML_LOG_WARN("[PLACEMENT] lazy %s residency=HOST table=%zu off=%zu host_budget=%zu "\n'
-        '                  "host_planned=%zu leftover=%zu\\n", n, t, o, b, p, l);\n'
+        '    GGML_LOG_WARN("[PLACEMENT] lazy %s residency=HOST %s host_budget=%zu "\n'
+        '                  "host_planned=%zu leftover=%zu\\n", n, fields.c_str(), b, p, l);\n'
         "  }\n"
+        "  const std::string refusal = placement_lazy_refusal_text(plan);\n"
         '  GGML_LOG_WARN("[HOST-PLAN] lazy device=%d budget=%zu source=%s planned=%zu weights=%zu named_terms=%zu "\n'
         '                "kv=%zu zones=%zu caches_carving=%zu refusal=%s\\n", d, b,\n'
         '                kv_info.host_budget_overridden ? "GGML_SYCL_HOST_RESERVE_MB" : "computed", p,\n'
-        "                wt.host_weights, wt.tlsf_bound, plan.host_zone_terms.kv, z, carving, r);\n"
+        "                wt.host_weights, wt.tlsf_bound, plan.host_zone_terms.kv, z, carving, refusal.c_str());\n"
         "}\n"
     )
     assert plan_line_gaps(decide) == [], plan_line_gaps(decide)
@@ -483,6 +550,9 @@ def test_the_plan_line_checks_see_each_dropped_piece():
             "kv_info.host_budget_overridden", 'getenv("GGML_SYCL_HOST_RESERVE_MB")'
         ),
         "the carving a constant": decide.replace("plan.multi_device ? plan.devices.size() : 1", "1"),
+        "the table fields not through the formatter": decide.replace("placement_lazy_table_fields(t, &info)", '""'),
+        "the refusal not through its formatter": decide.replace("placement_lazy_refusal_text(plan)", "r"),
+        "the device name restated": decide.replace('"computed", p,', '"computed", "CPU", p,'),
     }
     for name, mutant in decide_mutants.items():
         assert mutant != decide, f"mutant '{name}' changed nothing"

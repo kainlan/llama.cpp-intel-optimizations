@@ -33348,6 +33348,36 @@ static size_t lazy_row_cache_slots_within(size_t floor_slots, size_t max_slots, 
     return lo;
 }
 
+// A lazy table's yieldable bytes (th32 §6.4): what a STORAGE cache holds above its floor. A HOST table yields nothing.
+static size_t lazy_table_yieldable_bytes(const placement_lazy_table & table, size_t row_size) {
+    if (table.residency != lazy_residency::STORAGE) {
+        return 0;
+    }
+    return table.host_resident_bytes - lazy_row_cache_resident_bytes(table.cache_floor_slots, row_size);
+}
+
+std::string placement_lazy_table_fields(const placement_lazy_table & table, const placement_lazy_table_info * info) {
+    const std::string device = table.consumer_device >= 0 ? std::to_string(table.consumer_device) : "CPU";
+    std::string       fields = "table=" + std::to_string(table.table_bytes) +
+                         " resident=" + std::to_string(table.host_resident_bytes) +
+                         " cache_slots=" + std::to_string(table.cache_slots) +
+                         " floor_slots=" + std::to_string(table.cache_floor_slots) + " consumer_device=" + device;
+    if (info != nullptr) {
+        fields += " yieldable=" + std::to_string(lazy_table_yieldable_bytes(table, info->row_size)) +
+                  " consumer_layer=" + std::to_string(info->consumer_layer) +
+                  " rows_per_token=" + std::to_string(info->rows_per_token) +
+                  " file=" + std::to_string(info->file_index) + " off=" + std::to_string(info->file_offset);
+    }
+    return fields;
+}
+
+std::string placement_lazy_refusal_text(const placement_plan & plan) {
+    if (plan.lazy_refusal.empty()) {
+        return "none";
+    }
+    return plan.lazy_refusal_detail.empty() ? plan.lazy_refusal : plan.lazy_refusal + " " + plan.lazy_refusal_detail;
+}
+
 // The device that runs a lazy table's consumer layer: the device of a dense entry of that layer placed on a device,
 // -1 when the layer's dense weights are on the host, so the CPU runs it.
 static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_layer) {
@@ -33510,37 +33540,27 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
     plan.host_planned_bytes = placement_plan_host_planned_bytes(plan);
 
     // The plan lines (§10), WARN so a normal run shows them: one per planned table and one for the plan. They print
-    // every field the plan holds today; locked, output_slot, landing and cold_set wait for the rows that add them.
+    // every field the plan holds today, a table's through placement_lazy_table_fields and the refusal through
+    // placement_lazy_refusal_text, the formatters the dry run prints with; locked, output_slot, landing and cold_set
+    // wait for the rows that add them.
     const size_t planned       = plan.host_planned_bytes;
     const size_t leftover      = host_ledger_sat_sub(budget, host_ledger_sat_add(planned, reserve + envelope));
     size_t       lazy_resident = 0;
     size_t       yieldable     = 0;
     size_t       n_host        = 0;
     for (size_t i = 0; i < plan.lazy_tables.size(); ++i) {
-        const placement_lazy_table &      t       = plan.lazy_tables[i];
-        const placement_lazy_table_info & info    = *table_info[i];
-        const bool                        storage = t.residency == lazy_residency::STORAGE;
-        const size_t                      floor_res =
-            storage ? lazy_row_cache_resident_bytes(t.cache_floor_slots, info.row_size) : t.host_resident_bytes;
+        const placement_lazy_table &      t      = plan.lazy_tables[i];
+        const placement_lazy_table_info & info   = *table_info[i];
+        const std::string                 fields = placement_lazy_table_fields(t, &info);
         lazy_resident += t.host_resident_bytes;
-        yieldable += t.host_resident_bytes - floor_res;
-        n_host += storage ? 0 : 1;
-        const std::string device = t.consumer_device >= 0 ? std::to_string(t.consumer_device) : "CPU";
-        if (storage) {
-            GGML_LOG_WARN(
-                "[PLACEMENT] lazy %s residency=STORAGE table=%zu resident=%zu cache_slots=%zu index=%zu "
-                "floor_slots=%zu yieldable=%zu consumer_layer=%d device=%s rows_per_token=%u file=%u off=%zu\n",
-                t.name.c_str(), t.table_bytes, t.host_resident_bytes, t.cache_slots,
-                lazy_row_cache_index_bytes(t.cache_slots), t.cache_floor_slots, t.host_resident_bytes - floor_res,
-                info.consumer_layer, device.c_str(), info.rows_per_token, info.file_index, info.file_offset);
+        yieldable += lazy_table_yieldable_bytes(t, info.row_size);
+        if (t.residency == lazy_residency::STORAGE) {
+            GGML_LOG_WARN("[PLACEMENT] lazy %s residency=STORAGE %s index=%zu\n", t.name.c_str(), fields.c_str(),
+                          lazy_row_cache_index_bytes(t.cache_slots));
         } else {
-            GGML_LOG_WARN(
-                "[PLACEMENT] lazy %s residency=HOST table=%zu resident=%zu cache_slots=%zu floor_slots=%zu "
-                "yieldable=%zu consumer_layer=%d device=%s rows_per_token=%u file=%u off=%zu host_budget=%zu "
-                "host_planned=%zu leftover=%zu\n",
-                t.name.c_str(), t.table_bytes, t.host_resident_bytes, t.cache_slots, t.cache_floor_slots,
-                t.host_resident_bytes - floor_res, info.consumer_layer, device.c_str(), info.rows_per_token,
-                info.file_index, info.file_offset, budget, planned, leftover);
+            ++n_host;
+            GGML_LOG_WARN("[PLACEMENT] lazy %s residency=HOST %s host_budget=%zu host_planned=%zu leftover=%zu\n",
+                          t.name.c_str(), fields.c_str(), budget, planned, leftover);
         }
     }
     // weights= is the host weights at their exact bytes and named_terms= the zone's named terms, the two parts of the
@@ -33549,16 +33569,16 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
     const host_weight_zone_terms weight_terms   = placement_plan_host_weight_zone_terms(plan);
     const size_t                 named_terms    = weight_terms.total() - weight_terms.host_weights;
     const size_t                 caches_carving = plan.multi_device ? std::max<size_t>(1, plan.devices.size()) : 1;
+    const std::string            refusal        = placement_lazy_refusal_text(plan);
     GGML_LOG_WARN(
         "[HOST-PLAN] lazy device=%d budget=%zu source=%s planned=%zu weights=%zu named_terms=%zu kv=%zu zones=%zu "
         "caches_carving=%zu envelope=%zu lazy_resident=%zu ring=%zu reserve=%zu leftover=%zu mem_available_pre=%zu "
-        "p3_post_load=%zu yieldable=%zu tables=%zu host=%zu storage=%zu refusal=%s%s%s\n",
+        "p3_post_load=%zu yieldable=%zu tables=%zu host=%zu storage=%zu refusal=%s\n",
         plan.device_id, budget, kv_info.host_budget_overridden ? "GGML_SYCL_HOST_RESERVE_MB" : "computed", planned,
         weight_terms.host_weights, named_terms, plan.host_zone_terms.kv, step2, caches_carving, envelope, lazy_resident,
         plan.block_ring_charge, reserve, leftover, mem_pre,
         host_ledger_sat_sub(mem_pre, host_ledger_sat_add(planned, p3_runtime)), yieldable, kv_info.lazy_tables.size(),
-        n_host, plan.lazy_tables.size() - n_host, plan.lazy_refusal.empty() ? "none" : plan.lazy_refusal.c_str(),
-        plan.lazy_refusal_detail.empty() ? "" : " ", plan.lazy_refusal_detail.c_str());
+        n_host, plan.lazy_tables.size() - n_host, refusal.c_str());
 }
 
 // Records the plan's host figures (th32 §4.2): the budget the planner's caller passed, its commit terms, and
