@@ -273,7 +273,18 @@ LAZY_RESTATED = (
 # The fields the table formatter prints, as host-ledger-test-harness.hpp's printed() reads them, found in its string
 # literals joined, so a formatter built by concatenation and one built from one format string both show them.
 # locked= is the resident records' tier property (§3.1, §10): yes when the table holds resident bytes, none at 0.
-LAZY_TABLE_FIELDS = ("table=", " resident=", " locked=", " cache_slots=", " floor_slots=", " consumer_device=")
+# yieldable= needs the table's row geometry, so the formatter prints it when it is handed the table's info (§6.4).
+LAZY_TABLE_FIELDS = (
+    "table=",
+    " resident=",
+    " locked=",
+    " cache_slots=",
+    " floor_slots=",
+    " consumer_device=",
+    " yieldable=",
+)
+# A table formatter call with no table info: its line drops yieldable= and the consumer fields.
+LAZY_FIELDS_WITHOUT_INFO = re.compile(r"\bplacement_lazy_table_fields\s*\([^;]*?,\s*nullptr\s*\)")
 
 
 def log_formats(text: str) -> list:
@@ -317,6 +328,8 @@ def lazy_report_gaps(closure: str, formatters: str) -> list:
         gaps.append("no [PLAN-DRY-RUN] LAZY line prints a table's residency and its fields through the table formatter")
     if not any(" refusal=" in f for f in lazy) or not calls(closure, "placement_lazy_refusal_text"):
         gaps.append("no [PLAN-DRY-RUN] LAZY line prints the plan's refusal through the refusal formatter")
+    if LAZY_FIELDS_WITHOUT_INFO.search(closure):
+        gaps.append("the dry run hands the table formatter no table info, so its LAZY lines drop yieldable=")
     for field in LAZY_FIELDS:
         if not re.search(rf"(?:\.|->)\s*{field}\b", closure + formatters):
             gaps.append(f"the dry run never reads the plan's {field}")
@@ -356,7 +369,7 @@ def test_the_lazy_checks_see_each_dropped_piece():
         "void r(const placement_plan & plan) {\n"
         "  for (const placement_lazy_table & t : plan.lazy_tables) {\n"
         '    GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u LAZY %s residency=%s %s\\n", 0, t.name.c_str(),\n'
-        '                  t.residency == S ? "a" : "b", placement_lazy_table_fields(t, nullptr).c_str());\n'
+        '                  t.residency == S ? "a" : "b", placement_lazy_table_fields(t, info).c_str());\n'
         "  }\n"
         '  GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u LAZY tables=%zu refusal=%s\\n", 0, plan.lazy_tables.size(),\n'
         "                placement_lazy_refusal_text(plan).c_str());\n"
@@ -365,12 +378,14 @@ def test_the_lazy_checks_see_each_dropped_piece():
         "}\n"
     )
     formatters = strip_comments(
-        "std::string placement_lazy_table_fields(const placement_lazy_table & t) {\n"
+        "std::string placement_lazy_table_fields(const placement_lazy_table & t,\n"
+        "                                        const placement_lazy_table_info * i) {\n"
         '  return "table=" + std::to_string(t.table_bytes) + " resident=" + std::to_string(t.host_resident_bytes) +\n'
         '         " locked=" + (t.host_resident_bytes != 0 ? "yes" : "none") +\n'
         '         " cache_slots=" + std::to_string(t.cache_slots) +\n'
         '         " floor_slots=" + std::to_string(t.cache_floor_slots) +\n'
-        '         " consumer_device=" + (t.consumer_device >= 0 ? std::to_string(t.consumer_device) : "CPU");\n'
+        '         " consumer_device=" + (t.consumer_device >= 0 ? std::to_string(t.consumer_device) : "CPU") +\n'
+        '         (i != nullptr ? " yieldable=" + std::to_string(yieldable(t, i->row_size)) : "");\n'
         "}\n"
         "std::string placement_lazy_refusal_text(const placement_plan & plan) {\n"
         '  return plan.lazy_refusal.empty() ? "none" : plan.lazy_refusal + " " + plan.lazy_refusal_detail;\n'
@@ -388,7 +403,11 @@ def test_the_lazy_checks_see_each_dropped_piece():
         "the refusal dropped from its line": (report.replace(" refusal=%s", ""), formatters),
         "the per-table line dropped": (report.replace("residency=%s ", ""), formatters),
         "the fields not through the formatter": (
-            report.replace("placement_lazy_table_fields(t, nullptr).c_str()", "t.name.c_str()"), formatters
+            report.replace("placement_lazy_table_fields(t, info).c_str()", "t.name.c_str()"), formatters
+        ),
+        "no table info handed to the formatter": (
+            report.replace("placement_lazy_table_fields(t, info)", "placement_lazy_table_fields(t, nullptr)"),
+            formatters,
         ),
         "the refusal not through its formatter": (
             report.replace("placement_lazy_refusal_text(plan).c_str()", "plan.lazy_refusal.c_str()"), formatters
@@ -408,6 +427,7 @@ def test_the_lazy_checks_see_each_dropped_piece():
         "the resident bytes not printed": formatters.replace('" resident="', '" r="'),
         "the device not printed": formatters.replace('" consumer_device="', '" d="'),
         "the locked state not printed": formatters.replace('" locked="', '" l="'),
+        "the yieldable bytes not printed": formatters.replace('" yieldable="', '" y="'),
         "no yes": formatters.replace('"yes"', '"y"'),
         "no none": formatters.replace('"none"', '""'),
     }
