@@ -1661,6 +1661,35 @@ def _sched_path(texts: dict):
     return {"key": key, "measure": me, "reserve": im, "reserve_lo": im_lo}
 
 
+def _trial_flags(s):
+    """The auto-n_ubatch trial's function, the one enclosing try_candidate, and the identifiers it assigns."""
+    cand = _lambda_span(s.bare, "try_candidate")
+    fn = s.enclosing(cand[0]) if cand else None
+    body = s.bare[fn["open"]:fn["close"]] if fn else ""
+    flags = {m.group(1) for m in re.finditer(r"([A-Za-z_]\w*)\s*(?:=(?!=)|\+=|\+\+)", body)}
+    flags |= {m.group(1) for m in re.finditer(r"\+\+\s*([A-Za-z_]\w*)", body)}
+    return fn, flags
+
+
+def _trial_excepted(s, fn: dict, flags: set, p: int) -> bool:
+    """Whether `p` sits in a block of `fn` guarded by an if whose condition reads, negated, one of the trial's
+    `flags`: the step it guards is skipped while the auto-n_ubatch trial runs."""
+    for m in re.finditer(r"\bif\s*\(", s.bare[fn["open"]:p]):
+        lp = fn["open"] + m.end() - 1
+        rp = match_close(s.bare, lp)
+        k = rp + 1
+        while k < p and s.bare[k].isspace():
+            k += 1
+        if s.bare[k] != "{" or not k < p < match_close(s.bare, k):
+            continue
+        cond = s.bare[lp + 1:rp]
+        negated = set(re.findall(r"!\s*(?:this\s*->\s*)?([A-Za-z_]\w*)\b(?!\s*\()", cond))
+        negated |= set(re.findall(r"\b([A-Za-z_]\w*)\s*==\s*(?:0|false)\b", cond))
+        if negated & flags:
+            return True
+    return False
+
+
 def clause_context_wiring(texts: dict) -> list:
     """r6 I-1, r7 I-1, r7 m-1: llama_context resolves the notify, begin, plan and commit entries; each begin follows
     a scheduler creation before any graph_reserve, and each plan call follows a split_only graph_reserve. The commit
@@ -1696,33 +1725,12 @@ def clause_context_wiring(texts: dict) -> list:
     cand = _lambda_span(s.bare, "try_candidate")
     fallback = re.search(r"\breturn\s+\"compute buffer fell back to host\"\s*;", s.code[cand[0]:cand[1]]) \
         if cand else None
-    trial_fn = s.enclosing(cand[0]) if cand else None
-    trial_body = s.bare[trial_fn["open"]:trial_fn["close"]] if trial_fn else ""
-    trial_sets = {m.group(1) for m in re.finditer(r"([A-Za-z_]\w*)\s*(?:=(?!=)|\+=|\+\+)", trial_body)}
-    trial_sets |= {m.group(1) for m in re.finditer(r"\+\+\s*([A-Za-z_]\w*)", trial_body)}
-
-    def trial_excepted(p):
-        """Whether `p` sits in a block of sched_reserve guarded by an if whose condition reads, negated, a flag
-        the trial's function sets."""
-        for m in re.finditer(r"\bif\s*\(", s.bare[sr["open"]:p]):
-            lp = sr["open"] + m.end() - 1
-            rp = match_close(s.bare, lp)
-            k = rp + 1
-            while k < p and s.bare[k].isspace():
-                k += 1
-            if s.bare[k] != "{" or not k < p < match_close(s.bare, k):
-                continue
-            cond = s.bare[lp + 1:rp]
-            negated = set(re.findall(r"!\s*(?:this\s*->\s*)?([A-Za-z_]\w*)\b(?!\s*\()", cond))
-            negated |= set(re.findall(r"\b([A-Za-z_]\w*)\s*==\s*(?:0|false)\b", cond))
-            if negated & trial_sets:
-                return True
-        return False
+    trial_fn, trial_flags = _trial_flags(s)
     at_end = at_trial = 0
     for p in _pointer_calls(s, ptr["commit_host_holders"]):
         if sr and sr["open"] < p < sr["close"] and all(t < p for t in throws):
             at_end += 1
-            if not trial_excepted(p):
+            if not _trial_excepted(s, sr, trial_flags, p):
                 fails.append(f"context wiring: sched_reserve's end commit at line {s.line(p)} is not under an if "
                              f"that excepts the auto-n_ubatch trial (a negated read of a flag "
                              f"{trial_fn['name'] if trial_fn else 'the trial'} sets)")
@@ -1742,8 +1750,10 @@ def clause_context_wiring(texts: dict) -> list:
 
 def clause_trial_ops(texts: dict) -> list:
     """§M75, r9 n-6, r10 m-5: try_candidate OPENs before its reserve, KEEPs beside the commit and RETURNs on both loss
-    paths; sched_reserve RETURNs on its transaction's throw path and KEEPs on its success path, MARKs before the
-    measure and RETURN_TO_MARKs before the pipeline-parallel retry."""
+    paths; sched_reserve RETURNs on its transaction's throw path, MARKs before the measure, RETURN_TO_MARKs before
+    the pipeline-parallel retry, and KEEPs on its success path except under the auto-n_ubatch trial: like the end
+    commit, that KEEP sits under an if whose condition reads, negated, a flag the trial sets, because inside
+    try_candidate it would run before the host-fallback check and keep a losing candidate's growth."""
     lc = texts.get(LC, "")
     if not lc:
         return ["trial ops: src/llama-context.cpp is missing"]
@@ -1811,8 +1821,16 @@ def clause_trial_ops(texts: dict) -> list:
                 name = re.match(r"throw\s+([\w:]+)", code[t_at:])
                 fails.append(f"trial ops: sched_reserve does not RETURN on its transaction's throw path before its "
                              f"'throw {name.group(1) if name else ''}', in a block enclosing that throw (r10 m-5)")
-        if not (throws and ops("KEEP", throws[-1], sr["close"])):
+        success_keeps = ops("KEEP", throws[-1], sr["close"]) if throws else []
+        if not success_keeps:
             fails.append("trial ops: sched_reserve does not KEEP on its success path, after its throws (r10 m-5)")
+        trial_fn, trial_flags = _trial_flags(s)
+        for k in success_keeps:
+            if not _trial_excepted(s, sr, trial_flags, k):
+                fails.append(f"trial ops: sched_reserve's success KEEP at line {s.line(k)} is not under an if that "
+                             f"excepts the auto-n_ubatch trial (a negated read of a flag "
+                             f"{trial_fn['name'] if trial_fn else 'the trial'} sets): inside try_candidate it would "
+                             f"keep a losing candidate's growth before the host-fallback check (r10 m-5, §M75)")
     path = _sched_path(texts)
     im = path["reserve"] if path else None
     lo2 = path["reserve_lo"] if path else 0
@@ -2125,6 +2143,7 @@ _SR_COMMIT = ("    if (!sycl_ubatch_trial_active) {\n"
 _SPILL_OK = "        hold_spill_validated_ub = hold_spill_fn ? c : 0;\n"
 _CANDIDATE = "    auto try_candidate = [&](uint32_t c) -> const char * {\n"
 _TRIAL_FLAG = "    sycl_ubatch_trial_active = true;\n"
+_SR_KEEP = "    if (!sycl_ubatch_trial_active) {\n        " + _TRIAL + "KEEP);\n    }\n"
 _TRIAL_COMMIT = ("        for (auto & sb : sycl_backends) {\n"
                  "            hooks.commit_host_holders(sb.backend);\n"
                  "        }\n")
@@ -2208,7 +2227,8 @@ FIXTURES = {
          "                " + _TRIAL + "RETURN);\n                return \"compute buffer fell back to host\";\n"),
         (LC, _SPILL_OK, _SPILL_OK + _TRIAL_COMMIT + "        " + _TRIAL + "KEEP);\n"),
         (LC, _SR_FAIL, _SR_FAIL + "        " + _TRIAL + "RETURN);\n"),
-        (LC, _SR_TAIL_OPEN + _SR_TAIL_CLOSE, _SR_TAIL_OPEN + "    " + _TRIAL + "KEEP);\n" + _SR_TAIL_CLOSE),
+        (LC, _SR_TAIL_OPEN + _SR_TAIL_CLOSE, _SR_TAIL_OPEN + _SR_KEEP + _SR_TAIL_CLOSE),
+        (LC, _CANDIDATE, _TRIAL_FLAG + _CANDIDATE),
         (LC, _PP_MEASURE, "        " + _TRIAL + "MARK);\n" + _PP_MEASURE),
         (LC, "                state.cparams.pipeline_parallel = false;\n                state.sched.reset(",
          "                " + _TRIAL + "RETURN_TO_MARK);\n"
@@ -2467,8 +2487,7 @@ MUTANTS = [
      "try_candidate does not KEEP beside the commit"),
     ("trial-sched-return-on-success", "trial-ops",
      [(LC, _SR_FAIL + "        " + _TRIAL + "RETURN);\n", _SR_FAIL),
-      (LC, _SR_TAIL_OPEN + "    " + _TRIAL + "KEEP);\n",
-       _SR_TAIL_OPEN + "    " + _TRIAL + "KEEP);\n    " + _TRIAL + "RETURN);\n")],
+      (LC, _SR_TAIL_OPEN + _SR_KEEP, _SR_TAIL_OPEN + _SR_KEEP + "    " + _TRIAL + "RETURN);\n")],
      "sched_reserve does not RETURN on its transaction's throw path"),
     ("trial-sched-return-one-branch", "trial-ops",
      [(LC, _SR_FAIL + "        " + _TRIAL + "RETURN);\n", _SR_FAIL),
@@ -2476,9 +2495,12 @@ MUTANTS = [
                             "            throw llama_auto_ubatch_fit_refusal(result.reason);\n")],
      "sched_reserve does not RETURN on its transaction's throw path before its 'throw std::runtime_error'"),
     ("trial-sched-keep-before-transaction", "trial-ops",
-     [(LC, _SR_TAIL_OPEN + "    " + _TRIAL + "KEEP);\n", _SR_TAIL_OPEN),
-      (LC, _SR_FAIL, "    " + _TRIAL + "KEEP);\n" + _SR_FAIL)],
+     [(LC, _SR_TAIL_OPEN + _SR_KEEP, _SR_TAIL_OPEN), (LC, _SR_FAIL, _SR_KEEP + _SR_FAIL)],
      "sched_reserve does not KEEP on its success path"),
+    ("trial-sched-keep-unguarded", "trial-ops", [(LC, _SR_KEEP, "    " + _TRIAL + "KEEP);\n")],
+     "is not under an if that excepts the auto-n_ubatch trial"),
+    ("trial-sched-keep-flag-unset", "trial-ops", [(LC, _TRIAL_FLAG + _CANDIDATE, _CANDIDATE)],
+     "is not under an if that excepts the auto-n_ubatch trial"),
     ("trial-mark-after-measure", "trial-ops",
      [(LC, "        " + _TRIAL + "MARK);\n", ""), (LC, _PP_SPLITS, _PP_SPLITS + "        " + _TRIAL + "MARK);\n")],
      "a RETURN_TO_MARK is not preceded by its MARK before the reserve"),
