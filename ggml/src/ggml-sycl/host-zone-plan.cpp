@@ -811,7 +811,7 @@ bool slot_replace(host_staging_block & slot, int device, int kind, size_t bytes,
 }
 
 bool slot_device_ok(int device) {
-    return device >= 0 && device < host_staging_slots::max_devices;
+    return device >= 0 && device < host_zone_max_devices;
 }
 
 }  // namespace
@@ -907,7 +907,7 @@ void slots_release_device(host_staging_block (&slots)[HOST_STAGING_KIND_COUNT], 
 }  // namespace
 
 void host_staging_slots::release_unplanned(const host_staging_allocator & alloc) {
-    for (int d = 0; d < max_devices; ++d) {
+    for (int d = 0; d < host_zone_max_devices; ++d) {
 #if defined(HOST_ZONE_PLAN_MUTANT_FREE_RELEASES_PLANNED)
         // Positive control: every device's slots released, so an unrelated backend's free takes a committed plan's
         // slots with it.
@@ -921,7 +921,7 @@ void host_staging_slots::release_unplanned(const host_staging_allocator & alloc)
 }
 
 void host_staging_slots::release_all(const host_staging_allocator & alloc) {
-    for (int d = 0; d < max_devices; ++d) {
+    for (int d = 0; d < host_zone_max_devices; ++d) {
         slots_release_device(slots_[d], alloc);
     }
 }
@@ -1076,7 +1076,7 @@ bool host_holders_apply_device(int                            device,
 namespace {
 
 bool counter_device_ok(int device) {
-    return device >= 0 && device < attn_host_dispatch_counters::max_devices;
+    return device >= 0 && device < host_zone_max_devices;
 }
 
 }  // namespace

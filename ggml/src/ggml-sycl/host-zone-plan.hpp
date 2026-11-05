@@ -30,6 +30,10 @@
 
 namespace ggml_sycl {
 
+// The device bound of every per-device array here. This header includes no SYCL header, so it states
+// GGML_SYCL_MAX_DEVICES by value, and ggml-sycl.cpp static_asserts that the two agree.
+constexpr int host_zone_max_devices = 48;
+
 // ---------------------------------------------------------------------------------------------------------------
 // Routing (§4.4 "Route by role, in select_zone, the one place").
 // ---------------------------------------------------------------------------------------------------------------
@@ -352,8 +356,6 @@ class attn_host_dispatch_counters;
 // one record of the committed plans, so no free that releases slots can leave a committed plan out of force.
 class host_staging_slots {
   public:
-    static constexpr int max_devices = 48;  // GGML_SYCL_MAX_DEVICES
-
     explicit host_staging_slots(const host_holder_plans & plans) : plans_(plans) {}
 
     // Re-sizes `device`'s slots to the committed state: a slot below its planned capacity grows once, one above it is
@@ -382,8 +384,8 @@ class host_staging_slots {
 
   private:
     const host_holder_plans & plans_;
-    host_staging_block        slots_[max_devices][HOST_STAGING_KIND_COUNT]{};
-    std::atomic<bool>         fallback_warned_[max_devices]{};
+    host_staging_block        slots_[host_zone_max_devices][HOST_STAGING_KIND_COUNT]{};
+    std::atomic<bool>         fallback_warned_[host_zone_max_devices]{};
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -462,8 +464,6 @@ bool host_holders_apply_device(int                            device,
 
 class attn_host_dispatch_counters {
   public:
-    static constexpr int max_devices = 48;  // GGML_SYCL_MAX_DEVICES
-
     // One interception: the entry into the host dispatch of `op`, counted before any staging is asked for. The first
     // per device prints `[ATTN-HOST] first host dispatch dev=%d op=%s` at WARN.
     void   intercept(int device, ggml_op op);
@@ -475,10 +475,10 @@ class attn_host_dispatch_counters {
     size_t refusals(int device) const;
 
   private:
-    std::atomic<size_t> fa_[max_devices]{};
-    std::atomic<size_t> set_rows_[max_devices]{};
-    std::atomic<size_t> refusals_[max_devices]{};
-    std::atomic<bool>   first_[max_devices]{};
+    std::atomic<size_t> fa_[host_zone_max_devices]{};
+    std::atomic<size_t> set_rows_[host_zone_max_devices]{};
+    std::atomic<size_t> refusals_[host_zone_max_devices]{};
+    std::atomic<bool>   first_[host_zone_max_devices]{};
 };
 
 // The fail-closed helper of the segmented record and replay paths: returns when `ok`; otherwise prints the device's

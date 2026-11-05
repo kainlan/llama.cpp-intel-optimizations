@@ -95299,6 +95299,8 @@ static std::mutex        g_attn_host_cpu_backend_mutex;
 // owners are heap-allocated by this file's leak idiom. The slots ask g_host_holder_plans whether a device is planned.
 static auto * const g_host_staging_slots          = new ggml_sycl::host_staging_slots(*g_host_holder_plans);
 static auto * const g_attn_host_dispatch_counters = new ggml_sycl::attn_host_dispatch_counters();
+static_assert(ggml_sycl::host_zone_max_devices == GGML_SYCL_MAX_DEVICES,
+              "host-zone-plan's per-device arrays (the slots, the dispatch counter) must cover every SYCL device");
 
 enum ggml_sycl_attn_host_staging_kind {
     ATTN_STAGE_Q = 0,
