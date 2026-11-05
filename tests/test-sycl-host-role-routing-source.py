@@ -1795,9 +1795,19 @@ def clause_trial_ops(texts: dict) -> list:
     else:
         tx = re.search(r"\bsched_reserve_transaction\s*\(", code[sr["open"]:sr["close"]])
         throws = [sr["open"] + m.start() for m in re.finditer(r"\bthrow\b", code[sr["open"]:sr["close"]])]
-        if not (tx and throws and ops("RETURN", sr["open"] + tx.start(), throws[0])):
-            fails.append("trial ops: sched_reserve does not RETURN on its transaction's throw path, before it throws "
-                         "(r10 m-5)")
+        if not (tx and throws):
+            fails.append("trial ops: sched_reserve does not RETURN on its transaction's throw path: it has no "
+                         "transaction call or no throw (r10 m-5)")
+        for t_at in throws if tx else []:
+            chain = set()  # the blocks inside sched_reserve that enclose this throw
+            b = _block_open(code, t_at)
+            while b > sr["open"]:
+                chain.add(b)
+                b = _block_open(code, b)
+            if not [r for r in ops("RETURN", sr["open"] + tx.start(), t_at) if _block_open(code, r) in chain]:
+                name = re.match(r"throw\s+([\w:]+)", code[t_at:])
+                fails.append(f"trial ops: sched_reserve does not RETURN on its transaction's throw path before its "
+                             f"'throw {name.group(1) if name else ''}', in a block enclosing that throw (r10 m-5)")
         if not (throws and ops("KEEP", throws[-1], sr["close"])):
             fails.append("trial ops: sched_reserve does not KEEP on its success path, after its throws (r10 m-5)")
     path = _sched_path(texts)
@@ -2093,6 +2103,7 @@ _MEASURED = ("            return { sched_reserve_status::FAILED, format(\"failed
              "graphs.size()) };\n        }\n")
 _SR_FAIL = ("    const sched_reserve_result result = sched_reserve_transaction();\n"
             "    if (result.status != sched_reserve_status::OK) {\n")
+_SR_FIT_REFUSAL = "        if (result.fit_refusal) {\n            throw llama_auto_ubatch_fit_refusal(result.reason);\n"
 _SR_TAIL_OPEN = "        throw std::runtime_error(result.reason);\n    }\n"
 _SR_TAIL_CLOSE = "}\n\nbool llama_context::sched_reserve_nothrow() {\n"
 _SR_COMMIT = ("    if (!sycl_ubatch_trial_active) {\n"
@@ -2448,6 +2459,11 @@ MUTANTS = [
       (LC, _SR_TAIL_OPEN + "    " + _TRIAL + "KEEP);\n",
        _SR_TAIL_OPEN + "    " + _TRIAL + "KEEP);\n    " + _TRIAL + "RETURN);\n")],
      "sched_reserve does not RETURN on its transaction's throw path"),
+    ("trial-sched-return-one-branch", "trial-ops",
+     [(LC, _SR_FAIL + "        " + _TRIAL + "RETURN);\n", _SR_FAIL),
+      (LC, _SR_FIT_REFUSAL, "        if (result.fit_refusal) {\n            " + _TRIAL + "RETURN);\n"
+                            "            throw llama_auto_ubatch_fit_refusal(result.reason);\n")],
+     "sched_reserve does not RETURN on its transaction's throw path before its 'throw std::runtime_error'"),
     ("trial-sched-keep-before-transaction", "trial-ops",
      [(LC, _SR_TAIL_OPEN + "    " + _TRIAL + "KEEP);\n", _SR_TAIL_OPEN),
       (LC, _SR_FAIL, "    " + _TRIAL + "KEEP);\n" + _SR_FAIL)],
