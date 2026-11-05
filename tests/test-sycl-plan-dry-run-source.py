@@ -11,7 +11,9 @@ cannot see:
 2. the dry run (the export and every `ggml_sycl_plan_dry_run*` helper) calls each of those functions, takes the WEIGHT
    terms from `placement_plan_host_weight_zone_terms`, reports expected_host as the plan's `host_planned_bytes`, sizes
    the commit terms from the plan's own `host_zone_terms` inputs, and shares the stage's inventory and budget helpers
-   rather than restating them;
+   rather than restating them; it prints the plan's lazy tables, each one's residency, and the plan's refusal on
+   [PLAN-DRY-RUN] LAZY lines from the plan's own fields, and its host_planned_bytes check counts the lazy terms through
+   the helper the plan's sum uses;
 3. the dry run stores nothing: no `host_ledger_store_budget`, no `host_budget_pass_scope`, no zone configuration, no
    cache construction, no backend or queue initialisation, no write of the inventory globals; the shared helpers store
    nothing either;
@@ -240,12 +242,101 @@ def test_the_dry_run_shares_the_stage_helpers():
 
 
 def test_the_residency_seam_is_named():
-    # The per-table lazy decision is not in this tree (th32 §4.3), so the residency is reported per host backing from
-    # one named function the decision will replace.
+    # The weight entries' residency is reported per host backing from one named function; the lazy tables' residency
+    # is the plan's per-table decision (th32 §4.3 step 4), which the LAZY lines below print.
     cpp = sycl_cpp()
     seam = body(cpp, "ggml_sycl_plan_dry_run_residency")
     assert calls(dry_run_closure(cpp).replace(seam, ""), "ggml_sycl_plan_dry_run_residency"), (
         "nothing in the dry run calls the residency seam"
+    )
+
+
+# The lazy tables (th32 §4.3 step 4, §10): the plan decides each table's residency and records a refusal, and the dry
+# run prints what the plan holds, never a second computation: one LAZY line per table with its residency and resident
+# bytes, and one for the plan carrying its refusal and the figures behind it.
+LAZY_FIELDS = ("lazy_tables", "lazy_refusal", "lazy_refusal_detail", "residency", "host_resident_bytes")
+
+
+def lazy_report_gaps(closure: str) -> list:
+    """What the dry run's lazy report lacks; empty when it holds."""
+    gaps = []
+    formats = [
+        "".join(re.findall(r'"((?:\\.|[^"\\])*)"', m.group(1)))
+        for m in re.finditer(r"GGML_LOG_(?:INFO|WARN)\s*\(\s*((?:\"(?:\\.|[^\"\\])*\"\s*)+)", closure)
+    ]
+    lazy = [f for f in formats if f.startswith("[PLAN-DRY-RUN]") and " LAZY " in f]
+    if not any(" residency=" in f and " resident=" in f for f in lazy):
+        gaps.append("no [PLAN-DRY-RUN] LAZY line prints a table's residency and resident bytes")
+    if not any(" refusal=" in f for f in lazy):
+        gaps.append("no [PLAN-DRY-RUN] LAZY line prints the plan's refusal")
+    for field in LAZY_FIELDS:
+        if not re.search(rf"(?:\.|->)\s*{field}\b", closure):
+            gaps.append(f"the dry run never reads the plan's {field}")
+    for decider in ("placement_plan_decide_lazy_residency", "record_host_ledger_plan"):
+        if calls(closure, decider):
+            gaps.append(f"the dry run calls {decider}: a second computation of the decision")
+    return gaps
+
+
+def lazy_sum_gaps(closure: str, hpp: str) -> list:
+    """host_planned_bytes is the zone terms plus the lazy terms (th32 §4.2): the dry run's [PLAN-DRY-RUN-BUG] check
+    must count the lazy terms through the plan's own helper, or every plan holding a table logs a false bug."""
+    gaps = []
+    if re.search(r"\.\s*total\s*\(\s*\)\s*!=\s*[\w.\->]*\bhost_planned_bytes\b", closure):
+        gaps.append("the dry run compares the zone terms alone with host_planned_bytes")
+    if not calls(closure, "placement_plan_lazy_host_bytes"):
+        gaps.append("the dry run does not count the lazy terms through placement_plan_lazy_host_bytes")
+    if not calls(body(hpp, "placement_plan_host_planned_bytes"), "placement_plan_lazy_host_bytes"):
+        gaps.append("placement_plan_host_planned_bytes does not sum the lazy terms through their helper")
+    return gaps
+
+
+def test_the_dry_run_prints_the_lazy_decision():
+    gaps = lazy_report_gaps(dry_run_closure(sycl_cpp()))
+    assert not gaps, "; ".join(gaps)
+
+
+def test_the_dry_run_counts_the_lazy_terms():
+    gaps = lazy_sum_gaps(dry_run_closure(sycl_cpp()), read(SYCL / "unified-cache.hpp"))
+    assert not gaps, "; ".join(gaps)
+
+
+def test_the_lazy_checks_see_each_dropped_piece():
+    # Positive controls on a synthetic report shaped like the real one: each check passes it and fails each mutant.
+    report = strip_comments(
+        "void r(const placement_plan & plan) {\n"
+        "  for (const placement_lazy_table & t : plan.lazy_tables) {\n"
+        '    GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u LAZY %s residency=%s "\n'
+        '                  "resident=%zu\\n", 0, t.name.c_str(), t.residency == S ? "a" : "b",\n'
+        "                  t.host_resident_bytes);\n"
+        "  }\n"
+        '  GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u LAZY tables=%zu refusal=%s%s\\n", 0, plan.lazy_tables.size(),\n'
+        "                plan.lazy_refusal.c_str(), plan.lazy_refusal_detail.c_str());\n"
+        "  const size_t lazy = placement_plan_lazy_host_bytes(plan);\n"
+        "  if (terms.total() + lazy != plan.host_planned_bytes) {}\n"
+        "}\n"
+    )
+    hpp = (
+        "inline size_t placement_plan_host_planned_bytes(const placement_plan & p) {\n"
+        "  return placement_plan_lazy_host_bytes(p);\n"
+        "}\n"
+    )
+    assert lazy_report_gaps(report) == [], lazy_report_gaps(report)
+    assert lazy_sum_gaps(report, hpp) == [], lazy_sum_gaps(report, hpp)
+    mutants = {
+        "the refusal dropped from its line": report.replace(" refusal=%s%s", ""),
+        "the per-table line dropped": report.replace("residency=%s ", ""),
+        "the detail not read": report.replace("plan.lazy_refusal_detail.c_str()", '""'),
+        "the resident bytes not read": report.replace("t.host_resident_bytes", "0"),
+        "a second decision": report.replace("const size_t lazy", "record_host_ledger_plan(plan); const size_t lazy"),
+    }
+    for name, mutant in mutants.items():
+        assert mutant != report, f"mutant '{name}' changed nothing"
+        assert lazy_report_gaps(mutant), f"the lazy report check passes with {name}"
+    bare = report.replace("terms.total() + lazy != plan.host_planned_bytes", "terms.total() != plan.host_planned_bytes")
+    assert bare != report and lazy_sum_gaps(bare, hpp), "the sum check passes a bare zone-terms comparison"
+    assert lazy_sum_gaps(report, hpp.replace("placement_plan_lazy_host_bytes(p)", "0")), (
+        "the sum check passes a host_planned_bytes that does not count the lazy terms"
     )
 
 
