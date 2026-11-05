@@ -90,6 +90,7 @@ CACHE_HPP_REL = "ggml/src/ggml-sycl/unified-cache.hpp"
 ROOM_COST_REL = "ggml/src/ggml-sycl/kv-room-cost.hpp"
 FATTN_REL = "ggml/src/ggml-sycl/fattn.cpp"
 BENCH_REL = "tools/llama-bench/llama-bench.cpp"
+TOOL_REL = "tools/sycl-plan-dry-run/sycl-plan-dry-run.cpp"
 
 
 def read_or_empty(rel: str) -> str:
@@ -108,6 +109,7 @@ SYCL = read(SYCL_REL)
 CACHE = read(CACHE_REL)
 CACHE_HPP = read(CACHE_HPP_REL)
 ROOM_COST = read_or_empty(ROOM_COST_REL)
+TOOL = read(TOOL_REL)
 # Every C/C++ source of the SYCL backend, by path from the repository root: where a second reader of the provenance
 # would hide.
 BACKEND_TREE = {
@@ -343,6 +345,21 @@ def claim_sentinel_has_one_reader(tree: dict[str, str], value_tree: dict[str, st
     return counts == SENTINEL_OWNERS and backend_never_spells_the_value(value_tree)
 
 
+TOOL_MAIN_SIG = "int main(int argc, char ** argv)"
+TOOL_HINT = "params.n_ctx_hint = common_n_ctx_hint(args.n_ctx);"
+HINT_WRITE_RE = re.compile(r"\bn_ctx_hint\s*=(?!=)")
+
+
+def claim_tool_asks_common(tool: str) -> bool:
+    """The plan dry run keeps -c as given and maps it to the load's hint by asking common_n_ctx_hint, in main, and
+    writes the hint nowhere else in the tool: a raw cast would plan no room for the default context (0 is not the
+    sentinel) and a negative -c would plan a context of four billion cells (llama.cpp-h187). The args test checks the
+    mapping only by calling common, so this is the tool's one witness."""
+    n = norm(tool)
+    main = body(n, TOOL_MAIN_SIG)
+    return bool(main) and TOOL_HINT in main and len(HINT_WRITE_RE.findall(n)) == 1
+
+
 # ---- the backend ----------------------------------------------------------------------------------------------------
 
 
@@ -474,6 +491,10 @@ def test_loader_resolves_once():
 
 def test_sentinel_has_one_reader():
     assert claim_sentinel_has_one_reader(TREE, VALUE_TREE)
+
+
+def test_tool_asks_common():
+    assert claim_tool_asks_common(TOOL)
 
 
 def test_backend_carries_the_source():
@@ -700,6 +721,23 @@ def _value_tree_with(rel: str, text: str) -> dict[str, str]:
     tree = dict(VALUE_TREE)
     tree[rel] = text
     return tree
+
+
+def test_mutant_tool_casts_c_itself_fails():
+    """The tool hands -c to the load as a raw cast instead of asking common."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, "params.n_ctx_hint = (uint32_t) args.n_ctx;"))
+
+
+def test_mutant_tool_overwrites_the_hint_fails():
+    """The tool asks common, then sets the hint a second time."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " params.n_ctx_hint = 0;"))
+
+
+def test_mutant_tool_asks_outside_main_fails():
+    """The call moves out of main into a helper nothing calls, and main leaves the default hint."""
+    text = _once(TOOL, TOOL_HINT, "") + "\nstatic void h187_mutant(llama_model_params & params, " \
+        "const sycl_plan_dry_run_args & args) { " + TOOL_HINT + " }\n"
+    assert not claim_tool_asks_common(text)
 
 
 def test_mutant_backend_compares_the_context_to_all_ones_fails():
