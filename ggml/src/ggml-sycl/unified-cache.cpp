@@ -22230,6 +22230,16 @@ static size_t host_ledger_test_live_charged_bytes() {
 }
 #endif
 
+size_t unified_alloc_host_cpu_charged_bytes(const alloc_metadata & meta) {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto                  it = g_runtime_alloc_registry.find(meta.ptr);
+    if (it == g_runtime_alloc_registry.end() || it->second.state != runtime_alloc_state::LIVE ||
+        it->second.handle.tier != alloc_tier::HOST_CPU || !(it->second.handle.key() == meta.key())) {
+        return 0;
+    }
+    return it->second.charged_bytes;
+}
+
 bool unified_alloc_validate_registry(int device, const char * where) {
     const registry_tier_sums sums                 = unified_alloc_registry_tier_sums();
     const auto &             registry_device      = sums.device;

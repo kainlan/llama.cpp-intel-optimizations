@@ -7947,6 +7947,11 @@ struct file_mapping_request {
 
 allocation_result unified_allocate_file_mapping(const file_mapping_request & req) noexcept;
 
+// The host-ledger charge the live HOST_CPU registry row of `meta`'s exact allocation holds: host_cpu_mapped_size of its
+// request, the ledger's figure and never the handle's requested size. 0 when no live row has that exact key or the row
+// is not HOST_CPU. A lazy table's activation check sums it over the table's records (th32 §10).
+size_t unified_alloc_host_cpu_charged_bytes(const alloc_metadata & meta);
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The registry's host-pinned and file-mapped byte sums: the figures unified_alloc_validate_registry compares with the
 // host ledger and reports beside it. A file mapping is in the second and never in the first.
