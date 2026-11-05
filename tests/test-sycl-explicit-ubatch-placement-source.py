@@ -263,7 +263,7 @@ INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);
 BACKEND_COPY = "kv.n_ubatch_context = inventory->n_ubatch_context;"
 OFFSET_PIN = "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188,"
 # The header's own pins, compiled by both sides of the dlopen boundary (libllama fills the struct, libggml-sycl reads it).
-HEADER_SIZE_PIN = ('static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, '
+HEADER_SIZE_PIN = ('static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, '
                    '"ggml_sycl_tensor_inventory layout changed");')
 HEADER_OFFSET_PIN = ('static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, '
                      '"n_ubatch_context moved");')

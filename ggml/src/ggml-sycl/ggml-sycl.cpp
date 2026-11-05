@@ -100,8 +100,8 @@
 #include "ggml-sycl/chunk-cap.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/compute-alloc-scope.hpp"
-#include "ggml-sycl/context-tenant-measure.hpp"
 #include "ggml-sycl/compute-refusal-advice.hpp"
+#include "ggml-sycl/context-tenant-measure.hpp"
 #include "ggml-sycl/convert.hpp"
 #include "ggml-sycl/cpy.hpp"
 #include "ggml-sycl/dispatch-tuning.hpp"
@@ -117,6 +117,7 @@
 #include "ggml-sycl/kernel-selection.hpp"
 #include "ggml-sycl/kv-region-registry.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
+#include "ggml-sycl/lazy-io-pool.hpp"
 #include "ggml-sycl/lightning-indexer.hpp"
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
@@ -125,8 +126,8 @@
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
-#include "ggml-sycl/nonfa-stage.hpp"
 #include "ggml-sycl/mul-mat-bf16.hpp"
+#include "ggml-sycl/nonfa-stage.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/onednn-woq.hpp"
 #include "ggml-sycl/orchestrator.hpp"
@@ -17168,9 +17169,10 @@ static thread_local ggml_sycl::lifecycle::SlotToken g_sycl_plan_load_effect_owne
 
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
 // place without any error. These pin the KV tail of the layout (llama.cpp-8ecj), the context's provenance appended
-// after it (llama.cpp-7fmt), and libllama's resolved storage inputs and the micro-batch the caller named, both in the
-// provenance's padding.
-static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
+// after it (llama.cpp-7fmt), libllama's resolved storage inputs and the micro-batch the caller named, both in the
+// provenance's padding, and the lazy tables appended after them (th32 §4.1). The tables cross by pointer too, so each
+// field of a lazy table is pinned as well.
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
@@ -17180,6 +17182,18 @@ static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "u
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "use_mlock_resolved left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 187,
               "host_weight_layout_cpu left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
+static_assert(sizeof(ggml_sycl_lazy_table_info) == 80, "ggml_sycl_lazy_table_info layout changed");
+static_assert(offsetof(ggml_sycl_lazy_table_info, name) == 0, "lazy table name moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, type) == 8, "lazy table type moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, rows_per_token) == 12, "lazy table rows_per_token moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, ne) == 16, "lazy table ne moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, row_size) == 48, "lazy table row_size moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, consumer_layer) == 56, "lazy table consumer_layer moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, file_index) == 60, "lazy table file_index moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, file_offset) == 64, "lazy table file_offset moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, size) == 72, "lazy table size moved");
 
 // llama.cpp-w013, llama.cpp-7fmt: one of the KV context room's cost parameters (placement_kv_info::ctx_fill_pct,
 // host_attn_gbps, cpu_expert_gbps and host_split_us) from its environment variable. Unset, unparsable, not finite,
@@ -17308,6 +17322,14 @@ static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_in
     return in;
 }
 
+// An inventory no entry point reads: absent, or naming tensors or lazy tables with no array behind the count. The four
+// entry points (the early and the late direct entries, the stage and the dry run) refuse it before anything reads it,
+// so the intake below copies whatever the counts name.
+static bool ggml_sycl_inventory_malformed(const ggml_sycl_tensor_inventory * inventory) {
+    return inventory == nullptr || (inventory->count > 0 && inventory->tensors == nullptr) ||
+           (inventory->lazy_table_count > 0 && inventory->lazy_tables == nullptr);
+}
+
 // The planner's KV and cost inputs from an inventory, written over `kv`, which keeps every field the inventory does not
 // carry (n_seq_max is a runtime-context input). The stage fills g_placement_kv_info; the plan dry run fills a copy.
 static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     kv,
@@ -17389,6 +17411,28 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
     kv.moe_stream_staged_types = ggml_sycl_moe_stream_staged_types();
     kv.moe_stream_group_cap    = ggml_sycl_moe_pp_f16_group_experts_max();
     kv.n_expert_used           = inventory->n_expert_used;
+    // The lazy tables (th32 §4.1), an inventory class of their own: copied here, the one intake, and never into the
+    // tensor rows, so no table enters g_tensor_inventory_detail and no zone maximum the rows size ever counts it. Every
+    // entry point refuses a count with no array (ggml_sycl_inventory_malformed), so the copy reads what the count
+    // names.
+    kv.lazy_tables.clear();
+    kv.lazy_tables.reserve(inventory->lazy_table_count);
+    for (uint32_t i = 0; i < inventory->lazy_table_count; ++i) {
+        const ggml_sycl_lazy_table_info &    src = inventory->lazy_tables[i];
+        ggml_sycl::placement_lazy_table_info t;
+        t.name = src.name != nullptr ? src.name : "";
+        t.type = src.type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            t.ne[d] = src.ne[d];
+        }
+        t.row_size       = src.row_size;
+        t.rows_per_token = src.rows_per_token;
+        t.consumer_layer = src.consumer_layer;
+        t.file_index     = src.file_index;
+        t.file_offset    = src.file_offset;
+        t.table_bytes    = src.size;
+        kv.lazy_tables.push_back(std::move(t));
+    }
 }
 
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
@@ -17462,7 +17506,7 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // adapter marked (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch will not supply), in the same
     // RUNTIME zone (ggml_sycl_plan_load_dense_scratch).
     {
-        const uint32_t                        dense_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
+        const uint32_t                        dense_n_ubatch = ggml_sycl::placement_load_n_ubatch(inventory->n_ubatch);
         const ggml_sycl_dense_scratch_planned dense_planned =
             owned ? ggml_sycl_plan_load_dense_scratch(ctx->device, plan_owner, inventory_maxima, dense_n_ubatch) :
                     ggml_sycl_dense_scratch_planned{};
@@ -17784,6 +17828,40 @@ static size_t ggml_sycl_plan_single_device_budget(int device, size_t vram_budget
 
 thread_local uint64_t g_sycl_plan_load_effect_txn = 0;
 
+// The lazy tables' coverage pin for the plan this thread is building (th32 §3.3): a planner caller publishes the pin of
+// its lazy_coverage_scope here through lazy_plan_slot_scope, and compute_and_store_plan_for_inventory reads it at its
+// planner calls, so a planning entry reached through any caller plans against the lease that caller holds. Null outside
+// such a scope: a plan made then makes no lazy table STORAGE-eligible. No production caller builds the scope yet; the
+// T5 engine (design §11 row T5) adds it. Until then the slot is null on every load, so a table that fails the HOST test
+// refuses the plan as lazy-table-ring-unpinned.
+thread_local const ggml_sycl::ring_lease * g_sycl_lazy_plan_slot = nullptr;
+
+// Publishes a coverage pin on this thread's plan slot for the scope's lifetime and restores the previous slot after it,
+// so scopes nest. The constructor that takes a lazy_coverage_scope is the one a planner caller uses, so the slot only
+// ever names a lease a live scope holds; nothing in production constructs it yet (T5 adds that caller). The testing one
+// takes a fixture's pin guard, which holds its lease the same way.
+class lazy_plan_slot_scope {
+  public:
+    explicit lazy_plan_slot_scope(const ggml_sycl::lazy_coverage_scope & coverage) noexcept :
+        lazy_plan_slot_scope(coverage.pin()) {}
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    explicit lazy_plan_slot_scope(const ggml_sycl::lazy_test_coverage_pin & pin) noexcept :
+        lazy_plan_slot_scope(pin.pin()) {}
+#endif
+
+    ~lazy_plan_slot_scope() { g_sycl_lazy_plan_slot = previous_; }
+
+    lazy_plan_slot_scope(const lazy_plan_slot_scope &)             = delete;
+    lazy_plan_slot_scope & operator=(const lazy_plan_slot_scope &) = delete;
+
+  private:
+    explicit lazy_plan_slot_scope(const ggml_sycl::ring_lease * pin) noexcept : previous_(g_sycl_lazy_plan_slot) {
+        g_sycl_lazy_plan_slot = pin;
+    }
+
+    const ggml_sycl::ring_lease * previous_;
+};
+
 // The host budget's pass scope (th32 §4.2): sample, compute, store, then plan. The outermost scope of a load
 // transaction samples the host and stores the budget before any plan of that transaction is built; a later scope of the
 // same transaction finds its id in g_host_budget_stored_txn and only reads, so the early and the late plans and every
@@ -17871,8 +17949,12 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         // is llama.cpp-ouur.
         GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");
     }
-    const bool   is_moe = g_moe_n_experts_total > 0;
-    const auto & info   = ggml_sycl_info();
+    // P3's reading (th32 §4.3 step 4) and the budget's source (§10): the MemAvailable and the override flag of the
+    // sample this load's stored budget came from, so every plan of the load reads the values its budget does.
+    g_placement_kv_info.host_mem_available_pre = ggml_sycl::host_ledger_mem_available();
+    g_placement_kv_info.host_budget_overridden = ggml_sycl::host_ledger_budget_overridden();
+    const bool   is_moe                        = g_moe_n_experts_total > 0;
+    const auto & info                          = ggml_sycl_info();
     if (ggml_sycl_plan_multi_device()) {
         // P4.5: Multi-device placement
         ggml_sycl::init_shared_context_queues(info.total_gpu_count);
@@ -17906,7 +17988,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
         plan_candidate                                    = ggml_sycl::compute_multi_device_plan(
             budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
-            envelope_arg, g_moe_n_experts_total, ggml_sycl::host_ledger_budget());
+            envelope_arg, g_moe_n_experts_total, ggml_sycl::host_ledger_budget(), g_sycl_lazy_plan_slot);
         if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
             size_t moe_entries = 0;
             size_t xmx_entries = 0;
@@ -17965,7 +18047,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             }
             return ggml_sycl::compute_placement_plan(g_tensor_inventory_detail, plan_budget, ctx->device,
                                                      g_placement_kv_info, envelope_arg, g_moe_n_experts_total,
-                                                     ggml_sycl::host_ledger_budget());
+                                                     ggml_sycl::host_ledger_budget(), g_sycl_lazy_plan_slot);
         };
         // An explicit micro-batch's PP MoE oneDNN scratch ring: the planner holds the RUNTIME room the ring needs
         // against the routed experts. Every stage of the load re-publishes the ring and the dense scratch at the load's
@@ -18124,7 +18206,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
 // headroom reserve) that depend on state populated by create_tensor.
 void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t                     backend,
                                                     const ggml_sycl_tensor_inventory * inventory) {
-    if (!backend || !inventory || (inventory->count > 0 && !inventory->tensors)) {
+    if (!backend || ggml_sycl_inventory_malformed(inventory)) {
         return;
     }
     ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
@@ -18168,7 +18250,7 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
 
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(
     ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
-    if (!backend || !inventory || (inventory->count > 0 && !inventory->tensors)) {
+    if (!backend || ggml_sycl_inventory_malformed(inventory)) {
         return {};
     }
     ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
@@ -18468,13 +18550,27 @@ static ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan_stale_l
     return GGML_SYCL_LIFECYCLE_UNSUPPORTED;
 }
 
+// Refuses the load for a plan whose lazy-table decision refused (th32 §4.3 step 4): logs one WARN naming the reason and
+// its figures and returns true, and the stage then returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED, before the probe plan is
+// staged from it and before the late pass configures a host zone for it. Returns false, logging nothing, for a plan
+// that did not refuse. The planner stays exception-free, so a direct early call leaves the refused candidate staged
+// with no table.
+static bool ggml_sycl_stage_refuse_lazy_plan(const ggml_sycl::placement_plan * plan, bool early) {
+    if (plan == nullptr || plan->lazy_refusal.empty()) {
+        return false;
+    }
+    GGML_LOG_WARN("[HOST-PLAN] load refused: %s (early=%d)\n", ggml_sycl::placement_lazy_refusal_text(*plan).c_str(),
+                  early ? 1 : 0);
+    return true;
+}
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
                                                                        const ggml_sycl_placement_envelope * envelope,
                                                                        bool                                 early) {
     ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
-    if (!inventory || (inventory->count > 0 && !inventory->tensors)) {
+    if (ggml_sycl_inventory_malformed(inventory)) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
     try {
@@ -18545,6 +18641,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 if (!candidate_is_current()) {
                     throw std::runtime_error("stale host provisioning candidate before allocation");
                 }
+                if (ggml_sycl_stage_refuse_lazy_plan(snapshot->plan.get(), early)) {
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
 
                 // The inventory lock has been released. Keep module_guard, effect
                 // and the backend alive across physical provisioning; do not
@@ -18569,6 +18668,13 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 throw std::runtime_error("deterministic stage_load_inventory_plan failure");
             }
 #endif
+        }
+        // The early candidate is read once every device has planned it, and a refused one is never staged as the probe
+        // plan; the late pass refuses per device before it configures that device's host zones.
+        const auto early_candidate =
+            early ? ggml_sycl::lifecycle_find_candidate_placement_plan(effect.owner.load.value) : nullptr;
+        if (early_candidate && ggml_sycl_stage_refuse_lazy_plan(early_candidate->plan.get(), early)) {
+            return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
         }
         if (early) {
             // llama.cpp-p6i0: the early plan is the load's probe placement. Stage a copy for the PROBE-stage
@@ -18669,9 +18775,8 @@ static const char * ggml_sycl_plan_dry_run_backing_name(int backing) {
 // placement_entry_host_weight_bytes(), the per-entry figure placement_plan_host_weight_zone_terms() sizes the WEIGHT
 // zone with. Their sum and weight_host_bytes are then two figures for one set of entries, and a [PLAN-DRY-RUN-BUG]
 // WARN names a disagreement: a dense group charged on the DST basis whose host entries carry a converted dst_size is
-// how they part. th32 §4.3 decides residency per lazy table, as the joint placement's computation. This tree has lazy
-// tables, and they defer to the storage tier; what it lacks is §4.3's per-table residency decision, the plan's
-// Task 12, so the residency is reported per backing, and that decision replaces this function.
+// how they part. The lazy tables are no entries: the plan decides their residency per table (th32 §4.3 step 4), and
+// ggml_sycl_plan_dry_run_lazy prints that decision.
 static void ggml_sycl_plan_dry_run_residency(uint32_t                          index,
                                              const ggml_sycl::placement_plan & plan,
                                              ggml_sycl_plan_dry_run_plan &     out) {
@@ -18711,10 +18816,29 @@ static void ggml_sycl_plan_dry_run_residency(uint32_t                          i
     }
 }
 
+// The lazy tables of `plan` as the plan decided them (th32 §4.3 step 4, §10): one LAZY line per table carrying the
+// plan's fields for it through placement_lazy_table_fields, the formatter the planner's [PLACEMENT] lazy lines use,
+// then one LAZY line for the plan: its tables' host_resident_bytes, the block ring's need and charge, and its refusal
+// through placement_lazy_refusal_text. A refused plan holds no table, so its refusal is the whole of its lazy report.
+// Nothing is decided here.
+static void ggml_sycl_plan_dry_run_lazy(uint32_t index, const ggml_sycl::placement_plan & plan) {
+    size_t resident = 0;
+    for (const ggml_sycl::placement_lazy_table & t : plan.lazy_tables) {
+        resident += t.host_resident_bytes;
+        GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d LAZY %s residency=%s %s\n", index, plan.device_id,
+                      t.name.c_str(), t.residency == ggml_sycl::lazy_residency::STORAGE ? "STORAGE" : "HOST",
+                      ggml_sycl::placement_lazy_table_fields(t, nullptr).c_str());
+    }
+    GGML_LOG_INFO(
+        "[PLAN-DRY-RUN] plan=%u device=%d LAZY tables=%zu lazy_resident=%zu ring_need=%zu ring=%zu refusal=%s\n", index,
+        plan.device_id, plan.lazy_tables.size(), resident, plan.block_ring_need, plan.block_ring_charge,
+        ggml_sycl::placement_lazy_refusal_text(plan).c_str());
+}
+
 // Reports plan `index`: every host term from the plan's own record, each printed on its own line under its name. The
 // WEIGHT terms are the walk populate_host_zone_sizing() sized the zone with; the commit terms are the configure step's
 // sizing (ggml_sycl_configure_host_zones_for_plan) over the inputs the plan recorded, which record_host_ledger_plan()
-// summed into host_planned_bytes; expected_host is that figure.
+// summed, with the lazy tables' part, into host_planned_bytes; expected_host is that figure.
 static void ggml_sycl_plan_dry_run_record(uint32_t                          index,
                                           const ggml_sycl::placement_plan & plan,
                                           bool                              multi_device,
@@ -18739,11 +18863,13 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                          inde
     out.rounding                    = terms.rounding;
     out.expected_host               = plan.host_planned_bytes;
     ggml_sycl_plan_dry_run_residency(index, plan, out);
-    if (terms.total() != plan.host_planned_bytes) {
+    const size_t lazy_host = ggml_sycl::placement_plan_lazy_host_bytes(plan);
+    if (terms.total() + lazy_host != plan.host_planned_bytes) {
         GGML_LOG_WARN(
-            "[PLAN-DRY-RUN-BUG] plan=%u device=%d the commit terms sum to %zu bytes but the plan recorded "
-            "host_planned_bytes=%zu: a writer moved a zone term after the record without re-recording it\n",
-            index, plan.device_id, terms.total(), plan.host_planned_bytes);
+            "[PLAN-DRY-RUN-BUG] plan=%u device=%d the commit terms sum to %zu bytes and the lazy tables hold %zu, but "
+            "the plan recorded host_planned_bytes=%zu: a writer moved a host term after the record without "
+            "re-recording it\n",
+            index, plan.device_id, terms.total(), lazy_host, plan.host_planned_bytes);
     }
 
     const auto line = [&](const char * group, const char * term, uint64_t bytes) {
@@ -18782,6 +18908,7 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                          inde
                       index, plan.device_id, ggml_sycl_plan_dry_run_backing_name(b), out.residency_count[b],
                       out.residency_bytes[b], out.residency_bytes[b] / (1024.0 * 1024.0));
     }
+    ggml_sycl_plan_dry_run_lazy(index, plan);
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -18805,6 +18932,8 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     const ggml_sycl_tensor_inventory *  inventory,
     const ggml_sycl_plan_dry_run_opts & opts,
     size_t                              host_budget,
+    size_t                              mem_available,
+    bool                                budget_overridden,
     uint64_t (&device_budget)[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES]) {
     std::vector<ggml_sycl::placement_plan> plans;
     if (!ggml_sycl::vram_arena_enabled()) {
@@ -18816,6 +18945,10 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     // keeps the value a load would plan with.
     ggml_sycl::placement_kv_info                        kv     = g_placement_kv_info;
     ggml_sycl_inventory_fill_kv_info(kv, inventory);
+    // P3's reading and the budget's source are the dry run's own sample's, the one its budget came from, never the
+    // ledger's stored values.
+    kv.host_mem_available_pre = mem_available;
+    kv.host_budget_overridden = budget_overridden;
     if (kv.n_ubatch_context != 0) {
         GGML_LOG_INFO(
             "[PLAN-DRY-RUN] n_ubatch_context=%u is not modelled: every plan is the load's planning shape "
@@ -18894,7 +19027,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
     if (!module_guard) {
         return GGML_SYCL_LIFECYCLE_BUSY;
     }
-    if (!inventory || (inventory->count > 0 && !inventory->tensors) || !result) {
+    if (ggml_sycl_inventory_malformed(inventory) || !result) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
     // A caller built against another layout sends another struct_size. The size gate refuses it before anything is
@@ -18969,7 +19102,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
             std::lock_guard<std::mutex>        lock(g_tensor_inventory_mutex);
             ggml_sycl_plan_dry_run_saved_state saved(ggml_sycl_info().total_gpu_count);
             multi_device = ggml_sycl_plan_multi_device();
-            plans        = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, out.device_budget_bytes);
+            plans = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, sample.available_bytes, reserve_override,
+                                                 out.device_budget_bytes);
         }
         for (int d = 0; d < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES; ++d) {
             if (out.device_budget_bytes[d] != 0) {
@@ -126488,6 +126622,59 @@ extern "C" bool ggml_backend_sycl_role_bytes_for_testing(int device, int role, u
     return ggml_sycl::unified_cache_role_bytes_for_testing(device, static_cast<ggml_sycl::alloc_role>(role), out);
 }
 
+// C linkage from the header's declaration; the L4 proc gate finds the definition by its plain signature.
+bool ggml_sycl_plan_lazy_tables_for_testing(ggml_sycl_model_token model, uint64_t out[2]) {
+    if (out == nullptr) {
+        return false;
+    }
+    out[0] = 0;
+    out[1] = 0;
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot =
+        model.model_id != 0 ? ggml_sycl::lifecycle_find_placement_plan(model.model_id, model.load_txn_id) :
+                              ggml_sycl::lifecycle_find_candidate_placement_plan(model.load_txn_id);
+    if (!snapshot || !snapshot->plan) {
+        return false;
+    }
+    uint64_t resident = 0;
+    for (const ggml_sycl::placement_lazy_table & table : snapshot->plan->lazy_tables) {
+        resident += table.host_resident_bytes;
+    }
+    out[0] = snapshot->plan->lazy_tables.size();
+    out[1] = resident;
+    return true;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+extern "C" uint64_t ggml_sycl_test_plan_effect_begin(uint64_t load_txn_id) {
+    const uint64_t previous     = g_sycl_plan_load_effect_txn;
+    g_sycl_plan_load_effect_txn = load_txn_id;
+    return previous;
+}
+
+extern "C" void ggml_sycl_test_plan_effect_end(uint64_t previous_txn_id) {
+    g_sycl_plan_load_effect_txn = previous_txn_id;
+}
+
+extern "C" void * ggml_sycl_test_coverage_pin_make(uint64_t ring_bytes) {
+    return new ggml_sycl::lazy_test_coverage_pin(ggml_sycl::ggml_sycl_test_make_coverage_pin(ring_bytes));
+}
+
+extern "C" void ggml_sycl_test_coverage_pin_release(void * pin) {
+    delete static_cast<ggml_sycl::lazy_test_coverage_pin *>(pin);
+}
+
+extern "C" void * ggml_sycl_test_lazy_slot_begin(void * pin) {
+    if (pin == nullptr) {
+        return nullptr;
+    }
+    return new lazy_plan_slot_scope(*static_cast<const ggml_sycl::lazy_test_coverage_pin *>(pin));
+}
+
+extern "C" void ggml_sycl_test_lazy_slot_end(void * scope) {
+    delete static_cast<lazy_plan_slot_scope *>(scope);
+}
+#endif
+
 extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
     // Taken before the meta lock and released immediately: g_moe_bias_state_mutex
     // is strictly leaf (canonical §12.5), so it is never held across another.
@@ -126964,7 +127151,28 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_role_bytes_for_testing") == 0) {
         return (void *) ggml_backend_sycl_role_bytes_for_testing;
     }
+    if (strcmp(name, "ggml_sycl_plan_lazy_tables_for_testing") == 0) {
+        return (void *) ggml_sycl_plan_lazy_tables_for_testing;
+    }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (strcmp(name, "ggml_sycl_test_plan_effect_begin") == 0) {
+        return (void *) ggml_sycl_test_plan_effect_begin;
+    }
+    if (strcmp(name, "ggml_sycl_test_plan_effect_end") == 0) {
+        return (void *) ggml_sycl_test_plan_effect_end;
+    }
+    if (strcmp(name, "ggml_sycl_test_coverage_pin_make") == 0) {
+        return (void *) ggml_sycl_test_coverage_pin_make;
+    }
+    if (strcmp(name, "ggml_sycl_test_coverage_pin_release") == 0) {
+        return (void *) ggml_sycl_test_coverage_pin_release;
+    }
+    if (strcmp(name, "ggml_sycl_test_lazy_slot_begin") == 0) {
+        return (void *) ggml_sycl_test_lazy_slot_begin;
+    }
+    if (strcmp(name, "ggml_sycl_test_lazy_slot_end") == 0) {
+        return (void *) ggml_sycl_test_lazy_slot_end;
+    }
     if (strcmp(name, "ggml_backend_sycl_test_hold_live_update") == 0) {
         return (void *) ggml_backend_sycl_test_hold_live_update;
     }

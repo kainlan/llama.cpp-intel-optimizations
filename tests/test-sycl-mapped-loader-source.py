@@ -19,8 +19,8 @@ replace it (set at both populate sites, read by the planner).
 
 The fact and the ABI
   F1. ggml_sycl_tensor_inventory carries use_mmap_resolved, use_mlock_resolved and host_weight_layout_cpu in the padding
-      after n_ctx_context_is_default (offsets 185-187, so the struct stays 192 bytes and n_ubatch_context stays at
-      188), and both static_assert blocks pin the three offsets;
+      after n_ctx_context_is_default (offsets 185-187, so n_ubatch_context stays at 188; the struct is 208 bytes
+      since the lazy tables were appended after it), and both static_assert blocks pin the three offsets;
   F2. the four new exports (the renamed staging proc ggml_backend_sycl_stage_load_inventory_plan, planned_host_backing,
       mapped_buffer_type_for_device, mapped_buffer_from_file) are declared in ggml-sycl.h and resolvable through the
       strcmp proc table, the only way a GGML_BACKEND_DL build reaches them;
@@ -237,8 +237,8 @@ def clause_f1_inventory_fields(t: dict) -> list:
             problems.append(f"the inventory carries the derived fact `{field}`, not libllama's input")
     for rel in (H, GS):
         text = t[rel]
-        if not re.search(r"static_assert\s*\(\s*sizeof\s*\(\s*ggml_sycl_tensor_inventory\s*\)\s*==\s*192\s*,", text):
-            problems.append(f"{rel}: the inventory size pin is not 192")
+        if not re.search(r"static_assert\s*\(\s*sizeof\s*\(\s*ggml_sycl_tensor_inventory\s*\)\s*==\s*208\s*,", text):
+            problems.append(f"{rel}: the inventory size pin is not 208")
         for field, off in INVENTORY_OFFSETS.items():
             if not re.search(rf"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*{field}\s*\)\s*==\s*{off}\s*,", text):
                 problems.append(f"{rel}: no static_assert pins offsetof({field}) == {off}")
