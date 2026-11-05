@@ -1520,7 +1520,7 @@ The target lock inventory and mandatory order is concrete:
 | L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
 | L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
 | L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `unified_cache::deferred_frees_mutex_` (held around owner releases and taken by the enqueue paths), `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()`, and, last, the device cache's SCRATCH marked set `unified_cache::marked_set_mutex_` (taken before any pool call; the pinned pool's `mutex_` is the one listed lock named inside it) | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
-| L5 | allocation/pool/work locks: first, the pinned host pool's `pinned_chunk_pool::mutex_` (`pinned-pool.hpp`; `grow_into` and the footprint reconcile nest `g_runtime_alloc_mutex` under it); current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, the host SCRATCH demand ledger's `host_scratch_ledger::mutex_` and the host holder plan's `host_holder_plans::mutex_` (both `host-zone-plan.hpp`), the placement plans' `g_lifecycle_plan_mutex` (`unified-cache.cpp`), the lazy IO pool registry's `g_lazy_registry_mutex` (`lazy-io-pool.cpp`), and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
+| L5 | allocation/pool/work locks: first, the pinned host pool's `pinned_chunk_pool::mutex_` (`pinned-pool.hpp`; `grow_into` and the footprint reconcile nest `g_runtime_alloc_mutex` under it); current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, the host SCRATCH demand ledger's `host_scratch_ledger::mutex_` and the host holder plan's `host_holder_plans::mutex_` (both `host-zone-plan.hpp`), the host SCRATCH transactions' `unified_cache::host_scratch_txn_mutex_` (`unified-cache.hpp`), the placement plans' `g_lifecycle_plan_mutex` (`unified-cache.cpp`), the lazy IO pool registry's `g_lazy_registry_mutex` (`lazy-io-pool.cpp`), and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, the zone-reset audit's `zone_audit_state::mutex` (`unified-cache.cpp`), and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
@@ -1637,6 +1637,21 @@ into its merged state under that lock. `device_state`, which dispatch admission
 reads, copies one device's merged state under it and merges nothing. `commit`
 prints after releasing it. The slot re-size and the pools' re-size that follow a
 commit run with neither lock held.
+
+The host SCRATCH transactions' `unified_cache::host_scratch_txn_mutex_`
+(`unified-cache.hpp`; docs/design/sycl-mmap-host-tier.md §4.4, §M75) guards one
+device cache's open transactions: each context's owner, thread, mark and the
+chunks its zone grew while the transaction was open. It sits at L5 beside the
+ledger whose growth it records, and it is **strictly leaf: never held while any
+other lock is acquired, and no device work, callback or logging happens under
+it.** The one allocation under it is a transaction's own vector growth through
+the standard allocator, which takes no lock of this backend; a `bad_alloc`
+there leaves the transaction as it was and WARNs after the release. The grow
+hook runs after `grow_zone` has returned, so the pinned pool's `mutex_` is
+already released. A closing or truncating step takes its chunks out under the
+lock and releases it before it files them, so `marked_set_mutex_` and the
+pool's `mutex_` are taken only after it drops. The ledger's `drop_context` and
+`release_reserved`, and the witness line, also run after it drops.
 
 The MoE CONTROL reservation ledger's `g_mutex` (`moe-control-plan.cpp`, `dimc`)
 guards the per-(device, plan) reservation table, the conversion generations, and

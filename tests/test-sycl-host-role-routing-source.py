@@ -1964,6 +1964,7 @@ CLAUSES = [
     ("grow-host-scratch-gone", REQUIRED, clause_grow_host_scratch_gone, None, None),
     ("notify-compute-unused", REQUIRED, clause_notify_compute_unused, None, None),
     ("dlopen-header", REQUIRED, clause_dlopen_header, None, None),
+    ("open-touches-no-set", REQUIRED, clause_open_touches_no_set, None, None),
     ("slot-growth-plan-only", EXPECTED_RED, clause_slot_growth_plan_only, "Task 7",
      "slot_replace is called by ['host_staging_slots::admit'"),
     ("pools-from-plan", EXPECTED_RED, clause_pools_from_plan, "Task 7",
@@ -1978,8 +1979,6 @@ CLAUSES = [
      "llama_context does not resolve ggml_backend_sycl_notify_host_buffer_sizes"),
     ("owner-end-wired", EXPECTED_RED, clause_owner_end_wired, "Task 7",
      "ggml_backend_sycl_free does not call the owner's end"),
-    ("open-touches-no-set", EXPECTED_RED, clause_open_touches_no_set, "Task 7",
-     "no host_scratch_trial OPEN step in the tree"),
     ("scratch-fold", EXPECTED_RED, clause_scratch_fold, "Task 7", "beyond the four host terms (§M62 (A))"),
     ("runtime-term", EXPECTED_RED, clause_runtime_term, "Task 7",
      "names ['pp_pipeline_scratch_bytes', 'pp_moe_onednn_scratch_bytes']"),
@@ -2088,16 +2087,6 @@ _HAS_PLAN_MEMBER = ("    decltype(&ggml_backend_sycl_has_active_placement_plan) 
 _HDR_ARG = " " * 65  # the column of the notify's parameters in ggml-sycl.h
 _NOTIFY_MEMBER = "    bool (*notify_host_buffer_sizes)(ggml_backend_t, size_t, size_t) = nullptr;\n"
 _PLAN_MEMBER = "    bool (*plan_host_holders)(ggml_backend_sched_t, struct ggml_cgraph *) = nullptr;\n"
-_OPEN_TRIAL = (UC, None, "\nsize_t unified_cache::host_scratch_trial(host_scratch_trial_op op, uint64_t owner) {\n"
-                         "    switch (op) {\n"
-                         "        case host_scratch_trial_op::OPEN:\n"
-                         "            return host_scratch_trial_open_locked(owner);\n"
-                         "        case host_scratch_trial_op::RETURN:\n"
-                         "            return host_scratch_return_chunks(host_scratch_trial_chunks(owner), owner);\n"
-                         "        default:\n"
-                         "            return 0;\n"
-                         "    }\n"
-                         "}\n")
 _WITHDRAW_CHECKED = ("            if (!host_arena_->withdraw_zone_chunk(host_zone_id::SCRATCH, chunk_idx)) {\n"
                      "                GGML_LOG_WARN(\n"
                      "                    \"[HOST-ARENA] SCRATCH return skipped dev=%d chunk=%zu: not a chunk of the "
@@ -2175,7 +2164,6 @@ FIXTURES = {
         (GS, "    delete sycl_ctx;\n    // The backend-member check",
          _OWNER_END + "    delete sycl_ctx;\n    // The backend-member check"),
     ],
-    "open-touches-no-set": [_OPEN_TRIAL],
     "scratch-fold": [(UC, _FOLD, "    for (size_t bytes : " + _FOLD_FOUR + ") {\n")],
     "runtime-term": [
         (UCH, "    terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes + "
@@ -2474,7 +2462,7 @@ MUTANTS = [
      [(GS, _OWNER_END + "    delete sycl_ctx;\n", "    delete sycl_ctx;\n" + _OWNER_END)],
      "calls the owner's end after delete sycl_ctx"),
     ("open-returns-chunks", "open-touches-no-set",
-     [(UC, "            return host_scratch_trial_open_locked(owner);\n",
+     [(UC, "            return host_scratch_trial_open(owner, n_ubatch);\n",
        "            return host_scratch_return_chunks(host_scratch_trial_chunks(owner), owner);\n")],
      "touches the marked set in its OPEN step"),
     ("fold-device-term", "scratch-fold",
@@ -2489,7 +2477,7 @@ MUTANTS = [
 
 # A target-gone control removes what an EXPECTED-RED clause inspects. The clause must then fail with a distinct
 # reason and never with its recorded one, so a tree that deletes the target does not score as still waiting for its
-# landing task. open-touches-no-set has none: its red state is the OPEN step's absence itself.
+# landing task. A clause whose red state is its target's absence itself goes in NO_GONE instead.
 _GONE_LC = ([(LC, None, None)], "src/llama-context.cpp is missing")
 GONE = {
     "slot-growth-plan-only": ([(PLAN, None, None)], "slot_replace is called by []"),
@@ -2507,7 +2495,7 @@ GONE = {
                      "the host SCRATCH zone sum is not found"),
     "runtime-term": ([(UCH, "    terms.runtime = ", "    terms.runtime_moved = ")], "sets no runtime term"),
 }
-NO_GONE = ("open-touches-no-set",)
+NO_GONE = ()
 
 # An edit that changes no clause's subject: every REQUIRED clause must still hold, so a mutant's failure is its edit's.
 NEGATIVE_CONTROL = [(rel, None, "\n// routing gate negative control: a comment changes nothing\n")

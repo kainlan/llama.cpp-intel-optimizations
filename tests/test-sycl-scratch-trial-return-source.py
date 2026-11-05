@@ -526,7 +526,9 @@ def test_production_rejects_an_uncharged_grow_and_a_lost_witness():
     assert "host_scratch_trial_note_grow(" in grow, "control precondition: grow_scratch_zone charges no grow"
     texts[UC] = uc.replace(grow, grow.replace("host_scratch_trial_note_grow(", "(void) sizeof("), 1)
     rejects("production", texts, "grow_scratch_zone (the ledger's ensure) does not charge its grow")
-    rejects("production", planted(UC, "n_ubatch=%u", "n_ubatch=%d"), "witness")
+    # Anchored on the witness itself: other lines of the file carry `n_ubatch=%u` too.
+    rejects("production", planted(UC, '"[HOST-ARENA] SCRATCH %s dev=%d n_ubatch=%u',
+                                  '"[HOST-ARENA] SCRATCH %s dev=%d n_ubatch=%d'), "witness")
 
 
 def test_negative_control_comments_change_nothing():

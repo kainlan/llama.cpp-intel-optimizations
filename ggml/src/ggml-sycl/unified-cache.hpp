@@ -7051,14 +7051,43 @@ class unified_cache {
     std::vector<marked_chunk_entry> marked_set_;
 
     // One context's open SCRATCH transaction: its thread (the one whose grows it records), whether it is the trial's
-    // (OPEN) or the reserve's own (MARK), the chunk count at its MARK, and the chunks it grew, in order.
+    // (OPEN) or the reserve's own (MARK), the n_ubatch it opened at, which the witness names, the chunk count at its
+    // MARK, and the chunks it grew, in order.
     struct host_scratch_txn {
         uint64_t            owner = 0;
         std::thread::id     thread;
-        bool                trial = false;
-        size_t              mark  = 0;
+        bool                trial    = false;
+        uint32_t            n_ubatch = 0;
+        size_t              mark     = 0;
         std::vector<size_t> chunks;
     };
+
+    // What a closing or truncating step took out of a transaction under host_scratch_txn_mutex_, acted on after it
+    // drops: whether the owner had one open, whose it was, and the chunks it gives up.
+    struct host_scratch_txn_taken {
+        bool                found    = false;
+        bool                trial    = false;
+        uint32_t            n_ubatch = 0;
+        std::vector<size_t> chunks;
+    };
+
+    // OPEN and MARK, each under host_scratch_txn_mutex_ alone. They move no chunk and return 0.
+    size_t                 host_scratch_trial_open(uint64_t owner, uint32_t n_ubatch);
+    size_t                 host_scratch_trial_mark(uint64_t owner, uint32_t n_ubatch);
+    // KEEP and RETURN take every chunk and close the transaction; RETURN_TO_MARK (`to_mark`) takes the chunks grown
+    // since the mark and leaves it open.
+    host_scratch_txn_taken host_scratch_trial_take(uint64_t owner, bool to_mark);
+    // RETURN and RETURN_TO_MARK: the witness, the filing, and the withdrawn bytes given back to the ledger.
+    size_t host_scratch_trial_file(uint64_t owner, const host_scratch_txn_taken & taken, const char * txn);
+    // The SCRATCH bytes of `chunks` still counted in the zone (each chunk's zone share; a withdrawn or released chunk
+    // counts 0).
+    size_t host_scratch_counted_bytes(const std::vector<size_t> & chunks) const;
+    // `[HOST-ARENA] SCRATCH <txn> dev=%d n_ubatch=%u kept|returned %.1f MB (%zu chunk(s))`, only when chunks moved.
+    void   host_scratch_trial_witness(const char * txn,
+                                      uint32_t     n_ubatch,
+                                      const char * verb,
+                                      size_t       bytes,
+                                      size_t       n_chunks);
 
     mutable std::mutex            host_scratch_txn_mutex_;
     std::vector<host_scratch_txn> host_scratch_txns_;
