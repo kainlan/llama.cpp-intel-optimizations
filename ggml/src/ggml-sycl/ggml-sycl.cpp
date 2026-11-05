@@ -35250,7 +35250,7 @@ static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int 
 
 // The tier read off a buffer whose context is taken to be a ggml_backend_sycl_buffer_context, with no buffer-type
 // test. Only the SYCL, SYCL_HostCompute and CPU-offload compute types hold one (ggml_backend_buffer_has_sycl_context);
-// for any other type this is the pre-existing undefined read th32 leaves as it is (§3.2, r28 n-2).
+// for any other type this is the pre-existing undefined read th32 leaves as it is (§3.2).
 static bool ggml_sycl_buffer_context_tier_is_vram(ggml_backend_buffer_t buffer) {
     auto * buf_ctx = static_cast<ggml_backend_sycl_buffer_context *>(buffer->context);
     return buf_ctx->managed_meta.tier == ggml_sycl::alloc_tier::DEVICE_VRAM;
@@ -54336,7 +54336,7 @@ ggml_sycl_host_backing ggml_backend_sycl_planned_host_backing(const char * tenso
 // non-dereferenceable sentinel, so ggml_gallocr reads the tensor as allocated; its nominal size is the table's bytes;
 // is_host is false, so ggml_backend_sycl_get_weight_cache_key never registers it; its usage is WEIGHTS, so the
 // scheduler gives the gather to the backend that supports the type (§7.2). The interface is its own, never another
-// buffer type's (r26 M-2): init_tensor is null, so binding sets no extra and registers nothing, and every data call
+// buffer type's: init_tensor is null, so binding sets no extra and registers nothing, and every data call
 // aborts naming the table.
 
 struct ggml_backend_sycl_lazy_buffer_context {
@@ -54457,7 +54457,7 @@ static void ggml_backend_sycl_lazy_buffer_clear(ggml_backend_buffer_t buffer, ui
 static const ggml_backend_buffer_i ggml_backend_sycl_lazy_buffer_interface = {
     /* .free_buffer     = */ nullptr,  // the context cleanup drops the table reference
     /* .get_base        = */ ggml_backend_sycl_lazy_buffer_get_base,
-    /* .init_tensor     = */ nullptr,  // binding sets no extra and registers nothing (r26 M-2)
+    /* .init_tensor     = */ nullptr,  // binding sets no extra and registers nothing
     /* .memset_tensor   = */ ggml_backend_sycl_lazy_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_sycl_lazy_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_sycl_lazy_buffer_get_tensor,

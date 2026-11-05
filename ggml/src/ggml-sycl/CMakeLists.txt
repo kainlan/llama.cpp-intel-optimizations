@@ -8074,7 +8074,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # memory, the STORAGE descriptor, the last reference's release, the activation check (one extra chunk refuses,
     # naming both numbers, and aborts under strict leases), both descriptor buffer types, the descriptor guard at
     # ggml_sycl_get_data_ptr_slow's entry (its own process: one line, exit 134), and is_device_vram_buffer's
-    # descriptor test over every buffer type the backend exposes. Backend-level (r37 m-4): no libllama, a table built
+    # descriptor test over every buffer type the backend exposes. Backend-level: no libllama, a table built
     # from a fixture-written file in the working directory. Its tables come from the unified cache's owner-first entry
     # and its guard child initialises SYCL, so it carries the OOM-family labels, runs alone, on the B50. Lead-run.
     #

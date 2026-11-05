@@ -851,7 +851,7 @@ std::vector<buft_row> exposed_bufts() {
     return rows;
 }
 
-// (13) No other buffer type's is_device_vram_buffer answer changes (r28 n-2), over every type the backend exposes:
+// (13) No other buffer type's is_device_vram_buffer answer changes, over every type the backend exposes:
 // each row's buffer carries a zeroed context, so today's read is true for every type and the descriptor test is the
 // only thing that can make the answer false. Its RED cannot fail, since without the descriptor test no answer can
 // change; --mutant predicate-too-broad is its positive control. Engagement: every factory returned a type and
