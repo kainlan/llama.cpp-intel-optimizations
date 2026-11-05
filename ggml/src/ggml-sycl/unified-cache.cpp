@@ -22256,6 +22256,16 @@ static size_t host_ledger_test_live_charged_bytes() {
 }
 #endif
 
+size_t unified_alloc_host_cpu_charged_bytes(const alloc_metadata & meta) {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto                  it = g_runtime_alloc_registry.find(meta.ptr);
+    if (it == g_runtime_alloc_registry.end() || it->second.state != runtime_alloc_state::LIVE ||
+        it->second.handle.tier != alloc_tier::HOST_CPU || !(it->second.handle.key() == meta.key())) {
+        return 0;
+    }
+    return it->second.charged_bytes;
+}
+
 bool unified_alloc_validate_registry(int device, const char * where) {
     const registry_tier_sums sums                 = unified_alloc_registry_tier_sums();
     const auto &             registry_device      = sums.device;
@@ -26108,7 +26118,8 @@ bool unified_cache::configure_host_zones(size_t weight_bytes,
     // The refusal changes nothing: the zones, every flag, the marked set and the reserved figures stay one state.
     if (!host_arena_->configure_zones(weight_bytes, kv_bytes, staging_bytes, scratch_bytes)) {
         if (ggml_sycl_strict_enabled()) {
-            GGML_ABORT("[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives (GGML_SYCL_STRICT)");
+            GGML_ABORT(
+                "[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives (GGML_SYCL_STRICT_LEASES)");
         }
         return false;
     }
@@ -33896,7 +33907,9 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
         t.table_bytes       = info.table_bytes;
         t.consumer_device   = lazy_consumer_device(plan, info.consumer_layer);
         t.cache_floor_slots = 2ull * placement_load_n_ubatch(kv_info.n_ubatch) * info.rows_per_token;
-        const size_t body   = host_cpu_mapped_size(info.table_bytes);
+        // The HOST term is the body the materialization allocates, the O_DIRECT window over the table (§3.3).
+        const size_t body =
+            host_cpu_mapped_size(lazy_table_host_body_request_bytes(info.file_offset, info.table_bytes));
         const size_t with   = host_ledger_sat_add(used, body);
         const size_t span   = lazy_block_ring_span(info.row_size);
         if (body != 0 && with <= fit_room && with <= p3_room) {

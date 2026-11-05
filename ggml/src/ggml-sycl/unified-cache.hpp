@@ -5523,8 +5523,8 @@ class unified_cache {
     // return as a hard failure and fall back to non-pinned allocation.
     bool   host_zone_grow(host_zone_id zone, size_t additional_bytes);
     // Releases the device's empty marked SCRATCH chunks first. False only when a withdrawn chunk survives, so the pool
-    // refused the rebuild by name (under GGML_SYCL_STRICT it aborts instead); a capacity shortfall returns true with
-    // the zones unconfigured and the reserved figures zeroed, as before.
+    // refused the rebuild by name (under GGML_SYCL_STRICT_LEASES it aborts instead); a capacity shortfall returns
+    // true with the zones unconfigured and the reserved figures zeroed, as before.
     bool   configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
     bool   host_zones_configured() const;
     // One grow_zone(SCRATCH, request) call, the host SCRATCH demand ledger's only growth (§4.4 "Ensure capacity").
@@ -8015,6 +8015,11 @@ struct file_mapping_request {
 };
 
 allocation_result unified_allocate_file_mapping(const file_mapping_request & req) noexcept;
+
+// The host-ledger charge the live HOST_CPU registry row of `meta`'s exact allocation holds: host_cpu_mapped_size of its
+// request, the ledger's figure and never the handle's requested size. 0 when no live row has that exact key or the row
+// is not HOST_CPU. A lazy table's activation check sums it over the table's records (th32 §10).
+size_t unified_alloc_host_cpu_charged_bytes(const alloc_metadata & meta);
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The registry's host-pinned and file-mapped byte sums: the figures unified_alloc_validate_registry compares with the

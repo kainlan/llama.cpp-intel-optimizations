@@ -366,7 +366,11 @@ over the backend's tokenized sources (llama.cpp-5efe C2, llama.cpp-th32 T1a).
 **Rule (`HOST_CPU`, llama.cpp-th32 T1):** the `HOST_CPU` tier is host memory only the
 CPU reads: one anonymous mapping, `MADV_HUGEPAGE`, locked in full. It is requested
 only through `unified_allocate_owner(req)` with `constraints.must_host_cpu`, and that
-field selects the tier and nothing else. The owner entry charges the process-global host
+field selects the tier and nothing else. `test-sycl-alloc-zone-contract` clause (b) reads
+it as the third tier flag: a request establishes exactly one of `must_device`,
+`must_host_pinned` and `must_host_cpu` by an unconditional literal true, each of the other two
+unwritten or its last write an unconditional literal false, and a `must_host_cpu` request is a host tier
+that clause (d)'s zone rules excuse, as a pinned one is. The owner entry charges the process-global host
 ledger for it, by `host_cpu_mapped_size(size)`, before it mints the control (th32 §4.2,
 T2), and hands the charge to `unified_alloc` through the thread-local
 `g_allocating_charge`. `unified_alloc` refuses a `must_host_cpu` request that holds no

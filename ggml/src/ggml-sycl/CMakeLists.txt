@@ -8070,6 +8070,65 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         SKIP_RETURN_CODE 77
         TIMEOUT 120)
 
+    # The lazy table object (th32 §3.2, §3.3, §10, §11 T4): the HOST body's eager O_DIRECT read into locked HOST_CPU
+    # memory, the STORAGE descriptor, the last reference's release, the activation check (one extra chunk refuses,
+    # naming both numbers, and aborts under strict leases), both descriptor buffer types, the descriptor guard at
+    # ggml_sycl_get_data_ptr_slow's entry (its own process: one line, exit 134), and is_device_vram_buffer's
+    # descriptor test over every buffer type the backend exposes. Backend-level: no libllama, a table built
+    # from a fixture-written file in the working directory. Its tables come from the unified cache's owner-first entry
+    # and its guard child initialises SYCL, so it carries the OOM-family labels, runs alone, on the B50. Lead-run.
+    #
+    # The -mutant-predicate-too-broad registration is the buffer-type table's positive control: with
+    # ggml_backend_sycl_buffer_is_lazy also claiming the SYCL device type, the table must FAIL naming that type's
+    # changed answer. It is a runtime seam in ggml-sycl.cpp (PRIVATE_TESTING) rather than a compile variant, which
+    # would build ggml-sycl.cpp and the backend's device link a second time.
+    #
+    # The -mutant-read-whole-window registration is arm (2)'s end-of-file positive control: the table that ends its
+    # file at an unaligned end (Qwen's geometry), built by a read that asks for the whole O_DIRECT window instead of
+    # stopping at the table's last byte, must refuse naming that geometry. Also a runtime seam: a PRIVATE_TESTING
+    # constructor in lazy-table.cpp.
+    string(CONCAT _lazy_table_env
+        "ONEAPI_DEVICE_SELECTOR=level_zero:1;"
+        "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+    add_executable(test-sycl-lazy-table
+        tests/test-sycl-lazy-table.cpp)
+    target_link_libraries(test-sycl-lazy-table PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-table PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-table COMMAND test-sycl-lazy-table)
+    set_tests_properties(test-sycl-lazy-table PROPERTIES
+        LABELS "sycl;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "${_lazy_table_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+    string(CONCAT _lazy_table_mutant_regex
+        "FAIL \\(13\\) no other buffer type's is_device_vram_buffer answer changes: "
+        "SYCL0 \\(ggml_backend_sycl_buffer_type\\): is_device_vram_buffer answered 0, today's read 1, want 1")
+    add_test(NAME test-sycl-lazy-table-mutant-predicate-too-broad
+        COMMAND test-sycl-lazy-table --mutant predicate-too-broad)
+    set_tests_properties(test-sycl-lazy-table-mutant-predicate-too-broad PROPERTIES
+        LABELS "sycl;cache;mem-handle;gpu-serial;mutant"
+        ENVIRONMENT "${_lazy_table_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+        PASS_REGULAR_EXPRESSION "${_lazy_table_mutant_regex}")
+    string(CONCAT _lazy_table_eof_mutant_regex
+        "FAIL \\(2\\) a HOST table reads its rows eagerly into one locked HOST_CPU record: "
+        "the table that ends its file at an unaligned end \\(offset 192, 4195600 B, the window 2608 B past the end "
+        "of the file\\) refused: lazy-table-read-failed: read 4195792 of 4198400 B")
+    add_test(NAME test-sycl-lazy-table-mutant-read-whole-window
+        COMMAND test-sycl-lazy-table --mutant read-whole-window)
+    set_tests_properties(test-sycl-lazy-table-mutant-read-whole-window PROPERTIES
+        LABELS "sycl;cache;mem-handle;gpu-serial;mutant"
+        ENVIRONMENT "${_lazy_table_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+        PASS_REGULAR_EXPRESSION "${_lazy_table_eof_mutant_regex}")
+
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and
     # requires them to be rejected.  It is not redundant with the source gate in

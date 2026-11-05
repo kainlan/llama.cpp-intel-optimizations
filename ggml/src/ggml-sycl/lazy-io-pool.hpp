@@ -35,6 +35,19 @@ constexpr size_t lazy_block_ring_span(size_t row_size) {
     return (row_size + 2 * (LAZY_IO_BLOCK_BYTES - 1)) / LAZY_IO_BLOCK_BYTES * LAZY_IO_BLOCK_BYTES;
 }
 
+// The bytes a HOST table's body requests for a table at `file_offset` of `table_bytes` (§3.3, D1): the O_DIRECT window
+// over the table, from the start of the block that holds its first byte to the end of the block that holds its last,
+// so the table sits at body + file_offset % LAZY_IO_BLOCK_BYTES. The HOST term the planner charges and the request the
+// materialization makes both read this one rule, here so that neither needs the lazy table's SYCL header. SIZE_MAX when
+// the window does not fit a size_t.
+constexpr size_t lazy_table_host_body_request_bytes(uint64_t file_offset, size_t table_bytes) {
+    const size_t head = static_cast<size_t>(file_offset % LAZY_IO_BLOCK_BYTES);
+    if (table_bytes > SIZE_MAX - head - (LAZY_IO_BLOCK_BYTES - 1)) {
+        return SIZE_MAX;
+    }
+    return (head + table_bytes + LAZY_IO_BLOCK_BYTES - 1) / LAZY_IO_BLOCK_BYTES * LAZY_IO_BLOCK_BYTES;
+}
+
 // A STORAGE row cache's slab grows in chunks of this many bytes (§3.3, §6.3). The planner charges a cache's slab as its
 // whole chunks and one remainder, and the row cache the T4 row (design §11) adds allocates the same chunks, so its
 // activation check compares like with like.

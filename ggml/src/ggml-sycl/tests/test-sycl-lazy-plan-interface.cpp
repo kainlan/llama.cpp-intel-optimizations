@@ -34,6 +34,7 @@
 using namespace host_ledger_test_harness;
 using namespace lazy_table_test;
 using ggml_sycl::host_cpu_mapped_size;
+using ggml_sycl::lazy_table_host_body_request_bytes;
 using host_plan_shaped_inventory::loader_inventory;
 
 namespace {
@@ -108,7 +109,10 @@ bool reading_too_low(arm_result & r, size_t bytes) {
 }
 
 // (a) Through the stage: a 64 MiB table in the inventory is HOST in the early candidate, the late candidate and the
-// published plan, each holding the table's mapping, and the published plan leaves with the model.
+// published plan, each holding the table's body, and the published plan leaves with the model. The table sits at
+// 4032, the unaligned offset of DeepSeek's blk.14.engram_embd, where the body's O_DIRECT window crosses one more huge
+// page than the table alone (66 MiB against 64 MiB), so the plan's term is the materialization's rule (§3.3) and
+// not the table's own size.
 // Engagement: no candidate exists before the first stage (the reader answers VOID, not 0), both stages and the load's
 // end succeed, and the published plan is gone after the unload.
 // Mutants: the inventory's tables not copied into the planner's input (count 0); the late stage or the publish
@@ -117,9 +121,10 @@ arm_result arm_a_through_the_stage() {
     arm_result                arr;
     loader_inventory          inv;
     ggml_sycl_lazy_table_info table = lazy_table("blk.1.engram_embd.weight", (64 * MiB) / 34);
+    table.file_offset               = 4032;
     inv.inv.lazy_tables             = &table;
     inv.inv.lazy_table_count        = 1;
-    const size_t resident           = host_cpu_mapped_size(table.size);
+    const size_t resident = host_cpu_mapped_size(lazy_table_host_body_request_bytes(table.file_offset, table.size));
 
     const ggml_sycl_placement_envelope envelope{ inv.inv.n_ctx, inv.inv.n_ubatch, 1, -1 };
 
@@ -222,8 +227,8 @@ arm_result arm_b_the_slot_reaches_the_planner() {
            "no [PLACEMENT] line places the table STORAGE");
     expect(arr, got.resident >= floor_raw,
            "the cache holds " + num(got.resident) + " bytes, below its floor's " + num(floor_raw) + " slab bytes");
-    expect(arr, got.resident < host_cpu_mapped_size(table.size),
-           "the cache holds " + num(got.resident) + " bytes, not less than the table's mapping");
+    expect(arr, got.resident < host_cpu_mapped_size(lazy_table_host_body_request_bytes(table.file_offset, table.size)),
+           "the cache holds " + num(got.resident) + " bytes, not less than the table's HOST body");
     if (!placed.empty()) {
         expect(arr, printed(placed.back(), "resident") == got.resident,
                "the candidate's resident bytes " + num(got.resident) + " are not the [PLACEMENT] line's " +
