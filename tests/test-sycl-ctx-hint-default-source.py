@@ -347,7 +347,10 @@ def claim_sentinel_has_one_reader(tree: dict[str, str], value_tree: dict[str, st
 
 TOOL_MAIN_SIG = "int main(int argc, char ** argv)"
 TOOL_HINT = "params.n_ctx_hint = common_n_ctx_hint(args.n_ctx);"
-HINT_WRITE_RE = re.compile(r"\bn_ctx_hint\s*=(?!=)")
+# Every write to the hint: plain and compound assignment, and increment or decrement either side of it.
+HINT_WRITE_RE = re.compile(r"\bn_ctx_hint\s*(?:<<|>>|[-+*/%|&^])?=(?!=)"
+                           r"|\bn_ctx_hint\s*(?:\+\+|--)"
+                           r"|(?:\+\+|--)\s*(?:\w+\s*(?:\.|->)\s*)*n_ctx_hint\b")
 
 
 def claim_tool_asks_common(tool: str) -> bool:
@@ -731,6 +734,21 @@ def test_mutant_tool_casts_c_itself_fails():
 def test_mutant_tool_overwrites_the_hint_fails():
     """The tool asks common, then sets the hint a second time."""
     assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " params.n_ctx_hint = 0;"))
+
+
+def test_mutant_tool_adjusts_the_hint_after_asking_fails():
+    """The tool asks common, then adjusts the hint with a compound assignment."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " params.n_ctx_hint += 1;"))
+
+
+def test_mutant_tool_increments_the_hint_after_asking_fails():
+    """The tool asks common, then increments the hint."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " params.n_ctx_hint++;"))
+
+
+def test_mutant_tool_decrements_the_hint_before_use_fails():
+    """The tool asks common, then pre-decrements the hint."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " --params.n_ctx_hint;"))
 
 
 def test_mutant_tool_asks_outside_main_fails():
