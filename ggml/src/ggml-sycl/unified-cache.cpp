@@ -26305,6 +26305,7 @@ pinned_chunk_release unified_cache::release_marked_chunk_locked(size_t          
     return status;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 size_t unified_cache::marked_entries() const {
     std::lock_guard<std::mutex> lock(marked_set_mutex_);
     return marked_set_.size();
@@ -26316,6 +26317,7 @@ size_t unified_cache::marked_entries(size_t chunk_idx) const {
         std::count_if(marked_set_.begin(), marked_set_.end(),
                       [chunk_idx](const marked_chunk_entry & e) { return e.chunk_idx == chunk_idx; }));
 }
+#endif
 
 void unified_cache::print_marked_released(size_t n_released, size_t released_bytes) {
     if (n_released == 0) {

@@ -875,11 +875,13 @@ void pinned_chunk_pool::reconcile_stranded_locked() const {
     stranded_.erase(gone, stranded_.end());
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 size_t pinned_chunk_pool::stranded_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
     reconcile_stranded_locked();
     return stranded_.size();
 }
+#endif
 
 bool pinned_chunk_pool::withdraw_zone_chunk(host_zone_id zone, size_t chunk_idx) {
     const size_t                zi = static_cast<size_t>(zone);

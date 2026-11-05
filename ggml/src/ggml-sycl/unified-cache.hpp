@@ -5435,9 +5435,11 @@ class unified_cache {
     size_t               host_scratch_owner_end(uint64_t owner);
     // The public form, for a caller holding neither lock: the orphaned chunk's emptying free and last lease's drop.
     pinned_chunk_release release_marked_chunk(size_t chunk_idx) noexcept;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
     // Test accessors: the set's entries, and those for one chunk.
-    size_t               marked_entries() const;
-    size_t               marked_entries(size_t chunk_idx) const;
+    size_t marked_entries() const;
+    size_t marked_entries(size_t chunk_idx) const;
+#endif
 
     size_t pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
 

@@ -257,9 +257,11 @@ class pinned_chunk_pool {
 
     pinned_chunk_usage zone_chunk_usage(host_zone_id zone, size_t chunk_idx) const;
 
-    // Released backings whose registry row was still present when their carrier ran: their footprint stays counted
-    // until the registry drops the row.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Test accessor: released backings whose registry row was still present when their carrier ran. Their footprint
+    // stays counted until the registry drops the row.
     size_t stranded_count() const;
+#endif
 
     bool zones_configured() const { return zones_configured_; }
 
