@@ -338,9 +338,10 @@ if (BUILD_TESTING)
 
     # The hot-row cache of a STORAGE lazy table (th32 §6.3, §6.4, §11 T4): CLOCK replacement, shard independence, the
     # 13.3 B/slot index, the no-leases rule, the yield that frees a chunk with no wait while rows stay gatherable, the
-    # counters. lazy-row-cache.cpp includes no SYCL header and the test hands the cache fixture memory through its one
-    # seam, so this target links the translation unit alone with ggml-base for the log: no device, no unified cache, no
-    # SYCL module.
+    # counters, and the yieldable rule the planner shares. lazy-row-cache.cpp includes no SYCL header and the test hands
+    # the cache fixture memory through its one seam, so this target links that translation unit and host-cpu-mapping.cpp
+    # (the one sizing function the rule counts with, also device-free) with ggml-base for the log: no device, no unified
+    # cache, no SYCL module.
     #
     # Each MUTANTS pair is a positive control: a macro that plants one defect in lazy-row-cache.cpp, and the FAIL line
     # the test prints when it does. Each builds its own executable, test-sycl-lazy-row-cache-mutant-<macro suffix>, and
@@ -355,12 +356,16 @@ if (BUILD_TESTING)
         "${_lrc_yield}: the yield did not return within 3000 ms while a reader was inside a lookup")
     string(CONCAT _lrc_re_release_under_lock "${_lrc_yield}: chunk 63 was released while a shard lock was held")
     string(CONCAT _lrc_re_yield_floor "${_lrc_yield}: a yield of everything left 0 chunks, want the 16 floor chunks")
+    string(CONCAT _lrc_re_yieldable_by_subtraction
+        "FAIL \\(8\\) the cache and the planner count one yieldable figure: "
+        "the yieldable bytes at Qwen's geometry are 583008256, want 276824064")
     set(_lazy_row_cache_mutants
         LAZY_ROW_CACHE_MUTANT_NO_REFERENCE_BIT         "${_lrc_re_no_reference_bit}"
         LAZY_ROW_CACHE_MUTANT_ONE_LOCK                 "${_lrc_re_one_lock}"
         LAZY_ROW_CACHE_MUTANT_YIELD_WAITS_FOR_READERS  "${_lrc_re_yield_waits}"
         LAZY_ROW_CACHE_MUTANT_RELEASE_UNDER_SHARD_LOCK "${_lrc_re_release_under_lock}"
-        LAZY_ROW_CACHE_MUTANT_YIELD_FLOOR              "${_lrc_re_yield_floor}")
+        LAZY_ROW_CACHE_MUTANT_YIELD_FLOOR              "${_lrc_re_yield_floor}"
+        LAZY_ROW_CACHE_MUTANT_YIELDABLE_BY_SUBTRACTION "${_lrc_re_yieldable_by_subtraction}")
     set(_lazy_row_cache_variants test-sycl-lazy-row-cache "" "")
     list(LENGTH _lazy_row_cache_mutants _n)
     math(EXPR _last "${_n} - 1")
@@ -383,7 +388,8 @@ if (BUILD_TESTING)
         list(GET _lazy_row_cache_variants ${_k} _regex)
         add_executable(${_name}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-sycl-lazy-row-cache.cpp
-            lazy-row-cache.cpp)
+            lazy-row-cache.cpp
+            host-cpu-mapping.cpp)
         target_include_directories(${_name} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
         target_compile_definitions(${_name} PRIVATE GGML_SYCL_PRIVATE_TESTING=1)

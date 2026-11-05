@@ -1,9 +1,9 @@
 //
 // The hot-row cache of a STORAGE lazy table (th32 §6.3, §6.4; row T4b), host-only on fixture memory: the CLOCK
 // replacement, shard independence, the index width, the no-leases rule, the yield that frees a chunk with no wait
-// while every other row stays gatherable, and the counters. The cache's memory comes through its one seam,
-// lazy_row_cache_memory_source, which here hands out plain memory: the binary links lazy-row-cache.cpp and ggml-base
-// alone, with no device, no unified cache and no SYCL module.
+// while every other row stays gatherable, the counters, and the yieldable rule the planner shares. The cache's memory
+// comes through its one seam, lazy_row_cache_memory_source, which here hands out plain memory: the binary links
+// lazy-row-cache.cpp, host-cpu-mapping.cpp and ggml-base alone, with no device, no unified cache and no SYCL module.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -704,6 +704,71 @@ arm_result arm_invalid_config() {
     return r;
 }
 
+// (8) The cache and the planner count one yieldable figure (§6.4, §10): lazy_row_cache_floor_chunks and
+// lazy_row_cache_yieldable_bytes are the chunk rule, and a built cache's floor and yieldable bytes are theirs.
+// First at Qwen's geometry, arm (1)'s: the floor of 16,384 rows sits in the first 256 MiB chunk, so the yieldable bytes
+// are the second chunk and the remainder's mapping, 268,435,456 + 8,388,608 = 276,824,064 B. The planner's subtraction,
+// the resident bytes at cache_slots less those at floor_slots, counts the first chunk's unused part and the index
+// difference as well: 583,008,256 B.
+// Then three caches of 20 rows of 1 MiB in 8 MiB chunks (8, 8 and 4 rows), each chunk a 2 MiB multiple, so a chunk's
+// fixture charge is its mapping: a floor inside the first chunk (3 rows) and one exactly at its boundary (8 rows) are
+// one floor chunk and 12 MiB yieldable; a floor larger than one chunk (9 rows) is two floor chunks and 4 MiB.
+// Last, the mapping rounding with 100 B rows in 1000 B chunks, and a geometry the cache refuses, which is 0.
+// Engagement: each cache built. Mutant: LAZY_ROW_CACHE_MUTANT_YIELDABLE_BY_SUBTRACTION, the planner's subtraction.
+arm_result arm_yieldable_rule() {
+    arm_result   r;
+    const size_t mib = size_t{ 1 } << 20;
+    const size_t qwen =
+        ggml_sycl::lazy_row_cache_yieldable_bytes(3200000, 16384, k_row, ggml_sycl::LAZY_ROW_CACHE_CHUNK_BYTES);
+    expect(r, qwen == 276824064, "the yieldable bytes at Qwen's geometry are " + num(qwen) + ", want 276824064");
+
+    struct edge {
+        const char * what;
+        size_t       floor;
+        size_t       floor_chunks;
+        size_t       yieldable;
+    };
+
+    const edge edges[] = {
+        { "a floor inside the first chunk",      3, 1, 12 * mib },
+        { "a floor exactly at a chunk boundary", 8, 1, 12 * mib },
+        { "a floor larger than one chunk",       9, 2, 4 * mib  },
+    };
+    for (const edge & e : edges) {
+        const size_t      floor_chunks = ggml_sycl::lazy_row_cache_floor_chunks(20, e.floor, mib, 8 * mib);
+        const size_t      yieldable    = ggml_sycl::lazy_row_cache_yieldable_bytes(20, e.floor, mib, 8 * mib);
+        const std::string at           = std::string(e.what) + " (" + num(e.floor) + " rows): ";
+        expect(r, floor_chunks == e.floor_chunks,
+               at + "the rule's floor is " + num(floor_chunks) + " chunks, want " + num(e.floor_chunks));
+        expect(r, yieldable == e.yieldable,
+               at + "the rule's yieldable bytes are " + num(yieldable) + ", want " + num(e.yieldable));
+        fixture_source        src;
+        lazy_row_cache_config cfg = config(20, e.floor, 8 * mib, 16);
+        cfg.row_size              = mib;
+        lazy_row_cache_build b    = lazy_row_cache::build(cfg, src);
+        if (!built(r, b, at + "the cache")) {
+            continue;
+        }
+        expect(
+            r, b.cache->n_floor_chunks() == floor_chunks,
+            at + "the cache's floor is " + num(b.cache->n_floor_chunks()) + " chunks, the rule's " + num(floor_chunks));
+        expect(r, b.cache->yieldable_bytes() == yieldable,
+               at + "the cache publishes " + num(b.cache->yieldable_bytes()) + " yieldable bytes, the rule " +
+                   num(yieldable));
+    }
+    const size_t round_one = ggml_sycl::lazy_row_cache_yieldable_bytes(25, 10, 100, 1000);
+    const size_t round_two = ggml_sycl::lazy_row_cache_yieldable_bytes(25, 11, 100, 1000);
+    const size_t round_all = ggml_sycl::lazy_row_cache_yieldable_bytes(25, 25, 100, 1000);
+    expect(r, round_one == 2 * 2 * mib && round_two == 2 * mib && round_all == 0,
+           "100 B rows in 1000 B chunks yield " + num(round_one) + ", " + num(round_two) + " and " + num(round_all) +
+               " B at floors of 10, 11 and 25 rows, want two, one and no 2 MiB mappings");
+    expect(r,
+           ggml_sycl::lazy_row_cache_yieldable_bytes(10, 11, 100, 1000) == 0 &&
+               ggml_sycl::lazy_row_cache_floor_chunks(10, 11, 100, 1000) == 0,
+           "a floor above the slots is not 0 floor chunks and 0 yieldable bytes");
+    return r;
+}
+
 }  // namespace
 
 int main() {
@@ -716,5 +781,6 @@ int main() {
     arms.push_back({ "(5) a yield frees a chunk with no wait while rows remain gatherable", arm_yield });
     arms.push_back({ "(6) a refused allocation is a shortfall that leaves nothing live", arm_build_shortfall });
     arms.push_back({ "(7) a config that is not a cache's refuses before any allocation", arm_invalid_config });
+    arms.push_back({ "(8) the cache and the planner count one yieldable figure", arm_yieldable_rule });
     return run_arms(arms, "lazy row cache arms");
 }

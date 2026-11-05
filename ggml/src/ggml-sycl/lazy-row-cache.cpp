@@ -11,6 +11,7 @@
 #include "lazy-row-cache.hpp"
 
 #include "ggml-impl.h"
+#include "host-cpu-mapping.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -138,6 +139,23 @@ const char * lazy_row_cache_status_name(lazy_row_cache_status status) {
             return "shortfall";
     }
     return "unknown";
+}
+
+// RED stubs: no chunk rule yet.
+size_t lazy_row_cache_floor_chunks(size_t cache_slots, size_t floor_slots, size_t row_size, size_t chunk_bytes) {
+    (void) cache_slots;
+    (void) floor_slots;
+    (void) row_size;
+    (void) chunk_bytes;
+    return 0;
+}
+
+size_t lazy_row_cache_yieldable_bytes(size_t cache_slots, size_t floor_slots, size_t row_size, size_t chunk_bytes) {
+    (void) cache_slots;
+    (void) floor_slots;
+    (void) row_size;
+    (void) chunk_bytes;
+    return 0;
 }
 
 lazy_row_cache::lazy_row_cache() = default;

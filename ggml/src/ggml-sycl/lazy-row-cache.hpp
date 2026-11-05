@@ -94,6 +94,17 @@ struct lazy_row_cache_config {
     uint32_t    n_shards    = LAZY_ROW_CACHE_SHARDS;
 };
 
+// The chunk rule the cache and the planner share (§3.3, §6.4). The slab of cache_slots x row_size is whole chunks of
+// chunk_bytes, then one remainder, and a row never straddles two chunks, so a chunk of b bytes holds b / row_size rows.
+// The floor is the fewest leading chunks that hold floor_slots rows, every chunk when even all of them hold fewer.
+// 0 for a geometry the cache refuses.
+size_t lazy_row_cache_floor_chunks(size_t cache_slots, size_t floor_slots, size_t row_size, size_t chunk_bytes);
+
+// A cache's yieldable bytes (§6.4): the chunks above its floor, each at host_cpu_mapped_size of its bytes, as the
+// ledger charges it. The index is never yieldable. The cache publishes exactly this, and the planner's yieldable figure
+// is this function. 0 for a geometry the cache refuses.
+size_t lazy_row_cache_yieldable_bytes(size_t cache_slots, size_t floor_slots, size_t row_size, size_t chunk_bytes);
+
 enum class lazy_row_cache_status : uint8_t {
     OK = 0,
     INVALID_CONFIG,  // the geometry or the figures are not a cache's
