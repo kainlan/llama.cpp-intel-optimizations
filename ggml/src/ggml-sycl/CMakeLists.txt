@@ -336,6 +336,72 @@ if (BUILD_TESTING)
         endforeach()
     endif()
 
+    # The hot-row cache of a STORAGE lazy table (th32 §6.3, §6.4, §11 T4): CLOCK replacement, shard independence, the
+    # 13.3 B/slot index, the no-leases rule, the yield that frees a chunk with no wait while rows stay gatherable, the
+    # counters. lazy-row-cache.cpp includes no SYCL header and the test hands the cache fixture memory through its one
+    # seam, so this target links the translation unit alone with ggml-base for the log: no device, no unified cache, no
+    # SYCL module.
+    #
+    # Each MUTANTS pair is a positive control: a macro that plants one defect in lazy-row-cache.cpp, and the FAIL line
+    # the test prints when it does. Each builds its own executable, test-sycl-lazy-row-cache-mutant-<macro suffix>, and
+    # a ctest of that name which passes only when that line appears.
+    set(_lrc_clock "FAIL \\(2\\) CLOCK evicts by the reference bit and the hand, and the counters read back")
+    set(_lrc_shard "FAIL \\(3\\) a lookup in one shard never waits on another shard's lock")
+    set(_lrc_yield "FAIL \\(5\\) a yield frees a chunk with no wait while rows remain gatherable")
+    string(CONCAT _lrc_re_no_reference_bit "${_lrc_clock}: inserting 14 evicted 10, want 11")
+    string(CONCAT _lrc_re_one_lock
+        "${_lrc_shard}: a lookup in shard [0-9]+ did not return within 3000 ms while shard [0-9]+ was held")
+    string(CONCAT _lrc_re_yield_waits
+        "${_lrc_yield}: the yield did not return within 3000 ms while a reader was inside a lookup")
+    string(CONCAT _lrc_re_release_under_lock "${_lrc_yield}: chunk 63 was released while a shard lock was held")
+    string(CONCAT _lrc_re_yield_floor "${_lrc_yield}: a yield of everything left 0 chunks, want the 16 floor chunks")
+    set(_lazy_row_cache_mutants
+        LAZY_ROW_CACHE_MUTANT_NO_REFERENCE_BIT         "${_lrc_re_no_reference_bit}"
+        LAZY_ROW_CACHE_MUTANT_ONE_LOCK                 "${_lrc_re_one_lock}"
+        LAZY_ROW_CACHE_MUTANT_YIELD_WAITS_FOR_READERS  "${_lrc_re_yield_waits}"
+        LAZY_ROW_CACHE_MUTANT_RELEASE_UNDER_SHARD_LOCK "${_lrc_re_release_under_lock}"
+        LAZY_ROW_CACHE_MUTANT_YIELD_FLOOR              "${_lrc_re_yield_floor}")
+    set(_lazy_row_cache_variants test-sycl-lazy-row-cache "" "")
+    list(LENGTH _lazy_row_cache_mutants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _lazy_row_cache_mutants ${_i} _macro)
+        list(GET _lazy_row_cache_mutants ${_j} _regex)
+        string(REGEX REPLACE "^LAZY_ROW_CACHE_MUTANT_" "" _suffix "${_macro}")
+        string(TOLOWER "${_suffix}" _suffix)
+        string(REPLACE "_" "-" _suffix "${_suffix}")
+        list(APPEND _lazy_row_cache_variants test-sycl-lazy-row-cache-mutant-${_suffix} "${_macro}" "${_regex}")
+    endforeach()
+    list(LENGTH _lazy_row_cache_variants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 3)
+        math(EXPR _j "${_i} + 1")
+        math(EXPR _k "${_i} + 2")
+        list(GET _lazy_row_cache_variants ${_i} _name)
+        list(GET _lazy_row_cache_variants ${_j} _macro)
+        list(GET _lazy_row_cache_variants ${_k} _regex)
+        add_executable(${_name}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-sycl-lazy-row-cache.cpp
+            lazy-row-cache.cpp)
+        target_include_directories(${_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_compile_definitions(${_name} PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        target_link_libraries(${_name} PRIVATE ggml-base Threads::Threads)
+        set_target_properties(${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME ${_name} COMMAND ${_name})
+        if (_macro STREQUAL "")
+            set_tests_properties(${_name} PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 120)
+        else()
+            target_compile_definitions(${_name} PRIVATE ${_macro}=1)
+            set_tests_properties(${_name} PROPERTIES
+                LABELS "sycl;host;mutant"
+                SKIP_RETURN_CODE 77
+                TIMEOUT 120
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endif()
+    endforeach()
+
     # The tier on a build without it (llama.cpp-th32 T1a): host-cpu-mapping.cpp and the test are compiled with _WIN32
     # defined, so the refusing stub Windows gets is built and run on the host. Both are portable C++.
     add_executable(test-sycl-host-cpu-unsupported
