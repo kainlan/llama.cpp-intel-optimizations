@@ -21465,15 +21465,13 @@ mem_handle alloc_handle::as_mem_handle() const {
 allocation_registered_state unified_allocation_registered_exact(const alloc_metadata & metadata) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     const auto                  row = g_runtime_alloc_registry.find(metadata.ptr);
+
+    bool planted_ptr_only = false;
 #if defined(GGML_SYCL_SCRATCH_MUTANTS)
-    if (row != g_runtime_alloc_registry.end() &&
-        scratch_test_mutant_on(scratch_test_mutant::REGISTERED_EXACT_PTR_ONLY)) {
-        return row->second.state == runtime_alloc_state::RELEASING ? ALLOCATION_REGISTERED_RELEASING :
-                                                                     ALLOCATION_REGISTERED_LIVE;
-    }
+    planted_ptr_only = scratch_test_mutant_on(scratch_test_mutant::REGISTERED_EXACT_PTR_ONLY);
 #endif
     // A reused address answers GONE: the row there is another allocation unless its whole release key matches.
-    if (row == g_runtime_alloc_registry.end() || !(row->second.handle.key() == metadata.key())) {
+    if (row == g_runtime_alloc_registry.end() || (!planted_ptr_only && !(row->second.handle.key() == metadata.key()))) {
         return ALLOCATION_REGISTERED_GONE;
     }
     return row->second.state == runtime_alloc_state::RELEASING ? ALLOCATION_REGISTERED_RELEASING :
@@ -26136,17 +26134,15 @@ bool unified_cache::configure_host_zones(size_t weight_bytes,
             candidates.clear();
         }
         for (const marked_chunk_entry & candidate : candidates) {
+            const pinned_chunk_release status = release_marked_chunk_locked(candidate.chunk_idx, released, false);
 #if defined(GGML_SYCL_SCRATCH_MUTANTS)
-            if (scratch_test_mutant_on(scratch_test_mutant::CONFIGURE_DIRECT_RELEASE)) {
-                pinned_chunk_pool::released_chunk carrier;
-                if (host_arena_->release_zone_chunk(host_zone_id::SCRATCH, candidate.chunk_idx, carrier) ==
-                    PINNED_CHUNK_RELEASE_DONE) {
-                    released.emplace_back(std::move(carrier));
-                }
-                continue;
+            // A direct pool release leaves the marked entry behind, so the fault puts back the one this release erased.
+            if (status == PINNED_CHUNK_RELEASE_DONE &&
+                scratch_test_mutant_on(scratch_test_mutant::CONFIGURE_DIRECT_RELEASE)) {
+                marked_set_.push_back(candidate);
             }
 #endif
-            (void) release_marked_chunk_locked(candidate.chunk_idx, released, false);
+            (void) status;
         }
     }
     size_t released_bytes = 0;
@@ -26159,6 +26155,8 @@ bool unified_cache::configure_host_zones(size_t weight_bytes,
     // The refusal changes nothing: the zones, every flag, the marked set and the reserved figures stay one state.
     if (!host_arena_->configure_zones(weight_bytes, kv_bytes, staging_bytes, scratch_bytes)) {
 #if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        // Not a perturbation of the strict test below: that test stays a bare if (ggml_sycl_strict_enabled()) around
+        // the abort, so one fault returns before it and the other aborts a build it never aborts.
         if (ggml_sycl_strict_enabled()) {
             if (scratch_test_mutant_on(scratch_test_mutant::STRICT_ABORT_DROPPED)) {
                 return false;
@@ -26226,38 +26224,30 @@ size_t unified_cache::host_scratch_return_chunks(const std::vector<size_t> & chu
         // Withdrawal, filing and the release of an already-empty chunk share this one scope, so an empty chunk is
         // never visible in the set between its filing and its release (§4.4).
         for (const size_t chunk_idx : chunk_idxs) {
-#if defined(GGML_SYCL_SCRATCH_MUTANTS)
-            if (scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_WITHDRAW) ||
-                scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_FILE) ||
-                scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_IMMEDIATE) ||
-                scratch_test_mutant_on(scratch_test_mutant::RETURN_RELEASES_LIVE)) {
-                if (!scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_WITHDRAW)) {
-                    (void) host_arena_->withdraw_zone_chunk(host_zone_id::SCRATCH, chunk_idx);
-                }
-                if (!scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_FILE)) {
-                    marked_set_.push_back({ chunk_idx, owner });
-                }
-                const bool live = host_arena_->zone_chunk_usage(host_zone_id::SCRATCH, chunk_idx).used != 0;
-                if (scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_IMMEDIATE) ||
-                    (live && !scratch_test_mutant_on(scratch_test_mutant::RETURN_RELEASES_LIVE))) {
-                    continue;
-                }
-                const pinned_chunk_release status = release_marked_chunk_locked(chunk_idx, released, false);
-                if (status == PINNED_CHUNK_RELEASE_REFUSED_LIVE || status == PINNED_CHUNK_RELEASE_REFUSED_LEASE) {
-                    refusals.push_back({ chunk_idx, status });
-                }
-                continue;
-            }
-#endif
             if (!host_arena_->withdraw_zone_chunk(host_zone_id::SCRATCH, chunk_idx)) {
                 GGML_LOG_WARN(
                     "[HOST-ARENA] SCRATCH return skipped dev=%d chunk=%zu: not a chunk of the SCRATCH zone alone\n",
                     dev, chunk_idx);
                 continue;
             }
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            if (scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_WITHDRAW)) {
+                host_arena_->test_unwithdraw_zone_chunk(host_zone_id::SCRATCH, chunk_idx);
+            }
+#endif
             marked_set_.push_back({ chunk_idx, owner });
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            if (scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_FILE)) {
+                marked_set_.pop_back();
+            }
+#endif
             // A losing scheduler's buffers still in the chunk keep it: its owner's next begin or its end releases it.
-            if (host_arena_->zone_chunk_usage(host_zone_id::SCRATCH, chunk_idx).used != 0) {
+            bool kept = host_arena_->zone_chunk_usage(host_zone_id::SCRATCH, chunk_idx).used != 0;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            kept = scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_IMMEDIATE) ||
+                   (kept && !scratch_test_mutant_on(scratch_test_mutant::RETURN_RELEASES_LIVE));
+#endif
+            if (kept) {
                 continue;
             }
             const pinned_chunk_release status = release_marked_chunk_locked(chunk_idx, released, false);
@@ -26306,21 +26296,16 @@ size_t unified_cache::host_scratch_begin_release(uint64_t owner) {
         for (const marked_chunk_entry & entry : marked_set_) {
             marked_candidate_note(candidates, entry, owner);
         }
-        for (const marked_chunk_entry & candidate : candidates) {
+        bool planted_any_owner = false;
 #if defined(GGML_SYCL_SCRATCH_MUTANTS)
-            if (scratch_test_mutant_on(scratch_test_mutant::BEGIN_NAMES_ANY_OWNER)) {
-                const pinned_chunk_release status = release_marked_chunk_locked(candidate.chunk_idx, released, false);
-                if (status == PINNED_CHUNK_RELEASE_REFUSED_LIVE || status == PINNED_CHUNK_RELEASE_REFUSED_LEASE) {
-                    refusals.push_back({ candidate.chunk_idx, status });
-                }
-                continue;
-            }
+        planted_any_owner = scratch_test_mutant_on(scratch_test_mutant::BEGIN_NAMES_ANY_OWNER);
 #endif
+        for (const marked_chunk_entry & candidate : candidates) {
             const pinned_chunk_release status = release_marked_chunk_locked(candidate.chunk_idx, released, false);
             // Another owner's chunk still in use is left silently: it holds that context's scheduler buffers (§4.4
             // "A begin and a live owner"). Only the owning context's own begin names it.
             if ((status == PINNED_CHUNK_RELEASE_REFUSED_LIVE || status == PINNED_CHUNK_RELEASE_REFUSED_LEASE) &&
-                candidate.owner == owner) {
+                (candidate.owner == owner || planted_any_owner)) {
                 refusals.push_back({ candidate.chunk_idx, status });
             }
         }
