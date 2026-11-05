@@ -3990,6 +3990,27 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# docs/design/sycl-mmap-host-tier.md §7 C4: the pinned pool's marked set and its lock order, read from the pool's and
+# the cache's bodies, each clause with a planted control. Pure source gate.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-marked-set-lock-order-gate
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-marked-set-lock-order-gate.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
+endif()
+
+# docs/design/sycl-mmap-host-tier.md §7 C4 and §4.4: the host role routing site table regenerated from the tree, and
+# the rest of that bullet. The clauses the notify path turns green are scored EXPECTED-RED, never skipped. Pure source
+# gate; its planted controls re-parse ggml-sycl.cpp, so it takes about 40 s on an idle host.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-host-role-routing-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-role-routing-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 300)
+endif()
+
 # llama.cpp-5efe C1: llama_model_lazy_tensor_names() declares, per arch, exactly the
 # tensors src/models/*.cpp creates with TENSOR_READ_LAZY. Pure source contract.
 if (Python3_Interpreter_FOUND)
