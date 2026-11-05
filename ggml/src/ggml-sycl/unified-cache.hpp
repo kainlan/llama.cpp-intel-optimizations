@@ -2226,14 +2226,20 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
 // plan names the bytes it does not count (§10's zone check). A plan never recorded holds no chunk, so its terms stay
 // empty. Nothing is logged: the would-refuse line is the planner pass's own, and the runtime transaction re-plans on
 // every probe.
-// host_planned_bytes (th32 §4.2): the zone terms, the lazy tables' host_resident_bytes and the block ring's charge. The
-// one sum: the planner's record and a re-record both set the figure through it.
-inline size_t placement_plan_host_planned_bytes(const placement_plan & plan) {
-    size_t bytes = plan.host_zone_terms.total();
+// The lazy tables' part of host_planned_bytes (th32 §4.3 step 4): each table's host_resident_bytes and the block ring's
+// charge, the bytes the zone terms do not hold.
+inline size_t placement_plan_lazy_host_bytes(const placement_plan & plan) {
+    size_t bytes = 0;
     for (const placement_lazy_table & table : plan.lazy_tables) {
         bytes += table.host_resident_bytes;
     }
     return bytes + plan.block_ring_charge;
+}
+
+// host_planned_bytes (th32 §4.2): the zone terms and the lazy tables' part. The one sum: the planner's record and a
+// re-record both set the figure through it.
+inline size_t placement_plan_host_planned_bytes(const placement_plan & plan) {
+    return plan.host_zone_terms.total() + placement_plan_lazy_host_bytes(plan);
 }
 
 inline void placement_plan_rerecord_host_zone_terms(placement_plan & plan) {

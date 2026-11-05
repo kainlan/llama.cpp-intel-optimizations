@@ -18703,9 +18703,8 @@ static const char * ggml_sycl_plan_dry_run_backing_name(int backing) {
 // placement_entry_host_weight_bytes(), the per-entry figure placement_plan_host_weight_zone_terms() sizes the WEIGHT
 // zone with. Their sum and weight_host_bytes are then two figures for one set of entries, and a [PLAN-DRY-RUN-BUG]
 // WARN names a disagreement: a dense group charged on the DST basis whose host entries carry a converted dst_size is
-// how they part. th32 §4.3 decides residency per lazy table, as the joint placement's computation. This tree has lazy
-// tables, and they defer to the storage tier; what it lacks is §4.3's per-table residency decision, the plan's
-// Task 12, so the residency is reported per backing, and that decision replaces this function.
+// how they part. The lazy tables are no entries: the plan decides their residency per table (th32 §4.3 step 4), and
+// ggml_sycl_plan_dry_run_lazy prints that decision.
 static void ggml_sycl_plan_dry_run_residency(uint32_t                          index,
                                              const ggml_sycl::placement_plan & plan,
                                              ggml_sycl_plan_dry_run_plan &     out) {
@@ -18745,10 +18744,34 @@ static void ggml_sycl_plan_dry_run_residency(uint32_t                          i
     }
 }
 
+// The lazy tables of `plan` as the plan decided them (th32 §4.3 step 4, §10): one LAZY line per table carrying the
+// plan's fields for it, named as on the planner's [PLACEMENT] lazy line, then one LAZY line for the plan: its tables'
+// host_resident_bytes, the block ring's need and charge, and its refusal, `none` or the reason with the figures the
+// planner recorded. A refused plan holds no table, so its refusal is the whole of its lazy report. Nothing is decided
+// here.
+static void ggml_sycl_plan_dry_run_lazy(uint32_t index, const ggml_sycl::placement_plan & plan) {
+    size_t resident = 0;
+    for (const ggml_sycl::placement_lazy_table & t : plan.lazy_tables) {
+        const bool        storage = t.residency == ggml_sycl::lazy_residency::STORAGE;
+        const std::string device  = t.consumer_device >= 0 ? std::to_string(t.consumer_device) : "CPU";
+        resident += t.host_resident_bytes;
+        GGML_LOG_INFO(
+            "[PLAN-DRY-RUN] plan=%u device=%d LAZY %s residency=%s table=%zu resident=%zu cache_slots=%zu "
+            "floor_slots=%zu consumer_device=%s\n",
+            index, plan.device_id, t.name.c_str(), storage ? "STORAGE" : "HOST", t.table_bytes, t.host_resident_bytes,
+            t.cache_slots, t.cache_floor_slots, device.c_str());
+    }
+    GGML_LOG_INFO(
+        "[PLAN-DRY-RUN] plan=%u device=%d LAZY tables=%zu lazy_resident=%zu ring_need=%zu ring=%zu refusal=%s%s%s\n",
+        index, plan.device_id, plan.lazy_tables.size(), resident, plan.block_ring_need, plan.block_ring_charge,
+        plan.lazy_refusal.empty() ? "none" : plan.lazy_refusal.c_str(), plan.lazy_refusal_detail.empty() ? "" : " ",
+        plan.lazy_refusal_detail.c_str());
+}
+
 // Reports plan `index`: every host term from the plan's own record, each printed on its own line under its name. The
 // WEIGHT terms are the walk populate_host_zone_sizing() sized the zone with; the commit terms are the configure step's
 // sizing (ggml_sycl_configure_host_zones_for_plan) over the inputs the plan recorded, which record_host_ledger_plan()
-// summed into host_planned_bytes; expected_host is that figure.
+// summed, with the lazy tables' part, into host_planned_bytes; expected_host is that figure.
 static void ggml_sycl_plan_dry_run_record(uint32_t                          index,
                                           const ggml_sycl::placement_plan & plan,
                                           bool                              multi_device,
@@ -18773,11 +18796,13 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                          inde
     out.rounding                    = terms.rounding;
     out.expected_host               = plan.host_planned_bytes;
     ggml_sycl_plan_dry_run_residency(index, plan, out);
-    if (terms.total() != plan.host_planned_bytes) {
+    const size_t lazy_host = ggml_sycl::placement_plan_lazy_host_bytes(plan);
+    if (terms.total() + lazy_host != plan.host_planned_bytes) {
         GGML_LOG_WARN(
-            "[PLAN-DRY-RUN-BUG] plan=%u device=%d the commit terms sum to %zu bytes but the plan recorded "
-            "host_planned_bytes=%zu: a writer moved a zone term after the record without re-recording it\n",
-            index, plan.device_id, terms.total(), plan.host_planned_bytes);
+            "[PLAN-DRY-RUN-BUG] plan=%u device=%d the commit terms sum to %zu bytes and the lazy tables hold %zu, but "
+            "the plan recorded host_planned_bytes=%zu: a writer moved a host term after the record without "
+            "re-recording it\n",
+            index, plan.device_id, terms.total(), lazy_host, plan.host_planned_bytes);
     }
 
     const auto line = [&](const char * group, const char * term, uint64_t bytes) {
@@ -18816,6 +18841,7 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                          inde
                       index, plan.device_id, ggml_sycl_plan_dry_run_backing_name(b), out.residency_count[b],
                       out.residency_bytes[b], out.residency_bytes[b] / (1024.0 * 1024.0));
     }
+    ggml_sycl_plan_dry_run_lazy(index, plan);
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
