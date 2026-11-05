@@ -15,9 +15,9 @@
 // then its node. A pool that dies without parking, the install-race loser, frees its unparked node in its destructor.
 //
 // The registry's leaf mutex (canonical contract §12.5, L5) guards the slot and its generation, the reap list, the lease
-// counts, the DYING flags, the counters and the hold hook. Nothing is taken, allocated, freed, waited on or logged under
-// it. The slot is a raw pointer on purpose: a static owner would free the pool during static destruction under a lease
-// that still points at it, while the shut-down flag lets such a lease decrement without the mutex instead.
+// counts, the DYING flags, the counters and the hold hook. Nothing is taken, allocated, freed, waited on or logged
+// under it. The slot is a raw pointer on purpose: a static owner would free the pool during static destruction under a
+// lease that still points at it, while the shut-down flag lets such a lease decrement without the mutex instead.
 
 namespace ggml_sycl {
 

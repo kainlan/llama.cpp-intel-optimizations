@@ -21,9 +21,9 @@
 // from the plan's own zone terms (step 2 of §4.3), so the arms decide the same way on any host. The budget is 4 TiB so
 // the planner's fit never binds and P3 alone decides.
 //
-// Every arm names its engagement check and the mutant it kills. An arm whose engagement check fails FAILS: each check is
-// derived from the plan's own terms, so a miss is a defect in the planner or the fixture, never an unmet precondition.
-// Every arm runs, so one failure does not hide the rest.
+// Every arm names its engagement check and the mutant it kills. An arm whose engagement check fails FAILS: each check
+// is derived from the plan's own terms, so a miss is a defect in the planner or the fixture, never an unmet
+// precondition. Every arm runs, so one failure does not hide the rest.
 
 #include "../host-cpu-mapping.hpp"
 #include "../lazy-io-pool.hpp"

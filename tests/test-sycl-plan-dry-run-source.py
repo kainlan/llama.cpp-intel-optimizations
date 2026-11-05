@@ -32,8 +32,8 @@ cannot see:
    without the dry run;
 8. the residency decision's §10 plan lines, which the dry run's planner call prints, carry every field T3 can print,
    each from the plan's own terms: a STORAGE [PLACEMENT] line its cache's index bytes, a HOST one the host budget,
-   the planned bytes and the leftover, and the [HOST-PLAN] lazy line the budget's source, the host weights, rnh3's
-   named terms, the host KV and the caches carving the zones. The budget's source is a planner input beside the
+   the planned bytes and the leftover, and the [HOST-PLAN] lazy line the budget's source, the host weights, the WEIGHT
+   zone's named terms, the host KV and the caches carving the zones. The budget's source is a planner input beside the
    budget: the load copies the ledger's flag stored with its budget, the dry run its own sample's, and the decision
    reads neither the ledger nor the environment.
 
@@ -349,7 +349,7 @@ def test_the_lazy_checks_see_each_dropped_piece():
 # ---- 8. the residency decision's plan lines ----
 
 # The fields each line must carry, keyed as host-ledger-test-harness.hpp's printed() reads them (" name="). locked,
-# output_slot, landing and cold_set wait for the rows that make them true.
+# output_slot, landing and cold_set wait for the rows that add them.
 PLAN_LINE_FIELDS = {
     "STORAGE": (" index=",),
     "HOST": (" host_budget=", " host_planned=", " leftover="),

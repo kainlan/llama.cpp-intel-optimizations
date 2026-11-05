@@ -1646,16 +1646,16 @@ or takes again when that pool has already parked; either way it destroys its own
 pool after the unlock. The drop that reaches zero marks the pool DYING and links
 the pool's preallocated node into the reap list, which allocates nothing. A
 `FULL` reap swaps the list out under it and frees the parked pools after the
-unlock. The hold hook, armed at the reap or at the take, runs with no lock held. A clone that finds its pool
-DYING unlocks before it logs and aborts. It may be taken while a non-leaf lock
-is held, as a clone under `g_tensor_inventory_mutex` will be. It is never taken
-while another global L5 lock is held: `g_lifecycle_plan_mutex` and the
-retained-handle store's mutex are never held when it is taken, and it is never
-held when they are taken, so the three have no order. Once
-`lazy_io_pool_mark_shut_down()` has run, a lease's drop decrements without
-taking it, so a lease destroyed during static destruction never touches it. No
-production path takes it yet: the load's stage and the plan dry run plan with a
-null coverage pin until the IO engine adopts the coverage wrapper.
+unlock. The hold hook, armed at the reap or at the take, runs with no lock held.
+A clone that finds its pool DYING unlocks before it logs and aborts. It may be
+taken while a non-leaf lock is held, as a clone under `g_tensor_inventory_mutex`
+will be. It is never taken while another global L5 lock is held:
+`g_lifecycle_plan_mutex` and the retained-handle store's mutex are never held
+when it is taken, and it is never held when they are taken, so the three have no
+order. Once `lazy_io_pool_mark_shut_down()` has run, a lease's drop decrements
+without taking it, so a lease destroyed during static destruction never touches
+it. No production path takes it yet: the load's stage and the plan dry run plan
+with a null coverage pin until the IO engine adopts the coverage wrapper.
 
 `g_lifecycle_plan_mutex` (`unified-cache.cpp`) guards the placement plans' three
 maps: the load candidates, the probe plans, and the published plans by model and

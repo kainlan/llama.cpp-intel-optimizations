@@ -1017,9 +1017,9 @@ thread_local bool g_allocating_cache_backing = false;
 // passes warn_only, so its charge there logs a would-refuse WARN and is made.
 //
 // The committed bytes, the stored budget, its sample's MemAvailable and override flag, and the two yieldable counters
-// publish no other data: each is read for its own value alone, so the acquire, release and acq_rel orders on them order nothing else.
-// The orders are kept as documentation of intent, not relaxed. The yielder slots below are different: their handshake
-// orders the callback.
+// publish no other data: each is read for its own value alone, so the acquire, release and acq_rel orders on them order
+// nothing else. The orders are kept as documentation of intent, not relaxed. The yielder slots below are different:
+// their handshake orders the callback.
 static std::atomic<size_t> g_host_ledger_committed{ 0 };
 static std::atomic<size_t> g_host_ledger_budget{ 0 };
 // The MemAvailable of the sample the stored budget was computed from, stored by the same writer beside it, so a load's
@@ -33507,7 +33507,7 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
     plan.host_planned_bytes = placement_plan_host_planned_bytes(plan);
 
     // The plan lines (§10), WARN so a normal run shows them: one per planned table and one for the plan. They print
-    // every field the plan holds today; locked, output_slot, landing and cold_set wait for the rows that make them true.
+    // every field the plan holds today; locked, output_slot, landing and cold_set wait for the rows that add them.
     const size_t planned       = plan.host_planned_bytes;
     const size_t leftover      = host_ledger_sat_sub(budget, host_ledger_sat_add(planned, reserve + envelope));
     size_t       lazy_resident = 0;
@@ -33540,9 +33540,9 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
                 info.file_index, info.file_offset, budget, planned, leftover);
         }
     }
-    // weights= is the host weights at their exact bytes and named_terms= rnh3's named terms beside them, the two parts
-    // of the WEIGHT zone (§4.2); caches_carving= counts the caches that each build a zone set from this plan, every
-    // participating device's until llama.cpp-sgc5 lands.
+    // weights= is the host weights at their exact bytes and named_terms= the zone's named terms, the two parts of the
+    // WEIGHT zone (§4.2); caches_carving= counts the caches that each build a zone set from this plan: every
+    // participating device's, until each plan builds one zone set (design §4.2, One zone set per plan).
     const host_weight_zone_terms weight_terms   = placement_plan_host_weight_zone_terms(plan);
     const size_t                 named_terms    = weight_terms.total() - weight_terms.host_weights;
     const size_t                 caches_carving = plan.multi_device ? std::max<size_t>(1, plan.devices.size()) : 1;
