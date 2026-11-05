@@ -187,6 +187,13 @@ class owner_cache_memory final : public lazy_row_cache_memory {
         }
     }
 
+    void clear_yieldable() override {
+        if (yieldable_) {
+            host_ledger_yieldable_sub(charged_bytes());
+            yieldable_ = false;
+        }
+    }
+
   private:
     mem_handle handle_;
     bool       yieldable_ = false;
@@ -473,14 +480,19 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
     }
 
     // The cache's yielder registers once the table is whole, through T2's per-cache hook (§4.2), so a refusal above
-    // leaves none behind. Its chunks above the floor count as yieldable only while it is registered: a cache the
-    // ledger's slots cannot take runs with none (the ledger's WARN names it).
+    // leaves none behind. Its chunks above the floor are published yieldable first and the yielder registered after,
+    // so no yield can reach a chunk while it is published: no lock orders the two, the order does. §4.2 gives the same
+    // from the other side: the lifecycle admits one load transaction per process, and only its loader thread, this
+    // one, makes yielding charges. The chunks count as yieldable only while the yielder is registered: a cache the
+    // ledger's slots cannot take is unpublished again and runs with none (the ledger's WARN names it).
     size_t yieldable = 0;
     if (table->cache_ != nullptr) {
+        table->cache_->publish_yieldable();
         table->cache_yielder_slot_ = host_ledger_register_yielder(&lazy_row_cache::yield_entry, table->cache_.get());
         if (table->cache_yielder_slot_ >= 0) {
-            table->cache_->publish_yieldable();
             yieldable = table->cache_->yieldable_bytes();
+        } else {
+            table->cache_->unpublish_yieldable();
         }
     }
 

@@ -60,6 +60,10 @@ class lazy_row_cache_memory {
     // here and subtracts it in its destructor.
     virtual void set_yieldable() {}
 
+    // Undoes set_yieldable, by lazy_row_cache::unpublish_yieldable: the chunk stops counting as yieldable. The
+    // production form subtracts its charge from the ledger's yieldable bytes if it had added it.
+    virtual void clear_yieldable() {}
+
   protected:
     lazy_row_cache_memory(uint8_t * data, size_t bytes, size_t charged) :
         data_(data),
@@ -178,8 +182,15 @@ class lazy_row_cache {
     // host_ledger_yield_fn's shape (unified-cache.hpp), with `ctx` the cache: the owner registers it.
     static size_t yield_entry(void * ctx, size_t deficit, uint64_t load_txn_id) noexcept;
 
-    // Marks every resident chunk above the floor yieldable, once, before the cache is shared (§6.4).
+    // Marks every resident chunk above the floor yieldable, once, before the cache is shared (§6.4). The owner calls it
+    // before it registers the cache's yielder, so no yield can reach a chunk while it is published: no lock orders the
+    // two, the order does. §4.2 gives the same from the other side: the lifecycle admits one load transaction per
+    // process, and only its loader thread, the one building the cache, makes yielding charges.
     void publish_yieldable();
+
+    // Takes the published chunks back out of the yieldable bytes, for a cache whose yielder the ledger could not
+    // register: nothing can yield them, so they are not yieldable. Called before the cache is shared, like the publish.
+    void unpublish_yieldable();
 
     // Whether `row` is resident, without touching its reference bit.
     bool resident(int64_t row) const;

@@ -628,6 +628,15 @@ void lazy_row_cache::publish_yieldable() {
     }
 }
 
+void lazy_row_cache::unpublish_yieldable() {
+    for (size_t i = n_floor_chunks_; i < n_chunks_; ++i) {
+        chunk & ch = chunks_[i];
+        if (ch.memory != nullptr) {
+            ch.memory->clear_yieldable();
+        }
+    }
+}
+
 bool lazy_row_cache::resident(int64_t row) const {
     return chunk_holding(row) >= 0;
 }
