@@ -1,6 +1,7 @@
 //
-// The lazy table (th32 §3.2, §3.3, §10): its two constructors, the HOST body's eager O_DIRECT read into the locked
-// HOST_CPU tier, the STORAGE descriptor, the activation check and the sole release point. See lazy-table.hpp.
+// The lazy table (th32 §3.2, §3.3, §6.3, §6.4, §10): its two constructors, the HOST body's eager O_DIRECT read into the
+// locked HOST_CPU tier, the STORAGE descriptor and the row cache it owns, the activation check and the sole release
+// point. See lazy-table.hpp.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -97,6 +98,18 @@ std::string desc_invalid(const lazy_table_desc & desc, lazy_residency residency)
     if (desc.consumer_device < -1 || desc.consumer_device >= GGML_SYCL_MAX_DEVICES) {
         return "consumer_device=" + std::to_string(desc.consumer_device) + " is neither -1, the CPU, nor a SYCL device";
     }
+    // A STORAGE table's row cache holds at least its floor, which the plan sizes and never yields (§6.4); a HOST table
+    // has no cache.
+    if (residency == lazy_residency::STORAGE &&
+        (desc.cache_floor_slots == 0 || desc.cache_slots < desc.cache_floor_slots)) {
+        return "cache_slots=" + std::to_string(desc.cache_slots) +
+               " cache_floor_slots=" + std::to_string(desc.cache_floor_slots) +
+               ": a STORAGE plan's cache holds a floor of at least one slot";
+    }
+    if (residency == lazy_residency::HOST && (desc.cache_slots != 0 || desc.cache_floor_slots != 0)) {
+        return "cache_slots=" + std::to_string(desc.cache_slots) +
+               " cache_floor_slots=" + std::to_string(desc.cache_floor_slots) + ": a HOST table has no row cache";
+    }
     return {};
 }
 
@@ -151,6 +164,76 @@ allocation_result allocate_host_record(const lazy_table_desc & desc, size_t byte
     return unified_allocate_owner(req);
 }
 
+// One row-cache allocation through the owner entry (§6.4): its mem_handle, and the CPU view resolved from it once,
+// which the cache reads only under a shard lock for a slot of a chunk not withdrawn. Destroying it drops the handle,
+// the sole release point (P2), whose free credits the ledger; a chunk that was published yieldable leaves the
+// ledger's yieldable bytes first.
+class owner_cache_memory final : public lazy_row_cache_memory {
+  public:
+    owner_cache_memory(mem_handle handle, uint8_t * data, size_t bytes, size_t charged) :
+        lazy_row_cache_memory(data, bytes, charged),
+        handle_(std::move(handle)) {}
+
+    ~owner_cache_memory() override {
+        if (yieldable_) {
+            host_ledger_yieldable_sub(charged_bytes());
+        }
+    }
+
+    void set_yieldable() override {
+        if (!yieldable_) {
+            host_ledger_yieldable_add(charged_bytes());
+            yieldable_ = true;
+        }
+    }
+
+  private:
+    mem_handle handle_;
+    bool       yieldable_ = false;
+};
+
+// The production side of the cache's memory seam (§6.4): every allocation HOST_CPU, role LAZY_ROW_CACHE, owned by the
+// table's model for its lifetime and named by its load. The cache's own charge passes may_yield false: a step-4
+// shortfall is a plan bug, never masked by yielding chunks (§4.2). The fixture source in the host test is the only
+// other implementation.
+class owner_cache_source final : public lazy_row_cache_memory_source {
+  public:
+    explicit owner_cache_source(const lazy_table_desc & desc) : desc_(desc) {}
+
+    std::unique_ptr<lazy_row_cache_memory> allocate(size_t bytes) override {
+        alloc_request req{};
+        req.device                           = record_device(desc_);
+        req.size                             = bytes;
+        req.intent.role                      = alloc_role::LAZY_ROW_CACHE;
+        req.intent.constraints.must_host_cpu = true;
+        req.intent.lifetime                  = alloc_lifetime::MODEL;
+        req.intent.owner                     = { alloc_owner_kind::MODEL, desc_.model.model_id };
+        req.may_yield                        = false;
+        req.load_txn_id                      = desc_.model.load_txn_id;
+        allocation_result got                = unified_allocate_owner(req);
+        if (!got) {
+            last_error_ = (int) got.error;
+            return nullptr;
+        }
+        mem_handle         handle = mem_handle::from_owned_alloc(std::move(got.owner), GGML_LAYOUT_AOS);
+        const resolved_ptr view   = handle.resolve();
+        if (!view || view.extent < bytes) {
+            last_error_ = -1;  // the allocation did not resolve for the CPU; dropping the handle releases it
+            return nullptr;
+        }
+        const size_t charged = record_charged_bytes(handle);
+        return std::unique_ptr<lazy_row_cache_memory>(
+            new owner_cache_memory(std::move(handle), static_cast<uint8_t *>(view.ptr), bytes, charged));
+    }
+
+    // The last refusal's allocation_error, or -1 when the allocation did not resolve for the CPU.
+    int last_error() const { return last_error_; }
+
+  private:
+    const lazy_table_desc & desc_;
+    int                     last_error_ = 0;
+};
+
 // Reads [file_offset - head, file_offset - head + window) into `dst` with O_DIRECT, stopping once the table's last
 // byte is in. Returns the bytes read; *err is the errno of a failed call, 0 otherwise.
 size_t read_window(int fd, uint64_t aligned_offset, uint8_t * dst, size_t window, size_t need, int * err) {
@@ -199,6 +282,13 @@ const char * lazy_table_status_name(lazy_table_status status) {
 }
 
 lazy_table::~lazy_table() {
+    // The yielder goes first, with no lock held: the unregister waits for a yield already running, so none runs
+    // against the cache once it is gone (§4.2). Then the cache's allocations, the records and the descriptor.
+    if (cache_yielder_slot_ >= 0) {
+        host_ledger_unregister_yielder(cache_yielder_slot_);
+        cache_yielder_slot_ = -1;
+    }
+    cache_.reset();
     records_.clear();
     close_fd(fd_);
 }
@@ -221,7 +311,8 @@ size_t lazy_table::charged_bytes() const {
     for (const mem_handle & record : records_) {
         sum += record_charged_bytes(record);
     }
-    return sum;
+    // The cache's allocations, each counted at its registry row's charge as the records are.
+    return sum + (cache_ != nullptr ? cache_->charged_bytes() : 0);
 }
 
 lazy_table_result lazy_table::materialize(const lazy_table_desc &                 desc,
@@ -306,6 +397,51 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
         table->fd_ = -1;
     }
 
+    if (residency == lazy_residency::STORAGE) {
+        // The row cache at the plan's slots (§6.3, §6.4): the index and the slab's chunks, each its own owner-entry
+        // allocation. A refused one is a step-4 shortfall, a plan bug: the cache released everything it made before it
+        // returned, and the table refuses with one [HOST-PLAN-BUG] line naming the plan's figure and what was charged.
+        lazy_row_cache_config config;
+        config.name        = desc.name;
+        config.row_size    = desc.row_size;
+        config.n_rows      = desc.n_rows;
+        config.cache_slots = desc.cache_slots;
+        config.floor_slots = desc.cache_floor_slots;
+        config.load_txn_id = desc.model.load_txn_id;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        // Fixture seam: the owner-path fixtures cut the slab into small chunks; no constructor does.
+        if (variation.cache_chunk_bytes != 0) {
+            config.chunk_bytes = variation.cache_chunk_bytes;
+        }
+#endif
+        owner_cache_source   source(desc);
+        lazy_row_cache_build built = lazy_row_cache::build(config, source);
+        if (built.status == lazy_row_cache_status::SHORTFALL) {
+            const std::string reason =
+                "planned=" + std::to_string(desc.host_resident_bytes) +
+                " B charged=" + std::to_string(built.charged_bytes) + " B, " + std::to_string(built.allocations_made) +
+                " of " + std::to_string(built.allocations_planned) +
+                " allocations made, allocation_error=" + std::to_string(source.last_error()) + ": " + built.reason;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            // Fixture seam: the shortfall leg's positive control refuses without the line; no constructor does.
+            if (variation.shortfall_unreported) {
+                return refuse(desc, lazy_table_status::ROW_CACHE_SHORTFALL, reason);
+            }
+#endif
+            GGML_LOG_WARN("[HOST-PLAN-BUG] lazy table %s row cache: %s: %s\n", desc.name.c_str(),
+                          lazy_table_status_name(lazy_table_status::ROW_CACHE_SHORTFALL), reason.c_str());
+            if (ggml_sycl_strict_enabled()) {
+                GGML_ABORT("lazy table %s row cache fell short of its plan under GGML_SYCL_STRICT_LEASES=1",
+                           desc.name.c_str());
+            }
+            return refusal(lazy_table_status::ROW_CACHE_SHORTFALL, reason);
+        }
+        if (!built) {
+            return refuse(desc, lazy_table_status::INVALID_DESC, "the row cache refused its plan: " + built.reason);
+        }
+        table->cache_ = std::move(built.cache);
+    }
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     // Fixture seam: the activation fixture's one extra record, which no constructor asks for.
     if (variation.extra_record_bytes != 0) {
@@ -319,22 +455,15 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
     }
 #endif
 
-    // The activation check (th32 §10): the ledger's charge for the table's own records, the block ring excluded (it is
-    // the pool's), against the plan's host_resident_bytes. Plan != reality is a defect, never tolerated. A STORAGE
-    // table's plan figure is its row cache, whose chunks would be its records; until the cache is built that figure is
-    // refused by name, which is a missing part and not a plan bug.
-    if (residency == lazy_residency::STORAGE && desc.host_resident_bytes != 0) {
-        return refuse(desc, lazy_table_status::ROW_CACHE_SHORTFALL,
-                      "planned host_resident_bytes=" + std::to_string(desc.host_resident_bytes) +
-                          " B is the row cache (§6.3), which this build does not construct; records charge " +
-                          std::to_string(table->charged_bytes()) + " B");
-    }
+    // The activation check (th32 §10): the ledger's charge for the table's own records and its row cache's
+    // allocations, the block ring excluded (it is the pool's), against the plan's host_resident_bytes. Plan != reality
+    // is a defect, never tolerated.
     const size_t charged = table->charged_bytes();
     if (charged != desc.host_resident_bytes) {
-        const std::string reason = "charged_bytes=" + std::to_string(charged) + " B over " +
-                                   std::to_string(table->records_.size()) +
-                                   " record(s), the block ring excluded, planned host_resident_bytes=" +
-                                   std::to_string(desc.host_resident_bytes) + " B";
+        const std::string reason =
+            "charged_bytes=" + std::to_string(charged) + " B over " + std::to_string(table->records_.size()) +
+            " record(s) and the row cache, the block ring excluded, planned host_resident_bytes=" +
+            std::to_string(desc.host_resident_bytes) + " B";
         GGML_LOG_WARN("[HOST-PLAN-BUG] lazy table %s activation check: %s: %s\n", desc.name.c_str(),
                       lazy_table_status_name(lazy_table_status::ACTIVATION_MISMATCH), reason.c_str());
         if (ggml_sycl_strict_enabled()) {
@@ -343,11 +472,24 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
         return refusal(lazy_table_status::ACTIVATION_MISMATCH, reason);
     }
 
+    // The cache's yielder registers once the table is whole, through T2's per-cache hook (§4.2), so a refusal above
+    // leaves none behind. Its chunks above the floor count as yieldable only while it is registered: a cache the
+    // ledger's slots cannot take runs with none (the ledger's WARN names it).
+    size_t yieldable = 0;
+    if (table->cache_ != nullptr) {
+        table->cache_yielder_slot_ = host_ledger_register_yielder(&lazy_row_cache::yield_entry, table->cache_.get());
+        if (table->cache_yielder_slot_ >= 0) {
+            table->cache_->publish_yieldable();
+            yieldable = table->cache_->yieldable_bytes();
+        }
+    }
+
+    // locked= is the tier's property: every resident record and cache allocation is HOST_CPU, which is mlocked (§3.1).
     GGML_LOG_INFO(
-        "[LAZY-TABLE] %s residency=%s table=%zu B body=%zu B charged=%zu B planned=%zu B locked=%s consumer_layer=%d "
-        "device=%s file=%u off=%llu\n",
+        "[LAZY-TABLE] %s residency=%s table=%zu B body=%zu B charged=%zu B planned=%zu B locked=%s cache_slots=%zu "
+        "floor_slots=%zu yieldable=%zu B consumer_layer=%d device=%s file=%u off=%llu\n",
         desc.name.c_str(), residency_name(residency), desc.table_bytes, request, charged, desc.host_resident_bytes,
-        residency == lazy_residency::HOST ? "yes" : "none", desc.consumer_layer,
+        charged != 0 ? "yes" : "none", desc.cache_slots, desc.cache_floor_slots, yieldable, desc.consumer_layer,
         device_text(desc.consumer_device).c_str(), desc.file_index, (unsigned long long) desc.file_offset);
 
     lazy_table_result result;
