@@ -212,9 +212,9 @@ size_t lazy_table::charged_bytes() const {
     return sum;
 }
 
-lazy_table_result lazy_table::materialize(const lazy_table_desc & desc,
-                                          lazy_residency          residency,
-                                          const test_variation &  variation) {
+lazy_table_result lazy_table::materialize(const lazy_table_desc &                 desc,
+                                          lazy_residency                          residency,
+                                          [[maybe_unused]] const test_variation & variation) {
     const std::string invalid = desc_invalid(desc, residency);
     if (!invalid.empty()) {
         return refuse(desc, lazy_table_status::INVALID_DESC, invalid);
@@ -271,8 +271,13 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc & desc,
         }
         // The read ends once it holds the table's last byte: a table that ends its file has a window past the end
         // (Qwen's PLE table by 832 B), and the short read there is the end of the file, not a failure.
-        int          read_err = 0;
-        const size_t need     = variation.read_whole_window ? request : head + desc.table_bytes;
+        int read_err = 0;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        // Fixture seam: the end-of-file fixture's positive control asks for the whole window; no constructor does.
+        const size_t need = variation.read_whole_window ? request : head + desc.table_bytes;
+#else
+        const size_t need = head + desc.table_bytes;
+#endif
         const size_t got =
             read_window(fd, desc.file_offset - head, static_cast<uint8_t *>(view.ptr), request, need, &read_err);
         if (got < need) {
@@ -286,6 +291,8 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc & desc,
         table->fd_ = -1;
     }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Fixture seam: the activation fixture's one extra record, which no constructor asks for.
     if (variation.extra_record_bytes != 0) {
         allocation_result extra = allocate_host_record(desc, variation.extra_record_bytes);
         if (!extra) {
@@ -295,6 +302,7 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc & desc,
         }
         table->records_.push_back(mem_handle::from_owned_alloc(std::move(extra.owner), GGML_LAYOUT_AOS));
     }
+#endif
 
     // The activation check (th32 §10): the ledger's charge for the table's own records, the block ring excluded (it is
     // the pool's), against the plan's host_resident_bytes. Plan != reality is a defect, never tolerated. A STORAGE

@@ -117,12 +117,9 @@ class lazy_table {
     // The ledger charge of the table's own records (th32 §10): the sum the activation check compares with the plan.
     size_t charged_bytes() const;
 
-    void retain() { refs_.fetch_add(1, std::memory_order_relaxed); }
-
-    // Drops one reference; the last destroys the table.
-    void release();
-
   private:
+    // References are taken and dropped only through lazy_table_ref, so release() is the sole release point (P2).
+    friend class lazy_table_ref;
     friend lazy_table_result lazy_table_create_host(const lazy_table_desc & desc);
     friend lazy_table_result lazy_table_create_storage(const lazy_table_desc & desc);
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -135,11 +132,20 @@ class lazy_table {
 
     ~lazy_table();
 
-    // The fixtures' variations of a materialization, both off for the two constructors: one extra HOST_CPU record (the
-    // activation fixture) and an eager read asked for the whole window (the end-of-file fixture's positive control).
+    void retain() { refs_.fetch_add(1, std::memory_order_relaxed); }
+
+    // Drops one reference; the last destroys the table.
+    void release();
+
+    // The fixtures' variations of a materialization: one extra HOST_CPU record (the activation fixture) and an eager
+    // read asked for the whole window (the end-of-file fixture's positive control). A fixture seam: the fields, and the
+    // branches of materialize that read them, are compiled only into test targets, so a production variation has no
+    // fields, and the two constructors pass a default one in every build.
     struct test_variation {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
         size_t extra_record_bytes = 0;
         bool   read_whole_window  = false;
+#endif
     };
 
     // Both constructors: validates `desc` for `residency`, builds the residency's memory, runs the activation check.
@@ -227,7 +233,8 @@ bool ggml_backend_sycl_buffer_is_lazy(ggml_backend_buffer_t buffer);
 ggml_backend_buffer_t ggml_backend_sycl_lazy_buffer_init(ggml_backend_buffer_type_t buft,
                                                          ggml_sycl::lazy_table_ref  table);
 
-// The table a descriptor buffer holds; NULL for the no_alloc dummy and for any other buffer.
+// The table a descriptor buffer holds; NULL for the no_alloc dummy and for any other buffer. Borrowed: valid while
+// `buffer` lives; wrap it in a lazy_table_ref to hold it longer.
 ggml_sycl::lazy_table * ggml_backend_sycl_lazy_buffer_table(ggml_backend_buffer_t buffer);
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
