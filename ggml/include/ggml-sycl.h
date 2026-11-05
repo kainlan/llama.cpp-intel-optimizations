@@ -929,6 +929,22 @@ GGML_BACKEND_API bool ggml_backend_sycl_plan_host_holders(ggml_backend_sched_t s
 // Proc name: "ggml_backend_sycl_commit_host_holders".
 GGML_BACKEND_API bool ggml_backend_sycl_commit_host_holders(ggml_backend_t backend);
 
+// The host SCRATCH transaction of one llama_context (§4.4, §M75), made on the backend the notify is made through.
+// While a transaction is open, every chunk the host SCRATCH zone grows for it is recorded in it. OPEN opens the
+// auto-n_ubatch trial's transaction; MARK opens the reserve's own one when none is open and records its chunk count;
+// RETURN_TO_MARK returns the chunks grown since the mark and keeps the transaction open; KEEP closes it, its chunks
+// becoming ordinary capacity; RETURN closes it, drops the context's demand and returns its chunks, each released at
+// once when empty and otherwise at the context's next begin or its end. `n_ubatch` is the context's, printed by the
+// kept|returned witness. Returns false for a non-SYCL backend or an unknown op. `op` is a plain int, and every argument
+// a scalar, so no enum or struct crosses the dlopen boundary; look it up by name through the registry's proc address.
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_OPEN           0
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_KEEP           1
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN         2
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_MARK           3
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN_TO_MARK 4
+// Proc name: "ggml_backend_sycl_host_scratch_trial".
+GGML_BACKEND_API bool ggml_backend_sycl_host_scratch_trial(ggml_backend_t backend, int op, uint32_t n_ubatch);
+
 // Get cache hit/miss statistics (stub — returns zeros).
 // hits/misses may be NULL if caller doesn't need that stat.
 GGML_BACKEND_API void ggml_backend_sycl_get_cache_stats(ggml_backend_t backend, uint64_t * hits, uint64_t * misses);

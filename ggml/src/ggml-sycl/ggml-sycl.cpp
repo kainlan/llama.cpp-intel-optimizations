@@ -96279,6 +96279,30 @@ bool ggml_backend_sycl_commit_host_holders(ggml_backend_t backend) {
     return ok;
 }
 
+static_assert(GGML_SYCL_HOST_SCRATCH_TRIAL_OPEN == (int) ggml_sycl::host_scratch_trial_op::OPEN &&
+                  GGML_SYCL_HOST_SCRATCH_TRIAL_KEEP == (int) ggml_sycl::host_scratch_trial_op::KEEP &&
+                  GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN == (int) ggml_sycl::host_scratch_trial_op::RETURN &&
+                  GGML_SYCL_HOST_SCRATCH_TRIAL_MARK == (int) ggml_sycl::host_scratch_trial_op::MARK &&
+                  GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN_TO_MARK == (int) ggml_sycl::host_scratch_trial_op::RETURN_TO_MARK,
+              "the proc-table entry's int op values are the cache's transaction steps");
+
+bool ggml_backend_sycl_host_scratch_trial(ggml_backend_t backend, int op, uint32_t n_ubatch) {
+    if (!backend || !ggml_backend_is_sycl(backend)) {
+        GGML_LOG_WARN("[HOST-ARENA] SCRATCH trial refused: not a SYCL backend\n");
+        return false;
+    }
+    if (op < GGML_SYCL_HOST_SCRATCH_TRIAL_OPEN || op > GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN_TO_MARK) {
+        GGML_LOG_WARN("[HOST-ARENA] SCRATCH trial refused: unknown op %d\n", op);
+        return false;
+    }
+    // The transaction lives on the device whose SCRATCH zone the notify grows, the host buft's, keyed like the
+    // notify's demand by the backend context.
+    (void) ggml_sycl::unified_cache_host_scratch_trial(ggml_sycl_notify_host_buft_device(backend),
+                                                       static_cast<ggml_sycl::host_scratch_trial_op>(op),
+                                                       ggml_sycl_host_holder_backend_key(backend), n_ubatch);
+    return true;
+}
+
 // Process-lifetime CPU backend instance shared by every device's demoted
 // layers -- the CPU backend has no device affinity, so there is exactly one,
 // not one per GPU (unlike g_attn_host_pools, which is per-device because
@@ -127018,6 +127042,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_commit_host_holders") == 0) {
         return (void *) ggml_backend_sycl_commit_host_holders;
+    }
+    if (strcmp(name, "ggml_backend_sycl_host_scratch_trial") == 0) {
+        return (void *) ggml_backend_sycl_host_scratch_trial;
     }
     if (strcmp(name, "ggml_backend_sycl_cpu_offload_compute_buffer_type") == 0) {
         return (void *) ggml_backend_sycl_cpu_offload_compute_buffer_type;

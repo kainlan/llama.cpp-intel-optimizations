@@ -69,6 +69,16 @@ class ring_lease;
 // Forward declaration — needed by unified_cache::process_deferred_frees_public()
 bool unified_cache_is_graph_compute_active();
 
+// The host SCRATCH transaction's steps (§4.4, §M75), valued as the GGML_SYCL_HOST_SCRATCH_TRIAL_* constants the
+// proc-table entry takes as a plain int.
+enum class host_scratch_trial_op : int {
+    OPEN           = 0,
+    KEEP           = 1,
+    RETURN         = 2,
+    MARK           = 3,
+    RETURN_TO_MARK = 4,
+};
+
 // Check if VRAM arena mode is enabled (GGML_SYCL_VRAM_ARENA=1).
 bool vram_arena_enabled();
 
@@ -5558,6 +5568,24 @@ class unified_cache {
     size_t marked_entries(size_t chunk_idx) const;
 #endif
 
+    // === The SCRATCH transaction (docs/design/sycl-mmap-host-tier.md §4.4, §M75) ===
+    // One transaction per context, keyed by `owner` (its backend context's host_zone_owner_id). While it is open, each
+    // SCRATCH chunk this cache's zone grows on the transaction's own thread is recorded in it, by the ledger's ensure
+    // and by the miss path alike. OPEN opens the auto-n_ubatch trial's transaction. MARK opens the reserve's own when
+    // none is open, and records the chunk count. RETURN_TO_MARK files the chunks grown since the mark and keeps the
+    // transaction open. KEEP closes it; its chunks stay ordinary capacity. RETURN closes it, drops the context's demand
+    // and files every chunk. Filing is host_scratch_return_chunks(). Returns the chunks the step moved. The
+    // transactions sit under host_scratch_txn_mutex_, a leaf held alone (canon §12.5); the filing runs after it drops.
+    size_t host_scratch_trial(host_scratch_trial_op op, uint64_t owner, uint32_t n_ubatch);
+    // The grow hook: `chunk_idx`, a chunk the SCRATCH zone just appended, is charged to the open transaction of the
+    // calling thread, if any. Called with no lock held.
+    void   host_scratch_trial_note_grow(size_t chunk_idx);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Test accessors: whether `owner` has an open transaction, and its chunk count (0 when none is open).
+    bool   host_scratch_trial_active(uint64_t owner) const;
+    size_t host_scratch_trial_chunks(uint64_t owner) const;
+#endif
+
     size_t pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
 
     size_t pinned_pool_committed() const { return host_arena_ ? host_arena_->allocated() : 0; }
@@ -7018,6 +7046,19 @@ class unified_cache {
     mutable std::mutex              marked_set_mutex_;
     std::vector<marked_chunk_entry> marked_set_;
 
+    // One context's open SCRATCH transaction: its thread (the one whose grows it records), whether it is the trial's
+    // (OPEN) or the reserve's own (MARK), the chunk count at its MARK, and the chunks it grew, in order.
+    struct host_scratch_txn {
+        uint64_t            owner = 0;
+        std::thread::id     thread;
+        bool                trial = false;
+        size_t              mark  = 0;
+        std::vector<size_t> chunks;
+    };
+
+    mutable std::mutex            host_scratch_txn_mutex_;
+    std::vector<host_scratch_txn> host_scratch_txns_;
+
     // Host memory arena (pinned_chunk_pool).
     // Bypasses Intel Level Zero's ~11GB per-allocation limit via 2GB chunks.
     // Initialized with capped budget (128 GB) to prevent unbounded growth.
@@ -7878,6 +7919,11 @@ bool allocation_registry_test_cleanup_pending(void * ptr) noexcept;
 size_t allocation_registry_test_size() noexcept;
 bool allocation_registry_test_acquire_exact_lease(const alloc_metadata & metadata) noexcept;
 bool allocation_registry_test_release_exact_lease(const alloc_metadata & metadata) noexcept;
+// Hold a registered row's physical release (§M88 (1)): set its test_no_physical_release and take one exact test lease,
+// so its release is refused and the row returns to LIVE with a retry scheduled. unhold drops that lease and clears the
+// flag. Each is true when the row of `metadata` was found with the matching key.
+bool                      allocation_registry_test_hold_physical_release(const alloc_metadata & metadata) noexcept;
+bool                      allocation_registry_test_unhold_physical_release(const alloc_metadata & metadata) noexcept;
 size_t allocation_registry_test_process_promotion_retries(int device) noexcept;
 registered_release_status allocation_registry_test_release_exact(
     const alloc_metadata & metadata, registered_release_mode mode) noexcept;
@@ -9022,6 +9068,15 @@ bool unified_cache_host_scratch_ledger(int                     device,
 // The begin entry's release of `device`'s marked SCRATCH chunks for `owner`
 // (unified_cache::host_scratch_begin_release). Returns the chunks released; 0 when the device has no cache.
 size_t unified_cache_host_scratch_begin_release(int device, uint64_t owner);
+
+// One step of `owner`'s SCRATCH transaction on `device`'s cache (unified_cache::host_scratch_trial). Returns the chunks
+// the step moved; 0 when the device has no cache.
+size_t unified_cache_host_scratch_trial(int device, host_scratch_trial_op op, uint64_t owner, uint32_t n_ubatch);
+
+// The owner's end on `device`, before its backend context is deleted (§4.4 "Every withdrawn chunk has an owner and a
+// bounded release"): a transaction the owner left open is returned first, then unified_cache::host_scratch_owner_end
+// releases its empty marked chunks and orphans the rest. Returns the chunks released; 0 when the device has no cache.
+size_t unified_cache_host_scratch_owner_end(int device, uint64_t owner);
 
 // The owner-boundary check (§4.4 "Each lifetime keeps a leak check at its owner's boundary", §M57 (b)): every live
 // registry row with this lifetime and owner prints `[HOST-ZONE] leaked <lifetime> record: ...` at WARN, and under

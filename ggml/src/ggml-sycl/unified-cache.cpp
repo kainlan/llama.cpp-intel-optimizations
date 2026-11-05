@@ -21911,6 +21911,29 @@ bool allocation_registry_test_release_exact_lease(const alloc_metadata & metadat
     return true;
 }
 
+bool allocation_registry_test_hold_physical_release(const alloc_metadata & metadata) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto                  it = g_runtime_alloc_registry.find(metadata.ptr);
+    if (it == g_runtime_alloc_registry.end() || !(it->second.handle.key() == metadata.key())) {
+        return false;
+    }
+    it->second.test_no_physical_release = true;
+    ++it->second.test_exact_leases;
+    return true;
+}
+
+bool allocation_registry_test_unhold_physical_release(const alloc_metadata & metadata) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto                  it = g_runtime_alloc_registry.find(metadata.ptr);
+    if (it == g_runtime_alloc_registry.end() || !(it->second.handle.key() == metadata.key()) ||
+        it->second.test_exact_leases == 0) {
+        return false;
+    }
+    --it->second.test_exact_leases;
+    it->second.test_no_physical_release = false;
+    return true;
+}
+
 size_t allocation_registry_test_process_promotion_retries(int device) noexcept {
     return process_pending_legacy_promotion_cleanup(device);
 }
@@ -26372,6 +26395,39 @@ void unified_cache::print_marked_refusals(const std::vector<marked_chunk_refusal
     }
 }
 
+size_t unified_cache::host_scratch_trial(host_scratch_trial_op op, uint64_t owner, uint32_t n_ubatch) {
+    (void) op;
+    (void) owner;
+    (void) n_ubatch;
+    return 0;
+}
+
+void unified_cache::host_scratch_trial_note_grow(size_t chunk_idx) {
+    (void) chunk_idx;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+bool unified_cache::host_scratch_trial_active(uint64_t owner) const {
+    std::lock_guard<std::mutex> lock(host_scratch_txn_mutex_);
+    for (const host_scratch_txn & txn : host_scratch_txns_) {
+        if (txn.owner == owner) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t unified_cache::host_scratch_trial_chunks(uint64_t owner) const {
+    std::lock_guard<std::mutex> lock(host_scratch_txn_mutex_);
+    for (const host_scratch_txn & txn : host_scratch_txns_) {
+        if (txn.owner == owner) {
+            return txn.chunks.size();
+        }
+    }
+    return 0;
+}
+#endif
+
 bool unified_cache::host_zones_configured() const {
     return host_arena_ && host_arena_->zones_configured();
 }
@@ -27916,6 +27972,16 @@ bool unified_cache_host_scratch_ledger(int                     device,
 size_t unified_cache_host_scratch_begin_release(int device, uint64_t owner) {
     unified_cache * cache = get_existing_unified_cache_for_device(device);
     return cache != nullptr ? cache->host_scratch_begin_release(owner) : 0;
+}
+
+size_t unified_cache_host_scratch_trial(int device, host_scratch_trial_op op, uint64_t owner, uint32_t n_ubatch) {
+    unified_cache * cache = get_existing_unified_cache_for_device(device);
+    return cache != nullptr ? cache->host_scratch_trial(op, owner, n_ubatch) : 0;
+}
+
+size_t unified_cache_host_scratch_owner_end(int device, uint64_t owner) {
+    unified_cache * cache = get_existing_unified_cache_for_device(device);
+    return cache != nullptr ? cache->host_scratch_owner_end(owner) : 0;
 }
 
 void unified_cache_host_scratch_drop_context(uint64_t context_key) {
