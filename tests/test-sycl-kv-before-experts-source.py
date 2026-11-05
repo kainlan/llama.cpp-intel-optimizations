@@ -284,7 +284,14 @@ HINT_PASS = "max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), mode
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
             "bool n_ctx_context_is_default; bool use_mmap_resolved; bool use_mlock_resolved; "
             "bool host_weight_layout_cpu; uint32_t n_ubatch_context; }")
-COPY_CTX = "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;"
+# The backend copies the inventory into its KV inputs through the one KV intake the plan dry run also uses
+# (llama.cpp-4zup), written over the KV inputs it is handed; the stage hands it g_placement_kv_info.
+STAGE_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
+             "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info & kv, "
+              "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
+COPY_CTX = "kv.n_ctx_context = inventory->n_ctx_context;"
 TAIL_ASSERTS = (
     "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
@@ -299,7 +306,7 @@ def claim_loader_hands_the_requested_context(model: str, model_h: str, sycl: str
     model's default context, llama.cpp-7fmt, is pinned by test-sycl-ctx-hint-default-source); both plan builders pass
     the model's hint. The context sits right after kv_layer_count and before the indexer widths (the KV tail
     ggml-sycl.cpp pins with static_asserts, with the context's provenance appended after it), and the backend copies
-    it into its KV inputs."""
+    it into its KV inputs (in the KV intake, which the stage hands g_placement_kv_info)."""
     m   = norm(model)
     pop = body(m, POPULATE_SIG)
     r   = body(norm(resolver), RESOLVE_SIG)
@@ -313,7 +320,8 @@ def claim_loader_hands_the_requested_context(model: str, model_h: str, sycl: str
             and m.count(HINT_PASS) == 2
             and "uint32_t get_n_ctx_hint() const { return params.n_ctx_hint; }" in norm(model_h)
             and inv.endswith(INV_TAIL)
-            and COPY_CTX in s and all(a in s for a in TAIL_ASSERTS))
+            and COPY_CTX in body(s, INTAKE_SIG) and INTAKE_CALL in body(s, STAGE_SIG)
+            and all(a in s for a in TAIL_ASSERTS))
 
 
 def claim_hint_is_padded_like_the_context(resolver: str, context: str) -> bool:
@@ -635,6 +643,11 @@ def test_mutant_size_pin_left_at_the_old_size_fails():
 
 def test_mutant_backend_drops_the_context_fails():
     assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, _once(SYCL, COPY_CTX, ""), SYCL_H, RESOLVER)
+
+
+def test_mutant_stage_skips_the_intake_fails():
+    """The stage stops handing g_placement_kv_info to the intake: the copy still exists, and reaches no KV input."""
+    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, _once(SYCL, INTAKE_CALL, ""), SYCL_H, RESOLVER)
 
 
 def test_mutant_envelope_carries_the_hint_fails():
