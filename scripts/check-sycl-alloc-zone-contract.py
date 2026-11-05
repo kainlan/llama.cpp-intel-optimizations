@@ -3928,6 +3928,8 @@ WITNESSES = {
     "5": "raw allocator in a new function", "6": "comments and strings are not code",
     "7": "rename an exempt function", "8": "allowlist entry that matches nothing or pins a wrong count",
     "12": "request with no tier flag", "13": "request inside a broken #if", "14": "ternary arms",
+    "12c": "must_host_cpu is the third tier flag: exactly one of the three is established, the other two absent or "
+           "literal false",
     "18": "offload_buffer_request needs a literal tier", "19": "ERROR-root lexical pass", "20": "member initialiser",
     "23": "braceless declaration", "c1": "template argument hides a raw name", "i1": "dpct is in scope",
     "i2": "construction forms the enumeration could not see", "i3": "COUNT/false after a copy at a listed site",
@@ -4069,6 +4071,32 @@ def matrix_cases():
     A(Case("12", "tier written as a non-literal expression", plant(
         "void zzplant_w12(bool b) {\n    %s req{};\n    req.intent.constraints.must_device = b;\n}\n" % REQ),
         "FAIL", "B-TIER", "zzplant_w12"))
+    # 12c: must_host_cpu is the third tier (the canonical contract's HOST_CPU rule): exactly one of the three flags
+    A(Case("12c", "request with a literal HOST_CPU tier and no zone (control)", plant(
+        "void zzplant_w12c() {\n    %s req{};\n    req.intent.constraints.must_host_cpu = true;\n}\n" % REQ), "PASS"))
+    A(Case("12c", "HOST_CPU tier with the other two flags written literal false (control)", plant(
+        "void zzplant_w12c() {\n    %s req{};\n    req.intent.constraints.must_host_cpu = true;\n"
+        "    req.intent.constraints.must_device = false;\n"
+        "    req.intent.constraints.must_host_pinned = false;\n}\n" % REQ), "PASS"))
+    A(Case("12c", "HOST_CPU tier with forbid false is excused from clause (d) like a pinned host tier (control)", plant(
+        "void zzplant_w12c() {\n    %s req{};\n    req.intent.constraints.must_host_cpu = true;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = false;\n}\n" % REQ), "PASS"))
+    A(Case("12c", "must_host_cpu beside a zoned, forbidding must_device", plant(good_device(
+        "zzplant_w12c", "    req.intent.constraints.must_host_cpu = true;\n")), "FAIL", "B-TIER", "zzplant_w12c"))
+    A(Case("12c", "must_host_cpu beside must_host_pinned", plant(
+        "void zzplant_w12c() {\n    %s req{};\n    req.intent.constraints.must_host_cpu = true;\n"
+        "    req.intent.constraints.must_host_pinned = true;\n}\n" % REQ), "FAIL", "B-TIER", "zzplant_w12c"))
+    A(Case("12c", "the control's mutant: must_host_cpu = true then = false leaves no tier", plant(
+        "void zzplant_w12c() {\n    %s req{};\n    req.intent.constraints.must_host_cpu = true;\n"
+        "    req.intent.constraints.must_host_cpu = false;\n}\n" % REQ), "FAIL", "B-TIER", "zzplant_w12c"))
+    A(Case("12c", "must_host_cpu written as a non-literal expression", plant(
+        "void zzplant_w12c(bool b) {\n    %s req{};\n    req.intent.constraints.must_host_cpu = b;\n}\n" % REQ),
+        "FAIL", "B-TIER", "zzplant_w12c"))
+    A(Case("12c", "a zoned device request with a conditional must_host_cpu = true", plant(
+        "void zzplant_w12c(bool b) {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n"
+        "    if (b) req.intent.constraints.must_host_cpu = true;\n}\n" % REQ), "FAIL", "B-TIER", "zzplant_w12c"))
     # m1: last-write semantics on the tier
     A(Case("m1", "must_device = true then = false", plant(
         "void zzplant_m1() {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
