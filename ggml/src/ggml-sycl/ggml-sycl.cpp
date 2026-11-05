@@ -32600,6 +32600,24 @@ static bool ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test() {
 #endif
 }
 
+// The descriptor guard (th32 §3.2, T4). A lazy table's tensor, or a view of one, has no bytes behind its sentinel data
+// pointer, and the gather node is its only reader (§7.2), so a caller here is a plan bug nobody found. It fails closed,
+// before the layer-streaming registration below and before any device call, instead of registering the sentinel.
+static void ggml_sycl_get_data_ptr_refuse_lazy(const ggml_tensor * tensor, int device) {
+    const ggml_tensor * root = tensor;
+    while (root->view_src != nullptr) {
+        root = root->view_src;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_sycl_buffer_is_lazy(tensor->buffer) ? tensor->buffer : root->buffer;
+    if (!ggml_backend_sycl_buffer_is_lazy(buffer)) {
+        return;
+    }
+    const ggml_sycl::lazy_table * table = ggml_backend_sycl_lazy_buffer_table(buffer);
+    GGML_LOG_WARN("[LAZY-PLAN-BUG] data pointer requested for lazy table %s (tensor %s, device %d)\n",
+                  table != nullptr ? table->name() : root->name, tensor->name, device);
+    GGML_ABORT("a lazy table's descriptor reached ggml_sycl_get_data_ptr_slow");
+}
+
 // Cold path for ggml_sycl_get_data_ptr: full resolution chain
 // (tiered cache, get_pointer_type, unified cache, staging).
 // Called only when the fast-path data_device[] cache misses.
@@ -32607,6 +32625,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
     if (tensor == nullptr) {
         return nullptr;
     }
+    ggml_sycl_get_data_ptr_refuse_lazy(tensor, device);
 
     // Views must resolve through the root on the requested physical device
     // before any cached per-view direct handle can win.
