@@ -26118,7 +26118,8 @@ bool unified_cache::configure_host_zones(size_t weight_bytes,
     // The refusal changes nothing: the zones, every flag, the marked set and the reserved figures stay one state.
     if (!host_arena_->configure_zones(weight_bytes, kv_bytes, staging_bytes, scratch_bytes)) {
         if (ggml_sycl_strict_enabled()) {
-            GGML_ABORT("[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives (GGML_SYCL_STRICT)");
+            GGML_ABORT(
+                "[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives (GGML_SYCL_STRICT_LEASES)");
         }
         return false;
     }
