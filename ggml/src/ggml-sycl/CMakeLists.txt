@@ -8153,6 +8153,10 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # file at an unaligned end (Qwen's geometry), built by a read that asks for the whole O_DIRECT window instead of
     # stopping at the table's last byte, must refuse naming that geometry. Also a runtime seam: a PRIVATE_TESTING
     # constructor in lazy-table.cpp.
+    #
+    # The -mutant-shortfall-unreported registration is arm (15)'s positive control (th32 §6.4, the row cache's step-4
+    # shortfall): with the shortfall refused through the plain [LAZY-TABLE] WARN instead of its [HOST-PLAN-BUG] line,
+    # the arm must FAIL counting no such line. A runtime seam too: the PRIVATE_TESTING STORAGE constructor's flag.
     string(CONCAT _lazy_table_env
         "ONEAPI_DEVICE_SELECTOR=level_zero:1;"
         "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
@@ -8194,6 +8198,18 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         SKIP_RETURN_CODE 77
         TIMEOUT 120
         PASS_REGULAR_EXPRESSION "${_lazy_table_eof_mutant_regex}")
+    string(CONCAT _lazy_table_shortfall_mutant_regex
+        "FAIL \\(15\\) a row-cache shortfall refuses with one \\[HOST-PLAN-BUG\\] line naming planned and charged: "
+        "the shortfall printed 0 \\[HOST-PLAN-BUG\\] lines, want 1")
+    add_test(NAME test-sycl-lazy-table-mutant-shortfall-unreported
+        COMMAND test-sycl-lazy-table --mutant shortfall-unreported)
+    set_tests_properties(test-sycl-lazy-table-mutant-shortfall-unreported PROPERTIES
+        LABELS "sycl;cache;mem-handle;gpu-serial;mutant"
+        ENVIRONMENT "${_lazy_table_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+        PASS_REGULAR_EXPRESSION "${_lazy_table_shortfall_mutant_regex}")
 
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and

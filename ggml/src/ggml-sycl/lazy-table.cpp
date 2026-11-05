@@ -192,8 +192,8 @@ const char * lazy_table_status_name(lazy_table_status status) {
             return "lazy-table-read-failed";
         case lazy_table_status::ACTIVATION_MISMATCH:
             return "lazy-table-activation-mismatch";
-        case lazy_table_status::ROW_CACHE_UNBUILT:
-            return "lazy-table-row-cache-unbuilt";
+        case lazy_table_status::ROW_CACHE_SHORTFALL:
+            return "lazy-table-row-cache-shortfall";
     }
     return "lazy-table-unknown";
 }
@@ -324,7 +324,7 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
     // table's plan figure is its row cache, whose chunks would be its records; until the cache is built that figure is
     // refused by name, which is a missing part and not a plan bug.
     if (residency == lazy_residency::STORAGE && desc.host_resident_bytes != 0) {
-        return refuse(desc, lazy_table_status::ROW_CACHE_UNBUILT,
+        return refuse(desc, lazy_table_status::ROW_CACHE_SHORTFALL,
                       "planned host_resident_bytes=" + std::to_string(desc.host_resident_bytes) +
                           " B is the row cache (§6.3), which this build does not construct; records charge " +
                           std::to_string(table->charged_bytes()) + " B");
@@ -375,6 +375,15 @@ lazy_table_result lazy_table_test_create_host_reading_window(const lazy_table_de
     lazy_table::test_variation variation;
     variation.read_whole_window = true;
     return lazy_table::materialize(desc, lazy_residency::HOST, variation);
+}
+
+lazy_table_result lazy_table_test_create_storage(const lazy_table_desc & desc,
+                                                 size_t                  chunk_bytes,
+                                                 bool                    shortfall_unreported) {
+    lazy_table::test_variation variation;
+    variation.cache_chunk_bytes    = chunk_bytes;
+    variation.shortfall_unreported = shortfall_unreported;
+    return lazy_table::materialize(desc, lazy_residency::STORAGE, variation);
 }
 #endif
 
