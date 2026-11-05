@@ -70,11 +70,42 @@ struct host_zone {
 // Per-chunk TLSF allocator state for a zone. Each zone-chunk intersection
 // gets its own allocator managing [zone_start, zone_start + zone_size) within
 // the chunk.
+//
+// `withdrawn` and `orphaned` are the only per-chunk states of a returned
+// SCRATCH chunk, and this is their one home (docs/design/sycl-mmap-host-tier.md
+// §4.4 "Where the two flags live"). A withdrawn chunk takes no new zone
+// allocation and its bytes leave the zone's capacity; frees into it still reach
+// its allocator. An orphaned chunk's owner has ended, so the free that empties
+// it, or the drop of its last lease, releases it.
 struct zone_chunk_state {
     size_t                          chunk_idx;   // Index into chunks_ vector
     size_t                          zone_start;  // Byte offset within chunk where this zone starts
     size_t                          zone_size;   // Size of zone region within this chunk
     std::unique_ptr<tlsf_allocator> allocator;
+    bool                            withdrawn = false;
+    bool                            orphaned  = false;
+};
+
+// What pinned_chunk_pool::release_zone_chunk() decided, under the pool's lock, with the chunk's state (§4.4 "The state
+// re-read"). Only DONE fills the carrier. ORPHANED is returned only to a call made with `orphan_if_live`, in place of
+// REFUSED_LIVE or REFUSED_LEASE (a live allocation is checked first, then a lease), after setting `orphaned`.
+enum pinned_chunk_release {
+    PINNED_CHUNK_RELEASE_DONE,
+    PINNED_CHUNK_RELEASE_ALREADY,        // the chunk is a tombstone
+    PINNED_CHUNK_RELEASE_REFUSED_LIVE,   // the zone's or the chunk's allocator is not empty
+    PINNED_CHUNK_RELEASE_REFUSED_LEASE,  // a lease is held on the chunk
+    PINNED_CHUNK_RELEASE_ORPHANED,
+};
+
+// One zone chunk as the pool sees it: its flags, the bytes still allocated in it, and its usable span, for the
+// SCRATCH return-refused line and the test accessors. `found` is false when the zone holds no state for the chunk.
+struct pinned_chunk_usage {
+    bool      found     = false;
+    bool      withdrawn = false;
+    bool      orphaned  = false;
+    size_t    used      = 0;
+    uintptr_t lo        = 0;
+    uintptr_t hi        = 0;
 };
 
 // Segment of a pinned buffer.
@@ -102,11 +133,23 @@ struct segmented_buffer {
 // Uses per-zone-per-chunk TLSF sub-allocators for O(1) alloc/free with coalescing.
 // Each zone has isolated TLSF allocators, enabling proper zone_reset() without
 // disturbing other zones' allocations.
-// Chunks are only released when the pool is destroyed.
+// A chunk is released at the pool's destruction, or earlier by
+// release_zone_chunk() when it is a withdrawn SCRATCH chunk whose allocators are
+// empty and which holds no lease (§4.4 "The support gap it closes"). Its entry in
+// chunks_ stays as a tombstone (base null, size 0), so no other chunk's index
+// moves, and every loop over chunks_ skips a null base. Its backing leaves the
+// footprint only when the memory is gone (the released_chunk carrier below).
 class pinned_chunk_pool {
   public:
     static constexpr size_t CHUNK_SIZE        = 2ULL * 1024 * 1024 * 1024;  // 2GB default chunk
     static constexpr size_t DEFAULT_ALIGNMENT = 64;                         // Cache line alignment
+    // No chunk index: what zone_free() and release_chunk_lease() return when the call released no orphaned chunk.
+    static constexpr size_t NO_CHUNK          = SIZE_MAX;
+
+    // The release of one chunk's backing, as a move-only RAII carrier defined after this class: its destructor frees
+    // the chunk owner and moves the footprint, so a carrier dropped on any path releases and accounts exactly as a
+    // consumed one does.
+    class released_chunk;
 
     // Create a pool with the given budget (maximum total memory to allocate)
     pinned_chunk_pool(sycl::queue & queue, size_t budget);
@@ -154,7 +197,11 @@ class pinned_chunk_pool {
 
     // Configure logical zones across the pool's free capacity.
     // Must be called after pre-allocation and before any zone_alloc().
-    void configure_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
+    // Returns false only when a withdrawn chunk survives, before touching any
+    // state: the rebuild would discard a live allocation's allocator (§4.4
+    // "configure_zones refuses while a withdrawn chunk survives"). A capacity
+    // shortfall leaves the zones unconfigured and returns true, as before.
+    bool configure_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
 
     // Allocate from a specific host zone. Returns a segmented_buffer.
     // With per-zone TLSF, each allocator manages its own sub-region per chunk.
@@ -164,7 +211,9 @@ class pinned_chunk_pool {
     void * zone_alloc(host_zone_id zone, size_t size, size_t alignment = DEFAULT_ALIGNMENT);
 
     // Free a zone allocation. ptr must have been returned by zone_alloc / zone_alloc_segmented.
-    void zone_free(host_zone_id zone, void * ptr, size_t size = 0);
+    // Returns the chunk's index when the free emptied an orphaned chunk, which the caller then releases through the
+    // device cache after this lock has dropped; NO_CHUNK otherwise.
+    size_t zone_free(host_zone_id zone, void * ptr, size_t size = 0);
 
     // Reset a zone — bulk-resets all per-zone TLSF allocators.
     // Callers must ensure no outstanding users remain.
@@ -181,8 +230,36 @@ class pinned_chunk_pool {
 
     // Grow a zone by allocating additional chunks and extending the zone's span.
     // Used when compute buffer needs exceed the initially planned SCRATCH zone.
-    // Returns true if the zone was successfully grown.
-    bool grow_zone(host_zone_id zone, size_t additional_bytes);
+    // Returns true if the zone was successfully grown. `grown_chunk`, when given,
+    // receives the index of the chunk the growth appended (NO_CHUNK when none),
+    // which a SCRATCH transaction records.
+    bool grow_zone(host_zone_id zone, size_t additional_bytes, size_t * grown_chunk = nullptr);
+
+    // Withdraw a chunk from zone allocation (§4.4 "a marked chunk is withdrawn at
+    // once"). The chunk must belong to `zone` alone. The zone's capacity drops by
+    // the chunk's bytes only on the flag's false-to-true transition, so a second
+    // withdrawal changes nothing; this is the one site that lowers a zone's size.
+    // False when the chunk is not wholly the zone's.
+    bool withdraw_zone_chunk(host_zone_id zone, size_t chunk_idx);
+
+    // Release a withdrawn chunk whose allocators are empty and which holds no
+    // lease: unlink its span and zone allocator, leave a tombstone in chunks_, and
+    // move the chunk into `out`, whose destruction frees the owner. The zone's
+    // capacity and the footprint are not touched here. With `orphan_if_live` a
+    // chunk that cannot be released is marked orphaned under the same hold.
+    pinned_chunk_release release_zone_chunk(host_zone_id     zone,
+                                            size_t           chunk_idx,
+                                            released_chunk & out,
+                                            bool             orphan_if_live = false);
+
+    // Consume a carrier early: its release runs before this returns.
+    static void release_chunk_backing(released_chunk && carrier) noexcept;
+
+    pinned_chunk_usage zone_chunk_usage(host_zone_id zone, size_t chunk_idx) const;
+
+    // Released backings whose registry row was still present when their carrier ran: their footprint stays counted
+    // until the registry drops the row.
+    size_t stranded_count() const;
 
     bool zones_configured() const { return zones_configured_; }
 
@@ -198,8 +275,8 @@ class pinned_chunk_pool {
 
     size_t chunk_size() const { return chunk_size_; }
 
-    size_t allocated() const;  // Total bytes allocated (in chunks)
-    size_t chunk_count() const;
+    size_t allocated() const;    // Total bytes allocated (in chunks), after the stranded reconcile
+    size_t chunk_count() const;  // Live chunks; a released chunk's tombstone is not counted
 
     // === Chunk lease API (llama.cpp-dyhdl) ===
     // Reference-count a chunk while any mem_handle holds a raw pointer
@@ -226,13 +303,24 @@ class pinned_chunk_pool {
     uint64_t acquire_chunk_lease(const void * ptr);
 
     // Release a lease previously acquired via acquire_chunk_lease.
-    // No-op when handle == INVALID_CHUNK_HANDLE.
-    void release_chunk_lease(uint64_t handle);
+    // No-op when handle == INVALID_CHUNK_HANDLE. Returns the chunk's index when
+    // this drop took an orphaned, empty SCRATCH chunk's count to zero, which the
+    // caller then releases after this lock has dropped; NO_CHUNK otherwise.
+    size_t release_chunk_lease(uint64_t handle);
 
     // True while any lease is held on the given chunk.  Destruction-time
     // gate in ~pinned_chunk_pool waits for this to return false before
     // sycl::free'ing the chunk.
     bool chunk_has_leases(uint64_t handle) const;
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // The free point of a released chunk (§7 C4 "The footprint leaves with the memory"): called by the carrier after
+    // the owner's release and before the registry query, with no lock held, so a test reads "freed but still counted".
+    void test_set_free_point_hook(void (*hook)(void * ctx, const pinned_chunk_pool & pool), void * ctx) {
+        test_free_point_hook_ = hook;
+        test_free_point_ctx_  = ctx;
+    }
+#endif
 
   private:
     struct chunk {
@@ -291,12 +379,26 @@ class pinned_chunk_pool {
 
     void free_chunk_owner(chunk & c, const char * ctx);
 
-    // Internal free without acquiring mutex_ (caller must hold it).
-    void zone_free_unlocked(host_zone_id zone, void * ptr, size_t size);
+    // Internal free without acquiring mutex_ (caller must hold it). Returns the
+    // index of an orphaned chunk the free emptied, NO_CHUNK otherwise.
+    size_t zone_free_unlocked(host_zone_id zone, void * ptr, size_t size);
+
+    // Every decision read of the footprint (§4.4 "footprint_locked()"): reconcile the stranded list, then answer
+    // total_allocated_. Caller holds mutex_.
+    size_t footprint_locked() const;
+    // Drop each stranded entry the registry no longer holds, subtracting its bytes at that moment; prunes in place, so
+    // the list's capacity never shrinks. Caller holds mutex_; takes g_runtime_alloc_mutex per entry (canon §12.5 L5).
+    void   reconcile_stranded_locked() const;
+
+    // {registry metadata, backing bytes} of a released backing still registered; defined in pinned-pool.cpp, where
+    // alloc_metadata is complete.
+    struct stranded_entry;
 
     sycl::queue &                                                   queue_;
     size_t                                                          budget_;
-    size_t                                                          total_allocated_  = 0;
+    // Footprint: the backing bytes of every chunk whose memory is not yet gone. Written by grow_into's commit, the
+    // carrier's GONE branch, the reconcile and the destructor's reset; read for decisions only via footprint_locked().
+    mutable size_t                                                  total_allocated_  = 0;
     size_t                                                          chunk_size_       = CHUNK_SIZE;
     size_t                                                          alloc_timeout_ms_ = 0;
     std::vector<chunk>                                              chunks_;
@@ -306,7 +408,45 @@ class pinned_chunk_pool {
     std::vector<flat_span_info>                                     flat_spans_;
     // Per-zone, per-chunk TLSF allocators
     std::vector<zone_chunk_state> zone_allocators_[static_cast<size_t>(host_zone_id::COUNT)];
-    mutable std::mutex            mutex_;
+
+    // Reserved by grow_into to one entry per chunk before the chunk exists, so the carrier's append never allocates.
+    mutable std::vector<stranded_entry> stranded_;
+    // Owning released_chunk carriers alive; ~pinned_chunk_pool asserts 0 first.
+    std::atomic<size_t>                 owning_carriers_{ 0 };
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    void (*test_free_point_hook_)(void * ctx, const pinned_chunk_pool & pool) = nullptr;
+    void * test_free_point_ctx_                                               = nullptr;
+#endif
+    mutable std::mutex mutex_;
+};
+
+// A released chunk's backing (§4.4 "released_chunk is the release, and it is RAII"). Built only by
+// release_zone_chunk(); a move transfers the release and leaves the count unchanged; a default-constructed or
+// moved-from carrier owns nothing. Its destructor, for a carrier that still owns a chunk: (1) takes the owner's
+// registry metadata, (2) frees the chunk owner, (3) asks the registry whether that exact row is still registered, and
+// (4) under the pool's lock subtracts the backing on GONE, or else strands it for the reconcile. It never outlives its
+// pool.
+class pinned_chunk_pool::released_chunk {
+  public:
+    released_chunk() = default;
+    released_chunk(released_chunk && other) noexcept;
+    released_chunk & operator=(released_chunk && other) noexcept;
+    released_chunk(const released_chunk &)             = delete;
+    released_chunk & operator=(const released_chunk &) = delete;
+    ~released_chunk();
+
+    bool owns_backing() const { return pool_ != nullptr; }
+
+    size_t usable_size() const { return pool_ ? removed_.size : 0; }
+
+    size_t backing_size() const { return pool_ ? backing_ : 0; }
+
+  private:
+    friend class pinned_chunk_pool;
+
+    pinned_chunk_pool * pool_ = nullptr;
+    chunk               removed_{};
+    size_t              backing_ = 0;
 };
 
 }  // namespace ggml_sycl

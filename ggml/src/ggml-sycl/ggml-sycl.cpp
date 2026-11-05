@@ -96106,6 +96106,11 @@ void ggml_backend_sycl_begin_host_holders(ggml_backend_sched_t sched) {
         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
         if (backend && ggml_backend_is_sycl(backend)) {
             keys.push_back(ggml_sycl_host_holder_backend_key(backend));
+            // The scheduler creation before this begin freed the previous scheduler's compute buffers, so the
+            // device's empty marked SCRATCH chunks are released here (§4.4 "A begin and a live owner"). The marked set
+            // is the host buft device's, the device whose SCRATCH zone the notify grows.
+            (void) ggml_sycl::unified_cache_host_scratch_begin_release(ggml_sycl_notify_host_buft_device(backend),
+                                                                       ggml_sycl_host_holder_backend_key(backend));
         }
     }
     g_host_holder_plans->begin(keys.data(), keys.size());
