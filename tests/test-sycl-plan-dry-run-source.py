@@ -272,7 +272,8 @@ LAZY_RESTATED = (
 )
 # The fields the table formatter prints, as host-ledger-test-harness.hpp's printed() reads them, found in its string
 # literals joined, so a formatter built by concatenation and one built from one format string both show them.
-LAZY_TABLE_FIELDS = ("table=", " resident=", " cache_slots=", " floor_slots=", " consumer_device=")
+# locked= is the resident records' tier property (§3.1, §10): yes when the table holds resident bytes, none at 0.
+LAZY_TABLE_FIELDS = ("table=", " resident=", " locked=", " cache_slots=", " floor_slots=", " consumer_device=")
 
 
 def log_formats(text: str) -> list:
@@ -299,6 +300,8 @@ def formatter_gaps(formatters: str) -> list:
         gaps.append("the refusal formatter drops the refusal's detail")
     if '"none"' not in formatters:
         gaps.append("the refusal formatter prints no 'none' for a plan that did not refuse")
+    if '"yes"' not in formatters:
+        gaps.append("the table formatter prints no 'yes' for a table holding locked resident bytes")
     return gaps
 
 
@@ -364,6 +367,7 @@ def test_the_lazy_checks_see_each_dropped_piece():
     formatters = strip_comments(
         "std::string placement_lazy_table_fields(const placement_lazy_table & t) {\n"
         '  return "table=" + std::to_string(t.table_bytes) + " resident=" + std::to_string(t.host_resident_bytes) +\n'
+        '         " locked=" + (t.host_resident_bytes != 0 ? "yes" : "none") +\n'
         '         " cache_slots=" + std::to_string(t.cache_slots) +\n'
         '         " floor_slots=" + std::to_string(t.cache_floor_slots) +\n'
         '         " consumer_device=" + (t.consumer_device >= 0 ? std::to_string(t.consumer_device) : "CPU");\n'
@@ -403,6 +407,8 @@ def test_the_lazy_checks_see_each_dropped_piece():
     formatter_mutants = {
         "the resident bytes not printed": formatters.replace('" resident="', '" r="'),
         "the device not printed": formatters.replace('" consumer_device="', '" d="'),
+        "the locked state not printed": formatters.replace('" locked="', '" l="'),
+        "no yes": formatters.replace('"yes"', '"y"'),
         "no none": formatters.replace('"none"', '""'),
     }
     for name, mutant in formatter_mutants.items():
@@ -417,8 +423,9 @@ def test_the_lazy_checks_see_each_dropped_piece():
 
 # ---- 8. the residency decision's plan lines ----
 
-# The fields each line must carry, keyed as host-ledger-test-harness.hpp's printed() reads them (" name="). locked,
-# output_slot, landing and cold_set wait for the rows that add them.
+# The fields each line must carry, keyed as host-ledger-test-harness.hpp's printed() reads them (" name="). locked=
+# comes through the table formatter (LAZY_TABLE_FIELDS); output_slot, landing and cold_set wait for the rows that add
+# them.
 PLAN_LINE_FIELDS = {
     "STORAGE": (" index=",),
     "HOST": (" host_budget=", " host_planned=", " leftover="),
