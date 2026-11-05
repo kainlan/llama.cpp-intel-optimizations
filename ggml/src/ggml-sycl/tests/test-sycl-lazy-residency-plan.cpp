@@ -218,7 +218,9 @@ bool step2_of(arm_result & r, const moe_shape & shape, const ring_lease * pin, s
     const placement_plan bare = plan_for(shape, kv_with({}, 0), pin, delegate);
     step2                     = bare.host_zone_terms.total();
     if (bare.entries.empty() || bare.weight_host_bytes == 0) {
-        fail(r, "the plan with no table put no weight on the host, so step 2 is not the host zones it sizes");
+        fail(r, "the plan with no table has " + num(bare.entries.size()) + " entries and " +
+                    num(bare.weight_host_bytes) +
+                    " host weight bytes: it put no weight on the host, so step 2 is not the host zones it sizes");
         return false;
     }
     if (!bare.lazy_tables.empty() || !bare.lazy_refusal.empty()) {
@@ -308,13 +310,19 @@ arm_result deepseek_both_storage(bool delegate) {
                 threshold_one, threshold_both, reading);
     const placement_kv_info kv = kv_with(tables, reading);
     expect(r, threshold_one < threshold_both, "threshold_one is not below threshold_both");
-    expect(r, reading >= step2 + floor_upper_bytes(tables[0], kv) + floor_upper_bytes(tables[1], kv) + k_p3_margin,
-           "the reading does not clear step 2, both floors and the margin");
+    const size_t floor_a     = floor_upper_bytes(tables[0], kv);
+    const size_t floor_b     = floor_upper_bytes(tables[1], kv);
+    const size_t floors_need = step2 + floor_a + floor_b + k_p3_margin;
+    expect(r, reading >= floors_need,
+           "the reading " + num(reading) + " does not clear step 2 " + num(step2) + " + floors " + num(floor_a) +
+               " and " + num(floor_b) + " + 29 GiB = " + num(floors_need));
     const placement_plan plan = plan_for(ds_shape, kv, pin.pin(), delegate);
     expect_same_step2(r, plan, step2, "");
     expect(r, plan.lazy_refusal.empty(), "the plan refused: " + plan.lazy_refusal + " " + plan.lazy_refusal_detail);
     expect(r, plan.lazy_tables.size() == 2 && plan.lazy_tables[0].name == tables[0].name,
-           "the plan does not carry blk.1 first of two tables (ascending consumer_layer)");
+           "the plan carries " + num(plan.lazy_tables.size()) + " tables, the first " +
+               (plan.lazy_tables.empty() ? std::string("none") : plan.lazy_tables[0].name) + ", want two with " +
+               tables[0].name + " first (ascending consumer_layer)");
     for (const placement_lazy_table_info & t : tables) {
         expect_storage(r, plan, t, kv, "");
     }
@@ -335,7 +343,8 @@ arm_result deepseek_both_storage(bool delegate) {
                "the two caches differ by " + num(gap) + " slots, more than one chunk's " + num(slots_per_chunk) +
                    ": the yieldable share is not split by table_bytes x rows_per_token");
     }
-    expect(r, plan.block_ring_qd == LAZY_BLOCK_RING_QD, "block_ring_qd " + num(plan.block_ring_qd));
+    expect(r, plan.block_ring_qd == LAZY_BLOCK_RING_QD,
+           "block_ring_qd " + num(plan.block_ring_qd) + ", want LAZY_BLOCK_RING_QD " + num(LAZY_BLOCK_RING_QD));
     expect(r, plan.block_ring_need == LAZY_BLOCK_RING_QD * lazy_block_ring_span(tables[0].row_size),
            "block_ring_need " + num(plan.block_ring_need) + ", want QD x the widest STORAGE span");
     expect(r, plan.block_ring_charge == mapped(plan.block_ring_need),
@@ -436,9 +445,12 @@ arm_result arm_e_null_pin_refuses() {
            "the plan's refusal is '" + plan.lazy_refusal + "', want lazy-table-ring-unpinned");
     expect(r, !plan.lazy_refusal_detail.empty(), "the refusal carries no figures");
     expect(r, plan.lazy_tables.empty(), "a refused plan carries " + num(plan.lazy_tables.size()) + " tables");
-    expect(r, plan.block_ring_need == 0 && plan.block_ring_charge == 0, "a refused plan carries a ring");
+    expect(
+        r, plan.block_ring_need == 0 && plan.block_ring_charge == 0,
+        "a refused plan carries a ring: need " + num(plan.block_ring_need) + ", charge " + num(plan.block_ring_charge));
     expect(r, plan.host_planned_bytes == plan.host_zone_terms.total(),
-           "a refused plan's host figure " + num(plan.host_planned_bytes) + " is not its zone total");
+           "a refused plan's host figure " + num(plan.host_planned_bytes) + " is not its zone total " +
+               num(plan.host_zone_terms.total()));
     return r;
 }
 
