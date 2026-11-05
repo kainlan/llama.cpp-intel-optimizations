@@ -81,8 +81,6 @@ static void host_cpu_munmap(void * ptr, size_t mapped_bytes) {
 }
 
 host_cpu_status unified_cache_raw_alloc_host_cpu(size_t request_bytes, host_cpu_mapping * out) {
-    void * extra = mmap(nullptr, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    (void) extra;
     if (out == nullptr) {
         return host_cpu_status::INVALID_ARGUMENT;
     }
@@ -99,6 +97,8 @@ host_cpu_status unified_cache_raw_alloc_host_cpu(size_t request_bytes, host_cpu_
         return host_cpu_status::MMAP_FAILED;
     }
     out->mapped_bytes = mapped;
+    void * extra = mmap(nullptr, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);  // EXTRA-MMAP
+    (void) extra;
 
     // advisory: a refusal (THP compiled out, or "never") costs speed, not correctness. Before the lock, because mlock
     // faults every page in and a page faulted in small stays small. MADV_HUGEPAGE is Linux-only, so a POSIX kernel

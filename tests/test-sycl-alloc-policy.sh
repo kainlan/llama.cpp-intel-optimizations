@@ -829,9 +829,17 @@ fi
 
 # Clause (q) allows the tier TUs' mapping sites by file, function and count: an
 # extra mmap in a pinned function, and an mmap in a third file, must still fail.
+# The checker must also name the extra call (marked EXTRA-MMAP) as its one
+# violation, so a count rule cannot report a pinned site instead.
 for fixture in bad-host-cpu-mapping-extra-mmap bad-file-mapping-extra-mmap bad-tier-third-file-mmap; do
-    if "$CHECKER" "$ROOT_DIR/tests/sycl-alloc-policy-fixtures/$fixture" >/dev/null 2>&1; then
+    if out="$("$CHECKER" "$ROOT_DIR/tests/sycl-alloc-policy-fixtures/$fixture" 2>&1)"; then
         echo "expected $fixture fixture to fail policy check" >&2
+        exit 1
+    fi
+    if [[ "$(grep -c '^forbidden raw host VM' <<<"$out" || true)" != 1 ]] ||
+       ! grep -q '^forbidden raw host VM.*EXTRA-MMAP' <<<"$out"; then
+        echo "expected $fixture to report only its EXTRA-MMAP call; got:" >&2
+        echo "$out" >&2
         exit 1
     fi
 done
