@@ -18483,11 +18483,12 @@ static ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan_stale_l
     return GGML_SYCL_LIFECYCLE_UNSUPPORTED;
 }
 
-// A plan whose lazy-table decision refused (th32 §4.3 step 4) refuses the load: one WARN names the reason and its
-// figures, and the stage returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED, before the probe plan is staged from it and before
-// the late pass configures a host zone for it. The planner stays exception-free, so a direct early call leaves the
-// refused candidate staged with no table.
-static bool ggml_sycl_stage_lazy_refused(const ggml_sycl::placement_plan * plan, bool early) {
+// Refuses the load for a plan whose lazy-table decision refused (th32 §4.3 step 4): logs one WARN naming the reason and
+// its figures and returns true, and the stage then returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED, before the probe plan is
+// staged from it and before the late pass configures a host zone for it. Returns false, logging nothing, for a plan
+// that did not refuse. The planner stays exception-free, so a direct early call leaves the refused candidate staged
+// with no table.
+static bool ggml_sycl_stage_refuse_lazy_plan(const ggml_sycl::placement_plan * plan, bool early) {
     if (plan == nullptr || plan->lazy_refusal.empty()) {
         return false;
     }
@@ -18573,7 +18574,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 if (!candidate_is_current()) {
                     throw std::runtime_error("stale host provisioning candidate before allocation");
                 }
-                if (ggml_sycl_stage_lazy_refused(snapshot->plan.get(), early)) {
+                if (ggml_sycl_stage_refuse_lazy_plan(snapshot->plan.get(), early)) {
                     return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
                 }
 
@@ -18605,7 +18606,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
         // plan; the late pass refuses per device before it configures that device's host zones.
         const auto early_candidate =
             early ? ggml_sycl::lifecycle_find_candidate_placement_plan(effect.owner.load.value) : nullptr;
-        if (early_candidate && ggml_sycl_stage_lazy_refused(early_candidate->plan.get(), early)) {
+        if (early_candidate && ggml_sycl_stage_refuse_lazy_plan(early_candidate->plan.get(), early)) {
             return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
         }
         if (early) {
