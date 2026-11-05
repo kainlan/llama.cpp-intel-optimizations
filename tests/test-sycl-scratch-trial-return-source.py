@@ -67,7 +67,10 @@ ARMS = {
     "rtm-left-in-txn": ("retry-return,retry-keep,trial-retry-return,trial-retry-keep",
                         ("after RETURN_TO_MARK, expected 0",)),
     "rtm-left-in-txn,withdraw-transition-blind": ("retry-return", ("exceeds the pool's allocated()",)),
-    "keep-walks-set": ("retry-keep,trial-retry-keep", ("after the begin",)),
+    # The design's `chunk_count <n+2> after the begin` is unreachable: the un-withdrawn chunk is still marked, so the
+    # begin's release_zone_chunk aborts on its withdrawn assert. The arm scores the check the fault fails first.
+    "keep-walks-set": ("retry-keep,trial-retry-keep",
+                       ("not withdrawn after KEEP", "KEEP reaches only the transaction")),
     "carrier-dtor-noop": ("dropped-carrier", ("footprint leaked by a dropped carrier",)),
     "moved-from-releases": ("dropped-carrier", ("footprint subtracted twice",)),
     "no-prune": ("strand", ("stranded footprint never reconciled",)),

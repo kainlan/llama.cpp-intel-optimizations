@@ -8046,7 +8046,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         rtm-left-in-txn,withdraw-transition-blind retry-return
             "SCRATCH capacity [0-9.]+ MiB exceeds the pool's allocated\\(\\) [0-9.]+ MiB"
         keep-walks-set retry-keep,trial-retry-keep
-            "chunk_count [0-9]+ after the begin, expected [0-9]+"
+            "chunk [0-9]+ not withdrawn after KEEP: KEEP reaches only the transaction's chunks"
         carrier-dtor-noop dropped-carrier
             "after a dropped released_chunk, expected [0-9.]+ MiB: footprint leaked by a dropped carrier"
         moved-from-releases dropped-carrier
