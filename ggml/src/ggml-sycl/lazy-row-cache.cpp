@@ -395,6 +395,9 @@ lazy_row_cache_build lazy_row_cache::build(const lazy_row_cache_config &  config
         sh.limit = std::min(sh.owned, 3 * sh.n_buckets / 4);
         c->capacity_slots_ += sh.limit;
     }
+    // The capacity can fall short of cache_slots from two sources, and the build line prints the two side by side: a
+    // row never straddles two chunks, so each chunk boundary can lose one row (§6.3, §3.3), and each shard holds at
+    // most floor(0.75 x its buckets), so the per-shard caps can lose up to n_shards - 1 rows to rounding.
     c->chunks_resident_.store(c->n_chunks_, std::memory_order_relaxed);
     c->charged_live_.store(result.charged_bytes, std::memory_order_relaxed);
 
