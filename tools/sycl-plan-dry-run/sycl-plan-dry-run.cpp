@@ -16,6 +16,7 @@
 //   - the copies a TENSOR_DUPLICATED create makes, such as a tied output head created from token_embd: in the late
 //     inventory, not the early one, which holds the file's one tensor.
 
+#include "common.h"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "llama.h"
@@ -145,9 +146,10 @@ int main(int argc, char ** argv) {
     call.result->struct_size = sizeof(ggml_sycl_plan_dry_run_result);
     call.result->version     = GGML_SYCL_PLAN_DRY_RUN_VERSION;
 
-    // The load's own parameters: a header read, the requested context as the load's hint, no micro-batch named.
+    // The load's own parameters: a header read, the requested context as the load's hint (mapped as every tool that
+    // takes -c maps it), no micro-batch named.
     llama_model_params params = llama_model_default_params();
-    params.n_ctx_hint         = args.n_ctx;
+    params.n_ctx_hint         = common_n_ctx_hint(args.n_ctx);
     params.n_ubatch_hint      = 0;
     if (args.lazy_mode_set) {
         params.lazy_mode = args.lazy_mode;
