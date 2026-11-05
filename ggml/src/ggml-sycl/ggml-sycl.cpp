@@ -54511,9 +54511,20 @@ ggml_backend_buffer_type_t ggml_backend_sycl_lazy_host_buffer_type() {
 
 ggml_backend_buffer_t ggml_backend_sycl_lazy_buffer_init(ggml_backend_buffer_type_t buft,
                                                          ggml_sycl::lazy_table_ref  table) {
-    GGML_LOG_WARN("[LAZY-TABLE] no descriptor is bound: buft=%s table=%s\n",
-                  buft != nullptr ? buft->iface.get_name(buft) : "(none)", table ? table->name() : "(none)");
-    return nullptr;
+    if (!ggml_sycl_buft_is_lazy(buft) || !table) {
+        GGML_LOG_WARN("[LAZY-TABLE] a descriptor binds a table to a lazy buffer type: buft=%s table=%s\n",
+                      buft != nullptr ? buft->iface.get_name(buft) : "(none)", table ? table->name() : "(none)");
+        return nullptr;
+    }
+    const size_t          size   = table->desc().table_bytes;
+    auto *                ctx    = new ggml_backend_sycl_lazy_buffer_context{ std::move(table) };
+    // On a failure the wrapper runs the cleanup, which drops the reference.
+    ggml_backend_buffer_t buffer = ggml_backend_buffer_init_with_cleanup(
+        buft, ggml_backend_sycl_lazy_buffer_interface, ctx, size, ggml_backend_sycl_lazy_buffer_context_cleanup);
+    if (buffer != nullptr) {
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+    return buffer;
 }
 
 // Host compute buffer type - uses SYCL host memory with SYCL buffer interface
