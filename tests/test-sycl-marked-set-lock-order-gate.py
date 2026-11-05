@@ -898,7 +898,8 @@ CONTROLS = [
      "    std::vector<pinned_chunk_pool::released_chunk> released;",
      "pool call before marked_set_mutex_"),
     ("c3-pool-calls-release-marked", 3, "release_zone_chunk", "    states.erase(state);",
-     "    states.erase(state);\n    (void) release_marked_chunk(chunk_idx);", "pool mutex_ held across release_marked_chunk"),
+     "    states.erase(state);\n    (void) release_marked_chunk(chunk_idx);",
+     "pool mutex_ held across release_marked_chunk"),
     ("c4-rw-under-marked", 4, "begin", "        for (const marked_chunk_entry & entry : marked_set_) {",
      "        std::shared_lock<std::shared_mutex> rw(rw_mutex_);\n"
      "        for (const marked_chunk_entry & entry : marked_set_) {",
@@ -907,7 +908,8 @@ CONTROLS = [
      "        std::lock_guard<std::mutex> deferred(deferred_frees_mutex_);\n"
      "        for (const marked_chunk_entry & entry : marked_set_) {",
      "census lock deferred_frees_mutex_ under marked_set_mutex_"),
-    ("c5-backing-release-under-marked", 5, "public", "        status = release_marked_chunk_locked(chunk_idx, released);",
+    ("c5-backing-release-under-marked", 5, "public",
+     "        status = release_marked_chunk_locked(chunk_idx, released);",
      "        status = release_marked_chunk_locked(chunk_idx, released);\n"
      "        pinned_chunk_pool::release_chunk_backing(std::move(released));",
      "backing release under marked_set_mutex_"),
@@ -932,7 +934,8 @@ CONTROLS = [
      + LOCK_MARKED + "\n        pinned_chunk_pool::released_chunk released;\n",
      "released_chunk slot declared inside the marked_set_mutex_ scope"),
     ("c6-no-strict-read", 6, "configure",
-     "        if (ggml_sycl_strict_enabled()) {\n            GGML_ABORT(", "        if (false) {\n            GGML_ABORT(",
+     "        if (ggml_sycl_strict_enabled()) {\n            GGML_ABORT(",
+     "        if (false) {\n            GGML_ABORT(",
      "configure_host_zones returns the refusal without the strict read"),
     ("c7-public-under-marked", 7, "begin", "        for (const marked_chunk_entry & entry : marked_set_) {",
      "        (void) release_marked_chunk(0);\n        for (const marked_chunk_entry & entry : marked_set_) {",
@@ -1006,12 +1009,14 @@ CONTROLS = [
      "allocated does not call footprint_locked"),
     ("c10-helper-skips-reconcile", 10, "footprint_locked", "    reconcile_stranded_locked();\n", "",
      "footprint_locked returns total_allocated_ without reconcile_stranded_locked"),
-    ("c10-grow-zone-local-copy", 10, "grow_zone", "    const chunk_footprint footprint = chunk_footprint_for(additional_bytes);",
+    ("c10-grow-zone-local-copy", 10, "grow_zone",
+     "    const chunk_footprint footprint = chunk_footprint_for(additional_bytes);",
      "    const size_t snapshot = total_allocated_;\n    (void) snapshot;\n"
      "    const chunk_footprint footprint = chunk_footprint_for(additional_bytes);",
      "grow_zone reads total_allocated_ outside a log call"),
     ("c10-decision-body-writes", 10, "pre_allocate", "    size_t       chunks_grown  = 0;",
-     "    size_t       chunks_grown  = 0;\n    total_allocated_ = 0;", "total_allocated_ written outside the allow-list"),
+     "    size_t       chunks_grown  = 0;\n    total_allocated_ = 0;",
+     "total_allocated_ written outside the allow-list"),
     ("c10-tenth-log-read", 10, "pre_allocate", "    size_t       chunks_grown  = 0;",
      "    size_t       chunks_grown  = 0;\n"
      "    GGML_LOG_INFO(\"[SYCL] pool footprint %.1f GB\\n\", total_allocated_ / (1024.0 * 1024.0 * 1024.0));",
@@ -1070,8 +1075,10 @@ CONTROLS = [
 ]
 
 # The one negative control (§7 C4 clause 10): a comment quoting the member must not count as a mention.
-NEGATIVE_CONTROL = ("comment-quotes-member", "configure_zones", "    // Grow chunks until we have enough total capacity.",
-                    "    // Grow chunks until we have enough total capacity: total_allocated_ + chunk_size_ <= budget_\n"
+NEGATIVE_CONTROL = ("comment-quotes-member", "configure_zones",
+                    "    // Grow chunks until we have enough total capacity.",
+                    "    // Grow chunks until we have enough total capacity: total_allocated_ + chunk_size_ "
+                    "<= budget_\n"
                     "    /* total_allocated_ -= 0; total_allocated_ = 0; */")
 
 
