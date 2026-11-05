@@ -153,6 +153,11 @@ class host_scratch_ledger {
                                              const host_scratch_zone_ops & ops);
     // Drops the context's demand at its owner boundary. Dropping a demand returns no capacity.
     void                       drop_context(uint64_t context_key);
+    // Marks the context's demand at its commit (§4.4 "The same fact for the notify's measure"): the next notify_context
+    // for the key is the commit's re-notify with the allocated size, which replaces the measured one, and its demand
+    // line also prints `measured=%.1f allocated=%.1f`, the two host compute figures in MB. A key with no demand is not
+    // marked, and the re-notify consumes the mark.
+    void                       mark_committed(uint64_t context_key);
     // A returned SCRATCH chunk was withdrawn, so the zone's capacity fell by `bytes` (§4.4 "a marked chunk is withdrawn
     // at once"). The reservation falls by the same bytes, so a later target above what is left grows again.
     void                       release_reserved(size_t bytes);
@@ -163,8 +168,10 @@ class host_scratch_ledger {
 
   private:
     struct demand {
-        size_t bytes     = 0;
-        size_t n_buffers = 0;
+        size_t bytes          = 0;
+        size_t n_buffers      = 0;
+        size_t compute        = 0;      // the host compute figure of the last notify: the measured one until the commit
+        bool   committed_mark = false;  // set by mark_committed, consumed by the next notify_context
     };
 
     // Reserves the deficit of the demands now recorded under `lock`, releases it, makes the one grow, and returns a
@@ -202,6 +209,10 @@ bool host_scratch_notify(const host_scratch_notify_env & env,
                          ggml_backend_t                  backend,
                          size_t                          host_compute_bytes,
                          size_t                          host_output_bytes);
+
+// The commit's mark (ggml_backend_sycl_commit_host_holders): marks the backend context's demand on the ledger the
+// notify records it on. False, with nothing marked, for a non-SYCL backend or a device with no unified cache.
+bool host_scratch_mark_committed(const host_scratch_notify_env & env, ggml_backend_t backend);
 
 // ---------------------------------------------------------------------------------------------------------------
 // The plan walk (§4.4 "The plan walk is SYCL-side", "The walk runs where the split is live").

@@ -254,7 +254,12 @@ host_scratch_ensure_result host_scratch_ledger::notify_context(uint64_t         
                                                                const host_scratch_zone_ops & ops) {
     const size_t                 capacity_before = scratch_zone_capacity(ops);
     std::unique_lock<std::mutex> lock(mutex_);
-    demand &                     d = contexts_[context_key];
+    demand &                     d        = contexts_[context_key];
+    // The commit's re-notify replaces the measured compute figure with the allocated one and prints both.
+    const bool                   renotify = d.committed_mark;
+    const size_t                 measured = d.compute;
+    d.committed_mark                      = false;
+    d.compute                             = compute_bytes;
 #if defined(HOST_ZONE_PLAN_MUTANT_LEDGER_ACCUMULATE)
     // Positive control: accumulate instead of replace, so a context's second notify grows again for the same bytes.
     d.bytes += compute_bytes + output_bytes;
@@ -265,10 +270,14 @@ host_scratch_ensure_result host_scratch_ledger::notify_context(uint64_t         
     d.n_buffers = host_scratch_buffers_at_cap(compute_bytes, ops.chunk_cap) +
                   host_scratch_buffers_at_cap(output_bytes, ops.chunk_cap);
 #endif
-    const host_scratch_ensure_result r = ensure_locked_then_grow(lock, ops, capacity_before);
-    GGML_LOG_INFO("[HOST-ARENA] SCRATCH demand ctx=%llu compute=%.1f MB output=%.1f MB total=%.1f MB grown=%.1f MB\n",
+    const host_scratch_ensure_result r        = ensure_locked_then_grow(lock, ops, capacity_before);
+    char                             both[64] = "";
+    if (renotify) {
+        snprintf(both, sizeof(both), " measured=%.1f allocated=%.1f", to_mib(measured), to_mib(compute_bytes));
+    }
+    GGML_LOG_INFO("[HOST-ARENA] SCRATCH demand ctx=%llu compute=%.1f MB output=%.1f MB total=%.1f MB grown=%.1f MB%s\n",
                   (unsigned long long) context_key, to_mib(compute_bytes), to_mib(output_bytes), to_mib(r.total),
-                  to_mib(r.grown));
+                  to_mib(r.grown), both);
     return r;
 }
 
@@ -290,6 +299,19 @@ host_scratch_ensure_result host_scratch_ledger::holder_demand(const char *      
 void host_scratch_ledger::drop_context(uint64_t context_key) {
     std::lock_guard<std::mutex> lock(mutex_);
     contexts_.erase(context_key);
+}
+
+void host_scratch_ledger::mark_committed(uint64_t context_key) {
+#if defined(HOST_ZONE_PLAN_MUTANT_LEDGER_MARK_IGNORED)
+    // Positive control: the mark is dropped, so the commit's re-notify prints the plain demand line.
+    (void) context_key;
+#else
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto                  it = contexts_.find(context_key);
+    if (it != contexts_.end()) {
+        it->second.committed_mark = true;
+    }
+#endif
 }
 
 void host_scratch_ledger::release_reserved(size_t bytes) {
@@ -319,6 +341,30 @@ size_t host_scratch_ledger::context_demand(uint64_t context_key) const {
     return it == contexts_.end() ? 0 : it->second.bytes;
 }
 
+// The ledger the notify records a context's demand on and the commit marks it on: that of the device the host buft
+// allocates from, the zone the host buffers land in. False when that device has no unified cache.
+static bool host_scratch_resolve_ledger(const host_scratch_notify_env &   env,
+                                        ggml_backend_t                    backend,
+                                        const host_scratch_context_info & info,
+                                        int *                             device,
+                                        host_scratch_ledger **            ledger,
+                                        host_scratch_zone_ops *           ops) {
+#if defined(HOST_ZONE_PLAN_MUTANT_NOTIFY_DEVICE0)
+    // Positive control: the device-0 resolve.
+    (void) backend;
+    (void) info;
+    *device = 0;
+#elif defined(HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE)
+    // Positive control: the notifying backend's own device in place of the host buft's.
+    (void) backend;
+    *device = info.device;
+#else
+    (void) info;
+    *device = env.host_buft_device(backend);
+#endif
+    return *device >= 0 && env.ledger_of && env.ledger_of(*device, ledger, ops) && *ledger;
+}
+
 bool host_scratch_notify(const host_scratch_notify_env & env,
                          ggml_backend_t                  backend,
                          size_t                          host_compute_bytes,
@@ -329,25 +375,31 @@ bool host_scratch_notify(const host_scratch_notify_env & env,
         GGML_LOG_WARN("[HOST-ARENA] SCRATCH notify refused: the backend is not a SYCL backend; nothing recorded\n");
         return false;
     }
-    const host_scratch_context_info info = env.context_of(backend);
-#if defined(HOST_ZONE_PLAN_MUTANT_NOTIFY_DEVICE0)
-    // Positive control: the device-0 resolve.
-    const int device = 0;
-#elif defined(HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE)
-    // Positive control: the notifying backend's own device in place of the host buft's.
-    const int device = info.device;
-#else
-    // The zone that grows is the one the host buffers land in: the device the host buft allocates from.
-    const int device = env.host_buft_device(backend);
-#endif
-    host_scratch_ledger * ledger = nullptr;
-    host_scratch_zone_ops ops{};
-    if (device < 0 || !env.ledger_of || !env.ledger_of(device, &ledger, &ops) || !ledger) {
+    const host_scratch_context_info info   = env.context_of(backend);
+    int                             device = -1;
+    host_scratch_ledger *           ledger = nullptr;
+    host_scratch_zone_ops           ops{};
+    if (!host_scratch_resolve_ledger(env, backend, info, &device, &ledger, &ops)) {
         GGML_LOG_WARN("[HOST-ARENA] SCRATCH notify for ctx=%llu found no unified cache on device %d; nothing grown\n",
                       (unsigned long long) info.key, device);
         return false;
     }
     return ledger->notify_context(info.key, host_compute_bytes, host_output_bytes, ops).ok;
+}
+
+bool host_scratch_mark_committed(const host_scratch_notify_env & env, ggml_backend_t backend) {
+    if (!backend || !env.is_sycl || !env.is_sycl(backend)) {
+        return false;
+    }
+    const host_scratch_context_info info   = env.context_of(backend);
+    int                             device = -1;
+    host_scratch_ledger *           ledger = nullptr;
+    host_scratch_zone_ops           ops{};
+    if (!host_scratch_resolve_ledger(env, backend, info, &device, &ledger, &ops)) {
+        return false;
+    }
+    ledger->mark_committed(info.key);
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------------------------

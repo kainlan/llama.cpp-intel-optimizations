@@ -12,6 +12,7 @@
 //   HOST_ZONE_PLAN_MUTANT_LEDGER_NO_ROLLBACK   (host-zone-plan.cpp) a failed grow keeps its reservation
 //   HOST_ZONE_PLAN_MUTANT_LEDGER_NO_RESERVE    (host-zone-plan.cpp) the deficit is not reserved before the unlock
 //   HOST_ZONE_PLAN_MUTANT_LEDGER_WITHDRAW_KEPT (host-zone-plan.cpp) a withdrawal leaves the reservation as it was
+//   HOST_ZONE_PLAN_MUTANT_LEDGER_MARK_IGNORED  (host-zone-plan.cpp) the commit's mark does not reach the re-notify
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -341,6 +342,36 @@ void reset_caches() {
     g_context_calls = 0;
 }
 
+// The commit's re-notify (§4.4 "The same fact for the notify's measure"). The context's commit marks its demand, so the
+// next notify replaces the measured compute figure with the allocated one and its demand line prints both. A notify
+// after it carries no mark and prints neither, and a mark on a context with no demand records nothing.
+void test_commit_renotify_prints_both() {
+    fake_zone z;
+    z.capacity = plan_scratch;
+    host_scratch_ledger ledger;
+    const auto          ops = ops_for(z);
+
+    ledger.notify_context(1, 100 * MiB, 10 * MiB, ops);
+    capture_begin();
+    ledger.mark_committed(1);
+    ledger.notify_context(1, 80 * MiB, 10 * MiB, ops);
+    HZP_CHECK(log_has("measured=100.0 allocated=80.0"),
+              "the commit's re-notify printed no measured=100.0 allocated=80.0 on its demand line");
+    HZP_CHECK(ledger.context_demand(1) == 90 * MiB,
+              "demand %.1f MiB after the re-notify, expected the allocated 90.0 MiB",
+              (double) ledger.context_demand(1) / MiB);
+
+    capture_begin();
+    ledger.notify_context(1, 80 * MiB, 10 * MiB, ops);
+    HZP_CHECK(log_has("[HOST-ARENA] SCRATCH demand ctx=1 ") && !log_has("measured="),
+              "a notify after the re-notify printed measured=/allocated= again: the mark was not consumed");
+
+    ledger.mark_committed(7);
+    HZP_CHECK(ledger.context_demand(7) == 0 && ledger.total() == 90 * MiB,
+              "a mark on a context with no demand recorded one: total %.1f MiB, expected 90.0 MiB",
+              (double) ledger.total() / MiB);
+}
+
 void test_non_sycl_refused() {
     reset_caches();
     capture_begin();
@@ -369,6 +400,23 @@ void test_device_is_the_host_bufts() {
     g_buft_device = 0;
 }
 
+// The commit marks the demand on the ledger the notify recorded it on: with the host buft on device 0, a device-1
+// backend's notify and its commit's mark both reach device 0's ledger, so the re-notify prints both figures there. A
+// non-SYCL backend's mark is refused before its context is read.
+void test_commit_mark_reaches_the_notifys_ledger() {
+    reset_caches();
+    g_buft_device = 0;
+    host_scratch_notify(fake_env(), g_sycl_dev1, 100 * MiB, 10 * MiB);
+    capture_begin();
+    const bool marked = host_scratch_mark_committed(fake_env(), g_sycl_dev1);
+    host_scratch_notify(fake_env(), g_sycl_dev1, 80 * MiB, 10 * MiB);
+    HZP_CHECK(marked && log_has("[HOST-ARENA] SCRATCH demand ctx=42 ") && log_has("measured=100.0 allocated=80.0"),
+              "the commit's mark did not reach the ledger of the device the notify recorded ctx=42 on");
+    const int calls = g_context_calls;
+    HZP_CHECK(!host_scratch_mark_committed(fake_env(), g_not_sycl) && g_context_calls == calls,
+              "a non-SYCL backend's mark was not refused before its context was read");
+}
+
 void test_failed_grow_returns_false() {
     reset_caches();
     g_zone[0].fail = true;
@@ -388,8 +436,10 @@ int main() {
     test_covered_notify_reports_its_own_grow();
     test_failed_grow_returns_its_reservation();
     test_withdrawal_releases_its_reservation();
+    test_commit_renotify_prints_both();
     test_non_sycl_refused();
     test_device_is_the_host_bufts();
+    test_commit_mark_reaches_the_notifys_ledger();
     test_failed_grow_returns_false();
     return finish("test-sycl-host-scratch-demand");
 }

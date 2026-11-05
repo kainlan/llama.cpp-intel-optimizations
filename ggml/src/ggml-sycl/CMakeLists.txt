@@ -8484,7 +8484,9 @@ ggml_sycl_host_zone_plan_test(host-scratch-demand MUTANTS
     HOST_ZONE_PLAN_MUTANT_LEDGER_NO_RESERVE
         "two notifies for one deficit grew 2 time\\(s\\), expected 1"
     HOST_ZONE_PLAN_MUTANT_LEDGER_WITHDRAW_KEPT
-        "withdrawal, the same target grew 1 time\\(s\\) in all, expected 2: the reservation still counts")
+        "withdrawal, the same target grew 1 time\\(s\\) in all, expected 2: the reservation still counts"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_MARK_IGNORED
+        "the commit's re-notify printed no measured=100.0 allocated=80.0 on its demand line")
 
 if (NOT GGML_BACKEND_DL)
     # The real ggml-base scheduler over two CPU backend instances; ggml-cpu is a MODULE under GGML_BACKEND_DL.

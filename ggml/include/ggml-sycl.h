@@ -919,9 +919,10 @@ GGML_BACKEND_API bool ggml_backend_sycl_notify_host_buffer_sizes(ggml_backend_t 
 // the reserve graphs. begin clears the pending plan of every SYCL backend in sched; plan walks
 // one graph while sched's split is live (after ggml_backend_sched_reserve_size, before the next
 // reserve) and merges its figures into the pending plans as a maximum; commit makes backend's
-// pending plan its committed one, which re-sizes the slots and the pools of its device. The
-// SYCL side keeps neither sched nor graph past the call. Look each up by name through the
-// registry's proc address.
+// pending plan its committed one, which re-sizes the slots and the pools of its device. It also
+// marks backend's SCRATCH demand: the next notify through backend carries the allocated size,
+// and its demand line prints the measured and allocated figures. The SYCL side keeps neither
+// sched nor graph past the call. Look each up by name through the registry's proc address.
 // Proc name: "ggml_backend_sycl_begin_host_holders".
 GGML_BACKEND_API void ggml_backend_sycl_begin_host_holders(ggml_backend_sched_t sched);
 // Proc name: "ggml_backend_sycl_plan_host_holders".

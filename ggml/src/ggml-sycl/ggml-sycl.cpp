@@ -96264,6 +96264,14 @@ bool ggml_backend_sycl_commit_host_holders(ggml_backend_t backend) {
         GGML_LOG_WARN("[ATTN-HOST] host holder commit refused: not a SYCL backend\n");
         return false;
     }
+    // The commit marks this context's SCRATCH demand on the ledger the notify records it on, so llama_context's
+    // re-notify with the allocated size prints both figures (§4.4 "The same fact for the notify's measure").
+    ggml_sycl::host_scratch_notify_env env;
+    env.is_sycl          = ggml_backend_is_sycl;
+    env.host_buft_device = ggml_sycl_notify_host_buft_device;
+    env.context_of       = ggml_sycl_notify_context_of;
+    env.ledger_of        = ggml_sycl_notify_ledger_of;
+    (void) ggml_sycl::host_scratch_mark_committed(env, backend);
     int device   = -1;
     int previous = -1;
     if (!g_host_holder_plans->commit(ggml_sycl_host_holder_backend_key(backend), &device, &previous)) {
