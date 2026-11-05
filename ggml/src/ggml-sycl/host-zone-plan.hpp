@@ -123,11 +123,11 @@ struct host_scratch_ensure_result {
     // also gives its reservation back, so the next notify, or the miss path, grows the deficit. Waiting for the other
     // grow's outcome instead would be a host wait.
     bool   ok              = true;
-    size_t total           = 0;     // the sum of the live demands
-    size_t target          = 0;     // plan_scratch_bytes + total
+    size_t total           = 0;  // the sum of the live demands
+    size_t target          = 0;  // plan_scratch_bytes + total
     size_t capacity_before = 0;
-    size_t request         = 0;     // the grow request made (0 when nothing grew)
-    size_t grown           = 0;     // capacity after - capacity before
+    size_t request         = 0;  // the grow request made (0 when nothing grew)
+    size_t grown           = 0;  // capacity after - capacity before
 };
 
 // The number of buffers `bytes` splits into at `chunk_cap`.

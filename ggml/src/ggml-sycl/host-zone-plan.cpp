@@ -226,7 +226,7 @@ host_scratch_ensure_result host_scratch_ledger::ensure_locked_then_grow(std::uni
 #    endif
         // One grow_zone call for the deficit plus one alignment of slack per buffer the demands split into, the same
         // slack rule as the miss path. The pool commits one chunk of max(2048 MB, align_up(request)).
-        r.request          = reserved_increment + n_buffers * ops.alignment;
+        r.request = reserved_increment + n_buffers * ops.alignment;
     }
 #endif
     // The grow runs with the ledger's mutex released: it takes the pool's own locks and may commit a chunk, and no
@@ -1057,7 +1057,7 @@ host_pool_init_decision host_pools_init_from_plan(int                           
     s.device                         = device;
     const host_pool_dims graph_needs = host_pool_scan(graph, scan_host_placed, &s);
 #        endif
-    const bool           exceeds =
+    const bool exceeds =
         graph_needs.D > state.pools.D || graph_needs.K > state.pools.K || graph_needs.N > state.pools.N;
     if (exceeds && !warnings.over_plan.exchange(true)) {
         GGML_LOG_WARN(

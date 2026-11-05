@@ -174,9 +174,9 @@ void test_request_alignment_and_holder() {
 // A zone whose grow lets one more notify in before its chunk commits: the notify a second thread makes while the first
 // notify's grow runs. The ledger holds no lock across the grow, so this nested call is that interleaving.
 struct interleaved_zone {
-    fake_zone             zone;
-    host_scratch_ledger * ledger = nullptr;
-    host_scratch_zone_ops ops;
+    fake_zone                  zone;
+    host_scratch_ledger *      ledger = nullptr;
+    host_scratch_zone_ops      ops;
     bool                       pending        = false;  // a notify waits to arrive during the next grow
     uint64_t                   pending_key    = 0;
     size_t                     pending_demand = 0;
