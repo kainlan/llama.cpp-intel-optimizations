@@ -1661,19 +1661,25 @@ def _sched_path(texts: dict):
     return {"key": key, "measure": me, "reserve": im, "reserve_lo": im_lo}
 
 
-def _trial_flags(s):
-    """The auto-n_ubatch trial's function, the one enclosing try_candidate, and the identifiers it assigns."""
+def _trial_flags(s, sr):
+    """The auto-n_ubatch trial's function, the one enclosing try_candidate, and its flags: the identifiers it sets
+    true, its own or this->'s, minus every identifier sched_reserve (`sr`) assigns. A flag sched_reserve sets
+    itself, as it resets sched_need_reserve at its top, holds the same value under every caller, so it cannot tell
+    the trial apart."""
     cand = _lambda_span(s.bare, "try_candidate")
     fn = s.enclosing(cand[0]) if cand else None
     body = s.bare[fn["open"]:fn["close"]] if fn else ""
-    flags = {m.group(1) for m in re.finditer(r"([A-Za-z_]\w*)\s*(?:=(?!=)|\+=|\+\+)", body)}
-    flags |= {m.group(1) for m in re.finditer(r"\+\+\s*([A-Za-z_]\w*)", body)}
+    flags = {m.group(1) for m in re.finditer(r"(?<![\w.>])(?:this\s*->\s*)?([A-Za-z_]\w*)\s*=\s*true\b", body)}
+    own = s.bare[sr["open"]:sr["close"]] if sr else ""
+    flags -= {m.group(1) for m in re.finditer(r"([A-Za-z_]\w*)\s*(?:=(?!=)|\+=|-=|\+\+|--)", own)}
+    flags -= {m.group(1) for m in re.finditer(r"(?:\+\+|--)\s*([A-Za-z_]\w*)", own)}
     return fn, flags
 
 
 def _trial_excepted(s, fn: dict, flags: set, p: int) -> bool:
     """Whether `p` sits in a block of `fn` guarded by an if whose condition reads, negated, one of the trial's
-    `flags`: the step it guards is skipped while the auto-n_ubatch trial runs."""
+    `flags`, as a plain identifier or this->'s member, with no ||: the step it guards is then skipped whenever the
+    auto-n_ubatch trial runs, which a disjunct could override."""
     for m in re.finditer(r"\bif\s*\(", s.bare[fn["open"]:p]):
         lp = fn["open"] + m.end() - 1
         rp = match_close(s.bare, lp)
@@ -1683,8 +1689,10 @@ def _trial_excepted(s, fn: dict, flags: set, p: int) -> bool:
         if s.bare[k] != "{" or not k < p < match_close(s.bare, k):
             continue
         cond = s.bare[lp + 1:rp]
-        negated = set(re.findall(r"!\s*(?:this\s*->\s*)?([A-Za-z_]\w*)\b(?!\s*\()", cond))
-        negated |= set(re.findall(r"\b([A-Za-z_]\w*)\s*==\s*(?:0|false)\b", cond))
+        if "||" in cond:
+            continue
+        negated = set(re.findall(r"!\s*(?:this\s*->\s*)?([A-Za-z_]\w*)\b(?!\s*(?:\(|\.|->|\[))", cond))
+        negated |= set(re.findall(r"(?<![\w.>])(?:this\s*->\s*)?([A-Za-z_]\w*)\s*==\s*(?:0|false)\b", cond))
         if negated & flags:
             return True
     return False
@@ -1694,8 +1702,9 @@ def clause_context_wiring(texts: dict) -> list:
     """r6 I-1, r7 I-1, r7 m-1: llama_context resolves the notify, begin, plan and commit entries; each begin follows
     a scheduler creation before any graph_reserve, and each plan call follows a split_only graph_reserve. The commit
     calls run at the end of sched_reserve on its success for every caller except the auto-n_ubatch trial, so that
-    commit sits under an if whose condition reads, negated, a flag the trial sets; the trial's try_candidate commits
-    instead, after its host-fallback check (design :4571-4574, :1932-1943)."""
+    commit sits under an if whose condition, with no ||, reads negated a flag the trial sets true and sched_reserve
+    never assigns; the trial's try_candidate commits instead, after its host-fallback check (design :4571-4574,
+    :1932-1943)."""
     lc = texts.get(LC, "")
     if not lc:
         return ["context wiring: src/llama-context.cpp is missing"]
@@ -1725,15 +1734,16 @@ def clause_context_wiring(texts: dict) -> list:
     cand = _lambda_span(s.bare, "try_candidate")
     fallback = re.search(r"\breturn\s+\"compute buffer fell back to host\"\s*;", s.code[cand[0]:cand[1]]) \
         if cand else None
-    trial_fn, trial_flags = _trial_flags(s)
+    trial_fn, trial_flags = _trial_flags(s, sr)
     at_end = at_trial = 0
     for p in _pointer_calls(s, ptr["commit_host_holders"]):
         if sr and sr["open"] < p < sr["close"] and all(t < p for t in throws):
             at_end += 1
             if not _trial_excepted(s, sr, trial_flags, p):
                 fails.append(f"context wiring: sched_reserve's end commit at line {s.line(p)} is not under an if "
-                             f"that excepts the auto-n_ubatch trial (a negated read of a flag "
-                             f"{trial_fn['name'] if trial_fn else 'the trial'} sets)")
+                             f"that excepts the auto-n_ubatch trial (a negated read, with no ||, of a flag "
+                             f"{trial_fn['name'] if trial_fn else 'the trial'} sets true and sched_reserve never "
+                             f"assigns)")
         elif cand and fallback and cand[0] + fallback.end() < p < cand[1]:
             at_trial += 1
         else:
@@ -1752,8 +1762,9 @@ def clause_trial_ops(texts: dict) -> list:
     """§M75, r9 n-6, r10 m-5: try_candidate OPENs before its reserve, KEEPs beside the commit and RETURNs on both loss
     paths; sched_reserve RETURNs on its transaction's throw path, MARKs before the measure, RETURN_TO_MARKs before
     the pipeline-parallel retry, and KEEPs on its success path except under the auto-n_ubatch trial: like the end
-    commit, that KEEP sits under an if whose condition reads, negated, a flag the trial sets, because inside
-    try_candidate it would run before the host-fallback check and keep a losing candidate's growth."""
+    commit, that KEEP sits under an if whose condition, with no ||, reads negated a flag the trial sets true and
+    sched_reserve never assigns, because inside try_candidate it would run before the host-fallback check and keep
+    a losing candidate's growth."""
     lc = texts.get(LC, "")
     if not lc:
         return ["trial ops: src/llama-context.cpp is missing"]
@@ -1824,13 +1835,14 @@ def clause_trial_ops(texts: dict) -> list:
         success_keeps = ops("KEEP", throws[-1], sr["close"]) if throws else []
         if not success_keeps:
             fails.append("trial ops: sched_reserve does not KEEP on its success path, after its throws (r10 m-5)")
-        trial_fn, trial_flags = _trial_flags(s)
+        trial_fn, trial_flags = _trial_flags(s, sr)
         for k in success_keeps:
             if not _trial_excepted(s, sr, trial_flags, k):
                 fails.append(f"trial ops: sched_reserve's success KEEP at line {s.line(k)} is not under an if that "
-                             f"excepts the auto-n_ubatch trial (a negated read of a flag "
-                             f"{trial_fn['name'] if trial_fn else 'the trial'} sets): inside try_candidate it would "
-                             f"keep a losing candidate's growth before the host-fallback check (r10 m-5, §M75)")
+                             f"excepts the auto-n_ubatch trial (a negated read, with no ||, of a flag "
+                             f"{trial_fn['name'] if trial_fn else 'the trial'} sets true and sched_reserve never "
+                             f"assigns): inside try_candidate it would keep a losing candidate's growth before the "
+                             f"host-fallback check (r10 m-5, §M75)")
     path = _sched_path(texts)
     im = path["reserve"] if path else None
     lo2 = path["reserve_lo"] if path else 0
@@ -2144,6 +2156,11 @@ _SPILL_OK = "        hold_spill_validated_ub = hold_spill_fn ? c : 0;\n"
 _CANDIDATE = "    auto try_candidate = [&](uint32_t c) -> const char * {\n"
 _TRIAL_FLAG = "    sycl_ubatch_trial_active = true;\n"
 _SR_KEEP = "    if (!sycl_ubatch_trial_active) {\n        " + _TRIAL + "KEEP);\n    }\n"
+# Guards that do not except the trial: a flag sched_reserve resets itself, a disjunction, another object's member.
+_GUARD = "if (!sycl_ubatch_trial_active) {"
+_GUARD_RESET = "if (!sched_need_reserve) {"
+_GUARD_OR = "if (true || !sycl_ubatch_trial_active) {"
+_GUARD_MEMBER = "if (cparams.pipeline_parallel == false) {"
 _TRIAL_COMMIT = ("        for (auto & sb : sycl_backends) {\n"
                  "            hooks.commit_host_holders(sb.backend);\n"
                  "        }\n")
@@ -2467,6 +2484,12 @@ MUTANTS = [
      "is not under an if that excepts the auto-n_ubatch trial"),
     ("wiring-end-commit-flag-unset", "context-wiring", [(LC, _TRIAL_FLAG + _CANDIDATE, _CANDIDATE)],
      "is not under an if that excepts the auto-n_ubatch trial"),
+    ("wiring-end-commit-reset-flag", "context-wiring", [(LC, _SR_COMMIT, _SR_COMMIT.replace(_GUARD, _GUARD_RESET))],
+     "is not under an if that excepts the auto-n_ubatch trial"),
+    ("wiring-end-commit-disjunction", "context-wiring", [(LC, _SR_COMMIT, _SR_COMMIT.replace(_GUARD, _GUARD_OR))],
+     "is not under an if that excepts the auto-n_ubatch trial"),
+    ("wiring-end-commit-member", "context-wiring", [(LC, _SR_COMMIT, _SR_COMMIT.replace(_GUARD, _GUARD_MEMBER))],
+     "is not under an if that excepts the auto-n_ubatch trial"),
     ("wiring-trial-commit-before-fallback", "context-wiring",
      [(LC, _SPILL_OK + _TRIAL_COMMIT, _SPILL_OK),
       (LC, _RESERVED_OK, _RESERVED_OK + _TRIAL_COMMIT)],
@@ -2500,6 +2523,12 @@ MUTANTS = [
     ("trial-sched-keep-unguarded", "trial-ops", [(LC, _SR_KEEP, "    " + _TRIAL + "KEEP);\n")],
      "is not under an if that excepts the auto-n_ubatch trial"),
     ("trial-sched-keep-flag-unset", "trial-ops", [(LC, _TRIAL_FLAG + _CANDIDATE, _CANDIDATE)],
+     "is not under an if that excepts the auto-n_ubatch trial"),
+    ("trial-sched-keep-reset-flag", "trial-ops", [(LC, _SR_KEEP, _SR_KEEP.replace(_GUARD, _GUARD_RESET))],
+     "is not under an if that excepts the auto-n_ubatch trial"),
+    ("trial-sched-keep-disjunction", "trial-ops", [(LC, _SR_KEEP, _SR_KEEP.replace(_GUARD, _GUARD_OR))],
+     "is not under an if that excepts the auto-n_ubatch trial"),
+    ("trial-sched-keep-member", "trial-ops", [(LC, _SR_KEEP, _SR_KEEP.replace(_GUARD, _GUARD_MEMBER))],
      "is not under an if that excepts the auto-n_ubatch trial"),
     ("trial-mark-after-measure", "trial-ops",
      [(LC, "        " + _TRIAL + "MARK);\n", ""), (LC, _PP_SPLITS, _PP_SPLITS + "        " + _TRIAL + "MARK);\n")],
