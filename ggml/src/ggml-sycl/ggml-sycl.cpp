@@ -35263,6 +35263,11 @@ static bool ggml_sycl_is_device_vram_buffer(const ggml_tensor * t) {
     if (!t || !t->buffer || !t->buffer->context) {
         return false;
     }
+    // A lazy table's descriptor holds a table reference, not a SYCL buffer context, and has no bytes on any tier, so
+    // it answers false before the cast. Every other buffer type keeps today's read (th32 §3.2).
+    if (ggml_backend_sycl_buffer_is_lazy(t->buffer)) {
+        return false;
+    }
     return ggml_sycl_buffer_context_tier_is_vram(t->buffer);
 }
 
