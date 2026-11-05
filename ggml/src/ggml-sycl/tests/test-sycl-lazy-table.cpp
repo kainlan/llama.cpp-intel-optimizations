@@ -972,9 +972,10 @@ const char * k_eager_arm_name = "(2) a HOST table reads its rows eagerly into on
 // floor's are yieldable, and its yielder is registered. A charge of another load that does not fit, asked on this
 // thread, frees the last chunk with no wait and then fits: the chunk leaves the live HOST_CPU rows, the ledger is
 // credited its charge, the yield logs its chunk count and the asking load, and the cache counts it. A charge of the
-// table's own load that does not fit frees nothing. The last reference releases every allocation and takes the
-// yieldable bytes back. Engagement: the cache holds three chunks, one the floor's, and the budget is stored at the
-// committed figure before each charge, so neither fits without a yield.
+// table's own load that does not fit frees nothing. The last reference releases every allocation, takes the
+// yieldable bytes back and unregisters the yielder: the claimed slots are one more while the table lives and back to
+// their count before it after. Engagement: the cache holds three chunks, one the floor's, and the budget is stored at
+// the committed figure before each charge, so neither fits without a yield.
 // The role reading needs device 0's cache: the reader is VOID in a process that has none (§3.1), and the HOST_CPU owner
 // path builds none, so the arm creates it before any baseline and scores an unreadable reading VOID, never as a figure.
 arm_result arm_storage_cache_owner_path() {
@@ -986,6 +987,7 @@ arm_result arm_storage_cache_owner_path() {
     const uint64_t live0      = host_cpu_live();
     const uint64_t committed0 = ggml_sycl::host_ledger_committed();
     const uint64_t yieldable0 = ggml_sycl::host_ledger_yieldable_bytes();
+    const int      slots0     = ggml_sycl::host_ledger_yielder_slots_claimed_for_testing();
     uint64_t       role0      = 0;
     const bool     role_read0 =
         ggml_sycl::unified_cache_role_bytes_for_testing(0, ggml_sycl::alloc_role::LAZY_ROW_CACHE, &role0);
@@ -1017,6 +1019,10 @@ arm_result arm_storage_cache_owner_path() {
         expect(r, ggml_sycl::host_ledger_yieldable_bytes() - yieldable0 == k_cache_yieldable_bytes,
                "the ledger's yieldable bytes grew by " + num(ggml_sycl::host_ledger_yieldable_bytes() - yieldable0) +
                    " B, want the two chunks above the floor's, " + num(k_cache_yieldable_bytes));
+        const int slots1 = ggml_sycl::host_ledger_yielder_slots_claimed_for_testing();
+        expect(r, slots1 == slots0 + 1,
+               "the live table holds " + num(slots1) + " yielder slots, want one more than the " + num(slots0) +
+                   " before it: its cache is not registered");
         uint64_t   role1 = 0;
         const bool role_read1 =
             ggml_sycl::unified_cache_role_bytes_for_testing(0, ggml_sycl::alloc_role::LAZY_ROW_CACHE, &role1);
@@ -1083,6 +1089,10 @@ arm_result arm_storage_cache_owner_path() {
            "the last reference left " + num(ggml_sycl::host_ledger_yieldable_bytes() - yieldable0) +
                " yieldable bytes behind");
     expect(r, role_read2 && role2 == role0, "the last reference left LAZY_ROW_CACHE bytes live");
+    const int slots2 = ggml_sycl::host_ledger_yielder_slots_claimed_for_testing();
+    expect(r, slots2 == slots0,
+           "the last reference left " + num(slots2) + " yielder slots claimed, want the " + num(slots0) +
+               " before the table: its cache was not unregistered");
     return r;
 }
 

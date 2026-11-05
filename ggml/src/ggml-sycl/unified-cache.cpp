@@ -1361,6 +1361,16 @@ void host_ledger_unregister_yielder(int slot_index) {
     slot.claimed.store(false, std::memory_order_release);
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+int host_ledger_yielder_slots_claimed_for_testing() {
+    int claimed = 0;
+    for (int i = 0; i < 2 * GGML_SYCL_MAX_DEVICES; ++i) {
+        claimed += g_host_ledger_yielders[i].claimed.load(std::memory_order_acquire) ? 1 : 0;
+    }
+    return claimed;
+}
+#endif
+
 // The charge the owner entry holds for one HOST_CPU request (th32 §4.2): the owner entry charges the ledger before any
 // allocation, the registry row takes the charge when unified_alloc records the mapping, and the row's one free credits
 // it. Until the row takes it, every exit of the owner entry credits it once.
