@@ -353,24 +353,32 @@ SIZE_PINS = (
 )
 FILL_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
             "const ggml_sycl_tensor_inventory * inventory)")
-COPY_CTX = "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;"
-COPY_DEFAULT = "g_placement_kv_info.n_ctx_context_is_default = inventory->n_ctx_context_is_default;"
+# The stage fills g_placement_kv_info through the one KV intake the plan dry run also uses (llama.cpp-4zup), so the copy
+# is written once, in the intake, over the KV inputs it is handed.
+INTAKE_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info & kv, "
+              "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
+COPY_CTX = "kv.n_ctx_context = inventory->n_ctx_context;"
+COPY_DEFAULT = "kv.n_ctx_context_is_default = inventory->n_ctx_context_is_default;"
 KV_FIELD = "bool n_ctx_context_is_default = false;"
 
 
 def claim_backend_carries_the_source(sycl_h: str, sycl: str, cache_hpp: str) -> bool:
     """The inventory ends with the provenance, appended after the indexer widths with the size pins moved to match;
-    the backend copies it once, next to the context, into a KV input that defaults to a named context."""
+    the backend copies it once, next to the context, into a KV input that defaults to a named context: the copy is in
+    the KV intake, and the stage hands the intake g_placement_kv_info."""
     h = norm(sycl_h)
     at = h.find(INVENTORY_STRUCT)
     inv = body(h[at:], "struct ggml_sycl_tensor_inventory") if at >= 0 else ""
     s = norm(sycl)
     fill = body(s, FILL_SIG)
+    intake = body(s, INTAKE_SIG)
     hpp = norm(cache_hpp)
     kv_at = hpp.find("struct placement_kv_info {")
     kv = body(hpp[kv_at:], "struct placement_kv_info") if kv_at >= 0 else ""
-    return (inv.endswith(INV_TAIL) and all(p in s for p in SIZE_PINS) and bool(fill)
-            and ordered(fill, COPY_CTX, COPY_DEFAULT) and s.count(COPY_DEFAULT) == 1 and KV_FIELD in kv)
+    return (inv.endswith(INV_TAIL) and all(p in s for p in SIZE_PINS) and bool(fill) and INTAKE_CALL in fill
+            and bool(intake) and ordered(intake, COPY_CTX, COPY_DEFAULT) and s.count(COPY_DEFAULT) == 1
+            and KV_FIELD in kv)
 
 
 ROOM_LOG_SIG = "static void log_kv_context_room(const kv_context_room & room,"
@@ -706,6 +714,11 @@ def test_mutant_backend_names_the_value_fails():
 
 def test_mutant_backend_drops_the_provenance_fails():
     assert not claim_backend_carries_the_source(SYCL_H, _once(SYCL, COPY_DEFAULT, ""), CACHE_HPP)
+
+
+def test_mutant_stage_skips_the_intake_fails():
+    """The stage stops handing g_placement_kv_info to the intake: the copy still exists, and reaches no KV input."""
+    assert not claim_backend_carries_the_source(SYCL_H, _once(SYCL, INTAKE_CALL, ""), CACHE_HPP)
 
 
 def test_mutant_inventory_without_the_field_fails():
