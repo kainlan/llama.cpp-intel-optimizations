@@ -257,13 +257,17 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc & desc,
         table->records_.push_back(mem_handle::from_owned_alloc(std::move(body_alloc.owner), GGML_LAYOUT_AOS));
         table->body_offset_ = head;
 
-        // The body's bytes are a transient CPU view, resolved for this read alone (P2). The read writes the whole
-        // window, so the view must authorize it: an extent of 0 is unknown, never unbounded.
-        const resolved_ptr view = table->records_.front().resolve(record_device(desc));
-        if (!view || view.extent < request) {
-            return refuse(desc, lazy_table_status::BODY_REFUSED,
-                          "the body did not resolve to " + std::to_string(request) + " CPU bytes (extent " +
-                              std::to_string(view.extent) + ")");
+        // The body's bytes are a transient CPU view, resolved for this read alone (P2). A HOST_CPU record is the
+        // CPU's: resolve() gives its bytes, and resolve(device) is empty, since no device may be handed it. The read
+        // writes the whole window, so the view must authorize it: an extent of 0 is unknown, never unbounded.
+        const resolved_ptr view = table->records_.front().resolve();
+        if (!view) {
+            return refuse(desc, lazy_table_status::BODY_REFUSED, "the body did not resolve for the CPU");
+        }
+        if (view.extent < request) {
+            return refuse(
+                desc, lazy_table_status::BODY_REFUSED,
+                "the body resolved to " + std::to_string(view.extent) + " CPU bytes, want " + std::to_string(request));
         }
         // The read ends once it holds the table's last byte: a table that ends its file has a window past the end
         // (Qwen's PLE table by 832 B), and the short read there is the end of the file, not a failure.

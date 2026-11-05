@@ -356,7 +356,7 @@ void expect_eof_table_reads(arm_result & r) {
         fail(r, geometry + " refused: " + ggml_sycl::lazy_table_status_name(t.status) + ": " + t.reason);
         return;
     }
-    const ggml_sycl::resolved_ptr view = t.table->rows().resolve(0);
+    const ggml_sycl::resolved_ptr view = t.table->rows().resolve();
     if (!view) {
         fail(r, geometry + ": the rows view does not resolve");
         return;
@@ -366,8 +366,9 @@ void expect_eof_table_reads(arm_result & r) {
 }
 
 // (2) A HOST table reads its rows eagerly with O_DIRECT into one locked HOST_CPU record, owned by its model, and keeps
-// no descriptor; a table that ends its file reads whole too (the sub-check above). Engagement: the environment takes
-// O_DIRECT and locks the body; a refusal it caused is VOID, any other refusal FAILs.
+// no descriptor; its rows are the CPU's, never a device's; a table that ends its file reads whole too (the sub-check
+// above). Engagement: the environment takes O_DIRECT and locks the body; a refusal it caused is VOID, any other
+// refusal FAILs.
 arm_result arm_host_eager_read() {
     arm_result      r;
     const uint64_t  live_before = host_cpu_live();
@@ -393,7 +394,7 @@ arm_result arm_host_eager_read() {
 
     ggml_sycl::mem_handle         rows = t.table->rows();
     ggml_sycl::alloc_metadata     meta{};
-    const ggml_sycl::resolved_ptr view = rows.resolve(0);
+    const ggml_sycl::resolved_ptr view = rows.resolve();
     expect(r, rows.owner_metadata(&meta), "the rows view retains no owner");
     expect(r, meta.tier == ggml_sycl::alloc_tier::HOST_CPU, "the body is not HOST_CPU");
     expect(r, meta.role == ggml_sycl::alloc_role::WEIGHT, "the body's role is not WEIGHT");
@@ -404,9 +405,10 @@ arm_result arm_host_eager_read() {
     expect(r, meta.size == k_window_a_bytes,
            "the body requested " + num(meta.size) + " B, want the window " + num(k_window_a_bytes));
     if (!view) {
-        fail(r, "the rows view does not resolve");
+        fail(r, "the rows view does not resolve for the CPU");
         return r;
     }
+    expect(r, !rows.resolve(0), "a device was handed the HOST_CPU rows: resolve(0) is not empty");
     expect(r, reinterpret_cast<uintptr_t>(view.ptr) % ggml_sycl::LAZY_IO_BLOCK_BYTES == k_table_offset % 4096,
            "the rows do not sit at the window's head inside the body");
     const size_t bad = first_mismatch(static_cast<const uint8_t *>(view.ptr), k_table_offset, k_table_a_bytes);
@@ -438,7 +440,7 @@ arm_result arm_host_window_crosses_huge_page() {
     }
     expect(r, t.table->charged_bytes() == k_mapped_b_bytes,
            "the records charge " + num(t.table->charged_bytes()) + " B, want " + num(k_mapped_b_bytes));
-    const ggml_sycl::resolved_ptr view = t.table->rows().resolve(0);
+    const ggml_sycl::resolved_ptr view = t.table->rows().resolve();
     if (!view) {
         fail(r, "the rows view does not resolve");
         return r;

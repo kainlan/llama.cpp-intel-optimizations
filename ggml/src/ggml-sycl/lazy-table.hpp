@@ -118,8 +118,9 @@ class lazy_table {
     // The references held: the descriptor buffer's and every ticket's. A reading, never a release decision.
     uint32_t ref_count() const { return refs_.load(std::memory_order_acquire); }
 
-    // HOST: the table's bytes, a retained view of the body at file_offset % LAZY_IO_BLOCK_BYTES. STORAGE: an empty
-    // handle, since a STORAGE table holds no rows.
+    // HOST: the table's bytes, a retained view of the body at file_offset % LAZY_IO_BLOCK_BYTES. The body is HOST_CPU,
+    // so the view is the CPU's: resolve() gives the bytes and resolve(device) is empty. STORAGE: an empty handle, since
+    // a STORAGE table holds no rows.
     mem_handle rows() const;
 
     // STORAGE: the owned O_DIRECT descriptor the row cache reads through. HOST: -1, since the eager read closed it.
