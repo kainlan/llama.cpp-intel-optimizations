@@ -352,7 +352,7 @@ def call_args(bare: str, name_end: int):
     depth = 0
     cur = ""
     for c in inner:
-        if c in "([{<" and c != "<":
+        if c in "([{":
             depth += 1
         elif c in ")]}":
             depth -= 1

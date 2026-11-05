@@ -148,7 +148,7 @@ pinned_chunk_pool::~pinned_chunk_pool() {
     GGML_ASSERT(owning_carriers_.load(std::memory_order_acquire) == 0 &&
                 "released_chunk outstanding at pool destruction");
     std::lock_guard<std::mutex> lock(mutex_);
-    size_t                      chunk_count = chunks_.size() + runtime_chunks_.size();
+    size_t                      chunk_count = 0;
 
     // llama.cpp-dyhdl: wait for all chunk leases to drain before sycl::free.
     // If a lease is still held at destruction, a downstream caller holds a
@@ -158,12 +158,14 @@ pinned_chunk_pool::~pinned_chunk_pool() {
         if (c.base) {
             wait_for_chunk_drain_or_assert(c, "pinned-base");
             free_chunk_owner(c, "pinned-base");
+            ++chunk_count;
         }
     }
     for (auto & c : runtime_chunks_) {
         if (c.base) {
             wait_for_chunk_drain_or_assert(c, "pinned-runtime");
             free_chunk_owner(c, "pinned-runtime");
+            ++chunk_count;
         }
     }
     // A released backing the registry still holds now (a control the registry abandoned at shutdown, or a retry not

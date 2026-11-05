@@ -2189,9 +2189,10 @@ _OPEN_TRIAL = (UC, None, "\nsize_t unified_cache::host_scratch_trial(host_scratc
                          "    }\n"
                          "}\n")
 _WITHDRAW_CHECKED = ("            if (!host_arena_->withdraw_zone_chunk(host_zone_id::SCRATCH, chunk_idx)) {\n"
-                     "                GGML_LOG_WARN(\"[HOST-ARENA] SCRATCH return skipped chunk %zu: not a chunk "
-                     "of the SCRATCH zone alone\\n\",\n"
-                     "                              chunk_idx);\n"
+                     "                GGML_LOG_WARN(\n"
+                     "                    \"[HOST-ARENA] SCRATCH return skipped dev=%d chunk=%zu: not a chunk of the "
+                     "SCRATCH zone alone\\n\",\n"
+                     "                    dev, chunk_idx);\n"
                      "                continue;\n"
                      "            }\n")
 _FILED = "            marked_set_.push_back({ chunk_idx, owner });\n"

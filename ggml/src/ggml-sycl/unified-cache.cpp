@@ -26122,6 +26122,9 @@ size_t unified_cache::host_scratch_return_chunks(const std::vector<size_t> & chu
     if (!host_arena_ || chunk_idxs.empty()) {
         return 0;
     }
+    // The device the WARNs below name, read before the lock: the lookup can take the device manager's mutex.
+    const int dev = ggml_sycl_get_device_id_from_queue(queue_);
+
     // Declared before the lock: an unwinding scope destroys them after the unlock, so no backing is released under
     // marked_set_mutex_ (canon §12.5).
     std::vector<pinned_chunk_pool::released_chunk> released;
@@ -26134,17 +26137,18 @@ size_t unified_cache::host_scratch_return_chunks(const std::vector<size_t> & chu
             refusals.reserve(chunk_idxs.size());
         } catch (const std::bad_alloc &) {
             GGML_LOG_WARN(
-                "[HOST-ARENA] SCRATCH return of %zu chunk(s) not filed: no room in the marked set; they stay "
+                "[HOST-ARENA] SCRATCH return not filed dev=%d chunks=%zu: no room in the marked set; they stay "
                 "ordinary capacity\n",
-                chunk_idxs.size());
+                dev, chunk_idxs.size());
             return 0;
         }
         // Withdrawal, filing and the release of an already-empty chunk share this one scope, so an empty chunk is
         // never visible in the set between its filing and its release (§4.4).
         for (const size_t chunk_idx : chunk_idxs) {
             if (!host_arena_->withdraw_zone_chunk(host_zone_id::SCRATCH, chunk_idx)) {
-                GGML_LOG_WARN("[HOST-ARENA] SCRATCH return skipped chunk %zu: not a chunk of the SCRATCH zone alone\n",
-                              chunk_idx);
+                GGML_LOG_WARN(
+                    "[HOST-ARENA] SCRATCH return skipped dev=%d chunk=%zu: not a chunk of the SCRATCH zone alone\n",
+                    dev, chunk_idx);
                 continue;
             }
             marked_set_.push_back({ chunk_idx, owner });
@@ -26172,6 +26176,9 @@ size_t unified_cache::host_scratch_begin_release(uint64_t owner) {
     if (!host_arena_) {
         return 0;
     }
+    // The device the WARNs below name, read before the lock: the lookup can take the device manager's mutex.
+    const int dev = ggml_sycl_get_device_id_from_queue(queue_);
+
     // Declared before the lock, for the reason host_scratch_return_chunks gives.
     std::vector<pinned_chunk_pool::released_chunk> released;
     std::vector<marked_chunk_entry>                candidates;
@@ -26187,9 +26194,9 @@ size_t unified_cache::host_scratch_begin_release(uint64_t owner) {
             refusals.reserve(marked_set_.size());
         } catch (const std::bad_alloc &) {
             GGML_LOG_WARN(
-                "[HOST-ARENA] SCRATCH begin release skipped: no room to walk %zu marked entries; the next "
+                "[HOST-ARENA] SCRATCH begin release skipped dev=%d: no room to walk %zu marked entries; the next "
                 "begin retries\n",
-                marked_set_.size());
+                dev, marked_set_.size());
             return 0;
         }
         for (const marked_chunk_entry & entry : marked_set_) {
@@ -26219,6 +26226,9 @@ size_t unified_cache::host_scratch_owner_end(uint64_t owner) {
     if (!host_arena_) {
         return 0;
     }
+    // The device the WARNs below name, read before the lock: the lookup can take the device manager's mutex.
+    const int dev = ggml_sycl_get_device_id_from_queue(queue_);
+
     // Declared before the lock, for the reason host_scratch_return_chunks gives.
     std::vector<pinned_chunk_pool::released_chunk> released;
     std::vector<marked_chunk_entry>                candidates;
@@ -26232,9 +26242,9 @@ size_t unified_cache::host_scratch_owner_end(uint64_t owner) {
             candidates.reserve(marked_set_.size());
         } catch (const std::bad_alloc &) {
             GGML_LOG_WARN(
-                "[HOST-ARENA] SCRATCH owner end skipped: no room to walk %zu marked entries; the owner's chunks "
-                "stay marked\n",
-                marked_set_.size());
+                "[HOST-ARENA] SCRATCH owner end skipped dev=%d: no room to walk %zu marked entries; the owner's "
+                "chunks stay marked\n",
+                dev, marked_set_.size());
             return 0;
         }
         for (const marked_chunk_entry & entry : marked_set_) {
