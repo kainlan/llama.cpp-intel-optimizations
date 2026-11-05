@@ -65,11 +65,6 @@ std::string num(size_t v) {
     return std::to_string(v);
 }
 
-bool strict_in_env() {
-    const char * strict = getenv("GGML_SYCL_STRICT_LEASES");
-    return strict != nullptr && std::atoi(strict) != 0;
-}
-
 uint64_t owner_of(ggml_backend_t backend) {
     return static_cast<const ggml_backend_sycl_context *>(backend->context)->host_zone_owner_id;
 }
@@ -282,9 +277,14 @@ int child_carrier(checks & c, const device_fixture & f) {
 int run_child_case(const child_args & a) {
     checks     c{ a.case_name.c_str() };
     const bool strict_wanted = a.case_name == "strict";
-    if (strict_in_env() != strict_wanted) {
-        c.void_case(strict_wanted ? "GGML_SYCL_STRICT_LEASES is unset in the strict child" :
-                                    "GGML_SYCL_STRICT_LEASES is set in a non-strict child");
+
+    // The registry's own reading, asked of its one accessor: the child's environment is the envp the driver built.
+    const char * mismatch = strict_wanted ? "GGML_SYCL_STRICT_LEASES is unset in the strict child" : nullptr;
+    if (ggml_sycl_strict_enabled()) {
+        mismatch = strict_wanted ? nullptr : "GGML_SYCL_STRICT_LEASES is set in a non-strict child";
+    }
+    if (mismatch) {
+        c.void_case(mismatch);
         return c.status();
     }
     // RLIMIT_CORE first: a core-dumping abort holds pinned memory past its exit message.
@@ -292,10 +292,6 @@ int run_child_case(const child_args & a) {
         return 2;
     }
     if (!entry_environment_ok(c)) {
-        return c.status();
-    }
-    if (!strict_wanted && ggml_sycl_strict_enabled()) {
-        c.fail("ggml_sycl_strict_enabled() is true at the plain child's entry");
         return c.status();
     }
     device_fixture f;

@@ -667,9 +667,8 @@ int case_dropped_carrier(checks & c, const rig & r) {
 // --- a registry-refused free (§M88 (1), §M92; r16 M-5, M-6) ---
 
 bool strict_leases_set(checks & c) {
-    // The registry's own reading (ggml_sycl_strict_enabled): a non-zero integer.
-    const char * strict = getenv("GGML_SYCL_STRICT_LEASES");
-    if (strict != nullptr && std::atoi(strict) != 0) {
+    // The registry's own reading, asked of its one accessor.
+    if (ggml_sycl_strict_enabled()) {
         c.void_case("GGML_SYCL_STRICT_LEASES is set: the registry's strict classification could abort the held row");
         return true;
     }
