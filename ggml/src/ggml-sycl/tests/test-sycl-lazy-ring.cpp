@@ -780,9 +780,10 @@ arm_result arm_wider_refused() {
 
 // The wider-model RED, its P3 arm (r37 m-2): the 64 MiB table's HOST fit holds but P3 does not, at a reading of
 // step 2 + its body + 29 GiB - 1 GiB, so after the decline line the plan refuses as lazy-table-ring-too-narrow and
-// plans no HOST. A planner that sizes the term from the table alone, ignoring the live ring, plans it STORAGE.
+// plans no HOST. A planner that ignores the live ring declines nothing and admits the table STORAGE, and with no P3
+// room for its floor and the ring's charge the plan refuses as lazy-table-cache-below-floor instead.
 // Engagement: the pin holds a lease on a live 512 KiB ring.
-// Mutant: none of its own.
+// Mutant: ignore-live-ring-p3, the ignore-live-ring selector run against this arm.
 arm_result arm_wider_p3() {
     arm_result    r;
     wider_fixture f;
@@ -1542,6 +1543,7 @@ struct mutant_entry {
 const mutant_entry k_mutants[] = {
     { "no-span-check",                  lazy_ring_mutant::NO_SPAN_CHECK,                  k_arm_ring_plan     },
     { "ignore-live-ring",               lazy_ring_mutant::IGNORE_LIVE_RING,               k_arm_wider_refused },
+    { "ignore-live-ring-p3",            lazy_ring_mutant::IGNORE_LIVE_RING,               k_arm_wider_p3      },
     { "no-candidate-lease",             lazy_ring_mutant::NO_CANDIDATE_LEASE,             k_arm_lease         },
     { "lease-at-stage",                 lazy_ring_mutant::LEASE_AT_STAGE,                 k_arm_window        },
     { "lease-presence-as-coverage",     lazy_ring_mutant::LEASE_PRESENCE_AS_COVERAGE,     k_arm_staging       },

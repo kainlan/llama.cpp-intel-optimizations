@@ -8324,6 +8324,10 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     string(CONCAT _lr_re_ignore_live_ring
         "FAIL a wider table that fits nowhere refuses as lazy-table-ring-too-narrow: "
         "the wider table planned with refusal 'none', want lazy-table-ring-too-narrow")
+    string(CONCAT _lr_re_ignore_live_ring_p3
+        "FAIL a wider table whose HOST fit holds but P3 does not refuses and plans no HOST: "
+        "the wider table planned with refusal 'lazy-table-cache-below-floor' and 0 table\\(s\\), "
+        "want lazy-table-ring-too-narrow and none")
     string(CONCAT _lr_re_no_candidate_lease
         "FAIL a model planned as covered across an unload finds the ring through a read's lease: "
         "model A's ensure returned lazy-table-ring-unpinned, want ok")
@@ -8363,6 +8367,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     set(_lazy_ring_mutants
         no-span-check                  "${_lr_re_no_span_check}"
         ignore-live-ring               "${_lr_re_ignore_live_ring}"
+        ignore-live-ring-p3            "${_lr_re_ignore_live_ring_p3}"
         no-candidate-lease             "${_lr_re_no_candidate_lease}"
         lease-at-stage                 "${_lr_re_lease_at_stage}"
         lease-presence-as-coverage     "${_lr_re_lease_presence_as_coverage}"
