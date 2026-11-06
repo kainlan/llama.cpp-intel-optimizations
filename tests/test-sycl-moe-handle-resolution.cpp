@@ -6,8 +6,9 @@
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/mem-handle.hpp"
-#include "ggml-sycl/moe-resolved-batch.hpp"
 #include "ggml-sycl/model-lifecycle.hpp"
+#include "ggml-sycl/moe-resolved-batch.hpp"
+#include "ggml-sycl/tests/pinned-host-block-test-common.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "sycl-selector-fallback.hpp"
 
@@ -200,9 +201,9 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
 
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(0);
     TEST_ASSERT(cache != nullptr, "global unified cache unavailable");
-    uint8_t * pinned = static_cast<uint8_t *>(sycl::malloc_host(64, q));
-    TEST_ASSERT(pinned != nullptr, "sycl::malloc_host failed");
-    std::fill(pinned, pinned + 64, 0x53);
+    // Registered memory only: a pointer no registry names is refused (design 5efe §4.8, §7 C6).
+    pinned_host_block_test::block pinned_block(q, 64, 0x53);
+    uint8_t *                     pinned   = pinned_block.data();
     ggml_sycl_cache_id host_key = ggml_sycl::test_make_cache_id(pinned);
     host_key.aux_id             = 0x70005;
 
@@ -235,13 +236,16 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
     TEST_ASSERT(layout_miss.reason == ggml_sycl::expert_resolve_reason::LAYOUT_MISMATCH,
                 "wrong layout should report layout mismatch");
 
-    std::vector<uint8_t> plain_host(64, 0x54);
-    ggml_sycl_cache_id   mmap_key = ggml_sycl::test_make_cache_id(plain_host.data());
-    mmap_key.aux_id               = 0x70007;
+    // A mapped host expert is a slice of a FILE_MAPPED mapping, registered with the mapping's owner.
+    pinned_host_block_test::mapped_block mapped(0, 1);
+    uint8_t *                            plain_host = mapped.data();
+    ggml_sycl_cache_id                   mmap_key   = ggml_sycl::test_make_cache_id(plain_host);
+    mmap_key.aux_id                                 = 0x70007;
     {
         ggml_sycl::scoped_planned_materialization planned_materialization(cache, "test/MoE mmap expert registration");
-        TEST_ASSERT(cache->register_host_expert(mmap_key, plain_host.data(), plain_host.size(), GGML_LAYOUT_AOS),
-                    "register_host_expert should succeed for mmap host expert");
+        TEST_ASSERT(
+            cache->register_host_expert_owned(mmap_key, plain_host, 64, GGML_LAYOUT_AOS, nullptr, mapped.owner()),
+            "register_host_expert should succeed for mmap host expert");
     }
 
     auto mmap_res = cache->resolve_expert(make_request(mmap_key, GGML_LAYOUT_AOS));
@@ -263,7 +267,6 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
     TEST_ASSERT(missing.tier == ggml_sycl::expert_resolve_tier::UNAVAILABLE, "missing expert tier mismatch");
     TEST_ASSERT(missing.ptr == nullptr, "missing expert pointer should be null");
 
-    sycl::free(pinned, q);
     return true;
 }
 
