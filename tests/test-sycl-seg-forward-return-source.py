@@ -434,13 +434,11 @@ def test_the_order_reader_flags_a_cancel_step_after_the_flush_and_a_cleanup_befo
     cancel = CANCEL_CALL.search(body)
     assert flush and cancel, "the control's anchors did not match the fallback catch"
     late = body[: cancel.start()] + body[cancel.end() : flush.end()] + cancel.group(0) + body[flush.end() :]
-    assert any("the CPU-TG flush runs before th32's cancel step" in f or "runs before the CPU-TG flush" in f
-               for f in order_problems(late)), order_problems(late)
+    assert "the CPU-TG flush runs before th32's cancel step" in order_problems(late), order_problems(late)
     clear = CLEAR_CALL.search(body)
     drain = re.search(r"\bggml_sycl_cpu_staging_drain\s*\(", body)
     early = body[: drain.start()] + clear.group(0) + " " + body[drain.start() : clear.start()] + body[clear.end() :]
-    assert any("runs before the staging drain" in f or "the staging drain runs before" in f
-               for f in order_problems(early)), order_problems(early)
+    assert any(f.startswith("the cleanup step runs before") for f in order_problems(early)), order_problems(early)
 
 
 if __name__ == "__main__":
