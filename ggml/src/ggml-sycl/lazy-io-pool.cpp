@@ -1056,20 +1056,47 @@ bool lazy_io_deliver(const lazy_io_waiter & waiter, const uint8_t * read_bytes, 
     lazy_io_ticket * const ticket = waiter.ticket;
     if (read_errno == 0) {
         if (waiter.landing != nullptr && waiter.bytes != 0) {
-            lazy_landing_slot &         slot = *waiter.landing;
-            std::lock_guard<std::mutex> lock(slot.lock);
-            const lazy_gather_request * req  = ticket != nullptr ? ticket->request : nullptr;
-            const bool                  stop = req != nullptr && (req->cancelled.load(std::memory_order_acquire) ||
-                                                 req->drain.load(std::memory_order_acquire));
+            lazy_landing_slot & slot       = *waiter.landing;
+            bool                outside    = false;  // live, and the range does not fit the slot
+            size_t              slot_bytes = 0;
+            {
+                std::lock_guard<std::mutex> lock(slot.lock);
+                const lazy_gather_request * req  = ticket != nullptr ? ticket->request : nullptr;
+                const bool                  stop = req != nullptr && (req->cancelled.load(std::memory_order_acquire) ||
+                                                     req->drain.load(std::memory_order_acquire));
 #if defined(LAZY_IO_QUEUE_MUTANT_DELIVER_IGNORES_EPOCH)
-            GGML_UNUSED(stop);
-            const bool live = true;
+                GGML_UNUSED(stop);
+                const bool live = true;
 #else
-            const bool live = slot.epoch == waiter.epoch && !stop;
+                const bool live = slot.epoch == waiter.epoch && !stop;
 #endif
-            if (live && waiter.landing_offset <= slot.bytes && waiter.bytes <= slot.bytes - waiter.landing_offset) {
-                std::memcpy(slot.data + waiter.landing_offset, read_bytes + waiter.src_offset, waiter.bytes);
+                if (live) {
+                    if (waiter.landing_offset <= slot.bytes && waiter.bytes <= slot.bytes - waiter.landing_offset) {
+                        std::memcpy(slot.data + waiter.landing_offset, read_bytes + waiter.src_offset, waiter.bytes);
+                    } else {
+                        outside    = true;
+                        slot_bytes = slot.bytes;
+                    }
+                }
             }
+#if defined(LAZY_IO_QUEUE_MUTANT_LANDING_OOB_SILENT)
+            GGML_UNUSED(outside);
+            GGML_UNUSED(slot_bytes);
+#else
+            // A landing past its live slot is a defect in the request, never a short copy: the ticket fails with
+            // EINVAL, the first errno winning as for a failed read, and the WARN names the range after the unlock.
+            if (outside) {
+                if (ticket != nullptr) {
+                    int none = 0;
+                    ticket->read_error.compare_exchange_strong(none, EINVAL, std::memory_order_release,
+                                                               std::memory_order_relaxed);
+                }
+                GGML_LOG_WARN(
+                    "[LAZY-IO] landing outside its slot: %zu B at offset %zu of a %zu B slot (epoch %u), "
+                    "the request fails with EINVAL\n",
+                    waiter.bytes, waiter.landing_offset, slot_bytes, (unsigned) waiter.epoch);
+            }
+#endif
         }
         if (waiter.cache != nullptr) {
             waiter.cache->insert(waiter.row, read_bytes + waiter.src_offset);

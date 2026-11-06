@@ -405,7 +405,8 @@ class lazy_io_queue {
 // the slot's epoch is the waiter's and its request is neither cancelled nor draining; then, with no lock held, the
 // row's insert into the cache, whether or not the copy happened; then the ticket's decrement. A read that failed
 // (`read_errno` nonzero) copies and inserts nothing, stores the errno in the ticket if none is stored, and still
-// decrements. Returns whether this delivery took the ticket's count to 0.
+// decrements. A landing range that does not fit its live slot copies nothing and stores EINVAL the same way, with one
+// WARN after the unlock. Returns whether this delivery took the ticket's count to 0.
 bool lazy_io_deliver(const lazy_io_waiter & waiter, const uint8_t * read_bytes, int read_errno) noexcept;
 
 // ---- The block ring and the IO engine (§3.3, §5.2) ----

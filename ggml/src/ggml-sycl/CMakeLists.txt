@@ -386,6 +386,9 @@ if (BUILD_TESTING)
     string(CONCAT _lq_re_cached_waiter_unchecked
         "FAIL a cached waiter lies in one chunk, or the submit aborts: "
         "the submit of a straddling cached waiter returned instead of aborting")
+    string(CONCAT _lq_re_landing_oob_silent
+        "FAIL a landing outside its live slot fails the request with EINVAL and one WARN: "
+        "the out-of-bounds landing left read_error 0 and 0 WARN line\\(s\\), want [0-9]+ and 1")
     string(CONCAT _lq_re_index_before_own
         "FAIL a submit that throws leaves the queue's indexes whole: a new read, allocation [0-9]+ thrown: "
         "a class queue holds an entry no read owns")
@@ -407,7 +410,8 @@ if (BUILD_TESTING)
         LAZY_IO_QUEUE_MUTANT_DELIVER_IGNORES_EPOCH   "${_lq_re_deliver_ignores_epoch}"
         LAZY_IO_QUEUE_MUTANT_INDEX_BEFORE_OWN        "${_lq_re_index_before_own}"
         LAZY_IO_QUEUE_MUTANT_PARTIAL_INSERT          "${_lq_re_index_before_own}"
-        LAZY_IO_QUEUE_MUTANT_CACHED_WAITER_UNCHECKED "${_lq_re_cached_waiter_unchecked}")
+        LAZY_IO_QUEUE_MUTANT_CACHED_WAITER_UNCHECKED "${_lq_re_cached_waiter_unchecked}"
+        LAZY_IO_QUEUE_MUTANT_LANDING_OOB_SILENT      "${_lq_re_landing_oob_silent}")
     set(_lazy_io_queue_variants test-sycl-lazy-io-queue-host "" "")
     list(LENGTH _lazy_io_queue_mutants _n)
     math(EXPR _last "${_n} - 1")

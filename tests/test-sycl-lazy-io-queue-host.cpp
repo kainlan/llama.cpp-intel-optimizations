@@ -646,6 +646,97 @@ arm_result arm_submit_throw() {
     return r;
 }
 
+// The log lines an arm captures through ggml_log_set; the default logger is restored when it goes out of scope.
+struct log_capture {
+    std::vector<std::string> lines;
+
+    log_capture() { ggml_log_set(&log_capture::take, this); }
+
+    ~log_capture() { ggml_log_set(nullptr, nullptr); }
+
+    log_capture(const log_capture &)             = delete;
+    log_capture & operator=(const log_capture &) = delete;
+
+    static void take(ggml_log_level level, const char * text, void * self) {
+        GGML_UNUSED(level);
+        static_cast<log_capture *>(self)->lines.push_back(text);
+    }
+
+    size_t count_with(const char * needle) const {
+        size_t n = 0;
+        for (const std::string & line : lines) {
+            n += line.find(needle) != std::string::npos ? 1 : 0;
+        }
+        return n;
+    }
+};
+
+// A landing range past its live slot copies nothing and fails the request: the ticket's read_error becomes EINVAL by
+// the first-errno-wins store, with one WARN, and the count still goes down. The row still enters the cache, since the
+// read itself succeeded. A ticket that already holds EIO keeps it, and a stale-epoch waiter's range is not checked.
+// Mutant: LAZY_IO_QUEUE_MUTANT_LANDING_OOB_SILENT (the copy is skipped with no error and no WARN).
+arm_result arm_landing_outside_slot() {
+    arm_result           r;
+    plain_source         source;
+    lazy_row_cache_build build = fixture_cache(source);
+    if (!build) {
+        void_arm(r, "the fixture row cache did not build");
+        return r;
+    }
+    lazy_row_cache &           cache = *build.cache;
+    const std::vector<uint8_t> block(LAZY_IO_BLOCK_BYTES, 0x3c);
+    std::vector<uint8_t>       slab(2 * k_row, 0);
+    const std::vector<uint8_t> zeros(slab.size(), 0);
+    lazy_landing_slot          slot;
+    slot.epoch = 5;
+    slot.data  = slab.data();
+    slot.bytes = slab.size();
+    lazy_gather_request req;
+    auto                waiter = [&](lazy_io_ticket & t, uint32_t epoch, int64_t row) {
+        lazy_io_waiter w;
+        w.ticket         = &t;
+        w.epoch          = epoch;
+        w.landing        = &slot;
+        w.landing_offset = k_row + 10;  // k_row bytes from here reach 10 B past the slot
+        w.bytes          = k_row;
+        w.cache          = &cache;
+        w.row            = row;
+        return w;
+    };
+    const char * const warn = "[LAZY-IO] landing outside its slot";
+    log_capture        logs;
+
+    lazy_io_ticket t;
+    t.request = &req;
+    t.outstanding.store(1);
+    const bool   last  = lazy_io_deliver(waiter(t, 5, 8), block.data(), 0);
+    const size_t warns = logs.count_with(warn);
+    expect(r, t.read_error.load() == EINVAL && warns == 1,
+           "the out-of-bounds landing left read_error " + num(static_cast<uint64_t>(t.read_error.load())) + " and " +
+               num(warns) + " WARN line(s), want " + num(EINVAL) + " and 1");
+    expect(r, last && t.outstanding.load() == 0, "the out-of-bounds landing did not count its ticket down to 0");
+    expect(r, slab == zeros, "the out-of-bounds landing wrote into the slot");
+    expect(r, cache.resident(8), "the out-of-bounds landing's row is not in the cache, though its read succeeded");
+
+    lazy_io_ticket t2;
+    t2.request = &req;
+    t2.outstanding.store(1);
+    t2.read_error.store(EIO);
+    (void) lazy_io_deliver(waiter(t2, 5, 9), block.data(), 0);
+    expect(r, t2.read_error.load() == EIO,
+           "a ticket holding EIO was left with read_error " + num(static_cast<uint64_t>(t2.read_error.load())) +
+               ", want " + num(EIO) + ", since the first errno wins");
+
+    lazy_io_ticket t3;
+    t3.request = &req;
+    t3.outstanding.store(1);
+    (void) lazy_io_deliver(waiter(t3, 4, 10), block.data(), 0);
+    expect(r, t3.read_error.load() == 0 && logs.count_with(warn) == 2,
+           "a stale-epoch waiter's range was checked: read_error " + num(static_cast<uint64_t>(t3.read_error.load())) +
+               " and " + num(logs.count_with(warn)) + " WARN line(s) in all, want 0 and 2");
+    return r;
+}
+
 constexpr const char * k_straddle_child = "--straddling-cached-waiter-child";
 
 // The cached-waiter arm's child: a waiter with a row cache straddling the boundary of a 1 MiB span's two chunks. The
@@ -729,20 +820,21 @@ int main(int argc, char ** argv) {
         return straddle_child();
     }
     const std::vector<named_arm> arms = {
-        { "class 0 dispatches by (epoch, deadline), rows first, equal keys in order", arm_key_order               },
-        { "the epoch order survives the counter's wrap",                              arm_epoch_wrap              },
-        { "the contexts take turns",                                                  arm_round_robin             },
-        { "class 1 waits for every context's class 0",                                arm_class_order             },
-        { "a class-0 join promotes a lookahead read",                                 arm_promotion               },
-        { "a span is read in chunks of at most 512 KiB",                              arm_chunks                  },
-        { "a request for a pending block joins its read",                             arm_dedup                   },
-        { "a same-context join takes the more urgent key and keeps its number",       arm_same_context_rekey      },
-        { "a join from another context adds an entry at the joiner's key",            arm_cross_context_join      },
-        { "the FIFO override serves reads in enqueue order",                          arm_fifo_override           },
-        { "the dispatch log numbers a read when a worker picks it up",                arm_dispatch_log            },
-        { "the reaper copies only into its own epoch's live slot",                    arm_delivery                },
-        { "a submit that throws leaves the queue's indexes whole",                    arm_submit_throw            },
-        { "a cached waiter lies in one chunk, or the submit aborts",                  arm_cached_waiter_one_chunk },
+        { "class 0 dispatches by (epoch, deadline), rows first, equal keys in order",   arm_key_order               },
+        { "the epoch order survives the counter's wrap",                                arm_epoch_wrap              },
+        { "the contexts take turns",                                                    arm_round_robin             },
+        { "class 1 waits for every context's class 0",                                  arm_class_order             },
+        { "a class-0 join promotes a lookahead read",                                   arm_promotion               },
+        { "a span is read in chunks of at most 512 KiB",                                arm_chunks                  },
+        { "a request for a pending block joins its read",                               arm_dedup                   },
+        { "a same-context join takes the more urgent key and keeps its number",         arm_same_context_rekey      },
+        { "a join from another context adds an entry at the joiner's key",              arm_cross_context_join      },
+        { "the FIFO override serves reads in enqueue order",                            arm_fifo_override           },
+        { "the dispatch log numbers a read when a worker picks it up",                  arm_dispatch_log            },
+        { "the reaper copies only into its own epoch's live slot",                      arm_delivery                },
+        { "a submit that throws leaves the queue's indexes whole",                      arm_submit_throw            },
+        { "a cached waiter lies in one chunk, or the submit aborts",                    arm_cached_waiter_one_chunk },
+        { "a landing outside its live slot fails the request with EINVAL and one WARN", arm_landing_outside_slot    },
     };
     return run_arms(arms, "lazy io queue host arms");
 }
