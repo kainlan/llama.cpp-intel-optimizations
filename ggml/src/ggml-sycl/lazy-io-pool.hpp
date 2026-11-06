@@ -5,12 +5,14 @@
 //
 // One registry per process, defined once in lazy-io-pool.cpp beside the leaf mutex that guards it, never in this
 // header: a header-only registry would give every target that includes it a registry of its own, two ledgers for one
-// fact. The pool here holds no ring and starts no thread; the block ring and the pread workers arrive with the IO
-// engine. What it already decides is coverage: a planner reads the live ring's bytes through a held lease, so a
-// successful take is the pin, and a plan made without one carries no STORAGE table (§4.3 step 4).
+// fact. The pool decides coverage: a planner reads the live ring's bytes through a held lease, so a successful take is
+// the pin, and a plan made without one carries no STORAGE table (§4.3 step 4). The pool's block ring is created by
+// block_ring_ensure, once, with the IO engine whose pread workers read into its slots (§3.3, §5.2), and both are
+// released by the reap after the pool's last lease is gone.
 //
 // Device-free on purpose, like host-cpu-mapping.hpp: this header and lazy-io-pool.cpp include no SYCL header, so a
-// host test links the translation unit alone.
+// host test links the translation unit alone. The ring's memory and the strict switch are its two link seams, defined
+// by lazy-table.cpp in the backend and by a fixture in each host test.
 //
 // The registry's leaf mutex (canonical contract §12.5, L5) is a true leaf: nothing is taken, allocated, freed, waited
 // on or logged under it. A take reserves a generation under it, builds its pool outside it and installs the pool under
@@ -78,6 +80,45 @@ constexpr size_t lazy_row_cache_index_raw_bytes(size_t slots) {
     return sizeof(uint64_t) * slots + sizeof(uint32_t) * lazy_row_cache_index_buckets(slots);
 }
 
+// ---- The block ring's memory and the strict switch: the two link seams (§3.3) ----
+
+// The block ring's memory, owner-holding and type-erased: the backend's object holds the owner-first mem_handle of the
+// ring's HOST_CPU / LAZY_STAGING allocation with the CPU view resolved from it once, and destroying it drops that
+// handle, the sole release point, whose free credits the budget ledger. `bytes` are the usable bytes, `charged` the
+// ledger's charge for the allocation (host_cpu_mapped_size of the handle).
+class lazy_io_host_memory {
+  public:
+    virtual ~lazy_io_host_memory()                               = default;
+    lazy_io_host_memory(const lazy_io_host_memory &)             = delete;
+    lazy_io_host_memory & operator=(const lazy_io_host_memory &) = delete;
+
+    uint8_t * data() const noexcept { return data_; }
+
+    size_t size() const noexcept { return bytes_; }
+
+    size_t charged_bytes() const noexcept { return charged_; }
+
+  protected:
+    lazy_io_host_memory(uint8_t * data, size_t bytes, size_t charged) noexcept :
+        data_(data),
+        bytes_(bytes),
+        charged_(charged) {}
+
+  private:
+    uint8_t * data_    = nullptr;
+    size_t    bytes_   = 0;
+    size_t    charged_ = 0;
+};
+
+// The block ring's allocation of `bytes` usable bytes, O_DIRECT-aligned, on `device`'s cache (§3.3), charged to the
+// ledger under `load_txn_id`, whose own chunks a yield never gives back (§4.2): null when it is refused. May throw
+// std::bad_alloc. Defined once per link: lazy-table.cpp for the backend, a fixture in each host test that links
+// lazy-io-pool.cpp.
+std::unique_ptr<lazy_io_host_memory> lazy_io_allocate_host(size_t bytes, int device, uint64_t load_txn_id);
+
+// Whether a [HOST-PLAN-BUG] aborts (GGML_SYCL_STRICT_LEASES=1, §10). Defined like lazy_io_allocate_host.
+bool lazy_io_strict_enabled();
+
 struct lazy_io_pool;
 
 // A counted reference on the IO pool. Move-only: the count changes only under the registry's leaf mutex, at a take, a
@@ -102,8 +143,8 @@ class ring_lease {
 
     bool held() const noexcept { return pool_ != nullptr; }
 
-    // The live ring's bytes, read through this lease: the coverage a planner reads, 0 when the pool has no ring yet.
-    // A pool that holds leases but no ring covers 0, and this pool never has one, so a held lease always reads 0.
+    // The live ring's usable bytes, read through this lease: the coverage a planner reads, 0 when the pool has no ring
+    // yet. A planner reads it through lazy_ring_coverage_read, which counts the read.
     uint64_t ring_bytes() const noexcept;
 
     // Drops this reference now and leaves the lease empty. The drop that reaches zero marks the pool DYING and parks it
@@ -112,6 +153,7 @@ class ring_lease {
 
   private:
     friend ring_lease lazy_io_pool_take();
+    friend struct lazy_io_pool_access;  // the engine's paths in lazy-io-pool.cpp: join, ensure, submit, shutdown
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     friend void ggml_sycl_test_lazy_mark_dying(const ring_lease & lease);
 #endif
@@ -128,13 +170,20 @@ class ring_lease {
 // the lock. Returns an empty lease once the registry is shut down. Throws std::bad_alloc when the pool cannot be built.
 ring_lease lazy_io_pool_take();
 
+// A lease on the live pool, never a new one (§3.3): what a read takes so the pool and its ring outlive it. Empty when
+// no pool is live, when the live pool has no ring, or once the registry is shut down.
+ring_lease lazy_io_pool_join();
+
 enum class lazy_reap_scope : uint8_t {
-    FULL,  // frees every parked pool and then its node
+    FULL,    // frees every parked pool, which stops and joins its workers, and then its node
+    WORKER,  // frees only the parked pools' rings and leaves each node, with the pool and its workers, on the list
 };
 
-// Reaps the parked pools: swaps the reap list out under the leaf mutex, so concurrent reapers each take their own
-// nodes, and frees them after the unlock. A FULL reap counts even when the list is empty. Never throws, and never runs
-// under a lock this registry knows of: every caller is an unlocked context.
+// Reaps the parked pools. FULL swaps the reap list out under the leaf mutex, so concurrent reapers each take their own
+// nodes, and frees them after the unlock; it counts even when the list is empty. WORKER, the read-completion path's
+// scope, takes each parked pool's ring out under the mutex and frees the rings after the unlock, so a pool worker
+// never joins itself (§3.3). Never throws, and never runs under a lock this registry knows of: every caller is an
+// unlocked context.
 void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept;
 
 // Marks the registry shut down: from then on a take returns an empty lease and a lease's drop only decrements, so a
@@ -319,6 +368,10 @@ class lazy_io_queue {
     // destroys it, dropping its lease, after unlocking.
     std::unique_ptr<lazy_io_read> complete(lazy_io_read * read);
 
+    // Takes every read no worker has picked out of the queues and the in-flight table and hands them over, for
+    // shutdown's cancel: the caller delivers their waiters and destroys them, dropping their leases, after unlocking.
+    std::vector<std::unique_ptr<lazy_io_read>> cancel_queued();
+
     size_t queued_entries() const;  // queue entries, a read with two entries counted twice
     size_t in_flight() const;       // reads in the in-flight table, queued or dispatched
 
@@ -342,6 +395,64 @@ class lazy_io_queue {
 // decrements. Returns whether this delivery took the ticket's count to 0.
 bool lazy_io_deliver(const lazy_io_waiter & waiter, const uint8_t * read_bytes, int read_errno) noexcept;
 
+// ---- The block ring and the IO engine (§3.3, §5.2) ----
+
+// block_ring_ensure's answer. Every refusal but OK is typed; each name is the lazy table's refusal for it.
+enum class lazy_ring_ensure_status : uint8_t {
+    OK,
+    UNPINNED,    // lazy-table-ring-unpinned: no live pool, so no lease pins one
+    TOO_NARROW,  // lazy-table-ring-too-narrow: the need or the span does not fit the ring (§3.3, §10)
+    CONCURRENT,  // lazy-table-ring-concurrent-ensure: another caller holds the ensuring state
+    SHUT_DOWN,   // lazy-table-ring-shut-down: the registry is shut down
+    MISMATCH,    // lazy-table-ring-mismatch: the ring's bytes or charge differ from the plan's (§10's ring check)
+    REFUSED,     // lazy-table-ring-refused: the planned allocation was refused
+};
+
+const char * lazy_ring_ensure_status_name(lazy_ring_ensure_status status);
+
+// The pool's block ring for a STORAGE table (§3.3), called by the table's materialization with the plan's
+// block_ring_need as `need`, the table's own read span, the ring's device, the plan's block_ring_charge and the load's
+// transaction, which the ring's charge carries (§4.2). The first call allocates exactly `need` through
+// lazy_io_allocate_host and starts the engine's LAZY_BLOCK_RING_QD workers, one per slot of need / LAZY_BLOCK_RING_QD
+// bytes. A later call allocates nothing and accepts the live ring when it holds the need and the span and the plan's
+// charge is the ring's own for the transaction whose ensure created it, and 0 for any other (§10's ring check). It
+// keeps one piece of state, `ensuring`, in three steps: reserve under the registry's leaf mutex, allocate with no lock
+// held, install under it; a scope guard clears it on every exit. A caller that finds it set refuses at once and never
+// waits. Each mismatch with the plan is a [HOST-PLAN-BUG] WARN naming both numbers that aborts under strict leases
+// (§10); the shut-down and unpinned refusals are WARNs. May throw what the allocation or a worker's start throws, after
+// the guard has cleared `ensuring`.
+lazy_ring_ensure_status block_ring_ensure(size_t   need,
+                                          size_t   span,
+                                          int      device,
+                                          size_t   plan_charge,
+                                          uint64_t load_txn_id = 0);
+
+// Queues the read of `span` for `context` at `key` with `waiter` (§5.2.1, §5.3), on the live pool's engine, and wakes a
+// worker. The read takes a lease on the pool through lazy_io_pool_join, so the pool and its ring outlive it. Returns
+// the waiters added, as lazy_io_queue::submit counts them; 0, with a WARN, when no live pool has a ring or the span is
+// longer than one slot.
+size_t lazy_io_submit(uint64_t               context,
+                      int                    fd,
+                      const lazy_io_span &   span,
+                      const lazy_io_key &    key,
+                      const lazy_io_waiter & waiter);
+
+// Backend shutdown's step (§3.3): cancels the live engine's queued reads, delivering each waiter ECANCELED, and waits
+// for the reads the workers have picked to finish, their leases dropped. Shutdown is already a waiting context. It
+// sets no flag and reaps nothing; the lease drain that follows it does both.
+void lazy_io_pool_shutdown() noexcept;
+
+// One coverage read (§10's lazy_ring_coverage_reads): the live ring's bytes through `pin`, counted. No pin is no
+// coverage read: 0, and nothing counted.
+uint64_t lazy_ring_coverage_read(const ring_lease * pin) noexcept;
+
+// The coverage reads counted since the process started: one relaxed counter, unconditional in every build (§10).
+uint64_t lazy_ring_coverage_reads() noexcept;
+
+// The live ring's usable bytes, read under the leaf mutex: the pool's published figure (§10's accessor). False, writing
+// nothing, when no live pool has a ring.
+bool lazy_block_ring_bytes(uint64_t * out);
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The registry's state, read under its leaf mutex (§11's wrapper arm). The two take-time snapshots are the reaps run
 // and the parked nodes when the last successful take installed or joined a pool, so a fixture can tell an entry reap
@@ -355,6 +466,9 @@ struct lazy_registry_state {
     uint64_t full_reaps_run         = 0;  // FULL reaps run, an empty list included
     uint64_t reaps_run_at_last_take = 0;
     uint64_t parked_at_last_take    = 0;
+    uint64_t ring_bytes             = 0;      // the slot pool's ring, usable bytes; 0 with no ring
+    uint64_t ring_allocations       = 0;      // rings ensure allocated for the slot pool, installed or not
+    bool     ensuring               = false;  // the slot pool's ensuring state
 };
 
 // Copies the registry's state into *out. Returns false, writing nothing, for a null pointer.
@@ -372,6 +486,39 @@ void ggml_sycl_test_lazy_reap_hold(lazy_hold_fn hold, void * ctx);
 // Arms the hook in the take: the first take that reserves a generation after the arming calls it after building its
 // pool and before the install, so a fixture can install and park another pool inside that window.
 void ggml_sycl_test_lazy_take_hold(lazy_hold_fn hold, void * ctx);
+
+// Arms the hook in block_ring_ensure: the first ensure that reserves `ensuring` after the arming calls it between the
+// reserve and the allocation (§3.3), so a fixture can hold the reserver while another ensure runs.
+void ggml_sycl_test_lazy_ensure_hold(lazy_hold_fn hold, void * ctx);
+
+// The engine's read source (§5.2): `length` bytes of `fd` at `offset` into `dst`; returns the bytes read, or -errno.
+// A fixture's source replaces pread for every worker until it is cleared with null; it runs with no lock held.
+using lazy_io_read_fn = long (*)(void * ctx, int fd, uint8_t * dst, size_t length, uint64_t offset);
+
+void ggml_sycl_test_lazy_io_read_source(lazy_io_read_fn read, void * ctx);
+
+// The largest end of a worker's write into the ring, as an offset from the ring's start, over every read since the
+// last reset: slot offset plus read length (§11's ring-write recorder). Reset to 0 by the reset call.
+uint64_t ggml_sycl_test_lazy_ring_write_end();
+void     ggml_sycl_test_lazy_ring_write_end_reset();
+
+// The registered PRIVATE_TESTING runtime mutants (one selector, §11): each plants one defect a ring arm must catch,
+// selected by the arm's registration and NONE everywhere else.
+enum class lazy_ring_mutant : uint8_t {
+    NONE,
+    NO_ENSURING,                 // ensure keeps no ensuring state, so a concurrent caller allocates too
+    ENSURING_KEPT_ON_THROW,      // the guard leaves ensuring set when the allocation throws
+    INSTALL_AFTER_SHUT_DOWN,     // step 3 installs the ring although the registry was shut down
+    NO_SPAN_CHECK,               // the first ensure skips span <= need / QD
+    LEASE_PRESENCE_AS_COVERAGE,  // the planner reads a held lease as a covering ring
+    TAKE_WITHOUT_CANDIDATE,      // the coverage scope takes a lease with no lazy-table candidate
+    COUNT_WITHOUT_PIN,           // a coverage read with no pin is counted
+    NO_ENTRY_REAP,               // the coverage scope runs no entry reap
+    NO_CLOSING_REAP,             // the coverage scope runs no closing reap
+};
+
+void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);
+bool lazy_ring_mutant_is(lazy_ring_mutant mutant) noexcept;
 
 // The coverage pin a direct-planner fixture passes (§3.3): an RAII guard that owns the lease, so the const ring_lease *
 // the planner takes cannot dangle. It takes the pool through the registry's take path, never off-registry, and its
@@ -396,9 +543,10 @@ class lazy_test_coverage_pin {
 // about to abort calls it: the pool can no longer be parked or reaped. An empty lease is ignored.
 void ggml_sycl_test_lazy_mark_dying(const ring_lease & lease);
 
-// Only ring_bytes == 0, a ring-less pool, is accepted here: every table is then STORAGE-eligible and block_ring_charge
-// is the mapped need. Any other value aborts naming it, since a ring arrives only with the IO engine. A call while a
-// guard is live joins the live pool with a counted reference.
+// ring_bytes == 0 gives a ring-less pool: every table is then STORAGE-eligible and block_ring_charge is the mapped
+// need. A nonzero ring_bytes ensures that ring through block_ring_ensure on device 0, with a span of ring_bytes /
+// LAZY_BLOCK_RING_QD and the charge of a creating plan, so a planner sees a live ring of that size; an ensure that
+// refuses aborts naming the status. A call while a guard is live joins the live pool with a counted reference.
 lazy_test_coverage_pin ggml_sycl_test_make_coverage_pin(uint64_t ring_bytes);
 #endif
 

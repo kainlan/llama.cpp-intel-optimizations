@@ -3,13 +3,14 @@
 // list, the coverage wrapper and the helper guard, and the shut-down flag.
 //
 // Links ggml-sycl/lazy-io-pool.cpp alone, with ggml-base for the abort and the log: no SYCL header, no device, no
-// unified cache, no SYCL module. The process holds one registry, so the arms run in order and each leaves it with no
-// live pool and no parked node; the shut-down arm runs last because the flag is never cleared. The two abort paths run
-// in a child process of this binary.
+// unified cache, no SYCL module. The block ring's memory comes from the fixture side of the pool's link seams. The
+// process holds one registry, so the arms run in order and each leaves it with no live pool and no parked node; the
+// shut-down arm runs last because the flag is never cleared. The two abort paths run in a child process of this binary.
 //
 // Every arm names the mutant it kills. Every arm runs, so one failure does not hide the rest.
 
 #include "../ggml/src/ggml-sycl/lazy-io-pool.hpp"
+#include "../ggml/src/ggml-sycl/tests/lazy-io-host-fixture.hpp"
 #include "../ggml/src/ggml-sycl/tests/lazy-table-test-util.hpp"
 
 #include <atomic>
@@ -243,9 +244,14 @@ int clone_dying_child() {
     return 3;
 }
 
-int ring_bytes_child() {
-    lazy_test_coverage_pin pin = ggml_sycl_test_make_coverage_pin(4096);
-    std::fprintf(stderr, "child: a helper guard with 4096 ring bytes was made (%s)\n", pin.pin() ? "held" : "empty");
+// The ring a guard asks for in the arm and the child: one slot of two blocks per worker.
+constexpr uint64_t k_guard_ring = LAZY_BLOCK_RING_QD * 2 * LAZY_IO_BLOCK_BYTES;
+
+int ring_refused_child() {
+    lazy_io_host_fixture::g_state.refuse_next = true;
+    lazy_test_coverage_pin pin                = ggml_sycl_test_make_coverage_pin(k_guard_ring);
+    std::fprintf(stderr, "child: a helper guard whose ensure was refused was made (%s, ring %llu B)\n",
+                 pin.pin() ? "held" : "empty", (unsigned long long) pin.lease().ring_bytes());
     return 3;
 }
 
@@ -273,9 +279,11 @@ arm_result arm_clone_on_dying_aborts() {
 }
 
 // The helper guard takes its pool through the registry, and its destructor drops the lease and runs a FULL reap, so the
-// next fixture's guard finds no pool; a second guard while one lives joins its pool; any ring bytes but 0 abort.
+// next fixture's guard finds no pool; a second guard while one lives joins its pool. A nonzero ring_bytes ensures that
+// ring through block_ring_ensure, which the reap frees with the pool, and a refused ensure aborts naming its status.
 // Mutants: the guard taking off-registry (no live pool); its destructor not reaping (a parked node survives it); a
-// second guard building its own pool; a non-zero ring accepted.
+// second guard building its own pool; a nonzero ring not ensured (the guard reads 0 ring bytes); a refused ensure
+// returning a ring-less guard (the child returns).
 arm_result arm_helper_guard() {
     arm_result     r;
     const uint64_t c0 = registry().full_reaps_run;
@@ -295,9 +303,25 @@ arm_result arm_helper_guard() {
            "after the guards: " + describe(registry()) + ", want their pool reaped");
     expect(r, registry().full_reaps_run == c0 + 2,
            "the two guards ran " + num(registry().full_reaps_run - c0) + " FULL reaps, want one each");
-    const child_run c = run_leg("--ring-bytes-child");
-    expect(r, aborted(c) && c.err.find("4096") != std::string::npos,
-           "a guard with 4096 ring bytes did not abort naming them; the child wrote: " + c.err);
+    const uint64_t a0 = lazy_io_host_fixture::g_state.allocations.load();
+    {
+        lazy_test_coverage_pin pin = ggml_sycl_test_make_coverage_pin(k_guard_ring);
+        expect(r,
+               pin.lease().ring_bytes() == k_guard_ring && lazy_io_host_fixture::g_state.allocations.load() == a0 + 1,
+               "a guard with " + num(k_guard_ring) + " ring bytes reads " + num(pin.lease().ring_bytes()) + " after " +
+                   num(lazy_io_host_fixture::g_state.allocations.load() - a0) + " allocation(s), want " +
+                   num(k_guard_ring) + " and 1");
+    }
+    expect(r, registry_is(registry(), 0, 0, 0) && lazy_io_host_fixture::g_state.live_charged.load() == 0,
+           "after the ring guard: " + describe(registry()) + " and " +
+               num(lazy_io_host_fixture::g_state.live_charged.load()) + " ring bytes charged, want 0, 0, 0 and 0");
+    const child_run   c    = run_leg("--ring-refused-child");
+    const std::string want = "ring_bytes=" + num(k_guard_ring);
+    expect(r,
+           aborted(c) && c.err.find(want) != std::string::npos &&
+               c.err.find("lazy-table-ring-refused") != std::string::npos,
+           "a guard whose ensure was refused did not abort naming " + want +
+               " and lazy-table-ring-refused; the child wrote: " + c.err);
     return r;
 }
 
@@ -330,8 +354,8 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--clone-dying-child") == 0) {
         return clone_dying_child();
     }
-    if (argc == 2 && std::strcmp(argv[1], "--ring-bytes-child") == 0) {
-        return ring_bytes_child();
+    if (argc == 2 && std::strcmp(argv[1], "--ring-refused-child") == 0) {
+        return ring_refused_child();
     }
 
     std::vector<named_arm> arms = {

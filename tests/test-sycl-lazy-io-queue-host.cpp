@@ -15,6 +15,7 @@
 #include "../ggml/src/ggml-sycl/lazy-io-pool.hpp"
 #include "../ggml/src/ggml-sycl/lazy-row-cache.hpp"
 #include "../ggml/src/ggml-sycl/tests/host-ledger-test-harness.hpp"
+#include "../ggml/src/ggml-sycl/tests/lazy-io-host-fixture.hpp"
 
 #include <algorithm>
 #include <cerrno>

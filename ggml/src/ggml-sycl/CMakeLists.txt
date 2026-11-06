@@ -439,6 +439,62 @@ if (BUILD_TESTING)
         endif()
     endforeach()
 
+    # The block ring's ensure and the IO engine's workers (th32 §3.3, §5.2, §5.3, §10), host-only: ensure allocates
+    # through lazy_io_allocate_host, a link seam the fixture header lazy-io-host-fixture.hpp defines with a counting
+    # ledger in place of lazy-table.cpp's HOST_CPU allocation, and the workers read through the PRIVATE_TESTING read
+    # source, so no device, no unified cache and no SYCL module. Links lazy-io-pool.cpp with the row cache its reaper
+    # inserts into (lazy-row-cache.cpp, host-cpu-mapping.cpp) and ggml-base for the log and the abort. Its strict arm
+    # re-executes the binary through fork and /proc/self/exe, so it is Linux-only.
+    #
+    # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
+    # and the FAIL line the arm that kills it prints. Each registers test-sycl-lazy-io-engine-host-mutant-<name> on the
+    # one executable, which passes only when that line appears.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(_le_rules "FAIL ensure allocates the need once and refuses what the plan did not charge: ")
+        string(CONCAT _le_re_no_ensuring
+            "FAIL a concurrent ensure refuses at once while the reserver is held: the second ensure returned ok, "
+            "want lazy-table-ring-concurrent-ensure")
+        string(CONCAT _le_re_ensuring_kept_on_throw
+            "FAIL a throwing allocation leaves ensuring clear for the next ensure: after the throw the pool's "
+            "ensuring is still set, want it cleared by the guard")
+        string(CONCAT _le_re_install_after_shut_down
+            "FAIL ensure refuses after shut-down and frees the reserver's ring: the reserver that reached its install "
+            "after shut-down returned ok, want lazy-table-ring-shut-down")
+        string(CONCAT _le_re_no_span_check
+            "${_le_rules}the one-block-short ensure returned ok with 1 allocation\\(s\\), "
+            "want lazy-table-ring-too-narrow and none")
+        set(_lazy_io_engine_mutants
+            no-ensuring             "${_le_re_no_ensuring}"
+            ensuring-kept-on-throw  "${_le_re_ensuring_kept_on_throw}"
+            install-after-shut-down "${_le_re_install_after_shut_down}"
+            no-span-check           "${_le_re_no_span_check}")
+        add_executable(test-sycl-lazy-io-engine-host
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
+            lazy-io-pool.cpp
+            lazy-row-cache.cpp
+            host-cpu-mapping.cpp)
+        target_include_directories(test-sycl-lazy-io-engine-host PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_compile_definitions(test-sycl-lazy-io-engine-host PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        target_link_libraries(test-sycl-lazy-io-engine-host PRIVATE ggml-base Threads::Threads)
+        set_target_properties(test-sycl-lazy-io-engine-host PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-lazy-io-engine-host COMMAND test-sycl-lazy-io-engine-host)
+        set_tests_properties(test-sycl-lazy-io-engine-host PROPERTIES LABELS "sycl;host" TIMEOUT 120)
+        list(LENGTH _lazy_io_engine_mutants _n)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 2)
+            math(EXPR _j "${_i} + 1")
+            list(GET _lazy_io_engine_mutants ${_i} _mutant)
+            list(GET _lazy_io_engine_mutants ${_j} _regex)
+            add_test(NAME test-sycl-lazy-io-engine-host-mutant-${_mutant}
+                COMMAND test-sycl-lazy-io-engine-host --mutant ${_mutant})
+            set_tests_properties(test-sycl-lazy-io-engine-host-mutant-${_mutant} PROPERTIES
+                LABELS "sycl;host;mutant"
+                TIMEOUT 120
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endforeach()
+    endif()
+
     # The hot-row cache of a STORAGE lazy table (th32 §6.3, §6.4, §11 T4): CLOCK replacement, shard independence, the
     # 13.3 B/slot index, the no-leases rule, the yield that frees a chunk with no wait while rows stay gatherable, the
     # counters, and the yieldable rule the planner shares. lazy-row-cache.cpp includes no SYCL header and the test hands

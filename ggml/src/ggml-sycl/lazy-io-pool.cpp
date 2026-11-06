@@ -330,10 +330,7 @@ lazy_test_coverage_pin::~lazy_test_coverage_pin() {
 }
 
 lazy_test_coverage_pin ggml_sycl_test_make_coverage_pin(uint64_t ring_bytes) {
-    if (ring_bytes != 0) {
-        GGML_ABORT("ggml_sycl_test_make_coverage_pin: ring_bytes=%llu; only a ring-less pool (0) is accepted",
-                   (unsigned long long) ring_bytes);
-    }
+    GGML_UNUSED(ring_bytes);  // stub: no ring is ensured, so every guard is ring-less
     return lazy_test_coverage_pin(lazy_io_pool_take());
 }
 #endif
@@ -777,5 +774,104 @@ bool lazy_io_deliver(const lazy_io_waiter & waiter, const uint8_t * read_bytes, 
     }
     return ticket->outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1;
 }
+
+// ---- the block ring and the IO engine (§3.3, §5.2): stubs, which allocate nothing and start no worker ----
+
+std::vector<std::unique_ptr<lazy_io_read>> lazy_io_queue::cancel_queued() {
+    return {};
+}
+
+ring_lease lazy_io_pool_join() {
+    return ring_lease();
+}
+
+const char * lazy_ring_ensure_status_name(lazy_ring_ensure_status status) {
+    switch (status) {
+        case lazy_ring_ensure_status::OK:
+            return "ok";
+        case lazy_ring_ensure_status::UNPINNED:
+            return "lazy-table-ring-unpinned";
+        case lazy_ring_ensure_status::TOO_NARROW:
+            return "lazy-table-ring-too-narrow";
+        case lazy_ring_ensure_status::CONCURRENT:
+            return "lazy-table-ring-concurrent-ensure";
+        case lazy_ring_ensure_status::SHUT_DOWN:
+            return "lazy-table-ring-shut-down";
+        case lazy_ring_ensure_status::MISMATCH:
+            return "lazy-table-ring-mismatch";
+        case lazy_ring_ensure_status::REFUSED:
+            return "lazy-table-ring-refused";
+    }
+    return "lazy-table-ring-unknown";
+}
+
+lazy_ring_ensure_status block_ring_ensure(size_t   need,
+                                          size_t   span,
+                                          int      device,
+                                          size_t   plan_charge,
+                                          uint64_t load_txn_id) {
+    GGML_UNUSED(need);
+    GGML_UNUSED(span);
+    GGML_UNUSED(device);
+    GGML_UNUSED(plan_charge);
+    GGML_UNUSED(load_txn_id);
+    return lazy_ring_ensure_status::REFUSED;
+}
+
+size_t lazy_io_submit(uint64_t               context,
+                      int                    fd,
+                      const lazy_io_span &   span,
+                      const lazy_io_key &    key,
+                      const lazy_io_waiter & waiter) {
+    GGML_UNUSED(context);
+    GGML_UNUSED(fd);
+    GGML_UNUSED(span);
+    GGML_UNUSED(key);
+    GGML_UNUSED(waiter);
+    return 0;
+}
+
+void lazy_io_pool_shutdown() noexcept {}
+
+uint64_t lazy_ring_coverage_read(const ring_lease * pin) noexcept {
+    GGML_UNUSED(pin);
+    return 0;
+}
+
+uint64_t lazy_ring_coverage_reads() noexcept {
+    return 0;
+}
+
+bool lazy_block_ring_bytes(uint64_t * out) {
+    GGML_UNUSED(out);
+    return false;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void ggml_sycl_test_lazy_ensure_hold(lazy_hold_fn hold, void * ctx) {
+    GGML_UNUSED(hold);
+    GGML_UNUSED(ctx);
+}
+
+void ggml_sycl_test_lazy_io_read_source(lazy_io_read_fn read, void * ctx) {
+    GGML_UNUSED(read);
+    GGML_UNUSED(ctx);
+}
+
+uint64_t ggml_sycl_test_lazy_ring_write_end() {
+    return 0;
+}
+
+void ggml_sycl_test_lazy_ring_write_end_reset() {}
+
+void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant) {
+    GGML_UNUSED(mutant);
+}
+
+bool lazy_ring_mutant_is(lazy_ring_mutant mutant) noexcept {
+    GGML_UNUSED(mutant);
+    return false;
+}
+#endif
 
 }  // namespace ggml_sycl
