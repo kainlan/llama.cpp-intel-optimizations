@@ -935,9 +935,11 @@ GGML_BACKEND_API bool ggml_backend_sycl_commit_host_holders(ggml_backend_t backe
 // auto-n_ubatch trial's transaction; MARK opens the reserve's own one when none is open and records its chunk count;
 // RETURN_TO_MARK returns the chunks grown since the mark and keeps the transaction open; KEEP closes it, its chunks
 // becoming ordinary capacity; RETURN closes it, drops the context's demand and returns its chunks, each released at
-// once when empty and otherwise at the context's next begin or its end. `n_ubatch` is the context's, printed by the
-// kept|returned witness. Returns false for a non-SYCL backend or an unknown op. `op` is a plain int, and every argument
-// a scalar, so no enum or struct crosses the dlopen boundary; look it up by name through the registry's proc address.
+// once when empty and otherwise at the context's next begin or its end. `n_ubatch` is recorded by the OPEN, or by the
+// MARK that opens the transaction, and the kept|returned witness prints that recorded value; the value passed with
+// KEEP, RETURN or RETURN_TO_MARK is ignored. Returns false for a non-SYCL backend or an unknown op. `op` is a plain
+// int, and every argument a scalar, so no enum or struct crosses the dlopen boundary; look it up by name through the
+// registry's proc address.
 #define GGML_SYCL_HOST_SCRATCH_TRIAL_OPEN           0
 #define GGML_SYCL_HOST_SCRATCH_TRIAL_KEEP           1
 #define GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN         2
