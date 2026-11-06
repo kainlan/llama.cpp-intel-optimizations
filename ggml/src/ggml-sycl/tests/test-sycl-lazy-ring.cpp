@@ -28,6 +28,7 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "host-plan-shaped-inventory.hpp"
+#include "lazy-io-test-util.hpp"
 #include "lazy-table-test-util.hpp"
 #include "sycl-test-skip.hpp"
 
@@ -57,6 +58,10 @@ using namespace lazy_table_test;
 using host_plan_shaped_inventory::loader_inventory;
 using host_plan_shaped_inventory::planner_inventory;
 using host_plan_shaped_inventory::q2k_shape;
+using lazy_io_test::fill_source;
+using lazy_io_test::gate;
+using lazy_io_test::gated_source;
+using lazy_io_test::wait_for;
 
 namespace {
 
@@ -193,18 +198,6 @@ std::string chomp(std::string s) {
         s.pop_back();
     }
     return s;
-}
-
-// Polls `done` until it holds or the hook bound passes: an observation, never a sleep that stands in for an event.
-template <typename F> bool wait_for(F done) {
-    const auto deadline = std::chrono::steady_clock::now() + k_hook_bound;
-    while (!done()) {
-        if (std::chrono::steady_clock::now() > deadline) {
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return true;
 }
 
 template <typename F> F proc(const char * proc_name) {
@@ -508,46 +501,6 @@ lazy_ring_ensure_status ensure_for(const model_load & m) {
 
 lazy_io_key read_key() {
     return { lazy_io_class::PREFETCH, 1, 1, lazy_io_kind::TABLE_ROWS };
-}
-
-long fill_source(void * ctx, int fd, uint8_t * dst, size_t length, uint64_t offset) {
-    (void) ctx;
-    (void) fd;
-    for (size_t i = 0; i < length; ++i) {
-        dst[i] = static_cast<uint8_t>((offset + i) * 131u + 7u);
-    }
-    return static_cast<long>(length);
-}
-
-// A gate every holder blocks on until the arm releases it; the arm waits for the hold it needs to observe.
-struct gate {
-    std::mutex              mutex;
-    std::condition_variable cv;
-    size_t                  holders  = 0;
-    bool                    released = false;
-
-    void hold() {
-        std::unique_lock<std::mutex> lock(mutex);
-        ++holders;
-        cv.notify_all();
-        cv.wait(lock, [this] { return released; });
-    }
-
-    bool wait_holders(size_t n) {
-        std::unique_lock<std::mutex> lock(mutex);
-        return cv.wait_for(lock, k_hook_bound, [this, n] { return holders >= n; });
-    }
-
-    void release() {
-        std::lock_guard<std::mutex> lock(mutex);
-        released = true;
-        cv.notify_all();
-    }
-};
-
-long gated_source(void * ctx, int fd, uint8_t * dst, size_t length, uint64_t offset) {
-    static_cast<gate *>(ctx)->hold();
-    return fill_source(nullptr, fd, dst, length, offset);
 }
 
 // One read held on a worker by the gate: its waiter is the ticket alone (no landing, no cache), so its delivery only

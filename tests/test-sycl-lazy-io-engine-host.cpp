@@ -18,6 +18,7 @@
 
 #include "../ggml/src/ggml-sycl/lazy-io-pool.hpp"
 #include "../ggml/src/ggml-sycl/tests/lazy-io-host-fixture.hpp"
+#include "../ggml/src/ggml-sycl/tests/lazy-io-test-util.hpp"
 #include "../ggml/src/ggml-sycl/tests/lazy-table-test-util.hpp"
 
 #include <atomic>
@@ -36,6 +37,11 @@ using namespace ggml_sycl;
 using namespace host_ledger_test_harness;
 using host_ledger_test_harness::arm_loop::named_arm;
 using host_ledger_test_harness::arm_loop::run_arms;
+using lazy_io_test::file_byte;
+using lazy_io_test::fill_source;
+using lazy_io_test::gate;
+using lazy_io_test::gated_source;
+using lazy_io_test::wait_for;
 using lazy_table_test::registry;
 
 namespace {
@@ -65,18 +71,6 @@ size_t mapped(size_t bytes) {
     return host_cpu_mapped_size(bytes);
 }
 
-// Polls `done` until it holds or the bound passes: an observation, never a sleep that stands in for an event.
-template <typename F> bool wait_for(F done) {
-    const auto deadline = std::chrono::steady_clock::now() + k_bound;
-    while (!done()) {
-        if (std::chrono::steady_clock::now() > deadline) {
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return true;
-}
-
 // Waits for the reads' leases to drop, since a worker drops its read's lease after the delivery the arm observed, then
 // drops `lease` and runs a FULL reap, so the next arm finds no pool. True when no pool is left, live or parked.
 bool settle(ring_lease & lease) {
@@ -88,48 +82,8 @@ bool settle(ring_lease & lease) {
     return quiet && s.live_pools == 0 && s.parked_nodes == 0;
 }
 
-// A gate every holder blocks on until the arm releases it; the arm waits for the holds it needs to observe.
-struct gate {
-    std::mutex              mutex;
-    std::condition_variable cv;
-    size_t                  holders  = 0;
-    bool                    released = false;
-
-    void hold() {
-        std::unique_lock<std::mutex> lock(mutex);
-        ++holders;
-        cv.notify_all();
-        cv.wait(lock, [this] { return released; });
-    }
-
-    bool wait_holders(size_t n) {
-        std::unique_lock<std::mutex> lock(mutex);
-        return cv.wait_for(lock, k_bound, [this, n] { return holders >= n; });
-    }
-
-    void release() {
-        std::lock_guard<std::mutex> lock(mutex);
-        released = true;
-        cv.notify_all();
-    }
-};
-
 void gate_hold(void * ctx) {
     static_cast<gate *>(ctx)->hold();
-}
-
-// The fixture file's byte at `offset`: what every read source below writes, so a landing copy is checked by value.
-uint8_t file_byte(uint64_t offset) {
-    return static_cast<uint8_t>(offset * 131u + 7u);
-}
-
-long fill_source(void * ctx, int fd, uint8_t * dst, size_t length, uint64_t offset) {
-    (void) ctx;
-    (void) fd;
-    for (size_t i = 0; i < length; ++i) {
-        dst[i] = file_byte(offset + i);
-    }
-    return static_cast<long>(length);
 }
 
 // Fails the read at block `*ctx` with EIO and serves every other block.
@@ -137,12 +91,6 @@ long eio_source(void * ctx, int fd, uint8_t * dst, size_t length, uint64_t offse
     if (offset == *static_cast<const uint64_t *>(ctx)) {
         return -EIO;
     }
-    return fill_source(nullptr, fd, dst, length, offset);
-}
-
-// Holds every read on the gate in `ctx`, then serves it.
-long gated_source(void * ctx, int fd, uint8_t * dst, size_t length, uint64_t offset) {
-    static_cast<gate *>(ctx)->hold();
     return fill_source(nullptr, fd, dst, length, offset);
 }
 
