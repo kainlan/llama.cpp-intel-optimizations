@@ -17708,7 +17708,12 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
     // driver-staged copy and at worst a device loss, and streaming host-tier weights is forbidden outright (design 5efe
     // §5.3, P3). A typed, counted refusal, checked before everything else so a custom copy_fn is covered too. The
     // caller routes it to the CPU executor.
-    if (alloc_registry::instance().is_file_mapped(src.ptr)) {
+    bool planted_refusal_after_copy_fn = false;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    // The check placed after the copy_fn test: a custom copy streams a mapped source.
+    planted_refusal_after_copy_fn = scratch_test_mutant_on(scratch_test_mutant::REFUSAL_AFTER_COPY_FN);
+#endif
+    if (alloc_registry::instance().is_file_mapped(src.ptr) && !(planted_refusal_after_copy_fn && copy_fn != nullptr)) {
         result.refused_file_mapped = true;
         g_stream_dma_file_mapped_refusals.fetch_add(1, std::memory_order_relaxed);
         return result;

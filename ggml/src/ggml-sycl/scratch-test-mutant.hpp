@@ -8,15 +8,15 @@
 #define GGML_SYCL_SCRATCH_TEST_MUTANT_HPP
 
 // The planted faults of the SCRATCH return's three device REDs (docs/design/sycl-mmap-host-tier.md §7 C4:
-// test-sycl-scratch-trial-return, test-sycl-configure-refusal, test-sycl-scratch-owner-end). Each fault sits at its
-// site in the pinned pool, the unified cache or the backend, under `#if defined(GGML_SYCL_SCRATCH_MUTANTS)`, and is
-// taken only when a device test has switched it on. It either runs a block beside the production statement it
-// perturbs, just before or just after it, or sets a planted_* local that the statement reads; such a local is false
-// whenever GGML_SYCL_SCRATCH_MUTANTS is undefined. They are runtime seams, never compile-time variants: the private
-// fixtures are the one backend build those tests link (§M82 case (2)), and a variant would need a second one. The
-// macro is defined only in a GGML_SYCL_PRIVATE_TESTING build, so the shipped libggml-sycl compiles none of the blocks,
-// and a source gate reads the text with every block dropped (tests/sycl_gate.py resolve_mutants), as production
-// compiles it.
+// test-sycl-scratch-trial-return, test-sycl-configure-refusal, test-sycl-scratch-owner-end) and of the file-mapped
+// tier's (§5.3, §7 C4: test-sycl-file-mapped-stream-refusal). Each fault sits at its site in the pinned pool, the
+// unified cache or the backend, under `#if defined(GGML_SYCL_SCRATCH_MUTANTS)`, and is taken only when a device test
+// has switched it on. It either runs a block beside the production statement it perturbs, just before or just after it,
+// or sets a planted_* local that the statement reads; such a local is false whenever GGML_SYCL_SCRATCH_MUTANTS is
+// undefined. They are runtime seams, never compile-time variants: the private fixtures are the one backend build those
+// tests link (§M82 case (2)), and a variant would need a second one. The macro is defined only in a
+// GGML_SYCL_PRIVATE_TESTING build, so the shipped libggml-sycl compiles none of the blocks, and a source gate reads the
+// text with every block dropped (tests/sycl_gate.py resolve_mutants), as production compiles it.
 
 #include <cstdint>
 
@@ -63,7 +63,9 @@ enum class scratch_test_mutant : int {
     RTM_LEFT_IN_TXN           = 28,  // RETURN_TO_MARK files the tail but leaves it in the transaction
     KEEP_WALKS_SET            = 29,  // KEEP clears the withdrawn flag of every chunk in the device's marked set
     OWNER_END_REMOVED         = 30,  // ggml_backend_sycl_free makes no owner-end call
-    COUNT                     = 31,
+    // The file-mapped tier.
+    REFUSAL_AFTER_COPY_FN     = 31,  // stream_dma tests a custom copy_fn before the FILE_MAPPED refusal
+    COUNT                     = 32,
 };
 
 #if defined(GGML_SYCL_SCRATCH_MUTANTS)

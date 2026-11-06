@@ -8168,6 +8168,22 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         lease-drop-no-index lease-a
             "after the lease dropped, expected [0-9]+: withdrawn chunk [0-9]+ waits for a begin")
 
+    # The file-mapped tier's device REDs (docs/design/sycl-mmap-host-tier.md §5.3, §7 C4), registered through the
+    # same helper: one executable each against the private fixtures, the B50 alone, no model. The meminfo control
+    # runs first: it writes its outcome beside the binaries, and each of the other five reads it in its driver and
+    # exits 77 with one VOID line when the control has not run or failed (tests/file-mapped-test-common.hpp). DEPENDS
+    # orders a sweep that selects them all; it does not make a run of one of them pull the control in.
+    ggml_sycl_scratch_return_test(test-sycl-pinned-meminfo-control TIMEOUT 300)
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-stream-refusal TIMEOUT 120 MUTANTS
+        refusal-after-copy-fn with-copy-fn
+            "FAIL \\[with-copy-fn\\] stream_dma over a FILE_MAPPED view with a copy_fn was not refused")
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-bounce TIMEOUT 120)
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-expert-owner TIMEOUT 120)
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-resolve-abort TIMEOUT 120)
+    set_tests_properties(test-sycl-file-mapped-stream-refusal test-sycl-file-mapped-bounce
+        test-sycl-file-mapped-expert-owner test-sycl-file-mapped-resolve-abort
+        PROPERTIES DEPENDS test-sycl-pinned-meminfo-control)
+
     # The host-only plan dry run's lead-run arms (th32 §4.2, §11 T11): a caller built against another struct
     # layout is refused, expected_host is the stage's host_planned_bytes, every term is printed by name from the
     # plan, a dry run stores no budget, and the --mem-available option is the sample's MemAvailable. The planner

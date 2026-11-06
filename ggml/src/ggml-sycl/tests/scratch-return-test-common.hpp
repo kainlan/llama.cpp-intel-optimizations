@@ -91,6 +91,7 @@ inline const std::vector<mutant_name> & mutant_names() {
         { "rtm-left-in-txn",           scratch_test_mutant::RTM_LEFT_IN_TXN           },
         { "keep-walks-set",            scratch_test_mutant::KEEP_WALKS_SET            },
         { "owner-end-removed",         scratch_test_mutant::OWNER_END_REMOVED         },
+        { "refusal-after-copy-fn",     scratch_test_mutant::REFUSAL_AFTER_COPY_FN     },
     };
     return names;
 }
