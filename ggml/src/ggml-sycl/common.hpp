@@ -5351,14 +5351,23 @@ inline bool ggml_sycl_bf16_weight_dispatch_available(const ggml_tensor * tensor,
            tensor->name[0] != '\0' && ggml_is_contiguous(tensor);
 }
 
+// A file mapping is never a pointer a device or a kernel ABI may be handed: a mapped page is not USM, and a
+// host-tier weight runs on the CPU (docs/design/sycl-mmap-host-tier.md §5.3, P3). Reaching it here is a routing
+// defect, not a fallback, so it aborts naming the tensor instead of returning the mapped page.
 inline void * ggml_sycl_resolve_or_host_tensor_ptr(const ggml_tensor * tensor, int device) {
     void * resolved = ggml_sycl_resolve_tensor_ptr(tensor, device);
+    if (resolved != nullptr && ggml_sycl::alloc_registry::instance().is_file_mapped(resolved)) {
+        GGML_ABORT("[FILE-MAPPED] resolve_or_host on mapped weight %s", tensor->name);
+    }
     if (resolved != nullptr) {
         return resolved;
     }
     void * raw = const_cast<void *>(ggml_sycl_host_data(tensor));
     if (raw == nullptr) {
         return nullptr;
+    }
+    if (ggml_sycl::alloc_registry::instance().is_file_mapped(raw)) {
+        GGML_ABORT("[FILE-MAPPED] resolve_or_host on mapped weight %s", tensor->name);
     }
 
     const auto * info = ggml_sycl::alloc_registry::instance().lookup(raw);

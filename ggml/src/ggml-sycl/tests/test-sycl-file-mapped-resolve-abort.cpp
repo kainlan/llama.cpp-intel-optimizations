@@ -8,9 +8,9 @@
 //
 // A death test: its one case, "abort", runs in its own child. The child maps a fixture file through the FILE_MAPPED
 // front door on device 0's cache, points a named tensor's data at the mapping, as a SYCL_Mapped weight's is, and calls
-// ggml_sycl_resolve_or_host_tensor_ptr. A mapped page is no pointer a device may be handed, so the call must abort.
-// The driver scores the child on rc 134 (SIGABRT) plus the tensor's name in its output. A child that returns from the
-// call prints what it got and exits 1.
+// ggml_sycl_resolve_or_host_tensor_ptr. A mapped page is no pointer a device may be handed, so the call must abort. The
+// driver scores the child on rc 134 (SIGABRT) plus the abort's printed text, which names the tensor. A child that
+// returns from the call prints what it got and exits 1.
 
 #include "../common.hpp"
 #include "file-mapped-test-common.hpp"
@@ -23,6 +23,10 @@ using scratch_return_test::checks;
 namespace {
 
 constexpr const char * k_tensor_name = "blk.0.file_mapped_resolve_abort.weight";
+// The text the abort prints. GGML_ABORT is consumed by the preprocessor and never reaches a log, so the printed
+// message is what is scored.
+constexpr const char * k_abort_text =
+    "[FILE-MAPPED] resolve_or_host on mapped weight blk.0.file_mapped_resolve_abort.weight";
 
 int run_abort(checks & c) {
     if (!file_mapped_test::entry_ok(c)) {
@@ -78,16 +82,16 @@ int run_case(const scratch_return_test::child_args & a) {
     return 2;
 }
 
-// The child's SIGABRT is the pass, and only with the tensor's name in its output; a VOID stays a VOID.
+// The child's SIGABRT is the pass, and only with the abort's text in its output; a VOID stays a VOID.
 struct abort_runner : scratch_return_test::case_runner {
     scratch_return_test::case_verdict score(const char *                                name,
                                             const host_ledger_test_harness::child_run & r) const override {
         if (WIFSIGNALED(r.status) && WTERMSIG(r.status) == SIGABRT) {
-            if (r.err.find(k_tensor_name) == std::string::npos) {
-                fprintf(stderr, "FAIL [%s] rc 134, but the abort does not name the tensor %s\n", name, k_tensor_name);
+            if (r.err.find(k_abort_text) == std::string::npos) {
+                fprintf(stderr, "FAIL [%s] rc 134, but the abort does not print \"%s\"\n", name, k_abort_text);
                 return scratch_return_test::case_verdict::FAIL;
             }
-            fprintf(stderr, "PASS [%s] rc 134 naming %s\n", name, k_tensor_name);
+            fprintf(stderr, "PASS [%s] rc 134 printing \"%s\"\n", name, k_abort_text);
             return scratch_return_test::case_verdict::PASS;
         }
         if (!WIFSIGNALED(r.status) && WEXITSTATUS(r.status) == 0) {
