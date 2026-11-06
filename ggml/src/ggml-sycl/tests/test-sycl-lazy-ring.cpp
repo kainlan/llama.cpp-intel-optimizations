@@ -747,9 +747,10 @@ void wider_ring_intact(arm_result & r, const wider_fixture & f) {
            "the largest ring write ends at " + num(end) + ", want within the ring's " + num(now.ring_bytes) + " B");
 }
 
-// The wider-model RED, its HOST arm (lead ruling 2026-09-30; §3.3): the second model's 64 MiB table of 16384 B reads
-// fits HOST at a reading of step 2 + its body + 29 GiB + 1 GiB. The planner prints the decline line for it before the
-// HOST test, the table then takes the HOST test at its position and plans HOST, and the plan charges no ring.
+// The wider-model RED, its HOST arm (§4.3 step 4: a table the live ring declines takes the HOST test at its position):
+// the second model's 64 MiB table of 16384 B reads fits HOST at a reading of step 2 + its body + 29 GiB + 1 GiB. The
+// planner prints the decline line for it before the HOST test, the table then takes the HOST test at its position and
+// plans HOST, and the plan charges no ring.
 // Engagement: the pin holds a lease on a live 512 KiB ring.
 // Mutant: none of its own; a planner that prints no decline fails it.
 arm_result arm_wider_host() {
@@ -806,10 +807,11 @@ arm_result arm_wider_refused() {
     return settle(r);
 }
 
-// The wider-model RED, its P3 arm (r37 m-2): the 64 MiB table's HOST fit holds but P3 does not, at a reading of
-// step 2 + its body + 29 GiB - 1 GiB, so after the decline line the plan refuses as lazy-table-ring-too-narrow and
-// plans no HOST. A planner that ignores the live ring declines nothing and admits the table STORAGE, and with no P3
-// room for its floor and the ring's charge the plan refuses as lazy-table-cache-below-floor instead.
+// The wider-model RED, its P3 arm (§4.3 step 4: ring eligibility is an input, and the HOST test a declined table takes
+// includes P3): the 64 MiB table's HOST fit holds but P3 does not, at a reading of step 2 + its body + 29 GiB - 1 GiB,
+// so after the decline line the plan refuses as lazy-table-ring-too-narrow and plans no HOST. A planner that ignores
+// the live ring declines nothing and admits the table STORAGE, and with no P3 room for its floor and the ring's charge
+// the plan refuses as lazy-table-cache-below-floor instead.
 // Engagement: the pin holds a lease on a live 512 KiB ring.
 // Mutant: ignore-live-ring-p3, the ignore-live-ring selector run against this arm.
 arm_result arm_wider_p3() {
@@ -837,10 +839,11 @@ arm_result arm_wider_p3() {
 
 // --- the stage arms ---
 
-// The staging-pass RED (r37 I-2): the early and the late stage of one load on the ~1 TiB table plan it STORAGE on both
-// passes, and every device's line of each pass charges the ring row's charged bytes, the need's mapped size, since no
-// ring is live: the early pass's take built a ring-less pool, which the early candidate's lease keeps for the late
-// pass. The ensure with the late charge allocates one ring of the need, and the load's abort and a reap give it back.
+// The staging-pass RED (§3.3: coverage is a live ring, not a pool a lease holds): the early and the late stage of one
+// load on the ~1 TiB table plan it STORAGE on both passes, and every device's line of each pass charges the ring row's
+// charged bytes, the need's mapped size, since no ring is live: the early pass's take built a ring-less pool, which the
+// early candidate's lease keeps for the late pass. The ensure with the late charge allocates one ring of the need, and
+// the load's abort and a reap give it back.
 // Engagement: both stages return OK.
 // Mutant: lease-presence-as-coverage, which reads a pool holding a lease as covered and charges 0 on the late pass.
 arm_result arm_staging_pass() {
@@ -885,10 +888,11 @@ arm_result arm_staging_pass() {
     return settle(r, role0);
 }
 
-// The lease RED (r36 I-2, m-3): model A is loaded and its ensure makes the ring; a read is held in flight on it and A
-// is unloaded, so the read's lease alone holds the pool; model B then plans as covered (ring= 0 on both passes) and
-// loads. Once the read is released B's ensure with a charge of 0 finds the live ring, and the ledger shows exactly one
-// ring: the need's bytes under LAZY_STAGING from one allocation. B's unload and a reap give them back.
+// The lease RED (§3.3: a read's lease keeps the pool and its ring past its model's unload): model A is loaded and its
+// ensure makes the ring; a read is held in flight on it and A is unloaded, so the read's lease alone holds the pool;
+// model B then plans as covered (ring= 0 on both passes) and loads. Once the read is released B's ensure with a charge
+// of 0 finds the live ring, and the ledger shows exactly one ring: the need's bytes under LAZY_STAGING from one
+// allocation. B's unload and a reap give them back.
 // Engagement: A loads, the read is held on a worker, and B loads.
 // Mutant: no-candidate-lease, under which a staged plan carries no lease, so no pool survives A's stages and A's ensure
 // finds none.
@@ -965,12 +969,13 @@ void window_hold(void * ctx) {
     h->leases_after             = s.live_leases;
 }
 
-// The window arm (r39 I-1; the correct world of §3.3): model A is loaded, ensured and unloaded with a read held in
-// flight, and the plan-point hook inside B's early pass releases the read and waits for its drop. The stage's lease,
-// taken at its entry, holds the pool through that drop, so B's plan, made while A's ring was live, charges ring= 0, and
-// B's ensure with that charge finds the same ring: one ring of the need from one allocation, in the pool A made. The
-// hook is one-shot, so it holds the first device's plan, whose line is the pass's first; the plan's own figures are
-// scored before the stage's return code, which the second device's plan, made after the drop, decides.
+// The window arm (§3.3: a ring live when the stage plans stays live to its ensure): model A is loaded, ensured and
+// unloaded with a read held in flight, and the plan-point hook inside B's early pass releases the read and waits for
+// its drop. The stage's lease, taken at its entry, holds the pool through that drop, so B's plan, made while A's ring
+// was live, charges ring= 0, and B's ensure with that charge finds the same ring: one ring of the need from one
+// allocation, in the pool A made. The hook is one-shot, so it holds the first device's plan, whose line is the pass's
+// first; the plan's own figures are scored before the stage's return code, which the second device's plan, made after
+// the drop, decides.
 // Engagement, VOID counting as failed: the hook ran and observed the read's drop while it held B's planner.
 // Mutant: lease-at-stage, under which the stage drops its lease once planned and takes the plan's past the plan point,
 // so the drop empties the pool, the stage builds a new empty one, and the ensure of B's 0 charge allocates a ring the
@@ -1042,9 +1047,10 @@ arm_result arm_window() {
     return settle(r, role0);
 }
 
-// The no-STORAGE arm (r38 m-2): the q2k inventory with no lazy table, staged early and then late and loaded, takes no
-// lease and leaves the registry's generation where it was, with no pool; and a swap from a lazy model, whose unload
-// left its pool parked, to that inventory leaves none: the stage's entry reap frees it.
+// The no-STORAGE arm (§3.3: an inventory with no lazy-table candidate takes no provisional lease): the q2k inventory
+// with no lazy table, staged early and then late and loaded, takes no lease and leaves the registry's generation where
+// it was, with no pool; and a swap from a lazy model, whose unload left its pool parked, to that inventory leaves none:
+// the stage's entry reap frees it.
 // Engagement: the dense stages return OK, and the lazy model's unload leaves its pool parked.
 // Mutant: take-without-candidate, under which the coverage scope takes a lease for an inventory with no lazy table.
 arm_result arm_no_storage() {
@@ -1106,9 +1112,10 @@ arm_result arm_no_storage() {
     return settle(r);
 }
 
-// The all-HOST arm (r40 M-2 (c), M-3): a 64 MiB table this host's reading holds HOST. Each stage takes the
-// provisional lease (the registry's generation moves by exactly 1), records none, and returns with no pool, no parked
-// node and the ring's LAZY_STAGING bytes unchanged: the scope's closing reap runs after its lease's drop.
+// The all-HOST arm (§3.3: when no candidate ends STORAGE, the provisional lease's drop is the only one): a 64 MiB table
+// this host's reading holds HOST. Each stage takes the provisional lease (the registry's generation moves by exactly
+// 1), records none, and returns with no pool, no parked node and the ring's LAZY_STAGING bytes unchanged: the scope's
+// closing reap runs after its lease's drop.
 // Engagement: both stages return OK and place the table HOST; a reading too low for P3 is VOID.
 // Mutant: lease-before-guard, under which the scope's lease is declared before its reap guard, so the pool parks after
 // the closing reap and survives the call.
@@ -1156,9 +1163,9 @@ arm_result arm_all_host() {
     return settle(r, role0);
 }
 
-// The two-device arm (M-2 (a)): on both cards, the early and the late stage, the load's end, the ensure with the late
-// charge and the unload; after a FULL reap the pool's count is zero and the ring's LAZY_STAGING bytes are back at the
-// pre-ensure figure.
+// The two-device arm (§3.3: each record releases exactly its own reference, and a replacement hands the displaced lease
+// back): on both cards, the early and the late stage, the load's end, the ensure with the late charge and the unload;
+// after a FULL reap the pool's count is zero and the ring's LAZY_STAGING bytes are back at the pre-ensure figure.
 // Engagement: the model loads and its ensure makes the ring.
 // Mutant: replace-keeps-displaced, under which the late candidate's replacement keeps the early candidate's lease, so
 // the pool and its ring outlive the unload.
@@ -1186,9 +1193,10 @@ arm_result arm_two_device() {
     return settle(r, role0);
 }
 
-// The partial-failure arm (M-2 (b)): the PRIVATE_TESTING hooks fail the stage after the first device. A failed early
-// stage takes its lease (the generation moves by 1) and returns with no lease and no parked node; so does a failed late
-// stage after an early one that succeeded, whose candidate the rollback drops too.
+// The partial-failure arm (§3.3: a throw after the first device leaves the staged candidate's reference to the
+// rollback): the PRIVATE_TESTING hooks fail the stage after the first device. A failed early stage takes its lease (the
+// generation moves by 1) and returns with no lease and no parked node; so does a failed late stage after an early one
+// that succeeded, whose candidate the rollback drops too.
 // Engagement: both hooks are exported, and each armed hook makes its stage return EFFECT_FAILED.
 // Mutant: rollback-keeps-clone, under which the rollback leaves the candidate's lease alive.
 arm_result arm_partial_failure() {
@@ -1248,13 +1256,13 @@ ggml_sycl_lifecycle_result dry_run(const ggml_sycl_tensor_inventory * inv) {
     return ggml_backend_sycl_plan_dry_run(inv, nullptr, &result);
 }
 
-// The dry-run arm (r44 M-2; r45 I-2, M-3): the dry run adopts the coverage wrapper, scored as T3's wrapper arm by the
-// take-time snapshot. A helper guard's pool is parked by the guard's own drop, whose FULL reap the hook holds after its
-// count lands and before it swaps the list out; the fixture reads c0, the FULL reaps run. The dry run's entry reap is
-// the one that frees the node, so its take snapshots c0 + 1 reaps run and no parked node, and its closing reap frees
-// its own pool before it returns, c0 + 2 in all. Then, with model A loaded, ensured and unloaded, so its pool and ring
-// are parked, the dry run's plan charges ring= the need's mapped size from a fresh pool, as the early stage of the
-// same inventory does.
+// The dry-run arm (§3.3: the dry run and the load plan by one rule, and no parked node outlives the dry run): the dry
+// run adopts the coverage wrapper, scored as §11 T3's wrapper arm by the take-time snapshot. A helper guard's pool is
+// parked by the guard's own drop, whose FULL reap the hook holds after its count lands and before it swaps the list
+// out; the fixture reads c0, the FULL reaps run. The dry run's entry reap is the one that frees the node, so its take
+// snapshots c0 + 1 reaps run and no parked node, and its closing reap frees its own pool before it returns, c0 + 2 in
+// all. Then, with model A loaded, ensured and unloaded, so its pool and ring are parked, the dry run's plan charges
+// ring= the need's mapped size from a fresh pool, as the early stage of the same inventory does.
 // Engagement: the guard holds a lease and its drop parks the pool held in the hook within the bound; the dry run
 // returns OK and installs one pool, so a dry run that takes no lease fails before the snapshot is read; A's unload
 // leaves its pool parked.
@@ -1343,10 +1351,11 @@ arm_result arm_dry_run() {
     return settle(r);
 }
 
-// The empty-slot arm (r40 M-5): the public compute_placement_plan_early and the legacy setter, with no load open, plan
-// on an empty slot: the ~1 TiB table cannot be HOST and has no pin, so each plan refuses as lazy-table-ring-unpinned,
-// and the unconditional coverage-read counter does not move. ggml_sycl_publish_test_plan is a static of ggml-sycl.cpp
-// with no export, so its staging is not reached from here.
+// The empty-slot arm (§3.3's channel: a plan made outside a stage carries a null pin): the public
+// compute_placement_plan_early and the legacy setter, with no load open, plan on an empty slot: the ~1 TiB table cannot
+// be HOST and has no pin, so each plan refuses as lazy-table-ring-unpinned, and the unconditional coverage-read counter
+// does not move. ggml_sycl_publish_test_plan is a static of ggml-sycl.cpp with no export, so its staging is not reached
+// from here.
 // Engagement (positive control): the stage run of the same inventory reads at least one coverage read.
 // Mutant: count-without-pin, under which a coverage read with no pin is counted.
 arm_result arm_empty_slot() {
@@ -1561,11 +1570,11 @@ bool strict_child_scored(arm_result & r, const strict_case_entry & c) {
     return true;
 }
 
-// The strict arm, its too-narrow case (r47 I-4; §10): run as a child under GGML_SYCL_STRICT_LEASES=1 before this
-// process initialises SYCL, the materialization of a STORAGE table whose plan's need is one block short of its span's
-// aborts at the ensure's refusal, after the ensure's one [HOST-PLAN-BUG] line naming 520192 and 524288 (exit 134,
-// SIGABRT); ensure itself never aborts. The same materialization in this process, not strict, returns
-// lazy-table-ring-too-narrow.
+// The strict arm, its too-narrow case (§10: a [HOST-PLAN-BUG] aborts under strict leases): run as a child under
+// GGML_SYCL_STRICT_LEASES=1 before this process initialises SYCL, the materialization of a STORAGE table whose plan's
+// need is one block short of its span's aborts at the ensure's refusal, after the ensure's one [HOST-PLAN-BUG] line
+// naming 520192 and 524288 (exit 134, SIGABRT); ensure itself never aborts. The same materialization in this process,
+// not strict, returns lazy-table-ring-too-narrow.
 // Engagement: the child ran within its bound on a filesystem that takes O_DIRECT.
 // Mutant: strict-abort-dropped, under which the materialization returns the refusal under strict leases too.
 arm_result arm_strict() {
