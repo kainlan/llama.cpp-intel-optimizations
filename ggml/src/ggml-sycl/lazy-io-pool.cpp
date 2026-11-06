@@ -116,8 +116,9 @@ uint64_t          g_lazy_parked_at_last_take    = 0;
 std::atomic<uint64_t> g_lazy_ring_coverage_reads{ 0 };
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The one-shot hold hook and the point it is armed at: the first FULL reap, the first take that builds a pool, the
-// first ensure that reserves `ensuring`, or the first planner caller to reach the plan point.
-enum class lazy_hold_point : uint8_t { REAP, TAKE, ENSURE, PLAN };
+// first ensure that reserves `ensuring`, the first planner caller to reach the plan point, or the first shutdown to
+// reach its wait for the picked reads.
+enum class lazy_hold_point : uint8_t { REAP, TAKE, ENSURE, PLAN, SHUTDOWN };
 
 lazy_hold_point g_lazy_hold_point = lazy_hold_point::REAP;
 lazy_hold_fn    g_lazy_hold       = nullptr;
@@ -460,6 +461,10 @@ void ggml_sycl_test_lazy_ensure_hold(lazy_hold_fn hold, void * ctx) {
 
 void ggml_sycl_test_lazy_plan_hold(lazy_hold_fn hold, void * ctx) {
     lazy_hold_arm(lazy_hold_point::PLAN, hold, ctx);
+}
+
+void ggml_sycl_test_lazy_shutdown_hold(lazy_hold_fn hold, void * ctx) {
+    lazy_hold_arm(lazy_hold_point::SHUTDOWN, hold, ctx);
 }
 
 void ggml_sycl_test_lazy_plan_point() {
@@ -1563,6 +1568,22 @@ void lazy_io_pool_shutdown() noexcept {
     if (!cancelled.empty()) {
         GGML_LOG_WARN("[LAZY-IO] shutdown cancelled %zu queued reads\n", cancelled.size());
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // The wait's two test points: the mutant returns without waiting, and the hold hook runs just before the wait with
+    // no lock held. The hook is claimed under the registry's lock alone: the engine's is never held while it is taken.
+    if (lazy_ring_mutant_is(lazy_ring_mutant::SHUTDOWN_NO_WAIT)) {
+        return;
+    }
+    lazy_hold_fn hold     = nullptr;
+    void *       hold_ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> registry_lock(g_lazy_registry_mutex);
+        hold = lazy_hold_claim_locked(lazy_hold_point::SHUTDOWN, &hold_ctx);
+    }
+    if (hold != nullptr) {
+        hold(hold_ctx);
+    }
+#endif
     std::unique_lock<std::mutex> lock(engine->mutex);
     engine->idle.wait(lock, [engine] { return engine->busy == 0; });
 }

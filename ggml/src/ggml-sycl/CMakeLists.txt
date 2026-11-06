@@ -481,12 +481,16 @@ if (BUILD_TESTING)
         string(CONCAT _le_re_no_alignment_check
             "FAIL a need that is not whole blocks per slot refuses before ensure reserves: the unaligned need "
             "returned ok with 1 allocation\\(s\\), want lazy-table-ring-mismatch and none")
+        string(CONCAT _le_re_shutdown_no_wait
+            "FAIL shutdown cancels queued reads and waits for picked ones: shutdown returned while the picked reads "
+            "were still held on their latch, want it to return only after they finish")
         set(_lazy_io_engine_mutants
             no-ensuring             "${_le_re_no_ensuring}"
             ensuring-kept-on-throw  "${_le_re_ensuring_kept_on_throw}"
             install-after-shut-down "${_le_re_install_after_shut_down}"
             no-span-check           "${_le_re_no_span_check}"
-            no-alignment-check      "${_le_re_no_alignment_check}")
+            no-alignment-check      "${_le_re_no_alignment_check}"
+            shutdown-no-wait        "${_le_re_shutdown_no_wait}")
         add_executable(test-sycl-lazy-io-engine-host
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
             lazy-io-pool.cpp

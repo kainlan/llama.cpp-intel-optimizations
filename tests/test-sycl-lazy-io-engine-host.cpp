@@ -86,6 +86,10 @@ void gate_hold(void * ctx) {
     static_cast<gate *>(ctx)->hold();
 }
 
+void gate_release(void * ctx) {
+    static_cast<gate *>(ctx)->release();
+}
+
 // Fails the read at block `*ctx` with EIO and serves every other block.
 long eio_source(void * ctx, int fd, uint8_t * dst, size_t length, uint64_t offset) {
     if (offset == *static_cast<const uint64_t *>(ctx)) {
@@ -453,7 +457,10 @@ arm_result arm_engine_worker_reap() {
 }
 
 // Shutdown's step (§3.3): with every worker holding a read, lazy_io_pool_shutdown delivers the queued read ECANCELED
-// and returns only after the picked reads have finished. Engagement: every worker holds a read when it starts.
+// and returns only after the picked reads have finished. The picked reads are held on a latch that only shutdown's hold
+// hook releases, and the hook runs once the queued read is cancelled, just before the wait, so a shutdown that returns
+// without waiting returns with the latch still held. Shutdown's return reads the latch and the deliveries; the arm has
+// no timer. Engagement: every worker holds a read when shutdown starts.
 arm_result arm_engine_shutdown() {
     arm_result r;
     ring_lease lease = lazy_io_pool_take();
@@ -470,32 +477,39 @@ arm_result arm_engine_shutdown() {
         (void) lazy_io_submit(1, -1, block_span(2 * i), key0(6, 1), picked.back()->waiter(0, 64));
     }
     if (!g.wait_holders(LAZY_BLOCK_RING_QD)) {
-        void_arm(r, "not every worker held a read within 5 s");
+        void_arm(r, "not every worker held a read within the hook bound");
         g.release();
     }
     request_fixture queued(6);
     (void) lazy_io_submit(1, -1, block_span(2 * LAZY_BLOCK_RING_QD), key0(6, 2), queued.waiter(0, 64));
+    ggml_sycl_test_lazy_shutdown_hold(gate_release, &g);
     std::atomic<bool> returned{ false };
+    bool              released_at_return  = false;
+    size_t            delivered_at_return = 0;
     std::thread       stopper([&] {
         lazy_io_pool_shutdown();
+        released_at_return = g.is_released();
+        for (const auto & f : picked) {
+            delivered_at_return += f->ticket.outstanding.load() == 0 && f->ticket.read_error.load() == 0;
+        }
         returned = true;
     });
-    const bool        cancelled = wait_for([&] { return queued.ticket.outstanding.load() == 0; });
+    const bool        bounded = wait_for([&] { return returned.load(); });
+    // Frees the picked reads that a shutdown returning without waiting, or one that never reached its hook, left held.
+    g.release();
+    stopper.join();
+    ggml_sycl_test_lazy_shutdown_hold(nullptr, nullptr);
+    expect(r, bounded, "shutdown had not returned within the hook bound, want its hook to free the picked reads");
+    const bool cancelled = queued.ticket.outstanding.load() == 0;
     expect(r, cancelled && queued.ticket.read_error.load() == ECANCELED,
            "the queued read was delivered " + std::string(cancelled ? "with read_error " : "not at all, read_error ") +
                num(static_cast<uint64_t>(queued.ticket.read_error.load())) + ", want " + num(ECANCELED));
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    expect(r, !returned.load(), "shutdown returned while every worker still held its read");
-    g.release();
-    stopper.join();
-    size_t delivered = 0;
-    for (const auto & f : picked) {
-        delivered += f->ticket.outstanding.load() == 0 && f->ticket.read_error.load() == 0;
-    }
-    expect(r, delivered == LAZY_BLOCK_RING_QD,
-           num(delivered) + " of the " + num(LAZY_BLOCK_RING_QD) +
-               " picked reads were delivered when shutdown "
-               "returned, want all");
+    expect(r, released_at_return,
+           "shutdown returned while the picked reads were still held on their latch, want it to return only after "
+           "they finish");
+    expect(r, delivered_at_return == LAZY_BLOCK_RING_QD,
+           num(delivered_at_return) + " of the " + num(LAZY_BLOCK_RING_QD) +
+               " picked reads were delivered when shutdown returned, want all");
     ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
     expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
     return r;
@@ -588,6 +602,7 @@ lazy_ring_mutant mutant_named(const char * text) {
         { "install-after-shut-down", lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN },
         { "no-span-check",           lazy_ring_mutant::NO_SPAN_CHECK           },
         { "no-alignment-check",      lazy_ring_mutant::NO_ALIGNMENT_CHECK      },
+        { "shutdown-no-wait",        lazy_ring_mutant::SHUTDOWN_NO_WAIT        },
     };
     for (const entry & e : table) {
         if (std::strcmp(e.text, text) == 0) {

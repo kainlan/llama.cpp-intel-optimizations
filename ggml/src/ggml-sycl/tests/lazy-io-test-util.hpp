@@ -57,6 +57,11 @@ struct gate {
         released = true;
         cv.notify_all();
     }
+
+    bool is_released() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return released;
+    }
 };
 
 // The fixture file's byte at `offset`: what every read source below writes, so a landing copy is checked by value.

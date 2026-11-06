@@ -491,7 +491,7 @@ struct lazy_registry_state {
 // Copies the registry's state into *out. Returns false, writing nothing, for a null pointer.
 bool ggml_sycl_lazy_registry_for_testing(lazy_registry_state * out);
 
-// The registry's one-shot hold hook, armed at one of four points; arming any point replaces whatever was armed, and
+// The registry's one-shot hold hook, armed at one of five points; arming any point replaces whatever was armed, and
 // arming with a null callback disarms. The callback runs once, with no registry or IO-engine lock held (the plan
 // point's caller holds its inventory guard), and blocks for as long as the fixture wants its caller held.
 using lazy_hold_fn = void (*)(void * ctx);
@@ -513,6 +513,11 @@ void ggml_sycl_test_lazy_ensure_hold(lazy_hold_fn hold, void * ctx);
 // registry or IO-engine lock held, so a fixture can drop a lease inside that window (§3.3, the window arm). The planner
 // caller reaches the point through ggml_sycl_test_lazy_plan_point().
 void ggml_sycl_test_lazy_plan_hold(lazy_hold_fn hold, void * ctx);
+
+// Arms the hook in lazy_io_pool_shutdown: the first shutdown that reaches its wait for the picked reads after the
+// arming calls it once the queued reads are cancelled and before that wait, with no registry or IO-engine lock held, so
+// a fixture can hold the picked reads until shutdown is about to wait for them (§3.3).
+void ggml_sycl_test_lazy_shutdown_hold(lazy_hold_fn hold, void * ctx);
 
 // The plan point: claims the hook if it is armed there and calls it with no registry or IO-engine lock held; its one
 // caller, compute_and_store_plan_for_inventory, holds the inventory guard.
@@ -552,6 +557,7 @@ enum class lazy_ring_mutant : uint8_t {
     STRICT_ABORT_DROPPED,            // the STORAGE materialization does not abort on a ring refusal under strict leases
     NO_ALIGNMENT_CHECK,              // ensure accepts a need that is not whole 4 KiB blocks per slot
     DECLINE_EVERY_PLAN,              // the planner prints a table's STORAGE decline on every plan of its load
+    SHUTDOWN_NO_WAIT,                // shutdown returns without waiting for the reads the workers picked
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);
