@@ -935,7 +935,18 @@ void * host_staging_slots::admit(int                            device,
     }
     host_staging_block & slot = slots_[device][kind];
     (void) alloc;  // a slot grows only in apply, under the committed plan; only the positive controls allocate here
-    if (!planned(device)) {
+    if (planned(device)) {
+        if (bytes <= slot.cap) {
+            return slot.ptr;
+        }
+#if defined(HOST_ZONE_PLAN_MUTANT_DISPATCH_GROW)
+        // Positive control: the dispatch-time grow restored, which allocates for an over-plan request instead of
+        // refusing.
+        if (slot_replace(slot, device, kind, host_staging_slot_bytes(bytes), alloc)) {
+            return slot.ptr;
+        }
+#endif
+    } else {
 #if defined(HOST_ZONE_PLAN_MUTANT_UNPLANNED_GROWS)
         // Positive control: the transitional fallback restored, which grows an unplanned device's slot at dispatch.
         if (bytes > slot.cap && !slot_replace(slot, device, kind, host_staging_slot_bytes(bytes), alloc)) {
@@ -944,30 +955,14 @@ void * host_staging_slots::admit(int                            device,
         return slot.ptr;
 #endif
         // No host holder plan is committed for this device, so nothing sized its slots: each has capacity 0 and
-        // refuses by name and counts, as a planned slot's over-plan request does (§4.4 "At dispatch no slot grows"),
+        // takes the refusal below, as a planned slot's over-plan request does (§4.4 "At dispatch no slot grows"),
         // whatever a dropped plan left in it until the device is re-applied.
-        GGML_LOG_WARN(
-            "[ATTN-HOST] staging request %zu B for kind %s exceeds the planned %zu B on device %d; declining host "
-            "dispatch\n",
-            bytes, host_staging_kind_name(kind), (size_t) 0, device);
-        if (counters) {
-            counters->refusal(device);
-        }
-        return nullptr;
     }
-    if (bytes <= slot.cap) {
-        return slot.ptr;
-    }
-#if defined(HOST_ZONE_PLAN_MUTANT_DISPATCH_GROW)
-    // Positive control: the dispatch-time grow restored, which allocates for an over-plan request instead of refusing.
-    if (slot_replace(slot, device, kind, host_staging_slot_bytes(bytes), alloc)) {
-        return slot.ptr;
-    }
-#endif
+    // The one refusal: by name and counted, quoting capacity 0 for an unplanned device's slot.
     GGML_LOG_WARN(
         "[ATTN-HOST] staging request %zu B for kind %s exceeds the planned %zu B on device %d; declining host "
         "dispatch\n",
-        bytes, host_staging_kind_name(kind), slot.cap, device);
+        bytes, host_staging_kind_name(kind), planned(device) ? slot.cap : 0, device);
     if (counters) {
         counters->refusal(device);
     }

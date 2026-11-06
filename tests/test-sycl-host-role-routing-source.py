@@ -2119,10 +2119,11 @@ _PLANTED_SITE = (CD, None, "\nstatic void routing_gate_planted_site(ggml_sycl::a
                            "    out                                     = req;\n"
                            "}\n")
 _PBP_DEVICE = "    req_act.intent.lifetime                     = alloc_lifetime::DEVICE;\n"
-_PLANNED_FIT = "    if (bytes <= slot.cap) {\n        return slot.ptr;\n    }\n"
+# The planned branch's fit test: the planned and unplanned branches of admit share one refusal after them.
+_PLANNED_FIT = "        if (bytes <= slot.cap) {\n            return slot.ptr;\n        }\n"
 _PLANNED_GROW = (PLAN, _PLANNED_FIT,
-                 _PLANNED_FIT + "    if (slot_replace(slot, device, kind, host_staging_slot_bytes(bytes), alloc)) {\n"
-                                "        return slot.ptr;\n    }\n")
+                 _PLANNED_FIT + "        if (slot_replace(slot, device, kind, host_staging_slot_bytes(bytes), "
+                                "alloc)) {\n            return slot.ptr;\n        }\n")
 _IDLE = "    if (idle_slots && ggml_sycl_attn_host_staging_enabled(kind)) {\n"
 _INIT_SCAN = "        ggml_sycl::host_pool_scan(cgraph, ggml_sycl::host_pool_has_storage, nullptr);\n"
 _FOLD_FOUR = "{ plan.max_tensor_bytes, k_scratch_headroom, moe_host_scratch }"
