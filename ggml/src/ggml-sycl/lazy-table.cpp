@@ -510,10 +510,10 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
     }
 
     if (residency == lazy_residency::STORAGE) {
-        // The pool's block ring (§3.3), which every STORAGE table reads through: ensured with the plan's need and charge
-        // and the table's own read span, on the device whose cache holds the ring's row. The ensure's own line carries
-        // the figures; this refusal names the table. Ensure never aborts, so under GGML_SYCL_STRICT_LEASES=1 a plan bug
-        // aborts here, after both lines (§10).
+        // The pool's block ring (§3.3), which every STORAGE table reads through: ensured with the plan's need and
+        // charge and the table's own read span, on the device whose cache holds the ring's row. The ensure's own line
+        // carries the figures; this refusal names the table. Ensure never aborts, so under GGML_SYCL_STRICT_LEASES=1 a
+        // plan bug aborts here, after both lines (§10).
         const size_t                  span = lazy_block_ring_span(desc.row_size);
         const lazy_ring_ensure_status ring = block_ring_ensure(desc.block_ring_need, span, record_device(desc),
                                                                desc.block_ring_charge, desc.model.load_txn_id);

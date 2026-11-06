@@ -2403,9 +2403,9 @@ void                                           lifecycle_stage_probe_placement_p
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_plan(uint64_t load_txn_id) noexcept;
 void                                           lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept;
 
-// Stages the load's candidate (th32 §3.3). `lease` is the candidate's reference on the IO pool, given only when the plan
-// has a STORAGE table; the record holds it, never the snapshot. The lease of the candidate this replaces is moved to
-// *displaced_out for the caller to drop after its own locks, or dropped here after the unlock when that is null.
+// Stages the load's candidate (th32 §3.3). `lease` is the candidate's reference on the IO pool, given only when the
+// plan has a STORAGE table; the record holds it, never the snapshot. The lease of the candidate this replaces is moved
+// to *displaced_out for the caller to drop after its own locks, or dropped here after the unlock when that is null.
 void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
                                     placement_plan            plan,
                                     const placement_kv_info & kv_info       = {},

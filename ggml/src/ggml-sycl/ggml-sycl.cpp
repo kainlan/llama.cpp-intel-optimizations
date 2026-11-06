@@ -18181,8 +18181,8 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
 #else
     constexpr bool candidate_lease_dropped = false;
 #endif
-    // The stage's assert (th32 §3.3): the planner places a table STORAGE only through a coverage pin, and the pin is the
-    // slot's lease, so a plan staged without a lease carries no STORAGE table.
+    // The stage's assert (th32 §3.3): the planner places a table STORAGE only through a coverage pin, and the pin is
+    // the slot's lease, so a plan staged without a lease carries no STORAGE table.
     GGML_ASSERT(!storage || g_sycl_lazy_plan_slot != nullptr);
     if (storage && !candidate_lease_dropped) {
         candidate_lease = g_sycl_lazy_plan_slot->clone();

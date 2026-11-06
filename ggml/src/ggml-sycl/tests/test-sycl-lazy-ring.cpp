@@ -10,10 +10,10 @@
 //
 // LEAD-RUN. The stage initialises the SYCL backends, constructs their caches and plans through them, so the binary is
 // registered gpu-serial, serial, with the selector pinned to both discrete cards (level_zero:0,1). It runs iff the
-// planner caller takes its multi-device path, by the caller's own predicate, ggml_backend_sycl_moe_multi_gpu_requested(),
-// and exits 77 otherwise. No libllama: the fixture builds each inventory and drives the load transaction itself, the
-// engine's reads come from the PRIVATE_TESTING read source, and the strict arm's child materializes a table from a file
-// the fixture writes in the working directory.
+// planner caller takes its multi-device path, by the caller's own predicate,
+// ggml_backend_sycl_moe_multi_gpu_requested(), and exits 77 otherwise. No libllama: the fixture builds each inventory
+// and drives the load transaction itself, the engine's reads come from the PRIVATE_TESTING read source, and the strict
+// arm's child materializes a table from a file the fixture writes in the working directory.
 //
 // --mutant <name> selects one runtime mutant of the PRIVATE_TESTING selector (§11) and runs only the arm that kills it;
 // each --mutant registration passes only when that arm prints its FAIL line. Every arm names its engagement check and
@@ -177,7 +177,8 @@ template <typename F> F proc(const char * proc_name) {
 }
 
 // The live bytes of role LAZY_STAGING on device 0, the ring's device in every ensure here. The reader is VOID for a
-// device with no cache (§3.1), which main creates before any arm; an unreadable reading VOIDs the arm, never reads as 0.
+// device with no cache (§3.1), which main creates before any arm. An unreadable reading VOIDs the arm and never reads
+// as 0.
 uint64_t role_bytes(arm_result & r) {
     uint64_t v = 0;
     if (!unified_cache_role_bytes_for_testing(0, alloc_role::LAZY_STAGING, &v)) {
@@ -777,9 +778,9 @@ arm_result arm_wider_refused() {
     return settle(r);
 }
 
-// The wider-model RED, its P3 arm (r37 m-2): the 64 MiB table's HOST fit holds but P3 does not, at a reading of step 2 +
-// its body + 29 GiB - 1 GiB, so after the decline line the plan refuses as lazy-table-ring-too-narrow and plans no
-// HOST. A planner that sizes the term from the table alone, ignoring the live ring, plans it STORAGE.
+// The wider-model RED, its P3 arm (r37 m-2): the 64 MiB table's HOST fit holds but P3 does not, at a reading of
+// step 2 + its body + 29 GiB - 1 GiB, so after the decline line the plan refuses as lazy-table-ring-too-narrow and
+// plans no HOST. A planner that sizes the term from the table alone, ignoring the live ring, plans it STORAGE.
 // Engagement: the pin holds a lease on a live 512 KiB ring.
 // Mutant: none of its own.
 arm_result arm_wider_p3() {

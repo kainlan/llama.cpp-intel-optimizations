@@ -33905,10 +33905,11 @@ static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_la
 // exceeds the live slot (live / QD) is not STORAGE-eligible, prints one decline line naming the load, the table and
 // both spans, and takes the HOST test at its position. After the pass the block ring is sized over the STORAGE tables
 // and charged unless the live ring holds it; the floors and the ring must fit both the budget and P3, or the plan
-// refuses as lazy-table-cache-below-floor. The live ring is read through the pin by lazy_ring_coverage_read, which
-// counts each read (§10): one per table for eligibility, one for the need and one for the charge. What both leave above that is the STORAGE caches' yieldable share (§6.4), split in
-// proportion to table_bytes x rows_per_token. A cold expert class refuses as cold-set-not-implemented. A refused plan
-// carries no table and no ring, and host_planned_bytes is then the zone total.
+// refuses as lazy-table-cache-below-floor. What both leave above that is the STORAGE caches' yieldable share (§6.4),
+// split in proportion to table_bytes x rows_per_token. The live ring is read through the pin by
+// lazy_ring_coverage_read, which counts each read (§10): one per table for eligibility, one for the need and one for
+// the charge. A cold expert class refuses as cold-set-not-implemented. A refused plan carries no table and no ring, and
+// host_planned_bytes is then the zone total.
 static void placement_plan_decide_lazy_residency(placement_plan &          plan,
                                                  const placement_kv_info & kv_info,
                                                  const ring_lease *        coverage_pin) {
