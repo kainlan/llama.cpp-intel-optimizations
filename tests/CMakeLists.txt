@@ -2047,6 +2047,21 @@ if (NOT WIN32)
         TIMEOUT 180
     )
 
+    # th32 §11 T5: no unit a standalone cache test target compiles names a GGML_SYCL_PRIVATE_TESTING-only symbol of
+    # the lazy IO pool. Those targets compile unified-cache.cpp from source but take the pool from the ordinary library,
+    # so such a reference is an undefined symbol at link time, which a syntax-only check cannot see. The pin derives the
+    # targets from ggml/src/ggml-sycl/CMakeLists.txt and the symbols from lazy-io-pool.hpp, and plants its controls.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-lazy-ring-mutant-selector-closure-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lazy-ring-mutant-selector-closure-source.py
+    )
+    set_tests_properties(test-sycl-lazy-ring-mutant-selector-closure-source PROPERTIES
+        LABELS "sycl;host;python;source-contract"
+        TIMEOUT 120
+    )
+
     # Gate 27 (llama.cpp-zhcn): the holder census, producer half.  A cache that only
     # compares a source holds a mem_handle_identity, never a mem_handle (§B.2); the
     # gate pins the producer fixes and proves itself on mutants of the real source.
