@@ -6,7 +6,7 @@
 // Copyright (C) 2024-2026 Intel Corporation
 // SPDX-License-Identifier: MIT
 //
-// Two cases, each in its own child: expert drives register_host_expert, weight drives register_host_weight. Each case
+// Cases, each in its own child: expert drives register_host_expert, weight drives register_host_weight. Each of those
 // registers two pointers on device 0's cache under a planned-materialization token, as a model load does:
 //   - control: a slice of a FILE_MAPPED reservation with its owner, the registration a SYCL_Mapped weight makes. It
 //     must be accepted, and the cache must show its entry, so a refusal of everything and a cache the lookups cannot
@@ -14,7 +14,13 @@
 //   - subject: a malloc'ed block, which neither registry knows (query_location answers UNREGISTERED), with no owner.
 //     It must be refused: the call returns false, hands out no lease and leaves no entry. Today it is accepted as a
 //     HOST_MMAP entry that owns nothing (non_owning_external_host), which is what C6 retires.
-// A block the registry turned out to know, or a control the cache refused, makes the case VOID, not a pass.
+// A block the registry turned out to know, or a control the cache refused, makes the case VOID, not a pass. The refusal
+// also counts: the process-wide refusal counter moves by one for the subject and by none for the control.
+//
+// A third case, interior, is the production shape of the same hazard. A host expert is registered over a slice inside
+// a pinned allocation (a SYCL_Host buffer's expert), and query_location answers UNREGISTERED for such a slice because
+// the runtime registry is exact-base. The slice must still be accepted, as a HOST_PINNED entry, by both calls and with
+// the refusal counter unmoved: a refusal keyed on query_location alone would fire on a real load.
 
 #include "file-mapped-test-common.hpp"
 
@@ -128,6 +134,11 @@ int run_register(checks & c, bool expert) {
         return c.status();
     }
 
+    if (unified_cache_unregistered_host_registration_refusals() != 0) {
+        c.fail("the control, a FILE_MAPPED slice with its owner, moved the refusal counter to " +
+               std::to_string(unified_cache_unregistered_host_registration_refusals()) + ", expected 0");
+    }
+
     // The subject: a block neither registry knows.
     host_block block;
     if (block.ptr == nullptr) {
@@ -141,8 +152,9 @@ int run_register(checks & c, bool expert) {
         return c.status();
     }
 
-    mem_handle lease;
-    bool       registered = false;
+    mem_handle     lease;
+    bool           registered = false;
+    const uint64_t refusals   = unified_cache_unregistered_host_registration_refusals();
     {
         scoped_planned_materialization planned(cache, "test-sycl-unregistered-host-refusal/subject");
         registered = expert ?
@@ -161,6 +173,9 @@ int run_register(checks & c, bool expert) {
         }
         c.fail(seen + "; expected a refusal: returned 0, no lease, no entry");
     }
+    const uint64_t refused = unified_cache_unregistered_host_registration_refusals() - refusals;
+    c.expect(refused == 1, std::string(api) + " counted " + std::to_string(refused) +
+                               " unregistered-host refusal(s) for the malloc'ed pointer, expected 1");
 
     // The control is still the cache's: the refusal took nothing else down with it.
     c.expect(entry_of(cache, expert, control_key) != nullptr,
@@ -178,6 +193,84 @@ int run_register(checks & c, bool expert) {
     return c.status();
 }
 
+int run_interior(checks & c) {
+    if (!file_mapped_test::entry_ok(c)) {
+        return c.status();
+    }
+    if (ggml_backend_sycl_init(0) == nullptr) {
+        c.void_case("ggml_backend_sycl_init(0) failed");
+        return c.status();
+    }
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (cache == nullptr) {
+        c.void_case("device 0 has no unified cache");
+        return c.status();
+    }
+    constexpr size_t bytes = 4ull * 1024ull * 1024ull;
+    if (!cache->host_zones_configured()) {
+        cache->configure_host_zones(2 * bytes, 2ull * 1024ull * 1024ull, 4ull * 1024ull * 1024ull,
+                                    2ull * 1024ull * 1024ull);
+    }
+    if (!cache->host_zones_configured()) {
+        c.void_case("host zones could not be configured");
+        return c.status();
+    }
+    // The request a host-planned expert's buffer makes (test-mem-ops.cpp, the host expert lease copy).
+    alloc_request req{};
+    req.device                              = ggml_sycl_get_device_id_from_queue(cache->get_queue());
+    req.size                                = bytes;
+    req.intent.role                         = alloc_role::WEIGHT;
+    req.intent.constraints.must_host_pinned = true;
+    req.intent.constraints.use_pinned_pool  = true;
+    allocation_result allocation            = unified_allocate_owner(req);
+    if (!allocation) {
+        c.void_case("the pinned pool refused the " + std::to_string(bytes) + "-byte allocation");
+        return c.status();
+    }
+    mem_handle         owner = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const resolved_ptr base  = owner.resolve();
+    if (!base || base.on_device) {
+        c.void_case("the pinned allocation did not resolve to host memory");
+        return c.status();
+    }
+    // A slice off the base, as the preload's expert_aos is, registered with no owner of its own.
+    constexpr size_t slice_bytes = 4096;
+    void * const     slice       = static_cast<uint8_t *>(base.ptr) + 8192;
+    const alloc_tier exact       = query_location(slice, 0).tier;
+    if (query_location(base.ptr, 0).tier != alloc_tier::HOST_PINNED || exact != alloc_tier::UNREGISTERED) {
+        c.void_case("the base is not a HOST_PINNED row, or query_location already resolves the slice (tier " +
+                    std::to_string(static_cast<int>(exact)) + "): the containment lookup is not scored");
+        return c.status();
+    }
+
+    const uint64_t refusals = unified_cache_unregistered_host_registration_refusals();
+    for (int kind = 0; kind < 2; ++kind) {
+        const bool         expert = kind == 0;
+        const char * const api    = expert ? "register_host_expert" : "register_host_weight";
+        ggml_sycl_cache_id key    = key_of(10 + kind);
+        mem_handle         lease;
+        bool               registered = false;
+        {
+            scoped_planned_materialization planned(cache, "test-sycl-unregistered-host-refusal/interior");
+            registered = expert ? cache->register_host_expert(key, slice, slice_bytes, GGML_LAYOUT_AOS, &lease) :
+                                  cache->register_host_weight(key, slice, slice_bytes, GGML_LAYOUT_AOS, &lease);
+        }
+        const weight_entry * entry = entry_of(cache, expert, key);
+        c.expect(
+            registered && lease.valid() && entry != nullptr && entry->location == cache_location::HOST_PINNED,
+            std::string(api) + " refused or misplaced a slice inside a pinned allocation: returned " +
+                std::to_string(registered) + ", lease valid=" + std::to_string(lease.valid()) +
+                (entry != nullptr ? ", entry location=" + std::string(location_name(entry->location)) : ", no entry") +
+                "; expected accepted as HOST_PINNED");
+    }
+    const uint64_t refused = unified_cache_unregistered_host_registration_refusals() - refusals;
+    c.expect(refused == 0, "the pinned slice moved the refusal counter by " + std::to_string(refused) + ", expected 0");
+    if (c.status() == 0) {
+        fprintf(stderr, "[UNREGISTERED-HOST] a slice inside a pinned allocation was accepted by both calls\n");
+    }
+    return c.status();
+}
+
 int run_case(const scratch_return_test::child_args & a) {
     if (!scratch_return_test::child_begin(a)) {
         return 2;
@@ -189,6 +282,9 @@ int run_case(const scratch_return_test::child_args & a) {
     if (a.case_name == "weight") {
         return run_register(c, false);
     }
+    if (a.case_name == "interior") {
+        return run_interior(c);
+    }
     fprintf(stderr, "unknown case '%s'\n", a.case_name.c_str());
     return 2;
 }
@@ -196,6 +292,6 @@ int run_case(const scratch_return_test::child_args & a) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    static const std::vector<const char *> all = { "expert", "weight" };
+    static const std::vector<const char *> all = { "expert", "weight", "interior" };
     return scratch_return_test::cases_main(argc, argv, all, run_case, std::chrono::minutes(2));
 }

@@ -56,7 +56,8 @@ STEM = "test-sycl-scratch-trial-return"
 STEMS = (STEM, "test-sycl-configure-refusal", "test-sycl-scratch-owner-end")
 # Every registration whose arms the selector's census scores: the file-mapped tier's REDs and the segmented record's
 # refusal cleanup plant their faults through the same selector (§7 C4).
-CENSUS_STEMS = STEMS + ("test-sycl-file-mapped-stream-refusal", "test-sycl-seg-refusal-cleanup")
+CENSUS_STEMS = STEMS + ("test-sycl-file-mapped-stream-refusal", "test-sycl-seg-refusal-cleanup",
+                        "test-sycl-unregistered-host-refusal")
 FUNC = "ggml_sycl_scratch_return_test"
 BLOCK = "if (BUILD_TESTING AND NOT GGML_BACKEND_DL)"
 
