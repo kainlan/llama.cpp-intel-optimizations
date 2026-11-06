@@ -103,7 +103,7 @@ struct abort_runner : scratch_return_test::case_runner {
 int main(int argc, char ** argv) {
     static const std::vector<const char *> all = { "abort" };
     const scratch_return_test::child_args  a   = scratch_return_test::child_args_parse(argc, argv);
-    if (a.case_name.empty() && !file_mapped_test::control_gate("test-sycl-file-mapped-resolve-abort")) {
+    if (a.case_name.empty() && !file_mapped_test::control_gate()) {
         return SYCL_TEST_SKIP;
     }
     const abort_runner runner;

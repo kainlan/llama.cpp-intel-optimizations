@@ -10,8 +10,11 @@ files, so it runs without a configured build:
   N2. Each name has exactly one registration across tests/CMakeLists.txt and ggml/src/ggml-sycl/CMakeLists.txt. A
       registration counts when the ctest name it derives is the design's name or that name without its leading
       `test-`: the backend's CMakeLists names several host tests `sycl-<stem>` beside their `test-sycl-<stem>`
-      executable, so `ctest -N | grep -cE ': (test-)?<stem>$'` is the one-line form of the same check. A mutant
-      registration (`<name>-mutant-...`) is another name and does not count.
+      executable, so `ctest -N | grep -cE ': (test-)?<stem>$'` = 1 is the one-line form of the same check, and it
+      replaces the plan's literal `ctest -N | grep -c <name>` (a deviation the lead ruled). Seven names register
+      without the prefix: sycl-host-zone-select, sycl-host-scratch-demand, sycl-plan-walk-sched,
+      sycl-attn-host-staging-plan, unified-cache-bugs, sycl-kv-demand-idx and sycl-getrows-refusal-terminal. A
+      mutant registration (`<name>-mutant-...`) is another name and does not count.
   N3. The registering helpers still derive the names this pin models. A helper whose naming changed would make N2
       count names CMake no longer produces, so each modelled helper's body is checked for the line that names its test.
 

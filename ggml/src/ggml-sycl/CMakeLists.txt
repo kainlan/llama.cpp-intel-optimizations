@@ -8173,12 +8173,17 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # runs first: it writes its outcome beside the binaries, and each of the other five reads it in its driver and
     # exits 77 with one VOID line when the control has not run or failed (tests/file-mapped-test-common.hpp). DEPENDS
     # orders a sweep that selects them all; it does not make a run of one of them pull the control in.
+    # The lead runs this one first, by name. It writes ${CMAKE_BINARY_DIR}/bin/sycl-pinned-meminfo-control.outcome.
     ggml_sycl_scratch_return_test(test-sycl-pinned-meminfo-control TIMEOUT 300)
+    # Run after test-sycl-pinned-meminfo-control, whose outcome it reads first.
     ggml_sycl_scratch_return_test(test-sycl-file-mapped-stream-refusal TIMEOUT 120 MUTANTS
         refusal-after-copy-fn with-copy-fn
             "FAIL \\[with-copy-fn\\] stream_dma over a FILE_MAPPED view with a copy_fn was not refused")
+    # Run after test-sycl-pinned-meminfo-control, whose outcome it reads first.
     ggml_sycl_scratch_return_test(test-sycl-file-mapped-bounce TIMEOUT 120)
+    # Run after test-sycl-pinned-meminfo-control, whose outcome it reads first.
     ggml_sycl_scratch_return_test(test-sycl-file-mapped-expert-owner TIMEOUT 120)
+    # Run after test-sycl-pinned-meminfo-control, whose outcome it reads first.
     ggml_sycl_scratch_return_test(test-sycl-file-mapped-resolve-abort TIMEOUT 120)
     set_tests_properties(test-sycl-file-mapped-stream-refusal test-sycl-file-mapped-bounce
         test-sycl-file-mapped-expert-owner test-sycl-file-mapped-resolve-abort

@@ -117,6 +117,5 @@ int run_case(const scratch_return_test::child_args & a) {
 
 int main(int argc, char ** argv) {
     static const std::vector<const char *> all = { "with-copy-fn", "without-copy-fn" };
-    return file_mapped_test::gated_main(argc, argv, "test-sycl-file-mapped-stream-refusal", all, run_case,
-                                        std::chrono::minutes(2));
+    return file_mapped_test::gated_main(argc, argv, all, run_case, std::chrono::minutes(2));
 }

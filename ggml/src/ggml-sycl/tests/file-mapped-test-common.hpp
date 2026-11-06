@@ -72,12 +72,12 @@ inline std::string control_outcome_read() {
 
 // The gate each of the five runs first. true when the control ran and did not FAIL (its VOID, no counter moved, only
 // moves the lead's host-growth criterion to the Committed line and leaves these tests' mechanisms reachable).
-inline bool control_gate(const char * test) {
+inline bool control_gate() {
     const std::string outcome = control_outcome_read();
     if (outcome == "PASS" || outcome == "VOID") {
         return true;
     }
-    fprintf(stderr, "VOID: %s outcome %s; run it first (%s)\n", k_control_name, outcome.c_str(), test);
+    fprintf(stderr, "VOID: %s outcome %s; run it first\n", k_control_name, outcome.c_str());
     return false;
 }
 
@@ -100,12 +100,11 @@ inline bool entry_ok(checks & c) {
 // gate refuses, exits 77 with the gate's one line and forks nothing.
 inline int gated_main(int                               argc,
                       char **                           argv,
-                      const char *                      test,
                       const std::vector<const char *> & all,
                       int (*run_case)(const scratch_return_test::child_args &),
                       std::chrono::milliseconds bound) {
     const scratch_return_test::child_args a = scratch_return_test::child_args_parse(argc, argv);
-    if (a.case_name.empty() && !control_gate(test)) {
+    if (a.case_name.empty() && !control_gate()) {
         return SYCL_TEST_SKIP;
     }
     return scratch_return_test::cases_main(argc, argv, all, run_case, bound);
