@@ -17769,7 +17769,11 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
         g_stream_dma_file_mapped_refusals.fetch_add(1, std::memory_order_relaxed);
         return result;
     }
-    // A custom copy_fn copies outside mem-ops, so it is noted here; the default copy is noted in mem_copy_submit.
+    // A backstop behind the refusal above, which tests the same predicate first: production never counts here, only a
+    // bypassed refusal does (the refusal-after-copy-fn mutant). A custom copy_fn may copy outside mem-ops, so the
+    // stream is noted once here; the default copy is noted in mem_copy_submit. Not every copy_fn bypasses mem-ops:
+    // dmmv_stream_copy copies through mem_copy_async, so a bypassed refusal on that path counts this note once and
+    // then once more for every mem_copy_async call it makes, a double count the refusal exists to make unreachable.
     if (copy_fn != nullptr) {
         unified_cache_file_mapped_device_copy_note(src.ptr);
     }
