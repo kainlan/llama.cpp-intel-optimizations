@@ -36,7 +36,13 @@ text.
 """
 
 import re
+import sys
 from pathlib import Path
+
+# sycl_gate sits beside this file. `python3 -I` leaves the script's directory off sys.path, so it is appended here;
+# appended rather than prepended, a file in tests/ never shadows a standard module.
+sys.path.append(str(Path(__file__).resolve().parent))
+from sycl_gate import resolve_mutants  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SYCL = ROOT / "ggml/src/ggml-sycl"
@@ -81,15 +87,9 @@ def function_body(text: str, signature_re: str) -> str:
 
 
 # test-sycl-seg-refusal-cleanup's seams and planted faults sit in GGML_SYCL_SCRATCH_MUTANTS blocks, which the
-# production build compiles out (scratch-test-mutant.hpp): the contract reads the text without them. Not nested.
-SCRATCH_MUTANT_BLOCK = re.compile(
-    r"^[ \t]*#\s*if\s+defined\s*\(\s*GGML_SYCL_SCRATCH_MUTANTS\s*\)[^\n]*\n.*?^[ \t]*#\s*endif[^\n]*\n",
-    flags=re.DOTALL | re.MULTILINE,
-)
-
-
+# production build compiles out (scratch-test-mutant.hpp): the contract reads the text with every mutant block resolved.
 def code() -> str:
-    return SCRATCH_MUTANT_BLOCK.sub("", strip_comments((SYCL / "ggml-sycl.cpp").read_text()))
+    return resolve_mutants(strip_comments((SYCL / "ggml-sycl.cpp").read_text()))
 
 
 RECORD = r"static\s+bool\s+moe_graph_record_segments\s*\("
