@@ -8190,17 +8190,20 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # Run after test-sycl-pinned-meminfo-control, whose outcome it reads first. A refusal inside the segmented MoE
     # record (§4.4): five cases on the non-keyed record function. The immediate return must fail both of its cases.
     set(_seg_no_line "no \"recoverable runtime fallback failed\" line after a FAILED return")
+    # Every arm's text starts at its case's FAIL prefix, so only that case's c.fail line can match it.
+    set(_seg_lease_line "FAIL \\[active-valid\\] lease vectors [0-9]+\\+[0-9]+ non-empty after a FAILED return")
+    set(_seg_destroyed "FAIL \\[moe-after\\] executables destroyed")
     ggml_sycl_scratch_return_test(test-sycl-seg-refusal-cleanup TIMEOUT 900 MUTANTS
         seg-immediate-return direct,recording
             "FAIL \\[direct\\] ${_seg_no_line}.*FAIL \\[recording\\] ${_seg_no_line}"
         seg-cleanup-step-removed active-valid
-            "lease vectors [0-9]+\\+[0-9]+ non-empty after a FAILED return. active_exec_graph live"
+            "${_seg_lease_line}. active_exec_graph live"
         seg-local-unwind moe-after
-            "executables destroyed in the unwind: moe_segments 0 at catch entry, [0-9]+ recorded at the throw"
+            "${_seg_destroyed} in the unwind: moe_segments 0 at catch entry, [0-9]+ recorded at the throw"
         seg-destroy-before-waits moe-after
-            "executables destroyed before the waits: moe_segments [0-9]+ at catch entry, 0 at the cleanup step"
+            "${_seg_destroyed} before the waits: moe_segments [0-9]+ at catch entry, 0 at the cleanup step"
         seg-record-guard-removed stale-vectors
-            "no \"record refused\" line while the context holds [0-9]+ segment\\(s\\)")
+            "FAIL \\[stale-vectors\\] no \"record refused\" line while the context holds [0-9]+ segment\\(s\\)")
     set_tests_properties(test-sycl-file-mapped-stream-refusal test-sycl-file-mapped-bounce
         test-sycl-file-mapped-expert-owner test-sycl-file-mapped-resolve-abort test-sycl-seg-refusal-cleanup
         PROPERTIES DEPENDS test-sycl-pinned-meminfo-control)
