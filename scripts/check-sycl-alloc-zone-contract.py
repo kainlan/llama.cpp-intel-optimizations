@@ -3997,6 +3997,7 @@ WITNESSES = {
     "s2d": "the appendix census table is data: a missing appendix-rows.json fails",
     "37": "clause (p): the oneDNN SDPA arms sit in routed branches; the plan is read only by route_admits",
     "38": "clause (p): the support decision has one home (switch read, shape function, fills, layer name, case line, charge side)",
+    "r-pool": "clause (r): lifetime POOL, owner kind IO_POOL and must_host_cpu = true are established together, or not at all",
 }
 
 # the witnesses that run as process-level checks in `--witnesses` rather than as matrix cases
@@ -4999,6 +5000,7 @@ def matrix_cases():
     c.extend(matrix_cases_s31())
     c.extend(matrix_cases_s3f())
     c.extend(matrix_cases_s3g())
+    c.extend(matrix_cases_r())
     return c
 
 
@@ -6013,6 +6015,38 @@ def matrix_cases_s3f():
            "names a ruling-ledger id", edit_debt=e_libc_cite("ruling M265 R2, step 7 census item (f): deleted with S7(d)"), planted=False))
     A(Case("s3f-data", "the CHECK_TRY_ERROR cite citing a ruling-ledger id fails", lambda f: f, "FAIL", "data", "names a ruling-ledger id",
            edit_debt=pin_cite("ruling M265 R3, design 5.4a: the handler is rewritten there"), planted=False))
+    return c
+
+
+def matrix_cases_r():
+    """Clause (r): the block ring's request shape is the one POOL shape (the witness), and each way of breaking it fails."""
+    c = []
+    A = c.append
+
+    def pool_req(owner="{ ggml_sycl::alloc_owner_kind::IO_POOL, gen }", lifetime="ggml_sycl::alloc_lifetime::POOL",
+                 tier="must_host_cpu", extra=""):
+        return ("void zzplant_rpool(unsigned long long gen, bool b) {\n    %s req{};\n"
+                "    req.intent.role = ggml_sycl::alloc_role::LAZY_STAGING;\n"
+                "    req.intent.constraints.%s = true;\n"
+                "    req.intent.lifetime = %s;\n"
+                "    req.intent.owner = %s;\n%s    (void) b;\n}\n" % (REQ, tier, lifetime, owner, extra))
+
+    A(Case("r-pool", "the block ring's request: lifetime POOL, owner {IO_POOL, generation}, HOST_CPU", plant(pool_req()),
+           "PASS"))
+    A(Case("r-pool", "the mutant: a POOL request whose owner is {NONE, 0}", plant(
+        pool_req(owner="{ ggml_sycl::alloc_owner_kind::NONE, 0 }")), "FAIL", "R-POOL", "zzplant_rpool"))
+    A(Case("r-pool", "an IO_POOL owner on an UNOWNED request", plant(
+        pool_req(lifetime="ggml_sycl::alloc_lifetime::UNOWNED")), "FAIL", "R-POOL", "zzplant_rpool"))
+    A(Case("r-pool", "a POOL request on the pinned tier", plant(pool_req(tier="must_host_pinned")), "FAIL", "R-POOL",
+           "zzplant_rpool"))
+    A(Case("r-pool", "a POOL request whose owner kind is set by a conditional write to owner.kind", plant(
+        pool_req(owner="{}", extra="    if (b) req.intent.owner.kind = ggml_sycl::alloc_owner_kind::IO_POOL;\n")),
+        "FAIL", "R-POOL", "zzplant_rpool"))
+    A(Case("r-pool", "a later braced intent discards the owner, and the tier and lifetime written again do not restore it",
+           plant(pool_req(extra="    req.intent = { ggml_sycl::alloc_role::LAZY_STAGING };\n"
+                                "    req.intent.constraints.must_host_cpu = true;\n"
+                                "    req.intent.lifetime = ggml_sycl::alloc_lifetime::POOL;\n")),
+           "FAIL", "R-POOL", "zzplant_rpool"))
     return c
 
 
