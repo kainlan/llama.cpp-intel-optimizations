@@ -8,13 +8,15 @@
 #define GGML_SYCL_SCRATCH_TEST_MUTANT_HPP
 
 // The planted faults of the SCRATCH return's three device REDs (docs/design/sycl-mmap-host-tier.md §7 C4:
-// test-sycl-scratch-trial-return, test-sycl-configure-refusal, test-sycl-scratch-owner-end). Each fault is a block at
-// its site in the pinned pool, the unified cache or the backend, under `#if defined(GGML_SYCL_SCRATCH_MUTANTS)`, taken
-// only when a device test has switched it on, with the production statements after it unchanged. They are runtime
-// seams, never compile-time variants: the private fixtures are the one backend build those tests link (§M82 case (2)),
-// and a variant would need a second one. The macro is defined only in a GGML_SYCL_PRIVATE_TESTING build, so the
-// shipped libggml-sycl compiles none of the blocks, and a source gate reads the text with every block dropped
-// (tests/sycl_gate.py resolve_mutants), as production compiles it.
+// test-sycl-scratch-trial-return, test-sycl-configure-refusal, test-sycl-scratch-owner-end). Each fault sits at its
+// site in the pinned pool, the unified cache or the backend, under `#if defined(GGML_SYCL_SCRATCH_MUTANTS)`, and is
+// taken only when a device test has switched it on. It either runs a block beside the production statement it
+// perturbs, just before or just after it, or sets a planted_* local that the statement reads; such a local is false
+// whenever GGML_SYCL_SCRATCH_MUTANTS is undefined. They are runtime seams, never compile-time variants: the private
+// fixtures are the one backend build those tests link (§M82 case (2)), and a variant would need a second one. The
+// macro is defined only in a GGML_SYCL_PRIVATE_TESTING build, so the shipped libggml-sycl compiles none of the blocks,
+// and a source gate reads the text with every block dropped (tests/sycl_gate.py resolve_mutants), as production
+// compiles it.
 
 #include <cstdint>
 
