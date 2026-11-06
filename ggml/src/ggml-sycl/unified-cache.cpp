@@ -34515,6 +34515,24 @@ static void record_host_ledger_plan(placement_plan &          plan,
     }
 }
 
+// The resident working set (design 5efe §4.5, §7 C5), once per plan beside its Totals line: the plan line, and the
+// WARN when the host-executed mapped bytes exceed resident_room = MemAvailable_pre - expected_host -
+// host_headroom(MemTotal). expected_host is the plan's charged host figure, the one P3 reads; MemAvailable_pre is the
+// load's one sample. Locked mapped bytes are charged and cannot be dropped, so a locked mapping counts none and the
+// plan line says locked. A mapped overflow costs refaults, not an OOM, so the plan proceeds.
+static void placement_plan_log_working_set(const char *              tag,
+                                           const placement_plan &    plan,
+                                           const placement_kv_info & kv_info) {
+    const host_working_set ws =
+        host_working_set_check(ggml_sycl_get_total_system_memory_bytes(), kv_info.host_mem_available_pre,
+                               plan.host_planned_bytes, plan.host_mapped_bytes, plan.host_mapped_locked);
+    GGML_LOG_INFO("%s", host_working_set_plan_line(tag, ws).c_str());
+    const std::string warn = host_working_set_warn_line(ws);
+    if (!warn.empty()) {
+        GGML_LOG_WARN("%s", warn.c_str());
+    }
+}
+
 // The load's fact onto the plan (design 5efe §4.4), the one place either builder copies it, before it makes any entry.
 // The lock follows the mapping: a load that maps nothing locks nothing.
 static void placement_plan_copy_host_backing_fact(placement_plan & plan, const placement_kv_info & info) {
@@ -36571,6 +36589,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         plan.optional_layout_vram_bytes(-1) / (1024.0 * 1024.0), plan.weight_host_bytes / (1024.0 * 1024.0),
         plan.host_cpu_owned_bytes / (1024.0 * 1024.0), plan.host_mapped_bytes / (1024.0 * 1024.0),
         plan.host_mapped_source_bytes / (1024.0 * 1024.0));
+    placement_plan_log_working_set("[PLACEMENT]", plan, kv_info);
     GGML_LOG_INFO("[PLACEMENT] Total: %.1f MB device + %.1f MB host (budget=%.1f MB)\n",
                   plan.vram_bytes / (1024.0 * 1024.0), plan.host_bytes / (1024.0 * 1024.0),
                   vram_budget / (1024.0 * 1024.0));
@@ -38664,6 +38683,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         plan.optional_layout_vram_bytes(-1) / (1024.0 * 1024.0), plan.weight_host_bytes / (1024.0 * 1024.0),
         plan.host_cpu_owned_bytes / (1024.0 * 1024.0), plan.host_mapped_bytes / (1024.0 * 1024.0),
         plan.host_mapped_source_bytes / (1024.0 * 1024.0));
+    placement_plan_log_working_set("[PLACEMENT-MULTI]", plan, kv_info);
     GGML_LOG_INFO("[PLACEMENT-MULTI] Total: %.1f MB device + %.1f MB host (budget=%.1f MB)\n",
                   plan.vram_bytes / (1024.0 * 1024.0), plan.host_bytes / (1024.0 * 1024.0),
                   plan.vram_budget / (1024.0 * 1024.0));

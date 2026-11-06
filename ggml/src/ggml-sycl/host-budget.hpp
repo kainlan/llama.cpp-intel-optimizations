@@ -129,10 +129,14 @@ inline host_budget_result host_budget_compute(const host_budget_inputs & in) {
     return r;
 }
 
-// The resident working set (§4.5): resident_room = MemAvailable_pre - expected_host - the headroom, and mapped_ws, the
-// host-executed mapped bytes the kernel may drop. exceeds is the WARN. A locked mapping counts as any other.
+// The resident working set (§4.5): resident_room = MemAvailable_pre - expected_host - host_headroom(MemTotal), and
+// mapped_ws, the host-executed mapped bytes the kernel may drop. exceeds is the WARN; a mapped overflow costs refaults,
+// not an OOM, so it warns and refuses nothing. A locked mapping (-lm mmap+mlock) is charged at full size and cannot be
+// dropped, so its mapped_ws is 0. With no MemAvailable_pre sample there is no room to compare against, and nothing
+// warns.
 struct host_working_set {
     bool   sampled           = false;  // MemAvailable_pre is a reading
+    bool   locked            = false;  // the mapping is locked: charged, so its bytes are not working set
     size_t mem_available_pre = 0;
     size_t expected_host     = 0;
     size_t headroom          = 0;
@@ -144,23 +148,31 @@ struct host_working_set {
 inline host_working_set host_working_set_check(size_t total_bytes,
                                                size_t mem_available_pre,
                                                size_t expected_host,
-                                               size_t mapped_ws,
+                                               size_t mapped_bytes,
                                                bool   locked) {
-    (void) total_bytes;
-    (void) locked;
     host_working_set ws;
     ws.sampled           = mem_available_pre != 0;
+    ws.locked            = locked;
     ws.mem_available_pre = mem_available_pre;
     ws.expected_host     = expected_host;
-    ws.headroom          = k_host_p3_floor;
-    ws.mapped_ws         = mapped_ws;
-    const size_t charged = expected_host + ws.headroom;
-    ws.resident_room     = mem_available_pre > charged ? mem_available_pre - charged : 0;
-    ws.exceeds           = ws.mapped_ws > ws.resident_room;
+#if defined(HOST_BUDGET_MUTANT_P3_CONSTANT)
+    (void) total_bytes;
+    ws.headroom = k_host_p3_floor;
+#else
+    ws.headroom = host_headroom(total_bytes);
+#endif
+    ws.mapped_ws = locked ? 0 : mapped_bytes;
+    ws.resident_room =
+        detail::host_budget_sat_sub(detail::host_budget_sat_sub(mem_available_pre, expected_host), ws.headroom);
+#if defined(HOST_BUDGET_MUTANT_WARN_ABOVE_THRESHOLD)
+    ws.exceeds = ws.mapped_ws != 0;
+#else
+    ws.exceeds = ws.sampled && ws.mapped_ws > ws.resident_room;
+#endif
     return ws;
 }
 
-// The working set's figures, in the one order every line that prints them uses.
+// The working set's figures, in the one order the WARN and the plan line both print them.
 inline std::string host_working_set_figures(const host_working_set & ws) {
     char buf[256];
     std::snprintf(buf, sizeof(buf),
@@ -169,7 +181,7 @@ inline std::string host_working_set_figures(const host_working_set & ws) {
     return buf;
 }
 
-// The WARN, or an empty string when the mapped bytes fit.
+// The WARN (§4.5), or an empty string when the mapped bytes fit.
 inline std::string host_working_set_warn_line(const host_working_set & ws) {
     if (!ws.exceeds) {
         return std::string();
@@ -178,11 +190,12 @@ inline std::string host_working_set_warn_line(const host_working_set & ws) {
            host_working_set_figures(ws) + "\n";
 }
 
-// The plan report's working-set line: the plan's Totals carry no working-set figures.
+// The plan report's working-set line, printed by every plan beside its Totals line (`tag` is that line's tag): the
+// WARN's figures and the check's outcome: locked (mapped_ws is 0 because the mapping is locked), no-sample, WARN or
+// fits.
 inline std::string host_working_set_plan_line(const char * tag, const host_working_set & ws) {
-    (void) tag;
-    (void) ws;
-    return std::string();
+    const char * check = ws.locked ? "locked" : !ws.sampled ? "no-sample" : ws.exceeds ? "WARN" : "fits";
+    return std::string(tag) + " Working set: " + host_working_set_figures(ws) + " check=" + check + "\n";
 }
 
 }  // namespace ggml_sycl

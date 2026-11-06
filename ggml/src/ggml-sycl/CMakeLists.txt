@@ -446,12 +446,20 @@ if (BUILD_TESTING)
         "${_hb_override}an override above the formula gives 200\\.00 GiB, want the formula's 121\\.80 GiB")
     string(CONCAT _hb_re_old_reserve
         "${_hb_table}total=246\\.9 GiB available=150\\.8 GiB gives 142\\.80 GiB \\(status ok\\), want 121\\.80 GiB")
+    string(CONCAT _hb_re_warn_above_threshold
+        "FAIL \\(1\\) the WARN fires only past the room: "
+        "mapped_ws [0-9]+ at or below resident_room [0-9]+ printed the WARN")
+    string(CONCAT _hb_re_p3_constant
+        "FAIL \\(3\\) resident_room uses host_headroom\\(total\\): at total=62\\.0 GiB available=50\\.0 GiB "
+        "expected_host=4\\.0 GiB mapped_ws=20\\.0 GiB the WARN fired \\(headroom=31138512896 ")
     set(_host_budget_variants
         test-sycl-host-budget           ""                                      ""
         test-sycl-host-budget           HOST_BUDGET_MUTANT_CLIFF                "${_hb_re_cliff}"
         test-sycl-host-budget           HOST_BUDGET_MUTANT_OVERRIDE_REPLACES    "${_hb_re_override_replaces}"
         test-sycl-host-budget           HOST_BUDGET_MUTANT_OLD_RESERVE          "${_hb_re_old_reserve}"
-        test-sycl-host-working-set-warn ""                                      "")
+        test-sycl-host-working-set-warn ""                                      ""
+        test-sycl-host-working-set-warn HOST_BUDGET_MUTANT_WARN_ABOVE_THRESHOLD "${_hb_re_warn_above_threshold}"
+        test-sycl-host-working-set-warn HOST_BUDGET_MUTANT_P3_CONSTANT          "${_hb_re_p3_constant}")
     list(LENGTH _host_budget_variants _n)
     math(EXPR _last "${_n} - 1")
     foreach (_i RANGE 0 ${_last} 3)
