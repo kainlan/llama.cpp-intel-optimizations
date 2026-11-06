@@ -11,7 +11,9 @@
 // test-sycl-pinned-meminfo-control runs first (the lead's order, §7 C4). It writes its outcome, PASS, VOID or FAIL,
 // to a file beside its binary, and each of the other five reads that file in its driver, before any child forks or
 // any device is touched: a missing file or a FAIL prints one VOID line naming the control's outcome and the test exits
-// 77, so a test run before the control, or after it failed, never reads as a pass or a fail of its own.
+// 77, so a test run before the control, or after it failed, never reads as a pass or a fail of its own. The file also
+// carries the boot it was written in, and an outcome from another boot gates nothing: the file outlives the run, so
+// without it a targeted run after a reboot (a new driver, another card state) would read an old PASS.
 
 #pragma once
 
@@ -51,34 +53,59 @@ inline std::string control_outcome_path() {
     return (cut == std::string::npos ? std::string(".") : path.substr(0, cut)) + "/" + k_control_outcome;
 }
 
-// The control writes its outcome: "PASS", "VOID" or "FAIL".
+// This boot's id, from the kernel, or "unknown" when it cannot be read.
+inline std::string boot_id_current() {
+    std::ifstream in("/proc/sys/kernel/random/boot_id");
+    std::string   id;
+    if (!(in >> id)) {
+        return "unknown";
+    }
+    return id;
+}
+
+// The control writes its outcome, "PASS", "VOID" or "FAIL", and the boot it ran in.
 inline void control_outcome_write(const char * outcome) {
     FILE * f = fopen(control_outcome_path().c_str(), "w");
     if (f != nullptr) {
-        fprintf(f, "%s\n", outcome);
+        fprintf(f, "%s\n%s\n", outcome, boot_id_current().c_str());
         fclose(f);
     }
 }
 
-// The control's outcome as written, or "missing".
-inline std::string control_outcome_read() {
-    std::ifstream in(control_outcome_path());
-    std::string   outcome;
-    if (!(in >> outcome)) {
-        return "missing";
+// The control's outcome and the boot it was written in, as written; "missing" for an absent or empty file, and an
+// empty boot for a file written before the boot was recorded.
+struct control_outcome {
+    std::string outcome;
+    std::string boot;
+};
+
+inline control_outcome control_outcome_read() {
+    std::ifstream   in(control_outcome_path());
+    control_outcome r;
+    if (!(in >> r.outcome)) {
+        r.outcome = "missing";
+        return r;
     }
-    return outcome;
+    in >> r.boot;
+    return r;
 }
 
-// The gate each of the five runs first. true when the control ran and did not FAIL (its VOID, no counter moved, only
-// moves the lead's host-growth criterion to the Committed line and leaves these tests' mechanisms reachable).
+// The gate each of the five runs first. true when the control ran in this boot and did not FAIL (its VOID, no counter
+// moved, only moves the lead's host-growth criterion to the Committed line and leaves these tests' mechanisms
+// reachable).
 inline bool control_gate() {
-    const std::string outcome = control_outcome_read();
-    if (outcome == "PASS" || outcome == "VOID") {
-        return true;
+    const control_outcome r = control_outcome_read();
+    if (r.outcome != "PASS" && r.outcome != "VOID") {
+        fprintf(stderr, "VOID: %s outcome %s; run it first\n", k_control_name, r.outcome.c_str());
+        return false;
     }
-    fprintf(stderr, "VOID: %s outcome %s; run it first\n", k_control_name, outcome.c_str());
-    return false;
+    const std::string boot = boot_id_current();
+    if (r.boot != boot) {
+        fprintf(stderr, "VOID: %s outcome %s is from boot %s, not this boot %s; run it first\n", k_control_name,
+                r.outcome.c_str(), r.boot.empty() ? "(unrecorded)" : r.boot.c_str(), boot.c_str());
+        return false;
+    }
+    return true;
 }
 
 // The registration pins one device; a run without it, or without a GPU, measures nothing.

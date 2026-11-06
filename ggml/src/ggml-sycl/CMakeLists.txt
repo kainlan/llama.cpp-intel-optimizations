@@ -8171,9 +8171,10 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
 
     # The file-mapped tier's device REDs (docs/design/sycl-mmap-host-tier.md §5.3, §7 C4), registered through the
     # same helper: one executable each against the private fixtures, the B50 alone, no model. The meminfo control
-    # runs first: it writes its outcome beside the binaries, and each of the other five reads it in its driver and
-    # exits 77 with one VOID line when the control has not run or failed (tests/file-mapped-test-common.hpp). DEPENDS
-    # orders a sweep that selects them all; it does not make a run of one of them pull the control in.
+    # runs first: it writes its outcome and the boot id beside the binaries, and each of the other five reads it in its
+    # driver and exits 77 with one VOID line when the control has not run in this boot or failed
+    # (tests/file-mapped-test-common.hpp). DEPENDS orders a sweep that selects them all; it does not make a run of one
+    # of them pull the control in.
     # The lead runs this one first, by name. It writes ${CMAKE_BINARY_DIR}/bin/sycl-pinned-meminfo-control.outcome.
     ggml_sycl_scratch_return_test(test-sycl-pinned-meminfo-control TIMEOUT 300)
     # Run after test-sycl-pinned-meminfo-control, whose outcome it reads first.
