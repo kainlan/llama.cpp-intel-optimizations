@@ -5353,24 +5353,29 @@ inline bool ggml_sycl_bf16_weight_dispatch_available(const ggml_tensor * tensor,
 
 // A file mapping is never a pointer a device or a kernel ABI may be handed: a mapped page is not USM, and a
 // host-tier weight runs on the CPU (docs/design/sycl-mmap-host-tier.md §5.3, P3). Reaching it here is a routing
-// defect, not a fallback, so it aborts naming the tensor instead of returning the mapped page.
-inline void * ggml_sycl_resolve_or_host_tensor_ptr(const ggml_tensor * tensor, int device) {
-    void * resolved = ggml_sycl_resolve_tensor_ptr(tensor, device);
-    if (resolved != nullptr && ggml_sycl::alloc_registry::instance().is_file_mapped(resolved)) {
+// defect, not a fallback, so it aborts naming the tensor instead of returning the mapped page. `info` is the
+// registry's record of the pointer about to be returned, from either branch of the resolver below.
+inline void ggml_sycl_resolve_or_host_refuse_mapped(const ggml_tensor *                          tensor,
+                                                    const std::optional<ggml_sycl::alloc_info> & info) {
+    if (info && info->type == ggml_sycl::alloc_type::FILE_MAPPED) {
         GGML_ABORT("[FILE-MAPPED] resolve_or_host on mapped weight %s", tensor->name);
     }
+}
+
+inline void * ggml_sycl_resolve_or_host_tensor_ptr(const ggml_tensor * tensor, int device) {
+    const auto & registry = ggml_sycl::alloc_registry::instance();
+    void *       resolved = ggml_sycl_resolve_tensor_ptr(tensor, device);
     if (resolved != nullptr) {
+        ggml_sycl_resolve_or_host_refuse_mapped(tensor, registry.lookup_copy(resolved));
         return resolved;
     }
     void * raw = const_cast<void *>(ggml_sycl_host_data(tensor));
     if (raw == nullptr) {
         return nullptr;
     }
-    if (ggml_sycl::alloc_registry::instance().is_file_mapped(raw)) {
-        GGML_ABORT("[FILE-MAPPED] resolve_or_host on mapped weight %s", tensor->name);
-    }
-
-    const auto * info = ggml_sycl::alloc_registry::instance().lookup(raw);
+    // One lookup serves the mapped check and the type checks below.
+    const auto info = registry.lookup_copy(raw);
+    ggml_sycl_resolve_or_host_refuse_mapped(tensor, info);
     if (info && info->type == ggml_sycl::alloc_type::DEVICE) {
         return nullptr;
     }
