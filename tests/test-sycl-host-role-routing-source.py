@@ -1350,10 +1350,13 @@ def clause_notify_device(texts: dict) -> list:
     through the ledger's ensure call, and its growth path resolves the ledger of that device, not device 0's."""
     fails = []
     notify = _body(texts, GS, "ggml_backend_sycl_notify_host_buffer_sizes")
-    if not re.search(r"env\s*\.\s*host_buft_device\s*=\s*ggml_sycl_notify_host_buft_device\s*;", notify):
+    # The notify and the commit's mark build their view of the backend in one helper.
+    env = _body(texts, GS, "ggml_sycl_notify_env")
+    if not re.search(r"env\s*\.\s*host_buft_device\s*=\s*ggml_sycl_notify_host_buft_device\s*;", env):
         fails.append("notify device: the notify's device is not ggml_sycl_notify_host_buft_device")
-    if not re.search(r"env\s*\.\s*ledger_of\s*=\s*ggml_sycl_notify_ledger_of\s*;", notify) or \
-            not re.search(r"return\s+ggml_sycl::host_scratch_notify\s*\(\s*env\s*,\s*backend\s*,", notify):
+    if not re.search(r"env\s*\.\s*ledger_of\s*=\s*ggml_sycl_notify_ledger_of\s*;", env) or \
+            not re.search(r"return\s+ggml_sycl::host_scratch_notify\s*\(\s*ggml_sycl_notify_env\s*\(\s*\)\s*,\s*"
+                          r"backend\s*,", notify):
         fails.append("notify device: the notify does not grow through host_scratch_notify, the ledger's "
                      "ensure-capacity call, with ggml_sycl_notify_ledger_of as its growth path")
     ledger = _body(texts, GS, "ggml_sycl_notify_ledger_of")
@@ -1365,8 +1368,8 @@ def clause_notify_device(texts: dict) -> list:
                      r"ggml_backend_get_device\s*\(\s*backend\s*\)\s*\)\s*\)\s*;", dev):
         fails.append("notify device: the notify's device is not the host buft's (the buft llama_context allocates "
                      "from)")
-    for fn in ("ggml_backend_sycl_notify_host_buffer_sizes", "ggml_sycl_notify_host_buft_device",
-               "ggml_sycl_notify_ledger_of"):
+    for fn in ("ggml_backend_sycl_notify_host_buffer_sizes", "ggml_sycl_notify_env",
+               "ggml_sycl_notify_host_buft_device", "ggml_sycl_notify_ledger_of"):
         b = _body(texts, GS, fn)
         if re.search(r"backend\s*->\s*context\s*\)\s*->\s*device|ctx\s*->\s*device|get_current_device_id|"
                      r"grow_(?:host_)?scratch_zone|\(\s*0\s*\)", b):
@@ -2426,8 +2429,8 @@ MUTANTS = [
      [(GS, _NOTIFY_DEVICE, "    return static_cast<const ggml_backend_sycl_context *>(backend->context)->device;\n")],
      "ggml_sycl_notify_host_buft_device resolves the notifying backend's device"),
     ("notify-additive-grow", "notify-device",
-     [(GS, "    return ggml_sycl::host_scratch_notify(env, backend, host_compute_bytes, host_output_bytes);\n",
-       "    (void) env;\n"
+     [(GS, "    return ggml_sycl::host_scratch_notify(ggml_sycl_notify_env(), backend, host_compute_bytes, "
+           "host_output_bytes);\n",
        "    return ggml_sycl::unified_cache_grow_scratch_zone(ggml_sycl_notify_host_buft_device(backend),\n"
        "                                                      host_compute_bytes + host_output_bytes);\n")],
      "the notify does not grow through host_scratch_notify"),

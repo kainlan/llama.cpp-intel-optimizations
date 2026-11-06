@@ -96176,18 +96176,24 @@ static bool ggml_sycl_notify_ledger_of(int                                device
                                                         ops);
 }
 
+// The one view the notify and the commit's mark take of a backend's host SCRATCH: the host buft's device, the
+// context's key and device, and that device's ledger.
+static ggml_sycl::host_scratch_notify_env ggml_sycl_notify_env() {
+    ggml_sycl::host_scratch_notify_env env;
+    env.is_sycl          = ggml_backend_is_sycl;
+    env.host_buft_device = ggml_sycl_notify_host_buft_device;
+    env.context_of       = ggml_sycl_notify_context_of;
+    env.ledger_of        = ggml_sycl_notify_ledger_of;
+    return env;
+}
+
 bool ggml_backend_sycl_notify_host_buffer_sizes(ggml_backend_t backend,
                                                 size_t         host_compute_bytes,
                                                 size_t         host_output_bytes) {
     // host_scratch_notify tests ggml_backend_is_sycl(backend) before any callback reads backend->context, and refuses
     // a non-SYCL backend with a WARN. The zone's device is the host buft's, never the notifying backend's own, and the
     // growth is the ledger's ensure-capacity call on that device.
-    ggml_sycl::host_scratch_notify_env env;
-    env.is_sycl          = ggml_backend_is_sycl;
-    env.host_buft_device = ggml_sycl_notify_host_buft_device;
-    env.context_of       = ggml_sycl_notify_context_of;
-    env.ledger_of        = ggml_sycl_notify_ledger_of;
-    return ggml_sycl::host_scratch_notify(env, backend, host_compute_bytes, host_output_bytes);
+    return ggml_sycl::host_scratch_notify(ggml_sycl_notify_env(), backend, host_compute_bytes, host_output_bytes);
 }
 
 // The plan walk's view of the backend. The staging slots are planned on the dispatching backend's own device, the one
@@ -96264,12 +96270,7 @@ bool ggml_backend_sycl_commit_host_holders(ggml_backend_t backend) {
     }
     // The commit marks this context's SCRATCH demand on the ledger the notify records it on, so llama_context's
     // re-notify with the allocated size prints both figures (§4.4 "The same fact for the notify's measure").
-    ggml_sycl::host_scratch_notify_env env;
-    env.is_sycl          = ggml_backend_is_sycl;
-    env.host_buft_device = ggml_sycl_notify_host_buft_device;
-    env.context_of       = ggml_sycl_notify_context_of;
-    env.ledger_of        = ggml_sycl_notify_ledger_of;
-    (void) ggml_sycl::host_scratch_mark_committed(env, backend);
+    (void) ggml_sycl::host_scratch_mark_committed(ggml_sycl_notify_env(), backend);
     int device   = -1;
     int previous = -1;
     if (!g_host_holder_plans->commit(ggml_sycl_host_holder_backend_key(backend), &device, &previous)) {
