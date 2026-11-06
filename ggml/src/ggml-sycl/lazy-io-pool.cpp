@@ -648,23 +648,35 @@ struct lazy_io_queue::state {
     }
 
     // Indexes `e` in its context's class queue and the FIFO index, all or nothing: a throw leaves it in neither and
-    // removes a context entry made for it, so the caller still owns an entry no index holds.
+    // removes a context entry made for it, so the caller still owns an entry no index holds. The rollback is a guard's
+    // destructor, not a handler, so it runs for every exception and the exception propagates as thrown.
     void insert_entry(entry * e) {
         const size_t cls = lazy_io_class_index(e->key);
         auto         ctx = contexts.try_emplace(e->context);
-        entry_set &  q   = ctx.first->second.by_class[cls];
-        try {
-            q.insert(e);
-            by_seq[e->seq] = e;
-        } catch (...) {
-#if !defined(LAZY_IO_QUEUE_MUTANT_PARTIAL_INSERT)
-            q.erase(e);
-            if (ctx.second && q.empty()) {
-                contexts.erase(ctx.first);
+
+        struct undo_insert {
+            state &                                      s;
+            std::map<uint64_t, context_queues>::iterator pos;
+            bool                                         made;
+            size_t                                       cls;
+            entry *                                      e;
+            bool                                         armed = true;
+
+            ~undo_insert() {
+                if (armed) {
+                    pos->second.by_class[cls].erase(e);
+                    if (made && pos->second.by_class[cls].empty()) {
+                        s.contexts.erase(pos);
+                    }
+                }
             }
+        } undo{ *this, ctx.first, ctx.second, cls, e };
+#if defined(LAZY_IO_QUEUE_MUTANT_PARTIAL_INSERT)
+        undo.armed = false;
 #endif
-            throw;
-        }
+        ctx.first->second.by_class[cls].insert(e);
+        by_seq[e->seq] = e;
+        undo.armed     = false;
         class0 += cls == 0 ? 1 : 0;
     }
 
@@ -681,8 +693,8 @@ struct lazy_io_queue::state {
         class0 -= lazy_io_class_index(e->key) == 0 ? 1 : 0;
     }
 
-    // The node owns the entry before any index holds it, and a failed index takes it back out, so a throw never
-    // frees an entry an index still points at.
+    // The node owns the entry before any index holds it, and a failed index takes it back out through a guard, so a
+    // throw never frees an entry an index still points at.
     void add_entry(node & n, uint64_t context, const lazy_io_key & key) {
         std::unique_ptr<entry> owned(new entry());
         entry *                e = owned.get();
@@ -695,12 +707,20 @@ struct lazy_io_queue::state {
         n.entries.push_back(std::move(owned));
 #else
         n.entries.push_back(std::move(owned));
-        try {
-            insert_entry(e);
-        } catch (...) {
-            n.entries.pop_back();
-            throw;
-        }
+
+        struct undo_own {
+            std::vector<std::unique_ptr<entry>> & entries;
+            bool                                  armed = true;
+
+            ~undo_own() {
+                if (armed) {
+                    entries.pop_back();
+                }
+            }
+        } undo{ n.entries };
+
+        insert_entry(e);
+        undo.armed = false;
 #endif
     }
 
@@ -930,13 +950,23 @@ size_t lazy_io_queue::submit(uint64_t                  context,
             fresh.read->fd   = fd;
             auto it          = s_->in_flight.emplace(chunk, std::move(fresh));
             n                = &it->second;
-            // A read with no entry would never be picked, so one whose entry could not be added is taken back out.
-            try {
-                s_->add_entry(*n, context, key);
-            } catch (...) {
-                s_->in_flight.erase(it);
-                throw;
-            }
+
+            // A read with no entry would never be picked, so one whose entry could not be added is taken back out by
+            // the guard's destructor as the throw leaves.
+            struct undo_read {
+                state &      s;
+                decltype(it) pos;
+                bool         armed = true;
+
+                ~undo_read() {
+                    if (armed) {
+                        s.in_flight.erase(pos);
+                    }
+                }
+            } undo{ *s_, it };
+
+            s_->add_entry(*n, context, key);
+            undo.armed = false;
             // The lease moves in last, so a throw above leaves it with the caller, who drops it after unlocking.
             if (!spare_leases.empty()) {
                 n->read->lease = std::move(spare_leases.back());
