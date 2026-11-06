@@ -9056,8 +9056,9 @@ uint64_t unified_cache_stream_dma_file_mapped_refusals() noexcept;
 // (docs/design/sycl-mmap-host-tier.md §5.3 "Gates"). It is noted at the instrumented chokepoints only, once per copy:
 // mem_copy and mem_copy_async (both reach mem_copy_submit, as unified_cache::copy_to_device_async and stream_dma's
 // default copy do), mem_copy_ptr_async, and stream_dma's custom copy_fn. A copy through any other path is not counted.
-// `src` is the copy's source; the caller has established that its destination is a device. A correct load reads 0.
-void     unified_cache_file_mapped_device_copy_note(const void * src);
+// `src` is the copy's source. `device_dst` is null when the caller has established that the destination is a device;
+// otherwise the note asks the registry whether it is one, after its cheaper checks. A correct load reads 0.
+void     unified_cache_file_mapped_device_copy_note(const void * src, const void * device_dst = nullptr);
 uint64_t unified_cache_file_mapped_device_copies_outside_materialization() noexcept;
 
 // The load transaction's span, process-wide: from a successful ggml_backend_sycl_model_load_begin to the end of the

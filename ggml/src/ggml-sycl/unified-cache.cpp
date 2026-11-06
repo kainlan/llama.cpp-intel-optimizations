@@ -17711,14 +17711,20 @@ file_mapped_materialization_scope::~file_mapped_materialization_scope() {
     --t_file_mapped_materialization_depth;
 }
 
-void unified_cache_file_mapped_device_copy_note(const void * src) {
-    // The depths first: they are a thread-local read and a relaxed load, the registry lookup is a shared lock.
+void unified_cache_file_mapped_device_copy_note(const void * src, const void * device_dst) {
+    // The depths first: they are a thread-local read and a relaxed load, each registry lookup is a shared lock. Then
+    // the source, which is rarely file-mapped, and the destination last, so a typical copy pays one lookup, not two.
     if (t_file_mapped_materialization_depth > 0 || g_file_mapped_load_depth.load(std::memory_order_relaxed) > 0) {
         return;
     }
-    if (alloc_registry::instance().is_file_mapped(src)) {
-        g_file_mapped_device_copies_outside_materialization.fetch_add(1, std::memory_order_relaxed);
+    const auto & registry = alloc_registry::instance();
+    if (!registry.is_file_mapped(src)) {
+        return;
     }
+    if (device_dst != nullptr && !registry.is_device(device_dst)) {
+        return;
+    }
+    g_file_mapped_device_copies_outside_materialization.fetch_add(1, std::memory_order_relaxed);
 }
 
 uint64_t unified_cache_file_mapped_device_copies_outside_materialization() noexcept {

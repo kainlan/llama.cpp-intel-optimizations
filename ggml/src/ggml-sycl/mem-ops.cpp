@@ -1340,11 +1340,9 @@ sycl::event mem_copy_ptr_async(void *                           dst,
                                size_t                           size,
                                sycl::queue &                    queue,
                                const std::vector<sycl::event> & deps) {
-    // The pointer chokepoint of the outside-materialization counter (§5.3 "Gates"): a copy to a registered device
-    // allocation is noted, and the note asks whether its source is file-mapped.
-    if (alloc_registry::instance().is_device(dst)) {
-        unified_cache_file_mapped_device_copy_note(src);
-    }
+    // The pointer chokepoint of the outside-materialization counter (§5.3 "Gates"): a copy of file-mapped bytes to a
+    // registered device allocation is noted. The note asks about the destination itself, after its cheaper checks.
+    unified_cache_file_mapped_device_copy_note(src, dst);
     if (deps.empty()) {
         return queue.memcpy(dst, src, size);
     }
