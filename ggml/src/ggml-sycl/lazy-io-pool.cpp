@@ -334,4 +334,65 @@ lazy_test_coverage_pin ggml_sycl_test_make_coverage_pin(uint64_t ring_bytes) {
 }
 #endif
 
+// ---- the IO engine's queue (§5.2.1): RED stubs, replaced by the queue ----
+
+struct lazy_io_queue::state {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    std::vector<lazy_io_dispatch_record> log;
+#endif
+};
+
+lazy_io_queue::lazy_io_queue() : s_(new state()) {}
+
+lazy_io_queue::~lazy_io_queue() = default;
+
+size_t lazy_io_queue::submit(uint64_t                  context,
+                             int                       fd,
+                             const lazy_io_span &      span,
+                             const lazy_io_key &       key,
+                             const lazy_io_waiter &    waiter,
+                             std::vector<ring_lease> & spare_leases) {
+    GGML_UNUSED(context);
+    GGML_UNUSED(fd);
+    GGML_UNUSED(span);
+    GGML_UNUSED(key);
+    GGML_UNUSED(waiter);
+    GGML_UNUSED(spare_leases);
+    return 0;
+}
+
+lazy_io_read * lazy_io_queue::pick() {
+    return nullptr;
+}
+
+std::unique_ptr<lazy_io_read> lazy_io_queue::complete(lazy_io_read * read) {
+    GGML_UNUSED(read);
+    return nullptr;
+}
+
+size_t lazy_io_queue::queued_entries() const {
+    return 0;
+}
+
+size_t lazy_io_queue::in_flight() const {
+    return 0;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void lazy_io_queue::set_fifo_for_testing(bool fifo) {
+    GGML_UNUSED(fifo);
+}
+
+const std::vector<lazy_io_dispatch_record> & lazy_io_queue::dispatch_log_for_testing() const {
+    return s_->log;
+}
+#endif
+
+bool lazy_io_deliver(const lazy_io_waiter & waiter, const uint8_t * read_bytes, int read_errno) noexcept {
+    GGML_UNUSED(waiter);
+    GGML_UNUSED(read_bytes);
+    GGML_UNUSED(read_errno);
+    return false;
+}
+
 }  // namespace ggml_sycl

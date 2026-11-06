@@ -281,7 +281,8 @@ if (BUILD_TESTING)
 
     # The lazy tables' IO pool registry (th32 §3.3, §11 T3): the counted lease, clone, park, DYING, the FULL reap, the
     # coverage wrapper, the helper guard and shut-down. lazy-io-pool.cpp includes no SYCL header, so this target links
-    # it alone with ggml-base for the abort and the log: no device, no unified cache, no SYCL module. Its abort legs
+    # it with the row cache its reaper inserts into (lazy-row-cache.cpp and host-cpu-mapping.cpp, both device-free) and
+    # ggml-base for the abort and the log: no device, no unified cache, no SYCL module. Its abort legs
     # re-execute the binary through fork and /proc/self/exe, so it is Linux-only.
     #
     # Each MUTANTS pair is a positive control: a macro that plants one defect in lazy-io-pool.cpp, and the FAIL line the
@@ -317,7 +318,9 @@ if (BUILD_TESTING)
             list(GET _lazy_io_pool_host_variants ${_k} _regex)
             add_executable(${_name}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-pool-host.cpp
-                lazy-io-pool.cpp)
+                lazy-io-pool.cpp
+                lazy-row-cache.cpp
+                host-cpu-mapping.cpp)
             target_include_directories(${_name} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
             target_compile_definitions(${_name} PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
@@ -335,6 +338,106 @@ if (BUILD_TESTING)
             endif()
         endforeach()
     endif()
+
+    # The IO engine's queue (th32 §5.2.1) and the reaper's delivery (§5.3), host-only: the queue is a data structure
+    # the pool calls under its queue lock, so the order of §5.2.1 is exercised on one thread with fixture requests, no
+    # worker, no ring and no device. Links lazy-io-pool.cpp with the row cache its reaper inserts into
+    # (lazy-row-cache.cpp, host-cpu-mapping.cpp) and ggml-base for the log.
+    #
+    # Each MUTANTS pair is a positive control: a macro that plants one defect in lazy-io-pool.cpp's queue or delivery,
+    # and the FAIL line the arm that kills it prints. Each builds test-sycl-lazy-io-queue-host-mutant-<macro suffix>,
+    # and a ctest of that name which passes only when that line appears.
+    set(_lq_key "FAIL class 0 dispatches by \\(epoch, deadline\\), rows first, equal keys in order: dispatched ")
+    set(_lq_key_want ", want 106 103 102 105 104 100 101")
+    set(_lq_rekey_want "0 1 2 3 4 5 6 7 8 9 99 30 31 32 33 34 20 21 22 23 24")
+    set(_lq_join "FAIL a join from another context adds an entry at the joiner's key: block 97 dispatched at pick ")
+    string(CONCAT _lq_re_deadline_only "${_lq_key}100 101 106 103 102 105 104${_lq_key_want}")
+    string(CONCAT _lq_re_slices_first "${_lq_key}103 106 104 102 105 100 101${_lq_key_want}")
+    string(CONCAT _lq_re_equal_key_lifo "${_lq_key}106 103 105 102 104 101 100${_lq_key_want}")
+    string(CONCAT _lq_re_plain_epoch
+        "FAIL the epoch order survives the counter's wrap: dispatched 202 200 201, want 201 202 200")
+    string(CONCAT _lq_re_no_round_robin
+        "FAIL the contexts take turns: context 2's reads dispatched at picks 100 101 102 103, want 1 3 5 7")
+    string(CONCAT _lq_re_class_blind
+        "FAIL class 1 waits for every context's class 0: dispatched 0 13 1 10 2 11 12, want 10 11 12 0 13 1 2")
+    string(CONCAT _lq_re_no_promotion
+        "FAIL a class-0 join promotes a lookahead read: dispatched 10 2 0 1, want 10 2 1 0")
+    string(CONCAT _lq_re_no_chunking
+        "FAIL a span is read in chunks of at most 512 KiB: the span was queued as 1 reads, want 4 of at most 524288 B")
+    string(CONCAT _lq_re_no_dedup
+        "FAIL a request for a pending block joins its read: after two requests for block 5 and one for block 6, "
+        "3 reads in flight, want 2")
+    string(CONCAT _lq_re_join_keeps_position
+        "FAIL a same-context join takes the more urgent key and keeps its number: dispatched "
+        "0 1 2 3 4 5 6 7 8 9 30 31 32 33 34 20 21 22 23 24 99, want ${_lq_rekey_want}")
+    string(CONCAT _lq_re_no_second_entry "${_lq_join}100 from context 1, want pick 5 from context 2")
+    string(CONCAT _lq_re_cross_context_rekey "${_lq_join}0 from context 1, want pick 5 from context 2")
+    string(CONCAT _lq_re_fifo_ignored
+        "FAIL the FIFO override serves reads in enqueue order: dispatched 0 200 1 201 2 202 3 203 4 5 6 7 8 9 50, "
+        "want 0 1 2 3 4 5 6 7 8 9 200 201 202 203 50")
+    string(CONCAT _lq_re_log_at_completion
+        "FAIL the dispatch log numbers a read when a worker picks it up: the dispatch log lists blocks 2 1 0, "
+        "want 0 1 2")
+    string(CONCAT _lq_re_deliver_ignores_epoch
+        "FAIL the reaper copies only into its own epoch's live slot: a waiter for epoch 4 wrote into the slot at "
+        "epoch 5")
+    set(_lazy_io_queue_mutants
+        LAZY_IO_QUEUE_MUTANT_DEADLINE_ONLY          "${_lq_re_deadline_only}"
+        LAZY_IO_QUEUE_MUTANT_SLICES_FIRST           "${_lq_re_slices_first}"
+        LAZY_IO_QUEUE_MUTANT_EQUAL_KEY_LIFO         "${_lq_re_equal_key_lifo}"
+        LAZY_IO_QUEUE_MUTANT_PLAIN_EPOCH_COMPARE    "${_lq_re_plain_epoch}"
+        LAZY_IO_QUEUE_MUTANT_NO_ROUND_ROBIN         "${_lq_re_no_round_robin}"
+        LAZY_IO_QUEUE_MUTANT_CLASS_BLIND            "${_lq_re_class_blind}"
+        LAZY_IO_QUEUE_MUTANT_NO_PROMOTION           "${_lq_re_no_promotion}"
+        LAZY_IO_QUEUE_MUTANT_NO_CHUNKING            "${_lq_re_no_chunking}"
+        LAZY_IO_QUEUE_MUTANT_NO_DEDUP               "${_lq_re_no_dedup}"
+        LAZY_IO_QUEUE_MUTANT_JOIN_KEEPS_POSITION    "${_lq_re_join_keeps_position}"
+        LAZY_IO_QUEUE_MUTANT_NO_SECOND_ENTRY        "${_lq_re_no_second_entry}"
+        LAZY_IO_QUEUE_MUTANT_CROSS_CONTEXT_REKEY    "${_lq_re_cross_context_rekey}"
+        LAZY_IO_QUEUE_MUTANT_FIFO_IGNORED           "${_lq_re_fifo_ignored}"
+        LAZY_IO_QUEUE_MUTANT_LOG_AT_COMPLETION      "${_lq_re_log_at_completion}"
+        LAZY_IO_QUEUE_MUTANT_DELIVER_IGNORES_EPOCH  "${_lq_re_deliver_ignores_epoch}")
+    set(_lazy_io_queue_variants test-sycl-lazy-io-queue-host "" "")
+    list(LENGTH _lazy_io_queue_mutants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _lazy_io_queue_mutants ${_i} _macro)
+        list(GET _lazy_io_queue_mutants ${_j} _regex)
+        string(REGEX REPLACE "^LAZY_IO_QUEUE_MUTANT_" "" _suffix "${_macro}")
+        string(TOLOWER "${_suffix}" _suffix)
+        string(REPLACE "_" "-" _suffix "${_suffix}")
+        list(APPEND _lazy_io_queue_variants test-sycl-lazy-io-queue-host-mutant-${_suffix} "${_macro}" "${_regex}")
+    endforeach()
+    list(LENGTH _lazy_io_queue_variants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 3)
+        math(EXPR _j "${_i} + 1")
+        math(EXPR _k "${_i} + 2")
+        list(GET _lazy_io_queue_variants ${_i} _name)
+        list(GET _lazy_io_queue_variants ${_j} _macro)
+        list(GET _lazy_io_queue_variants ${_k} _regex)
+        add_executable(${_name}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-queue-host.cpp
+            lazy-io-pool.cpp
+            lazy-row-cache.cpp
+            host-cpu-mapping.cpp)
+        target_include_directories(${_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_compile_definitions(${_name} PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        target_link_libraries(${_name} PRIVATE ggml-base Threads::Threads)
+        set_target_properties(${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME ${_name} COMMAND ${_name})
+        if (_macro STREQUAL "")
+            set_tests_properties(${_name} PROPERTIES LABELS "sycl;host" TIMEOUT 120)
+        else()
+            target_compile_definitions(${_name} PRIVATE ${_macro}=1)
+            set_tests_properties(${_name} PROPERTIES
+                LABELS "sycl;host;mutant"
+                TIMEOUT 120
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endif()
+    endforeach()
 
     # The hot-row cache of a STORAGE lazy table (th32 §6.3, §6.4, §11 T4): CLOCK replacement, shard independence, the
     # 13.3 B/slot index, the no-leases rule, the yield that frees a chunk with no wait while rows stay gatherable, the

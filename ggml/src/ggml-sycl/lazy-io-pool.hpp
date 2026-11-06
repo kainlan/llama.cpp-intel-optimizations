@@ -16,8 +16,12 @@
 // on or logged under it. A take reserves a generation under it, builds its pool outside it and installs the pool under
 // it on a generation match; a final drop only parks the pool, and the reap frees parked pools after its unlock.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 namespace ggml_sycl {
 
@@ -168,6 +172,175 @@ class lazy_coverage_scope {
     reap_guard guard_;
     ring_lease lease_;
 };
+
+// ---- The IO engine's queue (§5.2.1) and the §5.3 types a read delivers through ----
+
+class lazy_row_cache;
+struct lazy_io_ticket;
+
+// A read's priority class (§5.2.1): the prefetched ubatches are served before lookahead.
+enum class lazy_io_class : uint8_t {
+    PREFETCH  = 0,  // class 0
+    LOOKAHEAD = 1,  // class 1 (§5.4): served only while no context has a class-0 read queued
+};
+
+// What a read feeds, the key's last term (§5.2.1): at an equal layer a lazy table's rows go before an expert slice,
+// because the engram consumer runs at the head of its layer and the expert FFN runs at its end.
+enum class lazy_io_kind : uint8_t {
+    TABLE_ROWS   = 0,
+    EXPERT_SLICE = 1,
+};
+
+// The longest read (§5.2.1): a span is queued as reads of at most this many bytes, so a read queued with an earlier key
+// waits at most for the chunk a worker has already started. A row block is 4 or 8 KiB and is one read. An enumerator,
+// so the bound adds no namespace-scope object (§11).
+enum lazy_io_chunk : uint64_t { LAZY_IO_CHUNK_BYTES = 512ull << 10 };
+
+// A queued read's key within its context (§5.2.1): (class, epoch, deadline, kind), compared lexicographically. The
+// epoch is the ubatch's (§5.3), compared by serial-number arithmetic so the order survives the counter's wrap; the
+// deadline is the layer whose execution needs the read. Keys of two contexts never compare: their epochs come from
+// independent counters.
+struct lazy_io_key {
+    lazy_io_class cls      = lazy_io_class::PREFETCH;
+    uint32_t      epoch    = 0;
+    int32_t       deadline = 0;
+    lazy_io_kind  kind     = lazy_io_kind::TABLE_ROWS;
+};
+
+// A read's place in its file (§5.2): a block-aligned offset and length. The in-flight table dedups on all three terms,
+// so two requests join only when they ask for the same bytes. `file` is the file's identity, never a descriptor
+// number: the submitter derives it from the file's device and inode, so two descriptors on one file read one id.
+struct lazy_io_span {
+    uint64_t file   = 0;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+};
+
+// The slot of the landing slab a STORAGE ticket's rows land in (§5.3), indexed by the epoch mod 2. Its leaf lock guards
+// the epoch and the copy: the reaper copies only while the slot's epoch is the waiter's. The memory is the context's;
+// the slot only names it.
+struct lazy_landing_slot {
+    std::mutex lock;  // a leaf (§5.3): nothing is taken under it
+    uint32_t   epoch = 0;
+    uint8_t *  data  = nullptr;
+    size_t     bytes = 0;
+};
+
+// One epoch's gather request (§5.3), never reused. The cancel step sets `cancelled`, and `drain` on an epoch already
+// enqueued; either stops the reaper's copy into the landing slot. The gather context is T7's and opaque here.
+struct lazy_gather_request {
+    void *            gather_ctx = nullptr;
+    uint32_t          epoch      = 0;
+    lazy_io_ticket *  ticket     = nullptr;  // STORAGE only
+    std::atomic<bool> cancelled{ false };
+    std::atomic<bool> drain{ false };
+};
+
+// A STORAGE request's ticket (§5.3): `outstanding` counts the waiters not yet delivered, so the consumer waits for 0.
+// `read_error` keeps the first failed read's errno, stored before that waiter's decrement, so a consumer that sees 0
+// also sees the failure.
+struct lazy_io_ticket {
+    lazy_gather_request * request = nullptr;
+    std::atomic<int>      outstanding{ 0 };
+    std::atomic<int>      read_error{ 0 };
+};
+
+// One waiter on a read (§5.2.1, §5.3): its ticket, its epoch, and where its bytes go. `src_offset` and `bytes` select
+// the waiter's bytes in the read; the landing copy goes to landing->data + landing_offset, and `row` is inserted into
+// `cache` whether or not the landing copy happens. The caller keeps the ticket, the request and the landing slot alive
+// until the ticket's count reaches 0.
+struct lazy_io_waiter {
+    lazy_io_ticket *    ticket         = nullptr;
+    uint32_t            epoch          = 0;
+    lazy_landing_slot * landing        = nullptr;  // null for a read with no landing, a lookahead
+    size_t              landing_offset = 0;
+    uint64_t            src_offset     = 0;
+    size_t              bytes          = 0;
+    lazy_row_cache *    cache          = nullptr;  // null for no insert
+    int64_t             row            = -1;
+};
+
+// One read: queued in one context's queue, or in several after a join from another context, then dispatched to one
+// worker, then completed. It holds a lease on the pool from its submission until its waiters are delivered, so the
+// pool and its ring outlive every read in flight (§3.3).
+struct lazy_io_read {
+    lazy_io_span                span;
+    int                         fd = -1;
+    std::vector<lazy_io_waiter> waiters;
+    ring_lease                  lease;
+    bool                        dispatched   = false;
+    uint64_t                    dispatch_seq = 0;  // the dispatch log's number, taken when a worker picks it up
+};
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// One dispatch log entry (§5.2.1): which read a pick took, from which context's queue, and at which key and enqueue
+// sequence number. The ordering witnesses score this log, never the completion order.
+struct lazy_io_dispatch_record {
+    uint64_t     dispatch_seq = 0;
+    uint64_t     context      = 0;
+    lazy_io_span span;
+    lazy_io_key  key;
+    uint64_t     enqueue_seq = 0;
+};
+#endif
+
+// The one queue of §5.2.1 and its in-flight table. Class 0 keeps one queue per context, ordered by key and then by the
+// enqueue sequence number, and the picks take the contexts in turn; class 1 is picked only while no class-0 read is
+// queued anywhere. Not synchronized: the pool calls it under its queue lock, a leaf (§5.3), and a host test calls it on
+// one thread, so the order can be exercised with no worker and no device.
+class lazy_io_queue {
+  public:
+    lazy_io_queue();
+    ~lazy_io_queue();
+    lazy_io_queue(const lazy_io_queue &)             = delete;
+    lazy_io_queue & operator=(const lazy_io_queue &) = delete;
+
+    // Queues the reads that cover `span` for `context` at `key`, one per chunk of at most LAZY_IO_CHUNK_BYTES, each
+    // with its share of `waiter` (the part of [src_offset, src_offset + bytes) that falls in that chunk). A chunk
+    // already in flight is joined instead (§5.2.1): a queued read joined from the same context is re-keyed to the more
+    // urgent of the two keys and keeps its sequence number, one joined from another context gains a second entry in the
+    // joiner's queue at the joiner's key, and a dispatched read only gains the waiter. A new read takes its lease from
+    // the back of `spare_leases` when one is left; the caller drops what remains after it unlocks. Each waiter added
+    // counts once in its ticket's `outstanding`. Returns the waiters added; 0 for a span that is empty or not
+    // block-aligned.
+    size_t submit(uint64_t                  context,
+                  int                       fd,
+                  const lazy_io_span &      span,
+                  const lazy_io_key &       key,
+                  const lazy_io_waiter &    waiter,
+                  std::vector<ring_lease> & spare_leases);
+
+    // A worker's pick (§5.2.1): the next read in the order, marked dispatched and numbered in the dispatch log, and
+    // every queue entry it had removed. Null when nothing is queued. The read stays in the in-flight table, so a
+    // request for it joins it, until complete() takes it out.
+    lazy_io_read * pick();
+
+    // Takes a dispatched read out of the in-flight table and hands it over: the caller delivers its waiters and then
+    // destroys it, dropping its lease, after unlocking.
+    std::unique_ptr<lazy_io_read> complete(lazy_io_read * read);
+
+    size_t queued_entries() const;  // queue entries, a read with two entries counted twice
+    size_t in_flight() const;       // reads in the in-flight table, queued or dispatched
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // The test-only FIFO ordering override (§5.2.1): picks serve entries in enqueue order, whatever their class,
+    // context or key. Witness 1's positive control; nothing outside a test sets it.
+    void set_fifo_for_testing(bool fifo);
+
+    const std::vector<lazy_io_dispatch_record> & dispatch_log_for_testing() const;
+#endif
+
+  private:
+    struct state;
+    std::unique_ptr<state> s_;
+};
+
+// The reaper's delivery of one waiter of a completed read (§5.3): under the landing slot's lock, the copy only while
+// the slot's epoch is the waiter's and its request is neither cancelled nor draining; then, with no lock held, the
+// row's insert into the cache, whether or not the copy happened; then the ticket's decrement. A read that failed
+// (`read_errno` nonzero) copies and inserts nothing, stores the errno in the ticket if none is stored, and still
+// decrements. Returns whether this delivery took the ticket's count to 0.
+bool lazy_io_deliver(const lazy_io_waiter & waiter, const uint8_t * read_bytes, int read_errno) noexcept;
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The registry's state, read under its leaf mutex (§11's wrapper arm). The two take-time snapshots are the reaps run
