@@ -395,7 +395,7 @@ inline int run_cases(const char *                      exe,
             fprintf(stderr, "FAIL [%s] the case died by signal %d\n", name, WTERMSIG(r.status));
             any_fail = true;
         } else if (WEXITSTATUS(r.status) == SYCL_TEST_SKIP) {
-            fprintf(stderr, "VOID [%s] (exit 77)\n", name);
+            fprintf(stderr, "VOID [%s] (exit %d)\n", name, SYCL_TEST_SKIP);
             any_void = true;
         } else if (WEXITSTATUS(r.status) != 0) {
             fprintf(stderr, "FAIL [%s] exit %d\n", name, WEXITSTATUS(r.status));

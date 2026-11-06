@@ -349,7 +349,7 @@ std::string status_of(const child_run & r) {
 // A child that must abort with `line` on its stderr.
 verdict score_abort(const char * who, const child_run & r, const char * line) {
     if (WIFEXITED(r.status) && WEXITSTATUS(r.status) == SYCL_TEST_SKIP) {
-        fprintf(stderr, "VOID [%s] (exit 77)\n", who);
+        fprintf(stderr, "VOID [%s] (exit %d)\n", who, SYCL_TEST_SKIP);
         return verdict::VOID;
     }
     if (WIFSIGNALED(r.status) && WTERMSIG(r.status) == SIGABRT) {
@@ -366,7 +366,7 @@ verdict score_abort(const char * who, const child_run & r, const char * line) {
 
 verdict score_clean(const char * who, const child_run & r) {
     if (WIFEXITED(r.status) && WEXITSTATUS(r.status) == SYCL_TEST_SKIP) {
-        fprintf(stderr, "VOID [%s] (exit 77)\n", who);
+        fprintf(stderr, "VOID [%s] (exit %d)\n", who, SYCL_TEST_SKIP);
         return verdict::VOID;
     }
     if (WIFEXITED(r.status) && WEXITSTATUS(r.status) == 0) {
