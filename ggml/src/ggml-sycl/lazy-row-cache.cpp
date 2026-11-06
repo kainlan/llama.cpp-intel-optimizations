@@ -316,12 +316,12 @@ lazy_row_cache_build lazy_row_cache::build(const lazy_row_cache_config &  config
         result.status = status;
         result.reason = reason;
         GGML_LOG_INFO("[LAZY-ROW-CACHE] %s refused: %s: %s\n", config.name.c_str(), lazy_row_cache_status_name(status),
-                      reason.c_str());
+                                reason.c_str());
         return std::move(result);
     };
 
-    const size_t slots = config.cache_slots;
-    const size_t row   = config.row_size;
+    const size_t      slots    = config.cache_slots;
+    const size_t      row      = config.row_size;
     // The geometry by the chunk helpers' rule, then what only a built cache needs: keys for its rows and a shard.
     const std::string geometry = lazy_row_cache_geometry_refusal(slots, config.floor_slots, row, config.chunk_bytes);
     if (!geometry.empty()) {
