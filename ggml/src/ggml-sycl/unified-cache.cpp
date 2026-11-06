@@ -19,6 +19,7 @@
 #include "kv-region-registry.hpp"
 #include "kv-tier-manager.hpp"
 #include "lazy-io-pool.hpp"
+#include "lazy-row-cache.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
@@ -1360,6 +1361,16 @@ void host_ledger_unregister_yielder(int slot_index) {
     slot.ctx.store(nullptr, std::memory_order_release);
     slot.claimed.store(false, std::memory_order_release);
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+int host_ledger_yielder_slots_claimed_for_testing() {
+    int claimed = 0;
+    for (int i = 0; i < 2 * GGML_SYCL_MAX_DEVICES; ++i) {
+        claimed += g_host_ledger_yielders[i].claimed.load(std::memory_order_acquire) ? 1 : 0;
+    }
+    return claimed;
+}
+#endif
 
 // The charge the owner entry holds for one HOST_CPU request (th32 §4.2): the owner entry charges the ledger before any
 // allocation, the registry row takes the charge when unified_alloc records the mapping, and the row's one free credits
@@ -22285,6 +22296,16 @@ static size_t host_ledger_test_live_charged_bytes() {
 }
 #endif
 
+size_t unified_alloc_host_cpu_charged_bytes(const alloc_metadata & meta) {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto                  it = g_runtime_alloc_registry.find(meta.ptr);
+    if (it == g_runtime_alloc_registry.end() || it->second.state != runtime_alloc_state::LIVE ||
+        it->second.handle.tier != alloc_tier::HOST_CPU || !(it->second.handle.key() == meta.key())) {
+        return 0;
+    }
+    return it->second.charged_bytes;
+}
+
 bool unified_alloc_validate_registry(int device, const char * where) {
     const registry_tier_sums sums                 = unified_alloc_registry_tier_sums();
     const auto &             registry_device      = sums.device;
@@ -34137,18 +34158,23 @@ static size_t lazy_row_cache_slots_within(size_t floor_slots, size_t max_slots, 
     return lo;
 }
 
-// A lazy table's yieldable bytes (th32 §6.4): what a STORAGE cache holds above its floor. A HOST table yields nothing.
+// A lazy table's yieldable bytes (th32 §6.4): what a STORAGE cache holds above its floor, by the row cache's own chunk
+// rule, so the plan counts the bytes the built cache publishes. A HOST table yields nothing.
 static size_t lazy_table_yieldable_bytes(const placement_lazy_table & table, size_t row_size) {
     if (table.residency != lazy_residency::STORAGE) {
         return 0;
     }
-    return table.host_resident_bytes - lazy_row_cache_resident_bytes(table.cache_floor_slots, row_size);
+    return lazy_row_cache_yieldable_bytes(table.cache_slots, table.cache_floor_slots, row_size,
+                                          LAZY_ROW_CACHE_CHUNK_BYTES);
 }
 
 std::string placement_lazy_table_fields(const placement_lazy_table & table, const placement_lazy_table_info * info) {
     const std::string device = table.consumer_device >= 0 ? std::to_string(table.consumer_device) : "CPU";
+    // locked= is the resident records' tier property (th32 §3.1, §10): both residencies hold locked HOST_CPU memory,
+    // so it is yes whenever the table holds resident bytes and none only at 0.
+    const char *      locked = table.host_resident_bytes != 0 ? "yes" : "none";
     std::string       fields = "table=" + std::to_string(table.table_bytes) +
-                         " resident=" + std::to_string(table.host_resident_bytes) +
+                         " resident=" + std::to_string(table.host_resident_bytes) + " locked=" + locked +
                          " cache_slots=" + std::to_string(table.cache_slots) +
                          " floor_slots=" + std::to_string(table.cache_floor_slots) + " consumer_device=" + device;
     if (info != nullptr) {
@@ -34265,7 +34291,9 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
         t.table_bytes       = info.table_bytes;
         t.consumer_device   = lazy_consumer_device(plan, info.consumer_layer);
         t.cache_floor_slots = 2ull * placement_load_n_ubatch(kv_info.n_ubatch) * info.rows_per_token;
-        const size_t body   = host_cpu_mapped_size(info.table_bytes);
+        // The HOST term is the body the materialization allocates, the O_DIRECT window over the table (§3.3).
+        const size_t body =
+            host_cpu_mapped_size(lazy_table_host_body_request_bytes(info.file_offset, info.table_bytes));
         const size_t with   = host_ledger_sat_add(used, body);
         const size_t span   = lazy_block_ring_span(info.row_size);
         if (body != 0 && with <= fit_room && with <= p3_room) {
@@ -34330,9 +34358,9 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
     plan.host_planned_bytes = placement_plan_host_planned_bytes(plan);
 
     // The plan lines (§10), WARN so a normal run shows them: one per planned table and one for the plan. They print
-    // every field the plan holds today, a table's through placement_lazy_table_fields and the refusal through
-    // placement_lazy_refusal_text, the formatters the dry run prints with; locked, output_slot, landing and cold_set
-    // wait for the rows that add them.
+    // every field the plan holds today, a table's through placement_lazy_table_fields (locked= among them) and the
+    // refusal through placement_lazy_refusal_text, the formatters the dry run prints with; output_slot, landing and
+    // cold_set wait for the rows that add them.
     const size_t planned       = plan.host_planned_bytes;
     const size_t leftover      = host_ledger_sat_sub(budget, host_ledger_sat_add(planned, reserve + envelope));
     size_t       lazy_resident = 0;

@@ -1,6 +1,6 @@
 //
-// The harness both host ledger tests share: an arm's PASS, FAIL or VOID verdict, the captured log lines the arms read,
-// and the child runner their abort legs use. Each test includes it once.
+// The harness both host ledger tests share: an arm's PASS, FAIL or VOID verdict, the loop that runs the arms, the
+// captured log lines the arms read, and the child runner their abort legs use. Each test includes it once.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -22,9 +22,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
+
+extern char ** environ;
 
 namespace host_ledger_test_harness {
 
@@ -59,6 +62,40 @@ inline void expect(arm_result & r, bool condition, const std::string & why) {
 inline std::string num(uint64_t v) {
     return std::to_string(static_cast<unsigned long long>(v));
 }
+
+// --- the arm loop ---
+
+// In a namespace of its own, so a test that names the harness with a using-directive and keeps a loop of its own
+// sees no second outcome_name; a test that runs its arms through this loop names it.
+namespace arm_loop {
+
+struct named_arm {
+    const char * name;
+    arm_result (*run)();
+};
+
+inline const char * outcome_name(outcome o) {
+    return o == outcome::PASS ? "PASS" : o == outcome::FAIL ? "FAIL" : "VOID";
+}
+
+// Runs every arm, so one failure does not hide the rest, printing each verdict, then `label` with the counts. Returns
+// the binary's status: 0 only when every arm passed, since a VOID arm fails the binary like a FAIL.
+inline int run_arms(const std::vector<named_arm> & arms, const std::string & label) {
+    int passed = 0, failed = 0, voided = 0;
+    for (const named_arm & arm : arms) {
+        const arm_result result = arm.run();
+        std::printf("%s %s%s%s\n", outcome_name(result.result), arm.name, result.why.empty() ? "" : ": ",
+                    result.why.c_str());
+        std::fflush(stdout);
+        passed += result.result == outcome::PASS;
+        failed += result.result == outcome::FAIL;
+        voided += result.result == outcome::VOID;
+    }
+    std::printf("%s: %d passed, %d failed, %d void\n", label.c_str(), passed, failed, voided);
+    return failed == 0 && voided == 0 ? 0 : 1;
+}
+
+}  // namespace arm_loop
 
 // --- the log lines the arms read ---
 
@@ -170,6 +207,64 @@ inline child_run run_child(char * const * argv, char * const * envp, std::chrono
     }
     r.ran = !timed_out;
     return r;
+}
+
+// This process's environment for a child, each "NAME=value" of `sets` replacing any inherited NAME, so the child's
+// getenv reads the value given here and never the first of two entries.
+inline std::vector<std::string> child_environment(const std::vector<std::string> & sets) {
+    std::vector<std::string> env;
+    for (char ** e = environ; e != nullptr && *e != nullptr; ++e) {
+        bool replaced = false;
+        for (const std::string & set : sets) {
+            const size_t eq = set.find('=');
+            if (eq != std::string::npos && std::strncmp(*e, set.c_str(), eq + 1) == 0) {
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            env.emplace_back(*e);
+        }
+    }
+    env.insert(env.end(), sets.begin(), sets.end());
+    return env;
+}
+
+// run_child over strings: builds the argv and envp arrays before the fork, as run_child requires, and keeps the
+// strings alive until the child is reaped.
+inline child_run run_child_strings(std::vector<std::string>  args,
+                                   std::vector<std::string>  env,
+                                   std::chrono::milliseconds bound) {
+    std::vector<char *> argv;
+    std::vector<char *> envp;
+    for (std::string & a : args) {
+        argv.push_back(a.data());
+    }
+    argv.push_back(nullptr);
+    for (std::string & e : env) {
+        envp.push_back(e.data());
+    }
+    envp.push_back(nullptr);
+    return run_child(argv.data(), envp.data(), bound);
+}
+
+// How many lines of `text` contain `a`, and `b` too when it is given: log_count_with's match over a child's stderr
+// rather than the captured log.
+inline size_t text_count_with(const std::string & text, const char * a, const char * b = nullptr) {
+    size_t count = 0;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        const std::string line = text.substr(start, end - start);
+        if (line.find(a) != std::string::npos && (b == nullptr || line.find(b) != std::string::npos)) {
+            count++;
+        }
+        start = end + 1;
+    }
+    return count;
 }
 
 }  // namespace host_ledger_test_harness

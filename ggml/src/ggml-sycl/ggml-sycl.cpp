@@ -118,6 +118,7 @@
 #include "ggml-sycl/kv-region-registry.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
 #include "ggml-sycl/lazy-io-pool.hpp"
+#include "ggml-sycl/lazy-table.hpp"
 #include "ggml-sycl/lightning-indexer.hpp"
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
@@ -18819,14 +18820,28 @@ static void ggml_sycl_plan_dry_run_residency(uint32_t                          i
 // plan's fields for it through placement_lazy_table_fields, the formatter the planner's [PLACEMENT] lazy lines use,
 // then one LAZY line for the plan: its tables' host_resident_bytes, the block ring's need and charge, and its refusal
 // through placement_lazy_refusal_text. A refused plan holds no table, so its refusal is the whole of its lazy report.
-// Nothing is decided here.
-static void ggml_sycl_plan_dry_run_lazy(uint32_t index, const ggml_sycl::placement_plan & plan) {
+// `lazy_infos` is the planner's input for the tables, the one the plan was decided from; a table's entry, found by
+// name, gives the formatter its row geometry, so the line carries yieldable= and the consumer fields as the
+// [PLACEMENT] line does. A plan built by hand has none, and its lines carry the plan's own fields alone. Nothing is
+// decided here.
+static void ggml_sycl_plan_dry_run_lazy(uint32_t                                                  index,
+                                        const ggml_sycl::placement_plan &                         plan,
+                                        const std::vector<ggml_sycl::placement_lazy_table_info> * lazy_infos) {
     size_t resident = 0;
     for (const ggml_sycl::placement_lazy_table & t : plan.lazy_tables) {
         resident += t.host_resident_bytes;
+        const ggml_sycl::placement_lazy_table_info * info = nullptr;
+        if (lazy_infos != nullptr) {
+            for (const ggml_sycl::placement_lazy_table_info & candidate : *lazy_infos) {
+                if (candidate.name == t.name) {
+                    info = &candidate;
+                    break;
+                }
+            }
+        }
         GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d LAZY %s residency=%s %s\n", index, plan.device_id,
                       t.name.c_str(), t.residency == ggml_sycl::lazy_residency::STORAGE ? "STORAGE" : "HOST",
-                      ggml_sycl::placement_lazy_table_fields(t, nullptr).c_str());
+                      ggml_sycl::placement_lazy_table_fields(t, info).c_str());
     }
     GGML_LOG_INFO(
         "[PLAN-DRY-RUN] plan=%u device=%d LAZY tables=%zu lazy_resident=%zu ring_need=%zu ring=%zu refusal=%s\n", index,
@@ -18838,10 +18853,11 @@ static void ggml_sycl_plan_dry_run_lazy(uint32_t index, const ggml_sycl::placeme
 // WEIGHT terms are the walk populate_host_zone_sizing() sized the zone with; the commit terms are the configure step's
 // sizing (ggml_sycl_configure_host_zones_for_plan) over the inputs the plan recorded, which record_host_ledger_plan()
 // summed, with the lazy tables' part, into host_planned_bytes; expected_host is that figure.
-static void ggml_sycl_plan_dry_run_record(uint32_t                          index,
-                                          const ggml_sycl::placement_plan & plan,
-                                          bool                              multi_device,
-                                          ggml_sycl_plan_dry_run_plan &     out) {
+static void ggml_sycl_plan_dry_run_record(uint32_t                                                  index,
+                                          const ggml_sycl::placement_plan &                         plan,
+                                          bool                                                      multi_device,
+                                          const std::vector<ggml_sycl::placement_lazy_table_info> * lazy_infos,
+                                          ggml_sycl_plan_dry_run_plan &                             out) {
     const ggml_sycl::host_weight_zone_terms weight = ggml_sycl::placement_plan_host_weight_zone_terms(plan);
     const ggml_sycl::host_zone_commit_terms terms  = ggml_sycl::placement_plan_host_zone_commit_terms(
         plan, plan.host_zone_terms.onednn_live, plan.host_zone_terms.chunk);
@@ -18907,7 +18923,7 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                          inde
                       index, plan.device_id, ggml_sycl_plan_dry_run_backing_name(b), out.residency_count[b],
                       out.residency_bytes[b], out.residency_bytes[b] / (1024.0 * 1024.0));
     }
-    ggml_sycl_plan_dry_run_lazy(index, plan);
+    ggml_sycl_plan_dry_run_lazy(index, plan, lazy_infos);
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -18915,7 +18931,7 @@ namespace ggml_sycl {
 // The record on a plan a test builds by hand, with backing mixes and charges a shaped inventory does not produce.
 ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const placement_plan & plan) {
     ggml_sycl_plan_dry_run_plan out{};
-    ggml_sycl_plan_dry_run_record(index, plan, false, out);
+    ggml_sycl_plan_dry_run_record(index, plan, false, nullptr, out);
     return out;
 }
 }  // namespace ggml_sycl
@@ -18925,15 +18941,17 @@ ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const place
 // planner inputs first, through the stage's helpers, against `host_budget`. A multi-device plan packs each physical
 // device to its budget authority's answer; a single-device plan to the arena's reservation when the device's cache
 // has an active arena, else to the authority's answer. A device budget in `opts` replaces either. Each device's budget
-// lands in `device_budget`. Plans nothing when the VRAM arena is disabled, as the stage then plans nothing. Reads a
-// cache that exists and creates none. Caller holds g_tensor_inventory_mutex and a saved state.
+// lands in `device_budget`, and the lazy tables' planner input, the one every plan here is decided from, in
+// `lazy_infos`. Plans nothing when the VRAM arena is disabled, as the stage then plans nothing. Reads a cache that
+// exists and creates none. Caller holds g_tensor_inventory_mutex and a saved state.
 static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     const ggml_sycl_tensor_inventory *  inventory,
     const ggml_sycl_plan_dry_run_opts & opts,
     size_t                              host_budget,
     size_t                              mem_available,
     bool                                budget_overridden,
-    uint64_t (&device_budget)[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES]) {
+    uint64_t (&device_budget)[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES],
+    std::vector<ggml_sycl::placement_lazy_table_info> & lazy_infos) {
     std::vector<ggml_sycl::placement_plan> plans;
     if (!ggml_sycl::vram_arena_enabled()) {
         GGML_LOG_INFO("[PLAN-DRY-RUN] the VRAM arena is disabled, so the load plans nothing and neither does this\n");
@@ -18948,6 +18966,7 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     // ledger's stored values.
     kv.host_mem_available_pre = mem_available;
     kv.host_budget_overridden = budget_overridden;
+    lazy_infos                = kv.lazy_tables;
     if (kv.n_ubatch_context != 0) {
         GGML_LOG_INFO(
             "[PLAN-DRY-RUN] n_ubatch_context=%u is not modelled: every plan is the load's planning shape "
@@ -19095,14 +19114,15 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         out.host_reserve_override   = reserve_override ? 1 : 0;
         out.host_budget             = host_budget;
 
-        std::vector<ggml_sycl::placement_plan> plans;
-        bool                                   multi_device = false;
+        std::vector<ggml_sycl::placement_plan>            plans;
+        std::vector<ggml_sycl::placement_lazy_table_info> lazy_infos;
+        bool                                              multi_device = false;
         {
             std::lock_guard<std::mutex>        lock(g_tensor_inventory_mutex);
             ggml_sycl_plan_dry_run_saved_state saved(ggml_sycl_info().total_gpu_count);
             multi_device = ggml_sycl_plan_multi_device();
             plans = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, sample.available_bytes, reserve_override,
-                                                 out.device_budget_bytes);
+                                                 out.device_budget_bytes, lazy_infos);
         }
         for (int d = 0; d < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES; ++d) {
             if (out.device_budget_bytes[d] != 0) {
@@ -19115,7 +19135,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         }
         out.n_plans = static_cast<uint32_t>(plans.size());
         for (uint32_t i = 0; i < out.n_plans; ++i) {
-            ggml_sycl_plan_dry_run_record(i, plans[i], multi_device, out.plans[i]);
+            ggml_sycl_plan_dry_run_record(i, plans[i], multi_device, &lazy_infos, out.plans[i]);
         }
         *result = out;
         return GGML_SYCL_LIFECYCLE_OK;
@@ -32597,6 +32617,24 @@ static bool ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test() {
 #endif
 }
 
+// The descriptor guard (th32 §3.2, T4). A lazy table's tensor, or a view of one, has no bytes behind its sentinel data
+// pointer, and the gather node is its only reader (§7.2), so a caller here is a plan bug nobody found. It fails closed,
+// before the layer-streaming registration below and before any device call, instead of registering the sentinel.
+static void ggml_sycl_get_data_ptr_guard_lazy(const ggml_tensor * tensor, int device) {
+    const ggml_tensor * root = tensor;
+    while (root->view_src != nullptr) {
+        root = root->view_src;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_sycl_buffer_is_lazy(tensor->buffer) ? tensor->buffer : root->buffer;
+    if (!ggml_backend_sycl_buffer_is_lazy(buffer)) {
+        return;
+    }
+    const ggml_sycl::lazy_table * table = ggml_backend_sycl_lazy_buffer_table(buffer);
+    GGML_LOG_WARN("[LAZY-PLAN-BUG] data pointer requested for lazy table %s (tensor %s, device %d)\n",
+                  table != nullptr ? table->name() : root->name, tensor->name, device);
+    GGML_ABORT("a lazy table's descriptor reached ggml_sycl_get_data_ptr_slow");
+}
+
 // Cold path for ggml_sycl_get_data_ptr: full resolution chain
 // (tiered cache, get_pointer_type, unified cache, staging).
 // Called only when the fast-path data_device[] cache misses.
@@ -32604,6 +32642,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
     if (tensor == nullptr) {
         return nullptr;
     }
+    ggml_sycl_get_data_ptr_guard_lazy(tensor, device);
 
     // Views must resolve through the root on the requested physical device
     // before any cached per-view direct handle can win.
@@ -35226,6 +35265,14 @@ static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int 
     return contexts.empty() ? nullptr : contexts.back();
 }
 
+// The tier read off a buffer whose context is taken to be a ggml_backend_sycl_buffer_context, with no buffer-type
+// test. Only the SYCL, SYCL_HostCompute and CPU-offload compute types hold one (ggml_backend_buffer_has_sycl_context);
+// for any other type this is the pre-existing undefined read th32 leaves as it is (§3.2).
+static bool ggml_sycl_buffer_context_tier_is_vram(ggml_backend_buffer_t buffer) {
+    auto * buf_ctx = static_cast<ggml_backend_sycl_buffer_context *>(buffer->context);
+    return buf_ctx->managed_meta.tier == ggml_sycl::alloc_tier::DEVICE_VRAM;
+}
+
 // Check if a tensor's buffer allocation is in device VRAM (not host-pinned fallback).
 // Uses managed metadata tier from the unified cache allocator — ground truth that works
 // correctly in multi-device Level Zero contexts (unlike sycl::get_pointer_type()).
@@ -35233,9 +35280,23 @@ static bool ggml_sycl_is_device_vram_buffer(const ggml_tensor * t) {
     if (!t || !t->buffer || !t->buffer->context) {
         return false;
     }
-    auto * buf_ctx = static_cast<ggml_backend_sycl_buffer_context *>(t->buffer->context);
-    return buf_ctx->managed_meta.tier == ggml_sycl::alloc_tier::DEVICE_VRAM;
+    // A lazy table's descriptor holds a table reference, not a SYCL buffer context, and has no bytes on any tier, so
+    // it answers false before the cast. Every other buffer type keeps today's read (th32 §3.2).
+    if (ggml_backend_sycl_buffer_is_lazy(t->buffer)) {
+        return false;
+    }
+    return ggml_sycl_buffer_context_tier_is_vram(t->buffer);
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+bool ggml_sycl_test_is_device_vram_buffer(const ggml_tensor * tensor) {
+    return ggml_sycl_is_device_vram_buffer(tensor);
+}
+
+bool ggml_sycl_test_device_vram_context_read(const ggml_tensor * tensor) {
+    return ggml_sycl_buffer_context_tier_is_vram(tensor->buffer);
+}
+#endif
 
 // The placement plan the MoE residency queries read for `device`: the cache's plan when it holds one, else
 // the global plan, else none. The one place that resolution is written; the owners are shared_ptrs returned
@@ -54282,6 +54343,231 @@ ggml_sycl_host_backing ggml_backend_sycl_planned_host_backing(const char * tenso
     // The transaction default (tensor_name NULL, or a routed expert the plan does not index by name): the planner
     // derived every entry's backing from the same fact, so a mapping load defaults to FILE_MAPPED.
     return GGML_SYCL_HOST_BACKING_FILE_MAPPED;
+}
+
+// --- the lazy-table descriptor buffer types (th32 §3.2) ---
+//
+// A lazy table's tensor is bound to a zero-byte descriptor on its consumer's executor: SYCL_Lazy for a SYCL consumer,
+// on the device the plan's query returns, and SYCL_Lazy_Host for a CPU consumer. A descriptor owns no bytes and no
+// mem_handle, only a lazy_table reference; every lazy byte is one of §3.3's owner-first handles. Its base is a
+// non-dereferenceable sentinel, so ggml_gallocr reads the tensor as allocated; its nominal size is the table's bytes;
+// is_host is false, so ggml_backend_sycl_get_weight_cache_key never registers it; its usage is WEIGHTS, so the
+// scheduler gives the gather to the backend that supports the type (§7.2). The interface is its own, never another
+// buffer type's: init_tensor is null, so binding sets no extra and registers nothing, and every data call
+// aborts naming the table.
+
+struct ggml_backend_sycl_lazy_buffer_context {
+    ggml_sycl::lazy_table_ref table;
+};
+
+static const char * ggml_backend_sycl_lazy_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return GGML_SYCL_NAME "_Lazy";
+}
+
+static const char * ggml_backend_sycl_lazy_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return GGML_SYCL_NAME "_Lazy_Host";
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// T4's positive control of its buffer-type table (ggml_sycl_test_lazy_predicate_too_broad).
+static std::atomic<bool> g_test_lazy_predicate_too_broad{ false };
+
+void ggml_sycl_test_lazy_predicate_too_broad(bool on) {
+    g_test_lazy_predicate_too_broad.store(on, std::memory_order_release);
+}
+#endif
+
+// Whether `buft` is a descriptor type, of either form: keyed by the get_name function, as the other SYCL buffer types
+// are. The one source of the fact, read by the predicate below and by the bind.
+static bool ggml_sycl_buft_is_lazy(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr) {
+        return false;
+    }
+    const auto get_name = buft->iface.get_name;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (g_test_lazy_predicate_too_broad.load(std::memory_order_acquire) &&
+        get_name == ggml_backend_sycl_buffer_type_get_name) {
+        return true;
+    }
+#endif
+    return get_name == ggml_backend_sycl_lazy_buffer_type_name ||
+           get_name == ggml_backend_sycl_lazy_host_buffer_type_name;
+}
+
+bool ggml_backend_sycl_buffer_is_lazy(ggml_backend_buffer_t buffer) {
+    return buffer != nullptr && ggml_sycl_buft_is_lazy(buffer->buft);
+}
+
+ggml_sycl::lazy_table * ggml_backend_sycl_lazy_buffer_table(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_sycl_buffer_is_lazy(buffer) || buffer->context == nullptr) {
+        return nullptr;
+    }
+    return static_cast<ggml_backend_sycl_lazy_buffer_context *>(buffer->context)->table.get();
+}
+
+// A data call reached a descriptor: the table has no bytes behind the sentinel, so the caller is a plan bug.
+[[noreturn]] static void ggml_sycl_lazy_buffer_data_call(ggml_backend_buffer_t buffer, const char * call) {
+    const ggml_sycl::lazy_table * table = ggml_backend_sycl_lazy_buffer_table(buffer);
+    GGML_LOG_WARN("[LAZY-PLAN-BUG] %s on lazy table %s: a descriptor holds no bytes\n", call,
+                  table != nullptr ? table->name() : "(unbound)");
+    GGML_ABORT("a data call reached a lazy-table descriptor");
+}
+
+static void * ggml_backend_sycl_lazy_buffer_get_base(ggml_backend_buffer_t buffer) {
+    GGML_UNUSED(buffer);
+    return reinterpret_cast<void *>(ggml_sycl::LAZY_TABLE_SENTINEL_BASE);
+}
+
+static void ggml_backend_sycl_lazy_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+                                                        ggml_tensor *         tensor,
+                                                        uint8_t               value,
+                                                        size_t                offset,
+                                                        size_t                size) {
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(value);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    ggml_sycl_lazy_buffer_data_call(buffer, "memset_tensor");
+}
+
+static void ggml_backend_sycl_lazy_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                     ggml_tensor *         tensor,
+                                                     const void *          data,
+                                                     size_t                offset,
+                                                     size_t                size) {
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(data);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    ggml_sycl_lazy_buffer_data_call(buffer, "set_tensor");
+}
+
+static void ggml_backend_sycl_lazy_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                     const ggml_tensor *   tensor,
+                                                     void *                data,
+                                                     size_t                offset,
+                                                     size_t                size) {
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(data);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    ggml_sycl_lazy_buffer_data_call(buffer, "get_tensor");
+}
+
+static bool ggml_backend_sycl_lazy_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
+                                                     const ggml_tensor *   src,
+                                                     ggml_tensor *         dst) {
+    GGML_UNUSED(src);
+    GGML_UNUSED(dst);
+    ggml_sycl_lazy_buffer_data_call(buffer, "cpy_tensor");
+}
+
+// ggml_backend_buffer_clear calls clear unconditionally on a non-empty buffer, so it cannot be null; a clear would
+// overwrite the table's weights, so it aborts like the data calls.
+static void ggml_backend_sycl_lazy_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    GGML_UNUSED(value);
+    ggml_sycl_lazy_buffer_data_call(buffer, "clear");
+}
+
+static const ggml_backend_buffer_i ggml_backend_sycl_lazy_buffer_interface = {
+    /* .free_buffer     = */ nullptr,  // the context cleanup drops the table reference
+    /* .get_base        = */ ggml_backend_sycl_lazy_buffer_get_base,
+    /* .init_tensor     = */ nullptr,  // binding sets no extra and registers nothing
+    /* .memset_tensor   = */ ggml_backend_sycl_lazy_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_sycl_lazy_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_sycl_lazy_buffer_get_tensor,
+    /* .set_tensor_2d   = */ nullptr,  // ggml falls back to set_tensor, which aborts
+    /* .get_tensor_2d   = */ nullptr,  // ggml falls back to get_tensor, which aborts
+    /* .cpy_tensor      = */ ggml_backend_sycl_lazy_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_sycl_lazy_buffer_clear,
+    /* .reset           = */ nullptr,
+    /* .get_caps        = */ nullptr,  // the type's: STABLE_BASE, and no host access since is_host is false
+};
+
+static void ggml_backend_sycl_lazy_buffer_context_cleanup(void * context) {
+    delete static_cast<ggml_backend_sycl_lazy_buffer_context *>(context);
+}
+
+// A descriptor is bound to a table, never allocated: only ggml_backend_sycl_lazy_buffer_init makes one, and the
+// no_alloc pass's dummy comes from ggml_backend_buft_alloc_buffer's zero-size path, which never reaches here.
+static ggml_backend_buffer_t ggml_backend_sycl_lazy_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
+                                                                             size_t                     size) {
+    GGML_LOG_WARN("[LAZY-TABLE] %s refuses alloc_buffer(%zu): a descriptor is bound to a table, never allocated\n",
+                  buft->iface.get_name(buft), size);
+    return nullptr;
+}
+
+static size_t ggml_backend_sycl_lazy_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return TENSOR_ALIGNMENT;
+}
+
+static bool ggml_backend_sycl_lazy_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return false;
+}
+
+static ggml_backend_buffer_type ggml_sycl_lazy_buft_prototype() {
+    ggml_backend_buffer_type t{};
+    t.iface.get_name      = ggml_backend_sycl_lazy_buffer_type_name;
+    t.iface.alloc_buffer  = ggml_backend_sycl_lazy_buffer_type_alloc_buffer;
+    t.iface.get_alignment = ggml_backend_sycl_lazy_buffer_type_get_alignment;
+    t.iface.is_host       = ggml_backend_sycl_lazy_buffer_type_is_host;
+    t.context             = nullptr;
+    return t;
+}
+
+ggml_backend_buffer_type_t ggml_backend_sycl_lazy_buffer_type(int device) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_sycl_reg();
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || device >= ggml_backend_sycl_get_device_count() ||
+        static_cast<size_t>(device) >= ggml_backend_reg_dev_count(reg)) {
+        return nullptr;
+    }
+    static std::once_flag                                              initialized;
+    static std::array<ggml_backend_buffer_type, GGML_SYCL_MAX_DEVICES> per_device{};
+    return ggml_sycl_per_device_buft(per_device, initialized, ggml_sycl_lazy_buft_prototype, reg,
+                                     static_cast<size_t>(device), ggml_backend_reg_dev_get(reg, device));
+}
+
+ggml_backend_buffer_type_t ggml_backend_sycl_lazy_host_buffer_type() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return nullptr;
+    }
+    // The host tier's descriptor sits on the backend's first device, as SYCL_Host does; no device reads it (§7.1).
+    static ggml_backend_buffer_type buft = [] {
+        ggml_backend_buffer_type t = ggml_sycl_lazy_buft_prototype();
+        t.iface.get_name           = ggml_backend_sycl_lazy_host_buffer_type_name;
+        t.device                   = ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), 0);
+        return t;
+    }();
+    return &buft;
+}
+
+ggml_backend_buffer_t ggml_backend_sycl_lazy_buffer_init(ggml_backend_buffer_type_t buft,
+                                                         ggml_sycl::lazy_table_ref  table) {
+    const bool lazy_buft = ggml_sycl_buft_is_lazy(buft);
+    if (!lazy_buft || !table) {
+        GGML_LOG_WARN("[LAZY-TABLE] lazy_buffer_init refused: %s: buft=%s table=%s\n",
+                      lazy_buft ? "the table reference is empty" : "the buffer type is not a descriptor type",
+                      buft != nullptr ? buft->iface.get_name(buft) : "(none)", table ? table->name() : "(none)");
+        return nullptr;
+    }
+    const size_t          size   = table->desc().table_bytes;
+    auto *                ctx    = new ggml_backend_sycl_lazy_buffer_context{ std::move(table) };
+    // On a failure the wrapper runs the cleanup, which drops the reference.
+    ggml_backend_buffer_t buffer = ggml_backend_buffer_init_with_cleanup(
+        buft, ggml_backend_sycl_lazy_buffer_interface, ctx, size, ggml_backend_sycl_lazy_buffer_context_cleanup);
+    if (buffer != nullptr) {
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+    return buffer;
 }
 
 // Host compute buffer type - uses SYCL host memory with SYCL buffer interface

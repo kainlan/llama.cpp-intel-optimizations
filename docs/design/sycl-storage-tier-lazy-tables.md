@@ -1687,7 +1687,7 @@ lazy_table
 
 | allocation | scope | tier / role | size | CPU-executed consumer (§5.3's CPU form) |
 |---|---|---|---|---|
-| HOST body | model | `HOST_CPU` / `WEIGHT` | `host_cpu_mapped_size(table_bytes)` (Qwen 50.66 GiB) | the same |
+| HOST body | model | `HOST_CPU` / `WEIGHT` | `host_cpu_mapped_size(lazy_table_host_body_request_bytes(file_offset, table_bytes))`, the `O_DIRECT` window over the table (below) (Qwen 50.66 GiB) | the same |
 | row cache slab | model | `HOST_CPU` / new `alloc_role::LAZY_ROW_CACHE` | `slots x row_size`, in chunks of 256 MiB so that it can yield (§6.4) | the same (STORAGE) |
 | row cache index | model | `HOST_CPU` / `LAZY_ROW_CACHE` | `slots x 13.3 B` (§6.3): 7.8% of the slab on 170 B rows, 12.1% on 110 B, 15.9% on 84 B | the same (STORAGE) |
 | landing slab | context (class C), per table | `HOST_CPU` / new `alloc_role::LAZY_STAGING` | `depth x n_ubatch x rows_per_token x row_size`: Qwen 2 x 512 x 16 x 170 B = 2.66 MiB; DeepSeek Q2_K 2 x 512 x 24 x 84 B = **1.97 MiB per table** | STORAGE: **one** slot, `n_ubatch x rows_per_token x row_size` (Qwen 1.33 MiB; DeepSeek 0.98 MiB per table); HOST: none |
@@ -1702,6 +1702,24 @@ shows the mapped figure), is the requested size of one allocation. The plan
 counts, and the ledger charges, `host_cpu_mapped_size` of it, allocation by
 allocation, so the landing slab, the ids captures, the ring and the row-cache
 chunks round the same way as the HOST body (r53 M-2).
+
+**The HOST body is the `O_DIRECT` window over the table**, not the table alone.
+D1's eager read needs its file offset, its length and its destination aligned to
+`LAZY_IO_BLOCK_BYTES`, and a real table's offset is not (Qwen's PLE table sits at
+offset 192, DeepSeek's `blk.14.engram_embd` at 4032). So the body requests the
+window from the start of the block that holds the table's first byte to the end of
+the block that holds its last, and the table starts at
+`body + file_offset % LAZY_IO_BLOCK_BYTES`. A table that ends its file has a window
+that runs past the end (Qwen's by 832 B); the read ends once it holds the table's last
+byte, so the short read at the end of the file is not a failure. One function in the
+device-free `lazy-io-pool.hpp`, `lazy_table_host_body_request_bytes(file_offset, table_bytes)`
+(`round_up(file_offset % LAZY_IO_BLOCK_BYTES + table_bytes,
+LAZY_IO_BLOCK_BYTES)`), is the request the materialization makes and, through
+`host_cpu_mapped_size`, the HOST term the planner charges: one rule for plan and
+reality, which the activation check (§10) compares. The window can map one huge
+page more than the table alone, when the head pushes the table's end past a 2 MiB
+boundary. Refusing a correct table for its geometry, and a bounce buffer (P4),
+were both rejected.
 
 - **Class C, charged at the context transaction** (*lead rulings §T9, §T10* I-1,
   r5 m-13). Every row whose scope is "context" scales with that context's own
@@ -5190,7 +5208,10 @@ Code and docs stay in the tables as the upper bound.
   tenant forced. That is proposed for v1 (D7); regrowing between publishes would
   need a trigger the ledger does not have.
 - **Logging.** The planner logs `cache_slots` per table and the yieldable bytes
-  (§10), and every yield logs the chunk count and the tenant that asked.
+  (§10), and every yield logs the chunk count and the tenant that asked. The
+  planner and the built cache count those bytes with one device-free helper,
+  `lazy_row_cache_yieldable_bytes` (`lazy-row-cache.hpp`): the chunks above the
+  chunks that hold the floor, each at `host_cpu_mapped_size`, never the index.
 
 ---
 
@@ -6512,7 +6533,7 @@ statics are not exempt: the classifier has no carve-out, and the existing
 |---|---|---|
 | T2 | `ledger_committed`, `ledger_budget`, `yieldable_bytes` (all atomics), the per-cache yielder slot array with its in-flight counters, the PRIVATE_TESTING hook table and its store counter, the thread-local `g_allocating_charge` beside `g_allocating_owner_control`, and the thread-local depth of `host_budget_pass_scope` and the atomic `g_host_budget_stored_txn` in `ggml-sycl.cpp` | `unified-cache.cpp` (listed), `ggml-sycl.cpp` (listed) |
 | T3 | the registry (pool slot and generation), the reap list head, the registry's leaf mutex, `shut_down`, the reap-run and parked counters with their take-time snapshots, the one-shot hold hook, the `ggml-sycl.cpp` slot, and the budget ledger's sibling atomics `g_host_ledger_mem_available` (`MemAvailable`) and `g_host_ledger_budget_overridden` (the budget's source) in `unified-cache.cpp` (§4.2) | `lazy-io-pool.hpp` and `lazy-io-pool.cpp` (added by T3), `ggml-sycl.cpp` and `unified-cache.cpp` (listed) |
-| T4 | none: each cache's chunk table is a cache member, and its yielder registers through T2's per-cache hook | none |
+| T4 | five in `ggml-sycl.cpp`, all for the descriptor buffer types (§3.2), each a CSV row as classified there: the interface `ggml_backend_sycl_lazy_buffer_interface` (file scope, immutable binding); in `ggml_backend_sycl_lazy_buffer_type`, the `std::once_flag` `initialized` (function-local, mutable, intrinsic lock primitive) and the `per_device` type array (function-local, mutable, synchronization none evident: `ggml_sycl_per_device_buft` fills it under that flag); the `buft` of `ggml_backend_sycl_lazy_host_buffer_type` (function-local, mutable, synchronization none evident: a lambda initialises it once, under the C++ local-static guard); and the PRIVATE_TESTING `std::atomic<bool>` `g_test_lazy_predicate_too_broad` (file scope, mutable, intrinsic atomic; the positive control of T4's buffer-type table). Nothing else: each cache's chunk table is a cache member, and its yielder registers through T2's per-cache hook | `ggml-sycl.cpp` (listed) |
 | T5 | `lazy_ring_coverage_reads`, the ring-write-offset recorder, the depth table, the IO pool's queue state, the held-lease-destructor counter, the ensure hook, the `GGML_SYCL_LAZY_READ_FAULT` accessor's cache if it caches the value | `witnessed-mutex.hpp` (added by T5), `lazy-io-pool.cpp` and `ggml-sycl.cpp` (listed) |
 
 **Existing tickets this design depends on or leaves open:**
