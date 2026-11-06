@@ -1,7 +1,8 @@
 // The block ring's ensure and the IO engine (docs/design/sycl-storage-tier-lazy-tables.md §3.3, §5.2, §5.3, §10):
 // the first ensure allocates exactly the plan's need and later calls allocate nothing, every mismatch with the plan
 // refuses naming both numbers, one flight at a time (a concurrent ensure refuses at once with its WARN line), a
-// throwing allocation leaves no ensuring state behind, shut-down refuses and frees the reserver's ring, a worker's read
+// throwing allocation leaves no ensuring state behind, shut-down refuses and frees the reserver's ring, a second
+// coverage pin while the first is live joins its ring and ensures nothing (another size aborts), a worker's read
 // lands in its waiter's slot, a failed read reaches the ticket with one WARN, a read's last drop on a worker frees only
 // the ring, and shutdown cancels the queued reads and waits for the picked ones. Ensure itself never aborts: under
 // strict leases its one production caller does, and test-sycl-lazy-ring scores that abort.
@@ -44,6 +45,9 @@ constexpr size_t   k_need  = LAZY_BLOCK_RING_QD * k_span;  // the plan's need fo
 constexpr uint64_t k_txn   = 42;
 constexpr uint64_t k_file  = 9;
 constexpr auto     k_bound = std::chrono::seconds(5);
+
+// The mismatched-pin child's switch: a pin of k_need, then one of twice that while the first is live.
+const char * k_pin_child = "--mismatched-pin-child";
 
 std::string name(lazy_ring_ensure_status s) {
     return lazy_ring_ensure_status_name(s);
@@ -521,6 +525,49 @@ arm_result arm_engine_shutdown() {
     return r;
 }
 
+// A second coverage pin while the first is live joins its pool (§3.3): it asks for the live ring's size, so it ensures
+// nothing, allocates nothing and prints no [HOST-PLAN-BUG] line, and the ring outlives the second pin's drop. A second
+// pin that asks for another size aborts naming both sizes, in a child, since the abort ends the process.
+arm_result arm_coverage_pin_joins() {
+    arm_result r;
+    log_clear();
+    const uint64_t a0 = allocations();
+    {
+        const lazy_test_coverage_pin first = ggml_sycl_test_make_coverage_pin(k_need);
+        {
+            const lazy_test_coverage_pin second = ggml_sycl_test_make_coverage_pin(k_need);
+            const lazy_registry_state    s      = registry();
+            expect(r, allocations() == a0 + 1 && s.live_pools == 1 && s.live_leases == 2 && s.ring_bytes == k_need,
+                   "two pins of " + num(k_need) + " B made " + num(allocations() - a0) + " allocation(s), " +
+                       num(s.live_pools) + " live pool(s) and " + num(s.live_leases) + " lease(s) on a ring of " +
+                       num(s.ring_bytes) + " B, want 1, 1, 2 and " + num(k_need) + " B");
+        }
+        expect(r, registry().ring_bytes == k_need,
+               "the second pin's drop left a ring of " + num(registry().ring_bytes) + " B, want " + num(k_need));
+    }
+    expect(r, log_count_with("[HOST-PLAN-BUG]") == 0,
+           "the pins printed " + num(log_count_with("[HOST-PLAN-BUG]")) + " [HOST-PLAN-BUG] lines, want 0");
+    const lazy_registry_state s = registry();
+    expect(r, s.live_pools == 0 && s.parked_nodes == 0 && live_charged() == 0,
+           "after both pins: " + num(s.live_pools) + " live pool(s), " + num(s.parked_nodes) + " parked and " +
+               num(live_charged()) + " B charged, want 0, 0 and 0");
+
+    const child_run child = run_child_strings({ "test-sycl-lazy-io-engine-host", k_pin_child },
+                                              child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
+    if (!child.ran) {
+        fail(r, "the mismatched-pin child did not finish within " + num(k_bound.count()) + " s");
+        return r;
+    }
+    const std::string want = "ggml_sycl_test_make_coverage_pin: ring_bytes=" + num(2 * k_need) +
+                             " joins a live ring of " + num(k_need) + " B";
+    const bool aborted = WIFSIGNALED(child.status) && WTERMSIG(child.status) == SIGABRT;
+    expect(r, aborted && text_count_with(child.err, want.c_str()) == 1,
+           "the mismatched second pin ended with status " + std::to_string(child.status) + " and " +
+               num(text_count_with(child.err, want.c_str())) + " lines '" + want + "', want SIGABRT and 1");
+    expect(r, text_count_with(child.err, "PIN-CHILD returned") == 0, "the mismatched second pin returned");
+    return r;
+}
+
 // Shut-down (§3.3): a reserver that reaches its install after the registry shut down refuses as
 // lazy-table-ring-shut-down and frees its ring after the unlock, and an ensure that begins after it refuses the same
 // way. Engagement: the reserver is held when the registry shuts down.
@@ -577,6 +624,12 @@ lazy_ring_mutant mutant_named(const char * text) {
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], k_pin_child) == 0) {
+        const lazy_test_coverage_pin first  = ggml_sycl_test_make_coverage_pin(k_need);
+        const lazy_test_coverage_pin second = ggml_sycl_test_make_coverage_pin(2 * k_need);
+        std::fprintf(stderr, "PIN-CHILD returned\n");
+        return 0;
+    }
     ggml_log_set(capture_log, nullptr);
     if (argc == 3 && std::strcmp(argv[1], "--mutant") == 0) {
         ggml_sycl_test_lazy_ring_mutant_select(mutant_named(argv[2]));
@@ -591,6 +644,7 @@ int main(int argc, char ** argv) {
         { "a failed read reaches the ticket with one WARN",                             arm_engine_read_error        },
         { "a read's last drop on a worker frees only the ring",                         arm_engine_worker_reap       },
         { "shutdown cancels queued reads and waits for picked ones",                    arm_engine_shutdown          },
+        { "a second coverage pin joins the live ring and a mismatched one aborts",      arm_coverage_pin_joins       },
         // Last: the shut-down flag is never cleared.
         { "ensure refuses after shut-down and frees the reserver's ring",               arm_ensure_shut_down         },
     };

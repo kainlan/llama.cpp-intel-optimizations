@@ -569,7 +569,8 @@ void ggml_sycl_test_lazy_mark_dying(const ring_lease & lease);
 // ring_bytes == 0 gives a ring-less pool: every table is then STORAGE-eligible and block_ring_charge is the mapped
 // need. A nonzero ring_bytes ensures that ring through block_ring_ensure on device 0, with a span of ring_bytes /
 // LAZY_BLOCK_RING_QD and the charge of a creating plan, so a planner sees a live ring of that size; an ensure that
-// refuses aborts naming the status. A call while a guard is live joins the live pool with a counted reference.
+// refuses aborts naming the status. A call while a guard is live joins the live pool with a counted reference; when
+// that pool holds a ring, ring_bytes must equal it and nothing is ensured, and any other ring_bytes aborts naming both.
 lazy_test_coverage_pin ggml_sycl_test_make_coverage_pin(uint64_t ring_bytes);
 #endif
 

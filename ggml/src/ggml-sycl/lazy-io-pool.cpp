@@ -490,8 +490,17 @@ lazy_test_coverage_pin::~lazy_test_coverage_pin() {
 }
 
 lazy_test_coverage_pin ggml_sycl_test_make_coverage_pin(uint64_t ring_bytes) {
-    ring_lease lease = lazy_io_pool_take();
-    if (ring_bytes != 0) {
+    ring_lease     lease = lazy_io_pool_take();
+    const uint64_t live  = lease.ring_bytes();
+    if (live != 0) {
+        // The take joined a live ring (§3.3): this pin holds the ring the live guard's pool already has, so it asks for
+        // that size and ensures nothing. An ensure would refuse it, since transaction 0 is never the ring's creator and
+        // the creating plan's charge is then a mismatch.
+        if (ring_bytes != live) {
+            GGML_ABORT("ggml_sycl_test_make_coverage_pin: ring_bytes=%llu joins a live ring of %llu B",
+                       (unsigned long long) ring_bytes, (unsigned long long) live);
+        }
+    } else if (ring_bytes != 0) {
         // The charge of a creating plan, the mapped need (§10): what a ring that ensure creates is charged.
         const size_t                  need = static_cast<size_t>(ring_bytes);
         const lazy_ring_ensure_status status =
