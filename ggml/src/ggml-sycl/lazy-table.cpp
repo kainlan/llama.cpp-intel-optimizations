@@ -348,6 +348,18 @@ const char * lazy_table_status_name(lazy_table_status status) {
             return "lazy-table-activation-mismatch";
         case lazy_table_status::ROW_CACHE_SHORTFALL:
             return "lazy-table-row-cache-shortfall";
+        case lazy_table_status::RING_UNPINNED:
+            return "lazy-table-ring-unpinned";
+        case lazy_table_status::RING_TOO_NARROW:
+            return "lazy-table-ring-too-narrow";
+        case lazy_table_status::RING_CONCURRENT:
+            return "lazy-table-ring-concurrent-ensure";
+        case lazy_table_status::RING_SHUT_DOWN:
+            return "lazy-table-ring-shut-down";
+        case lazy_table_status::RING_MISMATCH:
+            return "lazy-table-ring-mismatch";
+        case lazy_table_status::RING_REFUSED:
+            return "lazy-table-ring-refused";
     }
     return "lazy-table-unknown";
 }

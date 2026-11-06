@@ -295,7 +295,9 @@ if (BUILD_TESTING)
             LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP
                 "FAIL the wrapper reaps before its take and after its drop: after the scope: 0 live pools, 0 leases, 1 parked, want its pool reaped by its closing reap"
             LAZY_IO_POOL_MUTANT_INSTALL_ON_EMPTY_SLOT
-                "FAIL a take installs only on a generation match: take A's pool shares generation [0-9]+ with the pool installed and parked during its build")
+                "FAIL a take installs only on a generation match: take A's pool shares generation [0-9]+ with the pool installed and parked during its build"
+            LAZY_IO_POOL_MUTANT_GENERATION_LIVE_IGNORES_PARKED
+                "FAIL the owner check's generation is live in the slot and parked, and gone after the reap: generation [0-9]+ of the parked pool reads not live")
         set(_lazy_io_pool_host_variants test-sycl-lazy-io-pool-host "" "")
         list(LENGTH _lazy_io_pool_host_mutants _n)
         math(EXPR _last "${_n} - 1")
@@ -8300,6 +8302,108 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         TIMEOUT 120)
+
+    # The block ring's plan, leases and stage adoption (th32 §3.3, §4.2, §10, §11 T5): one ensure allocates the plan's
+    # need and a covered plan charges 0; a table wider than the live ring prints the decline line and plans HOST where
+    # it fits, else refuses as too narrow; the staged candidate's lease carries the pool across the early and the late
+    # pass and across another model's unload; the stage's lease holds it across a read's drop inside the planner; an
+    # inventory with no lazy table takes nothing; the stage, its failure and the dry run leave no pool; the owner check
+    # is silent for a live or parked pool's ring rows; and under strict leases a STORAGE materialization aborts on a
+    # ring refusal. The stage builds both cards' caches on the multi-device path, so it runs on level_zero:0,1, exits 77
+    # on the single-device path, carries the OOM-family labels and runs alone. Lead-run.
+    #
+    # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
+    # and the FAIL line of the arm that kills it, which runs alone. Each registers test-sycl-lazy-ring-mutant-<name> on
+    # the one executable, which passes only when that line appears.
+    string(CONCAT _lazy_ring_env
+        "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;"
+        "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+    string(CONCAT _lr_re_no_span_check
+        "FAIL the ring plan: one ensure allocates the need, a covered plan charges 0, a wider one declines: "
+        "the one-block-short ensure returned ok with 1 allocation\\(s\\), want lazy-table-ring-too-narrow and none")
+    string(CONCAT _lr_re_ignore_live_ring
+        "FAIL a wider table that fits nowhere refuses as lazy-table-ring-too-narrow: "
+        "the wider table planned with refusal 'none', want lazy-table-ring-too-narrow")
+    string(CONCAT _lr_re_no_candidate_lease
+        "FAIL a model planned as covered across an unload finds the ring through a read's lease: "
+        "model A's ensure returned lazy-table-ring-unpinned, want ok")
+    string(CONCAT _lr_re_lease_at_stage
+        "FAIL the stage's lease holds the pool across a read's drop inside the planner pass: "
+        "model B's ensure returned lazy-table-ring-mismatch, want ok")
+    string(CONCAT _lr_re_lease_presence_as_coverage
+        "FAIL the early and the late pass charge the ring once, on the same STORAGE set: "
+        "the late pass's ring= is 0, want [0-9]+")
+    string(CONCAT _lr_re_take_without_candidate
+        "FAIL an inventory with no lazy table creates no pool, alone and after a lazy model: "
+        "the dense stage moved the registry generation from [0-9]+ to [0-9]+")
+    string(CONCAT _lr_re_lease_before_guard
+        "FAIL an all-HOST inventory takes the provisional lease and leaves nothing after the call: "
+        "after the early stage: 0 live pools, 0 leases, 1 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_replace_keeps_displaced
+        "FAIL two devices, early then late then unload, give back the pool and the ring's bytes: "
+        "after the unload and the reap: 1 live pools, [0-9]+ leases, 0 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_rollback_keeps_clone
+        "FAIL a stage failed after the first device leaves no lease and no parked pool: "
+        "after the failed early stage: 1 live pools, [0-9]+ leases, 0 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_count_without_pin
+        "FAIL the public entries read no coverage, and a null pin refuses as lazy-table-ring-unpinned: "
+        "the public entries counted [0-9]+ coverage reads, want 0")
+    string(CONCAT _lr_re_no_entry_reap
+        "FAIL the dry run reaps before its take and after its drop and charges the ring as a stage: "
+        "the dry run's take snapshot [0-9]+ reaps run, want [0-9]+")
+    string(CONCAT _lr_re_no_closing_reap
+        "FAIL the dry run reaps before its take and after its drop and charges the ring as a stage: "
+        "after the dry run: 0 live pools, 0 leases, 1 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_generation_live_ignores_parked
+        "FAIL the block ring's POOL rows are silent while their generation is live or parked: "
+        "the parked generation [0-9]+ reports 1 ring row\\(s\\), want 0")
+    string(CONCAT _lr_re_strict_abort_dropped
+        "FAIL under strict leases the STORAGE materialization aborts on a ring refusal after its WARN: "
+        "the strict child did not abort: .*STRICT-CHILD returned status=lazy-table-ring-too-narrow")
+    set(_lazy_ring_mutants
+        no-span-check                  "${_lr_re_no_span_check}"
+        ignore-live-ring               "${_lr_re_ignore_live_ring}"
+        no-candidate-lease             "${_lr_re_no_candidate_lease}"
+        lease-at-stage                 "${_lr_re_lease_at_stage}"
+        lease-presence-as-coverage     "${_lr_re_lease_presence_as_coverage}"
+        take-without-candidate         "${_lr_re_take_without_candidate}"
+        lease-before-guard             "${_lr_re_lease_before_guard}"
+        replace-keeps-displaced        "${_lr_re_replace_keeps_displaced}"
+        rollback-keeps-clone           "${_lr_re_rollback_keeps_clone}"
+        count-without-pin              "${_lr_re_count_without_pin}"
+        no-entry-reap                  "${_lr_re_no_entry_reap}"
+        no-closing-reap                "${_lr_re_no_closing_reap}"
+        generation-live-ignores-parked "${_lr_re_generation_live_ignores_parked}"
+        strict-abort-dropped           "${_lr_re_strict_abort_dropped}")
+    add_executable(test-sycl-lazy-ring
+        tests/test-sycl-lazy-ring.cpp)
+    target_link_libraries(test-sycl-lazy-ring PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-ring PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-ring COMMAND test-sycl-lazy-ring)
+    set_tests_properties(test-sycl-lazy-ring PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "${_lazy_ring_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+    list(LENGTH _lazy_ring_mutants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _lazy_ring_mutants ${_i} _mutant)
+        list(GET _lazy_ring_mutants ${_j} _regex)
+        add_test(NAME test-sycl-lazy-ring-mutant-${_mutant}
+            COMMAND test-sycl-lazy-ring --mutant ${_mutant})
+        set_tests_properties(test-sycl-lazy-ring-mutant-${_mutant} PROPERTIES
+            LABELS "sycl;host;cache;mem-handle;gpu-serial;mutant"
+            ENVIRONMENT "${_lazy_ring_env}"
+            RUN_SERIAL TRUE
+            SKIP_RETURN_CODE 77
+            TIMEOUT 300
+            PASS_REGULAR_EXPRESSION "${_regex}")
+    endforeach()
 
     # The lazy table object (th32 §3.2, §3.3, §10, §11 T4): the HOST body's eager O_DIRECT read into locked HOST_CPU
     # memory, the STORAGE descriptor, the last reference's release, the activation check (one extra chunk refuses,

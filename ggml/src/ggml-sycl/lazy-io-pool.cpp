@@ -115,9 +115,9 @@ uint64_t          g_lazy_parked_at_last_take    = 0;
 // §10's lazy_ring_coverage_reads: one relaxed increment per coverage read, in every build, no lock.
 std::atomic<uint64_t> g_lazy_ring_coverage_reads{ 0 };
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-// The one-shot hold hook and the point it is armed at: the first FULL reap, the first take that builds a pool, or the
-// first ensure that reserves `ensuring`.
-enum class lazy_hold_point : uint8_t { REAP, TAKE, ENSURE };
+// The one-shot hold hook and the point it is armed at: the first FULL reap, the first take that builds a pool, the
+// first ensure that reserves `ensuring`, or the first planner caller to reach the plan point.
+enum class lazy_hold_point : uint8_t { REAP, TAKE, ENSURE, PLAN };
 
 lazy_hold_point g_lazy_hold_point = lazy_hold_point::REAP;
 lazy_hold_fn    g_lazy_hold       = nullptr;
@@ -360,6 +360,11 @@ void lazy_io_pool_mark_shut_down() noexcept {
     g_lazy_shut_down.store(true, std::memory_order_release);
 }
 
+bool lazy_io_pool_generation_live(uint64_t generation) noexcept {
+    (void) generation;
+    return false;
+}
+
 // LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP and LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP each drop one of the wrapper's two reaps.
 // Only test-sycl-lazy-io-pool-host's mutant targets define them; each passes only when the host test prints that
 // reap's FAIL text.
@@ -427,6 +432,22 @@ void ggml_sycl_test_lazy_take_hold(lazy_hold_fn hold, void * ctx) {
 
 void ggml_sycl_test_lazy_ensure_hold(lazy_hold_fn hold, void * ctx) {
     lazy_hold_arm(lazy_hold_point::ENSURE, hold, ctx);
+}
+
+void ggml_sycl_test_lazy_plan_hold(lazy_hold_fn hold, void * ctx) {
+    lazy_hold_arm(lazy_hold_point::PLAN, hold, ctx);
+}
+
+void ggml_sycl_test_lazy_plan_point() {
+    lazy_hold_fn hold     = nullptr;
+    void *       hold_ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+        hold = lazy_hold_claim_locked(lazy_hold_point::PLAN, &hold_ctx);
+    }
+    if (hold != nullptr) {
+        hold(hold_ctx);
+    }
 }
 
 void ggml_sycl_test_lazy_mark_dying(const ring_lease & lease) {

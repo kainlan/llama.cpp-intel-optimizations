@@ -191,6 +191,11 @@ void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept;
 // T5 engine (design §11 row T5) adds the lease drain at backend shutdown, which sets it after its own FULL reap.
 void lazy_io_pool_mark_shut_down() noexcept;
 
+// Whether `generation` names a pool the registry still holds, in its slot or parked on the reap list, read under the
+// leaf mutex (§3.3): the owner check's predicate for the block ring's POOL rows, whose IO_POOL owner id is that
+// generation. False for 0 and once the FULL reap has freed the pool. Never called under another lock.
+bool lazy_io_pool_generation_live(uint64_t generation) noexcept;
+
 // The one wrapper a planner caller holds around its planning (§3.3): its constructor runs the entry FULL reap, take_if
 // takes the provisional lease, pin() hands it to the planners, and its destructor drops the lease and then runs the
 // closing FULL reap, by member order (the reap guard is declared before the lease, so it is built first and destroyed
@@ -492,6 +497,14 @@ void ggml_sycl_test_lazy_take_hold(lazy_hold_fn hold, void * ctx);
 // reserve and the allocation (§3.3), so a fixture can hold the reserver while another ensure runs.
 void ggml_sycl_test_lazy_ensure_hold(lazy_hold_fn hold, void * ctx);
 
+// Arms the hook at the plan point: the first planner caller that reaches it after the arming calls it once its plan is
+// made and before the plan is staged, with no lock held, so a fixture can drop a lease inside that window (§3.3, the
+// window arm). The planner caller reaches the point through ggml_sycl_test_lazy_plan_point().
+void ggml_sycl_test_lazy_plan_hold(lazy_hold_fn hold, void * ctx);
+
+// The plan point: claims the hook if it is armed there and calls it with no lock held.
+void ggml_sycl_test_lazy_plan_point();
+
 // The engine's read source (§5.2): `length` bytes of `fd` at `offset` into `dst`; returns the bytes read, or -errno.
 // A fixture's source replaces pread for every worker until it is cleared with null; it runs with no lock held.
 using lazy_io_read_fn = long (*)(void * ctx, int fd, uint8_t * dst, size_t length, uint64_t offset);
@@ -516,6 +529,14 @@ enum class lazy_ring_mutant : uint8_t {
     COUNT_WITHOUT_PIN,           // a coverage read with no pin is counted
     NO_ENTRY_REAP,               // the coverage scope runs no entry reap
     NO_CLOSING_REAP,             // the coverage scope runs no closing reap
+    IGNORE_LIVE_RING,            // a coverage read returns 0 for a live ring, still counted
+    LEASE_AT_STAGE,              // the stage drops its lease once planned and takes the plan's past the plan point
+    NO_CANDIDATE_LEASE,          // a staged plan with a STORAGE table carries no lease
+    REPLACE_KEEPS_DISPLACED,     // a candidate's replacement keeps the displaced candidate's lease alive
+    ROLLBACK_KEEPS_CLONE,        // the stage's rollback leaves the candidate's lease alive
+    LEASE_BEFORE_GUARD,          // the stage keeps a lease built before its scope's reap guard, so it outlives the reap
+    GENERATION_LIVE_IGNORES_PARKED,  // the generation predicate reads only the slot, so a parked pool reads gone
+    STRICT_ABORT_DROPPED,            // the STORAGE materialization does not abort on a ring refusal under strict leases
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);

@@ -325,6 +325,34 @@ arm_result arm_helper_guard() {
     return r;
 }
 
+// The owner check's predicate for the block ring's POOL rows (§3.3): a generation is live while its pool is in the
+// registry's slot and while it is parked, since a parked pool still holds its ring until the FULL reap frees it, and
+// gone once that reap has run. A generation no take reserved, and 0, are never live.
+// Engagement: the lease's drop parks the pool (one parked node), so the parked reading is of a parked pool.
+// Mutant: LAZY_IO_POOL_MUTANT_GENERATION_LIVE_IGNORES_PARKED, the predicate reading the slot alone, under which the
+// parked pool's generation reads gone while its ring is still allocated and the owner check would report the ring.
+arm_result arm_generation_live() {
+    arm_result     r;
+    ring_lease     lease = lazy_io_pool_take();
+    const uint64_t gen   = registry().live_generation;
+    expect(r, gen != 0 && lazy_io_pool_generation_live(gen),
+           "generation " + num(gen) + " of the pool in the slot reads not live");
+    expect(r, !lazy_io_pool_generation_live(gen + 1),
+           "generation " + num(gen + 1) + ", which no take reserved, reads live");
+    expect(r, !lazy_io_pool_generation_live(0), "generation 0, which names no pool, reads live");
+    lease.reset();
+    if (registry().parked_nodes != 1) {
+        void_arm(r, "the lease's drop left " + describe(registry()) + ", want the pool parked: 0, 0, 1");
+        settle();
+        return r;
+    }
+    expect(r, lazy_io_pool_generation_live(gen), "generation " + num(gen) + " of the parked pool reads not live");
+    settle();
+    expect(r, !lazy_io_pool_generation_live(gen),
+           "generation " + num(gen) + " reads live after the FULL reap freed its pool");
+    return r;
+}
+
 // Once the registry is shut down a take returns an empty lease, take_if takes nothing, and a lease taken before only
 // decrements at its drop: it never parks, so a lease destroyed during static destruction never touches the mutex's
 // reap list. Runs last: the flag is never cleared.
@@ -370,6 +398,8 @@ int main(int argc, char ** argv) {
     for (const named_arm & arm : wrapper_arms()) {
         arms.push_back(arm);
     }
+    arms.push_back({ "the owner check's generation is live in the slot and parked, and gone after the reap",
+                     arm_generation_live });
     // Last: the shut-down flag is never cleared.
     arms.push_back({ "shut-down: no take, and a drop only decrements", arm_shut_down });
     return run_arms(arms, "lazy io pool host arms");

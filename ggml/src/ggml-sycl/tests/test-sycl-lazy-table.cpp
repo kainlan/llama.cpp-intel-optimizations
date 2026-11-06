@@ -56,6 +56,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -171,6 +172,19 @@ size_t row_size() {
     return ggml_row_size(GGML_TYPE_Q8_0, k_ne0);
 }
 
+// The block ring a STORAGE table of these rows needs (§3.3): LAZY_BLOCK_RING_QD read spans of one row, 512 KiB. The
+// process's coverage pin ensures it before any arm runs, as a model's load would, so a STORAGE materialization finds
+// the ring live and its plan charged none.
+size_t ring_need() {
+    return ggml_sycl::LAZY_BLOCK_RING_QD * ggml_sycl::lazy_block_ring_span(row_size());
+}
+
+// The coverage pin the STORAGE arms' materializations find live: a lease on a pool whose ring holds ring_need().
+std::unique_ptr<ggml_sycl::lazy_test_coverage_pin> make_ring_pin() {
+    return std::unique_ptr<ggml_sycl::lazy_test_coverage_pin>(
+        new ggml_sycl::lazy_test_coverage_pin(ggml_sycl::ggml_sycl_test_make_coverage_pin(ring_need())));
+}
+
 // A STORAGE table's resident bytes at `slots` slots with its slab cut at `chunk` bytes: the whole chunks, the
 // remainder and the index, each counted at host_cpu_mapped_size, as the ledger charges them and the planner sums them
 // (§3.3).
@@ -213,6 +227,9 @@ lazy_table_desc fixture_desc(const char *   name,
     if (residency == lazy_residency::STORAGE) {
         d.cache_slots       = static_cast<size_t>(n_rows);
         d.cache_floor_slots = k_cache_floor_slots;
+        // The ring the process's coverage pin made, which this table's plan found live, so it charged none (§10).
+        d.block_ring_need   = ring_need();
+        d.block_ring_charge = 0;
     }
     return d;
 }
@@ -1228,7 +1245,8 @@ int main(int argc, char ** argv) {
         if (sycl_test_require_gpu("the lazy table row-cache shortfall leg")) {
             ggml_log_set(capture_log, nullptr);
             ggml_sycl_test_host_ledger_store_budget(k_ledger_budget);
-            std::vector<named_arm> shortfall_only;
+            std::unique_ptr<ggml_sycl::lazy_test_coverage_pin> ring_pin = make_ring_pin();
+            std::vector<named_arm>                             shortfall_only;
             shortfall_only.push_back({ k_shortfall_arm_name, arm_storage_cache_shortfall_refuses });
             rc = run_arms(shortfall_only, "lazy table arms (--mutant shortfall-unreported)");
         }
@@ -1250,6 +1268,7 @@ int main(int argc, char ** argv) {
     }
     ggml_log_set(capture_log, nullptr);
     ggml_sycl_test_host_ledger_store_budget(k_ledger_budget);
+    std::unique_ptr<ggml_sycl::lazy_test_coverage_pin> ring_pin = make_ring_pin();
 
     std::vector<named_arm> arms;
     arms.push_back({ "(1) the HOST body requests the O_DIRECT window over the table", arm_body_request_window });
@@ -1274,6 +1293,7 @@ int main(int argc, char ** argv) {
     // Last: its tensor-parallel factory latches process-wide state.
     arms.push_back({ k_table_arm_name, arm_vram_answer_unchanged_for_other_types });
     const int rc = run_arms(arms, "lazy table arms");
+    ring_pin.reset();
     ::unlink(g_fixture_path.c_str());
     ::unlink(g_eof_fixture_path.c_str());
     return rc;
