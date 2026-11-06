@@ -8928,6 +8928,8 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
                                                        const void *         fill_ctx,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle) {
+    file_mapped_materialization_scope materialization_copies;  // its copies are the materialization (§5.3)
+
     auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
     if (load_effect_guard.failed()) {
@@ -9241,6 +9243,8 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle,
                                                        const std::vector<sycl::event> & deps) {
+    file_mapped_materialization_scope materialization_copies;  // its copies are the materialization (§5.3)
+
     auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
     if (load_effect_guard.failed()) {
@@ -9682,6 +9686,8 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                                                               const void *                            fill_ctx,
                                                               sycl::queue *                           queue,
                                                               std::vector<mem_handle> *               out_handles) {
+    file_mapped_materialization_scope materialization_copies;  // its copies are the materialization (§5.3)
+
     auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
     if (load_effect_guard.failed()) {
@@ -12476,6 +12482,8 @@ bool unified_cache::stage_expert_group(int                          block_id,
                                        const cache_layout_request * gate_req,
                                        const cache_layout_request * up_req,
                                        const cache_layout_request * down_req) {
+    file_mapped_materialization_scope materialization_copies;  // its copies are the materialization (§5.3)
+
     // Collect the tensors that need staging (skip unregistered roles)
     struct slot_info {
         const ggml_sycl_cache_id *   key;
@@ -17737,6 +17745,55 @@ uint64_t unified_cache_stream_dma_file_mapped_refusals() noexcept {
     return g_stream_dma_file_mapped_refusals.load(std::memory_order_relaxed);
 }
 
+// Device-bound copies of file-mapped bytes outside a load or a materialization, process-wide (design §5.3 "Gates").
+static std::atomic<uint64_t> g_file_mapped_device_copies_outside_materialization{ 0 };
+// Load transactions open, process-wide: a copy while any is open is a load's.
+static std::atomic<int>      g_file_mapped_load_depth{ 0 };
+// Materialization scopes open on this thread.
+static thread_local int      t_file_mapped_materialization_depth = 0;
+
+file_mapped_materialization_scope::file_mapped_materialization_scope() noexcept {
+    ++t_file_mapped_materialization_depth;
+}
+
+file_mapped_materialization_scope::~file_mapped_materialization_scope() {
+    --t_file_mapped_materialization_depth;
+}
+
+void unified_cache_file_mapped_device_copy_note(const void * src, const void * device_dst) {
+    // The depths first: they are a thread-local read and a relaxed load, each registry lookup is a shared lock. Then
+    // the source, which is rarely file-mapped, and the destination last, so a typical copy pays one lookup, not two.
+    if (t_file_mapped_materialization_depth > 0 || g_file_mapped_load_depth.load(std::memory_order_relaxed) > 0) {
+        return;
+    }
+    const auto & registry = alloc_registry::instance();
+    if (!registry.is_file_mapped(src)) {
+        return;
+    }
+    if (device_dst != nullptr && !registry.is_device(device_dst)) {
+        return;
+    }
+    g_file_mapped_device_copies_outside_materialization.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t unified_cache_file_mapped_device_copies_outside_materialization() noexcept {
+    return g_file_mapped_device_copies_outside_materialization.load(std::memory_order_relaxed);
+}
+
+void unified_cache_file_mapped_load_enter() noexcept {
+    g_file_mapped_load_depth.fetch_add(1, std::memory_order_relaxed);
+}
+
+void unified_cache_file_mapped_load_leave() noexcept {
+    g_file_mapped_load_depth.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void unified_cache_file_mapped_counters_log() {
+    GGML_LOG_WARN("[FILE-MAPPED] counters: stream_dma_refusals=%llu device_copies_outside_materialization=%llu\n",
+                  static_cast<unsigned long long>(unified_cache_stream_dma_file_mapped_refusals()),
+                  static_cast<unsigned long long>(unified_cache_file_mapped_device_copies_outside_materialization()));
+}
+
 unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view &           src,
                                                            size_t                           total_bytes,
                                                            size_t                           slice_bytes,
@@ -17757,10 +17814,23 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
     // driver-staged copy and at worst a device loss, and streaming host-tier weights is forbidden outright (design 5efe
     // §5.3, P3). A typed, counted refusal, checked before everything else so a custom copy_fn is covered too. The
     // caller routes it to the CPU executor.
-    if (alloc_registry::instance().is_file_mapped(src.ptr)) {
+    bool planted_refusal_after_copy_fn = false;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    // The check placed after the copy_fn test: a custom copy streams a mapped source.
+    planted_refusal_after_copy_fn = scratch_test_mutant_on(scratch_test_mutant::REFUSAL_AFTER_COPY_FN);
+#endif
+    if (alloc_registry::instance().is_file_mapped(src.ptr) && !(planted_refusal_after_copy_fn && copy_fn != nullptr)) {
         result.refused_file_mapped = true;
         g_stream_dma_file_mapped_refusals.fetch_add(1, std::memory_order_relaxed);
         return result;
+    }
+    // A backstop behind the refusal above, which tests the same predicate first: production never counts here, only a
+    // bypassed refusal does (the refusal-after-copy-fn mutant). A custom copy_fn may copy outside mem-ops, so the
+    // stream is noted once here; the default copy is noted in mem_copy_submit. Not every copy_fn bypasses mem-ops:
+    // dmmv_stream_copy copies through mem_copy_async, so a bypassed refusal on that path counts this note once and
+    // then once more for every mem_copy_async call it makes, a double count the refusal exists to make unreachable.
+    if (copy_fn != nullptr) {
+        unified_cache_file_mapped_device_copy_note(src.ptr);
     }
 
     size_t bytes = src.size;

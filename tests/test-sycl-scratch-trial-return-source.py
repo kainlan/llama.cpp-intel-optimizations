@@ -7,8 +7,9 @@ The device test is lead-run. This pin holds what a host can read:
    sycl;cache;mem-handle;gpu-serial, serial, skip code 77, the selector pinned to level_zero:1 and 64 MiB chunks, all
    inside the `BUILD_TESTING AND NOT GGML_BACKEND_DL` block; every planted fault the design names for the test is a
    registered arm with its cases and its expected text, and no other arm is registered;
-2. the mutant census over the three device REDs: every scratch_test_mutant enumerator has a name in the selector's
-   table and is scored by at least one registered arm, every name an arm uses is in the table, every enumerator
+2. the mutant census over the device REDs that share the selector (the SCRATCH return's three and the file-mapped
+   tier's): every scratch_test_mutant enumerator has a name in the selector's table and is scored by at least one
+   registered arm, every name an arm uses is in the table, every enumerator
    has a block in production code that the production build compiles out, and the pool step those blocks call is
    declared and defined only inside such blocks;
 3. the test source: the trial is resolved by proc name, the fixture's notifies carry a plan term of 0, main lists the
@@ -53,6 +54,9 @@ FILES = (CMAKE, TEST, COMMON, MUTANT_H) + PRODUCTION
 
 STEM = "test-sycl-scratch-trial-return"
 STEMS = (STEM, "test-sycl-configure-refusal", "test-sycl-scratch-owner-end")
+# Every registration whose arms the selector's census scores: the file-mapped tier's REDs and the segmented record's
+# refusal cleanup plant their faults through the same selector (§7 C4).
+CENSUS_STEMS = STEMS + ("test-sycl-file-mapped-stream-refusal", "test-sycl-seg-refusal-cleanup")
 FUNC = "ggml_sycl_scratch_return_test"
 BLOCK = "if (BUILD_TESTING AND NOT GGML_BACKEND_DL)"
 
@@ -155,7 +159,7 @@ def census_problems(texts: dict) -> list:
     by_enum = {e: n for n, e in table.items()}
     cmake = cmake_strip(texts[CMAKE])
     scored = set()
-    for stem in STEMS:
+    for stem in CENSUS_STEMS:
         reg = registration(cmake, FUNC, stem)
         arms = arms_of(reg[1]) if reg else None
         if arms is None:

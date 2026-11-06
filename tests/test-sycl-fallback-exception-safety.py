@@ -7,7 +7,12 @@ NameError that takes the later checks with it (llama.cpp-qeld).
 """
 from pathlib import Path
 import re
-from sycl_gate import finish, gate
+import sys
+
+# sycl_gate sits beside this file. `python3 -I` leaves the script's directory off sys.path, so it is appended here;
+# appended rather than prepended, a file in tests/ never shadows a standard module.
+sys.path.append(str(Path(__file__).resolve().parent))
+from sycl_gate import finish, gate, resolve_mutants  # noqa: E402
 
 root = Path(__file__).resolve().parents[1]
 sycl = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
@@ -101,17 +106,38 @@ with gate("tensor_storage_restore_guard restores in a noexcept destructor"):
 
 # Boundary cleanup drains prior submissions and deferred scatters, unpins
 # transient leases, and clears active/deferred state before FAILED.
+FALLBACK_CATCH = "catch (const ggml_sycl_fallback_error & error) {\n"
+FALLBACK_CLEANUP_TOKENS = ("ggml_sycl_cpu_tg_flush_pending", "last_graph_event->wait_and_throw",
+                           "stream()->wait_and_throw", "flush_pending_secondary_scatter",
+                           "ggml_sycl_cpu_staging_drain", "graph_unpin_transient_leases_after_direct_execution",
+                           "last_graph_event_deferred_decode = false",
+                           "unified_cache_set_graph_compute_active(false)")
+
+
+def fallback_cleanup_missing(text: str) -> list:
+    """What the fallback catch lacks before its first FAILED return, read with the mutant blocks resolved: a planted
+    mutant's early return is not the production order."""
+    production = resolve_mutants(text)
+    catch = production.index(FALLBACK_CATCH)
+    cleanup = production[catch:production.index("return GGML_STATUS_FAILED", catch)]
+    missing = [token for token in FALLBACK_CLEANUP_TOKENS if token not in cleanup]
+    if not missing and cleanup.index("ggml_sycl_cpu_tg_flush_pending") > cleanup.index(
+            "last_graph_event->wait_and_throw"):
+        missing.append("the CPU-TG flush ahead of the graph event wait")
+    return missing
+
+
 with gate("the fallback boundary cleanup drains, unpins and clears state before returning FAILED"):
-    catch = sycl.index("catch (const ggml_sycl_fallback_error & error)")
-    failed = sycl.index("return GGML_STATUS_FAILED", catch)
-    cleanup = sycl[catch:failed]
-    for token in ("ggml_sycl_cpu_tg_flush_pending", "last_graph_event->wait_and_throw", "stream()->wait_and_throw",
-                  "flush_pending_secondary_scatter", "ggml_sycl_cpu_staging_drain",
-                  "graph_unpin_transient_leases_after_direct_execution",
-                  "last_graph_event_deferred_decode = false",
-                  "unified_cache_set_graph_compute_active(false)"):
-        assert token in cleanup, token
-    assert cleanup.index("ggml_sycl_cpu_tg_flush_pending") < cleanup.index("last_graph_event->wait_and_throw")
+    missing = fallback_cleanup_missing(sycl)
+    assert not missing, missing
+# Positive control for the strip: an early return planted at the catch's top inside a mutant block must leave every
+# token found, and the same return outside a block must hide them, so the gate reads past mutant code and only that.
+with gate("the cleanup gate reads past a mutant block's early return and stops at a bare one"):
+    planted = "#if defined(GGML_SYCL_SCRATCH_MUTANTS)\n        return GGML_STATUS_FAILED;\n#endif\n"
+    assert sycl.count(FALLBACK_CATCH) == 1, sycl.count(FALLBACK_CATCH)
+    assert not fallback_cleanup_missing(sycl.replace(FALLBACK_CATCH, FALLBACK_CATCH + planted))
+    bare = "        return GGML_STATUS_FAILED;\n"
+    assert fallback_cleanup_missing(sycl.replace(FALLBACK_CATCH, FALLBACK_CATCH + bare))
 
 # Segment 1 may already be asynchronously submitted when segment 2 fails.
 # Per-attempt baselines preserve prior handles; current handles roll back only
