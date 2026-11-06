@@ -8231,6 +8231,125 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         SKIP_RETURN_CODE 77
         TIMEOUT 120)
 
+    # The SCRATCH return's three device REDs (docs/design/sycl-mmap-host-tier.md §7 C4): test-sycl-scratch-trial-return,
+    # test-sycl-configure-refusal and test-sycl-scratch-owner-end. Each is one executable linked against the private
+    # fixtures, never libllama (§M82 case (2)). Their planted faults are runtime seams (scratch-test-mutant.hpp), so one
+    # build scores every fault: the base ctest runs every case unmutated, and each `<test>-mutant-<names>` ctest runs
+    # `--mutant <names> --cases <cases>` and passes only when its expected failure text appears. They construct caches
+    # and pinned pools on a real queue, so they carry the OOM-family labels, run alone on the B50 with 64 MiB chunks
+    # (§M88 (2)), load no model, and exit 77 without a SYCL GPU. Lead-run.
+    #   MUTANTS is a flat list of triples: the mutant names (comma-separated), the cases (comma-separated) and the
+    #   expected text. ENV adds variables to the registration's environment. An expected text carries no `;`:
+    #   ${ARGN} splits it there and shifts every later triple, so a printed `;` is matched by `.`.
+    function(ggml_sycl_scratch_return_test stem)
+        cmake_parse_arguments(SRT "" "TIMEOUT" "ENV;MUTANTS" ${ARGN})
+        add_executable(${stem} tests/${stem}.cpp)
+        target_link_libraries(${stem} PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+        set_target_properties(${stem} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        set(_env "ONEAPI_DEVICE_SELECTOR=level_zero:1" "GGML_SYCL_PINNED_CHUNK_MB=64" ${SRT_ENV}
+                 "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+        add_test(NAME ${stem} COMMAND ${stem})
+        set_tests_properties(${stem} PROPERTIES
+            LABELS "sycl;cache;mem-handle;gpu-serial"
+            ENVIRONMENT "${_env}"
+            RUN_SERIAL TRUE
+            SKIP_RETURN_CODE 77
+            TIMEOUT ${SRT_TIMEOUT})
+        list(LENGTH SRT_MUTANTS _n)
+        if (_n GREATER 0)
+            math(EXPR _last "${_n} - 1")
+            foreach (_i RANGE 0 ${_last} 3)
+                math(EXPR _j "${_i} + 1")
+                math(EXPR _k "${_i} + 2")
+                list(GET SRT_MUTANTS ${_i} _mutants)
+                list(GET SRT_MUTANTS ${_j} _cases)
+                list(GET SRT_MUTANTS ${_k} _regex)
+                string(REPLACE "," "-" _suffix "${_mutants}")
+                add_test(NAME ${stem}-mutant-${_suffix} COMMAND ${stem} --mutant ${_mutants} --cases ${_cases})
+                set_tests_properties(${stem}-mutant-${_suffix} PROPERTIES
+                    LABELS "sycl;cache;mem-handle;gpu-serial;mutant"
+                    ENVIRONMENT "${_env}"
+                    RUN_SERIAL TRUE
+                    SKIP_RETURN_CODE 77
+                    TIMEOUT ${SRT_TIMEOUT}
+                    PASS_REGULAR_EXPRESSION "${_regex}")
+            endforeach()
+        endif()
+    endfunction()
+
+    ggml_sycl_scratch_return_test(test-sycl-scratch-trial-return TIMEOUT 900 MUTANTS
+        return-noop ladder,second-context
+            "after the ladder, expected [0-9.]+ MiB \\(winner's need\\)[\r\n]+  the capacity quotes the loser"
+        return-releases-live ladder
+            "RETURN printed a SCRATCH return refused line for live chunk [0-9]+"
+        return-no-withdraw window,ladder
+            "capacity [0-9.]+ MiB after RETURN, expected 64\\.0 MiB[\r\n]+  the capacity quotes the loser"
+        return-no-file window
+            "chunk_count [0-9]+ after the ladder, expected [0-9]+. no SCRATCH released line for chunk [0-9]+"
+        double-decrement ladder
+            "SCRATCH capacity [0-9.]+ MiB exceeds the pool's allocated\\(\\) [0-9.]+ MiB"
+        return-no-immediate empty-return
+            "chunk_count [0-9]+ right after RETURN, expected [0-9]+: empty returned chunk [0-9]+ not released"
+        footprint-before-free empty-return
+            "MiB at the free point, expected [0-9.]+ MiB: footprint decremented before the free"
+        release-no-erase empty-return,window
+            "marked set holds [0-9]+ entry\\(ies\\) after the release of chunk [0-9]+, expected 0"
+        begin-names-any-owner throw-kept
+            "the second context's begin printed a SCRATCH return refused line for chunk [0-9]+, another owner"
+        rtm-left-in-txn retry-return,retry-keep,trial-retry-return,trial-retry-keep
+            "transaction holds [0-9]+ chunk\\(s\\) after RETURN_TO_MARK, expected 0"
+        rtm-left-in-txn,withdraw-transition-blind retry-return
+            "SCRATCH capacity [0-9.]+ MiB exceeds the pool's allocated\\(\\) [0-9.]+ MiB"
+        keep-walks-set retry-keep,trial-retry-keep
+            "chunk [0-9]+ not withdrawn after KEEP: KEEP reaches only the transaction's chunks"
+        carrier-dtor-noop dropped-carrier
+            "after a dropped released_chunk, expected [0-9.]+ MiB: footprint leaked by a dropped carrier"
+        moved-from-releases dropped-carrier
+            "after release_chunk_backing, expected [0-9.]+ MiB: footprint subtracted twice"
+        no-prune strand
+            "after the retry completed, expected [0-9.]+ MiB: stranded footprint never reconciled"
+        prune-without-query strand
+            "at the first reconcile while the allocation is still registered"
+        subtract-at-refusal strand
+            "after a refused free, expected [0-9.]+ MiB: footprint left while the allocation is still registered"
+        dtor-no-report teardown
+            "no teardown line for the stranded entry"
+        registered-exact-ptr-only registered-exact
+            "registered_exact answered true for ptr [^ ]+ with id [0-9]+, the row holds id [0-9]+"
+        stranded-reserve-8 nine-strand
+            "stranded_ capacity [0-9]+ exhausted at [0-9]+ entries"
+        lease-checked-first status-order
+            "reason=lease for chunk [0-9]+, which holds a live allocation")
+
+    # The driver forks and execs three children with their own envp (strict, plain, outstanding-carrier); it touches
+    # no device itself. GGML_SYCL_HOST_RESERVE_MB bounds the pinned budget, so the plain child's shortfall control,
+    # which grows the pool to its budget before the refusal, commits 1 GiB and not the host's memory.
+    ggml_sycl_scratch_return_test(test-sycl-configure-refusal TIMEOUT 300 ENV "GGML_SYCL_HOST_RESERVE_MB=1024" MUTANTS
+        configure-rebuilds plain
+            "rebuilt over withdrawn chunk [0-9]+: capacity [0-9.]+ after, [0-9.]+ before, marked set holds [0-9]+"
+        configure-direct-release plain
+            "marked set holds [0-9]+ entry\\(ies\\) after the release of chunk [0-9]+, expected 0"
+        strict-abort-dropped strict
+            "strict child exited [0-9]+, expected SIGABRT"
+        abort-non-strict plain
+            "plain child died by signal [0-9]+, expected exit 0"
+        carrier-assert-removed carrier
+            "outstanding-carrier child exited [0-9]+, expected SIGABRT")
+
+    ggml_sycl_scratch_return_test(test-sycl-scratch-owner-end TIMEOUT 600 MUTANTS
+        owner-end-removed orphaned
+            "FAIL \\[orphaned\\] chunk [0-9]+ not orphaned by the owner's end"
+        orphan-free-ignored orphaned
+            "FAIL \\[orphaned\\] chunk_count [0-9]+ after the stand-in's free, expected [0-9]+"
+        owner-end-no-empty empty-at-free
+            "after the context is freed, expected [0-9]+: withdrawn chunk [0-9]+ idle until pool destruction"
+        release-no-erase orphaned
+            "FAIL \\[orphaned\\] marked set holds [0-9]+ entry\\(ies\\) after the release of chunk [0-9]+, expected 0"
+        owner-end-first-only two-empty
+            "owner-end freed one of two chunks"
+        lease-drop-no-index lease-a
+            "after the lease dropped, expected [0-9]+: withdrawn chunk [0-9]+ waits for a begin")
+
     # The host-only plan dry run's lead-run arms (th32 §4.2, §11 T11): a caller built against another struct
     # layout is refused, expected_host is the stage's host_planned_bytes, every term is printed by name from the
     # plan, a dry run stores no budget, and the --mem-available option is the sample's MemAvailable. The planner
@@ -8820,7 +8939,11 @@ ggml_sycl_host_zone_plan_test(host-scratch-demand MUTANTS
     HOST_ZONE_PLAN_MUTANT_LEDGER_NO_ROLLBACK
         "after a failed grow, the next notify for the same deficit grew 0 time\\(s\\), expected 1"
     HOST_ZONE_PLAN_MUTANT_LEDGER_NO_RESERVE
-        "two notifies for one deficit grew 2 time\\(s\\), expected 1")
+        "two notifies for one deficit grew 2 time\\(s\\), expected 1"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_WITHDRAW_KEPT
+        "withdrawal, the same target grew 1 time\\(s\\) in all, expected 2: the reservation still counts"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_MARK_IGNORED
+        "the commit's re-notify printed no measured=100.0 allocated=80.0 on its demand line")
 
 if (NOT GGML_BACKEND_DL)
     # The real ggml-base scheduler over two CPU backend instances; ggml-cpu is a MODULE under GGML_BACKEND_DL.
@@ -8856,8 +8979,10 @@ ggml_sycl_host_zone_plan_test(attn-host-staging-plan MUTANTS
         "the walk counted 2 host-KV node\\(s\\), expected 1 \\(the view\\)"
     HOST_ZONE_PLAN_MUTANT_HELPER_DEVICE
         "device 1's slots are unplanned"
-    HOST_ZONE_PLAN_MUTANT_UNPLANNED_REFUSES
-        "an unplanned device refused a dispatch"
+    HOST_ZONE_PLAN_MUTANT_UNPLANNED_GROWS
+        "an unplanned device admitted a dispatch: [1-3] of 3 admits returned a slot"
+    HOST_ZONE_PLAN_MUTANT_UNPLANNED_POOLS_SCAN
+        "with no commit the pools initialized=1 at D=32"
     HOST_ZONE_PLAN_MUTANT_FREE_RELEASES_PLANNED
         "after an unrelated backend's free, device 1 did not admit by its plan")
 

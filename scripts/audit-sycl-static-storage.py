@@ -53,6 +53,7 @@ FILES = (
     "ggml/src/ggml-sycl/kv-room-cost.hpp",
     "ggml/src/ggml-sycl/lazy-io-pool.hpp",
     "ggml/src/ggml-sycl/lazy-io-pool.cpp",
+    "ggml/src/ggml-sycl/scratch-test-mutant.hpp",
 )
 COLUMNS = (
     "file", "line", "symbol", "type", "scope", "mutability", "synchronization",

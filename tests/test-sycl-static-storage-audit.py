@@ -37,6 +37,7 @@ INPUTS = (
     "ggml/src/ggml-sycl/kv-room-cost.hpp",
     "ggml/src/ggml-sycl/lazy-io-pool.hpp",
     "ggml/src/ggml-sycl/lazy-io-pool.cpp",
+    "ggml/src/ggml-sycl/scratch-test-mutant.hpp",
 )
 INVENTORY = "docs/backend/sycl-static-storage-inventory.csv"
 STALE_MESSAGE = "is stale; regenerate without --check"

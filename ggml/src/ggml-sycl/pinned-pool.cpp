@@ -9,6 +9,7 @@
 #include "allocation-provenance.hpp"
 #include "common.hpp"
 #include "ggml-impl.h"
+#include "scratch-test-mutant.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -145,6 +146,11 @@ pinned_chunk_pool::pinned_chunk_pool(sycl::queue & queue, size_t budget) :
 }
 
 pinned_chunk_pool::~pinned_chunk_pool() {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::CARRIER_ASSERT_REMOVED)) {
+        owning_carriers_.store(0, std::memory_order_release);
+    }
+#endif
     GGML_ASSERT(owning_carriers_.load(std::memory_order_acquire) == 0 &&
                 "released_chunk outstanding at pool destruction");
     std::lock_guard<std::mutex> lock(mutex_);
@@ -171,6 +177,11 @@ pinned_chunk_pool::~pinned_chunk_pool() {
     // A released backing the registry still holds now (a control the registry abandoned at shutdown, or a retry not
     // yet run) is reported here: after this the pool counts nothing.
     reconcile_stranded_locked();
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::DTOR_NO_REPORT)) {
+        stranded_.clear();
+    }
+#endif
     for (const auto & entry : stranded_) {
         GGML_LOG_WARN("[PINNED-POOL] stranded chunk backing %.1f MB still registered at pool destruction\n",
                       entry.backing / (1024.0 * 1024.0));
@@ -334,6 +345,15 @@ bool pinned_chunk_pool::configure_zones(size_t weight_bytes,
     // A surviving withdrawn chunk refuses the rebuild before any state changes (§4.4 "configure_zones refuses while a
     // withdrawn chunk survives"): the rebuild below would drop its allocator, and the live allocation in it, while the
     // device cache's marked set still names the chunk.
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::CONFIGURE_REBUILDS)) {
+        for (auto & states : zone_allocators_) {
+            for (auto & zcs : states) {
+                zcs.withdrawn = false;
+            }
+        }
+    }
+#endif
     for (const auto & states : zone_allocators_) {
         for (const auto & zcs : states) {
             if (zcs.withdrawn) {
@@ -863,12 +883,19 @@ size_t pinned_chunk_pool::footprint_locked() const {
 }
 
 void pinned_chunk_pool::reconcile_stranded_locked() const {
+    bool planted_skip_query = false;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::NO_PRUNE)) {
+        return;
+    }
+    planted_skip_query = scratch_test_mutant_on(scratch_test_mutant::PRUNE_WITHOUT_QUERY);
+#endif
     if (stranded_.empty()) {
         return;
     }
     // In place (remove_if then erase), so the capacity grow_into reserved is never given back.
-    const auto gone = std::remove_if(stranded_.begin(), stranded_.end(), [this](const stranded_entry & entry) {
-        if (unified_allocation_registered_exact(entry.metadata) != ALLOCATION_REGISTERED_GONE) {
+    const auto gone = std::remove_if(stranded_.begin(), stranded_.end(), [&](const stranded_entry & entry) {
+        if (!planted_skip_query && unified_allocation_registered_exact(entry.metadata) != ALLOCATION_REGISTERED_GONE) {
             return false;
         }
         total_allocated_ -= entry.backing;
@@ -883,6 +910,30 @@ size_t pinned_chunk_pool::stranded_count() const {
     reconcile_stranded_locked();
     return stranded_.size();
 }
+
+bool pinned_chunk_pool::test_chunk_metadata(size_t chunk_idx, alloc_metadata * out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (out == nullptr || chunk_idx >= chunks_.size() || !chunks_[chunk_idx].base) {
+        return false;
+    }
+    return chunks_[chunk_idx].owner.owner_metadata(out);
+}
+
+#    if defined(GGML_SYCL_SCRATCH_MUTANTS)
+void pinned_chunk_pool::test_unwithdraw_zone_chunk(host_zone_id zone, size_t chunk_idx) {
+    const size_t                zi = static_cast<size_t>(zone);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (zi >= static_cast<size_t>(host_zone_id::COUNT)) {
+        return;
+    }
+    for (auto & zcs : zone_allocators_[zi]) {
+        if (zcs.chunk_idx == chunk_idx && zcs.withdrawn) {
+            zcs.withdrawn = false;
+            zones_[zi].size += zcs.zone_size;
+        }
+    }
+}
+#    endif
 #endif
 
 bool pinned_chunk_pool::withdraw_zone_chunk(host_zone_id zone, size_t chunk_idx) {
@@ -900,6 +951,11 @@ bool pinned_chunk_pool::withdraw_zone_chunk(host_zone_id zone, size_t chunk_idx)
         if (zcs.zone_start != 0 || zcs.zone_size != chunks_[chunk_idx].size) {
             return false;
         }
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        if (zcs.withdrawn && scratch_test_mutant_on(scratch_test_mutant::WITHDRAW_TRANSITION_BLIND)) {
+            zones_[zi].size -= zcs.zone_size;
+        }
+#endif
         if (!zcs.withdrawn) {
             zcs.withdrawn = true;
             zones_[zi].size -= zcs.zone_size;
@@ -932,6 +988,11 @@ pinned_chunk_release pinned_chunk_pool::release_zone_chunk(host_zone_id     zone
             state->orphaned = true;
             return PINNED_CHUNK_RELEASE_ORPHANED;
         }
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        if (c.lease_count.load() > 0 && scratch_test_mutant_on(scratch_test_mutant::LEASE_CHECKED_FIRST)) {
+            return PINNED_CHUNK_RELEASE_REFUSED_LEASE;
+        }
+#endif
         return live ? PINNED_CHUNK_RELEASE_REFUSED_LIVE : PINNED_CHUNK_RELEASE_REFUSED_LEASE;
     }
 
@@ -940,10 +1001,20 @@ pinned_chunk_release pinned_chunk_pool::release_zone_chunk(host_zone_id     zone
     flat_spans_.erase(std::remove_if(flat_spans_.begin(), flat_spans_.end(),
                                      [chunk_idx](const flat_span_info & s) { return s.chunk_idx == chunk_idx; }),
                       flat_spans_.end());
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::DOUBLE_DECREMENT)) {
+        zones_[zi].size -= state->zone_size;
+    }
+#endif
     states.erase(state);
 
     out.pool_    = this;
     out.backing_ = c.size + DEFAULT_ALIGNMENT;  // what grow_into committed: usable plus the base header
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::FOOTPRINT_BEFORE_FREE)) {
+        total_allocated_ -= out.backing_;
+    }
+#endif
     out.removed_ = std::move(c);
     // The tombstone: find_chunk_handle and acquire_chunk_lease skip a null base under this lock, so no lease can be
     // taken on the chunk from here on, and no other chunk's index moves.
@@ -987,6 +1058,15 @@ pinned_chunk_pool::released_chunk::released_chunk(released_chunk && other) noexc
     backing_(other.backing_) {
     other.pool_    = nullptr;
     other.backing_ = 0;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::MOVED_FROM_RELEASES)) {
+        // The moved-from carrier keeps its backing figure and the pool, so its destructor subtracts it again. Not one
+        // statement: keeping pool_ itself would send the moved-from carrier through the release path, whose owner
+        // assertion fires first, so the destructor needs its own subtraction for this fault.
+        other.test_moved_from_ = pool_;
+        other.backing_         = backing_;
+    }
+#endif
 }
 
 pinned_chunk_pool::released_chunk & pinned_chunk_pool::released_chunk::operator=(released_chunk && other) noexcept {
@@ -1003,6 +1083,15 @@ pinned_chunk_pool::released_chunk & pinned_chunk_pool::released_chunk::operator=
 }
 
 pinned_chunk_pool::released_chunk::~released_chunk() {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (pool_ == nullptr && test_moved_from_ != nullptr && backing_ != 0) {
+        std::lock_guard<std::mutex> lock(test_moved_from_->mutex_);
+        test_moved_from_->total_allocated_ -= backing_;
+    }
+    if (pool_ != nullptr && scratch_test_mutant_on(scratch_test_mutant::CARRIER_DTOR_NOOP)) {
+        return;
+    }
+#endif
     if (pool_ == nullptr) {
         return;
     }
@@ -1018,11 +1107,16 @@ pinned_chunk_pool::released_chunk::~released_chunk() {
 #endif
     // (3) Whether the registry still holds that exact row: the one fact that says the memory is gone (§M92).
     const allocation_registered_state state = unified_allocation_registered_exact(metadata);
+
+    bool planted_subtract_at_refusal = false;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    planted_subtract_at_refusal = scratch_test_mutant_on(scratch_test_mutant::SUBTRACT_AT_REFUSAL);
+#endif
     // (4) The footprint leaves only with the memory. A row still present strands the bytes until a reconcile finds it
     // gone; the row cannot say why its release is pending, so the line names no cause (§M97).
     {
         std::lock_guard<std::mutex> lock(pool_->mutex_);
-        if (state == ALLOCATION_REGISTERED_GONE) {
+        if (state == ALLOCATION_REGISTERED_GONE || planted_subtract_at_refusal) {
             pool_->total_allocated_ -= backing_;
         } else {
             if (pool_->stranded_.size() >= pool_->stranded_.capacity()) {
@@ -1175,6 +1269,16 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
                        chunks_.size() + runtime_chunks_.size());
         return false;
     }
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    // Not a perturbation of the reserve above: reserve() never lowers a capacity, so the fault swaps in a copy whose
+    // capacity is 8.
+    if (scratch_test_mutant_on(scratch_test_mutant::STRANDED_RESERVE_8) && stranded_.size() <= 8) {
+        std::vector<stranded_entry> eight;
+        eight.reserve(8);
+        eight.assign(stranded_.begin(), stranded_.end());
+        stranded_.swap(eight);
+    }
+#endif
 
     if (alloc_timeout_ms_ > 0) {
         if (pinned_trace_enabled()) {

@@ -4104,6 +4104,24 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-plan-dry-run-source.py
         LABEL "sycl;host;python;source-contract"
         TIMEOUT 120)
+    # 5efe §4.4, §7 C4: the host-readable half of the three lead-run SCRATCH return tests. Each pin holds its device
+    # test's registration and planted-fault arms, what its source may and may not call, and the production code its
+    # arms score: the transaction's steps and witness, the configure refusal, and the owner's end at the backend free.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-scratch-trial-return-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-scratch-trial-return-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-configure-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-configure-refusal-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-scratch-owner-end-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-scratch-owner-end-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
     # th32 §3.2, §4.3 step 4: the coverage pin reaches every planner path, from the thread's plan slot at both stage
     # calls through the pair overloads and the one-device delegation to the residency decision, and only the slot's
     # scope writes the slot. A dropped forward compiles (the parameter defaults to nullptr), so one mutant per forward.

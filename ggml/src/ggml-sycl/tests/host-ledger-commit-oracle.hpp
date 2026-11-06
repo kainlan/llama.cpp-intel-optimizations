@@ -30,8 +30,8 @@ struct derived_commit {
 
 // The rules ggml_sycl_configure_host_zones_for_plan() and the pinned pool apply: no entries, no zones; the KV zone at
 // least 64 MiB; the SCRATCH zone at least the live oneDNN scratch plus the largest tensor plus 32 MiB; the four zones
-// each aligned to 64 bytes and grown in whole chunks, each chunk carrying a 64-byte header; the RUNTIME pool's bytes in
-// chunks of their own.
+// each aligned to 64 bytes and grown in whole chunks, each chunk carrying a 64-byte header; the RUNTIME pool's bytes,
+// the oneDNN scratchpad and the DMA staging pool and neither PP term, in chunks of their own.
 inline derived_commit derive_commit(const ggml_sycl::placement_plan & plan, size_t onednn_live, size_t chunk) {
     constexpr size_t MiB = 1024ull * 1024ull;
     derived_commit   d;
@@ -45,8 +45,8 @@ inline derived_commit derive_commit(const ggml_sycl::placement_plan & plan, size
     d.kv      = std::max(plan.host_zone_kv_bytes, 64 * MiB);
     d.staging = plan.host_zone_staging_bytes;
     d.scratch = std::max(plan.host_zone_scratch_bytes, onednn_live + plan.max_tensor_bytes + 32 * MiB);
-    d.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes + plan.pp_pipeline_scratch_bytes +
-                plan.pp_moe_onednn_scratch_bytes;
+    d.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;
+
     const uint64_t zones = align64(d.weight) + align64(d.kv) + align64(d.staging) + align64(d.scratch);
     d.committed          = ((zones + chunk - 1) / chunk) * (chunk + 64);
     if (d.runtime > 0) {

@@ -29,6 +29,7 @@
 #include "onednn-woq.hpp"
 #include "planned-load-terms.hpp"
 #include "range-index.hpp"
+#include "scratch-test-mutant.hpp"
 #include "sycl-timeline.hpp"
 #include "unified-types.hpp"
 #include "vram-headroom.hpp"
@@ -21524,8 +21525,13 @@ mem_handle alloc_handle::as_mem_handle() const {
 allocation_registered_state unified_allocation_registered_exact(const alloc_metadata & metadata) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     const auto                  row = g_runtime_alloc_registry.find(metadata.ptr);
+
+    bool planted_ptr_only = false;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    planted_ptr_only = scratch_test_mutant_on(scratch_test_mutant::REGISTERED_EXACT_PTR_ONLY);
+#endif
     // A reused address answers GONE: the row there is another allocation unless its whole release key matches.
-    if (row == g_runtime_alloc_registry.end() || !(row->second.handle.key() == metadata.key())) {
+    if (row == g_runtime_alloc_registry.end() || (!planted_ptr_only && !(row->second.handle.key() == metadata.key()))) {
         return ALLOCATION_REGISTERED_GONE;
     }
     return row->second.state == runtime_alloc_state::RELEASING ? ALLOCATION_REGISTERED_RELEASING :
@@ -21968,6 +21974,29 @@ bool allocation_registry_test_release_exact_lease(const alloc_metadata & metadat
     if (it == g_runtime_alloc_registry.end() || !(it->second.handle.key() == metadata.key()) ||
         it->second.test_exact_leases == 0) return false;
     --it->second.test_exact_leases;
+    return true;
+}
+
+bool allocation_registry_test_hold_physical_release(const alloc_metadata & metadata) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto                  it = g_runtime_alloc_registry.find(metadata.ptr);
+    if (it == g_runtime_alloc_registry.end() || !(it->second.handle.key() == metadata.key())) {
+        return false;
+    }
+    it->second.test_no_physical_release = true;
+    ++it->second.test_exact_leases;
+    return true;
+}
+
+bool allocation_registry_test_unhold_physical_release(const alloc_metadata & metadata) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto                  it = g_runtime_alloc_registry.find(metadata.ptr);
+    if (it == g_runtime_alloc_registry.end() || !(it->second.handle.key() == metadata.key()) ||
+        it->second.test_exact_leases == 0) {
+        return false;
+    }
+    --it->second.test_exact_leases;
+    it->second.test_no_physical_release = false;
     return true;
 }
 
@@ -26084,6 +26113,11 @@ void unified_cache::host_zone_free(host_zone_id zone, void * ptr) {
     }
     const zone_audit_timer audit_timer(zone_audit_host_timing(zone), true);
     const size_t           orphaned_chunk = host_arena_->zone_free(zone, ptr);
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::ORPHAN_FREE_IGNORED)) {
+        return;
+    }
+#endif
     // The free that empties an orphaned chunk releases it, after the pool's lock has dropped (§4.4).
     if (orphaned_chunk != pinned_chunk_pool::NO_CHUNK) {
         (void) release_marked_chunk(orphaned_chunk);
@@ -26127,7 +26161,12 @@ bool unified_cache::host_zone_grow(host_zone_id zone, size_t additional_bytes) {
         fprintf(stderr, "[HOST-ZONE-ALLOC] where=grow zone=%s additional_bytes=%zu used_before=%zu cap_before=%zu\n",
                 host_zone_name(zone), additional_bytes, host_zone_used(zone), host_zone_capacity(zone));
     }
-    const bool grew = host_arena_->grow_zone(zone, additional_bytes);
+    size_t     grown_chunk = pinned_chunk_pool::NO_CHUNK;
+    const bool grew        = host_arena_->grow_zone(zone, additional_bytes, &grown_chunk);
+    // The miss path's SCRATCH growth is charged to the open transaction like the ensure's (§M75).
+    if (grew && zone == host_zone_id::SCRATCH) {
+        host_scratch_trial_note_grow(grown_chunk);
+    }
     if (host_zone_alloc_trace_enabled()) {
         fprintf(stderr, "[HOST-ZONE-ALLOC] where=grow-result zone=%s ok=%d cap_after=%zu\n", host_zone_name(zone),
                 (int) grew, host_zone_capacity(zone));
@@ -26165,7 +26204,15 @@ bool unified_cache::configure_host_zones(size_t weight_bytes,
             candidates.clear();
         }
         for (const marked_chunk_entry & candidate : candidates) {
-            (void) release_marked_chunk_locked(candidate.chunk_idx, released, false);
+            const pinned_chunk_release status = release_marked_chunk_locked(candidate.chunk_idx, released, false);
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            // A direct pool release leaves the marked entry behind, so the fault puts back the one this release erased.
+            if (status == PINNED_CHUNK_RELEASE_DONE &&
+                scratch_test_mutant_on(scratch_test_mutant::CONFIGURE_DIRECT_RELEASE)) {
+                marked_set_.push_back(candidate);
+            }
+#endif
+            (void) status;
         }
     }
     size_t released_bytes = 0;
@@ -26177,9 +26224,21 @@ bool unified_cache::configure_host_zones(size_t weight_bytes,
 
     // The refusal changes nothing: the zones, every flag, the marked set and the reserved figures stay one state.
     if (!host_arena_->configure_zones(weight_bytes, kv_bytes, staging_bytes, scratch_bytes)) {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        // Not a perturbation of the strict test below: that test stays a bare if (ggml_sycl_strict_enabled()) around
+        // the abort, so one fault returns before it and the other aborts a build it never aborts.
+        if (ggml_sycl_strict_enabled()) {
+            if (scratch_test_mutant_on(scratch_test_mutant::STRICT_ABORT_DROPPED)) {
+                return false;
+            }
+        } else if (scratch_test_mutant_on(scratch_test_mutant::ABORT_NON_STRICT)) {
+            GGML_ABORT("[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives (planted fault)");
+        }
+#endif
         if (ggml_sycl_strict_enabled()) {
             GGML_ABORT(
-                "[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives (GGML_SYCL_STRICT_LEASES)");
+                "[HOST-ARENA] configure_zones refused: a withdrawn SCRATCH chunk survives "
+                "(GGML_SYCL_STRICT_LEASES=1)");
         }
         return false;
     }
@@ -26241,9 +26300,24 @@ size_t unified_cache::host_scratch_return_chunks(const std::vector<size_t> & chu
                     dev, chunk_idx);
                 continue;
             }
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            if (scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_WITHDRAW)) {
+                host_arena_->test_unwithdraw_zone_chunk(host_zone_id::SCRATCH, chunk_idx);
+            }
+#endif
             marked_set_.push_back({ chunk_idx, owner });
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            if (scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_FILE)) {
+                marked_set_.pop_back();
+            }
+#endif
             // A losing scheduler's buffers still in the chunk keep it: its owner's next begin or its end releases it.
-            if (host_arena_->zone_chunk_usage(host_zone_id::SCRATCH, chunk_idx).used != 0) {
+            bool kept = host_arena_->zone_chunk_usage(host_zone_id::SCRATCH, chunk_idx).used != 0;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            kept = scratch_test_mutant_on(scratch_test_mutant::RETURN_NO_IMMEDIATE) ||
+                   (kept && !scratch_test_mutant_on(scratch_test_mutant::RETURN_RELEASES_LIVE));
+#endif
+            if (kept) {
                 continue;
             }
             const pinned_chunk_release status = release_marked_chunk_locked(chunk_idx, released, false);
@@ -26292,12 +26366,16 @@ size_t unified_cache::host_scratch_begin_release(uint64_t owner) {
         for (const marked_chunk_entry & entry : marked_set_) {
             marked_candidate_note(candidates, entry, owner);
         }
+        bool planted_any_owner = false;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        planted_any_owner = scratch_test_mutant_on(scratch_test_mutant::BEGIN_NAMES_ANY_OWNER);
+#endif
         for (const marked_chunk_entry & candidate : candidates) {
             const pinned_chunk_release status = release_marked_chunk_locked(candidate.chunk_idx, released, false);
             // Another owner's chunk still in use is left silently: it holds that context's scheduler buffers (§4.4
             // "A begin and a live owner"). Only the owning context's own begin names it.
             if ((status == PINNED_CHUNK_RELEASE_REFUSED_LIVE || status == PINNED_CHUNK_RELEASE_REFUSED_LEASE) &&
-                candidate.owner == owner) {
+                (candidate.owner == owner || planted_any_owner)) {
                 refusals.push_back({ candidate.chunk_idx, status });
             }
         }
@@ -26345,6 +26423,15 @@ size_t unified_cache::host_scratch_owner_end(uint64_t owner) {
         // A chunk still in use is marked orphaned under the pool's same hold, so a free cannot slip between the check
         // and the flag: the emptying free or the last lease's drop releases it.
         for (const marked_chunk_entry & candidate : candidates) {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            if (scratch_test_mutant_on(scratch_test_mutant::OWNER_END_NO_EMPTY) &&
+                host_arena_->zone_chunk_usage(host_zone_id::SCRATCH, candidate.chunk_idx).used == 0) {
+                continue;
+            }
+            if (scratch_test_mutant_on(scratch_test_mutant::OWNER_END_FIRST_ONLY) && !released.empty()) {
+                break;
+            }
+#endif
             (void) release_marked_chunk_locked(candidate.chunk_idx, released, true);
         }
     }
@@ -26384,6 +26471,12 @@ pinned_chunk_release unified_cache::release_marked_chunk_locked(size_t chunk_idx
     const pinned_chunk_release        status =
         host_arena_->release_zone_chunk(host_zone_id::SCRATCH, chunk_idx, carrier, orphan_if_live);
     if (status == PINNED_CHUNK_RELEASE_DONE) {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        if (scratch_test_mutant_on(scratch_test_mutant::RELEASE_NO_ERASE)) {
+            out.emplace_back(std::move(carrier));
+            return status;
+        }
+#endif
         marked_set_.erase(
             std::remove_if(marked_set_.begin(), marked_set_.end(),
                            [chunk_idx](const marked_chunk_entry & e) { return e.chunk_idx == chunk_idx; }),
@@ -26397,6 +26490,11 @@ pinned_chunk_release unified_cache::release_marked_chunk_locked(size_t          
                                                                 pinned_chunk_pool::released_chunk & out) {
     const pinned_chunk_release status = host_arena_->release_zone_chunk(host_zone_id::SCRATCH, chunk_idx, out, false);
     if (status == PINNED_CHUNK_RELEASE_DONE) {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        if (scratch_test_mutant_on(scratch_test_mutant::RELEASE_NO_ERASE)) {
+            return status;
+        }
+#endif
         marked_set_.erase(
             std::remove_if(marked_set_.begin(), marked_set_.end(),
                            [chunk_idx](const marked_chunk_entry & e) { return e.chunk_idx == chunk_idx; }),
@@ -26443,6 +26541,253 @@ void unified_cache::print_marked_refusals(const std::vector<marked_chunk_refusal
     }
 }
 
+size_t unified_cache::host_scratch_trial(host_scratch_trial_op op, uint64_t owner, uint32_t n_ubatch) {
+    if (!host_arena_ || owner == 0) {
+        return 0;
+    }
+    switch (op) {
+        case host_scratch_trial_op::OPEN:
+            return host_scratch_trial_open(owner, n_ubatch);
+        case host_scratch_trial_op::MARK:
+            return host_scratch_trial_mark(owner, n_ubatch);
+        case host_scratch_trial_op::KEEP:
+            {
+                // Closing the transaction is the whole step: its chunks are ordinary capacity from here on. KEEP never
+                // reaches the marked set or a withdrawn flag, so a chunk RETURN_TO_MARK filed stays withdrawn (§4.4
+                // r10 m-4, r12 M-4).
+                const host_scratch_txn_taken kept = host_scratch_trial_take(owner, false);
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+                if (scratch_test_mutant_on(scratch_test_mutant::KEEP_WALKS_SET)) {
+                    std::lock_guard<std::mutex> lock(marked_set_mutex_);
+                    for (const marked_chunk_entry & entry : marked_set_) {
+                        host_arena_->test_unwithdraw_zone_chunk(host_zone_id::SCRATCH, entry.chunk_idx);
+                    }
+                }
+#endif
+                host_scratch_trial_witness(kept.trial ? "trial" : "reserve", kept.n_ubatch, "kept",
+                                           host_scratch_counted_bytes(kept.chunks), kept.chunks.size());
+                return kept.chunks.size();
+            }
+        case host_scratch_trial_op::RETURN:
+            {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+                if (scratch_test_mutant_on(scratch_test_mutant::RETURN_NOOP)) {
+                    return 0;
+                }
+#endif
+                const host_scratch_txn_taken returned = host_scratch_trial_take(owner, false);
+                // A losing candidate's demand leaves with its growth (§M75), so the next notify sizes from the live
+                // contexts alone.
+                host_scratch_ledger_.drop_context(owner);
+                return host_scratch_trial_file(owner, returned, returned.trial ? "trial" : "reserve");
+            }
+        case host_scratch_trial_op::RETURN_TO_MARK:
+            return host_scratch_trial_file(owner, host_scratch_trial_take(owner, true), "retry");
+    }
+    return 0;
+}
+
+size_t unified_cache::host_scratch_trial_open(uint64_t owner, uint32_t n_ubatch) {
+    bool lost = false;
+    {
+        std::lock_guard<std::mutex> lock(host_scratch_txn_mutex_);
+        for (host_scratch_txn & txn : host_scratch_txns_) {
+            if (txn.owner == owner) {
+                // An OPEN over a transaction still open (no caller leaves one): the trial adopts it, chunks and all,
+                // so the trial's KEEP or RETURN decides every chunk the context grew.
+                txn.thread   = std::this_thread::get_id();
+                txn.trial    = true;
+                txn.n_ubatch = n_ubatch;
+                txn.mark     = txn.chunks.size();
+                return 0;
+            }
+        }
+        try {
+            host_scratch_txn txn;
+            txn.owner    = owner;
+            txn.thread   = std::this_thread::get_id();
+            txn.trial    = true;
+            txn.n_ubatch = n_ubatch;
+            host_scratch_txns_.push_back(std::move(txn));
+        } catch (const std::bad_alloc &) {
+            lost = true;
+        }
+    }
+    if (lost) {
+        GGML_LOG_WARN(
+            "[HOST-ARENA] SCRATCH trial not opened dev=%d n_ubatch=%u: no room for the transaction; the candidate's "
+            "growth stays ordinary capacity\n",
+            ggml_sycl_get_device_id_from_queue(queue_), n_ubatch);
+    }
+    return 0;
+}
+
+size_t unified_cache::host_scratch_trial_mark(uint64_t owner, uint32_t n_ubatch) {
+    bool lost = false;
+    {
+        std::lock_guard<std::mutex> lock(host_scratch_txn_mutex_);
+        for (host_scratch_txn & txn : host_scratch_txns_) {
+            if (txn.owner == owner) {
+                // The trial's transaction is open: the reserve brackets its measure inside it (r9 n-6).
+                txn.mark = txn.chunks.size();
+                return 0;
+            }
+        }
+        try {
+            host_scratch_txn txn;
+            txn.owner    = owner;
+            txn.thread   = std::this_thread::get_id();
+            txn.trial    = false;
+            txn.n_ubatch = n_ubatch;
+            host_scratch_txns_.push_back(std::move(txn));
+        } catch (const std::bad_alloc &) {
+            lost = true;
+        }
+    }
+    if (lost) {
+        GGML_LOG_WARN(
+            "[HOST-ARENA] SCRATCH reserve transaction not opened dev=%d n_ubatch=%u: no room for it; the reserve's "
+            "growth stays ordinary capacity\n",
+            ggml_sycl_get_device_id_from_queue(queue_), n_ubatch);
+    }
+    return 0;
+}
+
+unified_cache::host_scratch_txn_taken unified_cache::host_scratch_trial_take(uint64_t owner, bool to_mark) {
+    host_scratch_txn_taken taken;
+    bool                   lost = false;
+    {
+        std::lock_guard<std::mutex> lock(host_scratch_txn_mutex_);
+        for (size_t i = 0; i < host_scratch_txns_.size(); ++i) {
+            host_scratch_txn & txn = host_scratch_txns_[i];
+            if (txn.owner != owner) {
+                continue;
+            }
+            taken.found    = true;
+            taken.trial    = txn.trial;
+            taken.n_ubatch = txn.n_ubatch;
+            if (!to_mark) {
+                taken.chunks = std::move(txn.chunks);
+                host_scratch_txns_.erase(host_scratch_txns_.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+            // RETURN_TO_MARK: the chunks grown since the mark leave the transaction, which stays open (r10 m-4).
+            const size_t mark = std::min(txn.mark, txn.chunks.size());
+            try {
+                taken.chunks.assign(txn.chunks.begin() + static_cast<std::ptrdiff_t>(mark), txn.chunks.end());
+            } catch (const std::bad_alloc &) {
+                // The tail stays in the transaction, whose KEEP or RETURN decides it.
+                lost = true;
+                break;
+            }
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+            if (scratch_test_mutant_on(scratch_test_mutant::RTM_LEFT_IN_TXN)) {
+                break;
+            }
+#endif
+            txn.chunks.resize(mark);
+            break;
+        }
+    }
+    if (lost) {
+        GGML_LOG_WARN(
+            "[HOST-ARENA] SCRATCH retry not truncated dev=%d: no room to take the chunks grown since the mark; the "
+            "transaction keeps them\n",
+            ggml_sycl_get_device_id_from_queue(queue_));
+    }
+    return taken;
+}
+
+size_t unified_cache::host_scratch_trial_file(uint64_t owner, const host_scratch_txn_taken & taken, const char * txn) {
+    if (taken.chunks.empty()) {
+        return 0;
+    }
+    const size_t counted = host_scratch_counted_bytes(taken.chunks);
+    // Printed before the filing, so the `released` line of the filing's immediate release follows it.
+    host_scratch_trial_witness(txn, taken.n_ubatch, "returned", counted, taken.chunks.size());
+    (void) host_scratch_return_chunks(taken.chunks, owner);
+    // What withdrawal took out of the zone's capacity also leaves the ledger's reservation, so a later target above
+    // what remains grows again (§4.4 "a marked chunk is withdrawn at once").
+    const size_t still = host_scratch_counted_bytes(taken.chunks);
+    host_scratch_ledger_.release_reserved(counted > still ? counted - still : 0);
+    return taken.chunks.size();
+}
+
+size_t unified_cache::host_scratch_counted_bytes(const std::vector<size_t> & chunks) const {
+    size_t bytes = 0;
+    for (const size_t chunk_idx : chunks) {
+        const pinned_chunk_usage usage = host_arena_->zone_chunk_usage(host_zone_id::SCRATCH, chunk_idx);
+        if (usage.found && !usage.withdrawn) {
+            bytes += static_cast<size_t>(usage.hi - usage.lo);
+        }
+    }
+    return bytes;
+}
+
+void unified_cache::host_scratch_trial_witness(const char * txn,
+                                               uint32_t     n_ubatch,
+                                               const char * verb,
+                                               size_t       bytes,
+                                               size_t       n_chunks) {
+    // At zero chunks nothing prints (r9 m-4).
+    if (n_chunks == 0) {
+        return;
+    }
+    GGML_LOG_INFO("[HOST-ARENA] SCRATCH %s dev=%d n_ubatch=%u %s %.1f MB (%zu chunk(s))\n", txn,
+                  ggml_sycl_get_device_id_from_queue(queue_), n_ubatch, verb, bytes / (1024.0 * 1024.0), n_chunks);
+}
+
+void unified_cache::host_scratch_trial_note_grow(size_t chunk_idx) {
+    if (chunk_idx == pinned_chunk_pool::NO_CHUNK) {
+        return;
+    }
+    const std::thread::id self = std::this_thread::get_id();
+    bool                  lost = false;
+    {
+        std::lock_guard<std::mutex> lock(host_scratch_txn_mutex_);
+        // The last transaction opened on this thread: the innermost, if a thread ever holds two.
+        for (size_t i = host_scratch_txns_.size(); i-- > 0;) {
+            if (host_scratch_txns_[i].thread != self) {
+                continue;
+            }
+            try {
+                host_scratch_txns_[i].chunks.push_back(chunk_idx);
+            } catch (const std::bad_alloc &) {
+                lost = true;
+            }
+            break;
+        }
+    }
+    if (lost) {
+        GGML_LOG_WARN(
+            "[HOST-ARENA] SCRATCH grow not charged dev=%d chunk=%zu: no room in the transaction; the chunk stays "
+            "ordinary capacity\n",
+            ggml_sycl_get_device_id_from_queue(queue_), chunk_idx);
+    }
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+bool unified_cache::host_scratch_trial_active(uint64_t owner) const {
+    std::lock_guard<std::mutex> lock(host_scratch_txn_mutex_);
+    for (const host_scratch_txn & txn : host_scratch_txns_) {
+        if (txn.owner == owner) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t unified_cache::host_scratch_trial_chunks(uint64_t owner) const {
+    std::lock_guard<std::mutex> lock(host_scratch_txn_mutex_);
+    for (const host_scratch_txn & txn : host_scratch_txns_) {
+        if (txn.owner == owner) {
+            return txn.chunks.size();
+        }
+    }
+    return 0;
+}
+#endif
+
 bool unified_cache::host_zones_configured() const {
     return host_arena_ && host_arena_->zones_configured();
 }
@@ -26451,10 +26796,12 @@ bool unified_cache::grow_scratch_zone(size_t request_bytes) {
     if (!host_arena_ || !host_arena_->zones_configured() || request_bytes == 0) {
         return false;
     }
-    const size_t before = host_arena_->zone_capacity(host_zone_id::SCRATCH);
-    if (!host_arena_->grow_zone(host_zone_id::SCRATCH, request_bytes)) {
+    const size_t before      = host_arena_->zone_capacity(host_zone_id::SCRATCH);
+    size_t       grown_chunk = pinned_chunk_pool::NO_CHUNK;
+    if (!host_arena_->grow_zone(host_zone_id::SCRATCH, request_bytes, &grown_chunk)) {
         return false;
     }
+    host_scratch_trial_note_grow(grown_chunk);
     const size_t after = host_arena_->zone_capacity(host_zone_id::SCRATCH);
     GGML_LOG_INFO("[HOST-ARENA] SCRATCH zone grown by %.1f MB for compute buffers\n",
                   (after - before) / (1024.0 * 1024.0));
@@ -27987,6 +28334,22 @@ bool unified_cache_host_scratch_ledger(int                     device,
 size_t unified_cache_host_scratch_begin_release(int device, uint64_t owner) {
     unified_cache * cache = get_existing_unified_cache_for_device(device);
     return cache != nullptr ? cache->host_scratch_begin_release(owner) : 0;
+}
+
+size_t unified_cache_host_scratch_trial(int device, host_scratch_trial_op op, uint64_t owner, uint32_t n_ubatch) {
+    unified_cache * cache = get_existing_unified_cache_for_device(device);
+    return cache != nullptr ? cache->host_scratch_trial(op, owner, n_ubatch) : 0;
+}
+
+size_t unified_cache_host_scratch_owner_end(int device, uint64_t owner) {
+    unified_cache * cache = get_existing_unified_cache_for_device(device);
+    if (cache == nullptr) {
+        return 0;
+    }
+    // A transaction the owner left open is returned first, so its chunks are filed under the owner for the walk below,
+    // and no transaction outlives its context to collect another context's growth on the same thread.
+    (void) cache->host_scratch_trial(host_scratch_trial_op::RETURN, owner, 0);
+    return cache->host_scratch_owner_end(owner);
 }
 
 void unified_cache_host_scratch_drop_context(uint64_t context_key) {
@@ -30571,6 +30934,11 @@ void unified_cache::host_release_chunk_lease(uint64_t handle) noexcept {
     // The drop of an orphaned, empty SCRATCH chunk's last lease releases it, after the pool's lock has dropped (§4.4
     // "the lease-drop trigger"), through the public form, which allocates nothing.
     const size_t orphaned_chunk = host_arena_->release_chunk_lease(handle);
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::LEASE_DROP_NO_INDEX)) {
+        return;
+    }
+#endif
     if (orphaned_chunk != pinned_chunk_pool::NO_CHUNK) {
         (void) release_marked_chunk(orphaned_chunk);
     }
@@ -34869,12 +35237,12 @@ static void populate_host_zone_sizing(placement_plan &                          
     plan.host_zone_staging_bytes = std::max<size_t>(k_min_zone_bytes, host_staging_total);
     GGML_LOG_INFO("[SYCL-PLAN] Host staging zone: s1_window=%zu per_inflight=%.1f MB total=%.1f MB\n", s1_in_flight,
                   s1_per_inflight_bytes / (1024.0 * 1024.0), plan.host_zone_staging_bytes / (1024.0 * 1024.0));
-    // SCRATCH zone: baseline (max_tensor + headroom) plus oneDNN reorder, MoE Q8_1 workspace,
-    // PP CPU expert act/out staging, MoE device routing buffers (expert pointer tables),
-    // TP compute buffers, and DMA staging pool (device double-buffer for weight streaming).
-    // VRAM RUNTIME fields (moe/tp/dma) are folded here as conservative zone budgeting —
-    // the actual allocations live in the VRAM RUNTIME zone, but the host SCRATCH zone
-    // grows proportionally to ensure the planner accounts for peak VRAM usage.
+    // SCRATCH zone: what a term sizes decides whether host SCRATCH reads it, not its label (§4.4 "Host SCRATCH reads
+    // no term that sizes a device allocation", §M62 (A)). Two host tenants are left: the single-tensor staging
+    // copies, bounded by max_tensor_bytes plus k_scratch_headroom, and the MoE PP CPU-island act/out staging, bounded
+    // by moe_cpu_expert_staging_bytes plus moe_host_recipe_workspace_bytes. The oneDNN reorder, the MoE Q8_1
+    // workspace, the MoE pointer tables, the TP compute buffers, the DMA staging pool and the two PP terms each size a
+    // device allocation, so none of them is folded here: a host reservation for them would sit idle.
     // A context's host compute and output buffers are not folded here: they are notified demands on the cache's
     // host SCRATCH ledger (unified_cache_host_scratch_ledger()), which covers them before each allocation.
     // Note: onednn_scratchpad_bytes goes to the ONEDNN zone (separate 256 MB allocation),
@@ -34886,10 +35254,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     if (moe_host_scratch < plan.moe_cpu_expert_staging_bytes) {
         host_scratch_valid = false;
     }
-    for (size_t bytes : { plan.max_tensor_bytes, k_scratch_headroom, plan.onednn_reorder_bytes,
-                          plan.moe_q8_workspace_bytes, moe_host_scratch, plan.moe_vram_runtime_bytes,
-                          plan.tp_vram_runtime_bytes, plan.dma_staging_pool_bytes, plan.pp_pipeline_scratch_bytes,
-                          plan.pp_moe_onednn_scratch_bytes }) {
+    for (size_t bytes : { plan.max_tensor_bytes, k_scratch_headroom, moe_host_scratch }) {
         size_t next = 0;
         if (!moe_mmid_checked_zone_total(host_scratch_total, bytes, &next)) {
             host_scratch_valid = false;

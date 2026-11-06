@@ -103,8 +103,13 @@ def test_backend_free_flushes_timeline_after_kernel_profile_drain_without_waits(
     timeline_flush = 'ggml_sycl::sycl_timeline_flush("backend-free");'
     delete_backend = "delete sycl_ctx;"
 
-    begin = src.index(kernel_flush)
-    window = src[begin : begin + 500]
+    # The window runs from the drain to the context's deletion, not over a fixed byte count. The owner's end
+    # runs between the two (docs/design/sycl-mmap-host-tier.md §4.4, "Every withdrawn chunk has an owner and
+    # a bounded release"), and every check below is about what happens before the context goes.
+    free_begin, free_end = function_body_span(src, BACKEND_FREE)
+    begin = src.index(kernel_flush, free_begin, free_end)
+    end = src.index(delete_backend, begin, free_end) + len(delete_backend)
+    window = src[begin:end]
 
     assert timeline_flush in window
     assert window.index(kernel_flush) < window.index(timeline_flush) < window.index(delete_backend)

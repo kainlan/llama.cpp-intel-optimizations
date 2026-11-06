@@ -39,7 +39,7 @@ import pytest
 # sycl_gate sits beside this file. `python3 -I` leaves the script's directory off sys.path, so it is appended
 # here; appended rather than prepended, a file in tests/ never shadows a standard module.
 sys.path.append(str(Path(__file__).resolve().parent))
-from sycl_gate import match_close, views  # noqa: E402
+from sycl_gate import match_close, resolve_mutants, views  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -229,10 +229,12 @@ def source_for(rel: str, raw: str) -> Source:
 
 
 def tree_texts() -> dict:
+    """Each file's text with its planted-fault blocks resolved as the production build compiles them
+    (sycl_gate.resolve_mutants), so a control edits, and a clause scores, production code alone."""
     texts = {}
     for rel in (POOL, CACHE, CANON):
         p = ROOT / rel
-        texts[rel] = p.read_text(errors="replace") if p.exists() else ""
+        texts[rel] = resolve_mutants(p.read_text(errors="replace")) if p.exists() else ""
     return texts
 
 
@@ -246,7 +248,7 @@ def committed_census_files(texts: dict) -> dict:
         rel = f"{SYCL_DIR}/{p.name}"
         raw = texts.get(rel)
         if raw is None:
-            raw = p.read_text(errors="replace")
+            raw = resolve_mutants(p.read_text(errors="replace"))
         if "pinned_pool_committed" in raw:
             out[rel] = raw
     for rel, raw in texts.items():
@@ -937,7 +939,8 @@ CONTROLS = [
      "    const allocation_registered_state state = ALLOCATION_REGISTERED_GONE;",
      "released_chunk destructor subtracts without the registry query"),
     ("c8-subtracts-on-registered-branch", 8, "carrier_dtor",
-     "        if (state == ALLOCATION_REGISTERED_GONE) {", "        if (state != ALLOCATION_REGISTERED_GONE) {",
+     "        if (state == ALLOCATION_REGISTERED_GONE || planted_subtract_at_refusal) {",
+     "        if (state != ALLOCATION_REGISTERED_GONE || planted_subtract_at_refusal) {",
      "released_chunk destructor subtracts on the registered branch"),
     ("c8-kept-branch-no-append", 8, "carrier_dtor",
      "            pool_->stranded_.emplace_back(stranded_entry{ metadata, backing_ });", "",
@@ -950,7 +953,7 @@ CONTROLS = [
     ("c8-warn-names-a-cause", 8, "carrier_dtor", "footprint stranded until the registry drops it",
      "footprint stranded until the scheduled retry", "released_chunk WARN names a cause"),
     ("c9-ptr-only-compare", 9, "accessor",
-     " || !(row->second.handle.key() == metadata.key())", "", "accessor compares ptr only"),
+     " || (!planted_ptr_only && !(row->second.handle.key() == metadata.key()))", "", "accessor compares ptr only"),
     ("c9-accessor-erases", 9, "accessor", "        return ALLOCATION_REGISTERED_GONE;\n    }",
      "        return ALLOCATION_REGISTERED_GONE;\n    }\n    g_runtime_alloc_registry.erase(row);",
      "accessor writes the registry"),
@@ -988,8 +991,8 @@ CONTROLS = [
     ("c10-second-mention-in-allowed-body", 10, "footprint_locked", "    return total_allocated_;",
      "    return total_allocated_ + (total_allocated_ & 0);", "allow-listed mention count differs"),
     ("c10-prune-without-registry-query", 10, "reconcile",
-     "if (unified_allocation_registered_exact(entry.metadata) != ALLOCATION_REGISTERED_GONE) {",
-     "if (entry.backing == 0) {", "stranded prune without registry query"),
+     "if (!planted_skip_query && unified_allocation_registered_exact(entry.metadata) != ALLOCATION_REGISTERED_GONE) {",
+     "if (!planted_skip_query && entry.backing == 0) {", "stranded prune without registry query"),
     ("c11-no-reserve", 11, "grow_into",
      "        stranded_.reserve(chunks_.size() + runtime_chunks_.size() + 1);", "        (void) 0;",
      "chunk added without stranded reserve"),
