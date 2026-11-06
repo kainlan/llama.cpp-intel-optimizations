@@ -1313,13 +1313,18 @@ arm_result arm_dry_run() {
     const ggml_sycl_lifecycle_result rc    = dry_run(inv.inv());
     const lazy_registry_state        after = registry();
     expect(r, rc == GGML_SYCL_LIFECYCLE_OK, "the dry run returned " + num(rc) + ", want OK");
-    expect(r, after.generation - g0 == 1,
+    const bool took = after.generation - g0 == 1;
+    expect(r, took,
            "the dry run moved the registry generation by " + num(after.generation - g0) + ", want 1: it took no lease");
-    expect(r, after.reaps_run_at_last_take == c0 + 1,
-           "the dry run's take snapshot " + num(after.reaps_run_at_last_take) + " reaps run, want " + num(c0 + 1) +
-               ": the entry reap did not run before the take");
-    expect(r, after.parked_at_last_take == 0,
-           "the dry run's take found " + num(after.parked_at_last_take) + " parked nodes, want 0");
+    // The take-time snapshot is the dry run's own only when its take installed a pool; otherwise it is an earlier
+    // take's, so a dry run that took no lease is never scored by it.
+    if (took) {
+        expect(r, after.reaps_run_at_last_take == c0 + 1,
+               "the dry run's take snapshot " + num(after.reaps_run_at_last_take) + " reaps run, want " + num(c0 + 1) +
+                   ": the entry reap did not run before the take");
+        expect(r, after.parked_at_last_take == 0,
+               "the dry run's take found " + num(after.parked_at_last_take) + " parked nodes, want 0");
+    }
     expect(r, registry_is(after, 0, 0, 0), "after the dry run: " + describe(after) + ", want 0, 0, 0");
     release(hold);
     dropper.join();

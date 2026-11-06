@@ -8441,6 +8441,11 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
             TIMEOUT 300
             PASS_REGULAR_EXPRESSION "${_regex}")
     endforeach()
+    # The no-entry-reap kill line reads the dry run's take-time snapshot, which is its own only when it took a lease.
+    # A run that prints the arm's no-lease line fails whatever else it prints, so a mutant that skips the take cannot
+    # read as a kill of the entry reap.
+    set_tests_properties(test-sycl-lazy-ring-mutant-no-entry-reap PROPERTIES
+        FAIL_REGULAR_EXPRESSION "it took no lease")
 
     # The lazy table object (th32 §3.2, §3.3, §10, §11 T4): the HOST body's eager O_DIRECT read into locked HOST_CPU
     # memory, the STORAGE descriptor, the last reference's release, the activation check (one extra chunk refuses,
