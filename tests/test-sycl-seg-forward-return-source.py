@@ -23,7 +23,13 @@ skipped op, which is wrong tokens, not a refusal. This gate pins the fix:
 4. `graph_compute`'s `ggml_sycl_fallback_error` catch has a cleanup step immediately after the MMID recovery and
    before the transient-lease unpin, a call of the noexcept `ggml_sycl_graph_compute_fallback_clear_graphs`, whose
    own `try { ... } catch (...) {}` clears the cached whole-graph state (or just the segments) after the queue waits
-   and the staging drain.
+   and the staging drain;
+5. both of `graph_compute`'s catch paths, the `ggml_sycl_fallback_error` catch and the boundary cleanup its other two
+   catches share, run th32's lazy cancel step first, a call of the noexcept
+   `ggml_sycl_graph_compute_lazy_cancel_step`, before `ggml_sycl_cpu_tg_flush_pending()` and before any queue wait
+   (design 5efe §4.4 "th32's cancel step", lead ruling §M69 (b) fourth amendment; th32 §5.3 "Cancellation"). The
+   fallback catch then runs the flush, its own waits, the cleanup step, the unpin and the execution release, in that
+   order. The step's body is th32's and is not pinned here; its position is.
 
 The runtime counterpart is the lead-run device test `test-sycl-seg-refusal-cleanup`. Plain file I/O, comment-stripped
 text.
@@ -360,6 +366,81 @@ def test_the_catch_cleanup_runs_after_every_wait_and_in_its_own_guard():
     assert re.fullmatch(
         r"\s*catch\s*\(\s*\.\.\.\s*\)\s*\{\s*\}\s*", step[end:]
     ), "the clear step's try has no catch (...) {}, or the step does more after it"
+
+
+# ---- 5. th32's cancel step first, then the fallback catch's order ----
+
+CANCEL_STEP = (
+    r"static\s+void\s+ggml_sycl_graph_compute_lazy_cancel_step\s*\(\s*ggml_backend_sycl_context\s*\*\s*ctx\s*\)"
+    r"\s*noexcept(?=\s*\{)"
+)
+CANCEL_CALL = re.compile(r"\bggml_sycl_graph_compute_lazy_cancel_step\s*\(\s*cleanup_ctx\s*\)\s*;")
+BOUNDARY = (
+    r"static\s+void\s+ggml_backend_sycl_graph_boundary_exception_cleanup\s*\([^)]*\)\s*noexcept(?=\s*\{)"
+)
+# The fallback catch's steps, in the order design 5efe §4.4 fixes: th32's cancel step, the CPU-TG flush, the catch's own
+# waits (the quarantine, both queue waits, the scatter wait, the staging drain, the MMID recovery), 5efe's cleanup step,
+# the unpin and the execution release.
+FALLBACK_ORDER = [
+    ("th32's cancel step", CANCEL_CALL),
+    ("the CPU-TG flush", re.compile(r"\bggml_sycl_cpu_tg_flush_pending\s*\(\s*\)")),
+    ("the quarantine", re.compile(r"\bggml_sycl_execution_quarantine_graph\s*\(\s*cleanup_ctx\s*\)")),
+    ("the last graph event's wait", re.compile(r"last_graph_event\s*->\s*wait_and_throw\s*\(")),
+    ("the stream's wait", re.compile(r"stream\s*\(\s*\)\s*->\s*wait_and_throw\s*\(")),
+    ("the scatter wait", re.compile(r"\bwait_pending_secondary_scatter_events\s*\(")),
+    ("the staging drain", re.compile(r"\bggml_sycl_cpu_staging_drain\s*\(")),
+    ("the MMID recovery", re.compile(r"\bggml_sycl_recover_exact_mmid_after_drain\s*\(")),
+    ("the cleanup step", CLEAR_CALL),
+    ("the unpin", re.compile(r"\bgraph_unpin_transient_leases_after_direct_execution\s*\(")),
+    ("the execution release", re.compile(r"\bggml_sycl_execution_release_graph\s*\(")),
+]
+
+
+def order_problems(body: str) -> list:
+    """Each step of FALLBACK_ORDER found once, and in that order."""
+    fails, last, last_name = [], -1, None
+    for name, pattern in FALLBACK_ORDER:
+        hits = list(pattern.finditer(body))
+        if len(hits) != 1:
+            fails.append(f"{name}: {len(hits)} occurrence(s) in the fallback catch, expected 1")
+            continue
+        if hits[0].start() < last:
+            fails.append(f"{name} runs before {last_name}")
+        last, last_name = hits[0].start(), name
+    return fails
+
+
+def test_the_cancel_step_is_one_noexcept_function():
+    hits = re.findall(CANCEL_STEP, code())
+    assert len(hits) == 1, f"ggml_sycl_graph_compute_lazy_cancel_step defined {len(hits)} time(s), expected 1 noexcept"
+
+
+def test_the_fallback_catch_runs_its_steps_in_the_designed_order():
+    fails = order_problems(fallback_catch())
+    assert not fails, "\n".join(fails)
+
+
+def test_the_boundary_cleanup_runs_the_cancel_step_first():
+    body = function_body(code(), BOUNDARY)
+    first = re.match(r"\s*ggml_sycl_graph_compute_lazy_cancel_step\s*\(\s*cleanup_ctx\s*\)\s*;", body)
+    assert first, "the boundary cleanup's first statement is not th32's cancel step"
+    assert len(CANCEL_CALL.findall(body)) == 1, "the boundary cleanup runs the cancel step more than once"
+
+
+def test_the_order_reader_flags_a_cancel_step_after_the_flush_and_a_cleanup_before_the_drain():
+    body = fallback_catch()
+    flush = re.search(
+        r"try\s*\{\s*ggml_sycl_cpu_tg_flush_pending\s*\(\s*\)\s*;\s*\}\s*catch\s*\(\.\.\.\)\s*\{\s*\}", body)
+    cancel = CANCEL_CALL.search(body)
+    assert flush and cancel, "the control's anchors did not match the fallback catch"
+    late = body[: cancel.start()] + body[cancel.end() : flush.end()] + cancel.group(0) + body[flush.end() :]
+    assert any("the CPU-TG flush runs before th32's cancel step" in f or "runs before the CPU-TG flush" in f
+               for f in order_problems(late)), order_problems(late)
+    clear = CLEAR_CALL.search(body)
+    drain = re.search(r"\bggml_sycl_cpu_staging_drain\s*\(", body)
+    early = body[: drain.start()] + clear.group(0) + " " + body[drain.start() : clear.start()] + body[clear.end() :]
+    assert any("runs before the staging drain" in f or "the staging drain runs before" in f
+               for f in order_problems(early)), order_problems(early)
 
 
 if __name__ == "__main__":
