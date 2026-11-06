@@ -8,8 +8,9 @@ The device test is lead-run. This pin holds what a host can read:
    inside the `BUILD_TESTING AND NOT GGML_BACKEND_DL` block; every planted fault the design names for the test is a
    registered arm with its cases and its expected text, and no other arm is registered;
 2. the mutant census over the three device REDs: every scratch_test_mutant enumerator has a name in the selector's
-   table and is scored by at least one registered arm, every name an arm uses is in the table, and every enumerator
-   has a block in production code that the production build compiles out;
+   table and is scored by at least one registered arm, every name an arm uses is in the table, every enumerator
+   has a block in production code that the production build compiles out, and the pool step those blocks call is
+   declared and defined only inside such blocks;
 3. the test source: the trial is resolved by proc name, the fixture's notifies carry a plan term of 0, main lists the
    design's cases and each has its dispatch, every arm's cases are among them, every arm's expected text is printed by
    the test, and no case calls the owner's end;
@@ -43,7 +44,11 @@ COMMON = SYCL + "/tests/scratch-return-test-common.hpp"
 MUTANT_H = SYCL + "/scratch-test-mutant.hpp"
 UC = SYCL + "/unified-cache.cpp"
 # The production files the planted faults live in.
-PRODUCTION = (SYCL + "/pinned-pool.cpp", SYCL + "/pinned-pool.hpp", UC, SYCL + "/ggml-sycl.cpp")
+POOL_CPP = SYCL + "/pinned-pool.cpp"
+POOL_H = SYCL + "/pinned-pool.hpp"
+PRODUCTION = (POOL_CPP, POOL_H, UC, SYCL + "/ggml-sycl.cpp")
+# The pool step the KEEP_WALKS_SET and RETURN_NO_WITHDRAW faults take: the cache reaches the flag only through the pool.
+MUTANT_STEP = "test_unwithdraw_zone_chunk"
 FILES = (CMAKE, TEST, COMMON, MUTANT_H) + PRODUCTION
 
 STEM = "test-sycl-scratch-trial-return"
@@ -175,6 +180,13 @@ def census_problems(texts: dict) -> list:
             if call in strip_comments(resolve_mutants(texts[rel])):
                 fails.append(f"{rel}: scratch_test_mutant::{e} is tested outside a GGML_SYCL_SCRATCH_MUTANTS block, "
                              "so the production build compiles it")
+    # A fault's own pool step exists only where the faults that call it can be planted: its declaration and its
+    # definition both sit in GGML_SYCL_SCRATCH_MUTANTS blocks, so neither can outlive the other.
+    for rel in (POOL_H, POOL_CPP):
+        if MUTANT_STEP in texts[rel] and MUTANT_STEP in strip_comments(resolve_mutants(texts[rel])):
+            fails.append(f"{rel}: {MUTANT_STEP} sits outside a GGML_SYCL_SCRATCH_MUTANTS block")
+        if MUTANT_STEP not in texts[rel]:
+            fails.append(f"{rel}: no {MUTANT_STEP}")
     return fails
 
 
@@ -356,6 +368,15 @@ def test_census_rejects_a_block_production_compiles():
     assert call in uc, "control precondition: the RETURN_NOOP block is not in unified-cache.cpp"
     texts[UC] = uc + "\nstatic bool planted_control() { return " + call + "; }\n"
     rejects(CLAUSES, "census", texts, "RETURN_NOOP is tested outside a GGML_SYCL_SCRATCH_MUTANTS block")
+
+
+def test_census_rejects_a_mutant_step_production_compiles():
+    texts = tree_texts(FILES)
+    pool = texts.get(POOL_CPP, "")
+    at = pool.find("void pinned_chunk_pool::test_unwithdraw_zone_chunk(")
+    assert at >= 0, "control precondition: pinned-pool.cpp does not define test_unwithdraw_zone_chunk"
+    texts[POOL_CPP] = pool + "\nvoid pinned_chunk_pool::test_unwithdraw_zone_chunk(host_zone_id, size_t) {}\n"
+    rejects(CLAUSES, "census", texts, "test_unwithdraw_zone_chunk sits outside a GGML_SYCL_SCRATCH_MUTANTS block")
 
 
 def test_test_source_rejects_a_lost_case_and_a_direct_trial():

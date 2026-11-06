@@ -9,6 +9,7 @@
 
 #include "host-zone-kinds.hpp"
 #include "mem-handle.hpp"
+#include "scratch-test-mutant.hpp"
 #include "tlsf-allocator.hpp"
 
 #include <array>
@@ -333,9 +334,11 @@ class pinned_chunk_pool {
     // an index past the end.
     bool test_chunk_metadata(size_t chunk_idx, alloc_metadata * out) const;
 
-    // Clears a withdrawn chunk's flag and gives its bytes back to the zone: the KEEP_WALKS_SET fault's own step, so
-    // the fault can be planted in the cache, which reaches the flag only through the pool.
+#    if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    // Clears a withdrawn chunk's flag and gives its bytes back to the zone: the KEEP_WALKS_SET and RETURN_NO_WITHDRAW
+    // faults' own step, so they can be planted in the cache, which reaches the flag only through the pool.
     void test_unwithdraw_zone_chunk(host_zone_id zone, size_t chunk_idx);
+#    endif
 #endif
 
   private:
