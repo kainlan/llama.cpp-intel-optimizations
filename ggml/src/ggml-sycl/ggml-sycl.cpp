@@ -14080,6 +14080,19 @@ struct ggml_sycl_load_end_body_witness {
 
     ~ggml_sycl_load_end_body_witness() { g_load_end_bodies_running.fetch_sub(1, std::memory_order_acq_rel); }
 };
+
+// Leaves the file-mapped load span that load_begin opened for an outer load, when the call that ends that load
+// exits, by return or by throw (§5.3 "Gates"). A span left open keeps the outside-materialization counter at 0 for
+// the rest of the process.
+struct ggml_sycl_file_mapped_load_span_close {
+    bool armed;
+
+    ~ggml_sycl_file_mapped_load_span_close() {
+        if (armed) {
+            ggml_sycl::unified_cache_file_mapped_load_leave();
+        }
+    }
+};
 }  // namespace
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn      txn,
@@ -14106,15 +14119,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
 
         // This call finishes the outer load that load_begin opened, so the load's span closes on every return and
         // throw from here (§5.3 "Gates").
-        struct file_mapped_load_span_close {
-            bool armed;
-
-            ~file_mapped_load_span_close() {
-                if (armed) {
-                    ggml_sycl::unified_cache_file_mapped_load_leave();
-                }
-            }
-        } file_mapped_load_span{ ticket.outer };
+        ggml_sycl_file_mapped_load_span_close file_mapped_load_span{ ticket.outer };
 
         // This call finishes the load: when it ends normally from here, the load's early terms are done and the
         // guard clears them after the registry ended the transaction.  The handler clears them after its own end
@@ -14281,6 +14286,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
                 return ggml_sycl_load_end_replay_result(recovery, model);
             }
             after_end.txn = txn.id;
+            // A throw before this call held a finisher ticket (probe_end, the candidate scope, prepare_end) left the
+            // span open. The recovery rolls back the whole outer load, so the span closes here instead.
+            ggml_sycl_file_mapped_load_span_close file_mapped_load_span{ recovery.outer };
             ggml_sycl_finalize_binding_failure_abort(*registry, recovery);
         }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
