@@ -236,7 +236,7 @@ bool environment_refusal(const lazy_table_result & r, size_t locked_bytes, std::
     if (r.status == lazy_table_status::BODY_REFUSED || r.status == lazy_table_status::ROW_CACHE_SHORTFALL) {
         rlimit lim{};
         if (getrlimit(RLIMIT_MEMLOCK, &lim) == 0 && lim.rlim_cur != RLIM_INFINITY && lim.rlim_cur < locked_bytes) {
-            why = "RLIMIT_MEMLOCK is " + num(lim.rlim_cur) + " B, below the body: " + r.reason;
+            why = "RLIMIT_MEMLOCK is " + num(lim.rlim_cur) + " B, below the body or the row cache: " + r.reason;
             return true;
         }
     }

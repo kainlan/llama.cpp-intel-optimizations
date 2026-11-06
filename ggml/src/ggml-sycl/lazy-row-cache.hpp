@@ -117,7 +117,8 @@ enum class lazy_row_cache_status : uint8_t {
 
 const char * lazy_row_cache_status_name(lazy_row_cache_status status);
 
-// The counters (§10; Task 25's hit-rate harness reads them). Plain relaxed atomics, compiled in every build.
+// The counters (§10; the hit-rate match of §8.5, M4 and M5, reads them). Plain relaxed atomics, compiled in every
+// build.
 struct lazy_row_cache_counters {
     uint64_t hits            = 0;  // lookups that found the row and copied it out
     uint64_t misses          = 0;  // lookups that did not find it

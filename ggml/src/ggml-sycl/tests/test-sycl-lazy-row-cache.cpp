@@ -299,9 +299,10 @@ arm_result arm_index_width() {
 
 // (2) CLOCK replacement (§6.3), on one shard of four slots: rows 10-13 fill it, hits on 10 and 12 set their reference
 // bits, then 14, 15 and 16 each evict one row. The hand starts at slot 0: inserting 14 clears 10's bit and evicts 11;
-// 15 clears 12's bit and evicts 13; 16 finds 10's bit cleared and evicts 10. Then the counters read back: 2 hits,
-// 1 miss, 7 inserts (a resident row's second insertion is not one), 3 evictions. Engagement: the cache built with one
-// shard holding four rows. Mutant: LAZY_ROW_CACHE_MUTANT_NO_REFERENCE_BIT (CLOCK becomes FIFO: 14 evicts 10).
+// 15 clears 12's bit and evicts 13; 16 finds 10's bit cleared and evicts 10. Then the counters read back: 4 hits (10
+// and 12, then the inserted 14 and 16 read back), 1 miss, 7 inserts (a resident row's second insertion is not one),
+// 3 evictions. Engagement: the cache built with one shard holding four rows. Mutant:
+// LAZY_ROW_CACHE_MUTANT_NO_REFERENCE_BIT (CLOCK becomes FIFO: 14 evicts 10).
 arm_result arm_clock() {
     arm_result            r;
     fixture_source        src;
