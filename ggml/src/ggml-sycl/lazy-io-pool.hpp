@@ -481,9 +481,9 @@ struct lazy_registry_state {
 // Copies the registry's state into *out. Returns false, writing nothing, for a null pointer.
 bool ggml_sycl_lazy_registry_for_testing(lazy_registry_state * out);
 
-// The registry's one-shot hold hook, armed at one of two points; arming either point replaces whatever was armed, and
-// arming with a null callback disarms. The callback runs once, with no lock held, and blocks for as long as the fixture
-// wants its caller held.
+// The registry's one-shot hold hook, armed at one of four points; arming any point replaces whatever was armed, and
+// arming with a null callback disarms. The callback runs once, with no registry or IO-engine lock held (the plan
+// point's caller holds its inventory guard), and blocks for as long as the fixture wants its caller held.
 using lazy_hold_fn = void (*)(void * ctx);
 
 // Arms the hook in the FULL reap: the first FULL reap that starts after the arming calls it after its count has landed
@@ -499,11 +499,13 @@ void ggml_sycl_test_lazy_take_hold(lazy_hold_fn hold, void * ctx);
 void ggml_sycl_test_lazy_ensure_hold(lazy_hold_fn hold, void * ctx);
 
 // Arms the hook at the plan point: the first planner caller that reaches it after the arming calls it once its plan is
-// made and before the plan is staged, with no lock held, so a fixture can drop a lease inside that window (§3.3, the
-// window arm). The planner caller reaches the point through ggml_sycl_test_lazy_plan_point().
+// made and before the plan is staged, under that caller's inventory guard (g_tensor_inventory_mutex) and with no
+// registry or IO-engine lock held, so a fixture can drop a lease inside that window (§3.3, the window arm). The planner
+// caller reaches the point through ggml_sycl_test_lazy_plan_point().
 void ggml_sycl_test_lazy_plan_hold(lazy_hold_fn hold, void * ctx);
 
-// The plan point: claims the hook if it is armed there and calls it with no lock held.
+// The plan point: claims the hook if it is armed there and calls it with no registry or IO-engine lock held; its one
+// caller, compute_and_store_plan_for_inventory, holds the inventory guard.
 void ggml_sycl_test_lazy_plan_point();
 
 // The engine's read source (§5.2): `length` bytes of `fd` at `offset` into `dst`; returns the bytes read, or -errno.
