@@ -507,6 +507,14 @@ int run_stale_vectors(checks & c) {
                " time(s) or does not quote " + std::to_string(k) + " segment(s): " + refused.back());
         return c.status();
     }
+    // The design's retire precondition has two halves: the caller's retire before the entry, checked above, and the
+    // retire after the refusal. The second is checked only here, past the guard's own check, so the mutant that
+    // removes the guard still fails on its line instead of reaching this VOID.
+    if (r.retire_hits < 2) {
+        c.void_case("the retire after the refused record did not fail: retires failed " +
+                    std::to_string(r.retire_hits) + ", expected 2");
+        return c.status();
+    }
     if (status != GGML_STATUS_SUCCESS || lines(k_recoverable) != 0) {
         c.fail("the refused record did not return through the caller's fallback: " + status_name(status));
         return c.status();
