@@ -76,7 +76,7 @@ struct host_zone_record_view {
 };
 
 // Whether a row counts at the SCRATCH/STAGING graph-boundary check: only GRAPH rows do. A CONTEXT-lifetime compute
-// buffer, a MODEL row, a DEVICE holder and an UNOWNED holder are live there by design.
+// buffer, a MODEL row, a DEVICE holder, an UNOWNED holder and a POOL ring are live there by design.
 bool host_zone_lifetime_counts_at_graph_boundary(alloc_lifetime lifetime);
 
 // Whether `record` belongs to the owner whose boundary is being checked: the same lifetime AND the same owner. A row of
@@ -84,7 +84,7 @@ bool host_zone_lifetime_counts_at_graph_boundary(alloc_lifetime lifetime);
 bool host_zone_record_owned_by(const host_zone_record_view & record, alloc_lifetime lifetime, alloc_owner_ref owner);
 
 // The owner-boundary check: every row of `records` that host_zone_record_owned_by(lifetime, owner) and is still live
-// prints `[HOST-ZONE] leaked <CONTEXT|MODEL|DEVICE> record: <cohort> <bytes> owner=<kind>/<id>` at WARN. With
+// prints `[HOST-ZONE] leaked <CONTEXT|MODEL|DEVICE|POOL> record: <cohort> <bytes> owner=<kind>/<id>` at WARN. With
 // `strict` (GGML_SYCL_STRICT_LEASES=1, read by the caller through the cache's existing accessor) a leak aborts after
 // every line has printed. Returns the number of leaked rows.
 size_t host_zone_owner_boundary_check(const host_zone_record_view * records,

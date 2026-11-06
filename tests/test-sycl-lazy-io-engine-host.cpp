@@ -1,9 +1,10 @@
 // The block ring's ensure and the IO engine (docs/design/sycl-storage-tier-lazy-tables.md §3.3, §5.2, §5.3, §10):
 // the first ensure allocates exactly the plan's need and later calls allocate nothing, every mismatch with the plan
-// refuses naming both numbers, one flight at a time (a concurrent ensure refuses at once, and aborts under strict
-// leases), a throwing allocation leaves no ensuring state behind, shut-down refuses and frees the reserver's ring, a
-// worker's read lands in its waiter's slot, a failed read reaches the ticket with one WARN, a read's last drop on a
-// worker frees only the ring, and shutdown cancels the queued reads and waits for the picked ones.
+// refuses naming both numbers, one flight at a time (a concurrent ensure refuses at once with its WARN line), a
+// throwing allocation leaves no ensuring state behind, shut-down refuses and frees the reserver's ring, a worker's read
+// lands in its waiter's slot, a failed read reaches the ticket with one WARN, a read's last drop on a worker frees only
+// the ring, and shutdown cancels the queued reads and waits for the picked ones. Ensure itself never aborts: under
+// strict leases its one production caller does, and test-sycl-lazy-ring scores that abort.
 //
 // Host-only, because none of this needs a device: ensure allocates through lazy_io_allocate_host, a link seam the
 // fixture header defines with a counting ledger, and the workers read through the PRIVATE_TESTING read source. Links
@@ -22,7 +23,6 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
-#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -346,34 +346,6 @@ arm_result arm_ensure_concurrent() {
     return r;
 }
 
-// The strict child: the concurrent case of arm_ensure_concurrent, whose second ensure must abort. Returns only when it
-// did not.
-int strict_concurrent_child() {
-    ring_lease lease = lazy_io_pool_take();
-    gate       g;
-    ggml_sycl_test_lazy_ensure_hold(gate_hold, &g);
-    std::thread reserver([&] { (void) block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn); });
-    if (!g.wait_holders(1)) {
-        std::fprintf(stderr, "child: the hook did not hold the reserver within 5 s\n");
-        std::_Exit(4);
-    }
-    const lazy_ring_ensure_status second = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
-    std::fprintf(stderr, "child: the second ensure returned %s\n", name(second).c_str());
-    std::_Exit(3);
-}
-
-// Under GGML_SYCL_STRICT_LEASES=1 the concurrent ensure aborts after its WARN line (§10), in a child process.
-arm_result arm_ensure_concurrent_strict() {
-    arm_result                     r;
-    const std::vector<std::string> args    = { "test-sycl-lazy-io-engine-host", "--strict-concurrent-child" };
-    const std::vector<std::string> sets    = { "GGML_SYCL_STRICT_LEASES=1", "GGML_NO_BACKTRACE=1" };
-    const child_run                c       = run_child_strings(args, child_environment(sets), std::chrono::seconds(30));
-    const bool                     aborted = c.ran && WIFSIGNALED(c.status) && WTERMSIG(c.status) == SIGABRT;
-    expect(r, aborted && c.err.find("[HOST-PLAN-BUG] concurrent ring ensure") != std::string::npos,
-           "the strict concurrent ensure did not abort after its WARN; the child wrote: " + c.err);
-    return r;
-}
-
 // A throwing allocation leaves ensuring clear (§3.3's scope guard), so the next ensure allocates.
 // Mutant: ensuring-kept-on-throw, under which the next ensure finds ensuring set and refuses.
 arm_result arm_ensure_throw() {
@@ -606,9 +578,6 @@ lazy_ring_mutant mutant_named(const char * text) {
 
 int main(int argc, char ** argv) {
     ggml_log_set(capture_log, nullptr);
-    if (argc == 2 && std::strcmp(argv[1], "--strict-concurrent-child") == 0) {
-        return strict_concurrent_child();
-    }
     if (argc == 3 && std::strcmp(argv[1], "--mutant") == 0) {
         ggml_sycl_test_lazy_ring_mutant_select(mutant_named(argv[2]));
     }
@@ -617,7 +586,6 @@ int main(int argc, char ** argv) {
         { "a creating ensure refuses a refused, short or mischarged ring and frees it", arm_ensure_creation_refusals },
         { "an ensure with no live pool refuses as unpinned",                            arm_ensure_unpinned          },
         { "a concurrent ensure refuses at once while the reserver is held",             arm_ensure_concurrent        },
-        { "a concurrent ensure aborts under strict leases",                             arm_ensure_concurrent_strict },
         { "a throwing allocation leaves ensuring clear for the next ensure",            arm_ensure_throw             },
         { "a worker's read lands in its waiter's slot",                                 arm_engine_read_lands        },
         { "a failed read reaches the ticket with one WARN",                             arm_engine_read_error        },

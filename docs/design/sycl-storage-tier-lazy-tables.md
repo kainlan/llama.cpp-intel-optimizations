@@ -1793,12 +1793,18 @@ were both rejected.
   The first call allocates exactly `need` with `unified_allocate_owner` as a
   `HOST_CPU` / `LAZY_STAGING` allocation (P1), checks that the allocated size
   equals `need` and that `span <= need / QD`, and the IO pool holds the
-  owner-first `mem_handle`. A later call allocates nothing and returns the live
-  ring when the live size is at least `need` and `span <= live / QD`, and
-  otherwise declines with a typed error that names both numbers. Each mismatch
-  is `[HOST-PLAN-BUG]` (§10's check). **Ensure has one flight, and a second
-  concurrent caller is a defect** (r45 I-1 (b); r46 I-2; *lead rulings §M120,
-  §M122*). Production has one materializer. At most one load transaction is open
+  owner-first `mem_handle`. The ring is the pool's, never a model's: it is
+  allocated with lifetime `POOL` and owner kind `IO_POOL`, whose id is the
+  pool's registry generation, with `may_yield` true and the load's
+  transaction, on the device of ensure's argument. So no model's or backend's
+  owner check matches it, it never uses `CACHE_BACKING`, and only the pool's
+  `WORKER` or `FULL` reap releases it. A later call allocates nothing and
+  returns the live ring when the live size is at least `need` and
+  `span <= live / QD`, and otherwise declines with a typed error that names
+  both numbers. Each mismatch is `[HOST-PLAN-BUG]` (§10's check). **Ensure
+  has one flight, and a second concurrent caller is a defect** (r45 I-1 (b);
+  r46 I-2; *lead rulings §M120, §M122*). Production has one materializer.
+  At most one load transaction is open
   process-wide: `Registry::begin_outer()` returns `LOAD_BUSY` when `active_txn_
   != 0` (`d8a67422d ggml/src/ggml-sycl/model-lifecycle.cpp:178-182`), so a
   second model load cannot begin while the first is open, and the outer guard's
@@ -3526,10 +3532,12 @@ engine's queue is:
   is 4 or 8 KiB. Nothing preempts a chunk a worker has already started, so a
   newly queued read with an earlier key waits at most for one worker to finish
   its current chunk.
-- **In-flight dedup.** An in-flight table keyed by `(file, block offset)`
-  records each pending read and its **waiters** (ticket, epoch, landing
-  positions). A request for a block that is already pending joins it instead
-  of reading it again: a repeated n-gram within one ubatch, the same row in
+- **In-flight dedup.** An in-flight table keyed by the read's exact span,
+  `(file, block offset, length)`, where `file` is the file's identity from its
+  device and inode and never a descriptor number, records each pending read and
+  its **waiters** (ticket, epoch, landing positions). A request whose span is
+  already pending joins that read instead of reading it again:
+  a repeated n-gram within one ubatch, the same row in
   ubatch `k` and in `k+1`'s lookahead, or two contexts reading the same hot
   row cold at the same moment. Two rows that share a 4 KiB block are one read.
   A join takes references to the read's ring slot (§5.3).
@@ -3647,9 +3655,16 @@ epoch entry    { uint32 epoch; ids capture; ze event; marker word;
                  bool marker_enqueued; }             // submitter-private
 gather request { lazy_gather_ctx ref; epoch; ticket (STORAGE only);
                  std::atomic<bool> cancelled, drain; }  // one per epoch
-ticket         { request ref; std::atomic<int> outstanding; }
+ticket         { request ref; std::atomic<int> outstanding;
+                 std::atomic<int> read_error; }      // first errno wins
 landing slot   { uint32 epoch; leaf lock; }
 ```
+
+A failed read stores its errno in each waiter's ticket's `read_error` before
+that waiter's decrement, keeping the first, skips the landing copy and the
+row-cache insert, still decrements, and logs one WARN naming the errno, the
+file identity and the block offset, so a consumer that sees `outstanding`
+reach 0 also sees the failure.
 
 **The ring's depth** (*lead rulings §T9a*, *§T9b*). The caller's run-ahead is
 bounded today by the RAW guard on graph inputs, and *lead ruling §T9b* names
@@ -6534,7 +6549,7 @@ statics are not exempt: the classifier has no carve-out, and the existing
 | T2 | `ledger_committed`, `ledger_budget`, `yieldable_bytes` (all atomics), the per-cache yielder slot array with its in-flight counters, the PRIVATE_TESTING hook table and its store counter, the thread-local `g_allocating_charge` beside `g_allocating_owner_control`, and the thread-local depth of `host_budget_pass_scope` and the atomic `g_host_budget_stored_txn` in `ggml-sycl.cpp` | `unified-cache.cpp` (listed), `ggml-sycl.cpp` (listed) |
 | T3 | the registry (pool slot and generation), the reap list head, the registry's leaf mutex, `shut_down`, the reap-run and parked counters with their take-time snapshots, the one-shot hold hook, the `ggml-sycl.cpp` slot, and the budget ledger's sibling atomics `g_host_ledger_mem_available` (`MemAvailable`) and `g_host_ledger_budget_overridden` (the budget's source) in `unified-cache.cpp` (§4.2) | `lazy-io-pool.hpp` and `lazy-io-pool.cpp` (added by T3), `ggml-sycl.cpp` and `unified-cache.cpp` (listed) |
 | T4 | five in `ggml-sycl.cpp`, all for the descriptor buffer types (§3.2), each a CSV row as classified there: the interface `ggml_backend_sycl_lazy_buffer_interface` (file scope, immutable binding); in `ggml_backend_sycl_lazy_buffer_type`, the `std::once_flag` `initialized` (function-local, mutable, intrinsic lock primitive) and the `per_device` type array (function-local, mutable, synchronization none evident: `ggml_sycl_per_device_buft` fills it under that flag); the `buft` of `ggml_backend_sycl_lazy_host_buffer_type` (function-local, mutable, synchronization none evident: a lambda initialises it once, under the C++ local-static guard); and the PRIVATE_TESTING `std::atomic<bool>` `g_test_lazy_predicate_too_broad` (file scope, mutable, intrinsic atomic; the positive control of T4's buffer-type table). Nothing else: each cache's chunk table is a cache member, and its yielder registers through T2's per-cache hook | `ggml-sycl.cpp` (listed) |
-| T5 | `lazy_ring_coverage_reads`, the ring-write-offset recorder, the depth table, the IO pool's queue state, the held-lease-destructor counter, the ensure hook, the `GGML_SYCL_LAZY_READ_FAULT` accessor's cache if it caches the value | `witnessed-mutex.hpp` (added by T5), `lazy-io-pool.cpp` and `ggml-sycl.cpp` (listed) |
+| T5 | `lazy_ring_coverage_reads`, the ring-write-offset recorder, the PRIVATE_TESTING read source (its function and its context), the PRIVATE_TESTING runtime mutant selector, the depth table, the IO pool's queue state, the held-lease-destructor counter, the ensure hook, the `GGML_SYCL_LAZY_READ_FAULT` accessor's cache if it caches the value | `witnessed-mutex.hpp` (added by T5), `lazy-io-pool.cpp` and `ggml-sycl.cpp` (listed) |
 
 **Existing tickets this design depends on or leaves open:**
 

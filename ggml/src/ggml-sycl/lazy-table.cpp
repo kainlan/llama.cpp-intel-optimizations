@@ -259,6 +259,19 @@ class owner_cache_source final : public lazy_row_cache_memory_source {
     int                     last_error_ = 0;
 };
 
+// The block ring's memory (§3.3): one owner-first HOST_CPU allocation and the CPU view resolved from it once, which the
+// IO engine's workers write into. Destroying it drops the handle, the sole release point (P2), whose free credits the
+// ledger. The pool owns it, so only the pool's WORKER or FULL reap destroys it.
+class owner_ring_memory final : public lazy_io_host_memory {
+  public:
+    owner_ring_memory(mem_handle handle, uint8_t * data, size_t bytes, size_t charged) :
+        lazy_io_host_memory(data, bytes, charged),
+        handle_(std::move(handle)) {}
+
+  private:
+    mem_handle handle_;
+};
+
 // Reads [file_offset - head, file_offset - head + window) into `dst` with O_DIRECT, stopping once the table's last
 // byte is in. Returns the bytes read; *err is the errno of a failed call, 0 otherwise.
 size_t read_window(int fd, uint64_t aligned_offset, uint8_t * dst, size_t window, size_t need, int * err) {
@@ -283,6 +296,39 @@ size_t read_window(int fd, uint64_t aligned_offset, uint8_t * dst, size_t window
 }
 
 }  // namespace
+
+// The production side of the block ring's memory seam (lazy-io-pool.hpp, §3.3): role LAZY_STAGING, owned by the IO pool
+// and by no model, so its lifetime is POOL with the pool's registry generation as its IO_POOL owner: no model's or
+// backend's owner check matches it, and the pool's reap is its only release. The charge carries the load's transaction
+// and may yield, since ensure calls it on the loader's thread with no lock held (§4.2). The fixture in the host tests
+// is the only other definition.
+std::unique_ptr<lazy_io_host_memory> lazy_io_allocate_host(size_t   bytes,
+                                                           int      device,
+                                                           uint64_t pool_generation,
+                                                           uint64_t load_txn_id) {
+    alloc_request req{};
+    req.device                           = device;
+    req.size                             = bytes;
+    req.alignment                        = LAZY_IO_BLOCK_BYTES;
+    req.intent.role                      = alloc_role::LAZY_STAGING;
+    req.intent.constraints.must_host_cpu = true;
+    req.intent.lifetime                  = alloc_lifetime::POOL;
+    req.intent.owner                     = { alloc_owner_kind::IO_POOL, pool_generation };
+    req.may_yield                        = true;
+    req.load_txn_id                      = load_txn_id;
+    allocation_result got                = unified_allocate_owner(req);
+    if (!got) {
+        return nullptr;
+    }
+    mem_handle         handle = mem_handle::from_owned_alloc(std::move(got.owner), GGML_LAYOUT_AOS);
+    const resolved_ptr view   = handle.resolve();
+    if (!view || view.extent < bytes) {
+        return nullptr;  // the allocation did not resolve for the CPU; dropping the handle releases it
+    }
+    const size_t charged = record_charged_bytes(handle);
+    return std::unique_ptr<lazy_io_host_memory>(
+        new owner_ring_memory(std::move(handle), static_cast<uint8_t *>(view.ptr), bytes, charged));
+}
 
 const char * lazy_table_status_name(lazy_table_status status) {
     switch (status) {

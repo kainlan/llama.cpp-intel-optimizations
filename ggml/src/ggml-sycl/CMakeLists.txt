@@ -443,8 +443,8 @@ if (BUILD_TESTING)
     # through lazy_io_allocate_host, a link seam the fixture header lazy-io-host-fixture.hpp defines with a counting
     # ledger in place of lazy-table.cpp's HOST_CPU allocation, and the workers read through the PRIVATE_TESTING read
     # source, so no device, no unified cache and no SYCL module. Links lazy-io-pool.cpp with the row cache its reaper
-    # inserts into (lazy-row-cache.cpp, host-cpu-mapping.cpp) and ggml-base for the log and the abort. Its strict arm
-    # re-executes the binary through fork and /proc/self/exe, so it is Linux-only.
+    # inserts into (lazy-row-cache.cpp, host-cpu-mapping.cpp) and ggml-base for the log and the abort. The workers'
+    # reads are pread, so it is Linux-only.
     #
     # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
     # and the FAIL line the arm that kills it prints. Each registers test-sycl-lazy-io-engine-host-mutant-<name> on the

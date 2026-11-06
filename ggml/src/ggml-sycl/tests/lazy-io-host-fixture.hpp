@@ -1,8 +1,8 @@
 //
-// The fixture side of lazy-io-pool.cpp's two link seams (docs/design/sycl-storage-tier-lazy-tables.md §3.3), for a
-// host test that links the pool's translation unit without the backend: the block ring's memory from the aligned
-// operator new, with a fixture ledger that counts allocations and charges each at host_cpu_mapped_size, and the strict
-// switch read from GGML_SYCL_STRICT_LEASES. Each such test includes it once.
+// The fixture side of lazy-io-pool.cpp's one link seam (docs/design/sycl-storage-tier-lazy-tables.md §3.3), for a host
+// test that links the pool's translation unit without the backend: the block ring's memory from the aligned operator
+// new, with a fixture ledger that counts allocations and charges each at host_cpu_mapped_size. Each such test includes
+// it once.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -17,7 +17,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -29,6 +28,7 @@ struct state {
     std::atomic<uint64_t> allocations{ 0 };      // rings the seam handed out
     std::atomic<uint64_t> live_charged{ 0 };     // the charged bytes of the rings still alive
     std::atomic<uint64_t> last_load_txn{ 0 };    // the transaction the last allocation was charged under
+    std::atomic<uint64_t> last_pool_gen{ 0 };    // the pool generation the last allocation was owned by
     std::atomic<bool>     refuse_next{ false };  // the next allocation returns null
     std::atomic<bool>     throw_next{ false };   // the next allocation throws std::bad_alloc
     std::atomic<size_t>   short_next{ 0 };       // the next allocation's usable bytes fall short by this many
@@ -50,7 +50,10 @@ class memory final : public ggml_sycl::lazy_io_host_memory {
 
 namespace ggml_sycl {
 
-std::unique_ptr<lazy_io_host_memory> lazy_io_allocate_host(size_t bytes, int device, uint64_t load_txn_id) {
+std::unique_ptr<lazy_io_host_memory> lazy_io_allocate_host(size_t   bytes,
+                                                           int      device,
+                                                           uint64_t pool_generation,
+                                                           uint64_t load_txn_id) {
     using lazy_io_host_fixture::g_state;
     (void) device;
     if (g_state.throw_next.exchange(false)) {
@@ -66,12 +69,8 @@ std::unique_ptr<lazy_io_host_memory> lazy_io_allocate_host(size_t bytes, int dev
     g_state.allocations.fetch_add(1, std::memory_order_relaxed);
     g_state.live_charged.fetch_add(charged, std::memory_order_relaxed);
     g_state.last_load_txn.store(load_txn_id, std::memory_order_relaxed);
+    g_state.last_pool_gen.store(pool_generation, std::memory_order_relaxed);
     return std::unique_ptr<lazy_io_host_memory>(new lazy_io_host_fixture::memory(data, usable, charged));
-}
-
-bool lazy_io_strict_enabled() {
-    const char * env = std::getenv("GGML_SYCL_STRICT_LEASES");
-    return env != nullptr && std::strcmp(env, "1") == 0;
 }
 
 }  // namespace ggml_sycl

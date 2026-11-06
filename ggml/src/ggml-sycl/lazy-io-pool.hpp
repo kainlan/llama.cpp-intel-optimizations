@@ -11,8 +11,8 @@
 // released by the reap after the pool's last lease is gone.
 //
 // Device-free on purpose, like host-cpu-mapping.hpp: this header and lazy-io-pool.cpp include no SYCL header, so a
-// host test links the translation unit alone. The ring's memory and the strict switch are its two link seams, defined
-// by lazy-table.cpp in the backend and by a fixture in each host test.
+// host test links the translation unit alone. The ring's memory is its one link seam, defined by lazy-table.cpp in the
+// backend and by a fixture in each host test.
 //
 // The registry's leaf mutex (canonical contract §12.5, L5) is a true leaf: nothing is taken, allocated, freed, waited
 // on or logged under it. A take reserves a generation under it, builds its pool outside it and installs the pool under
@@ -80,7 +80,7 @@ constexpr size_t lazy_row_cache_index_raw_bytes(size_t slots) {
     return sizeof(uint64_t) * slots + sizeof(uint32_t) * lazy_row_cache_index_buckets(slots);
 }
 
-// ---- The block ring's memory and the strict switch: the two link seams (§3.3) ----
+// ---- The block ring's memory: the one link seam (§3.3) ----
 
 // The block ring's memory, owner-holding and type-erased: the backend's object holds the owner-first mem_handle of the
 // ring's HOST_CPU / LAZY_STAGING allocation with the CPU view resolved from it once, and destroying it drops that
@@ -110,14 +110,14 @@ class lazy_io_host_memory {
     size_t    charged_ = 0;
 };
 
-// The block ring's allocation of `bytes` usable bytes, O_DIRECT-aligned, on `device`'s cache (§3.3), charged to the
-// ledger under `load_txn_id`, whose own chunks a yield never gives back (§4.2): null when it is refused. May throw
-// std::bad_alloc. Defined once per link: lazy-table.cpp for the backend, a fixture in each host test that links
-// lazy-io-pool.cpp.
-std::unique_ptr<lazy_io_host_memory> lazy_io_allocate_host(size_t bytes, int device, uint64_t load_txn_id);
-
-// Whether a [HOST-PLAN-BUG] aborts (GGML_SYCL_STRICT_LEASES=1, §10). Defined like lazy_io_allocate_host.
-bool lazy_io_strict_enabled();
+// The block ring's allocation of `bytes` usable bytes, O_DIRECT-aligned, on `device`'s cache (§3.3), owned by the pool
+// whose registry generation is `pool_generation` and charged to the ledger under `load_txn_id`, whose own chunks a
+// yield never gives back (§4.2): null when it is refused. May throw std::bad_alloc. Defined once per link:
+// lazy-table.cpp for the backend, a fixture in each host test that links lazy-io-pool.cpp.
+std::unique_ptr<lazy_io_host_memory> lazy_io_allocate_host(size_t   bytes,
+                                                           int      device,
+                                                           uint64_t pool_generation,
+                                                           uint64_t load_txn_id);
 
 struct lazy_io_pool;
 
@@ -418,9 +418,10 @@ const char * lazy_ring_ensure_status_name(lazy_ring_ensure_status status);
 // charge is the ring's own for the transaction whose ensure created it, and 0 for any other (§10's ring check). It
 // keeps one piece of state, `ensuring`, in three steps: reserve under the registry's leaf mutex, allocate with no lock
 // held, install under it; a scope guard clears it on every exit. A caller that finds it set refuses at once and never
-// waits. Each mismatch with the plan is a [HOST-PLAN-BUG] WARN naming both numbers that aborts under strict leases
-// (§10); the shut-down and unpinned refusals are WARNs. May throw what the allocation or a worker's start throws, after
-// the guard has cleared `ensuring`.
+// waits. Each mismatch with the plan is a [HOST-PLAN-BUG] WARN naming both numbers, a concurrent call one naming the
+// need and the span, and the shut-down and unpinned refusals plain WARNs; every refusal returns its typed status.
+// Ensure never aborts: the strict abort is its caller's (§10). May throw what the allocation or a worker's start
+// throws, after the guard has cleared `ensuring`.
 lazy_ring_ensure_status block_ring_ensure(size_t   need,
                                           size_t   span,
                                           int      device,

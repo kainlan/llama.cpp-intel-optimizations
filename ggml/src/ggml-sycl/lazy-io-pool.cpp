@@ -1,14 +1,23 @@
 #include "lazy-io-pool.hpp"
 
 #include "ggml-impl.h"
+#include "host-cpu-mapping.hpp"
 #include "lazy-row-cache.hpp"
 
+#include <unistd.h>
+
 #include <atomic>
+#include <cerrno>
+#include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
+#include <system_error>
+#include <thread>
 #include <utility>
 
 // The IO pool registry (docs/design/sycl-storage-tier-lazy-tables.md §3.3). Ownership: while a pool lives the
@@ -22,10 +31,44 @@
 // counts, the DYING flags, the counters and the hold hook. Nothing is taken, allocated, freed, waited on or logged
 // under it. The slot is a raw pointer on purpose: a static owner would free the pool during static destruction under a
 // lease that still points at it, while the shut-down flag lets such a lease decrement without the mutex instead.
+//
+// The pool also owns its block ring and the IO engine whose workers read into it (§3.3, §5.2), both installed once by
+// block_ring_ensure under the leaf mutex. A WORKER reap takes a parked pool's ring out under the mutex and frees it
+// after the unlock; a FULL reap destroys the pool, whose destructor stops and joins the workers before the ring goes.
 
 namespace ggml_sycl {
 
 struct lazy_io_pool;
+
+// The IO engine (§5.2): the queue of §5.2.1 under its lock, and LAZY_BLOCK_RING_QD pread workers, worker i reading into
+// slot i of the ring, span bytes at ring + i * span. Its lock (canonical contract §12.5, L5) is a leaf: nothing is
+// taken under it, and it is never held across a read, a delivery, a lease drop or a log. A worker's wait releases it.
+struct lazy_io_engine {
+    std::mutex               mutex;
+    std::condition_variable  work;  // a worker waits here for a queued read or the stop
+    std::condition_variable  idle;  // shutdown waits here for the picked reads to finish
+    lazy_io_queue            queue;
+    std::vector<std::thread> workers;
+    uint8_t *                ring = nullptr;
+    size_t                   span = 0;
+    size_t                   busy = 0;  // reads a worker has picked and not finished, its lease dropped included
+    bool                     stop = false;
+
+    lazy_io_engine() = default;
+    ~lazy_io_engine();
+    lazy_io_engine(const lazy_io_engine &)             = delete;
+    lazy_io_engine & operator=(const lazy_io_engine &) = delete;
+
+    // Starts `n` workers over `ring_data` in slots of `slot_span` bytes. Throws what std::thread throws, after stopping
+    // and joining the workers already started.
+    void start(uint8_t * ring_data, size_t slot_span, size_t n);
+
+    // Sets the stop flag, wakes every worker and joins the ones started; the destructor and a failed start share it.
+    void stop_and_join() noexcept;
+
+    // Worker `slot`'s loop: pick under the lock, read and deliver with none held, drop the read's lease, then reap.
+    void run(size_t slot);
+};
 
 struct lazy_reap_node {
     lazy_io_pool *   pool = nullptr;  // a back-pointer while the pool lives; the owning pointer once it is parked
@@ -37,6 +80,24 @@ struct lazy_io_pool {
     uint64_t                        generation = 0;  // the generation its take reserved, set before the install
     bool                            dying      = false;
     std::unique_ptr<lazy_reap_node> node;            // owned until the park releases it into the reap list
+
+    // The block ring and its engine, installed together under the leaf mutex by ensure's step (3). The engine is
+    // declared after the ring, so the pool's destruction joins the workers before it frees the ring.
+    std::unique_ptr<lazy_io_host_memory> ring;
+    std::atomic<uint64_t>                ring_bytes{ 0 };  // the ring's usable bytes, read through a lease lock-free
+    size_t                               ring_span        = 0;  // one slot, need / LAZY_BLOCK_RING_QD
+    uint64_t                             ring_load_txn    = 0;  // the transaction whose ensure created it; 0 for none
+    bool                                 ensuring         = false;
+    uint64_t                             ring_allocations = 0;  // rings ensure allocated for this pool, under the mutex
+    std::unique_ptr<lazy_io_engine>      engine;
+};
+
+// The engine's paths into a lease's pool, the one friend of ring_lease they share.
+struct lazy_io_pool_access {
+    static lazy_io_pool * pool(const ring_lease & lease) noexcept { return lease.pool_; }
+
+    // A lease on `pool`, whose count the caller incremented under the leaf mutex.
+    static ring_lease adopt(lazy_io_pool * pool) noexcept { return ring_lease(pool); }
 };
 
 namespace {
@@ -50,9 +111,13 @@ uint64_t          g_lazy_parked_nodes           = 0;
 uint64_t          g_lazy_full_reaps_run         = 0;
 uint64_t          g_lazy_reaps_run_at_last_take = 0;
 uint64_t          g_lazy_parked_at_last_take    = 0;
+
+// §10's lazy_ring_coverage_reads: one relaxed increment per coverage read, in every build, no lock.
+std::atomic<uint64_t> g_lazy_ring_coverage_reads{ 0 };
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-// The one-shot hold hook and the point it is armed at: the first FULL reap, or the first take that builds a pool.
-enum class lazy_hold_point : uint8_t { REAP, TAKE };
+// The one-shot hold hook and the point it is armed at: the first FULL reap, the first take that builds a pool, or the
+// first ensure that reserves `ensuring`.
+enum class lazy_hold_point : uint8_t { REAP, TAKE, ENSURE };
 
 lazy_hold_point g_lazy_hold_point = lazy_hold_point::REAP;
 lazy_hold_fn    g_lazy_hold       = nullptr;
@@ -76,6 +141,14 @@ void lazy_hold_arm(lazy_hold_point point, lazy_hold_fn hold, void * ctx) {
     g_lazy_hold       = hold;
     g_lazy_hold_ctx   = hold != nullptr ? ctx : nullptr;
 }
+
+// The engine's read source and the ring-write recorder (§11): atomics, read by the workers with no lock held.
+std::atomic<lazy_io_read_fn> g_lazy_io_read_fn{ nullptr };
+std::atomic<void *>          g_lazy_io_read_ctx{ nullptr };
+std::atomic<uint64_t>        g_lazy_ring_write_end{ 0 };
+
+// The one runtime mutant selector (§11): NONE unless an arm's registration selects one.
+std::atomic<uint8_t> g_lazy_ring_mutant{ 0 };
 #endif
 
 // The take-time snapshots, read with the counters. Caller holds g_lazy_registry_mutex.
@@ -123,7 +196,7 @@ ring_lease ring_lease::clone() const noexcept {
 }
 
 uint64_t ring_lease::ring_bytes() const noexcept {
-    return 0;
+    return pool_ != nullptr ? pool_->ring_bytes.load(std::memory_order_acquire) : 0;
 }
 
 void ring_lease::reset() noexcept {
@@ -229,7 +302,28 @@ ring_lease lazy_io_pool_take() {
 }
 
 void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
-    GGML_UNUSED(scope);  // FULL is the only scope until the IO engine adds WORKER
+    if (scope == lazy_reap_scope::WORKER) {
+        // One ring per pass, so nothing is allocated under the leaf mutex: the first parked pool still holding a ring
+        // gives it up under the lock, and the ring is freed after the unlock, its handle's drop crediting the budget
+        // ledger. The nodes stay on the list with their pools, whose workers only a FULL reap joins.
+        for (;;) {
+            std::unique_ptr<lazy_io_host_memory> ring;
+            {
+                std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+                for (lazy_reap_node * node = g_lazy_reap_list; node != nullptr; node = node->next) {
+                    if (node->pool->ring != nullptr) {
+                        ring = std::move(node->pool->ring);
+                        node->pool->ring_bytes.store(0, std::memory_order_release);
+                        break;
+                    }
+                }
+            }
+            if (ring == nullptr) {
+                return;
+            }
+            ring.reset();
+        }
+    }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     lazy_hold_fn hold     = nullptr;
     void *       hold_ctx = nullptr;
@@ -269,19 +363,33 @@ void lazy_io_pool_mark_shut_down() noexcept {
 // LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP and LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP each drop one of the wrapper's two reaps.
 // Only test-sycl-lazy-io-pool-host's mutant targets define them; each passes only when the host test prints that
 // reap's FAIL text.
+// The runtime selector's NO_ENTRY_REAP and NO_CLOSING_REAP plant the same two defects for the device arms.
 lazy_coverage_scope::reap_guard::reap_guard() noexcept {
 #if !defined(LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP)
+#    if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (lazy_ring_mutant_is(lazy_ring_mutant::NO_ENTRY_REAP)) {
+        return;
+    }
+#    endif
     ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
 #endif
 }
 
 lazy_coverage_scope::reap_guard::~reap_guard() {
 #if !defined(LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP)
+#    if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (lazy_ring_mutant_is(lazy_ring_mutant::NO_CLOSING_REAP)) {
+        return;
+    }
+#    endif
     ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
 #endif
 }
 
 bool lazy_coverage_scope::take_if(bool has_lazy_candidate) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    has_lazy_candidate = has_lazy_candidate || lazy_ring_mutant_is(lazy_ring_mutant::TAKE_WITHOUT_CANDIDATE);
+#endif
     if (!has_lazy_candidate) {
         return false;
     }
@@ -303,6 +411,9 @@ bool ggml_sycl_lazy_registry_for_testing(lazy_registry_state * out) {
     out->full_reaps_run         = g_lazy_full_reaps_run;
     out->reaps_run_at_last_take = g_lazy_reaps_run_at_last_take;
     out->parked_at_last_take    = g_lazy_parked_at_last_take;
+    out->ring_bytes             = g_lazy_pool != nullptr ? g_lazy_pool->ring_bytes.load(std::memory_order_relaxed) : 0;
+    out->ring_allocations       = g_lazy_pool != nullptr ? g_lazy_pool->ring_allocations : 0;
+    out->ensuring               = g_lazy_pool != nullptr && g_lazy_pool->ensuring;
     return true;
 }
 
@@ -312,6 +423,10 @@ void ggml_sycl_test_lazy_reap_hold(lazy_hold_fn hold, void * ctx) {
 
 void ggml_sycl_test_lazy_take_hold(lazy_hold_fn hold, void * ctx) {
     lazy_hold_arm(lazy_hold_point::TAKE, hold, ctx);
+}
+
+void ggml_sycl_test_lazy_ensure_hold(lazy_hold_fn hold, void * ctx) {
+    lazy_hold_arm(lazy_hold_point::ENSURE, hold, ctx);
 }
 
 void ggml_sycl_test_lazy_mark_dying(const ring_lease & lease) {
@@ -330,8 +445,18 @@ lazy_test_coverage_pin::~lazy_test_coverage_pin() {
 }
 
 lazy_test_coverage_pin ggml_sycl_test_make_coverage_pin(uint64_t ring_bytes) {
-    GGML_UNUSED(ring_bytes);  // stub: no ring is ensured, so every guard is ring-less
-    return lazy_test_coverage_pin(lazy_io_pool_take());
+    ring_lease lease = lazy_io_pool_take();
+    if (ring_bytes != 0) {
+        // The charge of a creating plan, the mapped need (§10): what a ring that ensure creates is charged.
+        const size_t                  need = static_cast<size_t>(ring_bytes);
+        const lazy_ring_ensure_status status =
+            block_ring_ensure(need, need / LAZY_BLOCK_RING_QD, 0, host_cpu_mapped_size(need));
+        if (status != lazy_ring_ensure_status::OK) {
+            GGML_ABORT("ggml_sycl_test_make_coverage_pin: ring_bytes=%llu: block_ring_ensure refused: %s",
+                       (unsigned long long) ring_bytes, lazy_ring_ensure_status_name(status));
+        }
+    }
+    return lazy_test_coverage_pin(std::move(lease));
 }
 #endif
 
@@ -720,6 +845,21 @@ std::unique_ptr<lazy_io_read> lazy_io_queue::complete(lazy_io_read * read) {
     return nullptr;
 }
 
+std::vector<std::unique_ptr<lazy_io_read>> lazy_io_queue::cancel_queued() {
+    state &                                    s = *s_;
+    std::vector<std::unique_ptr<lazy_io_read>> out;
+    for (auto it = s.in_flight.begin(); it != s.in_flight.end();) {
+        if (it->second.read->dispatched) {
+            ++it;
+            continue;
+        }
+        s.drop_entries(it->second);
+        out.push_back(std::move(it->second.read));
+        it = s.in_flight.erase(it);
+    }
+    return out;
+}
+
 size_t lazy_io_queue::queued_entries() const {
     return s_->by_seq.size();
 }
@@ -775,14 +915,155 @@ bool lazy_io_deliver(const lazy_io_waiter & waiter, const uint8_t * read_bytes, 
     return ticket->outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1;
 }
 
-// ---- the block ring and the IO engine (§3.3, §5.2): stubs, which allocate nothing and start no worker ----
+// ---- the block ring and the IO engine (§3.3, §5.2) ----
 
-std::vector<std::unique_ptr<lazy_io_read>> lazy_io_queue::cancel_queued() {
-    return {};
+namespace {
+
+// A [HOST-PLAN-BUG] of the ring (§10): one WARN naming both numbers. Ensure returns its typed refusal after it, and the
+// strict abort is its caller's (§3.3). Called with no lock held.
+void lazy_ring_plan_bug(const char * what, size_t got, size_t want) {
+    GGML_LOG_WARN("[HOST-PLAN-BUG] %s %zu B, want %zu B\n", what, got, want);
+}
+
+// One read of `length` bytes of `fd` at `offset` into `dst` (§5.2): pread until done, retried on EINTR. A short read
+// at the end of the file zero-fills the rest of the span, since no row reaches past the file's end. Returns 0 or the
+// errno.
+int lazy_io_read_span(int fd, uint8_t * dst, size_t length, uint64_t offset) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const lazy_io_read_fn source = g_lazy_io_read_fn.load(std::memory_order_acquire);
+    if (source != nullptr) {
+        const long got = source(g_lazy_io_read_ctx.load(std::memory_order_acquire), fd, dst, length, offset);
+        if (got < 0) {
+            return static_cast<int>(-got);
+        }
+        if (static_cast<size_t>(got) < length) {
+            std::memset(dst + got, 0, length - static_cast<size_t>(got));
+        }
+        return 0;
+    }
+#endif
+    size_t done = 0;
+    while (done < length) {
+        const ssize_t got = ::pread(fd, dst + done, length - done, static_cast<off_t>(offset + done));
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return errno;
+        }
+        if (got == 0) {
+            std::memset(dst + done, 0, length - done);
+            break;
+        }
+        done += static_cast<size_t>(got);
+    }
+    return 0;
+}
+
+}  // namespace
+
+lazy_io_engine::~lazy_io_engine() {
+    stop_and_join();
+}
+
+void lazy_io_engine::stop_and_join() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        stop = true;
+    }
+    work.notify_all();
+    for (std::thread & worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    workers.clear();
+}
+
+void lazy_io_engine::start(uint8_t * ring_data, size_t slot_span, size_t n) {
+    ring = ring_data;
+    span = slot_span;
+    workers.reserve(n);
+
+    // A thread whose creation throws leaves the ones already started running over a ring the caller is about to free,
+    // so the guard stops and joins them on that exit, and the exception reaches the caller unchanged.
+    struct start_guard {
+        lazy_io_engine * engine;
+
+        ~start_guard() {
+            if (engine != nullptr) {
+                engine->stop_and_join();
+            }
+        }
+    } guard{ this };
+
+    for (size_t slot = 0; slot < n; ++slot) {
+        workers.emplace_back(&lazy_io_engine::run, this, slot);
+    }
+    guard.engine = nullptr;
+}
+
+void lazy_io_engine::run(size_t slot) {
+    uint8_t * const dst = ring + slot * span;
+    for (;;) {
+        lazy_io_read * read = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            for (;;) {
+                if (stop) {
+                    return;
+                }
+                read = queue.pick();
+                if (read != nullptr) {
+                    break;
+                }
+                work.wait(lock);
+            }
+            ++busy;
+        }
+        const size_t length = static_cast<size_t>(read->span.length);
+        const int    err    = lazy_io_read_span(read->fd, dst, length, read->span.offset);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        const uint64_t end  = static_cast<uint64_t>(slot * span + length);
+        uint64_t       seen = g_lazy_ring_write_end.load(std::memory_order_relaxed);
+        while (seen < end && !g_lazy_ring_write_end.compare_exchange_weak(seen, end, std::memory_order_relaxed)) {
+        }
+#endif
+        std::unique_ptr<lazy_io_read> done;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            done = queue.complete(read);
+        }
+        if (err != 0) {
+            const std::string why = std::generic_category().message(err);
+            GGML_LOG_WARN("[LAZY-IO] read failed: errno %d (%s), file %016llx, block offset %llu, %zu B\n", err,
+                          why.c_str(), (unsigned long long) read->span.file, (unsigned long long) read->span.offset,
+                          length);
+        }
+        if (done != nullptr) {
+            for (const lazy_io_waiter & waiter : done->waiters) {
+                lazy_io_deliver(waiter, dst, err);
+            }
+        }
+        // The read's lease goes last; when it was the pool's last, the pool parks and this worker frees only its ring.
+        done.reset();
+        ggml_sycl_lazy_ring_reap(lazy_reap_scope::WORKER);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            --busy;
+        }
+        idle.notify_all();
+    }
 }
 
 ring_lease lazy_io_pool_join() {
-    return ring_lease();
+    std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+    if (g_lazy_shut_down.load(std::memory_order_relaxed) || g_lazy_pool == nullptr ||
+        g_lazy_pool->ring_bytes.load(std::memory_order_relaxed) == 0) {
+        return ring_lease();
+    }
+    g_lazy_pool->leases.fetch_add(1, std::memory_order_relaxed);
+    return lazy_io_pool_access::adopt(g_lazy_pool);
 }
 
 const char * lazy_ring_ensure_status_name(lazy_ring_ensure_status status) {
@@ -810,12 +1091,172 @@ lazy_ring_ensure_status block_ring_ensure(size_t   need,
                                           int      device,
                                           size_t   plan_charge,
                                           uint64_t load_txn_id) {
-    GGML_UNUSED(need);
-    GGML_UNUSED(span);
-    GGML_UNUSED(device);
-    GGML_UNUSED(plan_charge);
-    GGML_UNUSED(load_txn_id);
-    return lazy_ring_ensure_status::REFUSED;
+    // Step (1), under the leaf mutex: refuse, accept the live ring, or reserve `ensuring` and take a counted reference
+    // that keeps the reserved pool alive through the unlocked allocation. Every log waits for the unlock.
+    enum class step1 : uint8_t { RESERVED, SHUT_DOWN, UNPINNED, CONCURRENT, LIVE };
+
+    step1          outcome      = step1::RESERVED;
+    uint64_t       live         = 0;
+    uint64_t       creator      = 0;
+    size_t         ring_charged = 0;
+    lazy_io_pool * pool         = nullptr;
+    ring_lease     hold;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    lazy_hold_fn hook        = nullptr;
+    void *       hook_ctx    = nullptr;
+    const bool   no_ensuring = lazy_ring_mutant_is(lazy_ring_mutant::NO_ENSURING);
+#else
+    const bool no_ensuring = false;
+#endif
+    {
+        std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+        if (g_lazy_shut_down.load(std::memory_order_relaxed)) {
+            outcome = step1::SHUT_DOWN;
+        } else if (g_lazy_pool == nullptr) {
+            outcome = step1::UNPINNED;
+        } else if (g_lazy_pool->ring_bytes.load(std::memory_order_relaxed) != 0) {
+            outcome      = step1::LIVE;
+            live         = g_lazy_pool->ring_bytes.load(std::memory_order_relaxed);
+            creator      = g_lazy_pool->ring_load_txn;
+            ring_charged = g_lazy_pool->ring->charged_bytes();
+        } else if (g_lazy_pool->ensuring && !no_ensuring) {
+            outcome = step1::CONCURRENT;
+        } else {
+            pool           = g_lazy_pool;
+            pool->ensuring = true;
+            pool->leases.fetch_add(1, std::memory_order_relaxed);
+            hold = lazy_io_pool_access::adopt(pool);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            hook = lazy_hold_claim_locked(lazy_hold_point::ENSURE, &hook_ctx);
+#endif
+        }
+    }
+    switch (outcome) {
+        case step1::SHUT_DOWN:
+            GGML_LOG_WARN("[LAZY-RING] block ring ensure refused: the IO pool is shut down (need %zu B)\n", need);
+            return lazy_ring_ensure_status::SHUT_DOWN;
+        case step1::UNPINNED:
+            GGML_LOG_WARN("[LAZY-RING] block ring ensure refused: no live IO pool pins a ring (need %zu B)\n", need);
+            return lazy_ring_ensure_status::UNPINNED;
+        case step1::CONCURRENT:
+            GGML_LOG_WARN(
+                "[HOST-PLAN-BUG] concurrent ring ensure: need %zu B, span %zu B, another caller is ensuring "
+                "the ring\n",
+                need, span);
+            return lazy_ring_ensure_status::CONCURRENT;
+        case step1::LIVE:
+            // A later call (§3.3, §10): the live ring must hold the need and the span. The model whose ensure created
+            // the ring carries its charge, the ring row's charged bytes, in every table's plan; any other model's plan
+            // charged no ring. A transaction of 0 names no model, so it is never the creator.
+            if (need > live) {
+                lazy_ring_plan_bug("block ring too narrow for the plan's need: need", need, static_cast<size_t>(live));
+                return lazy_ring_ensure_status::TOO_NARROW;
+            }
+            if (span > live / LAZY_BLOCK_RING_QD) {
+                lazy_ring_plan_bug("block ring slot too narrow for the table's span: span", span,
+                                   static_cast<size_t>(live / LAZY_BLOCK_RING_QD));
+                return lazy_ring_ensure_status::TOO_NARROW;
+            }
+            if (load_txn_id != 0 && load_txn_id == creator) {
+                if (plan_charge != ring_charged) {
+                    lazy_ring_plan_bug("block ring charge differs from the ledger's: ring charge", plan_charge,
+                                       ring_charged);
+                    return lazy_ring_ensure_status::MISMATCH;
+                }
+            } else if (plan_charge != 0) {
+                lazy_ring_plan_bug("block ring charged by a plan the live ring covers: ring charge", plan_charge, 0);
+                return lazy_ring_ensure_status::MISMATCH;
+            }
+            return lazy_ring_ensure_status::OK;
+        case step1::RESERVED:
+            break;
+    }
+
+    // The guard clears `ensuring` on every exit from here on, an exception included.
+    struct ensuring_guard {
+        lazy_io_pool * pool;
+        bool           armed = true;
+
+        ~ensuring_guard() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            if (std::uncaught_exceptions() > 0 && lazy_ring_mutant_is(lazy_ring_mutant::ENSURING_KEPT_ON_THROW)) {
+                return;
+            }
+#endif
+            if (armed) {
+                std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+                pool->ensuring = false;
+            }
+        }
+    } guard{ pool };
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const bool span_check = !lazy_ring_mutant_is(lazy_ring_mutant::NO_SPAN_CHECK);
+#else
+    const bool span_check = true;
+#endif
+    if (span_check && span > need / LAZY_BLOCK_RING_QD) {
+        lazy_ring_plan_bug("block ring need too short for the table's span: need", need, LAZY_BLOCK_RING_QD * span);
+        return lazy_ring_ensure_status::TOO_NARROW;
+    }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (hook != nullptr) {
+        hook(hook_ctx);
+    }
+#endif
+
+    // Step (2), no lock held: allocate exactly `need`, owned by the reserved pool's generation, check it against the
+    // plan, and start the workers over it. The generation was set before the pool's install and is never written
+    // again, and the counted reference keeps the pool alive, so it is read here without the lock.
+    std::unique_ptr<lazy_io_host_memory> ring = lazy_io_allocate_host(need, device, pool->generation, load_txn_id);
+    if (ring == nullptr) {
+        GGML_LOG_WARN("[LAZY-RING] block ring allocation refused: need %zu B on device %d\n", need, device);
+        return lazy_ring_ensure_status::REFUSED;
+    }
+    if (ring->size() != need) {
+        lazy_ring_plan_bug("block ring allocated size differs from the plan's need: allocated", ring->size(), need);
+        return lazy_ring_ensure_status::MISMATCH;
+    }
+    if (plan_charge != ring->charged_bytes()) {
+        lazy_ring_plan_bug("block ring charge differs from the ledger's: ring charge", plan_charge,
+                           ring->charged_bytes());
+        return lazy_ring_ensure_status::MISMATCH;
+    }
+    std::unique_ptr<lazy_io_engine> engine(new lazy_io_engine());
+    engine->start(ring->data(), need / LAZY_BLOCK_RING_QD, LAZY_BLOCK_RING_QD);
+
+    // Step (3), under the leaf mutex: install the ring and its engine unless the registry shut down meanwhile, in
+    // which case both are freed after the unlock.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const bool install_after_shut_down = lazy_ring_mutant_is(lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN);
+#else
+    const bool install_after_shut_down = false;
+#endif
+    bool shut_down = false;
+    {
+        std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+        ++pool->ring_allocations;
+        shut_down = g_lazy_shut_down.load(std::memory_order_relaxed) && !install_after_shut_down;
+        if (!shut_down && pool->ring == nullptr) {
+            pool->ring          = std::move(ring);
+            pool->engine        = std::move(engine);
+            pool->ring_span     = need / LAZY_BLOCK_RING_QD;
+            pool->ring_load_txn = load_txn_id;
+            pool->ring_bytes.store(need, std::memory_order_release);
+        }
+        pool->ensuring = false;
+        guard.armed    = false;
+    }
+    if (shut_down) {
+        GGML_LOG_WARN(
+            "[LAZY-RING] block ring ensure refused: the IO pool shut down during the allocation (need %zu "
+            "B)\n",
+            need);
+        return lazy_ring_ensure_status::SHUT_DOWN;
+    }
+    GGML_LOG_INFO("[LAZY-RING] block ring: %zu B on device %d, %zu slots of %zu B, charged %zu B\n", need, device,
+                  LAZY_BLOCK_RING_QD, need / LAZY_BLOCK_RING_QD, plan_charge);
+    return lazy_ring_ensure_status::OK;
 }
 
 size_t lazy_io_submit(uint64_t               context,
@@ -823,54 +1264,119 @@ size_t lazy_io_submit(uint64_t               context,
                       const lazy_io_span &   span,
                       const lazy_io_key &    key,
                       const lazy_io_waiter & waiter) {
-    GGML_UNUSED(context);
-    GGML_UNUSED(fd);
-    GGML_UNUSED(span);
-    GGML_UNUSED(key);
-    GGML_UNUSED(waiter);
-    return 0;
+    ring_lease lease = lazy_io_pool_join();
+    if (!lease.held()) {
+        GGML_LOG_WARN("[LAZY-IO] read refused: no live block ring (file %016llx, block offset %llu)\n",
+                      (unsigned long long) span.file, (unsigned long long) span.offset);
+        return 0;
+    }
+    lazy_io_pool * const pool = lazy_io_pool_access::pool(lease);
+    if (span.length == 0 || span.length > pool->ring_span) {
+        GGML_LOG_WARN("[LAZY-IO] read refused: span %llu B, block ring slot %zu B\n", (unsigned long long) span.length,
+                      pool->ring_span);
+        return 0;
+    }
+    // One lease per read the span may queue; the reads take theirs and the rest drop after the unlock. The join
+    // lease is held until after the notify, so the engine outlives this call whatever the workers do meanwhile.
+    const size_t            reads = static_cast<size_t>((span.length + LAZY_IO_CHUNK_BYTES - 1) / LAZY_IO_CHUNK_BYTES);
+    std::vector<ring_lease> spare;
+    spare.reserve(reads);
+    for (size_t i = 0; i < reads; ++i) {
+        spare.push_back(lease.clone());
+    }
+    lazy_io_engine * const engine = pool->engine.get();
+    size_t                 added  = 0;
+    {
+        std::lock_guard<std::mutex> lock(engine->mutex);
+        added = engine->queue.submit(context, fd, span, key, waiter, spare);
+    }
+    engine->work.notify_all();
+    return added;
 }
 
-void lazy_io_pool_shutdown() noexcept {}
+void lazy_io_pool_shutdown() noexcept {
+    ring_lease lease = lazy_io_pool_join();
+    if (!lease.held()) {
+        return;
+    }
+    lazy_io_engine * const                     engine = lazy_io_pool_access::pool(lease)->engine.get();
+    std::vector<std::unique_ptr<lazy_io_read>> cancelled;
+    {
+        std::lock_guard<std::mutex> lock(engine->mutex);
+        cancelled = engine->queue.cancel_queued();
+    }
+    for (std::unique_ptr<lazy_io_read> & read : cancelled) {
+        for (const lazy_io_waiter & waiter : read->waiters) {
+            lazy_io_deliver(waiter, nullptr, ECANCELED);
+        }
+        read.reset();
+    }
+    if (!cancelled.empty()) {
+        GGML_LOG_WARN("[LAZY-IO] shutdown cancelled %zu queued reads\n", cancelled.size());
+    }
+    std::unique_lock<std::mutex> lock(engine->mutex);
+    engine->idle.wait(lock, [engine] { return engine->busy == 0; });
+}
 
 uint64_t lazy_ring_coverage_read(const ring_lease * pin) noexcept {
-    GGML_UNUSED(pin);
-    return 0;
+    if (pin == nullptr) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        if (lazy_ring_mutant_is(lazy_ring_mutant::COUNT_WITHOUT_PIN)) {
+            g_lazy_ring_coverage_reads.fetch_add(1, std::memory_order_relaxed);
+        }
+#endif
+        return 0;
+    }
+    g_lazy_ring_coverage_reads.fetch_add(1, std::memory_order_relaxed);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (lazy_ring_mutant_is(lazy_ring_mutant::LEASE_PRESENCE_AS_COVERAGE) && pin->held()) {
+        return UINT64_MAX;
+    }
+#endif
+    return pin->ring_bytes();
 }
 
 uint64_t lazy_ring_coverage_reads() noexcept {
-    return 0;
+    return g_lazy_ring_coverage_reads.load(std::memory_order_relaxed);
 }
 
 bool lazy_block_ring_bytes(uint64_t * out) {
-    GGML_UNUSED(out);
-    return false;
+    if (out == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+    if (g_lazy_pool == nullptr || g_lazy_pool->ring_bytes.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    *out = g_lazy_pool->ring_bytes.load(std::memory_order_relaxed);
+    return true;
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-void ggml_sycl_test_lazy_ensure_hold(lazy_hold_fn hold, void * ctx) {
-    GGML_UNUSED(hold);
-    GGML_UNUSED(ctx);
-}
-
 void ggml_sycl_test_lazy_io_read_source(lazy_io_read_fn read, void * ctx) {
-    GGML_UNUSED(read);
-    GGML_UNUSED(ctx);
+    if (read == nullptr) {
+        g_lazy_io_read_fn.store(nullptr, std::memory_order_release);
+        g_lazy_io_read_ctx.store(nullptr, std::memory_order_release);
+        return;
+    }
+    g_lazy_io_read_ctx.store(ctx, std::memory_order_release);
+    g_lazy_io_read_fn.store(read, std::memory_order_release);
 }
 
 uint64_t ggml_sycl_test_lazy_ring_write_end() {
-    return 0;
+    return g_lazy_ring_write_end.load(std::memory_order_relaxed);
 }
 
-void ggml_sycl_test_lazy_ring_write_end_reset() {}
+void ggml_sycl_test_lazy_ring_write_end_reset() {
+    g_lazy_ring_write_end.store(0, std::memory_order_relaxed);
+}
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant) {
-    GGML_UNUSED(mutant);
+    g_lazy_ring_mutant.store(static_cast<uint8_t>(mutant), std::memory_order_relaxed);
 }
 
 bool lazy_ring_mutant_is(lazy_ring_mutant mutant) noexcept {
-    GGML_UNUSED(mutant);
-    return false;
+    return g_lazy_ring_mutant.load(std::memory_order_relaxed) == static_cast<uint8_t>(mutant);
 }
 #endif
 
