@@ -383,27 +383,31 @@ if (BUILD_TESTING)
     string(CONCAT _lq_re_deliver_ignores_epoch
         "FAIL the reaper copies only into its own epoch's live slot: a waiter for epoch 4 wrote into the slot at "
         "epoch 5")
+    string(CONCAT _lq_re_cached_waiter_unchecked
+        "FAIL a cached waiter lies in one chunk, or the submit aborts: "
+        "the submit of a straddling cached waiter returned instead of aborting")
     string(CONCAT _lq_re_index_before_own
         "FAIL a submit that throws leaves the queue's indexes whole: a new read, allocation [0-9]+ thrown: "
         "a class queue holds an entry no read owns")
     set(_lazy_io_queue_mutants
-        LAZY_IO_QUEUE_MUTANT_DEADLINE_ONLY          "${_lq_re_deadline_only}"
-        LAZY_IO_QUEUE_MUTANT_SLICES_FIRST           "${_lq_re_slices_first}"
-        LAZY_IO_QUEUE_MUTANT_EQUAL_KEY_LIFO         "${_lq_re_equal_key_lifo}"
-        LAZY_IO_QUEUE_MUTANT_PLAIN_EPOCH_COMPARE    "${_lq_re_plain_epoch}"
-        LAZY_IO_QUEUE_MUTANT_NO_ROUND_ROBIN         "${_lq_re_no_round_robin}"
-        LAZY_IO_QUEUE_MUTANT_CLASS_BLIND            "${_lq_re_class_blind}"
-        LAZY_IO_QUEUE_MUTANT_NO_PROMOTION           "${_lq_re_no_promotion}"
-        LAZY_IO_QUEUE_MUTANT_NO_CHUNKING            "${_lq_re_no_chunking}"
-        LAZY_IO_QUEUE_MUTANT_NO_DEDUP               "${_lq_re_no_dedup}"
-        LAZY_IO_QUEUE_MUTANT_JOIN_KEEPS_POSITION    "${_lq_re_join_keeps_position}"
-        LAZY_IO_QUEUE_MUTANT_NO_SECOND_ENTRY        "${_lq_re_no_second_entry}"
-        LAZY_IO_QUEUE_MUTANT_CROSS_CONTEXT_REKEY    "${_lq_re_cross_context_rekey}"
-        LAZY_IO_QUEUE_MUTANT_FIFO_IGNORED           "${_lq_re_fifo_ignored}"
-        LAZY_IO_QUEUE_MUTANT_LOG_AT_COMPLETION      "${_lq_re_log_at_completion}"
-        LAZY_IO_QUEUE_MUTANT_DELIVER_IGNORES_EPOCH  "${_lq_re_deliver_ignores_epoch}"
-        LAZY_IO_QUEUE_MUTANT_INDEX_BEFORE_OWN       "${_lq_re_index_before_own}"
-        LAZY_IO_QUEUE_MUTANT_PARTIAL_INSERT         "${_lq_re_index_before_own}")
+        LAZY_IO_QUEUE_MUTANT_DEADLINE_ONLY           "${_lq_re_deadline_only}"
+        LAZY_IO_QUEUE_MUTANT_SLICES_FIRST            "${_lq_re_slices_first}"
+        LAZY_IO_QUEUE_MUTANT_EQUAL_KEY_LIFO          "${_lq_re_equal_key_lifo}"
+        LAZY_IO_QUEUE_MUTANT_PLAIN_EPOCH_COMPARE     "${_lq_re_plain_epoch}"
+        LAZY_IO_QUEUE_MUTANT_NO_ROUND_ROBIN          "${_lq_re_no_round_robin}"
+        LAZY_IO_QUEUE_MUTANT_CLASS_BLIND             "${_lq_re_class_blind}"
+        LAZY_IO_QUEUE_MUTANT_NO_PROMOTION            "${_lq_re_no_promotion}"
+        LAZY_IO_QUEUE_MUTANT_NO_CHUNKING             "${_lq_re_no_chunking}"
+        LAZY_IO_QUEUE_MUTANT_NO_DEDUP                "${_lq_re_no_dedup}"
+        LAZY_IO_QUEUE_MUTANT_JOIN_KEEPS_POSITION     "${_lq_re_join_keeps_position}"
+        LAZY_IO_QUEUE_MUTANT_NO_SECOND_ENTRY         "${_lq_re_no_second_entry}"
+        LAZY_IO_QUEUE_MUTANT_CROSS_CONTEXT_REKEY     "${_lq_re_cross_context_rekey}"
+        LAZY_IO_QUEUE_MUTANT_FIFO_IGNORED            "${_lq_re_fifo_ignored}"
+        LAZY_IO_QUEUE_MUTANT_LOG_AT_COMPLETION       "${_lq_re_log_at_completion}"
+        LAZY_IO_QUEUE_MUTANT_DELIVER_IGNORES_EPOCH   "${_lq_re_deliver_ignores_epoch}"
+        LAZY_IO_QUEUE_MUTANT_INDEX_BEFORE_OWN        "${_lq_re_index_before_own}"
+        LAZY_IO_QUEUE_MUTANT_PARTIAL_INSERT          "${_lq_re_index_before_own}"
+        LAZY_IO_QUEUE_MUTANT_CACHED_WAITER_UNCHECKED "${_lq_re_cached_waiter_unchecked}")
     set(_lazy_io_queue_variants test-sycl-lazy-io-queue-host "" "")
     list(LENGTH _lazy_io_queue_mutants _n)
     math(EXPR _last "${_n} - 1")

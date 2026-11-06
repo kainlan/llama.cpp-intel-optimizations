@@ -19,7 +19,10 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -29,8 +32,12 @@
 
 using namespace ggml_sycl;
 using host_ledger_test_harness::arm_result;
+using host_ledger_test_harness::child_environment;
+using host_ledger_test_harness::child_run;
 using host_ledger_test_harness::expect;
 using host_ledger_test_harness::num;
+using host_ledger_test_harness::run_child_strings;
+using host_ledger_test_harness::text_count_with;
 using host_ledger_test_harness::void_arm;
 using host_ledger_test_harness::arm_loop::named_arm;
 using host_ledger_test_harness::arm_loop::run_arms;
@@ -474,6 +481,20 @@ class plain_source final : public lazy_row_cache_memory_source {
 
 constexpr size_t k_row = 170;
 
+// The row cache the delivery and cached-waiter arms insert into: one shard of 8 slots of 170 B rows.
+lazy_row_cache_build fixture_cache(plain_source & source) {
+    lazy_row_cache_config cfg;
+    cfg.name        = "fixture.lazy";
+    cfg.row_size    = k_row;
+    cfg.n_rows      = 1000;
+    cfg.cache_slots = 8;
+    cfg.floor_slots = 8;
+    cfg.load_txn_id = 0x51;
+    cfg.chunk_bytes = 8 * k_row;
+    cfg.n_shards    = 1;
+    return lazy_row_cache::build(cfg, source);
+}
+
 bool cache_holds(lazy_row_cache & c, int64_t row, const uint8_t * want) {
     std::vector<uint8_t> got(k_row);
     return c.lookup_copy(row, got.data()) && std::memcmp(got.data(), want, k_row) == 0;
@@ -484,18 +505,9 @@ bool cache_holds(lazy_row_cache & c, int64_t row, const uint8_t * want) {
 // delivery returning true. A failed read copies and inserts nothing, keeps the errno in the ticket, and counts down.
 // Mutant: LAZY_IO_QUEUE_MUTANT_DELIVER_IGNORES_EPOCH (the copy skips the epoch and cancel check).
 arm_result arm_delivery() {
-    arm_result            r;
-    plain_source          source;
-    lazy_row_cache_config cfg;
-    cfg.name                   = "fixture.lazy";
-    cfg.row_size               = k_row;
-    cfg.n_rows                 = 1000;
-    cfg.cache_slots            = 8;
-    cfg.floor_slots            = 8;
-    cfg.load_txn_id            = 0x51;
-    cfg.chunk_bytes            = 8 * k_row;
-    cfg.n_shards               = 1;
-    lazy_row_cache_build build = lazy_row_cache::build(cfg, source);
+    arm_result           r;
+    plain_source         source;
+    lazy_row_cache_build build = fixture_cache(source);
     if (!build) {
         host_ledger_test_harness::void_arm(r, "the fixture row cache did not build");
         return r;
@@ -634,23 +646,103 @@ arm_result arm_submit_throw() {
     return r;
 }
 
+constexpr const char * k_straddle_child = "--straddling-cached-waiter-child";
+
+// The cached-waiter arm's child: a waiter with a row cache straddling the boundary of a 1 MiB span's two chunks. The
+// submit must abort; a submit that returns prints the line the arm reads as the defect.
+int straddle_child() {
+    plain_source         source;
+    lazy_row_cache_build build = fixture_cache(source);
+    if (!build) {
+        std::fprintf(stderr, "STRADDLE-CHILD: the fixture row cache did not build\n");
+        return 2;
+    }
+    lazy_io_queue           q;
+    lazy_io_waiter          w;
+    std::vector<ring_lease> spare;
+    w.src_offset       = LAZY_IO_CHUNK_BYTES - k_row / 2;
+    w.bytes            = k_row;
+    w.cache            = build.cache.get();
+    w.row              = 3;
+    const size_t added = q.submit(1, -1, { k_file, 0, 2 * LAZY_IO_CHUNK_BYTES }, key0(5, 1), w, spare);
+    std::fprintf(stderr, "STRADDLE-CHILD returned %zu\n", added);
+    return 0;
+}
+
+// A waiter with a row cache inserts one whole row from one read (§5.2: a row's read covers only the blocks that hold
+// it, so it lies in one chunk). One inside the second chunk of a 1 MiB span is queued as one share, on that chunk's
+// read, and keeps its cache. One that straddles the two chunks aborts the submit on its assert, run in a child, rather
+// than queue a share per chunk that would each insert part of the row as the row.
+// Mutant: LAZY_IO_QUEUE_MUTANT_CACHED_WAITER_UNCHECKED (no assert, and every share keeps the cache), under which the
+// child's submit returns.
+arm_result arm_cached_waiter_one_chunk() {
+    arm_result           r;
+    plain_source         source;
+    lazy_row_cache_build build = fixture_cache(source);
+    if (!build) {
+        void_arm(r, "the fixture row cache did not build");
+        return r;
+    }
+    lazy_io_queue           q;
+    lazy_io_waiter          w;
+    std::vector<ring_lease> spare;
+    w.src_offset               = LAZY_IO_CHUNK_BYTES + 64;
+    w.bytes                    = k_row;
+    w.cache                    = build.cache.get();
+    w.row                      = 4;
+    const size_t added         = q.submit(1, -1, { k_file, 0, 2 * LAZY_IO_CHUNK_BYTES }, key0(5, 1), w, spare);
+    size_t       cached        = 0;
+    uint64_t     cached_offset = UINT64_MAX;
+    for (lazy_io_read * rd = q.pick(); rd != nullptr; rd = q.pick()) {
+        for (const lazy_io_waiter & share : rd->waiters) {
+            if (share.cache != nullptr) {
+                ++cached;
+                cached_offset = rd->span.offset;
+            }
+        }
+        q.complete(rd);
+    }
+    expect(r, added == 1 && cached == 1 && cached_offset == LAZY_IO_CHUNK_BYTES,
+           "a cached waiter in the second chunk was queued as " + num(added) + " share(s), " + num(cached) +
+               " keeping the cache, want 1 and 1 on the read at offset " + num(LAZY_IO_CHUNK_BYTES));
+
+    const child_run child = run_child_strings({ "test-sycl-lazy-io-queue-host", k_straddle_child },
+                                              child_environment({ "GGML_NO_BACKTRACE=1" }), std::chrono::seconds(30));
+    if (!child.ran) {
+        expect(r, false, "the straddling cached waiter's child did not finish within 30 s");
+        return r;
+    }
+    expect(r, text_count_with(child.err, "STRADDLE-CHILD returned") == 0,
+           "the submit of a straddling cached waiter returned instead of aborting");
+    const size_t asserts = text_count_with(child.err, "GGML_ASSERT(waiter.cache == nullptr");
+    const bool   aborted = WIFSIGNALED(child.status) && WTERMSIG(child.status) == SIGABRT;
+    expect(r, aborted && asserts == 1,
+           "the straddling cached waiter's child ended with status " + std::to_string(child.status) + " and " +
+               num(asserts) + " assert line(s), want SIGABRT and 1");
+    return r;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], k_straddle_child) == 0) {
+        return straddle_child();
+    }
     const std::vector<named_arm> arms = {
-        { "class 0 dispatches by (epoch, deadline), rows first, equal keys in order", arm_key_order          },
-        { "the epoch order survives the counter's wrap",                              arm_epoch_wrap         },
-        { "the contexts take turns",                                                  arm_round_robin        },
-        { "class 1 waits for every context's class 0",                                arm_class_order        },
-        { "a class-0 join promotes a lookahead read",                                 arm_promotion          },
-        { "a span is read in chunks of at most 512 KiB",                              arm_chunks             },
-        { "a request for a pending block joins its read",                             arm_dedup              },
-        { "a same-context join takes the more urgent key and keeps its number",       arm_same_context_rekey },
-        { "a join from another context adds an entry at the joiner's key",            arm_cross_context_join },
-        { "the FIFO override serves reads in enqueue order",                          arm_fifo_override      },
-        { "the dispatch log numbers a read when a worker picks it up",                arm_dispatch_log       },
-        { "the reaper copies only into its own epoch's live slot",                    arm_delivery           },
-        { "a submit that throws leaves the queue's indexes whole",                    arm_submit_throw       },
+        { "class 0 dispatches by (epoch, deadline), rows first, equal keys in order", arm_key_order               },
+        { "the epoch order survives the counter's wrap",                              arm_epoch_wrap              },
+        { "the contexts take turns",                                                  arm_round_robin             },
+        { "class 1 waits for every context's class 0",                                arm_class_order             },
+        { "a class-0 join promotes a lookahead read",                                 arm_promotion               },
+        { "a span is read in chunks of at most 512 KiB",                              arm_chunks                  },
+        { "a request for a pending block joins its read",                             arm_dedup                   },
+        { "a same-context join takes the more urgent key and keeps its number",       arm_same_context_rekey      },
+        { "a join from another context adds an entry at the joiner's key",            arm_cross_context_join      },
+        { "the FIFO override serves reads in enqueue order",                          arm_fifo_override           },
+        { "the dispatch log numbers a read when a worker picks it up",                arm_dispatch_log            },
+        { "the reaper copies only into its own epoch's live slot",                    arm_delivery                },
+        { "a submit that throws leaves the queue's indexes whole",                    arm_submit_throw            },
+        { "a cached waiter lies in one chunk, or the submit aborts",                  arm_cached_waiter_one_chunk },
     };
     return run_arms(arms, "lazy io queue host arms");
 }

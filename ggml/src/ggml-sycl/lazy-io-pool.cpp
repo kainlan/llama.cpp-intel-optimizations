@@ -880,6 +880,14 @@ size_t lazy_io_queue::submit(uint64_t                  context,
         span.length > UINT64_MAX - span.offset) {
         return 0;
     }
+#if !defined(LAZY_IO_QUEUE_MUTANT_CACHED_WAITER_UNCHECKED)
+    // A waiter with a row cache inserts one whole row from one read, so it must lie in one chunk; a share holding part
+    // of a row would insert that part as the row. A row's read covers only the blocks that hold it (§5.2), so a row
+    // smaller than a chunk always does.
+    GGML_ASSERT(waiter.cache == nullptr ||
+                (waiter.bytes != 0 && waiter.src_offset / LAZY_IO_CHUNK_BYTES ==
+                                          (waiter.src_offset + waiter.bytes - 1) / LAZY_IO_CHUNK_BYTES));
+#endif
     const uint64_t end   = span.offset + span.length;
     const uint64_t w0    = span.offset + waiter.src_offset;
     const uint64_t w1    = w0 + waiter.bytes;
@@ -901,6 +909,13 @@ size_t lazy_io_queue::submit(uint64_t                  context,
                 share.bytes          = static_cast<size_t>(hi - lo);
                 share.landing_offset = waiter.landing_offset + static_cast<size_t>(lo - w0);
                 has_share            = true;
+#if !defined(LAZY_IO_QUEUE_MUTANT_CACHED_WAITER_UNCHECKED)
+                // Only a share that is the whole waiter inserts the row; the assert above makes every cached share one.
+                if (share.bytes != waiter.bytes) {
+                    share.cache = nullptr;
+                    share.row   = -1;
+                }
+#endif
             }
         }
 #if defined(LAZY_IO_QUEUE_MUTANT_NO_DEDUP)
