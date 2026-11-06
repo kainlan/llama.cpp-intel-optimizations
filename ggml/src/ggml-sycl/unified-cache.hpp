@@ -5037,6 +5037,13 @@ class unified_cache {
                                  // Pass nothing.
                                  const char *                     caller_file = __builtin_FILE(),
                                  const char *                     caller_func = __builtin_FUNCTION());
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // copy_to_device_async on the cache's queue, so the outside-materialization counter's device test reaches each
+    // chokepoint the design names (docs/design/sycl-mmap-host-tier.md §5.3, §7 C4 test-sycl-file-mapped-bounce).
+    sycl::event copy_to_device_async_for_testing(void * dst, const void * src, size_t size) {
+        return copy_to_device_async(dst, src, size, {}, nullptr);
+    }
+#endif
 
     // Defer freeing host allocations until the associated event completes.
     void defer_host_free(void * ptr, size_t size, const sycl::event & event);
@@ -9044,6 +9051,34 @@ void * unified_cache_kv_arena_alloc(int device_id, size_t size);
 // llama.cpp-5efe C4: how many times stream_dma refused a file-mapped source (design 5efe §5.3). A refusal means
 // dispatch routed a host-tier weight to a device kernel, so a correct build reads 0.
 uint64_t unified_cache_stream_dma_file_mapped_refusals() noexcept;
+
+// A device-bound copy of file-mapped bytes outside a load transaction or a cache materialization
+// (docs/design/sycl-mmap-host-tier.md §5.3 "Gates"). It is noted at the instrumented chokepoints only, once per copy:
+// mem_copy and mem_copy_async (both reach mem_copy_submit, as unified_cache::copy_to_device_async and stream_dma's
+// default copy do), mem_copy_ptr_async, and stream_dma's custom copy_fn. A copy through any other path is not counted.
+// `src` is the copy's source; the caller has established that its destination is a device. A correct load reads 0.
+void     unified_cache_file_mapped_device_copy_note(const void * src);
+uint64_t unified_cache_file_mapped_device_copies_outside_materialization() noexcept;
+
+// The load transaction's span, process-wide: from a successful ggml_backend_sycl_model_load_begin to the end of the
+// model_load_end call that finishes it. Copies inside it are the load's own and are not counted.
+void unified_cache_file_mapped_load_enter() noexcept;
+void unified_cache_file_mapped_load_leave() noexcept;
+
+// `[FILE-MAPPED] counters: stream_dma_refusals=%llu device_copies_outside_materialization=%llu`, at WARN, so it
+// survives llama-completion's default log threshold (§5.3 "Where the lead reads both counters").
+void unified_cache_file_mapped_counters_log();
+
+// A cache materialization on this thread: direct_stage_weight, the expert stages and the fills they run. Its copies of
+// mapped bytes are the materialization itself, not a device read of the file, so they are not counted. Thread-local:
+// another thread's copy during the materialization is still counted.
+class file_mapped_materialization_scope {
+  public:
+    file_mapped_materialization_scope() noexcept;
+    ~file_mapped_materialization_scope();
+    file_mapped_materialization_scope(const file_mapped_materialization_scope &)             = delete;
+    file_mapped_materialization_scope & operator=(const file_mapped_materialization_scope &) = delete;
+};
 
 // Reserve the inference scratch pool on a device.
 bool unified_cache_reserve_scratch_pool(int device_id, size_t pool_bytes);

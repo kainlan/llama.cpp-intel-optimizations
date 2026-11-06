@@ -17688,6 +17688,49 @@ uint64_t unified_cache_stream_dma_file_mapped_refusals() noexcept {
     return g_stream_dma_file_mapped_refusals.load(std::memory_order_relaxed);
 }
 
+// Device-bound copies of file-mapped bytes outside a load or a materialization, process-wide (design §5.3 "Gates").
+static std::atomic<uint64_t> g_file_mapped_device_copies_outside_materialization{ 0 };
+// Load transactions open, process-wide: a copy while any is open is a load's.
+static std::atomic<int>      g_file_mapped_load_depth{ 0 };
+// Materialization scopes open on this thread.
+static thread_local int      t_file_mapped_materialization_depth = 0;
+
+file_mapped_materialization_scope::file_mapped_materialization_scope() noexcept {
+    ++t_file_mapped_materialization_depth;
+}
+
+file_mapped_materialization_scope::~file_mapped_materialization_scope() {
+    --t_file_mapped_materialization_depth;
+}
+
+void unified_cache_file_mapped_device_copy_note(const void * src) {
+    // The depths first: they are a thread-local read and a relaxed load, the registry lookup is a shared lock.
+    if (t_file_mapped_materialization_depth > 0 || g_file_mapped_load_depth.load(std::memory_order_relaxed) > 0) {
+        return;
+    }
+    if (alloc_registry::instance().is_file_mapped(src)) {
+        g_file_mapped_device_copies_outside_materialization.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+uint64_t unified_cache_file_mapped_device_copies_outside_materialization() noexcept {
+    return g_file_mapped_device_copies_outside_materialization.load(std::memory_order_relaxed);
+}
+
+void unified_cache_file_mapped_load_enter() noexcept {
+    g_file_mapped_load_depth.fetch_add(1, std::memory_order_relaxed);
+}
+
+void unified_cache_file_mapped_load_leave() noexcept {
+    g_file_mapped_load_depth.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void unified_cache_file_mapped_counters_log() {
+    GGML_LOG_WARN("[FILE-MAPPED] counters: stream_dma_refusals=%llu device_copies_outside_materialization=%llu\n",
+                  static_cast<unsigned long long>(unified_cache_stream_dma_file_mapped_refusals()),
+                  static_cast<unsigned long long>(unified_cache_file_mapped_device_copies_outside_materialization()));
+}
+
 unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view &           src,
                                                            size_t                           total_bytes,
                                                            size_t                           slice_bytes,
