@@ -124,6 +124,33 @@ const char * k_arm_empty_slot =
     "the public entries read no coverage, and a null pin refuses as lazy-table-ring-unpinned";
 const char * k_arm_owner_check = "the block ring's POOL rows are silent while their generation is live or parked";
 const char * k_arm_strict = "under strict leases the STORAGE materialization aborts on a ring refusal after its WARN";
+const char * k_arm_strict_mismatch =
+    "under strict leases the STORAGE materialization aborts on a ring mismatch after its WARN";
+const char * k_arm_strict_concurrent =
+    "under strict leases the STORAGE materialization aborts on a concurrent ensure after its WARN";
+
+// The strict cases (§10), one for each refusal ring_refusal_is_plan_bug names, each in its own child, since its abort
+// ends the process. TOO_NARROW is the strict table's one-block-short need on a ring-less pool. MISMATCH and CONCURRENT
+// plan the full need, LAZY_BLOCK_RING_QD x 8192 B, charged at its mapped size: MISMATCH on a live ring that a fixture's
+// ensure created under transaction 0, which is no plan's creator, so the charge is refused; CONCURRENT on a ring-less
+// pool while the ensure hook holds another caller between its reserve and its allocation. k_strict_cases lists them in
+// enum order, which indexes g_strict_runs.
+enum class strict_case : uint8_t { TOO_NARROW, MISMATCH, CONCURRENT };
+
+struct strict_case_entry {
+    strict_case       kind;
+    const char *      name;    // the child's argument
+    const char *      arm;     // the arm that scores it
+    lazy_table_status status;  // the materialization's refusal, which its abort names
+};
+
+const strict_case_entry k_strict_cases[] = {
+    { strict_case::TOO_NARROW, "too-narrow", k_arm_strict,            lazy_table_status::RING_TOO_NARROW },
+    { strict_case::MISMATCH,   "mismatch",   k_arm_strict_mismatch,   lazy_table_status::RING_MISMATCH   },
+    { strict_case::CONCURRENT, "concurrent", k_arm_strict_concurrent, lazy_table_status::RING_CONCURRENT },
+};
+constexpr size_t k_strict_case_count = 3;
+static_assert(sizeof(k_strict_cases) / sizeof(k_strict_cases[0]) == k_strict_case_count, "one entry per strict case");
 
 // The two accessors T5 publishes (§10), resolved through the proc table: null in a build that does not export them.
 using u64_reader                   = bool (*)(uint64_t *);
@@ -139,8 +166,9 @@ const char * k_strict_setting = "GGML_SYCL_STRICT_LEASES=1";
 
 ggml_backend_t g_backend0 = nullptr;          // main's backend 0, alive for every arm
 std::string    g_fixture_path;
-bool           g_direct_unsupported = false;  // the fixture's filesystem refuses O_DIRECT: the strict arm is VOID
-child_run      g_strict_run;
+bool           g_direct_unsupported = false;  // the fixture's filesystem refuses O_DIRECT: the strict arms are VOID
+// Each strict case's child, by strict_case.
+child_run      g_strict_runs[k_strict_case_count];
 
 // --- small readings ---
 
@@ -1475,47 +1503,76 @@ bool probe_direct(const std::string & path) {
     return true;
 }
 
-// The strict arm's line the child prints when its materialization returns, or what stands for it.
-std::string strict_returned_line() {
-    const std::string & err = g_strict_run.err;
-    const size_t        at  = err.find("STRICT-CHILD returned");
+// A strict child's first STRICT-CHILD line, which it prints when its materialization returns or when it cannot
+// engage, or what stands for it.
+std::string strict_child_line(const child_run & run) {
+    const size_t at = run.err.find("STRICT-CHILD ");
     if (at == std::string::npos) {
         return "it printed no STRICT-CHILD line";
     }
-    const size_t end = err.find('\n', at);
-    return err.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    const size_t end = run.err.find('\n', at);
+    return run.err.substr(at, end == std::string::npos ? std::string::npos : end - at);
 }
 
-// The strict arm (r47 I-4; §10): run as a child under GGML_SYCL_STRICT_LEASES=1 before this process initialises SYCL,
-// the materialization of a STORAGE table whose plan's need is one block short of its span's aborts at the ensure's
-// refusal, after the ensure's one [HOST-PLAN-BUG] line naming 520192 and 524288 (exit 134, SIGABRT); ensure itself
-// never aborts. The same materialization in this process, not strict, returns lazy-table-ring-too-narrow.
+// The figures a strict case's one [HOST-PLAN-BUG] line names.
+std::string strict_bug(strict_case kind) {
+    switch (kind) {
+        case strict_case::TOO_NARROW:
+            return "need " + num(k_strict_need) + " B, want " + num(k_need_8k) + " B";
+        case strict_case::MISMATCH:
+            return "ring charge " + num(mapped(k_need_8k)) + " B, want 0 B";
+        case strict_case::CONCURRENT:
+            return "concurrent ring ensure: need " + num(k_need_8k) + " B, span " + num(k_span_8k) + " B";
+    }
+    return "an unknown strict case";
+}
+
+// Scores a strict case's child (§10): it aborted (SIGABRT) at the materialization's strict abort, whose line names the
+// table and the case's refusal, after the ensure's one [HOST-PLAN-BUG] line naming the case's figures, and it never
+// returned. Ensure itself never aborts, so the abort is the materialization's. Returns false when the arm is VOID or
+// the child did not finish, so the arm stops there.
+bool strict_child_scored(arm_result & r, const strict_case_entry & c) {
+    if (g_direct_unsupported) {
+        void_arm(r, "the fixture's filesystem refuses O_DIRECT, which the STORAGE descriptor requires");
+        return false;
+    }
+    const child_run & run = g_strict_runs[static_cast<size_t>(c.kind)];
+    if (!run.ran) {
+        fail(r, "the strict child did not finish within its bound");
+        return false;
+    }
+    if (WIFEXITED(run.status) && WEXITSTATUS(run.status) == SYCL_TEST_SKIP) {
+        void_arm(r, "the strict child did not engage: " + strict_child_line(run));
+        return false;
+    }
+    const bool aborted = WIFSIGNALED(run.status) && WTERMSIG(run.status) == SIGABRT;
+    if (!aborted) {
+        fail(r, "the strict child did not abort: status " + std::to_string(run.status) + ", " + strict_child_line(run));
+    }
+    const std::string numbers = strict_bug(c.kind);
+    const size_t      bugs    = text_count_with(run.err, "[HOST-PLAN-BUG]", numbers.c_str());
+    expect(r, bugs == 1,
+           "the strict child printed " + num(bugs) + " [HOST-PLAN-BUG] lines naming '" + numbers + "', want 1");
+    const std::string abort_line =
+        std::string("lazy table strict.ring: ") + lazy_table_status_name(c.status) + " under " + k_strict_setting;
+    const size_t aborts = text_count_with(run.err, abort_line.c_str());
+    expect(r, aborts == 1, "the strict child printed " + num(aborts) + " lines '" + abort_line + "', want 1");
+    expect(r, text_count_with(run.err, "STRICT-CHILD returned") == 0, "the strict child returned");
+    return true;
+}
+
+// The strict arm, its too-narrow case (r47 I-4; §10): run as a child under GGML_SYCL_STRICT_LEASES=1 before this
+// process initialises SYCL, the materialization of a STORAGE table whose plan's need is one block short of its span's
+// aborts at the ensure's refusal, after the ensure's one [HOST-PLAN-BUG] line naming 520192 and 524288 (exit 134,
+// SIGABRT); ensure itself never aborts. The same materialization in this process, not strict, returns
+// lazy-table-ring-too-narrow.
 // Engagement: the child ran within its bound on a filesystem that takes O_DIRECT.
 // Mutant: strict-abort-dropped, under which the materialization returns the refusal under strict leases too.
 arm_result arm_strict() {
     arm_result r;
-    if (g_direct_unsupported) {
-        void_arm(r, "the fixture's filesystem refuses O_DIRECT, which the STORAGE descriptor requires");
+    if (!strict_child_scored(r, k_strict_cases[static_cast<size_t>(strict_case::TOO_NARROW)])) {
         return settle(r);
     }
-    if (!g_strict_run.ran) {
-        fail(r, "the strict child did not finish within its bound");
-        return settle(r);
-    }
-    if (WIFEXITED(g_strict_run.status) && WEXITSTATUS(g_strict_run.status) == SYCL_TEST_SKIP) {
-        void_arm(r, "the strict child could not open its table: " + strict_returned_line());
-        return settle(r);
-    }
-    const bool aborted = WIFSIGNALED(g_strict_run.status) && WTERMSIG(g_strict_run.status) == SIGABRT;
-    if (!aborted) {
-        fail(r, "the strict child did not abort: status " + std::to_string(g_strict_run.status) + ", " +
-                    strict_returned_line());
-    }
-    const std::string numbers = "need " + num(k_strict_need) + " B, want " + num(k_need_8k) + " B";
-    const size_t      bugs    = text_count_with(g_strict_run.err, "[HOST-PLAN-BUG]", numbers.c_str());
-    expect(r, bugs == 1,
-           "the strict child printed " + num(bugs) + " [HOST-PLAN-BUG] lines naming '" + numbers + "', want 1");
-    expect(r, text_count_with(g_strict_run.err, "STRICT-CHILD returned") == 0, "the strict child returned");
 
     pin_ptr pin = make_pin(0);
     if (!pin_engaged(r, pin, 0)) {
@@ -1532,6 +1589,29 @@ arm_result arm_strict() {
     return settle(r);
 }
 
+// The strict arm's mismatch case (§10): run as a child under GGML_SYCL_STRICT_LEASES=1, the materialization of a
+// STORAGE table whose plan charges a live ring it did not create aborts at the ensure's refusal, after the ensure's
+// one [HOST-PLAN-BUG] line naming the plan's charge and 0.
+// Engagement: the child ran within its bound on a filesystem that takes O_DIRECT, and its backend 0 initialised.
+// Mutant: strict-abort-dropped-mismatch, the strict-abort-dropped selector run against this arm.
+arm_result arm_strict_mismatch() {
+    arm_result r;
+    (void) strict_child_scored(r, k_strict_cases[static_cast<size_t>(strict_case::MISMATCH)]);
+    return settle(r);
+}
+
+// The strict arm's concurrent case (§10): run as a child under GGML_SYCL_STRICT_LEASES=1, the materialization of a
+// STORAGE table whose ensure finds another caller reserved aborts at the ensure's refusal, after the ensure's one
+// "[HOST-PLAN-BUG] concurrent ring ensure" line naming the need and the span.
+// Engagement: the child ran within its bound on a filesystem that takes O_DIRECT, its backend 0 initialised, and the
+// ensure hook held the other caller.
+// Mutant: strict-abort-dropped-concurrent, the strict-abort-dropped selector run against this arm.
+arm_result arm_strict_concurrent() {
+    arm_result r;
+    (void) strict_child_scored(r, k_strict_cases[static_cast<size_t>(strict_case::CONCURRENT)]);
+    return settle(r);
+}
+
 // --- the mutants ---
 
 struct mutant_entry {
@@ -1541,21 +1621,23 @@ struct mutant_entry {
 };
 
 const mutant_entry k_mutants[] = {
-    { "no-span-check",                  lazy_ring_mutant::NO_SPAN_CHECK,                  k_arm_ring_plan     },
-    { "ignore-live-ring",               lazy_ring_mutant::IGNORE_LIVE_RING,               k_arm_wider_refused },
-    { "ignore-live-ring-p3",            lazy_ring_mutant::IGNORE_LIVE_RING,               k_arm_wider_p3      },
-    { "no-candidate-lease",             lazy_ring_mutant::NO_CANDIDATE_LEASE,             k_arm_lease         },
-    { "lease-at-stage",                 lazy_ring_mutant::LEASE_AT_STAGE,                 k_arm_window        },
-    { "lease-presence-as-coverage",     lazy_ring_mutant::LEASE_PRESENCE_AS_COVERAGE,     k_arm_staging       },
-    { "take-without-candidate",         lazy_ring_mutant::TAKE_WITHOUT_CANDIDATE,         k_arm_no_storage    },
-    { "lease-before-guard",             lazy_ring_mutant::LEASE_BEFORE_GUARD,             k_arm_all_host      },
-    { "replace-keeps-displaced",        lazy_ring_mutant::REPLACE_KEEPS_DISPLACED,        k_arm_two_device    },
-    { "rollback-keeps-clone",           lazy_ring_mutant::ROLLBACK_KEEPS_CLONE,           k_arm_partial       },
-    { "count-without-pin",              lazy_ring_mutant::COUNT_WITHOUT_PIN,              k_arm_empty_slot    },
-    { "no-entry-reap",                  lazy_ring_mutant::NO_ENTRY_REAP,                  k_arm_dry_run       },
-    { "no-closing-reap",                lazy_ring_mutant::NO_CLOSING_REAP,                k_arm_dry_run       },
-    { "generation-live-ignores-parked", lazy_ring_mutant::GENERATION_LIVE_IGNORES_PARKED, k_arm_owner_check   },
-    { "strict-abort-dropped",           lazy_ring_mutant::STRICT_ABORT_DROPPED,           k_arm_strict        },
+    { "no-span-check",                   lazy_ring_mutant::NO_SPAN_CHECK,                  k_arm_ring_plan         },
+    { "ignore-live-ring",                lazy_ring_mutant::IGNORE_LIVE_RING,               k_arm_wider_refused     },
+    { "ignore-live-ring-p3",             lazy_ring_mutant::IGNORE_LIVE_RING,               k_arm_wider_p3          },
+    { "no-candidate-lease",              lazy_ring_mutant::NO_CANDIDATE_LEASE,             k_arm_lease             },
+    { "lease-at-stage",                  lazy_ring_mutant::LEASE_AT_STAGE,                 k_arm_window            },
+    { "lease-presence-as-coverage",      lazy_ring_mutant::LEASE_PRESENCE_AS_COVERAGE,     k_arm_staging           },
+    { "take-without-candidate",          lazy_ring_mutant::TAKE_WITHOUT_CANDIDATE,         k_arm_no_storage        },
+    { "lease-before-guard",              lazy_ring_mutant::LEASE_BEFORE_GUARD,             k_arm_all_host          },
+    { "replace-keeps-displaced",         lazy_ring_mutant::REPLACE_KEEPS_DISPLACED,        k_arm_two_device        },
+    { "rollback-keeps-clone",            lazy_ring_mutant::ROLLBACK_KEEPS_CLONE,           k_arm_partial           },
+    { "count-without-pin",               lazy_ring_mutant::COUNT_WITHOUT_PIN,              k_arm_empty_slot        },
+    { "no-entry-reap",                   lazy_ring_mutant::NO_ENTRY_REAP,                  k_arm_dry_run           },
+    { "no-closing-reap",                 lazy_ring_mutant::NO_CLOSING_REAP,                k_arm_dry_run           },
+    { "generation-live-ignores-parked",  lazy_ring_mutant::GENERATION_LIVE_IGNORES_PARKED, k_arm_owner_check       },
+    { "strict-abort-dropped",            lazy_ring_mutant::STRICT_ABORT_DROPPED,           k_arm_strict            },
+    { "strict-abort-dropped-mismatch",   lazy_ring_mutant::STRICT_ABORT_DROPPED,           k_arm_strict_mismatch   },
+    { "strict-abort-dropped-concurrent", lazy_ring_mutant::STRICT_ABORT_DROPPED,           k_arm_strict_concurrent },
 };
 
 const mutant_entry * mutant_named(const char * text) {
@@ -1567,9 +1649,32 @@ const mutant_entry * mutant_named(const char * text) {
     return nullptr;
 }
 
-// The strict arm's child: under GGML_SYCL_STRICT_LEASES=1, with a fixture's pin on a ring-less pool, the STORAGE
-// materialization's ensure refuses the one-block-short need, and the materialization aborts.
-int strict_child(const char * mutant) {
+const strict_case_entry * strict_case_named(const char * name) {
+    for (const strict_case_entry & c : k_strict_cases) {
+        if (std::strcmp(c.name, name) == 0) {
+            return &c;
+        }
+    }
+    return nullptr;
+}
+
+// The strict child's way out once its materialization returns or it cannot engage: its STRICT-CHILD line, then
+// _Exit, the process end the abort takes, without its signal. Nothing is torn down, so no teardown under strict leases
+// can stand in for the abort the arm scores.
+[[noreturn]] void strict_child_exit(const std::string & line, int code) {
+    std::fprintf(stderr, "STRICT-CHILD %s\n", line.c_str());
+    std::fflush(stderr);
+    std::_Exit(code);
+}
+
+// The strict arms' child: under GGML_SYCL_STRICT_LEASES=1, one case's STORAGE materialization refuses at its ensure
+// and aborts there. The full-need cases first initialise backend 0, as main does before any arm allocates a ring.
+int strict_child(const char * which, const char * mutant) {
+    const strict_case_entry * c = strict_case_named(which);
+    if (c == nullptr) {
+        std::fprintf(stderr, "STRICT-CHILD unknown case %s\n", which);
+        return 2;
+    }
     if (mutant != nullptr) {
         const mutant_entry * e = mutant_named(mutant);
         if (e == nullptr) {
@@ -1579,14 +1684,35 @@ int strict_child(const char * mutant) {
         ggml_sycl_test_lazy_ring_mutant_select(e->mutant);
     }
     ggml_sycl_test_host_ledger_store_budget(k_strict_budget);
-    pin_ptr                 pin = make_pin(0);
-    const lazy_table_result t   = lazy_table_create_storage(strict_desc());
-    std::fprintf(stderr, "STRICT-CHILD returned status=%s\n", lazy_table_status_name(t.status));
-    return t.status == lazy_table_status::OPEN_FAILED ? SYCL_TEST_SKIP : 0;
+    lazy_table_desc desc = strict_desc();
+    if (c->kind != strict_case::TOO_NARROW) {
+        if (ggml_backend_sycl_init(0) == nullptr) {
+            strict_child_exit("void: backend 0 did not initialise", SYCL_TEST_SKIP);
+        }
+        desc.block_ring_need   = k_need_8k;
+        desc.block_ring_charge = mapped(k_need_8k);
+    }
+    pin_ptr pin = make_pin(c->kind == strict_case::MISMATCH ? k_need_8k : 0);
+    gate    reserve_gate;
+    if (c->kind == strict_case::CONCURRENT) {
+        // The other caller: its ensure reserves the ring-less pool and the hook holds it there until the process ends.
+        ggml_sycl_test_lazy_ensure_hold([](void * ctx) { static_cast<gate *>(ctx)->hold(); }, &reserve_gate);
+        std::thread([] {
+            (void) block_ring_ensure(k_need_8k, k_span_8k, 0, mapped(k_need_8k), k_strict_txn);
+        }).detach();
+        if (!reserve_gate.wait_holders(1)) {
+            strict_child_exit(
+                "void: the ensure hook did not hold the other caller within " + num(k_hook_bound.count()) + " s",
+                SYCL_TEST_SKIP);
+        }
+    }
+    const lazy_table_status status = lazy_table_create_storage(desc).status;
+    strict_child_exit(std::string("returned status=") + lazy_table_status_name(status),
+                      status == lazy_table_status::OPEN_FAILED ? SYCL_TEST_SKIP : 0);
 }
 
-child_run spawn_strict(const char * mutant) {
-    std::vector<std::string> args = { "test-sycl-lazy-ring", "--strict-child", g_fixture_path };
+child_run spawn_strict(const char * which, const char * mutant) {
+    std::vector<std::string> args = { "test-sycl-lazy-ring", "--strict-child", g_fixture_path, which };
     if (mutant != nullptr) {
         args.emplace_back(mutant);
     }
@@ -1597,9 +1723,9 @@ child_run spawn_strict(const char * mutant) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    if (argc >= 3 && std::strcmp(argv[1], "--strict-child") == 0) {
+    if (argc >= 4 && std::strcmp(argv[1], "--strict-child") == 0) {
         g_fixture_path = argv[2];
-        return strict_child(argc >= 4 ? argv[3] : nullptr);
+        return strict_child(argv[3], argc >= 5 ? argv[4] : nullptr);
     }
     const mutant_entry * mutant = nullptr;
     if (argc == 3 && std::strcmp(argv[1], "--mutant") == 0) {
@@ -1618,8 +1744,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // The owner check and the refusal arms read typed results, which strict mode turns into aborts; the strict child
-    // sets it alone.
+    // The owner check and the refusal arms read typed results, which strict mode turns into aborts; the strict
+    // children set it alone.
     const std::string strict_name(k_strict_setting, std::strchr(k_strict_setting, '=') - k_strict_setting);
     unsetenv(strict_name.c_str());
     char cwd[PATH_MAX];
@@ -1635,11 +1761,15 @@ int main(int argc, char ** argv) {
     }
     g_direct_unsupported = !probe_direct(g_fixture_path);
 
-    // The child starts before this process initialises SYCL.
-    const bool strict_runs = mutant == nullptr || std::strcmp(mutant->arm, k_arm_strict) == 0;
-    if (strict_runs && !g_direct_unsupported) {
-        g_strict_run = spawn_strict(mutant != nullptr ? mutant->text : nullptr);
-        std::fputs(g_strict_run.err.c_str(), stderr);
+    // The strict children start before this process initialises SYCL, one at a time: every case's without a mutant,
+    // else the one the mutant's arm scores.
+    for (const strict_case_entry & c : k_strict_cases) {
+        if (g_direct_unsupported || (mutant != nullptr && std::strcmp(mutant->arm, c.arm) != 0)) {
+            continue;
+        }
+        child_run & run = g_strict_runs[static_cast<size_t>(c.kind)];
+        run             = spawn_strict(c.name, mutant != nullptr ? mutant->text : nullptr);
+        std::fputs(run.err.c_str(), stderr);
     }
 
     int rc = SYCL_TEST_SKIP;
@@ -1679,22 +1809,24 @@ int main(int argc, char ** argv) {
     }
 
     const std::vector<named_arm> arms = {
-        { k_arm_ring_plan,     arm_ring_plan       },
-        { k_arm_wider_host,    arm_wider_host      },
-        { k_arm_wider_refused, arm_wider_refused   },
-        { k_arm_wider_p3,      arm_wider_p3        },
-        { k_arm_staging,       arm_staging_pass    },
-        { k_arm_lease,         arm_lease           },
-        { k_arm_window,        arm_window          },
-        { k_arm_no_storage,    arm_no_storage      },
-        { k_arm_all_host,      arm_all_host        },
-        { k_arm_two_device,    arm_two_device      },
-        { k_arm_partial,       arm_partial_failure },
-        { k_arm_dry_run,       arm_dry_run         },
+        { k_arm_ring_plan,         arm_ring_plan         },
+        { k_arm_wider_host,        arm_wider_host        },
+        { k_arm_wider_refused,     arm_wider_refused     },
+        { k_arm_wider_p3,          arm_wider_p3          },
+        { k_arm_staging,           arm_staging_pass      },
+        { k_arm_lease,             arm_lease             },
+        { k_arm_window,            arm_window            },
+        { k_arm_no_storage,        arm_no_storage        },
+        { k_arm_all_host,          arm_all_host          },
+        { k_arm_two_device,        arm_two_device        },
+        { k_arm_partial,           arm_partial_failure   },
+        { k_arm_dry_run,           arm_dry_run           },
         // After the dry run: the legacy setter leaves a published legacy plan behind.
-        { k_arm_empty_slot,    arm_empty_slot      },
-        { k_arm_owner_check,   arm_owner_check     },
-        { k_arm_strict,        arm_strict          },
+        { k_arm_empty_slot,        arm_empty_slot        },
+        { k_arm_owner_check,       arm_owner_check       },
+        { k_arm_strict,            arm_strict            },
+        { k_arm_strict_mismatch,   arm_strict_mismatch   },
+        { k_arm_strict_concurrent, arm_strict_concurrent },
     };
     if (mutant == nullptr) {
         rc = run_arms(arms, "lazy ring arms");

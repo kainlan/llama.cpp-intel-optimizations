@@ -8308,9 +8308,10 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # it fits, else refuses as too narrow; the staged candidate's lease carries the pool across the early and the late
     # pass and across another model's unload; the stage's lease holds it across a read's drop inside the planner; an
     # inventory with no lazy table takes nothing; the stage, its failure and the dry run leave no pool; the owner check
-    # is silent for a live or parked pool's ring rows; and under strict leases a STORAGE materialization aborts on a
-    # ring refusal. The stage builds both cards' caches on the multi-device path, so it runs on level_zero:0,1, exits 77
-    # on the single-device path, carries the OOM-family labels and runs alone. Lead-run.
+    # is silent for a live or parked pool's ring rows; and under strict leases a STORAGE materialization aborts on each
+    # ring refusal that is a plan bug: too narrow, a mismatch and a concurrent ensure, each in its own child. The stage
+    # builds both cards' caches on the multi-device path, so it runs on level_zero:0,1, exits 77 on the single-device
+    # path, carries the OOM-family labels and runs alone. Lead-run.
     #
     # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
     # and the FAIL line of the arm that kills it, which runs alone. Each registers test-sycl-lazy-ring-mutant-<name> on
@@ -8364,22 +8365,30 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     string(CONCAT _lr_re_strict_abort_dropped
         "FAIL under strict leases the STORAGE materialization aborts on a ring refusal after its WARN: "
         "the strict child did not abort: .*STRICT-CHILD returned status=lazy-table-ring-too-narrow")
+    string(CONCAT _lr_re_strict_abort_dropped_mismatch
+        "FAIL under strict leases the STORAGE materialization aborts on a ring mismatch after its WARN: "
+        "the strict child did not abort: .*STRICT-CHILD returned status=lazy-table-ring-mismatch")
+    string(CONCAT _lr_re_strict_abort_dropped_concurrent
+        "FAIL under strict leases the STORAGE materialization aborts on a concurrent ensure after its WARN: "
+        "the strict child did not abort: .*STRICT-CHILD returned status=lazy-table-ring-concurrent-ensure")
     set(_lazy_ring_mutants
-        no-span-check                  "${_lr_re_no_span_check}"
-        ignore-live-ring               "${_lr_re_ignore_live_ring}"
-        ignore-live-ring-p3            "${_lr_re_ignore_live_ring_p3}"
-        no-candidate-lease             "${_lr_re_no_candidate_lease}"
-        lease-at-stage                 "${_lr_re_lease_at_stage}"
-        lease-presence-as-coverage     "${_lr_re_lease_presence_as_coverage}"
-        take-without-candidate         "${_lr_re_take_without_candidate}"
-        lease-before-guard             "${_lr_re_lease_before_guard}"
-        replace-keeps-displaced        "${_lr_re_replace_keeps_displaced}"
-        rollback-keeps-clone           "${_lr_re_rollback_keeps_clone}"
-        count-without-pin              "${_lr_re_count_without_pin}"
-        no-entry-reap                  "${_lr_re_no_entry_reap}"
-        no-closing-reap                "${_lr_re_no_closing_reap}"
-        generation-live-ignores-parked "${_lr_re_generation_live_ignores_parked}"
-        strict-abort-dropped           "${_lr_re_strict_abort_dropped}")
+        no-span-check                   "${_lr_re_no_span_check}"
+        ignore-live-ring                "${_lr_re_ignore_live_ring}"
+        ignore-live-ring-p3             "${_lr_re_ignore_live_ring_p3}"
+        no-candidate-lease              "${_lr_re_no_candidate_lease}"
+        lease-at-stage                  "${_lr_re_lease_at_stage}"
+        lease-presence-as-coverage      "${_lr_re_lease_presence_as_coverage}"
+        take-without-candidate          "${_lr_re_take_without_candidate}"
+        lease-before-guard              "${_lr_re_lease_before_guard}"
+        replace-keeps-displaced         "${_lr_re_replace_keeps_displaced}"
+        rollback-keeps-clone            "${_lr_re_rollback_keeps_clone}"
+        count-without-pin               "${_lr_re_count_without_pin}"
+        no-entry-reap                   "${_lr_re_no_entry_reap}"
+        no-closing-reap                 "${_lr_re_no_closing_reap}"
+        generation-live-ignores-parked  "${_lr_re_generation_live_ignores_parked}"
+        strict-abort-dropped            "${_lr_re_strict_abort_dropped}"
+        strict-abort-dropped-mismatch   "${_lr_re_strict_abort_dropped_mismatch}"
+        strict-abort-dropped-concurrent "${_lr_re_strict_abort_dropped_concurrent}")
     add_executable(test-sycl-lazy-ring
         tests/test-sycl-lazy-ring.cpp)
     target_link_libraries(test-sycl-lazy-ring PRIVATE
