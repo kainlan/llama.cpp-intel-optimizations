@@ -8055,7 +8055,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # build scores every fault: the base ctest runs every case unmutated, and each `<test>-mutant-<names>` ctest runs
     # `--mutant <names> --cases <cases>` and passes only when its expected failure text appears. They construct caches
     # and pinned pools on a real queue, so they carry the OOM-family labels, run alone on the B50 with 64 MiB chunks
-    # (§M88 (2)), load no model, and exit 77 without a SYCL GPU. Lead-run.
+    # (§M88 (2)), load no model, and exit 77 without a SYCL GPU. Lead-run. A mutant registration has no
+    # SKIP_RETURN_CODE: a VOID or skipped case exits 77 and prints no failure text, so the registration fails instead
+    # of passing as a skip. A mutant is scored killed only by its line.
     #   MUTANTS is a flat list of triples: the mutant names (comma-separated), the cases (comma-separated) and the
     #   expected text. ENV adds variables to the registration's environment. An expected text carries no `;`:
     #   ${ARGN} splits it there and shifts every later triple, so a printed `;` is matched by `.`.
@@ -8088,7 +8090,6 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
                     LABELS "sycl;cache;mem-handle;gpu-serial;mutant"
                     ENVIRONMENT "${_env}"
                     RUN_SERIAL TRUE
-                    SKIP_RETURN_CODE 77
                     TIMEOUT ${SRT_TIMEOUT}
                     PASS_REGULAR_EXPRESSION "${_regex}")
             endforeach()

@@ -486,7 +486,9 @@ int run_stale_vectors(checks & c) {
         c.void_case("the call did not reach the record function (segments_match hit, or the record path declined)");
         return c.status();
     }
-    if (r.retire_hits < 2 || r.entry_segments == 0 || !r.entry_disabled || ids_of(r.entry_ids, r.n_entry_ids) != kept) {
+    // The entry's precondition is the caller's failed retire before it. A second failed retire follows only the guard's
+    // refusal, so counting it here would read the guard's absence as an unusable fixture instead of as its failure.
+    if (r.retire_hits < 1 || r.entry_segments == 0 || !r.entry_disabled || ids_of(r.entry_ids, r.n_entry_ids) != kept) {
         c.void_case("the record function's entry did not meet the kept segments: retires failed " +
                     std::to_string(r.retire_hits) + ", segments " + std::to_string(r.entry_segments) +
                     ", disabled=" + std::to_string(r.entry_disabled));
