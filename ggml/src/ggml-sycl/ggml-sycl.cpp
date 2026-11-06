@@ -124518,6 +124518,17 @@ static void ggml_sycl_graph_compute_exception_exit() noexcept {
     }
 }
 
+// th32's lazy cancel step: the first step of each of graph_compute's two catch paths, before
+// ggml_sycl_cpu_tg_flush_pending() and before any queue wait, so a lazy copy parked at a segment boundary is cancelled
+// or drained before the catch waits on the queue (docs/design/sycl-storage-tier-lazy-tables.md §5.3 "Cancellation";
+// design 5efe §4.4 "th32's cancel step", lead ruling §M69 (b) fourth amendment). Its body is th32's cancellation and is
+// empty until that lands: this function holds the step's position in both paths, so the cancellation fills one body
+// and moves no line of either catch. noexcept, like each sibling step, because an exception out of a handler would
+// cross the backend boundary.
+static void ggml_sycl_graph_compute_lazy_cancel_step(ggml_backend_sycl_context * ctx) noexcept {
+    (void) ctx;
+}
+
 // The clear step of graph_compute's ggml_sycl_fallback_error handler. noexcept, with its own try, for the reason each
 // sibling step has one: an exception out of a handler is not caught by that try's other handlers and would cross the
 // backend boundary. A function of its own because the no-swallow rule exempts a catch-all by the function that holds
@@ -124537,6 +124548,10 @@ static void ggml_sycl_graph_compute_fallback_clear_graphs(ggml_backend_sycl_cont
 static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,
                                                                const char *                stage,
                                                                const char *                what) noexcept {
+    // The boundary catch paths' order (design 5efe §4.4 "th32's cancel step"): th32's cancel step, the CPU-TG flush,
+    // then the waits and drains below. No invalidate runs here: the executables a record moved into the context stay
+    // there until the next record's invalidate or the context's destructor, each of which waits first (§4.4).
+    ggml_sycl_graph_compute_lazy_cancel_step(cleanup_ctx);
     try { ggml_sycl_cpu_tg_flush_pending(); } catch (...) {}
     if (cleanup_ctx) {
         try { ggml_sycl_execution_quarantine_graph(cleanup_ctx); } catch (...) {}
@@ -124677,9 +124692,15 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         return ggml_sycl_graph_compute_exit_status(backend, ggml_backend_sycl_graph_compute_unchecked(backend, cgraph),
                                                    record_begins_before, exec_submits_before);
     } catch (const ggml_sycl_fallback_error & error) {
+        // The catch's order is fixed (design 5efe §4.4 "th32's cancel step" and "The catch's cleanup step", lead ruling
+        // §M69 (b) fourth amendment): th32's cancel step first, then the CPU-TG flush, then the catch's own waits (the
+        // quarantine, both queue waits, the scatter wait, the staging drain, the MMID recovery), then 5efe's cleanup
+        // step, then the unpin and the execution release. Every executable it destroys is destroyed after a drain.
         auto * cleanup_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+        ggml_sycl_graph_compute_lazy_cancel_step(cleanup_ctx);
         try { ggml_sycl_cpu_tg_flush_pending(); } catch (...) {}
         if (cleanup_ctx) {
+            // The catch's own waits: no wait sits at the throw site, because it would precede the cancel step.
             try { ggml_sycl_execution_quarantine_graph(cleanup_ctx); } catch (...) {}
             try {
                 if (cleanup_ctx->last_graph_event) {
