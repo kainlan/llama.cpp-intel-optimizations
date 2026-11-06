@@ -7,6 +7,7 @@
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/model-lifecycle.hpp"
+#include "ggml-sycl/tests/pinned-host-block-test-common.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
 #include "sycl-selector-fallback.hpp"
@@ -358,7 +359,7 @@ static bool test_planned_materialization_guard(sycl::queue & q) {
         return false;
     }
 
-    std::vector<uint8_t> host_data(64, 0xef);
+    pinned_host_block_test::block host_data(q, 64, 0xef);
     ggml_sycl_cache_id   host_key = ggml_sycl::test_make_cache_id(host_data.data());
     host_key.aux_id               = 7;
 
