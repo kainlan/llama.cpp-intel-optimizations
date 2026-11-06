@@ -91,9 +91,15 @@ constexpr uint64_t k_host_table = 64 * MiB;
 // The held and the probing read: file identity 9, one 8192 B span at offset 0, the slot of a 512 KiB ring.
 constexpr uint64_t k_read_file = 9;
 
-// The wider-model arms' table and the transaction their plans name.
-const char *       k_wider_table = "blk.1.wider.weight";
-constexpr uint64_t k_wider_txn   = 77;
+// The wider-model arms' table and the transaction each arm's plan names: one per arm, since a load prints a table's
+// decline line once (§3.3) and each arm is its own load. The decline arm's second table and its two transactions.
+const char *       k_wider_table       = "blk.1.wider.weight";
+const char *       k_wider_table_2     = "blk.2.wider.weight";
+constexpr uint64_t k_wider_host_txn    = 77;
+constexpr uint64_t k_wider_refused_txn = 78;
+constexpr uint64_t k_wider_p3_txn      = 79;
+constexpr uint64_t k_decline_txn       = 80;
+constexpr uint64_t k_decline_next_txn  = 81;
 
 // The strict arm's table: Q8_0 rows of 34 B, 4096 of them, the whole 139264 B fixture file, a STORAGE cache of all
 // 4096 rows over a floor of 1024. Its plan's need is one block per slot short of LAZY_BLOCK_RING_QD x 8192 B, so the
@@ -112,6 +118,7 @@ const char * k_arm_ring_plan =
 const char * k_arm_wider_host    = "a wider table on a live ring declines STORAGE and plans HOST where it fits";
 const char * k_arm_wider_refused = "a wider table that fits nowhere refuses as lazy-table-ring-too-narrow";
 const char * k_arm_wider_p3      = "a wider table whose HOST fit holds but P3 does not refuses and plans no HOST";
+const char * k_arm_decline_once  = "a load prints each declined table once across its plans, and again after its abort";
 const char * k_arm_staging       = "the early and the late pass charge the ring once, on the same STORAGE set";
 const char * k_arm_lease         = "a model planned as covered across an unload finds the ring through a read's lease";
 const char * k_arm_window        = "the stage's lease holds the pool across a read's drop inside the planner pass";
@@ -765,8 +772,8 @@ arm_result arm_wider_host() {
     const size_t                    body = mapped(lazy_table_host_body_request_bytes(0, t.table_bytes));
     log_clear();
     const placement_plan plan =
-        plan_for(kv_with({ t }, f.step2 + body + k_p3_margin + 1 * GiB, k_wider_txn), f.pin->pin());
-    const std::string line = decline_line(k_wider_txn, k_wider_table, k_span_16k, k_span_8k);
+        plan_for(kv_with({ t }, f.step2 + body + k_p3_margin + 1 * GiB, k_wider_host_txn), f.pin->pin());
+    const std::string line = decline_line(k_wider_host_txn, k_wider_table, k_span_16k, k_span_8k);
     expect(r, log_count_with(line.c_str()) == 1,
            "the plan printed " + num(log_count_with(line.c_str())) + " lines '" + line + "', want 1");
     expect(r, one_table(plan, lazy_residency::HOST),
@@ -794,13 +801,13 @@ arm_result arm_wider_refused() {
     }
     const placement_lazy_table_info t = planner_table(k_wider_table, k_ne0_16k, k_huge_table);
     log_clear();
-    const placement_plan plan = plan_for(kv_with({ t }, f.step2 + 64 * GiB, k_wider_txn), f.pin->pin());
+    const placement_plan plan = plan_for(kv_with({ t }, f.step2 + 64 * GiB, k_wider_refused_txn), f.pin->pin());
     expect(r, plan.lazy_refusal == "lazy-table-ring-too-narrow",
            "the wider table planned with refusal '" + refusal_name(plan) + "', want lazy-table-ring-too-narrow");
     expect(r, plan.lazy_refusal_detail.find("ring_bytes=" + num(k_need_8k)) != std::string::npos,
            "the refusal's figures '" + plan.lazy_refusal_detail +
                "' do not name the live ring's ring_bytes=" + num(k_need_8k));
-    const std::string line = decline_line(k_wider_txn, k_wider_table, k_span_16k, k_span_8k);
+    const std::string line = decline_line(k_wider_refused_txn, k_wider_table, k_span_16k, k_span_8k);
     expect(r, log_count_with(line.c_str()) == 1,
            "the plan printed " + num(log_count_with(line.c_str())) + " lines '" + line + "', want 1");
     wider_ring_intact(r, f);
@@ -826,14 +833,68 @@ arm_result arm_wider_p3() {
     const size_t                    body = mapped(lazy_table_host_body_request_bytes(0, t.table_bytes));
     log_clear();
     const placement_plan plan =
-        plan_for(kv_with({ t }, f.step2 + body + k_p3_margin - 1 * GiB, k_wider_txn), f.pin->pin());
+        plan_for(kv_with({ t }, f.step2 + body + k_p3_margin - 1 * GiB, k_wider_p3_txn), f.pin->pin());
     expect(r, plan.lazy_refusal == "lazy-table-ring-too-narrow" && plan.lazy_tables.empty(),
            "the wider table planned with refusal '" + refusal_name(plan) + "' and " + num(plan.lazy_tables.size()) +
                " table(s), want lazy-table-ring-too-narrow and none: its HOST fit holds and P3 does not");
-    const std::string line = decline_line(k_wider_txn, k_wider_table, k_span_16k, k_span_8k);
+    const std::string line = decline_line(k_wider_p3_txn, k_wider_table, k_span_16k, k_span_8k);
     expect(r, log_count_with(line.c_str()) == 1,
            "the plan printed " + num(log_count_with(line.c_str())) + " lines '" + line + "', want 1");
     wider_ring_intact(r, f);
+    f.pin.reset();
+    return settle(r);
+}
+
+// The decline line's once-per-load rule (§3.3: each declined table prints one loud WARN): a load plans once per device
+// and once per pass, so a second plan of the same load and table prints nothing more, while another table of that load
+// and the same table under another load each print one. The load's abort erases its record, so the record holds only
+// the open loads: the same load and table planned after it prints again.
+// Engagement: the pin holds a lease on a live 512 KiB ring, and the first plan prints its line.
+// Mutant: decline-every-plan, under which the second plan prints the line again.
+arm_result arm_decline_once() {
+    arm_result    r;
+    wider_fixture f;
+    if (!wider_begin(r, f)) {
+        f.pin.reset();
+        return settle(r);
+    }
+    const placement_lazy_table_info t       = planner_table(k_wider_table, k_ne0_16k, k_huge_table);
+    const placement_lazy_table_info t2      = planner_table(k_wider_table_2, k_ne0_16k, k_huge_table);
+    const size_t                    reading = f.step2 + 64 * GiB;
+    const std::string               line    = decline_line(k_decline_txn, k_wider_table, k_span_16k, k_span_8k);
+    log_clear();
+    (void) plan_for(kv_with({ t }, reading, k_decline_txn), f.pin->pin());
+    if (log_count_with(line.c_str()) != 1) {
+        void_arm(r, "the first plan of load " + num(k_decline_txn) + " printed " + num(log_count_with(line.c_str())) +
+                        " lines '" + line + "', want 1");
+        (void) unified_cache_note_model_load_abort(k_decline_txn);
+        f.pin.reset();
+        return settle(r);
+    }
+
+    (void) plan_for(kv_with({ t }, reading, k_decline_txn), f.pin->pin());
+    expect(r, log_count_with(line.c_str()) == 1,
+           "the second plan of load " + num(k_decline_txn) + " printed " + num(log_count_with(line.c_str())) +
+               " lines '" + line + "' in all, want 1");
+    const std::string line_2 = decline_line(k_decline_txn, k_wider_table_2, k_span_16k, k_span_8k);
+    (void) plan_for(kv_with({ t2 }, reading, k_decline_txn), f.pin->pin());
+    expect(
+        r, log_count_with(line_2.c_str()) == 1,
+        "the load's second table printed " + num(log_count_with(line_2.c_str())) + " lines '" + line_2 + "', want 1");
+    const std::string line_next = decline_line(k_decline_next_txn, k_wider_table, k_span_16k, k_span_8k);
+    (void) plan_for(kv_with({ t }, reading, k_decline_next_txn), f.pin->pin());
+    expect(r, log_count_with(line_next.c_str()) == 1,
+           "the table under load " + num(k_decline_next_txn) + " printed " + num(log_count_with(line_next.c_str())) +
+               " lines '" + line_next + "', want 1");
+
+    const bool aborted = unified_cache_note_model_load_abort(k_decline_txn);
+    (void) plan_for(kv_with({ t }, reading, k_decline_txn), f.pin->pin());
+    expect(r, aborted && log_count_with(line.c_str()) == 2,
+           "after load " + num(k_decline_txn) + "'s abort (" + (aborted ? "clean" : "not clean") +
+               ") its plan printed " + num(log_count_with(line.c_str())) + " lines '" + line +
+               "' in all, want 2 after a clean abort");
+    (void) unified_cache_note_model_load_abort(k_decline_txn);
+    (void) unified_cache_note_model_load_abort(k_decline_next_txn);
     f.pin.reset();
     return settle(r);
 }
@@ -1648,6 +1709,7 @@ const mutant_entry k_mutants[] = {
     { "strict-abort-dropped",            lazy_ring_mutant::STRICT_ABORT_DROPPED,           k_arm_strict            },
     { "strict-abort-dropped-mismatch",   lazy_ring_mutant::STRICT_ABORT_DROPPED,           k_arm_strict_mismatch   },
     { "strict-abort-dropped-concurrent", lazy_ring_mutant::STRICT_ABORT_DROPPED,           k_arm_strict_concurrent },
+    { "decline-every-plan",              lazy_ring_mutant::DECLINE_EVERY_PLAN,             k_arm_decline_once      },
 };
 
 const mutant_entry * mutant_named(const char * text) {
@@ -1823,6 +1885,7 @@ int main(int argc, char ** argv) {
         { k_arm_wider_host,        arm_wider_host        },
         { k_arm_wider_refused,     arm_wider_refused     },
         { k_arm_wider_p3,          arm_wider_p3          },
+        { k_arm_decline_once,      arm_decline_once      },
         { k_arm_staging,           arm_staging_pass      },
         { k_arm_lease,             arm_lease             },
         { k_arm_window,            arm_window            },

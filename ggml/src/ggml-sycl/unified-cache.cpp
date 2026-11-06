@@ -28152,8 +28152,35 @@ void unified_cache_set_live_model_mask(uint32_t mask) {
     }
 }
 
+// The STORAGE decline lines each open load has printed (th32 §3.3: one loud WARN per declined table). A load plans once
+// per device and once per pass, so a (transaction, table) pair prints at its first plan only. The load's end or abort
+// erases its transaction, so the map holds only the open loads. Transaction 0 names no load, so a direct planner entry
+// prints every decline. A leaf mutex: nothing is taken under it, and the planner prints after the unlock.
+static std::mutex                                                    g_lazy_decline_mutex;
+static std::unordered_map<uint64_t, std::unordered_set<std::string>> g_lazy_declined;
+
+// Whether this plan prints the decline line for `table` under `load_txn`; a print records the pair.
+static bool lazy_decline_first(uint64_t load_txn, const std::string & table) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (lazy_ring_mutant_is(lazy_ring_mutant::DECLINE_EVERY_PLAN)) {
+        return true;
+    }
+#endif
+    if (load_txn == 0) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(g_lazy_decline_mutex);
+    return g_lazy_declined[load_txn].insert(table).second;
+}
+
+static void lazy_decline_forget(uint64_t load_txn) {
+    std::lock_guard<std::mutex> lock(g_lazy_decline_mutex);
+    g_lazy_declined.erase(load_txn);
+}
+
 bool unified_cache_note_model_load_abort(uint64_t load_txn_id) noexcept {
     try {
+        lazy_decline_forget(load_txn_id);
         bool clean = true;
         std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
         for (auto & [device_id, cache] : g_device_caches) {
@@ -28336,6 +28363,7 @@ static void unified_cache_dump_capture_load_end(int             dev,
 }
 
 void unified_cache_note_model_load_end(uint32_t slot, uint64_t load_txn_id) {
+    lazy_decline_forget(load_txn_id);
     std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
     for (auto & [device_id, cache] : g_device_caches) {
         if (cache) {
@@ -33902,11 +33930,11 @@ static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_la
 // read through placement_load_n_ubatch as the stage reads it; otherwise the plan refuses, naming the ring:
 // lazy-table-ring-unpinned with no pin, lazy-table-ring-too-narrow when the live ring's slot is narrower than the
 // table's read span. That second-model rule (§3.3) is an input to the pass, not a demotion after it: a table whose span
-// exceeds the live slot (live / QD) is not STORAGE-eligible, prints one decline line naming the load, the table and
-// both spans, and takes the HOST test at its position. After the pass the block ring is sized over the STORAGE tables
-// and charged unless the live ring holds it; the floors and the ring must fit both the budget and P3, or the plan
-// refuses as lazy-table-cache-below-floor. What both leave above that is the STORAGE caches' yieldable share (§6.4),
-// split in proportion to table_bytes x rows_per_token. The live ring is read through the pin by
+// exceeds the live slot (live / QD) is not STORAGE-eligible, prints the decline line naming the load, the table and
+// both spans once per load and table, and takes the HOST test at its position. After the pass the block ring is sized
+// over the STORAGE tables and charged unless the live ring holds it; the floors and the ring must fit both the budget
+// and P3, or the plan refuses as lazy-table-cache-below-floor. What both leave above that is the STORAGE caches'
+// yieldable share (§6.4), split in proportion to table_bytes x rows_per_token. The live ring is read through the pin by
 // lazy_ring_coverage_read, which counts each read (§10): one per table for eligibility, one for the need and one for
 // the charge. A cold expert class refuses as cold-set-not-implemented. A refused plan carries no table and no ring, and
 // host_planned_bytes is then the zone total.
@@ -33989,10 +34017,11 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
         const size_t with   = host_ledger_sat_add(used, body);
         const size_t span   = lazy_block_ring_span(info.row_size);
         // The eligibility read: a live ring whose slot is narrower than this table's span declines it, loudly, before
-        // the HOST test, which then decides it as for any table. No ring yet, or no pin, declines nothing.
+        // the HOST test, which then decides it as for any table. No ring yet, or no pin, declines nothing. The line
+        // prints once per load and table, however many devices and passes plan the table.
         const uint64_t live     = lazy_ring_coverage_read(coverage_pin);
         const bool     declined = live != 0 && span > live / LAZY_BLOCK_RING_QD;
-        if (declined) {
+        if (declined && lazy_decline_first(kv_info.lazy_load_txn, info.name)) {
             GGML_LOG_WARN(
                 "[LAZY-PLAN] STORAGE declined for model load=%llu %s: span %zu B needed, live block ring spans "
                 "%llu B\n",

@@ -551,6 +551,7 @@ enum class lazy_ring_mutant : uint8_t {
     GENERATION_LIVE_IGNORES_PARKED,  // the generation predicate reads only the slot, so a parked pool reads gone
     STRICT_ABORT_DROPPED,            // the STORAGE materialization does not abort on a ring refusal under strict leases
     NO_ALIGNMENT_CHECK,              // ensure accepts a need that is not whole 4 KiB blocks per slot
+    DECLINE_EVERY_PLAN,              // the planner prints a table's STORAGE decline on every plan of its load
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);
