@@ -1667,8 +1667,18 @@ const mutant_entry k_mutants[] = {
     { "strict-abort-dropped",            lazy_ring_mutant::STRICT_ABORT_DROPPED,           k_arm_strict            },
     { "strict-abort-dropped-mismatch",   lazy_ring_mutant::STRICT_ABORT_DROPPED,           k_arm_strict_mismatch   },
     { "strict-abort-dropped-concurrent", lazy_ring_mutant::STRICT_ABORT_DROPPED,           k_arm_strict_concurrent },
-    { "decline-every-plan",              lazy_ring_mutant::DECLINE_EVERY_PLAN,             k_arm_decline_once      },
+    { "decline-every-plan",              lazy_ring_mutant::NONE,                           k_arm_decline_once      },
 };
+
+// Plants the entry's mutant through the IO pool's selector. NONE marks the decline record's, which the pool does not
+// plant: the record lives in unified-cache.cpp, which reads no IO pool mutant, so the cache's seam plants it.
+void plant_mutant(const mutant_entry & e) {
+    if (e.mutant == lazy_ring_mutant::NONE) {
+        unified_cache_test_lazy_decline_every_plan(true);
+        return;
+    }
+    ggml_sycl_test_lazy_ring_mutant_select(e.mutant);
+}
 
 const mutant_entry * mutant_named(const char * text) {
     for (const mutant_entry & e : k_mutants) {
@@ -1711,7 +1721,7 @@ int strict_child(const char * which, const char * mutant) {
             std::fprintf(stderr, "STRICT-CHILD unknown mutant %s\n", mutant);
             return 2;
         }
-        ggml_sycl_test_lazy_ring_mutant_select(e->mutant);
+        plant_mutant(*e);
     }
     ggml_sycl_test_host_ledger_store_budget(k_strict_budget);
     lazy_table_desc desc = strict_desc();
@@ -1862,7 +1872,7 @@ int main(int argc, char ** argv) {
     if (mutant == nullptr) {
         rc = run_arms(arms, "lazy ring arms");
     } else {
-        ggml_sycl_test_lazy_ring_mutant_select(mutant->mutant);
+        plant_mutant(*mutant);
         std::vector<named_arm> target;
         for (const named_arm & arm : arms) {
             if (std::strcmp(arm.name, mutant->arm) == 0) {

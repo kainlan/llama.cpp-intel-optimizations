@@ -28159,10 +28159,20 @@ void unified_cache_set_live_model_mask(uint32_t mask) {
 static std::mutex                                                    g_lazy_decline_mutex;
 static std::unordered_map<uint64_t, std::unordered_set<std::string>> g_lazy_declined;
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The record's mutant, with a seam of its own rather than the IO pool's mutant selector: the test targets that compile
+// this file directly link the pool from the ordinary library, which carries no selector.
+static std::atomic<bool> g_lazy_decline_every_plan{ false };
+
+void unified_cache_test_lazy_decline_every_plan(bool on) {
+    g_lazy_decline_every_plan.store(on, std::memory_order_relaxed);
+}
+#endif
+
 // Whether this plan prints the decline line for `table` under `load_txn`; a print records the pair.
 static bool lazy_decline_first(uint64_t load_txn, const std::string & table) {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-    if (lazy_ring_mutant_is(lazy_ring_mutant::DECLINE_EVERY_PLAN)) {
+    if (g_lazy_decline_every_plan.load(std::memory_order_relaxed)) {
         return true;
     }
 #endif

@@ -9525,6 +9525,8 @@ bool unified_cache_test_cache_exists(int device);
 using unified_cache_test_destroy_observer = void (*)(int device, ggml_sycl_arena_backing_type backing,
                                                      bool zone_backed);
 void unified_cache_test_set_destroy_observer(unified_cache_test_destroy_observer observer);
+// Plants the STORAGE decline record's mutant (th32 §3.3): with `on`, every plan prints its declines, as with no record.
+void unified_cache_test_lazy_decline_every_plan(bool on);
 #endif
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
 // Private direct-source fixture seam; never compiled into the ordinary backend DSO.
