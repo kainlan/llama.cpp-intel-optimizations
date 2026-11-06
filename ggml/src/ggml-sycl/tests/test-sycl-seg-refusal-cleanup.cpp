@@ -319,7 +319,7 @@ bool assertions_2_to_5(checks &                        c,
     }
     if (s.weight_leases + s.moe_leases != 0) {
         c.fail("lease vectors " + std::to_string(r.weight_leases) + "+" + std::to_string(r.moe_leases) +
-               " non-empty after a FAILED return" + (s.active_valid ? ", active_exec_graph live" : "") + " (now " +
+               " non-empty after a FAILED return" + (s.active_valid ? "; active_exec_graph live" : "") + " (now " +
                std::to_string(s.weight_leases) + "+" + std::to_string(s.moe_leases) + ")");
         return false;
     }

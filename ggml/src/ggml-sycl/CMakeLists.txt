@@ -8193,7 +8193,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         seg-immediate-return direct,recording
             "FAIL \\[direct\\] ${_seg_no_line}.*FAIL \\[recording\\] ${_seg_no_line}"
         seg-cleanup-step-removed active-valid
-            "lease vectors [0-9]+\\+[0-9]+ non-empty after a FAILED return, active_exec_graph live"
+            "lease vectors [0-9]+\\+[0-9]+ non-empty after a FAILED return. active_exec_graph live"
         seg-local-unwind moe-after
             "executables destroyed in the unwind: moe_segments 0 at catch entry, [0-9]+ recorded at the throw"
         seg-destroy-before-waits moe-after
