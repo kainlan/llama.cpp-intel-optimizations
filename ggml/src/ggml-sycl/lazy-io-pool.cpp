@@ -1441,11 +1441,17 @@ size_t lazy_io_submit(uint64_t               context,
     }
     lazy_io_engine * const engine = pool->engine.get();
     size_t                 added  = 0;
+    size_t                 fresh  = 0;  // the reads this call queued, each holding one of the spare leases
     {
         std::lock_guard<std::mutex> lock(engine->mutex);
         added = engine->queue.submit(context, fd, span, key, waiter, spare);
+        fresh = reads - spare.size();
     }
-    engine->work.notify_all();
+    // One wake per new read, and none for a join, which queues nothing a worker could pick. A wake lost to a busy
+    // worker loses no read: a worker picks before it waits, so it takes what was queued while it worked.
+    for (size_t i = 0; i < fresh; ++i) {
+        engine->work.notify_one();
+    }
     return added;
 }
 
