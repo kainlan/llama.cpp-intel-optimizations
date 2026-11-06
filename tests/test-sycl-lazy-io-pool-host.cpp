@@ -2,10 +2,11 @@
 // clone, the install on a generation match, the park and the DYING transition at the last drop, the FULL reap and its
 // list, the coverage wrapper and the helper guard, and the shut-down flag.
 //
-// Links ggml-sycl/lazy-io-pool.cpp alone, with ggml-base for the abort and the log: no SYCL header, no device, no
-// unified cache, no SYCL module. The block ring's memory comes from the fixture side of the pool's link seams. The
-// process holds one registry, so the arms run in order and each leaves it with no live pool and no parked node; the
-// shut-down arm runs last because the flag is never cleared. The two abort paths run in a child process of this binary.
+// Links three ggml-sycl translation units, lazy-io-pool.cpp, lazy-row-cache.cpp and host-cpu-mapping.cpp, with
+// ggml-base for the abort and the log: no SYCL header, no device, no unified cache, no SYCL module. The block ring's
+// memory comes from the fixture side of the pool's one link seam. The process holds one registry, so the arms run in
+// order and each leaves it with no live pool and no parked node; the shut-down arm runs last because the flag is never
+// cleared. The two abort paths run in a child process of this binary.
 //
 // Every arm names the mutant it kills. Every arm runs, so one failure does not hide the rest.
 
