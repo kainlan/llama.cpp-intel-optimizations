@@ -111417,7 +111417,179 @@ static void moe_graph_retention_reset(ggml_backend_sycl_context * ctx) {
     ctx->moe_retention_terminals.clear();
 }
 
+#    if defined(GGML_SYCL_SCRATCH_MUTANTS)
+// test-sycl-seg-refusal-cleanup's seams (docs/design/sycl-mmap-host-tier.md §4.4, §7 C4): the refusal forced at the
+// armed node, the lease and executable snapshot it takes before its throw, the note of the recorded segment whose
+// moe_after it refuses at, the moe_segments samples of the fallback catch, the record function's entry snapshot, and a
+// retire that fails on every call while armed. The production build compiles none of them.
+using ggml_sycl::scratch_test_mutant;
+using ggml_sycl::scratch_test_mutant_on;
+
+struct ggml_sycl_seg_seam_control {
+    std::string             node;  // the armed node's name; empty when disarmed
+    std::string             role;  // the helper role the refusal must match
+    bool                    samples = false;
+    ggml_sycl_test_seg_seam report{};
+};
+
+static ggml_sycl_seg_seam_control g_seg_seam;
+static std::atomic<bool>          g_seg_seam_retire_fails{ false };
+
+static size_t ggml_sycl_seg_seam_ids(const std::vector<ggml_backend_sycl_context::moe_graph_segment> & segments,
+                                     const void **                                                     out) noexcept {
+    size_t n = 0;
+    for (const auto & seg : segments) {
+        if (seg.exec_graph && n < GGML_SYCL_TEST_SEG_IDS_MAX) {
+            out[n++] = seg.exec_graph.get();
+        }
+    }
+    return n;
+}
+
+static void ggml_sycl_seg_seam_report_clear() {
+    g_seg_seam.report    = {};
+    g_seg_seam.report.s1 = -1;
+    g_seg_seam.report.s2 = -1;
+    g_seg_seam.report.s3 = -1;
+}
+
+static bool ggml_sycl_seg_seam_retire_fails() noexcept {
+    if (!g_seg_seam_retire_fails.load(std::memory_order_acquire)) {
+        return false;
+    }
+    g_seg_seam.report.retire_hits++;
+    return true;
+}
+
+static void ggml_sycl_seg_seam_note_record_entry(const ggml_backend_sycl_context * ctx) noexcept {
+    ggml_sycl_test_seg_seam & r = g_seg_seam.report;
+    r.record_entries++;
+    r.entry_segments = ctx->moe_segments.size();
+    r.entry_disabled = ctx->moe_graphs_disabled;
+    r.n_entry_ids    = ggml_sycl_seg_seam_ids(ctx->moe_segments, r.entry_ids);
+}
+
+static void ggml_sycl_seg_seam_note_recorded(
+    size_t                                                            seg_idx,
+    int                                                               moe_after,
+    bool                                                              submitted,
+    int                                                               last_node,
+    const std::vector<ggml_backend_sycl_context::moe_graph_segment> & recorded) noexcept {
+    ggml_sycl_test_seg_seam & r = g_seg_seam.report;
+    r.noted                     = true;
+    r.seg_idx                   = seg_idx;
+    r.moe_after                 = moe_after;
+    r.submitted                 = submitted;
+    r.last_recorded_node        = last_node;
+    r.n_recorded                = recorded.size();
+    r.seg_exec                  = recorded.empty() ? nullptr : recorded.back().exec_graph.get();
+    r.n_recorded_ids            = ggml_sycl_seg_seam_ids(recorded, r.recorded_ids);
+}
+
+// At the armed node in the armed role: the snapshot, then the refusal through the one fail-closed function, which
+// prints the unsupported-node line and throws ggml_sycl_fallback_error as a real refusal does. At a recorded
+// segment's moe_after the queue is not recording and that segment's executable was just submitted, so the seam waits
+// it first: a mutant that destroys it in the unwind then cannot crash before the test prints. That wait is the seam's;
+// the production catch still takes none at the throw site. A recording node is inside begin_recording, where a wait
+// on the queue is an error, so it takes none.
+static void ggml_sycl_seg_seam_refuse(ggml_backend_sycl_context & ctx, const ggml_tensor * node, const char * role) {
+    if (g_seg_seam.node.empty() || g_seg_seam.report.fired || node == nullptr || role == nullptr ||
+        g_seg_seam.node != node->name || g_seg_seam.role != role) {
+        return;
+    }
+    ggml_sycl_test_seg_seam & r = g_seg_seam.report;
+    r.fired                     = true;
+    r.weight_leases             = ctx.graph_weight_leases.size();
+    r.moe_leases                = ctx.graph_moe_expert_leases.size();
+    r.exec_graph                = ctx.exec_graph != nullptr;
+    r.active_valid              = ctx.active_exec_graph.valid;
+    if (g_seg_seam.role == "moe_after of a recorded segment") {
+        ctx.stream()->wait();
+    }
+    ggml_sycl::host_dispatch_fail_closed(false, nullptr, ctx.device, node, role);
+}
+
+// Prints each sample as it is taken, so the line a mutant's message quotes exists even if a later step dies.
+static void ggml_sycl_seg_seam_sample(const ggml_backend_sycl_context * ctx, int point) noexcept {
+    if (!g_seg_seam.samples || ctx == nullptr) {
+        return;
+    }
+    ggml_sycl_test_seg_seam & r = g_seg_seam.report;
+    const long                n = static_cast<long>(ctx->moe_segments.size());
+    if (point == 1) {
+        r.s1       = n;
+        r.n_s1_ids = ggml_sycl_seg_seam_ids(ctx->moe_segments, r.s1_ids);
+    } else if (point == 2) {
+        r.s2 = n;
+    } else {
+        r.s3 = n;
+    }
+    fprintf(stderr, "s%d=%ld\n", point, n);
+}
+
+extern "C" void ggml_backend_sycl_test_seg_seam_arm(const char * node_name, const char * role, bool samples) {
+    g_seg_seam.node    = node_name != nullptr ? node_name : "";
+    g_seg_seam.role    = role != nullptr ? role : "";
+    g_seg_seam.samples = samples;
+    ggml_sycl_seg_seam_report_clear();
+}
+
+extern "C" void ggml_backend_sycl_test_seg_seam_read(ggml_sycl_test_seg_seam * out) {
+    if (out != nullptr) {
+        *out = g_seg_seam.report;
+    }
+}
+
+extern "C" void ggml_backend_sycl_test_seg_retire_fail(bool on) {
+    g_seg_seam_retire_fails.store(on, std::memory_order_release);
+}
+
+extern "C" bool ggml_backend_sycl_test_seg_set_active_valid_alone(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_sycl(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    if (ctx->exec_graph) {
+        return false;
+    }
+    // The prompt phase the next call runs, so its entry's phase-change clear keeps the flag.
+    ctx->active_exec_graph.valid         = true;
+    ctx->active_exec_graph.key.is_decode = false;
+    ctx->active_exec_graph.key.device    = ctx->device;
+    return true;
+}
+
+extern "C" bool ggml_backend_sycl_test_seg_state_read(ggml_backend_t backend, ggml_sycl_test_seg_state * out) {
+    if (backend == nullptr || out == nullptr || !ggml_backend_is_sycl(backend)) {
+        return false;
+    }
+    auto * ctx                        = static_cast<ggml_backend_sycl_context *>(backend->context);
+    *out                              = {};
+    out->recording                    = g_ggml_sycl_graph_recording;
+    out->graph_ptr                    = g_recording_graph_ptr != nullptr;
+    out->queue_ptr                    = g_recording_queue_ptr != nullptr;
+    out->sink                         = ggml_sycl::graph_retention_token() != 0;
+    out->queue_recording              = ctx->stream()->ext_oneapi_get_state() == sycl_ex::queue_state::recording;
+    out->weight_leases                = ctx->graph_weight_leases.size();
+    out->moe_leases                   = ctx->graph_moe_expert_leases.size();
+    out->exec_graph                   = ctx->exec_graph != nullptr;
+    out->active_valid                 = ctx->active_exec_graph.valid;
+    out->rerecord                     = ctx->moe_graph_rerecord;
+    out->moe_graphs_disabled          = ctx->moe_graphs_disabled;
+    out->optional_layout_epoch        = ctx->optional_layout_epoch;
+    out->global_optional_layout_epoch = g_ggml_sycl_optional_layout_epoch.load(std::memory_order_acquire);
+    out->n_segments                   = ctx->moe_segments.size();
+    out->n_ids                        = ggml_sycl_seg_seam_ids(ctx->moe_segments, out->ids);
+    return true;
+}
+#    endif
+
 static bool moe_graph_retention_retire_exact(ggml_backend_sycl_context * ctx) {
+#    if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (ggml_sycl_seg_seam_retire_fails()) {
+        return false;  // the retire seam fails every call while armed (§7 C4, the stale-vectors case)
+    }
+#    endif
     if (!ctx || ctx->moe_retention_epoch.epoch.value == 0) {
         return true;
     }
@@ -112457,6 +112629,9 @@ struct moe_segmented_dispatch_scope {
 // the host-only tests and their fail-closed mutant score, so this path cannot drift from what they check. The device's
 // dispatch counter line prints first when the host dispatch is on (§4.4 "The dispatch counter").
 static void ggml_sycl_segment_forward_or_throw(ggml_backend_sycl_context & ctx, ggml_tensor * node, const char * role) {
+#    if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    ggml_sycl_seg_seam_refuse(ctx, node, role);  // a refusal forced at the armed node (§7 C4)
+#    endif
     const bool                                     ok = ggml_sycl_compute_forward(ctx, node);
     const ggml_sycl::attn_host_dispatch_counters * counters =
         ggml_sycl_attn_host_dispatch_enabled() ? g_attn_host_dispatch_counters : nullptr;
@@ -112678,7 +112853,12 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
     // invalidate_moe_segments keeps the vectors and sets the disabled flag when its retire fails, because it will not
     // destroy an executable whose submission may be outstanding. Recording over them would destroy those executables in
     // the success path's move, and the failure handler below moves into vectors that must be empty: refuse here.
-    if (!sycl_ctx->moe_segments.empty() || !sycl_ctx->moe_dispatch_graphs.empty()) {
+    bool planted_no_record_guard = false;
+#    if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    ggml_sycl_seg_seam_note_record_entry(sycl_ctx);
+    planted_no_record_guard = scratch_test_mutant_on(scratch_test_mutant::SEG_RECORD_GUARD_REMOVED);
+#    endif
+    if (!planted_no_record_guard && (!sycl_ctx->moe_segments.empty() || !sycl_ctx->moe_dispatch_graphs.empty())) {
         GGML_LOG_WARN("[SYCL-SEG] record refused: the context still holds %zu segment(s) after a failed retire\n",
                       sycl_ctx->moe_segments.size());
         g_graph_diag_counters.seg_record_failures.fetch_add(1, std::memory_order_relaxed);
@@ -112802,6 +112982,11 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
 
         ~recorded_handover() {
             if (std::uncaught_exceptions() > uncaught) {
+#    if defined(GGML_SYCL_SCRATCH_MUTANTS)
+                if (scratch_test_mutant_on(scratch_test_mutant::SEG_LOCAL_UNWIND)) {
+                    return;
+                }
+#    endif
                 ctx->moe_segments        = std::move(segments);
                 ctx->moe_dispatch_graphs = std::move(moe_graphs);
                 ctx->moe_segments_valid  = false;
@@ -112928,6 +113113,10 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
                 if (seg.moe_after >= 0) {
                     ggml_tensor * moe_node = cgraph->nodes[seg.moe_after];
                     if (moe_node) {
+#    if defined(GGML_SYCL_SCRATCH_MUTANTS)
+                        ggml_sycl_seg_seam_note_recorded(seg_idx, seg.moe_after, segment_submitted,
+                                                         recording_node_index, recorded_segments);
+#    endif
                         ggml_sycl_segment_forward_or_throw(*sycl_ctx, moe_node, "moe_after of a recorded segment");
                         record_moe_dispatch_graph_if_identified(seg.moe_after, moe_node);
                     }
@@ -124555,6 +124744,12 @@ static void ggml_sycl_graph_compute_lazy_cancel_step(ggml_backend_sycl_context *
 // it, and the handler's other catch-alls are counted as they stand. With a live execution graph the whole cached state
 // goes; without one, only the segments the record function handed over.
 static void ggml_sycl_graph_compute_fallback_clear_graphs(ggml_backend_sycl_context * ctx) noexcept {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    ggml_sycl_seg_seam_sample(ctx, 2);  // s2: the step's entry (§7 C4)
+    if (scratch_test_mutant_on(scratch_test_mutant::SEG_CLEANUP_STEP_REMOVED)) {
+        return;
+    }
+#endif
     try {
         if (ctx->exec_graph || ctx->active_exec_graph.valid) {
             sycl_exec_graph_clear_active(ctx, "fallback-error");
@@ -124563,6 +124758,9 @@ static void ggml_sycl_graph_compute_fallback_clear_graphs(ggml_backend_sycl_cont
         }
     } catch (...) {
     }
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    ggml_sycl_seg_seam_sample(ctx, 3);  // s3: the step's exit
+#endif
 }
 
 static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,
@@ -124717,6 +124915,16 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         // quarantine, both queue waits, the scatter wait, the staging drain, the MMID recovery), then 5efe's cleanup
         // step, then the unpin and the execution release. Every executable it destroys is destroyed after a drain.
         auto * cleanup_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        ggml_sycl_seg_seam_sample(cleanup_ctx, 1);     // s1: the catch's first statement (§7 C4)
+        if (scratch_test_mutant_on(scratch_test_mutant::SEG_IMMEDIATE_RETURN)) {
+            ggml_sycl_graph_compute_exception_exit();  // graph_compute's exit hooks, not a step of this catch
+            return GGML_STATUS_FAILED;
+        }
+        if (cleanup_ctx && scratch_test_mutant_on(scratch_test_mutant::SEG_DESTROY_BEFORE_WAITS)) {
+            (void) cleanup_ctx->invalidate_moe_segments();
+        }
+#endif
         ggml_sycl_graph_compute_lazy_cancel_step(cleanup_ctx);
         try { ggml_sycl_cpu_tg_flush_pending(); } catch (...) {}
         if (cleanup_ctx) {

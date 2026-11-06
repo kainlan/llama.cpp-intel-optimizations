@@ -80,8 +80,16 @@ def function_body(text: str, signature_re: str) -> str:
     return balanced(text, text.index("{", hits[0].end()))
 
 
+# test-sycl-seg-refusal-cleanup's seams and planted faults sit in GGML_SYCL_SCRATCH_MUTANTS blocks, which the
+# production build compiles out (scratch-test-mutant.hpp): the contract reads the text without them. Not nested.
+SCRATCH_MUTANT_BLOCK = re.compile(
+    r"^[ \t]*#\s*if\s+defined\s*\(\s*GGML_SYCL_SCRATCH_MUTANTS\s*\)[^\n]*\n.*?^[ \t]*#\s*endif[^\n]*\n",
+    flags=re.DOTALL | re.MULTILINE,
+)
+
+
 def code() -> str:
-    return strip_comments((SYCL / "ggml-sycl.cpp").read_text())
+    return SCRATCH_MUTANT_BLOCK.sub("", strip_comments((SYCL / "ggml-sycl.cpp").read_text()))
 
 
 RECORD = r"static\s+bool\s+moe_graph_record_segments\s*\("
@@ -263,9 +271,10 @@ def test_the_two_readers_flag_a_reordered_print_and_a_helper_that_prints_its_own
 
 def test_the_record_function_refuses_a_context_that_still_holds_segments():
     body = function_body(code(), RECORD)
+    # A planted_* local may gate the guard: false outside the private fixtures (scratch-test-mutant.hpp).
     guard = re.search(
-        r"if\s*\(\s*!\s*sycl_ctx\s*->\s*moe_segments\s*\.\s*empty\s*\(\s*\)\s*\|\|\s*"
-        r"!\s*sycl_ctx\s*->\s*moe_dispatch_graphs\s*\.\s*empty\s*\(\s*\)\s*\)\s*\{(.*?)return\s+false\s*;",
+        r"if\s*\(\s*(?:!\s*planted_\w+\s*&&\s*\(\s*)?!\s*sycl_ctx\s*->\s*moe_segments\s*\.\s*empty\s*\(\s*\)\s*\|\|\s*"
+        r"!\s*sycl_ctx\s*->\s*moe_dispatch_graphs\s*\.\s*empty\s*\(\s*\)\s*\)\s*\)?\s*\{(.*?)return\s+false\s*;",
         body,
         flags=re.DOTALL,
     )

@@ -14,6 +14,10 @@ sycl = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 getrows = (root / "ggml/src/ggml-sycl/getrows.cpp").read_text()
 module_test = (root / "tests/test-sycl-module-dependencies.py").read_text()
 recorder_scope = (root / "ggml/src/ggml-sycl/graph-recorder-scope.hpp").read_text()
+SCRATCH_MUTANT_BLOCK = re.compile(
+    r"^[ \t]*#\s*if\s+defined\s*\(\s*GGML_SYCL_SCRATCH_MUTANTS\s*\)[^\n]*\n.*?^[ \t]*#\s*endif[^\n]*\n",
+    flags=re.DOTALL | re.MULTILINE,
+)
 
 # DL preprocessing reaches the throw and excludes the CPU implementation call.
 with gate("the DL get_rows fallback throws before the #else that holds the CPU implementation call"):
@@ -103,8 +107,9 @@ with gate("tensor_storage_restore_guard restores in a noexcept destructor"):
 # transient leases, and clears active/deferred state before FAILED.
 with gate("the fallback boundary cleanup drains, unpins and clears state before returning FAILED"):
     catch = sycl.index("catch (const ggml_sycl_fallback_error & error)")
-    failed = sycl.index("return GGML_STATUS_FAILED", catch)
-    cleanup = sycl[catch:failed]
+    # A planted mutant's early return is not the production order this gate reads.
+    production = SCRATCH_MUTANT_BLOCK.sub("", sycl[catch:])
+    cleanup = production[:production.index("return GGML_STATUS_FAILED")]
     for token in ("ggml_sycl_cpu_tg_flush_pending", "last_graph_event->wait_and_throw", "stream()->wait_and_throw",
                   "flush_pending_secondary_scatter", "ggml_sycl_cpu_staging_drain",
                   "graph_unpin_transient_leases_after_direct_execution",

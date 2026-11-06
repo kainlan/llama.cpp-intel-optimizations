@@ -8,8 +8,9 @@
 #define GGML_SYCL_SCRATCH_TEST_MUTANT_HPP
 
 // The planted faults of the SCRATCH return's three device REDs (docs/design/sycl-mmap-host-tier.md §7 C4:
-// test-sycl-scratch-trial-return, test-sycl-configure-refusal, test-sycl-scratch-owner-end) and of the file-mapped
-// tier's (§5.3, §7 C4: test-sycl-file-mapped-stream-refusal). Each fault sits at its site in the pinned pool, the
+// test-sycl-scratch-trial-return, test-sycl-configure-refusal, test-sycl-scratch-owner-end), of the file-mapped
+// tier's (§5.3, §7 C4: test-sycl-file-mapped-stream-refusal) and of the segmented record's refusal cleanup (§4.4,
+// §7 C4: test-sycl-seg-refusal-cleanup). Each fault sits at its site in the pinned pool, the
 // unified cache or the backend, under `#if defined(GGML_SYCL_SCRATCH_MUTANTS)`, and is taken only when a device test
 // has switched it on. It either runs a block beside the production statement it perturbs, just before or just after it,
 // or sets a planted_* local that the statement reads; such a local is false whenever GGML_SYCL_SCRATCH_MUTANTS is
@@ -65,7 +66,13 @@ enum class scratch_test_mutant : int {
     OWNER_END_REMOVED         = 30,  // ggml_backend_sycl_free makes no owner-end call
     // The file-mapped tier.
     REFUSAL_AFTER_COPY_FN     = 31,  // stream_dma tests a custom copy_fn before the FILE_MAPPED refusal
-    COUNT                     = 32,
+    // The segmented record's refusal cleanup.
+    SEG_CLEANUP_STEP_REMOVED  = 32,  // graph_compute's fallback catch skips its cleanup step
+    SEG_LOCAL_UNWIND          = 33,  // the record function's handover moves nothing: the unwind destroys the graphs
+    SEG_DESTROY_BEFORE_WAITS  = 34,  // the fallback catch destroys the handed-over graphs before its waits
+    SEG_RECORD_GUARD_REMOVED  = 35,  // the record function records over a context that still holds segments
+    SEG_IMMEDIATE_RETURN      = 36,  // the fallback catch returns FAILED before any of its steps
+    COUNT                     = 37,
 };
 
 #if defined(GGML_SYCL_SCRATCH_MUTANTS)

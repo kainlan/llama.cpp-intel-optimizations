@@ -92,6 +92,11 @@ inline const std::vector<mutant_name> & mutant_names() {
         { "keep-walks-set",            scratch_test_mutant::KEEP_WALKS_SET            },
         { "owner-end-removed",         scratch_test_mutant::OWNER_END_REMOVED         },
         { "refusal-after-copy-fn",     scratch_test_mutant::REFUSAL_AFTER_COPY_FN     },
+        { "seg-cleanup-step-removed",  scratch_test_mutant::SEG_CLEANUP_STEP_REMOVED  },
+        { "seg-local-unwind",          scratch_test_mutant::SEG_LOCAL_UNWIND          },
+        { "seg-destroy-before-waits",  scratch_test_mutant::SEG_DESTROY_BEFORE_WAITS  },
+        { "seg-record-guard-removed",  scratch_test_mutant::SEG_RECORD_GUARD_REMOVED  },
+        { "seg-immediate-return",      scratch_test_mutant::SEG_IMMEDIATE_RETURN      },
     };
     return names;
 }
