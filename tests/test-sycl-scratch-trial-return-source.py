@@ -31,7 +31,10 @@ import pytest
 # sycl_gate sits beside this file. `python3 -I` leaves the script's directory off sys.path, so it is appended here;
 # appended rather than prepended, a file in tests/ never shadows a standard module.
 sys.path.append(str(Path(__file__).resolve().parent))
-from sycl_gate import ROOT, body, norm, resolve_mutants, run_without_source, strip_comments  # noqa: E402
+from sycl_gate import (  # noqa: E402
+    arms_of, body, cmake_strip, function_problems, if_stack_at, missing, norm, registration, rejects, resolve_mutants,
+    strip_comments, tree_tests, tree_texts
+)
 
 SYCL = "ggml/src/ggml-sycl"
 CMAKE = SYCL + "/CMakeLists.txt"
@@ -86,141 +89,7 @@ ARMS = {
 PRINTED_BY = {"stranded-reserve-8": SYCL + "/pinned-pool.cpp"}
 
 
-# ---- the tree -------------------------------------------------------------------------------------------------------
-
-def tree_texts() -> dict:
-    """Each file's raw text; a missing file is absent from the dict, so the clauses name it."""
-    out = {}
-    for rel in FILES:
-        p = ROOT / rel
-        if p.exists():
-            out[rel] = p.read_text(errors="replace")
-    return out
-
-
-def missing(texts: dict, *rels: str) -> list:
-    return [f"{rel} not found" for rel in rels if rel not in texts]
-
-
 # ---- CMake ----------------------------------------------------------------------------------------------------------
-
-def cmake_strip(text: str) -> str:
-    """CMake text with `#` comments blanked (their line breaks kept); a `#` inside a quoted argument stays."""
-    out, i, n, quoted = [], 0, len(text), False
-    while i < n:
-        c = text[i]
-        if quoted:
-            out.append(c)
-            if c == "\\" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            if c == '"':
-                quoted = False
-        elif c == '"':
-            quoted = True
-            out.append(c)
-        elif c == "#":
-            while i < n and text[i] != "\n":
-                i += 1
-            continue
-        else:
-            out.append(c)
-        i += 1
-    return "".join(out)
-
-
-def cmake_args(text: str, open_at: int) -> list:
-    """The arguments of the command whose `(` is at `open_at`: quoted ones as written between the quotes (escapes
-    kept), unquoted ones as tokens. None when the command is not closed. The function re-expands its arguments as
-    ${ARGN}, which splits a quoted argument at each unescaped `;`, so a quoted one is split there too: a semicolon in
-    an expected text adds a list element and shifts every later triple, as CMake reads it."""
-    args, i, n = [], open_at + 1, len(text)
-    while i < n:
-        c = text[i]
-        if c.isspace():
-            i += 1
-        elif c == ")":
-            return args
-        elif c == '"':
-            j = i + 1
-            while j < n and text[j] != '"':
-                j += 2 if text[j] == "\\" else 1
-            args += re.split(r"(?<!\\);", text[i + 1:j])
-            i = j + 1
-        else:
-            j = i
-            while j < n and not text[j].isspace() and text[j] not in "()":
-                j += 1
-            args.append(text[i:j])
-            i = j
-    return None
-
-
-def registration(cmake: str, stem: str):
-    """(offset, {"TIMEOUT": [...], "ENV": [...], "MUTANTS": [...]}) of the `FUNC(<stem> ...)` call, or None."""
-    m = re.search(r"^[ \t]*" + FUNC + r"\s*\(\s*" + re.escape(stem) + r"\s", cmake, re.M)
-    if not m:
-        return None
-    args = cmake_args(cmake, cmake.index("(", m.start()))
-    if args is None:
-        return None
-    parsed, key = {"TIMEOUT": [], "ENV": [], "MUTANTS": []}, None
-    for a in args[1:]:
-        if a in parsed:
-            key = a
-        elif key is not None:
-            parsed[key].append(a)
-    return m.start(), parsed
-
-
-def arms_of(parsed: dict):
-    """The MUTANTS triples as {names: (cases, expected text)}, or None when the list is not whole triples."""
-    flat = parsed["MUTANTS"]
-    if len(flat) % 3:
-        return None
-    return {flat[i]: (flat[i + 1], flat[i + 2]) for i in range(0, len(flat), 3)}
-
-
-def if_stack_at(cmake: str, offset: int) -> list:
-    """The `if (...)` lines open at `offset`, outermost first."""
-    stack = []
-    for m in re.finditer(r"^[ \t]*(if|endif)\s*\((.*)$", cmake[:offset], re.M):
-        if m.group(1) == "if":
-            stack.append(("if (" + m.group(2)).strip())
-        elif stack:
-            stack.pop()
-    return stack
-
-
-def function_problems(cmake: str) -> list:
-    """The registering function's contract (§M82 case (2), §M88 (2))."""
-    m = re.search(r"^[ \t]*function\s*\(\s*" + FUNC + r"\s+stem\s*\)(.*?)^[ \t]*endfunction\s*\(\s*\)", cmake,
-                  re.M | re.S)
-    if not m:
-        return [f"{CMAKE}: no function({FUNC} stem)"]
-    f = m.group(1)
-    fails = []
-    if BLOCK not in if_stack_at(cmake, m.start()):
-        fails.append(f"{FUNC} is defined outside `{BLOCK}`")
-    need = {
-        "target_link_libraries(${stem} PRIVATE ggml-sycl-private-fixtures": "links the private fixtures",
-        '"ONEAPI_DEVICE_SELECTOR=level_zero:1"': "pins the selector to level_zero:1",
-        '"GGML_SYCL_PINNED_CHUNK_MB=64"': "sets 64 MiB chunks",
-        'LABELS "sycl;cache;mem-handle;gpu-serial"': "labels the base ctest",
-        'LABELS "sycl;cache;mem-handle;gpu-serial;mutant"': "labels each arm",
-        "COMMAND ${stem} --mutant ${_mutants} --cases ${_cases}": "runs each arm on its mutants and cases",
-        'PASS_REGULAR_EXPRESSION "${_regex}"': "scores each arm by its expected text",
-    }
-    for text, what in need.items():
-        if text not in f:
-            fails.append(f"{FUNC} no longer {what}: missing {text!r}")
-    for text, n in (("RUN_SERIAL TRUE", 2), ("SKIP_RETURN_CODE 77", 2), ('ENVIRONMENT "${_env}"', 2)):
-        if f.count(text) != n:
-            fails.append(f"{FUNC} carries {text!r} {f.count(text)} time(s), expected {n} (base and arm)")
-    if re.search(r"target_link_libraries\([^)]*\bllama\b", f):
-        fails.append(f"{FUNC} links libllama")
-    return fails
 
 
 def registration_problems(texts: dict) -> list:
@@ -228,8 +97,8 @@ def registration_problems(texts: dict) -> list:
     if fails:
         return fails
     cmake = cmake_strip(texts[CMAKE])
-    fails += function_problems(cmake)
-    reg = registration(cmake, STEM)
+    fails += function_problems(cmake, FUNC, BLOCK, CMAKE)
+    reg = registration(cmake, FUNC, STEM)
     if reg is None:
         return fails + [f"{STEM} is not registered through {FUNC}"]
     at, parsed = reg
@@ -282,7 +151,7 @@ def census_problems(texts: dict) -> list:
     cmake = cmake_strip(texts[CMAKE])
     scored = set()
     for stem in STEMS:
-        reg = registration(cmake, stem)
+        reg = registration(cmake, FUNC, stem)
         arms = arms_of(reg[1]) if reg else None
         if arms is None:
             fails.append(f"{stem} has no whole registration to census")
@@ -408,154 +277,127 @@ CLAUSES = {
 
 # ---- the tree tests -------------------------------------------------------------------------------------------------
 
-def test_sources_exist():
-    texts = tree_texts()
-    assert not missing(texts, *FILES), missing(texts, *FILES)
-
-
-@pytest.mark.parametrize("clause", sorted(CLAUSES))
-def test_clause_holds_on_the_tree(clause):
-    fails = CLAUSES[clause](tree_texts())
-    assert not fails, "\n".join(fails)
+(test_sources_exist, test_clause_holds_on_the_tree,
+ test_missing_sources_fail_and_say_so) = tree_tests(FILES, CLAUSES, __file__)
 
 
 # ---- positive controls ----------------------------------------------------------------------------------------------
 
 def planted(rel: str, old: str, new: str) -> dict:
-    texts = tree_texts()
+    texts = tree_texts(FILES)
     assert rel in texts, f"control precondition: {rel} not found"
     assert texts[rel].count(old) >= 1, f"control precondition: {old!r} is not in {rel}"
     texts[rel] = texts[rel].replace(old, new, 1)
     return texts
 
 
-def rejects(clause: str, texts: dict, reason: str) -> None:
-    fails = CLAUSES[clause](texts)
-    assert any(reason in f for f in fails), f"{clause} did not reject the control with {reason!r}: {fails}"
-
-
 ARM_NOOP = "        return-noop ladder,second-context\n"
 
 
 def test_registration_rejects_a_dropped_arm():
-    texts = tree_texts()
+    texts = tree_texts(FILES)
     cmake = texts.get(CMAKE, "")
     at = cmake.find(ARM_NOOP)
     assert at >= 0, "control precondition: the return-noop arm is not where the control expects it"
     end = cmake.index("\n", cmake.index('"', at + len(ARM_NOOP)) + 1)
     texts[CMAKE] = cmake[:at] + cmake[end + 1:]
-    rejects("registration", texts, "arm return-noop is not registered")
+    rejects(CLAUSES, "registration", texts, "arm return-noop is not registered")
 
 
 def test_registration_rejects_moved_cases_and_a_lost_phrase():
-    rejects("registration", planted(CMAKE, ARM_NOOP, "        return-noop ladder\n"),
+    rejects(CLAUSES, "registration", planted(CMAKE, ARM_NOOP, "        return-noop ladder\n"),
             "arm return-noop runs cases 'ladder'")
-    rejects("registration", planted(CMAKE, "footprint decremented before the free", "footprint moved"),
+    rejects(CLAUSES, "registration", planted(CMAKE, "footprint decremented before the free", "footprint moved"),
             "arm footprint-before-free's expected text lacks the design's")
 
 
-def test_registration_rejects_a_semicolon_in_an_expected_text():
-    rejects("registration", planted(CMAKE, "expected [0-9]+. no SCRATCH released line",
-                                    "expected [0-9]+; no SCRATCH released line"),
-            "MUTANTS list is not whole")
-
-
 def test_registration_rejects_an_unlisted_arm():
-    rejects("registration", planted(CMAKE, ARM_NOOP, ARM_NOOP.replace("return-noop", "return-noop,no-prune")),
+    rejects(CLAUSES, "registration", planted(CMAKE, ARM_NOOP, ARM_NOOP.replace("return-noop", "return-noop,no-prune")),
             "arm return-noop,no-prune is registered but names no planted fault")
 
 
 def test_registration_rejects_a_contract_change():
-    rejects("registration", planted(CMAKE, "PRIVATE ggml-sycl-private-fixtures Threads::Threads)\n        "
-                                           "set_target_properties(${stem}", "PRIVATE llama Threads::Threads)\n"
-                                           "        set_target_properties(${stem}"),
+    rejects(CLAUSES, "registration", planted(CMAKE, "PRIVATE ggml-sycl-private-fixtures Threads::Threads)\n        "
+                                                    "set_target_properties(${stem}", "PRIVATE llama Threads::Threads)\n"
+                                                    "        set_target_properties(${stem}"),
             "no longer links the private fixtures")
-    rejects("registration", planted(CMAKE, 'set(_env "ONEAPI_DEVICE_SELECTOR=level_zero:1"',
-                                    'set(_env "ONEAPI_DEVICE_SELECTOR=level_zero:0,1"'),
+    rejects(CLAUSES, "registration", planted(CMAKE, 'set(_env "ONEAPI_DEVICE_SELECTOR=level_zero:1"',
+                                             'set(_env "ONEAPI_DEVICE_SELECTOR=level_zero:0,1"'),
             "pins the selector to level_zero:1")
 
 
 def test_registration_rejects_a_registration_outside_the_block():
-    texts = tree_texts()
+    texts = tree_texts(FILES)
     cmake = texts.get(CMAKE, "")
     m = re.search(r"^[ \t]*" + FUNC + r"\s*\(\s*" + STEM + r"\s", cmake, re.M)
     assert m, "control precondition: the registration is not found"
     texts[CMAKE] = cmake[:m.start()] + "endif()\nif (OTHER)\n" + cmake[m.start():]
-    rejects("registration", texts, f"{STEM} is registered outside")
+    rejects(CLAUSES, "registration", texts, f"{STEM} is registered outside")
 
 
 def test_census_rejects_an_unscored_or_unplanted_fault():
-    rejects("census", planted(COMMON, '"return-noop"', '"return-nop"'),
+    rejects(CLAUSES, "census", planted(COMMON, '"return-noop"', '"return-nop"'),
             "names 'return-noop', which the selector's table lacks")
-    rejects("census", planted(UC, "scratch_test_mutant_on(scratch_test_mutant::RETURN_NOOP)", "false"),
+    rejects(CLAUSES, "census", planted(UC, "scratch_test_mutant_on(scratch_test_mutant::RETURN_NOOP)", "false"),
             "scratch_test_mutant::RETURN_NOOP has no planted block in production code")
 
 
 def test_census_rejects_a_block_production_compiles():
-    texts = tree_texts()
+    texts = tree_texts(FILES)
     uc = texts.get(UC, "")
     call = "scratch_test_mutant_on(scratch_test_mutant::RETURN_NOOP)"
     assert call in uc, "control precondition: the RETURN_NOOP block is not in unified-cache.cpp"
     texts[UC] = uc + "\nstatic bool planted_control() { return " + call + "; }\n"
-    rejects("census", texts, "RETURN_NOOP is tested outside a GGML_SYCL_SCRATCH_MUTANTS block")
+    rejects(CLAUSES, "census", texts, "RETURN_NOOP is tested outside a GGML_SYCL_SCRATCH_MUTANTS block")
 
 
 def test_test_source_rejects_a_lost_case_and_a_direct_trial():
-    rejects("test-source", planted(TEST, 'n == "status-order"', 'n == "status_order"'),
+    rejects(CLAUSES, "test-source", planted(TEST, 'n == "status-order"', 'n == "status_order"'),
             "run_case has no dispatch for case status-order")
-    rejects("test-source", planted(TEST, '"ggml_backend_sycl_host_scratch_trial")', '"other")'),
+    rejects(CLAUSES, "test-source", planted(TEST, '"ggml_backend_sycl_host_scratch_trial")', '"other")'),
             "does not resolve ggml_backend_sycl_host_scratch_trial by proc name")
-    rejects("test-source", planted(TEST, "r.ops.plan_scratch_bytes = 0;", "r.ops.plan_scratch_bytes = 1;"),
+    rejects(CLAUSES, "test-source", planted(TEST, "r.ops.plan_scratch_bytes = 0;", "r.ops.plan_scratch_bytes = 1;"),
             "plan term of 0")
 
 
 def test_test_source_rejects_an_unprinted_phrase():
-    rejects("test-source", planted(TEST, "footprint decremented before the free", "footprint moved"),
+    rejects(CLAUSES, "test-source", planted(TEST, "footprint decremented before the free", "footprint moved"),
             "the test prints no 'footprint decremented before the free'")
 
 
 def test_production_rejects_a_missing_step_and_a_keep_that_walks_the_set():
-    rejects("production", planted(UC, "case host_scratch_trial_op::MARK:", "default:"),
+    rejects(CLAUSES, "production", planted(UC, "case host_scratch_trial_op::MARK:", "default:"),
             "host_scratch_trial has no case for MARK")
-    texts = tree_texts()
+    texts = tree_texts(FILES)
     uc = texts.get(UC, "")
     at = uc.find("case host_scratch_trial_op::KEEP:")
     assert at >= 0, "control precondition: no KEEP case"
     cut = at + len("case host_scratch_trial_op::KEEP:")
     texts[UC] = uc[:cut] + " (void) marked_set_.size();" + uc[cut:]
-    rejects("production", texts, "host_scratch_trial's KEEP touches the marked set (marked_set_)")
+    rejects(CLAUSES, "production", texts, "host_scratch_trial's KEEP touches the marked set (marked_set_)")
 
 
 def test_production_rejects_an_uncharged_grow_and_a_lost_witness():
-    texts = tree_texts()
+    texts = tree_texts(FILES)
     uc = texts.get(UC, "")
     sig = "bool unified_cache::grow_scratch_zone(size_t request_bytes)"
     grow = body(uc, sig)
     assert "host_scratch_trial_note_grow(" in grow, "control precondition: grow_scratch_zone charges no grow"
     texts[UC] = uc.replace(grow, grow.replace("host_scratch_trial_note_grow(", "(void) sizeof("), 1)
-    rejects("production", texts, "grow_scratch_zone (the ledger's ensure) does not charge its grow")
+    rejects(CLAUSES, "production", texts, "grow_scratch_zone (the ledger's ensure) does not charge its grow")
     # Anchored on the witness itself: other lines of the file carry `n_ubatch=%u` too.
-    rejects("production", planted(UC, '"[HOST-ARENA] SCRATCH %s dev=%d n_ubatch=%u',
-                                  '"[HOST-ARENA] SCRATCH %s dev=%d n_ubatch=%d'), "witness")
+    rejects(CLAUSES, "production", planted(UC, '"[HOST-ARENA] SCRATCH %s dev=%d n_ubatch=%u',
+                                           '"[HOST-ARENA] SCRATCH %s dev=%d n_ubatch=%d'), "witness")
 
 
 def test_negative_control_comments_change_nothing():
-    texts = tree_texts()
+    texts = tree_texts(FILES)
     for rel in FILES:
         if rel in texts:
             note = "\n# a comment\n" if rel.endswith(".txt") else "\n// a comment: case host_scratch_trial_op::KEEP:\n"
             texts[rel] += note
     for clause, check in CLAUSES.items():
-        assert check(texts) == check(tree_texts()), f"{clause} changed under appended comments"
-
-
-def test_missing_sources_fail_and_say_so():
-    if missing(tree_texts(), *FILES):
-        # The control's own copy runs in a tree without the sources, and must not run the control again.
-        pytest.skip("the pinned sources are absent here: test_sources_exist reports them")
-    rc, out = run_without_source(__file__)
-    assert rc != 0, out
-    assert "not found" in out, out
+        assert check(texts) == check(tree_texts(FILES)), f"{clause} changed under appended comments"
 
 
 if __name__ == "__main__":

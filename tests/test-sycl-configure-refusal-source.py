@@ -31,7 +31,10 @@ import pytest
 # sycl_gate sits beside this file. `python3 -I` leaves the script's directory off sys.path, so it is appended here;
 # appended rather than prepended, a file in tests/ never shadows a standard module.
 sys.path.append(str(Path(__file__).resolve().parent))
-from sycl_gate import ROOT, body, norm, ordered, resolve_mutants, run_without_source  # noqa: E402
+from sycl_gate import (  # noqa: E402
+    arms_of, body, cmake_strip, function_problems, if_stack_at, missing, norm, ordered, registration, rejects,
+    resolve_mutants, tree_tests, tree_texts
+)
 
 SYCL = "ggml/src/ggml-sycl"
 CMAKE = SYCL + "/CMakeLists.txt"
@@ -64,143 +67,7 @@ POOL_REFUSED = "configure_zones refused: chunk"
 CARRIER_LINE = "released_chunk outstanding at pool destruction"
 
 
-# ---- the tree -------------------------------------------------------------------------------------------------------
-
-def tree_texts() -> dict:
-    """Each file's raw text; a missing file is absent from the dict, so the clauses name it."""
-    out = {}
-    for rel in FILES:
-        p = ROOT / rel
-        if p.exists():
-            out[rel] = p.read_text(errors="replace")
-    return out
-
-
-def missing(texts: dict, *rels: str) -> list:
-    return [f"{rel} not found" for rel in rels if rel not in texts]
-
-
 # ---- CMake ----------------------------------------------------------------------------------------------------------
-
-def cmake_strip(text: str) -> str:
-    """CMake text with `#` comments blanked (their line breaks kept); a `#` inside a quoted argument stays."""
-    out, i, n, quoted = [], 0, len(text), False
-    while i < n:
-        c = text[i]
-        if quoted:
-            out.append(c)
-            if c == "\\" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            if c == '"':
-                quoted = False
-        elif c == '"':
-            quoted = True
-            out.append(c)
-        elif c == "#":
-            while i < n and text[i] != "\n":
-                i += 1
-            continue
-        else:
-            out.append(c)
-        i += 1
-    return "".join(out)
-
-
-def cmake_args(text: str, open_at: int) -> list:
-    """The arguments of the command whose `(` is at `open_at`: quoted ones as written between the quotes (escapes
-    kept), unquoted ones as tokens. None when the command is not closed. The function re-expands its arguments as
-    ${ARGN}, which splits a quoted argument at each unescaped `;`, so a quoted one is split there too: a semicolon in
-    an expected text adds a list element and shifts every later triple, as CMake reads it."""
-    args, i, n = [], open_at + 1, len(text)
-    while i < n:
-        c = text[i]
-        if c.isspace():
-            i += 1
-        elif c == ")":
-            return args
-        elif c == '"':
-            j = i + 1
-            while j < n and text[j] != '"':
-                j += 2 if text[j] == "\\" else 1
-            args += re.split(r"(?<!\\);", text[i + 1:j])
-            i = j + 1
-        else:
-            j = i
-            while j < n and not text[j].isspace() and text[j] not in "()":
-                j += 1
-            args.append(text[i:j])
-            i = j
-    return None
-
-
-def registration(cmake: str, stem: str):
-    """(offset, {"TIMEOUT": [...], "ENV": [...], "MUTANTS": [...]}) of the `FUNC(<stem> ...)` call, or None."""
-    m = re.search(r"^[ \t]*" + FUNC + r"\s*\(\s*" + re.escape(stem) + r"\s", cmake, re.M)
-    if not m:
-        return None
-    args = cmake_args(cmake, cmake.index("(", m.start()))
-    if args is None:
-        return None
-    parsed, key = {"TIMEOUT": [], "ENV": [], "MUTANTS": []}, None
-    for a in args[1:]:
-        if a in parsed:
-            key = a
-        elif key is not None:
-            parsed[key].append(a)
-    return m.start(), parsed
-
-
-def arms_of(parsed: dict):
-    """The MUTANTS triples as {names: (cases, expected text)}, or None when the list is not whole triples."""
-    flat = parsed["MUTANTS"]
-    if len(flat) % 3:
-        return None
-    return {flat[i]: (flat[i + 1], flat[i + 2]) for i in range(0, len(flat), 3)}
-
-
-def if_stack_at(cmake: str, offset: int) -> list:
-    """The `if (...)` lines open at `offset`, outermost first."""
-    stack = []
-    for m in re.finditer(r"^[ \t]*(if|endif)\s*\((.*)$", cmake[:offset], re.M):
-        if m.group(1) == "if":
-            stack.append(("if (" + m.group(2)).strip())
-        elif stack:
-            stack.pop()
-    return stack
-
-
-def function_problems(cmake: str) -> list:
-    """The registering function's contract (§M82 case (2), §M88 (2))."""
-    m = re.search(r"^[ \t]*function\s*\(\s*" + FUNC + r"\s+stem\s*\)(.*?)^[ \t]*endfunction\s*\(\s*\)", cmake,
-                  re.M | re.S)
-    if not m:
-        return [f"{CMAKE}: no function({FUNC} stem)"]
-    f = m.group(1)
-    fails = []
-    if BLOCK not in if_stack_at(cmake, m.start()):
-        fails.append(f"{FUNC} is defined outside `{BLOCK}`")
-    need = {
-        "target_link_libraries(${stem} PRIVATE ggml-sycl-private-fixtures": "links the private fixtures",
-        '"ONEAPI_DEVICE_SELECTOR=level_zero:1"': "pins the selector to level_zero:1",
-        '"GGML_SYCL_PINNED_CHUNK_MB=64"': "sets 64 MiB chunks",
-        'LABELS "sycl;cache;mem-handle;gpu-serial"': "labels the base ctest",
-        'LABELS "sycl;cache;mem-handle;gpu-serial;mutant"': "labels each arm",
-        "COMMAND ${stem} --mutant ${_mutants} --cases ${_cases}": "runs each arm on its mutants and cases",
-        'PASS_REGULAR_EXPRESSION "${_regex}"': "scores each arm by its expected text",
-    }
-    for text, what in need.items():
-        if text not in f:
-            fails.append(f"{FUNC} no longer {what}: missing {text!r}")
-    for text, n in (("RUN_SERIAL TRUE", 2), ("SKIP_RETURN_CODE 77", 2), ('ENVIRONMENT "${_env}"', 2)):
-        if f.count(text) != n:
-            fails.append(f"{FUNC} carries {text!r} {f.count(text)} time(s), expected {n} (base and arm)")
-    if re.search(r"target_link_libraries\([^)]*\bllama\b", f):
-        fails.append(f"{FUNC} links libllama")
-    return fails
-
-
 
 
 def registration_problems(texts: dict) -> list:
@@ -208,8 +75,8 @@ def registration_problems(texts: dict) -> list:
     if fails:
         return fails
     cmake = cmake_strip(texts[CMAKE])
-    fails += function_problems(cmake)
-    reg = registration(cmake, STEM)
+    fails += function_problems(cmake, FUNC, BLOCK, CMAKE)
+    reg = registration(cmake, FUNC, STEM)
     if reg is None:
         return fails + [f"{STEM} is not registered through {FUNC}"]
     at, parsed = reg
@@ -361,111 +228,86 @@ CLAUSES = {
 
 # ---- the tree tests -------------------------------------------------------------------------------------------------
 
-def test_sources_exist():
-    texts = tree_texts()
-    assert not missing(texts, *FILES), missing(texts, *FILES)
-
-
-@pytest.mark.parametrize("clause", sorted(CLAUSES))
-def test_clause_holds_on_the_tree(clause):
-    fails = CLAUSES[clause](tree_texts())
-    assert not fails, "\n".join(fails)
+(test_sources_exist, test_clause_holds_on_the_tree,
+ test_missing_sources_fail_and_say_so) = tree_tests(FILES, CLAUSES, __file__)
 
 
 # ---- positive controls ----------------------------------------------------------------------------------------------
 
 def planted(rel: str, old: str, new: str) -> dict:
-    texts = tree_texts()
+    texts = tree_texts(FILES)
     assert rel in texts, f"control precondition: {rel} not found"
     assert texts[rel].count(old) >= 1, f"control precondition: {old!r} is not in {rel}"
     texts[rel] = texts[rel].replace(old, new, 1)
     return texts
 
 
-def rejects(clause: str, texts: dict, reason: str) -> None:
-    fails = CLAUSES[clause](texts)
-    assert any(reason in f for f in fails), f"{clause} did not reject the control with {reason!r}: {fails}"
-
-
-def test_registration_rejects_a_semicolon_in_an_expected_text():
-    rejects("registration", planted(CMAKE, '"strict child exited [0-9]+, expected SIGABRT"',
-                                    '"strict child exited [0-9]+; expected SIGABRT"'),
-            "MUTANTS list is not whole")
-
-
 def test_registration_rejects_a_dropped_arm_and_an_unbounded_budget():
-    rejects("registration", planted(CMAKE, "        configure-direct-release plain\n",
-                                    "        configure-direct-release strict\n"),
+    rejects(CLAUSES, "registration", planted(CMAKE, "        configure-direct-release plain\n",
+                                             "        configure-direct-release strict\n"),
             "arm configure-direct-release runs children 'strict'")
-    rejects("registration", planted(CMAKE, 'ENV "GGML_SYCL_HOST_RESERVE_MB=1024"', ""),
+    rejects(CLAUSES, "registration", planted(CMAKE, 'ENV "GGML_SYCL_HOST_RESERVE_MB=1024"', ""),
             "does not bound the pinned budget")
-    rejects("registration", planted(CMAKE, 'ENV "GGML_SYCL_HOST_RESERVE_MB=1024"',
-                                    'ENV "GGML_SYCL_HOST_RESERVE_MB=262144"'),
+    rejects(CLAUSES, "registration", planted(CMAKE, 'ENV "GGML_SYCL_HOST_RESERVE_MB=1024"',
+                                             'ENV "GGML_SYCL_HOST_RESERVE_MB=262144"'),
             "does not bound the pinned budget")
-    rejects("registration", planted(CMAKE, "        strict-abort-dropped strict\n",
-                                    "        strict-abort-gone strict\n"),
+    rejects(CLAUSES, "registration", planted(CMAKE, "        strict-abort-dropped strict\n",
+                                             "        strict-abort-gone strict\n"),
             "arm strict-abort-dropped is not registered")
 
 
 def test_driver_rejects_a_setenv_and_a_device_in_the_driver():
-    rejects("driver", planted(TEST, "int child_plain(checks & c, const device_fixture & f) {",
-                              'int child_plain(checks & c, const device_fixture & f) {\n    setenv("X", "1", 1);'),
+    rejects(CLAUSES, "driver",
+            planted(TEST, "int child_plain(checks & c, const device_fixture & f) {",
+                    'int child_plain(checks & c, const device_fixture & f) {\n    setenv("X", "1", 1);'),
             "calls setenv")
-    rejects("driver", planted(TEST, "    // Every envp is built here, before any fork.",
-                              "    (void) ggml_backend_sycl_init(0);"),
+    rejects(CLAUSES, "driver", planted(TEST, "    // Every envp is built here, before any fork.",
+                                       "    (void) ggml_backend_sycl_init(0);"),
             "the driver touches a device: drive names ggml_backend_")
 
 
 def test_driver_rejects_a_late_rlimit_and_a_wrong_score():
-    rejects("driver", planted(TEST, "    if (!child_begin(a)) {\n        return 2;\n    }\n"
-                                    "    if (!entry_environment_ok(c)) {\n        return c.status();\n    }\n",
-                              "    if (!entry_environment_ok(c)) {\n        return c.status();\n    }\n"
-                              "    device_fixture early;\n    (void) device_fixture_open(c, early);\n"
-                              "    if (!child_begin(a)) {\n        return 2;\n    }\n"),
+    rejects(CLAUSES, "driver", planted(TEST, "    if (!child_begin(a)) {\n        return 2;\n    }\n"
+                                             "    if (!entry_environment_ok(c)) {\n        return c.status();\n    }\n",
+                                       "    if (!entry_environment_ok(c)) {\n        return c.status();\n    }\n"
+                                       "    device_fixture early;\n    (void) device_fixture_open(c, early);\n"
+                                       "    if (!child_begin(a)) {\n        return 2;\n    }\n"),
             "a child reaches a device before child_begin sets RLIMIT_CORE")
-    rejects("driver", planted(TEST, "v = score_abort(who, r, k_carrier_line);", "v = score_clean(who, r);"),
+    rejects(CLAUSES, "driver", planted(TEST, "v = score_abort(who, r, k_carrier_line);", "v = score_clean(who, r);"),
             "does not score strict and carrier by their abort lines")
-    rejects("driver", planted(TEST, '{ "GGML_SYCL_STRICT_LEASES=1", "GGML_NO_BACKTRACE=1" }',
-                              '{ "GGML_NO_BACKTRACE=1" }'),
+    rejects(CLAUSES, "driver", planted(TEST, '{ "GGML_SYCL_STRICT_LEASES=1", "GGML_NO_BACKTRACE=1" }',
+                                       '{ "GGML_NO_BACKTRACE=1" }'),
             "GGML_SYCL_STRICT_LEASES=1 is set 0 time(s)")
 
 
 def test_production_rejects_a_lost_abort_and_a_late_scan():
-    rejects("production", planted(UC, 'GGML_ABORT(\n                "[HOST-ARENA] configure_zones refused: a withdrawn '
-                                      'SCRATCH chunk survives "\n                "(GGML_SYCL_STRICT_LEASES=1)");', ";"),
+    rejects(CLAUSES, "production",
+            planted(UC, 'GGML_ABORT(\n                "[HOST-ARENA] configure_zones refused: a withdrawn '
+                        'SCRATCH chunk survives "\n                "(GGML_SYCL_STRICT_LEASES=1)");', ";"),
             "does not abort under ggml_sycl_strict_enabled()")
-    texts = tree_texts()
+    texts = tree_texts(FILES)
     pool = texts.get(POOL, "")
     at = pool.find("    const size_t total_zone_bytes = weight_bytes + kv_bytes + staging_bytes + scratch_bytes;")
     scan = pool.find("    for (const auto & states : zone_allocators_) {")
     assert 0 <= scan < at, "control precondition: the scan does not precede the zone sum"
     texts[POOL] = pool[:scan] + "    size_t total_zone_bytes = 0;\n" + pool[scan:]
-    rejects("production", texts, "before it computes the zones")
+    rejects(CLAUSES, "production", texts, "before it computes the zones")
 
 
 def test_production_rejects_a_reserved_write_in_the_refusal():
     strict = ('        if (ggml_sycl_strict_enabled()) {\n            GGML_ABORT(\n'
               '                "[HOST-ARENA] configure_zones refused')
-    rejects("production", planted(UC, strict, "        host_zone_reserved_bytes_.fill(0);\n" + strict),
+    rejects(CLAUSES, "production", planted(UC, strict, "        host_zone_reserved_bytes_.fill(0);\n" + strict),
             "refusal touches the reserved figures")
 
 
 def test_negative_control_comments_change_nothing():
-    texts = tree_texts()
+    texts = tree_texts(FILES)
     for rel in FILES:
         if rel in texts:
             texts[rel] += "\n# a comment\n" if rel.endswith(".txt") else "\n// a comment: setenv(\"X\", \"1\", 1);\n"
     for clause, check in CLAUSES.items():
-        assert check(texts) == check(tree_texts()), f"{clause} changed under appended comments"
-
-
-def test_missing_sources_fail_and_say_so():
-    if missing(tree_texts(), *FILES):
-        # The control's own copy runs in a tree without the sources, and must not run the control again.
-        pytest.skip("the pinned sources are absent here: test_sources_exist reports them")
-    rc, out = run_without_source(__file__)
-    assert rc != 0, out
-    assert "not found" in out, out
+        assert check(texts) == check(tree_texts(FILES)), f"{clause} changed under appended comments"
 
 
 if __name__ == "__main__":

@@ -25,13 +25,19 @@ the first forbidden text its region holds) as the message.
     assert claim_x(SYCL), first_missing(
         "file: region", region, ANCHOR_A, ANCHOR_B)
 
-Second, the text helpers for source-contract pins, at the end of the module:
+Second, the text helpers for source-contract pins, after the message helpers:
 ROOT (the repo root), strip_comments (source text with comments blanked, line
 breaks kept), norm (comment-stripped, whitespace-canonical text), read (a repo
 file's text, or empty when it is missing), body (the brace-balanced body of a
 definition), ordered (needles in order), mutate (a normalised text with one
 replacement, for positive controls) and resolve_mutants (source text with every
 `#if` over a MUTANT macro resolved as the production build compiles it).
+
+Third, last in the module, what the pins of the device REDs registered through one
+CMake function share: tree_texts and missing (the pinned files' texts, and the ones
+absent), the CMake reader (cmake_strip, cmake_args, registration, arms_of,
+if_stack_at), the registering function's contract (function_problems), rejects (a
+positive control's check) and tree_tests (the three tree tests each such pin binds).
 """
 import contextlib
 import linecache
@@ -373,3 +379,178 @@ def resolve_mutants(raw: str) -> str:
             continue
         out.append(line if active(stack) else "")
     return "\n".join(out)
+
+
+# ---- the pins of the device REDs one CMake function registers --------------------------------------------------------
+#
+# The SCRATCH return's three device REDs are registered through one function, with their planted faults as MUTANTS
+# triples, and each has a pin that reads that registration, the function's contract and the sources the test needs.
+# What the three pins share lives here, so a fix to the CMake reader or to the function's contract is made once: each
+# pin passes its own file list, function name, guarding block, CMake path and clause table.
+
+
+def tree_texts(files) -> dict:
+    """Each file's raw text; a missing file is absent from the dict, so the clauses name it."""
+    out = {}
+    for rel in files:
+        p = ROOT / rel
+        if p.exists():
+            out[rel] = p.read_text(errors="replace")
+    return out
+
+
+def missing(texts: dict, *rels: str) -> list:
+    return [f"{rel} not found" for rel in rels if rel not in texts]
+
+
+def cmake_strip(text: str) -> str:
+    """CMake text with `#` comments blanked (their line breaks kept); a `#` inside a quoted argument stays."""
+    out, i, n, quoted = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if quoted:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                quoted = False
+        elif c == '"':
+            quoted = True
+            out.append(c)
+        elif c == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def cmake_args(text: str, open_at: int) -> list:
+    """The arguments of the command whose `(` is at `open_at`: quoted ones as written between the quotes (escapes
+    kept), unquoted ones as tokens. None when the command is not closed. The function re-expands its arguments as
+    ${ARGN}, which splits a quoted argument at each unescaped `;`, so a quoted one is split there too: a semicolon in
+    an expected text adds a list element and shifts every later triple, as CMake reads it."""
+    args, i, n = [], open_at + 1, len(text)
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+        elif c == ")":
+            return args
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            args += re.split(r"(?<!\\);", text[i + 1:j])
+            i = j + 1
+        else:
+            j = i
+            while j < n and not text[j].isspace() and text[j] not in "()":
+                j += 1
+            args.append(text[i:j])
+            i = j
+    return None
+
+
+def registration(cmake: str, func: str, stem: str):
+    """(offset, {"TIMEOUT": [...], "ENV": [...], "MUTANTS": [...]}) of the `func(<stem> ...)` call, or None."""
+    m = re.search(r"^[ \t]*" + func + r"\s*\(\s*" + re.escape(stem) + r"\s", cmake, re.M)
+    if not m:
+        return None
+    args = cmake_args(cmake, cmake.index("(", m.start()))
+    if args is None:
+        return None
+    parsed, key = {"TIMEOUT": [], "ENV": [], "MUTANTS": []}, None
+    for a in args[1:]:
+        if a in parsed:
+            key = a
+        elif key is not None:
+            parsed[key].append(a)
+    return m.start(), parsed
+
+
+def arms_of(parsed: dict):
+    """The MUTANTS triples as {names: (cases, expected text)}, or None when the list is not whole triples."""
+    flat = parsed["MUTANTS"]
+    if len(flat) % 3:
+        return None
+    return {flat[i]: (flat[i + 1], flat[i + 2]) for i in range(0, len(flat), 3)}
+
+
+def if_stack_at(cmake: str, offset: int) -> list:
+    """The `if (...)` lines open at `offset`, outermost first."""
+    stack = []
+    for m in re.finditer(r"^[ \t]*(if|endif)\s*\((.*)$", cmake[:offset], re.M):
+        if m.group(1) == "if":
+            stack.append(("if (" + m.group(2)).strip())
+        elif stack:
+            stack.pop()
+    return stack
+
+
+def function_problems(cmake: str, func: str, block: str, cmake_rel: str) -> list:
+    """The contract of `func`, the function that registers the SCRATCH return's device REDs (§M82 case (2), §M88 (2)),
+    in the comment-stripped text of `cmake_rel`: defined inside `block`, linked against the private fixtures and never
+    libllama, pinned to one device and 64 MiB chunks, and every arm scored by its expected text."""
+    m = re.search(r"^[ \t]*function\s*\(\s*" + func + r"\s+stem\s*\)(.*?)^[ \t]*endfunction\s*\(\s*\)", cmake,
+                  re.M | re.S)
+    if not m:
+        return [f"{cmake_rel}: no function({func} stem)"]
+    f = m.group(1)
+    fails = []
+    if block not in if_stack_at(cmake, m.start()):
+        fails.append(f"{func} is defined outside `{block}`")
+    need = {
+        "target_link_libraries(${stem} PRIVATE ggml-sycl-private-fixtures": "links the private fixtures",
+        '"ONEAPI_DEVICE_SELECTOR=level_zero:1"': "pins the selector to level_zero:1",
+        '"GGML_SYCL_PINNED_CHUNK_MB=64"': "sets 64 MiB chunks",
+        'LABELS "sycl;cache;mem-handle;gpu-serial"': "labels the base ctest",
+        'LABELS "sycl;cache;mem-handle;gpu-serial;mutant"': "labels each arm",
+        "COMMAND ${stem} --mutant ${_mutants} --cases ${_cases}": "runs each arm on its mutants and cases",
+        'PASS_REGULAR_EXPRESSION "${_regex}"': "scores each arm by its expected text",
+    }
+    for text, what in need.items():
+        if text not in f:
+            fails.append(f"{func} no longer {what}: missing {text!r}")
+    for text, n in (("RUN_SERIAL TRUE", 2), ("SKIP_RETURN_CODE 77", 2), ('ENVIRONMENT "${_env}"', 2)):
+        if f.count(text) != n:
+            fails.append(f"{func} carries {text!r} {f.count(text)} time(s), expected {n} (base and arm)")
+    if re.search(r"target_link_libraries\([^)]*\bllama\b", f):
+        fails.append(f"{func} links libllama")
+    return fails
+
+
+def rejects(clauses: dict, clause: str, texts: dict, reason: str) -> None:
+    """A positive control: `clauses[clause]` must reject the planted `texts` with a message containing `reason`."""
+    fails = clauses[clause](texts)
+    assert any(reason in f for f in fails), f"{clause} did not reject the control with {reason!r}: {fails}"
+
+
+def tree_tests(files, clauses: dict, script: str):
+    """The three tests each such pin runs on its own tree, as (test_sources_exist, test_clause_holds_on_the_tree,
+    test_missing_sources_fail_and_say_so). The pin binds them under those names at module level, where pytest collects
+    them; `script` is the pin's own path, which the last test copies into a tree without the sources."""
+    import pytest  # here, not at the top: the script-style gates import this module and need no pytest
+
+    def test_sources_exist():
+        texts = tree_texts(files)
+        assert not missing(texts, *files), missing(texts, *files)
+
+    @pytest.mark.parametrize("clause", sorted(clauses))
+    def test_clause_holds_on_the_tree(clause):
+        fails = clauses[clause](tree_texts(files))
+        assert not fails, "\n".join(fails)
+
+    def test_missing_sources_fail_and_say_so():
+        if missing(tree_texts(files), *files):
+            # The control's own copy runs in a tree without the sources, and must not run the control again.
+            pytest.skip("the pinned sources are absent here: test_sources_exist reports them")
+        rc, out = run_without_source(script)
+        assert rc != 0, out
+        assert "not found" in out, out
+
+    return test_sources_exist, test_clause_holds_on_the_tree, test_missing_sources_fail_and_say_so
