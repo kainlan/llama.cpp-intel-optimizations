@@ -353,11 +353,7 @@ int run_refusal(checks & c, const char * node, const char * role, bool active_va
     }
     const int node_idx = node_index(prompt, node);
     ggml_backend_sycl_test_seg_seam_arm(node, role, false);
-    // The whole-graph record left an executable: drop it through the context's own invalidation, outside
-    // graph_compute, so the flag can be set with exec_graph null.
-    if (active_valid_alone) {
-        ggml_backend_sycl_graph_invalidate(f.backend, "test-sycl-seg-refusal-cleanup active-valid");
-    }
+    // The prologue left exec_graph null, so the flag can be set alone.
     if (active_valid_alone && !ggml_backend_sycl_test_seg_set_active_valid_alone(f.backend)) {
         c.void_case("exec_graph was set before the call: active_exec_graph.valid cannot be set alone");
         return c.status();
@@ -480,7 +476,7 @@ int run_stale_vectors(checks & c) {
     const ggml_status              status = ggml_backend_graph_compute(f.backend, longer.graph);
     const ggml_sycl_test_seg_seam  r      = seam_report();
     const ggml_sycl_test_seg_state after  = state_of(f);
-    ggml_backend_sycl_test_seg_retire_fail(false);  // before the context's destruction
+    ggml_backend_sycl_test_seg_retire_fail(false);  // only the call above runs with a failing retire
 
     if (r.record_entries == 0) {
         c.void_case("the call did not reach the record function (segments_match hit, or the record path declined)");
