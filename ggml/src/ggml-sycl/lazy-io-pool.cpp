@@ -647,10 +647,25 @@ struct lazy_io_queue::state {
         return nullptr;
     }
 
+    // Indexes `e` in its context's class queue and the FIFO index, all or nothing: a throw leaves it in neither and
+    // removes a context entry made for it, so the caller still owns an entry no index holds.
     void insert_entry(entry * e) {
-        contexts[e->context].by_class[lazy_io_class_index(e->key)].insert(e);
-        by_seq[e->seq] = e;
-        class0 += lazy_io_class_index(e->key) == 0 ? 1 : 0;
+        const size_t cls = lazy_io_class_index(e->key);
+        auto         ctx = contexts.try_emplace(e->context);
+        entry_set &  q   = ctx.first->second.by_class[cls];
+        try {
+            q.insert(e);
+            by_seq[e->seq] = e;
+        } catch (...) {
+#if !defined(LAZY_IO_QUEUE_MUTANT_PARTIAL_INSERT)
+            q.erase(e);
+            if (ctx.second && q.empty()) {
+                contexts.erase(ctx.first);
+            }
+#endif
+            throw;
+        }
+        class0 += cls == 0 ? 1 : 0;
     }
 
     // Takes `e` out of its context's queue and the FIFO index, leaving it owned by its node.
@@ -666,21 +681,42 @@ struct lazy_io_queue::state {
         class0 -= lazy_io_class_index(e->key) == 0 ? 1 : 0;
     }
 
+    // The node owns the entry before any index holds it, and a failed index takes it back out, so a throw never
+    // frees an entry an index still points at.
     void add_entry(node & n, uint64_t context, const lazy_io_key & key) {
-        std::unique_ptr<entry> e(new entry());
-        e->read    = n.read.get();
-        e->context = context;
-        e->key     = key;
-        e->seq     = next_seq++;
-        insert_entry(e.get());
-        n.entries.push_back(std::move(e));
+        std::unique_ptr<entry> owned(new entry());
+        entry *                e = owned.get();
+        e->read                  = n.read.get();
+        e->context               = context;
+        e->key                   = key;
+        e->seq                   = next_seq++;
+#if defined(LAZY_IO_QUEUE_MUTANT_INDEX_BEFORE_OWN)
+        insert_entry(e);
+        n.entries.push_back(std::move(owned));
+#else
+        n.entries.push_back(std::move(owned));
+        try {
+            insert_entry(e);
+        } catch (...) {
+            n.entries.pop_back();
+            throw;
+        }
+#endif
     }
 
-    // A re-key: out of its queue under the old key, back in under the new one, keeping its sequence number.
+    // A re-key: the entry moves to its class queue under the new key, keeping its sequence number and its FIFO
+    // index entry. The set node is extracted and reinserted, which allocates nothing, so a re-key cannot throw and
+    // cannot leave an entry its node owns out of every index.
     void rekey(entry * e, const lazy_io_key & key) {
-        unlink_entry(e);
+        auto ctx = contexts.find(e->context);
+        GGML_ASSERT(ctx != contexts.end());
+        const size_t from = lazy_io_class_index(e->key);
+        const size_t to   = lazy_io_class_index(key);
+        auto         nh   = ctx->second.by_class[from].extract(e);
+        GGML_ASSERT(!nh.empty());
         e->key = key;
-        insert_entry(e);
+        ctx->second.by_class[to].insert(std::move(nh));
+        class0 = class0 - (from == 0 ? 1 : 0) + (to == 0 ? 1 : 0);
     }
 
     void drop_entries(node & n) {
@@ -774,6 +810,60 @@ struct lazy_io_queue::state {
 #if defined(LAZY_IO_QUEUE_MUTANT_LOG_AT_COMPLETION)
     std::map<const lazy_io_read *, entry> picked_by;
 #endif
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // The indexes against their owners. It compares pointers and reads only entries a node owns, so a dangling pointer
+    // in an index is reported, never followed.
+    std::string check_indexes() const {
+        std::set<const entry *> owned;
+        size_t                  owned_class0 = 0;
+        for (const auto & kv : in_flight) {
+            const node & n = kv.second;
+            if (!n.read->dispatched && n.entries.empty()) {
+                return "the queued read at offset " + std::to_string(n.read->span.offset) + " has no entry";
+            }
+            for (const std::unique_ptr<entry> & e : n.entries) {
+                owned.insert(e.get());
+                owned_class0 += lazy_io_class_index(e->key) == 0 ? 1 : 0;
+            }
+        }
+        size_t queued = 0;
+        for (const auto & ctx : contexts) {
+            if (ctx.second.by_class[0].empty() && ctx.second.by_class[1].empty()) {
+                return "context " + std::to_string(ctx.first) + " is indexed with no entry";
+            }
+            for (size_t cls = 0; cls < 2; ++cls) {
+                for (const entry * e : ctx.second.by_class[cls]) {
+                    if (owned.count(e) == 0) {
+                        return "a class queue holds an entry no read owns";
+                    }
+                    if (e->context != ctx.first || lazy_io_class_index(e->key) != cls) {
+                        return "an entry is queued under another context or class";
+                    }
+                    ++queued;
+                }
+            }
+        }
+        for (const auto & kv : by_seq) {
+            if (owned.count(kv.second) == 0) {
+                return "the FIFO index holds an entry no read owns";
+            }
+            if (kv.second->seq != kv.first) {
+                return "the FIFO index files entry " + std::to_string(kv.second->seq) + " under " +
+                       std::to_string(kv.first);
+            }
+        }
+        if (queued != owned.size() || by_seq.size() != owned.size()) {
+            return "the reads own " + std::to_string(owned.size()) + " entries, the class queues hold " +
+                   std::to_string(queued) + " and the FIFO index " + std::to_string(by_seq.size());
+        }
+        if (class0 != owned_class0) {
+            return "the class-0 count is " + std::to_string(class0) + ", the reads own " +
+                   std::to_string(owned_class0) + " class-0 entries";
+        }
+        return std::string();
+    }
+#endif
 };
 
 lazy_io_queue::lazy_io_queue() : s_(new state()) {}
@@ -823,8 +913,15 @@ size_t lazy_io_queue::submit(uint64_t                  context,
             fresh.read.reset(new lazy_io_read());
             fresh.read->span = chunk;
             fresh.read->fd   = fd;
-            n                = &s_->in_flight.emplace(chunk, std::move(fresh))->second;
-            s_->add_entry(*n, context, key);
+            auto it          = s_->in_flight.emplace(chunk, std::move(fresh));
+            n                = &it->second;
+            // A read with no entry would never be picked, so one whose entry could not be added is taken back out.
+            try {
+                s_->add_entry(*n, context, key);
+            } catch (...) {
+                s_->in_flight.erase(it);
+                throw;
+            }
             // The lease moves in last, so a throw above leaves it with the caller, who drops it after unlocking.
             if (!spare_leases.empty()) {
                 n->read->lease = std::move(spare_leases.back());
@@ -933,6 +1030,10 @@ void lazy_io_queue::set_fifo_for_testing(bool fifo) {
 
 const std::vector<lazy_io_dispatch_record> & lazy_io_queue::dispatch_log_for_testing() const {
     return s_->log;
+}
+
+std::string lazy_io_queue::check_indexes_for_testing() const {
+    return s_->check_indexes();
 }
 #endif
 

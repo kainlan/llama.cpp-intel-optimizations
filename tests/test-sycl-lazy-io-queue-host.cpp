@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -30,8 +31,34 @@ using namespace ggml_sycl;
 using host_ledger_test_harness::arm_result;
 using host_ledger_test_harness::expect;
 using host_ledger_test_harness::num;
+using host_ledger_test_harness::void_arm;
 using host_ledger_test_harness::arm_loop::named_arm;
 using host_ledger_test_harness::arm_loop::run_arms;
+
+// The throw arm's fault injection: while this thread's countdown is armed, its n-th allocation throws std::bad_alloc.
+// The replacement covers the whole binary, the queue's translation unit included; disarmed, it is malloc and free.
+namespace {
+thread_local long g_alloc_countdown = 0;  // 0: disarmed
+}  // namespace
+
+void * operator new(std::size_t bytes) {
+    if (g_alloc_countdown > 0 && --g_alloc_countdown == 0) {
+        throw std::bad_alloc();
+    }
+    void * p = std::malloc(bytes == 0 ? 1 : bytes);
+    if (p == nullptr) {
+        throw std::bad_alloc();
+    }
+    return p;
+}
+
+void operator delete(void * p) noexcept {
+    std::free(p);
+}
+
+void operator delete(void * p, std::size_t) noexcept {
+    std::free(p);
+}
 
 namespace {
 
@@ -543,6 +570,70 @@ arm_result arm_delivery() {
     return r;
 }
 
+// A submit that throws leaves the queue's indexes whole: every entry a class queue or the FIFO index holds is owned by
+// a queued read, every queued read has an entry, and the class-0 count matches. Each case is run once per allocation
+// the submit makes, the n-th throwing, until a run throws none: a new read; another context's join, which adds an entry
+// to a queued read; and a same-context join that re-keys a class-1 read into class 0. After the last run every read
+// dispatches once.
+// Engagement: each case throws at least once, else VOID.
+// Mutants: LAZY_IO_QUEUE_MUTANT_INDEX_BEFORE_OWN (the entry is indexed before its read owns it, so the owner's growth
+// throwing frees an indexed entry) and LAZY_IO_QUEUE_MUTANT_PARTIAL_INSERT (a FIFO insert that throws leaves the entry
+// in its class queue, and the read's rollback frees it there).
+arm_result arm_submit_throw() {
+    struct throw_case {
+        const char *          name;
+        uint64_t              block;
+        lazy_io_key           key;
+        std::vector<uint64_t> want;
+    };
+
+    const throw_case cases[] = {
+        { "a new read",                       8, key0(6, 14), { 5, 6, 7, 8 } },
+        { "another context's join",           6, key0(6, 14), { 5, 6, 7 }    },
+        { "a re-key from class 1 to class 0", 7, key0(5, 14), { 5, 6, 7 }    },
+    };
+    arm_result r;
+    for (const throw_case & c : cases) {
+        size_t throws = 0;
+        bool   done   = false;
+        for (long n = 1; n <= 64 && !done; ++n) {
+            lazy_io_queue q;
+            put(q, 1, 5, key0(6, 14));
+            put(q, 2, 6, key0(6, 14));
+            put(q, 1, 7, key1(6, 14));
+            bool threw        = false;
+            g_alloc_countdown = n;
+            try {
+                put(q, 1, c.block, c.key);
+            } catch (const std::bad_alloc &) {
+                threw = true;
+            }
+            g_alloc_countdown = 0;
+            throws += threw ? 1 : 0;
+            const std::string bad = q.check_indexes_for_testing();
+            if (!bad.empty()) {
+                expect(r, false, std::string(c.name) + ", allocation " + num(n) + " thrown: " + bad);
+                return r;
+            }
+            if (!threw) {
+                done                      = true;
+                std::vector<uint64_t> got = drain(q);
+                std::sort(got.begin(), got.end());
+                expect(r, got == c.want,
+                       std::string(c.name) + ": after the run that threw nothing, dispatched " + join(got) + ", want " +
+                           join(c.want));
+            }
+        }
+        if (!done) {
+            expect(r, false, std::string(c.name) + ": every one of 64 runs threw");
+        }
+        if (throws == 0) {
+            void_arm(r, std::string(c.name) + ": no allocation was made, so no throw was exercised");
+        }
+    }
+    return r;
+}
+
 }  // namespace
 
 int main() {
@@ -559,6 +650,7 @@ int main() {
         { "the FIFO override serves reads in enqueue order",                          arm_fifo_override      },
         { "the dispatch log numbers a read when a worker picks it up",                arm_dispatch_log       },
         { "the reaper copies only into its own epoch's live slot",                    arm_delivery           },
+        { "a submit that throws leaves the queue's indexes whole",                    arm_submit_throw       },
     };
     return run_arms(arms, "lazy io queue host arms");
 }

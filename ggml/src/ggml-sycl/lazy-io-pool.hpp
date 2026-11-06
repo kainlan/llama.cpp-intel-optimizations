@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace ggml_sycl {
@@ -357,7 +358,8 @@ class lazy_io_queue {
     // joiner's queue at the joiner's key, and a dispatched read only gains the waiter. A new read takes its lease from
     // the back of `spare_leases` when one is left; the caller drops what remains after it unlocks. Each waiter added
     // counts once in its ticket's `outstanding`. Returns the waiters added; 0 for a span that is empty or not
-    // block-aligned.
+    // block-aligned. May throw std::bad_alloc; a throw leaves every queue entry owned by a queued read and every queued
+    // read with an entry, and the chunks queued before it stay queued.
     size_t submit(uint64_t                  context,
                   int                       fd,
                   const lazy_io_span &      span,
@@ -387,6 +389,11 @@ class lazy_io_queue {
     void set_fifo_for_testing(bool fifo);
 
     const std::vector<lazy_io_dispatch_record> & dispatch_log_for_testing() const;
+
+    // The queue's indexes checked against the reads that own their entries: empty when every class queue and FIFO
+    // entry is owned by a queued read, every owned entry is in both, no queued read lacks an entry, and the class-0
+    // count matches; otherwise the first discrepancy. It follows no pointer it has not found owned.
+    std::string check_indexes_for_testing() const;
 #endif
 
   private:
