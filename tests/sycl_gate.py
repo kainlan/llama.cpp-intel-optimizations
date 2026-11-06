@@ -516,9 +516,13 @@ def function_problems(cmake: str, func: str, block: str, cmake_rel: str) -> list
     for text, what in need.items():
         if text not in f:
             fails.append(f"{func} no longer {what}: missing {text!r}")
-    for text, n in (("RUN_SERIAL TRUE", 2), ("SKIP_RETURN_CODE 77", 2), ('ENVIRONMENT "${_env}"', 2)):
+    for text, n in (("RUN_SERIAL TRUE", 2), ('ENVIRONMENT "${_env}"', 2)):
         if f.count(text) != n:
             fails.append(f"{func} carries {text!r} {f.count(text)} time(s), expected {n} (base and arm)")
+    # Only the base skips on 77: an arm that did would pass a VOID as a skip instead of failing for its absent text.
+    if f.count("SKIP_RETURN_CODE 77") != 1:
+        fails.append(f"{func} carries 'SKIP_RETURN_CODE 77' {f.count('SKIP_RETURN_CODE 77')} time(s), expected 1 "
+                     "(the base only: an arm that skips on 77 passes a VOID)")
     if re.search(r"target_link_libraries\([^)]*\bllama\b", f):
         fails.append(f"{func} links libllama")
     return fails

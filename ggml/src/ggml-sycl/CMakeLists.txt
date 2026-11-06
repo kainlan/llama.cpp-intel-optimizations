@@ -8055,7 +8055,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # build scores every fault: the base ctest runs every case unmutated, and each `<test>-mutant-<names>` ctest runs
     # `--mutant <names> --cases <cases>` and passes only when its expected failure text appears. They construct caches
     # and pinned pools on a real queue, so they carry the OOM-family labels, run alone on the B50 with 64 MiB chunks
-    # (§M88 (2)), load no model, and exit 77 without a SYCL GPU. Lead-run.
+    # (§M88 (2)), load no model, and exit 77 without a SYCL GPU. Lead-run. A mutant registration has no
+    # SKIP_RETURN_CODE: a VOID or skipped case exits 77 and prints no failure text, so the registration fails instead
+    # of passing as a skip. A mutant is scored killed only by its line.
     #   MUTANTS is a flat list of triples: the mutant names (comma-separated), the cases (comma-separated) and the
     #   expected text. ENV adds variables to the registration's environment. An expected text carries no `;`:
     #   ${ARGN} splits it there and shifts every later triple, so a printed `;` is matched by `.`.
@@ -8088,7 +8090,6 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
                     LABELS "sycl;cache;mem-handle;gpu-serial;mutant"
                     ENVIRONMENT "${_env}"
                     RUN_SERIAL TRUE
-                    SKIP_RETURN_CODE 77
                     TIMEOUT ${SRT_TIMEOUT}
                     PASS_REGULAR_EXPRESSION "${_regex}")
             endforeach()
@@ -8167,6 +8168,41 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
             "owner-end freed one of two chunks"
         lease-drop-no-index lease-a
             "after the lease dropped, expected [0-9]+: withdrawn chunk [0-9]+ waits for a begin")
+
+    # The file-mapped tier's device REDs (docs/design/sycl-mmap-host-tier.md §5.3, §7 C4), registered through the
+    # same helper: one executable each against the private fixtures, the B50 alone, no model. The meminfo control
+    # runs first: it writes its outcome and the boot id beside the binaries, and each of the other five reads it in its
+    # driver and exits 77 with one VOID line when the control has not run in this boot or failed
+    # (tests/file-mapped-test-common.hpp). DEPENDS orders a sweep that selects them all; it does not make a run of one
+    # of them pull the control in.
+    # The lead runs this one first, by name. It writes ${CMAKE_BINARY_DIR}/bin/sycl-pinned-meminfo-control.outcome.
+    ggml_sycl_scratch_return_test(test-sycl-pinned-meminfo-control TIMEOUT 300)
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-stream-refusal TIMEOUT 120 MUTANTS
+        refusal-after-copy-fn with-copy-fn
+            "FAIL \\[with-copy-fn\\] stream_dma over a FILE_MAPPED view with a copy_fn was not refused")
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-bounce TIMEOUT 120)
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-expert-owner TIMEOUT 120)
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-resolve-abort TIMEOUT 120)
+    # A refusal inside the segmented MoE record (§4.4): five cases on the non-keyed record function. The immediate
+    # return must fail both of its cases.
+    set(_seg_no_line "no \"recoverable runtime fallback failed\" line after a FAILED return")
+    # Every arm's text starts at its case's FAIL prefix, so only that case's c.fail line can match it.
+    set(_seg_lease_line "FAIL \\[active-valid\\] lease vectors [0-9]+\\+[0-9]+ non-empty after a FAILED return")
+    set(_seg_destroyed "FAIL \\[moe-after\\] executables destroyed")
+    ggml_sycl_scratch_return_test(test-sycl-seg-refusal-cleanup TIMEOUT 900 MUTANTS
+        seg-immediate-return direct,recording
+            "FAIL \\[direct\\] ${_seg_no_line}.*FAIL \\[recording\\] ${_seg_no_line}"
+        seg-cleanup-step-removed active-valid
+            "${_seg_lease_line}. active_exec_graph live"
+        seg-local-unwind moe-after
+            "${_seg_destroyed} in the unwind: moe_segments 0 at catch entry, [0-9]+ recorded at the throw"
+        seg-destroy-before-waits moe-after
+            "${_seg_destroyed} before the waits: moe_segments [0-9]+ at catch entry, 0 at the cleanup step"
+        seg-record-guard-removed stale-vectors
+            "FAIL \\[stale-vectors\\] no \"record refused\" line while the context holds [0-9]+ segment\\(s\\)")
+    set_tests_properties(test-sycl-file-mapped-stream-refusal test-sycl-file-mapped-bounce
+        test-sycl-file-mapped-expert-owner test-sycl-file-mapped-resolve-abort test-sycl-seg-refusal-cleanup
+        PROPERTIES DEPENDS test-sycl-pinned-meminfo-control)
 
     # The host-only plan dry run's lead-run arms (th32 §4.2, §11 T11): a caller built against another struct
     # layout is refused, expected_host is the stage's host_planned_bytes, every term is printed by name from the

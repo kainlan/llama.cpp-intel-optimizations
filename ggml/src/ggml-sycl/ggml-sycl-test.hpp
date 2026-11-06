@@ -681,3 +681,74 @@ int ggml_sycl_get_blind_preload_threshold();
 // Check if blind preload should be skipped for given expert count
 // Returns true if should SKIP blind preload (expert count exceeds threshold)
 bool ggml_sycl_should_skip_blind_preload(int64_t n_experts);
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// test-sycl-seg-refusal-cleanup's seams in ggml-sycl.cpp (docs/design/sycl-mmap-host-tier.md §4.4, §7 C4). The
+// refusal is forced at the armed node through ggml_sycl::host_dispatch_fail_closed, the one function a real refusal
+// throws from, and the report records what the design's preconditions and assertions read. Identities are the
+// executables' addresses, compared only while the test holds the context.
+#    define GGML_SYCL_TEST_SEG_IDS_MAX 8
+
+struct ggml_sycl_test_seg_seam {
+    // The refusal, and the context's state the seam read just before its throw.
+    bool         fired;
+    size_t       weight_leases;  // graph_weight_leases.size()
+    size_t       moe_leases;     // graph_moe_expert_leases.size()
+    bool         exec_graph;     // exec_graph non-null
+    bool         active_valid;   // active_exec_graph.valid
+    // The note taken at a recorded segment's moe_after site, just before its helper call; the last one taken.
+    bool         noted;
+    size_t       seg_idx;
+    int          moe_after;
+    bool         submitted;           // segment_submitted
+    int          last_recorded_node;  // recording_node_index
+    size_t       n_recorded;          // recorded_segments.size()
+    const void * seg_exec;            // recorded_segments.back().exec_graph
+    size_t       n_recorded_ids;      // the non-null executables recorded so far, in order
+    const void * recorded_ids[GGML_SYCL_TEST_SEG_IDS_MAX];
+    // moe_segments.size() at the fallback catch's first statement (s1), the cleanup step's entry (s2) and its exit
+    // (s3); -1 until taken. s1's executables too.
+    long         s1;
+    long         s2;
+    long         s3;
+    size_t       n_s1_ids;
+    const void * s1_ids[GGML_SYCL_TEST_SEG_IDS_MAX];
+    // The record function's entries since the arm, and the context's segments at the last one.
+    size_t       record_entries;
+    size_t       entry_segments;
+    bool         entry_disabled;  // moe_graphs_disabled
+    size_t       n_entry_ids;
+    const void * entry_ids[GGML_SYCL_TEST_SEG_IDS_MAX];
+    // The retires the retire seam failed since the arm.
+    int          retire_hits;
+};
+
+struct ggml_sycl_test_seg_state {
+    bool         recording;        // g_ggml_sycl_graph_recording
+    bool         graph_ptr;        // g_recording_graph_ptr non-null
+    bool         queue_ptr;        // g_recording_queue_ptr non-null
+    bool         sink;             // a retained-handle sink attached
+    bool         queue_recording;  // the context's queue is in the recording state
+    size_t       weight_leases;
+    size_t       moe_leases;
+    bool         exec_graph;
+    bool         active_valid;
+    bool         rerecord;                      // moe_graph_rerecord
+    bool         moe_graphs_disabled;
+    uint64_t     optional_layout_epoch;         // the context's
+    uint64_t     global_optional_layout_epoch;  // g_ggml_sycl_optional_layout_epoch
+    size_t       n_segments;                    // moe_segments.size()
+    size_t       n_ids;
+    const void * ids[GGML_SYCL_TEST_SEG_IDS_MAX];
+};
+
+// Arms the refusal at the node named node_name when the helper runs it in `role` (null disarms), and the samples.
+// Every call clears the report.
+extern "C" void ggml_backend_sycl_test_seg_seam_arm(const char * node_name, const char * role, bool samples);
+extern "C" void ggml_backend_sycl_test_seg_seam_read(ggml_sycl_test_seg_seam * out);
+// While on, moe_graph_retention_retire_exact fails on every call, and each failure counts in retire_hits.
+extern "C" void ggml_backend_sycl_test_seg_retire_fail(bool on);
+// Sets active_exec_graph.valid for the prompt phase with exec_graph left null; false when exec_graph is set.
+extern "C" bool ggml_backend_sycl_test_seg_set_active_valid_alone(ggml_backend_t backend);
+extern "C" bool ggml_backend_sycl_test_seg_state_read(ggml_backend_t backend, ggml_sycl_test_seg_state * out);
+#endif
