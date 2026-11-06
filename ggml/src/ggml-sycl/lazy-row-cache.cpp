@@ -228,6 +228,16 @@ lazy_row_cache::shard & lazy_row_cache::shard_at(uint32_t j) const {
     return shards_[j];
 }
 
+// The shard whose mutex guards shard j's state: shard j itself, each shard its own leaf lock (§6.3).
+lazy_row_cache::shard & lazy_row_cache::shard_to_lock(uint32_t j) const {
+#if defined(LAZY_ROW_CACHE_MUTANT_ONE_LOCK)
+    (void) j;
+    return shard_at(0);  // Mutant: one lock for every shard.
+#else
+    return shard_at(j);
+#endif
+}
+
 size_t lazy_row_cache::chunk_of_slot(size_t slot) const {
     // Every chunk but the last is whole, so the whole chunks' slot count divides the slot ids among them.
     if (whole_slots_ == 0) {
@@ -450,12 +460,7 @@ bool lazy_row_cache::lookup_copy(int64_t row, void * dst) {
     test_fire(lazy_row_cache_test_point::HIT_BEFORE_LOCK, j);
 #endif
     shard & sh = shard_at(j);
-#if defined(LAZY_ROW_CACHE_MUTANT_ONE_LOCK)
-    shard & lock_sh = shard_at(0);
-    LAZY_ROW_CACHE_LOCK(lock_sh);
-#else
-    LAZY_ROW_CACHE_LOCK(sh);
-#endif
+    LAZY_ROW_CACHE_LOCK(shard_to_lock(j));
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     test_fire(lazy_row_cache_test_point::HIT_UNDER_LOCK, j);
 #endif
@@ -480,12 +485,7 @@ bool lazy_row_cache::insert(int64_t row, const void * src) {
     }
     const uint32_t j  = shard_of(row);
     shard &        sh = shard_at(j);
-#if defined(LAZY_ROW_CACHE_MUTANT_ONE_LOCK)
-    shard & lock_sh = shard_at(0);
-    LAZY_ROW_CACHE_LOCK(lock_sh);
-#else
-    LAZY_ROW_CACHE_LOCK(sh);
-#endif
+    LAZY_ROW_CACHE_LOCK(shard_to_lock(j));
     if (find_locked(sh, row) != NPOS) {
         return false;
     }
@@ -569,12 +569,7 @@ size_t lazy_row_cache::yield(size_t deficit, uint64_t asking_load_txn_id) {
         const size_t end = ch.first_slot + ch.n_slots;
         for (uint32_t j = 0; j < n_shards_; ++j) {
             shard & sh = shard_at(j);
-#if defined(LAZY_ROW_CACHE_MUTANT_ONE_LOCK)
-            shard & lock_sh = shard_at(0);
-            LAZY_ROW_CACHE_LOCK(lock_sh);
-#else
-            LAZY_ROW_CACHE_LOCK(sh);
-#endif
+            LAZY_ROW_CACHE_LOCK(shard_to_lock(j));
 #if defined(GGML_SYCL_PRIVATE_TESTING)
             test_fire(lazy_row_cache_test_point::YIELD_UNDER_SHARD_LOCK, j);
 #endif
@@ -652,13 +647,9 @@ int64_t lazy_row_cache::chunk_holding(int64_t row) const {
     if (!row_valid(row)) {
         return -1;
     }
-    shard & sh = shard_at(shard_of(row));
-#if defined(LAZY_ROW_CACHE_MUTANT_ONE_LOCK)
-    shard & lock_sh = shard_at(0);
-    LAZY_ROW_CACHE_LOCK(lock_sh);
-#else
-    LAZY_ROW_CACHE_LOCK(sh);
-#endif
+    const uint32_t j  = shard_of(row);
+    shard &        sh = shard_at(j);
+    LAZY_ROW_CACHE_LOCK(shard_to_lock(j));
     const size_t bucket = find_locked(sh, row);
     return bucket == NPOS ? -1 : static_cast<int64_t>(chunk_of_slot(sh.buckets[bucket]));
 }

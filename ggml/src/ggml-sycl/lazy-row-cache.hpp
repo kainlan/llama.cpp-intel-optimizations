@@ -252,6 +252,7 @@ class lazy_row_cache {
     lazy_row_cache();
 
     shard &   shard_at(uint32_t j) const;
+    shard &   shard_to_lock(uint32_t j) const;
     size_t    chunk_of_slot(size_t slot) const;
     uint8_t * slot_bytes(size_t slot) const;
     size_t    find_locked(const shard & sh, int64_t row) const;
