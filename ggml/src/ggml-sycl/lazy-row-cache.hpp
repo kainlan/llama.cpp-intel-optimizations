@@ -198,8 +198,6 @@ class lazy_row_cache {
     // The slab chunk that holds `row`, or -1 when it is not resident. Does not touch the reference bit.
     int64_t chunk_holding(int64_t row) const;
 
-    uint32_t shard_of(int64_t row) const;
-
     lazy_row_cache_counters counters() const;
 
     // The accounting, all fixed at build but the last two.
@@ -225,12 +223,6 @@ class lazy_row_cache {
 
     size_t n_floor_chunks() const { return n_floor_chunks_; }
 
-    size_t chunk_bytes(size_t chunk) const;
-
-    // A shard's index buckets and the live rows it may hold: at most 0.75 of its buckets.
-    size_t shard_buckets(uint32_t shard) const;
-    size_t shard_limit(uint32_t shard) const;
-
     // The ledger charge of every allocation still held: the index's and the resident chunks'.
     size_t charged_bytes() const;
 
@@ -238,6 +230,13 @@ class lazy_row_cache {
     size_t yieldable_bytes() const;
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+    // The shard `row` hashes to.
+    uint32_t shard_of(int64_t row) const;
+
+    // A shard's index buckets and the live rows it may hold: at most 0.75 of its buckets.
+    size_t shard_buckets(uint32_t shard) const;
+    size_t shard_limit(uint32_t shard) const;
+
     // Arms the hook at every test point; null disarms. Set before the threads it holds start.
     void test_set_hook(lazy_row_cache_test_hook hook, void * ctx);
 
@@ -253,6 +252,7 @@ class lazy_row_cache {
 
     shard &   shard_at(uint32_t j) const;
     shard &   shard_to_lock(uint32_t j) const;
+    uint32_t  shard_index(int64_t row) const;
     size_t    chunk_of_slot(size_t slot) const;
     uint8_t * slot_bytes(size_t slot) const;
     size_t    find_locked(const shard & sh, int64_t row) const;

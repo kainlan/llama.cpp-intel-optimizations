@@ -436,7 +436,8 @@ lazy_row_cache_build lazy_row_cache::build(const lazy_row_cache_config &  config
     return result;
 }
 
-uint32_t lazy_row_cache::shard_of(int64_t row) const {
+// The shard `row` hashes to: hash(row) mod n_shards (§6.3).
+uint32_t lazy_row_cache::shard_index(int64_t row) const {
     return static_cast<uint32_t>(hash_row(row) % n_shards_);
 }
 
@@ -445,7 +446,7 @@ bool lazy_row_cache::lookup_copy(int64_t row, void * dst) {
         misses_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const uint32_t j = shard_of(row);
+    const uint32_t j = shard_index(row);
 #if defined(LAZY_ROW_CACHE_MUTANT_YIELD_WAITS_FOR_READERS)
     // Mutant: a lookup is a lease the yield waits for.
     mutant_readers_.fetch_add(1, std::memory_order_seq_cst);
@@ -483,7 +484,7 @@ bool lazy_row_cache::insert(int64_t row, const void * src) {
     if (!row_valid(row) || src == nullptr) {
         return false;
     }
-    const uint32_t j  = shard_of(row);
+    const uint32_t j  = shard_index(row);
     shard &        sh = shard_at(j);
     LAZY_ROW_CACHE_LOCK(shard_to_lock(j));
     if (find_locked(sh, row) != NPOS) {
@@ -647,7 +648,7 @@ int64_t lazy_row_cache::chunk_holding(int64_t row) const {
     if (!row_valid(row)) {
         return -1;
     }
-    const uint32_t j  = shard_of(row);
+    const uint32_t j  = shard_index(row);
     shard &        sh = shard_at(j);
     LAZY_ROW_CACHE_LOCK(shard_to_lock(j));
     const size_t bucket = find_locked(sh, row);
@@ -666,18 +667,6 @@ lazy_row_cache_counters lazy_row_cache::counters() const {
     return n;
 }
 
-size_t lazy_row_cache::chunk_bytes(size_t i) const {
-    return i < n_chunks_ ? chunks_[i].n_slots * row_size_ : 0;
-}
-
-size_t lazy_row_cache::shard_buckets(uint32_t j) const {
-    return j < n_shards_ ? shards_[j].n_buckets : 0;
-}
-
-size_t lazy_row_cache::shard_limit(uint32_t j) const {
-    return j < n_shards_ ? shards_[j].limit : 0;
-}
-
 size_t lazy_row_cache::charged_bytes() const {
     return charged_live_.load(std::memory_order_relaxed);
 }
@@ -693,6 +682,18 @@ size_t lazy_row_cache::yieldable_bytes() const {
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+uint32_t lazy_row_cache::shard_of(int64_t row) const {
+    return shard_index(row);
+}
+
+size_t lazy_row_cache::shard_buckets(uint32_t j) const {
+    return j < n_shards_ ? shards_[j].n_buckets : 0;
+}
+
+size_t lazy_row_cache::shard_limit(uint32_t j) const {
+    return j < n_shards_ ? shards_[j].limit : 0;
+}
+
 void lazy_row_cache::test_set_hook(lazy_row_cache_test_hook hook, void * ctx) {
     test_hook_ctx_.store(ctx, std::memory_order_release);
     test_hook_.store(hook, std::memory_order_release);
