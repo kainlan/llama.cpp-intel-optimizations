@@ -17,7 +17,7 @@
 // lazy-row-cache.cpp, built as test-sycl-lazy-row-cache-mutant-<suffix>, whose ctest passes only on the arm's FAIL.
 
 #include "../lazy-row-cache.hpp"
-#include "lazy-table-test-util.hpp"
+#include "host-ledger-test-harness.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -34,7 +34,7 @@
 #include <vector>
 
 using namespace host_ledger_test_harness;
-using namespace lazy_table_test;
+using namespace host_ledger_test_harness::arm_loop;
 using ggml_sycl::lazy_row_cache;
 using ggml_sycl::lazy_row_cache_build;
 using ggml_sycl::lazy_row_cache_config;
@@ -109,11 +109,9 @@ fixture_memory::fixture_memory(fixture_source & source, uint8_t * data, size_t b
     ordinal_(ordinal) {}
 
 fixture_memory::~fixture_memory() {
-#if defined(GGML_SYCL_PRIVATE_TESTING)
     if (source_.watch != nullptr && source_.watch->test_any_shard_held()) {
         ++source_.released_under_lock[ordinal_];
     }
-#endif
     ++source_.released[ordinal_];
     --source_.live;
     // Poisoned before the free when asked, so a row read from a released chunk cannot pass for the row it was.
