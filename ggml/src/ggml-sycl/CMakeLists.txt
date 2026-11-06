@@ -431,6 +431,38 @@ if (BUILD_TESTING)
     add_test(NAME test-sycl-file-mapping-segments COMMAND test-sycl-file-mapping-segments)
     set_tests_properties(test-sycl-file-mapping-segments PROPERTIES LABELS "sycl;host" TIMEOUT 60)
 
+    # The monotone host budget and the resident working-set WARN (docs/design/sycl-mmap-host-tier.md §4.5, §7 C5).
+    # host-budget.hpp is a pure header that includes nothing from SYCL, the cache or ggml, so each target compiles one
+    # test file against it alone and links nothing: no device, no library, no model. Each variant is a triple: the
+    # ctest name, the macro that plants one defect in host-budget.hpp ("" for the base test), and the FAIL line the test
+    # prints when it does. A mutant builds its own executable, <test>-mutant-<macro suffix>, whose ctest passes only
+    # when that line appears; it has no SKIP_RETURN_CODE, so a mutant the test does not kill fails.
+    set(_host_budget_variants
+        test-sycl-host-budget           "" ""
+        test-sycl-host-working-set-warn "" "")
+    list(LENGTH _host_budget_variants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 3)
+        math(EXPR _j "${_i} + 1")
+        math(EXPR _k "${_i} + 2")
+        list(GET _host_budget_variants ${_i} _name)
+        list(GET _host_budget_variants ${_j} _macro)
+        list(GET _host_budget_variants ${_k} _regex)
+        string(REGEX REPLACE "-mutant-.*$" "" _stem "${_name}")
+        add_executable(${_name} ${CMAKE_CURRENT_SOURCE_DIR}/tests/${_stem}.cpp)
+        set_target_properties(${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME ${_name} COMMAND ${_name})
+        if (_macro STREQUAL "")
+            set_tests_properties(${_name} PROPERTIES LABELS "sycl;host" TIMEOUT 60)
+        else()
+            target_compile_definitions(${_name} PRIVATE ${_macro}=1)
+            set_tests_properties(${_name} PROPERTIES
+                LABELS "sycl;host;mutant"
+                TIMEOUT 60
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endif()
+    endforeach()
+
     # The residency gate: the page cache of the FILE, measured with cachestat(2), over a 64 MiB fixture under the build
     # directory (not tmpfs). It evicts per arm and exits 77 where it cannot (llama.cpp-5efe C3). Linux-only: it uses
     # cachestat, /sys/dev/block and the glibc headers for them.
