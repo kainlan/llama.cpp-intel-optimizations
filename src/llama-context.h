@@ -599,8 +599,9 @@ private:
     // SYCL host buft, as last measured or allocated, and the output buffer's size, as last allocated there.
     size_t                        sycl_host_compute_bytes  = 0;
     size_t                        sycl_host_output_bytes   = 0;
-    // True only while try_candidate's own reserve runs. sched_reserve then leaves the plan commit and the SCRATCH
-    // KEEP to the candidate, which makes them after its host-fallback and hold-spill checks (§M75).
+    // Set by try_candidate just before its OPEN and cleared when it returns, a throw included: true through its own
+    // reserve, its host-fallback and hold-spill checks, its commit and its KEEP. sched_reserve then leaves the plan
+    // commit and the SCRATCH KEEP to the candidate, which makes them after those checks (§M75).
     bool                          sycl_ubatch_trial_active = false;
 
     // llama.cpp-kpjw: the SYCL backend's scheduler-compute scope (ggml_backend_sycl_compute_alloc_scope), resolved once

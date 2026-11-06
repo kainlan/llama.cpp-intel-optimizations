@@ -3195,8 +3195,10 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
-    // A reserve that throws, the transaction itself or for its refused result, returns the SCRATCH its measure grew
-    // since the MARK, under the auto-n_ubatch trial too (§4.4 "The transaction", §M75).
+    // A reserve that throws, the transaction itself or for its refused result, RETURNs every SCRATCH chunk of the open
+    // transaction (§4.4 "The transaction", §M75): under the auto-n_ubatch trial, all it grew since the trial's OPEN;
+    // otherwise all since this reserve's first MARK, the allocating reserves' miss-path grows included. Only
+    // RETURN_TO_MARK stops at the MARK.
     ggml_backend_t sycl_dev0 =
         model.devices.empty() ? nullptr : llama_context_sycl_backend_of(backends, model.devices[0].dev);
     try {
@@ -3269,9 +3271,9 @@ bool llama_context::sched_reserve_nothrow() {
         LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
     }
 
-    // Every way out but OK returns the SCRATCH the reserve's measure grew since the MARK (§4.4 "The transaction",
-    // §M75). The scheduler is no longer reserved for the graphs decode builds, so the next decode or encode reserves
-    // again from the start.
+    // Every way out but OK RETURNs every SCRATCH chunk of the open transaction (§4.4 "The transaction", §M75): under
+    // the auto-n_ubatch trial, all since the trial's OPEN; otherwise all since this reserve's first MARK. The scheduler
+    // is no longer reserved for the graphs decode builds, so the next decode or encode reserves again from the start.
     sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, cparams.n_ubatch);
     sched_need_reserve = true;
     return false;
