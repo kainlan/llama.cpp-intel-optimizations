@@ -114,7 +114,7 @@ def namespace_scope_mask(bare: str) -> list:
     return mask
 
 
-def testing_lines(bare: str) -> set:
+def private_testing_lines(bare: str) -> set:
     """The 1-based lines of `bare` inside a GGML_SYCL_PRIVATE_TESTING block (its #else side excluded)."""
     inside, stack = set(), []
     for number, line in enumerate(bare.split("\n"), 1):
@@ -135,11 +135,11 @@ def testing_lines(bare: str) -> set:
     return inside
 
 
-def testing_only_symbols(header: str) -> set:
+def private_testing_symbols(header: str) -> set:
     """The names `header` declares at namespace scope only inside GGML_SYCL_PRIVATE_TESTING blocks."""
     _, bare = views(header)
     mask = namespace_scope_mask(bare)
-    pt_lines = testing_lines(bare)
+    pt_lines = private_testing_lines(bare)
     starts = [0]
     for i, ch in enumerate(bare):
         if ch == "\n":
@@ -183,7 +183,7 @@ def violations(forbidden: list, symbols: set, source) -> list:
 
 CMAKE = {rel: read(rel) for rel in CMAKE_FILES}
 TARGETS, FORBIDDEN = standalone_units(CMAKE)
-SYMBOLS = testing_only_symbols(read(POOL_HEADER))
+SYMBOLS = private_testing_symbols(read(POOL_HEADER))
 
 print("standalone targets: %s" % ", ".join(TARGETS))
 print("forbidden units: %d, test-only pool symbols: %d" % (len(FORBIDDEN), len(SYMBOLS)))
