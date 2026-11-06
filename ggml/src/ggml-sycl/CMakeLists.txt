@@ -476,13 +476,17 @@ if (BUILD_TESTING)
             "FAIL ensure refuses after shut-down and frees the reserver's ring: the reserver that reached its install "
             "after shut-down returned ok, want lazy-table-ring-shut-down")
         string(CONCAT _le_re_no_span_check
-            "${_le_rules}the one-block-short ensure returned ok with 1 allocation\\(s\\), "
+            "${_le_rules}the ensure one block per slot short returned ok with 1 allocation\\(s\\), "
             "want lazy-table-ring-too-narrow and none")
+        string(CONCAT _le_re_no_alignment_check
+            "FAIL a need that is not whole blocks per slot refuses before ensure reserves: the unaligned need "
+            "returned ok with 1 allocation\\(s\\), want lazy-table-ring-mismatch and none")
         set(_lazy_io_engine_mutants
             no-ensuring             "${_le_re_no_ensuring}"
             ensuring-kept-on-throw  "${_le_re_ensuring_kept_on_throw}"
             install-after-shut-down "${_le_re_install_after_shut_down}"
-            no-span-check           "${_le_re_no_span_check}")
+            no-span-check           "${_le_re_no_span_check}"
+            no-alignment-check      "${_le_re_no_alignment_check}")
         add_executable(test-sycl-lazy-io-engine-host
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
             lazy-io-pool.cpp
@@ -8336,7 +8340,8 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
     string(CONCAT _lr_re_no_span_check
         "FAIL the ring plan: one ensure allocates the need, a covered plan charges 0, a wider one declines: "
-        "the one-block-short ensure returned ok with 1 allocation\\(s\\), want lazy-table-ring-too-narrow and none")
+        "the ensure one block per slot short returned ok with 1 allocation\\(s\\), "
+        "want lazy-table-ring-too-narrow and none")
     string(CONCAT _lr_re_ignore_live_ring
         "FAIL a wider table that fits nowhere refuses as lazy-table-ring-too-narrow: "
         "the wider table planned with refusal 'none', want lazy-table-ring-too-narrow")

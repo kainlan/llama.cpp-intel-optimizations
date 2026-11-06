@@ -418,7 +418,8 @@ enum class lazy_ring_ensure_status : uint8_t {
     TOO_NARROW,  // lazy-table-ring-too-narrow: the need or the span does not fit the ring (§3.3, §10)
     CONCURRENT,  // lazy-table-ring-concurrent-ensure: another caller holds the ensuring state
     SHUT_DOWN,   // lazy-table-ring-shut-down: the registry is shut down
-    MISMATCH,    // lazy-table-ring-mismatch: the ring's bytes or charge differ from the plan's (§10's ring check)
+    MISMATCH,    // lazy-table-ring-mismatch: the need is not whole blocks per slot, or the ring's bytes or charge
+                 // differ from the plan's (§5.2, §10's ring check)
     REFUSED,     // lazy-table-ring-refused: the planned allocation was refused
 };
 
@@ -432,10 +433,11 @@ const char * lazy_ring_ensure_status_name(lazy_ring_ensure_status status);
 // charge is the ring's own for the transaction whose ensure created it, and 0 for any other (§10's ring check). It
 // keeps one piece of state, `ensuring`, in three steps: reserve under the registry's leaf mutex, allocate with no lock
 // held, install under it; a scope guard clears it on every exit. A caller that finds it set refuses at once and never
-// waits. Each mismatch with the plan is a [HOST-PLAN-BUG] WARN naming both numbers, a concurrent call one naming the
-// need and the span, and the shut-down and unpinned refusals plain WARNs; every refusal returns its typed status.
-// Ensure never aborts: the strict abort is its caller's (§10). May throw what the allocation or a worker's start
-// throws, after the guard has cleared `ensuring`.
+// waits. A need that is not a multiple of LAZY_BLOCK_RING_QD x LAZY_IO_BLOCK_BYTES is refused as MISMATCH before any
+// of that, never rounded up, since O_DIRECT alignment is a plan fact (§5.2). Each mismatch with the plan is a
+// [HOST-PLAN-BUG] WARN naming both numbers, a concurrent call one naming the need and the span, and the shut-down and
+// unpinned refusals plain WARNs; every refusal returns its typed status. Ensure never aborts: the strict abort is its
+// caller's (§10). May throw what the allocation or a worker's start throws, after the guard has cleared `ensuring`.
 lazy_ring_ensure_status block_ring_ensure(size_t   need,
                                           size_t   span,
                                           int      device,
@@ -548,6 +550,7 @@ enum class lazy_ring_mutant : uint8_t {
     LEASE_BEFORE_GUARD,          // the stage keeps a lease built before its scope's reap guard, so it outlives the reap
     GENERATION_LIVE_IGNORES_PARKED,  // the generation predicate reads only the slot, so a parked pool reads gone
     STRICT_ABORT_DROPPED,            // the STORAGE materialization does not abort on a ring refusal under strict leases
+    NO_ALIGNMENT_CHECK,              // ensure accepts a need that is not whole 4 KiB blocks per slot
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);

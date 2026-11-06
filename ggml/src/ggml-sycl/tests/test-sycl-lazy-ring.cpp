@@ -96,11 +96,11 @@ const char *       k_wider_table = "blk.1.wider.weight";
 constexpr uint64_t k_wider_txn   = 77;
 
 // The strict arm's table: Q8_0 rows of 34 B, 4096 of them, the whole 139264 B fixture file, a STORAGE cache of all
-// 4096 rows over a floor of 1024. Its plan's need is one block short of LAZY_BLOCK_RING_QD x 8192 B, so the creating
-// ensure refuses it as too narrow (§3.3) with one [HOST-PLAN-BUG] line naming 520192 and 524288.
+// 4096 rows over a floor of 1024. Its plan's need is one block per slot short of LAZY_BLOCK_RING_QD x 8192 B, so the
+// creating ensure refuses it as too narrow (§3.3) with one [HOST-PLAN-BUG] line naming 262144 and 524288.
 constexpr int64_t  k_strict_rows       = 4096;
 constexpr size_t   k_strict_file_bytes = k_row_8k * k_strict_rows;
-constexpr size_t   k_strict_need       = k_need_8k - LAZY_IO_BLOCK_BYTES;
+constexpr size_t   k_strict_need       = k_need_8k - LAZY_BLOCK_RING_QD * LAZY_IO_BLOCK_BYTES;
 constexpr size_t   k_strict_floor      = 1024;
 constexpr uint64_t k_strict_budget     = 64 * GiB;
 constexpr uint64_t k_strict_model_id   = 0x7a4b2f;
@@ -130,7 +130,7 @@ const char * k_arm_strict_concurrent =
     "under strict leases the STORAGE materialization aborts on a concurrent ensure after its WARN";
 
 // The strict cases (§10), one for each refusal ring_refusal_is_plan_bug names, each in its own child, since its abort
-// ends the process. TOO_NARROW is the strict table's one-block-short need on a ring-less pool. MISMATCH and CONCURRENT
+// ends the process. TOO_NARROW is the strict table's short need on a ring-less pool. MISMATCH and CONCURRENT
 // plan the full need, LAZY_BLOCK_RING_QD x 8192 B, charged at its mapped size: MISMATCH on a live ring that a fixture's
 // ensure created under transaction 0, which is no plan's creator, so the charge is refused; CONCURRENT on a ring-less
 // pool while the ensure hook holds another caller between its reserve and its allocation. k_strict_cases lists them in
@@ -604,14 +604,14 @@ arm_result settle(arm_result r, uint64_t role0 = UINT64_MAX) {
 // --- the direct planner arms ---
 
 // The ring plan (§3.3, §4.2, §10's ring check). On a fixture pin's ring-less pool, plan A's widest STORAGE table reads
-// 16384 B, so the plan needs LAZY_BLOCK_RING_QD x 16384 B = 1 MiB and charges its mapped size. An ensure one block
-// short of that need refuses as too narrow with one [HOST-PLAN-BUG] line naming both numbers and allocates nothing;
-// the full need allocates one ring, which the published accessor reads as the need, under role LAZY_STAGING; a second
-// call allocates nothing. Plan B, another model's 8192 B table, is covered by that ring: STORAGE with ring= 0 and no
-// decline, and its ensure with a charge of 0 passes. Plan C's 32768 B table is wider than the ring's 16384 B slot: it
-// prints the decline line and, since it cannot be HOST at its reading, refuses as lazy-table-ring-too-narrow.
+// 16384 B, so the plan needs LAZY_BLOCK_RING_QD x 16384 B = 1 MiB and charges its mapped size. An ensure one block per
+// slot short of that need refuses as too narrow with one [HOST-PLAN-BUG] line naming both numbers and allocates
+// nothing; the full need allocates one ring, which the published accessor reads as the need, under role LAZY_STAGING; a
+// second call allocates nothing. Plan B, another model's 8192 B table, is covered by that ring: STORAGE with ring= 0
+// and no decline, and its ensure with a charge of 0 passes. Plan C's 32768 B table is wider than the ring's 16384 B
+// slot: it prints the decline line and, since it cannot be HOST at its reading, refuses as lazy-table-ring-too-narrow.
 // Engagement: the pin holds a lease on a ring-less pool, and plan A plans its table STORAGE.
-// Mutant: no-span-check, under which the one-block-short ensure allocates a ring.
+// Mutant: no-span-check, under which the ensure one block per slot short allocates a ring.
 arm_result arm_ring_plan() {
     arm_result r;
     pin_ptr    pin   = make_pin(0);
@@ -638,18 +638,19 @@ arm_result arm_ring_plan() {
     expect(r, last_ring() == plan_a.block_ring_charge,
            "plan A's line prints ring=" + num(last_ring()) + ", want its charge " + num(plan_a.block_ring_charge));
 
-    const size_t   short_need = k_need_16k - LAZY_IO_BLOCK_BYTES;
+    const size_t   short_need = k_need_16k - LAZY_BLOCK_RING_QD * LAZY_IO_BLOCK_BYTES;
     const uint64_t a0         = registry().ring_allocations;
     log_clear();
     lazy_ring_ensure_status st = block_ring_ensure(short_need, k_span_16k, 0, mapped(short_need), 301);
     const uint64_t          a1 = registry().ring_allocations;
     expect(r, st == lazy_ring_ensure_status::TOO_NARROW && a1 == a0,
-           "the one-block-short ensure returned " + name(st) + " with " + num(a1 - a0) +
+           "the ensure one block per slot short returned " + name(st) + " with " + num(a1 - a0) +
                " allocation(s), want lazy-table-ring-too-narrow and none");
     const std::string short_numbers = "need " + num(short_need) + " B, want " + num(k_need_16k) + " B";
     expect(r, log_count_with("[HOST-PLAN-BUG]", short_numbers.c_str()) == 1,
-           "the one-block-short ensure printed " + num(log_count_with("[HOST-PLAN-BUG]", short_numbers.c_str())) +
-               " [HOST-PLAN-BUG] lines naming '" + short_numbers + "', want 1");
+           "the ensure one block per slot short printed " +
+               num(log_count_with("[HOST-PLAN-BUG]", short_numbers.c_str())) + " [HOST-PLAN-BUG] lines naming '" +
+               short_numbers + "', want 1");
 
     st = block_ring_ensure(k_need_16k, k_span_16k, 0, plan_a.block_ring_charge, 301);
     expect(r, st == lazy_ring_ensure_status::OK, "the full-need ensure returned " + name(st) + ", want ok");
@@ -1458,7 +1459,7 @@ arm_result arm_owner_check() {
 
 // --- the strict arm ---
 
-// The strict table's descriptor (see k_strict_rows): its plan's need is one block short of its span's.
+// The strict table's descriptor (see k_strict_rows): its plan's need is one block per slot short of its span's.
 lazy_table_desc strict_desc() {
     lazy_table_desc d;
     d.name                 = "strict.ring";
@@ -1572,9 +1573,9 @@ bool strict_child_scored(arm_result & r, const strict_case_entry & c) {
 
 // The strict arm, its too-narrow case (§10: a [HOST-PLAN-BUG] aborts under strict leases): run as a child under
 // GGML_SYCL_STRICT_LEASES=1 before this process initialises SYCL, the materialization of a STORAGE table whose plan's
-// need is one block short of its span's aborts at the ensure's refusal, after the ensure's one [HOST-PLAN-BUG] line
-// naming 520192 and 524288 (exit 134, SIGABRT); ensure itself never aborts. The same materialization in this process,
-// not strict, returns lazy-table-ring-too-narrow.
+// need is one block per slot short of its span's aborts at the ensure's refusal, after the ensure's one [HOST-PLAN-BUG]
+// line naming 262144 and 524288 (exit 134, SIGABRT); ensure itself never aborts. The same materialization in this
+// process, not strict, returns lazy-table-ring-too-narrow.
 // Engagement: the child ran within its bound on a filesystem that takes O_DIRECT.
 // Mutant: strict-abort-dropped, under which the materialization returns the refusal under strict leases too.
 arm_result arm_strict() {

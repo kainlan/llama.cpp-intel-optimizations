@@ -1288,6 +1288,22 @@ lazy_ring_ensure_status block_ring_ensure(size_t   need,
                                           int      device,
                                           size_t   plan_charge,
                                           uint64_t load_txn_id) {
+    // O_DIRECT alignment is a plan fact (§5.2): each of the LAZY_BLOCK_RING_QD slots of need / LAZY_BLOCK_RING_QD bytes
+    // must be whole 4 KiB blocks, since a worker reads a block-aligned span into its slot. Any other need is a plan
+    // bug, refused before any lock or state and never rounded up; the line names the next need that splits.
+    constexpr size_t ring_unit = LAZY_BLOCK_RING_QD * LAZY_IO_BLOCK_BYTES;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const bool alignment_check = !lazy_ring_mutant_is(lazy_ring_mutant::NO_ALIGNMENT_CHECK);
+#else
+    const bool alignment_check = true;
+#endif
+    if (alignment_check && need % ring_unit != 0) {
+        const size_t pad = ring_unit - need % ring_unit;
+        lazy_ring_plan_bug("block ring need not whole 4 KiB blocks per slot: need", need,
+                           need <= SIZE_MAX - pad ? need + pad : need - need % ring_unit);
+        return lazy_ring_ensure_status::MISMATCH;
+    }
+
     // Step (1), under the leaf mutex: refuse, accept the live ring, or reserve `ensuring` and take a counted reference
     // that keeps the reserved pool alive through the unlocked allocation. Every log waits for the unlock.
     enum class step1 : uint8_t { RESERVED, SHUT_DOWN, UNPINNED, CONCURRENT, LIVE };

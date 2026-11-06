@@ -186,22 +186,23 @@ struct request_fixture {
 // model's covered plan carries 0, and a need or a span the live ring cannot hold, or a charge other than that rule's,
 // refuses with one [HOST-PLAN-BUG] line naming both numbers (§3.3, §10's ring check). A transaction of 0 names no
 // model, so it is never the creator.
-// Mutant: no-span-check, under which the one-block-short need allocates a ring.
+// Mutant: no-span-check, under which the need one block per slot short allocates a ring.
 arm_result arm_ensure_rules() {
     arm_result r;
     log_clear();
     ring_lease     lease      = lazy_io_pool_take();
     const uint64_t a0         = allocations();
-    const size_t   short_need = k_need - LAZY_IO_BLOCK_BYTES;
+    const size_t   short_need = k_need - LAZY_BLOCK_RING_QD * LAZY_IO_BLOCK_BYTES;
 
     lazy_ring_ensure_status st = block_ring_ensure(short_need, k_span, 0, mapped(short_need), k_txn);
     expect(r, st == lazy_ring_ensure_status::TOO_NARROW && allocations() == a0,
-           "the one-block-short ensure returned " + name(st) + " with " + num(allocations() - a0) +
+           "the ensure one block per slot short returned " + name(st) + " with " + num(allocations() - a0) +
                " allocation(s), want lazy-table-ring-too-narrow and none");
     const std::string short_numbers = "need " + num(short_need) + " B, want " + num(k_need) + " B";
     expect(r, log_count_with("[HOST-PLAN-BUG]", short_numbers.c_str()) == 1,
-           "the one-block-short ensure printed " + num(log_count_with("[HOST-PLAN-BUG]", short_numbers.c_str())) +
-               " [HOST-PLAN-BUG] lines naming '" + short_numbers + "', want 1");
+           "the ensure one block per slot short printed " +
+               num(log_count_with("[HOST-PLAN-BUG]", short_numbers.c_str())) + " [HOST-PLAN-BUG] lines naming '" +
+               short_numbers + "', want 1");
 
     st               = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
     uint64_t   bytes = 0;
@@ -297,6 +298,33 @@ arm_result arm_ensure_creation_refusals() {
     expect(r, st == lazy_ring_ensure_status::OK && registry().ring_bytes == k_need && allocations() == a0 + 3,
            "the ensure after the refusals returned " + name(st) + " with ring " + num(registry().ring_bytes) +
                ", want ok and " + num(k_need));
+    expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
+// O_DIRECT alignment is a plan fact (§5.2): a need that is not whole 4 KiB blocks per slot is a plan bug, refused as
+// lazy-table-ring-mismatch with one [HOST-PLAN-BUG] line naming it and the next need that splits, before ensure
+// reserves or allocates anything, and never rounded up into a ring.
+// Mutant: no-alignment-check, under which the unaligned need allocates a ring.
+arm_result arm_ensure_unaligned_need() {
+    arm_result r;
+    log_clear();
+    ring_lease     lease = lazy_io_pool_take();
+    const uint64_t a0    = allocations();
+    const size_t   need  = k_need + LAZY_IO_BLOCK_BYTES;
+    const size_t   want  = k_need + LAZY_BLOCK_RING_QD * LAZY_IO_BLOCK_BYTES;
+
+    const lazy_ring_ensure_status st = block_ring_ensure(need, k_span, 0, mapped(need), k_txn);
+    expect(r, st == lazy_ring_ensure_status::MISMATCH && allocations() == a0,
+           "the unaligned need returned " + name(st) + " with " + num(allocations() - a0) +
+               " allocation(s), want lazy-table-ring-mismatch and none");
+    const std::string numbers = "need " + num(need) + " B, want " + num(want) + " B";
+    expect(r, log_count_with("[HOST-PLAN-BUG]", numbers.c_str()) == 1,
+           "the unaligned need printed " + num(log_count_with("[HOST-PLAN-BUG]", numbers.c_str())) +
+               " [HOST-PLAN-BUG] lines naming '" + numbers + "', want 1");
+    expect(r, registry().ring_bytes == 0 && !registry().ensuring,
+           "after the refusal the ring holds " + num(registry().ring_bytes) + " B with ensuring " +
+               (registry().ensuring ? "set" : "clear") + ", want 0 and clear");
     expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
     return r;
 }
@@ -611,6 +639,7 @@ lazy_ring_mutant mutant_named(const char * text) {
         { "ensuring-kept-on-throw",  lazy_ring_mutant::ENSURING_KEPT_ON_THROW  },
         { "install-after-shut-down", lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN },
         { "no-span-check",           lazy_ring_mutant::NO_SPAN_CHECK           },
+        { "no-alignment-check",      lazy_ring_mutant::NO_ALIGNMENT_CHECK      },
     };
     for (const entry & e : table) {
         if (std::strcmp(e.text, text) == 0) {
@@ -637,6 +666,7 @@ int main(int argc, char ** argv) {
     const std::vector<named_arm> arms = {
         { "ensure allocates the need once and refuses what the plan did not charge",    arm_ensure_rules             },
         { "a creating ensure refuses a refused, short or mischarged ring and frees it", arm_ensure_creation_refusals },
+        { "a need that is not whole blocks per slot refuses before ensure reserves",    arm_ensure_unaligned_need    },
         { "an ensure with no live pool refuses as unpinned",                            arm_ensure_unpinned          },
         { "a concurrent ensure refuses at once while the reserver is held",             arm_ensure_concurrent        },
         { "a throwing allocation leaves ensuring clear for the next ensure",            arm_ensure_throw             },
