@@ -12816,8 +12816,6 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
     ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
-    // Once at model unload (§5.3 "Where the lead reads both counters").
-    ggml_sycl::unified_cache_file_mapped_counters_log();
     const auto                            owner = ggml_sycl_cpp_token(token);
     ggml_sycl::lifecycle::teardown_ticket ticket;
     ggml_sycl::lifecycle::Registry *      registry = nullptr;
@@ -12845,6 +12843,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
             }
             return ggml_sycl_lifecycle_c_result(ticket.code);
         }
+        // Once at model unload (§5.3 "Where the lead reads both counters"): only the finisher prints it, so a duplicate
+        // teardown (OK_ALREADY_DEAD) that unloads nothing prints no second line.
+        ggml_sycl::unified_cache_file_mapped_counters_log();
         if (!ggml_sycl_teardown_owner_effects(owner)) {
             (void) registry->finalize_teardown(ticket, false);
             return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
