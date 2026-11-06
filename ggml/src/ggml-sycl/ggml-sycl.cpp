@@ -17846,10 +17846,17 @@ thread_local uint64_t g_sycl_plan_load_effect_txn = 0;
 // legacy setter and the test-plan publisher plan with the slot null.
 thread_local const ggml_sycl::ring_lease * g_sycl_lazy_plan_slot = nullptr;
 
+// The slot scope's out-slot (th32 §3.3): a stage that replaces a candidate hands the replaced record's lease here,
+// under the planner caller's g_tensor_inventory_mutex, and the stage loop drops it after that caller returns, so no
+// stage drops a lease under the guard. Null outside a slot scope, where the stage drops what it replaces after its own
+// unlock.
+thread_local ggml_sycl::ring_lease * g_sycl_lazy_plan_displaced = nullptr;
+
 // Publishes a coverage pin on this thread's plan slot for the scope's lifetime and restores the previous slot after it,
 // so scopes nest. The constructor that takes a lazy_coverage_scope is the one a planner caller uses, so the slot only
 // ever names a lease a live scope holds. The testing one takes a fixture's pin guard, which holds its lease the same
-// way.
+// way. The scope also carries the out-slot, which it publishes and restores with the slot; a lease left in it drops
+// with the scope, after both are restored.
 class lazy_plan_slot_scope {
   public:
     explicit lazy_plan_slot_scope(const ggml_sycl::lazy_coverage_scope & coverage) noexcept :
@@ -17859,17 +17866,37 @@ class lazy_plan_slot_scope {
         lazy_plan_slot_scope(pin.pin()) {}
 #endif
 
-    ~lazy_plan_slot_scope() { g_sycl_lazy_plan_slot = previous_; }
+    ~lazy_plan_slot_scope() {
+        g_sycl_lazy_plan_slot      = previous_;
+        g_sycl_lazy_plan_displaced = previous_displaced_;
+    }
 
     lazy_plan_slot_scope(const lazy_plan_slot_scope &)             = delete;
     lazy_plan_slot_scope & operator=(const lazy_plan_slot_scope &) = delete;
 
+    // Drops the lease a stage handed back through the out-slot. The stage loop calls it after each device's planner
+    // call returns, which is after that call's g_tensor_inventory_mutex guard has ended (th32 §3.3).
+    void drop_displaced() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        // The replace-path mutant (th32 §11 T5's two-device arm): the displaced candidate's reference is never dropped.
+        if (ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::REPLACE_KEEPS_DISPLACED) && displaced_.held()) {
+            (void) new ggml_sycl::ring_lease(std::move(displaced_));
+        }
+#endif
+        displaced_.reset();
+    }
+
   private:
-    explicit lazy_plan_slot_scope(const ggml_sycl::ring_lease * pin) noexcept : previous_(g_sycl_lazy_plan_slot) {
-        g_sycl_lazy_plan_slot = pin;
+    explicit lazy_plan_slot_scope(const ggml_sycl::ring_lease * pin) noexcept :
+        previous_(g_sycl_lazy_plan_slot),
+        previous_displaced_(g_sycl_lazy_plan_displaced) {
+        g_sycl_lazy_plan_slot      = pin;
+        g_sycl_lazy_plan_displaced = &displaced_;
     }
 
     const ggml_sycl::ring_lease * previous_;
+    ggml_sycl::ring_lease *       previous_displaced_;
+    ggml_sycl::ring_lease         displaced_;  // the out-slot
 };
 
 // The host budget's pass scope (th32 §4.2): sample, compute, store, then plan. The outermost scope of a load
@@ -17952,12 +17979,17 @@ static bool ggml_sycl_plan_has_storage_table(const ggml_sycl::placement_plan & p
 // store the plan into per-device unified caches.  Idempotent — replaces any
 // previous plan.  Caller must hold g_tensor_inventory_mutex.
 static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t vram_budget, int budget_pct) {
+    // Where either stage call below hands the lease of the candidate it replaces (th32 §3.3). It is empty here because
+    // the stage loop drains it after every planner call; a held lease would drop under this caller's guard when the
+    // stage moved the next one in.
+    ggml_sycl::ring_lease * const displaced_out = g_sycl_lazy_plan_displaced;
+    GGML_ASSERT(displaced_out == nullptr || !displaced_out->held());
     ggml_sycl::placement_plan plan_candidate;
     bool                      have_plan = false;
     if (!ggml_sycl::vram_arena_enabled()) {
         if (g_sycl_plan_load_effect_txn != 0) {
             ggml_sycl::lifecycle_stage_no_placement_plan(g_sycl_plan_load_effect_txn, g_placement_kv_info,
-                                                         g_model_n_layer);
+                                                         g_model_n_layer, displaced_out);
         }
         return;
     }
@@ -18158,19 +18190,11 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
 
     // Stage a full immutable transaction-owned candidate. Process-global and
     // per-cache copies remain legacy execution routing, not model identity.
-    // The replaced candidate's lease comes back here and drops at the end of this block, after the stage's unlock: the
-    // stage's own lease holds the pool, so that drop only decrements.
+    // The replaced candidate's lease goes to the out-slot, for the stage loop to drop after this caller's guard.
     if (g_sycl_plan_load_effect_txn != 0 && have_plan) {
-        ggml_sycl::ring_lease displaced;
         ggml_sycl::lifecycle_stage_placement_plan(g_sycl_plan_load_effect_txn, ggml_sycl::placement_plan(plan),
                                                   plan_snapshot->kv_info, plan_snapshot->model_n_layer,
-                                                  std::move(candidate_lease), &displaced);
-#if defined(GGML_SYCL_PRIVATE_TESTING)
-        // The replace-path mutant (th32 §11 T5's two-device arm): the displaced candidate's reference is never dropped.
-        if (ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::REPLACE_KEEPS_DISPLACED) && displaced.held()) {
-            (void) new ggml_sycl::ring_lease(std::move(displaced));
-        }
-#endif
+                                                  std::move(candidate_lease), displaced_out);
     }
 
     // Publish only after the authoritative plan is complete. Keep this verdict
@@ -18742,6 +18766,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                     throw std::runtime_error("stale host provisioning candidate after allocation");
                 }
             }
+            // The lease of the candidate this device's stage replaced (th32 §3.3), dropped now that the planner call
+            // has returned and its g_tensor_inventory_mutex guard has ended. A return or throw above leaves it to the
+            // slot scope's end, which follows the rollback guard's abort.
+            coverage_slot.drop_displaced();
 #if defined(GGML_SYCL_PRIVATE_TESTING)
             if ((early && g_test_fail_next_stage_inventory_plan_early_after_first_device.exchange(false, std::memory_order_acq_rel)) ||
                 (!early && g_test_fail_next_stage_inventory_plan_late_after_first_device.exchange(false, std::memory_order_acq_rel))) {

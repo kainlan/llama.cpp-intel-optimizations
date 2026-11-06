@@ -1695,9 +1695,11 @@ mutex alone and returns before the check takes `g_runtime_alloc_mutex`, so the
 two are never held together.
 The hold hook, armed at the reap or at the take, runs with no lock held.
 A clone that finds its pool DYING unlocks before it logs and aborts. It may be
-taken while a non-leaf lock is held, as the staged candidate's clone and the
-replaced candidate's drop are under `g_tensor_inventory_mutex`. It is never
-taken while another global L5 lock is held:
+taken while a non-leaf lock is held, as the staged candidate's clone under
+`g_tensor_inventory_mutex` is. The replaced candidate's lease is not dropped
+under that guard: the stage hands it back through the slot's out-slot, and
+`stage_inventory_plan`'s loop drops it after each device's call returns. The
+registry mutex is never taken while another global L5 lock is held:
 `g_lifecycle_plan_mutex` and the retained-handle store's mutex are never held
 when it is taken, and it is never held when they are taken, so the three have no
 order. Once `lazy_io_pool_mark_shut_down()` has run, a lease's drop decrements
