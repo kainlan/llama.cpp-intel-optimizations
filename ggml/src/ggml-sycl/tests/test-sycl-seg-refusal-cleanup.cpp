@@ -77,9 +77,12 @@ std::string status_name(ggml_status s) {
 }
 
 // One planned model of the fixture's two expert tensors, with the PP MoE ring fields libllama computes for this shape.
+// The names are real expert names: the plan is staged before usage registration, so the planner classifies a tensor as
+// an expert by its "_exps" name. Under any other name it is planned as a dense FFN weight, the preload materializes no
+// expert, and the prompt admission finds no per-expert record.
 constexpr uint32_t k_n_ctx    = 512;
 constexpr uint32_t k_n_ubatch = 512;
-const char * const k_names[2] = { "blk.0.seg_refusal_a.weight", "blk.1.seg_refusal_b.weight" };
+const char * const k_names[2] = { "blk.0.ffn_gate_exps.weight", "blk.1.ffn_gate_exps.weight" };
 
 size_t align_256(size_t n) {
     return (n + 255) & ~size_t(255);
