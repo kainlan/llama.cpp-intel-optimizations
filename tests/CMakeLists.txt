@@ -4122,6 +4122,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mapped-loader-source.py --self-test)
     set_tests_properties(test-sycl-mapped-loader-source PROPERTIES
         LABELS "sycl;host;source-contract;python" TIMEOUT 120)
+    # docs/design/sycl-mmap-host-tier.md §7 C4: every test the C4 section names is registered exactly once, read from
+    # the design's own list; with --load-log, the mapped load's DMA staging pool reads 0.0 MB. A plain script whose
+    # planted controls (one registration removed, one doubled, the section gone) run on every invocation.
+    add_test(NAME test-sycl-c4-coverage-source
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-c4-coverage-source.py)
+    set_tests_properties(test-sycl-c4-coverage-source PROPERTIES
+        LABELS "sycl;host;source-contract;python" TIMEOUT 120)
 endif()
 
 # The plan dry run's command line (tools/sycl-plan-dry-run): every option reaches the field the export reads, and the
