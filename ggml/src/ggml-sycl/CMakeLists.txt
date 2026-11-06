@@ -8315,7 +8315,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     #
     # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
     # and the FAIL line of the arm that kills it, which runs alone. Each registers test-sycl-lazy-ring-mutant-<name> on
-    # the one executable, which passes only when that line appears.
+    # the one executable, which passes only when that line appears. The mutant registrations carry no SKIP_RETURN_CODE:
+    # ctest honours a skip code before the regex, so a mutant run that VOIDs with exit 77 would read as skipped with its
+    # kill line never checked. A mutant run has no legitimate skip, so without the code that run fails.
     string(CONCAT _lazy_ring_env
         "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;"
         "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
@@ -8414,7 +8416,6 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
             LABELS "sycl;host;cache;mem-handle;gpu-serial;mutant"
             ENVIRONMENT "${_lazy_ring_env}"
             RUN_SERIAL TRUE
-            SKIP_RETURN_CODE 77
             TIMEOUT 300
             PASS_REGULAR_EXPRESSION "${_regex}")
     endforeach()
