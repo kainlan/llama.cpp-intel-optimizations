@@ -13,6 +13,8 @@
 //   (3) resident_room uses host_headroom(total), not P3's 29 GiB: at MemTotal 62 GiB, MemAvailable_pre 50 GiB,
 //       expected_host 4 GiB and mapped_ws 20 GiB it does not WARN, where P3's constant leaves 17 GiB and would;
 //   (4) a plan with no MemAvailable sample does not WARN, and its plan line says so.
+//   (5) a locked mapping (-lm mmap+mlock) is charged and cannot be dropped: mapped_ws is 0, nothing WARNs, and the
+//       plan line says locked.
 // Every arm names its engagement check. An arm whose engagement check fails is VOID, and a VOID arm fails the binary
 // like a FAIL. Every arm runs, so one failure does not hide the rest. Each registered mutant passes only on its arm's
 // FAIL line.
@@ -74,7 +76,7 @@ const size_t k_expected = gib(20.0);
 // (1) The threshold: past the room it WARNs with every figure, at or under it, it does not.
 void arm_threshold() {
     const char *           arm  = "(1) the WARN fires only past the room";
-    const host_working_set base = host_working_set_check(k_total, k_avail, k_expected, 0);
+    const host_working_set base = host_working_set_check(k_total, k_avail, k_expected, 0, false);
     // Engagement: the room is a positive figure, so a byte past it and a GiB under it both exist.
     if (base.resident_room <= GiB) {
         void_arm(arm, "resident_room is " + std::to_string(base.resident_room) + ", too small to straddle");
@@ -82,7 +84,7 @@ void arm_threshold() {
     }
     const size_t room = base.resident_room;
 
-    const host_working_set over = host_working_set_check(k_total, k_avail, k_expected, room + 1);
+    const host_working_set over = host_working_set_check(k_total, k_avail, k_expected, room + 1, false);
     const std::string      warn = host_working_set_warn_line(over);
     if (warn.empty()) {
         fail(arm, "mapped_ws " + std::to_string(room + 1) + " past resident_room " + std::to_string(room) +
@@ -99,7 +101,7 @@ void arm_threshold() {
     }
     const size_t unders[] = { room, room - GiB, 0 };
     for (size_t mapped : unders) {
-        const host_working_set ws = host_working_set_check(k_total, k_avail, k_expected, mapped);
+        const host_working_set ws = host_working_set_check(k_total, k_avail, k_expected, mapped, false);
         if (!host_working_set_warn_line(ws).empty()) {
             fail(arm, "mapped_ws " + std::to_string(mapped) + " at or below resident_room " +
                           std::to_string(ws.resident_room) + " printed the WARN");
@@ -110,8 +112,8 @@ void arm_threshold() {
 // (2) The plan-report line carries the WARN's figures, and carries them when nothing warns too.
 void arm_plan_line() {
     const char *           arm  = "(2) the plan line carries the WARN's figures";
-    const host_working_set base = host_working_set_check(k_total, k_avail, k_expected, 0);
-    const host_working_set over = host_working_set_check(k_total, k_avail, k_expected, base.resident_room + GiB);
+    const host_working_set base = host_working_set_check(k_total, k_avail, k_expected, 0, false);
+    const host_working_set over = host_working_set_check(k_total, k_avail, k_expected, base.resident_room + GiB, false);
     const std::string      warn = host_working_set_warn_line(over);
     // Engagement: the WARN fires on this plan, so it has figures to compare.
     if (warn.empty()) {
@@ -130,7 +132,7 @@ void arm_plan_line() {
             fail(arm, std::string(tag) + " plan line does not open with its tag: '" + line + "'");
         }
     }
-    const host_working_set fits = host_working_set_check(k_total, k_avail, k_expected, GiB);
+    const host_working_set fits = host_working_set_check(k_total, k_avail, k_expected, GiB, false);
     const std::string      line = host_working_set_plan_line("[PLACEMENT]", fits);
     const std::string      miss = missing_figure(line, fits);
     if (!miss.empty()) {
@@ -147,7 +149,7 @@ void arm_headroom() {
         void_arm(arm, "P3's constant would not WARN at this point either");
         return;
     }
-    const host_working_set ws = host_working_set_check(total, gib(50.0), gib(4.0), gib(20.0));
+    const host_working_set ws = host_working_set_check(total, gib(50.0), gib(4.0), gib(20.0), false);
     if (!host_working_set_warn_line(ws).empty() || ws.headroom != gib(15.5)) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
@@ -161,7 +163,7 @@ void arm_headroom() {
 // (4) No MemAvailable sample: no WARN, and the plan line names the missing sample.
 void arm_no_sample() {
     const char *           arm = "(4) a plan with no sample does not WARN";
-    const host_working_set ws  = host_working_set_check(k_total, 0, k_expected, gib(8.0));
+    const host_working_set ws  = host_working_set_check(k_total, 0, k_expected, gib(8.0), false);
     // Engagement: the plan maps bytes, so a WARN had something to report.
     if (ws.mapped_ws == 0) {
         void_arm(arm, "the plan maps nothing");
@@ -176,6 +178,24 @@ void arm_no_sample() {
     }
 }
 
+// (5) A locked mapping is charged, so it is not working set the kernel may drop: mapped_ws 0, no WARN, check=locked.
+void arm_locked() {
+    const char *           arm      = "(5) a locked mapping is not working set";
+    const host_working_set unlocked = host_working_set_check(k_total, k_avail, k_expected, gib(200.0), false);
+    // Engagement: the same bytes unlocked exceed the room, so a WARN had something to report.
+    if (!unlocked.exceeds) {
+        void_arm(arm, "200 GiB unlocked does not exceed the room");
+        return;
+    }
+    const host_working_set ws   = host_working_set_check(k_total, k_avail, k_expected, gib(200.0), true);
+    const std::string      line = host_working_set_plan_line("[PLACEMENT]", ws);
+    if (ws.mapped_ws != 0 || !host_working_set_warn_line(ws).empty() || !contains(line, "check=locked")) {
+        fail(arm, "200 GiB locked gives mapped_ws " + std::to_string(ws.mapped_ws) + ", WARN " +
+                      (host_working_set_warn_line(ws).empty() ? "silent" : "printed") + ", plan line '" + line +
+                      "', want mapped_ws 0, no WARN and check=locked");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -183,6 +203,7 @@ int main() {
     arm_plan_line();
     arm_headroom();
     arm_no_sample();
+    arm_locked();
     if (g_failures != 0) {
         std::printf("test-sycl-host-working-set-warn: %d failure(s)\n", g_failures);
         return 1;

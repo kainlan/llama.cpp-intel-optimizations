@@ -95,7 +95,7 @@ inline host_budget_result host_budget_compute(const host_budget_inputs & in) {
 }
 
 // The resident working set (§4.5): resident_room = MemAvailable_pre - expected_host - the headroom, and mapped_ws, the
-// host-executed mapped bytes the kernel may drop. exceeds is the WARN.
+// host-executed mapped bytes the kernel may drop. exceeds is the WARN. A locked mapping counts as any other.
 struct host_working_set {
     bool   sampled           = false;  // MemAvailable_pre is a reading
     size_t mem_available_pre = 0;
@@ -109,8 +109,10 @@ struct host_working_set {
 inline host_working_set host_working_set_check(size_t total_bytes,
                                                size_t mem_available_pre,
                                                size_t expected_host,
-                                               size_t mapped_ws) {
+                                               size_t mapped_ws,
+                                               bool   locked) {
     (void) total_bytes;
+    (void) locked;
     host_working_set ws;
     ws.sampled           = mem_available_pre != 0;
     ws.mem_available_pre = mem_available_pre;
