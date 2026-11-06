@@ -130,6 +130,14 @@ def fallback_cleanup_missing(text: str) -> list:
 with gate("the fallback boundary cleanup drains, unpins and clears state before returning FAILED"):
     missing = fallback_cleanup_missing(sycl)
     assert not missing, missing
+# Positive control for the strip: an early return planted at the catch's top inside a mutant block must leave every
+# token found, and the same return outside a block must hide them, so the gate reads past mutant code and only that.
+with gate("the cleanup gate reads past a mutant block's early return and stops at a bare one"):
+    planted = "#if defined(GGML_SYCL_SCRATCH_MUTANTS)\n        return GGML_STATUS_FAILED;\n#endif\n"
+    assert sycl.count(FALLBACK_CATCH) == 1, sycl.count(FALLBACK_CATCH)
+    assert not fallback_cleanup_missing(sycl.replace(FALLBACK_CATCH, FALLBACK_CATCH + planted))
+    bare = "        return GGML_STATUS_FAILED;\n"
+    assert fallback_cleanup_missing(sycl.replace(FALLBACK_CATCH, FALLBACK_CATCH + bare))
 
 # Segment 1 may already be asynchronously submitted when segment 2 fails.
 # Per-attempt baselines preserve prior handles; current handles roll back only
