@@ -127,6 +127,10 @@ constexpr uint64_t k_other_load_txn_id     = 0x5e11;
 // strict mode meets only the check under test.
 constexpr uint64_t k_ledger_budget = 64 * GiB;
 
+// The strict child's switch, its whole setting: unified-cache.cpp is the one place the variable's name is read, so this
+// file names it only with its "=1" and cuts the name from it to clear it.
+const char * k_strict_setting = "GGML_SYCL_STRICT_LEASES=1";
+
 std::string g_fixture_path;
 std::string g_eof_fixture_path;
 bool        g_direct_unsupported       = false;  // the fixture's filesystem refuses O_DIRECT: the reading arms are VOID
@@ -1209,7 +1213,8 @@ int main(int argc, char ** argv) {
     }
 
     // The refusal arms read the typed refusal, which strict mode turns into an abort; the strict arm sets it alone.
-    unsetenv("GGML_SYCL_STRICT_LEASES");
+    const std::string strict_name(k_strict_setting, std::strchr(k_strict_setting, '=') - k_strict_setting);
+    unsetenv(strict_name.c_str());
 
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) == nullptr) {
@@ -1257,7 +1262,7 @@ int main(int argc, char ** argv) {
 
     // Both children start before this process initialises SYCL.
     g_guard_run  = spawn("--guard-child", nullptr);
-    g_strict_run = spawn("--strict-child", "GGML_SYCL_STRICT_LEASES=1");
+    g_strict_run = spawn("--strict-child", k_strict_setting);
     std::fputs(g_guard_run.err.c_str(), stderr);
     std::fputs(g_strict_run.err.c_str(), stderr);
 
