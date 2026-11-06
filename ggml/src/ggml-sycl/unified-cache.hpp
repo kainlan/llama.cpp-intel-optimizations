@@ -18,6 +18,7 @@
 #include "host-zone-plan.hpp"
 #include "kv-room-cost.hpp"
 #include "kv-runtime-demotion.hpp"
+#include "lazy-io-pool.hpp"
 #include "mem-handle.hpp"
 #include "model-lifecycle.hpp"
 #include "moe-control-plan.hpp"
@@ -61,10 +62,6 @@
 namespace ggml_sycl {
 
 struct onednn_scratch_token;
-
-// The lazy tables' coverage pin (lazy-io-pool.hpp, th32 §3.3): the planners take a const pointer to one and read the
-// IO pool's ring bytes through it, so only unified-cache.cpp includes the definition.
-class ring_lease;
 
 // Forward declaration — needed by unified_cache::process_deferred_frees_public()
 bool unified_cache_is_graph_compute_active();
@@ -2405,14 +2402,23 @@ void                                           lifecycle_stage_probe_placement_p
                                                                                     uint32_t                  model_n_layer = 0);
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_plan(uint64_t load_txn_id) noexcept;
 void                                           lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept;
+
+// Stages the load's candidate (th32 §3.3). `lease` is the candidate's reference on the IO pool, given only when the plan
+// has a STORAGE table; the record holds it, never the snapshot. The lease of the candidate this replaces is moved to
+// *displaced_out for the caller to drop after its own locks, or dropped here after the unlock when that is null.
 void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
                                     placement_plan            plan,
                                     const placement_kv_info & kv_info       = {},
-                                    uint32_t                  model_n_layer = 0);
+                                    uint32_t                  model_n_layer = 0,
+                                    ring_lease                lease         = ring_lease(),
+                                    ring_lease *              displaced_out = nullptr);
+// Stages an explicit no-plan candidate, which holds no lease; the replaced candidate's lease goes as above.
 void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
                                        const placement_kv_info & kv_info       = {},
-                                       uint32_t                  model_n_layer = 0);
-void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept;
+                                       uint32_t                  model_n_layer = 0,
+                                       ring_lease *              displaced_out = nullptr);
+// Aborts the load's candidate and its probe placement; the candidate's lease goes as the stage's does.
+void lifecycle_abort_placement_plan(uint64_t load_txn_id, ring_lease * displaced_out = nullptr) noexcept;
 
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placement_plan(uint64_t load_txn_id) noexcept;
 bool lifecycle_publish_placement_plan(

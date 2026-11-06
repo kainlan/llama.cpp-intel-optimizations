@@ -199,8 +199,9 @@ bool lazy_io_pool_generation_live(uint64_t generation) noexcept;
 // The one wrapper a planner caller holds around its planning (§3.3): its constructor runs the entry FULL reap, take_if
 // takes the provisional lease, pin() hands it to the planners, and its destructor drops the lease and then runs the
 // closing FULL reap, by member order (the reap guard is declared before the lease, so it is built first and destroyed
-// last). Declared in an unlocked context. It holds only the lease and pin(). No production caller builds this scope
-// yet; the T5 engine (design §11 row T5) adds it.
+// last). Declared in an unlocked context. It holds only the lease and pin(). Its production callers are the stage,
+// ggml_backend_sycl_stage_load_inventory_plan, which declares it before its try so the closing reap runs after the
+// rollback guard, and the plan dry run.
 class lazy_coverage_scope {
   public:
     lazy_coverage_scope() noexcept                               = default;

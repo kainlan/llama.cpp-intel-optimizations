@@ -13229,10 +13229,19 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
                              (unsigned long long) owner.model.value, (unsigned long long) owner.load.value,
                              owner.owner.slot, (unsigned long long) owner.owner.generation);
     bool clean = true;
-    try {
-        ggml_sycl::lifecycle_abort_placement_plan(owner.load.value);
-    } catch (...) {
-        clean = false;
+    {
+        ggml_sycl::ring_lease aborted;  // the aborted candidate's lease, dropped at the end of this block
+        try {
+            ggml_sycl::lifecycle_abort_placement_plan(owner.load.value, &aborted);
+        } catch (...) {
+            clean = false;
+        }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        // The rollback mutant (th32 §11 T5's partial-failure arm): the rolled-back candidate's clone is never dropped.
+        if (ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::ROLLBACK_KEEPS_CLONE) && aborted.held()) {
+            (void) new ggml_sycl::ring_lease(std::move(aborted));
+        }
+#endif
     }
     try {
         clean = ggml_sycl::unified_cache_note_model_load_abort(owner.load.value) && clean;
@@ -17832,15 +17841,15 @@ thread_local uint64_t g_sycl_plan_load_effect_txn = 0;
 // The lazy tables' coverage pin for the plan this thread is building (th32 §3.3): a planner caller publishes the pin of
 // its lazy_coverage_scope here through lazy_plan_slot_scope, and compute_and_store_plan_for_inventory reads it at its
 // planner calls, so a planning entry reached through any caller plans against the lease that caller holds. Null outside
-// such a scope: a plan made then makes no lazy table STORAGE-eligible. No production caller builds the scope yet; the
-// T5 engine (design §11 row T5) adds it. Until then the slot is null on every load, so a table that fails the HOST test
-// refuses the plan as lazy-table-ring-unpinned.
+// such a scope: a plan made then makes no lazy table STORAGE-eligible, so a table that fails the HOST test refuses the
+// plan as lazy-table-ring-unpinned. The stage and the plan dry run each build the scope; the public early entry, the
+// legacy setter and the test-plan publisher plan with the slot null.
 thread_local const ggml_sycl::ring_lease * g_sycl_lazy_plan_slot = nullptr;
 
 // Publishes a coverage pin on this thread's plan slot for the scope's lifetime and restores the previous slot after it,
 // so scopes nest. The constructor that takes a lazy_coverage_scope is the one a planner caller uses, so the slot only
-// ever names a lease a live scope holds; nothing in production constructs it yet (T5 adds that caller). The testing one
-// takes a fixture's pin guard, which holds its lease the same way.
+// ever names a lease a live scope holds. The testing one takes a fixture's pin guard, which holds its lease the same
+// way.
 class lazy_plan_slot_scope {
   public:
     explicit lazy_plan_slot_scope(const ggml_sycl::lazy_coverage_scope & coverage) noexcept :
@@ -17929,6 +17938,16 @@ static void ggml_sycl_fill_explicit_ubatch_room(int device) {
         device, g_placement_kv_info.n_ubatch_context, g_placement_kv_info.n_ubatch);
 }
 
+// Whether `plan` places any lazy table STORAGE: the plans that read through the IO pool's block ring (th32 §3.3).
+static bool ggml_sycl_plan_has_storage_table(const ggml_sycl::placement_plan & plan) {
+    for (const ggml_sycl::placement_lazy_table & t : plan.lazy_tables) {
+        if (t.residency == ggml_sycl::lazy_residency::STORAGE) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Phase C helper: run compute_placement_plan (single- or multi-device) and
 // store the plan into per-device unified caches.  Idempotent — replaces any
 // previous plan.  Caller must hold g_tensor_inventory_mutex.
@@ -17954,6 +17973,8 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     // sample this load's stored budget came from, so every plan of the load reads the values its budget does.
     g_placement_kv_info.host_mem_available_pre = ggml_sycl::host_ledger_mem_available();
     g_placement_kv_info.host_budget_overridden = ggml_sycl::host_ledger_budget_overridden();
+    // The load a STORAGE decline line names (§3.3): this thread's staged transaction, 0 for a direct planner entry.
+    g_placement_kv_info.lazy_load_txn          = g_sycl_plan_load_effect_txn;
     const bool   is_moe                        = g_moe_n_experts_total > 0;
     const auto & info                          = ggml_sycl_info();
     if (ggml_sycl_plan_multi_device()) {
@@ -18105,11 +18126,51 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         ggml_sycl_make_provisional_plan_snapshot(std::move(plan_candidate), g_placement_kv_info, g_model_n_layer);
     const auto & plan          = *plan_snapshot->plan;
 
+    // The candidate's own reference on the IO pool (th32 §3.3): a clone of the lease the planners read coverage
+    // through, taken only for a plan with a STORAGE table, so the pool and its ring outlive the stage's scope until the
+    // record that holds it is erased. A null slot makes no table STORAGE-eligible, so a STORAGE plan without a lease
+    // is a defect.
+    ggml_sycl::ring_lease candidate_lease;
+    const bool            storage = have_plan && ggml_sycl_plan_has_storage_table(plan);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // The window between the coverage read and the stage (§11 T5's window arm), and its mutant, which holds no lease
+    // across it: the stage's lease is dropped once planned and a fresh one taken past the plan point.
+    const bool lease_at_stage = storage && g_sycl_lazy_plan_slot != nullptr &&
+                                ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::LEASE_AT_STAGE);
+    if (lease_at_stage) {
+        const_cast<ggml_sycl::ring_lease *>(g_sycl_lazy_plan_slot)->reset();
+    }
+    ggml_sycl::ggml_sycl_test_lazy_plan_point();
+    if (lease_at_stage) {
+        *const_cast<ggml_sycl::ring_lease *>(g_sycl_lazy_plan_slot) = ggml_sycl::lazy_io_pool_take();
+    }
+    const bool candidate_lease_dropped =
+        ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::NO_CANDIDATE_LEASE);
+#else
+    constexpr bool candidate_lease_dropped = false;
+#endif
+    // The stage's assert (th32 §3.3): the planner places a table STORAGE only through a coverage pin, and the pin is the
+    // slot's lease, so a plan staged without a lease carries no STORAGE table.
+    GGML_ASSERT(!storage || g_sycl_lazy_plan_slot != nullptr);
+    if (storage && !candidate_lease_dropped) {
+        candidate_lease = g_sycl_lazy_plan_slot->clone();
+    }
+
     // Stage a full immutable transaction-owned candidate. Process-global and
     // per-cache copies remain legacy execution routing, not model identity.
+    // The replaced candidate's lease comes back here and drops at the end of this block, after the stage's unlock: the
+    // stage's own lease holds the pool, so that drop only decrements.
     if (g_sycl_plan_load_effect_txn != 0 && have_plan) {
+        ggml_sycl::ring_lease displaced;
         ggml_sycl::lifecycle_stage_placement_plan(g_sycl_plan_load_effect_txn, ggml_sycl::placement_plan(plan),
-                                                  plan_snapshot->kv_info, plan_snapshot->model_n_layer);
+                                                  plan_snapshot->kv_info, plan_snapshot->model_n_layer,
+                                                  std::move(candidate_lease), &displaced);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        // The replace-path mutant (th32 §11 T5's two-device arm): the displaced candidate's reference is never dropped.
+        if (ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::REPLACE_KEEPS_DISPLACED) && displaced.held()) {
+            (void) new ggml_sycl::ring_lease(std::move(displaced));
+        }
+#endif
     }
 
     // Publish only after the authoritative plan is complete. Keep this verdict
@@ -18574,12 +18635,30 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
     if (ggml_sycl_inventory_malformed(inventory)) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // The ordering mutant (th32 §11 T5's all-HOST arm): a lease declared before the scope outlives its closing reap.
+    ggml_sycl::ring_lease lease_before_guard;
+#endif
+    // The provisional lease (th32 §3.3): declared before the try, so its drop and the closing reap run after the
+    // rollback guard has aborted a failed stage's candidate and dropped that candidate's clone; the entry reap has run
+    // by the time the take below builds or joins the pool.
+    ggml_sycl::lazy_coverage_scope coverage;
     try {
         auto & registry = ggml_sycl::lifecycle::global_registry();
         auto   effect   = registry.acquire_load_effect(registry.bound_candidate());
         if (!effect) {
             return GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION;
         }
+        // The take precedes every planner call of the stage, so each coverage read of both passes and every device
+        // reads under this lease, and a read's drop in between cannot empty the pool the plan counted as covering.
+        coverage.take_if(inventory->lazy_table_count > 0);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        if (coverage.pin() != nullptr &&
+            ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::LEASE_BEFORE_GUARD)) {
+            lease_before_guard = coverage.pin()->clone();
+        }
+#endif
+        lazy_plan_slot_scope coverage_slot(coverage);
 
         struct plan_effect_scope {
             uint64_t                        previous;
@@ -18943,8 +19022,10 @@ ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const place
 // device to its budget authority's answer; a single-device plan to the arena's reservation when the device's cache
 // has an active arena, else to the authority's answer. A device budget in `opts` replaces either. Each device's budget
 // lands in `device_budget`, and the lazy tables' planner input, the one every plan here is decided from, in
-// `lazy_infos`. Plans nothing when the VRAM arena is disabled, as the stage then plans nothing. Reads a cache that
-// exists and creates none. Caller holds g_tensor_inventory_mutex and a saved state.
+// `lazy_infos`. Each planner reads the block ring's coverage through `coverage_pin`, the caller's provisional lease
+// (th32 §3.3), as the stage's planners read the stage's. Plans nothing when the VRAM arena is disabled, as the stage
+// then plans nothing. Reads a cache that exists and creates none. Caller holds g_tensor_inventory_mutex and a saved
+// state.
 static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     const ggml_sycl_tensor_inventory *  inventory,
     const ggml_sycl_plan_dry_run_opts & opts,
@@ -18952,7 +19033,8 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     size_t                              mem_available,
     bool                                budget_overridden,
     uint64_t (&device_budget)[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES],
-    std::vector<ggml_sycl::placement_lazy_table_info> & lazy_infos) {
+    std::vector<ggml_sycl::placement_lazy_table_info> & lazy_infos,
+    const ggml_sycl::ring_lease *                       coverage_pin) {
     std::vector<ggml_sycl::placement_plan> plans;
     if (!ggml_sycl::vram_arena_enabled()) {
         GGML_LOG_INFO("[PLAN-DRY-RUN] the VRAM arena is disabled, so the load plans nothing and neither does this\n");
@@ -18967,6 +19049,7 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     // ledger's stored values.
     kv.host_mem_available_pre = mem_available;
     kv.host_budget_overridden = budget_overridden;
+    kv.lazy_load_txn          = 0;  // no load is open: a decline line names load=0, never the last load's transaction
     lazy_infos                = kv.lazy_tables;
     if (kv.n_ubatch_context != 0) {
         GGML_LOG_INFO(
@@ -19012,15 +19095,15 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
             const bool is_moe = n_experts > 0;
             plans.push_back(ggml_sycl::compute_multi_device_plan(budgets, detail, static_cast<int>(inventory->n_layer),
                                                                  ggml_sycl_plan_multi_gpu_mode(is_moe), kv,
-                                                                 opts.envelope, n_experts, host_budget));
+                                                                 opts.envelope, n_experts, host_budget, coverage_pin));
         } else {
             const size_t forced = override_for(i);
             const size_t plan_budget =
                 forced != 0 ? forced : ggml_sycl_plan_single_device_budget(i, authority.budget_bytes);
             device_budget[i] = plan_budget;
             unmodelled[i] |= ggml_sycl_plan_single_device_arena_cache(i) == nullptr;
-            plans.push_back(
-                ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope, n_experts, host_budget));
+            plans.push_back(ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope, n_experts,
+                                                              host_budget, coverage_pin));
         }
     }
     std::string no_arena;
@@ -19074,6 +19157,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         }
         in = *opts;
     }
+    // The dry run's own provisional lease (th32 §3.3), through the stage's wrapper: its entry reap frees a parked pool
+    // before the take, so expected_host never charges a dying ring beside the new pool's need, and its closing reap
+    // frees the pool the dry run built before it returns.
+    ggml_sycl::lazy_coverage_scope coverage;
     try {
         // A load plans against the budget its transaction stored, and a live model's plan is the device's: a dry run
         // beside either would plan against state it does not own, so it is refused before anything is sampled.
@@ -19085,6 +19172,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         if (ggml_backend_sycl_get_device_count() <= 0) {
             return GGML_SYCL_LIFECYCLE_NOT_FOUND;
         }
+        coverage.take_if(inventory->lazy_table_count > 0);
 
         // th32 §4.2: the dry run samples before its own planner call with no lock held, computes the budget a load
         // would store from that sample, and passes it to the planner. It never stores, so a later load's budget is
@@ -19123,7 +19211,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
             ggml_sycl_plan_dry_run_saved_state saved(ggml_sycl_info().total_gpu_count);
             multi_device = ggml_sycl_plan_multi_device();
             plans = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, sample.available_bytes, reserve_override,
-                                                 out.device_budget_bytes, lazy_infos);
+                                                 out.device_budget_bytes, lazy_infos, coverage.pin());
         }
         for (int d = 0; d < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES; ++d) {
             if (out.device_budget_bytes[d] != 0) {
@@ -126935,6 +127023,19 @@ bool ggml_sycl_plan_lazy_tables_for_testing(ggml_sycl_model_token model, uint64_
     return true;
 }
 
+// C linkage from the header's declarations, like the accessor above.
+bool ggml_sycl_lazy_block_ring_bytes_for_testing(uint64_t * out) {
+    return ggml_sycl::lazy_block_ring_bytes(out);
+}
+
+bool ggml_sycl_lazy_ring_coverage_reads_for_testing(uint64_t * out) {
+    if (out == nullptr) {
+        return false;
+    }
+    *out = ggml_sycl::lazy_ring_coverage_reads();
+    return true;
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 extern "C" uint64_t ggml_sycl_test_plan_effect_begin(uint64_t load_txn_id) {
     const uint64_t previous     = g_sycl_plan_load_effect_txn;
@@ -127001,6 +127102,10 @@ void ggml_backend_sycl_shutdown(void) {
     g_adaptive_prestage.stop();
     ggml_sycl_tp_worker_shutdown();
     cpu_worker_shutdown();
+    // The IO pool's reads (th32 §3.3): a read can complete after its context was freed, so its queued reads are
+    // cancelled and the picked ones waited out here, before any retained handle or cache goes, which drops every read's
+    // lease. Shutdown is already a waiting context.
+    ggml_sycl::lazy_io_pool_shutdown();
     split_config_shutdown_reset();
     ggml_sycl_watchdog_stop();
     ggml_sycl_quarantine_drain_shutdown();
@@ -127444,6 +127549,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_sycl_plan_lazy_tables_for_testing") == 0) {
         return (void *) ggml_sycl_plan_lazy_tables_for_testing;
+    }
+    if (strcmp(name, "ggml_sycl_lazy_block_ring_bytes_for_testing") == 0) {
+        return (void *) ggml_sycl_lazy_block_ring_bytes_for_testing;
+    }
+    if (strcmp(name, "ggml_sycl_lazy_ring_coverage_reads_for_testing") == 0) {
+        return (void *) ggml_sycl_lazy_ring_coverage_reads_for_testing;
     }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_sycl_test_plan_effect_begin") == 0) {

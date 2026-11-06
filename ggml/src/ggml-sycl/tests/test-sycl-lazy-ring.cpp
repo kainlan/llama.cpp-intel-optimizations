@@ -176,10 +176,13 @@ template <typename F> F proc(const char * proc_name) {
     return reinterpret_cast<F>(ggml_backend_reg_get_proc_address(ggml_backend_sycl_reg(), proc_name));
 }
 
-// The live bytes of role LAZY_STAGING on device 0, the ring's device in every ensure here.
-uint64_t role_bytes() {
+// The live bytes of role LAZY_STAGING on device 0, the ring's device in every ensure here. The reader is VOID for a
+// device with no cache (§3.1), which main creates before any arm; an unreadable reading VOIDs the arm, never reads as 0.
+uint64_t role_bytes(arm_result & r) {
     uint64_t v = 0;
-    (void) unified_cache_role_bytes_for_testing(0, alloc_role::LAZY_STAGING, &v);
+    if (!unified_cache_role_bytes_for_testing(0, alloc_role::LAZY_STAGING, &v)) {
+        void_arm(r, "device 0 has no cache, so its LAZY_STAGING reading is VOID");
+    }
     return v;
 }
 
@@ -562,8 +565,8 @@ arm_result settle(arm_result r, uint64_t role0 = UINT64_MAX) {
     const lazy_registry_state s = registry();
     expect(r, registry_is(s, 0, 0, 0), "after the arm's closing reap: " + describe(s) + ", want 0, 0, 0");
     if (role0 != UINT64_MAX) {
-        expect(r, role_bytes() == role0,
-               "after the arm's closing reap the ring's LAZY_STAGING bytes are " + num(role_bytes()) + ", want " +
+        expect(r, role_bytes(r) == role0,
+               "after the arm's closing reap the ring's LAZY_STAGING bytes are " + num(role_bytes(r)) + ", want " +
                    num(role0));
     }
     return r;
@@ -589,7 +592,7 @@ arm_result arm_ring_plan() {
         return settle(r);
     }
     const size_t   reading = step2 + 64 * GiB;
-    const uint64_t role0   = role_bytes();
+    const uint64_t role0   = role_bytes(r);
 
     const placement_lazy_table_info a = planner_table("blk.1.ring_a.weight", k_ne0_16k, k_huge_table);
     log_clear();
@@ -633,8 +636,9 @@ arm_result arm_ring_plan() {
     }
     expect(r, registry().ring_allocations == a0 + 1,
            "the full-need ensure made " + num(registry().ring_allocations - a0) + " allocation(s), want 1");
-    expect(r, role_bytes() - role0 == k_need_16k,
-           "the ring's LAZY_STAGING bytes rose by " + num(role_bytes() - role0) + ", want the need " + num(k_need_16k));
+    const uint64_t rose = role_bytes(r) - role0;
+    expect(r, rose == k_need_16k,
+           "the ring's LAZY_STAGING bytes rose by " + num(rose) + ", want the need " + num(k_need_16k));
 
     st = block_ring_ensure(k_need_16k, k_span_16k, 0, plan_a.block_ring_charge, 301);
     expect(r, st == lazy_ring_ensure_status::OK && registry().ring_allocations == a0 + 1,
@@ -812,7 +816,7 @@ arm_result arm_wider_p3() {
 arm_result arm_staging_pass() {
     arm_result         r;
     lazy_inventory     inv("blk.1.stage.weight", k_ne0_8k, k_huge_table);
-    const uint64_t     role0 = role_bytes();
+    const uint64_t     role0 = role_bytes(r);
     ggml_sycl_load_txn txn{};
     if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
         void_arm(r, "the load transaction did not begin");
@@ -844,8 +848,8 @@ arm_result arm_staging_pass() {
     const lazy_ring_ensure_status st = block_ring_ensure(k_need_8k, k_span_8k, 0, charge, txn.id);
     expect(r, st == lazy_ring_ensure_status::OK,
            "the ensure with the late pass's charge returned " + name(st) + ", want ok");
-    expect(r, role_bytes() - role0 == k_need_8k && registry().ring_allocations == 1,
-           "the ledger shows " + num(role_bytes() - role0) + " ring bytes from " + num(registry().ring_allocations) +
+    expect(r, role_bytes(r) - role0 == k_need_8k && registry().ring_allocations == 1,
+           "the ledger shows " + num(role_bytes(r) - role0) + " ring bytes from " + num(registry().ring_allocations) +
                " allocation(s), want one ring of " + num(k_need_8k) + " B");
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
     return settle(r, role0);
@@ -862,7 +866,7 @@ arm_result arm_lease() {
     arm_result     r;
     lazy_inventory inv_a("blk.1.lease_a.weight", k_ne0_8k, k_huge_table);
     lazy_inventory inv_b("blk.1.lease_b.weight", k_ne0_8k, k_huge_table);
-    const uint64_t role0 = role_bytes();
+    const uint64_t role0 = role_bytes(r);
     model_load     a     = load_model(r, inv_a, "model A");
     if (!a.ok) {
         return settle(r);
@@ -894,8 +898,8 @@ arm_result arm_lease() {
            "after the read's delivery the pool holds " + num(registry().live_leases) + " leases, want 1, B's");
     st = ensure_for(b);
     expect(r, st == lazy_ring_ensure_status::OK, "model B's ensure returned " + name(st) + ", want ok");
-    expect(r, role_bytes() - role0 == k_need_8k && registry().ring_allocations == 1,
-           "the ledger shows " + num(role_bytes() - role0) + " ring bytes from " + num(registry().ring_allocations) +
+    expect(r, role_bytes(r) - role0 == k_need_8k && registry().ring_allocations == 1,
+           "the ledger shows " + num(role_bytes(r) - role0) + " ring bytes from " + num(registry().ring_allocations) +
                " allocation(s), want one ring of " + num(k_need_8k) + " B");
     unload(b);
     return settle(r, role0);
@@ -945,7 +949,7 @@ arm_result arm_window() {
     arm_result     r;
     lazy_inventory inv_a("blk.1.window_a.weight", k_ne0_8k, k_huge_table);
     lazy_inventory inv_b("blk.1.window_b.weight", k_ne0_8k, k_huge_table);
-    const uint64_t role0 = role_bytes();
+    const uint64_t role0 = role_bytes(r);
     model_load     a     = load_model(r, inv_a, "model A");
     if (!a.ok) {
         return settle(r);
@@ -1001,8 +1005,8 @@ arm_result arm_window() {
     if (rc != GGML_SYCL_LIFECYCLE_OK) {
         stage_failed(r, "model B's early stage", rc);
     }
-    expect(r, role_bytes() - role0 == k_need_8k && registry().ring_allocations == 1,
-           "the ledger shows " + num(role_bytes() - role0) + " ring bytes from " + num(registry().ring_allocations) +
+    expect(r, role_bytes(r) - role0 == k_need_8k && registry().ring_allocations == 1,
+           "the ledger shows " + num(role_bytes(r) - role0) + " ring bytes from " + num(registry().ring_allocations) +
                " allocation(s), want one ring of " + num(k_need_8k) + " B");
     (void) ggml_backend_sycl_model_load_end(txn_b, false, nullptr);
     return settle(r, role0);
@@ -1082,7 +1086,7 @@ arm_result arm_all_host() {
     arm_result         r;
     lazy_inventory     inv("blk.1.host.weight", k_ne0_8k, k_host_table);
     const size_t       body  = mapped(lazy_table_host_body_request_bytes(0, inv.table.size));
-    const uint64_t     role0 = role_bytes();
+    const uint64_t     role0 = role_bytes(r);
     ggml_sycl_load_txn txn{};
     if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
         void_arm(r, "the load transaction did not begin");
@@ -1131,7 +1135,7 @@ arm_result arm_all_host() {
 arm_result arm_two_device() {
     arm_result     r;
     lazy_inventory inv("blk.1.pair.weight", k_ne0_8k, k_huge_table);
-    const uint64_t role0 = role_bytes();
+    const uint64_t role0 = role_bytes(r);
     model_load     m     = load_model(r, inv, "the model");
     if (!m.ok) {
         return settle(r);
@@ -1146,8 +1150,8 @@ arm_result arm_two_device() {
     ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
     const lazy_registry_state s = registry();
     expect(r, registry_is(s, 0, 0, 0), "after the unload and the reap: " + describe(s) + ", want 0, 0, 0");
-    expect(r, role_bytes() == role0,
-           "after the unload and the reap the ring's LAZY_STAGING bytes are " + num(role_bytes()) +
+    expect(r, role_bytes(r) == role0,
+           "after the unload and the reap the ring's LAZY_STAGING bytes are " + num(role_bytes(r)) +
                ", want the pre-ensure " + num(role0));
     return settle(r, role0);
 }
@@ -1222,7 +1226,8 @@ ggml_sycl_lifecycle_result dry_run(const ggml_sycl_tensor_inventory * inv) {
 // are parked, the dry run's plan charges ring= the need's mapped size from a fresh pool, as the early stage of the
 // same inventory does.
 // Engagement: the guard holds a lease and its drop parks the pool held in the hook within the bound; the dry run
-// returns OK; A's unload leaves its pool parked.
+// returns OK and installs one pool, so a dry run that takes no lease fails before the snapshot is read; A's unload
+// leaves its pool parked.
 // Mutants: no-entry-reap (the take snapshots c0 reaps run) and no-closing-reap (the dry run's pool survives it parked).
 arm_result arm_dry_run() {
     arm_result     r;
@@ -1242,6 +1247,7 @@ arm_result arm_dry_run() {
     }
     const lazy_registry_state held = registry();
     const uint64_t            c0   = held.full_reaps_run;
+    const uint64_t            g0   = held.generation;
     if (!entered || !registry_is(held, 0, 0, 1)) {
         release(hold);
         dropper.join();
@@ -1254,6 +1260,8 @@ arm_result arm_dry_run() {
     const ggml_sycl_lifecycle_result rc    = dry_run(inv.inv());
     const lazy_registry_state        after = registry();
     expect(r, rc == GGML_SYCL_LIFECYCLE_OK, "the dry run returned " + num(rc) + ", want OK");
+    expect(r, after.generation - g0 == 1,
+           "the dry run moved the registry generation by " + num(after.generation - g0) + ", want 1: it took no lease");
     expect(r, after.reaps_run_at_last_take == c0 + 1,
            "the dry run's take snapshot " + num(after.reaps_run_at_last_take) + " reaps run, want " + num(c0 + 1) +
                ": the entry reap did not run before the take");
@@ -1659,6 +1667,13 @@ int main(int argc, char ** argv) {
         }
     }
     g_backend0 = backends.front().get();
+    // The ring's LAZY_STAGING reading needs device 0's cache, and neither the direct planner arms nor the ring's
+    // HOST_CPU allocation builds one; a load's stage builds it before any ensure, so it is built here before any arm.
+    if (get_unified_cache_for_device(0) == nullptr) {
+        std::printf("FAIL: device 0's cache was not created, so every LAZY_STAGING reading would be VOID\n");
+        ::unlink(g_fixture_path.c_str());
+        return 1;
+    }
 
     const std::vector<named_arm> arms = {
         { k_arm_ring_plan,     arm_ring_plan       },

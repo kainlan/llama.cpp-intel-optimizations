@@ -137,12 +137,21 @@ void stamp_pending_owner(unified_cache_entry & entry, const cache_load_effect & 
     }
 }
 
-std::mutex                                                                   g_lifecycle_plan_mutex;
-std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_plan_candidates;
+// A staged or published plan's record (th32 §3.3): the immutable snapshot every reader shares, and the ring lease the
+// record holds while it is staged or published. The lease never enters the snapshot, so a reader that copies the
+// snapshot takes no reference on the IO pool. Every function that displaces or erases a record moves its lease into a
+// local declared before the lock and drops it after the unlock: a drop may park the pool, which takes the registry's
+// leaf mutex, and nothing is taken under this one.
+struct lifecycle_plan_record {
+    std::shared_ptr<const lifecycle_plan_snapshot> snapshot;
+    ring_lease                                     lease;
+};
+
+std::mutex                                                                        g_lifecycle_plan_mutex;
+std::unordered_map<uint64_t, lifecycle_plan_record>                               g_lifecycle_plan_candidates;
 // Unpublished probe-placement plans (the load-time measure's (a) stage), keyed by the load's transaction.
-std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_probe_plans;
-std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>>
-    g_lifecycle_plan_models;
+std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>      g_lifecycle_probe_plans;
+std::unordered_map<uint64_t, std::unordered_map<uint64_t, lifecycle_plan_record>> g_lifecycle_plan_models;
 std::atomic<uint64_t> g_lifecycle_plan_next_version{ 1 };
 }  // namespace
 
@@ -195,18 +204,30 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_make_candidate_snapshot
 void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
                                     placement_plan            plan,
                                     const placement_kv_info & kv_info,
-                                    uint32_t                  model_n_layer) {
+                                    uint32_t                  model_n_layer,
+                                    ring_lease                lease,
+                                    ring_lease *              displaced_out) {
     if (load_txn_id == 0) {
         return;
     }
-    auto snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
-    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
-    g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
+    auto       snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
+    ring_lease displaced;  // the replaced candidate's lease, dropped after the unlock
+    {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        lifecycle_plan_record &     record = g_lifecycle_plan_candidates[load_txn_id];
+        displaced                          = std::move(record.lease);
+        record.snapshot                    = std::move(snapshot);
+        record.lease                       = std::move(lease);
+    }
+    if (displaced_out != nullptr) {
+        *displaced_out = std::move(displaced);
+    }
 }
 
 void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
                                        const placement_kv_info & kv_info,
-                                       uint32_t                  model_n_layer) {
+                                       uint32_t                  model_n_layer,
+                                       ring_lease *              displaced_out) {
     if (load_txn_id == 0) {
         return;
     }
@@ -215,15 +236,23 @@ void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
     snapshot->explicit_no_plan = true;
     snapshot->model_n_layer    = model_n_layer;
     snapshot->kv_info          = kv_info;
-    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
-    g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
+    ring_lease displaced;  // the replaced candidate's lease, dropped after the unlock
+    {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        lifecycle_plan_record &     record = g_lifecycle_plan_candidates[load_txn_id];
+        displaced                          = std::move(record.lease);
+        record.snapshot                    = std::move(snapshot);
+    }
+    if (displaced_out != nullptr) {
+        *displaced_out = std::move(displaced);
+    }
 }
 
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placement_plan(uint64_t load_txn_id) noexcept {
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
         const auto                  candidate = g_lifecycle_plan_candidates.find(load_txn_id);
-        return candidate == g_lifecycle_plan_candidates.end() ? nullptr : candidate->second;
+        return candidate == g_lifecycle_plan_candidates.end() ? nullptr : candidate->second.snapshot;
     } catch (...) {
         return nullptr;
     }
@@ -259,12 +288,20 @@ void lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept {
     }
 }
 
-void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept {
+void lifecycle_abort_placement_plan(uint64_t load_txn_id, ring_lease * displaced_out) noexcept {
+    ring_lease displaced;  // the aborted candidate's lease, dropped after the unlock
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
-        g_lifecycle_plan_candidates.erase(load_txn_id);
+        const auto                  candidate = g_lifecycle_plan_candidates.find(load_txn_id);
+        if (candidate != g_lifecycle_plan_candidates.end()) {
+            displaced = std::move(candidate->second.lease);
+            g_lifecycle_plan_candidates.erase(candidate);
+        }
         g_lifecycle_probe_plans.erase(load_txn_id);  // the probe placement lives as long as the candidate
     } catch (...) {
+    }
+    if (displaced_out != nullptr) {
+        *displaced_out = std::move(displaced);
     }
 }
 
@@ -276,13 +313,14 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
                                       uint64_t actual_device_bytes,
                                       bool     have_actual,
                                       std::shared_ptr<const lifecycle_plan_snapshot> * published_out) noexcept {
+    ring_lease displaced;  // a lease the publish displaces, dropped after the unlock
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
         auto                        candidate = g_lifecycle_plan_candidates.find(load_txn_id);
         if (candidate == g_lifecycle_plan_candidates.end()) {
             return false;
         }
-        auto published                                 = std::make_shared<lifecycle_plan_snapshot>(*candidate->second);
+        auto published = std::make_shared<lifecycle_plan_snapshot>(*candidate->second.snapshot);
         published->model_id                            = model_id;
         published->slot                                = slot;
         published->slot_generation                     = slot_generation;
@@ -306,12 +344,18 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
         }
         published->version = lifecycle_next_plan_publication_id();
         if (published->version == 0) {
+            displaced = std::move(candidate->second.lease);
             g_lifecycle_plan_candidates.erase(candidate);
             g_lifecycle_probe_plans.erase(load_txn_id);
             return false;
         }
         std::shared_ptr<const lifecycle_plan_snapshot> immutable = std::move(published);
-        g_lifecycle_plan_models[model_id][load_txn_id] = immutable;
+
+        // The insertion is the last step that can throw; the candidate keeps its lease until it has succeeded.
+        lifecycle_plan_record & record = g_lifecycle_plan_models[model_id][load_txn_id];
+        displaced                      = std::move(record.lease);
+        record.snapshot                = immutable;
+        record.lease                   = std::move(candidate->second.lease);
         g_lifecycle_plan_candidates.erase(candidate);
         g_lifecycle_probe_plans.erase(load_txn_id);  // the probe placement lives as long as the candidate
         if (published_out) {
@@ -330,7 +374,7 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uin
         return nullptr;
     }
     auto plan = model->second.find(load_txn_id);
-    return plan == model->second.end() ? nullptr : plan->second;
+    return plan == model->second.end() ? nullptr : plan->second.snapshot;
 }
 
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(uint64_t model_id,
@@ -363,7 +407,7 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
             return false;
         }
         auto current = model->second.find(expected->load_txn_id);
-        if (current == model->second.end() || current->second.get() != expected.get()) {
+        if (current == model->second.end() || current->second.snapshot.get() != expected.get()) {
             return false;
         }
         const auto stable_workspace = [&] {
@@ -382,7 +426,7 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
         if (!unified_cache_moe_mmid_registry().replace_plan(
                 expected, replacement, replacement->version, stable_workspace)) return false;
         try {
-            current->second = replacement;
+            current->second.snapshot = replacement;
         } catch (...) {
             (void) unified_cache_moe_mmid_registry().replace_plan(
                 replacement, expected, expected->version, stable_workspace);
@@ -490,13 +534,18 @@ bool workspace_admission_authority_issuer::direct(
 }
 
 void lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept {
+    ring_lease displaced;  // the erased record's lease, dropped after the unlock
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
         auto                        model = g_lifecycle_plan_models.find(model_id);
         if (model == g_lifecycle_plan_models.end()) {
             return;
         }
-        model->second.erase(load_txn_id);
+        const auto record = model->second.find(load_txn_id);
+        if (record != model->second.end()) {
+            displaced = std::move(record->second.lease);
+            model->second.erase(record);
+        }
         if (model->second.empty()) {
             g_lifecycle_plan_models.erase(model);
         }
@@ -27966,6 +28015,14 @@ void unified_cache_host_scratch_drop_context(uint64_t context_key) {
 }
 
 size_t unified_cache_host_zone_owner_check(alloc_lifetime lifetime, alloc_owner_ref owner) {
+    // The block ring's rows (th32 §3.3) are POOL rows owned by the IO pool's registry generation. While the registry
+    // holds that pool, in its slot or parked for the FULL reap that frees its ring, the rows are the pool's and the
+    // check is silent; it reports them only once that generation is gone. The predicate takes the registry's leaf
+    // mutex, so it is read here, before g_runtime_alloc_mutex and never under it.
+    if (lifetime == alloc_lifetime::POOL && owner.kind == alloc_owner_kind::IO_POOL &&
+        lazy_io_pool_generation_live(owner.id)) {
+        return 0;
+    }
     // Copied under the registry mutex, reported after it is released: the report prints, and may abort. A row already
     // RELEASING is on its way out through its owner's own release, so only LIVE rows count as leaked.
     std::vector<host_zone_record_view> owned;
@@ -33844,9 +33901,12 @@ static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_la
 // STORAGE when the coverage pin makes it eligible, at its cache floor of 2 x n_ubatch x rows_per_token slots, n_ubatch
 // read through placement_load_n_ubatch as the stage reads it; otherwise the plan refuses, naming the ring:
 // lazy-table-ring-unpinned with no pin, lazy-table-ring-too-narrow when the live ring's slot is narrower than the
-// table's read span. After the pass the block ring is sized over the STORAGE tables and charged unless the live ring
-// holds it; the floors and the ring must fit both the budget and P3, or the plan refuses as
-// lazy-table-cache-below-floor. What both leave above that is the STORAGE caches' yieldable share (§6.4), split in
+// table's read span. That second-model rule (§3.3) is an input to the pass, not a demotion after it: a table whose span
+// exceeds the live slot (live / QD) is not STORAGE-eligible, prints one decline line naming the load, the table and
+// both spans, and takes the HOST test at its position. After the pass the block ring is sized over the STORAGE tables
+// and charged unless the live ring holds it; the floors and the ring must fit both the budget and P3, or the plan
+// refuses as lazy-table-cache-below-floor. The live ring is read through the pin by lazy_ring_coverage_read, which
+// counts each read (§10): one per table for eligibility, one for the need and one for the charge. What both leave above that is the STORAGE caches' yieldable share (§6.4), split in
 // proportion to table_bytes x rows_per_token. A cold expert class refuses as cold-set-not-implemented. A refused plan
 // carries no table and no ring, and host_planned_bytes is then the zone total.
 static void placement_plan_decide_lazy_residency(placement_plan &          plan,
@@ -33877,7 +33937,6 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
     const size_t   mem_pre    = kv_info.host_mem_available_pre;
     const size_t   fit_room   = host_ledger_sat_sub(budget, host_ledger_sat_add(step2, reserve + envelope));
     const size_t   p3_room    = host_ledger_sat_sub(mem_pre, host_ledger_sat_add(step2, p3_margin));
-    const uint64_t ring_bytes = coverage_pin != nullptr ? coverage_pin->ring_bytes() : 0;
 
     std::vector<size_t> order(kv_info.lazy_tables.size());
     for (size_t i = 0; i < order.size(); ++i) {
@@ -33928,11 +33987,22 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
             host_cpu_mapped_size(lazy_table_host_body_request_bytes(info.file_offset, info.table_bytes));
         const size_t with   = host_ledger_sat_add(used, body);
         const size_t span   = lazy_block_ring_span(info.row_size);
+        // The eligibility read: a live ring whose slot is narrower than this table's span declines it, loudly, before
+        // the HOST test, which then decides it as for any table. No ring yet, or no pin, declines nothing.
+        const uint64_t live     = lazy_ring_coverage_read(coverage_pin);
+        const bool     declined = live != 0 && span > live / LAZY_BLOCK_RING_QD;
+        if (declined) {
+            GGML_LOG_WARN(
+                "[LAZY-PLAN] STORAGE declined for model load=%llu %s: span %zu B needed, live block ring spans "
+                "%llu B\n",
+                (unsigned long long) kv_info.lazy_load_txn, info.name.c_str(), span,
+                (unsigned long long) (live / LAZY_BLOCK_RING_QD));
+        }
         if (body != 0 && with <= fit_room && with <= p3_room) {
             t.residency           = lazy_residency::HOST;
             t.host_resident_bytes = body;
             used                  = with;
-        } else if (coverage_pin != nullptr && (ring_bytes == 0 || span <= ring_bytes / LAZY_BLOCK_RING_QD)) {
+        } else if (coverage_pin != nullptr && !declined) {
             t.residency              = lazy_residency::STORAGE;
             t.cache_slots            = t.cache_floor_slots;
             t.host_resident_bytes    = lazy_row_cache_resident_bytes(t.cache_slots, info.row_size);
@@ -33943,7 +34013,7 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
             refuse(coverage_pin == nullptr ? "lazy-table-ring-unpinned" : "lazy-table-ring-too-narrow",
                    "table=" + info.name + " mapped=" + std::to_string(body) + " fit_room=" + std::to_string(fit_room) +
                        " p3_room=" + std::to_string(p3_room) + " decided=" + std::to_string(used) +
-                       " span=" + std::to_string(span) + " ring_bytes=" + std::to_string(ring_bytes));
+                       " span=" + std::to_string(span) + " ring_bytes=" + std::to_string(live));
             break;
         }
         plan.lazy_tables.push_back(t);
@@ -33951,9 +34021,21 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
     }
 
     if (plan.lazy_refusal.empty() && plan.block_ring_span_max != 0) {
-        plan.block_ring_qd     = LAZY_BLOCK_RING_QD;
-        plan.block_ring_need   = LAZY_BLOCK_RING_QD * plan.block_ring_span_max;
-        plan.block_ring_charge = ring_bytes >= plan.block_ring_need ? 0 : host_cpu_mapped_size(plan.block_ring_need);
+        // The need's read: the need is ensure's argument and the plan's decline test (§3.3), so a live ring that does
+        // not hold it refuses the plan. Every STORAGE table was admitted within the live slot and a ring is never
+        // resized under a lease, so only a ring installed after the eligibility reads can reach the refusal.
+        const size_t   need      = LAZY_BLOCK_RING_QD * plan.block_ring_span_max;
+        const uint64_t need_live = lazy_ring_coverage_read(coverage_pin);
+        if (need_live != 0 && need > need_live) {
+            refuse("lazy-table-ring-too-narrow",
+                   "need=" + std::to_string(need) + " ring_bytes=" + std::to_string(need_live));
+        } else {
+            // The charge's read: 0 when the live ring holds the need, else the need's mapped size (§4.2).
+            const uint64_t charge_live = lazy_ring_coverage_read(coverage_pin);
+            plan.block_ring_qd         = LAZY_BLOCK_RING_QD;
+            plan.block_ring_need       = need;
+            plan.block_ring_charge     = charge_live >= need ? 0 : host_cpu_mapped_size(need);
+        }
     }
     const size_t needed = host_ledger_sat_add(used, plan.block_ring_charge);
     if (plan.lazy_refusal.empty() && (needed > fit_room || needed > p3_room)) {

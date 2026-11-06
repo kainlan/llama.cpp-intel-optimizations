@@ -1687,19 +1687,26 @@ it, allocates the ring and starts the engine's workers after the unlock, and
 installs both under it unless the registry was shut down meanwhile, in which
 case it frees its ring after the unlock. The ring's allocation carries the
 `POOL` lifetime with owner kind `IO_POOL`, whose id is the pool's registry
-generation, so no model's or backend's owner check matches it.
+generation, so no model's or backend's owner check matches it. The owner check
+for that owner is silent while the registry still holds the generation, in its
+slot or parked for the `FULL` reap, and reports the ring's rows only once the
+generation is gone. Its predicate, `lazy_io_pool_generation_live()`, takes this
+mutex alone and returns before the check takes `g_runtime_alloc_mutex`, so the
+two are never held together.
 The hold hook, armed at the reap or at the take, runs with no lock held.
 A clone that finds its pool DYING unlocks before it logs and aborts. It may be
-taken while a non-leaf lock is held, as a clone under `g_tensor_inventory_mutex`
-will be. It is never taken while another global L5 lock is held:
+taken while a non-leaf lock is held, as the staged candidate's clone and the
+replaced candidate's drop are under `g_tensor_inventory_mutex`. It is never
+taken while another global L5 lock is held:
 `g_lifecycle_plan_mutex` and the retained-handle store's mutex are never held
 when it is taken, and it is never held when they are taken, so the three have no
 order. Once `lazy_io_pool_mark_shut_down()` has run, a lease's drop decrements
 without taking it, so a lease destroyed during static destruction never touches
 it. The host SCRATCH ledger's and holder plan's mutexes are strict leaves, so
-they have no order with it either. No production path takes it yet: the load's
-stage and the plan dry run plan with a null coverage pin until the IO engine
-adopts the coverage wrapper.
+they have no order with it either. The load's stage and the plan dry run each
+take it through the coverage wrapper before their first planner call, and the
+planners' coverage reads go through the lease that take holds, never through
+this mutex.
 
 The lazy row cache's per-shard `lazy_row_cache::shard::mutex` (`lazy-row-cache.cpp`,
 th32 T4; design `sycl-storage-tier-lazy-tables.md` §6.3, §6.4) exists once per
@@ -1757,7 +1764,13 @@ cache's `rw_mutex_` reads the bound load's candidate plan through
 under the L1 `g_tensor_inventory_mutex`. No rank below L5 is consistent with
 those holders. Its critical sections are map lookups, inserts and erases and
 `shared_ptr` copies. A snapshot displaced or erased under it frees only heap
-memory, because a placement plan holds no allocation handle.
+memory, because a placement plan holds no allocation handle. A staged or
+published record also holds the IO pool's ring lease (th32 §3.3) beside its
+snapshot, never inside it, so a reader that copies the snapshot takes no
+reference on the pool. A lease that a stage, a publish, an abort or an erase
+displaces is moved under this mutex into a local declared before it and dropped
+after the unlock, since a drop takes the registry's `g_lazy_registry_mutex`;
+so that mutex is never taken while this one is held.
 
 One path is **not conforming**, and it is recorded here rather than implied
 away. `lifecycle_replace_placement_plan()` calls the MoE MMID workspace

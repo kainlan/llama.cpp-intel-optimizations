@@ -360,9 +360,33 @@ void lazy_io_pool_mark_shut_down() noexcept {
     g_lazy_shut_down.store(true, std::memory_order_release);
 }
 
+// LAZY_IO_POOL_MUTANT_GENERATION_LIVE_IGNORES_PARKED, and the runtime selector's GENERATION_LIVE_IGNORES_PARKED, read
+// the slot alone, so a parked pool's generation reads gone before the FULL reap has freed its ring. Only
+// test-sycl-lazy-io-pool-host's mutant target defines the macro; it passes only when the host test prints the parked
+// pool's FAIL text.
 bool lazy_io_pool_generation_live(uint64_t generation) noexcept {
-    (void) generation;
+    if (generation == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+    if (g_lazy_pool != nullptr && g_lazy_pool->generation == generation) {
+        return true;
+    }
+#if defined(LAZY_IO_POOL_MUTANT_GENERATION_LIVE_IGNORES_PARKED)
     return false;
+#else
+#    if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (lazy_ring_mutant_is(lazy_ring_mutant::GENERATION_LIVE_IGNORES_PARKED)) {
+        return false;
+    }
+#    endif
+    for (const lazy_reap_node * node = g_lazy_reap_list; node != nullptr; node = node->next) {
+        if (node->pool != nullptr && node->pool->generation == generation) {
+            return true;
+        }
+    }
+    return false;
+#endif
 }
 
 // LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP and LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP each drop one of the wrapper's two reaps.
@@ -1350,6 +1374,9 @@ uint64_t lazy_ring_coverage_read(const ring_lease * pin) noexcept {
     }
     g_lazy_ring_coverage_reads.fetch_add(1, std::memory_order_relaxed);
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (lazy_ring_mutant_is(lazy_ring_mutant::IGNORE_LIVE_RING)) {
+        return 0;
+    }
     if (lazy_ring_mutant_is(lazy_ring_mutant::LEASE_PRESENCE_AS_COVERAGE) && pin->held()) {
         return UINT64_MAX;
     }
