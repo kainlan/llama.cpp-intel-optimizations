@@ -456,7 +456,7 @@ size_t lazy_io_submit(uint64_t               context,
 
 // Backend shutdown's step (§3.3): cancels the live engine's queued reads, delivering each waiter ECANCELED, and waits
 // for the reads the workers have picked to finish, their leases dropped. Shutdown is already a waiting context. It
-// sets no flag and reaps nothing; the lease drain that follows it does both.
+// sets no flag and reaps nothing; the lease drain (§3.3) is to do both.
 void lazy_io_pool_shutdown() noexcept;
 
 // One coverage read (§10's lazy_ring_coverage_reads): the live ring's bytes through `pin`, counted. No pin is no
