@@ -237,12 +237,33 @@ arm_result arm_b_the_slot_reaches_the_planner() {
     return arr;
 }
 
-// (c) A refused plan refuses the load at the stage (th32 §4.3 step 4): with no pin on the slot, a ~1 TiB table can be
-// neither HOST (it exceeds the budget at any reading) nor STORAGE, so the plan refuses as lazy-table-ring-unpinned, and
-// the early stage returns PLAN_REJECTED with exactly one "[HOST-PLAN] load refused:" WARN naming the reason, and its
-// rollback leaves no candidate for the transaction.
-// Engagement: the planner's [HOST-PLAN] lazy line carries refusal=lazy-table-ring-unpinned, so the stage was shown a
-// refused plan.
+// The live ring the refusal arms hold: 256 KiB, so its slot spans 256 KiB / LAZY_BLOCK_RING_QD = 4096 B, narrower than
+// the 8192 B read span of a table's 34 B rows (lazy_block_ring_span), which declines the table for STORAGE (§3.3).
+constexpr uint64_t k_narrow_ring = 256 * 1024;
+
+// The fixture's pin and the ring it reads, or null after a VOID naming why: a lease on a pool whose ring holds
+// `ring_bytes`, read from the registry, since the helper returns a guard even when its take came back empty.
+void * pin_with_ring(arm_result & arr, uint64_t ring_bytes) {
+    const ggml_sycl::lazy_registry_state before = registry();
+    void *                               pin    = ggml_sycl_test_coverage_pin_make(ring_bytes);
+    const ggml_sycl::lazy_registry_state after  = registry();
+    if (pin == nullptr || after.live_leases <= before.live_leases || after.ring_bytes != ring_bytes) {
+        ggml_sycl_test_coverage_pin_release(pin);
+        void_arm(arr, "the pin holds no lease on a ring of " + num(ring_bytes) + " B: the live leases went from " +
+                          num(before.live_leases) + " to " + num(after.live_leases) + ", the ring reads " +
+                          num(after.ring_bytes) + " B");
+        return nullptr;
+    }
+    return pin;
+}
+
+// (c) A refused plan refuses the load at the stage (th32 §4.3 step 4): a fixture's pin holds a live ring of 256 KiB,
+// the stage's own lease joins its pool, and the ring's 4096 B slot is narrower than the ~1 TiB table's 8192 B read
+// span, so the planner declines the table for STORAGE; it cannot be HOST either (it exceeds the budget at any
+// reading), so the plan refuses as lazy-table-ring-too-narrow, and the early stage returns PLAN_REJECTED with exactly
+// one "[HOST-PLAN] load refused:" WARN naming the reason, and its rollback leaves no candidate for the transaction.
+// Engagement: the pin holds a lease on a pool whose ring reads 256 KiB, and the planner's [HOST-PLAN] lazy line carries
+// refusal=lazy-table-ring-too-narrow, so the stage was shown a refused plan.
 // Mutants: the stage's refusal check dropped (the early stage returns OK and the load goes on with a plan that holds no
 // table); the WARN printed at both checks (the count is not 1). A WARN printed once per device is not among them: both
 // registrations expose one device to the backend (see the header), so it would still print once.
@@ -260,31 +281,39 @@ arm_result arm_c_the_stage_refuses_a_refused_plan() {
         void_arm(arr, "the load transaction did not begin");
         return arr;
     }
+    void * pin = pin_with_ring(arr, k_narrow_ring);
+    if (pin == nullptr) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        return arr;
+    }
     log_clear();
     const ggml_sycl_lifecycle_result rc   = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, true);
     const lazy_reading               left = read_candidate(txn);
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    ggml_sycl_test_coverage_pin_release(pin);
 
-    if (log_lines_containing("[HOST-PLAN] lazy ", "refusal=lazy-table-ring-unpinned").empty()) {
-        void_arm(arr, "no plan line carries refusal=lazy-table-ring-unpinned, so the stage saw no refused plan");
+    if (log_lines_containing("[HOST-PLAN] lazy ", "refusal=lazy-table-ring-too-narrow").empty()) {
+        void_arm(arr, "no plan line carries refusal=lazy-table-ring-too-narrow, so the stage saw no refused plan");
         return arr;
     }
     expect(arr, rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
            "the early stage returned " + num(rc) + ", want PLAN_REJECTED (" + num(GGML_SYCL_LIFECYCLE_PLAN_REJECTED) +
                ")");
-    const size_t warned = log_lines_containing("[HOST-PLAN] load refused: lazy-table-ring-unpinned ").size();
+    const size_t warned = log_lines_containing("[HOST-PLAN] load refused: lazy-table-ring-too-narrow ").size();
     expect(arr, warned == 1,
-           "the stage logged " + num(warned) + " load-refused lines naming lazy-table-ring-unpinned, want 1");
+           "the stage logged " + num(warned) + " load-refused lines naming lazy-table-ring-too-narrow, want 1");
     expect(arr, !left.ok, "a candidate is still staged for the refused load");
     return arr;
 }
 
-// (d) The late pass refuses on its own check (th32 §4.3 step 4): the early stage, with a fixture's pin on the thread's
-// plan slot, plans a ~1 TiB table STORAGE and returns OK; with the slot closed, the late stage's plan cannot hold the
-// table (no pin, and it exceeds the budget), so it refuses as lazy-table-ring-unpinned, and the late stage returns
-// PLAN_REJECTED with exactly one load-refused WARN, the late check's (early=0), and none from the early check.
-// Engagement: the pin holds a lease, the early stage returns OK with its candidate carrying the table, and the late
-// plan's [HOST-PLAN] lazy line carries refusal=lazy-table-ring-unpinned.
+// (d) The late pass refuses on its own check (th32 §4.3 step 4): a fixture's pin holds a ring-less pool, which the
+// early stage's own lease joins, so the early plan holds the ~1 TiB table STORAGE and the stage returns OK; the
+// fixture then ensures a 256 KiB ring on that pool, as an earlier model's materialization would have, and the late
+// stage's lease reads a live ring whose 4096 B slot is narrower than the table's 8192 B span, so its plan refuses as
+// lazy-table-ring-too-narrow, and the late stage returns PLAN_REJECTED with exactly one load-refused WARN, the late
+// check's (early=0), and none from the early check.
+// Engagement: the pin holds a lease, the early stage returns OK with its candidate carrying the table, the ensure
+// installs the 256 KiB ring, and the late plan's [HOST-PLAN] lazy line carries refusal=lazy-table-ring-too-narrow.
 // Mutant: the late pass's refusal check dropped (the late stage configures the refused plan's host zones and returns
 // OK).
 arm_result arm_d_the_late_pass_refuses() {
@@ -301,46 +330,49 @@ arm_result arm_d_the_late_pass_refuses() {
         void_arm(arr, "the load transaction did not begin");
         return arr;
     }
-    const ggml_sycl::lazy_registry_state before = registry();
-    void *                               pin    = ggml_sycl_test_coverage_pin_make(0);
-    const ggml_sycl::lazy_registry_state after  = registry();
-    if (pin == nullptr || after.live_leases <= before.live_leases) {
-        ggml_sycl_test_coverage_pin_release(pin);
+    void * pin = pin_with_ring(arr, 0);
+    if (pin == nullptr) {
         (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
-        void_arm(arr, "the pin holds no lease: the registry's live leases went from " + num(before.live_leases) +
-                          " to " + num(after.live_leases) + " across coverage_pin_make");
         return arr;
     }
     log_clear();
-    void *                           slot     = ggml_sycl_test_lazy_slot_begin(pin);
     const ggml_sycl_lifecycle_result early_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, true);
-    ggml_sycl_test_lazy_slot_end(slot);
-    const lazy_reading early = read_candidate(txn);
+    const lazy_reading               early    = read_candidate(txn);
     if (early_rc != GGML_SYCL_LIFECYCLE_OK || !early.ok || early.count != 1) {
         (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
         ggml_sycl_test_coverage_pin_release(pin);
-        void_arm(arr, "the early stage with a pin on the slot returned " + num(early_rc) + " with " +
+        void_arm(arr, "the early stage returned " + num(early_rc) + " with " +
                           (early.ok ? num(early.count) + " lazy tables" : std::string("no candidate")) +
                           ", want OK with 1");
+        return arr;
+    }
+    const ggml_sycl::lazy_ring_ensure_status ensured = ggml_sycl::block_ring_ensure(
+        k_narrow_ring, k_narrow_ring / ggml_sycl::LAZY_BLOCK_RING_QD, 0, host_cpu_mapped_size(k_narrow_ring), txn.id);
+    if (ensured != ggml_sycl::lazy_ring_ensure_status::OK || registry().ring_bytes != k_narrow_ring) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        ggml_sycl_test_coverage_pin_release(pin);
+        void_arm(arr, std::string("the fixture's ensure of a ") + num(k_narrow_ring) + " B ring returned " +
+                          ggml_sycl::lazy_ring_ensure_status_name(ensured) + " and the ring reads " +
+                          num(registry().ring_bytes) + " B");
         return arr;
     }
     const ggml_sycl_lifecycle_result late_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, false);
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
     ggml_sycl_test_coverage_pin_release(pin);
 
-    if (log_lines_containing("[HOST-PLAN] lazy ", "refusal=lazy-table-ring-unpinned").empty()) {
-        void_arm(arr, "no plan line carries refusal=lazy-table-ring-unpinned, so the late stage saw no refused plan");
+    if (log_lines_containing("[HOST-PLAN] lazy ", "refusal=lazy-table-ring-too-narrow").empty()) {
+        void_arm(arr, "no plan line carries refusal=lazy-table-ring-too-narrow, so the late stage saw no refused plan");
         return arr;
     }
     expect(arr, late_rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
            "the late stage returned " + num(late_rc) + ", want PLAN_REJECTED (" +
                num(GGML_SYCL_LIFECYCLE_PLAN_REJECTED) + ")");
     const size_t late_warned =
-        log_lines_containing("[HOST-PLAN] load refused: lazy-table-ring-unpinned ", "(early=0)").size();
+        log_lines_containing("[HOST-PLAN] load refused: lazy-table-ring-too-narrow ", "(early=0)").size();
     const size_t early_warned = log_lines_containing("[HOST-PLAN] load refused: ", "(early=1)").size();
     expect(arr, late_warned == 1 && early_warned == 0,
            "the two stages logged " + num(late_warned) + " late and " + num(early_warned) +
-               " early load-refused lines, want 1 late naming lazy-table-ring-unpinned and no early one");
+               " early load-refused lines, want 1 late naming lazy-table-ring-too-narrow and no early one");
     return arr;
 }
 

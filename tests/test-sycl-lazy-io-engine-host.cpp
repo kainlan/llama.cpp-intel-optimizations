@@ -1,0 +1,645 @@
+// The block ring's ensure and the IO engine (docs/design/sycl-storage-tier-lazy-tables.md §3.3, §5.2, §5.3, §10):
+// the first ensure allocates exactly the plan's need and later calls allocate nothing, every mismatch with the plan
+// refuses naming both numbers, one flight at a time (a concurrent ensure refuses at once with its WARN line), a
+// throwing allocation leaves no ensuring state behind, shut-down refuses and frees the reserver's ring, a second
+// coverage pin while the first is live joins its ring and ensures nothing (another size aborts), a worker's read
+// lands in its waiter's slot, a failed read reaches the ticket with one WARN, a read's last drop on a worker frees only
+// the ring, and shutdown cancels the queued reads and waits for the picked ones. Ensure itself never aborts: under
+// strict leases its one production caller does, and test-sycl-lazy-ring scores that abort.
+//
+// Host-only, because none of this needs a device: ensure allocates through lazy_io_allocate_host, a link seam the
+// fixture header defines with a counting ledger, and the workers read through the PRIVATE_TESTING read source. Links
+// ggml-sycl/lazy-io-pool.cpp and the row cache its reaper inserts into (lazy-row-cache.cpp, host-cpu-mapping.cpp), with
+// ggml-base for the log and the abort.
+//
+// The mutants are the runtime selector's (§11), one --mutant registration each, which passes only when the arm that
+// kills it prints its FAIL line. Every hold is released on an observed event, never on a timer, within a 5 s bound past
+// which the arm is VOID, which fails the binary like a FAIL.
+
+#include "../ggml/src/ggml-sycl/lazy-io-pool.hpp"
+#include "../ggml/src/ggml-sycl/tests/lazy-io-host-fixture.hpp"
+#include "../ggml/src/ggml-sycl/tests/lazy-io-test-util.hpp"
+#include "../ggml/src/ggml-sycl/tests/lazy-table-test-util.hpp"
+
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace ggml_sycl;
+using namespace host_ledger_test_harness;
+using host_ledger_test_harness::arm_loop::named_arm;
+using host_ledger_test_harness::arm_loop::run_arms;
+using lazy_io_test::file_byte;
+using lazy_io_test::fill_source;
+using lazy_io_test::gate;
+using lazy_io_test::gated_source;
+using lazy_io_test::wait_for;
+using lazy_table_test::registry;
+
+namespace {
+
+constexpr size_t   k_span  = 2 * LAZY_IO_BLOCK_BYTES;      // one row of at most 4 KiB: two blocks
+constexpr size_t   k_need  = LAZY_BLOCK_RING_QD * k_span;  // the plan's need for that span
+constexpr uint64_t k_txn   = 42;
+constexpr uint64_t k_file  = 9;
+constexpr auto     k_bound = std::chrono::seconds(5);
+
+// The mismatched-pin child's switch: a pin of k_need, then one of twice that while the first is live.
+const char * k_pin_child = "--mismatched-pin-child";
+
+std::string name(lazy_ring_ensure_status s) {
+    return lazy_ring_ensure_status_name(s);
+}
+
+uint64_t allocations() {
+    return lazy_io_host_fixture::g_state.allocations.load();
+}
+
+uint64_t live_charged() {
+    return lazy_io_host_fixture::g_state.live_charged.load();
+}
+
+size_t mapped(size_t bytes) {
+    return host_cpu_mapped_size(bytes);
+}
+
+// Waits for the reads' leases to drop, since a worker drops its read's lease after the delivery the arm observed, then
+// drops `lease` and runs a FULL reap, so the next arm finds no pool. True when no pool is left, live or parked.
+bool settle(ring_lease & lease) {
+    const uint64_t own   = lease.held() ? 1 : 0;
+    const bool     quiet = wait_for([own] { return registry().live_leases <= own; });
+    lease.reset();
+    ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    const lazy_registry_state s = registry();
+    return quiet && s.live_pools == 0 && s.parked_nodes == 0;
+}
+
+void gate_hold(void * ctx) {
+    static_cast<gate *>(ctx)->hold();
+}
+
+void gate_release(void * ctx) {
+    static_cast<gate *>(ctx)->release();
+}
+
+// Fails the read at block `*ctx` with EIO and serves every other block.
+long eio_source(void * ctx, int fd, uint8_t * dst, size_t length, uint64_t offset) {
+    if (offset == *static_cast<const uint64_t *>(ctx)) {
+        return -EIO;
+    }
+    return fill_source(nullptr, fd, dst, length, offset);
+}
+
+lazy_io_span block_span(uint64_t block) {
+    return { k_file, block * LAZY_IO_BLOCK_BYTES, k_span };
+}
+
+lazy_io_key key0(uint32_t epoch, int32_t layer) {
+    return { lazy_io_class::PREFETCH, epoch, layer, lazy_io_kind::TABLE_ROWS };
+}
+
+// One STORAGE request's ticket and landing slot at `epoch`, for one waiter of `bytes` from `src_offset` in its read.
+struct request_fixture {
+    lazy_gather_request  req;
+    lazy_io_ticket       ticket;
+    lazy_landing_slot    slot;
+    std::vector<uint8_t> slab;
+
+    explicit request_fixture(uint32_t epoch) : slab(LAZY_IO_BLOCK_BYTES, 0) {
+        req.epoch      = epoch;
+        req.ticket     = &ticket;
+        ticket.request = &req;
+        slot.epoch     = epoch;
+        slot.data      = slab.data();
+        slot.bytes     = slab.size();
+    }
+
+    lazy_io_waiter waiter(uint64_t src_offset, size_t bytes) {
+        lazy_io_waiter w;
+        w.ticket     = &ticket;
+        w.epoch      = req.epoch;
+        w.landing    = &slot;
+        w.src_offset = src_offset;
+        w.bytes      = bytes;
+        return w;
+    }
+};
+
+// The first ensure allocates exactly the plan's need, under the load's transaction, and only when the table's span fits
+// need / QD. Later calls allocate nothing: the creating model's next table carries the ring row's charge and another
+// model's covered plan carries 0, and a need or a span the live ring cannot hold, or a charge other than that rule's,
+// refuses with one [HOST-PLAN-BUG] line naming both numbers (§3.3, §10's ring check). A transaction of 0 names no
+// model, so it is never the creator.
+// Mutant: no-span-check, under which the need one block per slot short allocates a ring.
+arm_result arm_ensure_rules() {
+    arm_result r;
+    log_clear();
+    ring_lease     lease      = lazy_io_pool_take();
+    const uint64_t a0         = allocations();
+    const size_t   short_need = k_need - LAZY_BLOCK_RING_QD * LAZY_IO_BLOCK_BYTES;
+
+    lazy_ring_ensure_status st = block_ring_ensure(short_need, k_span, 0, mapped(short_need), k_txn);
+    expect(r, st == lazy_ring_ensure_status::TOO_NARROW && allocations() == a0,
+           "the ensure one block per slot short returned " + name(st) + " with " + num(allocations() - a0) +
+               " allocation(s), want lazy-table-ring-too-narrow and none");
+    const std::string short_numbers = "need " + num(short_need) + " B, want " + num(k_need) + " B";
+    expect(r, log_count_with("[HOST-PLAN-BUG]", short_numbers.c_str()) == 1,
+           "the ensure one block per slot short printed " +
+               num(log_count_with("[HOST-PLAN-BUG]", short_numbers.c_str())) + " [HOST-PLAN-BUG] lines naming '" +
+               short_numbers + "', want 1");
+
+    st               = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    uint64_t   bytes = 0;
+    const bool live  = lazy_block_ring_bytes(&bytes);
+    expect(r, st == lazy_ring_ensure_status::OK && allocations() == a0 + 1 && live && bytes == k_need,
+           "the full ensure returned " + name(st) + " with " + num(allocations() - a0) + " allocation(s) and ring " +
+               (live ? num(bytes) : std::string("none")) + ", want ok, 1 and " + num(k_need));
+    expect(r, live_charged() == mapped(k_need) && lazy_io_host_fixture::g_state.last_load_txn.load() == k_txn,
+           "the ring is charged " + num(live_charged()) + " B under txn " +
+               num(lazy_io_host_fixture::g_state.last_load_txn.load()) + ", want " + num(mapped(k_need)) + " under " +
+               num(k_txn));
+
+    st = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    expect(r, st == lazy_ring_ensure_status::OK && allocations() == a0 + 1,
+           "the creating model's next table, charged the ring row's bytes, returned " + name(st) + " after " +
+               num(allocations() - a0) + " allocations, want ok and still 1");
+    st = block_ring_ensure(k_need / 2, k_span, 0, 0, k_txn + 1);
+    expect(r, st == lazy_ring_ensure_status::OK && allocations() == a0 + 1,
+           "another model's covered ensure with fewer bytes and ring= 0 returned " + name(st) +
+               ", want ok with no allocation");
+
+    struct mismatch_case {
+        const char * what;
+        size_t       charge;
+        uint64_t     txn;
+        size_t       want;
+    };
+
+    const mismatch_case mismatches[] = {
+        { "the creating model's table charged no ring",              0,                  k_txn,     mapped(k_need) },
+        { "another model's covered plan charged a ring",             mapped(k_need / 2), k_txn + 1, 0              },
+        { "a plan with no transaction charged the ring row's bytes", mapped(k_need),     0,         0              },
+    };
+    for (const mismatch_case & m : mismatches) {
+        log_clear();
+        st                          = block_ring_ensure(k_need / 2, k_span, 0, m.charge, m.txn);
+        const std::string numbers   = "ring charge " + num(m.charge) + " B, want " + num(m.want) + " B";
+        const size_t      bug_lines = log_count_with("[HOST-PLAN-BUG]", numbers.c_str());
+        expect(r, st == lazy_ring_ensure_status::MISMATCH && bug_lines == 1,
+               std::string(m.what) + ": returned " + name(st) + " with " + num(bug_lines) + " lines naming '" +
+                   numbers + "', want lazy-table-ring-mismatch and 1");
+    }
+    log_clear();
+    st                             = block_ring_ensure(2 * k_need, k_span, 0, 0, k_txn);
+    const std::string wide_numbers = "need " + num(2 * k_need) + " B, want " + num(k_need) + " B";
+    expect(r, st == lazy_ring_ensure_status::TOO_NARROW && log_count_with("[HOST-PLAN-BUG]", wide_numbers.c_str()) == 1,
+           "an ensure with a larger need returned " + name(st) + ", want lazy-table-ring-too-narrow naming '" +
+               wide_numbers + "'");
+    st                             = block_ring_ensure(k_need, 2 * k_span, 0, 0, k_txn);
+    const std::string span_numbers = "span " + num(2 * k_span) + " B, want " + num(k_span) + " B";
+    expect(r, st == lazy_ring_ensure_status::TOO_NARROW && log_count_with("[HOST-PLAN-BUG]", span_numbers.c_str()) == 1,
+           "an ensure with a wider span returned " + name(st) + ", want lazy-table-ring-too-narrow naming '" +
+               span_numbers + "'");
+    expect(r, allocations() == a0 + 1, "the refusals allocated " + num(allocations() - a0 - 1) + " ring(s), want 0");
+
+    expect(r, settle(lease) && live_charged() == 0,
+           "after the drop and a FULL reap " + num(live_charged()) + " ring bytes are charged, want 0");
+    return r;
+}
+
+// A creating ensure whose allocation is refused, or falls short of the need, or whose plan charged other than the
+// ledger does, refuses with its typed reason, frees what it allocated and leaves no ensuring state, so the next ensure
+// creates the ring (§3.3, §10).
+arm_result arm_ensure_creation_refusals() {
+    arm_result r;
+    log_clear();
+    ring_lease     lease = lazy_io_pool_take();
+    const uint64_t a0    = allocations();
+
+    lazy_io_host_fixture::g_state.refuse_next = true;
+    lazy_ring_ensure_status st                = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    expect(r, st == lazy_ring_ensure_status::REFUSED && !registry().ensuring,
+           "a refused allocation returned " + name(st) + ", want lazy-table-ring-refused with ensuring clear");
+
+    lazy_io_host_fixture::g_state.short_next = LAZY_IO_BLOCK_BYTES;
+    st                                       = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    const std::string short_numbers =
+        "allocated " + num(k_need - LAZY_IO_BLOCK_BYTES) + " B, want " + num(k_need) + " B";
+    expect(
+        r, st == lazy_ring_ensure_status::MISMATCH && log_count_with("[HOST-PLAN-BUG]", short_numbers.c_str()) == 1,
+        "a short allocation returned " + name(st) + ", want lazy-table-ring-mismatch naming '" + short_numbers + "'");
+
+    st                               = block_ring_ensure(k_need, k_span, 0, 0, k_txn);
+    const std::string charge_numbers = "ring charge 0 B, want " + num(mapped(k_need)) + " B";
+    expect(r, st == lazy_ring_ensure_status::MISMATCH && log_count_with("[HOST-PLAN-BUG]", charge_numbers.c_str()) == 1,
+           "a creating plan that charged no ring returned " + name(st) + ", want lazy-table-ring-mismatch naming '" +
+               charge_numbers + "'");
+    expect(r, live_charged() == 0 && registry().ring_bytes == 0 && !registry().ensuring,
+           "after the refusals " + num(live_charged()) + " B are charged and the ring holds " +
+               num(registry().ring_bytes) + " B, want both 0 with ensuring clear");
+
+    st = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    expect(r, st == lazy_ring_ensure_status::OK && registry().ring_bytes == k_need && allocations() == a0 + 3,
+           "the ensure after the refusals returned " + name(st) + " with ring " + num(registry().ring_bytes) +
+               ", want ok and " + num(k_need));
+    expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
+// O_DIRECT alignment is a plan fact (§5.2): a need that is not whole 4 KiB blocks per slot is a plan bug, refused as
+// lazy-table-ring-mismatch with one [HOST-PLAN-BUG] line naming it and the next need that splits, before ensure
+// reserves or allocates anything, and never rounded up into a ring.
+// Mutant: no-alignment-check, under which the unaligned need allocates a ring.
+arm_result arm_ensure_unaligned_need() {
+    arm_result r;
+    log_clear();
+    ring_lease     lease = lazy_io_pool_take();
+    const uint64_t a0    = allocations();
+    const size_t   need  = k_need + LAZY_IO_BLOCK_BYTES;
+    const size_t   want  = k_need + LAZY_BLOCK_RING_QD * LAZY_IO_BLOCK_BYTES;
+
+    const lazy_ring_ensure_status st = block_ring_ensure(need, k_span, 0, mapped(need), k_txn);
+    expect(r, st == lazy_ring_ensure_status::MISMATCH && allocations() == a0,
+           "the unaligned need returned " + name(st) + " with " + num(allocations() - a0) +
+               " allocation(s), want lazy-table-ring-mismatch and none");
+    const std::string numbers = "need " + num(need) + " B, want " + num(want) + " B";
+    expect(r, log_count_with("[HOST-PLAN-BUG]", numbers.c_str()) == 1,
+           "the unaligned need printed " + num(log_count_with("[HOST-PLAN-BUG]", numbers.c_str())) +
+               " [HOST-PLAN-BUG] lines naming '" + numbers + "', want 1");
+    expect(r, registry().ring_bytes == 0 && !registry().ensuring,
+           "after the refusal the ring holds " + num(registry().ring_bytes) + " B with ensuring " +
+               (registry().ensuring ? "set" : "clear") + ", want 0 and clear");
+    expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
+// With no live pool, no lease pins a ring: ensure refuses as lazy-table-ring-unpinned and allocates nothing (§3.3).
+arm_result arm_ensure_unpinned() {
+    arm_result     r;
+    const uint64_t a0 = allocations();
+    ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    const lazy_ring_ensure_status st = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    expect(r, st == lazy_ring_ensure_status::UNPINNED && allocations() == a0,
+           "an ensure with no live pool returned " + name(st) + " after " + num(allocations() - a0) +
+               " allocation(s), want lazy-table-ring-unpinned and none");
+    return r;
+}
+
+// One flight at a time (§3.3): while the hook holds the reserver between its reserve and its allocation, a second
+// ensure returns lazy-table-ring-concurrent-ensure at once with one "[HOST-PLAN-BUG] concurrent ring ensure" line, and
+// the reserver then installs its ring with one allocation. Engagement: the reserver is held when the second ensure
+// runs. Mutant: no-ensuring, under which the second caller allocates and installs a ring of its own.
+arm_result arm_ensure_concurrent() {
+    arm_result r;
+    log_clear();
+    ring_lease     lease = lazy_io_pool_take();
+    const uint64_t a0    = allocations();
+    gate           g;
+    ggml_sycl_test_lazy_ensure_hold(gate_hold, &g);
+    std::atomic<int> first{ -1 };
+    std::thread      reserver([&] { first = (int) block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn); });
+    if (!g.wait_holders(1)) {
+        void_arm(r, "the hook did not hold the reserver within 5 s");
+        ggml_sycl_test_lazy_ensure_hold(nullptr, nullptr);
+        g.release();
+        reserver.join();
+        settle(lease);
+        return r;
+    }
+    const lazy_ring_ensure_status second = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    expect(r, second == lazy_ring_ensure_status::CONCURRENT,
+           "the second ensure returned " + name(second) + ", want lazy-table-ring-concurrent-ensure");
+    expect(r, log_count_with("[HOST-PLAN-BUG] concurrent ring ensure") == 1,
+           "the second ensure printed " + num(log_count_with("[HOST-PLAN-BUG] concurrent ring ensure")) +
+               " '[HOST-PLAN-BUG] concurrent ring ensure' lines, want 1");
+    g.release();
+    reserver.join();
+    expect(r, first == (int) lazy_ring_ensure_status::OK && allocations() == a0 + 1 && registry().ring_allocations == 1,
+           "the reserver returned " + name((lazy_ring_ensure_status) first.load()) + " after " +
+               num(allocations() - a0) + " allocation(s), the pool counting " + num(registry().ring_allocations) +
+               ", want ok, 1 and 1");
+    expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
+// A throwing allocation leaves ensuring clear (§3.3's scope guard), so the next ensure allocates.
+// Mutant: ensuring-kept-on-throw, under which the next ensure finds ensuring set and refuses.
+arm_result arm_ensure_throw() {
+    arm_result     r;
+    ring_lease     lease                     = lazy_io_pool_take();
+    const uint64_t a0                        = allocations();
+    lazy_io_host_fixture::g_state.throw_next = true;
+    bool threw                               = false;
+    try {
+        (void) block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    } catch (const std::bad_alloc &) {
+        threw = true;
+    }
+    expect(r, threw, "the throwing allocation did not reach the caller as std::bad_alloc");
+    expect(r, !registry().ensuring, "after the throw the pool's ensuring is still set, want it cleared by the guard");
+    const lazy_ring_ensure_status st = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    expect(r, st == lazy_ring_ensure_status::OK && allocations() == a0 + 1,
+           "the ensure after the throw returned " + name(st) + " after " + num(allocations() - a0) +
+               " allocation(s), want ok and 1");
+    expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
+// A worker reads its span into its slot of the ring and the reaper copies the waiter's bytes into the landing slot
+// (§5.2, §5.3); the ring-write recorder's largest end stays within the ring.
+arm_result arm_engine_read_lands() {
+    arm_result r;
+    ring_lease lease = lazy_io_pool_take();
+    if (block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn) != lazy_ring_ensure_status::OK) {
+        expect(r, false, "the ring was not ensured");
+        settle(lease);
+        return r;
+    }
+    ggml_sycl_test_lazy_ring_write_end_reset();
+    ggml_sycl_test_lazy_io_read_source(fill_source, nullptr);
+    request_fixture      f(3);
+    const uint64_t       block = 3;
+    const size_t         added = lazy_io_submit(1, -1, block_span(block), key0(3, 5), f.waiter(100, 1000));
+    const bool           done  = added == 1 && wait_for([&] { return f.ticket.outstanding.load() == 0; });
+    std::vector<uint8_t> want(1000);
+    for (size_t i = 0; i < want.size(); ++i) {
+        want[i] = file_byte(block * LAZY_IO_BLOCK_BYTES + 100 + i);
+    }
+    expect(r, done, "the read of block 3 queued " + num(added) + " waiter(s) and did not complete within 5 s");
+    expect(r, done && std::memcmp(f.slab.data(), want.data(), want.size()) == 0 && f.ticket.read_error.load() == 0,
+           "the landing slot does not hold bytes 100-1099 of block 3's read");
+    const uint64_t end = ggml_sycl_test_lazy_ring_write_end();
+    expect(r, end >= k_span && end <= k_need,
+           "the largest ring write ends at " + num(end) + ", want between " + num(k_span) + " and " + num(k_need));
+    ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+    expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
+// A failed read copies nothing, stores its errno in the ticket and still delivers, with one WARN naming the errno, the
+// file identity and the block offset (§5.3).
+arm_result arm_engine_read_error() {
+    arm_result r;
+    log_clear();
+    ring_lease lease = lazy_io_pool_take();
+    if (block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn) != lazy_ring_ensure_status::OK) {
+        expect(r, false, "the ring was not ensured");
+        settle(lease);
+        return r;
+    }
+    uint64_t failing = 6 * LAZY_IO_BLOCK_BYTES;
+    ggml_sycl_test_lazy_io_read_source(eio_source, &failing);
+    request_fixture f(4);
+    const size_t    added = lazy_io_submit(1, -1, block_span(6), key0(4, 2), f.waiter(0, 512));
+    const bool      done  = added == 1 && wait_for([&] { return f.ticket.outstanding.load() == 0; });
+    expect(r, done, "the failing read queued " + num(added) + " waiter(s) and did not complete within 5 s");
+    expect(r, done && f.ticket.read_error.load() == EIO && f.slab[0] == 0,
+           "the failing read left read_error " + num(static_cast<uint64_t>(f.ticket.read_error.load())) +
+               " and a landing byte " + num(f.slab[0]) + ", want " + num(EIO) + " and 0");
+    const std::string where = "block offset " + num(failing);
+    expect(r,
+           log_count_with("[LAZY-IO] read failed: errno 5", where.c_str()) == 1 &&
+               log_count_with("[LAZY-IO] read failed", "file 0000000000000009") == 1,
+           "the failing read printed " + num(log_count_with("[LAZY-IO] read failed")) +
+               " WARN lines, want 1 naming errno 5, file 0000000000000009 and " + where);
+    ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+    expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
+// A read holds a lease from its submission until its delivery (§3.3), so when the arm drops its own lease the read's is
+// the last: its drop on the worker parks the pool and the worker's WORKER reap frees the ring and leaves the node,
+// with the pool and its workers, for the next FULL reap. Engagement: the read is held on the worker when the arm drops.
+arm_result arm_engine_worker_reap() {
+    arm_result r;
+    ring_lease lease = lazy_io_pool_take();
+    if (block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn) != lazy_ring_ensure_status::OK) {
+        expect(r, false, "the ring was not ensured");
+        settle(lease);
+        return r;
+    }
+    gate g;
+    ggml_sycl_test_lazy_io_read_source(gated_source, &g);
+    request_fixture f(5);
+    const size_t    added = lazy_io_submit(1, -1, block_span(8), key0(5, 1), f.waiter(0, 64));
+    if (added != 1 || !g.wait_holders(1)) {
+        void_arm(r, "the read was not held on a worker within 5 s (" + num(added) + " waiter(s) queued)");
+        g.release();
+        wait_for([&] { return f.ticket.outstanding.load() == 0; });
+        ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+        settle(lease);
+        return r;
+    }
+    lease.reset();
+    const lazy_registry_state held = registry();
+    expect(r, held.live_pools == 1 && held.live_leases == 1 && held.parked_nodes == 0,
+           "with the read held after the arm's drop: " + num(held.live_pools) + " live pools, " +
+               num(held.live_leases) + " leases, " + num(held.parked_nodes) + " parked, want 1, 1 and 0");
+    g.release();
+    const bool freed = wait_for([&] { return live_charged() == 0 && registry().parked_nodes == 1; });
+    expect(r, freed,
+           "after the read's delivery " + num(live_charged()) + " ring bytes are charged and " +
+               num(registry().parked_nodes) +
+               " pool(s) parked, want 0 and 1: the worker's drop frees only "
+               "the ring");
+    ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+    ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    expect(r, registry().parked_nodes == 0, "the FULL reap left " + num(registry().parked_nodes) + " parked, want 0");
+    return r;
+}
+
+// Shutdown's step (§3.3): with every worker holding a read, lazy_io_pool_shutdown delivers the queued read ECANCELED
+// and returns only after the picked reads have finished. The picked reads are held on a latch that only shutdown's hold
+// hook releases, and the hook runs once the queued read is cancelled, just before the wait, so a shutdown that returns
+// without waiting returns with the latch still held. Shutdown's return reads the latch and the deliveries; the arm has
+// no timer. Engagement: every worker holds a read when shutdown starts.
+arm_result arm_engine_shutdown() {
+    arm_result r;
+    ring_lease lease = lazy_io_pool_take();
+    if (block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn) != lazy_ring_ensure_status::OK) {
+        expect(r, false, "the ring was not ensured");
+        settle(lease);
+        return r;
+    }
+    gate g;
+    ggml_sycl_test_lazy_io_read_source(gated_source, &g);
+    std::vector<std::unique_ptr<request_fixture>> picked;
+    for (size_t i = 0; i < LAZY_BLOCK_RING_QD; ++i) {
+        picked.emplace_back(new request_fixture(6));
+        (void) lazy_io_submit(1, -1, block_span(2 * i), key0(6, 1), picked.back()->waiter(0, 64));
+    }
+    if (!g.wait_holders(LAZY_BLOCK_RING_QD)) {
+        void_arm(r, "not every worker held a read within the hook bound");
+        g.release();
+    }
+    request_fixture queued(6);
+    (void) lazy_io_submit(1, -1, block_span(2 * LAZY_BLOCK_RING_QD), key0(6, 2), queued.waiter(0, 64));
+    ggml_sycl_test_lazy_shutdown_hold(gate_release, &g);
+    std::atomic<bool> returned{ false };
+    bool              released_at_return  = false;
+    size_t            delivered_at_return = 0;
+    std::thread       stopper([&] {
+        lazy_io_pool_shutdown();
+        released_at_return = g.is_released();
+        for (const auto & f : picked) {
+            delivered_at_return += f->ticket.outstanding.load() == 0 && f->ticket.read_error.load() == 0;
+        }
+        returned = true;
+    });
+    const bool        bounded = wait_for([&] { return returned.load(); });
+    // Frees the picked reads that a shutdown returning without waiting, or one that never reached its hook, left held.
+    g.release();
+    stopper.join();
+    ggml_sycl_test_lazy_shutdown_hold(nullptr, nullptr);
+    expect(r, bounded, "shutdown had not returned within the hook bound, want its hook to free the picked reads");
+    const bool cancelled = queued.ticket.outstanding.load() == 0;
+    expect(r, cancelled && queued.ticket.read_error.load() == ECANCELED,
+           "the queued read was delivered " + std::string(cancelled ? "with read_error " : "not at all, read_error ") +
+               num(static_cast<uint64_t>(queued.ticket.read_error.load())) + ", want " + num(ECANCELED));
+    expect(r, released_at_return,
+           "shutdown returned while the picked reads were still held on their latch, want it to return only after "
+           "they finish");
+    expect(r, delivered_at_return == LAZY_BLOCK_RING_QD,
+           num(delivered_at_return) + " of the " + num(LAZY_BLOCK_RING_QD) +
+               " picked reads were delivered when shutdown returned, want all");
+    ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+    expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
+// A second coverage pin while the first is live joins its pool (§3.3): it asks for the live ring's size, so it ensures
+// nothing, allocates nothing and prints no [HOST-PLAN-BUG] line, and the ring outlives the second pin's drop. A second
+// pin that asks for another size aborts naming both sizes, in a child, since the abort ends the process.
+arm_result arm_coverage_pin_joins() {
+    arm_result r;
+    log_clear();
+    const uint64_t a0 = allocations();
+    {
+        const lazy_test_coverage_pin first = ggml_sycl_test_make_coverage_pin(k_need);
+        {
+            const lazy_test_coverage_pin second = ggml_sycl_test_make_coverage_pin(k_need);
+            const lazy_registry_state    s      = registry();
+            expect(r, allocations() == a0 + 1 && s.live_pools == 1 && s.live_leases == 2 && s.ring_bytes == k_need,
+                   "two pins of " + num(k_need) + " B made " + num(allocations() - a0) + " allocation(s), " +
+                       num(s.live_pools) + " live pool(s) and " + num(s.live_leases) + " lease(s) on a ring of " +
+                       num(s.ring_bytes) + " B, want 1, 1, 2 and " + num(k_need) + " B");
+        }
+        expect(r, registry().ring_bytes == k_need,
+               "the second pin's drop left a ring of " + num(registry().ring_bytes) + " B, want " + num(k_need));
+    }
+    expect(r, log_count_with("[HOST-PLAN-BUG]") == 0,
+           "the pins printed " + num(log_count_with("[HOST-PLAN-BUG]")) + " [HOST-PLAN-BUG] lines, want 0");
+    const lazy_registry_state s = registry();
+    expect(r, s.live_pools == 0 && s.parked_nodes == 0 && live_charged() == 0,
+           "after both pins: " + num(s.live_pools) + " live pool(s), " + num(s.parked_nodes) + " parked and " +
+               num(live_charged()) + " B charged, want 0, 0 and 0");
+
+    const child_run child = run_child_strings({ "test-sycl-lazy-io-engine-host", k_pin_child },
+                                              child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
+    if (!child.ran) {
+        fail(r, "the mismatched-pin child did not finish within " + num(k_bound.count()) + " s");
+        return r;
+    }
+    const std::string want = "ggml_sycl_test_make_coverage_pin: ring_bytes=" + num(2 * k_need) +
+                             " joins a live ring of " + num(k_need) + " B";
+    const bool aborted = WIFSIGNALED(child.status) && WTERMSIG(child.status) == SIGABRT;
+    expect(r, aborted && text_count_with(child.err, want.c_str()) == 1,
+           "the mismatched second pin ended with status " + std::to_string(child.status) + " and " +
+               num(text_count_with(child.err, want.c_str())) + " lines '" + want + "', want SIGABRT and 1");
+    expect(r, text_count_with(child.err, "PIN-CHILD returned") == 0, "the mismatched second pin returned");
+    return r;
+}
+
+// Shut-down (§3.3): a reserver that reaches its install after the registry shut down refuses as
+// lazy-table-ring-shut-down and frees its ring after the unlock, and an ensure that begins after it refuses the same
+// way. Engagement: the reserver is held when the registry shuts down.
+// Mutant: install-after-shut-down, under which the reserver installs its ring and returns ok.
+arm_result arm_ensure_shut_down() {
+    arm_result     r;
+    ring_lease     lease = lazy_io_pool_take();
+    const uint64_t c0    = live_charged();
+    gate           g;
+    ggml_sycl_test_lazy_ensure_hold(gate_hold, &g);
+    std::atomic<int> first{ -1 };
+    std::thread      reserver([&] { first = (int) block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn); });
+    if (!g.wait_holders(1)) {
+        void_arm(r, "the hook did not hold the reserver within 5 s");
+    }
+    lazy_io_pool_mark_shut_down();
+    g.release();
+    reserver.join();
+    expect(r, first == (int) lazy_ring_ensure_status::SHUT_DOWN,
+           "the reserver that reached its install after shut-down returned " +
+               name((lazy_ring_ensure_status) first.load()) + ", want lazy-table-ring-shut-down");
+    expect(r, live_charged() == c0 && registry().ring_bytes == 0,
+           "after shut-down " + num(live_charged() - c0) + " ring bytes stay charged and the ring holds " +
+               num(registry().ring_bytes) + " B, want both 0: the reserver frees its ring");
+    const lazy_ring_ensure_status st = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    expect(r, st == lazy_ring_ensure_status::SHUT_DOWN,
+           "an ensure after shut-down returned " + name(st) + ", want lazy-table-ring-shut-down");
+    lease.reset();
+    ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    return r;
+}
+
+lazy_ring_mutant mutant_named(const char * text) {
+    struct entry {
+        const char *     text;
+        lazy_ring_mutant mutant;
+    };
+
+    static const entry table[] = {
+        { "no-ensuring",             lazy_ring_mutant::NO_ENSURING             },
+        { "ensuring-kept-on-throw",  lazy_ring_mutant::ENSURING_KEPT_ON_THROW  },
+        { "install-after-shut-down", lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN },
+        { "no-span-check",           lazy_ring_mutant::NO_SPAN_CHECK           },
+        { "no-alignment-check",      lazy_ring_mutant::NO_ALIGNMENT_CHECK      },
+        { "shutdown-no-wait",        lazy_ring_mutant::SHUTDOWN_NO_WAIT        },
+    };
+    for (const entry & e : table) {
+        if (std::strcmp(e.text, text) == 0) {
+            return e.mutant;
+        }
+    }
+    std::fprintf(stderr, "unknown mutant %s\n", text);
+    std::exit(2);
+}
+
+}  // namespace
+
+int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], k_pin_child) == 0) {
+        const lazy_test_coverage_pin first  = ggml_sycl_test_make_coverage_pin(k_need);
+        const lazy_test_coverage_pin second = ggml_sycl_test_make_coverage_pin(2 * k_need);
+        std::fprintf(stderr, "PIN-CHILD returned\n");
+        return 0;
+    }
+    ggml_log_set(capture_log, nullptr);
+    if (argc == 3 && std::strcmp(argv[1], "--mutant") == 0) {
+        ggml_sycl_test_lazy_ring_mutant_select(mutant_named(argv[2]));
+    }
+    const std::vector<named_arm> arms = {
+        { "ensure allocates the need once and refuses what the plan did not charge",    arm_ensure_rules             },
+        { "a creating ensure refuses a refused, short or mischarged ring and frees it", arm_ensure_creation_refusals },
+        { "a need that is not whole blocks per slot refuses before ensure reserves",    arm_ensure_unaligned_need    },
+        { "an ensure with no live pool refuses as unpinned",                            arm_ensure_unpinned          },
+        { "a concurrent ensure refuses at once while the reserver is held",             arm_ensure_concurrent        },
+        { "a throwing allocation leaves ensuring clear for the next ensure",            arm_ensure_throw             },
+        { "a worker's read lands in its waiter's slot",                                 arm_engine_read_lands        },
+        { "a failed read reaches the ticket with one WARN",                             arm_engine_read_error        },
+        { "a read's last drop on a worker frees only the ring",                         arm_engine_worker_reap       },
+        { "shutdown cancels queued reads and waits for picked ones",                    arm_engine_shutdown          },
+        { "a second coverage pin joins the live ring and a mismatched one aborts",      arm_coverage_pin_joins       },
+        // Last: the shut-down flag is never cleared.
+        { "ensure refuses after shut-down and frees the reserver's ring",               arm_ensure_shut_down         },
+    };
+    return run_arms(arms, "lazy io engine host arms");
+}

@@ -208,6 +208,24 @@ the predicate in the value function ends `..., nullptr, nullptr`.
 Stated gaps: the charge side's walk helpers are unnamed, so the head-dim and helper rules cover the bodies of the two named
 charge functions and the helper-name rule covers all of `unified-cache.cpp` and `.hpp`.
 
+## Clause (r): the POOL lifetime
+
+The lazy IO pool's block ring is the one allocation of lifetime `POOL` (th32 design §3.3, canonical contract §12.5): its
+owner is `{alloc_owner_kind::IO_POOL, generation}`, the registry generation of the pool that ensured it, and only the
+pool's reap frees it. The owner check reports such a row only once that generation is gone, so a `POOL` request of any
+other shape would be memory no owner check reports and no reap frees. Clause (r) therefore reads the three as one fact:
+a request whose intent writes `intent.lifetime = alloc_lifetime::POOL`, or an owner of kind `IO_POOL`, must establish all
+three of lifetime `POOL`, owner kind `IO_POOL` and `must_host_cpu = true`, each by an unconditional literal as its last
+write. The owner is read from a braced `{ kind, id }`, a designated `.kind`, or a write to `owner.kind`; a braced or
+copied intent written later re-seeds both members. The finding is `R-POOL`, which is never debt and never allowlisted.
+
+Witness `r-pool` carries the clause's six matrix cases: the ring's own request as the PASS twin, and five FAIL cases (the
+mutant whose owner is `{NONE, 0}`, an `IO_POOL` owner on an `UNOWNED` request, a `POOL` request on the pinned tier, an
+owner kind set by a conditional write, and a later braced intent that discards the owner).
+
+Stated gap: a lifetime or owner kind passed in through a helper's parameter is an expression, not a literal, so a `POOL`
+request built that way is not seen.
+
 ## Key shape
 
 `file::function::node-kind:variable:text-hash#ordinal`. The text hash is of the construction's normalized

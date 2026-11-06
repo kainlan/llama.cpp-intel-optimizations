@@ -72,6 +72,35 @@ lazy_table_result refuse_plan_bug(const lazy_table_desc & desc,
     return refusal(status, reason);
 }
 
+// The table's refusal for block_ring_ensure's answer (§3.3), one RING_ status each, under the ensure's own names.
+lazy_table_status ring_refusal_status(lazy_ring_ensure_status ring) {
+    switch (ring) {
+        case lazy_ring_ensure_status::OK:
+            return lazy_table_status::OK;
+        case lazy_ring_ensure_status::UNPINNED:
+            return lazy_table_status::RING_UNPINNED;
+        case lazy_ring_ensure_status::TOO_NARROW:
+            return lazy_table_status::RING_TOO_NARROW;
+        case lazy_ring_ensure_status::CONCURRENT:
+            return lazy_table_status::RING_CONCURRENT;
+        case lazy_ring_ensure_status::SHUT_DOWN:
+            return lazy_table_status::RING_SHUT_DOWN;
+        case lazy_ring_ensure_status::MISMATCH:
+            return lazy_table_status::RING_MISMATCH;
+        case lazy_ring_ensure_status::REFUSED:
+            return lazy_table_status::RING_REFUSED;
+    }
+    return lazy_table_status::RING_REFUSED;
+}
+
+// Whether the ensure's refusal is a plan bug, plan != reality or a second materializer (§10), which it reports with a
+// [HOST-PLAN-BUG] line: a plan whose need or span the ring does not hold, a charge that is not the ledger's, or a
+// concurrent ensure. No live pool, a shut-down pool and a refused allocation are not plan bugs.
+bool ring_refusal_is_plan_bug(lazy_ring_ensure_status ring) {
+    return ring == lazy_ring_ensure_status::TOO_NARROW || ring == lazy_ring_ensure_status::MISMATCH ||
+           ring == lazy_ring_ensure_status::CONCURRENT;
+}
+
 // Why `desc` is not a table of `residency`, before anything is opened or allocated; empty when it is one.
 std::string desc_invalid(const lazy_table_desc & desc, lazy_residency residency) {
     if (desc.name.empty()) {
@@ -259,6 +288,19 @@ class owner_cache_source final : public lazy_row_cache_memory_source {
     int                     last_error_ = 0;
 };
 
+// The block ring's memory (§3.3): one owner-first HOST_CPU allocation and the CPU view resolved from it once, which the
+// IO engine's workers write into. Destroying it drops the handle, the sole release point (P2), whose free credits the
+// ledger. The pool owns it, so only the pool's WORKER or FULL reap destroys it.
+class owner_ring_memory final : public lazy_io_host_memory {
+  public:
+    owner_ring_memory(mem_handle handle, uint8_t * data, size_t bytes, size_t charged) :
+        lazy_io_host_memory(data, bytes, charged),
+        handle_(std::move(handle)) {}
+
+  private:
+    mem_handle handle_;
+};
+
 // Reads [file_offset - head, file_offset - head + window) into `dst` with O_DIRECT, stopping once the table's last
 // byte is in. Returns the bytes read; *err is the errno of a failed call, 0 otherwise.
 size_t read_window(int fd, uint64_t aligned_offset, uint8_t * dst, size_t window, size_t need, int * err) {
@@ -284,6 +326,39 @@ size_t read_window(int fd, uint64_t aligned_offset, uint8_t * dst, size_t window
 
 }  // namespace
 
+// The production side of the block ring's memory seam (lazy-io-pool.hpp, §3.3): role LAZY_STAGING, owned by the IO pool
+// and by no model, so its lifetime is POOL with the pool's registry generation as its IO_POOL owner: no model's or
+// backend's owner check matches it, and the pool's reap is its only release. The charge carries the load's transaction
+// and may yield, since ensure calls it on the loader's thread with no lock held (§4.2). The fixture in the host tests
+// is the only other definition.
+std::unique_ptr<lazy_io_host_memory> lazy_io_allocate_host(size_t   bytes,
+                                                           int      device,
+                                                           uint64_t pool_generation,
+                                                           uint64_t load_txn_id) {
+    alloc_request req{};
+    req.device                           = device;
+    req.size                             = bytes;
+    req.alignment                        = LAZY_IO_BLOCK_BYTES;
+    req.intent.role                      = alloc_role::LAZY_STAGING;
+    req.intent.constraints.must_host_cpu = true;
+    req.intent.lifetime                  = alloc_lifetime::POOL;
+    req.intent.owner                     = { alloc_owner_kind::IO_POOL, pool_generation };
+    req.may_yield                        = true;
+    req.load_txn_id                      = load_txn_id;
+    allocation_result got                = unified_allocate_owner(req);
+    if (!got) {
+        return nullptr;
+    }
+    mem_handle         handle = mem_handle::from_owned_alloc(std::move(got.owner), GGML_LAYOUT_AOS);
+    const resolved_ptr view   = handle.resolve();
+    if (!view || view.extent < bytes) {
+        return nullptr;  // the allocation did not resolve for the CPU; dropping the handle releases it
+    }
+    const size_t charged = record_charged_bytes(handle);
+    return std::unique_ptr<lazy_io_host_memory>(
+        new owner_ring_memory(std::move(handle), static_cast<uint8_t *>(view.ptr), bytes, charged));
+}
+
 const char * lazy_table_status_name(lazy_table_status status) {
     switch (status) {
         case lazy_table_status::OK:
@@ -302,6 +377,18 @@ const char * lazy_table_status_name(lazy_table_status status) {
             return "lazy-table-activation-mismatch";
         case lazy_table_status::ROW_CACHE_SHORTFALL:
             return "lazy-table-row-cache-shortfall";
+        case lazy_table_status::RING_UNPINNED:
+            return "lazy-table-ring-unpinned";
+        case lazy_table_status::RING_TOO_NARROW:
+            return "lazy-table-ring-too-narrow";
+        case lazy_table_status::RING_CONCURRENT:
+            return "lazy-table-ring-concurrent-ensure";
+        case lazy_table_status::RING_SHUT_DOWN:
+            return "lazy-table-ring-shut-down";
+        case lazy_table_status::RING_MISMATCH:
+            return "lazy-table-ring-mismatch";
+        case lazy_table_status::RING_REFUSED:
+            return "lazy-table-ring-refused";
     }
     return "lazy-table-unknown";
 }
@@ -423,6 +510,35 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
     }
 
     if (residency == lazy_residency::STORAGE) {
+        // The pool's block ring (§3.3), which every STORAGE table reads through: ensured with the plan's need and
+        // charge and the table's own read span, on the device whose cache holds the ring's row. The ensure's own line
+        // carries the figures; this refusal names the table. Ensure never aborts, so under GGML_SYCL_STRICT_LEASES=1 a
+        // plan bug aborts here, after both lines (§10).
+        const size_t                  span = lazy_block_ring_span(desc.row_size);
+        const lazy_ring_ensure_status ring = block_ring_ensure(desc.block_ring_need, span, record_device(desc),
+                                                               desc.block_ring_charge, desc.model.load_txn_id);
+        if (ring != lazy_ring_ensure_status::OK) {
+            const lazy_table_status status = ring_refusal_status(ring);
+            lazy_table_result       refused =
+                refuse(desc, status,
+                       "block_ring_need=" + std::to_string(desc.block_ring_need) + " B span=" + std::to_string(span) +
+                           " B block_ring_charge=" + std::to_string(desc.block_ring_charge) + " B on device " +
+                           std::to_string(record_device(desc)));
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            // The strict arm's mutant (§11 T5): the refusal is returned under strict leases too.
+            const bool abort_dropped = lazy_ring_mutant_is(lazy_ring_mutant::STRICT_ABORT_DROPPED);
+#else
+            constexpr bool abort_dropped = false;
+#endif
+            if (ring_refusal_is_plan_bug(ring) && !abort_dropped) {
+                if (ggml_sycl_strict_enabled()) {
+                    GGML_ABORT("lazy table %s: %s under GGML_SYCL_STRICT_LEASES=1", desc.name.c_str(),
+                               lazy_table_status_name(status));
+                }
+            }
+            return refused;
+        }
+
         // The row cache at the plan's slots (§6.3, §6.4): the index and the slab's chunks, each its own owner-entry
         // allocation. A refused one is a step-4 shortfall, a plan bug: the cache released everything it made before it
         // returned, and the table refuses with one [HOST-PLAN-BUG] line naming the plan's figure and what was charged.
