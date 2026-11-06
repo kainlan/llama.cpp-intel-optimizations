@@ -1744,6 +1744,48 @@ def clause_context_wiring(texts: dict) -> list:
     return fails
 
 
+_DEV0_WARN = "llama_context_sycl_warn_dev0"
+
+
+def clause_dev0_warn(texts: dict) -> list:
+    """The host SCRATCH entries resolve from model.devices[0] alone (§4.4), so when it is not SYCL a SYCL device later
+    in the list gets no notify, holder plan or SCRATCH transaction from the context. The context says so once, where
+    it resolves them: the constructor calls the warning right after llama_context_sycl_host_procs and nowhere else,
+    and the warning names the device list, fires only when devices[0] is not SYCL and some device is, and touches no
+    hook, so nothing but the log changes."""
+    lc = texts.get(LC, "")
+    if not lc:
+        return ["dev0 warning: src/llama-context.cpp is missing"]
+    s = source_for(LC, lc)
+    fails = []
+    flat = re.sub(r"\s+", " ", s.code)
+    if not re.search(r"\bsycl_host_hooks = llama_context_sycl_host_procs\([^;]*\); " + _DEV0_WARN +
+                     r"\(model\.devices\);", flat):
+        fails.append(f"dev0 warning: the constructor does not call {_DEV0_WARN}(model.devices) right after it resolves "
+                     "the host SCRATCH entries")
+    calls = len(re.findall(r"\b" + _DEV0_WARN + r"\s*\(", s.bare)) - 1
+    if calls > 1:
+        fails.append(f"dev0 warning: {_DEV0_WARN} is called {calls} times, not once per context")
+    _, f = _fn(texts, LC, _DEV0_WARN)
+    if not f:
+        return fails + [f"dev0 warning: no single definition of {_DEV0_WARN}"]
+    body = re.sub(r"\s+", " ", s.code[f["open"]:f["close"] + 1])
+    head = re.sub(r"\s+", " ", s.code[max(0, f["open"] - 200):f["open"]])
+    if not re.search(r"static void " + _DEV0_WARN + r"\(const std::vector<llama_device> & devices\) $", head):
+        fails.append(f"dev0 warning: {_DEV0_WARN} is not a static void function of the device list alone")
+    if not re.search(r"if \(devices\.empty\(\) \|\| llama_context_dev_is_sycl\(devices\[0\]\.dev\)\) \{ return; \}",
+                     body):
+        fails.append("dev0 warning: the warning does not return when devices[0] is SYCL")
+    if not re.search(r"for \(const llama_device & d : devices\) \{[^}]*llama_context_dev_is_sycl\(d\.dev\)", body):
+        fails.append("dev0 warning: the warning does not ask whether any device in the list is SYCL")
+    if not re.search(r"for \(const llama_device & d : devices\) \{[^}]*ggml_backend_dev_name\(d\.dev\)", body) or \
+            not re.search(r"LLAMA_LOG_WARN\([^;]*names\.c_str\(\)\);", body):
+        fails.append("dev0 warning: the warning does not name the device list")
+    if re.search(r"\bhooks\b|=\s*nullptr|\bdevices\s*\.\s*(?:push_back|erase|clear|insert|emplace)", body):
+        fails.append("dev0 warning: the warning touches a hook or the device list, so more than the log changes")
+    return fails
+
+
 def clause_trial_ops(texts: dict) -> list:
     """§M75, r9 n-6, r10 m-5: try_candidate OPENs before its reserve, KEEPs beside the commit and RETURNs on every
     loss path (the reserve's throw, the host fallback and the hold spill); sched_reserve RETURNs on its transaction's
@@ -2094,6 +2136,7 @@ CLAUSES = [
     ("slot-growth-plan-only", REQUIRED, clause_slot_growth_plan_only, None, None),
     ("pools-from-plan", REQUIRED, clause_pools_from_plan, None, None),
     ("context-wiring", REQUIRED, clause_context_wiring, None, None),
+    ("dev0-warn", REQUIRED, clause_dev0_warn, None, None),
     ("trial-ops", REQUIRED, clause_trial_ops, None, None),
     ("notify-position", REQUIRED, clause_notify_position, None, None),
     ("dlopen-context", REQUIRED, clause_dlopen_context, None, None),
@@ -2150,6 +2193,9 @@ def _hook(name: str) -> str:
 _STEP = "sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_"
 _OPEN = "        " + _STEP + "OPEN, c);\n"
 _FLAG = "        sycl_ubatch_trial_active = true;\n"
+_DEV0_CALL = "        llama_context_sycl_warn_dev0(model.devices);\n"
+_DEV0_GUARD = "    if (devices.empty() || llama_context_dev_is_sycl(devices[0].dev)) {\n"
+_DEV0_NAME = "        names += std::string(names.empty() ? \"\" : \", \") + ggml_backend_dev_name(d.dev);\n"
 _RESERVED_OK = "        sched_matches_last_good = true;\n"
 # Each loss returns its growth first; the line before that RETURN anchors it, so a mutant drops the RETURN alone.
 _LOSS_FIT_AT = ("            LLAMA_LOG_INFO(\"[SYCL-PLAN] auto n_ubatch candidate %u: compute buffer reserve failed: "
@@ -2590,6 +2636,12 @@ MUTANTS = [
                       "                                                                     new_size) && grown;\n"
                       "                }\n")],
      "calls the notify in a loop, not once with one backend"),
+    ("dev0-warn-dropped", "dev0-warn", [(LC, _DEV0_CALL, "")],
+     "does not call llama_context_sycl_warn_dev0(model.devices) right after it resolves"),
+    ("dev0-warn-twice", "dev0-warn", [(LC, _FLAG, _FLAG + _DEV0_CALL)], "is called 2 times, not once per context"),
+    ("dev0-warn-inverted", "dev0-warn", [(LC, _DEV0_GUARD, _DEV0_GUARD.replace("|| ll", "|| !ll"))],
+     "does not return when devices[0] is SYCL"),
+    ("dev0-warn-unnamed", "dev0-warn", [(LC, _DEV0_NAME, "")], "does not name the device list"),
     ("notify-other-backend", "notify-position",
      [(LC, _IMPL_DEV0,
        "    ggml_backend_t sycl_dev0 = backends.back().get();\n    bool   sycl_host_measured = false;\n")],

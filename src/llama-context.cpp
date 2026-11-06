@@ -138,6 +138,27 @@ static llama_context_sycl_host_hooks llama_context_sycl_host_procs(ggml_backend_
     return hooks;
 }
 
+// The host SCRATCH entries resolve from model.devices[0] alone (§4.4), so when it is not SYCL a SYCL device later in
+// the list gets no notify, holder plan or SCRATCH transaction from this context. Said once per context, naming the
+// list; nothing else changes.
+static void llama_context_sycl_warn_dev0(const std::vector<llama_device> & devices) {
+    if (devices.empty() || llama_context_dev_is_sycl(devices[0].dev)) {
+        return;
+    }
+    bool        any_sycl = false;
+    std::string names;
+    for (const llama_device & d : devices) {
+        any_sycl = any_sycl || llama_context_dev_is_sycl(d.dev);
+        names += std::string(names.empty() ? "" : ", ") + ggml_backend_dev_name(d.dev);
+    }
+    if (any_sycl) {
+        LLAMA_LOG_WARN(
+            "host SCRATCH entries resolve from model.devices[0], which is not SYCL: the SYCL devices in "
+            "[%s] get no host SCRATCH notify, holder plan or transaction from this context\n",
+            names.c_str());
+    }
+}
+
 // The backend of `dev` among `backends` when `dev` is SYCL, else nullptr. model.devices[0]'s is the one the notify
 // and the SCRATCH transaction go through: its device's host buft is the one the CPU backend computes in (§4.4).
 static ggml_backend_t llama_context_sycl_backend_of(const std::vector<ggml_backend_ptr> & backends,
@@ -1514,6 +1535,7 @@ llama_context::llama_context(
 
         // The host SCRATCH entries, before the first notify: the output buffer's, right below.
         sycl_host_hooks = llama_context_sycl_host_procs(model.devices.empty() ? nullptr : model.devices[0].dev);
+        llama_context_sycl_warn_dev0(model.devices);
 
         // graph outputs buffer
         {
