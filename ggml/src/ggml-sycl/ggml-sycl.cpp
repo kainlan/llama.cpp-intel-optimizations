@@ -14282,13 +14282,14 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             // terminal/wrong replay, waiting behind another finisher, or
             // reserving this exact transaction's abort ticket.
             const auto recovery = registry->recover_binding_failure({ txn.id });
+            // A throw before the finisher ticket (probe_end, the candidate scope, prepare_end) left the span open.
+            // A recovery that becomes the finisher rolls back the whole outer load, so the span closes at the end
+            // of this arm, after the abort. A replay is not the finisher, so it does not close the span.
+            ggml_sycl_file_mapped_load_span_close file_mapped_load_span{ recovery.finisher && recovery.outer };
             if (!recovery.finisher) {
                 return ggml_sycl_load_end_replay_result(recovery, model);
             }
             after_end.txn = txn.id;
-            // A throw before this call held a finisher ticket (probe_end, the candidate scope, prepare_end) left the
-            // span open. The recovery rolls back the whole outer load, so the span closes here instead.
-            ggml_sycl_file_mapped_load_span_close file_mapped_load_span{ recovery.outer };
             ggml_sycl_finalize_binding_failure_abort(*registry, recovery);
         }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
