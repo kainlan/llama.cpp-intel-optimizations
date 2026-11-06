@@ -53,10 +53,25 @@ constexpr size_t lazy_table_host_body_request_bytes(uint64_t file_offset, size_t
 // activation check compares like with like.
 constexpr size_t LAZY_ROW_CACHE_CHUNK_BYTES = 256ull << 20;
 
-// A STORAGE row cache's index row at `slots` slots, before its mapping (§3.3, §6.3): 4 B slot ids at load factor 0.75
-// plus one 8 B key word per slot.
+// A STORAGE row cache's index load factor, LAZY_ROW_CACHE_LOAD_NUM / LAZY_ROW_CACHE_LOAD_DEN = 0.75 (§6.3): the index
+// has a bucket per 0.75 slot, and a shard holds at most 0.75 of its buckets, so a probe always meets an empty bucket.
+// Enumerators, so the factor adds no namespace-scope object (§11).
+enum lazy_row_cache_load_factor : size_t { LAZY_ROW_CACHE_LOAD_NUM = 3, LAZY_ROW_CACHE_LOAD_DEN = 4 };
+
+// A STORAGE row cache's index buckets at `slots` slots: slots / 0.75, rounded up.
+constexpr size_t lazy_row_cache_index_buckets(size_t slots) {
+    return (LAZY_ROW_CACHE_LOAD_DEN * slots + LAZY_ROW_CACHE_LOAD_NUM - 1) / LAZY_ROW_CACHE_LOAD_NUM;
+}
+
+// The live rows `buckets` index buckets may hold: 0.75 of them, rounded down.
+constexpr size_t lazy_row_cache_bucket_cap(size_t buckets) {
+    return LAZY_ROW_CACHE_LOAD_NUM * buckets / LAZY_ROW_CACHE_LOAD_DEN;
+}
+
+// A STORAGE row cache's index row at `slots` slots, before its mapping (§3.3, §6.3): one 8 B key word per slot, then
+// one 4 B slot id per bucket.
 constexpr size_t lazy_row_cache_index_raw_bytes(size_t slots) {
-    return 4 * ((4 * slots + 2) / 3) + 8 * slots;
+    return sizeof(uint64_t) * slots + sizeof(uint32_t) * lazy_row_cache_index_buckets(slots);
 }
 
 struct lazy_io_pool;

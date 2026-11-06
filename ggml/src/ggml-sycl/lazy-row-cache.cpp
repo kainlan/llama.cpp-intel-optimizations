@@ -141,14 +141,33 @@ const char * lazy_row_cache_status_name(lazy_row_cache_status status) {
     return "unknown";
 }
 
-// The geometries the cache builds: a row that fits a chunk, a floor that fits the slots, and a slab that fits a size_t.
-static bool lazy_row_cache_geometry_ok(size_t cache_slots, size_t floor_slots, size_t row_size, size_t chunk_bytes) {
-    return row_size != 0 && chunk_bytes >= row_size && floor_slots != 0 && cache_slots >= floor_slots &&
-           cache_slots <= SIZE_MAX / row_size;
+// Why the cache does not build a geometry, or empty when it does: a row of some bytes, a floor that fits the slots, a
+// slot count a 4 B slot id names (§6.3; the empty bucket's id is none of them) whose slab fits a size_t, and a chunk
+// that holds a row. The one rule for "a geometry the cache refuses": the build refuses these and the chunk helpers
+// return 0 for them.
+static std::string lazy_row_cache_geometry_refusal(size_t cache_slots,
+                                                   size_t floor_slots,
+                                                   size_t row_size,
+                                                   size_t chunk_bytes) {
+    if (row_size == 0) {
+        return "row_size=0 is not a table's row geometry";
+    }
+    if (floor_slots == 0 || cache_slots < floor_slots) {
+        return "cache_slots=" + std::to_string(cache_slots) + " floor_slots=" + std::to_string(floor_slots) +
+               ": the plan's slots must hold its floor";
+    }
+    if (cache_slots >= BUCKET_EMPTY || cache_slots > SIZE_MAX / row_size) {
+        return "cache_slots=" + std::to_string(cache_slots) + " is more slots than a 4 B slot id names";
+    }
+    if (chunk_bytes < row_size) {
+        return "chunk_bytes=" + std::to_string(chunk_bytes) + " row_size=" + std::to_string(row_size) +
+               ": a chunk must hold a row";
+    }
+    return {};
 }
 
 size_t lazy_row_cache_floor_chunks(size_t cache_slots, size_t floor_slots, size_t row_size, size_t chunk_bytes) {
-    if (!lazy_row_cache_geometry_ok(cache_slots, floor_slots, row_size, chunk_bytes)) {
+    if (!lazy_row_cache_geometry_refusal(cache_slots, floor_slots, row_size, chunk_bytes).empty()) {
         return 0;
     }
     const size_t slab      = cache_slots * row_size;
@@ -293,26 +312,17 @@ lazy_row_cache_build lazy_row_cache::build(const lazy_row_cache_config &  config
 
     const size_t slots = config.cache_slots;
     const size_t row   = config.row_size;
-    if (row == 0 || config.n_rows <= 0 || static_cast<uint64_t>(config.n_rows) >= KEY_EMPTY) {
-        return refuse(lazy_row_cache_status::INVALID_CONFIG, "row_size=" + std::to_string(row) +
-                                                                 " n_rows=" + std::to_string(config.n_rows) +
-                                                                 " is not a table's row geometry");
+    // The geometry by the chunk helpers' rule, then what only a built cache needs: keys for its rows and a shard.
+    const std::string geometry = lazy_row_cache_geometry_refusal(slots, config.floor_slots, row, config.chunk_bytes);
+    if (!geometry.empty()) {
+        return refuse(lazy_row_cache_status::INVALID_CONFIG, geometry);
     }
-    if (config.floor_slots == 0 || slots < config.floor_slots) {
-        return refuse(lazy_row_cache_status::INVALID_CONFIG, "cache_slots=" + std::to_string(slots) +
-                                                                 " floor_slots=" + std::to_string(config.floor_slots) +
-                                                                 ": the plan's slots must hold its floor");
-    }
-    // A 4 B slot id names every slot (§6.3), and the empty bucket's id is none of them.
-    if (slots >= BUCKET_EMPTY || slots > SIZE_MAX / row) {
+    if (config.n_rows <= 0 || static_cast<uint64_t>(config.n_rows) >= KEY_EMPTY) {
         return refuse(lazy_row_cache_status::INVALID_CONFIG,
-                      "cache_slots=" + std::to_string(slots) + " is more slots than a 4 B slot id names");
+                      "n_rows=" + std::to_string(config.n_rows) + " is not a table's row count");
     }
-    if (config.chunk_bytes < row || config.n_shards == 0) {
-        return refuse(lazy_row_cache_status::INVALID_CONFIG, "chunk_bytes=" + std::to_string(config.chunk_bytes) +
-                                                                 " row_size=" + std::to_string(row) +
-                                                                 " n_shards=" + std::to_string(config.n_shards) +
-                                                                 ": a chunk must hold a row and a cache a shard");
+    if (config.n_shards == 0) {
+        return refuse(lazy_row_cache_status::INVALID_CONFIG, "n_shards=0: a cache needs a shard");
     }
 
     std::unique_ptr<lazy_row_cache> c(new lazy_row_cache());
@@ -374,16 +384,16 @@ lazy_row_cache_build lazy_row_cache::build(const lazy_row_cache_config &  config
         c->chunks_[i].floor = true;
     }
 
-    // The index: one key word per slot, then the buckets, (4 x slots + 2) / 3 of them (load factor 0.75), split over
-    // the shards. Each shard keeps at least MIN_SHARD_BUCKETS, and holds at most 0.75 of its buckets.
+    // The index, laid out as lazy_row_cache_index_raw_bytes sized it: one key word per slot, then the buckets, split
+    // over the shards. Each shard keeps at least MIN_SHARD_BUCKETS, and holds at most its buckets' load-factor cap.
     c->index_              = std::move(index);
     c->keys_               = reinterpret_cast<uint64_t *>(c->index_->data());
-    uint32_t *   buckets   = reinterpret_cast<uint32_t *>(c->index_->data() + 8 * slots);
-    const size_t n_buckets = (4 * slots + 2) / 3;
+    uint32_t *   buckets   = reinterpret_cast<uint32_t *>(c->index_->data() + sizeof(uint64_t) * slots);
+    const size_t n_buckets = lazy_row_cache_index_buckets(slots);
     for (size_t s = 0; s < slots; ++s) {
         c->keys_[s] = KEY_EMPTY;
     }
-    std::memset(buckets, 0xFF, 4 * n_buckets);
+    std::memset(buckets, 0xFF, sizeof(uint32_t) * n_buckets);
     c->n_shards_ = static_cast<uint32_t>(
         std::max<size_t>(1, std::min<size_t>(config.n_shards, std::min(n_buckets / MIN_SHARD_BUCKETS, usable))));
     c->shards_.reset(new shard[c->n_shards_]);
@@ -394,7 +404,7 @@ lazy_row_cache_build lazy_row_cache::build(const lazy_row_cache_config &  config
         sh.buckets   = buckets + bucket_at;
         bucket_at += sh.n_buckets;
         sh.owned = usable / c->n_shards_ + (j < usable % c->n_shards_ ? 1 : 0);
-        sh.limit = std::min(sh.owned, 3 * sh.n_buckets / 4);
+        sh.limit = std::min(sh.owned, lazy_row_cache_bucket_cap(sh.n_buckets));
         c->capacity_slots_ += sh.limit;
     }
     // The capacity can fall short of cache_slots from two sources, and the build line prints the two side by side: a
@@ -403,10 +413,7 @@ lazy_row_cache_build lazy_row_cache::build(const lazy_row_cache_config &  config
     c->chunks_resident_.store(c->n_chunks_, std::memory_order_relaxed);
     c->charged_live_.store(result.charged_bytes, std::memory_order_relaxed);
 
-    size_t yieldable = 0;
-    for (size_t i = c->n_floor_chunks_; i < c->n_chunks_; ++i) {
-        yieldable += c->chunks_[i].charged;
-    }
+    const size_t yieldable = c->yieldable_bytes();
     GGML_LOG_INFO(
         "[LAZY-ROW-CACHE] %s built cache_slots=%zu capacity=%zu floor_slots=%zu row_size=%zu chunks=%zu "
         "floor_chunks=%zu chunk_bytes=%zu slab=%zu index=%zu shards=%u charged=%zu yieldable=%zu load_txn=%llu\n",
