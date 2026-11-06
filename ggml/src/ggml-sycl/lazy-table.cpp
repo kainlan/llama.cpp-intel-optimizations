@@ -43,7 +43,7 @@ std::string device_text(int device) {
     return device < 0 ? std::string("CPU") : std::to_string(device);
 }
 
-// The typed result of a refusal, after its WARN: refuse() and the activation check build theirs here.
+// The typed result of a refusal, after its WARN: refuse() and refuse_plan_bug() build theirs here.
 lazy_table_result refusal(lazy_table_status status, const std::string & reason) {
     lazy_table_result result;
     result.status = status;
@@ -54,6 +54,21 @@ lazy_table_result refusal(lazy_table_status status, const std::string & reason) 
 lazy_table_result refuse(const lazy_table_desc & desc, lazy_table_status status, const std::string & reason) {
     GGML_LOG_WARN("[LAZY-TABLE] %s refused: %s: %s\n", desc.name.c_str(), lazy_table_status_name(status),
                   reason.c_str());
+    return refusal(status, reason);
+}
+
+// A plan bug, plan != reality (§10), refuses with one [HOST-PLAN-BUG] WARN naming the table, the `subject` that fell
+// short of its plan and the figures, aborts under GGML_SYCL_STRICT_LEASES=1, and otherwise returns the typed refusal.
+lazy_table_result refuse_plan_bug(const lazy_table_desc & desc,
+                                  const char *            subject,
+                                  lazy_table_status       status,
+                                  const std::string &     reason) {
+    GGML_LOG_WARN("[HOST-PLAN-BUG] lazy table %s %s: %s: %s\n", desc.name.c_str(), subject,
+                  lazy_table_status_name(status), reason.c_str());
+    if (ggml_sycl_strict_enabled()) {
+        GGML_ABORT("lazy table %s %s: %s under GGML_SYCL_STRICT_LEASES=1", desc.name.c_str(), subject,
+                   lazy_table_status_name(status));
+    }
     return refusal(status, reason);
 }
 
@@ -147,21 +162,32 @@ int record_device(const lazy_table_desc & desc) {
     return desc.consumer_device >= 0 ? desc.consumer_device : 0;
 }
 
-// One HOST_CPU record of `bytes` for the table: owner first, WEIGHT, MODEL lifetime under the table's model (§3.3).
-// The body's charge is one of the two sites that may yield (§4.2): the load's thread holds no lock here, and the yield
-// skips this load's own chunks.
-allocation_result allocate_host_record(const lazy_table_desc & desc, size_t bytes) {
+// One HOST_CPU request of `bytes` for the table (§3.3): owner first, MODEL lifetime under the table's model, named by
+// its load, on record_device's device. Its callers differ only in the role, whether the charge may yield, and the
+// alignment (0 is the allocator's default).
+alloc_request host_record_request(const lazy_table_desc & desc,
+                                  size_t                  bytes,
+                                  alloc_role              role,
+                                  bool                    may_yield,
+                                  size_t                  alignment) {
     alloc_request req{};
     req.device                           = record_device(desc);
     req.size                             = bytes;
-    req.alignment                        = LAZY_IO_BLOCK_BYTES;
-    req.intent.role                      = alloc_role::WEIGHT;
+    req.alignment                        = alignment;
+    req.intent.role                      = role;
     req.intent.constraints.must_host_cpu = true;
     req.intent.lifetime                  = alloc_lifetime::MODEL;
     req.intent.owner                     = { alloc_owner_kind::MODEL, desc.model.model_id };
-    req.may_yield                        = true;
+    req.may_yield                        = may_yield;
     req.load_txn_id                      = desc.model.load_txn_id;
-    return unified_allocate_owner(req);
+    return req;
+}
+
+// One HOST_CPU record of `bytes` for the table, a WEIGHT at the O_DIRECT block alignment. The body's charge is one of
+// the two sites that may yield (§4.2): the load's thread holds no lock here, and the yield skips this load's own
+// chunks.
+allocation_result allocate_host_record(const lazy_table_desc & desc, size_t bytes) {
+    return unified_allocate_owner(host_record_request(desc, bytes, alloc_role::WEIGHT, true, LAZY_IO_BLOCK_BYTES));
 }
 
 // One row-cache allocation through the owner entry (§6.4): its mem_handle, and the CPU view resolved from it once,
@@ -208,16 +234,8 @@ class owner_cache_source final : public lazy_row_cache_memory_source {
     explicit owner_cache_source(const lazy_table_desc & desc) : desc_(desc) {}
 
     std::unique_ptr<lazy_row_cache_memory> allocate(size_t bytes) override {
-        alloc_request req{};
-        req.device                           = record_device(desc_);
-        req.size                             = bytes;
-        req.intent.role                      = alloc_role::LAZY_ROW_CACHE;
-        req.intent.constraints.must_host_cpu = true;
-        req.intent.lifetime                  = alloc_lifetime::MODEL;
-        req.intent.owner                     = { alloc_owner_kind::MODEL, desc_.model.model_id };
-        req.may_yield                        = false;
-        req.load_txn_id                      = desc_.model.load_txn_id;
-        allocation_result got                = unified_allocate_owner(req);
+        allocation_result got =
+            unified_allocate_owner(host_record_request(desc_, bytes, alloc_role::LAZY_ROW_CACHE, false, 0));
         if (!got) {
             last_error_ = (int) got.error;
             return nullptr;
@@ -435,13 +453,7 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
                 return refuse(desc, lazy_table_status::ROW_CACHE_SHORTFALL, reason);
             }
 #endif
-            GGML_LOG_WARN("[HOST-PLAN-BUG] lazy table %s row cache: %s: %s\n", desc.name.c_str(),
-                          lazy_table_status_name(lazy_table_status::ROW_CACHE_SHORTFALL), reason.c_str());
-            if (ggml_sycl_strict_enabled()) {
-                GGML_ABORT("lazy table %s row cache fell short of its plan under GGML_SYCL_STRICT_LEASES=1",
-                           desc.name.c_str());
-            }
-            return refusal(lazy_table_status::ROW_CACHE_SHORTFALL, reason);
+            return refuse_plan_bug(desc, "row cache", lazy_table_status::ROW_CACHE_SHORTFALL, reason);
         }
         if (!built) {
             return refuse(desc, lazy_table_status::INVALID_DESC, "the row cache refused its plan: " + built.reason);
@@ -471,12 +483,7 @@ lazy_table_result lazy_table::materialize(const lazy_table_desc &               
             "charged_bytes=" + std::to_string(charged) + " B over " + std::to_string(table->records_.size()) +
             " record(s) and the row cache, the block ring excluded, planned host_resident_bytes=" +
             std::to_string(desc.host_resident_bytes) + " B";
-        GGML_LOG_WARN("[HOST-PLAN-BUG] lazy table %s activation check: %s: %s\n", desc.name.c_str(),
-                      lazy_table_status_name(lazy_table_status::ACTIVATION_MISMATCH), reason.c_str());
-        if (ggml_sycl_strict_enabled()) {
-            GGML_ABORT("lazy table %s failed its activation check under GGML_SYCL_STRICT_LEASES=1", desc.name.c_str());
-        }
-        return refusal(lazy_table_status::ACTIVATION_MISMATCH, reason);
+        return refuse_plan_bug(desc, "activation check", lazy_table_status::ACTIVATION_MISMATCH, reason);
     }
 
     // The cache's yielder registers once the table is whole, through T2's per-cache hook (§4.2), so a refusal above
