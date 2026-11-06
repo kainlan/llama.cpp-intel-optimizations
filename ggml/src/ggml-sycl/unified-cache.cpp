@@ -11551,6 +11551,10 @@ uint64_t unified_cache_unregistered_host_registration_refusals() noexcept {
 // registry holds (file mappings, tracked blocks), so a slice inside a pinned allocation, which only the runtime
 // registry's containment index knows, comes back UNREGISTERED from it. A host registration takes such slices (a
 // SYCL_Host buffer's experts), so the index is asked before a pointer is called unregistered.
+//
+// Lock (design §12.5): g_runtime_alloc_mutex, L5. The registrations call this before they take direct_stage_mutex_ and
+// rw_mutex_ (L4), and hold no listed lock themselves, so the mutex is taken alone, as query_location's own lookup takes
+// it just before. Nothing is acquired and nothing is logged under it; the row's tier is copied out and the lock drops.
 static alloc_tier host_registration_tier(const void * ptr, int device) {
     const alloc_tier exact = query_location(ptr, device).tier;
     if (exact != alloc_tier::UNREGISTERED || ptr == nullptr) {
