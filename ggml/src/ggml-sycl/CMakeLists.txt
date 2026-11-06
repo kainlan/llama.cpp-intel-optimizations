@@ -8177,18 +8177,14 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # of them pull the control in.
     # The lead runs this one first, by name. It writes ${CMAKE_BINARY_DIR}/bin/sycl-pinned-meminfo-control.outcome.
     ggml_sycl_scratch_return_test(test-sycl-pinned-meminfo-control TIMEOUT 300)
-    # Run after test-sycl-pinned-meminfo-control, whose outcome it reads first.
     ggml_sycl_scratch_return_test(test-sycl-file-mapped-stream-refusal TIMEOUT 120 MUTANTS
         refusal-after-copy-fn with-copy-fn
             "FAIL \\[with-copy-fn\\] stream_dma over a FILE_MAPPED view with a copy_fn was not refused")
-    # Run after test-sycl-pinned-meminfo-control, whose outcome it reads first.
     ggml_sycl_scratch_return_test(test-sycl-file-mapped-bounce TIMEOUT 120)
-    # Run after test-sycl-pinned-meminfo-control, whose outcome it reads first.
     ggml_sycl_scratch_return_test(test-sycl-file-mapped-expert-owner TIMEOUT 120)
-    # Run after test-sycl-pinned-meminfo-control, whose outcome it reads first.
     ggml_sycl_scratch_return_test(test-sycl-file-mapped-resolve-abort TIMEOUT 120)
-    # Run after test-sycl-pinned-meminfo-control, whose outcome it reads first. A refusal inside the segmented MoE
-    # record (§4.4): five cases on the non-keyed record function. The immediate return must fail both of its cases.
+    # A refusal inside the segmented MoE record (§4.4): five cases on the non-keyed record function. The immediate
+    # return must fail both of its cases.
     set(_seg_no_line "no \"recoverable runtime fallback failed\" line after a FAILED return")
     # Every arm's text starts at its case's FAIL prefix, so only that case's c.fail line can match it.
     set(_seg_lease_line "FAIL \\[active-valid\\] lease vectors [0-9]+\\+[0-9]+ non-empty after a FAILED return")

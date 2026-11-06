@@ -1,6 +1,6 @@
 //
 // Which /proc/meminfo counter pinned host USM lands in (docs/design/sycl-mmap-host-tier.md §7 C4,
-// test-sycl-pinned-meminfo-control; r2 m-13). The lead runs it before the other file-mapped REDs and before C4's
+// test-sycl-pinned-meminfo-control). The lead runs it before the other file-mapped REDs and before C4's
 // host-growth criterion, which reads the counter this test names.
 //
 // MIT license

@@ -183,10 +183,6 @@ struct abort_runner : scratch_return_test::case_runner {
 
 int main(int argc, char ** argv) {
     static const std::vector<const char *> all = { "abort", "abort-raw" };
-    const scratch_return_test::child_args  a   = scratch_return_test::child_args_parse(argc, argv);
-    if (a.case_name.empty() && !file_mapped_test::control_gate()) {
-        return SYCL_TEST_SKIP;
-    }
-    const abort_runner runner;
-    return scratch_return_test::cases_main(argc, argv, all, run_case, std::chrono::minutes(2), runner);
+    const abort_runner                     runner;
+    return file_mapped_test::gated_main(argc, argv, all, run_case, std::chrono::minutes(2), runner);
 }

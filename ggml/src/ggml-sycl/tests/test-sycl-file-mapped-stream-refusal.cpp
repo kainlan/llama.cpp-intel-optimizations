@@ -10,8 +10,8 @@
 // fixture file through the FILE_MAPPED front door on device 0's cache, streams the whole view, and requires the typed
 // refusal (refused_file_mapped, not ok, nothing submitted), no call of either callback, and the process-wide refusal
 // counter one higher. The callbacks touch no memory, so a stream the refusal fails to stop reads no mapped page from a
-// device. Mutant check-after-copy-fn (a runtime seam in stream_dma) tests the copy_fn before the refusal; it fails the
-// with-copy-fn case.
+// device. Mutant refusal-after-copy-fn (a runtime seam in stream_dma) tests the copy_fn before the refusal; it fails
+// the with-copy-fn case.
 
 #include "file-mapped-test-common.hpp"
 

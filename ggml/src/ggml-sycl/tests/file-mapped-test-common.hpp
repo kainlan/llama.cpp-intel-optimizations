@@ -124,17 +124,18 @@ inline bool entry_ok(checks & c) {
 }
 
 // The main of each of the five: a child runs its case; the driver first reads the control's outcome and, when the
-// gate refuses, exits 77 with the gate's one line and forks nothing.
+// gate refuses, exits 77 with the gate's one line and forks nothing. `runner` scores each child, as in cases_main.
 inline int gated_main(int                               argc,
                       char **                           argv,
                       const std::vector<const char *> & all,
                       int (*run_case)(const scratch_return_test::child_args &),
-                      std::chrono::milliseconds bound) {
+                      std::chrono::milliseconds                bound,
+                      const scratch_return_test::case_runner & runner = scratch_return_test::case_runner()) {
     const scratch_return_test::child_args a = scratch_return_test::child_args_parse(argc, argv);
     if (a.case_name.empty() && !control_gate()) {
         return SYCL_TEST_SKIP;
     }
-    return scratch_return_test::cases_main(argc, argv, all, run_case, bound);
+    return scratch_return_test::cases_main(argc, argv, all, run_case, bound, runner);
 }
 
 // A file of `pages` pages whose byte i is pattern(i), open read-only. It is unlinked at destruction; a mapping of it
