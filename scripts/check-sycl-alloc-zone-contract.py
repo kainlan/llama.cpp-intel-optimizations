@@ -147,6 +147,15 @@ be written a literal false. Write credit is positional and does not follow contr
       ggml_sycl_fa_onednn_d512_enabled passes; the routing function's "reads the decline first" is not checked (its decline
       reader has no name yet); the charge side's walk helpers are not named, so the head-dim and helper rules cover the two
       named charge functions' bodies and the helper-name rule covers all of unified-cache.cpp/.hpp.
+  (r) the POOL lifetime (th32 design section 3.3, canonical contract section 12.5). A request that writes
+      `intent.lifetime = alloc_lifetime::POOL` establishes owner kind `alloc_owner_kind::IO_POOL` and
+      `must_host_cpu = true`, and a request that writes owner kind IO_POOL establishes lifetime POOL, each by an
+      unconditional literal as its last write (R-POOL). The lazy IO pool's reap is the only release of POOL memory and
+      its registry generation the only IO_POOL owner, so a POOL request of any other shape is memory that no owner
+      check reports and no reap frees. The owner is read from a braced `{ kind, id }`, a designated `.kind`, or a
+      write to `owner.kind`. R-POOL is never debt and never allowlisted.
+      Known (r) gap: a lifetime or owner kind passed in through a helper's parameter is an expression, not a literal,
+      so a POOL request built that way is not seen.
 
 Scope
   Every .cpp/.hpp under ggml/src/ggml-sycl except the skipped directories below. dpct/ is in
@@ -223,13 +232,16 @@ BASE_TYPES = ("alloc_request", "alloc_intent", "alloc_constraints")
 ZONES = ("KV", "WEIGHT", "ONEDNN", "RUNTIME", "SCRATCH")
 # Fields whose literal value the rules read. Later clauses add to this set.
 TRACKED = ("must_device", "must_host_pinned", "must_host_cpu", "prefer_vram_zone", "forbid_vram_zone_spill",
-           "cascade_step", "unconverted_ticket", "cohort_id")
+           "cascade_step", "unconverted_ticket", "cohort_id", "lifetime", "owner")
+# The members of alloc_intent itself that clause (r) reads: a braced or copied intent re-seeds them, a constraints
+# copy leaves them alone.
+INTENT_FIELDS = ("lifetime", "owner")
 # The tier flags of clause (b), in the order a finding names them. Exactly one is established.
 TIER_FLAGS = ("must_device", "must_host_pinned", "must_host_cpu")
 # Fields of a request that are themselves structs: a write to one is a copy, not a literal.
 STRUCT_FIELDS = ("intent", "constraints")
 # Members of alloc_constraints the rules read (the tracked fields that are not the cohort).
-CONSTRAINT_FIELDS = tuple(f for f in TRACKED if f != "cohort_id")
+CONSTRAINT_FIELDS = tuple(f for f in TRACKED if f != "cohort_id" and f not in INTENT_FIELDS)
 # A wrapper that builds one site-carrying request type from another must copy these (witness 24). A write to the
 # nested intent's own site is keyed `intent.site_file`, so it is never mistaken for the request's.
 SITE_FIELDS = ("site_file", "site_line")
@@ -311,8 +323,11 @@ S2D_CODES = ("I-RETRY", "K-INTERIM", "L-CALLER", "L-FREE", "L-GUARD", "J-SOURCE"
              "M-DATA", "N-VOID", "N-NODISCARD", "O-NOROW", "O-ROW", "O-QUEUE", "Z9-SITE", "Z9-SIZING", "P-ROUTE", "P-HOME", "P-FILL",
              "P-LAYER", "P-CHARGE", "X-LATCH")
 S2D_NEVER_ALLOW = ("X-LATCH", "P-ROUTE", "P-HOME", "P-FILL", "P-LAYER", "P-CHARGE")
+# Clause (r): a POOL request's shape. Fixed, never debt and never allowlisted.
+R_CODES = ("R-POOL",)
 CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-FORM", "B-TIER", "C-COHORT", "C-SITE", "D-ZONE",
-         "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "E-LIBC", "G-CATCH", "DEFER-C") + H_CODES + S2D_CODES
+         "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "E-LIBC", "G-CATCH", "DEFER-C") + H_CODES + S2D_CODES \
+    + R_CODES
 
 
 # ---------------------------------------------------------------- tree-sitter accessors
@@ -854,9 +869,46 @@ def str_class(src, n):
     return "null" if txt(src, n).strip() in ("nullptr", "NULL", "0") else "expr"
 
 
+def enum_class(src, n, enum):
+    """The enumerator a literal `enum::NAME` (or `ns::enum::NAME`) names, or 'expr' for anything else."""
+    if kind(n) == "parenthesized_expression":
+        inner = [c for c in kids(n) if _a(c, "is_named")]
+        return enum_class(src, inner[0], enum) if inner else "expr"
+    if kind(n) == "qualified_identifier":
+        while fld(n, "name") is not None and kind(fld(n, "name")) == "qualified_identifier":
+            n = fld(n, "name")
+        scope, name = fld(n, "scope"), fld(n, "name")
+        if scope is not None and name is not None and txt(src, scope).split("::")[-1].strip() == enum:
+            return txt(src, name).strip()
+    return "expr"
+
+
+def owner_class(src, n):
+    """The owner kind of an alloc_owner_ref value: the first element or the `.kind` designator of a braced list,
+    'none' for an empty list (a value-initialised ref is kind NONE), else 'expr'."""
+    if kind(n) != "initializer_list":
+        return "expr"
+    elems = [c for c in kids(n) if kind(c) not in ("{", "}", ",", "comment")]
+    if not elems:
+        return "none"
+    for e in elems:
+        if kind(e) == "initializer_pair":
+            desig = [x for x in kids(e) if kind(x) == "field_designator"]
+            fi = [x for x in kids(desig[-1]) if kind(x) == "field_identifier"] if desig else []
+            if fi and txt(src, fi[0]) == "kind":
+                return enum_class(src, fld(e, "value"), "alloc_owner_kind")
+    if kind(elems[0]) == "initializer_pair":
+        return "none"  # designated, and no .kind: the kind keeps its default, NONE
+    return enum_class(src, elems[0], "alloc_owner_kind")
+
+
 def classify(src, field, n):
     if field in ("cohort_id", "unconverted_ticket"):
         return str_class(src, n)
+    if field == "lifetime":
+        return enum_class(src, n, "alloc_lifetime")
+    if field == "owner":
+        return owner_class(src, n)
     if field == "prefer_vram_zone":
         return zone_class(src, n)
     if field in TIER_FLAGS + ("forbid_vram_zone_spill", "cascade_step"):
@@ -1480,6 +1532,11 @@ def writes_for(env, decl, name, blk, fields, copied, reason, st, callee_mode, st
                 st["pass"] = r[2]
         elif last in TRACKED:
             add_write(fields, last, pos, "expr" if compound else classify(src, last, rhs), cond or late,
+                      txt(src, rhs) if rhs is not None else "")
+        elif last == "kind" and chain[1:2] == ["owner"]:
+            # clause (r): a write to the owner's kind is a write of the owner
+            add_write(fields, "owner", pos,
+                      "expr" if compound or rhs is None else enum_class(src, rhs, "alloc_owner_kind"), cond or late,
                       txt(src, rhs) if rhs is not None else "")
         elif last in SITE_FIELDS:
             key = "intent." + last if "intent" in chain[1:] else last
@@ -2340,6 +2397,16 @@ def judge(c):
             out.append(("C-SITE", "built from %s but %s not copied from it by an unconditional assignment; the allocator "
                                   "would report this wrapper's line, not the caller's construction"
                         % (", ".join(inp), " and ".join(miss) + (" is" if len(miss) == 1 else " are"))))
+    life_ws, owner_ws = w.get("lifetime", []), w.get("owner", [])
+    if any(x[1] == "POOL" for x in life_ws) or any(x[1] == "IO_POOL" for x in owner_ws):
+        shape = [(established(life_ws, "POOL"), "lifetime POOL"), (established(owner_ws, "IO_POOL"), "owner kind IO_POOL"),
+                 (established(w.get("must_host_cpu", []), "true"), "must_host_cpu = true")]
+        miss = [name for ok, name in shape if not ok]
+        if miss:
+            out.append(("R-POOL", "a POOL request establishes lifetime POOL, owner kind IO_POOL and must_host_cpu = true, each "
+                                  "by an unconditional literal last write, and this one does not establish %s: only the lazy "
+                                  "IO pool's reap releases POOL memory and only its generation is an IO_POOL owner"
+                        % " or ".join(miss)))
     if c["needs_cohort"] and not established(w.get("cohort_id", []), "lit"):
         out.append(("C-COHORT", "a copy that is handed on must assign its own cohort_id literal; it inherits its source's "
                                 "site, so without one its trace and refusal lines read as the original's"))
@@ -3728,6 +3795,9 @@ def validate_data(allowlist, debt):
             continue
         if e["code"] not in CODES:
             errs.append("FAIL allowlist entry %s has unknown code %r" % (e["id"], e["code"]))
+        if e["code"] in R_CODES:
+            errs.append("FAIL allowlist entry %s: a finding of code %s is fixed, never exempted (a POOL request has one shape)"
+                        % (e["id"], e["code"]))
         if e["code"] in S2D_NEVER_ALLOW:
             errs.append("FAIL allowlist entry %s: a finding of code %s is fixed, never exempted (an X-LATCH means the clause cannot "
                         "see the code; a P-* finding is a design pin)" % (e["id"], e["code"]))
@@ -3763,6 +3833,8 @@ def validate_data(allowlist, debt):
             errs.append("FAIL debt entry %s %s has unknown code" % (d["code"], d["key"]))
         if d["code"] in H_CODES:
             errs.append("FAIL debt entry %s %s: a clause-(h) finding is allowlisted per node or fixed, never debt" % (d["code"], d["key"]))
+        if d["code"] in R_CODES:
+            errs.append("FAIL debt entry %s %s: a POOL request's shape is fixed, never debt" % (d["code"], d["key"]))
         if d["code"] in S2D_CODES:
             errs.append("FAIL debt entry %s %s: a finding of this code is allowlisted per node or fixed, never debt" % (d["code"], d["key"]))
         seen[(d["code"], d["key"])] += 1
@@ -3840,6 +3912,10 @@ def run_gate(files, allowlist, debt):
 def plan_debt_write(viols, allowlist, old_debt, allow_growth):
     """(ok, message, entries). Rewriting the debt list may drop entries; adding one needs --allow-growth."""
     rest = [v for v in viols if not any(entry_matches(e, v) for e in allowlist.get("entries", []))]
+    bad = sorted({v.ident() for v in rest if v.code in R_CODES})
+    if bad:
+        return False, "clause-(r) findings cannot be debt or allowlisted; fix them:\n%s" % "\n".join(
+            "  %s %s" % b for b in bad[:20]), []
     bad = sorted({v.ident() for v in rest if v.code in H_CODES})
     if bad:
         return False, "clause-(h) findings cannot be debt; fix them or allowlist each node:\n%s" % "\n".join(
