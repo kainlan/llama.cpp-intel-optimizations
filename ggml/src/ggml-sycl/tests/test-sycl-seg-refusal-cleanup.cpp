@@ -7,16 +7,19 @@
 // Copyright (C) 2024-2026 Intel Corporation
 // SPDX-License-Identifier: MIT
 //
-// The fixture is a hand-built MoE model, no libllama: two Q8_0 expert tensors loaded in a WEIGHTS buffer inside a
-// load transaction, and one graph shape built at two token counts,
+// The fixture is a hand-built MoE model, no libllama, loaded the way libllama loads one: an inventory plan staged
+// inside a load transaction, two Q8_0 expert tensors in the card's SYCL host buffer type registered and filled while
+// the load is open, the commit (whose preload materializes every expert as a per-expert record on the card), the
+// plan's activation, and a bound execution and runtime context. A WEIGHTS buffer in the device buffer type is not
+// that path: its upload publishes no per-expert record, so every MUL_MAT_ID admission refuses. The graph,
 //
 //   x -> a1 a2 a3 -> reshape -> m1 = MUL_MAT_ID -> b1 b2 -> m2 = MUL_MAT_ID -> c1 c2 c3 [c4]
 //
-// so the record function finds two dispatch boundaries and three segments: [a1..reshape] recorded with moe_after m1,
-// [b1 b2] direct (two nodes, below MIN_SEGMENT_NODES) with moe_after m2, and [c1..] recorded. Every case first runs
-// the one-token (decode) graph twice: the warmup, then the whole-graph record, which pauses at m1 and sets
-// moe_graph_rerecord. It then runs the four-token (prompt) graph once, its warmup, after which the next prompt call
-// records segments through the non-keyed record function. That call is the one each case perturbs.
+// runs at four tokens, so every call is a prompt phase and no decode admission runs. The record function finds two
+// dispatch boundaries and three segments: [a1..reshape] recorded with moe_after m1, [b1 b2] direct (two nodes, below
+// MIN_SEGMENT_NODES) with moe_after m2, and [c1..] recorded. Every case first runs the graph twice: the prompt warmup,
+// then the whole-graph record, which pauses at m1 and sets moe_graph_rerecord. The next call records segments
+// through the non-keyed record function. That call is the one each case perturbs.
 //
 // The refusal is a seam in ggml-sycl.cpp: at the armed node and helper role it snapshots the context, then refuses
 // through ggml_sycl::host_dispatch_fail_closed, the one function a real refusal throws from. Five cases:
@@ -73,8 +76,56 @@ std::string status_name(ggml_status s) {
     return "status " + std::to_string(static_cast<int>(s));
 }
 
-// The model: a backend on the pinned card and two expert tensors loaded the way libllama's loader registers them,
-// inside a load transaction, so the load's preload and the cache know them as weights.
+// One planned model of the fixture's two expert tensors, with the PP MoE ring fields libllama computes for this shape.
+constexpr uint32_t k_n_ctx    = 512;
+constexpr uint32_t k_n_ubatch = 512;
+const char * const k_names[2] = { "blk.0.seg_refusal_a.weight", "blk.1.seg_refusal_b.weight" };
+
+size_t align_256(size_t n) {
+    return (n + 255) & ~size_t(255);
+}
+
+struct expert_inventory {
+    ggml_sycl_tensor_info        tensors[2]{};
+    ggml_sycl_tensor_inventory   inventory{};
+    ggml_sycl_placement_envelope envelope{ k_n_ctx, k_n_ubatch, 1, -1 };
+
+    expert_inventory() {
+        for (int i = 0; i < 2; ++i) {
+            tensors[i].name  = k_names[i];
+            tensors[i].type  = GGML_TYPE_Q8_0;
+            tensors[i].ne[0] = k_embd;
+            tensors[i].ne[1] = k_embd;
+            tensors[i].ne[2] = k_experts;
+            tensors[i].ne[3] = 1;
+            tensors[i].size  = ggml_row_size(GGML_TYPE_Q8_0, k_embd) * k_embd * k_experts;
+            inventory.total_size += tensors[i].size;
+        }
+        inventory.tensors       = tensors;
+        inventory.count         = 2;
+        inventory.n_expert      = k_experts;
+        inventory.n_expert_used = k_used;
+        inventory.n_layer       = 2;
+        inventory.n_ctx         = k_n_ctx;
+        inventory.n_ubatch      = k_n_ubatch;
+
+        const size_t woq_slot = align_256(size_t(k_embd) * (k_embd / 2)) + align_256(size_t(k_embd / 32) * k_embd);
+        inventory.pp_moe_onednn_weight_slot_bytes        = woq_slot * k_experts;
+        inventory.pp_moe_onednn_activation_bytes_per_row = size_t(k_experts) * k_embd * sizeof(ggml_fp16_t);
+        inventory.pp_moe_onednn_output_bytes_per_row     = size_t(k_experts) * k_embd * sizeof(float);
+        inventory.pp_moe_onednn_activation_slot_bytes =
+            align_256(size_t(k_n_ubatch) * inventory.pp_moe_onednn_activation_bytes_per_row);
+        inventory.pp_moe_onednn_output_slot_bytes =
+            align_256(size_t(k_n_ubatch) * inventory.pp_moe_onednn_output_bytes_per_row);
+        inventory.pp_moe_onednn_ring_depth    = 1;
+        inventory.pp_moe_onednn_scratch_bytes = inventory.pp_moe_onednn_weight_slot_bytes +
+                                                inventory.pp_moe_onednn_activation_slot_bytes +
+                                                inventory.pp_moe_onednn_output_slot_bytes;
+    }
+};
+
+// The model: a backend on the pinned card and the two expert tensors, loaded through the lifecycle a real load drives.
+// The process ends with the case, so nothing is torn down.
 struct model_fixture {
     ggml_backend_t            backend = nullptr;
     ggml_sycl_load_txn        load{};
@@ -86,10 +137,21 @@ struct model_fixture {
 };
 
 bool model_open(checks & c, model_fixture & f) {
+    if (!ggml_backend_sycl_weights_evictable()) {
+        c.void_case("weights are not evictable: libllama would put these experts in the device buffer");
+        return false;
+    }
     if (ggml_backend_sycl_model_load_begin(&f.load) != GGML_SYCL_LIFECYCLE_OK) {
         c.void_case("ggml_backend_sycl_model_load_begin failed");
         return false;
     }
+    expert_inventory plan;
+    const auto       stage = ggml_backend_sycl_stage_load_inventory_plan(&plan.inventory, &plan.envelope, false);
+    if (stage != GGML_SYCL_LIFECYCLE_OK) {
+        c.void_case("the inventory plan was not staged: result " + std::to_string(static_cast<int>(stage)));
+        return false;
+    }
+    // Staging uses temporary backends; the retained backend is created after it, as libllama does.
     f.backend = ggml_backend_sycl_init(0);
     if (f.backend == nullptr) {
         c.void_case("ggml_backend_sycl_init(0) failed");
@@ -101,21 +163,22 @@ bool model_open(checks & c, model_fixture & f) {
         c.void_case("ggml_init for the weights failed");
         return false;
     }
-    const char * names[2]   = { "blk.0.seg_refusal_a.weight", "blk.1.seg_refusal_b.weight" };
-    const char * split_path = "test-sycl-seg-refusal-cleanup.gguf";
+    ggml_backend_dev_t dev        = ggml_backend_get_device(f.backend);
+    const char *       split_path = "test-sycl-seg-refusal-cleanup.gguf";
     for (int i = 0; i < 2; ++i) {
         f.w[i] = ggml_new_tensor_3d(f.weight_ctx, GGML_TYPE_Q8_0, k_embd, k_embd, k_experts);
-        ggml_set_name(f.w[i], names[i]);
+        ggml_set_name(f.w[i], k_names[i]);
         const size_t nbytes = ggml_nbytes(f.w[i]);
         ggml_backend_sycl_register_gguf_file_identity(0, split_path, uint64_t(2 * nbytes));
         ggml_backend_sycl_register_weight_identity(f.w[i], 0, size_t(i) * nbytes, nbytes, 0);
-        if (!ggml_backend_sycl_try_register_weight_usage(names[i], GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT)) {
-            c.void_case(std::string("usage registration refused for ") + names[i]);
+        ggml_backend_sycl_register_host_weight_tensor(dev, f.w[i]);
+        if (!ggml_backend_sycl_try_register_weight_usage(k_names[i], GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT)) {
+            c.void_case(std::string("usage registration refused for ") + k_names[i]);
             return false;
         }
     }
-    f.weight_buffer =
-        ggml_backend_alloc_ctx_tensors_from_buft(f.weight_ctx, ggml_backend_get_default_buffer_type(f.backend));
+    ggml_backend_buffer_type_t buft = ggml_backend_sycl_host_buffer_type_for_device(dev);
+    f.weight_buffer                 = buft ? ggml_backend_alloc_ctx_tensors_from_buft(f.weight_ctx, buft) : nullptr;
     if (f.weight_buffer == nullptr) {
         c.void_case("the weight buffer allocation failed");
         return false;
@@ -134,9 +197,19 @@ bool model_open(checks & c, model_fixture & f) {
         c.void_case("ggml_backend_sycl_model_load_end did not commit the load");
         return false;
     }
+    if (ggml_backend_sycl_activate_model_plan(f.model) != GGML_SYCL_LIFECYCLE_OK) {
+        c.void_case("the model's plan was not activated");
+        return false;
+    }
     if (ggml_backend_sycl_execution_context_create(&f.context) != GGML_SYCL_EXECUTION_OK ||
         ggml_backend_sycl_execution_context_bind_backend(f.backend, f.context) != GGML_SYCL_EXECUTION_OK) {
         c.void_case("the execution context could not be created and bound");
+        return false;
+    }
+    if (ggml_backend_sycl_set_runtime_context_for_model(f.backend, f.model, k_n_ctx, k_n_ubatch, 1,
+                                                        /*kv_unified=*/false, /*swa_full=*/false,
+                                                        /*flash_attn_enabled=*/true) != GGML_SYCL_LIFECYCLE_OK) {
+        c.void_case("the runtime context was not bound");
         return false;
     }
     return true;
@@ -232,29 +305,24 @@ std::vector<const void *> ids_of(const void * const * ids, size_t n) {
     return std::vector<const void *>(ids, ids + n);
 }
 
-// The common prologue: the decode graph's warmup and whole-graph record, which must set moe_graph_rerecord, then the
-// prompt graph's warmup. After it, the next call of `prompt` records segments.
-bool prologue(checks & c, model_fixture & f, moe_graph & decode, moe_graph & prompt) {
-    if (!file_mapped_test::entry_ok(c) || !model_open(c, f) || !graph_build(c, decode, f, 1, false) ||
-        !graph_build(c, prompt, f, k_prompt_n, false)) {
+// The common prologue: the prompt graph's warmup, then its whole-graph record, which pauses at m1 and must set
+// moe_graph_rerecord. After it, the next call of `prompt` records segments.
+bool prologue(checks & c, model_fixture & f, moe_graph & prompt) {
+    if (!file_mapped_test::entry_ok(c) || !model_open(c, f) || !graph_build(c, prompt, f, k_prompt_n, false)) {
         return false;
     }
-    for (int pass = 0; pass < 2; ++pass) {
-        const ggml_status s = ggml_backend_graph_compute(f.backend, decode.graph);
+    const char * pass_names[2] = { "the prompt warmup", "the whole-graph record" };
+    for (const char * pass : pass_names) {
+        const ggml_status s = ggml_backend_graph_compute(f.backend, prompt.graph);
         if (s != GGML_STATUS_SUCCESS) {
-            c.void_case("decode pass " + std::to_string(pass + 1) + " returned " + status_name(s));
+            c.void_case(std::string(pass) + " returned " + status_name(s));
             return false;
         }
     }
     if (!state_of(f).rerecord) {
         c.void_case(
-            "the decode warmup and record did not set moe_graph_rerecord: the prompt call would not reach "
-            "the segmented record");
-        return false;
-    }
-    const ggml_status s = ggml_backend_graph_compute(f.backend, prompt.graph);
-    if (s != GGML_STATUS_SUCCESS) {
-        c.void_case("the prompt warmup returned " + status_name(s));
+            "the prompt warmup and whole-graph record did not set moe_graph_rerecord: the next call would not "
+            "reach the segmented record");
         return false;
     }
     return true;
@@ -332,13 +400,17 @@ bool assertion_1(checks & c) {
 // direct, recording and active-valid: one refusal, its preconditions, then assertions 1 to 5.
 int run_refusal(checks & c, const char * node, const char * role, bool active_valid_alone) {
     model_fixture f;
-    moe_graph     decode;
     moe_graph     prompt;
-    if (!prologue(c, f, decode, prompt)) {
+    if (!prologue(c, f, prompt)) {
         return c.status();
     }
     const int node_idx = node_index(prompt, node);
     ggml_backend_sycl_test_seg_seam_arm(node, role, false);
+    // The whole-graph record left an executable: drop it through the context's own invalidation, outside
+    // graph_compute, so the flag can be set with exec_graph null.
+    if (active_valid_alone) {
+        ggml_backend_sycl_graph_invalidate(f.backend, "test-sycl-seg-refusal-cleanup active-valid");
+    }
     if (active_valid_alone && !ggml_backend_sycl_test_seg_set_active_valid_alone(f.backend)) {
         c.void_case("exec_graph was set before the call: active_exec_graph.valid cannot be set alone");
         return c.status();
@@ -372,9 +444,8 @@ int run_refusal(checks & c, const char * node, const char * role, bool active_va
 // moe-after: the refusal at the first segment's moe_after, just after that segment's executable was submitted.
 int run_moe_after(checks & c) {
     model_fixture f;
-    moe_graph     decode;
     moe_graph     prompt;
-    if (!prologue(c, f, decode, prompt)) {
+    if (!prologue(c, f, prompt)) {
         return c.status();
     }
     const int moe_idx = node_index(prompt, "seg.m1");
@@ -428,10 +499,9 @@ int run_moe_after(checks & c) {
 // stale-vectors: the record function's entry guard, met with every retire failing.
 int run_stale_vectors(checks & c) {
     model_fixture f;
-    moe_graph     decode;
     moe_graph     prompt;
     moe_graph     longer;
-    if (!prologue(c, f, decode, prompt) || !graph_build(c, longer, f, k_prompt_n, true)) {
+    if (!prologue(c, f, prompt) || !graph_build(c, longer, f, k_prompt_n, true)) {
         return c.status();
     }
     ggml_backend_sycl_test_seg_seam_arm(nullptr, nullptr, false);
