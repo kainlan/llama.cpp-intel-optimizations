@@ -9,8 +9,9 @@
 // One case, "owner". It maps a fixture file through the FILE_MAPPED front door on device 0's cache, as a SYCL_Mapped
 // buffer does, and registers a slice inside it as a host expert with the whole mapping's handle as the owner, as the
 // preload does for a served-in-place expert. The test's handle stands in for the buffer's: dropping it is the buffer's
-// free. Then, with only the entry and its lease holding the mapping, the file is still mapped, the lease reports the
-// FILE_MAPPED owner and resolves to the slice, and the slice reads the file's bytes. Dropping the lease and retiring
+// free. Then, with only the entry and its lease holding the mapping, the file is still mapped, the entry holds the
+// FILE_MAPPED owner, the lease presents no owner (it retains only a host-pinned one) and resolves to the slice, and the
+// slice reads the file's bytes. Dropping the lease and retiring
 // the entry unmaps it, so the entry held the last reference and nothing else leaked one.
 
 #include "file-mapped-test-common.hpp"
@@ -78,10 +79,17 @@ int run_owner(checks & c) {
             "entry did not store the owner");
         return c.status();
     }
+    // The entry holds the owner. A lease retains only a host-pinned owner, the evidence the copy path needs to trust a
+    // host source for a direct USM copy, so a lease on a mapped slice presents none and its copies take the bounce.
     alloc_metadata owner{};
-    c.expect(
-        lease.owner_metadata(&owner) && owner.tier == alloc_tier::FILE_MAPPED,
-        "the lease does not report a FILE_MAPPED owner (tier=" + std::to_string(static_cast<int>(owner.tier)) + ")");
+    const bool     entry_found = cache->test_expert_host_entry_state(key, nullptr, nullptr, &owner);
+    c.expect(entry_found && owner.tier == alloc_tier::FILE_MAPPED,
+             "the entry does not hold a FILE_MAPPED owner (found=" + std::to_string(entry_found) +
+                 " tier=" + std::to_string(static_cast<int>(owner.tier)) + ")");
+    alloc_metadata leased{};
+    c.expect(!lease.owner_metadata(&leased),
+             "the lease presents an owner (tier=" + std::to_string(static_cast<int>(leased.tier)) +
+                 "): the copy path would trust a mapped slice for a direct USM copy");
     const resolved_ptr held = lease.resolve();
     c.expect(held.ptr == slice, "the lease does not resolve to the registered slice");
     bool same = held.ptr == slice;
