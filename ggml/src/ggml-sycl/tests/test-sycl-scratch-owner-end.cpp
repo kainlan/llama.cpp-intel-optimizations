@@ -42,7 +42,6 @@ namespace {
 // The stand-in's size: it fits a freshly grown 64 MiB chunk and no base block left by scratch_fill.
 constexpr size_t k_stand_in = 48 * MiB;
 
-using trial_fn  = decltype(&ggml_backend_sycl_host_scratch_trial);
 using notify_fn = decltype(&ggml_backend_sycl_notify_host_buffer_sizes);
 
 struct entry_points {
@@ -52,13 +51,14 @@ struct entry_points {
 
 // By proc name, as llama_context resolves them: the private fixtures embed the backend, so the registry is theirs.
 bool entry_points_resolve(checks & c, entry_points & e) {
-    ggml_backend_reg_t reg = ggml_backend_sycl_reg();
-    e.trial =
-        reinterpret_cast<trial_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_host_scratch_trial"));
+    e.trial = trial_entry_resolve(c);
+    if (e.trial == nullptr) {
+        return false;
+    }
     e.notify = reinterpret_cast<notify_fn>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_notify_host_buffer_sizes"));
-    if (e.trial == nullptr || e.notify == nullptr) {
-        c.void_case("the proc table has no ggml_backend_sycl_host_scratch_trial or notify_host_buffer_sizes entry");
+        ggml_backend_reg_get_proc_address(ggml_backend_sycl_reg(), "ggml_backend_sycl_notify_host_buffer_sizes"));
+    if (e.notify == nullptr) {
+        c.void_case("the proc table has no ggml_backend_sycl_notify_host_buffer_sizes entry");
         return false;
     }
     return true;

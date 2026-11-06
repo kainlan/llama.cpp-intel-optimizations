@@ -109,6 +109,10 @@ def registration_problems(texts: dict) -> list:
     return fails
 
 
+RUN_CASES_SIG = ("inline int run_cases(const char * exe, const std::vector<const char *> & cases, "
+                 "const std::string & mutants, const case_runner & runner, std::chrono::milliseconds bound)")
+SCORE_ABORT_SIG = "case_verdict score_abort(const char * who, const child_run & r, const char * line)"
+SCORE_CLEAN_SIG = "case_verdict score_clean(const char * who, const child_run & r)"
 DEVICE_TOKENS = ("ggml_backend_", "ggml_sycl_", "sycl::", "get_unified_cache", "device_fixture", "unified_cache")
 
 
@@ -136,19 +140,24 @@ def driver_problems(texts: dict) -> list:
     if t.count('"GGML_SYCL_STRICT_LEASES=1"') != 1:
         fails.append(f"GGML_SYCL_STRICT_LEASES=1 is set {t.count(chr(34) + 'GGML_SYCL_STRICT_LEASES=1' + chr(34))} "
                      "time(s) in the test, expected once, for the strict child")
-    drive = body(t, "int drive(const char * exe, const std::vector<const char *> & children, "
-                    "const std::string & mutants)")
-    if "run_child(argv.data(), envp, bound)" not in drive or \
-            "child_env_build(strict_env, { \"GGML_SYCL_STRICT_LEASES=1\"" not in drive:
-        fails.append("drive does not pass each child the envp it built, with the strict variable for the strict child")
+    runs = body(common, RUN_CASES_SIG)
+    if "run_child(argv.data(), runner.envp(name), bound)" not in runs:
+        fails.append("run_cases does not run each child with the envp its runner gives for it")
+    runner = body(t, "struct refusal_runner : case_runner")
+    if "child_env_build(strict_env, { \"GGML_SYCL_STRICT_LEASES=1\"" not in runner or \
+            'std::strcmp(name, "strict") == 0 ? strict_env.envp.data() : plain_env.envp.data()' not in runner:
+        fails.append("refusal_runner does not give each child the envp it built, with the strict variable for the "
+                     "strict child")
     main = body(t, "int main(int argc, char ** argv)")
-    for where, text in (("drive", drive), ("main", main)):
+    for where, text in (("refusal_runner", runner), ("main", main)):
         if not text:
             fails.append(f"{TEST}: no {where}")
         for tok in DEVICE_TOKENS:
             if tok in text:
                 fails.append(f"the driver touches a device: {where} names {tok}")
-    m = re.search(r"cases_select\(\{([^}]*)\}, a\.cases", main)
+    if not ordered(main, "const refusal_runner runner;", "cases_main("):
+        fails.append("main does not build the children's environments before cases_main forks")
+    m = re.search(r"cases_main\(argc, argv, \{([^}]*)\}, run_child_case,", main)
     listed = tuple(re.findall(r'"([a-z-]+)"', m.group(1))) if m else ()
     if listed != CHILDREN:
         fails.append(f"main runs the children {list(listed)}, expected {list(CHILDREN)}")
@@ -157,17 +166,22 @@ def driver_problems(texts: dict) -> list:
     child = body(t, "int run_child_case(const child_args & a)")
     if not ordered(child, "child_begin(a)", "entry_environment_ok(c)", "device_fixture_open(c, f)"):
         fails.append("a child reaches a device before child_begin sets RLIMIT_CORE")
-    if "WTERMSIG(r.status) == SIGABRT" not in body(t, "verdict score_abort(const char * who, const child_run & r, "
-                                                      "const char * line)"):
+    if "WTERMSIG(r.status) == SIGABRT" not in body(t, SCORE_ABORT_SIG):
         fails.append("score_abort does not score SIGABRT")
     for const, value in (("k_pool_refused_line", POOL_REFUSED), ("k_carrier_line", CARRIER_LINE)):
         if f'constexpr const char * {const} = "{value}";' not in t:
             fails.append(f"{const} is not {value!r}, the line production prints")
-    if not ordered(drive, "score_abort(who, r, k_pool_refused_line)", "score_clean(who, r)",
+    if not ordered(runner, "score_abort(who, r, k_pool_refused_line)", "score_clean(who, r)",
                    "score_abort(who, r, k_carrier_line)"):
-        fails.append("drive does not score strict and carrier by their abort lines and plain by a clean exit")
-    if t.count("SYCL_TEST_SKIP") < 3:
-        fails.append("a VOID child does not make the driver exit 77")
+        fails.append("refusal_runner does not score strict and carrier by their abort lines and plain by a clean exit")
+    # A VOID child (exit 77) scores VOID, and any VOID verdict makes the driver exit 77.
+    for sig in (SCORE_ABORT_SIG, SCORE_CLEAN_SIG):
+        fn = body(t, sig)
+        if "WEXITSTATUS(r.status) == SYCL_TEST_SKIP" not in fn or "return case_verdict::VOID;" not in fn:
+            fails.append(f"a VOID child does not make the driver exit 77: {sig.split('(')[0].split()[-1]} does not "
+                         "score exit 77 as VOID")
+    if "return any_void ? SYCL_TEST_SKIP : 0;" not in runs:
+        fails.append("a VOID child does not make the driver exit 77: run_cases does not return 77 on a VOID verdict")
     for name, (children, phrases) in ARMS.items():
         if children not in CHILDREN:
             fails.append(f"arm {name} runs child {children}, which the driver does not run")
@@ -261,9 +275,9 @@ def test_driver_rejects_a_setenv_and_a_device_in_the_driver():
             planted(TEST, "int child_plain(checks & c, const device_fixture & f) {",
                     'int child_plain(checks & c, const device_fixture & f) {\n    setenv("X", "1", 1);'),
             "calls setenv")
-    rejects(CLAUSES, "driver", planted(TEST, "    // Every envp is built here, before any fork.",
-                                       "    (void) ggml_backend_sycl_init(0);"),
-            "the driver touches a device: drive names ggml_backend_")
+    rejects(CLAUSES, "driver", planted(TEST, "        // Every envp is built here, before any fork.",
+                                       "        (void) ggml_backend_sycl_init(0);"),
+            "the driver touches a device: refusal_runner names ggml_backend_")
 
 
 def test_driver_rejects_a_late_rlimit_and_a_wrong_score():
@@ -273,11 +287,26 @@ def test_driver_rejects_a_late_rlimit_and_a_wrong_score():
                                        "    device_fixture early;\n    (void) device_fixture_open(c, early);\n"
                                        "    if (!child_begin(a)) {\n        return 2;\n    }\n"),
             "a child reaches a device before child_begin sets RLIMIT_CORE")
-    rejects(CLAUSES, "driver", planted(TEST, "v = score_abort(who, r, k_carrier_line);", "v = score_clean(who, r);"),
+    rejects(CLAUSES, "driver", planted(TEST, "return score_abort(who, r, k_carrier_line);",
+                                       "return score_clean(who, r);"),
             "does not score strict and carrier by their abort lines")
     rejects(CLAUSES, "driver", planted(TEST, '{ "GGML_SYCL_STRICT_LEASES=1", "GGML_NO_BACKTRACE=1" }',
                                        '{ "GGML_NO_BACKTRACE=1" }'),
             "GGML_SYCL_STRICT_LEASES=1 is set 0 time(s)")
+
+
+def test_driver_rejects_a_shared_envp_a_late_environment_and_a_lost_void():
+    rejects(CLAUSES, "driver", planted(COMMON, "run_child(argv.data(), runner.envp(name), bound)",
+                                       "run_child(argv.data(), environ, bound)"),
+            "run_cases does not run each child with the envp its runner gives for it")
+    # main without its runner: nothing builds the children's environments before cases_main forks.
+    rejects(CLAUSES, "driver", planted(TEST, "    const refusal_runner runner;\n", ""),
+            "main does not build the children's environments before cases_main forks")
+    rejects(CLAUSES, "driver", planted(COMMON, "return any_void ? SYCL_TEST_SKIP : 0;", "return 0;"),
+            "run_cases does not return 77 on a VOID verdict")
+    rejects(CLAUSES, "driver", planted(TEST, "        return case_verdict::VOID;\n",
+                                       "        return case_verdict::PASS;\n"),
+            "score_abort does not score exit 77 as VOID")
 
 
 def test_production_rejects_a_lost_abort_and_a_late_scan():

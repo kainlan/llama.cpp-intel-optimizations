@@ -62,10 +62,6 @@ constexpr size_t k_shortfall_budget_max = 2048 * MiB;
 // The sizes every configure call here asks for: they fit the base chunks once the withdrawn chunk is gone.
 constexpr size_t k_scratch_new = 96 * MiB;
 
-std::string num(size_t v) {
-    return std::to_string(v);
-}
-
 uint64_t owner_of(ggml_backend_t backend) {
     return static_cast<const ggml_backend_sycl_context *>(backend->context)->host_zone_owner_id;
 }
@@ -337,8 +333,6 @@ void child_env_build(child_env & e, const std::vector<std::string> & extra) {
     e.envp.push_back(nullptr);
 }
 
-enum class verdict { PASS, FAIL, VOID };
-
 std::string status_of(const child_run & r) {
     if (WIFSIGNALED(r.status)) {
         return "died by signal " + std::to_string(WTERMSIG(r.status));
@@ -347,96 +341,69 @@ std::string status_of(const child_run & r) {
 }
 
 // A child that must abort with `line` on its stderr.
-verdict score_abort(const char * who, const child_run & r, const char * line) {
+case_verdict score_abort(const char * who, const child_run & r, const char * line) {
     if (WIFEXITED(r.status) && WEXITSTATUS(r.status) == SYCL_TEST_SKIP) {
         fprintf(stderr, "VOID [%s] (exit %d)\n", who, SYCL_TEST_SKIP);
-        return verdict::VOID;
+        return case_verdict::VOID;
     }
     if (WIFSIGNALED(r.status) && WTERMSIG(r.status) == SIGABRT) {
         if (r.err.find(line) == std::string::npos) {
             fprintf(stderr, "FAIL [%s] %s child aborted without the `%s` line\n", who, who, line);
-            return verdict::FAIL;
+            return case_verdict::FAIL;
         }
         fprintf(stderr, "PASS [%s]\n", who);
-        return verdict::PASS;
+        return case_verdict::PASS;
     }
     fprintf(stderr, "FAIL [%s] %s child %s, expected SIGABRT\n", who, who, status_of(r).c_str());
-    return verdict::FAIL;
+    return case_verdict::FAIL;
 }
 
-verdict score_clean(const char * who, const child_run & r) {
+case_verdict score_clean(const char * who, const child_run & r) {
     if (WIFEXITED(r.status) && WEXITSTATUS(r.status) == SYCL_TEST_SKIP) {
         fprintf(stderr, "VOID [%s] (exit %d)\n", who, SYCL_TEST_SKIP);
-        return verdict::VOID;
+        return case_verdict::VOID;
     }
     if (WIFEXITED(r.status) && WEXITSTATUS(r.status) == 0) {
         fprintf(stderr, "PASS [%s]\n", who);
-        return verdict::PASS;
+        return case_verdict::PASS;
     }
     fprintf(stderr, "FAIL [%s] %s child %s, expected exit 0\n", who, who, status_of(r).c_str());
-    return verdict::FAIL;
+    return case_verdict::FAIL;
 }
 
-int drive(const char * exe, const std::vector<const char *> & children, const std::string & mutants) {
-    // Every envp is built here, before any fork.
+// The three children's environments and verdicts.
+struct refusal_runner : case_runner {
     child_env strict_env;
     child_env plain_env;
-    child_env_build(strict_env, { "GGML_SYCL_STRICT_LEASES=1", "GGML_NO_BACKTRACE=1" });
-    child_env_build(plain_env, { "GGML_NO_BACKTRACE=1" });
-    const std::chrono::milliseconds bound(90000);
 
-    bool any_fail = false;
-    bool any_void = false;
-    for (const char * name : children) {
-        const std::string        child = name;
-        std::vector<std::string> args  = { exe, "--case", child };
-        if (!mutants.empty()) {
-            args.push_back("--mutant");
-            args.push_back(mutants);
-        }
-        std::vector<char *> argv;
-        for (std::string & s : args) {
-            argv.push_back(s.data());
-        }
-        argv.push_back(nullptr);
-        char * const *  envp = child == "strict" ? strict_env.envp.data() : plain_env.envp.data();
-        const child_run r    = run_child(argv.data(), envp, bound);
-        fputs(r.err.c_str(), stderr);
+    refusal_runner() {
+        // Every envp is built here, before any fork.
+        child_env_build(strict_env, { "GGML_SYCL_STRICT_LEASES=1", "GGML_NO_BACKTRACE=1" });
+        child_env_build(plain_env, { "GGML_NO_BACKTRACE=1" });
+    }
+
+    char * const * envp(const char * name) const override {
+        return std::strcmp(name, "strict") == 0 ? strict_env.envp.data() : plain_env.envp.data();
+    }
+
+    case_verdict score(const char * name, const child_run & r) const override {
         // The design's names for the three children.
-        const char * who = child == "carrier" ? "outstanding-carrier" : name;
-        verdict      v   = verdict::FAIL;
-        if (!r.ran) {
-            fprintf(stderr, "FAIL [%s] the %s child did not finish within %lld ms\n", who, who,
-                    (long long) bound.count());
-        } else if (child == "strict") {
-            v = score_abort(who, r, k_pool_refused_line);
-        } else if (child == "plain") {
-            v = score_clean(who, r);
-        } else {
-            v = score_abort(who, r, k_carrier_line);
+        const char * who = std::strcmp(name, "carrier") == 0 ? "outstanding-carrier" : name;
+        if (std::strcmp(name, "strict") == 0) {
+            return score_abort(who, r, k_pool_refused_line);
         }
-        any_fail = any_fail || v == verdict::FAIL;
-        any_void = any_void || v == verdict::VOID;
+        if (std::strcmp(name, "plain") == 0) {
+            return score_clean(who, r);
+        }
+        return score_abort(who, r, k_carrier_line);
     }
-    if (any_fail) {
-        return 1;
-    }
-    return any_void ? SYCL_TEST_SKIP : 0;
-}
+};
 
 }  // namespace
 
 int main(int argc, char ** argv) {
-    const child_args a = child_args_parse(argc, argv);
-    if (!a.case_name.empty()) {
-        return run_child_case(a);
-    }
-    std::vector<const char *> selected;
-    std::string               unknown;
-    if (!cases_select({ "strict", "plain", "carrier" }, a.cases, &selected, &unknown)) {
-        fprintf(stderr, "unknown child '%s'\n", unknown.c_str());
-        return 2;
-    }
     // The driver touches no device: each child runs in its own process.
-    return drive(argv[0], selected, a.mutants);
+    const refusal_runner runner;
+    return cases_main(argc, argv, { "strict", "plain", "carrier" }, run_child_case, std::chrono::milliseconds(90000),
+                      runner);
 }

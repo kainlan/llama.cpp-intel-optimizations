@@ -180,6 +180,9 @@ def census_problems(texts: dict) -> list:
 
 # ---- the test source ------------------------------------------------------------------------------------------------
 
+# The shared resolver both SCRATCH-return tests take the trial entry from, by proc name as llama_context resolves it.
+RESOLVER_SIG = "inline trial_fn trial_entry_resolve(checks & c)"
+
 def source_problems(texts: dict) -> list:
     fails = missing(texts, TEST, COMMON, *PRINTED_BY.values())
     if fails:
@@ -190,8 +193,12 @@ def source_problems(texts: dict) -> list:
     printed = t + "\n" + norm(texts[COMMON])
     if '#include "scratch-return-test-common.hpp"' not in raw:
         fails.append(f"{TEST} does not include scratch-return-test-common.hpp")
-    if 'ggml_backend_reg_get_proc_address(ggml_backend_sycl_reg(), "ggml_backend_sycl_host_scratch_trial")' not in t:
-        fails.append("the test does not resolve ggml_backend_sycl_host_scratch_trial by proc name")
+    resolver = body(norm(texts[COMMON]), RESOLVER_SIG)
+    if 'ggml_backend_reg_get_proc_address(ggml_backend_sycl_reg(), "ggml_backend_sycl_host_scratch_trial")' \
+            not in resolver:
+        fails.append("trial_entry_resolve does not resolve ggml_backend_sycl_host_scratch_trial by proc name")
+    if "trial_entry_resolve(c)" not in t:
+        fails.append("the test does not take its trial entry from trial_entry_resolve")
     if "r.ops.plan_scratch_bytes = 0;" not in t or "notify_context(" not in t:
         fails.append("the fixture's notifies do not carry the design's plan term of 0 through notify_context")
     if "host_scratch_owner_end" in t:
@@ -354,8 +361,10 @@ def test_census_rejects_a_block_production_compiles():
 def test_test_source_rejects_a_lost_case_and_a_direct_trial():
     rejects(CLAUSES, "test-source", planted(TEST, 'n == "status-order"', 'n == "status_order"'),
             "run_case has no dispatch for case status-order")
-    rejects(CLAUSES, "test-source", planted(TEST, '"ggml_backend_sycl_host_scratch_trial")', '"other")'),
+    rejects(CLAUSES, "test-source", planted(COMMON, '"ggml_backend_sycl_host_scratch_trial")', '"other")'),
             "does not resolve ggml_backend_sycl_host_scratch_trial by proc name")
+    rejects(CLAUSES, "test-source", planted(TEST, "trial_entry_resolve(c)", "nullptr"),
+            "does not take its trial entry from trial_entry_resolve")
     rejects(CLAUSES, "test-source", planted(TEST, "r.ops.plan_scratch_bytes = 0;", "r.ops.plan_scratch_bytes = 1;"),
             "plan term of 0")
 

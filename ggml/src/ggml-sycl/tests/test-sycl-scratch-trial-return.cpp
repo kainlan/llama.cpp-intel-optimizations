@@ -55,8 +55,6 @@ using namespace scratch_return_test;
 
 namespace {
 
-using trial_fn = decltype(&ggml_backend_sycl_host_scratch_trial);
-
 constexpr const char * k_strand_line   = "release not yet complete after the owner reset";
 constexpr const char * k_teardown_line = "still registered at pool destruction";
 
@@ -72,11 +70,8 @@ bool rig_open(checks & c, rig & r) {
     if (!entry_environment_ok(c) || !device_fixture_open(c, r.f)) {
         return false;
     }
-    // By proc name, as llama_context resolves it: the private fixtures embed the backend, so the registry is theirs.
-    r.trial = reinterpret_cast<trial_fn>(
-        ggml_backend_reg_get_proc_address(ggml_backend_sycl_reg(), "ggml_backend_sycl_host_scratch_trial"));
+    r.trial = trial_entry_resolve(c);
     if (r.trial == nullptr) {
-        c.void_case("the proc table has no ggml_backend_sycl_host_scratch_trial entry");
         return false;
     }
     if (!r.f.cache->host_scratch_ledger_ops(0, &r.ledger, &r.ops)) {
@@ -133,10 +128,6 @@ struct reading {
 
 reading read(const rig & r) {
     return { r.f.pool->chunk_count(), r.f.pool->allocated(), r.f.pool->zone_capacity(host_zone_id::SCRATCH) };
-}
-
-std::string num(size_t v) {
-    return std::to_string(v);
 }
 
 // SCRATCH capacity never exceeds the pool's allocated() (r9 m-3).

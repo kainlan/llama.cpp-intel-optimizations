@@ -8,14 +8,15 @@
 // SPDX-License-Identifier: MIT
 //
 // Every case runs in its own child process, re-executed from /proc/self/exe with the driver's own environment (it
-// carries the registration's ONEAPI_DEVICE_SELECTOR, LD_LIBRARY_PATH and GGML_SYCL_PINNED_CHUNK_MB). So each case
-// starts from a fresh cache, a fresh ledger and no transaction, a case that aborts cannot take the others with it, and
-// a planted fault that leaves the pool unable to shut down still lets its case print the line that names it. The
-// driver relays each child's stderr, so a mutant's ctest reads the child's failure line in the driver's output.
+// carries the registration's ONEAPI_DEVICE_SELECTOR, LD_LIBRARY_PATH and GGML_SYCL_PINNED_CHUNK_MB), or with the envp
+// the test's case_runner builds from it. So each case starts from a fresh cache, a fresh ledger and no transaction, a
+// case that aborts cannot take the others with it, and a planted fault that leaves the pool unable to shut down still
+// lets its case print the line that names it. The driver relays each child's stderr, so a mutant's ctest reads the
+// child's failure line in the driver's output.
 //
-// A case's verdict is its exit status: 0 PASS, 1 FAIL, 77 VOID (its entry or engagement check found it could not
-// reach the mechanism it scores). A case that dies by a signal is a FAIL. The driver exits 1 when any case FAILed,
-// else 77 when any was VOID, else 0, so a VOID never reads as a pass.
+// A case's verdict is its exit status unless its case_runner scores it otherwise: 0 PASS, 1 FAIL, 77 VOID (its entry
+// or engagement check found it could not reach the mechanism it scores). A case that dies by a signal is a FAIL. The
+// driver exits 1 when any case FAILed, else 77 when any was VOID, else 0, so a VOID never reads as a pass.
 
 #pragma once
 
@@ -229,6 +230,19 @@ inline bool device_fixture_open(checks & c, device_fixture & f) {
     return true;
 }
 
+using trial_fn = decltype(&ggml_backend_sycl_host_scratch_trial);
+
+// The trial entry point by proc name, as llama_context resolves it: the private fixtures embed the backend, so the
+// registry is theirs. Null, with the case VOID, when the proc table has no entry.
+inline trial_fn trial_entry_resolve(checks & c) {
+    const trial_fn trial = reinterpret_cast<trial_fn>(
+        ggml_backend_reg_get_proc_address(ggml_backend_sycl_reg(), "ggml_backend_sycl_host_scratch_trial"));
+    if (trial == nullptr) {
+        c.void_case("the proc table has no ggml_backend_sycl_host_scratch_trial entry");
+    }
+    return trial;
+}
+
 // Fills SCRATCH's existing free blocks, so the next allocation of any size lands in a chunk grown after this call.
 // The fillers stay live for the whole case.
 inline std::vector<void *> scratch_fill(unified_cache * cache) {
@@ -366,12 +380,45 @@ inline bool cases_select(const std::vector<const char *> & all,
     }
 }
 
-// Runs `cases` one per child, each as `<exe> --case <name> [--mutant <list>]`, with `envp` (the driver's environment
-// when null). Returns the driver's exit status.
+// A case's verdict, as the driver scores its child.
+enum class case_verdict { PASS, FAIL, VOID };
+
+// How the driver runs one case's child. By default with the driver's own environment, scored by its exit status: 0
+// PASS, 77 VOID, any other status or a signal FAIL. A test whose children need their own environments or verdicts
+// overrides these, building every envp before run_cases forks: the child calls only async-signal-safe functions.
+struct case_runner {
+    virtual ~case_runner() = default;
+
+    virtual char * const * envp(const char * name) const {
+        (void) name;
+        return environ;
+    }
+
+    virtual case_verdict score(const char * name, const child_run & r) const {
+        if (WIFSIGNALED(r.status)) {
+            fprintf(stderr, "FAIL [%s] the case died by signal %d\n", name, WTERMSIG(r.status));
+            return case_verdict::FAIL;
+        }
+        if (WEXITSTATUS(r.status) == SYCL_TEST_SKIP) {
+            fprintf(stderr, "VOID [%s] (exit %d)\n", name, SYCL_TEST_SKIP);
+            return case_verdict::VOID;
+        }
+        if (WEXITSTATUS(r.status) != 0) {
+            fprintf(stderr, "FAIL [%s] exit %d\n", name, WEXITSTATUS(r.status));
+            return case_verdict::FAIL;
+        }
+        fprintf(stderr, "PASS [%s]\n", name);
+        return case_verdict::PASS;
+    }
+};
+
+// Runs `cases` one per child, each as `<exe> --case <name> [--mutant <list>]` with the envp `runner` gives for it, and
+// scores each finished child through `runner`; a child still running at `bound` is a FAIL. Returns the driver's exit
+// status.
 inline int run_cases(const char *                      exe,
                      const std::vector<const char *> & cases,
                      const std::string &               mutants,
-                     char * const *                    envp,
+                     const case_runner &               runner,
                      std::chrono::milliseconds         bound) {
     bool any_fail = false;
     bool any_void = false;
@@ -386,23 +433,16 @@ inline int run_cases(const char *                      exe,
             argv.push_back(a.data());
         }
         argv.push_back(nullptr);
-        const child_run r = run_child(argv.data(), envp ? envp : environ, bound);
+        const child_run r = run_child(argv.data(), runner.envp(name), bound);
         fputs(r.err.c_str(), stderr);
+        case_verdict v = case_verdict::FAIL;
         if (!r.ran) {
             fprintf(stderr, "FAIL [%s] the case did not finish within %lld ms\n", name, (long long) bound.count());
-            any_fail = true;
-        } else if (WIFSIGNALED(r.status)) {
-            fprintf(stderr, "FAIL [%s] the case died by signal %d\n", name, WTERMSIG(r.status));
-            any_fail = true;
-        } else if (WEXITSTATUS(r.status) == SYCL_TEST_SKIP) {
-            fprintf(stderr, "VOID [%s] (exit %d)\n", name, SYCL_TEST_SKIP);
-            any_void = true;
-        } else if (WEXITSTATUS(r.status) != 0) {
-            fprintf(stderr, "FAIL [%s] exit %d\n", name, WEXITSTATUS(r.status));
-            any_fail = true;
         } else {
-            fprintf(stderr, "PASS [%s]\n", name);
+            v = runner.score(name, r);
         }
+        any_fail = any_fail || v == case_verdict::FAIL;
+        any_void = any_void || v == case_verdict::VOID;
     }
     if (any_fail) {
         return 1;
@@ -447,12 +487,14 @@ inline bool child_begin(const child_args & a) {
     return true;
 }
 
-// A test's main: a child runs its one case through `run_case`; the driver runs the selected cases, one child each.
+// A test's main: a child runs its one case through `run_case`; the driver runs the selected cases, one child each,
+// through `runner`.
 inline int cases_main(int                               argc,
                       char **                           argv,
                       const std::vector<const char *> & all,
                       int (*run_case)(const child_args &),
-                      std::chrono::milliseconds bound) {
+                      std::chrono::milliseconds bound,
+                      const case_runner &       runner = case_runner()) {
     const child_args a = child_args_parse(argc, argv);
     if (!a.case_name.empty()) {
         return run_case(a);
@@ -464,7 +506,7 @@ inline int cases_main(int                               argc,
         return 2;
     }
     // The driver touches no device: each case runs in its own child.
-    return run_cases(argv[0], selected, a.mutants, nullptr, bound);
+    return run_cases(argv[0], selected, a.mutants, runner, bound);
 }
 
 }  // namespace scratch_return_test

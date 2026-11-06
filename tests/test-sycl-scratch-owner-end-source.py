@@ -128,6 +128,7 @@ CASE_FUNCS = {
     "two-empty": "int case_two_empty(checks & c, const device_fixture & f, const entry_points & e)",
     "lease": "int case_lease(checks & c, const device_fixture & f, const entry_points & e, bool stand_in_freed_first)",
 }
+RESOLVER_SIG = "inline trial_fn trial_entry_resolve(checks & c)"
 NAMED_OWNER_END = ("host_scratch_owner_end", "unified_cache_host_scratch_trial", "->host_scratch_trial(")
 
 
@@ -142,11 +143,16 @@ def source_problems(texts: dict) -> list:
         if tok in t:
             fails.append(f"the test names {tok}: the owner's end and the transaction are reached only as llama_context "
                          "reaches them")
-    for proc in ("ggml_backend_sycl_host_scratch_trial", "ggml_backend_sycl_notify_host_buffer_sizes"):
-        if f'ggml_backend_reg_get_proc_address(reg, "{proc}")' not in t:
+    # The trial entry comes from the resolver the SCRATCH-return tests share; the notify entry from the test itself.
+    looked_up = {"ggml_backend_sycl_host_scratch_trial": body(norm(texts[COMMON]), RESOLVER_SIG),
+                 "ggml_backend_sycl_notify_host_buffer_sizes": t}
+    for proc, where in looked_up.items():
+        if f'ggml_backend_reg_get_proc_address(ggml_backend_sycl_reg(), "{proc}")' not in where:
             fails.append(f"the test does not resolve {proc} by proc name")
         if re.search(r"(?<![\"\w])" + proc + r"\(", t):
             fails.append(f"the test calls {proc} directly rather than through the proc table")
+    if "trial_entry_resolve(c)" not in t:
+        fails.append("the test does not take its trial entry from trial_entry_resolve")
     for case, sig in CASE_FUNCS.items():
         fn = body(t, sig)
         if not fn:
@@ -302,9 +308,11 @@ def test_source_rejects_a_named_owner_end_and_a_direct_trial():
             planted(TEST, "    ggml_backend_free(ctx);\n    c.expect(f.pool->chunk_count() == b.chunks + 1,",
                     "    delete ctx;\n    c.expect(f.pool->chunk_count() == b.chunks + 1,"),
             "case orphaned does not free its context with ggml_backend_free")
-    proc = '(ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_host_scratch_trial"))'
-    rejects(CLAUSES, "source", planted(TEST, proc, "(&ggml_backend_sycl_host_scratch_trial)"),
+    proc = 'ggml_backend_reg_get_proc_address(ggml_backend_sycl_reg(), "ggml_backend_sycl_host_scratch_trial")'
+    rejects(CLAUSES, "source", planted(COMMON, proc, "&ggml_backend_sycl_host_scratch_trial"),
             "does not resolve ggml_backend_sycl_host_scratch_trial by proc name")
+    rejects(CLAUSES, "source", planted(TEST, "trial_entry_resolve(c)", "nullptr"),
+            "does not take its trial entry from trial_entry_resolve")
     rejects(CLAUSES, "source",
             planted(TEST, "(void) e.trial(ctx, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, 512);",
                     "(void) ggml_backend_sycl_host_scratch_trial(ctx, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, 512);"),
