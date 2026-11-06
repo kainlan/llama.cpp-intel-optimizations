@@ -7994,6 +7994,10 @@ int  host_ledger_register_yielder(host_ledger_yield_fn fn, void * ctx);
 // The only unregister, from the cache's destructor: stores null, then waits until no yield that loaded the callback is
 // still running. The caller holds no cache, shard or registry lock, since a running callback may wait on one.
 void host_ledger_unregister_yielder(int slot);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The yielder slots claimed now, so a test can watch a cache register and, at its last reference, unregister.
+int host_ledger_yielder_slots_claimed_for_testing();
+#endif
 
 // Foundation owner path. The intrusive control is allocated before any physical
 // allocation. The legacy alloc_handle adapter remains inside the allocator;

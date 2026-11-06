@@ -1,8 +1,10 @@
 //
 // The lazy table object (th32 §3.2, §3.3, §10; row T4): the refcounted lazy_table and its two constructors, the HOST
-// body's eager O_DIRECT read into the locked HOST_CPU tier, the STORAGE descriptor, the activation check, the
-// descriptor buffer types with their own interface, the guard at ggml_sycl_get_data_ptr_slow's entry, and
-// ggml_sycl_is_device_vram_buffer's descriptor test before its cast. No libllama is involved: every table is built
+// body's eager O_DIRECT read into the locked HOST_CPU tier, the STORAGE descriptor and its hot-row cache's owner path
+// (§6.3, §6.4: the chunks charged through the owner entry, the yielder registered, a yield on the loader thread, the
+// step-4 shortfall's [HOST-PLAN-BUG] line), the activation check, the descriptor buffer types with their own
+// interface, the guard at ggml_sycl_get_data_ptr_slow's entry, and ggml_sycl_is_device_vram_buffer's descriptor test
+// before its cast. No libllama is involved: every table is built
 // from a fixture-written file through ggml_sycl::lazy_table_create_host / lazy_table_create_storage.
 //
 // MIT license
@@ -27,6 +29,10 @@
 // O_DIRECT window, and the arm must FAIL naming that geometry: the end-of-file sub-check's registered positive
 // control. A read that stops at the table's last byte and one that reads the whole window differ only when the window
 // runs past the end of the file, so the sub-check needs a mutant to show it can fail.
+//
+// --mutant shortfall-unreported runs arm (15) alone with the row-cache shortfall refused through the plain
+// [LAZY-TABLE] WARN and no [HOST-PLAN-BUG] line, and the arm must FAIL counting no such line: the shortfall leg's
+// registered positive control.
 
 #include "../common.hpp"
 #include "../host-cpu-mapping.hpp"
@@ -58,6 +64,7 @@ using namespace lazy_table_test;
 using ggml_sycl::host_cpu_mapped_size;
 using ggml_sycl::LAZY_IO_BLOCK_BYTES;
 using ggml_sycl::lazy_residency;
+using ggml_sycl::LAZY_ROW_CACHE_CHUNK_BYTES;
 using ggml_sycl::lazy_table_create_host;
 using ggml_sycl::lazy_table_create_storage;
 using ggml_sycl::lazy_table_desc;
@@ -101,6 +108,20 @@ constexpr uint64_t k_eof_file_bytes   = 4195792;
 constexpr size_t   k_eof_window_bytes = 4198400;
 constexpr size_t   k_eof_past_end     = 2608;
 
+// A STORAGE table's row cache, in table A's geometry (§6.3, §6.4): its 24680 rows cached whole, with a floor of 1024
+// slots. The index is 4 x ((4 x 24680 + 2) / 3) + 8 x 24680 = 329068 B, mapped to 2 MiB; the slab is table A's
+// 4195600 B. At the production chunk of 256 MiB the slab is one chunk, mapped to 6 MiB, which holds the floor, so
+// the cache yields nothing; at the fixtures' 2 MiB chunk it is two whole chunks and a 1296 B remainder, 2 MiB mapped
+// each, and the two above the floor's are yieldable. Either way the plan's figure is 8 MiB, and the bytes requested
+// under role LAZY_ROW_CACHE are the index's and the slab's, 4524668.
+constexpr size_t   k_cache_floor_slots     = 1024;
+constexpr size_t   k_cache_index_bytes     = 329068;
+constexpr size_t   k_cache_chunk_bytes     = 2 * MiB;
+constexpr size_t   k_storage_planned_bytes = 8 * MiB;
+constexpr size_t   k_cache_yieldable_bytes = 4 * MiB;
+constexpr size_t   k_cache_role_bytes      = k_cache_index_bytes + k_table_a_bytes;
+constexpr uint64_t k_other_load_txn_id     = 0x5e11;
+
 // A ledger budget far above the fixture's bytes, seeded in every process, so no charge logs a would-refuse WARN and
 // strict mode meets only the check under test.
 constexpr uint64_t k_ledger_budget = 64 * GiB;
@@ -109,6 +130,7 @@ std::string g_fixture_path;
 std::string g_eof_fixture_path;
 bool        g_direct_unsupported       = false;  // the fixture's filesystem refuses O_DIRECT: the reading arms are VOID
 bool        g_mutant_read_whole_window = false;  // --mutant read-whole-window
+bool        g_mutant_shortfall_unreported = false;  // --mutant shortfall-unreported
 
 uint8_t pattern_byte(uint64_t offset) {
     return static_cast<uint8_t>((offset * 2654435761ull) >> 13);
@@ -149,6 +171,18 @@ size_t row_size() {
     return ggml_row_size(GGML_TYPE_Q8_0, k_ne0);
 }
 
+// A STORAGE table's resident bytes at `slots` slots with its slab cut at `chunk` bytes: the whole chunks, the
+// remainder and the index, each counted at host_cpu_mapped_size, as the ledger charges them and the planner sums them
+// (§3.3).
+size_t storage_resident_bytes(size_t slots, size_t chunk) {
+    const size_t slab  = slots * row_size();
+    size_t       bytes = (slab / chunk) * host_cpu_mapped_size(chunk);
+    if (slab % chunk != 0) {
+        bytes += host_cpu_mapped_size(slab % chunk);
+    }
+    return bytes + host_cpu_mapped_size(ggml_sycl::lazy_row_cache_index_raw_bytes(slots));
+}
+
 lazy_table_desc fixture_desc(const char *   name,
                              uint64_t       offset,
                              int64_t        n_rows,
@@ -175,7 +209,11 @@ lazy_table_desc fixture_desc(const char *   name,
     d.consumer_device      = consumer_device;
     d.host_resident_bytes  = residency == lazy_residency::HOST ?
                                  host_cpu_mapped_size(lazy_table_host_body_request_bytes(offset, d.table_bytes)) :
-                                 0;
+                                 storage_resident_bytes(static_cast<size_t>(n_rows), LAZY_ROW_CACHE_CHUNK_BYTES);
+    if (residency == lazy_residency::STORAGE) {
+        d.cache_slots       = static_cast<size_t>(n_rows);
+        d.cache_floor_slots = k_cache_floor_slots;
+    }
     return d;
 }
 
@@ -189,16 +227,16 @@ std::string status_name(const lazy_table_result & t) {
     return ggml_sycl::lazy_table_status_name(t.status);
 }
 
-// A refusal the environment caused, not the table: no O_DIRECT, or a lock limit below the body.
+// A refusal the environment caused, not the table: no O_DIRECT, or a lock limit below the body or the row cache.
 bool environment_refusal(const lazy_table_result & r, size_t locked_bytes, std::string & why) {
     if (r.status == lazy_table_status::OPEN_FAILED && g_direct_unsupported) {
         why = "the fixture's filesystem refuses O_DIRECT: " + r.reason;
         return true;
     }
-    if (r.status == lazy_table_status::BODY_REFUSED) {
+    if (r.status == lazy_table_status::BODY_REFUSED || r.status == lazy_table_status::ROW_CACHE_SHORTFALL) {
         rlimit lim{};
         if (getrlimit(RLIMIT_MEMLOCK, &lim) == 0 && lim.rlim_cur != RLIM_INFINITY && lim.rlim_cur < locked_bytes) {
-            why = "RLIMIT_MEMLOCK is " + num(lim.rlim_cur) + " B, below the body: " + r.reason;
+            why = "RLIMIT_MEMLOCK is " + num(lim.rlim_cur) + " B, below the body or the row cache: " + r.reason;
             return true;
         }
     }
@@ -478,17 +516,22 @@ std::string fd_target(int fd) {
     return n > 0 ? std::string(buf, static_cast<size_t>(n)) : std::string();
 }
 
-// (5) A STORAGE table holds an O_DIRECT descriptor on its source and nothing else in T4, and its last reference closes
-// it; a STORAGE plan figure, which is its row cache's, is refused by name until the cache exists. Engagement: the
-// environment takes O_DIRECT; a refusal it caused is VOID, any other refusal FAILs.
+// (5) A STORAGE table holds an O_DIRECT descriptor on its source and its row cache, built through the owner entry at
+// the plan's slots (§6.3), and its last reference closes the descriptor and releases the cache. At the production
+// chunk of 256 MiB table A's slab is one chunk, the floor's, so the cache charges the plan's 8 MiB and publishes no
+// yieldable bytes. Engagement: the environment takes O_DIRECT and locks the cache; a refusal it caused is VOID, any
+// other refusal FAILs.
 arm_result arm_storage_holds_its_descriptor() {
     arm_result        r;
-    const uint64_t    before = host_cpu_live();
+    const uint64_t    before           = host_cpu_live();
+    const uint64_t    yieldable_before = ggml_sycl::host_ledger_yieldable_bytes();
     lazy_table_result t =
         lazy_table_create_storage(fixture_desc("storage.lazy", k_table_offset, k_rows_a, lazy_residency::STORAGE, 0));
-    if (!table_built(r, t, 0, other_refusal::FAIL)) {
+    if (!table_built(r, t, k_storage_planned_bytes, other_refusal::FAIL)) {
         return r;
     }
+    expect(r, storage_resident_bytes(k_rows_a, LAZY_ROW_CACHE_CHUNK_BYTES) == k_storage_planned_bytes,
+           "the hand figure for the production cache is not the planner's sum");
     const int fd = t.table->storage_fd();
     expect(r, fd >= 0, "a STORAGE table holds no descriptor");
     char * real = realpath(g_fixture_path.c_str(), nullptr);
@@ -496,19 +539,30 @@ arm_result arm_storage_holds_its_descriptor() {
     std::free(real);
     expect(r, (fd_flags(fd) & O_DIRECT) != 0, "the descriptor is not O_DIRECT");
     expect(r, !t.table->rows().valid(), "a STORAGE table holds rows");
-    expect(r, t.table->charged_bytes() == 0 && host_cpu_live() == before, "a STORAGE table charged HOST_CPU bytes");
+    const ggml_sycl::lazy_row_cache * cache = t.table->row_cache();
+    if (cache == nullptr) {
+        fail(r, "a STORAGE table built no row cache");
+        return r;
+    }
+    expect(r, cache->cache_slots() == static_cast<size_t>(k_rows_a) && cache->floor_slots() == k_cache_floor_slots,
+           "the cache holds " + num(cache->cache_slots()) + " slots with a floor of " + num(cache->floor_slots()) +
+               ", want the plan's " + num(k_rows_a) + " and " + num(k_cache_floor_slots));
+    expect(r, cache->n_chunks() == 1 && cache->n_floor_chunks() == 1,
+           "the production cache has " + num(cache->n_chunks()) + " chunks, " + num(cache->n_floor_chunks()) +
+               " of them the floor's, want 1 and 1");
+    expect(
+        r, t.table->charged_bytes() == k_storage_planned_bytes,
+        "the table charges " + num(t.table->charged_bytes()) + " B, want the plan's " + num(k_storage_planned_bytes));
+    expect(
+        r, host_cpu_live() - before == k_storage_planned_bytes,
+        "the live HOST_CPU rows grew by " + num(host_cpu_live() - before) + " B, want " + num(k_storage_planned_bytes));
+    expect(r, ggml_sycl::host_ledger_yieldable_bytes() == yieldable_before,
+           "a cache whose one chunk is the floor's published yieldable bytes");
     t.table.reset();
     errno = 0;
     expect(r, ::fcntl(fd, F_GETFD) == -1 && errno == EBADF, "the last reference left the descriptor open");
-
-    lazy_table_desc cached = fixture_desc("storage.cached.lazy", k_table_offset, k_rows_a, lazy_residency::STORAGE, 0);
-    cached.host_resident_bytes = 4 * MiB;
-    const lazy_table_result c  = lazy_table_create_storage(cached);
-    expect(r, c.status == lazy_table_status::ROW_CACHE_UNBUILT && !c.table,
-           std::string("a STORAGE plan holding 4 MiB of row cache built as ") +
-               ggml_sycl::lazy_table_status_name(c.status) + ", want lazy-table-row-cache-unbuilt");
-    expect(r, c.reason.find("host_resident_bytes=" + num(4 * MiB)) != std::string::npos,
-           "the row-cache refusal does not name the plan's figure: " + c.reason);
+    expect(r, host_cpu_live() == before,
+           "the last reference left " + num(host_cpu_live() - before) + " HOST_CPU bytes live, want 0");
     return r;
 }
 
@@ -539,9 +593,10 @@ arm_result arm_source_short_refuses() {
 }
 
 // (7) A descriptor that is not a table refuses before anything is opened or allocated: a wrong row size, table bytes
-// that are not row_size * n_rows, the other residency, a HOST window no size_t holds, and a consumer that is neither -1
-// nor a SYCL device. Engagement: none needed; the last two name a file that does not exist, so a refusal after the
-// open would read lazy-table-open-failed.
+// that are not row_size * n_rows, the other residency, a HOST window no size_t holds, a consumer that is neither -1
+// nor a SYCL device, a STORAGE cache with no floor or a floor above its slots, and a HOST plan with a cache.
+// Engagement: none needed; every case but the first and the third names a file that does not exist, so a refusal
+// after the open would read lazy-table-open-failed.
 arm_result arm_invalid_desc_refuses() {
     arm_result      r;
     lazy_table_desc d = fixture_desc("invalid.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, 0);
@@ -583,6 +638,25 @@ arm_result arm_invalid_desc_refuses() {
     const lazy_table_result other = lazy_table_create_host(d);
     expect(r, other.status == lazy_table_status::INVALID_DESC,
            "consumer_device=-7 gave " + status_name(other) + ", want lazy-table-invalid-desc");
+
+    // A STORAGE plan whose cache has no floor or a floor above its slots, and a HOST plan with a cache (§6.4).
+    d                   = fixture_desc("invalid.lazy", k_table_offset, k_rows_a, lazy_residency::STORAGE, 0);
+    d.file_path         = "/nonexistent/path/that/is/never/opened";
+    d.cache_floor_slots = 0;
+    const lazy_table_result no_floor = lazy_table_create_storage(d);
+    expect(r, no_floor.status == lazy_table_status::INVALID_DESC,
+           "a STORAGE plan with no floor gave " + status_name(no_floor) + ", want lazy-table-invalid-desc");
+    d.cache_floor_slots                 = d.cache_slots + 1;
+    const lazy_table_result floor_above = lazy_table_create_storage(d);
+    expect(r, floor_above.status == lazy_table_status::INVALID_DESC,
+           "a STORAGE floor above its slots gave " + status_name(floor_above) + ", want lazy-table-invalid-desc");
+    d                   = fixture_desc("invalid.lazy", k_table_offset, k_rows_a, lazy_residency::HOST, 0);
+    d.file_path         = "/nonexistent/path/that/is/never/opened";
+    d.cache_slots       = k_cache_floor_slots;
+    d.cache_floor_slots = k_cache_floor_slots;
+    const lazy_table_result host_cache = lazy_table_create_host(d);
+    expect(r, host_cache.status == lazy_table_status::INVALID_DESC,
+           "a HOST plan with a row cache gave " + status_name(host_cache) + ", want lazy-table-invalid-desc");
     return r;
 }
 
@@ -893,6 +967,201 @@ const char * k_eager_arm_name = "(2) a HOST table reads its rows eagerly into on
 
 }  // namespace
 
+// (14) Row T4b's owner path (§6.4): a STORAGE table at the fixtures' 2 MiB chunk charges its index and its three chunks
+// through the owner entry as HOST_CPU under role LAZY_ROW_CACHE, at the plan's figure; the two chunks above the
+// floor's are yieldable, and its yielder is registered. A charge of another load that does not fit, asked on this
+// thread, frees the last chunk with no wait and then fits: the chunk leaves the live HOST_CPU rows, the ledger is
+// credited its charge, the yield logs its chunk count and the asking load, and the cache counts it. A charge of the
+// table's own load that does not fit frees nothing. The last reference releases every allocation, takes the
+// yieldable bytes back and unregisters the yielder: the claimed slots are one more while the table lives and back to
+// their count before it after. Engagement: the cache holds three chunks, one the floor's, and the budget is stored at
+// the committed figure before each charge, so neither fits without a yield.
+// The role reading needs device 0's cache: the reader is VOID in a process that has none (§3.1), and the HOST_CPU owner
+// path builds none, so the arm creates it before any baseline and scores an unreadable reading VOID, never as a figure.
+arm_result arm_storage_cache_owner_path() {
+    arm_result r;
+    if (ggml_sycl::get_unified_cache_for_device(0) == nullptr) {
+        void_arm(r, "device 0 has no cache, so the LAZY_ROW_CACHE role reading would be VOID");
+        return r;
+    }
+    const uint64_t live0      = host_cpu_live();
+    const uint64_t committed0 = ggml_sycl::host_ledger_committed();
+    const uint64_t yieldable0 = ggml_sycl::host_ledger_yieldable_bytes();
+    const int      slots0     = ggml_sycl::host_ledger_yielder_slots_claimed_for_testing();
+    uint64_t       role0      = 0;
+    const bool     role_read0 =
+        ggml_sycl::unified_cache_role_bytes_for_testing(0, ggml_sycl::alloc_role::LAZY_ROW_CACHE, &role0);
+    lazy_table_desc d     = fixture_desc("storage.owner.lazy", k_table_offset, k_rows_a, lazy_residency::STORAGE, 0);
+    d.host_resident_bytes = storage_resident_bytes(k_rows_a, k_cache_chunk_bytes);
+    expect(r, d.host_resident_bytes == k_storage_planned_bytes,
+           "the hand figure for the 2 MiB-chunk cache is not the planner's sum: " + num(d.host_resident_bytes));
+    expect(r, ggml_sycl::lazy_row_cache_index_raw_bytes(k_rows_a) == k_cache_index_bytes,
+           "the index of " + num(k_rows_a) + " slots is not the hand figure " + num(k_cache_index_bytes));
+    {
+        lazy_table_result t = ggml_sycl::lazy_table_test_create_storage(d, k_cache_chunk_bytes, false);
+        if (!table_built(r, t, k_storage_planned_bytes, other_refusal::FAIL)) {
+            return r;
+        }
+        ggml_sycl::lazy_row_cache * cache = t.table->row_cache();
+        if (cache == nullptr || cache->n_chunks() != 3 || cache->n_floor_chunks() != 1) {
+            void_arm(r, "the table's cache is not three chunks with one the floor's, so no yield can be scored");
+            return r;
+        }
+        expect(r, t.table->charged_bytes() == k_storage_planned_bytes,
+               "the table charges " + num(t.table->charged_bytes()) + " B, want the plan's " +
+                   num(k_storage_planned_bytes));
+        expect(r, host_cpu_live() - live0 == k_storage_planned_bytes,
+               "the live HOST_CPU rows grew by " + num(host_cpu_live() - live0) + " B, want " +
+                   num(k_storage_planned_bytes));
+        expect(r, ggml_sycl::host_ledger_committed() - committed0 == k_storage_planned_bytes,
+               "the ledger's committed bytes grew by " + num(ggml_sycl::host_ledger_committed() - committed0) +
+                   " B, want " + num(k_storage_planned_bytes));
+        expect(r, ggml_sycl::host_ledger_yieldable_bytes() - yieldable0 == k_cache_yieldable_bytes,
+               "the ledger's yieldable bytes grew by " + num(ggml_sycl::host_ledger_yieldable_bytes() - yieldable0) +
+                   " B, want the two chunks above the floor's, " + num(k_cache_yieldable_bytes));
+        const int slots1 = ggml_sycl::host_ledger_yielder_slots_claimed_for_testing();
+        expect(r, slots1 == slots0 + 1,
+               "the live table holds " + num(slots1) + " yielder slots, want one more than the " + num(slots0) +
+                   " before it: its cache is not registered");
+        uint64_t   role1 = 0;
+        const bool role_read1 =
+            ggml_sycl::unified_cache_role_bytes_for_testing(0, ggml_sycl::alloc_role::LAZY_ROW_CACHE, &role1);
+        if (!role_read0 || !role_read1) {
+            void_arm(r, "the LAZY_ROW_CACHE role reading was VOID with device 0's cache created (readings " +
+                            num(role_read0) + "/" + num(role_read1) + ")");
+        }
+        expect(r, role1 - role0 == k_cache_role_bytes,
+               "the bytes requested under role LAZY_ROW_CACHE grew by " + num(role1 - role0) + ", want " +
+                   num(k_cache_role_bytes));
+
+        // Another load's charge that does not fit: the cache's yielder frees its last chunk on this thread.
+        ggml_sycl_test_host_ledger_store_budget(ggml_sycl::host_ledger_committed());
+        const uint64_t                        committed1 = ggml_sycl::host_ledger_committed();
+        const uint64_t                        live1      = host_cpu_live();
+        ggml_sycl::host_ledger_charge_request ask{};
+        ask.bytes       = 1 * MiB;
+        ask.may_yield   = true;
+        ask.load_txn_id = k_other_load_txn_id;
+        log_clear();
+        const ggml_sycl::host_ledger_charge_result other = ggml_sycl::host_ledger_try_charge(ask);
+        const ggml_sycl::lazy_row_cache_counters   after = cache->counters();
+        expect(r, after.chunks_yielded == 1 && after.yields == 1 && after.chunks_resident == 2,
+               "the other load's charge left chunks_yielded=" + num(after.chunks_yielded) + " yields=" +
+                   num(after.yields) + " chunks_resident=" + num(after.chunks_resident) + ", want 1, 1 and 2");
+        expect(r, other.charged, "the other load's charge did not fit after the yield");
+        expect(r, live1 - host_cpu_live() == k_cache_chunk_bytes,
+               "the yield took " + num(live1 - host_cpu_live()) + " B off the live HOST_CPU rows, want one chunk, " +
+                   num(k_cache_chunk_bytes));
+        expect(r, ggml_sycl::host_ledger_committed() == committed1 - k_cache_chunk_bytes + ask.bytes,
+               "committed is " + num(ggml_sycl::host_ledger_committed()) + ", want " +
+                   num(committed1 - k_cache_chunk_bytes + ask.bytes) + ": the chunk's charge was not credited once");
+        expect(r,
+               ggml_sycl::host_ledger_yieldable_bytes() - yieldable0 == k_cache_yieldable_bytes - k_cache_chunk_bytes,
+               "the yieldable bytes did not drop by the freed chunk");
+        const std::string yielded = "[LAZY-ROW-CACHE] storage.owner.lazy yielded chunks=1";
+        const std::string tenant  = " tenant_load_txn=" + num(k_other_load_txn_id);
+        expect(r, log_count_with(yielded.c_str(), tenant.c_str()) == 1,
+               "the yield did not log its chunk count and the asking load");
+        if (other.charged) {
+            ggml_sycl::host_ledger_credit(ask.bytes);
+        }
+
+        // The table's own load's charge that does not fit: the yield skips the load's own chunks.
+        ggml_sycl_test_host_ledger_store_budget(ggml_sycl::host_ledger_committed());
+        ask.load_txn_id                                = k_load_txn_id;
+        const ggml_sycl::host_ledger_charge_result own = ggml_sycl::host_ledger_try_charge(ask);
+        expect(r, !own.charged, "the own load's charge fit with no room");
+        expect(r, cache->counters().chunks_yielded == 1, "the own load's charge freed one of its own chunks");
+        if (own.charged) {
+            ggml_sycl::host_ledger_credit(ask.bytes);
+        }
+        ggml_sycl_test_host_ledger_store_budget(k_ledger_budget);
+    }
+    uint64_t   role2 = 0;
+    const bool role_read2 =
+        ggml_sycl::unified_cache_role_bytes_for_testing(0, ggml_sycl::alloc_role::LAZY_ROW_CACHE, &role2);
+    expect(r, host_cpu_live() == live0,
+           "the last reference left " + num(host_cpu_live() - live0) + " HOST_CPU bytes live, want 0");
+    expect(
+        r, ggml_sycl::host_ledger_committed() == committed0,
+        "the last reference left committed " + num(ggml_sycl::host_ledger_committed()) + ", want " + num(committed0));
+    expect(r, ggml_sycl::host_ledger_yieldable_bytes() == yieldable0,
+           "the last reference left " + num(ggml_sycl::host_ledger_yieldable_bytes() - yieldable0) +
+               " yieldable bytes behind");
+    expect(r, role_read2 && role2 == role0, "the last reference left LAZY_ROW_CACHE bytes live");
+    const int slots2 = ggml_sycl::host_ledger_yielder_slots_claimed_for_testing();
+    expect(r, slots2 == slots0,
+           "the last reference left " + num(slots2) + " yielder slots claimed, want the " + num(slots0) +
+               " before the table: its cache was not unregistered");
+    return r;
+}
+
+// The shortfall leg's mapping hook: counts the HOST_CPU mappings and fails the g_mmap_fail_at-th.
+std::atomic<int> g_mmap_calls{ 0 };
+std::atomic<int> g_mmap_fail_at{ 0 };
+
+int32_t mmap_fail_hook(int32_t point, int32_t) {
+    if (point != GGML_SYCL_TEST_HOST_LEDGER_POINT_HOST_CPU_MMAP_FAIL) {
+        return 0;
+    }
+    return g_mmap_calls.fetch_add(1) + 1 == g_mmap_fail_at.load() ? 1 : 0;
+}
+
+const char * k_shortfall_arm_name =
+    "(15) a row-cache shortfall refuses with one [HOST-PLAN-BUG] line naming planned and charged";
+
+// (15) Row T2's arm (n), its [HOST-PLAN-BUG] leg, on the row cache (§6.4): a step-4 shortfall, the owner entry
+// refusing one of the cache's planned allocations, refuses the table as lazy-table-row-cache-shortfall with exactly
+// one [HOST-PLAN-BUG] line naming the plan's figure and the bytes the cache had charged, and leaves nothing live and
+// nothing yieldable. The ledger is WARN-only in phase (a), so the owner entry's charge never refuses; the refusal is
+// injected at the HOST_CPU mapping of chunk 1, the third mapping after the index's and chunk 0's, which had charged
+// 4 MiB. Engagement: the hook saw three mappings and failed the third, and the owner entry logged that refusal.
+// Mutant: --mutant shortfall-unreported (the shortfall refuses with the plain [LAZY-TABLE] WARN and no [HOST-PLAN-BUG]
+// line).
+arm_result arm_storage_cache_shortfall_refuses() {
+    arm_result      r;
+    const uint64_t  live0      = host_cpu_live();
+    const uint64_t  committed0 = ggml_sycl::host_ledger_committed();
+    const uint64_t  yieldable0 = ggml_sycl::host_ledger_yieldable_bytes();
+    lazy_table_desc d = fixture_desc("storage.shortfall.lazy", k_table_offset, k_rows_a, lazy_residency::STORAGE, 0);
+    d.host_resident_bytes = storage_resident_bytes(k_rows_a, k_cache_chunk_bytes);
+    const size_t charged  = host_cpu_mapped_size(k_cache_index_bytes) + k_cache_chunk_bytes;
+    g_mmap_calls.store(0);
+    g_mmap_fail_at.store(3);
+    if (!ggml_sycl_test_host_ledger_hook(GGML_SYCL_TEST_HOST_LEDGER_POINT_HOST_CPU_MMAP_FAIL, mmap_fail_hook)) {
+        void_arm(r, "the mapping hook did not install");
+        return r;
+    }
+    log_clear();
+    lazy_table_result t =
+        ggml_sycl::lazy_table_test_create_storage(d, k_cache_chunk_bytes, g_mutant_shortfall_unreported);
+    (void) ggml_sycl_test_host_ledger_hook(GGML_SYCL_TEST_HOST_LEDGER_POINT_HOST_CPU_MMAP_FAIL, nullptr);
+    if (g_mmap_calls.load() != 3 || log_count_with("[UNIFIED-ALLOC]") != 1) {
+        void_arm(r, "the hook saw " + num(g_mmap_calls.load()) + " mappings and the owner entry logged " +
+                        num(log_count_with("[UNIFIED-ALLOC]")) + " refusals, want 3 and 1: " + status_name(t) + ": " +
+                        t.reason);
+        return r;
+    }
+    expect(r, t.status == lazy_table_status::ROW_CACHE_SHORTFALL && !t.table,
+           "the shortfall built as " + status_name(t) + ", want lazy-table-row-cache-shortfall");
+    const auto lines = log_lines_containing("[HOST-PLAN-BUG] lazy table storage.shortfall.lazy row cache");
+    expect(r, lines.size() == 1, "the shortfall printed " + num(lines.size()) + " [HOST-PLAN-BUG] lines, want 1");
+    if (lines.size() == 1) {
+        expect(r, lines[0].find("lazy-table-row-cache-shortfall") != std::string::npos,
+               "the [HOST-PLAN-BUG] line does not name its status: " + lines[0]);
+        expect(r, printed(lines[0], "planned") == k_storage_planned_bytes,
+               "the line's planned= is not the plan's " + num(k_storage_planned_bytes) + ": " + lines[0]);
+        expect(r, printed(lines[0], "charged") == charged,
+               "the line's charged= is not the index's and chunk 0's " + num(charged) + ": " + lines[0]);
+    }
+    expect(r, log_count_with("[HOST-PLAN-BUG]") == lines.size(), "another [HOST-PLAN-BUG] line was printed");
+    expect(r, host_cpu_live() == live0, "the shortfall left " + num(host_cpu_live() - live0) + " HOST_CPU bytes live");
+    expect(r, ggml_sycl::host_ledger_committed() == committed0,
+           "the shortfall left committed " + num(ggml_sycl::host_ledger_committed()) + ", want " + num(committed0));
+    expect(r, ggml_sycl::host_ledger_yieldable_bytes() == yieldable0, "the shortfall left yieldable bytes behind");
+    return r;
+}
+
 int main(int argc, char ** argv) {
     if (argc >= 3 && std::strcmp(argv[1], "--guard-child") == 0) {
         g_fixture_path = argv[2];
@@ -902,13 +1171,14 @@ int main(int argc, char ** argv) {
         g_fixture_path = argv[2];
         return strict_child();
     }
-    const bool mutant_args     = argc == 3 && std::strcmp(argv[1], "--mutant") == 0;
-    const bool mutant_table    = mutant_args && std::strcmp(argv[2], "predicate-too-broad") == 0;
-    g_mutant_read_whole_window = mutant_args && std::strcmp(argv[2], "read-whole-window") == 0;
-    if (argc >= 2 && !mutant_table && !g_mutant_read_whole_window) {
+    const bool mutant_args        = argc == 3 && std::strcmp(argv[1], "--mutant") == 0;
+    const bool mutant_table       = mutant_args && std::strcmp(argv[2], "predicate-too-broad") == 0;
+    g_mutant_read_whole_window    = mutant_args && std::strcmp(argv[2], "read-whole-window") == 0;
+    g_mutant_shortfall_unreported = mutant_args && std::strcmp(argv[2], "shortfall-unreported") == 0;
+    if (argc >= 2 && !mutant_table && !g_mutant_read_whole_window && !g_mutant_shortfall_unreported) {
         std::printf(
-            "FAIL: unknown arguments; the options are --mutant predicate-too-broad and --mutant "
-            "read-whole-window\n");
+            "FAIL: unknown arguments; the options are --mutant predicate-too-broad, --mutant read-whole-window and "
+            "--mutant shortfall-unreported\n");
         return 1;
     }
     if (mutant_table) {
@@ -953,6 +1223,19 @@ int main(int argc, char ** argv) {
         ::unlink(g_eof_fixture_path.c_str());
         return rc;
     }
+    if (g_mutant_shortfall_unreported) {
+        int rc = SYCL_TEST_SKIP;
+        if (sycl_test_require_gpu("the lazy table row-cache shortfall leg")) {
+            ggml_log_set(capture_log, nullptr);
+            ggml_sycl_test_host_ledger_store_budget(k_ledger_budget);
+            std::vector<named_arm> shortfall_only;
+            shortfall_only.push_back({ k_shortfall_arm_name, arm_storage_cache_shortfall_refuses });
+            rc = run_arms(shortfall_only, "lazy table arms (--mutant shortfall-unreported)");
+        }
+        ::unlink(g_fixture_path.c_str());
+        ::unlink(g_eof_fixture_path.c_str());
+        return rc;
+    }
 
     // Both children start before this process initialises SYCL.
     g_guard_run  = spawn("--guard-child", nullptr);
@@ -973,7 +1256,7 @@ int main(int argc, char ** argv) {
     arms.push_back({ k_eager_arm_name, arm_host_eager_read });
     arms.push_back({ "(3) a window past a huge page maps the larger figure", arm_host_window_crosses_huge_page });
     arms.push_back({ "(4) the last reference releases the body, once", arm_last_reference_releases });
-    arms.push_back({ "(5) a STORAGE table holds its O_DIRECT descriptor until its last reference",
+    arms.push_back({ "(5) a STORAGE table holds its descriptor and its row cache until its last reference",
                      arm_storage_holds_its_descriptor });
     arms.push_back({ "(6) a short source refuses naming both numbers", arm_source_short_refuses });
     arms.push_back({ "(7) a descriptor that is not a table refuses before any open", arm_invalid_desc_refuses });
@@ -985,6 +1268,9 @@ int main(int argc, char ** argv) {
     arms.push_back({ "(11) the descriptor guard prints one line and exits 134", arm_descriptor_guard });
     arms.push_back({ "(12) is_device_vram_buffer answers false for a descriptor before its cast",
                      arm_vram_answer_for_descriptors });
+    arms.push_back({ "(14) a STORAGE table's row cache charges, yields and releases through the owner entry",
+                     arm_storage_cache_owner_path });
+    arms.push_back({ k_shortfall_arm_name, arm_storage_cache_shortfall_refuses });
     // Last: its tensor-parallel factory latches process-wide state.
     arms.push_back({ k_table_arm_name, arm_vram_answer_unchanged_for_other_types });
     const int rc = run_arms(arms, "lazy table arms");

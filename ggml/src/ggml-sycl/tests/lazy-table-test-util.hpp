@@ -1,8 +1,8 @@
 //
 // What the lazy-table tests share (th32 §11 T3): the constants their thresholds derive from, the pool registry's
-// reading, the hold hook's rendezvous, the coverage wrapper's two arms, the --devices option and the arm loop. The pool
-// host test links lazy-io-pool.cpp alone, so nothing here reaches a device, the unified cache or a SYCL header. Each
-// test includes it once.
+// reading, the hold hook's rendezvous, the coverage wrapper's two arms, the --devices option, and the arm loop, which
+// is host-ledger-test-harness.hpp's, named here. The pool host test links lazy-io-pool.cpp alone, so nothing here
+// reaches a device, the unified cache or a SYCL header. Each test includes it once.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -33,6 +33,9 @@ using host_ledger_test_harness::expect;
 using host_ledger_test_harness::fail;
 using host_ledger_test_harness::num;
 using host_ledger_test_harness::outcome;
+using host_ledger_test_harness::arm_loop::named_arm;
+using host_ledger_test_harness::arm_loop::outcome_name;
+using host_ledger_test_harness::arm_loop::run_arms;
 
 constexpr uint64_t MiB = 1024ull * 1024ull;
 constexpr uint64_t GiB = 1024ull * MiB;
@@ -178,12 +181,7 @@ inline arm_result arm_wrapper_no_candidate() {
     return r;
 }
 
-// --- the arm loop ---
-
-struct named_arm {
-    const char * name;
-    arm_result (*run)();
-};
+// --- the arm loop: host-ledger-test-harness.hpp's ---
 
 // The wrapper arms under the names both tests print; the pool host test's registered controls match the first name.
 inline std::vector<named_arm> wrapper_arms() {
@@ -191,27 +189,6 @@ inline std::vector<named_arm> wrapper_arms() {
         { "the wrapper reaps before its take and after its drop",               arm_wrapper_reaps        },
         { "a scope with no lazy candidate takes nothing and still reaps twice", arm_wrapper_no_candidate },
     };
-}
-
-inline const char * outcome_name(outcome o) {
-    return o == outcome::PASS ? "PASS" : o == outcome::FAIL ? "FAIL" : "VOID";
-}
-
-// Runs every arm, so one failure does not hide the rest, printing each verdict, then `label` with the counts. Returns
-// the binary's status: 0 only when every arm passed, since a VOID arm fails the binary like a FAIL.
-inline int run_arms(const std::vector<named_arm> & arms, const std::string & label) {
-    int passed = 0, failed = 0, voided = 0;
-    for (const named_arm & arm : arms) {
-        const arm_result result = arm.run();
-        std::printf("%s %s%s%s\n", outcome_name(result.result), arm.name, result.why.empty() ? "" : ": ",
-                    result.why.c_str());
-        std::fflush(stdout);
-        passed += result.result == outcome::PASS;
-        failed += result.result == outcome::FAIL;
-        voided += result.result == outcome::VOID;
-    }
-    std::printf("%s: %d passed, %d failed, %d void\n", label.c_str(), passed, failed, voided);
-    return failed == 0 && voided == 0 ? 0 : 1;
 }
 
 // --- the --devices option ---

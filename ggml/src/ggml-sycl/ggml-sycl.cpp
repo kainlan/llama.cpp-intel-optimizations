@@ -18821,14 +18821,28 @@ static void ggml_sycl_plan_dry_run_residency(uint32_t                          i
 // plan's fields for it through placement_lazy_table_fields, the formatter the planner's [PLACEMENT] lazy lines use,
 // then one LAZY line for the plan: its tables' host_resident_bytes, the block ring's need and charge, and its refusal
 // through placement_lazy_refusal_text. A refused plan holds no table, so its refusal is the whole of its lazy report.
-// Nothing is decided here.
-static void ggml_sycl_plan_dry_run_lazy(uint32_t index, const ggml_sycl::placement_plan & plan) {
+// `lazy_infos` is the planner's input for the tables, the one the plan was decided from; a table's entry, found by
+// name, gives the formatter its row geometry, so the line carries yieldable= and the consumer fields as the
+// [PLACEMENT] line does. A plan built by hand has none, and its lines carry the plan's own fields alone. Nothing is
+// decided here.
+static void ggml_sycl_plan_dry_run_lazy(uint32_t                                                  index,
+                                        const ggml_sycl::placement_plan &                         plan,
+                                        const std::vector<ggml_sycl::placement_lazy_table_info> * lazy_infos) {
     size_t resident = 0;
     for (const ggml_sycl::placement_lazy_table & t : plan.lazy_tables) {
         resident += t.host_resident_bytes;
+        const ggml_sycl::placement_lazy_table_info * info = nullptr;
+        if (lazy_infos != nullptr) {
+            for (const ggml_sycl::placement_lazy_table_info & candidate : *lazy_infos) {
+                if (candidate.name == t.name) {
+                    info = &candidate;
+                    break;
+                }
+            }
+        }
         GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d LAZY %s residency=%s %s\n", index, plan.device_id,
                       t.name.c_str(), t.residency == ggml_sycl::lazy_residency::STORAGE ? "STORAGE" : "HOST",
-                      ggml_sycl::placement_lazy_table_fields(t, nullptr).c_str());
+                      ggml_sycl::placement_lazy_table_fields(t, info).c_str());
     }
     GGML_LOG_INFO(
         "[PLAN-DRY-RUN] plan=%u device=%d LAZY tables=%zu lazy_resident=%zu ring_need=%zu ring=%zu refusal=%s\n", index,
@@ -18840,10 +18854,11 @@ static void ggml_sycl_plan_dry_run_lazy(uint32_t index, const ggml_sycl::placeme
 // WEIGHT terms are the walk populate_host_zone_sizing() sized the zone with; the commit terms are the configure step's
 // sizing (ggml_sycl_configure_host_zones_for_plan) over the inputs the plan recorded, which record_host_ledger_plan()
 // summed, with the lazy tables' part, into host_planned_bytes; expected_host is that figure.
-static void ggml_sycl_plan_dry_run_record(uint32_t                          index,
-                                          const ggml_sycl::placement_plan & plan,
-                                          bool                              multi_device,
-                                          ggml_sycl_plan_dry_run_plan &     out) {
+static void ggml_sycl_plan_dry_run_record(uint32_t                                                  index,
+                                          const ggml_sycl::placement_plan &                         plan,
+                                          bool                                                      multi_device,
+                                          const std::vector<ggml_sycl::placement_lazy_table_info> * lazy_infos,
+                                          ggml_sycl_plan_dry_run_plan &                             out) {
     const ggml_sycl::host_weight_zone_terms weight = ggml_sycl::placement_plan_host_weight_zone_terms(plan);
     const ggml_sycl::host_zone_commit_terms terms  = ggml_sycl::placement_plan_host_zone_commit_terms(
         plan, plan.host_zone_terms.onednn_live, plan.host_zone_terms.chunk);
@@ -18909,7 +18924,7 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                          inde
                       index, plan.device_id, ggml_sycl_plan_dry_run_backing_name(b), out.residency_count[b],
                       out.residency_bytes[b], out.residency_bytes[b] / (1024.0 * 1024.0));
     }
-    ggml_sycl_plan_dry_run_lazy(index, plan);
+    ggml_sycl_plan_dry_run_lazy(index, plan, lazy_infos);
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -18917,7 +18932,7 @@ namespace ggml_sycl {
 // The record on a plan a test builds by hand, with backing mixes and charges a shaped inventory does not produce.
 ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const placement_plan & plan) {
     ggml_sycl_plan_dry_run_plan out{};
-    ggml_sycl_plan_dry_run_record(index, plan, false, out);
+    ggml_sycl_plan_dry_run_record(index, plan, false, nullptr, out);
     return out;
 }
 }  // namespace ggml_sycl
@@ -18927,15 +18942,17 @@ ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const place
 // planner inputs first, through the stage's helpers, against `host_budget`. A multi-device plan packs each physical
 // device to its budget authority's answer; a single-device plan to the arena's reservation when the device's cache
 // has an active arena, else to the authority's answer. A device budget in `opts` replaces either. Each device's budget
-// lands in `device_budget`. Plans nothing when the VRAM arena is disabled, as the stage then plans nothing. Reads a
-// cache that exists and creates none. Caller holds g_tensor_inventory_mutex and a saved state.
+// lands in `device_budget`, and the lazy tables' planner input, the one every plan here is decided from, in
+// `lazy_infos`. Plans nothing when the VRAM arena is disabled, as the stage then plans nothing. Reads a cache that
+// exists and creates none. Caller holds g_tensor_inventory_mutex and a saved state.
 static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     const ggml_sycl_tensor_inventory *  inventory,
     const ggml_sycl_plan_dry_run_opts & opts,
     size_t                              host_budget,
     size_t                              mem_available,
     bool                                budget_overridden,
-    uint64_t (&device_budget)[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES]) {
+    uint64_t (&device_budget)[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES],
+    std::vector<ggml_sycl::placement_lazy_table_info> & lazy_infos) {
     std::vector<ggml_sycl::placement_plan> plans;
     if (!ggml_sycl::vram_arena_enabled()) {
         GGML_LOG_INFO("[PLAN-DRY-RUN] the VRAM arena is disabled, so the load plans nothing and neither does this\n");
@@ -18950,6 +18967,7 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     // ledger's stored values.
     kv.host_mem_available_pre = mem_available;
     kv.host_budget_overridden = budget_overridden;
+    lazy_infos                = kv.lazy_tables;
     if (kv.n_ubatch_context != 0) {
         GGML_LOG_INFO(
             "[PLAN-DRY-RUN] n_ubatch_context=%u is not modelled: every plan is the load's planning shape "
@@ -19097,14 +19115,15 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         out.host_reserve_override   = reserve_override ? 1 : 0;
         out.host_budget             = host_budget;
 
-        std::vector<ggml_sycl::placement_plan> plans;
-        bool                                   multi_device = false;
+        std::vector<ggml_sycl::placement_plan>            plans;
+        std::vector<ggml_sycl::placement_lazy_table_info> lazy_infos;
+        bool                                              multi_device = false;
         {
             std::lock_guard<std::mutex>        lock(g_tensor_inventory_mutex);
             ggml_sycl_plan_dry_run_saved_state saved(ggml_sycl_info().total_gpu_count);
             multi_device = ggml_sycl_plan_multi_device();
             plans = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, sample.available_bytes, reserve_override,
-                                                 out.device_budget_bytes);
+                                                 out.device_budget_bytes, lazy_infos);
         }
         for (int d = 0; d < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES; ++d) {
             if (out.device_budget_bytes[d] != 0) {
@@ -19117,7 +19136,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         }
         out.n_plans = static_cast<uint32_t>(plans.size());
         for (uint32_t i = 0; i < out.n_plans; ++i) {
-            ggml_sycl_plan_dry_run_record(i, plans[i], multi_device, out.plans[i]);
+            ggml_sycl_plan_dry_run_record(i, plans[i], multi_device, &lazy_infos, out.plans[i]);
         }
         *result = out;
         return GGML_SYCL_LIFECYCLE_OK;

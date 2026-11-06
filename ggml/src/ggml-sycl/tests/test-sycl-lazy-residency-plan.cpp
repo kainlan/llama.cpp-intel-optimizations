@@ -27,6 +27,7 @@
 
 #include "../host-cpu-mapping.hpp"
 #include "../lazy-io-pool.hpp"
+#include "../lazy-row-cache.hpp"
 #include "../unified-cache.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
@@ -169,7 +170,9 @@ const char * residency_name(lazy_residency r) {
     return r == lazy_residency::HOST ? "HOST" : "STORAGE";
 }
 
-// A STORAGE table's checks: its cache holds at least the floor, and less than the table's HOST body.
+// A STORAGE table's checks: its cache holds at least the floor, and less than the table's HOST body, and the yieldable
+// figure the plan prints is the cache's chunk rule, lazy_row_cache_yieldable_bytes (§6.4, §10), so the plan counts the
+// bytes the built cache will publish.
 void expect_storage(arm_result &                      r,
                     const placement_plan &            plan,
                     const placement_lazy_table_info & info,
@@ -192,6 +195,12 @@ void expect_storage(arm_result &                      r,
            at + info.name + " floor is " + num(t->cache_floor_slots) + " slots, want " + num(floor_slots(info, kv)));
     expect(r, t->cache_slots >= t->cache_floor_slots,
            at + info.name + " cache of " + num(t->cache_slots) + " slots is below its floor");
+    const size_t yieldable = printed(placement_lazy_table_fields(*t, &info), "yieldable");
+    const size_t rule =
+        lazy_row_cache_yieldable_bytes(t->cache_slots, t->cache_floor_slots, info.row_size, LAZY_ROW_CACHE_CHUNK_BYTES);
+    expect(r, yieldable == rule,
+           at + info.name + " prints yieldable=" + num(yieldable) + ", the cache's rule " + num(rule) + " at " +
+               num(t->cache_slots) + " slots over a floor of " + num(t->cache_floor_slots));
 }
 
 void expect_host(arm_result &                      r,

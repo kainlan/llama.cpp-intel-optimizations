@@ -1,6 +1,6 @@
 //
-// The harness both host ledger tests share: an arm's PASS, FAIL or VOID verdict, the captured log lines the arms read,
-// and the child runner their abort legs use. Each test includes it once.
+// The harness both host ledger tests share: an arm's PASS, FAIL or VOID verdict, the loop that runs the arms, the
+// captured log lines the arms read, and the child runner their abort legs use. Each test includes it once.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -62,6 +62,40 @@ inline void expect(arm_result & r, bool condition, const std::string & why) {
 inline std::string num(uint64_t v) {
     return std::to_string(static_cast<unsigned long long>(v));
 }
+
+// --- the arm loop ---
+
+// In a namespace of its own, so a test that names the harness with a using-directive and keeps a loop of its own
+// sees no second outcome_name; a test that runs its arms through this loop names it.
+namespace arm_loop {
+
+struct named_arm {
+    const char * name;
+    arm_result (*run)();
+};
+
+inline const char * outcome_name(outcome o) {
+    return o == outcome::PASS ? "PASS" : o == outcome::FAIL ? "FAIL" : "VOID";
+}
+
+// Runs every arm, so one failure does not hide the rest, printing each verdict, then `label` with the counts. Returns
+// the binary's status: 0 only when every arm passed, since a VOID arm fails the binary like a FAIL.
+inline int run_arms(const std::vector<named_arm> & arms, const std::string & label) {
+    int passed = 0, failed = 0, voided = 0;
+    for (const named_arm & arm : arms) {
+        const arm_result result = arm.run();
+        std::printf("%s %s%s%s\n", outcome_name(result.result), arm.name, result.why.empty() ? "" : ": ",
+                    result.why.c_str());
+        std::fflush(stdout);
+        passed += result.result == outcome::PASS;
+        failed += result.result == outcome::FAIL;
+        voided += result.result == outcome::VOID;
+    }
+    std::printf("%s: %d passed, %d failed, %d void\n", label.c_str(), passed, failed, voided);
+    return failed == 0 && voided == 0 ? 0 : 1;
+}
+
+}  // namespace arm_loop
 
 // --- the log lines the arms read ---
 
