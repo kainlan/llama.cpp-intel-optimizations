@@ -2139,7 +2139,7 @@ typedef struct ggml_sycl_plan_dry_run_result {
     uint64_t                    committed_bytes;
     uint32_t                    budget_pct;
     uint32_t                    mem_available_from_opts;  // 1: mem_available_bytes is the option's
-    uint32_t                    host_reserve_override;    // 1: an accepted GGML_SYCL_HOST_RESERVE_MB is the budget
+    uint32_t                    host_reserve_override;    // 1: an accepted GGML_SYCL_HOST_RESERVE_MB caps the budget
     uint32_t                    n_plans;
     uint64_t                    host_budget;  // host_ledger_compute_budget of the sample and committed_bytes
     uint64_t                    device_budget_bytes[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES];  // each device's VRAM budget

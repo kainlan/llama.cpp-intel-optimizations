@@ -8015,9 +8015,10 @@ struct host_budget_sample {
 // exist. It runs before any lock is taken, and the lock witness aborts it when one is held other than the replan token.
 host_budget_sample host_ledger_sample();
 
-// The budget for `sample` with `committed` bytes already charged. Pure and saturating: no subtraction wraps, so a
-// pinned share above the percentage cap, or an available reading at or below the OS reserve, gives a budget at or
-// below `committed`, which refuses the next charge by name. An accepted GGML_SYCL_HOST_RESERVE_MB is the whole budget.
+// The budget for `sample` with `committed` bytes already charged: host_budget_compute (host-budget.hpp, design 5efe
+// §4.5). Saturating: a pinned share above the percentage cap, or an available reading at or below
+// host_headroom(total), the refusal host-headroom-exhausted, gives a budget at or below `committed`, which refuses
+// the next charge by name. An accepted GGML_SYCL_HOST_RESERVE_MB caps the budget and never raises it.
 size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed);
 
 // Computes against the live committed bytes and stores the result, and stores the sample's MemAvailable and whether

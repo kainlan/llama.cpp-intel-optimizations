@@ -19128,7 +19128,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         GGML_LOG_INFO("[PLAN-DRY-RUN] sample: total=%zu available=%zu (%s) pinned=%zu committed=%zu budget_pct=%d%s\n",
                       sample.total_bytes, sample.available_bytes,
                       in.mem_available_set != 0 ? "--mem-available" : "MemAvailable", sample.pinned_bytes, committed,
-                      sample.budget_pct, reserve_override ? " GGML_SYCL_HOST_RESERVE_MB (the whole budget)" : "");
+                      sample.budget_pct, reserve_override ? " GGML_SYCL_HOST_RESERVE_MB (a cap on the budget)" : "");
         GGML_LOG_INFO("[PLAN-DRY-RUN] host_budget=%zu (%.1f MB): the budget a load would store; nothing is stored\n",
                       host_budget, host_budget / (1024.0 * 1024.0));
 

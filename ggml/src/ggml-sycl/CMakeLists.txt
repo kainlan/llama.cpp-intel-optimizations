@@ -434,21 +434,39 @@ if (BUILD_TESTING)
     # The monotone host budget and the resident working-set WARN (docs/design/sycl-mmap-host-tier.md §4.5, §7 C5).
     # host-budget.hpp is a pure header that includes nothing from SYCL, the cache or ggml, so each target compiles one
     # test file against it alone and links nothing: no device, no library, no model. Each variant is a triple: the
-    # ctest name, the macro that plants one defect in host-budget.hpp ("" for the base test), and the FAIL line the test
+    # test, the macro that plants one defect in host-budget.hpp ("" for the base test), and the FAIL line the test
     # prints when it does. A mutant builds its own executable, <test>-mutant-<macro suffix>, whose ctest passes only
     # when that line appears; it has no SKIP_RETURN_CODE, so a mutant the test does not kill fails.
+    set(_hb_table "FAIL \\(1\\) every row of the 4\\.5 table: ")
+    set(_hb_sweep "FAIL \\(2\\) the budget never decreases as MemAvailable rises: ")
+    set(_hb_override "FAIL \\(3\\) the override composes: ")
+    string(CONCAT _hb_re_cliff
+        "${_hb_sweep}total=32\\.0 GiB: available 8\\.00 GiB gives 4\\.00 GiB, available 8\\.06 GiB gives 0\\.06 GiB")
+    string(CONCAT _hb_re_override_replaces
+        "${_hb_override}an override above the formula gives 200\\.00 GiB, want the formula's 121\\.80 GiB")
+    string(CONCAT _hb_re_old_reserve
+        "${_hb_table}total=246\\.9 GiB available=150\\.8 GiB gives 142\\.80 GiB \\(status ok\\), want 121\\.80 GiB")
     set(_host_budget_variants
-        test-sycl-host-budget           "" ""
-        test-sycl-host-working-set-warn "" "")
+        test-sycl-host-budget           ""                                      ""
+        test-sycl-host-budget           HOST_BUDGET_MUTANT_CLIFF                "${_hb_re_cliff}"
+        test-sycl-host-budget           HOST_BUDGET_MUTANT_OVERRIDE_REPLACES    "${_hb_re_override_replaces}"
+        test-sycl-host-budget           HOST_BUDGET_MUTANT_OLD_RESERVE          "${_hb_re_old_reserve}"
+        test-sycl-host-working-set-warn ""                                      "")
     list(LENGTH _host_budget_variants _n)
     math(EXPR _last "${_n} - 1")
     foreach (_i RANGE 0 ${_last} 3)
         math(EXPR _j "${_i} + 1")
         math(EXPR _k "${_i} + 2")
-        list(GET _host_budget_variants ${_i} _name)
+        list(GET _host_budget_variants ${_i} _stem)
         list(GET _host_budget_variants ${_j} _macro)
         list(GET _host_budget_variants ${_k} _regex)
-        string(REGEX REPLACE "-mutant-.*$" "" _stem "${_name}")
+        set(_name ${_stem})
+        if (NOT _macro STREQUAL "")
+            string(REGEX REPLACE "^HOST_BUDGET_MUTANT_" "" _suffix "${_macro}")
+            string(TOLOWER "${_suffix}" _suffix)
+            string(REPLACE "_" "-" _suffix "${_suffix}")
+            set(_name ${_stem}-mutant-${_suffix})
+        endif()
         add_executable(${_name} ${CMAKE_CURRENT_SOURCE_DIR}/tests/${_stem}.cpp)
         set_target_properties(${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
         add_test(NAME ${_name} COMMAND ${_name})

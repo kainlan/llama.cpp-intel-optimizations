@@ -15,6 +15,7 @@
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
+#include "host-budget.hpp"
 #include "host-reserve-env.hpp"
 #include "kv-region-registry.hpp"
 #include "kv-tier-manager.hpp"
@@ -1027,9 +1028,16 @@ static std::atomic<size_t> g_host_ledger_budget{ 0 };
 // The MemAvailable of the sample the stored budget was computed from, stored by the same writer beside it, so a load's
 // P3 reading (th32 §4.3 step 4) is the same sample as its budget, once per load transaction.
 static std::atomic<size_t> g_host_ledger_mem_available{ 0 };
-// Whether that budget is GGML_SYCL_HOST_RESERVE_MB's override rather than the computed one, stored by the same writer
-// from the same sample, so the plan lines (th32 §10) name the source of the budget they print.
+// Whether that budget is GGML_SYCL_HOST_RESERVE_MB's override, the smaller of it and the computed one (design 5efe
+// §4.5), stored by the same writer from the same sample, so the plan lines (th32 §10) name the source of the budget
+// they print.
 static std::atomic<bool>   g_host_ledger_budget_overridden{ false };
+// The sample's MemTotal, the headroom its budget left, and whether that budget is the refusal host-headroom-exhausted
+// (design 5efe §4.5), stored by the same writer from the same sample, so every refused charge names the refusal with
+// MemAvailable, MemTotal and the headroom.
+static std::atomic<size_t> g_host_ledger_mem_total{ 0 };
+static std::atomic<size_t> g_host_ledger_headroom{ 0 };
+static std::atomic<bool>   g_host_ledger_headroom_exhausted{ false };
 static std::atomic<size_t> g_host_ledger_yieldable_bytes{ 0 };
 // The yieldable chunks behind those bytes: a yield makes at most one round per chunk counted at its first shortfall.
 static std::atomic<size_t> g_host_ledger_yieldable_chunks{ 0 };
@@ -1087,6 +1095,19 @@ static size_t host_ledger_deficit(size_t ask, size_t committed, size_t budget) {
     return host_ledger_sat_sub(ask, budget - committed);
 }
 
+// The refusal's name when the stored budget is the headroom refusal (design 5efe §4.5), with MemAvailable, MemTotal
+// and the headroom, for every refused charge to print; otherwise an empty string. Each figure is read for display.
+static void host_ledger_refusal_reason(char * buf, size_t size) {
+    buf[0] = '\0';
+    if (!g_host_ledger_headroom_exhausted.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::snprintf(buf, size, " reason=host-headroom-exhausted MemAvailable=%zu MemTotal=%zu headroom=%zu",
+                  g_host_ledger_mem_available.load(std::memory_order_acquire),
+                  g_host_ledger_mem_total.load(std::memory_order_acquire),
+                  g_host_ledger_headroom.load(std::memory_order_acquire));
+}
+
 size_t host_ledger_budget() {
     return g_host_ledger_budget.load(std::memory_order_acquire);
 }
@@ -1138,75 +1159,79 @@ host_budget_sample host_ledger_sample() {
     return sample;
 }
 
-size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed) {
-    // The sample term is clamped here, so an uncapped ledger is SIZE_MAX/4 and never a value a later sum can wrap.
-    const size_t cap              = SIZE_MAX / 4;
-    bool         detection_failed = false;
-    size_t       computed         = cap;
-    if (sample.total_bytes == 0 && sample.available_bytes == 0) {
-        detection_failed = true;
-    } else {
-        size_t pct_cap    = 0;
-        size_t os_reserve = 0;
-        if (sample.total_bytes > 0) {
-            const size_t pct = static_cast<size_t>(std::min(std::max(sample.budget_pct, 1), 100));
-            pct_cap          = sample.total_bytes / 100 * pct + sample.total_bytes % 100 * pct / 100;
-            os_reserve       = std::max<size_t>(8ull << 30, sample.total_bytes / 32);
-        } else {
-            pct_cap    = sample.available_bytes;
-            os_reserve = std::min<size_t>(8ull << 30, sample.available_bytes / 4);
-        }
-        // Each subtraction clamps to 0: a pinned share above the cap, or a reading at or below the reserve, leaves a
-        // budget at or below `committed`, which refuses by name. HOST_CPU bytes are locked and resident when charged,
-        // so a reading at or below the reserve grants no headroom.
-        const size_t share_term = host_ledger_sat_sub(pct_cap, sample.pinned_bytes);
-        const size_t sample_term =
-            std::min(cap, host_ledger_sat_add(committed, host_ledger_sat_sub(sample.available_bytes, os_reserve)));
-        computed = std::min(share_term, sample_term);
-    }
+// The one budget function's result for `sample` (design 5efe §4.5, §7 C5: host_budget_compute), with its WARNs: an
+// override at or above the computed budget, which stays the budget; a rejected override; the refusal
+// host-headroom-exhausted; and a failed RAM detection.
+static host_budget_result host_ledger_compute(const host_budget_sample & sample, size_t committed) {
+    host_budget_inputs in;
+    in.total_bytes             = sample.total_bytes;
+    in.available_bytes         = sample.available_bytes;
+    in.budget_pct              = sample.budget_pct;
+    in.pinned_bytes            = sample.pinned_bytes;
+    in.committed_bytes         = committed;
+    in.override_set            = sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE;
+    in.override_bytes          = sample.reserve.bytes;
+    const host_budget_result b = host_budget_compute(in);
     switch (sample.reserve.status) {
         case detail::host_reserve_parse_status::OVERRIDE:
-            // The override is the whole budget: no percentage, sample or share term enters.
-            if (sample.reserve.bytes > computed) {
+            // The override composes (§4.5): it can lower the budget, never raise it.
+            if (!b.override_binds) {
                 GGML_LOG_WARN(
-                    "[HOST-LEDGER] GGML_SYCL_HOST_RESERVE_MB=%zu is the host budget (%zu bytes) and exceeds the "
-                    "computed budget (%zu bytes)\n",
-                    sample.reserve.mb, sample.reserve.bytes, computed);
+                    "[HOST-LEDGER] GGML_SYCL_HOST_RESERVE_MB=%zu (%zu bytes) is at or above the computed budget (%zu "
+                    "bytes), which stays the host budget: the override can lower it, never raise it\n",
+                    sample.reserve.mb, sample.reserve.bytes, b.computed);
             }
-            return sample.reserve.bytes;
+            break;
         case detail::host_reserve_parse_status::REJECTED:
             GGML_LOG_WARN(
                 "[HOST-LEDGER] ignoring GGML_SYCL_HOST_RESERVE_MB: %s; the host budget is the computed "
                 "%zu bytes\n",
-                sample.reserve.reason ? sample.reserve.reason : "rejected", computed);
+                sample.reserve.reason ? sample.reserve.reason : "rejected", b.computed);
             break;
         case detail::host_reserve_parse_status::AUTO:
         case detail::host_reserve_parse_status::UNSET:
             break;
     }
-    if (detection_failed) {
+    if (b.status == host_budget_status::HEADROOM_EXHAUSTED) {
+        GGML_LOG_WARN(
+            "[HOST-LEDGER] host-headroom-exhausted MemAvailable=%zu MemTotal=%zu headroom=%zu: the budget grants "
+            "nothing past the committed %zu bytes, so every pinned request is refused\n",
+            sample.available_bytes, sample.total_bytes, b.headroom, committed);
+    } else if (b.status == host_budget_status::DETECTION_FAILED) {
         GGML_LOG_WARN(
             "[HOST-ARENA] System RAM detection failed; the host ledger's budget is uncapped (%zu bytes) and only the "
             "plan's host sum bounds it\n",
-            cap);
+            k_host_budget_uncapped);
     }
-    return computed;
+    return b;
+}
+
+size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed) {
+    return host_ledger_compute(sample, committed).budget;
 }
 
 size_t host_ledger_store_budget(const host_budget_sample & sample) {
-    const size_t committed = g_host_ledger_committed.load(std::memory_order_acquire);
-    const size_t budget    = host_ledger_compute_budget(sample, committed);
+    const size_t             committed = g_host_ledger_committed.load(std::memory_order_acquire);
+    const host_budget_result b         = host_ledger_compute(sample, committed);
+    const size_t             budget    = b.budget;
     g_host_ledger_mem_available.store(sample.available_bytes, std::memory_order_release);
-    g_host_ledger_budget_overridden.store(sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE,
-                                          std::memory_order_release);
+    g_host_ledger_mem_total.store(sample.total_bytes, std::memory_order_release);
+    g_host_ledger_headroom.store(b.headroom, std::memory_order_release);
+    g_host_ledger_headroom_exhausted.store(b.status == host_budget_status::HEADROOM_EXHAUSTED,
+                                           std::memory_order_release);
+    g_host_ledger_budget_overridden.store(
+        sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE && b.override_binds,
+        std::memory_order_release);
     g_host_ledger_budget.store(budget, std::memory_order_release);
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     g_test_host_ledger_stores.fetch_add(1, std::memory_order_acq_rel);
 #endif
     GGML_LOG_INFO(
-        "[HOST-LEDGER] stored budget=%zu committed=%zu total=%zu available=%zu pct=%d pinned=%zu reserve_mb=%zu\n",
+        "[HOST-LEDGER] stored budget=%zu committed=%zu total=%zu available=%zu pct=%d pinned=%zu reserve_mb=%zu "
+        "headroom=%zu\n",
         budget, committed, sample.total_bytes, sample.available_bytes, sample.budget_pct, sample.pinned_bytes,
-        sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE ? sample.reserve.mb : (size_t) 0);
+        sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE ? sample.reserve.mb : (size_t) 0,
+        b.headroom);
     return budget;
 }
 
@@ -1288,12 +1313,15 @@ host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_reques
         }
     }
 
+    char reason[160];
+    host_ledger_refusal_reason(reason, sizeof(reason));
     if (req.warn_only) {
         // Phase (a): the ledger logs what it would refuse and refuses nothing.
         GGML_LOG_WARN(
             "[HOST-LEDGER] would refuse: host-budget-exceeded ask=%zu committed=%zu budget=%zu deficit=%zu "
-            "yieldable_bytes=%zu retries=%u (charged anyway: the ledger is WARN-only)\n",
-            result.ask, result.committed, result.budget, result.deficit, result.yieldable_bytes, result.retries);
+            "yieldable_bytes=%zu retries=%u (charged anyway: the ledger is WARN-only)%s\n",
+            result.ask, result.committed, result.budget, result.deficit, result.yieldable_bytes, result.retries,
+            reason);
         size_t committed = g_host_ledger_committed.load(std::memory_order_acquire);
         do {
             (void) GGML_SYCL_HOST_LEDGER_HOOK(CHARGE_BEFORE_CAS, 1);
@@ -1306,8 +1334,8 @@ host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_reques
     }
     GGML_LOG_WARN(
         "[HOST-LEDGER] host-budget-exceeded ask=%zu committed=%zu budget=%zu deficit=%zu yieldable_bytes=%zu "
-        "retries=%u\n",
-        result.ask, result.committed, result.budget, result.deficit, result.yieldable_bytes, result.retries);
+        "retries=%u%s\n",
+        result.ask, result.committed, result.budget, result.deficit, result.yieldable_bytes, result.retries, reason);
     return result;
 }
 
@@ -6914,25 +6942,15 @@ unified_cache::unified_cache(sycl::queue & queue,
     // The pool grows lazily; this budget is a cap, not committed memory.
     {
         size_t host_mem_budget = g_unified_cache_host_budget;
-        // llama.cpp-glkg: GGML_SYCL_HOST_RESERVE_MB used to be parsed only by
-        // resolve_host_reserve_bytes(), which has no callers -- a dead
-        // variable documented as a live override. Wire it here as the actual
-        // override of the pinned-pool BUDGET (in MB). The byte sentinel
-        // g_unified_cache_host_budget is initialized to zero and currently
-        // has no writer. The public host-budget-pct setter changes only the
-        // percentage used by the auto calculation below, not this sentinel.
-        // A positive parsed env value therefore precedes that calculation,
-        // even when the percentage was explicitly set through the API. Zero
-        // leaves auto calculation enabled. This describes current behavior,
-        // not a separate provenance mechanism or an API-priority guarantee.
-        // A small fixed budget can exercise pool shortfalls; its value alone
-        // does not guarantee a particular failure or allocation ordering.
-        //
-        // llama.cpp-16el: a budget gets the strict parser (host-reserve-env.cpp),
-        // not the lenient parse_env_mb_value() the tuning knobs share: junk,
-        // signs, ERANGE and a MiB count whose byte conversion would wrap are
-        // rejected with ONE warning and the auto calculation runs exactly as
-        // if the variable were unset.
+        // GGML_SYCL_HOST_RESERVE_MB caps the pinned pool's budget (in MB), read through the strict parser
+        // (host-reserve-env.cpp): junk, signs, ERANGE and a MiB count whose byte conversion would wrap are rejected
+        // with one WARN, and the computed budget runs as if the variable were unset; zero leaves it enabled. The byte
+        // sentinel g_unified_cache_host_budget has no writer, and the public host-budget-pct setter changes only the
+        // percentage below. The budget is the one host budget (design 5efe §4.5, host_budget_compute): the override
+        // composes as a cap on it, and at zero headroom-free memory it is 0, so every pinned request is refused.
+        size_t total_mem       = 0;
+        size_t available_mem   = 0;
+        size_t headroom        = 0;
         if (host_mem_budget == 0) {
             const char * reserve_raw = std::getenv("GGML_SYCL_HOST_RESERVE_MB");
 
@@ -6940,12 +6958,7 @@ unified_cache::unified_cache(sycl::queue & queue,
                 ggml_sycl::detail::parse_host_reserve_mb(reserve_raw);
             switch (reserve.status) {
                 case ggml_sycl::detail::host_reserve_parse_status::OVERRIDE:
-                    host_mem_budget = reserve.bytes;
-                    GGML_LOG_INFO(
-                        "[HOST-ARENA] GGML_SYCL_HOST_RESERVE_MB=%zu overrides the auto-computed pinned-pool budget "
-                        "(%.1f GB)\n",
-                        reserve.mb, host_mem_budget / (1024.0 * 1024.0 * 1024.0));
-                    break;
+                    break;  // logged below, beside the computed budget it caps
                 case ggml_sycl::detail::host_reserve_parse_status::AUTO:
                     GGML_LOG_INFO(
                         "[HOST-ARENA] GGML_SYCL_HOST_RESERVE_MB=0 leaves the auto-computed pinned-pool "
@@ -6960,38 +6973,34 @@ unified_cache::unified_cache(sycl::queue & queue,
                 case ggml_sycl::detail::host_reserve_parse_status::UNSET:
                     break;
             }
-        }
-        size_t total_mem     = 0;
-        size_t available_mem = 0;
-        size_t os_reserve    = 0;
-        if (host_mem_budget == 0) {
             total_mem     = ggml_sycl_get_total_system_memory_bytes();
             available_mem = ggml_sycl_get_available_system_memory_bytes();
-            int pct       = g_unified_cache_host_budget_pct;
-            if (pct < 1) {
-                pct = 1;
-            } else if (pct > 100) {
-                pct = 100;
-            }
 
-            if (total_mem > 0) {
-                host_mem_budget =
-                    static_cast<size_t>(static_cast<double>(total_mem) * (static_cast<double>(pct) / 100.0));
-                os_reserve = std::max<size_t>(8ull << 30, total_mem / 32);
-            } else if (available_mem > 0) {
-                host_mem_budget = available_mem;
-                os_reserve      = std::min<size_t>(8ull << 30, available_mem / 4);
-            } else {
-                host_mem_budget = std::numeric_limits<size_t>::max() / 4;
+            ggml_sycl::host_budget_inputs in;
+            in.total_bytes     = total_mem;
+            in.available_bytes = available_mem;
+            in.budget_pct      = g_unified_cache_host_budget_pct;
+            in.override_set    = reserve.status == ggml_sycl::detail::host_reserve_parse_status::OVERRIDE;
+            in.override_bytes  = reserve.bytes;
+
+            const ggml_sycl::host_budget_result b = ggml_sycl::host_budget_compute(in);
+            host_mem_budget                       = b.budget;
+            headroom                              = b.headroom;
+            if (in.override_set) {
+                GGML_LOG_INFO(
+                    "[HOST-ARENA] GGML_SYCL_HOST_RESERVE_MB=%zu caps the computed pinned-pool budget (%.1f GB): the "
+                    "budget is %.1f GB\n",
+                    reserve.mb, b.computed / (1024.0 * 1024.0 * 1024.0), host_mem_budget / (1024.0 * 1024.0 * 1024.0));
+            }
+            if (b.status == ggml_sycl::host_budget_status::HEADROOM_EXHAUSTED) {
+                GGML_LOG_WARN(
+                    "[HOST-ARENA] host-headroom-exhausted MemAvailable=%zu MemTotal=%zu headroom=%zu: the pinned "
+                    "pool's budget is 0, so every pinned request is refused\n",
+                    available_mem, total_mem, headroom);
+            } else if (b.status == ggml_sycl::host_budget_status::DETECTION_FAILED) {
                 GGML_LOG_WARN(
                     "[HOST-ARENA] System RAM detection failed; using lazy-growth host arena without a detected RAM "
                     "cap\n");
-            }
-
-            if (available_mem > 0 && os_reserve > 0) {
-                const size_t available_cap =
-                    available_mem > os_reserve ? available_mem - os_reserve : available_mem / 2;
-                host_mem_budget = std::min(host_mem_budget, available_cap);
             }
         }
 
@@ -7017,9 +7026,9 @@ unified_cache::unified_cache(sycl::queue & queue,
         host_arena_ = std::make_unique<pinned_chunk_pool>(queue_, host_mem_budget);
         GGML_LOG_INFO(
             "[HOST-ARENA] Created with %.1f GB budget, committed=0.0 GB "
-            "(system total=%.1f GB available=%.1f GB reserve=%.1f GB pct=%d)\n",
+            "(system total=%.1f GB available=%.1f GB headroom=%.1f GB pct=%d)\n",
             host_mem_budget / (1024.0 * 1024.0 * 1024.0), total_mem / (1024.0 * 1024.0 * 1024.0),
-            available_mem / (1024.0 * 1024.0 * 1024.0), os_reserve / (1024.0 * 1024.0 * 1024.0),
+            available_mem / (1024.0 * 1024.0 * 1024.0), headroom / (1024.0 * 1024.0 * 1024.0),
             g_unified_cache_host_budget_pct);
     }
 

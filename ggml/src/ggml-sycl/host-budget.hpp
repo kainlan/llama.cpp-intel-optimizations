@@ -7,6 +7,8 @@
 // Copyright (C) 2024-2026 Intel Corporation
 // SPDX-License-Identifier: MIT
 //
+// The HOST_BUDGET_MUTANT_* macros each plant one defect a registered mutant of the two host tests must kill; no
+// production target defines them.
 
 #pragma once
 
@@ -18,12 +20,21 @@
 
 namespace ggml_sycl {
 
-// P3's floor on this host (9g22's 24 GiB plus th32 §4.3's 5 GiB runtime margin): the only resident-room rule the
-// tree has before §4.5.
+// This host's measurement (§4.5): 9g22's 24 GiB P3 floor plus th32 §4.3's 5 GiB runtime margin.
 constexpr size_t k_host_p3_floor = 29ull << 30;
 
 // The budget a failed RAM detection leaves: uncapped, and never a value a later sum can wrap.
 constexpr size_t k_host_budget_uncapped = SIZE_MAX / 4;
+
+// The memory the budget leaves the host (§4.5): total/32, raised to this host's P3 floor but never past a quarter of
+// the host, so the floor measured here does not become a universal cap on a smaller host.
+inline size_t host_headroom(size_t total) {
+#if defined(HOST_BUDGET_MUTANT_OLD_RESERVE)
+    return std::max<size_t>(8ull << 30, total / 32);
+#else
+    return std::max(total / 32, std::min(k_host_p3_floor, total / 4));
+#endif
+}
 
 enum class host_budget_status : uint8_t {
     OK                 = 0,
@@ -43,8 +54,8 @@ inline const char * host_budget_status_name(host_budget_status status) {
     return "unknown";
 }
 
-// The budget's inputs: one sample's MemTotal and MemAvailable, the host-budget percentage, and an accepted
-// GGML_SYCL_HOST_RESERVE_MB in bytes.
+// The budget's inputs: one sample's MemTotal and MemAvailable, the host-budget percentage, the pinned share and the
+// bytes already charged (both 0 for the pinned pool's own cap), and an accepted GGML_SYCL_HOST_RESERVE_MB in bytes.
 struct host_budget_inputs {
     size_t total_bytes     = 0;
     size_t available_bytes = 0;
@@ -60,34 +71,58 @@ struct host_budget_result {
     size_t             computed       = 0;      // the formula's value, before the override
     size_t             headroom       = 0;      // the memory the budget leaves the host
     host_budget_status status         = host_budget_status::OK;
-    bool               override_binds = false;  // the override is the budget
+    bool               override_binds = false;  // the override is the smaller term, so it is the budget
 };
 
-// The [HOST-ARENA] formula as the pinned pool's constructor computes it: min(total x pct, MemAvailable - max(8 GiB,
-// total/32)), with the cap MemAvailable/2 when MemAvailable is at or below that reserve; an accepted override is the
-// whole budget.
+namespace detail {
+inline size_t host_budget_sat_sub(size_t a, size_t b) {
+    return a > b ? a - b : 0;
+}
+
+inline size_t host_budget_sat_add(size_t a, size_t b) {
+    return a > SIZE_MAX - b ? SIZE_MAX : a + b;
+}
+}  // namespace detail
+
+// The one host budget (§4.5): min(total x pct - pinned, committed + MemAvailable - host_headroom(total)) while
+// MemAvailable exceeds the headroom, and the refusal host-headroom-exhausted otherwise, which grants nothing past
+// `committed`. It never rises when MemAvailable falls. An unknown MemTotal keeps the reserve min(8 GiB,
+// MemAvailable/4) against MemAvailable itself; nothing read leaves it uncapped. The override is a cap: the budget is
+// min(override, formula), so it can lower the budget and never raise it, and the refusal stands either way.
 inline host_budget_result host_budget_compute(const host_budget_inputs & in) {
     host_budget_result r;
-    size_t             budget = 0;
-    if (in.total_bytes > 0) {
-        const int pct = std::min(std::max(in.budget_pct, 1), 100);
-        budget        = static_cast<size_t>(static_cast<double>(in.total_bytes) * (static_cast<double>(pct) / 100.0));
-        r.headroom    = std::max<size_t>(8ull << 30, in.total_bytes / 32);
-    } else if (in.available_bytes > 0) {
-        budget     = in.available_bytes;
-        r.headroom = std::min<size_t>(8ull << 30, in.available_bytes / 4);
+    if (in.total_bytes == 0 && in.available_bytes == 0) {
+        r.status   = host_budget_status::DETECTION_FAILED;
+        r.computed = k_host_budget_uncapped;
     } else {
-        budget   = k_host_budget_uncapped;
-        r.status = host_budget_status::DETECTION_FAILED;
+        size_t pct_cap = 0;
+        if (in.total_bytes > 0) {
+            const size_t pct = static_cast<size_t>(std::min(std::max(in.budget_pct, 1), 100));
+            pct_cap          = in.total_bytes / 100 * pct + in.total_bytes % 100 * pct / 100;
+            r.headroom       = host_headroom(in.total_bytes);
+        } else {
+            pct_cap    = in.available_bytes;
+            r.headroom = std::min<size_t>(8ull << 30, in.available_bytes / 4);
+        }
+        size_t headroom_free = detail::host_budget_sat_sub(in.available_bytes, r.headroom);
+        if (in.available_bytes <= r.headroom) {
+#if defined(HOST_BUDGET_MUTANT_CLIFF)
+            headroom_free = in.available_bytes / 2;
+#else
+            r.status = host_budget_status::HEADROOM_EXHAUSTED;
+#endif
+        }
+        const size_t share_term = detail::host_budget_sat_sub(pct_cap, in.pinned_bytes);
+        const size_t sample_term =
+            std::min(k_host_budget_uncapped, detail::host_budget_sat_add(in.committed_bytes, headroom_free));
+        r.computed = std::min(share_term, sample_term);
     }
-    if (in.available_bytes > 0 && r.headroom > 0) {
-        const size_t available_cap =
-            in.available_bytes > r.headroom ? in.available_bytes - r.headroom : in.available_bytes / 2;
-        budget = std::min(budget, available_cap);
-    }
-    r.computed = budget;
-    r.budget   = budget;
+    r.budget = r.computed;
+#if defined(HOST_BUDGET_MUTANT_OVERRIDE_REPLACES)
     if (in.override_set) {
+#else
+    if (in.override_set && in.override_bytes < r.computed) {
+#endif
         r.budget         = in.override_bytes;
         r.override_binds = true;
     }
