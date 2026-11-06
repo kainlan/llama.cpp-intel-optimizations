@@ -16,6 +16,7 @@
 #include "../ggml/src/ggml-sycl/lazy-row-cache.hpp"
 #include "../ggml/src/ggml-sycl/tests/host-ledger-test-harness.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -338,7 +339,8 @@ arm_result arm_same_context_rekey() {
 }
 
 // A join from another context leaves the owner's entry alone and adds a second entry at the joiner's key: block 97,
-// near the end of context 1's hundred-read backlog, dispatches at context 2's turn, pick 5, and is dispatched once.
+// near the end of context 1's hundred-read backlog, dispatches at context 2's turn, pick 5, and is dispatched once, so
+// the 104 requests dispatch the 103 blocks they name, each once.
 // Mutants: LAZY_IO_QUEUE_MUTANT_NO_SECOND_ENTRY (the join only adds a waiter, so 97 waits for context 1's backlog);
 // LAZY_IO_QUEUE_MUTANT_CROSS_CONTEXT_REKEY (the join re-keys context 1's entry by context 2's epoch, comparing two
 // contexts' counters).
@@ -359,7 +361,12 @@ arm_result arm_cross_context_join() {
     expect(r, p == 5 && context == 2,
            "block 97 dispatched at pick " + pos_text(p) + " from context " + num(context) +
                ", want pick 5 from context 2");
-    expect(r, got.size() == 104, "dispatched " + num(got.size()) + " reads, want each of the 104 blocks once");
+    std::vector<uint64_t> sorted = got;
+    std::sort(sorted.begin(), sorted.end());
+    const std::vector<uint64_t> blocks = cat(range(0, 99), range(200, 202));
+    expect(r, sorted == blocks,
+           "dispatched " + num(got.size()) + " reads, block 97 " + num(std::count(got.begin(), got.end(), 97)) +
+               " times, want each of the 103 blocks once");
     return r;
 }
 
