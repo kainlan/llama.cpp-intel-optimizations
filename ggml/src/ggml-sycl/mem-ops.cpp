@@ -1050,6 +1050,11 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
     resolved_ptr s = src.resolve();
     require_resolved_range("mem_copy", "destination", d, dst_offset, size);
     require_resolved_range("mem_copy", "source", s, src_offset, size);
+    // A host source copied to a device: noted when the source is file-mapped (docs/design/sycl-mmap-host-tier.md §5.3
+    // "Gates"). mem_copy, mem_copy_async and unified_cache::copy_to_device_async all arrive here, once per copy.
+    if (d.on_device && !s.on_device) {
+        unified_cache_file_mapped_device_copy_note(static_cast<const char *>(s.ptr) + src_offset);
+    }
 
     const int dst_device = d.on_device ? dst.device() : mem_handle::HOST_DEVICE;
     const int src_device = s.on_device ? src.device() : mem_handle::HOST_DEVICE;
@@ -1335,6 +1340,11 @@ sycl::event mem_copy_ptr_async(void *                           dst,
                                size_t                           size,
                                sycl::queue &                    queue,
                                const std::vector<sycl::event> & deps) {
+    // The pointer chokepoint of the outside-materialization counter (§5.3 "Gates"): a copy to a registered device
+    // allocation is noted, and the note asks whether its source is file-mapped.
+    if (alloc_registry::instance().is_device(dst)) {
+        unified_cache_file_mapped_device_copy_note(src);
+    }
     if (deps.empty()) {
         return queue.memcpy(dst, src, size);
     }

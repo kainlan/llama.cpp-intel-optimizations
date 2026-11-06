@@ -8879,6 +8879,8 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
                                                        const void *         fill_ctx,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle) {
+    file_mapped_materialization_scope materialization_copies;  // its copies are the materialization (§5.3)
+
     auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
     if (load_effect_guard.failed()) {
@@ -9192,6 +9194,8 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                        sycl::queue *        queue,
                                                        mem_handle *         out_handle,
                                                        const std::vector<sycl::event> & deps) {
+    file_mapped_materialization_scope materialization_copies;  // its copies are the materialization (§5.3)
+
     auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
     if (load_effect_guard.failed()) {
@@ -9633,6 +9637,8 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
                                                               const void *                            fill_ctx,
                                                               sycl::queue *                           queue,
                                                               std::vector<mem_handle> *               out_handles) {
+    file_mapped_materialization_scope materialization_copies;  // its copies are the materialization (§5.3)
+
     auto                load_effect_guard = acquire_bound_load_effect();
     direct_stage_result result{};
     if (load_effect_guard.failed()) {
@@ -12427,6 +12433,8 @@ bool unified_cache::stage_expert_group(int                          block_id,
                                        const cache_layout_request * gate_req,
                                        const cache_layout_request * up_req,
                                        const cache_layout_request * down_req) {
+    file_mapped_materialization_scope materialization_copies;  // its copies are the materialization (§5.3)
+
     // Collect the tensors that need staging (skip unregistered roles)
     struct slot_info {
         const ggml_sycl_cache_id *   key;
@@ -17760,6 +17768,10 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
         result.refused_file_mapped = true;
         g_stream_dma_file_mapped_refusals.fetch_add(1, std::memory_order_relaxed);
         return result;
+    }
+    // A custom copy_fn copies outside mem-ops, so it is noted here; the default copy is noted in mem_copy_submit.
+    if (copy_fn != nullptr) {
+        unified_cache_file_mapped_device_copy_note(src.ptr);
     }
 
     size_t bytes = src.size;

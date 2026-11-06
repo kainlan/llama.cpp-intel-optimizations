@@ -12816,6 +12816,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
     ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
+    // Once at model unload (§5.3 "Where the lead reads both counters").
+    ggml_sycl::unified_cache_file_mapped_counters_log();
     const auto                            owner = ggml_sycl_cpp_token(token);
     ggml_sycl::lifecycle::teardown_ticket ticket;
     ggml_sycl::lifecycle::Registry *      registry = nullptr;
@@ -13717,6 +13719,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
         ggml_sycl::lifecycle_stage_no_placement_plan(result.txn.value);
         ggml_sycl_model_loading_effects(true, true);
         registry->bind_candidate(result.txn);
+        // The load's span opens: its copies of mapped bytes are the load's (docs/design/sycl-mmap-host-tier.md §5.3).
+        ggml_sycl::unified_cache_file_mapped_load_enter();
         return GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
         g_sycl_in_model_load.store(false, std::memory_order_release);
@@ -14100,6 +14104,18 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             return ggml_sycl_load_end_replay_result(ticket, model);
         }
 
+        // This call finishes the outer load that load_begin opened, so the load's span closes on every return and
+        // throw from here (§5.3 "Gates").
+        struct file_mapped_load_span_close {
+            bool armed;
+
+            ~file_mapped_load_span_close() {
+                if (armed) {
+                    ggml_sycl::unified_cache_file_mapped_load_leave();
+                }
+            }
+        } file_mapped_load_span{ ticket.outer };
+
         // This call finishes the load: when it ends normally from here, the load's early terms are done and the
         // guard clears them after the registry ended the transaction.  The handler clears them after its own end
         // call instead (ggml_sycl_load_ledger_clear_after_end), and so does the recovery arm.
@@ -14114,6 +14130,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         g_sycl_abort_load_exit = !ticket.commit;
         ggml_sycl_model_loading_effects(false, ticket.outer);
         g_sycl_abort_load_exit = false;
+        // Once per load, after the preload, so a run killed later in the load still has the line (§5.3).
+        if (ticket.outer) {
+            ggml_sycl::unified_cache_file_mapped_counters_log();
+        }
         finisher_effect        = {};
         if (!ticket.commit) {
             const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token, "load_end/not-committed");
