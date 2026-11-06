@@ -622,9 +622,18 @@ def read_sources(root: Path) -> dict:
     return sources
 
 
+class AnchorMissed(Exception):
+    """A mutant's pattern matched nothing, so the mutant would score the unmodified code."""
+
+
 def sub(pattern: str, repl: str, count: int = 1):
+    # A pattern that matches nothing must not pass silently: inside then(), one missed step leaves the other steps to
+    # build a mutant that is not the fault it names, and that mutant can pass the pins.
     def f(text: str) -> str:
-        return re.sub(pattern, repl, text, count=count)
+        out, n = re.subn(pattern, repl, text, count=count)
+        if n == 0:
+            raise AnchorMissed(pattern)
+        return out
 
     return f
 
@@ -725,16 +734,14 @@ def mutants():
          sub(r"\n\s*ggml_sycl::unified_cache_host_zone_owner_check\(ggml_sycl::alloc_lifetime::CONTEXT,\s*"
              r"\{ ggml_sycl::alloc_owner_kind::BACKEND, freed_owner_id \}\);", "")),
         ("O4", SYCL, "the BACKEND check runs before the context is deleted",
-         then(sub(r"(\n    const uint64_t freed_owner_id = sycl_ctx \? sycl_ctx->host_zone_owner_id : 0;)"
-                  r"\n    delete sycl_ctx;", r"\1"),
+         then(sub(r"\n    delete sycl_ctx;", ""),
               sub(r"(\n    if \(freed_device >= 0 && freed_device < GGML_SYCL_MAX_DEVICES\) \{)",
                   r"\n    delete sycl_ctx;\1"))),
         ("O5", SYCL, "the DEVICE check is gone",
          sub(r"\n\s*ggml_sycl::unified_cache_host_zone_owner_check\(\s*ggml_sycl::alloc_lifetime::DEVICE,\s*"
              r"\{[^}]*\}\);", "")),
         ("O5", SYCL, "the DEVICE check runs before the context is deleted",
-         then(sub(r"(\n    const uint64_t freed_owner_id = sycl_ctx \? sycl_ctx->host_zone_owner_id : 0;)"
-                  r"\n    delete sycl_ctx;", r"\1"),
+         then(sub(r"\n    delete sycl_ctx;", ""),
               sub(r"(\n    delete backend;\n    g_sycl_backend_refcount\.fetch_sub)", r"\n    delete sycl_ctx;\1"))),
         ("O5", SYCL, "the DEVICE check runs at every backend's free",
          sub(r"if \(ggml_sycl::host_zone_device_check_due\(static_cast<int>\(live_on_device\)\)\) \{",
@@ -784,7 +791,12 @@ def self_test(root: Path) -> int:
         for pin, key, name, mutate in mutants():
             rel_mutated = FILES.get(key, key)
             original = every[rel_mutated]
-            mutated = mutate(original)
+            try:
+                mutated = mutate(original)
+            except AnchorMissed as missed:
+                failures.append(f"mutant '{name}' did not apply")
+                print(f"  self-test: mutant '{name}' did not apply: {missed} matched nothing")
+                continue
             if mutated == original:
                 failures.append(f"mutant '{name}' did not apply")
                 print(f"  self-test: mutant '{name}' did not apply")

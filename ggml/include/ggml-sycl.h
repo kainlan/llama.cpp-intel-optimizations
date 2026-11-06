@@ -919,15 +919,34 @@ GGML_BACKEND_API bool ggml_backend_sycl_notify_host_buffer_sizes(ggml_backend_t 
 // the reserve graphs. begin clears the pending plan of every SYCL backend in sched; plan walks
 // one graph while sched's split is live (after ggml_backend_sched_reserve_size, before the next
 // reserve) and merges its figures into the pending plans as a maximum; commit makes backend's
-// pending plan its committed one, which re-sizes the slots and the pools of its device. The
-// SYCL side keeps neither sched nor graph past the call. Look each up by name through the
-// registry's proc address.
+// pending plan its committed one, which re-sizes the slots and the pools of its device. It also
+// marks backend's SCRATCH demand: the next notify through backend carries the allocated size,
+// and its demand line prints the measured and allocated figures. The SYCL side keeps neither
+// sched nor graph past the call. Look each up by name through the registry's proc address.
 // Proc name: "ggml_backend_sycl_begin_host_holders".
 GGML_BACKEND_API void ggml_backend_sycl_begin_host_holders(ggml_backend_sched_t sched);
 // Proc name: "ggml_backend_sycl_plan_host_holders".
 GGML_BACKEND_API bool ggml_backend_sycl_plan_host_holders(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 // Proc name: "ggml_backend_sycl_commit_host_holders".
 GGML_BACKEND_API bool ggml_backend_sycl_commit_host_holders(ggml_backend_t backend);
+
+// The host SCRATCH transaction of one llama_context (§4.4, §M75), made on the backend the notify is made through.
+// While a transaction is open, every chunk the host SCRATCH zone grows for it is recorded in it. OPEN opens the
+// auto-n_ubatch trial's transaction; MARK opens the reserve's own one when none is open and records its chunk count;
+// RETURN_TO_MARK returns the chunks grown since the mark and keeps the transaction open; KEEP closes it, its chunks
+// becoming ordinary capacity; RETURN closes it, drops the context's demand and returns its chunks, each released at
+// once when empty and otherwise at the context's next begin or its end. `n_ubatch` is recorded by the OPEN, or by the
+// MARK that opens the transaction, and the kept|returned witness prints that recorded value; the value passed with
+// KEEP, RETURN or RETURN_TO_MARK is ignored. Returns false for a non-SYCL backend or an unknown op. `op` is a plain
+// int, and every argument a scalar, so no enum or struct crosses the dlopen boundary; look it up by name through the
+// registry's proc address.
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_OPEN           0
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_KEEP           1
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN         2
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_MARK           3
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN_TO_MARK 4
+// Proc name: "ggml_backend_sycl_host_scratch_trial".
+GGML_BACKEND_API bool ggml_backend_sycl_host_scratch_trial(ggml_backend_t backend, int op, uint32_t n_ubatch);
 
 // Get cache hit/miss statistics (stub — returns zeros).
 // hits/misses may be NULL if caller doesn't need that stat.

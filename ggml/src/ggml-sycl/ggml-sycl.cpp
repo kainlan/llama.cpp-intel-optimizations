@@ -364,6 +364,7 @@ static void pp_scratch_profile_end() {
 #include "ggml-sycl/moe-xmx-fused.hpp"
 #include "ggml-sycl/moe-xmx.hpp"
 #include "ggml-sycl/quantized-comm.hpp"
+#include "ggml-sycl/scratch-test-mutant.hpp"
 #include "ggml-sycl/sycl-profiling.hpp"
 #include "ggml-sycl/tensor-types.hpp"
 #include "ggml-sycl/tiered-plan-clear.hpp"
@@ -9454,8 +9455,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // by default, get_cpu_expert_thread_count(), or N via GGML_SYCL_CPU_EXPERT_THREADS=N). The pools' figures come
     // from the device's committed host holder plan, never from this graph, which is only checked against them over the
     // nodes the plan folds (§4.4 "And the pools are sized from the plan"). Their SCRATCH demand is registered by the
-    // plan's commit, not here. With no committed plan, the pre-notify fallback sizes them from this graph's storage
-    // scan, with a once-only WARN.
+    // plan's commit, not here. With no committed plan they are not initialized, with a once-only WARN.
     {
         const ggml_sycl::host_pool_init_decision pools =
             ggml_sycl::host_pools_init_from_plan(device, g_host_holder_plans->device_state(device), cgraph,
@@ -9482,8 +9482,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             GGML_LOG_INFO("[MOE-MULTI-GPU] Initializing device %d for MoE expert dispatch\n", gpu_d);
 
             try {
-                // The primary's rule: the device's committed plan when it has one, this graph's scan only under the
-                // pre-notify fallback.
+                // The primary's rule: the device's committed plan, and no pools without one.
                 const ggml_sycl::host_pool_init_decision pools_d = ggml_sycl::host_pools_init_from_plan(
                     gpu_d, g_host_holder_plans->device_state(gpu_d), cgraph, ggml_sycl_host_holder_host_experts,
                     g_host_pool_init_warnings[gpu_d]);
@@ -96186,8 +96185,8 @@ static std::mutex        g_attn_host_cpu_backend_mutex;
 // every subsequent resolve takes the slow revalidation path (measured: resolve at 73 us/op vs 21 us/op, ~+24 ms/token
 // across a 1374-node decode graph). The slots are sized by the host holder plan (docs/design/sycl-mmap-host-tier.md
 // §4.4 "At dispatch no slot grows"): the plan's commit re-sizes them in sched_reserve, and a dispatch is admitted at or
-// below a slot's capacity and refused by name above it. Until a plan is committed for the device, the slots grow at
-// dispatch as before the plan existed (the pre-notify fallback, with a once-per-device WARN). Only the graph-walker
+// below a slot's capacity and refused by name above it. Until a plan is committed for the device, every request is
+// refused by name over a planned 0 B: no slot grows at dispatch. Only the graph-walker
 // thread for a device touches the slot structs at dispatch, and the commit runs after sched_reserve's synchronize
 // (same-device concurrent inference is unsupported, canonical contract §5), so the slots take no lock. The ASYNC FA
 // body also uses the slots and hands dst_ptr to a pool worker thread, so slot-CONTENT reuse safety is NOT "both
@@ -96463,18 +96462,24 @@ static bool ggml_sycl_notify_ledger_of(int                                device
                                                         ops);
 }
 
+// The one view the notify and the commit's mark take of a backend's host SCRATCH: the host buft's device, the
+// context's key and device, and that device's ledger.
+static ggml_sycl::host_scratch_notify_env ggml_sycl_notify_env() {
+    ggml_sycl::host_scratch_notify_env env;
+    env.is_sycl          = ggml_backend_is_sycl;
+    env.host_buft_device = ggml_sycl_notify_host_buft_device;
+    env.context_of       = ggml_sycl_notify_context_of;
+    env.ledger_of        = ggml_sycl_notify_ledger_of;
+    return env;
+}
+
 bool ggml_backend_sycl_notify_host_buffer_sizes(ggml_backend_t backend,
                                                 size_t         host_compute_bytes,
                                                 size_t         host_output_bytes) {
     // host_scratch_notify tests ggml_backend_is_sycl(backend) before any callback reads backend->context, and refuses
     // a non-SYCL backend with a WARN. The zone's device is the host buft's, never the notifying backend's own, and the
     // growth is the ledger's ensure-capacity call on that device.
-    ggml_sycl::host_scratch_notify_env env;
-    env.is_sycl          = ggml_backend_is_sycl;
-    env.host_buft_device = ggml_sycl_notify_host_buft_device;
-    env.context_of       = ggml_sycl_notify_context_of;
-    env.ledger_of        = ggml_sycl_notify_ledger_of;
-    return ggml_sycl::host_scratch_notify(env, backend, host_compute_bytes, host_output_bytes);
+    return ggml_sycl::host_scratch_notify(ggml_sycl_notify_env(), backend, host_compute_bytes, host_output_bytes);
 }
 
 // The plan walk's view of the backend. The staging slots are planned on the dispatching backend's own device, the one
@@ -96549,6 +96554,9 @@ bool ggml_backend_sycl_commit_host_holders(ggml_backend_t backend) {
         GGML_LOG_WARN("[ATTN-HOST] host holder commit refused: not a SYCL backend\n");
         return false;
     }
+    // The commit marks this context's SCRATCH demand on the ledger the notify records it on, so llama_context's
+    // re-notify with the allocated size prints both figures (§4.4 "The same fact for the notify's measure").
+    (void) ggml_sycl::host_scratch_mark_committed(ggml_sycl_notify_env(), backend);
     int device   = -1;
     int previous = -1;
     if (!g_host_holder_plans->commit(ggml_sycl_host_holder_backend_key(backend), &device, &previous)) {
@@ -96563,6 +96571,30 @@ bool ggml_backend_sycl_commit_host_holders(ggml_backend_t backend) {
         ok = ggml_sycl_host_holders_apply(previous) && ok;
     }
     return ok;
+}
+
+static_assert(GGML_SYCL_HOST_SCRATCH_TRIAL_OPEN == (int) ggml_sycl::host_scratch_trial_op::OPEN &&
+                  GGML_SYCL_HOST_SCRATCH_TRIAL_KEEP == (int) ggml_sycl::host_scratch_trial_op::KEEP &&
+                  GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN == (int) ggml_sycl::host_scratch_trial_op::RETURN &&
+                  GGML_SYCL_HOST_SCRATCH_TRIAL_MARK == (int) ggml_sycl::host_scratch_trial_op::MARK &&
+                  GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN_TO_MARK == (int) ggml_sycl::host_scratch_trial_op::RETURN_TO_MARK,
+              "the proc-table entry's int op values are the cache's transaction steps");
+
+bool ggml_backend_sycl_host_scratch_trial(ggml_backend_t backend, int op, uint32_t n_ubatch) {
+    if (!backend || !ggml_backend_is_sycl(backend)) {
+        GGML_LOG_WARN("[HOST-ARENA] SCRATCH trial refused: not a SYCL backend\n");
+        return false;
+    }
+    if (op < GGML_SYCL_HOST_SCRATCH_TRIAL_OPEN || op > GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN_TO_MARK) {
+        GGML_LOG_WARN("[HOST-ARENA] SCRATCH trial refused: unknown op %d\n", op);
+        return false;
+    }
+    // The transaction lives on the device whose SCRATCH zone the notify grows, the host buft's, keyed like the
+    // notify's demand by the backend context.
+    (void) ggml_sycl::unified_cache_host_scratch_trial(ggml_sycl_notify_host_buft_device(backend),
+                                                       static_cast<ggml_sycl::host_scratch_trial_op>(op),
+                                                       ggml_sycl_host_holder_backend_key(backend), n_ubatch);
+    return true;
 }
 
 // Process-lifetime CPU backend instance shared by every device's demoted
@@ -98739,6 +98771,22 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     }
     const int      freed_device   = sycl_ctx ? sycl_ctx->device : -1;
     const uint64_t freed_owner_id = sycl_ctx ? sycl_ctx->host_zone_owner_id : 0;
+
+    // The owner's end, before the context is deleted (§4.4 "Every withdrawn chunk has an owner and a bounded
+    // release"): an open transaction is returned, empty marked chunks are released and the rest are orphaned. It runs
+    // on the host buft's device, where the context's notify grew SCRATCH and its transaction filed the chunks.
+    const int owner_end_device = ggml_sycl_notify_host_buft_device(backend);
+    bool      owner_end        = freed_owner_id != 0;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    using ggml_sycl::scratch_test_mutant;
+    using ggml_sycl::scratch_test_mutant_on;
+    if (scratch_test_mutant_on(scratch_test_mutant::OWNER_END_REMOVED)) {
+        owner_end = false;
+    }
+#endif
+    if (owner_end) {
+        (void) ggml_sycl::unified_cache_host_scratch_owner_end(owner_end_device, freed_owner_id);
+    }
     delete sycl_ctx;
     // The backend-member check (§4.4 "Lifetimes", §M57 (b)): after the context's destructor has released its members,
     // no CONTEXT record of this backend may remain. Then the context's notified SCRATCH demand and its host holder plan
@@ -127304,6 +127352,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_commit_host_holders") == 0) {
         return (void *) ggml_backend_sycl_commit_host_holders;
+    }
+    if (strcmp(name, "ggml_backend_sycl_host_scratch_trial") == 0) {
+        return (void *) ggml_backend_sycl_host_scratch_trial;
     }
     if (strcmp(name, "ggml_backend_sycl_cpu_offload_compute_buffer_type") == 0) {
         return (void *) ggml_backend_sycl_cpu_offload_compute_buffer_type;

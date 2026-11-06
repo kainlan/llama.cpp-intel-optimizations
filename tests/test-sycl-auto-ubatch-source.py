@@ -761,6 +761,7 @@ def test_host_fallback_query_has_a_mutation_witness():
     fallback_block = (
         "        for (auto & sb : sycl_backends) {\n"
         "            if (fallback_fn(sb.dev_index) > 0) {\n"
+        "                sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, c);\n"
         "                cparams.pipeline_parallel = pipeline_parallel_before_reserve;\n"
         "                sched_matches_last_good   = false;\n"
         '                return "compute buffer fell back to host";\n'
@@ -789,6 +790,8 @@ def test_host_fallback_query_has_a_mutation_witness():
 _IN_LOOP_RESERVE_WRAP_RE = (
     r"try\s*\{\s*sched_reserve\s*\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*&\s*e\s*\)\s*\{\s*"
     r"LLAMA_LOG_INFO\s*\([^;]*\be\.what\s*\(\s*\)\s*\)\s*;\s*"
+    r"sycl_host_hooks\.host_scratch_trial\s*\(\s*sycl_dev0\s*,\s*GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN\s*,\s*c\s*\)"
+    r"\s*;\s*"
     r"cparams\.pipeline_parallel\s*=\s*pipeline_parallel_before_reserve\s*;\s*sched_matches_last_good\s*=\s*"
     r'false\s*;\s*rung_fit_refused\s*=\s*dynamic_cast\s*<\s*const\s+llama_auto_ubatch_fit_refusal\s*\*\s*>\s*\(\s*&\s*e\s*\)\s*!=\s*nullptr\s*;'
     r'\s*return\s*"compute buffers did not fit"\s*;\s*\}'
@@ -956,6 +959,7 @@ def test_pipeline_parallel_restore_has_a_mutation_witness():
     fallback_block = (
         "        for (auto & sb : sycl_backends) {\n"
         "            if (fallback_fn(sb.dev_index) > 0) {\n"
+        "                sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, c);\n"
         "                cparams.pipeline_parallel = pipeline_parallel_before_reserve;\n"
         "                sched_matches_last_good   = false;\n"
         '                return "compute buffer fell back to host";\n'
@@ -967,6 +971,7 @@ def test_pipeline_parallel_restore_has_a_mutation_witness():
         fallback_block,
         "        for (auto & sb : sycl_backends) {\n"
         "            if (fallback_fn(sb.dev_index) > 0) {\n"
+        "                sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, c);\n"
         "                sched_matches_last_good   = false;\n"
         '                return "compute buffer fell back to host";\n'
         "            }\n"

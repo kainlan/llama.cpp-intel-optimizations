@@ -8,6 +8,8 @@ wording, and the 100-character cut. The text helpers the three MoE source-contra
 (comment stripping, whitespace canonicalisation, idempotence), read (text, or empty for a missing file), ROOT (the repo
 root beside tests/), body (brace balancing, string literals, a signature ending in "{", an empty result), ordered (each
 needle after the one before) and mutate (one replacement on normalised text, and a missing old text is refused).
+The CMake reader the SCRATCH return pins share is pinned once, here: a quoted argument splits at each unescaped ';' the
+way ${ARGN} re-expands it, so a semicolon in an expected text leaves the MUTANTS list without whole triples.
 """
 import subprocess
 import sys
@@ -15,7 +17,7 @@ import textwrap
 from pathlib import Path
 
 import sycl_gate
-from sycl_gate import body, first_missing, first_present, mutate, norm, ordered, read
+from sycl_gate import arms_of, body, cmake_args, first_missing, first_present, mutate, norm, ordered, read, registration
 
 TESTS = Path(__file__).resolve().parent
 
@@ -287,6 +289,23 @@ def test_mutate_replaces_once_on_normalised_text_and_demands_the_old_text() -> N
         assert "mutant precondition" in str(error)
     else:
         raise AssertionError("mutate accepted a missing old text")
+
+
+def test_cmake_args_splits_a_quoted_argument_at_each_unescaped_semicolon() -> None:
+    """The function that registers the SCRATCH return's device REDs re-expands its arguments as ${ARGN}, which splits a
+    quoted argument at each unescaped ';'. One semicolon in an expected text then adds a list element and shifts every
+    later triple, which once broke the configure step. The reader must split there too, so arms_of refuses the list;
+    an escaped semicolon is not a separator."""
+    whole = 'reg(stem TIMEOUT 60 MUTANTS\n    a x "one, two"\n    b y "three\\; four")\n'
+    args = cmake_args(whole, whole.index("("))
+    assert args == ["stem", "TIMEOUT", "60", "MUTANTS", "a", "x", "one, two", "b", "y", "three\\; four"], args
+    at, parsed = registration(whole, "reg", "stem")
+    assert at == 0 and parsed["TIMEOUT"] == ["60"]
+    assert arms_of(parsed) == {"a": ("x", "one, two"), "b": ("y", "three\\; four")}
+
+    split = whole.replace('"one, two"', '"one; two"')
+    assert cmake_args(split, split.index("("))[6:8] == ["one", " two"]
+    assert arms_of(registration(split, "reg", "stem")[1]) is None
 
 
 if __name__ == "__main__":
