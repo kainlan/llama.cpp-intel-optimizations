@@ -1091,7 +1091,7 @@ The 2026-11-01 run of the same probes on the same layout (`c-t65d`) gave
 7389 IOPS at QD1, 61492 at QD16, 69507 at QD64, 68884 rows/s for the batch of
 7100, and a batch-16 `T_ticket` of mean 0.41 ms, p99 0.65 ms. The differences
 from the table are run-to-run noise under host load, and the table keeps the
-2026-11-06 run. The batch of 7100 reaches 68887 rows/s against the 69706 IOPS
+2026-11-06 run. The §5.1 NVMe columns are the same `c-y57k` figures. The batch of 7100 reaches 68887 rows/s against the 69706 IOPS
 QD64 control, a ratio of 0.99.
 
 `/models` was bcachefs with three members (sysfs
@@ -3484,9 +3484,8 @@ Both engines were measured over the table's byte range (Appendix A.2):
 | fio `O_DIRECT` `io_uring` 4 KiB | QD64 | 9124, p50 5.7 ms, p99 25 ms | 69706, p50 897 us, p99 1597 us |
 | pread pool, `O_DIRECT` 4/8 KiB | 64 workers | 8344, (batch of 7100: 0.85 s) | 68887, (batch of 7100: 103.07 ms) |
 
-The mmap page-fault probe was not rerun on the NVMe layout (`c-t65d`), so its
-rows keep their 2026-09-26 figures. The NVMe columns are `c-y57k`, and the
-2026-11-01 run on the same layout (`c-t65d`) agrees within noise.
+The mmap page-fault probe was not rerun on the NVMe layout, so its rows keep
+their 2026-09-26 figures.
 
 **The device ceiling is the same for every engine.** On the old bcachefs
 layout the bottleneck was the 256 KiB extent bounce onto USB links, not the
