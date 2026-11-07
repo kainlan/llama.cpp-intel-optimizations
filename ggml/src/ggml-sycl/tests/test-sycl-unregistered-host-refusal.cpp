@@ -217,7 +217,7 @@ int run_interior(checks & c) {
     }
     // The request a host-planned expert's buffer makes (test-mem-ops.cpp, the host expert lease copy).
     alloc_request req{};
-    req.device                              = ggml_sycl_get_device_id_from_queue(cache->get_queue());
+    req.device                              = 0;  // the cache under test is device 0's
     req.size                                = bytes;
     req.intent.role                         = alloc_role::WEIGHT;
     req.intent.constraints.must_host_pinned = true;
