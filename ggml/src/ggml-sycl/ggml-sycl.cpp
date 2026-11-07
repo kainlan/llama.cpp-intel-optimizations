@@ -14114,6 +14114,27 @@ struct ggml_sycl_file_mapped_load_span_close {
 };
 }  // namespace
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// SNAPSHOT_CARRIES_LEASE: the published snapshot owns a lease on the IO pool. An aliasing shared_ptr whose control
+// block holds a lease beside the snapshot, so the lease lives while any reader holds a copy and drops wherever the last
+// copy goes, the publication swap under g_tensor_inventory_mutex included. The lease is a take's, not a join's: a
+// model's ensure makes its ring after its load ends and a join refuses a pool with no ring, so at the load's end only a
+// take finds the live pool the stage's plan record holds.
+static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_snapshot_carrying_lease(
+    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot) {
+    struct carrier {
+        std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;
+        ggml_sycl::ring_lease                                     lease;
+    };
+
+    auto held                                       = std::make_shared<carrier>();
+    held->snapshot                                  = std::move(snapshot);
+    held->lease                                     = ggml_sycl::lazy_io_pool_take();
+    const ggml_sycl::lifecycle_plan_snapshot * view = held->snapshot.get();
+    return std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot>(std::move(held), view);
+}
+#endif
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn      txn,
                                                             bool                    explicit_success,
                                                             ggml_sycl_model_token * model) {
@@ -14200,6 +14221,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             throw std::bad_alloc();
         }
         placement_inserted = true;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        if (ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::SNAPSHOT_CARRIES_LEASE)) {
+            plan_snapshot = ggml_sycl_snapshot_carrying_lease(std::move(plan_snapshot));
+        }
+#endif
         // Materialization binds backend-context queues, and no backend context
         // exists during the first model load: llama_context -- and with it every
         // ggml_backend_sycl_context -- is created only after llama_model_load
