@@ -798,7 +798,7 @@ struct placement_kv_info {
     // The load transaction this plan is made for (g_sycl_plan_load_effect_txn at the stage), which the STORAGE decline
     // line names and which keys it, one line per table and load (§3.3, §10); 0 for a plan made outside a load, a dry
     // run's or a direct fixture's, which prints every decline.
-    uint64_t                               lazy_load_txn          = 0;
+    uint64_t                               lazy_load_txn           = 0;
 
     bool valid() const { return n_layer > 0 && n_embd_k_gqa > 0 && n_embd_v_gqa > 0 && n_ctx > 0; }
 
