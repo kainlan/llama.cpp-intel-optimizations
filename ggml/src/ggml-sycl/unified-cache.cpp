@@ -34506,12 +34506,15 @@ static void record_host_ledger_plan(placement_plan &          plan,
         plan.device_id, plan.host_budget, plan.host_planned_bytes, t.weight, t.kv, t.staging, t.scratch, t.runtime,
         t.rounding);
     if (plan.host_planned_bytes > plan.host_budget) {
+        // The headroom refusal names itself here as on every refused charge (design 5efe §4.5).
+        char reason[160];
+        host_ledger_refusal_reason(reason, sizeof(reason));
         GGML_LOG_WARN(
             "[HOST-LEDGER] device=%d would refuse: host-budget-exceeded host_budget=%zu "
             "host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu scratch=%zu runtime=%zu rounding=%zu (the "
-            "plan is kept: the ledger is WARN-only)\n",
+            "plan is kept: the ledger is WARN-only)%s\n",
             plan.device_id, plan.host_budget, plan.host_planned_bytes, t.weight, t.kv, t.staging, t.scratch, t.runtime,
-            t.rounding);
+            t.rounding, reason);
     }
 }
 
