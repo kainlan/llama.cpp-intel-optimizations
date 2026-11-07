@@ -1096,16 +1096,13 @@ static size_t host_ledger_deficit(size_t ask, size_t committed, size_t budget) {
 }
 
 // The refusal's name when the stored budget is the headroom refusal (design 5efe §4.5), with MemAvailable, MemTotal
-// and the headroom, for every refused charge to print; otherwise an empty string. Each figure is read for display.
-static void host_ledger_refusal_reason(char * buf, size_t size) {
-    buf[0] = '\0';
-    if (!g_host_ledger_headroom_exhausted.load(std::memory_order_acquire)) {
-        return;
-    }
-    std::snprintf(buf, size, " reason=host-headroom-exhausted MemAvailable=%zu MemTotal=%zu headroom=%zu",
-                  g_host_ledger_mem_available.load(std::memory_order_acquire),
-                  g_host_ledger_mem_total.load(std::memory_order_acquire),
-                  g_host_ledger_headroom.load(std::memory_order_acquire));
+// and the headroom of the stored sample, for every refused charge to print; otherwise an empty string. Each figure is
+// read for display.
+static std::string host_ledger_refusal_reason() {
+    return host_headroom_refusal_reason(g_host_ledger_headroom_exhausted.load(std::memory_order_acquire),
+                                        g_host_ledger_mem_available.load(std::memory_order_acquire),
+                                        g_host_ledger_mem_total.load(std::memory_order_acquire),
+                                        g_host_ledger_headroom.load(std::memory_order_acquire));
 }
 
 size_t host_ledger_budget() {
@@ -1122,6 +1119,18 @@ size_t host_ledger_mem_available() {
 
 bool host_ledger_budget_overridden() {
     return g_host_ledger_budget_overridden.load(std::memory_order_acquire);
+}
+
+bool host_ledger_headroom_exhausted() {
+    return g_host_ledger_headroom_exhausted.load(std::memory_order_acquire);
+}
+
+size_t host_ledger_mem_total() {
+    return g_host_ledger_mem_total.load(std::memory_order_acquire);
+}
+
+size_t host_ledger_headroom() {
+    return g_host_ledger_headroom.load(std::memory_order_acquire);
 }
 
 size_t host_ledger_yieldable_bytes() {
@@ -1317,15 +1326,14 @@ host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_reques
         }
     }
 
-    char reason[160];
-    host_ledger_refusal_reason(reason, sizeof(reason));
+    const std::string reason = host_ledger_refusal_reason();
     if (req.warn_only) {
         // Phase (a): the ledger logs what it would refuse and refuses nothing.
         GGML_LOG_WARN(
             "[HOST-LEDGER] would refuse: host-budget-exceeded ask=%zu committed=%zu budget=%zu deficit=%zu "
             "yieldable_bytes=%zu retries=%u (charged anyway: the ledger is WARN-only)%s\n",
             result.ask, result.committed, result.budget, result.deficit, result.yieldable_bytes, result.retries,
-            reason);
+            reason.c_str());
         size_t committed = g_host_ledger_committed.load(std::memory_order_acquire);
         do {
             (void) GGML_SYCL_HOST_LEDGER_HOOK(CHARGE_BEFORE_CAS, 1);
@@ -1339,7 +1347,8 @@ host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_reques
     GGML_LOG_WARN(
         "[HOST-LEDGER] host-budget-exceeded ask=%zu committed=%zu budget=%zu deficit=%zu yieldable_bytes=%zu "
         "retries=%u%s\n",
-        result.ask, result.committed, result.budget, result.deficit, result.yieldable_bytes, result.retries, reason);
+        result.ask, result.committed, result.budget, result.deficit, result.yieldable_bytes, result.retries,
+        reason.c_str());
     return result;
 }
 
@@ -34510,15 +34519,17 @@ static void record_host_ledger_plan(placement_plan &          plan,
         plan.device_id, plan.host_budget, plan.host_planned_bytes, t.weight, t.kv, t.staging, t.scratch, t.runtime,
         t.rounding);
     if (plan.host_planned_bytes > plan.host_budget) {
-        // The headroom refusal names itself here as on every refused charge (design 5efe §4.5).
-        char reason[160];
-        host_ledger_refusal_reason(reason, sizeof(reason));
+        // The headroom refusal names itself here as on every refused charge (design 5efe §4.5), from the sample this
+        // plan's budget came from: the planner input, which a dry run fills from its own sample and never stores.
+        const std::string reason =
+            host_headroom_refusal_reason(kv_info.host_headroom_exhausted, kv_info.host_mem_available_pre,
+                                         kv_info.host_mem_total, kv_info.host_headroom);
         GGML_LOG_WARN(
             "[HOST-LEDGER] device=%d would refuse: host-budget-exceeded host_budget=%zu "
             "host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu scratch=%zu runtime=%zu rounding=%zu (the "
             "plan is kept: the ledger is WARN-only)%s\n",
             plan.device_id, plan.host_budget, plan.host_planned_bytes, t.weight, t.kv, t.staging, t.scratch, t.runtime,
-            t.rounding, reason);
+            t.rounding, reason.c_str());
     }
 }
 

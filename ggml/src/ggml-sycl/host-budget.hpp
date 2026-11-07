@@ -129,6 +129,19 @@ inline host_budget_result host_budget_compute(const host_budget_inputs & in) {
     return r;
 }
 
+// The reason every refused or would-refuse line appends (§4.5): the refusal host-headroom-exhausted with the
+// MemAvailable, MemTotal and headroom of the sample its budget came from, or an empty string when that budget is not
+// the refusal.
+inline std::string host_headroom_refusal_reason(bool exhausted, size_t available, size_t total, size_t headroom) {
+    if (!exhausted) {
+        return std::string();
+    }
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), " reason=%s MemAvailable=%zu MemTotal=%zu headroom=%zu",
+                  host_budget_status_name(host_budget_status::HEADROOM_EXHAUSTED), available, total, headroom);
+    return buf;
+}
+
 // The resident working set (§4.5): resident_room = MemAvailable_pre - expected_host - host_headroom(MemTotal), and
 // mapped_ws, the host-executed mapped bytes the kernel may drop. exceeds is the WARN; a mapped overflow costs refaults,
 // not an OOM, so it warns and refuses nothing. A locked mapping (-lm mmap+mlock) is charged at full size and cannot be

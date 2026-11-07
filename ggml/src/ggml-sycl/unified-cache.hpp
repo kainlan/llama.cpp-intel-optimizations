@@ -789,6 +789,12 @@ struct placement_kv_info {
     // Whether the budget this plan is made against is GGML_SYCL_HOST_RESERVE_MB's override, from the same sample as
     // the budget (host_ledger_budget_overridden() for a load): the source the [HOST-PLAN] lazy line prints (§10).
     bool                                   host_budget_overridden = false;
+    // Whether the budget this plan is made against is the refusal host-headroom-exhausted, with the MemTotal and the
+    // headroom it compared, from the same sample as the budget (the stored values for a load, a dry run's own): the
+    // reason the plan's would-refuse line names (design 5efe §4.5).
+    bool                                   host_headroom_exhausted = false;
+    size_t                                 host_mem_total          = 0;
+    size_t                                 host_headroom           = 0;
     // A cold expert class is selected (§4.3 step 4): the cold set is not implemented, so a plan that carries lazy
     // tables refuses it rather than plan a set it cannot hold.
     bool                                   cold_expert_class      = false;
@@ -8038,6 +8044,12 @@ size_t host_ledger_yieldable_bytes();  // one atomic load of the yieldable bytes
 
 // One atomic load: whether the stored budget is GGML_SYCL_HOST_RESERVE_MB's override (false: computed, or none stored).
 bool host_ledger_budget_overridden();
+
+// One atomic load each, of the stored budget's sample (design 5efe §4.5): whether that budget is the refusal
+// host-headroom-exhausted, its MemTotal, and the headroom it compared (false and 0: none stored).
+bool   host_ledger_headroom_exhausted();
+size_t host_ledger_mem_total();
+size_t host_ledger_headroom();
 
 // A cache's yieldable chunk appears (add) or goes (sub). One call is one chunk: a yield makes at most one round per
 // chunk counted at its first shortfall.

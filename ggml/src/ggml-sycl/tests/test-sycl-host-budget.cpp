@@ -12,7 +12,9 @@
 //       decreases, a refusal counting as 0;
 //   (3) GGML_SYCL_HOST_RESERVE_MB composes: above the formula the budget is the formula's, below it the override's, and
 //       at zero headroom-free memory it is the named refusal either way;
-//   (4) an unknown MemTotal keeps the min(8 GiB, MemAvailable/4) reserve and stays monotone; nothing read is uncapped.
+//   (4) an unknown MemTotal keeps the min(8 GiB, MemAvailable/4) reserve and stays monotone; nothing read is uncapped;
+//   (5) the refusal names itself with MemAvailable, MemTotal and the headroom it compared, and a budget that is not
+//       the refusal names nothing.
 // Every arm names its engagement check. An arm whose engagement check fails is VOID, and a VOID arm fails the binary
 // like a FAIL. Every arm runs, so one failure does not hide the rest. Each registered mutant passes only on its arm's
 // FAIL line.
@@ -216,6 +218,29 @@ void arm_unknown_total() {
     }
 }
 
+// (5) The reason every refused line appends: the refusal's name and its three figures, or nothing.
+void arm_refusal_reason() {
+    const char *             arm       = "(5) the refusal names its figures";
+    const size_t             total     = gib(246.9);
+    const size_t             available = gib(28.9);
+    const host_budget_result refused   = budget_of(total, available);
+    // Engagement: the §4.5 table's (246.9, 28.9) row is the refusal.
+    if (refused.status != host_budget_status::HEADROOM_EXHAUSTED) {
+        void_arm(arm, "total=246.9 GiB available=28.9 GiB is not the refusal");
+        return;
+    }
+    const std::string want = " reason=host-headroom-exhausted MemAvailable=" + std::to_string(available) +
+                             " MemTotal=" + std::to_string(total) + " headroom=" + std::to_string(refused.headroom);
+    const std::string got = host_headroom_refusal_reason(true, available, total, refused.headroom);
+    if (got != want) {
+        fail(arm, "the refusal's reason is '" + got + "', want '" + want + "'");
+    }
+    const std::string none = host_headroom_refusal_reason(false, gib(150.8), total, refused.headroom);
+    if (!none.empty()) {
+        fail(arm, "a budget that is not the refusal names '" + none + "', want nothing");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -223,6 +248,7 @@ int main() {
     arm_sweep();
     arm_override();
     arm_unknown_total();
+    arm_refusal_reason();
     if (g_failures != 0) {
         std::printf("test-sycl-host-budget: %d failure(s)\n", g_failures);
         return 1;

@@ -621,6 +621,79 @@ def test_the_plan_line_checks_see_each_dropped_piece():
         assert budget_source_gaps(*args), f"the budget source check passes with {name}"
 
 
+# The headroom refusal a plan's would-refuse line names (design 5efe §4.5) is its budget's own: the load copies the
+# stored sample's figures into the planner input, the dry run its own sample's, and the line reads the planner input,
+# never the stored values a dry run does not write.
+REFUSAL_FIELDS = (
+    ("host_headroom_exhausted", "host_ledger_headroom_exhausted"),
+    ("host_mem_total", "host_ledger_mem_total"),
+    ("host_headroom", "host_ledger_headroom"),
+)
+
+
+def refusal_source_gaps(record: str, load: str, closure: str) -> list:
+    """Where the plan line's refusal reason comes from; empty when it is the budget's own sample."""
+    gaps = []
+    if not calls(record, "host_headroom_refusal_reason"):
+        gaps.append("record_host_ledger_plan does not format the reason through host_headroom_refusal_reason")
+    for reader in ("host_ledger_refusal_reason", "host_ledger_mem_available", "host_ledger_budget"):
+        if calls(record, reader):
+            gaps.append(f"record_host_ledger_plan calls {reader}: the reason is the stored sample's, not the plan's")
+    if re.search(r"\bg_host_ledger_\w+", record):
+        gaps.append("record_host_ledger_plan reads a stored ledger atomic")
+    for field, accessor in REFUSAL_FIELDS + (("host_mem_available_pre", "host_ledger_mem_available"),):
+        if not re.search(rf"kv_info\s*\.\s*{field}\b", record):
+            gaps.append(f"the reason does not read kv_info.{field}")
+    for field, accessor in REFUSAL_FIELDS:
+        if not re.search(rf"g_placement_kv_info\s*\.\s*{field}\s*=\s*(?:ggml_sycl::)?{accessor}\s*\(", load):
+            gaps.append(f"the load does not copy {accessor}() into its planner input's {field}")
+        if not re.search(rf"\bkv\s*\.\s*{field}\s*=", closure):
+            gaps.append(f"the dry run does not set its planner input's {field}")
+        if calls(closure, accessor):
+            gaps.append(f"the dry run calls {accessor}: the stored sample's, not its own")
+    return gaps
+
+
+def test_the_plan_refusal_reason_is_the_budgets_own_sample():
+    uc = read(SYCL / "unified-cache.cpp")
+    cpp = sycl_cpp()
+    gaps = refusal_source_gaps(
+        body(uc, "record_host_ledger_plan"), body(cpp, "compute_and_store_plan_for_inventory"), dry_run_closure(cpp)
+    )
+    assert not gaps, "; ".join(gaps)
+
+
+def test_the_refusal_source_check_sees_each_dropped_piece():
+    record = (
+        "const std::string reason = host_headroom_refusal_reason(kv_info.host_headroom_exhausted,\n"
+        "    kv_info.host_mem_available_pre, kv_info.host_mem_total, kv_info.host_headroom);\n"
+    )
+    load = (
+        "g_placement_kv_info.host_headroom_exhausted = ggml_sycl::host_ledger_headroom_exhausted();\n"
+        "g_placement_kv_info.host_mem_total = ggml_sycl::host_ledger_mem_total();\n"
+        "g_placement_kv_info.host_headroom = ggml_sycl::host_ledger_headroom();\n"
+    )
+    closure = (
+        "kv.host_headroom_exhausted = budget.status == ggml_sycl::host_budget_status::HEADROOM_EXHAUSTED;\n"
+        "kv.host_mem_total = mem_total;\nkv.host_headroom = budget.headroom;\n"
+    )
+    assert refusal_source_gaps(record, load, closure) == [], refusal_source_gaps(record, load, closure)
+    mutants = {
+        "the line reads the stored reason": (
+            "char reason[160];\nhost_ledger_refusal_reason(reason, sizeof(reason));\n", load, closure),
+        "the line reads a stored atomic": (
+            record.replace("kv_info.host_mem_total", "g_host_ledger_mem_total.load()"), load, closure),
+        "the load copies no exhausted flag": (
+            record, load.replace("host_ledger_headroom_exhausted()", "false"), closure),
+        "the dry run sets no headroom": (record, load, closure.replace("kv.host_headroom = budget.headroom;\n", "")),
+        "the dry run reads the stored MemTotal": (
+            record, load, closure.replace("= mem_total;", "= ggml_sycl::host_ledger_mem_total();")),
+    }
+    for name, args in mutants.items():
+        assert args != (record, load, closure), f"mutant '{name}' changed nothing"
+        assert refusal_source_gaps(*args), f"the refusal source check passes with {name}"
+
+
 # ---- 3. nothing stored ----
 
 
