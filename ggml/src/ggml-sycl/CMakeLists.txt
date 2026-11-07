@@ -281,7 +281,8 @@ if (BUILD_TESTING)
 
     # The lazy tables' IO pool registry (th32 §3.3, §11 T3): the counted lease, clone, park, DYING, the FULL reap, the
     # coverage wrapper, the helper guard and shut-down. lazy-io-pool.cpp includes no SYCL header, so this target links
-    # it alone with ggml-base for the abort and the log: no device, no unified cache, no SYCL module. Its abort legs
+    # it with the row cache its reaper inserts into (lazy-row-cache.cpp and host-cpu-mapping.cpp, both device-free) and
+    # ggml-base for the abort and the log: no device, no unified cache, no SYCL module. Its abort legs
     # re-execute the binary through fork and /proc/self/exe, so it is Linux-only.
     #
     # Each MUTANTS pair is a positive control: a macro that plants one defect in lazy-io-pool.cpp, and the FAIL line the
@@ -294,7 +295,9 @@ if (BUILD_TESTING)
             LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP
                 "FAIL the wrapper reaps before its take and after its drop: after the scope: 0 live pools, 0 leases, 1 parked, want its pool reaped by its closing reap"
             LAZY_IO_POOL_MUTANT_INSTALL_ON_EMPTY_SLOT
-                "FAIL a take installs only on a generation match: take A's pool shares generation [0-9]+ with the pool installed and parked during its build")
+                "FAIL a take installs only on a generation match: take A's pool shares generation [0-9]+ with the pool installed and parked during its build"
+            LAZY_IO_POOL_MUTANT_GENERATION_LIVE_IGNORES_PARKED
+                "FAIL the owner check's generation is live in the slot and parked, and gone after the reap: generation [0-9]+ of the parked pool reads not live")
         set(_lazy_io_pool_host_variants test-sycl-lazy-io-pool-host "" "")
         list(LENGTH _lazy_io_pool_host_mutants _n)
         math(EXPR _last "${_n} - 1")
@@ -317,7 +320,9 @@ if (BUILD_TESTING)
             list(GET _lazy_io_pool_host_variants ${_k} _regex)
             add_executable(${_name}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-pool-host.cpp
-                lazy-io-pool.cpp)
+                lazy-io-pool.cpp
+                lazy-row-cache.cpp
+                host-cpu-mapping.cpp)
             target_include_directories(${_name} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
             target_compile_definitions(${_name} PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
@@ -333,6 +338,183 @@ if (BUILD_TESTING)
                     TIMEOUT 120
                     PASS_REGULAR_EXPRESSION "${_regex}")
             endif()
+        endforeach()
+    endif()
+
+    # The IO engine's queue (th32 §5.2.1) and the reaper's delivery (§5.3), host-only: the queue is a data structure
+    # the pool calls under its queue lock, so the order of §5.2.1 is exercised on one thread with fixture requests, no
+    # worker, no ring and no device. Links lazy-io-pool.cpp with the row cache its reaper inserts into
+    # (lazy-row-cache.cpp, host-cpu-mapping.cpp) and ggml-base for the log.
+    #
+    # Each MUTANTS pair is a positive control: a macro that plants one defect in lazy-io-pool.cpp's queue or delivery,
+    # and the FAIL line the arm that kills it prints. Each builds test-sycl-lazy-io-queue-host-mutant-<macro suffix>,
+    # and a ctest of that name which passes only when that line appears.
+    set(_lq_key "FAIL class 0 dispatches by \\(epoch, deadline\\), rows first, equal keys in order: dispatched ")
+    set(_lq_key_want ", want 106 103 102 105 104 100 101")
+    set(_lq_rekey_want "0 1 2 3 4 5 6 7 8 9 99 30 31 32 33 34 20 21 22 23 24")
+    set(_lq_join "FAIL a join from another context adds an entry at the joiner's key: block 97 dispatched at pick ")
+    string(CONCAT _lq_re_deadline_only "${_lq_key}100 101 106 103 102 105 104${_lq_key_want}")
+    string(CONCAT _lq_re_slices_first "${_lq_key}103 106 104 102 105 100 101${_lq_key_want}")
+    string(CONCAT _lq_re_equal_key_lifo "${_lq_key}106 103 105 102 104 101 100${_lq_key_want}")
+    string(CONCAT _lq_re_plain_epoch
+        "FAIL the epoch order survives the counter's wrap: dispatched 202 200 201, want 201 202 200")
+    string(CONCAT _lq_re_no_round_robin
+        "FAIL the contexts take turns: context 2's reads dispatched at picks 100 101 102 103, want 1 3 5 7")
+    string(CONCAT _lq_re_class_blind
+        "FAIL class 1 waits for every context's class 0: dispatched 0 13 1 10 2 11 12, want 10 11 12 0 13 1 2")
+    string(CONCAT _lq_re_no_promotion
+        "FAIL a class-0 join promotes a lookahead read: dispatched 10 2 0 1, want 10 2 1 0")
+    string(CONCAT _lq_re_no_chunking
+        "FAIL a span is read in chunks of at most 512 KiB: the span was queued as 1 reads, want 4 of at most 524288 B")
+    string(CONCAT _lq_re_no_dedup
+        "FAIL a request for a pending block joins its read: after two requests for block 5 and one for block 6, "
+        "3 reads in flight, want 2")
+    string(CONCAT _lq_re_join_keeps_position
+        "FAIL a same-context join takes the more urgent key and keeps its number: dispatched "
+        "0 1 2 3 4 5 6 7 8 9 30 31 32 33 34 20 21 22 23 24 99, want ${_lq_rekey_want}")
+    string(CONCAT _lq_re_no_second_entry "${_lq_join}100 from context 1, want pick 5 from context 2")
+    string(CONCAT _lq_re_cross_context_rekey "${_lq_join}0 from context 1, want pick 5 from context 2")
+    string(CONCAT _lq_re_fifo_ignored
+        "FAIL the FIFO override serves reads in enqueue order: dispatched 0 200 1 201 2 202 3 203 4 5 6 7 8 9 50, "
+        "want 0 1 2 3 4 5 6 7 8 9 200 201 202 203 50")
+    string(CONCAT _lq_re_log_at_completion
+        "FAIL the dispatch log numbers a read when a worker picks it up: the dispatch log lists blocks 2 1 0, "
+        "want 0 1 2")
+    string(CONCAT _lq_re_deliver_ignores_epoch
+        "FAIL the reaper copies only into its own epoch's live slot: a waiter for epoch 4 wrote into the slot at "
+        "epoch 5")
+    string(CONCAT _lq_re_cached_waiter_unchecked
+        "FAIL a cached waiter lies in one chunk, or the submit aborts: "
+        "the submit of a straddling cached waiter returned instead of aborting")
+    string(CONCAT _lq_re_landing_oob_silent
+        "FAIL a landing outside its live slot fails the request with EINVAL and one WARN: "
+        "the out-of-bounds landing left read_error 0 and 0 WARN line\\(s\\), want [0-9]+ and 1")
+    string(CONCAT _lq_re_index_before_own
+        "FAIL a submit that throws leaves the queue's indexes whole: a new read, allocation [0-9]+ thrown: "
+        "a class queue holds an entry no read owns")
+    set(_lazy_io_queue_mutants
+        LAZY_IO_QUEUE_MUTANT_DEADLINE_ONLY           "${_lq_re_deadline_only}"
+        LAZY_IO_QUEUE_MUTANT_SLICES_FIRST            "${_lq_re_slices_first}"
+        LAZY_IO_QUEUE_MUTANT_EQUAL_KEY_LIFO          "${_lq_re_equal_key_lifo}"
+        LAZY_IO_QUEUE_MUTANT_PLAIN_EPOCH_COMPARE     "${_lq_re_plain_epoch}"
+        LAZY_IO_QUEUE_MUTANT_NO_ROUND_ROBIN          "${_lq_re_no_round_robin}"
+        LAZY_IO_QUEUE_MUTANT_CLASS_BLIND             "${_lq_re_class_blind}"
+        LAZY_IO_QUEUE_MUTANT_NO_PROMOTION            "${_lq_re_no_promotion}"
+        LAZY_IO_QUEUE_MUTANT_NO_CHUNKING             "${_lq_re_no_chunking}"
+        LAZY_IO_QUEUE_MUTANT_NO_DEDUP                "${_lq_re_no_dedup}"
+        LAZY_IO_QUEUE_MUTANT_JOIN_KEEPS_POSITION     "${_lq_re_join_keeps_position}"
+        LAZY_IO_QUEUE_MUTANT_NO_SECOND_ENTRY         "${_lq_re_no_second_entry}"
+        LAZY_IO_QUEUE_MUTANT_CROSS_CONTEXT_REKEY     "${_lq_re_cross_context_rekey}"
+        LAZY_IO_QUEUE_MUTANT_FIFO_IGNORED            "${_lq_re_fifo_ignored}"
+        LAZY_IO_QUEUE_MUTANT_LOG_AT_COMPLETION       "${_lq_re_log_at_completion}"
+        LAZY_IO_QUEUE_MUTANT_DELIVER_IGNORES_EPOCH   "${_lq_re_deliver_ignores_epoch}"
+        LAZY_IO_QUEUE_MUTANT_INDEX_BEFORE_OWN        "${_lq_re_index_before_own}"
+        LAZY_IO_QUEUE_MUTANT_PARTIAL_INSERT          "${_lq_re_index_before_own}"
+        LAZY_IO_QUEUE_MUTANT_CACHED_WAITER_UNCHECKED "${_lq_re_cached_waiter_unchecked}"
+        LAZY_IO_QUEUE_MUTANT_LANDING_OOB_SILENT      "${_lq_re_landing_oob_silent}")
+    set(_lazy_io_queue_variants test-sycl-lazy-io-queue-host "" "")
+    list(LENGTH _lazy_io_queue_mutants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _lazy_io_queue_mutants ${_i} _macro)
+        list(GET _lazy_io_queue_mutants ${_j} _regex)
+        string(REGEX REPLACE "^LAZY_IO_QUEUE_MUTANT_" "" _suffix "${_macro}")
+        string(TOLOWER "${_suffix}" _suffix)
+        string(REPLACE "_" "-" _suffix "${_suffix}")
+        list(APPEND _lazy_io_queue_variants test-sycl-lazy-io-queue-host-mutant-${_suffix} "${_macro}" "${_regex}")
+    endforeach()
+    list(LENGTH _lazy_io_queue_variants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 3)
+        math(EXPR _j "${_i} + 1")
+        math(EXPR _k "${_i} + 2")
+        list(GET _lazy_io_queue_variants ${_i} _name)
+        list(GET _lazy_io_queue_variants ${_j} _macro)
+        list(GET _lazy_io_queue_variants ${_k} _regex)
+        add_executable(${_name}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-queue-host.cpp
+            lazy-io-pool.cpp
+            lazy-row-cache.cpp
+            host-cpu-mapping.cpp)
+        target_include_directories(${_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_compile_definitions(${_name} PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        target_link_libraries(${_name} PRIVATE ggml-base Threads::Threads)
+        set_target_properties(${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME ${_name} COMMAND ${_name})
+        if (_macro STREQUAL "")
+            set_tests_properties(${_name} PROPERTIES LABELS "sycl;host" TIMEOUT 120)
+        else()
+            target_compile_definitions(${_name} PRIVATE ${_macro}=1)
+            set_tests_properties(${_name} PROPERTIES
+                LABELS "sycl;host;mutant"
+                TIMEOUT 120
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endif()
+    endforeach()
+
+    # The block ring's ensure and the IO engine's workers (th32 §3.3, §5.2, §5.3, §10), host-only: ensure allocates
+    # through lazy_io_allocate_host, a link seam the fixture header lazy-io-host-fixture.hpp defines with a counting
+    # ledger in place of lazy-table.cpp's HOST_CPU allocation, and the workers read through the PRIVATE_TESTING read
+    # source, so no device, no unified cache and no SYCL module. Links lazy-io-pool.cpp with the row cache its reaper
+    # inserts into (lazy-row-cache.cpp, host-cpu-mapping.cpp) and ggml-base for the log and the abort. The workers'
+    # reads are pread, so it is Linux-only.
+    #
+    # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
+    # and the FAIL line the arm that kills it prints. Each registers test-sycl-lazy-io-engine-host-mutant-<name> on the
+    # one executable, which passes only when that line appears.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(_le_rules "FAIL ensure allocates the need once and refuses what the plan did not charge: ")
+        string(CONCAT _le_re_no_ensuring
+            "FAIL a concurrent ensure refuses at once while the reserver is held: the second ensure returned ok, "
+            "want lazy-table-ring-concurrent-ensure")
+        string(CONCAT _le_re_ensuring_kept_on_throw
+            "FAIL a throwing allocation leaves ensuring clear for the next ensure: after the throw the pool's "
+            "ensuring is still set, want it cleared by the guard")
+        string(CONCAT _le_re_install_after_shut_down
+            "FAIL ensure refuses after shut-down and frees the reserver's ring: the reserver that reached its install "
+            "after shut-down returned ok, want lazy-table-ring-shut-down")
+        string(CONCAT _le_re_no_span_check
+            "${_le_rules}the ensure one block per slot short returned ok with 1 allocation\\(s\\), "
+            "want lazy-table-ring-too-narrow and none")
+        string(CONCAT _le_re_no_alignment_check
+            "FAIL a need that is not whole blocks per slot refuses before ensure reserves: the unaligned need "
+            "returned ok with 1 allocation\\(s\\), want lazy-table-ring-mismatch and none")
+        string(CONCAT _le_re_shutdown_no_wait
+            "FAIL shutdown cancels queued reads and waits for picked ones: shutdown returned while the picked reads "
+            "were still held on their latch, want it to return only after they finish")
+        set(_lazy_io_engine_mutants
+            no-ensuring             "${_le_re_no_ensuring}"
+            ensuring-kept-on-throw  "${_le_re_ensuring_kept_on_throw}"
+            install-after-shut-down "${_le_re_install_after_shut_down}"
+            no-span-check           "${_le_re_no_span_check}"
+            no-alignment-check      "${_le_re_no_alignment_check}"
+            shutdown-no-wait        "${_le_re_shutdown_no_wait}")
+        add_executable(test-sycl-lazy-io-engine-host
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
+            lazy-io-pool.cpp
+            lazy-row-cache.cpp
+            host-cpu-mapping.cpp)
+        target_include_directories(test-sycl-lazy-io-engine-host PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_compile_definitions(test-sycl-lazy-io-engine-host PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        target_link_libraries(test-sycl-lazy-io-engine-host PRIVATE ggml-base Threads::Threads)
+        set_target_properties(test-sycl-lazy-io-engine-host PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-lazy-io-engine-host COMMAND test-sycl-lazy-io-engine-host)
+        set_tests_properties(test-sycl-lazy-io-engine-host PROPERTIES LABELS "sycl;host" TIMEOUT 120)
+        list(LENGTH _lazy_io_engine_mutants _n)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 2)
+            math(EXPR _j "${_i} + 1")
+            list(GET _lazy_io_engine_mutants ${_i} _mutant)
+            list(GET _lazy_io_engine_mutants ${_j} _regex)
+            add_test(NAME test-sycl-lazy-io-engine-host-mutant-${_mutant}
+                COMMAND test-sycl-lazy-io-engine-host --mutant ${_mutant})
+            set_tests_properties(test-sycl-lazy-io-engine-host-mutant-${_mutant} PROPERTIES
+                LABELS "sycl;host;mutant"
+                TIMEOUT 120
+                PASS_REGULAR_EXPRESSION "${_regex}")
         endforeach()
     endif()
 
@@ -8354,6 +8536,133 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         TIMEOUT 120)
+
+    # The block ring's plan, leases and stage adoption (th32 §3.3, §4.2, §10, §11 T5): one ensure allocates the plan's
+    # need and a covered plan charges 0; a table wider than the live ring prints the decline line, once per load, and
+    # plans HOST where it fits, else refuses as too narrow; the staged candidate's lease carries the pool across the
+    # early and the late pass and across another model's unload; the stage's lease holds it across a read's drop inside
+    # the planner; an inventory with no lazy table takes nothing; the stage, its failure and the dry run leave no pool;
+    # the owner check is silent for a live or parked pool's ring rows; and under strict leases a STORAGE materialization
+    # aborts on each ring refusal that is a plan bug: too narrow, a mismatch and a concurrent ensure, each in its own
+    # child. The stage builds both cards' caches on the multi-device path, so it runs on level_zero:0,1, exits 77 on the
+    # single-device path, carries the OOM-family labels and runs alone. Lead-run.
+    #
+    # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
+    # and the FAIL line of the arm that kills it, which runs alone. Each registers test-sycl-lazy-ring-mutant-<name> on
+    # the one executable, which passes only when that line appears. The mutant registrations carry no SKIP_RETURN_CODE:
+    # ctest honours a skip code before the regex, so a mutant run that VOIDs with exit 77 would read as skipped with its
+    # kill line never checked. A mutant run has no legitimate skip, so without the code that run fails.
+    string(CONCAT _lazy_ring_env
+        "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;"
+        "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+    string(CONCAT _lr_re_no_span_check
+        "FAIL the ring plan: one ensure allocates the need, a covered plan charges 0, a wider one declines: "
+        "the ensure one block per slot short returned ok with 1 allocation\\(s\\), "
+        "want lazy-table-ring-too-narrow and none")
+    string(CONCAT _lr_re_ignore_live_ring
+        "FAIL a wider table that fits nowhere refuses as lazy-table-ring-too-narrow: "
+        "the wider table planned with refusal 'none', want lazy-table-ring-too-narrow")
+    string(CONCAT _lr_re_ignore_live_ring_p3
+        "FAIL a wider table whose HOST fit holds but P3 does not refuses and plans no HOST: "
+        "the wider table planned with refusal 'lazy-table-cache-below-floor' and 0 table\\(s\\), "
+        "want lazy-table-ring-too-narrow and none")
+    string(CONCAT _lr_re_no_candidate_lease
+        "FAIL a model planned as covered across an unload finds the ring through a read's lease: "
+        "model A's ensure returned lazy-table-ring-unpinned, want ok")
+    string(CONCAT _lr_re_lease_at_stage
+        "FAIL the stage's lease holds the pool across a read's drop inside the planner pass: "
+        "model B's ensure returned lazy-table-ring-mismatch, want ok")
+    string(CONCAT _lr_re_lease_presence_as_coverage
+        "FAIL the early and the late pass charge the ring once, on the same STORAGE set: "
+        "the late pass's ring= is 0, want [0-9]+")
+    string(CONCAT _lr_re_take_without_candidate
+        "FAIL an inventory with no lazy table creates no pool, alone and after a lazy model: "
+        "the dense stage moved the registry generation from [0-9]+ to [0-9]+")
+    string(CONCAT _lr_re_lease_before_guard
+        "FAIL an all-HOST inventory takes the provisional lease and leaves nothing after the call: "
+        "after the early stage: 0 live pools, 0 leases, 1 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_replace_keeps_displaced
+        "FAIL two devices, early then late then unload, give back the pool and the ring's bytes: "
+        "after the unload and the reap: 1 live pools, [0-9]+ leases, 0 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_rollback_keeps_clone
+        "FAIL a stage failed after the first device leaves no lease and no parked pool: "
+        "after the failed early stage: 1 live pools, [0-9]+ leases, 0 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_count_without_pin
+        "FAIL the public entries read no coverage, and a null pin refuses as lazy-table-ring-unpinned: "
+        "the public entries counted [0-9]+ coverage reads, want 0")
+    string(CONCAT _lr_re_no_entry_reap
+        "FAIL the dry run reaps before its take and after its drop and charges the ring as a stage: "
+        "the dry run's take snapshot [0-9]+ reaps run, want [0-9]+")
+    string(CONCAT _lr_re_no_closing_reap
+        "FAIL the dry run reaps before its take and after its drop and charges the ring as a stage: "
+        "after the dry run: 0 live pools, 0 leases, 1 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_generation_live_ignores_parked
+        "FAIL the block ring's POOL rows are silent while their generation is live or parked: "
+        "the parked generation [0-9]+ reports 1 ring row\\(s\\), want 0")
+    string(CONCAT _lr_re_strict_abort_dropped
+        "FAIL under strict leases the STORAGE materialization aborts on a ring refusal after its WARN: "
+        "the strict child did not abort: .*STRICT-CHILD returned status=lazy-table-ring-too-narrow")
+    string(CONCAT _lr_re_strict_abort_dropped_mismatch
+        "FAIL under strict leases the STORAGE materialization aborts on a ring mismatch after its WARN: "
+        "the strict child did not abort: .*STRICT-CHILD returned status=lazy-table-ring-mismatch")
+    string(CONCAT _lr_re_strict_abort_dropped_concurrent
+        "FAIL under strict leases the STORAGE materialization aborts on a concurrent ensure after its WARN: "
+        "the strict child did not abort: .*STRICT-CHILD returned status=lazy-table-ring-concurrent-ensure")
+    string(CONCAT _lr_re_decline_every_plan
+        "FAIL a load prints each declined table once across its plans, and again after its abort: "
+        "the second plan of load [0-9]+ printed 2 lines '.*' in all, want 1")
+    set(_lazy_ring_mutants
+        no-span-check                   "${_lr_re_no_span_check}"
+        ignore-live-ring                "${_lr_re_ignore_live_ring}"
+        ignore-live-ring-p3             "${_lr_re_ignore_live_ring_p3}"
+        no-candidate-lease              "${_lr_re_no_candidate_lease}"
+        lease-at-stage                  "${_lr_re_lease_at_stage}"
+        lease-presence-as-coverage      "${_lr_re_lease_presence_as_coverage}"
+        take-without-candidate          "${_lr_re_take_without_candidate}"
+        lease-before-guard              "${_lr_re_lease_before_guard}"
+        replace-keeps-displaced         "${_lr_re_replace_keeps_displaced}"
+        rollback-keeps-clone            "${_lr_re_rollback_keeps_clone}"
+        count-without-pin               "${_lr_re_count_without_pin}"
+        no-entry-reap                   "${_lr_re_no_entry_reap}"
+        no-closing-reap                 "${_lr_re_no_closing_reap}"
+        generation-live-ignores-parked  "${_lr_re_generation_live_ignores_parked}"
+        strict-abort-dropped            "${_lr_re_strict_abort_dropped}"
+        strict-abort-dropped-mismatch   "${_lr_re_strict_abort_dropped_mismatch}"
+        strict-abort-dropped-concurrent "${_lr_re_strict_abort_dropped_concurrent}"
+        decline-every-plan              "${_lr_re_decline_every_plan}")
+    add_executable(test-sycl-lazy-ring
+        tests/test-sycl-lazy-ring.cpp)
+    target_link_libraries(test-sycl-lazy-ring PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-ring PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-ring COMMAND test-sycl-lazy-ring)
+    set_tests_properties(test-sycl-lazy-ring PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "${_lazy_ring_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+    list(LENGTH _lazy_ring_mutants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _lazy_ring_mutants ${_i} _mutant)
+        list(GET _lazy_ring_mutants ${_j} _regex)
+        add_test(NAME test-sycl-lazy-ring-mutant-${_mutant}
+            COMMAND test-sycl-lazy-ring --mutant ${_mutant})
+        set_tests_properties(test-sycl-lazy-ring-mutant-${_mutant} PROPERTIES
+            LABELS "sycl;host;cache;mem-handle;gpu-serial;mutant"
+            ENVIRONMENT "${_lazy_ring_env}"
+            RUN_SERIAL TRUE
+            TIMEOUT 300
+            PASS_REGULAR_EXPRESSION "${_regex}")
+    endforeach()
+    # The no-entry-reap kill line reads the dry run's take-time snapshot, which is its own only when it took a lease.
+    # A run that prints the arm's no-lease line fails whatever else it prints, so a mutant that skips the take cannot
+    # read as a kill of the entry reap.
+    set_tests_properties(test-sycl-lazy-ring-mutant-no-entry-reap PROPERTIES
+        FAIL_REGULAR_EXPRESSION "it took no lease")
 
     # The lazy table object (th32 §3.2, §3.3, §10, §11 T4): the HOST body's eager O_DIRECT read into locked HOST_CPU
     # memory, the STORAGE descriptor, the last reference's release, the activation check (one extra chunk refuses,

@@ -82,6 +82,8 @@ const char * alloc_lifetime_name(alloc_lifetime lifetime) {
             return "DEVICE";
         case alloc_lifetime::UNOWNED:
             return "UNOWNED";
+        case alloc_lifetime::POOL:
+            return "POOL";
     }
     return "?";
 }
@@ -100,6 +102,8 @@ const char * alloc_owner_kind_name(alloc_owner_kind kind) {
             return "device";
         case alloc_owner_kind::EXECUTION_CONTEXT:
             return "execution_context";
+        case alloc_owner_kind::IO_POOL:
+            return "io_pool";
     }
     return "?";
 }
