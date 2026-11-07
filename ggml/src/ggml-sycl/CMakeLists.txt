@@ -450,7 +450,7 @@ if (BUILD_TESTING)
         "FAIL \\(1\\) the WARN fires only past the room: "
         "mapped_ws [0-9]+ at or below resident_room [0-9]+ printed the WARN")
     string(CONCAT _hb_re_p3_constant
-        "FAIL \\(3\\) resident_room uses host_headroom\\(total\\): at total=62\\.0 GiB available=50\\.0 GiB "
+        "FAIL \\(3\\) resident_room uses the budget's headroom: at total=62\\.0 GiB available=50\\.0 GiB "
         "expected_host=4\\.0 GiB mapped_ws=20\\.0 GiB the WARN fired \\(headroom=31138512896 ")
     set(_host_budget_variants
         test-sycl-host-budget           ""                                      ""

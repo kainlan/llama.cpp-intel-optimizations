@@ -141,11 +141,12 @@ inline std::string host_headroom_refusal_reason(bool exhausted, size_t available
     return buf;
 }
 
-// The resident working set (§4.5): resident_room = MemAvailable_pre - expected_host - host_headroom(MemTotal), and
-// mapped_ws, the host-executed mapped bytes the kernel may drop. exceeds is the WARN; a mapped overflow costs refaults,
-// not an OOM, so it warns and refuses nothing. A locked mapping (-lm mmap+mlock) is charged at full size and cannot be
-// dropped, so its mapped_ws is 0. With no MemAvailable_pre sample there is no room to compare against, and nothing
-// warns.
+// The resident working set (§4.5): resident_room = MemAvailable_pre - expected_host - headroom, the headroom the
+// budget's sample left (host_budget_compute: host_headroom(MemTotal), or min(8 GiB, MemAvailable/4) when MemTotal is
+// unread), and mapped_ws, the host-executed mapped bytes the kernel may drop. exceeds is the WARN; a mapped overflow
+// costs refaults, not an OOM, so it warns and refuses nothing. A locked mapping (-lm mmap+mlock) is charged at full
+// size and cannot be dropped, so its mapped_ws is 0. With no MemAvailable_pre sample there is no room to compare
+// against, and nothing warns.
 struct host_working_set {
     bool   sampled           = false;  // MemAvailable_pre is a reading
     bool   locked            = false;  // the mapping is locked: charged, so its bytes are not working set
@@ -157,8 +158,8 @@ struct host_working_set {
     bool   exceeds           = false;
 };
 
-// The working set against `headroom` as given: a plan passes its budget's own, so its working-set line and its
-// would-refuse line name one sample.
+// The working set against `headroom` as given: a plan passes its budget's own (host_budget_result::headroom), so its
+// working-set line and its would-refuse line name one sample.
 inline host_working_set host_working_set_check_headroom(size_t headroom,
                                                         size_t mem_available_pre,
                                                         size_t expected_host,
@@ -169,30 +170,20 @@ inline host_working_set host_working_set_check_headroom(size_t headroom,
     ws.locked            = locked;
     ws.mem_available_pre = mem_available_pre;
     ws.expected_host     = expected_host;
-    ws.headroom          = headroom;
-    ws.mapped_ws         = locked ? 0 : mapped_bytes;
-    ws.resident_room     = host_ledger_sat_sub(host_ledger_sat_sub(mem_available_pre, expected_host), ws.headroom);
+#if defined(HOST_BUDGET_MUTANT_P3_CONSTANT)
+    (void) headroom;
+    ws.headroom = k_host_p3_floor;
+#else
+    ws.headroom = headroom;
+#endif
+    ws.mapped_ws     = locked ? 0 : mapped_bytes;
+    ws.resident_room = host_ledger_sat_sub(host_ledger_sat_sub(mem_available_pre, expected_host), ws.headroom);
 #if defined(HOST_BUDGET_MUTANT_WARN_ABOVE_THRESHOLD)
     ws.exceeds = ws.mapped_ws != 0;
 #else
     ws.exceeds = ws.sampled && ws.mapped_ws > ws.resident_room;
 #endif
     return ws;
-}
-
-// The working set against host_headroom(MemTotal), the headroom §4.5's budget leaves a host of `total_bytes`.
-inline host_working_set host_working_set_check(size_t total_bytes,
-                                               size_t mem_available_pre,
-                                               size_t expected_host,
-                                               size_t mapped_bytes,
-                                               bool   locked) {
-#if defined(HOST_BUDGET_MUTANT_P3_CONSTANT)
-    (void) total_bytes;
-    const size_t headroom = k_host_p3_floor;
-#else
-    const size_t headroom = host_headroom(total_bytes);
-#endif
-    return host_working_set_check_headroom(headroom, mem_available_pre, expected_host, mapped_bytes, locked);
 }
 
 // The working set's figures, in the one order the WARN and the plan line both print them.

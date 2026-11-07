@@ -34532,10 +34532,11 @@ static void record_host_ledger_plan(placement_plan &          plan,
 }
 
 // The resident working set (design 5efe §4.5, §7 C5), once per plan beside its Totals line: the plan line, and the
-// WARN when the host-executed mapped bytes exceed resident_room = MemAvailable_pre - expected_host -
-// host_headroom(MemTotal). expected_host is the plan's charged host figure, the one P3 reads. MemAvailable_pre and the
-// headroom are the planner input's, the sample this plan's budget came from (the load's stored one, or a dry run's
-// own), so this line and the would-refuse line name one sample. Locked mapped bytes are charged and cannot be dropped,
+// WARN when the host-executed mapped bytes exceed resident_room = MemAvailable_pre - expected_host - headroom.
+// expected_host is the plan's charged host figure, the one P3 reads. MemAvailable_pre and the headroom are the planner
+// input's, from the sample this plan's budget came from (the load's stored one, or a dry run's own): the headroom is
+// that budget's, host_headroom(MemTotal), or min(8 GiB, MemAvailable/4) when MemTotal is unread. So this line and the
+// would-refuse line name one sample. Locked mapped bytes are charged and cannot be dropped,
 // so a locked mapping counts none and the plan line says locked. A mapped overflow costs refaults, not an OOM, so the
 // plan proceeds.
 static void placement_plan_log_working_set(const char *              tag,

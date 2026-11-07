@@ -37,7 +37,9 @@ cannot see:
    budget: the load copies the ledger's flag stored with its budget, the dry run its own sample's, and the decision
    reads neither the ledger nor the environment. Every lazy line prints a table's fields through
    placement_lazy_table_fields and a refusal through placement_lazy_refusal_text, so no line builds the consumer's
-   device name or the refusal text itself.
+   device name or the refusal text itself;
+9. the working-set line takes its headroom and MemAvailable_pre from the planner input, the sample the plan's budget
+   and its would-refuse line come from (design 5efe §4.5), never a constant or a live reading.
 
 Plain file I/O, comment-stripped text.
 """
@@ -722,6 +724,60 @@ def test_the_refusal_source_check_sees_each_dropped_piece():
         assert args != (record, load, closure), f"mutant '{name}' changed nothing"
         gaps = refusal_source_gaps(*args)
         assert any(expected in g for g in gaps), f"the refusal source check misses {name}: {gaps}"
+
+
+# The working-set line's room (design 5efe §4.5) is computed against the planner input's headroom and MemAvailable_pre,
+# the sample the plan's budget and its would-refuse line come from. The host test's P3-constant mutant guards the
+# function; this guards the arguments a plan passes it.
+WORKING_SET_CALL = re.compile(
+    r"\bhost_working_set_check_headroom\s*\(\s*kv_info\s*\.\s*host_headroom\s*,"
+    r"\s*kv_info\s*\.\s*host_mem_available_pre\s*,"
+)
+
+
+def working_set_wiring_gaps(log: str) -> list:
+    """Where placement_plan_log_working_set's headroom and MemAvailable_pre come from; empty when the planner input."""
+    if not calls(log, "host_working_set_check_headroom"):
+        return ["placement_plan_log_working_set does not call host_working_set_check_headroom"]
+    if not WORKING_SET_CALL.search(log):
+        return ["placement_plan_log_working_set does not pass kv_info.host_headroom and kv_info.host_mem_available_pre"]
+    return []
+
+
+def test_the_working_set_takes_the_planner_inputs_sample():
+    gaps = working_set_wiring_gaps(body(read(SYCL / "unified-cache.cpp"), "placement_plan_log_working_set"))
+    assert not gaps, "; ".join(gaps)
+
+
+def test_the_working_set_wiring_check_sees_each_substitution():
+    log = (
+        "const host_working_set ws =\n"
+        "    host_working_set_check_headroom(kv_info.host_headroom, kv_info.host_mem_available_pre,\n"
+        "                                    plan.host_planned_bytes, plan.host_mapped_bytes,\n"
+        "                                    plan.host_mapped_locked);\n"
+    )
+    assert working_set_wiring_gaps(log) == [], working_set_wiring_gaps(log)
+    # Each mutant names the gap it must produce.
+    passes = "does not pass kv_info.host_headroom and kv_info.host_mem_available_pre"
+    mutants = {
+        "the headroom P3's constant": (log.replace("kv_info.host_headroom,", "k_host_p3_floor,"), passes),
+        "the headroom 0": (log.replace("kv_info.host_headroom,", "0,"), passes),
+        "the headroom a live reading": (
+            log.replace("kv_info.host_headroom,", "host_headroom(ggml_sycl_get_total_system_memory_bytes()),"), passes),
+        "MemAvailable_pre from the ledger": (
+            log.replace("kv_info.host_mem_available_pre,", "host_ledger_mem_available(),"), passes),
+        "the arguments swapped": (
+            log.replace("kv_info.host_headroom, kv_info.host_mem_available_pre,",
+                        "kv_info.host_mem_available_pre, kv_info.host_headroom,"), passes),
+        "no working-set check": (
+            log.replace("host_working_set_check_headroom(", "host_working_set_figures("),
+            "does not call host_working_set_check_headroom",
+        ),
+    }
+    for name, (mutant, expected) in mutants.items():
+        assert mutant != log, f"mutant '{name}' changed nothing"
+        gaps = working_set_wiring_gaps(mutant)
+        assert any(expected in g for g in gaps), f"the working-set wiring check misses {name}: {gaps}"
 
 
 # ---- 3. nothing stored ----
