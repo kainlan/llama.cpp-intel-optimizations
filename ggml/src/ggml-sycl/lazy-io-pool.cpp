@@ -176,6 +176,7 @@ std::atomic<uint64_t> g_lazy_worker_reaps{ 0 };
 std::atomic<uint64_t> g_lazy_joins{ 0 };
 std::atomic<uint64_t> g_lazy_joins_from_worker{ 0 };
 std::atomic<uint64_t> g_lazy_self_joins{ 0 };
+thread_local bool     t_lazy_io_worker = false;  // set by a pool worker on entry, so a join knows who runs it
 std::atomic<uint64_t> g_lazy_drops_after_shut_down{ 0 };
 std::atomic<bool>     g_lazy_reap_throw_next{ false };
 
@@ -376,6 +377,29 @@ ring_lease lazy_io_pool_take() {
 
 namespace {
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// WORKER_REAP_DESTROYS_POOL: the WORKER pass runs the parked pools' destruction, whose join of their workers the census
+// records, on the thread the pass runs on. It stops and joins each pool's engine and then leaks the pool, since freeing
+// it would free the engine the calling worker returns into.
+void lazy_reap_worker_destroys_pools() {
+    lazy_reap_node * list = nullptr;
+    {
+        std::lock_guard lock(g_lazy_registry_mutex);
+        list                = g_lazy_reap_list;
+        g_lazy_reap_list    = nullptr;
+        g_lazy_parked_nodes = 0;
+    }
+    while (list != nullptr) {
+        lazy_reap_node * next = list->next;
+        if (list->pool->engine != nullptr) {
+            list->pool->engine->stop_and_join();
+        }
+        delete list;
+        list = next;
+    }
+}
+#endif
+
 // A WORKER pass: one ring per pass, so nothing is allocated under the leaf mutex. The first parked pool still holding a
 // ring gives it up under the lock, and the ring is freed after the unlock, its handle's drop crediting the budget
 // ledger. The nodes stay on the list with their pools, whose workers only a FULL reap joins. Its locks can throw
@@ -395,6 +419,9 @@ void lazy_reap_worker_pass() {
         }
         if (ring == nullptr) {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+            if (lazy_ring_mutant_is(lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL)) {
+                lazy_reap_worker_destroys_pools();
+            }
             g_lazy_worker_reaps.fetch_add(1, std::memory_order_relaxed);
 #endif
             return;
@@ -1399,9 +1426,24 @@ void lazy_io_engine::stop_and_join() noexcept {
     }
     work.notify_all();
     for (std::thread & worker : workers) {
-        if (worker.joinable()) {
-            worker.join();
+        if (!worker.joinable()) {
+            continue;
         }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        // The join census (§3.3: a pool worker never joins itself). A worker's join of itself throws inside this
+        // noexcept function, so a test build records it and detaches instead, and the arm reads the count. A release
+        // build records nothing: only a FULL reap destroys a pool, and no worker runs one.
+        if (worker.get_id() == std::this_thread::get_id()) {
+            g_lazy_self_joins.fetch_add(1, std::memory_order_relaxed);
+            worker.detach();
+            continue;
+        }
+        g_lazy_joins.fetch_add(1, std::memory_order_relaxed);
+        if (t_lazy_io_worker) {
+            g_lazy_joins_from_worker.fetch_add(1, std::memory_order_relaxed);
+        }
+#endif
+        worker.join();
     }
     workers.clear();
 }
@@ -1430,6 +1472,9 @@ void lazy_io_engine::start(uint8_t * ring_data, size_t slot_span, size_t n) {
 }
 
 void lazy_io_engine::run(size_t slot) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    t_lazy_io_worker = true;
+#endif
     uint8_t * const dst = ring + slot * span;
     for (;;) {
         lazy_io_read * read = nullptr;

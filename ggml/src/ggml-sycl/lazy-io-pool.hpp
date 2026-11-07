@@ -643,7 +643,7 @@ enum class lazy_ring_mutant : uint8_t {
     NO_ALIGNMENT_CHECK,              // ensure accepts a need that is not whole 4 KiB blocks per slot
     SHUTDOWN_NO_WAIT,                // shutdown returns without waiting for the reads the workers picked
     TAKE_IGNORES_DYING,              // a take joins a parked pool whose ring is still held
-    WORKER_REAP_DESTROYS_POOL,       // a WORKER reap deletes the parked pools, joining their workers on a worker
+    WORKER_REAP_DESTROYS_POOL,       // a WORKER reap runs the parked pools' destruction, joining their workers there
     SNAPSHOT_CARRIES_LEASE,          // the published snapshot owns a lease on the pool
     REAP_INSIDE_TRY,                 // the teardown reap runs inside the try that re-finalizes the ticket
     SKIP_LEASE_DRAIN,                // shutdown moves no record's lease out before it marks the registry shut down
