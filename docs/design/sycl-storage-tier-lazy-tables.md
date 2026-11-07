@@ -1080,9 +1080,11 @@ KiB read; the batch rows are a batch of 16 rows (`T_ticket`) or of 7100 rows.
 | fio `io_uring` `O_DIRECT` 4 KiB randread, QD1 | 1389 IOPS, p50 0.48 ms, p99 2.7 ms | 7398 IOPS, p50 144 us, p99 253 us |
 | fio, QD16 | 7815 IOPS, p50 1.8 ms, p99 6.8 ms | 63757 IOPS, p50 224 us, p99 651 us |
 | fio, QD64 (the §8.1 control) | 9124 IOPS, p50 5.7 ms, p99 25 ms | 69706 IOPS, p50 897 us, p99 1597 us |
-| sequential 1 MiB `O_DIRECT` | 1.78 GB/s | 2240 MB/s, QD8 |
+| sequential 1 MiB `O_DIRECT`, QD8 | 1.78 GB/s | 2.24 GB/s |
 | batch of 16, 16 workers: `T_ticket` mean, p99 | 3.75 ms, 13.0 ms | 0.40 ms, 0.63 ms |
 | batch of 7100, 64 workers: rows/s (batch time) | 8344 (0.85 s) | 68887 (103.07 ms) |
+
+us = microseconds, ms = milliseconds.
 
 The 2026-11-01 run of the same probes on the same layout gave 7389 IOPS at QD1, 61492 at QD16, 69507 at QD64, 68884
 rows/s for the batch of 7100, and a batch-16 `T_ticket` of mean 0.41 ms, p99 0.65 ms. The differences from the table are
