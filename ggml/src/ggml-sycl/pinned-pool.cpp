@@ -226,8 +226,9 @@ segmented_buffer pinned_chunk_pool::allocate_segmented(size_t size, size_t align
 
     // Need to grow - allocate a new chunk
     if (footprint_locked() + chunk_size_ > budget_) {
-        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)%s\n",
-                      total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
+        // No used figure: the footprint's log reads are a fixed census, and at a budget the headroom zeroed it says
+        // nothing the budget and the reason do not.
+        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB budget)%s\n", budget_ / (1024.0 * 1024.0 * 1024.0),
                       pinned_budget_refusal_reason(headroom_exhausted_).c_str());
         return {};
     }
