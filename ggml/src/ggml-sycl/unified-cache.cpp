@@ -148,6 +148,7 @@ struct lifecycle_plan_record {
     ring_lease                                     lease;
 };
 
+// witnessed_mutex comes from witnessed-mutex.hpp, which this file includes only through lazy-io-pool.hpp.
 witnessed_mutex g_lifecycle_plan_mutex{ GGML_SYCL_WITNESS_NAME("g_lifecycle_plan_mutex") };
 std::unordered_map<uint64_t, lifecycle_plan_record>                               g_lifecycle_plan_candidates;
 // Unpublished probe-placement plans (the load-time measure's (a) stage), keyed by the load's transaction.

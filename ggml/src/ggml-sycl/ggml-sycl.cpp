@@ -2801,8 +2801,8 @@ static thread_local bool                                                      g_
 static thread_local ggml_sycl_model_token                                     g_runtime_expected_model{};
 static thread_local bool                                                      g_runtime_update_succeeded = false;
 static thread_local bool                                                      g_runtime_external_lease   = false;
-// Canonical ranked inventory/lifecycle publication writer lock. All cache/global
-// placement publications are serialized by this existing lock.
+// Canonical ranked inventory/lifecycle publication writer lock. All cache/global placement publications are serialized
+// by this existing lock. Its type is witnessed-mutex.hpp's, included here only through lazy-io-pool.hpp.
 static ggml_sycl::witnessed_mutex g_tensor_inventory_mutex{ GGML_SYCL_WITNESS_NAME("g_tensor_inventory_mutex") };
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool> g_fail_next_plan_publication_prepare{ false };
