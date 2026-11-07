@@ -1204,7 +1204,8 @@ static host_budget_result host_ledger_compute(const host_budget_sample & sample,
     if (b.status == host_budget_status::HEADROOM_EXHAUSTED) {
         GGML_LOG_WARN(
             "[HOST-LEDGER] host-headroom-exhausted MemAvailable=%zu MemTotal=%zu headroom=%zu: the budget grants "
-            "nothing past the committed %zu bytes, so every pinned request is refused\n",
+            "nothing past the committed %zu bytes, so every host charge past them is refused (a would-refuse WARN "
+            "while the ledger is WARN-only)\n",
             sample.available_bytes, sample.total_bytes, b.headroom, committed);
     } else if (b.status == host_budget_status::DETECTION_FAILED) {
         GGML_LOG_WARN(
