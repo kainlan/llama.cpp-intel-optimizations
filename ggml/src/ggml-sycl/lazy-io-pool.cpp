@@ -44,10 +44,12 @@ struct lazy_io_pool;
 // The IO engine (§5.2): the queue of §5.2.1 under its lock, and LAZY_BLOCK_RING_QD pread workers, worker i reading into
 // slot i of the ring, span bytes at ring + i * span. Its lock (canonical contract §12.5, L5) is a leaf: nothing is
 // taken under it, and it is never held across a read, a delivery, a lease drop or a log. A worker's wait releases it.
+// It is a witnessed lock (§3.3, §11 T5), so its condition variables are condition_variable_any: a test build's
+// witnessed_mutex records its holder and is not a std::mutex.
 struct lazy_io_engine {
-    std::mutex               mutex;
-    std::condition_variable  work;  // a worker waits here for a queued read or the stop
-    std::condition_variable  idle;  // shutdown waits here for the picked reads to finish
+    witnessed_mutex             mutex{ GGML_SYCL_WITNESS_NAME("lazy_io_engine::mutex") };
+    std::condition_variable_any work;  // a worker waits here for a queued read or the stop
+    std::condition_variable_any idle;  // shutdown waits here for the picked reads to finish
     lazy_io_queue            queue;
     std::vector<std::thread> workers;
     uint8_t *                ring = nullptr;
@@ -103,7 +105,7 @@ struct lazy_io_pool_access {
 
 namespace {
 
-std::mutex        g_lazy_registry_mutex;
+witnessed_mutex   g_lazy_registry_mutex{ GGML_SYCL_WITNESS_NAME("g_lazy_registry_mutex") };
 lazy_io_pool *    g_lazy_pool       = nullptr;  // the live pool, owned by the registry
 uint64_t          g_lazy_generation = 0;        // the last installed pool's generation; a take reserves the next one
 lazy_reap_node *  g_lazy_reap_list  = nullptr;  // the parked pools, each node owning its pool
@@ -138,7 +140,7 @@ lazy_hold_fn lazy_hold_claim_locked(lazy_hold_point point, void ** ctx) {
 }
 
 void lazy_hold_arm(lazy_hold_point point, lazy_hold_fn hold, void * ctx) {
-    std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+    std::lock_guard lock(g_lazy_registry_mutex);
     g_lazy_hold_point = point;
     g_lazy_hold       = hold;
     g_lazy_hold_ctx   = hold != nullptr ? ctx : nullptr;
@@ -204,7 +206,7 @@ ring_lease ring_lease::clone() const noexcept {
     }
     bool dying = false;
     {
-        std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+        std::lock_guard lock(g_lazy_registry_mutex);
         dying = pool_->dying;
         if (!dying) {
             pool_->leases.fetch_add(1, std::memory_order_relaxed);
@@ -234,7 +236,7 @@ void ring_lease::reset() noexcept {
         pool->leases.fetch_sub(1, std::memory_order_relaxed);
         return;
     }
-    std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+    std::lock_guard lock(g_lazy_registry_mutex);
     if (pool->leases.fetch_sub(1, std::memory_order_relaxed) != 1 || g_lazy_shut_down.load(std::memory_order_relaxed)) {
         return;
     }
@@ -265,7 +267,7 @@ ring_lease lazy_io_pool_take() {
         void *       hold_ctx = nullptr;
 #endif
         {
-            std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+            std::lock_guard lock(g_lazy_registry_mutex);
             if (g_lazy_shut_down.load(std::memory_order_relaxed)) {
                 return ring_lease();
             }
@@ -293,7 +295,7 @@ ring_lease lazy_io_pool_take() {
         lazy_io_pool * held  = nullptr;
         bool           again = false;
         {
-            std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+            std::lock_guard lock(g_lazy_registry_mutex);
 #if defined(LAZY_IO_POOL_MUTANT_INSTALL_ON_EMPTY_SLOT)
             const bool install = g_lazy_pool == nullptr;
 #else
@@ -334,7 +336,7 @@ void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
         for (;;) {
             std::unique_ptr<lazy_io_host_memory> ring;
             {
-                std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+                std::lock_guard lock(g_lazy_registry_mutex);
                 for (lazy_reap_node * node = g_lazy_reap_list; node != nullptr; node = node->next) {
                     if (node->pool->ring != nullptr) {
                         ring = std::move(node->pool->ring);
@@ -358,7 +360,7 @@ void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
     void *       hold_ctx = nullptr;
 #endif
     {
-        std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+        std::lock_guard lock(g_lazy_registry_mutex);
         ++g_lazy_full_reaps_run;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
         hold = lazy_hold_claim_locked(lazy_hold_point::REAP, &hold_ctx);
@@ -371,7 +373,7 @@ void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
 #endif
     lazy_reap_node * list = nullptr;
     {
-        std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+        std::lock_guard lock(g_lazy_registry_mutex);
         list                = g_lazy_reap_list;
         g_lazy_reap_list    = nullptr;
         g_lazy_parked_nodes = 0;
@@ -385,7 +387,7 @@ void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
 }
 
 void lazy_io_pool_mark_shut_down() noexcept {
-    std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+    std::lock_guard lock(g_lazy_registry_mutex);
     g_lazy_shut_down.store(true, std::memory_order_release);
 }
 
@@ -397,7 +399,7 @@ bool lazy_io_pool_generation_live(uint64_t generation) noexcept {
     if (generation == 0) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+    std::lock_guard lock(g_lazy_registry_mutex);
     if (g_lazy_pool != nullptr && g_lazy_pool->generation == generation) {
         return true;
     }
@@ -460,7 +462,7 @@ bool ggml_sycl_lazy_registry_for_testing(lazy_registry_state * out) {
     if (out == nullptr) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+    std::lock_guard lock(g_lazy_registry_mutex);
     out->live_pools             = g_lazy_pool != nullptr ? 1 : 0;
     out->live_leases            = g_lazy_pool != nullptr ? g_lazy_pool->leases.load(std::memory_order_relaxed) : 0;
     out->generation             = g_lazy_generation;
@@ -517,7 +519,7 @@ lazy_holding_status ggml_sycl_test_lazy_run_holding(int lock, lazy_hold_fn fn, v
         return lazy_holding_status::NOT_WIRED;
     }
     if (lock == LAZY_LOCK_REGISTRY) {
-        std::lock_guard<std::mutex> registry_lock(g_lazy_registry_mutex);
+        std::lock_guard registry_lock(g_lazy_registry_mutex);
         fn(ctx);
         return lazy_holding_status::HELD;
     }
@@ -531,7 +533,7 @@ lazy_holding_status ggml_sycl_test_lazy_run_holding(int lock, lazy_hold_fn fn, v
         return lazy_holding_status::NO_ENGINE;
     }
     {
-        std::lock_guard<std::mutex> queue_lock(engine->mutex);
+        std::lock_guard queue_lock(engine->mutex);
         fn(ctx);
     }
     return lazy_holding_status::HELD;
@@ -588,7 +590,7 @@ void ggml_sycl_test_lazy_plan_point() {
     lazy_hold_fn hold     = nullptr;
     void *       hold_ctx = nullptr;
     {
-        std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+        std::lock_guard lock(g_lazy_registry_mutex);
         hold = lazy_hold_claim_locked(lazy_hold_point::PLAN, &hold_ctx);
     }
     if (hold != nullptr) {
@@ -600,7 +602,7 @@ void ggml_sycl_test_lazy_mark_dying(const ring_lease & lease) {
     if (lease.pool_ == nullptr) {
         return;
     }
-    std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+    std::lock_guard lock(g_lazy_registry_mutex);
     lease.pool_->dying = true;
 }
 
@@ -1317,7 +1319,7 @@ lazy_io_engine::~lazy_io_engine() {
 
 void lazy_io_engine::stop_and_join() noexcept {
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::lock_guard lock(mutex);
         stop = true;
     }
     work.notify_all();
@@ -1357,7 +1359,7 @@ void lazy_io_engine::run(size_t slot) {
     for (;;) {
         lazy_io_read * read = nullptr;
         {
-            std::unique_lock<std::mutex> lock(mutex);
+            std::unique_lock lock(mutex);
             for (;;) {
                 if (stop) {
                     return;
@@ -1380,7 +1382,7 @@ void lazy_io_engine::run(size_t slot) {
 #endif
         std::unique_ptr<lazy_io_read> done;
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::lock_guard lock(mutex);
             done = queue.complete(read);
         }
         if (err != 0) {
@@ -1398,7 +1400,7 @@ void lazy_io_engine::run(size_t slot) {
         done.reset();
         ggml_sycl_lazy_ring_reap(lazy_reap_scope::WORKER);
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::lock_guard lock(mutex);
             --busy;
         }
         idle.notify_all();
@@ -1406,7 +1408,7 @@ void lazy_io_engine::run(size_t slot) {
 }
 
 ring_lease lazy_io_pool_join() {
-    std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+    std::lock_guard lock(g_lazy_registry_mutex);
     if (g_lazy_shut_down.load(std::memory_order_relaxed) || g_lazy_pool == nullptr ||
         g_lazy_pool->ring_bytes.load(std::memory_order_relaxed) == 0) {
         return ring_lease();
@@ -1474,7 +1476,7 @@ lazy_ring_ensure_status block_ring_ensure(size_t   need,
     const bool no_ensuring = false;
 #endif
     {
-        std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+        std::lock_guard lock(g_lazy_registry_mutex);
         if (g_lazy_shut_down.load(std::memory_order_relaxed)) {
             outcome = step1::SHUT_DOWN;
         } else if (g_lazy_pool == nullptr) {
@@ -1549,7 +1551,7 @@ lazy_ring_ensure_status block_ring_ensure(size_t   need,
             }
 #endif
             if (armed) {
-                std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+                std::lock_guard lock(g_lazy_registry_mutex);
                 pool->ensuring = false;
             }
         }
@@ -1599,7 +1601,7 @@ lazy_ring_ensure_status block_ring_ensure(size_t   need,
 #endif
     bool shut_down = false;
     {
-        std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+        std::lock_guard lock(g_lazy_registry_mutex);
         ++pool->ring_allocations;
         shut_down = g_lazy_shut_down.load(std::memory_order_relaxed) && !install_after_shut_down;
         if (!shut_down && pool->ring == nullptr) {
@@ -1653,7 +1655,7 @@ size_t lazy_io_submit(uint64_t               context,
     size_t                 added  = 0;
     size_t                 fresh  = 0;  // the reads this call queued, each holding one of the spare leases
     {
-        std::lock_guard<std::mutex> lock(engine->mutex);
+        std::lock_guard lock(engine->mutex);
         added = engine->queue.submit(context, fd, span, key, waiter, spare);
         fresh = reads - spare.size();
     }
@@ -1673,7 +1675,7 @@ void lazy_io_pool_shutdown() noexcept {
     lazy_io_engine * const                     engine = lazy_io_pool_access::pool(lease)->engine.get();
     std::vector<std::unique_ptr<lazy_io_read>> cancelled;
     {
-        std::lock_guard<std::mutex> lock(engine->mutex);
+        std::lock_guard lock(engine->mutex);
         cancelled = engine->queue.cancel_queued();
     }
     for (std::unique_ptr<lazy_io_read> & read : cancelled) {
@@ -1694,14 +1696,14 @@ void lazy_io_pool_shutdown() noexcept {
     lazy_hold_fn hold     = nullptr;
     void *       hold_ctx = nullptr;
     {
-        std::lock_guard<std::mutex> registry_lock(g_lazy_registry_mutex);
+        std::lock_guard registry_lock(g_lazy_registry_mutex);
         hold = lazy_hold_claim_locked(lazy_hold_point::SHUTDOWN, &hold_ctx);
     }
     if (hold != nullptr) {
         hold(hold_ctx);
     }
 #endif
-    std::unique_lock<std::mutex> lock(engine->mutex);
+    std::unique_lock lock(engine->mutex);
     engine->idle.wait(lock, [engine] { return engine->busy == 0; });
 }
 
@@ -1734,7 +1736,7 @@ bool lazy_block_ring_bytes(uint64_t * out) {
     if (out == nullptr) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(g_lazy_registry_mutex);
+    std::lock_guard lock(g_lazy_registry_mutex);
     if (g_lazy_pool == nullptr || g_lazy_pool->ring_bytes.load(std::memory_order_relaxed) == 0) {
         return false;
     }

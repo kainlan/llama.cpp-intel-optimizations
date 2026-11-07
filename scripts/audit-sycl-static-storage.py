@@ -898,7 +898,9 @@ def classify(row, reset_candidates):
     typ, scope, storage, name = row["type"], row["scope"], row["storage"], row["name"]
     if "thread_local" in storage:
         synchronization = "thread-local"
-    elif re.search(r"\b(atomic|mutex|once_flag|semaphore)\b", typ):
+    # witnessed_mutex is the lazy tables' lock (th32 §11 T5): std::mutex in a release build, a recording wrapper of one
+    # in a test build.
+    elif re.search(r"\b(atomic|mutex|witnessed_mutex|once_flag|semaphore)\b", typ):
         synchronization = "intrinsic:" + ("atomic" if "atomic" in typ else "lock primitive")
     else:
         synchronization = "none evident"
