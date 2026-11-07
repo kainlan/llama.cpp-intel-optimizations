@@ -73,20 +73,6 @@ const char * location_name(cache_location l) {
     return "?";
 }
 
-const char * retire_status_name(expert_retire_status status) {
-    switch (status) {
-        case expert_retire_status::INVALID:
-            return "INVALID";
-        case expert_retire_status::NOT_FOUND:
-            return "NOT_FOUND";
-        case expert_retire_status::WITHDRAWN:
-            return "WITHDRAWN";
-        case expert_retire_status::DEFERRED:
-            return "DEFERRED";
-    }
-    return "?";
-}
-
 ggml_sycl_cache_id key_of(uint64_t aux) {
     ggml_sycl_cache_id key{};
     key.valid    = true;
@@ -308,7 +294,7 @@ int run_interior(checks & c) {
             // what is checked.
             c.expect(retired == expert_retire_status::WITHDRAWN,
                      std::string("retiring the entry ") + api + " registered over the pinned slice returned status " +
-                         retire_status_name(retired) +
+                         pinned_host_block_test::retire_status_name(retired) +
                          ", expected WITHDRAWN: the entry would name memory freed when "
                          "the allocation drops");
         }
@@ -458,7 +444,8 @@ int run_overrun(checks & c) {
     if (!control_registered || control_retired != expert_retire_status::WITHDRAWN) {
         c.void_case(std::string("the control, a slice ending exactly at the allocation's end, was not accepted and "
                                 "retired (returned ") +
-                    std::to_string(control_registered) + ", retire " + retire_status_name(control_retired) +
+                    std::to_string(control_registered) + ", retire " +
+                    pinned_host_block_test::retire_status_name(control_retired) +
                     "): a refusal of everything would read as the refusal working");
         return c.status();
     }

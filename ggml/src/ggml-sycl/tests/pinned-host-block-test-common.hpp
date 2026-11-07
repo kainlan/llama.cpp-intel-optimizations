@@ -69,9 +69,26 @@ class block {
     size_t                bytes_ = 0;
 };
 
+// The name of a retire status, for a failure text that has to say which one it saw.
+inline const char * retire_status_name(ggml_sycl::expert_retire_status status) {
+    switch (status) {
+        case ggml_sycl::expert_retire_status::INVALID:
+            return "INVALID";
+        case ggml_sycl::expert_retire_status::NOT_FOUND:
+            return "NOT_FOUND";
+        case ggml_sycl::expert_retire_status::WITHDRAWN:
+            return "WITHDRAWN";
+        case ggml_sycl::expert_retire_status::DEFERRED:
+            return "DEFERRED";
+    }
+    return "?";
+}
+
 // Whole pages of a temporary file mapped through the FILE_MAPPED front door on `device`'s cache, as a SYCL_Mapped
 // buffer holds them: a registered FILE_MAPPED row, with the owner that keeps the mapping alive. A registration over it
-// names that owner (register_host_expert_owned).
+// names that owner (register_host_expert_owned). It does not reuse file_mapped_test::fixture_file and map_whole because
+// those report through the scratch-return-test checks framework, which the tests that include this header do not have;
+// this class fails by exiting, as block does.
 class mapped_block {
   public:
     mapped_block(int device, size_t pages) {

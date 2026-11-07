@@ -207,20 +207,6 @@ struct host_entry_retire {
     const char *               what;
     bool &                     refused;
 
-    static const char * status_name(ggml_sycl::expert_retire_status status) {
-        switch (status) {
-            case ggml_sycl::expert_retire_status::INVALID:
-                return "INVALID";
-            case ggml_sycl::expert_retire_status::NOT_FOUND:
-                return "NOT_FOUND";
-            case ggml_sycl::expert_retire_status::WITHDRAWN:
-                return "WITHDRAWN";
-            case ggml_sycl::expert_retire_status::DEFERRED:
-                return "DEFERRED";
-        }
-        return "?";
-    }
-
     ~host_entry_retire() {
         const ggml_sycl::expert_retire_status status =
             cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test/MoE host expert");
@@ -229,7 +215,7 @@ struct host_entry_retire {
             fprintf(
                 stderr,
                 "  FAIL: retiring the %s entry returned %s, expected WITHDRAWN: the entry would outlive its memory\n",
-                what, status_name(status));
+                what, pinned_host_block_test::retire_status_name(status));
             refused = true;
         }
     }
