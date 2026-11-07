@@ -1087,12 +1087,10 @@ average was 12-14. Latencies are per 4 KiB read; the batch rows are a batch of
 | batch of 16, 16 workers: `T_ticket` mean, p99 | 3.75 ms, 13.0 ms | 0.40 ms, 0.63 ms |
 | batch of 7100, 64 workers: rows/s (batch time) | 8344 (0.85 s) | 68887 (103.07 ms) |
 
-The 2026-11-01 run of the same probes on the same layout (`c-t65d`) gave
-7389 IOPS at QD1, 61492 at QD16, 69507 at QD64, 68884 rows/s for the batch of
-7100, and a batch-16 `T_ticket` of mean 0.41 ms, p99 0.65 ms. The differences
-from the table are run-to-run noise under host load, and the table keeps the
-2026-11-06 run. The §5.1 NVMe columns are the same `c-y57k` figures. The batch of 7100 reaches 68887 rows/s against the 69706 IOPS
-QD64 control, a ratio of 0.99.
+The 2026-11-01 run of the same probes on the same layout (`c-t65d`) gave 7389 IOPS at QD1, 61492 at QD16, 69507 at QD64,
+68884 rows/s for the batch of 7100, and a batch-16 `T_ticket` of mean 0.41 ms, p99 0.65 ms. The differences from the
+table are run-to-run noise under host load, and the table keeps the 2026-11-06 run. The §5.1 NVMe columns are the same
+`c-y57k` figures. The batch of 7100 reaches 68887 rows/s against the 69706 IOPS QD64 control, a ratio of 0.99.
 
 `/models` was bcachefs with three members (sysfs
 `/sys/fs/bcachefs/118129b2-.../dev-*`, and `bcachefs fs usage`):
