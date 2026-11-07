@@ -499,7 +499,7 @@ def budget_source_gaps(store: str, accessor: str, load: str, closure: str) -> li
     """The budget's source travels with the budget: stored beside it from the same sample, copied by the load, and
     taken by the dry run from its own sample."""
     gaps = []
-    if not re.search(r"g_host_ledger_budget_overridden\s*\.\s*store\s*\(", store) or "OVERRIDE" not in store:
+    if not re.search(r"g_host_ledger_budget_overridden\s*\.\s*store\s*\(\s*[^;]*\boverride_binds\b", store):
         gaps.append("host_ledger_store_budget does not store the override flag beside the budget")
     if not re.search(r"g_host_ledger_budget_overridden\s*\.\s*load\s*\(", accessor):
         gaps.append("host_ledger_budget_overridden does not read the stored flag")
@@ -591,7 +591,7 @@ def test_the_plan_line_checks_see_each_dropped_piece():
 
     store = (
         "g_host_ledger_mem_available.store(sample.available_bytes);\n"
-        "g_host_ledger_budget_overridden.store(sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE);\n"
+        "g_host_ledger_budget_overridden.store(b.override_binds, std::memory_order_release);\n"
     )
     accessor = "return g_host_ledger_budget_overridden.load(std::memory_order_acquire);\n"
     load = "g_placement_kv_info.host_budget_overridden = ggml_sycl::host_ledger_budget_overridden();\n"
@@ -603,8 +603,9 @@ def test_the_plan_line_checks_see_each_dropped_piece():
             (store.replace("g_host_ledger_budget_overridden.store", "(void)"), accessor, load, closure),
             "does not store the override flag beside the budget",
         ),
-        "the flag stored from no override test": (
-            (store.replace("::OVERRIDE", "::AUTO").replace("OVERRIDE", "AUTO"), accessor, load, closure),
+        "the flag stored from the accepted override": (
+            (store.replace("b.override_binds", "sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE"),
+             accessor, load, closure),
             "does not store the override flag beside the budget",
         ),
         "the accessor reads nothing": ((store, "return false;\n", load, closure), "does not read the stored flag"),

@@ -74,15 +74,14 @@ struct host_budget_result {
     bool               override_binds = false;  // the override is the smaller term, so it is the budget
 };
 
-namespace detail {
-inline size_t host_budget_sat_sub(size_t a, size_t b) {
+// Saturating size arithmetic: the one pair this header and the host ledger (unified-cache.cpp) both use.
+inline size_t host_ledger_sat_sub(size_t a, size_t b) {
     return a > b ? a - b : 0;
 }
 
-inline size_t host_budget_sat_add(size_t a, size_t b) {
+inline size_t host_ledger_sat_add(size_t a, size_t b) {
     return a > SIZE_MAX - b ? SIZE_MAX : a + b;
 }
-}  // namespace detail
 
 // The one host budget (§4.5): min(total x pct - pinned, committed + MemAvailable - host_headroom(total)) while
 // MemAvailable exceeds the headroom, and the refusal host-headroom-exhausted otherwise, which grants nothing past
@@ -104,7 +103,7 @@ inline host_budget_result host_budget_compute(const host_budget_inputs & in) {
             pct_cap    = in.available_bytes;
             r.headroom = std::min<size_t>(8ull << 30, in.available_bytes / 4);
         }
-        size_t headroom_free = detail::host_budget_sat_sub(in.available_bytes, r.headroom);
+        size_t headroom_free = host_ledger_sat_sub(in.available_bytes, r.headroom);
         if (in.available_bytes <= r.headroom) {
 #if defined(HOST_BUDGET_MUTANT_CLIFF)
             headroom_free = in.available_bytes / 2;
@@ -112,9 +111,9 @@ inline host_budget_result host_budget_compute(const host_budget_inputs & in) {
             r.status = host_budget_status::HEADROOM_EXHAUSTED;
 #endif
         }
-        const size_t share_term = detail::host_budget_sat_sub(pct_cap, in.pinned_bytes);
+        const size_t share_term = host_ledger_sat_sub(pct_cap, in.pinned_bytes);
         const size_t sample_term =
-            std::min(k_host_budget_uncapped, detail::host_budget_sat_add(in.committed_bytes, headroom_free));
+            std::min(k_host_budget_uncapped, host_ledger_sat_add(in.committed_bytes, headroom_free));
         r.computed = std::min(share_term, sample_term);
     }
     r.budget = r.computed;
@@ -172,8 +171,7 @@ inline host_working_set host_working_set_check_headroom(size_t headroom,
     ws.expected_host     = expected_host;
     ws.headroom          = headroom;
     ws.mapped_ws         = locked ? 0 : mapped_bytes;
-    ws.resident_room =
-        detail::host_budget_sat_sub(detail::host_budget_sat_sub(mem_available_pre, expected_host), ws.headroom);
+    ws.resident_room     = host_ledger_sat_sub(host_ledger_sat_sub(mem_available_pre, expected_host), ws.headroom);
 #if defined(HOST_BUDGET_MUTANT_WARN_ABOVE_THRESHOLD)
     ws.exceeds = ws.mapped_ws != 0;
 #else

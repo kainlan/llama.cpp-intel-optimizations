@@ -1079,14 +1079,6 @@ static size_t host_ledger_pinned_share();
 static size_t host_ledger_test_live_charged_bytes();
 #endif
 
-static size_t host_ledger_sat_sub(size_t a, size_t b) {
-    return a > b ? a - b : 0;
-}
-
-static size_t host_ledger_sat_add(size_t a, size_t b) {
-    return a > SIZE_MAX - b ? SIZE_MAX : a + b;
-}
-
 // The bytes `ask` is short of fitting under `budget` with `committed` charged, without wrapping either way.
 static size_t host_ledger_deficit(size_t ask, size_t committed, size_t budget) {
     if (committed > budget) {
@@ -1223,9 +1215,7 @@ size_t host_ledger_store_budget(const host_budget_sample & sample) {
     g_host_ledger_headroom.store(b.headroom, std::memory_order_release);
     g_host_ledger_headroom_exhausted.store(b.status == host_budget_status::HEADROOM_EXHAUSTED,
                                            std::memory_order_release);
-    g_host_ledger_budget_overridden.store(
-        sample.reserve.status == detail::host_reserve_parse_status::OVERRIDE && b.override_binds,
-        std::memory_order_release);
+    g_host_ledger_budget_overridden.store(b.override_binds, std::memory_order_release);
     g_host_ledger_budget.store(budget, std::memory_order_release);
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     g_test_host_ledger_stores.fetch_add(1, std::memory_order_acq_rel);
