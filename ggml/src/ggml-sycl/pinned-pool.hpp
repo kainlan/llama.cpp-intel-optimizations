@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <sycl/sycl.hpp>
 #include <vector>
 
@@ -152,10 +153,10 @@ class pinned_chunk_pool {
     // consumed one does.
     class released_chunk;
 
-    // Create a pool with the given budget (maximum total memory to allocate). `headroom_exhausted` records that the
-    // budget is 0 because MemAvailable is at or below the host's headroom (design 5efe §4.5), so every refused growth
-    // names that reason.
-    pinned_chunk_pool(sycl::queue & queue, size_t budget, bool headroom_exhausted = false);
+    // Create a pool with the given budget (maximum total memory to allocate). `refusal_reason` is what every refused
+    // growth appends: the headroom refusal with its sample's figures (host_headroom_refusal_reason, design 5efe §4.5)
+    // when the budget is 0 because MemAvailable is at or below the host's headroom, and empty otherwise.
+    pinned_chunk_pool(sycl::queue & queue, size_t budget, std::string refusal_reason = std::string());
     ~pinned_chunk_pool();
 
     // Non-copyable, non-movable (owns SYCL allocations)
@@ -417,7 +418,7 @@ class pinned_chunk_pool {
 
     sycl::queue &                                                   queue_;
     size_t                                                          budget_;
-    const bool                                                      headroom_exhausted_;  // the budget's refusal
+    const std::string                                               refusal_reason_;  // every refused growth appends it
     // Footprint: the backing bytes of every chunk whose memory is not yet gone. Written by grow_into's commit, the
     // carrier's GONE branch, the reconcile and the destructor's reset; read for decisions only via footprint_locked().
     mutable size_t                                                  total_allocated_  = 0;

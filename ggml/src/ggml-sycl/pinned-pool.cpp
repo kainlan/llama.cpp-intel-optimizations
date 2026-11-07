@@ -9,7 +9,6 @@
 #include "allocation-provenance.hpp"
 #include "common.hpp"
 #include "ggml-impl.h"
-#include "host-budget.hpp"
 #include "scratch-test-mutant.hpp"
 
 #include <algorithm>
@@ -21,6 +20,7 @@
 #include <memory>
 #include <new>
 #include <thread>
+#include <utility>
 
 namespace ggml_sycl {
 namespace {
@@ -115,15 +115,6 @@ mem_handle allocate_pinned_chunk_owner(sycl::queue &       queue,
     return owner;
 }
 
-// What a refused growth appends (design 5efe §4.5): the refusal host-headroom-exhausted when the pool's budget is 0
-// because MemAvailable is at or below the host's headroom, otherwise nothing.
-std::string pinned_budget_refusal_reason(bool headroom_exhausted) {
-    if (!headroom_exhausted) {
-        return std::string();
-    }
-    return std::string(" reason=") + host_budget_status_name(host_budget_status::HEADROOM_EXHAUSTED);
-}
-
 }  // namespace
 
 struct pinned_chunk_pool::stranded_entry {
@@ -146,10 +137,10 @@ const char * host_zone_name(host_zone_id zone) {
     }
 }
 
-pinned_chunk_pool::pinned_chunk_pool(sycl::queue & queue, size_t budget, bool headroom_exhausted) :
+pinned_chunk_pool::pinned_chunk_pool(sycl::queue & queue, size_t budget, std::string refusal_reason) :
     queue_(queue),
     budget_(budget),
-    headroom_exhausted_(headroom_exhausted),
+    refusal_reason_(std::move(refusal_reason)),
     chunk_size_(resolve_chunk_size()),
     alloc_timeout_ms_(resolve_alloc_timeout_ms()) {
     GGML_LOG_INFO("[SYCL] Pinned chunk pool created with %.1f GB budget, committed=0.0 GB (chunk=%.1f MB)\n",
@@ -229,7 +220,7 @@ segmented_buffer pinned_chunk_pool::allocate_segmented(size_t size, size_t align
         // No used figure: the footprint's log reads are a fixed census, and at a budget the headroom zeroed it says
         // nothing the budget and the reason do not.
         GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB budget)%s\n", budget_ / (1024.0 * 1024.0 * 1024.0),
-                      pinned_budget_refusal_reason(headroom_exhausted_).c_str());
+                      refusal_reason_.c_str());
         return {};
     }
 
@@ -290,7 +281,7 @@ size_t pinned_chunk_pool::pre_allocate(size_t total_bytes) {
     for (size_t i = 0; i < chunks_needed; i++) {
         if (footprint_locked() + chunk_size_ > budget_) {
             GGML_LOG_WARN("[SYCL] Pinned pool pre_allocate: budget exhausted after %zu/%zu chunks%s\n", chunks_grown,
-                          chunks_needed, pinned_budget_refusal_reason(headroom_exhausted_).c_str());
+                          chunks_needed, refusal_reason_.c_str());
             break;
         }
         if (!grow(chunk_size_, "pre_allocate")) {
@@ -770,7 +761,7 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes, si
             "[SYCL] Pinned pool grow_zone: budget exhausted for zone %zu "
             "(need %.1f MB, budget=%.1f GB, used=%.1f GB)%s\n",
             zi, footprint.backing / (1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
-            total_allocated_ / (1024.0 * 1024.0 * 1024.0), pinned_budget_refusal_reason(headroom_exhausted_).c_str());
+            total_allocated_ / (1024.0 * 1024.0 * 1024.0), refusal_reason_.c_str());
         return false;
     }
 
@@ -1203,7 +1194,7 @@ void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
     if (footprint_locked() + footprint.backing > budget_) {
         GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)%s\n",
                       total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
-                      pinned_budget_refusal_reason(headroom_exhausted_).c_str());
+                      refusal_reason_.c_str());
         return nullptr;
     }
 
@@ -1271,7 +1262,7 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
     if (footprint_locked() + backing_size > budget_) {
         GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)%s\n",
                       total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
-                      pinned_budget_refusal_reason(headroom_exhausted_).c_str());
+                      refusal_reason_.c_str());
         return false;
     }
 

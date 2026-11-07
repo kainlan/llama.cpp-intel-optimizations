@@ -1203,10 +1203,10 @@ static host_budget_result host_ledger_compute(const host_budget_sample & sample,
     }
     if (b.status == host_budget_status::HEADROOM_EXHAUSTED) {
         GGML_LOG_WARN(
-            "[HOST-LEDGER] host-headroom-exhausted MemAvailable=%zu MemTotal=%zu headroom=%zu: the budget grants "
-            "nothing past the committed %zu bytes, so every host charge past them is refused (a would-refuse WARN "
-            "while the ledger is WARN-only)\n",
-            sample.available_bytes, sample.total_bytes, b.headroom, committed);
+            "[HOST-LEDGER] the budget grants nothing past the committed %zu bytes, so every host charge past them is "
+            "refused (a would-refuse WARN while the ledger is WARN-only)%s\n",
+            committed,
+            host_headroom_refusal_reason(true, sample.available_bytes, sample.total_bytes, b.headroom).c_str());
     } else if (b.status == host_budget_status::DETECTION_FAILED) {
         GGML_LOG_WARN(
             "[HOST-ARENA] System RAM detection failed; the host ledger's budget is uncapped (%zu bytes) and only the "
@@ -6965,7 +6965,9 @@ unified_cache::unified_cache(sycl::queue & queue,
         size_t total_mem          = 0;
         size_t available_mem      = 0;
         size_t headroom           = 0;
-        bool   headroom_exhausted = false;  // the budget is 0 because MemAvailable is at or below the headroom
+        // The reason every refused pinned growth appends when this budget is the headroom refusal (design 5efe §4.5),
+        // formatted once from this sample: empty otherwise.
+        std::string refusal_reason;
         if (host_mem_budget == 0) {
             const char * reserve_raw = std::getenv("GGML_SYCL_HOST_RESERVE_MB");
 
@@ -7007,12 +7009,11 @@ unified_cache::unified_cache(sycl::queue & queue,
                     "budget is %.1f GB\n",
                     reserve.mb, b.computed / (1024.0 * 1024.0 * 1024.0), host_mem_budget / (1024.0 * 1024.0 * 1024.0));
             }
-            headroom_exhausted = b.status == ggml_sycl::host_budget_status::HEADROOM_EXHAUSTED;
-            if (headroom_exhausted) {
-                GGML_LOG_WARN(
-                    "[HOST-ARENA] host-headroom-exhausted MemAvailable=%zu MemTotal=%zu headroom=%zu: the pinned "
-                    "pool's budget is 0, so every pinned request is refused\n",
-                    available_mem, total_mem, headroom);
+            refusal_reason = ggml_sycl::host_headroom_refusal_reason(
+                b.status == ggml_sycl::host_budget_status::HEADROOM_EXHAUSTED, available_mem, total_mem, headroom);
+            if (!refusal_reason.empty()) {
+                GGML_LOG_WARN("[HOST-ARENA] the pinned pool's budget is 0, so every pinned request is refused%s\n",
+                              refusal_reason.c_str());
             } else if (b.status == ggml_sycl::host_budget_status::DETECTION_FAILED) {
                 GGML_LOG_WARN(
                     "[HOST-ARENA] System RAM detection failed; using lazy-growth host arena without a detected RAM "
@@ -7037,10 +7038,10 @@ unified_cache::unified_cache(sycl::queue & queue,
         if (getenv("GGML_SYCL_NO_PINNED") != nullptr) {
             GGML_LOG_INFO("[HOST-ARENA] GGML_SYCL_NO_PINNED set: disabling pinned host memory\n");
             host_mem_budget    = 0;
-            headroom_exhausted = false;  // the budget is 0 by request, not by the headroom
+            refusal_reason.clear();  // the budget is 0 by request, not by the headroom
         }
 
-        host_arena_ = std::make_unique<pinned_chunk_pool>(queue_, host_mem_budget, headroom_exhausted);
+        host_arena_ = std::make_unique<pinned_chunk_pool>(queue_, host_mem_budget, refusal_reason);
         GGML_LOG_INFO(
             "[HOST-ARENA] Created with %.1f GB budget, committed=0.0 GB "
             "(system total=%.1f GB available=%.1f GB headroom=%.1f GB pct=%d)\n",
