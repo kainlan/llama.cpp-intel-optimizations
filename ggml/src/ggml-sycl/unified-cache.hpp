@@ -12,6 +12,7 @@
 #include "dpct/helper.hpp"
 #include "file-mapping.hpp"
 #include "ggml-sycl.h"
+#include "host-budget.hpp"
 #include "host-cpu-mapping.hpp"
 #include "host-reserve-env.hpp"
 #include "host-zone-kinds.hpp"
@@ -8018,8 +8019,12 @@ host_budget_sample host_ledger_sample();
 // The budget for `sample` with `committed` bytes already charged: host_budget_compute (host-budget.hpp, design 5efe
 // §4.5). Saturating: a pinned share above the percentage cap, or an available reading at or below
 // host_headroom(total), the refusal host-headroom-exhausted, gives a budget at or below `committed`, which refuses
-// the next charge by name. An accepted GGML_SYCL_HOST_RESERVE_MB caps the budget and never raises it.
-size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed);
+// the next charge by name. An accepted GGML_SYCL_HOST_RESERVE_MB caps the budget and never raises it. `result`, when
+// given, receives the whole result: its override_binds is whether the override is the budget, its status and headroom
+// whether the budget is the headroom refusal.
+size_t host_ledger_compute_budget(const host_budget_sample & sample,
+                                  size_t                     committed,
+                                  host_budget_result *       result = nullptr);
 
 // Computes against the live committed bytes and stores the result, and stores the sample's MemAvailable and whether
 // GGML_SYCL_HOST_RESERVE_MB's override set the budget beside it. The one writer of the stored budget besides the test

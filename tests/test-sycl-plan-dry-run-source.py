@@ -512,6 +512,10 @@ def budget_source_gaps(store: str, accessor: str, load: str, closure: str) -> li
         gaps.append("the dry run does not set its planner input's budget source")
     if calls(closure, "host_ledger_budget_overridden"):
         gaps.append("the dry run reads the ledger's stored flag, not its own sample's")
+    # An accepted override above the formula is not the budget (design 5efe §4.5: it composes), so the source is the
+    # dry run's own budget's binding term, as the store's is.
+    if not re.search(r"\.\s*override_binds\b", closure):
+        gaps.append("the dry run's budget source is not its own budget's binding term (override_binds)")
     return gaps
 
 
@@ -591,7 +595,10 @@ def test_the_plan_line_checks_see_each_dropped_piece():
     )
     accessor = "return g_host_ledger_budget_overridden.load(std::memory_order_acquire);\n"
     load = "g_placement_kv_info.host_budget_overridden = ggml_sycl::host_ledger_budget_overridden();\n"
-    closure = "kv.host_mem_available_pre = mem_available;\nkv.host_budget_overridden = budget_overridden;\n"
+    closure = (
+        "const bool budget_overridden = budget.override_binds;\n"
+        "kv.host_mem_available_pre = mem_available;\nkv.host_budget_overridden = budget_overridden;\n"
+    )
     assert budget_source_gaps(store, accessor, load, closure) == [], budget_source_gaps(store, accessor, load, closure)
     source_mutants = {
         "the flag not stored": (store.replace("g_host_ledger_budget_overridden.store", "(void)"), accessor, load,
@@ -601,6 +608,10 @@ def test_the_plan_line_checks_see_each_dropped_piece():
         "the accessor reads nothing": (store, "return false;\n", load, closure),
         "the load copies nothing": (store, accessor, "", closure),
         "the dry run sets nothing": (store, accessor, load, "kv.host_mem_available_pre = mem_available;\n"),
+        "the dry run's source is the accepted override": (
+            store, accessor, load,
+            closure.replace("budget.override_binds", "reserve.status == detail::host_reserve_parse_status::OVERRIDE"),
+        ),
         "the dry run reads the ledger": (
             store, accessor, load, closure.replace("budget_overridden;", "ggml_sycl::host_ledger_budget_overridden();")
         ),

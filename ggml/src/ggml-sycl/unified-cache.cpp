@@ -1206,8 +1206,12 @@ static host_budget_result host_ledger_compute(const host_budget_sample & sample,
     return b;
 }
 
-size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed) {
-    return host_ledger_compute(sample, committed).budget;
+size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed, host_budget_result * result) {
+    const host_budget_result b = host_ledger_compute(sample, committed);
+    if (result != nullptr) {
+        *result = b;
+    }
+    return b.budget;
 }
 
 size_t host_ledger_store_budget(const host_budget_sample & sample) {

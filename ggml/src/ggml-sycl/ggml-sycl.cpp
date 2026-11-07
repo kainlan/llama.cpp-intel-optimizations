@@ -19122,9 +19122,13 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         if (in.mem_available_set != 0) {
             sample.available_bytes = static_cast<size_t>(in.mem_available_bytes);
         }
-        const size_t committed        = ggml_sycl::host_ledger_committed();
-        const size_t host_budget      = ggml_sycl::host_ledger_compute_budget(sample, committed);
+        const size_t                  committed = ggml_sycl::host_ledger_committed();
+        ggml_sycl::host_budget_result budget_result;
+        const size_t host_budget       = ggml_sycl::host_ledger_compute_budget(sample, committed, &budget_result);
         const bool   reserve_override = sample.reserve.status == ggml_sycl::detail::host_reserve_parse_status::OVERRIDE;
+        // The budget's source is the override only when the override is the budget (design 5efe §4.5: it composes),
+        // as the load's stored flag is; an accepted override above the formula leaves the computed budget.
+        const bool   budget_overridden = budget_result.override_binds;
         GGML_LOG_INFO("[PLAN-DRY-RUN] sample: total=%zu available=%zu (%s) pinned=%zu committed=%zu budget_pct=%d%s\n",
                       sample.total_bytes, sample.available_bytes,
                       in.mem_available_set != 0 ? "--mem-available" : "MemAvailable", sample.pinned_bytes, committed,
@@ -19151,7 +19155,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
             std::lock_guard<std::mutex>        lock(g_tensor_inventory_mutex);
             ggml_sycl_plan_dry_run_saved_state saved(ggml_sycl_info().total_gpu_count);
             multi_device = ggml_sycl_plan_multi_device();
-            plans = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, sample.available_bytes, reserve_override,
+            plans = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, sample.available_bytes, budget_overridden,
                                                  out.device_budget_bytes, lazy_infos);
         }
         for (int d = 0; d < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES; ++d) {
