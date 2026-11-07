@@ -6009,12 +6009,13 @@ NVMe (1000 / (50 + 0.46)), against **>= 18.4 tok/s** on bcachefs (1000 / (50 + 4
 The control IOPS is the same-session QD64 control of §8.1: 69706 on the NVMe in
 the 2026-11-06 probe run, against 9124 on bcachefs. The QD16 control, 63757, is not an input
 to any target here. The engine ratio, 68887 rows/s over 69706 IOPS, is 0.99.
+The NVMe time bounds of this section are rounded up to the third decimal place, never down.
 
 | arm | target, NVMe, 2026-11-06 | target, bcachefs over USB, 2026-09-26 | derived from |
 |---|---|---|---|
 | H | `T_gather` <= **3 ms/ubatch**; pp512 within **1%** of `--lazy-mode off`. Unchanged: not storage-derived | the same | measured ~2 ms for 8192 rows |
-| S-cold | engine ratio >= **0.9** (§8.1; 68887 / 69706 = 0.99). `T_ticket` <= **1.15 x U / (0.9 x 69706)**: real text (U 7028-7104) <= **0.13 s** (1.15 x 7104 / 62735 = 0.130), `llama-bench` random (U 8116-8192) <= **0.15 s** (1.15 x 8192 / 62735 = 0.150) | engine ratio >= **0.9** (§8.1). `T_ticket` <= **1.15 x U / (0.9 x 9124)**: real text (U 7028-7104) <= **1.0 s**, `llama-bench` random (U 8116-8192) <= **1.15 s** | §5.1, §6.2.1 |
-| S-warm | the same formula with `U` from the simulation at the planned `cache_slots`: prose (512 MiB) 4335 -> **<= 0.079 s** (1.15 x 4335 / 62735); mixed (512 MiB) 2275 -> **<= 0.042 s** (1.15 x 2275 / 62735) | the same formula, `U` from the same simulation: prose 4335 -> **<= 0.6 s**; mixed 2275 -> **<= 0.32 s** | §6.2.1 |
+| S-cold | engine ratio >= **0.9** (§8.1; 68887 / 69706 = 0.99). `T_ticket` <= **1.15 x U / (0.9 x 69706)**: real text (U 7028-7104) <= **0.131 s** (1.15 x 7104 / 62735 = 0.1302), `llama-bench` random (U 8116-8192) <= **0.151 s** (1.15 x 8192 / 62735 = 0.1502) | engine ratio >= **0.9** (§8.1). `T_ticket` <= **1.15 x U / (0.9 x 9124)**: real text (U 7028-7104) <= **1.0 s**, `llama-bench` random (U 8116-8192) <= **1.15 s** | §5.1, §6.2.1 |
+| S-warm | the same formula with `U` from the simulation at the planned `cache_slots`: prose (512 MiB) 4335 -> **<= 0.080 s** (1.15 x 4335 / 62735 = 0.0795); mixed (512 MiB) 2275 -> **<= 0.042 s** (1.15 x 2275 / 62735 = 0.0417) | the same formula, `U` from the same simulation: prose 4335 -> **<= 0.6 s**; mixed 2275 -> **<= 0.32 s** | §6.2.1 |
 | S-hot | `T_ticket == 0`. Unchanged | the same | |
 | phase 2 lookahead, multi-ubatch prompt | stall of ubatch `k >= 2` <= `max(0, IO(k) - compute(k-1)) + 10%`. Unchanged | the same | §5.4 |
 
