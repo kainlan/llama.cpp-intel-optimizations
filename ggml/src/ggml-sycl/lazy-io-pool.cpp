@@ -50,12 +50,12 @@ struct lazy_io_engine {
     witnessed_mutex             mutex{ GGML_SYCL_WITNESS_NAME("lazy_io_engine::mutex") };
     std::condition_variable_any work;  // a worker waits here for a queued read or the stop
     std::condition_variable_any idle;  // shutdown waits here for the picked reads to finish
-    lazy_io_queue            queue;
-    std::vector<std::thread> workers;
-    uint8_t *                ring = nullptr;
-    size_t                   span = 0;
-    size_t                   busy = 0;  // reads a worker has picked and not finished, its lease dropped included
-    bool                     stop = false;
+    lazy_io_queue               queue;
+    std::vector<std::thread>    workers;
+    uint8_t *                   ring = nullptr;
+    size_t                      span = 0;
+    size_t                      busy = 0;  // reads a worker has picked and not finished, its lease dropped included
+    bool                        stop = false;
 
     lazy_io_engine() = default;
     ~lazy_io_engine();
