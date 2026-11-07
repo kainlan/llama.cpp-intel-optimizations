@@ -1,9 +1,9 @@
 //
-// A host block for the tests that register host memory with a unified_cache directly (docs/design/sycl-mmap-host-tier.md
-// §4.8, §7 C6). register_host_expert and register_host_weight refuse a pointer no registry knows, so a std::vector's
-// bytes no longer qualify; this block is a pinned allocation minted owner-first through unified_allocate_owner, which
-// is a registered HOST_PINNED row. The block owns its memory, and a registration over it stays the unowned external
-// kind the test meant, because the call still names no owner.
+// A host block for the tests that register host memory with a unified_cache directly
+// (docs/design/sycl-mmap-host-tier.md §4.8, §7 C6). register_host_expert and register_host_weight refuse a pointer no
+// registry knows, so a std::vector's bytes no longer qualify; this block is a pinned allocation minted owner-first
+// through unified_allocate_owner, which is a registered HOST_PINNED row. The block owns its memory, and a registration
+// over it stays the unowned external kind the test meant, because the call still names no owner.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -69,9 +69,9 @@ class block {
     size_t                bytes_ = 0;
 };
 
-// Whole pages of a temporary file mapped through the FILE_MAPPED front door on `device`'s cache, as a SYCL_Mapped buffer
-// holds them: a registered FILE_MAPPED row, with the owner that keeps the mapping alive. A registration over it names
-// that owner (register_host_expert_owned).
+// Whole pages of a temporary file mapped through the FILE_MAPPED front door on `device`'s cache, as a SYCL_Mapped
+// buffer holds them: a registered FILE_MAPPED row, with the owner that keeps the mapping alive. A registration over it
+// names that owner (register_host_expert_owned).
 class mapped_block {
   public:
     mapped_block(int device, size_t pages) {
