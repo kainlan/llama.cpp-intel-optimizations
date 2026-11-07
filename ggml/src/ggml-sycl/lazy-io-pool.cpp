@@ -186,6 +186,34 @@ void lazy_reap_first_step_seam() {
                                 "the test seam's throw at the reap's first step");
     }
 }
+
+// The reap's witness (§3.3, §11 T5): the reap takes the registry's leaf mutex and joins IO workers, so it runs with no
+// witnessed lock held. One called with a lock held refuses before taking any: it names the lock in one WARN, counts the
+// refusal and frees nothing, leaving its parked pools to the next reap.
+bool lazy_reap_refused_under_held_lock() noexcept {
+    const char * held = witnessed_mutex_held_any();
+    if (held == nullptr) {
+        return false;
+    }
+    g_lazy_reaps_refused.fetch_add(1, std::memory_order_relaxed);
+    GGML_LOG_WARN("[HOST-PLAN-BUG] ring reap refused: %s held\n", held);
+    return true;
+}
+
+// The drop's witness (§3.3, §11 T5): a final drop parks its pool under the registry's leaf mutex, so a drop runs with
+// no witnessed lock held. One that runs with a lock held names it in one WARN, counts it and completes; under the
+// registry's own mutex the drop would take that mutex again, so it aborts naming it.
+void lazy_drop_witness() noexcept {
+    const char * held = witnessed_mutex_held_any();
+    if (held == nullptr) {
+        return;
+    }
+    g_lazy_lease_drops_locked.fetch_add(1, std::memory_order_relaxed);
+    GGML_LOG_WARN("[HOST-PLAN-BUG] ring lease dropped with %s held\n", held);
+    if (witnessed_mutex_held(g_lazy_registry_mutex)) {
+        GGML_ABORT("ring_lease::reset: the dropping thread holds the IO pool registry's leaf mutex");
+    }
+}
 #endif
 
 // The take-time snapshots, read with the counters. Caller holds g_lazy_registry_mutex.
@@ -250,6 +278,7 @@ void ring_lease::reset() noexcept {
         return;
     }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+    lazy_drop_witness();
     // The drop's hold point (§3.3's race): a fixture holds this drop before its decrement while a take joins the pool.
     lazy_hold_run(lazy_hold_point::DROP);
 #endif
@@ -346,6 +375,11 @@ ring_lease lazy_io_pool_take() {
 }
 
 void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (lazy_reap_refused_under_held_lock()) {
+        return;
+    }
+#endif
     if (scope == lazy_reap_scope::WORKER) {
         // One ring per pass, so nothing is allocated under the leaf mutex: the first parked pool still holding a ring
         // gives it up under the lock, and the ring is freed after the unlock, its handle's drop crediting the budget
