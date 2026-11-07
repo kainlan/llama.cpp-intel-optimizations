@@ -2,8 +2,8 @@
 // A host block for the tests that register host memory with a unified_cache directly
 // (docs/design/sycl-mmap-host-tier.md §4.8, §7 C6). register_host_expert and register_host_weight refuse a pointer no
 // registry knows, so a std::vector's bytes no longer qualify; this block is a pinned allocation minted owner-first
-// through unified_allocate_owner, which is a registered HOST_PINNED row. The block owns its memory, and a registration
-// over it stays the unowned external kind the test meant, because the call still names no owner.
+// through unified_allocate_owner, which is a registered HOST_PINNED row. The helper only allocates the block: whether a
+// registration over it names an owner (register_host_expert_owned) or none (register_host_expert) is the test's call.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
