@@ -1019,10 +1019,10 @@ thread_local bool g_allocating_cache_backing = false;
 // starts at 0, at which host_ledger_try_charge refuses every charge until the first store. Phase (a)'s owner entry
 // passes warn_only, so its charge there logs a would-refuse WARN and is made.
 //
-// The committed bytes, the stored budget, its sample's MemAvailable and override flag, and the two yieldable counters
-// publish no other data: each is read for its own value alone, so the acquire, release and acq_rel orders on them order
-// nothing else. The orders are kept as documentation of intent, not relaxed. The yielder slots below are different:
-// their handshake orders the callback.
+// The committed bytes, the stored budget, its sample's MemAvailable, MemTotal and headroom, its override and
+// headroom-exhausted flags, and the two yieldable counters publish no other data: each is read for its own value alone,
+// so the acquire, release and acq_rel orders on them order nothing else. The orders are kept as documentation of
+// intent, not relaxed. The yielder slots below are different: their handshake orders the callback.
 static std::atomic<size_t> g_host_ledger_committed{ 0 };
 static std::atomic<size_t> g_host_ledger_budget{ 0 };
 // The MemAvailable of the sample the stored budget was computed from, stored by the same writer beside it, so a load's

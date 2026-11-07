@@ -8032,9 +8032,11 @@ size_t host_ledger_compute_budget(const host_budget_sample & sample,
                                   size_t                     committed,
                                   host_budget_result *       result = nullptr);
 
-// Computes against the live committed bytes and stores the result, and stores the sample's MemAvailable and whether
-// GGML_SYCL_HOST_RESERVE_MB's override set the budget beside it. The one writer of the stored budget besides the test
-// setter, which leaves the MemAvailable and the override flag as they were; it counts its stores, the setter does not.
+// Computes against the live committed bytes and stores the result, and beside it the sample's MemAvailable, MemTotal
+// and the headroom the budget left, whether that budget is the refusal host-headroom-exhausted (design 5efe §4.5), and
+// whether GGML_SYCL_HOST_RESERVE_MB's override set it. The one writer of the stored budget besides the test setter,
+// which clears the refusal flag, zeroes MemTotal and the headroom, and leaves MemAvailable and the override flag as
+// they were; it counts its stores, the setter does not.
 size_t host_ledger_store_budget(const host_budget_sample & sample);
 
 size_t host_ledger_budget();           // one atomic load of the stored budget
