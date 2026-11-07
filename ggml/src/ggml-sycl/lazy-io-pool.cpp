@@ -374,37 +374,39 @@ ring_lease lazy_io_pool_take() {
     }
 }
 
-void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
-#if defined(GGML_SYCL_PRIVATE_TESTING)
-    if (lazy_reap_refused_under_held_lock()) {
-        return;
-    }
-#endif
-    if (scope == lazy_reap_scope::WORKER) {
-        // One ring per pass, so nothing is allocated under the leaf mutex: the first parked pool still holding a ring
-        // gives it up under the lock, and the ring is freed after the unlock, its handle's drop crediting the budget
-        // ledger. The nodes stay on the list with their pools, whose workers only a FULL reap joins.
-        for (;;) {
-            std::unique_ptr<lazy_io_host_memory> ring;
-            {
-                std::lock_guard lock(g_lazy_registry_mutex);
-                for (lazy_reap_node * node = g_lazy_reap_list; node != nullptr; node = node->next) {
-                    if (node->pool->ring != nullptr) {
-                        ring = std::move(node->pool->ring);
-                        node->pool->ring_bytes.store(0, std::memory_order_release);
-                        break;
-                    }
+namespace {
+
+// A WORKER pass: one ring per pass, so nothing is allocated under the leaf mutex. The first parked pool still holding a
+// ring gives it up under the lock, and the ring is freed after the unlock, its handle's drop crediting the budget
+// ledger. The nodes stay on the list with their pools, whose workers only a FULL reap joins. Its locks can throw
+// std::system_error, which the reap catches.
+void lazy_reap_worker_pass() {
+    for (;;) {
+        std::unique_ptr<lazy_io_host_memory> ring;
+        {
+            std::lock_guard lock(g_lazy_registry_mutex);
+            for (lazy_reap_node * node = g_lazy_reap_list; node != nullptr; node = node->next) {
+                if (node->pool->ring != nullptr) {
+                    ring = std::move(node->pool->ring);
+                    node->pool->ring_bytes.store(0, std::memory_order_release);
+                    break;
                 }
             }
-            if (ring == nullptr) {
-#if defined(GGML_SYCL_PRIVATE_TESTING)
-                g_lazy_worker_reaps.fetch_add(1, std::memory_order_relaxed);
-#endif
-                return;
-            }
-            ring.reset();
         }
+        if (ring == nullptr) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            g_lazy_worker_reaps.fetch_add(1, std::memory_order_relaxed);
+#endif
+            return;
+        }
+        ring.reset();
     }
+}
+
+// A FULL pass: takes the parked list under the lock and frees every pool on it after the unlock, joining its workers.
+// Its locks can throw std::system_error, which the reap catches; a throw before the list is taken leaves every pool
+// parked for the next reap.
+void lazy_reap_full_pass() {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     lazy_reap_first_step_seam();
     lazy_hold_fn hold     = nullptr;
@@ -434,6 +436,31 @@ void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
         delete list->pool;
         delete list;
         list = next;
+    }
+}
+
+}  // namespace
+
+void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (lazy_reap_refused_under_held_lock()) {
+        return;
+    }
+#endif
+    // A failure to reset is logged and never thrown (§3.3): std::mutex::lock can throw std::system_error, and the reap
+    // runs from destructors and from noexcept teardown. Only that type is caught: anything else is a defect this
+    // noexcept function ends the process on.
+    try {
+        if (scope == lazy_reap_scope::WORKER) {
+            lazy_reap_worker_pass();
+        } else {
+            lazy_reap_full_pass();
+        }
+    } catch (const std::system_error & e) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        g_lazy_reaps_failed.fetch_add(1, std::memory_order_relaxed);
+#endif
+        GGML_LOG_WARN("[HOST-PLAN-BUG] ring reap failed: %s\n", e.what());
     }
 }
 
