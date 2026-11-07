@@ -9402,15 +9402,15 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             if (!host_ptr) {
                 // The pinned copy was refused. Publishing the source in place is allowed only for a slice of a
                 // FILE_MAPPED mapping (a HOST_PINNED source was published above). A source in no registry is refused
-                // and counted; a source in any other tier (device memory, CPU-only memory) is not host memory a
-                // HOST_MMAP entry can name, and is refused without a count.
+                // and counted. A source in any other tier is refused without a count: the in-place publication takes
+                // no owner, and the fallback only ever meant a mapped slice, whose mapping the cache already holds.
                 if (host_registration_refuses("direct_stage_expert", src_ptr, src_size, src_view)) {
                     return result;
                 }
                 if (src_tier != alloc_tier::FILE_MAPPED) {
                     GGML_LOG_WARN(
-                        "[DIRECT-STAGE] direct_stage_expert refused: source tier %s cannot be published in place as "
-                        "host memory ptr=%p size=%zu\n",
+                        "[DIRECT-STAGE] direct_stage_expert refused: source tier %s cannot be published in place, "
+                        "only a slice of a mapped file is ptr=%p size=%zu\n",
                         alloc_tier_name(src_tier), src_ptr, src_size);
                     return result;
                 }
@@ -11612,8 +11612,8 @@ static host_registration_view host_registration_tier(const void * ptr, size_t si
     return view;
 }
 
-// A host weight or expert is registered over memory some owner holds: a slice of a FILE_MAPPED reservation or of a
-// pinned allocation. A pointer inside no registered row (host_registration_tier answers UNREGISTERED, after the exact
+// A host weight or expert is registered over memory some owner holds: a slice of a registered allocation. A pointer
+// inside no registered row (host_registration_tier answers UNREGISTERED, after the exact
 // base, the range and the containment lookups) has no owner to name, so the entry would be a non_owning_external_host
 // row over memory the cache can neither keep alive nor account for. A slice that starts inside a row and runs past its
 // end names memory outside the row's owner, and is refused the same way. Both refusals are counted and named, and the
@@ -11641,7 +11641,7 @@ static bool host_registration_refuses(const char *                   api,
     g_unregistered_host_registration_refusals.fetch_add(1, std::memory_order_relaxed);
     GGML_LOG_WARN(
         "[UNIFIED-CACHE] %s refused: unregistered_host_pointer ptr=%p size=%zu names no owner; a host registration "
-        "takes a slice of a FILE_MAPPED mapping or of a pinned allocation\n",
+        "takes a slice of a registered allocation\n",
         api, ptr, size);
     return true;
 }
