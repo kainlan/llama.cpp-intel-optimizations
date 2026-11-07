@@ -6962,9 +6962,10 @@ unified_cache::unified_cache(sycl::queue & queue,
         // sentinel g_unified_cache_host_budget has no writer, and the public host-budget-pct setter changes only the
         // percentage below. The budget is the one host budget (design 5efe §4.5, host_budget_compute): the override
         // composes as a cap on it, and at zero headroom-free memory it is 0, so every pinned request is refused.
-        size_t total_mem          = 0;
-        size_t available_mem      = 0;
-        size_t headroom           = 0;
+        size_t total_mem       = 0;
+        size_t available_mem   = 0;
+        size_t headroom        = 0;
+
         // The reason every refused pinned growth appends when this budget is the headroom refusal (design 5efe §4.5),
         // formatted once from this sample: empty otherwise.
         std::string refusal_reason;
@@ -7037,7 +7038,7 @@ unified_cache::unified_cache(sycl::queue & queue,
 
         if (getenv("GGML_SYCL_NO_PINNED") != nullptr) {
             GGML_LOG_INFO("[HOST-ARENA] GGML_SYCL_NO_PINNED set: disabling pinned host memory\n");
-            host_mem_budget    = 0;
+            host_mem_budget = 0;
             refusal_reason.clear();  // the budget is 0 by request, not by the headroom
         }
 
