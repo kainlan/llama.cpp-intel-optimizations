@@ -676,7 +676,8 @@ arm_result arm_i() {
            "an available reading at or below the headroom: the refusal does not append '" + headroom_reason + "'");
 
     host_budget_sample avail_zero = control;
-    avail_zero.available_bytes    = 0;  // total known, the sample failed: not headroom
+    // Total known, the sample failed: 0 is at or below the headroom, so this is the host-headroom-exhausted refusal.
+    avail_zero.available_bytes    = 0;
     // min(64 GiB, committed + (0 - 16 saturating to 0))
     stored_refuses(avail_zero, committed, "total known and available 0");
 
