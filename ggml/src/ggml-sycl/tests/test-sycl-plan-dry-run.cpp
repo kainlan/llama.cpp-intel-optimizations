@@ -650,8 +650,8 @@ arm_result arm_0_another_layout_is_refused() {
 // as the sample's MemAvailable, reports them as such, and its budget is host_ledger_compute_budget of that sample (the
 // other inputs read live, as the result reports them) and the committed bytes it reports. Without the option it
 // reports the live reading.
-// Engagement: no accepted GGML_SYCL_HOST_RESERVE_MB (which would be the whole budget), the available term binds (two
-// readings give two budgets), and the reported pinned share is the live one.
+// Engagement: no accepted GGML_SYCL_HOST_RESERVE_MB (which caps the budget, so below the computed one it would be the
+// budget), the available term binds (two readings give two budgets), and the reported pinned share is the live one.
 // Mutants: the live reading used instead of the option (the reported MemAvailable is not the option, and the budget
 // moves); the budget computed from another sample or another committed figure (it is not compute_budget of the
 // reported inputs).
@@ -672,7 +672,7 @@ arm_result arm_d_mem_available_option_is_the_sample() {
         return r;
     }
     if (now.reserve.status == detail::host_reserve_parse_status::OVERRIDE || res->host_reserve_override != 0) {
-        void_arm(r, "GGML_SYCL_HOST_RESERVE_MB is accepted, so MemAvailable does not enter the budget");
+        void_arm(r, "GGML_SYCL_HOST_RESERVE_MB is accepted, so it may cap the budget below the MemAvailable term");
         return r;
     }
     host_budget_sample reported = now;
