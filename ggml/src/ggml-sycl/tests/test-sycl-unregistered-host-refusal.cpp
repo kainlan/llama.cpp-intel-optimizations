@@ -251,8 +251,10 @@ int run_interior(checks & c) {
 
     // A dense weight's entry keeps a direct-table mirror that holds a lease, and nothing short of a model reset
     // removes it, so the weight is registered with the pinned allocation as its storage owner, as the preload does for
-    // a dense weight (§4.8): the entry then keeps its memory alive and cannot outlive it. The expert is registered with
-    // no owner, as the preload's no-owner branch does, and is retired below.
+    // a dense weight (§4.8): the entry then keeps its memory alive and cannot outlive it. This case therefore does not
+    // exercise an unowned dense weight over a pinned slice; the mirror's lease is the reason, and retiring it is beyond
+    // what the cache offers a test. The expert is registered with no owner, as the preload's no-owner branch does,
+    // and is retired below.
     const auto weight_storage = std::make_shared<mem_handle>(owner);
 
     const uint64_t refusals = unified_cache_unregistered_host_registration_refusals();
