@@ -1073,7 +1073,7 @@ shard 2 (tensors); Appendix A.1:
 > and the bullets after the table describe the old layout and stand as history.
 
 Measured 2026-11-06 on the NVMe branch (XFS, `/dev/nvme1n1`, the Kingston
-OM3PDP3512B; `c-y57k`, device from `c-t65d`). The file was cold by
+OM3PDP3512B). The file was cold by
 `POSIX_FADV_DONTNEED` with `fincore` at 0 pages before each probe, and the load
 average was 12-14. Latencies are per 4 KiB read; the batch rows are a batch of
 16 rows (`T_ticket`) or of 7100 rows.
@@ -1087,10 +1087,9 @@ average was 12-14. Latencies are per 4 KiB read; the batch rows are a batch of
 | batch of 16, 16 workers: `T_ticket` mean, p99 | 3.75 ms, 13.0 ms | 0.40 ms, 0.63 ms |
 | batch of 7100, 64 workers: rows/s (batch time) | 8344 (0.85 s) | 68887 (103.07 ms) |
 
-The 2026-11-01 run of the same probes on the same layout (`c-t65d`) gave 7389 IOPS at QD1, 61492 at QD16, 69507 at QD64,
+The 2026-11-01 run of the same probes on the same layout gave 7389 IOPS at QD1, 61492 at QD16, 69507 at QD64,
 68884 rows/s for the batch of 7100, and a batch-16 `T_ticket` of mean 0.41 ms, p99 0.65 ms. The differences from the
-table are run-to-run noise under host load, and the table keeps the 2026-11-06 run. The §5.1 NVMe columns are the same
-`c-y57k` figures. The batch of 7100 reaches 68887 rows/s against the 69706 IOPS QD64 control, a ratio of 0.99.
+table are run-to-run noise under host load, and the table keeps the 2026-11-06 run. The §5.1 NVMe columns carry the same figures. The batch of 7100 reaches 68887 rows/s against the 69706 IOPS QD64 control, a ratio of 0.99.
 
 `/models` was bcachefs with three members (sysfs
 `/sys/fs/bcachefs/118129b2-.../dev-*`, and `bcachefs fs usage`):
@@ -3354,7 +3353,7 @@ HOST). Main-pool chunk rounding (0-2 GiB) is excluded, as everywhere here.
 **Measured on the dry-run, 2026-11-06** (Qwen3.8-Flash-Next Q8_0, the first of
 six splits on `/mnt/models-nvme`; tree `integ/th32` at `2cd9d311e`, Tasks 1-15,
 with Task 11's `llama-sycl-plan-dry-run`; `budget_pct` 90 of `MemTotal`
-246.9 GiB; printed figures from `c-h9n4`). The rows are the planner's printed
+246.9 GiB; printed figures from the 2026-11-06 dry-run). The rows are the planner's printed
 figures in MB, as printed. The derived model above is unchanged.
 
 | run | `host_budget` | device | FILE_MAPPED | `expected_host` | lazy tables | verdict |
@@ -5853,14 +5852,14 @@ is the one per-model hook. Model code is untouched apart from
 > **Dated note, 2026-11-06.** The targets in §8.2 and §8.3 were re-pinned on
 > 2026-11-06 for the NVMe layout. `/models` moved to XFS per drive under
 > mergerfs, and the Qwen3.8 Q8_0 files sit on the Kingston NVMe. The NVMe
-> figures are from `c-y57k` on `llama.cpp-th32`, and the dry-run inputs of §4.5
-> are from `c-h9n4`. The bcachefs targets stay beside them as the history of
+> figures are from the 2026-11-06 probe run, and the dry-run inputs of §4.5
+> are from the 2026-11-06 dry-run. The bcachefs targets stay beside them as the history of
 > the old layout. Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md`
 > is the plan record.
 
 Every target below is derived from the numbers measured in §2.4, §5 and §6.2 on
 this host under ambient load. The §8.2 and §8.3 targets use the NVMe figures of
-2026-11-06 (`c-y57k`), and their bcachefs targets are kept as history. The implementer measures against
+2026-11-06 probe run, and their bcachefs targets are kept as history. The implementer measures against
 them with the counters in §10; the lead runs every GPU part, one run at a time,
 selector pinned, `Shmem`/`MemAvailable` sampled before and ~5 s after. Qwen's
 targets are §8.2-8.3; DeepSeek's, the harder case, are §8.4.
@@ -5994,10 +5993,10 @@ from a completed plan, not a refusal, and the S arm still runs and must pass.
 
 ### 8.2 Qwen decode
 
-Targets are re-derived on 2026-11-06 from the NVMe batch-16 latency (`c-y57k`).
+Targets are re-derived on 2026-11-06 from the NVMe batch-16 latency of the 2026-11-06 probe run.
 The bcachefs column keeps the 2026-09-26 targets. Each formula is unchanged.
 
-| arm | target, NVMe, 2026-11-06 (`c-y57k`) | target, bcachefs over USB, 2026-09-26 | derived from |
+| arm | target, NVMe, 2026-11-06 | target, bcachefs over USB, 2026-09-26 | derived from |
 |---|---|---|---|
 | H | `T_gather` <= **20 us/token** (the worker's gather time); tg128 within **1%** of `--lazy-mode off` (scored on that arm's second run, its table pages resident). Unchanged: not storage-derived | the same | measured 4.2 us for 16 rows including dequant |
 | S-cold | `T_ticket` mean <= **0.46 ms/token** (0.40 x 1.15), p99 <= **0.72 ms** (0.63 x 1.15) | `T_ticket` mean <= **4.3 ms/token** (3.75 x 1.15), p99 <= **15 ms** (13.0 x 1.15) | batch of 16 with 16 workers, `T_ticket`: mean 0.40 ms and p99 0.63 ms (NVMe); mean 3.75 ms and p99 13.0 ms (A.2), each + 15% |
@@ -6013,11 +6012,11 @@ NVMe (1000 / (50 + 0.46)), against **>= 18.4 tok/s** on bcachefs (1000 / (50 + 4
 
 ### 8.3 Qwen PP512
 
-The control IOPS is the same-session QD64 control of §8.1: 69706 on the NVMe
-(`c-y57k`), against 9124 on bcachefs. The QD16 control, 63757, is not an input
+The control IOPS is the same-session QD64 control of §8.1: 69706 on the NVMe in
+the 2026-11-06 probe run, against 9124 on bcachefs. The QD16 control, 63757, is not an input
 to any target here. The engine ratio, 68887 rows/s over 69706 IOPS, is 0.99.
 
-| arm | target, NVMe, 2026-11-06 (`c-y57k`) | target, bcachefs over USB, 2026-09-26 | derived from |
+| arm | target, NVMe, 2026-11-06 | target, bcachefs over USB, 2026-09-26 | derived from |
 |---|---|---|---|
 | H | `T_gather` <= **3 ms/ubatch**; pp512 within **1%** of `--lazy-mode off`. Unchanged: not storage-derived | the same | measured ~2 ms for 8192 rows |
 | S-cold | engine ratio >= **0.9** (§8.1; 68887 / 69706 = 0.99). `T_ticket` <= **1.15 x U / (0.9 x 69706)**: real text (U 7028-7104) <= **0.13 s** (1.15 x 7104 / 62735 = 0.130), `llama-bench` random (U 8116-8192) <= **0.15 s** (1.15 x 8192 / 62735 = 0.150) | engine ratio >= **0.9** (§8.1). `T_ticket` <= **1.15 x U / (0.9 x 9124)**: real text (U 7028-7104) <= **1.0 s**, `llama-bench` random (U 8116-8192) <= **1.15 s** | §5.1, §6.2.1 |
