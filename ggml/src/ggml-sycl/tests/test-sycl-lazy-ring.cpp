@@ -773,9 +773,9 @@ arm_result arm_window() {
 
 // The no-STORAGE arm (§3.3: an inventory with no lazy-table candidate takes no provisional lease): the q2k inventory
 // with no lazy table, staged early and then late and loaded, takes no lease and leaves the registry's generation where
-// it was, with no pool; and a swap from a lazy model, whose unload left its pool parked, to that inventory leaves none:
-// the stage's entry reap frees it.
-// Engagement: the dense stages return OK, and the lazy model's unload leaves its pool parked.
+// it was, with no pool; and a swap from a lazy model, whose pool a lease held past its unload left parked, to that
+// inventory leaves none: the stage's entry reap frees it.
+// Engagement: the dense stages return OK, and the lazy model's pool is parked after its unload.
 // Mutant: take-without-candidate, under which the coverage scope takes a lease for an inventory with no lazy table.
 arm_result arm_no_storage() {
     arm_result                         r;
@@ -816,7 +816,7 @@ arm_result arm_no_storage() {
     if (st != lazy_ring_ensure_status::OK) {
         fail(r, "the lazy model's ensure returned " + name(st) + ", want ok");
     }
-    unload(a);
+    unload_parked(a);
     const lazy_registry_state parked = registry();
     if (!registry_is(parked, 0, 0, 1)) {
         void_arm(r,
@@ -985,11 +985,12 @@ ggml_sycl_lifecycle_result dry_run(const ggml_sycl_tensor_inventory * inv) {
 // parked by the guard's own drop, whose FULL reap the hook holds after its count lands and before it swaps the list
 // out; the fixture reads c0, the FULL reaps run. The dry run's entry reap is the one that frees the node, so its take
 // snapshots c0 + 1 reaps run and no parked node, and its closing reap frees its own pool before it returns, c0 + 2 in
-// all. Then, with model A loaded, ensured and unloaded, so its pool and ring are parked, the dry run's plan charges
-// ring= the need's mapped size from a fresh pool, as the early stage of the same inventory does.
+// all. Then, with model A loaded, ensured and unloaded with a lease held past the unload, so its pool and ring are
+// parked, the dry run's plan charges ring= the need's mapped size from a fresh pool, as the early stage of the same
+// inventory does.
 // Engagement: the guard holds a lease and its drop parks the pool held in the hook within the bound; the dry run
-// returns OK and installs one pool, so a dry run that takes no lease fails before the snapshot is read; A's unload
-// leaves its pool parked.
+// returns OK and installs one pool, so a dry run that takes no lease fails before the snapshot is read; A's pool is
+// parked after its unload.
 // Mutants: no-entry-reap (the take snapshots c0 reaps run) and no-closing-reap (the dry run's pool survives it parked).
 arm_result arm_dry_run() {
     arm_result     r;
@@ -1048,7 +1049,7 @@ arm_result arm_dry_run() {
         return settle(r);
     }
     const lazy_ring_ensure_status st = ensure_for(a);
-    unload(a);
+    unload_parked(a);
     const lazy_registry_state parked = registry();
     if (st != lazy_ring_ensure_status::OK || !registry_is(parked, 0, 0, 1)) {
         void_arm(r, "model A's ensure returned " + name(st) + " and its unload left " + describe(parked) +

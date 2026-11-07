@@ -269,6 +269,15 @@ inline void unload(const model_load & m) {
     }
 }
 
+// A model's unload that leaves its pool parked: the unload reaps after its erase (§3.3 point (ii)), so a join lease
+// held across it keeps the pool live through that reap, and its drop here, the pool's last, parks the pool with no reap
+// after it.
+inline void unload_parked(const model_load & m) {
+    ring_lease held = lazy_io_pool_join();
+    unload(m);
+    held.reset();
+}
+
 // A model's STORAGE materialization's ensure: its 8192 B table's need, with the late plan's charge and the model's
 // transaction (§3.3, §10's ring check).
 inline lazy_ring_ensure_status ensure_for(const model_load & m) {

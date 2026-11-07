@@ -12816,6 +12816,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
     ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
+    // The teardown reap (th32 §3.3 point (ii)): declared before the try, so it reaps after the erase drops the record's
+    // lease, and outside the try whose catch re-finalizes the ticket.
+    ggml_sycl::lazy_reap_at_exit teardown_reap;
+
     const auto                            owner = ggml_sycl_cpp_token(token);
     ggml_sycl::lifecycle::teardown_ticket ticket;
     ggml_sycl::lifecycle::Registry *      registry = nullptr;
@@ -12860,6 +12864,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
             // in Registry::dead_ after this snapshot is deleted.
             ggml_sycl::lifecycle_erase_placement_plan(owner.model.value, owner.load.value);
         }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        if (ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::REAP_INSIDE_TRY)) {
+            ggml_sycl::ggml_sycl_test_lazy_ring_reap_uncaught(ggml_sycl::lazy_reap_scope::FULL);
+        }
+#endif
         return ggml_sycl_lifecycle_c_result(result);
     } catch (...) {
         (void) ggml_sycl_restore_latest_live_plan();
@@ -14112,6 +14121,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
     ggml_sycl_load_end_body_witness load_end_body_witness;
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
+    // The failed load's reap (th32 §3.3 point (iii)): declared before the try, so it reaps after every erase and abort
+    // this call makes, the abort inside ggml_sycl_abort_owner_effects_noexcept included, with no lock held.
+    ggml_sycl::lazy_reap_at_exit end_reap;
+
     ggml_sycl::lifecycle::Registry *    registry = nullptr;
     ggml_sycl::lifecycle::finish_ticket ticket;
     bool                                placement_inserted = false;

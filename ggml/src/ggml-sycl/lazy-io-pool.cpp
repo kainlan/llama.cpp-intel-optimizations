@@ -491,6 +491,16 @@ void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
     }
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void ggml_sycl_test_lazy_ring_reap_uncaught(lazy_reap_scope scope) {
+    if (scope == lazy_reap_scope::WORKER) {
+        lazy_reap_worker_pass();
+    } else {
+        lazy_reap_full_pass();
+    }
+}
+#endif
+
 void lazy_io_pool_mark_shut_down() noexcept {
     std::lock_guard lock(g_lazy_registry_mutex);
     g_lazy_shut_down.store(true, std::memory_order_release);

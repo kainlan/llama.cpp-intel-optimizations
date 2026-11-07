@@ -192,6 +192,19 @@ enum class lazy_reap_scope : uint8_t {
 // unlocked context.
 void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept;
 
+// The scope guard of §3.3's points (ii) and (iii): declared before the try of a model's unload or load end, in an
+// unlocked context, its destructor runs a FULL reap after the try/catch has returned. So the reap follows every erase
+// and abort the call makes, and runs outside the try whose catch re-finalizes the ticket.
+class lazy_reap_at_exit {
+  public:
+    lazy_reap_at_exit() noexcept = default;
+
+    ~lazy_reap_at_exit() { ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL); }
+
+    lazy_reap_at_exit(const lazy_reap_at_exit &)             = delete;
+    lazy_reap_at_exit & operator=(const lazy_reap_at_exit &) = delete;
+};
+
 // Marks the registry shut down: from then on a take returns an empty lease and a lease's drop only decrements, so a
 // lease destroyed during static destruction never touches the registry's mutex. Its production caller is the lease
 // drain at backend shutdown, ggml_sycl_lazy_lease_drain in ggml-sycl.cpp, which sets it after its own FULL reap.
@@ -598,6 +611,9 @@ lazy_reap_holding_result ggml_sycl_test_lazy_reap_holding_pool(int lock);
 // Makes the next FULL reap's first step throw std::system_error, as std::mutex::lock can (§3.3: a failure to reset is
 // logged and never thrown). One-shot.
 void ggml_sycl_test_lazy_reap_throw_next();
+
+// REAP_INSIDE_TRY's reap: the reap's passes without its catch, so the seam's std::system_error reaches the caller.
+void ggml_sycl_test_lazy_ring_reap_uncaught(lazy_reap_scope scope);
 
 // Runs `fn(ctx)` on the calling thread holding one witnessed lock (§11 T5): g_tensor_inventory_mutex itself,
 // g_lifecycle_plan_mutex through the unified cache's seam, and the registry's leaf mutex and the queue lock through
