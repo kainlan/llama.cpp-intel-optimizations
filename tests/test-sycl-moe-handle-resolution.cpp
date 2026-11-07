@@ -197,21 +197,39 @@ static bool test_direct_staged_device_resolution(sycl::queue & q) {
 }
 
 // Retires the host expert entry a test registered over memory it owns, before that memory is freed. The global cache
-// outlives the test, so an entry left behind would point at freed memory. A refused retire is a leak of the entry,
-// reported through `refused` for the caller to fail on, since a destructor cannot return it.
+// outlives the test, so an entry left behind would point at freed memory. Only WITHDRAWN means the storage is
+// reclaimed: DEFERRED leaves the canonical entry naming the memory, NOT_FOUND means the registration the guard was
+// declared for never took place, and INVALID is a bad key. Anything else is reported through `refused` for the caller
+// to fail on, since a destructor cannot return it.
 struct host_entry_retire {
     ggml_sycl::unified_cache * cache;
     ggml_sycl_cache_id         key;
     const char *               what;
     bool &                     refused;
 
+    static const char * status_name(ggml_sycl::expert_retire_status status) {
+        switch (status) {
+            case ggml_sycl::expert_retire_status::INVALID:
+                return "INVALID";
+            case ggml_sycl::expert_retire_status::NOT_FOUND:
+                return "NOT_FOUND";
+            case ggml_sycl::expert_retire_status::WITHDRAWN:
+                return "WITHDRAWN";
+            case ggml_sycl::expert_retire_status::DEFERRED:
+                return "DEFERRED";
+        }
+        return "?";
+    }
+
     ~host_entry_retire() {
         const ggml_sycl::expert_retire_status status =
             cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test/MoE host expert");
         cache->process_deferred_frees_public();
-        // NOT_FOUND is a test that returned before it registered: nothing is left behind.
-        if (status == ggml_sycl::expert_retire_status::INVALID) {
-            fprintf(stderr, "  FAIL: retiring the %s entry was refused, the entry outlives its memory\n", what);
+        if (status != ggml_sycl::expert_retire_status::WITHDRAWN) {
+            fprintf(
+                stderr,
+                "  FAIL: retiring the %s entry returned %s, expected WITHDRAWN: the entry would outlive its memory\n",
+                what, status_name(status));
             refused = true;
         }
     }

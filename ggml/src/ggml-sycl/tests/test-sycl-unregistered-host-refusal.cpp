@@ -69,6 +69,20 @@ const char * location_name(cache_location l) {
     return "?";
 }
 
+const char * retire_status_name(expert_retire_status status) {
+    switch (status) {
+        case expert_retire_status::INVALID:
+            return "INVALID";
+        case expert_retire_status::NOT_FOUND:
+            return "NOT_FOUND";
+        case expert_retire_status::WITHDRAWN:
+            return "WITHDRAWN";
+        case expert_retire_status::DEFERRED:
+            return "DEFERRED";
+    }
+    return "?";
+}
+
 ggml_sycl_cache_id key_of(uint64_t aux) {
     ggml_sycl_cache_id key{};
     key.valid    = true;
@@ -282,12 +296,17 @@ int run_interior(checks & c) {
         // it is retired before the allocation is freed: an entry that names memory must not outlive it.
         if (expert) {
             lease = {};
-            (void) cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test-sycl-unregistered-host-refusal");
+            const expert_retire_status retired =
+                cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test-sycl-unregistered-host-refusal");
             cache->process_deferred_frees_public();
-            c.expect(entry_of(cache, expert, key) == nullptr,
-                     std::string("the entry ") + api +
-                         " registered over the pinned slice outlives the test: it would point at memory freed when the "
-                         "allocation drops");
+            // WITHDRAWN means the storage is reclaimed. DEFERRED leaves the canonical entry naming the block, and
+            // entry_of reads only the direct-table mirror, which retirement erases in either case, so the status is
+            // what is checked.
+            c.expect(retired == expert_retire_status::WITHDRAWN,
+                     std::string("retiring the entry ") + api + " registered over the pinned slice returned status " +
+                         retire_status_name(retired) +
+                         ", expected WITHDRAWN: the entry would name memory freed when "
+                         "the allocation drops");
         }
     }
     const uint64_t refused = unified_cache_unregistered_host_registration_refusals() - refusals;
