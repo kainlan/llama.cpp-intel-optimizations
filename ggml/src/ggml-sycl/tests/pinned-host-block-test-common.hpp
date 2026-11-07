@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "../common.hpp"
 #include "../unified-cache.hpp"
 
 #include <fcntl.h>
