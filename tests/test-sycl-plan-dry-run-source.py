@@ -513,8 +513,8 @@ def budget_source_gaps(store: str, accessor: str, load: str, closure: str) -> li
     if calls(closure, "host_ledger_budget_overridden"):
         gaps.append("the dry run reads the ledger's stored flag, not its own sample's")
     # An accepted override above the formula is not the budget (design 5efe §4.5: it composes), so the source is the
-    # dry run's own budget's binding term, as the store's is.
-    if not re.search(r"\.\s*override_binds\b", closure):
+    # dry run's own budget's binding term, as the store's is, assigned to the flag itself.
+    if not re.search(r"\bkv\s*\.\s*host_budget_overridden\s*=\s*[^;]*\boverride_binds\b", closure):
         gaps.append("the dry run's budget source is not its own budget's binding term (override_binds)")
     return gaps
 
@@ -595,30 +595,44 @@ def test_the_plan_line_checks_see_each_dropped_piece():
     )
     accessor = "return g_host_ledger_budget_overridden.load(std::memory_order_acquire);\n"
     load = "g_placement_kv_info.host_budget_overridden = ggml_sycl::host_ledger_budget_overridden();\n"
-    closure = (
-        "const bool budget_overridden = budget.override_binds;\n"
-        "kv.host_mem_available_pre = mem_available;\nkv.host_budget_overridden = budget_overridden;\n"
-    )
+    closure = "kv.host_mem_available_pre = mem_available;\nkv.host_budget_overridden = budget.override_binds;\n"
     assert budget_source_gaps(store, accessor, load, closure) == [], budget_source_gaps(store, accessor, load, closure)
+    # Each mutant names the gap it must produce, so a mutant caught by another check for another reason fails.
     source_mutants = {
-        "the flag not stored": (store.replace("g_host_ledger_budget_overridden.store", "(void)"), accessor, load,
-                                closure),
-        "the flag stored from no override test": (store.replace("::OVERRIDE", "::AUTO").replace("OVERRIDE", "AUTO"),
-                                                  accessor, load, closure),
-        "the accessor reads nothing": (store, "return false;\n", load, closure),
-        "the load copies nothing": (store, accessor, "", closure),
-        "the dry run sets nothing": (store, accessor, load, "kv.host_mem_available_pre = mem_available;\n"),
+        "the flag not stored": (
+            (store.replace("g_host_ledger_budget_overridden.store", "(void)"), accessor, load, closure),
+            "does not store the override flag beside the budget",
+        ),
+        "the flag stored from no override test": (
+            (store.replace("::OVERRIDE", "::AUTO").replace("OVERRIDE", "AUTO"), accessor, load, closure),
+            "does not store the override flag beside the budget",
+        ),
+        "the accessor reads nothing": ((store, "return false;\n", load, closure), "does not read the stored flag"),
+        "the load copies nothing": ((store, accessor, "", closure), "the load does not copy the stored flag"),
+        "the dry run sets nothing": (
+            (store, accessor, load, "kv.host_mem_available_pre = mem_available;\n"),
+            "the dry run does not set its planner input's budget source",
+        ),
         "the dry run's source is the accepted override": (
-            store, accessor, load,
-            closure.replace("budget.override_binds", "reserve.status == detail::host_reserve_parse_status::OVERRIDE"),
+            (store, accessor, load,
+             closure.replace("budget.override_binds", "reserve.status == detail::host_reserve_parse_status::OVERRIDE")),
+            "is not its own budget's binding term (override_binds)",
+        ),
+        "the binding term read but not assigned to the flag": (
+            (store, accessor, load,
+             closure.replace("= budget.override_binds;", "= false;\n(void) budget.override_binds;")),
+            "is not its own budget's binding term (override_binds)",
         ),
         "the dry run reads the ledger": (
-            store, accessor, load, closure.replace("budget_overridden;", "ggml_sycl::host_ledger_budget_overridden();")
+            (store, accessor, load,
+             closure.replace("budget.override_binds;", "ggml_sycl::host_ledger_budget_overridden();")),
+            "the dry run reads the ledger's stored flag",
         ),
     }
-    for name, args in source_mutants.items():
+    for name, (args, expected) in source_mutants.items():
         assert args != (store, accessor, load, closure), f"mutant '{name}' changed nothing"
-        assert budget_source_gaps(*args), f"the budget source check passes with {name}"
+        gaps = budget_source_gaps(*args)
+        assert any(expected in g for g in gaps), f"the budget source check misses {name}: {gaps}"
 
 
 # The headroom refusal a plan's would-refuse line names (design 5efe §4.5) is its budget's own: the load copies the
@@ -680,20 +694,33 @@ def test_the_refusal_source_check_sees_each_dropped_piece():
         "kv.host_mem_total = mem_total;\nkv.host_headroom = budget.headroom;\n"
     )
     assert refusal_source_gaps(record, load, closure) == [], refusal_source_gaps(record, load, closure)
+    # Each mutant names the gap it must produce, so a mutant caught by another check for another reason fails.
     mutants = {
         "the line reads the stored flag": (
-            record.replace("kv_info.host_headroom_exhausted", "host_ledger_headroom_exhausted()"), load, closure),
+            (record.replace("kv_info.host_headroom_exhausted", "host_ledger_headroom_exhausted()"), load, closure),
+            "record_host_ledger_plan calls host_ledger_headroom_exhausted",
+        ),
         "the line reads a stored atomic": (
-            record.replace("kv_info.host_mem_total", "g_host_ledger_mem_total.load()"), load, closure),
+            (record.replace("kv_info.host_mem_total", "g_host_ledger_mem_total.load()"), load, closure),
+            "record_host_ledger_plan reads a stored ledger atomic",
+        ),
         "the load copies no exhausted flag": (
-            record, load.replace("host_ledger_headroom_exhausted()", "false"), closure),
-        "the dry run sets no headroom": (record, load, closure.replace("kv.host_headroom = budget.headroom;\n", "")),
+            (record, load.replace("host_ledger_headroom_exhausted()", "false"), closure),
+            "the load does not copy host_ledger_headroom_exhausted()",
+        ),
+        "the dry run sets no headroom": (
+            (record, load, closure.replace("kv.host_headroom = budget.headroom;\n", "")),
+            "the dry run does not set its planner input's host_headroom",
+        ),
         "the dry run reads the stored MemTotal": (
-            record, load, closure.replace("= mem_total;", "= ggml_sycl::host_ledger_mem_total();")),
+            (record, load, closure.replace("= mem_total;", "= ggml_sycl::host_ledger_mem_total();")),
+            "the dry run calls host_ledger_mem_total",
+        ),
     }
-    for name, args in mutants.items():
+    for name, (args, expected) in mutants.items():
         assert args != (record, load, closure), f"mutant '{name}' changed nothing"
-        assert refusal_source_gaps(*args), f"the refusal source check passes with {name}"
+        gaps = refusal_source_gaps(*args)
+        assert any(expected in g for g in gaps), f"the refusal source check misses {name}: {gaps}"
 
 
 # ---- 3. nothing stored ----
