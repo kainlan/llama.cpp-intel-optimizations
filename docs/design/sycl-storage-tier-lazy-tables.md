@@ -5964,24 +5964,23 @@ from a completed plan, not a refusal, and the S arm still runs and must pass.
 - The IO count and bytes, the hit and miss counts (§10), and end-to-end
   `llama-bench`, `llama-perplexity` on wikitext-2 test, and the decode vehicle
   (§8.5).
-- **The engine rate is a ratio, never an absolute** (I6, M12).
-  `rows_miss_reads / T_io` over a cold PP512 ubatch, divided by the IOPS of a
-  **same-session fio QD64 control on the same extent**, run immediately before
-  and after the arm (Appendix B, `io_probe2.sh` with `FOFF` at the table's
-  offset). The ratio must be **>= 0.9**; the pool measured 0.99 against the
-  bracketing controls (§2.4). If the two controls differ by more than 20%, the
-  ceiling moved during the arm and the run is void, not scored. Each arm
-  records the per-device `io_done` and write deltas from `/proc/diskstats` for
-  its duration, so that fresh (NVMe-foreground) and settled (backing-device)
-  placement are told apart: during the `blk.1` probes the NVMe wrote 7.5 GB in
-  15 s at 4657 IOPS, and 0.4-0.5 GB at 7070-7242 two minutes later.
+- **The engine rate is a ratio, never an absolute** (I6, M12). `rows_miss_reads / T_io` over a cold PP512 ubatch,
+  divided by the IOPS of the **same-session fio QD64 control on the same extent**, the QD64 runs immediately before and
+  after the arm (Appendix B, `io_probe2.sh` with `FOFF` at the table's offset). The bracket is in time, and both
+  controls are QD64. The ratio must be **>= 0.9**. Their agreement within 20% is the validity check: if the two controls
+  differ by more than 20%, the ceiling moved during the arm and the run is void, not scored. On the 2026-11-06 NVMe run
+  the pool read 68887 rows/s against the QD64 control of 69706 IOPS, a ratio of 0.99. On the 2026-09-26 bcachefs run the
+  pool measured 0.99 against its bracketing QD64 controls (§2.4). Each arm records the per-device `io_done` and write
+  deltas from `/proc/diskstats` for its duration, so that fresh (NVMe-foreground) and settled (backing-device) placement
+  are told apart: during the `blk.1` probes the NVMe wrote 7.5 GB in 15 s at 4657 IOPS, and 0.4-0.5 GB at 7070-7242 two
+  minutes later.
 - **Concurrent expert IO** (*lead ruling §T4*, I-4). On DeepSeek, every arm
   also records the cold-expert reads that shared the device in the same
   window: `llama.cpp-yl3v`'s read and byte counters, per ubatch and per decode
   token, next to the engram counters. Without that record, an engram latency
   measured on the shared device cannot be told apart from contention.
 - **Scaling rule for latency targets.** The latency targets below were measured
-  with the control at 4657-7242 IOPS. When an arm's bracketing control reads
+  with the QD64 control at 4657-7242 IOPS. When an arm's QD64 control reads
   below 4657, each latency bound is multiplied by `4657 / control`.
 
 ### 8.2 Qwen decode
