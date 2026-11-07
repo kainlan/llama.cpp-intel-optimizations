@@ -1066,17 +1066,14 @@ shard 2 (tensors); Appendix A.1:
   `GGML_SYCL_GRAPH_DIAG` counts both kinds (`:632-660`, printed at `:794-830`).
 ### 2.4 The storage under the table (measured)
 
-> **Dated note, 2026-11-06.** `/models` moved to XFS per drive under mergerfs,
-> and the Qwen3.8 Q8_0 files now sit on the Kingston NVMe under the branch
-> `/mnt/models-nvme`. The table below sets the 2026-11-06 probes of that file
-> beside the 2026-09-26 probes of the bcachefs layout. The bcachefs description
-> and the bullets after the table describe the old layout and stand as history.
+> **Dated note, 2026-11-06.** `/models` moved to XFS per drive under mergerfs, and the Qwen3.8 Q8_0 files now sit on the
+> Kingston NVMe under the branch `/mnt/models-nvme`. The table below sets the 2026-11-06 probes of that file beside the
+> 2026-09-26 probes of the bcachefs layout. The bcachefs description and the bullets after the table describe the old
+> layout and stand as history.
 
-Measured 2026-11-06 on the NVMe branch (XFS, `/dev/nvme1n1`, the Kingston
-OM3PDP3512B). The file was cold by
-`POSIX_FADV_DONTNEED` with `fincore` at 0 pages before each probe, and the load
-average was 12-14. Latencies are per 4 KiB read; the batch rows are a batch of
-16 rows (`T_ticket`) or of 7100 rows.
+Measured 2026-11-06 on the NVMe branch (XFS, `/dev/nvme1n1`, the Kingston OM3PDP3512B). The file was cold by
+`POSIX_FADV_DONTNEED` with `fincore` at 0 pages before each probe, and the load average was 12-14. Latencies are per 4
+KiB read; the batch rows are a batch of 16 rows (`T_ticket`) or of 7100 rows.
 
 | probe | bcachefs over USB, 2026-09-26 | NVMe, XFS, 2026-11-06 |
 |---|---|---|
@@ -1087,9 +1084,10 @@ average was 12-14. Latencies are per 4 KiB read; the batch rows are a batch of
 | batch of 16, 16 workers: `T_ticket` mean, p99 | 3.75 ms, 13.0 ms | 0.40 ms, 0.63 ms |
 | batch of 7100, 64 workers: rows/s (batch time) | 8344 (0.85 s) | 68887 (103.07 ms) |
 
-The 2026-11-01 run of the same probes on the same layout gave 7389 IOPS at QD1, 61492 at QD16, 69507 at QD64,
-68884 rows/s for the batch of 7100, and a batch-16 `T_ticket` of mean 0.41 ms, p99 0.65 ms. The differences from the
-table are run-to-run noise under host load, and the table keeps the 2026-11-06 run. The §5.1 NVMe columns carry the same figures. The batch of 7100 reaches 68887 rows/s against the 69706 IOPS QD64 control, a ratio of 0.99.
+The 2026-11-01 run of the same probes on the same layout gave 7389 IOPS at QD1, 61492 at QD16, 69507 at QD64, 68884
+rows/s for the batch of 7100, and a batch-16 `T_ticket` of mean 0.41 ms, p99 0.65 ms. The differences from the table are
+run-to-run noise under host load, and the table keeps the 2026-11-06 run. The §5.1 NVMe columns carry the same figures.
+The batch of 7100 reaches 68887 rows/s against the 69706 IOPS QD64 control, a ratio of 0.99.
 
 `/models` was bcachefs with three members (sysfs
 `/sys/fs/bcachefs/118129b2-.../dev-*`, and `bcachefs fs usage`):
@@ -3366,8 +3364,9 @@ figures in MB, as printed. The derived model above is unchanged.
 | B70 only, `-lzm off`, `--mem-available` 171.4 GiB | 167321.6 | not in the posted figures | 150996.4 | 159744.0 | eager, `eligible=0` | fits |
 | both cards (`level_zero:0,1`), live `MemAvailable` 213.4 GiB | 210346.9 | 40875.4, both cards | 84150.0 | 6144.0 | `tables=0` | `PLACEMENT-BLOCK`, `no-compatible-gpu-capacity` |
 
-The both-cards run also charges 2843.3 MB to host and prints `CPU_OWNED` 2667.9
-MB and `kv_host_bytes` 10.1 MB. The dry-run prints `LAZY tables=0` and `ring_need=0` at every reading although the 51880 MiB table is recorded `deferral=STORAGE` (`llama.cpp-8v67`).
+The both-cards run also charges 2843.3 MB to host and prints `CPU_OWNED` 2667.9 MB and `kv_host_bytes` 10.1 MB. The
+dry-run prints `LAZY tables=0` and `ring_need=0` at every reading although the 51880 MiB table is recorded
+`deferral=STORAGE` (`llama.cpp-8v67`).
 
 **DeepSeek Q2_K, the planner's fit** (`MemAvailable - 8`; the verdicts are
 after (s)):
@@ -3480,13 +3479,10 @@ Both engines were measured over the table's byte range (Appendix A.2):
 The mmap page-fault probe was not rerun on the NVMe layout, so its rows keep
 their 2026-09-26 figures.
 
-**The device ceiling is the same for every engine.** On the old bcachefs
-layout the bottleneck was the 256 KiB extent bounce onto USB links, not the
-syscall mechanism (bcachefs layout, history; see the §2.4 note). On the NVMe
-the same parity holds: fio at QD64 read 69706 IOPS and the pread pool 68887
-rows/s. The choice of engine
-therefore rests on *timing*, *ownership* and *accounting*, and on all three
-`O_DIRECT` prefetch wins:
+**The device ceiling is the same for every engine.** On the old bcachefs layout the bottleneck was the 256 KiB extent
+bounce onto USB links, not the syscall mechanism (bcachefs layout, history; see the §2.4 note). On the NVMe the same
+parity holds: fio at QD64 read 69706 IOPS and the pread pool 68887 rows/s. The choice of engine therefore rests on
+*timing*, *ownership* and *accounting*, and on all three `O_DIRECT` prefetch wins:
 
 1. **Timing.** A fault happens inside `get_rows`, on a compute thread, *after*
    the graph reached the node, and at an effective QD of however many
@@ -5849,20 +5845,17 @@ is the one per-model hook. Model code is untouched apart from
 
 ## 8. Pre-registered speed targets (item 6)
 
-> **Dated note, 2026-11-06.** The targets in §8.2 and §8.3 were re-pinned on
-> 2026-11-06 for the NVMe layout. `/models` moved to XFS per drive under
-> mergerfs, and the Qwen3.8 Q8_0 files sit on the Kingston NVMe. The NVMe
-> figures are from the 2026-11-06 probe run, and the dry-run inputs of §4.5
-> are from the 2026-11-06 dry-run. The bcachefs targets stay beside them as the history of
-> the old layout. Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md`
-> is the plan record.
+> **Dated note, 2026-11-06.** The targets in §8.2 and §8.3 were re-pinned on 2026-11-06 for the NVMe layout. `/models`
+> moved to XFS per drive under mergerfs, and the Qwen3.8 Q8_0 files sit on the Kingston NVMe. The NVMe figures are from
+> the 2026-11-06 probe run, and the dry-run inputs of §4.5 are from the 2026-11-06 dry-run. The bcachefs targets stay
+> beside them as the history of the old layout. Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md` is
+> the plan record.
 
-Every target below is derived from the numbers measured in §2.4, §5 and §6.2 on
-this host under ambient load. The §8.2 and §8.3 targets use the NVMe figures of
-2026-11-06 probe run, and their bcachefs targets are kept as history. The implementer measures against
-them with the counters in §10; the lead runs every GPU part, one run at a time,
-selector pinned, `Shmem`/`MemAvailable` sampled before and ~5 s after. Qwen's
-targets are §8.2-8.3; DeepSeek's, the harder case, are §8.4.
+Every target below is derived from the numbers measured in §2.4, §5 and §6.2 on this host under ambient load. The §8.2
+and §8.3 targets use the NVMe figures of the 2026-11-06 probe run, and their bcachefs targets are kept as history. The
+implementer measures against them with the counters in §10; the lead runs every GPU part, one run at a time, selector
+pinned, `Shmem`/`MemAvailable` sampled before and ~5 s after. Qwen's targets are §8.2-8.3; DeepSeek's, the harder case,
+are §8.4.
 
 ### 8.1 Arms, positive controls and instruments
 
