@@ -1067,9 +1067,9 @@ shard 2 (tensors); Appendix A.1:
 ### 2.4 The storage under the table (measured)
 
 > **Dated note, 2026-11-06.** `/models` moved to XFS per drive under mergerfs, and the Qwen3.8 Q8_0 files now sit on the
-> Kingston NVMe under the branch `/mnt/models-nvme`. The table below sets the 2026-11-06 probes of that file beside the
-> 2026-09-26 probes of the bcachefs layout. The bcachefs description and the bullets after the table describe the old
-> layout and stand as history.
+> Kingston NVMe under the branch `/mnt/models-nvme`. The table below sets the 2026-11-06 probes of the Qwen3.8 Q8_0
+> table beside the 2026-09-26 probes of the bcachefs layout. The bcachefs description and the bullets after the table
+> describe the old layout and stand as history.
 
 Measured 2026-11-06 on the NVMe branch (XFS, `/dev/nvme1n1`, the Kingston OM3PDP3512B). The file was cold by
 `POSIX_FADV_DONTNEED` with `fincore` at 0 pages before each probe, and the load average was 12-14. Latencies are per 4
