@@ -669,6 +669,11 @@ arm_result arm_i() {
     avail_low.available_bytes    = 6 * GiB;  // at or below the headroom
     // min(64 GiB, committed + (6 - 16 saturating to 0))
     stored_refuses(avail_low, committed, "an available reading at or below the headroom");
+    // The refusal names the headroom refusal with the stored sample's three figures (design 5efe §4.5).
+    const std::string headroom_reason = " reason=host-headroom-exhausted MemAvailable=" + num(6 * GiB) +
+                                        " MemTotal=" + num(total) + " headroom=" + num(16 * GiB);
+    expect(r, !log_line_with("host-budget-exceeded", headroom_reason.c_str()).empty(),
+           "an available reading at or below the headroom: the refusal does not append '" + headroom_reason + "'");
 
     host_budget_sample avail_zero = control;
     avail_zero.available_bytes    = 0;  // total known, the sample failed: not headroom
