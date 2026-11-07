@@ -9385,8 +9385,17 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             }
             if (!host_ptr) {
                 // The pinned copy was refused. Publishing the source in place is allowed only for a slice of a
-                // registered allocation (a FILE_MAPPED mapping); a source in no registry is refused, as a refusal.
+                // FILE_MAPPED mapping (a HOST_PINNED source was published above). A source in no registry is refused
+                // and counted; a source in any other tier (device memory, CPU-only memory) is not host memory a
+                // HOST_MMAP entry can name, and is refused without a count.
                 if (host_registration_refuses_unregistered("direct_stage_expert", src_ptr, src_size, src_tier)) {
+                    return result;
+                }
+                if (src_tier != alloc_tier::FILE_MAPPED) {
+                    GGML_LOG_WARN(
+                        "[DIRECT-STAGE] direct_stage_expert refused: source tier %s cannot be published in place as "
+                        "host memory ptr=%p size=%zu\n",
+                        alloc_tier_name(src_tier), src_ptr, src_size);
                     return result;
                 }
                 host_ptr = const_cast<void *>(src_ptr);
