@@ -5987,9 +5987,9 @@ from a completed plan, not a refusal, and the S arm still runs and must pass.
 
 ### 8.2 Qwen decode
 
-Targets are re-derived on 2026-11-06 from the NVMe batch-16 latency of the 2026-11-06 probe run.
-The bcachefs column keeps the 2026-09-26 targets. Each formula is unchanged.
-The NVMe bounds of this section are rounded up at the last digit shown, never down.
+Targets are re-derived on 2026-11-06 from the NVMe batch-16 latency of the 2026-11-06 probe run. The bcachefs column
+keeps the 2026-09-26 targets. Each formula is unchanged. The NVMe bounds of this section round in the safe direction:
+upper bounds on times round up, and lower bounds on throughput round down, at the last digit shown.
 
 | arm | target, NVMe, 2026-11-06 | target, bcachefs over USB, 2026-09-26 | derived from |
 |---|---|---|---|
@@ -6002,8 +6002,8 @@ The §8.1 scaling rule does not apply on the NVMe, because the QD64 control,
 69706 IOPS, is above 4657, so no latency bound is multiplied.
 
 Expressed as throughput: `tg_S >= 1 / (1/tg_H + T_stall)`. If H decodes at
-20 tok/s (50 ms per token), S-cold must decode at **>= 19.9 tok/s** on the
-NVMe (1000 / (50 + 0.46) = 19.82, rounded up), against **>= 18.4 tok/s** on bcachefs (1000 / (50 + 4.3)).
+20 tok/s (50 ms per token), S-cold must decode at **>= 19.8 tok/s** on the
+NVMe (1000 / (50 + 0.46) = 19.82, rounded down), against **>= 18.4 tok/s** on bcachefs (1000 / (50 + 4.3)).
 
 ### 8.3 Qwen PP512
 
