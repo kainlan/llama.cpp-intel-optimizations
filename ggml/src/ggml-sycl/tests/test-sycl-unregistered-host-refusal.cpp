@@ -268,6 +268,20 @@ int run_interior(checks & c) {
                 std::to_string(registered) + ", lease valid=" + std::to_string(lease.valid()) +
                 (entry != nullptr ? ", entry location=" + std::string(location_name(entry->location)) : ", no entry") +
                 "; expected accepted as HOST_PINNED");
+
+        // The entry points into `owner`'s memory and the process-wide cache outlives this function, so it is retired
+        // before the allocation is freed: an entry that names memory must not outlive it.
+        lease = {};
+        if (expert) {
+            (void) cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test-sycl-unregistered-host-refusal");
+        } else {
+            cache->remove(key, cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS);
+        }
+        cache->process_deferred_frees_public();
+        c.expect(entry_of(cache, expert, key) == nullptr,
+                 std::string("the entry ") + api +
+                     " registered over the pinned slice outlives the test: it would point "
+                     "at memory freed when the allocation drops");
     }
     const uint64_t refused = unified_cache_unregistered_host_registration_refusals() - refusals;
     c.expect(refused == 0, "the pinned slice moved the refusal counter by " + std::to_string(refused) + ", expected 0");
