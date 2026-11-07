@@ -158,23 +158,20 @@ struct host_working_set {
     bool   exceeds           = false;
 };
 
-inline host_working_set host_working_set_check(size_t total_bytes,
-                                               size_t mem_available_pre,
-                                               size_t expected_host,
-                                               size_t mapped_bytes,
-                                               bool   locked) {
+// The working set against `headroom` as given: a plan passes its budget's own, so its working-set line and its
+// would-refuse line name one sample.
+inline host_working_set host_working_set_check_headroom(size_t headroom,
+                                                        size_t mem_available_pre,
+                                                        size_t expected_host,
+                                                        size_t mapped_bytes,
+                                                        bool   locked) {
     host_working_set ws;
     ws.sampled           = mem_available_pre != 0;
     ws.locked            = locked;
     ws.mem_available_pre = mem_available_pre;
     ws.expected_host     = expected_host;
-#if defined(HOST_BUDGET_MUTANT_P3_CONSTANT)
-    (void) total_bytes;
-    ws.headroom = k_host_p3_floor;
-#else
-    ws.headroom = host_headroom(total_bytes);
-#endif
-    ws.mapped_ws = locked ? 0 : mapped_bytes;
+    ws.headroom          = headroom;
+    ws.mapped_ws         = locked ? 0 : mapped_bytes;
     ws.resident_room =
         detail::host_budget_sat_sub(detail::host_budget_sat_sub(mem_available_pre, expected_host), ws.headroom);
 #if defined(HOST_BUDGET_MUTANT_WARN_ABOVE_THRESHOLD)
@@ -183,6 +180,21 @@ inline host_working_set host_working_set_check(size_t total_bytes,
     ws.exceeds = ws.sampled && ws.mapped_ws > ws.resident_room;
 #endif
     return ws;
+}
+
+// The working set against host_headroom(MemTotal), the headroom §4.5's budget leaves a host of `total_bytes`.
+inline host_working_set host_working_set_check(size_t total_bytes,
+                                               size_t mem_available_pre,
+                                               size_t expected_host,
+                                               size_t mapped_bytes,
+                                               bool   locked) {
+#if defined(HOST_BUDGET_MUTANT_P3_CONSTANT)
+    (void) total_bytes;
+    const size_t headroom = k_host_p3_floor;
+#else
+    const size_t headroom = host_headroom(total_bytes);
+#endif
+    return host_working_set_check_headroom(headroom, mem_available_pre, expected_host, mapped_bytes, locked);
 }
 
 // The working set's figures, in the one order the WARN and the plan line both print them.

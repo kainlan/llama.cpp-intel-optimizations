@@ -34543,15 +34543,17 @@ static void record_host_ledger_plan(placement_plan &          plan,
 
 // The resident working set (design 5efe §4.5, §7 C5), once per plan beside its Totals line: the plan line, and the
 // WARN when the host-executed mapped bytes exceed resident_room = MemAvailable_pre - expected_host -
-// host_headroom(MemTotal). expected_host is the plan's charged host figure, the one P3 reads; MemAvailable_pre is the
-// load's one sample. Locked mapped bytes are charged and cannot be dropped, so a locked mapping counts none and the
-// plan line says locked. A mapped overflow costs refaults, not an OOM, so the plan proceeds.
+// host_headroom(MemTotal). expected_host is the plan's charged host figure, the one P3 reads. MemAvailable_pre and the
+// headroom are the planner input's, the sample this plan's budget came from (the load's stored one, or a dry run's
+// own), so this line and the would-refuse line name one sample. Locked mapped bytes are charged and cannot be dropped,
+// so a locked mapping counts none and the plan line says locked. A mapped overflow costs refaults, not an OOM, so the
+// plan proceeds.
 static void placement_plan_log_working_set(const char *              tag,
                                            const placement_plan &    plan,
                                            const placement_kv_info & kv_info) {
     const host_working_set ws =
-        host_working_set_check(ggml_sycl_get_total_system_memory_bytes(), kv_info.host_mem_available_pre,
-                               plan.host_planned_bytes, plan.host_mapped_bytes, plan.host_mapped_locked);
+        host_working_set_check_headroom(kv_info.host_headroom, kv_info.host_mem_available_pre, plan.host_planned_bytes,
+                                        plan.host_mapped_bytes, plan.host_mapped_locked);
     GGML_LOG_INFO("%s", host_working_set_plan_line(tag, ws).c_str());
     const std::string warn = host_working_set_warn_line(ws);
     if (!warn.empty()) {
