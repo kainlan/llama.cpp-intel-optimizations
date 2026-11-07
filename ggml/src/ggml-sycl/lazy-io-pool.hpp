@@ -495,12 +495,15 @@ struct lazy_registry_state {
     uint64_t joins                  = 0;  // joins run
     uint64_t joins_from_worker      = 0;  // joins run on a pool worker thread
     uint64_t self_joins             = 0;  // joins a worker asked of itself, recorded and never run
+    // Held leases destroyed after the registry shut down (§3.3's drain): a record's lease the drain missed, dropped by
+    // static destruction or a test's clear. The drain moves every record's lease out before it marks shut-down.
+    uint64_t drops_after_shut_down  = 0;
 };
 
 // Copies the registry's state into *out. Returns false, writing nothing, for a null pointer.
 bool ggml_sycl_lazy_registry_for_testing(lazy_registry_state * out);
 
-// The registry's one-shot hold hook, armed at one of five points; arming any point replaces whatever was armed, and
+// The registry's one-shot hold hook, armed at one of seven points; arming any point replaces whatever was armed, and
 // arming with a null callback disarms. The callback runs once, with no registry or IO-engine lock held (the plan
 // point's caller holds its inventory guard), and blocks for as long as the fixture wants its caller held.
 using lazy_hold_fn = void (*)(void * ctx);
@@ -527,6 +530,15 @@ void ggml_sycl_test_lazy_plan_hold(lazy_hold_fn hold, void * ctx);
 // arming calls it once the queued reads are cancelled and before that wait, with no registry or IO-engine lock held, so
 // a fixture can hold the picked reads until shutdown is about to wait for them (§3.3).
 void ggml_sycl_test_lazy_shutdown_hold(lazy_hold_fn hold, void * ctx);
+
+// Arms the hook in the coverage scope's take (§3.3's race): the first planner caller's take after the arming calls it
+// after the scope's entry reap and before lazy_io_pool_take, with no registry or IO-engine lock held, so a fixture can
+// park the live pool between the entry reap and the take.
+void ggml_sycl_test_lazy_stage_take_hold(lazy_hold_fn hold, void * ctx);
+
+// Arms the hook in ring_lease::reset: the first drop of a held lease after the arming calls it before the drop's
+// critical section, with no registry lock held, so a fixture can hold a drop while a take joins the pool (§3.3's race).
+void ggml_sycl_test_lazy_drop_hold(lazy_hold_fn hold, void * ctx);
 
 // The plan point: claims the hook if it is armed there and calls it with no registry or IO-engine lock held; its one
 // caller, compute_and_store_plan_for_inventory, holds the inventory guard.
@@ -582,6 +594,15 @@ lazy_reap_holding_result ggml_sycl_test_lazy_reap_holding_pool(int lock);
 // logged and never thrown). One-shot.
 void ggml_sycl_test_lazy_reap_throw_next();
 
+// Runs `fn(ctx)` on the calling thread holding one witnessed lock (§11 T5): g_tensor_inventory_mutex itself,
+// g_lifecycle_plan_mutex through the unified cache's seam, and the registry's leaf mutex and the queue lock through
+// ggml_sycl_test_lazy_run_holding. A table's strand lock is NOT_WIRED. Defined in ggml-sycl.cpp.
+lazy_holding_status ggml_sycl_test_lazy_run_holding_any(int lock, lazy_hold_fn fn, void * ctx);
+
+// The reap's positive control over all five locks: a FULL reap called on a thread that holds `lock`, its status the
+// holding seam's. Defined in ggml-sycl.cpp.
+lazy_reap_holding_result ggml_sycl_test_lazy_ring_reap_holding(int lock);
+
 // The engine's read source (§5.2): `length` bytes of `fd` at `offset` into `dst`; returns the bytes read, or -errno.
 // A fixture's source replaces pread for every worker until it is cleared with null; it runs with no lock held.
 using lazy_io_read_fn = long (*)(void * ctx, int fd, uint8_t * dst, size_t length, uint64_t offset);
@@ -616,6 +637,11 @@ enum class lazy_ring_mutant : uint8_t {
     STRICT_ABORT_DROPPED,            // the STORAGE materialization does not abort on a ring refusal under strict leases
     NO_ALIGNMENT_CHECK,              // ensure accepts a need that is not whole 4 KiB blocks per slot
     SHUTDOWN_NO_WAIT,                // shutdown returns without waiting for the reads the workers picked
+    TAKE_IGNORES_DYING,              // a take joins a parked pool whose ring is still held
+    WORKER_REAP_DESTROYS_POOL,       // a WORKER reap deletes the parked pools, joining their workers on a worker
+    SNAPSHOT_CARRIES_LEASE,          // the published snapshot owns a lease on the pool
+    REAP_INSIDE_TRY,                 // the teardown reap runs inside the try that re-finalizes the ticket
+    SKIP_LEASE_DRAIN,                // shutdown moves no record's lease out before it marks the registry shut down
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);

@@ -756,7 +756,7 @@ arm_result arm_witness_table_full() {
     const child_run child = run_child_strings({ "test-sycl-lazy-io-engine-host", k_table_child },
                                               child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
     if (!child.ran) {
-        fail(r, "the nine-lock child did not finish within " + num(k_bound.count()) + " s");
+        void_arm(r, "the nine-lock child did not end within " + num(k_bound.count()) + " s");
         return r;
     }
     const char * want    = "witnessed_mutex: the depth table is full taking witness-full-8";
@@ -825,8 +825,8 @@ arm_result arm_reap_refuses_held_lock() {
             run_child_strings({ "test-sycl-lazy-io-engine-host", k_holding_child, std::to_string(c.lock) },
                               child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
         if (!child.ran) {
-            fail(r, std::string("the reap under ") + c.name + " did not return within " + num(k_bound.count()) +
-                        " s, want it to refuse and return");
+            void_arm(r, std::string("the reap under ") + c.name + " did not return within " + num(k_bound.count()) +
+                            " s, want it to refuse and return");
             continue;
         }
         const std::string want = std::string("REAP-HOLDING status=held witnessed=1 registry_held=") +
@@ -895,8 +895,8 @@ arm_result arm_drop_witness() {
     const child_run child = run_child_strings({ "test-sycl-lazy-io-engine-host", k_drop_child },
                                               child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
     if (!child.ran) {
-        fail(r, "the drop under g_lazy_registry_mutex did not finish within " + num(k_bound.count()) +
-                    " s, want it to abort naming that mutex");
+        void_arm(r, "the drop under g_lazy_registry_mutex did not end within " + num(k_bound.count()) +
+                        " s, want it to abort naming that mutex");
         return r;
     }
     const char * line  = "[HOST-PLAN-BUG] ring lease dropped with g_lazy_registry_mutex held";
@@ -932,7 +932,7 @@ arm_result arm_reap_throw() {
     const child_run child = run_child_strings({ "test-sycl-lazy-io-engine-host", k_throw_child },
                                               child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
     if (!child.ran) {
-        fail(r, "the throwing reap's child did not finish within " + num(k_bound.count()) + " s");
+        void_arm(r, "the throwing reap's child did not end within " + num(k_bound.count()) + " s");
         return r;
     }
     expect(r, WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0,
@@ -971,8 +971,9 @@ int reap_throw_child() {
 // join census records each join by its caller, so a join from a pool worker, or a worker asked to join itself, is a
 // finding.
 // Engagement, VOID counting as failed: the read is held on a worker when A's lease drops, and the worker's reap ran to
-// its end within the bound.
-// Mutant: worker-reap-destroys-pool, under which the WORKER reap stops and joins its own pool's workers.
+// its end and gave the ring's bytes back within the bound.
+// Mutant: worker-reap-destroys-pool, under which the WORKER reap deletes the parked pool, joining its workers from one
+// of them, which asks itself to join.
 arm_result arm_engine_worker_drop() {
     arm_result     r;
     const uint64_t charged0 = live_charged();
@@ -999,7 +1000,7 @@ arm_result arm_engine_worker_drop() {
     g.release();
     const bool done = within_bound([&] {
         const lazy_registry_state s = registry();
-        return s.worker_reaps > s0.worker_reaps && s.parked_nodes == 1 && live_charged() == charged0;
+        return s.worker_reaps > s0.worker_reaps && live_charged() == charged0;
     });
     ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
     if (!done) {
@@ -1016,6 +1017,8 @@ arm_result arm_engine_worker_drop() {
            "the worker's drop ran " + num(s1.joins_from_worker - s0.joins_from_worker) +
                " join(s) on a pool worker and " + num(s1.self_joins - s0.self_joins) +
                " self-join(s), want 0 and 0: no join runs on the completion path");
+    expect(r, s1.parked_nodes == 1,
+           "after the worker's drop " + num(s1.parked_nodes) + " pool(s) wait on the reap list, want 1");
     ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
     const lazy_registry_state s2 = registry();
     expect(r,
@@ -1035,12 +1038,13 @@ lazy_ring_mutant mutant_named(const char * text) {
     };
 
     static const entry table[] = {
-        { "no-ensuring",             lazy_ring_mutant::NO_ENSURING             },
-        { "ensuring-kept-on-throw",  lazy_ring_mutant::ENSURING_KEPT_ON_THROW  },
-        { "install-after-shut-down", lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN },
-        { "no-span-check",           lazy_ring_mutant::NO_SPAN_CHECK           },
-        { "no-alignment-check",      lazy_ring_mutant::NO_ALIGNMENT_CHECK      },
-        { "shutdown-no-wait",        lazy_ring_mutant::SHUTDOWN_NO_WAIT        },
+        { "no-ensuring",               lazy_ring_mutant::NO_ENSURING               },
+        { "ensuring-kept-on-throw",    lazy_ring_mutant::ENSURING_KEPT_ON_THROW    },
+        { "install-after-shut-down",   lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN   },
+        { "no-span-check",             lazy_ring_mutant::NO_SPAN_CHECK             },
+        { "no-alignment-check",        lazy_ring_mutant::NO_ALIGNMENT_CHECK        },
+        { "shutdown-no-wait",          lazy_ring_mutant::SHUTDOWN_NO_WAIT          },
+        { "worker-reap-destroys-pool", lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL },
     };
     for (const entry & e : table) {
         if (std::strcmp(e.text, text) == 0) {

@@ -127400,6 +127400,35 @@ extern "C" void * ggml_sycl_test_lazy_slot_begin(void * pin) {
 extern "C" void ggml_sycl_test_lazy_slot_end(void * scope) {
     delete static_cast<lazy_plan_slot_scope *>(scope);
 }
+
+namespace ggml_sycl {
+
+// The lazy lock witness's control (th32 §11 T5): this file owns g_tensor_inventory_mutex, the unified cache the plan
+// records' lock, and the IO pool the registry's leaf mutex and the queue lock.
+lazy_holding_status ggml_sycl_test_lazy_run_holding_any(int lock, lazy_hold_fn fn, void * ctx) {
+    if (lock == LAZY_LOCK_INVENTORY) {
+        std::lock_guard<std::mutex> inventory_lock(g_tensor_inventory_mutex);
+        fn(ctx);
+        return lazy_holding_status::HELD;
+    }
+    if (lock == LAZY_LOCK_PLAN) {
+        lifecycle_plan_run_locked_for_test(fn, ctx);
+        return lazy_holding_status::HELD;
+    }
+    return ggml_sycl_test_lazy_run_holding(lock, fn, ctx);
+}
+
+static void lazy_ring_reap_under_held_lock_into(void * out) {
+    *static_cast<lazy_reap_holding_result *>(out) = ggml_sycl_test_lazy_reap_under_held_lock();
+}
+
+lazy_reap_holding_result ggml_sycl_test_lazy_ring_reap_holding(int lock) {
+    lazy_reap_holding_result result;
+    result.status = ggml_sycl_test_lazy_run_holding_any(lock, lazy_ring_reap_under_held_lock_into, &result);
+    return result;
+}
+
+}  // namespace ggml_sycl
 #endif
 
 extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {

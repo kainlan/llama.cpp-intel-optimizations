@@ -484,13 +484,17 @@ if (BUILD_TESTING)
         string(CONCAT _le_re_shutdown_no_wait
             "FAIL shutdown cancels queued reads and waits for picked ones: shutdown returned while the picked reads "
             "were still held on their latch, want it to return only after they finish")
+        string(CONCAT _le_re_worker_reap_destroys_pool
+            "FAIL a worker's last drop leaves its pool's join to the next FULL reap: the worker's drop ran [0-9]+ "
+            "join\\(s\\) on a pool worker and 1 self-join\\(s\\), want 0 and 0")
         set(_lazy_io_engine_mutants
-            no-ensuring             "${_le_re_no_ensuring}"
-            ensuring-kept-on-throw  "${_le_re_ensuring_kept_on_throw}"
-            install-after-shut-down "${_le_re_install_after_shut_down}"
-            no-span-check           "${_le_re_no_span_check}"
-            no-alignment-check      "${_le_re_no_alignment_check}"
-            shutdown-no-wait        "${_le_re_shutdown_no_wait}")
+            no-ensuring               "${_le_re_no_ensuring}"
+            ensuring-kept-on-throw    "${_le_re_ensuring_kept_on_throw}"
+            install-after-shut-down   "${_le_re_install_after_shut_down}"
+            no-span-check             "${_le_re_no_span_check}"
+            no-alignment-check        "${_le_re_no_alignment_check}"
+            shutdown-no-wait          "${_le_re_shutdown_no_wait}"
+            worker-reap-destroys-pool "${_le_re_worker_reap_destroys_pool}")
         add_executable(test-sycl-lazy-io-engine-host
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
             lazy-io-pool.cpp
@@ -8605,6 +8609,92 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # read as a kill of the entry reap.
     set_tests_properties(test-sycl-lazy-ring-mutant-no-entry-reap PROPERTIES
         FAIL_REGULAR_EXPRESSION "it took no lease")
+
+    # The five witnessed locks (th32 §3.3, §11 T5; canonical §12.5): a FULL reap called under each of the IO pool
+    # registry's leaf mutex, g_tensor_inventory_mutex, g_lifecycle_plan_mutex and the IO engine's queue lock refuses
+    # naming it, and the control reports a table's strand lock not wired; host_ledger_sample and a yield round abort
+    # through GGML_SYCL_WITNESS under each of the four and return with none held. Every case runs in a child of the
+    # binary; the queue lock's children initialise backend 0 and ensure a block ring so an IO engine exists, so the
+    # binary runs on the B50, carries the OOM-family labels and runs alone. Lead-run.
+    string(CONCAT _lazy_lock_witness_env
+        "ONEAPI_DEVICE_SELECTOR=level_zero:1;"
+        "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+    add_executable(test-sycl-lazy-lock-witness
+        tests/test-sycl-lazy-lock-witness.cpp)
+    target_link_libraries(test-sycl-lazy-lock-witness PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-lock-witness PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-lock-witness COMMAND test-sycl-lazy-lock-witness)
+    set_tests_properties(test-sycl-lazy-lock-witness PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "${_lazy_lock_witness_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 600)
+
+    # The IO pool's reap points (th32 §3.3, §11 T5): the entry reap of a planner caller, the reap after a failed load's
+    # end, the teardown reap at a model swap, the teardown reap whose first step throws, the shutdown drain with a read
+    # in flight, with the last table and read freed and with a published record never erased, and both orders of a
+    # read's last drop against a stage's take. The stage builds both cards' caches on the multi-device path, so it runs
+    # on level_zero:0,1, exits 77 on the single-device path, carries the OOM-family labels and runs alone. The teardown
+    # throw and the three shutdown fixtures run in children started before the parent initialises SYCL. Lead-run.
+    #
+    # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
+    # and the FAIL line of the arm that kills it, which runs alone (a child arm's mutant is planted in that child). No
+    # mutant registration carries SKIP_RETURN_CODE, for the reason the lazy-ring block gives.
+    string(CONCAT _lrp_re_no_entry_reap
+        "FAIL a stage's entry reap frees a ring another thread parked before the stage takes its lease: "
+        "after B's ensure the ledger shows [0-9]+ ring bytes, want one ring of [0-9]+ B: "
+        "the parked ring outlived B's take")
+    string(CONCAT _lrp_re_snapshot_carries_lease
+        "FAIL a model swap gives A's ring back at A's teardown with no witnessed lock held: "
+        "(after A's unload: [0-9]+ live pools, [0-9]+ leases, [0-9]+ parked, want 0, 0, 0"
+        "|A's ring lease was dropped with a witnessed lock held)")
+    string(CONCAT _lrp_re_take_ignores_dying
+        "FAIL a read's last drop between the stage's entry reap and its take parks, and the take builds anew: "
+        "model B's early plan charged ring=0, want [0-9]+: the take joined the parked pool")
+    string(CONCAT _lrp_re_reap_inside_try
+        "FAIL a teardown reap whose first step throws logs it and leaves the unload finalized once: "
+        "the teardown printed 'TEARDOWN-CHILD unloaded rc=16 ")
+    string(CONCAT _lrp_re_skip_lease_drain
+        "FAIL shutdown drains a never-erased record's lease with one leaked-lease line: "
+        "after the records were cleared: 'LEAKED-CHILD cleared drops_after_shut_down=1', "
+        "want drops_after_shut_down=0")
+    set(_lazy_reap_points_mutants
+        no-entry-reap          "${_lrp_re_no_entry_reap}"
+        snapshot-carries-lease "${_lrp_re_snapshot_carries_lease}"
+        take-ignores-dying     "${_lrp_re_take_ignores_dying}"
+        reap-inside-try        "${_lrp_re_reap_inside_try}"
+        skip-lease-drain       "${_lrp_re_skip_lease_drain}")
+    add_executable(test-sycl-lazy-reap-points
+        tests/test-sycl-lazy-reap-points.cpp)
+    target_link_libraries(test-sycl-lazy-reap-points PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-reap-points PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-reap-points COMMAND test-sycl-lazy-reap-points)
+    set_tests_properties(test-sycl-lazy-reap-points PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "${_lazy_ring_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 900)
+    list(LENGTH _lazy_reap_points_mutants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _lazy_reap_points_mutants ${_i} _mutant)
+        list(GET _lazy_reap_points_mutants ${_j} _regex)
+        add_test(NAME test-sycl-lazy-reap-points-mutant-${_mutant}
+            COMMAND test-sycl-lazy-reap-points --mutant ${_mutant})
+        set_tests_properties(test-sycl-lazy-reap-points-mutant-${_mutant} PROPERTIES
+            LABELS "sycl;host;cache;mem-handle;gpu-serial;mutant"
+            ENVIRONMENT "${_lazy_ring_env}"
+            RUN_SERIAL TRUE
+            TIMEOUT 900
+            PASS_REGULAR_EXPRESSION "${_regex}")
+    endforeach()
 
     # The lazy table object (th32 §3.2, §3.3, §10, §11 T4): the HOST body's eager O_DIRECT read into locked HOST_CPU
     # memory, the STORAGE descriptor, the last reference's release, the activation check (one extra chunk refuses,

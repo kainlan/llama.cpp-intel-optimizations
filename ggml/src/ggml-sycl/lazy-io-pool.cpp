@@ -117,9 +117,9 @@ uint64_t          g_lazy_parked_at_last_take    = 0;
 std::atomic<uint64_t> g_lazy_ring_coverage_reads{ 0 };
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The one-shot hold hook and the point it is armed at: the first FULL reap, the first take that builds a pool, the
-// first ensure that reserves `ensuring`, the first planner caller to reach the plan point, or the first shutdown to
-// reach its wait for the picked reads.
-enum class lazy_hold_point : uint8_t { REAP, TAKE, ENSURE, PLAN, SHUTDOWN };
+// first ensure that reserves `ensuring`, the first planner caller to reach the plan point, the first shutdown to reach
+// its wait for the picked reads, the first coverage scope's take, or the first drop of a held lease.
+enum class lazy_hold_point : uint8_t { REAP, TAKE, ENSURE, PLAN, SHUTDOWN, STAGE_TAKE, DROP };
 
 lazy_hold_point g_lazy_hold_point = lazy_hold_point::REAP;
 lazy_hold_fn    g_lazy_hold       = nullptr;
@@ -161,6 +161,7 @@ std::atomic<uint64_t> g_lazy_worker_reaps{ 0 };
 std::atomic<uint64_t> g_lazy_joins{ 0 };
 std::atomic<uint64_t> g_lazy_joins_from_worker{ 0 };
 std::atomic<uint64_t> g_lazy_self_joins{ 0 };
+std::atomic<uint64_t> g_lazy_drops_after_shut_down{ 0 };
 std::atomic<bool>     g_lazy_reap_throw_next{ false };
 
 // The test seam's throw at the FULL reap's first step: what std::mutex::lock throws.
@@ -227,6 +228,9 @@ void ring_lease::reset() noexcept {
     }
     pool_ = nullptr;
     if (g_lazy_shut_down.load(std::memory_order_acquire)) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        g_lazy_drops_after_shut_down.fetch_add(1, std::memory_order_relaxed);
+#endif
         pool->leases.fetch_sub(1, std::memory_order_relaxed);
         return;
     }
@@ -475,6 +479,7 @@ bool ggml_sycl_lazy_registry_for_testing(lazy_registry_state * out) {
     out->joins                  = g_lazy_joins.load(std::memory_order_relaxed);
     out->joins_from_worker      = g_lazy_joins_from_worker.load(std::memory_order_relaxed);
     out->self_joins             = g_lazy_self_joins.load(std::memory_order_relaxed);
+    out->drops_after_shut_down  = g_lazy_drops_after_shut_down.load(std::memory_order_relaxed);
     return true;
 }
 
@@ -569,6 +574,14 @@ void ggml_sycl_test_lazy_plan_hold(lazy_hold_fn hold, void * ctx) {
 
 void ggml_sycl_test_lazy_shutdown_hold(lazy_hold_fn hold, void * ctx) {
     lazy_hold_arm(lazy_hold_point::SHUTDOWN, hold, ctx);
+}
+
+void ggml_sycl_test_lazy_stage_take_hold(lazy_hold_fn hold, void * ctx) {
+    lazy_hold_arm(lazy_hold_point::STAGE_TAKE, hold, ctx);
+}
+
+void ggml_sycl_test_lazy_drop_hold(lazy_hold_fn hold, void * ctx) {
+    lazy_hold_arm(lazy_hold_point::DROP, hold, ctx);
 }
 
 void ggml_sycl_test_lazy_plan_point() {

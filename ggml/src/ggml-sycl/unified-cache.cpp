@@ -175,6 +175,34 @@ uint64_t lifecycle_next_plan_publication_id() noexcept {
 void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept {
     g_lifecycle_plan_next_version.store(next, std::memory_order_relaxed);
 }
+
+void lifecycle_plan_run_locked_for_test(void (*fn)(void *), void * ctx) {
+    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    fn(ctx);
+}
+
+size_t lifecycle_plan_lease_count_for_test() {
+    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    size_t                      count = 0;
+    for (const auto & candidate : g_lifecycle_plan_candidates) {
+        count += candidate.second.lease.held() ? 1 : 0;
+    }
+    for (const auto & model : g_lifecycle_plan_models) {
+        for (const auto & record : model.second) {
+            count += record.second.lease.held() ? 1 : 0;
+        }
+    }
+    return count;
+}
+
+void lifecycle_plan_clear_for_test() {
+    // Declared before the lock, so the records, and their leases, are destroyed after the unlock with no lock held.
+    std::unordered_map<uint64_t, lifecycle_plan_record>                               candidates;
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, lifecycle_plan_record>> models;
+    std::lock_guard<std::mutex>                                                       lock(g_lifecycle_plan_mutex);
+    candidates.swap(g_lifecycle_plan_candidates);
+    models.swap(g_lifecycle_plan_models);
+}
 #endif
 
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_make_candidate_snapshot(uint64_t                  load_txn_id,
@@ -1294,6 +1322,12 @@ static size_t host_ledger_yield_round(size_t deficit, uint64_t load_txn_id) {
     }
     return freed;
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+size_t host_ledger_test_yield_round(size_t deficit, uint64_t load_txn_id) {
+    return host_ledger_yield_round(deficit, load_txn_id);
+}
+#endif
 
 host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_request & req) {
     host_ledger_charge_result result{};
