@@ -12,8 +12,8 @@
 //     must be accepted, and the cache must show its entry, so a refusal of everything and a cache the lookups cannot
 //     see both read as a failure of the control and never as the refusal working;
 //   - subject: a malloc'ed block, which neither registry knows (query_location answers UNREGISTERED), with no owner.
-//     It must be refused: the call returns false, hands out no lease and leaves no entry. Today it is accepted as a
-//     HOST_MMAP entry that owns nothing (non_owning_external_host), which is what C6 retires.
+//     It must be refused: the call returns false, hands out no lease and leaves no entry. Before C6 it was accepted as
+//     a HOST_MMAP entry that owned nothing (non_owning_external_host), which is what C6 retired.
 // A block the registry turned out to know, or a control the cache refused, makes the case VOID, not a pass. The refusal
 // also counts: the process-wide refusal counter moves by one for the subject and by none for the control.
 //
@@ -23,9 +23,10 @@
 // the refusal counter unmoved: a refusal keyed on query_location alone would fire on a real load.
 //
 // A fourth case, direct, is the direct stage's host fallback (§4.8, §5.3). A destination no zone can hold sends
-// direct_stage_expert to its host fallback; with the pinned copy refused as well (a source length no pinned pool can
-// grant), the fallback publishes the source in place. A slice inside a pinned allocation is published in place as
-// HOST_PINNED, and a malloc'ed source is refused, counted, and leaves no entry: it has no owner to publish under.
+// direct_stage_expert to its host fallback. A slice inside a pinned allocation, the control, is published in place as
+// HOST_PINNED without a pinned copy being tried. For the malloc'ed subject the pinned copy is tried and refused (a
+// source length no pinned pool can grant), and after a refused copy only a FILE_MAPPED source may be published in
+// place, so the subject is refused, counted, and leaves no entry: it has no owner to publish under.
 //
 // A fifth case, overrun, is a slice that starts inside a pinned allocation and runs past its end. Both registrations
 // refuse it, with the counter and no entry; a slice ending exactly at the allocation's end is accepted.

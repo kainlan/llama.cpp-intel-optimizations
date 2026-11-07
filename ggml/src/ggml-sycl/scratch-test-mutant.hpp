@@ -73,8 +73,8 @@ enum class scratch_test_mutant : int {
     SEG_DESTROY_BEFORE_WAITS  = 34,  // the fallback catch destroys the handed-over graphs before its waits
     SEG_RECORD_GUARD_REMOVED  = 35,  // the record function records over a context that still holds segments
     SEG_IMMEDIATE_RETURN      = 36,  // the fallback catch returns FAILED before any of its steps
-    // The host registrations' refusal of an unregistered pointer.
-    UNREGISTERED_HOST_ALLOWED = 37,  // register_host_expert and register_host_weight accept an UNREGISTERED pointer
+    // The refusal of an unregistered host pointer.
+    UNREGISTERED_HOST_ALLOWED = 37,  // register_host_expert, register_host_weight and the direct stage accept one
     COUNT                     = 38,
 };
 

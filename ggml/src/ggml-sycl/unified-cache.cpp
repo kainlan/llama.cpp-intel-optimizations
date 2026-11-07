@@ -11613,11 +11613,11 @@ static host_registration_view host_registration_tier(const void * ptr, size_t si
 }
 
 // A host weight or expert is registered over memory some owner holds: a slice of a registered allocation. A pointer
-// inside no registered row (host_registration_tier answers UNREGISTERED, after the exact
-// base, the range and the containment lookups) has no owner to name, so the entry would be a non_owning_external_host
-// row over memory the cache can neither keep alive nor account for. A slice that starts inside a row and runs past its
-// end names memory outside the row's owner, and is refused the same way. Both refusals are counted and named, and the
-// caller sees false with nothing registered.
+// inside no registered row (host_registration_tier answers UNREGISTERED, after the exact base, the range and the
+// containment lookups) has no owner to name, so the entry would be a non_owning_external_host row over memory the cache
+// can neither keep alive nor account for. A slice that starts inside a row and runs past its end names memory outside
+// the row's owner, and is refused the same way. Both refusals are counted and named, and the caller sees false with
+// nothing registered.
 static bool host_registration_refuses(const char *                   api,
                                       const void *                   ptr,
                                       size_t                         size,
