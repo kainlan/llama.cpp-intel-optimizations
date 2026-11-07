@@ -1426,12 +1426,10 @@ GGML_BACKEND_API bool ggml_sycl_test_host_ledger_hook(int32_t point, ggml_sycl_t
 }
 
 GGML_BACKEND_API void ggml_sycl_test_host_ledger_store_budget(uint64_t budget) {
-    // A seeded budget is no headroom refusal (design 5efe §4.5): the flag and the refusal's MemTotal and headroom are
-    // cleared before the budget is stored, so a refusal against it names none from an earlier sample. MemAvailable
-    // stays: it is the load's P3 sample as well, and a seed does not resample it.
+    // A seeded budget is no headroom refusal (design 5efe §4.5): the flag is cleared before the budget is stored, so
+    // a refusal against it appends no reason, which the flag alone decides. The sample's figures stay: MemAvailable is
+    // the load's P3 sample and the headroom the plan's working-set input, and a seed does not resample either.
     ggml_sycl::g_host_ledger_headroom_exhausted.store(false, std::memory_order_release);
-    ggml_sycl::g_host_ledger_mem_total.store(0, std::memory_order_release);
-    ggml_sycl::g_host_ledger_headroom.store(0, std::memory_order_release);
     ggml_sycl::g_host_ledger_budget.store(static_cast<size_t>(budget), std::memory_order_release);
 }
 
