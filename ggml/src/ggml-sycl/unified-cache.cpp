@@ -1095,16 +1095,6 @@ static size_t host_ledger_deficit(size_t ask, size_t committed, size_t budget) {
     return host_ledger_sat_sub(ask, budget - committed);
 }
 
-// The refusal's name when the stored budget is the headroom refusal (design 5efe §4.5), with MemAvailable, MemTotal
-// and the headroom of the stored sample, for every refused charge to print; otherwise an empty string. Each figure is
-// read for display.
-static std::string host_ledger_refusal_reason() {
-    return host_headroom_refusal_reason(g_host_ledger_headroom_exhausted.load(std::memory_order_acquire),
-                                        g_host_ledger_mem_available.load(std::memory_order_acquire),
-                                        g_host_ledger_mem_total.load(std::memory_order_acquire),
-                                        g_host_ledger_headroom.load(std::memory_order_acquire));
-}
-
 size_t host_ledger_budget() {
     return g_host_ledger_budget.load(std::memory_order_acquire);
 }
@@ -1289,6 +1279,12 @@ host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_reques
     host_ledger_charge_result result{};
     result.ask           = req.bytes;
     result.budget        = g_host_ledger_budget.load(std::memory_order_acquire);
+    // The headroom refusal's figures, loaded beside the budget so a refused charge names the sample that budget came
+    // from (design 5efe §4.5) and not one a concurrent store wrote during the yield rounds; formatted only on refusal.
+    const bool   exhausted = g_host_ledger_headroom_exhausted.load(std::memory_order_acquire);
+    const size_t available = g_host_ledger_mem_available.load(std::memory_order_acquire);
+    const size_t total     = g_host_ledger_mem_total.load(std::memory_order_acquire);
+    const size_t headroom  = g_host_ledger_headroom.load(std::memory_order_acquire);
     // a charge a yielder makes never yields (th32 §4.2), whatever its request says
     const bool may_yield = req.may_yield && !g_host_ledger_in_yield;
     bool       counted   = false;
@@ -1327,7 +1323,7 @@ host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_reques
         }
     }
 
-    const std::string reason = host_ledger_refusal_reason();
+    const std::string reason = host_headroom_refusal_reason(exhausted, available, total, headroom);
     if (req.warn_only) {
         // Phase (a): the ledger logs what it would refuse and refuses nothing.
         GGML_LOG_WARN(

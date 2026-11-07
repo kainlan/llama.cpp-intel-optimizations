@@ -636,7 +636,9 @@ def refusal_source_gaps(record: str, load: str, closure: str) -> list:
     gaps = []
     if not calls(record, "host_headroom_refusal_reason"):
         gaps.append("record_host_ledger_plan does not format the reason through host_headroom_refusal_reason")
-    for reader in ("host_ledger_refusal_reason", "host_ledger_mem_available", "host_ledger_budget"):
+    stored_readers = tuple(accessor for _, accessor in REFUSAL_FIELDS)
+    stored_readers += ("host_ledger_mem_available", "host_ledger_budget")
+    for reader in stored_readers:
         if calls(record, reader):
             gaps.append(f"record_host_ledger_plan calls {reader}: the reason is the stored sample's, not the plan's")
     if re.search(r"\bg_host_ledger_\w+", record):
@@ -679,8 +681,8 @@ def test_the_refusal_source_check_sees_each_dropped_piece():
     )
     assert refusal_source_gaps(record, load, closure) == [], refusal_source_gaps(record, load, closure)
     mutants = {
-        "the line reads the stored reason": (
-            "char reason[160];\nhost_ledger_refusal_reason(reason, sizeof(reason));\n", load, closure),
+        "the line reads the stored flag": (
+            record.replace("kv_info.host_headroom_exhausted", "host_ledger_headroom_exhausted()"), load, closure),
         "the line reads a stored atomic": (
             record.replace("kv_info.host_mem_total", "g_host_ledger_mem_total.load()"), load, closure),
         "the load copies no exhausted flag": (
