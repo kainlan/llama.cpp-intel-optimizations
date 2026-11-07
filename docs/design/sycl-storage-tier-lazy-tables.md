@@ -1066,13 +1066,35 @@ shard 2 (tensors); Appendix A.1:
   `GGML_SYCL_GRAPH_DIAG` counts both kinds (`:632-660`, printed at `:794-830`).
 ### 2.4 The storage under the table (measured)
 
-> **Dated note, 2026-11-01.** The figures in this section were measured on
-> bcachefs over USB. `/models` has since moved to XFS per drive under mergerfs,
-> with the Qwen3.8 Q8_0 files on the NVMe. The figures are history for the old
-> layout. Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md`
-> re-pins them.
+> **Dated note, 2026-11-06.** `/models` moved to XFS per drive under mergerfs,
+> and the Qwen3.8 Q8_0 files now sit on the Kingston NVMe under the branch
+> `/mnt/models-nvme`. The table below sets the 2026-11-06 probes of that file
+> beside the 2026-09-26 probes of the bcachefs layout. The bcachefs description
+> and the bullets after the table describe the old layout and stand as history.
 
-`/models` is bcachefs with three members (sysfs
+Measured 2026-11-06 on the NVMe branch (XFS, `/dev/nvme1n1`, the Kingston
+OM3PDP3512B; `c-y57k`, device from `c-t65d`). The file was cold by
+`POSIX_FADV_DONTNEED` with `fincore` at 0 pages before each probe, and the load
+average was 12-14. Latencies are per 4 KiB read; the batch rows are a batch of
+16 rows (`T_ticket`) or of 7100 rows.
+
+| probe | bcachefs over USB, 2026-09-26 | NVMe, XFS, 2026-11-06 |
+|---|---|---|
+| fio `io_uring` `O_DIRECT` 4 KiB randread, QD1 | 1389 IOPS, p50 0.48 ms, p99 2.7 ms | 7398 IOPS, p50 144 us, p99 253 us |
+| fio, QD16 (the §8.3 QD16 control) | 7815 IOPS, p50 1.8 ms, p99 6.8 ms | 63757 IOPS, p50 224 us, p99 651 us |
+| fio, QD64 (the §8.1 control) | 9124 IOPS, p50 5.7 ms, p99 25 ms | 69706 IOPS, p50 897 us, p99 1597 us |
+| sequential 1 MiB `O_DIRECT` | 1.78 GB/s | 2240 MB/s, QD8 |
+| batch of 16, 16 workers: `T_ticket` mean, p99 | 3.75 ms, 13.0 ms | 0.40 ms, 0.63 ms |
+| batch of 7100, 64 workers: rows/s (batch time) | 8344 (0.85 s) | 68887 (103.07 ms) |
+
+The 2026-11-01 run of the same probes on the same layout (`c-t65d`) gave
+7389 IOPS at QD1, 61492 at QD16, 69507 at QD64, 68884 rows/s for the batch of
+7100, and a batch-16 `T_ticket` of mean 0.41 ms, p99 0.65 ms. The differences
+from the table are run-to-run noise under host load, and the table keeps the
+2026-11-06 run. The batch of 7100 reaches 68887 rows/s against the 69706 IOPS
+QD64 control, a ratio of 0.99.
+
+`/models` was bcachefs with three members (sysfs
 `/sys/fs/bcachefs/118129b2-.../dev-*`, and `bcachefs fs usage`):
 
 | dev | label | block device | link | user data | cached data |
@@ -3429,19 +3451,25 @@ the reading changes `C`, not the caches.
 
 Both engines were measured over the table's byte range (Appendix A.2):
 
-| engine | concurrency | rows/s | per-row latency |
-|---|---|---:|---|
-| mmap faults (upstream path), `MADV_RANDOM` | 1 thread | 1555 | mean 0.64 ms, p99 2.3 ms |
-| mmap faults | 16 threads | 7866 | mean 2.0 ms, p99 7.3 ms |
-| mmap faults | 24 threads | 7370 | mean 3.3 ms, p99 17.7 ms |
-| fio `O_DIRECT` `io_uring` 4 KiB | QD1 | 1389 | p50 0.48 ms, p99 2.7 ms |
-| fio `O_DIRECT` `io_uring` 4 KiB | QD16 | 7815 | p50 1.8 ms, p99 6.8 ms |
-| fio `O_DIRECT` `io_uring` 4 KiB | QD64 | 9124 | p50 5.7 ms, p99 25 ms |
-| pread pool, `O_DIRECT` 4/8 KiB | 64 workers | 8344 | (batch of 7100: 0.85 s) |
+| engine | concurrency | bcachefs over USB, 2026-09-26: rows/s, per-row latency | NVMe, XFS, 2026-11-06: rows/s, per-row latency |
+|---|---|---|---|
+| mmap faults (upstream path), `MADV_RANDOM` | 1 thread | 1555, mean 0.64 ms, p99 2.3 ms | not re-measured |
+| mmap faults | 16 threads | 7866, mean 2.0 ms, p99 7.3 ms | not re-measured |
+| mmap faults | 24 threads | 7370, mean 3.3 ms, p99 17.7 ms | not re-measured |
+| fio `O_DIRECT` `io_uring` 4 KiB | QD1 | 1389, p50 0.48 ms, p99 2.7 ms | 7398, p50 144 us, p99 253 us |
+| fio `O_DIRECT` `io_uring` 4 KiB | QD16 | 7815, p50 1.8 ms, p99 6.8 ms | 63757, p50 224 us, p99 651 us |
+| fio `O_DIRECT` `io_uring` 4 KiB | QD64 | 9124, p50 5.7 ms, p99 25 ms | 69706, p50 897 us, p99 1597 us |
+| pread pool, `O_DIRECT` 4/8 KiB | 64 workers | 8344, (batch of 7100: 0.85 s) | 68887, (batch of 7100: 103.07 ms) |
 
-**The device ceiling is the same for every engine.** On this filesystem the
-bottleneck is the 256 KiB extent bounce onto USB links, not the syscall
-mechanism (bcachefs layout, history; see the §2.4 note). The choice of engine
+The mmap page-fault probe was not rerun on the NVMe layout (`c-t65d`), so its
+rows keep their 2026-09-26 figures. The NVMe columns are `c-y57k`, and the
+2026-11-01 run on the same layout (`c-t65d`) agrees within noise.
+
+**The device ceiling is the same for every engine.** On the old bcachefs
+layout the bottleneck was the 256 KiB extent bounce onto USB links, not the
+syscall mechanism (bcachefs layout, history; see the §2.4 note). On the NVMe
+the same parity holds: fio at QD64 read 69706 IOPS and the pread pool 68887
+rows/s. The choice of engine
 therefore rests on *timing*, *ownership* and *accounting*, and on all three
 `O_DIRECT` prefetch wins:
 
