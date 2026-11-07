@@ -127451,6 +127451,31 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
            ggml_sycl::unified_alloc_validate_registry(-1, "module-reload-clean");
 }
 
+// The shutdown drain (th32 §3.3). A plan record that still holds its ring lease here was never aborted or erased, a
+// leak: each such lease is moved out of its record, one per take, named in one WARN and dropped here with no lock held,
+// so its pool parks as any last drop's does. A FULL reap then frees the parked pools, and only then is the registry
+// marked shut down: a lease dropped after the mark, as static destruction of the records would drop one, only
+// decrements its pool's count, and nothing frees the pool.
+static void ggml_sycl_lazy_lease_drain() noexcept {
+    bool drain = true;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    drain = !ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::SKIP_LEASE_DRAIN);
+#endif
+    while (drain) {
+        uint64_t              model_id    = 0;
+        uint64_t              load_txn_id = 0;
+        ggml_sycl::ring_lease lease       = ggml_sycl::lifecycle_take_ring_lease(&model_id, &load_txn_id);
+        if (!lease.held()) {
+            break;
+        }
+        GGML_LOG_WARN("[HOST-PLAN-BUG] leaked ring lease: model=%llu load=%llu\n", (unsigned long long) model_id,
+                      (unsigned long long) load_txn_id);
+        lease.reset();
+    }
+    ggml_sycl::ggml_sycl_lazy_ring_reap(ggml_sycl::lazy_reap_scope::FULL);
+    ggml_sycl::lazy_io_pool_mark_shut_down();
+}
+
 void ggml_backend_sycl_shutdown(void) {
     ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     {
@@ -127470,6 +127495,7 @@ void ggml_backend_sycl_shutdown(void) {
     // cancelled and the picked ones waited out here, before any retained handle or cache goes, which drops every read's
     // lease. Shutdown is already a waiting context.
     ggml_sycl::lazy_io_pool_shutdown();
+    ggml_sycl_lazy_lease_drain();
     split_config_shutdown_reset();
     ggml_sycl_watchdog_stop();
     ggml_sycl_quarantine_drain_shutdown();

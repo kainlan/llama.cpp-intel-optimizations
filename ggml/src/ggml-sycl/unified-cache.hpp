@@ -2450,6 +2450,10 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(u
                                                                                uint64_t slot_generation) noexcept;
 void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept;
 size_t lifecycle_published_placement_plan_count_for_test() noexcept;
+// The shutdown drain's take (th32 §3.3): moves one held lease out of a published or staged record, leaving the record,
+// and names its owner, model 0 for a staged candidate. An empty lease means no record holds one. The caller drops the
+// lease after this returns, with no lock held.
+ring_lease lifecycle_take_ring_lease(uint64_t * model_id, uint64_t * load_txn_id) noexcept;
 bool   lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                         const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept;
 #if defined(GGML_SYCL_PRIVATE_TESTING)

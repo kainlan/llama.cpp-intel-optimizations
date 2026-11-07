@@ -193,8 +193,8 @@ enum class lazy_reap_scope : uint8_t {
 void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept;
 
 // Marks the registry shut down: from then on a take returns an empty lease and a lease's drop only decrements, so a
-// lease destroyed during static destruction never touches the registry's mutex. No production caller sets it yet: the
-// T5 engine (design §11 row T5) adds the lease drain at backend shutdown, which sets it after its own FULL reap.
+// lease destroyed during static destruction never touches the registry's mutex. Its production caller is the lease
+// drain at backend shutdown, ggml_sycl_lazy_lease_drain in ggml-sycl.cpp, which sets it after its own FULL reap.
 void lazy_io_pool_mark_shut_down() noexcept;
 
 // Whether `generation` names a pool the registry still holds, in its slot or parked on the reap list, read under the

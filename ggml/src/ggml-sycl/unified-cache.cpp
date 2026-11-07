@@ -595,6 +595,30 @@ size_t lifecycle_published_placement_plan_count_for_test() noexcept {
     }
 }
 
+ring_lease lifecycle_take_ring_lease(uint64_t * model_id, uint64_t * load_txn_id) noexcept {
+    ring_lease      lease;  // moved out under the lock into an empty lease, so nothing is dropped under it
+    std::lock_guard lock(g_lifecycle_plan_mutex);
+    for (auto & model : g_lifecycle_plan_models) {
+        for (auto & record : model.second) {
+            if (record.second.lease.held()) {
+                *model_id    = model.first;
+                *load_txn_id = record.first;
+                lease        = std::move(record.second.lease);
+                return lease;
+            }
+        }
+    }
+    for (auto & candidate : g_lifecycle_plan_candidates) {
+        if (candidate.second.lease.held()) {
+            *model_id    = 0;
+            *load_txn_id = candidate.first;
+            lease        = std::move(candidate.second.lease);
+            return lease;
+        }
+    }
+    return lease;
+}
+
 const char * residency_reject_reason_name(residency_reject_reason reason) {
     switch (reason) {
         case residency_reject_reason::NONE:
