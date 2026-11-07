@@ -3368,11 +3368,7 @@ figures in MB, as printed. The derived model above is unchanged.
 | both cards (`level_zero:0,1`), live `MemAvailable` 213.4 GiB | 210346.9 | 40875.4, both cards | 84150.0 | 6144.0 | `tables=0` | `PLACEMENT-BLOCK`, `no-compatible-gpu-capacity` |
 
 The both-cards run also charges 2843.3 MB to host and prints `CPU_OWNED` 2667.9
-MB and `kv_host_bytes` 10.1 MB. With the table deferred to STORAGE, the dry-run
-prints `LAZY tables=0` and `ring_need=0` at every reading, although the 51880
-MiB table is recorded `deferral=STORAGE taker=1` and appears in no residency
-row, so the `expected_host` and ring figures above carry no charge for it on
-this tree (`llama.cpp-8v67`).
+MB and `kv_host_bytes` 10.1 MB. The dry-run prints `LAZY tables=0` and `ring_need=0` at every reading although the 51880 MiB table is recorded `deferral=STORAGE` (`llama.cpp-8v67`).
 
 **DeepSeek Q2_K, the planner's fit** (`MemAvailable - 8`; the verdicts are
 after (s)):
