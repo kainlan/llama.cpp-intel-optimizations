@@ -8,8 +8,8 @@
 //
 // Arms:
 //   (1) every row of the §4.5 table: the headroom and the budget, or the named refusal host-headroom-exhausted;
-//   (2) MemAvailable swept from 0 to MemTotal in 64 MiB steps on 32, 62 and 246.9 GiB hosts: the budget never
-//       decreases, a refusal counting as 0;
+//   (2) MemAvailable swept from 0 in 64 MiB steps and then at MemTotal itself on 32, 62 and 246.9 GiB hosts: the
+//       budget never decreases, a refusal counting as 0;
 //   (3) GGML_SYCL_HOST_RESERVE_MB composes: above the formula the budget is the formula's, below it the override's, and
 //       at zero headroom-free memory it is the named refusal either way;
 //   (4) an unknown MemTotal keeps the min(8 GiB, MemAvailable/4) reserve and stays monotone; nothing read is uncapped;
@@ -125,29 +125,40 @@ void arm_sweep() {
     const char *              arm    = "(2) the budget never decreases as MemAvailable rises";
     const std::vector<double> totals = { 32.0, 62.0, 246.9 };
     for (double t : totals) {
-        const size_t total   = gib(t);
-        size_t       prev    = 0;
-        size_t       prev_av = 0;
-        size_t       steps   = 0;
-        size_t       top     = 0;
-        for (size_t av = 0; av <= total; av += 64 * MiB) {
-            const size_t g = granted(budget_of(total, av));
-            if (steps > 0 && g < prev) {
+        const size_t        total = gib(t);
+        // The 64 MiB steps below MemTotal, then MemTotal itself, which a step lands on only when it is a multiple of
+        // 64 MiB (246.9 GiB is not).
+        std::vector<size_t> avs;
+        for (size_t av = 0; av < total; av += 64 * MiB) {
+            avs.push_back(av);
+        }
+        avs.push_back(total);
+        size_t prev    = 0;
+        size_t prev_av = 0;
+        bool   first   = true;
+        bool   refused = false;
+        size_t last    = 0;
+        for (size_t av : avs) {
+            const host_budget_result r = budget_of(total, av);
+            const size_t             g = granted(r);
+            if (!first && g < prev) {
                 char buf[256];
                 std::snprintf(buf, sizeof(buf), "total=%.1f GiB: available %s gives %s, available %s gives %s", t,
                               fmt_gib(prev_av).c_str(), fmt_gib(prev).c_str(), fmt_gib(av).c_str(), fmt_gib(g).c_str());
                 fail(arm, buf);
             }
+            refused = refused || r.status == host_budget_status::HEADROOM_EXHAUSTED;
             prev    = g;
             prev_av = av;
-            top     = g;
-            ++steps;
+            last    = g;
+            first   = false;
         }
-        // Engagement: the sweep visited every step and ended on a granted budget.
-        if (steps != total / (64 * MiB) + 1 || top == 0) {
-            char buf[128];
-            std::snprintf(buf, sizeof(buf), "total=%.1f GiB: %zu steps, last budget %s", t, steps,
-                          fmt_gib(top).c_str());
+        // Engagement: the sweep crossed the refusal (some step at or below the headroom was refused) and ended on a
+        // budget granted at MemTotal, so it ran on both sides of the headroom.
+        if (!refused || last == 0) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "total=%.1f GiB: %s step refused, budget at MemTotal %s", t,
+                          refused ? "a" : "no", fmt_gib(last).c_str());
             void_arm(arm, buf);
         }
     }
