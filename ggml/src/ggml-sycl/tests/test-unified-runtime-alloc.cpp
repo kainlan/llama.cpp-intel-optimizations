@@ -10,6 +10,7 @@
 #include "../model-lifecycle.hpp"
 #include "../unified-cache.hpp"
 #include "../zone-sizing.hpp"
+#include "pinned-host-block-test-common.hpp"
 #include "sycl-spin-kernel.hpp"
 #include "sycl-test-skip.hpp"
 
@@ -618,10 +619,12 @@ static bool direct_stage_host_fallback_counts_attempt(sycl::queue & q) {
     unified_cache * cache = get_unified_cache(q);
     TEST_ASSERT(cache != nullptr, "cache unavailable");
 
+    // The fallback publishes a source in place only when a registry names it (design 5efe §4.8, §7 C6), so the
+    // source is a pinned unified-cache block, not a raw sycl::malloc_host pointer. The block outlives the entry
+    // dropped below.
     constexpr size_t src_size = 4096;
-    void *           src      = sycl::malloc_host(src_size, q);
-    TEST_ASSERT(src != nullptr, "failed to allocate tiny host source");
-    std::memset(src, 0x5a, src_size);
+    pinned_host_block_test::block src_block(q, src_size, 0x5a);
+    void * const                  src = src_block.data();
 
     static int key_tag;
     const ggml_sycl_cache_id key      = test_make_cache_id(&key_tag, 0xfeed);
@@ -631,9 +634,8 @@ static bool direct_stage_host_fallback_counts_attempt(sycl::queue & q) {
     const direct_stage_result result = cache->direct_stage_expert(key, src, src_size, dst_size, GGML_LAYOUT_SOA,
                                                                   nullptr, nullptr, &q);
     const offload_stats_snapshot stats = offload_stats_get();
-    const size_t dropped = cache->drop_expert_entries_for_tensor_layout(
+    const size_t                 dropped = cache->drop_expert_entries_for_tensor_layout(
         std::vector<ggml_sycl_cache_id>{ key }, GGML_LAYOUT_AOS, "test-direct-stage-host-fallback-counts-attempt");
-    sycl::free(src, q);
 
     TEST_ASSERT(result.ok && result.ptr == src, "direct-stage should fall back to the host-USM source");
     TEST_ASSERT(dropped == 1, "direct-stage fallback entry should be dropped before freeing source");

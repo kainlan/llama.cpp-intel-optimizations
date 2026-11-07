@@ -9184,6 +9184,9 @@ static std::shared_ptr<mem_handle> make_direct_entry_handle(const unified_cache_
         cache_key, cache_device, entry.device_ptr, entry.layout, entry.location == cache_location::DEVICE, &entry));
 }
 
+static alloc_tier host_registration_tier(const void * ptr, int device);
+static bool host_registration_refuses_unregistered(const char * api, const void * ptr, size_t size, alloc_tier tier);
+
 direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                        const void *         src_ptr,
                                                        size_t               src_size,
@@ -9342,15 +9345,16 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             GGML_LOG_WARN("[DIRECT-STAGE] WEIGHT zone full (%zu bytes) — host arena fallback\n", dst_size);
         }
 
-        const sycl::context & ctx   = queue->get_context();
-        sycl::usm::alloc      atype = sycl::get_pointer_type(src_ptr, ctx);
+        // The tier of the registered allocation the source lies in (design 5efe §4.8, §5.3, §7 C6). A source no
+        // registry names has no owner, so it is copied into an owned pinned block or refused, never published in place.
+        const alloc_tier src_tier = host_registration_tier(src_ptr, cache_device);
 
         void *         host_ptr       = nullptr;
         bool           host_allocated = false;
         mem_handle     host_alloc_owner;
         cache_location loc            = cache_location::HOST_MMAP;
 
-        if (atype == sycl::usm::alloc::host) {
+        if (src_tier == alloc_tier::HOST_PINNED) {
             host_ptr = const_cast<void *>(src_ptr);
             loc      = cache_location::HOST_PINNED;
         } else {
@@ -9380,9 +9384,14 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                 }
             }
             if (!host_ptr) {
+                // The pinned copy was refused. Publishing the source in place is allowed only for a slice of a
+                // registered allocation (a FILE_MAPPED mapping); a source in no registry is refused, as a refusal.
+                if (host_registration_refuses_unregistered("direct_stage_expert", src_ptr, src_size, src_tier)) {
+                    return result;
+                }
                 host_ptr = const_cast<void *>(src_ptr);
                 loc      = cache_location::HOST_MMAP;
-                GGML_LOG_WARN("[DIRECT-STAGE] host arena exhausted, raw mmap fallback\n");
+                GGML_LOG_WARN("[DIRECT-STAGE] host arena exhausted, publishing the registered source in place\n");
             }
         }
 

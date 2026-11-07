@@ -21,8 +21,14 @@
 // a pinned allocation (a SYCL_Host buffer's expert), and query_location answers UNREGISTERED for such a slice because
 // the runtime registry is exact-base. The slice must still be accepted, as a HOST_PINNED entry, by both calls and with
 // the refusal counter unmoved: a refusal keyed on query_location alone would fire on a real load.
+//
+// A fourth case, direct, is the direct stage's host fallback (§4.8, §5.3). A destination no zone can hold sends
+// direct_stage_expert to its host fallback; with the pinned copy refused as well (a source length no pinned pool can
+// grant), the fallback publishes the source in place. A slice inside a pinned allocation is published in place as
+// HOST_PINNED, and a malloc'ed source is refused, counted, and leaves no entry: it has no owner to publish under.
 
 #include "file-mapped-test-common.hpp"
+#include "pinned-host-block-test-common.hpp"
 
 using namespace ggml_sycl;
 using scratch_return_test::checks;
@@ -271,6 +277,101 @@ int run_interior(checks & c) {
     return c.status();
 }
 
+int run_direct(checks & c) {
+    if (!file_mapped_test::entry_ok(c)) {
+        return c.status();
+    }
+    if (ggml_backend_sycl_init(0) == nullptr) {
+        c.void_case("ggml_backend_sycl_init(0) failed");
+        return c.status();
+    }
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (cache == nullptr) {
+        c.void_case("device 0 has no unified cache");
+        return c.status();
+    }
+    sycl::queue &    q             = cache->get_queue();
+    constexpr size_t slice_bytes   = 4096;
+    // No zone holds this destination and no pinned pool grants this source length, so both allocations are refused and
+    // the fallback decides what to publish.
+    constexpr size_t dst_bytes     = static_cast<size_t>(1) << 50;
+    constexpr size_t lying_src_len = static_cast<size_t>(1) << 40;
+
+    // The control: a slice inside a pinned allocation, which only the containment lookup resolves.
+    pinned_host_block_test::block registered(q, 8192, 0x5a);
+    uint8_t * const               slice = registered.data() + 256;
+    if (query_location(slice, 0).tier != alloc_tier::UNREGISTERED) {
+        c.void_case("query_location already resolves the slice: the containment lookup is not scored");
+        return c.status();
+    }
+    // The subject: a malloc'ed source neither registry knows.
+    host_block block;
+    if (block.ptr == nullptr) {
+        c.void_case("aligned_alloc returned null");
+        return c.status();
+    }
+    if (query_location(block.ptr, 0).tier != alloc_tier::UNREGISTERED) {
+        c.void_case("the malloc'ed block is known to a registry: it is not the UNREGISTERED subject");
+        return c.status();
+    }
+    {
+        // The subject's source length is a lie that only a refused pinned copy hides; a pool that grants it would copy
+        // that many bytes from a 4 KiB block, so the precondition is checked by asking for it first.
+        alloc_request req{};
+        req.queue                               = &q;
+        req.device                              = 0;
+        req.size                                = lying_src_len;
+        req.alignment                           = 256;
+        req.intent.role                         = alloc_role::WEIGHT;
+        req.intent.constraints.must_host_pinned = true;
+        req.intent.constraints.use_pinned_pool  = true;
+        allocation_result probe                 = unified_allocate_owner(req);
+        if (probe) {
+            c.void_case("the pinned pool granted a " + std::to_string(lying_src_len) + "-byte block");
+            return c.status();
+        }
+    }
+
+    const ggml_sycl_cache_id control_key = key_of(20);
+    const ggml_sycl_cache_id subject_key = key_of(21);
+
+    uint64_t            refusals = unified_cache_unregistered_host_registration_refusals();
+    direct_stage_result control;
+    control =
+        cache->direct_stage_expert(control_key, slice, slice_bytes, dst_bytes, GGML_LAYOUT_SOA, nullptr, nullptr, &q);
+    const size_t control_dropped = cache->drop_expert_entries_for_tensor_layout(
+        std::vector<ggml_sycl_cache_id>{ control_key }, GGML_LAYOUT_AOS, "test-sycl-unregistered-host-refusal");
+    if (!control.ok || control.ptr != slice || control_dropped != 1) {
+        c.void_case("the control, a slice inside a pinned allocation, was not published in place by the fallback (ok " +
+                    std::to_string(control.ok) + ", ptr==slice " + std::to_string(control.ptr == slice) + ", entries " +
+                    std::to_string(control_dropped) + "): a refusal of everything would read as the refusal working");
+        return c.status();
+    }
+    c.expect(unified_cache_unregistered_host_registration_refusals() == refusals,
+             "the control moved the refusal counter by " +
+                 std::to_string(unified_cache_unregistered_host_registration_refusals() - refusals) + ", expected 0");
+
+    refusals = unified_cache_unregistered_host_registration_refusals();
+    direct_stage_result subject;
+    subject = cache->direct_stage_expert(subject_key, block.ptr, lying_src_len, dst_bytes, GGML_LAYOUT_SOA, nullptr,
+                                         nullptr, &q);
+    const size_t subject_entries = cache->drop_expert_entries_for_tensor_layout(
+        std::vector<ggml_sycl_cache_id>{ subject_key }, GGML_LAYOUT_AOS, "test-sycl-unregistered-host-refusal");
+    if (subject.ok || subject_entries != 0) {
+        c.fail("direct_stage_expert published an UNREGISTERED source in place: ok=" + std::to_string(subject.ok) +
+               ", ptr==source=" + std::to_string(subject.ptr == block.ptr) +
+               ", entries=" + std::to_string(subject_entries) + "; expected a refusal: not ok, no entry");
+    }
+    const uint64_t refused = unified_cache_unregistered_host_registration_refusals() - refusals;
+    c.expect(refused == 1, "direct_stage_expert counted " + std::to_string(refused) +
+                               " unregistered-host refusal(s) for the malloc'ed source, expected 1");
+    if (c.status() == 0) {
+        fprintf(stderr,
+                "[UNREGISTERED-HOST] direct_stage_expert refused the malloc'ed source and kept the pinned slice\n");
+    }
+    return c.status();
+}
+
 int run_case(const scratch_return_test::child_args & a) {
     if (!scratch_return_test::child_begin(a)) {
         return 2;
@@ -285,6 +386,9 @@ int run_case(const scratch_return_test::child_args & a) {
     if (a.case_name == "interior") {
         return run_interior(c);
     }
+    if (a.case_name == "direct") {
+        return run_direct(c);
+    }
     fprintf(stderr, "unknown case '%s'\n", a.case_name.c_str());
     return 2;
 }
@@ -292,6 +396,6 @@ int run_case(const scratch_return_test::child_args & a) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    static const std::vector<const char *> all = { "expert", "weight", "interior" };
+    static const std::vector<const char *> all = { "expert", "weight", "interior", "direct" };
     return scratch_return_test::cases_main(argc, argv, all, run_case, std::chrono::minutes(2));
 }

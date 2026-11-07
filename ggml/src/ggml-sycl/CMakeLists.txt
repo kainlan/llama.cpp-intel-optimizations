@@ -8187,8 +8187,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # pinned-memory figure, so it does not wait for the meminfo control. The mutant takes the refusal out of both calls.
     set(_unreg_expert "FAIL \\[expert\\] register_host_expert accepted a malloc'ed UNREGISTERED pointer")
     set(_unreg_weight "FAIL \\[weight\\] register_host_weight accepted a malloc'ed UNREGISTERED pointer")
+    set(_unreg_direct "FAIL \\[direct\\] direct_stage_expert published an UNREGISTERED source in place")
     ggml_sycl_scratch_return_test(test-sycl-unregistered-host-refusal TIMEOUT 120 MUTANTS
-        unregistered-host-allowed expert,weight "${_unreg_expert}.*${_unreg_weight}")
+        unregistered-host-allowed expert,weight,direct "${_unreg_expert}.*${_unreg_weight}.*${_unreg_direct}")
     # A refusal inside the segmented MoE record (§4.4): five cases on the non-keyed record function. The immediate
     # return must fail both of its cases.
     set(_seg_no_line "no \"recoverable runtime fallback failed\" line after a FAILED return")
