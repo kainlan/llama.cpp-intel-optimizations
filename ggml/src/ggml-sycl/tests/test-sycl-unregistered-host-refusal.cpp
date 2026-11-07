@@ -26,6 +26,9 @@
 // direct_stage_expert to its host fallback; with the pinned copy refused as well (a source length no pinned pool can
 // grant), the fallback publishes the source in place. A slice inside a pinned allocation is published in place as
 // HOST_PINNED, and a malloc'ed source is refused, counted, and leaves no entry: it has no owner to publish under.
+//
+// A fifth case, overrun, is a slice that starts inside a pinned allocation and runs past its end. Both registrations
+// refuse it, with the counter and no entry; a slice ending exactly at the allocation's end is accepted.
 
 #include "file-mapped-test-common.hpp"
 #include "pinned-host-block-test-common.hpp"
@@ -412,6 +415,92 @@ int run_direct(checks & c) {
     return c.status();
 }
 
+// A slice that starts inside a pinned allocation and runs past its end names memory its owner does not hold, so both
+// registrations refuse it, with the counter and no entry. The control is the same block's last bytes, a slice that ends
+// exactly at the allocation's end, which is accepted: the bound is on the end, not on the start.
+int run_overrun(checks & c) {
+    if (!file_mapped_test::entry_ok(c)) {
+        return c.status();
+    }
+    if (ggml_backend_sycl_init(0) == nullptr) {
+        c.void_case("ggml_backend_sycl_init(0) failed");
+        return c.status();
+    }
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (cache == nullptr) {
+        c.void_case("device 0 has no unified cache");
+        return c.status();
+    }
+    sycl::queue &                 q           = cache->get_queue();
+    constexpr size_t              block_bytes = 8192;
+    constexpr size_t              tail_bytes  = 4096;
+    pinned_host_block_test::block pinned(q, block_bytes, 0x5a);
+    uint8_t * const               tail = pinned.data() + block_bytes - tail_bytes;
+    if (query_location(tail, 0).tier != alloc_tier::UNREGISTERED) {
+        c.void_case("query_location already resolves the slice: the containment lookup is not scored");
+        return c.status();
+    }
+
+    // The control: the block's last tail_bytes, ending exactly at the end of the allocation.
+    const ggml_sycl_cache_id control_key = key_of(30);
+    mem_handle               control_lease;
+    bool                     control_registered = false;
+    {
+        scoped_planned_materialization planned(cache, "test-sycl-unregistered-host-refusal/overrun-control");
+        control_registered =
+            cache->register_host_expert(control_key, tail, tail_bytes, GGML_LAYOUT_AOS, &control_lease);
+    }
+    control_lease = {};
+    const expert_retire_status control_retired =
+        cache->retire_expert_entry_exact(control_key, GGML_LAYOUT_AOS, "test-sycl-unregistered-host-refusal");
+    cache->process_deferred_frees_public();
+    if (!control_registered || control_retired != expert_retire_status::WITHDRAWN) {
+        c.void_case(std::string("the control, a slice ending exactly at the allocation's end, was not accepted and "
+                                "retired (returned ") +
+                    std::to_string(control_registered) + ", retire " + retire_status_name(control_retired) +
+                    "): a refusal of everything would read as the refusal working");
+        return c.status();
+    }
+
+    const uint64_t refusals = unified_cache_unregistered_host_registration_refusals();
+    for (int kind = 0; kind < 2; ++kind) {
+        const bool         expert = kind == 0;
+        const char * const api    = expert ? "register_host_expert" : "register_host_weight";
+        ggml_sycl_cache_id key    = key_of(31 + kind);
+        mem_handle         lease;
+        bool               registered = false;
+        {
+            scoped_planned_materialization planned(cache, "test-sycl-unregistered-host-refusal/overrun");
+            // Twice the tail from the same start: it runs tail_bytes past the end of the allocation.
+            registered = expert ? cache->register_host_expert(key, tail, 2 * tail_bytes, GGML_LAYOUT_AOS, &lease) :
+                                  cache->register_host_weight(key, tail, 2 * tail_bytes, GGML_LAYOUT_AOS, &lease);
+        }
+        const weight_entry * entry = entry_of(cache, expert, key);
+        if (registered || lease.valid() || entry != nullptr) {
+            c.fail(std::string(api) + " accepted a slice that runs " + std::to_string(tail_bytes) +
+                   " bytes past the end of its pinned allocation: returned " + std::to_string(registered) +
+                   ", lease valid=" + std::to_string(lease.valid()) + ", entry " +
+                   (entry != nullptr ? "present" : "absent") + "; expected a refusal: returned 0, no lease, no entry");
+            if (entry != nullptr) {
+                // The entry would name memory past the block; take it out before the block drops.
+                lease = {};
+                if (expert) {
+                    (void) cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS,
+                                                            "test-sycl-unregistered-host-refusal");
+                    cache->process_deferred_frees_public();
+                }
+            }
+        }
+    }
+    const uint64_t refused = unified_cache_unregistered_host_registration_refusals() - refusals;
+    c.expect(refused == 2, "the overrunning slices were counted " + std::to_string(refused) +
+                               " time(s) by the two registrations, expected 2");
+    if (c.status() == 0) {
+        fprintf(stderr, "[UNREGISTERED-HOST] both calls refused a slice that runs past the end of its allocation\n");
+    }
+    return c.status();
+}
+
 int run_case(const scratch_return_test::child_args & a) {
     if (!scratch_return_test::child_begin(a)) {
         return 2;
@@ -429,6 +518,9 @@ int run_case(const scratch_return_test::child_args & a) {
     if (a.case_name == "direct") {
         return run_direct(c);
     }
+    if (a.case_name == "overrun") {
+        return run_overrun(c);
+    }
     fprintf(stderr, "unknown case '%s'\n", a.case_name.c_str());
     return 2;
 }
@@ -436,6 +528,6 @@ int run_case(const scratch_return_test::child_args & a) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    static const std::vector<const char *> all = { "expert", "weight", "interior", "direct" };
+    static const std::vector<const char *> all = { "expert", "weight", "interior", "direct", "overrun" };
     return scratch_return_test::cases_main(argc, argv, all, run_case, std::chrono::minutes(2));
 }
