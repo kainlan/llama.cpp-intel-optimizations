@@ -11572,21 +11572,19 @@ uint64_t unified_cache_unregistered_host_registration_refusals() noexcept {
 // registry's containment index knows, comes back UNREGISTERED from it. A host registration takes such slices (a
 // SYCL_Host buffer's experts), so the index is asked before a pointer is called unregistered.
 //
-// Lock (design §12.5): g_runtime_alloc_mutex, L5. The registrations call this before they take direct_stage_mutex_ and
-// rw_mutex_ (L4), and hold no listed lock themselves, so the mutex is taken alone, as query_location's own lookup takes
-// it just before. Nothing is acquired and nothing is logged under it; the row's tier is copied out and the lock drops.
+// The containment step is unified_lookup_runtime_allocation, which keeps the index and registry assertions.
+//
+// Lock (design §12.5): g_runtime_alloc_mutex, L5, taken inside unified_lookup_runtime_allocation. The registrations call
+// this before they take direct_stage_mutex_ and rw_mutex_ (L4), and hold no listed lock themselves, so the mutex is
+// taken alone, as query_location's own lookup takes it just before. Nothing is acquired and nothing is logged under it;
+// the row is copied out and the lock drops.
 static alloc_tier host_registration_tier(const void * ptr, int device) {
     const alloc_tier exact = query_location(ptr, device).tier;
     if (exact != alloc_tier::UNREGISTERED || ptr == nullptr) {
         return exact;
     }
-    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    address_range_index::entry  hit;
-    if (!g_runtime_alloc_index.find_innermost(reinterpret_cast<uintptr_t>(ptr), &hit)) {
-        return alloc_tier::UNREGISTERED;
-    }
-    const auto row = g_runtime_alloc_registry.find(hit.key);
-    return row != g_runtime_alloc_registry.end() ? row->second.handle.tier : alloc_tier::UNREGISTERED;
+    alloc_metadata row;
+    return unified_lookup_runtime_allocation(ptr, &row) ? row.tier : alloc_tier::UNREGISTERED;
 }
 
 // A host weight or expert is registered over memory some owner holds: a slice of a FILE_MAPPED reservation or of a
