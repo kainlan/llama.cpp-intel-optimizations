@@ -3353,6 +3353,29 @@ HOST). Main-pool chunk rounding (0-2 GiB) is excluded, as everywhere here.
   the DeepSeek size). After sgc5 it adds the non-weight terms again, 5.5-15.4
   GiB, and moves the threshold up by as much (*lead ruling §T6*, m-8).
 
+**Measured on the dry-run, 2026-11-06** (Qwen3.8-Flash-Next Q8_0, the first of
+six splits on `/mnt/models-nvme`; tree `integ/th32` at `2cd9d311e`, Tasks 1-15,
+with Task 11's `llama-sycl-plan-dry-run`; `budget_pct` 90 of `MemTotal`
+246.9 GiB; printed figures from `c-h9n4`). The rows are the planner's printed
+figures in MB, as printed. The derived model above is unchanged.
+
+| run | `host_budget` | device | FILE_MAPPED | `expected_host` | lazy tables | verdict |
+|---|---:|---:|---:|---:|---|---|
+| B70 only (`level_zero:0`), live `MemAvailable` 213.0 GiB | 209951.6 | 28737.7 | 99116.3 | 6144.0 | `tables=0`, `ring=0` | fits |
+| B70 only, `--mem-available` 171.4 GiB | 167321.6 | 28737.7 | 99116.3 | 6144.0 | `tables=0`, `ring=0` | fits |
+| B70 only, `--mem-available` 181.8 GiB | 177971.2 | 28737.7 | 99116.3 | 6144.0 | `tables=0`, `ring=0` | fits |
+| B70 only, `--mem-available` 183.7 GiB | 179916.8 | 28737.7 | 99116.3 | 6144.0 | `tables=0`, `ring=0` | fits |
+| B70 only, `--mem-available` 190.4 GiB | 186777.6 | 28737.7 | 99116.3 | 6144.0 | `tables=0`, `ring=0` | fits |
+| B70 only, `-lzm off`, `--mem-available` 171.4 GiB | 167321.6 | not in the posted figures | 150996.4 | 159744.0 | eager, `eligible=0` | fits |
+| both cards (`level_zero:0,1`), live `MemAvailable` 213.4 GiB | 210346.9 | 40875.4, both cards | 84150.0 | 6144.0 | `tables=0` | `PLACEMENT-BLOCK`, `no-compatible-gpu-capacity` |
+
+The both-cards run also charges 2843.3 MB to host and prints `CPU_OWNED` 2667.9
+MB and `kv_host_bytes` 10.1 MB. With the table deferred to STORAGE, the dry-run
+prints `LAZY tables=0` and `ring_need=0` at every reading, although the 51880
+MiB table is recorded `deferral=STORAGE taker=1` and appears in no residency
+row, so the `expected_host` and ring figures above carry no charge for it on
+this tree (`llama.cpp-8v67`).
+
 **DeepSeek Q2_K, the planner's fit** (`MemAvailable - 8`; the verdicts are
 after (s)):
 
