@@ -1813,6 +1813,29 @@ this one, and a final destructor under a listed lock, both forbidden in this
 section. It stays a failing census item until the old context is moved out and
 destroyed after the unlocks and the MMID registry's locks are ranked.
 
+The lazy tables' **witnessed locks** (design `sycl-storage-tier-lazy-tables.md`
+§3.3, §11 T5) are five: the lazy IO pool registry's `g_lazy_registry_mutex`, the
+L1 `g_tensor_inventory_mutex`, `g_lifecycle_plan_mutex`, the lazy IO engine's
+`lazy_io_engine::mutex`, and each STORAGE table's strand lock. Each is declared
+`witnessed_mutex` (`witnessed-mutex.hpp`), and three entry points run with none
+of them held: the ring reap (`ggml_sycl_lazy_ring_reap`), the host ledger's
+yield round, and `host_ledger_sample()`. A ring lease's drop runs with none held
+as well, since a drop takes the registry's mutex. The witness changes no rank:
+each lock keeps its row above. A release build's `witnessed_mutex` is
+`std::mutex` itself, with a `static_assert` on its size, and records nothing. A
+`GGML_SYCL_PRIVATE_TESTING` build's records each instance the calling thread
+holds, with its name, in an eight-entry `thread_local` table, through every
+guard, `unique_lock` relock and `condition_variable_any` wait, and aborts naming
+a ninth. There the reap refuses under a held one, logging `[HOST-PLAN-BUG] ring
+reap refused: <name> held` and freeing nothing, so its parked pools wait for the
+next reap; a lease's drop under one logs `[HOST-PLAN-BUG] ring lease dropped
+with <name> held` and completes, and aborts under the registry's own mutex; and
+`GGML_SYCL_WITNESS` aborts the yield round and the sample. Four of the five are
+witnessed today. The strand lock arrives with the strands themselves (th32 T5c),
+and until then the reap-holding test seam reports its index as not wired.
+`test-sycl-lazy-lock-witness` holds each witnessed lock in turn and gates the
+reap's refusal and both aborts, with a no-lock run as the negative control.
+
 PP MoE oneDNN scratch admission (`moe-scratch-admission.hpp`, `ijla`) adds **no
 lock at all**, and that is a load-bearing property rather than an omission. The
 policy is a pure function of two shapes: it takes no mutex, allocates nothing,
