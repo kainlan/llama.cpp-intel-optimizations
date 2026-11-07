@@ -12,6 +12,7 @@
 #include "dpct/helper.hpp"
 #include "file-mapping.hpp"
 #include "ggml-sycl.h"
+#include "host-budget.hpp"
 #include "host-cpu-mapping.hpp"
 #include "host-reserve-env.hpp"
 #include "host-zone-kinds.hpp"
@@ -785,13 +786,19 @@ struct placement_kv_info {
     // Whether the budget this plan is made against is GGML_SYCL_HOST_RESERVE_MB's override, from the same sample as
     // the budget (host_ledger_budget_overridden() for a load): the source the [HOST-PLAN] lazy line prints (§10).
     bool                                   host_budget_overridden = false;
+    // Whether the budget this plan is made against is the refusal host-headroom-exhausted, with the MemTotal and the
+    // headroom it compared, from the same sample as the budget (the stored values for a load, a dry run's own): the
+    // reason the plan's would-refuse line names (design 5efe §4.5).
+    bool                                   host_headroom_exhausted = false;
+    size_t                                 host_mem_total          = 0;
+    size_t                                 host_headroom           = 0;
     // A cold expert class is selected (§4.3 step 4): the cold set is not implemented, so a plan that carries lazy
     // tables refuses it rather than plan a set it cannot hold.
     bool                                   cold_expert_class      = false;
     // The load transaction this plan is made for (g_sycl_plan_load_effect_txn at the stage), which the STORAGE decline
     // line names and which keys it, one line per table and load (§3.3, §10); 0 for a plan made outside a load, a dry
     // run's or a direct fixture's, which prints every decline.
-    uint64_t                               lazy_load_txn          = 0;
+    uint64_t                               lazy_load_txn           = 0;
 
     bool valid() const { return n_layer > 0 && n_embd_k_gqa > 0 && n_embd_v_gqa > 0 && n_ctx > 0; }
 
@@ -8025,14 +8032,21 @@ struct host_budget_sample {
 // exist. It runs before any lock is taken, and the lock witness aborts it when one is held other than the replan token.
 host_budget_sample host_ledger_sample();
 
-// The budget for `sample` with `committed` bytes already charged. Pure and saturating: no subtraction wraps, so a
-// pinned share above the percentage cap, or an available reading at or below the OS reserve, gives a budget at or
-// below `committed`, which refuses the next charge by name. An accepted GGML_SYCL_HOST_RESERVE_MB is the whole budget.
-size_t host_ledger_compute_budget(const host_budget_sample & sample, size_t committed);
+// The budget for `sample` with `committed` bytes already charged: host_budget_compute (host-budget.hpp, design 5efe
+// §4.5). Saturating: a pinned share above the percentage cap, or an available reading at or below
+// host_headroom(total), the refusal host-headroom-exhausted, gives a budget at or below `committed`, which refuses
+// the next charge by name. An accepted GGML_SYCL_HOST_RESERVE_MB caps the budget and never raises it. `result`, when
+// given, receives the whole result: its override_binds is whether the override is the budget, its status and headroom
+// whether the budget is the headroom refusal.
+size_t host_ledger_compute_budget(const host_budget_sample & sample,
+                                  size_t                     committed,
+                                  host_budget_result *       result = nullptr);
 
-// Computes against the live committed bytes and stores the result, and stores the sample's MemAvailable and whether
-// GGML_SYCL_HOST_RESERVE_MB's override set the budget beside it. The one writer of the stored budget besides the test
-// setter, which leaves the MemAvailable and the override flag as they were; it counts its stores, the setter does not.
+// Computes against the live committed bytes and stores the result, and beside it the sample's MemAvailable, MemTotal
+// and the headroom the budget left, whether that budget is the refusal host-headroom-exhausted (design 5efe §4.5), and
+// whether GGML_SYCL_HOST_RESERVE_MB's override set it. The one writer of the stored budget besides the test setter,
+// which clears the refusal flag and leaves the sample's figures and the override flag as they were; it counts its
+// stores, the setter does not.
 size_t host_ledger_store_budget(const host_budget_sample & sample);
 
 size_t host_ledger_budget();           // one atomic load of the stored budget
@@ -8042,6 +8056,12 @@ size_t host_ledger_yieldable_bytes();  // one atomic load of the yieldable bytes
 
 // One atomic load: whether the stored budget is GGML_SYCL_HOST_RESERVE_MB's override (false: computed, or none stored).
 bool host_ledger_budget_overridden();
+
+// One atomic load each, of the stored budget's sample (design 5efe §4.5): whether that budget is the refusal
+// host-headroom-exhausted, its MemTotal, and the headroom it compared (false and 0: none stored).
+bool   host_ledger_headroom_exhausted();
+size_t host_ledger_mem_total();
+size_t host_ledger_headroom();
 
 // A cache's yieldable chunk appears (add) or goes (sub). One call is one chunk: a yield makes at most one round per
 // chunk counted at its first shortfall.
