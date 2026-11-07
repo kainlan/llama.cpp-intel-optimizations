@@ -616,9 +616,10 @@ arm_result arm_h() {
 // available 0 give committed, which refuses by name.
 // Engagement: a positive control sample gives the formula's exact value, and each stored budget counts one store.
 // Each refusing case is scored at its exact value, not at or below committed: a pinned share above the cap gives 0, and
-// an available reading at or below the reserve gives committed, so the next charge refuses with nothing granted.
-// Mutants: unsigned subtraction (either term) admits; the override replacing os_reserve only gives a sample-shaped
-// budget instead of X; a failed sample treated as no budget at all (0, not committed) on a host whose total is known.
+// an available reading at or below host_headroom(total) gives committed, so the next charge refuses with nothing
+// granted. Mutants: unsigned subtraction (either term) admits; the override replacing the computed budget instead of
+// capping it gives 100 GiB where the computed 25 GiB stays; a failed sample treated as no budget at all (0, not
+// committed) on a host whose total is known.
 arm_result arm_i() {
     arm_result r;
     ledger_settle();
@@ -661,7 +662,7 @@ arm_result arm_i() {
 
     host_budget_sample pinned_over = control;
     pinned_over.pinned_bytes       = 80 * GiB;  // above pct_cap
-    // min(64 - 80 saturating to 0, committed + 32 GiB)
+    // min(64 - 80 saturating to 0, committed + 24 GiB)
     stored_refuses(pinned_over, 0, "a pinned share above total x pct");
 
     host_budget_sample avail_low = control;
