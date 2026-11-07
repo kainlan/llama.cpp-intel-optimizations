@@ -5865,7 +5865,8 @@ is the one per-model hook. Model code is untouched apart from
 > is the plan record.
 
 Every target below is derived from the numbers measured in §2.4, §5 and §6.2 on
-this host, bcachefs as-is, under ambient load. The implementer measures against
+this host under ambient load. The §8.2 and §8.3 targets use the NVMe figures of
+2026-11-06 (`c-y57k`), and their bcachefs targets are kept as history. The implementer measures against
 them with the counters in §10; the lead runs every GPU part, one run at a time,
 selector pinned, `Shmem`/`MemAvailable` sampled before and ~5 s after. Qwen's
 targets are §8.2-8.3; DeepSeek's, the harder case, are §8.4.
