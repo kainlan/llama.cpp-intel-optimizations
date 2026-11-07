@@ -1230,6 +1230,10 @@ host_budget_sample host_ledger_sample() {
     // token is the one lock allowed: a staged load holds it, and it ranks above every lock the share takes.
     GGML_SYCL_WITNESS(kv_lock_witness::held_count_besides(KV_LOCK_L0_REPLAN) == 0,
                       "[HOST-LEDGER] host_ledger_sample ran with a witnessed lock held (th32 4.2)");
+    // Nor any of the lazy tables' witnessed locks (th32 §3.3): the inventory and plan locks, the IO pool registry's
+    // leaf mutex and the IO engine's queue lock.
+    GGML_SYCL_WITNESS(witnessed_mutex_held_any() == nullptr,
+                      "[HOST-LEDGER] host_ledger_sample ran holding a lazy table's witnessed lock (th32 3.3)");
     host_budget_sample sample{};
     sample.reserve         = detail::parse_host_reserve_mb(std::getenv("GGML_SYCL_HOST_RESERVE_MB"));
     sample.total_bytes     = ggml_sycl_get_total_system_memory_bytes();
@@ -1313,6 +1317,9 @@ size_t host_ledger_store_budget(const host_budget_sample & sample) {
 
 // One yield round over the registered yielders, with this thread marked as yielding. Returns the bytes freed.
 static size_t host_ledger_yield_round(size_t deficit, uint64_t load_txn_id) {
+    // A yield round, like the sample, runs with none of the lazy tables' witnessed locks held (th32 §3.3).
+    GGML_SYCL_WITNESS(witnessed_mutex_held_any() == nullptr,
+                      "[HOST-LEDGER] a yield round ran holding a lazy table's witnessed lock (th32 3.3)");
     struct in_yield_scope {
         bool previous;
 
