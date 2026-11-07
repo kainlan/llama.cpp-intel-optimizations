@@ -5857,11 +5857,13 @@ is the one per-model hook. Model code is untouched apart from
 
 ## 8. Pre-registered speed targets (item 6)
 
-> **Dated note, 2026-11-01.** The targets below were derived from figures
-> measured on bcachefs over USB. `/models` has since moved to XFS per drive
-> under mergerfs, with the Qwen3.8 Q8_0 files on the NVMe. The targets are
-> history for the old layout. Task 27 of
-> `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md` re-pins them.
+> **Dated note, 2026-11-06.** The targets in §8.2 and §8.3 were re-pinned on
+> 2026-11-06 for the NVMe layout. `/models` moved to XFS per drive under
+> mergerfs, and the Qwen3.8 Q8_0 files sit on the Kingston NVMe. The NVMe
+> figures are from `c-y57k` on `llama.cpp-th32`, and the dry-run inputs of §4.5
+> are from `c-h9n4`. The bcachefs targets stay beside them as the history of
+> the old layout. Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md`
+> is the plan record.
 
 Every target below is derived from the numbers measured in §2.4, §5 and §6.2 on
 this host, bcachefs as-is, under ambient load. The implementer measures against
