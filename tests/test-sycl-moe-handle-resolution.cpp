@@ -207,6 +207,19 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
     ggml_sycl_cache_id host_key = ggml_sycl::test_make_cache_id(pinned);
     host_key.aux_id             = 0x70005;
 
+    // The global cache outlives this function, so the entry registered over the block is retired before the block is
+    // freed. It is declared after the block and before every handle below, so those release first and the retire finds
+    // no lease.
+    struct host_entry_retire {
+        ggml_sycl::unified_cache * cache;
+        ggml_sycl_cache_id         key;
+
+        ~host_entry_retire() {
+            (void) cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test/MoE host expert");
+            cache->process_deferred_frees_public();
+        }
+    } retire_host_entry{ cache, host_key };
+
     ggml_sycl::mem_handle host_handle;
     {
         ggml_sycl::scoped_planned_materialization planned_materialization(cache, "test/MoE host expert registration");

@@ -11,6 +11,10 @@
 //
 // require_host_usm_base makes the allocation a standalone host USM base on the queue given, so the block needs neither
 // the global cache nor configured host zones: the local unified_cache objects these tests build can register over it.
+//
+// A cache entry registered over a block points at the block's memory, so the block must outlive the cache that holds
+// the entry: declare it BEFORE the cache (locals are destroyed in reverse order). Against the process-wide cache, which
+// outlives any function, retire the entry before the block is freed.
 
 #pragma once
 

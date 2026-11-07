@@ -568,9 +568,9 @@ static bool test_expert_publication_retirement_linearization(sycl::queue & q) {
         s.cv.wait(lock, [&] { return s.release; });
     };
 
-    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
     pinned_host_block_test::block   first(q, 4096, 0x31);
     pinned_host_block_test::block   second(q, 4096, 0x72);
+    ggml_sycl::unified_cache        cache(q, 16 * 1024 * 1024);
     const auto key = make_test_cache_id(706, 7, first.size());
     std::atomic<bool> publish_ok{ false };
     std::atomic<bool> retire_done{ false };
@@ -624,8 +624,8 @@ static bool test_expert_publication_retirement_linearization(sycl::queue & q) {
 static bool test_host_publication_fault_is_transactional(sycl::queue & q) {
     TEST_BEGIN("host_publication_fault_is_transactional");
 
-    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
     pinned_host_block_test::block bytes(q, 4096, 0x44);
+    ggml_sycl::unified_cache      cache(q, 16 * 1024 * 1024);
     const auto key = make_test_cache_id(707, 8, bytes.size());
 
     ggml_sycl::unified_cache_fail_next_expert_phase_for_test(
@@ -655,6 +655,9 @@ static bool test_device_publication_fault_phases(sycl::queue & q) {
     TEST_BEGIN("device_publication_fault_phases");
 
     constexpr size_t bytes = 4096;
+    // Registered memory for the recovery registration below: a pointer no registry names is refused (design 5efe
+    // §4.8, §7 C6). It is declared before the cache so it outlives the entry registered over it.
+    pinned_host_block_test::block host_src(q, bytes, 0x61);
     // Configure the fixture geometry before cache construction instead of
     // assuming the production 1280 MiB tail (which made a 512 MiB assertion
     // impossible on constrained B50/B70 test runs). oneDNN retains its 256 MiB
@@ -704,9 +707,8 @@ static bool test_device_publication_fault_phases(sycl::queue & q) {
     // an external sycl::malloc_host pointer is classified as HOST_PINNED and
     // the compatibility chunk bridge cannot infer that allocation's extent.
     std::vector<uint8_t> src(bytes * 2, 0x61);
-    // The recovery registration below takes registered memory: a pointer no registry names is refused (design 5efe
-    // §4.8, §7 C6), and src's std::vector bytes are what direct_stage_expert is meant to bridge, not to register.
-    pinned_host_block_test::block host_src(q, bytes, 0x61);
+    // src's std::vector bytes are what direct_stage_expert is meant to bridge, not to register; host_src, above, is
+    // the registered block the recovery registration takes.
 
     const ggml_sycl::expert_fault_phase single_phases[] = {
         ggml_sycl::expert_fault_phase::SINGLE_AFTER_ALLOC,
@@ -822,8 +824,8 @@ static bool test_owner_failure_prevents_raw_stage_use(sycl::queue & q) {
 static bool test_abort_cleanup_status_is_observable(sycl::queue & q) {
     TEST_BEGIN("abort_cleanup_status_is_observable");
 
-    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
     pinned_host_block_test::block bytes(q, 4096, 0x52);
+    ggml_sycl::unified_cache      cache(q, 16 * 1024 * 1024);
     const auto key = make_test_cache_id(735, 45, bytes.size());
     constexpr uint64_t load_txn = 0xB70;
     TEST_ASSERT(cache.register_host_expert(key, bytes.data(), bytes.size(), GGML_LAYOUT_AOS),
