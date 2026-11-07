@@ -5975,25 +5975,37 @@ from a completed plan, not a refusal, and the S arm still runs and must pass.
 
 ### 8.2 Qwen decode
 
-| arm | target | derived from |
-|---|---|---|
-| H | `T_gather` <= **20 us/token** (the worker's gather time); tg128 within **1%** of `--lazy-mode off` (scored on that arm's second run, its table pages resident) | measured 4.2 us for 16 rows including dequant |
-| S-cold | `T_ticket` mean <= **4.3 ms/token**, p99 <= **15 ms** | batch of 16: mean 3.75 ms, p99 13.0 ms (A.2), + 15% |
-| S-warm | mean `T_ticket` <= **(1 - P0) x 4.3 ms**, where P0 is the steady-state zero-miss share at the *planned* `cache_slots` (§8.5): prose 32-43%, mixed 63-68%. This is a ceiling, not a discriminator (M13); the runtime-versus-simulation match of §8.5 is the discriminator | §6.2.1 |
-| S-hot | `T_ticket == 0` on **>= 99%** of tokens | every row hits |
+Targets are re-derived on 2026-11-06 from the NVMe batch-16 latency (`c-y57k`).
+The bcachefs column keeps the 2026-09-26 targets. Each formula is unchanged.
+
+| arm | target, NVMe, 2026-11-06 (`c-y57k`) | target, bcachefs over USB, 2026-09-26 | derived from |
+|---|---|---|---|
+| H | `T_gather` <= **20 us/token** (the worker's gather time); tg128 within **1%** of `--lazy-mode off` (scored on that arm's second run, its table pages resident). Unchanged: not storage-derived | the same | measured 4.2 us for 16 rows including dequant |
+| S-cold | `T_ticket` mean <= **0.46 ms/token** (0.40 x 1.15), p99 <= **0.72 ms** (0.63 x 1.15) | `T_ticket` mean <= **4.3 ms/token** (3.75 x 1.15), p99 <= **15 ms** (13.0 x 1.15) | batch of 16 with 16 workers, `T_ticket`: mean 0.40 ms and p99 0.63 ms (NVMe); mean 3.75 ms and p99 13.0 ms (A.2), each + 15% |
+| S-warm | mean `T_ticket` <= **(1 - P0) x 0.46 ms**, where P0 is the steady-state zero-miss share at the *planned* `cache_slots` (§8.5): prose 32-43% gives **0.26-0.31 ms**; mixed 63-68% gives **0.15-0.17 ms**. This is a ceiling, not a discriminator (M13); the runtime-versus-simulation match of §8.5 is the discriminator | mean `T_ticket` <= **(1 - P0) x 4.3 ms**, where P0 is the steady-state zero-miss share at the *planned* `cache_slots` (§8.5): prose 32-43%, mixed 63-68%. This is a ceiling, not a discriminator (M13); the runtime-versus-simulation match of §8.5 is the discriminator | §6.2.1; P0 unchanged, the S-cold mean re-derived |
+| S-hot | `T_ticket == 0` on **>= 99%** of tokens. Unchanged | the same | every row hits |
+
+The §8.1 scaling rule does not apply on the NVMe. Its bracketing controls,
+69706 IOPS at QD64 and 63757 at QD16, are above 4657, so no latency bound is
+multiplied.
 
 Expressed as throughput: `tg_S >= 1 / (1/tg_H + T_stall)`. If H decodes at
-20 tok/s (50 ms per token), S-cold must decode at **>= 18.4 tok/s**.
+20 tok/s (50 ms per token), S-cold must decode at **>= 19.8 tok/s** on the
+NVMe (1000 / (50 + 0.46)), against **>= 18.4 tok/s** on bcachefs (1000 / (50 + 4.3)).
 
 ### 8.3 Qwen PP512
 
-| arm | target | derived from |
-|---|---|---|
-| H | `T_gather` <= **3 ms/ubatch**; pp512 within **1%** of `--lazy-mode off` | measured ~2 ms for 8192 rows |
-| S-cold | engine ratio >= **0.9** (§8.1); `T_ticket` <= **1.15 x U / (0.9 x control IOPS)**: at the r1 control (9124), real text (U 7028-7104) <= **1.0 s**, `llama-bench` random (U 8116-8192) <= **1.15 s** | §5.1, §6.2.1 |
-| S-warm | the same formula with `U` from the simulation at the planned `cache_slots`: prose (512 MiB) 4335 -> **<= 0.6 s**; mixed (512 MiB) 2275 -> **<= 0.32 s** | §6.2.1 |
-| S-hot | `T_ticket == 0` | |
-| phase 2 lookahead, multi-ubatch prompt | stall of ubatch `k >= 2` <= `max(0, IO(k) - compute(k-1)) + 10%` | §5.4 |
+The control IOPS is the same-session QD64 control of §8.1: 69706 on the NVMe
+(`c-y57k`), against 9124 on bcachefs. The QD16 control, 63757, is not an input
+to any target here. The engine ratio, 68887 rows/s over 69706 IOPS, is 0.99.
+
+| arm | target, NVMe, 2026-11-06 (`c-y57k`) | target, bcachefs over USB, 2026-09-26 | derived from |
+|---|---|---|---|
+| H | `T_gather` <= **3 ms/ubatch**; pp512 within **1%** of `--lazy-mode off`. Unchanged: not storage-derived | the same | measured ~2 ms for 8192 rows |
+| S-cold | engine ratio >= **0.9** (§8.1; 68887 / 69706 = 0.99). `T_ticket` <= **1.15 x U / (0.9 x 69706)**: real text (U 7028-7104) <= **0.13 s** (1.15 x 7104 / 62735 = 0.130), `llama-bench` random (U 8116-8192) <= **0.15 s** (1.15 x 8192 / 62735 = 0.150) | engine ratio >= **0.9** (§8.1). `T_ticket` <= **1.15 x U / (0.9 x 9124)**: real text (U 7028-7104) <= **1.0 s**, `llama-bench` random (U 8116-8192) <= **1.15 s** | §5.1, §6.2.1 |
+| S-warm | the same formula with `U` from the simulation at the planned `cache_slots`: prose (512 MiB) 4335 -> **<= 0.079 s** (1.15 x 4335 / 62735); mixed (512 MiB) 2275 -> **<= 0.042 s** (1.15 x 2275 / 62735) | the same formula, `U` from the same simulation: prose 4335 -> **<= 0.6 s**; mixed 2275 -> **<= 0.32 s** | §6.2.1 |
+| S-hot | `T_ticket == 0`. Unchanged | the same | |
+| phase 2 lookahead, multi-ubatch prompt | stall of ubatch `k >= 2` <= `max(0, IO(k) - compute(k-1)) + 10%`. Unchanged | the same | §5.4 |
 
 Expressed as throughput: `pp_S >= 512 / (512/pp_H + T_stall)`.
 
