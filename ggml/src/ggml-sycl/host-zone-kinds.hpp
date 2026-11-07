@@ -67,16 +67,20 @@ enum class host_zone_id : uint8_t {
 //            that device is freed (§M62 (D)).
 //   UNOWNED  the interim marker of the file-scope holders §4.4's site table leaves to their refactor. select_zone
 //            sends it to WEIGHT, where those holders land today, and no boundary check counts it.
+//   POOL     owned by a lease-counted pool, owner kind IO_POOL (the lazy IO pool's block ring, lazy-io-pool.hpp), and
+//            released only by that pool's reap. Its check reports a row only once the owning generation is gone.
 enum class alloc_lifetime : uint8_t {
     GRAPH   = 0,
     CONTEXT = 1,
     MODEL   = 2,
     DEVICE  = 3,
     UNOWNED = 4,
+    POOL    = 5,
 };
 
 // Which owner a non-GRAPH record names. The kind keeps the id spaces apart: a buffer serial, a backend-context serial,
-// a ModelId, a device index and an execution-context id can hold the same number.
+// a ModelId, a device index, an execution-context id and the lazy IO pool's registry generation can hold the same
+// number.
 enum class alloc_owner_kind : uint8_t {
     NONE              = 0,
     BUFFER            = 1,
@@ -84,6 +88,7 @@ enum class alloc_owner_kind : uint8_t {
     MODEL             = 3,
     DEVICE            = 4,
     EXECUTION_CONTEXT = 5,
+    IO_POOL           = 6,
 };
 
 struct alloc_owner_ref {

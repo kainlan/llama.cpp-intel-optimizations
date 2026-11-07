@@ -66,12 +66,20 @@ struct lazy_table_desc {
     size_t cache_slots       = 0;
     // STORAGE: the plan's floor slots, never yielded (§6.4); at least 1, and at most cache_slots. HOST: 0.
     size_t cache_floor_slots = 0;
+
+    // STORAGE: the plan's block ring (§3.3), the pool's and not the table's: block_ring_need, LAZY_BLOCK_RING_QD read
+    // spans of the widest STORAGE row, which the materialization passes to block_ring_ensure, and block_ring_charge,
+    // the ring the plan charged (§4.2): the need's mapped size for the model whose ensure creates the ring, 0 for a
+    // model a live ring covers. HOST: 0.
+    size_t block_ring_need   = 0;
+    size_t block_ring_charge = 0;
 };
 
 // Why a materialization refused (th32 §3.2, §10). Every refusal logs one WARN naming the table, its status name and
 // the figures that decided it: "[LAZY-TABLE] <table> refused: ...", or "[HOST-PLAN-BUG] lazy table <table> activation
 // check: ..." for an activation mismatch, and "[HOST-PLAN-BUG] lazy table <table> row cache: ..." for a row-cache
-// shortfall, which are plan bugs.
+// shortfall, which are plan bugs. The RING_ statuses are block_ring_ensure's refusals, one each, with its names; the
+// ensure's own line carries the figures.
 enum class lazy_table_status : uint8_t {
     OK = 0,
     INVALID_DESC,         // the descriptor's geometry, source or residency is not a table's
@@ -81,6 +89,12 @@ enum class lazy_table_status : uint8_t {
     READ_FAILED,          // the eager read failed or came up short
     ACTIVATION_MISMATCH,  // the records' charged bytes are not the plan's host_resident_bytes
     ROW_CACHE_SHORTFALL,  // the row cache's planned allocations were not all made: a step-4 shortfall (§6.4)
+    RING_UNPINNED,        // no live IO pool, so no lease pins a block ring
+    RING_TOO_NARROW,      // the plan's need or the table's span does not fit the ring (§3.3, §10)
+    RING_CONCURRENT,      // another caller holds the ring's ensuring state
+    RING_SHUT_DOWN,       // the IO pool is shut down
+    RING_MISMATCH,        // the ring's bytes or charge differ from the plan's (§10's ring check)
+    RING_REFUSED,         // the ring's planned allocation was refused
 };
 
 const char * lazy_table_status_name(lazy_table_status status);

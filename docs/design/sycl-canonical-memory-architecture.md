@@ -1524,7 +1524,7 @@ The target lock inventory and mandatory order is concrete:
 | L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
 | L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
 | L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `unified_cache::deferred_frees_mutex_` (held around owner releases and taken by the enqueue paths), `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()`, and, last, the device cache's SCRATCH marked set `unified_cache::marked_set_mutex_` (taken before any pool call; the pinned pool's `mutex_` is the one listed lock named inside it) | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
-| L5 | allocation/pool/work locks: first, the pinned host pool's `pinned_chunk_pool::mutex_` (`pinned-pool.hpp`; `grow_into` and the footprint reconcile nest `g_runtime_alloc_mutex` under it); current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, the host SCRATCH demand ledger's `host_scratch_ledger::mutex_` and the host holder plan's `host_holder_plans::mutex_` (both `host-zone-plan.hpp`), the host SCRATCH transactions' `unified_cache::host_scratch_txn_mutex_` (`unified-cache.hpp`), the placement plans' `g_lifecycle_plan_mutex` (`unified-cache.cpp`), the lazy IO pool registry's `g_lazy_registry_mutex` (`lazy-io-pool.cpp`), the lazy row cache's per-shard `lazy_row_cache::shard::mutex` (`lazy-row-cache.cpp`), and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
+| L5 | allocation/pool/work locks: first, the pinned host pool's `pinned_chunk_pool::mutex_` (`pinned-pool.hpp`; `grow_into` and the footprint reconcile nest `g_runtime_alloc_mutex` under it); current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, the host SCRATCH demand ledger's `host_scratch_ledger::mutex_` and the host holder plan's `host_holder_plans::mutex_` (both `host-zone-plan.hpp`), the host SCRATCH transactions' `unified_cache::host_scratch_txn_mutex_` (`unified-cache.hpp`), the placement plans' `g_lifecycle_plan_mutex` (`unified-cache.cpp`), the lazy IO pool registry's `g_lazy_registry_mutex` (`lazy-io-pool.cpp`), the lazy row cache's per-shard `lazy_row_cache::shard::mutex` (`lazy-row-cache.cpp`), the lazy landing slab's per-slot `lazy_landing_slot::lock` (`lazy-io-pool.hpp`), the lazy IO engine's per-pool queue lock `lazy_io_engine::mutex` (`lazy-io-pool.cpp`), the lazy STORAGE decline record's `g_lazy_decline_mutex` (`unified-cache.cpp`), and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, the zone-reset audit's `zone_audit_state::mutex` (`unified-cache.cpp`), and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
@@ -1682,7 +1682,8 @@ state machine.
 The lazy IO pool registry's `g_lazy_registry_mutex` (`lazy-io-pool.cpp`, th32
 T3; design `sycl-storage-tier-lazy-tables.md` §3.3) guards the registry's pool
 slot and generation, the reap list, every pool's lease count and DYING flag, the
-reap-run and parked counters with their take-time snapshots, and the
+reap-run and parked counters with their take-time snapshots, each pool's
+block ring with its slot span, creating transaction and `ensuring` flag, and the
 PRIVATE_TESTING hold hook. It sits at L5 and is a **true leaf: nothing is taken
 under it.** No lock is acquired, nothing is allocated, freed or waited on, and
 nothing is logged while it is held. A take that finds no pool reserves the next
@@ -1693,18 +1694,36 @@ or takes again when that pool has already parked; either way it destroys its own
 pool after the unlock. The drop that reaches zero marks the pool DYING and links
 the pool's preallocated node into the reap list, which allocates nothing. A
 `FULL` reap swaps the list out under it and frees the parked pools after the
-unlock. The hold hook, armed at the reap or at the take, runs with no lock held.
+unlock. A `WORKER` reap, which a pool worker runs after its read's lease drops,
+moves one parked pool's ring out under it per pass and frees that ring after the
+unlock; the pools and nodes stay parked for a `FULL` reap, since destroying a
+pool joins its workers. An ensure that finds no ring reserves `ensuring` under
+it, allocates the ring and starts the engine's workers after the unlock, and
+installs both under it unless the registry was shut down meanwhile, in which
+case it frees its ring after the unlock. The ring's allocation carries the
+`POOL` lifetime with owner kind `IO_POOL`, whose id is the pool's registry
+generation, so no model's or backend's owner check matches it. The owner check
+for that owner is silent while the registry still holds the generation, in its
+slot or parked for the `FULL` reap, and reports the ring's rows only once the
+generation is gone. Its predicate, `lazy_io_pool_generation_live()`, takes this
+mutex alone and returns before the check takes `g_runtime_alloc_mutex`, so the
+two are never held together.
+The hold hook, armed at the reap or at the take, runs with no lock held.
 A clone that finds its pool DYING unlocks before it logs and aborts. It may be
-taken while a non-leaf lock is held, as a clone under `g_tensor_inventory_mutex`
-will be. It is never taken while another global L5 lock is held:
+taken while a non-leaf lock is held, as the staged candidate's clone under
+`g_tensor_inventory_mutex` is. The replaced candidate's lease is not dropped
+under that guard: the stage hands it back through the slot's out-slot, and
+`stage_inventory_plan`'s loop drops it after each device's call returns. The
+registry mutex is never taken while another global L5 lock is held:
 `g_lifecycle_plan_mutex` and the retained-handle store's mutex are never held
 when it is taken, and it is never held when they are taken, so the three have no
 order. Once `lazy_io_pool_mark_shut_down()` has run, a lease's drop decrements
 without taking it, so a lease destroyed during static destruction never touches
 it. The host SCRATCH ledger's and holder plan's mutexes are strict leaves, so
-they have no order with it either. No production path takes it yet: the load's
-stage and the plan dry run plan with a null coverage pin until the IO engine
-adopts the coverage wrapper.
+they have no order with it either. The load's stage and the plan dry run each
+take it through the coverage wrapper before their first planner call, and the
+planners' coverage reads go through the lease that take holds, never through
+this mutex.
 
 The lazy row cache's per-shard `lazy_row_cache::shard::mutex` (`lazy-row-cache.cpp`,
 th32 T4; design `sycl-storage-tier-lazy-tables.md` §6.3, §6.4) exists once per
@@ -1725,6 +1744,45 @@ the yield passed it skips the chunk. Under `GGML_SYCL_PRIVATE_TESTING` only, the
 test hook at two points runs under it so that a test can hold one shard while it
 proves another proceeds; a production build has no hook.
 
+The lazy IO engine's `lazy_io_engine::mutex` (`lazy-io-pool.cpp`, th32 T5;
+design `sycl-storage-tier-lazy-tables.md` §5.2, §5.2.1) is the IO pool's queue
+lock. It exists once per IO pool, a member of the pool's engine, so it is not a
+global. It guards the queue of §5.2.1 (the per-context entry sets, the in-flight
+table and the dispatch log), the count of reads the workers have picked and not
+finished, and the stop flag. It sits at L5 and is a **true leaf: nothing is
+taken under it.** A worker holds it to pick a read and again to complete it;
+the read itself, the delivery to the waiters, the lease drop, the reap and every
+log run after the unlock. A submit queues the read's entries under it, which
+allocates from the C++ heap only; the leases a submit did not use and the reads
+a completion or a cancel returns are destroyed after the unlock, so no lease
+drop and no unified-cache allocation or free happens while it is held. A
+worker's wait for work and shutdown's wait for the picked reads release it. It
+is never held while the registry's `g_lazy_registry_mutex` is taken, and it is
+never taken while that mutex is held: a pool's engine is started before its
+install and destroyed after the reap's unlock, so the two have no order.
+
+The lazy landing slab's per-slot `lazy_landing_slot::lock` (`lazy-io-pool.hpp`,
+th32 T5; design `sycl-storage-tier-lazy-tables.md` §5.3) exists once per slot of
+a STORAGE request's landing slab, which a context owns, so it is not a global.
+It guards the slot's epoch and the IO reaper's copy of one waiter's bytes into
+the slot. It sits at L5 and is a **true leaf: nothing is taken under it.** The
+reaper holds it for the epoch and cancel test and the one copy; the row cache's
+insert and the ticket's decrement run after the unlock, so it is never held with
+a shard's mutex. Nothing is allocated, freed, waited on or logged while it is
+held, and no callback runs under it.
+
+The lazy STORAGE decline record's `g_lazy_decline_mutex` (`unified-cache.cpp`,
+th32 T5; design `sycl-storage-tier-lazy-tables.md` §3.3) guards the tables each
+open load has printed a STORAGE decline line for, keyed by the load's
+transaction, so that a load prints a table's line once across its devices and
+passes. It sits at L5 and is a **true leaf: nothing is taken under it.** The
+planner holds it for one set insert, which allocates from the C++ heap only,
+and prints the line after the unlock. The load-end and load-abort notes hold it
+for one erase before they take `g_cache_rw_mutex`. Nothing is freed into the
+unified cache, waited on or logged while it is held, and no callback runs under
+it. It may be taken while a non-leaf lock is held, since the planner runs under
+its callers' locks.
+
 `g_lifecycle_plan_mutex` (`unified-cache.cpp`) guards the placement plans' three
 maps: the load candidates, the probe plans, and the published plans by model and
 load. It is ranked by what is held when it is taken, and that reaches L4:
@@ -1735,7 +1793,13 @@ cache's `rw_mutex_` reads the bound load's candidate plan through
 under the L1 `g_tensor_inventory_mutex`. No rank below L5 is consistent with
 those holders. Its critical sections are map lookups, inserts and erases and
 `shared_ptr` copies. A snapshot displaced or erased under it frees only heap
-memory, because a placement plan holds no allocation handle.
+memory, because a placement plan holds no allocation handle. A staged or
+published record also holds the IO pool's ring lease (th32 §3.3) beside its
+snapshot, never inside it, so a reader that copies the snapshot takes no
+reference on the pool. A lease that a stage, a publish, an abort or an erase
+displaces is moved under this mutex into a local declared before it and dropped
+after the unlock, since a drop takes the registry's `g_lazy_registry_mutex`;
+so that mutex is never taken while this one is held.
 
 One path is **not conforming**, and it is recorded here rather than implied
 away. `lifecycle_replace_placement_plan()` calls the MoE MMID workspace

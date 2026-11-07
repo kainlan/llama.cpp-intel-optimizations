@@ -702,7 +702,7 @@ granularity are dead by measurement; (a) launch overhead is real but small.
 **The largest contributor is not the ring.** The per-layer-embedding table `per_layer_token_embd.weight` (IQ4_NL [160,
 320001536], 27466 MiB, 16 random 90-byte rows per token) stays mmap-backed under upstream's lazy-read AUTO mode ("lazy
 read enabled", `CPU_Mapped model buffer size = 27465.95 MiB`) and the CPU scheduler split page-faulted it from the
-degraded bcachefs array on every ubatch: a state+wchan sampler put the bench main thread in D state on
+bcachefs array on every ubatch: a state+wchan sampler put the bench main thread in D state on
 `bch2_read_single_folio` for 90 of 138 samples in ~4.7 s bursts per ~6.8 s ubatch, the DWARF stack ran
 `ggml_compute_forward_get_rows` -> `dequantize_row_iq4_nl` -> page fault -> bcachefs read, and the GT idle sampler
 showed the B70 busy ~2 s then idle for the rest of each ubatch. Same-binary ABBA on `llama-bench -lzm`:

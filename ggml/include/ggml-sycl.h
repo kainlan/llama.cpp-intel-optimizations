@@ -2275,6 +2275,19 @@ GGML_BACKEND_API bool ggml_backend_sycl_role_bytes_for_testing(int device, int r
 // Proc name: "ggml_sycl_plan_lazy_tables_for_testing".
 GGML_BACKEND_API bool ggml_sycl_plan_lazy_tables_for_testing(struct ggml_sycl_model_token model, uint64_t out[2]);
 
+// The IO pool's live block ring (th32 §3.3, §10): its usable bytes, which equal the plan's block_ring_need that created
+// it and never its ring= charge, written to *out. Returns false, writing nothing, when no live pool has a ring or `out`
+// is null: a VOID reading. Exported unconditionally and reachable through the proc table, like the accessors above.
+// Proc name: "ggml_sycl_lazy_block_ring_bytes_for_testing".
+GGML_BACKEND_API bool ggml_sycl_lazy_block_ring_bytes_for_testing(uint64_t * out);
+
+// The planners' coverage reads since the process started (th32 §10's lazy_ring_coverage_reads): one per step-4
+// eligibility read, block_ring_need read and block_ring_charge read made through a coverage pin, so a plan made with no
+// provisional lease adds none. Written to *out; returns false only for a null `out`. Exported unconditionally and
+// reachable through the proc table, like the accessors above.
+// Proc name: "ggml_sycl_lazy_ring_coverage_reads_for_testing".
+GGML_BACKEND_API bool ggml_sycl_lazy_ring_coverage_reads_for_testing(uint64_t * out);
+
 // The load-time measure's plan override.  While installed, every plan accessor on the
 // calling thread answers from the plan named by `stage` for the load `load_txn`,
 // and nothing is published.  Written only by these two functions; llama reaches them
@@ -2537,7 +2550,8 @@ GGML_BACKEND_API bool ggml_sycl_test_host_cpu_live_bytes(uint64_t * live_bytes);
 // calls, so the entry stages its plan as that load's candidate; it returns the id it replaced, which plan_effect_end
 // restores. It sets the transaction only, not the owner token the stage sets beside it, so a plan made under it skips
 // the dense scratch planning, which is keyed by that owner. coverage_pin_make takes a coverage pin through the IO
-// pool's registry (ring_bytes 0 only: lazy-io-pool.hpp) and coverage_pin_release drops it and runs the closing reap.
+// pool's registry, and a nonzero ring_bytes also ensures a ring of that many bytes through block_ring_ensure
+// (lazy-io-pool.hpp); coverage_pin_release drops it and runs the closing reap.
 // lazy_slot_begin publishes a pin on this thread's plan slot, the one the planner caller reads, and returns the scope
 // lazy_slot_end closes. Each pair nests: close them in reverse order, on the thread that opened them.
 GGML_BACKEND_API uint64_t ggml_sycl_test_plan_effect_begin(uint64_t load_txn_id);
