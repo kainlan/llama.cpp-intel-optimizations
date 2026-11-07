@@ -9,6 +9,7 @@
 #include "allocation-provenance.hpp"
 #include "common.hpp"
 #include "ggml-impl.h"
+#include "host-budget.hpp"
 #include "scratch-test-mutant.hpp"
 
 #include <algorithm>
@@ -114,6 +115,15 @@ mem_handle allocate_pinned_chunk_owner(sycl::queue &       queue,
     return owner;
 }
 
+// What a refused growth appends (design 5efe §4.5): the refusal host-headroom-exhausted when the pool's budget is 0
+// because MemAvailable is at or below the host's headroom, otherwise nothing.
+std::string pinned_budget_refusal_reason(bool headroom_exhausted) {
+    if (!headroom_exhausted) {
+        return std::string();
+    }
+    return std::string(" reason=") + host_budget_status_name(host_budget_status::HEADROOM_EXHAUSTED);
+}
+
 }  // namespace
 
 struct pinned_chunk_pool::stranded_entry {
@@ -136,9 +146,10 @@ const char * host_zone_name(host_zone_id zone) {
     }
 }
 
-pinned_chunk_pool::pinned_chunk_pool(sycl::queue & queue, size_t budget) :
+pinned_chunk_pool::pinned_chunk_pool(sycl::queue & queue, size_t budget, bool headroom_exhausted) :
     queue_(queue),
     budget_(budget),
+    headroom_exhausted_(headroom_exhausted),
     chunk_size_(resolve_chunk_size()),
     alloc_timeout_ms_(resolve_alloc_timeout_ms()) {
     GGML_LOG_INFO("[SYCL] Pinned chunk pool created with %.1f GB budget, committed=0.0 GB (chunk=%.1f MB)\n",
@@ -215,6 +226,9 @@ segmented_buffer pinned_chunk_pool::allocate_segmented(size_t size, size_t align
 
     // Need to grow - allocate a new chunk
     if (footprint_locked() + chunk_size_ > budget_) {
+        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)%s\n",
+                      total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
+                      pinned_budget_refusal_reason(headroom_exhausted_).c_str());
         return {};
     }
 
@@ -274,8 +288,8 @@ size_t pinned_chunk_pool::pre_allocate(size_t total_bytes) {
 
     for (size_t i = 0; i < chunks_needed; i++) {
         if (footprint_locked() + chunk_size_ > budget_) {
-            GGML_LOG_WARN("[SYCL] Pinned pool pre_allocate: budget exhausted after %zu/%zu chunks\n", chunks_grown,
-                          chunks_needed);
+            GGML_LOG_WARN("[SYCL] Pinned pool pre_allocate: budget exhausted after %zu/%zu chunks%s\n", chunks_grown,
+                          chunks_needed, pinned_budget_refusal_reason(headroom_exhausted_).c_str());
             break;
         }
         if (!grow(chunk_size_, "pre_allocate")) {
@@ -753,9 +767,9 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes, si
     if (footprint_locked() + footprint.backing > budget_) {
         GGML_LOG_WARN(
             "[SYCL] Pinned pool grow_zone: budget exhausted for zone %zu "
-            "(need %.1f MB, budget=%.1f GB, used=%.1f GB)\n",
+            "(need %.1f MB, budget=%.1f GB, used=%.1f GB)%s\n",
             zi, footprint.backing / (1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
-            total_allocated_ / (1024.0 * 1024.0 * 1024.0));
+            total_allocated_ / (1024.0 * 1024.0 * 1024.0), pinned_budget_refusal_reason(headroom_exhausted_).c_str());
         return false;
     }
 
@@ -1186,8 +1200,9 @@ void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
     const chunk_footprint footprint      = chunk_footprint_for(size);
     const size_t          new_chunk_size = footprint.usable;
     if (footprint_locked() + footprint.backing > budget_) {
-        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)\n",
-                      total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0));
+        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)%s\n",
+                      total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
+                      pinned_budget_refusal_reason(headroom_exhausted_).c_str());
         return nullptr;
     }
 
@@ -1253,8 +1268,9 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
     const size_t          usable_size  = footprint.usable;
     const size_t          backing_size = footprint.backing;
     if (footprint_locked() + backing_size > budget_) {
-        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)\n",
-                      total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0));
+        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)%s\n",
+                      total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
+                      pinned_budget_refusal_reason(headroom_exhausted_).c_str());
         return false;
     }
 

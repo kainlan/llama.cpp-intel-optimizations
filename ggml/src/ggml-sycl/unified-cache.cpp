@@ -6961,9 +6961,10 @@ unified_cache::unified_cache(sycl::queue & queue,
         // sentinel g_unified_cache_host_budget has no writer, and the public host-budget-pct setter changes only the
         // percentage below. The budget is the one host budget (design 5efe §4.5, host_budget_compute): the override
         // composes as a cap on it, and at zero headroom-free memory it is 0, so every pinned request is refused.
-        size_t total_mem       = 0;
-        size_t available_mem   = 0;
-        size_t headroom        = 0;
+        size_t total_mem          = 0;
+        size_t available_mem      = 0;
+        size_t headroom           = 0;
+        bool   headroom_exhausted = false;  // the budget is 0 because MemAvailable is at or below the headroom
         if (host_mem_budget == 0) {
             const char * reserve_raw = std::getenv("GGML_SYCL_HOST_RESERVE_MB");
 
@@ -7005,7 +7006,8 @@ unified_cache::unified_cache(sycl::queue & queue,
                     "budget is %.1f GB\n",
                     reserve.mb, b.computed / (1024.0 * 1024.0 * 1024.0), host_mem_budget / (1024.0 * 1024.0 * 1024.0));
             }
-            if (b.status == ggml_sycl::host_budget_status::HEADROOM_EXHAUSTED) {
+            headroom_exhausted = b.status == ggml_sycl::host_budget_status::HEADROOM_EXHAUSTED;
+            if (headroom_exhausted) {
                 GGML_LOG_WARN(
                     "[HOST-ARENA] host-headroom-exhausted MemAvailable=%zu MemTotal=%zu headroom=%zu: the pinned "
                     "pool's budget is 0, so every pinned request is refused\n",
@@ -7033,10 +7035,11 @@ unified_cache::unified_cache(sycl::queue & queue,
 
         if (getenv("GGML_SYCL_NO_PINNED") != nullptr) {
             GGML_LOG_INFO("[HOST-ARENA] GGML_SYCL_NO_PINNED set: disabling pinned host memory\n");
-            host_mem_budget = 0;
+            host_mem_budget    = 0;
+            headroom_exhausted = false;  // the budget is 0 by request, not by the headroom
         }
 
-        host_arena_ = std::make_unique<pinned_chunk_pool>(queue_, host_mem_budget);
+        host_arena_ = std::make_unique<pinned_chunk_pool>(queue_, host_mem_budget, headroom_exhausted);
         GGML_LOG_INFO(
             "[HOST-ARENA] Created with %.1f GB budget, committed=0.0 GB "
             "(system total=%.1f GB available=%.1f GB headroom=%.1f GB pct=%d)\n",
