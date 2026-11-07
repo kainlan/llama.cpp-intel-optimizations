@@ -11604,13 +11604,13 @@ static host_registration_view host_registration_tier(const void * ptr, size_t si
     if (!unified_lookup_runtime_allocation(ptr, &row)) {
         return view;
     }
-    view.tier                 = row.tier;
+    view.tier               = row.tier;
     // The containing row's extent is in hand, so a slice that starts inside it and runs past its end is measured here.
     // The lookup guarantees row.ptr <= ptr < row_end, so the room left in the row is computed without adding to ptr: a
     // size near the top of the address space cannot wrap into reading as a fit.
-    const uintptr_t row_end   = reinterpret_cast<uintptr_t>(row.ptr) + row.size;
-    const size_t    room      = static_cast<size_t>(row_end - reinterpret_cast<uintptr_t>(ptr));
-    view.overrun              = size > room ? size - room : 0;
+    const uintptr_t row_end = reinterpret_cast<uintptr_t>(row.ptr) + row.size;
+    const size_t    room    = static_cast<size_t>(row_end - reinterpret_cast<uintptr_t>(ptr));
+    view.overrun            = size > room ? size - room : 0;
     return view;
 }
 
