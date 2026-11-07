@@ -11606,9 +11606,11 @@ static host_registration_view host_registration_tier(const void * ptr, size_t si
     }
     view.tier                 = row.tier;
     // The containing row's extent is in hand, so a slice that starts inside it and runs past its end is measured here.
-    const uintptr_t slice_end = reinterpret_cast<uintptr_t>(ptr) + size;
+    // The lookup guarantees row.ptr <= ptr < row_end, so the room left in the row is computed without adding to ptr: a
+    // size near the top of the address space cannot wrap into reading as a fit.
     const uintptr_t row_end   = reinterpret_cast<uintptr_t>(row.ptr) + row.size;
-    view.overrun              = slice_end > row_end ? static_cast<size_t>(slice_end - row_end) : 0;
+    const size_t    room      = static_cast<size_t>(row_end - reinterpret_cast<uintptr_t>(ptr));
+    view.overrun              = size > room ? size - room : 0;
     return view;
 }
 
