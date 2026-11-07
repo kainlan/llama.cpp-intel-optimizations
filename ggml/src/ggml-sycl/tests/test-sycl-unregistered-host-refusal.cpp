@@ -249,6 +249,12 @@ int run_interior(checks & c) {
         return c.status();
     }
 
+    // A dense weight's entry keeps a direct-table mirror that holds a lease, and nothing short of a model reset
+    // removes it, so the weight is registered with the pinned allocation as its storage owner, as the preload does for
+    // a dense weight (§4.8): the entry then keeps its memory alive and cannot outlive it. The expert is registered with
+    // no owner, as the preload's no-owner branch does, and is retired below.
+    const auto weight_storage = std::make_shared<mem_handle>(owner);
+
     const uint64_t refusals = unified_cache_unregistered_host_registration_refusals();
     for (int kind = 0; kind < 2; ++kind) {
         const bool         expert = kind == 0;
@@ -259,7 +265,8 @@ int run_interior(checks & c) {
         {
             scoped_planned_materialization planned(cache, "test-sycl-unregistered-host-refusal/interior");
             registered = expert ? cache->register_host_expert(key, slice, slice_bytes, GGML_LAYOUT_AOS, &lease) :
-                                  cache->register_host_weight(key, slice, slice_bytes, GGML_LAYOUT_AOS, &lease);
+                                  cache->register_host_weight(key, slice, slice_bytes, GGML_LAYOUT_AOS, &lease,
+                                                              std::shared_ptr<void>(weight_storage, slice));
         }
         const weight_entry * entry = entry_of(cache, expert, key);
         c.expect(
@@ -269,19 +276,17 @@ int run_interior(checks & c) {
                 (entry != nullptr ? ", entry location=" + std::string(location_name(entry->location)) : ", no entry") +
                 "; expected accepted as HOST_PINNED");
 
-        // The entry points into `owner`'s memory and the process-wide cache outlives this function, so it is retired
-        // before the allocation is freed: an entry that names memory must not outlive it.
-        lease = {};
+        // The unowned expert entry points into `owner`'s memory and the process-wide cache outlives this function, so
+        // it is retired before the allocation is freed: an entry that names memory must not outlive it.
         if (expert) {
+            lease = {};
             (void) cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test-sycl-unregistered-host-refusal");
-        } else {
-            cache->remove(key, cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS);
+            cache->process_deferred_frees_public();
+            c.expect(entry_of(cache, expert, key) == nullptr,
+                     std::string("the entry ") + api +
+                         " registered over the pinned slice outlives the test: it would point at memory freed when the "
+                         "allocation drops");
         }
-        cache->process_deferred_frees_public();
-        c.expect(entry_of(cache, expert, key) == nullptr,
-                 std::string("the entry ") + api +
-                     " registered over the pinned slice outlives the test: it would point "
-                     "at memory freed when the allocation drops");
     }
     const uint64_t refused = unified_cache_unregistered_host_registration_refusals() - refusals;
     c.expect(refused == 0, "the pinned slice moved the refusal counter by " + std::to_string(refused) + ", expected 0");
