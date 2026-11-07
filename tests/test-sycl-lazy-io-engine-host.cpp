@@ -4,8 +4,14 @@
 // throwing allocation leaves no ensuring state behind, shut-down refuses and frees the reserver's ring, a second
 // coverage pin while the first is live joins its ring and ensures nothing (another size aborts), a worker's read
 // lands in its waiter's slot, a failed read reaches the ticket with one WARN, a read's last drop on a worker frees only
-// the ring, and shutdown cancels the queued reads and waits for the picked ones. Ensure itself never aborts: under
-// strict leases its one production caller does, and test-sycl-lazy-ring scores that abort.
+// the ring and leaves the join of the pool's workers to the next FULL reap, and shutdown cancels the queued reads and
+// waits for the picked ones. Ensure itself never aborts: under strict leases its one production caller does, and
+// test-sycl-lazy-ring scores that abort.
+//
+// The lock witness (§3.3, §11 T5): a witnessed lock's depth table follows lock, try_lock, unlock, a unique_lock's
+// relock and a condition_variable_any wait; the reap refuses, naming it, when it is called with the registry's leaf
+// mutex or the queue lock held, and with none held it runs; a held lease dropped under a witnessed lock is logged, and
+// under the registry's own mutex aborts; and a reap whose step throws logs it and returns.
 //
 // Host-only, because none of this needs a device: ensure allocates through lazy_io_allocate_host, a link seam the
 // fixture header defines with a counting ledger, and the workers read through the PRIVATE_TESTING read source. Links
@@ -20,7 +26,9 @@
 #include "../ggml/src/ggml-sycl/tests/lazy-io-host-fixture.hpp"
 #include "../ggml/src/ggml-sycl/tests/lazy-io-test-util.hpp"
 #include "../ggml/src/ggml-sycl/tests/lazy-table-test-util.hpp"
+#include "../ggml/src/ggml-sycl/witnessed-mutex.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -54,6 +62,13 @@ constexpr auto     k_bound = std::chrono::seconds(5);
 
 // The mismatched-pin child's switch: a pin of k_need, then one of twice that while the first is live.
 const char * k_pin_child = "--mismatched-pin-child";
+
+// The witness arms' children (§11 T5): nine witnessed locks held at once; a FULL reap under the lock named by the next
+// argument; a held lease dropped under the registry's own mutex; and a FULL reap whose first step throws.
+const char * k_table_child   = "--witness-table-child";
+const char * k_holding_child = "--reap-holding-child";
+const char * k_drop_child    = "--drop-holding-child";
+const char * k_throw_child   = "--reap-throw-child";
 
 std::string name(lazy_ring_ensure_status s) {
     return lazy_ring_ensure_status_name(s);
@@ -590,6 +605,429 @@ arm_result arm_ensure_shut_down() {
     return r;
 }
 
+// ---- the lock witness (§3.3, §11 T5) ----
+
+// The name the witness gives the first witnessed lock the calling thread holds, or "(none)".
+std::string held_name() {
+    const char * held = witnessed_mutex_held_any();
+    return held != nullptr ? held : "(none)";
+}
+
+std::string depth_of(const witnessed_mutex & m) {
+    return std::to_string(witnessed_mutex_depth(m));
+}
+
+// Polls `done` until it holds or the 5 s bound of §11 T5 passes: an observation, never a sleep standing in for an
+// event.
+template <typename F> bool within_bound(F done) {
+    const auto deadline = std::chrono::steady_clock::now() + k_bound;
+    while (!done()) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+// The first line of `text` that contains `needle`, or "(none)".
+std::string first_line_with(const std::string & text, const std::string & needle) {
+    const size_t at = text.find(needle);
+    if (at == std::string::npos) {
+        return "(none)";
+    }
+    const size_t start = text.rfind('\n', at);
+    const size_t end   = text.find('\n', at);
+    const size_t from  = start == std::string::npos ? 0 : start + 1;
+    return text.substr(from, end == std::string::npos ? std::string::npos : end - from);
+}
+
+std::string status_text(int status) {
+    if (WIFSIGNALED(status)) {
+        return "signal " + std::to_string(WTERMSIG(status));
+    }
+    return "exit " + std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+}
+
+// The depth table (§11 T5): a witnessed lock's depth is 1 on the thread that holds it, through lock, try_lock and
+// unlock, and 0 on every other thread, and each instance is its own entry, so the witness names the one still held.
+arm_result arm_witness_depth() {
+    arm_result      r;
+    witnessed_mutex a{ GGML_SYCL_WITNESS_NAME("witness-arm-a") };
+    witnessed_mutex b{ GGML_SYCL_WITNESS_NAME("witness-arm-b") };
+    expect(r, held_name() == "(none)", "before any lock the witness names " + held_name() + ", want (none)");
+    a.lock();
+    int a_elsewhere = -1;
+    std::thread([&] { a_elsewhere = witnessed_mutex_depth(a); }).join();
+    expect(r, witnessed_mutex_depth(a) == 1 && held_name() == "witness-arm-a" && a_elsewhere == 0,
+           "after a.lock() the witness reads depth " + depth_of(a) + " naming " + held_name() + ", and depth " +
+               std::to_string(a_elsewhere) + " on another thread, want 1 naming witness-arm-a, and 0");
+    b.lock();
+    a.unlock();
+    expect(r, witnessed_mutex_depth(a) == 0 && witnessed_mutex_depth(b) == 1 && held_name() == "witness-arm-b",
+           "after b.lock() and a.unlock() the witness reads depths " + depth_of(a) + " and " + depth_of(b) +
+               " naming " + held_name() + ", want 0 and 1 naming witness-arm-b");
+    b.unlock();
+    expect(
+        r, witnessed_mutex_depth(b) == 0 && held_name() == "(none)",
+        "after b.unlock() the witness reads depth " + depth_of(b) + " naming " + held_name() + ", want 0 and (none)");
+    const bool took           = a.try_lock();
+    bool       took_elsewhere = true;
+    std::thread([&] {
+        took_elsewhere = a.try_lock();
+        if (took_elsewhere) {
+            a.unlock();
+        }
+    }).join();
+    const int depth_taken = witnessed_mutex_depth(a);
+    if (took) {
+        a.unlock();
+    }
+    expect(r, took && !took_elsewhere && depth_taken == 1 && witnessed_mutex_depth(a) == 0,
+           "a try_lock that took the lock read depth " + std::to_string(depth_taken) + " and " + depth_of(a) +
+               " after its unlock, want 1 and 0");
+    return r;
+}
+
+// A unique_lock that unlocks and relocks, and a condition_variable_any wait, which unlocks and relocks through the same
+// calls, keep the depth exact (§11 T5: the guard sites whose unique_lock unlocks and relocks, and the engine's waits).
+// Engagement, VOID counting as failed: this thread takes the lock while the waiter waits, so the wait released it.
+arm_result arm_witness_relock() {
+    arm_result      r;
+    witnessed_mutex m{ GGML_SYCL_WITNESS_NAME("witness-arm-cv") };
+    int             depths[4] = { -1, -1, -1, -1 };
+    {
+        std::unique_lock lock(m);
+        depths[0] = witnessed_mutex_depth(m);
+        lock.unlock();
+        depths[1] = witnessed_mutex_depth(m);
+        lock.lock();
+        depths[2] = witnessed_mutex_depth(m);
+    }
+    depths[3] = witnessed_mutex_depth(m);
+    expect(r, depths[0] == 1 && depths[1] == 0 && depths[2] == 1 && depths[3] == 0,
+           "a unique_lock's lock, unlock, relock and scope end read depths " + std::to_string(depths[0]) + " " +
+               std::to_string(depths[1]) + " " + std::to_string(depths[2]) + " " + std::to_string(depths[3]) +
+               ", want 1 0 1 0");
+
+    std::condition_variable_any cv;
+    bool                        waiting      = false;
+    bool                        go           = false;
+    int                         in_wait      = 2;  // the least depth the predicate read; it runs with the lock held
+    int                         after_wait   = -1;
+    int                         after_unlock = -1;
+    std::thread                 waiter([&] {
+        std::unique_lock lock(m);
+        waiting = true;
+        cv.wait(lock, [&] {
+            in_wait = std::min(in_wait, witnessed_mutex_depth(m));
+            return go;
+        });
+        after_wait = witnessed_mutex_depth(m);
+        lock.unlock();
+        after_unlock = witnessed_mutex_depth(m);
+    });
+    const bool                  released = within_bound([&] {
+        std::lock_guard lock(m);
+        if (waiting) {
+            go = true;
+        }
+        return waiting;
+    });
+    if (!released) {
+        std::lock_guard lock(m);
+        go = true;
+    }
+    cv.notify_all();
+    waiter.join();
+    if (!released) {
+        void_arm(r, "this thread did not take the lock while the waiter waited within 5 s");
+    }
+    expect(r, in_wait == 1 && after_wait == 1 && after_unlock == 0,
+           "the waiter's predicate read depth " + std::to_string(in_wait) + ", the wait's return " +
+               std::to_string(after_wait) + " and the unlock " + std::to_string(after_unlock) + ", want 1, 1 and 0");
+    return r;
+}
+
+// The table is fixed and allocates nothing (§11 T5), so a lock that finds it full aborts naming that lock rather than
+// go unwitnessed: nine witnessed locks held at once, in a child, since the abort ends the process.
+arm_result arm_witness_table_full() {
+    arm_result      r;
+    const child_run child = run_child_strings({ "test-sycl-lazy-io-engine-host", k_table_child },
+                                              child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
+    if (!child.ran) {
+        fail(r, "the nine-lock child did not finish within " + num(k_bound.count()) + " s");
+        return r;
+    }
+    const char * want    = "witnessed_mutex: the depth table is full taking witness-full-8";
+    const bool   aborted = WIFSIGNALED(child.status) && WTERMSIG(child.status) == SIGABRT;
+    expect(r, aborted && text_count_with(child.err, want) == 1 && text_count_with(child.err, "TABLE-CHILD") == 0,
+           "the ninth witnessed lock ended the child with " + status_text(child.status) + ", " +
+               num(text_count_with(child.err, want)) + " line(s) '" + want + "' and " +
+               num(text_count_with(child.err, "TABLE-CHILD")) + " return line(s), want SIGABRT, 1 and 0");
+    return r;
+}
+
+int witness_table_child() {
+    static const char * const        names[9] = { "witness-full-0", "witness-full-1", "witness-full-2",
+                                                  "witness-full-3", "witness-full-4", "witness-full-5",
+                                                  "witness-full-6", "witness-full-7", "witness-full-8" };
+    std::unique_ptr<witnessed_mutex> locks[9];
+    for (size_t i = 0; i < 9; ++i) {
+        (void) names[i];
+        locks[i].reset(new witnessed_mutex{ GGML_SYCL_WITNESS_NAME(names[i]) });
+    }
+    for (size_t i = 0; i < 9; ++i) {
+        locks[i]->lock();
+    }
+    std::fprintf(stderr, "TABLE-CHILD returned with 9 locks held\n");
+    for (size_t i = 9; i-- > 0;) {
+        locks[i]->unlock();
+    }
+    return 0;
+}
+
+// The reap's negative control (§11 T5): with no witnessed lock held a FULL reap runs, counts, and refuses nothing.
+arm_result arm_reap_unheld() {
+    arm_result r;
+    log_clear();
+    const lazy_registry_state s0 = registry();
+    ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    const lazy_registry_state s1 = registry();
+    expect(r,
+           s1.full_reaps_run == s0.full_reaps_run + 1 && s1.reaps_refused == s0.reaps_refused &&
+               log_count_with("[HOST-PLAN-BUG] ring reap refused") == 0,
+           "with no lock held the reap ran " + num(s1.full_reaps_run - s0.full_reaps_run) + " time(s), refused " +
+               num(s1.reaps_refused - s0.reaps_refused) + " and printed " +
+               num(log_count_with("[HOST-PLAN-BUG] ring reap refused")) + " refusal line(s), want 1, 0 and 0");
+    return r;
+}
+
+// The reap's positive control, the pool's half (§11 T5): a FULL reap called with the registry's leaf mutex, or the live
+// engine's queue lock, held reads that lock through the witness, prints one "[HOST-PLAN-BUG] ring reap refused: <name>
+// held" line and reaps nothing, and registry_mutex_held() reads the registry's mutex held and nothing else. Each run is
+// a child bounded at 5 s, since a reap that takes the registry's mutex under itself never returns. A table's strand
+// lock is not in this tree, and the control says so: not-wired.
+arm_result arm_reap_refuses_held_lock() {
+    struct lock_case {
+        int          lock;
+        const char * name;
+        bool         registry;
+    };
+
+    static const lock_case cases[] = {
+        { LAZY_LOCK_REGISTRY, "g_lazy_registry_mutex", true  },
+        { LAZY_LOCK_QUEUE,    "lazy_io_engine::mutex", false },
+    };
+    arm_result r;
+    for (const lock_case & c : cases) {
+        const child_run child =
+            run_child_strings({ "test-sycl-lazy-io-engine-host", k_holding_child, std::to_string(c.lock) },
+                              child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
+        if (!child.ran) {
+            fail(r, std::string("the reap under ") + c.name + " did not return within " + num(k_bound.count()) +
+                        " s, want it to refuse and return");
+            continue;
+        }
+        const std::string want = std::string("REAP-HOLDING status=held witnessed=1 registry_held=") +
+                                 (c.registry ? "1" : "0") + " refused=1 held=" + c.name;
+        const std::string warn = std::string("[HOST-PLAN-BUG] ring reap refused: ") + c.name + " held";
+        expect(r,
+               WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0 &&
+                   text_count_with(child.err, want.c_str()) == 1 && text_count_with(child.err, warn.c_str()) == 1,
+               std::string("the reap under ") + c.name + " ended with " + status_text(child.status) + ", printed '" +
+                   first_line_with(child.err, "REAP-HOLDING") + "' and " +
+                   num(text_count_with(child.err, "[HOST-PLAN-BUG] ring reap refused")) +
+                   " refusal line(s), want exit 0, '" + want + "' and 1 '" + warn + "'");
+    }
+    const lazy_reap_holding_result strand = ggml_sycl_test_lazy_reap_holding_pool(LAZY_LOCK_STRAND);
+    expect(r, strand.status == lazy_holding_status::NOT_WIRED,
+           std::string("the strand lock's control reported ") + lazy_holding_status_name(strand.status) +
+               ", want not-wired");
+    return r;
+}
+
+int reap_holding_child(int lock) {
+    ring_lease lease;
+    if (lock == LAZY_LOCK_QUEUE) {
+        lease = lazy_io_pool_take();
+        if (block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn) != lazy_ring_ensure_status::OK) {
+            std::fprintf(stderr, "REAP-HOLDING-CHILD: the ring was not ensured\n");
+            return 3;
+        }
+    }
+    const lazy_reap_holding_result res = ggml_sycl_test_lazy_reap_holding_pool(lock);
+    std::fprintf(stderr, "REAP-HOLDING status=%s witnessed=%d registry_held=%d refused=%d held=%s\n",
+                 lazy_holding_status_name(res.status), res.witnessed ? 1 : 0, res.registry_held ? 1 : 0,
+                 res.refused ? 1 : 0, res.held != nullptr ? res.held : "(none)");
+    lease.reset();
+    ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    return 0;
+}
+
+// The drop's witness (§3.3, §11 T5): a held lease dropped by a thread that holds a witnessed lock prints one
+// "[HOST-PLAN-BUG] ring lease dropped with <name> held" line, counts it, and completes; a drop with nothing held prints
+// nothing. Under the registry's own mutex the drop would take that mutex again, so it prints the line and aborts, in a
+// child bounded at 5 s.
+arm_result arm_drop_witness() {
+    arm_result r;
+    log_clear();
+    const lazy_registry_state s0     = registry();
+    ring_lease                lease  = lazy_io_pool_take();
+    ring_lease                second = lease.clone();
+    witnessed_mutex           m{ GGML_SYCL_WITNESS_NAME("witness-arm-drop") };
+    {
+        std::lock_guard lock(m);
+        second.reset();
+    }
+    const lazy_registry_state s1   = registry();
+    const char *              warn = "[HOST-PLAN-BUG] ring lease dropped with witness-arm-drop held";
+    expect(r, log_count_with(warn) == 1 && s1.lease_drops_locked == s0.lease_drops_locked + 1 && s1.live_leases == 1,
+           "the drop under witness-arm-drop printed " + num(log_count_with(warn)) + " line(s) '" + warn +
+               "', counted " + num(s1.lease_drops_locked - s0.lease_drops_locked) + " and left " + num(s1.live_leases) +
+               " lease(s), want 1, 1 and 1");
+    lease.reset();
+    expect(r, log_count_with("[HOST-PLAN-BUG] ring lease dropped") == 1,
+           "the drop with nothing held printed a drop line: " +
+               num(log_count_with("[HOST-PLAN-BUG] ring lease dropped")) + " in all, want 1");
+    ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+
+    const child_run child = run_child_strings({ "test-sycl-lazy-io-engine-host", k_drop_child },
+                                              child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
+    if (!child.ran) {
+        fail(r, "the drop under g_lazy_registry_mutex did not finish within " + num(k_bound.count()) +
+                    " s, want it to abort naming that mutex");
+        return r;
+    }
+    const char * line  = "[HOST-PLAN-BUG] ring lease dropped with g_lazy_registry_mutex held";
+    const char * abort = "ring_lease::reset: the dropping thread holds the IO pool registry's leaf mutex";
+    const bool   died  = WIFSIGNALED(child.status) && WTERMSIG(child.status) == SIGABRT;
+    expect(r,
+           died && text_count_with(child.err, line) == 1 && text_count_with(child.err, abort) == 1 &&
+               text_count_with(child.err, "DROP-CHILD") == 0,
+           "the drop under g_lazy_registry_mutex ended with " + status_text(child.status) + ", " +
+               num(text_count_with(child.err, line)) + " drop line(s) and " + num(text_count_with(child.err, abort)) +
+               " abort line(s), want SIGABRT, 1 and 1");
+    return r;
+}
+
+void reset_lease(void * lease) {
+    static_cast<ring_lease *>(lease)->reset();
+}
+
+int drop_holding_child() {
+    ring_lease lease  = lazy_io_pool_take();
+    ring_lease second = lease.clone();
+    (void) ggml_sycl_test_lazy_run_holding(LAZY_LOCK_REGISTRY, reset_lease, &second);
+    std::fprintf(stderr, "DROP-CHILD returned\n");
+    return 0;
+}
+
+// A failure to reset is logged and never thrown (§3.3): a FULL reap whose first step throws std::system_error, as
+// std::mutex::lock can, prints one "[HOST-PLAN-BUG] ring reap failed: <what>" line, counts it and returns with its
+// parked pool left for the next reap, which frees it. In a child, since a throw that escapes the noexcept reap ends
+// the process.
+arm_result arm_reap_throw() {
+    arm_result      r;
+    const child_run child = run_child_strings({ "test-sycl-lazy-io-engine-host", k_throw_child },
+                                              child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
+    if (!child.ran) {
+        fail(r, "the throwing reap's child did not finish within " + num(k_bound.count()) + " s");
+        return r;
+    }
+    expect(r, WIFEXITED(child.status) && WEXITSTATUS(child.status) == 0,
+           "the reap's thrown step ended the child with " + status_text(child.status) +
+               ", want the reap to log it and return");
+    const char * warn = "[HOST-PLAN-BUG] ring reap failed: the test seam's throw at the reap's first step";
+    expect(r, text_count_with(child.err, warn) == 1,
+           "the throwing reap printed " + num(text_count_with(child.err, "[HOST-PLAN-BUG] ring reap failed")) +
+               " failure line(s), want 1 '" + warn + "'");
+    expect(r,
+           text_count_with(child.err, "THROW-CHILD after the throw: parked=1 failed=1") == 1 &&
+               text_count_with(child.err, "THROW-CHILD after the next reap: parked=0") == 1,
+           "the child printed '" + first_line_with(child.err, "THROW-CHILD after the throw") + "' and '" +
+               first_line_with(child.err, "THROW-CHILD after the next reap") +
+               "', want parked=1 failed=1, then parked=0");
+    return r;
+}
+
+int reap_throw_child() {
+    lazy_io_pool_take().reset();  // the last drop parks the pool
+    ggml_sycl_test_lazy_reap_throw_next();
+    ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    lazy_registry_state s = registry();
+    std::fprintf(stderr, "THROW-CHILD after the throw: parked=%llu failed=%llu\n", (unsigned long long) s.parked_nodes,
+                 (unsigned long long) s.reaps_failed);
+    ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    s = registry();
+    std::fprintf(stderr, "THROW-CHILD after the next reap: parked=%llu\n", (unsigned long long) s.parked_nodes);
+    return 0;
+}
+
+// The worker-drop RED (§3.3, §11 T5): model A is unloaded with a read in flight, so the read's lease is the last, and
+// its drop and WORKER reap run on a pool worker. Within 5 s the ring's bytes return to the pre-ensure figure through
+// the fixture ledger, with no FULL reap run and no join on the completion path: the pool, with its workers, waits on
+// the reap list for the next FULL reap, which joins every one of its LAZY_BLOCK_RING_QD workers from this thread. The
+// join census records each join by its caller, so a join from a pool worker, or a worker asked to join itself, is a
+// finding.
+// Engagement, VOID counting as failed: the read is held on a worker when A's lease drops, and the worker's reap ran to
+// its end within the bound.
+// Mutant: worker-reap-destroys-pool, under which the WORKER reap stops and joins its own pool's workers.
+arm_result arm_engine_worker_drop() {
+    arm_result     r;
+    const uint64_t charged0 = live_charged();
+    ring_lease     lease    = lazy_io_pool_take();
+    if (block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn) != lazy_ring_ensure_status::OK) {
+        expect(r, false, "the ring was not ensured");
+        settle(lease);
+        return r;
+    }
+    gate g;
+    ggml_sycl_test_lazy_io_read_source(gated_source, &g);
+    request_fixture f(7);
+    const size_t    added = lazy_io_submit(1, -1, block_span(10), key0(7, 1), f.waiter(0, 64));
+    if (added != 1 || !g.wait_holders(1)) {
+        void_arm(r, "the read was not held on a worker within the hook bound (" + num(added) + " waiter(s) queued)");
+        g.release();
+        wait_for([&] { return f.ticket.outstanding.load() == 0; });
+        ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+        settle(lease);
+        return r;
+    }
+    const lazy_registry_state s0 = registry();
+    lease.reset();  // A's unload: the read's lease is now the pool's last
+    g.release();
+    const bool done = within_bound([&] {
+        const lazy_registry_state s = registry();
+        return s.worker_reaps > s0.worker_reaps && s.parked_nodes == 1 && live_charged() == charged0;
+    });
+    ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+    if (!done) {
+        void_arm(r, "the worker's drop and reap did not finish within " + num(k_bound.count()) +
+                        " s: " + num(live_charged() - charged0) + " ring bytes still charged, " +
+                        num(registry().parked_nodes) + " parked");
+        ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+        return r;
+    }
+    const lazy_registry_state s1 = registry();
+    expect(r, s1.full_reaps_run == s0.full_reaps_run,
+           num(s1.full_reaps_run - s0.full_reaps_run) + " FULL reap(s) ran during the worker's drop, want 0");
+    expect(r, s1.joins_from_worker == s0.joins_from_worker && s1.self_joins == s0.self_joins && s1.joins == s0.joins,
+           "the worker's drop ran " + num(s1.joins_from_worker - s0.joins_from_worker) +
+               " join(s) on a pool worker and " + num(s1.self_joins - s0.self_joins) +
+               " self-join(s), want 0 and 0: no join runs on the completion path");
+    ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    const lazy_registry_state s2 = registry();
+    expect(r,
+           s2.joins - s1.joins == LAZY_BLOCK_RING_QD && s2.joins_from_worker == s1.joins_from_worker &&
+               s2.self_joins == s1.self_joins && s2.parked_nodes == 0,
+           "the next FULL reap recorded " + num(s2.joins - s1.joins) + " join(s), " +
+               num(s2.joins_from_worker - s1.joins_from_worker) + " of them from a pool worker, and left " +
+               num(s2.parked_nodes) + " parked, want " + num(LAZY_BLOCK_RING_QD) +
+               ", 0 and 0: the pool's workers are joined there, from this thread");
+    return r;
+}
+
 lazy_ring_mutant mutant_named(const char * text) {
     struct entry {
         const char *     text;
@@ -623,6 +1061,18 @@ int main(int argc, char ** argv) {
         return 0;
     }
     ggml_log_set(capture_log, nullptr);
+    if (argc == 2 && std::strcmp(argv[1], k_table_child) == 0) {
+        return witness_table_child();
+    }
+    if (argc == 3 && std::strcmp(argv[1], k_holding_child) == 0) {
+        return reap_holding_child(std::atoi(argv[2]));
+    }
+    if (argc == 2 && std::strcmp(argv[1], k_drop_child) == 0) {
+        return drop_holding_child();
+    }
+    if (argc == 2 && std::strcmp(argv[1], k_throw_child) == 0) {
+        return reap_throw_child();
+    }
     if (argc == 3 && std::strcmp(argv[1], "--mutant") == 0) {
         ggml_sycl_test_lazy_ring_mutant_select(mutant_named(argv[2]));
     }
@@ -636,8 +1086,16 @@ int main(int argc, char ** argv) {
         { "a worker's read lands in its waiter's slot",                                 arm_engine_read_lands        },
         { "a failed read reaches the ticket with one WARN",                             arm_engine_read_error        },
         { "a read's last drop on a worker frees only the ring",                         arm_engine_worker_reap       },
+        { "a worker's last drop leaves its pool's join to the next FULL reap",          arm_engine_worker_drop       },
         { "shutdown cancels queued reads and waits for picked ones",                    arm_engine_shutdown          },
         { "a second coverage pin joins the live ring and a mismatched one aborts",      arm_coverage_pin_joins       },
+        { "a witnessed lock's depth follows lock, try_lock and unlock",                 arm_witness_depth            },
+        { "a unique_lock relock and a condition_variable_any wait keep the depth",      arm_witness_relock           },
+        { "a ninth witnessed lock held at once aborts naming it",                       arm_witness_table_full       },
+        { "a FULL reap with no witnessed lock held runs and refuses nothing",           arm_reap_unheld              },
+        { "a reap under the registry's mutex or the queue lock refuses naming it",      arm_reap_refuses_held_lock   },
+        { "a lease dropped under a witnessed lock is logged, or aborts",                arm_drop_witness             },
+        { "a reap whose step throws logs it and returns",                               arm_reap_throw               },
         // Last: the shut-down flag is never cleared.
         { "ensure refuses after shut-down and frees the reserver's ring",               arm_ensure_shut_down         },
     };

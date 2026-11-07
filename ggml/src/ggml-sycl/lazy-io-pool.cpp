@@ -3,6 +3,7 @@
 #include "ggml-impl.h"
 #include "host-cpu-mapping.hpp"
 #include "lazy-row-cache.hpp"
+#include "witnessed-mutex.hpp"
 
 #include <unistd.h>
 
@@ -150,6 +151,25 @@ std::atomic<uint64_t>        g_lazy_ring_write_end{ 0 };
 
 // The one runtime mutant selector (§11): NONE unless an arm's registration selects one.
 std::atomic<uint8_t> g_lazy_ring_mutant{ 0 };
+
+// The witness's counts and the join census (§3.3, §11 T5): relaxed atomics read lock-free, since a reap that refuses
+// under the registry's own mutex counts there. The one-shot throw at the FULL reap's first step is the test seam's.
+std::atomic<uint64_t> g_lazy_reaps_refused{ 0 };
+std::atomic<uint64_t> g_lazy_reaps_failed{ 0 };
+std::atomic<uint64_t> g_lazy_lease_drops_locked{ 0 };
+std::atomic<uint64_t> g_lazy_worker_reaps{ 0 };
+std::atomic<uint64_t> g_lazy_joins{ 0 };
+std::atomic<uint64_t> g_lazy_joins_from_worker{ 0 };
+std::atomic<uint64_t> g_lazy_self_joins{ 0 };
+std::atomic<bool>     g_lazy_reap_throw_next{ false };
+
+// The test seam's throw at the FULL reap's first step: what std::mutex::lock throws.
+void lazy_reap_first_step_seam() {
+    if (g_lazy_reap_throw_next.exchange(false, std::memory_order_relaxed)) {
+        throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur),
+                                "the test seam's throw at the reap's first step");
+    }
+}
 #endif
 
 // The take-time snapshots, read with the counters. Caller holds g_lazy_registry_mutex.
@@ -320,12 +340,16 @@ void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
                 }
             }
             if (ring == nullptr) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+                g_lazy_worker_reaps.fetch_add(1, std::memory_order_relaxed);
+#endif
                 return;
             }
             ring.reset();
         }
     }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+    lazy_reap_first_step_seam();
     lazy_hold_fn hold     = nullptr;
     void *       hold_ctx = nullptr;
 #endif
@@ -444,7 +468,87 @@ bool ggml_sycl_lazy_registry_for_testing(lazy_registry_state * out) {
     out->ring_bytes             = g_lazy_pool != nullptr ? g_lazy_pool->ring_bytes.load(std::memory_order_relaxed) : 0;
     out->ring_allocations       = g_lazy_pool != nullptr ? g_lazy_pool->ring_allocations : 0;
     out->ensuring               = g_lazy_pool != nullptr && g_lazy_pool->ensuring;
+    out->reaps_refused          = g_lazy_reaps_refused.load(std::memory_order_relaxed);
+    out->reaps_failed           = g_lazy_reaps_failed.load(std::memory_order_relaxed);
+    out->lease_drops_locked     = g_lazy_lease_drops_locked.load(std::memory_order_relaxed);
+    out->worker_reaps           = g_lazy_worker_reaps.load(std::memory_order_relaxed);
+    out->joins                  = g_lazy_joins.load(std::memory_order_relaxed);
+    out->joins_from_worker      = g_lazy_joins_from_worker.load(std::memory_order_relaxed);
+    out->self_joins             = g_lazy_self_joins.load(std::memory_order_relaxed);
     return true;
+}
+
+bool registry_mutex_held() {
+    return witnessed_mutex_held(g_lazy_registry_mutex);
+}
+
+const char * lazy_holding_status_name(lazy_holding_status status) {
+    switch (status) {
+        case lazy_holding_status::HELD:
+            return "held";
+        case lazy_holding_status::NOT_WIRED:
+            return "not-wired";
+        case lazy_holding_status::NO_ENGINE:
+            return "no-engine";
+        case lazy_holding_status::UNKNOWN:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+lazy_reap_holding_result ggml_sycl_test_lazy_reap_under_held_lock() {
+    lazy_reap_holding_result result;
+    result.held           = witnessed_mutex_held_any();
+    result.witnessed      = result.held != nullptr;
+    result.registry_held  = registry_mutex_held();
+    const uint64_t before = g_lazy_reaps_refused.load(std::memory_order_relaxed);
+    ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    result.refused = g_lazy_reaps_refused.load(std::memory_order_relaxed) != before;
+    return result;
+}
+
+lazy_holding_status ggml_sycl_test_lazy_run_holding(int lock, lazy_hold_fn fn, void * ctx) {
+    if (lock == LAZY_LOCK_STRAND) {
+        return lazy_holding_status::NOT_WIRED;
+    }
+    if (lock == LAZY_LOCK_REGISTRY) {
+        std::lock_guard<std::mutex> registry_lock(g_lazy_registry_mutex);
+        fn(ctx);
+        return lazy_holding_status::HELD;
+    }
+    if (lock != LAZY_LOCK_QUEUE) {
+        return lazy_holding_status::UNKNOWN;
+    }
+    // The join lease keeps the pool, and so its engine, alive across the call, and drops after the queue lock's scope.
+    const ring_lease       lease  = lazy_io_pool_join();
+    lazy_io_engine * const engine = lease.held() ? lazy_io_pool_access::pool(lease)->engine.get() : nullptr;
+    if (engine == nullptr) {
+        return lazy_holding_status::NO_ENGINE;
+    }
+    {
+        std::lock_guard<std::mutex> queue_lock(engine->mutex);
+        fn(ctx);
+    }
+    return lazy_holding_status::HELD;
+}
+
+namespace {
+
+void lazy_reap_under_held_lock_into(void * out) {
+    *static_cast<lazy_reap_holding_result *>(out) = ggml_sycl_test_lazy_reap_under_held_lock();
+}
+
+}  // namespace
+
+lazy_reap_holding_result ggml_sycl_test_lazy_reap_holding_pool(int lock) {
+    lazy_reap_holding_result  result;
+    const lazy_holding_status status = ggml_sycl_test_lazy_run_holding(lock, lazy_reap_under_held_lock_into, &result);
+    result.status                    = status;
+    return result;
+}
+
+void ggml_sycl_test_lazy_reap_throw_next() {
+    g_lazy_reap_throw_next.store(true, std::memory_order_relaxed);
 }
 
 void ggml_sycl_test_lazy_reap_hold(lazy_hold_fn hold, void * ctx) {
