@@ -11590,10 +11590,10 @@ uint64_t unified_cache_unregistered_host_registration_refusals() noexcept {
 //
 // The containment step is unified_lookup_runtime_allocation, which keeps the index and registry assertions.
 //
-// Lock (design §12.5): g_runtime_alloc_mutex, L5, taken inside unified_lookup_runtime_allocation. The registrations call
-// this before they take direct_stage_mutex_ and rw_mutex_ (L4), and hold no listed lock themselves, so the mutex is
-// taken alone, as query_location's own lookup takes it just before. Nothing is acquired and nothing is logged under it;
-// the row is copied out and the lock drops.
+// Lock (design §12.5): g_runtime_alloc_mutex, L5, taken inside unified_lookup_runtime_allocation. The registrations
+// call this before they take direct_stage_mutex_ and rw_mutex_ (L4), and hold no listed lock themselves, so the mutex
+// is taken alone, as query_location's own lookup takes it just before. Nothing is acquired and nothing is logged under
+// it; the row is copied out and the lock drops.
 static host_registration_view host_registration_tier(const void * ptr, size_t size, int device) {
     host_registration_view view;
     view.tier = query_location(ptr, device).tier;
@@ -11691,7 +11691,7 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         return false;
     }
 
-    const int        dev  = ggml_sycl_get_device_id_from_queue(queue_);
+    const int                    dev  = ggml_sycl_get_device_id_from_queue(queue_);
     const host_registration_view view = host_registration_tier(ptr, size, dev);
     const alloc_tier             tier = view.tier;
     if (host_registration_refuses("register_host_expert", ptr, size, view)) {
@@ -11862,7 +11862,7 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
         return false;
     }
 
-    const int        dev  = ggml_sycl_get_device_id_from_queue(queue_);
+    const int                    dev  = ggml_sycl_get_device_id_from_queue(queue_);
     const host_registration_view view = host_registration_tier(ptr, size, dev);
     const alloc_tier             tier = view.tier;
     if (host_registration_refuses("register_host_weight", ptr, size, view)) {
