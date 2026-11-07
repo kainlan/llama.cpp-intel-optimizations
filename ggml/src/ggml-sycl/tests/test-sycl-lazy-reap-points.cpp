@@ -167,12 +167,27 @@ ring_lease read_lease_on_live_ring(arm_result & r) {
 
 // --- the entry reap ---
 
+// What the stage-take hook read at model B's first take, after its entry reap: the parked nodes.
+struct take_view {
+    bool     entered = false;
+    uint64_t parked  = 0;
+};
+
+void read_take_view(void * ctx) {
+    take_view * v = static_cast<take_view *>(ctx);
+    v->entered    = true;
+    v->parked     = registry().parked_nodes;
+}
+
 // The entry reap (§3.3 point (i)): a ring parked by a test thread, never a pool worker, whose own FULL reap the hook
 // holds after its count lands, is freed by the next stage's entry reap before that stage's provisional take. So model
-// B's take snapshots no parked node, B plans ring= the mapped need on both passes, and B's ensure allocates exactly the
-// need: the ledger shows one ring.
-// Engagement, VOID counting as failed: the dropper's reap is held within 5 s with the node parked.
-// Mutant: no-entry-reap, under which B's take runs with A's ring still parked, so B's ensure makes a second ring.
+// B's first take runs with no parked node, B plans ring= the mapped need on both passes, and B's ensure allocates
+// exactly the need: the ledger shows one ring.
+// The parked count is read at the first take itself: the early pass's closing reap frees the parked ring whether or not
+// the entry reap ran, so the late take, the plans and the ledger after B's ensure read the same either way.
+// Engagement, VOID counting as failed: the dropper's reap is held within 5 s with the node parked, and B's stage
+// reaches its take.
+// Mutant: no-entry-reap, under which B's first take runs with A's ring still parked.
 arm_result arm_entry() {
     arm_result     r;
     lazy_inventory inv_b("blk.1.entry_b.weight", k_ne0_8k, k_huge_table);
@@ -202,12 +217,21 @@ arm_result arm_entry() {
                         describe(parked) + ", want 1 parked");
         return settle(r, role0);
     }
+    take_view view;
+    ggml_sycl_test_lazy_stage_take_hold(read_take_view, &view);
     model_load b = load_model(r, inv_b, "model B");
+    ggml_sycl_test_lazy_stage_take_hold(nullptr, nullptr);
     release(hold);
     dropper.join();
     if (!b.ok) {
         return settle(r, role0);
     }
+    if (!view.entered) {
+        void_arm(r, "model B's stage did not reach its take after the entry reap");
+    }
+    expect(r, view.parked == 0,
+           "B's first take ran with " + num(view.parked) +
+               " parked node(s) after its entry reap, want 0: the entry reap left the ring parked");
     const lazy_ring_ensure_status st = ensure_for(b);
     expect(r, st == lazy_ring_ensure_status::OK, "model B's ensure returned " + name(st) + ", want ok");
     expect(r, role_bytes(r) - role0 == k_need_8k,
@@ -554,6 +578,12 @@ void child_setup(const char * tag, child_model & m) {
         if (m.backends.back() == nullptr) {
             child_exit(tag, "void: backend " + std::to_string(d) + " did not initialise", SYCL_TEST_SKIP);
         }
+    }
+    // The ring's LAZY_STAGING reading needs device 0's cache, which neither the backends' init nor the ring's HOST_CPU
+    // allocation builds; main builds it the same way before any arm.
+    if (get_unified_cache_for_device(0) == nullptr) {
+        child_exit(tag, "void: device 0's cache was not created, so every LAZY_STAGING reading would be VOID",
+                   SYCL_TEST_SKIP);
     }
     arm_result r;
     m.role0 = role_bytes(r);

@@ -8645,8 +8645,8 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # mutant registration carries SKIP_RETURN_CODE, for the reason the lazy-ring block gives.
     string(CONCAT _lrp_re_no_entry_reap
         "FAIL a stage's entry reap frees a ring another thread parked before the stage takes its lease: "
-        "after B's ensure the ledger shows [0-9]+ ring bytes, want one ring of [0-9]+ B: "
-        "the parked ring outlived B's take")
+        "B's first take ran with 1 parked node\\(s\\) after its entry reap, want 0: "
+        "the entry reap left the ring parked")
     string(CONCAT _lrp_re_snapshot_carries_lease
         "FAIL a model swap gives A's ring back at A's teardown with no witnessed lock held: "
         "(after A's unload: [0-9]+ live pools, [0-9]+ leases, [0-9]+ parked, want 0, 0, 0"
