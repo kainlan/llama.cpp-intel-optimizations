@@ -5848,7 +5848,7 @@ is the one per-model hook. Model code is untouched apart from
 ## 8. Pre-registered speed targets (item 6)
 
 > **Dated note, 2026-11-06.** The targets in §8.2 and §8.3 were re-pinned on 2026-11-06 for the NVMe layout. `/models`
-> moved to XFS per drive under mergerfs, and the Qwen3.8 Q8_0 files sit on the Kingston NVMe. The NVMe figures are from
+> moved to XFS per drive under mergerfs, and the Qwen3.8 Q8_0 table sits on the Kingston NVMe. The NVMe figures are from
 > the 2026-11-06 probe run, and the dry-run inputs of §4.5 are from the 2026-11-06 dry-run. The bcachefs targets stay
 > beside them as the history of the old layout. Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md` is
 > the plan record.
@@ -6008,7 +6008,7 @@ NVMe (1000 / (50 + 0.46) = 19.82, rounded down), against **>= 18.4 tok/s** on bc
 ### 8.3 Qwen PP512
 
 The control IOPS is the same-session QD64 control of §8.1: 69706 on the NVMe in
-the 2026-11-06 probe run, against 9124 on bcachefs. The QD16 control, 63757, is not an input
+the 2026-11-06 probe run, against 9124 on bcachefs. The QD16 probe, 63757 IOPS, is not an input
 to any target here. The engine ratio, 68887 rows/s over 69706 IOPS, is 0.99.
 The NVMe time bounds of this section are rounded up to the third decimal place, never down.
 
