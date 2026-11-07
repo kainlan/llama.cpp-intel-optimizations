@@ -9409,8 +9409,8 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                 }
                 if (src_tier != alloc_tier::FILE_MAPPED) {
                     GGML_LOG_WARN(
-                        "[DIRECT-STAGE] direct_stage_expert refused: source tier %s cannot be published in place, "
-                        "only a slice of a mapped file is ptr=%p size=%zu\n",
+                        "[DIRECT-STAGE] direct_stage_expert refused: source tier %s cannot be published in place: "
+                        "the publication takes no owner and only a mapped-file slice may use it; ptr=%p size=%zu\n",
                         alloc_tier_name(src_tier), src_ptr, src_size);
                     return result;
                 }
