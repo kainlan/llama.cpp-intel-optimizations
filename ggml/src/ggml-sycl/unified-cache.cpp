@@ -10626,8 +10626,10 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
 
     // The host registration must not refuse once the device entries are withdrawn, so what it checks is checked here
     // first, while nothing has changed. Inside the planned materialization session the registration runs in, it
-    // refuses only for the load effect and for a plan the cache does not hold, and neither can change while the
-    // caller holds the inventory mutex. A host id's existing entry is checked under the locks below.
+    // refuses for the load effect, for a plan the cache does not hold, and for a pointer inside no registered row
+    // (design 5efe §4.8, §7 C6). The first two cannot change while the caller holds the inventory mutex. The pointer
+    // is resolved from a pinned owner whose tier is checked below, and that owner's allocation is a registered row, so
+    // the third cannot fire. A host id's existing entry is checked under the locks below.
     if (acquire_bound_load_effect().failed()) {
         out.reason = "load effect unavailable";
         return false;
@@ -11579,9 +11581,10 @@ static alloc_tier host_registration_tier(const void * ptr, int device) {
 }
 
 // A host weight or expert is registered over memory some owner holds: a slice of a FILE_MAPPED reservation or of a
-// pinned allocation. A pointer neither registry knows (query_location answers UNREGISTERED) has no owner to name, so
-// the entry would be a non_owning_external_host row over memory the cache can neither keep alive nor account for. The
-// refusal is counted and named, and the caller sees false with nothing registered.
+// pinned allocation. A pointer inside no registered row (host_registration_tier answers UNREGISTERED, after the exact
+// base, the range and the containment lookups) has no owner to name, so the entry would be a non_owning_external_host
+// row over memory the cache can neither keep alive nor account for. The refusal is counted and named, and the caller
+// sees false with nothing registered.
 static bool host_registration_refuses_unregistered(const char * api, const void * ptr, size_t size, alloc_tier tier) {
     bool planted_allowed = false;
 #if defined(GGML_SYCL_SCRATCH_MUTANTS)
