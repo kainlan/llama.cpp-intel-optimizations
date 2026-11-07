@@ -146,6 +146,19 @@ void lazy_hold_arm(lazy_hold_point point, lazy_hold_fn hold, void * ctx) {
     g_lazy_hold_ctx   = hold != nullptr ? ctx : nullptr;
 }
 
+// Claims the hook if it is armed at `point` and calls it after the unlock, with no registry or IO-engine lock held.
+void lazy_hold_run(lazy_hold_point point) {
+    lazy_hold_fn hold     = nullptr;
+    void *       hold_ctx = nullptr;
+    {
+        std::lock_guard lock(g_lazy_registry_mutex);
+        hold = lazy_hold_claim_locked(point, &hold_ctx);
+    }
+    if (hold != nullptr) {
+        hold(hold_ctx);
+    }
+}
+
 // The engine's read source and the ring-write recorder (§11): atomics, read by the workers with no lock held.
 std::atomic<lazy_io_read_fn> g_lazy_io_read_fn{ nullptr };
 std::atomic<void *>          g_lazy_io_read_ctx{ nullptr };
@@ -236,6 +249,10 @@ void ring_lease::reset() noexcept {
         pool->leases.fetch_sub(1, std::memory_order_relaxed);
         return;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // The drop's hold point (§3.3's race): a fixture holds this drop before its decrement while a take joins the pool.
+    lazy_hold_run(lazy_hold_point::DROP);
+#endif
     std::lock_guard lock(g_lazy_registry_mutex);
     if (pool->leases.fetch_sub(1, std::memory_order_relaxed) != 1 || g_lazy_shut_down.load(std::memory_order_relaxed)) {
         return;
@@ -453,6 +470,11 @@ bool lazy_coverage_scope::take_if(bool has_lazy_candidate) {
     if (!has_lazy_candidate) {
         return false;
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // The stage-take hold point (§3.3's race): after the scope's entry reap and before its take, so a fixture can park
+    // the live pool between the two or read what the entry reap left.
+    lazy_hold_run(lazy_hold_point::STAGE_TAKE);
+#endif
     lease_ = lazy_io_pool_take();
     return lease_.held();
 }
@@ -587,15 +609,7 @@ void ggml_sycl_test_lazy_drop_hold(lazy_hold_fn hold, void * ctx) {
 }
 
 void ggml_sycl_test_lazy_plan_point() {
-    lazy_hold_fn hold     = nullptr;
-    void *       hold_ctx = nullptr;
-    {
-        std::lock_guard lock(g_lazy_registry_mutex);
-        hold = lazy_hold_claim_locked(lazy_hold_point::PLAN, &hold_ctx);
-    }
-    if (hold != nullptr) {
-        hold(hold_ctx);
-    }
+    lazy_hold_run(lazy_hold_point::PLAN);
 }
 
 void ggml_sycl_test_lazy_mark_dying(const ring_lease & lease) {
