@@ -6010,9 +6010,8 @@ The bcachefs column keeps the 2026-09-26 targets. Each formula is unchanged.
 | S-warm | mean `T_ticket` <= **(1 - P0) x 0.46 ms**, where P0 is the steady-state zero-miss share at the *planned* `cache_slots` (§8.5): prose 32-43% gives **0.26-0.31 ms**; mixed 63-68% gives **0.15-0.17 ms**. This is a ceiling, not a discriminator (M13); the runtime-versus-simulation match of §8.5 is the discriminator | mean `T_ticket` <= **(1 - P0) x 4.3 ms**, where P0 is the steady-state zero-miss share at the *planned* `cache_slots` (§8.5): prose 32-43%, mixed 63-68%. This is a ceiling, not a discriminator (M13); the runtime-versus-simulation match of §8.5 is the discriminator | §6.2.1; P0 unchanged, the S-cold mean re-derived |
 | S-hot | `T_ticket == 0` on **>= 99%** of tokens. Unchanged | the same | every row hits |
 
-The §8.1 scaling rule does not apply on the NVMe. Its bracketing controls,
-69706 IOPS at QD64 and 63757 at QD16, are above 4657, so no latency bound is
-multiplied.
+The §8.1 scaling rule does not apply on the NVMe, because the QD64 control,
+69706 IOPS, is above 4657, so no latency bound is multiplied.
 
 Expressed as throughput: `tg_S >= 1 / (1/tg_H + T_stall)`. If H decodes at
 20 tok/s (50 ms per token), S-cold must decode at **>= 19.8 tok/s** on the
