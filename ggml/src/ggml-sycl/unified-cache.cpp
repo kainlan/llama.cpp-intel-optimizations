@@ -148,7 +148,7 @@ struct lifecycle_plan_record {
     ring_lease                                     lease;
 };
 
-std::mutex                                                                        g_lifecycle_plan_mutex;
+witnessed_mutex g_lifecycle_plan_mutex{ GGML_SYCL_WITNESS_NAME("g_lifecycle_plan_mutex") };
 std::unordered_map<uint64_t, lifecycle_plan_record>                               g_lifecycle_plan_candidates;
 // Unpublished probe-placement plans (the load-time measure's (a) stage), keyed by the load's transaction.
 std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>      g_lifecycle_probe_plans;
@@ -177,13 +177,13 @@ void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept {
 }
 
 void lifecycle_plan_run_locked_for_test(void (*fn)(void *), void * ctx) {
-    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    std::lock_guard lock(g_lifecycle_plan_mutex);
     fn(ctx);
 }
 
 size_t lifecycle_plan_lease_count_for_test() {
-    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
-    size_t                      count = 0;
+    std::lock_guard lock(g_lifecycle_plan_mutex);
+    size_t          count = 0;
     for (const auto & candidate : g_lifecycle_plan_candidates) {
         count += candidate.second.lease.held() ? 1 : 0;
     }
@@ -199,7 +199,7 @@ void lifecycle_plan_clear_for_test() {
     // Declared before the lock, so the records, and their leases, are destroyed after the unlock with no lock held.
     std::unordered_map<uint64_t, lifecycle_plan_record>                               candidates;
     std::unordered_map<uint64_t, std::unordered_map<uint64_t, lifecycle_plan_record>> models;
-    std::lock_guard<std::mutex>                                                       lock(g_lifecycle_plan_mutex);
+    std::lock_guard                                                                   lock(g_lifecycle_plan_mutex);
     candidates.swap(g_lifecycle_plan_candidates);
     models.swap(g_lifecycle_plan_models);
 }
@@ -242,7 +242,7 @@ void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
     auto       snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
     ring_lease displaced;  // the replaced candidate's lease, dropped after the unlock
     {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         lifecycle_plan_record &     record = g_lifecycle_plan_candidates[load_txn_id];
         displaced                          = std::move(record.lease);
         record.snapshot                    = std::move(snapshot);
@@ -267,7 +267,7 @@ void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
     snapshot->kv_info          = kv_info;
     ring_lease displaced;  // the replaced candidate's lease, dropped after the unlock
     {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         lifecycle_plan_record &     record = g_lifecycle_plan_candidates[load_txn_id];
         displaced                          = std::move(record.lease);
         record.snapshot                    = std::move(snapshot);
@@ -279,7 +279,7 @@ void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
 
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placement_plan(uint64_t load_txn_id) noexcept {
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         const auto                  candidate = g_lifecycle_plan_candidates.find(load_txn_id);
         return candidate == g_lifecycle_plan_candidates.end() ? nullptr : candidate->second.snapshot;
     } catch (...) {
@@ -295,13 +295,13 @@ void lifecycle_stage_probe_placement_plan(uint64_t                  load_txn_id,
         return;
     }
     auto snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
-    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    std::lock_guard lock(g_lifecycle_plan_mutex);
     g_lifecycle_probe_plans[load_txn_id] = std::move(snapshot);
 }
 
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_plan(uint64_t load_txn_id) noexcept {
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         const auto                  probe = g_lifecycle_probe_plans.find(load_txn_id);
         return probe == g_lifecycle_probe_plans.end() ? nullptr : probe->second;
     } catch (...) {
@@ -311,7 +311,7 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_pl
 
 void lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept {
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard lock(g_lifecycle_plan_mutex);
         g_lifecycle_probe_plans.erase(load_txn_id);
     } catch (...) {
     }
@@ -320,7 +320,7 @@ void lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept {
 void lifecycle_abort_placement_plan(uint64_t load_txn_id, ring_lease * displaced_out) noexcept {
     ring_lease displaced;  // the aborted candidate's lease, dropped after the unlock
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         const auto                  candidate = g_lifecycle_plan_candidates.find(load_txn_id);
         if (candidate != g_lifecycle_plan_candidates.end()) {
             displaced = std::move(candidate->second.lease);
@@ -344,7 +344,7 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
                                       std::shared_ptr<const lifecycle_plan_snapshot> * published_out) noexcept {
     ring_lease displaced;  // a lease the publish displaces, dropped after the unlock
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         auto                        candidate = g_lifecycle_plan_candidates.find(load_txn_id);
         if (candidate == g_lifecycle_plan_candidates.end()) {
             return false;
@@ -397,7 +397,7 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
 }
 
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uint64_t model_id, uint64_t load_txn_id) {
-    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    std::lock_guard             lock(g_lifecycle_plan_mutex);
     auto                        model = g_lifecycle_plan_models.find(model_id);
     if (model == g_lifecycle_plan_models.end()) {
         return nullptr;
@@ -430,7 +430,7 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
         return false;
     }
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         auto                        model = g_lifecycle_plan_models.find(expected->model_id);
         if (model == g_lifecycle_plan_models.end()) {
             return false;
@@ -565,7 +565,7 @@ bool workspace_admission_authority_issuer::direct(
 void lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept {
     ring_lease displaced;  // the erased record's lease, dropped after the unlock
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         auto                        model = g_lifecycle_plan_models.find(model_id);
         if (model == g_lifecycle_plan_models.end()) {
             return;
@@ -584,7 +584,7 @@ void lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noe
 
 size_t lifecycle_published_placement_plan_count_for_test() noexcept {
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         size_t                      count = 0;
         for (const auto & model : g_lifecycle_plan_models) {
             count += model.second.size();

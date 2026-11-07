@@ -2339,7 +2339,9 @@ def test_mutation_woq_resolve_unleased_is_witnessed() -> None:
 def yield_lock_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
     found: list[str] = []
     txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
-    if "std::unique_lock<std::mutex> lock(g_tensor_inventory_mutex);" not in txn:
+    # A unique_lock, with or without a template argument (the lock is a witnessed_mutex, so the guard deduces it): a
+    # lock_guard cannot be released for the yield.
+    if not re.search(r"std::unique_lock(?:<[^<>]*>)?\s+lock\s*\(\s*g_tensor_inventory_mutex\s*\)\s*;", txn):
         found.append("the transaction cannot release its inventory lock")
     begin = txn.find("unified_cache_yield_optional_layouts_begin(")
     retired = re.search(r"retired_any\s*=\s*retired_any\s*\|\|\s*releases\[i\]\.result\.retired\s*>\s*0;", txn)

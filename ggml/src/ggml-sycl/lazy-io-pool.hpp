@@ -17,6 +17,11 @@
 // The registry's leaf mutex (canonical contract §12.5, L5) is a true leaf: nothing is taken, allocated, freed, waited
 // on or logged under it. A take reserves a generation under it, builds its pool outside it and installs the pool under
 // it on a generation match; a final drop only parks the pool, and the reap frees parked pools after its unlock.
+//
+// witnessed-mutex.hpp comes with this header: the reap refuses under any of the five witnessed locks (§3.3), and
+// the units that declare the inventory and plan locks, ggml-sycl.cpp and unified-cache.cpp, reach the type here.
+
+#include "witnessed-mutex.hpp"
 
 #include <atomic>
 #include <cstddef>

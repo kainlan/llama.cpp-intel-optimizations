@@ -2803,7 +2803,7 @@ static thread_local bool                                                      g_
 static thread_local bool                                                      g_runtime_external_lease   = false;
 // Canonical ranked inventory/lifecycle publication writer lock. All cache/global
 // placement publications are serialized by this existing lock.
-static std::mutex                                                g_tensor_inventory_mutex;
+static ggml_sycl::witnessed_mutex g_tensor_inventory_mutex{ GGML_SYCL_WITNESS_NAME("g_tensor_inventory_mutex") };
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool> g_fail_next_plan_publication_prepare{ false };
 #endif
@@ -3166,12 +3166,12 @@ static void ggml_sycl_publish_test_plan(ggml_sycl::placement_plan plan) {
         return;
     }
     const auto                  snapshot = ggml_sycl_make_provisional_plan_snapshot(std::move(plan));
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard             lock(g_tensor_inventory_mutex);
     ggml_sycl_publish_plan_locked(snapshot);
 }
 
 static void ggml_sycl_republish_current_plan() {
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard lock(g_tensor_inventory_mutex);
     ggml_sycl_publish_plan_locked(ggml_sycl_global_plan_snapshot());
 }
 
@@ -3304,7 +3304,7 @@ static ggml_sycl_into_empty_result ggml_sycl_republish_current_plan_into_empty(
     if (cache->into_empty_skip_key() == skip_key) {
         return ggml_sycl_into_empty_result::NOOP;
     }
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard lock(g_tensor_inventory_mutex);
     const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value, owner.load.value,
                                                                      owner.owner.slot, owner.owner.generation);
     if (!selected) {
@@ -13086,7 +13086,7 @@ static bool ggml_sycl_prepare_latest_live_plan(ggml_sycl_plan_restoration_bundle
 }
 
 static void ggml_sycl_publish_restored_plan(const ggml_sycl_plan_restoration_bundle & bundle) {
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard lock(g_tensor_inventory_mutex);
     ggml_sycl_publish_plan_locked(bundle.snapshot);
 }
 
@@ -13132,7 +13132,7 @@ static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken ow
         ggml_sycl_tenant_publish_gen_bump();
         ggml_sycl_plan_restoration_bundle restoration;
         {
-            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            std::lock_guard lock(g_tensor_inventory_mutex);
             const auto published = ggml_sycl_global_plan_snapshot();
             const bool owns_publication = ggml_sycl::lifecycle_plan_snapshot_owned_by(
                 published, owner.model.value, owner.load.value, owner.owner.slot, owner.owner.generation);
@@ -14216,7 +14216,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         }
         ggml_sycl_prepared_plan_publication prepared_publication;
         {
-            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            std::lock_guard lock(g_tensor_inventory_mutex);
             prepared_publication = ggml_sycl_prepare_plan_publication_locked(plan_snapshot);
         }
         const auto publication = ggml_sycl_lifecycle_publication_from_plan(*plan_snapshot);
@@ -14228,7 +14228,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         // while waiters still observe COMMITTING; only finalize_end makes LIVE
         // terminal state visible and notifies duplicate load_end callers.
         {
-            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            std::lock_guard lock(g_tensor_inventory_mutex);
             ggml_sycl_publish_prepared_plan_locked(prepared_publication);
         }
         auto result = registry->finalize_end(ticket, true, publication, std::move(state));
@@ -15826,7 +15826,7 @@ std::atomic<bool>                                    g_tiered_enabled{ false };
 // classification, so owner-scoped teardown removes them instead.
 static void ggml_sycl_reset_model_load_scratch_state(bool preserve_placement_authority) {
     {
-        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        std::lock_guard lock(g_tensor_inventory_mutex);
         g_tensor_inventory.clear();
         g_tensor_inventory_detail.clear();
         g_tensor_inventory_index.clear();
@@ -16502,7 +16502,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(ggml_sycl_model
         } lease{ registry, std::move(ticket) };
 
         {
-            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            std::lock_guard             lock(g_tensor_inventory_mutex);
             const auto                  state = registry.find(token.model);
             const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id, model.load_txn_id,
                                                                              model.slot, model.slot_generation);
@@ -17732,12 +17732,12 @@ void test_set_kv_placement_plan(const placement_plan & plan, uint32_t n_layers, 
     kv_info.n_ctx                        = static_cast<uint32_t>(std::max<size_t>(1, kv_per_layer / 4));
     kv_info.n_ubatch                     = 1;
     auto                        snapshot = ggml_sycl_make_provisional_plan_snapshot(std::move(next), kv_info, n_layers);
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard             lock(g_tensor_inventory_mutex);
     ggml_sycl_publish_plan_locked(snapshot);
 }
 
 void test_clear_kv_placement_plan() {
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard lock(g_tensor_inventory_mutex);
     ggml_sycl_publish_plan_locked(nullptr);
     g_model_n_layer     = 0;
     g_placement_kv_info = {};
@@ -18330,7 +18330,7 @@ void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t              
     }
 
     host_budget_pass_scope      host_budget;
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard             lock(g_tensor_inventory_mutex);
     populate_inventory_globals(ctx, inventory);
     size_t vram_budget = 0, base_mem = 0, free_mem = 0;
     int    budget_pct = 0;
@@ -18374,7 +18374,7 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
     }
 
     host_budget_pass_scope      host_budget;
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard             lock(g_tensor_inventory_mutex);
 
     // Phase A: inventory + KV + MoE globals.  Idempotent against a prior
     // ggml_backend_sycl_compute_placement_plan_early() call with the same
@@ -18634,7 +18634,7 @@ void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard lock(g_tensor_inventory_mutex);
     if (envelope == nullptr) {
         g_placement_envelope     = ggml_sycl_placement_envelope{};
         g_placement_envelope_set = false;
@@ -19264,7 +19264,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         std::vector<ggml_sycl::placement_lazy_table_info> lazy_infos;
         bool                                              multi_device = false;
         {
-            std::lock_guard<std::mutex>        lock(g_tensor_inventory_mutex);
+            std::lock_guard                    lock(g_tensor_inventory_mutex);
             ggml_sycl_plan_dry_run_saved_state saved(ggml_sycl_info().total_gpu_count);
             multi_device = ggml_sycl_plan_multi_device();
             plans = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, sample.available_bytes, reserve_override,
@@ -20910,7 +20910,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         return busy("busy (could not acquire a live-update lease)");
     }
 
-    std::unique_lock<std::mutex> lock(g_tensor_inventory_mutex);
+    std::unique_lock lock(g_tensor_inventory_mutex);
     if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
         return busy("busy (plan changed while acquiring the transaction lock)");
     }
@@ -22137,7 +22137,7 @@ static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_refill_sele
     uint32_t *                                 remaining) {
     std::vector<ggml_sycl::expert_placement_key> keys;
     keys.reserve(3 * std::min<size_t>(max_triplets, 1024));
-    std::lock_guard<std::mutex>    lock(g_tensor_inventory_mutex);
+    std::lock_guard                lock(g_tensor_inventory_mutex);
     ggml_sycl_expert_lent_ledger & ledger      = ggml_sycl_expert_lent_ledger_locked(device, current);
     auto                           not_on_host = [&](const std::array<ggml_sycl::expert_placement_key, 3> & lent) {
         for (const ggml_sycl::expert_placement_key & k : lent) {
@@ -22475,7 +22475,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                       stop ? stop : "nothing lendable");
     }
 
-    std::unique_lock<std::mutex> lock(g_tensor_inventory_mutex);
+    std::unique_lock lock(g_tensor_inventory_mutex);
     if (ggml_sycl_global_plan_snapshot().get() != current.get() ||
         (lifecycle_owned &&
          ggml_sycl::lifecycle_find_placement_plan(current->model_id, current->load_txn_id).get() != current.get())) {
@@ -22939,7 +22939,7 @@ static uint32_t ggml_sycl_expert_refill_transaction_run(int                     
 
 // Arm or disarm the device's refill cursor. Armed only while the ledger holds a lent triplet.
 static void ggml_sycl_expert_refill_set_armed(int device, bool armed) {
-    std::lock_guard<std::mutex>    lock(g_tensor_inventory_mutex);
+    std::lock_guard                lock(g_tensor_inventory_mutex);
     ggml_sycl_expert_lent_ledger & ledger = g_sycl_expert_lent[device];
     ledger.refill_armed                   = armed && !ledger.triplets.empty();
 }
@@ -23009,14 +23009,14 @@ static void ggml_sycl_expert_bulk_refill_owe(int device, uint64_t first_graph) {
         g_sycl_expert_lent_count[device].load(std::memory_order_acquire) == 0) {
         return;
     }
-    std::lock_guard<std::mutex>    lock(g_tensor_inventory_mutex);
+    std::lock_guard                lock(g_tensor_inventory_mutex);
     ggml_sycl_expert_lent_ledger & ledger = g_sycl_expert_lent[device];
     ledger.bulk_refill_owed_at            = ledger.triplets.empty() ? 0 : first_graph;
 }
 
 // The bulk refill `device` is owed, taken: the decode graph it is owed at, 0 for none.
 static uint64_t ggml_sycl_expert_bulk_refill_take(int device) {
-    std::lock_guard<std::mutex>    lock(g_tensor_inventory_mutex);
+    std::lock_guard                lock(g_tensor_inventory_mutex);
     ggml_sycl_expert_lent_ledger & ledger  = g_sycl_expert_lent[device];
     const uint64_t                 owed_at = ledger.bulk_refill_owed_at;
     ledger.bulk_refill_owed_at             = 0;
@@ -23072,7 +23072,7 @@ static uint32_t ggml_sycl_expert_bulk_refill_owe_next_context(int device) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return 0;
     }
-    std::lock_guard<std::mutex>    lock(g_tensor_inventory_mutex);
+    std::lock_guard                lock(g_tensor_inventory_mutex);
     ggml_sycl_expert_lent_ledger & ledger = g_sycl_expert_lent[device];
     ledger.bulk_refill_next_context       = !ledger.triplets.empty();
     return static_cast<uint32_t>(ledger.triplets.size());
@@ -23080,7 +23080,7 @@ static uint32_t ggml_sycl_expert_bulk_refill_owe_next_context(int device) {
 
 // The triplets `device` owes the next context: 0 when it owes none.
 static uint32_t ggml_sycl_expert_bulk_refill_owed_next_context(int device) {
-    std::lock_guard<std::mutex>          lock(g_tensor_inventory_mutex);
+    std::lock_guard                      lock(g_tensor_inventory_mutex);
     const ggml_sycl_expert_lent_ledger & ledger = g_sycl_expert_lent[device];
     return ledger.bulk_refill_next_context ? static_cast<uint32_t>(ledger.triplets.size()) : 0;
 }
@@ -23107,7 +23107,7 @@ static uint32_t ggml_sycl_run_expert_bulk_refill_between_contexts(int           
         return 0;
     }
     {
-        std::lock_guard<std::mutex>    lock(g_tensor_inventory_mutex);
+        std::lock_guard                lock(g_tensor_inventory_mutex);
         ggml_sycl_expert_lent_ledger & ledger = g_sycl_expert_lent[device];
         const bool                     owed   = ledger.bulk_refill_next_context;
         ledger.bulk_refill_next_context       = false;
@@ -23349,7 +23349,7 @@ struct test_loan_fixture {
         // Not an empty plan: one uses no device, so it leaves every cache's snapshot null under a non-null authority,
         // which reads as TRANSIENT_MISMATCH and refuses every later direct stage.
         {
-            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            std::lock_guard lock(g_tensor_inventory_mutex);
             ::ggml_sycl_publish_plan_locked(found);
             g_sycl_expert_lent[device] = ggml_sycl_expert_lent_ledger{};
         }
@@ -24223,7 +24223,7 @@ std::string test_expert_loan_lends_two_triplets() {
         const auto other_plan = ::ggml_sycl_make_provisional_plan_snapshot(fx.plan(/*host_expert=*/3));
         auto       other      = std::make_shared<lifecycle_plan_snapshot>(*other_plan);
         other->model_id ^= 0x7999ull;
-        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        std::lock_guard lock(g_tensor_inventory_mutex);
         ::ggml_sycl_publish_plan_locked(other);
     }
     if (g_sycl_expert_lent_count[fx.device].load() != 0) {
@@ -25178,7 +25178,7 @@ std::string test_expert_loan_sizes_its_copies_from_the_entry() {
     expert_loan_record refused;
     bool               accepted = false;
     {
-        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        std::lock_guard lock(g_tensor_inventory_mutex);
         accepted = fx.cache->loan_expert_triplet(members, refused);
     }
     if (accepted || std::strcmp(refused.reason, "host storage too small") != 0) {
@@ -26164,7 +26164,7 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
     // canonical §12 forbids allocation under the publication locks.
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> bound_snapshot;
     try {
-        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        std::lock_guard lock(g_tensor_inventory_mutex);
         const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id, model.load_txn_id, model.slot,
                                                                          model.slot_generation);
         if (!snapshot) {
@@ -26598,7 +26598,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
     // live one -- it may have changed between the lock-free read of
     // `current` and acquiring the lock (a concurrent model load/unload
     // or another runtime-context call).
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard lock(g_tensor_inventory_mutex);
     if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
         return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
     }
@@ -26704,13 +26704,13 @@ void ggml_backend_sycl_notify_compute_buffer_sizes(ggml_backend_t backend, const
 
 // Get the total model size from tensor inventory (for budget calculations)
 size_t ggml_sycl_get_model_size() {
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard lock(g_tensor_inventory_mutex);
     return g_tensor_inventory_total_size;
 }
 
 // Get MoE expert memory breakdown (for budget calculations)
 void ggml_sycl_get_moe_info(size_t * expert_total_bytes, int * n_expert, int * n_expert_used) {
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard lock(g_tensor_inventory_mutex);
     if (expert_total_bytes) {
         *expert_total_bytes = g_moe_expert_total_bytes;
     }
@@ -26731,7 +26731,7 @@ int ggml_backend_sycl_planned_target_device(const char * tensor_name) {
     if (!tensor_name) {
         return GGML_SYCL_PLANNED_NO_PLAN;
     }
-    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    std::lock_guard             lock(g_tensor_inventory_mutex);
     const auto                  plan_owner = ggml_sycl_global_plan_owner();
     if (!ggml_sycl_has_global_plan() || !plan_owner->has_dense_entry(tensor_name)) {
         return GGML_SYCL_PLANNED_NO_PLAN;
@@ -26799,7 +26799,7 @@ void * get_cached_tensor_ptr(const char * tensor_name, ggml_sycl::memory_tier * 
     }
     // First check inventory index (fast path for inventory check)
     {
-        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        std::lock_guard             lock(g_tensor_inventory_mutex);
         auto                        it = g_tensor_inventory_index.find(tensor_name);
         if (it == g_tensor_inventory_index.end()) {
             return nullptr;  // Not a tracked tensor
@@ -95508,7 +95508,7 @@ static void build_layer_device_map(int device) {
     // Determine max layer from tensor inventory
     int max_layer = -1;
     {
-        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        std::lock_guard lock(g_tensor_inventory_mutex);
         for (const auto & [name, size] : g_tensor_inventory) {
             int lid = ggml_sycl::extract_layer_id(name.c_str());
             if (lid > max_layer) {
@@ -127407,7 +127407,7 @@ namespace ggml_sycl {
 // records' lock, and the IO pool the registry's leaf mutex and the queue lock.
 lazy_holding_status ggml_sycl_test_lazy_run_holding_any(int lock, lazy_hold_fn fn, void * ctx) {
     if (lock == LAZY_LOCK_INVENTORY) {
-        std::lock_guard<std::mutex> inventory_lock(g_tensor_inventory_mutex);
+        std::lock_guard inventory_lock(g_tensor_inventory_mutex);
         fn(ctx);
         return lazy_holding_status::HELD;
     }

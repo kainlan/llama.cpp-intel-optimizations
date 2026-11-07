@@ -421,7 +421,7 @@ def claim_graph_mutex_untouched(cache: str, sycl: str) -> bool:
 # --- lock order -----------------------------------------------------------------------------------------------------
 
 HOST_ALLOC = "ggml_sycl::mem_handle host = ggml_sycl_host_expert_alloc(device, bytes);"
-INVENTORY_LOCK = "std::unique_lock<std::mutex> lock(g_tensor_inventory_mutex);"
+INVENTORY_LOCK = "std::unique_lock lock(g_tensor_inventory_mutex);"
 LEND = "loaned = cache->loan_expert_triplet(triplet.members, record);"
 CACHE_LOCKS = ("std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock); "
                "std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock); "
@@ -981,7 +981,7 @@ def claim_a_loan_cancels_the_refills(sycl: str) -> bool:
                         PUBLISH))
 
 
-LEDGER_LOCK = "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);"
+LEDGER_LOCK = "std::lock_guard lock(g_tensor_inventory_mutex);"
 OWE_SIG = "static void ggml_sycl_expert_bulk_refill_owe(int device, uint64_t first_graph)"
 TAKE_SIG = "static uint64_t ggml_sycl_expert_bulk_refill_take(int device)"
 OWE_NEXT_SIG = "static uint32_t ggml_sycl_expert_bulk_refill_owe_next_context(int device)"
@@ -1927,7 +1927,7 @@ def test_mutant_cache_takes_rw_mutex_alone_fails():
 def test_mutant_request_takes_a_mutex_fails():
     """An in-graph caller may hold g_sycl_graph_compute_mutex (L2): a request that locks could invert L1 under it."""
     assert not claim_request_is_lock_free(
-        _once(SYCL, REQUEST_CAS, "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex), " + REQUEST_CAS))
+        _once(SYCL, REQUEST_CAS, "std::lock_guard lock(g_tensor_inventory_mutex), " + REQUEST_CAS))
 
 
 def test_mutant_loan_runs_before_the_graph_flag_clears_fails():
@@ -2376,7 +2376,7 @@ def test_mutant_refill_allocates_under_the_inventory_lock_fails():
 
 
 def test_mutant_refill_cache_takes_the_inventory_mutex_fails():
-    mutant = _once(CACHE, REFILL_LOAD_EFFECT, "std::lock_guard<std::mutex> inv(g_tensor_inventory_mutex); "
+    mutant = _once(CACHE, REFILL_LOAD_EFFECT, "std::lock_guard inv(g_tensor_inventory_mutex); "
                    + REFILL_LOAD_EFFECT)
     assert not claim_refill_lock_order(mutant, SYCL)
 

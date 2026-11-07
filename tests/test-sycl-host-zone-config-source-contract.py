@@ -90,7 +90,11 @@ def statement_window(source: str, statement_anchor: str, window: int = 1400) -> 
 
 
 # Real code text the checks anchor on (never comments).
-LOCK_STMT = "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);"
+# The inventory guard in either guard type, with or without a template argument: the lock is a witnessed_mutex, which
+# a test build cannot spell std::mutex, so its guards deduce the type (std::lock_guard lock(m)).
+LOCK_RE = re.compile(r"std::(?:lock_guard|unique_lock)(?:<[^<>]*>)?\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\)\s*;")
+# The guard the A1 witness reintroduces, in the spelling the source uses.
+LOCK_STMT = "std::lock_guard lock(g_tensor_inventory_mutex);"
 PLAN_STORE_CALL = "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);"
 IMPL_DELEGATE_CALL = "ggml_sycl_set_tensor_inventory_impl(backend, inventory);"
 SNAPSHOT_CAPTURE = "const auto snapshot = " + IMPL_DELEGATE_CALL
@@ -209,13 +213,14 @@ def witness_a(t):
 def check_a1_lock_scoped_to_impl(t):
     impl = t["impl_fn"]
     stage = t["stage_fn"]
+    lock = LOCK_RE.search(impl)
     return (
         impl != ""
         and stage != ""
-        and LOCK_STMT in impl
+        and lock is not None
         and PLAN_STORE_CALL in impl
-        and impl.find(LOCK_STMT) < impl.find(PLAN_STORE_CALL)
-        and LOCK_STMT not in stage
+        and lock.start() < impl.find(PLAN_STORE_CALL)
+        and LOCK_RE.search(stage) is None
     )
 
 

@@ -336,7 +336,8 @@ def impl_first_publish_wrong(source):
     if impl is None:
         return True
     r = impl.find("ggml_sycl_reserve_host_tenants(")
-    l1 = impl.find("std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex)")
+    l1_lock = re.search(r"std::lock_guard(?:<[^<>]*>)?\s+lock\s*\(\s*g_tensor_inventory_mutex\s*\)", impl)
+    l1 = l1_lock.start() if l1_lock else -1
     inner = impl.find("ggml_sycl_run_runtime_context_transaction(")
     inst = impl.find("ggml_sycl_host_tenants_install(")
     return not (0 <= r < inst < l1 and inst < inner and impl.count("ggml_sycl_host_tenants_install(") == 1)
@@ -1940,13 +1941,13 @@ def mutations(header_raw, source):
                          header_raw.replace(line, "", 1), src))
     for label, msg, old, new in pairs:
         if label == "the first publish reserves under L1":
-            lock = ("        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);\n"
+            lock = ("        std::lock_guard lock(g_tensor_inventory_mutex);\n"
                     "        const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id")
             if src.count(old) != 1 or src.count(lock) != 1:
                 muts.append(("PATTERN NOT FOUND: " + label, "PATTERN", header_raw, src))
             else:
                 moved = src.replace(old, new, 1).replace(
-                    lock, "        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);\n"
+                    lock, "        std::lock_guard lock(g_tensor_inventory_mutex);\n"
                           "        (void) ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, refusal_under_l1);\n"
                           "        const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id", 1)
                 muts.append((label, msg, header_raw, moved))
