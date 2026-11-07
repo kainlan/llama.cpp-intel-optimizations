@@ -74,8 +74,9 @@ struct lazy_io_engine {
 };
 
 struct lazy_reap_node {
-    lazy_io_pool *   pool = nullptr;  // a back-pointer while the pool lives; the owning pointer once it is parked
-    lazy_reap_node * next = nullptr;
+    lazy_io_pool *   pool           = nullptr;  // a back-pointer while the pool lives; the owning pointer once parked
+    lazy_reap_node * next           = nullptr;
+    uint64_t         leases_at_reap = 0;        // the leases the FULL reap found on the parked pool, which must be 0
 };
 
 struct lazy_io_pool {
@@ -291,6 +292,11 @@ void ring_lease::reset() noexcept {
     if (g_lazy_pool == pool) {
         g_lazy_pool = nullptr;
     }
+    // A pool that parked before has no node to give: a take joined it on the reap list, a defect the FULL reap
+    // reports, and it stays where that left it, parked or leaked.
+    if (pool->node == nullptr) {
+        return;
+    }
     lazy_reap_node * node = pool->node.release();
     node->next            = g_lazy_reap_list;
     g_lazy_reap_list      = node;
@@ -318,6 +324,18 @@ ring_lease lazy_io_pool_take() {
             if (g_lazy_shut_down.load(std::memory_order_relaxed)) {
                 return ring_lease();
             }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            // TAKE_IGNORES_DYING: with the slot empty, the take joins a parked pool whose ring is still held, as a take
+            // blind to DYING would, and clears the flag it ignores, so the pool reads live to the lease's clone.
+            if (g_lazy_pool == nullptr && g_lazy_reap_list != nullptr && g_lazy_reap_list->pool->ring != nullptr &&
+                lazy_ring_mutant_is(lazy_ring_mutant::TAKE_IGNORES_DYING)) {
+                lazy_io_pool * parked = g_lazy_reap_list->pool;
+                parked->dying         = false;
+                parked->leases.fetch_add(1, std::memory_order_relaxed);
+                lazy_snapshot_take_locked();
+                return ring_lease(parked);
+            }
+#endif
             if (g_lazy_pool != nullptr) {
                 g_lazy_pool->leases.fetch_add(1, std::memory_order_relaxed);
                 lazy_snapshot_take_locked();
@@ -451,12 +469,34 @@ void lazy_reap_full_pass() {
         hold(hold_ctx);
     }
 #endif
-    lazy_reap_node * list = nullptr;
+    lazy_reap_node * list   = nullptr;
+    lazy_reap_node * leased = nullptr;  // parked pools a take joined, reported and leaked
     {
         std::lock_guard lock(g_lazy_registry_mutex);
         list                = g_lazy_reap_list;
         g_lazy_reap_list    = nullptr;
         g_lazy_parked_nodes = 0;
+        // A parked pool's count is 0 (§3.3): its last drop parked it, and a take never joins a parked pool. One still
+        // holding a lease was joined after it parked, a defect, and freeing it would free memory that lease points at,
+        // so it is taken off the list and leaked.
+        for (lazy_reap_node ** link = &list; *link != nullptr;) {
+            lazy_reap_node * node = *link;
+            node->leases_at_reap  = node->pool->leases.load(std::memory_order_relaxed);
+            if (node->leases_at_reap == 0) {
+                link = &node->next;
+                continue;
+            }
+            *link      = node->next;
+            node->next = leased;
+            leased     = node;
+        }
+    }
+    while (leased != nullptr) {
+        lazy_reap_node * next = leased->next;
+        GGML_LOG_WARN("[HOST-PLAN-BUG] reap found a parked pool holding %llu lease(s), want 0\n",
+                      (unsigned long long) leased->leases_at_reap);
+        delete leased;
+        leased = next;
     }
     while (list != nullptr) {
         lazy_reap_node * next = list->next;
