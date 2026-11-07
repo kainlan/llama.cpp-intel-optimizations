@@ -1066,13 +1066,32 @@ shard 2 (tensors); Appendix A.1:
   `GGML_SYCL_GRAPH_DIAG` counts both kinds (`:632-660`, printed at `:794-830`).
 ### 2.4 The storage under the table (measured)
 
-> **Dated note, 2026-11-01.** The figures in this section were measured on
-> bcachefs over USB. `/models` has since moved to XFS per drive under mergerfs,
-> with the Qwen3.8 Q8_0 files on the NVMe. The figures are history for the old
-> layout. Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md`
-> re-pins them.
+> **Dated note, 2026-11-06.** `/models` moved to XFS per drive under mergerfs, and the Qwen3.8 Q8_0 files now sit on the
+> Kingston NVMe under the branch `/mnt/models-nvme`. The table below sets the 2026-11-06 probes of the Qwen3.8 Q8_0
+> table beside the 2026-09-26 probes of the bcachefs layout. The bcachefs description and the bullets after the table
+> describe the old layout and stand as history.
 
-`/models` is bcachefs with three members (sysfs
+Measured 2026-11-06 on the NVMe branch (XFS, `/dev/nvme1n1`, the Kingston OM3PDP3512B). The file was cold by
+`POSIX_FADV_DONTNEED` with `fincore` at 0 pages before each probe, and the load average was 12-14. Latencies are per 4
+KiB read; the batch rows are a batch of 16 rows (`T_ticket`) or of 7100 rows.
+
+| probe | bcachefs over USB, 2026-09-26 | NVMe, XFS, 2026-11-06 |
+|---|---|---|
+| fio `io_uring` `O_DIRECT` 4 KiB randread, QD1 | 1389 IOPS, p50 0.48 ms, p99 2.7 ms | 7398 IOPS, p50 144 us, p99 253 us |
+| fio, QD16 | 7815 IOPS, p50 1.8 ms, p99 6.8 ms | 63757 IOPS, p50 224 us, p99 651 us |
+| fio, QD64 (the §8.1 control) | 9124 IOPS, p50 5.7 ms, p99 25 ms | 69706 IOPS, p50 897 us, p99 1597 us |
+| sequential 1 MiB `O_DIRECT` | 1.78 GB/s | 2.24 GB/s (QD8) |
+| batch of 16, 16 workers: `T_ticket` mean, p99 | 3.75 ms, 13.0 ms | 0.40 ms, 0.63 ms |
+| batch of 7100, 64 workers: rows/s (batch time) | 8344 (0.85 s) | 68887 (103.07 ms) |
+
+us = microseconds, ms = milliseconds.
+
+The 2026-11-01 run of the same probes on the same layout gave 7389 IOPS at QD1, 61492 at QD16, 69507 at QD64, 68884
+rows/s for the batch of 7100, and a batch-16 `T_ticket` of mean 0.41 ms, p99 0.65 ms. The differences from the table are
+run-to-run noise under host load, and the table keeps the 2026-11-06 run. The §5.1 NVMe columns carry the same figures.
+The batch of 7100 reaches 68887 rows/s against the 69706 IOPS QD64 control, a ratio of 0.99.
+
+`/models` was bcachefs with three members (sysfs
 `/sys/fs/bcachefs/118129b2-.../dev-*`, and `bcachefs fs usage`):
 
 | dev | label | block device | link | user data | cached data |
@@ -3331,6 +3350,26 @@ HOST). Main-pool chunk rounding (0-2 GiB) is excluded, as everywhere here.
   the DeepSeek size). After sgc5 it adds the non-weight terms again, 5.5-15.4
   GiB, and moves the threshold up by as much (*lead ruling §T6*, m-8).
 
+**Measured on the dry-run, 2026-11-06** (Qwen3.8-Flash-Next Q8_0, the first of
+six splits on `/mnt/models-nvme`; tree `integ/th32` at `2cd9d311e`, Tasks 1-15,
+with Task 11's `llama-sycl-plan-dry-run`; `budget_pct` 90 of `MemTotal`
+246.9 GiB; printed figures from the 2026-11-06 dry-run). The rows are the planner's printed
+figures in MB, as printed. The derived model above is unchanged.
+
+| run | `host_budget` | device | FILE_MAPPED | `expected_host` | lazy tables | verdict |
+|---|---:|---:|---:|---:|---|---|
+| B70 only (`level_zero:0`), live `MemAvailable` 213.0 GiB | 209951.6 | 28737.7 | 99116.3 | 6144.0 | `tables=0`, `ring=0` | fits |
+| B70 only, `--mem-available` 171.4 GiB | 167321.6 | 28737.7 | 99116.3 | 6144.0 | `tables=0`, `ring=0` | fits |
+| B70 only, `--mem-available` 181.8 GiB | 177971.2 | 28737.7 | 99116.3 | 6144.0 | `tables=0`, `ring=0` | fits |
+| B70 only, `--mem-available` 183.7 GiB | 179916.8 | 28737.7 | 99116.3 | 6144.0 | `tables=0`, `ring=0` | fits |
+| B70 only, `--mem-available` 190.4 GiB | 186777.6 | 28737.7 | 99116.3 | 6144.0 | `tables=0`, `ring=0` | fits |
+| B70 only, `-lzm off`, `--mem-available` 171.4 GiB | 167321.6 | not in the posted figures | 150996.4 | 159744.0 | eager, `eligible=0` | fits |
+| both cards (`level_zero:0,1`), live `MemAvailable` 213.4 GiB | 210346.9 | 40875.4, both cards | 84150.0 | 6144.0 | `tables=0` | `PLACEMENT-BLOCK`, `no-compatible-gpu-capacity` |
+
+The both-cards run also charges 2843.3 MB to host and prints `CPU_OWNED` 2667.9 MB and `kv_host_bytes` 10.1 MB. The
+dry-run prints `LAZY tables=0` and `ring_need=0` at every reading although the 51880 MiB table is recorded
+`deferral=STORAGE` (`llama.cpp-8v67`).
+
 **DeepSeek Q2_K, the planner's fit** (`MemAvailable - 8`; the verdicts are
 after (s)):
 
@@ -3429,21 +3468,23 @@ the reading changes `C`, not the caches.
 
 Both engines were measured over the table's byte range (Appendix A.2):
 
-| engine | concurrency | rows/s | per-row latency |
-|---|---|---:|---|
-| mmap faults (upstream path), `MADV_RANDOM` | 1 thread | 1555 | mean 0.64 ms, p99 2.3 ms |
-| mmap faults | 16 threads | 7866 | mean 2.0 ms, p99 7.3 ms |
-| mmap faults | 24 threads | 7370 | mean 3.3 ms, p99 17.7 ms |
-| fio `O_DIRECT` `io_uring` 4 KiB | QD1 | 1389 | p50 0.48 ms, p99 2.7 ms |
-| fio `O_DIRECT` `io_uring` 4 KiB | QD16 | 7815 | p50 1.8 ms, p99 6.8 ms |
-| fio `O_DIRECT` `io_uring` 4 KiB | QD64 | 9124 | p50 5.7 ms, p99 25 ms |
-| pread pool, `O_DIRECT` 4/8 KiB | 64 workers | 8344 | (batch of 7100: 0.85 s) |
+| engine | concurrency | bcachefs over USB, 2026-09-26: rows/s, per-row latency | NVMe, XFS, 2026-11-06: rows/s, per-row latency |
+|---|---|---|---|
+| mmap faults (upstream path), `MADV_RANDOM` | 1 thread | 1555, mean 0.64 ms, p99 2.3 ms | not re-measured |
+| mmap faults | 16 threads | 7866, mean 2.0 ms, p99 7.3 ms | not re-measured |
+| mmap faults | 24 threads | 7370, mean 3.3 ms, p99 17.7 ms | not re-measured |
+| fio `O_DIRECT` `io_uring` 4 KiB | QD1 | 1389, p50 0.48 ms, p99 2.7 ms | 7398, p50 144 us, p99 253 us |
+| fio `O_DIRECT` `io_uring` 4 KiB | QD16 | 7815, p50 1.8 ms, p99 6.8 ms | 63757, p50 224 us, p99 651 us |
+| fio `O_DIRECT` `io_uring` 4 KiB | QD64 | 9124, p50 5.7 ms, p99 25 ms | 69706, p50 897 us, p99 1597 us |
+| pread pool, `O_DIRECT` 4/8 KiB | 64 workers | 8344, (batch of 7100: 0.85 s) | 68887, (batch of 7100: 103.07 ms) |
 
-**The device ceiling is the same for every engine.** On this filesystem the
-bottleneck is the 256 KiB extent bounce onto USB links, not the syscall
-mechanism (bcachefs layout, history; see the §2.4 note). The choice of engine
-therefore rests on *timing*, *ownership* and *accounting*, and on all three
-`O_DIRECT` prefetch wins:
+The mmap page-fault probe was not rerun on the NVMe layout, so its rows keep
+their 2026-09-26 figures.
+
+**The device ceiling is the same for every engine.** On the old bcachefs layout the bottleneck was the 256 KiB extent
+bounce onto USB links, not the syscall mechanism (bcachefs layout, history; see the §2.4 note). On the NVMe the same
+parity holds: fio at QD64 read 69706 IOPS and the pread pool 68887 rows/s. The choice of engine therefore rests on
+*timing*, *ownership* and *accounting*, and on all three `O_DIRECT` prefetch wins:
 
 1. **Timing.** A fault happens inside `get_rows`, on a compute thread, *after*
    the graph reached the node, and at an effective QD of however many
@@ -5806,17 +5847,17 @@ is the one per-model hook. Model code is untouched apart from
 
 ## 8. Pre-registered speed targets (item 6)
 
-> **Dated note, 2026-11-01.** The targets below were derived from figures
-> measured on bcachefs over USB. `/models` has since moved to XFS per drive
-> under mergerfs, with the Qwen3.8 Q8_0 files on the NVMe. The targets are
-> history for the old layout. Task 27 of
-> `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md` re-pins them.
+> **Dated note, 2026-11-06.** The targets in §8.2 and §8.3 were re-pinned on 2026-11-06 for the NVMe layout. `/models`
+> moved to XFS per drive under mergerfs, and the Qwen3.8 Q8_0 table sits on the Kingston NVMe. The NVMe figures are from
+> the 2026-11-06 probe run, and the dry-run inputs of §4.5 are from the 2026-11-06 dry-run. The bcachefs targets stay
+> beside them as the history of the old layout. Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md` is
+> the plan record.
 
-Every target below is derived from the numbers measured in §2.4, §5 and §6.2 on
-this host, bcachefs as-is, under ambient load. The implementer measures against
-them with the counters in §10; the lead runs every GPU part, one run at a time,
-selector pinned, `Shmem`/`MemAvailable` sampled before and ~5 s after. Qwen's
-targets are §8.2-8.3; DeepSeek's, the harder case, are §8.4.
+Every target below is derived from the numbers measured in §2.4, §5 and §6.2 on this host under ambient load. The §8.2
+and §8.3 targets use the NVMe figures of the 2026-11-06 probe run, and their bcachefs targets are kept as history. The
+implementer measures against them with the counters in §10; the lead runs every GPU part, one run at a time, selector
+pinned, `Shmem`/`MemAvailable` sampled before and ~5 s after. Qwen's targets are §8.2-8.3; DeepSeek's, the harder case,
+are §8.4.
 
 ### 8.1 Arms, positive controls and instruments
 
@@ -5925,47 +5966,59 @@ from a completed plan, not a refusal, and the S arm still runs and must pass.
 - The IO count and bytes, the hit and miss counts (§10), and end-to-end
   `llama-bench`, `llama-perplexity` on wikitext-2 test, and the decode vehicle
   (§8.5).
-- **The engine rate is a ratio, never an absolute** (I6, M12).
-  `rows_miss_reads / T_io` over a cold PP512 ubatch, divided by the IOPS of a
-  **same-session fio QD64 control on the same extent**, run immediately before
-  and after the arm (Appendix B, `io_probe2.sh` with `FOFF` at the table's
-  offset). The ratio must be **>= 0.9**; the pool measured 0.99 against the
-  bracketing controls (§2.4). If the two controls differ by more than 20%, the
-  ceiling moved during the arm and the run is void, not scored. Each arm
-  records the per-device `io_done` and write deltas from `/proc/diskstats` for
-  its duration, so that fresh (NVMe-foreground) and settled (backing-device)
-  placement are told apart: during the `blk.1` probes the NVMe wrote 7.5 GB in
-  15 s at 4657 IOPS, and 0.4-0.5 GB at 7070-7242 two minutes later.
+- **The engine rate is a ratio, never an absolute** (I6, M12). `rows_miss_reads / T_io` over a cold PP512 ubatch,
+  divided by the IOPS of the **same-session fio QD64 control on the same extent**, the QD64 runs immediately before and
+  after the arm (Appendix B, `io_probe2.sh` with `FOFF` at the table's offset). The bracket is in time, and both
+  controls are QD64. The ratio must be **>= 0.9**. Their agreement within 20% is the validity check: if the two controls
+  differ by more than 20%, the ceiling moved during the arm and the run is void, not scored. On the 2026-11-06 NVMe run
+  the pool read 68887 rows/s against the QD64 control of 69706 IOPS, a ratio of 0.99. On the 2026-09-26 bcachefs run the
+  pool measured 0.99 against its bracketing QD64 controls (§2.4). Each arm records the per-device `io_done` and write
+  deltas from `/proc/diskstats` for its duration, so that fresh (NVMe-foreground) and settled (backing-device) placement
+  are told apart: during the `blk.1` probes the NVMe wrote 7.5 GB in 15 s at 4657 IOPS, and 0.4-0.5 GB at 7070-7242 two
+  minutes later.
 - **Concurrent expert IO** (*lead ruling §T4*, I-4). On DeepSeek, every arm
   also records the cold-expert reads that shared the device in the same
   window: `llama.cpp-yl3v`'s read and byte counters, per ubatch and per decode
   token, next to the engram counters. Without that record, an engram latency
   measured on the shared device cannot be told apart from contention.
 - **Scaling rule for latency targets.** The latency targets below were measured
-  with the control at 4657-7242 IOPS. When an arm's bracketing control reads
+  with the QD64 control at 4657-7242 IOPS. When an arm's QD64 control reads
   below 4657, each latency bound is multiplied by `4657 / control`.
 
 ### 8.2 Qwen decode
 
-| arm | target | derived from |
-|---|---|---|
-| H | `T_gather` <= **20 us/token** (the worker's gather time); tg128 within **1%** of `--lazy-mode off` (scored on that arm's second run, its table pages resident) | measured 4.2 us for 16 rows including dequant |
-| S-cold | `T_ticket` mean <= **4.3 ms/token**, p99 <= **15 ms** | batch of 16: mean 3.75 ms, p99 13.0 ms (A.2), + 15% |
-| S-warm | mean `T_ticket` <= **(1 - P0) x 4.3 ms**, where P0 is the steady-state zero-miss share at the *planned* `cache_slots` (§8.5): prose 32-43%, mixed 63-68%. This is a ceiling, not a discriminator (M13); the runtime-versus-simulation match of §8.5 is the discriminator | §6.2.1 |
-| S-hot | `T_ticket == 0` on **>= 99%** of tokens | every row hits |
+Targets are re-derived on 2026-11-06 from the NVMe batch-16 latency of the 2026-11-06 probe run. The bcachefs column
+keeps the 2026-09-26 targets. Each formula is unchanged. The NVMe bounds of this section round in the safe direction:
+upper bounds on times round up, and lower bounds on throughput round down, at the last digit shown.
+
+| arm | target, NVMe, 2026-11-06 | target, bcachefs over USB, 2026-09-26 | derived from |
+|---|---|---|---|
+| H | `T_gather` <= **20 us/token** (the worker's gather time); tg128 within **1%** of `--lazy-mode off` (scored on that arm's second run, its table pages resident). Unchanged: not storage-derived | the same | measured 4.2 us for 16 rows including dequant |
+| S-cold | `T_ticket` mean <= **0.46 ms/token** (0.40 x 1.15), p99 <= **0.73 ms** (0.63 x 1.15 = 0.7245, rounded up) | `T_ticket` mean <= **4.3 ms/token** (3.75 x 1.15), p99 <= **15 ms** (13.0 x 1.15) | batch of 16 with 16 workers, `T_ticket`: mean 0.40 ms and p99 0.63 ms (NVMe); mean 3.75 ms and p99 13.0 ms (A.2), each + 15% |
+| S-warm | mean `T_ticket` <= **(1 - P0) x 0.46 ms**, where P0 is the steady-state zero-miss share at the *planned* `cache_slots` (§8.5): prose 32-43% gives **0.27-0.32 ms**; mixed 63-68% gives **0.15-0.18 ms**. This is a ceiling, not a discriminator (M13); the runtime-versus-simulation match of §8.5 is the discriminator | mean `T_ticket` <= **(1 - P0) x 4.3 ms**, where P0 is the steady-state zero-miss share at the *planned* `cache_slots` (§8.5): prose 32-43%, mixed 63-68%. This is a ceiling, not a discriminator (M13); the runtime-versus-simulation match of §8.5 is the discriminator | §6.2.1; P0 unchanged, the S-cold mean re-derived |
+| S-hot | `T_ticket == 0` on **>= 99%** of tokens. Unchanged | the same | every row hits |
+
+The §8.1 scaling rule does not apply on the NVMe, because the QD64 control,
+69706 IOPS, is above 4657, so no latency bound is multiplied.
 
 Expressed as throughput: `tg_S >= 1 / (1/tg_H + T_stall)`. If H decodes at
-20 tok/s (50 ms per token), S-cold must decode at **>= 18.4 tok/s**.
+20 tok/s (50 ms per token), S-cold must decode at **>= 19.8 tok/s** on the
+NVMe (1000 / (50 + 0.46) = 19.82, rounded down), against **>= 18.4 tok/s** on bcachefs (1000 / (50 + 4.3)).
 
 ### 8.3 Qwen PP512
 
-| arm | target | derived from |
-|---|---|---|
-| H | `T_gather` <= **3 ms/ubatch**; pp512 within **1%** of `--lazy-mode off` | measured ~2 ms for 8192 rows |
-| S-cold | engine ratio >= **0.9** (§8.1); `T_ticket` <= **1.15 x U / (0.9 x control IOPS)**: at the r1 control (9124), real text (U 7028-7104) <= **1.0 s**, `llama-bench` random (U 8116-8192) <= **1.15 s** | §5.1, §6.2.1 |
-| S-warm | the same formula with `U` from the simulation at the planned `cache_slots`: prose (512 MiB) 4335 -> **<= 0.6 s**; mixed (512 MiB) 2275 -> **<= 0.32 s** | §6.2.1 |
-| S-hot | `T_ticket == 0` | |
-| phase 2 lookahead, multi-ubatch prompt | stall of ubatch `k >= 2` <= `max(0, IO(k) - compute(k-1)) + 10%` | §5.4 |
+The control IOPS is the same-session QD64 control of §8.1: 69706 on the NVMe in
+the 2026-11-06 probe run, against 9124 on bcachefs. The QD16 probe, 63757 IOPS, is not an input
+to any target here. The engine ratio, 68887 rows/s over 69706 IOPS, is 0.99.
+The NVMe time bounds of this section are rounded up to the third decimal place, never down.
+
+| arm | target, NVMe, 2026-11-06 | target, bcachefs over USB, 2026-09-26 | derived from |
+|---|---|---|---|
+| H | `T_gather` <= **3 ms/ubatch**; pp512 within **1%** of `--lazy-mode off`. Unchanged: not storage-derived | the same | measured ~2 ms for 8192 rows |
+| S-cold | engine ratio >= **0.9** (§8.1; 68887 / 69706 = 0.99). `T_ticket` <= **1.15 x U / (0.9 x 69706)**: real text (U 7028-7104) <= **0.131 s** (1.15 x 7104 / 62735 = 0.1302), `llama-bench` random (U 8116-8192) <= **0.151 s** (1.15 x 8192 / 62735 = 0.1502) | engine ratio >= **0.9** (§8.1). `T_ticket` <= **1.15 x U / (0.9 x 9124)**: real text (U 7028-7104) <= **1.0 s**, `llama-bench` random (U 8116-8192) <= **1.15 s** | §5.1, §6.2.1 |
+| S-warm | the same formula with `U` from the simulation at the planned `cache_slots`: prose (512 MiB) 4335 -> **<= 0.080 s** (1.15 x 4335 / 62735 = 0.0795); mixed (512 MiB) 2275 -> **<= 0.042 s** (1.15 x 2275 / 62735 = 0.0417) | the same formula, `U` from the same simulation: prose 4335 -> **<= 0.6 s**; mixed 2275 -> **<= 0.32 s** | §6.2.1 |
+| S-hot | `T_ticket == 0`. Unchanged | the same | |
+| phase 2 lookahead, multi-ubatch prompt | stall of ubatch `k >= 2` <= `max(0, IO(k) - compute(k-1)) + 10%`. Unchanged | the same | §5.4 |
 
 Expressed as throughput: `pp_S >= 512 / (512/pp_H + T_stall)`.
 
