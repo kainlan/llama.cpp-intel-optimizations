@@ -2139,7 +2139,7 @@ typedef struct ggml_sycl_plan_dry_run_result {
     uint64_t                    committed_bytes;
     uint32_t                    budget_pct;
     uint32_t                    mem_available_from_opts;  // 1: mem_available_bytes is the option's
-    uint32_t                    host_reserve_override;    // 1: an accepted GGML_SYCL_HOST_RESERVE_MB is the budget
+    uint32_t                    host_reserve_override;    // 1: an accepted GGML_SYCL_HOST_RESERVE_MB caps the budget
     uint32_t                    n_plans;
     uint64_t                    host_budget;  // host_ledger_compute_budget of the sample and committed_bytes
     uint64_t                    device_budget_bytes[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES];  // each device's VRAM budget
@@ -2537,7 +2537,8 @@ enum ggml_sycl_test_host_ledger_point {
 typedef int32_t (*ggml_sycl_test_host_ledger_hook_fn)(int32_t point, int32_t arg);
 // Sets (fn) or clears (NULL) the point's hook. Returns false, and changes nothing, for an unknown point.
 GGML_BACKEND_API bool ggml_sycl_test_host_ledger_hook(int32_t point, ggml_sycl_test_host_ledger_hook_fn fn);
-// Seeds the stored budget without counting a store, so a store count read after seeding is still 0.
+// Seeds the stored budget without counting a store, so a store count read after seeding is still 0. The seeded budget
+// is not the headroom refusal: the refusal's flag is cleared, and the stored sample's figures are kept.
 GGML_BACKEND_API void ggml_sycl_test_host_ledger_store_budget(uint64_t budget);
 // The committed bytes; the budget stores made by the pass scope's store (the setter's are not counted); and the sum of
 // charged_bytes over the live HOST_CPU registry rows. Each returns false, writing nothing, for a null pointer.
