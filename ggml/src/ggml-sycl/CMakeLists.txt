@@ -8649,8 +8649,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         "the entry reap left the ring parked")
     string(CONCAT _lrp_re_snapshot_carries_lease
         "FAIL a model swap gives A's ring back at A's teardown with no witnessed lock held: "
-        "(after A's unload: [0-9]+ live pools, [0-9]+ leases, [0-9]+ parked, want 0, 0, 0"
-        "|A's ring lease was dropped with a witnessed lock held)")
+        "with A loaded and its ring made: 1 live pools, 2 leases, 0 parked, want 1, 1, 0")
     string(CONCAT _lrp_re_take_ignores_dying
         "FAIL a read's last drop between the stage's entry reap and its take parks, and the take builds anew: "
         "model B's early plan charged ring=0, want [0-9]+: the take joined the parked pool")

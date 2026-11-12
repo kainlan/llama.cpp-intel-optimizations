@@ -342,9 +342,11 @@ arm_result arm_failed_load() {
 // ring's LAZY_STAGING bytes back, and the lease was dropped with no witnessed lock held: no "[HOST-PLAN-BUG] ring lease
 // dropped with" line and no count. Model B, with no STORAGE table, then plans with no ring live, and model W, whose
 // table's span is twice A's, plans normally: no decline line, and ring= its own mapped need.
+// At rest the pool counts one lease per record (§3.3), so before the unload A's record holds the only one.
 // Engagement: A loads and ensures, B and W stage.
-// Mutant: snapshot-carries-lease, under which the published snapshot holds a lease on the pool: A's ring stays live
-// past A's unload, or the lease drops under g_tensor_inventory_mutex, where the witness trips.
+// Mutant: snapshot-carries-lease, under which the published snapshot holds a second lease on the pool, so the census
+// before the unload counts two. The unload alone need not show it: another holder of the snapshot, the MoE workspace
+// registry, can drop the last copy outside every witnessed lock and before the teardown reap, and the ring goes back.
 arm_result arm_swap() {
     arm_result       r;
     lazy_inventory   inv_a("blk.1.swap_a.weight", k_ne0_8k, k_huge_table);
@@ -362,6 +364,8 @@ arm_result arm_swap() {
         return settle(r, role0);
     }
     const lazy_registry_state s0 = registry();
+    expect(r, registry_is(s0, 1, 1, 0),
+           "with A loaded and its ring made: " + describe(s0) + ", want 1, 1, 0: one lease, A's record's");
     log_clear();
     const ggml_sycl_lifecycle_result rc = ggml_backend_sycl_model_unloaded_token(a.token);
     const lazy_registry_state        s1 = registry();
@@ -573,6 +577,10 @@ void child_setup(const char * tag, child_model & m) {
     if (!ggml_backend_sycl_moe_multi_gpu_requested()) {
         child_exit(tag, "void: the planner caller takes its single-device path", SYCL_TEST_SKIP);
     }
+    // A child leaves main before main installs the capture, and load_model reads each stage's ring from the captured
+    // [HOST-PLAN] lazy line, so the child installs its own. capture_log echoes every line to stderr, where the parent
+    // scores the child.
+    ggml_log_set(capture_log, nullptr);
     for (int d = 0; d < ggml_backend_sycl_get_device_count(); ++d) {
         m.backends.push_back(ggml_backend_sycl_init(d));
         if (m.backends.back() == nullptr) {
