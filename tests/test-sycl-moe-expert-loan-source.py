@@ -129,8 +129,9 @@ gate pins:
   - the cache's checks stay as the guards: a host copy smaller than its device entry, and device storage not exactly
     the lent copy's size, are still refused.
 
-Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
-mutant that must make it fail.
+Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, where a
+guard on g_tensor_inventory_mutex reads the same with or without its template argument, and has a mutant that must make
+it fail.
 
 Pytest-style (module-level test_* functions): register with llama_test_pytest.
 """
@@ -161,15 +162,22 @@ def strip_cmake_comments(src: str) -> str:
     return re.sub(r"#[^\n]*", "", src)
 
 
+# A guard on g_tensor_inventory_mutex with its template argument spelled out, which norm reads in the deduced spelling
+# the claims name: they pin that the lock is taken, not how its type is spelled, as the other gates read it.
+_INVENTORY_GUARD_RE = re.compile(r"std::(lock_guard|unique_lock) ?<[^<>;]*> ?(\w+)\(g_tensor_inventory_mutex\)")
+
+
 def norm(text: str) -> str:
     """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so neither a clang-format
-    re-wrap nor a re-split format string can turn a claim red."""
+    re-wrap nor a re-split format string can turn a claim red, and every guard on g_tensor_inventory_mutex in its
+    deduced spelling, so neither can a guard that names its template argument."""
     t = re.sub(r"\s+", " ", strip_comments(text))
     t = re.sub(r"\( ", "(", t)
     t = re.sub(r" \)", ")", t)
     t = re.sub(r" ,", ",", t)
     t = re.sub(r",(?! )", ", ", t)
     t = re.sub(r'(?<!\\)" "', "", t)
+    t = _INVENTORY_GUARD_RE.sub(r"std::\1 \2(g_tensor_inventory_mutex)", t)
     return t
 
 
@@ -2422,6 +2430,37 @@ def test_mutant_refill_ignores_a_loan_between_select_and_lock_fails():
 
 def test_mutant_arming_skips_the_inventory_lock_fails():
     assert not claim_ledger_is_guarded_by_the_inventory_mutex(_once_in(SYCL, ARM_SIG, LEDGER_LOCK, ";"))
+
+
+TEMPLATED_INVENTORY_LOCK = "std::unique_lock<ggml_sycl::witnessed_mutex> lock(g_tensor_inventory_mutex);"
+TEMPLATED_LEDGER_LOCK = "std::lock_guard<ggml_sycl::witnessed_mutex> lock(g_tensor_inventory_mutex);"
+
+
+def _templated_inventory_guards(text: str) -> str:
+    """`text` with every guard on g_tensor_inventory_mutex naming its template argument."""
+    return re.sub(r"std::(lock_guard|unique_lock)(\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\))",
+                  r"std::\1<ggml_sycl::witnessed_mutex>\2", text)
+
+
+def test_templated_inventory_guards_pass():
+    """Every claim that reads the inventory lock passes on the tree with each guard on g_tensor_inventory_mutex
+    spelled with its template argument, and the lock-order and ledger mutants still fail there."""
+    sycl = _templated_inventory_guards(SYCL)
+    assert TEMPLATED_INVENTORY_LOCK in sycl and TEMPLATED_LEDGER_LOCK in sycl
+    assert INVENTORY_LOCK not in sycl and LEDGER_LOCK not in sycl
+    assert claim_lock_order(CACHE, sycl)
+    assert claim_loan_runs_at_the_graph_boundary(sycl)
+    assert claim_a_loan_without_host_zones_is_refused(CACHE, sycl)
+    assert claim_probe_changes_nothing_and_a_loan_publishes_once(sycl)
+    assert claim_exception_publishes_what_was_lent(sycl)
+    assert claim_one_body_two_directions(sycl)
+    assert claim_refill_lock_order(CACHE, sycl)
+    assert claim_ledger_is_guarded_by_the_inventory_mutex(sycl)
+    assert claim_an_unpreparable_triplet_leaves_the_ledger(sycl)
+    assert claim_an_unengaged_prompts_loan_comes_back_at_once(sycl)
+    assert claim_an_ended_contexts_loan_comes_back_at_the_next_context(sycl)
+    assert not claim_lock_order(CACHE, _once_in(sycl, TXN_SIG, INVENTORY_LOCK, ""))
+    assert not claim_ledger_is_guarded_by_the_inventory_mutex(_once_in(sycl, ARM_SIG, LEDGER_LOCK, ";"))
 
 
 def test_mutant_boundary_writes_the_ledger_unlocked_fails():
