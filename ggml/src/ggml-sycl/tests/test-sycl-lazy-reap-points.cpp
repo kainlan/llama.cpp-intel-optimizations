@@ -875,10 +875,12 @@ arm_result arm_leaked() {
 // ggml_sycl_strict_enabled(), the leaked lease among them): the same never-unloaded A, in a child started under
 // GGML_SYCL_STRICT_LEASES=1, whose shutdown drain prints the one "[HOST-PLAN-BUG] leaked ring lease: model=<m>
 // load=<t>" line naming A and then aborts (SIGABRT) with one "leaked ring lease: model=<m> load=<t> under
-// GGML_SYCL_STRICT_LEASES=1" line, and the shutdown never returns. The abort's line is scored first, so the mutant's
-// FAIL line names it whatever else the child did.
+// GGML_SYCL_STRICT_LEASES=1" line, and the shutdown never returns. The shutdown's return is scored first, so the
+// mutant's FAIL line is one only a child whose shutdown ran past the drain prints. A child that died between its load
+// and the drain, whatever killed it, fails on the abort's line instead, which no registration names.
 // Engagement: the child's backends initialise and A loads and ensures under strict leases.
-// Mutant: drain-strict-abort-dropped, under which the drain logs A's lease and continues under strict leases too.
+// Mutant: drain-strict-abort-dropped, under which the drain logs A's lease and continues under strict leases too, so
+// the shutdown returns, and its registration scores that return line.
 arm_result arm_leaked_strict() {
     arm_result r;
     if (!child_engaged(r, g_leaked_strict_run, "LEAKED-STRICT-CHILD")) {
@@ -894,6 +896,8 @@ arm_result arm_leaked_strict() {
     const std::string ids   = loaded.substr(loaded.find("model="));
     const std::string warn  = "[HOST-PLAN-BUG] leaked ring lease: " + ids;
     const std::string abort = "leaked ring lease: " + ids + " under " + k_strict_setting;
+    expect(r, text_count_with(err, "LEAKED-STRICT-CHILD returned") == 0,
+           "the strict child's shutdown returned: '" + first_line_with(err, "LEAKED-STRICT-CHILD returned") + "'");
     expect(r, text_count_with(err, abort.c_str()) == 1,
            "the strict child printed " + num(text_count_with(err, abort.c_str())) + " line(s) '" + abort +
                "', want 1; its first strict line: '" + first_line_with(err, std::string(" under ") + k_strict_setting) +
@@ -904,7 +908,6 @@ arm_result arm_leaked_strict() {
     expect(r, text_count_with(err, warn.c_str()) == 1 && text_count_with(err, k_leaked) == 1,
            "the strict child printed " + num(text_count_with(err, k_leaked)) + " leaked-lease line(s), want 1 '" +
                warn + "'");
-    expect(r, text_count_with(err, "LEAKED-STRICT-CHILD returned") == 0, "the strict child's shutdown returned");
     return r;
 }
 

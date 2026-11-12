@@ -986,8 +986,10 @@ int reap_throw_child() {
 // and never returns. This process keeps the switch off, so the arms above score the same sites' WARN-and-continue
 // path.
 // Engagement: the child ran within 5 s; at the parked site, its ensure made a ring and its take joined that pool.
-// Mutant: pool-strict-abort-dropped, under which each site logs and continues under strict leases too; its
-// registration names the throwing reap's line.
+// Mutant: pool-strict-abort-dropped, under which each site logs and continues under strict leases too, so the child
+// returns from its site. One registration per site scores that site's return line: pool-strict-abort-dropped the
+// throwing reap's, and its aliases pool-strict-abort-dropped-refused, -drop and -parked (the same selector) the refused
+// reap's, the dropped lease's and the parked pool's.
 struct strict_site {
     const char * name;        // the child's site argument
     const char * warn;        // the site's one [HOST-PLAN-BUG] line
@@ -1023,7 +1025,8 @@ const strict_site k_strict_failed = {
     "under GGML_SYCL_STRICT_LEASES=1",
 };
 
-// The abort's line is scored first, so a mutant's FAIL line names it whatever else the child did.
+// The child's return is scored first, so a mutant's FAIL line is one only a child that ran past its site prints. A
+// child that died before its site, whatever killed it, fails on the abort's line instead, which no registration names.
 arm_result score_strict_site(const strict_site & site) {
     arm_result               r;
     std::vector<std::string> args = { "test-sycl-lazy-io-engine-host", k_strict_child, site.name };
@@ -1041,6 +1044,8 @@ arm_result score_strict_site(const strict_site & site) {
         void_arm(r, engaged);
         return r;
     }
+    expect(r, text_count_with(child.err, "STRICT-CHILD returned") == 0,
+           "the strict child returned from its site: '" + first_line_with(child.err, "STRICT-CHILD returned") + "'");
     const size_t      aborts     = text_count_with(child.err, site.abort, site.abort_tail);
     const std::string abort_text = site.abort_tail == nullptr ?
                                        "'" + std::string(site.abort) + "'" :
@@ -1052,7 +1057,6 @@ arm_result score_strict_site(const strict_site & site) {
            "the strict child printed " + num(text_count_with(child.err, site.warn)) + " line(s) '" + site.warn +
                "' among " + num(text_count_with(child.err, "[HOST-PLAN-BUG]")) +
                " [HOST-PLAN-BUG] line(s), want 1 and 1");
-    expect(r, text_count_with(child.err, "STRICT-CHILD returned") == 0, "the strict child returned from its site");
     return r;
 }
 
@@ -1125,7 +1129,8 @@ arm_result arm_strict_failed() {
 // before. Each runs in a child that takes the pool first, so the ensure finds a live pool: under a local witnessed
 // lock, ensure-child-lock, and, the negative control, with no lock held.
 // Engagement, VOID counting as failed: both children ended within 5 s.
-// Mutant: ensure-witness-dropped, under which the held child's ensure runs and returns ok.
+// Mutant: ensure-witness-dropped, under which the held child's ensure runs and returns ok, and its registration
+// scores that return line.
 const char * k_ensure_abort = "block_ring_ensure: the calling thread holds ensure-child-lock";
 
 arm_result arm_ensure_held_lock() {
@@ -1143,14 +1148,16 @@ arm_result arm_ensure_held_lock() {
                         " did not end within " + num(k_bound.count()) + " s");
         return r;
     }
-    // The abort's line first, so the mutant's FAIL line names it whatever else the child did.
+    // The ensure's return first, so the mutant's FAIL line is one only a held child that ran its ensure prints. A held
+    // child that died before its ensure, whatever killed it, fails on the abort's line instead, which no registration
+    // names.
+    expect(r, text_count_with(held.err, "ENSURE-CHILD returned") == 0,
+           "the held child's ensure returned: '" + first_line_with(held.err, "ENSURE-CHILD returned") + "'");
     expect(r, text_count_with(held.err, k_ensure_abort) == 1,
            "the held child printed " + num(text_count_with(held.err, k_ensure_abort)) + " line(s) '" + k_ensure_abort +
                "', want 1");
     expect(r, WIFSIGNALED(held.status) && WTERMSIG(held.status) == SIGABRT,
            "the held child ended with " + status_text(held.status) + ", want SIGABRT");
-    expect(r, text_count_with(held.err, "ENSURE-CHILD returned") == 0,
-           "the held child's ensure returned: '" + first_line_with(held.err, "ENSURE-CHILD returned") + "'");
     const bool none_ok = WIFEXITED(none.status) && WEXITSTATUS(none.status) == 0;
     expect(r,
            none_ok && text_count_with(none.err, "ENSURE-CHILD returned ok") == 1 &&
@@ -1251,15 +1258,18 @@ lazy_ring_mutant mutant_named(const char * text) {
     };
 
     static const entry table[] = {
-        { "no-ensuring",               lazy_ring_mutant::NO_ENSURING               },
-        { "ensuring-kept-on-throw",    lazy_ring_mutant::ENSURING_KEPT_ON_THROW    },
-        { "install-after-shut-down",   lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN   },
-        { "no-span-check",             lazy_ring_mutant::NO_SPAN_CHECK             },
-        { "no-alignment-check",        lazy_ring_mutant::NO_ALIGNMENT_CHECK        },
-        { "shutdown-no-wait",          lazy_ring_mutant::SHUTDOWN_NO_WAIT          },
-        { "worker-reap-destroys-pool", lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL },
-        { "pool-strict-abort-dropped", lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED },
-        { "ensure-witness-dropped",    lazy_ring_mutant::ENSURE_WITNESS_DROPPED    },
+        { "no-ensuring",                       lazy_ring_mutant::NO_ENSURING               },
+        { "ensuring-kept-on-throw",            lazy_ring_mutant::ENSURING_KEPT_ON_THROW    },
+        { "install-after-shut-down",           lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN   },
+        { "no-span-check",                     lazy_ring_mutant::NO_SPAN_CHECK             },
+        { "no-alignment-check",                lazy_ring_mutant::NO_ALIGNMENT_CHECK        },
+        { "shutdown-no-wait",                  lazy_ring_mutant::SHUTDOWN_NO_WAIT          },
+        { "worker-reap-destroys-pool",         lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL },
+        { "pool-strict-abort-dropped",         lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED },
+        { "pool-strict-abort-dropped-refused", lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED },
+        { "pool-strict-abort-dropped-drop",    lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED },
+        { "pool-strict-abort-dropped-parked",  lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED },
+        { "ensure-witness-dropped",            lazy_ring_mutant::ENSURE_WITNESS_DROPPED    },
     };
     for (const entry & e : table) {
         if (std::strcmp(e.text, text) == 0) {

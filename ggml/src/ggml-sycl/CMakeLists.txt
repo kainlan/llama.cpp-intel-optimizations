@@ -464,7 +464,10 @@ if (BUILD_TESTING)
     #
     # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
     # and the FAIL line the arm that kills it prints. Each registers test-sycl-lazy-io-engine-host-mutant-<name> on the
-    # one executable, which passes only when that line appears.
+    # one executable, which passes only when that line appears. A mutant whose arm scores a child is registered on the
+    # child's return, a line only a child that ran past its mutated site prints, never on a missing abort line, which a
+    # child that died early for any other reason prints too. The strict sites' mutant has one registration per site:
+    # pool-strict-abort-dropped (the throwing reap) and its aliases -refused, -drop and -parked, the same selector.
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         set(_le_rules "FAIL ensure allocates the need once and refuses what the plan did not charge: ")
         string(CONCAT _le_re_no_ensuring
@@ -489,22 +492,33 @@ if (BUILD_TESTING)
             "FAIL a worker's last drop leaves its pool's join to the next FULL reap: the worker's drop ran [0-9]+ "
             "join\\(s\\) on a pool worker and 1 self-join\\(s\\), want 0 and 0")
         string(CONCAT _le_re_pool_strict_abort_dropped
-            "FAIL a reap whose first step throws aborts under strict leases: the strict child printed 0 line\\(s\\) "
-            "with 'ring reap failed: the test seam's throw at the reap's first step' and "
-            "'under GGML_SYCL_STRICT_LEASES=1', want 1")
+            "FAIL a reap whose first step throws aborts under strict leases: "
+            "the strict child returned from its site: 'STRICT-CHILD returned'")
+        string(CONCAT _le_re_pool_strict_abort_dropped_refused
+            "FAIL a reap refused under a held lock aborts under strict leases: "
+            "the strict child returned from its site: 'STRICT-CHILD returned'")
+        string(CONCAT _le_re_pool_strict_abort_dropped_drop
+            "FAIL a lease dropped under a held lock aborts under strict leases: "
+            "the strict child returned from its site: 'STRICT-CHILD returned'")
+        string(CONCAT _le_re_pool_strict_abort_dropped_parked
+            "FAIL a reap finding a parked pool with a lease aborts under strict leases: "
+            "the strict child returned from its site: 'STRICT-CHILD returned'")
         string(CONCAT _le_re_ensure_witness_dropped
-            "FAIL an ensure entered holding a witnessed lock aborts naming it: the held child printed 0 line\\(s\\) "
-            "'block_ring_ensure: the calling thread holds ensure-child-lock', want 1")
+            "FAIL an ensure entered holding a witnessed lock aborts naming it: "
+            "the held child's ensure returned: 'ENSURE-CHILD returned ok'")
         set(_lazy_io_engine_mutants
-            no-ensuring               "${_le_re_no_ensuring}"
-            ensuring-kept-on-throw    "${_le_re_ensuring_kept_on_throw}"
-            install-after-shut-down   "${_le_re_install_after_shut_down}"
-            no-span-check             "${_le_re_no_span_check}"
-            no-alignment-check        "${_le_re_no_alignment_check}"
-            shutdown-no-wait          "${_le_re_shutdown_no_wait}"
-            worker-reap-destroys-pool "${_le_re_worker_reap_destroys_pool}"
-            pool-strict-abort-dropped "${_le_re_pool_strict_abort_dropped}"
-            ensure-witness-dropped    "${_le_re_ensure_witness_dropped}")
+            no-ensuring                       "${_le_re_no_ensuring}"
+            ensuring-kept-on-throw            "${_le_re_ensuring_kept_on_throw}"
+            install-after-shut-down           "${_le_re_install_after_shut_down}"
+            no-span-check                     "${_le_re_no_span_check}"
+            no-alignment-check                "${_le_re_no_alignment_check}"
+            shutdown-no-wait                  "${_le_re_shutdown_no_wait}"
+            worker-reap-destroys-pool         "${_le_re_worker_reap_destroys_pool}"
+            pool-strict-abort-dropped         "${_le_re_pool_strict_abort_dropped}"
+            pool-strict-abort-dropped-refused "${_le_re_pool_strict_abort_dropped_refused}"
+            pool-strict-abort-dropped-drop    "${_le_re_pool_strict_abort_dropped_drop}"
+            pool-strict-abort-dropped-parked  "${_le_re_pool_strict_abort_dropped_parked}"
+            ensure-witness-dropped            "${_le_re_ensure_witness_dropped}")
         add_executable(test-sycl-lazy-io-engine-host
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
             lazy-io-pool.cpp
@@ -8654,7 +8668,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     #
     # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
     # and the FAIL line of the arm that kills it, which runs alone (a child arm's mutant is planted in that child). No
-    # mutant registration carries SKIP_RETURN_CODE, for the reason the lazy-ring block gives.
+    # mutant registration carries SKIP_RETURN_CODE, for the reason the lazy-ring block gives. The strict drain's mutant
+    # is registered on its child's shutdown returning, a line only a child whose drain ran prints, never on the missing
+    # abort line, which a child that died between its load and the drain for any other reason prints too.
     string(CONCAT _lrp_re_no_entry_reap
         "FAIL a stage's entry reap frees a ring another thread parked before the stage takes its lease: "
         "B's first take ran with 1 parked node\\(s\\) after its entry reap, want 0: "
@@ -8674,8 +8690,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         "want drops_after_shut_down=0")
     string(CONCAT _lrp_re_drain_strict_abort_dropped
         "FAIL under strict leases the drain aborts at a never-erased record's leaked lease: "
-        "the strict child printed 0 line\\(s\\) 'leaked ring lease: model=[0-9]+ load=[0-9]+ "
-        "under GGML_SYCL_STRICT_LEASES=1', want 1")
+        "the strict child's shutdown returned: 'LEAKED-STRICT-CHILD returned threw=")
     set(_lazy_reap_points_mutants
         no-entry-reap              "${_lrp_re_no_entry_reap}"
         snapshot-carries-lease     "${_lrp_re_snapshot_carries_lease}"
