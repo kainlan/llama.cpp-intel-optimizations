@@ -670,6 +670,7 @@ enum class lazy_ring_mutant : uint8_t {
     SKIP_LEASE_DRAIN,                // shutdown moves no record's lease out before it marks the registry shut down
     POOL_STRICT_ABORT_DROPPED,       // the reap's and the drop's [HOST-PLAN-BUG] lines continue under strict leases
     DRAIN_STRICT_ABORT_DROPPED,      // the shutdown drain logs a leaked lease and continues under strict leases
+    ENSURE_WITNESS_DROPPED,          // ensure runs when it is entered with a witnessed lock held
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);

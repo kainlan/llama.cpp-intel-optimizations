@@ -492,6 +492,9 @@ if (BUILD_TESTING)
             "FAIL a reap whose first step throws aborts under strict leases: the strict child printed 0 line\\(s\\) "
             "'ring reap failed: the test seam's throw at the reap's first step under GGML_SYCL_STRICT_LEASES=1', "
             "want 1")
+        string(CONCAT _le_re_ensure_witness_dropped
+            "FAIL an ensure entered holding a witnessed lock aborts naming it: the held child printed 0 line\\(s\\) "
+            "'block_ring_ensure: the calling thread holds ensure-child-lock', want 1")
         set(_lazy_io_engine_mutants
             no-ensuring               "${_le_re_no_ensuring}"
             ensuring-kept-on-throw    "${_le_re_ensuring_kept_on_throw}"
@@ -500,7 +503,8 @@ if (BUILD_TESTING)
             no-alignment-check        "${_le_re_no_alignment_check}"
             shutdown-no-wait          "${_le_re_shutdown_no_wait}"
             worker-reap-destroys-pool "${_le_re_worker_reap_destroys_pool}"
-            pool-strict-abort-dropped "${_le_re_pool_strict_abort_dropped}")
+            pool-strict-abort-dropped "${_le_re_pool_strict_abort_dropped}"
+            ensure-witness-dropped    "${_le_re_ensure_witness_dropped}")
         add_executable(test-sycl-lazy-io-engine-host
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
             lazy-io-pool.cpp

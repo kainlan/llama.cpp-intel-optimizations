@@ -5,8 +5,8 @@
 // coverage pin while the first is live joins its ring and ensures nothing (another size aborts), a worker's read
 // lands in its waiter's slot, a failed read reaches the ticket with one WARN, a read's last drop on a worker frees only
 // the ring and leaves the join of the pool's workers to the next FULL reap, and shutdown cancels the queued reads and
-// waits for the picked ones. Ensure itself never aborts: under strict leases its one production caller does, and
-// test-sycl-lazy-ring scores that abort.
+// waits for the picked ones. Ensure never aborts on a refusal: under strict leases its one production caller does, and
+// test-sycl-lazy-ring scores that abort. Entered with a witnessed lock held, it aborts at its entry naming the lock.
 //
 // The lock witness (§3.3, §11 T5): a witnessed lock's depth table follows lock, try_lock, unlock, a unique_lock's
 // relock and a condition_variable_any wait; the reap refuses, naming it, when it is called with the registry's leaf
@@ -76,6 +76,10 @@ const char * k_throw_child   = "--reap-throw-child";
 
 // The strict arms' child (§10), its site the next argument and its mutant, if any, the one after.
 const char * k_strict_child = "--strict-child";
+
+// The ensure entry witness's child (§3.3, §11 T5): an ensure with a witnessed lock held when the next argument is
+// "held", with none when it is "none"; its mutant, if any, the one after.
+const char * k_ensure_child = "--ensure-holding-child";
 
 // The --mutant this process runs under, passed on to the strict children; null in a plain run.
 const char * g_mutant = nullptr;
@@ -1105,6 +1109,64 @@ arm_result arm_strict_failed() {
     strict_child_exit("returned", 0);
 }
 
+// Ensure's entry witness (§3.3, §11 T5): ensure allocates through unified_allocate_owner, which charges the budget
+// ledger and may yield, so it is called with no witnessed lock held. One entered with a lock held aborts there, before
+// it refuses, reserves or allocates anything, with one line naming the lock; one entered with none held ensures as
+// before. Each runs in a child that takes the pool first, so the ensure finds a live pool: under a local witnessed
+// lock, ensure-child-lock, and, the negative control, with no lock held.
+// Engagement, VOID counting as failed: both children ended within 5 s.
+// Mutant: ensure-witness-dropped, under which the held child's ensure runs and returns ok.
+const char * k_ensure_abort = "block_ring_ensure: the calling thread holds ensure-child-lock";
+
+arm_result arm_ensure_held_lock() {
+    arm_result               r;
+    std::vector<std::string> held_args = { "test-sycl-lazy-io-engine-host", k_ensure_child, "held" };
+    std::vector<std::string> none_args = { "test-sycl-lazy-io-engine-host", k_ensure_child, "none" };
+    if (g_mutant != nullptr) {
+        held_args.emplace_back(g_mutant);
+        none_args.emplace_back(g_mutant);
+    }
+    const child_run held = run_child_strings(held_args, child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
+    const child_run none = run_child_strings(none_args, child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
+    if (!held.ran || !none.ran) {
+        void_arm(r, std::string("the ensure child ") + (held.ran ? "with no lock held" : "holding the lock") +
+                        " did not end within " + num(k_bound.count()) + " s");
+        return r;
+    }
+    // The abort's line first, so the mutant's FAIL line names it whatever else the child did.
+    expect(r, text_count_with(held.err, k_ensure_abort) == 1,
+           "the held child printed " + num(text_count_with(held.err, k_ensure_abort)) + " line(s) '" + k_ensure_abort +
+               "', want 1");
+    expect(r, WIFSIGNALED(held.status) && WTERMSIG(held.status) == SIGABRT,
+           "the held child ended with " + status_text(held.status) + ", want SIGABRT");
+    expect(r, text_count_with(held.err, "ENSURE-CHILD returned") == 0,
+           "the held child's ensure returned: '" + first_line_with(held.err, "ENSURE-CHILD returned") + "'");
+    const bool none_ok = WIFEXITED(none.status) && WEXITSTATUS(none.status) == 0;
+    expect(r,
+           none_ok && text_count_with(none.err, "ENSURE-CHILD returned ok") == 1 &&
+               text_count_with(none.err, "block_ring_ensure: the calling thread holds") == 0,
+           "the child with no lock held ended with " + status_text(none.status) + " and printed '" +
+               first_line_with(none.err, "ENSURE-CHILD") + "', want exit 0 and 'ENSURE-CHILD returned ok'");
+    return r;
+}
+
+// The entry witness's child: a take, so the ensure finds a live pool, then the ensure, with ensure-child-lock held when
+// `held`. It prints the ensure's status and ends through _Exit with nothing torn down.
+[[noreturn]] void ensure_holding_child(bool held) {
+    ring_lease              lease = lazy_io_pool_take();
+    lazy_ring_ensure_status st    = lazy_ring_ensure_status::OK;
+    if (held) {
+        witnessed_mutex m{ GGML_SYCL_WITNESS_NAME("ensure-child-lock") };
+        std::lock_guard lock(m);
+        st = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    } else {
+        st = block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn);
+    }
+    std::fprintf(stderr, "ENSURE-CHILD returned %s\n", name(st).c_str());
+    std::fflush(stderr);
+    std::_Exit(0);
+}
+
 // The worker-drop RED (§3.3, §11 T5): model A is unloaded with a read in flight, so the read's lease is the last, and
 // its drop and WORKER reap run on a pool worker. Within 5 s the ring's bytes return to the pre-ensure figure through
 // the fixture ledger, with no FULL reap run and no join on the completion path: the pool, with its workers, waits on
@@ -1187,6 +1249,7 @@ lazy_ring_mutant mutant_named(const char * text) {
         { "shutdown-no-wait",          lazy_ring_mutant::SHUTDOWN_NO_WAIT          },
         { "worker-reap-destroys-pool", lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL },
         { "pool-strict-abort-dropped", lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED },
+        { "ensure-witness-dropped",    lazy_ring_mutant::ENSURE_WITNESS_DROPPED    },
     };
     for (const entry & e : table) {
         if (std::strcmp(e.text, text) == 0) {
@@ -1224,6 +1287,10 @@ int main(int argc, char ** argv) {
         ggml_sycl_test_lazy_ring_mutant_select(mutant);
         strict_child(argv[2], mutant);
     }
+    if ((argc == 3 || argc == 4) && std::strcmp(argv[1], k_ensure_child) == 0) {
+        ggml_sycl_test_lazy_ring_mutant_select(argc == 4 ? mutant_named(argv[3]) : lazy_ring_mutant::NONE);
+        ensure_holding_child(std::strcmp(argv[2], "held") == 0);
+    }
     if (argc == 3 && std::strcmp(argv[1], "--mutant") == 0) {
         g_mutant = argv[2];
         ggml_sycl_test_lazy_ring_mutant_select(mutant_named(argv[2]));
@@ -1235,6 +1302,7 @@ int main(int argc, char ** argv) {
         { "an ensure with no live pool refuses as unpinned",                            arm_ensure_unpinned          },
         { "a concurrent ensure refuses at once while the reserver is held",             arm_ensure_concurrent        },
         { "a throwing allocation leaves ensuring clear for the next ensure",            arm_ensure_throw             },
+        { "an ensure entered holding a witnessed lock aborts naming it",                arm_ensure_held_lock         },
         { "a worker's read lands in its waiter's slot",                                 arm_engine_read_lands        },
         { "a failed read reaches the ticket with one WARN",                             arm_engine_read_error        },
         { "a read's last drop on a worker frees only the ring",                         arm_engine_worker_reap       },
