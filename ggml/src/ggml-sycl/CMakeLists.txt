@@ -490,8 +490,8 @@ if (BUILD_TESTING)
             "join\\(s\\) on a pool worker and 1 self-join\\(s\\), want 0 and 0")
         string(CONCAT _le_re_pool_strict_abort_dropped
             "FAIL a reap whose first step throws aborts under strict leases: the strict child printed 0 line\\(s\\) "
-            "'ring reap failed: the test seam's throw at the reap's first step under GGML_SYCL_STRICT_LEASES=1', "
-            "want 1")
+            "with 'ring reap failed: the test seam's throw at the reap's first step' and "
+            "'under GGML_SYCL_STRICT_LEASES=1', want 1")
         string(CONCAT _le_re_ensure_witness_dropped
             "FAIL an ensure entered holding a witnessed lock aborts naming it: the held child printed 0 line\\(s\\) "
             "'block_ring_ensure: the calling thread holds ensure-child-lock', want 1")

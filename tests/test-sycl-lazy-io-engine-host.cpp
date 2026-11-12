@@ -989,30 +989,38 @@ int reap_throw_child() {
 // Mutant: pool-strict-abort-dropped, under which each site logs and continues under strict leases too; its
 // registration names the throwing reap's line.
 struct strict_site {
-    const char * name;   // the child's site argument
-    const char * warn;   // the site's one [HOST-PLAN-BUG] line
-    const char * abort;  // the strict abort's line
+    const char * name;        // the child's site argument
+    const char * warn;        // the site's one [HOST-PLAN-BUG] line
+    const char * abort;       // the strict abort's line, or the part of it this arm fixes
+    const char * abort_tail;  // the rest the abort's line also carries, or nullptr when `abort` is the whole line
 };
 
 const strict_site k_strict_refused = {
     "refused",
     "[HOST-PLAN-BUG] ring reap refused: strict-child-lock held",
     "ring reap refused: strict-child-lock held under GGML_SYCL_STRICT_LEASES=1",
+    nullptr,
 };
 const strict_site k_strict_dropped = {
     "dropped",
     "[HOST-PLAN-BUG] ring lease dropped with strict-child-lock held",
     "ring lease dropped with strict-child-lock held under GGML_SYCL_STRICT_LEASES=1",
+    nullptr,
 };
 const strict_site k_strict_parked = {
     "parked",
     "[HOST-PLAN-BUG] reap found a parked pool holding 1 lease(s), want 0",
     "reap found a parked pool holding 1 lease(s) under GGML_SYCL_STRICT_LEASES=1",
+    nullptr,
 };
+// The abort names the exception's what(), and a std::system_error's ends with the platform's message for its error
+// code, which this arm does not fix. So the line is scored by the two parts the pool writes: the seam's text, which
+// the WARN line shares, and the strict suffix, which only the abort carries.
 const strict_site k_strict_failed = {
     "failed",
     "[HOST-PLAN-BUG] ring reap failed: the test seam's throw at the reap's first step",
-    "ring reap failed: the test seam's throw at the reap's first step under GGML_SYCL_STRICT_LEASES=1",
+    "ring reap failed: the test seam's throw at the reap's first step",
+    "under GGML_SYCL_STRICT_LEASES=1",
 };
 
 // The abort's line is scored first, so a mutant's FAIL line names it whatever else the child did.
@@ -1033,9 +1041,11 @@ arm_result score_strict_site(const strict_site & site) {
         void_arm(r, engaged);
         return r;
     }
-    expect(r, text_count_with(child.err, site.abort) == 1,
-           "the strict child printed " + num(text_count_with(child.err, site.abort)) + " line(s) '" + site.abort +
-               "', want 1");
+    const size_t      aborts     = text_count_with(child.err, site.abort, site.abort_tail);
+    const std::string abort_text = site.abort_tail == nullptr ?
+                                       "'" + std::string(site.abort) + "'" :
+                                       "with '" + std::string(site.abort) + "' and '" + site.abort_tail + "'";
+    expect(r, aborts == 1, "the strict child printed " + num(aborts) + " line(s) " + abort_text + ", want 1");
     expect(r, WIFSIGNALED(child.status) && WTERMSIG(child.status) == SIGABRT,
            "the strict child ended with " + status_text(child.status) + ", want SIGABRT");
     expect(r, text_count_with(child.err, site.warn) == 1 && text_count_with(child.err, "[HOST-PLAN-BUG]") == 1,
