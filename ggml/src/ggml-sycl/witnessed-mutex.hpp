@@ -13,12 +13,15 @@
 // the mutex itself. A ninth lock held at once aborts naming it: eight is above the deepest nesting of the five, and a
 // lock the witness cannot record is one the reap would miss.
 //
-// Include it only from backend translation units compiled with the same GGML_SYCL_PRIVATE_TESTING setting as the
-// library they link: no public header and no libllama translation unit includes it, and the lock objects are file-scope
-// statics and members of backend-private types, so no type that embeds one is compiled under both settings. The two
-// forms' functions live in distinct inline namespaces, so a binary that links units of both settings holds two
-// definitions under two names, never two definitions of one name. Guards spell the lock type through class template
-// argument deduction (std::lock_guard lock(m)), so a guard reads the same under both settings.
+// Both settings meet in one binary: test-mem-handle-wrong-device, test-mem-handle-byte-contract and
+// test-sycl-runtime-alloc compile unified-cache.cpp with GGML_SYCL_PRIVATE_TESTING=1 and link the backend library,
+// built without it. No public header and no libllama translation unit includes this one, and three invariants keep such
+// a binary sound. Each lock instance has internal linkage, a file-scope static or one in an unnamed namespace, or is a
+// member of a type that one translation unit defines, so no instance is named across the two settings. The two forms'
+// functions live in distinct inline namespaces, so the binary holds two definitions under two names, never two
+// definitions of one name. No type that embeds a witnessed_mutex is defined in a header, so none is compiled under both
+// settings with two layouts. Guards spell the lock type through class template argument deduction (std::lock_guard
+// lock(m)), so a guard reads the same under both settings.
 
 #include <mutex>
 
