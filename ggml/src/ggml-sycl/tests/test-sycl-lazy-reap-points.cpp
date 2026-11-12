@@ -69,7 +69,7 @@ const char * k_arm_throw = "a teardown reap whose first step throws logs it and 
 const char * k_arm_shutdown_read = "shutdown with a read in flight returns after the read's drop and leaves no pool";
 const char * k_arm_shutdown_freed =
     "with the last table and read freed the ring's bytes return and shutdown leaves no pool";
-const char * k_arm_leaked = "shutdown drains a never-erased record's lease with one leaked-lease line";
+const char * k_arm_leaked        = "shutdown drains a never-erased record's lease with one leaked-lease line";
 const char * k_arm_leaked_strict = "under strict leases the drain aborts at a never-erased record's leaked lease";
 const char * k_arm_drop_first =
     "a read's last drop between the stage's entry reap and its take parks, and the take builds anew";
