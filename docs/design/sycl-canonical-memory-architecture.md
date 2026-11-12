@@ -1845,9 +1845,9 @@ eight-entry `thread_local` table, through every guard, `unique_lock` relock and
   `unified-cache.cpp`, which the pool's host-only test targets do not link;
 - `GGML_SYCL_WITNESS` aborts the yield round and the sample.
 
-Under `GGML_SYCL_STRICT_LEASES=1`, each `[HOST-PLAN-BUG]` WARN of the IO pool
-and of the shutdown's lease drain is followed by an abort naming the same
-figures and ending `under GGML_SYCL_STRICT_LEASES=1` (design
+Under `GGML_SYCL_STRICT_LEASES=1`, each `[HOST-PLAN-BUG]` WARN of the ring
+reap, the lease drop and the shutdown's lease drain is followed by an abort
+naming the same figures and ending `under GGML_SYCL_STRICT_LEASES=1` (design
 `sycl-storage-tier-lazy-tables.md` §10). There are five such strict aborts:
 
 1. the reap's refusal under a held witnessed lock (test builds only, the only
