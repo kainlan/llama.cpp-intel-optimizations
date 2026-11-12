@@ -1817,24 +1817,59 @@ The lazy tables' **witnessed locks** (design `sycl-storage-tier-lazy-tables.md`
 §3.3, §11 T5) are five: the lazy IO pool registry's `g_lazy_registry_mutex`, the
 L1 `g_tensor_inventory_mutex`, `g_lifecycle_plan_mutex`, the lazy IO engine's
 `lazy_io_engine::mutex`, and each STORAGE table's strand lock. Each is declared
-`witnessed_mutex` (`witnessed-mutex.hpp`), and three entry points run with none
-of them held: the ring reap (`ggml_sycl_lazy_ring_reap`), the host ledger's
-yield round, and `host_ledger_sample()`. A ring lease's drop runs with none held
-as well, since a drop takes the registry's mutex. The witness changes no rank:
-each lock keeps its row above. A release build's `witnessed_mutex` is
-`std::mutex` itself, with a `static_assert` on its size, and records nothing. A
-`GGML_SYCL_PRIVATE_TESTING` build's records each instance the calling thread
-holds, with its name, in an eight-entry `thread_local` table, through every
-guard, `unique_lock` relock and `condition_variable_any` wait, and aborts naming
-a ninth. There the reap refuses under a held one, logging `[HOST-PLAN-BUG] ring
-reap refused: <name> held` and freeing nothing, so its parked pools wait for the
-next reap; a lease's drop under one logs `[HOST-PLAN-BUG] ring lease dropped
-with <name> held` and completes, and aborts under the registry's own mutex; and
-`GGML_SYCL_WITNESS` aborts the yield round and the sample. Four of the five are
-witnessed today. The strand lock arrives with the strands themselves (th32 T5c),
-and until then the reap-holding test seam reports its index as not wired.
-`test-sycl-lazy-lock-witness` holds each witnessed lock in turn and gates the
-reap's refusal and both aborts, with a no-lock run as the negative control.
+`witnessed_mutex` (`witnessed-mutex.hpp`), and four entry points run with none
+of them held: the ring reap (`ggml_sycl_lazy_ring_reap`), the block ring's
+ensure (`block_ring_ensure`, whose allocation charges the budget ledger and may
+yield), the host ledger's yield round, and `host_ledger_sample()`. A ring
+lease's drop runs with none held as well, since a drop takes the registry's
+mutex. The witness changes no rank: each lock keeps its row above. Four of the
+five are witnessed today. The strand lock arrives with the strands themselves
+(th32 T5c), and until then the reap-holding test seam reports its index as not
+wired.
+
+A release build's `witnessed_mutex` is `std::mutex` itself, with a
+`static_assert` on its size, and records nothing. A `GGML_SYCL_PRIVATE_TESTING`
+build's records each instance the calling thread holds, with its name, in an
+eight-entry `thread_local` table, through every guard, `unique_lock` relock and
+`condition_variable_any` wait, and aborts naming a ninth. In that build:
+
+- the reap called under a held one refuses: it logs `[HOST-PLAN-BUG] ring reap
+  refused: <name> held`, frees nothing and returns, so its parked pools wait for
+  the next reap;
+- a lease dropped under one logs `[HOST-PLAN-BUG] ring lease dropped with <name>
+  held` and completes, and under the registry's own mutex it aborts;
+- `block_ring_ensure` entered under one aborts at its entry with
+  `block_ring_ensure: the calling thread holds <name>`, before it refuses,
+  reserves or allocates anything. This is a plain test-build abort, not
+  `GGML_SYCL_WITNESS`, whose switch and failure function live in
+  `unified-cache.cpp`, which the pool's host-only test targets do not link;
+- `GGML_SYCL_WITNESS` aborts the yield round and the sample.
+
+Under `GGML_SYCL_STRICT_LEASES=1`, each `[HOST-PLAN-BUG]` WARN of the IO pool
+and of the shutdown's lease drain is followed by an abort naming the same
+figures and ending `under GGML_SYCL_STRICT_LEASES=1` (design
+`sycl-storage-tier-lazy-tables.md` §10). There are five such strict aborts:
+
+1. the reap's refusal under a held witnessed lock (test builds only, the only
+   builds that record holders);
+2. a lease's drop under a held witnessed lock (test builds only);
+3. a FULL reap that finds a parked pool still holding a lease;
+4. the reap's catch of a step that threw, naming the exception's `what()`;
+5. the shutdown drain (`ggml_sycl_lazy_lease_drain`) at a published record that
+   was never erased, naming its leaked lease's model and load.
+
+`ring_lease::clone()`'s `[HOST-PLAN-BUG]` line, a pool DYING under a held lease,
+aborts in every mode.
+
+Three tests gate this. `test-sycl-lazy-lock-witness` holds each witnessed lock
+in turn and gates the reap's refusal and the aborts of the yield round and the
+sample, with a no-lock run as the negative control.
+`test-sycl-lazy-io-engine-host` gates the drop's line and its abort under the
+registry's mutex, the ensure's entry abort, and strict aborts 1 to 4, each in a
+child whose fixture switch stands for the variable. `test-sycl-lazy-reap-points`
+gates strict abort 5 in a child started under `GGML_SYCL_STRICT_LEASES=1`.
+Strict aborts 1 to 5 and the ensure's entry abort each have a mutant
+registration scored on the child returning past its site.
 
 PP MoE oneDNN scratch admission (`moe-scratch-admission.hpp`, `ijla`) adds **no
 lock at all**, and that is a load-bearing property rather than an omission. The
