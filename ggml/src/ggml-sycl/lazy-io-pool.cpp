@@ -1637,6 +1637,16 @@ lazy_ring_ensure_status block_ring_ensure(size_t   need,
                                           int      device,
                                           size_t   plan_charge,
                                           uint64_t load_txn_id) {
+    // The entry witness (§3.3, §11 T5): ensure's allocation charges the budget ledger and may yield, so ensure is
+    // called with no witnessed lock held. One entered with a lock held aborts here, naming it, before it refuses,
+    // reserves or allocates anything. Only a test build records holders.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const char * held = witnessed_mutex_held_any();
+    // ENSURE_WITNESS_DROPPED: the ensure runs with the lock held.
+    if (held != nullptr && !lazy_ring_mutant_is(lazy_ring_mutant::ENSURE_WITNESS_DROPPED)) {
+        GGML_ABORT("block_ring_ensure: the calling thread holds %s", held);
+    }
+#endif
     // O_DIRECT alignment is a plan fact (§5.2): each of the LAZY_BLOCK_RING_QD slots of need / LAZY_BLOCK_RING_QD bytes
     // must be whole 4 KiB blocks, since a worker reads a block-aligned span into its slot. Any other need is a plan
     // bug, refused before any lock or state and never rounded up; the line names the next need that splits.

@@ -459,8 +459,10 @@ const char * lazy_ring_ensure_status_name(lazy_ring_ensure_status status);
 // waits. A need that is not a multiple of LAZY_BLOCK_RING_QD x LAZY_IO_BLOCK_BYTES is refused as MISMATCH before any
 // of that, never rounded up, since O_DIRECT alignment is a plan fact (§5.2). Each mismatch with the plan is a
 // [HOST-PLAN-BUG] WARN naming both numbers, a concurrent call one naming the need and the span, and the shut-down and
-// unpinned refusals plain WARNs; every refusal returns its typed status. Ensure never aborts: the strict abort is its
-// caller's (§10). May throw what the allocation or a worker's start throws, after the guard has cleared `ensuring`.
+// unpinned refusals plain WARNs; every refusal returns its typed status. Ensure never aborts on a refusal: the strict
+// abort is its caller's (§10). Its allocation charges the budget ledger and may yield, so it is called with no
+// witnessed lock held; a test build aborts at its entry naming a held one (§11 T5). May throw what the allocation or a
+// worker's start throws, after the guard has cleared `ensuring`.
 lazy_ring_ensure_status block_ring_ensure(size_t   need,
                                           size_t   span,
                                           int      device,
