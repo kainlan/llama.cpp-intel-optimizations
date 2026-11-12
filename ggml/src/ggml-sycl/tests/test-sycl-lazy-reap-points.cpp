@@ -798,6 +798,9 @@ arm_result arm_shutdown_freed() {
 // pool's lease through the shutdown. The drain moves that lease out, logs one "[HOST-PLAN-BUG] leaked ring lease:
 // model=<m> load=<t>" line naming A, and drops it with no lock held: after the shutdown no record holds a lease, and
 // once the records are cleared, as static destruction would, no held lease's destructor runs after shut-down.
+// The shutdown's own verdict is not scored: A is never unloaded, so the MoE workspace blobs its load materialized and
+// its unload would retire are still live, and the cache census after the drain refuses the shutdown, as it must for a
+// live owner. The drain runs before that census, and the leaked line and the record count show it ran.
 // Engagement: the child's backends initialise and A loads and ensures.
 // Mutant: skip-lease-drain, under which the drain moves no lease, so clearing the records destroys a held lease after
 // shut-down.
@@ -814,8 +817,8 @@ arm_result arm_leaked() {
     expect(r, text_count_with(err, "LEAKED-CHILD cleared drops_after_shut_down=0") == 1,
            "after the records were cleared: '" + first_line_with(err, "LEAKED-CHILD cleared") +
                "', want drops_after_shut_down=0");
-    expect(r, text_count_with(err, "LEAKED-CHILD returned threw=none records=0") == 1,
-           "after the shutdown: '" + first_line_with(err, "LEAKED-CHILD returned") + "', want threw=none records=0");
+    expect(r, text_count_with(err, "LEAKED-CHILD returned threw=", " records=0") == 1,
+           "after the shutdown: '" + first_line_with(err, "LEAKED-CHILD returned") + "', want records=0");
     const std::string want = ids.empty() ? std::string(k_leaked) : std::string(k_leaked) + ids.substr(6);
     expect(
         r, !ids.empty() && text_count_with(err, want.c_str()) == 1 && text_count_with(err, k_leaked) == 1,
