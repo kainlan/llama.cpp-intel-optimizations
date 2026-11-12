@@ -119,16 +119,15 @@ uint64_t          g_lazy_parked_at_last_take    = 0;
 // §10's lazy_ring_coverage_reads: one relaxed increment per coverage read, in every build, no lock.
 std::atomic<uint64_t> g_lazy_ring_coverage_reads{ 0 };
 
-// Every [HOST-PLAN-BUG] line of the reap and the drop is a WARN that aborts under ggml_sycl_strict_enabled() (§10):
-// true when the site that just printed one must abort.
-bool lazy_plan_bug_aborts() noexcept {
+// Every [HOST-PLAN-BUG] line of the reap and the drop is a WARN that aborts under ggml_sycl_strict_enabled() (§10),
+// which each site asks itself. True when POOL_STRICT_ABORT_DROPPED makes every such site log and continue under strict
+// leases too; false outside a test build.
+bool lazy_strict_abort_dropped() noexcept {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-    // POOL_STRICT_ABORT_DROPPED: every such site logs and continues under strict leases too.
-    if (lazy_ring_mutant_is(lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED)) {
-        return false;
-    }
+    return lazy_ring_mutant_is(lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED);
+#else
+    return false;
 #endif
-    return ggml_sycl_strict_enabled();
 }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The one-shot hold hook and the point it is armed at: the first FULL reap, the first take that builds a pool, the
@@ -211,8 +210,10 @@ bool lazy_reap_refused_under_held_lock() noexcept {
     }
     g_lazy_reaps_refused.fetch_add(1, std::memory_order_relaxed);
     GGML_LOG_WARN("[HOST-PLAN-BUG] ring reap refused: %s held\n", held);
-    if (lazy_plan_bug_aborts()) {
-        GGML_ABORT("ring reap refused: %s held under GGML_SYCL_STRICT_LEASES=1", held);
+    if (!lazy_strict_abort_dropped()) {
+        if (ggml_sycl_strict_enabled()) {
+            GGML_ABORT("ring reap refused: %s held under GGML_SYCL_STRICT_LEASES=1", held);
+        }
     }
     return true;
 }
@@ -230,8 +231,10 @@ void lazy_drop_witness() noexcept {
     if (witnessed_mutex_held(g_lazy_registry_mutex)) {
         GGML_ABORT("ring_lease::reset: the dropping thread holds the IO pool registry's leaf mutex");
     }
-    if (lazy_plan_bug_aborts()) {
-        GGML_ABORT("ring lease dropped with %s held under GGML_SYCL_STRICT_LEASES=1", held);
+    if (!lazy_strict_abort_dropped()) {
+        if (ggml_sycl_strict_enabled()) {
+            GGML_ABORT("ring lease dropped with %s held under GGML_SYCL_STRICT_LEASES=1", held);
+        }
     }
 }
 #endif
@@ -513,9 +516,11 @@ void lazy_reap_full_pass() {
         lazy_reap_node * next = leased->next;
         GGML_LOG_WARN("[HOST-PLAN-BUG] reap found a parked pool holding %llu lease(s), want 0\n",
                       (unsigned long long) leased->leases_at_reap);
-        if (lazy_plan_bug_aborts()) {
-            GGML_ABORT("reap found a parked pool holding %llu lease(s) under GGML_SYCL_STRICT_LEASES=1",
-                       (unsigned long long) leased->leases_at_reap);
+        if (!lazy_strict_abort_dropped()) {
+            if (ggml_sycl_strict_enabled()) {
+                GGML_ABORT("reap found a parked pool holding %llu lease(s) under GGML_SYCL_STRICT_LEASES=1",
+                           (unsigned long long) leased->leases_at_reap);
+            }
         }
         delete leased;
         leased = next;
@@ -550,8 +555,10 @@ void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept {
         g_lazy_reaps_failed.fetch_add(1, std::memory_order_relaxed);
 #endif
         GGML_LOG_WARN("[HOST-PLAN-BUG] ring reap failed: %s\n", e.what());
-        if (lazy_plan_bug_aborts()) {
-            GGML_ABORT("ring reap failed: %s under GGML_SYCL_STRICT_LEASES=1", e.what());
+        if (!lazy_strict_abort_dropped()) {
+            if (ggml_sycl_strict_enabled()) {
+                GGML_ABORT("ring reap failed: %s under GGML_SYCL_STRICT_LEASES=1", e.what());
+            }
         }
     }
 }

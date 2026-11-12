@@ -127496,14 +127496,14 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
 // parked pools, and only then is the registry marked shut down: a lease dropped after the mark, as static destruction
 // of the records would drop one, only decrements its pool's count, and nothing frees the pool.
 static void ggml_sycl_lazy_lease_drain() noexcept {
-    bool drain        = true;
-    bool strict_abort = ggml_sycl::ggml_sycl_strict_enabled();
+    bool drain = true;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     drain = !ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::SKIP_LEASE_DRAIN);
     // DRAIN_STRICT_ABORT_DROPPED: the leaked lease is logged and dropped under strict leases too.
-    if (ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::DRAIN_STRICT_ABORT_DROPPED)) {
-        strict_abort = false;
-    }
+    const bool strict_abort_dropped =
+        ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::DRAIN_STRICT_ABORT_DROPPED);
+#else
+    constexpr bool strict_abort_dropped = false;
 #endif
     while (drain) {
         uint64_t              model_id    = 0;
@@ -127514,9 +127514,11 @@ static void ggml_sycl_lazy_lease_drain() noexcept {
         }
         GGML_LOG_WARN("[HOST-PLAN-BUG] leaked ring lease: model=%llu load=%llu\n", (unsigned long long) model_id,
                       (unsigned long long) load_txn_id);
-        if (strict_abort) {
-            GGML_ABORT("leaked ring lease: model=%llu load=%llu under GGML_SYCL_STRICT_LEASES=1",
-                       (unsigned long long) model_id, (unsigned long long) load_txn_id);
+        if (!strict_abort_dropped) {
+            if (ggml_sycl::ggml_sycl_strict_enabled()) {
+                GGML_ABORT("leaked ring lease: model=%llu load=%llu under GGML_SYCL_STRICT_LEASES=1",
+                           (unsigned long long) model_id, (unsigned long long) load_txn_id);
+            }
         }
         lease.reset();
     }
