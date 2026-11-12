@@ -11,7 +11,9 @@
 // The lock witness (§3.3, §11 T5): a witnessed lock's depth table follows lock, try_lock, unlock, a unique_lock's
 // relock and a condition_variable_any wait; the reap refuses, naming it, when it is called with the registry's leaf
 // mutex or the queue lock held, and with none held it runs; a held lease dropped under a witnessed lock is logged, and
-// under the registry's own mutex aborts; and a reap whose step throws logs it and returns.
+// under the registry's own mutex aborts; and a reap whose step throws logs it and returns. Under strict leases (§10)
+// each of those [HOST-PLAN-BUG] lines, and the one a reap prints for a parked pool a take joined, aborts after its
+// WARN, scored in children whose fixture strict switch is on.
 //
 // Host-only, because none of this needs a device: ensure allocates through lazy_io_allocate_host, a link seam the
 // fixture header defines with a counting ledger, and the workers read through the PRIVATE_TESTING read source. Links
@@ -34,6 +36,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -69,6 +73,12 @@ const char * k_table_child   = "--witness-table-child";
 const char * k_holding_child = "--reap-holding-child";
 const char * k_drop_child    = "--drop-holding-child";
 const char * k_throw_child   = "--reap-throw-child";
+
+// The strict arms' child (§10), its site the next argument and its mutant, if any, the one after.
+const char * k_strict_child = "--strict-child";
+
+// The --mutant this process runs under, passed on to the strict children; null in a plain run.
+const char * g_mutant = nullptr;
 
 std::string name(lazy_ring_ensure_status s) {
     return lazy_ring_ensure_status_name(s);
@@ -964,6 +974,137 @@ int reap_throw_child() {
     return 0;
 }
 
+// The strict arms (§10: every [HOST-PLAN-BUG] line is a WARN that aborts under ggml_sycl_strict_enabled(), clone()
+// excepted). Each of the pool's four such sites is reached in a child whose fixture strict switch stands for
+// GGML_SYCL_STRICT_LEASES=1: a FULL reap refused under a held witnessed lock, a lease dropped under one, a FULL reap
+// that finds a parked pool a take joined, and a FULL reap whose first step throws. The child prints the site's one
+// [HOST-PLAN-BUG] line, then aborts (SIGABRT) with one line naming the same figures under GGML_SYCL_STRICT_LEASES=1,
+// and never returns. This process keeps the switch off, so the arms above score the same sites' WARN-and-continue
+// path.
+// Engagement: the child ran within 5 s; at the parked site, its ensure made a ring and its take joined that pool.
+// Mutant: pool-strict-abort-dropped, under which each site logs and continues under strict leases too; its
+// registration names the throwing reap's line.
+struct strict_site {
+    const char * name;   // the child's site argument
+    const char * warn;   // the site's one [HOST-PLAN-BUG] line
+    const char * abort;  // the strict abort's line
+};
+
+const strict_site k_strict_refused = {
+    "refused",
+    "[HOST-PLAN-BUG] ring reap refused: strict-child-lock held",
+    "ring reap refused: strict-child-lock held under GGML_SYCL_STRICT_LEASES=1",
+};
+const strict_site k_strict_dropped = {
+    "dropped",
+    "[HOST-PLAN-BUG] ring lease dropped with strict-child-lock held",
+    "ring lease dropped with strict-child-lock held under GGML_SYCL_STRICT_LEASES=1",
+};
+const strict_site k_strict_parked = {
+    "parked",
+    "[HOST-PLAN-BUG] reap found a parked pool holding 1 lease(s), want 0",
+    "reap found a parked pool holding 1 lease(s) under GGML_SYCL_STRICT_LEASES=1",
+};
+const strict_site k_strict_failed = {
+    "failed",
+    "[HOST-PLAN-BUG] ring reap failed: the test seam's throw at the reap's first step",
+    "ring reap failed: the test seam's throw at the reap's first step under GGML_SYCL_STRICT_LEASES=1",
+};
+
+// The abort's line is scored first, so a mutant's FAIL line names it whatever else the child did.
+arm_result score_strict_site(const strict_site & site) {
+    arm_result               r;
+    std::vector<std::string> args = { "test-sycl-lazy-io-engine-host", k_strict_child, site.name };
+    if (g_mutant != nullptr) {
+        args.emplace_back(g_mutant);
+    }
+    const child_run child = run_child_strings(args, child_environment({ "GGML_NO_BACKTRACE=1" }), k_bound);
+    if (!child.ran) {
+        void_arm(
+            r, std::string("the strict child at ") + site.name + " did not end within " + num(k_bound.count()) + " s");
+        return r;
+    }
+    const std::string engaged = first_line_with(child.err, "STRICT-CHILD void:");
+    if (engaged != "(none)") {
+        void_arm(r, engaged);
+        return r;
+    }
+    expect(r, text_count_with(child.err, site.abort) == 1,
+           "the strict child printed " + num(text_count_with(child.err, site.abort)) + " line(s) '" + site.abort +
+               "', want 1");
+    expect(r, WIFSIGNALED(child.status) && WTERMSIG(child.status) == SIGABRT,
+           "the strict child ended with " + status_text(child.status) + ", want SIGABRT");
+    expect(r, text_count_with(child.err, site.warn) == 1 && text_count_with(child.err, "[HOST-PLAN-BUG]") == 1,
+           "the strict child printed " + num(text_count_with(child.err, site.warn)) + " line(s) '" + site.warn +
+               "' among " + num(text_count_with(child.err, "[HOST-PLAN-BUG]")) +
+               " [HOST-PLAN-BUG] line(s), want 1 and 1");
+    expect(r, text_count_with(child.err, "STRICT-CHILD returned") == 0, "the strict child returned from its site");
+    return r;
+}
+
+arm_result arm_strict_refused() {
+    return score_strict_site(k_strict_refused);
+}
+
+arm_result arm_strict_dropped() {
+    return score_strict_site(k_strict_dropped);
+}
+
+arm_result arm_strict_parked() {
+    return score_strict_site(k_strict_parked);
+}
+
+arm_result arm_strict_failed() {
+    return score_strict_site(k_strict_failed);
+}
+
+// The strict child's way out when its site returns or it cannot engage: its STRICT-CHILD line, then _Exit, with
+// nothing torn down, so no teardown can stand in for the abort the arm scores.
+[[noreturn]] void strict_child_exit(const std::string & line, int code) {
+    std::fprintf(stderr, "STRICT-CHILD %s\n", line.c_str());
+    std::fflush(stderr);
+    std::_Exit(code);
+}
+
+// The strict arms' child: the fixture's strict switch on, `mutant` planted by the caller, then the site named `site`.
+[[noreturn]] void strict_child(const char * site, lazy_ring_mutant mutant) {
+    lazy_io_host_fixture::g_state.strict.store(true);
+    if (std::strcmp(site, k_strict_refused.name) == 0) {
+        witnessed_mutex m{ GGML_SYCL_WITNESS_NAME("strict-child-lock") };
+        std::lock_guard lock(m);
+        ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    } else if (std::strcmp(site, k_strict_dropped.name) == 0) {
+        ring_lease      lease  = lazy_io_pool_take();
+        ring_lease      second = lease.clone();
+        witnessed_mutex m{ GGML_SYCL_WITNESS_NAME("strict-child-lock") };
+        std::lock_guard lock(m);
+        second.reset();
+    } else if (std::strcmp(site, k_strict_parked.name) == 0) {
+        ring_lease lease = lazy_io_pool_take();
+        if (block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn) != lazy_ring_ensure_status::OK) {
+            strict_child_exit("void: the ring was not ensured", 3);
+        }
+        lease.reset();  // the last drop parks the pool with its ring
+        // The defect the site reports: a take blind to DYING joins the parked pool, as TAKE_IGNORES_DYING plants it.
+        ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant::TAKE_IGNORES_DYING);
+        ring_lease joined = lazy_io_pool_take();
+        ggml_sycl_test_lazy_ring_mutant_select(mutant);
+        if (joined.ring_bytes() != k_need) {
+            strict_child_exit("void: the take did not join the parked pool: ring " + num(joined.ring_bytes()) +
+                                  " B, want " + num(k_need),
+                              3);
+        }
+        ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    } else if (std::strcmp(site, k_strict_failed.name) == 0) {
+        lazy_io_pool_take().reset();  // the last drop parks the pool
+        ggml_sycl_test_lazy_reap_throw_next();
+        ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL);
+    } else {
+        strict_child_exit(std::string("unknown site ") + site, 2);
+    }
+    strict_child_exit("returned", 0);
+}
+
 // The worker-drop RED (§3.3, §11 T5): model A is unloaded with a read in flight, so the read's lease is the last, and
 // its drop and WORKER reap run on a pool worker. Within 5 s the ring's bytes return to the pre-ensure figure through
 // the fixture ledger, with no FULL reap run and no join on the completion path: the pool, with its workers, waits on
@@ -1045,6 +1186,7 @@ lazy_ring_mutant mutant_named(const char * text) {
         { "no-alignment-check",        lazy_ring_mutant::NO_ALIGNMENT_CHECK        },
         { "shutdown-no-wait",          lazy_ring_mutant::SHUTDOWN_NO_WAIT          },
         { "worker-reap-destroys-pool", lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL },
+        { "pool-strict-abort-dropped", lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED },
     };
     for (const entry & e : table) {
         if (std::strcmp(e.text, text) == 0) {
@@ -1077,7 +1219,13 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], k_throw_child) == 0) {
         return reap_throw_child();
     }
+    if ((argc == 3 || argc == 4) && std::strcmp(argv[1], k_strict_child) == 0) {
+        const lazy_ring_mutant mutant = argc == 4 ? mutant_named(argv[3]) : lazy_ring_mutant::NONE;
+        ggml_sycl_test_lazy_ring_mutant_select(mutant);
+        strict_child(argv[2], mutant);
+    }
     if (argc == 3 && std::strcmp(argv[1], "--mutant") == 0) {
+        g_mutant = argv[2];
         ggml_sycl_test_lazy_ring_mutant_select(mutant_named(argv[2]));
     }
     const std::vector<named_arm> arms = {
@@ -1100,6 +1248,10 @@ int main(int argc, char ** argv) {
         { "a reap under the registry's mutex or the queue lock refuses naming it",      arm_reap_refuses_held_lock   },
         { "a lease dropped under a witnessed lock is logged, or aborts",                arm_drop_witness             },
         { "a reap whose step throws logs it and returns",                               arm_reap_throw               },
+        { "a reap refused under a held lock aborts under strict leases",                arm_strict_refused           },
+        { "a lease dropped under a held lock aborts under strict leases",               arm_strict_dropped           },
+        { "a reap finding a parked pool with a lease aborts under strict leases",       arm_strict_parked            },
+        { "a reap whose first step throws aborts under strict leases",                  arm_strict_failed            },
         // Last: the shut-down flag is never cleared.
         { "ensure refuses after shut-down and frees the reserver's ring",               arm_ensure_shut_down         },
     };

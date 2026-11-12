@@ -2,8 +2,9 @@
 // The IO pool's reap points (th32 §3.3, §11 T5), one fixture per point class, and the race between a lease's last drop
 // and a take: the entry reap of a planner caller, the reap after a failed load's end, the teardown reap at a model
 // swap and the teardown reap whose first step throws, the shutdown drain with a read in flight, with the last table and
-// read freed and with a published record never erased, and the two orders of a read's last drop against a stage's
-// take. The reader-thread point is the engine host test's worker-drop arm.
+// read freed and with a published record never erased, that last under strict leases too, where its drain aborts
+// (§10), and the two orders of a read's last drop against a stage's take. The reader-thread point is the engine host
+// test's worker-drop arm.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -13,9 +14,9 @@
 // registered gpu-serial, serial, with the selector pinned to both discrete cards (level_zero:0,1). It runs iff the
 // planner caller takes its multi-device path, ggml_backend_sycl_moe_multi_gpu_requested(), and exits 77 otherwise. No
 // libllama: the fixture builds each inventory and drives the load transaction itself, and the engine's reads come from
-// the PRIVATE_TESTING read source. The teardown throw, the three shutdown fixtures and their mutants run in children
+// the PRIVATE_TESTING read source. The teardown throw, the four shutdown fixtures and their mutants run in children
 // of this binary, started before this process initialises SYCL, since a shutdown ends the backend for the process and
-// a throw that escapes a noexcept reap ends it.
+// a throw that escapes a noexcept reap ends it. Only the strict shutdown's child runs under GGML_SYCL_STRICT_LEASES=1.
 //
 // --mutant <name> selects one runtime mutant of the PRIVATE_TESTING selector (§11) and runs only the arm that kills it;
 // each --mutant registration passes only when that arm prints its FAIL line. An arm whose engagement check fails is
@@ -69,6 +70,7 @@ const char * k_arm_shutdown_read = "shutdown with a read in flight returns after
 const char * k_arm_shutdown_freed =
     "with the last table and read freed the ring's bytes return and shutdown leaves no pool";
 const char * k_arm_leaked = "shutdown drains a never-erased record's lease with one leaked-lease line";
+const char * k_arm_leaked_strict = "under strict leases the drain aborts at a never-erased record's leaked lease";
 const char * k_arm_drop_first =
     "a read's last drop between the stage's entry reap and its take parks, and the take builds anew";
 const char * k_arm_take_first = "a read's drop held while the stage takes leaves the pool live and its ring unchanged";
@@ -80,6 +82,9 @@ const char * k_leaked       = "[HOST-PLAN-BUG] leaked ring lease: model=";
 
 // What ggml_backend_sycl_shutdown throws when the cache census finds a live owner's allocation.
 const char * k_census_refusal = "SYCL unified cache arena release failed";
+
+// The strict child's environment entry; every other child, and this process, run without it.
+const char * k_strict_setting = "GGML_SYCL_STRICT_LEASES=1";
 
 // The mutant a child plants, passed on its command line; null in a plain run.
 const char * g_child_mutant = nullptr;
@@ -701,18 +706,35 @@ int leaked_child() {
     child_exit("LEAKED-CHILD", "cleared drops_after_shut_down=" + num(registry().drops_after_shut_down), 0);
 }
 
+// The leaked-record child under GGML_SYCL_STRICT_LEASES=1: A loaded and never unloaded, then the shutdown, whose drain
+// must abort at A's lease. A return prints what the shutdown threw.
+int leaked_strict_child() {
+    child_model m;
+    child_setup("LEAKED-STRICT-CHILD", m);
+    std::fprintf(stderr, "LEAKED-STRICT-CHILD loaded model=%llu load=%llu\n", (unsigned long long) m.a.token.model_id,
+                 (unsigned long long) m.a.token.load_txn_id);
+    std::fflush(stderr);
+    const std::string threw = shut_down();
+    child_exit("LEAKED-STRICT-CHILD", "returned threw=" + threw, 0);
+}
+
 // --- the child-scored arms ---
 
 child_run g_throw_run;
 child_run g_shutdown_read_run;
 child_run g_shutdown_freed_run;
 child_run g_leaked_run;
+child_run g_leaked_strict_run;
 
-child_run spawn(std::vector<std::string> args) {
+child_run spawn(std::vector<std::string> args, bool strict = false) {
     if (g_child_mutant != nullptr) {
         args.emplace_back(g_child_mutant);
     }
-    return run_child_strings(args, child_environment({ "GGML_NO_BACKTRACE=1" }), k_child_bound);
+    std::vector<std::string> sets = { "GGML_NO_BACKTRACE=1" };
+    if (strict) {
+        sets.emplace_back(k_strict_setting);
+    }
+    return run_child_strings(args, child_environment(sets), k_child_bound);
 }
 
 // A child that did not end, or exited 77 naming why it could not engage, VOIDs the arm.
@@ -849,6 +871,43 @@ arm_result arm_leaked() {
     return r;
 }
 
+// The leaked-record arm under strict leases (§10: every [HOST-PLAN-BUG] line is a WARN that aborts under
+// ggml_sycl_strict_enabled(), the leaked lease among them): the same never-unloaded A, in a child started under
+// GGML_SYCL_STRICT_LEASES=1, whose shutdown drain prints the one "[HOST-PLAN-BUG] leaked ring lease: model=<m>
+// load=<t>" line naming A and then aborts (SIGABRT) with one "leaked ring lease: model=<m> load=<t> under
+// GGML_SYCL_STRICT_LEASES=1" line, and the shutdown never returns. The abort's line is scored first, so the mutant's
+// FAIL line names it whatever else the child did.
+// Engagement: the child's backends initialise and A loads and ensures under strict leases.
+// Mutant: drain-strict-abort-dropped, under which the drain logs A's lease and continues under strict leases too.
+arm_result arm_leaked_strict() {
+    arm_result r;
+    if (!child_engaged(r, g_leaked_strict_run, "LEAKED-STRICT-CHILD")) {
+        return r;
+    }
+    const std::string & err    = g_leaked_strict_run.err;
+    const std::string   loaded = first_line_with(err, "LEAKED-STRICT-CHILD loaded ");
+    if (loaded == "(none)") {
+        fail(r, "the strict child ended with " + status_text(g_leaked_strict_run.status) +
+                    " before it printed its loaded line, want A loaded under strict leases");
+        return r;
+    }
+    const std::string ids   = loaded.substr(loaded.find("model="));
+    const std::string warn  = "[HOST-PLAN-BUG] leaked ring lease: " + ids;
+    const std::string abort = "leaked ring lease: " + ids + " under " + k_strict_setting;
+    expect(r, text_count_with(err, abort.c_str()) == 1,
+           "the strict child printed " + num(text_count_with(err, abort.c_str())) + " line(s) '" + abort +
+               "', want 1; its first strict line: '" + first_line_with(err, std::string(" under ") + k_strict_setting) +
+               "'");
+    expect(r, WIFSIGNALED(g_leaked_strict_run.status) && WTERMSIG(g_leaked_strict_run.status) == SIGABRT,
+           "the strict child ended with " + status_text(g_leaked_strict_run.status) + " after '" +
+               first_line_with(err, "LEAKED-STRICT-CHILD returned") + "', want SIGABRT");
+    expect(r, text_count_with(err, warn.c_str()) == 1 && text_count_with(err, k_leaked) == 1,
+           "the strict child printed " + num(text_count_with(err, k_leaked)) + " leaked-lease line(s), want 1 '" +
+               warn + "'");
+    expect(r, text_count_with(err, "LEAKED-STRICT-CHILD returned") == 0, "the strict child's shutdown returned");
+    return r;
+}
+
 // --- the mutants ---
 
 struct mutant_entry {
@@ -858,11 +917,12 @@ struct mutant_entry {
 };
 
 const mutant_entry k_mutants[] = {
-    { "no-entry-reap",          lazy_ring_mutant::NO_ENTRY_REAP,          k_arm_entry      },
-    { "snapshot-carries-lease", lazy_ring_mutant::SNAPSHOT_CARRIES_LEASE, k_arm_swap       },
-    { "take-ignores-dying",     lazy_ring_mutant::TAKE_IGNORES_DYING,     k_arm_drop_first },
-    { "reap-inside-try",        lazy_ring_mutant::REAP_INSIDE_TRY,        k_arm_throw      },
-    { "skip-lease-drain",       lazy_ring_mutant::SKIP_LEASE_DRAIN,       k_arm_leaked     },
+    { "no-entry-reap",              lazy_ring_mutant::NO_ENTRY_REAP,              k_arm_entry         },
+    { "snapshot-carries-lease",     lazy_ring_mutant::SNAPSHOT_CARRIES_LEASE,     k_arm_swap          },
+    { "take-ignores-dying",         lazy_ring_mutant::TAKE_IGNORES_DYING,         k_arm_drop_first    },
+    { "reap-inside-try",            lazy_ring_mutant::REAP_INSIDE_TRY,            k_arm_throw         },
+    { "skip-lease-drain",           lazy_ring_mutant::SKIP_LEASE_DRAIN,           k_arm_leaked        },
+    { "drain-strict-abort-dropped", lazy_ring_mutant::DRAIN_STRICT_ABORT_DROPPED, k_arm_leaked_strict },
 };
 
 const mutant_entry * mutant_named(const char * text) {
@@ -901,6 +961,10 @@ int main(int argc, char ** argv) {
         plant_child_mutant("LEAKED-CHILD", argc >= 3 ? argv[2] : nullptr);
         return leaked_child();
     }
+    if (argc >= 2 && std::strcmp(argv[1], "--leaked-strict-child") == 0) {
+        plant_child_mutant("LEAKED-STRICT-CHILD", argc >= 3 ? argv[2] : nullptr);
+        return leaked_strict_child();
+    }
     const mutant_entry * mutant = nullptr;
     if (argc == 3 && std::strcmp(argv[1], "--mutant") == 0) {
         mutant = mutant_named(argv[2]);
@@ -916,6 +980,11 @@ int main(int argc, char ** argv) {
         std::printf("FAIL: the Q8_0 row sizes are not the geometry's 34 and 8194 B\n");
         return 1;
     }
+
+    // Every arm but the strict one scores a [HOST-PLAN-BUG] line's WARN-and-continue path, which strict leases turn
+    // into an abort, so this process and its other children run without the setting; the strict child sets it alone.
+    const std::string strict_name(k_strict_setting, std::strchr(k_strict_setting, '=') - k_strict_setting);
+    unsetenv(strict_name.c_str());
 
     // The children start before this process initialises SYCL, one at a time: every one without a mutant, else the
     // one the mutant's arm scores.
@@ -938,6 +1007,10 @@ int main(int argc, char ** argv) {
     if (wanted(k_arm_leaked)) {
         g_leaked_run = spawn({ k_self, "--leaked-child" });
         std::fputs(g_leaked_run.err.c_str(), stderr);
+    }
+    if (wanted(k_arm_leaked_strict)) {
+        g_leaked_strict_run = spawn({ k_self, "--leaked-strict-child" }, true);
+        std::fputs(g_leaked_strict_run.err.c_str(), stderr);
     }
 
     if (!sycl_test_require_gpu("the lazy reap point arms")) {
@@ -973,6 +1046,7 @@ int main(int argc, char ** argv) {
         { k_arm_shutdown_read,  arm_shutdown_read  },
         { k_arm_shutdown_freed, arm_shutdown_freed },
         { k_arm_leaked,         arm_leaked         },
+        { k_arm_leaked_strict,  arm_leaked_strict  },
     };
     if (mutant == nullptr) {
         return run_arms(arms, "lazy reap point arms");

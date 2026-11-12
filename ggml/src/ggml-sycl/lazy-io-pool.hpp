@@ -11,8 +11,8 @@
 // released by the reap after the pool's last lease is gone.
 //
 // Device-free on purpose, like host-cpu-mapping.hpp: this header and lazy-io-pool.cpp include no SYCL header, so a
-// host test links the translation unit alone. The ring's memory is its one link seam, defined by lazy-table.cpp in the
-// backend and by a fixture in each host test.
+// host test links the translation unit alone. It has two link seams, each defined by the backend and by a fixture in
+// each host test: the ring's memory (lazy-table.cpp) and the strict-leases switch (unified-cache.cpp).
 //
 // The registry's leaf mutex (canonical contract §12.5, L5) is a true leaf: nothing is taken, allocated, freed, waited
 // on or logged under it. A take reserves a generation under it, builds its pool outside it and installs the pool under
@@ -124,6 +124,11 @@ std::unique_ptr<lazy_io_host_memory> lazy_io_allocate_host(size_t   bytes,
                                                            int      device,
                                                            uint64_t pool_generation,
                                                            uint64_t load_txn_id);
+
+// GGML_SYCL_STRICT_LEASES=1, the switch under which every [HOST-PLAN-BUG] line of the reap and the drop aborts after
+// its WARN (§10). Defined once per link: unified-cache.cpp for the backend, which declares it in unified-cache.hpp too,
+// and the fixture in each host test that links lazy-io-pool.cpp, whose switch only a death child sets.
+bool ggml_sycl_strict_enabled();
 
 struct lazy_io_pool;
 
@@ -663,6 +668,8 @@ enum class lazy_ring_mutant : uint8_t {
     SNAPSHOT_CARRIES_LEASE,          // the published snapshot owns a lease on the pool
     REAP_INSIDE_TRY,                 // the teardown reap runs inside the try that re-finalizes the ticket
     SKIP_LEASE_DRAIN,                // shutdown moves no record's lease out before it marks the registry shut down
+    POOL_STRICT_ABORT_DROPPED,       // the reap's and the drop's [HOST-PLAN-BUG] lines continue under strict leases
+    DRAIN_STRICT_ABORT_DROPPED,      // the shutdown drain logs a leaked lease and continues under strict leases
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);

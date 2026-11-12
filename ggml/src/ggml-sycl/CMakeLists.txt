@@ -457,9 +457,10 @@ if (BUILD_TESTING)
     # The block ring's ensure and the IO engine's workers (th32 §3.3, §5.2, §5.3, §10), host-only: ensure allocates
     # through lazy_io_allocate_host, a link seam the fixture header lazy-io-host-fixture.hpp defines with a counting
     # ledger in place of lazy-table.cpp's HOST_CPU allocation, and the workers read through the PRIVATE_TESTING read
-    # source, so no device, no unified cache and no SYCL module. Links lazy-io-pool.cpp with the row cache its reaper
-    # inserts into (lazy-row-cache.cpp, host-cpu-mapping.cpp) and ggml-base for the log and the abort. The workers'
-    # reads are pread, so it is Linux-only.
+    # source, so no device, no unified cache and no SYCL module. The fixture header defines the pool's other link seam,
+    # ggml_sycl_strict_enabled, as a switch only the strict arms' children turn on. Links lazy-io-pool.cpp with the row
+    # cache its reaper inserts into (lazy-row-cache.cpp, host-cpu-mapping.cpp) and ggml-base for the log and the abort.
+    # The workers' reads are pread, so it is Linux-only.
     #
     # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
     # and the FAIL line the arm that kills it prints. Each registers test-sycl-lazy-io-engine-host-mutant-<name> on the
@@ -487,6 +488,10 @@ if (BUILD_TESTING)
         string(CONCAT _le_re_worker_reap_destroys_pool
             "FAIL a worker's last drop leaves its pool's join to the next FULL reap: the worker's drop ran [0-9]+ "
             "join\\(s\\) on a pool worker and 1 self-join\\(s\\), want 0 and 0")
+        string(CONCAT _le_re_pool_strict_abort_dropped
+            "FAIL a reap whose first step throws aborts under strict leases: the strict child printed 0 line\\(s\\) "
+            "'ring reap failed: the test seam's throw at the reap's first step under GGML_SYCL_STRICT_LEASES=1', "
+            "want 1")
         set(_lazy_io_engine_mutants
             no-ensuring               "${_le_re_no_ensuring}"
             ensuring-kept-on-throw    "${_le_re_ensuring_kept_on_throw}"
@@ -494,7 +499,8 @@ if (BUILD_TESTING)
             no-span-check             "${_le_re_no_span_check}"
             no-alignment-check        "${_le_re_no_alignment_check}"
             shutdown-no-wait          "${_le_re_shutdown_no_wait}"
-            worker-reap-destroys-pool "${_le_re_worker_reap_destroys_pool}")
+            worker-reap-destroys-pool "${_le_re_worker_reap_destroys_pool}"
+            pool-strict-abort-dropped "${_le_re_pool_strict_abort_dropped}")
         add_executable(test-sycl-lazy-io-engine-host
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
             lazy-io-pool.cpp
@@ -8635,10 +8641,12 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
 
     # The IO pool's reap points (th32 §3.3, §11 T5): the entry reap of a planner caller, the reap after a failed load's
     # end, the teardown reap at a model swap, the teardown reap whose first step throws, the shutdown drain with a read
-    # in flight, with the last table and read freed and with a published record never erased, and both orders of a
-    # read's last drop against a stage's take. The stage builds both cards' caches on the multi-device path, so it runs
-    # on level_zero:0,1, exits 77 on the single-device path, carries the OOM-family labels and runs alone. The teardown
-    # throw and the three shutdown fixtures run in children started before the parent initialises SYCL. Lead-run.
+    # in flight, with the last table and read freed and with a published record never erased, that last also under
+    # GGML_SYCL_STRICT_LEASES=1, where the drain aborts (§10), and both orders of a read's last drop against a stage's
+    # take. The stage builds both cards' caches on the multi-device path, so it runs on level_zero:0,1, exits 77 on the
+    # single-device path, carries the OOM-family labels and runs alone. The teardown throw and the four shutdown
+    # fixtures run in children started before the parent initialises SYCL; only the strict one sets the variable.
+    # Lead-run.
     #
     # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
     # and the FAIL line of the arm that kills it, which runs alone (a child arm's mutant is planted in that child). No
@@ -8660,12 +8668,17 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         "FAIL shutdown drains a never-erased record's lease with one leaked-lease line: "
         "after the records were cleared: 'LEAKED-CHILD cleared drops_after_shut_down=1', "
         "want drops_after_shut_down=0")
+    string(CONCAT _lrp_re_drain_strict_abort_dropped
+        "FAIL under strict leases the drain aborts at a never-erased record's leaked lease: "
+        "the strict child printed 0 line\\(s\\) 'leaked ring lease: model=[0-9]+ load=[0-9]+ "
+        "under GGML_SYCL_STRICT_LEASES=1', want 1")
     set(_lazy_reap_points_mutants
-        no-entry-reap          "${_lrp_re_no_entry_reap}"
-        snapshot-carries-lease "${_lrp_re_snapshot_carries_lease}"
-        take-ignores-dying     "${_lrp_re_take_ignores_dying}"
-        reap-inside-try        "${_lrp_re_reap_inside_try}"
-        skip-lease-drain       "${_lrp_re_skip_lease_drain}")
+        no-entry-reap              "${_lrp_re_no_entry_reap}"
+        snapshot-carries-lease     "${_lrp_re_snapshot_carries_lease}"
+        take-ignores-dying         "${_lrp_re_take_ignores_dying}"
+        reap-inside-try            "${_lrp_re_reap_inside_try}"
+        skip-lease-drain           "${_lrp_re_skip_lease_drain}"
+        drain-strict-abort-dropped "${_lrp_re_drain_strict_abort_dropped}")
     add_executable(test-sycl-lazy-reap-points
         tests/test-sycl-lazy-reap-points.cpp)
     target_link_libraries(test-sycl-lazy-reap-points PRIVATE
