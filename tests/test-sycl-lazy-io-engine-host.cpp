@@ -978,18 +978,18 @@ int reap_throw_child() {
     return 0;
 }
 
-// The strict arms (§10: every [HOST-PLAN-BUG] line is a WARN that aborts under ggml_sycl_strict_enabled(), clone()
-// excepted). Each of the pool's four such sites is reached in a child whose fixture strict switch stands for
-// GGML_SYCL_STRICT_LEASES=1: a FULL reap refused under a held witnessed lock, a lease dropped under one, a FULL reap
-// that finds a parked pool a take joined, and a FULL reap whose first step throws. The child prints the site's one
-// [HOST-PLAN-BUG] line, then aborts (SIGABRT) with one line naming the same figures under GGML_SYCL_STRICT_LEASES=1,
-// and never returns. This process keeps the switch off, so the arms above score the same sites' WARN-and-continue
-// path.
+// The strict arms (§10: each [HOST-PLAN-BUG] line of the ring reap and the lease drop is a WARN that aborts under
+// ggml_sycl_strict_enabled()). Each of the pool's four such sites is reached in a child whose fixture strict switch
+// stands for GGML_SYCL_STRICT_LEASES=1: a FULL reap refused under a held witnessed lock, a lease dropped under one, a
+// FULL reap that finds a parked pool a take joined, and a FULL reap whose first step throws. The child prints the
+// site's one [HOST-PLAN-BUG] line, then aborts (SIGABRT) with one line naming the same figures under
+// GGML_SYCL_STRICT_LEASES=1, and never returns. This process keeps the switch off, so the arms above score the same
+// sites' WARN-and-continue path.
 // Engagement: the child ran within 5 s; at the parked site, its ensure made a ring and its take joined that pool.
 // Mutant: pool-strict-abort-dropped, under which each site logs and continues under strict leases too, so the child
-// returns from its site. One registration per site scores that site's return line: pool-strict-abort-dropped the
-// throwing reap's, and its aliases pool-strict-abort-dropped-refused, -drop and -parked (the same selector) the refused
-// reap's, the dropped lease's and the parked pool's.
+// returns from its site. One registration per site scores that site's return line after its one WARN:
+// pool-strict-abort-dropped the throwing reap's, and its aliases pool-strict-abort-dropped-refused, -drop and -parked
+// (the same selector) the refused reap's, the dropped lease's and the parked pool's.
 struct strict_site {
     const char * name;        // the child's site argument
     const char * warn;        // the site's one [HOST-PLAN-BUG] line
@@ -1025,8 +1025,11 @@ const strict_site k_strict_failed = {
     "under GGML_SYCL_STRICT_LEASES=1",
 };
 
-// The child's return is scored first, so a mutant's FAIL line is one only a child that ran past its site prints. A
-// child that died before its site, whatever killed it, fails on the abort's line instead, which no registration names.
+// The child's return is scored first, and its FAIL line carries the count of the site's WARN lines. The return line is
+// the last the child writes before _Exit, so every WARN counted was written before it, and a registration that names a
+// count of 1 matches only a child whose site logged its WARN and then returned. A child that died before its site,
+// whatever killed it, fails on the abort's line instead, and one that returned without its WARN fails with a count of
+// 0, neither of which a registration names.
 arm_result score_strict_site(const strict_site & site) {
     arm_result               r;
     std::vector<std::string> args = { "test-sycl-lazy-io-engine-host", k_strict_child, site.name };
@@ -1044,8 +1047,10 @@ arm_result score_strict_site(const strict_site & site) {
         void_arm(r, engaged);
         return r;
     }
+    const size_t warns = text_count_with(child.err, site.warn);
     expect(r, text_count_with(child.err, "STRICT-CHILD returned") == 0,
-           "the strict child returned from its site: '" + first_line_with(child.err, "STRICT-CHILD returned") + "'");
+           "the strict child returned from its site after " + num(warns) + " line(s) '" + site.warn + "': '" +
+               first_line_with(child.err, "STRICT-CHILD returned") + "'");
     const size_t      aborts     = text_count_with(child.err, site.abort, site.abort_tail);
     const std::string abort_text = site.abort_tail == nullptr ?
                                        "'" + std::string(site.abort) + "'" :
@@ -1053,10 +1058,9 @@ arm_result score_strict_site(const strict_site & site) {
     expect(r, aborts == 1, "the strict child printed " + num(aborts) + " line(s) " + abort_text + ", want 1");
     expect(r, WIFSIGNALED(child.status) && WTERMSIG(child.status) == SIGABRT,
            "the strict child ended with " + status_text(child.status) + ", want SIGABRT");
-    expect(r, text_count_with(child.err, site.warn) == 1 && text_count_with(child.err, "[HOST-PLAN-BUG]") == 1,
-           "the strict child printed " + num(text_count_with(child.err, site.warn)) + " line(s) '" + site.warn +
-               "' among " + num(text_count_with(child.err, "[HOST-PLAN-BUG]")) +
-               " [HOST-PLAN-BUG] line(s), want 1 and 1");
+    expect(r, warns == 1 && text_count_with(child.err, "[HOST-PLAN-BUG]") == 1,
+           "the strict child printed " + num(warns) + " line(s) '" + site.warn + "' among " +
+               num(text_count_with(child.err, "[HOST-PLAN-BUG]")) + " [HOST-PLAN-BUG] line(s), want 1 and 1");
     return r;
 }
 

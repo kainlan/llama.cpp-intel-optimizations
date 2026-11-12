@@ -466,8 +466,10 @@ if (BUILD_TESTING)
     # and the FAIL line the arm that kills it prints. Each registers test-sycl-lazy-io-engine-host-mutant-<name> on the
     # one executable, which passes only when that line appears. A mutant whose arm scores a child is registered on the
     # child's return, a line only a child that ran past its mutated site prints, never on a missing abort line, which a
-    # child that died early for any other reason prints too. The strict sites' mutant has one registration per site:
-    # pool-strict-abort-dropped (the throwing reap) and its aliases -refused, -drop and -parked, the same selector.
+    # child that died early for any other reason prints too. A strict site's return line carries the count of the
+    # site's WARN lines, and its registration names a count of 1, so it proves the WARN fired before the return. The
+    # strict sites' mutant has one registration per site: pool-strict-abort-dropped (the throwing reap) and its aliases
+    # -refused, -drop and -parked, the same selector.
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         set(_le_rules "FAIL ensure allocates the need once and refuses what the plan did not charge: ")
         string(CONCAT _le_re_no_ensuring
@@ -491,18 +493,19 @@ if (BUILD_TESTING)
         string(CONCAT _le_re_worker_reap_destroys_pool
             "FAIL a worker's last drop leaves its pool's join to the next FULL reap: the worker's drop ran [0-9]+ "
             "join\\(s\\) on a pool worker and 1 self-join\\(s\\), want 0 and 0")
+        set(_le_strict_returned "the strict child returned from its site after 1 line\\(s\\) '\\[HOST-PLAN-BUG\\] ")
         string(CONCAT _le_re_pool_strict_abort_dropped
-            "FAIL a reap whose first step throws aborts under strict leases: "
-            "the strict child returned from its site: 'STRICT-CHILD returned'")
+            "FAIL a reap whose first step throws aborts under strict leases: ${_le_strict_returned}"
+            "ring reap failed: the test seam's throw at the reap's first step': 'STRICT-CHILD returned'")
         string(CONCAT _le_re_pool_strict_abort_dropped_refused
-            "FAIL a reap refused under a held lock aborts under strict leases: "
-            "the strict child returned from its site: 'STRICT-CHILD returned'")
+            "FAIL a reap refused under a held lock aborts under strict leases: ${_le_strict_returned}"
+            "ring reap refused: strict-child-lock held': 'STRICT-CHILD returned'")
         string(CONCAT _le_re_pool_strict_abort_dropped_drop
-            "FAIL a lease dropped under a held lock aborts under strict leases: "
-            "the strict child returned from its site: 'STRICT-CHILD returned'")
+            "FAIL a lease dropped under a held lock aborts under strict leases: ${_le_strict_returned}"
+            "ring lease dropped with strict-child-lock held': 'STRICT-CHILD returned'")
         string(CONCAT _le_re_pool_strict_abort_dropped_parked
-            "FAIL a reap finding a parked pool with a lease aborts under strict leases: "
-            "the strict child returned from its site: 'STRICT-CHILD returned'")
+            "FAIL a reap finding a parked pool with a lease aborts under strict leases: ${_le_strict_returned}"
+            "reap found a parked pool holding 1 lease\\(s\\), want 0': 'STRICT-CHILD returned'")
         string(CONCAT _le_re_ensure_witness_dropped
             "FAIL an ensure entered holding a witnessed lock aborts naming it: "
             "the held child's ensure returned: 'ENSURE-CHILD returned ok'")
@@ -8669,8 +8672,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
     # and the FAIL line of the arm that kills it, which runs alone (a child arm's mutant is planted in that child). No
     # mutant registration carries SKIP_RETURN_CODE, for the reason the lazy-ring block gives. The strict drain's mutant
-    # is registered on its child's shutdown returning, a line only a child whose drain ran prints, never on the missing
-    # abort line, which a child that died between its load and the drain for any other reason prints too.
+    # is registered on its child's shutdown returning after 1 leaked-lease line, which only a child whose drain logged
+    # the leaked lease and whose shutdown then returned prints, never on the missing abort line, which a child that
+    # died between its load and the drain for any other reason prints too.
     string(CONCAT _lrp_re_no_entry_reap
         "FAIL a stage's entry reap frees a ring another thread parked before the stage takes its lease: "
         "B's first take ran with 1 parked node\\(s\\) after its entry reap, want 0: "
@@ -8690,7 +8694,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         "want drops_after_shut_down=0")
     string(CONCAT _lrp_re_drain_strict_abort_dropped
         "FAIL under strict leases the drain aborts at a never-erased record's leaked lease: "
-        "the strict child's shutdown returned: 'LEAKED-STRICT-CHILD returned threw=")
+        "the strict child's shutdown returned after 1 leaked-lease line\\(s\\): 'LEAKED-STRICT-CHILD returned threw=")
     set(_lazy_reap_points_mutants
         no-entry-reap              "${_lrp_re_no_entry_reap}"
         snapshot-carries-lease     "${_lrp_re_snapshot_carries_lease}"
