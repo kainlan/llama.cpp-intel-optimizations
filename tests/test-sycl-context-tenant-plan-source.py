@@ -48,7 +48,9 @@ covers ggml-sycl.cpp): (1) names: every GGML_SYCL_*STRICT* name in ggml/, src/, 
 tests/, scripts/ and the three user-facing SYCL docs is the one switch, GGML_SYCL_STRICT_LEASES, or
 the single exception GGML_SYCL_UNIFIED_ALLOC_STRICT (until llama.cpp-1obo), or the named non-member
 GGML_SYCL_HANDLE_STRICT; (2) exactly one getenv of the switch, inside the function
-ggml_sycl_strict_enabled() resolves to (followed one call deep); (3) the non-member stays
+ggml_sycl_strict_enabled() resolves to (followed one call deep), with one production definition of
+that accessor (a host test's link-seam double under tests/ or ggml/src/ggml-sycl/tests/ is not
+counted); (3) the non-member stays
 report-only: every read of its variable is part of an if condition whose branches hold only
 GGML_LOG_* calls, and its occurrence set (definition, extern, env-table entry, three reads) is
 closed, which refuses an alias, a reference and a by-reference argument; (4) every
@@ -684,6 +686,10 @@ STRICT_CENSUS = {
                     "docs/backend/sycl-env-vars.md"),
 }
 STRICT_ACCESSOR_NAME = "ggml_sycl_strict_enabled"
+# A host test that compiles a device-free source without unified-cache.cpp defines the accessor as a link seam of its
+# own, a test double that reads no environment (the getenv count still covers these directories). The one-definition
+# clause counts production definitions only, outside these.
+STRICT_TEST_DIRS = ("tests/", "ggml/src/ggml-sycl/tests/")
 STRICT_ACCESSOR_COND = re.compile(r"^(?:::)?(?:ggml_sycl::)?ggml_sycl_strict_enabled\(\s*\)$")
 STRICT_PLAN_BUG = re.compile(r"(?:GGML_ABORT\s*\(|\bggml_abort\s*\(\s*__FILE__\s*,\s*__LINE__\s*,)\s*"
                              r"\"(\[[A-Z0-9]+(?:-[A-Z0-9]+)*-PLAN-BUG\])")
@@ -1047,7 +1053,8 @@ def _getenv_scan(name, text):
 
 
 def strict_getenv_violations(code_files):
-    """Exactly one getenv of the switch, inside the function ggml_sycl_strict_enabled() resolves to. String
+    """Exactly one getenv of the switch, inside the function ggml_sycl_strict_enabled() resolves to, and exactly one
+    production definition of that accessor (a host test's link seam under STRICT_TEST_DIRS is not counted). String
     literals are folded first, so getenv("GGML_SYCL_" "STRICT_LEASES") is seen as the read it is."""
     out = []
     calls = []
@@ -1065,7 +1072,7 @@ def strict_getenv_violations(code_files):
                     (len(calls), ["%s:%d" % (n, line_of(code_files[n], p)) for n, p in calls])))
     exports = []
     for name, text in sorted(code_files.items()):
-        if STRICT_ACCESSOR_NAME not in text:
+        if STRICT_ACCESSOR_NAME not in text or name.startswith(STRICT_TEST_DIRS):
             continue
         for span in function_bodies(scrubbed(text, False), STRICT_ACCESSOR_NAME):
             exports.append((name, span))
@@ -1280,6 +1287,12 @@ def strict_mutants(files):
     yield ("second getenv, bare and spaced, in src/", append("src/llama.cpp", 'static const char * e = getenv( "%s" );' % STRICT_LEASES),
            "found 2 getenv")
     yield ("the getenv removed", edit(_UC, 'std::getenv("%s")' % STRICT_LEASES, "nullptr", "getenv removed"), "found 0 getenv")
+    double = ("namespace ggml_sycl {\nbool %s() {\n    return false;\n}\n}  // namespace ggml_sycl"
+              % STRICT_ACCESSOR_NAME)
+    yield ("a second definition of the accessor in a production source",
+           append("ggml/src/ggml-sycl/lazy-io-pool.cpp", double), "found 2 definitions of the accessor")
+    yield ("positive control: a host test's own link-seam definition of the accessor",
+           append("tests/test-sycl-lazy-io-engine-host.cpp", double), None)
     yield ("the switch name held in a variable", append(_MH, 'static const char * k = "%s";' % STRICT_LEASES),
            "outside its one reader")
     reader = edit(_UC, "bool ggml_sycl_strict_enabled() {\n    return strict_lease_checks_enabled();\n}",
