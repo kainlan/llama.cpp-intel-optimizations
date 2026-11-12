@@ -1944,7 +1944,8 @@ def mutations(header_raw, source):
             # The guard is found with or without its template argument, as impl_first_publish_wrong reads it, and kept
             # as written: the mutant only moves the reservation under it.
             lock = re.compile(r"( *std::lock_guard(?:<[^<>]*>)?\s+lock\s*\(\s*g_tensor_inventory_mutex\s*\);\n)"
-                              r"(?= *const auto snapshot = ggml_sycl::lifecycle_select_placement_plan\(model\.model_id)")
+                              r"(?= *const auto snapshot = "
+                              r"ggml_sycl::lifecycle_select_placement_plan\(model\.model_id)")
             if src.count(old) != 1 or len(lock.findall(src)) != 1:
                 muts.append(("PATTERN NOT FOUND: " + label, "PATTERN", header_raw, src))
             else:
