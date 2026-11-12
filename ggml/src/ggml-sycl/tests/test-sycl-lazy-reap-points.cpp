@@ -78,6 +78,9 @@ const char * k_reap_failed  = "[HOST-PLAN-BUG] ring reap failed: the test seam's
 const char * k_lease_locked = "[HOST-PLAN-BUG] ring lease dropped with";
 const char * k_leaked       = "[HOST-PLAN-BUG] leaked ring lease: model=";
 
+// What ggml_backend_sycl_shutdown throws when the cache census finds a live owner's allocation.
+const char * k_census_refusal = "SYCL unified cache arena release failed";
+
 // The mutant a child plants, passed on its command line; null in a plain run.
 const char * g_child_mutant = nullptr;
 
@@ -682,9 +685,18 @@ int leaked_child() {
     child_setup("LEAKED-CHILD", m);
     std::fprintf(stderr, "LEAKED-CHILD loaded model=%llu load=%llu\n", (unsigned long long) m.a.token.model_id,
                  (unsigned long long) m.a.token.load_txn_id);
-    const std::string threw   = shut_down();
-    const size_t      records = lifecycle_plan_lease_count_for_test();
+    // Device 0's LAZY_STAGING bytes around the shutdown, read directly so an unreadable reading prints as one: a
+    // refused shutdown stops before the cache teardown, so the reading after it still has a cache to read.
+    uint64_t          before      = 0;
+    uint64_t          after       = 0;
+    const bool        read_before = unified_cache_role_bytes_for_testing(0, alloc_role::LAZY_STAGING, &before);
+    const std::string threw       = shut_down();
+    const size_t      records     = lifecycle_plan_lease_count_for_test();
+    const bool        read_after  = unified_cache_role_bytes_for_testing(0, alloc_role::LAZY_STAGING, &after);
     std::fprintf(stderr, "LEAKED-CHILD returned threw=%s records=%zu\n", threw.c_str(), records);
+    std::fprintf(stderr, "LEAKED-CHILD ring read=%d%d before=%llu after=%llu role0=%llu\n", read_before ? 1 : 0,
+                 read_after ? 1 : 0, (unsigned long long) before, (unsigned long long) after,
+                 (unsigned long long) m.role0);
     lifecycle_plan_clear_for_test();
     child_exit("LEAKED-CHILD", "cleared drops_after_shut_down=" + num(registry().drops_after_shut_down), 0);
 }
@@ -798,9 +810,10 @@ arm_result arm_shutdown_freed() {
 // pool's lease through the shutdown. The drain moves that lease out, logs one "[HOST-PLAN-BUG] leaked ring lease:
 // model=<m> load=<t>" line naming A, and drops it with no lock held: after the shutdown no record holds a lease, and
 // once the records are cleared, as static destruction would, no held lease's destructor runs after shut-down.
-// The shutdown's own verdict is not scored: A is never unloaded, so the MoE workspace blobs its load materialized and
-// its unload would retire are still live, and the cache census after the drain refuses the shutdown, as it must for a
-// live owner. The drain runs before that census, and the leaked line and the record count show it ran.
+// The shutdown itself must throw the cache census's refusal, and only that: A is never unloaded, so the MoE workspace
+// blobs its load materialized and its unload would retire are still live at the census, which runs after the drain and
+// refuses a live owner's allocations. None of them is the ring: device 0's LAZY_STAGING bytes, above the pre-load
+// figure before the shutdown, are back to it after, so the drain's reap freed the ring before the census.
 // Engagement: the child's backends initialise and A loads and ensures.
 // Mutant: skip-lease-drain, under which the drain moves no lease, so clearing the records destroys a held lease after
 // shut-down.
@@ -817,8 +830,18 @@ arm_result arm_leaked() {
     expect(r, text_count_with(err, "LEAKED-CHILD cleared drops_after_shut_down=0") == 1,
            "after the records were cleared: '" + first_line_with(err, "LEAKED-CHILD cleared") +
                "', want drops_after_shut_down=0");
-    expect(r, text_count_with(err, "LEAKED-CHILD returned threw=", " records=0") == 1,
-           "after the shutdown: '" + first_line_with(err, "LEAKED-CHILD returned") + "', want records=0");
+    const std::string returned      = first_line_with(err, "LEAKED-CHILD returned");
+    const std::string want_returned = std::string("LEAKED-CHILD returned threw=") + k_census_refusal + " records=0";
+    expect(r, returned == want_returned, "after the shutdown: '" + returned + "', want '" + want_returned + "'");
+    const std::string ring       = first_line_with(err, "LEAKED-CHILD ring ");
+    const size_t      ring_from  = printed(ring, "before");
+    const size_t      ring_after = printed(ring, "after");
+    const size_t      ring_role0 = printed(ring, "role0");
+    expect(r,
+           ring.find(" read=11 ") != std::string::npos && ring_role0 != SIZE_MAX && ring_from != SIZE_MAX &&
+               ring_from > ring_role0 && ring_after == ring_role0,
+           "device 0's LAZY_STAGING bytes around the shutdown: '" + ring +
+               "', want both read, before above role0 and after equal to it: the drain's reap frees the ring");
     const std::string want = ids.empty() ? std::string(k_leaked) : std::string(k_leaked) + ids.substr(6);
     expect(
         r, !ids.empty() && text_count_with(err, want.c_str()) == 1 && text_count_with(err, k_leaked) == 1,
