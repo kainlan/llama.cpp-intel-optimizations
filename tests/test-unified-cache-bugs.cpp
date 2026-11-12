@@ -7,6 +7,7 @@
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/model-lifecycle.hpp"
+#include "ggml-sycl/tests/pinned-host-block-test-common.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
 #include "sycl-selector-fallback.hpp"
@@ -317,6 +318,7 @@ static bool test_multi_layout_id_mapping_survives_drop(sycl::queue & q) {
 static bool test_planned_materialization_guard(sycl::queue & q) {
     printf("\n=== Test: planned materialization guard ===\n");
 
+    pinned_host_block_test::block host_data(q, 64, 0xef);
     ggml_sycl::unified_cache cache(q, 4096);
     ggml_sycl_load_txn       txn{};
     if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK || txn.id == 0) {
@@ -358,9 +360,8 @@ static bool test_planned_materialization_guard(sycl::queue & q) {
         return false;
     }
 
-    std::vector<uint8_t> host_data(64, 0xef);
-    ggml_sycl_cache_id   host_key = ggml_sycl::test_make_cache_id(host_data.data());
-    host_key.aux_id               = 7;
+    ggml_sycl_cache_id host_key = ggml_sycl::test_make_cache_id(host_data.data());
+    host_key.aux_id             = 7;
 
     cache.register_host_expert(host_key, host_data.data(), host_data.size(), GGML_LAYOUT_AOS);
     if (cache.lookup_expert(host_key) != nullptr) {

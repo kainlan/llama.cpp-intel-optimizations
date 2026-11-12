@@ -9082,6 +9082,11 @@ void * unified_cache_kv_arena_alloc(int device_id, size_t size);
 // dispatch routed a host-tier weight to a device kernel, so a correct build reads 0.
 uint64_t unified_cache_stream_dma_file_mapped_refusals() noexcept;
 
+// How many host registrations (register_host_expert, register_host_weight) were refused for a pointer no registry
+// names (design 5efe §4.8, §7 C6). A refusal on a real load means a caller registered memory with no owner, so a
+// correct build reads 0 after one.
+uint64_t unified_cache_unregistered_host_registration_refusals() noexcept;
+
 // A device-bound copy of file-mapped bytes outside a load transaction or a cache materialization
 // (docs/design/sycl-mmap-host-tier.md §5.3 "Gates"). It is noted at the instrumented chokepoints only, once per copy:
 // mem_copy and mem_copy_async (both reach mem_copy_submit, as unified_cache::copy_to_device_async and stream_dma's

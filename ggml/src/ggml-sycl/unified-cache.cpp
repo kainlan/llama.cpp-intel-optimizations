@@ -9251,6 +9251,21 @@ static std::shared_ptr<mem_handle> make_direct_entry_handle(const unified_cache_
         cache_key, cache_device, entry.device_ptr, entry.layout, entry.location == cache_location::DEVICE, &entry));
 }
 
+// What a host registration or the direct stage's in-place publication learns about a source pointer (design 5efe
+// §4.8, §7 C6): the tier of the registered row it lies in, and by how many bytes [ptr, ptr + size) runs past the end of
+// that row (0 when it fits, or when the row's extent is not known: an exact-base or alloc-registry answer carries no
+// extent).
+struct host_registration_view {
+    alloc_tier tier    = alloc_tier::UNREGISTERED;
+    size_t     overrun = 0;
+};
+
+static host_registration_view host_registration_tier(const void * ptr, size_t size, int device);
+static bool                   host_registration_refuses(const char *                   api,
+                                                        const void *                   ptr,
+                                                        size_t                         size,
+                                                        const host_registration_view & view);
+
 direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                                                        const void *         src_ptr,
                                                        size_t               src_size,
@@ -9409,15 +9424,20 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             GGML_LOG_WARN("[DIRECT-STAGE] WEIGHT zone full (%zu bytes) — host arena fallback\n", dst_size);
         }
 
-        const sycl::context & ctx   = queue->get_context();
-        sycl::usm::alloc      atype = sycl::get_pointer_type(src_ptr, ctx);
+        // The tier of the registered allocation the source lies in (design 5efe §4.8, §5.3, §7 C6). A source no
+        // registry names has no owner, so it is copied into an owned pinned block or refused, never published in place.
+        const host_registration_view src_view = host_registration_tier(src_ptr, src_size, cache_device);
+        const alloc_tier             src_tier = src_view.tier;
 
         void *         host_ptr       = nullptr;
         bool           host_allocated = false;
         mem_handle     host_alloc_owner;
         cache_location loc            = cache_location::HOST_MMAP;
 
-        if (atype == sycl::usm::alloc::host) {
+        if (src_tier == alloc_tier::HOST_PINNED) {
+            if (host_registration_refuses("direct_stage_expert", src_ptr, src_size, src_view)) {
+                return result;
+            }
             host_ptr = const_cast<void *>(src_ptr);
             loc      = cache_location::HOST_PINNED;
         } else {
@@ -9447,9 +9467,23 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                 }
             }
             if (!host_ptr) {
+                // The pinned copy was refused. Publishing the source in place is allowed only for a slice of a
+                // FILE_MAPPED mapping (a HOST_PINNED source was published above). A source in no registry is refused
+                // and counted. A source in any other tier is refused without a count: the in-place publication takes
+                // no owner, and the fallback only ever meant a mapped slice, whose mapping the cache already holds.
+                if (host_registration_refuses("direct_stage_expert", src_ptr, src_size, src_view)) {
+                    return result;
+                }
+                if (src_tier != alloc_tier::FILE_MAPPED) {
+                    GGML_LOG_WARN(
+                        "[DIRECT-STAGE] direct_stage_expert refused: source tier %s cannot be published in place: "
+                        "the publication takes no owner and only a mapped-file slice may use it; ptr=%p size=%zu\n",
+                        alloc_tier_name(src_tier), src_ptr, src_size);
+                    return result;
+                }
                 host_ptr = const_cast<void *>(src_ptr);
                 loc      = cache_location::HOST_MMAP;
-                GGML_LOG_WARN("[DIRECT-STAGE] host arena exhausted, raw mmap fallback\n");
+                GGML_LOG_WARN("[DIRECT-STAGE] host arena exhausted, publishing the registered source in place\n");
             }
         }
 
@@ -10684,8 +10718,10 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
 
     // The host registration must not refuse once the device entries are withdrawn, so what it checks is checked here
     // first, while nothing has changed. Inside the planned materialization session the registration runs in, it
-    // refuses only for the load effect and for a plan the cache does not hold, and neither can change while the
-    // caller holds the inventory mutex. A host id's existing entry is checked under the locks below.
+    // refuses for the load effect, for a plan the cache does not hold, and for a pointer inside no registered row
+    // (design 5efe §4.8, §7 C6). The first two cannot change while the caller holds the inventory mutex. The pointer
+    // is resolved from a pinned owner whose tier is checked below, and that owner's allocation is a registered row, so
+    // the third cannot fire. A host id's existing entry is checked under the locks below.
     if (acquire_bound_load_effect().failed()) {
         out.reason = "load effect unavailable";
         return false;
@@ -11607,6 +11643,78 @@ size_t unified_cache::drop_expert_entries_for_tensor_layout(const std::vector<gg
     return dropped;
 }
 
+// Host registrations refused for a pointer no registry names (design 5efe §4.8, §7 C6), process-wide.
+static std::atomic<uint64_t> g_unregistered_host_registration_refusals{ 0 };
+
+uint64_t unified_cache_unregistered_host_registration_refusals() noexcept {
+    return g_unregistered_host_registration_refusals.load(std::memory_order_relaxed);
+}
+
+// The tier of the registered allocation `ptr` lies in. query_location answers an exact base, or a range the alloc
+// registry holds (file mappings, tracked blocks), so a slice inside a pinned allocation, which only the runtime
+// registry's containment index knows, comes back UNREGISTERED from it. A host registration takes such slices (a
+// SYCL_Host buffer's experts), so the index is asked before a pointer is called unregistered.
+//
+// The containment step is unified_lookup_runtime_allocation, which keeps the index and registry assertions.
+//
+// Lock (design §12.5): g_runtime_alloc_mutex, L5, taken inside unified_lookup_runtime_allocation. The registrations
+// call this before they take direct_stage_mutex_ and rw_mutex_ (L4), and hold no listed lock themselves, so the mutex
+// is taken alone, as query_location's own lookup takes it just before. Nothing is acquired and nothing is logged under
+// it; the row is copied out and the lock drops.
+static host_registration_view host_registration_tier(const void * ptr, size_t size, int device) {
+    host_registration_view view;
+    view.tier = query_location(ptr, device).tier;
+    if (view.tier != alloc_tier::UNREGISTERED || ptr == nullptr) {
+        return view;
+    }
+    alloc_metadata row;
+    if (!unified_lookup_runtime_allocation(ptr, &row)) {
+        return view;
+    }
+    view.tier               = row.tier;
+    // The containing row's extent is in hand, so a slice that starts inside it and runs past its end is measured here.
+    // The lookup guarantees row.ptr <= ptr < row_end, so the room left in the row is computed without adding to ptr: a
+    // size near the top of the address space cannot wrap into reading as a fit.
+    const uintptr_t row_end = reinterpret_cast<uintptr_t>(row.ptr) + row.size;
+    const size_t    room    = static_cast<size_t>(row_end - reinterpret_cast<uintptr_t>(ptr));
+    view.overrun            = size > room ? size - room : 0;
+    return view;
+}
+
+// A host weight or expert is registered over memory some owner holds: a slice of a registered allocation. A pointer
+// inside no registered row (host_registration_tier answers UNREGISTERED, after the exact base, the range and the
+// containment lookups) has no owner to name, so the entry would be a non_owning_external_host row over memory the cache
+// can neither keep alive nor account for. A slice that starts inside a row and runs past its end names memory outside
+// the row's owner, and is refused the same way. Both refusals are counted and named, and the caller sees false with
+// nothing registered.
+static bool host_registration_refuses(const char *                   api,
+                                      const void *                   ptr,
+                                      size_t                         size,
+                                      const host_registration_view & view) {
+    if (view.tier != alloc_tier::UNREGISTERED && view.overrun != 0) {
+        g_unregistered_host_registration_refusals.fetch_add(1, std::memory_order_relaxed);
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] %s refused: host_slice_overruns_allocation ptr=%p size=%zu runs %zu bytes past the end of "
+            "the registered allocation it starts in\n",
+            api, ptr, size, view.overrun);
+        return true;
+    }
+    bool planted_allowed = false;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    // The refusal removed: the unregistered pointer is registered as before.
+    planted_allowed = scratch_test_mutant_on(scratch_test_mutant::UNREGISTERED_HOST_ALLOWED);
+#endif
+    if (view.tier != alloc_tier::UNREGISTERED || planted_allowed) {
+        return false;
+    }
+    g_unregistered_host_registration_refusals.fetch_add(1, std::memory_order_relaxed);
+    GGML_LOG_WARN(
+        "[UNIFIED-CACHE] %s refused: unregistered_host_pointer ptr=%p size=%zu names no owner; a host registration "
+        "takes a slice of a registered allocation\n",
+        api, ptr, size);
+    return true;
+}
+
 bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                                          void *                ptr,
                                          size_t                size,
@@ -11652,20 +11760,14 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         return false;
     }
 
-    const int       dev = ggml_sycl_get_device_id_from_queue(queue_);
-    memory_location loc = query_location(ptr, dev);
-    cache_location  cache_loc =
-        loc.tier == alloc_tier::HOST_PINNED ? cache_location::HOST_PINNED : cache_location::HOST_MMAP;
-    if (cache_loc != cache_location::HOST_PINNED) {
-        try {
-            const sycl::usm::alloc atype = sycl::get_pointer_type(ptr, queue_.get_context());
-            if (atype == sycl::usm::alloc::host || atype == sycl::usm::alloc::shared) {
-                cache_loc = cache_location::HOST_PINNED;
-            }
-        } catch (...) {
-            cache_loc = cache_location::HOST_MMAP;
-        }
+    const int                    dev  = ggml_sycl_get_device_id_from_queue(queue_);
+    const host_registration_view view = host_registration_tier(ptr, size, dev);
+    const alloc_tier             tier = view.tier;
+    if (host_registration_refuses("register_host_expert", ptr, size, view)) {
+        return false;
     }
+    cache_location cache_loc =
+        tier == alloc_tier::HOST_PINNED ? cache_location::HOST_PINNED : cache_location::HOST_MMAP;
 
     if (GGML_SYCL_FAIL_EXPERT_PHASE(expert_fault_phase::HOST_BEFORE_COMMIT)) {
         return false;
@@ -11829,20 +11931,14 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
         return false;
     }
 
-    const int       dev = ggml_sycl_get_device_id_from_queue(queue_);
-    memory_location loc = query_location(ptr, dev);
-    cache_location  cache_loc =
-        loc.tier == alloc_tier::HOST_PINNED ? cache_location::HOST_PINNED : cache_location::HOST_MMAP;
-    if (cache_loc != cache_location::HOST_PINNED) {
-        try {
-            const sycl::usm::alloc atype = sycl::get_pointer_type(ptr, queue_.get_context());
-            if (atype == sycl::usm::alloc::host || atype == sycl::usm::alloc::shared) {
-                cache_loc = cache_location::HOST_PINNED;
-            }
-        } catch (...) {
-            cache_loc = cache_location::HOST_MMAP;
-        }
+    const int                    dev  = ggml_sycl_get_device_id_from_queue(queue_);
+    const host_registration_view view = host_registration_tier(ptr, size, dev);
+    const alloc_tier             tier = view.tier;
+    if (host_registration_refuses("register_host_weight", ptr, size, view)) {
+        return false;
     }
+    cache_location cache_loc =
+        tier == alloc_tier::HOST_PINNED ? cache_location::HOST_PINNED : cache_location::HOST_MMAP;
 
     std::shared_ptr<mem_handle> direct_handle;
     bool                        cache_inserted = false;

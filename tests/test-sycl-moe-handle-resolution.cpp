@@ -6,8 +6,9 @@
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/mem-handle.hpp"
-#include "ggml-sycl/moe-resolved-batch.hpp"
 #include "ggml-sycl/model-lifecycle.hpp"
+#include "ggml-sycl/moe-resolved-batch.hpp"
+#include "ggml-sycl/tests/pinned-host-block-test-common.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "sycl-selector-fallback.hpp"
 
@@ -195,16 +196,54 @@ static bool test_direct_staged_device_resolution(sycl::queue & q) {
     return true;
 }
 
+// Retires the host expert entry a test registered over memory it owns, before that memory is freed. The global cache
+// outlives the test, so an entry left behind would point at freed memory. Only WITHDRAWN means the storage is
+// reclaimed: DEFERRED leaves the canonical entry naming the memory, NOT_FOUND means the registration the guard was
+// declared for never took place, and INVALID is a bad key. Anything else is reported through `refused` for the caller
+// to fail on, since a destructor cannot return it.
+struct host_entry_retire {
+    ggml_sycl::unified_cache * cache;
+    ggml_sycl_cache_id         key;
+    const char *               what;
+    bool &                     refused;
+
+    ~host_entry_retire() {
+        const ggml_sycl::expert_retire_status status =
+            cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test/MoE host expert");
+        cache->process_deferred_frees_public();
+        if (status != ggml_sycl::expert_retire_status::WITHDRAWN) {
+            fprintf(
+                stderr,
+                "  FAIL: retiring the %s entry returned %s, expected WITHDRAWN: the entry would outlive its memory\n",
+                what, pinned_host_block_test::retire_status_name(status));
+            refused = true;
+        }
+    }
+};
+
+static bool test_direct_host_and_miss_resolution_body(sycl::queue & q, bool & retire_refused);
+
 static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
+    bool       retire_refused = false;
+    const bool ok             = test_direct_host_and_miss_resolution_body(q, retire_refused);
+    return ok && !retire_refused;
+}
+
+static bool test_direct_host_and_miss_resolution_body(sycl::queue & q, bool & retire_refused) {
     printf("\n=== Test: direct host and miss expert resolution ===\n");
 
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(0);
     TEST_ASSERT(cache != nullptr, "global unified cache unavailable");
-    uint8_t * pinned = static_cast<uint8_t *>(sycl::malloc_host(64, q));
-    TEST_ASSERT(pinned != nullptr, "sycl::malloc_host failed");
-    std::fill(pinned, pinned + 64, 0x53);
+    // Registered memory only: a pointer no registry names is refused (design 5efe §4.8, §7 C6).
+    pinned_host_block_test::block pinned_block(q, 64, 0x53);
+    uint8_t *                     pinned   = pinned_block.data();
     ggml_sycl_cache_id host_key = ggml_sycl::test_make_cache_id(pinned);
     host_key.aux_id             = 0x70005;
+
+    // The global cache outlives this function, so the entry registered over the block is retired before the block is
+    // freed. The guard is declared after the block and before every handle below, so those release first and the
+    // retire finds no lease.
+    host_entry_retire retire_host_entry{ cache, host_key, "pinned host expert", retire_refused };
 
     ggml_sycl::mem_handle host_handle;
     {
@@ -235,26 +274,31 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
     TEST_ASSERT(layout_miss.reason == ggml_sycl::expert_resolve_reason::LAYOUT_MISMATCH,
                 "wrong layout should report layout mismatch");
 
-    std::vector<uint8_t> plain_host(64, 0x54);
-    ggml_sycl_cache_id   mmap_key = ggml_sycl::test_make_cache_id(plain_host.data());
-    mmap_key.aux_id               = 0x70007;
+    // A mapped host expert is a slice of a FILE_MAPPED mapping, registered with the mapping's owner.
+    pinned_host_block_test::mapped_block mapped(0, 1);
+    uint8_t *                            mapped_slice = mapped.data();
+    ggml_sycl_cache_id                   mmap_key     = ggml_sycl::test_make_cache_id(mapped_slice);
+    mmap_key.aux_id                                   = 0x70007;
+    // Declared after the mapping, so the entry (which holds the mapping's owner) is retired before the mapping goes.
+    host_entry_retire retire_mapped_entry{ cache, mmap_key, "FILE_MAPPED host expert", retire_refused };
     {
         ggml_sycl::scoped_planned_materialization planned_materialization(cache, "test/MoE mmap expert registration");
-        TEST_ASSERT(cache->register_host_expert(mmap_key, plain_host.data(), plain_host.size(), GGML_LAYOUT_AOS),
-                    "register_host_expert should succeed for mmap host expert");
+        TEST_ASSERT(
+            cache->register_host_expert_owned(mmap_key, mapped_slice, 64, GGML_LAYOUT_AOS, nullptr, mapped.owner()),
+            "register_host_expert_owned should succeed for a FILE_MAPPED host expert");
     }
 
     auto mmap_res = cache->resolve_expert(make_request(mmap_key, GGML_LAYOUT_AOS));
-    TEST_ASSERT(mmap_res.reason == ggml_sycl::expert_resolve_reason::FOUND, "plain host expert should resolve");
-    TEST_ASSERT(mmap_res.tier == ggml_sycl::expert_resolve_tier::HOST_MMAP, "plain host expert tier mismatch");
-    TEST_ASSERT(mmap_res.location == ggml_sycl::cache_location::HOST_MMAP, "plain host expert location mismatch");
-    TEST_ASSERT(mmap_res.cpu_accessible, "plain host expert should be CPU accessible");
+    TEST_ASSERT(mmap_res.reason == ggml_sycl::expert_resolve_reason::FOUND, "FILE_MAPPED host expert should resolve");
+    TEST_ASSERT(mmap_res.tier == ggml_sycl::expert_resolve_tier::HOST_MMAP, "FILE_MAPPED host expert tier mismatch");
+    TEST_ASSERT(mmap_res.location == ggml_sycl::cache_location::HOST_MMAP, "FILE_MAPPED host expert location mismatch");
+    TEST_ASSERT(mmap_res.cpu_accessible, "FILE_MAPPED host expert should be CPU accessible");
 
     auto mmap_blocked_req            = make_request(mmap_key, GGML_LAYOUT_AOS);
     mmap_blocked_req.allow_mmap_host = false;
     auto mmap_blocked                = cache->resolve_expert(mmap_blocked_req);
     TEST_ASSERT(mmap_blocked.reason == ggml_sycl::expert_resolve_reason::MMAP_HOST_DISALLOWED,
-                "plain host expert should honor allow_mmap_host=false");
+                "FILE_MAPPED host expert should honor allow_mmap_host=false");
 
     ggml_sycl_cache_id missing_key = ggml_sycl::test_make_cache_id(reinterpret_cast<void *>(0x12345));
     missing_key.aux_id             = 0x70006;
@@ -263,7 +307,6 @@ static bool test_direct_host_and_miss_resolution(sycl::queue & q) {
     TEST_ASSERT(missing.tier == ggml_sycl::expert_resolve_tier::UNAVAILABLE, "missing expert tier mismatch");
     TEST_ASSERT(missing.ptr == nullptr, "missing expert pointer should be null");
 
-    sycl::free(pinned, q);
     return true;
 }
 

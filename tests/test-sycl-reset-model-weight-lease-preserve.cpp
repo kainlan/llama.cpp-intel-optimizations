@@ -95,6 +95,7 @@
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/model-lifecycle.hpp"
+#include "ggml-sycl/tests/pinned-host-block-test-common.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
 #include "sycl-selector-fallback.hpp"
@@ -429,8 +430,8 @@ static bool test_live_model_idle_weights_survive_load_boundary(sycl::queue & q) 
 // model's ownership vetoes reclaim in every mode.
 static bool test_host_registration_initial_insert_failures(sycl::queue & q) {
     printf("\n=== Test: host registration insertion failures preserve prior aliases ===\n");
-    ggml_sycl::unified_cache cache(q, 64 * 1024);
-    std::vector<uint8_t>     dense_data(128, 0x41), expert_data(128, 0x42), alias_data(128, 0x43);
+    pinned_host_block_test::block dense_data(q, 128, 0x41), expert_data(q, 128, 0x42), alias_data(q, 128, 0x43);
+    ggml_sycl::unified_cache      cache(q, 64 * 1024);
     const auto               dense_key     = ggml_sycl::test_make_cache_id(dense_data.data());
     const auto               expert_key    = ggml_sycl::test_make_cache_id(expert_data.data());
     const auto               alias_key     = ggml_sycl::test_make_cache_id(alias_data.data());
@@ -462,8 +463,8 @@ static bool test_host_registration_initial_insert_failures(sycl::queue & q) {
 }
 
 static bool test_external_host_registration_never_freed(sycl::queue & q) {
-    ggml_sycl::unified_cache cache(q, 64 * 1024);
-    std::vector<uint8_t>     dense(128, 0x51), expert(128, 0x52);
+    pinned_host_block_test::block dense(q, 128, 0x51), expert(q, 128, 0x52);
+    ggml_sycl::unified_cache      cache(q, 64 * 1024);
     const auto               dense_key  = ggml_sycl::test_make_cache_id(dense.data());
     const auto               expert_key = ggml_sycl::test_make_cache_id(expert.data());
     if (!cache.register_host_weight(dense_key, dense.data(), dense.size(), GGML_LAYOUT_AOS) ||
@@ -487,8 +488,8 @@ static bool test_external_host_registration_never_freed(sycl::queue & q) {
 }
 
 static bool test_expert_abort_after_resolve_snapshot(sycl::queue & q) {
-    ggml_sycl::unified_cache cache(q, 64 * 1024);
-    std::vector<uint8_t>     expert(128, 0x61);
+    pinned_host_block_test::block expert(q, 128, 0x61);
+    ggml_sycl::unified_cache      cache(q, 64 * 1024);
     const auto               key = ggml_sycl::test_make_cache_id(expert.data());
     if (!cache.register_host_expert(key, expert.data(), expert.size(), GGML_LAYOUT_AOS)) {
         return false;
