@@ -73,6 +73,7 @@ inline namespace witness_private_testing {
 class witnessed_mutex;
 
 // One held lock of the calling thread: the instance and its name. An empty entry has a null instance.
+// No depth field: the lock is not recursive, so an entry's presence is depth 1 and its absence depth 0.
 struct witnessed_mutex_entry {
     const witnessed_mutex * m;
     const char *            name;
