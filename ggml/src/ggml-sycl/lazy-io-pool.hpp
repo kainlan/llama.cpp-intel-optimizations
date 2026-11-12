@@ -11,12 +11,17 @@
 // released by the reap after the pool's last lease is gone.
 //
 // Device-free on purpose, like host-cpu-mapping.hpp: this header and lazy-io-pool.cpp include no SYCL header, so a
-// host test links the translation unit alone. The ring's memory is its one link seam, defined by lazy-table.cpp in the
-// backend and by a fixture in each host test.
+// host test links the translation unit alone. It has two link seams, each defined by the backend and by a fixture in
+// each host test: the ring's memory (lazy-table.cpp) and the strict-leases switch (unified-cache.cpp).
 //
 // The registry's leaf mutex (canonical contract §12.5, L5) is a true leaf: nothing is taken, allocated, freed, waited
 // on or logged under it. A take reserves a generation under it, builds its pool outside it and installs the pool under
 // it on a generation match; a final drop only parks the pool, and the reap frees parked pools after its unlock.
+//
+// witnessed-mutex.hpp comes with this header: the reap refuses under any of the five witnessed locks (§3.3), and
+// the units that declare the inventory and plan locks, ggml-sycl.cpp and unified-cache.cpp, reach the type here.
+
+#include "witnessed-mutex.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -120,6 +125,11 @@ std::unique_ptr<lazy_io_host_memory> lazy_io_allocate_host(size_t   bytes,
                                                            uint64_t pool_generation,
                                                            uint64_t load_txn_id);
 
+// GGML_SYCL_STRICT_LEASES=1, the switch under which every [HOST-PLAN-BUG] line of the reap and the drop aborts after
+// its WARN (§10). Defined once per link: unified-cache.cpp for the backend, which declares it in unified-cache.hpp too,
+// and the fixture in each host test that links lazy-io-pool.cpp, whose switch only a death child sets.
+bool ggml_sycl_strict_enabled();
+
 struct lazy_io_pool;
 
 // A counted reference on the IO pool. Move-only: the count changes only under the registry's leaf mutex, at a take, a
@@ -187,9 +197,22 @@ enum class lazy_reap_scope : uint8_t {
 // unlocked context.
 void ggml_sycl_lazy_ring_reap(lazy_reap_scope scope) noexcept;
 
+// The scope guard of §3.3's points (ii) and (iii): declared before the try of a model's unload or load end, in an
+// unlocked context, its destructor runs a FULL reap after the try/catch has returned. So the reap follows every erase
+// and abort the call makes, and runs outside the try whose catch re-finalizes the ticket.
+class lazy_reap_at_exit {
+  public:
+    lazy_reap_at_exit() noexcept = default;
+
+    ~lazy_reap_at_exit() { ggml_sycl_lazy_ring_reap(lazy_reap_scope::FULL); }
+
+    lazy_reap_at_exit(const lazy_reap_at_exit &)             = delete;
+    lazy_reap_at_exit & operator=(const lazy_reap_at_exit &) = delete;
+};
+
 // Marks the registry shut down: from then on a take returns an empty lease and a lease's drop only decrements, so a
-// lease destroyed during static destruction never touches the registry's mutex. No production caller sets it yet: the
-// T5 engine (design §11 row T5) adds the lease drain at backend shutdown, which sets it after its own FULL reap.
+// lease destroyed during static destruction never touches the registry's mutex. Its production caller is the lease
+// drain at backend shutdown, ggml_sycl_lazy_lease_drain in ggml-sycl.cpp, which sets it after its own FULL reap.
 void lazy_io_pool_mark_shut_down() noexcept;
 
 // Whether `generation` names a pool the registry still holds, in its slot or parked on the reap list, read under the
@@ -436,8 +459,10 @@ const char * lazy_ring_ensure_status_name(lazy_ring_ensure_status status);
 // waits. A need that is not a multiple of LAZY_BLOCK_RING_QD x LAZY_IO_BLOCK_BYTES is refused as MISMATCH before any
 // of that, never rounded up, since O_DIRECT alignment is a plan fact (§5.2). Each mismatch with the plan is a
 // [HOST-PLAN-BUG] WARN naming both numbers, a concurrent call one naming the need and the span, and the shut-down and
-// unpinned refusals plain WARNs; every refusal returns its typed status. Ensure never aborts: the strict abort is its
-// caller's (§10). May throw what the allocation or a worker's start throws, after the guard has cleared `ensuring`.
+// unpinned refusals plain WARNs; every refusal returns its typed status. Ensure never aborts on a refusal: the strict
+// abort is its caller's (§10). Its allocation charges the budget ledger and may yield, so it is called with no
+// witnessed lock held; a test build aborts at its entry naming a held one (§11 T5). May throw what the allocation or a
+// worker's start throws, after the guard has cleared `ensuring`.
 lazy_ring_ensure_status block_ring_ensure(size_t   need,
                                           size_t   span,
                                           int      device,
@@ -486,12 +511,24 @@ struct lazy_registry_state {
     uint64_t ring_bytes             = 0;      // the slot pool's ring, usable bytes; 0 with no ring
     uint64_t ring_allocations       = 0;      // rings ensure allocated for the slot pool, installed or not
     bool     ensuring               = false;  // the slot pool's ensuring state
+    // The witness's counts (§3.3, §11 T5), process totals.
+    uint64_t reaps_refused          = 0;  // reaps that found a witnessed lock held and reaped nothing
+    uint64_t reaps_failed           = 0;  // reaps whose step threw, logged [HOST-PLAN-BUG] and returned
+    uint64_t lease_drops_locked     = 0;  // held leases dropped with a witnessed lock held
+    uint64_t worker_reaps           = 0;  // WORKER reaps that ran to their end
+    // The join census (§3.3: a pool worker never joins itself): every join of an IO engine worker, by the joiner.
+    uint64_t joins                  = 0;  // joins run
+    uint64_t joins_from_worker      = 0;  // joins run on a pool worker thread
+    uint64_t self_joins             = 0;  // joins a worker asked of itself, recorded and never run
+    // Held leases destroyed after the registry shut down (§3.3's drain): a record's lease the drain missed, dropped by
+    // static destruction or a test's clear. The drain moves every record's lease out before it marks shut-down.
+    uint64_t drops_after_shut_down  = 0;
 };
 
 // Copies the registry's state into *out. Returns false, writing nothing, for a null pointer.
 bool ggml_sycl_lazy_registry_for_testing(lazy_registry_state * out);
 
-// The registry's one-shot hold hook, armed at one of five points; arming any point replaces whatever was armed, and
+// The registry's one-shot hold hook, armed at one of seven points; arming any point replaces whatever was armed, and
 // arming with a null callback disarms. The callback runs once, with no registry or IO-engine lock held (the plan
 // point's caller holds its inventory guard), and blocks for as long as the fixture wants its caller held.
 using lazy_hold_fn = void (*)(void * ctx);
@@ -519,9 +556,80 @@ void ggml_sycl_test_lazy_plan_hold(lazy_hold_fn hold, void * ctx);
 // a fixture can hold the picked reads until shutdown is about to wait for them (§3.3).
 void ggml_sycl_test_lazy_shutdown_hold(lazy_hold_fn hold, void * ctx);
 
+// Arms the hook in the coverage scope's take (§3.3's race): the first planner caller's take after the arming calls it
+// after the scope's entry reap and before lazy_io_pool_take, with no registry or IO-engine lock held, so a fixture can
+// park the live pool between the entry reap and the take.
+void ggml_sycl_test_lazy_stage_take_hold(lazy_hold_fn hold, void * ctx);
+
+// Arms the hook in ring_lease::reset: the first drop of a held lease after the arming calls it before the drop's
+// critical section, with no registry lock held, so a fixture can hold a drop while a take joins the pool (§3.3's race).
+void ggml_sycl_test_lazy_drop_hold(lazy_hold_fn hold, void * ctx);
+
 // The plan point: claims the hook if it is armed there and calls it with no registry or IO-engine lock held; its one
 // caller, compute_and_store_plan_for_inventory, holds the inventory guard.
 void ggml_sycl_test_lazy_plan_point();
+
+// Whether the calling thread holds the registry's leaf mutex (§11 T5), in the style of the retained store's
+// retained_store_mutex_held(): the witness every guard of that mutex carries (take, clone, drop, park, reap, install).
+bool registry_mutex_held();
+
+// The five witnessed locks (§11 T5), numbered as the reap's positive control takes them.
+enum lazy_witnessed_lock : int {
+    LAZY_LOCK_REGISTRY  = 0,  // the IO pool registry's leaf mutex
+    LAZY_LOCK_INVENTORY = 1,  // g_tensor_inventory_mutex
+    LAZY_LOCK_PLAN      = 2,  // g_lifecycle_plan_mutex
+    LAZY_LOCK_QUEUE     = 3,  // the live IO engine's queue lock
+    LAZY_LOCK_STRAND    = 4,  // a table's strand lock
+};
+
+// What a holding seam did with the lock it was asked for.
+enum class lazy_holding_status : uint8_t {
+    HELD,       // it took the lock and ran the callback under it
+    NOT_WIRED,  // the lock is not in this tree yet: a table's strand lock, which the reader's strand brings
+    NO_ENGINE,  // the queue lock was asked for with no live IO engine
+    UNKNOWN,    // no such lock, or one this half of the control does not take
+};
+
+const char * lazy_holding_status_name(lazy_holding_status status);
+
+// One run of the reap's positive control: a FULL reap called on a thread that holds one witnessed lock.
+struct lazy_reap_holding_result {
+    lazy_holding_status status        = lazy_holding_status::UNKNOWN;
+    bool                witnessed     = false;    // the witness read a lock held when the reap was called
+    bool                registry_held = false;    // registry_mutex_held() when the reap was called
+    bool                refused       = false;    // the reap refused: its refusal count moved
+    const char *        held          = nullptr;  // the lock the witness named, or nullptr
+};
+
+// Runs `fn(ctx)` on the calling thread with LAZY_LOCK_REGISTRY or LAZY_LOCK_QUEUE held (the queue lock of the live
+// IO engine, whose pool a join lease keeps alive across the call) and returns HELD; any other lock runs nothing.
+lazy_holding_status ggml_sycl_test_lazy_run_holding(int lock, lazy_hold_fn fn, void * ctx);
+
+// Calls a FULL reap on the calling thread, which holds the lock under test, and reports what the witness read and
+// whether the reap refused, by its refusal count read lock-free, so the call is safe under the registry's own mutex.
+// `status` is left to the caller, which took the lock.
+lazy_reap_holding_result ggml_sycl_test_lazy_reap_under_held_lock();
+
+// The pool's half of the reap's positive control: ggml_sycl_test_lazy_run_holding with the reap under it, for the
+// registry's leaf mutex and the queue lock; a table's strand lock is NOT_WIRED. The full control, over all five, is
+// ggml_sycl_test_lazy_ring_reap_holding in ggml-sycl.cpp.
+lazy_reap_holding_result ggml_sycl_test_lazy_reap_holding_pool(int lock);
+
+// Makes the next FULL reap's first step throw std::system_error, as std::mutex::lock can (§3.3: a failure to reset is
+// logged and never thrown). One-shot.
+void ggml_sycl_test_lazy_reap_throw_next();
+
+// REAP_INSIDE_TRY's reap: the reap's passes without its catch, so the seam's std::system_error reaches the caller.
+void ggml_sycl_test_lazy_ring_reap_uncaught(lazy_reap_scope scope);
+
+// Runs `fn(ctx)` on the calling thread holding one witnessed lock (§11 T5): g_tensor_inventory_mutex itself,
+// g_lifecycle_plan_mutex through the unified cache's seam, and the registry's leaf mutex and the queue lock through
+// ggml_sycl_test_lazy_run_holding. A table's strand lock is NOT_WIRED. Defined in ggml-sycl.cpp.
+lazy_holding_status ggml_sycl_test_lazy_run_holding_any(int lock, lazy_hold_fn fn, void * ctx);
+
+// The reap's positive control over all five locks: a FULL reap called on a thread that holds `lock`, its status the
+// holding seam's. Defined in ggml-sycl.cpp.
+lazy_reap_holding_result ggml_sycl_test_lazy_ring_reap_holding(int lock);
 
 // The engine's read source (§5.2): `length` bytes of `fd` at `offset` into `dst`; returns the bytes read, or -errno.
 // A fixture's source replaces pread for every worker until it is cleared with null; it runs with no lock held.
@@ -557,6 +665,14 @@ enum class lazy_ring_mutant : uint8_t {
     STRICT_ABORT_DROPPED,            // the STORAGE materialization does not abort on a ring refusal under strict leases
     NO_ALIGNMENT_CHECK,              // ensure accepts a need that is not whole 4 KiB blocks per slot
     SHUTDOWN_NO_WAIT,                // shutdown returns without waiting for the reads the workers picked
+    TAKE_IGNORES_DYING,              // a take joins a parked pool whose ring is still held
+    WORKER_REAP_DESTROYS_POOL,       // a WORKER reap runs the parked pools' destruction, joining their workers there
+    SNAPSHOT_CARRIES_LEASE,          // the published snapshot owns a lease on the pool
+    REAP_INSIDE_TRY,                 // the teardown reap runs inside the try that re-finalizes the ticket
+    SKIP_LEASE_DRAIN,                // shutdown moves no record's lease out before it marks the registry shut down
+    POOL_STRICT_ABORT_DROPPED,       // the reap's and the drop's [HOST-PLAN-BUG] lines continue under strict leases
+    DRAIN_STRICT_ABORT_DROPPED,      // the shutdown drain logs a leaked lease and continues under strict leases
+    ENSURE_WITNESS_DROPPED,          // ensure runs when it is entered with a witnessed lock held
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);

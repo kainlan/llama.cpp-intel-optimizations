@@ -720,7 +720,7 @@ def gate31_owner(files, bad):
     else:
         t = text_of(c, ie[0])
         tk = text_of(k, ie[0])
-        locks = re.findall(r"std::lock_guard<std::mutex>\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\)", t)
+        locks = re.findall(r"std::lock_guard(?:<[^<>]*>)?\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\)", t)
         if len(locks) != 1 or re.search(r"\b(unique_lock|scoped_lock)\b", t):
             bad("gate 31 (owner): into_empty is not exactly one g_tensor_inventory_mutex critical section")
         order = [t.find(x) for x in ("g_tensor_inventory_mutex", "lifecycle_select_placement_plan(", "get_placement_plan_snapshot()",
@@ -1337,7 +1337,8 @@ def mutants(files):
            "null selection branch does not refuse")
     yield ("into_empty taking a second lock",
            edit(files, M, "    const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value,",
-                "    std::lock_guard<std::mutex> second(g_tensor_inventory_mutex);\n    const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value,", "o14"),
+                "    std::lock_guard second(g_tensor_inventory_mutex);\n"
+                "    const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value,", "o14"),
            "not exactly one g_tensor_inventory_mutex critical section")
     yield ("a plain republish restored in ensure",
            edit(files, M, "        if (owner) {\n            if (auto * cache = ggml_sycl::get_unified_cache_for_device(target_device);",

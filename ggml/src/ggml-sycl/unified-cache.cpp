@@ -149,7 +149,8 @@ struct lifecycle_plan_record {
     ring_lease                                     lease;
 };
 
-std::mutex                                                                        g_lifecycle_plan_mutex;
+// witnessed_mutex comes from witnessed-mutex.hpp, which this file includes only through lazy-io-pool.hpp.
+witnessed_mutex g_lifecycle_plan_mutex{ GGML_SYCL_WITNESS_NAME("g_lifecycle_plan_mutex") };
 std::unordered_map<uint64_t, lifecycle_plan_record>                               g_lifecycle_plan_candidates;
 // Unpublished probe-placement plans (the load-time measure's (a) stage), keyed by the load's transaction.
 std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>      g_lifecycle_probe_plans;
@@ -175,6 +176,34 @@ uint64_t lifecycle_next_plan_publication_id() noexcept {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept {
     g_lifecycle_plan_next_version.store(next, std::memory_order_relaxed);
+}
+
+void lifecycle_plan_run_locked_for_test(void (*fn)(void *), void * ctx) {
+    std::lock_guard lock(g_lifecycle_plan_mutex);
+    fn(ctx);
+}
+
+size_t lifecycle_plan_lease_count_for_test() {
+    std::lock_guard lock(g_lifecycle_plan_mutex);
+    size_t          count = 0;
+    for (const auto & candidate : g_lifecycle_plan_candidates) {
+        count += candidate.second.lease.held() ? 1 : 0;
+    }
+    for (const auto & model : g_lifecycle_plan_models) {
+        for (const auto & record : model.second) {
+            count += record.second.lease.held() ? 1 : 0;
+        }
+    }
+    return count;
+}
+
+void lifecycle_plan_clear_for_test() {
+    // Declared before the lock, so the records, and their leases, are destroyed after the unlock with no lock held.
+    std::unordered_map<uint64_t, lifecycle_plan_record>                               candidates;
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, lifecycle_plan_record>> models;
+    std::lock_guard                                                                   lock(g_lifecycle_plan_mutex);
+    candidates.swap(g_lifecycle_plan_candidates);
+    models.swap(g_lifecycle_plan_models);
 }
 #endif
 
@@ -215,7 +244,7 @@ void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
     auto       snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
     ring_lease displaced;  // the replaced candidate's lease, dropped after the unlock
     {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         lifecycle_plan_record &     record = g_lifecycle_plan_candidates[load_txn_id];
         displaced                          = std::move(record.lease);
         record.snapshot                    = std::move(snapshot);
@@ -240,7 +269,7 @@ void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
     snapshot->kv_info          = kv_info;
     ring_lease displaced;  // the replaced candidate's lease, dropped after the unlock
     {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         lifecycle_plan_record &     record = g_lifecycle_plan_candidates[load_txn_id];
         displaced                          = std::move(record.lease);
         record.snapshot                    = std::move(snapshot);
@@ -252,7 +281,7 @@ void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
 
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placement_plan(uint64_t load_txn_id) noexcept {
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         const auto                  candidate = g_lifecycle_plan_candidates.find(load_txn_id);
         return candidate == g_lifecycle_plan_candidates.end() ? nullptr : candidate->second.snapshot;
     } catch (...) {
@@ -268,13 +297,13 @@ void lifecycle_stage_probe_placement_plan(uint64_t                  load_txn_id,
         return;
     }
     auto snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
-    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    std::lock_guard lock(g_lifecycle_plan_mutex);
     g_lifecycle_probe_plans[load_txn_id] = std::move(snapshot);
 }
 
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_plan(uint64_t load_txn_id) noexcept {
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         const auto                  probe = g_lifecycle_probe_plans.find(load_txn_id);
         return probe == g_lifecycle_probe_plans.end() ? nullptr : probe->second;
     } catch (...) {
@@ -284,7 +313,7 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_pl
 
 void lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept {
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard lock(g_lifecycle_plan_mutex);
         g_lifecycle_probe_plans.erase(load_txn_id);
     } catch (...) {
     }
@@ -293,7 +322,7 @@ void lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept {
 void lifecycle_abort_placement_plan(uint64_t load_txn_id, ring_lease * displaced_out) noexcept {
     ring_lease displaced;  // the aborted candidate's lease, dropped after the unlock
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         const auto                  candidate = g_lifecycle_plan_candidates.find(load_txn_id);
         if (candidate != g_lifecycle_plan_candidates.end()) {
             displaced = std::move(candidate->second.lease);
@@ -317,7 +346,7 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
                                       std::shared_ptr<const lifecycle_plan_snapshot> * published_out) noexcept {
     ring_lease displaced;  // a lease the publish displaces, dropped after the unlock
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         auto                        candidate = g_lifecycle_plan_candidates.find(load_txn_id);
         if (candidate == g_lifecycle_plan_candidates.end()) {
             return false;
@@ -370,7 +399,7 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
 }
 
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_placement_plan(uint64_t model_id, uint64_t load_txn_id) {
-    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    std::lock_guard             lock(g_lifecycle_plan_mutex);
     auto                        model = g_lifecycle_plan_models.find(model_id);
     if (model == g_lifecycle_plan_models.end()) {
         return nullptr;
@@ -403,7 +432,7 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
         return false;
     }
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         auto                        model = g_lifecycle_plan_models.find(expected->model_id);
         if (model == g_lifecycle_plan_models.end()) {
             return false;
@@ -538,7 +567,7 @@ bool workspace_admission_authority_issuer::direct(
 void lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept {
     ring_lease displaced;  // the erased record's lease, dropped after the unlock
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         auto                        model = g_lifecycle_plan_models.find(model_id);
         if (model == g_lifecycle_plan_models.end()) {
             return;
@@ -557,7 +586,7 @@ void lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noe
 
 size_t lifecycle_published_placement_plan_count_for_test() noexcept {
     try {
-        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        std::lock_guard             lock(g_lifecycle_plan_mutex);
         size_t                      count = 0;
         for (const auto & model : g_lifecycle_plan_models) {
             count += model.second.size();
@@ -566,6 +595,30 @@ size_t lifecycle_published_placement_plan_count_for_test() noexcept {
     } catch (...) {
         return 0;
     }
+}
+
+ring_lease lifecycle_take_ring_lease(uint64_t * model_id, uint64_t * load_txn_id) noexcept {
+    ring_lease      lease;  // moved out under the lock into an empty lease, so nothing is dropped under it
+    std::lock_guard lock(g_lifecycle_plan_mutex);
+    for (auto & model : g_lifecycle_plan_models) {
+        for (auto & record : model.second) {
+            if (record.second.lease.held()) {
+                *model_id    = model.first;
+                *load_txn_id = record.first;
+                lease        = std::move(record.second.lease);
+                return lease;
+            }
+        }
+    }
+    for (auto & candidate : g_lifecycle_plan_candidates) {
+        if (candidate.second.lease.held()) {
+            *model_id    = 0;
+            *load_txn_id = candidate.first;
+            lease        = std::move(candidate.second.lease);
+            return lease;
+        }
+    }
+    return lease;
 }
 
 const char * residency_reject_reason_name(residency_reject_reason reason) {
@@ -1190,6 +1243,10 @@ host_budget_sample host_ledger_sample() {
     // token is the one lock allowed: a staged load holds it, and it ranks above every lock the share takes.
     GGML_SYCL_WITNESS(kv_lock_witness::held_count_besides(KV_LOCK_L0_REPLAN) == 0,
                       "[HOST-LEDGER] host_ledger_sample ran with a witnessed lock held (th32 4.2)");
+    // Nor any of the lazy tables' witnessed locks (th32 §3.3): the inventory and plan locks, the IO pool registry's
+    // leaf mutex and the IO engine's queue lock.
+    GGML_SYCL_WITNESS(witnessed_mutex_held_any() == nullptr,
+                      "[HOST-LEDGER] host_ledger_sample ran holding a lazy table's witnessed lock (th32 3.3)");
     host_budget_sample sample{};
     sample.reserve         = detail::parse_host_reserve_mb(std::getenv("GGML_SYCL_HOST_RESERVE_MB"));
     sample.total_bytes     = ggml_sycl_get_total_system_memory_bytes();
@@ -1280,6 +1337,9 @@ size_t host_ledger_store_budget(const host_budget_sample & sample) {
 
 // One yield round over the registered yielders, with this thread marked as yielding. Returns the bytes freed.
 static size_t host_ledger_yield_round(size_t deficit, uint64_t load_txn_id) {
+    // A yield round, like the sample, runs with none of the lazy tables' witnessed locks held (th32 §3.3).
+    GGML_SYCL_WITNESS(witnessed_mutex_held_any() == nullptr,
+                      "[HOST-LEDGER] a yield round ran holding a lazy table's witnessed lock (th32 3.3)");
     struct in_yield_scope {
         bool previous;
 
@@ -1313,6 +1373,12 @@ static size_t host_ledger_yield_round(size_t deficit, uint64_t load_txn_id) {
     }
     return freed;
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+size_t host_ledger_test_yield_round(size_t deficit, uint64_t load_txn_id) {
+    return host_ledger_yield_round(deficit, load_txn_id);
+}
+#endif
 
 host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_request & req) {
     host_ledger_charge_result result{};

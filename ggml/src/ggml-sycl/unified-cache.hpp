@@ -2457,10 +2457,24 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(u
                                                                                uint64_t slot_generation) noexcept;
 void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept;
 size_t lifecycle_published_placement_plan_count_for_test() noexcept;
+// The shutdown drain's take (th32 §3.3): moves one held lease out of a published or staged record, leaving the record,
+// and names its owner, model 0 for a staged candidate. An empty lease means no record holds one. The caller drops the
+// lease after this returns, with no lock held.
+ring_lease lifecycle_take_ring_lease(uint64_t * model_id, uint64_t * load_txn_id) noexcept;
 bool   lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                         const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept;
+
+// Runs `fn(ctx)` holding g_lifecycle_plan_mutex: the plan records' half of the lazy lock witness's control (th32 §11).
+void lifecycle_plan_run_locked_for_test(void (*fn)(void *), void * ctx);
+
+// The staged and published records that hold a ring lease (th32 §3.3's drain).
+size_t lifecycle_plan_lease_count_for_test();
+
+// Drops every staged and published record as static destruction would: out of the maps under the lock, destroyed
+// after the unlock.
+void lifecycle_plan_clear_for_test();
 #endif
 
 // Compute placement plan for all model weights given a VRAM budget.
@@ -8115,6 +8129,9 @@ void host_ledger_unregister_yielder(int slot);
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The yielder slots claimed now, so a test can watch a cache register and, at its last reference, unregister.
 int host_ledger_yielder_slots_claimed_for_testing();
+
+// One yield round over the registered yielders with `deficit` asked, as a charge runs it (th32 §3.3's yield entry).
+size_t host_ledger_test_yield_round(size_t deficit, uint64_t load_txn_id);
 #endif
 
 // Foundation owner path. The intrusive control is allocated before any physical

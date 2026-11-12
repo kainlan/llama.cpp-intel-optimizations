@@ -516,7 +516,9 @@ def test_narrow_recheck_forbids_replan_and_takes_the_lock():
         "the narrow re-check must take sycl_module_mutation_guard, the same admission guard the full "
         "transaction's callers rely on, so it cannot run past a module shutdown"
     )
-    assert "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);" in recheck_body_norm, (
+    # Either guard type, with or without a template argument: the lock is a witnessed_mutex, so the guard deduces it.
+    assert re.search(r"std::(?:lock_guard|unique_lock)(?:<[^<>]*>)?\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\)\s*;",
+                     recheck_body_norm), (
         "the narrow re-check must take g_tensor_inventory_mutex, the same mutex the full transaction "
         "serializes its own mutating work under, before confirming the plan snapshot is still live -- "
         "not because some specific accessor this then reads requires the lock (zone_capacity() is an "

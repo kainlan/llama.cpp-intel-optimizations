@@ -1,8 +1,9 @@
 //
-// The fixture side of lazy-io-pool.cpp's one link seam (docs/design/sycl-storage-tier-lazy-tables.md §3.3), for a host
-// test that links the pool's translation unit without the backend: the block ring's memory from the aligned operator
-// new, with a fixture ledger that counts allocations and charges each at host_cpu_mapped_size. Each such test includes
-// it once.
+// The fixture side of lazy-io-pool.cpp's two link seams (docs/design/sycl-storage-tier-lazy-tables.md §3.3, §10), for
+// a host test that links the pool's translation unit without the backend: the block ring's memory from the aligned
+// operator new, with a fixture ledger that counts allocations and charges each at host_cpu_mapped_size, and the
+// strict-leases switch, off unless a death child turns it on, so no host arm reads GGML_SYCL_STRICT_LEASES. Each such
+// test includes it once.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -32,6 +33,7 @@ struct state {
     std::atomic<bool>     refuse_next{ false };  // the next allocation returns null
     std::atomic<bool>     throw_next{ false };   // the next allocation throws std::bad_alloc
     std::atomic<size_t>   short_next{ 0 };       // the next allocation's usable bytes fall short by this many
+    std::atomic<bool>     strict{ false };       // ggml_sycl_strict_enabled(): GGML_SYCL_STRICT_LEASES=1's stand-in
 };
 
 inline state g_state;
@@ -71,6 +73,10 @@ std::unique_ptr<lazy_io_host_memory> lazy_io_allocate_host(size_t   bytes,
     g_state.last_load_txn.store(load_txn_id, std::memory_order_relaxed);
     g_state.last_pool_gen.store(pool_generation, std::memory_order_relaxed);
     return std::unique_ptr<lazy_io_host_memory>(new lazy_io_host_fixture::memory(data, usable, charged));
+}
+
+bool ggml_sycl_strict_enabled() {
+    return lazy_io_host_fixture::g_state.strict.load(std::memory_order_relaxed);
 }
 
 }  // namespace ggml_sycl
