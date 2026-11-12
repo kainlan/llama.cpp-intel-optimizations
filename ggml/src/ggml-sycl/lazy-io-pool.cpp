@@ -1646,7 +1646,10 @@ lazy_ring_ensure_status block_ring_ensure(size_t   need,
                                           uint64_t load_txn_id) {
     // The entry witness (§3.3, §11 T5): ensure's allocation charges the budget ledger and may yield, so ensure is
     // called with no witnessed lock held. One entered with a lock held aborts here, naming it, before it refuses,
-    // reserves or allocates anything. Only a test build records holders.
+    // reserves or allocates anything. Only a test build records holders. This is a plain test-build abort, not
+    // GGML_SYCL_WITNESS: that macro's switch (g_sycl_witness_enabled, GGML_SYCL_WITNESS_CHECKS) and its failure
+    // function are defined in unified-cache.cpp, which the pool's host targets do not link, so the switch does not
+    // reach this file there.
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     const char * held = witnessed_mutex_held_any();
     // ENSURE_WITNESS_DROPPED: the ensure runs with the lock held.
