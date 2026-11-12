@@ -97,6 +97,7 @@ inline const std::vector<mutant_name> & mutant_names() {
         { "seg-destroy-before-waits",  scratch_test_mutant::SEG_DESTROY_BEFORE_WAITS  },
         { "seg-record-guard-removed",  scratch_test_mutant::SEG_RECORD_GUARD_REMOVED  },
         { "seg-immediate-return",      scratch_test_mutant::SEG_IMMEDIATE_RETURN      },
+        { "unregistered-host-allowed", scratch_test_mutant::UNREGISTERED_HOST_ALLOWED },
     };
     return names;
 }

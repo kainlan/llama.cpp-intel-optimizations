@@ -18073,8 +18073,12 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     // sample this load's stored budget came from, so every plan of the load reads the values its budget does.
     g_placement_kv_info.host_mem_available_pre = ggml_sycl::host_ledger_mem_available();
     g_placement_kv_info.host_budget_overridden = ggml_sycl::host_ledger_budget_overridden();
+    // The headroom refusal of that sample (design 5efe §4.5), which the plan's would-refuse line names.
+    g_placement_kv_info.host_headroom_exhausted = ggml_sycl::host_ledger_headroom_exhausted();
+    g_placement_kv_info.host_mem_total          = ggml_sycl::host_ledger_mem_total();
+    g_placement_kv_info.host_headroom           = ggml_sycl::host_ledger_headroom();
     // The load a STORAGE decline line names (§3.3): this thread's staged transaction, 0 for a direct planner entry.
-    g_placement_kv_info.lazy_load_txn          = g_sycl_plan_load_effect_txn;
+    g_placement_kv_info.lazy_load_txn           = g_sycl_plan_load_effect_txn;
     const bool   is_moe                        = g_moe_n_experts_total > 0;
     const auto & info                          = ggml_sycl_info();
     if (ggml_sycl_plan_multi_device()) {
@@ -19114,23 +19118,23 @@ ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const place
 #endif
 
 // Plans `inventory` as the load's stage plans it: once per device the scheduler exposes, publishing that device's
-// planner inputs first, through the stage's helpers, against `host_budget`. A multi-device plan packs each physical
-// device to its budget authority's answer; a single-device plan to the arena's reservation when the device's cache
-// has an active arena, else to the authority's answer. A device budget in `opts` replaces either. Each device's budget
-// lands in `device_budget`, and the lazy tables' planner input, the one every plan here is decided from, in
-// `lazy_infos`. Each planner reads the block ring's coverage through `coverage_pin`, the caller's provisional lease
-// (th32 §3.3), as the stage's planners read the stage's. Plans nothing when the VRAM arena is disabled, as the stage
-// then plans nothing. Reads a cache that exists and creates none. Caller holds g_tensor_inventory_mutex and a saved
-// state.
+// planner inputs first, through the stage's helpers, against `budget`, the one computed from `sample`. A multi-device
+// plan packs each physical device to its budget authority's answer; a single-device plan to the arena's reservation
+// when the device's cache has an active arena, else to the authority's answer. A device budget in `opts` replaces
+// either. Each device's budget lands in `device_budget`, and the lazy tables' planner input, the one every plan here
+// is decided from, in `lazy_infos`. Each planner reads the block ring's coverage through `coverage_pin`, the caller's
+// provisional lease (th32 §3.3), as the stage's planners read the stage's. Plans nothing when the VRAM arena is
+// disabled, as the stage then plans nothing. Reads a cache that exists and creates none. Caller holds
+// g_tensor_inventory_mutex and a saved state.
 static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
-    const ggml_sycl_tensor_inventory *  inventory,
-    const ggml_sycl_plan_dry_run_opts & opts,
-    size_t                              host_budget,
-    size_t                              mem_available,
-    bool                                budget_overridden,
+    const ggml_sycl_tensor_inventory *    inventory,
+    const ggml_sycl_plan_dry_run_opts &   opts,
+    const ggml_sycl::host_budget_sample & sample,
+    const ggml_sycl::host_budget_result & budget,
     uint64_t (&device_budget)[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES],
     std::vector<ggml_sycl::placement_lazy_table_info> & lazy_infos,
     const ggml_sycl::ring_lease *                       coverage_pin) {
+    const size_t                           host_budget = budget.budget;
     std::vector<ggml_sycl::placement_plan> plans;
     if (!ggml_sycl::vram_arena_enabled()) {
         GGML_LOG_INFO("[PLAN-DRY-RUN] the VRAM arena is disabled, so the load plans nothing and neither does this\n");
@@ -19141,11 +19145,15 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     // keeps the value a load would plan with.
     ggml_sycl::placement_kv_info                        kv     = g_placement_kv_info;
     ggml_sycl_inventory_fill_kv_info(kv, inventory);
-    // P3's reading and the budget's source are the dry run's own sample's, the one its budget came from, never the
-    // ledger's stored values.
-    kv.host_mem_available_pre = mem_available;
-    kv.host_budget_overridden = budget_overridden;
-    kv.lazy_load_txn          = 0;  // no load is open: a decline line names load=0, never the last load's transaction
+    // P3's reading, the budget's source and its headroom refusal are the dry run's own sample's, the one its budget
+    // came from, never the ledger's stored values. The source is the override only when the override is the budget
+    // (design 5efe §4.5: it composes); an accepted override above the formula leaves the computed budget.
+    kv.host_mem_available_pre  = sample.available_bytes;
+    kv.host_budget_overridden  = budget.override_binds;
+    kv.host_headroom_exhausted = budget.status == ggml_sycl::host_budget_status::HEADROOM_EXHAUSTED;
+    kv.host_mem_total          = sample.total_bytes;
+    kv.host_headroom           = budget.headroom;
+    kv.lazy_load_txn           = 0;  // no load is open: a decline line names load=0, never the last load's transaction
     lazy_infos                = kv.lazy_tables;
     if (kv.n_ubatch_context != 0) {
         GGML_LOG_INFO(
@@ -19277,13 +19285,14 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         if (in.mem_available_set != 0) {
             sample.available_bytes = static_cast<size_t>(in.mem_available_bytes);
         }
-        const size_t committed        = ggml_sycl::host_ledger_committed();
-        const size_t host_budget      = ggml_sycl::host_ledger_compute_budget(sample, committed);
+        const size_t                  committed = ggml_sycl::host_ledger_committed();
+        ggml_sycl::host_budget_result budget_result;
+        const size_t host_budget      = ggml_sycl::host_ledger_compute_budget(sample, committed, &budget_result);
         const bool   reserve_override = sample.reserve.status == ggml_sycl::detail::host_reserve_parse_status::OVERRIDE;
         GGML_LOG_INFO("[PLAN-DRY-RUN] sample: total=%zu available=%zu (%s) pinned=%zu committed=%zu budget_pct=%d%s\n",
                       sample.total_bytes, sample.available_bytes,
                       in.mem_available_set != 0 ? "--mem-available" : "MemAvailable", sample.pinned_bytes, committed,
-                      sample.budget_pct, reserve_override ? " GGML_SYCL_HOST_RESERVE_MB (the whole budget)" : "");
+                      sample.budget_pct, reserve_override ? " GGML_SYCL_HOST_RESERVE_MB (a cap on the budget)" : "");
         GGML_LOG_INFO("[PLAN-DRY-RUN] host_budget=%zu (%.1f MB): the budget a load would store; nothing is stored\n",
                       host_budget, host_budget / (1024.0 * 1024.0));
 
@@ -19306,8 +19315,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
             std::lock_guard                    lock(g_tensor_inventory_mutex);
             ggml_sycl_plan_dry_run_saved_state saved(ggml_sycl_info().total_gpu_count);
             multi_device = ggml_sycl_plan_multi_device();
-            plans = ggml_sycl_plan_dry_run_plans(inventory, in, host_budget, sample.available_bytes, reserve_override,
-                                                 out.device_budget_bytes, lazy_infos, coverage.pin());
+            plans        = ggml_sycl_plan_dry_run_plans(inventory, in, sample, budget_result, out.device_budget_bytes,
+                                                        lazy_infos, coverage.pin());
         }
         for (int d = 0; d < GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES; ++d) {
             if (out.device_budget_bytes[d] != 0) {

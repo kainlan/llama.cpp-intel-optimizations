@@ -1344,9 +1344,9 @@ arm_result arm_j_store_order() {
     // A pinned commit between the runs. The injection grows device 0's RUNTIME chunks by the shortfall past the free
     // bytes they already hold, each chunk pinned host memory committed to the pool and never charged to the ledger, so
     // the budget sees it through the pinned share. In this fixture the share is the binding term: 5 % of RAM less the
-    // pinned bytes sits far below committed plus MemAvailable less the OS reserve. So the commit moves the budget by
-    // the bytes the pool committed, which are read back here, not by the bytes requested. The two budgets come from
-    // one sample that differs only in its pinned bytes, so a MemAvailable reading cannot move between them.
+    // pinned bytes sits far below committed plus MemAvailable less host_headroom(total). So the commit moves the
+    // budget by the bytes the pool committed, which are read back here, not by the bytes requested. The two budgets
+    // come from one sample that differs only in its pinned bytes, so a MemAvailable reading cannot move between them.
     constexpr size_t requested     = 512 * MiB;
     unified_cache *  cache         = get_unified_cache_for_device(0);
     const size_t     pinned_before = host_ledger_sample().pinned_bytes;

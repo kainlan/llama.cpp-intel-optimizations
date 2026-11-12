@@ -609,19 +609,21 @@ arm_result arm_h() {
     return r;
 }
 
-// (i) The budget function saturates: a pinned share above total x pct, or an available reading at or below the OS
-// reserve, gives a budget at or below committed that refuses by name, never a near-SIZE_MAX admit; an accepted
-// GGML_SYCL_HOST_RESERVE_MB is exactly the budget; total and available both 0 give SIZE_MAX/4 with the WARN; total
-// known and available 0 give committed, which refuses by name.
+// (i) The budget function saturates: a pinned share above total x pct, or an available reading at or below
+// host_headroom(total) (design 5efe §4.5), gives a budget at or below committed that refuses by name, never a
+// near-SIZE_MAX admit; an accepted GGML_SYCL_HOST_RESERVE_MB caps the budget, exactly the budget below the computed
+// one and the computed one above it; total and available both 0 give SIZE_MAX/4 with the WARN; total known and
+// available 0 give committed, which refuses by name.
 // Engagement: a positive control sample gives the formula's exact value, and each stored budget counts one store.
 // Each refusing case is scored at its exact value, not at or below committed: a pinned share above the cap gives 0, and
-// an available reading at or below the reserve gives committed, so the next charge refuses with nothing granted.
-// Mutants: unsigned subtraction (either term) admits; the override replacing os_reserve only gives a sample-shaped
-// budget instead of X; a failed sample treated as no budget at all (0, not committed) on a host whose total is known.
+// an available reading at or below host_headroom(total) gives committed, so the next charge refuses with nothing
+// granted. Mutants: unsigned subtraction (either term) admits; the override replacing the computed budget instead of
+// capping it gives 100 GiB where the computed 25 GiB stays; a failed sample treated as no budget at all (0, not
+// committed) on a host whose total is known.
 arm_result arm_i() {
     arm_result r;
     ledger_settle();
-    const size_t total     = 64 * GiB;  // pct 100: pct_cap 64 GiB; os_reserve max(8 GiB, 2 GiB) = 8 GiB
+    const size_t total     = 64 * GiB;  // pct 100: pct_cap 64 GiB; host_headroom max(2, min(29, 16)) = 16 GiB
     const size_t committed = 1 * GiB;
 
     host_budget_sample control{};
@@ -629,9 +631,9 @@ arm_result arm_i() {
     control.available_bytes = 40 * GiB;
     control.budget_pct      = 100;
     control.pinned_bytes    = 0;
-    // min(64 - 0, 0 + (40 - 8)) GiB
-    if (host_ledger_compute_budget(control, 0) != 32 * GiB) {
-        void_arm(r, "the positive control does not give min(pct_cap - pinned, committed + available - os_reserve)");
+    // min(64 - 0, 0 + (40 - 16)) GiB
+    if (host_ledger_compute_budget(control, 0) != 24 * GiB) {
+        void_arm(r, "the positive control does not give min(pct_cap - pinned, committed + available - headroom)");
     }
     host_budget_sample pct_half = control;
     pct_half.budget_pct         = 25;  // pct_cap 16 GiB
@@ -660,24 +662,31 @@ arm_result arm_i() {
 
     host_budget_sample pinned_over = control;
     pinned_over.pinned_bytes       = 80 * GiB;  // above pct_cap
-    // min(64 - 80 saturating to 0, committed + 32 GiB)
+    // min(64 - 80 saturating to 0, committed + 24 GiB)
     stored_refuses(pinned_over, 0, "a pinned share above total x pct");
 
     host_budget_sample avail_low = control;
-    avail_low.available_bytes    = 6 * GiB;  // at or below os_reserve
-    // min(64 GiB, committed + (6 - 8 saturating to 0))
-    stored_refuses(avail_low, committed, "an available reading at or below os_reserve");
+    avail_low.available_bytes    = 6 * GiB;  // at or below the headroom
+    // min(64 GiB, committed + (6 - 16 saturating to 0))
+    stored_refuses(avail_low, committed, "an available reading at or below the headroom");
+    // The refusal names the headroom refusal with the stored sample's three figures (design 5efe §4.5).
+    const std::string headroom_reason = " reason=host-headroom-exhausted MemAvailable=" + num(6 * GiB) +
+                                        " MemTotal=" + num(total) + " headroom=" + num(16 * GiB);
+    expect(r, !log_line_with("host-budget-exceeded", headroom_reason.c_str()).empty(),
+           "an available reading at or below the headroom: the refusal does not append '" + headroom_reason + "'");
 
     host_budget_sample avail_zero = control;
-    avail_zero.available_bytes    = 0;  // total known, the sample failed: not headroom
-    // min(64 GiB, committed + (0 - 8 saturating to 0))
+    // Total known, the sample failed: 0 is at or below the headroom, so this is the host-headroom-exhausted refusal.
+    avail_zero.available_bytes    = 0;
+    // min(64 GiB, committed + (0 - 16 saturating to 0))
     stored_refuses(avail_zero, committed, "total known and available 0");
 
     uint64_t stores_after = 0;
     (void) ggml_sycl_test_host_ledger_stores(&stores_after);
     expect(r, stores_after - stores_before == 3, "each store_budget counts one store and the setter none");
 
-    // The override is the whole budget: no pct, sample or share term enters.
+    // The override caps the budget (§4.5): below the computed min(54, 1 + 24) = 25 GiB it is exactly the budget,
+    // above it the computed budget stays, with one WARN.
     ledger_settle();
     host_budget_sample over = control;
     over.pinned_bytes       = 10 * GiB;
@@ -689,8 +698,8 @@ arm_result arm_i() {
     over.reserve.mb    = 100 * 1024;
     over.reserve.bytes = 100 * GiB;
     log_clear();
-    expect(r, host_ledger_compute_budget(over, committed) == 100 * GiB,
-           "an override above the computed budget still gives exactly the override");
+    expect(r, host_ledger_compute_budget(over, committed) == 25 * GiB,
+           "an override above the computed budget gives the computed 25 GiB");
     expect(r, log_count_with("GGML_SYCL_HOST_RESERVE_MB") == 1, "an override above the computed budget logs one WARN");
 
     // Both unknown: SIZE_MAX/4 and the WARN.
@@ -1143,7 +1152,7 @@ int main(int argc, char ** argv) {
         { "f: a yielder's own charge never yields",                                               arm_f },
         { "g: the unregister waits for the yield in flight",                                      arm_g },
         { "h: a budget below committed and an overflowing sum both refuse; the credit saturates", arm_h },
-        { "i: the budget function saturates and the override is the whole budget",                arm_i },
+        { "i: the budget function saturates and the override caps it",                            arm_i },
         { "plan terms: the commit terms are what configuring the zones commits",                  leg_t },
         { "zone check: growth past the plan logs one [HOST-PLAN-BUG] naming both numbers",        leg_c },
         { "re-plan, KV: the KV refresh re-records the terms it grows",                            leg_k },

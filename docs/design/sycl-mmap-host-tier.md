@@ -6222,7 +6222,8 @@ I-5, §F2). It is the commit that changes every SYCL load.
   - The WARN is printed with its figures at `resident_room < mapped_ws`, not
     above it, and the plan-report line carries the same figures.
   - `resident_room` uses `host_headroom(total)`. At (62 GiB, 50 GiB
-    available, 20 GiB mapped) it does not WARN, where the P3 constant would.
+    available, 4 GiB expected_host, 20 GiB mapped) it does not WARN, where
+    the P3 constant would.
 - It depends on th32 T2 for `host_ledger_budget()` if T2 has landed.
   Otherwise it edits `uc:4165-4231`, and T2 lifts the result.
 - Lead (r3 E). C5 changes the host budget that uize-demoted host KV is
