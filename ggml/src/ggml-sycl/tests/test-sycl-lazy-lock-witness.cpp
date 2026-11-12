@@ -122,8 +122,10 @@ std::string first_line_with(const std::string & text, const std::string & needle
 
 std::vector<std::string> child_env() {
     // GGML_SYCL_WITNESS is on by default in this PRIVATE_TESTING build; the setting states it, so an inherited 0
-    // cannot turn the death children into returns.
-    return child_environment({ "GGML_SYCL_WITNESS_CHECKS=1", "GGML_NO_BACKTRACE=1" });
+    // cannot turn the death children into returns. The reap children score the refusal's WARN-and-return path, which
+    // strict leases turn into an abort (§10), so the second setting pins them off: an inherited
+    // GGML_SYCL_STRICT_LEASES=1 cannot turn those returns into deaths.
+    return child_environment({ "GGML_SYCL_WITNESS_CHECKS=1", "GGML_SYCL_STRICT_LEASES=0", "GGML_NO_BACKTRACE=1" });
 }
 
 std::chrono::milliseconds bound_for(int lock) {
