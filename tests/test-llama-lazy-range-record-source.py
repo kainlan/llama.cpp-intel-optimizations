@@ -39,6 +39,9 @@ Windows) or that a rebase of upstream code would silently restore:
    prefix lock grow_to (which locks contiguously from the mapping's base, so a tensor after a lazy range locks the range
    too and faults all of it in).
 
+9. while the tree has no STORAGE consumer, the pre-fill records the taker's AUTO row ineligible (the default mode must
+   load), through exactly one condition; that bridge and the STORAGE refusal are added and deleted together.
+
 Plain file I/O, comment-stripped text.
 """
 
@@ -51,6 +54,7 @@ LOADER_H = ROOT / "src/llama-model-loader.h"
 LOADER_CPP = ROOT / "src/llama-model-loader.cpp"
 MODEL_CPP = ROOT / "src/llama-model.cpp"
 RECORD_CPP = ROOT / "src/llama-lazy-range-record.cpp"
+RECORD_H = ROOT / "src/llama-lazy-range-record.h"
 
 _LEXEME_RE = re.compile(
     r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
@@ -269,6 +273,28 @@ def test_the_storage_refusal_function_throws_on_exactly_a_storage_row():
         "the refusal is not conditioned on exactly `record.deferral(name) == LLAMA_LAZY_DEFERRAL_STORAGE`"
     )
     assert "throw" in body, "the refusal does not throw"
+
+
+def test_the_auto_bridge_lives_exactly_as_long_as_the_refusal():
+    cpp = read_code(RECORD_CPP)
+    hdr = read_code(RECORD_H)
+    # the refusal's text is a string literal, which read_code keeps; a comment naming it does not count
+    refusal = "no STORAGE consumer" in cpp
+    bridge_fn = "llama_lazy_storage_consumer_present" in hdr
+    bridge_use = "!llama_lazy_storage_consumer_present()" in cpp
+    assert bridge_fn == refusal and bridge_use == refusal, (
+        f"the AUTO bridge and the STORAGE refusal must be added and deleted together: "
+        f"refusal={refusal} bridge_fn={bridge_fn} bridge_use={bridge_use}"
+    )
+    if bridge_use:
+        body = function_body(cpp, r"void\s+llama_lazy_range_record_prefill\s*\((?:[^()]|\([^()]*\))*\)")
+        assert re.search(
+            r"taker\s*&&\s*eligible\s*&&\s*mode\s*==\s*LLAMA_LAZY_MODE_AUTO\s*&&\s*!llama_lazy_storage_consumer_present\(\)",
+            body,
+        ), "the bridge is not conditioned on exactly taker, eligible, AUTO and the absent consumer"
+        assert len(re.findall(r"!llama_lazy_storage_consumer_present\(\)", body)) == 1, (
+            "the bridge decides in more than one place"
+        )
 
 
 # ---- 7. the early plan ----
