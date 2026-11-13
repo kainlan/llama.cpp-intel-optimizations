@@ -199,3 +199,11 @@ def test_mutant_no_arena_warn_without_equals_fails():
     old = "device=%d has no cache"
     mutant = _once(RING_CPP, old, "device %d has no cache")
     assert not claim_warns_carry_device_field(mutant)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
