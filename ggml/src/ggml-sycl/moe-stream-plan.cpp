@@ -608,6 +608,12 @@ bool moe_stream_phase::ring_ready(const moe_stream_loan_sizer * sizer) {
     size_t bytes_short = 0;
     if (!ring->reserve(device_, geo_, &bytes_short)) {
         reserve_failed_ = true;
+        // A zone short of slots, not a refused geometry: name what holds the WEIGHT zone while the refused ring still
+        // holds its slots, once per context, since the reserve is retried every micro-batch.
+        if (bytes_short != 0 && !weight_zone_warned_) {
+            weight_zone_warned_ = true;
+            moe_stream_ring_warn_weight_zone(device_, ring->slots_held(), geo_.slot_bytes);
+        }
         if (moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, geo_.slot_bytes, request_loan_,
                                              loan_refusals_, sizer) == moe_stream_loan_step::REFUSED) {
             warn_loan_refused(bytes_short);

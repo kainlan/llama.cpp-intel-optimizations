@@ -1193,6 +1193,10 @@ class moe_stream_phase {
     // off for every later prompt in this backend context, which holds this phase; the per-prompt reset does not clear
     // this flag.
     bool                                    window_marks_failed_ = false;
+    // A short reserve printed the WEIGHT zone's holders (moe_stream_ring_warn_weight_zone): once per llama context.
+    // Each llama context initializes its own SYCL backend, whose context owns this phase until its destructor, so
+    // neither begin_ubatch nor end_prompt clears the flag, and a new or recreated llama context has a new phase.
+    bool                                    weight_zone_warned_  = false;
     // The windows' timing under GGML_SYCL_MOE_EXEC_TRACE=2, keyed by micro-batch and window:
     // begin_layer enables it from the op's decision log, stage_window(), window_begin and window_launched() record,
     // and flush_window_timing() prints and clears it. Written by the submitting thread only, so it takes no lock.

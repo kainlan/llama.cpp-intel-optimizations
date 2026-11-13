@@ -98,9 +98,9 @@ static void check_weight_zone_census() {
         check_text("census of no tags stays empty", tag_order(tags), "");
     }
 
-    // 1000000 bytes, 250000 free: 750000 held. The registered allocations sum to 1000020 over 10 allocations in five
-    // tags, more than the zone reports held, so the unregistered figure goes negative instead of wrapping. Only the top
-    // four are printed; the totals still count the fifth.
+    // 1000000 bytes, 250000 free: 750000 used. The census attributes 1000020 bytes over 10 allocations in five tags,
+    // more than the allocator reports used, so unattributed goes negative instead of wrapping. Only the top four are
+    // printed; the totals still count the fifth.
     zone_tag_census census;
     census.capacity     = 1000000;
     census.available    = 250000;
@@ -108,21 +108,30 @@ static void check_weight_zone_census() {
     census.tags         = census_tags();
     check_text("short reserve line names the zone's figures and its top tags",
                ggml_sycl::moe_stream_ring_weight_zone_line(0, census, 3, 256, 4),
-               "[MOE-STREAM-RING] WEIGHT zone at the short reserve: device 0 size 1000000 free 250000 largest_free "
-               "100000 held 750000; registered 10 allocations 1000020 bytes in 5 tags, unregistered -250020 bytes; "
-               "the ring holds 3 slots x 256 bytes; top 4 tags by bytes: exact_zone_allocate_owner/weight count=5 "
-               "bytes=400000, kv_cache/kv count=2 bytes=300000, scratch_pool/compute count=1 bytes=300000, a/other "
-               "count=1 bytes=10");
+               "[MOE-STREAM-RING] WEIGHT zone at the short reserve: device=0 ring_slots_held=3 slot_bytes=256 "
+               "size=1000000 free=250000 largest_free=100000 used=750000 attributed=1000020 unattributed=-250020 "
+               "allocations=10 tags=5; top 4 by bytes: exact_zone_allocate_owner/weight count=5 bytes=400000, "
+               "kv_cache/kv count=2 bytes=300000, scratch_pool/compute count=1 bytes=300000, a/other count=1 "
+               "bytes=10");
     check_text("the line ranks a copy: the census keeps its order", tag_order(census.tags),
                "b/other,scratch_pool/compute,exact_zone_allocate_owner/weight,a/other,kv_cache/kv");
 
-    // A zone that reports more free than its size (no arena figures at all reads 0 and 0) holds 0, not a wrapped size.
+    // A zone that reports more free than its size uses 0, not a wrapped size; a census that found nothing leaves all
+    // of the used bytes unattributed.
     zone_tag_census empty;
     empty.available = 4096;
     check_text("short reserve line with no tags", ggml_sycl::moe_stream_ring_weight_zone_line(1, empty, 0, 512, 12),
-               "[MOE-STREAM-RING] WEIGHT zone at the short reserve: device 1 size 0 free 4096 largest_free 0 held 0; "
-               "registered 0 allocations 0 bytes in 0 tags, unregistered 0 bytes; the ring holds 0 slots x 512 bytes; "
-               "top 0 tags by bytes: none");
+               "[MOE-STREAM-RING] WEIGHT zone at the short reserve: device=1 ring_slots_held=0 slot_bytes=512 size=0 "
+               "free=4096 largest_free=0 used=0 attributed=0 unattributed=0 allocations=0 tags=0; top 0 by bytes: "
+               "none");
+    zone_tag_census unseen;
+    unseen.capacity  = 8192;
+    unseen.available = 1024;
+    check_text("short reserve line shows what the census did not attribute",
+               ggml_sycl::moe_stream_ring_weight_zone_line(0, unseen, 2, 512, 12),
+               "[MOE-STREAM-RING] WEIGHT zone at the short reserve: device=0 ring_slots_held=2 slot_bytes=512 "
+               "size=8192 free=1024 largest_free=0 used=7168 attributed=0 unattributed=7168 allocations=0 tags=0; top "
+               "0 by bytes: none");
 }
 
 int main() {

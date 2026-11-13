@@ -79,11 +79,8 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
 // without printing every cohort of the zone.
 static constexpr size_t MOE_STREAM_RING_WEIGHT_ZONE_TOP_TAGS = 12;
 
-// The WARN a short reserve prints once per context (moe_stream_phase::ring_ready), without its newline, every figure
-// in bytes: the WEIGHT zone's size, free bytes and largest free block, the bytes it holds (size - free), the live
-// registered allocations in it in total, the held bytes none of them accounts for (negative when their extents exceed
-// what the zone reports held), the slots the refused ring itself holds, and the `top` largest tags with their count
-// and bytes. The census is ranked on a copy; the totals count every tag, not only the `top` printed.
+// The WARN a short reserve prints once per context (moe_stream_phase::ring_ready), without its newline: the device, the
+// slots the refused ring itself holds and their size, then zone_tag_census_line()'s figures and its `top` tags.
 std::string moe_stream_ring_weight_zone_line(int                     device,
                                              const zone_tag_census & census,
                                              uint32_t                slots_held,
@@ -106,6 +103,14 @@ namespace ggml_sycl {
 // its stage-table entry and the executor's reader and check all read this one
 // fact, so none restates it.
 static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_AOS;
+
+// One WARN naming what holds the WEIGHT zone on `device` when a reserve comes up short: unified_cache_zone_tag_census()
+// read into moe_stream_ring_weight_zone_line(), its top MOE_STREAM_RING_WEIGHT_ZONE_TOP_TAGS tags, with the refused
+// ring's own `slots_held` slots of `slot_bytes`, which the census counts among the zone's holders. A diagnostic:
+// nothing the reserve or its caller decides reads it. The census takes two L5 locks one after the other, so the caller
+// must hold neither; moe_stream_phase::ring_ready() calls it once per llama context, where the reserve's own
+// allocations have just taken the same two.
+void moe_stream_ring_warn_weight_zone(int device, uint32_t slots_held, size_t slot_bytes);
 
 // Not thread-safe: one ring belongs to one device's prompt executor, which
 // acquires, flips and releases from its submitting thread. Nothing here queries

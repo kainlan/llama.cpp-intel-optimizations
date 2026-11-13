@@ -30773,6 +30773,155 @@ bool unified_cache::zone_free_figures(vram_zone_id zone,
     return true;
 }
 
+// The role half of a zone census tag. A role added to the enum after this list reads as its number, never as another
+// role's name.
+static std::string zone_tag_census_role_label(alloc_role role) {
+    switch (role) {
+        case alloc_role::WEIGHT:
+            return "weight";
+        case alloc_role::COMPUTE:
+            return "compute";
+        case alloc_role::KV:
+            return "kv";
+        case alloc_role::STAGING:
+            return "staging";
+        case alloc_role::GRAPH_TMP:
+            return "graph_tmp";
+        case alloc_role::TP_TMP:
+            return "tp_tmp";
+        case alloc_role::EXPERT_STAGING:
+            return "expert_staging";
+        case alloc_role::CONTROL:
+            return "control";
+        case alloc_role::OTHER:
+            return "other";
+        case alloc_role::LAZY_ROW_CACHE:
+            return "lazy_row_cache";
+        case alloc_role::LAZY_STAGING:
+            return "lazy_staging";
+        case alloc_role::LAZY_OUTPUT:
+            return "lazy_output";
+    }
+    return "role" + std::to_string(static_cast<unsigned>(role));
+}
+
+bool unified_cache_zone_tag_census(int device, vram_zone_id zone, zone_tag_census & out) {
+    out = zone_tag_census();
+
+    // g_cache_rw_mutex (L4), shared, held only for the lookup.
+    unified_cache * cache = get_existing_unified_cache_for_device(device);
+    if (cache == nullptr || !cache->arena_active()) {
+        return false;
+    }
+
+    // Instant 1, one hold of the zone's allocator group mutex (L5): the free figures and the group's own record of
+    // every allocation it made. Every zone_alloc() records into the group before it returns, registry row or not, so
+    // this set is complete: an allocation with no registry row (a cache-internal one) is counted, as its own tag.
+    // Each record keeps its address only to find its registry row below; nothing dereferences it.
+    struct zone_record {
+        void *       ptr           = nullptr;
+        uint64_t     allocation_id = 0;
+        size_t       extent        = 0;
+        vram_zone_id record_zone   = vram_zone_id::COUNT;
+    };
+
+    std::vector<zone_record> records;
+    {
+        std::lock_guard<std::mutex> lock(cache->arena_allocator_group_mutex(zone));
+        out.capacity     = cache->zone_capacity(zone);
+        out.available    = cache->zone_available(zone);
+        out.largest_free = cache->zone_largest_free(zone);
+        const unified_cache::allocator_group & group =
+            cache->arena_allocator_groups_[unified_cache::arena_allocator_group_index(zone)];
+        records.reserve(group.allocations.size());
+        for (const auto & kv : group.allocations) {
+            if (!cache->zone_owns(zone, kv.first)) {
+                continue;
+            }
+            zone_record r;
+            r.ptr           = kv.first;
+            r.allocation_id = kv.second.allocation_id;
+            r.extent        = kv.second.extent;
+            r.record_zone   = kv.second.zone;
+            records.push_back(r);
+        }
+    }
+
+    // Instant 2, g_runtime_alloc_mutex (L5) alone, after the group mutex is released: each record's tag from its
+    // registry row. A row matches only with the record's allocation id, so an address freed and reused between the two
+    // instants reads as no row rather than as another allocation's tag. Per cohort, the count and bytes of each role
+    // or, for an allocation with no row, of the logical zone it was made for.
+    // A slot is a role in a registered cohort's sums and a logical zone in the no-row sums: 256 holds any value of
+    // either one-byte enum.
+    constexpr size_t SLOTS = 256;
+
+    struct cohort_sums {
+        std::string         cohort;
+        bool                registered = true;
+        std::vector<size_t> count;
+        std::vector<size_t> bytes;
+    };
+
+    std::vector<cohort_sums>                sums;
+    std::unordered_map<std::string, size_t> sums_index;
+    size_t                                  unregistered_at = SIZE_MAX;
+    {
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        for (const zone_record & r : records) {
+            const auto row = g_runtime_alloc_registry.find(r.ptr);
+            const bool registered =
+                row != g_runtime_alloc_registry.end() && row->second.handle.alloc_id == r.allocation_id;
+            size_t at   = sums.size();
+            size_t slot = 0;
+            if (registered) {
+                slot             = static_cast<size_t>(row->second.handle.role);
+                const auto found = sums_index.find(row->second.cohort_id);
+                if (found != sums_index.end()) {
+                    at = found->second;
+                } else {
+                    sums_index.emplace(row->second.cohort_id, at);
+                }
+            } else {
+                slot = static_cast<size_t>(r.record_zone);
+                if (unregistered_at != SIZE_MAX) {
+                    at = unregistered_at;
+                } else {
+                    unregistered_at = at;
+                }
+            }
+            if (at == sums.size()) {
+                cohort_sums fresh;
+                fresh.cohort     = registered ? row->second.cohort_id : std::string();
+                fresh.registered = registered;
+                fresh.count.assign(SLOTS, 0);
+                fresh.bytes.assign(SLOTS, 0);
+                sums.push_back(std::move(fresh));
+            }
+            sums[at].count[slot] += 1;
+            sums[at].bytes[slot] += r.extent;
+        }
+    }
+
+    for (const cohort_sums & cohort : sums) {
+        const std::string name = !cohort.registered    ? std::string("(no registry row)") :
+                                 cohort.cohort.empty() ? std::string("(none)") :
+                                                         cohort.cohort;
+        for (size_t slot = 0; slot < SLOTS; ++slot) {
+            if (cohort.count[slot] == 0) {
+                continue;
+            }
+            zone_tag_total total;
+            total.tag = name + "/" +
+                        (cohort.registered ? zone_tag_census_role_label(static_cast<alloc_role>(slot)) :
+                                             std::string(vram_zone_name(static_cast<vram_zone_id>(slot))));
+            total.count = cohort.count[slot];
+            total.bytes = cohort.bytes[slot];
+            out.tags.push_back(std::move(total));
+        }
+    }
+    return true;
+}
+
 void unified_cache_dump_report_zone_figures(int dev, const char * point, vram_zone_id zone) noexcept {
     if (!counter_dump_requested()) {
         return;
