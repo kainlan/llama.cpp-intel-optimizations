@@ -1824,6 +1824,17 @@ int main() {
               "and turns no record off: only a real disagreement does");
     }
 
+    // The setter WARNs on exactly the store that turns the record off: from a shape to the mark, never from the mark
+    // again, never on a first record or a repeat.
+    {
+        using ggml_sycl::zone_compute_term_n_ubatch_turns_off;
+        CHECK(zone_compute_term_n_ubatch_turns_off(512, UINT32_MAX), "512 to the mark turns it off");
+        CHECK(!zone_compute_term_n_ubatch_turns_off(UINT32_MAX, UINT32_MAX), "the mark to the mark does not again");
+        CHECK(!zone_compute_term_n_ubatch_turns_off(0, 512), "a first record does not");
+        CHECK(!zone_compute_term_n_ubatch_turns_off(512, 512), "a repeat does not");
+        CHECK(!zone_compute_term_n_ubatch_turns_off(0, 0), "no record and no store does not");
+    }
+
     // ---- Case 24d (compute room, scoped): only the rung the plan placed sees the room. Over every record set the
     // cases above use, every rung from 32 to 8192 gets the demand the fit gave before the room existed (spill bound
     // over the plan and the rung's request, net of the KV room, plus the uncovered ring) when no rung is named, even

@@ -34,7 +34,8 @@ What this gate pins:
   single-device plan PLACED on the device, or, for a plan that named none, at the load's planning micro-batch, read
   once before the demand, whole or nothing; a realized rung that held a request out is charged, and every other rung
   is judged as before. The planning micro-batch is the load's own record, taken at the inventory stage and turned off
-  when two loads disagree, never the plan's planner_n_ubatch, which every runtime context transaction rewrites; and it
+  when two loads disagree (with one WARN, on the compare-exchange store that turns it off), never the plan's
+  planner_n_ubatch, which every runtime context transaction rewrites; and it
   is the shape the compute term was measured at only while the inventory's literal, the auto ladder's bottom rung and
   the load measure's n_ubatch name one value;
 - a load whose plan was packed against a RUNTIME zone an earlier load in the process grew says so in ONE WARN after
@@ -168,6 +169,13 @@ PLAN_ROOM_PLANNING = ("if (n == 0 && plan.explicit_ubatch.action == pp_moe_onedn
 PLANNING_SET = "ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, inventory->n_ubatch);"
 PLANNING_SETTER_SIG = "void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch)"
 PLANNING_SETTER_RULE = "uint32_t next = zone_compute_term_n_ubatch_store(stored, n_ubatch);"
+# The setter updates through a compare-exchange loop on the device's slot, so exactly one store sees the transition
+# to the mark, and WARNs only when that store is the one zone_compute_term_n_ubatch_turns_off() names.
+PLANNING_CAS_LOOP = ("while (next != stored && !g_planned_compute_term_n_ubatch[device_id].compare_exchange_weak("
+                     "stored, next, std::memory_order_acq_rel)) { next = zone_compute_term_n_ubatch_store(stored, "
+                     "n_ubatch); }")
+PLANNING_WARN_GUARD = "if (zone_compute_term_n_ubatch_turns_off(stored, next)) { GGML_LOG_WARN("
+PLANNING_WARN_TEXT = '"[LOAD-PLAN] device %d: this load plans its compute term at n_ubatch=%u where an earlier load'
 PLANNING_GETTER_SIG = "uint32_t unified_cache_get_planned_compute_term_n_ubatch(int device_id)"
 PLANNING_GETTER_RULE = ("return zone_compute_term_n_ubatch_read("
                         "g_planned_compute_term_n_ubatch[device_id].load(std::memory_order_acquire));")
@@ -394,7 +402,19 @@ def claim_fit_reads_the_load_planning_micro_batch(sycl_cpp: str, cache_cpp: str)
             and bool(txn) and "unified_cache_set_planned_compute_term_n_ubatch(" not in txn
             and PLANNING_SETTER_RULE in body(cache, PLANNING_SETTER_SIG)
             and PLANNING_GETTER_RULE in body(cache, PLANNING_GETTER_SIG)
-            and cache.count("g_planned_compute_term_n_ubatch[device_id]") == 2)
+            and cache.count("g_planned_compute_term_n_ubatch[device_id]") == 3)
+
+
+def claim_planning_record_warns_once(cache_cpp: str) -> bool:
+    """The setter moves the record through a compare-exchange loop, never a plain store, and WARNs only behind
+    zone_compute_term_n_ubatch_turns_off(), so the one store that turns the record off is the one that WARNs; the WARN
+    is written nowhere else."""
+    cache = norm(cache_cpp)
+    setter = body(cache, PLANNING_SETTER_SIG)
+    return (bool(setter) and ordered(setter, PLANNING_SETTER_RULE, PLANNING_CAS_LOOP, PLANNING_WARN_GUARD,
+                                     PLANNING_WARN_TEXT)
+            and ".store(" not in setter
+            and cache.count(PLANNING_WARN_TEXT) == 1)
 
 
 def claim_planning_micro_batch_is_the_measure_shape(model_cpp: str, ladder_h: str, measure_h: str) -> bool:
@@ -542,6 +562,10 @@ def test_fit_credits_the_placed_compute_room():
 
 def test_fit_reads_the_load_planning_micro_batch():
     assert claim_fit_reads_the_load_planning_micro_batch(SYCL_CPP, CACHE_CPP)
+
+
+def test_planning_record_warns_once():
+    assert claim_planning_record_warns_once(CACHE_CPP)
 
 
 def test_planning_micro_batch_is_the_measure_shape():
@@ -818,6 +842,20 @@ def test_mutant_planning_record_skips_the_store_rule_fails():
     """A plain store would let the last load win where two loads disagree, a credit at the wrong shape."""
     assert not claim_fit_reads_the_load_planning_micro_batch(
         SYCL_CPP, _once(CACHE_CPP, PLANNING_SETTER_RULE, "uint32_t next = n_ubatch;"))
+
+
+def test_mutant_planning_warn_on_any_mark_fails():
+    """A WARN on any store that leaves the mark would repeat on every later disagreeing load."""
+    assert not claim_planning_record_warns_once(
+        _once(CACHE_CPP, "if (zone_compute_term_n_ubatch_turns_off(stored, next)) {",
+              "if (next == k_zone_compute_term_n_ubatch_disagreed) {"))
+
+
+def test_mutant_planning_record_plain_store_fails():
+    """A plain store lets two racing loads both see the transition, and both WARN."""
+    assert not claim_planning_record_warns_once(
+        _once(CACHE_CPP, PLANNING_CAS_LOOP,
+              "g_planned_compute_term_n_ubatch[device_id].store(next, std::memory_order_release);"))
 
 
 def test_mutant_planning_getter_reads_the_disagreement_mark_fails():
