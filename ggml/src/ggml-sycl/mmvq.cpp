@@ -5923,6 +5923,14 @@ static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair_slm(const uint8_t * __
 // SOA kernel (mul_mat_vec_q_reorder) spreads them, and each block dot is that kernel's
 // reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>, so the tree keeps one Q8_0 SOA block dot.
 // `ids` null: the dispatch passed a compact table with one entry per (id, token) slot.
+// `ids` non-null: the table has one entry per expert, and each slot reads its expert id from `ids` (strides ids_nb0,
+// ids_nb1). The batched dispatch passes this form when it cannot compact the table: when the caller gave no device ids
+// or not every slot runs on this device, it uploads one id per slot (a host slot names a device expert, and the host's
+// row later overwrites that slot's output); when no compact list is available (graph recording without preallocated
+// storage), it keeps the caller's ids. In ggml_sycl_mul_mat_id the retained routes call it that way, and a decode
+// reaches them only when neither the direct route (every expert and the ids on this device) nor the event-chained
+// hybrid route takes it: both of those pass device ids with a full table, which the dispatch compacts. vec_q, whose
+// one caller passes its retained table, passes this form only when no compact list is available.
 // WRONG_SCALE_BLOCK is a planted fault, instantiated only in the private test build: every block reads the next
 // block's scale (the expert's last block wraps to its first), so a test that cannot see a scale read from the wrong
 // block proves nothing about this kernel's scale offsets.
