@@ -770,8 +770,17 @@ def derive_wrappers(texts: dict[str, str]) -> set[str]:
     (`F && f`) to a wrapper call, as `f`, `static_cast<F &&>(f)` or `std::forward<F>(f)`: the caller's command group
     reaches the profiler through it. Found by name-free structure and closed transitively, so a helper is a wrapper
     whatever it is called (ggml_sycl_submit_binbcast_kernel is one)."""
+    key = tuple(sorted((name, id(parse(src))) for name, src in texts.items()))
+    if key not in _WRAPPERS:
+        _WRAPPERS[key] = derive_wrappers_uncached(texts)
+    return set(_WRAPPERS[key])
+
+
+_WRAPPERS: dict[tuple, set[str]] = {}
+
+
+def derive_wrappers_uncached(texts: dict[str, str]) -> set[str]:
     wrappers = {BASE_WRAPPER}
-    return wrappers
     changed = True
     while changed:
         changed = False
@@ -868,8 +877,6 @@ def census(texts: dict[str, str], wrappers: set[str] | None = None, decl_texts: 
     for name, src in texts.items():
         code = parse(src)
         for pos, kind, method, parens, braces in code.sites:
-            if kind == "shortcut":
-                continue
             callees = [code.callee(p) for p in parens]
             if any(c in wrappers for c in callees):
                 continue
