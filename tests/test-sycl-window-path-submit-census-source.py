@@ -5,7 +5,8 @@ A launch the profiler cannot see lands in "device idle" or in nothing, so the at
 only as complete as this list is short. The list shrinks to empty; it never grows without a reason beside the entry.
 
 Two kinds of launch are censused, and kept apart in the output and in the allowlist keys:
-- submit: a `->submit(` or `.submit(` call.
+- submit: a `->submit(` or `.submit(` call. A submit whose command group is only a `host_task` counts too: it occupies
+  the in-order device queue, and the device sits idle while it runs, so the profiler must see it like a kernel.
 - shortcut: a queue member that enqueues a command without submit(): `parallel_for`, `single_task`, `memcpy`, `memset`,
   `fill`, `copy`, `prefetch`, `mem_advise`, in member-call form only (`->name(` / `.name(`), so `std::memcpy(` and free
   functions never match. Two rules decide whether a member call is a queue launch:
@@ -21,15 +22,18 @@ Two kinds of launch are censused, and kept apart in the output and in the allowl
 A launch is profiled, and not a site, in two cases:
 - Wrapped: any '(' still open at it, at any nesting depth and any distance, is the argument list of a wrapper call.
   The wrappers are `ggml_sycl_profile_submit` and every function that hands one of its own forwarding-reference
-  parameters (`F && f`) to a wrapper call, as a top-level argument or forwarded (`std::forward<F>(f)`) inside the
-  call's arguments, a lambda body included (mmq_submit). Found from the source and closed transitively, whatever
-  the name.
+  parameters (`F && f`) on as the command group: as the wrapper call's command-group argument (`f`,
+  `static_cast<F &&>(f)`, `std::forward<F>(f)`), or as the whole argument of a `submit(` inside the call's arguments,
+  a lambda body included (mmq_submit). A forward anywhere else (a label, a log call) makes nothing a wrapper. Found
+  from the source and closed transitively, whatever the name.
 - Recorded: its returned event reaches `ggml_sycl_kernel_profile_record_event` or
-  `ggml_sycl_profile_record_returned_event` in the same function, by lexical data flow only: the launch is an argument
-  of the record call, or it is assigned to `ev` (`ev = <launch>`, a declaration included) and a later record call is
-  handed `ev` as its event argument. Not when a loop around the launch closes before the record call, nor when `ev` is
-  assigned again in between in the launch's block or a block around it. A record call elsewhere in the function
-  excuses nothing else.
+  `ggml_sycl_profile_record_returned_event` on every path from it, by lexical data flow only (Code.recorded): the
+  launch is the record call's argument, or it is assigned to a plain local `ev` and a later record call in the same
+  function or lambda body is handed `ev` (or `std::move(ev)`) as its event. Refused when a loop around the launch,
+  braced or not, does not hold the record call; when the record call sits in an `else` arm the launch is not in; or
+  when `ev` is assigned or declared in between where it would reach the record call. A record call elsewhere in the
+  function excuses nothing else; test_the_record_rule_excuses_exactly_the_known_launches_of_the_tree pins what it
+  excuses on the tree.
 Comments, string and character literals are blanked first, so a launch named in prose is not counted. The #elif and
 #else branches of a conditional are blanked only when they hold no call of either class, so that braces opened in
 both branches count once; a branch holding a launch is kept whatever its condition, a dead one included (its entry
@@ -37,11 +41,13 @@ says so). The census is keyed by `kind:file:function` with a count per key: a li
 second raw launch added to a function that is already listed does. A launch inside a helper that its callers wrap is
 still raw here, because the helper's text cannot know its callers; its entry says which caller wraps it.
 
-FILES membership: a file is in FILES when a call from the qwen4exp prompt graph reaches it with more than one row on
-a default route, and the comment beside it cites the dispatch site. Every other source under ggml/src/ggml-sycl that
-holds a launch-like call is in EXCLUDED_FILES (or under an EXCLUDED_DIRS prefix) with its reason; that table is the
-source of truth, and test_every_launching_file_is_on_the_path_or_excluded fails on a file in neither. Challenge an
-exclusion by citing the call that reaches the file; then move it to FILES and its launches to ALLOW.
+FILES membership: a file is in FILES when a call from the qwen4exp prompt graph reaches it with more than one row on a
+default route, and the comment beside it cites the dispatch site. An opt-in route may also be listed when its comment
+and its entries name it as one (the XMX sorted MoE route), so that it stays censused. Every other source under
+ggml/src/ggml-sycl that holds a launch-like call is in EXCLUDED_FILES (or under an EXCLUDED_DIRS prefix) with its
+reason; that table is the source of truth, and test_every_launching_file_is_on_the_path_or_excluded fails on a file in
+neither. Challenge an exclusion by citing the call that reaches the file; then move it to FILES and its launches to
+ALLOW.
 
 Run directly or under pytest; `-s` prints the `file:line function kind` list and the counts per kind and file, and a
 failing census prints the list too.
@@ -121,9 +127,9 @@ FILES = [
     "moe-stream-ring.cpp",
     "moe-scratch-admission.cpp",
     "mem-ops.cpp",
-    # MUL_MAT_ID with more than one row tries these before the window executor, each on by default:
-    # try_xmx_sorted_moe (off only for GGML_SYCL_XMX_MOE=0; it refuses a batch that names a staged ring slot), with
-    # its token sort, XMX GEMMs and the fused MXFP4 GEMMs it calls (try_fused_xmx_moe_mxfp4_*)
+    # an opt-in route, kept on the list so it stays censused: try_xmx_sorted_moe (ggml_sycl_mul_mat_id, ahead of the
+    # window executor) refuses every batch unless GGML_SYCL_XMX_MOE_SORTED=1 ("diagnostic-only-current-sorted-wrapper"),
+    # before its first submit; these are its token sort, XMX GEMMs and fused MXFP4 GEMMs (try_fused_xmx_moe_mxfp4_*)
     "moe-sort.hpp",
     "moe-xmx.hpp",
     "moe-xmx-fused.hpp",
@@ -134,6 +140,10 @@ FILES = [
     "unified-cache.cpp",
     # ExpertPredictor::predict_multi_layer, called by ggml_sycl_mul_mat_id while the predictor is active
     "expert-prefetch.cpp",
+    # the CPU executor: should_dispatch_to_cpu (ggml-sycl.cpp) routes a MUL_MAT whose weight resolves to host, with no
+    # opt-in, and the ops of a CPU-bound layer, to ggml_sycl_compute_forward_cpu; its submits to the device queue are
+    # host_task bodies (a host_task on the device queue counts, see the docstring)
+    "cpu-dispatch.cpp",
 ]
 
 # Every other source under ggml/src/ggml-sycl that holds a launch-like call (either class, before any receiver or
@@ -172,9 +182,8 @@ EXCLUDED_FILES = {
     "gpu-sampler.hpp": "sampling (ggml_sycl_sample_token*), after the graph",
     "cont-batching.hpp": "multi-sequence sampling (ggml_sycl_multi_seq_sample*), after the graph",
     "persistent-tg-kernel.cpp": "the persistent token-generation kernel, decode only",
-    "fused-ffn.hpp": "execute_ffn_fusion: can_fuse_ffn admits Q4_0 gate/up pairs at token-generation batch sizes only",
-    "cpu-dispatch.cpp": "the CPU executor of host-placed ops (should_dispatch_to_cpu, ggml_sycl_compute_forward_cpu): "
-                        "its kernels run on the CPU queue, and each submit to the device queue is a host_task body",
+    "fused-ffn.hpp": "opt-in GGML_SYCL_FFN_FUSION=1 (read before execute_ffn_fusion in graph compute); "
+                     "can_fuse_ffn then admits Q4_0 gate/up pairs of at most 8 rows",
     "mmq-esimd.hpp": "opt-in GGML_SYCL_MMQ_ESIMD: mmq_esimd_version() is 0 when it is unset",
     "mmq-xmx.hpp": "opt-in GGML_SYCL_XMX_MMQ=1 (use_xmx_mmq_kernel, read by can_use_xmx_q8_0)",
     "convert-esimd.hpp": "opt-in GGML_SYCL_ESIMD_DEQUANT=1 (g_esimd_dequant_enabled in convert.cpp)",
@@ -201,7 +210,9 @@ SHORTCUT_KERNEL = "kernel launched by a queue shortcut (parallel_for / single_ta
 SHORTCUT_USM = "USM copy or fill launched by a queue shortcut, not yet labelled"
 SHORTCUT_KERNEL_QK_K = (SHORTCUT_KERNEL + "; one per branch of #if QK_K == 256, and the #else branch is dead code "
                         "(ggml-common.h defines QK_K as 256)")
-MOE_XMX = "the XMX sorted MoE route (try_xmx_sorted_moe, on by default), not yet wrapped"
+MOE_XMX = "opt-in GGML_SYCL_XMX_MOE_SORTED=1 (try_xmx_sorted_moe); kept on the list so the opt-in route stays censused"
+CPU_HOST_TASK = ("a host-placed op run on the CPU as a host_task on the device queue (the in-order queue orders it "
+                 "with the device kernels), not yet labelled")
 FUSED_ESIMD = "the fused ESIMD MoE (ggml_sycl_mul_mat_id_fused, on by default), not yet wrapped"
 FUSED_ESIMD_CASES = ("; one launch per case: the direct f32 kernel under graph recording or without Q8 scratch, "
                      "else DP4A")
@@ -295,8 +306,7 @@ ALLOW: dict[str, tuple[int, str]] = {
         (1, "test or benchmark entry point; graph compute does not call it"),
     "submit:ggml-sycl.cpp:try_xmx_sorted_moe": (
         3,
-        "the XMX sorted MoE route, on by default (GGML_SYCL_XMX_MOE=0 turns it off) for a prompt batch that names "
-        "no staged ring slot: the sort's dependency barrier and the two sorted_token_ids extracts, not yet wrapped",
+        MOE_XMX + ": the sort's dependency barrier and the two sorted_token_ids extracts",
     ),
     "submit:mem-ops.cpp:mem_copy_ptr_async": (1, "not yet wrapped"),
     "submit:mmq_xmx.cpp:ggml_mul_mat_q2_K_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
@@ -454,9 +464,19 @@ ALLOW: dict[str, tuple[int, str]] = {
     "submit:unified-kernel.cpp:dispatch_xmx_kernel": (
         3,
         "debug only: the GGML_SYCL_XMX_DETAIL timing probes (real, empty and SLM-only kernels between q.wait() "
-        "calls); the kernel the route runs is launched elsewhere",
+        "calls); the production launch below them in the same function is wrapped (ggml_sycl_profile_submit)",
     ),
     "submit:unified-kernel.cpp:launch_unified_matmul": (1, "unified kernel launch, not yet wrapped"),
+    "submit:cpu-dispatch.cpp:cpu_submit_async":
+        (1, "the CPU executor's submit helper: a kernel on the CPU queue, or a host_task on the device queue for the "
+            "CPU matmul and fused paths (run_mul_mat, run_fused); not yet labelled"),
+    "submit:cpu-dispatch.cpp:cpu_cpy": (1, CPU_HOST_TASK),
+    "submit:cpu-dispatch.cpp:cpu_glu": (1, CPU_HOST_TASK),
+    "submit:cpu-dispatch.cpp:cpu_norm": (1, CPU_HOST_TASK),
+    "submit:cpu-dispatch.cpp:cpu_rms_norm": (1, CPU_HOST_TASK),
+    "submit:cpu-dispatch.cpp:cpu_rope": (1, CPU_HOST_TASK),
+    "submit:cpu-dispatch.cpp:cpu_scale": (1, CPU_HOST_TASK),
+    "submit:cpu-dispatch.cpp:cpu_silu": (1, CPU_HOST_TASK),
     "submit:expert-prefetch.cpp:ExpertPredictor::predict_pregate":
         (1, "the expert predictor's gate GEMV, run while the predictor is active; not yet wrapped"),
     "submit:fused-moe-esimd.hpp:launch_fused_moe_mxfp4_impl": (3, FUSED_ESIMD + FUSED_ESIMD_CASES),
@@ -694,7 +714,8 @@ def blank_alternative_branches(code: str) -> str:
             groups[-1].append([])
         elif m and m.group(1) == "endif" and groups:
             for branch in groups.pop()[1:]:
-                if not any(SUBMIT.search(lines[j]) or SHORTCUT.search(lines[j]) for j in branch):
+                text = "\n".join(lines[j] for j in branch)
+                if not (SUBMIT.search(text) or SHORTCUT.search(text)):
                     drop.update(branch)
         elif groups:
             groups[-1][-1].append(i)
@@ -867,9 +888,29 @@ class Code:
         open_ = self.paren_open.get(max(0, brace - 2000) + len(head) - 1) if head.endswith(")") else None
         return open_ is not None and self.callee(open_) in ("for", "while")
 
-    def assigned_event(self, pos: int) -> str | None:
-        """`ev` when the launch whose '.'/'->' is at pos is the right-hand side of `ev = ...` (a declaration
-        `sycl::event ev = ...` included), else None."""
+    def is_else_arm(self, brace: int) -> bool:
+        """The '{' opens an `else` or `else if (...)` arm."""
+        lo = max(0, brace - 2000)
+        head = self.code[lo:brace].rstrip()
+        if re.search(r"\belse$", head):
+            return True
+        if not head.endswith(")"):
+            return False
+        open_ = self.paren_open.get(lo + len(head) - 1)
+        return (open_ is not None and self.callee(open_) == "if"
+                and re.search(r"\belse\s*if\s*$", self.code[max(0, open_ - 200):open_]) is not None)
+
+    def body_brace(self, braces: list[int]) -> int | None:
+        """The '{' of the innermost function, lambda or class body among braces (any order)."""
+        for b in sorted(braces, reverse=True):
+            if self.brace_kind(b)[0] in ("function", "lambda", "class"):
+                return b
+        return None
+
+    def assigned_event(self, pos: int) -> tuple[str, int] | None:
+        """(`ev`, where its statement starts) when the launch whose '.'/'->' is at pos is the whole right-hand side of
+        `ev = ...` (a declaration `sycl::event ev = ...` included) and `ev` is a plain name, not a member (`s.ev`,
+        `this->ev`); else None."""
         i = pos
         while True:  # back over the receiver expression: names, `::`, `.`, `->` and bracketed calls or indexes
             head = self.code[max(0, i - 300):i]
@@ -884,33 +925,77 @@ class Code:
             i = max(0, i - 300) + m.start()
             if not re.match(r"\s*(?:->|\.|::)", self.code[i:]):
                 break
-        m = re.search(r"\b(\w+)\s*=\s*$", self.code[max(0, i - 300):i])
-        return m.group(1) if m else None
+        lo = max(0, i - 300)
+        m = re.search(r"\b(\w+)\s*=\s*$", self.code[lo:i])
+        if not m or re.search(r"(?:\.|->|::)\s*$", self.code[max(0, lo + m.start(1) - 50):lo + m.start(1)]):
+            return None
+        # the statement starts after the type of a declaration, at the name of an assignment
+        decl = re.search(r"([A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?[\s&*]+)$", self.code[max(0, lo + m.start(1) - 300):
+                                                                               lo + m.start(1)])
+        start = lo + m.start(1)
+        if decl and decl.group(1).split()[0].split("<")[0] not in NOT_A_TYPE:
+            start -= len(decl.group(1))
+        return m.group(1), start
+
+    def under_braceless_loop(self, start: int) -> bool:
+        """The statement starting at start is the body of a `for (...)`, `while (...)` or `do` with no braces."""
+        lo = max(0, start - 2000)
+        head = self.code[lo:start].rstrip()
+        if re.search(r"\bdo$", head):
+            return True
+        open_ = self.paren_open.get(lo + len(head) - 1) if head.endswith(")") else None
+        return open_ is not None and self.callee(open_) in ("for", "while")
+
+    def writes(self, name: str, lo: int, hi: int) -> list[int]:
+        """Positions in [lo, hi) where name is assigned (`name =`) or declared (`T name`, `T & name = ...`)."""
+        ident = re.escape(name)
+        found = [m.start() for m in re.finditer(r"(?<![.>:\w])" + ident + r"\s*=(?!=)", self.code[lo:hi])]
+        for m in re.finditer(r"\b([A-Za-z_]\w*)(?:\s*<[^;{}()]*>)?[ \t&*]+" + ident + r"\s*[=;({,]",
+                             self.code[lo:hi]):
+            if m.group(1) not in NOT_A_TYPE:
+                found.append(m.start())
+        return [lo + p for p in found]
 
     def recorded(self, pos: int, parens: list[int], braces: list[int]) -> bool:
-        """The launch at pos is profiled by a record call: its event is handed to one directly, or it is assigned to a
-        variable that a later record call in the same function is handed, as its event argument, with no loop around
-        the launch that the record call is outside of and no assignment to that variable between them that runs on
-        every path from the launch (one in the launch's own block or a block around it)."""
-        if parens and self.callee(parens[-1]) in RECORDERS:
+        """The launch at pos is profiled by a record call (RECORDERS) on every path from it, by lexical data flow:
+        - its event is the record call's argument, the launch not inside a lambda written in that call; or
+        - it is assigned to a plain name `ev` (`ev = <launch>`, a declaration included) and a later record call in the
+          same function or lambda body is handed `ev`, or `std::move(ev)`, as its event (second) argument; unless
+          - a loop around the launch, braced or not, does not also hold the record call;
+          - the outermost block that holds the record call but not the launch is an `else` / `else if` arm (the launch
+            is then in another arm of the same choice, or before it, and is conservatively refused either way);
+          - `ev` is assigned or declared between them in the launch's block, a block around it, or a block that holds
+            the record call (a shadowing declaration included).
+        A record call elsewhere in the function excuses nothing else."""
+        if parens and self.callee(parens[-1]) in RECORDERS and not any(b > parens[-1] for b in braces):
             return True
-        name = self.assigned_event(pos)
-        fb = self.function_brace(braces)
-        if name is None or not fb:
+        target = self.assigned_event(pos)
+        body = self.body_brace(braces)
+        if target is None or body is None:
             return False
-        overwrite = re.compile(r"(?<![.>\w])" + re.escape(name) + r"\s*=(?!=)")
-        for m in RECORD_CALL.finditer(self.code, pos, self.brace_close.get(fb, len(self.code))):
+        name, start = target
+        if self.under_braceless_loop(start):
+            return False
+        launch_braces = set(braces)
+        call_open = self.code.find("(", pos)
+        after_launch = self.paren_close.get(call_open, pos)
+        for m in RECORD_CALL.finditer(self.code, after_launch, self.brace_close.get(body, len(self.code))):
             open_ = m.end() - 1
             close = self.paren_close.get(open_)
             args = top_level_args(self.code[open_ + 1:close]) if close is not None else []
-            if len(args) < 2 or args[1] != name:
+            event = re.sub(r"^std::move\s*\(\s*(\w+)\s*\)$", r"\1", args[1]) if len(args) >= 2 else None
+            if event != name:
                 continue
             around_record = self.braces_at(m.start())
-            if any(self.is_loop(b) for b in braces if b not in around_record):
+            if self.body_brace(list(around_record)) != body:
                 continue
-            # the launch's own statement ends at its ';'; an overwrite is searched from there
-            end = self.code.find(";", pos)
-            if any(self.innermost_brace(w.start()) in braces for w in overwrite.finditer(self.code, end, m.start())):
+            if any(self.is_loop(b) for b in launch_braces - around_record):
+                continue
+            record_only = around_record - launch_braces
+            if record_only and launch_braces - around_record and self.is_else_arm(min(record_only)):
+                continue
+            if any(self.innermost_brace(w) in launch_braces or self.innermost_brace(w) in around_record
+                   for w in self.writes(name, after_launch, m.start())):
                 continue
             return True
         return False
@@ -975,16 +1060,19 @@ def top_level_args(text: str) -> list[str]:
 
 # an argument that passes a parameter on: `f`, `static_cast<F &&>(f)` or `std::forward<F>(f)`
 FORWARDED_ARG = re.compile(r"(?:static_cast\s*<[^()]*>|std::forward\s*<[^()]*>)\s*\(\s*(\w+)\s*\)|(\w+)")
-# a parameter forwarded anywhere inside a wrapper call's arguments, a lambda body included
-FORWARDED_INSIDE = re.compile(r"(?:\bstatic_cast\s*<[^()]*&&\s*>|\bstd::forward\s*<[^()]*>)\s*\(\s*(\w+)\s*\)")
+# a parameter forwarded as the whole argument of a submit inside a wrapper call's arguments, a lambda body included
+FORWARDED_TO_SUBMIT = re.compile(r"(?:->|\.)\s*submit\s*\(\s*"
+                                 r"(?:\bstatic_cast\s*<[^()]*&&\s*>|\bstd::forward\s*<[^()]*>)"
+                                 r"\s*\(\s*(\w+)\s*\)\s*\)")
 
 
 def derive_wrappers(texts: dict[str, str]) -> set[str]:
     """ggml_sycl_profile_submit, and every function that hands one of its own forwarding-reference parameters
-    (`F && f`) to a wrapper call: as a top-level argument (`f`, `static_cast<F &&>(f)`, `std::forward<F>(f)`), or
-    forwarded inside the call's arguments, as mmq_submit does from inside the profiler's lambda
+    (`F && f`) on as the command group of a wrapper call: as the argument in the wrapper's command-group position
+    (`f`, `static_cast<F &&>(f)`, `std::forward<F>(f)`), or as the whole argument of a `submit(` inside the call's
+    arguments, as mmq_submit does from inside the profiler's lambda
     (`ggml_sycl_profile_submit(q, label, [&](sycl::queue &) { return stream->submit(std::forward<F>(fn)); })`).
-    Either way the caller's command group reaches the profiler through it. Found by name-free structure and closed
+    A derived wrapper's command-group position is that parameter's. Found by name-free structure and closed
     transitively, so a helper is a wrapper whatever it is called (ggml_sycl_submit_binbcast_kernel is one)."""
     key = tuple(sorted((name, id(parse(src))) for name, src in texts.items()))
     if key not in _WRAPPERS:
@@ -995,8 +1083,13 @@ def derive_wrappers(texts: dict[str, str]) -> set[str]:
 _WRAPPERS: dict[tuple, set[str]] = {}
 
 
+# the command-group parameter of ggml_sycl_profile_submit(q, label, submit_fn, file, line, function)
+BASE_WRAPPER_COMMAND_GROUP = 2
+
+
 def derive_wrappers_uncached(texts: dict[str, str]) -> set[str]:
-    wrappers = {BASE_WRAPPER}
+    # wrapper -> the index of its command-group parameter, the one a caller's command group is passed in
+    wrappers = {BASE_WRAPPER: BASE_WRAPPER_COMMAND_GROUP}
     changed = True
     while changed:
         changed = False
@@ -1011,21 +1104,29 @@ def derive_wrappers_uncached(texts: dict[str, str]) -> set[str]:
                     continue
                 kind, name = code.brace_kind(fb)
                 p_open, p_close = code.params[fb]
-                forwarding = set(re.findall(r"&&\s*(\w+)\s*(?=,|$)", code.code[p_open + 1:p_close], re.M))
+                params = top_level_args(code.code[p_open + 1:p_close])
+                forwarding = {}
+                for index, param in enumerate(params):
+                    f = re.search(r"&&\s*(\w+)\s*(?:=.*)?$", param, re.S)
+                    if f:
+                        forwarding[f.group(1)] = index
                 inside = code.code[open_ + 1:close]
-                passed_on = {m.group(1) for m in FORWARDED_INSIDE.finditer(inside)}
-                for arg in top_level_args(inside):
-                    inner = FORWARDED_ARG.fullmatch(arg)
+                # forwarded as the whole argument of a submit inside the call (mmq_submit's lambda), or passed as the
+                # call's own command-group argument
+                passed_on = [g.group(1) for g in FORWARDED_TO_SUBMIT.finditer(inside)]
+                args = top_level_args(inside)
+                if wrappers[m.group(1)] < len(args):
+                    inner = FORWARDED_ARG.fullmatch(args[wrappers[m.group(1)]])
                     if inner:
-                        passed_on.add(inner.group(1) or inner.group(2))
-                for passed in sorted(passed_on):
+                        passed_on.append(inner.group(1) or inner.group(2))
+                for passed in passed_on:
                     if passed in forwarding:
                         short = name.split("::")[-1]
                         if short not in wrappers:
-                            wrappers.add(short)
+                            wrappers[short] = forwarding[passed]
                             changed = True
                         break
-    return wrappers
+    return set(wrappers)
 
 
 def declared_type(text: str, name: str, last: bool) -> str | None:
@@ -1086,7 +1187,8 @@ def receiver_kind(code: Code, pos: int, braces: list[int], file_text: str, decl_
 
 
 def census(texts: dict[str, str], wrappers: set[str] | None = None, decl_texts: dict[str, str] | None = None,
-           skipped: list[str] | None = None) -> dict[str, list[tuple[int, str, str]]]:
+           skipped: list[str] | None = None,
+           recorded: list[str] | None = None) -> dict[str, list[tuple[int, str, str]]]:
     """The raw sites of each named text, as (line, function, kind) triples. A site is wrapped when any '(' still open
     at it, however far back and however deeply nested, is the argument list of a wrapper call. A shortcut is a site
     only when its receiver is a queue and it is not inside a submit's parentheses (there it is the command group's
@@ -1100,7 +1202,11 @@ def census(texts: dict[str, str], wrappers: set[str] | None = None, decl_texts: 
         code = parse(src)
         for pos, kind, method, parens, braces in code.sites:
             callees = [code.callee(p) for p in parens]
-            if any(c in wrappers for c in callees) or code.recorded(pos, parens, braces):
+            if any(c in wrappers for c in callees):
+                continue
+            if code.recorded(pos, parens, braces):
+                if recorded is not None:
+                    recorded.append(f"{name}:{code.enclosing(braces)}")
                 continue
             if kind == "shortcut":
                 why = None
@@ -1343,7 +1449,8 @@ def test_a_record_call_on_no_path_from_the_launch_does_not_excuse_it():
         # a: the record is in the else arm opposite the launch's arm
         "opposite arm": (H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ ev = {L2}; {RECORD}(lab, ev); }}\n}}\n",
                          ["f"]),
-        "opposite arm alone": (H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ {REC2}(lab, ev); }}\n}}\n", ["f"]),
+        "opposite arm alone": (H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ {REC2}(lab, ev); }}\n}}\n",
+                               ["f"]),
         # b: a shadowing declaration around the record
         "shadow": (H + f"sycl::event ev = {L1};\n{{ sycl::event ev = other(); {RECORD}(lab, ev); }}\n}}\n", ["f"]),
         # c: a brace-less loop around the launch
@@ -1495,6 +1602,15 @@ def test_a_receiver_of_unknown_type_is_named_unresolved():
 
 # every shortcut on the path set aside by its receiver's type, as "file:function .method( receiver type"
 EXCLUDED_SHORTCUTS = [
+    # the command groups the CPU executor hands to cpu_submit_async; that submit is the site
+    "cpu-dispatch.cpp:cpu_binary_op .parallel_for( receiver cgh is handler",
+    "cpu-dispatch.cpp:cpu_glu .parallel_for( receiver cgh is handler",
+    "cpu-dispatch.cpp:cpu_norm .parallel_for( receiver cgh is handler",
+    "cpu-dispatch.cpp:cpu_rms_norm .parallel_for( receiver cgh is handler",
+    "cpu-dispatch.cpp:cpu_rope .parallel_for( receiver cgh is handler",
+    "cpu-dispatch.cpp:cpu_scale .parallel_for( receiver cgh is handler",
+    "cpu-dispatch.cpp:cpu_silu .parallel_for( receiver cgh is handler",
+    "cpu-dispatch.cpp:cpu_soft_max .parallel_for( receiver cgh is handler",
     "ggml-sycl.cpp:ggml_sycl_plan_dry_run_plans .fill( receiver ready is other:std::array",
     "ggml-sycl.cpp:ggml_sycl_reset_model_load_scratch_state .fill( "
     "receiver g_moe_expert_vram_reserve is other:std::array",
