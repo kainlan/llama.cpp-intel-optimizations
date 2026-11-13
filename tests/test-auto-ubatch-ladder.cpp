@@ -46,7 +46,7 @@
 // goes on below it; busy, stale identity and any other lifecycle code end the walk.
 //
 // llama_auto_ubatch_ctor_lowered_skips_trial() decides whether a context the constructor's publish lowered leaves
-// the trial nothing to run: no ladder rung lies between the lowered rung and the cap, which is where the trial's
+// the trial no candidate to try: no ladder rung lies between the lowered rung and the cap, which is where the trial's
 // no-candidate exit would otherwise take it before any lowered WARN.
 //
 // No device, no model, no allocation.

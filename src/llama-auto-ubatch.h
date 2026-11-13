@@ -169,12 +169,12 @@ inline bool llama_auto_ubatch_ctor_walks_down(bool trial_runs, bool fit_refusal)
 #endif
 }
 
-// True iff a context whose -ub the constructor's publish lowered leaves the trial nothing to run: no rung of `ladder`
-// lies in [lowered_ubatch, cap]. The trial's no-candidate exit asks exactly that and, without such a rung, reserves
-// once and returns before the trial's lowered WARN, while the constructor announces a lowering only when the trial
-// has no prep. So the trial's prepare step returns before it builds one, and the lowering is announced. Two shapes
-// reach it: a rung above the cap (the walk is capped at what was asked, not at a MoE routing ceiling under it; the
-// rung set is then empty) and a rung under the cap with no ladder rung up to it (a raw-API -ub above the largest
+// True iff a context whose -ub the constructor's publish lowered leaves the trial no candidate to try: no rung of
+// `ladder` lies in [lowered_ubatch, cap]. The trial's no-candidate exit asks exactly that and, without such a rung,
+// reserves once and returns before the trial's lowered WARN, while the constructor announces a lowering only when the
+// trial has no prep. So the trial's prepare step returns before it builds one, and the lowering is announced. Two
+// shapes reach it: a rung above the cap (the walk is capped at what was asked, not at a MoE routing ceiling under it;
+// the rung set is then empty) and a rung under the cap with no ladder rung up to it (a raw-API -ub above the largest
 // rung). A context the constructor did not lower keeps the trial's own exit.
 inline bool llama_auto_ubatch_ctor_lowered_skips_trial(bool             ctor_lowered,
                                                        const uint32_t * ladder,
