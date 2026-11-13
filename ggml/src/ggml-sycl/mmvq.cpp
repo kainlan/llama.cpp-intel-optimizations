@@ -6019,7 +6019,11 @@ static bool mmvq_q8_0_soa_id_mutant_wrong_scale_block() {
 //     before the call when it has none. The refusal keeps a future caller from running this kernel on bytes it
 //     would misread;
 //   - one expert's SOA block past INT_MAX bytes: the block dot takes int offsets.
-static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl(const char *                     tensor_name,
+// A refusal fails the op, so each one is named, with the dispatcher (`site`), the tensor and its shape.
+// With GGML_SYCL_MMVQ_TRACE on, every launch logs one [MMVQ-TRACE] q8_0-soa-id line naming `site`, through the log
+// callback rather than stderr, so a test can tell which dispatcher launched the kernel for each op it runs.
+static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl(const char *                     site,
+                                              const char *                     tensor_name,
                                               const void * const *             expert_ptrs,
                                               const void *                     vy,
                                               float *                          dst,
@@ -6042,24 +6046,19 @@ static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl(const char *                     t
                                               sycl::event *                    event_out = nullptr) {
     GGML_ASSERT(ncols % QK8_0 == 0);
     const int64_t expert_bytes = (int64_t) nrows_per_expert * (ncols / QK8_0) * (int64_t) (QK8_0 + sizeof(ggml_half));
+    const char *  name         = tensor_name ? tensor_name : "?";
     if (expert_ptrs == nullptr) {
-        static std::atomic<bool> warned{ false };
-        if (!warned.exchange(true, std::memory_order_relaxed)) {
-            GGML_LOG_WARN(
-                "[MMVQ] Q8_0 SOA MUL_MAT_ID refused for %s: the operand is one SOA block over all %d experts "
-                "(%lld bytes) with no per-expert table, and this kernel reads only per-expert SOA blocks\n",
-                tensor_name ? tensor_name : "?", n_experts, (long long) (expert_bytes * n_experts));
-        }
+        GGML_LOG_WARN(
+            "[MMVQ] Q8_0 SOA MUL_MAT_ID refused at %s for %s [%d, %d, %d]: the operand is one SOA block over all %d "
+            "experts (%lld bytes) with no per-expert table, and this kernel reads only per-expert SOA blocks\n",
+            site, name, ncols, nrows_per_expert, n_experts, n_experts, (long long) (expert_bytes * n_experts));
         return false;
     }
     if (expert_bytes > INT_MAX) {
-        static std::atomic<bool> warned{ false };
-        if (!warned.exchange(true, std::memory_order_relaxed)) {
-            GGML_LOG_WARN(
-                "[MMVQ] Q8_0 SOA MUL_MAT_ID refused for %s: one expert's SOA block is %lld bytes, past the %d-byte "
-                "limit of the block dot's int offsets\n",
-                tensor_name ? tensor_name : "?", (long long) expert_bytes, INT_MAX);
-        }
+        GGML_LOG_WARN(
+            "[MMVQ] Q8_0 SOA MUL_MAT_ID refused at %s for %s [%d, %d, %d]: one expert's SOA block is %lld bytes, "
+            "past the %d-byte limit of the block dot's int offsets\n",
+            site, name, ncols, nrows_per_expert, n_experts, (long long) expert_bytes, INT_MAX);
         return false;
     }
 
@@ -6113,6 +6112,10 @@ static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl(const char *                     t
     });
     if (event_out) {
         *event_out = ev;
+    }
+    if (mmvq_moe_trace_enabled()) {
+        GGML_LOG_DEBUG("[MMVQ-TRACE] q8_0-soa-id site=%s tensor=%s experts=%d rows=%d cols=%d batches=%d tokens=%d\n",
+                       site, name, n_experts, nrows_per_expert, ncols, total_batches, n_tokens);
     }
     return true;
 }
@@ -17688,7 +17691,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             // The kernel follows the layout the experts are loaded in: SOA bytes read as AOS blocks are garbage.
             if (layout == GGML_LAYOUT_SOA) {
                 if (!mul_mat_vec_q8_0_q8_1_soa_id_sycl(
-                        src0->name, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00,
+                        "batched", src0->name, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00,
                         ne10,  // ncols_y: the SOA Q8_1 row's quant bytes
                         ne01, ne02, total_batches, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, nb1, nb2,
                         stream, &kernel_deps, &kernel_event)) {
@@ -22243,7 +22246,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             // The SOA kernel reads per-expert blocks only, so it refuses an operand with no expert table (src0_d,
             // the whole tensor in one SOA block) rather than reading it.
             if (layout == GGML_LAYOUT_SOA) {
-                if (!mul_mat_vec_q8_0_q8_1_soa_id_sycl(src0->name, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
+                if (!mul_mat_vec_q8_0_q8_1_soa_id_sycl("vec_q", src0->name, dispatch_ptrs, q8_1_buffer, dst_d,
+                                                       dispatch_ids,
                                                        ne00,  // ncols
                                                        ne10,  // ncols_y: the SOA Q8_1 row's quant bytes
                                                        ne01,  // nrows_per_expert
