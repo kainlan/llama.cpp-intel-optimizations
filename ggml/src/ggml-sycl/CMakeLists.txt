@@ -6093,6 +6093,38 @@ set_tests_properties(test-moe-pp-batched-dequant PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# Decode runs Q8_0 experts in the SOA layout the planner materialized them in: three one-token MUL_MAT_ID cases on a
+# planned model loaded the way libllama loads one, each matching the CPU backend at NMSE <= 5e-4 and a largest
+# difference <= 1.0, each failing unless its load logged the preload's [MOE-LAYOUT] line with layout=soa for the
+# tensor, and each failing on a decode or prompt refusal. Pinned to the B50; a run with no SYCL GPU, or with
+# GGML_SYCL_WEIGHTS_EVICTABLE off, exits 77.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-decode-q8-0-soa
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-decode-q8-0-soa.cpp
+)
+target_include_directories(test-moe-decode-q8-0-soa PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-decode-q8-0-soa PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-decode-q8-0-soa PRIVATE "-fsycl")
+target_link_libraries(test-moe-decode-q8-0-soa PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-decode-q8-0-soa PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-moe-decode-q8-0-soa PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-decode-q8-0-soa COMMAND test-moe-decode-q8-0-soa)
+set_tests_properties(test-moe-decode-q8-0-soa PROPERTIES
+    LABELS "sycl;moe;device;B50"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 600
+)
+endif() # static SYCL backend fixture
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp
