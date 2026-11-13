@@ -18,31 +18,30 @@ Two kinds of launch are censused, and kept apart in the output and in the allowl
      (a helper that takes the command group's handler) and any other type (`std::array::fill`) are not. A receiver
      with no declaration found, or declared `auto`, fails the pin, so a queue cannot hide behind an unread type.
 
-A launch is wrapped when any '(' still open at it, at any nesting depth and any distance, is the argument list of a
-wrapper call. The wrappers are `ggml_sycl_profile_submit` and every function that hands one of its own forwarding-
-reference parameters (`F && f`) to a wrapper call, found from the source and closed transitively, whatever its name.
-Comments, string and character literals are blanked first, so a launch named in prose is not counted. The census is
-keyed by `kind:file:function` with a count per key: a line moving does not change it, and a second raw launch added to
-a function that is already listed does. A launch inside a helper that its callers wrap is still raw here, because the
-helper's text cannot know its callers; its entry says which caller wraps it.
+A launch is profiled, and not a site, in two cases:
+- Wrapped: any '(' still open at it, at any nesting depth and any distance, is the argument list of a wrapper call.
+  The wrappers are `ggml_sycl_profile_submit` and every function that hands one of its own forwarding-reference
+  parameters (`F && f`) to a wrapper call, as a top-level argument or forwarded (`std::forward<F>(f)`) inside the
+  call's arguments, a lambda body included (mmq_submit). Found from the source and closed transitively, whatever
+  the name.
+- Recorded: its returned event reaches `ggml_sycl_kernel_profile_record_event` or
+  `ggml_sycl_profile_record_returned_event` in the same function, by lexical data flow only: the launch is an argument
+  of the record call, or it is assigned to `ev` (`ev = <launch>`, a declaration included) and a later record call is
+  handed `ev` as its event argument. Not when a loop around the launch closes before the record call, nor when `ev` is
+  assigned again in between in the launch's block or a block around it. A record call elsewhere in the function
+  excuses nothing else.
+Comments, string and character literals are blanked first, so a launch named in prose is not counted. The #elif and
+#else branches of a conditional are blanked only when they hold no call of either class, so that braces opened in
+both branches count once; a branch holding a launch is kept whatever its condition, a dead one included (its entry
+says so). The census is keyed by `kind:file:function` with a count per key: a line moving does not change it, and a
+second raw launch added to a function that is already listed does. A launch inside a helper that its callers wrap is
+still raw here, because the helper's text cannot know its callers; its entry says which caller wraps it.
 
-FILES membership: a file is in FILES when a call from the qwen4exp prompt graph reaches it with more than one row,
-and the comment beside it cites the dispatch site. Opt-in paths stay out. Excluded, each for the one reason given:
-- dmmv.cpp, dmmv-esimd.hpp: dequantize-mul-mat-vec, the one-row (decode) MUL_MAT route.
-- add-id.cpp: ADD_ID; the qwen4exp graph builds none.
-- wkv.cpp, gla.cpp, upscale.cpp, roll.cpp, pad_reflect_1d.cpp, cross_entropy_loss.cpp: ops the graph does not build.
-- gpu-sampler.hpp, cont-batching.hpp, persistent-tg-kernel.cpp: sampling and decode-only paths.
-- moe-xmx.hpp, moe-xmx-fused.hpp, moe-sort.hpp: reached only through try_xmx_sorted_moe, behind the opt-in
-  GGML_SYCL_XMX_MOE_PP.
-- fused-moe-esimd.hpp: the fused ESIMD MoE launches, called from ggml_sycl_mul_mat_id's decode branches.
-- convert-esimd.hpp: ESIMD dequant, behind the opt-in GGML_SYCL_ESIMD_DEQUANT.
-- cpu-dispatch.cpp: the host executor; placement runs host-resident work on the CPU, not on the window.
-- kv-cache-quant.hpp: quantized KV only; the window path's KV is f16.
-- unified-cache.cpp, expert-prefetch.cpp, lazy-io-pool.cpp, moe-fused-transaction.cpp, moe-tile-convert.cpp,
-  mxfp4-stored-gemm.cpp, mul-mat-bf16.hpp, quantized-comm.hpp, mmq-esimd.hpp, mmq-xmx.hpp, fused-ffn.hpp,
-  fused-norm-gemm.hpp, mmvq-rmsnorm.hpp, l2-prefetch.hpp: no call from the prompt graph's dispatch reaches them
-  (allocator, prefetch, load-time conversion, MXFP4/BF16 weights, multi-GPU, decode fusions).
-Challenge an exclusion by citing the call that reaches the file; then add it to FILES and its launches to ALLOW.
+FILES membership: a file is in FILES when a call from the qwen4exp prompt graph reaches it with more than one row on
+a default route, and the comment beside it cites the dispatch site. Every other source under ggml/src/ggml-sycl that
+holds a launch-like call is in EXCLUDED_FILES (or under an EXCLUDED_DIRS prefix) with its reason; that table is the
+source of truth, and test_every_launching_file_is_on_the_path_or_excluded fails on a file in neither. Challenge an
+exclusion by citing the call that reaches the file; then move it to FILES and its launches to ALLOW.
 
 Run directly or under pytest; `-s` prints the `file:line function kind` list and the counts per kind and file, and a
 failing census prints the list too.
@@ -64,8 +63,14 @@ PROFILER_HEADER = "sycl-kernel-profiler.hpp"
 # header counts as a file of its own: its submits belong to every translation unit that includes it.
 FILES = [
     # the dispatcher, and the forward functions of MUL_MAT, MUL_MAT_ID (the window executor), GET_ROWS, RMS_NORM,
-    # SCALE, SUM_ROWS, ARGSORT and TOP_K
+    # SCALE, SUM_ROWS and ARGSORT; TOP_K's forward function here only calls topk.cpp
     "ggml-sycl.cpp",
+    # TOP_K: ggml_top_k (qwen4exp.cpp:813) -> ggml_sycl_top_k (ggml-sycl.cpp) -> ggml_sycl_op_top_k
+    "topk.cpp",
+    "diag.cpp",  # DIAG: ggml_diag (delta-net-base.cpp:158) -> ggml_sycl_op_diag
+    # hc_pre_launch, hc_comb_launch, hc_post_launch, called by dsv4-hc.cpp for DSV4_HC_PRE / DSV4_HC_POST
+    # (qwen4exp.cpp:319 ggml_dsv4_hc_pre_gated, :364 ggml_dsv4_hc_post)
+    "dsv4-hc-kernels.hpp",
     # ggml_sycl_submit_marker: the window's timing marks (moe-stream-plan.cpp) and the GEMM span marks of the executor
     "common.hpp",
     "binbcast.cpp",  # ADD, MUL, SUB, DIV, REPEAT
@@ -116,6 +121,19 @@ FILES = [
     "moe-stream-ring.cpp",
     "moe-scratch-admission.cpp",
     "mem-ops.cpp",
+    # MUL_MAT_ID with more than one row tries these before the window executor, each on by default:
+    # try_xmx_sorted_moe (off only for GGML_SYCL_XMX_MOE=0; it refuses a batch that names a staged ring slot), with
+    # its token sort, XMX GEMMs and the fused MXFP4 GEMMs it calls (try_fused_xmx_moe_mxfp4_*)
+    "moe-sort.hpp",
+    "moe-xmx.hpp",
+    "moe-xmx-fused.hpp",
+    # ggml_sycl_mul_mat_id_fused, the batched-prefill fused ESIMD MoE (off only for GGML_SYCL_DISABLE_FUSED_MOE)
+    "fused-moe-esimd.hpp",
+    # moe_cpu_job_prologue (ggml-sycl.cpp) arms a host expert job's input marker through
+    # unified_cache_cpu_job_input_marker_arm, which submits the marker on the device queue
+    "unified-cache.cpp",
+    # ExpertPredictor::predict_multi_layer, called by ggml_sycl_mul_mat_id while the predictor is active
+    "expert-prefetch.cpp",
 ]
 
 # Every other source under ggml/src/ggml-sycl that holds a launch-like call (either class, before any receiver or
@@ -155,8 +173,8 @@ EXCLUDED_FILES = {
     "cont-batching.hpp": "multi-sequence sampling (ggml_sycl_multi_seq_sample*), after the graph",
     "persistent-tg-kernel.cpp": "the persistent token-generation kernel, decode only",
     "fused-ffn.hpp": "execute_ffn_fusion: can_fuse_ffn admits Q4_0 gate/up pairs at token-generation batch sizes only",
-    "cpu-dispatch.cpp": "the CPU executor of host-placed ops (should_dispatch_to_cpu, ggml_sycl_compute_forward_cpu): its "
-                        "kernels run on the CPU queue, and each submit to the device queue is a host_task body",
+    "cpu-dispatch.cpp": "the CPU executor of host-placed ops (should_dispatch_to_cpu, ggml_sycl_compute_forward_cpu): "
+                        "its kernels run on the CPU queue, and each submit to the device queue is a host_task body",
     "mmq-esimd.hpp": "opt-in GGML_SYCL_MMQ_ESIMD: mmq_esimd_version() is 0 when it is unset",
     "mmq-xmx.hpp": "opt-in GGML_SYCL_XMX_MMQ=1 (use_xmx_mmq_kernel, read by can_use_xmx_q8_0)",
     "convert-esimd.hpp": "opt-in GGML_SYCL_ESIMD_DEQUANT=1 (g_esimd_dequant_enabled in convert.cpp)",
@@ -164,6 +182,9 @@ EXCLUDED_FILES = {
     "kv-cache-quant.hpp": "included by fattn.cpp, which calls neither launch_quantize_kv_fp8 nor launch_attention_fp8",
     "dpct/helper.hpp": "dpct_memcpy, dpct_memset and host_buffer: no backend source outside dpct/ calls them",
     "lazy-io-pool.cpp": "its submit is the read queue of the I/O pool (lazy_io_engine::queue), not a SYCL queue",
+    "moe-fused-transaction.cpp": "on the path (mmvq_submit_retained_prompt_fusion -> submit_prompt_fusion), but its "
+                                 "two submits are Transaction::submit and the submitter's submit, not SYCL queues; "
+                                 "the prompt fusion's device work is submitted from mmvq.cpp",
     "moe-tile-convert.cpp": "MXFP4 to XMX-tiled weight conversion, run when a weight is materialized "
                             "(ggml_sycl_fill_xmx_tiled, convert_tensor_layout), not by an op of the graph",
     "moe-mmid-workspace.cpp": "no launch: its .fill( calls are std::array::fill in moe_mmid_workspace_registry::admit",
@@ -178,6 +199,12 @@ EXCLUDED_FILES = {
 # shared reasons for the shortcut entries
 SHORTCUT_KERNEL = "kernel launched by a queue shortcut (parallel_for / single_task), not yet labelled"
 SHORTCUT_USM = "USM copy or fill launched by a queue shortcut, not yet labelled"
+SHORTCUT_KERNEL_QK_K = (SHORTCUT_KERNEL + "; one per branch of #if QK_K == 256, and the #else branch is dead code "
+                        "(ggml-common.h defines QK_K as 256)")
+MOE_XMX = "the XMX sorted MoE route (try_xmx_sorted_moe, on by default), not yet wrapped"
+FUSED_ESIMD = "the fused ESIMD MoE (ggml_sycl_mul_mat_id_fused, on by default), not yet wrapped"
+FUSED_ESIMD_CASES = ("; one launch per case: the direct f32 kernel under graph recording or without Q8 scratch, "
+                     "else DP4A")
 
 # "kind:file:function" -> (raw sites of that kind in it, why they are not wrapped yet). A named lambda is
 # `function/lambda`. The kind is `submit` or `shortcut`, so the two classes are driven down separately.
@@ -214,10 +241,6 @@ ALLOW: dict[str, tuple[int, str]] = {
     "submit:convert.cpp:reorder_q8_0_aos_to_coalesced_sycl":
         (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
     "submit:cumsum.cpp:ggml_sycl_op_cumsum": (1, "not yet wrapped"),
-    "submit:fattn.cpp:ggml_sycl_fattn_xmx_materialize_packed_k":
-        (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
-    "submit:fattn.cpp:ggml_sycl_fattn_xmx_submit_set_rows_update":
-        (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
     "submit:fattn-mma.hpp:launch_fattn_mma": (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
     "submit:fattn-tile-f16.hpp:launch_fattn_tile_f16":
         (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
@@ -226,8 +249,6 @@ ALLOW: dict[str, tuple[int, str]] = {
     "submit:fattn-vec-f16.hpp:launch_fattn_vec_f16":
         (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
     "submit:fattn-vec.hpp:launch_fattn_vec": (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
-    "submit:fattn-xmx-f16-v2.hpp:launch_fattn_xmx_v2_decode_gqa_split_leaf":
-        (2, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
     "submit:ggml-sycl.cpp:argmax_f32_i32_sycl": (1, "not yet wrapped"),
     "submit:ggml-sycl.cpp:argsort_f32_i32_sycl": (2, "not yet wrapped"),
     "submit:ggml-sycl.cpp:dispatch_experts_secondary_gpu_impl": (1, "not yet wrapped"),
@@ -237,7 +258,13 @@ ALLOW: dict[str, tuple[int, str]] = {
     "submit:ggml-sycl.cpp:ggml_sycl_dispatch_host_flash_attn_sync": (1, "not yet wrapped"),
     "submit:ggml-sycl.cpp:ggml_sycl_moe_down_weighted_sum_sycl": (1, "not yet wrapped"),
     "submit:ggml-sycl.cpp:ggml_sycl_mul_mat_batched_sycl": (2, "not yet wrapped"),
-    "submit:ggml-sycl.cpp:ggml_sycl_mul_mat_id": (4, "not yet wrapped"),
+    "submit:ggml-sycl.cpp:ggml_sycl_mul_mat_id": (
+        4,
+        "two are host_task submits of the Q1/NVFP4 exact route, ordering and completion rather than device kernels: "
+        "the injected terminal failure (test-only, under GGML_SYCL_Q1_NVFP4_ROUTE_TESTING) and the completion that "
+        "follows terminal->arm(final); two are prompt row copies, not yet wrapped: the MXFP4 SOA f16 activation "
+        "staging (f16_staging_event) and the expert output scatter",
+    ),
     "submit:ggml-sycl.cpp:ggml_sycl_mul_mat_id/copy_src1_current_f32": (1, "not yet wrapped"),
     "submit:ggml-sycl.cpp:ggml_sycl_mul_mat_tp_row_parallel_post": (1, "not yet wrapped"),
     "submit:ggml-sycl.cpp:ggml_sycl_router_f32_bias_argsort_sycl": (1, "not yet wrapped"),
@@ -266,9 +293,12 @@ ALLOW: dict[str, tuple[int, str]] = {
         (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
     "submit:ggml-sycl.cpp:test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing":
         (1, "test or benchmark entry point; graph compute does not call it"),
-    "submit:ggml-sycl.cpp:try_xmx_sorted_moe": (3, "not yet wrapped"),
+    "submit:ggml-sycl.cpp:try_xmx_sorted_moe": (
+        3,
+        "the XMX sorted MoE route, on by default (GGML_SYCL_XMX_MOE=0 turns it off) for a prompt batch that names "
+        "no staged ring slot: the sort's dependency barrier and the two sorted_token_ids extracts, not yet wrapped",
+    ),
     "submit:mem-ops.cpp:mem_copy_ptr_async": (1, "not yet wrapped"),
-    "submit:mem-ops.cpp:mem_fill_direct_submit": (1, "not yet wrapped"),
     "submit:mmq_xmx.cpp:ggml_mul_mat_q2_K_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
     "submit:mmq_xmx.cpp:ggml_mul_mat_q3_K_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
     "submit:mmq_xmx.cpp:ggml_mul_mat_q4_0_q8_1_xmx_colfused_4tile_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
@@ -421,8 +451,41 @@ ALLOW: dict[str, tuple[int, str]] = {
     "submit:quantize.hpp:quantize_row_q8_1_sycl": (1, "src1 quantize helper, not yet wrapped"),
     "submit:solve_tri.cpp:ggml_sycl_op_solve_tri": (1, "not yet wrapped"),
     "submit:ssm_conv.cpp:kernel_ssm_conv": (1, "not yet wrapped"),
-    "submit:unified-kernel.cpp:dispatch_xmx_kernel": (3, "unified kernel launch, not yet wrapped"),
+    "submit:unified-kernel.cpp:dispatch_xmx_kernel": (
+        3,
+        "debug only: the GGML_SYCL_XMX_DETAIL timing probes (real, empty and SLM-only kernels between q.wait() "
+        "calls); the kernel the route runs is launched elsewhere",
+    ),
     "submit:unified-kernel.cpp:launch_unified_matmul": (1, "unified kernel launch, not yet wrapped"),
+    "submit:expert-prefetch.cpp:ExpertPredictor::predict_pregate":
+        (1, "the expert predictor's gate GEMV, run while the predictor is active; not yet wrapped"),
+    "submit:fused-moe-esimd.hpp:launch_fused_moe_mxfp4_impl": (3, FUSED_ESIMD + FUSED_ESIMD_CASES),
+    "submit:fused-moe-esimd.hpp:launch_fused_moe_mxfp4_soa":
+        (3, FUSED_ESIMD + "; one launch per hidden-size case (2880, 4096, any other)"),
+    "submit:fused-moe-esimd.hpp:launch_fused_moe_q8_0": (1, FUSED_ESIMD),
+    "submit:fused-moe-esimd.hpp:launch_persistent_moe_mxfp4_impl":
+        (3, FUSED_ESIMD + "; the persistent variant, for at most 8 tokens" + FUSED_ESIMD_CASES),
+    "submit:moe-sort.hpp:moe_compute_expert_offsets_gpu": (1, MOE_XMX),
+    "submit:moe-sort.hpp:moe_compute_expert_offsets_gpu_simple": (1, MOE_XMX),
+    "submit:moe-sort.hpp:moe_compute_tile_mapping": (1, MOE_XMX),
+    "submit:moe-sort.hpp:moe_count_tokens_per_expert_async": (1, MOE_XMX),
+    "submit:moe-sort.hpp:moe_scatter_results_f16_to_f32_async": (1, MOE_XMX),
+    "submit:moe-sort.hpp:moe_sort_tokens_by_expert_async": (1, MOE_XMX),
+    "submit:moe-xmx-fused.hpp:fused_xmx_moe_gemm_mxfp4_soa": (1, MOE_XMX),
+    "submit:moe-xmx-fused.hpp:fused_xmx_moe_gemm_mxfp4_tiled": (1, MOE_XMX),
+    "submit:moe-xmx-fused.hpp:fused_xmx_moe_gemm_q8_0": (1, MOE_XMX),
+    "submit:moe-xmx.hpp:launch_fused_xmx_moe_q8_0_soa": (1, MOE_XMX),
+    "submit:moe-xmx.hpp:launch_xmx_moe_gemm_mxfp4": (1, MOE_XMX),
+    "submit:moe-xmx.hpp:launch_xmx_moe_gemm_mxfp4_coalesced": (1, MOE_XMX),
+    "submit:moe-xmx.hpp:launch_xmx_moe_gemm_mxfp4_soa": (1, MOE_XMX),
+    "submit:moe-xmx.hpp:launch_xmx_moe_gemm_q8_0": (1, MOE_XMX),
+    "submit:moe-xmx.hpp:launch_xmx_moe_gemm_q8_0_coalesced": (1, MOE_XMX),
+    "submit:moe-xmx.hpp:launch_xmx_moe_gemm_q8_0_soa": (1, MOE_XMX),
+    "submit:moe-xmx.hpp:preprocess_tokens_q8_async": (1, MOE_XMX),
+    "submit:unified-cache.cpp:cpu_job_input_marker_submit":
+        (1, "the input marker of a host expert job (a single_task that publishes a serial), not yet wrapped"),
+    "submit:unified-cache.cpp:unified_cache::onednn_graph_scratch_free":
+        (1, "the completion marker of a freed oneDNN Graph scratch slot on the watch queue, not yet wrapped"),
     "submit:unified-kernel.cpp:micro_submit_add": (1, "unified kernel launch, not yet wrapped"),
     "submit:unified-kernel.cpp:micro_submit_attention": (1, "unified kernel launch, not yet wrapped"),
     "submit:unified-kernel.cpp:micro_submit_rms_norm": (1, "unified kernel launch, not yet wrapped"),
@@ -439,24 +502,35 @@ ALLOW: dict[str, tuple[int, str]] = {
     "submit:unified-kernel.cpp:UnifiedKernel::record_micro_graph": (1, "unified kernel launch, not yet wrapped"),
     "submit:unified-kernel.cpp:UnifiedKernel::rms_norm": (1, "unified kernel launch, not yet wrapped"),
     "submit:unified-kernel.cpp:UnifiedKernel::silu_mul": (1, "unified kernel launch, not yet wrapped"),
-    "shortcut:common.hpp:ggml_sycl_graph_safe_memcpy": (3, SHORTCUT_KERNEL),
     "shortcut:concat.cpp:concat_T_sycl": (3, SHORTCUT_KERNEL),
+    "shortcut:diag.cpp:ggml_sycl_op_diag": (1, SHORTCUT_KERNEL),
+    "shortcut:dsv4-hc-kernels.hpp:hc_comb_launch": (1, SHORTCUT_KERNEL),
+    "shortcut:dsv4-hc-kernels.hpp:hc_post_launch": (1, SHORTCUT_KERNEL),
+    "shortcut:dsv4-hc-kernels.hpp:hc_pre_launch": (1, SHORTCUT_KERNEL),
+    "shortcut:moe-sort.hpp:moe_convert_f32_to_f16": (1, MOE_XMX),
+    "shortcut:moe-sort.hpp:moe_convert_f32_to_f16_async": (1, MOE_XMX),
+    "shortcut:moe-sort.hpp:moe_count_tokens_per_expert": (1, MOE_XMX),
+    "shortcut:moe-sort.hpp:moe_scatter_results": (1, MOE_XMX),
+    "shortcut:moe-sort.hpp:moe_scatter_results_f16_to_f32": (1, MOE_XMX),
+    "shortcut:moe-sort.hpp:moe_sort_tokens_by_expert": (1, MOE_XMX),
+    "shortcut:moe-xmx-fused.hpp:fused_xmx_moe_gemm_q8_0": (1, MOE_XMX),
+    "shortcut:moe-xmx.hpp:extract_q8_0_scales": (1, MOE_XMX),
     "shortcut:concat.cpp:concat_T_sycl_non_cont": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:convert_unary_nc_sycl": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:dequantize_block_sycl": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:dequantize_row_mxfp4_soa_to_fp16_rowmajor": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:dequantize_row_mxfp4_sycl": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:dequantize_row_nvfp4_fp16_sycl": (1, SHORTCUT_KERNEL),
-    "shortcut:convert.cpp:dequantize_row_q2_K_sycl": (1, SHORTCUT_KERNEL),
-    "shortcut:convert.cpp:dequantize_row_q3_K_sycl": (1, SHORTCUT_KERNEL),
+    "shortcut:convert.cpp:dequantize_row_q2_K_sycl": (2, SHORTCUT_KERNEL_QK_K),
+    "shortcut:convert.cpp:dequantize_row_q3_K_sycl": (2, SHORTCUT_KERNEL_QK_K),
     "shortcut:convert.cpp:dequantize_row_q4_0_soa_to_fp16_rowmajor": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:dequantize_row_q4_0_sycl": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:dequantize_row_q4_0_sycl_coalesced": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:dequantize_row_q4_0_sycl_coalesced_rowmajor": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:dequantize_row_q4_0_sycl_reorder": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:dequantize_row_q4_1_sycl": (1, SHORTCUT_KERNEL),
-    "shortcut:convert.cpp:dequantize_row_q5_K_sycl": (1, SHORTCUT_KERNEL),
-    "shortcut:convert.cpp:dequantize_row_q6_K_sycl": (1, SHORTCUT_KERNEL),
+    "shortcut:convert.cpp:dequantize_row_q5_K_sycl": (2, SHORTCUT_KERNEL_QK_K),
+    "shortcut:convert.cpp:dequantize_row_q6_K_sycl": (2, SHORTCUT_KERNEL_QK_K),
     "shortcut:convert.cpp:dequantize_row_q6_K_sycl_reorder": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:dequantize_row_q8_0_coalesced_rowmajor": (1, SHORTCUT_KERNEL),
     "shortcut:convert.cpp:dequantize_row_q8_0_soa_to_fp16_rowmajor": (1, SHORTCUT_KERNEL),
@@ -562,6 +636,9 @@ ALLOW: dict[str, tuple[int, str]] = {
 }
 
 BASE_WRAPPER = "ggml_sycl_profile_submit"
+# record a launch's returned event with the profiler; a launch whose event reaches one is profiled (Code.recorded)
+RECORDERS = ("ggml_sycl_kernel_profile_record_event", "ggml_sycl_profile_record_returned_event")
+RECORD_CALL = re.compile(r"\b(?:" + "|".join(RECORDERS) + r")\s*\(")
 
 SUBMIT = re.compile(r"(?:->|\.)\s*submit\s*\(")
 # a queue member that enqueues a command without submit(); the receiver decides whether it is one (receiver_kind)
@@ -601,9 +678,11 @@ CONDITIONAL = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b")
 
 
 def blank_alternative_branches(code: str) -> str:
-    """Blanks the #elif / #else branches of each conditional group, so brackets are counted over one branch: code like
-    `#ifdef A for (...) { #else for (...) { #endif` opens one block, not two. A branch that holds a submit is kept, so
-    nothing is hidden; if it also unbalances the brackets, the balance test names the file."""
+    """Blanks the #elif / #else branches of each conditional group that hold no launch-like call, so brackets are
+    counted over one branch: code like `#ifdef A for (...) { #else for (...) { #endif` opens one block, not two. A
+    branch that holds a call of either class (a submit or a shortcut name) is kept whatever its condition, so no
+    launch is hidden by the blanking; if a kept branch also unbalances the brackets, the balance test names the
+    file. The first branch of each group is never blanked."""
     lines = code.split("\n")
     groups: list[list[list[int]]] = []  # per open group, its branches as lists of line indices
     drop: set[int] = set()
@@ -615,7 +694,7 @@ def blank_alternative_branches(code: str) -> str:
             groups[-1].append([])
         elif m and m.group(1) == "endif" and groups:
             for branch in groups.pop()[1:]:
-                if not any(SUBMIT.search(lines[j]) for j in branch):
+                if not any(SUBMIT.search(lines[j]) or SHORTCUT.search(lines[j]) for j in branch):
                     drop.update(branch)
         elif groups:
             groups[-1][-1].append(i)
@@ -760,6 +839,82 @@ class Code:
             i -= 1
         return None
 
+    def innermost_brace(self, pos: int) -> int | None:
+        """The '{' of the innermost block of any kind whose body holds pos."""
+        if self._brace_starts is None:
+            self._brace_starts = sorted(self.brace_close)
+        i = bisect.bisect_left(self._brace_starts, pos) - 1
+        while i >= 0:
+            b = self._brace_starts[i]
+            if self.brace_close[b] > pos:
+                return b
+            i -= 1
+        return None
+
+    def braces_at(self, pos: int) -> set[int]:
+        """The '{' of every block whose body holds pos."""
+        found = set()
+        b = self.innermost_brace(pos)
+        while b is not None:
+            found.add(b)
+            b = self.innermost_brace(b)
+        return found
+
+    def is_loop(self, brace: int) -> bool:
+        head = self.code[max(0, brace - 2000):brace].rstrip()
+        if re.search(r"\bdo$", head):
+            return True
+        open_ = self.paren_open.get(max(0, brace - 2000) + len(head) - 1) if head.endswith(")") else None
+        return open_ is not None and self.callee(open_) in ("for", "while")
+
+    def assigned_event(self, pos: int) -> str | None:
+        """`ev` when the launch whose '.'/'->' is at pos is the right-hand side of `ev = ...` (a declaration
+        `sycl::event ev = ...` included), else None."""
+        i = pos
+        while True:  # back over the receiver expression: names, `::`, `.`, `->` and bracketed calls or indexes
+            head = self.code[max(0, i - 300):i]
+            stripped = head.rstrip()
+            j = max(0, i - 300) + len(stripped)
+            if stripped.endswith(")") and (j - 1) in self.paren_open:
+                i = self.paren_open[j - 1]
+                continue
+            m = re.search(r"(?:->|\.|::)?\s*\w+$", stripped)
+            if not m:
+                break
+            i = max(0, i - 300) + m.start()
+            if not re.match(r"\s*(?:->|\.|::)", self.code[i:]):
+                break
+        m = re.search(r"\b(\w+)\s*=\s*$", self.code[max(0, i - 300):i])
+        return m.group(1) if m else None
+
+    def recorded(self, pos: int, parens: list[int], braces: list[int]) -> bool:
+        """The launch at pos is profiled by a record call: its event is handed to one directly, or it is assigned to a
+        variable that a later record call in the same function is handed, as its event argument, with no loop around
+        the launch that the record call is outside of and no assignment to that variable between them that runs on
+        every path from the launch (one in the launch's own block or a block around it)."""
+        if parens and self.callee(parens[-1]) in RECORDERS:
+            return True
+        name = self.assigned_event(pos)
+        fb = self.function_brace(braces)
+        if name is None or not fb:
+            return False
+        overwrite = re.compile(r"(?<![.>\w])" + re.escape(name) + r"\s*=(?!=)")
+        for m in RECORD_CALL.finditer(self.code, pos, self.brace_close.get(fb, len(self.code))):
+            open_ = m.end() - 1
+            close = self.paren_close.get(open_)
+            args = top_level_args(self.code[open_ + 1:close]) if close is not None else []
+            if len(args) < 2 or args[1] != name:
+                continue
+            around_record = self.braces_at(m.start())
+            if any(self.is_loop(b) for b in braces if b not in around_record):
+                continue
+            # the launch's own statement ends at its ';'; an overwrite is searched from there
+            end = self.code.find(";", pos)
+            if any(self.innermost_brace(w.start()) in braces for w in overwrite.finditer(self.code, end, m.start())):
+                continue
+            return True
+        return False
+
     def receiver(self, pos: int) -> str | None:
         """The object a member call at pos (the '.' or '->') is made on: `q` for `q->f(`, `stream()` for
         `ctx.stream()->f(`, None for anything else (`(*q).f(`, `qs[i].f(`)."""
@@ -820,13 +975,17 @@ def top_level_args(text: str) -> list[str]:
 
 # an argument that passes a parameter on: `f`, `static_cast<F &&>(f)` or `std::forward<F>(f)`
 FORWARDED_ARG = re.compile(r"(?:static_cast\s*<[^()]*>|std::forward\s*<[^()]*>)\s*\(\s*(\w+)\s*\)|(\w+)")
+# a parameter forwarded anywhere inside a wrapper call's arguments, a lambda body included
+FORWARDED_INSIDE = re.compile(r"(?:\bstatic_cast\s*<[^()]*&&\s*>|\bstd::forward\s*<[^()]*>)\s*\(\s*(\w+)\s*\)")
 
 
 def derive_wrappers(texts: dict[str, str]) -> set[str]:
     """ggml_sycl_profile_submit, and every function that hands one of its own forwarding-reference parameters
-    (`F && f`) to a wrapper call, as `f`, `static_cast<F &&>(f)` or `std::forward<F>(f)`: the caller's command group
-    reaches the profiler through it. Found by name-free structure and closed transitively, so a helper is a wrapper
-    whatever it is called (ggml_sycl_submit_binbcast_kernel is one)."""
+    (`F && f`) to a wrapper call: as a top-level argument (`f`, `static_cast<F &&>(f)`, `std::forward<F>(f)`), or
+    forwarded inside the call's arguments, as mmq_submit does from inside the profiler's lambda
+    (`ggml_sycl_profile_submit(q, label, [&](sycl::queue &) { return stream->submit(std::forward<F>(fn)); })`).
+    Either way the caller's command group reaches the profiler through it. Found by name-free structure and closed
+    transitively, so a helper is a wrapper whatever it is called (ggml_sycl_submit_binbcast_kernel is one)."""
     key = tuple(sorted((name, id(parse(src))) for name, src in texts.items()))
     if key not in _WRAPPERS:
         _WRAPPERS[key] = derive_wrappers_uncached(texts)
@@ -853,9 +1012,13 @@ def derive_wrappers_uncached(texts: dict[str, str]) -> set[str]:
                 kind, name = code.brace_kind(fb)
                 p_open, p_close = code.params[fb]
                 forwarding = set(re.findall(r"&&\s*(\w+)\s*(?=,|$)", code.code[p_open + 1:p_close], re.M))
-                for arg in top_level_args(code.code[open_ + 1:close]):
+                inside = code.code[open_ + 1:close]
+                passed_on = {m.group(1) for m in FORWARDED_INSIDE.finditer(inside)}
+                for arg in top_level_args(inside):
                     inner = FORWARDED_ARG.fullmatch(arg)
-                    passed = inner and (inner.group(1) or inner.group(2))
+                    if inner:
+                        passed_on.add(inner.group(1) or inner.group(2))
+                for passed in sorted(passed_on):
                     if passed in forwarding:
                         short = name.split("::")[-1]
                         if short not in wrappers:
@@ -871,8 +1034,10 @@ def declared_type(text: str, name: str, last: bool) -> str | None:
     call = name.endswith("()")
     ident = re.escape(name[:-2] if call else name)
     after = r"\s*\(" if call else r"\s*(?=[;=,)\[{(]|$)"
-    # a type is a (qualified) name with optional template arguments, on the declaration's own line
-    pattern = re.compile(r"\b([A-Za-z_]\w*(?:::\w+)*)(?:[ \t]*<[^;{}()\n]*>)?(?:[ \t]*(?:const|&&|&|\*))*[ \t]+"
+    # a type is a (qualified) name with optional template arguments, on the declaration's own line; an argument may
+    # hold one level of brackets (`std::array<size_t, static_cast<size_t>(zone_id::COUNT)>`)
+    targs = r"<(?:[^;{}()<>\n]|\([^;{}()\n]*\)|<[^;{}()<>\n]*>)*>"
+    pattern = re.compile(r"\b([A-Za-z_]\w*(?:::\w+)*)(?:[ \t]*" + targs + r")?(?:[ \t]*(?:const|&&|&|\*))*[ \t]+"
                          + ident + r"\b" + after, re.M)
     types = [m.group(1) for m in pattern.finditer(text) if m.group(1) not in NOT_A_TYPE]
     if not types:
@@ -935,7 +1100,7 @@ def census(texts: dict[str, str], wrappers: set[str] | None = None, decl_texts: 
         code = parse(src)
         for pos, kind, method, parens, braces in code.sites:
             callees = [code.callee(p) for p in parens]
-            if any(c in wrappers for c in callees):
+            if any(c in wrappers for c in callees) or code.recorded(pos, parens, braces):
                 continue
             if kind == "shortcut":
                 why = None
@@ -1160,7 +1325,8 @@ def test_a_record_call_excuses_only_the_launch_whose_event_it_is_handed():
         "void a(sycl::queue * q) { sycl::event ev; for (int i = 0; i < n; ++i) { ev = q->submit(cgf); } "
         f"{RECORD}(label, ev); }}\n",
         # the record is in another function
-        f"void a(sycl::queue * q) {{ sycl::event ev = q->submit(cgf); }}\nvoid b() {{ sycl::event ev; {RECORD}(l, ev); }}\n",
+        "void a(sycl::queue * q) { sycl::event ev = q->submit(cgf); }\n"
+        f"void b() {{ sycl::event ev; {RECORD}(l, ev); }}\n",
     ]
     for sample in samples:
         assert raw_sites(sample) == [("a", "submit")], sample
@@ -1248,6 +1414,12 @@ EXCLUDED_SHORTCUTS = [
     "mmq.cpp:ggml_sycl_parallel_for_grf .parallel_for( receiver cgh is handler",
     "mmq.cpp:ggml_sycl_parallel_for_grf .parallel_for( receiver cgh is handler",
     "mmq.cpp:ggml_sycl_parallel_for_grf .parallel_for( receiver cgh is handler",
+    "unified-cache.cpp:arena_pp_profile_snapshot_zones .fill( receiver cap_out is other:std::array",
+    "unified-cache.cpp:arena_pp_profile_snapshot_zones .fill( receiver used_out is other:std::array",
+    "unified-cache.cpp:unified_cache::configure_host_zones .fill( "
+    "receiver host_zone_reserved_bytes_ is other:std::array",
+    "unified-cache.cpp:unified_cache::configure_host_zones .fill( "
+    "receiver host_zone_reserved_bytes_ is other:std::array",
 ]
 
 
