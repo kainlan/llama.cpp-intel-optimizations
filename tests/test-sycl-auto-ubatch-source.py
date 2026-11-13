@@ -577,6 +577,58 @@ def test_probe_is_called_with_the_candidate_shape():
     ), "the probe must be called with (backend, token, n_ctx, the CANDIDATE c, n_seq_max, flash_attn, &probe)"
 
 
+# The probe's lifecycle result reaches llama_auto_ubatch_probe_classify() as one flag per code, positionally. Two
+# swapped flags still compile (all are bool) and every flag still "appears" in the call, so the call is pinned in full
+# and in order against the header's own parameter order: a BUSY result read as STALE would report the wrong stop reason.
+_PROBE_CLASSIFY_PARAMS_RE = (
+    r"llama_auto_ubatch_probe_outcome llama_auto_ubatch_probe_classify\( ?bool rc_ok, bool rc_busy, bool rc_stale, "
+    r"bool rc_plan_rejected, bool accepted ?\)"
+)
+_PROBE_CLASSIFY_CALL_RE = (
+    r"llama_auto_ubatch_probe_classify\( ?rc == GGML_SYCL_LIFECYCLE_OK, rc == GGML_SYCL_LIFECYCLE_BUSY, "
+    r"rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY, rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, probe\.accepted ?\)"
+)
+
+
+def _probe_classify_call_is_in_order(try_candidate_norm: str, header: str) -> bool:
+    """True iff the header declares (rc_ok, rc_busy, rc_stale, rc_plan_rejected, accepted) and try_candidate passes
+    (rc == OK, rc == BUSY, rc == STALE_IDENTITY, rc == PLAN_REJECTED, probe.accepted) in that order."""
+    return (
+        re.search(_PROBE_CLASSIFY_PARAMS_RE, _normalize_ws(strip_comments(header))) is not None
+        and re.search(_PROBE_CLASSIFY_CALL_RE, try_candidate_norm) is not None
+    )
+
+
+def test_the_probe_classifier_gets_every_flag_in_its_own_slot():
+    assert _probe_classify_call_is_in_order(_try_candidate_norm(), LLAMA_AUTO_UBATCH_H)
+
+
+@pytest.mark.parametrize(
+    "where,old,new",
+    [
+        ("call", "rc == GGML_SYCL_LIFECYCLE_OK, rc == GGML_SYCL_LIFECYCLE_BUSY,\n"
+                 "                                                     rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY,",
+         "rc == GGML_SYCL_LIFECYCLE_OK, rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY,\n"
+         "                                                     rc == GGML_SYCL_LIFECYCLE_BUSY,"),
+        ("call", "rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, probe.accepted", "probe.accepted, rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED"),
+        ("header", "bool rc_busy,", "bool rc_stale_,"),
+    ],
+)
+def test_the_probe_classifier_order_has_a_mutation_witness(where, old, new):
+    ctx_raw, hdr_raw = LLAMA_CONTEXT_CPP, LLAMA_AUTO_UBATCH_H
+    raw = ctx_raw if where == "call" else hdr_raw
+    pat = _ws_tolerant(old)
+    found = len(pat.findall(raw))
+    assert found == 1, f"mutation target not unique/found ({found}) -- update this witness: {old!r}"
+    mutated = pat.sub(lambda _m: new, raw, count=1)
+    if where == "call":
+        ctx_raw = mutated
+    else:
+        hdr_raw = mutated
+    body = _body_of(ctx_raw, _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
+    assert not _probe_classify_call_is_in_order(body, hdr_raw)
+
+
 def test_probe_busy_is_not_retried():
     """A GGML_SYCL_LIFECYCLE_BUSY probe result is the module-admission
     refusal, not lock contention: the candidate loses with "transaction
@@ -590,9 +642,9 @@ def test_probe_busy_is_not_retried():
     assert "sleep_for" not in LLAMA_CONTEXT_CPP_CODE
     body_norm = _normalize_ws(_try_candidate_body())
     assert not re.search(r"for\s*\(\s*int\s+wait\b", body_norm), "the probe is not retried"
-    # The probe's result is read through llama_auto_ubatch_probe_classify(): BUSY is its rc_busy argument, and the
-    # BUSY outcome returns "transaction busy" directly.
-    assert re.search(r"llama_auto_ubatch_probe_classify\([^;]*rc\s*==\s*GGML_SYCL_LIFECYCLE_BUSY\s*,", body_norm), (
+    # The probe's result is read through llama_auto_ubatch_probe_classify(): BUSY is its rc_busy argument (the full
+    # call is pinned in order), and the BUSY outcome returns "transaction busy" directly.
+    assert _probe_classify_call_is_in_order(body_norm, LLAMA_AUTO_UBATCH_H), (
         "the probe's BUSY result must reach the classifier as its busy flag"
     )
     assert re.search(
@@ -617,9 +669,9 @@ def test_stale_identity_branches_to_not_the_published_model():
     lives, not to the assignment (which is now generic and reason-agnostic:
     `stop = reason;`)."""
     body_norm = _normalize_ws(_try_candidate_body())
-    assert re.search(
-        r"llama_auto_ubatch_probe_classify\([^;]*rc\s*==\s*GGML_SYCL_LIFECYCLE_STALE_IDENTITY\s*,", body_norm
-    ), "the probe's STALE_IDENTITY result must reach the classifier as its stale flag"
+    assert _probe_classify_call_is_in_order(body_norm, LLAMA_AUTO_UBATCH_H), (
+        "the probe's STALE_IDENTITY result must reach the classifier as its stale flag"
+    )
     assert re.search(
         r'case\s+llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_STALE\s*:\s*return\s*"not the published model"\s*;',
         body_norm,
@@ -2689,7 +2741,7 @@ def _fit_flag_is_set_only_on_fit_refusals(tc: str) -> bool:
         tc,
     ):
         return False
-    if "rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, probe.accepted" not in tc:
+    if re.search(_PROBE_CLASSIFY_CALL_RE, tc) is None:
         return False
     for reason in nonfit:
         at = tc.find(f'return "{reason}";')
@@ -2698,8 +2750,7 @@ def _fit_flag_is_set_only_on_fit_refusals(tc: str) -> bool:
     # the lifecycle failure and the publish throw keep their stop reason and stay non-fit
     lifecycle = 'case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE: return "transaction refused";'
     return (
-        "llama_auto_ubatch_probe_classify(rc == GGML_SYCL_LIFECYCLE_OK," in tc
-        and lifecycle in tc
+        lifecycle in tc
         and 'publish_dirty = true; return "transaction refused";' in tc
     )
 

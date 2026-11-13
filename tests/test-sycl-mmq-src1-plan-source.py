@@ -1140,7 +1140,7 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
         len(re.findall(r"rung_fit_refused\s*=\s*true\s*;", try_fn)) == 2 and \
         re.search(r"rung_fit_refused\s*=\s*dynamic_cast<const\s+llama_auto_ubatch_fit_refusal\s*\*>\(\s*&e\s*\)\s*!=\s*nullptr\s*;\s*return \"compute buffers did not fit\"\s*;", try_fn) is not None and \
         re.search(r"case\s+llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT\s*:\s*rung_fit_refused\s*=\s*true\s*;\s*return \"transaction refused\"\s*;", try_fn) is not None and \
-        re.search(r"rc\s*==\s*GGML_SYCL_LIFECYCLE_PLAN_REJECTED\s*,\s*probe\.accepted\s*\)", try_fn) is not None and \
+        re.search(r"llama_auto_ubatch_probe_classify\(\s*rc\s*==\s*GGML_SYCL_LIFECYCLE_OK\s*,\s*rc\s*==\s*GGML_SYCL_LIFECYCLE_BUSY\s*,\s*rc\s*==\s*GGML_SYCL_LIFECYCLE_STALE_IDENTITY\s*,\s*rc\s*==\s*GGML_SYCL_LIFECYCLE_PLAN_REJECTED\s*,\s*probe\.accepted\s*\)", try_fn) is not None and \
         re.search(r"rung_fit_refused\s*=\s*true\s*;\s*return \"hold spill left no headroom\"\s*;", try_fn) is not None
     results["the trial state starts at nothing-happened and every rung asked is named in tried"] = \
         all(re.search(pat, select_fn) is not None for pat in (
@@ -2128,6 +2128,8 @@ if args.self_test:
                 new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"case\s+llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT\s*:\s*rung_fit_refused\s*=\s*true\s*;", "case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT:")),
         ctx_mut("a rejected plan is not a fit refusal", FLAG,
                 new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"rc\s*==\s*GGML_SYCL_LIFECYCLE_PLAN_REJECTED\s*,\s*probe\.accepted", "false, probe.accepted")),
+        ctx_mut("an OK probe is read in the busy slot", FLAG,
+                new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"rc\s*==\s*GGML_SYCL_LIFECYCLE_OK\s*,\s*rc\s*==\s*GGML_SYCL_LIFECYCLE_BUSY\s*,", "rc == GGML_SYCL_LIFECYCLE_BUSY, rc == GGML_SYCL_LIFECYCLE_OK,")),
         ctx_mut("a compute buffer that did not fit is not a fit refusal", FLAG,
                 new_ctx=re.sub(r"rung_fit_refused\s*=\s*dynamic_cast<const\s+llama_auto_ubatch_fit_refusal\s*\*>\(\s*&e\s*\)\s*!=\s*nullptr\s*;\s*return \"compute buffers did not fit\"", 'return "compute buffers did not fit"', context_src, count=1)),
         ctx_mut("every reserve exception is a fit refusal", FLAG,
