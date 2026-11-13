@@ -176,8 +176,9 @@ int main() {
         llama_log_set(capture_log, nullptr);
         llama_lazy_range_record_prefill(rec, arch, hp, declared, fx.finder(), mode, mode, true, true);
         llama_log_set(nullptr, nullptr);
-        CHECK(!llama_lazy_early_plan_excludes(rec, unflagged),
-              "taker, mode %d: the filter excluded an ineligible row (AUTO at 4 GiB / OFF)", (int) mode);
+        // the 4 GiB row is ineligible under OFF and AUTO (at the floor); ON has no floor and makes it STORAGE
+        CHECK(llama_lazy_early_plan_excludes(rec, unflagged) == on, "taker, mode %d: the filter %s the 4 GiB row",
+              (int) mode, on ? "did not exclude" : "excluded");
         const bool excluded = llama_lazy_early_plan_excludes(rec, lazy);
         CHECK(excluded == on, "taker, mode %d: the filter %s the 5 GiB table", (int) mode,
               excluded ? "excluded" : "did not exclude");

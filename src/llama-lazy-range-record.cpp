@@ -163,7 +163,17 @@ void llama_lazy_range_record_prefill(llama_lazy_range_record &        record,
                 continue;
             }
 
-            const bool eligible = llama_lazy_eligible(mode, src.size, taker ? true : mmap_supported);
+            bool eligible = llama_lazy_eligible(mode, src.size, taker ? true : mmap_supported);
+
+            // the default mode must load: without a STORAGE consumer the table is the ordinary weight
+            // `-lzm off` makes it
+            if (taker && eligible && mode == LLAMA_LAZY_MODE_AUTO && !llama_lazy_storage_consumer_present()) {
+                eligible = false;
+                LLAMA_LOG_WARN(
+                    "%s: tensor %s (size = %zu MiB) is loaded into host memory in full: this build has no "
+                    "storage tier for a SYCL-owned table; -lzm on asks for it by name and is refused\n",
+                    __func__, name.c_str(), src.size / 1024 / 1024);
+            }
 
             // add()'s old warning, moved here: a table that would have been lazy,
             // read in full because this platform cannot map the file
