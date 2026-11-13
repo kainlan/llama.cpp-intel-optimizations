@@ -581,6 +581,16 @@ static bool llama_context_sycl_hold_spill_fits(const std::vector<ggml_backend_pt
     }
     return fits;
 }
+
+// What a named refusal of a context appends when the constructor's publish lowered its -ub: the default the publish
+// was refused at and why, so the -ub the error names is not read as the one that was asked for. Empty when the
+// constructor did not lower it.
+static std::string llama_context_sycl_ctor_lowered_note(uint32_t ctor_lowered_from, const std::string & cause) {
+    if (ctor_lowered_from == 0) {
+        return "";
+    }
+    return format("; auto n_ubatch was lowered from %u because %s", ctor_lowered_from, cause.c_str());
+}
 #endif
 
 // llama.cpp-mmi1: the text a "failed to allocate compute ... buffers" refusal appends when a SYCL backend could not
@@ -1961,14 +1971,15 @@ llama_context::llama_context(
             if (!llama_context_sycl_hold_spill_fits(backends, cparams.n_ubatch, &largest_ub)) {
                 throw std::runtime_error(format(
                     "compute buffers held out of the SYCL RUNTIME zone for the planned dense scratch spilled outside "
-                    "the VRAM arena and left a card under the driver headroom the arena expects (n_ubatch=%u); %s",
+                    "the VRAM arena and left a card under the driver headroom the arena expects (n_ubatch=%u); %s%s",
                     cparams.n_ubatch,
                     largest_ub != 0 ?
                         format("the largest -ub that fits is about %u, a power of two, estimated by scaling the "
                                "measured compute buffers (or free VRAM on the card)",
                                largest_ub)
                             .c_str() :
-                        "no -ub is known to fit: free VRAM on the card"));
+                        "no -ub is known to fit: free VRAM on the card",
+                    llama_context_sycl_ctor_lowered_note(sycl_ctor_lowered_from, sycl_ctor_lowered_cause).c_str()));
             }
         }
 #endif
@@ -2598,9 +2609,12 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 // graph_reserve() also failed -- caught like the candidate publish;
 // non-terminal, so a later start can still resume the ladder above the cached
 // rung), or "cached" (a persisted value passed the same per-candidate
-// validation a ladder rung uses, so the ladder never ran). Candidate refusals
-// inside the probe itself log at GGML_LOG_INFO, not ERROR (Task 2), so a
-// multi-candidate trial does not print one scary refusal per losing candidate.
+// validation a ladder rung uses, so the ladder never ran). A context whose -ub
+// the constructor's publish lowered reached neither ceiling: it reports that
+// publish's refusal instead of the first two, until a rung of its own loses.
+// Candidate refusals inside the probe itself log at GGML_LOG_INFO, not ERROR
+// (Task 2), so a multi-candidate trial does not print one scary refusal per
+// losing candidate.
 void llama_context::sycl_select_auto_ubatch() {
     sycl_hold_spill_validated_ub = 0;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
@@ -2652,6 +2666,11 @@ void llama_context::sycl_select_auto_ubatch() {
     // lowers.
     lowered_from  = sycl_ctor_lowered_from;
     lowered_cause = sycl_ctor_lowered_cause;
+    // Nor did it reach a ceiling of this ladder: until a rung of its own loses, the outcome (and a named error's last
+    // stop) names the refusal that lowered it.
+    if (sycl_ctor_lowered_from != 0) {
+        stop = sycl_ctor_lowered_cause.c_str();
+    }
 
     // A rung that lost: the reason is the last one a named error reports, and the rung lowers the bound the -ub a
     // refusal names is capped under (the advice never names a rung this start already lost).
@@ -3194,7 +3213,7 @@ void llama_context::sycl_select_auto_ubatch() {
             }
             const uint32_t advice = llama_auto_ubatch_advice(largest_ub, lowest_refused);
             throw std::runtime_error(format(
-                "auto n_ubatch: %s (tried %s; last stop: %s), and the settle at %u was refused (%s); %s",
+                "auto n_ubatch: %s (tried %s; last stop: %s), and the settle at %u was refused (%s); %s%s",
                 descent_ran ? format("no -ub from %u down to %u fits this context", fallback_ubatch,
                                      llama_auto_ubatch_descent_floor)
                                   .c_str() :
@@ -3204,7 +3223,8 @@ void llama_context::sycl_select_auto_ubatch() {
                                      "measured compute buffers (or free VRAM on the card)",
                                      advice)
                                   .c_str() :
-                              "no -ub is known to fit: free VRAM on the card"));
+                              "no -ub is known to fit: free VRAM on the card",
+                llama_context_sycl_ctor_lowered_note(sycl_ctor_lowered_from, sycl_ctor_lowered_cause).c_str()));
         } else {
             sched_need_reserve = true;
             sched_reserve();
