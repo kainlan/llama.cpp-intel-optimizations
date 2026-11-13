@@ -17,6 +17,44 @@ struct llama_auto_ubatch_fit_refusal : public std::runtime_error {
     explicit llama_auto_ubatch_fit_refusal(const std::string & what) : std::runtime_error(what) {}
 };
 
+// What one probe of a rung says. FIT is the only loss that is a verdict on the rung: the transaction ran and refused
+// the candidate plan. The probe reports that either as a rejected plan or as OK with accepted == false, and the publish
+// path reads a rejected plan the same way. Everything else is no verdict and never lowers -ub.
+enum class llama_auto_ubatch_probe_outcome {
+    LLAMA_AUTO_UBATCH_PROBE_ACCEPTED,
+    LLAMA_AUTO_UBATCH_PROBE_FIT,
+    LLAMA_AUTO_UBATCH_PROBE_BUSY,
+    LLAMA_AUTO_UBATCH_PROBE_STALE,
+    LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE,
+};
+
+// The probe's lifecycle result arrives as one flag per code it can name (rc_ok, rc_busy, rc_stale, rc_plan_rejected;
+// all false for any other code), so this header needs no backend type. `accepted` is read only when rc_ok is set.
+inline llama_auto_ubatch_probe_outcome llama_auto_ubatch_probe_classify(bool rc_ok,
+                                                                        bool rc_busy,
+                                                                        bool rc_stale,
+                                                                        bool rc_plan_rejected,
+                                                                        bool accepted) {
+    using O = llama_auto_ubatch_probe_outcome;
+    if (rc_busy) {
+        return O::LLAMA_AUTO_UBATCH_PROBE_BUSY;
+    }
+    if (rc_stale) {
+        return O::LLAMA_AUTO_UBATCH_PROBE_STALE;
+    }
+    if (rc_plan_rejected) {
+#ifdef LLAMA_AUTO_UBATCH_MUTANT_REJECTED_IS_LIFECYCLE
+        return O::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE;
+#else
+        return O::LLAMA_AUTO_UBATCH_PROBE_FIT;
+#endif
+    }
+    if (!rc_ok) {
+        return O::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE;
+    }
+    return accepted ? O::LLAMA_AUTO_UBATCH_PROBE_ACCEPTED : O::LLAMA_AUTO_UBATCH_PROBE_FIT;
+}
+
 // The trial's candidate micro-batch sizes, ascending.
 static const uint32_t llama_auto_ubatch_ladder[] = { 512, 1024, 2048, 4096 };
 static const size_t   llama_auto_ubatch_ladder_size =

@@ -41,6 +41,10 @@
 // when the default rung is refused (llama.cpp-kpjw item 0): the same pure walk the trial runs, driven here by a
 // fake that accepts what the B50 / Qwen arithmetic accepts.
 //
+// llama_auto_ubatch_probe_classify() reads one probe's answer. A plan the transaction refused is a fit verdict
+// whichever way the probe reports it (a rejected-plan lifecycle code, or OK with accepted == false), so the descent
+// goes on below it; busy, stale identity and any other lifecycle code end the walk.
+//
 // No device, no model, no allocation.
 
 #include "../src/llama-auto-ubatch.h"
@@ -410,6 +414,59 @@ int main() {
     check_advice("nothing known to fit stays nothing", 0, 512, 0);
     check_advice("the rung under the floor names nothing", 512, 64, 0);
     check_advice("a refused 1024 with the function accepting it: 512", 1024, 1024, 512);
+
+    // ---- A probe that refuses the plan is a fit verdict: the walk goes on to the next rung. Any other loss (busy,
+    // stale identity, another lifecycle code) is no verdict and ends it. ----
+    {
+        using O = llama_auto_ubatch_probe_outcome;
+
+        struct probe_case {
+            const char * name;
+            bool         ok, busy, stale, plan_rejected, accepted;
+            O            want;
+        };
+
+        const probe_case cases[] = {
+            { "ok, accepted",           true,  false, false, false, true,  O::LLAMA_AUTO_UBATCH_PROBE_ACCEPTED  },
+            { "ok, not accepted",       true,  false, false, false, false, O::LLAMA_AUTO_UBATCH_PROBE_FIT       },
+            { "plan rejected",          false, false, false, true,  false, O::LLAMA_AUTO_UBATCH_PROBE_FIT       },
+            { "busy",                   false, true,  false, false, false, O::LLAMA_AUTO_UBATCH_PROBE_BUSY      },
+            { "stale identity",         false, false, true,  false, false, O::LLAMA_AUTO_UBATCH_PROBE_STALE     },
+            { "another lifecycle code", false, false, false, false, false, O::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE },
+        };
+        for (const probe_case & c : cases) {
+            const O got = llama_auto_ubatch_probe_classify(c.ok, c.busy, c.stale, c.plan_rejected, c.accepted);
+            if (got != c.want) {
+                std::fprintf(stderr, "FAIL probe classify %s: got %d (expected %d)\n", c.name, (int) got, (int) c.want);
+                g_failures++;
+            } else {
+                std::printf("ok   probe classify %s: %d\n", c.name, (int) got);
+            }
+        }
+
+        // The descent as sycl_select_auto_ubatch runs it: 256 is refused by the plan, 128 fits. A non-fit loss
+        // answers true and so ends the walk at that rung, as the trial's own lambda does.
+        std::vector<uint32_t> tried;
+        bool                  aborted = false;
+        const uint32_t        ended   = llama_auto_ubatch_descend(512, 4096, [&](uint32_t c) {
+            tried.push_back(c);
+            const bool plan_rejected = c == 256;
+            const O o = llama_auto_ubatch_probe_classify(!plan_rejected, false, false, plan_rejected, !plan_rejected);
+            if (o == O::LLAMA_AUTO_UBATCH_PROBE_ACCEPTED) {
+                return true;
+            }
+            aborted = o != O::LLAMA_AUTO_UBATCH_PROBE_FIT;
+            return aborted;
+        });
+        if (aborted || ended != 128 || tried != std::vector<uint32_t>({ 256, 128 })) {
+            std::fprintf(stderr,
+                         "FAIL probe-refusal descent: got %u after %zu rung(s), aborted=%d (expected 128 after 2)\n",
+                         ended, tried.size(), aborted ? 1 : 0);
+            g_failures++;
+        } else {
+            std::printf("ok   probe-refusal descent: got 128 after 2 rungs\n");
+        }
+    }
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d case(s) failed\n", g_failures);

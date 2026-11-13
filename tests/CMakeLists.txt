@@ -5029,6 +5029,21 @@ endif()
 # model, no allocation, so it builds and runs in every configuration.
 llama_build_and_test(test-auto-ubatch-ladder.cpp)
 
+# The probe-verdict mutant reads a rejected plan as a lifecycle failure, which is the defect the probe-refusal
+# descent case exists to catch: the walk then ends at 256 instead of settling on 128. Scored on the line only that
+# defect prints, with no skip code, so a mutant that stops building or stops running is a failure. Same sources and
+# link as llama_build_and_test gives the gate above.
+add_executable(test-auto-ubatch-ladder-mutant-rejected-is-lifecycle test-auto-ubatch-ladder.cpp)
+target_compile_definitions(test-auto-ubatch-ladder-mutant-rejected-is-lifecycle
+    PRIVATE LLAMA_AUTO_UBATCH_MUTANT_REJECTED_IS_LIFECYCLE)
+target_link_libraries(test-auto-ubatch-ladder-mutant-rejected-is-lifecycle PRIVATE llama-common)
+add_test(NAME test-auto-ubatch-ladder-mutant-rejected-is-lifecycle
+         COMMAND test-auto-ubatch-ladder-mutant-rejected-is-lifecycle)
+set_tests_properties(test-auto-ubatch-ladder-mutant-rejected-is-lifecycle PROPERTIES
+    LABELS "sycl;host;mutant"
+    TIMEOUT 120
+    PASS_REGULAR_EXPRESSION "FAIL probe-refusal descent: got 256 after 1 rung\\(s\\), aborted=1 \\(expected 128 after 2\\)")
+
 # zhcn C7f: executes the pure helpers in src/llama-measure-plan.h -- the graph
 # set one planned reserve measures ((3 + S) * 2 * N graphs: the allocating
 # reserve's own pp, tg and closing pp, then one decode graph per stream count)
