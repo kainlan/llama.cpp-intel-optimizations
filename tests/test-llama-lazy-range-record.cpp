@@ -9,13 +9,16 @@
 //     mode, and a same-named tensor under an arch that does not declare it gets no row;
 //   - the eligibility matrix over taker x mode_pre x mode_post x SUPPORTED:
 //     lazy_eligible = llama_lazy_eligible(taker ? mode_pre : mode_post, size,
-//     taker ? true : SUPPORTED), STORAGE iff eligible and taker, LAZY_READ iff
-//     eligible and not taker, and `deferral != EAGER` iff `lazy_eligible`;
+//     taker ? true : SUPPORTED), except that the taker reading AUTO records every row
+//     ineligible (this tree has no STORAGE consumer, and the default mode must load);
+//     STORAGE iff eligible and taker, LAZY_READ iff eligible and not taker, and
+//     `deferral != EAGER` iff `lazy_eligible`;
 //   - the witness cell: AUTO requested, a device that cannot mmap and owns no
 //     placement, taker -> the loader's AUTO resolver (llama_lazy_auto_enabled) turns
-//     mode_post OFF, yet the sparse row is eligible and STORAGE and the early plan's
-//     filter excludes it. A fill that reads mode_post for the taker (the post-fallback
-//     fill) clears the bit and fails here;
+//     mode_post OFF. The taker reads mode_pre, AUTO, so the sparse row is the ordinary
+//     EAGER weight with one WARN naming it, and the early plan's filter includes it.
+//     A fill that reads mode_post for the taker (the post-fallback fill) reads OFF,
+//     stays silent and fails here; the matrix's ON-over-OFF cells catch it as well;
 //   - off the taker without mmap the bit is clear under every mode and the WARN
 //     prints once per row that would have been lazy;
 //   - the attributes are per model, from hparams: two qwen4exp hparams sets give each
@@ -57,10 +60,11 @@ static void capture_log(enum ggml_log_level, const char * text, void *) {
     g_log.emplace_back(text);
 }
 
-static size_t count_log(const char * needle) {
+// lines carrying `needle` and, when given, `also`
+static size_t count_log(const char * needle, const char * also = nullptr) {
     size_t n = 0;
     for (const std::string & line : g_log) {
-        if (line.find(needle) != std::string::npos) {
+        if (line.find(needle) != std::string::npos && (also == nullptr || line.find(also) != std::string::npos)) {
             n++;
         }
     }
@@ -153,9 +157,12 @@ int main() {
                     llama_lazy_range_record_prefill(rec, LLM_ARCH_LLAMA, hp, declared, fx.finder(), pre, post,
                                                     taker != 0, supported != 0);
                     for (const llama_lazy_range_row & row : rec.rows()) {
-                        // T6a's function, called and not restated
-                        const bool expected =
-                            llama_lazy_eligible(taker ? pre : post, row.value.size, taker ? true : supported != 0);
+                        // T6a's function, called and not restated; with the taker, AUTO has no STORAGE
+                        // consumer to hand a row to, so every row is the ordinary weight OFF makes it
+                        const llama_lazy_mode read = taker ? pre : post;
+                        const bool            expected =
+                            llama_lazy_eligible(read, row.value.size, taker ? true : supported != 0) &&
+                            !(taker && read == LLAMA_LAZY_MODE_AUTO);
                         const llama_lazy_deferral expected_deferral = !expected ? LLAMA_LAZY_DEFERRAL_EAGER :
                                                                       taker     ? LLAMA_LAZY_DEFERRAL_STORAGE :
                                                                                   LLAMA_LAZY_DEFERRAL_LAZY_READ;
@@ -186,14 +193,22 @@ int main() {
         const llama_lazy_mode        mode_post = llama_lazy_auto_enabled(&no_mmap, 1) ? mode_pre : LLAMA_LAZY_MODE_OFF;
         CHECK(mode_post == LLAMA_LAZY_MODE_OFF, "the resolver did not turn AUTO into OFF: %s", mode_name(mode_post));
 
+        g_log.clear();
         llama_lazy_range_record rec;
         llama_lazy_range_record_prefill(rec, LLM_ARCH_LLAMA, hp, declared, fx.finder(), mode_pre, mode_post, true,
                                         true);
-        CHECK(rec.eligible("lz_sparse"), "the witness cell: the sparse row's bit is clear (post-fallback fill)");
-        CHECK(rec.deferral("lz_sparse") == LLAMA_LAZY_DEFERRAL_STORAGE, "the witness cell: the sparse row is %s",
-              llama_lazy_deferral_name(rec.deferral("lz_sparse")));
-        CHECK(llama_lazy_early_plan_excludes(rec, "lz_sparse"),
-              "the witness cell: the early plan's filter includes the table");
+        // the taker read AUTO, and with no STORAGE consumer the table is the ordinary weight: one WARN per
+        // row AUTO would have made STORAGE (4 GiB + 1 and the sparse 6 GiB), which a fill reading OFF never prints
+        CHECK(!rec.eligible("lz_sparse") && rec.deferral("lz_sparse") == LLAMA_LAZY_DEFERRAL_EAGER,
+              "the witness cell: the sparse row is %s, eligible=%d",
+              llama_lazy_deferral_name(rec.deferral("lz_sparse")), rec.eligible("lz_sparse") ? 1 : 0);
+        CHECK(count_log("-lzm on") == 2 && count_log("-lzm on", "lz_sparse") == 1 &&
+                  count_log("-lzm on", "lz_plus1") == 1,
+              "the witness cell: %zu bridge WARN(s), expected one each for lz_plus1 and lz_sparse (a post-fallback "
+              "fill prints none)",
+              count_log("-lzm on"));
+        CHECK(!llama_lazy_early_plan_excludes(rec, "lz_sparse"),
+              "the witness cell: the early plan's filter excludes the table");
 
         // ineligible rows are the ordinary weights they are: AUTO at exactly 4 GiB
         CHECK(!rec.eligible("lz_exact") && !llama_lazy_early_plan_excludes(rec, "lz_exact"),

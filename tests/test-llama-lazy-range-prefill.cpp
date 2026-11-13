@@ -12,9 +12,12 @@
 //     that compares the flag only against non-EAGER rows lets both through;
 //   - value(name) equals the weight's (file, offset, size);
 //   - with the taker, the early plan's filter includes an ineligible row (AUTO at
-//     4 GiB, OFF) as the ordinary weight it is and excludes the eligible one;
+//     4 GiB, OFF) as the ordinary weight it is. Under AUTO the 5 GiB table would be
+//     STORAGE, but this tree has no STORAGE consumer, so the default mode records it
+//     ineligible and EAGER, the filter includes it too, and one WARN names it;
 //   - create_tensor()'s STORAGE refusal throws, naming the tensor, on a STORAGE row
-//     and on that row alone: a LAZY_READ and an EAGER row pass it.
+//     and on that row alone: a LAZY_READ and an EAGER row pass it. With the taker,
+//     only ON (the storage tier asked for by name) makes the 5 GiB table STORAGE.
 //
 // Host-only: no backend, device or model.
 
@@ -96,6 +99,25 @@ static bool passes(const check_args & a) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+static std::vector<std::string> g_warns;  // one entry per WARN line
+
+static void capture_log(enum ggml_log_level level, const char * text, void *) {
+    if (level == GGML_LOG_LEVEL_WARN) {
+        g_warns.emplace_back(text);
+    }
+}
+
+// WARN lines carrying both `a` and `b`
+static size_t count_warns(const std::string & a, const char * b) {
+    size_t n = 0;
+    for (const std::string & line : g_warns) {
+        if (line.find(a) != std::string::npos && line.find(b) != std::string::npos) {
+            n++;
+        }
+    }
+    return n;
+}
+
 int main() {
     lazy_fixture fx;
 
@@ -155,14 +177,29 @@ int main() {
               "AUTO at 4 GiB: the EAGER row's drift went unnoticed");
     }
 
-    // the early plan, with the taker: ineligible rows stay in, the eligible one is out
-    for (llama_lazy_mode mode : { LLAMA_LAZY_MODE_OFF, LLAMA_LAZY_MODE_AUTO }) {
+    // the early plan, with the taker: no row is excluded under OFF or AUTO. Under AUTO the 5 GiB table would be
+    // STORAGE, and with no STORAGE consumer in the tree it is the ordinary weight OFF makes it. ON asks for the
+    // storage tier by name: the table stays STORAGE and out of the plan, and the bridge stays silent.
+    for (llama_lazy_mode mode : { LLAMA_LAZY_MODE_OFF, LLAMA_LAZY_MODE_AUTO, LLAMA_LAZY_MODE_ON }) {
+        const bool              on = mode == LLAMA_LAZY_MODE_ON;
         llama_lazy_range_record rec;
+        g_warns.clear();
+        llama_log_set(capture_log, nullptr);
         llama_lazy_range_record_prefill(rec, arch, hp, declared, fx.finder(), mode, mode, true, true);
-        CHECK(!llama_lazy_early_plan_excludes(rec, unflagged),
-              "taker, mode %d: the filter excluded an ineligible row (AUTO at 4 GiB / OFF)", (int) mode);
-        CHECK(llama_lazy_early_plan_excludes(rec, lazy) == (mode == LLAMA_LAZY_MODE_AUTO),
-              "taker, mode %d: the filter decision on the 5 GiB table is wrong", (int) mode);
+        llama_log_set(nullptr, nullptr);
+        // the 4 GiB row is ineligible under OFF and AUTO (at the floor); ON has no floor and makes it STORAGE
+        CHECK(llama_lazy_early_plan_excludes(rec, unflagged) == on, "taker, mode %d: the filter %s the 4 GiB row",
+              (int) mode, on ? "did not exclude" : "excluded");
+        const bool excluded = llama_lazy_early_plan_excludes(rec, lazy);
+        CHECK(excluded == on, "taker, mode %d: the filter %s the 5 GiB table", (int) mode,
+              excluded ? "excluded" : "did not exclude");
+        CHECK(rec.deferral(lazy) == (on ? LLAMA_LAZY_DEFERRAL_STORAGE : LLAMA_LAZY_DEFERRAL_EAGER) &&
+                  rec.eligible(lazy) == on,
+              "taker, mode %d: the 5 GiB table is %s, eligible=%d", (int) mode,
+              llama_lazy_deferral_name(rec.deferral(lazy)), rec.eligible(lazy) ? 1 : 0);
+        const size_t n_warned = count_warns(lazy, "-lzm on");
+        CHECK(n_warned == (mode == LLAMA_LAZY_MODE_AUTO ? 1u : 0u),
+              "taker, mode %d: the bridge WARN for the 5 GiB table printed %zu time(s)", (int) mode, n_warned);
     }
 
     // the STORAGE refusal: a STORAGE row throws naming the tensor; LAZY_READ and EAGER rows pass
@@ -175,11 +212,11 @@ int main() {
         };
 
         const cell cells[] = {
-            { "ON, the taker (STORAGE)",                             LLAMA_LAZY_MODE_ON,   true,  true  },
-            { "AUTO, the taker (STORAGE: 5 GiB is above the floor)", LLAMA_LAZY_MODE_AUTO, true,  true  },
-            { "OFF, the taker (EAGER)",                              LLAMA_LAZY_MODE_OFF,  true,  false },
-            { "ON, off the taker (LAZY_READ)",                       LLAMA_LAZY_MODE_ON,   false, false },
-            { "OFF, off the taker (EAGER)",                          LLAMA_LAZY_MODE_OFF,  false, false },
+            { "ON, the taker (STORAGE)",                                  LLAMA_LAZY_MODE_ON,   true,  true  },
+            { "AUTO, the taker (EAGER: no STORAGE consumer in the tree)", LLAMA_LAZY_MODE_AUTO, true,  false },
+            { "OFF, the taker (EAGER)",                                   LLAMA_LAZY_MODE_OFF,  true,  false },
+            { "ON, off the taker (LAZY_READ)",                            LLAMA_LAZY_MODE_ON,   false, false },
+            { "OFF, off the taker (EAGER)",                               LLAMA_LAZY_MODE_OFF,  false, false },
         };
         for (const cell & c : cells) {
             llama_lazy_range_record rec;

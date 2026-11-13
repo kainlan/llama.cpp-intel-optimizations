@@ -102,6 +102,10 @@ using llama_lazy_range_find_fn = std::function<bool(const std::string & name, ll
 //                   LAZY_READ when eligible and not `taker`
 //                   EAGER     otherwise
 //
+//   with the taker, mode AUTO and no STORAGE consumer in the tree, a row llama_lazy_eligible()
+//   accepts is recorded ineligible and EAGER, with one WARN: the default mode must load. Mode ON
+//   is the caller asking for the storage tier by name, so it keeps the STORAGE row and the refusal.
+//
 // `taker` is the model's fact "its weights are SYCL-owned and the hooks resolve"
 // (sycl_model_loading_guard.active), not the process-level "a SYCL backend is
 // registered". The taker reads a table through its own O_DIRECT fd and never
