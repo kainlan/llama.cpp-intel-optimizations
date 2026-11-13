@@ -655,6 +655,20 @@ ALLOW: dict[str, tuple[int, str]] = {
     "shortcut:unified-kernel.cpp:UnifiedKernel::reset_dag_counters": (4, SHORTCUT_USM),
 }
 
+# "file:function" -> the launches in it that are profiled by an explicit record call. The record rule (Code.recorded)
+# excuses a launch only in a function listed here, and only when the number of launches it matches there equals the
+# count. Adding a row is the reviewed act, not the rule: read the function and confirm that the event each record
+# call receives is that launch's event, on the paths that matter, before adding or raising a row.
+RECORDED_ON_THE_PATH = {
+    # copy_event, assigned by each of three width branches, recorded once after them while profiling is on
+    "common.hpp:ggml_sycl_graph_safe_memcpy": 3,
+    # first_event and merge_event, each recorded right after its launch
+    "fattn-xmx-f16-v2.hpp:launch_fattn_xmx_v2_decode_gqa_split_leaf": 2,
+    "fattn.cpp:ggml_sycl_fattn_xmx_materialize_packed_k": 1,  # pack_event
+    "fattn.cpp:ggml_sycl_fattn_xmx_submit_set_rows_update": 1,  # event
+    "mem-ops.cpp:mem_fill_direct_submit": 1,  # event
+}
+
 BASE_WRAPPER = "ggml_sycl_profile_submit"
 # record a launch's returned event with the profiler; a launch whose event reaches one is profiled (Code.recorded)
 RECORDERS = ("ggml_sycl_kernel_profile_record_event", "ggml_sycl_profile_record_returned_event")
@@ -1404,107 +1418,90 @@ def test_a_launch_in_an_alternative_branch_is_counted_whatever_its_kind():
 RECORD = "ggml_sycl_kernel_profile_record_event"
 
 
-def test_a_launch_whose_event_is_handed_to_a_record_call_is_profiled():
-    samples = [
-        f"void a(sycl::queue * q) {{ sycl::event ev = q->submit(cgf); {RECORD}(label, ev, site, t0, t1); }}\n",
-        # assigned in each branch, recorded once after them, under the profiler's own condition
-        "void a(sycl::queue & q) {\n    sycl::event ev;\n    if (w) {\n        ev = q.parallel_for(r, k);\n"
-        "    } else {\n        ev = q.parallel_for(r, k2);\n    }\n"
-        f"    if (on) {{ {RECORD}(label, ev); }}\n}}\n",
-        "sycl::event a(sycl::queue * q) { return ggml_sycl_profile_record_returned_event(label, q->submit(cgf)); }\n",
-    ]
-    for sample in samples:
-        assert raw_sites(sample) == [], sample
-
-
-def test_a_record_call_excuses_only_the_launch_whose_event_it_is_handed():
-    samples = [
-        # a second launch in the same function, its event not recorded
-        f"void a(sycl::queue * q) {{ sycl::event ev = q->submit(cgf); q->submit(cgf2); {RECORD}(label, ev); }}\n",
-        # the record is handed a different event
-        f"void a(sycl::queue * q) {{ sycl::event ev = q->submit(cgf); sycl::event other; {RECORD}(label, other); }}\n",
-        # the record comes before the launch
-        f"void a(sycl::queue * q) {{ sycl::event ev; {RECORD}(label, ev); ev = q->submit(cgf); }}\n",
-        # the event is overwritten between the launch and the record
-        f"void a(sycl::queue * q) {{ sycl::event ev = q->submit(cgf); ev = other(); {RECORD}(label, ev); }}\n",
-        # a launch in a loop the record is outside of: only the last iteration's event is recorded
-        "void a(sycl::queue * q) { sycl::event ev; for (int i = 0; i < n; ++i) { ev = q->submit(cgf); } "
-        f"{RECORD}(label, ev); }}\n",
-        # the record is in another function
-        "void a(sycl::queue * q) { sycl::event ev = q->submit(cgf); }\n"
-        f"void b() {{ sycl::event ev; {RECORD}(l, ev); }}\n",
-    ]
-    for sample in samples:
-        assert raw_sites(sample) == [("a", "submit")], sample
-
-
 H = "void f(sycl::queue * q, bool c) {\n"
 L1 = "q->submit([&](sycl::handler & h) { h.single_task(k1); })"
 L2 = "q->submit([&](sycl::handler & h) { h.single_task(k2); })"
 REC2 = "ggml_sycl_profile_record_returned_event"
 
 
-def test_a_record_call_on_no_path_from_the_launch_does_not_excuse_it():
+def test_a_launch_in_a_function_not_in_the_table_is_reported_whatever_the_shape():
+    # (shape, launches in it): with no table row for x.cpp:f, every launch is reported, the plain shape included
     cases = {
-        # a: the record is in the else arm opposite the launch's arm
+        "plain": (H + f"sycl::event ev = {L1};\n{RECORD}(lab, ev);\n}}\n", 1),
+        "direct": (H + f"{REC2}(lab, {L1});\n}}\n", 1),
         "opposite arm": (H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ ev = {L2}; {RECORD}(lab, ev); }}\n}}\n",
-                         ["f"]),
-        "opposite arm alone": (H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ {REC2}(lab, ev); }}\n}}\n",
-                               ["f"]),
-        # b: a shadowing declaration around the record
-        "shadow": (H + f"sycl::event ev = {L1};\n{{ sycl::event ev = other(); {RECORD}(lab, ev); }}\n}}\n", ["f"]),
-        # c: a brace-less loop around the launch
-        "brace-less loop": (H + f"sycl::event ev;\nfor (int i = 0; i < n; ++i) ev = {L1};\n{RECORD}(lab, ev);\n}}\n",
-                            ["f"]),
-        "brace-less while": (H + f"sycl::event ev;\nwhile (c) ev = {L1};\n{RECORD}(lab, ev);\n}}\n", ["f"]),
-        # d: a launch inside a lambda in the record call's arguments
-        "lambda argument": (H + f"sycl::event ev;\n{RECORD}(lab, ev, [&] {{ {L1}; }});\n}}\n", ["f"]),
-        "called lambda argument": (H + f"{REC2}(lab, [&] {{ return {L1}; }}());\n}}\n", ["f"]),
-        # e: a member assigned, a local recorded
-        "member": (H + f"sycl::event ev;\ns.ev = {L1};\n{RECORD}(lab, ev);\n}}\n", ["f"]),
-        "this member": (H + f"sycl::event ev;\nthis->ev = {L1};\n{RECORD}(lab, ev);\n}}\n", ["f"]),
-        # f: the record is in a lambda that is never called
-        "uncalled lambda": (H + f"sycl::event ev = {L1};\nauto g = [&] {{ {RECORD}(lab, ev); }};\n}}\n", ["f"]),
-        # the event in the label slot, a different name, a ternary
-        "label slot": (H + f"sycl::event ev = {L1};\n{RECORD}(ev, other);\n}}\n", ["f"]),
-        "ev2": (H + f"sycl::event ev = {L1};\n{RECORD}(lab, ev2);\n}}\n", ["f"]),
-        "event_done": (H + f"sycl::event event = {L1};\n{RECORD}(lab, event_done);\n}}\n", ["f"]),
-        "ternary": (H + f"sycl::event ev = c ? {L1} : {L2};\n{RECORD}(lab, ev);\n}}\n", ["f", "f"]),
+                         2),
+        "shadow": (H + f"sycl::event ev = {L1};\n{{ sycl::event ev = other(); {RECORD}(lab, ev); }}\n}}\n", 1),
+        "brace-less for": (H + f"sycl::event ev;\nfor (int i = 0; i < n; ++i) ev = {L1};\n{RECORD}(lab, ev);\n}}\n", 1),
+        "brace-less do": (H + f"sycl::event ev;\ndo ev = {L1}; while (c);\n{RECORD}(lab, ev);\n}}\n", 1),
+        "brace-less loop and if": (H + f"sycl::event ev;\nwhile (c) if (x) ev = {L1};\n{RECORD}(lab, ev);\n}}\n", 1),
+        "brace-less loop and else": (H + f"sycl::event ev;\nwhile (c) if (x) g(); else ev = {L1};\n"
+                                     f"{RECORD}(lab, ev);\n}}\n", 1),
+        "brace-less else record": (H + f"sycl::event ev = {L1};\nif (c) g(); else {RECORD}(lab, ev);\n}}\n", 1),
+        "sibling blocks": (H + f"sycl::event ev;\n{{ ev = {L1}; }} {{ ev = {L2}; }}\n{RECORD}(lab, ev);\n}}\n", 2),
+        "two ifs": (H + f"sycl::event ev;\nif (a) {{ ev = {L1}; }} if (b) {{ ev = {L2}; }}\n"
+                    f"{RECORD}(lab, ev);\n}}\n", 2),
+        "switch case": (H + f"sycl::event ev;\nswitch (k) {{ case 0: ev = {L1}; break; "
+                        f"case 1: {RECORD}(lab, ev); }}\n}}\n", 1),
+        "catch handler": (H + f"sycl::event ev = {L1};\ntry {{ g(); }} catch (...) {{ {RECORD}(lab, ev); }}\n}}\n", 1),
+        "range-for shadow": (H + f"sycl::event ev = {L1};\nfor (auto & ev : evs) {{ {RECORD}(lab, ev); }}\n}}\n", 1),
+        "structured binding": (H + f"sycl::event ev = {L1};\nauto [ev, n] = pair();\n{RECORD}(lab, ev);\n}}\n", 1),
+        "record in a define": (H + f"sycl::event ev = {L1};\n#define REC_IT {RECORD}(lab, ev)\n}}\n", 1),
+        "lambda argument": (H + f"sycl::event ev;\n{RECORD}(lab, ev, [&] {{ {L1}; }});\n}}\n", 1),
+        "member": (H + f"sycl::event ev;\ns.ev = {L1};\n{RECORD}(lab, ev);\n}}\n", 1),
+        "uncalled lambda": (H + f"sycl::event ev = {L1};\nauto g = [&] {{ {RECORD}(lab, ev); }};\n}}\n", 1),
+        "ternary": (H + f"sycl::event ev = c ? {L1} : {L2};\n{RECORD}(lab, ev);\n}}\n", 2),
     }
-    for what, (sample, funcs) in cases.items():
-        assert [func for func, _ in raw_sites(sample)] == funcs, what
+    for what, (sample, launches) in cases.items():
+        assert [func for func, _ in raw_sites(sample)] == ["f"] * launches, what
 
 
-def test_a_record_call_on_every_path_from_the_launch_excuses_it():
+def test_a_listed_function_whose_launches_the_rule_matches_is_excused():
     cases = {
-        "join": H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ ev = {L2}; }}\n{RECORD}(lab, ev);\n}}\n",
-        "same arm": H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ ev = {L2}; {RECORD}(lab, ev); }}\n"
-                        f"{RECORD}(lab2, ev);\n}}\n",
-        "moved": H + f"sycl::event ev = {L1};\n{REC2}(lab, std::move(ev));\n}}\n",
-        "conditional record": H + f"sycl::event ev = {L1};\nif (on) {{ {RECORD}(lab, ev); }}\n}}\n",
+        "plain": (H + f"sycl::event ev = {L1};\n{RECORD}(lab, ev, site, t0, t1);\n}}\n", 1),
+        "direct": (H + f"return {REC2}(lab, {L1});\n}}\n", 1),
+        "join": (H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ ev = {L2}; }}\n{RECORD}(lab, ev);\n}}\n", 2),
+        "moved": (H + f"sycl::event ev = {L1};\n{REC2}(lab, std::move(ev));\n}}\n", 1),
+        "record under profiling on": (H + f"sycl::event ev = {L1};\nif (on) {{ {RECORD}(lab, ev); }}\n}}\n", 1),
+    }
+    for what, (sample, count) in cases.items():
+        assert raw_sites(sample, table={"x.cpp:f": count}) == [], what
+
+
+def test_a_listed_function_whose_match_count_differs_from_its_row_is_reported():
+    two = H + f"sycl::event a = {L1};\n{RECORD}(lab, a);\nsycl::event b = {L2};\n{RECORD}(lab, b);\n}}\n"
+    # a new recorded launch in a listed function: N listed, N + 1 matched
+    assert [func for func, _ in raw_sites(two, table={"x.cpp:f": 1})] == ["f", "f"]
+    # a stale row: N listed, fewer matched
+    one = H + f"sycl::event ev = {L1};\n{RECORD}(lab, ev);\n}}\n"
+    assert [func for func, _ in raw_sites(one, table={"x.cpp:f": 2})] == ["f"]
+
+
+def test_inside_a_listed_function_the_rule_still_refuses_what_it_can_see():
+    table = {"x.cpp:f": 1}
+    cases = {
+        # one matched launch is listed; each refused shape leaves the row matching nothing, so the launch is reported
+        "brace-less do": H + f"sycl::event ev;\ndo ev = {L1}; while (c);\n{RECORD}(lab, ev);\n}}\n",
+        "brace-less loop and if": H + f"sycl::event ev;\nwhile (c) if (x) ev = {L1};\n{RECORD}(lab, ev);\n}}\n",
+        "brace-less loop and else": H + f"sycl::event ev;\nwhile (c) if (x) g(); else ev = {L1};\n"
+                                        f"{RECORD}(lab, ev);\n}}\n",
+        "label slot": H + f"sycl::event ev = {L1};\n{RECORD}(ev, other);\n}}\n",
+        "record before": H + f"sycl::event ev;\n{RECORD}(lab, ev);\nev = {L1};\n}}\n",
+        "overwritten": H + f"sycl::event ev = {L1};\nev = other();\n{RECORD}(lab, ev);\n}}\n",
     }
     for what, sample in cases.items():
-        assert raw_sites(sample) == [], what
+        assert [func for func, _ in raw_sites(sample, table=table)] == ["f"], what
 
 
-# the tree's launches the record rule excuses, as file:function, one per launch; a widening of the rule shows here
-RECORDED_ON_THE_PATH = [
-    "common.hpp:ggml_sycl_graph_safe_memcpy",
-    "common.hpp:ggml_sycl_graph_safe_memcpy",
-    "common.hpp:ggml_sycl_graph_safe_memcpy",
-    "fattn-xmx-f16-v2.hpp:launch_fattn_xmx_v2_decode_gqa_split_leaf",
-    "fattn-xmx-f16-v2.hpp:launch_fattn_xmx_v2_decode_gqa_split_leaf",
-    "fattn.cpp:ggml_sycl_fattn_xmx_materialize_packed_k",
-    "fattn.cpp:ggml_sycl_fattn_xmx_submit_set_rows_update",
-    "mem-ops.cpp:mem_fill_direct_submit",
-]
-
-
-def test_the_record_rule_excuses_exactly_the_known_launches_of_the_tree():
+def test_the_record_rule_excuses_exactly_the_tables_launches_of_the_tree():
     texts = read_tree()
     excused: list[str] = []
     census({name: texts[name] for name in FILES}, derive_wrappers(texts), texts, recorded=excused)
-    assert sorted(excused) == RECORDED_ON_THE_PATH
+    counted: dict[str, int] = {}
+    for key in excused:
+        counted[key] = counted.get(key, 0) + 1
+    assert counted == RECORDED_ON_THE_PATH
+    assert sum(RECORDED_ON_THE_PATH.values()) == 8
 
 
 def test_a_forward_that_is_not_the_command_group_does_not_make_a_wrapper():
