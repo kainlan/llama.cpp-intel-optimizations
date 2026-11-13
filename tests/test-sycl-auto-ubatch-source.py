@@ -3487,6 +3487,10 @@ _LOWERED_NOTE_FN = (
 _LOWERED_NOTE_ARG = "llama_context_sycl_ctor_lowered_note(sycl_ctor_lowered_from, sycl_ctor_lowered_cause).c_str()));"
 _SETTLE_FMT = '"auto n_ubatch: %s (tried %s; last stop: %s), and the settle at %u was refused (%s); %s%s",'
 _HOLD_SPILL_FMT = '"the VRAM arena and left a card under the driver headroom the arena expects (n_ubatch=%u); %s%s",'
+_SKIPS_TRIAL = (
+    "if (llama_auto_ubatch_ctor_lowered_skips_trial(ctor_lowered, ladder, llama_auto_ubatch_ladder_size, "
+    "fallback_ubatch, cap)) { return; }"
+)
 
 _V_DECISION = "the trial decision is not made once, before the constructor's one publish, before the memory"
 _V_RUNG = "the publish does not run at the rung it is asked, or the first refusal is not the one kept"
@@ -3502,6 +3506,7 @@ _V_SILENT = "a lowering the trial does not announce is silent"
 _V_AT_MOST_ONE = "a context can print the lowered announcement from both sources, or twice from one"
 _V_WORDING = "the two lowered announcements do not share the trial's wording"
 _V_NOTE = "a named refusal of a context the constructor lowered does not say so"
+_V_NO_RUNG = "a lowered context the trial has no rung for gets a prep, so its lowering goes unannounced"
 
 
 def _call_closes_throw(code: str, fmt: str) -> bool:
@@ -3551,6 +3556,14 @@ def _ctor_walk_violations(raw_cpp: str) -> list:
             "const size_t n_rung_set = ctor_lowered ? 1 : n_rung_set_full;" not in prep or \
             "if (ctor_lowered) { rung_ladder.assign(1, fallback_ubatch); }" not in prep:
         found.append(_V_HOISTED)
+    # The trial's no-candidate exit returns before its lowered WARN, and the constructor announces only on an empty
+    # prep, so a lowered context with no rung in [lowered, cap] leaves prepare before any of the prep is built.
+    lowered_at = prep.find("const bool ctor_lowered = sycl_ctor_lowered_from != 0;")
+    skips = prep.find(_SKIPS_TRIAL)
+    built = [prep.find(s) for s in ("llama_auto_ubatch_rung_set(", "tenant_rung_set.assign(",
+                                    "auto_ubatch_prep = std::move(prep);")]
+    if prep.count(_SKIPS_TRIAL) != 1 or min([lowered_at, skips] + built) < 0 or not lowered_at < skips < min(built):
+        found.append(_V_NO_RUNG)
 
     seed = sel.find("lowered_from = sycl_ctor_lowered_from; lowered_cause = sycl_ctor_lowered_cause;")
     first_cache = sel.find("if (cache_available) {")
@@ -3625,6 +3638,15 @@ _CTOR_WALK_MUTANTS = {
         "ctor_lowered ? 1 : n_rung_set_full", "n_rung_set_full", _V_HOISTED),
     "the ladder climbs above a lowered rung": (
         "if (ctor_lowered) { rung_ladder.assign(1, fallback_ubatch); }", "", _V_HOISTED),
+    "a lowered context with no rung builds a prep": (_SKIPS_TRIAL, "", _V_NO_RUNG),
+    "the no-rung guard falls through": (
+        "fallback_ubatch, cap)) { return; }", "fallback_ubatch, cap)) { (void) 0; }", _V_NO_RUNG),
+    "the no-rung guard asks from the origin": (
+        "llama_auto_ubatch_ladder_size, fallback_ubatch, cap)) { return; }",
+        "llama_auto_ubatch_ladder_size, sycl_ctor_lowered_from, cap)) { return; }", _V_NO_RUNG),
+    "the no-rung guard runs for every context": (
+        "llama_auto_ubatch_ctor_lowered_skips_trial(ctor_lowered,", "llama_auto_ubatch_ctor_lowered_skips_trial(true,",
+        _V_NO_RUNG),
     "the trial is not told the rung was lowered": ("lowered_from  = sycl_ctor_lowered_from;", "(void) 0;", _V_SEED),
     "the trial's descent overwrites the constructor's origin": ("if (lowered_from == 0) {", "if (true) {", _V_ORIGIN),
     "the outcome names the ladder's ceiling for a lowered rung": (

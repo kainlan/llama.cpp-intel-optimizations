@@ -45,6 +45,10 @@
 // whichever way the probe reports it (a rejected-plan lifecycle code, or OK with accepted == false), so the descent
 // goes on below it; busy, stale identity and any other lifecycle code end the walk.
 //
+// llama_auto_ubatch_ctor_lowered_skips_trial() decides whether a context the constructor's publish lowered leaves
+// the trial nothing to run: no ladder rung lies between the lowered rung and the cap, which is where the trial's
+// no-candidate exit would otherwise take it before any lowered WARN.
+//
 // No device, no model, no allocation.
 
 #include "../src/llama-auto-ubatch.h"
@@ -492,6 +496,50 @@ int main() {
                 g_failures++;
             } else {
                 std::printf("ok   ctor walks down, %s: %d\n", c.name, got ? 1 : 0);
+            }
+        }
+    }
+
+    // ---- A context the constructor lowered that the trial has no rung for. The trial's no-candidate exit asks the
+    // ladder for a rung in [lowered, cap] and, without one, reserves once and returns before the trial's lowered WARN,
+    // so the trial's prepare step leaves the prep empty instead and the constructor announces the lowering. The case
+    // under the cap also runs the narrower "lowered above the cap" form and requires it to DISAGREE. ----
+    {
+        struct skip_case {
+            const char * name;
+            bool         ctor_lowered;
+            uint32_t     lowered, cap;
+            bool         want, narrow_is_wrong;
+        };
+
+        const skip_case cases[] = {
+            // A MoE model with a 512 routing ceiling, refused at 1152: the walk is capped at what was asked, not at
+            // the ceiling, so it stands at 576, and the trial's rung set holds no entry at all.
+            { "lowered above the MoE ceiling",            true,  576,  512,  true,  false },
+            // A raw-API -ub of 9984 with n_batch = n_ctx = 9984: the walk stands at 4992, under the cap, and no rung
+            // lies between the two.
+            { "lowered under the cap, no rung up to it",  true,  4992, 9984, true,  true  },
+            { "lowered to a rung under the cap",          true,  1024, 4096, false, false },
+            { "lowered under the first rung",             true,  256,  4096, false, false },
+            { "lowered to the cap, which is a rung",      true,  512,  512,  false, false },
+            { "not lowered, the default above the cap",   false, 1024, 512,  false, false },
+        };
+        for (const skip_case & c : cases) {
+            const bool got =
+                llama_auto_ubatch_ctor_lowered_skips_trial(c.ctor_lowered, ladder, n_ladder, c.lowered, c.cap);
+            const bool narrow = c.ctor_lowered && c.lowered > c.cap;
+            if (got != c.want) {
+                std::fprintf(stderr, "FAIL ctor lowered skips trial, %s: got %d (expected %d)\n", c.name, got ? 1 : 0,
+                             c.want ? 1 : 0);
+                g_failures++;
+            } else if (c.narrow_is_wrong && narrow == c.want) {
+                std::fprintf(stderr,
+                             "FAIL ctor lowered skips trial, %s: case does not discriminate -- the lowered-above-cap "
+                             "form also gives %d\n",
+                             c.name, c.want ? 1 : 0);
+                g_failures++;
+            } else {
+                std::printf("ok   ctor lowered skips trial, %s: %d\n", c.name, got ? 1 : 0);
             }
         }
     }
