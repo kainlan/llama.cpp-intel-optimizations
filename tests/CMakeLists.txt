@@ -5044,6 +5044,20 @@ set_tests_properties(test-auto-ubatch-ladder-mutant-rejected-is-lifecycle PROPER
     TIMEOUT 120
     PASS_REGULAR_EXPRESSION "FAIL probe-refusal descent: got 256 after 1 rung\\(s\\), aborted=1 \\(expected 128 after 2\\)")
 
+# The constructor-walk mutant walks -ub down on any refusal of the constructor's publish, which is the defect the
+# lifecycle case exists to catch: a busy or stale-identity refusal is no verdict on the rung. Scored on the line only
+# that defect prints, with no skip code, as the probe-verdict mutant above.
+add_executable(test-auto-ubatch-ladder-mutant-ctor-walks-on-any-refusal test-auto-ubatch-ladder.cpp)
+target_compile_definitions(test-auto-ubatch-ladder-mutant-ctor-walks-on-any-refusal
+    PRIVATE LLAMA_AUTO_UBATCH_MUTANT_CTOR_WALKS_ON_ANY_REFUSAL)
+target_link_libraries(test-auto-ubatch-ladder-mutant-ctor-walks-on-any-refusal PRIVATE llama-common)
+add_test(NAME test-auto-ubatch-ladder-mutant-ctor-walks-on-any-refusal
+         COMMAND test-auto-ubatch-ladder-mutant-ctor-walks-on-any-refusal)
+set_tests_properties(test-auto-ubatch-ladder-mutant-ctor-walks-on-any-refusal PROPERTIES
+    LABELS "sycl;host;mutant"
+    TIMEOUT 120
+    PASS_REGULAR_EXPRESSION "FAIL ctor walks down, lifecycle refusal, the trial runs: got 1 \\(expected 0\\)")
+
 # zhcn C7f: executes the pure helpers in src/llama-measure-plan.h -- the graph
 # set one planned reserve measures ((3 + S) * 2 * N graphs: the allocating
 # reserve's own pp, tg and closing pp, then one decode graph per stream count)

@@ -297,8 +297,9 @@ def witness_viii_order(t):
 # --- (ix) the selection is the LAST thing that can see a stale plan: the only
 # scheduler constructions are inside sched_reserve(), no plan-mutating call sits
 # between the selection and the first one, and the narrow flash-attn recheck
-# (allow_replan=false) comes only after it. The plan mutators -- the constructor,
-# candidate and settle resyncs -- all run in callers, before sched_reserve().
+# (allow_replan=false) comes only after it. The plan mutators -- the constructor's
+# publish and the candidate and settle resyncs -- all run in callers, before
+# sched_reserve().
 def check_ix_selection_follows_last_plan_mutation(t):
     sched = t["sched_reserve_fn"]
     ctx = t["ctx_cpp"]
@@ -312,8 +313,8 @@ def check_ix_selection_follows_last_plan_mutation(t):
     mnew = meas.find(NEW_CALL)
     mbetween = meas[msel:mnew] if 0 <= msel < mnew else None
     recheck = sched.find("\n    resolve_fused_ops(state, mctx.get(), n_seqs);")
-    mutators = ("sycl_resync_runtime_context_flash_attn(", "ggml_backend_sycl_set_runtime_context",
-                "set_runtime_context_for_model")
+    mutators = ("sycl_resync_runtime_context_flash_attn(", "sycl_publish_runtime_context(",
+                "ggml_backend_sycl_set_runtime_context", "set_runtime_context_for_model")
     return (between is not None
             and mbetween is not None
             and not any(m in between or m in mbetween for m in mutators)

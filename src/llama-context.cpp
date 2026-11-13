@@ -1496,7 +1496,101 @@ llama_context::llama_context(
             }
             sycl_exec_context_bound = true;
         }
-        sycl_resync_runtime_context_flash_attn();
+#endif
+    }
+
+    // The auto n_ubatch trial's decision, made before the constructor's publish below: a publish refused for fit walks
+    // -ub down only on a context the trial runs for. It reads the params, cparams and the GPU backends, which all exist
+    // here.
+    bool sycl_auto_ubatch_trial = false;
+    if (!hparams.vocab_only && !measure_only) {
+        // llama.cpp-xojq (nphx Task 4b, c-wgxn): run the SYCL auto
+        // micro-batch selection trial IN PLACE OF the unconditional
+        // sched_reserve() below, when all four conditions hold: the caller
+        // did not pin -ub explicitly (n_ubatch_auto), this context has a
+        // SYCL backend, GGML_SYCL_AUTO_UBATCH allows it, and the model is
+        // causal (comment c-dcct: a non-causal model's n_ubatch == n_batch
+        // semantics must never be shrunk by the trial). Any condition false
+        // falls through to today's single sched_reserve() call, unchanged.
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        const bool sycl_backend_present     = llama_context_has_sycl_backend(backends);
+        bool       sycl_auto_ubatch_enabled = false;
+        // The accessor is consulted only once the cheap conditions hold, so an
+        // older SYCL DSO's proc lookup does not run for a pinned -ub or a
+        // non-causal model.
+        if (params.n_ubatch_auto && cparams.causal_attn && sycl_backend_present) {
+#    ifdef GGML_USE_SYCL
+            sycl_auto_ubatch_enabled = ggml_backend_sycl_auto_ubatch_enabled();
+#    else
+            ggml_backend_dev_t sycl_dev = nullptr;
+            for (auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                if (llama_context_dev_is_sycl(dev)) {
+                    sycl_dev = dev;
+                    break;
+                }
+            }
+            auto auto_ubatch_enabled_fn = llama_context_sycl_auto_ubatch_enabled_proc(sycl_dev);
+            sycl_auto_ubatch_enabled    = auto_ubatch_enabled_fn && auto_ubatch_enabled_fn();
+#    endif
+        }
+        sycl_auto_ubatch_trial = llama_auto_ubatch_trial_runs(params.n_ubatch_auto, cparams.causal_attn,
+                                                              sycl_backend_present, sycl_auto_ubatch_enabled);
+#endif
+    }
+
+    if (!hparams.vocab_only && !measure_only) {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        // The constructor's publish, before the memory module: the KV cache is created with the residency of the
+        // publish that stands. A refusal fails the context, unless it is a fit verdict on a context the trial runs for
+        // (llama_auto_ubatch_ctor_walks_down): -ub then walks down from the default by the trial's own descent rule
+        // until a publish stands, and the trial starts from that rung and asks nothing above it
+        // (sycl_auto_ubatch_prepare). A refusal on the walk that is no fit verdict ends it, as it ends the trial's.
+        {
+            const uint32_t       asked_ubatch = cparams.n_ubatch;
+            std::string          walked;
+            sched_reserve_result first_refusal{ sched_reserve_status::OK, "" };
+            sched_reserve_result last_refusal{ sched_reserve_status::OK, "" };
+
+            // One publish site for the default and every rung of the walk: true when the publish stood.
+            auto publish_at = [&](uint32_t ub) {
+                cparams.n_ubatch = ub;
+                walked.append(walked.empty() ? "" : ",").append(std::to_string(ub));
+                const sched_reserve_result published = sycl_publish_runtime_context(cparams.flash_attn);
+                if (published.status == sched_reserve_status::OK) {
+                    return true;
+                }
+                if (first_refusal.status == sched_reserve_status::OK) {
+                    first_refusal = published;
+                }
+                last_refusal = published;
+                return false;
+            };
+            if (!publish_at(asked_ubatch)) {
+                if (!llama_auto_ubatch_ctor_walks_down(sycl_auto_ubatch_trial, first_refusal.fit_refusal)) {
+                    throw std::runtime_error(first_refusal.reason);
+                }
+                // Each rung under the default, largest first (the default is the walk's cap: nothing above it is
+                // asked), until one stands or a refusal is no fit verdict.
+                bool           walk_aborted = false;
+                const uint32_t stood        = llama_auto_ubatch_descend(asked_ubatch, asked_ubatch, [&](uint32_t c) {
+                    if (publish_at(c)) {
+                        return true;
+                    }
+                    walk_aborted = !last_refusal.fit_refusal;
+                    return walk_aborted;
+                });
+                if (stood == 0 || walk_aborted) {
+                    throw std::runtime_error(
+                        format("%s (auto n_ubatch: the constructor's publish walked -ub down through %s and none "
+                               "stood; the last refusal: %s)",
+                               first_refusal.reason.c_str(), walked.c_str(), last_refusal.reason.c_str()));
+                }
+                sycl_ctor_lowered_from  = asked_ubatch;
+                sycl_ctor_lowered_cause = format("the constructor's publish at %u was refused (%s)", asked_ubatch,
+                                                 first_refusal.reason.c_str());
+            }
+        }
 #endif
 
         // add ACCEL backends (such as BLAS)
@@ -1750,46 +1844,17 @@ llama_context::llama_context(
         }
     }
 
-    // llama.cpp-7gno: the auto n_ubatch trial's decision, and everything the planned ladder's rung set depends on,
-    // are made here, before the memory module exists (sycl_auto_ubatch_prepare); the reserve below runs the trial
-    // on them.
-    bool sycl_auto_ubatch_trial = false;
+    // Everything the planned ladder's rung set depends on is made here, before the memory module exists
+    // (sycl_auto_ubatch_prepare), from the trial decision made before the constructor's publish; the reserve below
+    // runs the trial on it.
     if (!hparams.vocab_only && !measure_only) {
-        // llama.cpp-xojq (nphx Task 4b, c-wgxn): run the SYCL auto
-        // micro-batch selection trial IN PLACE OF the unconditional
-        // sched_reserve() below, when all four conditions hold: the caller
-        // did not pin -ub explicitly (n_ubatch_auto), this context has a
-        // SYCL backend, GGML_SYCL_AUTO_UBATCH allows it, and the model is
-        // causal (comment c-dcct: a non-causal model's n_ubatch == n_batch
-        // semantics must never be shrunk by the trial). Any condition false
-        // falls through to today's single sched_reserve() call, unchanged.
-#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-        const bool sycl_backend_present     = llama_context_has_sycl_backend(backends);
-        bool       sycl_auto_ubatch_enabled = false;
-        // The accessor is consulted only once the cheap conditions hold, so an
-        // older SYCL DSO's proc lookup does not run for a pinned -ub or a
-        // non-causal model.
-        if (params.n_ubatch_auto && cparams.causal_attn && sycl_backend_present) {
-#    ifdef GGML_USE_SYCL
-            sycl_auto_ubatch_enabled = ggml_backend_sycl_auto_ubatch_enabled();
-#    else
-            ggml_backend_dev_t sycl_dev = nullptr;
-            for (auto & backend : backends) {
-                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-                if (llama_context_dev_is_sycl(dev)) {
-                    sycl_dev = dev;
-                    break;
-                }
-            }
-            auto auto_ubatch_enabled_fn = llama_context_sycl_auto_ubatch_enabled_proc(sycl_dev);
-            sycl_auto_ubatch_enabled    = auto_ubatch_enabled_fn && auto_ubatch_enabled_fn();
-#    endif
-        }
-        sycl_auto_ubatch_trial = llama_auto_ubatch_trial_runs(params.n_ubatch_auto, cparams.causal_attn,
-                                                              sycl_backend_present, sycl_auto_ubatch_enabled);
-#endif
         if (sycl_auto_ubatch_trial) {
             sycl_auto_ubatch_prepare(params.type_k, params.type_v);
+        }
+        // A -ub the constructor's publish lowered is announced by the trial, with whatever the trial does to it after;
+        // a trial that takes its single reserve (an empty prep) announces nothing, so it is announced here.
+        if (sycl_ctor_lowered_from != 0 && !auto_ubatch_prep) {
+            sycl_announce_ctor_lowered_ubatch();
         }
 
         // llama.cpp-7gno: a context under an active SYCL placement plan owns a chunk-cap copy and runs the residency
@@ -2048,8 +2113,11 @@ sched_reserve_result llama_context::sycl_publish_runtime_context(bool flash_attn
     return { sched_reserve_status::OK, "" };
 }
 
-// llama.cpp-oyfl: the constructor's own call, right after model activation,
-// before any auto flash_attn_type is resolved. See the declaration in
+// The throwing form of the full publish, for the trial's candidate and settle
+// publishes. The constructor's own publish, right after model activation and
+// before any auto flash_attn_type is resolved, calls
+// sycl_publish_runtime_context() directly instead: it reads a refusal's fit
+// verdict to walk -ub down. See the declaration in
 // llama-context.h. resolve_fused_ops() does NOT call this: once an AUTO
 // flash_attn_type resolves, only flash_attn_enabled has changed, so it calls
 // the narrow sycl_recheck_runtime_context_flash_attn() below instead, rather
@@ -2403,8 +2471,13 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     }
 
     // Already clamped to n_batch by the constructor's own `cparams.n_ubatch = std::min(cparams.n_batch, ...)`
-    // assignment, above: the floor of the rung set, and the rung the context runs at when nothing climbs.
+    // assignment, above, or lowered under it by the constructor's publish: the floor of the rung set, and the rung the
+    // context runs at when nothing climbs.
     const uint32_t fallback_ubatch = cparams.n_ubatch;
+
+    // The constructor's publish was refused for fit at every rung from the default down to this one: nothing above it
+    // is asked again, by the cache or by the ladder.
+    const bool ctor_lowered = sycl_ctor_lowered_from != 0;
 
     const bool cache_available = have_cache_accessors && cache_enabled_fn();
 
@@ -2415,8 +2488,8 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     // the rung set, so a cache candidate is always a member of it.
     uint32_t   cached_ubatch         = 0;
     char       cached_reason_buf[64] = { 0 };
-    const bool cache_found =
-        cache_available && cache_lookup_fn(&cache_key, &cached_ubatch, cached_reason_buf, sizeof(cached_reason_buf));
+    const bool cache_found           = !ctor_lowered && cache_available &&
+                             cache_lookup_fn(&cache_key, &cached_ubatch, cached_reason_buf, sizeof(cached_reason_buf));
     const bool     cache_usable = cache_found && llama_auto_ubatch_cached_valid(ladder, llama_auto_ubatch_ladder_size,
                                                                                 cached_ubatch, fallback_ubatch, cap);
     const uint32_t cache_set_value = cache_usable ? cached_ubatch : 0;
@@ -2427,12 +2500,20 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     // of its own -- a rung outside [fallback_ubatch, cap] is not in the set.
     uint32_t     rung_set[llama_auto_ubatch_rung_set_capacity];
     uint32_t     rungs[llama_auto_ubatch_rung_set_capacity];
-    const size_t n_rung_set =
+    const size_t n_rung_set_full =
         llama_auto_ubatch_rung_set(ladder, llama_auto_ubatch_ladder_size, fallback_ubatch, cap, cache_set_value,
                                    rung_set, llama_auto_ubatch_rung_set_capacity);
+    // A context the constructor lowered climbs nothing: its set is the rung its publish stood at alone, the smallest
+    // of the full set (fallback_ubatch; every ladder rung is at least the default the publish was refused at).
+    const size_t n_rung_set = ctor_lowered ? 1 : n_rung_set_full;
     const size_t n_rungs = llama_auto_ubatch_ladder_members(rung_set, n_rung_set, ladder, llama_auto_ubatch_ladder_size,
                                                             rungs, llama_auto_ubatch_rung_set_capacity);
     std::vector<uint32_t> rung_ladder(rungs, rungs + n_rungs);
+    // That rung is no ladder member, so the ladder is handed it directly: a fit loss there descends from it as a loss
+    // at the default does.
+    if (ctor_lowered) {
+        rung_ladder.assign(1, fallback_ubatch);
+    }
     // The set is the host hold's: R_h is folded over every rung the trial may try, at its first transaction.
     tenant_rung_set.assign(rung_set, rung_set + n_rung_set);
 
@@ -2565,6 +2646,12 @@ void llama_context::sycl_select_auto_ubatch() {
     bool           published_any           = false;
     bool           publish_dirty           = false;  // a candidate publish threw, possibly after landing somewhere
     std::string    tried;
+
+    // A -ub the constructor's publish lowered (the hoisted block made it this trial's only rung) is a lowered result
+    // from the start: announced from the default it was lowered from, and stored, by the rules of one the walk below
+    // lowers.
+    lowered_from  = sycl_ctor_lowered_from;
+    lowered_cause = sycl_ctor_lowered_cause;
 
     // A rung that lost: the reason is the last one a named error reports, and the rung lowers the bound the -ub a
     // refusal names is capped under (the advice never names a rung this start already lost).
@@ -2995,9 +3082,14 @@ void llama_context::sycl_select_auto_ubatch() {
             return descent_aborted;
         });
         if (ended != 0 && !descent_aborted) {
-            last_good     = ended;
-            lowered_from  = fallback_ubatch;
-            lowered_cause = format("the default did not fit (%s)", stop);
+            last_good = ended;
+            // A rung the constructor already lowered keeps the origin it was lowered from, and the cause grows.
+            if (lowered_from == 0) {
+                lowered_from  = fallback_ubatch;
+                lowered_cause = format("the default did not fit (%s)", stop);
+            } else {
+                lowered_cause += format("; %u did not fit either (%s)", fallback_ubatch, stop);
+            }
         }
     }
 
@@ -3207,6 +3299,16 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf, bool log) {
     }
 
     return (int) users.size();
+}
+
+// The trial's lowered announcement, in its wording, for a -ub the constructor's publish lowered on a context whose
+// trial then takes its single reserve: that trial announces nothing, and a lowered -ub is never silent. It is not one
+// of the trial's own outcome lines, so it lives outside the trial.
+void llama_context::sycl_announce_ctor_lowered_ubatch() const {
+    LLAMA_LOG_WARN(
+        "[SYCL-PLAN] auto n_ubatch lowered from %u to %u: %s; a smaller -ub is not a smaller context; "
+        "pass -ub N to override\n",
+        sycl_ctor_lowered_from, cparams.n_ubatch, sycl_ctor_lowered_cause.c_str());
 }
 
 sched_reserve_state llama_context::member_reserve_state() {

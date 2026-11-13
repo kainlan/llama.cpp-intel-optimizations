@@ -155,6 +155,20 @@ inline bool llama_auto_ubatch_trial_runs(bool n_ubatch_auto,
     return n_ubatch_auto && causal_attn && has_sycl_backend && auto_ubatch_enabled;
 }
 
+// True iff the constructor's refused publish walks -ub down where it stands, before the memory module exists: the
+// refusal is a fit verdict (the transaction ran and refused the plan) and the trial runs for the context
+// (llama_auto_ubatch_trial_runs), so -ub is the trial's to choose. The KV cache is created with the residency of the
+// publish that stood, which is why the walk cannot wait for the trial. A lifecycle refusal (busy, a stale identity,
+// any other result) is no verdict on the rung, and a pinned -ub is the caller's; both fail the context as before.
+inline bool llama_auto_ubatch_ctor_walks_down(bool trial_runs, bool fit_refusal) {
+#ifdef LLAMA_AUTO_UBATCH_MUTANT_CTOR_WALKS_ON_ANY_REFUSAL
+    (void) fit_refusal;
+    return trial_runs;
+#else
+    return trial_runs && fit_refusal;
+#endif
+}
+
 // The trial's cap: min(n_batch, n_ctx), narrowed to the GPU MoE routing
 // ceiling for a MoE model whenever that ceiling does not exceed it. A ceiling
 // equal to the cap still binds, so the stop reason names the ceiling.
