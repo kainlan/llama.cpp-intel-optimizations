@@ -1554,8 +1554,9 @@ llama_context::llama_context(
         // The constructor's publish, before the memory module: the KV cache is created with the residency of the
         // publish that stands. A refusal fails the context, unless it is a fit verdict on a context the trial runs for
         // (llama_auto_ubatch_ctor_walks_down): -ub then walks down from the default by the trial's own descent rule
-        // until a publish stands, and the trial starts from that rung and asks nothing above it
-        // (sycl_auto_ubatch_prepare). A refusal on the walk that is no fit verdict ends it, as it ends the trial's.
+        // until a publish stands, and the trial starts from that rung and asks nothing above it, or takes its single
+        // reserve there when no ladder rung lies between that rung and its cap (sycl_auto_ubatch_prepare). A refusal
+        // on the walk that is no fit verdict ends it, as it ends the trial's.
         {
             const uint32_t       asked_ubatch = cparams.n_ubatch;
             std::string          walked;
@@ -2409,9 +2410,10 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     // rows -- so the trial cannot try a single candidate. Take exactly the
     // pre-trial path (one reserve at whatever n_ubatch the constructor's
     // own clamp already resolved, or lowered under it by the constructor's
-    // publish) and log no WARN: a WARN here would report an empty `tried`
-    // list against a ladder that never got a chance to run, and the one
-    // WARN this function does log is reserved for "the trial actually ran".
+    // publish) with no outcome WARN: one would report an empty `tried` list
+    // against a ladder that never got a chance to run, and the outcome WARN
+    // is reserved for "the trial actually ran". A lowering is still
+    // announced, by the constructor, once this returns with no prep.
     if (cap < ladder[0]) {
         return;
     }
@@ -2422,8 +2424,8 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     // flash_attn() apply per backend before building a token -- a model
     // that never had a SYCL token published is not "not the published
     // model" (GGML_SYCL_LIFECYCLE_STALE_IDENTITY); it simply has nothing
-    // for the probe to evaluate against. Same no-WARN pre-trial fallback
-    // as the cap check above.
+    // for the probe to evaluate against. Same pre-trial fallback, with no
+    // outcome WARN, as the cap check above.
     if (owner.model_id == 0 || owner.load_txn_id == 0) {
         return;
     }
@@ -2493,11 +2495,11 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 
     // Already clamped to n_batch by the constructor's own `cparams.n_ubatch = std::min(cparams.n_batch, ...)`
     // assignment, above, or lowered under it by the constructor's publish: the floor of the rung set, and the rung the
-    // context runs at when nothing climbs.
+    // context runs at when nothing climbs and the trial's descent does not go under it.
     const uint32_t fallback_ubatch = cparams.n_ubatch;
 
-    // The constructor's publish was refused for fit at every rung from the default down to this one: nothing above it
-    // is asked again, by the cache or by the ladder.
+    // The constructor's publish was refused for fit at every rung from the default down to the one above this, and
+    // stood at this one: nothing above it is asked again, by the cache or by the ladder.
     const bool ctor_lowered = sycl_ctor_lowered_from != 0;
 
     // With no ladder rung in [fallback_ubatch, cap], the trial's no-candidate exit would take a lowered context and
@@ -2510,11 +2512,12 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 
     const bool cache_available = have_cache_accessors && cache_enabled_fn();
 
-    // The one tuning-cache lookup. A cached value below fallback_ubatch must
-    // not win either (the "never silently shrink" contract applies to a cached
-    // hit exactly as much as to a fresh ladder rung), so the value counts only
-    // when llama_auto_ubatch_cached_valid accepts it; that same value feeds
-    // the rung set, so a cache candidate is always a member of it.
+    // The one tuning-cache lookup, which a lowered context does not make. A
+    // cached value below fallback_ubatch must not win either (the "never
+    // silently shrink" contract applies to a cached hit exactly as much as to
+    // a fresh ladder rung), so the value counts only when
+    // llama_auto_ubatch_cached_valid accepts it; that same value feeds the
+    // rung set, so a cache candidate is always a member of it.
     uint32_t   cached_ubatch         = 0;
     char       cached_reason_buf[64] = { 0 };
     const bool cache_found           = !ctor_lowered && cache_available &&
@@ -2523,10 +2526,12 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
                                                                                 cached_ubatch, fallback_ubatch, cap);
     const uint32_t cache_set_value = cache_usable ? cached_ubatch : 0;
 
-    // The candidates this trial may try: fallback_ubatch, the ladder rungs in
-    // [fallback_ubatch, cap] and the usable cached value, ascending. The loop
-    // below iterates the set's ladder members, so it carries no bound checks
-    // of its own -- a rung outside [fallback_ubatch, cap] is not in the set.
+    // The candidates the trial may try: fallback_ubatch, the ladder rungs in
+    // [fallback_ubatch, cap] and the usable cached value, ascending. The
+    // trial's ladder loop iterates the set's ladder members, so it carries no
+    // bound checks of its own -- a rung outside [fallback_ubatch, cap] is not
+    // in the set. A lowered context's set and ladder are cut to its one rung
+    // below.
     uint32_t     rung_set[llama_auto_ubatch_rung_set_capacity];
     uint32_t     rungs[llama_auto_ubatch_rung_set_capacity];
     const size_t n_rung_set_full =
@@ -2592,8 +2597,9 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 // freed by that reset, not left behind). A candidate whose reserve lands any
 // compute buffer host-pinned (ggml_backend_sycl_compute_buffer_host_
 // fallbacks() > 0, read AFTER the publish that resets it) also loses. The
-// last candidate that clears all three checks wins; if none do, the floor is
-// the pre-trial -ub (clamped to n_batch by the constructor's own
+// last candidate that clears all three checks wins; if none do, the result is
+// the first rung under the floor that fits when the floor lost for fit, and
+// otherwise the floor: the pre-trial -ub (clamped to n_batch by the constructor's own
 // `cparams.n_ubatch = std::min(cparams.n_batch, ...)` assignment, or lowered
 // under it by the constructor's publish, both before this function is
 // entered). The settle step
@@ -2606,15 +2612,17 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 // At most FOUR GGML_LOG_WARN lines report the outcome (llama.cpp-7n6n,
 // Task 5, wires the persisted auto n_ubatch cache into this trial). The
 // first, `[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)`, reports the CACHE
-// lookup's own outcome (hit/miss/disabled) before the ladder decision below
-// it. The second, `[SYCL-PLAN] tuning cache store failed: %s`, is emitted
+// lookup's own outcome (hit/miss/disabled; a lowered context, which asks the
+// cache nothing, reads as a miss) before the ladder decision below it. The
+// second, `[SYCL-PLAN] tuning cache store failed: %s`, is emitted
 // only when the cache store below actually runs and returns false --
 // not on every start. The third, `[SYCL-PLAN] auto n_ubatch lowered from %u to
 // %u: ...` (llama.cpp-kpjw), is emitted only when the result ended up under the
-// rung that was asked for: the default lost and the downward continuation found
-// a smaller rung that fits, or the settle's publish refused the rung that won
-// the ladder and a smaller one fit. The fourth (the
-// pre-existing one) is
+// rung that was asked for: the constructor's publish lowered -ub, or the
+// default lost for fit and the downward continuation found a smaller rung that
+// fits. (The settle never lowers: a refused settle fails the context by name.
+// A lowered context this function does not run for is announced by the
+// constructor instead.) The fourth (the pre-existing one) is
 // `[SYCL-PLAN] auto n_ubatch=...`, with one of these ten stop reasons:
 // "ladder exhausted" (no candidate lost -- either the cap stopped the ladder or
 // all four rungs were accepted), "MoE GPU routing ceiling" (the MoE cap bound,
@@ -2642,7 +2650,8 @@ void llama_context::sycl_select_auto_ubatch() {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     // llama.cpp-7gno: the decisions below the SYCL backend enumeration (the procs, the cap, the cache lookup and the
     // rung set) were made by the constructor's hoisted block (sycl_auto_ubatch_prepare); an empty prep is the
-    // single-reserve exit every one of them used to take here.
+    // single-reserve exit every one of them used to take here, and the one a lowered context with no ladder rung up
+    // to the cap takes (the constructor has announced that lowering already).
     if (!auto_ubatch_prep) {
         sched_reserve();
         return;
@@ -2665,11 +2674,13 @@ void llama_context::sycl_select_auto_ubatch() {
     const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot, owner.slot_generation };
 
     // The floor the hoisted block built the rung set over, read back: one source for it, not a second read of
-    // cparams.n_ubatch after the residency fixpoint's measures have run.
+    // cparams.n_ubatch after the residency fixpoint's measures have run. "The default" below is this value: the
+    // pre-trial -ub, or for a context the constructor lowered, the rung its walk stood at. "The rung that was asked
+    // for" is the -ub before any lowering.
     const uint32_t fallback_ubatch         = prep.fallback_ubatch;
     uint32_t       last_good               = 0;
     uint32_t       hold_spill_validated_ub = 0;  // the rung try_candidate last passed the realized hold-spill check for
-    uint32_t       lowered_from            = 0;  // the default the downward continuation lowered from (0: it did not)
+    uint32_t       lowered_from            = 0;  // the -ub the result was lowered from (0: it was not lowered)
     bool           fallback_tried          = false;  // the default itself was a rung the ladder asked about
     bool           descent_ran             = false;  // the downward continuation ran (and may have found nothing)
     bool           rung_fit_refused        = false;  // the rung try_candidate last lost was a real fit refusal
@@ -2684,7 +2695,7 @@ void llama_context::sycl_select_auto_ubatch() {
     std::string    tried;
 
     // A -ub the constructor's publish lowered (the hoisted block made it this trial's only rung) is a lowered result
-    // from the start: announced from the default it was lowered from, and stored, by the rules of one the walk below
+    // from the start: announced from the -ub it was lowered from, and stored, by the rules of one the walk below
     // lowers.
     lowered_from  = sycl_ctor_lowered_from;
     lowered_cause = sycl_ctor_lowered_cause;
@@ -2966,8 +2977,9 @@ void llama_context::sycl_select_auto_ubatch() {
     uint32_t     cache_resume_ubatch = 0;  // the validated value the resume started from
     std::string  cache_resume_reason;      // its stored reason, for the "unchanged outcome" compare at the store gate
 
-    // The one tuning-cache lookup was made by the hoisted block; its answer and the ladder rungs of the rung set (the
-    // candidates this trial may try, ascending) are read here.
+    // The one tuning-cache lookup was made by the hoisted block (a lowered context made none: its answer is no usable
+    // value); its answer and the rungs the ladder loop tries (the ladder members of the rung set, ascending, or a
+    // lowered context's one rung) are read here.
     const uint32_t                cached_ubatch    = prep.cached_ubatch;
     const char *                  cached_reason_buf = prep.cached_reason_buf;
     const bool                    cache_usable     = prep.cache_usable;
@@ -3004,7 +3016,9 @@ void llama_context::sycl_select_auto_ubatch() {
                     cache_resume_reason = cached_reason_buf;
                     // `stop` stays at its pre-cache value ("ladder
                     // exhausted" or "MoE GPU routing ceiling", set before
-                    // this block ran) -- if the resumed ladder finds
+                    // this block ran; a lowered context, whose seed sets
+                    // another, has no usable cached value and never gets
+                    // here) -- if the resumed ladder finds
                     // nothing better above the cached rung, that value is
                     // exactly the correct reason to report, matching a
                     // normal from-scratch run that reached the same result.
@@ -3046,7 +3060,11 @@ void llama_context::sycl_select_auto_ubatch() {
     // candidate) still gets its normal outcome WARN and store logic. Skips only
     // the [SYCL-PLAN] auto n_ubatch= WARN and the cache store: the tuning cache
     // WARN above has already printed its miss/disabled line, unlike the earlier
-    // pre-trial exits, which all return before the cache lookup.
+    // pre-trial exits, which all return before the cache lookup. A context the
+    // constructor lowered never reaches it: this exit returns before the
+    // lowered WARN, so the hoisted block left such a context no prep
+    // (llama_auto_ubatch_ctor_lowered_skips_trial) and the constructor
+    // announced the lowering.
     if (tried.empty() &&
         !llama_auto_ubatch_ladder_has_candidate(ladder, llama_auto_ubatch_ladder_size, fallback_ubatch, cap)) {
         sched_reserve();
@@ -3054,15 +3072,16 @@ void llama_context::sycl_select_auto_ubatch() {
     }
 
     // Never let the ladder pick something SMALLER than the caller's own
-    // explicit n_ubatch (fallback_ubatch) -- a raw-API caller can set
+    // explicit n_ubatch (fallback_ubatch, or the rung the constructor's walk
+    // lowered it to) -- a raw-API caller can set
     // llama_context_params.n_ubatch above the ladder's first rung together
     // with n_ubatch_auto=true, and the "never silently shrink" gotcha
     // (docs/plans/2026-09-10-auto-ubatch.md) applies to that value too, not
     // only to a rung the trial itself already accepted. rung_ladder holds no
     // rung under fallback_ubatch or over cap, so a rung the ladder never tries
     // can never become last_good; if nothing wins, last_good falls through to
-    // fallback_ubatch itself below, which was always safe -- it is exactly
-    // today's pre-trial default.
+    // fallback_ubatch itself below (unless the descent finds a smaller rung),
+    // the -ub the constructor's own publish stood at.
     for (uint32_t c : rung_ladder) {
         if (!ladder_needed) {
             break;
@@ -3104,8 +3123,9 @@ void llama_context::sycl_select_auto_ubatch() {
     // unchanged). It continues DOWNWARD (256, 128, 64 from a default of 512) and settles on the first rung that fits,
     // announced loud. A loss that is no fit refusal (a lifecycle failure, a publish that threw or raced, a KV that
     // would be demoted, a host fallback) never lowers -ub, here or at any rung of the walk: the walk ends at the first
-    // such loss. Only when the default was itself tried (a default that is not a rung was never asked, so lowering
-    // past it would skip the one value that was always safe to reserve). A pinned -ub never reaches this function.
+    // such loss. Only when the default was itself tried (an unlowered default that is not a rung was never asked, so
+    // lowering past it would skip the one value that was always safe to reserve; a lowered context's default is its
+    // only candidate, asked whether or not it is a rung). A pinned -ub never reaches this function.
     if (last_good == 0 && ladder_needed && fallback_tried && rung_fit_refused) {
         descent_ran                    = true;
         // A rung below the default is about to be published, so the ring is sized for it whatever happens: the settle
@@ -3160,7 +3180,9 @@ void llama_context::sycl_select_auto_ubatch() {
     //
     // The first rung tried is the smallest rung >= fallback_ubatch (the loop
     // skips rungs under the floor), so it equals fallback_ubatch only when
-    // fallback_ubatch is itself a rung. In that case a first-rung loss on the
+    // fallback_ubatch is itself a rung, or when the constructor lowered -ub:
+    // the lowered rung is then the only one tried, rung or not, and counts
+    // here as one that is. In that case a first-rung loss on the
     // host-fallback check leaves last_good == fallback_ubatch == the rung that
     // just lost (the "last_good == 0" branch above), so this gate still fires
     // (sched_matches_last_good is false) and re-publishes/re-reserves the
@@ -3182,7 +3204,8 @@ void llama_context::sycl_select_auto_ubatch() {
     // The ring's state after a probe whose rollback failed is ARITHMETIC, not
     // something this gate has to know about structurally. The ascending phase
     // tries only candidates >= fallback_ubatch (the cache lookup rejects a
-    // smaller value and the loop skips rungs below it), so a rollback failure
+    // smaller value and the loop skips rungs below it; a lowered context asks
+    // the cache nothing and tries fallback_ubatch alone), so a rollback failure
     // there leaves the ring sized for a value >= fallback_ubatch. The downward
     // continuation is the one place a rung BELOW fallback_ubatch is published,
     // and it sets publish_dirty before its first rung, so whatever it leaves
@@ -3270,11 +3293,12 @@ void llama_context::sycl_select_auto_ubatch() {
     // still never fatal to this trial's own outcome either way.
     const bool resumed_outcome_unchanged =
         cache_resumed && last_good == cache_resume_ubatch && cache_resume_reason == stop;
-    // A LOWERED result is not worth storing for itself: the lookup refuses any value under the ladder's first rung, so
-    // it could only ever be a miss, and the next start runs the ladder again. It IS stored when a cached rung was just
-    // refused (llama.cpp-kpjw): the entry that rung came from would otherwise sit there and be paid for on every
-    // start, and the lowered value overwrites it as the miss it is. A walk that ran and found nothing stores nothing:
-    // last_good is then the default, which did not fit.
+    // A LOWERED result is not worth storing for itself: it could only ever be a miss (the lookup refuses any value
+    // under the ladder's first rung, and a context the constructor lowers asks the cache nothing), and the next start
+    // runs the ladder, or the constructor's walk, again. It IS stored when a cached rung was just refused, which only
+    // an unlowered context's lookup can produce: the entry that rung came from would otherwise sit there and be paid
+    // for on every start, and the lowered value overwrites it as the miss it is. A walk that ran and found nothing
+    // stores nothing: last_good is then the default, which did not fit.
     const bool store_outcome = lowered_from == 0 ? !descent_ran : cache_refused_ub != 0;
     if (ladder_needed && !stop_is_pure_race && store_outcome && !resumed_outcome_unchanged && have_cache_accessors &&
         cache_enabled_fn()) {
@@ -3283,8 +3307,9 @@ void llama_context::sycl_select_auto_ubatch() {
         }
     }
 
-    // One announcement for every way the result ended up under the rung that was asked for (the default lost, or the
-    // settle refused a winner).
+    // One announcement for every way the result ended up under the rung that was asked for: the constructor's publish
+    // lowered it, or the default lost for fit and the descent found a smaller rung (a refused settle fails the context
+    // by name instead). A lowered context this function does not run for is announced by the constructor.
     if (lowered_from != 0) {
         LLAMA_LOG_WARN(
             "[SYCL-PLAN] auto n_ubatch lowered from %u to %u: %s; a smaller -ub is not a smaller context; "

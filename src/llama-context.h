@@ -599,6 +599,8 @@ private:
     // The -ub the constructor's publish was refused at, for fit, when it walked -ub down before the memory module
     // existed (0: it did not), and why. The trial starts from the rung the walk stood at (sycl_auto_ubatch_prepare) and
     // treats it as a lowered result from this origin: announced, and stored, by the rules of one its own walk lowered.
+    // With no ladder rung between that rung and the trial's cap the trial takes its single reserve instead, and the
+    // constructor announces the lowering (sycl_announce_ctor_lowered_ubatch).
     uint32_t    sycl_ctor_lowered_from = 0;
     std::string sycl_ctor_lowered_cause;
 
