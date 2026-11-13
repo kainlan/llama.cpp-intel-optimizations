@@ -28,20 +28,22 @@ Two kinds of launch are censused, and kept apart in the output and in the allowl
   the in-order device queue, and the device sits idle while it runs, so the profiler must see it like a kernel.
 - shortcut: a queue member that enqueues a command without submit(): `parallel_for`, `single_task`, `memcpy`, `memset`,
   `fill`, `copy`, `prefetch`, `mem_advise`, in member-call form only (`->name(` / `.name(`), so `std::memcpy(` and free
-  functions never match. Inside the parentheses of a submit that counts, it is that command group's handler call, and
-  the submit is the launch: not counted. Inside a submit set aside (a host pool's job), it counts like any other.
+  functions never match. Inside a submit's parentheses, the innermost enclosing submit decides: if it counts, the
+  shortcut is its command group's handler call and the submit is the launch, so the shortcut is not counted; if a
+  row sets it aside (a host pool's job), the shortcut counts like any other, whatever encloses that submit.
 Every call of either kind counts unless a reviewed row sets it aside. No type is read anywhere: a row of
 SET_ASIDE_BY_RECEIVER, keyed `kind:file:function:receiver`, names the receiver expression exactly as written at the
 call, prefix included and whitespace removed, and sets aside the calls of that kind on that expression in that function
 only when there are exactly as many as the row's count, all in one definition of it (a row naming an overload pair, or
-one name in two namespaces, is refused). A receiver a row can name is a plain chain of names joined by `.`, `->` or `::`
-(`pool`, `engine->queue`, `this->pool_`, `ns::g_pool`); a call, an index, a cast, a template argument, a parenthesised
-or dereferenced operand, a `*` or `&` before it and a line continuation make it nameless, so its call counts. A call on
-`c->q` is not one on `q`. Adding a row is the reviewed act: the reviewer reads the receiver's declaration by hand, and
-the row's reason says what it is and where it is declared. The pin proves only that the set of set-aside expressions and
-their counts did not change; that a receiver is no queue is the reviewer's claim. queue_tripwire is a lexical tripwire
-on top, not a resolver: it refuses a row whose last name the function plainly binds next to the token `queue`
-(`sycl::queue & ready`, `for (sycl::queue * ready : qs)`), and proves nothing when it stays quiet.
+one name in two namespaces, is refused), and a named one (a row for calls outside every named function is refused). A
+receiver a row can name is a plain chain of names joined by `.`, `->` or `::` (`pool`, `engine->queue`, `this->pool_`,
+`ns::g_pool`); a call, an index, a cast, a template argument, a parenthesised or dereferenced operand, a `*` or `&`
+before it, a line continuation and a keyword joined by `::` make it nameless, so its call counts. A call on `c->q` is
+not one on `q`. Adding a row is the reviewed act: the reviewer reads the receiver's declaration by hand, and the row's
+reason says what it is and where it is declared. The pin proves only that the set of set-aside expressions and their
+counts did not change; that a receiver is no queue is the reviewer's claim. queue_tripwire is a lexical tripwire on top,
+not a resolver: it refuses a row whose last name the function plainly binds next to the token `queue` (`sycl::queue &
+ready`, `for (sycl::queue * ready : qs)`), and proves nothing when it stays quiet.
 
 A launch is profiled, and not a site, in two cases:
 - Wrapped: any '(' still open at it, at any nesting depth and any distance, is the argument list of a wrapper call.
@@ -718,13 +720,12 @@ RECORDED_ON_THE_PATH = {
 
 # "kind:file:function:receiver" -> (count, reason): the calls set aside by their receiver. receiver is the receiver
 # expression exactly as written at the call, a plain chain of names (Code.receiver), prefix included and whitespace
-# removed (`engine->queue`, `pool`, `cgh`). A call is set aside only when its exact key has a row and the one
-# definition of the function holds exactly count calls of that kind on that expression; every other call counts,
-# and no type is read anywhere. Adding a row is the reviewed act: read the
-# receiver's declaration by hand, and its call, first. If the receiver is a queue, there is no row to add. The pin
-# proves only that the set of set-aside expressions and their counts did not change; the reason is the reviewer's
-# claim, so it says what the receiver is and where it is declared. queue_tripwire refuses a row whose name the
-# function plainly binds next to `queue`, as a tripwire, not a type check.
+# removed (`engine->queue`, `pool`, `cgh`). A call is set aside only when its exact key has a row and the one definition
+# of the function holds exactly count calls of that kind on that expression; every other call counts, and no type is
+# read anywhere. Adding a row is the reviewed act: read the receiver's declaration by hand, and its call, first. If the
+# receiver is a queue, there is no row to add. The pin proves only that the set of set-aside expressions and their
+# counts did not change; the reason is the reviewer's claim, so it says what the receiver is and where it is declared.
+# queue_tripwire refuses a row whose name the function plainly binds next to `queue`, as a tripwire, not a type check.
 SET_ASIDE_BY_RECEIVER = {
     # the CPU executor's command groups, handed to cpu_submit_async, whose submit is the site; cgh is the lambda's
     # `sycl::handler & cgh` parameter at each line
@@ -1203,7 +1204,8 @@ class Code:
         joined by `.`, `->` or `::` (`q`, `engine->queue`, `this->pool_`, `ns::g_pool`), written with its whitespace
         removed; else None, which no row names, so the call counts. A call, an index, a cast, a template argument,
         a parenthesised or dereferenced operand (`foo.stream()`, `g_pools[d]`, `static_cast<T &>(g)`, `(*q)`), a
-        `*` or `&` right before the chain, and a backslash line continuation all give None."""
+        `*` or `&` right before the chain, a backslash line continuation, and a keyword joined by `::` all give
+        None."""
         code = self.code
         lo = max(0, pos - NAME_WINDOW)
         i = pos
@@ -1230,7 +1232,9 @@ class Code:
         if code[i - 1] in "\\*&":
             return None
         text = re.sub(r"\s+", "", code[i:pos])
-        return None if text[:1].isdigit() else text
+        if text[:1].isdigit() or set(re.findall(r"\w+", text)) & CHAIN_KEYWORDS:
+            return None
+        return text
 
     def enclosing(self, braces: list[int]) -> str:
         """The innermost named function around a submit, `Class::` added for a member defined in its class, and
@@ -1412,7 +1416,10 @@ def census(texts: dict[str, str], wrappers: set[str] | None = None, skipped: lis
                 # one row covers one definition: overloads, or functions of one name in two namespaces, share a key
                 definitions = {code.function_brace(braces) for _, braces, _ in held}
                 refusal = None
-                if len(definitions) > 1:
+                if code.enclosing(held[0][1]) == "?":
+                    refusal = (f"a row needs a named function, and the calls at {', '.join(lines)} have none, so they "
+                               "count (To update, e)")
+                elif len(definitions) > 1:
                     refusal = (f"the row names {len(definitions)} definitions of {code.enclosing(held[0][1])}, with "
                                f"calls at {', '.join(lines)}; a row covers one definition, so these calls count "
                                "(To update, e)")
@@ -1443,6 +1450,10 @@ def census(texts: dict[str, str], wrappers: set[str] | None = None, skipped: lis
             found.setdefault(name, []).append((code.line(pos), code.enclosing(braces), kind))
     return found
 
+
+# keywords the receiver walk can join to a chain through `::` (`return ::q.fill(p)` reads `return::q`): no expression
+CHAIN_KEYWORDS = {"return", "co_await", "co_yield", "co_return", "throw", "else", "case", "new", "delete", "sizeof",
+                  "typename", "do"}
 
 # `queue` or `queue_ptr` as a whole token: `sycl::queue`, `dpct::queue_ptr`, but not `lazy_io_queue`
 QUEUE_TOKEN = re.compile(r"\bqueue(?:_ptr)?\b")
@@ -1486,9 +1497,9 @@ def queue_tripwire(code: Code, braces: list[int], receiver: str) -> list[int]:
 
 
 def inside_counted_submit(code: Code, parens: list[int], set_aside: set[int]) -> bool:
-    """Whether the innermost submit whose parentheses hold a call is one that counts: a call there is that submit's
-    command group's (`h.memcpy(` in `q.submit([&](sycl::handler & h) { ... })`). set_aside holds the position of each
-    submit set aside by its receiver, whose job is no command group."""
+    """Whether the innermost enclosing submit of a call counts: a call there is that submit's command group's
+    (`h.memcpy(` in `q.submit([&](sycl::handler & h) { ... })`). set_aside holds the position of each submit set aside
+    by its receiver, whose job is no command group; what encloses that submit does not matter."""
     for p in reversed(parens):
         if code.callee(p) == "submit":
             dot = re.search(r"(?:->|\.)\s*submit\s*$", code.code[max(0, p - NAME_WINDOW):p])
