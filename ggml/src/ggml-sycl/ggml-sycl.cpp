@@ -20374,6 +20374,9 @@ struct ggml_sycl_ring_kv_zone_inputs {
     size_t budget_room_bytes     = 0;      // ggml_sycl_device_vram_budget_room() before the ring is charged
     bool   readmit               = false;  // the KV re-fit counted the ring's KV-zone slots as free
     ggml_sycl_runtime_pending_terms pending_terms;  // runtime_pending_bytes by summand
+    // The dense scratch published before this transaction re-planned it (Q8_1 src1 + f16 dequant, saturating). Only the
+    // ring refusal's term line reads it.
+    size_t                          dense_at_txn_start_bytes = 0;
 };
 
 // What the plan's VRAM budget leaves on `device` once the plan's VRAM (weights,
@@ -20426,8 +20429,11 @@ struct ggml_sycl_ring_refusal_runtime_view {
 // placement. The plan side is the RUNTIME requirement split the way the zone is sized from it (floor, fixed, dense
 // scratch, the ring's RUNTIME part). The plan keeps only the zone it reserved, not the terms it was sized from, so
 // those terms are read from what is published now, after the refusal restored the previous ring, and labelled so: a
-// load or context that published since then has moved them. WARN on every refusal, the probe's included, because a
-// default-verbosity run is the one that needs it.
+// load or context that published since then has moved them. On a publish the dense term has moved in any case: the
+// transaction re-planned the dense scratch at its own n_ubatch before the ring, and a refusal restores only the hold,
+// so the published dense figure is this transaction's. The dense figure published when the transaction started is
+// printed beside it. WARN on every refusal, the probe's included, because a default-verbosity run is the one that
+// needs it.
 static void ggml_sycl_log_ring_refusal_runtime_terms(int device, const ggml_sycl_ring_refusal_runtime_view & v) {
     const ggml_sycl_runtime_pending_terms   none{};
     const ggml_sycl_runtime_pending_terms & pending       = v.kv_zone ? v.kv_zone->pending_terms : none;
@@ -20446,7 +20452,7 @@ static void ggml_sycl_log_ring_refusal_runtime_terms(int device, const ggml_sycl
     const size_t state        = ggml_sycl::unified_cache_get_planned_state_term_bytes(device);
     const size_t mmq_src1     = ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(device);
     const size_t dequant_f16  = ggml_sycl::unified_cache_get_planned_dequant_f16_scratch_bytes(device);
-    const size_t dense        = mmq_src1 + dequant_f16;
+    const size_t dense        = mmq_src1 > SIZE_MAX - dequant_f16 ? SIZE_MAX : mmq_src1 + dequant_f16;
     const size_t ring         = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device);
     // The cache's own figure for the ring's KV-zone part is file-local to the cache, so it is recomputed here from the
     // published slots the way the cache composes it.
@@ -20471,9 +20477,10 @@ static void ggml_sycl_log_ring_refusal_runtime_terms(int device, const ggml_sycl
         "net=%zu ring_request=%zu (weights=%zu activation=%zu output=%zu per slot, depth=%u) admitted_slots "
         "(activation=%zu output=%zu) kv_zone_part=%zu (activation=%d output=%d headroom=%zu kv_capacity=%zu kv=%zu "
         "compute_reserve=%zu largest_block=%zu budget_room=%zu); plan, recomputed from the terms published now "
-        "(ring restored to n_ubatch=%u): answerable=%d floor=%zu requirement=%zu zone_for_requirement=%zu fixed=%zu "
-        "(pipeline=%zu control=%zu host_scatter=%zu compute=%zu state=%zu) dense=%zu (mmq_src1=%zu dequant_f16=%zu) "
-        "ring_runtime=%zu (ring=%zu kv_zone_part=%zu)\n",
+        "(ring restored to n_ubatch=%u; on a publish dense is this transaction's re-plan): answerable=%d floor=%zu "
+        "requirement=%zu zone_for_requirement=%zu fixed=%zu (pipeline=%zu control=%zu host_scatter=%zu compute=%zu "
+        "state=%zu) dense=%zu (mmq_src1=%zu dequant_f16=%zu; dense_at_txn_start=%zu) ring_runtime=%zu (ring=%zu "
+        "kv_zone_part=%zu)\n",
         device, v.n_ubatch, v.zone_bytes, v.used_bytes, v.available_bytes, pending_bytes, pending.dense_scratch_bytes,
         pending.compute_term_bytes, pending.state_term_bytes, pending.host_scatter_bytes, pending.mmid_pools_bytes,
         v.kv_zone ? 1 : 0, v.net_bytes, v.ring_request, v.weight_slot_bytes, v.activation_bytes, v.output_bytes,
@@ -20482,7 +20489,7 @@ static void ggml_sycl_log_ring_refusal_runtime_terms(int device, const ggml_sycl
         v.kv_zone ? v.kv_zone->kv_bytes : 0, a.compute_reserve_bytes, v.kv_largest_block,
         v.kv_zone ? v.kv_zone->budget_room_bytes : 0, v.restored_n_ubatch, answerable ? 1 : 0, floor_bytes, requirement,
         planned_zone, fixed, pipeline, control.bytes, host_scatter, compute, state, dense, mmq_src1, dequant_f16,
-        ring_runtime, ring, ring_kv);
+        v.kv_zone ? v.kv_zone->dense_at_txn_start_bytes : 0, ring_runtime, ring, ring_kv);
 }
 
 static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
@@ -21740,6 +21747,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         }
         dense_scratch_runtime_bytes = needed;
     }
+    // The dense scratch as published before the re-plan below replaces it with this context's, for the ring refusal's
+    // term line: a refused publish leaves the re-planned figure published.
+    size_t dense_at_txn_start_bytes = 0;
+    {
+        const size_t mmq_src1    = ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(ctx->device);
+        const size_t dequant_f16 = ggml_sycl::unified_cache_get_planned_dequant_f16_scratch_bytes(ctx->device);
+        dense_at_txn_start_bytes = mmq_src1 > SIZE_MAX - dequant_f16 ? SIZE_MAX : mmq_src1 + dequant_f16;
+    }
     ggml_sycl_dense_scratch_txn_guard dense_guard(*ctx, !probe_mode);
     if (!probe_mode && next_kv_info.n_ubatch != 0) {
         // The published plan's model re-plans its own inputs (llama.cpp-45qo) at the largest n_ubatch its live
@@ -21806,6 +21821,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // materialized it, like the pools below: conservative), so the ring leaves it that room.
     ring_kv_zone.runtime_pending_bytes += dense_scratch_runtime_bytes;
     ring_kv_zone.pending_terms.dense_scratch_bytes = dense_scratch_runtime_bytes;
+    ring_kv_zone.dense_at_txn_start_bytes          = dense_at_txn_start_bytes;
     // Each summand below is recorded by name for the ring refusal's term line. A summand read from a getter is taken
     // back out of the sum, so the record is the bytes that were added, not a second read of a value that may move.
     // The load's planned compute term (llama.cpp-p6i0) is the room the scheduler's compute buffer takes in the RUNTIME
