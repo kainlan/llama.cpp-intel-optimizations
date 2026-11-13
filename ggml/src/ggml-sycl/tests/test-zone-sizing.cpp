@@ -1767,6 +1767,74 @@ int main() {
         CHECK(ggml_sycl::zone_hold_spill_bound(1, SIZE_MAX / 2, 512, 2048) == SIZE_MAX, "an overflowing product");
     }
 
+    // The terms the hold-spill refusal prints are the ones the demand is made of.
+    {
+        const size_t MiB  = 1024 * 1024;
+        auto         plan = [](void *, uint32_t) -> size_t {
+            return 1100 * 1024 * 1024;
+        };
+        ggml_sycl::zone_hold_rung_request rungs[] = {
+            { 512, 490 * MiB }
+        };
+        ggml_sycl::zone_hold_fit_inputs in = {};
+        in.headroom_target                 = 256 * MiB;
+        in.free_before                     = 1764 * MiB;
+        in.kv_room                         = 64 * MiB;
+        in.rungs                           = rungs;
+        in.n_rungs                         = 1;
+        in.plan_of                         = plan;
+        in.ring_bytes                      = 2 * MiB;
+        ggml_sycl::zone_hold_fit_terms t   = ggml_sycl::zone_hold_fit_terms_at(in, 512);
+        CHECK(t.plan == 1100 * MiB && t.request == 490 * MiB && !t.request_credited, "plan and the uncredited request");
+        CHECK(t.kv_room == 64 * MiB && t.ring_uncovered == 2 * MiB, "the KV room and the uncovered ring");
+        CHECK(t.demand == ggml_sycl::zone_hold_fit_demand(in, 512), "the terms' demand is the fit's demand");
+        CHECK(t.demand == 1100 * MiB + 490 * MiB - 64 * MiB + 2 * MiB, "1528 MiB");
+        in.compute_room_n_ubatch = 512;
+        in.compute_room_bytes    = 2057 * MiB;
+        t                        = ggml_sycl::zone_hold_fit_terms_at(in, 512);
+        CHECK(t.request == 490 * MiB && t.request_credited, "a credited request is still named, and marked");
+        CHECK(t.demand == 1100 * MiB - 64 * MiB + 2 * MiB && t.demand == ggml_sycl::zone_hold_fit_demand(in, 512),
+              "and adds nothing");
+        t = ggml_sycl::zone_hold_fit_terms_at(in, 0);
+        CHECK(t.demand == 0 && t.plan == 0 && t.request == 0, "an unknown n_ubatch names nothing");
+    }
+
+    // The micro-batch the compute term was planned at, as each load records it: the first load's value stands while
+    // later loads agree; a load that disagrees turns the record off for good, so no rung is credited at a shape the
+    // term was not measured at.
+    {
+        using ggml_sycl::zone_compute_term_n_ubatch_read;
+        using ggml_sycl::zone_compute_term_n_ubatch_store;
+        uint32_t s = 0;
+        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "nothing recorded reads 0");
+        s = zone_compute_term_n_ubatch_store(s, 512);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 512, "0 then 512 records 512");
+        s = zone_compute_term_n_ubatch_store(s, 512);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 512, "512 then 512 keeps 512");
+        CHECK(zone_compute_term_n_ubatch_store(s, 0) == s, "a load naming no micro-batch changes nothing");
+        s = zone_compute_term_n_ubatch_store(s, 1024);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "512 then 1024 disagree: 0");
+        s = zone_compute_term_n_ubatch_store(s, 1024);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "and a later load cannot restore it");
+        s = zone_compute_term_n_ubatch_store(s, 512);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "not even with the first value");
+        CHECK(zone_compute_term_n_ubatch_store(0, UINT32_MAX) == 0,
+              "a micro-batch equal to the disagreement mark records nothing on a first load");
+        CHECK(zone_compute_term_n_ubatch_read(zone_compute_term_n_ubatch_store(512, UINT32_MAX)) == 512,
+              "and turns no record off: only a real disagreement does");
+    }
+
+    // The setter WARNs on exactly the store that turns the record off: from a shape to the mark, never from the mark
+    // again, never on a first record or a repeat.
+    {
+        using ggml_sycl::zone_compute_term_n_ubatch_turns_off;
+        CHECK(zone_compute_term_n_ubatch_turns_off(512, UINT32_MAX), "512 to the mark turns it off");
+        CHECK(!zone_compute_term_n_ubatch_turns_off(UINT32_MAX, UINT32_MAX), "the mark to the mark does not again");
+        CHECK(!zone_compute_term_n_ubatch_turns_off(0, 512), "a first record does not");
+        CHECK(!zone_compute_term_n_ubatch_turns_off(512, 512), "a repeat does not");
+        CHECK(!zone_compute_term_n_ubatch_turns_off(0, 0), "no record and no store does not");
+    }
+
     // ---- Case 24d (compute room, scoped): only the rung the plan placed sees the room. Over every record set the
     // cases above use, every rung from 32 to 8192 gets the demand the fit gave before the room existed (spill bound
     // over the plan and the rung's request, net of the KV room, plus the uncovered ring) when no rung is named, even

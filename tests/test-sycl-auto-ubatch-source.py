@@ -2945,12 +2945,12 @@ _RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q
 
 
 def _ring_term_precedes_the_printed_demand(raw_cpp: str) -> bool:
-    """The ring term is set BEFORE the fit reads the demand: the demand the refusal prints (a.demand) and the verdict
-    (zone_hold_fit) are both over `in`, so an assignment after the a.demand read would print a demand that omits the
-    ring while the verdict charges it."""
+    """The ring term is set BEFORE the fit reads the terms of its demand: the demand and terms the refusal prints
+    (a.terms, a.demand) and the verdict (zone_hold_fit) are all over `in`, so an assignment after the a.terms read would
+    print a demand and an uncovered ring that omit the ring while the verdict charges it."""
     body = _body_of(raw_cpp, _HOLD_FIT_START, _HOLD_FIT_END)
     assign = body.find(_RING_BYTES_LINE)
-    demand = body.find("a.demand = ggml_sycl::zone_hold_fit_demand(")
+    demand = body.find("a.terms = ggml_sycl::zone_hold_fit_terms_at(")
     return assign != -1 and demand != -1 and assign < demand
 
 
@@ -2971,7 +2971,7 @@ def test_the_ring_term_order_has_a_mutation_witness():
     m = re.search(_RING_ASSIGN_RE, GGML_SYCL_CPP[start:end], re.M)
     assert m, "the assignment must sit in the fit body"
     at, line = start + m.start(), m.group(0)
-    demand_re = r"^[ \t]*a\.demand\s*=\s*ggml_sycl::zone_hold_fit_demand\(in, q\.n_ubatch\);\n"
+    demand_re = r"^[ \t]*a\.terms\s*=\s*ggml_sycl::zone_hold_fit_terms_at\(in, q\.n_ubatch\);\n"
     demand = re.search(demand_re, GGML_SYCL_CPP[start:end], re.M)
     assert demand and start + demand.start() > at
     d_end = start + demand.end()
