@@ -1081,8 +1081,6 @@ struct host_zone_commit_terms {
     size_t total() const { return zones() + runtime + rounding; }
 };
 
-struct placement_plan;
-
 // Defined below the plan, with the commit terms it recomputes: the KV refresh inside placement_plan calls it.
 inline void placement_plan_rerecord_host_zone_terms(placement_plan & plan);
 
