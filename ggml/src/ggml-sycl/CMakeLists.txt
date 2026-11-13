@@ -6130,9 +6130,10 @@ endif() # static SYCL backend fixture
 
 # The positive control of test-moe-decode-q8-0-soa: the same source linked against the private backend objects, with
 # the Q8_0 SOA MUL_MAT_ID kernel's planted fault switched on (every block reads the next block's scale). It passes only
-# when the kernel announced the fault and then both dispatchers' cases failed on NMSE, in output order: prompt-vec-q
-# (its child process prints first) with the kernel launched from vec_q, then decode-base. So the test is shown to see a
-# scale read from the wrong block through each dispatcher, and a later break of either half fails the kill.
+# when the kernel announced the fault and then three cases failed on NMSE, in output order: prompt-vec-q (its child
+# process prints first) with the kernel launched from vec_q, decode-base, and decode-ids-table with the kernel on the
+# per-expert table. So the test is shown to see a scale read from the wrong block through each dispatcher and each
+# table form, and a later break of any of them fails the kill.
 # No SKIP_RETURN_CODE: a run that skips prints none of those lines and fails, never reading as a kill.
 # It loads the same planned models, so it carries the `model` label too.
 if (NOT GGML_BACKEND_DL)
@@ -6151,7 +6152,8 @@ set_target_properties(test-moe-decode-q8-0-soa-mutant-wrong-scale PROPERTIES
 string(CONCAT _q8_0_soa_mutant_regex
     "\\[MMVQ-MUTANT\\] q8_0-soa-id wrong-scale-block active.*"
     "CASE name=prompt-vec-q [^\n]* site=vec_q [^\n]*-> FAIL: nmse.*"
-    "CASE name=decode-base [^\n]*-> FAIL: nmse")
+    "CASE name=decode-base [^\n]*-> FAIL: nmse.*"
+    "CASE name=decode-ids-table [^\n]* table=ids [^\n]*-> FAIL: nmse")
 add_test(NAME test-moe-decode-q8-0-soa-mutant-wrong-scale COMMAND test-moe-decode-q8-0-soa-mutant-wrong-scale)
 set_tests_properties(test-moe-decode-q8-0-soa-mutant-wrong-scale PROPERTIES
     LABELS "sycl;moe;device;B50;mutant;model"
