@@ -2303,7 +2303,10 @@ template <int qtype> class mmvq_coalesced_kernel_name;
 template <int qtype> class mmvq_id_kernel_name;
 template <int qtype> class mmvq_soa_id_kernel_name;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-// The planted fault of a device test's mutant has its own name, so a profile or a trace never reads it as the kernel.
+// The planted fault of a device test's mutant, in the private build only. It has its own kernel type name, and its
+// launcher submits it under its own profile label (mulmat.mmvq.id_soa_q8_0_mutant_wrong_scale), so a device-side
+// tool or a profile never counts its launches as the kernel's. Its [MMVQ-TRACE] q8_0-soa-id line is shared: the
+// mutant logs the kernel's own line, so a trace cannot tell the two apart; the [MMVQ-MUTANT] line says it ran.
 template <int qtype> class mmvq_soa_id_mutant_kernel_name;
 #endif
 
@@ -6077,9 +6080,12 @@ static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl(const char *                     s
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
     const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
+    const char * profile_name = "mulmat.mmvq.id_soa_q8_0";
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     const bool wrong_scale_block = mmvq_q8_0_soa_id_mutant_wrong_scale_block();
     if (wrong_scale_block) {
+        // Its own label, so a profile never counts the planted fault's launches as the kernel's.
+        profile_name = "mulmat.mmvq.id_soa_q8_0_mutant_wrong_scale";
         static std::atomic<bool> announced{ false };
         if (!announced.exchange(true, std::memory_order_relaxed)) {
             GGML_LOG_WARN(
@@ -6090,7 +6096,7 @@ static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl(const char *                     s
 
     const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
     ggml_sycl_profile_label profile_label =
-        mmvq_profile_label(*stream, "mulmat.mmvq.id_soa_q8_0", profile_metadata.c_str(), "mulmat");
+        mmvq_profile_label(*stream, profile_name, profile_metadata.c_str(), "mulmat");
 
     sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
