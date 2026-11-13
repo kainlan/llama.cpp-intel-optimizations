@@ -426,7 +426,20 @@ def test_mmvq_moe_id_kernels_have_named_profile_labels() -> None:
         assert "ggml_sycl_profile_submit(*stream" in body, label
         assert "mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches)" in body, label
     assert mmvq.count('"mulmat.mmvq.id_soa_mxfp4_coalesced"') == 1
-    mxfp4_aos = slice_between(mmvq, "static void mul_mat_vec_mxfp4_q8_1_id_sycl", "template <bool VECTOR_QS_LOAD = false>")
+    # The Q8_0 SOA kernel's planted fault submits under its own label, and only in the private build, so a profile
+    # never counts the mutant's launches as the kernel's. The row above matches a substring, which the mutant label
+    # alone would satisfy, so the kernel's own label is checked quoted.
+    q8_0_soa = slice_between(
+        mmvq, "static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl", "static void mul_mat_vec_mxfp4_q8_1_soa_id_kernel("
+    )
+    assert q8_0_soa.count('"mulmat.mmvq.id_soa_q8_0"') == 1
+    mutant_label = '"mulmat.mmvq.id_soa_q8_0_mutant_wrong_scale"'
+    assert mmvq.count(mutant_label) == 1 and q8_0_soa.count(mutant_label) == 1, "mutant profile label"
+    before_mutant = q8_0_soa[: q8_0_soa.index(mutant_label)]
+    assert before_mutant.rfind("#if defined(GGML_SYCL_PRIVATE_TESTING)") > before_mutant.rfind("#endif"), (
+        "the mutant profile label must sit in the private build only"
+    )
+    mxfp4_aos =slice_between(mmvq, "static void mul_mat_vec_mxfp4_q8_1_id_sycl", "template <bool VECTOR_QS_LOAD = false>")
     assert "mulmat.mmvq.id_aos_mxfp4" in mxfp4_aos
     assert "ggml_sycl_profile_submit(*stream" in mxfp4_aos
     assert "mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches)" in mxfp4_aos
