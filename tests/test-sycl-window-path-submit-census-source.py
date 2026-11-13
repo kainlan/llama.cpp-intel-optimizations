@@ -26,14 +26,14 @@ A launch is profiled, and not a site, in two cases:
   `static_cast<F &&>(f)`, `std::forward<F>(f)`), or as the whole argument of a `submit(` inside the call's arguments,
   a lambda body included (mmq_submit). A forward anywhere else (a label, a log call) makes nothing a wrapper. Found
   from the source and closed transitively, whatever the name.
-- Recorded: its returned event reaches `ggml_sycl_kernel_profile_record_event` or
-  `ggml_sycl_profile_record_returned_event` on every path from it, by lexical data flow only (Code.recorded): the
-  launch is the record call's argument, or it is assigned to a plain local `ev` and a later record call in the same
-  function or lambda body is handed `ev` (or `std::move(ev)`) as its event. Refused when a loop around the launch,
-  braced or not, does not hold the record call; when the record call sits in an `else` arm the launch is not in; or
-  when `ev` is assigned or declared in between where it would reach the record call. A record call elsewhere in the
-  function excuses nothing else; test_the_record_rule_excuses_exactly_the_known_launches_of_the_tree pins what it
-  excuses on the tree.
+- Recorded: its function is a row of RECORDED_ON_THE_PATH, and the launch is lexically followed in the same
+  function body by a call to `ggml_sycl_kernel_profile_record_event` or `ggml_sycl_profile_record_returned_event`
+  that receives its event (Code.recorded): the launch is that call's argument, or it is assigned to a plain local
+  `ev` that a later record call is handed (or `std::move(ev)`) as its event. A record call under a condition (the
+  profiler being on) is accepted. The rule does not follow paths; the table row is what vouches for them, so a launch
+  in a function with no row is reported whatever the code around it looks like, and a row excuses only when the rule
+  matches exactly its count of launches in that function (a new launch, or a stale row, fails). Adding a row is the
+  reviewed act: read the function and confirm the event each record call receives is that launch's event first.
 Comments, string and character literals are blanked first, so a launch named in prose is not counted. The #elif and
 #else branches of a conditional are blanked only when they hold no call of either class, so that braces opened in
 both branches count once; a branch holding a launch is kept whatever its condition, a dead one included (its entry
@@ -682,7 +682,7 @@ SHORTCUT = re.compile(
 QUEUE_TYPES = {"sycl::queue", "queue", "queue_ptr", "dpct::queue_ptr"}
 HANDLER_TYPES = {"sycl::handler", "handler"}
 NOT_A_TYPE = {"return", "else", "case", "new", "delete", "throw", "goto", "sizeof", "co_return", "using", "typedef",
-              "operator", "const", "static", "inline", "constexpr", "auto"}
+              "operator", "const", "static", "inline", "constexpr", "auto", "do"}
 
 # A comment, a raw string, a string or a character literal. Each is blanked to spaces with its newlines kept, so
 # offsets and line numbers survive and nothing inside one is read as code, a parenthesis included.
@@ -952,13 +952,53 @@ class Code:
         return m.group(1), start
 
     def under_braceless_loop(self, start: int) -> bool:
-        """The statement starting at start is the body of a `for (...)`, `while (...)` or `do` with no braces."""
-        lo = max(0, start - 2000)
-        head = self.code[lo:start].rstrip()
-        if re.search(r"\bdo$", head):
-            return True
-        open_ = self.paren_open.get(lo + len(head) - 1) if head.endswith(")") else None
-        return open_ is not None and self.callee(open_) in ("for", "while")
+        """The statement starting at start is, through brace-less control prefixes only, the body of a `for (...)`,
+        `while (...)` or `do`: walking back over `if (...)` heads and `else` (with the statement its `if` controls),
+        to the previous `;`, `{` or `}`, meets a loop head."""
+        end = start
+        while True:
+            lo = max(0, end - 2000)  # a window, not the whole file: this runs for every assigned launch
+            head = self.code[lo:end].rstrip()
+            if re.search(r"\bdo$", head):
+                return True
+            other = re.search(r"\belse$", head)
+            if other:
+                end = self.controlled_statement_head(lo + other.start())
+                if end is None:
+                    return False
+                continue
+            open_ = self.paren_open.get(lo + len(head) - 1) if head.endswith(")") else None
+            word = self.callee(open_) if open_ is not None else None
+            if word in ("for", "while"):
+                return True
+            if word != "if":
+                return False
+            keyword_lo = max(0, open_ - 300)
+            end = keyword_lo + re.search(r"\bif\s*$", self.code[keyword_lo:open_]).start()
+
+    def controlled_statement_head(self, else_pos: int) -> int | None:
+        """For the `else` at else_pos: the end of the `if (...)` head whose statement it follows, or None when that
+        statement is not found behind a control head."""
+        i = else_pos - 1
+        while i >= 0 and self.code[i].isspace():
+            i -= 1
+        if i >= 0 and self.code[i] == "}":
+            opens = [b for b, c in self.brace_close.items() if c == i]
+            if not opens:
+                return None
+            return opens[0]
+        i -= 1  # past the statement's ';'
+        while i >= 0:
+            c = self.code[i]
+            if c == ")" and i in self.paren_open:
+                if self.callee(self.paren_open[i]) in ("if", "for", "while"):
+                    return i + 1
+                i = self.paren_open[i] - 1
+                continue
+            if c in ";{}":
+                return None
+            i -= 1
+        return None
 
     def writes(self, name: str, lo: int, hi: int) -> list[int]:
         """Positions in [lo, hi) where name is assigned (`name =`) or declared (`T name`, `T & name = ...`)."""
@@ -971,16 +1011,18 @@ class Code:
         return [lo + p for p in found]
 
     def recorded(self, pos: int, parens: list[int], braces: list[int]) -> bool:
-        """The launch at pos is profiled by a record call (RECORDERS) on every path from it, by lexical data flow:
+        """The launch at pos is lexically followed, in the same function or lambda body, by a record call (RECORDERS)
+        that receives its event. This is a candidate only: census excuses it only for a function that is a row of
+        RECORDED_ON_THE_PATH with a matching count, because the rule does not follow paths and the row vouches for them.
         - its event is the record call's argument, the launch not inside a lambda written in that call; or
         - it is assigned to a plain name `ev` (`ev = <launch>`, a declaration included) and a later record call in the
-          same function or lambda body is handed `ev`, or `std::move(ev)`, as its event (second) argument; unless
+          same body is handed `ev`, or `std::move(ev)`, as its event (second) argument; a record call under a
+          condition (the profiler being on) is accepted; unless
+          - the assignment is the body of a loop with no braces, through any brace-less `if` / `else` heads;
           - a loop around the launch, braced or not, does not also hold the record call;
-          - the outermost block that holds the record call but not the launch is an `else` / `else if` arm (the launch
-            is then in another arm of the same choice, or before it, and is conservatively refused either way);
+          - the outermost block that holds the record call but not the launch is an `else` / `else if` arm;
           - `ev` is assigned or declared between them in the launch's block, a block around it, or a block that holds
-            the record call (a shadowing declaration included).
-        A record call elsewhere in the function excuses nothing else."""
+            the record call (a shadowing declaration included)."""
         if parens and self.callee(parens[-1]) in RECORDERS and not any(b > parens[-1] for b in braces):
             return True
         target = self.assigned_event(pos)
@@ -1201,27 +1243,39 @@ def receiver_kind(code: Code, pos: int, braces: list[int], file_text: str, decl_
 
 
 def census(texts: dict[str, str], wrappers: set[str] | None = None, decl_texts: dict[str, str] | None = None,
-           skipped: list[str] | None = None,
-           recorded: list[str] | None = None) -> dict[str, list[tuple[int, str, str]]]:
+           skipped: list[str] | None = None, recorded: list[str] | None = None,
+           table: dict[str, int] | None = None) -> dict[str, list[tuple[int, str, str]]]:
     """The raw sites of each named text, as (line, function, kind) triples. A site is wrapped when any '(' still open
-    at it, however far back and however deeply nested, is the argument list of a wrapper call. A shortcut is a site
-    only when its receiver is a queue and it is not inside a submit's parentheses (there it is the command group's
-    handler call, and the submit is the site); each shortcut set aside is appended to skipped with its reason."""
+    at it, however far back and however deeply nested, is the argument list of a wrapper call. A launch the record
+    rule matches (Code.recorded) is excused only when its "file:function" is a row of table (RECORDED_ON_THE_PATH by
+    default) and the rule matches exactly that many launches in the function; each one excused is appended to
+    recorded. A shortcut is a site only when its receiver is a queue and it is not inside a submit's parentheses
+    (there it is the command group's handler call, and the submit is the site); each shortcut set aside is appended to
+    skipped with its reason."""
     if wrappers is None:
         wrappers = derive_wrappers(texts)
     if decl_texts is None:
         decl_texts = texts
+    if table is None:
+        table = RECORDED_ON_THE_PATH
     found: dict[str, list[tuple[int, str, str]]] = {}
     for name, src in texts.items():
         code = parse(src)
+        unwrapped = []
+        matched: dict[str, int] = {}
         for pos, kind, method, parens, braces in code.sites:
-            callees = [code.callee(p) for p in parens]
-            if any(c in wrappers for c in callees):
+            if any(code.callee(p) in wrappers for p in parens):
                 continue
-            if code.recorded(pos, parens, braces):
+            key = f"{name}:{code.enclosing(braces)}" if code.recorded(pos, parens, braces) else None
+            if key is not None:
+                matched[key] = matched.get(key, 0) + 1
+            unwrapped.append((pos, kind, method, parens, braces, key))
+        for pos, kind, method, parens, braces, key in unwrapped:
+            if key is not None and table.get(key) == matched[key]:
                 if recorded is not None:
-                    recorded.append(f"{name}:{code.enclosing(braces)}")
+                    recorded.append(key)
                 continue
+            callees = [code.callee(p) for p in parens]
             if kind == "shortcut":
                 why = None
                 if "submit" in callees:
@@ -1295,8 +1349,8 @@ def raw_functions(src: str, wrappers: set[str] | None = None) -> list[str]:
     return [func for _, func, _ in census({"x.cpp": src}, wrappers).get("x.cpp", [])]
 
 
-def raw_sites(src: str, skipped: list[str] | None = None) -> list[tuple[str, str]]:
-    return [(func, kind) for _, func, kind in census({"x.cpp": src}, skipped=skipped).get("x.cpp", [])]
+def raw_sites(src: str, skipped: list[str] | None = None, table: dict[str, int] | None = None) -> list[tuple[str, str]]:
+    return [(func, kind) for _, func, kind in census({"x.cpp": src}, skipped=skipped, table=table).get("x.cpp", [])]
 
 
 def plan_window_detector_says_wrapped(src: str) -> bool:
