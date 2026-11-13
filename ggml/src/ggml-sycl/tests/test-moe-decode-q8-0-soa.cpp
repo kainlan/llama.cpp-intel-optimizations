@@ -17,6 +17,13 @@
 // "[MMVQ-TRACE] q8_0-soa-id site=<batched|vec_q>" line per launch. Each case counts the lines its compute logged for
 // the tensor, prints site= on its CASE line, and fails unless the site is the one the case names.
 //
+// A pass must also say which pointer table the kernel read. The kernel takes two: a compact table, one entry per
+// (id, token) slot, with no ids; or a table with one entry per expert, read at the slot's expert id. Each trace line
+// names its table (table=compact or table=ids); each case counts both, prints table= on its CASE line, and fails
+// unless the table is the one the case names. Every case below wants the compact table: with every expert and the ids
+// on the card, decode takes the direct route, which compacts its table, and vec_q compacts the table it uploads for
+// the prompt's admitted batch.
+//
 // The decode cases (one token) all reach the batched dispatch. ggml_sycl_mul_mat_id calls vec_q only from its MMVQ
 // layout probes, which run for a prompt alone.
 //   * decode-base: k 256, m 128, 8 experts, 4 used, one activation row per used expert (the down projection's form);
@@ -85,13 +92,14 @@ struct decode_case {
     int          ne11;    // activation rows per token: `used` (one per selected expert) or 1 (broadcast to each)
     int          tokens;  // 1 is decode; more is a prompt
     const char * site;    // the dispatcher that must launch the SOA kernel: "batched" or "vec_q"
+    const char * table;   // the pointer table the kernel must read: "compact" (per slot) or "ids" (per expert)
     int32_t      ids[k_max_used * k_max_tokens];  // `used` ids per token, token after token
 };
 
 constexpr decode_case k_cases[] = {
-    { "decode-base",        256, 128, 4, 4, 1, "batched", { 5, 0, 3, 6 } },
-    { "decode-tail-rows",   384, 94,  4, 1, 1, "batched", { 7, 2, 4, 1 } },
-    { "decode-last-expert", 256, 128, 1, 1, 1, "batched", { 7 }          },
+    { "decode-base",        256, 128, 4, 4, 1, "batched", "compact", { 5, 0, 3, 6 } },
+    { "decode-tail-rows",   384, 94,  4, 1, 1, "batched", "compact", { 7, 2, 4, 1 } },
+    { "decode-last-expert", 256, 128, 1, 1, 1, "batched", "compact", { 7 }          },
 };
 
 // Runs in a child process (run_prompt_child) under GGML_SYCL_MOE_PP_ONEDNN_F16=0, which is how vec_q is reached, not a
@@ -99,7 +107,7 @@ constexpr decode_case k_cases[] = {
 // SOA experts before the MMVQ probes run, so only a user who turns that executor off reaches vec_q, as this case does.
 // Every expert is used by some token, expert 7 by two.
 constexpr decode_case k_prompt_case = {
-    "prompt-vec-q", 256, 128, 4, 4, 4, "vec_q", { 5, 0, 3, 6, 7, 2, 4, 1, 1, 6, 0, 7, 3, 5, 2, 4 }
+    "prompt-vec-q", 256, 128, 4, 4, 4, "vec_q", "compact", { 5, 0, 3, 6, 7, 2, 4, 1, 1, 6, 0, 7, 3, 5, 2, 4 }
 };
 constexpr int k_n_cases = int(sizeof(k_cases) / sizeof(k_cases[0])) + 1;
 
@@ -437,16 +445,16 @@ double max_abs_diff(const std::vector<float> & ref, const std::vector<float> & g
     return largest;
 }
 
-// The dispatcher the SYCL compute launched the SOA kernel from, by the launcher's trace lines for the tensor that
-// compute logged: one site, "both", or "none".
-const char * launch_site(size_t batched, size_t vec_q) {
-    if (batched != 0 && vec_q != 0) {
+// Which of two values a trace field took over the launcher's lines for the tensor that the SYCL compute logged, given
+// how many lines carried each: one value, "both", or "none".
+const char * traced_value(const char * a, size_t a_lines, const char * b, size_t b_lines) {
+    if (a_lines != 0 && b_lines != 0) {
         return "both";
     }
-    if (batched != 0) {
-        return "batched";
+    if (a_lines != 0) {
+        return a;
     }
-    return vec_q != 0 ? "vec_q" : "none";
+    return b_lines != 0 ? b : "none";
 }
 
 // Runs one case on its own freshly loaded model and prints its CASE line. Returns true when it passed. The layout
@@ -489,7 +497,12 @@ bool run_case(ggml_backend_t cpu, const decode_case & c, std::mt19937 & rng) {
         g_log.count_since(run_from, { "[MMVQ-TRACE] q8_0-soa-id site=batched ", tensor_needle.c_str() });
     const size_t site_vec_q =
         g_log.count_since(run_from, { "[MMVQ-TRACE] q8_0-soa-id site=vec_q ", tensor_needle.c_str() });
-    const char * site = launch_site(site_batched, site_vec_q);
+    const char * site = traced_value("batched", site_batched, "vec_q", site_vec_q);
+    const size_t table_compact =
+        g_log.count_since(run_from, { "[MMVQ-TRACE] q8_0-soa-id ", " table=compact ", tensor_needle.c_str() });
+    const size_t table_ids =
+        g_log.count_since(run_from, { "[MMVQ-TRACE] q8_0-soa-id ", " table=ids ", tensor_needle.c_str() });
+    const char * table = traced_value("compact", table_compact, "ids", table_ids);
 
     std::string why;
     if (!computed) {
@@ -514,15 +527,20 @@ bool run_case(ggml_backend_t cpu, const decode_case & c, std::mt19937 & rng) {
     if (std::strcmp(site, c.site) != 0) {
         why += " site";
     }
+    if (std::strcmp(table, c.table) != 0) {
+        why += " table";
+    }
     // The executor switch this process ran under, as the backend read it: the prompt case's child sets it to 0.
     const char * pp_onednn_f16 = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16");
     std::fprintf(stderr,
                  "CASE name=%s in=%d out=%d experts=%d used=%d ne11=%d tokens=%d pp_onednn_f16=%s status=%d "
                  "nmse=%.3e max_diff=%.4f soa_layout_lines=%zu layout_lines=%zu decode_refusal=%zu prompt_refusal=%zu "
-                 "fallback_failed=%zu site=%s want_site=%s site_batched=%zu site_vec_q=%zu -> %s%s\n",
+                 "fallback_failed=%zu site=%s want_site=%s site_batched=%zu site_vec_q=%zu table=%s want_table=%s "
+                 "table_compact=%zu table_ids=%zu -> %s%s\n",
                  c.name, c.in, c.out, k_experts, c.used, c.ne11, c.tokens, pp_onednn_f16 ? pp_onednn_f16 : "unset",
                  static_cast<int>(status), err, diff, layout_soa, layout_all, decode_rf, prompt_rf, fallback, site,
-                 c.site, site_batched, site_vec_q, why.empty() ? "PASS" : "FAIL:", why.c_str());
+                 c.site, site_batched, site_vec_q, table, c.table, table_compact, table_ids,
+                 why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
 }
 
