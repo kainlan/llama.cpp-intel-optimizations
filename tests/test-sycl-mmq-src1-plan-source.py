@@ -1139,7 +1139,8 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
         re.search(r"^\{\s*rung_fit_refused\s*=\s*false\s*;", try_fn) is not None and \
         len(re.findall(r"rung_fit_refused\s*=\s*true\s*;", try_fn)) == 2 and \
         re.search(r"rung_fit_refused\s*=\s*dynamic_cast<const\s+llama_auto_ubatch_fit_refusal\s*\*>\(\s*&e\s*\)\s*!=\s*nullptr\s*;\s*return \"compute buffers did not fit\"\s*;", try_fn) is not None and \
-        re.search(r"if\s*\(\s*!probe\.accepted\s*\)\s*\{\s*rung_fit_refused\s*=\s*true\s*;\s*return \"transaction refused\"\s*;", try_fn) is not None and \
+        re.search(r"case\s+llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT\s*:\s*rung_fit_refused\s*=\s*true\s*;\s*return \"transaction refused\"\s*;", try_fn) is not None and \
+        re.search(r"rc\s*==\s*GGML_SYCL_LIFECYCLE_PLAN_REJECTED\s*,\s*probe\.accepted\s*\)", try_fn) is not None and \
         re.search(r"rung_fit_refused\s*=\s*true\s*;\s*return \"hold spill left no headroom\"\s*;", try_fn) is not None
     results["the trial state starts at nothing-happened and every rung asked is named in tried"] = \
         all(re.search(pat, select_fn) is not None for pat in (
@@ -2116,7 +2117,7 @@ if args.self_test:
                 new_ctx=mutate_re_in_func(context_src, r"if \(last_good == 0 && ladder_needed && fallback_tried && rung_fit_refused\)", r"note_loss\(\s*c\s*,\s*rung_reason\s*\)\s*;", "(void) 0;")),
         ctx_mut("fit flag never cleared per rung", FLAG, new_ctx=re.sub(r"(auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{\s*)rung_fit_refused\s*=\s*false\s*;", r"\1", context_src, count=1)),
         ctx_mut("a lifecycle failure is a fit refusal", FLAG,
-                new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"if\s*\(\s*rc\s*!=\s*GGML_SYCL_LIFECYCLE_OK\s*\)\s*\{", "if (rc != GGML_SYCL_LIFECYCLE_OK) { rung_fit_refused = true;")),
+                new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"case\s+llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE\s*:", "case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE: rung_fit_refused = true;")),
         ctx_mut("a demoted KV is a fit refusal", FLAG,
                 new_ctx=context_src.replace('return "KV would be demoted";', 'rung_fit_refused = true; return "KV would be demoted";', 1)),
         ctx_mut("a host fallback is a fit refusal", FLAG,
@@ -2124,7 +2125,9 @@ if args.self_test:
         ctx_mut("a publish that threw is a fit refusal", FLAG,
                 new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"publish_dirty\s*=\s*true\s*;\s*return \"transaction refused\"\s*;", 'publish_dirty = true; rung_fit_refused = true; return "transaction refused";')),
         ctx_mut("a probe refusal is not a fit refusal", FLAG,
-                new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"if\s*\(\s*!probe\.accepted\s*\)\s*\{\s*rung_fit_refused\s*=\s*true\s*;", "if (!probe.accepted) {")),
+                new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"case\s+llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT\s*:\s*rung_fit_refused\s*=\s*true\s*;", "case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT:")),
+        ctx_mut("a rejected plan is not a fit refusal", FLAG,
+                new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"rc\s*==\s*GGML_SYCL_LIFECYCLE_PLAN_REJECTED\s*,\s*probe\.accepted", "false, probe.accepted")),
         ctx_mut("a compute buffer that did not fit is not a fit refusal", FLAG,
                 new_ctx=re.sub(r"rung_fit_refused\s*=\s*dynamic_cast<const\s+llama_auto_ubatch_fit_refusal\s*\*>\(\s*&e\s*\)\s*!=\s*nullptr\s*;\s*return \"compute buffers did not fit\"", 'return "compute buffers did not fit"', context_src, count=1)),
         ctx_mut("every reserve exception is a fit refusal", FLAG,

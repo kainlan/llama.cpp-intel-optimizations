@@ -590,8 +590,14 @@ def test_probe_busy_is_not_retried():
     assert "sleep_for" not in LLAMA_CONTEXT_CPP_CODE
     body_norm = _normalize_ws(_try_candidate_body())
     assert not re.search(r"for\s*\(\s*int\s+wait\b", body_norm), "the probe is not retried"
+    # The probe's result is read through llama_auto_ubatch_probe_classify(): BUSY is its rc_busy argument, and the
+    # BUSY outcome returns "transaction busy" directly.
+    assert re.search(r"llama_auto_ubatch_probe_classify\([^;]*rc\s*==\s*GGML_SYCL_LIFECYCLE_BUSY\s*,", body_norm), (
+        "the probe's BUSY result must reach the classifier as its busy flag"
+    )
     assert re.search(
-        r'if\s*\(\s*rc\s*==\s*GGML_SYCL_LIFECYCLE_BUSY\s*\)\s*\{\s*return\s*"transaction busy"\s*;\s*\}', body_norm
+        r'case\s+llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_BUSY\s*:\s*return\s*"transaction busy"\s*;',
+        body_norm,
     ), 'a BUSY probe must return "transaction busy" directly'
 
 
@@ -612,7 +618,10 @@ def test_stale_identity_branches_to_not_the_published_model():
     `stop = reason;`)."""
     body_norm = _normalize_ws(_try_candidate_body())
     assert re.search(
-        r'rc\s*==\s*GGML_SYCL_LIFECYCLE_STALE_IDENTITY\s*\)\s*\{\s*return\s*"not the published model"\s*;\s*\}',
+        r"llama_auto_ubatch_probe_classify\([^;]*rc\s*==\s*GGML_SYCL_LIFECYCLE_STALE_IDENTITY\s*,", body_norm
+    ), "the probe's STALE_IDENTITY result must reach the classifier as its stale flag"
+    assert re.search(
+        r'case\s+llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_STALE\s*:\s*return\s*"not the published model"\s*;',
         body_norm,
     ), 'GGML_SYCL_LIFECYCLE_STALE_IDENTITY must return "not the published model"'
 
@@ -2672,15 +2681,27 @@ def _fit_flag_is_set_only_on_fit_refusals(tc: str) -> bool:
         tc,
     ):
         return False
-    # the probe's own refusal is a fit refusal only when the probe ran and said no
-    if not re.search(r"if \(!probe\.accepted\) \{ rung_fit_refused = true; return \"transaction refused\"; \}", tc):
+    # the probe's refusal is a fit refusal exactly on the classifier's FIT outcome: a plan the transaction refused,
+    # reported as PLAN_REJECTED or as OK with accepted == false
+    if not re.search(
+        r"case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT: rung_fit_refused = true; "
+        r"return \"transaction refused\";",
+        tc,
+    ):
+        return False
+    if "rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, probe.accepted" not in tc:
         return False
     for reason in nonfit:
         at = tc.find(f'return "{reason}";')
         if at == -1 or "rung_fit_refused = true;" in tc[max(0, at - 60) : at]:
             return False
     # the lifecycle failure and the publish throw keep their stop reason and stay non-fit
-    return 'rc != GGML_SYCL_LIFECYCLE_OK' in tc and 'publish_dirty = true; return "transaction refused";' in tc
+    lifecycle = 'case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE: return "transaction refused";'
+    return (
+        "llama_auto_ubatch_probe_classify(rc == GGML_SYCL_LIFECYCLE_OK," in tc
+        and lifecycle in tc
+        and 'publish_dirty = true; return "transaction refused";' in tc
+    )
 
 
 def test_the_fit_flag_is_set_only_by_real_fit_refusals():
@@ -2694,6 +2715,15 @@ def test_the_fit_flag_is_set_only_by_real_fit_refusals():
         ('                return "compute buffer fell back to host";',
          '                rung_fit_refused = true;\n                return "compute buffer fell back to host";'),
         ('            return "transaction busy";', '            rung_fit_refused = true;\n            return "transaction busy";'),
+        ('                    return "not the published model";',
+         '                    rung_fit_refused = true;\n                    return "not the published model";'),
+        ('case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE:\n                    return "transaction refused";',
+         'case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE:\n'
+         '                    rung_fit_refused = true;\n                    return "transaction refused";'),
+        ('case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT:\n                    rung_fit_refused = true;',
+         'case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT:'),
+        ('rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, probe.accepted', 'false, probe.accepted'),
+        ('rc == GGML_SYCL_LIFECYCLE_OK, rc == GGML_SYCL_LIFECYCLE_BUSY', 'true, rc == GGML_SYCL_LIFECYCLE_BUSY'),
         ('            publish_dirty           = true;\n            return "transaction refused";',
          '            publish_dirty           = true;\n            rung_fit_refused = true;\n            return "transaction refused";'),
         ('            return "hold spill left no headroom" ;', ''),

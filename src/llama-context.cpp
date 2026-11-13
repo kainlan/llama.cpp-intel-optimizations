@@ -2630,21 +2630,24 @@ void llama_context::sycl_select_auto_ubatch() {
             const auto rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.kv_unified,
                                      cparams.swa_full, cparams.flash_attn, &probe);
 
-            // BUSY is the module-admission refusal, not lock contention, so
-            // the probe is not retried: the candidate simply loses.
-            if (rc == GGML_SYCL_LIFECYCLE_BUSY) {
-                return "transaction busy";
-            }
-            if (rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY) {
-                return "not the published model";
-            }
-            if (rc != GGML_SYCL_LIFECYCLE_OK) {
-                return "transaction refused";
-            }
-            // The probe ran and said no: the candidate does not fit (a lifecycle failure above is no such verdict).
-            if (!probe.accepted) {
-                rung_fit_refused = true;
-                return "transaction refused";
+            // BUSY is the module-admission refusal, not lock contention, so the probe is not retried: the
+            // candidate simply loses. A plan the transaction refused, reported as PLAN_REJECTED or as OK with
+            // accepted == false, is the probe's verdict that the rung does not fit; any other lifecycle result is
+            // no such verdict.
+            switch (llama_auto_ubatch_probe_classify(rc == GGML_SYCL_LIFECYCLE_OK, rc == GGML_SYCL_LIFECYCLE_BUSY,
+                                                     rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY,
+                                                     rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, probe.accepted)) {
+                case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_BUSY:
+                    return "transaction busy";
+                case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_STALE:
+                    return "not the published model";
+                case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE:
+                    return "transaction refused";
+                case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT:
+                    rung_fit_refused = true;
+                    return "transaction refused";
+                case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_ACCEPTED:
+                    break;
             }
             if (probe.would_demote_kv) {
                 return "KV would be demoted";
