@@ -87,7 +87,255 @@ FILES = [
 ]
 
 # "file:function" -> (raw submits in it, why they are not wrapped yet). A named lambda is `function/lambda`.
-ALLOW: dict[str, tuple[int, str]] = {}
+ALLOW: dict[str, tuple[int, str]] = {
+    "common.hpp:ggml_sycl_submit_marker": (1, "empty ordering marker on every caller's behalf; no work time"),
+    "convert.cpp:dequantize_row_iq1_m_sycl":
+        (1, "dequant helper; the window executor wraps its call (dequant_expert_f16), other callers do not"),
+    "convert.cpp:dequantize_row_iq1_s_sycl":
+        (1, "dequant helper; the window executor wraps its call (dequant_expert_f16), other callers do not"),
+    "convert.cpp:dequantize_row_iq2_s_sycl":
+        (1, "dequant helper; the window executor wraps its call (dequant_expert_f16), other callers do not"),
+    "convert.cpp:dequantize_row_iq2_xs_sycl":
+        (1, "dequant helper; the window executor wraps its call (dequant_expert_f16), other callers do not"),
+    "convert.cpp:dequantize_row_iq2_xxs_sycl":
+        (1, "dequant helper; the window executor wraps its call (dequant_expert_f16), other callers do not"),
+    "convert.cpp:dequantize_row_iq3_s_sycl":
+        (1, "dequant helper; the window executor wraps its call (dequant_expert_f16), other callers do not"),
+    "convert.cpp:dequantize_row_iq3_xxs_sycl":
+        (1, "dequant helper; the window executor wraps its call (dequant_expert_f16), other callers do not"),
+    "convert.cpp:dequantize_row_iq4_nl_sycl":
+        (1, "dequant helper; the window executor wraps its call (dequant_expert_f16), other callers do not"),
+    "convert.cpp:dequantize_row_iq4_xs_sycl":
+        (1, "dequant helper; the window executor wraps its call (dequant_expert_f16), other callers do not"),
+    "convert.cpp:dequantize_row_q4_K_sycl":
+        (1, "dequant helper; the window executor wraps its call (dequant_expert_f16), other callers do not"),
+    "convert.cpp:dequantize_row_q4_K_sycl_reorder":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "convert.cpp:reorder_mxfp4_aos_to_coalesced_sycl":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "convert.cpp:reorder_q4_0_aos_to_coalesced_sycl":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "convert.cpp:reorder_q6_k_aos_to_coalesced_sycl":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "convert.cpp:reorder_q8_0_aos_to_coalesced_sycl":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "cumsum.cpp:ggml_sycl_op_cumsum": (1, "not yet wrapped"),
+    "fattn.cpp:ggml_sycl_fattn_xmx_materialize_packed_k":
+        (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
+    "fattn.cpp:ggml_sycl_fattn_xmx_submit_set_rows_update":
+        (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
+    "fattn-mma.hpp:launch_fattn_mma": (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
+    "fattn-tile-f16.hpp:launch_fattn_tile_f16": (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
+    "fattn-v2-partition.hpp:launch_paged_attention_v2":
+        (2, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
+    "fattn-vec-f16.hpp:launch_fattn_vec_f16": (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
+    "fattn-vec.hpp:launch_fattn_vec": (1, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
+    "fattn-xmx-f16-v2.hpp:launch_fattn_xmx_v2_decode_gqa_split_leaf":
+        (2, "attention kernel, not yet wrapped; fattn.cpp picks it per shape"),
+    "ggml-sycl.cpp:argmax_f32_i32_sycl": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:argsort_f32_i32_sycl": (2, "not yet wrapped"),
+    "ggml-sycl.cpp:dispatch_experts_secondary_gpu_impl": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_add_f32": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_copy_ids_to_host": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_dispatch_host_flash_attn_async": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_dispatch_host_flash_attn_sync": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_moe_down_weighted_sum_sycl": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_mul_mat_batched_sycl": (2, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_mul_mat_id": (4, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_mul_mat_id/copy_src1_current_f32": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_mul_mat_tp_row_parallel_post": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_router_f32_bias_argsort_sycl": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_submit_moe_gather_activation_rows": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_submit_moe_scatter_rows": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_submit_mul_mat_unpin_event": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_submit_q8_1_soa_repeat": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_submit_q8_1_soa_selected": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_submit_queue_sync_event": (2, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_submit_secondary_moe_glu": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_submit_secondary_moe_weighted_reduce": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_update_moe_ptr_table": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:ggml_sycl_upload_moe_transient_ptr_table": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:moe_cpu_job_join_on_queue": (1, "not yet wrapped"),
+    "ggml-sycl.cpp:reorder_mxfp4_gpu": (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "ggml-sycl.cpp:reorder_q4_0_gpu": (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "ggml-sycl.cpp:reorder_q4_k_gpu": (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "ggml-sycl.cpp:reorder_q6_k_gpu": (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "ggml-sycl.cpp:reorder_q8_0_gpu": (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "ggml-sycl.cpp:sycl_reorder_parallel_for":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "ggml-sycl.cpp:test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing":
+        (1, "test or benchmark entry point; graph compute does not call it"),
+    "ggml-sycl.cpp:try_xmx_sorted_moe": (3, "not yet wrapped"),
+    "mem-ops.cpp:mem_copy_ptr_async": (1, "not yet wrapped"),
+    "mem-ops.cpp:mem_fill_direct_submit": (1, "not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q2_K_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q3_K_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q4_0_q8_1_xmx_colfused_4tile_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q4_0_q8_1_xmx_colfused_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q4_0_q8_1_xmx_largetile_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q4_0_q8_1_xmx_multitile_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q4_0_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q4_1_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q4_K_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q5_0_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q5_1_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q5_K_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q6_K_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q8_0_q8_1_xmx_largetile_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:ggml_mul_mat_q8_0_q8_1_xmx_sycl": (1, "MMQ XMX kernel, not yet wrapped"),
+    "mmq_xmx.cpp:xmx_test_kernel": (1, "test or benchmark entry point; graph compute does not call it"),
+    "mmvq.cpp:coalesced_mul_mat_vec_mxfp4_q8_1_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:convert_mxfp4_to_coalesced_sycl":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "mmvq.cpp:convert_q4_0_to_coalesced_sycl":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "mmvq.cpp:convert_q6_k_to_coalesced_sycl":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "mmvq.cpp:convert_q8_0_to_coalesced_sycl":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "mmvq.cpp:ggml_sycl_build_moe_compact_list":
+        (2, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mmvq_submit_aos_impl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mmvq_submit_mxfp4_soa": (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mmvq_submit_q4_0_soa":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mmvq_submit_q6_k_soa":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mmvq_submit_quantize_q8_1_aos_after":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mmvq_submit_quantize_q8_1_soa":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_iq1_m_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_iq1_s_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_iq2_s_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_iq2_xs_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_iq2_xxs_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_iq3_s_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_iq3_xxs_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_iq4_nl_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_iq4_xs_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_mxfp4_q8_1_sycl": (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mul_mat_vec_q2_0_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_q2_K_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_q3_K_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_q4_1_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_q4_K_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_q5_0_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_q5_1_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_q5_K_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mul_mat_vec_q6_K_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "mmvq.cpp:mxfp4_build_grouped_metadata_from_ids_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_down_sum_direct_final_zero_dst_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_down_sum_i8_direct_final_rank_parallel_atomic_q8_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_down_sum_i8_direct_final_rank_parallel_scratch_q8_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_down_sum_i8_direct_final_rank_parallel_scratch_reduce_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_dpas_down_single_col_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_dpas_i8_rowmajor_single_col_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_i8_grouped_direct_q8_m2_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_i8_grouped_direct_q8_m4_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_i8_grouped_direct_q8_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_i8_grouped_packed_q8_m4_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_moe_gateup_prepack_selected_rows_submit":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_gateup_prepack_dpas_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_multirhs_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_singlecol_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_soa_dpas_m4_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_split_q8_submit/submit_glu_q8":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_split_submit/submit_glu":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_xmx_tiled_dpas_direct_q8_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_xmx_tiled_dpas_m2_direct_q8_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_xmx_tiled_dpas_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_m2_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_m4_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_xmx_tiled_grouped_direct_q8_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_xmx_tiled_grouped_packed_q8_m2_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_pair_glu_xmx_tiled_v2_dpas_m2_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_xmx_tiled_grouped_direct_q8_m2_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_xmx_tiled_grouped_direct_q8_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:mxfp4_xmx_tiled_grouped_weighted_q8_m2_sycl":
+        (1, "MXFP4 kernel, not yet wrapped; the target packs hold no MXFP4 tensor"),
+    "mmvq.cpp:reorder_mul_mat_vec_mxfp4_i8_q8_1_id_sycl_rows/submit_mmv":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "mmvq.cpp:reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_xmx_sycl":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "mmvq.cpp:reorder_mul_mat_vec_mxfp4_q8_1_sycl":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "mmvq.cpp:reorder_mul_mat_vec_mxfp4_q8_1_xmx_tiled_id_sycl":
+        (1, "weight layout conversion; runs when a weight is placed, not per ubatch"),
+    "mmvq.cpp:variable_tile_mul_mat_vec_q6_k_q8_1_sycl":
+        (1, "vector kernel, not yet wrapped"),
+    "norm.cpp:ggml_sycl_op_rms_norm_back": (1, "not yet wrapped"),
+    "norm.cpp:l2_norm_f32_sycl": (2, "not yet wrapped"),
+    "quantize.hpp:quantize_row_q8_0_sycl": (1, "src1 quantize helper, not yet wrapped"),
+    "quantize.hpp:quantize_row_q8_1_sycl": (1, "src1 quantize helper, not yet wrapped"),
+    "solve_tri.cpp:ggml_sycl_op_solve_tri": (1, "not yet wrapped"),
+    "ssm_conv.cpp:kernel_ssm_conv": (1, "not yet wrapped"),
+    "unified-kernel.cpp:dispatch_xmx_kernel": (3, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:launch_unified_matmul": (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:micro_submit_add": (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:micro_submit_attention": (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:micro_submit_rms_norm": (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:micro_submit_silu_mul": (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:micro_submit_strided_copy": (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:mmvq_submit_silu_mul": (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:UnifiedKernel::benchmark_graph_overhead":
+        (7, "test or benchmark entry point; graph compute does not call it"),
+    "unified-kernel.cpp:UnifiedKernel::execute_persistent_phased": (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:UnifiedKernel::launch_persistent_kernel_async": (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:UnifiedKernel::launch_persistent_kernel/run_persistent_kernel":
+        (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:UnifiedKernel::record_micro_graph": (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:UnifiedKernel::rms_norm": (1, "unified kernel launch, not yet wrapped"),
+    "unified-kernel.cpp:UnifiedKernel::silu_mul": (1, "unified kernel launch, not yet wrapped"),
+}
 
 BASE_WRAPPER = "ggml_sycl_profile_submit"
 
@@ -117,8 +365,35 @@ CLASS_HEAD = re.compile(r"\b(?:struct|class|union)\s+(?:alignas\s*\([^()]*\)\s*)
 NAMED_LAMBDA = re.compile(r"\b(\w+)\s*=\s*$")
 
 
+CONDITIONAL = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b")
+
+
+def blank_alternative_branches(code: str) -> str:
+    """Blanks the #elif / #else branches of each conditional group, so brackets are counted over one branch: code like
+    `#ifdef A for (...) { #else for (...) { #endif` opens one block, not two. A branch that holds a submit is kept, so
+    nothing is hidden; if it also unbalances the brackets, the balance test names the file."""
+    lines = code.split("\n")
+    groups: list[list[list[int]]] = []  # per open group, its branches as lists of line indices
+    drop: set[int] = set()
+    for i, text in enumerate(lines):
+        m = CONDITIONAL.match(text)
+        if m and m.group(1) in ("if", "ifdef", "ifndef"):
+            groups.append([[]])
+        elif m and m.group(1) in ("elif", "else") and groups:
+            groups[-1].append([])
+        elif m and m.group(1) == "endif" and groups:
+            for branch in groups.pop()[1:]:
+                if not any(SUBMIT.search(lines[j]) for j in branch):
+                    drop.update(branch)
+        elif groups:
+            groups[-1][-1].append(i)
+            for outer in groups[:-1]:
+                outer[-1].append(i)
+    return "\n".join(re.sub(r"[^\n]", " ", t) if i in drop else t for i, t in enumerate(lines))
+
+
 def blank(src: str) -> str:
-    return NOT_CODE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), src)
+    return blank_alternative_branches(NOT_CODE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), src))
 
 
 class Code:
@@ -247,11 +522,22 @@ class Code:
         return "/".join([func] + list(reversed(lambdas)))
 
 
+_PARSED: dict[str, Code] = {}
+
+
+def parse(src: str) -> Code:
+    """Code for a text, kept per text: the controls census the tree again with one file changed, and the other files,
+    ggml-sycl.cpp above all, need not be parsed a second time."""
+    if src not in _PARSED:
+        _PARSED[src] = Code(src)
+    return _PARSED[src]
+
+
 def derive_wrappers(texts: dict[str, str]) -> set[str]:
     """ggml_sycl_profile_submit, and every `*_profile_submit` function defined in the texts whose body calls it."""
     wrappers = {BASE_WRAPPER}
     for src in texts.values():
-        code = Code(src)
+        code = parse(src)
         for m in re.finditer(r"\b(\w+_profile_submit)\s*\(", code.code):
             if m.group(1) == BASE_WRAPPER:
                 continue
@@ -269,8 +555,18 @@ def derive_wrappers(texts: dict[str, str]) -> set[str]:
 
 
 def census(texts: dict[str, str], wrappers: set[str] | None = None) -> dict[str, list[tuple[int, str]]]:
-    """The raw submits of each named text, as (line, function) pairs."""
-    return {}
+    """The raw submits of each named text, as (line, function) pairs. A submit is wrapped when any '(' still open at
+    it, however far back and however deeply nested, is the argument list of a wrapper call."""
+    if wrappers is None:
+        wrappers = derive_wrappers(texts)
+    found: dict[str, list[tuple[int, str]]] = {}
+    for name, src in texts.items():
+        code = parse(src)
+        for pos, parens, braces in code.submits:
+            if any(code.callee(p) in wrappers for p in parens):
+                continue
+            found.setdefault(name, []).append((code.line(pos), code.enclosing(braces)))
+    return found
 
 
 def census_keys(found: dict[str, list[tuple[int, str]]]) -> dict[str, int]:
@@ -438,7 +734,7 @@ def test_the_enclosing_function_is_named_for_every_definition_shape():
 def test_every_file_of_the_path_has_balanced_brackets_and_a_name_for_every_site():
     texts = read_tree()
     for name in FILES:
-        assert not Code(texts[name]).unbalanced, f"{name}: {Code(texts[name]).unbalanced[:3]}"
+        assert not parse(texts[name]).unbalanced, f"{name}: {parse(texts[name]).unbalanced[:3]}"
     found = census_tree(texts)
     unnamed = [f"{name}:{line}" for name, sites in found.items() for line, func in sites if func == "?"]
     assert found and not unnamed, f"no census, or sites with no enclosing function: {unnamed}"
@@ -462,9 +758,9 @@ def test_a_second_raw_submit_in_a_listed_function_is_reported():
     texts[name] = "\n".join(lines)
     keys = census_keys(census_tree(texts))
     allow = {key: (count, "listed") for key, count in census_keys(found).items()}
-    assert diff_against_allow(keys, allow) == [
-        f"{name}:{func}: {allow[f'{name}:{func}'][0] + 1} raw submit(s) in the tree, {allow[f'{name}:{func}'][0]} listed"
-    ]
+    listed = allow[f"{name}:{func}"][0]
+    expected = f"{name}:{func}: {listed + 1} raw submit(s) in the tree, {listed} listed"
+    assert diff_against_allow(keys, allow) == [expected]
 
 
 def test_a_listed_function_whose_submits_are_gone_fails():
