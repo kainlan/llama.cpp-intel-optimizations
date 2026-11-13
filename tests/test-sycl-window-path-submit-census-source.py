@@ -2312,16 +2312,9 @@ def test_every_nothing_includes_it_reason_is_true():
     assert not false, f"excluded as {NOT_INCLUDED!r}, but included by: {false}"
 
 
-
-
-
-
-
-
-
 def receiver_census(src: str, rows: dict[str, tuple[int, str]], skipped: list[str] | None = None,
                     matches: dict[str, list[str]] | None = None,
-                    tripped: dict[str, list[str]] | None = None) -> list[tuple[str, str]]:
+                    tripped: dict[str, str] | None = None) -> list[tuple[str, str]]:
     """(function, kind) of each raw launch of src as x.cpp, with rows standing in for SET_ASIDE_BY_RECEIVER."""
     found = census({"x.cpp": src}, skipped=skipped, set_aside_table=rows, receiver_matches=matches,
                    tripped=tripped)
@@ -2334,22 +2327,71 @@ def test_a_row_names_the_receiver_expression_as_written_prefix_included():
         "    c->q.submit(job);\n"
         "    d.q.submit(job);\n"
         "    q.submit(job);\n"
-        "    foo.stream().submit(job);\n"
-        "    stream().submit(job);\n"
         "    engine -> queue . submit(job);\n"
+        "    this->pool_.submit(job);\n"
         "}\n"
     )
-    rows = {"submit:x.cpp:f:q": (1, "test"), "submit:x.cpp:f:stream()": (1, "test"),
-            "submit:x.cpp:f:engine->queue": (1, "test")}
+    rows = {"submit:x.cpp:f:q": (1, "test"), "submit:x.cpp:f:engine->queue": (1, "test"),
+            "submit:x.cpp:f:this->pool_": (1, "test")}
     skipped: list[str] = []
-    assert receiver_census(sample, rows, skipped=skipped) == [("f", "submit"), ("f", "submit"), ("f", "submit")]
+    assert receiver_census(sample, rows, skipped=skipped) == [("f", "submit"), ("f", "submit")]
     assert skipped == [
         "x.cpp:f .submit( on q, a SET_ASIDE_BY_RECEIVER row",
-        "x.cpp:f .submit( on stream(), a SET_ASIDE_BY_RECEIVER row",
         "x.cpp:f .submit( on engine->queue, a SET_ASIDE_BY_RECEIVER row",
+        "x.cpp:f .submit( on this->pool_, a SET_ASIDE_BY_RECEIVER row",
     ]
     found = census({"x.cpp": sample}, set_aside_table=rows)
-    assert [line for line, _, _ in found["x.cpp"]] == [2, 3, 5]
+    assert [line for line, _, _ in found.get("x.cpp", [])] == [2, 3]
+
+
+def test_a_receiver_that_is_not_a_chain_of_names_matches_no_row():
+    # each receiver as the walk over calls and brackets used to write it: no row may name such an expression
+    for call, text in [
+        ("static_cast<sycl::queue &>(g).fill(p, 0, n);", "(g)"),
+        ("std::get<0>(t).fill(p, 0, n);", "(t)"),
+        ("F<T>(x).fill(p, 0, n);", "(x)"),
+        ("(g).fill(p, 0, n);", "(g)"),
+        ("(*ready).fill(p, 0, n);", "(*ready)"),
+        ("foo.stream().fill(p, 0, n);", "foo.stream()"),
+        ("g_pools[d].fill(p, 0, n);", "g_pools[d]"),
+        ("a.\\\n    b.fill(p, 0, n);", "b"),
+    ]:
+        src = "void f() {\n    " + call + "\n}\n"
+        assert receiver_census(src, {f"shortcut:x.cpp:f:{text}": (1, "test")}) == [("f", "shortcut")], src
+
+
+def test_a_row_covering_two_definitions_of_one_function_name_is_refused():
+    one = "void f(int n) {\n    std::array<int, 4> ready;\n    ready.fill(0);\n}\n"
+    two = "void f(sycl::queue & ready) {\n    ready.fill(p, 0, n);\n}\n"
+    for src, lines in [(one + two, "x.cpp:3, x.cpp:6"), (two + one, "x.cpp:2, x.cpp:6")]:
+        rows = {"shortcut:x.cpp:f:ready": (2, "a std::array")}
+        matches: dict[str, list[str]] = {}
+        tripped: dict[str, str] = {}
+        assert receiver_census(src, rows, matches=matches, tripped=tripped) == [("f", "shortcut")] * 2, src
+        assert set_aside_problems(matches, rows, tripped) == [
+            f"shortcut:x.cpp:f:ready: refused: the row names 2 definitions of f, with calls at {lines}; a row covers "
+            "one definition, so these calls count (To update, e)"], src
+    function = "void f(Pool & p) { p.submit(job); }\n"
+    src = "namespace a {\n" + function + "}\nnamespace b {\n" + function + "}\n"
+    assert receiver_census(src, {"submit:x.cpp:f:p": (2, "a host pool")}) == [("f", "submit")] * 2
+
+
+def test_a_free_submit_call_is_no_submit_site_so_a_queue_call_inside_it_counts():
+    sample = "void f(sycl::queue & q) {\n    submit([&] { q.memcpy(a, b, n); });\n}\n"
+    assert receiver_census(sample, {}) == [("f", "shortcut")]
+
+
+def test_a_row_whose_receiver_holds_a_scope_operator_is_keyed_and_named_whole():
+    rows = {"submit:x.cpp:g:ns::g_pool": (1, "a host pool")}
+    assert receiver_census("void g() {\n    ns::g_pool.submit(job);\n}\n", rows) == []
+    src = "void f(sycl::queue & g_pool) {\n    ns::g_pool.fill(p, 0, n);\n}\n"
+    rows = {"shortcut:x.cpp:f:ns::g_pool": (1, "a std::array")}
+    matches: dict[str, list[str]] = {}
+    tripped: dict[str, str] = {}
+    assert receiver_census(src, rows, matches=matches, tripped=tripped) == [("f", "shortcut")]
+    assert set_aside_problems(matches, rows, tripped) == [
+        "shortcut:x.cpp:f:ns::g_pool: refused: x.cpp:1 binds g_pool next to `queue`; read its declaration, and if "
+        "the receiver is a queue, delete the row (To update, e)"]
 
 
 def test_a_row_whose_count_differs_or_whose_call_is_gone_names_what_to_do():
@@ -2376,19 +2418,27 @@ def test_a_row_whose_count_differs_or_whose_call_is_gone_names_what_to_do():
 
 
 def test_the_tripwire_refuses_a_row_whose_name_the_function_binds_to_a_queue():
-    for src, line in [
-        ("void f(sycl::queue & ready) {\n    ready.fill(x, 0, n);\n}\n", 1),
-        ("void f() {\n    sycl::queue * ready = get();\n    ready->fill(x, 0, n);\n}\n", 2),
+    for src, line, func in [
+        ("void f(sycl::queue & ready) {\n    ready.fill(x, 0, n);\n}\n", 1, "f"),
+        ("void f() {\n    sycl::queue * ready = get();\n    ready->fill(x, 0, n);\n}\n", 2, "f"),
         ("void f(std::vector<sycl::queue *> & qs) {\n    for (sycl::queue * ready : qs) {\n"
-         "        ready->fill(x, 0, n);\n    }\n}\n", 2),
+         "        ready->fill(x, 0, n);\n    }\n}\n", 2, "f"),
+        # each of the following only one binding pattern catches: by value, by assignment, a structured binding
+        ("void f(sycl::device dev) {\n    sycl::queue ready{dev};\n    ready.fill(x, 0, n);\n}\n", 2, "f"),
+        ("void f(Ctx * ctx) {\n    auto & ready = ctx->queue();\n    ready.fill(x, 0, n);\n}\n", 2, "f"),
+        ("void f(sycl::queue * q) {\n    auto [ready, n] = std::pair<sycl::queue *, int>(q, 0);\n"
+         "    ready->fill(x, 0, n);\n}\n", 2, "f"),
+        # an init-capture
+        ("void f(Ctx & ctx) {\n    auto g = [ready = ctx.queue]() {\n        ready.fill(x, 0, n);\n    };\n}\n", 2,
+         "f/g"),
     ]:
-        rows = {"shortcut:x.cpp:f:ready": (1, "a std::array")}
+        rows = {f"shortcut:x.cpp:{func}:ready": (1, "a std::array")}
         matches: dict[str, list[str]] = {}
-        tripped: dict[str, list[str]] = {}
-        assert receiver_census(src, rows, matches=matches, tripped=tripped) == [("f", "shortcut")], src
+        tripped: dict[str, str] = {}
+        assert receiver_census(src, rows, matches=matches, tripped=tripped) == [(func, "shortcut")], src
         assert set_aside_problems(matches, rows, tripped) == [
-            f"shortcut:x.cpp:f:ready: refused: x.cpp:{line} binds ready next to `queue`; read its declaration, and if "
-            "the receiver is a queue, delete the row (To update, e)"], src
+            f"shortcut:x.cpp:{func}:ready: refused: x.cpp:{line} binds ready next to `queue`; read its declaration, "
+            "and if the receiver is a queue, delete the row (To update, e)"], src
     # a std::array of that name in a function that also takes a queue is not refused
     src = "void f(sycl::queue & q) {\n    std::array<int, 4> ready;\n    ready.fill(0);\n    q.memset(p, 0, n);\n}\n"
     assert receiver_census(src, {"shortcut:x.cpp:f:ready": (1, "a std::array")}) == [("f", "shortcut")]
@@ -2412,18 +2462,17 @@ def test_the_print_report_lists_the_set_aside_calls_and_the_rows_that_do_not_mat
     matches: dict[str, list[str]] = {}
     receiver_census(sample, rows, skipped=skipped, matches=matches)
     assert receiver_sections(skipped, set_aside_problems(matches, rows)).split("\n") == [
-        "# set aside by a SET_ASIDE_BY_RECEIVER row",
+        "# set aside by a SET_ASIDE_BY_RECEIVER row, in the files on the path",
         "x.cpp:a .submit( on pool, a SET_ASIDE_BY_RECEIVER row",
-        "# SET_ASIDE_BY_RECEIVER rows that do not match the tree (excluded files included)",
+        "# SET_ASIDE_BY_RECEIVER rows that do not match the files on the path (excluded files included)",
         "submit:x.cpp:b:p: 1 call(s) on this receiver in the function (x.cpp:5), SET_ASIDE_BY_RECEIVER says 2: read "
         "the declaration of each receiver; if it is a queue, delete the row; otherwise set the count to 1 "
         "(To update, e)",
     ]
     assert receiver_sections([], []).split("\n") == [
-        "# set aside by a SET_ASIDE_BY_RECEIVER row", "(none)",
-        "# SET_ASIDE_BY_RECEIVER rows that do not match the tree (excluded files included)", "(none)",
+        "# set aside by a SET_ASIDE_BY_RECEIVER row, in the files on the path", "(none)",
+        "# SET_ASIDE_BY_RECEIVER rows that do not match the files on the path (excluded files included)", "(none)",
     ]
-
 
 
 def test_an_unlisted_launch_the_record_rule_matches_also_names_the_record_table():
