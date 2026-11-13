@@ -45,7 +45,8 @@
 //
 // The same source, linked against the private backend objects, is test-moe-decode-q8-0-soa-mutant-wrong-scale: its
 // registration switches on the kernel's planted fault (every block reads the next block's scale) and passes only when
-// the kernel announced it and decode-base then failed on NMSE.
+// the kernel announced it and then prompt-vec-q, launched from vec_q, and decode-base both failed on NMSE, in that
+// order (the child prints first).
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
