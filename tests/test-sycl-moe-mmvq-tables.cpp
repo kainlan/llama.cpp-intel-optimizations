@@ -900,10 +900,9 @@ int main() {
         }
     }
 
-    // 15. Decode runs every SOA expert layout that prefill runs. Decode must run every expert layout the fill can
-    // materialize and the prompt executor runs. A type with an SOA reorder and an SOA prompt row needs an SOA decode
-    // executor too. The pairs below are the known support gaps: each is a missing kernel, and the change that writes
-    // it deletes its line.
+    // 15. Decode runs every SOA expert layout that prefill runs. A type with an SOA reorder and an SOA prompt row
+    // needs an SOA decode executor too. The pairs below are the known support gaps: each is a missing kernel, and the
+    // change that writes it deletes its line.
     {
         const ggml_type decode_soa_gaps[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 };
         for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
