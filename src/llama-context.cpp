@@ -2398,10 +2398,10 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     // not fit at all -- any -c below 512, or llama-bench's own pp128/tg128
     // rows -- so the trial cannot try a single candidate. Take exactly the
     // pre-trial path (one reserve at whatever n_ubatch the constructor's
-    // own clamp already resolved) and log no WARN: a WARN here would report
-    // an empty `tried` list against a ladder that never got a chance to
-    // run, and the one WARN this function does log is reserved for "the
-    // trial actually ran".
+    // own clamp already resolved, or lowered under it by the constructor's
+    // publish) and log no WARN: a WARN here would report an empty `tried`
+    // list against a ladder that never got a chance to run, and the one
+    // WARN this function does log is reserved for "the trial actually ran".
     if (cap < ladder[0]) {
         return;
     }
@@ -2514,14 +2514,14 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     const size_t n_rung_set_full =
         llama_auto_ubatch_rung_set(ladder, llama_auto_ubatch_ladder_size, fallback_ubatch, cap, cache_set_value,
                                    rung_set, llama_auto_ubatch_rung_set_capacity);
-    // A context the constructor lowered climbs nothing: its set is the rung its publish stood at alone, the smallest
-    // of the full set (fallback_ubatch; every ladder rung is at least the default the publish was refused at).
+    // A context the constructor lowered climbs nothing: its set is the rung its publish stood at alone,
+    // fallback_ubatch, the smallest member of the full set.
     const size_t n_rung_set = ctor_lowered ? 1 : n_rung_set_full;
     const size_t n_rungs = llama_auto_ubatch_ladder_members(rung_set, n_rung_set, ladder, llama_auto_ubatch_ladder_size,
                                                             rungs, llama_auto_ubatch_rung_set_capacity);
     std::vector<uint32_t> rung_ladder(rungs, rungs + n_rungs);
-    // That rung is no ladder member, so the ladder is handed it directly: a fit loss there descends from it as a loss
-    // at the default does.
+    // The ladder is handed that rung directly, whether or not it is a ladder member: a fit loss there descends from
+    // it as a loss at the default does.
     if (ctor_lowered) {
         rung_ladder.assign(1, fallback_ubatch);
     }
@@ -2558,7 +2558,9 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 // additionally by the GPU MoE routing ceiling
 // (ggml_backend_sycl_moe_gpu_ubatch_max(), llama.cpp-ohkx) until that
 // ceiling is lifted -- a candidate whose ring still fits but whose routing
-// silently falls off the GPU path is not a win. Per candidate, on every
+// silently falls off the GPU path is not a win. A context whose -ub the
+// constructor's publish lowered tries that rung as its only candidate, and
+// the descent below it when it loses for fit. Per candidate, on every
 // SYCL backend this context has: Task 2's non-publishing probe
 // (ggml_backend_sycl_probe_runtime_context_for_model) must accept it without
 // demoting KV (a BUSY answer is not retried: the candidate loses with
@@ -2572,9 +2574,10 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 // compute buffer host-pinned (ggml_backend_sycl_compute_buffer_host_
 // fallbacks() > 0, read AFTER the publish that resets it) also loses. The
 // last candidate that clears all three checks wins; if none do, the floor is
-// today's pre-trial default (already clamped to n_batch by the
-// constructor's own `cparams.n_ubatch = std::min(cparams.n_batch, ...)`
-// assignment, which runs before this function is entered). The settle step
+// the pre-trial -ub (clamped to n_batch by the constructor's own
+// `cparams.n_ubatch = std::min(cparams.n_batch, ...)` assignment, or lowered
+// under it by the constructor's publish, both before this function is
+// entered). The settle step
 // re-publishes and re-reserves at the winner whenever the published
 // plan/sched do not already describe it (a losing final candidate's demand
 // must not be left live) -- see c-wgxn's own safety analysis for why a
