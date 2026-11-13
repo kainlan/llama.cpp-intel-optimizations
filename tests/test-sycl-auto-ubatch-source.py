@@ -3588,15 +3588,18 @@ def _ctor_walk_violations(raw_cpp: str) -> list:
     if prep.count(_SKIPS_TRIAL) != 1 or min([lowered_at, skips] + built) < 0 or not lowered_at < skips < min(built):
         found.append(_V_NO_RUNG)
 
+    # Every anchor of an ordering is found first: a missing lower anchor (-1) would otherwise order before anything.
     seed = sel.find("lowered_from = sycl_ctor_lowered_from; lowered_cause = sycl_ctor_lowered_cause;")
     first_cache = sel.find("if (cache_available) {")
-    if seed == -1 or not sel.find("uint32_t lowered_from = 0;") < seed < first_cache:
+    declared = sel.find("uint32_t lowered_from = 0;")
+    if min(declared, seed, first_cache) < 0 or not declared < seed < first_cache:
         found.append(_V_SEED)
     if 'if (lowered_from == 0) { lowered_from = fallback_ubatch; lowered_cause = format("the default did not fit ' \
        '(%s)", stop); } else { lowered_cause += format(' not in sel:
         found.append(_V_ORIGIN)
+    stop_init = sel.find('stop = moe_bound ? "MoE GPU routing ceiling"')
     stop_seed = sel.find(_STOP_SEED)
-    if stop_seed == -1 or not sel.find('stop = moe_bound ? "MoE GPU routing ceiling"') < seed < stop_seed < first_cache:
+    if min(stop_init, seed, stop_seed, first_cache) < 0 or not stop_init < seed < stop_seed < first_cache:
         found.append(_V_STOP)
 
     # One source or the other, never both: the constructor announces only on an empty prep, the trial only past its
@@ -3679,6 +3682,11 @@ _CTOR_WALK_MUTANTS = {
         "llama_auto_ubatch_ctor_lowered_skips_trial(ctor_lowered,", "llama_auto_ubatch_ctor_lowered_skips_trial(true,",
         _V_NO_RUNG),
     "the trial is not told the rung was lowered": ("lowered_from  = sycl_ctor_lowered_from;", "(void) 0;", _V_SEED),
+    "the seed's declaration is no longer where the clause looks": (
+        "uint32_t lowered_from = 0;", "uint32_t lowered_from{};", _V_SEED),
+    "the stop initializer is no longer where the clause looks": (
+        'const char * stop = moe_bound ? "MoE GPU routing ceiling" : "ladder exhausted";',
+        'const char * stop{ moe_bound ? "MoE GPU routing ceiling" : "ladder exhausted" };', _V_STOP),
     "the trial's descent overwrites the constructor's origin": ("if (lowered_from == 0) {", "if (true) {", _V_ORIGIN),
     "the outcome names the ladder's ceiling for a lowered rung": (
         "stop = sycl_ctor_lowered_cause.c_str();", "(void) 0;", _V_STOP),
