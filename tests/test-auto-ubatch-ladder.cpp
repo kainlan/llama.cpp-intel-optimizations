@@ -468,6 +468,34 @@ int main() {
         }
     }
 
+    // ---- The constructor's first publish, refused. Only a fit verdict, on a context the auto n_ubatch trial runs for,
+    // walks -ub down right there, before the memory module exists. A lifecycle refusal (busy, a stale identity, any
+    // other result), or a context the trial does not run for (a pinned -ub, a non-causal model, no SYCL backend, the
+    // trial disabled), fails the context as before. ----
+    {
+        struct walk_case {
+            const char * name;
+            bool         trial_runs, fit_refusal, want;
+        };
+
+        const walk_case cases[] = {
+            { "fit refusal, the trial runs",       true,  true,  true  },
+            { "lifecycle refusal, the trial runs", true,  false, false },
+            { "fit refusal, no trial",             false, true,  false },
+            { "lifecycle refusal, no trial",       false, false, false },
+        };
+        for (const walk_case & c : cases) {
+            const bool got = llama_auto_ubatch_ctor_walks_down(c.trial_runs, c.fit_refusal);
+            if (got != c.want) {
+                std::fprintf(stderr, "FAIL ctor walks down, %s: got %d (expected %d)\n", c.name, got ? 1 : 0,
+                             c.want ? 1 : 0);
+                g_failures++;
+            } else {
+                std::printf("ok   ctor walks down, %s: %d\n", c.name, got ? 1 : 0);
+            }
+        }
+    }
+
     if (g_failures != 0) {
         std::fprintf(stderr, "%d case(s) failed\n", g_failures);
         return 1;
