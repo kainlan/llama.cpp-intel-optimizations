@@ -5,7 +5,8 @@ A launch the profiler cannot see lands in "device idle" or in nothing, so the at
 only as complete as this list is short. The list shrinks to empty; it never grows without a reason beside the entry.
 
 To update (`python3 tests/test-sycl-window-path-submit-census-source.py --print` lists every key with its count and
-file:line, the ALLOW lines to paste, what the record rule matched per function, and what the receiver rule set aside):
+file:line, the ALLOW lines to paste, what the record rule matched per function, and what each SET_ASIDE_BY_RECEIVER
+row set aside):
   a. You wrapped a site: its key's tree count dropped. Lower that ALLOW count, or delete the entry at 0.
   b. You added a launch on the path: wrap it. If it cannot be wrapped yet, add or raise its ALLOW entry with what it
      is and what a wrap task must do (the WRAP_ texts).
@@ -15,11 +16,10 @@ file:line, the ALLOW lines to paste, what the record rule matched per function, 
   d. A launch is profiled through its event (a record call is handed what the launch returned): read the function,
      confirm each record call receives that launch's event, and set the function's RECORDED_ON_THE_PATH row to the
      number of such launches. Nothing is excused without a row.
-  e. A call is set aside, or would be, by its receiver (set_aside_problems names each with its file:line, receiver
-     and declared type): read the receiver's declaration and what its call does. If the receiver is a queue, the
-     resolver misread it: fix receiver_type, never add a row. If it is no queue, its type must be in
-     NON_QUEUE_RECEIVER_TYPES with what its call does and where any device work it leads to is counted, and its
-     function's SET_ASIDE_BY_RECEIVER row must be the number of such calls there.
+  e. A SET_ASIDE_BY_RECEIVER row does not match (set_aside_problems names its calls by file:line, or the line the
+     tripwire refused it at): read the declaration of each receiver by hand. If it is a queue, delete the row: its
+     calls are launches. If it is no queue, set the row's count to the calls on that receiver in the function, with a
+     reason saying what the receiver is, where it is declared, and where any device work its call leads to is counted.
 
 Two kinds of launch are censused, and kept apart in the output and in the allowlist keys:
 - submit: a `->submit(` or `.submit(` call. A submit whose command group is only a `host_task` counts too: it occupies
@@ -28,23 +28,15 @@ Two kinds of launch are censused, and kept apart in the output and in the allowl
   `fill`, `copy`, `prefetch`, `mem_advise`, in member-call form only (`->name(` / `.name(`), so `std::memcpy(` and free
   functions never match. Inside the parentheses of a submit that counts, it is that command group's handler call, and
   the submit is the launch: not counted. Inside a submit set aside (a host pool's job), it counts like any other.
-Every call of either kind counts unless its receiver is set aside, which takes two reviewed tables, as the record rule
-does, so that the resolver can only over-count:
-  1. The receiver's declared type is listed for the call's kind in NON_QUEUE_RECEIVER_TYPES (a host thread pool, the
-     fused transaction, a command group's handler, std::array), with what its call does.
-  2. The call's `kind:file:function` is a row of SET_ASIDE_BY_RECEIVER, and the rule finds exactly that many such
-     calls in the function. A type or a row is added only after reading the receiver's declaration and its call;
-     a queue read as something else is a resolver defect, never a row (To update, e).
-The receiver is the name before the `.`/`->` (`stream`), or a call (`ctx.stream()`). Its type is read from the
-nearest declaration in the call's own function that is visible at the call: a parameter, or a declaration in a block
-still open at the call (a lambda's or an if's parameters only when its body holds the call); `T name`, `T & name`,
-`T * const name`, `T name[N]`, `T name(` for a call, starting after a statement boundary, a parameter list or a
-qualifier, so `n = w & q` declares nothing. A name the function does not declare is read from its file's
-declarations outside every function body, then from those of any other file read here (a member declared in the
-class header beside a .cpp); declarations of two types there decide nothing. A receiver declared `auto` is read
-through its initializer when that is a plain name or an element of a plain array (`auto & pool = g_pools[device];`
-over `T g_pools[N]`), and never through another declaration of its name. Anything unread, a template parameter, an
-alias (`using queue_t = sycl::queue`), a smart pointer or an optional is no listed type, so its call counts.
+Every call of either kind counts unless a reviewed row sets it aside. No type is read anywhere: a row of
+SET_ASIDE_BY_RECEIVER, keyed `kind:file:function:receiver`, names the receiver expression exactly as written at the
+call, prefix included and whitespace removed (`pool`, `engine->queue`, `cgh`, `foo.stream()`), and sets aside the
+calls of that kind on that expression in that function only when there are exactly as many as the row's count. A
+call on `c->q` is not one on `q`. Adding a row is the reviewed act: the reviewer reads the receiver's declaration by
+hand, and the row's reason says what it is and where it is declared. The pin proves only that the set of set-aside
+expressions and their counts did not change; that a receiver is no queue is the reviewer's claim. queue_tripwire is a
+lexical tripwire on top, not a resolver: it refuses a row whose last name the function plainly binds next to the
+token `queue` (`sycl::queue & ready`, `for (sycl::queue * ready : qs)`), and proves nothing when it stays quiet.
 
 A launch is profiled, and not a site, in two cases:
 - Wrapped: any '(' still open at it, at any nesting depth and any distance, is the argument list of a wrapper call.
@@ -180,7 +172,7 @@ FILES = [
     # admits it: at least 8 rows, a Q4_0/Q4_1/Q8_0/Q4_K/Q5_K/Q6_K weight, and a shape the oneDNN prompt GEMM declines
     "fused-norm-gemm.hpp",
     # the prompt fusion's transaction (mmvq_submit_retained_prompt_fusion -> submit_prompt_fusion): on the path, and
-    # its two submits are Transaction::submit and Submitter::submit, which the receiver rule sets aside
+    # its two submits, on transaction and submitter, are SET_ASIDE_BY_RECEIVER rows
     # (SET_ASIDE_BY_RECEIVER); its device work is submitted from mmvq.cpp
     "moe-fused-transaction.cpp",
     # quantized_allreduce, called by ggml_sycl_mul_mat_tp_row_parallel_post (ggml-sycl.cpp), which ggml_sycl_mul_mat
@@ -243,7 +235,8 @@ EXCLUDED_FILES = {
     "kv-cache-quant.hpp": "included by fattn.cpp, which calls neither launch_quantize_kv_fp8 nor launch_attention_fp8",
     "dpct/helper.hpp": "dpct_memcpy, dpct_memset and host_buffer: no backend source outside dpct/ calls them",
     "lazy-io-pool.cpp": "the weight loader's I/O pool, not an op of the graph; and its one submit is "
-                        "lazy_io_queue::submit, which the receiver rule sets aside (" + BY_RECEIVER_CHECKED + ")",
+                        "lazy_io_queue::submit on engine->queue, a SET_ASIDE_BY_RECEIVER row ("
+                        + BY_RECEIVER_CHECKED + ")",
     "moe-tile-convert.cpp": "MXFP4 to XMX-tiled weight conversion, run when a weight is materialized "
                             "(ggml_sycl_fill_xmx_tiled, convert_tensor_layout), not by an op of the graph",
     "moe-mmid-workspace.cpp": "no launch: its .fill( calls are std::array::fill in moe_mmid_workspace_registry::admit",
@@ -718,59 +711,54 @@ RECORDED_ON_THE_PATH = {
     "mem-ops.cpp:mem_fill_direct_submit": 1,  # event
 }
 
-# The receiver types a call may be set aside on, per kind, each with what its call does and where the device work
-# it leads to (if any) is counted. A type not listed here, an unread receiver, a template parameter, an alias, a
-# smart pointer and an optional keep the call counted, so a misread receiver can only over-count. Adding a type is
-# the reviewed act: read the type's declaration and the member the call reaches first. If the receiver is a queue,
-# the resolver misread it, and the fix is the resolver (receiver_type), never a new type.
-NON_QUEUE_RECEIVER_TYPES = {
-    "submit": {
-        "ggml_sycl::AttnHostPool": "the host flash attention's worker pool (attn-host-pool.hpp): its submit queues a "
-                                   "CPU job; the device copies that feed it are mem_copy_ptr_async, counted in "
-                                   "mem-ops.cpp",
-        "Submitter": "the fused prompt transaction's submitter interface (moe-fused-transaction.hpp): "
-                     "PromptSubmitter::submit calls the executor's submit_writes, whose launches are counted in "
-                     "ggml-sycl.cpp",
-        "Transaction": "the fused prompt transaction (moe-fused-transaction.hpp): Transaction::submit checks its "
-                       "state and calls Submitter::submit, set aside above",
-        "lazy_io_queue": "the loader's O_DIRECT read queue (lazy-io-pool.hpp): its submit queues a file read, no "
-                         "device command",
-    },
-    "shortcut": {
-        "sycl::handler": "a command group's handler: the submit (or wrapper) that hands it the group is the launch, "
-                         "counted there (cpu_submit_async; the callers of ggml_sycl_parallel_for_grf)",
-        "std::array": "std::array::fill writes host memory, no device command",
-    },
-}
-
-# "kind:file:function" -> how many calls in it the receiver rule sets aside. A call on a type of
-# NON_QUEUE_RECEIVER_TYPES is set aside only when its function has a row here and the rule finds exactly that many
-# such calls there; otherwise each one counts. Adding or raising a row is the reviewed act, not the rule: read each
-# receiver's declaration and its call first. If a receiver is a queue, the resolver misread it, and the fix is the
-# resolver, never a new row. set_aside_problems names each call of a row that differs.
+# "kind:file:function:receiver" -> (count, reason): the calls set aside by their receiver. receiver is the receiver
+# expression exactly as written at the call, prefix included and whitespace removed (`engine->queue`, `pool`, `cgh`).
+# A call is set aside only when its exact key has a row and the function holds exactly count calls of that kind on
+# that expression; every other call counts, and no type is read anywhere. Adding a row is the reviewed act: read the
+# receiver's declaration by hand, and its call, first. If the receiver is a queue, there is no row to add. The pin
+# proves only that the set of set-aside expressions and their counts did not change; the reason is the reviewer's
+# claim, so it says what the receiver is and where it is declared. queue_tripwire refuses a row whose name the
+# function plainly binds next to `queue`, as a tripwire, not a type check.
 SET_ASIDE_BY_RECEIVER = {
-    # the command groups the CPU executor hands to cpu_submit_async; that submit is the site
-    "shortcut:cpu-dispatch.cpp:cpu_binary_op": 1,
-    "shortcut:cpu-dispatch.cpp:cpu_glu": 1,
-    "shortcut:cpu-dispatch.cpp:cpu_norm": 1,
-    "shortcut:cpu-dispatch.cpp:cpu_rms_norm": 1,
-    "shortcut:cpu-dispatch.cpp:cpu_rope": 1,
-    "shortcut:cpu-dispatch.cpp:cpu_scale": 1,
-    "shortcut:cpu-dispatch.cpp:cpu_silu": 1,
-    "shortcut:cpu-dispatch.cpp:cpu_soft_max": 1,
-    "shortcut:ggml-sycl.cpp:ggml_sycl_plan_dry_run_plans": 1,  # ready, a std::array
-    "shortcut:ggml-sycl.cpp:ggml_sycl_reset_model_load_scratch_state": 1,  # g_moe_expert_vram_reserve, a std::array
-    "shortcut:ggml-sycl.cpp:populate_inventory_globals": 1,  # g_moe_expert_vram_reserve
-    # the GRF-mode helper takes the command group's handler; its callers submit
-    "shortcut:mmq.cpp:ggml_sycl_parallel_for_grf": 3,
-    "shortcut:unified-cache.cpp:arena_pp_profile_snapshot_zones": 2,  # cap_out and used_out, std::arrays
-    "shortcut:unified-cache.cpp:unified_cache::configure_host_zones": 2,  # host_zone_reserved_bytes_, a std::array
-    # pool, `auto & pool = g_attn_host_pools[device]` over a plain array of ggml_sycl::AttnHostPool
-    "submit:ggml-sycl.cpp:ggml_sycl_dispatch_host_flash_attn_async": 1,
-    "submit:ggml-sycl.cpp:ggml_sycl_dispatch_host_flash_attn_sync": 1,
-    "submit:lazy-io-pool.cpp:lazy_io_submit": 1,  # engine->queue, a lazy_io_queue
-    "submit:moe-fused-transaction.cpp:Transaction::submit": 1,  # submitter, a Submitter &
-    "submit:moe-fused-transaction.cpp:submit_prompt_fusion": 1,  # transaction, a Transaction
+    # the CPU executor's command groups, handed to cpu_submit_async, whose submit is the site; cgh is the lambda's
+    # `sycl::handler & cgh` parameter at each line
+    "shortcut:cpu-dispatch.cpp:cpu_binary_op:cgh": (1, "the command group's handler (cpu-dispatch.cpp:5116)"),
+    "shortcut:cpu-dispatch.cpp:cpu_glu:cgh": (1, "the command group's handler (cpu-dispatch.cpp:5364)"),
+    "shortcut:cpu-dispatch.cpp:cpu_norm:cgh": (1, "the command group's handler (cpu-dispatch.cpp:5835)"),
+    "shortcut:cpu-dispatch.cpp:cpu_rms_norm:cgh": (1, "the command group's handler (cpu-dispatch.cpp:4978)"),
+    "shortcut:cpu-dispatch.cpp:cpu_rope:cgh": (1, "the command group's handler (cpu-dispatch.cpp:6183)"),
+    "shortcut:cpu-dispatch.cpp:cpu_scale:cgh": (1, "the command group's handler (cpu-dispatch.cpp:5929)"),
+    "shortcut:cpu-dispatch.cpp:cpu_silu:cgh": (1, "the command group's handler (cpu-dispatch.cpp:5224)"),
+    "shortcut:cpu-dispatch.cpp:cpu_soft_max:cgh": (1, "the command group's handler (cpu-dispatch.cpp:5709)"),
+    "shortcut:ggml-sycl.cpp:ggml_sycl_plan_dry_run_plans:ready": (
+        1, "a std::array<bool, GGML_SYCL_MAX_DEVICES> (ggml-sycl.cpp:19187): a host fill"),
+    "shortcut:ggml-sycl.cpp:ggml_sycl_reset_model_load_scratch_state:g_moe_expert_vram_reserve": (
+        1, "a file-scope std::array<size_t, GGML_SYCL_MAX_DEVICES> (ggml-sycl.cpp:4208): a host fill"),
+    "shortcut:ggml-sycl.cpp:populate_inventory_globals:g_moe_expert_vram_reserve": (
+        1, "a file-scope std::array<size_t, GGML_SYCL_MAX_DEVICES> (ggml-sycl.cpp:4208): a host fill"),
+    "shortcut:mmq.cpp:ggml_sycl_parallel_for_grf:cgh": (
+        3, "the `sycl::handler & cgh` parameter (mmq.cpp:321), one launch per GRF mode; the callers submit"),
+    "shortcut:unified-cache.cpp:arena_pp_profile_snapshot_zones:cap_out": (
+        1, "a std::array & parameter (unified-cache.cpp:5443): a host fill"),
+    "shortcut:unified-cache.cpp:arena_pp_profile_snapshot_zones:used_out": (
+        1, "a std::array & parameter (unified-cache.cpp:5442): a host fill"),
+    "shortcut:unified-cache.cpp:unified_cache::configure_host_zones:host_zone_reserved_bytes_": (
+        2, "a std::array member of unified_cache (unified-cache.hpp:6063): a host fill"),
+    "submit:ggml-sycl.cpp:ggml_sycl_dispatch_host_flash_attn_async:pool": (
+        1, "`auto & pool = g_attn_host_pools[device]` (ggml-sycl.cpp:97223) over a plain array of "
+           "ggml_sycl::AttnHostPool (ggml-sycl.cpp:2729): a CPU job; its D2H feeds are mem_copy_ptr_async, counted in "
+           "mem-ops.cpp"),
+    "submit:ggml-sycl.cpp:ggml_sycl_dispatch_host_flash_attn_sync:pool": (
+        1, "`auto & pool = g_attn_host_pools[device]` (ggml-sycl.cpp:97441), as in the async dispatch"),
+    "submit:lazy-io-pool.cpp:lazy_io_submit:engine->queue": (
+        1, "the lazy_io_queue member of lazy_io_engine (lazy-io-pool.cpp:53), engine declared at "
+           "lazy-io-pool.cpp:1869: queues an O_DIRECT file read, no device command"),
+    "submit:moe-fused-transaction.cpp:Transaction::submit:submitter": (
+        1, "the `Submitter & submitter` parameter (moe-fused-transaction.cpp:213): PromptSubmitter::submit calls the "
+           "executor's submit_writes, whose launches are counted in ggml-sycl.cpp"),
+    "submit:moe-fused-transaction.cpp:submit_prompt_fusion:transaction": (
+        1, "a local Transaction (moe-fused-transaction.cpp:391): its submit checks its state and calls "
+           "Submitter::submit, set aside above"),
 }
 
 # Synthetic source the record-rule tests are built from: a function head, two launches, the two record calls.
@@ -788,7 +776,7 @@ RECORD_CALL = re.compile(r"\b(?:" + "|".join(RECORDERS) + r")\s*\(")
 
 # `q->submit(`, `stream()\n    .submit(`
 SUBMIT = re.compile(r"(?:->|\.)\s*submit\s*\(")
-# a queue member that enqueues a command without submit(); only a reviewed receiver sets one aside (receiver_type):
+# a queue member that enqueues a command without submit(); only a SET_ASIDE_BY_RECEIVER row sets one aside:
 # `stream->parallel_for(`, `q.memcpy(`, `q.parallel_for<class k>(`
 SHORTCUT = re.compile(
     r"(?:->|\.)\s*(parallel_for|single_task|memcpy|memset|fill|copy|prefetch|mem_advise)\s*(?:<[^;{}()]*>\s*)?\("
@@ -800,17 +788,10 @@ SHORTCUT = re.compile(
 # is not seen, which can only let the record rule match more, and a match counts only through a reviewed row.
 HEAD_WINDOW = 2000
 # A callee name before '(', a receiver expression before '.' / '->', the declaration before `ev =`. A callee missed
-# is no wrapper, so its launch is reported; a receiver missed is unread, which keeps its call counted.
+# is no wrapper, so its launch is reported; a receiver cut short names no row, which keeps its call counted.
 NAME_WINDOW = 300
 # A function's name before its parameter list. A miss reads the body as a plain block, named `?`: the test fails.
 PARAMS_NAME_WINDOW = 400
-# Where a receiver's own declarations are looked for when the call has no function whose parameter list is known (a
-# lambda at namespace scope, a signature the head windows miss): this far before the innermost function's '{', or
-# before the call. Otherwise the search starts at the parameter list and needs no window. Too short: a declaration
-# before it is missed, the name is read from outside the function or not at all, and the call counts unless that
-# reading is a listed type with a row. Too long: it reaches into earlier functions, but in_call_scope drops every
-# declaration whose block or parentheses closed before the call, so it cannot read another function's local.
-DECLARATION_WINDOW = 1500
 # `auto name =` before a lambda's capture list, and `else` before `if (`. A lambda name missed drops `/name` from
 # the key, which then differs from ALLOW; an `else if` missed can only let the record rule match more.
 LAMBDA_NAME_WINDOW = 200
@@ -899,10 +880,8 @@ class Code:
         self.params: dict[int, tuple[int, int]] = {}
         self._brace_starts: list[int] | None = None
         self.brace_close: dict[int, int] = {}
-        # the '{' or '(' each one opened inside, so the innermost one around a position is a climb, not a scan
+        # the '{' each '{' opened inside, so the innermost block around a position is a climb, not a scan
         self.brace_parent: dict[int, int | None] = {}
-        self.paren_parent: dict[int, int | None] = {}
-        self._paren_starts: list[int] | None = None
         self.unbalanced: list[str] = []
         self._newlines = [m.start() for m in re.finditer("\n", self.code)]
         self._brace_kinds: dict[int, tuple[str, str | None]] = {}
@@ -919,7 +898,6 @@ class Code:
                 self.sites.append((*starts[si], list(parens), list(braces)))
                 si += 1
             if c == "(":
-                self.paren_parent[pos] = parens[-1] if parens else None
                 parens.append(pos)
             elif c == "{":
                 self.brace_parent[pos] = braces[-1] if braces else None
@@ -1041,16 +1019,6 @@ class Code:
         while b is not None and self.brace_close.get(b, len(self.code)) < pos:
             b = self.brace_parent.get(b)
         return b
-
-    def innermost_paren(self, pos: int) -> int | None:
-        """The '(' of the innermost parenthesis still open at pos, found as innermost_brace finds a '{'."""
-        if self._paren_starts is None:
-            self._paren_starts = sorted(self.paren_parent)
-        i = bisect.bisect_left(self._paren_starts, pos) - 1
-        p = self._paren_starts[i] if i >= 0 else None
-        while p is not None and self.paren_close.get(p, len(self.code)) < pos:
-            p = self.paren_parent.get(p)
-        return p
 
     def braces_at(self, pos: int) -> set[int]:
         """The '{' of every block whose body holds pos."""
@@ -1225,15 +1193,55 @@ class Code:
         return False
 
     def receiver(self, pos: int) -> str | None:
-        """The object a member call at pos (the '.' or '->') is made on: `q` for `q->f(`, `stream()` for
-        `ctx.stream()->f(`, None for anything else (`(*q).f(`, `qs[i].f(`)."""
-        head = self.code[max(0, pos - NAME_WINDOW):pos].rstrip()
-        if head.endswith(")"):
-            open_ = self.paren_open.get(max(0, pos - NAME_WINDOW) + len(head) - 1)
-            name = self.callee(open_) if open_ is not None else None
-            return f"{name}()" if name else None
-        m = re.search(r"(\w+)$", head)
-        return m.group(1) if m else None
+        """The receiver expression of the member call at pos (the '.' or '->'), as written with its whitespace
+        removed: `q`, `engine->queue`, `foo.stream()`, `g_pools[device]`, `(*q)`; None when no name or bracketed
+        group precedes it (a cast's `>`), so no row can name it."""
+        code = self.code
+        lo = max(0, pos - NAME_WINDOW)
+        i = pos
+        operand = True
+        while True:
+            while i > lo and code[i - 1].isspace():
+                i -= 1
+            if i <= lo:
+                break
+            c = code[i - 1]
+            if not operand:
+                if code[i - 2:i] in ("->", "::"):
+                    i -= 2
+                elif c == ".":
+                    i -= 1
+                else:
+                    break
+                operand = True
+            elif c == ")":
+                open_ = self.paren_open.get(i - 1)
+                if open_ is None or open_ < lo:
+                    return None
+                i = open_
+                j = i
+                while j > lo and code[j - 1].isspace():
+                    j -= 1
+                # a call or an index has its callee before it; a parenthesized operand, `(*q)`, ends the expression
+                if not (j > lo and (code[j - 1].isalnum() or code[j - 1] in "_)]")):
+                    break
+            elif c == "]":
+                depth = 0
+                while i > lo:
+                    i -= 1
+                    depth += {"]": 1, "[": -1}.get(code[i], 0)
+                    if depth == 0:
+                        break
+                if depth:
+                    return None
+            elif c.isalnum() or c == "_":
+                m = re.search(r"\w+$", code[lo:i])
+                i = lo + m.start()
+                operand = False
+            else:
+                return None
+        text = re.sub(r"\s+", "", code[i:pos])
+        return text or None
 
     def enclosing(self, braces: list[int]) -> str:
         """The innermost named function around a submit, `Class::` added for a member defined in its class, and
@@ -1353,151 +1361,27 @@ def derive_wrappers_uncached(texts: dict[str, str]) -> set[str]:
     return set(wrappers)
 
 
-# Words a declaration's type may follow (`static Pool p;`, `const Pool & p`), and the text it may follow: a statement
-# or block boundary, a parameter list, a template's `>`, an access label, a line start. `n = w & q` reads as
-# no declaration, because `w` follows `=`.
-DECLARATION_QUALIFIERS = ("static", "const", "constexpr", "inline", "extern", "thread_local", "volatile", "mutable",
-                          "typename", "register")
-DECLARATION_START = re.compile(r"(?:[;{}(,<>\n]|(?<!:):)[ \t]*$|\b(?:" + "|".join(DECLARATION_QUALIFIERS) + r")[ \t]*$")
-# a template argument list holding at most one level of brackets: `<size_t, static_cast<size_t>(zone_id::COUNT)>`
-TEMPLATE_ARGS = r"<(?:[^;{}()<>\n]|\([^;{}()\n]*\)|<[^;{}()<>\n]*>)*>"
-# what may stand between a parameter list's ')' and its body's '{': `) mutable {`, `) -> T {`
-TO_BODY = re.compile(r"\s*(?:(?:mutable|constexpr|noexcept|const|override|final)\b\s*)*(?:->[^;{}]*)?\{")
-
-
-def declarations(code: str, name: str, lo: int = 0, hi: int | None = None) -> list[tuple[int, str, bool]]:
-    """(position, type, is a plain array) of each declaration of name in code[lo:hi]: `T name`, `T & name`,
-    `T * const name`, `T name[N]`, `T name(` for a function (name ending in `()`). `auto` is kept: an auto receiver
-    is read through its initializer, or not at all."""
-    call = name.endswith("()")
-    ident = re.escape(name[:-2] if call else name)
-    # `T name;`, `T name = ...`, `T name[`, `T name(`, a parameter `T name,` / `T name)`; never `x && name == y`
-    after = r"\s*\(" if call else r"\s*(?=[;,)\[{(]|=(?!=)|$)"
-    pattern = re.compile(r"\b([A-Za-z_]\w*(?:::\w+)*)(?:[ \t]*" + TEMPLATE_ARGS + r")?(?:[ \t]*(?:const|&&|&|\*))*"
-                         r"[ \t]+" + ident + r"\b" + after, re.M)
-    found = []
-    for m in pattern.finditer(code, lo, len(code) if hi is None else hi):
-        if m.group(1) in NOT_A_TYPE - {"auto"}:
-            continue
-        before = code[max(0, m.start() - 60):m.start()]
-        if not (DECLARATION_START.search(before) or (m.start() < 60 and not before.strip())):
-            continue
-        found.append((m.start(), m.group(1), code[m.end():m.end() + 8].lstrip().startswith("[")))
-    return found
-
-
-def in_call_scope(code: Code, decl: int, pos: int, braces: list[int]) -> bool:
-    """Whether a declaration at decl is visible at the call at pos: a parameter of the call's function, or declared
-    in a block still open at the call; a declaration in parentheses closed before the call (a lambda's parameters,
-    an if's or a for's head) only when the body after them holds the call."""
-    open_braces = set(braces)
-    fb = code.function_brace(braces)
-    params = code.params.get(fb)
-    if params is not None and params[0] <= decl <= params[1]:
-        return True
-    block = code.innermost_brace(decl)
-    if block is not None and block not in open_braces:
-        return False
-    paren = code.innermost_paren(decl)
-    if paren is not None and code.paren_close.get(paren, len(code.code)) < pos:
-        body = TO_BODY.match(code.code, code.paren_close[paren] + 1)
-        return body is not None and body.end() - 1 in open_braces
-    return True
-
-
-_OUTER: dict[tuple[int, str], set[tuple[str, bool]]] = {}
-
-
-def outer_declarations(text: str, name: str) -> set[tuple[str, bool]]:
-    """The (type, is a plain array) of each declaration of name outside every function body and parenthesis of
-    text: a namespace-scope variable or a class member. Kept per file and name, as a whole-file scan of
-    ggml-sycl.cpp is the census's most expensive step."""
-    code = parse(text)
-    key = (id(code), name)
-    if key not in _OUTER:
-        _OUTER[key] = {(t, arr) for d, t, arr in declarations(code.code, name)
-                       if code.innermost_paren(d) is None and code.function_brace_at(d) is None}
-    return _OUTER[key]
-
-
-def outer_type(name: str, file_text: str, decl_texts: dict[str, str]) -> tuple[str, bool] | None:
-    """A name the function does not declare: its file's declarations decide it; if the file has none, every other
-    file read here. Declarations of more than one type (two classes' members of one name) decide nothing."""
-    found = outer_declarations(file_text, name)
-    if not found:
-        found = set()
-        for text in decl_texts.values():
-            if text is not file_text:
-                found |= outer_declarations(text, name)
-    return next(iter(found)) if len(found) == 1 else None
-
-
-def scoped_declaration(code: Code, name: str, lo: int, hi: int, braces: list[int]) -> tuple[int, str, bool] | None:
-    """The nearest declaration of name in code[lo:hi] that is visible at hi, else None."""
-    visible = [d for d in declarations(code.code, name, lo, hi) if in_call_scope(code, d[0], hi, braces)]
-    return visible[-1] if visible else None
-
-
-def receiver_type(code: Code, pos: int, braces: list[int], file_text: str, decl_texts: dict[str, str]) -> str | None:
-    """The declared type of the receiver of the call at pos, or None when it cannot be read. The function's own
-    declarations decide first, from its parameter list to the call, each visible at the call; a name declared
-    `auto` is read through its initializer when that is a plain name or an element of a plain array, else it is
-    unread. Only a name the function does not declare is looked up outside it (outer_type)."""
-    name = code.receiver(pos)
-    if name is None:
-        return None
-    fb = code.function_brace(braces)
-    lo = code.params[fb][0] if fb in code.params else max(0, (fb or pos) - DECLARATION_WINDOW)
-    local = scoped_declaration(code, name, lo, pos, braces)
-    if local is None:
-        outer = outer_type(name, file_text, decl_texts)
-        return None if outer is None or outer[0] == "auto" else outer[0]
-    decl, found, _ = local
-    if found != "auto":
-        return found
-    # `auto & pool = g_pools[device];` over a plain array `T g_pools[N]`, or `auto & q = other_q;`: one hop
-    alias = re.compile(r"auto\s*[&*]*\s*" + re.escape(name) + r"\s*=\s*(\w+)\s*(\[[^;\]]*\])?\s*;").match(code.code,
-                                                                                                     decl)
-    if alias is None:
-        return None
-    target = scoped_declaration(code, alias.group(1), lo, decl, braces)
-    if target is not None:
-        typed = (target[1], target[2])
-    else:
-        typed = outer_type(alias.group(1), file_text, decl_texts)
-    if typed is None or typed[0] == "auto":
-        return None
-    if alias.group(2) is not None:
-        return typed[0] if typed[1] else None
-    return typed[0]
-
-
-def census(texts: dict[str, str], wrappers: set[str] | None = None, decl_texts: dict[str, str] | None = None,
-           skipped: list[str] | None = None, recorded: list[str] | None = None,
-           table: dict[str, int] | None = None,
+def census(texts: dict[str, str], wrappers: set[str] | None = None, skipped: list[str] | None = None,
+           recorded: list[str] | None = None, table: dict[str, int] | None = None,
            rule_matches: dict[str, list[int]] | None = None,
-           receiver_types: dict[str, dict[str, str]] | None = None,
-           set_aside_table: dict[str, int] | None = None,
-           receiver_matches: dict[str, list[str]] | None = None) -> dict[str, list[tuple[int, str, str]]]:
+           set_aside_table: dict[str, tuple[int, str]] | None = None,
+           receiver_matches: dict[str, list[str]] | None = None,
+           tripped: dict[str, list[str]] | None = None) -> dict[str, list[tuple[int, str, str]]]:
     """The raw sites of each named text, as (line, function, kind) triples. A site is wrapped when any '(' still open
     at it, however far back and however deeply nested, is the argument list of a wrapper call. A launch the record
     rule matches (Code.recorded) is excused only when its "file:function" is a row of table (RECORDED_ON_THE_PATH by
     default) and the rule matches exactly that many launches in the function; each one excused is appended to
     recorded, and the line of every launch the rule matches goes to rule_matches under its "file:function".
-    A submit or shortcut is set aside by its receiver only when the receiver's declared type is listed for its kind
-    in receiver_types (NON_QUEUE_RECEIVER_TYPES) and its "kind:file:function" is a row of set_aside_table
-    (SET_ASIDE_BY_RECEIVER) whose count equals the calls the rule finds there; every call the rule finds goes to
-    receiver_matches under that key. A shortcut inside a submit's parentheses is that submit's command group's
-    call, not a site, unless the submit is set aside (a host pool's job may launch on a queue). Each call set aside
-    is appended to skipped with its reason."""
+    A call is set aside by its receiver only when its "kind:file:function:receiver" is a row of set_aside_table
+    (SET_ASIDE_BY_RECEIVER), the function holds exactly the row's count of such calls, and queue_tripwire does not
+    refuse the row; the file:line of each call with a row goes to receiver_matches under its key, and each refusal to
+    tripped. A shortcut inside a submit's parentheses is that submit's command group's call, not a site, unless the
+    submit is set aside (a host pool's job may launch on a queue). Each call set aside is appended to skipped with
+    its reason."""
     if wrappers is None:
         wrappers = derive_wrappers(texts)
-    if decl_texts is None:
-        decl_texts = texts
     if table is None:
         table = RECORDED_ON_THE_PATH
-    if receiver_types is None:
-        receiver_types = NON_QUEUE_RECEIVER_TYPES
     if set_aside_table is None:
         set_aside_table = SET_ASIDE_BY_RECEIVER
     found: dict[str, list[tuple[int, str, str]]] = {}
@@ -1524,23 +1408,29 @@ def census(texts: dict[str, str], wrappers: set[str] | None = None, decl_texts: 
         set_aside: set[int] = set()
         # submits first: whether a submit is set aside decides whether the shortcuts inside it count
         for which in ("submit", "shortcut"):
-            candidates: dict[str, list[tuple[int, str]]] = {}
+            calls: dict[str, list[tuple[int, list[int], str]]] = {}
             for pos, kind, method, parens, braces in launches:
                 if kind != which or (kind == "shortcut" and inside_counted_submit(code, parens, set_aside)):
                     continue
-                typed = receiver_type(code, pos, braces, src, decl_texts)
-                if typed in receiver_types.get(kind, {}):
-                    where = f"{name}:{code.line(pos)} {code.receiver(pos)}.{method}( declared {typed}"
-                    candidates.setdefault(f"{kind}:{name}:{code.enclosing(braces)}", []).append((pos, where))
-            for key, calls in candidates.items():
+                receiver = code.receiver(pos)
+                key = f"{kind}:{name}:{code.enclosing(braces)}:{receiver}"
+                if receiver is not None and key in set_aside_table:
+                    calls.setdefault(key, []).append((pos, braces, receiver))
+            for key, held in calls.items():
                 if receiver_matches is not None:
-                    receiver_matches.setdefault(key, []).extend(where for _, where in calls)
-                if set_aside_table.get(key) == len(calls):
-                    set_aside.update(pos for pos, _ in calls)
+                    receiver_matches.setdefault(key, []).extend(f"{name}:{code.line(pos)}" for pos, _, _ in held)
+                if set_aside_table[key][0] != len(held):
+                    continue
+                refused = queue_tripwire(code, held[0][1], held[0][2])
+                if refused:
+                    if tripped is not None:
+                        tripped.setdefault(key, []).extend(f"{name}:{line}" for line in refused)
+                    continue
+                set_aside.update(pos for pos, _, _ in held)
         for pos, kind, method, parens, braces in launches:
             why = None
             if pos in set_aside:
-                why = f"receiver {code.receiver(pos)} declared {receiver_type(code, pos, braces, src, decl_texts)}"
+                why = f"on {code.receiver(pos)}, a SET_ASIDE_BY_RECEIVER row"
             elif kind == "shortcut" and inside_counted_submit(code, parens, set_aside):
                 why = "inside a submit"
             if why is not None:
@@ -1549,6 +1439,43 @@ def census(texts: dict[str, str], wrappers: set[str] | None = None, decl_texts: 
                 continue
             found.setdefault(name, []).append((code.line(pos), code.enclosing(braces), kind))
     return found
+
+
+# `queue` or `queue_ptr` as a whole token: `sycl::queue`, `dpct::queue_ptr`, but not `lazy_io_queue`
+QUEUE_TOKEN = re.compile(r"\bqueue(?:_ptr)?\b")
+
+
+def queue_tripwire(code: Code, braces: list[int], receiver: str) -> list[int]:
+    """The lines on which the function around a set-aside call plainly binds the receiver's last name next to the
+    token `queue`, in one statement (text between `;`, `{` and `}`): `queue & NAME`, `queue * NAME`, `queue NAME`,
+    `: NAME` after `queue` (a range-for), or `[NAME` / `NAME =` with `queue` in the statement. A tripwire, not a
+    resolver: it reads no type and follows no alias, and a row it does not refuse is still only as good as the
+    reviewer who read the receiver's declaration. It looks from the function's parameter list to its end."""
+    last = re.sub(r"(?:\([^()]*\)|\[[^\[\]]*\])+$", "", receiver)
+    names = re.findall(r"\w+", last)
+    if not names:
+        return []
+    ident = re.escape(names[-1])
+    binds = [
+        re.compile(r"\bqueue(?:_ptr)?\b\s*(?:<[^;{}]*?>)?\s*(?:const\s*)?[&*]+\s*(?:const\s+)?" + ident + r"\b"),
+        re.compile(r"\bqueue(?:_ptr)?\s+(?:const\s+)?" + ident + r"\b"),
+        re.compile(r"\bqueue(?:_ptr)?\b[^;{}]*?(?<!:):(?!:)\s*" + ident + r"\b"),
+        re.compile(r"\[\s*&?\s*" + ident + r"\b|\b" + ident + r"\s*=(?!=)"),
+    ]
+    fb = code.function_brace(braces)
+    lo = code.params[fb][0] if fb in code.params else fb
+    hi = code.brace_close.get(fb, len(code.code)) if fb else len(code.code)
+    lines = []
+    for statement in re.finditer(r"[^;{}]+", code.code[lo:hi]):
+        text = statement.group(0)
+        if not QUEUE_TOKEN.search(text):
+            continue
+        for bind in binds:
+            m = bind.search(text)
+            if m:
+                lines.append(code.line(lo + statement.start() + m.start()))
+                break
+    return lines
 
 
 def inside_counted_submit(code: Code, parens: list[int], set_aside: set[int]) -> bool:
@@ -1620,24 +1547,37 @@ def record_table_problems(rule_matches: dict[str, list[int]], table: dict[str, i
     return problems
 
 
-def set_aside_problems(receiver_matches: dict[str, list[str]], table: dict[str, int]) -> list[str]:
-    """One line per "kind:file:function" whose SET_ASIDE_BY_RECEIVER row is not the number of calls the receiver rule
-    would set aside there: each call with its file:line, receiver and declared type, and what to do."""
+def set_aside_problems(receiver_matches: dict[str, list[str]], table: dict[str, tuple[int, str]],
+                       tripped: dict[str, list[str]] | None = None) -> list[str]:
+    """One line per SET_ASIDE_BY_RECEIVER row that does not set its calls aside: the tripwire refused it, its count
+    is not the number of calls on that receiver in the function, or no such call is left; each says what to do."""
+    tripped = tripped or {}
     problems = []
     for key in sorted(set(receiver_matches) | set(table)):
         calls = receiver_matches.get(key, [])
-        row = table.get(key, 0)
-        if len(calls) == row:
-            continue
-        if calls:
-            problems.append(f"{key}: the receiver rule would set aside {len(calls)} ({'; '.join(calls)}), "
-                            f"SET_ASIDE_BY_RECEIVER says {row}: read each receiver's declaration and its call; if one "
-                            "is a queue, the resolver misread it: fix the resolver and do not add the row; otherwise "
-                            f"set the row to {len(calls)} (To update, e)")
-        else:
-            problems.append(f"{key}: SET_ASIDE_BY_RECEIVER says {row}, the receiver rule sets aside 0: delete the row "
-                            "(To update, e)")
+        row = table[key][0] if key in table else 0
+        receiver = key.rsplit(":", 1)[1] if key in table else key
+        if key in tripped:
+            name = re.findall(r"\w+", re.sub(r"(?:\([^()]*\)|\[[^\[\]]*\])+$", "", receiver))[-1]
+            problems.append(f"{key}: refused: {', '.join(tripped[key])} binds {name} next to `queue`; read its "
+                            "declaration, and if the receiver is a queue, delete the row (To update, e)")
+        elif calls and len(calls) != row:
+            problems.append(f"{key}: {len(calls)} call(s) on this receiver in the function ({', '.join(calls)}), "
+                            f"SET_ASIDE_BY_RECEIVER says {row}: read the declaration of each receiver; if it is a "
+                            f"queue, delete the row; otherwise set the count to {len(calls)} (To update, e)")
+        elif not calls:
+            problems.append(f"{key}: SET_ASIDE_BY_RECEIVER says {row}, no call in the function has this receiver: "
+                            "delete the row (To update, e)")
     return problems
+
+
+def receiver_sections(skipped: list[str], problems: list[str]) -> str:
+    """The two receiver sections of `--print`: each call set aside by a row, and each row that does not match."""
+    out = ["# set aside by a SET_ASIDE_BY_RECEIVER row"]
+    out += sorted(entry for entry in skipped if "SET_ASIDE_BY_RECEIVER" in entry) or ["(none)"]
+    out.append("# SET_ASIDE_BY_RECEIVER rows that do not match the tree (excluded files included)")
+    out += problems or ["(none)"]
+    return "\n".join(out)
 
 
 def paste_line(key: str, count: int, reason: str) -> str:
@@ -1676,13 +1616,10 @@ def print_report() -> int:
     texts = read_tree()
     skipped: list[str] = []
     matches: dict[str, list[int]] = {}
-    found = census({name: texts[name] for name in FILES}, derive_wrappers(texts), texts, skipped,
+    found = census({name: texts[name] for name in FILES}, derive_wrappers(texts), skipped,
                    rule_matches=matches)
     print(report(found, matches, ALLOW, RECORDED_ON_THE_PATH))
-    print("# set aside by the receiver rule")
-    print("\n".join(sorted(entry for entry in skipped if "inside a submit" not in entry)))
-    print("# SET_ASIDE_BY_RECEIVER rows the receiver rule does not match (excluded files included)")
-    print("\n".join(set_aside_problems(tree_receiver_matches(texts), SET_ASIDE_BY_RECEIVER)) or "(none)")
+    print(receiver_sections(skipped, tree_set_aside_problems(texts)))
     print(count_by_kind_and_file(found))
     print(f"{sum(len(sites) for sites in found.values())} raw launch(es) in {len(census_keys(found))} key(s) over "
           f"{len(FILES)} file(s)")
@@ -1690,8 +1627,7 @@ def print_report() -> int:
 
 
 def read_tree() -> dict[str, str]:
-    """FILES, the profiler header (wrapper definitions) and the header beside each .cpp of FILES (its class members'
-    declarations, which a receiver's type is read from)."""
+    """FILES, the profiler header and the header beside each .cpp of FILES: every text a wrapper may be defined in."""
     texts = {}
     for name in FILES + [PROFILER_HEADER]:
         path = SYCL / name
@@ -1704,35 +1640,27 @@ def read_tree() -> dict[str, str]:
     return texts
 
 
-def excluded_file_texts(texts: dict[str, str], name: str) -> dict[str, str]:
-    """texts with an excluded file and the header beside it added, to census that file as if it were on the path."""
-    file_texts = dict(texts)
-    file_texts[name] = (SYCL / name).read_text(encoding="utf-8")
-    header = SYCL / (name[:-4] + ".hpp")
-    if header.exists():
-        file_texts[header.name] = header.read_text(encoding="utf-8")
-    return file_texts
-
-
 def receiver_rule_files() -> list[str]:
-    """The excluded files whose reason is the receiver rule: their set-asides are rows of SET_ASIDE_BY_RECEIVER."""
+    """The excluded files whose reason is a SET_ASIDE_BY_RECEIVER row: their set-asides are rows of that table."""
     return [name for name, reason in EXCLUDED_FILES.items() if BY_RECEIVER_CHECKED in reason]
 
 
-def tree_receiver_matches(texts: dict[str, str]) -> dict[str, list[str]]:
-    """What the receiver rule would set aside, per "kind:file:function", over FILES and the files excluded by it."""
+def tree_set_aside_problems(texts: dict[str, str]) -> list[str]:
+    """set_aside_problems over FILES and the files excluded by a receiver row, whose rows live in the same table."""
     matches: dict[str, list[str]] = {}
-    census({name: texts[name] for name in FILES}, derive_wrappers(texts), texts, receiver_matches=matches)
+    tripped: dict[str, list[str]] = {}
+    census({name: texts[name] for name in FILES}, derive_wrappers(texts), receiver_matches=matches,
+           tripped=tripped)
     for name in receiver_rule_files():
-        file_texts = excluded_file_texts(texts, name)
-        census({name: file_texts[name]}, derive_wrappers(texts), file_texts, receiver_matches=matches)
-    return matches
+        census({name: (SYCL / name).read_text(encoding="utf-8")}, derive_wrappers(texts), receiver_matches=matches,
+               tripped=tripped)
+    return set_aside_problems(matches, SET_ASIDE_BY_RECEIVER, tripped)
 
 
 def census_tree(texts: dict[str, str], skipped: list[str] | None = None,
                 rule_matches: dict[str, list[int]] | None = None) -> dict[str, list[tuple[int, str, str]]]:
     wrappers = derive_wrappers(texts)
-    return census({name: texts[name] for name in FILES}, wrappers, texts, skipped, rule_matches=rule_matches)
+    return census({name: texts[name] for name in FILES}, wrappers, skipped, rule_matches=rule_matches)
 
 
 def format_sites(found: dict[str, list[tuple[int, str, str]]]) -> str:
@@ -2016,7 +1944,7 @@ def test_the_record_rule_excuses_exactly_the_tables_launches_of_the_tree():
     texts = read_tree()
     excused: list[str] = []
     matches: dict[str, list[int]] = {}
-    census({name: texts[name] for name in FILES}, derive_wrappers(texts), texts, recorded=excused,
+    census({name: texts[name] for name in FILES}, derive_wrappers(texts), recorded=excused,
            rule_matches=matches)
     wrong = record_table_problems(matches, RECORDED_ON_THE_PATH)
     assert not wrong, "\n".join(wrong)
@@ -2123,7 +2051,7 @@ def test_a_shortcut_with_no_row_for_its_receiver_counts():
 
 
 def test_every_set_aside_row_is_what_the_receiver_rule_finds_in_the_tree():
-    problems = set_aside_problems(tree_receiver_matches(read_tree()), SET_ASIDE_BY_RECEIVER)
+    problems = tree_set_aside_problems(read_tree())
     assert not problems, "SET_ASIDE_BY_RECEIVER is wrong:\n" + "\n".join(problems)
 
 
@@ -2247,11 +2175,11 @@ def test_every_file_excused_by_the_receiver_rule_censuses_to_nothing():
     cited = receiver_rule_files()
     assert cited, "no exclusion cites the receiver rule, so this test checks nothing"
     for name in cited:
-        file_texts = excluded_file_texts(texts, name)
         skipped: list[str] = []
-        found = census({name: file_texts[name]}, derive_wrappers(texts), file_texts, skipped)
+        found = census({name: (SYCL / name).read_text(encoding="utf-8")}, derive_wrappers(texts), skipped)
         assert not found, f"{name} is excluded as explained by the receiver rule, but holds:\n{format_sites(found)}"
-        assert any(".submit( receiver" in entry for entry in skipped), f"{name}: the receiver rule set nothing aside"
+        assert any(".submit( on " in entry and "SET_ASIDE_BY_RECEIVER" in entry for entry in skipped), \
+            f"{name}: no SET_ASIDE_BY_RECEIVER row set anything aside"
 
 
 def test_every_allowlist_entry_has_a_reason():
@@ -2271,8 +2199,7 @@ def test_census_matches_the_allowlist():
     assert not record_table_problems(matches, RECORDED_ON_THE_PATH), \
         "RECORDED_ON_THE_PATH is wrong (test_the_record_rule_excuses_exactly_the_tables_launches_of_the_tree names " \
         "the row); the ALLOW comparison waits for it"
-    assert not [p for p in set_aside_problems(tree_receiver_matches(texts), SET_ASIDE_BY_RECEIVER)
-                if p.split(":")[1] in FILES], \
+    assert not [p for p in tree_set_aside_problems(texts) if p.split(":")[1] in FILES], \
         "SET_ASIDE_BY_RECEIVER is wrong (test_every_set_aside_row_is_what_the_receiver_rule_finds_in_the_tree names " \
         "the row); the ALLOW comparison waits for it"
     problems = diff_against_allow(found, ALLOW, matches)
