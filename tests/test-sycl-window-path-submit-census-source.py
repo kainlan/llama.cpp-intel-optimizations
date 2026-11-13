@@ -2086,11 +2086,12 @@ def test_a_handler_call_inside_a_raw_submit_yields_one_site_the_submit():
         "static void launch(sycl::handler & cgh) { cgh.parallel_for(r, k); }\n"
     )
     skipped: list[str] = []
-    assert receiver_census(sample, None, {"shortcut:x.cpp:launch": 1}, skipped=skipped) == [("a", "submit")]
+    assert receiver_census(sample, {"shortcut:x.cpp:launch:cgh": (1, "a handler")}, skipped=skipped) == [
+        ("a", "submit")]
     assert skipped == [
         "x.cpp:a .parallel_for( inside a submit",
         "x.cpp:a .memcpy( inside a submit",
-        "x.cpp:launch .parallel_for( receiver cgh declared sycl::handler",
+        "x.cpp:launch .parallel_for( on cgh, a SET_ASIDE_BY_RECEIVER row",
     ]
 
 
@@ -2107,16 +2108,17 @@ def test_std_memcpy_is_no_launch_a_listed_std_array_fill_is_set_aside_and_an_unl
         "void b(sycl::queue & q2) { q2.fill(ptr, 0, n); }\n"
     )
     skipped: list[str] = []
-    # staging_buffer is on no allowlist, so its copy counts: only a reviewed type and row set a call aside
-    assert receiver_census(sample, None, {"shortcut:x.cpp:a": 1}, skipped=skipped) == [("a", "shortcut"),
-                                                                                       ("b", "shortcut")]
-    assert skipped == ["x.cpp:a .fill( receiver arr declared std::array"]
+    # buf has no row, so its copy counts: only a reviewed row sets a call aside
+    assert receiver_census(sample, {"shortcut:x.cpp:a:arr": (1, "a std::array")}, skipped=skipped) == [
+        ("a", "shortcut"), ("b", "shortcut")]
+    assert skipped == ["x.cpp:a .fill( on arr, a SET_ASIDE_BY_RECEIVER row"]
 
 
-def test_a_shortcut_on_a_receiver_of_unknown_type_counts():
+def test_a_shortcut_with_no_row_for_its_receiver_counts():
     sample = "void a() { auto q = make_queue(); q.parallel_for(r, k); }\n"
     skipped: list[str] = []
-    assert receiver_census(sample, None, {"shortcut:x.cpp:a": 1}, skipped=skipped) == [("a", "shortcut")]
+    assert receiver_census(sample, {"shortcut:x.cpp:a:p": (1, "another receiver")}, skipped=skipped) == [
+        ("a", "shortcut")]
     assert skipped == []
 
 
@@ -2278,19 +2280,18 @@ def test_census_matches_the_allowlist():
         " --print` lists every key and writes the ALLOW lines to paste"
 
 
-def test_a_submit_on_a_listed_receiver_type_is_set_aside_and_an_unresolved_one_counts():
+def test_a_submit_on_a_receiver_with_a_row_is_set_aside_and_every_other_counts():
     sample = (
         "void a(thread_pool & pool) { pool.submit([] { work(); }); }\n"
         "void b(sycl::queue & q) { q.submit(cgf); }\n"
         "void c() { auto q = make_queue(); q.submit(cgf); }\n"
     )
-    rows = {"submit:x.cpp:a": 1, "submit:x.cpp:b": 1, "submit:x.cpp:c": 1}
     skipped: list[str] = []
-    # a host thread pool's submit is no device launch; an unread receiver keeps the submit counted (fails closed)
-    assert receiver_census(sample, {"thread_pool"}, rows, skipped=skipped) == [("b", "submit"), ("c", "submit")]
-    assert skipped == ["x.cpp:a .submit( receiver pool declared thread_pool"]
-    # the same pool type off the allowlist: counted, row or not
-    assert receiver_census(sample, None, rows) == [("a", "submit"), ("b", "submit"), ("c", "submit")]
+    # no type is read: the row for `pool` in a is what sets that submit aside, and nothing else is
+    assert receiver_census(sample, {"submit:x.cpp:a:pool": (1, "a host pool")}, skipped=skipped) == [
+        ("b", "submit"), ("c", "submit")]
+    assert skipped == ["x.cpp:a .submit( on pool, a SET_ASIDE_BY_RECEIVER row"]
+    assert receiver_census(sample, {}) == [("a", "submit"), ("b", "submit"), ("c", "submit")]
 
 
 def test_an_if_constexpr_block_is_not_named_as_a_function():
@@ -2384,120 +2385,118 @@ def test_every_nothing_includes_it_reason_is_true():
     assert not false, f"excluded as {NOT_INCLUDED!r}, but included by: {false}"
 
 
-def receiver_census(src: str, types: set[str] | None, rows: dict[str, int], extra: dict[str, str] | None = None,
-                    skipped: list[str] | None = None,
-                    matches: dict[str, list[str]] | None = None) -> list[tuple[str, str]]:
-    """(function, kind) of each raw launch of src as x.cpp, with types (for both kinds) standing in for
-    NON_QUEUE_RECEIVER_TYPES when given, rows for SET_ASIDE_BY_RECEIVER, and extra files to read declarations from."""
-    texts = {"x.cpp": src, **(extra or {})}
-    kinds = None if types is None else {kind: {t: "test" for t in types} for kind in ("submit", "shortcut")}
-    found = census({"x.cpp": src}, None, texts, skipped, receiver_types=kinds, set_aside_table=rows,
-                   receiver_matches=matches)
+
+
+
+
+
+
+
+def receiver_census(src: str, rows: dict[str, tuple[int, str]], skipped: list[str] | None = None,
+                    matches: dict[str, list[str]] | None = None,
+                    tripped: dict[str, list[str]] | None = None) -> list[tuple[str, str]]:
+    """(function, kind) of each raw launch of src as x.cpp, with rows standing in for SET_ASIDE_BY_RECEIVER."""
+    found = census({"x.cpp": src}, skipped=skipped, set_aside_table=rows, receiver_matches=matches,
+                   tripped=tripped)
     return [(func, kind) for _, func, kind in found.get("x.cpp", [])]
 
 
-def test_a_set_aside_needs_a_listed_type_and_a_row_that_matches_the_function():
+def test_a_row_names_the_receiver_expression_as_written_prefix_included():
     sample = (
-        "void a(ThreadPool & pool) { pool.submit(job); }\n"
-        "void b(ThreadPool & pool) { pool.submit(job); pool.submit(job); }\n"
-        "void c(OtherPool & pool) { pool.submit(job); }\n"
-        "void d(ThreadPool & pool) { pool.submit(job); }\n"
+        "void f(Ctx * c, Ctx & d, Pool & q, lazy_engine * engine) {\n"
+        "    c->q.submit(job);\n"
+        "    d.q.submit(job);\n"
+        "    q.submit(job);\n"
+        "    foo.stream().submit(job);\n"
+        "    stream().submit(job);\n"
+        "    engine -> queue . submit(job);\n"
+        "}\n"
     )
-    rows = {"submit:x.cpp:a": 1, "submit:x.cpp:b": 1, "submit:x.cpp:c": 1}
+    rows = {"submit:x.cpp:f:q": (1, "test"), "submit:x.cpp:f:stream()": (1, "test"),
+            "submit:x.cpp:f:engine->queue": (1, "test")}
     skipped: list[str] = []
-    # b: the row says 1, the rule finds 2; c: OtherPool is not listed; d: no row
-    assert receiver_census(sample, {"ThreadPool"}, rows, skipped=skipped) == [
-        ("b", "submit"), ("b", "submit"), ("c", "submit"), ("d", "submit")]
-    assert skipped == ["x.cpp:a .submit( receiver pool declared ThreadPool"]
+    assert receiver_census(sample, rows, skipped=skipped) == [("f", "submit"), ("f", "submit"), ("f", "submit")]
+    assert skipped == [
+        "x.cpp:f .submit( on q, a SET_ASIDE_BY_RECEIVER row",
+        "x.cpp:f .submit( on stream(), a SET_ASIDE_BY_RECEIVER row",
+        "x.cpp:f .submit( on engine->queue, a SET_ASIDE_BY_RECEIVER row",
+    ]
+    found = census({"x.cpp": sample}, set_aside_table=rows)
+    assert [line for line, _, _ in found["x.cpp"]] == [2, 3, 5]
 
 
-def test_a_receiver_the_resolver_cannot_prove_is_listed_stays_counted():
-    rows = {"submit:x.cpp:f": 1, "submit:x.cpp:S::f": 1}
-    for src in [
-        "template <typename Q> void f(Q & q) { q.submit(cg); }\n",
-        "using queue_t = sycl::queue;\nvoid f(queue_t & q) { q.submit(cg); }\n",
-        "typedef sycl::queue queue_t;\nvoid f(queue_t * q) { q->submit(cg); }\n",
-        "void f(std::unique_ptr<sycl::queue> & q) { q->submit(cg); }\n",
-        "void f(std::optional<sycl::queue> & q) { q->submit(cg); }\n",
-        "struct S { std::shared_ptr<sycl::queue> q; void f() { q->submit(cg); } };\n",
-    ]:
-        assert len(receiver_census(src, None, rows)) == 1, f"not counted:\n{src}"
-
-
-def test_a_declaration_out_of_the_calls_scope_is_not_its_receivers():
-    rows = {"submit:x.cpp:f": 1}
-    for src in [
-        # a declaration in another function
-        "void a() { Pool stream; stream.run(); }\nvoid f() { stream.submit(cg); }\nsycl::queue stream;\n",
-        # two classes' members of one name: the file cannot say which `q` is meant
-        "struct A { sycl::queue q; };\nstruct B { Pool q; };\nvoid f(A & a) { a.q.submit(cg); }\n",
-        "struct B { Pool q; };\nstruct A { sycl::queue q; };\nvoid f(A & a) { a.q.submit(cg); }\n",
-        # an inner block closed before the call
-        "void f(sycl::queue & q) {\n    { Pool q; q.run(); }\n    q.submit(cg);\n}\n",
-        # an expression that reads like a declaration of a reference
-        "void f(sycl::queue & q, Foo w) {\n    size_t n = w & q;\n    q.submit(cg);\n}\n",
-    ]:
-        assert receiver_census(src, {"Pool", "w"}, rows) == [("f", "submit")], f"set aside:\n{src}"
-
-
-def test_a_declaration_in_the_calls_scope_still_sets_it_aside():
-    for src, rows in [
-        ("void f(Pool & q) {\n    { sycl::queue q; }\n    q.submit(job);\n}\n", {"submit:x.cpp:f": 1}),
-        ("void f() {\n    auto g = [&](Pool & p) { p.submit(job); };\n}\n", {"submit:x.cpp:f/g": 1}),
-        ("static Pool g_pools[4];\nvoid f(int d) {\n    auto & pool = g_pools[d];\n    pool.submit(job);\n}\n",
-         {"submit:x.cpp:f": 1}),
-        ("void f() {\n    Pool p;\n    if (c) {\n        p.submit(job);\n    }\n}\n", {"submit:x.cpp:f": 1}),
-        ("struct S { Pool p_; void f(); };\nvoid S::f() { p_.submit(job); }\n", {"submit:x.cpp:S::f": 1}),
-    ]:
-        assert receiver_census(src, {"Pool"}, rows) == [], f"counted:\n{src}"
-
-
-def test_a_queue_shortcut_inside_a_set_aside_submit_counts():
-    sample = "void f(ThreadPool & pool, sycl::queue & q) {\n    pool.submit([&] { q.memcpy(a, b, n); });\n}\n"
-    skipped: list[str] = []
-    assert receiver_census(sample, {"ThreadPool"}, {"submit:x.cpp:f": 1}, skipped=skipped) == [("f", "shortcut")]
-    assert skipped == ["x.cpp:f .submit( receiver pool declared ThreadPool"]
-    # inside a counted submit, the handler's call is that submit's command, not a second launch
-    sample = "void f(sycl::queue & q) {\n    q.submit([&](sycl::handler & h) { h.memcpy(a, b, n); });\n}\n"
-    assert receiver_census(sample, {"ThreadPool"}, {"submit:x.cpp:f": 1}) == [("f", "submit")]
-
-
-def test_an_auto_receiver_and_a_comparison_are_never_read_through_another_declaration():
-    rows = {"submit:x.cpp:f": 1}
-    for src, types in [
-        ("void g() { Pool q; q.run(); }\nvoid f() {\n    auto q = make();\n    q.submit(c);\n}\n", {"Pool"}),
-        # a file-scope `Pool q`: only the auto receiver's own initializer may decide it
-        ("Pool q;\nvoid f() {\n    auto q = make();\n    q.submit(c);\n}\n", {"Pool"}),
-        ("void f(sycl::queue * cpu_q, void * x) {\n    bool b = x != nullptr && cpu_q == nullptr;\n"
-         "    cpu_q->submit(c);\n}\n", {"nullptr"}),
-        # `(ok && cpu_q == ...` reads as a declaration of cpu_q of type ok but for the `==`, and the if's body holds
-        # the call, so the scope check would keep it
-        ("void f(sycl::queue * cpu_q, bool ok) {\n    if (ok && cpu_q == other) {\n        cpu_q->submit(c);\n"
-         "    }\n}\n", {"ok"}),
-    ]:
-        assert receiver_census(src, types, rows) == [("f", "submit")], f"set aside:\n{src}"
-
-
-def test_a_set_aside_row_mismatch_names_each_site_its_receiver_and_type_and_what_to_do():
+def test_a_row_whose_count_differs_or_whose_call_is_gone_names_what_to_do():
     sample = (
         "void a(ThreadPool & pool) {\n    pool.submit(job);\n    pool.submit(job);\n}\n"
         "void b(ThreadPool & pool) {\n    pool.submit(job);\n}\n"
     )
-    rows = {"submit:x.cpp:a": 1, "submit:x.cpp:gone": 2}
+    rows = {"submit:x.cpp:a:pool": (1, "a host pool"), "submit:x.cpp:gone:pool": (2, "a host pool")}
     matches: dict[str, list[str]] = {}
-    receiver_census(sample, {"ThreadPool"}, rows, matches=matches)
+    # b has no row, so its call counts and is no problem of the table
+    assert receiver_census(sample, rows, matches=matches) == [("a", "submit"), ("a", "submit"), ("b", "submit")]
     assert set_aside_problems(matches, rows) == [
-        "submit:x.cpp:a: the receiver rule would set aside 2 (x.cpp:2 pool.submit( declared ThreadPool; x.cpp:3 "
-        "pool.submit( declared ThreadPool), SET_ASIDE_BY_RECEIVER says 1: read each receiver's declaration and its "
-        "call; if one is a queue, the resolver misread it: fix the resolver and do not add the row; otherwise set "
-        "the row to 2 (To update, e)",
-        "submit:x.cpp:b: the receiver rule would set aside 1 (x.cpp:6 pool.submit( declared ThreadPool), "
-        "SET_ASIDE_BY_RECEIVER says 0: read each receiver's declaration and its call; if one is a queue, the "
-        "resolver misread it: fix the resolver and do not add the row; otherwise set the row to 1 (To update, e)",
-        "submit:x.cpp:gone: SET_ASIDE_BY_RECEIVER says 2, the receiver rule sets aside 0: delete the row "
+        "submit:x.cpp:a:pool: 2 call(s) on this receiver in the function (x.cpp:2, x.cpp:3), SET_ASIDE_BY_RECEIVER "
+        "says 1: read the declaration of each receiver; if it is a queue, delete the row; otherwise set the count to "
+        "2 (To update, e)",
+        "submit:x.cpp:gone:pool: SET_ASIDE_BY_RECEIVER says 2, no call in the function has this receiver: delete the "
+        "row (To update, e)",
+    ]
+    rows["submit:x.cpp:a:pool"] = (2, "a host pool")
+    del rows["submit:x.cpp:gone:pool"]
+    matches.clear()
+    assert receiver_census(sample, rows, matches=matches) == [("b", "submit")]
+    assert set_aside_problems(matches, rows) == []
+
+
+def test_the_tripwire_refuses_a_row_whose_name_the_function_binds_to_a_queue():
+    for src, line in [
+        ("void f(sycl::queue & ready) {\n    ready.fill(x, 0, n);\n}\n", 1),
+        ("void f() {\n    sycl::queue * ready = get();\n    ready->fill(x, 0, n);\n}\n", 2),
+        ("void f(std::vector<sycl::queue *> & qs) {\n    for (sycl::queue * ready : qs) {\n"
+         "        ready->fill(x, 0, n);\n    }\n}\n", 2),
+    ]:
+        rows = {"shortcut:x.cpp:f:ready": (1, "a std::array")}
+        matches: dict[str, list[str]] = {}
+        tripped: dict[str, list[str]] = {}
+        assert receiver_census(src, rows, matches=matches, tripped=tripped) == [("f", "shortcut")], src
+        assert set_aside_problems(matches, rows, tripped) == [
+            f"shortcut:x.cpp:f:ready: refused: x.cpp:{line} binds ready next to `queue`; read its declaration, and if "
+            "the receiver is a queue, delete the row (To update, e)"], src
+    # a std::array of that name in a function that also takes a queue is not refused
+    src = "void f(sycl::queue & q) {\n    std::array<int, 4> ready;\n    ready.fill(0);\n    q.memset(p, 0, n);\n}\n"
+    assert receiver_census(src, {"shortcut:x.cpp:f:ready": (1, "a std::array")}) == [("f", "shortcut")]
+
+
+def test_a_queue_shortcut_inside_a_submit_set_aside_by_a_row_counts():
+    sample = "void f(ThreadPool & pool, sycl::queue & q) {\n    pool.submit([&] { q.memcpy(a, b, n); });\n}\n"
+    skipped: list[str] = []
+    assert receiver_census(sample, {"submit:x.cpp:f:pool": (1, "a host pool")}, skipped=skipped) == [
+        ("f", "shortcut")]
+    assert skipped == ["x.cpp:f .submit( on pool, a SET_ASIDE_BY_RECEIVER row"]
+    # inside a counted submit, the handler's call is that submit's command, not a second launch
+    sample = "void f(sycl::queue & q) {\n    q.submit([&](sycl::handler & h) { h.memcpy(a, b, n); });\n}\n"
+    assert receiver_census(sample, {"submit:x.cpp:f:pool": (1, "a host pool")}) == [("f", "submit")]
+
+
+def test_the_print_report_lists_the_set_aside_calls_and_the_rows_that_do_not_match():
+    sample = "void a(ThreadPool & pool) {\n    pool.submit(job);\n}\nvoid b(Pool & p) {\n    p.submit(job);\n}\n"
+    rows = {"submit:x.cpp:a:pool": (1, "a host pool"), "submit:x.cpp:b:p": (2, "a host pool")}
+    skipped: list[str] = []
+    matches: dict[str, list[str]] = {}
+    receiver_census(sample, rows, skipped=skipped, matches=matches)
+    assert receiver_sections(skipped, set_aside_problems(matches, rows)).split("\n") == [
+        "# set aside by a SET_ASIDE_BY_RECEIVER row",
+        "x.cpp:a .submit( on pool, a SET_ASIDE_BY_RECEIVER row",
+        "# SET_ASIDE_BY_RECEIVER rows that do not match the tree (excluded files included)",
+        "submit:x.cpp:b:p: 1 call(s) on this receiver in the function (x.cpp:5), SET_ASIDE_BY_RECEIVER says 2: read "
+        "the declaration of each receiver; if it is a queue, delete the row; otherwise set the count to 1 "
         "(To update, e)",
     ]
-    assert set_aside_problems(matches, {"submit:x.cpp:a": 2, "submit:x.cpp:b": 1}) == []
+    assert receiver_sections([], []).split("\n") == [
+        "# set aside by a SET_ASIDE_BY_RECEIVER row", "(none)",
+        "# SET_ASIDE_BY_RECEIVER rows that do not match the tree (excluded files included)", "(none)",
+    ]
+
 
 
 def test_an_unlisted_launch_the_record_rule_matches_also_names_the_record_table():
