@@ -1818,8 +1818,10 @@ int main() {
         CHECK(zone_compute_term_n_ubatch_read(s) == 0, "and a later load cannot restore it");
         s = zone_compute_term_n_ubatch_store(s, 512);
         CHECK(zone_compute_term_n_ubatch_read(s) == 0, "not even with the first value");
-        CHECK(zone_compute_term_n_ubatch_read(zone_compute_term_n_ubatch_store(0, UINT32_MAX)) == 0,
-              "a micro-batch equal to the disagreement mark is never read as a shape");
+        CHECK(zone_compute_term_n_ubatch_store(0, UINT32_MAX) == 0,
+              "a micro-batch equal to the disagreement mark records nothing on a first load");
+        CHECK(zone_compute_term_n_ubatch_read(zone_compute_term_n_ubatch_store(512, UINT32_MAX)) == 512,
+              "and turns no record off: only a real disagreement does");
     }
 
     // ---- Case 24d (compute room, scoped): only the rung the plan placed sees the room. Over every record set the
