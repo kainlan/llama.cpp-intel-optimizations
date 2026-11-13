@@ -2870,7 +2870,7 @@ void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_u
     while (next != stored && !slot.compare_exchange_weak(stored, next, std::memory_order_acq_rel)) {
         next = zone_compute_term_n_ubatch_store(stored, n_ubatch);
     }
-    if (next != stored && next == zone_compute_term_n_ubatch_disagreed) {
+    if (next != stored && next == k_zone_compute_term_n_ubatch_disagreed) {
         GGML_LOG_WARN(
             "[LOAD-PLAN] device %d: this load plans its compute term at n_ubatch=%u where an earlier load planned it "
             "at n_ubatch=%u; the hold-spill fit credits the planned compute room at no rung for the rest of the "

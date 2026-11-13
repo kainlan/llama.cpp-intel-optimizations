@@ -677,25 +677,25 @@ bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size
 
 // The micro-batch the planned compute term was measured at, as the loads on a device record it, one store per load:
 // the hold-spill fit credits the term at that rung only. The first load's value stands while later loads agree. A
-// load that names a different one turns the record off for good (zone_compute_term_n_ubatch_disagreed), because a
+// load that names a different one turns the record off for good (k_zone_compute_term_n_ubatch_disagreed), because a
 // credit at a shape the term was not measured at is the defect the record prevents, and once off it never reads as a
 // shape again. A load naming 0, or naming the mark itself, changes nothing, so the mark only ever means two loads
 // really disagreed and the WARN that reports it names two values loads did plan. Nothing ever clears it: when every
 // load that reserved the term is gone the term merges to 0 bytes, and a 0-byte room credits nothing, so a micro-batch
 // left behind is harmless.
-constexpr uint32_t zone_compute_term_n_ubatch_disagreed = UINT32_MAX;
+constexpr uint32_t k_zone_compute_term_n_ubatch_disagreed = UINT32_MAX;
 
 inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_ubatch) {
-    if (n_ubatch == 0 || n_ubatch == zone_compute_term_n_ubatch_disagreed ||
-        stored == zone_compute_term_n_ubatch_disagreed) {
+    if (n_ubatch == 0 || n_ubatch == k_zone_compute_term_n_ubatch_disagreed ||
+        stored == k_zone_compute_term_n_ubatch_disagreed) {
         return stored;
     }
-    return stored == 0 || stored == n_ubatch ? n_ubatch : zone_compute_term_n_ubatch_disagreed;
+    return stored == 0 || stored == n_ubatch ? n_ubatch : k_zone_compute_term_n_ubatch_disagreed;
 }
 
 // The micro-batch a record names: 0 for none, and for one that disagreement turned off.
 inline uint32_t zone_compute_term_n_ubatch_read(uint32_t stored) {
-    return stored == zone_compute_term_n_ubatch_disagreed ? 0 : stored;
+    return stored == k_zone_compute_term_n_ubatch_disagreed ? 0 : stored;
 }
 
 // ---------------------------------------------------------------------------
