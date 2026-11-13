@@ -1200,7 +1200,10 @@ MUTANTS = [
     ("b", "tables", "case GGML_TYPE_MXFP4: return layout == GGML_LAYOUT_SOA;",
      "case GGML_TYPE_MXFP4: return layout == GGML_LAYOUT_AOS;"),
     ("b", "tables", "case GGML_TYPE_IQ4_XS:", "case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q1_0:"),
-    ("b", "tables", " || layout == GGML_LAYOUT_SOA;", ";"),
+    # Anchored on the f16 table's last SOA case: the MMVQ executor and capability tables answer Q8_0 with the same
+    # expression, and replace() mutates only the first occurrence.
+    ("b", "tables", "case GGML_TYPE_Q6_K: return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA;",
+     "case GGML_TYPE_Q6_K: return layout == GGML_LAYOUT_AOS;"),
     ("b", "convert", "return dequantize_row_q6_K_sycl_reorder;", "return nullptr;"),
     ("b", "sycl", "if (pp_q8_0_soa(expert)) {", "if (false) {"),
     ("b", "sycl", "} else if (!pp_q8_0_soa(expert)) {", "} else {"),
