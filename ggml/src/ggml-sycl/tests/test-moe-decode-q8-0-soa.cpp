@@ -20,9 +20,10 @@
 // A pass must also say which pointer table the kernel read. The kernel takes two: a compact table, one entry per
 // (id, token) slot, with no ids; or a table with one entry per expert, read at the slot's expert id. Each trace line
 // names its table (table=compact or table=ids); each case counts both, prints table= on its CASE line, and fails
-// unless the table is the one the case names. Every case below wants the compact table: with every expert and the ids
-// on the card, decode takes the direct route, which compacts its table, and vec_q compacts the table it uploads for
-// the prompt's admitted batch.
+// unless the table is the one the case names. Every case but decode-ids-table wants the compact table: with every
+// expert and the ids on the card, decode takes the direct route, which compacts its table, and vec_q compacts the table
+// it uploads for the prompt's admitted batch. decode-ids-table keeps its ids in the SYCL host buffer type to reach the
+// other form; every CASE line prints where its ids lived (ids_buffer=) and fails unless that is where the case put them.
 //
 // The decode cases (one token) all reach the batched dispatch. ggml_sycl_mul_mat_id calls vec_q only from its MMVQ
 // layout probes, which run for a prompt alone.
@@ -30,7 +31,8 @@
 //   * decode-tail-rows: k 384, m 94, 8 experts, 4 used, one activation row broadcast to every used expert. m is not a
 //     multiple of the rows one work-group computes (GGML_SYCL_MOE_MMV_Y, 4), so the last group has rows past the
 //     expert's end; k is 12 blocks, not a multiple of the 8 blocks one sub-group covers per pass;
-//   * decode-last-expert: k 256, m 128, 8 experts, 1 used, id 7, so an offset that is right only for expert 0 fails.
+//   * decode-last-expert: k 256, m 128, 8 experts, 1 used, id 7, so an offset that is right only for expert 0 fails;
+//   * decode-ids-table: decode-base's shape with its ids in host memory, so the kernel reads the per-expert table.
 // The prompt case reaches vec_q:
 //   * prompt-vec-q: k 256, m 128, 8 experts, 4 used, 4 tokens of 4 rows each. At default flags the batched oneDNN
 //     prompt executor claims a Q8_0 SOA prompt and the MMVQ probes are skipped, so this case turns that executor off
@@ -45,8 +47,8 @@
 //
 // The same source, linked against the private backend objects, is test-moe-decode-q8-0-soa-mutant-wrong-scale: its
 // registration switches on the kernel's planted fault (every block reads the next block's scale) and passes only when
-// the kernel announced it and then prompt-vec-q, launched from vec_q, and decode-base both failed on NMSE, in that
-// order (the child prints first).
+// the kernel announced it and then prompt-vec-q (launched from vec_q), decode-base and decode-ids-table (on the
+// per-expert table) all failed on NMSE, in that order (the child prints first).
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -87,20 +89,26 @@ constexpr const char * k_tensor_names[3] = { "blk.0.ffn_gate_exps.weight", "blk.
 
 struct decode_case {
     const char * name;
-    int          in;      // k: the expert weight's row length, the activation's width
-    int          out;     // m: output rows per expert
-    int          used;    // experts each token selects
-    int          ne11;    // activation rows per token: `used` (one per selected expert) or 1 (broadcast to each)
-    int          tokens;  // 1 is decode; more is a prompt
-    const char * site;    // the dispatcher that must launch the SOA kernel: "batched" or "vec_q"
-    const char * table;   // the pointer table the kernel must read: "compact" (per slot) or "ids" (per expert)
+    int          in;          // k: the expert weight's row length, the activation's width
+    int          out;         // m: output rows per expert
+    int          used;        // experts each token selects
+    int          ne11;        // activation rows per token: `used` (one per selected expert) or 1 (broadcast to each)
+    int          tokens;      // 1 is decode; more is a prompt
+    const char * site;        // the dispatcher that must launch the SOA kernel: "batched" or "vec_q"
+    const char * table;       // the pointer table the kernel must read: "compact" (per slot) or "ids" (per expert)
+    const char * ids_buffer;  // where the SYCL run puts the ids: "device" (the backend's buffer) or "host"
     int32_t      ids[k_max_used * k_max_tokens];  // `used` ids per token, token after token
 };
 
 constexpr decode_case k_cases[] = {
-    { "decode-base",        256, 128, 4, 4, 1, "batched", "compact", { 5, 0, 3, 6 } },
-    { "decode-tail-rows",   384, 94,  4, 1, 1, "batched", "compact", { 7, 2, 4, 1 } },
-    { "decode-last-expert", 256, 128, 1, 1, 1, "batched", "compact", { 7 }          },
+    { "decode-base",        256, 128, 4, 4, 1, "batched", "compact", "device", { 5, 0, 3, 6 } },
+    { "decode-tail-rows",   384, 94,  4, 1, 1, "batched", "compact", "device", { 7, 2, 4, 1 } },
+    { "decode-last-expert", 256, 128, 1, 1, 1, "batched", "compact", "device", { 7 }          },
+    // Its ids live in the SYCL host buffer type. Both decode routes that pass device ids (the direct route and the
+    // event-chained hybrid route) require them resident on this card, so the op takes the retained route, whose batched
+    // dispatch uploads one expert id per slot and hands the kernel the per-expert table with those ids. A decode with
+    // host experts reads the same form whenever the event-chained route declines it.
+    { "decode-ids-table",   256, 128, 4, 4, 1, "batched", "ids",     "host",   { 6, 1, 7, 3 } },
 };
 
 // Runs in a child process (run_prompt_child) under GGML_SYCL_MOE_PP_ONEDNN_F16=0, which is how vec_q is reached, not a
@@ -108,7 +116,7 @@ constexpr decode_case k_cases[] = {
 // SOA experts before the MMVQ probes run, so only a user who turns that executor off reaches vec_q, as this case does.
 // Every expert is used by some token, expert 7 by two.
 constexpr decode_case k_prompt_case = {
-    "prompt-vec-q", 256, 128, 4, 4, 4, "vec_q", "compact", { 5, 0, 3, 6, 7, 2, 4, 1, 1, 6, 0, 7, 3, 5, 2, 4 }
+    "prompt-vec-q", 256, 128, 4, 4, 4, "vec_q", "compact", "device", { 5, 0, 3, 6, 7, 2, 4, 1, 1, 6, 0, 7, 3, 5, 2, 4 }
 };
 constexpr int k_n_cases = int(sizeof(k_cases) / sizeof(k_cases[0])) + 1;
 
@@ -364,13 +372,16 @@ ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft,
 
 // Builds MUL_MAT_ID over the case's input and ids on `backend` and computes it. Fills `out` on success. The SYCL run
 // passes the fixture's loaded down tensor as `loaded_weights`; the CPU reference passes null, and `weight_bytes` go
-// into a fresh tensor on the CPU backend.
+// into a fresh tensor on the CPU backend. The ids go in `ids_buft` when given, else in the backend's buffer type;
+// `ids_buffer`, when given, receives where they landed: "host" or "device".
 ggml_status run_backend(ggml_backend_t               backend,
                         ggml_tensor *                loaded_weights,
                         const std::vector<uint8_t> & weight_bytes,
                         const decode_case &          c,
                         const std::vector<float> &   input_data,
-                        std::vector<float> &         out) {
+                        std::vector<float> &         out,
+                        ggml_backend_buffer_type_t   ids_buft   = nullptr,
+                        const char **                ids_buffer = nullptr) {
     ggml_init_params                                    params = { 1024 * 1024, nullptr, true };
     std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), &ggml_free);
     require(ctx != nullptr, "ggml_init failed");
@@ -389,7 +400,7 @@ ggml_status run_backend(ggml_backend_t               backend,
     ggml_backend_buffer_type_t         buft    = ggml_backend_get_default_buffer_type(backend);
     std::vector<ggml_backend_buffer_t> buffers = {
         alloc_tensor(buft, input, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
-        alloc_tensor(buft, ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
+        alloc_tensor(ids_buft ? ids_buft : buft, ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
         alloc_tensor(buft, dst, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
     };
     if (!loaded_weights) {
@@ -410,6 +421,9 @@ ggml_status run_backend(ggml_backend_t               backend,
 
     for (ggml_backend_buffer_t buffer : buffers) {
         require(buffer != nullptr, "tensor buffer allocation failed");
+    }
+    if (ids_buffer) {
+        *ids_buffer = ggml_backend_buffer_is_host(ids->buffer) ? "host" : "device";
     }
     if (!loaded_weights) {
         ggml_backend_tensor_set(weights, weight_bytes.data(), 0, weight_bytes.size());
@@ -483,15 +497,19 @@ bool run_case(ggml_backend_t cpu, const decode_case & c, std::mt19937 & rng) {
     require(run_backend(cpu, nullptr, life.down_bytes, c, input, ref) == GGML_STATUS_SUCCESS,
             std::string("CPU reference compute failed for ") + c.name);
 
-    const size_t       run_from = g_log.mark();
-    std::vector<float> got;
-    const ggml_status  status    = run_backend(life.backend, life.down, life.down_bytes, c, input, got);
-    const bool         computed  = status == GGML_STATUS_SUCCESS && got.size() == ref.size();
-    const double       err       = computed ? nmse(ref, got) : NAN;
-    const double       diff      = computed ? max_abs_diff(ref, got) : NAN;
-    const size_t       decode_rf = g_log.count_since(run_from, { "[MOE-DECODE-REFUSAL]" });
-    const size_t       prompt_rf = g_log.count_since(run_from, { "[MOE-PROMPT-REFUSAL]" });
-    const size_t       fallback  = g_log.count_since(run_from, { "recoverable runtime fallback failed" });
+    const size_t               run_from = g_log.mark();
+    std::vector<float>         got;
+    const char *               ids_buffer = "none";
+    ggml_backend_buffer_type_t ids_buft =
+        std::strcmp(c.ids_buffer, "host") == 0 ? ggml_backend_sycl_host_buffer_type() : nullptr;
+    const ggml_status status =
+        run_backend(life.backend, life.down, life.down_bytes, c, input, got, ids_buft, &ids_buffer);
+    const bool   computed  = status == GGML_STATUS_SUCCESS && got.size() == ref.size();
+    const double err       = computed ? nmse(ref, got) : NAN;
+    const double diff      = computed ? max_abs_diff(ref, got) : NAN;
+    const size_t decode_rf = g_log.count_since(run_from, { "[MOE-DECODE-REFUSAL]" });
+    const size_t prompt_rf = g_log.count_since(run_from, { "[MOE-PROMPT-REFUSAL]" });
+    const size_t fallback  = g_log.count_since(run_from, { "recoverable runtime fallback failed" });
 
     const std::string tensor_needle = std::string(" tensor=") + k_tensor_names[k_down_index] + " ";
     const size_t      site_batched =
@@ -531,17 +549,21 @@ bool run_case(ggml_backend_t cpu, const decode_case & c, std::mt19937 & rng) {
     if (std::strcmp(table, c.table) != 0) {
         why += " table";
     }
+    if (std::strcmp(ids_buffer, c.ids_buffer) != 0) {
+        why += " ids-buffer";
+    }
     // The executor switch this process ran under, as the backend read it: the prompt case's child sets it to 0.
     const char * pp_onednn_f16 = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16");
     std::fprintf(stderr,
-                 "CASE name=%s in=%d out=%d experts=%d used=%d ne11=%d tokens=%d pp_onednn_f16=%s status=%d "
+                 "CASE name=%s in=%d out=%d experts=%d used=%d ne11=%d tokens=%d ids_buffer=%s want_ids_buffer=%s "
+                 "pp_onednn_f16=%s status=%d "
                  "nmse=%.3e max_diff=%.4f soa_layout_lines=%zu layout_lines=%zu decode_refusal=%zu prompt_refusal=%zu "
                  "fallback_failed=%zu site=%s want_site=%s site_batched=%zu site_vec_q=%zu table=%s want_table=%s "
                  "table_compact=%zu table_ids=%zu -> %s%s\n",
-                 c.name, c.in, c.out, k_experts, c.used, c.ne11, c.tokens, pp_onednn_f16 ? pp_onednn_f16 : "unset",
-                 static_cast<int>(status), err, diff, layout_soa, layout_all, decode_rf, prompt_rf, fallback, site,
-                 c.site, site_batched, site_vec_q, table, c.table, table_compact, table_ids,
-                 why.empty() ? "PASS" : "FAIL:", why.c_str());
+                 c.name, c.in, c.out, k_experts, c.used, c.ne11, c.tokens, ids_buffer, c.ids_buffer,
+                 pp_onednn_f16 ? pp_onednn_f16 : "unset", static_cast<int>(status), err, diff, layout_soa, layout_all,
+                 decode_rf, prompt_rf, fallback, site, c.site, site_batched, site_vec_q, table, c.table, table_compact,
+                 table_ids, why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
 }
 
