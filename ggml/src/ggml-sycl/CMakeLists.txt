@@ -6125,6 +6125,36 @@ set_tests_properties(test-moe-decode-q8-0-soa PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# The positive control of test-moe-decode-q8-0-soa: the same source linked against the private backend objects, with
+# the Q8_0 SOA MUL_MAT_ID kernel's planted fault switched on (every block reads the next block's scale). It passes only
+# when the kernel announced the fault and the first case then failed on NMSE, so the test is shown to see a scale read
+# from the wrong block. No SKIP_RETURN_CODE: a run that skips prints neither line and fails, never reading as a kill.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-decode-q8-0-soa-mutant-wrong-scale
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-decode-q8-0-soa.cpp
+)
+target_include_directories(test-moe-decode-q8-0-soa-mutant-wrong-scale PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+# The fault is compiled only into the private backend objects; the ordinary DSO carries none of it.
+target_link_libraries(test-moe-decode-q8-0-soa-mutant-wrong-scale PRIVATE ggml-sycl-private-fixtures)
+set_target_properties(test-moe-decode-q8-0-soa-mutant-wrong-scale PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+string(CONCAT _q8_0_soa_mutant_regex
+    "\\[MMVQ-MUTANT\\] q8_0-soa-id wrong-scale-block active.*"
+    "CASE name=decode-base [^\n]*-> FAIL: nmse")
+add_test(NAME test-moe-decode-q8-0-soa-mutant-wrong-scale COMMAND test-moe-decode-q8-0-soa-mutant-wrong-scale)
+set_tests_properties(test-moe-decode-q8-0-soa-mutant-wrong-scale PROPERTIES
+    LABELS "sycl;moe;device;B50;mutant"
+    RUN_SERIAL TRUE
+    ENVIRONMENT "GGML_SYCL_TEST_MUTANT_Q8_0_SOA_ID=wrong-scale-block;ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 600
+    PASS_REGULAR_EXPRESSION "${_q8_0_soa_mutant_regex}"
+)
+endif() # private SYCL backend fixture
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp

@@ -23,6 +23,10 @@
 // in the device buffer, which reorders the whole tensor and publishes no per-expert records, so the process exits 77
 // before any case. It also exits 77 when there is no SYCL GPU, and 1 if any case failed. Every case runs and prints
 // one CASE line, a case whose load throws included. Pin one card (the registration selects level_zero:1, the B50).
+//
+// The same source, linked against the private backend objects, is test-moe-decode-q8-0-soa-mutant-wrong-scale: its
+// registration switches on the kernel's planted fault (every block reads the next block's scale) and passes only when
+// the kernel announced it and decode-base then failed on NMSE.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -125,12 +129,20 @@ void log_callback(ggml_log_level level, const char * text, void * user_data) {
     std::fputs(text, stderr);
 }
 
-// One expert tensor's Q8_0 bytes: k_experts experts of `out` rows of `in` values.
+// One expert tensor's Q8_0 bytes: k_experts experts of `out` rows of `in` values. Each Q8_0 block gets its own
+// magnitude, so block scales differ by up to 16x and a scale read from the wrong block, row or expert moves the result
+// by about its own size. With one magnitude for every block the scales differ by a few percent, and such a read moves
+// NMSE only a few times past the tolerance.
 std::vector<uint8_t> make_weights(const decode_case & c, std::mt19937 & rng) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> magnitude(0.0625f, 1.0f);
+    const size_t                          block = size_t(ggml_blck_size(GGML_TYPE_Q8_0));
     std::vector<float>                    weight_f32(size_t(k_experts) * c.out * c.in);
-    for (float & v : weight_f32) {
-        v = 0.5f * dist(rng);
+    for (size_t b = 0; b < weight_f32.size(); b += block) {
+        const float m = magnitude(rng);
+        for (size_t j = b; j < b + block; ++j) {
+            weight_f32[j] = m * dist(rng);
+        }
     }
     std::vector<uint8_t> bytes(ggml_row_size(GGML_TYPE_Q8_0, c.in) * c.out * k_experts);
     const size_t         written = ggml_quantize_chunk(GGML_TYPE_Q8_0, weight_f32.data(), bytes.data(), 0,
