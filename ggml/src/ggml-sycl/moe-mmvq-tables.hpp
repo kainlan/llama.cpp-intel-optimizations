@@ -38,14 +38,25 @@
 // other turns that test red.
 //
 // This header must stay free of SYCL and of ggml-sycl internals -- ggml.h only.
+//
+// Q8_0 is the one type besides MXFP4 with a non-AOS row: its SOA _id kernel
+// (mul_mat_vec_q8_0_q8_1_soa_id_sycl) reads the per-expert SOA blocks the planner
+// materializes on an XMX card. A row is a (type, layout) pair and cannot say whether
+// the operand has a per-expert table. The kernel reads per-expert blocks only and
+// refuses, with a WARN, an operand that is one SOA block over every expert (what a
+// device-buffer upload makes). No route hands it one: that operand has no per-expert
+// entry, so the retained admission refuses the op before any dispatch; the batched
+// dispatcher refuses a null expert table; and the vec_q dispatcher's one caller passes
+// its retained per-expert table (see the launcher's comment).
 
 inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
+        case GGML_TYPE_Q8_0:
+            return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q8_0:
         // gx30. AoS only: these dispatch through mmvq_submit_quant_aos_id(), which
         // instantiates the same generic kernel as the four above. No SoA or packed
         // variant exists for them, so do not widen the layout here without adding
@@ -178,11 +189,12 @@ inline bool moe_mmvq_any_dispatch_supports_layout(enum ggml_type type, enum ggml
 
 inline bool moe_mmvq_capability_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
+        case GGML_TYPE_Q8_0:
+            return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:

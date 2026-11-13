@@ -411,6 +411,11 @@ def test_mmvq_moe_id_kernels_have_named_profile_labels() -> None:
         ("mulmat.mmvq.id_aos_q4_0", "static void mul_mat_vec_q4_0_q8_1_id_sycl", "static void mul_mat_vec_q4_1_q8_1_sycl"),
         ("mulmat.mmvq.id_aos_q8_0", "static void mul_mat_vec_q8_0_q8_1_id_sycl", "static void mul_mat_vec_q2_K_q8_1_sycl"),
         (
+            "mulmat.mmvq.id_soa_q8_0",
+            "static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl",
+            "static void mul_mat_vec_mxfp4_q8_1_soa_id_kernel(",
+        ),
+        (
             "mulmat.mmvq.id_soa_mxfp4_pair",
             "static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_sycl",
             "reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows",

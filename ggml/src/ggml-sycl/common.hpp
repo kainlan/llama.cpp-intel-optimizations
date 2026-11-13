@@ -1931,7 +1931,8 @@ struct layout_policy {
             if (qtype == GGML_TYPE_MXFP4) {
                 return GGML_LAYOUT_COALESCED;
             }
-            // MMVQ _id kernels for Q4_0/Q8_0 are AoS-only.
+            // Without XMX, Q4_0 and Q8_0 experts are AoS. Q4_0's MMVQ _id kernel is AoS-only; Q8_0 has an
+            // SOA one too (the branch above relies on it), so its AoS here is a placement choice, not a kernel limit.
             if (qtype == GGML_TYPE_Q4_0 || qtype == GGML_TYPE_Q8_0) {
                 return GGML_LAYOUT_AOS;
             }

@@ -2301,6 +2301,11 @@ template <int qtype> class mmvq_reorder_kernel_name;
 template <int qtype> class mmvq_reorder_slm_kernel_name;
 template <int qtype> class mmvq_coalesced_kernel_name;
 template <int qtype> class mmvq_id_kernel_name;
+template <int qtype> class mmvq_soa_id_kernel_name;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The planted fault of a device test's mutant has its own name, so a profile or a trace never reads it as the kernel.
+template <int qtype> class mmvq_soa_id_mutant_kernel_name;
+#endif
 
 // SoA MMVQ kernel template
 // Note: total_nrows is the full tensor row count (ne01), used for SoA offset calculations
@@ -5907,6 +5912,209 @@ static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair_slm(const uint8_t * __
         acc_a += d8 * sumi_a;
         acc_b += d8 * sumi_b;
     }
+}
+
+// MoE dispatch: Q8_0 experts in the SOA layout the planner materialized them in.
+// Each entry of `expert_ptrs` is one expert's own SOA block, because the planner materializes and leases every expert
+// separately: the quant bytes of its nrows_per_expert * ncols / QK8_0 blocks, then their ggml_half scales. So block and
+// scale offsets are relative to that expert's base, with that expert's row count. The activation is SOA Q8_1
+// (quantize_and_reorder_q8_1_soa): per row, ncols_y quant bytes, then one half2 (d, sum) per block.
+// One sub-group computes one row of one (expert, token) slot. Its lanes are spread over the row's blocks as the dense
+// SOA kernel (mul_mat_vec_q_reorder) spreads them, and each block dot is that kernel's
+// reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>, so the tree keeps one Q8_0 SOA block dot.
+// `ids` null: the dispatch passed a compact table with one entry per (id, token) slot.
+// WRONG_SCALE_BLOCK is a planted fault, instantiated only in the private test build: every block reads the next
+// block's scale (the expert's last block wraps to its first), so a test that cannot see a scale read from the wrong
+// block proves nothing about this kernel's scale offsets.
+template <bool WRONG_SCALE_BLOCK>
+static void mul_mat_vec_q8_0_q8_1_soa_id_kernel(const uint8_t * const * __restrict__ expert_ptrs,
+                                                const void * __restrict__ vy,
+                                                float * __restrict__ dst,
+                                                const int32_t * __restrict__ ids,
+                                                const int                ncols,
+                                                const int                ncols_y,
+                                                const int                nrows_per_expert,
+                                                const int                n_tokens,
+                                                const int                ne11,
+                                                const int64_t            ids_nb0,
+                                                const int64_t            ids_nb1,
+                                                const int64_t            nb11,
+                                                const int64_t            nb12,
+                                                const int64_t            nb1,
+                                                const int64_t            nb2,
+                                                const sycl::nd_item<3> & item_ct1) {
+    using block_type   = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>;
+    using block_traits = block_type::traits;
+
+    const int batch_idx = item_ct1.get_group(1);
+    const int row       = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    if (row >= nrows_per_expert) {
+        return;
+    }
+
+    // batch_idx is linearized row-major by id: (id, token)
+    const int id   = batch_idx / n_tokens;
+    const int iid1 = batch_idx - id * n_tokens;
+
+    const uint8_t * x = nullptr;
+    if (ids) {
+        const int32_t expert_id = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
+        x                       = expert_ptrs[expert_id];
+    } else {
+        x = expert_ptrs[batch_idx];
+    }
+    const char * y_row = (const char *) vy + (int64_t) (id % ne11) * nb11 + (int64_t) iid1 * nb12;
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    const int     nblocks                     = nrows_per_expert * blocks_per_row;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    static_assert(blocks_per_subgroup > 0);
+    static_assert(block_elements_per_subgroup > 0);
+
+    const int lane_id     = item_ct1.get_local_id(2);
+    float     partial_sum = 0.0f;
+    for (int i = lane_id / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
+        const int ibx    = row * blocks_per_row + i;
+        const int iscale = WRONG_SCALE_BLOCK ? (ibx + 1) % nblocks : ibx;
+
+        const auto          bx_offset      = block_type::get_block_offset(ibx, nblocks);
+        const auto          d_offset       = block_type::get_d_offset(nrows_per_expert, ncols, iscale);
+        const int           iby            = i * block_type::block_to_q8_1_ratio();
+        const int8_t *      q8_1_quant_ptr = (const int8_t *) y_row + iby * QK8_1;
+        const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) (y_row + ncols_y + iby * sizeof(sycl::half2));
+
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+            const int iqs = elem + block_traits::vdr_mmvq * (lane_id % block_elements_per_subgroup);
+            partial_sum +=
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>()(x, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+        }
+    }
+
+    const float sum = sycl::reduce_over_group(item_ct1.get_sub_group(), partial_sum, sycl::plus<float>());
+    if (lane_id == 0) {
+        float * dst_out = (float *) ((char *) dst + (int64_t) id * nb1 + (int64_t) iid1 * nb2);
+        dst_out[row]    = sum;
+    }
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The planted fault test-moe-decode-q8-0-soa-mutant-wrong-scale switches on. Read once: a value other than
+// wrong-scale-block leaves the kernel as shipped, and that mutant's registration then fails for want of its active line.
+static bool mmvq_q8_0_soa_id_mutant_wrong_scale_block() {
+    static const bool on = [] {
+        const char * value = std::getenv("GGML_SYCL_TEST_MUTANT_Q8_0_SOA_ID");
+        return value != nullptr && std::strcmp(value, "wrong-scale-block") == 0;
+    }();
+    return on;
+}
+#endif
+
+// Submits the Q8_0 SOA MUL_MAT_ID decode kernel over per-expert SOA blocks. Returns false, having submitted nothing,
+// for an operand this kernel does not read:
+//   - no expert table: the operand is one SOA block over every expert (a device-buffer upload reorders the whole
+//     tensor that way). Nothing reaches here with one today: the batched dispatch refuses a null table before its
+//     type switch, and the one caller of ggml_sycl_mul_mat_id_vec_q passes its retained per-expert table and returns
+//     before the call when it has none. The refusal keeps a future caller from running this kernel on bytes it
+//     would misread;
+//   - one expert's SOA block past INT_MAX bytes: the block dot takes int offsets.
+static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl(const char *                     tensor_name,
+                                              const void * const *             expert_ptrs,
+                                              const void *                     vy,
+                                              float *                          dst,
+                                              const int32_t *                  ids,
+                                              const int                        ncols,
+                                              const int                        ncols_y,
+                                              const int                        nrows_per_expert,
+                                              const int                        n_experts,
+                                              const int                        total_batches,
+                                              const int                        n_tokens,
+                                              const int                        ne11,
+                                              const int64_t                    ids_nb0,
+                                              const int64_t                    ids_nb1,
+                                              const int64_t                    nb11,
+                                              const int64_t                    nb12,
+                                              const int64_t                    nb1,
+                                              const int64_t                    nb2,
+                                              dpct::queue_ptr                  stream,
+                                              const std::vector<sycl::event> * deps      = nullptr,
+                                              sycl::event *                    event_out = nullptr) {
+    GGML_ASSERT(ncols % QK8_0 == 0);
+    const int64_t expert_bytes = (int64_t) nrows_per_expert * (ncols / QK8_0) * (int64_t) (QK8_0 + sizeof(ggml_half));
+    if (expert_ptrs == nullptr) {
+        static std::atomic<bool> warned{ false };
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_WARN(
+                "[MMVQ] Q8_0 SOA MUL_MAT_ID refused for %s: the operand is one SOA block over all %d experts "
+                "(%lld bytes) with no per-expert table, and this kernel reads only per-expert SOA blocks\n",
+                tensor_name ? tensor_name : "?", n_experts, (long long) (expert_bytes * n_experts));
+        }
+        return false;
+    }
+    if (expert_bytes > INT_MAX) {
+        static std::atomic<bool> warned{ false };
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_WARN(
+                "[MMVQ] Q8_0 SOA MUL_MAT_ID refused for %s: one expert's SOA block is %lld bytes, past the %d-byte "
+                "limit of the block dot's int offsets\n",
+                tensor_name ? tensor_name : "?", (long long) expert_bytes, INT_MAX);
+        }
+        return false;
+    }
+
+    constexpr int moe_mmv_y = GGML_SYCL_MOE_MMV_Y;
+    static_assert(moe_mmv_y * WARP_SIZE <= 1024, "GGML_SYCL_MOE_MMV_Y exceeds SYCL work-group limit");
+    const int            block_num_z = (nrows_per_expert + moe_mmv_y - 1) / moe_mmv_y;
+    const sycl::range<3> block_nums(1, total_batches, block_num_z);
+    const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const bool wrong_scale_block = mmvq_q8_0_soa_id_mutant_wrong_scale_block();
+    if (wrong_scale_block) {
+        static std::atomic<bool> announced{ false };
+        if (!announced.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_WARN(
+                "[MMVQ-MUTANT] q8_0-soa-id wrong-scale-block active: every block reads the next block's scale\n");
+        }
+    }
+#endif
+
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_soa_q8_0", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            const auto * x_ptrs = (const uint8_t * const *) expert_ptrs;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            if (wrong_scale_block) {
+                cgh.parallel_for<mmvq_soa_id_mutant_kernel_name<GGML_TYPE_Q8_0>>(
+                    sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        mul_mat_vec_q8_0_q8_1_soa_id_kernel<true>(x_ptrs, vy, dst, ids, ncols, ncols_y,
+                                                                  nrows_per_expert, n_tokens, ne11, ids_nb0, ids_nb1,
+                                                                  nb11, nb12, nb1, nb2, item_ct1);
+                    });
+                return;
+            }
+#endif
+            cgh.parallel_for<mmvq_soa_id_kernel_name<GGML_TYPE_Q8_0>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q8_0_q8_1_soa_id_kernel<false>(x_ptrs, vy, dst, ids, ncols, ncols_y, nrows_per_expert,
+                                                               n_tokens, ne11, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2,
+                                                               item_ct1);
+                });
+        });
+    });
+    if (event_out) {
+        *event_out = ev;
+    }
+    return true;
 }
 
 // MoE dispatch: MXFP4 with SoA layout (reordered weights) + expert routing
@@ -17477,9 +17685,20 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             have_kernel_event = true;
             break;
         case GGML_TYPE_Q8_0:
-            mul_mat_vec_q8_0_q8_1_id_sycl(nullptr, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00, ne01,
-                                          total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0, ids_nb1,
-                                          q8_nb11, q8_nb12, nb1, nb2, stream, &kernel_deps, &kernel_event);
+            // The kernel follows the layout the experts are loaded in: SOA bytes read as AOS blocks are garbage.
+            if (layout == GGML_LAYOUT_SOA) {
+                if (!mul_mat_vec_q8_0_q8_1_soa_id_sycl(
+                        src0->name, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00,
+                        ne10,  // ncols_y: the SOA Q8_1 row's quant bytes
+                        ne01, ne02, total_batches, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, nb1, nb2,
+                        stream, &kernel_deps, &kernel_event)) {
+                    return false;
+                }
+            } else {
+                mul_mat_vec_q8_0_q8_1_id_sycl(nullptr, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00, ne01,
+                                              total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0, ids_nb1,
+                                              q8_nb11, q8_nb12, nb1, nb2, stream, &kernel_deps, &kernel_event);
+            }
             have_kernel_event = true;
             break;
         case GGML_TYPE_MXFP4:
@@ -22020,14 +22239,31 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             have_kernel_event = true;
             break;
         case GGML_TYPE_Q8_0:
-            mul_mat_vec_q8_0_q8_1_id_sycl(src0_d, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
-                                          ne00,              // ncols
-                                          ne01,              // nrows_per_expert
-                                          total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0,
-                                          ids_nb1,           // ids strides
-                                          q8_nb11, q8_nb12,  // Q8_1 strides
-                                          nb1, nb2,          // dst strides
-                                          stream, &kernel_deps, &kernel_event);
+            // The kernel follows the layout the experts are loaded in: SOA bytes read as AOS blocks are garbage.
+            // The SOA kernel reads per-expert blocks only, so it refuses an operand with no expert table (src0_d,
+            // the whole tensor in one SOA block) rather than reading it.
+            if (layout == GGML_LAYOUT_SOA) {
+                if (!mul_mat_vec_q8_0_q8_1_soa_id_sycl(src0->name, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
+                                                       ne00,  // ncols
+                                                       ne10,  // ncols_y: the SOA Q8_1 row's quant bytes
+                                                       ne01,  // nrows_per_expert
+                                                       ne02, total_batches, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11,
+                                                       q8_nb12, nb1, nb2, stream, &kernel_deps, &kernel_event)) {
+                    mmvq_moe_trace(src0, "q8_0_soa_operand_refused", ctx.device, (int) layout, forced_layout != nullptr,
+                                   batch_size, -1, host_weights, use_ptr_table, placement_plan_active,
+                                   plan_has_host_experts);
+                    return false;
+                }
+            } else {
+                mul_mat_vec_q8_0_q8_1_id_sycl(src0_d, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
+                                              ne00,              // ncols
+                                              ne01,              // nrows_per_expert
+                                              total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0,
+                                              ids_nb1,           // ids strides
+                                              q8_nb11, q8_nb12,  // Q8_1 strides
+                                              nb1, nb2,          // dst strides
+                                              stream, &kernel_deps, &kernel_event);
+            }
             have_kernel_event = true;
             break;
         case GGML_TYPE_MXFP4:
