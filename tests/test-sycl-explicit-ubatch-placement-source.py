@@ -144,7 +144,8 @@ FIT_GATE = "if (!room_plan->multi_device && room_plan->device_id == q.device) {"
 FIT_ROOM = ("room_bytes = ggml_sycl::placement_explicit_ubatch_compute_room(room_plan->explicit_ubatch, "
             "ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device), &room_n_ubatch);")
 FIT_FIELDS = "in.compute_room_n_ubatch = room_n_ubatch; in.compute_room_bytes = room_bytes;"
-FIT_DEMAND = "a.demand = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);"
+FIT_DEMAND = "a.terms = ggml_sycl::zone_hold_fit_terms_at(in, q.n_ubatch);"
+FIT_DEMAND_FROM_TERMS = "a.demand = a.terms.demand;"
 FIT_FITS = "const bool fits = ggml_sycl::zone_hold_fit(in, q.n_ubatch);"
 ROOM_HELPER_SIG = "size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & xub,"
 ROOM_HELPER_RULE = ("const bool placed = xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && xub.n_ubatch != 0; "
@@ -152,10 +153,15 @@ ROOM_HELPER_RULE = ("const bool placed = xub.action == pp_moe_onednn_explicit_ub
                     "return placed ? compute_term : 0;")
 CREDIT_SIG = "bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request)"
 CREDIT_RULE = "return n_ubatch != 0 && n_ubatch == in.compute_room_n_ubatch && request <= in.compute_room_bytes;"
-DEMAND_SIG = "size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch)"
-DEMAND_CREDIT = ("size_t request = zone_hold_fit_request(in, n_ubatch); "
-                 "if (zone_hold_fit_rung_has_compute_room(in, n_ubatch, request)) { request = 0; }")
-DEMAND_BOUND = "zone_hold_spill_raw_demand(zone_hold_spill_bound(plan, request, n_ubatch, n_ubatch), in.kv_room);"
+# The demand's one arithmetic lives in zone_hold_fit_terms_at, so the terms a refusal prints are the demand's;
+# zone_hold_fit_demand (and so zone_hold_fit) only reads it.
+DEMAND_SIG = "zone_hold_fit_terms zone_hold_fit_terms_at(const zone_hold_fit_inputs & in, uint32_t n_ubatch)"
+DEMAND_CREDIT = ("t.request = zone_hold_fit_request(in, n_ubatch); "
+                 "t.request_credited = zone_hold_fit_rung_has_compute_room(in, n_ubatch, t.request);")
+DEMAND_BOUND = ("zone_hold_spill_raw_demand(zone_hold_spill_bound(t.plan, t.request_credited ? 0 : t.request, "
+                "n_ubatch, n_ubatch), in.kv_room);")
+DEMAND_READER_SIG = "size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch)"
+DEMAND_READER = "{ return zone_hold_fit_terms_at(in, n_ubatch).demand; }"
 
 # A RUNTIME zone an earlier load grew: one WARN after the late plan, gated by the predicate on the zone the plan sizes.
 SET_INV_SIG = ("static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl("
@@ -327,11 +333,13 @@ def claim_fit_credits_the_placed_compute_room(sycl_cpp: str, zone_cpp: str, cach
     fit = body(norm(sycl_cpp), FIT_SIG)
     zone = norm(zone_cpp)
     demand = body(zone, DEMAND_SIG)
-    return (bool(fit) and ordered(fit, FIT_PLAN, FIT_GATE, FIT_ROOM, FIT_FIELDS, FIT_DEMAND, FIT_FITS)
+    return (bool(fit)
+            and ordered(fit, FIT_PLAN, FIT_GATE, FIT_ROOM, FIT_FIELDS, FIT_DEMAND, FIT_DEMAND_FROM_TERMS, FIT_FITS)
             and fit.count("in.compute_room_n_ubatch =") == 1 and fit.count("in.compute_room_bytes =") == 1
             and ROOM_HELPER_RULE in body(norm(cache_cpp), ROOM_HELPER_SIG)
             and CREDIT_RULE in body(zone, CREDIT_SIG)
-            and bool(demand) and ordered(demand, DEMAND_CREDIT, DEMAND_BOUND))
+            and bool(demand) and ordered(demand, DEMAND_CREDIT, DEMAND_BOUND)
+            and body(zone, DEMAND_READER_SIG) == DEMAND_READER)
 
 
 def claim_grown_zone_is_announced(sycl_cpp: str, zone_cpp: str, zone_hpp: str = ZONE_HPP) -> bool:
@@ -815,8 +823,21 @@ def test_mutant_credit_drops_the_plan_fails():
     assert not claim_fit_credits_the_placed_compute_room(
         SYCL_CPP,
         _once(ZONE_CPP, DEMAND_BOUND,
-              "zone_hold_spill_raw_demand(zone_hold_spill_bound(0, request, n_ubatch, n_ubatch), in.kv_room);"),
+              DEMAND_BOUND.replace("zone_hold_spill_bound(t.plan, ", "zone_hold_spill_bound(0, ", 1)),
         CACHE_CPP)
+
+
+def test_mutant_demand_with_its_own_arithmetic_fails():
+    """A demand that computes its own sum can drift from the terms the refusal prints beside it."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        SYCL_CPP, _once(ZONE_CPP, DEMAND_READER, "{ return zone_hold_fit_terms_at(in, n_ubatch).plan; }"), CACHE_CPP)
+
+
+def test_mutant_printed_demand_not_the_terms_fails():
+    """A printed demand read apart from the terms can disagree with the terms printed beside it."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        _once(SYCL_CPP, FIT_DEMAND_FROM_TERMS, "a.demand = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);"),
+        ZONE_CPP, CACHE_CPP)
 
 
 def test_mutant_room_dips_into_the_kv_room_fails():

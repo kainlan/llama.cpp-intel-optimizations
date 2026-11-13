@@ -570,24 +570,30 @@ bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32
     return n_ubatch != 0 && n_ubatch == in.compute_room_n_ubatch && request <= in.compute_room_bytes;
 }
 
-size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+zone_hold_fit_terms zone_hold_fit_terms_at(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    zone_hold_fit_terms t;
     if (n_ubatch == 0) {
-        return 0;
+        return t;
     }
     // No plan function, no hold: the ring is still a demand.
-    const size_t plan    = in.plan_of ? in.plan_of(in.plan_ctx, n_ubatch) : 0;
+    t.plan             = in.plan_of ? in.plan_of(in.plan_ctx, n_ubatch) : 0;
     // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch. One
     // the zone was planned to serve is not held back, so it spills nothing; the plan stays in the bound as it is.
-    size_t       request = zone_hold_fit_request(in, n_ubatch);
-    if (zone_hold_fit_rung_has_compute_room(in, n_ubatch, request)) {
-        request = 0;
-    }
-    const size_t spill =
-        zone_hold_spill_raw_demand(zone_hold_spill_bound(plan, request, n_ubatch, n_ubatch), in.kv_room);
+    t.request          = zone_hold_fit_request(in, n_ubatch);
+    t.request_credited = zone_hold_fit_rung_has_compute_room(in, n_ubatch, t.request);
+    t.kv_room          = in.kv_room;
+    t.ring_uncovered   = in.ring_bytes;
+    const size_t spill = zone_hold_spill_raw_demand(
+        zone_hold_spill_bound(t.plan, t.request_credited ? 0 : t.request, n_ubatch, n_ubatch), in.kv_room);
     // The ring's slots are the planned room's bytes and lent bytes, so only the part neither the planned room nor a
     // loan covers is a demand on free memory (llama.cpp-kjef). The one place it is added, so every consumer of the fit
     // reads it. Saturating, so a wrapped sum never reads as a fit.
-    return in.ring_bytes > SIZE_MAX - spill ? SIZE_MAX : spill + in.ring_bytes;
+    t.demand = in.ring_bytes > SIZE_MAX - spill ? SIZE_MAX : spill + in.ring_bytes;
+    return t;
+}
+
+size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    return zone_hold_fit_terms_at(in, n_ubatch).demand;
 }
 
 bool zone_hold_fit(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {

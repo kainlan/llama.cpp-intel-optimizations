@@ -589,6 +589,20 @@ bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32
 // it adds nothing to the bound. 0 for an unknown n_ubatch.
 size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
+// The terms zone_hold_fit_demand is made of at `n_ubatch`, for a refusal to print. `request` is the rung's request
+// whether or not the compute room credits it; `request_credited` says the demand left it out. `demand` is the value
+// zone_hold_fit_demand returns for the same inputs.
+struct zone_hold_fit_terms {
+    size_t plan             = 0;
+    size_t request          = 0;
+    bool   request_credited = false;
+    size_t kv_room          = 0;
+    size_t ring_uncovered   = 0;
+    size_t demand           = 0;
+};
+
+zone_hold_fit_terms zone_hold_fit_terms_at(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
+
 // Whether the rung fits: zone_hold_spill_bound_fits(free_before, headroom, demand).
 bool zone_hold_fit(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 

@@ -19714,6 +19714,11 @@ struct ggml_sycl_hold_fit_answer {
     size_t   demand      = 0;  // the raw demand the hold can cause at the rung
     size_t   free_before = 0;  // the ledger's free memory without the rung's own buffers
     uint32_t largest_ub  = 0;  // when the rung does not fit: the largest -ub the same function accepts (0: none)
+    // What the demand is made of, and the compute room the fit was given (the rung it holds room for, 0 for none, and
+    // its bytes), for a refusal to print.
+    ggml_sycl::zone_hold_fit_terms terms;
+    uint32_t                       compute_room_n_ubatch = 0;
+    size_t                         compute_room_bytes    = 0;
 };
 
 // The KV-zone room a compute buffer can count on: the zone's LARGEST FREE BLOCK (a buffer is indivisible), net of the
@@ -19795,8 +19800,11 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
         in.compute_room_n_ubatch = room_n_ubatch;
         in.compute_room_bytes    = room_bytes;
     }
-    a.demand        = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);
-    a.free_before   = in.free_before;
+    a.terms                 = ggml_sycl::zone_hold_fit_terms_at(in, q.n_ubatch);
+    a.demand                = a.terms.demand;
+    a.compute_room_n_ubatch = in.compute_room_n_ubatch;
+    a.compute_room_bytes    = in.compute_room_bytes;
+    a.free_before           = in.free_before;
     const bool fits = ggml_sycl::zone_hold_fit(in, q.n_ubatch);
     if (!fits) {
         a.largest_ub = ggml_sycl::zone_hold_fit_largest_ub(in, q.n_ubatch);
@@ -19847,9 +19855,13 @@ static bool ggml_sycl_check_hold_spill_headroom(const ggml_sycl_hold_fit_query &
         "its worst-case spill outside the arena (%.1f MB: the plan plus the rung's largest compute-buffer request, "
         "net of the KV-zone room a compute buffer can use, plus the prefill-ring bytes neither the planned room nor "
         "a loan covers) would leave device %d %.1f MB free (of %.1f MB free before it), under the %.1f MB driver "
-        "headroom the arena expects; %s; or free VRAM on this card (another process) before loading\n",
+        "headroom the arena expects; %s; or free VRAM on this card (another process) before loading; terms: "
+        "plan=%.1f MB request=%.1f MB request_credited=%d kv_room=%.1f MB ring_uncovered=%.1f MB "
+        "compute_room=%.1f MB@%u\n",
         a.demand / mb, q.device, free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb,
-        ggml_sycl_hold_fit_advice(a.largest_ub).c_str());
+        ggml_sycl_hold_fit_advice(a.largest_ub).c_str(), a.terms.plan / mb, a.terms.request / mb,
+        a.terms.request_credited ? 1 : 0, a.terms.kv_room / mb, a.terms.ring_uncovered / mb, a.compute_room_bytes / mb,
+        a.compute_room_n_ubatch);
     return false;
 }
 
@@ -19887,9 +19899,12 @@ static bool ggml_sycl_check_hold_spill_realized(int        device,
         "keeps out of the RUNTIME zone (worst case %.1f MB, with any prefill-ring bytes neither the planned room nor "
         "a loan covers; %llu request(s) totalling %.1f MB were held out and now live outside the arena) leave device "
         "%d %.1f MB free (of %.1f MB free before them), under the %.1f MB driver headroom the arena expects; "
-        "a smaller -ub keeps those buffers in the zone\n",
+        "a smaller -ub keeps those buffers in the zone; terms: plan=%.1f MB request=%.1f MB request_credited=%d "
+        "kv_room=%.1f MB ring_uncovered=%.1f MB compute_room=%.1f MB@%u\n",
         n_ubatch, a.demand / mb, (unsigned long long) spill_totals.raw_count, spill_totals.raw_bytes / mb, device,
-        free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb);
+        free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb, a.terms.plan / mb,
+        a.terms.request / mb, a.terms.request_credited ? 1 : 0, a.terms.kv_room / mb, a.terms.ring_uncovered / mb,
+        a.compute_room_bytes / mb, a.compute_room_n_ubatch);
     return false;
 }
 
