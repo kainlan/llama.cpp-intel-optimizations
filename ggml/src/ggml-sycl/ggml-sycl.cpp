@@ -20439,8 +20439,8 @@ struct ggml_sycl_ring_refusal_runtime_view {
 // a summand added there without a record shows up instead of being credited to the next term's name.
 static void ggml_sycl_log_ring_refusal_runtime_terms(int device, const ggml_sycl_ring_refusal_runtime_view & v) {
     const ggml_sycl_runtime_pending_terms   none{};
-    const ggml_sycl_runtime_pending_terms & pending       = v.kv_zone ? v.kv_zone->pending_terms : none;
-    const size_t                            pending_bytes = v.kv_zone ? v.kv_zone->runtime_pending_bytes : 0;
+    const ggml_sycl_runtime_pending_terms & pending          = v.kv_zone ? v.kv_zone->pending_terms : none;
+    const size_t                            pending_bytes    = v.kv_zone ? v.kv_zone->runtime_pending_bytes : 0;
     const size_t                            pending_recorded = pending.sum();
     const size_t unattributed = pending_bytes > pending_recorded ? pending_bytes - pending_recorded : 0;
 
@@ -20470,7 +20470,7 @@ static void ggml_sycl_log_ring_refusal_runtime_terms(int device, const ggml_sycl
     const size_t ring_kv_depth = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(device);
     const size_t ring_kv =
         ring_kv_depth != 0 && ring_kv_slot > SIZE_MAX / ring_kv_depth ? SIZE_MAX : ring_kv_slot * ring_kv_depth;
-    const size_t ring_runtime = ring > ring_kv ? ring - ring_kv : 0;
+    const size_t ring_runtime           = ring > ring_kv ? ring - ring_kv : 0;
     // The rest of the requirement, split as the explicit micro-batch's room splits it.
     const size_t ring_runtime_and_dense = ring_runtime > SIZE_MAX - dense ? SIZE_MAX : ring_runtime + dense;
     const size_t fixed = requirement > ring_runtime_and_dense ? requirement - ring_runtime_and_dense : 0;
@@ -20497,7 +20497,6 @@ static void ggml_sycl_log_ring_refusal_runtime_terms(int device, const ggml_sycl
         v.kv_largest_block, v.kv_zone ? v.kv_zone->budget_room_bytes : 0, v.restored_n_ubatch, answerable ? 1 : 0,
         floor_bytes, requirement, planned_zone, fixed, pipeline, control.bytes, host_scatter, compute, state, dense,
         mmq_src1, dequant_f16, v.kv_zone ? v.kv_zone->dense_at_txn_start_bytes : 0, ring_runtime, ring, ring_kv);
-}
 }
 
 static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
