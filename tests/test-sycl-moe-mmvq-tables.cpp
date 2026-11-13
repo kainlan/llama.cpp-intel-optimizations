@@ -13,6 +13,7 @@
 // Adding a type to one table without the other must be caught here, not there.
 
 #include "../ggml/src/ggml-sycl/moe-mmvq-tables.hpp"
+#include "../ggml/src/ggml-sycl/soa-reorder-types.hpp"
 #include "ggml.h"
 
 #include <cstdint>
@@ -895,6 +896,38 @@ int main() {
                         ++failures;
                     }
                 }
+            }
+        }
+    }
+
+    // Decode must run every expert layout the planner materializes. A type the planner reorders to SOA and
+    // the prompt executor runs there needs a decode executor at SOA too. The pairs below are the known
+    // support gaps: each is a missing kernel, and the change that writes it deletes its line.
+    {
+        const ggml_type decode_soa_gaps[] = { GGML_TYPE_Q4_0 };
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const ggml_type type = (ggml_type) t;
+            const char *    name = ggml_type_name(type);
+            if (name == nullptr || !ggml_sycl_soa_reorder_supported_type(type) ||
+                !moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_SOA)) {
+                continue;
+            }
+            bool listed = false;
+            for (ggml_type g : decode_soa_gaps) {
+                listed = listed || g == type;
+            }
+            const bool decodes = moe_mmvq_capability_supports_layout(type, GGML_LAYOUT_SOA);
+            std::printf("decode SOA gap check: %s decodes=%d listed=%d\n", name, decodes ? 1 : 0, listed ? 1 : 0);
+            if (!decodes && !listed) {
+                std::printf(
+                    "FAIL: %s experts are materialized SOA and run in prefill, but decode has no SOA executor "
+                    "and the pair is not a listed gap\n",
+                    name);
+                ++failures;
+            }
+            if (decodes && listed) {
+                std::printf("FAIL: %s SOA has a decode executor now; delete it from decode_soa_gaps\n", name);
+                ++failures;
             }
         }
     }
