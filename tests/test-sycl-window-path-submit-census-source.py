@@ -1332,6 +1332,95 @@ def test_a_record_call_excuses_only_the_launch_whose_event_it_is_handed():
         assert raw_sites(sample) == [("a", "submit")], sample
 
 
+H = "void f(sycl::queue * q, bool c) {\n"
+L1 = "q->submit([&](sycl::handler & h) { h.single_task(k1); })"
+L2 = "q->submit([&](sycl::handler & h) { h.single_task(k2); })"
+REC2 = "ggml_sycl_profile_record_returned_event"
+
+
+def test_a_record_call_on_no_path_from_the_launch_does_not_excuse_it():
+    cases = {
+        # a: the record is in the else arm opposite the launch's arm
+        "opposite arm": (H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ ev = {L2}; {RECORD}(lab, ev); }}\n}}\n",
+                         ["f"]),
+        "opposite arm alone": (H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ {REC2}(lab, ev); }}\n}}\n", ["f"]),
+        # b: a shadowing declaration around the record
+        "shadow": (H + f"sycl::event ev = {L1};\n{{ sycl::event ev = other(); {RECORD}(lab, ev); }}\n}}\n", ["f"]),
+        # c: a brace-less loop around the launch
+        "brace-less loop": (H + f"sycl::event ev;\nfor (int i = 0; i < n; ++i) ev = {L1};\n{RECORD}(lab, ev);\n}}\n",
+                            ["f"]),
+        "brace-less while": (H + f"sycl::event ev;\nwhile (c) ev = {L1};\n{RECORD}(lab, ev);\n}}\n", ["f"]),
+        # d: a launch inside a lambda in the record call's arguments
+        "lambda argument": (H + f"sycl::event ev;\n{RECORD}(lab, ev, [&] {{ {L1}; }});\n}}\n", ["f"]),
+        "called lambda argument": (H + f"{REC2}(lab, [&] {{ return {L1}; }}());\n}}\n", ["f"]),
+        # e: a member assigned, a local recorded
+        "member": (H + f"sycl::event ev;\ns.ev = {L1};\n{RECORD}(lab, ev);\n}}\n", ["f"]),
+        "this member": (H + f"sycl::event ev;\nthis->ev = {L1};\n{RECORD}(lab, ev);\n}}\n", ["f"]),
+        # f: the record is in a lambda that is never called
+        "uncalled lambda": (H + f"sycl::event ev = {L1};\nauto g = [&] {{ {RECORD}(lab, ev); }};\n}}\n", ["f"]),
+        # the event in the label slot, a different name, a ternary
+        "label slot": (H + f"sycl::event ev = {L1};\n{RECORD}(ev, other);\n}}\n", ["f"]),
+        "ev2": (H + f"sycl::event ev = {L1};\n{RECORD}(lab, ev2);\n}}\n", ["f"]),
+        "event_done": (H + f"sycl::event event = {L1};\n{RECORD}(lab, event_done);\n}}\n", ["f"]),
+        "ternary": (H + f"sycl::event ev = c ? {L1} : {L2};\n{RECORD}(lab, ev);\n}}\n", ["f", "f"]),
+    }
+    for what, (sample, funcs) in cases.items():
+        assert [func for func, _ in raw_sites(sample)] == funcs, what
+
+
+def test_a_record_call_on_every_path_from_the_launch_excuses_it():
+    cases = {
+        "join": H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ ev = {L2}; }}\n{RECORD}(lab, ev);\n}}\n",
+        "same arm": H + f"sycl::event ev;\nif (c) {{ ev = {L1}; }} else {{ ev = {L2}; {RECORD}(lab, ev); }}\n"
+                        f"{RECORD}(lab2, ev);\n}}\n",
+        "moved": H + f"sycl::event ev = {L1};\n{REC2}(lab, std::move(ev));\n}}\n",
+        "conditional record": H + f"sycl::event ev = {L1};\nif (on) {{ {RECORD}(lab, ev); }}\n}}\n",
+    }
+    for what, sample in cases.items():
+        assert raw_sites(sample) == [], what
+
+
+# the tree's launches the record rule excuses, as file:function, one per launch; a widening of the rule shows here
+RECORDED_ON_THE_PATH = [
+    "common.hpp:ggml_sycl_graph_safe_memcpy",
+    "common.hpp:ggml_sycl_graph_safe_memcpy",
+    "common.hpp:ggml_sycl_graph_safe_memcpy",
+    "fattn-xmx-f16-v2.hpp:launch_fattn_xmx_v2_decode_gqa_split_leaf",
+    "fattn-xmx-f16-v2.hpp:launch_fattn_xmx_v2_decode_gqa_split_leaf",
+    "fattn.cpp:ggml_sycl_fattn_xmx_materialize_packed_k",
+    "fattn.cpp:ggml_sycl_fattn_xmx_submit_set_rows_update",
+    "mem-ops.cpp:mem_fill_direct_submit",
+]
+
+
+def test_the_record_rule_excuses_exactly_the_known_launches_of_the_tree():
+    texts = read_tree()
+    excused: list[str] = []
+    census({name: texts[name] for name in FILES}, derive_wrappers(texts), texts, recorded=excused)
+    assert sorted(excused) == RECORDED_ON_THE_PATH
+
+
+def test_a_forward_that_is_not_the_command_group_does_not_make_a_wrapper():
+    helpers = (
+        "template <typename F> sycl::event logs(sycl::queue * q, F && f) {\n"
+        "    return ggml_sycl_profile_submit(q, label, [&](sycl::queue & pq) { log(std::forward<F>(f)); "
+        "return pq.submit(cgf); });\n"
+        "}\n"
+        "template <typename F> sycl::event labels(sycl::queue * q, F && f) {\n"
+        "    return ggml_sycl_profile_submit(q, make_label(std::forward<F>(f)), cgf);\n"
+        "}\n"
+    )
+    assert derive_wrappers({"x.cpp": helpers}) == {BASE_WRAPPER}
+
+
+def test_a_launch_split_over_lines_in_an_alternative_branch_is_counted():
+    for launch, kind in (("q->\n        parallel_for(r, k);", "shortcut"),
+                         ("q->parallel_for<\n        name>(r, k);", "shortcut"),
+                         ("q\n        ->submit(cgf);", "submit")):
+        sample = f"void a(sycl::queue * q) {{\n#ifdef FOO\n    log();\n#else\n    {launch}\n#endif\n}}\n"
+        assert raw_sites(sample) == [("a", kind)], sample
+
+
 def test_a_helper_that_forwards_under_any_name_is_a_wrapper():
     helpers = (
         "template <typename F> static sycl::event launch_named(sycl::queue & q, const char * n, F && f) {\n"
