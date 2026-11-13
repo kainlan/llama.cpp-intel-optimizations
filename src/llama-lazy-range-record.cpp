@@ -125,6 +125,9 @@ llama_mmap::ranges llama_lazy_range_record::excluded_for_file(uint32_t file_idx)
 // the pre-fill, the early-plan filter and the create_tensor check
 //
 
+// defined beside llama_lazy_range_check_storage(), the refusal it bridges
+static bool llama_lazy_storage_consumer_present();
+
 // "per_layer_token_embd.weight" -> itself; "blk.%d.x.weight" -> one name per block
 static std::vector<std::string> llama_lazy_expand_declared(const std::string & declared, uint32_t n_layer) {
     const size_t pos = declared.find("%d");
@@ -170,8 +173,9 @@ void llama_lazy_range_record_prefill(llama_lazy_range_record &        record,
             if (taker && eligible && mode == LLAMA_LAZY_MODE_AUTO && !llama_lazy_storage_consumer_present()) {
                 eligible = false;
                 LLAMA_LOG_WARN(
-                    "%s: tensor %s (size = %zu MiB) is loaded into host memory in full: this build has no "
-                    "storage tier for a SYCL-owned table; -lzm on asks for it by name and is refused\n",
+                    "%s: tensor %s (size = %zu MiB) is loaded as an ordinary weight (read in full, placed by the "
+                    "plan): this build has no storage tier for a SYCL-owned table, so -lzm on, which asks for it, "
+                    "fails the load\n",
                     __func__, name.c_str(), src.size / 1024 / 1024);
             }
 
@@ -221,6 +225,23 @@ void llama_lazy_range_check_create(const llama_lazy_range_record & record,
         GGML_ABORT("lazy-range record: tensor %s of arch %s has a row but is created without TENSOR_READ_LAZY",
                    name.c_str(), llm_arch_name(arch));
     }
+}
+
+// Whether this tree can consume a STORAGE row. It cannot: the loader has no SYCL STORAGE branch, so
+// llama_lazy_range_check_storage() below refuses one. While that holds, the pre-fill does not make a STORAGE
+// row from the default mode (AUTO); ON still asks for one by name and is refused. The change that adds the
+// consumer deletes, together:
+//   - this function and its declaration above the pre-fill;
+//   - the bridge condition in llama_lazy_range_record_prefill();
+//   - the refusal in llama_lazy_range_check_storage() and its call in llama_model_loader::create_tensor();
+//   - the bridge paragraph of the pre-fill's doc in llama-lazy-range-record.h;
+//   - the pin test_the_auto_bridge_lives_exactly_as_long_as_the_refusal in
+//     tests/test-llama-lazy-range-record-source.py;
+//   - the expectations that encode the bridge in tests/test-llama-lazy-range-prefill.cpp (the AUTO taker
+//     row: EAGER, not refused, one WARN) and tests/test-llama-lazy-range-record.cpp (the matrix's taker AUTO
+//     exception and the witness cell's WARN count).
+static bool llama_lazy_storage_consumer_present() {
+    return false;
 }
 
 void llama_lazy_range_check_storage(const llama_lazy_range_record & record, const std::string & name) {

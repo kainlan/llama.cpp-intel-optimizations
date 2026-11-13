@@ -92,14 +92,6 @@ class llama_lazy_range_record {
 // looks a declared tensor up in the model file(s); false when the file does not carry it
 using llama_lazy_range_find_fn = std::function<bool(const std::string & name, llama_lazy_range_source & out)>;
 
-// Whether this tree can consume a STORAGE row. It cannot: the loader has no SYCL STORAGE branch, so
-// llama_lazy_range_check_storage() refuses one. While that holds, the pre-fill does not make a STORAGE row
-// from the default mode (see below). The change that adds the consumer deletes this function, the bridge in
-// the pre-fill and the refusal together.
-inline bool llama_lazy_storage_consumer_present() {
-    return false;
-}
-
 // The pre-fill. Fills `record` once, before the early plan and before any
 // create_tensor() call, with one row per name in `declared` (a name, or a pattern
 // with one "%d" for the block index) that `find` returns.
@@ -110,9 +102,9 @@ inline bool llama_lazy_storage_consumer_present() {
 //                   LAZY_READ when eligible and not `taker`
 //                   EAGER     otherwise
 //
-//   with the taker, mode AUTO and no STORAGE consumer in the tree, an eligible row is recorded
-//   ineligible and EAGER, with one WARN: the default mode must load. Mode ON is the caller asking
-//   for the storage tier by name, so it keeps the STORAGE row and the refusal.
+//   with the taker, mode AUTO and no STORAGE consumer in the tree, a row llama_lazy_eligible()
+//   accepts is recorded ineligible and EAGER, with one WARN: the default mode must load. Mode ON
+//   is the caller asking for the storage tier by name, so it keeps the STORAGE row and the refusal.
 //
 // `taker` is the model's fact "its weights are SYCL-owned and the hooks resolve"
 // (sycl_model_loading_guard.active), not the process-level "a SYCL backend is

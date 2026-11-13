@@ -99,12 +99,23 @@ static bool passes(const check_args & a) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-static std::string g_warns;
+static std::vector<std::string> g_warns;  // one entry per WARN line
 
 static void capture_log(enum ggml_log_level level, const char * text, void *) {
     if (level == GGML_LOG_LEVEL_WARN) {
-        g_warns += text;
+        g_warns.emplace_back(text);
     }
+}
+
+// WARN lines carrying both `a` and `b`
+static size_t count_warns(const std::string & a, const char * b) {
+    size_t n = 0;
+    for (const std::string & line : g_warns) {
+        if (line.find(a) != std::string::npos && line.find(b) != std::string::npos) {
+            n++;
+        }
+    }
+    return n;
 }
 
 int main() {
@@ -186,9 +197,9 @@ int main() {
                   rec.eligible(lazy) == on,
               "taker, mode %d: the 5 GiB table is %s, eligible=%d", (int) mode,
               llama_lazy_deferral_name(rec.deferral(lazy)), rec.eligible(lazy) ? 1 : 0);
-        const bool warned = g_warns.find(lazy) != std::string::npos && g_warns.find("-lzm on") != std::string::npos;
-        CHECK(warned == (mode == LLAMA_LAZY_MODE_AUTO), "taker, mode %d: the bridge WARN %s", (int) mode,
-              warned ? "fired" : "did not fire");
+        const size_t n_warned = count_warns(lazy, "-lzm on");
+        CHECK(n_warned == (mode == LLAMA_LAZY_MODE_AUTO ? 1u : 0u),
+              "taker, mode %d: the bridge WARN for the 5 GiB table printed %zu time(s)", (int) mode, n_warned);
     }
 
     // the STORAGE refusal: a STORAGE row throws naming the tensor; LAZY_READ and EAGER rows pass
