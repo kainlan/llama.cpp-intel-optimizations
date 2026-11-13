@@ -675,14 +675,15 @@ bool zone_route_draws_scratch(bool decision_valid,
 // is added. False, with *out untouched, when the sum or a rounding would wrap: never a smaller term.
 bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size_t alignment, size_t * out);
 
-// The micro-batch the planned compute term was measured at, as the loads on a device record it, one store per load:
-// the hold-spill fit credits the term at that rung only. The first load's value stands while later loads agree. A
-// load that names a different one turns the record off for good (k_zone_compute_term_n_ubatch_disagreed), because a
-// credit at a shape the term was not measured at is the defect the record prevents, and once off it never reads as a
-// shape again. A load naming 0, or naming the mark itself, changes nothing, so the mark only ever means two loads
-// really disagreed and the WARN that reports it names two values loads did plan. Nothing ever clears it: when every
-// load that reserved the term is gone the term merges to 0 bytes, and a 0-byte room credits nothing, so a micro-batch
-// left behind is harmless.
+// The micro-batch the planned compute term was measured at, as the loads on a device record it, one store per
+// inventory intake (a load's early plan and late intake carry the same inventory, so its repeat store keeps an equal
+// value and changes nothing): the hold-spill fit credits the term at that rung only. The first load's value stands
+// while later loads agree. A load that names a different one turns the record off for good
+// (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the term was not measured at is the defect the
+// record prevents, and once off it never reads as a shape again. A load naming 0, or naming the mark itself, changes
+// nothing, so the mark only ever means two loads really disagreed and the WARN that reports it names two values loads
+// did plan. Nothing ever clears it: when every load that reserved the term is gone the term merges to 0 bytes, and a
+// 0-byte room credits nothing, so a micro-batch left behind is harmless.
 constexpr uint32_t k_zone_compute_term_n_ubatch_disagreed = UINT32_MAX;
 
 inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_ubatch) {

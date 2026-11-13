@@ -164,8 +164,10 @@ PLAN_ROOM_GATE = "if (!held_out && !plan.multi_device && plan.device_id == devic
 PLAN_ROOM_EXPLICIT = "room = placement_explicit_ubatch_compute_room(plan.explicit_ubatch, compute_term, &n);"
 PLAN_ROOM_PLANNING = ("if (n == 0 && plan.explicit_ubatch.action == pp_moe_onednn_explicit_ubatch_action::NONE && "
                       "planning_n_ubatch != 0) { n = planning_n_ubatch; room = compute_term; }")
-# The load's planning micro-batch is recorded once per load at the inventory stage (STAGE_SIG), under the inventory
-# mutex, through the store rule that turns the record off when two loads disagree; the getter reads the record.
+# The load's planning micro-batch is recorded at each inventory intake, in the inventory stage (STAGE_SIG), under the
+# inventory mutex, through the store rule that turns the record off when two loads disagree; a load's early plan and
+# late intake carry the same inventory, and the rule keeps an equal value, so the repeat changes nothing. The getter
+# reads the record.
 PLANNING_SET = "ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, inventory->n_ubatch);"
 PLANNING_SETTER_SIG = "void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch)"
 PLANNING_SETTER_RULE = "uint32_t next = zone_compute_term_n_ubatch_store(stored, n_ubatch);"

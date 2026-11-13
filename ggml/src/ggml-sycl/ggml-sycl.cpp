@@ -17652,10 +17652,11 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_row_bytes(
         ctx->device, inventory->pp_moe_onednn_activation_bytes_per_row, inventory->pp_moe_onednn_output_bytes_per_row);
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(ctx->device, inventory->n_ubatch);
-    // The load's planning micro-batch, recorded beside the compute term for the hold-spill fit. Recorded here, once per
-    // load, because the published plan cannot carry it: every runtime context transaction rewrites the plan's
-    // planner_n_ubatch with the context's own micro-batch. It is the measure's shape only while inventory.n_ubatch and
-    // llama_auto_ubatch_ladder[0] agree, which a source pin holds.
+    // The load's planning micro-batch, recorded beside the compute term for the hold-spill fit. Recorded here, at each
+    // inventory intake, because the published plan cannot carry it: every runtime context transaction rewrites the
+    // plan's planner_n_ubatch with the context's own micro-batch. A load's early plan and late intake both pass here
+    // with the same inventory, and the store rule keeps an equal value, so the repeat changes nothing. It is the
+    // measure's shape only while inventory.n_ubatch and llama_auto_ubatch_ladder[0] agree, which a source pin holds.
     ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, inventory->n_ubatch);
 
     g_model_n_layer = inventory->n_layer;
