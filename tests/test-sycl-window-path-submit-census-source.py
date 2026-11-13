@@ -118,6 +118,63 @@ FILES = [
     "mem-ops.cpp",
 ]
 
+# Every other source under ggml/src/ggml-sycl that holds a launch-like call (either class, before any receiver or
+# wrapper test), with the one reason it is not on the window path. test_every_launching_file_is_on_the_path_or_excluded
+# fails on a file in neither list, so a new file, or a file a new call reaches, cannot go unread.
+NOT_BUILT = "an op the qwen4exp graph does not build (qwen4exp.cpp, delta-net-base.cpp and llama-graph.cpp name none)"
+NOT_INCLUDED = "no backend source includes it"
+EXCLUDED_DIRS = {
+    "tests/": "device tests and benchmarks; not compiled into the backend",
+}
+EXCLUDED_FILES = {
+    "add-id.cpp": "ADD_ID: built only for expert biases (llama-graph.cpp build_moe_ffn *_exps_b); qwen4exp passes none",
+    "col2im-1d.cpp": "COL2IM_1D: " + NOT_BUILT,
+    "conv.cpp": "CONV_TRANSPOSE_1D: " + NOT_BUILT,
+    "conv2d-dw.cpp": "CONV_2D_DW: " + NOT_BUILT,
+    "conv2d-transpose.cpp": "CONV_TRANSPOSE_2D: " + NOT_BUILT,
+    "conv2d.cpp": "CONV_2D: " + NOT_BUILT,
+    "conv3d.cpp": "CONV_3D: " + NOT_BUILT,
+    "count-equal.cpp": "COUNT_EQUAL: " + NOT_BUILT,
+    "cross_entropy_loss.cpp": "CROSS_ENTROPY_LOSS (training): " + NOT_BUILT,
+    "gla.cpp": "GATED_LINEAR_ATTN: " + NOT_BUILT,
+    "im2col.cpp": "IM2COL: " + NOT_BUILT,
+    "outprod.cpp": "OUT_PROD: " + NOT_BUILT,
+    "pad_reflect_1d.cpp": "PAD_REFLECT_1D: " + NOT_BUILT,
+    "pool.cpp": "POOL_1D, POOL_2D: " + NOT_BUILT,
+    "repeat_back.cpp": "REPEAT_BACK: " + NOT_BUILT,
+    "roll.cpp": "ROLL: " + NOT_BUILT,
+    "ssm_scan.cpp": "SSM_SCAN: " + NOT_BUILT,
+    "tsembd.cpp": "TIMESTEP_EMBEDDING: " + NOT_BUILT,
+    "upscale.cpp": "UPSCALE: " + NOT_BUILT,
+    "wkv.cpp": "RWKV_WKV6, RWKV_WKV7: " + NOT_BUILT,
+    "lightning-indexer-kernel.hpp": "the lightning indexer (lightning-indexer.cpp): " + NOT_BUILT,
+    "set_rows_paged.hpp": "SET_ROWS_PAGED; " + NOT_INCLUDED,
+    "dmmv.cpp": "dequantize-mul-mat-vec, the one-row (decode) MUL_MAT route",
+    "dmmv-esimd.hpp": "dequantize-mul-mat-vec in ESIMD, the one-row (decode) MUL_MAT route",
+    "gpu-sampler.hpp": "sampling (ggml_sycl_sample_token*), after the graph",
+    "cont-batching.hpp": "multi-sequence sampling (ggml_sycl_multi_seq_sample*), after the graph",
+    "persistent-tg-kernel.cpp": "the persistent token-generation kernel, decode only",
+    "fused-ffn.hpp": "execute_ffn_fusion: can_fuse_ffn admits Q4_0 gate/up pairs at token-generation batch sizes only",
+    "cpu-dispatch.cpp": "the CPU executor of host-placed ops (should_dispatch_to_cpu, ggml_sycl_compute_forward_cpu): its "
+                        "kernels run on the CPU queue, and each submit to the device queue is a host_task body",
+    "mmq-esimd.hpp": "opt-in GGML_SYCL_MMQ_ESIMD: mmq_esimd_version() is 0 when it is unset",
+    "mmq-xmx.hpp": "opt-in GGML_SYCL_XMX_MMQ=1 (use_xmx_mmq_kernel, read by can_use_xmx_q8_0)",
+    "convert-esimd.hpp": "opt-in GGML_SYCL_ESIMD_DEQUANT=1 (g_esimd_dequant_enabled in convert.cpp)",
+    "dnnl-ops.hpp": "the oneDNN softmax, opt-in GGML_SYCL_ONEDNN_SOFTMAX (read in softmax.cpp)",
+    "kv-cache-quant.hpp": "included by fattn.cpp, which calls neither launch_quantize_kv_fp8 nor launch_attention_fp8",
+    "dpct/helper.hpp": "dpct_memcpy, dpct_memset and host_buffer: no backend source outside dpct/ calls them",
+    "lazy-io-pool.cpp": "its submit is the read queue of the I/O pool (lazy_io_engine::queue), not a SYCL queue",
+    "moe-tile-convert.cpp": "MXFP4 to XMX-tiled weight conversion, run when a weight is materialized "
+                            "(ggml_sycl_fill_xmx_tiled, convert_tensor_layout), not by an op of the graph",
+    "moe-mmid-workspace.cpp": "no launch: its .fill( calls are std::array::fill in moe_mmid_workspace_registry::admit",
+    "mxfp4-stored-gemm.cpp": "its header mxfp4-stored-gemm.hpp is included by no other backend source",
+    "fused-norm-gemm.hpp": "included only by mmvq-rmsnorm.hpp, which " + NOT_INCLUDED,
+    "mmvq-rmsnorm.hpp": NOT_INCLUDED,
+    "l2-prefetch.hpp": NOT_INCLUDED,
+    "mul-mat-bf16.hpp": NOT_INCLUDED,
+    "quantized-comm.hpp": NOT_INCLUDED,
+}
+
 # shared reasons for the shortcut entries
 SHORTCUT_KERNEL = "kernel launched by a queue shortcut (parallel_for / single_task), not yet labelled"
 SHORTCUT_USM = "USM copy or fill launched by a queue shortcut, not yet labelled"
@@ -1043,7 +1100,70 @@ def test_the_tree_derives_the_known_wrappers():
         "ggml_sycl_memcpy_profile_submit",
         "ggml_sycl_set_rows_profile_submit",
         "ggml_sycl_submit_binbcast_kernel",
+        "mmq_submit",
     }
+
+
+def test_a_helper_that_forwards_its_command_group_inside_the_profilers_lambda_is_a_wrapper():
+    helpers = (
+        "template <typename F> sycl::event via_lambda(sycl::queue * q, F && fn) {\n"
+        "    return ggml_sycl_profile_submit(label, [&]() { return q->submit(std::forward<F>(fn)); });\n"
+        "}\n"
+        "template <typename F> sycl::event outside(sycl::queue * q, F && fn) {\n"
+        "    sycl::event ev = q->submit(std::forward<F>(fn));\n"
+        "    return ggml_sycl_profile_submit(label, [&]() { return ev; });\n"
+        "}\n"
+    )
+    wrappers = derive_wrappers({"x.cpp": helpers})
+    assert wrappers == {BASE_WRAPPER, "via_lambda"}
+    assert raw_functions(helpers, wrappers) == ["outside"]
+
+
+def test_a_launch_in_an_alternative_branch_is_counted_whatever_its_kind():
+    for launch, kind in (("q->parallel_for(r, k);", "shortcut"), ("q->submit(cgf);", "submit")):
+        sample = f"void a(sycl::queue * q) {{\n#ifdef FOO\n    log();\n#else\n    {launch}\n#endif\n}}\n"
+        assert raw_sites(sample) == [("a", kind)], sample
+    # a branch with no launch is still blanked, so a block opened in both branches is counted once
+    sample = "void a(sycl::queue * q) {\n#ifdef FOO\n    for (;;) {\n#else\n    while (x) {\n#endif\n" \
+             "        q->submit(cgf);\n    }\n}\n"
+    assert not parse(sample).unbalanced
+    assert raw_sites(sample) == [("a", "submit")]
+
+
+RECORD = "ggml_sycl_kernel_profile_record_event"
+
+
+def test_a_launch_whose_event_is_handed_to_a_record_call_is_profiled():
+    samples = [
+        f"void a(sycl::queue * q) {{ sycl::event ev = q->submit(cgf); {RECORD}(label, ev, site, t0, t1); }}\n",
+        # assigned in each branch, recorded once after them, under the profiler's own condition
+        "void a(sycl::queue & q) {\n    sycl::event ev;\n    if (w) {\n        ev = q.parallel_for(r, k);\n"
+        "    } else {\n        ev = q.parallel_for(r, k2);\n    }\n"
+        f"    if (on) {{ {RECORD}(label, ev); }}\n}}\n",
+        "sycl::event a(sycl::queue * q) { return ggml_sycl_profile_record_returned_event(label, q->submit(cgf)); }\n",
+    ]
+    for sample in samples:
+        assert raw_sites(sample) == [], sample
+
+
+def test_a_record_call_excuses_only_the_launch_whose_event_it_is_handed():
+    samples = [
+        # a second launch in the same function, its event not recorded
+        f"void a(sycl::queue * q) {{ sycl::event ev = q->submit(cgf); q->submit(cgf2); {RECORD}(label, ev); }}\n",
+        # the record is handed a different event
+        f"void a(sycl::queue * q) {{ sycl::event ev = q->submit(cgf); sycl::event other; {RECORD}(label, other); }}\n",
+        # the record comes before the launch
+        f"void a(sycl::queue * q) {{ sycl::event ev; {RECORD}(label, ev); ev = q->submit(cgf); }}\n",
+        # the event is overwritten between the launch and the record
+        f"void a(sycl::queue * q) {{ sycl::event ev = q->submit(cgf); ev = other(); {RECORD}(label, ev); }}\n",
+        # a launch in a loop the record is outside of: only the last iteration's event is recorded
+        "void a(sycl::queue * q) { sycl::event ev; for (int i = 0; i < n; ++i) { ev = q->submit(cgf); } "
+        f"{RECORD}(label, ev); }}\n",
+        # the record is in another function
+        f"void a(sycl::queue * q) {{ sycl::event ev = q->submit(cgf); }}\nvoid b() {{ sycl::event ev; {RECORD}(l, ev); }}\n",
+    ]
+    for sample in samples:
+        assert raw_sites(sample) == [("a", "submit")], sample
 
 
 def test_a_helper_that_forwards_under_any_name_is_a_wrapper():
@@ -1228,6 +1348,31 @@ def test_a_listed_function_whose_submits_are_gone_fails():
     problems = diff_against_allow(census_keys(census_tree(texts)), allow)
     key = f"submit:{name}:{func}"
     assert problems == [f"{key}: 0 raw site(s) in the tree, {allow[key][0]} listed"]
+
+
+def launching_sources() -> list[str]:
+    """Every .cpp/.hpp under ggml/src/ggml-sycl whose code (comments and literals blanked) holds a launch-like call of
+    either class, before any receiver or wrapper test, as a path relative to it."""
+    found = []
+    for path in sorted(SYCL.rglob("*")):
+        if path.suffix not in (".cpp", ".hpp") or not path.is_file():
+            continue
+        code = blank(path.read_text(encoding="utf-8", errors="replace"))
+        if SUBMIT.search(code) or SHORTCUT.search(code):
+            found.append(path.relative_to(SYCL).as_posix())
+    return found
+
+
+def test_every_launching_file_is_on_the_path_or_excluded():
+    on_path = set(FILES)
+    unread = [name for name in launching_sources()
+              if name not in on_path and name not in EXCLUDED_FILES
+              and not any(name.startswith(d) for d in EXCLUDED_DIRS)]
+    assert not unread, f"in neither FILES nor EXCLUDED_FILES: {unread}"
+    assert not on_path & set(EXCLUDED_FILES), "a file is both on the path and excluded"
+    assert all(reason.strip() for reason in EXCLUDED_FILES.values())
+    stale = [name for name in EXCLUDED_FILES if not (SYCL / name).exists()]
+    assert not stale, f"excluded files that are gone: {stale}"
 
 
 def test_every_allowlist_entry_has_a_reason():
