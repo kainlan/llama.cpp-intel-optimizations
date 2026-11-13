@@ -2352,7 +2352,7 @@ def test_a_row_names_the_receiver_expression_as_written_prefix_included():
 
 
 def test_a_receiver_that_is_not_a_chain_of_names_matches_no_row():
-    # each receiver as the walk over calls and brackets used to write it: no row may name such an expression
+    # receivers no row may name, each with a row for the text it would otherwise be keyed by
     for call, text in [
         ("static_cast<sycl::queue &>(g).fill(p, 0, n);", "(g)"),
         ("std::get<0>(t).fill(p, 0, n);", "(t)"),
@@ -2362,6 +2362,14 @@ def test_a_receiver_that_is_not_a_chain_of_names_matches_no_row():
         ("foo.stream().fill(p, 0, n);", "foo.stream()"),
         ("g_pools[d].fill(p, 0, n);", "g_pools[d]"),
         ("a.\\\n    b.fill(p, 0, n);", "b"),
+        # the character right before the chain: a dereference, an address, a product, a conjunction, a continuation
+        ("*q.fill(p);", "q"),
+        ("auto z = &q.fill(p);", "q"),
+        ("x = a * q.fill(p);", "q"),
+        ("x = a && q.fill(p);", "q"),
+        ("\\\n    q.fill(p);", "q"),
+        # a keyword joined to the chain by `::` is no part of an expression
+        ("return ::q.fill(p);", "return::q"),
     ]:
         src = "void f() {\n    " + call + "\n}\n"
         assert receiver_census(src, {f"shortcut:x.cpp:f:{text}": (1, "test")}) == [("f", "shortcut")], src
@@ -2381,6 +2389,25 @@ def test_a_row_covering_two_definitions_of_one_function_name_is_refused():
     function = "void f(Pool & p) { p.submit(job); }\n"
     src = "namespace a {\n" + function + "}\nnamespace b {\n" + function + "}\n"
     assert receiver_census(src, {"submit:x.cpp:f:p": (2, "a host pool")}) == [("f", "submit")] * 2
+
+
+def test_a_row_for_calls_in_no_named_function_is_refused():
+    src = "auto a = [](Pool & p) { p.submit(job); };\nauto b = [](Pool & p) { p.submit(job); };\n"
+    rows = {"submit:x.cpp:?:p": (2, "a host pool")}
+    matches: dict[str, list[str]] = {}
+    tripped: dict[str, str] = {}
+    assert receiver_census(src, rows, matches=matches, tripped=tripped) == [("?", "submit")] * 2
+    assert set_aside_problems(matches, rows, tripped) == [
+        "submit:x.cpp:?:p: refused: a row needs a named function, and the calls at x.cpp:1, x.cpp:2 have none, so "
+        "they count (To update, e)"]
+
+
+def test_the_innermost_enclosing_submit_decides_for_a_shortcut_inside_nested_submits():
+    sample = ("void f(sycl::queue & q, Pool & pool) {\n"
+              "    q.submit([&] { pool.submit([&] { x.memcpy(a, b, n); }); });\n}\n")
+    # pool's submit is set aside by its row, so the memcpy inside it counts, though q's counted submit encloses both
+    assert receiver_census(sample, {"submit:x.cpp:f:pool": (1, "a host pool")}) == [("f", "submit"),
+                                                                                   ("f", "shortcut")]
 
 
 def test_a_free_submit_call_is_no_submit_site_so_a_queue_call_inside_it_counts():
