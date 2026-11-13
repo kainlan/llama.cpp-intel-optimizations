@@ -107,9 +107,10 @@ static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_AOS;
 // One WARN naming what holds the WEIGHT zone on `device` when a reserve comes up short: unified_cache_zone_tag_census()
 // read into moe_stream_ring_weight_zone_line(), its top MOE_STREAM_RING_WEIGHT_ZONE_TOP_TAGS tags, with the refused
 // ring's own `slots_held` slots of `slot_bytes`, which the census counts among the zone's holders. A diagnostic:
-// nothing the reserve or its caller decides reads it. The census takes two L5 locks one after the other, so the caller
-// must hold neither; moe_stream_phase::ring_ready() calls it once per llama context, where the reserve's own
-// allocations have just taken the same two.
+// nothing the reserve or its caller decides reads it. The census takes g_cache_rw_mutex (L4), shared, for the cache
+// lookup, then the WEIGHT zone's allocator group mutex (L5), then g_runtime_alloc_mutex (L5), each released before the
+// next, so the caller must hold no L4 or L5 lock; moe_stream_phase::ring_ready() calls it once per llama context,
+// where the reserve's own allocations have just taken the same locks.
 void moe_stream_ring_warn_weight_zone(int device, uint32_t slots_held, size_t slot_bytes);
 
 // Not thread-safe: one ring belongs to one device's prompt executor, which

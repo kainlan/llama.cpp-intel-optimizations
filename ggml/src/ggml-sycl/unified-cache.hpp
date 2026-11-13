@@ -9026,12 +9026,17 @@ void unified_cache_dump_live_zone_allocations(int          device,
 // allocation its allocator group records at an address `zone` owns, summed by tag. The group records every
 // zone_alloc(), registry row or not, so the count is complete. A tag is the registry row's cohort_id ("(none)" without
 // one), a slash and its alloc_role; an allocation with no row matching its allocation id is "(no registry row)/" and
-// the zone it was made for. Bytes are each allocation's extent. In single-chunk mode WEIGHT and KV share one address
-// range and one allocator, so the KV zone's allocations are counted too. Two instants: the figures and the record set
-// in one hold of the zone's allocator group mutex, released, then the tags under g_runtime_alloc_mutex alone; the two
-// L5 locks are never co-held, and the caller must hold neither. Host containers only; no address outlives the call and
-// none is dereferenced. False, with `out` empty, when the device has no cache or no active arena. Never creates a
-// cache.
+// the zone it was made for. Bytes are each allocation's extent.
+// WEIGHT and KV share one allocator group, so a WEIGHT census can carry KV-role tags; that is expected, not a census
+// defect. In single-chunk mode WEIGHT and KV share one address range and one allocator: every KV allocation is
+// counted, and the figures cover that same range. In N-chunk mode WEIGHT is the weight chunks: a KV allocation that
+// fell through to a weight chunk is counted, and the KV zone's own tail allocator in the last chunk is outside both
+// the figures and the census.
+// Three acquisitions in order, never two at once: g_cache_rw_mutex (L4), shared, for the cache lookup, released; the
+// zone's allocator group mutex (L5) for the figures and the record set, released; then g_runtime_alloc_mutex (L5)
+// alone for the tags. The figures and the tags are therefore two instants, not one snapshot. The caller must hold no
+// L4 or L5 lock. Host containers only; no address outlives the call and none is dereferenced. False, with `out` empty,
+// when the device has no cache or no active arena. Never creates a cache.
 bool unified_cache_zone_tag_census(int device, vram_zone_id zone, zone_tag_census & out);
 
 // ---------------------------------------------------------------------------
