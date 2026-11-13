@@ -6020,8 +6020,9 @@ static bool mmvq_q8_0_soa_id_mutant_wrong_scale_block() {
 //     would misread;
 //   - one expert's SOA block past INT_MAX bytes: the block dot takes int offsets.
 // A refusal fails the op, so each one is named, with the dispatcher (`site`), the tensor and its shape.
-// With GGML_SYCL_MMVQ_TRACE on, every launch logs one [MMVQ-TRACE] q8_0-soa-id line naming `site`, through the log
-// callback rather than stderr, so a test can tell which dispatcher launched the kernel for each op it runs.
+// With GGML_SYCL_MMVQ_TRACE on, every launch logs one [MMVQ-TRACE] q8_0-soa-id line naming `site` and the table it
+// passed (table=compact when `ids` is null, table=ids otherwise), through the log callback rather than stderr, so a
+// test can tell which dispatcher launched the kernel, and on which table form, for each op it runs.
 static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl(const char *                     site,
                                               const char *                     tensor_name,
                                               const void * const *             expert_ptrs,
@@ -6114,8 +6115,9 @@ static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl(const char *                     s
         *event_out = ev;
     }
     if (mmvq_moe_trace_enabled()) {
-        GGML_LOG_DEBUG("[MMVQ-TRACE] q8_0-soa-id site=%s tensor=%s experts=%d rows=%d cols=%d batches=%d tokens=%d\n",
-                       site, name, n_experts, nrows_per_expert, ncols, total_batches, n_tokens);
+        GGML_LOG_DEBUG(
+            "[MMVQ-TRACE] q8_0-soa-id site=%s table=%s tensor=%s experts=%d rows=%d cols=%d batches=%d tokens=%d\n",
+            site, ids ? "ids" : "compact", name, n_experts, nrows_per_expert, ncols, total_batches, n_tokens);
     }
     return true;
 }
