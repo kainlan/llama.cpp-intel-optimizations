@@ -1820,6 +1820,106 @@ def test_census_matches_the_allowlist():
     assert not problems, "\n".join(problems) + "\n\nraw submits found:\n" + format_sites(found)
 
 
+
+def test_a_submit_on_a_receiver_declared_as_no_queue_is_set_aside_and_an_unresolved_one_counts():
+    sample = (
+        "void a(thread_pool & pool) { pool.submit([] { work(); }); }\n"
+        "void b(sycl::queue & q) { q.submit(cgf); }\n"
+        "void c() { auto q = make_queue(); q.submit(cgf); }\n"
+    )
+    skipped: list[str] = []
+    # a host thread pool's submit is no device launch; an unread receiver keeps the submit counted (fails closed)
+    assert raw_sites(sample, skipped) == [("b", "submit"), ("c", "submit")]
+    assert skipped == ["x.cpp:a .submit( receiver pool is other:thread_pool"]
+
+
+def test_an_if_constexpr_block_is_not_named_as_a_function():
+    sample = "void a(sycl::queue * q) {\n    if constexpr (X) { q->submit(cgf); }\n}\n"
+    assert raw_functions(sample) == ["a"]
+
+
+def test_a_mismatch_names_its_key_its_launches_and_what_to_do_in_both_directions():
+    found = census({"x.cpp": "void b(sycl::queue & q) {\n    q.submit(c);\n    q.submit(c);\n}\n"})
+    allow = {"submit:x.cpp:gone": (1, "was the old copy")}
+    assert diff_against_allow(found, allow) == [
+        "submit:x.cpp:b: 2 raw launch(es) in the tree (x.cpp:2, x.cpp:3), 0 listed: wrap them, or list them in "
+        "ALLOW with why they are not wrapped (To update, b)",
+        'submit:x.cpp:gone: 0 raw launch(es) in the tree, 1 listed ("was the old copy"): lower the count or delete '
+        "the entry (To update, a)",
+    ]
+    assert diff_against_allow(found, {"submit:x.cpp:b": (2, "two copies")}) == []
+
+
+def test_a_wrong_record_row_names_its_count_and_the_rules_matches():
+    one = H + f"sycl::event ev = {L1};\n{RECORD}(lab, ev);\n}}\n"
+    table = {"x.cpp:f": 2, "x.cpp:g": 1}
+    matches: dict[str, list[int]] = {}
+    census({"x.cpp": one}, table=table, rule_matches=matches)
+    assert matches == {"x.cpp:f": [2]}
+    assert record_table_problems(matches, table) == [
+        "x.cpp:f: RECORDED_ON_THE_PATH says 2, the record rule matches 1 (x.cpp:2): read the function and set the "
+        "row to the launches whose event it records (To update, d)",
+        "x.cpp:g: RECORDED_ON_THE_PATH says 1, the record rule matches 0: read the function and set the row to the "
+        "launches whose event it records (To update, d)",
+    ]
+    assert record_table_problems(matches, {"x.cpp:f": 1}) == []
+
+
+def test_the_print_report_lists_keys_the_paste_lines_and_the_record_matches():
+    found = census({"x.cpp": "void b(sycl::queue & q) {\n    q.submit(c);\n}\n"
+                             "void k(sycl::queue & q) {\n    q.submit(c);\n    q.submit(c);\n}\n"})
+    allow = {"submit:x.cpp:gone": (1, "old"), "submit:x.cpp:k": (1, "a copy")}
+    lines = report(found, {"x.cpp:f": [3]}, allow, {"x.cpp:f": 1}).split("\n")
+    for line in [
+        "submit:x.cpp:b 1 (x.cpp:2)",
+        "submit:x.cpp:k 2 (x.cpp:5, x.cpp:6)",
+        '    "submit:x.cpp:b": (1, "TODO: what it is, and why it is not wrapped"),',
+        '    "submit:x.cpp:k": (2, "a copy"),',
+        '#   "submit:x.cpp:gone": (1, "old"),  <- delete: 0 in the tree',
+        "x.cpp:f: the record rule matches 1 (x.cpp:3), RECORDED_ON_THE_PATH says 1",
+    ]:
+        assert line in lines, f"{line!r} missing from the report:\n" + "\n".join(lines)
+
+
+def test_allow_is_written_sorted_by_key_with_no_duplicate():
+    text = Path(__file__).read_text(encoding="utf-8")
+    block = text[text.index("\nALLOW: dict"):]
+    block = block[:block.index("\n}\n")]
+    keys = re.findall(r'^    "((?:submit|shortcut):[^"]+)":', block, re.M)
+    duplicated = sorted({key for key in keys if keys.count(key) > 1})
+    assert not duplicated, f"ALLOW lists these keys twice (a dict literal keeps only the last): {duplicated}"
+    unsorted = [b for a, b in zip(keys, keys[1:]) if b < a]
+    assert not unsorted, f"ALLOW keys out of order, first at {unsorted[0]}"
+    assert len(keys) == len(ALLOW), "an ALLOW key is not at the start of its own line"
+
+
+def includers_outside_tests() -> dict[str, list[str]]:
+    """basename -> the sources outside any tests/ directory that #include a file of that name, over the trees a
+    backend or tool is built from."""
+    found: dict[str, list[str]] = {}
+    for top in ("ggml", "src", "common", "tools", "examples"):
+        for path in sorted((ROOT / top).rglob("*")):
+            if path.suffix not in (".c", ".cpp", ".h", ".hpp") or not path.is_file() or "tests" in path.parts:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for m in re.finditer(r'^\s*#\s*include\s*[<"](?:[^">]*/)?([^/">]+)[">]', text, re.M):
+                found.setdefault(m.group(1), []).append(path.relative_to(ROOT).as_posix())
+    return found
+
+
+def test_every_nothing_includes_it_reason_is_true():
+    includers = includers_outside_tests()
+    assert includers.get("norm.hpp"), "the include scan finds nothing, so its silence below would mean nothing"
+    claimed = {}
+    for name, reason in EXCLUDED_FILES.items():
+        header = re.fullmatch(r"its header (\S+): " + re.escape(NOT_INCLUDED), reason)
+        if header or reason.endswith(NOT_INCLUDED):
+            claimed[name] = header.group(1) if header else name.split("/")[-1]
+    assert claimed, "no reason claims that nothing includes a file"
+    false = {name: includers[checked] for name, checked in claimed.items() if checked in includers}
+    assert not false, f"excluded as {NOT_INCLUDED!r}, but included by: {false}"
+
+
 if __name__ == "__main__":
     import sys
 
