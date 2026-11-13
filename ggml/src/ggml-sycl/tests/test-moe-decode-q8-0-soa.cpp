@@ -29,7 +29,7 @@
 //     prompt executor claims a Q8_0 SOA prompt and the MMVQ probes are skipped, so this case turns that executor off
 //     (GGML_SYCL_MOE_PP_ONEDNN_F16=0). The knob is read once per process, so the case runs in a child process of
 //     this binary (`--prompt-vec-q`), which sets it before its backend starts. 4 tokens is under vec_q's prompt batch
-//     threshold for 8 experts at 4 used.
+//     threshold for 8 experts at 4 used. Every CASE line prints the switch its process ran under (pp_onednn_f16=).
 //
 // The fixture models the default load only, GGML_SYCL_WEIGHTS_EVICTABLE on: with it off, libllama puts these experts
 // in the device buffer, which reorders the whole tensor and publishes no per-expert records, so the process exits 77
@@ -94,7 +94,10 @@ constexpr decode_case k_cases[] = {
     { "decode-last-expert", 256, 128, 1, 1, 1, "batched", { 7 }          },
 };
 
-// Runs in a child process (run_prompt_child). Every expert is used by some token, expert 7 by two.
+// Runs in a child process (run_prompt_child) under GGML_SYCL_MOE_PP_ONEDNN_F16=0, which is how vec_q is reached, not a
+// workaround: at default flags the batched oneDNN prompt executor claims every multi-token (ne12 > 1) op on these Q8_0
+// SOA experts before the MMVQ probes run, so only a user who turns that executor off reaches vec_q, as this case does.
+// Every expert is used by some token, expert 7 by two.
 constexpr decode_case k_prompt_case = {
     "prompt-vec-q", 256, 128, 4, 4, 4, "vec_q", { 5, 0, 3, 6, 7, 2, 4, 1, 1, 6, 0, 7, 3, 5, 2, 4 }
 };
@@ -511,13 +514,15 @@ bool run_case(ggml_backend_t cpu, const decode_case & c, std::mt19937 & rng) {
     if (std::strcmp(site, c.site) != 0) {
         why += " site";
     }
+    // The executor switch this process ran under, as the backend read it: the prompt case's child sets it to 0.
+    const char * pp_onednn_f16 = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16");
     std::fprintf(stderr,
-                 "CASE name=%s in=%d out=%d experts=%d used=%d ne11=%d tokens=%d status=%d nmse=%.3e max_diff=%.4f "
-                 "soa_layout_lines=%zu layout_lines=%zu decode_refusal=%zu prompt_refusal=%zu fallback_failed=%zu "
-                 "site=%s want_site=%s site_batched=%zu site_vec_q=%zu -> %s%s\n",
-                 c.name, c.in, c.out, k_experts, c.used, c.ne11, c.tokens, static_cast<int>(status), err, diff,
-                 layout_soa, layout_all, decode_rf, prompt_rf, fallback, site, c.site, site_batched, site_vec_q,
-                 why.empty() ? "PASS" : "FAIL:", why.c_str());
+                 "CASE name=%s in=%d out=%d experts=%d used=%d ne11=%d tokens=%d pp_onednn_f16=%s status=%d "
+                 "nmse=%.3e max_diff=%.4f soa_layout_lines=%zu layout_lines=%zu decode_refusal=%zu prompt_refusal=%zu "
+                 "fallback_failed=%zu site=%s want_site=%s site_batched=%zu site_vec_q=%zu -> %s%s\n",
+                 c.name, c.in, c.out, k_experts, c.used, c.ne11, c.tokens, pp_onednn_f16 ? pp_onednn_f16 : "unset",
+                 static_cast<int>(status), err, diff, layout_soa, layout_all, decode_rf, prompt_rf, fallback, site,
+                 c.site, site_batched, site_vec_q, why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
 }
 
