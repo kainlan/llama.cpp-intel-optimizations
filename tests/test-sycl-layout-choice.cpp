@@ -862,6 +862,50 @@ static bool run_explicit_ubatch_ring_placement_test() {
         ok = false;
     }
 
+    // A plan that placed no explicit micro-batch holds the load's compute term at its planning micro-batch.
+    {
+        ggml_sycl::placement_plan shaped = unnamed;  // action NONE: no micro-batch was named
+        shaped.multi_device              = false;
+        shaped.device_id                 = 0;
+        shaped.planner_n_ubatch          = 512;
+
+        uint32_t     n      = 1;
+        const size_t at_512 = ggml_sycl::placement_plan_compute_room(shaped, 0, compute_term, false, &n);
+        bool         good   = at_512 == compute_term && n == 512;
+        // a rung that recorded a held-out request is charged, whatever the plan says
+        good = good && ggml_sycl::placement_plan_compute_room(shaped, 0, compute_term, true, &n) == 0 && n == 0;
+        // another device, a multi-device plan and an unknown planning micro-batch hold nothing
+        good = good && ggml_sycl::placement_plan_compute_room(shaped, 1, compute_term, false, &n) == 0 && n == 0;
+        shaped.multi_device = true;
+        good = good && ggml_sycl::placement_plan_compute_room(shaped, 0, compute_term, false, &n) == 0 && n == 0;
+        shaped.multi_device     = false;
+        shaped.planner_n_ubatch = 0;
+        good = good && ggml_sycl::placement_plan_compute_room(shaped, 0, compute_term, false, &n) == 0 && n == 0;
+        // an explicit PLACE keeps its own micro-batch, not the planning one
+        ggml_sycl::placement_plan explicit_plan = placed;
+        explicit_plan.multi_device              = false;
+        explicit_plan.device_id                 = 0;
+        explicit_plan.planner_n_ubatch          = 512;
+
+        good = good &&
+               ggml_sycl::placement_plan_compute_room(explicit_plan, 0, compute_term, false, &n) == compute_term &&
+               n == 2048;
+        // a micro-batch that was named but not placed (grow-zone, refused) sized no room at either micro-batch
+        for (const ggml_sycl::placement_plan * other : { &grow, &partial, &none }) {
+            ggml_sycl::placement_plan named = *other;
+            named.multi_device              = false;
+            named.device_id                 = 0;
+            named.planner_n_ubatch          = 512;
+            good = good && ggml_sycl::placement_plan_compute_room(named, 0, compute_term, false, &n) == 0 && n == 0;
+        }
+        if (!good) {
+            printf(
+                "FAIL: the compute room of a plan with no explicit micro-batch is the planned term at the "
+                "planning micro-batch on its own device, and nothing once a request was held out\n");
+            ok = false;
+        }
+    }
+
     // The first non-probe context since the load announces the placement at WARN. The rule reads the plan alone, so a
     // context whose micro-batch differs (-p 512 under -ub 2048) still announces it. The plan that context publishes
     // carries the mark and the next context copies it, so none announces again. A probe never announces, and neither
