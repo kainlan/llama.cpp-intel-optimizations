@@ -953,6 +953,8 @@ static std::atomic<uint32_t> g_planned_dense_scratch_n_ubatch[GGML_SYCL_MAX_DEVI
 // llama.cpp-ihk6: this is the MERGE over the owners on the device (g_planned_load_terms below), published there; it is
 // what every reader loads.
 static std::atomic<size_t>   g_planned_compute_term_bytes[GGML_SYCL_MAX_DEVICES]{};
+// The micro-batch the compute term was measured at, as zone_compute_term_n_ubatch_store records it across loads.
+static std::atomic<uint32_t> g_planned_compute_term_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-p6i0: the load's planned state term (the context memory the measure placed on the device's plain buffer
 // type, the recurrent state, which takes the RUNTIME zone before the compute buffer), at the same grain. The merge
 // over the owners on the device, like the compute term.
@@ -2854,6 +2856,34 @@ size_t unified_cache_get_planned_compute_term_bytes(int device_id) {
         return 0;
     }
     return g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire);
+}
+
+void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    // A compare-exchange, so the one transition to disagreement is seen by exactly one store, whatever lock its
+    // caller holds.
+    std::atomic<uint32_t> & slot   = g_planned_compute_term_n_ubatch[device_id];
+    uint32_t                stored = slot.load(std::memory_order_acquire);
+    uint32_t                next   = zone_compute_term_n_ubatch_store(stored, n_ubatch);
+    while (next != stored && !slot.compare_exchange_weak(stored, next, std::memory_order_acq_rel)) {
+        next = zone_compute_term_n_ubatch_store(stored, n_ubatch);
+    }
+    if (next != stored && next == zone_compute_term_n_ubatch_disagreed) {
+        GGML_LOG_WARN(
+            "[LOAD-PLAN] device %d: this load plans its compute term at n_ubatch=%u where an earlier load planned it "
+            "at n_ubatch=%u; the hold-spill fit credits the planned compute room at no rung for the rest of the "
+            "process\n",
+            device_id, n_ubatch, stored);
+    }
+}
+
+uint32_t unified_cache_get_planned_compute_term_n_ubatch(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return zone_compute_term_n_ubatch_read(g_planned_compute_term_n_ubatch[device_id].load(std::memory_order_acquire));
 }
 
 bool unified_cache_set_planned_state_term(int device_id, lifecycle::SlotToken owner, size_t bytes) {
@@ -36147,6 +36177,29 @@ size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & 
         *n_ubatch = placed ? xub.n_ubatch : 0;
     }
     return placed ? compute_term : 0;
+}
+
+// The compute room the hold-spill fit credits for a plan; unified-cache.hpp describes it.
+size_t placement_plan_compute_room(const placement_plan & plan,
+                                   int                    device,
+                                   size_t                 compute_term,
+                                   uint32_t               planning_n_ubatch,
+                                   bool                   held_out,
+                                   uint32_t *             n_ubatch) {
+    uint32_t n    = 0;
+    size_t   room = 0;
+    if (!held_out && !plan.multi_device && plan.device_id == device) {
+        room = placement_explicit_ubatch_compute_room(plan.explicit_ubatch, compute_term, &n);
+        if (n == 0 && plan.explicit_ubatch.action == pp_moe_onednn_explicit_ubatch_action::NONE &&
+            planning_n_ubatch != 0) {
+            n    = planning_n_ubatch;
+            room = compute_term;
+        }
+    }
+    if (n_ubatch != nullptr) {
+        *n_ubatch = n;
+    }
+    return room;
 }
 
 // The announce rule for a placed explicit micro-batch; unified-cache.hpp describes it.

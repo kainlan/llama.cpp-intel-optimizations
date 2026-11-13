@@ -1025,6 +1025,23 @@ size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & 
                                               size_t                            compute_term,
                                               uint32_t *                        n_ubatch);
 
+struct placement_plan;
+
+// The compute room the RUNTIME zone of `plan` holds on `device`, for the hold-spill fit to credit: `compute_term` at
+// the micro-batch the zone was sized for, in *n_ubatch. A placed explicit micro-batch names its own. Otherwise, for a
+// plan that named no micro-batch, the zone was sized at the load's planning micro-batch, the shape the load measured
+// the compute term at, which the caller passes as `planning_n_ubatch`: the plan's planner_n_ubatch is the context's
+// micro-batch, rewritten by every runtime context transaction, so it cannot say what the load measured. The fit
+// credits that one rung only (zone_hold_fit_rung_has_compute_room). 0 with *n_ubatch 0 for a multi-device plan,
+// another device, a planning micro-batch of 0, a named micro-batch the plan did not place, and when `held_out` says
+// the rung already recorded a request outside the arena: a measured spill overrules the plan.
+size_t placement_plan_compute_room(const placement_plan & plan,
+                                   int                    device,
+                                   size_t                 compute_term,
+                                   uint32_t               planning_n_ubatch,
+                                   bool                   held_out,
+                                   uint32_t *             n_ubatch);
+
 // Whether a context announces the load's explicit micro-batch placement at WARN: it is the first non-probe context
 // since the load whose plan PLACED the micro-batch and whose room cost device bytes of routed experts. The bytes
 // decide, not the count of triplets: with triplets of unequal size the device can keep as many triplets and still hold
@@ -2647,6 +2664,15 @@ bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_
 // (planned_load_terms::set).
 bool             unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
 size_t           unified_cache_get_planned_compute_term_bytes(int device_id);
+// The micro-batch the planned compute term was measured at on the device, for the hold-spill fit to credit the term
+// at that rung only (placement_plan_compute_room). Each load records its planning micro-batch, the inventory's
+// n_ubatch, through zone_compute_term_n_ubatch_store: a load that disagrees with an earlier one turns the record off
+// for the rest of the process, with one WARN naming both values. The stored value is the measure's shape only while
+// inventory.n_ubatch and llama_auto_ubatch_ladder[0] (the measure's n_ubatch) agree; a source pin holds the two to one
+// value. Nothing clears it: a term no live load owns merges to 0 bytes and credits nothing. The getter answers 0 for
+// none, for a record turned off, and for a device out of range.
+void             unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch);
+uint32_t         unified_cache_get_planned_compute_term_n_ubatch(int device_id);
 // llama.cpp-p6i0: the load's planned state term, the bytes the context memory the probe measure placed on the
 // device's plain buffer type occupies in the RUNTIME zone (the recurrent state: the real context allocates it there,
 // RUNTIME-first and outside the compute scope, before the compute buffer, so a compute term alone does not hold the

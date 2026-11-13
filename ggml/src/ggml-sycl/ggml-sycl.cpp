@@ -17652,6 +17652,11 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_row_bytes(
         ctx->device, inventory->pp_moe_onednn_activation_bytes_per_row, inventory->pp_moe_onednn_output_bytes_per_row);
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(ctx->device, inventory->n_ubatch);
+    // The load's planning micro-batch, recorded beside the compute term for the hold-spill fit. Recorded here, once per
+    // load, because the published plan cannot carry it: every runtime context transaction rewrites the plan's
+    // planner_n_ubatch with the context's own micro-batch. It is the measure's shape only while inventory.n_ubatch and
+    // llama_auto_ubatch_ladder[0] agree, which a source pin holds.
+    ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, inventory->n_ubatch);
 
     g_model_n_layer = inventory->n_layer;
     ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);
@@ -19785,18 +19790,24 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     // Lent bytes cost the card nothing; the part of the ring neither the planned room nor a loan covers is a demand
     // (zone_hold_fit_demand).
     in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device);
-    // The explicit micro-batch the published plan placed on this device: its RUNTIME zone holds the planned compute
-    // term beside that micro-batch's ring and dense scratch, so the fit credits a request of that rung no larger than
-    // the term (whole or nothing). Every other rung, and every load that placed no micro-batch, is judged as before.
+    // The micro-batch the published single-device plan sized this device's RUNTIME zone for: the explicit one it
+    // placed, or else the load's planning micro-batch, the shape the load measured the compute term at. The zone holds
+    // that term beside the micro-batch's ring and dense scratch, so the fit credits a request of that rung no larger
+    // than the term (whole or nothing). Every other rung is judged as before.
     {
         const auto room_plan     = ggml_sycl_global_plan_owner();
         uint32_t   room_n_ubatch = 0;
-        size_t     room_bytes    = 0;
-        if (!room_plan->multi_device && room_plan->device_id == q.device) {
-            room_bytes = ggml_sycl::placement_explicit_ubatch_compute_room(
-                room_plan->explicit_ubatch, ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device),
-                &room_n_ubatch);
+        // The realized check has the rung's own record: a request the hold kept outside the arena is charged. The read
+        // copies the counters and resets nothing, so the realized refusal still reports them.
+        bool       held_out      = false;
+        if (q.rung_live) {
+            ggml_sycl::planned_hold_spill_totals totals;
+            ggml_sycl::unified_cache_get_recent_planned_hold_spills(q.device, q.owner, &totals);
+            held_out = totals.raw_count != 0;
         }
+        const size_t room_bytes = ggml_sycl::placement_plan_compute_room(
+            *room_plan, q.device, ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device),
+            ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device), held_out, &room_n_ubatch);
         in.compute_room_n_ubatch = room_n_ubatch;
         in.compute_room_bytes    = room_bytes;
     }

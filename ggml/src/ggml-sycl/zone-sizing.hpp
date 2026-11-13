@@ -579,7 +579,9 @@ size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch)
 // sized a compute room for, and the request is no larger than that room. Whole or nothing: a request above the room
 // gets no part of it. It can over-credit a rung whose compute buffers span several chunks, because the request is the
 // rung's largest single buffer (zone_hold_fit_request) while the room is a sum of per-chunk peaks that the other
-// chunks draw on too. The bound has the same limit, since it charges one request rather than the rung's chunks.
+// chunks draw on too. The bound has the same limit, since it charges one request rather than the rung's chunks. The
+// credit at the load's planning micro-batch (placement_plan_compute_room) shares the limit, since its room is the
+// same summed term.
 bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request);
 
 // The raw (outside-arena) demand the hold can cause at the rung: zone_hold_spill_raw_demand over
@@ -672,6 +674,26 @@ bool zone_route_draws_scratch(bool decision_valid,
 // chunk allocates nothing (ggml_backend_buft_alloc_buffer answers a size-0 request without the backend). No headroom
 // is added. False, with *out untouched, when the sum or a rounding would wrap: never a smaller term.
 bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size_t alignment, size_t * out);
+
+// The micro-batch the planned compute term was measured at, as the loads on a device record it, one store per load:
+// the hold-spill fit credits the term at that rung only. The first load's value stands while later loads agree. A
+// load that names a different one turns the record off for good (zone_compute_term_n_ubatch_disagreed), because a
+// credit at a shape the term was not measured at is the defect the record prevents, and once off it never reads as a
+// shape again. A load naming 0 changes nothing. Nothing ever clears it: when every load that reserved the term is gone
+// the term merges to 0 bytes, and a 0-byte room credits nothing, so a micro-batch left behind is harmless.
+constexpr uint32_t zone_compute_term_n_ubatch_disagreed = UINT32_MAX;
+
+inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_ubatch) {
+    if (n_ubatch == 0 || stored == zone_compute_term_n_ubatch_disagreed) {
+        return stored;
+    }
+    return stored == 0 || stored == n_ubatch ? n_ubatch : zone_compute_term_n_ubatch_disagreed;
+}
+
+// The micro-batch a record names: 0 for none, and for one that disagreement turned off.
+inline uint32_t zone_compute_term_n_ubatch_read(uint32_t stored) {
+    return stored == zone_compute_term_n_ubatch_disagreed ? 0 : stored;
+}
 
 // ---------------------------------------------------------------------------
 // Mispredict accounting
