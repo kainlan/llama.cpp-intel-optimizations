@@ -13,6 +13,7 @@
 // Adding a type to one table without the other must be caught here, not there.
 
 #include "../ggml/src/ggml-sycl/moe-mmvq-tables.hpp"
+#include "../ggml/src/ggml-sycl/soa-reorder-types.hpp"
 #include "ggml.h"
 
 #include <cstdint>
@@ -895,6 +896,39 @@ int main() {
                         ++failures;
                     }
                 }
+            }
+        }
+    }
+
+    // 15. Decode runs every SOA expert layout that prefill runs. A type with an SOA reorder and an SOA prompt row
+    // needs an SOA decode executor too. The pairs below are the known support gaps: each is a missing kernel, and the
+    // change that writes it deletes its line.
+    {
+        const ggml_type decode_soa_gaps[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 };
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const ggml_type type = static_cast<ggml_type>(t);
+            const char *    name = ggml_type_name(type);
+            if (name == nullptr || !ggml_sycl_soa_reorder_supported_type(type) ||
+                !moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_SOA)) {
+                continue;
+            }
+            bool listed = false;
+            for (ggml_type g : decode_soa_gaps) {
+                listed = listed || g == type;
+            }
+            const bool decodes = moe_mmvq_capability_supports_layout(type, GGML_LAYOUT_SOA);
+            std::printf("decode SOA gap check: %s decodes=%d listed=%d\n", name, decodes ? 1 : 0, listed ? 1 : 0);
+            if (!decodes && !listed) {
+                std::printf(
+                    "FAIL: %s experts have an SOA layout and run in prefill at SOA, but decode has no SOA executor: "
+                    "write the decode SOA kernel and advertise (%s, SOA) in moe_mmvq_capability_supports_layout; "
+                    "only if the gap is accepted for now, add the type to decode_soa_gaps\n",
+                    name, name);
+                ++failures;
+            }
+            if (decodes && listed) {
+                std::printf("FAIL: %s SOA has a decode executor now; delete it from decode_soa_gaps\n", name);
+                ++failures;
             }
         }
     }
