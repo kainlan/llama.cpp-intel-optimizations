@@ -1767,6 +1767,38 @@ int main() {
         CHECK(ggml_sycl::zone_hold_spill_bound(1, SIZE_MAX / 2, 512, 2048) == SIZE_MAX, "an overflowing product");
     }
 
+    // The terms the hold-spill refusal prints are the ones the demand is made of.
+    {
+        const size_t MiB  = 1024 * 1024;
+        auto         plan = [](void *, uint32_t) -> size_t {
+            return 1100 * 1024 * 1024;
+        };
+        ggml_sycl::zone_hold_rung_request rungs[] = {
+            { 512, 490 * MiB }
+        };
+        ggml_sycl::zone_hold_fit_inputs in = {};
+        in.headroom_target                 = 256 * MiB;
+        in.free_before                     = 1764 * MiB;
+        in.kv_room                         = 64 * MiB;
+        in.rungs                           = rungs;
+        in.n_rungs                         = 1;
+        in.plan_of                         = plan;
+        in.ring_bytes                      = 2 * MiB;
+        ggml_sycl::zone_hold_fit_terms t   = ggml_sycl::zone_hold_fit_terms_at(in, 512);
+        CHECK(t.plan == 1100 * MiB && t.request == 490 * MiB && !t.request_credited, "plan and the uncredited request");
+        CHECK(t.kv_room == 64 * MiB && t.ring_uncovered == 2 * MiB, "the KV room and the uncovered ring");
+        CHECK(t.demand == ggml_sycl::zone_hold_fit_demand(in, 512), "the terms' demand is the fit's demand");
+        CHECK(t.demand == 1100 * MiB + 490 * MiB - 64 * MiB + 2 * MiB, "1528 MiB");
+        in.compute_room_n_ubatch = 512;
+        in.compute_room_bytes    = 2057 * MiB;
+        t                        = ggml_sycl::zone_hold_fit_terms_at(in, 512);
+        CHECK(t.request == 490 * MiB && t.request_credited, "a credited request is still named, and marked");
+        CHECK(t.demand == 1100 * MiB - 64 * MiB + 2 * MiB && t.demand == ggml_sycl::zone_hold_fit_demand(in, 512),
+              "and adds nothing");
+        t = ggml_sycl::zone_hold_fit_terms_at(in, 0);
+        CHECK(t.demand == 0 && t.plan == 0 && t.request == 0, "an unknown n_ubatch names nothing");
+    }
+
     // ---- Case 24d (compute room, scoped): only the rung the plan placed sees the room. Over every record set the
     // cases above use, every rung from 32 to 8192 gets the demand the fit gave before the room existed (spill bound
     // over the plan and the rung's request, net of the KV room, plus the uncovered ring) when no rung is named, even
