@@ -20350,6 +20350,20 @@ enum class ggml_sycl_ring_replan_result { OK, RELEASE_REFUSED, DOES_NOT_FIT };
 // admission subtracts that and this constant goes away.
 static constexpr size_t k_pp_moe_ring_compute_reserve_bytes_per_row = 1024 * 1024;
 
+// Each summand of ggml_sycl_ring_kv_zone_inputs::runtime_pending_bytes, by name, recorded where the sum is built. Only
+// the ring refusal's term line reads them; the admission reads the sum.
+struct ggml_sycl_runtime_pending_terms {
+    size_t dense_scratch_bytes = 0;  // the dense scratch planned at the runtime n_ubatch
+    size_t compute_term_bytes  = 0;  // the load's planned compute term
+    size_t state_term_bytes    = 0;  // the load's planned state term
+    size_t host_scatter_bytes  = 0;  // the planned host-expert scatter scratch this context does not hold yet
+    size_t mmid_pools_bytes    = 0;  // the next plan's MMID workspace pools on the device
+
+    size_t sum() const {
+        return dense_scratch_bytes + compute_term_bytes + state_term_bytes + host_scatter_bytes + mmid_pools_bytes;
+    }
+};
+
 // What the runtime-context transaction knows when it re-plans the ring, after
 // it has admitted KV. Without it (the rollbacks) the ring is restored to a
 // size that fit before, and its KV-zone part is not re-admitted.
@@ -20359,6 +20373,10 @@ struct ggml_sycl_ring_kv_zone_inputs {
     size_t runtime_pending_bytes = 0;      // RUNTIME bytes the transaction places after the ring
     size_t budget_room_bytes     = 0;      // ggml_sycl_device_vram_budget_room() before the ring is charged
     bool   readmit               = false;  // the KV re-fit counted the ring's KV-zone slots as free
+    ggml_sycl_runtime_pending_terms pending_terms;  // runtime_pending_bytes by summand
+    // The dense scratch published before this transaction re-planned it (Q8_1 src1 + f16 dequant, saturating). Only the
+    // ring refusal's term line reads it.
+    size_t                          dense_at_txn_start_bytes = 0;
 };
 
 // What the plan's VRAM budget leaves on `device` once the plan's VRAM (weights,
@@ -20385,6 +20403,100 @@ static size_t ggml_sycl_device_kv_bytes_with_slack(const ggml_sycl::placement_pl
         n_resident += owner == device && layer >= 0 && plan.kv_size_for_layer(static_cast<uint32_t>(layer)) > 0;
     }
     return plan.device_kv_vram_bytes(device) + n_resident * ggml_sycl::kv_alloc_slack_per_layer;
+}
+
+// What a refused ring re-plan saw on the arena route, in bytes, for the term line below.
+struct ggml_sycl_ring_refusal_runtime_view {
+    uint32_t                                        n_ubatch          = 0;  // the micro-batch refused
+    uint32_t                                        restored_n_ubatch = 0;  // the ring the refusal restored
+    size_t                                          zone_bytes        = 0;  // RUNTIME zone capacity
+    size_t                                          used_bytes        = 0;  // RUNTIME bytes in use before the restore
+    size_t                                          available_bytes   = 0;  // the zone_available() the admission read
+    size_t                                          net_bytes         = 0;  // available less the pending sum
+    size_t                                          ring_request      = 0;  // the ring the refusal names, in bytes
+    size_t                                          weight_slot_bytes = 0;
+    size_t                                          activation_bytes  = 0;  // per slot, as the re-plan sized it
+    size_t                                          output_bytes      = 0;  // per slot, as the re-plan sized it
+    uint32_t                                        ring_depth        = 0;
+    size_t                                          kv_largest_block  = 0;  // the KV zone's largest free block read
+    const ggml_sycl_ring_kv_zone_inputs *           kv_zone           = nullptr;
+    const ggml_sycl::pp_moe_onednn_ring_admission * admission         = nullptr;
+    bool                                            probe_mode        = false;  // a probe rung: its refusal is INFO
+};
+
+// The ring refusal names the RUNTIME zone's terms one by one, in bytes, so a refusal by a fraction of a megabyte can be
+// traced to the term that differs. Two sides. The admission side is what the refusal decided on: the zone's capacity,
+// used and available bytes, the pending sum and each summand, the ring requested, and the admission's KV-zone
+// placement. The plan side is the RUNTIME requirement split the way the zone is sized from it (floor, fixed, dense
+// scratch, the ring's RUNTIME part). The plan keeps only the zone it reserved, not the terms it was sized from, so
+// those terms are read from what is published now, after the refusal restored the previous ring, and labelled so: a
+// load or context that published since then has moved them. On a publish the dense term has moved in any case: the
+// transaction re-planned the dense scratch at its own n_ubatch before the ring, and a refusal restores only the hold,
+// so the published dense figure is this transaction's. The dense figure published when the transaction started is
+// printed beside it. WARN on every refusal, the probe's included, because a default-verbosity run is the one that
+// needs it; a probe rung's line says "probe: " as the probe's other lines do, because its refusal sentence is INFO.
+// The pending sum's summands are recorded where the sum is built; `unattributed` is what the sum holds beyond them, so
+// a summand added there without a record shows up instead of being credited to the next term's name.
+static void ggml_sycl_log_ring_refusal_runtime_terms(int device, const ggml_sycl_ring_refusal_runtime_view & v) {
+    const ggml_sycl_runtime_pending_terms   none{};
+    const ggml_sycl_runtime_pending_terms & pending          = v.kv_zone ? v.kv_zone->pending_terms : none;
+    const size_t                            pending_bytes    = v.kv_zone ? v.kv_zone->runtime_pending_bytes : 0;
+    const size_t                            pending_recorded = pending.sum();
+    const size_t unattributed = pending_bytes > pending_recorded ? pending_bytes - pending_recorded : 0;
+
+    const size_t floor_bytes  = ggml_sycl::unified_cache_runtime_zone_floor_bytes();
+    size_t       requirement  = 0;
+    size_t       planned_zone = 0;
+    const bool   answerable   = ggml_sycl::unified_cache_get_planned_runtime_zone_requirement(device, &requirement) &&
+                            ggml_sycl::zone_runtime_reserved_bytes(floor_bytes, requirement, &planned_zone);
+    const size_t pipeline = ggml_sycl::unified_cache_get_planned_pp_pipeline_scratch_bytes(device);
+    const ggml_sycl::moe_control_requirement control =
+        ggml_sycl::unified_cache_get_planned_moe_control_requirement(device);
+    const size_t host_scatter = ggml_sycl::unified_cache_get_planned_moe_host_scatter_scratch_bytes(device);
+    const size_t compute      = ggml_sycl::unified_cache_get_planned_compute_term_bytes(device);
+    const size_t state        = ggml_sycl::unified_cache_get_planned_state_term_bytes(device);
+    const size_t mmq_src1     = ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(device);
+    const size_t dequant_f16  = ggml_sycl::unified_cache_get_planned_dequant_f16_scratch_bytes(device);
+    const size_t dense        = mmq_src1 > SIZE_MAX - dequant_f16 ? SIZE_MAX : mmq_src1 + dequant_f16;
+    const size_t ring         = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device);
+    // The ring's KV-zone part, composed as its twin unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes()
+    // (unified-cache.cpp) composes it, saturating included: the twin is file-local to the cache.
+    const size_t ring_kv_slot = (ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(device) ?
+                                     ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device) :
+                                     0) +
+                                (ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(device) ?
+                                     ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(device) :
+                                     0);
+    const size_t ring_kv_depth = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(device);
+    const size_t ring_kv =
+        ring_kv_depth != 0 && ring_kv_slot > SIZE_MAX / ring_kv_depth ? SIZE_MAX : ring_kv_slot * ring_kv_depth;
+    const size_t ring_runtime           = ring > ring_kv ? ring - ring_kv : 0;
+    // The rest of the requirement, split as the explicit micro-batch's room splits it.
+    const size_t ring_runtime_and_dense = ring_runtime > SIZE_MAX - dense ? SIZE_MAX : ring_runtime + dense;
+    const size_t fixed = requirement > ring_runtime_and_dense ? requirement - ring_runtime_and_dense : 0;
+
+    const ggml_sycl::pp_moe_onednn_ring_admission   none_admitted{};
+    const ggml_sycl::pp_moe_onednn_ring_admission & a = v.admission ? *v.admission : none_admitted;
+
+    GGML_LOG_WARN(
+        "[SYCL-PLAN] %sRUNTIME zone terms (bytes): device=%d n_ubatch=%u; admission: zone=%zu used=%zu available=%zu "
+        "pending=%zu (dense_scratch=%zu compute=%zu state=%zu host_scatter_unheld=%zu mmid_pools=%zu "
+        "unattributed=%zu; txn_inputs=%d) net=%zu ring_request=%zu (weights=%zu activation=%zu output=%zu per slot, "
+        "depth=%u) admission_slots (activation=%zu output=%zu) candidate_kv_zone_part=%zu (activation=%d output=%d "
+        "headroom=%zu kv_capacity=%zu kv=%zu compute_reserve=%zu largest_block=%zu budget_room=%zu); plan, recomputed "
+        "from the terms published now (ring restored to n_ubatch=%u; on a publish dense is this transaction's "
+        "re-plan): answerable=%d floor=%zu requirement=%zu zone_for_requirement=%zu fixed=%zu (pipeline=%zu "
+        "control=%zu host_scatter=%zu plan_compute=%zu plan_state=%zu) dense=%zu (mmq_src1=%zu dequant_f16=%zu; "
+        "dense_at_txn_start=%zu) ring_runtime=%zu (ring=%zu restored_kv_zone_part=%zu)\n",
+        v.probe_mode ? "probe: " : "", device, v.n_ubatch, v.zone_bytes, v.used_bytes, v.available_bytes, pending_bytes,
+        pending.dense_scratch_bytes, pending.compute_term_bytes, pending.state_term_bytes, pending.host_scatter_bytes,
+        pending.mmid_pools_bytes, unattributed, v.kv_zone ? 1 : 0, v.net_bytes, v.ring_request, v.weight_slot_bytes,
+        v.activation_bytes, v.output_bytes, v.ring_depth, a.activation_slot_bytes, a.output_slot_bytes, a.kv_zone_bytes,
+        a.activation_in_kv_zone ? 1 : 0, a.output_in_kv_zone ? 1 : 0, a.kv_zone_headroom_bytes,
+        v.kv_zone ? v.kv_zone->kv_capacity_bytes : 0, v.kv_zone ? v.kv_zone->kv_bytes : 0, a.compute_reserve_bytes,
+        v.kv_largest_block, v.kv_zone ? v.kv_zone->budget_room_bytes : 0, v.restored_n_ubatch, answerable ? 1 : 0,
+        floor_bytes, requirement, planned_zone, fixed, pipeline, control.bytes, host_scatter, compute, state, dense,
+        mmq_src1, dequant_f16, v.kv_zone ? v.kv_zone->dense_at_txn_start_bytes : 0, ring_runtime, ring, ring_kv);
 }
 
 static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
@@ -20482,6 +20594,9 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
     const char * const zone_name = arena ? "RUNTIME" : "direct-device";
     const size_t       needed_total =
         static_cast<size_t>(ring_depth) * (weight_slot_bytes + new_activation_slot_bytes + new_output_slot_bytes);
+    // Read with the capacity, before a refusal's restore re-reserves the previous ring: only a refusal's term line
+    // reads it.
+    const size_t runtime_used_bytes = arena ? cache->zone_used(ggml_sycl::vram_zone_id::RUNTIME) : 0;
 
     // On the arena route, where each slot goes and whether the ring fits is
     // pp_moe_onednn_admit_ring()'s answer: the weight slots stay in the RUNTIME
@@ -20497,10 +20612,12 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
     const size_t runtime_net_bytes = capacity_bytes > runtime_pending ? capacity_bytes - runtime_pending : 0;
 
     ggml_sycl::pp_moe_onednn_ring_admission admission;
+    size_t                                  kv_zone_largest_block_bytes = std::numeric_limits<size_t>::max();
     if (arena) {
         ggml_sycl::pp_moe_onednn_ring_admission_inputs admit_in;
-        admit_in.kv_zone_largest_block_bytes =
+        kv_zone_largest_block_bytes =
             kv_zone ? cache->zone_largest_free(ggml_sycl::vram_zone_id::KV) : std::numeric_limits<size_t>::max();
+        admit_in.kv_zone_largest_block_bytes = kv_zone_largest_block_bytes;
         admit_in.kv_zone_available_bytes = kv_zone ? kv_zone->kv_capacity_bytes : std::numeric_limits<size_t>::max();
         admit_in.kv_admitted_bytes       = kv_zone ? kv_zone->kv_bytes : 0;
         admit_in.vram_budget_room_bytes  = kv_zone ? kv_zone->budget_room_bytes : std::numeric_limits<size_t>::max();
@@ -20566,6 +20683,25 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
             "available%s\n",
             n_ubatch, needed_total / mb, weight_slot_bytes / mb, new_activation_slot_bytes / mb,
             new_output_slot_bytes / mb, ring_depth, zone_name, runtime_net_bytes / mb, fits_clause);
+        if (arena) {
+            ggml_sycl_ring_refusal_runtime_view view;
+            view.n_ubatch          = n_ubatch;
+            view.restored_n_ubatch = old_n_ubatch;
+            view.zone_bytes        = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
+            view.used_bytes        = runtime_used_bytes;
+            view.available_bytes   = capacity_bytes;
+            view.net_bytes         = runtime_net_bytes;
+            view.ring_request      = needed_total;
+            view.weight_slot_bytes = weight_slot_bytes;
+            view.activation_bytes  = new_activation_slot_bytes;
+            view.output_bytes      = new_output_slot_bytes;
+            view.ring_depth        = ring_depth;
+            view.kv_largest_block  = kv_zone_largest_block_bytes;
+            view.kv_zone           = kv_zone;
+            view.admission         = &admission;
+            view.probe_mode        = probe_mode;
+            ggml_sycl_log_ring_refusal_runtime_terms(device, view);
+        }
         return ggml_sycl_ring_replan_result::DOES_NOT_FIT;
     };
 
@@ -21619,6 +21755,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         }
         dense_scratch_runtime_bytes = needed;
     }
+    // The dense scratch as published before the re-plan below replaces it with this context's, for the ring refusal's
+    // term line: a refused publish leaves the re-planned figure published.
+    size_t dense_at_txn_start_bytes = 0;
+    {
+        const size_t mmq_src1    = ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(ctx->device);
+        const size_t dequant_f16 = ggml_sycl::unified_cache_get_planned_dequant_f16_scratch_bytes(ctx->device);
+        dense_at_txn_start_bytes = mmq_src1 > SIZE_MAX - dequant_f16 ? SIZE_MAX : mmq_src1 + dequant_f16;
+    }
     ggml_sycl_dense_scratch_txn_guard dense_guard(*ctx, !probe_mode);
     if (!probe_mode && next_kv_info.n_ubatch != 0) {
         // The published plan's model re-plans its own inputs (llama.cpp-45qo) at the largest n_ubatch its live
@@ -21684,13 +21828,20 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // The dense scratch planned above lives in the RUNTIME zone too (counted twice when this context already
     // materialized it, like the pools below: conservative), so the ring leaves it that room.
     ring_kv_zone.runtime_pending_bytes += dense_scratch_runtime_bytes;
+    ring_kv_zone.pending_terms.dense_scratch_bytes = dense_scratch_runtime_bytes;
+    ring_kv_zone.dense_at_txn_start_bytes          = dense_at_txn_start_bytes;
+    // Each summand below is recorded by name for the ring refusal's term line. A summand read from a getter is taken
+    // back out of the sum, so the record is the bytes that were added, not a second read of a value that may move.
     // The load's planned compute term (llama.cpp-p6i0) is the room the scheduler's compute buffer takes in the RUNTIME
     // zone after this transaction, so the ring leaves it too. A re-publish while the buffer is live counts it twice,
     // like the dense scratch above: conservative.
     ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_compute_term_bytes(ctx->device);
+    ring_kv_zone.pending_terms.compute_term_bytes =
+        ring_kv_zone.runtime_pending_bytes - ring_kv_zone.pending_terms.sum();
     // And the load's planned state term: the context memory (the recurrent state) the RUNTIME zone takes before the
     // compute buffer. Counted twice on a re-publish while it is live, like the term above: conservative.
     ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_state_term_bytes(ctx->device);
+    ring_kv_zone.pending_terms.state_term_bytes = ring_kv_zone.runtime_pending_bytes - ring_kv_zone.pending_terms.sum();
     // The host-expert MoE scatter scratch (llama.cpp-cre6) is claimed after the ring as well; the part this context
     // does not hold yet is what is still to be placed.
     {
@@ -21699,6 +21850,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         const size_t moe_host_scatter_held = ctx->moe_host_scatter_scratch.capacity(ctx->device);
         ring_kv_zone.runtime_pending_bytes +=
             moe_host_scatter_planned > moe_host_scatter_held ? moe_host_scatter_planned - moe_host_scatter_held : 0;
+        ring_kv_zone.pending_terms.host_scatter_bytes =
+            ring_kv_zone.runtime_pending_bytes - ring_kv_zone.pending_terms.sum();
     }
     // The current plan's pools, still allocated, are already missing from the
     // RUNTIME zone's free space, so they are counted twice here: conservative,
@@ -21707,6 +21860,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         for (const auto & workspace : next_plan.moe_mmid_workspaces) {
             if (workspace.owner_device == ctx->device) {
                 ring_kv_zone.runtime_pending_bytes += workspace.device_pool_bytes;
+                ring_kv_zone.pending_terms.mmid_pools_bytes += workspace.device_pool_bytes;
             }
         }
     }
