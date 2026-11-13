@@ -5,8 +5,8 @@ A launch the profiler cannot see lands in "device idle" or in nothing, so the at
 only as complete as this list is short. The list shrinks to empty; it never grows without a reason beside the entry.
 
 To update (`python3 tests/test-sycl-window-path-submit-census-source.py --print` lists every key with its count and
-file:line, the ALLOW lines to paste, what the record rule matched per function, and what each SET_ASIDE_BY_RECEIVER
-row set aside):
+file:line, the ALLOW lines to paste, what the record rule matched per function, and, for the files on the path,
+what each SET_ASIDE_BY_RECEIVER row set aside and which rows do not match):
   a. You wrapped a site: its key's tree count dropped. Lower that ALLOW count, or delete the entry at 0.
   b. You added a launch on the path: wrap it. If it cannot be wrapped yet, add or raise its ALLOW entry with what it
      is and what a wrap task must do (the WRAP_ texts).
@@ -16,10 +16,12 @@ row set aside):
   d. A launch is profiled through its event (a record call is handed what the launch returned): read the function,
      confirm each record call receives that launch's event, and set the function's RECORDED_ON_THE_PATH row to the
      number of such launches. Nothing is excused without a row.
-  e. A SET_ASIDE_BY_RECEIVER row does not match (set_aside_problems names its calls by file:line, or the line the
-     tripwire refused it at): read the declaration of each receiver by hand. If it is a queue, delete the row: its
-     calls are launches. If it is no queue, set the row's count to the calls on that receiver in the function, with a
-     reason saying what the receiver is, where it is declared, and where any device work its call leads to is counted.
+  e. A SET_ASIDE_BY_RECEIVER row does not match, or you want to add one (set_aside_problems names a row's calls by
+     file:line, or why it was refused). Adding or raising a row is the reviewed act: read the declaration of each
+     receiver by hand. If it is a queue, delete the row: its calls are launches. If it is no queue, set the row's
+     count to the calls on that receiver in its one function, with a reason saying what the receiver is, where it is
+     declared, and where any device work its call leads to is counted. The pin proves only that the set of set-aside
+     receiver expressions and their counts did not change, never that a receiver is no queue.
 
 Two kinds of launch are censused, and kept apart in the output and in the allowlist keys:
 - submit: a `->submit(` or `.submit(` call. A submit whose command group is only a `host_task` counts too: it occupies
@@ -30,13 +32,16 @@ Two kinds of launch are censused, and kept apart in the output and in the allowl
   the submit is the launch: not counted. Inside a submit set aside (a host pool's job), it counts like any other.
 Every call of either kind counts unless a reviewed row sets it aside. No type is read anywhere: a row of
 SET_ASIDE_BY_RECEIVER, keyed `kind:file:function:receiver`, names the receiver expression exactly as written at the
-call, prefix included and whitespace removed (`pool`, `engine->queue`, `cgh`, `foo.stream()`), and sets aside the
-calls of that kind on that expression in that function only when there are exactly as many as the row's count. A
-call on `c->q` is not one on `q`. Adding a row is the reviewed act: the reviewer reads the receiver's declaration by
-hand, and the row's reason says what it is and where it is declared. The pin proves only that the set of set-aside
-expressions and their counts did not change; that a receiver is no queue is the reviewer's claim. queue_tripwire is a
-lexical tripwire on top, not a resolver: it refuses a row whose last name the function plainly binds next to the
-token `queue` (`sycl::queue & ready`, `for (sycl::queue * ready : qs)`), and proves nothing when it stays quiet.
+call, prefix included and whitespace removed, and sets aside the calls of that kind on that expression in that function
+only when there are exactly as many as the row's count, all in one definition of it (a row naming an overload pair, or
+one name in two namespaces, is refused). A receiver a row can name is a plain chain of names joined by `.`, `->` or `::`
+(`pool`, `engine->queue`, `this->pool_`, `ns::g_pool`); a call, an index, a cast, a template argument, a parenthesised
+or dereferenced operand, a `*` or `&` before it and a line continuation make it nameless, so its call counts. A call on
+`c->q` is not one on `q`. Adding a row is the reviewed act: the reviewer reads the receiver's declaration by hand, and
+the row's reason says what it is and where it is declared. The pin proves only that the set of set-aside expressions and
+their counts did not change; that a receiver is no queue is the reviewer's claim. queue_tripwire is a lexical tripwire
+on top, not a resolver: it refuses a row whose last name the function plainly binds next to the token `queue`
+(`sycl::queue & ready`, `for (sycl::queue * ready : qs)`), and proves nothing when it stays quiet.
 
 A launch is profiled, and not a site, in two cases:
 - Wrapped: any '(' still open at it, at any nesting depth and any distance, is the argument list of a wrapper call.
@@ -712,9 +717,10 @@ RECORDED_ON_THE_PATH = {
 }
 
 # "kind:file:function:receiver" -> (count, reason): the calls set aside by their receiver. receiver is the receiver
-# expression exactly as written at the call, prefix included and whitespace removed (`engine->queue`, `pool`, `cgh`).
-# A call is set aside only when its exact key has a row and the function holds exactly count calls of that kind on
-# that expression; every other call counts, and no type is read anywhere. Adding a row is the reviewed act: read the
+# expression exactly as written at the call, a plain chain of names (Code.receiver), prefix included and whitespace
+# removed (`engine->queue`, `pool`, `cgh`). A call is set aside only when its exact key has a row and the one
+# definition of the function holds exactly count calls of that kind on that expression; every other call counts,
+# and no type is read anywhere. Adding a row is the reviewed act: read the
 # receiver's declaration by hand, and its call, first. If the receiver is a queue, there is no row to add. The pin
 # proves only that the set of set-aside expressions and their counts did not change; the reason is the reviewer's
 # claim, so it says what the receiver is and where it is declared. queue_tripwire refuses a row whose name the
@@ -1193,55 +1199,38 @@ class Code:
         return False
 
     def receiver(self, pos: int) -> str | None:
-        """The receiver expression of the member call at pos (the '.' or '->'), as written with its whitespace
-        removed: `q`, `engine->queue`, `foo.stream()`, `g_pools[device]`, `(*q)`; None when no name or bracketed
-        group precedes it (a cast's `>`), so no row can name it."""
+        """The receiver expression of the member call at pos (the '.' or '->') when it is a plain chain of names
+        joined by `.`, `->` or `::` (`q`, `engine->queue`, `this->pool_`, `ns::g_pool`), written with its whitespace
+        removed; else None, which no row names, so the call counts. A call, an index, a cast, a template argument,
+        a parenthesised or dereferenced operand (`foo.stream()`, `g_pools[d]`, `static_cast<T &>(g)`, `(*q)`), a
+        `*` or `&` right before the chain, and a backslash line continuation all give None."""
         code = self.code
         lo = max(0, pos - NAME_WINDOW)
         i = pos
         operand = True
         while True:
-            while i > lo and code[i - 1].isspace():
+            while i > lo and code[i - 1] in " \t\n":
                 i -= 1
             if i <= lo:
-                break
-            c = code[i - 1]
-            if not operand:
-                if code[i - 2:i] in ("->", "::"):
-                    i -= 2
-                elif c == ".":
-                    i -= 1
-                else:
-                    break
-                operand = True
-            elif c == ")":
-                open_ = self.paren_open.get(i - 1)
-                if open_ is None or open_ < lo:
-                    return None
-                i = open_
-                j = i
-                while j > lo and code[j - 1].isspace():
-                    j -= 1
-                # a call or an index has its callee before it; a parenthesized operand, `(*q)`, ends the expression
-                if not (j > lo and (code[j - 1].isalnum() or code[j - 1] in "_)]")):
-                    break
-            elif c == "]":
-                depth = 0
-                while i > lo:
-                    i -= 1
-                    depth += {"]": 1, "[": -1}.get(code[i], 0)
-                    if depth == 0:
-                        break
-                if depth:
-                    return None
-            elif c.isalnum() or c == "_":
+                return None
+            if operand:
                 m = re.search(r"\w+$", code[lo:i])
+                if m is None:
+                    return None
                 i = lo + m.start()
                 operand = False
+            elif code[i - 2:i] in ("->", "::") and code[i - 3:i] != ":::":
+                i -= 2
+                operand = True
+            elif code[i - 1] == ".":
+                i -= 1
+                operand = True
             else:
-                return None
+                break
+        if code[i - 1] in "\\*&":
+            return None
         text = re.sub(r"\s+", "", code[i:pos])
-        return text or None
+        return None if text[:1].isdigit() else text
 
     def enclosing(self, braces: list[int]) -> str:
         """The innermost named function around a submit, `Class::` added for a member defined in its class, and
@@ -1366,7 +1355,7 @@ def census(texts: dict[str, str], wrappers: set[str] | None = None, skipped: lis
            rule_matches: dict[str, list[int]] | None = None,
            set_aside_table: dict[str, tuple[int, str]] | None = None,
            receiver_matches: dict[str, list[str]] | None = None,
-           tripped: dict[str, list[str]] | None = None) -> dict[str, list[tuple[int, str, str]]]:
+           tripped: dict[str, str] | None = None) -> dict[str, list[tuple[int, str, str]]]:
     """The raw sites of each named text, as (line, function, kind) triples. A site is wrapped when any '(' still open
     at it, however far back and however deeply nested, is the argument list of a wrapper call. A launch the record
     rule matches (Code.recorded) is excused only when its "file:function" is a row of table (RECORDED_ON_THE_PATH by
@@ -1417,14 +1406,28 @@ def census(texts: dict[str, str], wrappers: set[str] | None = None, skipped: lis
                 if receiver is not None and key in set_aside_table:
                     calls.setdefault(key, []).append((pos, braces, receiver))
             for key, held in calls.items():
+                lines = [f"{name}:{code.line(pos)}" for pos, _, _ in held]
                 if receiver_matches is not None:
-                    receiver_matches.setdefault(key, []).extend(f"{name}:{code.line(pos)}" for pos, _, _ in held)
-                if set_aside_table[key][0] != len(held):
+                    receiver_matches.setdefault(key, []).extend(lines)
+                # one row covers one definition: overloads, or functions of one name in two namespaces, share a key
+                definitions = {code.function_brace(braces) for _, braces, _ in held}
+                refusal = None
+                if len(definitions) > 1:
+                    refusal = (f"the row names {len(definitions)} definitions of {code.enclosing(held[0][1])}, with "
+                               f"calls at {', '.join(lines)}; a row covers one definition, so these calls count "
+                               "(To update, e)")
+                elif set_aside_table[key][0] != len(held):
                     continue
-                refused = queue_tripwire(code, held[0][1], held[0][2])
-                if refused:
+                else:
+                    receiver = held[0][2]
+                    bound = queue_tripwire(code, held[0][1], receiver)
+                    if bound:
+                        refusal = (f"{', '.join(f'{name}:{line}' for line in bound)} binds {last_name(receiver)} next "
+                                   "to `queue`; read its declaration, and if the receiver is a queue, delete the row "
+                                   "(To update, e)")
+                if refusal is not None:
                     if tripped is not None:
-                        tripped.setdefault(key, []).extend(f"{name}:{line}" for line in refused)
+                        tripped[key] = refusal
                     continue
                 set_aside.update(pos for pos, _, _ in held)
         for pos, kind, method, parens, braces in launches:
@@ -1445,22 +1448,26 @@ def census(texts: dict[str, str], wrappers: set[str] | None = None, skipped: lis
 QUEUE_TOKEN = re.compile(r"\bqueue(?:_ptr)?\b")
 
 
+def last_name(receiver: str) -> str:
+    """The last name of a receiver chain: `queue` for `engine->queue`, `g_pool` for `ns::g_pool`."""
+    return re.findall(r"\w+", receiver)[-1]
+
+
 def queue_tripwire(code: Code, braces: list[int], receiver: str) -> list[int]:
-    """The lines on which the function around a set-aside call plainly binds the receiver's last name next to the
-    token `queue`, in one statement (text between `;`, `{` and `}`): `queue & NAME`, `queue * NAME`, `queue NAME`,
-    `: NAME` after `queue` (a range-for), or `[NAME` / `NAME =` with `queue` in the statement. A tripwire, not a
-    resolver: it reads no type and follows no alias, and a row it does not refuse is still only as good as the
-    reviewer who read the receiver's declaration. It looks from the function's parameter list to its end."""
-    last = re.sub(r"(?:\([^()]*\)|\[[^\[\]]*\])+$", "", receiver)
-    names = re.findall(r"\w+", last)
-    if not names:
-        return []
-    ident = re.escape(names[-1])
+    """The lines on which the one function around a row's calls plainly binds the receiver's last name next to the
+    token `queue`, in one statement (text between `;`, `{` and `}`). A tripwire, not a resolver: it reads no type and
+    follows no alias, so a row it does not refuse is still only as good as the reviewer who read the receiver's
+    declaration. It looks from the function's parameter list to its end."""
+    ident = re.escape(last_name(receiver))
     binds = [
+        # a reference or a pointer: `sycl::queue & ready`, `sycl::queue * ready` (a range-for's variable too)
         re.compile(r"\bqueue(?:_ptr)?\b\s*(?:<[^;{}]*?>)?\s*(?:const\s*)?[&*]+\s*(?:const\s+)?" + ident + r"\b"),
+        # a value: `sycl::queue ready{dev}`, `dpct::queue_ptr ready`
         re.compile(r"\bqueue(?:_ptr)?\s+(?:const\s+)?" + ident + r"\b"),
-        re.compile(r"\bqueue(?:_ptr)?\b[^;{}]*?(?<!:):(?!:)\s*" + ident + r"\b"),
-        re.compile(r"\[\s*&?\s*" + ident + r"\b|\b" + ident + r"\s*=(?!=)"),
+        # an assignment or an initialization from an expression naming a queue: `auto & ready = ctx->queue()`
+        re.compile(r"\b" + ident + r"\s*=(?!=)"),
+        # a structured binding or a capture: `auto [ready, n] = ...queue...`, `[ready = ctx.queue]`
+        re.compile(r"\[\s*&?\s*" + ident + r"\b"),
     ]
     fb = code.function_brace(braces)
     lo = code.params[fb][0] if fb in code.params else fb
@@ -1485,7 +1492,9 @@ def inside_counted_submit(code: Code, parens: list[int], set_aside: set[int]) ->
     for p in reversed(parens):
         if code.callee(p) == "submit":
             dot = re.search(r"(?:->|\.)\s*submit\s*$", code.code[max(0, p - NAME_WINDOW):p])
-            return dot is None or max(0, p - NAME_WINDOW) + dot.start() not in set_aside
+            # a free `submit(` is no submit site and no command group: look further out
+            if dot is not None:
+                return max(0, p - NAME_WINDOW) + dot.start() not in set_aside
     return False
 
 
@@ -1548,19 +1557,17 @@ def record_table_problems(rule_matches: dict[str, list[int]], table: dict[str, i
 
 
 def set_aside_problems(receiver_matches: dict[str, list[str]], table: dict[str, tuple[int, str]],
-                       tripped: dict[str, list[str]] | None = None) -> list[str]:
-    """One line per SET_ASIDE_BY_RECEIVER row that does not set its calls aside: the tripwire refused it, its count
-    is not the number of calls on that receiver in the function, or no such call is left; each says what to do."""
+                       tripped: dict[str, str] | None = None) -> list[str]:
+    """One line per SET_ASIDE_BY_RECEIVER row that does not set its calls aside: it was refused (tripped holds why),
+    its count is not the number of calls on that receiver in the function, or no such call is left; each says what to
+    do."""
     tripped = tripped or {}
     problems = []
     for key in sorted(set(receiver_matches) | set(table)):
         calls = receiver_matches.get(key, [])
         row = table[key][0] if key in table else 0
-        receiver = key.rsplit(":", 1)[1] if key in table else key
         if key in tripped:
-            name = re.findall(r"\w+", re.sub(r"(?:\([^()]*\)|\[[^\[\]]*\])+$", "", receiver))[-1]
-            problems.append(f"{key}: refused: {', '.join(tripped[key])} binds {name} next to `queue`; read its "
-                            "declaration, and if the receiver is a queue, delete the row (To update, e)")
+            problems.append(f"{key}: refused: {tripped[key]}")
         elif calls and len(calls) != row:
             problems.append(f"{key}: {len(calls)} call(s) on this receiver in the function ({', '.join(calls)}), "
                             f"SET_ASIDE_BY_RECEIVER says {row}: read the declaration of each receiver; if it is a "
@@ -1573,9 +1580,9 @@ def set_aside_problems(receiver_matches: dict[str, list[str]], table: dict[str, 
 
 def receiver_sections(skipped: list[str], problems: list[str]) -> str:
     """The two receiver sections of `--print`: each call set aside by a row, and each row that does not match."""
-    out = ["# set aside by a SET_ASIDE_BY_RECEIVER row"]
+    out = ["# set aside by a SET_ASIDE_BY_RECEIVER row, in the files on the path"]
     out += sorted(entry for entry in skipped if "SET_ASIDE_BY_RECEIVER" in entry) or ["(none)"]
-    out.append("# SET_ASIDE_BY_RECEIVER rows that do not match the tree (excluded files included)")
+    out.append("# SET_ASIDE_BY_RECEIVER rows that do not match the files on the path (excluded files included)")
     out += problems or ["(none)"]
     return "\n".join(out)
 
@@ -1648,7 +1655,7 @@ def receiver_rule_files() -> list[str]:
 def tree_set_aside_problems(texts: dict[str, str]) -> list[str]:
     """set_aside_problems over FILES and the files excluded by a receiver row, whose rows live in the same table."""
     matches: dict[str, list[str]] = {}
-    tripped: dict[str, list[str]] = {}
+    tripped: dict[str, str] = {}
     census({name: texts[name] for name in FILES}, derive_wrappers(texts), receiver_matches=matches,
            tripped=tripped)
     for name in receiver_rule_files():
