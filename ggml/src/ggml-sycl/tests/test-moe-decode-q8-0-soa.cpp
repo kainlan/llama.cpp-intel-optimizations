@@ -12,12 +12,24 @@
 // tensor's experts on this card, all in one layout), and no such line for the tensor with another layout. A case also
 // fails on any [MOE-DECODE-REFUSAL] or [MOE-PROMPT-REFUSAL] line during its compute, and names it on its CASE line.
 //
-// The cases:
+// A pass must also say which dispatcher launched the SOA kernel. Two do: the batched MoE MMVQ dispatch and
+// ggml_sycl_mul_mat_id_vec_q. With GGML_SYCL_MMVQ_TRACE on (set below), the kernel's launcher logs one
+// "[MMVQ-TRACE] q8_0-soa-id site=<batched|vec_q>" line per launch. Each case counts the lines its compute logged for
+// the tensor, prints site= on its CASE line, and fails unless the site is the one the case names.
+//
+// The decode cases (one token) all reach the batched dispatch. ggml_sycl_mul_mat_id calls vec_q only from its MMVQ
+// layout probes, which run for a prompt alone.
 //   * decode-base: k 256, m 128, 8 experts, 4 used, one activation row per used expert (the down projection's form);
 //   * decode-tail-rows: k 384, m 94, 8 experts, 4 used, one activation row broadcast to every used expert. m is not a
 //     multiple of the rows one work-group computes (GGML_SYCL_MOE_MMV_Y, 4), so the last group has rows past the
 //     expert's end; k is 12 blocks, not a multiple of the 8 blocks one sub-group covers per pass;
 //   * decode-last-expert: k 256, m 128, 8 experts, 1 used, id 7, so an offset that is right only for expert 0 fails.
+// The prompt case reaches vec_q:
+//   * prompt-vec-q: k 256, m 128, 8 experts, 4 used, 4 tokens of 4 rows each. At default flags the batched oneDNN
+//     prompt executor claims a Q8_0 SOA prompt and the MMVQ probes are skipped, so this case turns that executor off
+//     (GGML_SYCL_MOE_PP_ONEDNN_F16=0). The knob is read once per process, so the case runs in a child process of
+//     this binary (`--prompt-vec-q`), which sets it before its backend starts. 4 tokens is under vec_q's prompt batch
+//     threshold for 8 experts at 4 used.
 //
 // The fixture models the default load only, GGML_SYCL_WEIGHTS_EVICTABLE on: with it off, libllama puts these experts
 // in the device buffer, which reorders the whole tensor and publishes no per-expert records, so the process exits 77
@@ -33,6 +45,9 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
@@ -52,7 +67,7 @@ namespace {
 
 constexpr int      k_experts    = 8;
 constexpr int      k_max_used   = 4;
-constexpr int      k_n_tokens   = 1;
+constexpr int      k_max_tokens = 4;
 constexpr uint32_t k_n_ubatch   = 512;
 constexpr uint32_t k_n_ctx      = 512;
 constexpr double   k_nmse_tol   = 5e-4;
@@ -64,19 +79,26 @@ constexpr const char * k_tensor_names[3] = { "blk.0.ffn_gate_exps.weight", "blk.
 
 struct decode_case {
     const char * name;
-    int          in;    // k: the expert weight's row length, the activation's width
-    int          out;   // m: output rows per expert
-    int          used;  // experts the token selects
-    int          ne11;  // activation rows per token: `used` (one per selected expert) or 1 (broadcast to each)
-    int32_t      ids[k_max_used];
+    int          in;      // k: the expert weight's row length, the activation's width
+    int          out;     // m: output rows per expert
+    int          used;    // experts each token selects
+    int          ne11;    // activation rows per token: `used` (one per selected expert) or 1 (broadcast to each)
+    int          tokens;  // 1 is decode; more is a prompt
+    const char * site;    // the dispatcher that must launch the SOA kernel: "batched" or "vec_q"
+    int32_t      ids[k_max_used * k_max_tokens];  // `used` ids per token, token after token
 };
 
 constexpr decode_case k_cases[] = {
-    { "decode-base",        256, 128, 4, 4, { 5, 0, 3, 6 } },
-    { "decode-tail-rows",   384, 94,  4, 1, { 7, 2, 4, 1 } },
-    { "decode-last-expert", 256, 128, 1, 1, { 7 }          },
+    { "decode-base",        256, 128, 4, 4, 1, "batched", { 5, 0, 3, 6 } },
+    { "decode-tail-rows",   384, 94,  4, 1, 1, "batched", { 7, 2, 4, 1 } },
+    { "decode-last-expert", 256, 128, 1, 1, 1, "batched", { 7 }          },
 };
-constexpr int k_n_cases = int(sizeof(k_cases) / sizeof(k_cases[0]));
+
+// Runs in a child process (run_prompt_child). Every expert is used by some token, expert 7 by two.
+constexpr decode_case k_prompt_case = {
+    "prompt-vec-q", 256, 128, 4, 4, 4, "vec_q", { 5, 0, 3, 6, 7, 2, 4, 1, 1, 6, 0, 7, 3, 5, 2, 4 }
+};
+constexpr int k_n_cases = int(sizeof(k_cases) / sizeof(k_cases[0])) + 1;
 
 void require(bool condition, const std::string & message) {
     if (!condition) {
@@ -345,8 +367,8 @@ ggml_status run_backend(ggml_backend_t               backend,
         weights = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_Q8_0, c.in, c.out, k_experts);
         ggml_set_name(weights, k_tensor_names[k_down_index]);
     }
-    ggml_tensor * input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, c.in, c.ne11, k_n_tokens);
-    ggml_tensor * ids   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, c.used, k_n_tokens);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, c.in, c.ne11, c.tokens);
+    ggml_tensor * ids   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, c.used, c.tokens);
     ggml_set_name(input, "moe_input");
     ggml_set_name(ids, "moe_ids");
     ggml_tensor * dst = ggml_mul_mat_id(ctx.get(), weights, input, ids);
@@ -381,14 +403,14 @@ ggml_status run_backend(ggml_backend_t               backend,
         ggml_backend_tensor_set(weights, weight_bytes.data(), 0, weight_bytes.size());
     }
     ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
-    ggml_backend_tensor_set(ids, c.ids, 0, size_t(c.used) * sizeof(int32_t));
+    ggml_backend_tensor_set(ids, c.ids, 0, size_t(c.used) * c.tokens * sizeof(int32_t));
 
     ggml_cgraph * graph = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(graph, dst);
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
     ggml_backend_synchronize(backend);
     if (status == GGML_STATUS_SUCCESS) {
-        out.resize(size_t(c.out) * c.used * k_n_tokens);
+        out.resize(size_t(c.out) * c.used * c.tokens);
         ggml_backend_tensor_get(dst, out.data(), 0, out.size() * sizeof(float));
     }
     return status;
@@ -412,8 +434,20 @@ double max_abs_diff(const std::vector<float> & ref, const std::vector<float> & g
     return largest;
 }
 
+// The dispatcher the SYCL compute launched the SOA kernel from, by the launcher's trace lines for the tensor that
+// compute logged: one site, "both", or "none".
+const char * launch_site(size_t batched, size_t vec_q) {
+    if (batched != 0 && vec_q != 0) {
+        return "both";
+    }
+    if (batched != 0) {
+        return "batched";
+    }
+    return vec_q != 0 ? "vec_q" : "none";
+}
+
 // Runs one case on its own freshly loaded model and prints its CASE line. Returns true when it passed. The layout
-// counts are of the lines its load logged; the refusal counts are of the lines its SYCL compute logged.
+// counts are of the lines its load logged; the refusal and site counts are of the lines its SYCL compute logged.
 bool run_case(ggml_backend_t cpu, const decode_case & c, std::mt19937 & rng) {
     const std::string tensor_field = std::string("[MOE-LAYOUT] tensor=") + k_tensor_names[k_down_index] + " ";
     const std::string shape_field =
@@ -428,7 +462,7 @@ bool run_case(ggml_backend_t cpu, const decode_case & c, std::mt19937 & rng) {
                                                              " layout=soa reason=planner-entry-layout " });
 
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    std::vector<float>                    input(size_t(c.in) * c.ne11 * k_n_tokens);
+    std::vector<float>                    input(size_t(c.in) * c.ne11 * c.tokens);
     for (float & v : input) {
         v = dist(rng);
     }
@@ -446,6 +480,13 @@ bool run_case(ggml_backend_t cpu, const decode_case & c, std::mt19937 & rng) {
     const size_t       decode_rf = g_log.count_since(run_from, { "[MOE-DECODE-REFUSAL]" });
     const size_t       prompt_rf = g_log.count_since(run_from, { "[MOE-PROMPT-REFUSAL]" });
     const size_t       fallback  = g_log.count_since(run_from, { "recoverable runtime fallback failed" });
+
+    const std::string tensor_needle = std::string(" tensor=") + k_tensor_names[k_down_index] + " ";
+    const size_t      site_batched =
+        g_log.count_since(run_from, { "[MMVQ-TRACE] q8_0-soa-id site=batched ", tensor_needle.c_str() });
+    const size_t site_vec_q =
+        g_log.count_since(run_from, { "[MMVQ-TRACE] q8_0-soa-id site=vec_q ", tensor_needle.c_str() });
+    const char * site = launch_site(site_batched, site_vec_q);
 
     std::string why;
     if (!computed) {
@@ -467,18 +508,65 @@ bool run_case(ggml_backend_t cpu, const decode_case & c, std::mt19937 & rng) {
     if (prompt_rf != 0) {
         why += " prompt-refusal";
     }
+    if (std::strcmp(site, c.site) != 0) {
+        why += " site";
+    }
     std::fprintf(stderr,
-                 "CASE name=%s in=%d out=%d experts=%d used=%d ne11=%d status=%d nmse=%.3e max_diff=%.4f "
+                 "CASE name=%s in=%d out=%d experts=%d used=%d ne11=%d tokens=%d status=%d nmse=%.3e max_diff=%.4f "
                  "soa_layout_lines=%zu layout_lines=%zu decode_refusal=%zu prompt_refusal=%zu fallback_failed=%zu "
-                 "-> %s%s\n",
-                 c.name, c.in, c.out, k_experts, c.used, c.ne11, static_cast<int>(status), err, diff, layout_soa,
-                 layout_all, decode_rf, prompt_rf, fallback, why.empty() ? "PASS" : "FAIL:", why.c_str());
+                 "site=%s want_site=%s site_batched=%zu site_vec_q=%zu -> %s%s\n",
+                 c.name, c.in, c.out, k_experts, c.used, c.ne11, c.tokens, static_cast<int>(status), err, diff,
+                 layout_soa, layout_all, decode_rf, prompt_rf, fallback, site, c.site, site_batched, site_vec_q,
+                 why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
+}
+
+// Runs the prompt case in a child process: this binary again, as `--prompt-vec-q`, so the child turns the batched
+// oneDNN prompt executor off before its backend reads the knob. The child's CASE line shares this process's stderr;
+// its exit status is the verdict.
+bool run_prompt_child() {
+    std::fflush(stdout);
+    std::fflush(stderr);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        execl("/proc/self/exe", "test-moe-decode-q8-0-soa", "--prompt-vec-q", static_cast<char *>(nullptr));
+        _exit(127);
+    }
+    if (pid < 0) {
+        std::fprintf(stderr, "CASE name=%s -> FAIL: fork failed\n", k_prompt_case.name);
+        return false;
+    }
+    int        status = 0;
+    const bool waited = waitpid(pid, &status, 0) == pid;
+    if (waited && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return true;
+    }
+    if (!waited) {
+        std::fprintf(stderr, "FAIL: waitpid for the %s case failed\n", k_prompt_case.name);
+    } else if (WIFEXITED(status)) {
+        // 77 is a skip, which this process ruled out before it started the child; 127 is a failed exec.
+        std::fprintf(stderr, "FAIL: the %s case exited %d\n", k_prompt_case.name, WEXITSTATUS(status));
+    } else {
+        std::fprintf(stderr, "FAIL: the %s case died on signal %d\n", k_prompt_case.name,
+                     WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    }
+    return false;
 }
 
 }  // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    // The prompt case's child process (run_prompt_child) runs that case alone.
+    const bool prompt_child = argc == 2 && std::strcmp(argv[1], "--prompt-vec-q") == 0;
+    if (argc != 1 && !prompt_child) {
+        std::fprintf(stderr, "usage: %s [--prompt-vec-q]\n", argv[0]);
+        return 1;
+    }
+    // Read once by the backend, so they are set before anything touches it.
+    setenv("GGML_SYCL_MMVQ_TRACE", "1", 1);
+    if (prompt_child) {
+        setenv("GGML_SYCL_MOE_PP_ONEDNN_F16", "0", 1);
+    }
     ggml_log_set(log_callback, nullptr);
     try {
         bool have_gpu = false;
@@ -500,7 +588,16 @@ int main() {
         require(cpu != nullptr, "CPU backend init failed");
 
         std::mt19937 rng(808);
-        int          failed = 0;
+        if (prompt_child) {
+            try {
+                return run_case(cpu.get(), k_prompt_case, rng) ? 0 : 1;
+            } catch (const std::exception & e) {
+                std::fprintf(stderr, "CASE name=%s -> FAIL: %s\n", k_prompt_case.name, e.what());
+                return 1;
+            }
+        }
+        // The prompt case first, in its own process, so this one holds no model while the child runs.
+        int failed = run_prompt_child() ? 0 : 1;
         for (const decode_case & c : k_cases) {
             // A case whose load or reference fails is a failed case, past the device check above, and the cases
             // after it still run.
