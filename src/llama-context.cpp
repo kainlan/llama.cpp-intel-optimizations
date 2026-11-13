@@ -3285,11 +3285,11 @@ void llama_context::sycl_select_auto_ubatch() {
 
     LLAMA_LOG_WARN("[SYCL-PLAN] auto n_ubatch=%u for n_ctx=%u n_batch=%u (tried %s; %s); pass -ub N to override\n",
                    cparams.n_ubatch, cparams.n_ctx, cparams.n_batch, tried.c_str(), stop);
-    // llama.cpp-xojq (quality round 1 Q6): names the pre-trial value this
-    // line supersedes (the constructor's own "n_ubatch = ..." INFO line
-    // above, before this function's one call site), rather than leaving the
-    // reader to infer it.
-    LLAMA_LOG_INFO("%s: n_ubatch = %u (auto, was %u)\n", __func__, cparams.n_ubatch, fallback_ubatch);
+    // Names the value this line supersedes, rather than leaving the reader to infer it: the constructor's own
+    // "n_ubatch = ..." INFO line, which prints the -ub as asked, before the constructor's publish can lower it. For a
+    // lowered context that is the origin, not fallback_ubatch.
+    LLAMA_LOG_INFO("%s: n_ubatch = %u (auto, was %u)\n", __func__, cparams.n_ubatch,
+                   sycl_ctor_lowered_from != 0 ? sycl_ctor_lowered_from : fallback_ubatch);
 #else
     sched_reserve();
 #endif

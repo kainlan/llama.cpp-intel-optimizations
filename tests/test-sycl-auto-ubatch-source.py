@@ -3487,6 +3487,10 @@ _LOWERED_NOTE_FN = (
 _LOWERED_NOTE_ARG = "llama_context_sycl_ctor_lowered_note(sycl_ctor_lowered_from, sycl_ctor_lowered_cause).c_str()));"
 _SETTLE_FMT = '"auto n_ubatch: %s (tried %s; last stop: %s), and the settle at %u was refused (%s); %s%s",'
 _HOLD_SPILL_FMT = '"the VRAM arena and left a card under the driver headroom the arena expects (n_ubatch=%u); %s%s",'
+_WAS_INFO = (
+    'LLAMA_LOG_INFO("%s: n_ubatch = %u (auto, was %u)\\n", __func__, cparams.n_ubatch, '
+    "sycl_ctor_lowered_from != 0 ? sycl_ctor_lowered_from : fallback_ubatch);"
+)
 _SKIPS_TRIAL = (
     "if (llama_auto_ubatch_ctor_lowered_skips_trial(ctor_lowered, ladder, llama_auto_ubatch_ladder_size, "
     "fallback_ubatch, cap)) { return; }"
@@ -3507,6 +3511,7 @@ _V_AT_MOST_ONE = "a context can print the lowered announcement from both sources
 _V_WORDING = "the two lowered announcements do not share the trial's wording"
 _V_NOTE = "a named refusal of a context the constructor lowered does not say so"
 _V_NO_RUNG = "a lowered context the trial has no rung for gets a prep, so its lowering goes unannounced"
+_V_WAS = "the trial's INFO line gives a lowered rung as the -ub the constructor printed"
 
 
 def _call_closes_throw(code: str, fmt: str) -> bool:
@@ -3590,6 +3595,9 @@ def _ctor_walk_violations(raw_cpp: str) -> list:
             sel.count(_LOWERED_LITERAL) != 1 or announce.count(_LOWERED_LITERAL) != 1 or \
             not 0 <= empty_exit < sel.find(_LOWERED_LITERAL):
         found.append(_V_AT_MOST_ONE)
+    # The constructor's own n_ubatch INFO line prints the -ub as asked, before its publish can lower it.
+    if sel.count(_WAS_INFO) != 1:
+        found.append(_V_WAS)
     if "LLAMA_LOG_WARN( " + _LOWERED_FMT + ", lowered_from, last_good, lowered_cause.c_str());" not in sel or \
             "LLAMA_LOG_WARN( " + _LOWERED_FMT + ", sycl_ctor_lowered_from, cparams.n_ubatch, " \
             "sycl_ctor_lowered_cause.c_str());" not in announce:
@@ -3678,6 +3686,8 @@ _CTOR_WALK_MUTANTS = {
         '"no -ub is known to fit: free VRAM on the card", ""));\n            }\n        }\n#endif', _V_NOTE),
     "a context the constructor did not lower gets the note": (
         "if (ctor_lowered_from == 0) {", "if (false) {", _V_NOTE),
+    "the INFO line gives the lowered rung as the -ub it superseded": (
+        "sycl_ctor_lowered_from != 0 ? sycl_ctor_lowered_from : fallback_ubatch);", "fallback_ubatch);", _V_WAS),
 }
 
 
