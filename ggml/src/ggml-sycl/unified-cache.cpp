@@ -2863,14 +2863,14 @@ void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_u
         return;
     }
     // A compare-exchange, so the one transition to disagreement is seen by exactly one store, whatever lock its
-    // caller holds.
-    std::atomic<uint32_t> & slot   = g_planned_compute_term_n_ubatch[device_id];
-    uint32_t                stored = slot.load(std::memory_order_acquire);
-    uint32_t                next   = zone_compute_term_n_ubatch_store(stored, n_ubatch);
-    while (next != stored && !slot.compare_exchange_weak(stored, next, std::memory_order_acq_rel)) {
+    // caller holds. On exit `stored` is the value this store replaced (or `next` when it changed nothing).
+    uint32_t stored = g_planned_compute_term_n_ubatch[device_id].load(std::memory_order_acquire);
+    uint32_t next   = zone_compute_term_n_ubatch_store(stored, n_ubatch);
+    while (next != stored &&
+           !g_planned_compute_term_n_ubatch[device_id].compare_exchange_weak(stored, next, std::memory_order_acq_rel)) {
         next = zone_compute_term_n_ubatch_store(stored, n_ubatch);
     }
-    if (next != stored && next == k_zone_compute_term_n_ubatch_disagreed) {
+    if (zone_compute_term_n_ubatch_turns_off(stored, next)) {
         GGML_LOG_WARN(
             "[LOAD-PLAN] device %d: this load plans its compute term at n_ubatch=%u where an earlier load planned it "
             "at n_ubatch=%u; the hold-spill fit credits the planned compute room at no rung for the rest of the "

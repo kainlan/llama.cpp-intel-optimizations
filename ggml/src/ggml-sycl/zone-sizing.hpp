@@ -693,6 +693,12 @@ inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_uba
     return stored == 0 || stored == n_ubatch ? n_ubatch : k_zone_compute_term_n_ubatch_disagreed;
 }
 
+// Whether a store moved the record from `before` to `after` by turning it off: the one store the setter WARNs on. A
+// record already off stays off without turning off again, so a later disagreeing load does not repeat the WARN.
+inline bool zone_compute_term_n_ubatch_turns_off(uint32_t before, uint32_t after) {
+    return before != k_zone_compute_term_n_ubatch_disagreed && after == k_zone_compute_term_n_ubatch_disagreed;
+}
+
 // The micro-batch a record names: 0 for none, and for one that disagreement turned off.
 inline uint32_t zone_compute_term_n_ubatch_read(uint32_t stored) {
     return stored == k_zone_compute_term_n_ubatch_disagreed ? 0 : stored;
