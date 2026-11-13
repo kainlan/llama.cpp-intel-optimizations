@@ -1580,6 +1580,11 @@ llama_context::llama_context(
                 if (!llama_auto_ubatch_ctor_walks_down(sycl_auto_ubatch_trial, first_refusal.fit_refusal)) {
                     throw std::runtime_error(first_refusal.reason);
                 }
+                // A default under twice the descent floor has no rung under it, so nothing is walked and its own
+                // refusal is the answer, as it is for a context that does not walk.
+                if (llama_auto_ubatch_next_lower(asked_ubatch) == 0) {
+                    throw std::runtime_error(first_refusal.reason);
+                }
                 // Each rung under the default, largest first (the default is the walk's cap: nothing above it is
                 // asked), until one stands or a refusal is no fit verdict.
                 bool           walk_aborted = false;
@@ -1591,10 +1596,14 @@ llama_context::llama_context(
                     return walk_aborted;
                 });
                 if (stood == 0 || walk_aborted) {
+                    // The last refusal is named only when it says something the first does not.
+                    const std::string last_note = last_refusal.reason == first_refusal.reason ?
+                                                      std::string() :
+                                                      format("; the last refusal: %s", last_refusal.reason.c_str());
                     throw std::runtime_error(
                         format("%s (auto n_ubatch: the constructor's publish walked -ub down through %s and none "
-                               "stood; the last refusal: %s)",
-                               first_refusal.reason.c_str(), walked.c_str(), last_refusal.reason.c_str()));
+                               "stood%s)",
+                               first_refusal.reason.c_str(), walked.c_str(), last_note.c_str()));
                 }
                 sycl_ctor_lowered_from  = asked_ubatch;
                 sycl_ctor_lowered_cause = format("the constructor's publish at %u was refused (%s)", asked_ubatch,

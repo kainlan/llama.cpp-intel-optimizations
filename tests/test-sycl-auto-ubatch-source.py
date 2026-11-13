@@ -3461,8 +3461,16 @@ _CTOR_WALK_GATE = (
 )
 _CTOR_WALK_DESCENT = (
     "llama_auto_ubatch_descend(asked_ubatch, asked_ubatch, [&](uint32_t c) { if (publish_at(c)) { return true; } "
-    "walk_aborted = !last_refusal.fit_refusal; return walk_aborted; }); if (stood == 0 || walk_aborted) { "
-    "throw std::runtime_error("
+    "walk_aborted = !last_refusal.fit_refusal; return walk_aborted; }); if (stood == 0 || walk_aborted) {"
+)
+_CTOR_NO_LOWER = (
+    "if (llama_auto_ubatch_next_lower(asked_ubatch) == 0) { throw std::runtime_error(first_refusal.reason); }"
+)
+_CTOR_LAST_NOTE = (
+    "const std::string last_note = last_refusal.reason == first_refusal.reason ? std::string() : "
+    'format("; the last refusal: %s", last_refusal.reason.c_str()); throw std::runtime_error( '
+    "format(\"%s (auto n_ubatch: the constructor's publish walked -ub down through %s and none \" \"stood%s)\", "
+    "first_refusal.reason.c_str(), walked.c_str(), last_note.c_str())); }"
 )
 _CTOR_WALK_RECORD = "sycl_ctor_lowered_from = asked_ubatch;"
 _CTOR_WALK_ANNOUNCE = (
@@ -3512,6 +3520,8 @@ _V_WORDING = "the two lowered announcements do not share the trial's wording"
 _V_NOTE = "a named refusal of a context the constructor lowered does not say so"
 _V_NO_RUNG = "a lowered context the trial has no rung for gets a prep, so its lowering goes unannounced"
 _V_WAS = "the trial's INFO line gives a lowered rung as the -ub the constructor printed"
+_V_NO_LOWER = "a default with no rung under it reports a walk that never ran"
+_V_LAST_TWICE = "the walk's error names its last refusal again when it is the first"
 
 
 def _call_closes_throw(code: str, fmt: str) -> bool:
@@ -3555,6 +3565,14 @@ def _ctor_walk_violations(raw_cpp: str) -> list:
         found.append(_V_WALK)
     if record == -1 or not 0 <= walk < record < memory:
         found.append(_V_RECORD)
+    # The descent asks nothing under a default below twice its floor, so that refusal is thrown as it came; a walk
+    # that ran names its last refusal only when it differs from the first.
+    no_lower = ctor.find(_CTOR_NO_LOWER)
+    if ctor.count(_CTOR_NO_LOWER) != 1 or min(gate, no_lower, walk) < 0 or not gate < no_lower < walk:
+        found.append(_V_NO_LOWER)
+    last_note = ctor.find(_CTOR_LAST_NOTE)
+    if ctor.count(_CTOR_LAST_NOTE) != 1 or min(walk, last_note, record) < 0 or not walk < last_note < record:
+        found.append(_V_LAST_TWICE)
 
     if "const bool ctor_lowered = sycl_ctor_lowered_from != 0;" not in prep or \
             "const bool cache_found = !ctor_lowered && cache_available && cache_lookup_fn(" not in prep or \
@@ -3638,6 +3656,11 @@ _CTOR_WALK_MUTANTS = {
     "the walk goes on past a lifecycle refusal": (
         "walk_aborted = !last_refusal.fit_refusal;", "walk_aborted = false;", _V_WALK),
     "an aborted walk keeps the rung it aborted at": ("if (stood == 0 || walk_aborted) {", "if (stood == 0) {", _V_WALK),
+    "a default with no rung under it reports a walk": (_CTOR_NO_LOWER, "", _V_NO_LOWER),
+    "the no-lower check never fires": (
+        "if (llama_auto_ubatch_next_lower(asked_ubatch) == 0) {", "if (false) {", _V_NO_LOWER),
+    "the last refusal is named when it is the first": (
+        "last_refusal.reason == first_refusal.reason ? std::string() :", "false ? std::string() :", _V_LAST_TWICE),
     "the origin is not recorded": ("sycl_ctor_lowered_from  = asked_ubatch;", "(void) asked_ubatch;", _V_RECORD),
     "the cache asks above a lowered rung": (
         "const bool cache_found           = !ctor_lowered && cache_available &&",
