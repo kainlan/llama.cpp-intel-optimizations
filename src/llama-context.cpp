@@ -2326,8 +2326,9 @@ void llama_context::resolve_fused_ops(sched_reserve_state &          state,
 // decision the planned ladder's rung set depends on (the SYCL backends and procs, the cap and its MoE ceiling, the
 // tuning-cache lookup and the rung set) once, and stores what sycl_select_auto_ubatch() needs afterwards in
 // `auto_ubatch_prep`; the ladder does not look any of it up again. A condition that makes the trial take its single
-// reserve (no SYCL backend, a DSO without the trial's entry points, a cap under the first rung, a model with no token)
-// leaves `auto_ubatch_prep` empty and does the lookup nowhere, as before. Nothing here prints: the
+// reserve (no SYCL backend, a DSO without the trial's entry points, a cap under the first rung, a model with no token,
+// a -ub the constructor lowered with no ladder rung between it and the cap) leaves `auto_ubatch_prep` empty and does
+// the lookup nowhere. Nothing here prints: the
 // `[SYCL-PLAN] tuning cache` WARN and the outcome WARN stay at their sites in sycl_select_auto_ubatch(), whose text
 // this move does not touch. `tenant_rung_set` is written here, so the host hold's set exists before the memory
 // module.
@@ -2490,6 +2491,14 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     // is asked again, by the cache or by the ladder.
     const bool ctor_lowered = sycl_ctor_lowered_from != 0;
 
+    // With no ladder rung in [fallback_ubatch, cap], the trial's no-candidate exit would take a lowered context and
+    // return before the trial's lowered WARN. Leaving the prep empty makes the trial reserve once, and the constructor
+    // then announces the lowering itself.
+    if (llama_auto_ubatch_ctor_lowered_skips_trial(ctor_lowered, ladder, llama_auto_ubatch_ladder_size, fallback_ubatch,
+                                                   cap)) {
+        return;
+    }
+
     const bool cache_available = have_cache_accessors && cache_enabled_fn();
 
     // The one tuning-cache lookup. A cached value below fallback_ubatch must
@@ -2515,7 +2524,8 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
         llama_auto_ubatch_rung_set(ladder, llama_auto_ubatch_ladder_size, fallback_ubatch, cap, cache_set_value,
                                    rung_set, llama_auto_ubatch_rung_set_capacity);
     // A context the constructor lowered climbs nothing: its set is the rung its publish stood at alone,
-    // fallback_ubatch, the smallest member of the full set.
+    // fallback_ubatch, which the guard above leaves at or under the cap, so it is in the full set and its smallest
+    // member.
     const size_t n_rung_set = ctor_lowered ? 1 : n_rung_set_full;
     const size_t n_rungs = llama_auto_ubatch_ladder_members(rung_set, n_rung_set, ladder, llama_auto_ubatch_ladder_size,
                                                             rungs, llama_auto_ubatch_rung_set_capacity);

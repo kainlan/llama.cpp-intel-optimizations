@@ -515,14 +515,14 @@ int main() {
         const skip_case cases[] = {
             // A MoE model with a 512 routing ceiling, refused at 1152: the walk is capped at what was asked, not at
             // the ceiling, so it stands at 576, and the trial's rung set holds no entry at all.
-            { "lowered above the MoE ceiling",            true,  576,  512,  true,  false },
+            { "lowered above the MoE ceiling",           true,  576,  512,  true,  false },
             // A raw-API -ub of 9984 with n_batch = n_ctx = 9984: the walk stands at 4992, under the cap, and no rung
             // lies between the two.
-            { "lowered under the cap, no rung up to it",  true,  4992, 9984, true,  true  },
-            { "lowered to a rung under the cap",          true,  1024, 4096, false, false },
-            { "lowered under the first rung",             true,  256,  4096, false, false },
-            { "lowered to the cap, which is a rung",      true,  512,  512,  false, false },
-            { "not lowered, the default above the cap",   false, 1024, 512,  false, false },
+            { "lowered under the cap, no rung up to it", true,  4992, 9984, true,  true  },
+            { "lowered to a rung under the cap",         true,  1024, 4096, false, false },
+            { "lowered under the first rung",            true,  256,  4096, false, false },
+            { "lowered to the cap, which is a rung",     true,  512,  512,  false, false },
+            { "not lowered, the default above the cap",  false, 1024, 512,  false, false },
         };
         for (const skip_case & c : cases) {
             const bool got =
