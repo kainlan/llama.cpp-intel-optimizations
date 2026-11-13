@@ -1799,6 +1799,29 @@ int main() {
         CHECK(t.demand == 0 && t.plan == 0 && t.request == 0, "an unknown n_ubatch names nothing");
     }
 
+    // The micro-batch the compute term was planned at, as each load records it: the first load's value stands while
+    // later loads agree; a load that disagrees turns the record off for good, so no rung is credited at a shape the
+    // term was not measured at.
+    {
+        using ggml_sycl::zone_compute_term_n_ubatch_read;
+        using ggml_sycl::zone_compute_term_n_ubatch_store;
+        uint32_t s = 0;
+        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "nothing recorded reads 0");
+        s = zone_compute_term_n_ubatch_store(s, 512);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 512, "0 then 512 records 512");
+        s = zone_compute_term_n_ubatch_store(s, 512);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 512, "512 then 512 keeps 512");
+        CHECK(zone_compute_term_n_ubatch_store(s, 0) == s, "a load naming no micro-batch changes nothing");
+        s = zone_compute_term_n_ubatch_store(s, 1024);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "512 then 1024 disagree: 0");
+        s = zone_compute_term_n_ubatch_store(s, 1024);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "and a later load cannot restore it");
+        s = zone_compute_term_n_ubatch_store(s, 512);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "not even with the first value");
+        CHECK(zone_compute_term_n_ubatch_read(zone_compute_term_n_ubatch_store(0, UINT32_MAX)) == 0,
+              "a micro-batch equal to the disagreement mark is never read as a shape");
+    }
+
     // ---- Case 24d (compute room, scoped): only the rung the plan placed sees the room. Over every record set the
     // cases above use, every rung from 32 to 8192 gets the demand the fit gave before the room existed (spill bound
     // over the plan and the rung's request, net of the KV room, plus the uncovered ring) when no rung is named, even
