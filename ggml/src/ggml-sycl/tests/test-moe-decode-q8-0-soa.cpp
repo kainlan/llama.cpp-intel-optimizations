@@ -107,7 +107,7 @@ constexpr decode_case k_cases[] = {
     // Its ids live in the SYCL host buffer type. Both decode routes that pass device ids (the direct route and the
     // event-chained hybrid route) require them resident on this card, so the op takes the retained route, whose batched
     // dispatch uploads one expert id per slot and hands the kernel the per-expert table with those ids. A decode with
-    // host experts reads the same form whenever the event-chained route declines it.
+    // host experts that reaches the retained route's batched dispatch reads the same form.
     { "decode-ids-table",   256, 128, 4, 4, 1, "batched", "ids",     "host",   { 6, 1, 7, 3 } },
 };
 

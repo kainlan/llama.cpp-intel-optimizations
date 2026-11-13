@@ -439,7 +439,7 @@ def test_mmvq_moe_id_kernels_have_named_profile_labels() -> None:
     assert before_mutant.rfind("#if defined(GGML_SYCL_PRIVATE_TESTING)") > before_mutant.rfind("#endif"), (
         "the mutant profile label must sit in the private build only"
     )
-    mxfp4_aos =slice_between(mmvq, "static void mul_mat_vec_mxfp4_q8_1_id_sycl", "template <bool VECTOR_QS_LOAD = false>")
+    mxfp4_aos = slice_between(mmvq, "static void mul_mat_vec_mxfp4_q8_1_id_sycl", "template <bool VECTOR_QS_LOAD = false>")
     assert "mulmat.mmvq.id_aos_mxfp4" in mxfp4_aos
     assert "ggml_sycl_profile_submit(*stream" in mxfp4_aos
     assert "mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches)" in mxfp4_aos

@@ -5930,10 +5930,11 @@ static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair_slm(const uint8_t * __
 // ids_nb1). The batched dispatch passes this form when it cannot compact the table: when the caller gave no device ids
 // or not every slot runs on this device, it uploads one id per slot (a host slot names a device expert, and the host's
 // row later overwrites that slot's output); when no compact list is available (graph recording without preallocated
-// storage), it keeps the caller's ids. In ggml_sycl_mul_mat_id the retained routes call it that way, and a decode
-// reaches them only when neither the direct route (every expert and the ids on this device) nor the event-chained
-// hybrid route takes it: both of those pass device ids with a full table, which the dispatch compacts. vec_q, whose
-// one caller passes its retained table, passes this form only when no compact list is available.
+// storage), it keeps the caller's ids. In ggml_sycl_mul_mat_id the retained decode route (the planner pointer-table
+// dispatch) calls it that way, and a decode reaches that route only when neither the direct route (every expert and
+// the ids on this device) nor the event-chained hybrid route takes it: both of those pass device ids with a full
+// table, which the dispatch compacts. vec_q, whose one caller passes its retained table, passes this form only when no
+// compact list is available.
 // WRONG_SCALE_BLOCK is a planted fault, instantiated only in the private test build: every block reads the next
 // block's scale (the expert's last block wraps to its first), so a test that cannot see a scale read from the wrong
 // block proves nothing about this kernel's scale offsets.
