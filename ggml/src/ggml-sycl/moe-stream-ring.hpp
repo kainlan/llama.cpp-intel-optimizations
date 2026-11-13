@@ -32,8 +32,11 @@
 
 #pragma once
 
+#include "zone-tag-census.hpp"
+
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace ggml_sycl {
 
@@ -71,6 +74,21 @@ struct moe_stream_ring_geometry {
 moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
                                               size_t   matrix_bytes_max,
                                               size_t   resident_expert_bytes);
+
+// The tags a short reserve's WEIGHT zone line names: the largest holders, enough to find what took the ring's room
+// without printing every cohort of the zone.
+static constexpr size_t MOE_STREAM_RING_WEIGHT_ZONE_TOP_TAGS = 12;
+
+// The WARN a short reserve prints once per context (moe_stream_phase::ring_ready), without its newline, every figure
+// in bytes: the WEIGHT zone's size, free bytes and largest free block, the bytes it holds (size - free), the live
+// registered allocations in it in total, the held bytes none of them accounts for (negative when their extents exceed
+// what the zone reports held), the slots the refused ring itself holds, and the `top` largest tags with their count
+// and bytes. The census is ranked on a copy; the totals count every tag, not only the `top` printed.
+std::string moe_stream_ring_weight_zone_line(int                     device,
+                                             const zone_tag_census & census,
+                                             uint32_t                slots_held,
+                                             size_t                  slot_bytes,
+                                             size_t                  top);
 
 }  // namespace ggml_sycl
 

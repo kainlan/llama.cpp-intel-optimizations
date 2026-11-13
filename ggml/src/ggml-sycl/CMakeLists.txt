@@ -7571,6 +7571,28 @@ set_tests_properties(sycl-moe-stream-ring-sizing PROPERTIES
     LABELS "sycl;moe;ring;hostonly"
     TIMEOUT 60
 )
+# Positive control for the short reserve's WEIGHT zone census: the same test with the tag ranking inverted, smallest
+# first. It passes only when the test prints the ranking case's FAIL line, which the unmutated ranking never prints.
+add_executable(test-moe-stream-ring-sizing-mutant-smallest-first
+    tests/test-moe-stream-ring-sizing.cpp
+    moe-stream-ring.cpp
+)
+target_include_directories(test-moe-stream-ring-sizing-mutant-smallest-first PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_compile_definitions(test-moe-stream-ring-sizing-mutant-smallest-first PRIVATE
+    GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY=1
+    GGML_SYCL_ZONE_TAG_CENSUS_MUTANT_SMALLEST_FIRST=1
+)
+set_target_properties(test-moe-stream-ring-sizing-mutant-smallest-first PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-stream-ring-sizing-mutant-smallest-first
+    COMMAND test-moe-stream-ring-sizing-mutant-smallest-first)
+set_tests_properties(sycl-moe-stream-ring-sizing-mutant-smallest-first PROPERTIES
+    LABELS "sycl;moe;ring;hostonly;mutant"
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "FAIL: census ranks largest bytes first, then more allocations, then the tag:"
+)
 
 add_executable(test-moe-mmid-workspace-plan
     tests/test-moe-mmid-workspace-plan.cpp

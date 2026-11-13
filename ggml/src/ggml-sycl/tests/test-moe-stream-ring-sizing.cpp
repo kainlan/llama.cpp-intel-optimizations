@@ -12,14 +12,22 @@
 // ring counted back, so the figure does not move with a loan; that half is
 // test-moe-stream-plan's (llama.cpp-7999). The model pins re-derive the plan's
 // base figures.
+//
+// It also checks the short reserve's WEIGHT zone line: the ranking of a zone's tags (zone_tag_census_rank) and the
+// line moe_stream_ring_weight_zone_line() builds from a census, both pure. The census itself reads the live registry
+// and is the lead's device run's to show.
 
 #include "moe-stream-ring.hpp"
 
 #include <cstdint>
 #include <cstdio>
+#include <string>
+#include <vector>
 
 using ggml_sycl::moe_stream_ring_geometry;
 using ggml_sycl::moe_stream_ring_size;
+using ggml_sycl::zone_tag_census;
+using ggml_sycl::zone_tag_total;
 
 static int g_failures = 0;
 
@@ -40,6 +48,81 @@ static void check_geometry(const char *                     label,
         "bytes=%zu region_slots=%u\n",
         label, got.slot_bytes, got.n_slots, got.bytes, got.region_slots, slot_bytes, n_slots, bytes, region_slots);
     ++g_failures;
+}
+
+static void check_text(const char * label, const std::string & got, const std::string & want) {
+    if (got == want) {
+        std::printf("PASS: %s\n", label);
+        return;
+    }
+    std::printf("FAIL: %s:\n  got  \"%s\"\n  want \"%s\"\n", label, got.c_str(), want.c_str());
+    ++g_failures;
+}
+
+static std::string tag_order(const std::vector<zone_tag_total> & tags) {
+    std::string out;
+    for (const zone_tag_total & t : tags) {
+        out += out.empty() ? "" : ",";
+        out += t.tag;
+    }
+    return out;
+}
+
+// Five tags with every tie the rank breaks: two of 300000 bytes (more allocations first) and two of 10 bytes with one
+// allocation each (tag order). They arrive in neither byte nor name order, as a hash map hands them over.
+static std::vector<zone_tag_total> census_tags() {
+    return {
+        { "b/other",                          1, 10     },
+        { "scratch_pool/compute",             1, 300000 },
+        { "exact_zone_allocate_owner/weight", 5, 400000 },
+        { "a/other",                          1, 10     },
+        { "kv_cache/kv",                      2, 300000 },
+    };
+}
+
+static void check_weight_zone_census() {
+    {
+        std::vector<zone_tag_total> tags = census_tags();
+        ggml_sycl::zone_tag_census_rank(tags, 12);
+        check_text("census ranks largest bytes first, then more allocations, then the tag", tag_order(tags),
+                   "exact_zone_allocate_owner/weight,kv_cache/kv,scratch_pool/compute,a/other,b/other");
+    }
+    {
+        std::vector<zone_tag_total> tags = census_tags();
+        ggml_sycl::zone_tag_census_rank(tags, 2);
+        check_text("census keeps only the top tags", tag_order(tags), "exact_zone_allocate_owner/weight,kv_cache/kv");
+    }
+    {
+        std::vector<zone_tag_total> tags;
+        ggml_sycl::zone_tag_census_rank(tags, 12);
+        check_text("census of no tags stays empty", tag_order(tags), "");
+    }
+
+    // 1000000 bytes, 250000 free: 750000 held. The registered allocations sum to 1000020 over 10 allocations in five
+    // tags, more than the zone reports held, so the unregistered figure goes negative instead of wrapping. Only the top
+    // four are printed; the totals still count the fifth.
+    zone_tag_census census;
+    census.capacity     = 1000000;
+    census.available    = 250000;
+    census.largest_free = 100000;
+    census.tags         = census_tags();
+    check_text("short reserve line names the zone's figures and its top tags",
+               ggml_sycl::moe_stream_ring_weight_zone_line(0, census, 3, 256, 4),
+               "[MOE-STREAM-RING] WEIGHT zone at the short reserve: device 0 size 1000000 free 250000 largest_free "
+               "100000 held 750000; registered 10 allocations 1000020 bytes in 5 tags, unregistered -250020 bytes; "
+               "the ring holds 3 slots x 256 bytes; top 4 tags by bytes: exact_zone_allocate_owner/weight count=5 "
+               "bytes=400000, kv_cache/kv count=2 bytes=300000, scratch_pool/compute count=1 bytes=300000, a/other "
+               "count=1 bytes=10");
+    check_text("the line ranks a copy: the census keeps its order", tag_order(census.tags),
+               "b/other,scratch_pool/compute,exact_zone_allocate_owner/weight,a/other,kv_cache/kv");
+
+    // A zone that reports more free than its size (no arena figures at all reads 0 and 0) holds 0, not a wrapped size.
+    zone_tag_census empty;
+    empty.available = 4096;
+    check_text("short reserve line with no tags", ggml_sycl::moe_stream_ring_weight_zone_line(1, empty, 0, 512, 12),
+               "[MOE-STREAM-RING] WEIGHT zone at the short reserve: device 1 size 0 free 4096 largest_free 0 held 0; "
+               "registered 0 allocations 0 bytes in 0 tags, unregistered 0 bytes; the ring holds 0 slots x 512 bytes; "
+               "top 0 tags by bytes: none");
 }
 
 int main() {
@@ -111,6 +194,8 @@ int main() {
         check_geometry("eleventh: inside a tenth, outside an eleventh", moe_stream_ring_size(4, slot, 22527), 0, 0, 0,
                        0);
     }
+
+    check_weight_zone_census();
 
     if (g_failures != 0) {
         std::printf("FAILED: %d case(s)\n", g_failures);

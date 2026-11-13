@@ -58,6 +58,19 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
     return geo;
 }
 
+std::string moe_stream_ring_weight_zone_line(int                     device,
+                                             const zone_tag_census & census,
+                                             uint32_t                slots_held,
+                                             size_t                  slot_bytes,
+                                             size_t                  top) {
+    (void) device;
+    (void) census;
+    (void) slots_held;
+    (void) slot_bytes;
+    (void) top;
+    return std::string();
+}
+
 #if !defined(GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY)
 
 bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short) {
