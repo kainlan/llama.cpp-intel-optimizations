@@ -1,4 +1,4 @@
-// A VRAM zone's live registered allocations summed by tag, and their ranking for a report.
+// A VRAM zone's live recorded allocations summed by tag, and their ranking for a report.
 //
 // Pure: no SYCL, no allocator, no lock, so the host-only ring sizing test compiles it alone. The unified cache fills a
 // zone_tag_census (unified_cache_zone_tag_census); a report ranks a copy of its tags here.
@@ -25,8 +25,8 @@ struct zone_tag_total {
     size_t      bytes = 0;
 };
 
-// A zone's free-space figures and every tag of the live registered allocations its address range holds, all read in
-// one call. `tags` is in no particular order and holds every tag, not a top-N.
+// A zone's free-space figures and every tag of the live recorded allocations its address range holds, all read in one
+// call. `tags` is in no particular order and holds every tag, not a top-N.
 struct zone_tag_census {
     size_t                      capacity     = 0;
     size_t                      available    = 0;
@@ -60,10 +60,13 @@ inline void zone_tag_census_rank(std::vector<zone_tag_total> & tags, size_t top)
 
 // `head`, then the census's figures in bytes: the zone's size, free bytes and largest free block; used (size - free,
 // the allocator's view); attributed, the bytes of every allocation the census counted; unattributed=, used minus
-// attributed, signed, so a census that missed a holder shows on the line instead of reading as complete (the
-// allocator's alignment and block headers make it a little positive on a complete one); the allocation and tag counts;
-// and the `top` largest tags with their count and bytes. The tags are ranked on a copy; the totals count every tag,
-// not only those printed.
+// attributed, signed; the allocation and tag counts; and the `top` largest tags with their count and bytes. The tags
+// are ranked on a copy; the totals count every tag, not only those printed.
+// An allocation's bytes are its requested extent, while the allocator's used figure counts the request rounded up to
+// its block grain (tlsf_allocator::block_grain, 256 bytes; the TLSF keeps no header in the zone). So a complete census
+// reads 0 <= unattributed < block_grain x allocations, and a value outside that range means the census missed a
+// holder. The one exception is a block carved at a region end off the grain, which absorbs that end's tail of less
+// than one grain more.
 inline std::string zone_tag_census_line(const char * head, const zone_tag_census & census, size_t top) {
     size_t allocations = 0;
     size_t attributed  = 0;

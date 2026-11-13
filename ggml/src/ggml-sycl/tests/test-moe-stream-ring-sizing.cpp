@@ -14,8 +14,8 @@
 // base figures.
 //
 // It also checks the short reserve's WEIGHT zone line: the ranking of a zone's tags (zone_tag_census_rank) and the
-// line moe_stream_ring_weight_zone_line() builds from a census, both pure. The census itself reads the live registry
-// and is the lead's device run's to show.
+// line moe_stream_ring_weight_zone_line() builds from a census, both pure. The census itself needs a cache with an
+// active arena, so no host case covers it.
 
 #include "moe-stream-ring.hpp"
 

@@ -7553,8 +7553,9 @@ set_tests_properties(sycl-moe-control-plan PROPERTIES
 
 # MoE prefill expert streaming ring sizing (llama.cpp-36j0): the ring's byte
 # budget and slot count. Host-only: moe-stream-ring.cpp is compiled with
-# GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY, which leaves only the pure function, so
-# this target takes no -fsycl and does not link ggml-sycl (the same TU is also
+# GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY, which leaves only the pure functions
+# (moe_stream_ring_size and moe_stream_ring_weight_zone_line), so this target
+# takes no -fsycl and does not link ggml-sycl (the same TU is also
 # globbed into libggml-sycl, where the ring class is compiled too).
 add_executable(test-moe-stream-ring-sizing
     tests/test-moe-stream-ring-sizing.cpp

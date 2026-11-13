@@ -110,9 +110,15 @@ def test_mutant_statement_after_the_try_fails():
 # ---- (b) the census cannot throw ---------------------------------------------------------------------------------
 
 
+def _free_decl_count(hpp: str) -> int:
+    """The census's free-function declarations: CENSUS_DECL is the friend declaration's tail too, so those are
+    subtracted."""
+    return hpp.count(CENSUS_DECL) - hpp.count(CENSUS_FRIEND)
+
+
 def claim_census_is_noexcept_and_one_try(hpp: str, cpp: str) -> bool:
     b = body(cpp, CENSUS_SIG)
-    return (hpp.count(CENSUS_DECL) == 1 and hpp.count(CENSUS_FRIEND) == 1 and bool(b)
+    return (_free_decl_count(hpp) == 1 and hpp.count(CENSUS_FRIEND) == 1 and bool(b)
             and _is_one_try(b, CENSUS_HANDLER))
 
 
@@ -121,7 +127,16 @@ def test_census_is_noexcept_and_one_try():
 
 
 def test_mutant_census_declared_without_noexcept_fails():
-    mutant = _once(CACHE_HPP, CENSUS_DECL, "bool " + CENSUS_PARAMS + ";")
+    """The free declaration, not the friend's: the one CENSUS_DECL occurrence no `friend ` precedes."""
+    at = [i for i in range(len(CACHE_HPP)) if CACHE_HPP.startswith(CENSUS_DECL, i)
+          and not CACHE_HPP[:i].endswith("friend ")]
+    assert len(at) == 1
+    mutant = CACHE_HPP[:at[0]] + "bool " + CENSUS_PARAMS + ";" + CACHE_HPP[at[0] + len(CENSUS_DECL):]
+    assert not claim_census_is_noexcept_and_one_try(mutant, CACHE)
+
+
+def test_mutant_census_friend_without_noexcept_fails():
+    mutant = _once(CACHE_HPP, CENSUS_FRIEND, "friend bool " + CENSUS_PARAMS + ";")
     assert not claim_census_is_noexcept_and_one_try(mutant, CACHE)
 
 
@@ -162,8 +177,10 @@ def test_mutant_zone_guard_dropped_fails():
 
 
 def test_mutant_zone_guard_after_the_read_fails():
-    mutant = _once(_once(CACHE, ZONE_GUARD, ""), FIRST_ARENA_READ, FIRST_ARENA_READ + " " + ZONE_GUARD)
-    assert not claim_census_guards_the_zone(mutant)
+    """Built inside the census body: the lookup line is spelled the same in other functions of the file."""
+    b = body(CACHE, CENSUS_SIG)
+    moved = _once(_once(b, ZONE_GUARD, ""), FIRST_ARENA_READ, FIRST_ARENA_READ + " " + ZONE_GUARD)
+    assert not claim_census_guards_the_zone(_once(CACHE, b, moved))
 
 
 # ---- (d) both WARNs carry device= ------------------------------------------------------------------------------

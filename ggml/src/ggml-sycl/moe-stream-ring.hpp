@@ -7,7 +7,8 @@
 // role of one executor phase). Each host matrix of a window is copied whole
 // into one slot, AOS, and the executor's dequant reads it there in place: no
 // SOA staging, no reorder (W2 of the window ring).
-// This header holds two things:
+// This header holds two things, plus the short reserve's WEIGHT zone line (moe_stream_ring_weight_zone_line(), pure,
+// and moe_stream_ring_warn_weight_zone(), which reads the cache):
 //
 //   moe_stream_ring_size()  the pure geometry: two regions, each holding one
 //                           executor window's slots, or no ring. It depends on
@@ -79,8 +80,12 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
 // without printing every cohort of the zone.
 static constexpr size_t MOE_STREAM_RING_WEIGHT_ZONE_TOP_TAGS = 12;
 
-// The WARN a short reserve prints once per context (moe_stream_phase::ring_ready), without its newline: the device, the
-// slots the refused ring itself holds and their size, then zone_tag_census_line()'s figures and its `top` tags.
+// The WARN a short reserve prints once per backend context (moe_stream_phase::ring_ready), without its newline: the
+// device, the slots the refused ring itself holds and their size, then zone_tag_census_line()'s figures and its `top`
+// tags. The ring's slots carry no tag of their own: a slot from unified_cache_zone_allocate_owner() is tagged
+// exact_zone_allocate_owner/weight, with every other allocation of that cohort and role, and one from the fallback
+// request moe_stream_ring/expert_staging. The ring's share of those tags is ring_slots_held x slot_bytes, which is why
+// both are on the line.
 std::string moe_stream_ring_weight_zone_line(int                     device,
                                              const zone_tag_census & census,
                                              uint32_t                slots_held,
@@ -107,11 +112,12 @@ static constexpr ggml_layout_mode MOE_STREAM_RING_SLOT_LAYOUT = GGML_LAYOUT_AOS;
 // One WARN naming what holds the WEIGHT zone on `device` when a reserve comes up short: unified_cache_zone_tag_census()
 // read into moe_stream_ring_weight_zone_line(), its top MOE_STREAM_RING_WEIGHT_ZONE_TOP_TAGS tags, with the refused
 // ring's own `slots_held` slots of `slot_bytes`, which the census counts among the zone's holders. A diagnostic:
-// nothing the reserve or its caller decides reads it. The census takes g_cache_rw_mutex (L4), shared, for the cache
-// lookup, then the WEIGHT zone's allocator group mutex (L5), then g_runtime_alloc_mutex (L5), each released before the
-// next, so the caller must hold no L4 or L5 lock; moe_stream_phase::ring_ready() calls it once per llama context,
-// where the reserve's own allocations have just taken the same locks.
-void moe_stream_ring_warn_weight_zone(int device, uint32_t slots_held, size_t slot_bytes);
+// nothing the reserve or its caller decides reads it, and it never throws: a census that fails prints a literal
+// `device=%d census failed` WARN instead. The census takes g_cache_rw_mutex (L4), shared, for the cache lookup, then
+// the WEIGHT zone's allocator group mutex (L5), then g_runtime_alloc_mutex (L5), each released before the next, so the
+// caller must hold no L4 or L5 lock; moe_stream_phase::ring_ready() calls it once per backend context, that is once
+// per device per llama context, where the reserve's own allocations have just taken the same locks.
+void moe_stream_ring_warn_weight_zone(int device, uint32_t slots_held, size_t slot_bytes) noexcept;
 
 // Not thread-safe: one ring belongs to one device's prompt executor, which
 // acquires, flips and releases from its submitting thread. Nothing here queries

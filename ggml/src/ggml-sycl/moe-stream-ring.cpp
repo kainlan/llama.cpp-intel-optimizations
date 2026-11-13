@@ -76,16 +76,23 @@ std::string moe_stream_ring_weight_zone_line(int                     device,
 
 #if !defined(GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY)
 
-void moe_stream_ring_warn_weight_zone(int device, uint32_t slots_held, size_t slot_bytes) {
-    zone_tag_census census;
-    if (!unified_cache_zone_tag_census(device, vram_zone_id::WEIGHT, census)) {
-        GGML_LOG_WARN("[MOE-STREAM-RING] WEIGHT zone at the short reserve: device %d has no cache or no active arena\n",
-                      device);
-        return;
+void moe_stream_ring_warn_weight_zone(int device, uint32_t slots_held, size_t slot_bytes) noexcept {
+    // The caller is mid-reserve with its loan step still to run: an exception (the line's strings allocate) must not
+    // leave here, so the handler prints a literal that allocates nothing.
+    try {
+        zone_tag_census census;
+        if (!unified_cache_zone_tag_census(device, vram_zone_id::WEIGHT, census)) {
+            GGML_LOG_WARN(
+                "[MOE-STREAM-RING] WEIGHT zone at the short reserve: device=%d has no cache or no active arena\n",
+                device);
+            return;
+        }
+        const std::string line = moe_stream_ring_weight_zone_line(device, census, slots_held, slot_bytes,
+                                                                  MOE_STREAM_RING_WEIGHT_ZONE_TOP_TAGS);
+        GGML_LOG_WARN("%s\n", line.c_str());
+    } catch (...) {
+        GGML_LOG_WARN("[MOE-STREAM-RING] WEIGHT zone at the short reserve: device=%d census failed\n", device);
     }
-    const std::string line =
-        moe_stream_ring_weight_zone_line(device, census, slots_held, slot_bytes, MOE_STREAM_RING_WEIGHT_ZONE_TOP_TAGS);
-    GGML_LOG_WARN("%s\n", line.c_str());
 }
 
 bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short) {
