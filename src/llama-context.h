@@ -487,10 +487,13 @@ private:
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(sched_reserve_state & state, const llama_memory_context_i * mctx, uint32_t n_seqs);
 
-    // llama.cpp-oyfl: the SYCL runtime-context call the constructor makes
-    // right after model activation, for every SYCL backend -- the FULL
+    // The SYCL runtime-context call for every SYCL backend -- the FULL
     // transaction (KV replan, MoE MMID reaccount/materialize, plan
-    // republish). One caller, the constructor itself: resolve_fused_ops()
+    // republish) -- throwing the reason of a refusal. The auto n_ubatch
+    // trial's candidate and settle publishes call it; the constructor's own
+    // publish, right after model activation, calls
+    // sycl_publish_runtime_context() below instead, because a refusal's fit
+    // verdict decides whether it walks -ub down. resolve_fused_ops()
     // does NOT call this -- it calls the narrow
     // sycl_recheck_runtime_context_flash_attn() below instead, since by
     // then only flash_attn_enabled has changed, not n_ctx/n_ubatch.
@@ -592,6 +595,17 @@ private:
     // re-reserved, a backend without the check). The constructor's own check runs unless it equals n_ubatch, so
     // it never re-reads the live free memory at the margin to overturn a rung the ladder just accepted.
     uint32_t sycl_hold_spill_validated_ub = 0;
+
+    // The -ub the constructor's publish was refused at, for fit, when it walked -ub down before the memory module
+    // existed (0: it did not), and why. The trial starts from the rung the walk stood at (sycl_auto_ubatch_prepare) and
+    // treats it as a lowered result from this origin: announced, and stored, by the rules of one its own walk lowered.
+    // With no ladder rung between that rung and the trial's cap the trial takes its single reserve instead, and the
+    // constructor announces the lowering (sycl_announce_ctor_lowered_ubatch).
+    uint32_t    sycl_ctor_lowered_from = 0;
+    std::string sycl_ctor_lowered_cause;
+
+    // The announcement of that lowering for a trial that takes its single reserve, which announces nothing itself.
+    void sycl_announce_ctor_lowered_ubatch() const;
 
     // The host SCRATCH entries, resolved once by the constructor (llama_context_sycl_host_hooks).
     llama_context_sycl_host_hooks sycl_host_hooks;

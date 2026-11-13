@@ -45,6 +45,8 @@ applies the same hardening for the same reason.
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 GGML_SYCL_H = (ROOT / "ggml/include/ggml-sycl.h").read_text()
 CACHE_HPP = (ROOT / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
@@ -626,6 +628,30 @@ def test_formula_and_inverse_are_declared_and_defined():
         assert not _has_static_before(hpp_norm, name), f"{name}() must not be declared static (.hpp)"
 
 
+def _ctor_body_norm(ctx_norm: str) -> str:
+    """The constructor, bounded to the destructor that immediately follows it (not all the way to
+    resolve_fused_ops(), which would also swallow the two helper methods' own definitions sitting in
+    between and make the check imprecise about what "the constructor" actually means)."""
+    ctor_start = ctx_norm.find("llama_context::llama_context(")
+    assert ctor_start != -1, "llama_context::llama_context() definition not found"
+    dtor_start = ctx_norm.find("llama_context::~llama_context(", ctor_start + 1)
+    assert dtor_start != -1, "~llama_context() definition not found"
+    resolve_start = ctx_norm.find("void llama_context::resolve_fused_ops(")
+    assert resolve_start != -1, "resolve_fused_ops() definition not found"
+    assert ctor_start < dtor_start < resolve_start, (
+        "expected the constructor, then the destructor, then resolve_fused_ops(), in that order"
+    )
+    return ctx_norm[ctor_start:dtor_start]
+
+
+_CTOR_FULL_PUBLISH = "sycl_publish_runtime_context(cparams.flash_attn);"
+_NARROW_RECHECK = "sycl_recheck_runtime_context_flash_attn();"
+
+
+def _ctor_publishes_the_full_transaction(ctor_body: str) -> bool:
+    return _CTOR_FULL_PUBLISH in ctor_body and _NARROW_RECHECK not in ctor_body
+
+
 def test_auto_flash_attn_resolution_rechecks_the_guard():
     """cparams.flash_attn defaults true for AUTO before resolve_fused_ops()
     resolves it (llama-context.cpp's cparams init runs before the
@@ -634,10 +660,12 @@ def test_auto_flash_attn_resolution_rechecks_the_guard():
     value, or the guard above never sees it for that context.
 
     Two DIFFERENT methods are involved, not one shared between both call
-    sites: sycl_resync_runtime_context_flash_attn() (the FULL
-    runtime-context transaction: KV replan, MoE MMID reaccount/materialize,
-    plan republish) is the constructor's OWN initial call, made before any
-    AUTO resolution; sycl_recheck_runtime_context_flash_attn() (a NARROW
+    sites: sycl_publish_runtime_context() (the FULL runtime-context
+    transaction: KV replan, MoE MMID reaccount/materialize, plan republish;
+    sycl_resync_runtime_context_flash_attn() is its throwing form) is the
+    constructor's OWN initial call, made before any AUTO resolution, in its
+    status form because a refusal's fit verdict decides whether the
+    constructor walks -ub down; sycl_recheck_runtime_context_flash_attn() (a NARROW
     re-check of only the non-FA attention scratch guard) is what
     resolve_fused_ops() calls once AUTO actually resolves. Re-running the
     full transaction from resolve_fused_ops() would needlessly redo KV/MMID
@@ -650,29 +678,14 @@ def test_auto_flash_attn_resolution_rechecks_the_guard():
         "expected a separate narrow re-check helper for resolve_fused_ops() to call"
     )
 
-    # The constructor calls the FULL-transaction helper, not the narrow one.
-    # Bounded to the destructor that immediately follows it (not all the way
-    # to resolve_fused_ops(), which would also swallow the two helper
-    # methods' own definitions sitting in between and make this check
-    # imprecise about what "the constructor" actually means).
-    ctor_start = ctx_norm.find("llama_context::llama_context(")
-    assert ctor_start != -1, "llama_context::llama_context() definition not found"
-    dtor_start = ctx_norm.find("llama_context::~llama_context(", ctor_start + 1)
-    assert dtor_start != -1, "~llama_context() definition not found"
+    # The constructor calls the FULL transaction, not the narrow one.
+    assert _ctor_publishes_the_full_transaction(_ctor_body_norm(ctx_norm)), (
+        "the constructor must call the FULL-transaction sycl_publish_runtime_context(cparams.flash_attn) -- "
+        "it is where n_ctx/n_ubatch are established for the first time -- and must NOT call the narrow "
+        "re-check, which would skip the KV replan/MMID reaccount a first-time call needs"
+    )
     resolve_start = ctx_norm.find("void llama_context::resolve_fused_ops(")
     assert resolve_start != -1, "resolve_fused_ops() definition not found"
-    assert ctor_start < dtor_start < resolve_start, (
-        "expected the constructor, then the destructor, then resolve_fused_ops(), in that order"
-    )
-    ctor_body = ctx_norm[ctor_start:dtor_start]
-    assert "sycl_resync_runtime_context_flash_attn();" in ctor_body, (
-        "the constructor must call the FULL-transaction sycl_resync_runtime_context_flash_attn() -- "
-        "it is where n_ctx/n_ubatch are established for the first time"
-    )
-    assert "sycl_recheck_runtime_context_flash_attn();" not in ctor_body, (
-        "the constructor must NOT call the narrow re-check -- that would skip the KV replan/MMID "
-        "reaccount a first-time call needs"
-    )
 
     # resolve_fused_ops() calls the NARROW re-check, inside the same
     # if (cparams.auto_fa) block that resolves flash_attn, so it fires
@@ -698,6 +711,14 @@ def test_auto_flash_attn_resolution_rechecks_the_guard():
     ctx_h_norm = _normalize_ws(strip_comments(ctx_h))
     assert "void sycl_resync_runtime_context_flash_attn();" in ctx_h_norm
     assert "void sycl_recheck_runtime_context_flash_attn();" in ctx_h_norm
+
+
+@pytest.mark.parametrize("replacement", [_NARROW_RECHECK, _CTOR_FULL_PUBLISH + " " + _NARROW_RECHECK])
+def test_constructor_full_transaction_check_has_a_mutation_witness(replacement):
+    """The narrow re-check in place of the constructor's full publish, or beside it, fails the check."""
+    ctor_body = _ctor_body_norm(_normalize_ws(LLAMA_CONTEXT_CPP_CODE))
+    assert ctor_body.count(_CTOR_FULL_PUBLISH) == 1, "mutation target not unique/found -- update this witness"
+    assert not _ctor_publishes_the_full_transaction(ctor_body.replace(_CTOR_FULL_PUBLISH, replacement, 1))
 
 
 _PREPROC_OPEN_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef)\b")

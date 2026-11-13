@@ -3447,6 +3447,291 @@ def test_the_slots_kept_rule_has_a_mutation_witness(mutation):
     assert not _ring_helper_credits_the_planned_room(GGML_SYCL_CPP, mutated), "the mutant must make the pin fail"
 
 
+# ---------------------------------------------------------------------------
+# The constructor's publish, refused for fit on a context the trial runs for, walks -ub down before the memory module
+# exists (the KV cache is created with the residency of the publish that stands), and the trial starts from the rung
+# it stood at, asking nothing above it.
+# ---------------------------------------------------------------------------
+
+_CTOR_WALK_DECISION = "sycl_auto_ubatch_trial = llama_auto_ubatch_trial_runs("
+_CTOR_WALK_PUBLISH = "const sched_reserve_result published = sycl_publish_runtime_context(cparams.flash_attn);"
+_CTOR_WALK_GATE = (
+    "if (!llama_auto_ubatch_ctor_walks_down(sycl_auto_ubatch_trial, first_refusal.fit_refusal)) { "
+    "throw std::runtime_error(first_refusal.reason); }"
+)
+_CTOR_WALK_DESCENT = (
+    "llama_auto_ubatch_descend(asked_ubatch, asked_ubatch, [&](uint32_t c) { if (publish_at(c)) { return true; } "
+    "walk_aborted = !last_refusal.fit_refusal; return walk_aborted; }); if (stood == 0 || walk_aborted) {"
+)
+_CTOR_NO_LOWER = (
+    "if (llama_auto_ubatch_next_lower(asked_ubatch) == 0) { throw std::runtime_error(first_refusal.reason); }"
+)
+_CTOR_LAST_NOTE = (
+    "const std::string last_note = last_refusal.reason == first_refusal.reason ? std::string() : "
+    'format("; the last refusal: %s", last_refusal.reason.c_str()); throw std::runtime_error( '
+    "format(\"%s (auto n_ubatch: the constructor's publish walked -ub down through %s and none \" \"stood%s)\", "
+    "first_refusal.reason.c_str(), walked.c_str(), last_note.c_str())); }"
+)
+_CTOR_WALK_RECORD = "sycl_ctor_lowered_from = asked_ubatch;"
+_CTOR_WALK_ANNOUNCE = (
+    "if (sycl_ctor_lowered_from != 0 && !auto_ubatch_prep) { sycl_announce_ctor_lowered_ubatch(); }"
+)
+_LOWERED_LITERAL = "auto n_ubatch lowered from %u to %u"
+_LOWERED_FMT = (
+    '"[SYCL-PLAN] auto n_ubatch lowered from %u to %u: %s; a smaller -ub is not a smaller context; " '
+    '"pass -ub N to override\\n"'
+)
+_ANNOUNCE_FN = "void llama_context::sycl_announce_ctor_lowered_ubatch() const {"
+_ANNOUNCE_END = "sched_reserve_state llama_context::member_reserve_state() {"
+_SELECT_FN = "void llama_context::sycl_select_auto_ubatch() {"
+_PUBLISH_FN = "sched_reserve_result llama_context::sycl_publish_runtime_context(bool flash_attn) {"
+_RESYNC_FN = "void llama_context::sycl_resync_runtime_context_flash_attn() {"
+_STOP_SEED = "if (sycl_ctor_lowered_from != 0) { stop = sycl_ctor_lowered_cause.c_str(); }"
+_LOWERED_NOTE_FN = (
+    "static std::string llama_context_sycl_ctor_lowered_note(uint32_t ctor_lowered_from, const std::string & cause) "
+    '{ if (ctor_lowered_from == 0) { return ""; } return format("; auto n_ubatch was lowered from %u because %s", '
+    "ctor_lowered_from, cause.c_str()); }"
+)
+_LOWERED_NOTE_ARG = "llama_context_sycl_ctor_lowered_note(sycl_ctor_lowered_from, sycl_ctor_lowered_cause).c_str()));"
+_SETTLE_FMT = '"auto n_ubatch: %s (tried %s; last stop: %s), and the settle at %u was refused (%s); %s%s",'
+_HOLD_SPILL_FMT = '"the VRAM arena and left a card under the driver headroom the arena expects (n_ubatch=%u); %s%s",'
+_WAS_INFO = (
+    'LLAMA_LOG_INFO("%s: n_ubatch = %u (auto, was %u)\\n", __func__, cparams.n_ubatch, '
+    "sycl_ctor_lowered_from != 0 ? sycl_ctor_lowered_from : fallback_ubatch);"
+)
+_SKIPS_TRIAL = (
+    "if (llama_auto_ubatch_ctor_lowered_skips_trial(ctor_lowered, ladder, llama_auto_ubatch_ladder_size, "
+    "fallback_ubatch, cap)) { return; }"
+)
+
+_V_DECISION = "the trial decision is not made once, before the constructor's one publish, before the memory"
+_V_RUNG = "the publish does not run at the rung it is asked, or the first refusal is not the one kept"
+_V_BACKENDS = "a rung's publish does not run over every backend of the context, from the first"
+_V_GATE = "a refusal walks -ub down without a fit verdict on a context the trial runs for"
+_V_WALK = "the walk is not the trial's descent from the default, capped at it, ending at a non-fit refusal"
+_V_RECORD = "the lowered rung is not recorded, with its origin, after the walk's throw and before the memory"
+_V_HOISTED = "the hoisted block asks the cache, the ladder or the host hold above a lowered rung"
+_V_SEED = "the trial does not start from the constructor's lowering"
+_V_ORIGIN = "the trial's descent overwrites the origin the constructor lowered from"
+_V_STOP = "the outcome of a lowered rung names a ceiling this ladder never reached"
+_V_SILENT = "a lowering the trial does not announce is silent"
+_V_AT_MOST_ONE = "a context can print the lowered announcement from both sources, or twice from one"
+_V_WORDING = "the two lowered announcements do not share the trial's wording"
+_V_NOTE = "a named refusal of a context the constructor lowered does not say so"
+_V_NO_RUNG = "a lowered context the trial has no rung for gets a prep, so its lowering goes unannounced"
+_V_WAS = "the trial's INFO line gives a lowered rung as the -ub the constructor printed"
+_V_NO_LOWER = "a default with no rung under it reports a walk that never ran"
+_V_LAST_TWICE = "the walk's error names its last refusal again when it is the first"
+
+
+def _call_closes_throw(code: str, fmt: str) -> bool:
+    """True iff the format string `fmt` occurs once and the lowered note is the last argument of its throw."""
+    at = code.find(fmt)
+    if at == -1 or code.count(fmt) != 1:
+        return False
+    end = code.find("));", at)
+    return end != -1 and code[:end + 3].endswith(_LOWERED_NOTE_ARG) and "throw" not in code[at:end]
+
+
+def _ctor_walk_violations(raw_cpp: str) -> list:
+    code = _normalize_ws(strip_comments(raw_cpp))
+    ctor = _bounded_body(code, "llama_context::llama_context(", "llama_context::~llama_context(")
+    prep = _bounded_body(code, _TRIAL_START, _SELECT_FN)
+    sel = _bounded_body(code, _SELECT_FN, _TRIAL_END)
+    pub = _bounded_body(code, _PUBLISH_FN, _RESYNC_FN)
+    # A tree without the constructor's announcement names the violation below rather than failing the lookup.
+    announce = _bounded_body(code, _ANNOUNCE_FN, _ANNOUNCE_END) if _ANNOUNCE_FN in code else ""
+    found = []
+
+    decision = ctor.find(_CTOR_WALK_DECISION)
+    publish = ctor.find(_CTOR_WALK_PUBLISH)
+    memory = ctor.find("model.create_memory(")
+    if ctor.count("llama_auto_ubatch_trial_runs(") != 1 or ctor.count("sycl_publish_runtime_context(") != 1 or \
+            min(decision, publish, memory) < 0 or not decision < publish < memory:
+        found.append(_V_DECISION)
+    publish_at = ctor[ctor.find("auto publish_at = [&](uint32_t ub) {"):publish]
+    if not publish_at.startswith("auto publish_at") or "cparams.n_ubatch = ub;" not in publish_at or \
+            "if (first_refusal.status == sched_reserve_status::OK) { first_refusal = published; }" not in ctor:
+        found.append(_V_RUNG)
+    # Every rung's one publish starts over at the first backend, so a backend that accepted a rung a later one
+    # refused is republished at the next rung down (the refusal returns at once and the OK only after the loop: the
+    # publish-status pin; a skipped backend: the kv-layer-sizing pin).
+    if pub.count("for (") != 1 or pub.count("for (auto & backend : backends) {") != 1:
+        found.append(_V_BACKENDS)
+    if _CTOR_WALK_GATE not in ctor:
+        found.append(_V_GATE)
+    gate, walk, record = ctor.find(_CTOR_WALK_GATE), ctor.find(_CTOR_WALK_DESCENT), ctor.find(_CTOR_WALK_RECORD)
+    if walk == -1 or not 0 <= gate < walk:
+        found.append(_V_WALK)
+    if record == -1 or not 0 <= walk < record < memory:
+        found.append(_V_RECORD)
+    # The descent asks nothing under a default below twice its floor, so that refusal is thrown as it came; a walk
+    # that ran names its last refusal only when it differs from the first.
+    no_lower = ctor.find(_CTOR_NO_LOWER)
+    if ctor.count(_CTOR_NO_LOWER) != 1 or min(gate, no_lower, walk) < 0 or not gate < no_lower < walk:
+        found.append(_V_NO_LOWER)
+    last_note = ctor.find(_CTOR_LAST_NOTE)
+    if ctor.count(_CTOR_LAST_NOTE) != 1 or min(walk, last_note, record) < 0 or not walk < last_note < record:
+        found.append(_V_LAST_TWICE)
+
+    if "const bool ctor_lowered = sycl_ctor_lowered_from != 0;" not in prep or \
+            "const bool cache_found = !ctor_lowered && cache_available && cache_lookup_fn(" not in prep or \
+            "const size_t n_rung_set = ctor_lowered ? 1 : n_rung_set_full;" not in prep or \
+            "if (ctor_lowered) { rung_ladder.assign(1, fallback_ubatch); }" not in prep:
+        found.append(_V_HOISTED)
+    # The trial's no-candidate exit returns before its lowered WARN, and the constructor announces only on an empty
+    # prep, so a lowered context with no rung in [lowered, cap] leaves prepare before any of the prep is built.
+    lowered_at = prep.find("const bool ctor_lowered = sycl_ctor_lowered_from != 0;")
+    skips = prep.find(_SKIPS_TRIAL)
+    built = [prep.find(s) for s in ("llama_auto_ubatch_rung_set(", "tenant_rung_set.assign(",
+                                    "auto_ubatch_prep = std::move(prep);")]
+    if prep.count(_SKIPS_TRIAL) != 1 or min([lowered_at, skips] + built) < 0 or not lowered_at < skips < min(built):
+        found.append(_V_NO_RUNG)
+
+    # Every anchor of an ordering is found first: a missing lower anchor (-1) would otherwise order before anything.
+    seed = sel.find("lowered_from = sycl_ctor_lowered_from; lowered_cause = sycl_ctor_lowered_cause;")
+    first_cache = sel.find("if (cache_available) {")
+    declared = sel.find("uint32_t lowered_from = 0;")
+    if min(declared, seed, first_cache) < 0 or not declared < seed < first_cache:
+        found.append(_V_SEED)
+    if 'if (lowered_from == 0) { lowered_from = fallback_ubatch; lowered_cause = format("the default did not fit ' \
+       '(%s)", stop); } else { lowered_cause += format(' not in sel:
+        found.append(_V_ORIGIN)
+    stop_init = sel.find('stop = moe_bound ? "MoE GPU routing ceiling"')
+    stop_seed = sel.find(_STOP_SEED)
+    if min(stop_init, seed, stop_seed, first_cache) < 0 or not stop_init < seed < stop_seed < first_cache:
+        found.append(_V_STOP)
+
+    # One source or the other, never both: the constructor announces only on an empty prep, the trial only past its
+    # empty-prep exit, the prep is not touched between the two decisions, and each source has one call or line.
+    prepared = ctor.find("sycl_auto_ubatch_prepare(params.type_k, params.type_v);")
+    announce_at = ctor.find(_CTOR_WALK_ANNOUNCE)
+    if announce_at == -1 or not 0 <= prepared < announce_at < memory:
+        found.append(_V_SILENT)
+    trial_call = ctor.find("sycl_select_auto_ubatch();")
+    empty_exit = sel.find("if (!auto_ubatch_prep) { sched_reserve(); return; }")
+    between = ctor[announce_at + len(_CTOR_WALK_ANNOUNCE):trial_call]
+    if announce_at == -1 or trial_call == -1 or "auto_ubatch_prep" in between or \
+            code.count("sycl_announce_ctor_lowered_ubatch();") != 1 or code.count(_LOWERED_LITERAL) != 2 or \
+            sel.count(_LOWERED_LITERAL) != 1 or announce.count(_LOWERED_LITERAL) != 1 or \
+            not 0 <= empty_exit < sel.find(_LOWERED_LITERAL):
+        found.append(_V_AT_MOST_ONE)
+    # The constructor's own n_ubatch INFO line prints the -ub as asked, before its publish can lower it.
+    if sel.count(_WAS_INFO) != 1:
+        found.append(_V_WAS)
+    if "LLAMA_LOG_WARN( " + _LOWERED_FMT + ", lowered_from, last_good, lowered_cause.c_str());" not in sel or \
+            "LLAMA_LOG_WARN( " + _LOWERED_FMT + ", sycl_ctor_lowered_from, cparams.n_ubatch, " \
+            "sycl_ctor_lowered_cause.c_str());" not in announce:
+        found.append(_V_WORDING)
+
+    # The two named refusals that can follow a constructor lowering carry it; generic throws stay as they are.
+    if _LOWERED_NOTE_FN not in code or code.count("llama_context_sycl_ctor_lowered_note(") != 3 or \
+            not _call_closes_throw(sel, _SETTLE_FMT) or not _call_closes_throw(ctor, _HOLD_SPILL_FMT):
+        found.append(_V_NOTE)
+    return found
+
+
+def test_the_constructor_publish_walks_down_only_through_the_predicate():
+    assert _ctor_walk_violations(LLAMA_CONTEXT_CPP) == []
+
+
+# Each mutant names the violation it must produce, so a witness proves its own clause rather than any clause.
+_CTOR_WALK_MUTANTS = {
+    "the decision computed again at the publish": (
+        "llama_auto_ubatch_ctor_walks_down(sycl_auto_ubatch_trial,",
+        "llama_auto_ubatch_ctor_walks_down(llama_auto_ubatch_trial_runs(params.n_ubatch_auto, cparams.causal_attn, "
+        "true, true),", _V_DECISION),
+    "a second publish site": (
+        "if (!publish_at(asked_ubatch)) {",
+        "(void) sycl_publish_runtime_context(cparams.flash_attn); if (!publish_at(asked_ubatch)) {", _V_DECISION),
+    "the walk publishes at the default every time": ("cparams.n_ubatch = ub;", "(void) ub;", _V_RUNG),
+    "the last refusal reported as the first": (
+        "if (first_refusal.status == sched_reserve_status::OK) {", "if (true) {", _V_RUNG),
+    "the publish resumes at the backend that refused": (
+        _PUBLISH_FN + " #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL) for (auto & backend : backends) {",
+        _PUBLISH_FN + "\n#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)\n"
+        "    for (auto & backend : sycl_publish_pending) {", _V_BACKENDS),
+    "a lifecycle refusal walks": ("first_refusal.fit_refusal)) {", "true)) {", _V_GATE),
+    "a context without the trial walks": ("walks_down(sycl_auto_ubatch_trial,", "walks_down(true,", _V_GATE),
+    "the walk asks above the default": (
+        "llama_auto_ubatch_descend(asked_ubatch, asked_ubatch,",
+        "llama_auto_ubatch_descend(asked_ubatch, cparams.n_batch,", _V_WALK),
+    "the walk goes on past a lifecycle refusal": (
+        "walk_aborted = !last_refusal.fit_refusal;", "walk_aborted = false;", _V_WALK),
+    "an aborted walk keeps the rung it aborted at": ("if (stood == 0 || walk_aborted) {", "if (stood == 0) {", _V_WALK),
+    "a default with no rung under it reports a walk": (_CTOR_NO_LOWER, "", _V_NO_LOWER),
+    "the no-lower check never fires": (
+        "if (llama_auto_ubatch_next_lower(asked_ubatch) == 0) {", "if (false) {", _V_NO_LOWER),
+    "the last refusal is named when it is the first": (
+        "last_refusal.reason == first_refusal.reason ? std::string() :", "false ? std::string() :", _V_LAST_TWICE),
+    "the origin is not recorded": ("sycl_ctor_lowered_from  = asked_ubatch;", "(void) asked_ubatch;", _V_RECORD),
+    "the cache asks above a lowered rung": (
+        "const bool cache_found           = !ctor_lowered && cache_available &&",
+        "const bool cache_found = cache_available &&", _V_HOISTED),
+    "the host hold folds rungs a lowered context never tries": (
+        "ctor_lowered ? 1 : n_rung_set_full", "n_rung_set_full", _V_HOISTED),
+    "the ladder climbs above a lowered rung": (
+        "if (ctor_lowered) { rung_ladder.assign(1, fallback_ubatch); }", "", _V_HOISTED),
+    "a lowered context with no rung builds a prep": (_SKIPS_TRIAL, "", _V_NO_RUNG),
+    "the no-rung guard falls through": (
+        "fallback_ubatch, cap)) { return; }", "fallback_ubatch, cap)) { (void) 0; }", _V_NO_RUNG),
+    "the no-rung guard asks from the origin": (
+        "llama_auto_ubatch_ladder_size, fallback_ubatch, cap)) { return; }",
+        "llama_auto_ubatch_ladder_size, sycl_ctor_lowered_from, cap)) { return; }", _V_NO_RUNG),
+    "the no-rung guard runs for every context": (
+        "llama_auto_ubatch_ctor_lowered_skips_trial(ctor_lowered,", "llama_auto_ubatch_ctor_lowered_skips_trial(true,",
+        _V_NO_RUNG),
+    "the trial is not told the rung was lowered": ("lowered_from  = sycl_ctor_lowered_from;", "(void) 0;", _V_SEED),
+    "the seed's declaration is no longer where the clause looks": (
+        "uint32_t lowered_from = 0;", "uint32_t lowered_from{};", _V_SEED),
+    "the stop initializer is no longer where the clause looks": (
+        'const char * stop = moe_bound ? "MoE GPU routing ceiling" : "ladder exhausted";',
+        'const char * stop{ moe_bound ? "MoE GPU routing ceiling" : "ladder exhausted" };', _V_STOP),
+    "the trial's descent overwrites the constructor's origin": ("if (lowered_from == 0) {", "if (true) {", _V_ORIGIN),
+    "the outcome names the ladder's ceiling for a lowered rung": (
+        "stop = sycl_ctor_lowered_cause.c_str();", "(void) 0;", _V_STOP),
+    "a single-reserve trial lowers silently": (
+        "if (sycl_ctor_lowered_from != 0 && !auto_ubatch_prep) {", "if (false) {", _V_SILENT),
+    "the constructor announces what the trial announces": (
+        "if (sycl_ctor_lowered_from != 0 && !auto_ubatch_prep) {", "if (sycl_ctor_lowered_from != 0) {",
+        _V_AT_MOST_ONE),
+    "the trial announces on an empty prep too": (
+        "if (!auto_ubatch_prep) { sched_reserve(); return; }",
+        "if (!auto_ubatch_prep) { sched_reserve(); sycl_announce_ctor_lowered_ubatch(); return; }", _V_AT_MOST_ONE),
+    "the prep is made after the constructor announced": (
+        "sycl_announce_ctor_lowered_ubatch(); }",
+        "sycl_announce_ctor_lowered_ubatch(); } sycl_auto_ubatch_prepare(params.type_k, params.type_v);",
+        _V_AT_MOST_ONE),
+    "a third lowered announcement": (
+        "sycl_select_auto_ubatch(); } else { sched_reserve(); }",
+        'sycl_select_auto_ubatch(); } else { sched_reserve(); } '
+        'LLAMA_LOG_WARN("[SYCL-PLAN] auto n_ubatch lowered from %u to %u\\n", 1u, 2u);', _V_AT_MOST_ONE),
+    "the constructor's announcement leaves the trial's wording": (
+        _ANNOUNCE_FN + ' LLAMA_LOG_WARN( "[SYCL-PLAN] auto n_ubatch lowered from',
+        _ANNOUNCE_FN + ' LLAMA_LOG_WARN( "[SYCL-PLAN] auto n_ubatch reduced from', _V_WORDING),
+    "the settle's named error drops the lowering": (
+        '"no -ub is known to fit: free VRAM on the card", ' + _LOWERED_NOTE_ARG + " } else {",
+        '"no -ub is known to fit: free VRAM on the card", "")); } else {', _V_NOTE),
+    "the hold-spill named error drops the lowering": (
+        '"no -ub is known to fit: free VRAM on the card", ' + _LOWERED_NOTE_ARG + " } } #endif",
+        '"no -ub is known to fit: free VRAM on the card", ""));\n            }\n        }\n#endif', _V_NOTE),
+    "a context the constructor did not lower gets the note": (
+        "if (ctor_lowered_from == 0) {", "if (false) {", _V_NOTE),
+    "the INFO line gives the lowered rung as the -ub it superseded": (
+        "sycl_ctor_lowered_from != 0 ? sycl_ctor_lowered_from : fallback_ubatch);", "fallback_ubatch);", _V_WAS),
+}
+
+
+@pytest.mark.parametrize("mutation", sorted(_CTOR_WALK_MUTANTS))
+def test_the_constructor_walk_has_a_mutation_witness(mutation):
+    old, new, expected = _CTOR_WALK_MUTANTS[mutation]
+    pat = _ws_tolerant(old)
+    found = len(pat.findall(LLAMA_CONTEXT_CPP))
+    assert found == 1, f"mutation target not unique/found ({found}) -- update this witness: {old!r}"
+    mutated = pat.sub(lambda _m: new, LLAMA_CONTEXT_CPP, count=1)
+    violations = _ctor_walk_violations(mutated)
+    assert expected in violations, f"the mutant must fail its own clause -- got {violations}"
+
 if __name__ == "__main__":
     import sys
 

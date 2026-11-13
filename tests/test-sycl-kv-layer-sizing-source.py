@@ -1197,7 +1197,7 @@ def kv_overflow_announcement_violations(sycl_cpp: str) -> list[str]:
 def kv_publish_order_violations(ctx_cpp: str) -> list[str]:
     found: list[str] = []
     ctor = strip_comments(function(ctx_cpp, LLAMA_CONTEXT_CTOR_SIGNATURE))
-    publish = ctor.find("sycl_resync_runtime_context_flash_attn();")
+    publish = ctor.find("sycl_publish_runtime_context(cparams.flash_attn);")
     memory = ctor.find("memory.reset(model.create_memory(")
     ladder = ctor.find("sycl_select_auto_ubatch(")
     if min(publish, memory, ladder) < 0 or not publish < memory < ladder:
@@ -1635,11 +1635,12 @@ def test_mutation_budget_demotion_warns_ungated_is_witnessed() -> None:
 def test_mutation_publish_after_kv_allocation_is_witnessed() -> None:
     ctx = LLAMA_CONTEXT_CPP.read_text()
     ctor = function(ctx, LLAMA_CONTEXT_CTOR_SIGNATURE)
-    first = ctor.index("        sycl_resync_runtime_context_flash_attn();\n")
-    moved = ctor[:first] + ctor[first + len("        sycl_resync_runtime_context_flash_attn();\n"):]
+    line = "                const sched_reserve_result published = sycl_publish_runtime_context(cparams.flash_attn);\n"
+    first = ctor.index(line)
+    moved = ctor[:first] + ctor[first + len(line):]
     at = moved.index("        memory.reset(model.create_memory(params_mem, cparams, measure_only));\n")
     at += len("        memory.reset(model.create_memory(params_mem, cparams, measure_only));\n")
-    moved = moved[:at] + "        sycl_resync_runtime_context_flash_attn();\n" + moved[at:]
+    moved = moved[:at] + line + moved[at:]
     _assert_witnessed(ctx, ctx.replace(ctor, moved, 1), kv_publish_order_violations,
                       "a backend's first publish can run after the context's KV is allocated",
                       "the constructor publishes after creating the KV cache")
