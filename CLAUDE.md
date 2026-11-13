@@ -1083,6 +1083,28 @@ correctness. Full rationale and sources: `docs/backend/gpt-oss-testing.md`.
 
 ### Patched compute-runtime & P2P topology
 
+⚠️ **THE LOADED DRIVER IS 26.40, NOT 26.31 (verified 2026-11-13).**
+`libze_intel_gpu.so.1` points at `libze_intel_gpu.so.1.18.40196`, package
+`libze-intel-gpu1 26.40.40196.8`. `/var/log/dpkg.log` records two further one-way
+PPA upgrades after the 26.31 one described below:
+
+| date | `libze-intel-gpu1` |
+|------|--------------------|
+| 2026-08-20 | 26.27 → 26.31.39395.13 |
+| 2026-10-10 | 26.31 → 26.35.39758.11 |
+| 2026-11-01 | 26.35 → 26.40.40196.8 |
+
+So a measurement is on 26.31 only if it was taken before 2026-10-10, on 26.35
+from then until 2026-11-01, and on 26.40 since. Every "26.31" figure in this file
+and in `docs/backend/sycl-perf-baselines.md` was measured on 26.31 and has not
+been re-validated on 26.40. Read the version live before attributing a
+throughput delta to the tree:
+
+```bash
+readlink /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+dpkg -l libze-intel-gpu1 | tail -1
+```
+
 ⚠️ **STALE-PIN CORRECTION (verified 2026-08-30, llama.cpp-09um):** the paragraph
 below described the loader state until 2026-08-18, when a PPA upgrade (one-way)
 moved `libze_intel_gpu.so.1` to **26.31** (`libze_intel_gpu.so.1.17.39395`,
