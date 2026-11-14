@@ -442,10 +442,13 @@ arm_result arm_d_qwen_flip() {
     return r;
 }
 
-// (j) A storage-only table is STORAGE at a reading where the same table without the flag is HOST.
-// Engagement: the control plan (no flag, arm (d)'s "above" reading) carries the table HOST.
-// Mutants: the flag not read by the HOST test (the flagged table is HOST).
-// This arm checks residency and floor only; the cache's size is another arm's.
+// (j) A storage-only table is STORAGE at a reading where the same table without the flag is HOST, and its cache is
+// smaller than the table's HOST body.
+// Engagement: the control plan (no flag, arm (d)'s "above" reading) carries the table HOST. At this reading an
+// uncapped cache would hold every row and its index, which is more than the body: only a ceiling makes the last check
+// pass.
+// Mutants: the flag not read by the HOST test (the flagged table is HOST); no ceiling on the cache (it holds more than
+// the body).
 arm_result arm_j_storage_only_skips_host() {
     arm_result                             r;
     const lazy_test_coverage_pin           pin    = ggml_sycl_test_make_coverage_pin(0);
@@ -468,6 +471,77 @@ arm_result arm_j_storage_only_skips_host() {
            t != nullptr && t->cache_floor_slots == floor_slots(tables[0], kv) &&
                t->cache_slots >= t->cache_floor_slots && t->host_resident_bytes >= floor_raw_bytes(tables[0], kv),
            "the flagged table is below its floor");
+    expect_storage(r, p, tables[0], kv, "storage-only: ");
+    expect_pin_held(r, pin);
+    return r;
+}
+
+// (k) The big storage-only table's cache stops at 2 GiB, index included, where the same table without the flag gets
+// tens of GiB from the same reading.
+// Engagement: the control (no flag, arm (d)'s "below" reading) holds more than 2 GiB.
+// Mutants: no ceiling (the flagged table holds the control's bytes); the ceiling on every table (the control holds
+// 2 GiB); the ceiling ignoring the index (the flagged table exceeds 2 GiB); a ceiling well under 2 GiB (the flagged
+// table holds 1.5 GiB or less).
+arm_result arm_k_storage_only_cache_cap() {
+    arm_result                             r;
+    const lazy_test_coverage_pin           pin    = ggml_sycl_test_make_coverage_pin(0);
+    std::vector<placement_lazy_table_info> tables = qwen_tables();
+    size_t                                 step2  = 0;
+    if (!step2_of(r, qwen38_shape, pin.pin(), step2)) {
+        return r;
+    }
+    const size_t                 reading = step2 + host_body(tables[0]) + k_p3_margin - 1 * GiB;
+    const placement_plan         plain   = plan_for(qwen38_shape, kv_with(tables, reading), pin.pin());
+    const placement_lazy_table * c       = find_table(plain, tables[0].name);
+    expect(r, c != nullptr && c->host_resident_bytes > 2 * GiB,
+           "control: the unflagged table holds " + num(c ? c->host_resident_bytes : 0) + ", want more than 2 GiB");
+
+    tables[0].storage_only          = true;
+    const placement_kv_info      kv = kv_with(tables, reading);
+    const placement_plan         p  = plan_for(qwen38_shape, kv, pin.pin());
+    const placement_lazy_table * t  = find_table(p, tables[0].name);
+    expect_storage(r, p, tables[0], kv, "capped: ");
+    expect(r, t != nullptr && t->host_resident_bytes <= 2 * GiB && t->host_resident_bytes > 2 * GiB - 512 * MiB,
+           "capped: the table holds " + num(t ? t->host_resident_bytes : 0) + ", want (1.5 GiB, 2 GiB]");
+    expect_p3(r, p, step2, reading, "capped: ");
+    expect_pin_held(r, pin);
+    return r;
+}
+
+// (l) A small storage-only table never plans a cache larger than its HOST body: a 64 MiB table at a reading with room
+// for every row holds at most its body, where a full cache of every row and its index would exceed it.
+// Engagement: the full cache's bytes (every row, index included) exceed the body, so a ceiling of 2 GiB alone would
+// let the cache pass the body; the arm checks that figure before it plans.
+// Mutants: the ceiling at 2 GiB without the body term (the table holds every row plus its index, about 90 MiB against
+// a 64 MiB body: the helper puts the table at offset 0, so the body is the table on its mapping); the ceiling at the
+// floor (the table holds under half its body).
+arm_result arm_l_small_storage_only_stops_at_its_body() {
+    arm_result                   r;
+    const lazy_test_coverage_pin pin = ggml_sycl_test_make_coverage_pin(0);
+    placement_lazy_table_info    t   = lazy_table("blk.1.small.weight", GGML_TYPE_Q8_0, 32, (64 * MiB) / 34, 1, 1);
+    t.storage_only                   = true;
+    const std::vector<placement_lazy_table_info> tables = { t };
+    const size_t                                 rows   = t.table_bytes / t.row_size;
+    const size_t full = mapped(rows * t.row_size) + mapped(lazy_row_cache_index_raw_bytes(rows));
+    if (full <= host_body(t)) {
+        fail(r, "the full cache of " + num(rows) + " rows is " + num(full) + " bytes, not more than the body " +
+                    num(host_body(t)) + ": a ceiling of 2 GiB alone would pass");
+        return r;
+    }
+    size_t step2 = 0;
+    if (!step2_of(r, qwen38_shape, pin.pin(), step2)) {
+        return r;
+    }
+    const size_t                 reading = step2 + 64 * GiB + k_p3_margin;
+    const placement_kv_info      kv      = kv_with(tables, reading);
+    const placement_plan         p       = plan_for(qwen38_shape, kv, pin.pin());
+    const placement_lazy_table * got     = find_table(p, t.name);
+    expect(r, got != nullptr && got->residency == lazy_residency::STORAGE, "the small table is not STORAGE");
+    expect(r,
+           got != nullptr && got->host_resident_bytes <= host_body(t) && got->host_resident_bytes > host_body(t) / 2 &&
+               got->host_resident_bytes >= floor_raw_bytes(t, kv),
+           "the small table holds " + num(got ? got->host_resident_bytes : 0) + ", want (half its body " +
+               num(host_body(t) / 2) + ", its body " + num(host_body(t)) + "]");
     expect_pin_held(r, pin);
     return r;
 }
@@ -708,6 +782,8 @@ int main(int argc, char ** argv) {
         { "(h) floors past P3 refuse as cache-below-floor",   arm_h_floors_past_p3_refuse                        },
         { "(i) an unnamed micro-batch floors at the default", arm_i_an_unnamed_micro_batch_floors_at_the_default },
         { "(j) a storage-only table skips the HOST test",     arm_j_storage_only_skips_host                      },
+        { "(k) a storage-only cache stops at 2 GiB",          arm_k_storage_only_cache_cap                       },
+        { "(l) a small storage-only cache stops at its body", arm_l_small_storage_only_stops_at_its_body         },
     };
     if (g_devices == 1) {
         arms.push_back(
