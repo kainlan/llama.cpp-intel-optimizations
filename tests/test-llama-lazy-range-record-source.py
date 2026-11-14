@@ -42,6 +42,10 @@ Windows) or that a rebase of upstream code would silently restore:
 9. while the tree has no STORAGE consumer, the pre-fill records the taker's AUTO row ineligible (the default mode must
    load), through exactly one condition; that bridge and the STORAGE refusal are added and deleted together.
 
+10. qwen4exp is the one arch with a STORAGE consumer: its PLE graph input takes an F32 tensor that set_input() gathers
+    from the storage tier and dequantizes on the host, with no get_rows on that path, and a failed gather fails the
+    ubatch through set_input_failed() instead of computing on stale rows.
+
 Plain file I/O, comment-stripped text.
 """
 
@@ -56,6 +60,7 @@ MODEL_CPP = ROOT / "src/llama-model.cpp"
 RECORD_CPP = ROOT / "src/llama-lazy-range-record.cpp"
 RECORD_H = ROOT / "src/llama-lazy-range-record.h"
 SAVER_CPP = ROOT / "src/llama-model-saver.cpp"
+QWEN4EXP_CPP = ROOT / "src/models/qwen4exp.cpp"
 
 _LEXEME_RE = re.compile(
     r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
@@ -432,3 +437,131 @@ def test_the_saver_refuses_a_storage_table_before_it_touches_the_gguf_context():
     assert null_check, "add_tensor has no `if (!tensor)` early return"
     assert null_check.start() < guards[0], (
         "the STORAGE refusal must follow the null-tensor check, because the saver passes null tensors")
+
+
+# ---- 10. qwen4exp's STORAGE consumer ----
+
+
+def if_block(code: str, m: re.Match):
+    """The condition and the braced block of the `if (` that `m` ends on, and the index just past the block; None when
+    the statement has no braces."""
+    open_paren = m.end() - 1
+    cond = balanced(code, open_paren, "(", ")")
+    after = open_paren + len(cond) + 2
+    brace = re.match(r"\s*\{", code[after:])
+    if not brace:
+        return None
+    open_brace = after + brace.end() - 1
+    block = balanced(code, open_brace)
+    return cond, block, open_brace + len(block) + 2
+
+
+def qwen4exp_ple_class() -> str:
+    code = read_code(QWEN4EXP_CPP)
+    m = re.search(r"class\s+llm_graph_input_ple\s*:\s*public\s+llm_graph_input_i\s*\{", code)
+    assert m, "class llm_graph_input_ple is not defined in src/models/qwen4exp.cpp"
+    return balanced(code, m.end() - 1)
+
+
+def qwen4exp_ple_failed_flag() -> str:
+    # the flag's name is read from the override, so the pins below test the shape and not a spelling
+    m = re.search(r"\bbool\s+set_input_failed\s*\(\s*\)\s*const\s+override\s*\{\s*return\s+(\w+)\s*;\s*\}",
+                  qwen4exp_ple_class())
+    assert m, "llm_graph_input_ple does not override set_input_failed() to return a member flag"
+    return m.group(1)
+
+
+def test_qwen4exp_is_the_one_storage_consumer():
+    # anchored on the definition's brace: the forward declaration at the top of the file matches the same signature
+    # and would hand function_body the next function's body
+    cpp = read_code(RECORD_CPP)
+    m = re.search(r"static\s+bool\s+llama_lazy_storage_consumer_present\s*\(\s*enum\s+llm_arch\s+arch\s*\)\s*\{", cpp)
+    assert m, "the consumer predicate's definition is missing"
+    assert re.fullmatch(r"\s*return\s+arch\s*==\s*LLM_ARCH_QWEN4EXP\s*;\s*", balanced(cpp, m.end() - 1)), (
+        "the consumer predicate must answer exactly `arch == LLM_ARCH_QWEN4EXP`: qwen4exp's graph is the one that "
+        "reads a STORAGE table")
+
+
+def test_qwen4exp_ple_input_is_f32_from_storage_and_get_rows_only_otherwise():
+    build = function_body(read_code(QWEN4EXP_CPP),
+                          r"ggml_tensor\s*\*\s*llama_model_qwen4exp::graph::build_inp_ple\s*\((?:[^()]|\([^()]*\))*\)")
+    branches = []
+    for m in re.finditer(r"\bif\s*\(", build):
+        got = if_block(build, m)
+        if got and "lazy_storage(" in got[0]:
+            branches.append(got)
+    assert len(branches) == 1, f"build_inp_ple must branch once on the table's storage handle, found {len(branches)}"
+    _, storage, past = branches[0]
+    other = re.match(r"\s*else\s*\{", build[past:])
+    assert other, "the STORAGE branch of build_inp_ple has no else branch for the resident table"
+    open_else = past + other.end() - 1
+    eager = balanced(build, open_else)
+    tail = build[open_else + len(eager) + 2:]
+    assert re.search(r"ggml_new_tensor_2d\s*\([^;]*GGML_TYPE_F32", storage) and "ggml_set_input(" in storage, (
+        "in STORAGE mode the PLE input is an F32 graph input")
+    for absent in ("ggml_get_rows(", "GGML_TYPE_I32"):
+        assert absent not in storage, f"the STORAGE branch builds {absent}: the table must never enter the graph"
+    assert "ggml_get_rows(" in eager and "GGML_TYPE_I32" in eager, "the resident table is gathered by its row ids"
+    assert build.count("ggml_get_rows(") == 1, "get_rows on the PLE table belongs to the resident branch alone"
+    assert "add_input(" in storage and "add_input(" in eager, "each branch must hand its input to the graph result"
+    assert "ggml_reshape_2d(" in tail, "both branches feed the one reshape, so everything downstream is unchanged"
+
+
+def test_qwen4exp_ple_input_reports_failure_and_reuses_by_its_mode():
+    cls = qwen4exp_ple_class()
+    flag = qwen4exp_ple_failed_flag()
+    assert re.search(r"\bbool\s+" + flag + r"\s*(=\s*false\s*)?;", cls), (
+        "the flag set_input_failed() returns is not a bool member of the input")
+    m = re.search(r"\bbool\s+can_reuse\s*\((?:[^()]|\([^()]*\))*\)\s*override\s*\{", cls)
+    assert m, "llm_graph_input_ple does not override can_reuse()"
+    assert re.search(r"return\s+\w+\s*!=\s*nullptr\s*\?", balanced(cls, m.end() - 1)), (
+        "can_reuse must test the input this mode built: a STORAGE graph has no row ids to read")
+
+
+def test_qwen4exp_ple_set_input_clears_its_flag_and_fails_every_early_return():
+    flag = qwen4exp_ple_failed_flag()
+    body = function_body(read_code(QWEN4EXP_CPP),
+                         r"void\s+llm_graph_input_ple::set_input\s*\((?:[^()]|\([^()]*\))*\)")
+    clear = r"\b" + flag + r"\s*=\s*false\s*;"
+    fail = r"\b" + flag + r"\s*=\s*true\s*;"
+    # a reused graph calls set_input again on the same input: the last ubatch's failure must not outlive this call
+    assert re.match(r"\s*" + clear, body), "set_input must clear its failure flag as its first statement"
+    g = re.search(r"(\w+)\s*=\s*(\w+)\s*->\s*gather\s*\(", body)
+    assert g, "set_input does not keep the result of the storage gather"
+    rc, handle = g.group(1), g.group(2)
+    resident = None
+    for m in re.finditer(r"\bif\s*\(", body):
+        got = if_block(body, m)
+        if got and re.fullmatch(r"\s*" + handle + r"\s*==\s*nullptr\s*", got[0]):
+            resident = (m.start(), got)
+            break
+    assert resident, "set_input does not dispatch on whether the table is STORAGE"
+    i_if, (_, eager, past) = resident
+    assert not re.search(r"\breturn\b", body[:i_if]), "set_input returns before either path sets its input"
+    assert "ggml_backend_tensor_set(" in eager and re.search(r"\breturn\b", eager), (
+        "the resident path sets the row ids and returns")
+    assert not re.search(fail, eager), "the resident path never reports a failure"
+    rest = body[past:]
+    i_fail = [m.start() for m in re.finditer(fail, rest)]
+    i_clear = [m.start() for m in re.finditer(clear, rest)]
+    i_ret = [m.start() for m in re.finditer(r"\breturn\b", rest)]
+    i_set = [m.start() for m in re.finditer(r"ggml_backend_tensor_set\s*\(", rest)]
+    assert i_ret, "the STORAGE path has no failure return"
+    assert len(i_fail) == 1 and i_fail[0] < min(i_ret), "the STORAGE path must set its failure flag before any return"
+    assert len(i_set) == 1 and len(i_clear) == 1 and max(i_ret) < i_set[0] < i_clear[0], (
+        "the STORAGE path clears its failure flag once, after its last return and after its input is set")
+    # rows that did not land must never be dequantized into the graph
+    gathered = re.search(r"\b" + rc + r"\s*=\s*" + handle + r"\s*->\s*gather\s*\(", rest)
+    tested = None
+    for m in re.finditer(r"\bif\s*\(", rest):
+        got = if_block(rest, m)
+        if got and re.fullmatch(r"\s*" + rc + r"\s*!=\s*0\s*", got[0]) and re.search(r"\breturn\b", got[1]):
+            tested = m.start()
+            break
+    convert = re.search(r"->\s*to_float\s*\(", rest)
+    assert gathered and tested is not None and convert, "the STORAGE path must gather, test the result, and convert"
+    assert gathered.start() < tested < convert.start() < i_set[0], (
+        "the gather's result is tested before the rows are dequantized, and they are dequantized before the input is "
+        "set")
+    refused = re.search(r"to_float\s*==\s*nullptr", rest)
+    assert refused and refused.start() < convert.start(), "a type with no f32 conversion is refused before converting"
