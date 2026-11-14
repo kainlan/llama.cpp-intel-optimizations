@@ -29,9 +29,9 @@ struct derived_commit {
 };
 
 // The rules ggml_sycl_configure_host_zones_for_plan() and the pinned pool apply: no entries, no zones; the KV zone at
-// least 64 MiB; the SCRATCH zone at least the live oneDNN scratch plus the largest copied tensor plus 32 MiB; the four zones
-// each aligned to 64 bytes and grown in whole chunks, each chunk carrying a 64-byte header; the RUNTIME pool's bytes,
-// the oneDNN scratchpad and the DMA staging pool and neither PP term, in chunks of their own.
+// least 64 MiB; the SCRATCH zone at least the live oneDNN scratch plus the largest copied tensor plus 32 MiB; the four
+// zones each aligned to 64 bytes and grown in whole chunks, each chunk carrying a 64-byte header; the RUNTIME pool's
+// bytes, the oneDNN scratchpad and the DMA staging pool and neither PP term, in chunks of their own.
 inline derived_commit derive_commit(const ggml_sycl::placement_plan & plan, size_t onednn_live, size_t chunk) {
     constexpr size_t MiB = 1024ull * 1024ull;
     derived_commit   d;

@@ -76,9 +76,10 @@
 // request, which must grow the zone by at least those bytes, the effect a hook that copied into the pinned pool has.
 //
 // Arm 4 (no device, both builders) adds a gather-only table 64x the largest tensor that the starved plan keeps on the
-// host, to an inventory with one dense weight that lifts both reference zones above their 64 MiB floor. The host STAGING and SCRATCH zones hold only copies, and the CPU reads such a table in place, so both zones and
-// the commit floor must equal those of the plan without it. Its controls: the same tensor not gather-only sizes both
-// zones as before, and a gather-only tensor the plan puts on a device (it takes a staged fill) still counts.
+// host, to an inventory with one dense weight that lifts both reference zones above their 64 MiB floor. The host
+// STAGING and SCRATCH zones hold only copies, and the CPU reads such a table in place, so both zones and the commit
+// floor must equal those of the plan without it. Its controls: the same tensor not gather-only sizes both zones as
+// before, and a gather-only tensor the plan puts on a device (it takes a staged fill) still counts.
 
 #include "../common.hpp"
 #include "../ggml-sycl-test.hpp"
