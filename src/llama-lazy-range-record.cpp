@@ -238,6 +238,31 @@ static bool llama_lazy_storage_consumer_present(enum llm_arch arch) {
     return false;
 }
 
+std::vector<llama_lazy_storage_table> llama_lazy_range_storage_tables(const llama_lazy_range_record &    record,
+                                                                      const llama_lazy_range_tensor_fn & tensor) {
+    std::vector<llama_lazy_storage_table> out;
+    for (const llama_lazy_range_row & row : record.rows()) {
+        if (row.deferral != LLAMA_LAZY_DEFERRAL_STORAGE) {
+            continue;
+        }
+        const ggml_tensor * t = tensor(row.name);
+        if (t == nullptr) {
+            GGML_ABORT("lazy-range record: STORAGE row %s has no tensor in the model file", row.name.c_str());
+        }
+        llama_lazy_storage_table s = {};
+        s.name                     = row.name;
+        s.type                     = t->type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            s.ne[d] = t->ne[d];
+        }
+        s.row_size = ggml_row_size(t->type, t->ne[0]);
+        s.value    = row.value;
+        s.attrs    = row.attrs;
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
 void llama_lazy_range_check_storage(const llama_lazy_range_record & record,
                                     enum llm_arch                   arch,
                                     const std::string &             name) {

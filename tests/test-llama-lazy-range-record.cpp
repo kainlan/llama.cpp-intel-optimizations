@@ -296,6 +296,29 @@ int main() {
               "storage_for_file is not the STORAGE ranges");
         CHECK(storage.excluded_for_file(0) == file0 && storage.excluded_for_file(1) == file1,
               "excluded_for_file is not the union");
+
+        // the backend's inventory takes each STORAGE row with its weight's type, shape and row size
+        ggml_init_params ip   = { 4 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context *   gctx = ggml_init(ip);
+        ggml_tensor *    w    = ggml_new_tensor_2d(gctx, GGML_TYPE_Q8_0, 160, 1000);
+        const auto       find = [&](const std::string &) -> const ggml_tensor * {
+            return w;
+        };
+        const std::vector<llama_lazy_storage_table> tables    = llama_lazy_range_storage_tables(storage, find);
+        size_t                                      n_storage = 0;
+        for (const llama_lazy_range_row & row : storage.rows()) {
+            n_storage += row.deferral == LLAMA_LAZY_DEFERRAL_STORAGE;
+        }
+        CHECK(n_storage > 0 && tables.size() == n_storage, "%zu tables for %zu STORAGE rows", tables.size(), n_storage);
+        for (const llama_lazy_storage_table & t : tables) {
+            const llama_lazy_range_value v = storage.value(t.name);
+            CHECK(t.type == GGML_TYPE_Q8_0 && t.ne[0] == 160 && t.ne[1] == 1000 &&
+                      t.row_size == ggml_row_size(GGML_TYPE_Q8_0, 160) && t.value.offs == v.offs &&
+                      t.value.size == v.size && t.value.file_idx == v.file_idx,
+                  "%s: a field differs from its row or tensor", t.name.c_str());
+        }
+        CHECK(llama_lazy_range_storage_tables(lazy, find).empty(), "a LAZY_READ record yields a storage table");
+        ggml_free(gctx);
     }
 
     // ---- lazy_read reads the record: add() accepts exactly the LAZY_READ rows, under every mode it holds ----

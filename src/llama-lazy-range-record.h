@@ -58,6 +58,19 @@ struct llama_lazy_range_row {
     llama_lazy_tensor_attrs  attrs;
 };
 
+// A STORAGE row as the backend's inventory needs it: the row, and the shape and type of the weight it names.
+struct llama_lazy_storage_table {
+    std::string             name;
+    enum ggml_type          type;
+    int64_t                 ne[GGML_MAX_DIMS];
+    size_t                  row_size;
+    llama_lazy_range_value  value;
+    llama_lazy_tensor_attrs attrs;
+};
+
+// Looks up the loader's tensor for a row's name.
+using llama_lazy_range_tensor_fn = std::function<const ggml_tensor *(const std::string & name)>;
+
 class llama_lazy_range_record {
   public:
     // Set the rows once. Aborts when the record is already filled: rows, the bit,
@@ -124,6 +137,11 @@ void llama_lazy_range_record_prefill(llama_lazy_range_record &        record,
                                      enum llama_lazy_mode             mode_post,
                                      bool                             taker,
                                      bool                             mmap_supported);
+
+// The record's STORAGE rows, in record order, each with its weight's type, shape and row size. A name the lookup does
+// not find aborts: a STORAGE row is a declared tensor the file carries.
+std::vector<llama_lazy_storage_table> llama_lazy_range_storage_tables(const llama_lazy_range_record &    record,
+                                                                      const llama_lazy_range_tensor_fn & tensor);
 
 // The early plan's inventory filter: true for a tensor it must not place, stage or
 // count as an ordinary weight. Only a STORAGE row; an ineligible one is the ordinary

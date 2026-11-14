@@ -36,6 +36,7 @@ set(LLAMA_CORE_SOURCES
     llama-memory-recurrent.cpp
     llama-pp-scheduler.cpp
     llama-lazy-range-record.cpp
+    llama-lazy-storage.cpp
     llama-mmap.cpp
     llama-model-loader.cpp
     llama-model-saver.cpp

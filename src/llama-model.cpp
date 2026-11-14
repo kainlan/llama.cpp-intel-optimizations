@@ -5,6 +5,7 @@
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-lazy-mode.h"
+#include "llama-lazy-storage.h"
 #include "llama-mmap.h"
 #include "llama-n-ctx-hint.h"
 #include "llama-cparams.h"
@@ -755,7 +756,26 @@ struct llama_model_sycl_early_inventory {
     llama_model_sycl_kv_layer_arrays   kv_layer_arrays;
     ggml_sycl_tensor_inventory         inventory  = {};
     size_t                             total_size = 0;
+    // the STORAGE rows the inventory's lazy tables describe; the infos point at the names the tables own
+    std::vector<llama_lazy_storage_table>  lazy_tables;
+    std::vector<ggml_sycl_lazy_table_info> lazy_infos;
 };
+
+// The STORAGE rows as the planner's lazy tables. `tables` owns the names the infos point at, so it must live as long
+// as the inventory that carries them.
+static std::vector<ggml_sycl_lazy_table_info> llama_model_sycl_lazy_table_infos(
+    const llama_model_loader &              ml,
+    std::vector<llama_lazy_storage_table> & tables) {
+    tables = llama_lazy_range_storage_tables(ml.lazy_record, [&](const std::string & name) -> const ggml_tensor * {
+        const auto it = ml.weights_map.find(name);
+        return it != ml.weights_map.end() ? it->second.tensor : nullptr;
+    });
+    std::vector<ggml_sycl_lazy_table_info> infos;
+    for (const llama_lazy_storage_table & t : tables) {
+        infos.push_back(llama_lazy_storage_table_info(t));
+    }
+    return infos;
+}
 
 // False when no weight remains for the plan.
 static bool llama_model_sycl_build_early_inventory(llama_model_loader &               ml,
@@ -795,6 +815,9 @@ static bool llama_model_sycl_build_early_inventory(llama_model_loader &         
         out.kv_layer_arrays.v_width.get(), out.kv_layer_arrays.kind.get(), out.kv_layer_arrays.idx_k_width.get(),
         out.total_size, max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock);
+    out.lazy_infos             = llama_model_sycl_lazy_table_infos(ml, out.lazy_tables);
+    inventory.lazy_tables      = out.lazy_infos.empty() ? nullptr : out.lazy_infos.data();
+    inventory.lazy_table_count = static_cast<uint32_t>(out.lazy_infos.size());
     return true;
 }
 
@@ -873,6 +896,11 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader & ml,
                                         kv_layer_arrays.idx_k_width.get(), total_size, max_pp_pipeline_weight_bytes,
                                         hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock);
+    std::vector<llama_lazy_storage_table>        lazy_tables;
+    const std::vector<ggml_sycl_lazy_table_info> lazy_infos = llama_model_sycl_lazy_table_infos(ml, lazy_tables);
+    inventory.lazy_tables                                   = lazy_infos.empty() ? nullptr : lazy_infos.data();
+    inventory.lazy_table_count                              = static_cast<uint32_t>(lazy_infos.size());
+
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, false);
 
