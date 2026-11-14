@@ -24,6 +24,7 @@
 #include "witnessed-mutex.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -315,19 +316,36 @@ struct lazy_gather_request {
     std::atomic<bool> drain{ false };
 };
 
-// A STORAGE request's ticket (§5.3): `outstanding` counts the waiters not yet delivered, so the consumer waits for 0.
+// A STORAGE request's ticket (§5.3): `outstanding` counts the waiters not yet delivered, and the consumer waits on
+// lazy_io_ticket_wait.
 // `read_error` keeps the first failed read's errno, stored before that waiter's decrement, so a consumer that sees 0
 // also sees the failure.
 struct lazy_io_ticket {
-    lazy_gather_request * request = nullptr;
-    std::atomic<int>      outstanding{ 0 };
-    std::atomic<int>      read_error{ 0 };
+    lazy_gather_request *   request = nullptr;
+    std::atomic<int>        outstanding{ 0 };
+    std::atomic<int>        read_error{ 0 };
+    // Every decrement happens under done_lock and the one that reaches 0 notifies, so a waiter that reads 0 under the
+    // same lock knows no delivery will touch the ticket again and may destroy it. A leaf: nothing is taken under it.
+    std::mutex              done_lock;
+    std::condition_variable done;
 };
+
+// Blocks, with no timeout, until every waiter submitted on `ticket` has been delivered; then returns the first errno a
+// delivery stored (a read's errno, EINVAL for a landing outside its slot, ECANCELED from shutdown), or 0. A 0 does not
+// mean every row landed: a lazy_io_submit that refused (no live ring, or a span wider than a slot) returned 0 and never
+// counted its waiter, so the caller must check each submit's return; and a cancelled or draining request, or a slot
+// whose epoch moved, delivers without copying. Call it after the last lazy_io_submit on the ticket has returned, on
+// that thread or one ordered after it; a wait that overlaps a submit can return before the later reads land. Its return
+// is the point from which the ticket, its request and its landing slots may be destroyed, on every path: no delivery
+// touches them after it. Hold no lock a pool worker takes between picking a read and picking the next (the engine's,
+// the registry's, the landing slot's, the row cache's), and never call it from a pool worker.
+int lazy_io_ticket_wait(lazy_io_ticket & ticket);
 
 // One waiter on a read (§5.2.1, §5.3): its ticket, its epoch, and where its bytes go. `src_offset` and `bytes` select
 // the waiter's bytes in the read; the landing copy goes to landing->data + landing_offset, and `row` is inserted into
 // `cache` whether or not the landing copy happens. The caller keeps the ticket, the request and the landing slot alive
-// until the ticket's count reaches 0.
+// until lazy_io_ticket_wait on the ticket has returned. A 0 read without done_lock is not enough: the delivery that
+// reaches 0 still notifies and unlocks done_lock after its decrement.
 struct lazy_io_waiter {
     lazy_io_ticket *    ticket         = nullptr;
     uint32_t            epoch          = 0;
@@ -673,6 +691,8 @@ enum class lazy_ring_mutant : uint8_t {
     POOL_STRICT_ABORT_DROPPED,       // the reap's and the drop's [HOST-PLAN-BUG] lines continue under strict leases
     DRAIN_STRICT_ABORT_DROPPED,      // the shutdown drain logs a leaked lease and continues under strict leases
     ENSURE_WITNESS_DROPPED,          // ensure runs when it is entered with a witnessed lock held
+    TICKET_WAIT_RETURNS_AT_ONCE,     // a ticket's wait returns its read_error without waiting for the count to reach 0
+    TICKET_ZERO_NO_NOTIFY,           // the delivery that takes a ticket's count to 0 does not notify its waiter
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);

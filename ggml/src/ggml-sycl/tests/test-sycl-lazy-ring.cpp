@@ -405,6 +405,10 @@ void wider_ring_intact(arm_result & r, const wider_fixture & f) {
     const size_t     added = lazy_io_submit(1, -1, { k_read_file, 0, k_span_8k }, read_key(), w);
     lazy_io_ticket * t     = ticket.get();
     const bool       done  = added == 1 && wait_for([t] { return t->outstanding.load() == 0; });
+    if (done) {
+        // Returns at once; its lock orders the ticket's free after the delivery's notify and unlock.
+        (void) lazy_io_ticket_wait(*t);
+    }
     ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
     const uint64_t end = ggml_sycl_test_lazy_ring_write_end();
     if (!done) {
