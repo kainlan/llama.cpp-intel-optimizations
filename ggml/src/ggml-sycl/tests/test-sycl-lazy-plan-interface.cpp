@@ -408,7 +408,9 @@ arm_result arm_e_stage_refuses_a_count_with_no_array() {
 // (g) storage_only crosses the boundary: arm (a)'s 64 MiB table, flagged, is STORAGE in the published plan, holding at
 // most its 66 MiB body (the ceiling's body term), and its own [PLACEMENT] line says so.
 // Engagement: arm (a) publishes the same table HOST, holding exactly the body; the log is cleared before the stage,
-// and the line matched names this table.
+// and the line matched names this table. The arm VOIDs when the host could not have held the body (the load's
+// MemAvailable reading cannot clear P3 with the body resident): an unflagged table would then fall through to
+// STORAGE too, and a dropped flag would pass every check below.
 // Mutants: the copy loop not copying storage_only (the table is HOST, its line says residency=HOST).
 arm_result arm_g_storage_only_crosses_the_boundary() {
     arm_result                arr;
@@ -427,10 +429,20 @@ arm_result arm_g_storage_only_crosses_the_boundary() {
         return arr;
     }
     log_clear();
-    if (ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
-        ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, false) != GGML_SYCL_LIFECYCLE_OK) {
+    const ggml_sycl_lifecycle_result early_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, true);
+    if (early_rc != GGML_SYCL_LIFECYCLE_OK) {
         (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
-        void_arm(arr, "a stage refused");
+        void_arm(arr, "the early stage returned " + num(early_rc));
+        return arr;
+    }
+    if (reading_too_low(arr, body)) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        return arr;
+    }
+    const ggml_sycl_lifecycle_result late_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, false);
+    if (late_rc != GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        void_arm(arr, "the late stage returned " + num(late_rc));
         return arr;
     }
     ggml_sycl_model_token model{};
