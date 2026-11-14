@@ -4,9 +4,11 @@
 // throwing allocation leaves no ensuring state behind, shut-down refuses and frees the reserver's ring, a second
 // coverage pin while the first is live joins its ring and ensures nothing (another size aborts), a worker's read
 // lands in its waiter's slot, a failed read reaches the ticket with one WARN, a read's last drop on a worker frees only
-// the ring and leaves the join of the pool's workers to the next FULL reap, and shutdown cancels the queued reads and
-// waits for the picked ones. Ensure never aborts on a refusal: under strict leases its one production caller does, and
-// test-sycl-lazy-ring scores that abort. Entered with a witnessed lock held, it aborts at its entry naming the lock.
+// the ring and leaves the join of the pool's workers to the next FULL reap, shutdown cancels the queued reads and
+// waits for the picked ones, and a ticket's wait returns only once every read submitted on it is delivered, with the
+// first errno a delivery stored. Ensure never aborts on a refusal: under strict leases its one production caller does,
+// and test-sycl-lazy-ring scores that abort. Entered with a witnessed lock held, it aborts at its entry naming the
+// lock.
 //
 // The lock witness (§3.3, §11 T5): a witnessed lock's depth table follows lock, try_lock, unlock, a unique_lock's
 // relock and a condition_variable_any wait; the reap refuses, naming it, when it is called with the registry's leaf
@@ -22,7 +24,9 @@
 //
 // The mutants are the runtime selector's (§11), one --mutant registration each, which passes only when the arm that
 // kills it prints its FAIL line. Every hold is released on an observed event, never on a timer, within a 5 s bound past
-// which the arm is VOID, which fails the binary like a FAIL.
+// which the arm is VOID, which fails the binary like a FAIL. The one exception is the ticket-wait arm, which releases
+// its reads once the wait has started and not returned for 200 ms: a wait asleep on its condition variable cannot be
+// observed without a hook in the wait itself.
 
 #include "../ggml/src/ggml-sycl/lazy-io-pool.hpp"
 #include "../ggml/src/ggml-sycl/tests/lazy-io-host-fixture.hpp"
@@ -137,17 +141,34 @@ lazy_io_key key0(uint32_t epoch, int32_t layer) {
     return { lazy_io_class::PREFETCH, epoch, layer, lazy_io_kind::TABLE_ROWS };
 }
 
-// Runs `fn` on its own thread and waits at most `seconds`: a call that does not return fails its arm instead of hanging
-// the binary, so a mutant registration still sees its own message. `fn` must own everything it touches (capture a
-// shared_ptr by value): a call that never returns is detached and outlives the arm.
-bool returns_within(std::function<int()> fn, int seconds, int & rc) {
+// Runs `fn` on its own detached thread and returns its result's future. `fn` must own everything it touches (capture a
+// shared_ptr by value): a call that never returns outlives the arm.
+std::future<int> run_detached(std::function<int()> fn) {
     auto             task = std::make_shared<std::packaged_task<int()>>(std::move(fn));
     std::future<int> done = task->get_future();
     std::thread([task] { (*task)(); }).detach();
+    return done;
+}
+
+// Runs `fn` detached and waits at most `seconds`: a call that does not return fails its arm instead of hanging the
+// binary, so a mutant registration still sees its own message.
+bool returns_within(std::function<int()> fn, int seconds, int & rc) {
+    std::future<int> done = run_detached(std::move(fn));
     if (done.wait_for(std::chrono::seconds(seconds)) != std::future_status::ready) {
         return false;
     }
     rc = done.get();
+    return true;
+}
+
+// Polls `ticket` to 0 within the hook bound, then takes its wait, which returns at once: the wait's lock orders the
+// ticket's later free after the last delivery's notify and unlock, which a 0 read alone does not. False at the bound,
+// when a worker may still deliver to the ticket.
+bool delivered(lazy_io_ticket & ticket) {
+    if (!wait_for([&ticket] { return ticket.outstanding.load() == 0; })) {
+        return false;
+    }
+    (void) lazy_io_ticket_wait(ticket);
     return true;
 }
 
@@ -413,7 +434,7 @@ arm_result arm_engine_read_lands() {
     request_fixture      f(3);
     const uint64_t       block = 3;
     const size_t         added = lazy_io_submit(1, -1, block_span(block), key0(3, 5), f.waiter(100, 1000));
-    const bool           done  = added == 1 && wait_for([&] { return f.ticket.outstanding.load() == 0; });
+    const bool           done  = added == 1 && delivered(f.ticket);
     std::vector<uint8_t> want(1000);
     for (size_t i = 0; i < want.size(); ++i) {
         want[i] = file_byte(block * LAZY_IO_BLOCK_BYTES + 100 + i);
@@ -444,7 +465,7 @@ arm_result arm_engine_read_error() {
     ggml_sycl_test_lazy_io_read_source(eio_source, &failing);
     request_fixture f(4);
     const size_t    added = lazy_io_submit(1, -1, block_span(6), key0(4, 2), f.waiter(0, 512));
-    const bool      done  = added == 1 && wait_for([&] { return f.ticket.outstanding.load() == 0; });
+    const bool      done  = added == 1 && delivered(f.ticket);
     expect(r, done, "the failing read queued " + num(added) + " waiter(s) and did not complete within 5 s");
     expect(r, done && f.ticket.read_error.load() == EIO && f.slab[0] == 0,
            "the failing read left read_error " + num(static_cast<uint64_t>(f.ticket.read_error.load())) +
@@ -478,7 +499,7 @@ arm_result arm_engine_worker_reap() {
     if (added != 1 || !g.wait_holders(1)) {
         void_arm(r, "the read was not held on a worker within 5 s (" + num(added) + " waiter(s) queued)");
         g.release();
-        wait_for([&] { return f.ticket.outstanding.load() == 0; });
+        (void) delivered(f.ticket);
         ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
         settle(lease);
         return r;
@@ -543,6 +564,9 @@ arm_result arm_engine_shutdown() {
     // Frees the picked reads that a shutdown returning without waiting, or one that never reached its hook, left held.
     g.release();
     stopper.join();
+    for (const auto & f : picked) {
+        (void) delivered(f->ticket);
+    }
     ggml_sycl_test_lazy_shutdown_hold(nullptr, nullptr);
     expect(r, bounded, "shutdown had not returned within the hook bound, want its hook to free the picked reads");
     const bool cancelled = queued.ticket.outstanding.load() == 0;
@@ -1230,7 +1254,7 @@ arm_result arm_engine_worker_drop() {
     if (added != 1 || !g.wait_holders(1)) {
         void_arm(r, "the read was not held on a worker within the hook bound (" + num(added) + " waiter(s) queued)");
         g.release();
-        wait_for([&] { return f.ticket.outstanding.load() == 0; });
+        (void) delivered(f.ticket);
         ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
         settle(lease);
         return r;
@@ -1273,8 +1297,9 @@ arm_result arm_engine_worker_drop() {
 
 // A ticket's wait returns once its three reads are delivered, every row landed and no error; a ticket with nothing
 // submitted returns at once; a failed read returns its errno. Every wait is bounded. The three reads are held on a
-// gate until the wait has been seen blocked for 200 ms, so the wait cannot pass by starting after they finished.
-// Engagement, VOID counting as failed: the three reads are held on workers before the wait starts.
+// gate until the wait has been seen started and not returned for 200 ms, so the wait cannot pass by starting after they
+// finished. Engagement, VOID counting as failed: the three reads are held on workers before the wait starts, and the
+// wait has started before the 200 ms window opens.
 // Mutants: ticket-wait-returns-at-once, under which the wait returns with the reads held, and ticket-zero-no-notify,
 // under which the wait is never woken once they are released.
 arm_result arm_ticket_wait() {
@@ -1317,14 +1342,24 @@ arm_result arm_ticket_wait() {
         void_arm(
             r, "the three reads were not held on workers within the hook bound (" + num(added) + " waiter(s) queued)");
         g.release();
-        wait_for([&] { return f->ticket.outstanding.load() == 0; });
+        (void) delivered(f->ticket);
         ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
         settle(lease);
         return r;
     }
-    auto             task = std::make_shared<std::packaged_task<int()>>([f] { return lazy_io_ticket_wait(f->ticket); });
-    std::future<int> waited = task->get_future();
-    std::thread([task] { (*task)(); }).detach();
+    auto             entered = std::make_shared<std::atomic<bool>>(false);
+    std::future<int> waited  = run_detached([f, entered] {
+        entered->store(true);
+        return lazy_io_ticket_wait(f->ticket);
+    });
+    if (!wait_for([&entered] { return entered->load(); })) {
+        void_arm(r, "the wait's thread had not started within the hook bound");
+        g.release();
+        (void) delivered(f->ticket);
+        ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+        settle(lease);
+        return r;
+    }
     expect(r, waited.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout,
            "the wait returned with 3 reads held");
     g.release();

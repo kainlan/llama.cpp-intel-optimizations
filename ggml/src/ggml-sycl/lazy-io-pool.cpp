@@ -1455,6 +1455,8 @@ bool lazy_io_deliver(const lazy_io_waiter & waiter, const uint8_t * read_bytes, 
     }
 #endif
     if (last) {
+        // Notify before the unlock: a waiter that reads 0 may destroy the ticket, this condition variable with it, as
+        // soon as it can take done_lock.
         ticket->done.notify_all();
     }
     return last;

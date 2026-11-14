@@ -316,7 +316,8 @@ struct lazy_gather_request {
     std::atomic<bool> drain{ false };
 };
 
-// A STORAGE request's ticket (§5.3): `outstanding` counts the waiters not yet delivered, so the consumer waits for 0.
+// A STORAGE request's ticket (§5.3): `outstanding` counts the waiters not yet delivered, and the consumer waits on
+// lazy_io_ticket_wait.
 // `read_error` keeps the first failed read's errno, stored before that waiter's decrement, so a consumer that sees 0
 // also sees the failure.
 struct lazy_io_ticket {
@@ -329,15 +330,20 @@ struct lazy_io_ticket {
     std::condition_variable done;
 };
 
-// Blocks until every waiter submitted on `ticket` has been delivered and returns its read_error: 0 when every row
-// landed. The caller submits all its waiters first; the count may touch 0 between two submits, which only wakes it
-// early to wait again.
+// Blocks, with no timeout, until every waiter submitted on `ticket` has been delivered; then returns the first errno a
+// delivery stored (a read's errno, EINVAL for a landing outside its slot, ECANCELED from shutdown), or 0. A 0 does not
+// mean every row landed: a cancelled or draining request, or a slot whose epoch moved, delivers without copying. Call
+// it after the last lazy_io_submit on the ticket has returned, on that thread or one ordered after it; a wait that
+// overlaps a submit can return before the later reads land. Its return is the point from which the ticket, its request
+// and its landing slots may be destroyed, on every path: no delivery touches them after it. Hold no lock a delivery
+// takes (the landing slot's, the row cache's), and never call it from a pool worker.
 int lazy_io_ticket_wait(lazy_io_ticket & ticket);
 
 // One waiter on a read (§5.2.1, §5.3): its ticket, its epoch, and where its bytes go. `src_offset` and `bytes` select
 // the waiter's bytes in the read; the landing copy goes to landing->data + landing_offset, and `row` is inserted into
 // `cache` whether or not the landing copy happens. The caller keeps the ticket, the request and the landing slot alive
-// until the ticket's count reaches 0.
+// until lazy_io_ticket_wait on the ticket has returned. A 0 read without done_lock is not enough: the delivery that
+// reaches 0 still notifies and unlocks done_lock after its decrement.
 struct lazy_io_waiter {
     lazy_io_ticket *    ticket         = nullptr;
     uint32_t            epoch          = 0;

@@ -312,10 +312,14 @@ struct held_read {
     }
 
     // Lets the read go and waits for its delivery. False when it is still outstanding at the bound: the caller then
-    // leaks the object, since a worker still holds its ticket.
+    // leaks the object, since a worker still holds its ticket. Once the count reads 0 the ticket's wait returns at
+    // once, and its lock orders the caller's free after the delivery's notify and unlock.
     bool finish() {
         g.release();
         const bool delivered = wait_for([this] { return ticket.outstanding.load() == 0; });
+        if (delivered) {
+            (void) lazy_io_ticket_wait(ticket);
+        }
         ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
         return delivered;
     }
