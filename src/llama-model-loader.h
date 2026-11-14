@@ -196,6 +196,11 @@ struct llama_model_loader {
 
     std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
 
+    // The STORAGE tables' tensors: metadata only, in no buffer, so neither a buffer allocation, the load's measure nor
+    // load_all_data ever sees them. Kept out of ctx_map for that reason, and moved to the model in load_tensors.
+    ggml_context_ptr storage_ctx;
+    ggml_tensor *    create_storage_tensor(const std::string & name, const ggml_tensor * cur);
+
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
     std::string first_tensor_moved_name;

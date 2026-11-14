@@ -2257,6 +2257,13 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    // The STORAGE tables' tensors, in no buffer and never in ctxs_bufs (memory_breakdown expects a buffer for every
+    // context there), and the handle each table is read through. The handles go with pimpl: when the model has a
+    // token, ~llama_model destroys pimpl before its unload hook runs, so every open table closes while its plan still
+    // exists; a model that never got a token never opened a table, so it has nothing to close.
+    ggml_context_ptr                                 storage_ctx;
+    std::vector<std::unique_ptr<llama_lazy_storage>> lazy_storage;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -2909,6 +2916,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // the STORAGE tables, before the measure below builds a graph: their consumer builds its F32 input from them, and
+    // the table tensor itself must never enter a graph, tensors_by_name or ctxs_bufs
+    pimpl->storage_ctx = std::move(ml.storage_ctx);
+    // Driven by the record's STORAGE rows, not by whether storage_ctx exists: a STORAGE row whose tensor was never
+    // created then aborts in llama_lazy_range_storage_tables() instead of leaving the table silently unread.
+    const std::vector<llama_lazy_storage_table> storage_tables =
+        llama_lazy_range_storage_tables(ml.lazy_record, [&](const std::string & name) -> const ggml_tensor * {
+            return pimpl->storage_ctx ? ggml_get_tensor(pimpl->storage_ctx.get(), name.c_str()) : nullptr;
+        });
+    // a load with no STORAGE table does not touch the backend registry
+    const llama_lazy_storage_procs procs =
+        storage_tables.empty() ? llama_lazy_storage_procs{} : llama_lazy_storage_sycl_procs();
+    for (const llama_lazy_storage_table & t : storage_tables) {
+        // a file loaded from an open handle has no path, and the table is read through its own O_DIRECT
+        // descriptor, which needs one
+        if (t.value.file_idx >= ml.file_paths.size() || ml.file_paths[t.value.file_idx].empty()) {
+            throw std::runtime_error(
+                format("STORAGE table %s: its file was opened from a handle and has no path "
+                       "to read the table from; load the model from a file path",
+                       t.name.c_str()));
+        }
+        pimpl->lazy_storage.push_back(std::make_unique<llama_lazy_storage>(t, ml.file_paths[t.value.file_idx], procs));
+    }
+
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     bool has_sycl_weight_buft = false;
     for (const auto & [ctx_key, _] : ml.ctx_map) {
@@ -3408,10 +3439,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     if (has_sycl_weight_buffer) {
         sycl_model_loading_guard.finish(true);
+        // the open reads the published plan by the model token, which exists only from here
+        for (auto & s : pimpl->lazy_storage) {
+            if (!s->open(sycl_model_token)) {
+                throw std::runtime_error(format("failed to open STORAGE table %s", s->name().c_str()));
+            }
+        }
     } else {
         sycl_model_loading_guard.cancel();
     }
 #endif
+    // a STORAGE table has no data in memory, so a load that could not open one has no way to read it
+    for (const auto & s : pimpl->lazy_storage) {
+        if (!s->is_open()) {
+            throw std::runtime_error(format(
+                "STORAGE table %s cannot be read: this load put no weight in a SYCL buffer, so no placement plan was "
+                "published to read the table through; let the SYCL backend hold the weights (remove any tensor "
+                "override that sends them elsewhere), or load with --lazy-mode off to read the whole table into memory",
+                s->name().c_str()));
+        }
+    }
     return true;
 }
 
@@ -3783,6 +3830,15 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
+}
+
+const llama_lazy_storage * llama_model::lazy_storage(const std::string & name) const {
+    for (const auto & s : pimpl->lazy_storage) {
+        if (s->name() == name) {
+            return s.get();
+        }
+    }
+    return nullptr;
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {

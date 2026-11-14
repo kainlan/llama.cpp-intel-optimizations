@@ -39,6 +39,8 @@ class llama_lazy_storage {
     bool open(const llama_sycl_model_token & token);
     int  gather(const int32_t * rows, size_t n, void * dst, size_t dst_bytes) const;  // 0, ENODEV unopened, or errno
 
+    bool is_open() const { return handle_ != nullptr; }
+
     const std::string & name() const { return table_.name; }
 
     ggml_type type() const { return table_.type; }

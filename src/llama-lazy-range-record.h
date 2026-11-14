@@ -138,8 +138,9 @@ void llama_lazy_range_record_prefill(llama_lazy_range_record &        record,
                                      bool                             taker,
                                      bool                             mmap_supported);
 
-// The record's STORAGE rows, in record order, each with its weight's type, shape and row size. A name the lookup does
-// not find aborts: a STORAGE row is a declared tensor the file carries.
+// The record's STORAGE rows, in record order, each with its weight's type, shape and row size. The lookup is the
+// caller's (the model file's tensors, or the tensors the loader created for its STORAGE rows), and a STORAGE row it
+// does not find aborts: every such row must have its tensor there.
 std::vector<llama_lazy_storage_table> llama_lazy_range_storage_tables(const llama_lazy_range_record &    record,
                                                                       const llama_lazy_range_tensor_fn & tensor);
 
@@ -164,3 +165,7 @@ void llama_lazy_range_check_create(const llama_lazy_range_record & record,
 void llama_lazy_range_check_storage(const llama_lazy_range_record & record,
                                     enum llm_arch                   arch,
                                     const std::string &             name);
+
+// Whether `name`'s row is STORAGE: the one question create_tensor() asks to keep the table out of every buffer. Aborts
+// on a name without a row, like the other accessors.
+bool llama_lazy_range_is_storage(const llama_lazy_range_record & record, const std::string & name);

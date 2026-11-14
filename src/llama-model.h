@@ -20,6 +20,7 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 struct llama_model;
+class llama_lazy_storage;
 
 struct llama_sycl_model_token {
     uint64_t model_id = 0;
@@ -812,6 +813,10 @@ struct llama_model {
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
     const llama_sycl_model_token & get_sycl_model_token() const { return sycl_model_token; }
+
+    // The STORAGE lazy table of that name, or null: such a table is read from its file per ubatch and has no tensor in
+    // tensors_by_name or in any buffer.
+    const llama_lazy_storage * lazy_storage(const std::string & name) const;
 
     // llama_model_params::n_ctx_hint, for the SYCL plan builders, which take the model by reference.
     uint32_t get_n_ctx_hint() const { return params.n_ctx_hint; }
