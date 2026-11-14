@@ -303,6 +303,11 @@ struct ggml_sycl_lazy_table_info {
     uint32_t       file_index;
     size_t         file_offset;
     size_t         size;
+    // Set by libllama for a table it never wants held whole on the host: the planner never places it HOST (it is
+    // STORAGE, or the plan refuses) and caps its row cache (unified-cache.cpp, placement_plan_decide_lazy_residency).
+    // The array of these is indexed by sizeof on the libggml-sycl side, so libllama and libggml-sycl must be rebuilt
+    // together.
+    bool           storage_only;
 };
 
 // llama.cpp-3aos: per-layer attention/KV kind, carried by
@@ -482,7 +487,7 @@ static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inven
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
-static_assert(sizeof(ggml_sycl_lazy_table_info) == 80, "ggml_sycl_lazy_table_info layout changed");
+static_assert(sizeof(ggml_sycl_lazy_table_info) == 88, "ggml_sycl_lazy_table_info layout changed");
 static_assert(offsetof(ggml_sycl_lazy_table_info, name) == 0, "lazy table name moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, type) == 8, "lazy table type moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, rows_per_token) == 12, "lazy table rows_per_token moved");
@@ -492,6 +497,7 @@ static_assert(offsetof(ggml_sycl_lazy_table_info, consumer_layer) == 56, "lazy t
 static_assert(offsetof(ggml_sycl_lazy_table_info, file_index) == 60, "lazy table file_index moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, file_offset) == 64, "lazy table file_offset moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, size) == 72, "lazy table size moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, storage_only) == 80, "lazy table storage_only moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "use_mmap_resolved left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "use_mlock_resolved left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 187,

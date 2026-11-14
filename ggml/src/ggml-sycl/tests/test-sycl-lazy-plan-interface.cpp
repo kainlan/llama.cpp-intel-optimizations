@@ -108,6 +108,27 @@ bool reading_too_low(arm_result & r, size_t bytes) {
     return true;
 }
 
+// The last [HOST-PLAN] lazy line's budget cannot hold `bytes` beside its zones, reserve and envelope, the fit-room term
+// of the planner's HOST test (budget - (zones + reserve + envelope) >= the table's body): the arm is VOID, since the
+// budget, not the plan, decided.
+bool fit_room_too_low(arm_result & r, size_t bytes) {
+    const std::vector<std::string> lines = log_lines_containing("[HOST-PLAN] lazy ");
+    if (lines.empty()) {
+        return false;
+    }
+    const size_t budget   = printed(lines.back(), "budget");
+    const size_t zones    = printed(lines.back(), "zones");
+    const size_t reserve  = printed(lines.back(), "reserve");
+    const size_t envelope = printed(lines.back(), "envelope");
+    if (budget == SIZE_MAX || zones == SIZE_MAX || reserve == SIZE_MAX || envelope == SIZE_MAX ||
+        budget >= zones + reserve + envelope + bytes) {
+        return false;
+    }
+    void_arm(r, "the load's host budget " + num(budget) + " cannot hold " + num(bytes) + " bytes beside zones of " +
+                    num(zones) + ", a reserve of " + num(reserve) + " and an envelope of " + num(envelope));
+    return true;
+}
+
 // (a) Through the stage: a 64 MiB table in the inventory is HOST in the early candidate, the late candidate and the
 // published plan, each holding the table's body, and the published plan leaves with the model. The table sits at
 // 4032, the unaligned offset of DeepSeek's blk.14.engram_embd, where the body's O_DIRECT window crosses one more huge
@@ -405,6 +426,64 @@ arm_result arm_e_stage_refuses_a_count_with_no_array() {
     return arr;
 }
 
+// (g) storage_only crosses the boundary: arm (a)'s 64 MiB table, flagged, is STORAGE in the published plan, holding at
+// most its 66 MiB body (the ceiling's body term), and its own [PLACEMENT] line says so.
+// Engagement: arm (a) publishes the same table HOST, holding exactly the body; the log is cleared before the stage,
+// and the line matched names this table. The arm VOIDs when the host could not have held the body: the load's
+// MemAvailable reading cannot clear P3 with the body resident, or the budget's fit room (budget less zones, reserve and
+// envelope) is short of it. An unflagged table would then fall through to STORAGE too, and a dropped flag would pass
+// every check below.
+// Mutants: the copy loop not copying storage_only (the table is HOST, its line says residency=HOST); the planner not
+// holding a storage-only cache to its ceiling (the cache takes every row, a 64 MiB slab plus a ~25 MiB index, past the
+// 66 MiB body).
+arm_result arm_g_storage_only_crosses_the_boundary() {
+    arm_result                arr;
+    loader_inventory          inv;
+    ggml_sycl_lazy_table_info table = lazy_table("blk.1.engram_embd.weight", (64 * MiB) / 34);
+    table.file_offset               = 4032;
+    table.storage_only              = true;
+    inv.inv.lazy_tables             = &table;
+    inv.inv.lazy_table_count        = 1;
+    const size_t body = host_cpu_mapped_size(lazy_table_host_body_request_bytes(table.file_offset, table.size));
+
+    const ggml_sycl_placement_envelope envelope{ inv.inv.n_ctx, inv.inv.n_ubatch, 1, -1 };
+    ggml_sycl_load_txn                 txn{};
+    if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(arr, "the load transaction did not begin");
+        return arr;
+    }
+    log_clear();
+    const ggml_sycl_lifecycle_result early_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, true);
+    if (early_rc != GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        void_arm(arr, "the early stage returned " + num(early_rc));
+        return arr;
+    }
+    if (reading_too_low(arr, body) || fit_room_too_low(arr, body)) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        return arr;
+    }
+    const ggml_sycl_lifecycle_result late_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, false);
+    if (late_rc != GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        void_arm(arr, "the late stage returned " + num(late_rc));
+        return arr;
+    }
+    ggml_sycl_model_token model{};
+    if (ggml_backend_sycl_model_load_end(txn, true, &model) != GGML_SYCL_LIFECYCLE_OK || model.model_id == 0) {
+        void_arm(arr, "the load did not end with a model token");
+        return arr;
+    }
+    const lazy_reading got = read_published(model);
+    expect(arr, got.ok && got.count == 1, "the published plan carries " + num(got.count) + " tables, want 1");
+    expect(arr, got.resident != 0 && got.resident <= body,
+           "the table holds " + num(got.resident) + ", want a cache of at most its body " + num(body));
+    expect(arr, !log_lines_containing("[PLACEMENT] lazy blk.1.engram_embd.weight residency=STORAGE").empty(),
+           "this table's [PLACEMENT] lazy line does not say STORAGE");
+    (void) ggml_backend_sycl_model_unloaded_token(model);
+    return arr;
+}
+
 // (f) The dry run refuses the same inventory with NULL_OUTPUT. It runs last: with its check dropped the intake reads
 // the null array, so the binary faults after every other arm has printed its verdict.
 // Engagement: the same call with the array present returns OK, so the result header and the host's state let the dry
@@ -473,6 +552,7 @@ int main(int argc, char ** argv) {
         { "(c) a refused plan refuses the load at the stage",          arm_c_the_stage_refuses_a_refused_plan      },
         { "(d) the late pass refuses a plan the early pass held",      arm_d_the_late_pass_refuses                 },
         { "(e) the stage refuses a lazy count with no array",          arm_e_stage_refuses_a_count_with_no_array   },
+        { "(g) storage_only crosses the boundary",                     arm_g_storage_only_crosses_the_boundary     },
         // Last: with its check dropped the dry run faults the binary.
         { "(f) the dry run refuses a lazy count with no array",        arm_f_dry_run_refuses_a_count_with_no_array },
     };
