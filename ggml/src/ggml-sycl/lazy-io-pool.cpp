@@ -1447,7 +1447,18 @@ bool lazy_io_deliver(const lazy_io_waiter & waiter, const uint8_t * read_bytes, 
     if (ticket == nullptr) {
         return false;
     }
-    return ticket->outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1;
+    std::lock_guard<std::mutex> lock(ticket->done_lock);
+    const bool                  last = ticket->outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1;
+    if (last) {
+        ticket->done.notify_all();
+    }
+    return last;
+}
+
+int lazy_io_ticket_wait(lazy_io_ticket & ticket) {
+    std::unique_lock<std::mutex> lock(ticket.done_lock);
+    ticket.done.wait(lock, [&] { return ticket.outstanding.load(std::memory_order_acquire) == 0; });
+    return ticket.read_error.load(std::memory_order_acquire);
 }
 
 // ---- the block ring and the IO engine (§3.3, §5.2) ----

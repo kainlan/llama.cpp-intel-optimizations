@@ -24,6 +24,7 @@
 #include "witnessed-mutex.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -319,10 +320,19 @@ struct lazy_gather_request {
 // `read_error` keeps the first failed read's errno, stored before that waiter's decrement, so a consumer that sees 0
 // also sees the failure.
 struct lazy_io_ticket {
-    lazy_gather_request * request = nullptr;
-    std::atomic<int>      outstanding{ 0 };
-    std::atomic<int>      read_error{ 0 };
+    lazy_gather_request *   request = nullptr;
+    std::atomic<int>        outstanding{ 0 };
+    std::atomic<int>        read_error{ 0 };
+    // Every decrement happens under done_lock and the one that reaches 0 notifies, so a waiter that reads 0 under the
+    // same lock knows no delivery will touch the ticket again and may destroy it. A leaf: nothing is taken under it.
+    std::mutex              done_lock;
+    std::condition_variable done;
 };
+
+// Blocks until every waiter submitted on `ticket` has been delivered and returns its read_error: 0 when every row
+// landed. The caller submits all its waiters first; the count may touch 0 between two submits, which only wakes it
+// early to wait again.
+int lazy_io_ticket_wait(lazy_io_ticket & ticket);
 
 // One waiter on a read (§5.2.1, §5.3): its ticket, its epoch, and where its bytes go. `src_offset` and `bytes` select
 // the waiter's bytes in the read; the landing copy goes to landing->data + landing_offset, and `row` is inserted into
