@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
-#include <exception>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -1182,15 +1181,15 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
         const int64_t n = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
-        // exactly one of the two inputs exists, the one build_inp_ple built for the table's residency
-        return emb != nullptr ? emb->ne[1] == n : rows->ne[0] == n;
+        // the handle decides the mode, as in set_input: with it build_inp_ple made only emb, without it only rows
+        return storage != nullptr ? emb->ne[1] == n : rows->ne[0] == n;
     }
 
     bool set_input_failed() const override { return failed; }
 
     ggml_tensor * rows = nullptr;  // I32 [ple_n_heads * n_tokens]; null when the table is STORAGE
     // F32 [ple_head_dim, ple_n_heads * n_tokens], only when the table is STORAGE: the rows this ubatch reads, gathered
-    // from the storage tier and dequantized on the host, in the order get_rows would produce them
+    // from the storage tier as f32 on the host, in the order get_rows would produce them
     ggml_tensor * emb  = nullptr;
 
     const llama_lazy_storage * storage = nullptr;  // the STORAGE table, or null when the table is resident
@@ -1203,8 +1202,8 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
-    std::vector<uint8_t>     raw;  // the gathered rows, in the table's type
-    std::vector<float>       deq;  // the same rows as f32
+    std::vector<uint8_t>     raw;  // the gathered rows in the table's type; unused when the table is F32
+    std::vector<float>       deq;  // the gathered rows as f32
 };
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
@@ -1277,49 +1276,18 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     // STORAGE: the rows come from the storage tier (hits from its row cache, misses read from the file and waited for
-    // here) and are converted to f32 on the host with the type's own to_float, the conversion the CPU backend's
-    // get_rows applies. The SYCL get_rows multiplies in half precision when the build has GGML_SYCL_F16, so against an
-    // eager load whose get_rows ran there the values can differ in the last bits. A failure is reported through
-    // set_input_failed(), never thrown.
+    // here) as f32, in the order of idx. A failure is reported through set_input_failed(), never thrown.
     failed = true;  // until every step below has succeeded
 
-    const ggml_type          type = storage->type();
-    const ggml_type_traits * tt   = ggml_get_type_traits(type);
-    const size_t             n    = idx.size();
-    // F32 has no to_float, and needs none: an F32 table's rows already are the values
-    if (type != GGML_TYPE_F32 && tt->to_float == nullptr) {
-        LLAMA_LOG_ERROR("%s: the PLE table's type %s has no f32 conversion\n", __func__, ggml_type_name(type));
-        return;
-    }
-    try {
-        deq.resize(n * (size_t) storage->ne0());
-        if (type != GGML_TYPE_F32) {
-            raw.resize(n * storage->row_size());
-        }
-    } catch (const std::exception & e) {
-        LLAMA_LOG_ERROR("%s: no host memory for %zu PLE rows: %s\n", __func__, n, e.what());
-        return;
-    }
     // a table that was never opened answers ENODEV and fails the ubatch: a load that finishes has opened it, so that
     // is reachable only on a model loaded without allocations, which is measured and not computed
-    if (type == GGML_TYPE_F32) {
-        // an F32 row is ne0 floats, so the rows land in the f32 scratch as they are
-        const int rc = storage->gather(idx.data(), n, deq.data(), deq.size() * sizeof(float));
-        if (rc != 0) {
-            LLAMA_LOG_ERROR("%s: reading %zu PLE rows of %s failed: %s\n", __func__, n, storage->name().c_str(),
-                            strerror(rc));
-            return;
-        }
-    } else {
-        const int rc = storage->gather(idx.data(), n, raw.data(), raw.size());
-        if (rc != 0) {
-            LLAMA_LOG_ERROR("%s: reading %zu PLE rows of %s failed: %s\n", __func__, n, storage->name().c_str(),
-                            strerror(rc));
-            return;
-        }
-        // one call over every row: a row is whole blocks (ne0 is a multiple of the block size, which the backend's
-        // open refuses otherwise), so the gathered rows are one contiguous run of blocks
-        tt->to_float(raw.data(), deq.data(), (int64_t) deq.size());
+    const int rc = storage->gather_f32(idx.data(), idx.size(), raw, deq);
+    if (rc != 0) {
+        LLAMA_LOG_ERROR(
+            "%s: reading %zu rows of the PLE table %s from storage failed: %s; "
+            "--lazy-mode off holds the table in memory instead\n",
+            __func__, idx.size(), storage->name().c_str(), strerror(rc));
+        return;
     }
     ggml_backend_tensor_set(emb, deq.data(), 0, deq.size() * sizeof(float));
     failed = false;
@@ -1391,10 +1359,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     ggml_tensor * emb = nullptr;
     if (const llama_lazy_storage * storage = model.lazy_storage(ggml_get_name(model.per_layer_tok_embd))) {
-        // the table is never resident: set_input gathers this ubatch's rows and dequantizes them on the host, so the
-        // graph takes them as an F32 input where the get_rows result was, with no table and no row ids
+        // the table is never resident: set_input gathers this ubatch's rows as f32 on the host, so the graph takes
+        // them as an F32 input where the get_rows result was, with no table and no row ids
         // (the loader's shape check made the tensor's ne0 ple_head_dim, and the handle's geometry is that tensor's)
         GGML_ASSERT(storage->ne0() == hparams.ple_head_dim);
+        // a type with no f32 form could never fill the input, so the graph is refused here rather than every ubatch
+        // failing later; the throw reaches the user as the reason the model or the context could not be made
+        if (!storage->can_gather_f32()) {
+            throw std::runtime_error(
+                format("the PLE table %s has type %s, which cannot be read from storage as f32; "
+                       "--lazy-mode off loads the table into memory",
+                       storage->name().c_str(), ggml_type_name(storage->type())));
+        }
         ple_inp->storage = storage;
         ple_inp->emb     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, storage->ne0(), n_heads * n_tokens);
         ggml_set_input(ple_inp->emb);
