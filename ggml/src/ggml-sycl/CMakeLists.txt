@@ -519,8 +519,11 @@ if (BUILD_TESTING)
             "FAIL a gather whose submit throws still waits for the reads it queued: after a submit threw, the gather "
             "returned with a submitted read still held")
         string(CONCAT _le_re_submit_throw_unwoken
-            "FAIL a gather whose submit throws still waits for the reads it queued: after a submit threw, a queued "
-            "read was never picked by a worker")
+            "FAIL a submit throwing at a later chunk wakes a worker for each read it queued: after a submit threw at "
+            "its second chunk, a read it queued was never picked by a worker")
+        string(CONCAT _le_re_submit_waiter_unreserved
+            "FAIL a gather whose submit throws still waits for the reads it queued: after a submit threw, a worker "
+            "served a read no waiter was counted on")
         set(_lazy_io_engine_mutants
             no-ensuring                       "${_le_re_no_ensuring}"
             ensuring-kept-on-throw            "${_le_re_ensuring_kept_on_throw}"
@@ -538,7 +541,8 @@ if (BUILD_TESTING)
             ticket-zero-no-notify             "${_le_re_ticket_zero_no_notify}"
             gather-returns-unwaited           "${_le_re_gather_returns_unwaited}"
             gather-error-returns-unwaited     "${_le_re_gather_error_returns_unwaited}"
-            submit-throw-unwoken              "${_le_re_submit_throw_unwoken}")
+            submit-throw-unwoken              "${_le_re_submit_throw_unwoken}"
+            submit-waiter-unreserved          "${_le_re_submit_waiter_unreserved}")
         add_executable(test-sycl-lazy-io-engine-host
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
             lazy-gather.cpp

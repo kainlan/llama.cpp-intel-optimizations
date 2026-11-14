@@ -33,8 +33,8 @@ struct lazy_gather_stats {
 //              table's, a row whose block span is wider than one IO chunk, an n_rows below 0, or a table whose end,
 //              file_offset + n_rows * row_size, does not fit a uint64_t, all refused before anything is submitted; or a
 //              row outside [0, n_rows), which stops the submitting there;
-//   EIO        the engine refused a read (no live ring, or a span wider than a slot), or a lookup threw
-//              std::system_error;
+//   EIO        the engine refused a read (no live ring, a span wider than a slot, or a span past the end of the
+//              address space), or a lookup or a submit threw std::system_error;
 //   ENOMEM     a lookup or a submit threw std::bad_alloc;
 //   ECANCELED  the backend shut down and cancelled a queued read: not a disk error;
 //   other      the first failed read's errno.

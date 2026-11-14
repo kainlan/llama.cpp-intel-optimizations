@@ -1259,7 +1259,7 @@ size_t lazy_io_queue::submit(uint64_t                  context,
             // The waiter's slot is taken before the read is visible, so the push_back below cannot throw once the read
             // is queued: a fresh read is never left queued without the waiter it was queued for.
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-            if (!lazy_ring_mutant_is(lazy_ring_mutant::SUBMIT_THROW_UNWOKEN))
+            if (!lazy_ring_mutant_is(lazy_ring_mutant::SUBMIT_WAITER_UNRESERVED))
 #endif
             {
                 fresh.read->waiters.reserve(1);

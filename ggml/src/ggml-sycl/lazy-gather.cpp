@@ -44,8 +44,10 @@ int lazy_gather_rows(lazy_row_cache *           cache,
         return EINVAL;
     }
     // A row whose block span exceeds one chunk would be queued as several reads, each with part of the row: the waiter
-    // count would no longer be one per miss, and a part cannot be inserted into the cache as the row.
-    if (src.row_size > LAZY_IO_CHUNK_BYTES - 2 * (LAZY_IO_BLOCK_BYTES - 1)) {
+    // count would no longer be one per miss, and a part cannot be inserted into the cache as the row. The widest span
+    // of a row of r bytes, starting 4095 bytes into its first block, is (r + 8190) / 4096 whole blocks, which is at
+    // most one chunk exactly when r is at most a chunk less 4095 bytes.
+    if (src.row_size > LAZY_IO_CHUNK_BYTES - (LAZY_IO_BLOCK_BYTES - 1)) {
         return EINVAL;
     }
     // The table's end, file_offset + n_rows * row_size, must fit a uint64_t, so no row's file offset can wrap.
@@ -89,11 +91,11 @@ int lazy_gather_rows(lazy_row_cache *           cache,
         }
         ++st.rows;
         uint8_t * const out = dst + i * src.row_size;
-        // A lookup's shard lock may throw std::system_error and a submit std::bad_alloc, with reads perhaps already
-        // counted on this frame: a throw stops the submitting and still waits. The wait ends, because a submit that
-        // throws has woken a worker for every read it queued and never queues a read without the waiter it was
-        // queued for, so every counted waiter is on a read some worker will pick with no further submit. Any other
-        // exception ends the process through noexcept.
+        // A lookup's shard lock, or a submit's locks, may throw std::system_error, and a submit std::bad_alloc, with
+        // reads perhaps already counted on this frame: a throw stops the submitting and still waits. The wait ends,
+        // because a submit that throws has woken a worker for every read it queued and never queues a read without
+        // the waiter it was queued for, so every counted waiter is on a read some worker will pick with no further
+        // submit. Any other exception ends the process through noexcept.
         try {
             if (cache != nullptr && cache->lookup_copy(row, out)) {
                 ++st.hits;

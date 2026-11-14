@@ -491,9 +491,10 @@ lazy_ring_ensure_status block_ring_ensure(size_t   need,
 // Queues the read of `span` for `context` at `key` with `waiter` (§5.2.1, §5.3), on the live pool's engine, and wakes a
 // worker. The read takes a lease on the pool through lazy_io_pool_join, so the pool and its ring outlive it. Returns
 // the waiters added, as lazy_io_queue::submit counts them; 0, with a WARN, when no live pool has a ring or the span is
-// longer than one slot. May throw std::bad_alloc. A throw still wakes one worker per read it queued, so every read a
-// throwing call left queued is picked with no further submit, and a fresh read's waiter slot is reserved before the
-// read is queued, so the waiter it was queued for is never the step that throws.
+// longer than one slot. May throw std::bad_alloc, or std::system_error from a lock; neither leaves a read queued
+// unwoken. A throw still wakes one worker per read it queued, so every read a throwing call left queued is picked with
+// no further submit, and a fresh read's waiter slot is reserved before the read is queued, so the waiter it was queued
+// for is never the step that throws.
 size_t lazy_io_submit(uint64_t               context,
                       int                    fd,
                       const lazy_io_span &   span,
@@ -698,7 +699,10 @@ enum class lazy_ring_mutant : uint8_t {
     TICKET_ZERO_NO_NOTIFY,           // the delivery that takes a ticket's count to 0 does not notify its waiter
     GATHER_RETURNS_UNWAITED,         // a ubatch gather returns without waiting for the reads it submitted
     GATHER_ERROR_RETURNS_UNWAITED,   // a gather whose submitting stopped early returns without waiting for its reads
-    SUBMIT_THROW_UNWOKEN,  // a fresh read reserves no waiter slot, and a throwing submit wakes no worker for its reads
+    // The two halves of a throwing submit's guarantee, each alone: the wakes, seen when a later chunk throws with an
+    // earlier chunk's read queued, and the reserve, seen as a read a worker serves with no waiter counted on it.
+    SUBMIT_THROW_UNWOKEN,      // a submit that throws wakes no worker for the reads it already queued
+    SUBMIT_WAITER_UNRESERVED,  // a fresh read reserves no waiter slot, so the push of its waiter can throw
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);

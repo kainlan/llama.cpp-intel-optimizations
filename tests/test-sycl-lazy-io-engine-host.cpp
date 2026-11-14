@@ -180,6 +180,12 @@ bool holding(gate & g, size_t n) {
     return g.holders >= n;
 }
 
+// The reads `g` has served, held or passed after its release, read under its mutex: a holder is never uncounted.
+size_t served(gate & g) {
+    std::lock_guard<std::mutex> lock(g.mutex);
+    return g.holders;
+}
+
 // Fails the read at block `*ctx` with EIO and serves every other block.
 long eio_source(void * ctx, int fd, uint8_t * dst, size_t length, uint64_t offset) {
     if (offset == *static_cast<const uint64_t *>(ctx)) {
@@ -1538,14 +1544,16 @@ struct refusal_state {
     lazy_gather_stats             s;
 };
 
-// Gathers `row` from `src` into a patterned dst of `dst_bytes`, bounded: true when the gather returned EINVAL with
-// nothing looked up or submitted and dst unchanged. `got` is what it returned, or -1 when it did not return.
-bool refused_at_entry(const std::shared_ptr<gather_state> & owner,
-                      const lazy_gather_source &            src,
-                      bool                                  with_cache,
-                      int32_t                               row,
-                      size_t                                dst_bytes,
-                      std::string &                         got) {
+// Gathers `row` from `src` into a patterned dst of `dst_bytes`, bounded: true when the gather returned `want` after
+// `want_rows` lookups, with nothing submitted and dst unchanged. `got` says what it did.
+bool gathers_nothing(const std::shared_ptr<gather_state> & owner,
+                     const lazy_gather_source &            src,
+                     bool                                  with_cache,
+                     int32_t                               row,
+                     size_t                                dst_bytes,
+                     int                                   want,
+                     uint64_t                              want_rows,
+                     std::string &                         got) {
     auto rs        = std::make_shared<refusal_state>();
     rs->owner      = owner;
     rs->src        = src;
@@ -1565,14 +1573,25 @@ bool refused_at_entry(const std::shared_ptr<gather_state> & owner,
     got = back ? std::to_string(rc) + " after " + num(rs->s.rows) + " lookup(s) and " + num(rs->s.reads) +
                      " read(s), dst " + (rs->dst == rs->before ? "unchanged" : "written") :
                  std::string("no return within 5 s");
-    return back && rc == EINVAL && rs->s.rows == 0 && rs->s.reads == 0 && rs->dst == rs->before;
+    return back && rc == want && rs->s.rows == want_rows && rs->s.reads == 0 && rs->dst == rs->before;
+}
+
+// The common case: refused EINVAL before anything is looked up.
+bool refused_at_entry(const std::shared_ptr<gather_state> & owner,
+                      const lazy_gather_source &            src,
+                      bool                                  with_cache,
+                      int32_t                               row,
+                      size_t                                dst_bytes,
+                      std::string &                         got) {
+    return gathers_nothing(owner, src, with_cache, row, dst_bytes, EINVAL, 0, got);
 }
 
 // A gather of rows 3, 40000, 3 lands each row byte-exact from the file, over a sentinel; a second gather of row 3 hits
 // the cache, submits nothing and lands the cache's copy; a row past the table is EINVAL and submits nothing; a gather
 // whose read fails returns EIO after its other reads are delivered. A cache of another row size, a row wider than one
 // IO chunk can hold, and a table whose end does not fit a uint64_t are each refused EINVAL before anything is looked up
-// or submitted, with dst unchanged. Every gather is bounded.
+// or submitted, with dst unchanged. The widest row one chunk holds is not refused at entry: it reaches the engine,
+// which refuses its span as wider than this ring's 8 KiB slot, so EIO after one lookup. Every gather is bounded.
 arm_result arm_gather_rows() {
     arm_result r;
     ring_lease lease = lazy_io_pool_take();
@@ -1629,8 +1648,13 @@ arm_result arm_gather_rows() {
         expect(r, refused_at_entry(st, other_size, true, 77777, k_gather_row, got),
                "a cache of " + num(k_gather_row) + " B rows for a table of " + num(other_size.row_size) +
                    " B rows returned " + got + ", want EINVAL, nothing looked up or read, dst unchanged");
+        lazy_gather_source widest = st->src;
+        widest.row_size           = LAZY_IO_CHUNK_BYTES - (LAZY_IO_BLOCK_BYTES - 1);
+        expect(r, gathers_nothing(st, widest, false, 0, widest.row_size, EIO, 1, got),
+               "a row of " + num(widest.row_size) + " B, whose block span fits one IO chunk, returned " + got +
+                   ", want EIO from the engine after 1 lookup, nothing read, dst unchanged");
         lazy_gather_source wide = st->src;
-        wide.row_size           = LAZY_IO_CHUNK_BYTES - 2 * (LAZY_IO_BLOCK_BYTES - 1) + 1;
+        wide.row_size           = widest.row_size + 1;
         expect(r, refused_at_entry(st, wide, false, 0, wide.row_size, got),
                "a row of " + num(wide.row_size) + " B, whose block span exceeds one IO chunk, returned " + got +
                    ", want EINVAL, nothing looked up or read, dst unchanged");
@@ -1739,10 +1763,14 @@ arm_result arm_gather_waits() {
 // countdown at k, and k grows from 1 until a countdown outlasts every allocation and the gather returns 0 with its rows
 // landed. The gated source holds every read it serves, so no read, held or queued, is delivered before the gate opens:
 // a gather that returned before then returned with a counted read undelivered, and the reads still holding a lease on
-// the pool before then are exactly the reads queued or held, every one of which must reach the gate.
+// the pool before then are exactly the reads queued or held, every one of which must reach the gate. Once the reads
+// have drained, the gate has served exactly the reads the gather counted a waiter on, since its rows sit in two blocks:
+// a read served with no waiter counted on it was queued by a submit whose waiter push threw.
 // Engagement, VOID counting as failed: some countdown throws after a counted submit.
 // Mutants: gather-error-returns-unwaited, under which the gather returns as soon as its submit throws, and
-// submit-throw-unwoken, under which a throw leaves a fresh read queued with no worker woken.
+// submit-waiter-unreserved, under which a fresh read reserves no waiter slot, so its waiter's push throws with the read
+// queued. A read left queued unwoken is seen by the two-chunk submit arm; a one-row submit queues one read, so with the
+// reserve in place it cannot throw once that read is queued.
 arm_result arm_gather_throw_waits() {
     arm_result r;
     ring_lease lease = lazy_io_pool_take();
@@ -1791,8 +1819,9 @@ arm_result arm_gather_throw_waits() {
             break;
         }
         const bool shut_return = returned(std::chrono::milliseconds(0)) || returned(std::chrono::milliseconds(200));
-        // The arm's own lease is the one lease that is not a read's; a read delivered by an earlier attempt drops its
-        // lease just after its delivery, so the count is polled.
+        // The arm's own lease is the one lease that is not a read's once the gather's submits have returned. A submit
+        // still in progress holds a join lease and a spare until it returns, and a read delivered by an earlier attempt
+        // drops its lease just after its delivery, so the count is polled.
         size_t     queued      = 0;
         const bool picked      = wait_for([&] {
             const uint64_t leases = registry().live_leases;
@@ -1810,6 +1839,17 @@ arm_result arm_gather_throw_waits() {
             // it, so its lease can outlive this arm and leave a later arm VOID. Only a defect reaches this branch.
             fail(r, "after a submit threw, a queued read was never picked by a worker: " + num(queued) +
                         " read(s) queued or held under countdown " + num(k));
+            break;
+        }
+        // Each read drops its lease after its delivery, so once only the arm's lease is left every read is served.
+        if (!wait_for([] { return registry().live_leases <= 1; })) {
+            fail(r, "after the release under countdown " + num(k) + ", " + num(registry().live_leases - 1) +
+                        " read(s) still hold a lease past the bound");
+            break;
+        }
+        if (served(g) != st->s.reads) {
+            fail(r, "after a submit threw, a worker served a read no waiter was counted on: " + num(served(g)) +
+                        " read(s) served, " + num(st->s.reads) + " counted, under countdown " + num(k));
             break;
         }
         if (rc == 0) {
@@ -1842,6 +1882,85 @@ arm_result arm_gather_throw_waits() {
     return r;
 }
 
+// A submit that throws at a later chunk of a long span still wakes a worker for each read it queued at the earlier
+// chunks. The ring's slot holds two chunks, and the arm submits a two-chunk span of its own under a countdown k on its
+// own thread, k growing from 1 until the submit no longer throws; the waiter covers bytes of the first chunk only.
+// Once the call has returned, the reads still holding a pool lease, all but the arm's own, are the reads it queued,
+// and the gated source holds each read a worker picks, so every one must reach the gate before it opens.
+// Engagement, VOID counting as failed: some countdown throws with a read queued.
+// Mutant: submit-throw-unwoken, under which the throw skips the wakes and the first chunk's read waits unpicked.
+arm_result arm_submit_throw_wakes() {
+    arm_result       r;
+    ring_lease       lease = lazy_io_pool_take();
+    constexpr size_t span  = 2 * LAZY_IO_CHUNK_BYTES;
+    constexpr size_t need  = LAZY_BLOCK_RING_QD * span;
+    if (block_ring_ensure(need, span, 0, mapped(need), k_txn) != lazy_ring_ensure_status::OK) {
+        expect(r, false, "a ring of two-chunk slots was not ensured");
+        settle(lease);
+        return r;
+    }
+    constexpr long k_most = 64;  // past every allocation one two-chunk submit makes
+    long           found  = 0;   // attempts that threw with a read queued
+    long           last   = 0;   // the countdown the search ended at
+    for (long k = 1; k <= k_most && r.result == outcome::PASS; ++k) {
+        last                 = k;
+        gate &             g = lasting_gate();
+        gate_release_guard release_on_exit{ g };
+        ggml_sycl_test_lazy_io_read_source(gated_source, &g);
+        // Freed once its waiter is delivered; a read that may still deliver to it keeps it alive.
+        request_fixture * const f     = new request_fixture(static_cast<uint32_t>(k));
+        const uint32_t          e     = static_cast<uint32_t>(k);
+        const lazy_io_span      own   = { k_file, static_cast<uint64_t>(k) * 2 * span, span };
+        bool                    threw = false;
+        size_t                  added = 0;
+        g_alloc_countdown             = k;
+        try {
+            added = lazy_io_submit(1, -1, own, key0(e, 1), f->waiter(0, 64));
+        } catch (const std::bad_alloc &) {
+            threw = true;
+        }
+        g_alloc_countdown = 0;
+        // A read delivered by an earlier attempt drops its lease just after its delivery, so the count is polled.
+        size_t     queued = 0;
+        const bool picked = wait_for([&] {
+            const uint64_t leases = registry().live_leases;
+            queued                = leases > 0 ? static_cast<size_t>(leases - 1) : 0;
+            return holding(g, queued);
+        });
+        g.release();
+        if (!picked) {
+            fail(r, "after a submit threw at its second chunk, a read it queued was never picked by a worker: " +
+                        num(queued) + " read(s) queued or held under countdown " + num(k));
+            // A fresh read's wake frees a worker that picks the stranded read too before it waits again, so the reap
+            // below settles; both fixtures stay alive, since their reads may deliver after this arm.
+            request_fixture * const wake = new request_fixture(e);
+            (void) lazy_io_submit(1, -1, { k_file, own.offset + span, k_span }, key0(e, 1), wake->waiter(0, 64));
+            break;
+        }
+        if (!delivered(f->ticket)) {
+            fail(r, "the first chunk's waiter was not delivered within the bound after the release under countdown " +
+                        num(k));
+            break;
+        }
+        delete f;
+        if (!threw) {
+            expect(r, added == 1,
+                   "the untouched two-chunk submit added " + num(added) + " waiter(s), want 1 for the first chunk");
+            break;
+        }
+        if (queued > 0) {
+            ++found;
+        }
+    }
+    if (found == 0) {
+        void_arm(r, "no countdown from 1 to " + num(last) + ", where the search stopped, threw with a read queued");
+    }
+    ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+    expect(r, settle(lease) && live_charged() == 0,
+           "after " + num(found) + " throwing attempt(s) the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
 lazy_ring_mutant mutant_named(const char * text) {
     struct entry {
         const char *     text;
@@ -1866,6 +1985,7 @@ lazy_ring_mutant mutant_named(const char * text) {
         { "gather-returns-unwaited",           lazy_ring_mutant::GATHER_RETURNS_UNWAITED       },
         { "gather-error-returns-unwaited",     lazy_ring_mutant::GATHER_ERROR_RETURNS_UNWAITED },
         { "submit-throw-unwoken",              lazy_ring_mutant::SUBMIT_THROW_UNWOKEN          },
+        { "submit-waiter-unreserved",          lazy_ring_mutant::SUBMIT_WAITER_UNRESERVED      },
     };
     for (const entry & e : table) {
         if (std::strcmp(e.text, text) == 0) {
@@ -1940,6 +2060,7 @@ int main(int argc, char ** argv) {
         { "a gather lands its rows from the row cache and the file",                    arm_gather_rows              },
         { "a gather waits for the reads it submitted",                                  arm_gather_waits             },
         { "a gather whose submit throws still waits for the reads it queued",           arm_gather_throw_waits       },
+        { "a submit throwing at a later chunk wakes a worker for each read it queued",  arm_submit_throw_wakes       },
         // Last: the shut-down flag is never cleared.
         { "ensure refuses after shut-down and frees the reserver's ring",               arm_ensure_shut_down         },
     };
