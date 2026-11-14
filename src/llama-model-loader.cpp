@@ -1927,7 +1927,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (flags & TENSOR_READ_LAZY) {
         // a STORAGE row is the SYCL storage tier's, not lazy_read's: refuse it before
         // buft_for_tensor() can make it an ordinary input-layer weight in host memory
-        llama_lazy_range_check_storage(lazy_record, tn.str());
+        llama_lazy_range_check_storage(lazy_record, get_arch(), tn.str());
 
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));

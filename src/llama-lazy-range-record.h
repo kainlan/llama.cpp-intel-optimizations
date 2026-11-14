@@ -33,6 +33,7 @@ const char * llama_lazy_deferral_name(enum llama_lazy_deferral deferral);
 struct llama_lazy_tensor_attrs {
     uint32_t rows_per_token;  // 0 = not known for this arch
     int32_t  consumer_layer;  // -1 = not known for this arch
+    bool     storage_only;    // the planner is to place it STORAGE whatever the host room (no reader yet)
 };
 
 // the table's place in its file, handed out by value
@@ -102,7 +103,7 @@ using llama_lazy_range_find_fn = std::function<bool(const std::string & name, ll
 //                   LAZY_READ when eligible and not `taker`
 //                   EAGER     otherwise
 //
-//   with the taker, mode AUTO and no STORAGE consumer in the tree, a row llama_lazy_eligible()
+//   with the taker, mode AUTO and an arch with no STORAGE consumer, a row llama_lazy_eligible()
 //   accepts is recorded ineligible and EAGER, with one WARN: the default mode must load. Mode ON
 //   is the caller asking for the storage tier by name, so it keeps the STORAGE row and the refusal.
 //
@@ -138,8 +139,10 @@ void llama_lazy_range_check_create(const llama_lazy_range_record & record,
                                    bool                            flagged);
 
 // The STORAGE refusal of create_tensor(): a TENSOR_READ_LAZY tensor whose row is
-// STORAGE belongs to the SYCL storage tier, and this tree has no consumer for it, so
+// STORAGE belongs to the SYCL storage tier, and when this arch has no STORAGE consumer
 // the load refuses it by throwing std::runtime_error naming the tensor, before
 // buft_for_tensor() can make it an ordinary input-layer weight in host memory. Silent
-// on a LAZY_READ or EAGER row; aborts on a name without a row.
-void llama_lazy_range_check_storage(const llama_lazy_range_record & record, const std::string & name);
+// on a LAZY_READ or EAGER row and on a STORAGE row of an arch with a consumer; aborts on a name without a row.
+void llama_lazy_range_check_storage(const llama_lazy_range_record & record,
+                                    enum llm_arch                   arch,
+                                    const std::string &             name);

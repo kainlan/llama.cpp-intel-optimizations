@@ -979,7 +979,7 @@ bool llama_model_sycl_header_inventory(const char *                         fnam
 #endif  // GGML_USE_SYCL || GGML_BACKEND_DL
 
 llama_lazy_tensor_attrs llama_model_lazy_tensor_attrs(llm_arch arch, const llama_hparams & hparams, const std::string & name) {
-    const llama_lazy_tensor_attrs unknown = { 0, -1 };
+    const llama_lazy_tensor_attrs unknown = { 0, -1, false };
 
     switch (arch) {
         case LLM_ARCH_QWEN4EXP:
@@ -994,12 +994,12 @@ llama_lazy_tensor_attrs llama_model_lazy_tensor_attrs(llm_arch arch, const llama
                         }
                     }
                 }
-                return { hparams.ple_n_heads, consumer_layer };
+                return { hparams.ple_n_heads, consumer_layer, true };
             }
             return unknown;
         case LLM_ARCH_GEMMA4:
             if (name == LLM_TN(arch)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str()) {
-                return { 1, 0 };
+                return { 1, 0, false };
             }
             return unknown;
         default:
