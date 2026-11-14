@@ -87,8 +87,8 @@ static llama_hparams qwen_hparams(uint32_t n_heads, uint32_t ple_layer) {
     return hp;
 }
 
-// The STORAGE rows of `record` come out of llama_lazy_range_storage_tables in record order, each carrying its row's value
-// and attributes and the type and shape of the weight `w`.
+// The STORAGE rows of `record` come out of llama_lazy_range_storage_tables in record order, each carrying its row's
+// value and attributes and the type and shape of the weight `w`.
 static void check_storage_tables(const llama_lazy_range_record & record, const ggml_tensor * w, const char * what) {
     const auto find = [&](const std::string &) -> const ggml_tensor * {
         return w;

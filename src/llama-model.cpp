@@ -748,9 +748,9 @@ static void llama_model_sycl_set_inventory_host_backing(ggml_sycl_tensor_invento
 }
 
 // The STORAGE rows an inventory's lazy tables describe, and the infos that point at them. Each info's name points into
-// tables[i].name, so the owner is never copied (a copy's infos would point into the source), and `tables` is not touched
-// once the infos are filled. It must live as long as the inventory that carries the infos. Moving it is safe: a vector
-// move keeps its elements where they are.
+// tables[i].name, so the owner is never copied (a copy's infos would point into the source), and `tables` is not
+// touched once the infos are filled. It must live as long as the inventory that carries the infos. Moving it is safe: a
+// vector move keeps its elements where they are.
 struct llama_model_sycl_lazy_tables {
     std::vector<llama_lazy_storage_table>  tables;
     std::vector<ggml_sycl_lazy_table_info> infos;
