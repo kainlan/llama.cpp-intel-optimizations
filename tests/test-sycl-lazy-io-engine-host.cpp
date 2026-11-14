@@ -5,10 +5,11 @@
 // coverage pin while the first is live joins its ring and ensures nothing (another size aborts), a worker's read
 // lands in its waiter's slot, a failed read reaches the ticket with one WARN, a read's last drop on a worker frees only
 // the ring and leaves the join of the pool's workers to the next FULL reap, shutdown cancels the queued reads and
-// waits for the picked ones, and a ticket's wait returns only once every read submitted on it is delivered, with the
-// first errno a delivery stored. Ensure never aborts on a refusal: under strict leases its one production caller does,
-// and test-sycl-lazy-ring scores that abort. Entered with a witnessed lock held, it aborts at its entry naming the
-// lock.
+// waits for the picked ones, a ticket's wait returns only once every read submitted on it is delivered, with the
+// first errno a delivery stored, and a ubatch gather lands every row byte for byte from the row cache or the file and
+// returns only after the reads it submitted are delivered, on its error paths too. Ensure never aborts on a refusal:
+// under strict leases its one production caller does, and test-sycl-lazy-ring scores that abort. Entered with a
+// witnessed lock held, it aborts at its entry naming the lock.
 //
 // The lock witness (§3.3, §11 T5): a witnessed lock's depth table follows lock, try_lock, unlock, a unique_lock's
 // relock and a condition_variable_any wait; the reap refuses, naming it, when it is called with the registry's leaf
@@ -24,11 +25,19 @@
 //
 // The mutants are the runtime selector's (§11), one --mutant registration each, which passes only when the arm that
 // kills it prints its FAIL line. Every hold is released on an observed event, never on a timer, within a 5 s bound past
-// which the arm is VOID, which fails the binary like a FAIL. The one exception is the ticket-wait arm, which releases
-// its reads once the wait has started and not returned for 200 ms: a wait asleep on its condition variable cannot be
-// observed without a hook in the wait itself.
+// which the arm is VOID, which fails the binary like a FAIL. The exceptions release their reads after a 200 ms window
+// in which the call must not return, since a wait asleep on its condition variable cannot be observed without a hook
+// in the wait itself: the ticket-wait arm once its wait's thread has started with its three reads held; the gated
+// gather arm once every read each gather submits is held, which puts that gather past its last submit; and the
+// throwing-submit arm once the gather has returned or one of its reads is held, the earliest point a throw that leaves
+// a read queued is seen.
+//
+// The throwing-submit arm replaces the global operator new for the whole binary: disarmed, it is malloc and free; on a
+// thread that armed its countdown, the countdown's last allocation throws std::bad_alloc.
 
+#include "../ggml/src/ggml-sycl/lazy-gather.hpp"
 #include "../ggml/src/ggml-sycl/lazy-io-pool.hpp"
+#include "../ggml/src/ggml-sycl/lazy-row-cache.hpp"
 #include "../ggml/src/ggml-sycl/tests/lazy-io-host-fixture.hpp"
 #include "../ggml/src/ggml-sycl/tests/lazy-io-test-util.hpp"
 #include "../ggml/src/ggml-sycl/tests/lazy-table-test-util.hpp"
@@ -47,9 +56,35 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
+
+// The throwing-submit arm's fault injection: while this thread's countdown is armed, its n-th allocation throws
+// std::bad_alloc. The replacement covers the whole binary, lazy-io-pool.cpp included; disarmed, it is malloc and free.
+namespace {
+thread_local long g_alloc_countdown = 0;  // 0: disarmed
+}  // namespace
+
+void * operator new(std::size_t bytes) {
+    if (g_alloc_countdown > 0 && --g_alloc_countdown == 0) {
+        throw std::bad_alloc();
+    }
+    void * p = std::malloc(bytes == 0 ? 1 : bytes);
+    if (p == nullptr) {
+        throw std::bad_alloc();
+    }
+    return p;
+}
+
+void operator delete(void * p) noexcept {
+    std::free(p);
+}
+
+void operator delete(void * p, std::size_t) noexcept {
+    std::free(p);
+}
 
 using namespace ggml_sycl;
 using namespace host_ledger_test_harness;
@@ -123,6 +158,32 @@ void gate_hold(void * ctx) {
 
 void gate_release(void * ctx) {
     static_cast<gate *>(ctx)->release();
+}
+
+// Releases its gate on every path out of the scope that declares it, so no arm leaves a read held.
+struct gate_release_guard {
+    gate & g;
+
+    ~gate_release_guard() { g.release(); }
+};
+
+// A gate for one gated call, never destroyed: a held read still takes the gate's mutex on its way out of hold() after
+// release() returns, so the gate must outlive every holder, and an arm that makes one gate per attempt cannot keep
+// them all static.
+gate & lasting_gate() {
+    return *new gate;
+}
+
+// Whether `g` holds at least `n` reads now, read under its mutex.
+bool holding(gate & g, size_t n) {
+    std::lock_guard<std::mutex> lock(g.mutex);
+    return g.holders >= n;
+}
+
+// The reads `g` has served, held or passed after its release, read under its mutex: a holder is never uncounted.
+size_t served(gate & g) {
+    std::lock_guard<std::mutex> lock(g.mutex);
+    return g.holders;
 }
 
 // Fails the read at block `*ctx` with EIO and serves every other block.
@@ -1322,13 +1383,8 @@ arm_result arm_ticket_wait() {
 
     // Static, so it outlives its holders: a held read still takes the gate's mutex on its way out of hold() after
     // release() returns. The guard releases it on every path out of this arm.
-    static gate g;
-
-    struct gate_release_guard {
-        gate & g;
-
-        ~gate_release_guard() { g.release(); }
-    } release_on_exit{ g };
+    static gate        g;
+    gate_release_guard release_on_exit{ g };
 
     ggml_sycl_test_lazy_io_read_source(gated_source, &g);
     auto   f     = std::make_shared<request_fixture>(2);
@@ -1386,6 +1442,525 @@ arm_result arm_ticket_wait() {
     return r;
 }
 
+// ---- the ubatch gather (STORAGE tables) ----
+
+// The gather arms' row cache, on plain memory.
+class plain_memory final : public lazy_row_cache_memory {
+  public:
+    plain_memory(uint8_t * data, size_t bytes) : lazy_row_cache_memory(data, bytes, bytes) {}
+
+    ~plain_memory() override { ::operator delete[](data(), std::align_val_t(64)); }
+};
+
+class plain_source final : public lazy_row_cache_memory_source {
+  public:
+    std::unique_ptr<lazy_row_cache_memory> allocate(size_t bytes) override {
+        uint8_t * p = static_cast<uint8_t *>(::operator new[](bytes, std::align_val_t(64)));
+        std::memset(p, 0, bytes);
+        return std::unique_ptr<lazy_row_cache_memory>(new plain_memory(p, bytes));
+    }
+};
+
+constexpr size_t   k_gather_row    = 170;     // a Q8_0 row of 160 values, the PLE table's
+constexpr uint64_t k_gather_offset = 4032;    // the table's first byte in the file, not on a block
+constexpr int64_t  k_gather_rows   = 100000;  // the table's rows
+constexpr size_t   k_gather_max    = 4;       // the most rows one gather of these arms asks for
+
+// One gather's world in one shared state: the cache, the table's place in the file, the destination and the stats. A
+// gather that never returns keeps it alive through its capture, so it cannot outlive the memory it writes.
+struct gather_state {
+    plain_source         mem;  // before the cache, which it outlives
+    lazy_row_cache_build cache;
+    lazy_gather_source   src;
+    std::vector<uint8_t> dst = std::vector<uint8_t>(k_gather_max * k_gather_row, 0);
+    lazy_gather_stats    s;
+};
+
+// A state whose cache holds 64 rows of the 100000-row table at file offset 4032; its cache is null when the build was
+// refused.
+std::shared_ptr<gather_state> make_gather_state() {
+    auto                  st = std::make_shared<gather_state>();
+    lazy_row_cache_config cfg;
+    cfg.name            = "fixture.gather";
+    cfg.row_size        = k_gather_row;
+    cfg.n_rows          = k_gather_rows;
+    cfg.cache_slots     = 64;
+    cfg.floor_slots     = 64;
+    cfg.chunk_bytes     = 64 * k_gather_row;
+    cfg.n_shards        = 1;
+    st->cache           = lazy_row_cache::build(cfg, st->mem);
+    st->src.fd          = -1;
+    st->src.file_id     = k_file;
+    st->src.file_offset = k_gather_offset;
+    st->src.row_size    = k_gather_row;
+    st->src.n_rows      = k_gather_rows;
+    return st;
+}
+
+int gather_into(gather_state & s, const std::vector<int32_t> & rows, uint32_t epoch) {
+    return lazy_gather_rows(s.cache.cache.get(), s.src, 1, epoch, 0, rows.data(), rows.size(), s.dst.data(),
+                            s.dst.size(), &s.s);
+}
+
+// The file's byte `j` of table row `row`.
+uint8_t row_byte(int64_t row, size_t j) {
+    return file_byte(k_gather_offset + static_cast<uint64_t>(row) * k_gather_row + j);
+}
+
+// Fills the destination of each row of `rows` with bytes that differ from the file's at every position, so a row the
+// gather did not copy reads as a mismatch. False when some sentinel byte equals its file byte, whose check would then
+// be blind.
+bool fill_sentinel(std::vector<uint8_t> & dst, const std::vector<int32_t> & rows) {
+    bool distinct = true;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        for (size_t j = 0; j < k_gather_row; ++j) {
+            const uint8_t want        = row_byte(rows[i], j);
+            dst[i * k_gather_row + j] = static_cast<uint8_t>(want ^ 0xA5u);
+            distinct                  = distinct && dst[i * k_gather_row + j] != want;
+        }
+    }
+    return distinct;
+}
+
+// The first index into `rows` whose destination does not hold the file's bytes, or rows.size() when every row does.
+size_t first_inexact(const std::vector<uint8_t> & dst, const std::vector<int32_t> & rows) {
+    for (size_t i = 0; i < rows.size(); ++i) {
+        for (size_t j = 0; j < k_gather_row; ++j) {
+            if (dst[i * k_gather_row + j] != row_byte(rows[i], j)) {
+                return i;
+            }
+        }
+    }
+    return rows.size();
+}
+
+// One refused gather's own state: a gather that is not refused may still be running when its arm moves on.
+struct refusal_state {
+    std::shared_ptr<gather_state> owner;  // keeps the cache alive
+    lazy_gather_source            src;
+    bool                          with_cache = false;
+    std::vector<uint8_t>          dst;
+    std::vector<uint8_t>          before;
+    lazy_gather_stats             s;
+};
+
+// Gathers `row` from `src` into a patterned dst of `dst_bytes`, bounded: true when the gather returned `want` after
+// `want_rows` lookups, with nothing submitted and dst unchanged. `got` says what it did.
+bool gathers_nothing(const std::shared_ptr<gather_state> & owner,
+                     const lazy_gather_source &            src,
+                     bool                                  with_cache,
+                     int32_t                               row,
+                     size_t                                dst_bytes,
+                     int                                   want,
+                     uint64_t                              want_rows,
+                     std::string &                         got) {
+    auto rs        = std::make_shared<refusal_state>();
+    rs->owner      = owner;
+    rs->src        = src;
+    rs->with_cache = with_cache;
+    rs->dst.resize(dst_bytes);
+    for (size_t i = 0; i < dst_bytes; ++i) {
+        rs->dst[i] = static_cast<uint8_t>(i * 7u + 1u);
+    }
+    rs->before      = rs->dst;
+    int        rc   = -1;
+    const bool back = returns_within(
+        [rs, row] {
+            return lazy_gather_rows(rs->with_cache ? rs->owner->cache.cache.get() : nullptr, rs->src, 1, 9, 0, &row, 1,
+                                    rs->dst.data(), rs->dst.size(), &rs->s);
+        },
+        5, rc);
+    got = back ? std::to_string(rc) + " after " + num(rs->s.rows) + " lookup(s) and " + num(rs->s.reads) +
+                     " read(s), dst " + (rs->dst == rs->before ? "unchanged" : "written") :
+                 std::string("no return within 5 s");
+    return back && rc == want && rs->s.rows == want_rows && rs->s.reads == 0 && rs->dst == rs->before;
+}
+
+// The common case: refused EINVAL before anything is looked up.
+bool refused_at_entry(const std::shared_ptr<gather_state> & owner,
+                      const lazy_gather_source &            src,
+                      bool                                  with_cache,
+                      int32_t                               row,
+                      size_t                                dst_bytes,
+                      std::string &                         got) {
+    return gathers_nothing(owner, src, with_cache, row, dst_bytes, EINVAL, 0, got);
+}
+
+// A gather of rows 3, 40000, 3 lands each row byte-exact from the file, over a sentinel; a second gather of row 3 hits
+// the cache, submits nothing and lands the cache's copy; a row past the table is EINVAL and submits nothing; a gather
+// whose read fails returns EIO after its other reads are delivered. A cache of another row size, a row wider than one
+// IO chunk can hold, and a table whose end does not fit a uint64_t are each refused EINVAL before anything is looked up
+// or submitted, with dst unchanged. The widest row one chunk holds is not refused at entry: it reaches the engine,
+// which refuses its span as wider than this ring's 8 KiB slot, so EIO after one lookup. Every gather is bounded.
+arm_result arm_gather_rows() {
+    arm_result r;
+    ring_lease lease = lazy_io_pool_take();
+    if (block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn) != lazy_ring_ensure_status::OK) {
+        expect(r, false, "the ring was not ensured");
+        settle(lease);
+        return r;
+    }
+    const std::shared_ptr<gather_state> st = make_gather_state();
+    if (!st->cache) {
+        void_arm(r, "the fixture's row cache was not built: " + st->cache.reason);
+        settle(lease);
+        return r;
+    }
+    ggml_sycl_test_lazy_io_read_source(fill_source, nullptr);
+    const auto gather = [&r](const std::shared_ptr<gather_state> & s, const std::vector<int32_t> & rows, uint32_t epoch,
+                             int & rc) {
+        if (!fill_sentinel(s->dst, rows)) {
+            void_arm(r, "a sentinel byte equals its file byte");
+            return false;
+        }
+        const bool done = returns_within([s, rows, epoch] { return gather_into(*s, rows, epoch); }, 5, rc);
+        expect(r, done, "a gather did not return within 5 s");
+        return done;
+    };
+
+    int                        rc    = -1;
+    const std::vector<int32_t> first = { 3, 40000, 3 };
+    if (gather(st, first, 1, rc)) {
+        const size_t bad = first_inexact(st->dst, first);
+        expect(r, rc == 0 && bad == first.size(),
+               "the gather returned " + std::to_string(rc) +
+                   (bad < first.size() ? ", and row " + num(first[bad]) + " is not the file's bytes" : ""));
+        expect(r, st->s.rows == 3 && st->s.reads >= 2,
+               "rows " + num(st->s.rows) + ", reads " + num(st->s.reads) + ", want 3 and at least 2");
+    }
+    const uint64_t hits0 = st->cache.cache->counters().hits;
+    if (gather(st, { 3 }, 2, rc)) {
+        expect(r, rc == 0 && st->s.hits == 1 && st->s.reads == 0 && first_inexact(st->dst, { 3 }) == 1,
+               "the repeated row did not hit and land: returned " + std::to_string(rc) + ", hits " + num(st->s.hits) +
+                   ", reads " + num(st->s.reads));
+        expect(r, st->cache.cache->counters().hits == hits0 + 1,
+               "the cache counted " + num(st->cache.cache->counters().hits - hits0) + " hit(s) for the repeat, want 1");
+    }
+    if (gather(st, { static_cast<int32_t>(k_gather_rows) }, 3, rc)) {
+        expect(r, rc == EINVAL && st->s.reads == 0,
+               "a row past the table returned " + std::to_string(rc) + " after " + num(st->s.reads) +
+                   " read(s), want EINVAL and none");
+    }
+    {
+        std::string        got;
+        lazy_gather_source other_size = st->src;
+        other_size.row_size           = k_gather_row - 10;
+        expect(r, refused_at_entry(st, other_size, true, 77777, k_gather_row, got),
+               "a cache of " + num(k_gather_row) + " B rows for a table of " + num(other_size.row_size) +
+                   " B rows returned " + got + ", want EINVAL, nothing looked up or read, dst unchanged");
+        lazy_gather_source widest = st->src;
+        widest.row_size           = LAZY_IO_CHUNK_BYTES - (LAZY_IO_BLOCK_BYTES - 1);
+        expect(r, gathers_nothing(st, widest, false, 0, widest.row_size, EIO, 1, got),
+               "a row of " + num(widest.row_size) + " B, whose block span fits one IO chunk, returned " + got +
+                   ", want EIO from the engine after 1 lookup, nothing read, dst unchanged");
+        lazy_gather_source wide = st->src;
+        wide.row_size           = widest.row_size + 1;
+        expect(r, refused_at_entry(st, wide, false, 0, wide.row_size, got),
+               "a row of " + num(wide.row_size) + " B, whose block span exceeds one IO chunk, returned " + got +
+                   ", want EINVAL, nothing looked up or read, dst unchanged");
+        lazy_gather_source wrapping = st->src;
+        wrapping.file_offset        = UINT64_MAX - 100 * LAZY_IO_BLOCK_BYTES;
+        expect(r, refused_at_entry(st, wrapping, false, 5000, k_gather_row, got),
+               "a table whose end wraps a uint64_t returned " + got +
+                   ", want EINVAL, nothing looked up or read, dst unchanged");
+    }
+    static uint64_t failing = (k_gather_offset + 50000ull * k_gather_row) / LAZY_IO_BLOCK_BYTES * LAZY_IO_BLOCK_BYTES;
+    ggml_sycl_test_lazy_io_read_source(eio_source, &failing);
+    if (gather(st, { 50000, 7 }, 4, rc)) {
+        expect(r, rc == EIO, "a failed read returned " + std::to_string(rc) + ", want " + std::to_string(EIO));
+    }
+    ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+    // The reads' deliveries insert into the state's cache, so the arm keeps the state until the reads have settled.
+    expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
+// A gather waits for the reads it submitted: with every read held on a gate, a gather of rows 20000, 30000, 20000,
+// 40000 has not returned 200 ms after its three blocks' reads are held, and once the gate opens it returns 0 with all
+// four rows byte-exact over a sentinel. The last row's read is submitted after the third row's lookup, so three reads
+// held proves the gather is past every submit, and the gate is still shut when the third row looks up row 20000: it
+// misses and joins the first row's read, queued or held, never hitting the cache. Nothing in the wait itself can be
+// observed without a hook there. Then a gather of rows 25000 and one past the table, which stops at the second row
+// without a throw, has not returned 200 ms after the first row's read is held, and once released returns EINVAL with
+// row 25000 byte-exact.
+// Engagement, VOID counting as failed: each gather's reads are held within the hook bound.
+// Mutants: gather-returns-unwaited, under which the first gather returns with the three reads held, and
+// gather-error-returns-unwaited, under which the stopped gather returns with its read held.
+arm_result arm_gather_waits() {
+    arm_result r;
+    ring_lease lease = lazy_io_pool_take();
+    if (block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn) != lazy_ring_ensure_status::OK) {
+        expect(r, false, "the ring was not ensured");
+        settle(lease);
+        return r;
+    }
+    const std::shared_ptr<gather_state> st   = make_gather_state();
+    const std::vector<int32_t>          rows = { 20000, 30000, 20000, 40000 };
+    if (!st->cache || !fill_sentinel(st->dst, rows)) {
+        void_arm(r, "the fixture's row cache was not built, or a sentinel byte equals its file byte");
+        settle(lease);
+        return r;
+    }
+    gate &             g = lasting_gate();
+    gate_release_guard release_on_exit{ g };
+    ggml_sycl_test_lazy_io_read_source(gated_source, &g);
+    std::future<int> gathered = run_detached([st, rows] { return gather_into(*st, rows, 1); });
+    if (!g.wait_holders(3)) {
+        void_arm(r, "the gather's three reads were not held on workers within the hook bound");
+        g.release();
+        (void) gathered.wait_for(std::chrono::seconds(5));
+        ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+        settle(lease);
+        return r;
+    }
+    expect(r, gathered.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout,
+           "the gather returned with 3 reads held");
+    g.release();
+    const bool   back = gathered.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    const int    rc   = back ? gathered.get() : -1;
+    const size_t bad  = back ? first_inexact(st->dst, rows) : 0;
+    expect(r, back && rc == 0 && bad == rows.size(),
+           !back   ? std::string("after the release the gather did not return within 5 s") :
+           rc != 0 ? "after the release the gather returned " + std::to_string(rc) + ", want 0" :
+                     "row " + num(rows[bad]) + " at index " + num(bad) + " is not the file's bytes");
+    expect(
+        r, !back || (st->s.rows == 4 && st->s.hits == 0 && st->s.reads == 4),
+        "rows " + num(st->s.rows) + ", hits " + num(st->s.hits) + ", reads " + num(st->s.reads) + ", want 4, 0 and 4");
+
+    const std::vector<int32_t> stopping = { 25000, static_cast<int32_t>(k_gather_rows) };
+    gate &                     g2       = lasting_gate();
+    gate_release_guard         release_g2_on_exit{ g2 };
+    if (back && fill_sentinel(st->dst, stopping)) {
+        ggml_sycl_test_lazy_io_read_source(gated_source, &g2);
+        std::future<int> stopped = run_detached([st, stopping] { return gather_into(*st, stopping, 2); });
+        if (g2.wait_holders(1)) {
+            expect(r, stopped.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout,
+                   "the gather that stopped at a row past the table returned with 1 read held");
+        } else {
+            void_arm(r, "the stopping gather's read was not held on a worker within the hook bound");
+        }
+        g2.release();
+        const bool back2 = stopped.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+        const int  rc2   = back2 ? stopped.get() : -1;
+        expect(r, back2 && rc2 == EINVAL,
+               back2 ? "the stopping gather returned " + std::to_string(rc2) + ", want EINVAL" :
+                       std::string("after the release the stopping gather did not return within 5 s"));
+        expect(r, !back2 || (first_inexact(st->dst, { 25000 }) == 1 && st->s.rows == 1 && st->s.reads == 1),
+               "after stopping, row 25000 is " +
+                   std::string(first_inexact(st->dst, { 25000 }) == 1 ? "exact" : "not the file's bytes") + ", rows " +
+                   num(st->s.rows) + ", reads " + num(st->s.reads) + ", want exact, 1 and 1");
+    } else if (back) {
+        void_arm(r, "a sentinel byte of the stopping gather equals its file byte");
+    }
+    ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+    expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
+// A submit that throws, at every allocation the gather makes: the gather still waits for every read it counted before
+// its frame dies, returns ENOMEM with the counted rows landed, and no read the throw left queued is stranded, since a
+// worker picks each one with no further submit. The throw is the fault injection's: the gather's thread arms its
+// countdown at k, and k grows from 1 until a countdown outlasts every allocation and the gather returns 0 with its rows
+// landed. The gated source holds every read it serves, so no read, held or queued, is delivered before the gate opens:
+// a gather that returned before then returned with a counted read undelivered, and the reads still holding a lease on
+// the pool before then are exactly the reads queued or held, every one of which must reach the gate. Once the reads
+// have drained, the gate has served exactly the reads the gather counted a waiter on, since its rows sit in two blocks:
+// a read served with no waiter counted on it was queued by a submit whose waiter push threw.
+// Engagement, VOID counting as failed: some countdown throws after a counted submit.
+// Mutants: gather-error-returns-unwaited, under which the gather returns as soon as its submit throws, and
+// submit-waiter-unreserved, under which a fresh read reserves no waiter slot, so its waiter's push throws with the read
+// queued. A read left queued unwoken is seen by the two-chunk submit arm; a one-row submit queues one read, so with the
+// reserve in place it cannot throw once that read is queued.
+arm_result arm_gather_throw_waits() {
+    arm_result r;
+    ring_lease lease = lazy_io_pool_take();
+    if (block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn) != lazy_ring_ensure_status::OK) {
+        expect(r, false, "the ring was not ensured");
+        settle(lease);
+        return r;
+    }
+    const std::shared_ptr<gather_state> st = make_gather_state();
+    if (!st->cache) {
+        void_arm(r, "the fixture's row cache was not built: " + st->cache.reason);
+        settle(lease);
+        return r;
+    }
+    // The attempts' rows: k's pair is 60000 + 300 k and 150 rows on, and the last pair must stay inside the table.
+    constexpr long k_first = 60000;
+    constexpr long k_step  = 300;
+    constexpr long k_apart = 150;
+    constexpr long k_most  = (k_gather_rows - 1 - k_apart - k_first) / k_step;
+    static_assert(k_first + k_step * k_most + k_apart < k_gather_rows, "the last attempt's rows leave the table");
+    long found = 0;  // attempts that threw after a counted submit
+    long last  = 0;  // the countdown the search ended at
+    for (long k = 1; k <= k_most && r.result == outcome::PASS; ++k) {
+        last                 = k;
+        gate &             g = lasting_gate();
+        gate_release_guard release_on_exit{ g };
+        ggml_sycl_test_lazy_io_read_source(gated_source, &g);
+        // Rows of their own each attempt, in two blocks, so neither is cached or in flight from an earlier attempt.
+        const int32_t              a    = static_cast<int32_t>(k_first + k_step * k);
+        const std::vector<int32_t> rows = { a, static_cast<int32_t>(a + k_apart) };
+        if (!fill_sentinel(st->dst, rows)) {
+            void_arm(r, "a sentinel byte equals its file byte");
+            break;
+        }
+        std::future<int> gathered = run_detached([st, rows, k] {
+            g_alloc_countdown = k;
+            const int rc      = gather_into(*st, rows, static_cast<uint32_t>(k));
+            g_alloc_countdown = 0;
+            return rc;
+        });
+        const auto       returned = [&gathered](std::chrono::milliseconds within) {
+            return gathered.wait_for(within) == std::future_status::ready;
+        };
+        if (!wait_for([&] { return returned(std::chrono::milliseconds(0)) || holding(g, 1); })) {
+            void_arm(r, "a gather under countdown " + num(k) + " neither returned nor held a read within the bound");
+            break;
+        }
+        const bool shut_return = returned(std::chrono::milliseconds(0)) || returned(std::chrono::milliseconds(200));
+        // The arm's own lease is the one lease that is not a read's once the gather's submits have returned. A submit
+        // still in progress holds a join lease and a spare until it returns, so the count is polled; the drain below
+        // clears an attempt's reads before the next attempt starts.
+        size_t     queued      = 0;
+        const bool picked      = wait_for([&] {
+            const uint64_t leases = registry().live_leases;
+            queued                = leases > 0 ? static_cast<size_t>(leases - 1) : 0;
+            return holding(g, queued);
+        });
+        g.release();
+        if (!returned(std::chrono::seconds(5))) {
+            fail(r, "after the release a gather under countdown " + num(k) + " did not return within 5 s");
+            break;
+        }
+        const int rc = gathered.get();
+        if (!picked) {
+            // The stranded read waits for the next fresh read's wake, since no held worker may exist to loop back to
+            // it, so its lease can outlive this arm and leave a later arm VOID. Only a defect reaches this branch.
+            fail(r, "after a submit threw, a queued read was never picked by a worker: " + num(queued) +
+                        " read(s) queued or held under countdown " + num(k));
+            break;
+        }
+        // Each read drops its lease after its delivery, so once only the arm's lease is left every read is served.
+        if (!wait_for([] { return registry().live_leases <= 1; })) {
+            fail(r, "after the release under countdown " + num(k) + ", " + num(registry().live_leases - 1) +
+                        " read(s) still hold a lease past the bound");
+            break;
+        }
+        if (served(g) != st->s.reads) {
+            fail(r, "after a submit threw, a worker served a read no waiter was counted on: " + num(served(g)) +
+                        " read(s) served, " + num(st->s.reads) + " counted, under countdown " + num(k));
+            break;
+        }
+        if (rc == 0) {
+            // The countdown outlasted every allocation the gather made: no throw, so every row must have landed.
+            const size_t bad = first_inexact(st->dst, rows);
+            expect(r, bad == rows.size(),
+                   "a gather under countdown " + num(k) + " returned 0, and row " +
+                       num(rows[bad < rows.size() ? bad : 0]) + " is not the file's bytes");
+            break;
+        }
+        if (rc != ENOMEM) {
+            fail(r, "a gather under countdown " + num(k) + " returned " + std::to_string(rc) + ", want ENOMEM or 0");
+            break;
+        }
+        if (st->s.reads == 0) {
+            continue;  // the throw came before any row's submit was counted
+        }
+        ++found;
+        expect(r, !shut_return, "after a submit threw, the gather returned with a submitted read still held");
+        expect(r, first_inexact(st->dst, { a }) == 1,
+               "after a submit threw under countdown " + num(k) + ", the counted row " + num(a) +
+                   " is not the file's bytes");
+    }
+    if (found == 0) {
+        void_arm(r, "no countdown from 1 to " + num(last) + ", where the search stopped, threw after a counted submit");
+    }
+    ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+    expect(r, settle(lease) && live_charged() == 0,
+           "after " + num(found) + " throwing attempt(s) the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
+// A submit that throws at a later chunk of a long span still wakes a worker for each read it queued at the earlier
+// chunks. The ring's slot holds two chunks, and the arm submits a two-chunk span of its own under a countdown k on its
+// own thread, k growing from 1 until the submit no longer throws; the waiter covers bytes of the first chunk only.
+// Once the call has returned, the reads still holding a pool lease, all but the arm's own, are the reads it queued,
+// and the gated source holds each read a worker picks, so every one must reach the gate before it opens.
+// Engagement, VOID counting as failed: some countdown throws with a read queued.
+// Mutant: submit-throw-unwoken, under which the throw skips the wakes and the first chunk's read waits unpicked.
+arm_result arm_submit_throw_wakes() {
+    arm_result       r;
+    ring_lease       lease = lazy_io_pool_take();
+    constexpr size_t span  = 2 * LAZY_IO_CHUNK_BYTES;
+    constexpr size_t need  = LAZY_BLOCK_RING_QD * span;
+    if (block_ring_ensure(need, span, 0, mapped(need), k_txn) != lazy_ring_ensure_status::OK) {
+        expect(r, false, "a ring of two-chunk slots was not ensured");
+        settle(lease);
+        return r;
+    }
+    constexpr long k_most = 64;  // past every allocation one two-chunk submit makes
+    long           found  = 0;   // attempts that threw with a read queued
+    long           last   = 0;   // the countdown the search ended at
+    for (long k = 1; k <= k_most && r.result == outcome::PASS; ++k) {
+        last                 = k;
+        gate &             g = lasting_gate();
+        gate_release_guard release_on_exit{ g };
+        ggml_sycl_test_lazy_io_read_source(gated_source, &g);
+        // Freed once its waiter is delivered; a read that may still deliver to it keeps it alive.
+        request_fixture * const f     = new request_fixture(static_cast<uint32_t>(k));
+        const uint32_t          e     = static_cast<uint32_t>(k);
+        const lazy_io_span      own   = { k_file, static_cast<uint64_t>(k) * 2 * span, span };
+        bool                    threw = false;
+        size_t                  added = 0;
+        g_alloc_countdown             = k;
+        try {
+            added = lazy_io_submit(1, -1, own, key0(e, 1), f->waiter(0, 64));
+        } catch (const std::bad_alloc &) {
+            threw = true;
+        }
+        g_alloc_countdown = 0;
+        // A read delivered by an earlier attempt drops its lease just after its delivery, so the count is polled.
+        size_t     queued = 0;
+        const bool picked = wait_for([&] {
+            const uint64_t leases = registry().live_leases;
+            queued                = leases > 0 ? static_cast<size_t>(leases - 1) : 0;
+            return holding(g, queued);
+        });
+        g.release();
+        if (!picked) {
+            fail(r, "after a submit threw at its second chunk, a read it queued was never picked by a worker: " +
+                        num(queued) + " read(s) queued or held under countdown " + num(k));
+            // A fresh read's wake frees a worker that picks the stranded read too before it waits again, so the reap
+            // below settles; both fixtures stay alive, since their reads may deliver after this arm.
+            request_fixture * const wake = new request_fixture(e);
+            (void) lazy_io_submit(1, -1, { k_file, own.offset + span, k_span }, key0(e, 1), wake->waiter(0, 64));
+            break;
+        }
+        if (!delivered(f->ticket)) {
+            fail(r, "the first chunk's waiter was not delivered within the bound after the release under countdown " +
+                        num(k));
+            break;
+        }
+        delete f;
+        if (!threw) {
+            expect(r, added == 1,
+                   "the untouched two-chunk submit added " + num(added) + " waiter(s), want 1 for the first chunk");
+            break;
+        }
+        if (queued > 0) {
+            ++found;
+        }
+    }
+    if (found == 0) {
+        void_arm(r, "no countdown from 1 to " + num(last) + ", where the search stopped, threw with a read queued");
+    }
+    ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+    expect(r, settle(lease) && live_charged() == 0,
+           "after " + num(found) + " throwing attempt(s) the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
 lazy_ring_mutant mutant_named(const char * text) {
     struct entry {
         const char *     text;
@@ -1393,20 +1968,24 @@ lazy_ring_mutant mutant_named(const char * text) {
     };
 
     static const entry table[] = {
-        { "no-ensuring",                       lazy_ring_mutant::NO_ENSURING                 },
-        { "ensuring-kept-on-throw",            lazy_ring_mutant::ENSURING_KEPT_ON_THROW      },
-        { "install-after-shut-down",           lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN     },
-        { "no-span-check",                     lazy_ring_mutant::NO_SPAN_CHECK               },
-        { "no-alignment-check",                lazy_ring_mutant::NO_ALIGNMENT_CHECK          },
-        { "shutdown-no-wait",                  lazy_ring_mutant::SHUTDOWN_NO_WAIT            },
-        { "worker-reap-destroys-pool",         lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL   },
-        { "pool-strict-abort-dropped",         lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
-        { "pool-strict-abort-dropped-refused", lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
-        { "pool-strict-abort-dropped-drop",    lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
-        { "pool-strict-abort-dropped-parked",  lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
-        { "ensure-witness-dropped",            lazy_ring_mutant::ENSURE_WITNESS_DROPPED      },
-        { "ticket-wait-returns-at-once",       lazy_ring_mutant::TICKET_WAIT_RETURNS_AT_ONCE },
-        { "ticket-zero-no-notify",             lazy_ring_mutant::TICKET_ZERO_NO_NOTIFY       },
+        { "no-ensuring",                       lazy_ring_mutant::NO_ENSURING                   },
+        { "ensuring-kept-on-throw",            lazy_ring_mutant::ENSURING_KEPT_ON_THROW        },
+        { "install-after-shut-down",           lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN       },
+        { "no-span-check",                     lazy_ring_mutant::NO_SPAN_CHECK                 },
+        { "no-alignment-check",                lazy_ring_mutant::NO_ALIGNMENT_CHECK            },
+        { "shutdown-no-wait",                  lazy_ring_mutant::SHUTDOWN_NO_WAIT              },
+        { "worker-reap-destroys-pool",         lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL     },
+        { "pool-strict-abort-dropped",         lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED     },
+        { "pool-strict-abort-dropped-refused", lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED     },
+        { "pool-strict-abort-dropped-drop",    lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED     },
+        { "pool-strict-abort-dropped-parked",  lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED     },
+        { "ensure-witness-dropped",            lazy_ring_mutant::ENSURE_WITNESS_DROPPED        },
+        { "ticket-wait-returns-at-once",       lazy_ring_mutant::TICKET_WAIT_RETURNS_AT_ONCE   },
+        { "ticket-zero-no-notify",             lazy_ring_mutant::TICKET_ZERO_NO_NOTIFY         },
+        { "gather-returns-unwaited",           lazy_ring_mutant::GATHER_RETURNS_UNWAITED       },
+        { "gather-error-returns-unwaited",     lazy_ring_mutant::GATHER_ERROR_RETURNS_UNWAITED },
+        { "submit-throw-unwoken",              lazy_ring_mutant::SUBMIT_THROW_UNWOKEN          },
+        { "submit-waiter-unreserved",          lazy_ring_mutant::SUBMIT_WAITER_UNRESERVED      },
     };
     for (const entry & e : table) {
         if (std::strcmp(e.text, text) == 0) {
@@ -1478,6 +2057,10 @@ int main(int argc, char ** argv) {
         { "a reap finding a parked pool with a lease aborts under strict leases",       arm_strict_parked            },
         { "a reap whose first step throws aborts under strict leases",                  arm_strict_failed            },
         { "a ticket's wait returns when its reads are delivered",                       arm_ticket_wait              },
+        { "a gather lands its rows from the row cache and the file",                    arm_gather_rows              },
+        { "a gather waits for the reads it submitted",                                  arm_gather_waits             },
+        { "a gather whose submit throws still waits for the reads it queued",           arm_gather_throw_waits       },
+        { "a submit throwing at a later chunk wakes a worker for each read it queued",  arm_submit_throw_wakes       },
         // Last: the shut-down flag is never cleared.
         { "ensure refuses after shut-down and frees the reserver's ring",               arm_ensure_shut_down         },
     };
