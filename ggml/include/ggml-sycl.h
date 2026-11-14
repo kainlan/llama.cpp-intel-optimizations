@@ -2303,7 +2303,12 @@ struct ggml_sycl_lazy_storage;
 // module refuses mutations, an argument is null or model.model_id is 0, no published plan exists, the plan has no such
 // table or holds it HOST, the geometry disagrees, or the materialization refuses. The table is built from the plan's
 // figures; `info` only has to agree with them. The open is a mutation, made under the module mutation guard. It throws
-// nothing in practice: a failure is a NULL. Close the table before the model's unload.
+// nothing in practice: a failure is a NULL.
+// Opens of one model and table are counted and return the same handle: a later open makes no second table and charges
+// no host bytes, and it is refused, with a WARN saying the table is already open on another file, when `file_path` is
+// not the live table's file. Each successful open needs exactly one close; the last close releases the table, and every
+// close must come before the model's unload. Gathers through any holder serialise, and the counters are the table's,
+// not the caller's.
 // Proc name: "ggml_backend_sycl_lazy_storage_open".
 GGML_BACKEND_API struct ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(
     struct ggml_sycl_model_token             model,
@@ -2337,10 +2342,11 @@ GGML_BACKEND_API int ggml_backend_sycl_lazy_storage_gather(struct ggml_sycl_lazy
 GGML_BACKEND_API void ggml_backend_sycl_lazy_storage_counters(const struct ggml_sycl_lazy_storage * storage,
                                                               uint64_t                              out[4]);
 
-// Releases the table; a null storage is a no-op. No other call on the handle, the counters included, may overlap the
-// close, and the handle is dead after it. Never refused. The module mutation guard is taken only while the module
-// admits mutations: an admitted close holds off the unload's drain, and a close arriving after admission closed runs
-// unguarded, which closing before the unload makes unreachable.
+// Drops one open of the table; a null storage is a no-op. The close that drops the last open releases the table: no
+// other call on the handle, the counters included, may overlap that close, and the handle is dead after it. Every
+// other holder's calls go on through the same handle. Never refused. The module mutation guard is taken only while the
+// module admits mutations: an admitted close holds off the unload's drain, and a close arriving after admission closed
+// runs unguarded, which closing before the unload makes unreachable.
 // Proc name: "ggml_backend_sycl_lazy_storage_close".
 GGML_BACKEND_API void ggml_backend_sycl_lazy_storage_close(struct ggml_sycl_lazy_storage * storage);
 

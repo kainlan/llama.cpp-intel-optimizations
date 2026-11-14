@@ -46,6 +46,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <typeinfo>
 #include <utility>
@@ -127637,18 +127638,35 @@ static uint64_t ggml_sycl_lazy_storage_file_id(const struct stat & st) {
     return x ^ static_cast<uint64_t>(st.st_ino);
 }
 
+// A live table's name in the registry below: model id, load transaction id, table name.
+using ggml_sycl_lazy_storage_key = std::tuple<uint64_t, uint64_t, std::string>;
+
 // The C declaration's opaque type, so it stays outside namespace ggml_sycl.
 struct ggml_sycl_lazy_storage {
     ggml_sycl::lazy_table_ref     table;
     ggml_sycl::lazy_gather_source source;
     uint64_t                      context  = 0;  // the IO engine's queue name for this table's gathers
     int32_t                       deadline = 0;  // the consumer layer
+    ggml_sycl_lazy_storage_key    key;           // its registry entry
+    size_t                        opens = 0;     // the opens not yet closed, guarded by the registry's mutex
     // One gather at a time: it guards `epoch`, and it keeps one table's gathers queued in the order they were called.
     // No IO pool worker takes it, so a gather may hold it while it waits for the workers' deliveries.
     std::mutex                    gather_lock;
     uint32_t                      epoch = 0;       // guarded by gather_lock
     std::atomic<uint64_t>         submitted{ 0 };  // waiters submitted for misses over every gather
 };
+
+// One live table per model and table name. The plan charged the table's MODEL-lifetime host bytes once, so a later
+// open shares the live table instead of materializing a second row cache. The mutex is held across a first open's
+// materialization, so two first opens cannot both build, and across the last close's release.
+static std::mutex                                                     g_lazy_storage_registry_mutex;
+static std::map<ggml_sycl_lazy_storage_key, ggml_sycl_lazy_storage *> g_lazy_storage_registry;
+
+// A table's IO-engine context: a fresh number per materialization, never the handle's address, so a later table at a
+// reused address shares no name with an earlier one, whatever the engine keeps per context. The gather is the only
+// production caller of lazy_io_submit, and the test fixtures name contexts with small literals; numbering from 2^63
+// keeps the two apart.
+static std::atomic<uint64_t> g_lazy_storage_next_context{ uint64_t{ 1 } << 63 };
 
 // C linkage from the header's declarations, like the accessors above.
 ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(ggml_sycl_model_token             model,
@@ -127709,6 +127727,27 @@ ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(ggml_sycl_model_tok
                 planned->file_offset, (int) info->type, (int) planned->type);
             return nullptr;
         }
+        // A later open shares the live table, provided it names the same file: the live table reads only its own.
+        const ggml_sycl_lazy_storage_key key(model.model_id, model.load_txn_id, planned->name);
+        std::lock_guard<std::mutex>      registry_lock(g_lazy_storage_registry_mutex);
+        const auto                       live = g_lazy_storage_registry.find(key);
+        if (live != g_lazy_storage_registry.end()) {
+            ggml_sycl_lazy_storage * shared  = live->second;
+            struct stat              path_st = {};
+            if (stat(file_path, &path_st) != 0) {
+                const int stat_err = errno;
+                GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: it is already open, and stat of %s failed (errno %d)\n",
+                              info->name, file_path, stat_err);
+                return nullptr;
+            }
+            if (ggml_sycl_lazy_storage_file_id(path_st) != shared->source.file_id) {
+                GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: it is already open on another file than %s\n",
+                              info->name, file_path);
+                return nullptr;
+            }
+            ++shared->opens;
+            return shared;
+        }
         // Every figure below is the plan's; the caller's info only had to agree with it above.
         ggml_sycl::lazy_table_desc desc;
         desc.name                = planned->name;
@@ -127740,7 +127779,8 @@ ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(ggml_sycl_model_tok
             GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: fstat failed (errno %d)\n", info->name, fstat_err);
             return nullptr;
         }
-        auto * s              = new ggml_sycl_lazy_storage;
+        // Owned here until the registry holds it, so a throwing registration releases the table.
+        std::unique_ptr<ggml_sycl_lazy_storage> s(new ggml_sycl_lazy_storage);
         s->table              = std::move(made.table);
         s->source.fd          = s->table->storage_fd();
         s->source.file_id     = ggml_sycl_lazy_storage_file_id(st);  // two descriptors on one file share reads
@@ -127749,9 +127789,12 @@ ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(ggml_sycl_model_tok
         // size is not the source's cannot fire; and the materialization refused a table whose end wraps a uint64_t.
         s->source.row_size    = planned->row_size;
         s->source.n_rows      = planned->ne[1];
-        s->context            = reinterpret_cast<uintptr_t>(s);
+        s->context            = g_lazy_storage_next_context.fetch_add(1, std::memory_order_relaxed);
         s->deadline           = planned->consumer_layer;
-        return s;
+        s->key                = key;
+        s->opens              = 1;
+        g_lazy_storage_registry.emplace(key, s.get());
+        return s.release();
     } catch (const ggml_sycl_fallback_error &) {
         throw;  // no broad handler in this backend may swallow a fallback request, though nothing here raises one
     } catch (const std::exception & e) {
@@ -127803,6 +127846,23 @@ void ggml_backend_sycl_lazy_storage_close(ggml_sycl_lazy_storage * s) {
     // only while the module admits mutations: an admitted close holds off the unload's drain until the delete is
     // done. A close arriving after admission closed runs unguarded, which closing before the unload makes unreachable.
     sycl_module_mutation_guard module_guard;
+    if (s == nullptr) {
+        return;
+    }
+    // Only the close that drops the last open releases the table. It does so under the registry's lock, so an open
+    // of the same table either shares it before this or materializes a new one after the delete.
+    std::unique_lock<std::mutex> lock(g_lazy_storage_registry_mutex, std::defer_lock);
+    try {
+        lock.lock();
+    } catch (const std::system_error &) {
+        GGML_LOG_WARN("[LAZY-STORAGE] %s: close could not take the registry lock; the table stays open\n",
+                      std::get<2>(s->key).c_str());
+        return;
+    }
+    if (--s->opens != 0) {
+        return;
+    }
+    g_lazy_storage_registry.erase(s->key);
     delete s;
 }
 
