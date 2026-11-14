@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""Source contract: the prompt's CPU island moves its rows across the device by its copy plan, not one copy per row.
+
+Host-only: reads ggml-sycl.cpp, builds nothing, loads no model and touches no device.
+
+A MUL_MAT_ID whose experts live on the host runs them on the CPU through the lambda dispatch_host_expert_groups in
+ggml_sycl_mul_mat_id (the "PP CPU island"). Every (token, slot) row reads one activation row of src1 and writes one
+result row of dst. It used to copy each row on its own in both directions: on a 2048-token prompt of a host-expert MoE
+that was millions of copies each way, almost every copy of the run. The copy plan in ggml-sycl/moe-host-island.hpp
+(tested by tests/test-sycl-moe-host-island.cpp) gathers each distinct activation row once, in runs of adjacent rows,
+and lays the results out in destination order so adjacent rows return in one copy. Rows that read the same src1 row
+share its copy: for gate and up (one src1 row per token, ne11 == 1) that is every expert of the token. The down
+projection's src1 has a row per (slot, token), so its rows share nothing and gain only from the runs.
+
+This gate holds the lambda to that plan. It is the only gate on the lambda's copies and on the order of its rows.
+Two other pins read other parts of the lambda: test-sycl-host-role-routing-source.py pins its activation block's
+allocation intent (cohort moe_pp_cpu_island_act), and test-sycl-moe-cpu-dispatch-storage-bridge-source.py pins its
+smart-handle refusal.
+
+  P0  the lambda exists exactly once;
+  P1  its body builds the plan with ggml_sycl::moe_island_plan_build( exactly once;
+  P2  its body walks island.gather and island.scatter, one loop each;
+  P3  its body has exactly two mem_copy_async( calls: the device-to-host copy of a gather run (src1 into the
+      activation block, at the run's offsets) inside the gather loop, and the host-to-device copy of a scatter run
+      (the result block into dst, at the run's offsets) inside the scatter loop. A per-row loop in either direction
+      is a third call;
+  P4  the per-row destination list scatter_dst_offsets is gone;
+  P5  the activation block is sized from the plan's distinct rows (island.n_act_rows), not from the row count;
+  P6  each CPU task reads the activation block row and writes the result block row the plan assigned to it, indexed
+      by the task loop's one row counter flat_row: act_index for the activation, out_index for the result. Nothing
+      writes flat_row but its declaration from 0 and its one `++flat_row;`;
+  P7  the plan's rows and the task loop walk the groups in the same order, since act_index and out_index are indexed
+      by position: island_rows is built, before the plan call, by one forward loop over groups and their rows, with
+      the row's (iid1, id) binding, its i11, and its src1 and dst offsets exactly as the per-row copies computed them;
+      the task loop walks groups forward and each group's rows forward by index. Between the two loops nothing
+      reorders the groups or their rows: groups appears only in its const weight-check loop and in size(), and there
+      is no sort, reverse, swap, shuffle, rotate, partition, erase, insert, pop, clear, resize, assign or assignment
+      to rows. Inside the task loop none of those appear either. The task loop has no continue, break, return or
+      goto, its row loop's body never writes ri, and `++flat_row;` is the last statement of its row loop.
+
+Checks run on comment-blanked text with whitespace collapsed, so a clang-format re-wrap moves no claim.
+
+NOT VACUOUS. --self-test runs the gate on in-memory mutants of the real source. Each mutant names the pin that must
+catch it, and is reported if it survives, if a different pin catches it, or if its anchor no longer matches exactly
+once in the lambda (NOT APPLIED). The self-test also proves that last report fires, on an anchor that cannot match.
+ctest registers it with --self-test.
+
+WHAT THIS DOES NOT PROVE. It reads text. That the plan maps rows correctly is the host test's job; that the island's
+numbers are right is the lead's correctness gate on a device.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BACKEND = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
+
+LAMBDA_MARKER = "auto dispatch_host_expert_groups = [&]"
+PLAN_CALL = "ggml_sycl::moe_island_plan_build("
+GATHER_LOOP = "for (const ggml_sycl::moe_gather_run & run : island.gather)"
+SCATTER_LOOP = "for (const ggml_sycl::moe_scatter_run & run : island.scatter)"
+GATHER_COPY = ("d2h_events.push_back(ggml_sycl::mem_copy_async(act_handle, run.dst_offset, src1_storage.handle, "
+               "run.src_offset, run.bytes, *stream));")
+SCATTER_COPY = ("h2d_events.push_back(ggml_sycl::mem_copy_async(dst_storage.handle, run.dst_offset, out_handle, "
+                "run.src_offset, run.bytes, *stream));")
+COPY_CALL = "mem_copy_async("
+ACT_SIZE = "act_req.size = island.n_act_rows * static_cast<size_t>(K) * sizeof(float);"
+TASK_ACT = "task.act_host = act_pinned + static_cast<size_t>(island.act_index[flat_row]) * static_cast<size_t>(K);"
+TASK_OUT = "task.output_host = out_pinned + static_cast<size_t>(island.out_index[flat_row]) * static_cast<size_t>(N);"
+# The plan's rows, in the groups' order: the whole loop, as squash() renders it.
+ISLAND_ROWS_LOOP = (
+    "island_rows.reserve(n_rows); for (const pp_host_expert_group & group : groups) { "
+    "for (const auto & row : group.rows) { const auto [iid1, id] = row; const int64_t i11 = id % ne11; "
+    "ggml_sycl::moe_island_row r; "
+    "r.src_offset = src1_storage.view_offset + static_cast<size_t>(i11) * nb11 + static_cast<size_t>(iid1) * nb12; "
+    "r.dst_offset = dst_storage.view_offset + static_cast<size_t>(id) * nb1 + static_cast<size_t>(iid1) * nb2; "
+    "island_rows.push_back(r); } }"
+)
+ISLAND_ROWS_PARTS = (
+    "const auto [iid1, id] = row;",
+    "const int64_t i11 = id % ne11;",
+    "r.src_offset = src1_storage.view_offset + static_cast<size_t>(i11) * nb11 + static_cast<size_t>(iid1) * nb12;",
+    "r.dst_offset = dst_storage.view_offset + static_cast<size_t>(id) * nb1 + static_cast<size_t>(iid1) * nb2;",
+    "island_rows.push_back(",
+)
+TASK_LOOP = "for (pp_host_expert_group & group : groups) {"
+TASK_ROWS_LOOP = "for (size_t ri = 0; ri < group.rows.size(); ++ri) {"
+# The only loop over groups allowed between the two: it checks each group's weight and cannot reorder anything.
+GROUPS_READ_LOOP = "for (const pp_host_expert_group & group : groups) {"
+# What could reorder, shorten or refill the groups or a group's rows. Checked between the two loops and inside the task
+# loop: the plan indexes rows by their position at plan time, so neither may move or drop one.
+REORDER_RE = re.compile(
+    r"\bstd::(?:sort|stable_sort|reverse|swap|shuffle|rotate|partition|stable_partition)\b"
+    r"|\.(?:erase|insert|swap|pop_back|pop_front|clear|resize|assign)\(|\brows\s*=(?!=)"
+)
+
+
+def writes_to(name: str, code: str) -> list[str]:
+    """Every write to the variable `name`: ++/-- on either side, plain or compound assignment."""
+    return re.findall(r"(?:\+\+|--)\s*\b" + name + r"\b|\b" + name + r"\b\s*(?:\+\+|--|(?:[-+*/%&|^]|<<|>>)?=(?!=))",
+                      code)
+
+
+def code_only(text: str) -> str:
+    """String literals blanked, so a message's text cannot satisfy or trip a check on code."""
+    return re.sub(r"\"(?:\\.|[^\"\\])*\"", '""', text)
+
+
+class ContractError(AssertionError):
+    pass
+
+
+class MutantNotApplied(Exception):
+    pass
+
+
+def blank_comments(src: str) -> str:
+    """Replace // and /* */ comment bodies with spaces, preserving offsets and newlines. String literals are kept."""
+    out = []
+    i = 0
+    n = len(src)
+    while i < n:
+        two = src[i : i + 2]
+        if two == "//":
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        elif two == "/*":
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("".join("\n" if c == "\n" else " " for c in src[i:j]))
+            i = j
+        elif src[i] == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                if src[j] == "\\":
+                    j += 1
+                j += 1
+            out.append(src[i : j + 1])
+            i = j + 1
+        else:
+            out.append(src[i])
+            i += 1
+    return "".join(out)
+
+
+def brace_block_from(src: str, start: int) -> str:
+    """The `{ ... }` block whose opening brace is the first `{` at or after `start`; string literals are skipped."""
+    open_at = src.find("{", start)
+    if open_at < 0:
+        raise ContractError("FAIL: expected a brace block and found none")
+    depth = 0
+    k = open_at
+    n = len(src)
+    while k < n:
+        c = src[k]
+        if c == '"':
+            k += 1
+            while k < n and src[k] != '"':
+                k += 2 if src[k] == "\\" else 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return src[open_at : k + 1]
+        k += 1
+    raise ContractError("FAIL: brace block is unbalanced")
+
+
+def squash(text: str) -> str:
+    """Collapse whitespace, and drop it inside parentheses' edges so a wrapped call reads like an unwrapped one."""
+    t = re.sub(r"\s+", " ", text)
+    t = re.sub(r"\( ", "(", t)
+    return re.sub(r" \)", ")", t)
+
+
+def lambda_body(backend_src: str) -> str:
+    code = blank_comments(backend_src)
+    n_markers = code.count(LAMBDA_MARKER)
+    if n_markers != 1:
+        raise ContractError(f"FAIL [pin P0]: `{LAMBDA_MARKER}` appears {n_markers} times in ggml-sycl.cpp, not once")
+    return squash(brace_block_from(code, code.find(LAMBDA_MARKER)))
+
+
+def loop_block(body: str, header: str, pin: str) -> str:
+    at = body.find(header)
+    if at < 0 or body.count(header) != 1:
+        raise ContractError(f"FAIL [pin {pin}]: the island does not walk its plan with exactly one `{header}`")
+    return brace_block_from(body, at + len(header))
+
+
+def check(backend_src: str) -> None:
+    body = lambda_body(backend_src)
+
+    n_plans = body.count(PLAN_CALL)
+    if n_plans != 1:
+        raise ContractError(f"FAIL [pin P1]: the island builds its copy plan {n_plans} times, not once ({PLAN_CALL})")
+
+    gather = loop_block(body, GATHER_LOOP, "P2")
+    scatter = loop_block(body, SCATTER_LOOP, "P2")
+
+    n_copies = body.count(COPY_CALL)
+    if n_copies != 2:
+        raise ContractError(
+            f"FAIL [pin P3]: the island issues {n_copies} mem_copy_async calls, not two (one per gather run, one per "
+            "scatter run): a per-row copy loop is back"
+        )
+    if gather.count(COPY_CALL) != 1 or GATHER_COPY not in gather:
+        raise ContractError(f"FAIL [pin P3]: the gather loop does not copy each run with `{GATHER_COPY}`")
+    if scatter.count(COPY_CALL) != 1 or SCATTER_COPY not in scatter:
+        raise ContractError(f"FAIL [pin P3]: the scatter loop does not copy each run with `{SCATTER_COPY}`")
+
+    if re.search(r"\bscatter_dst_offsets\b", body):
+        raise ContractError("FAIL [pin P4]: the per-row destination list scatter_dst_offsets is back in the island")
+
+    if body.count("act_req.size =") != 1 or ACT_SIZE not in body:
+        raise ContractError(f"FAIL [pin P5]: the activation block is not sized once as `{ACT_SIZE}`")
+
+    if body.count(TASK_ACT) != 1 or body.count(TASK_OUT) != 1:
+        raise ContractError(
+            "FAIL [pin P6]: a CPU task does not read and write the block rows the plan assigned to it "
+            f"(`{TASK_ACT}` and `{TASK_OUT}`, once each)"
+        )
+    if len(re.findall(r"\bsize_t flat_row = 0;", body)) != 1 or len(re.findall(r"\+\+flat_row;", body)) != 1:
+        raise ContractError(
+            "FAIL [pin P6]: flat_row is not the task loop's one row counter (declared once from 0, advanced once)"
+        )
+    # Any other write (a compound assignment, a decrement, a reassignment) would make flat_row skip or revisit rows.
+    flat_row_writes = writes_to("flat_row", code_only(body))
+    if sorted(w.replace(" ", "") for w in flat_row_writes) != ["++flat_row", "flat_row="]:
+        raise ContractError(
+            "FAIL [pin P6]: flat_row is written other than by its declaration and its one `++flat_row;` "
+            f"({', '.join(flat_row_writes)})"
+        )
+
+    rows_at = body.find(ISLAND_ROWS_LOOP)
+    if body.count(ISLAND_ROWS_LOOP) != 1 or any(body.count(part) != 1 for part in ISLAND_ROWS_PARTS):
+        raise ContractError(
+            "FAIL [pin P7]: island_rows is not built once by a forward loop over groups and their rows with the "
+            f"per-row binding and offsets, each once: `{ISLAND_ROWS_LOOP}`"
+        )
+    if rows_at > body.find(PLAN_CALL):
+        raise ContractError("FAIL [pin P7]: island_rows is built after the plan call")
+    task_at = body.find(TASK_LOOP)
+    if (body.count(TASK_LOOP) != 1 or body.count(TASK_ROWS_LOOP) != 1
+            or TASK_ROWS_LOOP not in brace_block_from(body, task_at)):
+        raise ContractError(
+            f"FAIL [pin P7]: the task loop does not walk groups forward (`{TASK_LOOP}`) and each group's rows forward "
+            f"by index (`{TASK_ROWS_LOOP}`), once each, so its flat_row may not be the plan's row"
+        )
+
+    # Between the two loops nothing may reorder the groups or their rows. String literals are blanked so an abort's
+    # message cannot satisfy or trip this.
+    between = code_only(body[rows_at + len(ISLAND_ROWS_LOOP):task_at])
+    rest = between.replace(GROUPS_READ_LOOP, "").replace("groups.size()", "")
+    reorder = REORDER_RE.search(between)
+    if re.search(r"\bgroups\b", rest) or reorder:
+        what = reorder.group(0) if reorder else "a use of groups other than its const weight-check loop and size()"
+        raise ContractError(
+            f"FAIL [pin P7]: between the island_rows loop and the task loop the groups or their rows may be reordered "
+            f"({what.strip()}), so the task loop's flat_row may not be the plan's row"
+        )
+
+    # The task loop visits every row, and advances flat_row as the last statement of each.
+    task_block = brace_block_from(body, task_at)
+    rows_block = brace_block_from(task_block, task_block.find(TASK_ROWS_LOOP))
+    if re.search(r"\b(continue|break|return|goto)\b", code_only(task_block)) or not rows_block.endswith("++flat_row; }"):
+        raise ContractError(
+            "FAIL [pin P7]: the task loop can leave a row without advancing flat_row (a continue, break, return or "
+            "goto, or `++flat_row;` not the last statement of the row loop)"
+        )
+    # Inside the task loop the groups and their rows must stay as the plan saw them, and the row loop's index is
+    # advanced only by its header, or a row would be skipped while flat_row still counts it.
+    task_reorder = REORDER_RE.search(code_only(task_block))
+    ri_writes = writes_to("ri", code_only(rows_block))
+    if task_reorder or ri_writes:
+        what = task_reorder.group(0) if task_reorder else ", ".join(ri_writes)
+        raise ContractError(
+            f"FAIL [pin P7]: the task loop moves, drops or skips rows ({what.strip()}), so its flat_row may not be the "
+            "plan's row"
+        )
+
+
+def self_test(backend_src: str) -> int:
+    failures: list[str] = []
+    n_mutants = 0
+    # Mutants land in the lambda's raw text. Blanking comments preserves offsets, so the block found on the blanked
+    # text spans the same characters of the raw text.
+    code = blank_comments(backend_src)
+    lam_at = code.find(LAMBDA_MARKER)
+    if lam_at < 0:
+        print("  self-test: lambda marker not found; cannot place mutants")
+        return 1
+    lam_end = code.find("{", lam_at) + len(brace_block_from(code, lam_at))
+
+    def sub(old: str, new: str, after: str | None = None) -> str:
+        """Replace `old` with `new` in the raw text of the lambda. `old` must occur exactly once there, or exactly once
+        after the lambda's one `after` when that is given."""
+        start = lam_at
+        if after is not None:
+            region = backend_src[lam_at:lam_end]
+            if region.count(after) != 1:
+                raise MutantNotApplied(f"`after` matches {region.count(after)} times in the lambda: {after[:70]!r}")
+            start = lam_at + region.find(after)
+        region = backend_src[start:lam_end]
+        if region.count(old) != 1:
+            raise MutantNotApplied(f"anchor matches {region.count(old)} times in the lambda: {old[:70]!r}")
+        return backend_src[:start] + region.replace(old, new, 1) + backend_src[lam_end:]
+
+    def expect_fail(name: str, pin: str, old: str, new: str, after: str | None = None) -> None:
+        nonlocal n_mutants
+        n_mutants += 1
+        try:
+            mutated = sub(old, new, after)
+        except MutantNotApplied as e:
+            failures.append(f"{name}: NOT APPLIED ({e})")
+            print(f"  mutant {name}: NOT APPLIED ({e})")
+            return
+        try:
+            check(mutated)
+        except ContractError as e:
+            if f"[pin {pin}]" not in str(e):
+                failures.append(f"{name}: caught, but not by pin {pin}: {str(e)[:120]}")
+                print(f"  mutant {name}: caught by the WRONG pin ({str(e)[:90]}...)")
+                return
+            print(f"  mutant {name}: caught (pin {pin})")
+            return
+        failures.append(f"{name}: survived")
+        print(f"  mutant {name}: SURVIVED")
+
+    plan_call = "ggml_sycl::moe_island_plan_build(island_rows,"
+    gather_copy = "d2h_events.push_back(ggml_sycl::mem_copy_async(act_handle, run.dst_offset, src1_storage.handle,"
+    scatter_copy = "h2d_events.push_back(ggml_sycl::mem_copy_async(dst_storage.handle, run.dst_offset, out_handle,"
+    gather_wait = "sycl::event::wait(d2h_events);"
+    scatter_wait = "sycl::event::wait(h2d_events);"
+    per_row_d2h = ("for (size_t ri = 0; ri < n_rows; ++ri) { d2h_events.push_back(ggml_sycl::mem_copy_async(act_handle, "
+                   "ri * static_cast<size_t>(K) * sizeof(float), src1_storage.handle, ri * nb12, "
+                   "static_cast<size_t>(K) * sizeof(float), *stream)); } ")
+    per_row_h2d = ("for (size_t ri = 0; ri < n_rows; ++ri) { h2d_events.push_back(ggml_sycl::mem_copy_async("
+                   "dst_storage.handle, ri * nb1, out_handle, ri * static_cast<size_t>(N) * sizeof(float), "
+                   "static_cast<size_t>(N) * sizeof(float), *stream)); } ")
+
+    expect_fail("lambda-renamed", "P0", "auto dispatch_host_expert_groups = [&]", "auto dispatch_host_rows = [&]")
+    expect_fail("plan-not-built", "P1", plan_call, "build_island_plan_elsewhere(island_rows,")
+    expect_fail("plan-call-commented-out", "P1", plan_call, "/* ggml_sycl::moe_island_plan_build( */ (island_rows,")
+    expect_fail("plan-built-twice", "P1", "ggml_sycl::moe_island_plan island;",
+                "ggml_sycl::moe_island_plan island; (void) ggml_sycl::moe_island_plan_build(island_rows, 1, 1, &island);")
+    expect_fail("gather-loop-gone", "P2", "run : island.gather)", "run : island.scatter_unused)")
+    expect_fail("scatter-loop-gone", "P2", "run : island.scatter)", "run : island.gather_unused)")
+    expect_fail("per-row-d2h-loop-restored", "P3", gather_wait, per_row_d2h + gather_wait)
+    expect_fail("per-row-h2d-loop-restored", "P3", scatter_wait, per_row_h2d + scatter_wait)
+    expect_fail("gather-copy-offsets-swapped", "P3", gather_copy,
+                "d2h_events.push_back(ggml_sycl::mem_copy_async(act_handle, run.src_offset, src1_storage.handle,")
+    expect_fail("gather-copy-wrong-handle", "P3", gather_copy,
+                "d2h_events.push_back(ggml_sycl::mem_copy_async(out_handle, run.dst_offset, src1_storage.handle,")
+    expect_fail("scatter-copy-direction-reversed", "P3", scatter_copy,
+                "h2d_events.push_back(ggml_sycl::mem_copy_async(out_handle, run.dst_offset, dst_storage.handle,")
+    expect_fail("scatter-copy-one-row", "P3", "run.bytes, *stream)", "static_cast<size_t>(N) * sizeof(float), *stream)",
+                after="run : island.scatter)")
+    expect_fail("per-row-destinations-back", "P4", "std::vector<cpu_expert_task> tasks;",
+                "std::vector<cpu_expert_task> tasks; std::vector<size_t> scatter_dst_offsets;")
+    expect_fail("act-block-sized-by-rows", "P5", "island.n_act_rows * static_cast<size_t>(K) * sizeof(float);\n",
+                "n_rows * static_cast<size_t>(K) * sizeof(float);\n")
+    expect_fail("task-reads-its-flat-row", "P6", "static_cast<size_t>(island.act_index[flat_row])", "flat_row")
+    expect_fail("task-writes-its-flat-row", "P6", "static_cast<size_t>(island.out_index[flat_row])", "flat_row")
+    expect_fail("task-act-reads-out-index", "P6", "island.act_index[flat_row]", "island.out_index[flat_row]")
+    expect_fail("task-second-row-counter", "P6", "++flat_row;", "++flat_row; ++flat_row;")
+    # The groups' header repeats in the lambda (the row count, island_rows and the weight check walk it), so the
+    # island_rows mutant's anchor carries the reserve that precedes that loop.
+    expect_fail("island-rows-groups-reversed", "P7",
+                "island_rows.reserve(n_rows);\n            for (const pp_host_expert_group & group : groups) {",
+                "island_rows.reserve(n_rows);\n            for (const pp_host_expert_group & group : reversed(groups)) {")
+    expect_fail("island-rows-rows-reversed", "P7", "for (const auto & row : group.rows) {",
+                "for (const auto & row : reversed(group.rows)) {")
+    expect_fail("island-rows-iid1-id-swapped", "P7", "[iid1, id]", "[id, iid1]")
+    expect_fail("island-rows-nb11-nb12-swapped", "P7", "* nb11 + static_cast<size_t>(iid1) * nb12",
+                "* nb12 + static_cast<size_t>(iid1) * nb11")
+    expect_fail("island-rows-nb1-nb2-swapped", "P7", "* nb1 + static_cast<size_t>(iid1) * nb2",
+                "* nb2 + static_cast<size_t>(iid1) * nb1")
+    expect_fail("task-loop-groups-reversed", "P7", "for (pp_host_expert_group & group : groups) {",
+                "for (pp_host_expert_group & group : reversed(groups)) {")
+    expect_fail("task-loop-rows-reversed", "P7", "for (size_t ri = 0; ri < group.rows.size(); ++ri) {",
+                "for (size_t ri = group.rows.size(); ri-- > 0;) {")
+    # Reorderings between the two loops, and a task row loop that skips a row: each leaves both loops' text intact
+    # but makes flat_row name another row than the plan's.
+    expect_fail("groups-sorted-between-loops", "P7", "std::vector<cpu_expert_task> tasks;",
+                "std::sort(groups.begin(), groups.end(), [](const pp_host_expert_group & a, "
+                "const pp_host_expert_group & b) { return a.expert_id < b.expert_id; }); "
+                "std::vector<cpu_expert_task> tasks;")
+    expect_fail("group-rows-reversed-between-loops", "P7", "std::vector<cpu_expert_task> tasks;",
+                "for (pp_host_expert_group & g : groups) { std::reverse(g.rows.begin(), g.rows.end()); } "
+                "std::vector<cpu_expert_task> tasks;")
+    expect_fail("task-row-loop-skips-a-row", "P7", "for (size_t ri = 0; ri < group.rows.size(); ++ri) {",
+                "for (size_t ri = 0; ri < group.rows.size(); ++ri) { if (group.rows[ri].second < 0) { continue; }")
+    # Inside the task loop: rows moved or dropped, a group dropped, the row index advanced by the body.
+    expect_fail("task-row-loop-sorts-rows", "P7", "cpu_expert_task task;",
+                "std::sort(group.rows.begin(), group.rows.end()); cpu_expert_task task;")
+    expect_fail("task-row-loop-pops-a-row", "P7", "cpu_expert_task task;", "group.rows.pop_back(); cpu_expert_task task;")
+    expect_fail("task-loop-pops-a-group", "P7", "task.weight_lease = std::move(group.weight_lease);",
+                "task.weight_lease = std::move(group.weight_lease); groups.pop_back();")
+    expect_fail("task-row-index-advanced-in-body", "P7", "cpu_expert_task task;", "++ri; cpu_expert_task task;")
+    # Writes to flat_row other than its declaration and its one increment.
+    expect_fail("flat-row-compound-add", "P6", "++flat_row;", "flat_row += 2; ++flat_row;")
+    expect_fail("flat-row-reassigned", "P6", "cpu_expert_task task;", "flat_row = ri; cpu_expert_task task;")
+    expect_fail("flat-row-decremented", "P6", "cpu_expert_task task;", "--flat_row; cpu_expert_task task;")
+    expect_fail("flat-row-postfix-increment", "P6", "++flat_row;", "flat_row++;")
+    expect_fail("flat-row-not-the-last-statement", "P7",
+                "tasks.push_back(std::move(task));\n                    ++flat_row;",
+                "++flat_row;\n                    tasks.push_back(std::move(task));")
+
+    # The NOT APPLIED report must fire on an anchor the lambda does not hold, or a stale mutant would pass unseen.
+    try:
+        sub("this anchor is in no lambda", "x")
+        failures.append("stale-anchor-not-reported")
+        print("  self-test: a stale mutant anchor is NOT reported")
+    except MutantNotApplied:
+        print("  self-test: a stale mutant anchor is reported")
+
+    try:
+        check(backend_src)
+        print("  self-test: unmodified tree passes")
+    except ContractError as e:
+        print(f"  self-test: unmodified tree FAILS: {e}")
+        failures.append("unmodified")
+
+    if failures:
+        print(f"SELF-TEST FAIL: {', '.join(failures)}")
+        return 1
+    print(f"SELF-TEST PASS: {n_mutants} mutants caught by their pins, unmodified tree passes")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    backend_src = BACKEND.read_text()
+    if "--self-test" in argv:
+        return self_test(backend_src)
+    try:
+        check(backend_src)
+    except ContractError as e:
+        print(e)
+        return 1
+    print("PASS: the prompt CPU island copies by its plan: each distinct activation row once in runs, results in "
+          "destination order, no per-row copy loop")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

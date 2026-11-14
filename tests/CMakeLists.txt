@@ -510,6 +510,15 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-moe-host-scatter PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# The copy plan of the prompt's CPU island: how host-expert activation and result rows cross the device in
+# blocks. ggml-sycl/moe-host-island.hpp includes the standard library, ggml.h and two SYCL-free headers, so this
+# needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-moe-host-island.cpp)
+    set_tests_properties(test-sycl-moe-host-island PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-moe-host-island PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # Decode/prompt classification of a scheduler split (llama.cpp-7pm2): MUL_MAT_ID is batch evidence and a split with
 # no matmul keeps the previous phase. ggml-sycl/graph-phase.hpp includes only ggml.h; the test builds synthetic
 # graphs on a no-alloc ggml context, so it needs no device.
@@ -971,6 +980,14 @@ if (Python3_Interpreter_FOUND)
     # TIMEOUT: the 96-mutant self-test took 52 s wall at host load 10-11.
     set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
+    # The prompt's CPU island (dispatch_host_expert_groups) copies by its plan: each distinct activation row once in
+    # runs, results in destination order, no per-row copy loop, and its rows in the order the plan indexes them. The
+    # only gate on the lambda's copies and row order. Run WITH --self-test so each mutant is caught by the pin it
+    # names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-host-island-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-host-island-source.py --self-test)
+    set_tests_properties(test-sycl-moe-host-island-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
     # llama.cpp-36j0 Task 4: the MoE executor knobs' literals, log formats, env-report rows and teardown summary.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-exec-knobs-source
