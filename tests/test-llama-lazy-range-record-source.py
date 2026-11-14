@@ -279,13 +279,29 @@ def test_a_storage_tensor_bypasses_buffers_and_is_opened_after_the_load():
         ct,
     ), "create_tensor returns create_storage_tensor() exactly when the record says the row is STORAGE"
     lt = load_tensors_body()
+    # the entries are built once every tensor is created and the context is the model's, and before the probe measure
+    i_done = lt.find("ml.done_getting_tensors(")
+    i_move = lt.find("pimpl->storage_ctx = std::move(ml.storage_ctx)")
     i_entries = lt.find("std::make_unique<llama_lazy_storage>(")
-    i_probe = lt.find("probe")
-    assert 0 <= i_entries < i_probe, "the storage entries must exist before the probe measure builds a graph"
+    i_probe = lt.find("llama_load_probe_bound(")
+    assert 0 <= i_done < i_move < i_entries < i_probe, (
+        f"the storage entries must be built after done_getting_tensors() and the move of storage_ctx, and before the "
+        f"probe measure builds a graph (done {i_done}, move {i_move}, entries {i_entries}, probe {i_probe})")
+    # the record's STORAGE rows drive the block: a gate on storage_ctx would skip a row whose tensor was never created
+    i_for = lt.find("for (", i_move)
+    assert i_move < i_for < i_entries and not re.search(r"\bif\s*\(", lt[i_move:i_for]), (
+        "nothing may gate the storage entries between the move of storage_ctx and their loop")
     tail = lt[lt.rfind("has_sycl_weight_buffer"):]
     # [^{;]* keeps the loop header and its body one loop: it cannot reach from another loop to a later open
-    assert re.search(r"finish\(true\);\s*for\s*\([^{;]*lazy_storage[^{;]*\)\s*\{[^}]*->open\(", tail), (
-        "every storage entry is opened right after the load's finish")
+    opens = re.search(r"finish\(true\);\s*for\s*\([^{;]*lazy_storage[^{;]*\)\s*\{", tail)
+    assert opens, "every storage entry is opened right after the load's finish"
+    body = balanced(tail, opens.end() - 1)
+    assert re.search(r"if\s*\(\s*!\s*\w+\s*->\s*open\s*\(", body) and "throw" in body, (
+        "a storage entry that fails to open fails the load")
+    i_endif = tail.find("#endif")
+    assert i_endif >= 0, "the SYCL block that opens the storage entries has no #endif"
+    assert re.search(r"for\s*\([^{;]*lazy_storage[^{;]*\)\s*\{[^}]*is_open\s*\(\s*\)[^}]*throw", tail[i_endif:]), (
+        "a load that ends with an unopened storage entry fails")
     path = re.search(r"if\s*\(([^{};]*file_paths[^{};]*\.empty\(\)[^{};]*)\)\s*\{", lt)
     assert path, "load_tensors() does not test a STORAGE table's file path for emptiness"
     refusal = balanced(lt, path.end() - 1)
