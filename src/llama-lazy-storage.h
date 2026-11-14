@@ -22,7 +22,9 @@ llama_lazy_storage_procs llama_lazy_storage_sycl_procs();
 
 // A STORAGE table the model's graph reads through set_input: created before the load's measure, so the graph builds
 // its F32 input instead of a gather from the table, and opened once the load has a model token. Not copyable: the
-// backend handle is closed exactly once.
+// backend handle is closed exactly once. Per the backend's contract, gathers on one table serialise and the counters
+// may be read while a gather runs, but nothing may overlap the close, so the object is destroyed after its last
+// gather and before the model's unload.
 class llama_lazy_storage {
   public:
     llama_lazy_storage(const llama_lazy_storage_table & table,

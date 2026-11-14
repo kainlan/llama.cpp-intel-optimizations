@@ -20,21 +20,18 @@ llama_lazy_storage::~llama_lazy_storage() {
         return;
     }
     // WARN so that a normal run shows the line: it is the evidence that the table was read through the backend.
-    if (procs_.counters != nullptr) {
-        uint64_t c[4] = {};
-        procs_.counters(handle_, c);
-        LLAMA_LOG_WARN("[LAZY-STORAGE] %s hits=%llu misses=%llu evictions=%llu submitted=%llu\n", table_.name.c_str(),
-                       (unsigned long long) c[0], (unsigned long long) c[1], (unsigned long long) c[2],
-                       (unsigned long long) c[3]);
-    }
-    if (procs_.close != nullptr) {
-        procs_.close(handle_);
-    }
+    uint64_t c[4] = {};
+    procs_.counters(handle_, c);
+    LLAMA_LOG_WARN("[LAZY-STORAGE] %s hits=%llu misses=%llu evictions=%llu submitted=%llu\n", table_.name.c_str(),
+                   (unsigned long long) c[0], (unsigned long long) c[1], (unsigned long long) c[2],
+                   (unsigned long long) c[3]);
+    procs_.close(handle_);
     handle_ = nullptr;
 }
 
 bool llama_lazy_storage::open(const llama_sycl_model_token & token) {
-    if (procs_.open == nullptr) {
+    // All four are required, so that a handle can exist only when it can be read, counted and closed.
+    if (procs_.open == nullptr || procs_.gather == nullptr || procs_.counters == nullptr || procs_.close == nullptr) {
         LLAMA_LOG_WARN("%s: no backend to open the storage table %s\n", __func__, table_.name.c_str());
         return false;
     }
@@ -49,7 +46,7 @@ bool llama_lazy_storage::open(const llama_sycl_model_token & token) {
 }
 
 int llama_lazy_storage::gather(const int32_t * rows, size_t n, void * dst, size_t dst_bytes) const {
-    if (handle_ == nullptr || procs_.gather == nullptr) {
+    if (handle_ == nullptr) {
         return ENODEV;
     }
     return procs_.gather(handle_, rows, n, dst, dst_bytes);
@@ -142,8 +139,9 @@ llama_lazy_storage_procs llama_lazy_storage_sycl_procs() {
         b.close = reinterpret_cast<decltype(b.close)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_lazy_storage_close"));
         if (b.open && b.gather && b.counters && b.close) {
-            // One publication is enough: the registration's procs are fixed for the life of the process, so a
-            // later call would only write the same four pointers again.
+            // One publication is enough: the four are code addresses in the SYCL library, and a dynamically loaded
+            // backend library stays mapped once loaded (a logical unload does not unmap it), so every later call
+            // resolves the same four.
             std::call_once(g_llama_lazy_storage_backend_once, [&b]() { g_llama_lazy_storage_backend = b; });
             result.open     = llama_lazy_storage_adapt_open;
             result.gather   = llama_lazy_storage_adapt_gather;
