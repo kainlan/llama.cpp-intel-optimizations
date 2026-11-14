@@ -445,7 +445,7 @@ arm_result arm_d_qwen_flip() {
 // (j) A storage-only table is STORAGE at a reading where the same table without the flag is HOST.
 // Engagement: the control plan (no flag, arm (d)'s "above" reading) carries the table HOST.
 // Mutants: the flag not read by the HOST test (the flagged table is HOST).
-// The cache's size is T2's arm (k); this arm checks residency and floor only.
+// This arm checks residency and floor only; the cache's size is another arm's.
 arm_result arm_j_storage_only_skips_host() {
     arm_result                             r;
     const lazy_test_coverage_pin           pin    = ggml_sycl_test_make_coverage_pin(0);
