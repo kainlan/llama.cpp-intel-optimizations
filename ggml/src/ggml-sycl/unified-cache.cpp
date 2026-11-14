@@ -34699,6 +34699,14 @@ static size_t lazy_table_host_body_bytes(const placement_lazy_table_info & info)
     return host_cpu_mapped_size(lazy_table_host_body_request_bytes(info.file_offset, info.table_bytes));
 }
 
+// The ceiling on a storage-only table's row cache, index included: 2 GiB, and never more than holding the table whole
+// would cost. A fixed size and not a share of the room, because the cache only needs the hot rows of a table that is
+// deliberately never held whole. The cache's floor still holds when it alone exceeds the ceiling.
+static size_t lazy_table_storage_cache_ceiling(const placement_lazy_table_info & info) {
+    constexpr size_t cache_cap = 2ull << 30;
+    return std::min(cache_cap, lazy_table_host_body_bytes(info));
+}
+
 // A lazy table's yieldable bytes (th32 §6.4): what a STORAGE cache holds above its floor, by the row cache's own chunk
 // rule, so the plan counts the bytes the built cache publishes. A HOST table yields nothing.
 static size_t lazy_table_yieldable_bytes(const placement_lazy_table & table, size_t row_size) {
@@ -34775,10 +34783,6 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
 
     constexpr size_t reserve_floor = 2ull << 30;          // step 3: host_reserve's floor
     constexpr size_t reserve_pct   = 1;                   // step 3: host_reserve's share of the budget, in percent
-
-    // A storage-only table's row cache, index included. A fixed size and not a share of the room, because the cache
-    // only needs the hot rows of a table that is deliberately never held whole.
-    constexpr size_t storage_only_cache_cap = 2ull << 30;
     plan.lazy_tables.clear();
     plan.lazy_refusal.clear();
     plan.lazy_refusal_detail.clear();
@@ -34930,10 +34934,7 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
             const size_t floor_res                  = t.host_resident_bytes;
             size_t       target                     = floor_res + share;
             if (info.storage_only) {
-                // The ceiling is storage_only_cache_cap, and never more than holding the table whole would cost. The
-                // floor still holds when it alone exceeds the ceiling.
-                const size_t ceiling = std::min(storage_only_cache_cap, lazy_table_host_body_bytes(info));
-                target               = std::min(target, std::max(floor_res, ceiling));
+                target = std::min(target, std::max(floor_res, lazy_table_storage_cache_ceiling(info)));
             }
             t.cache_slots         = lazy_row_cache_slots_within(t.cache_floor_slots, rows, info.row_size, target);
             t.host_resident_bytes = lazy_row_cache_resident_bytes(t.cache_slots, info.row_size);
@@ -34960,8 +34961,7 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
         if (t.residency == lazy_residency::STORAGE) {
             // cache_cap= is the ceiling a storage-only table's cache was held to, none for any other table.
             const std::string cache_cap =
-                info.storage_only ? std::to_string(std::min(storage_only_cache_cap, lazy_table_host_body_bytes(info))) :
-                                    "none";
+                info.storage_only ? std::to_string(lazy_table_storage_cache_ceiling(info)) : "none";
             GGML_LOG_WARN("[PLACEMENT] lazy %s residency=STORAGE %s index=%zu cache_cap=%s\n", t.name.c_str(),
                           fields.c_str(), lazy_row_cache_index_bytes(t.cache_slots), cache_cap.c_str());
         } else {
