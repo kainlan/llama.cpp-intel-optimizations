@@ -127659,6 +127659,9 @@ struct ggml_sycl_lazy_storage {
 // One live table per model and table name. The plan charged the table's MODEL-lifetime host bytes once, so a later
 // open shares the live table instead of materializing a second row cache. The mutex is held across a first open's
 // materialization, so two first opens cannot both build, and across the last close's release.
+// That cannot deadlock: only the open and the close below take this mutex, each holding no other lock when it does,
+// and nothing a materialization or a release waits on (a ledger yield, the yielder's unregister, the IO workers' reads)
+// ever takes it.
 static std::mutex                                                     g_lazy_storage_registry_mutex;
 static std::map<ggml_sycl_lazy_storage_key, ggml_sycl_lazy_storage *> g_lazy_storage_registry;
 
@@ -127741,8 +127744,8 @@ ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(ggml_sycl_model_tok
                 return nullptr;
             }
             if (ggml_sycl_lazy_storage_file_id(path_st) != shared->source.file_id) {
-                GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: it is already open on another file than %s\n",
-                              info->name, file_path);
+                GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: it is already open on %s, not %s\n", info->name,
+                              shared->table->desc().file_path.c_str(), file_path);
                 return nullptr;
             }
             ++shared->opens;

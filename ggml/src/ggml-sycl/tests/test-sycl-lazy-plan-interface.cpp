@@ -703,6 +703,14 @@ void storage_api_on_file(arm_result &        arr,
                "the row past the table returned " + num(past_rc) + " (want EINVAL " + num(EINVAL) + ")" +
                    (untouched ? "" : " and wrote dst"));
 
+        // While the table is live, a later open is still cross-checked against the plan before it may share the table,
+        // and one whose stat of its path fails is refused.
+        expect(arr, open_refused_with(model, &wrong_off, path.c_str(), "(caller/plan)"),
+               "a later open whose file_offset disagrees with the plan was not refused by the cross-check");
+        const std::string absent = path + ".absent";
+        expect(arr, open_refused_with(model, &table, absent.c_str(), "stat of"),
+               "a later open whose path does not exist was not refused");
+
         // A second open of the live table shares it: the same handle and no second row cache, so the rows the first
         // holder gathered hit through the second with no read submitted.
         ggml_sycl_lazy_storage * second = ggml_backend_sycl_lazy_storage_open(model, &table, path.c_str());
@@ -730,8 +738,17 @@ void storage_api_on_file(arm_result &        arr,
                        " -> " + num(q[0]) + ", misses " + num(p[1]) + " -> " + num(q[1]) + ", submitted " + num(p[3]) +
                        " -> " + num(q[3]) + ", or a row is not the file's bytes");
 
-            // One close leaves the table live for the other holder, which still reads a fresh row from the file.
+            // One close leaves the table live for the other holder, which still reads a fresh row from the file. If the
+            // close released the table, the handle may be freed: the arm unloads the model and returns without touching
+            // it again.
             ggml_backend_sycl_lazy_storage_close(s);
+            uint64_t kept_bytes = 0;
+            if (!row_cache_bytes(&kept_bytes) || kept_bytes != opened_bytes) {
+                fail(arr, "a close with another open outstanding released row-cache bytes: " + num(opened_bytes) +
+                              " -> " + num(kept_bytes));
+                (void) ggml_backend_sycl_model_unloaded_token(model);
+                return;
+            }
             s                      = second;
             const int32_t fresh[1] = { static_cast<int32_t>(rows / 2) };
             std::fill(dst.begin(), dst.end(), 0);
@@ -741,8 +758,9 @@ void storage_api_on_file(arm_result &        arr,
                        ", or its row is not the file's bytes");
 
             // A later open naming another file is refused: the live table reads only its own.
-            expect(arr, open_refused_with(model, &table, other.c_str(), "already open on another file"),
-                   "a second open naming another file was not refused");
+            const std::string mismatch = "already open on " + path + ", not " + other;
+            expect(arr, open_refused_with(model, &table, other.c_str(), mismatch.c_str()),
+                   "a second open naming another file was not refused with a WARN naming both files");
         }
         ggml_backend_sycl_lazy_storage_close(s);
         uint64_t closed_bytes = 0;
@@ -768,13 +786,14 @@ void storage_api_on_file(arm_result &        arr,
 
 // (h) The storage API: a 4 MiB storage-only table written to a file in the build directory opens by the published
 // model token, gathers four rows byte-exact, hits on a repeated row, refuses a row past the table, and closes before
-// the unload, after which the unload finds no leaked MODEL record. A second open while the first is live returns the
-// same handle and charges no row-cache bytes, the rows the first holder gathered hit through it with no read
-// submitted, it still reads after the first holder's close, and an open naming another file is refused; the last close
-// returns the row-cache bytes, and an open after it succeeds while the model is loaded. A null argument, model id 0, a
-// table the plan lacks, and an info whose row_size, file_offset, size or type disagrees with the plan are refused,
-// each by its own WARN; a null storage's counters are zero and its gather EINVAL, as is a dst short of the rows; an
-// open after the unload finds no plan.
+// the unload, after which the unload finds no leaked MODEL record. While the table is live, a later open is still
+// refused by the cross-check, and one whose path does not exist is refused. A second open while the first is live
+// returns the same handle and charges no row-cache bytes, the rows the first holder gathered hit through it with no
+// read submitted, the first holder's close keeps the row-cache bytes and the second still reads, and an open naming
+// another file is refused with a WARN naming both; the last close returns the row-cache bytes, and an open after it
+// succeeds while the model is loaded. A null argument, model id 0, a table the plan lacks, and an info whose row_size,
+// file_offset, size or type disagrees with the plan are refused, each by its own WARN; a null storage's counters are
+// zero and its gather EINVAL, as is a dst short of the rows; an open after the unload finds no plan.
 // Engagement: the published plan's [PLACEMENT] line says STORAGE (arm (g) shows the same flag publishing it); the first
 // gather misses (the cache is cold), so rows come through O_DIRECT reads; the first open charges row-cache bytes. The
 // arm VOIDs when a fixture is not written, its filesystem refuses O_DIRECT, or the host could not have held the
@@ -783,7 +802,10 @@ void storage_api_on_file(arm_result &        arr,
 // returned null"); file_offset ignored (every row off by 4032 B: "the first gather returned 0, or a row is not the
 // file's bytes"); the geometry cross-check missing (the offset-shifted info opens: "... file_offset disagrees ...");
 // a later open materializing a second table ("the second open returned another handle, not the first's"); the last
-// close not deleting the table ("the last close left row-cache bytes live").
+// close not deleting the table ("the last close left row-cache bytes live"); the registry lookup moved ahead of the
+// cross-check ("a later open whose file_offset disagrees with the plan was not refused by the cross-check"); every
+// close deleting the table ("a close with another open outstanding released row-cache bytes", and the arm returns
+// there).
 arm_result arm_h_storage_api() {
     arm_result        arr;
     // The process id keeps the name apart between the -1dev and -2dev registrations, which share the build directory:
