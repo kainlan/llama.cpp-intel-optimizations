@@ -56,6 +56,9 @@ saveable_mutating_procs = {
     "ggml_backend_sycl_set_runtime_context_for_model": "ggml_backend_sycl_set_runtime_context_for_model",
     "ggml_backend_sycl_model_unloaded_token": "ggml_backend_sycl_model_unloaded_token",
     "ggml_backend_sycl_model_quarantine_token": "ggml_backend_sycl_model_quarantine_token",
+    # A STORAGE lazy table's open materializes its row cache, and its close releases it.
+    "ggml_backend_sycl_lazy_storage_open": "ggml_backend_sycl_lazy_storage_open",
+    "ggml_backend_sycl_lazy_storage_close": "ggml_backend_sycl_lazy_storage_close",
     "ggml_backend_sycl_test_seed_cpu_retained": "ggml_backend_sycl_test_seed_cpu_retained",
     "ggml_backend_sycl_test_seed_moe_module_state": "ggml_backend_sycl_test_seed_moe_module_state",
     "ggml_backend_sycl_test_allocate_predictor_scores": "ggml_backend_sycl_test_allocate_predictor_scores",
