@@ -1329,6 +1329,22 @@ Add the four proc table entries in the existing form, for example
 **Commit:** `sycl: open, gather from and close a STORAGE lazy table by model token`.
 Stage `ggml/include/ggml-sycl.h ggml/src/ggml-sycl/ggml-sycl.cpp ggml/src/ggml-sycl/CMakeLists.txt ggml/src/ggml-sycl/tests/test-sycl-lazy-plan-interface.cpp tests/test-sycl-lifecycle-source-contract.py`.
 
+**As merged (`integ/th32` at `13d0aaab0`, 2026-11-14).** The merged code differs from the snippets above in four
+places. Later tasks read the merged header, not these snippets.
+- **A second open shares the table** (owner ruling, 2026-11-14: "allow it, share one cache").
+  - A table has one live handle per model, load transaction and table name, held in a registry under one mutex.
+  - A later open of the same table runs the same checks, compares the file's identity with the live table's,
+    and returns the same handle with its open count raised. It does not build a second row cache.
+  - A later open that names another file, or whose stat fails, is refused with a WARN and returns NULL.
+  - Every successful open needs exactly one close. Only the close that takes the count to zero releases the table.
+  - T10 still opens each table once per model. The count exists so that a second opener is safe, not required.
+- **The file id** is a splitmix64 finalizer over `st_dev XOR st_ino`. The shift-and-xor above let two devices
+  produce the same id.
+- **The IO context** comes from a process-wide counter that starts at 2^63. The handle's address, used above,
+  can be reused by a later allocation.
+- **The open builds from the plan.** The descriptor, the source and the deadline come from the published plan's
+  figures. The caller's info is used only for the geometry cross-check.
+
 ---
 
 ## T7: the record's STORAGE consumer is per arch, still absent everywhere, and qwen4exp's table is storage-only
