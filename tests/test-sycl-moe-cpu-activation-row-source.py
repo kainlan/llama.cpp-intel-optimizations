@@ -1065,6 +1065,8 @@ def self_test(backend_src: str) -> int:
     expect_fail("lease-skip-inverted", sub(lease_skip, lease_skip.replace("!=", "==")), None, "W4")
     lease_loop = "for (const expert_dispatch_entry & entry : entries) {\n                    if (entry.has_ready_event &&"
     expect_fail("lease-loop-guarded", sub(lease_loop, "if (n_cpu > 1) " + lease_loop), None, "W4")
+    expect_fail("lease-loop-narrowed", sub(lease_loop, lease_loop.replace(
+        ": entries)", ": std::vector<expert_dispatch_entry>(entries.begin(), entries.begin() + 1))")), None, "W4")
     expect_fail("copy-events-overwritten", sub("                // Order this job's pool writes",
                                                "                job_inputs.events = {};\n                // Order this job's pool writes"),
                 None, "W4")
