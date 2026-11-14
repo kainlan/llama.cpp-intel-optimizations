@@ -132,6 +132,12 @@ void llama_model_saver::add_tensor(const struct ggml_tensor * tensor) {
     if (!tensor) {
         return;
     }
+    // a STORAGE table is read from its model file on demand and has no data in memory, so writing it would produce a
+    // tensor without data; the saver's entry point returns nothing, so the failure is an abort, before any file exists
+    if (model != nullptr && model->lazy_storage(ggml_get_name(tensor)) != nullptr) {
+        GGML_ABORT("cannot save a model whose table %s is read from its model file on demand and is not in memory; "
+                   "copy the original GGUF file instead", ggml_get_name(tensor));
+    }
     if (gguf_find_tensor(gguf_ctx, tensor->name) >= 0) {
         const std::string tensor_name = tensor->name;
         GGML_ASSERT(
