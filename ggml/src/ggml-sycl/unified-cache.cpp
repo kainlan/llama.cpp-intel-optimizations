@@ -34716,7 +34716,8 @@ std::string placement_lazy_table_fields(const placement_lazy_table & table, cons
         fields += " yieldable=" + std::to_string(lazy_table_yieldable_bytes(table, info->row_size)) +
                   " consumer_layer=" + std::to_string(info->consumer_layer) +
                   " rows_per_token=" + std::to_string(info->rows_per_token) +
-                  " file=" + std::to_string(info->file_index) + " off=" + std::to_string(info->file_offset);
+                  " file=" + std::to_string(info->file_index) + " off=" + std::to_string(info->file_offset) +
+                  " storage_only=" + std::to_string(info->storage_only ? 1 : 0);
     }
     return fields;
 }
@@ -34742,15 +34743,16 @@ static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_la
 // The lazy tables' residency (th32 §4.3 step 4), decided once the zone terms are set, so their total is step 2. Step 3
 // sets aside the context envelope, a named 0 until the SYCL_Host compute buffer is a planned tenant, and host_reserve =
 // max(2 GiB, 1% of the budget). The tables are taken in ascending consumer_layer (ties to the larger table, then the
-// name). A table is HOST when its mapped body fits what the budget leaves (the planner's fit) and P3 holds with it
-// resident (MemAvailable_pre - expected_host - 5 >= 24 GiB, against everything decided before it); otherwise it is
-// STORAGE when the coverage pin makes it eligible, at its cache floor of 2 x n_ubatch x rows_per_token slots, n_ubatch
-// read through placement_load_n_ubatch as the stage reads it; otherwise the plan refuses, naming the ring:
-// lazy-table-ring-unpinned with no pin, lazy-table-ring-too-narrow when the live ring's slot is narrower than the
-// table's read span. That second-model rule (§3.3) is an input to the pass, not a demotion after it: a table whose span
-// exceeds the live slot (live / QD) is not STORAGE-eligible, prints the decline line naming the load, the table and
-// both spans once per load and table, and takes the HOST test at its position. After the pass the block ring is sized
-// over the STORAGE tables and charged unless the live ring holds it; the floors and the ring must fit both the budget
+// name). A table is HOST when it is not storage_only, its mapped body fits what the budget leaves (the planner's fit)
+// and P3 holds with it resident (MemAvailable_pre - expected_host - 5 >= 24 GiB, against everything decided before
+// it); otherwise it is STORAGE when the coverage pin makes it eligible, at its cache floor of 2 x n_ubatch x
+// rows_per_token slots, n_ubatch read through placement_load_n_ubatch as the stage reads it; otherwise the plan
+// refuses, naming the ring: lazy-table-ring-unpinned with no pin, lazy-table-ring-too-narrow when the live ring's slot
+// is narrower than the table's read span. That second-model rule (§3.3) is an input to the pass, not a demotion after
+// it: a table whose span exceeds the live slot (live / QD) is not STORAGE-eligible, prints the decline line naming the
+// load, the table and both spans once per load and table, and takes the HOST test at its position. A declined
+// storage_only table has no HOST test to fall back on, so it refuses. After the pass the block ring is sized over the
+// STORAGE tables and charged unless the live ring holds it; the floors and the ring must fit both the budget
 // and P3, or the plan refuses as lazy-table-cache-below-floor. What both leave above that is the STORAGE caches'
 // yieldable share (§6.4), split in proportion to table_bytes x rows_per_token. The live ring is read through the pin by
 // lazy_ring_coverage_read, which counts each read (§10): one per table for eligibility, one for the need and one for
@@ -34835,8 +34837,9 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
         const size_t with   = host_ledger_sat_add(used, body);
         const size_t span   = lazy_block_ring_span(info.row_size);
         // The eligibility read: a live ring whose slot is narrower than this table's span declines it, loudly, before
-        // the HOST test, which then decides it as for any table. No ring yet, or no pin, declines nothing. The line
-        // prints once per load and table, however many devices and passes plan the table.
+        // the HOST test, which then decides it as for any table; a declined storage-only table has no HOST test to fall
+        // back on and refuses. No ring yet, or no pin, declines nothing. The line prints once per load and table,
+        // however many devices and passes plan the table.
         const uint64_t live     = lazy_ring_coverage_read(coverage_pin);
         const bool     declined = live != 0 && span > live / LAZY_BLOCK_RING_QD;
         if (declined && lazy_decline_first(kv_info.lazy_load_txn, info.name)) {
@@ -34846,8 +34849,8 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
                 (unsigned long long) kv_info.lazy_load_txn, info.name.c_str(), span,
                 (unsigned long long) (live / LAZY_BLOCK_RING_QD));
         }
-        // A storage-only table is read from its file whatever the host room: holding it costs more host memory than its
-        // reads save, so it never takes the HOST branch.
+        // A storage-only table is read from its file and never held whole on the host, whatever room the host has, so
+        // it never takes the HOST branch.
         if (!info.storage_only && body != 0 && with <= fit_room && with <= p3_room) {
             t.residency           = lazy_residency::HOST;
             t.host_resident_bytes = body;
@@ -34863,7 +34866,8 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
             refuse(coverage_pin == nullptr ? "lazy-table-ring-unpinned" : "lazy-table-ring-too-narrow",
                    "table=" + info.name + " mapped=" + std::to_string(body) + " fit_room=" + std::to_string(fit_room) +
                        " p3_room=" + std::to_string(p3_room) + " decided=" + std::to_string(used) +
-                       " span=" + std::to_string(span) + " ring_bytes=" + std::to_string(live));
+                       " span=" + std::to_string(span) + " ring_bytes=" + std::to_string(live) +
+                       " storage_only=" + std::to_string(info.storage_only ? 1 : 0));
             break;
         }
         plan.lazy_tables.push_back(t);

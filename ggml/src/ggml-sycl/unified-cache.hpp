@@ -522,8 +522,8 @@ struct placement_lazy_table_info {
     uint32_t    file_index        = 0;
     size_t      file_offset       = 0;
     size_t      table_bytes       = 0;
-    // libllama's answer for a table that is never held resident: the planner places it STORAGE whatever room the
-    // host has, and caps its row cache.
+    // libllama's answer for a table that is never held whole on the host: the planner places it STORAGE whatever room
+    // the host has.
     bool        storage_only      = false;
 };
 
