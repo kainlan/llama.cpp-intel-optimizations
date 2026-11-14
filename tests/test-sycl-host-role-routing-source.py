@@ -651,7 +651,9 @@ assert len(UNOWNED_KEYS) == 12, "the site table carries the 12 UNOWNED lines of 
 
 # Each GRAPH row's plan term (§4.4 "GRAPH tenants"; r3 m4, r4 m-12). A GRAPH row with no term is UNSIZED, listed
 # here with the reason, and ratcheted like UNOWNED.
-SINGLE_TENSOR = ("max_tensor_bytes", "k_scratch_headroom")
+# A single-tensor copy is bounded by the largest tensor a host zone can be asked to copy: a gather-only tensor the plan
+# keeps on the host is read in place, so max_copied_tensor_bytes leaves it out.
+SINGLE_TENSOR = ("max_copied_tensor_bytes", "k_scratch_headroom")
 MOE_STAGING = ("moe_cpu_expert_staging_bytes", "moe_host_recipe_workspace_bytes")
 SLOT_CAPACITY = ("slot_bytes",)  # the planned capacity of the staging kind, host_holder_device_state::slot_bytes
 GRAPH_TERMS = {
@@ -669,8 +671,8 @@ UNSIZED = {
     (_GS, "tp_device1_worker_thread_func", 1): "TP_TMP, as above",
     (_GS, "ggml_sycl_tp_launch_async_ffn", 1): "TP_TMP, as above",
     (_GS, "ggml_sycl_cpu_fallback_graph", 1): "one copy per device-resident tensor the CPU fallback graph reads, all "
-                                              "live until the graph's exit: max_tensor_bytes bounds one copy, not "
-                                              "their sum",
+                                              "live until the graph's exit: max_copied_tensor_bytes bounds one copy, "
+                                              "not their sum",
 }
 
 # The DEVICE holders (§M62 (D)) and the call that releases each at module shutdown.
@@ -2082,8 +2084,8 @@ def clause_open_touches_no_set(texts: dict) -> list:
 
 
 def clause_scratch_fold(texts: dict) -> list:
-    """§M62 (A): host SCRATCH folds exactly max_tensor_bytes, k_scratch_headroom, moe_cpu_expert_staging_bytes and
-    moe_host_recipe_workspace_bytes."""
+    """§M62 (A): host SCRATCH folds exactly max_copied_tensor_bytes, k_scratch_headroom,
+    moe_cpu_expert_staging_bytes and moe_host_recipe_workspace_bytes."""
     terms = _scratch_fold_terms(texts)
     if terms is None:
         return ["SCRATCH fold: the host SCRATCH zone sum is not found"]
@@ -2172,7 +2174,7 @@ _PLANNED_GROW = (PLAN, _PLANNED_FIT,
                                 "alloc)) {\n            return slot.ptr;\n        }\n")
 _IDLE = "    if (idle_slots && ggml_sycl_attn_host_staging_enabled(kind)) {\n"
 _INIT_SCAN = "        ggml_sycl::host_pool_scan(cgraph, ggml_sycl::host_pool_has_storage, nullptr);\n"
-_FOLD_FOUR = "{ plan.max_tensor_bytes, k_scratch_headroom, moe_host_scratch }"
+_FOLD_FOUR = "{ plan.max_copied_tensor_bytes, k_scratch_headroom, moe_host_scratch }"
 _RUNTIME_FOUR = "    terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;\n"
 _HOOKS_AT = "        ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_has_active_placement_plan\"));\n"
 _OWNER_END = ("    if (owner_end) {\n"
@@ -2375,7 +2377,7 @@ MUTANTS = [
      "(routing_gate_planted_lifetime) stamps UNOWNED outside the site table's 12 lines"),
     ("unsized-term-unfolded", "unsized-ratchet",
      [(UC, _FOLD_FOUR, "{ k_scratch_headroom, moe_host_scratch }")],
-     "maps to max_tensor_bytes, which the host SCRATCH sum does not read"),
+     "maps to max_copied_tensor_bytes, which the host SCRATCH sum does not read"),
     ("unsized-graph-row", "unsized-ratchet", [_PLANTED_SITE],
      "maps to no plan term and is not one of the UNSIZED rows"),
     ("device-lifetime-lost", "device-holders", [(PBP, _PBP_DEVICE, _PBP_DEVICE.replace("DEVICE", "GRAPH"))],
@@ -2669,8 +2671,12 @@ MUTANTS = [
     ("fold-device-term", "scratch-fold",
      [(UC, _FOLD_FOUR, _FOLD_FOUR.replace(" }", ", plan.pp_moe_onednn_scratch_bytes }"))],
      "reads ['pp_moe_onednn_scratch_bytes'] beyond the four host terms"),
-    ("fold-term-dropped", "scratch-fold", [(UC, _FOLD_FOUR, "{ plan.max_tensor_bytes, moe_host_scratch }")],
+    ("fold-term-dropped", "scratch-fold", [(UC, _FOLD_FOUR, "{ plan.max_copied_tensor_bytes, moe_host_scratch }")],
      "lacks ['k_scratch_headroom']"),
+    # The fold back on the model-wide maximum: a host-kept gather-only table would size SCRATCH again.
+    ("fold-global-max", "scratch-fold",
+     [(UC, _FOLD_FOUR, _FOLD_FOUR.replace("max_copied_tensor_bytes", "max_tensor_bytes"))],
+     "reads ['max_tensor_bytes'] beyond the four host terms"),
     ("runtime-pp-term", "runtime-term",
      [(UCH, _RUNTIME_FOUR, _RUNTIME_FOUR.replace(";\n", " + plan.pp_moe_onednn_scratch_bytes;\n"))],
      "names ['pp_moe_onednn_scratch_bytes']"),

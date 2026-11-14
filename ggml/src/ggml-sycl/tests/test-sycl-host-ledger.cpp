@@ -733,6 +733,7 @@ placement_plan plan_with_zones(size_t weight, size_t kv, size_t staging, size_t 
     plan.host_zone_staging_bytes = staging;
     plan.host_zone_scratch_bytes = scratch;
     plan.max_tensor_bytes        = max_tensor;
+    plan.max_copied_tensor_bytes = max_tensor;
     return plan;
 }
 

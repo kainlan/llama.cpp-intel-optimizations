@@ -1067,7 +1067,7 @@ struct host_zone_commit_terms {
     size_t weight   = 0;  // host_zone_weight_bytes
     size_t kv       = 0;  // host_zone_kv_bytes, at least 64 MiB
     size_t staging  = 0;  // host_zone_staging_bytes
-    size_t scratch  = 0;  // host_zone_scratch_bytes, at least the live oneDNN scratch + max_tensor_bytes + 32 MiB
+    size_t scratch  = 0;  // host_zone_scratch_bytes, at least live oneDNN scratch + max_copied_tensor_bytes + 32 MiB
     size_t runtime  = 0;  // the RUNTIME pool: the oneDNN scratchpad and the DMA staging pool
     size_t rounding = 0;  // the zones and the runtime bytes each grown to whole chunks, chunk headers included
 
@@ -1207,6 +1207,10 @@ struct placement_plan {
     size_t                       host_zone_staging_bytes  = 0;
     size_t                       host_zone_scratch_bytes  = 0;
     size_t                       max_tensor_bytes         = 0;
+    // Largest tensor that can be copied through a host zone: max_tensor_bytes, leaving out a gather-only tensor with at
+    // least one plan entry, none on a device. The CPU reads such a table in place, so no staging, readback or fallback
+    // copy of it exists to hold. A gather-only tensor with no entry stays counted.
+    size_t                       max_copied_tensor_bytes  = 0;
     size_t                       max_staging_pair_bytes   = 0;
     // th32 §4.2: the ledger's stored budget when the plan was made, the host bytes the plan commits term by term (both
     // planner builders record them after populate_host_zone_sizing, and a re-plan that moves a zone term re-records
@@ -2251,8 +2255,9 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
     terms.weight  = plan.host_zone_weight_bytes;
     terms.kv      = std::max(plan.host_zone_kv_bytes, k_min_kv_zone_bytes);
     terms.staging = plan.host_zone_staging_bytes;
-    terms.scratch = std::max(plan.host_zone_scratch_bytes,
-                             sat_add(sat_add(onednn_live_bytes, plan.max_tensor_bytes), k_scratch_headroom_bytes));
+    terms.scratch =
+        std::max(plan.host_zone_scratch_bytes,
+                 sat_add(sat_add(onednn_live_bytes, plan.max_copied_tensor_bytes), k_scratch_headroom_bytes));
     // The PP pipeline scratch and the PP MoE oneDNN ring are VRAM allocations, so neither host pool carries them
     // (§4.4 "The runtime pre-allocate stops carrying the same two terms").
     terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;

@@ -2230,11 +2230,29 @@ by 32×.
 comment — an unjustified `any_tensor` reintroduces exactly the over-provision
 this exists to remove.
 
-Two consumers are deliberately left on `any_tensor`, and both comments say why:
+Two consumers stay on the model-wide class, and both comments say why:
 `moe_q8_workspace_bytes` is derived as `max_tensor_bytes / n_experts` and is
 therefore already a per-expert figure, and `s1_per_inflight_bytes` backs the S1
-preload, which streams *every* tensor including the embeddings. Narrowing that
-second one would be this bug in reverse.
+preload, which streams every tensor bound for a device, the embeddings
+included. Narrowing that second one to a per-layer maximum would be this bug in
+reverse. It leaves out only the one class the next paragraph describes, a
+gather-only table the plan keeps on the host, which S1 never streams.
+
+The host STAGING and SCRATCH zones, which hold only copies, leave out exactly
+one class: a tensor the loader marked gather-only (`get_rows_only`) that has at
+least one plan entry and none on a device. `plan.max_copied_tensor_bytes` is
+`max_tensor_bytes` without those tensors; STAGING (`s1_per_inflight_bytes` and
+the per-entry pair term), the SCRATCH fold and the commit floor in
+`placement_plan_host_zone_commit_terms` read it, and `max_tensor_bytes` keeps
+its meaning for every other reader. Such a table is read in place by the CPU:
+S1-PRELOAD serves it from the mapping or a WEIGHT-zone copy, and no fill,
+readback or CPU fallback copies it. Gather-only alone is not the test, because a
+device-resident token embedding is gather-only and takes a staged fill. The rule
+is the narrow one on purpose: `staging_buffer_pool` allocates with
+`forbid_host_zone_growth`, so an under-sized STAGING zone is an abort at load,
+not a slow path. On Qwen3.8-Flash-Next the left-out tensor is the 51,880.1 MiB
+`per_layer_token_embd.weight`, which on a mapping load sized STAGING at
+103,779.4 MB and SCRATCH at 52,362 MiB that nothing could use.
 
 ### There are TWO oneDNN sizing sites, not one
 
