@@ -459,8 +459,9 @@ if (BUILD_TESTING)
     # ledger in place of lazy-table.cpp's HOST_CPU allocation, and the workers read through the PRIVATE_TESTING read
     # source, so no device, no unified cache and no SYCL module. The fixture header defines the pool's other link seam,
     # ggml_sycl_strict_enabled, as a switch only the strict arms' children turn on. Links lazy-io-pool.cpp with the row
-    # cache its reaper inserts into (lazy-row-cache.cpp, host-cpu-mapping.cpp) and ggml-base for the log and the abort.
-    # The workers' reads are pread, so it is Linux-only.
+    # cache its reaper inserts into (lazy-row-cache.cpp, host-cpu-mapping.cpp), the ubatch gather that submits to it
+    # (lazy-gather.cpp, device-free too) and ggml-base for the log and the abort. The workers' reads are pread, so it is
+    # Linux-only.
     #
     # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
     # and the FAIL line the arm that kills it prints. Each registers test-sycl-lazy-io-engine-host-mutant-<name> on the
@@ -529,6 +530,7 @@ if (BUILD_TESTING)
             ticket-zero-no-notify             "${_le_re_ticket_zero_no_notify}")
         add_executable(test-sycl-lazy-io-engine-host
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
+            lazy-gather.cpp
             lazy-io-pool.cpp
             lazy-row-cache.cpp
             host-cpu-mapping.cpp)
