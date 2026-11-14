@@ -980,6 +980,13 @@ if (Python3_Interpreter_FOUND)
     # TIMEOUT: the 96-mutant self-test took 52 s wall at host load 10-11.
     set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
+    # The prompt's CPU island (dispatch_host_expert_groups) copies by its plan: each distinct activation row once in
+    # runs, results in destination order, no per-row copy loop. The only gate on that lambda. Run WITH --self-test so
+    # each mutant is caught by the pin it names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-host-island-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-host-island-source.py --self-test)
+    set_tests_properties(test-sycl-moe-host-island-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
     # llama.cpp-36j0 Task 4: the MoE executor knobs' literals, log formats, env-report rows and teardown summary.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-exec-knobs-source
