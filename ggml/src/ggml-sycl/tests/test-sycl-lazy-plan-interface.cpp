@@ -108,6 +108,27 @@ bool reading_too_low(arm_result & r, size_t bytes) {
     return true;
 }
 
+// The last [HOST-PLAN] lazy line's budget cannot hold `bytes` beside its zones, reserve and envelope, the fit-room term
+// of the planner's HOST test (budget - (zones + reserve + envelope) >= the table's body): the arm is VOID, since the
+// budget, not the plan, decided.
+bool fit_room_too_low(arm_result & r, size_t bytes) {
+    const std::vector<std::string> lines = log_lines_containing("[HOST-PLAN] lazy ");
+    if (lines.empty()) {
+        return false;
+    }
+    const size_t budget   = printed(lines.back(), "budget");
+    const size_t zones    = printed(lines.back(), "zones");
+    const size_t reserve  = printed(lines.back(), "reserve");
+    const size_t envelope = printed(lines.back(), "envelope");
+    if (budget == SIZE_MAX || zones == SIZE_MAX || reserve == SIZE_MAX || envelope == SIZE_MAX ||
+        budget >= zones + reserve + envelope + bytes) {
+        return false;
+    }
+    void_arm(r, "the load's host budget " + num(budget) + " cannot hold " + num(bytes) + " bytes beside zones of " +
+                    num(zones) + ", a reserve of " + num(reserve) + " and an envelope of " + num(envelope));
+    return true;
+}
+
 // (a) Through the stage: a 64 MiB table in the inventory is HOST in the early candidate, the late candidate and the
 // published plan, each holding the table's body, and the published plan leaves with the model. The table sits at
 // 4032, the unaligned offset of DeepSeek's blk.14.engram_embd, where the body's O_DIRECT window crosses one more huge
@@ -408,10 +429,13 @@ arm_result arm_e_stage_refuses_a_count_with_no_array() {
 // (g) storage_only crosses the boundary: arm (a)'s 64 MiB table, flagged, is STORAGE in the published plan, holding at
 // most its 66 MiB body (the ceiling's body term), and its own [PLACEMENT] line says so.
 // Engagement: arm (a) publishes the same table HOST, holding exactly the body; the log is cleared before the stage,
-// and the line matched names this table. The arm VOIDs when the host could not have held the body (the load's
-// MemAvailable reading cannot clear P3 with the body resident): an unflagged table would then fall through to
-// STORAGE too, and a dropped flag would pass every check below.
-// Mutants: the copy loop not copying storage_only (the table is HOST, its line says residency=HOST).
+// and the line matched names this table. The arm VOIDs when the host could not have held the body: the load's
+// MemAvailable reading cannot clear P3 with the body resident, or the budget's fit room (budget less zones, reserve and
+// envelope) is short of it. An unflagged table would then fall through to STORAGE too, and a dropped flag would pass
+// every check below.
+// Mutants: the copy loop not copying storage_only (the table is HOST, its line says residency=HOST); the planner not
+// holding a storage-only cache to its ceiling (the cache takes every row, a 64 MiB slab plus a ~25 MiB index, past the
+// 66 MiB body).
 arm_result arm_g_storage_only_crosses_the_boundary() {
     arm_result                arr;
     loader_inventory          inv;
@@ -435,7 +459,7 @@ arm_result arm_g_storage_only_crosses_the_boundary() {
         void_arm(arr, "the early stage returned " + num(early_rc));
         return arr;
     }
-    if (reading_too_low(arr, body)) {
+    if (reading_too_low(arr, body) || fit_room_too_low(arr, body)) {
         (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
         return arr;
     }

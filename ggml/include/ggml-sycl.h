@@ -303,8 +303,10 @@ struct ggml_sycl_lazy_table_info {
     uint32_t       file_index;
     size_t         file_offset;
     size_t         size;
-    // Set by libllama for a table it never wants resident: the planner places it STORAGE whatever the host room and
-    // caps its row cache (unified-cache.cpp, placement_plan_decide_lazy_residency).
+    // Set by libllama for a table it never wants held whole on the host: the planner never places it HOST (it is
+    // STORAGE, or the plan refuses) and caps its row cache (unified-cache.cpp, placement_plan_decide_lazy_residency).
+    // The array of these is indexed by sizeof on the libggml-sycl side, so libllama and libggml-sycl must be rebuilt
+    // together.
     bool           storage_only;
 };
 
