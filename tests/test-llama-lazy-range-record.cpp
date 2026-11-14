@@ -197,8 +197,9 @@ int main() {
         llama_lazy_range_record rec;
         llama_lazy_range_record_prefill(rec, LLM_ARCH_LLAMA, hp, declared, fx.finder(), mode_pre, mode_post, true,
                                         true);
-        // the taker read AUTO, and LLM_ARCH_LLAMA has no STORAGE consumer, so the table is the ordinary weight: one WARN per
-        // row AUTO would have made STORAGE (4 GiB + 1 and the sparse 6 GiB), which a fill reading OFF never prints
+        // the taker read AUTO, and LLM_ARCH_LLAMA has no STORAGE consumer, so the table is the ordinary weight: one
+        // WARN per row AUTO would have made STORAGE (4 GiB + 1 and the sparse 6 GiB), which a fill reading OFF never
+        // prints
         CHECK(!rec.eligible("lz_sparse") && rec.deferral("lz_sparse") == LLAMA_LAZY_DEFERRAL_EAGER,
               "the witness cell: the sparse row is %s, eligible=%d",
               llama_lazy_deferral_name(rec.deferral("lz_sparse")), rec.eligible("lz_sparse") ? 1 : 0);
