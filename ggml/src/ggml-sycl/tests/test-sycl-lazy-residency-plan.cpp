@@ -442,6 +442,36 @@ arm_result arm_d_qwen_flip() {
     return r;
 }
 
+// (j) A storage-only table is STORAGE at a reading where the same table without the flag is HOST.
+// Engagement: the control plan (no flag, arm (d)'s "above" reading) carries the table HOST.
+// Mutants: the flag not read by the HOST test (the flagged table is HOST).
+// This arm checks residency and floor only; the cache's size is another arm's.
+arm_result arm_j_storage_only_skips_host() {
+    arm_result                             r;
+    const lazy_test_coverage_pin           pin    = ggml_sycl_test_make_coverage_pin(0);
+    std::vector<placement_lazy_table_info> tables = qwen_tables();
+    size_t                                 step2  = 0;
+    if (!step2_of(r, qwen38_shape, pin.pin(), step2)) {
+        return r;
+    }
+    const size_t reading = step2 + host_body(tables[0]) + k_p3_margin + 1 * GiB;
+    expect_host(r, plan_for(qwen38_shape, kv_with(tables, reading), pin.pin()), tables[0], "control: ");
+
+    tables[0].storage_only          = true;
+    const placement_kv_info      kv = kv_with(tables, reading);
+    const placement_plan         p  = plan_for(qwen38_shape, kv, pin.pin());
+    const placement_lazy_table * t  = find_table(p, tables[0].name);
+    expect(r, p.lazy_refusal.empty(), "the plan refused: " + p.lazy_refusal);
+    expect(r, t != nullptr && t->residency == lazy_residency::STORAGE,
+           std::string("the flagged table is ") + (t ? residency_name(t->residency) : "absent") + ", want STORAGE");
+    expect(r,
+           t != nullptr && t->cache_floor_slots == floor_slots(tables[0], kv) &&
+               t->cache_slots >= t->cache_floor_slots && t->host_resident_bytes >= floor_raw_bytes(tables[0], kv),
+           "the flagged table is below its floor");
+    expect_pin_held(r, pin);
+    return r;
+}
+
 // (e) With no coverage pin no table is STORAGE-eligible: at a reading where neither DeepSeek table passes the HOST test
 // the plan refuses as lazy-table-ring-unpinned, carrying no table and no ring.
 // Engagement: arm (b) plans the same tables at the same reading with a pin and carries both STORAGE.
@@ -677,6 +707,7 @@ int main(int argc, char ** argv) {
         { "(g) the planner's fit keeps both tables STORAGE",  arm_g_the_fit_decides                              },
         { "(h) floors past P3 refuse as cache-below-floor",   arm_h_floors_past_p3_refuse                        },
         { "(i) an unnamed micro-batch floors at the default", arm_i_an_unnamed_micro_batch_floors_at_the_default },
+        { "(j) a storage-only table skips the HOST test",     arm_j_storage_only_skips_host                      },
     };
     if (g_devices == 1) {
         arms.push_back(
