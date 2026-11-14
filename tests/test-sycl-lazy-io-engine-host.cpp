@@ -1806,7 +1806,8 @@ arm_result arm_gather_throw_waits() {
         }
         const int rc = gathered.get();
         if (!picked) {
-            // The worker the release frees picks the stranded read on its next loop, so the reap below still settles.
+            // The stranded read waits for the next fresh read's wake, since no held worker may exist to loop back to
+            // it, so its lease can outlive this arm and leave a later arm VOID. Only a defect reaches this branch.
             fail(r, "after a submit threw, a queued read was never picked by a worker: " + num(queued) +
                         " read(s) queued or held under countdown " + num(k));
             break;
