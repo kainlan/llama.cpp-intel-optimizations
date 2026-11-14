@@ -411,6 +411,7 @@ def test_the_lazy_table_owner_cannot_be_copied():
 def test_the_saver_refuses_a_storage_table_before_it_touches_the_gguf_context():
     # a STORAGE table has no data in memory: saving it would write a tensor without data, so add_tensor must stop on it
     # with an abort that names the tensor, ahead of both the duplicate lookup and the add
+    # and after the null-tensor early return, because the saver passes null tensors
     body = function_body(read_code(SAVER_CPP), r"void\s+llama_model_saver::add_tensor\s*\((?:[^()]|\([^()]*\))*\)")
     i_find = body.find("gguf_find_tensor(")
     i_add = body.find("gguf_add_tensor(")

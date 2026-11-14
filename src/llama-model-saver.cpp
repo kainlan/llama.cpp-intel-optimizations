@@ -133,7 +133,7 @@ void llama_model_saver::add_tensor(const struct ggml_tensor * tensor) {
         return;
     }
     // a STORAGE table is read from its model file on demand and has no data in memory, so writing it would produce a
-    // tensor without data; the saver's entry point returns nothing, so the failure is an abort, before any file exists
+    // tensor without data; the saver's entry point returns nothing, so the failure is an abort, before anything is written
     if (model != nullptr && model->lazy_storage(ggml_get_name(tensor)) != nullptr) {
         GGML_ABORT(
             "cannot save the table %s: it is read from the model file on demand and is not in memory; "
