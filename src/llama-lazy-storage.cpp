@@ -52,6 +52,22 @@ int llama_lazy_storage::gather(const int32_t * rows, size_t n, void * dst, size_
     return procs_.gather(handle_, rows, n, dst, dst_bytes);
 }
 
+// Stubs: the contract is in the header, and the behaviour tests in tests/test-llama-lazy-storage.cpp fail on them.
+bool llama_lazy_storage::can_gather_f32() const {
+    return false;
+}
+
+int llama_lazy_storage::gather_f32(const int32_t *        rows,
+                                   size_t                 n,
+                                   std::vector<uint8_t> & raw,
+                                   std::vector<float> &   out) const {
+    GGML_UNUSED(rows);
+    GGML_UNUSED(n);
+    GGML_UNUSED(raw);
+    GGML_UNUSED(out);
+    return ENOSYS;
+}
+
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 ggml_sycl_lazy_table_info llama_lazy_storage_table_info(const llama_lazy_storage_table & t) {
     ggml_sycl_lazy_table_info i = {};

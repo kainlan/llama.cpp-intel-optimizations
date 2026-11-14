@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 struct llama_sycl_model_token;
 
@@ -38,6 +39,17 @@ class llama_lazy_storage {
     // returns true: the backend counts opens, and the destructor closes exactly once.
     bool open(const llama_sycl_model_token & token);
     int  gather(const int32_t * rows, size_t n, void * dst, size_t dst_bytes) const;  // 0, ENODEV unopened, or errno
+
+    // Whether gather_f32() can produce this table's rows as f32: the type is F32, or the type has a to_float.
+    bool can_gather_f32() const;
+
+    // Gathers `n` rows as f32 into `out`, n * ne0() values in the order of `rows`, through gather(). An F32 table's
+    // rows are read straight into `out`; any other type is read into `raw` and converted with its to_float in one
+    // call. Returns 0, or an errno value: ENOTSUP when can_gather_f32() is false (nothing is read), ENOMEM when a
+    // scratch cannot grow, otherwise what gather() returns (ENODEV on a handle that is not open). Never throws. `raw`
+    // and `out` are the caller's scratch, kept across calls so that a warm call allocates nothing; after a failure
+    // their contents are unspecified.
+    int gather_f32(const int32_t * rows, size_t n, std::vector<uint8_t> & raw, std::vector<float> & out) const;
 
     bool is_open() const { return handle_ != nullptr; }
 
