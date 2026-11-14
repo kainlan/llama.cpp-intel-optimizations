@@ -81,6 +81,12 @@ def read(path):
     return strip_comments(Path(path).read_text())
 
 
+# A parameter list, allowing one level of nested parentheses.  A default argument such as
+# `__builtin_FILE()` closes a parenthesis inside the list, so a flat `\([^)]*\)` stops there and the
+# signature no longer matches at all.
+PARAMS = r"\((?:[^()]|\([^()]*\))*\)"
+
+
 def function_body(source, signature_regex):
     """Return the brace-balanced body of the first function matching the regex."""
     m = re.search(signature_regex, source)
@@ -108,9 +114,9 @@ HOST_WAIT = re.compile(r"(\.|->|::)\s*wait\s*\(|wait_and_throw|\bsynchronize\s*\
 def evaluate(backend, concat, common):
     results = {}
 
-    compat = function_body(backend, r"static ggml_sycl_graph_compat check_graph_compatibility\([^)]*\)\s*\{")
-    impl = function_body(concat, r"void concat_impl_sycl\([^)]*\)\s*\{")
-    op = function_body(concat, r"void ggml_sycl_op_concat\([^)]*\)\s*\{")
+    compat = function_body(backend, r"static ggml_sycl_graph_compat check_graph_compatibility" + PARAMS + r"\s*\{")
+    impl = function_body(concat, r"void concat_impl_sycl" + PARAMS + r"\s*\{")
+    op = function_body(concat, r"void ggml_sycl_op_concat" + PARAMS + r"\s*\{")
     results["anchor: check_graph_compatibility exists"] = compat is not None
     results["anchor: concat_impl_sycl exists"] = impl is not None
     results["anchor: ggml_sycl_op_concat exists"] = op is not None
@@ -144,7 +150,7 @@ def evaluate(backend, concat, common):
     # --- the dim-0 / non-contiguous kernel qwen35 actually runs ------------------
     # It strides i0 by the local range, so a (1,1,1) work-group runs the whole row on one lane. The launch
     # must give each (i3,i2,i1) row a full work-group.
-    non_cont = function_body(concat, r"static void concat_T_sycl_non_cont\([^)]*\)\s*\{")
+    non_cont = function_body(concat, r"static void concat_T_sycl_non_cont" + PARAMS + r"\s*\{")
     results["anchor: concat_T_sycl_non_cont exists"] = non_cont is not None
     if non_cont is not None:
         results["non-contiguous concat launches a full work-group per row"] = \
@@ -152,7 +158,7 @@ def evaluate(backend, concat, common):
             re.search(r"range<3>\(\s*1\s*,\s*1\s*,\s*1\s*\)", non_cont) is None
 
     # --- the helper the op copies through is alignment-correct ------------------
-    safe = function_body(common, r"inline sycl::event ggml_sycl_graph_safe_memcpy\([^)]*\)\s*\{")
+    safe = function_body(common, r"inline sycl::event ggml_sycl_graph_safe_memcpy" + PARAMS + r"\s*\{")
     results["anchor: ggml_sycl_graph_safe_memcpy exists"] = safe is not None
     if safe is not None:
         recording = safe[:safe.find("const int             queue_device")] if "const int             queue_device" in safe \
@@ -214,9 +220,9 @@ if args.self_test:
         k = src.find(old, m.end())
         return src[:k] + new + src[k + len(old):]
 
-    compat_sig = r"static ggml_sycl_graph_compat check_graph_compatibility\([^)]*\)\s*\{"
-    impl_sig = r"void concat_impl_sycl\([^)]*\)\s*\{"
-    safe_sig = r"inline sycl::event ggml_sycl_graph_safe_memcpy\([^)]*\)\s*\{"
+    compat_sig = r"static ggml_sycl_graph_compat check_graph_compatibility" + PARAMS + r"\s*\{"
+    impl_sig = r"void concat_impl_sycl" + PARAMS + r"\s*\{"
+    safe_sig = r"inline sycl::event ggml_sycl_graph_safe_memcpy" + PARAMS + r"\s*\{"
     first_stmt = "const size_t size0 = src0.nbytes();"
     # Inject into the first node-op switch of the compat scan: the rejection as it used to be.
     reject = "case GGML_OP_CONCAT: GGML_LOG_INFO(\"%s: disabling SYCL graphs due to unsupported node type %s\\n\", " \
@@ -257,7 +263,7 @@ if args.self_test:
          with_concat(mutate_in_func(concat, impl_sig, "GGML_ASSERT(stream->has_property<sycl::property::queue::in_order>());",
                                     "bool ok = stream->has_property<sycl::property::queue::in_order>(); GGML_ASSERT(true);"))),
         ("single-lane work-group restored", "non-contiguous concat launches a full work-group per row",
-         with_concat(mutate_in_func(concat, r"static void concat_T_sycl_non_cont\([^)]*\)\s*\{",
+         with_concat(mutate_in_func(concat, r"static void concat_T_sycl_non_cont" + PARAMS + r"\s*\{",
                                     "sycl::range<3>(1, 1, SYCL_CONCAT_BLOCK_SIZE))", "sycl::range<3>(1, 1, 1))"))),
         ("int32 split restored", "recording copy never splits an int32 body from a byte tail",
          (backend, concat, mutate_in_func(common, safe_sig, "if (g_ggml_sycl_graph_recording) {",

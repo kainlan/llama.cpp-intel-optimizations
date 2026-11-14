@@ -968,7 +968,7 @@ if (Python3_Interpreter_FOUND)
     # experts). Run WITH --self-test so each anchor is proven load-bearing.
     add_test(NAME test-sycl-moe-cpu-activation-row-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-activation-row-source.py --self-test)
-    # TIMEOUT: the 79-mutant self-test took 37 s wall at host load 9.5.
+    # TIMEOUT: the 96-mutant self-test took 52 s wall at host load 10-11.
     set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # llama.cpp-36j0 Task 4: the MoE executor knobs' literals, log formats, env-report rows and teardown summary.
