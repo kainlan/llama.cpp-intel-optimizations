@@ -7650,9 +7650,9 @@ void llama_context::opt_epoch_iter(
 
             res->set_inputs(&ubatch);
             if (res->inputs_failed()) {
-                LLAMA_LOG_ERROR("%s: a graph input could not be set\n", __func__);
-                ggml_free(ctx_compute_opt);
-                break;
+                // ggml_opt_alloc has armed the optimizer for this graph and ggml-opt has no call that disarms it, and
+                // opt_epoch returns void, so a ubatch without its inputs cannot be skipped
+                GGML_ABORT("%s: a graph input could not be set; training cannot skip the ubatch", __func__);
             }
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);

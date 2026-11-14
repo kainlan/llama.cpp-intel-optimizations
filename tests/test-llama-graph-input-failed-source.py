@@ -46,7 +46,6 @@ def function_body(code: str, signature_re: str) -> str:
     return balanced(code, code.index("{", m.end()))
 
 
-
 def test_process_ubatch_stops_on_a_failed_input():
     body = function_body(
         read_code(CONTEXT_CPP),
@@ -76,4 +75,4 @@ def test_opt_epoch_iter_stops_on_a_failed_input():
         "the optimizer epoch must check for a failed input between set_inputs and ggml_opt_eval"
     )
     seg = body[i_fail:i_eval]
-    assert "break;" in seg, "the optimizer epoch must leave its loop when an input failed"
+    assert "GGML_ABORT" in seg, "the optimizer epoch must abort when an input failed: the optimizer cannot be disarmed"
