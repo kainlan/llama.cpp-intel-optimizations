@@ -271,15 +271,25 @@ def test_a_storage_tensor_bypasses_buffers_and_is_opened_after_the_load():
     i_store = ct.find("create_storage_tensor(")
     i_buft = ct.rfind("buft_for_tensor(")
     assert 0 <= i_check < i_store < i_buft, "a STORAGE tensor must leave create_tensor before the last buft_for_tensor()"
-    assert "llama_lazy_range_is_storage(" in ct, "create_tensor asks the record whether a row is STORAGE"
+    # lazy_read must never take a STORAGE row as a member, so the STORAGE return precedes lazy.add()
+    i_add = ct.find("lazy.add(")
+    assert 0 <= i_store < i_add, "a STORAGE tensor must leave create_tensor before lazy.add()"
+    assert re.search(
+        r"if\s*\(\s*llama_lazy_range_is_storage\s*\((?:[^()]|\([^()]*\))*\)\s*\)\s*\{\s*return\s+create_storage_tensor\s*\(",
+        ct,
+    ), "create_tensor returns create_storage_tensor() exactly when the record says the row is STORAGE"
     lt = load_tensors_body()
-    i_entries = lt.find("new llama_lazy_storage(")
+    i_entries = lt.find("std::make_unique<llama_lazy_storage>(")
     i_probe = lt.find("probe")
     assert 0 <= i_entries < i_probe, "the storage entries must exist before the probe measure builds a graph"
     tail = lt[lt.rfind("has_sycl_weight_buffer"):]
-    assert re.search(r"finish\(true\);\s*for\s*\(.*lazy_storage.*\)\s*\{[^}]*->open\(", tail, re.S), (
+    # [^{;]* keeps the loop header and its body one loop: it cannot reach from another loop to a later open
+    assert re.search(r"finish\(true\);\s*for\s*\([^{;]*lazy_storage[^{;]*\)\s*\{[^}]*->open\(", tail), (
         "every storage entry is opened right after the load's finish")
-    assert re.search(r"file_paths.*\.empty\(\)", lt), "a STORAGE table with no file path refuses"
+    path = re.search(r"if\s*\(([^{};]*file_paths[^{};]*\.empty\(\)[^{};]*)\)\s*\{", lt)
+    assert path, "load_tensors() does not test a STORAGE table's file path for emptiness"
+    refusal = balanced(lt, path.end() - 1)
+    assert "throw" in refusal and "t.name" in refusal, "a STORAGE table with no file path refuses, naming the table"
 
 
 def test_the_storage_refusal_function_throws_on_exactly_a_storage_row():
