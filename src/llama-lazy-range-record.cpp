@@ -247,7 +247,7 @@ std::vector<llama_lazy_storage_table> llama_lazy_range_storage_tables(const llam
         }
         const ggml_tensor * t = tensor(row.name);
         if (t == nullptr) {
-            GGML_ABORT("lazy-range record: STORAGE row %s has no tensor in the model file", row.name.c_str());
+            GGML_ABORT("lazy-range record: the tensor lookup found no tensor for STORAGE row %s", row.name.c_str());
         }
         llama_lazy_storage_table s = {};
         s.name                     = row.name;
