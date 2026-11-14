@@ -55,8 +55,8 @@
 // shape, so between those two the call alone attributes the bytes; the reserve is now an UNOWNED request and the
 // loader's buffer a MODEL one, so their lifetimes separate them as well. Every byte the zone gains belongs to a named
 // term or to unplanned loader residency, which is reported on its own line; any other byte fails. The terms stay within
-// their bytes and the zone does not grow for them. It needs a device, so a host without one exits 77 after arms 1, 1b
-// and 3a have passed.
+// their bytes and the zone does not grow for them. It needs a device, so a host without one exits 77 after arms 1, 1b,
+// 3a and 4 have passed.
 //
 // Arm 1b (no device) re-backs one host expert FILE_MAPPED and another CPU_OWNED on the single-device plan and asserts
 // that neither one's bytes reach host_weights, blocks or tlsf_bound, while host_weights still equals the plan's
@@ -74,6 +74,11 @@
 // the buffer from its file offset as load_all_data does, reads one in place as the file's own bytes, and measures the
 // WEIGHT zone around it: it must not grow. Its positive control is a pinned copy of the same bytes through S1-PRELOAD's
 // request, which must grow the zone by at least those bytes, the effect a hook that copied into the pinned pool has.
+//
+// Arm 4 (no device, both builders) adds a gather-only table 64x the largest tensor that the starved plan keeps on the
+// host. The host STAGING and SCRATCH zones hold only copies, and the CPU reads such a table in place, so both zones and
+// the commit floor must equal those of the plan without it. Its controls: the same tensor not gather-only sizes both
+// zones as before, and a gather-only tensor the plan puts on a device (it takes a staged fill) still counts.
 
 #include "../common.hpp"
 #include "../ggml-sycl-test.hpp"
@@ -84,6 +89,7 @@
 #include "host-planner-test-fixture.hpp"
 #include "sycl-test-skip.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -297,23 +303,29 @@ derived_terms derive_terms(const placement_plan & plan) {
     return t;
 }
 
+// The starved budget every arm but arm 4's device-bound control plans with.
+constexpr size_t k_starved_vram_budget = 1 * MiB;
+
 // `kv` carries the load's host-backing fact; the default is a load that does not map files.
-placement_plan plan_q2k(const std::vector<placement_tensor_info> & inventory, const placement_kv_info & kv = {}) {
+placement_plan plan_q2k(const std::vector<placement_tensor_info> & inventory,
+                        const placement_kv_info &                  kv          = {},
+                        size_t                                     vram_budget = k_starved_vram_budget) {
     const ggml_sycl_device_info   info = make_mock_sycl_info(1, k_card_vram, k_card_nsm, k_card_name);
     test_sycl_info_override_guard info_guard(info);
-    // A budget far below the experts: every expert, and with them the dense weights, is host-resident.
-    return compute_placement_plan(inventory, /*vram_budget=*/1 * MiB, /*device_id=*/0, kv, nullptr, k_experts,
+    // At the default budget, far below the experts, every expert, and with them the dense weights, is host-resident.
+    return compute_placement_plan(inventory, vram_budget, /*device_id=*/0, kv, nullptr, k_experts,
                                   host_ledger_budget());
 }
 
-// The other planner builder, over two cards with the same starved budget.
-placement_plan plan_q2k_two_devices(const std::vector<placement_tensor_info> & inventory) {
+// The other planner builder, over two cards with the same budget each.
+placement_plan plan_q2k_two_devices(const std::vector<placement_tensor_info> & inventory,
+                                    size_t                                     vram_budget = k_starved_vram_budget) {
     const ggml_sycl_device_info      info = make_mock_sycl_info(2, k_card_vram, k_card_nsm, k_card_name);
     test_sycl_info_override_guard    info_guard(info);
     placement_kv_info                kv{};
     const std::vector<device_budget> budgets = {
-        { 0, 1 * MiB, 16ull * 1024ull * MiB, 1.0, true },
-        { 1, 1 * MiB, 16ull * 1024ull * MiB, 1.0, true },
+        { 0, vram_budget, 16ull * 1024ull * MiB, 1.0, true },
+        { 1, vram_budget, 16ull * 1024ull * MiB, 1.0, true },
     };
     return compute_multi_device_plan(budgets, inventory, k_layers, multi_gpu_mode::HYBRID, kv, nullptr, k_experts,
                                      host_ledger_budget());
@@ -513,6 +525,91 @@ void arm1b_walk_counts_only_weight_zone_backings(const placement_plan & built) {
     std::printf("  [HOST-PLAN-BUG] comparison on a mis-charged plan: figures %s\n",
                 mis_charged_differs ? "differ" : "agree");
     check(mis_charged_differs, "a host expert re-backed without moving its charge makes the figures differ");
+}
+
+// --- arm 4: a host-kept gather-only table sizes no zone that holds copies ---
+
+using plan_builder = placement_plan (*)(const std::vector<placement_tensor_info> &, size_t vram_budget);
+
+placement_plan build_single(const std::vector<placement_tensor_info> & inventory, size_t vram_budget) {
+    return plan_q2k(inventory, {}, vram_budget);
+}
+
+placement_plan build_two_devices(const std::vector<placement_tensor_info> & inventory, size_t vram_budget) {
+    return plan_q2k_two_devices(inventory, vram_budget);
+}
+
+// A Q8_0 row-lookup table shaped like the per-layer token embedding, `scale` times `base_max` bytes or just under.
+placement_tensor_info gather_table(size_t base_max, size_t scale, bool gather_only) {
+    const int64_t         n_cols = 160;
+    const int64_t         n_rows = static_cast<int64_t>(base_max * scale / ggml_row_size(GGML_TYPE_Q8_0, n_cols));
+    placement_tensor_info table  = tensor("per_layer_token_embd.weight", GGML_TYPE_Q8_0, n_cols, n_rows);
+    table.get_rows_only          = gather_only;
+    return table;
+}
+
+// Whether the plan's one entry for `name` is on a device; false when the plan has no dense entry of that name.
+bool dense_entry_on_device(const placement_plan & plan, const std::string & name) {
+    const placement_entry * e = plan.find_dense_entry(name);
+    return e != nullptr && e->on_device;
+}
+
+// Arm 4: the CPU reads a gather-only table the plan keeps on the host in place, so no staging, readback or fallback
+// copy of it exists, and the host STAGING and SCRATCH zones and the commit floor do not grow for it. A host tensor
+// that is not gather-only, and a gather-only tensor the plan puts on a device (its fill is staged), still count.
+// Mutants: a rule that leaves out every gather-only tensor (the device-bound control counts nothing); one that leaves
+// out every host tensor (the dense control's STAGING does not grow); a reader left on max_tensor_bytes (the matching
+// zone grows with the host table).
+void arm4_host_gather_only_table_sizes_no_copy_zone(const char * builder_name, plan_builder build) {
+    std::printf("(4) [%s] a host-kept gather-only table sizes no host STAGING or SCRATCH\n", builder_name);
+
+    const std::vector<placement_tensor_info> base     = q2k_inventory();
+    size_t                                   base_max = 0;
+    for (const placement_tensor_info & t : base) {
+        base_max = std::max(base_max, t.size);
+    }
+
+    // The host table: 64x the largest tensor, so a zone sized from it is far from one sized without it.
+    const placement_tensor_info        table      = gather_table(base_max, 64, /*gather_only=*/true);
+    std::vector<placement_tensor_info> with_table = base;
+    with_table.push_back(table);
+
+    const placement_plan ref  = build(base, k_starved_vram_budget);
+    const placement_plan plan = build(with_table, k_starved_vram_budget);
+
+    check(table.size > base_max, "the table is larger than every other tensor");
+    check_eq("the table is the model-wide maximum", plan.max_tensor_bytes, table.size);
+    check(plan.find_dense_entry(table.name) != nullptr, "the plan has an entry for the table");
+    check(!dense_entry_on_device(plan, table.name), "the table's entry is host-resident");
+
+    check_eq("the largest copied tensor leaves the host table out", plan.max_copied_tensor_bytes, base_max);
+    check_eq("host STAGING is unchanged by a host-kept table", plan.host_zone_staging_bytes,
+             ref.host_zone_staging_bytes);
+    check_eq("host SCRATCH is unchanged by a host-kept table", plan.host_zone_scratch_bytes,
+             ref.host_zone_scratch_bytes);
+    const host_zone_commit_terms ref_terms  = placement_plan_host_zone_commit_terms(ref, 0, 2048ull * MiB);
+    const host_zone_commit_terms plan_terms = placement_plan_host_zone_commit_terms(plan, 0, 2048ull * MiB);
+    check_eq("the commit floor's SCRATCH is unchanged by a host-kept table", plan_terms.scratch, ref_terms.scratch);
+
+    // Control: the same tensor, not gather-only, is a dense weight a fill or a fallback can copy, so it still sizes
+    // both zones.
+    const placement_tensor_info        dense_table = gather_table(base_max, 64, /*gather_only=*/false);
+    std::vector<placement_tensor_info> with_dense  = base;
+    with_dense.push_back(dense_table);
+    const placement_plan dense = build(with_dense, k_starved_vram_budget);
+    check(!dense_entry_on_device(dense, dense_table.name), "the dense control's entry is host-resident too");
+    check_eq("a host tensor that is not gather-only still counts", dense.max_copied_tensor_bytes, dense_table.size);
+    check(dense.host_zone_staging_bytes >= 2 * dense_table.size, "and host STAGING grows with it");
+    check(dense.host_zone_scratch_bytes >= dense_table.size, "and host SCRATCH grows with it");
+
+    // Control: a gather-only tensor the plan puts on a device takes a staged fill, so it counts. 4x the largest tensor
+    // keeps it the model-wide maximum, and the card's whole VRAM as the budget puts it on the device.
+    const placement_tensor_info        device_table = gather_table(base_max, 4, /*gather_only=*/true);
+    std::vector<placement_tensor_info> with_device  = base;
+    with_device.push_back(device_table);
+    const placement_plan on_device = build(with_device, k_card_vram);
+    check(dense_entry_on_device(on_device, device_table.name), "the device control's table is on a device");
+    check_eq("a device-bound gather-only tensor still counts", on_device.max_copied_tensor_bytes, device_table.size);
 }
 
 // --- arm 2: the census ---
@@ -1121,6 +1218,8 @@ int main() {
     placement_plan plan{};
     arm1_weight_zone_is_exact_bytes_plus_named_terms(inventory, tensors, plan);
     arm1b_walk_counts_only_weight_zone_backings(plan);
+    arm4_host_gather_only_table_sizes_no_copy_zone("compute_placement_plan", build_single);
+    arm4_host_gather_only_table_sizes_no_copy_zone("compute_multi_device_plan", build_two_devices);
     const mapping_load mapping = arm3a_mapping_load_keeps_no_weight_on_sycl_host(inventory, tensors, plan);
 
     bool       measured_loader = false;
@@ -1135,7 +1234,7 @@ int main() {
         return 1;
     }
     if (!ran_census) {
-        std::printf("SKIP: arms 1, 1b and 3a passed; arms 2 and 3b need a device and proved nothing\n");
+        std::printf("SKIP: arms 1, 1b, 3a and 4 passed; arms 2 and 3b need a device and proved nothing\n");
         return SYCL_TEST_SKIP;
     }
     if (!measured_loader) {
