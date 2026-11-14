@@ -1272,7 +1272,11 @@ arm_result arm_engine_worker_drop() {
 }
 
 // A ticket's wait returns once its three reads are delivered, every row landed and no error; a ticket with nothing
-// submitted returns at once; a failed read returns its errno. Every wait is bounded.
+// submitted returns at once; a failed read returns its errno. Every wait is bounded. The three reads are held on a
+// gate until the wait has been seen blocked for 200 ms, so the wait cannot pass by starting after they finished.
+// Engagement, VOID counting as failed: the three reads are held on workers before the wait starts.
+// Mutants: ticket-wait-returns-at-once, under which the wait returns with the reads held, and ticket-zero-no-notify,
+// under which the wait is never woken once they are released.
 arm_result arm_ticket_wait() {
     arm_result r;
     ring_lease lease = lazy_io_pool_take();
@@ -1282,12 +1286,26 @@ arm_result arm_ticket_wait() {
         return r;
     }
     ggml_sycl_test_lazy_io_read_source(fill_source, nullptr);
-    int rc = -1;
     {
-        auto idle = std::make_shared<request_fixture>(1);
-        expect(r, returns_within([idle] { return lazy_io_ticket_wait(idle->ticket); }, 5, rc) && rc == 0,
-               "an empty ticket's wait did not return 0 within 5 s");
+        auto       idle    = std::make_shared<request_fixture>(1);
+        int        idle_rc = -1;
+        const bool back    = returns_within([idle] { return lazy_io_ticket_wait(idle->ticket); }, 5, idle_rc);
+        expect(r, back && idle_rc == 0,
+               back ? "an empty ticket's wait returned " + std::to_string(idle_rc) + ", want 0" :
+                      std::string("an empty ticket's wait did not return within 5 s"));
     }
+
+    // Static, so it outlives its holders: a held read still takes the gate's mutex on its way out of hold() after
+    // release() returns. The guard releases it on every path out of this arm.
+    static gate g;
+
+    struct gate_release_guard {
+        gate & g;
+
+        ~gate_release_guard() { g.release(); }
+    } release_on_exit{ g };
+
+    ggml_sycl_test_lazy_io_read_source(gated_source, &g);
     auto   f     = std::make_shared<request_fixture>(2);
     size_t added = 0;
     for (uint64_t b = 0; b < 3; ++b) {
@@ -1295,17 +1313,39 @@ arm_result arm_ticket_wait() {
         w.landing_offset = b * 100;
         added += lazy_io_submit(1, -1, block_span(10 + b), key0(2, 0), w);
     }
-    expect(r, added == 3 && returns_within([f] { return lazy_io_ticket_wait(f->ticket); }, 5, rc) && rc == 0,
-           "added " + num(added) + ", the wait returned " + num(rc) + " or did not return within 5 s");
+    if (added != 3 || !g.wait_holders(3)) {
+        void_arm(
+            r, "the three reads were not held on workers within the hook bound (" + num(added) + " waiter(s) queued)");
+        g.release();
+        wait_for([&] { return f->ticket.outstanding.load() == 0; });
+        ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+        settle(lease);
+        return r;
+    }
+    auto             task = std::make_shared<std::packaged_task<int()>>([f] { return lazy_io_ticket_wait(f->ticket); });
+    std::future<int> waited = task->get_future();
+    std::thread([task] { (*task)(); }).detach();
+    expect(r, waited.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout,
+           "the wait returned with 3 reads held");
+    g.release();
+    const bool back = waited.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    const int  rc   = back ? waited.get() : -1;
+    expect(r, back && rc == 0,
+           back ? "after the release the wait returned " + std::to_string(rc) + ", want 0" :
+                  std::string("after the release the wait did not return within 5 s"));
     for (uint64_t b = 0; b < 3; ++b) {
         expect(r, f->slab[b * 100] == file_byte((10 + b) * LAZY_IO_BLOCK_BYTES), "row " + num(b) + " did not land");
     }
+
     static uint64_t bad = 20 * LAZY_IO_BLOCK_BYTES;
     auto            e   = std::make_shared<request_fixture>(3);
     ggml_sycl_test_lazy_io_read_source(eio_source, &bad);
     (void) lazy_io_submit(1, -1, block_span(20), key0(3, 0), e->waiter(0, 100));
-    expect(r, returns_within([e] { return lazy_io_ticket_wait(e->ticket); }, 5, rc) && rc == EIO,
-           "a failed read's wait did not return EIO within 5 s");
+    int        eio_rc   = -1;
+    const bool eio_back = returns_within([e] { return lazy_io_ticket_wait(e->ticket); }, 5, eio_rc);
+    expect(r, eio_back && eio_rc == EIO,
+           eio_back ? "a failed read's wait returned " + std::to_string(eio_rc) + ", want " + std::to_string(EIO) :
+                      std::string("a failed read's wait did not return within 5 s"));
     ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
     expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
     return r;
@@ -1318,18 +1358,20 @@ lazy_ring_mutant mutant_named(const char * text) {
     };
 
     static const entry table[] = {
-        { "no-ensuring",                       lazy_ring_mutant::NO_ENSURING               },
-        { "ensuring-kept-on-throw",            lazy_ring_mutant::ENSURING_KEPT_ON_THROW    },
-        { "install-after-shut-down",           lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN   },
-        { "no-span-check",                     lazy_ring_mutant::NO_SPAN_CHECK             },
-        { "no-alignment-check",                lazy_ring_mutant::NO_ALIGNMENT_CHECK        },
-        { "shutdown-no-wait",                  lazy_ring_mutant::SHUTDOWN_NO_WAIT          },
-        { "worker-reap-destroys-pool",         lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL },
-        { "pool-strict-abort-dropped",         lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED },
-        { "pool-strict-abort-dropped-refused", lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED },
-        { "pool-strict-abort-dropped-drop",    lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED },
-        { "pool-strict-abort-dropped-parked",  lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED },
-        { "ensure-witness-dropped",            lazy_ring_mutant::ENSURE_WITNESS_DROPPED    },
+        { "no-ensuring",                       lazy_ring_mutant::NO_ENSURING                 },
+        { "ensuring-kept-on-throw",            lazy_ring_mutant::ENSURING_KEPT_ON_THROW      },
+        { "install-after-shut-down",           lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN     },
+        { "no-span-check",                     lazy_ring_mutant::NO_SPAN_CHECK               },
+        { "no-alignment-check",                lazy_ring_mutant::NO_ALIGNMENT_CHECK          },
+        { "shutdown-no-wait",                  lazy_ring_mutant::SHUTDOWN_NO_WAIT            },
+        { "worker-reap-destroys-pool",         lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL   },
+        { "pool-strict-abort-dropped",         lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
+        { "pool-strict-abort-dropped-refused", lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
+        { "pool-strict-abort-dropped-drop",    lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
+        { "pool-strict-abort-dropped-parked",  lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
+        { "ensure-witness-dropped",            lazy_ring_mutant::ENSURE_WITNESS_DROPPED      },
+        { "ticket-wait-returns-at-once",       lazy_ring_mutant::TICKET_WAIT_RETURNS_AT_ONCE },
+        { "ticket-zero-no-notify",             lazy_ring_mutant::TICKET_ZERO_NO_NOTIFY       },
     };
     for (const entry & e : table) {
         if (std::strcmp(e.text, text) == 0) {

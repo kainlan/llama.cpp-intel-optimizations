@@ -683,6 +683,8 @@ enum class lazy_ring_mutant : uint8_t {
     POOL_STRICT_ABORT_DROPPED,       // the reap's and the drop's [HOST-PLAN-BUG] lines continue under strict leases
     DRAIN_STRICT_ABORT_DROPPED,      // the shutdown drain logs a leaked lease and continues under strict leases
     ENSURE_WITNESS_DROPPED,          // ensure runs when it is entered with a witnessed lock held
+    TICKET_WAIT_RETURNS_AT_ONCE,     // a ticket's wait returns its read_error without waiting for the count to reach 0
+    TICKET_ZERO_NO_NOTIFY,           // the delivery that takes a ticket's count to 0 does not notify its waiter
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);

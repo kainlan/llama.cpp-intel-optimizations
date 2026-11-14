@@ -509,6 +509,9 @@ if (BUILD_TESTING)
         string(CONCAT _le_re_ensure_witness_dropped
             "FAIL an ensure entered holding a witnessed lock aborts naming it: "
             "the held child's ensure returned: 'ENSURE-CHILD returned ok'")
+        set(_le_ticket_wait "FAIL a ticket's wait returns when its reads are delivered: ")
+        set(_le_re_ticket_wait_returns_at_once "${_le_ticket_wait}the wait returned with 3 reads held")
+        set(_le_re_ticket_zero_no_notify "${_le_ticket_wait}after the release the wait did not return within 5 s")
         set(_lazy_io_engine_mutants
             no-ensuring                       "${_le_re_no_ensuring}"
             ensuring-kept-on-throw            "${_le_re_ensuring_kept_on_throw}"
@@ -521,7 +524,9 @@ if (BUILD_TESTING)
             pool-strict-abort-dropped-refused "${_le_re_pool_strict_abort_dropped_refused}"
             pool-strict-abort-dropped-drop    "${_le_re_pool_strict_abort_dropped_drop}"
             pool-strict-abort-dropped-parked  "${_le_re_pool_strict_abort_dropped_parked}"
-            ensure-witness-dropped            "${_le_re_ensure_witness_dropped}")
+            ensure-witness-dropped            "${_le_re_ensure_witness_dropped}"
+            ticket-wait-returns-at-once       "${_le_re_ticket_wait_returns_at_once}"
+            ticket-zero-no-notify             "${_le_re_ticket_zero_no_notify}")
         add_executable(test-sycl-lazy-io-engine-host
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
             lazy-io-pool.cpp
