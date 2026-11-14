@@ -265,6 +265,23 @@ def test_create_tensor_checks_the_record_and_refuses_storage_before_buft_for_ten
     assert "LLAMA_LAZY_DEFERRAL_STORAGE" not in body, "create_tensor() decides STORAGE itself, not through the refusal function"
 
 
+def test_a_storage_tensor_bypasses_buffers_and_is_opened_after_the_load():
+    ct = create_tensor_body()
+    i_check = ct.find("llama_lazy_range_check_storage(")
+    i_store = ct.find("create_storage_tensor(")
+    i_buft = ct.rfind("buft_for_tensor(")
+    assert 0 <= i_check < i_store < i_buft, "a STORAGE tensor must leave create_tensor before the last buft_for_tensor()"
+    assert "llama_lazy_range_is_storage(" in ct, "create_tensor asks the record whether a row is STORAGE"
+    lt = load_tensors_body()
+    i_entries = lt.find("new llama_lazy_storage(")
+    i_probe = lt.find("probe")
+    assert 0 <= i_entries < i_probe, "the storage entries must exist before the probe measure builds a graph"
+    tail = lt[lt.rfind("has_sycl_weight_buffer"):]
+    assert re.search(r"finish\(true\);\s*for\s*\(.*lazy_storage.*\)\s*\{[^}]*->open\(", tail, re.S), (
+        "every storage entry is opened right after the load's finish")
+    assert re.search(r"file_paths.*\.empty\(\)", lt), "a STORAGE table with no file path refuses"
+
+
 def test_the_storage_refusal_function_throws_on_exactly_a_storage_row():
     body = function_body(
         read_code(RECORD_CPP), r"void\s+llama_lazy_range_check_storage\s*\((?:[^()]|\([^()]*\))*\)"
