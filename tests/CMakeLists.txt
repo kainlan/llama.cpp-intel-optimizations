@@ -510,6 +510,15 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-moe-host-scatter PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# The copy plan of the prompt's CPU island: how host-expert activation and result rows cross the device in
+# blocks. ggml-sycl/moe-host-island.hpp includes the standard library, ggml.h and two SYCL-free headers, so this
+# needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-moe-host-island.cpp)
+    set_tests_properties(test-sycl-moe-host-island PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-moe-host-island PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # Decode/prompt classification of a scheduler split (llama.cpp-7pm2): MUL_MAT_ID is batch evidence and a split with
 # no matmul keeps the previous phase. ggml-sycl/graph-phase.hpp includes only ggml.h; the test builds synthetic
 # graphs on a no-alloc ggml context, so it needs no device.
