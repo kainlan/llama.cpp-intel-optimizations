@@ -124,6 +124,7 @@
 #include "ggml-sycl/mmq.hpp"
 #include "ggml-sycl/model-lifecycle-probe.hpp"
 #include "ggml-sycl/moe-exec-cost.hpp"
+#include "ggml-sycl/moe-host-island.hpp"
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
@@ -92349,12 +92350,36 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             };
             ensure_island_storage(src1, &src1_storage, "src1");
             ensure_island_storage(dst, &dst_storage, "dst");
+
+            // One row per (token, slot) the host runs, in the groups' order, which keeps an expert's rows together
+            // for the CPU.
+            std::vector<ggml_sycl::moe_island_row> island_rows;
+            island_rows.reserve(n_rows);
+            for (const pp_host_expert_group & group : groups) {
+                for (const auto & row : group.rows) {
+                    const auto [iid1, id]         = row;
+                    const int64_t             i11 = id % ne11;
+                    ggml_sycl::moe_island_row r;
+                    r.src_offset =
+                        src1_storage.view_offset + static_cast<size_t>(i11) * nb11 + static_cast<size_t>(iid1) * nb12;
+                    r.dst_offset =
+                        dst_storage.view_offset + static_cast<size_t>(id) * nb1 + static_cast<size_t>(iid1) * nb2;
+                    island_rows.push_back(r);
+                }
+            }
+            ggml_sycl::moe_island_plan island;
+            if (!ggml_sycl::moe_island_plan_build(island_rows, static_cast<size_t>(K) * sizeof(float),
+                                                  static_cast<size_t>(N) * sizeof(float), &island)) {
+                GGML_ABORT("[MOE-ROUTE] PP CPU island rows overlap: tensor=%s groups=%zu rows=%zu",
+                           src0 && src0->name ? src0->name : "?", groups.size(), n_rows);
+            }
+
             queue_ptr                act_queue = src1_storage.owner >= 0 ? ctx.stream(src1_storage.owner, 0) : stream;
             queue_ptr                out_queue = dst_storage.owner >= 0 ? ctx.stream(dst_storage.owner, 0) : stream;
             ggml_sycl::alloc_request act_req{};
             act_req.queue                               = act_queue;
             act_req.device                              = src1_storage.owner >= 0 ? src1_storage.owner : ctx.device;
-            act_req.size                                = n_rows * static_cast<size_t>(K) * sizeof(float);
+            act_req.size                                = island.n_act_rows * static_cast<size_t>(K) * sizeof(float);
             act_req.intent.role                         = ggml_sycl::alloc_role::EXPERT_STAGING;
             act_req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
             act_req.intent.cohort_id                    = "moe_pp_cpu_island_act";
@@ -92390,19 +92415,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
             auto                     t_d2h_begin = host_phase_now();
             std::vector<sycl::event> d2h_events;
-            d2h_events.reserve(n_rows);
-            size_t flat_row = 0;
-            for (const pp_host_expert_group & group : groups) {
-                for (const auto & row : group.rows) {
-                    const auto [iid1, id] = row;
-                    const int64_t i11     = id % ne11;
-                    const size_t  src_off =
-                        src1_storage.view_offset + static_cast<size_t>(i11) * nb11 + static_cast<size_t>(iid1) * nb12;
-                    const size_t dst_off = flat_row * static_cast<size_t>(K) * sizeof(float);
-                    d2h_events.push_back(ggml_sycl::mem_copy_async(act_handle, dst_off, src1_storage.handle, src_off,
-                                                                   static_cast<size_t>(K) * sizeof(float), *stream));
-                    ++flat_row;
-                }
+            d2h_events.reserve(island.gather.size());
+            for (const ggml_sycl::moe_gather_run & run : island.gather) {
+                d2h_events.push_back(ggml_sycl::mem_copy_async(act_handle, run.dst_offset, src1_storage.handle,
+                                                               run.src_offset, run.bytes, *stream));
             }
             sycl::event::wait(d2h_events);
             auto t_d2h_end = host_phase_now();
@@ -92422,10 +92438,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
 
             std::vector<cpu_expert_task> tasks;
-            std::vector<size_t>          scatter_dst_offsets;
             tasks.reserve(n_rows);
-            scatter_dst_offsets.reserve(n_rows);
-            flat_row = 0;
+            // Counts rows in the groups' order, the order island_rows was built in, so it indexes the plan.
+            size_t flat_row = 0;
             for (pp_host_expert_group & group : groups) {
                 auto         host_resolved     = group.weight_lease.resolve();
                 const void * group_host_weight = host_resolved.ptr;
@@ -92434,11 +92449,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                src0 && src0->name ? src0->name : "?", group.expert_id, group_host_weight);
                 }
                 for (size_t ri = 0; ri < group.rows.size(); ++ri) {
-                    const auto [iid1, id] = group.rows[ri];
                     cpu_expert_task task;
                     task.weight_host = group_host_weight;
-                    task.act_host    = act_pinned + flat_row * static_cast<size_t>(K);
-                    task.output_host = out_pinned + flat_row * static_cast<size_t>(N);
+                    task.act_host =
+                        act_pinned + static_cast<size_t>(island.act_index[flat_row]) * static_cast<size_t>(K);
+                    task.output_host =
+                        out_pinned + static_cast<size_t>(island.out_index[flat_row]) * static_cast<size_t>(N);
                     task.type        = src0->type;
                     task.K           = static_cast<int>(K);
                     task.N           = static_cast<int>(N);
@@ -92446,8 +92462,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         task.weight_lease = std::move(group.weight_lease);
                     }
                     tasks.push_back(std::move(task));
-                    scatter_dst_offsets.push_back(dst_storage.view_offset + static_cast<size_t>(id) * nb1 +
-                                                  static_cast<size_t>(iid1) * nb2);
                     ++flat_row;
                 }
             }
@@ -92464,12 +92478,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
             auto                     t_h2d_begin = host_phase_now();
             std::vector<sycl::event> h2d_events;
-            h2d_events.reserve(n_rows);
-            for (size_t ri = 0; ri < n_rows; ++ri) {
-                const size_t src_off = ri * static_cast<size_t>(N) * sizeof(float);
-                h2d_events.push_back(ggml_sycl::mem_copy_async(dst_storage.handle, scatter_dst_offsets[ri], out_handle,
-                                                               src_off, static_cast<size_t>(N) * sizeof(float),
-                                                               *stream));
+            h2d_events.reserve(island.scatter.size());
+            for (const ggml_sycl::moe_scatter_run & run : island.scatter) {
+                h2d_events.push_back(ggml_sycl::mem_copy_async(dst_storage.handle, run.dst_offset, out_handle,
+                                                               run.src_offset, run.bytes, *stream));
             }
             sycl::event::wait(h2d_events);
             auto t_h2d_end = host_phase_now();
@@ -92477,16 +92489,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                 static std::atomic<int> pp_cpu_island_log{ 0 };
                 if (pp_cpu_island_log.fetch_add(1, std::memory_order_relaxed) < 32) {
-                    GGML_LOG_INFO("[MOE-CPU-ISLAND] tensor=%s layer=%d role=%s groups=%zu rows=%zu device=%d\n",
-                                  src0 && src0->name ? src0->name : "?", layer_id, moe_tensor_type_name(pp_role),
-                                  groups.size(), n_rows, ctx.device);
+                    GGML_LOG_INFO(
+                        "[MOE-CPU-ISLAND] tensor=%s layer=%d role=%s groups=%zu rows=%zu act_rows=%zu d2h_copies=%zu "
+                        "h2d_copies=%zu device=%d\n",
+                        src0 && src0->name ? src0->name : "?", layer_id, moe_tensor_type_name(pp_role), groups.size(),
+                        n_rows, island.n_act_rows, island.gather.size(), island.scatter.size(), ctx.device);
                 }
             }
             if (profile_host_detail) {
-                g_moe_profile.moe_host_detail(
-                    host_phase_us(t_d2h_begin, t_d2h_end), host_phase_us(t_cpu_begin, t_cpu_end),
-                    host_phase_us(t_h2d_begin, t_h2d_end), static_cast<int64_t>(n_rows),
-                    n_rows * static_cast<double>(K) * sizeof(float), n_rows * static_cast<double>(N) * sizeof(float));
+                g_moe_profile.moe_host_detail(host_phase_us(t_d2h_begin, t_d2h_end),
+                                              host_phase_us(t_cpu_begin, t_cpu_end),
+                                              host_phase_us(t_h2d_begin, t_h2d_end), static_cast<int64_t>(n_rows),
+                                              island.n_act_rows * static_cast<double>(K) * sizeof(float),
+                                              n_rows * static_cast<double>(N) * sizeof(float));
             }
             groups.clear();
         };
