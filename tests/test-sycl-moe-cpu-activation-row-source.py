@@ -315,7 +315,7 @@ def check(backend_src: str, pool_src: str | None = None, hostpath_src: str | Non
         body,
     ):
         raise ContractError(
-            "FAIL: dispatch_cpu_compute's per-expert branch no longer gathers its own entries, in order, into slots "
+            "FAIL [pin 5]: dispatch_cpu_compute's per-expert branch no longer gathers its own entries, in order, into slots "
             "pool_base + ci (llama.cpp-4hg7)"
         )
     check_gather(code, lam_at, hostpath_src)
@@ -678,10 +678,11 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
     # skip compares against the LAST element only, so it can drop a duplicate and never a distinct event;
     # the loop is pinned whole, and as an unconditional statement of the lambda, so a weakened skip, a
     # narrowed loop or a guard around it all fail.
+    per_row = "job_inputs.events = gather_activation_rows("
     lease = ("for (const expert_dispatch_entry & entry : entries) { if (entry.has_ready_event && "
              "(job_inputs.events.empty() || job_inputs.events.back() != entry.ready_event)) { "
              "job_inputs.events.push_back(entry.ready_event); } }")
-    if (lam.count("moe_cpu_job_inputs job_inputs;") != 1 or any(lam.count(n) != 1 for n in (shared, single, pregathered, lease))
+    if (lam.count("moe_cpu_job_inputs job_inputs;") != 1 or any(lam.count(n) != 1 for n in (shared, single, per_row, pregathered, lease))
             or lam.count("job_inputs.events = ") != 2):
         raise ContractError(
             "FAIL [pin W4]: not every activation-copy branch hands its copy events to the job's prologue (shared "
@@ -1045,9 +1046,16 @@ def self_test(backend_src: str) -> int:
     expect_fail("single-d2h-event-dropped", sub("job_inputs.events.push_back(ggml_sycl::mem_copy_async(\n",
                                                 "(void) (ggml_sycl::mem_copy_async(\n"), None, "W4")
     # The per-row branch's hand-off is matched exactly by pin 5 (its regex carries `job_inputs.events =`),
-    # which runs before W4, so the mutant is expected to fail there.
+    # which runs before W4, so a change to that branch's own text fails there.
     expect_fail("per-row-gather-events-dropped", sub("job_inputs.events =\n                        gather_activation_rows(rows, act_handle,",
-                                                     "(void)\n                        gather_activation_rows(rows, act_handle,"))
+                                                     "(void)\n                        gather_activation_rows(rows, act_handle,"),
+                None, "5")
+    # A second gather after the branches leaves pin 5's branch intact and replaces whatever events the taken
+    # branch handed over; only W4 sees it.
+    expect_fail("per-row-gather-repeated-after-branches", sub(
+        "                // Order this job's pool writes",
+        "                job_inputs.events = gather_activation_rows(rows_again, act_handle, 0);\n"
+        "                // Order this job's pool writes"), None, "W4")
     expect_fail("pregather-events-dropped", sub("job_inputs.events   = pregather_events;", "job_inputs.events.clear();"),
                 None, "W4")
     expect_fail("lease-events-dropped", sub("job_inputs.events.push_back(entry.ready_event);", "(void) entry;"), None, "W4")
