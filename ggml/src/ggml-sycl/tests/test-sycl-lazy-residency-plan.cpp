@@ -444,9 +444,8 @@ arm_result arm_d_qwen_flip() {
 
 // (j) A storage-only table is STORAGE at a reading where the same table without the flag is HOST, and its cache is
 // smaller than the table's HOST body.
-// Engagement: the control plan (no flag, arm (d)'s "above" reading) carries the table HOST. At this reading an
-// uncapped cache would hold every row and its index, which is more than the body: only a ceiling makes the last check
-// pass.
+// Engagement: the control plan (no flag, arm (d)'s "above" reading) carries the table HOST. At this reading the
+// uncapped share is about 1 GiB more than the body, so only a ceiling makes the last check pass.
 // Mutants: the flag not read by the HOST test (the flagged table is HOST); no ceiling on the cache (it holds more than
 // the body).
 arm_result arm_j_storage_only_skips_host() {
