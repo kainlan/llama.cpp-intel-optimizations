@@ -496,7 +496,8 @@ def test_qwen4exp_is_the_one_storage_consumer():
         "reads a STORAGE table")
 
 
-def test_qwen4exp_ple_input_is_f32_from_storage_and_get_rows_only_otherwise():
+def qwen4exp_ple_build():
+    """build_inp_ple's STORAGE branch condition and block, its resident (else) block, and what follows both."""
     build = function_body(read_code(QWEN4EXP_CPP),
                           r"ggml_tensor\s*\*\s*llama_model_qwen4exp::graph::build_inp_ple\s*\((?:[^()]|\([^()]*\))*\)")
     branches = []
@@ -505,12 +506,20 @@ def test_qwen4exp_ple_input_is_f32_from_storage_and_get_rows_only_otherwise():
         if got and "lazy_storage(" in got[0]:
             branches.append(got)
     assert len(branches) == 1, f"build_inp_ple must branch once on the table's storage handle, found {len(branches)}"
-    _, storage, past = branches[0]
+    cond, storage, past = branches[0]
     other = re.match(r"\s*else\s*\{", build[past:])
     assert other, "the STORAGE branch of build_inp_ple has no else branch for the resident table"
     open_else = past + other.end() - 1
     eager = balanced(build, open_else)
-    tail = build[open_else + len(eager) + 2:]
+    return build, cond, storage, eager, build[open_else + len(eager) + 2:]
+
+
+def squash(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def test_qwen4exp_ple_input_is_f32_from_storage_and_get_rows_only_otherwise():
+    build, cond, storage, eager, tail = qwen4exp_ple_build()
     assert re.search(r"ggml_new_tensor_2d\s*\([^;]*GGML_TYPE_F32", storage) and "ggml_set_input(" in storage, (
         "in STORAGE mode the PLE input is an F32 graph input")
     for absent in ("ggml_get_rows(", "GGML_TYPE_I32"):
@@ -519,6 +528,26 @@ def test_qwen4exp_ple_input_is_f32_from_storage_and_get_rows_only_otherwise():
     assert build.count("ggml_get_rows(") == 1, "get_rows on the PLE table belongs to the resident branch alone"
     assert "add_input(" in storage and "add_input(" in eager, "each branch must hand its input to the graph result"
     assert "ggml_reshape_2d(" in tail, "both branches feed the one reshape, so everything downstream is unchanged"
+    # the handle is looked up by the name of the very tensor the resident branch gathers from: any other name finds no
+    # handle and leaves the graph on a get_rows over a STORAGE tensor, which has no data
+    look = re.fullmatch(r"[^=]*?(\w+)\s*=\s*\w+\s*\.\s*lazy_storage\s*\(\s*ggml_get_name\s*\(\s*([\w.]+)\s*\)\s*\)\s*",
+                        cond)
+    assert look, (
+        f"the STORAGE branch's condition is not `<handle> = <model>.lazy_storage(ggml_get_name(<table>))`: {cond}")
+    handle, table = look.group(1), look.group(2)
+    gathers = re.search(r"ggml_get_rows\s*\(\s*\w+\s*,\s*([\w.]+)\s*,", eager)
+    assert gathers and gathers.group(1) == table, (
+        f"the handle is looked up for {table}, but the resident branch gathers from "
+        f"{gathers.group(1) if gathers else 'nothing'}")
+    # the F32 input has the get_rows result's shape: the row width first, then one row per row id
+    ids = re.search(r"ggml_new_tensor_1d\s*\(\s*\w+\s*,\s*GGML_TYPE_I32\s*,\s*([^;]*?)\s*\)\s*;", eager)
+    f32 = re.search(r"ggml_new_tensor_2d\s*\(\s*\w+\s*,\s*GGML_TYPE_F32\s*,\s*([^,;]*?)\s*,\s*([^;]*?)\s*\)\s*;",
+                    storage)
+    assert ids and f32, "the two branches' inputs are not a 1d I32 tensor and a 2d F32 tensor"
+    assert re.fullmatch(handle + r"\s*->\s*ne0\s*\(\s*\)", f32.group(1)), (
+        f"the F32 input's first dimension is `{f32.group(1)}`, not the handle's row width")
+    assert squash(f32.group(2)) == squash(ids.group(1)), (
+        f"the F32 input has `{f32.group(2)}` rows, the resident row ids number `{ids.group(1)}`")
 
 
 def test_qwen4exp_ple_input_reports_failure_and_reuses_by_its_mode():
@@ -526,10 +555,24 @@ def test_qwen4exp_ple_input_reports_failure_and_reuses_by_its_mode():
     flag = qwen4exp_ple_failed_flag()
     assert re.search(r"\bbool\s+" + flag + r"\s*(=\s*false\s*)?;", cls), (
         "the flag set_input_failed() returns is not a bool member of the input")
+    _, _, storage, eager, _ = qwen4exp_ple_build()
+    emb = re.search(r"->\s*(\w+)\s*=\s*ggml_new_tensor_2d\s*\(", storage)
+    ids = re.search(r"->\s*(\w+)\s*=\s*ggml_new_tensor_1d\s*\(", eager)
+    assert emb and ids and emb.group(1) != ids.group(1), "the two modes must build two different members of the input"
     m = re.search(r"\bbool\s+can_reuse\s*\((?:[^()]|\([^()]*\))*\)\s*override\s*\{", cls)
     assert m, "llm_graph_input_ple does not override can_reuse()"
-    assert re.search(r"return\s+\w+\s*!=\s*nullptr\s*\?", balanced(cls, m.end() - 1)), (
-        "can_reuse must test the input this mode built: a STORAGE graph has no row ids to read")
+    # each arm reads only the input its test says exists: a STORAGE graph has no row ids, a resident one no F32 input
+    reuse = re.search(r"return\s+(\w+)\s*!=\s*nullptr\s*\?\s*(\w+)\s*->\s*ne\s*\[\s*1\s*\]\s*==\s*(\w+)\s*:\s*"
+                      r"(\w+)\s*->\s*ne\s*\[\s*0\s*\]\s*==\s*(\w+)\s*;", balanced(cls, m.end() - 1))
+    assert reuse, "can_reuse must answer `<F32 input> != nullptr ? <its ne[1]> == n : <row ids' ne[0]> == n`"
+    tested, true_arm, n_a, false_arm, n_b = reuse.groups()
+    assert tested == true_arm == emb.group(1) and false_arm == ids.group(1) and n_a == n_b, (
+        f"can_reuse tests {tested}, reads {true_arm}->ne[1] and {false_arm}->ne[0]: the F32 input is {emb.group(1)} "
+        f"and the row ids are {ids.group(1)}")
+
+
+def call_args(text: str, call: re.Match) -> list[str]:
+    return [squash(a) for a in split_args(text, call)]
 
 
 def test_qwen4exp_ple_set_input_clears_its_flag_and_fails_every_early_return():
@@ -542,7 +585,7 @@ def test_qwen4exp_ple_set_input_clears_its_flag_and_fails_every_early_return():
     assert re.match(r"\s*" + clear, body), "set_input must clear its failure flag as its first statement"
     g = re.search(r"(\w+)\s*=\s*(\w+)\s*->\s*gather\s*\(", body)
     assert g, "set_input does not keep the result of the storage gather"
-    rc, handle = g.group(1), g.group(2)
+    handle = g.group(2)
     resident = None
     for m in re.finditer(r"\bif\s*\(", body):
         got = if_block(body, m)
@@ -561,23 +604,67 @@ def test_qwen4exp_ple_set_input_clears_its_flag_and_fails_every_early_return():
     i_fail = [m.start() for m in re.finditer(fail, rest)]
     i_clear = [m.start() for m in re.finditer(clear, rest)]
     i_ret = [m.start() for m in re.finditer(r"\breturn\b", rest)]
-    i_set = [m.start() for m in re.finditer(r"ggml_backend_tensor_set\s*\(", rest)]
+    i_set = [m for m in re.finditer(r"ggml_backend_tensor_set\s*\(", rest)]
     assert i_ret, "the STORAGE path has no failure return"
     assert len(i_fail) == 1 and i_fail[0] < min(i_ret), "the STORAGE path must set its failure flag before any return"
-    assert len(i_set) == 1 and len(i_clear) == 1 and max(i_ret) < i_set[0] < i_clear[0], (
+    assert len(i_set) == 1 and len(i_clear) == 1 and max(i_ret) < i_set[0].start() < i_clear[0], (
         "the STORAGE path clears its failure flag once, after its last return and after its input is set")
-    # rows that did not land must never be dequantized into the graph
-    gathered = re.search(r"\b" + rc + r"\s*=\s*" + handle + r"\s*->\s*gather\s*\(", rest)
-    tested = None
+    # the f32 scratch is what the input is set from, whole
+    set_args = call_args(rest, i_set[0])
+    scratch = re.fullmatch(r"(\w+)\.data\(\)", set_args[1]) if len(set_args) == 4 else None
+    assert scratch and set_args[3] == scratch.group(1) + ".size() * sizeof(float)", (
+        f"the input is not set from the whole of one f32 scratch: {set_args}")
+    deq = scratch.group(1)
+
+    # the type dispatch: F32 rows are gathered straight into the f32 scratch, every other type is gathered and converted
+    split = None
     for m in re.finditer(r"\bif\s*\(", rest):
         got = if_block(rest, m)
-        if got and re.fullmatch(r"\s*" + rc + r"\s*!=\s*0\s*", got[0]) and re.search(r"\breturn\b", got[1]):
-            tested = m.start()
+        if got and re.fullmatch(r"[^&|]*==\s*GGML_TYPE_F32\s*", got[0]):
+            split = (m.start(), got)
             break
-    convert = re.search(r"->\s*to_float\s*\(", rest)
-    assert gathered and tested is not None and convert, "the STORAGE path must gather, test the result, and convert"
-    assert gathered.start() < tested < convert.start() < i_set[0], (
-        "the gather's result is tested before the rows are dequantized, and they are dequantized before the input is "
-        "set")
-    refused = re.search(r"to_float\s*==\s*nullptr", rest)
-    assert refused and refused.start() < convert.start(), "a type with no f32 conversion is refused before converting"
+    assert split, "the STORAGE path does not dispatch on GGML_TYPE_F32"
+    i_split, (_, as_f32, past_f32) = split
+    other = re.match(r"\s*else\s*\{", rest[past_f32:])
+    assert other, "the F32 arm has no else arm for the converted types"
+    converted = balanced(rest, past_f32 + other.end() - 1)
+    assert i_split < i_set[0].start(), "the input is set after both arms"
+
+    # a type with no conversion is refused before anything is read, and F32, which has none and needs none, is not
+    refusal = None
+    for m in re.finditer(r"\bif\s*\(", rest):
+        got = if_block(rest, m)
+        if got and re.search(r"to_float\s*==\s*nullptr", got[0]) and re.search(r"\breturn\b", got[1]):
+            refusal = (m.start(), got[0])
+            break
+    assert refusal and refusal[0] < i_split, "a type with no f32 conversion is not refused before the gather"
+    exempt = re.search(r"!=\s*GGML_TYPE_F32", refusal[1])
+    assert exempt and exempt.start() < re.search(r"to_float\s*==\s*nullptr", refusal[1]).start(), (
+        f"the refusal must test for F32 before the missing conversion, or every F32 ubatch fails: {refusal[1]}")
+
+    def arm(text: str, label: str):
+        calls = list(re.finditer(r"(\w+)\s*=\s*" + handle + r"\s*->\s*gather\s*\(", text))
+        assert len(calls) == 1, f"the {label} arm must gather exactly once, found {len(calls)}"
+        rc = calls[0].group(1)
+        tested = None
+        for m in re.finditer(r"\bif\s*\(", text):
+            got = if_block(text, m)
+            if got and re.fullmatch(r"\s*" + rc + r"\s*!=\s*0\s*", got[0]) and re.search(r"\breturn\b", got[1]):
+                tested = m.start()
+                break
+        assert tested is not None and calls[0].start() < tested, f"the {label} arm does not test its gather's result"
+        return call_args(text, calls[0]), tested
+
+    f32_args, _ = arm(as_f32, "F32")
+    assert f32_args[2:] == [deq + ".data()", deq + ".size() * sizeof(float)"], (
+        f"the F32 arm must gather into the whole f32 scratch: {f32_args}")
+    assert "to_float" not in as_f32, "the F32 arm converts: F32 has no to_float"
+    conv_args, tested = arm(converted, "converted")
+    assert conv_args[2] != deq + ".data()", "the converted arm gathers into the f32 scratch it then converts into"
+    # rows that did not land must never be converted into the graph, and the conversion covers every gathered row
+    convert = list(re.finditer(r"->\s*to_float\s*\(", converted))
+    assert len(convert) == 1 and tested < convert[0].start(), (
+        "the converted arm must test its gather's result before its one conversion")
+    to_args = call_args(converted, convert[0])
+    assert to_args[0] == conv_args[2] and to_args[1:] == [deq + ".data()", "(int64_t) " + deq + ".size()"], (
+        f"the conversion must read the gathered rows and fill the whole f32 scratch: to_float({to_args})")

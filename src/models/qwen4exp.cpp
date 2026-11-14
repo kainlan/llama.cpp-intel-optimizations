@@ -1213,7 +1213,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
     const auto & hp = pmodel.hparams;
 
-    // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
+    // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row, for
+    // ggml_get_rows when the table is resident and for the storage gather when it is STORAGE
     // stand in the image token id that the reference hashes, or EOS if the file has no such key
     // gemma3n and gemma4 do the same with a hardcoded row 0 of per_layer_token_embd.
     const llama_token img_tok = hp.ple_image_token_id != 0
@@ -1276,35 +1277,50 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     // STORAGE: the rows come from the storage tier (hits from its row cache, misses read from the file and waited for
-    // here) and are dequantized to f32 on the host, so the graph receives the values the eager get_rows computes in
-    // f32, whichever backend runs the graph. A failure is reported through set_input_failed(), never thrown.
+    // here) and are converted to f32 on the host with the type's own to_float, the conversion the CPU backend's
+    // get_rows applies. The SYCL get_rows multiplies in half precision when the build has GGML_SYCL_F16, so against an
+    // eager load whose get_rows ran there the values can differ in the last bits. A failure is reported through
+    // set_input_failed(), never thrown.
     failed = true;  // until every step below has succeeded
 
-    const ggml_type_traits * tt = ggml_get_type_traits(storage->type());
-    const size_t             n  = idx.size();
-    if (tt->to_float == nullptr) {
-        LLAMA_LOG_ERROR("%s: the PLE table's type %s has no f32 conversion\n", __func__,
-                        ggml_type_name(storage->type()));
+    const ggml_type          type = storage->type();
+    const ggml_type_traits * tt   = ggml_get_type_traits(type);
+    const size_t             n    = idx.size();
+    // F32 has no to_float, and needs none: an F32 table's rows already are the values
+    if (type != GGML_TYPE_F32 && tt->to_float == nullptr) {
+        LLAMA_LOG_ERROR("%s: the PLE table's type %s has no f32 conversion\n", __func__, ggml_type_name(type));
         return;
     }
     try {
-        raw.resize(n * storage->row_size());
         deq.resize(n * (size_t) storage->ne0());
+        if (type != GGML_TYPE_F32) {
+            raw.resize(n * storage->row_size());
+        }
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: no host memory for %zu PLE rows: %s\n", __func__, n, e.what());
         return;
     }
     // a table that was never opened answers ENODEV and fails the ubatch: a load that finishes has opened it, so that
     // is reachable only on a model loaded without allocations, which is measured and not computed
-    const int rc = storage->gather(idx.data(), n, raw.data(), raw.size());
-    if (rc != 0) {
-        LLAMA_LOG_ERROR("%s: reading %zu PLE rows of %s failed: %s\n", __func__, n, storage->name().c_str(),
-                        strerror(rc));
-        return;
+    if (type == GGML_TYPE_F32) {
+        // an F32 row is ne0 floats, so the rows land in the f32 scratch as they are
+        const int rc = storage->gather(idx.data(), n, deq.data(), deq.size() * sizeof(float));
+        if (rc != 0) {
+            LLAMA_LOG_ERROR("%s: reading %zu PLE rows of %s failed: %s\n", __func__, n, storage->name().c_str(),
+                            strerror(rc));
+            return;
+        }
+    } else {
+        const int rc = storage->gather(idx.data(), n, raw.data(), raw.size());
+        if (rc != 0) {
+            LLAMA_LOG_ERROR("%s: reading %zu PLE rows of %s failed: %s\n", __func__, n, storage->name().c_str(),
+                            strerror(rc));
+            return;
+        }
+        // one call over every row: a row is whole blocks (ne0 is a multiple of the block size, which the backend's
+        // open refuses otherwise), so the gathered rows are one contiguous run of blocks
+        tt->to_float(raw.data(), deq.data(), (int64_t) deq.size());
     }
-    // one call over every row: a row is whole blocks (ne0 is a multiple of the block size, which the backend's open
-    // refuses otherwise), so the gathered rows are one contiguous run of blocks
-    tt->to_float(raw.data(), deq.data(), (int64_t) deq.size());
     ggml_backend_tensor_set(emb, deq.data(), 0, deq.size() * sizeof(float));
     failed = false;
 }
