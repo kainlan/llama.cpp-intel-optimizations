@@ -182,7 +182,7 @@ int main() {
     // Both arches that declare the PLE table go through the taker and refusal blocks. `consumer` is whether the arch's
     // graph consumes a STORAGE row.
     for (const llm_arch a : { LLM_ARCH_QWEN4EXP, LLM_ARCH_GEMMA4 }) {
-        const bool consumer = false;  // T13 makes it a == LLM_ARCH_QWEN4EXP
+        const bool consumer = false;  // mirrors llama_lazy_storage_consumer_present(a): true once a's graph consumes a STORAGE row
 
         // the early plan, with the taker: no row is excluded under OFF. Under AUTO the 5 GiB table would be STORAGE,
         // and an arch with no STORAGE consumer records it as the ordinary weight OFF makes it, with one WARN. ON asks

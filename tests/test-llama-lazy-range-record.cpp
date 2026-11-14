@@ -10,7 +10,7 @@
 //   - the eligibility matrix over taker x mode_pre x mode_post x SUPPORTED:
 //     lazy_eligible = llama_lazy_eligible(taker ? mode_pre : mode_post, size,
 //     taker ? true : SUPPORTED), except that the taker reading AUTO records every row
-//     ineligible (this tree has no STORAGE consumer, and the default mode must load);
+//     ineligible (LLM_ARCH_LLAMA has no STORAGE consumer, and the default mode must load);
 //     STORAGE iff eligible and taker, LAZY_READ iff eligible and not taker, and
 //     `deferral != EAGER` iff `lazy_eligible`;
 //   - the witness cell: AUTO requested, a device that cannot mmap and owns no
@@ -158,7 +158,7 @@ int main() {
                                                     taker != 0, supported != 0);
                     for (const llama_lazy_range_row & row : rec.rows()) {
                         // T6a's function, called and not restated; with the taker, AUTO has no STORAGE
-                        // consumer to hand a row to, so every row is the ordinary weight OFF makes it
+                        // consumer to hand a LLM_ARCH_LLAMA row to, so every row is the ordinary weight OFF makes it
                         const llama_lazy_mode read = taker ? pre : post;
                         const bool            expected =
                             llama_lazy_eligible(read, row.value.size, taker ? true : supported != 0) &&
@@ -197,7 +197,7 @@ int main() {
         llama_lazy_range_record rec;
         llama_lazy_range_record_prefill(rec, LLM_ARCH_LLAMA, hp, declared, fx.finder(), mode_pre, mode_post, true,
                                         true);
-        // the taker read AUTO, and with no STORAGE consumer the table is the ordinary weight: one WARN per
+        // the taker read AUTO, and LLM_ARCH_LLAMA has no STORAGE consumer, so the table is the ordinary weight: one WARN per
         // row AUTO would have made STORAGE (4 GiB + 1 and the sparse 6 GiB), which a fill reading OFF never prints
         CHECK(!rec.eligible("lz_sparse") && rec.deferral("lz_sparse") == LLAMA_LAZY_DEFERRAL_EAGER,
               "the witness cell: the sparse row is %s, eligible=%d",
