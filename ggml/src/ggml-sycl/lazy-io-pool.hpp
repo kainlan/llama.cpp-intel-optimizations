@@ -332,11 +332,13 @@ struct lazy_io_ticket {
 
 // Blocks, with no timeout, until every waiter submitted on `ticket` has been delivered; then returns the first errno a
 // delivery stored (a read's errno, EINVAL for a landing outside its slot, ECANCELED from shutdown), or 0. A 0 does not
-// mean every row landed: a cancelled or draining request, or a slot whose epoch moved, delivers without copying. Call
-// it after the last lazy_io_submit on the ticket has returned, on that thread or one ordered after it; a wait that
-// overlaps a submit can return before the later reads land. Its return is the point from which the ticket, its request
-// and its landing slots may be destroyed, on every path: no delivery touches them after it. Hold no lock a delivery
-// takes (the landing slot's, the row cache's), and never call it from a pool worker.
+// mean every row landed: a lazy_io_submit that refused (no live ring, or a span wider than a slot) returned 0 and never
+// counted its waiter, so the caller must check each submit's return; and a cancelled or draining request, or a slot
+// whose epoch moved, delivers without copying. Call it after the last lazy_io_submit on the ticket has returned, on
+// that thread or one ordered after it; a wait that overlaps a submit can return before the later reads land. Its return
+// is the point from which the ticket, its request and its landing slots may be destroyed, on every path: no delivery
+// touches them after it. Hold no lock a pool worker takes between picking a read and picking the next (the engine's,
+// the registry's, the landing slot's, the row cache's), and never call it from a pool worker.
 int lazy_io_ticket_wait(lazy_io_ticket & ticket);
 
 // One waiter on a read (§5.2.1, §5.3): its ticket, its epoch, and where its bytes go. `src_offset` and `bytes` select
