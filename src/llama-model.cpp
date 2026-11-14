@@ -2259,8 +2259,9 @@ struct llama_model::impl {
     std::vector<float> tensor_split_owned;
 
     // The STORAGE tables' tensors, in no buffer and never in ctxs_bufs (memory_breakdown expects a buffer for every
-    // context there), and the handle each table is read through. The handles go with pimpl, which ~llama_model
-    // destroys before the backend unloads the model, so every table closes while its plan still exists.
+    // context there), and the handle each table is read through. The handles go with pimpl: when the model has a
+    // token, ~llama_model destroys pimpl before its unload hook runs, so every open table closes while its plan still
+    // exists; a model that never got a token never opened a table, so it has nothing to close.
     ggml_context_ptr                                 storage_ctx;
     std::vector<std::unique_ptr<llama_lazy_storage>> lazy_storage;
 };
@@ -2932,7 +2933,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                            "to read the table from; load the model from a file path",
                            t.name.c_str()));
             }
-            pimpl->lazy_storage.emplace_back(new llama_lazy_storage(t, ml.file_paths[t.value.file_idx], procs));
+            pimpl->lazy_storage.push_back(
+                std::make_unique<llama_lazy_storage>(t, ml.file_paths[t.value.file_idx], procs));
         }
     }
 
