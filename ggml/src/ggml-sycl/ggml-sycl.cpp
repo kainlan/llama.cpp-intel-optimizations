@@ -92370,8 +92370,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             ggml_sycl::moe_island_plan island;
             if (!ggml_sycl::moe_island_plan_build(island_rows, static_cast<size_t>(K) * sizeof(float),
                                                   static_cast<size_t>(N) * sizeof(float), &island)) {
-                GGML_ABORT("[MOE-ROUTE] PP CPU island rows overlap: tensor=%s groups=%zu rows=%zu",
-                           src0 && src0->name ? src0->name : "?", groups.size(), n_rows);
+                GGML_ABORT(
+                    "[MOE-ROUTE] PP CPU island rows overlap tensor=%s groups=%zu rows=%zu K=%lld N=%lld ne11=%lld "
+                    "nb11=%zu nb12=%zu nb1=%zu nb2=%zu",
+                    src0 && src0->name ? src0->name : "?", groups.size(), n_rows, (long long) K, (long long) N,
+                    (long long) ne11, nb11, nb12, nb1, nb2);
             }
 
             queue_ptr                act_queue = src1_storage.owner >= 0 ? ctx.stream(src1_storage.owner, 0) : stream;
@@ -92455,9 +92458,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         act_pinned + static_cast<size_t>(island.act_index[flat_row]) * static_cast<size_t>(K);
                     task.output_host =
                         out_pinned + static_cast<size_t>(island.out_index[flat_row]) * static_cast<size_t>(N);
-                    task.type        = src0->type;
-                    task.K           = static_cast<int>(K);
-                    task.N           = static_cast<int>(N);
+                    task.type = src0->type;
+                    task.K    = static_cast<int>(K);
+                    task.N    = static_cast<int>(N);
                     if (ri == 0) {
                         task.weight_lease = std::move(group.weight_lease);
                     }
