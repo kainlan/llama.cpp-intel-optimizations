@@ -5367,6 +5367,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+
+        if (res->inputs_failed()) {
+            LLAMA_LOG_ERROR("%s: a graph input could not be set; the ubatch is not computed\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
