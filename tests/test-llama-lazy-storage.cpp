@@ -50,6 +50,7 @@ static std::string g_log;
 static void * fake_open(llama_sycl_model_token, const llama_lazy_storage_table &, const char *) {
     return &g_handle;
 }
+
 static int fake_gather(void *, const int32_t * rows, size_t n, void * dst, size_t) {
     for (size_t i = 0; i < n; ++i) {
         if (rows[i] == 99) {
@@ -59,12 +60,14 @@ static int fake_gather(void *, const int32_t * rows, size_t n, void * dst, size_
     }
     return 0;
 }
+
 static void fake_counters(const void *, uint64_t out[4]) {
     out[0] = 1;
     out[1] = 2;
     out[2] = 0;
     out[3] = 2;
 }
+
 static void fake_close(void * h) {
     g_closed += h == &g_handle;
 }
