@@ -530,6 +530,18 @@ bool rows_are_the_files(const std::vector<uint8_t> & dst, const int32_t * rows, 
     return true;
 }
 
+// Whether an open of `info` is refused with a WARN that contains `why`; a stray table is closed so it cannot outlive
+// the model.
+bool open_refused_with(ggml_sycl_model_token             model,
+                       const ggml_sycl_lazy_table_info * info,
+                       const char *                      path,
+                       const char *                      why) {
+    log_clear();
+    ggml_sycl_lazy_storage * stray = ggml_backend_sycl_lazy_storage_open(model, info, path);
+    ggml_backend_sycl_lazy_storage_close(stray);
+    return stray == nullptr && !log_lines_containing("[LAZY-STORAGE] ", why).empty();
+}
+
 // Arm (h) on its fixture file, which exists; the arm removes the file after this returns, on every path.
 void storage_api_on_file(arm_result & arr, const std::string & path, size_t off, int64_t rows) {
     if (!direct_open_works(path)) {
@@ -578,24 +590,63 @@ void storage_api_on_file(arm_result & arr, const std::string & path, size_t off,
     expect(arr, !log_lines_containing("[PLACEMENT] lazy per_layer_token_embd.weight residency=STORAGE").empty(),
            "this table's [PLACEMENT] lazy line does not say STORAGE");
 
-    // A row size the plan did not size is refused by the materialization too; an offset is refused only by the
-    // cross-check, since every other figure of that info is a table's.
-    ggml_sycl_lazy_table_info wrong_row = table;
-    wrong_row.row_size                  = row + 2;
-    expect(arr, ggml_backend_sycl_lazy_storage_open(model, &wrong_row, path.c_str()) == nullptr,
-           "an info whose row_size disagrees with the plan opened");
-    ggml_sycl_lazy_table_info wrong_off = table;
-    wrong_off.file_offset               = off + row;
-    ggml_sycl_lazy_storage * stray      = ggml_backend_sycl_lazy_storage_open(model, &wrong_off, path.c_str());
-    expect(arr, stray == nullptr, "an info whose file_offset disagrees with the plan opened");
-    ggml_backend_sycl_lazy_storage_close(stray);  // a stray table must not outlive the model
+    // The arguments are refused before the plan is read, each with its own reason.
+    ggml_sycl_lazy_table_info no_name = table;
+    no_name.name                      = nullptr;
+    ggml_sycl_model_token no_model    = model;
+    no_model.model_id                 = 0;
+    expect(arr, open_refused_with(model, nullptr, path.c_str(), "info is null"), "a null info was not refused");
+    expect(arr, open_refused_with(model, &no_name, path.c_str(), "info->name is null"), "a null name was not refused");
+    expect(arr, open_refused_with(model, &table, nullptr, "file_path is null"), "a null path was not refused");
+    expect(arr, open_refused_with(no_model, &table, path.c_str(), "the model id is 0"), "model id 0 was not refused");
+    ggml_sycl_lazy_table_info unplanned = table;
+    unplanned.name                      = "per_layer_token_embd.unplanned";
+    expect(arr, open_refused_with(model, &unplanned, path.c_str(), "carries no such table"),
+           "a table the plan lacks was not refused");
+
+    // Each figure the cross-check compares is refused by the cross-check itself, its "(caller/plan)" WARN, and not by
+    // the materialization: the open builds the table from the plan's figures, never the caller's. F16 with 17
+    // elements keeps the row at 34 B, so only the type differs.
+    ggml_sycl_lazy_table_info wrong_row  = table;
+    wrong_row.row_size                   = row + 2;
+    ggml_sycl_lazy_table_info wrong_off  = table;
+    wrong_off.file_offset                = off + row;
+    ggml_sycl_lazy_table_info wrong_size = table;
+    wrong_size.ne[1]                     = rows - 1;
+    wrong_size.size                      = row * static_cast<size_t>(rows - 1);
+    ggml_sycl_lazy_table_info wrong_type = table;
+    wrong_type.type                      = GGML_TYPE_F16;
+    wrong_type.ne[0]                     = 17;
+    expect(arr, open_refused_with(model, &wrong_row, path.c_str(), "(caller/plan)"),
+           "an info whose row_size disagrees with the plan was not refused by the cross-check");
+    expect(arr, open_refused_with(model, &wrong_off, path.c_str(), "(caller/plan)"),
+           "an info whose file_offset disagrees with the plan was not refused by the cross-check");
+    expect(arr, open_refused_with(model, &wrong_size, path.c_str(), "(caller/plan)"),
+           "an info whose size disagrees with the plan was not refused by the cross-check");
+    expect(arr, open_refused_with(model, &wrong_type, path.c_str(), "(caller/plan)"),
+           "an info whose type disagrees with the plan was not refused by the cross-check");
+
+    // A null storage: the counters zero all four, and a gather is EINVAL.
+    uint64_t zeroed[4] = { 1, 2, 3, 4 };
+    ggml_backend_sycl_lazy_storage_counters(nullptr, zeroed);
+    expect(arr, zeroed[0] == 0 && zeroed[1] == 0 && zeroed[2] == 0 && zeroed[3] == 0,
+           "the counters of a null storage are not all zero");
+    {
+        const int32_t        first[1] = { 0 };
+        std::vector<uint8_t> one(row);
+        const int            null_rc = ggml_backend_sycl_lazy_storage_gather(nullptr, first, 1, one.data(), one.size());
+        expect(arr, null_rc == EINVAL, "a gather on a null storage returned " + num(null_rc));
+    }
 
     ggml_sycl_lazy_storage * s = ggml_backend_sycl_lazy_storage_open(model, &table, path.c_str());
     expect(arr, s != nullptr, "the open returned null");
     if (s != nullptr) {
         const int32_t        want[4] = { 0, 7, 7, static_cast<int32_t>(rows - 1) };
         std::vector<uint8_t> dst(4 * row);
-        const int            rc = ggml_backend_sycl_lazy_storage_gather(s, want, 4, dst.data(), dst.size());
+        // A dst one byte short of four rows is refused before anything is read, so the cache stays cold.
+        const int short_rc = ggml_backend_sycl_lazy_storage_gather(s, want, 4, dst.data(), dst.size() - 1);
+        expect(arr, short_rc == EINVAL, "a dst one byte short returned " + num(short_rc));
+        const int rc = ggml_backend_sycl_lazy_storage_gather(s, want, 4, dst.data(), dst.size());
         expect(arr, rc == 0 && rows_are_the_files(dst, want, 4, row, off),
                "the first gather returned " + num(rc) + ", or a row is not the file's bytes");
         uint64_t c[4] = {};  // hits, misses, evictions, submitted
@@ -627,7 +678,12 @@ void storage_api_on_file(arm_result & arr, const std::string & path, size_t off,
                    (untouched ? "" : " and wrote dst"));
         ggml_backend_sycl_lazy_storage_close(s);
     }
-    (void) ggml_backend_sycl_model_unloaded_token(model);
+    // The close released the row cache: the unload finds no MODEL-lifetime record of this model still open.
+    log_clear();
+    const ggml_sycl_lifecycle_result unload_rc = ggml_backend_sycl_model_unloaded_token(model);
+    expect(arr, log_lines_containing("[HOST-ZONE] leaked MODEL record").empty(),
+           "the unload found a leaked MODEL record: the close did not release the table");
+    expect(arr, unload_rc == GGML_SYCL_LIFECYCLE_OK, "the unload returned " + num(unload_rc));
     ggml_sycl_lazy_storage * late = ggml_backend_sycl_lazy_storage_open(model, &table, path.c_str());
     expect(arr, late == nullptr, "an open after the unload found a plan");
     ggml_backend_sycl_lazy_storage_close(late);
@@ -635,14 +691,17 @@ void storage_api_on_file(arm_result & arr, const std::string & path, size_t off,
 
 // (h) The storage API: a 4 MiB storage-only table written to a file in the build directory opens by the published
 // model token, gathers four rows byte-exact, hits on a repeated row, refuses a row past the table, and closes before
-// the unload. An info whose row_size or file_offset disagrees with the plan is refused, and an open after the unload
+// the unload, after which the unload finds no leaked MODEL record. A null argument, model id 0, a table the plan lacks,
+// and an info whose row_size, file_offset, size or type disagrees with the plan are refused, each by its own WARN; a
+// null storage's counters are zero and its gather EINVAL, as is a dst short of the rows; an open after the unload
 // finds no plan.
 // Engagement: the published plan's [PLACEMENT] line says STORAGE (arm (g) shows the same flag publishing it); the first
 // gather misses (the cache is cold), so rows come through O_DIRECT reads. The arm VOIDs when the fixture is not
 // written, its filesystem refuses O_DIRECT, or the host could not have held the table's body (arm (g)'s guards).
 // Mutants: the open reading the candidate instead of the published plan (no entry at model_id != 0: "the open
 // returned null"); file_offset ignored (every row off by 4032 B: "the first gather returned 0, or a row is not the
-// file's bytes"); the geometry cross-check missing (the offset-shifted info opens).
+// file's bytes"); the geometry cross-check missing (the offset-shifted info opens: "... file_offset disagrees ...");
+// the close not deleting the table ("the unload found a leaked MODEL record").
 arm_result arm_h_storage_api() {
     arm_result        arr;
     // The process id keeps the name apart between the -1dev and -2dev registrations, which share the build directory:
