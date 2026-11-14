@@ -445,7 +445,6 @@ def test_the_saver_refuses_a_storage_table_before_it_touches_the_gguf_context():
 
 
 ARG_CPP = ROOT / "common/arg.cpp"
-LAZY_STORAGE_H = ROOT / "src/llama-lazy-storage.h"
 
 # the advice both PLE failures end with: the option value that keeps the table resident
 PLE_ADVICE = "--lazy-mode off"
@@ -465,9 +464,11 @@ def if_block(code: str, m: re.Match):
     return cond, block, open_brace + len(block) + 2
 
 
-# a lambda: the capture, then optionally the parameters, the specifiers and a trailing return type, then the body
+# a lambda: the capture, then optionally the parameters, the specifiers and a trailing return type, then the body. A
+# `[` right after a name, `]` or `)` is a subscript, never a capture: with the parameters optional, `p[i]->x) {` would
+# otherwise read as a lambda whose trailing return type is `x)`, and the block after it would be hidden
 _LAMBDA_RE = re.compile(
-    r"\[[^\]\[]*\]\s*"
+    r"(?<![\w\])])\[[^\]\[]*\]\s*"
     r"(?:\((?:[^()]|\([^()]*\))*\)\s*)?"
     r"(?:(?:mutable|constexpr|consteval|noexcept(?:\s*\((?:[^()]|\([^()]*\))*\))?)\s*)*"
     r"(?:->\s*[^{};]+?\s*)?\{")
@@ -588,6 +589,8 @@ def test_the_section_10_helpers():
         assert "return" not in kept and kept.startswith("a();") and kept.endswith("; b();"), (
             f"drop_lambda_bodies left a lambda's body, or cut the code around it: {lam} -> {kept}")
     assert "return" in drop_lambda_bodies("v[i] = 1; return v[i];"), "drop_lambda_bodies emptied a subscript"
+    for kept in ("if (p[i]->x) { return; }", "if ((&u)[0]->n == 0) { return; }", "int a[2] { 1, 2 }"):
+        assert drop_lambda_bodies(kept) == kept, f"drop_lambda_bodies took a subscript for a lambda: {kept}"
     call = re.search(r"f\s*\(", 'f(a, g(b, c), "x, (y", \',\', {1, 2}, s[i, j], h())')
     assert call_args('f(a, g(b, c), "x, (y", \',\', {1, 2}, s[i, j], h())', call) == [
         "a", "g(b, c)", '"x, (y"', "','", "{1, 2}", "s[i, j]", "h()"], "call_args split inside a nested argument"
@@ -762,7 +765,8 @@ def test_qwen4exp_ple_set_input_clears_its_flag_and_fails_every_early_return():
     assert len(set_ids) == 1, "the resident path sets its input once"
     ids_args = call_args(eager, set_ids[0])
     vec = re.fullmatch(r"(\w+)\.data\(\)", ids_args[1]) if len(ids_args) == 4 else None
-    assert ids_args[0] == ids and vec, f"the resident path must set {ids} from a vector's data: {ids_args}"
+    assert ids_args[0] == ids and vec and ids_args[2] == "0", (
+        f"the resident path must set {ids} from offset 0 out of a vector's data: {ids_args}")
     vec = vec.group(1)
 
     rest = body[past:]
@@ -788,6 +792,7 @@ def test_qwen4exp_ple_set_input_clears_its_flag_and_fails_every_early_return():
     set_args = call_args(rest, i_set[0])
     out = re.fullmatch(r"(\w+)\.data\(\)", set_args[1]) if len(set_args) == 4 else None
     assert set_args[0] == emb, f"the STORAGE path sets {set_args[0]}, not {emb}, the F32 input build_inp_ple made"
+    assert set_args[2] == "0", f"the STORAGE path must set {emb} from offset 0, not {set_args[2]}"
     assert out and out.group(1) == g_args[3] and scratch_bytes(set_args[3]) == g_args[3], (
         f"the input must be set from the whole of {g_args[3]}, the f32 vector gather_f32 filled: {set_args}")
 
@@ -813,15 +818,9 @@ def test_the_ple_advice_names_a_value_the_option_takes():
     # both PLE failures tell the user to switch the table resident: the option and its value must exist as spelled
     opt, value = PLE_ADVICE.split()
     arg = read_code(ARG_CPP)
-    reg = re.search(r'\{\s*"-\w+"\s*,\s*"' + re.escape(opt) + r'"\s*\}', arg)
+    # anywhere in the brace list of names, so an alias added, dropped or moved changes nothing
+    reg = re.search(r'\{[^{}]*"' + re.escape(opt) + r'"[^{}]*\}', arg)
     assert reg, f"common/arg.cpp registers no {opt}"
     parse = arg[reg.end():arg.index("add_opt(", reg.end())]
     assert re.search(r'value\s*==\s*"' + value + r'"', parse), f"{opt} does not accept {value}"
 
-
-def test_lazy_storage_offers_the_f32_gather_qwen4exp_uses():
-    h = read_code(LAZY_STORAGE_H)
-    assert re.search(r"\bbool\s+can_gather_f32\s*\(\s*\)\s*const\s*;", h), "llama_lazy_storage has no can_gather_f32()"
-    assert re.search(r"\bint\s+gather_f32\s*\(\s*const\s+int32_t\s*\*\s*\w+\s*,\s*size_t\s+\w+\s*,"
-                     r"\s*std::vector<uint8_t>\s*&\s*\w+\s*,\s*std::vector<float>\s*&\s*\w+\s*\)\s*const\s*;", h), (
-        "llama_lazy_storage has no gather_f32(rows, n, raw, out)")

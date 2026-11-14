@@ -326,8 +326,8 @@ static void check_gather_f32() {
         std::vector<float>   out;
         const int            rc = s.gather_f32(rows, 4, raw, out);
         CHECK(rc == 0, "the Q8_0 gather_f32 returned %d", rc);
-        CHECK(g_typed_calls == 1 && g_typed_dst_bytes >= 4 * k_q8_row_size,
-              "the Q8_0 rows were not read once into room for 4 rows: %d call(s), %zu B", g_typed_calls,
+        CHECK(g_typed_calls == 1 && g_typed_dst_bytes == 4 * k_q8_row_size,
+              "the Q8_0 rows were not read once into exactly 4 rows of bytes: %d call(s), %zu B", g_typed_calls,
               g_typed_dst_bytes);
         CHECK(out.size() == 4 * (size_t) k_q8_ne0, "the Q8_0 gather_f32 gave %zu values, want %lld", out.size(),
               (long long) (4 * k_q8_ne0));
