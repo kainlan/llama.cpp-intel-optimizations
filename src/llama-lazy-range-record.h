@@ -164,3 +164,7 @@ void llama_lazy_range_check_create(const llama_lazy_range_record & record,
 void llama_lazy_range_check_storage(const llama_lazy_range_record & record,
                                     enum llm_arch                   arch,
                                     const std::string &             name);
+
+// Whether `name`'s row is STORAGE: the one question create_tensor() asks to keep the table out of every buffer. Aborts
+// on a name without a row, like the other accessors.
+bool llama_lazy_range_is_storage(const llama_lazy_range_record & record, const std::string & name);

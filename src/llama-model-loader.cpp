@@ -1925,9 +1925,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     llama_lazy_range_check_create(lazy_record, get_arch(), tn.str(), (flags & TENSOR_READ_LAZY) != 0);
 
     if (flags & TENSOR_READ_LAZY) {
-        // a STORAGE row is the SYCL storage tier's, not lazy_read's: refuse it before
-        // buft_for_tensor() can make it an ordinary input-layer weight in host memory
+        // a STORAGE row is the SYCL storage tier's, not lazy_read's: refused for an arch with no consumer, and
+        // otherwise kept out of buft_for_tensor(), which would make it an ordinary input-layer weight in host memory
         llama_lazy_range_check_storage(lazy_record, get_arch(), tn.str());
+        if (llama_lazy_range_is_storage(lazy_record, tn.str())) {
+            return create_storage_tensor(tn.str(), cur);
+        }
 
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
@@ -1978,6 +1981,29 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     register_sycl_tensor_metadata(tensor);
     return tensor;
+}
+
+ggml_tensor * llama_model_loader::create_storage_tensor(const std::string & name, const ggml_tensor * cur) {
+    if (!storage_ctx) {
+        // every STORAGE tensor has a row, so the record's row count bounds how many this context holds
+        const size_t     n_max  = std::max<size_t>(1, lazy_record.rows().size());
+        ggml_init_params params = {
+            /*.mem_size   =*/n_max * ggml_tensor_overhead(),
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
+        };
+        storage_ctx.reset(ggml_init(params));
+        if (!storage_ctx) {
+            throw std::runtime_error("failed to create the STORAGE tensors' context");
+        }
+    }
+    ggml_tensor * t = ggml_dup_tensor(storage_ctx.get(), cur);
+    ggml_set_name(t, name.c_str());
+    // never read in full, so not part of the load's progress: load_all_data's last-tensor cleanup waits for
+    // size_done to reach size_data
+    size_data -= ggml_nbytes(cur);
+    n_created++;
+    return t;
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {

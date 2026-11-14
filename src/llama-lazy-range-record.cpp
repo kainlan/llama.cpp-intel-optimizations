@@ -271,3 +271,7 @@ void llama_lazy_range_check_storage(const llama_lazy_range_record & record,
                                         name.c_str(), llm_arch_name(arch)));
     }
 }
+
+bool llama_lazy_range_is_storage(const llama_lazy_range_record & record, const std::string & name) {
+    return record.deferral(name) == LLAMA_LAZY_DEFERRAL_STORAGE;
+}
