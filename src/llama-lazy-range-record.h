@@ -33,7 +33,7 @@ const char * llama_lazy_deferral_name(enum llama_lazy_deferral deferral);
 struct llama_lazy_tensor_attrs {
     uint32_t rows_per_token;  // 0 = not known for this arch
     int32_t  consumer_layer;  // -1 = not known for this arch
-    bool     storage_only;    // never held resident: the planner places it STORAGE whatever the host room
+    bool     storage_only;    // the planner is to place it STORAGE whatever the host room (no reader yet)
 };
 
 // the table's place in its file, handed out by value
@@ -142,7 +142,7 @@ void llama_lazy_range_check_create(const llama_lazy_range_record & record,
 // STORAGE belongs to the SYCL storage tier, and when this arch has no STORAGE consumer
 // the load refuses it by throwing std::runtime_error naming the tensor, before
 // buft_for_tensor() can make it an ordinary input-layer weight in host memory. Silent
-// on a LAZY_READ or EAGER row; aborts on a name without a row.
+// on a LAZY_READ or EAGER row and on a STORAGE row of an arch with a consumer; aborts on a name without a row.
 void llama_lazy_range_check_storage(const llama_lazy_range_record & record,
                                     enum llm_arch                   arch,
                                     const std::string &             name);

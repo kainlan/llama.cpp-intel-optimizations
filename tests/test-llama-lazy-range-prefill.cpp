@@ -145,7 +145,8 @@ int main() {
         CHECK(rec.filled() && rec.has(lazy), "mode %d: the declared name has no row after the pre-fill", (int) mode);
         const llama_lazy_tensor_attrs want = llama_model_lazy_tensor_attrs(arch, hp, lazy);
         CHECK(rec.attrs(lazy).rows_per_token == want.rows_per_token &&
-                  rec.attrs(lazy).consumer_layer == want.consumer_layer,
+                  rec.attrs(lazy).consumer_layer == want.consumer_layer &&
+                  rec.attrs(lazy).storage_only == want.storage_only,
               "the row's attributes are not llama_model_lazy_tensor_attrs()'s");
         const auto &                 w = fx.weights.at(lazy);
         const llama_lazy_range_value v = rec.value(lazy);
@@ -244,8 +245,10 @@ int main() {
                 const bool refused = c.taker && c.mode == LLAMA_LAZY_MODE_ON && !consumer;
                 CHECK(threw == refused, "%s, %s: the STORAGE refusal %s", llm_arch_name(a), c.label,
                       threw ? "fired" : "did not fire");
-                CHECK(!threw || what.find(lazy) != std::string::npos,
-                      "%s, %s: the refusal does not name the tensor: %s", llm_arch_name(a), c.label, what.c_str());
+                CHECK(!threw ||
+                          (what.find(lazy) != std::string::npos && what.find(llm_arch_name(a)) != std::string::npos),
+                      "%s, %s: the refusal does not name the tensor and the arch: %s", llm_arch_name(a), c.label,
+                      what.c_str());
 
                 // an EAGER row (the 4 GiB table is ineligible under AUTO and OFF) never refuses
                 bool threw_eager = false;

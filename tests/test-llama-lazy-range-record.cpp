@@ -157,8 +157,8 @@ int main() {
                     llama_lazy_range_record_prefill(rec, LLM_ARCH_LLAMA, hp, declared, fx.finder(), pre, post,
                                                     taker != 0, supported != 0);
                     for (const llama_lazy_range_row & row : rec.rows()) {
-                        // T6a's function, called and not restated; with the taker, AUTO has no STORAGE
-                        // consumer to hand a LLM_ARCH_LLAMA row to, so every row is the ordinary weight OFF makes it
+                        // llama_lazy_eligible(), called and not restated; with the taker, AUTO has no STORAGE
+                        // consumer to hand an LLM_ARCH_LLAMA row to, so every row is the ordinary weight OFF makes it
                         const llama_lazy_mode read = taker ? pre : post;
                         const bool            expected =
                             llama_lazy_eligible(read, row.value.size, taker ? true : supported != 0) &&
@@ -245,6 +245,7 @@ int main() {
               a.attrs(t).consumer_layer);
         CHECK(b.attrs(t).rows_per_token == 8 && b.attrs(t).consumer_layer == 5,
               "record b read (%u, %d), expected (8, 5)", b.attrs(t).rows_per_token, b.attrs(t).consumer_layer);
+        CHECK(a.attrs(t).storage_only && b.attrs(t).storage_only, "the record dropped storage_only");
 
         // not a literal 1; more than one PLE layer is "not known"
         llama_hparams two = qwen_hparams(16, 1);
