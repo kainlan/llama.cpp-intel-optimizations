@@ -95,6 +95,8 @@ int main() {
         std::vector<moe_island_row> same_dst = { row_of(0, 0, 2), row_of(1, 0, 2) };
         same_dst[1].dst_offset               = same_dst[0].dst_offset;
         CHECK(!moe_island_plan_build(same_dst, K_BYTES, N_BYTES, &plan));
+        // A refusal leaves nothing to submit, although the activations were planned before the destinations failed.
+        CHECK(plan.gather.empty() && plan.scatter.empty() && plan.n_act_rows == 0);
         std::vector<moe_island_row> torn_src = { row_of(0, 0, 2), row_of(1, 0, 2) };
         torn_src[1].src_offset               = K_BYTES / 2;
         CHECK(!moe_island_plan_build(torn_src, K_BYTES, N_BYTES, &plan));
