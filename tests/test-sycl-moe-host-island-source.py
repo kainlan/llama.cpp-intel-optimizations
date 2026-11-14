@@ -4,11 +4,13 @@
 Host-only: reads ggml-sycl.cpp, builds nothing, loads no model and touches no device.
 
 A MUL_MAT_ID whose experts live on the host runs them on the CPU through the lambda dispatch_host_expert_groups in
-ggml_sycl_mul_mat_id (the "PP CPU island"). Every (token, slot) row reads its token's activation row of src1 and
-writes one result row of dst. It used to copy each row on its own in both directions: on a 2048-token prompt of a
-host-expert MoE that was millions of copies each way, almost every copy of the run. The copy plan in
-ggml-sycl/moe-host-island.hpp (tested by tests/test-sycl-moe-host-island.cpp) gathers each distinct activation row once,
-in runs of adjacent rows, and lays the results out in destination order so adjacent rows return in one copy.
+ggml_sycl_mul_mat_id (the "PP CPU island"). Every (token, slot) row reads one activation row of src1 and writes one
+result row of dst. It used to copy each row on its own in both directions: on a 2048-token prompt of a host-expert MoE
+that was millions of copies each way, almost every copy of the run. The copy plan in ggml-sycl/moe-host-island.hpp
+(tested by tests/test-sycl-moe-host-island.cpp) gathers each distinct activation row once, in runs of adjacent rows,
+and lays the results out in destination order so adjacent rows return in one copy. Rows that read the same src1 row
+share its copy: for gate and up (one src1 row per token, ne11 == 1) that is every expert of the token. The down
+projection's src1 has a row per (slot, token), so its rows share nothing and gain only from the runs.
 
 This gate holds the lambda to that plan. It is the only gate on the lambda's copies and on the order of its rows.
 Two other pins read other parts of the lambda: test-sycl-host-role-routing-source.py pins its activation block's

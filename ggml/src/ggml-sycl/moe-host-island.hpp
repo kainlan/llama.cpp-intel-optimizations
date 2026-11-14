@@ -2,11 +2,13 @@
 
 // How the prompt's CPU island moves its rows across the device.
 //
-// A MUL_MAT_ID whose experts live on the host runs them on the CPU: each (token, slot) row reads the token's
-// activation row of src1 and writes one result row of dst. A token's activation is the same row for every expert that
-// reads it, so the plan copies each distinct activation row once, as one copy per run of adjacent rows (one copy, when
-// the micro-batch's tokens are contiguous in src1). The result rows are laid out on the host in destination order,
-// so rows adjacent in dst return in one copy: a layer whose every selected expert is on the host returns in one.
+// A MUL_MAT_ID whose experts live on the host runs them on the CPU: each (token, slot) row reads one activation row of
+// src1 and writes one result row of dst. Rows that read the same src1 row share one copy of it: for gate and up, whose
+// src1 holds one row per token (ne11 == 1), that is every expert of the token. The down projection's src1 holds a row
+// per (slot, token), so there every row has its own activation row and nothing is shared. Either way the plan copies
+// each distinct activation row once, as one copy per run of adjacent rows (one copy, when those rows are contiguous in
+// src1). The result rows are laid out on the host in destination order, so rows adjacent in dst return in one copy: a
+// layer whose every selected expert is on the host returns in one.
 //
 // SYCL-free on purpose so tests/test-sycl-moe-host-island.cpp can run it without a device.
 
