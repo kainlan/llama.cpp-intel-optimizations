@@ -34693,6 +34693,20 @@ static size_t lazy_row_cache_slots_within(size_t floor_slots, size_t max_slots, 
     return lo;
 }
 
+// A lazy table's HOST body: the O_DIRECT window over the table (§3.3) at host_cpu_mapped_size, the bytes holding the
+// table whole would charge the ledger.
+static size_t lazy_table_host_body_bytes(const placement_lazy_table_info & info) {
+    return host_cpu_mapped_size(lazy_table_host_body_request_bytes(info.file_offset, info.table_bytes));
+}
+
+// The ceiling on a storage-only table's row cache, index included: 2 GiB, and never more than holding the table whole
+// would cost. A fixed size and not a share of the room, because the cache only needs the hot rows of a table that is
+// deliberately never held whole. The cache's floor still holds when it alone exceeds the ceiling.
+static size_t lazy_table_storage_cache_ceiling(const placement_lazy_table_info & info) {
+    constexpr size_t cache_cap = 2ull << 30;
+    return std::min(cache_cap, lazy_table_host_body_bytes(info));
+}
+
 // A lazy table's yieldable bytes (th32 §6.4): what a STORAGE cache holds above its floor, by the row cache's own chunk
 // rule, so the plan counts the bytes the built cache publishes. A HOST table yields nothing.
 static size_t lazy_table_yieldable_bytes(const placement_lazy_table & table, size_t row_size) {
@@ -34754,10 +34768,11 @@ static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_la
 // storage_only table has no HOST test to fall back on, so it refuses. After the pass the block ring is sized over the
 // STORAGE tables and charged unless the live ring holds it; the floors and the ring must fit both the budget
 // and P3, or the plan refuses as lazy-table-cache-below-floor. What both leave above that is the STORAGE caches'
-// yieldable share (§6.4), split in proportion to table_bytes x rows_per_token. The live ring is read through the pin by
-// lazy_ring_coverage_read, which counts each read (§10): one per table for eligibility, one for the need and one for
-// the charge. A cold expert class refuses as cold-set-not-implemented. A refused plan carries no table and no ring, and
-// host_planned_bytes is then the zone total.
+// yieldable share (§6.4), split in proportion to table_bytes x rows_per_token. A storage_only table's cache stops at
+// min(2 GiB, its HOST body), its floor aside, and the room that leaves unused is not handed to another table. The live
+// ring is read through the pin by lazy_ring_coverage_read, which counts each read (§10): one per table for
+// eligibility, one for the need and one for the charge. A cold expert class refuses as cold-set-not-implemented. A
+// refused plan carries no table and no ring, and host_planned_bytes is then the zone total.
 static void placement_plan_decide_lazy_residency(placement_plan &          plan,
                                                  const placement_kv_info & kv_info,
                                                  const ring_lease *        coverage_pin) {
@@ -34832,10 +34847,9 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
         t.consumer_device   = lazy_consumer_device(plan, info.consumer_layer);
         t.cache_floor_slots = 2ull * placement_load_n_ubatch(kv_info.n_ubatch) * info.rows_per_token;
         // The HOST term is the body the materialization allocates, the O_DIRECT window over the table (§3.3).
-        const size_t body =
-            host_cpu_mapped_size(lazy_table_host_body_request_bytes(info.file_offset, info.table_bytes));
-        const size_t with   = host_ledger_sat_add(used, body);
-        const size_t span   = lazy_block_ring_span(info.row_size);
+        const size_t   body     = lazy_table_host_body_bytes(info);
+        const size_t   with     = host_ledger_sat_add(used, body);
+        const size_t   span     = lazy_block_ring_span(info.row_size);
         // The eligibility read: a live ring whose slot is narrower than this table's span declines it, loudly, before
         // the HOST test, which then decides it as for any table; a declined storage-only table has no HOST test to fall
         // back on and refuses. No ring yet, or no pin, declines nothing. The line prints once per load and table,
@@ -34918,7 +34932,11 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
             share                                   = std::min(share, avail - given);
             const size_t rows                       = info.row_size != 0 ? info.table_bytes / info.row_size : 0;
             const size_t floor_res                  = t.host_resident_bytes;
-            t.cache_slots = lazy_row_cache_slots_within(t.cache_floor_slots, rows, info.row_size, floor_res + share);
+            size_t       target                     = floor_res + share;
+            if (info.storage_only) {
+                target = std::min(target, std::max(floor_res, lazy_table_storage_cache_ceiling(info)));
+            }
+            t.cache_slots         = lazy_row_cache_slots_within(t.cache_floor_slots, rows, info.row_size, target);
             t.host_resident_bytes = lazy_row_cache_resident_bytes(t.cache_slots, info.row_size);
             given += t.host_resident_bytes - floor_res;
         }
@@ -34941,8 +34959,11 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
         lazy_resident += t.host_resident_bytes;
         yieldable += lazy_table_yieldable_bytes(t, info.row_size);
         if (t.residency == lazy_residency::STORAGE) {
-            GGML_LOG_WARN("[PLACEMENT] lazy %s residency=STORAGE %s index=%zu\n", t.name.c_str(), fields.c_str(),
-                          lazy_row_cache_index_bytes(t.cache_slots));
+            // cache_cap= is the ceiling a storage-only table's cache was held to, none for any other table.
+            const std::string cache_cap =
+                info.storage_only ? std::to_string(lazy_table_storage_cache_ceiling(info)) : "none";
+            GGML_LOG_WARN("[PLACEMENT] lazy %s residency=STORAGE %s index=%zu cache_cap=%s\n", t.name.c_str(),
+                          fields.c_str(), lazy_row_cache_index_bytes(t.cache_slots), cache_cap.c_str());
         } else {
             ++n_host;
             GGML_LOG_WARN("[PLACEMENT] lazy %s residency=HOST %s host_budget=%zu host_planned=%zu leftover=%zu\n",
