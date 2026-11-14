@@ -117,6 +117,7 @@
 #include "ggml-sycl/kernel-selection.hpp"
 #include "ggml-sycl/kv-region-registry.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
+#include "ggml-sycl/lazy-gather.hpp"
 #include "ggml-sycl/lazy-io-pool.hpp"
 #include "ggml-sycl/lazy-table.hpp"
 #include "ggml-sycl/lightning-indexer.hpp"
@@ -127623,6 +127624,170 @@ bool ggml_sycl_lazy_ring_coverage_reads_for_testing(uint64_t * out) {
     return true;
 }
 
+// The C declaration's opaque type, so it stays outside namespace ggml_sycl.
+struct ggml_sycl_lazy_storage {
+    ggml_sycl::lazy_table_ref     table;
+    ggml_sycl::lazy_gather_source source;
+    uint64_t                      context  = 0;  // the IO engine's queue name for this table's gathers
+    int32_t                       deadline = 0;  // the consumer layer
+    // One gather at a time, so each call's landing epoch is its own. No IO pool worker takes it, so a gather may hold
+    // it while it waits for the workers' deliveries.
+    std::mutex                    gather_lock;
+    uint32_t                      epoch = 0;       // guarded by gather_lock
+    std::atomic<uint64_t>         submitted{ 0 };  // waiters submitted for misses over every gather
+};
+
+// C linkage from the header's declarations, like the accessors above.
+ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(ggml_sycl_model_token             model,
+                                                             const ggml_sycl_lazy_table_info * info,
+                                                             const char *                      file_path) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        GGML_LOG_WARN("[LAZY-STORAGE] open refused: the backend module is not admitting mutations\n");
+        return nullptr;
+    }
+    if (info == nullptr || info->name == nullptr || file_path == nullptr || model.model_id == 0) {
+        GGML_LOG_WARN("[LAZY-STORAGE] open refused: a null argument or model id 0\n");
+        return nullptr;
+    }
+    try {
+        // The published plan, never the load's candidate: a table is opened after its model's load ended.
+        const auto snapshot = ggml_sycl::lifecycle_find_placement_plan(model.model_id, model.load_txn_id);
+        if (!snapshot || !snapshot->plan) {
+            GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: no published plan for model %llu\n", info->name,
+                          (unsigned long long) model.model_id);
+            return nullptr;
+        }
+        const ggml_sycl::placement_plan &       plan  = *snapshot->plan;
+        const ggml_sycl::placement_lazy_table * entry = nullptr;
+        for (const ggml_sycl::placement_lazy_table & t : plan.lazy_tables) {
+            if (t.name == info->name) {
+                entry = &t;
+            }
+        }
+        const ggml_sycl::placement_lazy_table_info * planned = nullptr;
+        for (const ggml_sycl::placement_lazy_table_info & t : snapshot->kv_info.lazy_tables) {
+            if (t.name == info->name) {
+                planned = &t;
+            }
+        }
+        if (entry == nullptr || planned == nullptr) {
+            GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: the plan for model %llu carries no such table\n",
+                          info->name, (unsigned long long) model.model_id);
+            return nullptr;
+        }
+        if (entry->residency != ggml_sycl::lazy_residency::STORAGE) {
+            GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: the plan holds it HOST\n", info->name);
+            return nullptr;
+        }
+        // The table the caller names must be the one the plan sized: a row size or extent that differs would read
+        // the wrong bytes into a cache planned for other ones. With these four equal, the materialization's own check
+        // (row_size is ggml_row_size(type, ne0), table_bytes is row_size * n_rows) leaves ne0 and n_rows no freedom.
+        if (planned->row_size != info->row_size || entry->table_bytes != info->size ||
+            planned->file_offset != info->file_offset || planned->type != info->type) {
+            GGML_LOG_WARN(
+                "[LAZY-STORAGE] %s: open refused: row_size %zu/%zu B, bytes %zu/%zu B, offset %zu/%zu, type %d/%d "
+                "(caller/plan)\n",
+                info->name, info->row_size, planned->row_size, info->size, entry->table_bytes, info->file_offset,
+                planned->file_offset, (int) info->type, (int) planned->type);
+            return nullptr;
+        }
+        ggml_sycl::lazy_table_desc desc;
+        desc.name                = info->name;
+        desc.model               = model;
+        desc.type                = info->type;
+        desc.ne0                 = info->ne[0];
+        desc.n_rows              = info->ne[1];
+        desc.row_size            = info->row_size;
+        desc.file_index          = info->file_index;
+        desc.file_offset         = info->file_offset;
+        desc.table_bytes         = info->size;
+        desc.file_path           = file_path;
+        desc.residency           = ggml_sycl::lazy_residency::STORAGE;
+        desc.consumer_layer      = info->consumer_layer;
+        desc.consumer_device     = entry->consumer_device;
+        desc.host_resident_bytes = entry->host_resident_bytes;
+        desc.cache_slots         = entry->cache_slots;
+        desc.cache_floor_slots   = entry->cache_floor_slots;
+        desc.block_ring_need     = plan.block_ring_need;
+        desc.block_ring_charge   = plan.block_ring_charge;
+
+        ggml_sycl::lazy_table_result made = ggml_sycl::lazy_table_create_storage(desc);
+        if (!made) {
+            return nullptr;  // the materialization logged its refusal with the figures
+        }
+        struct stat st = {};
+        if (fstat(made.table->storage_fd(), &st) != 0) {
+            const int fstat_err = errno;
+            GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: fstat failed (errno %d)\n", info->name, fstat_err);
+            return nullptr;
+        }
+        auto * s              = new ggml_sycl_lazy_storage;
+        s->table              = std::move(made.table);
+        s->source.fd          = s->table->storage_fd();
+        // device and inode, so two descriptors on one file share reads in the engine's in-flight table
+        s->source.file_id     = (static_cast<uint64_t>(st.st_dev) << 40) ^ static_cast<uint64_t>(st.st_ino);
+        s->source.file_offset = info->file_offset;
+        // The row cache was built at desc.row_size, this same figure, so the gather's refusal of a cache whose row
+        // size is not the source's cannot fire; and the materialization refused a table whose end wraps a uint64_t.
+        s->source.row_size    = info->row_size;
+        s->source.n_rows      = info->ne[1];
+        s->context            = reinterpret_cast<uintptr_t>(s);
+        s->deadline           = info->consumer_layer;
+        return s;
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (const std::exception & e) {
+        GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: %s\n", info->name, e.what());
+        return nullptr;
+    }
+}
+
+int ggml_backend_sycl_lazy_storage_gather(ggml_sycl_lazy_storage * s,
+                                          const int32_t *          rows,
+                                          size_t                   n,
+                                          void *                   dst,
+                                          size_t                   dst_bytes) {
+    if (s == nullptr) {
+        return EINVAL;
+    }
+    // The gather blocks until the IO pool's workers deliver, so this lock is one no worker takes. A lock that throws
+    // is EIO, as the gather answers a lookup's or a submit's throwing lock: a caller's graph input never throws.
+    std::unique_lock<std::mutex> lock(s->gather_lock, std::defer_lock);
+    try {
+        lock.lock();
+    } catch (const std::system_error &) {
+        return EIO;
+    }
+    ggml_sycl::lazy_gather_stats st;
+    const int rc = ggml_sycl::lazy_gather_rows(s->table->row_cache(), s->source, s->context, ++s->epoch, s->deadline,
+                                               rows, n, static_cast<uint8_t *>(dst), dst_bytes, &st);
+    s->submitted += st.reads;
+    return rc;
+}
+
+void ggml_backend_sycl_lazy_storage_counters(const ggml_sycl_lazy_storage * s, uint64_t out[4]) {
+    if (out == nullptr) {
+        return;
+    }
+    out[0] = out[1] = out[2] = out[3] = 0;
+    if (s == nullptr || s->table->row_cache() == nullptr) {
+        return;
+    }
+    const ggml_sycl::lazy_row_cache_counters c = s->table->row_cache()->counters();
+    out[0]                                     = c.hits;
+    out[1]                                     = c.misses;
+    out[2]                                     = c.evictions;
+    out[3]                                     = s->submitted.load();
+}
+
+void ggml_backend_sycl_lazy_storage_close(ggml_sycl_lazy_storage * s) {
+    // A release is never refused: the guard only keeps the release from overlapping a module reactivation, and a
+    // refused close would leak the table's MODEL-lifetime cache past its model.
+    sycl_module_mutation_guard module_guard;
+    delete s;
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 extern "C" uint64_t ggml_sycl_test_plan_effect_begin(uint64_t load_txn_id) {
     const uint64_t previous     = g_sycl_plan_load_effect_txn;
@@ -128211,6 +128376,18 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_sycl_lazy_ring_coverage_reads_for_testing") == 0) {
         return (void *) ggml_sycl_lazy_ring_coverage_reads_for_testing;
+    }
+    if (strcmp(name, "ggml_backend_sycl_lazy_storage_open") == 0) {
+        return (void *) ggml_backend_sycl_lazy_storage_open;
+    }
+    if (strcmp(name, "ggml_backend_sycl_lazy_storage_gather") == 0) {
+        return (void *) ggml_backend_sycl_lazy_storage_gather;
+    }
+    if (strcmp(name, "ggml_backend_sycl_lazy_storage_counters") == 0) {
+        return (void *) ggml_backend_sycl_lazy_storage_counters;
+    }
+    if (strcmp(name, "ggml_backend_sycl_lazy_storage_close") == 0) {
+        return (void *) ggml_backend_sycl_lazy_storage_close;
     }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_sycl_test_plan_effect_begin") == 0) {
