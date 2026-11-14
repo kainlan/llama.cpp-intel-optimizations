@@ -16,7 +16,8 @@ static int g_fails = 0;
         }                                      \
     } while (0)
 
-static void check_converter() {
+// False when this build has no SYCL backend and nothing was checked.
+static bool check_converter() {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     llama_lazy_storage_table t = {};
     t.name                     = "per_layer_token_embd.weight";
@@ -32,12 +33,16 @@ static void check_converter() {
     CHECK(i.type == t.type && i.ne[0] == 160 && i.ne[1] == 1000 && i.row_size == 170, "shape");
     CHECK(i.file_index == 2 && i.file_offset == 4032 && i.size == 170000, "place");
     CHECK(i.rows_per_token == 16 && i.consumer_layer == 1 && i.storage_only, "attrs");
+    return true;
 #else
-    std::printf("SKIP converter: no SYCL in this build\n");
+    return false;
 #endif
 }
 
 int main() {
-    check_converter();
+    if (!check_converter()) {
+        std::printf("SKIP: no SYCL in this build, so nothing was checked\n");
+        return 77;
+    }
     return g_fails == 0 ? 0 : 1;
 }

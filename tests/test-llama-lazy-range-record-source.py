@@ -339,12 +339,26 @@ def test_both_inventories_carry_the_storage_tables():
     for fn in (r"static\s+bool\s+llama_model_sycl_build_early_inventory\s*\(",
                r"static\s+void\s+llama_model_sycl_set_late_inventory\s*\("):
         body = function_body(src, fn + r"(?:[^()]|\([^()]*\))*\)")
-        assert "llama_model_sycl_lazy_table_infos(" in body and re.search(r"\.lazy_table_count\s*=", body), (
+        assert "llama_model_sycl_set_inventory_lazy_tables(" in body, (
             f"{fn} does not hand the STORAGE rows to the planner")
     # anchored on the return type and the brace, so neither a call nor a declaration of the helper can match
-    m = re.search(r"static\s+std::vector\s*<\s*ggml_sycl_lazy_table_info\s*>\s*llama_model_sycl_lazy_table_infos\s*"
+    m = re.search(r"static\s+void\s+llama_model_sycl_set_inventory_lazy_tables\s*"
                   r"\((?:[^()]|\([^()]*\))*\)\s*\{", src)
-    assert m, "the inventories' helper llama_model_sycl_lazy_table_infos is not defined"
+    assert m, "the inventories' helper llama_model_sycl_set_inventory_lazy_tables is not defined"
     helper = balanced(src, m.end() - 1)
     assert "llama_lazy_range_storage_tables(" in helper and "llama_lazy_storage_table_info(" in helper, (
         "the inventories' helper must collect through the record and convert through the shared converter")
+    assert re.search(r"\.lazy_tables\s*=", helper) and re.search(r"\.lazy_table_count\s*=", helper), (
+        "the inventories' helper must set both the table array and its count")
+
+
+def test_the_lazy_table_owner_cannot_be_copied():
+    # the infos point into the owner's tables, so a copy would leave them pointing into the source
+    src = read_code(MODEL_CPP)
+    m = re.search(r"struct\s+llama_model_sycl_lazy_tables\s*\{", src)
+    assert m, "the owner struct llama_model_sycl_lazy_tables is not defined"
+    body = balanced(src, m.end() - 1)
+    assert re.search(r"llama_model_sycl_lazy_tables\s*\(\s*const\s+llama_model_sycl_lazy_tables\s*&\s*\)\s*=\s*delete",
+                     body), "the owner's copy constructor is not deleted"
+    assert re.search(r"operator\s*=\s*\(\s*const\s+llama_model_sycl_lazy_tables\s*&\s*\)\s*=\s*delete", body), (
+        "the owner's copy assignment is not deleted")
