@@ -1549,8 +1549,8 @@ arm_result arm_gather_rows() {
             void_arm(r, "a sentinel byte equals its file byte");
             return false;
         }
-        const bool done = returns_within([s, rows, epoch] { return gather_into(*s, rows, epoch); }, 10, rc);
-        expect(r, done, "a gather did not return within 10 s");
+        const bool done = returns_within([s, rows, epoch] { return gather_into(*s, rows, epoch); }, 5, rc);
+        expect(r, done, "a gather did not return within 5 s");
         return done;
     };
 
@@ -1726,20 +1726,22 @@ lazy_ring_mutant mutant_named(const char * text) {
     };
 
     static const entry table[] = {
-        { "no-ensuring",                       lazy_ring_mutant::NO_ENSURING                 },
-        { "ensuring-kept-on-throw",            lazy_ring_mutant::ENSURING_KEPT_ON_THROW      },
-        { "install-after-shut-down",           lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN     },
-        { "no-span-check",                     lazy_ring_mutant::NO_SPAN_CHECK               },
-        { "no-alignment-check",                lazy_ring_mutant::NO_ALIGNMENT_CHECK          },
-        { "shutdown-no-wait",                  lazy_ring_mutant::SHUTDOWN_NO_WAIT            },
-        { "worker-reap-destroys-pool",         lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL   },
-        { "pool-strict-abort-dropped",         lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
-        { "pool-strict-abort-dropped-refused", lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
-        { "pool-strict-abort-dropped-drop",    lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
-        { "pool-strict-abort-dropped-parked",  lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED   },
-        { "ensure-witness-dropped",            lazy_ring_mutant::ENSURE_WITNESS_DROPPED      },
-        { "ticket-wait-returns-at-once",       lazy_ring_mutant::TICKET_WAIT_RETURNS_AT_ONCE },
-        { "ticket-zero-no-notify",             lazy_ring_mutant::TICKET_ZERO_NO_NOTIFY       },
+        { "no-ensuring",                       lazy_ring_mutant::NO_ENSURING                   },
+        { "ensuring-kept-on-throw",            lazy_ring_mutant::ENSURING_KEPT_ON_THROW        },
+        { "install-after-shut-down",           lazy_ring_mutant::INSTALL_AFTER_SHUT_DOWN       },
+        { "no-span-check",                     lazy_ring_mutant::NO_SPAN_CHECK                 },
+        { "no-alignment-check",                lazy_ring_mutant::NO_ALIGNMENT_CHECK            },
+        { "shutdown-no-wait",                  lazy_ring_mutant::SHUTDOWN_NO_WAIT              },
+        { "worker-reap-destroys-pool",         lazy_ring_mutant::WORKER_REAP_DESTROYS_POOL     },
+        { "pool-strict-abort-dropped",         lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED     },
+        { "pool-strict-abort-dropped-refused", lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED     },
+        { "pool-strict-abort-dropped-drop",    lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED     },
+        { "pool-strict-abort-dropped-parked",  lazy_ring_mutant::POOL_STRICT_ABORT_DROPPED     },
+        { "ensure-witness-dropped",            lazy_ring_mutant::ENSURE_WITNESS_DROPPED        },
+        { "ticket-wait-returns-at-once",       lazy_ring_mutant::TICKET_WAIT_RETURNS_AT_ONCE   },
+        { "ticket-zero-no-notify",             lazy_ring_mutant::TICKET_ZERO_NO_NOTIFY         },
+        { "gather-returns-unwaited",           lazy_ring_mutant::GATHER_RETURNS_UNWAITED       },
+        { "gather-error-returns-unwaited",     lazy_ring_mutant::GATHER_ERROR_RETURNS_UNWAITED },
     };
     for (const entry & e : table) {
         if (std::strcmp(e.text, text) == 0) {

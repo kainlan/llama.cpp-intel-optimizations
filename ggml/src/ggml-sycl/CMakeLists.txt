@@ -513,6 +513,11 @@ if (BUILD_TESTING)
         set(_le_ticket_wait "FAIL a ticket's wait returns when its reads are delivered: ")
         set(_le_re_ticket_wait_returns_at_once "${_le_ticket_wait}the wait returned with 3 reads held")
         set(_le_re_ticket_zero_no_notify "${_le_ticket_wait}after the release the wait did not return within 5 s")
+        string(CONCAT _le_re_gather_returns_unwaited
+            "FAIL a gather waits for the reads it submitted: the gather returned with 2 reads held")
+        string(CONCAT _le_re_gather_error_returns_unwaited
+            "FAIL a gather whose submit throws still waits for the reads it queued: after a submit threw, the gather "
+            "returned with a submitted read still held")
         set(_lazy_io_engine_mutants
             no-ensuring                       "${_le_re_no_ensuring}"
             ensuring-kept-on-throw            "${_le_re_ensuring_kept_on_throw}"
@@ -527,7 +532,9 @@ if (BUILD_TESTING)
             pool-strict-abort-dropped-parked  "${_le_re_pool_strict_abort_dropped_parked}"
             ensure-witness-dropped            "${_le_re_ensure_witness_dropped}"
             ticket-wait-returns-at-once       "${_le_re_ticket_wait_returns_at_once}"
-            ticket-zero-no-notify             "${_le_re_ticket_zero_no_notify}")
+            ticket-zero-no-notify             "${_le_re_ticket_zero_no_notify}"
+            gather-returns-unwaited           "${_le_re_gather_returns_unwaited}"
+            gather-error-returns-unwaited     "${_le_re_gather_error_returns_unwaited}")
         add_executable(test-sycl-lazy-io-engine-host
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
             lazy-gather.cpp

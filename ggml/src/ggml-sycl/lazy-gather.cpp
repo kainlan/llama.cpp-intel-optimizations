@@ -8,6 +8,17 @@
 
 namespace ggml_sycl {
 
+namespace {
+
+// One gather's request, its ticket and its landing slot: what every waiter the gather submits points into.
+struct gather_frame {
+    lazy_gather_request req;
+    lazy_io_ticket      ticket;
+    lazy_landing_slot   slot;
+};
+
+}  // namespace
+
 int lazy_gather_rows(lazy_row_cache *           cache,
                      const lazy_gather_source & src,
                      uint64_t                   context,
@@ -29,15 +40,28 @@ int lazy_gather_rows(lazy_row_cache *           cache,
     }
     // The request, ticket and landing slot live on this frame, and no pointer to them leaves it but the waiters': the
     // wait below is what makes that safe. The slot's epoch is set once, here, before the first submit.
-    lazy_gather_request req;
-    lazy_io_ticket      ticket;
-    lazy_landing_slot   slot;
-    req.epoch      = epoch;
-    req.ticket     = &ticket;
-    ticket.request = &req;
-    slot.epoch     = epoch;
-    slot.data      = dst;
-    slot.bytes     = n * src.row_size;
+    gather_frame   own;
+    gather_frame * frame = &own;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // A runtime mutant may let the wait return before the reads are delivered (the two unwaited gathers below, or a
+    // ticket wait that returns at once), so under any mutant the frame is leaked instead: a test must see the early
+    // return, not a delivery into a dead frame. A gather that cannot leak it submits nothing.
+    if (!lazy_ring_mutant_is(lazy_ring_mutant::NONE)) {
+        frame = new (std::nothrow) gather_frame;
+        if (frame == nullptr) {
+            return ENOMEM;
+        }
+    }
+#endif
+    lazy_gather_request & req    = frame->req;
+    lazy_io_ticket &      ticket = frame->ticket;
+    lazy_landing_slot &   slot   = frame->slot;
+    req.epoch                    = epoch;
+    req.ticket                   = &ticket;
+    ticket.request               = &req;
+    slot.epoch                   = epoch;
+    slot.data                    = dst;
+    slot.bytes                   = n * src.row_size;
 
     const size_t      span_bytes = lazy_block_ring_span(src.row_size);
     const lazy_io_key key{ lazy_io_class::PREFETCH, epoch, deadline, lazy_io_kind::TABLE_ROWS };
@@ -86,6 +110,12 @@ int lazy_gather_rows(lazy_row_cache *           cache,
     // drain the request or move the slot's epoch, so no delivery skips its copy, and each landing range,
     // [i * row_size, (i + 1) * row_size) with i < n, fits the slot's n * row_size bytes, so none is refused as outside
     // it. A refused submit counted nothing, and `stopped` reports it.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (lazy_ring_mutant_is(lazy_ring_mutant::GATHER_RETURNS_UNWAITED) ||
+        (stopped != 0 && lazy_ring_mutant_is(lazy_ring_mutant::GATHER_ERROR_RETURNS_UNWAITED))) {
+        return stopped;
+    }
+#endif
     const int read_error = lazy_io_ticket_wait(ticket);
     return stopped != 0 ? stopped : read_error;
 }

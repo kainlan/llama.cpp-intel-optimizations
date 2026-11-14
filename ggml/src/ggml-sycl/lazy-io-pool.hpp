@@ -693,6 +693,8 @@ enum class lazy_ring_mutant : uint8_t {
     ENSURE_WITNESS_DROPPED,          // ensure runs when it is entered with a witnessed lock held
     TICKET_WAIT_RETURNS_AT_ONCE,     // a ticket's wait returns its read_error without waiting for the count to reach 0
     TICKET_ZERO_NO_NOTIFY,           // the delivery that takes a ticket's count to 0 does not notify its waiter
+    GATHER_RETURNS_UNWAITED,         // a ubatch gather returns without waiting for the reads it submitted
+    GATHER_ERROR_RETURNS_UNWAITED,   // a gather whose submitting stopped early returns without waiting for its reads
 };
 
 void ggml_sycl_test_lazy_ring_mutant_select(lazy_ring_mutant mutant);
