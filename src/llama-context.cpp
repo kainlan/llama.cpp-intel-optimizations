@@ -7649,6 +7649,11 @@ void llama_context::opt_epoch_iter(
             ggml_opt_alloc(opt_ctx, train);
 
             res->set_inputs(&ubatch);
+            if (res->inputs_failed()) {
+                LLAMA_LOG_ERROR("%s: a graph input could not be set\n", __func__);
+                ggml_free(ctx_compute_opt);
+                break;
+            }
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);

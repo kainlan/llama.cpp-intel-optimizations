@@ -58,3 +58,22 @@ def test_process_ubatch_stops_on_a_failed_input():
     assert 0 <= i_set < i_fail < i_compute, (
         "a failed input must stop the ubatch between set_inputs and graph_compute"
     )
+    seg = body[i_fail:i_compute]
+    assert "GGML_STATUS_FAILED" in seg and "return nullptr" in seg, (
+        "the inputs_failed() check must stop the ubatch: return FAILED and no graph, not log and carry on"
+    )
+
+
+def test_opt_epoch_iter_stops_on_a_failed_input():
+    body = function_body(
+        read_code(CONTEXT_CPP),
+        r"void\s+llama_context::opt_epoch_iter\s*\((?:[^()]|\([^()]*\))*\)",
+    )
+    i_set = body.find("set_inputs(")
+    i_fail = body.find("inputs_failed()")
+    i_eval = body.find("ggml_opt_eval(")
+    assert 0 <= i_set < i_fail < i_eval, (
+        "the optimizer epoch must check for a failed input between set_inputs and ggml_opt_eval"
+    )
+    seg = body[i_fail:i_eval]
+    assert "break;" in seg, "the optimizer epoch must leave its loop when an input failed"
