@@ -8661,6 +8661,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         ggml-sycl-private-fixtures Threads::Threads)
     set_target_properties(test-sycl-lazy-plan-interface PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    # Arm (h) writes its table's file here: a STORAGE table reads through O_DIRECT, which tmpfs (/tmp) refuses.
+    target_compile_definitions(test-sycl-lazy-plan-interface PRIVATE
+        LAZY_STORAGE_FIXTURE_DIR="${CMAKE_BINARY_DIR}")
     add_test(NAME test-sycl-lazy-plan-interface-1dev COMMAND test-sycl-lazy-plan-interface --devices 1)
     set_tests_properties(test-sycl-lazy-plan-interface-1dev PROPERTIES
         LABELS "sycl;host;cache;mem-handle;gpu-serial"

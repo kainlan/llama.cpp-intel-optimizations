@@ -2294,6 +2294,65 @@ GGML_BACKEND_API bool ggml_sycl_lazy_block_ring_bytes_for_testing(uint64_t * out
 // Proc name: "ggml_sycl_lazy_ring_coverage_reads_for_testing".
 GGML_BACKEND_API bool ggml_sycl_lazy_ring_coverage_reads_for_testing(uint64_t * out);
 
+// A STORAGE lazy table opened for a published model (the storage tier's consumer side): the table's O_DIRECT
+// descriptor, its row cache and the gather's state. Opaque.
+struct ggml_sycl_lazy_storage;
+
+// Opens the table `info` names for `model`, whose published plan must carry it STORAGE with the same row size, table
+// bytes, file offset and type, reading `file_path`. NULL, after a WARN naming the table and the reason, when the
+// module refuses mutations, an argument is null or model.model_id is 0, no published plan exists, the plan has no such
+// table or holds it HOST, the geometry disagrees, the materialization refuses, or, for a later open of a live table,
+// the stat of `file_path` fails or names another file. The table is built from the plan's figures; `info` only has to
+// agree with them. The open is a mutation, made under the module mutation guard. It throws nothing in practice: a
+// failure is a NULL.
+// Opens of one model and table are counted and return the same handle: a later open makes no second table and charges
+// no host bytes, and it is refused, with a WARN naming the live table's file and `file_path`, when `file_path` is not
+// the live table's file. Each successful open needs exactly one close; the last close releases the table, and every
+// close must come before the model's unload. Gathers through any holder serialise, and the counters are the table's,
+// not the caller's.
+// Proc name: "ggml_backend_sycl_lazy_storage_open".
+GGML_BACKEND_API struct ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(
+    struct ggml_sycl_model_token             model,
+    const struct ggml_sycl_lazy_table_info * info,
+    const char *                             file_path);
+
+// Copies row rows[i] of the table to dst + i * row_size for i in [0, n), from the row cache on a hit and from the file
+// on a miss, and returns once every row it submitted has landed. Calls on one table are serialised. Returns:
+//   0          every row landed;
+//   EINVAL     a null storage, a null rows or dst with n > 0, a dst shorter than n rows, or a table whose row spans
+//              more than one IO chunk, all refused before anything is read; or a row outside the table, which stops the
+//              gather there, every row before it that was submitted still waited for;
+//   EIO        the IO engine refused a read (no live ring, or a span the ring cannot hold or the address space cannot
+//              reach), or a lookup, a submit or the serialising lock threw std::system_error;
+//   ENOMEM     a lookup or a submit threw std::bad_alloc;
+//   ECANCELED  the backend shut down and cancelled a queued read: not a disk error;
+//   other      the first failed read's errno.
+// A code that stopped the submitting (EINVAL, EIO, ENOMEM) wins over a read's errno. It never throws, and it blocks
+// with no timeout until the IO engine's workers have delivered, so it must not be called from one of them.
+// Proc name: "ggml_backend_sycl_lazy_storage_gather".
+GGML_BACKEND_API int ggml_backend_sycl_lazy_storage_gather(struct ggml_sycl_lazy_storage * storage,
+                                                           const int32_t *                 rows,
+                                                           size_t                          n,
+                                                           void *                          dst,
+                                                           size_t                          dst_bytes);
+
+// out[0] hits, out[1] misses, out[2] evictions (the row cache's own counters), out[3] waiters submitted for misses
+// (not disk reads: rows of one block, and joined reads, share one). All zero for a null storage. It may run while a
+// gather does; the four are then a relaxed snapshot each, not consistent with one another.
+// Proc name: "ggml_backend_sycl_lazy_storage_counters".
+GGML_BACKEND_API void ggml_backend_sycl_lazy_storage_counters(const struct ggml_sycl_lazy_storage * storage,
+                                                              uint64_t                              out[4]);
+
+// Drops one open of the table; a null storage is a no-op. The close that drops the last open releases the table: no
+// other call on the handle, the counters included, may overlap that close, and the handle is dead after it. Every
+// other holder's calls go on through the same handle. Never refused, with one exception that a std::mutex does not
+// raise in practice: if taking the registry lock throws, the open is kept, the table stays live, and a WARN says so.
+// The module mutation guard is taken only while the module admits mutations: an admitted close holds off the unload's
+// drain, and a close arriving after admission closed runs unguarded, which closing before the unload makes
+// unreachable.
+// Proc name: "ggml_backend_sycl_lazy_storage_close".
+GGML_BACKEND_API void ggml_backend_sycl_lazy_storage_close(struct ggml_sycl_lazy_storage * storage);
+
 // The load-time measure's plan override.  While installed, every plan accessor on the
 // calling thread answers from the plan named by `stage` for the load `load_txn`,
 // and nothing is published.  Written only by these two functions; llama reaches them

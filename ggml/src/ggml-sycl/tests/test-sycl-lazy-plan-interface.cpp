@@ -22,11 +22,18 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "host-plan-shaped-inventory.hpp"
+#include "lazy-io-test-util.hpp"
 #include "lazy-table-test-util.hpp"
 #include "sycl-test-skip.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -36,6 +43,7 @@ using namespace lazy_table_test;
 using ggml_sycl::host_cpu_mapped_size;
 using ggml_sycl::lazy_table_host_body_request_bytes;
 using host_plan_shaped_inventory::loader_inventory;
+using lazy_io_test::file_byte;
 
 namespace {
 
@@ -484,6 +492,343 @@ arm_result arm_g_storage_only_crosses_the_boundary() {
     return arr;
 }
 
+// Writes `bytes` bytes to `path`, byte i being file_byte(i), so a gathered row is checked by value against the file
+// offset it was read from.
+bool write_fixture_file(const std::string & path, uint64_t bytes) {
+    std::ofstream     out(path, std::ios::binary | std::ios::trunc);
+    std::vector<char> chunk(1 * MiB);
+    for (uint64_t base = 0; base < bytes && out; base += chunk.size()) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(chunk.size(), bytes - base));
+        for (size_t i = 0; i < n; ++i) {
+            chunk[i] = static_cast<char>(file_byte(base + i));
+        }
+        out.write(chunk.data(), static_cast<std::streamsize>(n));
+    }
+    out.close();
+    return !out.fail();
+}
+
+// Whether the file's filesystem takes O_DIRECT, which a STORAGE table reads through and tmpfs refuses.
+bool direct_open_works(const std::string & path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    ::close(fd);
+    return true;
+}
+
+// Whether the `n` rows of `rows` sit in `dst` as the file holds them, the table starting at `off`.
+bool rows_are_the_files(const std::vector<uint8_t> & dst, const int32_t * rows, size_t n, size_t row_size, size_t off) {
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < row_size; ++j) {
+            if (dst[i * row_size + j] != file_byte(off + static_cast<uint64_t>(rows[i]) * row_size + j)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Whether an open of `info` is refused with a WARN that contains `why`; a stray table is closed so it cannot outlive
+// the model.
+bool open_refused_with(ggml_sycl_model_token             model,
+                       const ggml_sycl_lazy_table_info * info,
+                       const char *                      path,
+                       const char *                      why) {
+    log_clear();
+    ggml_sycl_lazy_storage * stray = ggml_backend_sycl_lazy_storage_open(model, info, path);
+    ggml_backend_sycl_lazy_storage_close(stray);
+    return stray == nullptr && !log_lines_containing("[LAZY-STORAGE] ", why).empty();
+}
+
+// The live row-cache bytes over the devices this registration runs on, summed into *out; false when no device's cache
+// gave a reading. A STORAGE table's row cache is charged on its consumer device.
+bool row_cache_bytes(uint64_t * out) {
+    *out      = 0;
+    bool read = false;
+    for (int d = 0; d < g_devices; ++d) {
+        uint64_t bytes = 0;
+        if (ggml_backend_sycl_role_bytes_for_testing(d, static_cast<int>(ggml_sycl::alloc_role::LAZY_ROW_CACHE),
+                                                     &bytes)) {
+            *out += bytes;
+            read = true;
+        }
+    }
+    return read;
+}
+
+// Arm (h) on its fixture files, which exist; `other` is a second file, for an open naming the wrong one. The arm
+// removes both after this returns, on every path.
+void storage_api_on_file(arm_result &        arr,
+                         const std::string & path,
+                         const std::string & other,
+                         size_t              off,
+                         int64_t             rows) {
+    if (!direct_open_works(path)) {
+        void_arm(arr, "the fixture's filesystem refuses O_DIRECT: " + path);
+        return;
+    }
+    loader_inventory          inv;
+    ggml_sycl_lazy_table_info table = lazy_table("per_layer_token_embd.weight", rows);
+    table.file_offset               = off;
+    table.storage_only              = true;
+    inv.inv.lazy_tables             = &table;
+    inv.inv.lazy_table_count        = 1;
+
+    const size_t row  = table.row_size;
+    const size_t body = host_cpu_mapped_size(lazy_table_host_body_request_bytes(table.file_offset, table.size));
+
+    const ggml_sycl_placement_envelope envelope{ inv.inv.n_ctx, inv.inv.n_ubatch, 1, -1 };
+    ggml_sycl_load_txn                 txn{};
+    if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(arr, "the load transaction did not begin");
+        return;
+    }
+    log_clear();
+    const ggml_sycl_lifecycle_result early_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, true);
+    if (early_rc != GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        void_arm(arr, "the early stage returned " + num(early_rc));
+        return;
+    }
+    // The row cache holds at most the body, so a host that could hold the body could hold the cache.
+    if (reading_too_low(arr, body) || fit_room_too_low(arr, body)) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        return;
+    }
+    const ggml_sycl_lifecycle_result late_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, false);
+    if (late_rc != GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        void_arm(arr, "the late stage returned " + num(late_rc));
+        return;
+    }
+    ggml_sycl_model_token model{};
+    if (ggml_backend_sycl_model_load_end(txn, true, &model) != GGML_SYCL_LIFECYCLE_OK || model.model_id == 0) {
+        void_arm(arr, "the load did not end with a model token");
+        return;
+    }
+    expect(arr, !log_lines_containing("[PLACEMENT] lazy per_layer_token_embd.weight residency=STORAGE").empty(),
+           "this table's [PLACEMENT] lazy line does not say STORAGE");
+
+    // The arguments are refused before the plan is read, each with its own reason.
+    ggml_sycl_lazy_table_info no_name = table;
+    no_name.name                      = nullptr;
+    ggml_sycl_model_token no_model    = model;
+    no_model.model_id                 = 0;
+    expect(arr, open_refused_with(model, nullptr, path.c_str(), "info is null"), "a null info was not refused");
+    expect(arr, open_refused_with(model, &no_name, path.c_str(), "info->name is null"), "a null name was not refused");
+    expect(arr, open_refused_with(model, &table, nullptr, "file_path is null"), "a null path was not refused");
+    expect(arr, open_refused_with(no_model, &table, path.c_str(), "the model id is 0"), "model id 0 was not refused");
+    ggml_sycl_lazy_table_info unplanned = table;
+    unplanned.name                      = "per_layer_token_embd.unplanned";
+    expect(arr, open_refused_with(model, &unplanned, path.c_str(), "carries no such table"),
+           "a table the plan lacks was not refused");
+
+    // Each figure the cross-check compares is refused by the cross-check itself, its "(caller/plan)" WARN, and not by
+    // the materialization: the open builds the table from the plan's figures, never the caller's. F16 with 17
+    // elements keeps the row at 34 B, so only the type differs.
+    ggml_sycl_lazy_table_info wrong_row  = table;
+    wrong_row.row_size                   = row + 2;
+    ggml_sycl_lazy_table_info wrong_off  = table;
+    wrong_off.file_offset                = off + row;
+    ggml_sycl_lazy_table_info wrong_size = table;
+    wrong_size.ne[1]                     = rows - 1;
+    wrong_size.size                      = row * static_cast<size_t>(rows - 1);
+    ggml_sycl_lazy_table_info wrong_type = table;
+    wrong_type.type                      = GGML_TYPE_F16;
+    wrong_type.ne[0]                     = 17;
+    expect(arr, open_refused_with(model, &wrong_row, path.c_str(), "(caller/plan)"),
+           "an info whose row_size disagrees with the plan was not refused by the cross-check");
+    expect(arr, open_refused_with(model, &wrong_off, path.c_str(), "(caller/plan)"),
+           "an info whose file_offset disagrees with the plan was not refused by the cross-check");
+    expect(arr, open_refused_with(model, &wrong_size, path.c_str(), "(caller/plan)"),
+           "an info whose size disagrees with the plan was not refused by the cross-check");
+    expect(arr, open_refused_with(model, &wrong_type, path.c_str(), "(caller/plan)"),
+           "an info whose type disagrees with the plan was not refused by the cross-check");
+
+    // A null storage: the counters zero all four, and a gather is EINVAL.
+    uint64_t zeroed[4] = { 1, 2, 3, 4 };
+    ggml_backend_sycl_lazy_storage_counters(nullptr, zeroed);
+    expect(arr, zeroed[0] == 0 && zeroed[1] == 0 && zeroed[2] == 0 && zeroed[3] == 0,
+           "the counters of a null storage are not all zero");
+    {
+        const int32_t        first[1] = { 0 };
+        std::vector<uint8_t> one(row);
+        const int            null_rc = ggml_backend_sycl_lazy_storage_gather(nullptr, first, 1, one.data(), one.size());
+        expect(arr, null_rc == EINVAL, "a gather on a null storage returned " + num(null_rc));
+    }
+
+    uint64_t                 base_bytes = 0;
+    const bool               base_read  = row_cache_bytes(&base_bytes);
+    ggml_sycl_lazy_storage * s          = ggml_backend_sycl_lazy_storage_open(model, &table, path.c_str());
+    expect(arr, s != nullptr, "the open returned null");
+    if (s != nullptr) {
+        uint64_t opened_bytes = 0;
+        expect(arr, base_read && row_cache_bytes(&opened_bytes) && opened_bytes > base_bytes,
+               "the open charged no row-cache bytes: " + num(base_bytes) + " -> " + num(opened_bytes));
+        const int32_t        want[4] = { 0, 7, 7, static_cast<int32_t>(rows - 1) };
+        std::vector<uint8_t> dst(4 * row);
+        // A dst one byte short of four rows is refused before anything is read, so the cache stays cold.
+        const int short_rc = ggml_backend_sycl_lazy_storage_gather(s, want, 4, dst.data(), dst.size() - 1);
+        expect(arr, short_rc == EINVAL, "a dst one byte short returned " + num(short_rc));
+        const int rc = ggml_backend_sycl_lazy_storage_gather(s, want, 4, dst.data(), dst.size());
+        expect(arr, rc == 0 && rows_are_the_files(dst, want, 4, row, off),
+               "the first gather returned " + num(rc) + ", or a row is not the file's bytes");
+        uint64_t c[4] = {};  // hits, misses, evictions, submitted
+        ggml_backend_sycl_lazy_storage_counters(s, c);
+        expect(arr, c[0] + c[1] == 4 && c[1] >= 3 && c[3] >= 3 && c[3] <= c[1],
+               "first gather: hits " + num(c[0]) + " misses " + num(c[1]) + " submitted " + num(c[3]));
+
+        const int32_t again[1] = { 7 };
+        std::fill(dst.begin(), dst.end(), 0);
+        const int again_rc = ggml_backend_sycl_lazy_storage_gather(s, again, 1, dst.data(), row);
+        expect(arr, again_rc == 0 && rows_are_the_files(dst, again, 1, row, off),
+               "the repeated row's gather returned " + num(again_rc) + ", or its row is not the file's bytes");
+        uint64_t d[4] = {};
+        ggml_backend_sycl_lazy_storage_counters(s, d);
+        expect(arr, d[0] == c[0] + 1 && d[3] == c[3],
+               "the repeated row did not hit: hits " + num(c[0]) + " -> " + num(d[0]) + ", submitted " + num(c[3]) +
+                   " -> " + num(d[3]));
+
+        // The row past the table stops the gather before anything is copied or submitted.
+        const int32_t past[1] = { static_cast<int32_t>(rows) };
+        std::fill(dst.begin(), dst.end(), 0xA5);
+        const int past_rc   = ggml_backend_sycl_lazy_storage_gather(s, past, 1, dst.data(), row);
+        bool      untouched = true;
+        for (size_t j = 0; j < row; ++j) {
+            untouched = untouched && dst[j] == 0xA5;
+        }
+        expect(arr, past_rc == EINVAL && untouched,
+               "the row past the table returned " + num(past_rc) + " (want EINVAL " + num(EINVAL) + ")" +
+                   (untouched ? "" : " and wrote dst"));
+
+        // While the table is live, a later open is still cross-checked against the plan before it may share the table,
+        // and one whose stat of its path fails is refused.
+        expect(arr, open_refused_with(model, &wrong_off, path.c_str(), "(caller/plan)"),
+               "a later open whose file_offset disagrees with the plan was not refused by the cross-check");
+        const std::string absent = path + ".absent";
+        expect(arr, open_refused_with(model, &table, absent.c_str(), "stat of"),
+               "a later open whose path does not exist was not refused");
+
+        // A second open of the live table shares it: the same handle and no second row cache, so the rows the first
+        // holder gathered hit through the second with no read submitted.
+        ggml_sycl_lazy_storage * second = ggml_backend_sycl_lazy_storage_open(model, &table, path.c_str());
+        expect(arr, second != nullptr, "the second open of the live table returned null");
+        expect(arr, second == nullptr || second == s, "the second open returned another handle, not the first's");
+        if (second != nullptr && second != s) {
+            ggml_backend_sycl_lazy_storage_close(second);  // a second table must not outlive the model
+            second = nullptr;
+        }
+        if (second != nullptr) {
+            uint64_t shared_bytes = 0;
+            expect(arr, row_cache_bytes(&shared_bytes) && shared_bytes == opened_bytes,
+                   "the second open charged row-cache bytes: " + num(opened_bytes) + " -> " + num(shared_bytes));
+            uint64_t p[4] = {};
+            ggml_backend_sycl_lazy_storage_counters(s, p);
+            const int32_t held[3] = { 0, 7, static_cast<int32_t>(rows - 1) };
+            std::fill(dst.begin(), dst.end(), 0);
+            const int held_rc = ggml_backend_sycl_lazy_storage_gather(second, held, 3, dst.data(), 3 * row);
+            uint64_t  q[4]    = {};
+            ggml_backend_sycl_lazy_storage_counters(second, q);
+            expect(arr,
+                   held_rc == 0 && rows_are_the_files(dst, held, 3, row, off) && q[0] == p[0] + 3 && q[1] == p[1] &&
+                       q[3] == p[3],
+                   "the first holder's rows through the second returned " + num(held_rc) + ": hits " + num(p[0]) +
+                       " -> " + num(q[0]) + ", misses " + num(p[1]) + " -> " + num(q[1]) + ", submitted " + num(p[3]) +
+                       " -> " + num(q[3]) + ", or a row is not the file's bytes");
+
+            // One close leaves the table live for the other holder, which still reads a fresh row from the file. If the
+            // close released the table, the handle may be freed: the arm unloads the model and returns without touching
+            // it again.
+            ggml_backend_sycl_lazy_storage_close(s);
+            uint64_t kept_bytes = 0;
+            if (!row_cache_bytes(&kept_bytes) || kept_bytes != opened_bytes) {
+                fail(arr, "a close with another open outstanding released row-cache bytes: " + num(opened_bytes) +
+                              " -> " + num(kept_bytes));
+                (void) ggml_backend_sycl_model_unloaded_token(model);
+                return;
+            }
+            s                      = second;
+            const int32_t fresh[1] = { static_cast<int32_t>(rows / 2) };
+            std::fill(dst.begin(), dst.end(), 0);
+            const int fresh_rc = ggml_backend_sycl_lazy_storage_gather(s, fresh, 1, dst.data(), row);
+            expect(arr, fresh_rc == 0 && rows_are_the_files(dst, fresh, 1, row, off),
+                   "after one close the other holder's gather returned " + num(fresh_rc) +
+                       ", or its row is not the file's bytes");
+
+            // A later open naming another file is refused: the live table reads only its own.
+            const std::string mismatch = "already open on " + path + ", not " + other;
+            expect(arr, open_refused_with(model, &table, other.c_str(), mismatch.c_str()),
+                   "a second open naming another file was not refused with a WARN naming both files");
+        }
+        ggml_backend_sycl_lazy_storage_close(s);
+        uint64_t closed_bytes = 0;
+        expect(arr, row_cache_bytes(&closed_bytes) && closed_bytes == base_bytes,
+               "the last close left row-cache bytes live: " + num(base_bytes) + " before the open, " +
+                   num(closed_bytes) + " after the last close");
+
+        // With every open closed, an open materializes the table again while the model is loaded.
+        ggml_sycl_lazy_storage * reopened = ggml_backend_sycl_lazy_storage_open(model, &table, path.c_str());
+        expect(arr, reopened != nullptr, "an open after the last close was refused");
+        ggml_backend_sycl_lazy_storage_close(reopened);
+    }
+    // The close released the row cache: the unload finds no MODEL-lifetime record of this model still open.
+    log_clear();
+    const ggml_sycl_lifecycle_result unload_rc = ggml_backend_sycl_model_unloaded_token(model);
+    expect(arr, log_lines_containing("[HOST-ZONE] leaked MODEL record").empty(),
+           "the unload found a leaked MODEL record: the close did not release the table");
+    expect(arr, unload_rc == GGML_SYCL_LIFECYCLE_OK, "the unload returned " + num(unload_rc));
+    ggml_sycl_lazy_storage * late = ggml_backend_sycl_lazy_storage_open(model, &table, path.c_str());
+    expect(arr, late == nullptr, "an open after the unload found a plan");
+    ggml_backend_sycl_lazy_storage_close(late);
+}
+
+// (h) The storage API: a 4 MiB storage-only table written to a file in the build directory opens by the published
+// model token, gathers four rows byte-exact, hits on a repeated row, refuses a row past the table, and closes before
+// the unload, after which the unload finds no leaked MODEL record. While the table is live, a later open is still
+// refused by the cross-check, and one whose path does not exist is refused. A second open while the first is live
+// returns the same handle and charges no row-cache bytes, the rows the first holder gathered hit through it with no
+// read submitted, the first holder's close keeps the row-cache bytes and the second still reads, and an open naming
+// another file is refused with a WARN naming both; the last close returns the row-cache bytes, and an open after it
+// succeeds while the model is loaded. A null argument, model id 0, a table the plan lacks, and an info whose row_size,
+// file_offset, size or type disagrees with the plan are refused, each by its own WARN; a null storage's counters are
+// zero and its gather EINVAL, as is a dst short of the rows; an open after the unload finds no plan.
+// Engagement: the published plan's [PLACEMENT] line says STORAGE (arm (g) shows the same flag publishing it); the first
+// gather misses (the cache is cold), so rows come through O_DIRECT reads; the first open charges row-cache bytes. The
+// arm VOIDs when a fixture is not written, its filesystem refuses O_DIRECT, or the host could not have held the
+// table's body (arm (g)'s guards).
+// Mutants: the open reading the candidate instead of the published plan (no entry at model_id != 0: "the open
+// returned null"); file_offset ignored (every row off by 4032 B: "the first gather returned 0, or a row is not the
+// file's bytes"); the geometry cross-check missing (the offset-shifted info opens: "... file_offset disagrees ...");
+// a later open materializing a second table ("the second open returned another handle, not the first's"); the last
+// close not deleting the table ("the last close left row-cache bytes live"); the registry lookup moved ahead of the
+// cross-check ("a later open whose file_offset disagrees with the plan was not refused by the cross-check"); every
+// close deleting the table ("a close with another open outstanding released row-cache bytes", and the arm returns
+// there).
+arm_result arm_h_storage_api() {
+    arm_result        arr;
+    // The process id keeps the name apart between the -1dev and -2dev registrations, which share the build directory:
+    // run at once, one's remove would otherwise pull the file from under the other's reads.
+    const std::string path = std::string(LAZY_STORAGE_FIXTURE_DIR) + "/lazy-storage-fixture-" +
+                             std::to_string(static_cast<long long>(getpid())) + ".bin";
+    const std::string other = path + ".other";
+    const size_t      off   = 4032;
+    const int64_t     rows  = static_cast<int64_t>((4 * MiB) / 34);
+    // 4 KiB past the table's end, so the offset-shifted info's table still ends inside the file. The other file is
+    // only ever named, never read.
+    if (!write_fixture_file(path, off + static_cast<uint64_t>(rows) * 34 + 4096) || !write_fixture_file(other, 4096)) {
+        std::remove(path.c_str());
+        std::remove(other.c_str());
+        void_arm(arr, "the fixture files " + path + " and " + other + " were not written");
+        return arr;
+    }
+    storage_api_on_file(arr, path, other, off, rows);
+    std::remove(path.c_str());
+    std::remove(other.c_str());
+    return arr;
+}
+
 // (f) The dry run refuses the same inventory with NULL_OUTPUT. It runs last: with its check dropped the intake reads
 // the null array, so the binary faults after every other arm has printed its verdict.
 // Engagement: the same call with the array present returns OK, so the result header and the host's state let the dry
@@ -553,6 +898,7 @@ int main(int argc, char ** argv) {
         { "(d) the late pass refuses a plan the early pass held",      arm_d_the_late_pass_refuses                 },
         { "(e) the stage refuses a lazy count with no array",          arm_e_stage_refuses_a_count_with_no_array   },
         { "(g) storage_only crosses the boundary",                     arm_g_storage_only_crosses_the_boundary     },
+        { "(h) the storage API opens, gathers, counts and closes",     arm_h_storage_api                           },
         // Last: with its check dropped the dry run faults the binary.
         { "(f) the dry run refuses a lazy count with no array",        arm_f_dry_run_refuses_a_count_with_no_array },
     };
