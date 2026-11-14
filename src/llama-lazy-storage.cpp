@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <mutex>
 #include <utility>
 
 llama_lazy_storage::llama_lazy_storage(const llama_lazy_storage_table & table,
@@ -38,6 +39,9 @@ bool llama_lazy_storage::open(const llama_sycl_model_token & token) {
         return false;
     }
     if (handle_ != nullptr) {
+        // The backend counts opens and the destructor closes once, so a second open must not reach it.
+        LLAMA_LOG_WARN("%s: the storage table %s is already open, the second open is ignored\n", __func__,
+                       table_.name.c_str());
         return true;
     }
     handle_ = procs_.open(token, table_, file_path_.c_str());
@@ -73,17 +77,20 @@ ggml_sycl_lazy_table_info llama_lazy_storage_table_info(const llama_lazy_storage
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 namespace {
 
-// The backend's procs, resolved once by name from the SYCL registration; null members when it has none.
+// The backend's procs, typed from the real exports so that a signature change fails to compile.
 struct llama_lazy_storage_backend_procs {
-    ggml_sycl_lazy_storage * (*open)(ggml_sycl_model_token, const ggml_sycl_lazy_table_info *, const char *) = nullptr;
-    int (*gather)(ggml_sycl_lazy_storage *, const int32_t *, size_t, void *, size_t)                         = nullptr;
-    void (*counters)(const ggml_sycl_lazy_storage *, uint64_t[4])                                            = nullptr;
-    void (*close)(ggml_sycl_lazy_storage *)                                                                  = nullptr;
+    decltype(&ggml_backend_sycl_lazy_storage_open)     open     = nullptr;
+    decltype(&ggml_backend_sycl_lazy_storage_gather)   gather   = nullptr;
+    decltype(&ggml_backend_sycl_lazy_storage_counters) counters = nullptr;
+    decltype(&ggml_backend_sycl_lazy_storage_close)    close    = nullptr;
 };
 
+// Written once, by llama_lazy_storage_sycl_procs(), before any adapter can be handed out; adapters only read it.
+std::once_flag                   g_llama_lazy_storage_backend_once;
+llama_lazy_storage_backend_procs g_llama_lazy_storage_backend;
+
 llama_lazy_storage_backend_procs & llama_lazy_storage_backend() {
-    static llama_lazy_storage_backend_procs procs;
-    return procs;
+    return g_llama_lazy_storage_backend;
 }
 
 void * llama_lazy_storage_adapt_open(llama_sycl_model_token           token,
@@ -124,8 +131,8 @@ llama_lazy_storage_procs llama_lazy_storage_sycl_procs() {
         if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
             continue;
         }
-        llama_lazy_storage_backend_procs & b = llama_lazy_storage_backend();
-
+        // Resolved into locals, so that no other thread ever sees a half-written table.
+        llama_lazy_storage_backend_procs b;
         b.open = reinterpret_cast<decltype(b.open)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_lazy_storage_open"));
         b.gather = reinterpret_cast<decltype(b.gather)>(
@@ -135,6 +142,9 @@ llama_lazy_storage_procs llama_lazy_storage_sycl_procs() {
         b.close = reinterpret_cast<decltype(b.close)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_lazy_storage_close"));
         if (b.open && b.gather && b.counters && b.close) {
+            // One publication is enough: the registration's procs are fixed for the life of the process, so a
+            // later call would only write the same four pointers again.
+            std::call_once(g_llama_lazy_storage_backend_once, [&b]() { g_llama_lazy_storage_backend = b; });
             result.open     = llama_lazy_storage_adapt_open;
             result.gather   = llama_lazy_storage_adapt_gather;
             result.counters = llama_lazy_storage_adapt_counters;

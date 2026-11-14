@@ -32,7 +32,9 @@ class llama_lazy_storage {
     llama_lazy_storage(const llama_lazy_storage &)             = delete;
     llama_lazy_storage & operator=(const llama_lazy_storage &) = delete;
 
-    bool open(const llama_sycl_model_token & token);  // false, after a WARN, when the backend refuses
+    // False, after a WARN, when the backend refuses. A second open of an open handle is a no-op that WARNs and
+    // returns true: the backend counts opens, and the destructor closes exactly once.
+    bool open(const llama_sycl_model_token & token);
     int  gather(const int32_t * rows, size_t n, void * dst, size_t dst_bytes) const;  // 0, ENODEV unopened, or errno
 
     const std::string & name() const { return table_.name; }

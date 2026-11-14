@@ -44,10 +44,13 @@ static bool check_converter() {
 }
 
 static int         g_closed = 0;
+static int         g_opened = 0;
+static int         g_level  = -1;
 static int         g_handle = 0;
 static std::string g_log;
 
 static void * fake_open(llama_sycl_model_token, const llama_lazy_storage_table &, const char *) {
+    ++g_opened;
     return &g_handle;
 }
 
@@ -64,8 +67,8 @@ static int fake_gather(void *, const int32_t * rows, size_t n, void * dst, size_
 static void fake_counters(const void *, uint64_t out[4]) {
     out[0] = 1;
     out[1] = 2;
-    out[2] = 0;
-    out[3] = 2;
+    out[2] = 3;
+    out[3] = 4;
 }
 
 static void fake_close(void * h) {
@@ -75,7 +78,14 @@ static void fake_close(void * h) {
 // The handle on fake procs: it refuses a gather before the open, forwards after it, prints its counters once and
 // closes the backend handle exactly once.
 static void check_handle() {
-    llama_log_set([](ggml_log_level, const char * t, void *) { g_log += t; }, nullptr);
+    llama_log_set(
+        [](ggml_log_level level, const char * t, void *) {
+            if (std::strstr(t, "[LAZY-STORAGE]") != nullptr) {
+                g_level = level;
+            }
+            g_log += t;
+        },
+        nullptr);
     const llama_lazy_storage_procs procs = { fake_open, fake_gather, fake_counters, fake_close };
     llama_lazy_storage_table       table = {};
     table.name                           = "per_layer_token_embd.weight";
@@ -85,7 +95,7 @@ static void check_handle() {
     table.row_size                       = 4;
     {
         llama_lazy_storage s(table, "/models/x.gguf", procs);
-        uint8_t            dst[8];
+        uint8_t            dst[8]  = {};
         const int32_t      rows[2] = { 1, 2 };
         CHECK(s.gather(rows, 2, dst, sizeof(dst)) == ENODEV, "a gather before the open did not return ENODEV");
         llama_sycl_model_token token;
@@ -94,22 +104,33 @@ static void check_handle() {
         token.slot            = 0;
         token.slot_generation = 1;
         CHECK(s.open(token), "the open failed");
-        CHECK(s.gather(rows, 2, dst, sizeof(dst)) == 0 && dst[4] == 2, "the gather was not forwarded");
+        CHECK(s.gather(rows, 2, dst, sizeof(dst)) == 0 && dst[0] == 1 && dst[4] == 2, "the gather was not forwarded");
+        CHECK(s.open(token) && g_opened == 1, "a second open reached the backend: %d opens", g_opened);
+        CHECK(g_log.find("already open") != std::string::npos, "a second open did not WARN");
         const int32_t bad[1] = { 99 };
         CHECK(s.gather(bad, 1, dst, 4) == EIO, "a failed gather did not return its errno");
     }
     llama_log_set(nullptr, nullptr);
     CHECK(g_closed == 1, "closed %d times", g_closed);
-    CHECK(g_log.find("[LAZY-STORAGE] per_layer_token_embd.weight hits=1 misses=2 evictions=0 submitted=2") !=
-              std::string::npos,
-          "no counters line: %s", g_log.c_str());
+    const std::string line  = "[LAZY-STORAGE] per_layer_token_embd.weight hits=1 misses=2 evictions=3 submitted=4";
+    size_t            found = 0;
+    for (size_t at = g_log.find(line); at != std::string::npos; at = g_log.find(line, at + 1)) {
+        ++found;
+    }
+    CHECK(found == 1, "the counters line was printed %zu times: %s", found, g_log.c_str());
+    CHECK(g_level == GGML_LOG_LEVEL_WARN, "the counters line was logged at level %d, not WARN", g_level);
 }
 
 int main() {
-    if (!check_converter()) {
-        std::printf("SKIP: no SYCL in this build, so nothing was checked\n");
+    // The handle does not depend on the backend, so it is checked in every build.
+    check_handle();
+    const bool converter_ran = check_converter();
+    if (g_fails != 0) {
+        return 1;
+    }
+    if (!converter_ran) {
+        std::printf("SKIP: no SYCL in this build, so only the converter was skipped; the handle checks ran\n");
         return 77;
     }
-    check_handle();
-    return g_fails == 0 ? 0 : 1;
+    return 0;
 }
