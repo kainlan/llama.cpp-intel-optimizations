@@ -118,6 +118,11 @@ public:
         GGML_UNUSED(params);
         return false;
     }
+
+    // true when the last set_input() could not produce its data (a read that failed): the ubatch must not compute.
+    // set_input() never throws; it reports here instead.
+    virtual bool set_input_failed() const { return false; }
+
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -915,6 +920,10 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+
+    // true when any input reported, after set_inputs(), that it could not produce its data
+    bool inputs_failed() const;
+
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
