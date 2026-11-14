@@ -1820,8 +1820,8 @@ arm_result arm_gather_throw_waits() {
         }
         const bool shut_return = returned(std::chrono::milliseconds(0)) || returned(std::chrono::milliseconds(200));
         // The arm's own lease is the one lease that is not a read's once the gather's submits have returned. A submit
-        // still in progress holds a join lease and a spare until it returns, and a read delivered by an earlier attempt
-        // drops its lease just after its delivery, so the count is polled.
+        // still in progress holds a join lease and a spare until it returns, so the count is polled; the drain below
+        // clears an attempt's reads before the next attempt starts.
         size_t     queued      = 0;
         const bool picked      = wait_for([&] {
             const uint64_t leases = registry().live_leases;

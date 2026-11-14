@@ -112,8 +112,8 @@ int lazy_gather_rows(lazy_row_cache *           cache,
             w.bytes          = src.row_size;
             w.cache          = cache;
             w.row            = row;
-            // 0 is a refusal the engine did not count (no live ring, or a span the ring cannot hold); it has logged
-            // which. The rows after it are not submitted.
+            // 0 is a refusal the engine did not count: no live ring, or a span the ring cannot hold, each logged; or
+            // a span past the end of the address space, refused without a log. The rows after it are not submitted.
             if (lazy_io_submit(context, src.fd, lazy_io_span{ src.file_id, start, span_bytes }, key, w) == 0) {
                 stopped = EIO;
             } else {

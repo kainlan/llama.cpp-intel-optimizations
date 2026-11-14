@@ -491,10 +491,11 @@ lazy_ring_ensure_status block_ring_ensure(size_t   need,
 // Queues the read of `span` for `context` at `key` with `waiter` (§5.2.1, §5.3), on the live pool's engine, and wakes a
 // worker. The read takes a lease on the pool through lazy_io_pool_join, so the pool and its ring outlive it. Returns
 // the waiters added, as lazy_io_queue::submit counts them; 0, with a WARN, when no live pool has a ring or the span is
-// longer than one slot. May throw std::bad_alloc, or std::system_error from a lock; neither leaves a read queued
-// unwoken. A throw still wakes one worker per read it queued, so every read a throwing call left queued is picked with
-// no further submit, and a fresh read's waiter slot is reserved before the read is queued, so the waiter it was queued
-// for is never the step that throws.
+// longer than one slot, and 0 without a WARN when the span runs past the end of the address space. May throw
+// std::bad_alloc, or std::system_error from a lock; neither leaves a read queued unwoken. A throw still wakes one
+// worker per read it queued, so every read a throwing call left queued is picked with no further submit, and a fresh
+// read's waiter slot is reserved before the read is queued, so the waiter it was queued for is never the step that
+// throws.
 size_t lazy_io_submit(uint64_t               context,
                       int                    fd,
                       const lazy_io_span &   span,
