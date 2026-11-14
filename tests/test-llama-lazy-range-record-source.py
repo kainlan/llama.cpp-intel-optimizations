@@ -427,3 +427,7 @@ def test_the_saver_refuses_a_storage_table_before_it_touches_the_gguf_context():
             guards.append(m.start())
     assert guards, "add_tensor has no `if` on lazy_storage( whose own block aborts with a message naming the tensor"
     assert guards[0] < i_find, "the STORAGE refusal must come before gguf_find_tensor, which can return early"
+    null_check = re.search(r"\bif\s*\(\s*!\s*tensor\s*\)", body)
+    assert null_check, "add_tensor has no `if (!tensor)` early return"
+    assert null_check.start() < guards[0], (
+        "the STORAGE refusal must follow the null-tensor check, because the saver passes null tensors")
