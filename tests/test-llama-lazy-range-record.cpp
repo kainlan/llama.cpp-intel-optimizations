@@ -87,6 +87,40 @@ static llama_hparams qwen_hparams(uint32_t n_heads, uint32_t ple_layer) {
     return hp;
 }
 
+// The STORAGE rows of `record` come out of llama_lazy_range_storage_tables in record order, each carrying its row's
+// value and attributes and the type and shape of the weight `w`.
+static void check_storage_tables(const llama_lazy_range_record & record, const ggml_tensor * w, const char * what) {
+    const auto find = [&](const std::string &) -> const ggml_tensor * {
+        return w;
+    };
+    const std::vector<llama_lazy_storage_table> tables = llama_lazy_range_storage_tables(record, find);
+    size_t                                      k      = 0;
+    for (const llama_lazy_range_row & row : record.rows()) {
+        if (row.deferral != LLAMA_LAZY_DEFERRAL_STORAGE) {
+            continue;
+        }
+        if (k >= tables.size()) {
+            ++k;
+            continue;
+        }
+        const llama_lazy_storage_table & t = tables[k++];
+        CHECK(t.name == row.name, "%s: table %zu is %s, expected the row %s", what, k - 1, t.name.c_str(),
+              row.name.c_str());
+        CHECK(t.type == w->type && t.ne[0] == w->ne[0] && t.ne[1] == w->ne[1] && t.ne[2] == 1 && t.ne[3] == 1 &&
+                  t.row_size == ggml_row_size(w->type, w->ne[0]),
+              "%s: %s: type, shape or row size differs from the tensor", what, t.name.c_str());
+        CHECK(
+            t.value.file_idx == row.value.file_idx && t.value.offs == row.value.offs && t.value.size == row.value.size,
+            "%s: %s: value differs from its row", what, t.name.c_str());
+        CHECK(t.attrs.rows_per_token == row.attrs.rows_per_token &&
+                  t.attrs.consumer_layer == row.attrs.consumer_layer && t.attrs.storage_only == row.attrs.storage_only,
+              "%s: %s: attrs (%u, %d, %d) differ from its row (%u, %d, %d)", what, t.name.c_str(),
+              t.attrs.rows_per_token, t.attrs.consumer_layer, (int) t.attrs.storage_only, row.attrs.rows_per_token,
+              row.attrs.consumer_layer, (int) row.attrs.storage_only);
+    }
+    CHECK(k > 0 && k == tables.size(), "%s: %zu tables for %zu STORAGE rows", what, tables.size(), k);
+}
+
 // runs `fn` in a child and reports whether it died of SIGABRT
 static bool aborts(void (*fn)(void *), void * arg) {
     fflush(nullptr);
@@ -247,6 +281,12 @@ int main() {
               "record b read (%u, %d), expected (8, 5)", b.attrs(t).rows_per_token, b.attrs(t).consumer_layer);
         CHECK(a.attrs(t).storage_only && b.attrs(t).storage_only, "the record dropped storage_only");
 
+        // the record's attributes (16, 1, storage_only) reach the table the inventory is built from
+        ggml_init_params ip   = { 4 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context *   gctx = ggml_init(ip);
+        check_storage_tables(a, ggml_new_tensor_2d(gctx, GGML_TYPE_Q8_0, 160, 1000), "qwen4exp storage record");
+        ggml_free(gctx);
+
         // not a literal 1; more than one PLE layer is "not known"
         llama_hparams two = qwen_hparams(16, 1);
         two.is_ple_impl.set(5);
@@ -296,6 +336,17 @@ int main() {
               "storage_for_file is not the STORAGE ranges");
         CHECK(storage.excluded_for_file(0) == file0 && storage.excluded_for_file(1) == file1,
               "excluded_for_file is not the union");
+
+        // the backend's inventory takes each STORAGE row with its weight's type, shape and row size
+        ggml_init_params ip   = { 4 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context *   gctx = ggml_init(ip);
+        ggml_tensor *    w    = ggml_new_tensor_2d(gctx, GGML_TYPE_Q8_0, 160, 1000);
+        check_storage_tables(storage, w, "llama storage record");
+        const auto find = [&](const std::string &) -> const ggml_tensor * {
+            return w;
+        };
+        CHECK(llama_lazy_range_storage_tables(lazy, find).empty(), "a LAZY_READ record yields a storage table");
+        ggml_free(gctx);
     }
 
     // ---- lazy_read reads the record: add() accepts exactly the LAZY_READ rows, under every mode it holds ----

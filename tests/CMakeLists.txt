@@ -4180,10 +4180,9 @@ if (GGML_SYCL)
     set_tests_properties(test-sycl-plan-dry-run-args PROPERTIES LABELS "sycl;host")
 endif()
 
-# llama.cpp-5efe C1: the per-model lazy-range record and its pre-fill, driven over
-# a two-file GGUF fixture whose tables are sparse holes. Host-only: no backend,
-# device or model.
-foreach (lazy_range_test test-llama-lazy-range-record test-llama-lazy-range-prefill)
+# The per-model lazy-range record, its pre-fill over a two-file GGUF fixture whose tables are sparse holes, and the
+# converter that hands a STORAGE row to the SYCL backend as a lazy table. Host-only: no backend, device or model.
+foreach (lazy_range_test test-llama-lazy-range-record test-llama-lazy-range-prefill test-llama-lazy-storage)
     llama_build_and_test(${lazy_range_test}.cpp)
     target_include_directories(${lazy_range_test} PRIVATE ${PROJECT_SOURCE_DIR}/src)
     set_tests_properties(${lazy_range_test} PROPERTIES LABELS "sycl;host;lazy")

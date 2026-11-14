@@ -5,6 +5,7 @@
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-lazy-mode.h"
+#include "llama-lazy-storage.h"
 #include "llama-mmap.h"
 #include "llama-n-ctx-hint.h"
 #include "llama-cparams.h"
@@ -746,6 +747,38 @@ static void llama_model_sycl_set_inventory_host_backing(ggml_sycl_tensor_invento
     inventory.host_weight_layout_cpu = llama_model_loader::host_weight_layout_cpu();
 }
 
+// The STORAGE rows an inventory's lazy tables describe, and the infos that point at them. Each info's name points into
+// tables[i].name, so the owner is never copied (a copy's infos would point into the source), and `tables` is not
+// touched once the infos are filled. It must live as long as the inventory that carries the infos. Moving it is safe: a
+// vector move keeps its elements where they are.
+struct llama_model_sycl_lazy_tables {
+    std::vector<llama_lazy_storage_table>  tables;
+    std::vector<ggml_sycl_lazy_table_info> infos;
+
+    llama_model_sycl_lazy_tables()                                                 = default;
+    llama_model_sycl_lazy_tables(const llama_model_sycl_lazy_tables &)             = delete;
+    llama_model_sycl_lazy_tables & operator=(const llama_model_sycl_lazy_tables &) = delete;
+    llama_model_sycl_lazy_tables(llama_model_sycl_lazy_tables &&)                  = default;
+    llama_model_sycl_lazy_tables & operator=(llama_model_sycl_lazy_tables &&)      = default;
+};
+
+// Hands the planner the record's STORAGE rows as the inventory's lazy tables, owned by `owner`.
+static void llama_model_sycl_set_inventory_lazy_tables(ggml_sycl_tensor_inventory &   inventory,
+                                                       const llama_model_loader &     ml,
+                                                       llama_model_sycl_lazy_tables & owner) {
+    owner.tables =
+        llama_lazy_range_storage_tables(ml.lazy_record, [&](const std::string & name) -> const ggml_tensor * {
+            const auto it = ml.weights_map.find(name);
+            return it != ml.weights_map.end() ? it->second.tensor : nullptr;
+        });
+    owner.infos.clear();
+    for (const llama_lazy_storage_table & t : owner.tables) {
+        owner.infos.push_back(llama_lazy_storage_table_info(t));
+    }
+    inventory.lazy_tables      = owner.infos.empty() ? nullptr : owner.infos.data();
+    inventory.lazy_table_count = static_cast<uint32_t>(owner.infos.size());
+}
+
 // The early plan's inventory, built from weights_map before create_tensor() runs, with the storage its raw pointers
 // point into. The tensor names point into the loader's metadata, so the loader must outlive it. The load's early plan
 // and the plan dry run's header read build it here, so the dry run plans what the load plans.
@@ -755,6 +788,7 @@ struct llama_model_sycl_early_inventory {
     llama_model_sycl_kv_layer_arrays   kv_layer_arrays;
     ggml_sycl_tensor_inventory         inventory  = {};
     size_t                             total_size = 0;
+    llama_model_sycl_lazy_tables       lazy;
 };
 
 // False when no weight remains for the plan.
@@ -795,6 +829,7 @@ static bool llama_model_sycl_build_early_inventory(llama_model_loader &         
         out.kv_layer_arrays.v_width.get(), out.kv_layer_arrays.kind.get(), out.kv_layer_arrays.idx_k_width.get(),
         out.total_size, max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock);
+    llama_model_sycl_set_inventory_lazy_tables(inventory, ml, out.lazy);
     return true;
 }
 
@@ -873,6 +908,9 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader & ml,
                                         kv_layer_arrays.idx_k_width.get(), total_size, max_pp_pipeline_weight_bytes,
                                         hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock);
+    llama_model_sycl_lazy_tables lazy;
+    llama_model_sycl_set_inventory_lazy_tables(inventory, ml, lazy);
+
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, false);
 
