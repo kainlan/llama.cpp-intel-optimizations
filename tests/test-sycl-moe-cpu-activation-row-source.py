@@ -83,11 +83,13 @@ scatter events and was rejected for that reason).  It is DISJOINT REGIONS:
      close the ways a pinned statement can be present and still not run: W3 (the memset's guard is
      defined exactly once as `from_pool || !out_owner.valid()`, so `= false` cannot drop the zeroing,
      and the zeroing request it guards covers all n_cpu * N floats),
-     and, for W2, W3, O1, F1 and F3, a structural test of each pinned statement -- it follows a statement or
+     and, for W2, W3, W4, O1, F1 and F3, a structural test of each pinned statement -- it follows a statement or
      block boundary (`;`, `{`, `}`), so it is not the body of an `if (...)`/`else`/loop header, and
      the innermost block that holds it is the expected one (the lambda body for the prologue, the
-     zeroing request and the order decision, `if (moe_hybrid_with_plan)` for the three flushes), so
-     it is not wrapped in a block of its own.
+     zeroing request, the lease producer-event loop and the order decision, `if (moe_hybrid_with_plan)`
+     for the three flushes), so it is not wrapped in a block of its own.  W4's lease loop skips an event
+     equal to the one pushed last (a run of one lent expert's rows shares a copy event); the loop is
+     pinned whole, so the skip cannot widen to drop a distinct event.
      These are TEXTUAL and STRUCTURAL pins (brace and statement adjacency), not control-flow analysis:
      a conditional hidden behind a macro or a helper function, or an early `return` above the
      statement, is outside what they can see.
@@ -671,7 +673,14 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
               "src1_storage.view_offset, static_cast<size_t>(K) * sizeof(float), *stream)); }")
     pregathered = ("} else { job_inputs.events = pregather_events; copy_serial = pregather_serial; "
                    "has_activation_copy = !pregather_events.empty(); }")
-    lease = "if (entry.has_ready_event) { job_inputs.events.push_back(entry.ready_event); }"
+    # Every entry's lease producer event is pushed, except one equal to the event pushed last: a run of one
+    # lent expert's rows carries the same copy event, and that event is already in the job's inputs.  The
+    # skip compares against the LAST element only, so it can drop a duplicate and never a distinct event;
+    # the loop is pinned whole, and as an unconditional statement of the lambda, so a weakened skip, a
+    # narrowed loop or a guard around it all fail.
+    lease = ("for (const expert_dispatch_entry & entry : entries) { if (entry.has_ready_event && "
+             "(job_inputs.events.empty() || job_inputs.events.back() != entry.ready_event)) { "
+             "job_inputs.events.push_back(entry.ready_event); } }")
     if (lam.count("moe_cpu_job_inputs job_inputs;") != 1 or any(lam.count(n) != 1 for n in (shared, single, pregathered, lease))
             or lam.count("job_inputs.events = ") != 2):
         raise ContractError(
@@ -680,6 +689,7 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
             "lease producer event; or a later assignment overwrites them.  A job that does not wait its copy reads "
             "and zeroes before the D2H lands (llama.cpp-4hg7, llama.cpp-z4kd)"
         )
+    require_unconditional(lam, lam.find(lease), header=None, pin="W4", what="the lease producer-event loop")
 
     # O1 (llama.cpp-z4kd): a scatter flushed AFTER this job's activation copy is not ordered by that copy.
     # The job asks moe_cpu_job_order_decide (moe-decode-hostpath.hpp, behaviour pinned by
@@ -1032,9 +1042,21 @@ def self_test(backend_src: str) -> int:
     expect_fail("shared-act-event-needs-n-cpu-gt-1", sub(
         "job_inputs.events.push_back(act_d2h_event);", "if (n_cpu > 1) { job_inputs.events.push_back(act_d2h_event); }"),
         None, "W4")
+    expect_fail("single-d2h-event-dropped", sub("job_inputs.events.push_back(ggml_sycl::mem_copy_async(\n",
+                                                "(void) (ggml_sycl::mem_copy_async(\n"), None, "W4")
+    # The per-row branch's hand-off is matched exactly by pin 5 (its regex carries `job_inputs.events =`),
+    # which runs before W4, so the mutant is expected to fail there.
+    expect_fail("per-row-gather-events-dropped", sub("job_inputs.events =\n                        gather_activation_rows(rows, act_handle,",
+                                                     "(void)\n                        gather_activation_rows(rows, act_handle,"))
     expect_fail("pregather-events-dropped", sub("job_inputs.events   = pregather_events;", "job_inputs.events.clear();"),
                 None, "W4")
     expect_fail("lease-events-dropped", sub("job_inputs.events.push_back(entry.ready_event);", "(void) entry;"), None, "W4")
+    # The duplicate skip may drop only an event equal to the last one pushed.
+    lease_skip = "(job_inputs.events.empty() || job_inputs.events.back() != entry.ready_event)"
+    expect_fail("lease-skip-drops-distinct-events", sub(lease_skip, "job_inputs.events.empty()"), None, "W4")
+    expect_fail("lease-skip-inverted", sub(lease_skip, lease_skip.replace("!=", "==")), None, "W4")
+    lease_loop = "for (const expert_dispatch_entry & entry : entries) {\n                    if (entry.has_ready_event &&"
+    expect_fail("lease-loop-guarded", sub(lease_loop, "if (n_cpu > 1) " + lease_loop), None, "W4")
     expect_fail("copy-events-overwritten", sub("                // Order this job's pool writes",
                                                "                job_inputs.events = {};\n                // Order this job's pool writes"),
                 None, "W4")
