@@ -256,7 +256,7 @@ def test_create_tensor_checks_the_record_and_refuses_storage_before_buft_for_ten
     # site is pinned: the first statement of the TENSOR_READ_LAZY branch, with no extra conjunct
     # (`!no_alloc && ...` would let the fit pass plan the 51 GB table as an ordinary weight)
     assert re.search(
-        r"if\s*\(\s*flags\s*&\s*TENSOR_READ_LAZY\s*\)\s*\{\s*llama_lazy_range_check_storage\s*\(\s*lazy_record\s*,\s*tn\.str\(\)\s*\)\s*;",
+        r"if\s*\(\s*flags\s*&\s*TENSOR_READ_LAZY\s*\)\s*\{\s*llama_lazy_range_check_storage\s*\(\s*lazy_record\s*,\s*get_arch\(\)\s*,\s*tn\.str\(\)\s*\)\s*;",
         body,
     ), "create_tensor() does not refuse a STORAGE row as the first statement of its TENSOR_READ_LAZY branch"
     call = re.search(r"llama_lazy_range_check_storage\s*\(", body)
@@ -269,8 +269,8 @@ def test_the_storage_refusal_function_throws_on_exactly_a_storage_row():
     body = function_body(
         read_code(RECORD_CPP), r"void\s+llama_lazy_range_check_storage\s*\((?:[^()]|\([^()]*\))*\)"
     )
-    assert re.search(r"if\s*\(\s*record\s*\.\s*deferral\s*\(\s*name\s*\)\s*==\s*LLAMA_LAZY_DEFERRAL_STORAGE\s*\)", body), (
-        "the refusal is not conditioned on exactly `record.deferral(name) == LLAMA_LAZY_DEFERRAL_STORAGE`"
+    assert re.search(r"if\s*\(\s*record\s*\.\s*deferral\s*\(\s*name\s*\)\s*==\s*LLAMA_LAZY_DEFERRAL_STORAGE\s*&&\s*!\s*llama_lazy_storage_consumer_present\s*\(\s*arch\s*\)\s*\)", body), (
+        "the refusal is not conditioned on exactly `record.deferral(name) == LLAMA_LAZY_DEFERRAL_STORAGE` and the arch having no consumer"
     )
     assert "throw" in body, "the refusal does not throw"
 
@@ -281,9 +281,9 @@ def test_the_auto_bridge_lives_exactly_as_long_as_the_refusal():
     # the refusal is llama_lazy_range_check_storage() throwing, whatever its message says
     sig = re.search(r"void\s+llama_lazy_range_check_storage\s*\((?:[^()]|\([^()]*\))*\)\s*\{", cpp)
     refusal = bool(sig) and "throw" in balanced(cpp, sig.end() - 1)
-    bridge_fn = bool(re.search(r"static\s+bool\s+llama_lazy_storage_consumer_present\s*\(\s*\)\s*\{", cpp))
+    bridge_fn = bool(re.search(r"static\s+bool\s+llama_lazy_storage_consumer_present\s*\(\s*enum\s+llm_arch\s+arch\s*\)\s*\{", cpp))
     prefill = function_body(cpp, r"void\s+llama_lazy_range_record_prefill\s*\((?:[^()]|\([^()]*\))*\)")
-    n_use = len(re.findall(r"!\s*llama_lazy_storage_consumer_present\s*\(\s*\)", prefill))
+    n_use = len(re.findall(r"!\s*llama_lazy_storage_consumer_present\s*\(\s*arch\s*\)", prefill))
     assert bridge_fn == refusal and (n_use == 1) == refusal and n_use <= 1, (
         f"the AUTO bridge and the STORAGE refusal must be added and deleted together (refusal={refusal} "
         f"bridge_fn={bridge_fn} bridge uses in the pre-fill={n_use}): delete or restore both, see the comment at "
@@ -294,7 +294,7 @@ def test_the_auto_bridge_lives_exactly_as_long_as_the_refusal():
     )
     if n_use:
         assert re.search(
-            r"taker\s*&&\s*eligible\s*&&\s*mode\s*==\s*LLAMA_LAZY_MODE_AUTO\s*&&\s*!llama_lazy_storage_consumer_present\(\)",
+            r"taker\s*&&\s*eligible\s*&&\s*mode\s*==\s*LLAMA_LAZY_MODE_AUTO\s*&&\s*!llama_lazy_storage_consumer_present\(arch\)",
             prefill,
         ), "the bridge is not conditioned on exactly taker, eligible, AUTO and the absent consumer"
 

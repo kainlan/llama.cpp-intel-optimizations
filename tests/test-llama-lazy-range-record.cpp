@@ -256,6 +256,9 @@ int main() {
         const llama_lazy_tensor_attrs none = llama_model_lazy_tensor_attrs(LLM_ARCH_LLAMA, hp, t);
         CHECK(none.rows_per_token == 0 && none.consumer_layer == -1, "an undeclared arch reads (%u, %d)",
               none.rows_per_token, none.consumer_layer);
+        CHECK(llama_model_lazy_tensor_attrs(LLM_ARCH_QWEN4EXP, hp, t).storage_only,
+              "the qwen4exp PLE table is not storage-only");
+        CHECK(!g4.storage_only && !none.storage_only, "a table other than qwen4exp's PLE is storage-only");
     }
 
     // ---- deferred / storage / excluded ----

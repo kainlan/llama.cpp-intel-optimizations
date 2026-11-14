@@ -177,74 +177,85 @@ int main() {
               "AUTO at 4 GiB: the EAGER row's drift went unnoticed");
     }
 
-    // the early plan, with the taker: no row is excluded under OFF or AUTO. Under AUTO the 5 GiB table would be
-    // STORAGE, and with no STORAGE consumer in the tree it is the ordinary weight OFF makes it. ON asks for the
-    // storage tier by name: the table stays STORAGE and out of the plan, and the bridge stays silent.
-    for (llama_lazy_mode mode : { LLAMA_LAZY_MODE_OFF, LLAMA_LAZY_MODE_AUTO, LLAMA_LAZY_MODE_ON }) {
-        const bool              on = mode == LLAMA_LAZY_MODE_ON;
-        llama_lazy_range_record rec;
-        g_warns.clear();
-        llama_log_set(capture_log, nullptr);
-        llama_lazy_range_record_prefill(rec, arch, hp, declared, fx.finder(), mode, mode, true, true);
-        llama_log_set(nullptr, nullptr);
-        // the 4 GiB row is ineligible under OFF and AUTO (at the floor); ON has no floor and makes it STORAGE
-        CHECK(llama_lazy_early_plan_excludes(rec, unflagged) == on, "taker, mode %d: the filter %s the 4 GiB row",
-              (int) mode, on ? "did not exclude" : "excluded");
-        const bool excluded = llama_lazy_early_plan_excludes(rec, lazy);
-        CHECK(excluded == on, "taker, mode %d: the filter %s the 5 GiB table", (int) mode,
-              excluded ? "excluded" : "did not exclude");
-        CHECK(rec.deferral(lazy) == (on ? LLAMA_LAZY_DEFERRAL_STORAGE : LLAMA_LAZY_DEFERRAL_EAGER) &&
-                  rec.eligible(lazy) == on,
-              "taker, mode %d: the 5 GiB table is %s, eligible=%d", (int) mode,
-              llama_lazy_deferral_name(rec.deferral(lazy)), rec.eligible(lazy) ? 1 : 0);
-        const size_t n_warned = count_warns(lazy, "-lzm on");
-        CHECK(n_warned == (mode == LLAMA_LAZY_MODE_AUTO ? 1u : 0u),
-              "taker, mode %d: the bridge WARN for the 5 GiB table printed %zu time(s)", (int) mode, n_warned);
-    }
+    // Both arches that declare the PLE table go through the taker and refusal blocks. `consumer` is whether the arch's
+    // graph consumes a STORAGE row.
+    for (const llm_arch a : { LLM_ARCH_QWEN4EXP, LLM_ARCH_GEMMA4 }) {
+        const bool consumer = false;  // T13 makes it a == LLM_ARCH_QWEN4EXP
 
-    // the STORAGE refusal: a STORAGE row throws naming the tensor; LAZY_READ and EAGER rows pass
-    {
-        struct cell {
-            const char *    label;
-            llama_lazy_mode mode;
-            bool            taker;
-            bool            refused;  // of the 5 GiB table
-        };
-
-        const cell cells[] = {
-            { "ON, the taker (STORAGE)",                                  LLAMA_LAZY_MODE_ON,   true,  true  },
-            { "AUTO, the taker (EAGER: no STORAGE consumer in the tree)", LLAMA_LAZY_MODE_AUTO, true,  false },
-            { "OFF, the taker (EAGER)",                                   LLAMA_LAZY_MODE_OFF,  true,  false },
-            { "ON, off the taker (LAZY_READ)",                            LLAMA_LAZY_MODE_ON,   false, false },
-            { "OFF, off the taker (EAGER)",                               LLAMA_LAZY_MODE_OFF,  false, false },
-        };
-        for (const cell & c : cells) {
+        // the early plan, with the taker: no row is excluded under OFF. Under AUTO the 5 GiB table would be STORAGE,
+        // and an arch with no STORAGE consumer records it as the ordinary weight OFF makes it, with one WARN. ON asks
+        // for the storage tier by name: the table stays STORAGE and out of the plan, and the bridge stays silent.
+        for (llama_lazy_mode mode : { LLAMA_LAZY_MODE_OFF, LLAMA_LAZY_MODE_AUTO, LLAMA_LAZY_MODE_ON }) {
+            const bool              on      = mode == LLAMA_LAZY_MODE_ON;
+            const bool              storage = on || (mode == LLAMA_LAZY_MODE_AUTO && consumer);
             llama_lazy_range_record rec;
-            llama_lazy_range_record_prefill(rec, arch, hp, declared, fx.finder(), c.mode, c.mode, c.taker, true);
+            g_warns.clear();
+            llama_log_set(capture_log, nullptr);
+            llama_lazy_range_record_prefill(rec, a, hp, declared, fx.finder(), mode, mode, true, true);
+            llama_log_set(nullptr, nullptr);
+            // the 4 GiB row is ineligible under OFF and AUTO (at the floor); ON has no floor and makes it STORAGE
+            CHECK(llama_lazy_early_plan_excludes(rec, unflagged) == on,
+                  "%s, taker, mode %d: the filter %s the 4 GiB row", llm_arch_name(a), (int) mode,
+                  on ? "did not exclude" : "excluded");
+            const bool excluded = llama_lazy_early_plan_excludes(rec, lazy);
+            CHECK(excluded == storage, "%s, taker, mode %d: the filter %s the 5 GiB table", llm_arch_name(a),
+                  (int) mode, excluded ? "excluded" : "did not exclude");
+            CHECK(rec.deferral(lazy) == (storage ? LLAMA_LAZY_DEFERRAL_STORAGE : LLAMA_LAZY_DEFERRAL_EAGER) &&
+                      rec.eligible(lazy) == storage,
+                  "%s, taker, mode %d: the 5 GiB table is %s, eligible=%d", llm_arch_name(a), (int) mode,
+                  llama_lazy_deferral_name(rec.deferral(lazy)), rec.eligible(lazy) ? 1 : 0);
+            const size_t n_warned = count_warns(lazy, "-lzm on");
+            CHECK(n_warned == (mode == LLAMA_LAZY_MODE_AUTO && !consumer ? 1u : 0u),
+                  "%s, taker, mode %d: the bridge WARN for the 5 GiB table printed %zu time(s)", llm_arch_name(a),
+                  (int) mode, n_warned);
+        }
 
-            bool        threw = false;
-            std::string what;
-            try {
-                llama_lazy_range_check_storage(rec, lazy);
-            } catch (const std::runtime_error & e) {
-                threw = true;
-                what  = e.what();
-            }
-            CHECK(threw == c.refused, "%s: the STORAGE refusal %s", c.label, threw ? "fired" : "did not fire");
-            CHECK(!threw || what.find(lazy) != std::string::npos, "%s: the refusal does not name the tensor: %s",
-                  c.label, what.c_str());
+        // the STORAGE refusal: a STORAGE row of an arch with no consumer throws naming the tensor; LAZY_READ and EAGER
+        // rows pass, and so does a STORAGE row of an arch with one
+        {
+            struct cell {
+                const char *    label;
+                llama_lazy_mode mode;
+                bool            taker;
+            };
 
-            // an EAGER row (the 4 GiB table is ineligible under AUTO and OFF) never refuses
-            bool threw_eager = false;
-            try {
-                llama_lazy_range_check_storage(rec, unflagged);
-            } catch (const std::runtime_error &) {
-                threw_eager = true;
+            const cell cells[] = {
+                { "ON, the taker (STORAGE)",       LLAMA_LAZY_MODE_ON,   true  },
+                { "AUTO, the taker",               LLAMA_LAZY_MODE_AUTO, true  },
+                { "OFF, the taker (EAGER)",        LLAMA_LAZY_MODE_OFF,  true  },
+                { "ON, off the taker (LAZY_READ)", LLAMA_LAZY_MODE_ON,   false },
+                { "OFF, off the taker (EAGER)",    LLAMA_LAZY_MODE_OFF,  false },
+            };
+            for (const cell & c : cells) {
+                llama_lazy_range_record rec;
+                llama_lazy_range_record_prefill(rec, a, hp, declared, fx.finder(), c.mode, c.mode, c.taker, true);
+
+                bool        threw = false;
+                std::string what;
+                try {
+                    llama_lazy_range_check_storage(rec, a, lazy);
+                } catch (const std::runtime_error & e) {
+                    threw = true;
+                    what  = e.what();
+                }
+                const bool refused = c.taker && c.mode == LLAMA_LAZY_MODE_ON && !consumer;
+                CHECK(threw == refused, "%s, %s: the STORAGE refusal %s", llm_arch_name(a), c.label,
+                      threw ? "fired" : "did not fire");
+                CHECK(!threw || what.find(lazy) != std::string::npos,
+                      "%s, %s: the refusal does not name the tensor: %s", llm_arch_name(a), c.label, what.c_str());
+
+                // an EAGER row (the 4 GiB table is ineligible under AUTO and OFF) never refuses
+                bool threw_eager = false;
+                try {
+                    llama_lazy_range_check_storage(rec, a, unflagged);
+                } catch (const std::runtime_error &) {
+                    threw_eager = true;
+                }
+                const bool unflagged_is_storage = rec.deferral(unflagged) == LLAMA_LAZY_DEFERRAL_STORAGE;
+                CHECK(threw_eager == (unflagged_is_storage && !consumer),
+                      "%s, %s: the refusal on the 4 GiB row (%s) disagrees with its deferral", llm_arch_name(a),
+                      c.label, llama_lazy_deferral_name(rec.deferral(unflagged)));
             }
-            const bool unflagged_is_storage = rec.deferral(unflagged) == LLAMA_LAZY_DEFERRAL_STORAGE;
-            CHECK(threw_eager == unflagged_is_storage,
-                  "%s: the refusal on the 4 GiB row (%s) disagrees with its deferral", c.label,
-                  llama_lazy_deferral_name(rec.deferral(unflagged)));
         }
     }
 
