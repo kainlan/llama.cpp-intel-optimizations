@@ -35077,6 +35077,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     for (const auto & item : tensor_inventory) {
         plan.max_tensor_bytes = std::max(plan.max_tensor_bytes, item.size);
     }
+    plan.max_copied_tensor_bytes = plan.max_tensor_bytes;
 
     // Path-scoped maxima: "the largest tensor MY path can reach", per consumer,
     // instead of one global maximum handed to every zone. The classifier is
