@@ -17263,7 +17263,7 @@ static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 18
               "host_weight_layout_cpu left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
-static_assert(sizeof(ggml_sycl_lazy_table_info) == 80, "ggml_sycl_lazy_table_info layout changed");
+static_assert(sizeof(ggml_sycl_lazy_table_info) == 88, "ggml_sycl_lazy_table_info layout changed");
 static_assert(offsetof(ggml_sycl_lazy_table_info, name) == 0, "lazy table name moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, type) == 8, "lazy table type moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, rows_per_token) == 12, "lazy table rows_per_token moved");
@@ -17273,6 +17273,7 @@ static_assert(offsetof(ggml_sycl_lazy_table_info, consumer_layer) == 56, "lazy t
 static_assert(offsetof(ggml_sycl_lazy_table_info, file_index) == 60, "lazy table file_index moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, file_offset) == 64, "lazy table file_offset moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, size) == 72, "lazy table size moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, storage_only) == 80, "lazy table storage_only moved");
 
 // llama.cpp-w013, llama.cpp-7fmt: one of the KV context room's cost parameters (placement_kv_info::ctx_fill_pct,
 // host_attn_gbps, cpu_expert_gbps and host_split_us) from its environment variable. Unset, unparsable, not finite,
@@ -17510,6 +17511,7 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
         t.file_index     = src.file_index;
         t.file_offset    = src.file_offset;
         t.table_bytes    = src.size;
+        t.storage_only   = src.storage_only;
         kv.lazy_tables.push_back(std::move(t));
     }
 }

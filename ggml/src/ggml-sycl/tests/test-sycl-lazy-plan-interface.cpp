@@ -405,6 +405,49 @@ arm_result arm_e_stage_refuses_a_count_with_no_array() {
     return arr;
 }
 
+// (g) storage_only crosses the boundary: arm (a)'s 64 MiB table, flagged, is STORAGE in the published plan, holding at
+// most its 66 MiB body (the ceiling's body term), and its own [PLACEMENT] line says so.
+// Engagement: arm (a) publishes the same table HOST, holding exactly the body; the log is cleared before the stage,
+// and the line matched names this table.
+// Mutants: the copy loop not copying storage_only (the table is HOST, its line says residency=HOST).
+arm_result arm_g_storage_only_crosses_the_boundary() {
+    arm_result                arr;
+    loader_inventory          inv;
+    ggml_sycl_lazy_table_info table = lazy_table("blk.1.engram_embd.weight", (64 * MiB) / 34);
+    table.file_offset               = 4032;
+    table.storage_only              = true;
+    inv.inv.lazy_tables             = &table;
+    inv.inv.lazy_table_count        = 1;
+    const size_t body = host_cpu_mapped_size(lazy_table_host_body_request_bytes(table.file_offset, table.size));
+
+    const ggml_sycl_placement_envelope envelope{ inv.inv.n_ctx, inv.inv.n_ubatch, 1, -1 };
+    ggml_sycl_load_txn                 txn{};
+    if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(arr, "the load transaction did not begin");
+        return arr;
+    }
+    log_clear();
+    if (ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
+        ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, &envelope, false) != GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        void_arm(arr, "a stage refused");
+        return arr;
+    }
+    ggml_sycl_model_token model{};
+    if (ggml_backend_sycl_model_load_end(txn, true, &model) != GGML_SYCL_LIFECYCLE_OK || model.model_id == 0) {
+        void_arm(arr, "the load did not end with a model token");
+        return arr;
+    }
+    const lazy_reading got = read_published(model);
+    expect(arr, got.ok && got.count == 1, "the published plan carries " + num(got.count) + " tables, want 1");
+    expect(arr, got.resident != 0 && got.resident <= body,
+           "the table holds " + num(got.resident) + ", want a cache of at most its body " + num(body));
+    expect(arr, !log_lines_containing("[PLACEMENT] lazy blk.1.engram_embd.weight residency=STORAGE").empty(),
+           "this table's [PLACEMENT] lazy line does not say STORAGE");
+    (void) ggml_backend_sycl_model_unloaded_token(model);
+    return arr;
+}
+
 // (f) The dry run refuses the same inventory with NULL_OUTPUT. It runs last: with its check dropped the intake reads
 // the null array, so the binary faults after every other arm has printed its verdict.
 // Engagement: the same call with the array present returns OK, so the result header and the host's state let the dry
@@ -473,6 +516,7 @@ int main(int argc, char ** argv) {
         { "(c) a refused plan refuses the load at the stage",          arm_c_the_stage_refuses_a_refused_plan      },
         { "(d) the late pass refuses a plan the early pass held",      arm_d_the_late_pass_refuses                 },
         { "(e) the stage refuses a lazy count with no array",          arm_e_stage_refuses_a_count_with_no_array   },
+        { "(g) storage_only crosses the boundary",                     arm_g_storage_only_crosses_the_boundary     },
         // Last: with its check dropped the dry run faults the binary.
         { "(f) the dry run refuses a lazy count with no array",        arm_f_dry_run_refuses_a_count_with_no_array },
     };
