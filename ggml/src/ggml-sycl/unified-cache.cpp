@@ -34846,7 +34846,9 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
                 (unsigned long long) kv_info.lazy_load_txn, info.name.c_str(), span,
                 (unsigned long long) (live / LAZY_BLOCK_RING_QD));
         }
-        if (body != 0 && with <= fit_room && with <= p3_room) {
+        // A storage-only table is read from its file whatever the host room: holding it costs more host memory than its
+        // reads save, so it never takes the HOST branch.
+        if (!info.storage_only && body != 0 && with <= fit_room && with <= p3_room) {
             t.residency           = lazy_residency::HOST;
             t.host_resident_bytes = body;
             used                  = with;
