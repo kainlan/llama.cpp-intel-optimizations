@@ -76,7 +76,7 @@
 // request, which must grow the zone by at least those bytes, the effect a hook that copied into the pinned pool has.
 //
 // Arm 4 (no device, both builders) adds a gather-only table 64x the largest tensor that the starved plan keeps on the
-// host. The host STAGING and SCRATCH zones hold only copies, and the CPU reads such a table in place, so both zones and
+// host, to an inventory with one dense weight that lifts both reference zones above their 64 MiB floor. The host STAGING and SCRATCH zones hold only copies, and the CPU reads such a table in place, so both zones and
 // the commit floor must equal those of the plan without it. Its controls: the same tensor not gather-only sizes both
 // zones as before, and a gather-only tensor the plan puts on a device (it takes a staged fill) still counts.
 
@@ -302,6 +302,9 @@ derived_terms derive_terms(const placement_plan & plan) {
     }
     return t;
 }
+
+// The size below which the planner never sizes a host zone (populate_host_zone_sizing's k_min_zone_bytes).
+constexpr size_t k_min_host_zone_bytes = 64 * MiB;
 
 // The starved budget every arm but arm 4's device-bound control plans with.
 constexpr size_t k_starved_vram_budget = 1 * MiB;
@@ -563,8 +566,11 @@ bool dense_entry_on_device(const placement_plan & plan, const std::string & name
 void arm4_host_gather_only_table_sizes_no_copy_zone(const char * builder_name, plan_builder build) {
     std::printf("(4) [%s] a host-kept gather-only table sizes no host STAGING or SCRATCH\n", builder_name);
 
-    const std::vector<placement_tensor_info> base     = q2k_inventory();
-    size_t                                   base_max = 0;
+    // The fixture's inventory plus one dense Q8_0 weight large enough to lift both reference zones off their 64 MiB
+    // floor, so "unchanged" compares sizes the largest copied tensor decides rather than two floors.
+    std::vector<placement_tensor_info> base = q2k_inventory();
+    base.push_back(tensor("blk.0.ffn_up.weight", GGML_TYPE_Q8_0, 4096, 10240));
+    size_t base_max = 0;
     for (const placement_tensor_info & t : base) {
         base_max = std::max(base_max, t.size);
     }
@@ -577,6 +583,8 @@ void arm4_host_gather_only_table_sizes_no_copy_zone(const char * builder_name, p
     const placement_plan ref  = build(base, k_starved_vram_budget);
     const placement_plan plan = build(with_table, k_starved_vram_budget);
 
+    check(ref.host_zone_staging_bytes > k_min_host_zone_bytes, "the reference STAGING sits above the zone floor");
+    check(ref.host_zone_scratch_bytes > k_min_host_zone_bytes, "the reference SCRATCH sits above the zone floor");
     check(table.size > base_max, "the table is larger than every other tensor");
     check_eq("the table is the model-wide maximum", plan.max_tensor_bytes, table.size);
     check(plan.find_dense_entry(table.name) != nullptr, "the plan has an entry for the table");

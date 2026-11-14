@@ -1067,7 +1067,7 @@ struct host_zone_commit_terms {
     size_t weight   = 0;  // host_zone_weight_bytes
     size_t kv       = 0;  // host_zone_kv_bytes, at least 64 MiB
     size_t staging  = 0;  // host_zone_staging_bytes
-    size_t scratch  = 0;  // host_zone_scratch_bytes, at least the live oneDNN scratch + max_tensor_bytes + 32 MiB
+    size_t scratch  = 0;  // host_zone_scratch_bytes, at least live oneDNN scratch + max_copied_tensor_bytes + 32 MiB
     size_t runtime  = 0;  // the RUNTIME pool: the oneDNN scratchpad and the DMA staging pool
     size_t rounding = 0;  // the zones and the runtime bytes each grown to whole chunks, chunk headers included
 
@@ -2255,8 +2255,9 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
     terms.weight  = plan.host_zone_weight_bytes;
     terms.kv      = std::max(plan.host_zone_kv_bytes, k_min_kv_zone_bytes);
     terms.staging = plan.host_zone_staging_bytes;
-    terms.scratch = std::max(plan.host_zone_scratch_bytes,
-                             sat_add(sat_add(onednn_live_bytes, plan.max_tensor_bytes), k_scratch_headroom_bytes));
+    terms.scratch =
+        std::max(plan.host_zone_scratch_bytes,
+                 sat_add(sat_add(onednn_live_bytes, plan.max_copied_tensor_bytes), k_scratch_headroom_bytes));
     // The PP pipeline scratch and the PP MoE oneDNN ring are VRAM allocations, so neither host pool carries them
     // (§4.4 "The runtime pre-allocate stops carrying the same two terms").
     terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;

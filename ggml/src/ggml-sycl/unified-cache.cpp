@@ -35077,7 +35077,6 @@ static void populate_host_zone_sizing(placement_plan &                          
     for (const auto & item : tensor_inventory) {
         plan.max_tensor_bytes = std::max(plan.max_tensor_bytes, item.size);
     }
-    plan.max_copied_tensor_bytes = plan.max_tensor_bytes;
 
     // Path-scoped maxima: "the largest tensor MY path can reach", per consumer,
     // instead of one global maximum handed to every zone. The classifier is
@@ -35220,7 +35219,38 @@ static void populate_host_zone_sizing(placement_plan &                          
             group_count, tensor_inventory.size(), hist.c_str(), family, rare);
     }
 
+    // The zones that hold copies (STAGING, SCRATCH) are sized from the largest tensor that can be copied. A gather-only
+    // tensor the plan keeps wholly on the host is read in place by the CPU: S1-PRELOAD serves it from the mapping or
+    // a WEIGHT-zone copy, and no fill, readback or fallback copies it. Gather-only alone is not the test, since a
+    // device-resident embedding takes a staged fill, and an under-sized STAGING zone aborts the load because the
+    // staging pool forbids zone growth, so every other tensor, and a gather-only one with no entry, still counts.
+    std::unordered_set<std::string> host_gather_only;
+    for (const auto & item : tensor_inventory) {
+        if (!item.get_rows_only) {
+            continue;
+        }
+        bool has_entry  = false;
+        bool any_device = false;
+        for (const auto & entry : plan.entries) {
+            if (entry.name == item.name) {
+                has_entry  = true;
+                any_device = any_device || entry.on_device;
+            }
+        }
+        if (has_entry && !any_device) {
+            host_gather_only.insert(item.name);
+        }
+    }
+    plan.max_copied_tensor_bytes = 0;
+    for (const auto & item : tensor_inventory) {
+        if (host_gather_only.count(item.name) == 0) {
+            plan.max_copied_tensor_bytes = std::max(plan.max_copied_tensor_bytes, item.size);
+        }
+    }
     for (const auto & entry : plan.entries) {
+        if (host_gather_only.count(entry.name) != 0) {
+            continue;
+        }
         plan.max_staging_pair_bytes =
             std::max(plan.max_staging_pair_bytes, entry.src_size + std::max(entry.dst_size, entry.src_size));
     }
@@ -35680,7 +35710,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     size_t       s1_preload_staging_bytes = 0;
     size_t       host_staging_total       = 0;
     bool host_sizing_valid =
-        moe_mmid_checked_zone_total(plan.max_tensor_bytes, plan.max_tensor_bytes, &twice_max_tensor) &&
+        moe_mmid_checked_zone_total(plan.max_copied_tensor_bytes, plan.max_copied_tensor_bytes, &twice_max_tensor) &&
         moe_mmid_checked_zone_total(std::max(twice_max_tensor, plan.max_staging_pair_bytes),
                                     s1_reorder_guard_bytes, &s1_per_inflight_bytes) &&
         moe_mmid_checked_product(s1_per_inflight_bytes, s1_in_flight, &s1_preload_staging_bytes);
@@ -35702,12 +35732,15 @@ static void populate_host_zone_sizing(placement_plan &                          
         host_staging_total             = k_min_zone_bytes;
     }
     plan.host_zone_staging_bytes = std::max<size_t>(k_min_zone_bytes, host_staging_total);
-    GGML_LOG_INFO("[SYCL-PLAN] Host staging zone: s1_window=%zu per_inflight=%.1f MB total=%.1f MB\n", s1_in_flight,
-                  s1_per_inflight_bytes / (1024.0 * 1024.0), plan.host_zone_staging_bytes / (1024.0 * 1024.0));
+    GGML_LOG_INFO(
+        "[SYCL-PLAN] Host staging zone: s1_window=%zu per_inflight=%.1f MB total=%.1f MB copied_max=%.1f MB "
+        "global_max=%.1f MB\n",
+        s1_in_flight, s1_per_inflight_bytes / (1024.0 * 1024.0), plan.host_zone_staging_bytes / (1024.0 * 1024.0),
+        plan.max_copied_tensor_bytes / (1024.0 * 1024.0), plan.max_tensor_bytes / (1024.0 * 1024.0));
     // SCRATCH zone: what a term sizes decides whether host SCRATCH reads it, not its label (§4.4 "Host SCRATCH reads
     // no term that sizes a device allocation", §M62 (A)). Two host tenants are left: the single-tensor staging
-    // copies, bounded by max_tensor_bytes plus k_scratch_headroom, and the MoE PP CPU-island act/out staging, bounded
-    // by moe_cpu_expert_staging_bytes plus moe_host_recipe_workspace_bytes. The oneDNN reorder, the MoE Q8_1
+    // copies, bounded by max_copied_tensor_bytes plus k_scratch_headroom, and the MoE PP CPU-island act/out staging,
+    // bounded by moe_cpu_expert_staging_bytes plus moe_host_recipe_workspace_bytes. The oneDNN reorder, the MoE Q8_1
     // workspace, the MoE pointer tables, the TP compute buffers, the DMA staging pool and the two PP terms each size a
     // device allocation, so none of them is folded here: a host reservation for them would sit idle.
     // A context's host compute and output buffers are not folded here: they are notified demands on the cache's
@@ -35721,7 +35754,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     if (moe_host_scratch < plan.moe_cpu_expert_staging_bytes) {
         host_scratch_valid = false;
     }
-    for (size_t bytes : { plan.max_tensor_bytes, k_scratch_headroom, moe_host_scratch }) {
+    for (size_t bytes : { plan.max_copied_tensor_bytes, k_scratch_headroom, moe_host_scratch }) {
         size_t next = 0;
         if (!moe_mmid_checked_zone_total(host_scratch_total, bytes, &next)) {
             host_scratch_valid = false;

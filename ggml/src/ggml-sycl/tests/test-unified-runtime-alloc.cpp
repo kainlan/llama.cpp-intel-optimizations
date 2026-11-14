@@ -983,7 +983,7 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     // 16-MiB chunk; allow one further chunk for aligned zone boundaries.
     const size_t host_scratch = std::max(plan.host_zone_scratch_bytes,
         cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() +
-        plan.max_tensor_bytes + 32 * mib);
+        plan.max_copied_tensor_bytes + 32 * mib);
     const size_t host_zones = plan.host_zone_weight_bytes + std::max(plan.host_zone_kv_bytes, 64 * mib) +
                              plan.host_zone_staging_bytes + host_scratch;
     const size_t host_runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;
