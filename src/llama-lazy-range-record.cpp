@@ -227,9 +227,9 @@ void llama_lazy_range_check_create(const llama_lazy_range_record & record,
     }
 }
 
-// Whether `arch`'s graph consumes a STORAGE row. None does yet: llama_lazy_range_check_storage() below refuses a STORAGE
-// row for an arch without one, and the pre-fill does not make one from the default mode (AUTO). An arch gains its
-// consumer by returning true here, and its expectations move together: the `consumer` flag of
+// Whether `arch`'s graph consumes a STORAGE row. None does yet: llama_lazy_range_check_storage() below refuses a
+// STORAGE row for an arch without one, and the pre-fill does not make one from the default mode (AUTO). An arch
+// gains its consumer by returning true here, and its expectations move together: the `consumer` flag of
 // tests/test-llama-lazy-range-prefill.cpp and the pin test_the_auto_bridge_lives_exactly_as_long_as_the_refusal in
 // tests/test-llama-lazy-range-record-source.py.
 static bool llama_lazy_storage_consumer_present(enum llm_arch arch) {
