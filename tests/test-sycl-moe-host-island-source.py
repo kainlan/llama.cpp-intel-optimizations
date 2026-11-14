@@ -10,7 +10,10 @@ host-expert MoE that was millions of copies each way, almost every copy of the r
 ggml-sycl/moe-host-island.hpp (tested by tests/test-sycl-moe-host-island.cpp) gathers each distinct activation row once,
 in runs of adjacent rows, and lays the results out in destination order so adjacent rows return in one copy.
 
-This gate holds the lambda to that plan. It is the only gate on the lambda: no other source pin reads it.
+This gate holds the lambda to that plan. It is the only gate on the lambda's copies and on the order of its rows.
+Two other pins read other parts of the lambda: test-sycl-host-role-routing-source.py pins its activation block's
+allocation intent (cohort moe_pp_cpu_island_act), and test-sycl-moe-cpu-dispatch-storage-bridge-source.py pins its
+smart-handle refusal.
 
   P0  the lambda exists exactly once;
   P1  its body builds the plan with ggml_sycl::moe_island_plan_build( exactly once;
@@ -22,7 +25,11 @@ This gate holds the lambda to that plan. It is the only gate on the lambda: no o
   P4  the per-row destination list scatter_dst_offsets is gone;
   P5  the activation block is sized from the plan's distinct rows (island.n_act_rows), not from the row count;
   P6  each CPU task reads the activation block row and writes the result block row the plan assigned to it, indexed
-      by the task loop's one row counter flat_row: act_index for the activation, out_index for the result.
+      by the task loop's one row counter flat_row: act_index for the activation, out_index for the result;
+  P7  the plan's rows and the task loop walk the groups in the same order, since act_index and out_index are indexed
+      by position: island_rows is built, before the plan call, by one forward loop over groups and their rows, with
+      the row's (iid1, id) binding, its i11, and its src1 and dst offsets exactly as the per-row copies computed them;
+      the task loop walks groups forward and each group's rows forward by index.
 
 Checks run on comment-blanked text with whitespace collapsed, so a clang-format re-wrap moves no claim.
 
@@ -56,6 +63,24 @@ COPY_CALL = "mem_copy_async("
 ACT_SIZE = "act_req.size = island.n_act_rows * static_cast<size_t>(K) * sizeof(float);"
 TASK_ACT = "task.act_host = act_pinned + static_cast<size_t>(island.act_index[flat_row]) * static_cast<size_t>(K);"
 TASK_OUT = "task.output_host = out_pinned + static_cast<size_t>(island.out_index[flat_row]) * static_cast<size_t>(N);"
+# The plan's rows, in the groups' order: the whole loop, as squash() renders it.
+ISLAND_ROWS_LOOP = (
+    "island_rows.reserve(n_rows); for (const pp_host_expert_group & group : groups) { "
+    "for (const auto & row : group.rows) { const auto [iid1, id] = row; const int64_t i11 = id % ne11; "
+    "ggml_sycl::moe_island_row r; "
+    "r.src_offset = src1_storage.view_offset + static_cast<size_t>(i11) * nb11 + static_cast<size_t>(iid1) * nb12; "
+    "r.dst_offset = dst_storage.view_offset + static_cast<size_t>(id) * nb1 + static_cast<size_t>(iid1) * nb2; "
+    "island_rows.push_back(r); } }"
+)
+ISLAND_ROWS_PARTS = (
+    "const auto [iid1, id] = row;",
+    "const int64_t i11 = id % ne11;",
+    "r.src_offset = src1_storage.view_offset + static_cast<size_t>(i11) * nb11 + static_cast<size_t>(iid1) * nb12;",
+    "r.dst_offset = dst_storage.view_offset + static_cast<size_t>(id) * nb1 + static_cast<size_t>(iid1) * nb2;",
+    "island_rows.push_back(",
+)
+TASK_LOOP = "for (pp_host_expert_group & group : groups) {"
+TASK_ROWS_LOOP = "for (size_t ri = 0; ri < group.rows.size(); ++ri) {"
 
 
 class ContractError(AssertionError):
@@ -180,6 +205,22 @@ def check(backend_src: str) -> None:
             "FAIL [pin P6]: flat_row is not the task loop's one row counter (declared once from 0, advanced once)"
         )
 
+    rows_at = body.find(ISLAND_ROWS_LOOP)
+    if body.count(ISLAND_ROWS_LOOP) != 1 or any(body.count(part) != 1 for part in ISLAND_ROWS_PARTS):
+        raise ContractError(
+            "FAIL [pin P7]: island_rows is not built once by a forward loop over groups and their rows with the "
+            f"per-row binding and offsets, each once: `{ISLAND_ROWS_LOOP}`"
+        )
+    if rows_at > body.find(PLAN_CALL):
+        raise ContractError("FAIL [pin P7]: island_rows is built after the plan call")
+    task_at = body.find(TASK_LOOP)
+    if (body.count(TASK_LOOP) != 1 or body.count(TASK_ROWS_LOOP) != 1
+            or TASK_ROWS_LOOP not in brace_block_from(body, task_at)):
+        raise ContractError(
+            f"FAIL [pin P7]: the task loop does not walk groups forward (`{TASK_LOOP}`) and each group's rows forward "
+            f"by index (`{TASK_ROWS_LOOP}`), once each, so its flat_row may not be the plan's row"
+        )
+
 
 def self_test(backend_src: str) -> int:
     failures: list[str] = []
@@ -265,6 +306,22 @@ def self_test(backend_src: str) -> int:
     expect_fail("task-writes-its-flat-row", "P6", "static_cast<size_t>(island.out_index[flat_row])", "flat_row")
     expect_fail("task-act-reads-out-index", "P6", "island.act_index[flat_row]", "island.out_index[flat_row]")
     expect_fail("task-second-row-counter", "P6", "++flat_row;", "++flat_row; ++flat_row;")
+    # The groups' header repeats in the lambda (the row count, island_rows and the weight check walk it), so the
+    # island_rows mutant's anchor carries the reserve that precedes that loop.
+    expect_fail("island-rows-groups-reversed", "P7",
+                "island_rows.reserve(n_rows);\n            for (const pp_host_expert_group & group : groups) {",
+                "island_rows.reserve(n_rows);\n            for (const pp_host_expert_group & group : reversed(groups)) {")
+    expect_fail("island-rows-rows-reversed", "P7", "for (const auto & row : group.rows) {",
+                "for (const auto & row : reversed(group.rows)) {")
+    expect_fail("island-rows-iid1-id-swapped", "P7", "[iid1, id]", "[id, iid1]")
+    expect_fail("island-rows-nb11-nb12-swapped", "P7", "* nb11 + static_cast<size_t>(iid1) * nb12",
+                "* nb12 + static_cast<size_t>(iid1) * nb11")
+    expect_fail("island-rows-nb1-nb2-swapped", "P7", "* nb1 + static_cast<size_t>(iid1) * nb2",
+                "* nb2 + static_cast<size_t>(iid1) * nb1")
+    expect_fail("task-loop-groups-reversed", "P7", "for (pp_host_expert_group & group : groups) {",
+                "for (pp_host_expert_group & group : reversed(groups)) {")
+    expect_fail("task-loop-rows-reversed", "P7", "for (size_t ri = 0; ri < group.rows.size(); ++ri) {",
+                "for (size_t ri = group.rows.size(); ri-- > 0;) {")
 
     # The NOT APPLIED report must fire on an anchor the lambda does not hold, or a stale mutant would pass unseen.
     try:

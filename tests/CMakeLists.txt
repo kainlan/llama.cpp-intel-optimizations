@@ -981,8 +981,9 @@ if (Python3_Interpreter_FOUND)
     set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # The prompt's CPU island (dispatch_host_expert_groups) copies by its plan: each distinct activation row once in
-    # runs, results in destination order, no per-row copy loop. The only gate on that lambda. Run WITH --self-test so
-    # each mutant is caught by the pin it names. Text only: no device, no model.
+    # runs, results in destination order, no per-row copy loop, and its rows in the order the plan indexes them. The
+    # only gate on the lambda's copies and row order. Run WITH --self-test so each mutant is caught by the pin it
+    # names. Text only: no device, no model.
     add_test(NAME test-sycl-moe-host-island-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-host-island-source.py --self-test)
     set_tests_properties(test-sycl-moe-host-island-source PROPERTIES
