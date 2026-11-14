@@ -2455,6 +2455,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 **Commit:** `llama: qwen4exp reads its PLE rows from the storage tier as f32 in set_input`.
 Stage `src/models/qwen4exp.cpp src/llama-lazy-range-record.cpp tests/test-llama-lazy-range-prefill.cpp tests/test-llama-lazy-range-record-source.py`.
 
+**As merged (`integ/th32` at `20e4361e0`, 2026-11-14).** The merged code differs from the snippets above in seven
+places. Each was ruled by the lead during review.
+- **The conversion lives on the handle.** `llama_lazy_storage` has `can_gather_f32()` and `gather_f32()`.
+  - `set_input` calls `gather_f32()` and makes one `ggml_backend_tensor_set`. It holds no type dispatch.
+  - `gather_f32()` never throws. It returns `ENOTSUP` for a type with no f32 form before anything is read,
+    `ENOMEM` when a scratch cannot grow, and otherwise what `gather()` returns.
+  - Host tests on fake storage procs run it (`tests/test-llama-lazy-storage.cpp`). The snippets above had no
+    behaviour test for this path.
+- **An F32 table is supported.** `GGML_TYPE_F32` has no `to_float`, so the snippets above would have failed every
+  ubatch. Its rows are read straight into the f32 scratch. No F32 file of this model exists, so the host test is
+  this path's only proof.
+- **A type with no f32 form is refused when the graph is built.** `build_inp_ple` throws, so the load or the
+  context creation fails with the reason. The snippets above tested it on every ubatch.
+- **One member decides the mode.** `can_reuse` and `set_input` both test the `storage` handle.
+- **The failure flag is cleared as `set_input`'s first statement,** and `std::exception` is caught around the
+  scratch resizes.
+- **The read-failure ERROR names the table** and tells the user that `--lazy-mode off` holds the table in memory.
+- **The bridge's WARN names the arch.**
+
+The planned single source pin became 21 pins plus the behaviour tests. The files staged also include
+`src/llama-lazy-storage.h`, `src/llama-lazy-storage.cpp` and `tests/test-llama-lazy-storage.cpp`.
+
+**Precision.** The rows are converted with the type's own `to_float`, as the CPU backend's `get_rows` converts
+them. The SYCL `get_rows` multiplies in half precision under `GGML_SYCL_F16`, so its result can differ in the
+last bits. T14 found that the eager `get_rows` on this table runs on the CPU backend, so the two modes use the
+same arithmetic.
+
 ---
 
 ## T14: End-to-End Validation (lead only)
@@ -2500,6 +2527,36 @@ from run to run.
 
 If row 8 shows the STORAGE run far below the eager one, report the row 5 counters line with it. The hit rate
 decides whether the follow-up is lookahead or a larger cache, and that decision is the owner's.
+
+**As run (`integ/th32` at `20e4361e0`, base `ec08e5907`, driver 26.44.40734.6, 2026-11-14).** Rows 1-6, 8 and
+10-12 pass. Row 7 is recorded. Every arm returned 0. The full record is on `llama.cpp-nbzq`.
+
+| # | result |
+|---|---|
+| 2 | `residency=STORAGE table=54400261120 resident=2147483648 storage_only=1 cache_cap=2147483648` |
+| 3 | `lazy_resident=2147483648 tables=1 host=0 storage=1 refusal=none` |
+| 4 | the pinned pool working set is 2561.5 MB in both modes. Maximum RSS is 50.06 GB by default and 48.25 GB with `-lzm off` |
+| 5 | `hits=202 misses=1350 evictions=0 submitted=1350` |
+| 6 | 1 and 0 |
+| 7 | the texts differ from the second paragraph on. See below |
+| 8 | pp2048 is 112.41 ± 0.32 t/s STORAGE and 109.14 ± 0.59 t/s eager. The ratio is 1.03 |
+| 10 | the plan terms, the 485.6 MB working set and the 4096.0 MB commit equal base. The gate passes |
+| 11 | the plan terms, the 2073.0 MB working set and the 6144.0 MB commit equal base. The gate scores 1 |
+| 12 | no matching kernel line on any card, from the first arm's start to the last arm's end |
+
+- **Row 7.** The `-v` log does not name the backend that ran the eager `get_rows`. One extra `-lzm off` arm with
+  `GGML_SCHED_DEBUG=2` does: `node # 1 (GET_ROWS): node_1 [CPU]`, reading the table from its `SYCL_Mapped`
+  buffer. So both modes convert the rows in exact f32. A second default-mode run on the same build then gave a
+  different text from the fourth generated token. A temp-0 completion on this model is not reproducible run to
+  run, so this row cannot tell the modes apart. That is `llama.cpp-fd88`, and it also shows with `-lzm off`.
+- **Row 8.** The eager figure on this tree is 109 t/s, not the 31-38 t/s this plan quotes. That figure's
+  conditions were not traced, so no speedup is claimed from it.
+- **Departures from the commands above.** The Qwen cli and completion arms ran with `-v` and split stdout and
+  stderr. The Qwen bench had an 1800 s timeout and took 9:54.
+- **Load time.** The default run's wall time is 2:55, against 4:30 with `-lzm off`.
+- **Short cold prompt, one sample each.** The count gate's prompt eval took 7.75 s for 78 tokens by default and
+  3.48 s with `-lzm off`. The bench warms up first and shows no gap. It reads as a first-use cost and is left
+  to the storage-path follow-up.
 
 ---
 
