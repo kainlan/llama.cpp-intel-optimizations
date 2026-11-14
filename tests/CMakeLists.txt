@@ -4191,6 +4191,19 @@ foreach (lazy_range_test test-llama-lazy-range-record test-llama-lazy-range-pref
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
 endforeach()
 
+# A graph input that cannot produce its data stops its ubatch before graph_compute: the result reports it, and
+# process_ubatch returns FAILED between set_inputs and graph_compute.
+llama_build_and_test(test-llama-graph-input-failed.cpp)
+target_include_directories(test-llama-graph-input-failed PRIVATE ${PROJECT_SOURCE_DIR}/src)
+set_tests_properties(test-llama-graph-input-failed PROPERTIES LABELS "host")
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-llama-graph-input-failed-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-llama-graph-input-failed-source.py
+        LABEL "host;python;source-contract"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-5efe C3: the loader's per-tensor lock is a ranged lock, so a tensor after a lazy
 # range no longer locks the range too. The fixture is a 64 MiB file under the build directory
 # (not tmpfs); the test measures the page cache of the file with cachestat(2) and exits 77

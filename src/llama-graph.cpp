@@ -1362,6 +1362,15 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_graph_result::inputs_failed() const {
+    for (const auto & input : inputs) {
+        if (input->set_input_failed()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);

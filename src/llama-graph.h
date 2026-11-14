@@ -118,6 +118,12 @@ public:
         GGML_UNUSED(params);
         return false;
     }
+
+    // true when the last set_input() could not produce its data: the ubatch is not computed (decode() returns -3
+    // and removes the ubatch's positions from the memory module). set_input() must not throw; it clears this at its
+    // start, because a reused graph calls set_input() again on the same input, and sets it on failure.
+    virtual bool set_input_failed() const { return false; }
+
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -915,6 +921,10 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+
+    // true when any input reported, after set_inputs(), that it could not produce its data
+    bool inputs_failed() const;
+
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
