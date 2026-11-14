@@ -514,7 +514,7 @@ if (BUILD_TESTING)
         set(_le_re_ticket_wait_returns_at_once "${_le_ticket_wait}the wait returned with 3 reads held")
         set(_le_re_ticket_zero_no_notify "${_le_ticket_wait}after the release the wait did not return within 5 s")
         string(CONCAT _le_re_gather_returns_unwaited
-            "FAIL a gather waits for the reads it submitted: the gather returned with 2 reads held")
+            "FAIL a gather waits for the reads it submitted: the gather returned with 3 reads held")
         string(CONCAT _le_re_gather_error_returns_unwaited
             "FAIL a gather whose submit throws still waits for the reads it queued: after a submit threw, the gather "
             "returned with a submitted read still held")

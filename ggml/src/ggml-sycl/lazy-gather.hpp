@@ -28,14 +28,15 @@ struct lazy_gather_stats {
 // Copies row rows[i] of the table to dst + i * row_size for i in [0, n). `context` names the caller's queue, `epoch`
 // this call (distinct from the caller's previous call), `deadline` the consumer layer. Returns 0 when every row landed;
 // EINVAL for a bad row or a short dst; the first failed read's errno; EIO when the engine refused a read (no live ring,
-// or a span wider than a slot); ENOMEM when a lookup or a submit threw std::bad_alloc, EIO when one threw anything else.
-// `stats`, when not null, is reset and then counts this call.
+// or a span wider than a slot); ENOMEM when a lookup or a submit threw std::bad_alloc, EIO when one threw anything
+// else. `stats`, when not null, is reset and then counts this call.
 //
 // It never returns with a waiter of its own undelivered: every path that submitted anything waits until each waiter
 // the engine counted has been delivered, the error paths included, so the request, ticket and landing slot it keeps on
-// its own frame, and dst, are never touched after it returns. That wait has no timeout and is done by the IO engine's pool workers, and a worker takes
-// the engine's lock, the pool registry's, the landing slot's and the row cache's shard lock between its reads. So call
-// it holding none of those locks, and never from a pool worker; the gather itself holds no lock while it waits.
+// its own frame, and dst, are never touched after it returns. That wait has no timeout and ends only when the IO
+// engine's pool workers have delivered, and a worker takes the engine's lock, the pool registry's, the landing slot's
+// and the row cache's shard lock between its reads. So call it holding none of those locks, and never from a pool
+// worker; the gather itself holds no lock while it waits.
 int lazy_gather_rows(lazy_row_cache *           cache,
                      const lazy_gather_source & src,
                      uint64_t                   context,
