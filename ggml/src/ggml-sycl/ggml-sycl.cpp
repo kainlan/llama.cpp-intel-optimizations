@@ -127624,14 +127624,27 @@ bool ggml_sycl_lazy_ring_coverage_reads_for_testing(uint64_t * out) {
     return true;
 }
 
+// A file's identity for the IO engine's in-flight table, which dedups reads on (file_id, offset, length): two files
+// that collide here would have one's bytes delivered into the other's table. st_dev goes through splitmix64's
+// finalizer so every one of its bits reaches the id, and two devices with the same inode number do not collide.
+static uint64_t ggml_sycl_lazy_storage_file_id(const struct stat & st) {
+    uint64_t x = static_cast<uint64_t>(st.st_dev);
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebull;
+    x ^= x >> 31;
+    return x ^ static_cast<uint64_t>(st.st_ino);
+}
+
 // The C declaration's opaque type, so it stays outside namespace ggml_sycl.
 struct ggml_sycl_lazy_storage {
     ggml_sycl::lazy_table_ref     table;
     ggml_sycl::lazy_gather_source source;
     uint64_t                      context  = 0;  // the IO engine's queue name for this table's gathers
     int32_t                       deadline = 0;  // the consumer layer
-    // One gather at a time, so each call's landing epoch is its own. No IO pool worker takes it, so a gather may hold
-    // it while it waits for the workers' deliveries.
+    // One gather at a time: it guards `epoch`, and it keeps one table's gathers queued in the order they were called.
+    // No IO pool worker takes it, so a gather may hold it while it waits for the workers' deliveries.
     std::mutex                    gather_lock;
     uint32_t                      epoch = 0;       // guarded by gather_lock
     std::atomic<uint64_t>         submitted{ 0 };  // waiters submitted for misses over every gather
@@ -127646,8 +127659,13 @@ ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(ggml_sycl_model_tok
         GGML_LOG_WARN("[LAZY-STORAGE] open refused: the backend module is not admitting mutations\n");
         return nullptr;
     }
-    if (info == nullptr || info->name == nullptr || file_path == nullptr || model.model_id == 0) {
-        GGML_LOG_WARN("[LAZY-STORAGE] open refused: a null argument or model id 0\n");
+    const char * bad = info == nullptr       ? "info is null" :
+                       info->name == nullptr ? "info->name is null" :
+                       file_path == nullptr  ? "file_path is null" :
+                       model.model_id == 0   ? "the model id is 0" :
+                                               nullptr;
+    if (bad != nullptr) {
+        GGML_LOG_WARN("[LAZY-STORAGE] open refused: %s\n", bad);
         return nullptr;
     }
     try {
@@ -127680,9 +127698,8 @@ ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(ggml_sycl_model_tok
             GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: the plan holds it HOST\n", info->name);
             return nullptr;
         }
-        // The table the caller names must be the one the plan sized: a row size or extent that differs would read
-        // the wrong bytes into a cache planned for other ones. With these four equal, the materialization's own check
-        // (row_size is ggml_row_size(type, ne0), table_bytes is row_size * n_rows) leaves ne0 and n_rows no freedom.
+        // The table the caller names must be the one the plan sized: a caller that expects another row size, extent,
+        // offset or type would read the plan's bytes as something else. The open itself uses only the plan's figures.
         if (planned->row_size != info->row_size || entry->table_bytes != info->size ||
             planned->file_offset != info->file_offset || planned->type != info->type) {
             GGML_LOG_WARN(
@@ -127692,19 +127709,20 @@ ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(ggml_sycl_model_tok
                 planned->file_offset, (int) info->type, (int) planned->type);
             return nullptr;
         }
+        // Every figure below is the plan's; the caller's info only had to agree with it above.
         ggml_sycl::lazy_table_desc desc;
-        desc.name                = info->name;
+        desc.name                = planned->name;
         desc.model               = model;
-        desc.type                = info->type;
-        desc.ne0                 = info->ne[0];
-        desc.n_rows              = info->ne[1];
-        desc.row_size            = info->row_size;
-        desc.file_index          = info->file_index;
-        desc.file_offset         = info->file_offset;
-        desc.table_bytes         = info->size;
+        desc.type                = planned->type;
+        desc.ne0                 = planned->ne[0];
+        desc.n_rows              = planned->ne[1];
+        desc.row_size            = planned->row_size;
+        desc.file_index          = planned->file_index;
+        desc.file_offset         = planned->file_offset;
+        desc.table_bytes         = entry->table_bytes;
         desc.file_path           = file_path;
         desc.residency           = ggml_sycl::lazy_residency::STORAGE;
-        desc.consumer_layer      = info->consumer_layer;
+        desc.consumer_layer      = planned->consumer_layer;
         desc.consumer_device     = entry->consumer_device;
         desc.host_resident_bytes = entry->host_resident_bytes;
         desc.cache_slots         = entry->cache_slots;
@@ -127725,18 +127743,17 @@ ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(ggml_sycl_model_tok
         auto * s              = new ggml_sycl_lazy_storage;
         s->table              = std::move(made.table);
         s->source.fd          = s->table->storage_fd();
-        // device and inode, so two descriptors on one file share reads in the engine's in-flight table
-        s->source.file_id     = (static_cast<uint64_t>(st.st_dev) << 40) ^ static_cast<uint64_t>(st.st_ino);
-        s->source.file_offset = info->file_offset;
+        s->source.file_id     = ggml_sycl_lazy_storage_file_id(st);  // two descriptors on one file share reads
+        s->source.file_offset = planned->file_offset;
         // The row cache was built at desc.row_size, this same figure, so the gather's refusal of a cache whose row
         // size is not the source's cannot fire; and the materialization refused a table whose end wraps a uint64_t.
-        s->source.row_size    = info->row_size;
-        s->source.n_rows      = info->ne[1];
+        s->source.row_size    = planned->row_size;
+        s->source.n_rows      = planned->ne[1];
         s->context            = reinterpret_cast<uintptr_t>(s);
-        s->deadline           = info->consumer_layer;
+        s->deadline           = planned->consumer_layer;
         return s;
     } catch (const ggml_sycl_fallback_error &) {
-        throw;
+        throw;  // no broad handler in this backend may swallow a fallback request, though nothing here raises one
     } catch (const std::exception & e) {
         GGML_LOG_WARN("[LAZY-STORAGE] %s: open refused: %s\n", info->name, e.what());
         return nullptr;
@@ -127782,8 +127799,9 @@ void ggml_backend_sycl_lazy_storage_counters(const ggml_sycl_lazy_storage * s, u
 }
 
 void ggml_backend_sycl_lazy_storage_close(ggml_sycl_lazy_storage * s) {
-    // A release is never refused: the guard only keeps the release from overlapping a module reactivation, and a
-    // refused close would leak the table's MODEL-lifetime cache past its model.
+    // A release is never refused, or the table's MODEL-lifetime cache would outlive its model. The guard is taken
+    // only while the module admits mutations: an admitted close holds off the unload's drain until the delete is
+    // done. A close arriving after admission closed runs unguarded, which closing before the unload makes unreachable.
     sycl_module_mutation_guard module_guard;
     delete s;
 }
