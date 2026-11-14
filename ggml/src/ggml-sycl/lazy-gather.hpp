@@ -25,11 +25,20 @@ struct lazy_gather_stats {
     uint64_t reads = 0;  // waiters submitted for misses: not disk reads, since rows of one block share a read
 };
 
-// Copies row rows[i] of the table to dst + i * row_size for i in [0, n). `context` names the caller's queue, `epoch`
-// this call (distinct from the caller's previous call), `deadline` the consumer layer. Returns 0 when every row landed;
-// EINVAL for a bad row or a short dst; the first failed read's errno; EIO when the engine refused a read (no live ring,
-// or a span wider than a slot); ENOMEM when a lookup or a submit threw std::bad_alloc, EIO when one threw anything
-// else. `stats`, when not null, is reset and then counts this call.
+// Copies row rows[i] of the table to dst + i * row_size for i in [0, n). `context` names the caller's queue and
+// `deadline` the consumer layer. `epoch` only orders this context's queue: each call has a landing slot of its own, so
+// correctness does not depend on it. `stats`, when not null, is reset and then counts this call. Returns:
+//   0          every row landed;
+//   EINVAL     a null rows or dst, a row_size of 0, a dst shorter than n rows, a cache whose row size is not the
+//              table's, a row whose block span is wider than one IO chunk, an n_rows below 0, or a table whose end,
+//              file_offset + n_rows * row_size, does not fit a uint64_t, all refused before anything is submitted; or a
+//              row outside [0, n_rows), which stops the submitting there;
+//   EIO        the engine refused a read (no live ring, or a span wider than a slot), or a lookup threw
+//              std::system_error;
+//   ENOMEM     a lookup or a submit threw std::bad_alloc;
+//   ECANCELED  the backend shut down and cancelled a queued read: not a disk error;
+//   other      the first failed read's errno.
+// When the submitting stopped (EINVAL, EIO, ENOMEM), that code wins over any errno a delivered read stored.
 //
 // It never returns with a waiter of its own undelivered: every path that submitted anything waits until each waiter
 // the engine counted has been delivered, the error paths included, so the request, ticket and landing slot it keeps on

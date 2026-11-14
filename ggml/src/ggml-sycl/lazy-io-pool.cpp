@@ -1256,6 +1256,14 @@ size_t lazy_io_queue::submit(uint64_t                  context,
             fresh.read.reset(new lazy_io_read());
             fresh.read->span = chunk;
             fresh.read->fd   = fd;
+            // The waiter's slot is taken before the read is visible, so the push_back below cannot throw once the read
+            // is queued: a fresh read is never left queued without the waiter it was queued for.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            if (!lazy_ring_mutant_is(lazy_ring_mutant::SUBMIT_THROW_UNWOKEN))
+#endif
+            {
+                fresh.read->waiters.reserve(1);
+            }
             auto it          = s_->in_flight.emplace(chunk, std::move(fresh));
             n                = &it->second;
 
@@ -1892,15 +1900,42 @@ size_t lazy_io_submit(uint64_t               context,
     lazy_io_engine * const engine = pool->engine.get();
     size_t                 added  = 0;
     size_t                 fresh  = 0;  // the reads this call queued, each holding one of the spare leases
+
+    // One wake per new read, and none for a join, which queues nothing a worker could pick. A wake lost to a busy
+    // worker loses no read: a worker picks before it waits, so it takes what was queued while it worked. The wakes
+    // run from a destructor after the unlock, so a queue submit that throws after queuing a read, at a later chunk of
+    // a long span, still wakes a worker for it: a read left queued unwoken would wait for the next fresh read, and a
+    // waiter that joins it adds no wake.
+    struct wake_fresh {
+        lazy_io_engine * engine;
+        const size_t &   fresh;
+
+        ~wake_fresh() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            if (std::uncaught_exceptions() > 0 && lazy_ring_mutant_is(lazy_ring_mutant::SUBMIT_THROW_UNWOKEN)) {
+                return;
+            }
+#endif
+            for (size_t i = 0; i < fresh; ++i) {
+                engine->work.notify_one();
+            }
+        }
+    } wake{ engine, fresh };
+
     {
         std::lock_guard lock(engine->mutex);
+
+        // Counts the reads queued under the lock on every exit: a fresh read takes its spare lease last, after it is
+        // queued, so the spares a throw leaves behind are exactly the reads it did not queue.
+        struct count_fresh {
+            size_t &                        fresh;
+            size_t                          reads;
+            const std::vector<ring_lease> & spare;
+
+            ~count_fresh() { fresh = reads - spare.size(); }
+        } count{ fresh, reads, spare };
+
         added = engine->queue.submit(context, fd, span, key, waiter, spare);
-        fresh = reads - spare.size();
-    }
-    // One wake per new read, and none for a join, which queues nothing a worker could pick. A wake lost to a busy
-    // worker loses no read: a worker picks before it waits, so it takes what was queued while it worked.
-    for (size_t i = 0; i < fresh; ++i) {
-        engine->work.notify_one();
     }
     return added;
 }

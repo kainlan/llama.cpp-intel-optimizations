@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <new>
+#include <system_error>
 
 namespace ggml_sycl {
 
@@ -36,6 +37,20 @@ int lazy_gather_rows(lazy_row_cache *           cache,
         return 0;
     }
     if (rows == nullptr || dst == nullptr || src.row_size == 0 || dst_bytes / src.row_size < n) {
+        return EINVAL;
+    }
+    // A cache of another row size would copy past each row's place in dst, and insert a row from past the read's bytes.
+    if (cache != nullptr && cache->row_size() != src.row_size) {
+        return EINVAL;
+    }
+    // A row whose block span exceeds one chunk would be queued as several reads, each with part of the row: the waiter
+    // count would no longer be one per miss, and a part cannot be inserted into the cache as the row.
+    if (src.row_size > LAZY_IO_CHUNK_BYTES - 2 * (LAZY_IO_BLOCK_BYTES - 1)) {
+        return EINVAL;
+    }
+    // The table's end, file_offset + n_rows * row_size, must fit a uint64_t, so no row's file offset can wrap.
+    if (src.n_rows < 0 ||
+        (src.n_rows > 0 && src.row_size > (UINT64_MAX - src.file_offset) / static_cast<uint64_t>(src.n_rows))) {
         return EINVAL;
     }
     // The request, ticket and landing slot live on this frame, and no pointer to them leaves it but the waiters': the
@@ -74,8 +89,11 @@ int lazy_gather_rows(lazy_row_cache *           cache,
         }
         ++st.rows;
         uint8_t * const out = dst + i * src.row_size;
-        // A lookup takes the cache's shard lock and a submit allocates: either may throw, and this function is
-        // noexcept with reads perhaps already counted on its frame, so a throw stops the submitting and still waits.
+        // A lookup's shard lock may throw std::system_error and a submit std::bad_alloc, with reads perhaps already
+        // counted on this frame: a throw stops the submitting and still waits. The wait ends, because a submit that
+        // throws has woken a worker for every read it queued and never queues a read without the waiter it was
+        // queued for, so every counted waiter is on a read some worker will pick with no further submit. Any other
+        // exception ends the process through noexcept.
         try {
             if (cache != nullptr && cache->lookup_copy(row, out)) {
                 ++st.hits;
@@ -101,7 +119,7 @@ int lazy_gather_rows(lazy_row_cache *           cache,
             }
         } catch (const std::bad_alloc &) {
             stopped = ENOMEM;
-        } catch (...) {
+        } catch (const std::system_error &) {
             stopped = EIO;
         }
     }
