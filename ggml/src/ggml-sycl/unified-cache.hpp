@@ -1207,9 +1207,9 @@ struct placement_plan {
     size_t                       host_zone_staging_bytes  = 0;
     size_t                       host_zone_scratch_bytes  = 0;
     size_t                       max_tensor_bytes         = 0;
-    // Largest tensor that can be copied through a host zone: max_tensor_bytes, leaving out a gather-only tensor every
-    // one of whose entries stays on the host. The CPU reads such a table in place, so no staging, readback or
-    // fallback copy of it exists to hold.
+    // Largest tensor that can be copied through a host zone: max_tensor_bytes, leaving out a gather-only tensor with at
+    // least one plan entry, none on a device. The CPU reads such a table in place, so no staging, readback or fallback
+    // copy of it exists to hold. A gather-only tensor with no entry stays counted.
     size_t                       max_copied_tensor_bytes  = 0;
     size_t                       max_staging_pair_bytes   = 0;
     // th32 §4.2: the ledger's stored budget when the plan was made, the host bytes the plan commits term by term (both

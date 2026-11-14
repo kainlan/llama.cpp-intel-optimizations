@@ -2230,11 +2230,13 @@ by 32×.
 comment — an unjustified `any_tensor` reintroduces exactly the over-provision
 this exists to remove.
 
-Two consumers are deliberately left on `any_tensor`, and both comments say why:
+Two consumers stay on the model-wide class, and both comments say why:
 `moe_q8_workspace_bytes` is derived as `max_tensor_bytes / n_experts` and is
 therefore already a per-expert figure, and `s1_per_inflight_bytes` backs the S1
-preload, which streams *every* tensor including the embeddings. Narrowing that
-second one would be this bug in reverse.
+preload, which streams every tensor bound for a device, the embeddings
+included. Narrowing that second one to a per-layer maximum would be this bug in
+reverse. It leaves out only the one class the next paragraph describes, a
+gather-only table the plan keeps on the host, which S1 never streams.
 
 The host STAGING and SCRATCH zones, which hold only copies, leave out exactly
 one class: a tensor the loader marked gather-only (`get_rows_only`) that has at
