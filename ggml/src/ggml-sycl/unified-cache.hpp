@@ -523,7 +523,8 @@ struct placement_lazy_table_info {
     size_t      file_offset       = 0;
     size_t      table_bytes       = 0;
     // libllama's answer for a table that is never held whole on the host: the planner places it STORAGE whatever room
-    // the host has, and caps its row cache above its floor at min(2 GiB, the table's HOST body), index included.
+    // the host has, and caps its row cache, index included, at min(2 GiB, the table's HOST body), or at its floor when
+    // the floor alone is larger.
     bool        storage_only      = false;
 };
 

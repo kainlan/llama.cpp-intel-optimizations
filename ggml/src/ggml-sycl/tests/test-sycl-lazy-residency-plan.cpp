@@ -499,6 +499,7 @@ arm_result arm_k_storage_only_cache_cap() {
     const placement_kv_info      kv = kv_with(tables, reading);
     const placement_plan         p  = plan_for(qwen38_shape, kv, pin.pin());
     const placement_lazy_table * t  = find_table(p, tables[0].name);
+    expect(r, p.lazy_refusal.empty(), "capped: the plan refused: " + p.lazy_refusal + " " + p.lazy_refusal_detail);
     expect_storage(r, p, tables[0], kv, "capped: ");
     expect(r, t != nullptr && t->host_resident_bytes <= 2 * GiB && t->host_resident_bytes > 2 * GiB - 512 * MiB,
            "capped: the table holds " + num(t ? t->host_resident_bytes : 0) + ", want (1.5 GiB, 2 GiB]");
@@ -517,7 +518,8 @@ arm_result arm_k_storage_only_cache_cap() {
 arm_result arm_l_small_storage_only_stops_at_its_body() {
     arm_result                   r;
     const lazy_test_coverage_pin pin = ggml_sycl_test_make_coverage_pin(0);
-    placement_lazy_table_info    t   = lazy_table("blk.1.small.weight", GGML_TYPE_Q8_0, 32, (64 * MiB) / 34, 1, 1);
+    const size_t                 row = ggml_row_size(GGML_TYPE_Q8_0, 32);
+    placement_lazy_table_info    t   = lazy_table("blk.1.small.weight", GGML_TYPE_Q8_0, 32, (64 * MiB) / row, 1, 1);
     t.storage_only                   = true;
     const std::vector<placement_lazy_table_info> tables = { t };
     const size_t                                 rows   = t.table_bytes / t.row_size;
@@ -535,7 +537,9 @@ arm_result arm_l_small_storage_only_stops_at_its_body() {
     const placement_kv_info      kv      = kv_with(tables, reading);
     const placement_plan         p       = plan_for(qwen38_shape, kv, pin.pin());
     const placement_lazy_table * got     = find_table(p, t.name);
-    expect(r, got != nullptr && got->residency == lazy_residency::STORAGE, "the small table is not STORAGE");
+    expect(r, p.lazy_refusal.empty(), "the plan refused: " + p.lazy_refusal + " " + p.lazy_refusal_detail);
+    expect(r, got != nullptr && got->residency == lazy_residency::STORAGE,
+           std::string("the small table is ") + (got ? residency_name(got->residency) : "absent") + ", want STORAGE");
     expect(r,
            got != nullptr && got->host_resident_bytes <= host_body(t) && got->host_resident_bytes > host_body(t) / 2 &&
                got->host_resident_bytes >= floor_raw_bytes(t, kv),
