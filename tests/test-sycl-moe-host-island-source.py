@@ -27,14 +27,16 @@ smart-handle refusal.
   P4  the per-row destination list scatter_dst_offsets is gone;
   P5  the activation block is sized from the plan's distinct rows (island.n_act_rows), not from the row count;
   P6  each CPU task reads the activation block row and writes the result block row the plan assigned to it, indexed
-      by the task loop's one row counter flat_row: act_index for the activation, out_index for the result;
+      by the task loop's one row counter flat_row: act_index for the activation, out_index for the result. Nothing
+      writes flat_row but its declaration from 0 and its one `++flat_row;`;
   P7  the plan's rows and the task loop walk the groups in the same order, since act_index and out_index are indexed
       by position: island_rows is built, before the plan call, by one forward loop over groups and their rows, with
       the row's (iid1, id) binding, its i11, and its src1 and dst offsets exactly as the per-row copies computed them;
       the task loop walks groups forward and each group's rows forward by index. Between the two loops nothing
       reorders the groups or their rows: groups appears only in its const weight-check loop and in size(), and there
-      is no sort, reverse, swap, shuffle, rotate, partition, erase, insert or assignment to rows. The task loop has
-      no continue, break, return or goto, and `++flat_row;` is the last statement of its row loop.
+      is no sort, reverse, swap, shuffle, rotate, partition, erase, insert, pop, clear, resize, assign or assignment
+      to rows. Inside the task loop none of those appear either. The task loop has no continue, break, return or
+      goto, its row loop's body never writes ri, and `++flat_row;` is the last statement of its row loop.
 
 Checks run on comment-blanked text with whitespace collapsed, so a clang-format re-wrap moves no claim.
 
@@ -88,11 +90,18 @@ TASK_LOOP = "for (pp_host_expert_group & group : groups) {"
 TASK_ROWS_LOOP = "for (size_t ri = 0; ri < group.rows.size(); ++ri) {"
 # The only loop over groups allowed between the two: it checks each group's weight and cannot reorder anything.
 GROUPS_READ_LOOP = "for (const pp_host_expert_group & group : groups) {"
-# What could reorder the groups or a group's rows.
+# What could reorder, shorten or refill the groups or a group's rows. Checked between the two loops and inside the task
+# loop: the plan indexes rows by their position at plan time, so neither may move or drop one.
 REORDER_RE = re.compile(
-    r"\bstd::(?:sort|stable_sort|reverse|swap|shuffle|rotate|partition|stable_partition)\b|\.(?:erase|insert|swap)\("
-    r"|\brows\s*=(?!=)"
+    r"\bstd::(?:sort|stable_sort|reverse|swap|shuffle|rotate|partition|stable_partition)\b"
+    r"|\.(?:erase|insert|swap|pop_back|pop_front|clear|resize|assign)\(|\brows\s*=(?!=)"
 )
+
+
+def writes_to(name: str, code: str) -> list[str]:
+    """Every write to the variable `name`: ++/-- on either side, plain or compound assignment."""
+    return re.findall(r"(?:\+\+|--)\s*\b" + name + r"\b|\b" + name + r"\b\s*(?:\+\+|--|(?:[-+*/%&|^]|<<|>>)?=(?!=))",
+                      code)
 
 
 def code_only(text: str) -> str:
@@ -221,6 +230,13 @@ def check(backend_src: str) -> None:
         raise ContractError(
             "FAIL [pin P6]: flat_row is not the task loop's one row counter (declared once from 0, advanced once)"
         )
+    # Any other write (a compound assignment, a decrement, a reassignment) would make flat_row skip or revisit rows.
+    flat_row_writes = writes_to("flat_row", code_only(body))
+    if sorted(w.replace(" ", "") for w in flat_row_writes) != ["++flat_row", "flat_row="]:
+        raise ContractError(
+            "FAIL [pin P6]: flat_row is written other than by its declaration and its one `++flat_row;` "
+            f"({', '.join(flat_row_writes)})"
+        )
 
     rows_at = body.find(ISLAND_ROWS_LOOP)
     if body.count(ISLAND_ROWS_LOOP) != 1 or any(body.count(part) != 1 for part in ISLAND_ROWS_PARTS):
@@ -257,6 +273,16 @@ def check(backend_src: str) -> None:
         raise ContractError(
             "FAIL [pin P7]: the task loop can leave a row without advancing flat_row (a continue, break, return or "
             "goto, or `++flat_row;` not the last statement of the row loop)"
+        )
+    # Inside the task loop the groups and their rows must stay as the plan saw them, and the row loop's index is
+    # advanced only by its header, or a row would be skipped while flat_row still counts it.
+    task_reorder = REORDER_RE.search(code_only(task_block))
+    ri_writes = writes_to("ri", code_only(rows_block))
+    if task_reorder or ri_writes:
+        what = task_reorder.group(0) if task_reorder else ", ".join(ri_writes)
+        raise ContractError(
+            f"FAIL [pin P7]: the task loop moves, drops or skips rows ({what.strip()}), so its flat_row may not be the "
+            "plan's row"
         )
 
 
@@ -371,6 +397,18 @@ def self_test(backend_src: str) -> int:
                 "std::vector<cpu_expert_task> tasks;")
     expect_fail("task-row-loop-skips-a-row", "P7", "for (size_t ri = 0; ri < group.rows.size(); ++ri) {",
                 "for (size_t ri = 0; ri < group.rows.size(); ++ri) { if (group.rows[ri].second < 0) { continue; }")
+    # Inside the task loop: rows moved or dropped, a group dropped, the row index advanced by the body.
+    expect_fail("task-row-loop-sorts-rows", "P7", "cpu_expert_task task;",
+                "std::sort(group.rows.begin(), group.rows.end()); cpu_expert_task task;")
+    expect_fail("task-row-loop-pops-a-row", "P7", "cpu_expert_task task;", "group.rows.pop_back(); cpu_expert_task task;")
+    expect_fail("task-loop-pops-a-group", "P7", "task.weight_lease = std::move(group.weight_lease);",
+                "task.weight_lease = std::move(group.weight_lease); groups.pop_back();")
+    expect_fail("task-row-index-advanced-in-body", "P7", "cpu_expert_task task;", "++ri; cpu_expert_task task;")
+    # Writes to flat_row other than its declaration and its one increment.
+    expect_fail("flat-row-compound-add", "P6", "++flat_row;", "flat_row += 2; ++flat_row;")
+    expect_fail("flat-row-reassigned", "P6", "cpu_expert_task task;", "flat_row = ri; cpu_expert_task task;")
+    expect_fail("flat-row-decremented", "P6", "cpu_expert_task task;", "--flat_row; cpu_expert_task task;")
+    expect_fail("flat-row-postfix-increment", "P6", "++flat_row;", "flat_row++;")
     expect_fail("flat-row-not-the-last-statement", "P7",
                 "tasks.push_back(std::move(task));\n                    ++flat_row;",
                 "++flat_row;\n                    tasks.push_back(std::move(task));")
