@@ -13,11 +13,13 @@
 //   - value(name) equals the weight's (file, offset, size);
 //   - with the taker, the early plan's filter includes an ineligible row (AUTO at
 //     4 GiB, OFF) as the ordinary weight it is. Under AUTO the 5 GiB table would be
-//     STORAGE, but this tree has no STORAGE consumer, so the default mode records it
-//     ineligible and EAGER, the filter includes it too, and one WARN names it;
+//     STORAGE, but an arch with no STORAGE consumer records it ineligible and EAGER,
+//     the filter includes it too, and one WARN names it;
 //   - create_tensor()'s STORAGE refusal throws, naming the tensor, on a STORAGE row
-//     and on that row alone: a LAZY_READ and an EAGER row pass it. With the taker,
-//     only ON (the storage tier asked for by name) makes the 5 GiB table STORAGE.
+//     of an arch with no consumer and on that row alone: a LAZY_READ and an EAGER row
+//     pass it. With the taker, ON (the storage tier asked for by name) makes the 5 GiB
+//     table STORAGE for every arch, and AUTO does for an arch with a consumer;
+//   - both arches that declare the PLE table, qwen4exp and gemma4, run the last two.
 //
 // Host-only: no backend, device or model.
 
