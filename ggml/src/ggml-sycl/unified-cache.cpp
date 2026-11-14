@@ -34754,10 +34754,11 @@ static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_la
 // storage_only table has no HOST test to fall back on, so it refuses. After the pass the block ring is sized over the
 // STORAGE tables and charged unless the live ring holds it; the floors and the ring must fit both the budget
 // and P3, or the plan refuses as lazy-table-cache-below-floor. What both leave above that is the STORAGE caches'
-// yieldable share (§6.4), split in proportion to table_bytes x rows_per_token. The live ring is read through the pin by
-// lazy_ring_coverage_read, which counts each read (§10): one per table for eligibility, one for the need and one for
-// the charge. A cold expert class refuses as cold-set-not-implemented. A refused plan carries no table and no ring, and
-// host_planned_bytes is then the zone total.
+// yieldable share (§6.4), split in proportion to table_bytes x rows_per_token. A storage_only table's cache stops at
+// min(2 GiB, its HOST body), its floor aside, and the room that leaves unused is not handed to another table. The live
+// ring is read through the pin by lazy_ring_coverage_read, which counts each read (§10): one per table for
+// eligibility, one for the need and one for the charge. A cold expert class refuses as cold-set-not-implemented. A
+// refused plan carries no table and no ring, and host_planned_bytes is then the zone total.
 static void placement_plan_decide_lazy_residency(placement_plan &          plan,
                                                  const placement_kv_info & kv_info,
                                                  const ring_lease *        coverage_pin) {
@@ -34768,6 +34769,8 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
 
     constexpr size_t reserve_floor = 2ull << 30;          // step 3: host_reserve's floor
     constexpr size_t reserve_pct   = 1;                   // step 3: host_reserve's share of the budget, in percent
+
+    constexpr size_t storage_only_cache_cap = 2ull << 30;  // a storage-only table's row cache, index included
     plan.lazy_tables.clear();
     plan.lazy_refusal.clear();
     plan.lazy_refusal_detail.clear();
@@ -34918,7 +34921,15 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
             share                                   = std::min(share, avail - given);
             const size_t rows                       = info.row_size != 0 ? info.table_bytes / info.row_size : 0;
             const size_t floor_res                  = t.host_resident_bytes;
-            t.cache_slots = lazy_row_cache_slots_within(t.cache_floor_slots, rows, info.row_size, floor_res + share);
+            size_t       target                     = floor_res + share;
+            if (info.storage_only) {
+                // A table that is never held whole gets at most 2 GiB of cache, and never more than holding the table
+                // whole (its HOST body) would cost. The floor still holds when it alone exceeds that ceiling.
+                const size_t body =
+                    host_cpu_mapped_size(lazy_table_host_body_request_bytes(info.file_offset, info.table_bytes));
+                target = std::min(target, std::max(floor_res, std::min(storage_only_cache_cap, body)));
+            }
+            t.cache_slots         = lazy_row_cache_slots_within(t.cache_floor_slots, rows, info.row_size, target);
             t.host_resident_bytes = lazy_row_cache_resident_bytes(t.cache_slots, info.row_size);
             given += t.host_resident_bytes - floor_res;
         }
