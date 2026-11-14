@@ -174,9 +174,9 @@ void llama_lazy_range_record_prefill(llama_lazy_range_record &        record,
                 eligible = false;
                 LLAMA_LOG_WARN(
                     "%s: tensor %s (size = %zu MiB) is loaded as an ordinary weight (read in full, placed by the "
-                    "plan): this build has no storage tier for a SYCL-owned table, so -lzm on, which asks for it, "
-                    "fails the load\n",
-                    __func__, name.c_str(), src.size / 1024 / 1024);
+                    "plan): the graph of arch %s does not read it from the storage tier, so -lzm on, which asks for "
+                    "that tier, fails the load\n",
+                    __func__, name.c_str(), src.size / 1024 / 1024, llm_arch_name(arch));
             }
 
             // add()'s old warning, moved here: a table that would have been lazy,
@@ -227,15 +227,15 @@ void llama_lazy_range_check_create(const llama_lazy_range_record & record,
     }
 }
 
-// Whether `arch`'s graph consumes a STORAGE row. None does yet: llama_lazy_range_check_storage() below refuses a
-// STORAGE row for an arch without one, and the pre-fill does not make one from the default mode (AUTO). An arch
-// gains its consumer by returning true here, which moves the `consumer` flag of
-// tests/test-llama-lazy-range-prefill.cpp. Once every arch has one, this function goes, and with it the bridge in
-// the pre-fill and the refusal below; the pin test_the_auto_bridge_lives_exactly_as_long_as_the_refusal in
-// tests/test-llama-lazy-range-record-source.py holds those three together.
+// Whether `arch`'s graph consumes a STORAGE row. qwen4exp's does: its PLE input gathers the table's rows from the
+// storage tier in set_input (src/models/qwen4exp.cpp). For every other arch llama_lazy_range_check_storage() below
+// refuses a STORAGE row, and the pre-fill does not make one from the default mode (AUTO). An arch gains its consumer
+// by answering true here, which moves the `consumer` flag of tests/test-llama-lazy-range-prefill.cpp. Once every
+// arch has one, this function goes, and with it the bridge in the pre-fill and the refusal below; the pin
+// test_the_auto_bridge_lives_exactly_as_long_as_the_refusal in tests/test-llama-lazy-range-record-source.py holds
+// those three together.
 static bool llama_lazy_storage_consumer_present(enum llm_arch arch) {
-    GGML_UNUSED(arch);
-    return false;
+    return arch == LLM_ARCH_QWEN4EXP;
 }
 
 std::vector<llama_lazy_storage_table> llama_lazy_range_storage_tables(const llama_lazy_range_record &    record,

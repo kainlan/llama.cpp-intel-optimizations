@@ -39,7 +39,7 @@ Windows) or that a rebase of upstream code would silently restore:
    prefix lock grow_to (which locks contiguously from the mapping's base, so a tensor after a lazy range locks the range
    too and faults all of it in).
 
-9. while the tree has no STORAGE consumer, the pre-fill records the taker's AUTO row ineligible (the default mode must
+9. for an arch with no STORAGE consumer, the pre-fill records the taker's AUTO row ineligible (the default mode must
    load), through exactly one condition; that bridge and the STORAGE refusal are added and deleted together.
 
 10. qwen4exp is the one arch with a STORAGE consumer: its PLE graph input takes an F32 tensor that set_input() gathers
@@ -456,6 +456,20 @@ def if_block(code: str, m: re.Match):
     return cond, block, open_brace + len(block) + 2
 
 
+def drop_lambda_bodies(code: str) -> str:
+    """`code` with the body of every lambda emptied, so a statement search sees only the enclosing function's own."""
+    out, pos = [], 0
+    lam = re.compile(r"\[[^\]\[]*\]\s*\((?:[^()]|\([^()]*\))*\)\s*(?:->\s*[\w:]+\s*)?\{")
+    while True:
+        m = lam.search(code, pos)
+        if not m:
+            out.append(code[pos:])
+            return "".join(out)
+        body = balanced(code, m.end() - 1)
+        out.append(code[pos:m.end()])
+        pos = m.end() + len(body)
+
+
 def qwen4exp_ple_class() -> str:
     code = read_code(QWEN4EXP_CPP)
     m = re.search(r"class\s+llm_graph_input_ple\s*:\s*public\s+llm_graph_input_i\s*\{", code)
@@ -537,7 +551,9 @@ def test_qwen4exp_ple_set_input_clears_its_flag_and_fails_every_early_return():
             break
     assert resident, "set_input does not dispatch on whether the table is STORAGE"
     i_if, (_, eager, past) = resident
-    assert not re.search(r"\breturn\b", body[:i_if]), "set_input returns before either path sets its input"
+    # a lambda's return leaves the lambda, not set_input
+    assert not re.search(r"\breturn\b", drop_lambda_bodies(body[:i_if])), (
+        "set_input returns before either path sets its input")
     assert "ggml_backend_tensor_set(" in eager and re.search(r"\breturn\b", eager), (
         "the resident path sets the row ids and returns")
     assert not re.search(fail, eager), "the resident path never reports a failure"

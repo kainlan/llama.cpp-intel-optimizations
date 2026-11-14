@@ -1,10 +1,13 @@
 #include "models.h"
 #include "llama-impl.h"
+#include "llama-lazy-storage.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstring>
+#include <exception>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -1178,10 +1181,20 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+        const int64_t n = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+        // exactly one of the two inputs exists, the one build_inp_ple built for the table's residency
+        return emb != nullptr ? emb->ne[1] == n : rows->ne[0] == n;
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    bool set_input_failed() const override { return failed; }
+
+    ggml_tensor * rows = nullptr;  // I32 [ple_n_heads * n_tokens]; null when the table is STORAGE
+    // F32 [ple_head_dim, ple_n_heads * n_tokens], only when the table is STORAGE: the rows this ubatch reads, gathered
+    // from the storage tier and dequantized on the host, in the order get_rows would produce them
+    ggml_tensor * emb  = nullptr;
+
+    const llama_lazy_storage * storage = nullptr;  // the STORAGE table, or null when the table is resident
+    bool                       failed  = false;    // the last set_input() could not produce the rows
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1190,9 +1203,14 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<uint8_t>     raw;  // the gathered rows, in the table's type
+    std::vector<float>       deq;  // the same rows as f32
 };
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+    // a reused graph calls set_input() again on this input, so the last ubatch's failure must not outlive this call
+    failed = false;
+
     const auto & hp = pmodel.hparams;
 
     // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
@@ -1252,7 +1270,43 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    if (storage == nullptr) {
+        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size() * ggml_element_size(rows));
+        return;
+    }
+
+    // STORAGE: the rows come from the storage tier (hits from its row cache, misses read from the file and waited for
+    // here) and are dequantized to f32 on the host, so the graph receives the values the eager get_rows computes in
+    // f32, whichever backend runs the graph. A failure is reported through set_input_failed(), never thrown.
+    failed = true;  // until every step below has succeeded
+
+    const ggml_type_traits * tt = ggml_get_type_traits(storage->type());
+    const size_t             n  = idx.size();
+    if (tt->to_float == nullptr) {
+        LLAMA_LOG_ERROR("%s: the PLE table's type %s has no f32 conversion\n", __func__,
+                        ggml_type_name(storage->type()));
+        return;
+    }
+    try {
+        raw.resize(n * storage->row_size());
+        deq.resize(n * (size_t) storage->ne0());
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: no host memory for %zu PLE rows: %s\n", __func__, n, e.what());
+        return;
+    }
+    // a table that was never opened answers ENODEV and fails the ubatch: a load that finishes has opened it, so that
+    // is reachable only on a model loaded without allocations, which is measured and not computed
+    const int rc = storage->gather(idx.data(), n, raw.data(), raw.size());
+    if (rc != 0) {
+        LLAMA_LOG_ERROR("%s: reading %zu PLE rows of %s failed: %s\n", __func__, n, storage->name().c_str(),
+                        strerror(rc));
+        return;
+    }
+    // one call over every row: a row is whole blocks (ne0 is a multiple of the block size, which the backend's open
+    // refuses otherwise), so the gathered rows are one contiguous run of blocks
+    tt->to_float(raw.data(), deq.data(), (int64_t) deq.size());
+    ggml_backend_tensor_set(emb, deq.data(), 0, deq.size() * sizeof(float));
+    failed = false;
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1319,13 +1373,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
-
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb = nullptr;
+    if (const llama_lazy_storage * storage = model.lazy_storage(ggml_get_name(model.per_layer_tok_embd))) {
+        // the table is never resident: set_input gathers this ubatch's rows and dequantizes them on the host, so the
+        // graph takes them as an F32 input where the get_rows result was, with no table and no row ids
+        // (the loader's shape check made the tensor's ne0 ple_head_dim, and the handle's geometry is that tensor's)
+        GGML_ASSERT(storage->ne0() == hparams.ple_head_dim);
+        ple_inp->storage = storage;
+        ple_inp->emb     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, storage->ne0(), n_heads * n_tokens);
+        ggml_set_input(ple_inp->emb);
+        emb = ple_inp->emb;
+        res->add_input(std::move(ple_inp));
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
+        res->add_input(std::move(ple_inp));
+        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

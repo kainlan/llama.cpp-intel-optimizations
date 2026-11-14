@@ -19,7 +19,8 @@
 //     of an arch with no consumer and on that row alone: a LAZY_READ and an EAGER row
 //     pass it. With the taker, ON (the storage tier asked for by name) makes the 5 GiB
 //     table STORAGE for every arch, and AUTO does for an arch with a consumer;
-//   - both arches that declare the PLE table, qwen4exp and gemma4, run the last two.
+//   - both arches that declare the PLE table run the last two: qwen4exp, whose graph
+//     is a STORAGE consumer, and gemma4, whose graph is not.
 //
 // Host-only: no backend, device or model.
 
