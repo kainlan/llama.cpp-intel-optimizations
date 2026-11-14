@@ -31,7 +31,10 @@ smart-handle refusal.
   P7  the plan's rows and the task loop walk the groups in the same order, since act_index and out_index are indexed
       by position: island_rows is built, before the plan call, by one forward loop over groups and their rows, with
       the row's (iid1, id) binding, its i11, and its src1 and dst offsets exactly as the per-row copies computed them;
-      the task loop walks groups forward and each group's rows forward by index.
+      the task loop walks groups forward and each group's rows forward by index. Between the two loops nothing
+      reorders the groups or their rows: groups appears only in its const weight-check loop and in size(), and there
+      is no sort, reverse, swap, shuffle, rotate, partition, erase, insert or assignment to rows. The task loop has
+      no continue, break, return or goto, and `++flat_row;` is the last statement of its row loop.
 
 Checks run on comment-blanked text with whitespace collapsed, so a clang-format re-wrap moves no claim.
 
@@ -83,6 +86,18 @@ ISLAND_ROWS_PARTS = (
 )
 TASK_LOOP = "for (pp_host_expert_group & group : groups) {"
 TASK_ROWS_LOOP = "for (size_t ri = 0; ri < group.rows.size(); ++ri) {"
+# The only loop over groups allowed between the two: it checks each group's weight and cannot reorder anything.
+GROUPS_READ_LOOP = "for (const pp_host_expert_group & group : groups) {"
+# What could reorder the groups or a group's rows.
+REORDER_RE = re.compile(
+    r"\bstd::(?:sort|stable_sort|reverse|swap|shuffle|rotate|partition|stable_partition)\b|\.(?:erase|insert|swap)\("
+    r"|\brows\s*=(?!=)"
+)
+
+
+def code_only(text: str) -> str:
+    """String literals blanked, so a message's text cannot satisfy or trip a check on code."""
+    return re.sub(r"\"(?:\\.|[^\"\\])*\"", '""', text)
 
 
 class ContractError(AssertionError):
@@ -223,6 +238,27 @@ def check(backend_src: str) -> None:
             f"by index (`{TASK_ROWS_LOOP}`), once each, so its flat_row may not be the plan's row"
         )
 
+    # Between the two loops nothing may reorder the groups or their rows. String literals are blanked so an abort's
+    # message cannot satisfy or trip this.
+    between = code_only(body[rows_at + len(ISLAND_ROWS_LOOP):task_at])
+    rest = between.replace(GROUPS_READ_LOOP, "").replace("groups.size()", "")
+    reorder = REORDER_RE.search(between)
+    if re.search(r"\bgroups\b", rest) or reorder:
+        what = reorder.group(0) if reorder else "a use of groups other than its const weight-check loop and size()"
+        raise ContractError(
+            f"FAIL [pin P7]: between the island_rows loop and the task loop the groups or their rows may be reordered "
+            f"({what.strip()}), so the task loop's flat_row may not be the plan's row"
+        )
+
+    # The task loop visits every row, and advances flat_row as the last statement of each.
+    task_block = brace_block_from(body, task_at)
+    rows_block = brace_block_from(task_block, task_block.find(TASK_ROWS_LOOP))
+    if re.search(r"\b(continue|break|return|goto)\b", code_only(task_block)) or not rows_block.endswith("++flat_row; }"):
+        raise ContractError(
+            "FAIL [pin P7]: the task loop can leave a row without advancing flat_row (a continue, break, return or "
+            "goto, or `++flat_row;` not the last statement of the row loop)"
+        )
+
 
 def self_test(backend_src: str) -> int:
     failures: list[str] = []
@@ -324,6 +360,20 @@ def self_test(backend_src: str) -> int:
                 "for (pp_host_expert_group & group : reversed(groups)) {")
     expect_fail("task-loop-rows-reversed", "P7", "for (size_t ri = 0; ri < group.rows.size(); ++ri) {",
                 "for (size_t ri = group.rows.size(); ri-- > 0;) {")
+    # Reorderings between the two loops, and a task row loop that skips a row: each leaves both loops' text intact
+    # but makes flat_row name another row than the plan's.
+    expect_fail("groups-sorted-between-loops", "P7", "std::vector<cpu_expert_task> tasks;",
+                "std::sort(groups.begin(), groups.end(), [](const pp_host_expert_group & a, "
+                "const pp_host_expert_group & b) { return a.expert_id < b.expert_id; }); "
+                "std::vector<cpu_expert_task> tasks;")
+    expect_fail("group-rows-reversed-between-loops", "P7", "std::vector<cpu_expert_task> tasks;",
+                "for (pp_host_expert_group & g : groups) { std::reverse(g.rows.begin(), g.rows.end()); } "
+                "std::vector<cpu_expert_task> tasks;")
+    expect_fail("task-row-loop-skips-a-row", "P7", "for (size_t ri = 0; ri < group.rows.size(); ++ri) {",
+                "for (size_t ri = 0; ri < group.rows.size(); ++ri) { if (group.rows[ri].second < 0) { continue; }")
+    expect_fail("flat-row-not-the-last-statement", "P7",
+                "tasks.push_back(std::move(task));\n                    ++flat_row;",
+                "++flat_row;\n                    tasks.push_back(std::move(task));")
 
     # The NOT APPLIED report must fire on an anchor the lambda does not hold, or a stale mutant would pass unseen.
     try:
