@@ -55,6 +55,7 @@ LOADER_CPP = ROOT / "src/llama-model-loader.cpp"
 MODEL_CPP = ROOT / "src/llama-model.cpp"
 RECORD_CPP = ROOT / "src/llama-lazy-range-record.cpp"
 RECORD_H = ROOT / "src/llama-lazy-range-record.h"
+SAVER_CPP = ROOT / "src/llama-model-saver.cpp"
 
 _LEXEME_RE = re.compile(
     r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
@@ -405,3 +406,29 @@ def test_the_lazy_table_owner_cannot_be_copied():
                      body), "the owner's copy constructor is not deleted"
     assert re.search(r"operator\s*=\s*\(\s*const\s+llama_model_sycl_lazy_tables\s*&\s*\)\s*=\s*delete", body), (
         "the owner's copy assignment is not deleted")
+
+
+def test_the_saver_refuses_a_storage_table_before_it_touches_the_gguf_context():
+    # a STORAGE table has no data in memory: saving it would write a tensor without data, so add_tensor must stop on it
+    # with an abort that names the tensor, ahead of both the duplicate lookup and the add
+    # and after the null-tensor early return, because the saver passes null tensors
+    body = function_body(read_code(SAVER_CPP), r"void\s+llama_model_saver::add_tensor\s*\((?:[^()]|\([^()]*\))*\)")
+    i_find = body.find("gguf_find_tensor(")
+    i_add = body.find("gguf_add_tensor(")
+    assert 0 <= i_find < i_add, "add_tensor must look the tensor up and then add it"
+    guards = []
+    for m in re.finditer(r"\bif\s*\(", body):
+        cond = balanced(body, m.end() - 1, "(", ")")
+        brace = re.match(r"\s*\{", body[m.end() + len(cond) + 1:])
+        if "lazy_storage(" not in cond or not brace:
+            continue
+        block = balanced(body, m.end() + len(cond) + 1 + brace.end() - 1)
+        abort = re.search(r"\bGGML_ABORT\s*\(", block)
+        if abort and "%s" in balanced(block, abort.end() - 1, "(", ")"):
+            guards.append(m.start())
+    assert guards, "add_tensor has no `if` on lazy_storage( whose own block aborts with a message naming the tensor"
+    assert guards[0] < i_find, "the STORAGE refusal must come before gguf_find_tensor, which can return early"
+    null_check = re.search(r"\bif\s*\(\s*!\s*tensor\s*\)", body)
+    assert null_check, "add_tensor has no `if (!tensor)` early return"
+    assert null_check.start() < guards[0], (
+        "the STORAGE refusal must follow the null-tensor check, because the saver passes null tensors")
