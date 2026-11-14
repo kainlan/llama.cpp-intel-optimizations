@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <utility>
 
@@ -50,6 +51,45 @@ int llama_lazy_storage::gather(const int32_t * rows, size_t n, void * dst, size_
         return ENODEV;
     }
     return procs_.gather(handle_, rows, n, dst, dst_bytes);
+}
+
+bool llama_lazy_storage::can_gather_f32() const {
+    // F32 has no to_float, and needs none: an F32 table's rows already are the values
+    return table_.type == GGML_TYPE_F32 || ggml_get_type_traits(table_.type)->to_float != nullptr;
+}
+
+// The conversion is the type's own to_float, the one the CPU backend's get_rows applies. The SYCL get_rows multiplies
+// in half precision when the build has GGML_SYCL_F16, so against a resident table whose get_rows ran there the values
+// can differ in the last bits.
+int llama_lazy_storage::gather_f32(const int32_t *        rows,
+                                   size_t                 n,
+                                   std::vector<uint8_t> & raw,
+                                   std::vector<float> &   out) const {
+    if (!can_gather_f32()) {
+        return ENOTSUP;
+    }
+    const bool is_f32 = table_.type == GGML_TYPE_F32;
+    // a vector that shrinks keeps its capacity, so once the scratch has held the largest call no call allocates
+    try {
+        out.resize(n * (size_t) ne0());
+        if (!is_f32) {
+            raw.resize(n * row_size());
+        }
+    } catch (const std::exception &) {
+        return ENOMEM;
+    }
+    if (is_f32) {
+        // an F32 row is ne0 floats, so the rows land in `out` as they are
+        return gather(rows, n, out.data(), out.size() * sizeof(float));
+    }
+    const int rc = gather(rows, n, raw.data(), raw.size());
+    if (rc != 0) {
+        return rc;
+    }
+    // one call over every row: a row is whole blocks (ne0 is a multiple of the block size, as in every ggml row of a
+    // block type, and the backend's open refuses a table otherwise), so the gathered rows are one run of blocks
+    ggml_get_type_traits(table_.type)->to_float(raw.data(), out.data(), (int64_t) out.size());
+    return 0;
 }
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
