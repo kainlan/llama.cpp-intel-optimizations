@@ -39,6 +39,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -133,6 +135,20 @@ lazy_io_span block_span(uint64_t block) {
 
 lazy_io_key key0(uint32_t epoch, int32_t layer) {
     return { lazy_io_class::PREFETCH, epoch, layer, lazy_io_kind::TABLE_ROWS };
+}
+
+// Runs `fn` on its own thread and waits at most `seconds`: a call that does not return fails its arm instead of hanging
+// the binary, so a mutant registration still sees its own message. `fn` must own everything it touches (capture a
+// shared_ptr by value): a call that never returns is detached and outlives the arm.
+bool returns_within(std::function<int()> fn, int seconds, int & rc) {
+    auto             task = std::make_shared<std::packaged_task<int()>>(std::move(fn));
+    std::future<int> done = task->get_future();
+    std::thread([task] { (*task)(); }).detach();
+    if (done.wait_for(std::chrono::seconds(seconds)) != std::future_status::ready) {
+        return false;
+    }
+    rc = done.get();
+    return true;
 }
 
 // One STORAGE request's ticket and landing slot at `epoch`, for one waiter of `bytes` from `src_offset` in its read.
@@ -1255,6 +1271,46 @@ arm_result arm_engine_worker_drop() {
     return r;
 }
 
+// A ticket's wait returns once its three reads are delivered, every row landed and no error; a ticket with nothing
+// submitted returns at once; a failed read returns its errno. Every wait is bounded.
+arm_result arm_ticket_wait() {
+    arm_result r;
+    ring_lease lease = lazy_io_pool_take();
+    if (block_ring_ensure(k_need, k_span, 0, mapped(k_need), k_txn) != lazy_ring_ensure_status::OK) {
+        expect(r, false, "the ring was not ensured");
+        settle(lease);
+        return r;
+    }
+    ggml_sycl_test_lazy_io_read_source(fill_source, nullptr);
+    int rc = -1;
+    {
+        auto idle = std::make_shared<request_fixture>(1);
+        expect(r, returns_within([idle] { return lazy_io_ticket_wait(idle->ticket); }, 5, rc) && rc == 0,
+               "an empty ticket's wait did not return 0 within 5 s");
+    }
+    auto   f     = std::make_shared<request_fixture>(2);
+    size_t added = 0;
+    for (uint64_t b = 0; b < 3; ++b) {
+        lazy_io_waiter w = f->waiter(0, 100);
+        w.landing_offset = b * 100;
+        added += lazy_io_submit(1, -1, block_span(10 + b), key0(2, 0), w);
+    }
+    expect(r, added == 3 && returns_within([f] { return lazy_io_ticket_wait(f->ticket); }, 5, rc) && rc == 0,
+           "added " + num(added) + ", the wait returned " + num(rc) + " or did not return within 5 s");
+    for (uint64_t b = 0; b < 3; ++b) {
+        expect(r, f->slab[b * 100] == file_byte((10 + b) * LAZY_IO_BLOCK_BYTES), "row " + num(b) + " did not land");
+    }
+    static uint64_t bad = 20 * LAZY_IO_BLOCK_BYTES;
+    auto            e   = std::make_shared<request_fixture>(3);
+    ggml_sycl_test_lazy_io_read_source(eio_source, &bad);
+    (void) lazy_io_submit(1, -1, block_span(20), key0(3, 0), e->waiter(0, 100));
+    expect(r, returns_within([e] { return lazy_io_ticket_wait(e->ticket); }, 5, rc) && rc == EIO,
+           "a failed read's wait did not return EIO within 5 s");
+    ggml_sycl_test_lazy_io_read_source(nullptr, nullptr);
+    expect(r, settle(lease) && live_charged() == 0, "the reap left " + num(live_charged()) + " B charged, want 0");
+    return r;
+}
+
 lazy_ring_mutant mutant_named(const char * text) {
     struct entry {
         const char *     text;
@@ -1344,6 +1400,7 @@ int main(int argc, char ** argv) {
         { "a lease dropped under a held lock aborts under strict leases",               arm_strict_dropped           },
         { "a reap finding a parked pool with a lease aborts under strict leases",       arm_strict_parked            },
         { "a reap whose first step throws aborts under strict leases",                  arm_strict_failed            },
+        { "a ticket's wait returns when its reads are delivered",                       arm_ticket_wait              },
         // Last: the shut-down flag is never cleared.
         { "ensure refuses after shut-down and frees the reserver's ring",               arm_ensure_shut_down         },
     };
