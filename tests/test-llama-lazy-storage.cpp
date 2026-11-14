@@ -185,22 +185,36 @@ static void check_handle() {
     {
         llama_lazy_storage s(table, k_path, llama_lazy_storage_procs{});
         CHECK(!s.open(make_token()), "an open with no procs returned true");
-        CHECK(g_log.find("no backend") != std::string::npos, "an open with no procs did not WARN");
+        CHECK(count_log("no backend") == 1, "an open with no procs did not WARN exactly once");
         CHECK(s.gather(rows, 2, dst, sizeof(dst)) == ENODEV, "a gather with no procs did not return ENODEV");
     }
     llama_log_set(nullptr, nullptr);
 
-    // One proc missing: a handle that could not be closed must never exist.
-    log_capture();
-    {
-        llama_lazy_storage_procs partial = procs;
-        partial.close                    = nullptr;
-        llama_lazy_storage s(table, k_path, partial);
-        CHECK(!s.open(make_token()), "an open with no close proc returned true");
-        CHECK(g_opened == 0, "an open with no close proc reached the backend");
+    // One proc missing, each of the four in turn: a handle that could not be read, counted or closed must never exist.
+    const char * const names[4] = { "open", "gather", "counters", "close" };
+    for (int missing = 0; missing < 4; ++missing) {
+        log_capture();
+        {
+            llama_lazy_storage_procs partial = procs;
+            if (missing == 0) {
+                partial.open = nullptr;
+            } else if (missing == 1) {
+                partial.gather = nullptr;
+            } else if (missing == 2) {
+                partial.counters = nullptr;
+            } else {
+                partial.close = nullptr;
+            }
+            llama_lazy_storage s(table, k_path, partial);
+            CHECK(!s.open(make_token()), "an open with no %s proc returned true", names[missing]);
+            CHECK(g_opened == 0, "an open with no %s proc reached the backend", names[missing]);
+            CHECK(count_log("no backend") == 1, "an open with no %s proc did not WARN exactly once", names[missing]);
+            CHECK(s.gather(rows, 2, dst, sizeof(dst)) == ENODEV, "a gather with no %s proc did not return ENODEV",
+                  names[missing]);
+        }
+        llama_log_set(nullptr, nullptr);
+        CHECK(count_log("[LAZY-STORAGE]") == 0, "a storage with no %s proc printed a counters line", names[missing]);
     }
-    llama_log_set(nullptr, nullptr);
-    CHECK(count_log("[LAZY-STORAGE]") == 0, "a storage with no close proc printed a counters line");
 }
 
 int main() {
