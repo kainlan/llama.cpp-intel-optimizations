@@ -9,6 +9,11 @@
 > **Amendment 1, 2026-11-14: task A10.2b is new.** Task A10.2's census found that an expert loan publishes its
 > lent triplets with the wrong backing on a mapping load. The owner approved A10.2b on 2026-11-14 ("Do A10.2b
 > now"), ticket llama.cpp-hqz7. Tasks A10.1 (merged, `93d00fbbe`), A10.2 and A10.3 are unchanged.
+> **Amendment 2, 2026-11-14: task A10.4 is new.** The lead's early run of A10.2 and A10.2b gave 14.5 t/s at pp2048
+> on a mapped load, against 58 to 80 on today's tree. A `cpu` decision takes a prompt path about 5 times slower
+> than the one a mapped load takes today. The owner ruled "Fix the cpu path first" on 2026-11-14, ticket
+> llama.cpp-ibg2. A10.4 awaits the owner's review. Tasks A10.2, A10.2b and A10.3 are unchanged. The merge waits
+> for A10.4.
 
 **Goal:** on a normal load (`-lm auto`, which maps the file), the host-executed routed experts are held once, in
 pinned memory, when the device has a window ring and the host budget holds them. Prompts then take the ring without
@@ -93,6 +98,20 @@ two arms by environment, quiet, order pin, map, map, pin:
 **Reading.** Copy-pin gives the `-lm none` throughput with a 54 GB pinned pool in place of 124 GB. It is 2.0 times
 the warm mapped arm and 3.4 times the cold one.
 
+**Correction (amendment 2).** The two mapped figures are not a warm and a cold file cache. A mapped arm that ran
+directly after two mapped arms still gave 49.48 t/s. What the verbose logs show at `20e4361e0`:
+- The plan budget comes out 29898.0 MB or 29900.0 MB at the same reported free VRAM. The larger one leaves the
+  WEIGHT zone one ring slot short. The first prompt graph then decides `cpu (ring-unavailable)`, one triplet is
+  lent (`loan device`), and the run gives about 49 t/s (llama.cpp-az3g). Without a loan it gives 58 t/s verbose and
+  80 quiet.
+- A run that lent spends about 6 minutes in `reclaim_weight_entries` at unload (llama.cpp-ewu1). That is the long
+  wall, and it is after the timing.
+- A mapped load streams nothing in either mode: `0 MiB streamed`. Its summary counts the host layers under `ring`
+  because the decision was `ring`; the executor then declines each op (`window-not-staged`) and the retained
+  per-expert path runs the host experts on the prompt CPU island. Task A10.4 has the measurements.
+
+Read "warm" in this addendum as "no loan" and "cold" as "with a loan".
+
 **Not measured:** the B50, GPT-OSS, a load that does not fit, and the copy's cost in load time. The count-gate run
 took 5:07 under copy-pin against 2:55 by default in A12's end-to-end, one sample each on different builds.
 
@@ -172,22 +191,27 @@ over a mapped buffer. The lead's end-to-end runs 4 and 5 are the preload's devic
 10. **`-lm none` is unchanged.** Its double holding is a separate defect and gets its own ticket.
 11. **The storage path is separate.** Reading experts from the NVMe straight into pinned windows, for packs whose
     experts do not fit in RAM, is the owner's second request. It gets its own spike and addendum after this one.
+12. **A `cpu` decision runs the CPU island where the staged claim covers the layer (amendment 2).** Decisions 6
+    and 7 turn mapped layers to `cpu`. Task A10.4 makes that path the one a mapped load takes today.
 
 ---
 
 ## Team Topology
 
-**Implementers:** 1 (Opus: ownership and placement code), the three tasks in order, in one worktree.
+**Implementers:** 2. One (Opus: ownership and placement code) takes track F in order, in one worktree. A second
+(Opus: dispatch routing in `ggml_sycl_mul_mat_id`) takes track G in its own worktree, on a branch cut from the
+reviewed head of A10.2b (`18d6e11e1`).
 **Reviewers:** spec then quality, fresh each round, Opus. Each task is reviewed on its own commit range.
-**Merge:** A10.1 changes no behaviour and merges when it passes. A10.2, A10.2b and A10.3 merge together, after
-the lead's end-to-end.
+**Merge:** A10.1 changes no behaviour and merges when it passes. A10.2, A10.2b, A10.3 and A10.4 merge together,
+after the lead's end-to-end. The lead merges track F's branch into track G's for that run, and builds the result.
 
 | Track | Tasks | Description |
 |-------|-------|-------------|
 | F | A10.1, A10.2, A10.2b, A10.3 | the preload reads the plan; the ring index reads the backing; a loan publishes its backing; the plan pins |
+| G | A10.4 | a prompt layer decided for the CPU runs the CPU island |
 
 ```dot
-digraph dependencies { rankdir=LR; "A10.1 preload reads the plan" -> "A10.2 ring index reads the backing" -> "A10.2b a loan publishes its backing" -> "A10.3 the plan pins"; }
+digraph dependencies { rankdir=LR; "A10.1 preload reads the plan" -> "A10.2 ring index reads the backing" -> "A10.2b a loan publishes its backing" -> "A10.3 the plan pins"; "A10.2b a loan publishes its backing" -> "A10.4 a cpu layer runs the island"; }
 ```
 
 ### File Ownership Map
@@ -210,6 +234,18 @@ digraph dependencies { rankdir=LR; "A10.1 preload reads the plan" -> "A10.2 ring
 | `tests/test-sycl-layout-choice.cpp` | A10.3 | one new test function in `ring_room_case` |
 | `docs/backend/sycl-env-vars.md` | A10.3 | one row |
 | `docs/design/sycl-mmap-host-tier.md` | A10.3 | §4.4: the expert row (`:1188`) and the sentence at `:1195` |
+| `ggml/src/ggml-sycl/moe-stream-plan.hpp` | A10.4 | one predicate, one phase method's declaration, two comments |
+| `ggml/src/ggml-sycl/moe-stream-plan.cpp` | A10.4 | `moe_stream_phase::runs_cpu_island`; one comment in `begin_layer` |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | A10.4 | six sites inside `ggml_sycl_mul_mat_id` |
+| `ggml/src/ggml-sycl/tests/test-moe-stream-phase.cpp` | A10.4 | checks in the claimed block and the mapped block; one comment |
+| `tests/test-sycl-staged-ring-route-source.py` | A10.4 | one new claim with eight mutants; two constants and two mutants follow |
+| `docs/backend/sycl-memory-design.md` | A10.4 | the "Two regimes" paragraph |
+| `docs/backend/sycl-env-vars.md` | A10.4 | the `GGML_SYCL_MOE_EXEC` and `GGML_SYCL_MOE_EXEC_DECLINE_LAYER` text |
+| `scripts/sycl-moe-exec-gate.sh` | A10.4 | the `Q_decline` header comment (`:69-70`), which says the layer runs the hybrid path |
+
+Tracks F and G both touch `ggml-sycl.cpp`, `moe-stream-plan.hpp` and `docs/backend/sycl-env-vars.md`, in different
+places. A10.3's `ggml-sycl.cpp` hunks are near `:434` and `:35366`; A10.4's are inside `ggml_sycl_mul_mat_id`
+(`:85769` on). A10.4 runs `git merge-tree` against `task/a10-host-expert-pin` each round as well.
 
 Run `git merge-tree` against `integ/th32` each round.
 
@@ -1012,12 +1048,426 @@ Then:
 
 ---
 
+### Task A10.4: a layer decided `cpu` at prefill runs its host experts on the prompt CPU island
+
+**Track:** G. **Depends on:** A10.2b (branch base `18d6e11e1`). **Added by amendment 2.** Ticket llama.cpp-ibg2.
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/moe-stream-plan.hpp`, `ggml/src/ggml-sycl/moe-stream-plan.cpp`
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp`, inside `ggml_sycl_mul_mat_id` only
+- Test: `ggml/src/ggml-sycl/tests/test-moe-stream-phase.cpp`, `tests/test-sycl-staged-ring-route-source.py`
+- Docs: `docs/backend/sycl-memory-design.md`, `docs/backend/sycl-env-vars.md`
+- Comment only: `scripts/sycl-moe-exec-gate.sh:69-70`
+
+**Description:** a prompt layer with host experts can reach the CPU two ways today, and they differ about 5x.
+
+- **Decision `ring`, executor declines.** The op leaves the hybrid world, the batched executor refuses it
+  (`window-not-staged` on a mapped load), and the retained per-expert path runs: one `ggml_sycl_mul_mat` per device
+  expert, and the host experts on the **PP CPU island** (`enqueue_host_expert_rows`, `dispatch_host_expert_groups`),
+  grouped per expert. This is what every mapped load does on today's tree. Its summary says `ring`, but
+  `0 MiB streamed`.
+- **Decision `cpu`.** The op stays in the hybrid world (`moe_hybrid_with_plan`) and its host rows run one
+  (token, slot) row at a time (`do_cpu_dispatch`).
+
+Task A10.2 stops sizing a ring for mapped experts, so a mapped load now decides `cpu` on those layers and lands on
+the slow path. This task sends a `cpu` decision to the island when the staged claim covers every host matrix of the
+layer. That is exactly the set of layers the retained path already serves when the executor declines, so no new
+(type, layout) pair reaches it. Any other layer keeps the hybrid route. GPT-OSS MXFP4 is never staged-claimed
+(`moe-mmvq-tables.hpp:312`, `:374`), so its host layers do not move.
+
+For a mapped layer the island is today's default path. For a pinned layer it is the path the code already gives a
+batch the executor declines: the retained batch build leaves an executor's stage entry to the route core, whose
+answer for the expert is HOST (the `s->consumer == moe_stream_consumer::EXECUTOR` branch of the staged route). No
+default load takes it today, so the lead's run 18 is its first device run on pinned experts.
+
+Placement decides the executor here as before: the host experts run on the CPU either way. Only the CPU path changes.
+
+**Evidence (lead runs, 2026-11-14, B70, mapped exps-IQ4_NL, tuning cache off, driver 26.44):**
+
+| Tree and arm | Decisions | pp2048 t/s |
+|---|---|---:|
+| `20e4361e0` default, no loan | ring (executor declines, island) | 58.49 verbose, 79.93 quiet |
+| `20e4361e0` default, with a loan | ring after one `cpu (ring-unavailable)` graph | 49.48, 49.09 |
+| `20e4361e0` `GGML_SYCL_MOE_EXEC=cpu` | cpu (hybrid) | 14.30, 14.25 |
+| `5f1202df4` (A10.2 + A10.2b) default | cpu (hybrid), 0 ring | 14.50 verbose, 14.51 quiet |
+
+- Placement on this pack: layers 0-10 all on the device, layer 11 mixed, layers 12-46 all host.
+- Per op of 5120 rows on an all-host layer, first graph, `GGML_SYCL_MOE_ROW_AGG_DEBUG=1` with wall-clock
+  timestamps: 0.18-0.36 s on the hybrid path, 0.07-0.17 s on the island path. Layers 0-10 take the batched executor
+  in both arms and cost the same.
+- `GGML_SYCL_MOE_PP_PROFILE=1` on a `cpu` graph of 512 tokens: 41.7 s, of which CPU expert compute is 8.59 s
+  (15.9 us per row). The profile books the rest of each op under `GPU expert compute`, a timer that spans
+  `ids_done` to `moe_gpu_compute_done()` whatever runs there. It is host-side work before the CPU dispatch.
+- No `dispatch-reject` line prints in any run. The hybrid route's batched device kernel is not being refused.
+
+**Acceptance criteria:**
+
+- [ ] `moe_stream_layer_runs_cpu_island(decision, layer_info)` is true exactly when the decision is `CPU` and
+      `moe_stream_layer_claimed` or `moe_stream_layer_mapped_only` holds.
+- [ ] `ggml_sycl_mul_mat_id` asks the phase once per prompt op, beside `executor_claims`, and one bool carries the
+      answer. That bool is written at one site and read at four: the MMVQ-probe skip, `plan_has_cpu_experts`,
+      `planner_needs_prompt_route`, and the head of `try_pp_onednn_f16_batched`.
+- [ ] The existing bool `pp_onednn_batched_claims_staged_layer` gains no writer and no new reader.
+- [ ] Decode is unchanged: the block runs only for `ids->ne[1] > 1`, and `moe_hybrid_with_plan` keeps `ne12 == 1 ||`.
+- [ ] The decision log and the summary are unchanged. A rerouted layer still prints and counts as `cpu`.
+- [ ] Lead's device runs (rows 16 to 20 of the end-to-end) pass.
+
+#### Step 1: census (report before editing; STOP if an answer contradicts this task)
+
+Line numbers are at `18d6e11e1`. `ggml_sycl_mul_mat_id` starts at `ggml-sycl.cpp:85769`.
+
+1. Confirm the six edit sites below still read as quoted. Cite each line.
+2. `pp_onednn_batched_claims_staged_layer`: list every read and write in `ggml-sycl.cpp`
+   (`cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n pp_onednn_batched_claims_staged_layer`). Expected: declared
+   `:86113`, written `:86204`, read `:87928`, `:88934`, `:89407`, and inside the executor lambda `:92829`, `:92980`.
+3. The retained per-expert path between the executor's try (`:94279`) and `dispatch_host_expert_groups` (`:95337`):
+   name every read of state that only a `ring` decision or a reserved ring sets. Expected: none besides the
+   staged-ring refusal at `:94289`. If you find one, STOP.
+4. A `cpu`-decided layer and the stage table: the retained prompt batch is built with `allow_materialize=false` and
+   the staged route refuses an entry whose consumer is the executor. Confirm a layer that was `ring` in one
+   micro-batch and `cpu` in the next cannot hand the per-expert path a `STAGED_RING` route (it would throw at
+   `:94289`). Cite the refusal's lines. If it can, STOP.
+5. The island's type support: say where the island picks its CPU kernel for a host expert and what it does for a
+   type with none. Confirm every type `moe_pp_batched_takes_staged_type` names has one.
+6. Confirm no staged type can plan `GGML_LAYOUT_XMX_TILED` for its device experts
+   (`ggml_sycl_moe_pp_batched_takes_layout`). The per-expert path cannot read tiled bytes.
+7. Run every pin that names a changed statement, before editing, and report each rc:
+   `tests/test-sycl-staged-ring-route-source.py`, `tests/test-sycl-moe-exec-window-source.py`,
+   `tests/test-sycl-moe-pp-batched-types-source.py`, `tests/test-sycl-moe-resolved-batch-source.py`,
+   `tests/test-sycl-moe-host-island-source.py`, `tests/test-sycl-pp-moe-scratch-admission-contract.py`,
+   `tests/test-sycl-moe-stream-enqueue-source.py`. Run each as `python3 <file>`.
+
+#### Step 2: RED
+
+(a) `ggml/src/ggml-sycl/tests/test-moe-stream-phase.cpp`. In the block that starts
+`// ---- the executor takes a layer's weights whole, or not at all (moe_stream_executor_claims) ----` (`:743`),
+directly after `CHECK(!ggml_sycl::moe_stream_layer_claimed(routed));` (`:777`):
+
+```cpp
+            // ---- a CPU decision runs the host experts on the prompt CPU island where the staged claim covers them
+            // ----
+            moe_exec_decision cpu_d;
+            cpu_d.choice = moe_exec_choice::CPU;
+            moe_exec_decision ring_d;
+            ring_d.choice = moe_exec_choice::RING;
+            const moe_exec_decision unconsulted_d;
+            // Every host matrix is the executor's: the island takes the layer, whatever made the decision CPU.
+            for (ggml_sycl::moe_exec_reason reason :
+                 { ggml_sycl::moe_exec_reason::FORCED, ggml_sycl::moe_exec_reason::CHEAPER,
+                   ggml_sycl::moe_exec_reason::RING_UNAVAILABLE, ggml_sycl::moe_exec_reason::DECLINED }) {
+                cpu_d.reason = reason;
+                CHECK(ggml_sycl::moe_stream_layer_runs_cpu_island(cpu_d, *c0));
+                CHECK(ggml_sycl::moe_stream_layer_runs_cpu_island(cpu_d, *p2));
+            }
+            // A RING decision is the executor's, and a layer never weighed has no decision.
+            CHECK(!ggml_sycl::moe_stream_layer_runs_cpu_island(ring_d, *c0));
+            CHECK(!ggml_sycl::moe_stream_layer_runs_cpu_island(unconsulted_d, *c0));
+            // A layer the claim does not cover whole keeps the hybrid route: a fused entry, no item, an unclaimed
+            // role, no claim at all, and each half of one item's claim.
+            CHECK(!ggml_sycl::moe_stream_layer_runs_cpu_island(cpu_d, *c1));
+            CHECK(!ggml_sycl::moe_stream_layer_runs_cpu_island(cpu_d, *c4));
+            CHECK(!ggml_sycl::moe_stream_layer_runs_cpu_island(cpu_d, *p0));
+            CHECK(!ggml_sycl::moe_stream_layer_runs_cpu_island(cpu_d, *u0));
+            CHECK(!ggml_sycl::moe_stream_layer_runs_cpu_island(cpu_d, unstaged));
+            CHECK(!ggml_sycl::moe_stream_layer_runs_cpu_island(cpu_d, routed));
+```
+
+In the mapped block, directly after `CHECK(mf1 != nullptr && !ggml_sycl::moe_stream_layer_mapped_only(*mf1));`
+(`:895`):
+
+```cpp
+        // The island reads a mapped expert in place, so a layer that only the plan's backing keeps from the executor
+        // takes it too. A mapped layer the claim does not cover whole does not.
+        moe_exec_decision mapped_cpu;
+        mapped_cpu.choice             = moe_exec_choice::CPU;
+        mapped_cpu.reason             = ggml_sycl::moe_exec_reason::RING_UNAVAILABLE;
+        moe_exec_decision mapped_ring = mapped_cpu;
+        mapped_ring.choice            = moe_exec_choice::RING;
+        CHECK(m0 != nullptr && ggml_sycl::moe_stream_layer_runs_cpu_island(mapped_cpu, *m0));
+        CHECK(o0 != nullptr && ggml_sycl::moe_stream_layer_runs_cpu_island(mapped_cpu, *o0));
+        CHECK(m0 != nullptr && !ggml_sycl::moe_stream_layer_runs_cpu_island(mapped_ring, *m0));
+        CHECK(mu0 != nullptr && !ggml_sycl::moe_stream_layer_runs_cpu_island(mapped_cpu, *mu0));
+        CHECK(mp0 != nullptr && !ggml_sycl::moe_stream_layer_runs_cpu_island(mapped_cpu, *mp0));
+        CHECK(mn0 != nullptr && !ggml_sycl::moe_stream_layer_runs_cpu_island(mapped_cpu, *mn0));
+        CHECK(mf1 != nullptr && !ggml_sycl::moe_stream_layer_runs_cpu_island(mapped_cpu, *mf1));
+```
+
+If a name above is out of scope at the line given, STOP and report the scope; do not rebuild the fixtures.
+
+RED evidence: the syntax-only compile of `test-moe-stream-phase.cpp` fails with
+`no member named 'moe_stream_layer_runs_cpu_island' in namespace 'ggml_sycl'`. Paste the error line.
+
+(b) `tests/test-sycl-staged-ring-route-source.py`. Above `STAGED_LAYER_SITE` (`:831`) add the two constants it now
+names, and change it:
+
+```python
+CPU_ISLAND_DECL = "bool pp_layer_runs_cpu_island = false;"
+CPU_ISLAND_SET = "pp_layer_runs_cpu_island = ctx.moe_stream->runs_cpu_island(stream_call.layer);"
+# The release site stays directly after begin_layer (claim_staged_pointer_released_with_ring); the two bools follow it,
+# inside the same block, the claim's own (stream_call lives at function scope since llama.cpp-8epx).
+STAGED_LAYER_SITE = ("*ctx.stream(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx); "
+                     + STAGED_LAYER_SET + " " + CPU_ISLAND_SET + " }")
+```
+
+Change `PLAN_HAS_CPU` (`:840`):
+
+```python
+PLAN_HAS_CPU = ("plan_has_cpu_experts = plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && "
+                "!pp_onednn_batched_claims_staged_layer && !pp_layer_runs_cpu_island;")
+```
+
+Two mutants of `test_fully_staged_layer_leaves_hybrid_mutants` name text that moves. Replace them:
+
+```python
+    # The phase asked before begin_layer decided the layer, so the first op of a layer always stays hybrid.
+    m = mutate(SYCL, " " + STAGED_LAYER_SET + " " + CPU_ISLAND_SET + " }", " " + CPU_ISLAND_SET + " }")
+```
+
+```python
+    # The plan's host experts keep the op hybrid: plan_has_cpu_experts is not cleared.
+    assert not c(mutate(SYCL, " && !pp_onednn_batched_claims_staged_layer && !pp_layer_runs_cpu_island;",
+                        " && !pp_layer_runs_cpu_island;"))
+```
+
+After `test_fully_staged_layer_leaves_hybrid_mutants` (before `claim_decode_builds_skip_the_phase`, `:925`) add:
+
+```python
+# ---- a prompt layer decided for the CPU runs the retained per-expert path and its CPU island -------------------------
+
+CPU_ISLAND_PROBE = ("if (!prompt_down_has_planned_specialized_layout && !pp_onednn_batched_claims_op && "
+                    "!pp_layer_runs_cpu_island) {")
+CPU_ISLAND_NEEDS_ROUTE = ("const bool planner_needs_prompt_route = has_placement_plan && placement_planned_moe && "
+                          "prompt_batch && !exact_layout_override && !pp_onednn_batched_route_claims_prompt && "
+                          "!pp_layer_runs_cpu_island;")
+CPU_ISLAND_EXECUTOR = ("auto try_pp_onednn_f16_batched = [&]() -> bool { if (pp_layer_runs_cpu_island) { "
+                       "return false; }")
+CPU_ISLAND_PHASE_SIG = "bool moe_stream_phase::runs_cpu_island(int layer) const"
+CPU_ISLAND_PHASE_BODY = ("const auto it = index_.layers.find(layer); return it != index_.layers.end() && "
+                         "moe_stream_layer_runs_cpu_island(decision_of(layer), it->second);")
+
+
+def claim_cpu_layer_runs_the_island(sycl: str, phase: str) -> bool:
+    """A prompt op whose layer the phase decided for the CPU, and whose every host matrix the staged claim covers,
+    takes the retained per-expert path, whose CPU island runs the host experts grouped per expert; the hybrid route
+    would run the same rows one at a time. ggml_sycl_mul_mat_id asks the phase once (`->runs_cpu_island(`), beside
+    executor_claims and for the same layer, and one bool carries the answer: written at that one site and read at
+    four. It skips the MMVQ probes, clears plan_has_cpu_experts and drops the planner's prompt route, as a staged
+    layer does, and the batched executor declines the op at its head, since the decision gave the layer to the CPU.
+    The phase answers from the layer's decision and its index entry, through the pure predicate the host test
+    covers."""
+    m = body(norm(sycl), MMID_SIG)
+    p = body(norm(phase), CPU_ISLAND_PHASE_SIG)
+    return (m != "" and m.count("pp_layer_runs_cpu_island") == 6 and m.count("pp_layer_runs_cpu_island =") == 2
+            and m.count("->runs_cpu_island(") == 1 and m.count(CPU_ISLAND_DECL) == 1
+            and m.count(STAGED_LAYER_SITE) == 1 and m.count(CPU_ISLAND_PROBE) == 1 and m.count(PLAN_HAS_CPU) == 1
+            and m.count(CPU_ISLAND_NEEDS_ROUTE) == 1 and m.count(CPU_ISLAND_EXECUTOR) == 1
+            and ordered(m, STAGED_LAYER_DECL, CPU_ISLAND_DECL, STAGED_LAYER_BEGIN, STAGED_LAYER_SITE, PROBE_CLAIM,
+                        CPU_ISLAND_PROBE, PLAN_HAS_CPU, ROUTE_CLAIM, CPU_ISLAND_NEEDS_ROUTE, HYBRID_WITH_PLAN,
+                        CPU_ISLAND_EXECUTOR, PER_EXPERT_ANCHOR)
+            and CPU_ISLAND_PHASE_BODY in p)
+
+
+def test_cpu_layer_runs_the_island():
+    assert claim_cpu_layer_runs_the_island(SYCL, PHASE), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id (the phase's answer is searched in the body "
+        "of moe_stream_phase::runs_cpu_island, moe-stream-plan.cpp)",
+        body(norm(SYCL), MMID_SIG),
+        STAGED_LAYER_DECL, CPU_ISLAND_DECL, STAGED_LAYER_BEGIN, STAGED_LAYER_SITE, PROBE_CLAIM, CPU_ISLAND_PROBE,
+        PLAN_HAS_CPU, ROUTE_CLAIM, CPU_ISLAND_NEEDS_ROUTE, HYBRID_WITH_PLAN, CPU_ISLAND_EXECUTOR, PER_EXPERT_ANCHOR,
+        signature=MMID_SIG)
+
+
+def test_cpu_layer_runs_the_island_mutants():
+    c = claim_cpu_layer_runs_the_island
+    # The MMVQ probes run for the op, which a staged layer skips.
+    assert not c(mutate(SYCL, " && !pp_layer_runs_cpu_island) {", ") {"), PHASE)
+    # The plan's host experts keep the op hybrid.
+    assert not c(mutate(SYCL, "!pp_onednn_batched_claims_staged_layer && !pp_layer_runs_cpu_island;",
+                        "!pp_onednn_batched_claims_staged_layer;"), PHASE)
+    # The planner's prompt route keeps the op hybrid.
+    assert not c(mutate(SYCL, "!pp_onednn_batched_route_claims_prompt && !pp_layer_runs_cpu_island;",
+                        "!pp_onednn_batched_route_claims_prompt;"), PHASE)
+    # The batched executor is asked for a layer the decision gave to the CPU.
+    assert not c(mutate(SYCL, "-> bool { if (pp_layer_runs_cpu_island) { return false; }", "-> bool {"), PHASE)
+    # The phase asked before begin_layer decided the layer.
+    m = mutate(SYCL, " " + CPU_ISLAND_SET + " }", " }")
+    early = STAGED_LAYER_BEGIN.replace("ctx.moe_stream->begin_layer(",
+                                       CPU_ISLAND_SET + " ctx.moe_stream->begin_layer(")
+    assert not c(m.replace(STAGED_LAYER_BEGIN, early, 1), PHASE)
+    # Keyed by another layer than the one the phase decides under.
+    assert not c(mutate(SYCL, "runs_cpu_island(stream_call.layer)",
+                        "runs_cpu_island(moe_cache_layer_id(src0->name))"), PHASE)
+    # A second writer of the bool.
+    assert not c(mutate(SYCL, PLAN_HAS_CPU, "pp_layer_runs_cpu_island = false; " + PLAN_HAS_CPU), PHASE)
+    # Any CPU decision takes the island, so a layer the staged claim does not cover reaches the per-expert path.
+    assert not c(SYCL, mutate(PHASE, "moe_stream_layer_runs_cpu_island(decision_of(layer), it->second);",
+                              "decision_of(layer).choice == moe_exec_choice::CPU;"))
+```
+
+The lead checked this claim and its eight mutants against scratch copies of the sources with the GREEN edits below
+applied: the claim is false before, true after, and every mutant is caught.
+
+RED evidence: `python3 tests/test-sycl-staged-ring-route-source.py` fails, and the failures are
+`test_fully_staged_layer_leaves_hybrid` and `test_cpu_layer_runs_the_island` (plus their mutant tests, whose
+preconditions no longer hold). Paste the summary line. Commit RED:
+`test(sycl): a prompt layer decided for the CPU runs the CPU island (RED)`.
+
+#### Step 3: GREEN
+
+(1) `ggml/src/ggml-sycl/moe-stream-plan.hpp`, directly after `moe_stream_executor_claims` (`:434-436`):
+
+```cpp
+// True iff a prompt layer the phase decided for the CPU runs its host experts on the prompt CPU island, the retained
+// per-expert path's CPU dispatch, which groups a layer's rows per expert. The hybrid route runs the same rows one at a
+// time. It needs the staged claim to hold for every host matrix of the layer, staged or left in its mapping: that is
+// the layer the retained path already serves when the executor declines it, so the claim's type and layout checks are
+// the island's too. A layer the claim does not cover whole keeps the hybrid route.
+static inline bool moe_stream_layer_runs_cpu_island(const moe_exec_decision & d, const moe_stream_layer_info & li) {
+    return d.choice == moe_exec_choice::CPU && (moe_stream_layer_claimed(li) || moe_stream_layer_mapped_only(li));
+}
+```
+
+(2) Same file, in `moe_stream_phase`, directly after `bool     executor_claims(int layer);` (`:1096`):
+
+```cpp
+    // True iff `layer`'s decision is CPU and the staged claim covers every host matrix of it
+    // (moe_stream_layer_runs_cpu_island). Its prompt ops then take the retained per-expert path, whose CPU island runs
+    // the host experts, and the batched executor declines them. False for a layer with no host entry.
+    bool     runs_cpu_island(int layer) const;
+```
+
+(3) `ggml/src/ggml-sycl/moe-stream-plan.cpp`, directly after `executor_claims` (`:153-157`):
+
+```cpp
+bool moe_stream_phase::runs_cpu_island(int layer) const {
+    const auto it = index_.layers.find(layer);
+    return it != index_.layers.end() && moe_stream_layer_runs_cpu_island(decision_of(layer), it->second);
+}
+```
+
+(4) `ggml/src/ggml-sycl/ggml-sycl.cpp`, six sites in `ggml_sycl_mul_mat_id`:
+
+a. After `bool pp_onednn_batched_claims_staged_layer = false;` (`:86113`):
+
+```cpp
+    // True when the phase decided this prompt op's layer for the CPU and the staged claim covers every host matrix of
+    // it (moe_stream_phase::runs_cpu_island). Set once, beside the staged claim. Such an op leaves the hybrid world at
+    // the same three places a staged layer does, and the batched executor declines it: the retained per-expert path
+    // multiplies the device experts and its CPU island the host ones, grouped per expert. The hybrid route would run
+    // the same host rows one at a time.
+    bool pp_layer_runs_cpu_island = false;
+```
+
+b. After `pp_onednn_batched_claims_staged_layer = ctx.moe_stream->executor_claims(stream_call.layer);` (`:86204`):
+
+```cpp
+            pp_layer_runs_cpu_island = ctx.moe_stream->runs_cpu_island(stream_call.layer);
+```
+
+c. The probe gate (`:87939`) becomes:
+
+```cpp
+                if (!prompt_down_has_planned_specialized_layout && !pp_onednn_batched_claims_op &&
+                    !pp_layer_runs_cpu_island) {
+```
+
+   Add one comment line above it: the probes are skipped for a layer the CPU island runs, as for a claimed one.
+
+d. `plan_has_cpu_experts` (`:88933-88934`) becomes:
+
+```cpp
+        plan_has_cpu_experts =
+            plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && !pp_onednn_batched_claims_staged_layer &&
+            !pp_layer_runs_cpu_island;
+```
+
+   Extend the comment above it: a layer the CPU island runs leaves the hybrid world too, and its host experts
+   still run on the CPU.
+
+e. `planner_needs_prompt_route` (`:89408-89409`) becomes:
+
+```cpp
+    const bool planner_needs_prompt_route = has_placement_plan && placement_planned_moe && prompt_batch &&
+                                            !exact_layout_override && !pp_onednn_batched_route_claims_prompt &&
+                                            !pp_layer_runs_cpu_island;
+```
+
+f. The head of the executor lambda (`:92781`), before `#if GGML_SYCL_DNNL`:
+
+```cpp
+        auto try_pp_onednn_f16_batched = [&]() -> bool {
+            // The phase decided this layer for the CPU: the per-expert path below and its CPU island run it. Not a
+            // refusal to report; the decision log already says cpu.
+            if (pp_layer_runs_cpu_island) {
+                return false;
+            }
+#if GGML_SYCL_DNNL
+```
+
+(5) Comments that the change makes false. Edit each to say what now happens; keep them reasons, not history:
+- `ggml-sycl.cpp:86105-86112`, last sentence ("A layer the executor does not claim whole stays hybrid as before"):
+  still true; add that a claimed layer decided for the CPU takes the island.
+- `moe-stream-plan.cpp`, in `begin_layer`: "so the ring is neither reserved nor claimed for it and the layer runs
+  the hybrid path".
+- `moe-stream-plan.hpp:424-426` (`moe_stream_layer_declined`) and `:1093-1095` ("A refused reserve answers false,
+  and the layer stays hybrid").
+- `tests/test-moe-stream-phase.cpp:270-272` ("so executor_claims answers false and the layer stays hybrid").
+- `scripts/sycl-moe-exec-gate.sh:69-70` (`Q_decline`: "so the executor does not claim it and it runs the hybrid
+  path"). Comment only. Run `bash -n scripts/sycl-moe-exec-gate.sh` after the edit. If a pin quotes the line,
+  follow the pin in the same commit and report it.
+
+#### Step 4: pins and docs that follow
+
+- `tests/test-sycl-staged-ring-route-source.py`: the edits of Step 2 (b), and the module docstring's bullet on the
+  claimed layer gains one sentence for the island.
+- Any other pin Step 1.7 shows failing after GREEN: edit it in the GREEN commit, and say which and why in the
+  report. A pin outside the ownership map needs the lead's yes first.
+- `docs/backend/sycl-memory-design.md`, the "Two regimes" paragraph (`:114-139`). Replace the sentence "A layer
+  that the executor does not claim, or whose ring cannot exist, stays whole in the hybrid world and runs its host
+  experts on the CPU from their host leases." with:
+  "A layer the executor does not claim stays whole in the hybrid world and runs its host experts on the CPU from
+  their host leases. A layer the claim covers but the phase decides for the CPU (the cost model, a refused ring, a
+  plan that left the experts mapped, or `GGML_SYCL_MOE_EXEC=cpu`) leaves the hybrid world as well: the retained
+  per-expert path runs it, with the host experts on its CPU island, grouped per expert
+  (`moe_stream_layer_runs_cpu_island`)."
+  In the last sentence of the paragraph, "so a gate can prove that hybrid fallback" becomes "so a gate can prove
+  the CPU island".
+- `docs/backend/sycl-env-vars.md`: the `GGML_SYCL_MOE_EXEC` row (`:365`), the `GGML_SYCL_MOE_EXEC_DECLINE_LAYER`
+  row (`:423`, "Forces one layer to the hybrid path") and its section (`:437-443`, "its host experts run on the CPU
+  in the hybrid world"). Each says where a `cpu` layer runs: on the retained per-expert path's CPU island when the
+  staged claim covers the layer, in the hybrid world otherwise. Task A10.3 adds one row to this file elsewhere;
+  touch no other row.
+
+#### Gotchas
+
+- `ggml-sycl.cpp` is about 96k lines and codescout is blind in it. Find each site with `cat <file> | grep -n`.
+- Do not add a writer or a reader to `pp_onednn_batched_claims_staged_layer`. Pins count its two `=` sites, and
+  it drives `pp_stream_windowed` inside the executor.
+- Do not change the call site `if (try_pp_onednn_f16_batched()) { return; }` (`:94279`). Two pins quote it. The
+  decline goes inside the lambda, before the `#if`.
+- Do not touch the unreachable `else` of the duplicated `if (moe_hybrid_with_plan)` (`:91497-92170`). A pin fixes
+  its position (`claim_c_q4k_fallback`). It has its own ticket.
+- The island waits on its copies on the host (`sycl::event::wait`). Leave that; it has its own ticket.
+- Syntax-only compile `ggml-sycl.cpp` twice (plain and with `GGML_SYCL_PRIVATE_TESTING`), `moe-stream-plan.cpp`
+  and `test-moe-stream-phase.cpp`, each with its own command from `compile_commands.json`. Never while
+  `/Apps/llama.cpp/GPU.lock` exists.
+- `git merge-tree` against `integ/th32` and against `task/a10-host-expert-pin` each round. Both branches touch
+  `ggml-sycl.cpp` and `docs/backend/sycl-env-vars.md`, in different places.
+
+**Commit (GREEN):** `sycl: a prompt layer decided for the CPU runs its host experts on the CPU island`, paths:
+the two `moe-stream-plan` files, `ggml-sycl.cpp`, the host test, the pin(s), the two docs, the gate script.
+
+**Build** (lead only): `test-moe-stream-phase test-moe-stream-plan llama-bench llama-cli`.
+
+---
+
 ## End-to-End Validation (on the user's machine): lead only
 
 One run at a time, under `GPU.lock`, selector pinned, `GGML_SYCL_TUNING_CACHE=0`, the VRAM preflight first, `Shmem`
 sampled before and 5 s after (kill above 100 GB), the kernel log checked after. Read the driver version first.
-Build the task worktree at the reviewed head of A10.3. "Opt-out" means `GGML_SYCL_MOE_PIN_HOST_EXPERTS=0` on the
-same binary. The mapped bench arms are reported warm and cold separately, each with its wall time.
+Build the combined tree: the reviewed head of A10.4 with the reviewed head of A10.3 merged in. "Opt-out" means
+`GGML_SYCL_MOE_PIN_HOST_EXPERTS=0` on the same binary. "Today's tree" means the `integ/th32` binaries built at
+`20e4361e0`. Every arm of today's tree is reported with its mode (loan or no loan, from `loan device` in a verbose
+arm or from the wall time) and its wall time.
 
 | # | Command | Card | Pass when |
 |---|---------|------|-----------|
@@ -1026,7 +1476,7 @@ same binary. The mapped bench arms are reported warm and cold separately, each w
 | 3 | The source pins A10.1 to A10.3 touched or named, each with `--self-test` where it has one | none | rc 0 each |
 | 4 | `llama-cli -m <exps-IQ4_NL>` count prompt, **default flags**, `-v` | B70 | `grep -cx '1, 2, 3, 4, 5'` = 1. `host weights by backing` shows the host experts under `pinned`. No `SYCL_Host model buffer` line. `host_expert_copy_cumulative` equals the WEIGHT term of the plan the preload read, within 1 GiB. Every `[HOST-LEDGER]` plan line of the load is a pinned plan. `[MOE-EXEC] summary` shows MiB streamed above 0 and 0 misses |
 | 5 | Run 4 with the opt-out | B70 | the gate passes. The experts are under `mapped`. No `MoE window ring room ... held` line. `[MOE-EXEC] summary` counts the host layers under `cpu`, none under `ring`. `DMA staging pool: 0.0 MB` |
-| 6 | `llama-bench -m <exps-IQ4_NL> -p 2048 -n 0 -r 5 -o json`: default, opt-out, opt-out, default | B70 | record all four with wall times and min `MemAvailable`. The first opt-out arm follows a pinned arm and is expected cold. Also record the opt-out arm against today's mapped arm at `20e4361e0` (80 warm, 48 to 50 cold): task A10.2 changed that path |
+| 6 | `llama-bench -m <exps-IQ4_NL> -p 2048 -n 0 -r 5 -o json`: default, opt-out, opt-out, default | B70 | record all four with wall times and min `MemAvailable`. Row 16 is the opt-out arm's verdict against today's tree |
 | 7 | Device experts: the `device-resident routed experts` figure of the ring-room line in runs 4 and 5 | B70 | record both. The default arm pays the ring's room and the 900 MB DMA pool |
 | 8 | Run 4 with `-lm mlock` | B70 | the gate passes; the experts stay mapped; host layers under `cpu` |
 | 9 | Run 4 with `-lm none` | B70 | unchanged from today's pinned arm: the ring streams, 0 misses |
@@ -1036,10 +1486,16 @@ same binary. The mapped bench arms are reported warm and cold separately, each w
 | 13 | `llama-bench` GPT-OSS 20B `-p 512 -n 128`: default, opt-out, opt-out, default | B50, then B70 | within the spread of `docs/backend/sycl-perf-baselines.md`, or explained by the opt-out pair and by today's tree measured the same way |
 | 14 | Kernel log over the whole run | both | no `GT reset`, `guc_id` or `CAT error` line on the card an arm was using, during that arm |
 | 15 | Loans: `grep -a 'MOE-EXEC\] loan device'` in the verbose logs of runs 4, 5, 8, 9 and 11 | both | record every loan line. In a default-flag run that lent, the summary shows MiB streamed above 0 and 0 misses, and no host layer prints `ring-unavailable` after the loan. If no default-flag run lends, say so: the loan under a pinned mapping plan is then covered by the unit tests only |
+| 16 | `llama-bench -m <exps-IQ4_NL> -p 2048 -n 0 -r 5 -o json`, mapped: today's tree, opt-out, opt-out, today's tree. One `-r 1 -v` arm of each tree first | B70 | **Blocking (owner).** In each pair the opt-out mean is at or above today's arm, or below it by no more than the two arms' summed standard deviations. Today's arm is scored in the mode it ran in, and both modes are reported. The opt-out verbose arm prints no `loan device` line and counts every host layer under `cpu` |
+| 17 | Run 16's opt-out verbose arm at `-p 512`, with `GGML_SYCL_MOE_ROW_AGG_DEBUG=1 GGML_SYCL_MOE_ROUTE_LOG=1` | B70 | `grep -ac 'path=planner_hybrid'` = 0 and `grep -ac 'path=pp_planned_route'` > 0. `[MOE-CPU-ISLAND]` lines print. Control, already measured at `20e4361e0` with the same switches: forced `cpu` gives 63 `planner_hybrid` and 0 `pp_planned_route`; the default gives 0 and 63 |
+| 18 | Run 4 with `GGML_SYCL_MOE_EXEC=cpu` (default pinned load), then `llama-bench -p 2048 -n 0 -r 3 -o json` with the same variable | B70 | `grep -cx '1, 2, 3, 4, 5'` = 1. The summary counts every host layer under `cpu`, `0 MiB streamed`, and no `staged ring slot` refusal prints. The bench is at or above today's forced-`cpu` arm (14.30). This is the island's first device run on pinned host experts |
+| 19 | `scripts/sycl-moe-exec-gate.sh` arm `Q_decline` with its references | B70 | `Q_decline=PASS`. The declined layer now runs the island, and its text must still equal the references' |
+| 20 | GPT-OSS 20B `llama-bench -p 512 -n 0 -r 1 -v` with `GGML_SYCL_MOE_ROW_AGG_DEBUG=1` | B50 | `path=planner_hybrid` lines print for its host layers, as on today's tree: the staged claim does not cover MXFP4, so A10.4 must not move them. Record both counts |
 
 Run 4 is the acceptance: the default load takes the ring, answers correctly, and holds the experts once. Runs 11
 and 13 matter because GPT-OSS also has host experts on the B50, so both the pin and A10.2's change can move it.
-A regression there against today's tree blocks the merge.
+A regression there against today's tree blocks the merge. Run 16 blocks the merge by the owner's ruling: the
+mapped path must not be slower than today's tree.
 
 ## Follow-ups left out
 
@@ -1056,6 +1512,15 @@ A regression there against today's tree blocks the merge.
   that small matters.
 - **The mapping's pages after the copy.** The copy-pin load's peak RSS was 76.8 GB against 56.5 GB mapped, the
   difference being file pages the kernel may reclaim. An explicit release is left out until it is shown to matter.
-- **The mapped path's cold state** (48 t/s against 80 t/s) and **the storage path** for packs that do not fit:
-  the owner's second request, next spike.
+- **The mapped path's two modes** (about 49 t/s with a loan, 58 to 80 without): llama.cpp-az3g and
+  llama.cpp-ewu1. With A10.2 a mapped plan sizes no ring, so it has no loan to take; row 16 records what is left.
+- **The storage path** for packs that do not fit: the owner's second request, next spike.
+- **The CPU island waits on its copies on the host** (`sycl::event::wait`). It is the mapped path's hot loop after
+  A10.4, and the first thing the storage-path work should chain. Its own ticket.
+- **The hybrid route spends about 0.2 s per 5120-row op on the host before its CPU dispatch**, more than the CPU
+  compute itself. GPT-OSS host layers on the B50 still take that route. Its own ticket.
+- **The cost model's CPU rate** was fitted on the hybrid route. After A10.4 a claimed layer's CPU cost is the
+  island's. Its own ticket: re-fit, or keep two rates.
+- **The second `if (moe_hybrid_with_plan)` has an unreachable `else`** of about 670 lines, which a pin holds in
+  place. Its own ticket.
 - **Temp-0 completions on this pack vary run to run** (llama.cpp-fd88). The count gate is unaffected.
