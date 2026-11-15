@@ -216,6 +216,42 @@ void test_window_sizing() {
     CHECK(idx.window_slots == 3);
 }
 
+// The ring copies only from pinned memory, so a host expert the plan left mapped stages nothing: its layer is not
+// claimed and takes no slot. A lent device triplet is read as before.
+void test_mapped_host_experts_are_not_staged() {
+    ggml_sycl::moe_stream_window_hints hints;
+    hints.weight_slot_bytes = 10 * kSrc;
+
+    placement_plan mapped = make_typed_plan();
+    for (ggml_sycl::placement_entry & e : mapped.entries) {
+        if (e.expert_id >= 0 && !e.on_device) {
+            e.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+        }
+    }
+    auto idx = ggml_sycl::moe_stream_plan_index_build(mapped, 0, nullptr, claims_all, hints);
+    CHECK(idx.role_items_max == 0);
+    CHECK(idx.window_slots == 0);
+    CHECK(idx.layers.count(0) == 1 && !ggml_sycl::moe_stream_layer_claimed(idx.layers.at(0)));
+    CHECK(ggml_sycl::moe_stream_plan_ring_geometry(mapped, 0, nullptr, claims_all, hints).bytes == 0);
+
+    // One mapped expert in a pinned layer leaves the layer unclaimed, and the ring is sized over the others.
+    placement_plan mixed = make_typed_plan();
+    for (ggml_sycl::placement_entry & e : mixed.entries) {
+        if (e.layer_id == 0 && e.expert_id == 1) {
+            e.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+        }
+    }
+    idx = ggml_sycl::moe_stream_plan_index_build(mixed, 0, nullptr, claims_all, hints);
+    CHECK(!ggml_sycl::moe_stream_layer_claimed(idx.layers.at(0)));
+    CHECK(ggml_sycl::moe_stream_layer_claimed(idx.layers.at(2)));
+
+    // The control: the same plan with every host expert pinned is claimed, as test_window_sizing sizes it.
+    const placement_plan pinned = make_typed_plan();
+    idx                         = ggml_sycl::moe_stream_plan_index_build(pinned, 0, nullptr, claims_all, hints);
+    CHECK(idx.window_slots == 3);
+    CHECK(ggml_sycl::moe_stream_layer_claimed(idx.layers.at(0)));
+}
+
 // The ring cap is loan-invariant (llama.cpp-7999, first half of llama.cpp-8p5x): a loan flips device triplets to host,
 // so the index's resident bytes fall by the lent bytes L, and the caller hands L back through hints.lent_bytes. The
 // geometry sized before the loan is then the geometry sized after it, even where the cap is tight.
@@ -671,6 +707,7 @@ int main() {
     }
 
     test_window_sizing();
+    test_mapped_host_experts_are_not_staged();
     test_ring_cap_is_loan_invariant();
     test_loan_converges_on_the_post_loan_ring();
     test_loan_whose_post_loan_ring_exceeds_the_cap_is_refused();
