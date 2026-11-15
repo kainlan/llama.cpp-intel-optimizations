@@ -817,6 +817,21 @@ int main() {
         CHECK(rule(idx, c0, no_ring, true, false) == "ring exceeds an eleventh of resident plus lent expert bytes");
         CHECK(rule(idx, c0, ring_geo, false, false) == "queue not in order");
         CHECK(rule(idx, c0, ring_geo, true, true) == "reserve refused");
+        // A layer whose host experts the plan left in their mapping stages none of them, so the executor cannot claim
+        // it: the rule names the plan's choice, the cause, ahead of the claim and of every later rule. A layer
+        // unclaimed for another reason (layer 1's fused entry) and a claimed layer answer as before.
+        placement_plan mapped_plan = make_plan();
+        for (placement_entry & e : mapped_plan.entries) {
+            if (e.layer_id == 0 && e.expert_id >= 0 && !e.on_device) {
+                e.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+            }
+        }
+        const moe_stream_plan_index mapped = index_of(mapped_plan, claims_all);
+        CHECK(rule(mapped, layer_info(mapped, 0), ring_geo, true, false) == "host experts left mapped by the plan");
+        CHECK(rule(mapped, layer_info(mapped, 0), no_ring, false, true) == "host experts left mapped by the plan");
+        CHECK(rule(mapped, layer_info(mapped, 1), ring_geo, true, false) == "executor does not claim");
+        CHECK(rule(mapped, layer_info(mapped, 2), ring_geo, true, false) ==
+              "region smaller than the largest streamable matrix");
         // None of the seven: named anyway, so no ring-unavailable line goes unexplained.
         CHECK(rule(idx, c0, ring_geo, true, false) == "region smaller than the largest streamable matrix");
         CHECK(rule(partial, layer_info(partial, 2), ring_geo, true, false) ==

@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -234,6 +235,17 @@ void test_mapped_host_experts_are_not_staged() {
     CHECK(idx.layers.count(0) == 1 && !ggml_sycl::moe_stream_layer_claimed(idx.layers.at(0)));
     CHECK(ggml_sycl::moe_stream_plan_ring_geometry(mapped, 0, nullptr, claims_all, hints).bytes == 0);
 
+    // A mapping load marks device entries FILE_MAPPED too (their staging source); a lent device triplet is still asked.
+    for (ggml_sycl::placement_entry & e : mapped.entries) {
+        if (e.on_device) {
+            e.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+        }
+    }
+    const std::unordered_set<uint64_t> lend = { ggml_sycl::moe_stream_table_key(3, 0, expert_tensor_role::UNKNOWN) };
+    idx = ggml_sycl::moe_stream_plan_index_build(mapped, 0, nullptr, claims_all, hints, &lend);
+    CHECK(idx.layers.count(3) == 1 && ggml_sycl::moe_stream_layer_claimed(idx.layers.at(3)));
+    CHECK(idx.window_slots == 1);
+
     // One mapped expert in a pinned layer leaves the layer unclaimed, and the ring is sized over the others.
     placement_plan mixed = make_typed_plan();
     for (ggml_sycl::placement_entry & e : mixed.entries) {
@@ -244,6 +256,7 @@ void test_mapped_host_experts_are_not_staged() {
     idx = ggml_sycl::moe_stream_plan_index_build(mixed, 0, nullptr, claims_all, hints);
     CHECK(!ggml_sycl::moe_stream_layer_claimed(idx.layers.at(0)));
     CHECK(ggml_sycl::moe_stream_layer_claimed(idx.layers.at(2)));
+    CHECK(idx.window_slots == 3);  // layer 2's three items per role still size the window
 
     // The control: the same plan with every host expert pinned is claimed, as test_window_sizing sizes it.
     const placement_plan pinned = make_typed_plan();
