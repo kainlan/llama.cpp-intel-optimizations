@@ -5839,10 +5839,12 @@ I-5, §F2). It is the commit that changes every SYCL load.
 - Lead, in this order (r1 I-8, m-14, m-15):
   1. `POSIX_FADV_DONTNEED` over shard 3, then `fincore` on it. Pre-registered:
      ≤ 1 MiB resident.
-  2. **Qwen3.8 Q8_0 on `level_zero:0`, default load flags, `-c 4096`, the
-     baseline completion**: `env GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1
-     GGML_SYCL_MOE_PIN_HOST_EXPERTS=0 ONEAPI_DEVICE_SELECTOR=level_zero:0
-     ./build/bin/llama-completion -m <Qwen3.8 Q8_0> -no-cnv -v -c 4096 -p
+  2. **Qwen3.8 Q8_0 on `level_zero:0`, default load flags with the pin's
+     opt-out (the routed host experts stay mapped, not the default pinned
+     load), `-c 4096`, the baseline completion**: `env
+     GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1 GGML_SYCL_MOE_PIN_HOST_EXPERTS=0
+     ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion -m
+     <Qwen3.8 Q8_0> -no-cnv -v -c 4096 -p
      'The capital of France is' -n 32 --seed 42 --temp 0 >step2.out
      2>step2.err`, the run2 vehicle (r3 m2).
      The trace variable is part of the command, not the environment the
@@ -5983,9 +5985,13 @@ I-5, §F2). It is the commit that changes every SYCL load.
   3. **The same `llama-completion` Qwen run with no `-c`** (the
      default-context arm), at `n_ctx = n_ctx_train = 262144`
      (`run2.log:131`): `env GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1
-     ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion -m
-     <Qwen3.8 Q8_0> -no-cnv -v -p 'The capital of France is' -n 32 --seed 42
-     --temp 0 >step3.out 2>step3.err`. The same precondition applies.
+     GGML_SYCL_MOE_PIN_HOST_EXPERTS=0 ONEAPI_DEVICE_SELECTOR=level_zero:0
+     ./build/bin/llama-completion -m <Qwen3.8 Q8_0> -no-cnv -v -p 'The
+     capital of France is' -n 32 --seed 42 --temp 0 >step3.out
+     2>step3.err`. The same precondition applies. The command carries the
+     pin's opt-out for the same reason as step 2's: the step-2 criteria it
+     inherits, and the `MemAvailable` figure below, describe a load whose
+     routed host experts stay mapped.
      - **The KV.** 12 of the 48 layers carry KV: qwen4exp marks layer `i`
        recurrent unless `(i + 1) % full_attention_interval == 0`
        (`src/models/qwen4exp.cpp:132-134`), and the interval is 4
