@@ -922,6 +922,42 @@ def test_fully_staged_layer_leaves_hybrid_mutants():
     assert not c(mutate(SYCL, PLAN_HAS_CPU, "pp_onednn_batched_claims_staged_layer = false; " + PLAN_HAS_CPU))
 
 
+# ---- a prompt op of a layer decided for the CPU: the phase says which layers those are -------------------------------
+
+CPU_DECIDED_SIG = "bool moe_stream_phase::cpu_decided(int layer) const"
+CPU_DECIDED_BODY = "return decision_of(layer).choice == moe_exec_choice::CPU;"
+
+
+def claim_phase_names_cpu_decided_layers(phase: str) -> bool:
+    """moe_stream_phase::cpu_decided answers from the layer's decision alone, the one begin_layer made in this
+    micro-batch: true exactly for a CPU choice, whatever its reason. A layer begin_layer has not decided, and a
+    layer with no host entry, has no decision and answers false (decision_of gives NOT_CONSULTED). It reads no ring
+    state and no index entry, so it is const and cannot reserve."""
+    b = body(norm(phase), CPU_DECIDED_SIG)
+    return b != "" and b.count("return ") == 1 and CPU_DECIDED_BODY in b and "ring_ready(" not in b
+
+
+def test_phase_names_cpu_decided_layers():
+    assert claim_phase_names_cpu_decided_layers(PHASE), first_missing(
+        "ggml/src/ggml-sycl/moe-stream-plan.cpp: body of moe_stream_phase::cpu_decided",
+        body(norm(PHASE), CPU_DECIDED_SIG), CPU_DECIDED_BODY, signature=CPU_DECIDED_SIG)
+
+
+def test_phase_names_cpu_decided_layers_mutants():
+    c = claim_phase_names_cpu_decided_layers
+    # A RING decision named as the CPU's.
+    assert not c(mutate(PHASE, CPU_DECIDED_BODY, "return decision_of(layer).choice == moe_exec_choice::RING;"))
+    # Every layer the executor does not take, an undecided one included.
+    assert not c(mutate(PHASE, CPU_DECIDED_BODY, "return decision_of(layer).choice != moe_exec_choice::RING;"))
+    # Only one reason counted: a forced or a declined layer would stay hybrid.
+    assert not c(mutate(PHASE, CPU_DECIDED_BODY,
+                        "return decision_of(layer).reason == moe_exec_reason::RING_UNAVAILABLE;"))
+    # A second answer ahead of the decision.
+    assert not c(mutate(PHASE, CPU_DECIDED_BODY,
+                        "if (index_.layers.find(layer) == index_.layers.end()) { return true; } "
+                        + CPU_DECIDED_BODY))
+
+
 def claim_decode_builds_skip_the_phase(sycl: str) -> bool:
     """A decode build never takes the phase: `rows > 1` is the first term of the phase pointer's condition, ahead of
     the layer, the role and the stage-table lookup, which all read it. The refusal lambda runs only at a stage-table

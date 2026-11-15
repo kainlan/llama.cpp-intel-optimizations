@@ -281,6 +281,74 @@ void test_declined_layer(const moe_stream_layer_info & claimed, const ggml_sycl:
     CHECK(ggml_sycl::moe_stream_executor_claims(claimed, geo));
 }
 
+// Which executor runs a prompt op of a layer decided for the CPU (moe_pp_cpu_split_choose). The counts are the plan's
+// for one (layer, role) of 32 experts: found, host, on_device (any device), on_target (the op's device).
+ggml_sycl::moe_pp_cpu_split_facts split_facts(int64_t found, int64_t host, int64_t on_device, int64_t on_target) {
+    ggml_sycl::moe_pp_cpu_split_facts f;
+    f.cpu_decided      = true;
+    f.triplet_role     = true;
+    f.island_runs_type = true;
+    f.experts          = 32;
+    f.counts.found     = found;
+    f.counts.host      = host;
+    f.counts.on_device = on_device;
+    f.counts.on_target = on_target;
+    return f;
+}
+
+void test_pp_cpu_split() {
+    using ggml_sycl::moe_pp_cpu_split;
+    using ggml_sycl::moe_pp_cpu_split_choose;
+    using ggml_sycl::moe_pp_cpu_split_facts;
+    // Every expert on the host: the island runs the op, whether or not the executor would take a device part.
+    const moe_pp_cpu_split_facts all_host = split_facts(32, 32, 0, 0);
+    CHECK(moe_pp_cpu_split_choose(all_host) == moe_pp_cpu_split::ISLAND);
+    moe_pp_cpu_split_facts f = all_host;
+    f.executor_takes_part    = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::ISLAND);
+    // Each of the three gates alone keeps the op hybrid: no CPU decision, a role outside the triplet, a type the
+    // island has no kernel for.
+    f             = all_host;
+    f.cpu_decided = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    f              = all_host;
+    f.triplet_role = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    f                  = all_host;
+    f.island_runs_type = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // A mixed op is split only when the executor takes its device experts.
+    const moe_pp_cpu_split_facts mixed = split_facts(32, 12, 20, 20);
+    CHECK(moe_pp_cpu_split_choose(mixed) == moe_pp_cpu_split::NONE);
+    f                     = mixed;
+    f.executor_takes_part = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::EXECUTOR_AND_ISLAND);
+    f.cpu_decided = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // An expert the plan has no entry for, on an all-host op and on a mixed one.
+    CHECK(moe_pp_cpu_split_choose(split_facts(31, 31, 0, 0)) == moe_pp_cpu_split::NONE);
+    f                     = split_facts(31, 11, 20, 20);
+    f.executor_takes_part = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // An expert on a device other than the op's.
+    f                     = split_facts(32, 12, 20, 19);
+    f.executor_takes_part = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    f                     = split_facts(32, 31, 1, 0);
+    f.executor_takes_part = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // No host expert: the op is resident, and the executor's resident claim owns it.
+    f                     = split_facts(32, 0, 32, 32);
+    f.executor_takes_part = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // No expert count.
+    f         = all_host;
+    f.experts = 0;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // The default facts choose nothing.
+    CHECK(moe_pp_cpu_split_choose(moe_pp_cpu_split_facts()) == moe_pp_cpu_split::NONE);
+}
+
 // The decision log prints a declined layer through the change line's fixed format, with the reason "declined", which is
 // the line the gate's Q_decline arm scores; the summary counts it as a cpu layer-ubatch and not as a forced one.
 void capture_line(void * ctx, const char * line) {
@@ -786,6 +854,9 @@ int main() {
         }
         test_declined_line();
     }
+
+    // ---- which executor runs a prompt op of a layer decided for the CPU (moe_pp_cpu_split_choose) ----
+    test_pp_cpu_split();
 
     // ---- why a layer answered RING_UNAVAILABLE: the first rule that holds, in a fixed order ----
     {
