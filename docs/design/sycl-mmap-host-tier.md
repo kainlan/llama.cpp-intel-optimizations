@@ -3436,6 +3436,10 @@ created") describes a path that does not run.
   whose routed host experts are pinned for the window ring.
 
 **Pre-registered Qwen zones and pre-size after C4** (r1 C-1, r2 I-1).
+These figures hold when the routed host experts stay mapped
+(`GGML_SYCL_MOE_PIN_HOST_EXPERTS=0`, as §7's C4 step 2 runs). A mapping load
+that keeps the window ring's pin charges them to `weight_host_bytes` and sizes
+WEIGHT and the pre-size for them (§4.4).
 - Host experts are all AOS, registered in place (`gs:33442-33462`), so
   `weight_host_bytes` = 0 and `host_cpu_owned_bytes` = 0. The host total is
   experts only: 61671 host tensors = 20557 groups x 3 (`run2.log:2824`).
@@ -5837,11 +5841,16 @@ I-5, §F2). It is the commit that changes every SYCL load.
      ≤ 1 MiB resident.
   2. **Qwen3.8 Q8_0 on `level_zero:0`, default load flags, `-c 4096`, the
      baseline completion**: `env GGML_SYCL_HOST_ZONE_ALLOC_TRACE=1
-     ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-completion -m
-     <Qwen3.8 Q8_0> -no-cnv -v -c 4096 -p 'The capital of France is' -n 32
-     --seed 42 --temp 0 >step2.out 2>step2.err`, the run2 vehicle (r3 m2).
+     GGML_SYCL_MOE_PIN_HOST_EXPERTS=0 ONEAPI_DEVICE_SELECTOR=level_zero:0
+     ./build/bin/llama-completion -m <Qwen3.8 Q8_0> -no-cnv -v -c 4096 -p
+     'The capital of France is' -n 32 --seed 42 --temp 0 >step2.out
+     2>step2.err`, the run2 vehicle (r3 m2).
      The trace variable is part of the command, not the environment the
-     lead happens to have (§M66; r5 I-3). `-v` is required: the zone, pre-size and demand
+     lead happens to have (§M66; r5 I-3). So is the pin's opt-out: every
+     zone, pre-size and pool criterion below describes a load whose routed
+     host experts stay mapped. A load that keeps the window ring's pin
+     charges them to `weight_host_bytes`, which moves WEIGHT, the pre-size
+     and the DMA staging pool (§4.4). `-v` is required: the zone, pre-size and demand
      criteria below read INFO lines, which `llama-completion` drops at its
      default threshold (§7 preamble).
 
@@ -5924,7 +5933,7 @@ I-5, §F2). It is the commit that changes every SYCL load.
        lines, and the arm is **VOID**, which counts as failed;
      - `[ATTN-HOST] staging not planned (host dispatch off)` once, and no
        staging demand (§4.4 criteria, §M69 (a));
-     - `DMA staging pool: 0.0 MB` when the routed host experts stay mapped;
+     - `DMA staging pool: 0.0 MB`;
      - **no `Pinned pool grow_zone: zone 0` line after the pre-size**, through
        the end of the completion (r2 I-2). This absence counts only because
        the same run printed the `Pinned pool pre_allocate: grew` line above,
