@@ -67,9 +67,10 @@
 #   Q_noc      the q0xu Q_noc arm (the same without -c)                          B70  tg >= 9.5, md5 25b7738a,
 #              watchdog 0, place line as --place-ref-noc, and the same md5/flip, refill and bulk refill rules as Q_tg
 #   Q_decline  Q_tok with GGML_SYCL_MOE_EXEC_DECLINE_LAYER=20                    B70  the knob turns layer 20's
-#              decision to cpu with reason "declined", so the executor does not claim it and it runs the hybrid path
-#              (llama.cpp-ny6i, the forced-decline proof of llama.cpp-8p5x c-0blp). Its references are the two auto
-#              loads that run before it, Q_tok and Q_tok_2: Qwen3.8 greedy decoding on the B70 flips between two texts
+#              decision to cpu with reason "declined", so the executor does not claim it and its host experts run
+#              on the prompt CPU island (llama.cpp-ny6i, the forced-decline proof of llama.cpp-8p5x c-0blp). Its
+#              references are the two auto loads that run before it, Q_tok and Q_tok_2: Qwen3.8 greedy decoding on
+#              the B70 flips between two texts
 #              from load to load (see Q_tok_cpu), so one md5 cannot be the reference. PASS needs at least one
 #              "[MOE-EXEC] layer 20: cpu (... declined)" line and no "[MOE-EXEC] layer 20: ring" line, the
 #              "[MOE-EXEC] summary:" cpu counts adding up to >= 1, stdout identical to Q_tok's or Q_tok_2's (md5; a
