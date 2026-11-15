@@ -29,9 +29,10 @@ What this gate pins:
     boundary runner's REFUSED count. A loan this prompt asked for that comes back REFUSED (never BUSY, which the runner
     re-posts) latches until end_prompt, with one WARN under an explicit ring or a trace;
   - a layer answering RING_UNAVAILABLE under an explicit ring or a trace prints one WARN per prompt that names the rule
-    (the first is the executor's claim, "executor does not claim") and the ring's inputs, in a fixed format, through the
-    decision log's WARN sink; the flag is cleared by end_prompt and never per micro-batch (lead ruling c-kcyf), and the
-    phase logs nothing else of its own but the refused-loan line, under the same gating;
+    (the first is host experts the plan left mapped, "host experts left mapped by the plan", then the executor's claim,
+    "executor does not claim") and the ring's inputs, in a fixed format, through the decision log's WARN sink; the
+    flag is cleared by end_prompt and never per micro-batch (lead ruling c-kcyf), and the phase logs nothing else of
+    its own but the refused-loan line, under the same gating;
   - begin_layer reports every layer it decides, under every policy, so the decision log keeps the cost model's choice;
     it weighs only its own layer, with no copy window (there is no layer-ahead copy), and stages nothing;
   - the copy is mem_copy_async on the unified cache's BCS queue, chained behind the ring region's gate (ruling A,
@@ -1938,8 +1939,14 @@ DIAG_RULE_CALL = "moe_stream_ring_unavailable_rule(index_, li, geo_, in_order_, 
 WARN_SIG = ("void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, "
             "const moe_stream_layer_info & li)")
 RULE_SIG = "static inline const char * moe_stream_ring_unavailable_rule("
+# The index counts the host items the plan left in their mapping, right where it decides they stage nothing, so the
+# rule can name the plan as the cause of a layer the executor then cannot claim.
+INDEX_MAPPED_COUNT = "if (mapped_host) { ++li.n_mapped_host; }"
+MAPPED_RULE = 'if (li.n_mapped_host != 0) { return "host experts left mapped by the plan"; }'
+CLAIM_RULE = 'if (!moe_stream_layer_claimed(li)) { return "executor does not claim"; }'
 # Each rule's condition, then its name, in the order the helper tests them.
 RULE_ORDER = (
+    "li.n_mapped_host != 0", '"host experts left mapped by the plan"',
     "!moe_stream_layer_claimed(li)", '"executor does not claim"',
     "idx.host_matrices_per_layer_max == 0", '"no host matrices of a streamable type"',
     "idx.matrix_bytes_max == 0", '"no matrix bytes"',
@@ -1959,11 +1966,16 @@ WARN_CALL = ("if (st.decision.reason == moe_exec_reason::RING_UNAVAILABLE) { "
 def claim_ring_unavailable_diagnostic(phase: str, hpp: str, tree: dict) -> bool:
     """Lead ruling c-kcyf: a ring-unavailable answer is explained in the log. The fixed format exists once in the
     backend, carries the rule the helper names and the ring's inputs, and goes out through the decision log's WARN sink;
-    the helper names each rule right after testing its condition, in a fixed order, the executor's claim first (W2: a
-    layer the executor does not claim has no ring to explain)."""
+    the helper names each rule right after testing its condition, in a fixed order: host experts the plan left mapped
+    first (the plan's choice is why the executor cannot claim such a layer), then the executor's claim (W2: a layer the
+    executor does not claim has no ring to explain). The index build counts the mapped items once, right after it
+    decides an item is mapped and before it asks the claim."""
     w = body(norm(phase), WARN_SIG)
+    h = norm(hpp)
     count = sum(norm(text).count(DIAG_FMT) for text in tree.values())
     return (count == 1 and ordered(w, DIAG_FMT, DIAG_RULE_CALL, DIAG_ARGS, DIAG_EMIT)
+            and h.count("++li.n_mapped_host;") == 1
+            and ordered(body(h, INDEX_BUILD_SIG), INDEX_MAPPED_HOST, INDEX_MAPPED_COUNT, INDEX_CLAIM_GUARD)
             and ordered(body(norm(hpp), RULE_SIG), *RULE_ORDER))
 
 
@@ -2003,8 +2015,16 @@ def test_ring_unavailable_diagnostic_mutants():
         PHASE, mutate(PLAN_HPP, '"ring exceeds an eleventh of resident plus lent expert bytes"',
                       '"ring exceeds 10% of resident expert bytes"'), SYCL_TREE)
     # The claim rule dropped, or asked after the ring's rules that it would otherwise be reported as.
-    claim_rule = 'if (!moe_stream_layer_claimed(li)) { return "executor does not claim"; }'
+    claim_rule = CLAIM_RULE
     assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, claim_rule, ""), SYCL_TREE)
+    # The mapped rule dropped: a layer whose host experts the plan left mapped would read "executor does not claim".
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, MAPPED_RULE, ""), SYCL_TREE)
+    # The mapped rule asked after the claim rule, which a mapped layer always fails first, so it would never be named.
+    after_claim = mutate(PLAN_HPP, MAPPED_RULE, "")
+    after_claim = mutate(after_claim, CLAIM_RULE, CLAIM_RULE + " " + MAPPED_RULE)
+    assert not claim_ring_unavailable_diagnostic(PHASE, after_claim, SYCL_TREE)
+    # The count never taken: the mapped rule could never hold.
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, INDEX_MAPPED_COUNT, ""), SYCL_TREE)
     late = mutate(PLAN_HPP, claim_rule, "")
     late = mutate(late, 'return "region smaller than the largest streamable matrix";',
                   claim_rule + ' return "region smaller than the largest streamable matrix";')
