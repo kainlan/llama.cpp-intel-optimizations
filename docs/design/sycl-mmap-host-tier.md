@@ -1185,7 +1185,7 @@ copied into a cache allocation at load.
 | weight | executor | materialized layout | `host_backing` | tier of the executed bytes |
 |---|---|---|---|---|
 | device-planned dense or expert | GPU | per-device (SOA, XMX, WOQ...) | `FILE_MAPPED` (its staging source) | `DEVICE_VRAM`, staged once from the mapping (§5.3); the mapped pages are dropped after staging (§4.6) |
-| host MoE expert, AOS | CPU (`CpuExpertPool`) | AOS = file | `FILE_MAPPED`; `PINNED`, copied from the mapping by the preload, when the plan holds window-ring room and the host plan fits | **`FILE_MAPPED`, served in place**; when `PINNED`, the pinned copy, which the window ring streams to the device for prompts |
+| host MoE expert, AOS | CPU (`CpuExpertPool`) | AOS = file | `FILE_MAPPED`; `PINNED`, copied from the mapping by the preload, when the plan holds window-ring room, the host plan fits and no lazy table refuses | **`FILE_MAPPED`, served in place**; when `PINNED`, the pinned copy, which the window ring streams to the device for prompts |
 | host MoE expert needing a CPU reorder (`register_host_aos_expert`'s SOA/XMX branch) | CPU | reordered | `FILE_MAPPED` source | copied: into `HOST_CPU` once th32 T1 lands, pinned until then |
 | planner-host dense, `GGML_SYCL_HOST_WEIGHT_LAYOUT=cpu` (default) | ggml-cpu | `CPU_REPACK` | `CPU_OWNED` | copied by ggml-cpu, outside the cache (ticket below) |
 | planner-host dense, `=plain` | ggml-cpu | file | `FILE_MAPPED` | `FILE_MAPPED` (`is_host`, so the CPU backend runs it) |
@@ -1196,10 +1196,11 @@ The GPU never reads a host weight in place, but the prompt phase's window ring
 copies host experts to the device, and it copies only from pinned memory. So in
 mmap mode the pinned pool holds staging windows, KV, scratch, compute buffers,
 the reordered experts until th32 T1 lands, and the routed host experts when the
-single-device plan holds window-ring room and its host plan fits the budget
-(`GGML_SYCL_MOE_PIN_HOST_EXPERTS=0` keeps them mapped). That pin is measured at
-47.6 GiB of pinned memory on the Qwen3.8 exps-IQ4_NL pack. Otherwise `PINNED` host
-backing survives only when `load_maps_files` is false.
+single-device plan holds window-ring room, its host plan fits the budget and
+no lazy table refuses it (`GGML_SYCL_MOE_PIN_HOST_EXPERTS=0` keeps them
+mapped). That pin is measured at 47.6 GiB of pinned memory on the Qwen3.8
+exps-IQ4_NL pack. Otherwise `PINNED` host backing survives only when
+`load_maps_files` is false.
 
 **Ticket to file:** `CPU_REPACK` weights are allocated by ggml-cpu's
 `ggml_backend_cpu_repack_buffer_type` (`ggml-cpu/repack.cpp:5238-5250`),
@@ -3431,7 +3432,8 @@ created") describes a path that does not run.
 - C4 sets `dma_streamed = 0` when no host weight is `PINNED`-backed. Both
   charges then vanish, and the log prints `DMA staging pool: 0.0 MB (no
   pinned host weights)`.
-- `-lm none` keeps it, pending 23mk's row 118.
+- `-lm none` keeps it, pending 23mk's row 118, and so does a mapping load
+  whose routed host experts are pinned for the window ring.
 
 **Pre-registered Qwen zones and pre-size after C4** (r1 C-1, r2 I-1).
 - Host experts are all AOS, registered in place (`gs:33442-33462`), so
@@ -5922,7 +5924,7 @@ I-5, §F2). It is the commit that changes every SYCL load.
        lines, and the arm is **VOID**, which counts as failed;
      - `[ATTN-HOST] staging not planned (host dispatch off)` once, and no
        staging demand (§4.4 criteria, §M69 (a));
-     - `DMA staging pool: 0.0 MB`;
+     - `DMA staging pool: 0.0 MB` when the routed host experts stay mapped;
      - **no `Pinned pool grow_zone: zone 0` line after the pre-size**, through
        the end of the completion (r2 I-2). This absence counts only because
        the same run printed the `Pinned pool pre_allocate: grew` line above,

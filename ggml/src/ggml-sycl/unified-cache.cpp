@@ -35839,43 +35839,64 @@ static void populate_host_zone_sizing(placement_plan &                          
 }
 
 // The host side of a finished placement: the device entries' staging source, the host zones, the ledger. Both builders
-// end with it. `ring_pin` says the routed experts were marked PINNED for the window ring. That answer is kept when the
-// plan holds ring room, its host bytes fit the budget and no lazy table refuses; otherwise the host experts go back to
-// the mapping, all of them, and the zones and the ledger are sized again for the plan that results. The fit is the
-// ledger's own figure, so a plan that keeps the pin never also logs the would-refuse line.
+// end with it. `host_experts_pinned` says this plan marked the routed experts PINNED for the window ring. That answer
+// is kept when the plan holds ring room, its host bytes fit the budget and no lazy table refuses; otherwise the host
+// experts go back to the mapping, all of them. With no ring room the move comes first and the zones and the ledger
+// are sized once; after a failed fit they are sized again for the plan that results, and the stay-mapped WARN says
+// which lines above it describe the plan that is not kept. The fit is the ledger's own figure, so a plan that keeps
+// the pin never also logs the would-refuse line.
 static void placement_plan_size_host_side(placement_plan &                           plan,
                                           const std::vector<placement_tensor_info> & tensor_inventory,
                                           int                                        n_experts,
                                           const placement_kv_info &                  kv_info,
                                           size_t                                     host_budget,
                                           const ring_lease *                         coverage_pin,
-                                          bool                                       ring_pin) {
+                                          bool                                       host_experts_pinned) {
     const double mb = 1024.0 * 1024.0;
-    if (ring_pin && plan.moe_stream_ring_reserve_bytes == 0) {
+    if (host_experts_pinned && plan.moe_stream_ring_reserve_bytes == 0) {
         // No ring exists for this plan, so nothing would stream the copies.
-        placement_move_host_expert_backing(plan, placement_host_backing::PINNED, placement_host_backing::FILE_MAPPED);
-        ring_pin = false;
+        const size_t moved = placement_move_host_expert_backing(plan, placement_host_backing::PINNED,
+                                                                placement_host_backing::FILE_MAPPED);
+        GGML_LOG_WARN(
+            "[PLACEMENT] routed host experts stay mapped, so prompts run them on the CPU: the plan holds no "
+            "window-ring room. %.1f MB of experts are served from the mapping\n",
+            moved / mb);
+        host_experts_pinned = false;
     }
     placement_mark_device_entries_file_mapped(plan);
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
     record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
-    if (!ring_pin) {
+    if (!host_experts_pinned) {
         return;
     }
-    const size_t pinned = plan.weight_host_bytes;
-    if (plan.host_planned_bytes <= plan.host_budget && plan.lazy_refusal.empty()) {
+    const bool over_budget = plan.host_planned_bytes > plan.host_budget;
+    if (!over_budget && plan.lazy_refusal.empty()) {
         GGML_LOG_INFO(
             "[PLACEMENT] routed host experts pinned for the window ring: %.1f MB, host plan %.1f MB of "
             "%.1f MB\n",
-            pinned / mb, plan.host_planned_bytes / mb, plan.host_budget / mb);
+            plan.weight_host_bytes / mb, plan.host_planned_bytes / mb, plan.host_budget / mb);
         return;
     }
+    const size_t      pinned_planned = plan.host_planned_bytes;
+    const std::string lazy_refusal   = placement_lazy_refusal_text(plan);
+    const size_t      moved =
+        placement_move_host_expert_backing(plan, placement_host_backing::PINNED, placement_host_backing::FILE_MAPPED);
+    std::string why;
+    if (over_budget) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "the pinned plan's %.1f MB of host memory exceeds the %.1f MB budget",
+                      pinned_planned / mb, plan.host_budget / mb);
+        why = text;
+    }
+    if (!lazy_refusal.empty()) {
+        why +=
+            (over_budget ? ", and a lazy table refuses it: " : "a lazy table refuses the pinned plan: ") + lazy_refusal;
+    }
     GGML_LOG_WARN(
-        "[PLACEMENT] routed host experts stay mapped, so prompts run them on the CPU: pinning %.1f MB "
-        "plans %.1f MB of host memory against a budget of %.1f MB (lazy refusal: %s). The host zones "
-        "are sized again without them\n",
-        pinned / mb, plan.host_planned_bytes / mb, plan.host_budget / mb, placement_lazy_refusal_text(plan).c_str());
-    placement_move_host_expert_backing(plan, placement_host_backing::PINNED, placement_host_backing::FILE_MAPPED);
+        "[PLACEMENT] routed host experts stay mapped, so prompts run them on the CPU: %s. %.1f MB of experts go back "
+        "to the mapping, and %.1f MB of window-ring room stays held. The host-ledger and lazy-table lines above "
+        "describe the pinned plan, which is not kept; the lines after this one describe the plan kept\n",
+        why.c_str(), moved / mb, plan.moe_stream_ring_reserve_bytes / mb);
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
     record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
 }
@@ -36487,12 +36508,15 @@ static size_t moe_stream_room_dry_pack(placement_plan &                       pl
 // would send every expert to the host for a ring the cap then refuses.
 // No room is held when no ring would exist (nothing staged, no host expert, no planned weight slot), or when the
 // ring's cap, an eleventh of the device's expert bytes, refuses the ring once its room displaces experts. The phase,
-// the ring and the loan are unchanged: a reserve this room cannot fund still asks for a loan.
+// the ring and the loan are unchanged: a reserve this room cannot fund still asks for a loan. `host_experts_pinned`
+// says this plan pinned its routed experts for the ring; holding none then sends them back to the mapping, so no ring
+// runs and no loan is asked, and the none-held lines leave the loan out.
 static void hold_moe_stream_ring_room(placement_plan &                       plan,
                                       const std::vector<moe_triplet_group> & groups,
                                       const placement_kv_info &              kv_info,
                                       int                                    device_id,
-                                      size_t &                               remaining) {
+                                      size_t &                               remaining,
+                                      bool                                   host_experts_pinned) {
     plan.moe_stream_ring_reserve_bytes = 0;
     if (kv_info.moe_stream_staged_types == 0 || plan.pp_moe_onednn_weight_slot_bytes == 0 || groups.empty()) {
         return;
@@ -36567,19 +36591,19 @@ static void hold_moe_stream_ring_room(placement_plan &                       pla
     if (room == 0) {
         return;  // no ring would exist with all of `remaining` for the experts: nothing to hold, nothing to say
     }
+    const char * loan = host_experts_pinned ? "" : ", so the prompt phase's reserve asks for an expert loan";
     if (settled && geo.bytes == 0) {
         GGML_LOG_WARN(
             "[SYCL-PLAN] MoE window ring room on device %d: none held: the ring's cap (an eleventh of the device's "
-            "expert bytes) refuses the %.1f MB ring once its room displaces experts, so the prompt phase's reserve "
-            "asks for an expert loan\n",
-            device_id, room / mb);
+            "expert bytes) refuses the %.1f MB ring once its room displaces experts%s\n",
+            device_id, room / mb, loan);
         return;
     }
     if (room > remaining) {
         GGML_LOG_WARN(
             "[SYCL-PLAN] MoE window ring room on device %d: none held: the %.1f MB ring exceeds the %.1f MB left "
-            "after the dense weights and the KV, so the prompt phase's reserve asks for an expert loan\n",
-            device_id, room / mb, remaining / mb);
+            "after the dense weights and the KV%s\n",
+            device_id, room / mb, remaining / mb, loan);
         return;
     }
     remaining -= room;
@@ -36617,7 +36641,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     }
     placement_plan plan;
     placement_plan_copy_host_backing_fact(plan, kv_info);
-    bool ring_pin                            = false;
+    bool host_experts_pinned                 = false;
     plan.vram_budget                         = vram_budget;
     plan.device_id                           = device_id;
     plan.multi_device                        = false;
@@ -37031,8 +37055,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         // The window ring's room, the last term held before the pack: the ring is sized over the host experts the pack
         // leaves, so the room is sized over the pack it predicts, after every group's charge is final. On a load that
         // maps files the routed experts are marked PINNED first, since the ring streams only pinned experts.
-        ring_pin = placement_pin_routed_experts_for_ring(plan, kv_info);
-        hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining);
+        host_experts_pinned = placement_pin_routed_experts_for_ring(plan, kv_info);
+        hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining, host_experts_pinned);
         moe_triplet_pack_stats stats;
         stats.groups  = moe_groups.size();
         stats.hotness = hotness_source != nullptr ? hotness_source : stats.hotness;
@@ -37149,7 +37173,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         !account_moe_mmid_workspaces(plan, { device_budget{ device_id, vram_budget, vram_budget } })) {
         reject_moe_mmid_workspaces(plan);
     }
-    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, host_budget, coverage_pin, ring_pin);
+    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, host_budget, coverage_pin,
+                                  host_experts_pinned);
 
     // Build the name->index lookup for O(1) queries
     plan.build_index();
@@ -39199,7 +39224,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     }
     // The multi-device builder sizes no window ring, so its routed experts are never pinned for one.
     placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, host_budget, coverage_pin,
-                                  /*ring_pin=*/false);
+                                  /*host_experts_pinned=*/false);
 
     plan.build_index();
     publish_moe_host_scatter_term(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
