@@ -1174,7 +1174,9 @@ def claim_mixed_cpu_op_is_split(sycl: str) -> bool:
     executor's record, in a list that lives inside the lambda, so a decline drops it. The op ends through one
     lambda at both points the executor answers true: a micro-batch with no device row, and the success tail after
     the done marker holds the device leases. There the island takes the experts set aside, with their leases, and
-    the rows are booked by where they ran. The call site still only returns."""
+    the rows are booked by where they ran, and nowhere else in the executor are host experts handed to the island:
+    it calls enqueue_host_expert_rows and dispatch_host_expert_groups once each, both inside that lambda. The call
+    site still only returns."""
     t = norm(sycl)
     m = body(t, MMID_SIG)
     lam = body(m, EXEC_SIG)
@@ -1184,6 +1186,7 @@ def claim_mixed_cpu_op_is_split(sycl: str) -> bool:
     return (lam != "" and fin != "" and m.count(CPU_SPLIT_BOTH) == 2 and lam.count(CPU_SPLIT_BOTH) == 2
             and m.count("pp_split_host_experts") == lam.count("pp_split_host_experts")
             and lam.count(SPLIT_LIST) == 1 and lam.count("finish_pp_batched_rows();") == 2
+            and lam.count("enqueue_host_expert_rows(") == 1 and lam.count("dispatch_host_expert_groups(") == 1
             and SPLIT_OLD_STATS not in lam and m.count(PER_EXPERT_ANCHOR) == 1
             and ordered(lam, SPLIT_TILED, SPLIT_LIST, SPLIT_FINISH_SIG, SPLIT_ROUTE, SPLIT_SET_ASIDE,
                         "pp_onednn_batched_expert expert;", SPLIT_ALL_HOST, SPLIT_NO_ACTIVE, SPLIT_RETAIN,
@@ -1234,6 +1237,8 @@ def test_mixed_cpu_op_is_split_mutants():
     m = mutate(SYCL, SPLIT_RETAIN + " } if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {",
                SPLIT_RETAIN + " finish_pp_batched_rows(); } if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {")
     assert not c(m)
+    # The island dispatched a second time, outside the finish lambda: after a decline, ahead of the per-expert path.
+    assert not c(mutate(SYCL, SPLIT_NO_ACTIVE, SPLIT_NO_ACTIVE + " " + SPLIT_DISPATCH))
     # The host experts are enqueued and never dispatched.
     assert not c(mutate(SYCL, SPLIT_PATH + ", no_local_entries, no_gpu_entries, pp_host_entries_for_log); "
                         + SPLIT_DISPATCH, SPLIT_PATH + ", no_local_entries, no_gpu_entries, pp_host_entries_for_log);"))
@@ -1253,7 +1258,7 @@ def test_mixed_cpu_op_is_split_mutants():
                         "return false; }"))
     # The split taken under a layout knob it has not run under.
     assert not c(mutate(SYCL, DEVICE_PART_KNOBS + " ", ""))
-    # A tiled down claimed: nothing repacks it.
+    # A tiled down claimed: the executor takes XMX_TILED for gate and up only.
     assert not c(mutate(SYCL, DEVICE_PART_DOWN + " " + DEVICE_PART_TAKES, DEVICE_PART_TAKES))
     # A layout the executor does not take.
     assert not c(mutate(SYCL, DEVICE_PART_TAKES + " } static bool ggml_sycl_moe_pp_cpu_island_runs_type",
