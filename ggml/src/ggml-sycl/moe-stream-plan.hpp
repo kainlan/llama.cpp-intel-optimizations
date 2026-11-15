@@ -230,8 +230,8 @@ static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints &
 // `hints` gives the executor's phase, which with the streamable items per role decides window_slots, the region the
 // ring is sized to. `as_host`, when given, names (layer, expert) triplets, keyed moe_stream_table_key(layer, expert,
 // UNKNOWN), whose gate/up/down entries resident on `device` are read as host entries: the plan as a loan of those
-// triplets would leave it (the transaction's update_expert_placement flips on_device and the target only), without
-// copying the plan (moe_stream_loan_size_post_loan).
+// triplets would leave it (the transaction flips on_device and the target, and publishes the backing of the pinned copy
+// it made), without copying the plan (moe_stream_loan_size_post_loan).
 static inline moe_stream_plan_index moe_stream_plan_index_build(
     const placement_plan &               plan,
     int                                  device,
@@ -293,8 +293,9 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(
         // host-planned expert whose backing holds no WEIGHT-zone block is read in place from its mapping, so it stages
         // NONE and its layer runs on the CPU. The claim is still asked for it, a pure predicate cached per
         // (layer, role): a mapped item the executor would claim is counted, so the ring-unavailable rule can tell a
-        // layer only the plan's backing keeps from the executor from one the executor refuses. A lent device triplet
-        // is not asked: its host copy is the loan's business.
+        // layer only the plan's backing keeps from the executor from one the executor refuses. A device triplet read
+        // through as_host stages as a pinned host item would: its backing is not read here, because the loan copies it
+        // into pinned memory and publishes its entry PINNED.
         const bool mapped_host = !e.on_device && !placement_plan::host_backing_sizes_weight_zone(e.host_backing);
         bool       claimed     = false;
         if (library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {

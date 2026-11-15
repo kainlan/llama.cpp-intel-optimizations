@@ -22841,6 +22841,13 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                 const ggml_sycl::expert_placement_key & k = placed[r];
                 (void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, /*on_device=*/refill,
                                                           refill ? device : -1);
+                // The plan says whose memory the host bytes are. A lent member's are the pinned copy this transaction
+                // minted. A re-admitted member is staged from the load's own source again: the mapping when the load
+                // maps files. The ring's plan index reads this to decide what it can stage.
+                (void) next_plan->set_expert_host_backing(k.layer_id, k.expert_id, k.role,
+                                                          refill && next_plan->host_backing_maps_files ?
+                                                              ggml_sycl::placement_host_backing::FILE_MAPPED :
+                                                              ggml_sycl::placement_host_backing::PINNED);
             }
             if (refill) {
                 ledger.triplets.pop_back();
