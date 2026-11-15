@@ -335,6 +335,67 @@ void test_ring_cap_is_loan_invariant() {
     CHECK(after.bytes == before.bytes);
 }
 
+// A loan on a load that maps files. Every device entry there reads FILE_MAPPED, its staging source. The transaction
+// copies a lent triplet into pinned memory and publishes it as a host entry with that backing, so the index stages it
+// as it did when it sized the loan through as_host. Published still FILE_MAPPED, the index would stage nothing for it.
+void test_a_lent_triplet_on_a_mapping_load_is_staged() {
+    ggml_sycl::moe_stream_window_hints hints;
+    hints.weight_slot_bytes = 10 * kSrc;  // fit = 10 -> G_plan = 5
+    // The lent triplet's device bytes, counted back as resident as the loan's caller counts them.
+    hints.lent_bytes        = 3 * kDst;
+
+    // A ring of the sized window, 2 regions x 4 slots x kSrc, needs 11 times its bytes resident. The anchor, one
+    // layer-3 entry, holds that alone, so each geometry below is a real ring and differs only by its window.
+    constexpr size_t sized_ring_bytes = 8 * kSrc;
+    placement_plan   plan             = make_typed_plan();
+    plan.host_backing_maps_files      = true;
+    for (ggml_sycl::placement_entry & e : plan.entries) {
+        if (e.expert_id >= 0 && e.on_device) {
+            e.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+        }
+        if (e.layer_id == 3 && e.expert_id == 0 && e.expert_role == expert_tensor_role::GATE) {
+            e.dst_size = 11 * sized_ring_bytes;
+        }
+    }
+    const std::unordered_set<uint64_t> as_host{ ggml_sycl::moe_stream_table_key(0, 0, expert_tensor_role::UNKNOWN) };
+    ggml_sycl::moe_stream_plan_index   sized;
+    const auto                         sized_geo =
+        ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, claims_all, hints, &sized, &as_host);
+    CHECK(sized.role_items_max == 4);  // layer 0: host experts 1, 5 and 6, and the lent expert 0
+    CHECK(sized.window_slots == 4);
+    CHECK(ggml_sycl::moe_stream_layer_claimed(sized.layers.at(0)));
+    CHECK(sized_geo.bytes == sized_ring_bytes);
+
+    const expert_tensor_role roles[3] = { expert_tensor_role::GATE, expert_tensor_role::UP, expert_tensor_role::DOWN };
+
+    // The control: the flip alone publishes a mapped host triplet. Layer 0 is no longer claimed: the executor's claim
+    // counts the triplet as left mapped and stages none of it, so the window falls to the other layers' three.
+    placement_plan flipped = plan;
+    for (expert_tensor_role role : roles) {
+        CHECK(flipped.update_expert_placement(0, 0, role, false, -1));
+    }
+    ggml_sycl::moe_stream_plan_index unstaged;
+    const auto                       unstaged_geo =
+        ggml_sycl::moe_stream_plan_ring_geometry(flipped, 0, nullptr, claims_all, hints, &unstaged);
+    CHECK(!ggml_sycl::moe_stream_layer_claimed(unstaged.layers.at(0)));
+    CHECK(unstaged.layers.at(0).n_mapped_host == 3);
+    CHECK(unstaged.window_slots == 3);
+    CHECK(unstaged_geo.bytes == 6 * kSrc);
+
+    // The transaction's two steps per member.
+    for (expert_tensor_role role : roles) {
+        CHECK(plan.update_expert_placement(0, 0, role, false, -1));
+        CHECK(plan.set_expert_host_backing(0, 0, role, ggml_sycl::placement_host_backing::PINNED));
+    }
+    ggml_sycl::moe_stream_plan_index published;
+    const auto                       published_geo =
+        ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, claims_all, hints, &published);
+    CHECK(published.role_items_max == sized.role_items_max);
+    CHECK(published.window_slots == sized.window_slots);
+    CHECK(ggml_sycl::moe_stream_layer_claimed(published.layers.at(0)));
+    CHECK(published_geo.bytes != 0 && published_geo.bytes == sized_geo.bytes);
+}
+
 // The loan request's stub hooks: what the phase's short reserve would post to the backend, and the backend's REFUSED
 // count, which no case here moves.
 struct loan_requests {
@@ -726,6 +787,7 @@ int main() {
     test_window_sizing();
     test_mapped_host_experts_are_not_staged();
     test_ring_cap_is_loan_invariant();
+    test_a_lent_triplet_on_a_mapping_load_is_staged();
     test_loan_converges_on_the_post_loan_ring();
     test_loan_whose_post_loan_ring_exceeds_the_cap_is_refused();
     test_loan_into_a_smaller_ring_is_covered();
