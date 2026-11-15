@@ -1198,7 +1198,7 @@ mmap mode the pinned pool holds staging windows, KV, scratch, compute buffers,
 the reordered experts until th32 T1 lands, and the routed host experts when the
 single-device plan holds window-ring room and its host plan fits the budget
 (`GGML_SYCL_MOE_PIN_HOST_EXPERTS=0` keeps them mapped). That pin is measured at
-48.7 GB of pinned memory on the Qwen3.8 exps-IQ4_NL pack. Otherwise `PINNED` host
+47.6 GiB of pinned memory on the Qwen3.8 exps-IQ4_NL pack. Otherwise `PINNED` host
 backing survives only when `load_maps_files` is false.
 
 **Ticket to file:** `CPU_REPACK` weights are allocated by ggml-cpu's

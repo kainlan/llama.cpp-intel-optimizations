@@ -29,9 +29,8 @@ cannot see:
    steps the early plan took in the order it took them, and the load's pre-fill helper calls the record pre-fill;
 7. the dry run leaves no trace: every per-device planner global the stage planners write (in their recording
    definitions, the host-side sequence, and the static functions those reach within two calls) or the shared
-   planner-input publish writes is
-   written again by the destructor of the dry run's saved state, so a later load reads what it would have read
-   without the dry run;
+   planner-input publish writes is written again by the destructor of the dry run's saved state, so a later load
+   reads what it would have read without the dry run;
 8. the residency decision's §10 plan lines, which the dry run's planner call prints, carry every field T3 can print,
    each from the plan's own terms: a STORAGE [PLACEMENT] line its cache's index bytes, a HOST one the host budget,
    the planned bytes and the leftover, and the [HOST-PLAN] lazy line the budget's source, the host weights, the WEIGHT

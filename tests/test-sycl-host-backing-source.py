@@ -9,8 +9,9 @@ every reader reads the meaning design 5efe §4.4 assigns it.
    `placement_plan` carries `host_cpu_owned_bytes`, `host_mapped_bytes` and `host_mapped_source_bytes`;
 2. nothing writes `weight_host_bytes`, `host_cpu_owned_bytes` or `host_mapped_bytes` except the plan's own
    `charge_host_weight` / `uncharge_host_weight` (and the `= 0` initialisation of a new plan): every accumulation site in
-   the planner (the single-device and multi-device builders, the layout-change delta, `update_expert_placement`) calls
-   one of the helpers, and the sites are the pinned list below;
+   the planner (the single-device and multi-device builders, the layout-change delta, `update_expert_placement`,
+   `placement_move_host_expert_backing`) calls one of the helpers, and the sites are the pinned list below; the move
+   helper uncharges and charges each expert by its own `host_backing`, at its `src_size`, around the flip;
 3. the readers: the plan snapshot's `planned_host_bytes` (staged candidate and published) is the PLACED figure; the
    lifecycle publication carries `charged_host_bytes` beside it into `ModelState`; the load summary prints placed and
    charged; both `Totals` lines print all four terms; `refresh_kv_byte_totals` counts the cpu-owned bytes and not the
@@ -169,17 +170,62 @@ def test_the_helpers_test_the_backing():
     assert "host_bytes" in charge, "charge_host_weight does not charge host_bytes"
 
 
-def test_the_planner_sites_are_the_pinned_list():
-    cpp = read(CPP)
+MOVE_HELPER = r"static\s+size_t\s+placement_move_host_expert_backing\s*\("
+MOVE_FLIP = (
+    r"\bplan\s*\.\s*uncharge_host_weight\s*\(\s*e\s*\.\s*host_backing\s*,\s*e\s*\.\s*src_size\s*\)\s*;\s*"
+    r"e\s*\.\s*host_backing\s*=\s*to\s*;\s*"
+    r"plan\s*\.\s*charge_host_weight\s*\(\s*e\s*\.\s*host_backing\s*,\s*e\s*\.\s*src_size\s*\)\s*;"
+)
+
+
+def planner_site_gaps(cpp: str) -> list:
+    gaps = []
     singles = len(re.findall(r"\bplan\s*\.\s*charge_host_weight\s*\(", cpp))
     groups = len(re.findall(r"\bplan\s*\.\s*charge_host_weight_entries\s*\(", cpp))
     undo = len(re.findall(r"\bplan\s*\.\s*uncharge_host_weight\s*\(", cpp))
     # single entry: the standalone dense host branch, the layout-change delta (extra), the multi-device standalone dense
-    # via commit; groups: the per-layer dense unit (both KV arms), the MoE host group, the multi-device commit
-    # (dense layer, MoE group), the cohesive host layer (dense + MoE); undo: the layout-change delta's freed bytes
-    assert singles >= 2, f"{singles} charge_host_weight call sites in the planner, expected the pinned single-entry sites"
-    assert groups >= 6, f"{groups} charge_host_weight_entries call sites in the planner, expected the pinned group sites"
-    assert undo >= 1, "the layout-change delta does not uncharge through the helper"
+    # via commit, placement_move_host_expert_backing's charge to the new backing; groups: the per-layer dense unit
+    # (both KV arms), the MoE host group, the multi-device commit (dense layer, MoE group), the cohesive host layer
+    # (dense + MoE); undo: the layout-change delta's freed bytes, placement_move_host_expert_backing's uncharge of the
+    # old backing
+    if singles < 3:
+        gaps.append(f"{singles} charge_host_weight call sites in the planner, expected the pinned single-entry sites")
+    if groups < 6:
+        gaps.append(f"{groups} charge_host_weight_entries call sites in the planner, expected the pinned group sites")
+    if undo < 2:
+        gaps.append(f"{undo} uncharge_host_weight call sites, expected the layout-change delta's and the move helper's")
+    hits = list(re.finditer(MOVE_HELPER, cpp))
+    if len(hits) != 1:
+        return gaps + [f"{len(hits)} definitions of placement_move_host_expert_backing, want 1"]
+    move = balanced(cpp, cpp.index("{", hits[0].end()))
+    if not re.search(MOVE_FLIP, move):
+        gaps.append("placement_move_host_expert_backing does not uncharge the old backing, flip it and charge the new "
+                    "one, each by e.host_backing at e.src_size")
+    return gaps
+
+
+def test_the_planner_sites_are_the_pinned_list():
+    gaps = planner_site_gaps(read(CPP))
+    assert not gaps, "\n".join(gaps)
+
+
+def test_the_planner_site_check_sees_each_dropped_piece():
+    cpp = read(CPP)
+    charge = r"(plan\s*\.\s*)charge_host_weight(\s*\(\s*e\s*\.\s*host_backing\s*,\s*e\s*\.\s*src_size\s*\)\s*;)"
+    uncharge = r"(plan\s*\.\s*)uncharge_host_weight(\s*\(\s*e\s*\.\s*host_backing\s*,\s*e\s*\.\s*src_size\s*\))"
+    mutants = {
+        "the move helper's charge is removed": re.sub(charge, r"\1charge_unused\2", cpp, count=1),
+        "the move helper's uncharge is removed": re.sub(uncharge, r"\1uncharge_unused\2", cpp, count=1),
+        "the move helper charges the old backing": re.sub(
+            r"(e\s*\.\s*host_backing\s*=\s*to\s*;\s*plan\s*\.\s*charge_host_weight\s*\(\s*)e\s*\.\s*host_backing",
+            r"\1from", cpp, count=1),
+        "the move helper charges the device size": re.sub(
+            r"(e\s*\.\s*host_backing\s*=\s*to\s*;\s*plan\s*\.\s*charge_host_weight\s*\(\s*e\s*\.\s*host_backing\s*,"
+            r"\s*e\s*\.\s*)src_size", r"\1dst_size", cpp, count=1),
+    }
+    for label, mutated in mutants.items():
+        assert mutated != cpp, f"the mutant '{label}' changed nothing"
+        assert planner_site_gaps(mutated), f"the mutant '{label}' is not caught"
 
 
 def test_update_expert_placement_moves_bytes_through_the_helpers():
