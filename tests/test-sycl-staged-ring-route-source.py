@@ -42,6 +42,9 @@ What this gate pins:
     the plan's residency counts, is read at the MMVQ-probe skip, at plan_has_cpu_experts and at the planner's prompt
     route. An op whose experts are all on the host makes the batched executor decline at its head, so the retained
     per-expert path runs it and its CPU island runs the host experts;
+  - a mixed op of such a layer is split: the batched executor runs the device experts it claims in their planned
+    layout (ggml_sycl_moe_pp_onednn_batched_claims_device_part) and sets the host experts aside, and the island runs
+    those where the executor answers true;
   - the device recipe is one function shared by a resident expert and a staged slot (one fact, one source);
   - the staged branch keeps no persistent handle: no moe_expert_handles[] write, no remember_moe_storage_handle, no
     handle retention; the transient pointer-table upload clears a staged slot's handle entry and keeps it out of the
@@ -1113,6 +1116,148 @@ def test_cpu_decided_op_leaves_hybrid_mutants():
     # The recipe restates the condition instead of asking the helper.
     assert not c(mutate(SYCL, HOST_RECIPE_CALL,
                         "if (normalized.actual_layout == GGML_LAYOUT_AOS && traits && traits->vec_dot) {"))
+
+
+# ---- a mixed prompt op of a layer decided for the CPU: device experts on the executor, host experts on the island ----
+
+DEVICE_PART_SIG = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_device_part("
+                   "const ggml_sycl::placement_plan & plan, const ggml_tensor * weight, int device)")
+DEVICE_PART_TYPE = "if (!weight || !ggml_sycl_moe_pp_batched_takes_type(weight->type)) { return false; }"
+DEVICE_PART_KNOBS = ("if (ggml_sycl_moe_decode_down_i8_hotset_enabled() || "
+                     "ggml_sycl_moe_prompt_down_transient_soa_enabled() || ggml_sycl_moe_gateup_bundle4_enabled()) { "
+                     "return false; }")
+DEVICE_PART_LAYOUT = ("if (!ggml_sycl_moe_tensor_plan_staged_layout(plan, weight, device, &planned_layout)) { "
+                      "return false; }")
+DEVICE_PART_ENTRIES = ("if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) { "
+                       "return false; }")
+DEVICE_PART_DOWN = ("if (planned_layout == GGML_LAYOUT_XMX_TILED && "
+                    "moe_classify_tensor(weight->name) == MOE_TENSOR_DOWN) { return false; }")
+DEVICE_PART_TAKES = "return ggml_sycl_moe_pp_batched_takes_layout(weight->type, planned_layout);"
+CPU_SPLIT_TAKES_PART = ("f.executor_takes_part = f.counts.host > 0 && f.counts.on_target > 0 && "
+                        "ggml_sycl_moe_pp_onednn_batched_claims_device_part(plan, weight, device);")
+CPU_SPLIT_BOTH = "pp_cpu_split == ggml_sycl::moe_pp_cpu_split::EXECUTOR_AND_ISLAND"
+SPLIT_TILED = ("const bool tiled_claimed_op = !pp_cpu_reference && route_layout == GGML_LAYOUT_XMX_TILED && "
+               "(ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device) || " + CPU_SPLIT_BOTH + ");")
+SPLIT_LIST = "std::vector<pp_split_host_expert> pp_split_host_experts;"
+SPLIT_FINISH_SIG = "auto finish_pp_batched_rows = [&]()"
+SPLIT_ROUTE = "moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));"
+SPLIT_SET_ASIDE = ("if (" + CPU_SPLIT_BOTH + " && route.kind == moe_expert_route_kind::HOST && route.ptr && "
+                   "route.lease.valid()) { pp_split_host_rows += rows; pp_split_host_experts.push_back({ "
+                   "static_cast<int32_t>(i02), row_begin, row_end, route.ptr, route.actual_layout, "
+                   "std::move(route.lease), route.has_ready_event, route.ready_event }); continue; }")
+SPLIT_ALL_HOST = ("if (active_experts.empty() && !pp_split_host_experts.empty()) { finish_pp_batched_rows(); "
+                  "return true; }")
+SPLIT_NO_ACTIVE = ("if (active_experts.empty() || max_rows_per_expert == 0) { "
+                   "return trace_batched_skip(moe_pp_batched_refusal::NO_ACTIVE_EXPERTS, nullptr); }")
+SPLIT_RETAIN = "retain_expert_leases_until(done);"
+SPLIT_LOG_ENTRY = ("append_pp_log_entries(pp_host_entries_for_log, h.row_begin, h.row_end, h.expert_id, h.ptr, "
+                   "ggml_sycl::mem_handle::HOST_DEVICE, h.layout, &h.lease);")
+SPLIT_ENQUEUE = ("enqueue_host_expert_rows(h.expert_id, make_matched_rows(h.row_begin, h.row_end), "
+                 "std::move(h.lease), h.has_ready_event, h.ready_event);")
+SPLIT_PATH = '"pp_cpu_split_island"'
+SPLIT_DISPATCH = "dispatch_host_expert_groups(pp_host_groups);"
+SPLIT_ROWS = ("const int64_t host_rows = static_cast<int64_t>(pp_split_host_rows); "
+              "const int64_t device_rows = static_cast<int64_t>(row_maps_total) - host_rows;")
+SPLIT_STATS = "g_moe_profile.moe_route_stats(pp_role, device_rows, 0, host_rows, 0, device_rows, host_rows, 0);"
+SPLIT_RESIDENCY = ("stats.record_route_residency(static_cast<int>(device_rows), 0, static_cast<int>(host_rows), 0, 0, "
+                   "0);")
+SPLIT_OLD_STATS = "moe_route_stats(pp_role, static_cast<int64_t>(row_maps_total), 0, 0, 0,"
+
+
+def claim_mixed_cpu_op_is_split(sycl: str) -> bool:
+    """A mixed prompt op of a layer decided for the CPU runs its device experts on the batched executor and its host
+    experts on the CPU island (moe_pp_cpu_split::EXECUTOR_AND_ISLAND). The helper asks the device-part claim only for
+    a mixed op. That claim reads the device experts' one planned layout from the plan and applies the resident
+    claim's checks to it (type, per-expert entries, down never tiled, the executor takes the layout), refuses under
+    the three opt-in layout knobs, and never asks the staged claim's type test. In the executor, the fail-closed
+    tiled guard covers a split op. The expert loop sets a host expert of a split op aside before it builds the
+    executor's record, in a list that lives inside the lambda, so a decline drops it. The op ends through one
+    lambda at both points the executor answers true: a micro-batch with no device row, and the success tail after
+    the done marker holds the device leases. There the island takes the experts set aside, with their leases, and
+    the rows are booked by where they ran. The call site still only returns."""
+    t = norm(sycl)
+    m = body(t, MMID_SIG)
+    lam = body(m, EXEC_SIG)
+    fin = body(lam, SPLIT_FINISH_SIG)
+    h = body(t, CPU_SPLIT_FOR_OP_SIG)
+    dp = body(t, DEVICE_PART_SIG)
+    return (lam != "" and fin != "" and m.count(CPU_SPLIT_BOTH) == 2 and lam.count(CPU_SPLIT_BOTH) == 2
+            and m.count("pp_split_host_experts") == lam.count("pp_split_host_experts")
+            and lam.count(SPLIT_LIST) == 1 and lam.count("finish_pp_batched_rows();") == 2
+            and SPLIT_OLD_STATS not in lam and m.count(PER_EXPERT_ANCHOR) == 1
+            and ordered(lam, SPLIT_TILED, SPLIT_LIST, SPLIT_FINISH_SIG, SPLIT_ROUTE, SPLIT_SET_ASIDE,
+                        "pp_onednn_batched_expert expert;", SPLIT_ALL_HOST, SPLIT_NO_ACTIVE, SPLIT_RETAIN,
+                        "finish_pp_batched_rows();")
+            and lam.count(SPLIT_ROUTE + " " + SPLIT_SET_ASIDE) == 1
+            and ordered(fin, SPLIT_LOG_ENTRY, SPLIT_ENQUEUE, SPLIT_PATH, SPLIT_DISPATCH, SPLIT_ROWS, SPLIT_STATS,
+                        SPLIT_RESIDENCY)
+            and h != "" and ordered(h, CPU_SPLIT_FACTS, CPU_SPLIT_TAKES_PART, CPU_SPLIT_CHOOSE)
+            and dp != "" and "claims_staged_type(" not in dp
+            and ordered(dp, DEVICE_PART_TYPE, DEVICE_PART_KNOBS, DEVICE_PART_LAYOUT, DEVICE_PART_ENTRIES,
+                        DEVICE_PART_DOWN, DEVICE_PART_TAKES))
+
+
+def test_mixed_cpu_op_is_split():
+    assert claim_mixed_cpu_op_is_split(SYCL), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: body of the try_pp_onednn_f16_batched lambda (the claim is searched in "
+        "ggml_sycl_moe_pp_onednn_batched_claims_device_part, the facts in ggml_sycl_moe_pp_cpu_split_for_op)",
+        body(body(norm(SYCL), MMID_SIG), EXEC_SIG),
+        SPLIT_TILED, SPLIT_LIST, SPLIT_FINISH_SIG, SPLIT_ROUTE, SPLIT_SET_ASIDE, SPLIT_ALL_HOST, SPLIT_NO_ACTIVE,
+        SPLIT_RETAIN, signature=EXEC_SIG)
+
+
+def test_mixed_cpu_op_is_split_mutants():
+    c = claim_mixed_cpu_op_is_split
+    # A tiled split op that declines falls to the per-expert path, which cannot read tiled bytes.
+    assert not c(mutate(SYCL, "(ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device) || "
+                        + CPU_SPLIT_BOTH + ");",
+                        "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);"))
+    # A host expert without a lease handed to the island.
+    assert not c(mutate(SYCL, "route.kind == moe_expert_route_kind::HOST && route.ptr && route.lease.valid()) { "
+                              "pp_split_host_rows += rows;",
+                        "route.kind == moe_expert_route_kind::HOST && route.ptr) { pp_split_host_rows += rows;"))
+    # Any op's host expert set aside, a windowed op's included.
+    assert not c(mutate(SYCL, "if (" + CPU_SPLIT_BOTH + " && route.kind == moe_expert_route_kind::HOST && route.ptr",
+                        "if (route.kind == moe_expert_route_kind::HOST && route.ptr"))
+    # The island's copy of the lease is a second owner: the list keeps one too.
+    assert not c(mutate(SYCL, "route.actual_layout, std::move(route.lease), route.has_ready_event",
+                        "route.actual_layout, route.lease, route.has_ready_event"))
+    # The set-aside expert also takes an executor slot.
+    assert not c(mutate(SYCL, "route.has_ready_event, route.ready_event }); continue; }",
+                        "route.has_ready_event, route.ready_event }); }"))
+    # A micro-batch with no device row declines, and a tiled op then throws.
+    assert not c(mutate(SYCL, SPLIT_ALL_HOST + " ", ""))
+    # The island skipped when no device row ran.
+    assert not c(mutate(SYCL, "!pp_split_host_experts.empty()) { finish_pp_batched_rows(); return true; }",
+                        "!pp_split_host_experts.empty()) { return true; }"))
+    # The island runs ahead of the device half, which can still decline.
+    m = mutate(SYCL, SPLIT_RETAIN + " } if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {",
+               SPLIT_RETAIN + " finish_pp_batched_rows(); } if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {")
+    assert not c(m)
+    # The host experts are enqueued and never dispatched.
+    assert not c(mutate(SYCL, SPLIT_PATH + ", no_local_entries, no_gpu_entries, pp_host_entries_for_log); "
+                        + SPLIT_DISPATCH, SPLIT_PATH + ", no_local_entries, no_gpu_entries, pp_host_entries_for_log);"))
+    # Every row booked to the device, the island's included.
+    assert not c(mutate(SYCL, "static_cast<int64_t>(row_maps_total) - host_rows;",
+                        "static_cast<int64_t>(row_maps_total);"))
+    # The list outlives the lambda: a decline leaves leases behind for the per-expert path's op.
+    m = mutate(SYCL, SPLIT_LIST + " ", "")
+    assert not c(m.replace(EXEC_SIG, SPLIT_LIST + " " + EXEC_SIG, 1))
+    # The claim asked for an op with no device expert, or with no host expert.
+    assert not c(mutate(SYCL, "f.executor_takes_part = f.counts.host > 0 && f.counts.on_target > 0 && ",
+                        "f.executor_takes_part = "))
+    # The staged claim's type test asked: MXFP4 is never staged, so the 120B's mixed layer would stay hybrid.
+    assert not c(mutate(SYCL, DEVICE_PART_LAYOUT,
+                        "if (!ggml_sycl_moe_pp_batched_claims_staged_type(weight->type) || "
+                        "!ggml_sycl_moe_tensor_plan_staged_layout(plan, weight, device, &planned_layout)) { "
+                        "return false; }"))
+    # The split taken under a layout knob it has not run under.
+    assert not c(mutate(SYCL, DEVICE_PART_KNOBS + " ", ""))
+    # A tiled down claimed: nothing repacks it.
+    assert not c(mutate(SYCL, DEVICE_PART_DOWN + " " + DEVICE_PART_TAKES, DEVICE_PART_TAKES))
+    # A layout the executor does not take.
+    assert not c(mutate(SYCL, DEVICE_PART_TAKES + " } static bool ggml_sycl_moe_pp_cpu_island_runs_type",
+                        "return true; } static bool ggml_sycl_moe_pp_cpu_island_runs_type"))
 
 
 def claim_decode_builds_skip_the_phase(sycl: str) -> bool:
