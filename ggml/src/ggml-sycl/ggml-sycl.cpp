@@ -85061,6 +85061,8 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(const ggml_sycl
 // names the types the ring stages, and nothing is staged here. Three opt-in knobs change a device expert's bytes or
 // lifetime around the executor (the decode down hotset, the transient prompt down SOA, the gate/up bundle). The split
 // has not run under them, so the op keeps the hybrid route there.
+// Invariant: the split is correct only while the executor's route_layout equals the layout the plan gave the device
+// experts; when they differ, the executor declines the op.
 static bool ggml_sycl_moe_pp_onednn_batched_claims_device_part(const ggml_sycl::placement_plan & plan,
                                                                const ggml_tensor *               weight,
                                                                int                               device) {
@@ -85079,7 +85081,8 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_device_part(const ggml_sycl::
     if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) {
         return false;
     }
-    // Down never plans XMX_TILED, and the per-expert path cannot read tiled bytes (the resident claim's reason).
+    // The executor takes XMX_TILED for gate and up only, so a claimed tiled down would always decline, and a split
+    // op's tiled decline throws.
     if (planned_layout == GGML_LAYOUT_XMX_TILED && moe_classify_tensor(weight->name) == MOE_TENSOR_DOWN) {
         return false;
     }
