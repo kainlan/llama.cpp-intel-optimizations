@@ -35842,9 +35842,9 @@ static void populate_host_zone_sizing(placement_plan &                          
 // end with it. `host_experts_pinned` says this plan marked the routed experts PINNED for the window ring. That answer
 // is kept when the plan holds ring room, its host bytes fit the budget and no lazy table refuses; otherwise the host
 // experts go back to the mapping, all of them. With no ring room the move comes first and the zones and the ledger
-// are sized once; after a failed fit they are sized again for the plan that results, and the stay-mapped WARN says
-// which lines above it describe the plan that is not kept. The fit is the ledger's own figure, so a plan that keeps
-// the pin never also logs the would-refuse line.
+// are sized once; after a failed fit or a lazy refusal they are sized again for the plan that results, and the
+// stay-mapped WARN says which lines above it describe the plan that is not kept. The fit is the ledger's own figure,
+// so a plan that keeps the pin never also logs the would-refuse line.
 static void placement_plan_size_host_side(placement_plan &                           plan,
                                           const std::vector<placement_tensor_info> & tensor_inventory,
                                           int                                        n_experts,
@@ -35854,13 +35854,16 @@ static void placement_plan_size_host_side(placement_plan &                      
                                           bool                                       host_experts_pinned) {
     const double mb = 1024.0 * 1024.0;
     if (host_experts_pinned && plan.moe_stream_ring_reserve_bytes == 0) {
-        // No ring exists for this plan, so nothing would stream the copies.
+        // No ring exists for this plan, so nothing would stream the copies. A plan that put every expert on the device
+        // has no host expert to move back, and nothing for the line to report.
         const size_t moved = placement_move_host_expert_backing(plan, placement_host_backing::PINNED,
                                                                 placement_host_backing::FILE_MAPPED);
-        GGML_LOG_WARN(
-            "[PLACEMENT] routed host experts stay mapped, so prompts run them on the CPU: the plan holds no "
-            "window-ring room. %.1f MB of experts are served from the mapping\n",
-            moved / mb);
+        if (moved > 0) {
+            GGML_LOG_WARN(
+                "[PLACEMENT] routed host experts stay mapped, so prompts run them on the CPU: the plan holds no "
+                "window-ring room. %.1f MB of experts are served from the mapping\n",
+                moved / mb);
+        }
         host_experts_pinned = false;
     }
     placement_mark_device_entries_file_mapped(plan);

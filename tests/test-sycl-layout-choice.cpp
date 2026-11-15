@@ -1573,12 +1573,9 @@ struct env_var_scope_guard {
         }
     }
 
-    // llama.cpp-o3h1 quality review (final batch, F8): an RAII env-var
-    // restore guard that could be copied would double-restore (or leak, if
-    // moved-from and the moved-from copy's destructor still ran) -- this
-    // guard is used only as a single stack-local per test block, never
-    // needs to be copied or moved, so forbid both explicitly rather than
-    // leaving it to accident.
+    // An RAII env-var restore guard that could be copied would double-restore (or leak, if moved-from and the
+    // moved-from copy's destructor still ran) -- this guard is used only as a single stack-local per test block, never
+    // needs to be copied or moved, so forbid both explicitly rather than leaving it to accident.
     env_var_scope_guard(const env_var_scope_guard &)             = delete;
     env_var_scope_guard & operator=(const env_var_scope_guard &) = delete;
     env_var_scope_guard(env_var_scope_guard &&)                  = delete;
@@ -1752,6 +1749,38 @@ static ggml_sycl::placement_plan plan_mapping(size_t   budget,
     kv.load_locks_files             = locks;
     return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv, nullptr, n_exps, host_budget);
 }
+
+// The planner's line when its routed host experts go back to the mapping.
+constexpr const char * stay_mapped_line = "routed host experts stay mapped";
+
+// Counts the log lines that carry `needle` while it lives, and passes every line on to the callback it replaced, which
+// it puts back when the scope ends.
+struct log_line_counter {
+    const char *      needle;
+    size_t            count   = 0;
+    ggml_log_callback prev_cb = nullptr;
+    void *            prev_ud = nullptr;
+
+    explicit log_line_counter(const char * text) : needle(text) {
+        ggml_log_get(&prev_cb, &prev_ud);
+        ggml_log_set(on_log, this);
+    }
+
+    log_line_counter(const log_line_counter &)             = delete;
+    log_line_counter & operator=(const log_line_counter &) = delete;
+
+    ~log_line_counter() { ggml_log_set(prev_cb, prev_ud); }
+
+    static void on_log(ggml_log_level level, const char * text, void * user) {
+        auto * self = static_cast<log_line_counter *>(user);
+        if (text != nullptr && std::strstr(text, self->needle) != nullptr) {
+            self->count++;
+        }
+        if (self->prev_cb != nullptr) {
+            self->prev_cb(level, text, self->prev_ud);
+        }
+    }
+};
 }  // namespace ring_room_case
 
 // A budget whose experts fill the zone exactly (40 of 64 triplets) without the room: the planner holds the window
@@ -1886,16 +1915,45 @@ static bool run_moe_stream_ring_pins_host_experts_test() {
     // No planned weight slot, so the planner holds no ring room: the pin made before the room was sized goes back
     // before the host zones are sized, and nothing is pinned for a ring that cannot run.
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
-    const auto bare = plan_mapping(budget, roomy_host);
+    size_t                    bare_lines = 0;
+    ggml_sycl::placement_plan bare;
+    {
+        log_line_counter lines(stay_mapped_line);
+        bare       = plan_mapping(budget, roomy_host);
+        bare_lines = lines.count;
+    }
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
     const backing_count rc = count_backings(bare);
     if (rc.host == 0 || rc.host_pinned != 0 || bare.moe_stream_ring_reserve_bytes != 0 || bare.weight_host_bytes != 0 ||
-        bare.host_mapped_bytes != rc.host_src || bare.dma_staging_pool_bytes != 0) {
+        bare.host_mapped_bytes != rc.host_src || bare.dma_staging_pool_bytes != 0 || bare_lines != 1) {
         printf(
             "FAIL: a plan with no ring room leaves the experts mapped: host %zu, pinned %zu, room %zu, weight %zu, "
-            "mapped %zu (want %zu), DMA pool %zu\n",
+            "mapped %zu (want %zu), DMA pool %zu, stay-mapped lines %zu (want 1)\n",
             rc.host, rc.host_pinned, bare.moe_stream_ring_reserve_bytes, bare.weight_host_bytes, bare.host_mapped_bytes,
-            rc.host_src, bare.dma_staging_pool_bytes);
+            rc.host_src, bare.dma_staging_pool_bytes, bare_lines);
+        ok = false;
+    }
+
+    // Every expert fits on the device, so no ring room is held and nothing goes back to the mapping: the pin leaves
+    // no device entry PINNED, and the stay-mapped line, which reports host experts moved back, does not print.
+    const size_t              roomy_budget = base + 2 * static_cast<size_t>(n_triplets) * ring_bytes;
+    size_t                    full_lines   = 0;
+    ggml_sycl::placement_plan full;
+    {
+        log_line_counter lines(stay_mapped_line);
+        full       = plan_mapping(roomy_budget, roomy_host);
+        full_lines = lines.count;
+    }
+    const backing_count fc = count_backings(full);
+    if (device_triplets(full) != n_triplets || fc.host != 0 || fc.device_other != 0 ||
+        full.moe_stream_ring_reserve_bytes != 0 || full.weight_host_bytes != 0 || full.dma_staging_pool_bytes != 0 ||
+        full_lines != 0) {
+        printf(
+            "FAIL: a mapping load whose experts all fit on the device pins nothing and says nothing: %zu device "
+            "triplets (want %d), host %zu, device entries not mapped %zu, room %zu, weight %zu, DMA pool %zu, "
+            "stay-mapped lines %zu (want 0)\n",
+            device_triplets(full), n_triplets, fc.host, fc.device_other, full.moe_stream_ring_reserve_bytes,
+            full.weight_host_bytes, full.dma_staging_pool_bytes, full_lines);
         ok = false;
     }
 
