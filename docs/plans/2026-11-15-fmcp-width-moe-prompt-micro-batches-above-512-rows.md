@@ -47,11 +47,11 @@ plan starts before that merge. Task branches fork from `integ/th32` after it.
 7. **Width gate.** Each width (1024, 2048, 4096) runs the real-text perplexity 5 times with no fault. Every final
    figure is within 1% of the mean of 5 runs at 512 rows.
 
-## Decisions this plan asks the owner to confirm
+## Decisions the owner confirmed at the review gate (2026-11-15)
 
-The plan is written with the recommended answer to each. A different answer changes only the task named.
+The owner approved this plan for execution after the A10 merge, and confirmed each decision below as written.
 
-| # | Question | Recommended, as written | Task |
+| # | Question | Confirmed | Task |
 |---|---|---|---|
 | D1 | A device loss can also surface at a queue wait (`SYCL_CHECK`, which aborts after forking gdb) or at the graph boundary (which returns `GGML_STATUS_FAILED`, after which the application exits normally into the Level Zero destructor that hung on 2026-11-15). Does stage 1 cover those paths? | Yes. A latch records the loss. `SYCL_CHECK` then leaves through the fast exit instead of gdb and `abort()`. The graph boundary still returns `FAILED`, and an exit handler registered at the loss ends the process through the fast exit when the application leaves. | W1.3 |
 | D2 | Exit status of a process ended by a device loss. | 69, distinct from 1. A script can then tell a lost device from a failed test (llama.cpp-4lnb records that 1 is ambiguous today). Every other fatal op error keeps 1. | W1.1 |
