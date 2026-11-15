@@ -68,8 +68,9 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
       the tier);
   L9. init_mappings: prefetch 0 on a SYCL load (landed before this change; kept here as the §4.3 row);
   L10. load_all_data addresses a SYCL_Mapped tensor from its buffer's base, before the loader's lock and mmaps_used;
-  L11. the preload serves a SYCL_Mapped source in place: register_host_aos_expert and the host-planned dense copy
-      (§4.3's preload rows) take the mapping's owner (ggml_sycl_mapped_buffer_owner) instead of copying;
+  L11. the preload serves a SYCL_Mapped source in place: register_host_aos_expert (for an expert the plan left
+      mapped) and the host-planned dense copy (§4.3's preload rows) take the mapping's owner
+      (ggml_sycl_mapped_buffer_owner) instead of copying;
   L12. the SYCL_Mapped buft: its own get_name ("SYCL_Mapped"), is_host, listed by supports_buft; set_tensor and
       memset_tensor abort naming the tensor, clear naming the buffer's size; alloc_buffer aborts unconditionally (core
       answers a zero-size request first), naming the core entry point and the from-file hook;
@@ -611,7 +612,9 @@ def clause_l11_preload_serves_mapped_in_place(t: dict) -> list:
     gs = t[GS]
     problems = []
     aos = between(gs, "auto register_host_aos_expert = [&]", "bool any_cached = false;")
-    in_place = re.search(r"(\w+)\s*=\s*(?:!\s*tensor_source_is_device\s*&&\s*)?ggml_sycl_mapped_buffer_owner\s*\(", aos)
+    in_place = re.search(r"(\w+)\s*=\s*(?:!\s*tensor_source_is_device\s*&&\s*)?"
+                         r"(?:!\s*ggml_sycl::placement_plan::host_backing_sizes_weight_zone\s*\(\s*planned_backing\s*\)"
+                         r"\s*&&\s*)?ggml_sycl_mapped_buffer_owner\s*\(", aos)
     if "ggml_sycl_mapped_buffer_owner(" not in aos:
         problems.append("register_host_aos_expert copies a SYCL_Mapped expert instead of registering it in place")
     elif not in_place or not re.search(rf"if\s*\(\s*{in_place.group(1)}\s*\)\s*\{{\s*\w+\s*=\s*[^;]*\bexpert_aos\b",
@@ -1081,7 +1084,8 @@ MUTANTS = [
                     r"\1 mmaps_used[weight->idx].first = 0;")),
     ("register_host_aos_expert's in-place test is false", "L11",
      lambda t: _mut(t, GS, r"!\s*tensor_source_is_device\s*&&\s*"
-                           r"(ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer)", r"false && \1")),
+                           r"(!\s*ggml_sycl::placement_plan::host_backing_sizes_weight_zone\s*\(\s*planned_backing\s*\)"
+                           r"\s*&&\s*ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer)", r"false && \1")),
     ("SYCL_Mapped's alloc_buffer returns a zero-size dummy before aborting", "L12",
      lambda t: _mut(t, GS, MAPPED_ALLOC_BODY_RE + r"(GGML_ABORT\s*\()",
                     r"\1if (size == 0) { return ggml_backend_buffer_init(buft, {}, nullptr, 0); } \2")),

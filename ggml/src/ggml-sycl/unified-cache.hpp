@@ -375,6 +375,16 @@ struct placement_alternate_layout {
     int              target_device    = -1;  // -1 means same device as the owning placement_entry
 };
 
+// Whose memory a planned weight's host bytes live in (design 5efe §4.4). For a host-executed entry it is the memory
+// the CPU executes from; for a device-planned FILE_MAPPED entry it is the staging source. The plan keeps one byte term
+// per meaning, so a backing decides which term an entry's bytes land in and whether host_bytes is charged.
+enum class placement_host_backing : uint8_t {
+    PINNED,       // copied into the cache's pinned host pool
+    FILE_MAPPED,  // served from the model file's mapping; the page cache is not charged to host_bytes
+    HOST_CPU,     // copied into a cache-owned pageable host allocation
+    CPU_OWNED,    // copied by ggml-cpu outside the cache (CPU_REPACK); anonymous memory, charged
+};
+
 struct expert_placement_result {
     expert_placement_status                 status    = expert_placement_status::MISSING;
     int                                     layer_id  = -1;
@@ -382,6 +392,9 @@ struct expert_placement_result {
     expert_tensor_role                      role      = expert_tensor_role::UNKNOWN;
     std::string                             tensor_name;
     bool                                    on_device        = false;
+    // The plan's host backing for this expert. For a host-executed expert, a backing that sizes the WEIGHT zone means
+    // the preload holds it there; FILE_MAPPED means the CPU reads the mapping in place.
+    placement_host_backing                  host_backing     = placement_host_backing::PINNED;
     int                                     target_device    = -1;
     size_t                                  src_size         = 0;
     size_t                                  dst_size         = 0;
@@ -413,16 +426,6 @@ inline size_t placement_vram_charge_bytes(size_t bytes, size_t alignment = 256) 
     size_t charged = ((bytes + alignment - 1) / alignment) * alignment;
     return std::max<size_t>(charged, 256);
 }
-
-// Whose memory a planned weight's host bytes live in (design 5efe §4.4). For a host-executed entry it is the memory
-// the CPU executes from; for a device-planned FILE_MAPPED entry it is the staging source. The plan keeps one byte term
-// per meaning, so a backing decides which term an entry's bytes land in and whether host_bytes is charged.
-enum class placement_host_backing : uint8_t {
-    PINNED,       // copied into the cache's pinned host pool
-    FILE_MAPPED,  // served from the model file's mapping; the page cache is not charged to host_bytes
-    HOST_CPU,     // copied into a cache-owned pageable host allocation
-    CPU_OWNED,    // copied by ggml-cpu outside the cache (CPU_REPACK); anonymous memory, charged
-};
 
 // Which of an entry's sizes a group charge sums. The planner's host groups do not agree on one: the MoE host group
 // charges the file bytes, the dense layer unit and the multi-device MoE group the materialized layout's bytes.
@@ -1715,6 +1718,7 @@ struct placement_plan {
         result.on_device         = e.on_device;
         result.target_device     = e.target_device;
         result.src_size          = e.src_size;
+        result.host_backing      = e.host_backing;
         result.dst_size          = e.dst_size;
         result.vram_charge_size  = e.vram_charge_size;
         result.layout            = e.layout;

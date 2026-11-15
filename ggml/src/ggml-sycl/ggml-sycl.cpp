@@ -44474,8 +44474,11 @@ static void ggml_sycl_preload_model_weights() {
                         return layout;
                     };
 
+                    // One line per tensor when the pinned room for an expert the plan pinned could not be had.
+                    bool logged_pin_alloc_failed  = false;
                     auto register_host_aos_expert = [&](int64_t e, const uint8_t * expert_aos,
-                                                        const char * reason) -> bool {
+                                                        ggml_sycl::placement_host_backing planned_backing,
+                                                        const char *                      reason) -> bool {
                         if (!expert_aos || expert_size == 0) {
                             return false;
                         }
@@ -44501,12 +44504,15 @@ static void ggml_sycl_preload_model_weights() {
                             return false;
                         }
 
-                        // A SYCL_Mapped source is served in place: the CPU executes the file layout (host experts
-                        // are AOS), and the entry holds the mapping's owner (design 5efe §4.3-4.4). Nothing is copied
-                        // into memory the plan does not charge.
+                        // A SYCL_Mapped source is served in place when the plan left the expert mapped: the CPU
+                        // executes the file layout (host experts are AOS), and the entry holds the mapping's owner.
+                        // When the plan gave it a WEIGHT-zone block, the window ring streams it, and the ring copies
+                        // only from pinned memory, so it is copied out of the mapping as any other source is.
                         ggml_sycl::mem_handle host_owner;
                         const bool            served_in_place =
-                            !tensor_source_is_device && ggml_sycl_mapped_buffer_owner(tensor->buffer, &host_owner);
+                            !tensor_source_is_device &&
+                            !ggml_sycl::placement_plan::host_backing_sizes_weight_zone(planned_backing) &&
+                            ggml_sycl_mapped_buffer_owner(tensor->buffer, &host_owner);
                         void * host_ptr = nullptr;
                         if (served_in_place) {
                             host_ptr = const_cast<uint8_t *>(expert_aos);
@@ -44534,9 +44540,22 @@ static void ggml_sycl_preload_model_weights() {
                             ggml_sycl::host_mem_ledger_get().host_expert_copy_cumulative_bytes.fetch_add(
                                 expert_size, std::memory_order_relaxed);
                         } else if (!tensor_source_is_device) {
-                            // The mmap source itself, registered as unowned external storage.
+                            // No pinned room: the source is served in place. A SYCL_Mapped source keeps its mapping's
+                            // owner, as a planned in-place expert does; the window ring cannot stream this expert, so
+                            // the load says so once per tensor. Any other host source is registered unowned.
                             host_owner = {};
-                            host_ptr   = const_cast<uint8_t *>(expert_aos);
+                            if (ggml_sycl_mapped_buffer_owner(tensor->buffer, &host_owner)) {
+                                if (!logged_pin_alloc_failed) {
+                                    GGML_LOG_WARN(
+                                        "[MOE-LAYOUT] tensor=%s device=%d expert=%lld: no pinned room for "
+                                        "%zu bytes the plan pinned; served from the mapping, and the "
+                                        "window ring will not stream it\n",
+                                        tensor->name ? tensor->name : "?", device, static_cast<long long>(e),
+                                        expert_size);
+                                    logged_pin_alloc_failed = true;
+                                }
+                            }
+                            host_ptr = const_cast<uint8_t *>(expert_aos);
                         } else {
                             return false;
                         }
@@ -44819,7 +44838,7 @@ static void ggml_sycl_preload_model_weights() {
                                 }
                                 const uint8_t * expert_aos =
                                     static_cast<const uint8_t *>(tensor->data) + e * expert_size;
-                                if (register_host_aos_expert(e, expert_aos, "planner-host")) {
+                                if (register_host_aos_expert(e, expert_aos, placement.host_backing, "planner-host")) {
                                     any_cached = true;
                                     if (s1_trace) {
                                         fprintf(stderr,
