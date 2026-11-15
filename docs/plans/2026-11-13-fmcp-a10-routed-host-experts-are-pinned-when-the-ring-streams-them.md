@@ -18,7 +18,8 @@
 > A10.4 with the wider scope on 2026-11-14 ("Approve, wider scope": every `cpu` decision goes to the island), and
 > ruled "Full wide before merge" on 2026-11-15: A10 stays unmerged until a mixed layer also runs on the fast path.
 > A census and a device spike on GPT-OSS 120B and on the mapped Qwen pack came first ("Evidence for amendment 3").
-> The three tasks await the owner's review. Tasks A10.2, A10.2b and A10.3 are unchanged. The merge waits for A10.6.
+> The owner approved the three tasks on 2026-11-15 ("Split, as written"). Tasks A10.2, A10.2b and A10.3 are
+> unchanged. The merge waits for A10.6.
 
 **Goal:** on a normal load (`-lm auto`, which maps the file), the host-executed routed experts are held once, in
 pinned memory, when the device has a window ring and the host budget holds them. Prompts then take the ring without
@@ -303,9 +304,9 @@ over a mapped buffer. The lead's end-to-end runs 4 and 5 are the preload's devic
     pack the split measured 1.4% to 5.7% below amendment 2's narrow mode at pp2048. That mode runs the mixed
     layer's few device experts (14 of 512) with the per-expert kernels. The split is the drafted choice because
     it is one rule for every layout (the per-expert kernels cannot read a tiled expert) and its cost at a low
-    device share is small. The owner's review of amendment 3 decides between it and keeping the per-expert
+    device share is small. The owner chose it on 2026-11-15 ("Split, as written") over keeping the per-expert
     kernels for a mixed op whose device experts are in AOS. Running the two halves at the same time is a
-    follow-up.
+    follow-up (llama.cpp-peww).
 15. **What keeps the hybrid route at prefill:** a fused or chunked matrix; a type that needs its direct kernel
     (Q1_0, NVFP4) or has no CPU `vec_dot`; an expert the plan does not place, or places on another device; a load
     that routes experts to a second device (`GGML_SYCL_MOE_MULTI_GPU`, in line with decision 8); and a mixed op
@@ -1475,7 +1476,7 @@ paths: the two `moe-stream-plan` files.
 
 ### Task A10.5: a prompt op of a CPU-decided layer whose experts are all on the host runs the CPU island
 
-**Track:** G. **Depends on:** A10.4. **Added by amendment 3.** Ticket llama.cpp-ibg2.
+**Track:** G. **Depends on:** A10.4. **Added by amendment 3.** Ticket llama.cpp-r3ja.
 **File scope:**
 - Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp`: two helpers after
   `ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor`, and six sites inside `ggml_sycl_mul_mat_id`
@@ -1900,7 +1901,7 @@ paths: `ggml-sycl.cpp`, the pin, the two docs, the gate script.
 ### Task A10.6: a mixed prompt op of a CPU-decided layer runs its device experts on the batched executor and its host experts on the CPU island
 
 **Track:** G. **Depends on:** A10.5. **Added by amendment 3** (owner ruling "Full wide before merge"). Ticket
-llama.cpp-ibg2.
+llama.cpp-ord4.
 **File scope:**
 - Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp`: one new claim before `ggml_sycl_moe_pp_cpu_island_runs_type`, one
   line in `ggml_sycl_moe_pp_cpu_split_for_op`, and five sites inside the `try_pp_onednn_f16_batched` lambda
