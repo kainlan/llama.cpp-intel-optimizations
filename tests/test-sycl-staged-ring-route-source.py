@@ -37,6 +37,11 @@ What this gate pins:
     layer begin_layer was given, and the one bool clears plan_has_cpu_experts and joins the resident claim at the
     MMVQ-probe skip and the prompt route; decode keeps `ne12 == 1 ||` and the retained prompt batch keeps
     allow_materialize=false. The resolver asks the same question, once per build, for the executor's handoff;
+  - a prompt op of a layer the phase decided for the CPU leaves the hybrid world when the CPU island can run it
+    (moe_pp_cpu_split_choose): one variable, written beside the staged claim from moe_stream_phase::cpu_decided and
+    the plan's residency counts, is read at the MMVQ-probe skip, at plan_has_cpu_experts and at the planner's prompt
+    route. An op whose experts are all on the host makes the batched executor decline at its head, so the retained
+    per-expert path runs it and its CPU island runs the host experts;
   - the device recipe is one function shared by a resident expert and a staged slot (one fact, one source);
   - the staged branch keeps no persistent handle: no moe_expert_handles[] write, no remember_moe_storage_handle, no
     handle retention; the transient pointer-table upload clears a staged slot's handle entry and keeps it out of the
@@ -829,16 +834,20 @@ STAGED_LAYER_BEGIN = ("if (ids->ne[1] > 1 && ggml_sycl_moe_stream_prepare(ctx, s
 STAGED_LAYER_SET = "pp_onednn_batched_claims_staged_layer = ctx.moe_stream->executor_claims(stream_call.layer);"
 STAGED_LAYER_ASSIGN = "pp_onednn_batched_claims_staged_layer = ctx.moe_stream->"
 # The release site stays directly after begin_layer (claim_staged_pointer_released_with_ring); the bool follows it,
-# inside the same block, the claim's own (stream_call lives at function scope since llama.cpp-8epx).
+# and the CPU split after the bool, inside the same block, the claim's own (stream_call lives at function scope since
+# llama.cpp-8epx).
+CPU_SPLIT_SET = ("pp_cpu_split = ggml_sycl_moe_pp_cpu_split_for_op(*stream_call.plan, src0, ctx.device, "
+                 "ctx.moe_stream->cpu_decided(stream_call.layer));")
+CPU_SPLIT_NONE = "pp_cpu_split == ggml_sycl::moe_pp_cpu_split::NONE"
 STAGED_LAYER_SITE = ("*ctx.stream(), stream_call.op); ggml_sycl_moe_stream_release_payload(ctx); "
-                     + STAGED_LAYER_SET + " }")
+                     + STAGED_LAYER_SET + " " + CPU_SPLIT_SET + " }")
 RETAINED_BUILD = ("retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(src0, ctx.device, "
                   "prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]), "
                   "retained_prompt_layout, false, &ctx, ctx.stream());")
 PROBE_CLAIM = ("const bool pp_onednn_batched_claims_op = ne12 > 1 && (pp_onednn_batched_claims_staged_layer || "
                "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));")
 PLAN_HAS_CPU = ("plan_has_cpu_experts = plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && "
-                "!pp_onednn_batched_claims_staged_layer;")
+                "!pp_onednn_batched_claims_staged_layer && " + CPU_SPLIT_NONE + ";")
 ROUTE_CLAIM = ("const bool pp_onednn_batched_route_claims_prompt = prompt_batch && "
                "(pp_onednn_batched_claims_staged_layer || "
                "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));")
@@ -898,13 +907,14 @@ def test_fully_staged_layer_leaves_hybrid_mutants():
     # Keyed by another layer than the one the phase stages under.
     assert not c(mutate(SYCL, "executor_claims(stream_call.layer)", "executor_claims(moe_cache_layer_id(src0->name))"))
     # The phase asked before begin_layer decided the layer, so the first op of a layer always stays hybrid.
-    m = mutate(SYCL, " " + STAGED_LAYER_SET + " }", " }")
+    m = mutate(SYCL, " " + STAGED_LAYER_SET + " " + CPU_SPLIT_SET + " }", " " + CPU_SPLIT_SET + " }")
     early = STAGED_LAYER_BEGIN.replace("ctx.moe_stream->begin_layer(",
                                        STAGED_LAYER_SET + " ctx.moe_stream->begin_layer(")
     m = m.replace(STAGED_LAYER_BEGIN, early, 1)
     assert not c(m)
     # The plan's host experts keep the op hybrid: plan_has_cpu_experts is not cleared.
-    assert not c(mutate(SYCL, " && !pp_onednn_batched_claims_staged_layer;", ";"))
+    assert not c(mutate(SYCL, " && !pp_onednn_batched_claims_staged_layer && " + CPU_SPLIT_NONE + ";",
+                        " && " + CPU_SPLIT_NONE + ";"))
     # The MMVQ probes may consume a staged op before the executor sees it.
     assert not c(mutate(SYCL, "ne12 > 1 && (pp_onednn_batched_claims_staged_layer || "
                               "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));",
@@ -960,6 +970,115 @@ def test_phase_names_cpu_decided_layers_mutants():
                         + CPU_DECIDED_BODY))
     # An index read beside the decision: the answer is the decision's alone.
     assert not c(mutate(PHASE, CPU_DECIDED_BODY, "(void) index_.layers.size(); " + CPU_DECIDED_BODY))
+
+
+# ---- a prompt op of a layer decided for the CPU, with every expert on the host, runs the CPU island ------------------
+
+CPU_SPLIT_DECL = "ggml_sycl::moe_pp_cpu_split pp_cpu_split = ggml_sycl::moe_pp_cpu_split::NONE;"
+CPU_SPLIT_PROBE = ("if (!prompt_down_has_planned_specialized_layout && !pp_onednn_batched_claims_op && "
+                   + CPU_SPLIT_NONE + ") {")
+CPU_SPLIT_NEEDS_ROUTE = ("const bool planner_needs_prompt_route = has_placement_plan && placement_planned_moe && "
+                         "prompt_batch && " + CPU_SPLIT_NONE + " && !exact_layout_override && "
+                         "!pp_onednn_batched_route_claims_prompt;")
+CPU_SPLIT_EXECUTOR = ("auto try_pp_onednn_f16_batched = [&]() -> bool { "
+                      "if (pp_cpu_split == ggml_sycl::moe_pp_cpu_split::ISLAND) { return false; }")
+CPU_SPLIT_FOR_OP_SIG = ("static ggml_sycl::moe_pp_cpu_split ggml_sycl_moe_pp_cpu_split_for_op("
+                        "const ggml_sycl::placement_plan & plan, const ggml_tensor * weight, int device, "
+                        "bool cpu_decided)")
+CPU_SPLIT_FACTS = ("f.cpu_decided = cpu_decided; "
+                   "f.triplet_role = role == MOE_TENSOR_GATE || role == MOE_TENSOR_UP || role == MOE_TENSOR_DOWN; "
+                   "f.island_runs_type = ggml_sycl_moe_pp_cpu_island_runs_type(weight->type); "
+                   "f.experts = weight->ne[2] > 0 ? weight->ne[2] : 1; "
+                   "f.counts = plan.count_planned_experts(weight->name, f.experts, device);")
+CPU_SPLIT_CHOOSE = "return ggml_sycl::moe_pp_cpu_split_choose(f);"
+CPU_SPLIT_MULTI = ("if (g_moe_multi_gpu_active.load(std::memory_order_acquire)) { "
+                   "return ggml_sycl::moe_pp_cpu_split::NONE; }")
+ISLAND_TYPE_SIG = "static bool ggml_sycl_moe_pp_cpu_island_runs_type(ggml_type type)"
+ISLAND_TYPE_DIRECT = "if (ggml_sycl::moe_type_needs_direct_kernel(type)) { return false; }"
+ISLAND_TYPE_TRAITS = "return vdt != nullptr && vdt->from_float != nullptr;"
+
+
+def claim_cpu_decided_op_leaves_hybrid(sycl: str) -> bool:
+    """A prompt op whose layer the phase decided for the CPU leaves the hybrid route when the island can run it
+    (moe_pp_cpu_split_choose, which the host test covers). ggml_sycl_mul_mat_id asks once per op, beside the staged
+    claim and for the same layer, after begin_layer decided it: the phase says whether the decision is CPU
+    (`->cpu_decided(`), and one helper reads the rest from the plan the phase decided by and from the weight: the
+    role, whether the island runs the type, and the plan's residency counts for the op's device. One variable
+    carries the answer, written at that one site. Three readers ask whether it is NONE: the MMVQ-probe skip,
+    plan_has_cpu_experts and the planner's prompt route, so any split takes the op out of the hybrid world the way a
+    staged layer's op leaves it. The batched executor declines an ISLAND op at its head, ahead of the build guard,
+    so the retained per-expert path runs it in every build. The island's type test is the retained batch's own
+    condition for a host recipe, less the two types that need their direct kernel. A load that routes experts to a
+    second device answers NONE before any fact is read, so it keeps the route it has."""
+    t = norm(sycl)
+    m = body(t, MMID_SIG)
+    h = body(t, CPU_SPLIT_FOR_OP_SIG)
+    i = body(t, ISLAND_TYPE_SIG)
+    return (m != "" and m.count("pp_cpu_split = ") == 2 and m.count(CPU_SPLIT_DECL) == 1
+            and m.count(CPU_SPLIT_SET) == 1 and m.count("->cpu_decided(") == 1
+            and m.count("ggml_sycl_moe_pp_cpu_split_for_op(") == 1
+            and m.count(STAGED_LAYER_SITE) == 1 and m.count(CPU_SPLIT_PROBE) == 1 and m.count(PLAN_HAS_CPU) == 1
+            and m.count(CPU_SPLIT_NEEDS_ROUTE) == 1 and m.count(CPU_SPLIT_EXECUTOR) == 1
+            and m.count(CPU_SPLIT_NONE) == 3
+            and ordered(m, STAGED_LAYER_DECL, CPU_SPLIT_DECL, STAGED_LAYER_BEGIN, STAGED_LAYER_SITE, PROBE_CLAIM,
+                        CPU_SPLIT_PROBE, PLAN_HAS_CPU, ROUTE_CLAIM, CPU_SPLIT_NEEDS_ROUTE, HYBRID_WITH_PLAN,
+                        CPU_SPLIT_EXECUTOR, PER_EXPERT_ANCHOR)
+            and h != "" and ordered(h, CPU_SPLIT_MULTI, CPU_SPLIT_FACTS, CPU_SPLIT_CHOOSE)
+            and h.count("f.cpu_decided =") == 1
+            and i != "" and ordered(i, ISLAND_TYPE_DIRECT, ISLAND_TYPE_TRAITS))
+
+
+def test_cpu_decided_op_leaves_hybrid():
+    assert claim_cpu_decided_op_leaves_hybrid(SYCL), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id (the facts are searched in the body of "
+        "ggml_sycl_moe_pp_cpu_split_for_op, the type test in ggml_sycl_moe_pp_cpu_island_runs_type)",
+        body(norm(SYCL), MMID_SIG),
+        STAGED_LAYER_DECL, CPU_SPLIT_DECL, STAGED_LAYER_BEGIN, STAGED_LAYER_SITE, PROBE_CLAIM, CPU_SPLIT_PROBE,
+        PLAN_HAS_CPU, ROUTE_CLAIM, CPU_SPLIT_NEEDS_ROUTE, HYBRID_WITH_PLAN, CPU_SPLIT_EXECUTOR, PER_EXPERT_ANCHOR,
+        signature=MMID_SIG)
+
+
+def test_cpu_decided_op_leaves_hybrid_mutants():
+    c = claim_cpu_decided_op_leaves_hybrid
+    # The MMVQ probes run for the op, which a staged layer's op skips.
+    assert not c(mutate(SYCL, "!pp_onednn_batched_claims_op && " + CPU_SPLIT_NONE + ") {",
+                        "!pp_onednn_batched_claims_op) {"))
+    # The plan's host experts keep the op hybrid.
+    assert not c(mutate(SYCL, "!pp_onednn_batched_claims_staged_layer && " + CPU_SPLIT_NONE + ";",
+                        "!pp_onednn_batched_claims_staged_layer;"))
+    # The planner's prompt route keeps the op hybrid.
+    assert not c(mutate(SYCL, "prompt_batch && " + CPU_SPLIT_NONE + " && !exact_layout_override",
+                        "prompt_batch && !exact_layout_override"))
+    # The batched executor is asked for an op with no device expert.
+    assert not c(mutate(SYCL, "-> bool { if (pp_cpu_split == ggml_sycl::moe_pp_cpu_split::ISLAND) { return false; }",
+                        "-> bool {"))
+    # The executor declines every split, so a mixed op could never reach it.
+    assert not c(mutate(SYCL, "-> bool { if (pp_cpu_split == ggml_sycl::moe_pp_cpu_split::ISLAND) {",
+                        "-> bool { if (pp_cpu_split != ggml_sycl::moe_pp_cpu_split::NONE) {"))
+    # The phase asked before begin_layer decided the layer.
+    m = mutate(SYCL, " " + CPU_SPLIT_SET + " }", " }")
+    early = STAGED_LAYER_BEGIN.replace("ctx.moe_stream->begin_layer(",
+                                       CPU_SPLIT_SET + " ctx.moe_stream->begin_layer(")
+    assert not c(m.replace(STAGED_LAYER_BEGIN, early, 1))
+    # Keyed by another layer than the one the phase decides under.
+    assert not c(mutate(SYCL, "cpu_decided(stream_call.layer)", "cpu_decided(moe_cache_layer_id(src0->name))"))
+    # The counts asked of another plan than the one the phase decided by.
+    assert not c(mutate(SYCL, "ggml_sycl_moe_pp_cpu_split_for_op(*stream_call.plan, src0,",
+                        "ggml_sycl_moe_pp_cpu_split_for_op(*plan_owner, src0,"))
+    # A second writer of the variable.
+    assert not c(mutate(SYCL, PLAN_HAS_CPU,
+                        "pp_cpu_split = ggml_sycl::moe_pp_cpu_split::NONE; " + PLAN_HAS_CPU))
+    # A two-device load takes the island, which has only run beside one device's queue.
+    assert not c(mutate(SYCL, CPU_SPLIT_MULTI + " ", ""))
+    # The decision ignored: every op with host experts leaves the hybrid route, a RING layer's included.
+    assert not c(mutate(SYCL, "f.cpu_decided = cpu_decided;", "f.cpu_decided = true;"))
+    # The counts asked for every device: an expert on another card would look local.
+    assert not c(mutate(SYCL, "plan.count_planned_experts(weight->name, f.experts, device);",
+                        "plan.count_planned_experts(weight->name, f.experts, -1);"))
+    # The island handed a type that needs its direct kernel.
+    assert not c(mutate(SYCL, ISLAND_TYPE_DIRECT + " const auto * traits", "const auto * traits"))
+    # The island handed a type the retained batch gives no host recipe.
+    assert not c(mutate(SYCL, ISLAND_TYPE_TRAITS, "return true;"))
 
 
 def claim_decode_builds_skip_the_phase(sycl: str) -> bool:
