@@ -38397,6 +38397,15 @@ static size_t ggml_sycl_hold_ring_uncovered(int device) {
     return loan.geo.bytes > room_kept + lent ? loan.geo.bytes - room_kept - lent : 0;
 }
 
+// True iff `type` has a CPU vec_dot whose activation type quantizes from float: the type half of the HOST_CPU recipe's
+// condition (ggml_sycl_build_moe_resolved_batch). The recipe and the prompt CPU island's type test both ask it, so a
+// type the island takes always has a host recipe, and the two cannot drift.
+static bool ggml_sycl_moe_host_recipe_type_ok(ggml_type type) {
+    const auto * traits = ggml_sycl_get_type_traits_cpu(type);
+    const auto * vdt    = traits && traits->vec_dot ? ggml_sycl_get_type_traits_cpu(traits->vec_dot_type) : nullptr;
+    return vdt != nullptr && vdt->from_float != nullptr;
+}
+
 namespace ggml_sycl {
 
 const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
@@ -38671,8 +38680,7 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
         normalized.recipe.owner_device = normalized.owning_device;
         if (normalized.residency == moe_batch_residency::HOST) {
             const auto * traits = src0 ? ggml_sycl_get_type_traits_cpu(src0->type) : nullptr;
-            const auto * vdt = traits && traits->vec_dot ? ggml_sycl_get_type_traits_cpu(traits->vec_dot_type) : nullptr;
-            if (normalized.actual_layout == GGML_LAYOUT_AOS && traits && traits->vec_dot && vdt && vdt->from_float) {
+            if (normalized.actual_layout == GGML_LAYOUT_AOS && src0 && ggml_sycl_moe_host_recipe_type_ok(src0->type)) {
                 normalized.recipe.kind     = moe_batch_executor::HOST_CPU;
                 normalized.recipe.kernel   = moe_route_kernel::HOST_CPU;
                 normalized.recipe.queue    = moe_recipe_queue::NONE;
@@ -85047,16 +85055,14 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(const ggml_sycl
 }
 
 // Whether the prompt CPU island runs a host expert of `type`. The retained batch gives a host operand a HOST_CPU
-// recipe only for a type with a CPU vec_dot whose activation type quantizes from float (the recipe's own condition,
-// ggml_sycl_build_moe_resolved_batch), and the island's batched CPU kernel has no path for a type that needs its direct
-// kernel (moe_type_needs_direct_kernel).
+// recipe only for a type ggml_sycl_moe_host_recipe_type_ok accepts (the recipe's own condition, asked here rather than
+// restated), and the island's batched CPU kernel has no path for a type that needs its direct kernel
+// (moe_type_needs_direct_kernel).
 static bool ggml_sycl_moe_pp_cpu_island_runs_type(ggml_type type) {
     if (ggml_sycl::moe_type_needs_direct_kernel(type)) {
         return false;
     }
-    const auto * traits = ggml_sycl_get_type_traits_cpu(type);
-    const auto * vdt    = traits && traits->vec_dot ? ggml_sycl_get_type_traits_cpu(traits->vec_dot_type) : nullptr;
-    return vdt != nullptr && vdt->from_float != nullptr;
+    return ggml_sycl_moe_host_recipe_type_ok(type);
 }
 
 // Which executor runs one prompt op whose layer begin_layer decided (moe_pp_cpu_split_choose): the facts are read here,
@@ -86153,7 +86159,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // leaves it: it skips the MMVQ probes, clears plan_has_cpu_experts and drops the planner's prompt route. ISLAND
     // also makes the batched executor decline at its head, so the retained per-expert path runs the op and its CPU
     // island runs the host experts grouped per expert, where the hybrid route runs them a row at a time.
-    ggml_sycl::moe_pp_cpu_split pp_cpu_split = ggml_sycl::moe_pp_cpu_split::NONE;
+    ggml_sycl::moe_pp_cpu_split pp_cpu_split                          = ggml_sycl::moe_pp_cpu_split::NONE;
     // The prompt layer's stream call, filled at the claim below and alive for the whole op (llama.cpp-8epx): the
     // batched executor hands its op to window_begin, whose host_lease reads the call back through op.graph_ctx, which
     // points at the call (so it is neither copied nor moved).
