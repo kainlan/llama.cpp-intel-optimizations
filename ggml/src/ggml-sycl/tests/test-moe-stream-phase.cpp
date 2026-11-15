@@ -341,8 +341,9 @@ void test_pp_cpu_split() {
     f                     = split_facts(32, 0, 32, 32);
     f.executor_takes_part = true;
     CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
-    // No expert count.
-    f         = all_host;
+    // No expert count. The counts are ones the plan cannot produce (a host expert among none found): they pass every
+    // other gate, so the count gate alone answers.
+    f         = split_facts(0, 1, 0, 0);
     f.experts = 0;
     CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
     // The default facts choose nothing.

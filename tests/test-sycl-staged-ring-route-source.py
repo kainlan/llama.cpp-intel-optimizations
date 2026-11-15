@@ -934,7 +934,8 @@ def claim_phase_names_cpu_decided_layers(phase: str) -> bool:
     layer with no host entry, has no decision and answers false (decision_of gives NOT_CONSULTED). It reads no ring
     state and no index entry, so it is const and cannot reserve."""
     b = body(norm(phase), CPU_DECIDED_SIG)
-    return b != "" and b.count("return ") == 1 and CPU_DECIDED_BODY in b and "ring_ready(" not in b
+    return (b != "" and b.count("return ") == 1 and CPU_DECIDED_BODY in b and "ring_ready(" not in b
+            and "index_" not in b)
 
 
 def test_phase_names_cpu_decided_layers():
@@ -956,6 +957,8 @@ def test_phase_names_cpu_decided_layers_mutants():
     assert not c(mutate(PHASE, CPU_DECIDED_BODY,
                         "if (index_.layers.find(layer) == index_.layers.end()) { return true; } "
                         + CPU_DECIDED_BODY))
+    # An index read beside the decision: the answer is the decision's alone.
+    assert not c(mutate(PHASE, CPU_DECIDED_BODY, "(void) index_.layers.size(); " + CPU_DECIDED_BODY))
 
 
 def claim_decode_builds_skip_the_phase(sycl: str) -> bool:
