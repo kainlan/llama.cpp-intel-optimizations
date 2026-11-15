@@ -435,6 +435,40 @@ static inline bool moe_stream_executor_claims(const moe_stream_layer_info & li, 
     return geo.n_slots != 0 && moe_stream_layer_claimed(li);
 }
 
+// Which executor runs one prompt op of a layer the cost model decided for the CPU. NONE keeps the hybrid route. ISLAND
+// sends the op to the retained per-expert path, whose CPU island runs the host experts grouped per expert.
+// EXECUTOR_AND_ISLAND runs the op's device experts on the batched executor and its host experts on the island.
+enum class moe_pp_cpu_split : uint8_t { NONE, ISLAND, EXECUTOR_AND_ISLAND };
+
+// What moe_pp_cpu_split_choose reads about one prompt op. `counts` is the plan's for the op's (layer, role) over
+// `experts`, asked for the op's device.
+struct moe_pp_cpu_split_facts {
+    bool                    cpu_decided         = false;  // the layer's decision is CPU
+    bool                    triplet_role        = false;  // the weight is a GATE, UP or DOWN matrix
+    bool                    island_runs_type    = false;  // the CPU island has a kernel for the weight's type
+    bool                    executor_takes_part = false;  // the batched executor takes the op's device experts
+    int64_t                 experts             = 0;      // the weight's expert count
+    expert_residency_counts counts;
+};
+
+// The op leaves the hybrid route only when the island can run every host expert and nothing else is left over: each
+// expert is planned, on the host or on the op's own device, and at least one is on the host. With no device expert
+// the island runs the whole op. With some, the op is split only if the batched executor takes the device experts;
+// otherwise it stays hybrid, since the retained per-expert path cannot read every device layout.
+static inline moe_pp_cpu_split moe_pp_cpu_split_choose(const moe_pp_cpu_split_facts & f) {
+    if (!f.cpu_decided || !f.triplet_role || !f.island_runs_type) {
+        return moe_pp_cpu_split::NONE;
+    }
+    const expert_residency_counts & c = f.counts;
+    if (f.experts <= 0 || c.found != f.experts || c.host <= 0 || c.on_device != c.on_target) {
+        return moe_pp_cpu_split::NONE;
+    }
+    if (c.on_target == 0) {
+        return moe_pp_cpu_split::ISLAND;
+    }
+    return f.executor_takes_part ? moe_pp_cpu_split::EXECUTOR_AND_ISLAND : moe_pp_cpu_split::NONE;
+}
+
 // Why a layer answered RING_UNAVAILABLE, for the phase's once-per-prompt WARN (lead ruling c-kcyf): the first rule that
 // holds, in this order. A layer only the plan's backing keeps from the executor comes first
 // (moe_stream_layer_mapped_only): the executor would claim it once its mapped experts were pinned, so the plan's choice
@@ -1094,6 +1128,9 @@ class moe_stream_phase {
     // which begin_layer gives only to a layer the executor claims (moe_stream_executor_claims, asked again here), and
     // the ring is reserved (ring_ready()). A refused reserve answers false, and the layer stays hybrid.
     bool     executor_claims(int layer);
+    // True iff begin_layer weighed `layer` in this micro-batch and chose the CPU, for any reason. A layer with no
+    // host entry, and one begin_layer has not decided, answer false.
+    bool     cpu_decided(int layer) const;
     // Before the executor dequantizes one phase of (layer, role), on a layer executor_claims answered true for: every
     // host matrix of the window that the ring can take is in the stage table after this returns. One not there yet is
     // copied now, with the rest of its window, into a region of its own, on the copy queue behind the region's read
