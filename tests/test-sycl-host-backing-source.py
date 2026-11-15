@@ -324,9 +324,14 @@ def test_the_preload_serves_in_place_only_what_the_plan_left_mapped():
     fallback = balanced(body, fb_at.end() - 1)
     owner = re.search(r"ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer\s*,\s*&\s*host_owner\s*\)", fallback)
     assert owner, fallback
-    gate = r"\bif\s*\(\s*ggml_sycl_mapped_buffer_owner\s*\("
-    assert re.search(gate, fallback), "the owner call does not gate the warning"
-    assert re.search(r"\blogged_pin_alloc_failed\s*=\s*true\s*;", fallback), fallback
+    gate = re.search(
+        r"\bif\s*\(\s*ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer\s*,\s*&\s*host_owner\s*\)\s*\)\s*\{",
+        fallback,
+    )
+    assert gate, "the owner call does not gate the warning"
+    gated = balanced(fallback, gate.end() - 1)
+    assert re.search(r"\bGGML_LOG_WARN\s*\(", gated), "the warning is not inside the mapping-owner branch"
+    assert re.search(r"\blogged_pin_alloc_failed\s*=\s*true\s*;", gated), "the once-flag is not set inside that branch"
     clear = re.search(r"\bhost_owner\s*=\s*\{\s*\}\s*;", fallback)
     assert clear and clear.start() < owner.start(), "host_owner is not cleared before the owner call"
 
