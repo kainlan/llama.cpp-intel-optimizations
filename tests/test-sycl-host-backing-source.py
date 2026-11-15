@@ -310,8 +310,28 @@ def test_the_preload_serves_in_place_only_what_the_plan_left_mapped():
     cond = body[body.index("served_in_place ="):]
     cond = cond[:cond.index(";")]
     assert "host_backing_sizes_weight_zone(planned_backing)" in cond, cond
+    # In place only when the backing does NOT size the WEIGHT zone: a dropped negation serves pinned experts in place.
+    assert re.search(
+        r"!\s*(?:ggml_sycl\s*::\s*placement_plan\s*::\s*)?host_backing_sizes_weight_zone\s*\(\s*planned_backing\s*\)",
+        cond,
+    ), cond
     assert cond.index("host_backing_sizes_weight_zone") < cond.index("ggml_sycl_mapped_buffer_owner"), cond
     assert "getenv" not in body
+
+    # A failed pinned allocation over a mapping registers the mapping with its owner, and warns once per tensor.
+    fb_at = re.search(r"\}\s*else\s+if\s*\(\s*!\s*tensor_source_is_device\s*\)\s*\{", body)
+    assert fb_at, "the lambda has no fallback branch for a host source without pinned room"
+    fallback = balanced(body, fb_at.end() - 1)
+    owner = re.search(r"ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer\s*,\s*&\s*host_owner\s*\)", fallback)
+    assert owner, fallback
+    gate = r"\bif\s*\(\s*ggml_sycl_mapped_buffer_owner\s*\("
+    assert re.search(gate, fallback), "the owner call does not gate the warning"
+    assert re.search(r"\blogged_pin_alloc_failed\s*=\s*true\s*;", fallback), fallback
+    clear = re.search(r"\bhost_owner\s*=\s*\{\s*\}\s*;", fallback)
+    assert clear and clear.start() < owner.start(), "host_owner is not cleared before the owner call"
+
+    # The caller hands the plan's backing over, not a constant.
+    assert re.search(r"register_host_aos_expert\s*\(\s*e\s*,\s*expert_aos\s*,\s*placement\s*\.\s*host_backing\s*,", src)
 
 
 # ---- positive controls ----

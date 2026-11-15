@@ -303,7 +303,7 @@ size_t lookup_backing_mismatches(const placement_plan & plan) {
     return n;
 }
 
-// Arm 0:the generator reproduces the dump, and the budget reproduces run2's split.
+// Arm 0: the generator reproduces the dump, and the budget reproduces run2's split.
 size_t arm0_inventory_and_budget(const std::vector<placement_tensor_info> & inv) {
     std::printf("(0) the Qwen3.8 inventory and the budget that leaves the device run2's %zu groups\n", k_device_groups);
     size_t total = 0;
