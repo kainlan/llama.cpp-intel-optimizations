@@ -435,8 +435,8 @@ static inline bool moe_stream_executor_claims(const moe_stream_layer_info & li, 
     return geo.n_slots != 0 && moe_stream_layer_claimed(li);
 }
 
-// Which executor runs one prompt op of a layer the cost model decided for the CPU. NONE keeps the hybrid route. ISLAND
-// sends the op to the retained per-expert path, whose CPU island runs the host experts grouped per expert.
+// Which executor runs one prompt op of a layer the cost model decided for the CPU. NONE leaves the op's route as it is.
+// ISLAND sends the op to the retained per-expert path, whose CPU island runs the host experts grouped per expert.
 // EXECUTOR_AND_ISLAND runs the op's device experts on the batched executor and its host experts on the island.
 enum class moe_pp_cpu_split : uint8_t { NONE, ISLAND, EXECUTOR_AND_ISLAND };
 
@@ -1128,8 +1128,10 @@ class moe_stream_phase {
     // which begin_layer gives only to a layer the executor claims (moe_stream_executor_claims, asked again here), and
     // the ring is reserved (ring_ready()). A refused reserve answers false, and the layer stays hybrid.
     bool     executor_claims(int layer);
-    // True iff begin_layer weighed `layer` in this micro-batch and chose the CPU, for any reason. A layer with no
-    // host entry, and one begin_layer has not decided, answer false.
+    // True iff the decision begin_layer made for `layer` in the current micro-batch is CPU, for any reason; a layer
+    // with no host entry answers false. Ask it only after begin_layer for this op's layer: begin_layer is where a new
+    // micro-batch is detected and the last one's decisions dropped, so before it the answer may be the last
+    // micro-batch's.
     bool     cpu_decided(int layer) const;
     // Before the executor dequantizes one phase of (layer, role), on a layer executor_claims answered true for: every
     // host matrix of the window that the ring can take is in the stage table after this returns. One not there yet is

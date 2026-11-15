@@ -325,6 +325,15 @@ void test_pp_cpu_split() {
     CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::EXECUTOR_AND_ISLAND);
     f.cpu_decided = false;
     CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // The role and type gates hold for the split too: the island must run the op's host experts either way.
+    f                     = mixed;
+    f.executor_takes_part = true;
+    f.triplet_role        = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    f                     = mixed;
+    f.executor_takes_part = true;
+    f.island_runs_type    = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
     // An expert the plan has no entry for, on an all-host op and on a mixed one.
     CHECK(moe_pp_cpu_split_choose(split_facts(31, 31, 0, 0)) == moe_pp_cpu_split::NONE);
     f                     = split_facts(31, 11, 20, 20);

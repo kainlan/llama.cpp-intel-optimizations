@@ -929,10 +929,11 @@ CPU_DECIDED_BODY = "return decision_of(layer).choice == moe_exec_choice::CPU;"
 
 
 def claim_phase_names_cpu_decided_layers(phase: str) -> bool:
-    """moe_stream_phase::cpu_decided answers from the layer's decision alone, the one begin_layer made in this
-    micro-batch: true exactly for a CPU choice, whatever its reason. A layer begin_layer has not decided, and a
-    layer with no host entry, has no decision and answers false (decision_of gives NOT_CONSULTED). It reads no ring
-    state and no index entry, so it is const and cannot reserve."""
+    """moe_stream_phase::cpu_decided answers from the layer's decision alone, the one begin_layer made in the current
+    micro-batch: true exactly for a CPU choice, whatever its reason. A layer with no host entry has no decision and
+    answers false (decision_of gives NOT_CONSULTED). It is asked only after begin_layer for the op's layer:
+    begin_layer is where a new micro-batch is detected and the last one's decisions dropped, so before it the answer
+    may be the last micro-batch's. It reads no ring state and no index entry, so it is const and cannot reserve."""
     b = body(norm(phase), CPU_DECIDED_SIG)
     return (b != "" and b.count("return ") == 1 and CPU_DECIDED_BODY in b and "ring_ready(" not in b
             and "index_" not in b)
