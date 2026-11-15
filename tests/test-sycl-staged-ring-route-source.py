@@ -995,7 +995,15 @@ CPU_SPLIT_MULTI = ("if (g_moe_multi_gpu_active.load(std::memory_order_acquire)) 
                    "return ggml_sycl::moe_pp_cpu_split::NONE; }")
 ISLAND_TYPE_SIG = "static bool ggml_sycl_moe_pp_cpu_island_runs_type(ggml_type type)"
 ISLAND_TYPE_DIRECT = "if (ggml_sycl::moe_type_needs_direct_kernel(type)) { return false; }"
-ISLAND_TYPE_TRAITS = "return vdt != nullptr && vdt->from_float != nullptr;"
+ISLAND_TYPE_CALL = "return ggml_sycl_moe_host_recipe_type_ok(type);"
+HOST_RECIPE_TYPE_SIG = "static bool ggml_sycl_moe_host_recipe_type_ok(ggml_type type)"
+HOST_RECIPE_TRAITS = "const auto * traits = ggml_sycl_get_type_traits_cpu(type);"
+HOST_RECIPE_VDT = ("const auto * vdt = traits && traits->vec_dot ? "
+                   "ggml_sycl_get_type_traits_cpu(traits->vec_dot_type) : nullptr;")
+HOST_RECIPE_FROM_FLOAT = "return vdt != nullptr && vdt->from_float != nullptr;"
+HOST_RECIPE_CALL = ("if (normalized.actual_layout == GGML_LAYOUT_AOS && src0 && "
+                    "ggml_sycl_moe_host_recipe_type_ok(src0->type)) {")
+HOST_RECIPE_KIND = "normalized.recipe.kind = moe_batch_executor::HOST_CPU;"
 
 
 def claim_cpu_decided_op_leaves_hybrid(sycl: str) -> bool:
@@ -1008,12 +1016,16 @@ def claim_cpu_decided_op_leaves_hybrid(sycl: str) -> bool:
     plan_has_cpu_experts and the planner's prompt route, so any split takes the op out of the hybrid world the way a
     staged layer's op leaves it. The batched executor declines an ISLAND op at its head, ahead of the build guard,
     so the retained per-expert path runs it in every build. The island's type test is the retained batch's own
-    condition for a host recipe, less the two types that need their direct kernel. A load that routes experts to a
-    second device answers NONE before any fact is read, so it keeps the route it has."""
+    condition for a host recipe, less the two types that need their direct kernel: one helper holds that condition's
+    type half (a CPU vec_dot, looked up through the type's vec_dot_type, whose activation type quantizes from float),
+    and both the recipe and the island call it, so the two cannot drift. A load that routes experts to a second device
+    answers NONE before any fact is read, so it keeps the route it has."""
     t = norm(sycl)
     m = body(t, MMID_SIG)
     h = body(t, CPU_SPLIT_FOR_OP_SIG)
     i = body(t, ISLAND_TYPE_SIG)
+    r = body(t, HOST_RECIPE_TYPE_SIG)
+    b = body(t, BUILD_SIG)
     return (m != "" and m.count("pp_cpu_split = ") == 2 and m.count(CPU_SPLIT_DECL) == 1
             and m.count(CPU_SPLIT_SET) == 1 and m.count("->cpu_decided(") == 1
             and m.count("ggml_sycl_moe_pp_cpu_split_for_op(") == 1
@@ -1025,13 +1037,22 @@ def claim_cpu_decided_op_leaves_hybrid(sycl: str) -> bool:
                         CPU_SPLIT_EXECUTOR, PER_EXPERT_ANCHOR)
             and h != "" and ordered(h, CPU_SPLIT_MULTI, CPU_SPLIT_FACTS, CPU_SPLIT_CHOOSE)
             and h.count("f.cpu_decided =") == 1
-            and i != "" and ordered(i, ISLAND_TYPE_DIRECT, ISLAND_TYPE_TRAITS))
+            and i != "" and ordered(i, ISLAND_TYPE_DIRECT, ISLAND_TYPE_CALL)
+            and "ggml_sycl_get_type_traits_cpu(" not in i
+            and r != "" and r.count("return ") == 1
+            and ordered(r, HOST_RECIPE_TRAITS, HOST_RECIPE_VDT, HOST_RECIPE_FROM_FLOAT)
+            and b != "" and b.count(HOST_RECIPE_CALL) == 1 and ordered(b, HOST_RECIPE_CALL, HOST_RECIPE_KIND))
 
 
 def test_cpu_decided_op_leaves_hybrid():
+    r = body(norm(SYCL), HOST_RECIPE_TYPE_SIG)
+    assert r != "" and ordered(r, HOST_RECIPE_TRAITS, HOST_RECIPE_VDT, HOST_RECIPE_FROM_FLOAT), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_moe_host_recipe_type_ok", r,
+        HOST_RECIPE_TRAITS, HOST_RECIPE_VDT, HOST_RECIPE_FROM_FLOAT, signature=HOST_RECIPE_TYPE_SIG)
     assert claim_cpu_decided_op_leaves_hybrid(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id (the facts are searched in the body of "
-        "ggml_sycl_moe_pp_cpu_split_for_op, the type test in ggml_sycl_moe_pp_cpu_island_runs_type)",
+        "ggml_sycl_moe_pp_cpu_split_for_op, the type test in ggml_sycl_moe_pp_cpu_island_runs_type and in "
+        "ggml_sycl_moe_host_recipe_type_ok, which the HOST_CPU recipe of ggml_sycl_build_moe_resolved_batch calls)",
         body(norm(SYCL), MMID_SIG),
         STAGED_LAYER_DECL, CPU_SPLIT_DECL, STAGED_LAYER_BEGIN, STAGED_LAYER_SITE, PROBE_CLAIM, CPU_SPLIT_PROBE,
         PLAN_HAS_CPU, ROUTE_CLAIM, CPU_SPLIT_NEEDS_ROUTE, HYBRID_WITH_PLAN, CPU_SPLIT_EXECUTOR, PER_EXPERT_ANCHOR,
@@ -1076,9 +1097,22 @@ def test_cpu_decided_op_leaves_hybrid_mutants():
     assert not c(mutate(SYCL, "plan.count_planned_experts(weight->name, f.experts, device);",
                         "plan.count_planned_experts(weight->name, f.experts, -1);"))
     # The island handed a type that needs its direct kernel.
-    assert not c(mutate(SYCL, ISLAND_TYPE_DIRECT + " const auto * traits", "const auto * traits"))
+    assert not c(mutate(SYCL, ISLAND_TYPE_DIRECT + " " + ISLAND_TYPE_CALL, ISLAND_TYPE_CALL))
     # The island handed a type the retained batch gives no host recipe.
-    assert not c(mutate(SYCL, ISLAND_TYPE_TRAITS, "return true;"))
+    assert not c(mutate(SYCL, HOST_RECIPE_FROM_FLOAT, "return true;"))
+    # The activation type looked up without asking for a vec_dot: a type with no CPU dot product would pass.
+    assert not c(mutate(SYCL, "traits && traits->vec_dot ? ggml_sycl_get_type_traits_cpu(traits->vec_dot_type)",
+                        "traits ? ggml_sycl_get_type_traits_cpu(traits->vec_dot_type)"))
+    # The weight's own traits read as the activation type's.
+    assert not c(mutate(SYCL, HOST_RECIPE_VDT,
+                        "const auto * vdt = traits ? ggml_sycl_get_type_traits_cpu(type) : nullptr;"))
+    # The island restates the condition instead of asking the helper: two sources that can drift.
+    assert not c(mutate(SYCL, ISLAND_TYPE_DIRECT + " " + ISLAND_TYPE_CALL,
+                        ISLAND_TYPE_DIRECT + " " + HOST_RECIPE_TRAITS + " " + HOST_RECIPE_VDT + " "
+                        + HOST_RECIPE_FROM_FLOAT))
+    # The recipe restates the condition instead of asking the helper.
+    assert not c(mutate(SYCL, HOST_RECIPE_CALL,
+                        "if (normalized.actual_layout == GGML_LAYOUT_AOS && traits && traits->vec_dot) {"))
 
 
 def claim_decode_builds_skip_the_phase(sycl: str) -> bool:
