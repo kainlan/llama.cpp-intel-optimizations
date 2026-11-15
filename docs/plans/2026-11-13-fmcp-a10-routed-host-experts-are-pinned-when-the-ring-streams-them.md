@@ -7,8 +7,8 @@
 > written after addendum A12 merged, a re-measure, a code census and a spike.
 > The owner approved revision 2 on 2026-11-14 (opt-out kept, no ring for mapped experts).
 > **Amendment 1, 2026-11-14: task A10.2b is new.** Task A10.2's census found that an expert loan publishes its
-> lent triplets with the wrong backing on a mapping load. **A10.2b is not approved for spawning until the owner has
-> reviewed it.** Tasks A10.1 (merged, `93d00fbbe`), A10.2 and A10.3 are unchanged.
+> lent triplets with the wrong backing on a mapping load. The owner approved A10.2b on 2026-11-14 ("Do A10.2b
+> now"), ticket llama.cpp-hqz7. Tasks A10.1 (merged, `93d00fbbe`), A10.2 and A10.3 are unchanged.
 
 **Goal:** on a normal load (`-lm auto`, which maps the file), the host-executed routed experts are held once, in
 pinned memory, when the device has a window ring and the host budget holds them. Prompts then take the ring without
