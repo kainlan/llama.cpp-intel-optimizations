@@ -685,8 +685,9 @@ void test_a_lent_triplet_on_a_mapping_load_is_staged() {
   the target only" becomes "the transaction flips on_device and the target, and publishes the backing of the pinned
   copy it made".
 - in the claim guard A10.2 added: the sentence "A lent device triplet is not asked: its host copy is the loan's
-  business." becomes "A device triplet read through as_host is not asked: the loan copies it into pinned memory and
-  publishes it PINNED."
+  business." becomes "A device triplet read through as_host is asked as before: its backing is not read, because
+  the loan copies it into pinned memory and publishes it PINNED." (The old sentence said "not asked", which the
+  code does not do; A10.2's spec review found it.)
 
 `tests/test-sycl-moe-expert-loan-source.py`: a `BACKING` constant for the new call beside `FLIP` (`:637`),
 `b.count(BACKING) == 1`, and `ordered(..., FLIP, BACKING, PUBLISH, ...)` in every sequence that names `FLIP`. Two
