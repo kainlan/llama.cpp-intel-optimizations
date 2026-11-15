@@ -124,6 +124,12 @@
 //                           llama.cpp-i4ny: the same with no room. The bulk refill is refused (WEIGHT zone full)
 //                           with no bulk line, all three stay lent and the debt is spent; with the room back, the
 //                           next decode boundary re-admits one per graph, with no bulk line.
+//   loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned
+//                           A plan that maps files, its device entries FILE_MAPPED as a mapping load leaves them: a
+//                           one-triplet loan publishes the lent members off the device and PINNED, the pinned copy
+//                           it made, and the refill publishes them on the device and FILE_MAPPED again. Each reads
+//                           FILE_MAPPED on the device before the loan. Then the same on a plan that maps nothing,
+//                           PINNED throughout.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -200,6 +206,8 @@ int main() {
                    ggml_sycl::test_expert_refill_returns_a_partial_bulk_refills_leftovers_per_graph);
     ok &= run_case("refill_returns_a_refused_bulk_refills_loan_per_graph",
                    ggml_sycl::test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph);
+    ok &= run_case("loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned",
+                   ggml_sycl::test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;

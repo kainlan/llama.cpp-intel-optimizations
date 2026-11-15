@@ -661,6 +661,9 @@ std::string test_expert_refill_returns_a_loan_an_ended_context_owes();
 // refill re-admits the rest, one per decode graph, with no second bulk line (llama.cpp-i4ny).
 std::string test_expert_refill_returns_a_partial_bulk_refills_leftovers_per_graph();
 std::string test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph();
+// On a plan that maps files, a loan publishes its lent members PINNED, the pinned copy it made, and a refill publishes
+// them FILE_MAPPED again; on a plan that maps nothing they read PINNED throughout.
+std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned();
 #endif
 
 }  // namespace ggml_sycl

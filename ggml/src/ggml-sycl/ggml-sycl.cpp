@@ -26106,6 +26106,81 @@ std::string test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph() {
     return test_expert_bulk_refill_short_room_case(/*model_id=*/0x69346e7905ull, /*room_for_one=*/false);
 }
 
+std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned() {
+    // A mapping load leaves every device expert entry FILE_MAPPED, its staging source. The loan copies a lent triplet
+    // into pinned host memory, so the plan it publishes must say PINNED there, or the ring's plan index reads the
+    // triplet as left in its mapping and stages none of it. A refill stages from the load's source again. The second
+    // pass is a plan that maps nothing, where every backing is PINNED throughout.
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x6131306201ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    // Every member of the triplet the loan takes (layer 1 expert 2, the plan's tail) as the published plan has it.
+    auto members_read = [&](bool on_device, placement_host_backing want, const char * when) {
+        const auto             published = ::ggml_sycl_global_plan_snapshot();
+        const placement_plan * plan      = published ? published->plan.get() : nullptr;
+        for (int s = 0; s < 3; ++s) {
+            const placement_entry * e = plan ? plan->find_expert_entry(1, 2, test_loan_fixture::role(s)) : nullptr;
+            if (!e || e->on_device != on_device || e->host_backing != want) {
+                return test_loan_fail(
+                    "%s: layer 1 expert 2 slot %d reads on_device=%d backing=%d, not on_device=%d backing=%d "
+                    "(PINNED 0, FILE_MAPPED 1)",
+                    when, s, e ? (int) e->on_device : -1, e ? (int) e->host_backing : -1, (int) on_device, (int) want);
+            }
+        }
+        return std::string();
+    };
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+    for (const bool maps_files : { true, false }) {
+        const placement_host_backing source =
+            maps_files ? placement_host_backing::FILE_MAPPED : placement_host_backing::PINNED;
+        placement_plan plan          = fx.plan(/*host_expert=*/3);
+        plan.host_backing_maps_files = maps_files;
+        for (placement_entry & e : plan.entries) {
+            e.host_backing = e.on_device ? source : e.host_backing;
+        }
+        ::ggml_sycl_publish_test_plan(std::move(plan));
+        // The control: before the loan the triplet is on the device and reads its source.
+        if (std::string why = members_read(true, source, "before the loan"); !why.empty()) {
+            return why;
+        }
+        if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3); !why.empty()) {
+            return why;
+        }
+        const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
+        if (lent.size() != 1 || lent[0] != std::make_pair(1, 2)) {
+            return test_loan_fail("the loan lent %zu triplets, not layer 1 expert 2 alone", lent.size());
+        }
+        if (std::string why = members_read(false, placement_host_backing::PINNED, "after the loan"); !why.empty()) {
+            return why;
+        }
+        const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+        ::ggml_sycl_expert_loan_result         result;
+        const uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+        if (!result.accepted || result.n_triplets != 1 || remaining != 0) {
+            return test_loan_fail("the refill re-admitted %u triplets with %u remaining (%s), not 1 and 0",
+                                  result.n_triplets, remaining, result.reason);
+        }
+        if (std::string why = members_read(true, source, "after the refill"); !why.empty()) {
+            return why;
+        }
+        // As the cancelled-refill case does before it lends a re-admitted triplet again.
+        if (std::string why = fx.readmitted(1, 2); !why.empty()) {
+            return why;
+        }
+        if (!drain_retained_handles(true, 5000)) {
+            return "the refill's retained owners did not drain";
+        }
+    }
+    return {};
+}
+
 }  // namespace ggml_sycl
 #endif  // GGML_SYCL_PRIVATE_TESTING
 
