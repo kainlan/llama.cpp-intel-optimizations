@@ -26128,12 +26128,25 @@ std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pin
     if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
         return why;
     }
-    // Every member of the triplet the loan takes (layer 1 expert 2, the plan's tail) as the published plan has it.
-    auto members_read = [&](bool on_device, placement_host_backing want, const char * when) {
+    // Every member of the triplet the loan takes (layer 1 expert 2, the plan's tail) as the published plan has it, and
+    // the plan's mapped staging source: `mapped` device-planned FILE_MAPPED entries of the fixture's expert size, and
+    // equal to a recount of a copy, since the transaction moves the term per member without one.
+    auto members_read = [&](bool on_device, placement_host_backing want, size_t mapped, const char * when) {
         const auto             published = ::ggml_sycl_global_plan_snapshot();
         const placement_plan * plan      = published ? published->plan.get() : nullptr;
+        if (!plan) {
+            return test_loan_fail("%s: no plan published", when);
+        }
+        placement_plan recounted = *plan;
+        recounted.recount_host_mapped_source_bytes();
+        if (plan->host_mapped_source_bytes != recounted.host_mapped_source_bytes ||
+            plan->host_mapped_source_bytes != mapped * test_loan_expert_bytes()) {
+            return test_loan_fail("%s: the mapped source is %zu bytes, a recount %zu, not %zu", when,
+                                  plan->host_mapped_source_bytes, recounted.host_mapped_source_bytes,
+                                  mapped * test_loan_expert_bytes());
+        }
         for (int s = 0; s < 3; ++s) {
-            const placement_entry * e = plan ? plan->find_expert_entry(1, 2, test_loan_fixture::role(s)) : nullptr;
+            const placement_entry * e = plan->find_expert_entry(1, 2, test_loan_fixture::role(s));
             if (!e || e->on_device != on_device || e->host_backing != want) {
                 return test_loan_fail(
                     "%s: layer 1 expert 2 slot %d reads on_device=%d backing=%d, not on_device=%d backing=%d "
@@ -26152,9 +26165,14 @@ std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pin
         for (placement_entry & e : plan.entries) {
             e.host_backing = e.on_device ? source : e.host_backing;
         }
+        // A builder recounts the source once the backings are set: on the mapping pass the 18 device entries.
+        plan.recount_host_mapped_source_bytes();
         ::ggml_sycl_publish_test_plan(std::move(plan));
-        // The control: before the loan the triplet is on the device and reads its source.
-        if (std::string why = members_read(true, source, "before the loan"); !why.empty()) {
+        // On the mapping pass this is the control: the triplet is on the device and reads FILE_MAPPED before the loan.
+        // On the pass that maps nothing PINNED is the default, so it cannot fail there: that pass asserts the backings
+        // a plan that maps nothing published before, unchanged, and is not a control.
+        const size_t mapped = maps_files ? 18 : 0;
+        if (std::string why = members_read(true, source, mapped, "before the loan"); !why.empty()) {
             return why;
         }
         if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3); !why.empty()) {
@@ -26164,7 +26182,10 @@ std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pin
         if (lent.size() != 1 || lent[0] != std::make_pair(1, 2)) {
             return test_loan_fail("the loan lent %zu triplets, not layer 1 expert 2 alone", lent.size());
         }
-        if (std::string why = members_read(false, placement_host_backing::PINNED, "after the loan"); !why.empty()) {
+        // The lent three leave the source: their bytes are the pinned copies now.
+        const size_t mapped_lent = maps_files ? 15 : 0;
+        if (std::string why = members_read(false, placement_host_backing::PINNED, mapped_lent, "after the loan");
+            !why.empty()) {
             return why;
         }
         const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
@@ -26174,7 +26195,7 @@ std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pin
             return test_loan_fail("the refill re-admitted %u triplets with %u remaining (%s), not 1 and 0",
                                   result.n_triplets, remaining, result.reason);
         }
-        if (std::string why = members_read(true, source, "after the refill"); !why.empty()) {
+        if (std::string why = members_read(true, source, mapped, "after the refill"); !why.empty()) {
             return why;
         }
         // As the cancelled-refill case does before it lends a re-admitted triplet again.
