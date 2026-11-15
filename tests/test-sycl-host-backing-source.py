@@ -183,11 +183,11 @@ def planner_site_gaps(cpp: str) -> list:
     singles = len(re.findall(r"\bplan\s*\.\s*charge_host_weight\s*\(", cpp))
     groups = len(re.findall(r"\bplan\s*\.\s*charge_host_weight_entries\s*\(", cpp))
     undo = len(re.findall(r"\bplan\s*\.\s*uncharge_host_weight\s*\(", cpp))
-    # single entry: the standalone dense host branch, the layout-change delta (extra), the multi-device standalone dense
-    # via commit, placement_move_host_expert_backing's charge to the new backing; groups: the per-layer dense unit
-    # (both KV arms), the MoE host group, the multi-device commit (dense layer, MoE group), the cohesive host layer
-    # (dense + MoE); undo: the layout-change delta's freed bytes, placement_move_host_expert_backing's uncharge of the
-    # old backing
+    # single entry: the standalone dense host branch, the layout-change delta (extra),
+    # placement_move_host_expert_backing's charge to the new backing; groups: the per-layer dense unit (both KV arms),
+    # the MoE host group, the multi-device commit (its standalone dense, dense layer and MoE group all reach it), the
+    # cohesive host layer (dense + MoE); undo: the layout-change delta's freed bytes,
+    # placement_move_host_expert_backing's uncharge of the old backing
     if singles < 3:
         gaps.append(f"{singles} charge_host_weight call sites in the planner, expected the pinned single-entry sites")
     if groups < 6:
