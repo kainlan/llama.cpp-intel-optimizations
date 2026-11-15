@@ -11,7 +11,8 @@ every reader reads the meaning design 5efe §4.4 assigns it.
    `charge_host_weight` / `uncharge_host_weight` (and the `= 0` initialisation of a new plan): every accumulation site in
    the planner (the single-device and multi-device builders, the layout-change delta, `update_expert_placement`,
    `placement_move_host_expert_backing`) calls one of the helpers, and the sites are the pinned list below; the move
-   helper uncharges and charges each expert by its own `host_backing`, at its `src_size`, around the flip;
+   helper uncharges each expert from the backing it leaves and charges it to the one it takes, at its `src_size`,
+   around the flip;
 3. the readers: the plan snapshot's `planned_host_bytes` (staged candidate and published) is the PLACED figure; the
    lifecycle publication carries `charged_host_bytes` beside it into `ModelState`; the load summary prints placed and
    charged; both `Totals` lines print all four terms; `refresh_kv_byte_totals` counts the cpu-owned bytes and not the
@@ -171,10 +172,12 @@ def test_the_helpers_test_the_backing():
 
 
 MOVE_HELPER = r"static\s+size_t\s+placement_move_host_expert_backing\s*\("
+# The old backing is e.host_backing before the flip or `from`, which the loop matched it against; the new one is
+# e.host_backing after the flip or `to`.
 MOVE_FLIP = (
-    r"\bplan\s*\.\s*uncharge_host_weight\s*\(\s*e\s*\.\s*host_backing\s*,\s*e\s*\.\s*src_size\s*\)\s*;\s*"
+    r"\bplan\s*\.\s*uncharge_host_weight\s*\(\s*(?:e\s*\.\s*host_backing|from)\s*,\s*e\s*\.\s*src_size\s*\)\s*;\s*"
     r"e\s*\.\s*host_backing\s*=\s*to\s*;\s*"
-    r"plan\s*\.\s*charge_host_weight\s*\(\s*e\s*\.\s*host_backing\s*,\s*e\s*\.\s*src_size\s*\)\s*;"
+    r"plan\s*\.\s*charge_host_weight\s*\(\s*(?:e\s*\.\s*host_backing|to)\s*,\s*e\s*\.\s*src_size\s*\)\s*;"
 )
 
 
@@ -200,7 +203,7 @@ def planner_site_gaps(cpp: str) -> list:
     move = balanced(cpp, cpp.index("{", hits[0].end()))
     if not re.search(MOVE_FLIP, move):
         gaps.append("placement_move_host_expert_backing does not uncharge the old backing, flip it and charge the new "
-                    "one, each by e.host_backing at e.src_size")
+                    "one, each at e.src_size")
     return gaps
 
 
@@ -226,6 +229,11 @@ def test_the_planner_site_check_sees_each_dropped_piece():
     for label, mutated in mutants.items():
         assert mutated != cpp, f"the mutant '{label}' changed nothing"
         assert planner_site_gaps(mutated), f"the mutant '{label}' is not caught"
+    # The same flip spelled with the loop's own names is the same accounting, so the check accepts it.
+    named = re.sub(uncharge, r"\1uncharge_host_weight(from, e.src_size)", cpp, count=1)
+    named = re.sub(charge, r"\1charge_host_weight(to, e.src_size);", named, count=1)
+    assert named != cpp, "the from/to spelling changed nothing"
+    assert not planner_site_gaps(named), "the flip spelled with from and to is refused"
 
 
 def test_update_expert_placement_moves_bytes_through_the_helpers():

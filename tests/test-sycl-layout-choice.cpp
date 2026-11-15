@@ -1555,6 +1555,45 @@ static bool run_kv_context_room_is_cost_based_test() {
     return ok;
 }
 
+// Saves an environment variable for a scope and restores it, or unsets it, when the scope ends, so a case that sets
+// GGML_SYCL_VRAM_BUDGET_PCT or GGML_SYCL_MOE_PIN_HOST_EXPERTS cannot leak it into any other test in this binary, nor
+// clobber a value the shell exported (main() later does its own unconditional setenv(..., 0) for
+// run_layout_choice_test(), which must still see an accurate "already set?" signal).
+namespace {
+struct env_var_scope_guard {
+    std::string name;
+    bool        had_value;
+    std::string prior_value;
+
+    explicit env_var_scope_guard(const char * env_name) : name(env_name) {
+        const char * existing = std::getenv(env_name);
+        had_value             = existing != nullptr;
+        if (had_value) {
+            prior_value = existing;
+        }
+    }
+
+    // llama.cpp-o3h1 quality review (final batch, F8): an RAII env-var
+    // restore guard that could be copied would double-restore (or leak, if
+    // moved-from and the moved-from copy's destructor still ran) -- this
+    // guard is used only as a single stack-local per test block, never
+    // needs to be copied or moved, so forbid both explicitly rather than
+    // leaving it to accident.
+    env_var_scope_guard(const env_var_scope_guard &)             = delete;
+    env_var_scope_guard & operator=(const env_var_scope_guard &) = delete;
+    env_var_scope_guard(env_var_scope_guard &&)                  = delete;
+    env_var_scope_guard & operator=(env_var_scope_guard &&)      = delete;
+
+    ~env_var_scope_guard() {
+        if (had_value) {
+            setenv(name.c_str(), prior_value.c_str(), 1);
+        } else {
+            unsetenv(name.c_str());
+        }
+    }
+};
+}  // namespace
+
 // The prompt phase's window ring reserves its slots in the WEIGHT zone, which the routed experts fill at default
 // placement. The planner holds the ring's bytes there before it packs the experts, so the first reserve finds them
 // and the expert loan is only the fallback. The synthetic model has two layers of Q4_0 gate/up/down experts, 32
@@ -1789,22 +1828,28 @@ static bool run_moe_stream_ring_room_before_experts_test() {
     return ok;
 }
 
-// A mapping load pins its routed host experts when the plan holds ring room and the host plan fits its budget, all of
-// them or none. The opt-out, a budget the pinned plan exceeds, a locked mapping and a type nothing stages each leave
-// them mapped.
+// A mapping load pins its routed host experts when the plan holds ring room, the host plan fits its budget and no lazy
+// table refuses, all of them or none. The opt-out, a plan with no ring room, a budget the pinned plan exceeds, a lazy
+// table that refuses, a locked mapping and a type nothing stages each leave them mapped.
 static bool run_moe_stream_ring_pins_host_experts_test() {
     using namespace ring_room_case;
     bool ok = true;
+    // The arms below that pin need the variable unset, whatever the shell exported; the guard puts it back.
+    env_var_scope_guard pin_env("GGML_SYCL_MOE_PIN_HOST_EXPERTS");
+    unsetenv("GGML_SYCL_MOE_PIN_HOST_EXPERTS");
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
     const size_t roomy_host = size_t(64) << 30;
     const auto   roomy      = plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, q4_0_bit);
     const size_t charge     = triplet_charge(roomy);
     const size_t budget     = base + 40 * charge;
 
-    setenv("GGML_SYCL_MOE_PIN_HOST_EXPERTS", "0", 1);
-    const auto          off = plan_mapping(budget, roomy_host);
-    const backing_count oc  = count_backings(off);
-    unsetenv("GGML_SYCL_MOE_PIN_HOST_EXPERTS");
+    ggml_sycl::placement_plan off;
+    {
+        env_var_scope_guard off_env("GGML_SYCL_MOE_PIN_HOST_EXPERTS");
+        setenv("GGML_SYCL_MOE_PIN_HOST_EXPERTS", "0", 1);
+        off = plan_mapping(budget, roomy_host);
+    }
+    const backing_count oc = count_backings(off);
     if (oc.host == 0 || oc.host_pinned != 0 || off.moe_stream_ring_reserve_bytes != 0 ||
         off.host_mapped_bytes != oc.host_src || off.weight_host_bytes != 0) {
         printf(
@@ -1827,40 +1872,89 @@ static bool run_moe_stream_ring_pins_host_experts_test() {
             pin.weight_host_bytes, pc.host_src, pin.host_planned_bytes, pin.host_budget);
         ok = false;
     }
-    if (pin.host_planned_bytes < off.host_planned_bytes + pc.host_src ||
-        pin.host_zone_weight_bytes < off.host_zone_weight_bytes + pc.host_src) {
+    if (pin.host_zone_weight_bytes < off.host_zone_weight_bytes + pc.host_src) {
+        printf("FAIL: the pinned plan's WEIGHT zone holds the experts: %zu (mapped %zu), experts %zu\n",
+               pin.host_zone_weight_bytes, off.host_zone_weight_bytes, pc.host_src);
+        ok = false;
+    }
+    if (off.host_planned_bytes >= pin.host_planned_bytes) {
+        printf("FAIL: the pinned plan must plan more host memory than the mapped one: pinned %zu, mapped %zu\n",
+               pin.host_planned_bytes, off.host_planned_bytes);
+        ok = false;
+    }
+
+    // No planned weight slot, so the planner holds no ring room: the pin made before the room was sized goes back
+    // before the host zones are sized, and nothing is pinned for a ring that cannot run.
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    const auto bare = plan_mapping(budget, roomy_host);
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
+    const backing_count rc = count_backings(bare);
+    if (rc.host == 0 || rc.host_pinned != 0 || bare.moe_stream_ring_reserve_bytes != 0 || bare.weight_host_bytes != 0 ||
+        bare.host_mapped_bytes != rc.host_src || bare.dma_staging_pool_bytes != 0) {
         printf(
-            "FAIL: the pinned plan's host figures hold the experts: planned %zu (mapped %zu), WEIGHT zone %zu "
-            "(mapped %zu), experts %zu\n",
-            pin.host_planned_bytes, off.host_planned_bytes, pin.host_zone_weight_bytes, off.host_zone_weight_bytes,
-            pc.host_src);
+            "FAIL: a plan with no ring room leaves the experts mapped: host %zu, pinned %zu, room %zu, weight %zu, "
+            "mapped %zu (want %zu), DMA pool %zu\n",
+            rc.host, rc.host_pinned, bare.moe_stream_ring_reserve_bytes, bare.weight_host_bytes, bare.host_mapped_bytes,
+            rc.host_src, bare.dma_staging_pool_bytes);
         ok = false;
     }
 
     // A budget the mapped plan fits and the pinned plan does not: the experts go back, and the host zones are sized
     // for the mapped plan. The ring room, already taken out of the device pack, stays held.
-    const size_t        tight = off.host_planned_bytes + pc.host_src / 2;
+    const size_t        tight = pin.host_planned_bytes - 1;
     const auto          back  = plan_mapping(budget, tight);
     const backing_count bc    = count_backings(back);
     if (bc.host == 0 || bc.host_pinned != 0 || back.weight_host_bytes != 0 || back.host_mapped_bytes != bc.host_src ||
         back.host_zone_weight_bytes != off.host_zone_weight_bytes || back.dma_staging_pool_bytes != 0 ||
-        back.host_planned_bytes > back.host_budget) {
+        back.host_planned_bytes > back.host_budget ||
+        back.moe_stream_ring_reserve_bytes != pin.moe_stream_ring_reserve_bytes) {
         printf(
             "FAIL: a host budget the pinned plan exceeds leaves the experts mapped: host %zu, pinned %zu, weight "
-            "%zu, mapped %zu (want %zu), WEIGHT zone %zu (want %zu), DMA pool %zu, planned %zu of %zu\n",
+            "%zu, mapped %zu (want %zu), WEIGHT zone %zu (want %zu), DMA pool %zu, planned %zu of %zu, room %zu "
+            "(want %zu)\n",
             bc.host, bc.host_pinned, back.weight_host_bytes, back.host_mapped_bytes, bc.host_src,
             back.host_zone_weight_bytes, off.host_zone_weight_bytes, back.dma_staging_pool_bytes,
-            back.host_planned_bytes, back.host_budget);
+            back.host_planned_bytes, back.host_budget, back.moe_stream_ring_reserve_bytes,
+            pin.moe_stream_ring_reserve_bytes);
         ok = false;
     }
 
-    const backing_count lc = count_backings(plan_mapping(budget, roomy_host, q4_0_bit, /*locks=*/true));
-    const backing_count nc = count_backings(plan_mapping(budget, roomy_host, /*staged_types=*/0));
-    if (lc.host == 0 || lc.host_pinned != 0 || nc.host == 0 || nc.host_pinned != 0) {
+    // A lazy table that refuses the plan, with room on the host: a cold expert class refuses any plan with a lazy
+    // table, so the experts go back although the budget holds them, and the ring room stays held.
+    ggml_sycl::placement_kv_info cold_kv = kv_info(q4_0_bit, 0);
+    cold_kv.load_maps_files              = true;
+    cold_kv.cold_expert_class            = true;
+    ggml_sycl::placement_lazy_table_info table;
+    table.name           = "blk.0.cold_table";
+    table.table_bytes    = size_t(1) << 20;
+    table.consumer_layer = 0;
+    cold_kv.lazy_tables.push_back(table);
+    const auto cold = ggml_sycl::compute_placement_plan(inventory(), budget, 0, cold_kv, nullptr, n_exps, roomy_host);
+    const backing_count cc = count_backings(cold);
+    if (cold.lazy_refusal != "cold-set-not-implemented" || cc.host == 0 || cc.host_pinned != 0 ||
+        cold.weight_host_bytes != 0 || cold.host_mapped_bytes != cc.host_src || cold.dma_staging_pool_bytes != 0 ||
+        cold.host_planned_bytes > cold.host_budget ||
+        cold.moe_stream_ring_reserve_bytes != pin.moe_stream_ring_reserve_bytes) {
         printf(
-            "FAIL: a locked mapping and a type nothing stages keep the host experts mapped: locked %zu of %zu "
-            "pinned, unstaged %zu of %zu pinned\n",
-            lc.host_pinned, lc.host, nc.host_pinned, nc.host);
+            "FAIL: a lazy table that refuses leaves the experts mapped: refusal '%s', host %zu, pinned %zu, weight "
+            "%zu, mapped %zu (want %zu), DMA pool %zu, planned %zu of %zu, room %zu (want %zu)\n",
+            cold.lazy_refusal.c_str(), cc.host, cc.host_pinned, cold.weight_host_bytes, cold.host_mapped_bytes,
+            cc.host_src, cold.dma_staging_pool_bytes, cold.host_planned_bytes, cold.host_budget,
+            cold.moe_stream_ring_reserve_bytes, pin.moe_stream_ring_reserve_bytes);
+        ok = false;
+    }
+
+    const auto          locked   = plan_mapping(budget, roomy_host, q4_0_bit, /*locks=*/true);
+    const auto          unstaged = plan_mapping(budget, roomy_host, /*staged_types=*/0);
+    const backing_count lc       = count_backings(locked);
+    const backing_count nc       = count_backings(unstaged);
+    if (lc.host == 0 || lc.host_pinned != 0 || nc.host == 0 || nc.host_pinned != 0 ||
+        locked.moe_stream_ring_reserve_bytes != 0 || unstaged.moe_stream_ring_reserve_bytes != 0) {
+        printf(
+            "FAIL: a locked mapping and a type nothing stages keep the host experts mapped with no ring room: "
+            "locked %zu of %zu pinned, room %zu; unstaged %zu of %zu pinned, room %zu\n",
+            lc.host_pinned, lc.host, locked.moe_stream_ring_reserve_bytes, nc.host_pinned, nc.host,
+            unstaged.moe_stream_ring_reserve_bytes);
         ok = false;
     }
 
@@ -3820,46 +3914,6 @@ static bool run_dense_attention_ffn_layout_test() {
 // removed headroom composition, the multi-GPU dev_budget line, and two
 // diagnostic sites that disagreed on the default pct -- 100 vs 90) now all
 // either call directly or read published off a unified_cache instance.
-// Small helper: save/restore GGML_SYCL_VRAM_BUDGET_PCT around a scope so
-// these cases cannot leak env state into any other test in this binary
-// (main() later does its own unconditional setenv(..., 0) for
-// run_layout_choice_test(), which must still see an accurate "already set?"
-// signal).
-namespace {
-struct env_var_scope_guard {
-    std::string name;
-    bool        had_value;
-    std::string prior_value;
-
-    explicit env_var_scope_guard(const char * env_name) : name(env_name) {
-        const char * existing = std::getenv(env_name);
-        had_value             = existing != nullptr;
-        if (had_value) {
-            prior_value = existing;
-        }
-    }
-
-    // llama.cpp-o3h1 quality review (final batch, F8): an RAII env-var
-    // restore guard that could be copied would double-restore (or leak, if
-    // moved-from and the moved-from copy's destructor still ran) -- this
-    // guard is used only as a single stack-local per test block, never
-    // needs to be copied or moved, so forbid both explicitly rather than
-    // leaving it to accident.
-    env_var_scope_guard(const env_var_scope_guard &)             = delete;
-    env_var_scope_guard & operator=(const env_var_scope_guard &) = delete;
-    env_var_scope_guard(env_var_scope_guard &&)                  = delete;
-    env_var_scope_guard & operator=(env_var_scope_guard &&)      = delete;
-
-    ~env_var_scope_guard() {
-        if (had_value) {
-            setenv(name.c_str(), prior_value.c_str(), 1);
-        } else {
-            unsetenv(name.c_str());
-        }
-    }
-};
-}  // namespace
-
 static bool run_vram_budget_authority_test() {
     constexpr size_t mib = 1024ull * 1024ull;
 
