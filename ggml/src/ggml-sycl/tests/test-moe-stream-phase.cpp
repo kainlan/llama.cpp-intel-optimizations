@@ -762,7 +762,7 @@ int main() {
             // One unclaimed role (layer 0's up and down) keeps the layer hybrid, and so does no claim at all.
             CHECK(!ggml_sycl::moe_stream_executor_claims(*p0, ring_geo));
             CHECK(!ggml_sycl::moe_stream_executor_claims(*u0, ring_geo));
-            // The geometry-free half, which the ring-unavailable rule asks first.
+            // The geometry-free half, which the ring-unavailable rule asks right after moe_stream_layer_mapped_only.
             CHECK(ggml_sycl::moe_stream_layer_claimed(*c0) && ggml_sycl::moe_stream_layer_claimed(*p2));
             CHECK(!ggml_sycl::moe_stream_layer_claimed(*c1) && !ggml_sycl::moe_stream_layer_claimed(*c4));
             CHECK(!ggml_sycl::moe_stream_layer_claimed(*p0) && !ggml_sycl::moe_stream_layer_claimed(*u0));
@@ -854,6 +854,27 @@ int main() {
         const moe_stream_layer_info * mp0 = layer_info(mapped_partial, 0);
         CHECK(mp0 != nullptr && mp0->n_mapped_host == 3);
         CHECK(rule(mapped_partial, mp0, ring_geo, true, false) == "executor does not claim");
+        // A mapped layer with a fused entry: pinning its experts would still leave the entry the ring cannot stage.
+        placement_plan mapped_fused_plan = make_plan();
+        for (placement_entry & e : mapped_fused_plan.entries) {
+            if (e.layer_id == 1 && e.expert_id >= 0 && !e.on_device) {
+                e.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+            }
+        }
+        const moe_stream_plan_index   mapped_fused = index_of(mapped_fused_plan, claims_all);
+        const moe_stream_layer_info * mf1          = layer_info(mapped_fused, 1);
+        CHECK(mf1 != nullptr && mf1->n_mapped_host == 9 && mf1->n_untriplet == 1);
+        CHECK(rule(mapped_fused, mf1, ring_geo, true, false) == "executor does not claim");
+        // The helper the rule asks first, directly: true only where the backing alone refuses the layer.
+        const moe_stream_layer_info * m0 = layer_info(mapped, 0);
+        const moe_stream_layer_info * o0 = layer_info(one, 0);
+        const moe_stream_layer_info * m2 = layer_info(mapped, 2);
+        CHECK(m0 != nullptr && ggml_sycl::moe_stream_layer_mapped_only(*m0));
+        CHECK(o0 != nullptr && ggml_sycl::moe_stream_layer_mapped_only(*o0));
+        CHECK(m2 != nullptr && !ggml_sycl::moe_stream_layer_mapped_only(*m2));
+        CHECK(mu0 != nullptr && !ggml_sycl::moe_stream_layer_mapped_only(*mu0));
+        CHECK(mp0 != nullptr && !ggml_sycl::moe_stream_layer_mapped_only(*mp0));
+        CHECK(mf1 != nullptr && !ggml_sycl::moe_stream_layer_mapped_only(*mf1));
         // None of the eight: named anyway, so no ring-unavailable line goes unexplained.
         CHECK(rule(idx, c0, ring_geo, true, false) == "region smaller than the largest streamable matrix");
         CHECK(rule(partial, layer_info(partial, 2), ring_geo, true, false) ==

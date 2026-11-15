@@ -144,7 +144,7 @@ struct moe_stream_layer_info {
     size_t  host_bytes       = 0;  // AOS bytes of every host expert entry of the layer, fused ones included
     int     n_host_experts   = 0;  // distinct expert ids with a host entry
     int     n_untriplet      = 0;  // host expert entries the ring cannot stage (fused GATE_UP, CHUNK_*)
-    int     n_mapped_host    = 0;  // items the plan left in their mapping on the host: no pinned copy to stage from
+    int     n_mapped_host    = 0;  // items the executor would stage but for the plan leaving them in their mapping
     int     n_streamable     = 0;  // items the ring gives slots, one each: staging AOS_ONLY
     size_t  matrix_bytes_max = 0;  // the largest one streamable matrix's slot bytes: the unit the ring stages
     int64_t K                = 0;  // the largest ne[0] over the host expert entries
@@ -286,26 +286,30 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(
         // slot (llama.cpp-3460, resolving llama.cpp-v7np): no reorder and no second slot, and the route refuses the
         // entry by its consumer. Any other matrix stages NONE (W2), and a matrix no AOS slot can hold does not ask
         // for its weight.
-        // This term is the plan-time mirror of moe_stream_owner_streamable, which admits only a pinned WEIGHT owner:
+        // mapped_host is the plan-time mirror of moe_stream_owner_streamable, which admits only a pinned WEIGHT owner:
         // the index decides what the ring is sized for, the owner check guards each copy, and neither replaces the
-        // other. The preload copies every host expert whose backing sizes the WEIGHT zone into pinned memory, so the
-        // two agree. A host-planned expert whose backing holds no WEIGHT-zone block is read in place from its mapping,
-        // so it stages NONE, its layer runs on the CPU, and the ring-unavailable rule names the plan as the cause. A
-        // lent device triplet is not asked: its host copy is the loan's business.
+        // other. The preload copies a host expert whose backing sizes the WEIGHT zone into pinned memory when it has
+        // room, so the two agree except where the preload found none; there the owner check refuses the copy. A
+        // host-planned expert whose backing holds no WEIGHT-zone block is read in place from its mapping, so it stages
+        // NONE and its layer runs on the CPU. The claim is still asked for it, a pure predicate cached per
+        // (layer, role): a mapped item the executor would claim is counted, so the ring-unavailable rule can tell a
+        // layer only the plan's backing keeps from the executor from one the executor refuses. A lent device triplet
+        // is not asked: its host copy is the loan's business.
         const bool mapped_host = !e.on_device && !placement_plan::host_backing_sizes_weight_zone(e.host_backing);
-        if (mapped_host) {
-            ++li.n_mapped_host;
-        }
-        if (!mapped_host && library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {
+        bool       claimed     = false;
+        if (library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {
             const uint64_t ck = moe_stream_table_key(item.layer, 0, item.role);
             auto           c  = claims.find(ck);
             if (c == claims.end()) {
                 c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;
             }
-            if (c->second) {
-                item.staging  = moe_stream_staging::AOS_ONLY;
-                item.consumer = moe_stream_consumer::EXECUTOR;
-            }
+            claimed = c->second;
+        }
+        if (claimed && mapped_host) {
+            ++li.n_mapped_host;
+        } else if (claimed) {
+            item.staging  = moe_stream_staging::AOS_ONLY;
+            item.consumer = moe_stream_consumer::EXECUTOR;
         }
         li.items.push_back(item);
         // The ring is sized over the matrices it stages. Another one is still listed, so the layer's claim can see it
@@ -394,7 +398,7 @@ static inline uint32_t moe_stream_ring_slots_kept(const moe_stream_ring_geometry
 // True iff the batched executor takes every host matrix of the layer from the ring (W2): the layer has items, each one
 // staged AOS_ONLY for the executor (the index build's record of the claim), and no host entry is one the ring cannot
 // stage (fused GATE_UP, CHUNK_*). The geometry-free half of moe_stream_executor_claims, which the ring-unavailable rule
-// asks first.
+// asks right after moe_stream_layer_mapped_only.
 static inline bool moe_stream_layer_claimed(const moe_stream_layer_info & li) {
     if (li.n_untriplet != 0 || li.items.empty()) {
         return false;
@@ -405,6 +409,15 @@ static inline bool moe_stream_layer_claimed(const moe_stream_layer_info & li) {
         }
     }
     return true;
+}
+
+// True iff only the plan's backing keeps the layer from the executor: every item the ring does not stage is one the
+// plan left in its mapping and the executor would claim, and no fused entry refuses the layer, so pinning those
+// experts would make moe_stream_layer_claimed true. A layer the executor refuses for another reason (a type or role it
+// does not claim, a fused entry) answers false even when it also has mapped items, since pinning would not cure it.
+static inline bool moe_stream_layer_mapped_only(const moe_stream_layer_info & li) {
+    return li.n_mapped_host != 0 && li.n_untriplet == 0 &&
+           li.items.size() == static_cast<size_t>(li.n_streamable) + static_cast<size_t>(li.n_mapped_host);
 }
 
 // True iff GGML_SYCL_MOE_EXEC_DECLINE_LAYER (`knob`, -1 unset) names `layer`: begin_layer then turns the layer's
@@ -422,9 +435,10 @@ static inline bool moe_stream_executor_claims(const moe_stream_layer_info & li, 
 }
 
 // Why a layer answered RING_UNAVAILABLE, for the phase's once-per-prompt WARN (lead ruling c-kcyf): the first rule that
-// holds, in this order. A layer with host experts the plan left in their mapping comes first: none of them can be
-// staged, so the executor cannot claim the layer, and the plan's choice, not the executor, is the cause to name. A
-// layer the executor does not claim comes next, since the ring serves the executor only (W2). geo is what
+// holds, in this order. A layer only the plan's backing keeps from the executor comes first
+// (moe_stream_layer_mapped_only): the executor would claim it once its mapped experts were pinned, so the plan's choice
+// is the cause to name. Any other layer the executor does not claim comes next, since the ring serves the executor
+// only (W2). geo is what
 // moe_stream_ring_size gave for idx; its all-zero answer past the index's first three rules is the cap, an eleventh
 // of the resident plus lent expert bytes (llama.cpp-7999; its overflow guards refuse sizes far above any resident
 // expert set too). A window of 0 slots is no planned executor slot (before the load publishes the inventory globals),
@@ -436,7 +450,7 @@ static inline const char * moe_stream_ring_unavailable_rule(const moe_stream_pla
                                                             const moe_stream_ring_geometry & geo,
                                                             bool                             in_order,
                                                             bool                             reserve_failed) {
-    if (li.n_mapped_host != 0) {
+    if (moe_stream_layer_mapped_only(li)) {
         return "host experts left mapped by the plan";
     }
     if (!moe_stream_layer_claimed(li)) {
