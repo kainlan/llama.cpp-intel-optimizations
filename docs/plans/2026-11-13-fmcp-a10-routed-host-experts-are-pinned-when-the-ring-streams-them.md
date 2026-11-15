@@ -5,7 +5,10 @@
 > **Revision 2, 2026-11-14.** It replaces the text approved on 2026-11-14. That text pinned the experts through the
 > loader, and its cost figure was wrong: the implementer's census stopped it before any code. This revision was
 > written after addendum A12 merged, a re-measure, a code census and a spike.
-> **Not approved for spawning until the owner has reviewed it.**
+> The owner approved revision 2 on 2026-11-14 (opt-out kept, no ring for mapped experts).
+> **Amendment 1, 2026-11-14: task A10.2b is new.** Task A10.2's census found that an expert loan publishes its
+> lent triplets with the wrong backing on a mapping load. **A10.2b is not approved for spawning until the owner has
+> reviewed it.** Tasks A10.1 (merged, `93d00fbbe`), A10.2 and A10.3 are unchanged.
 
 **Goal:** on a normal load (`-lm auto`, which maps the file), the host-executed routed experts are held once, in
 pinned memory, when the device has a window ring and the host budget holds them. Prompts then take the ring without
@@ -176,15 +179,15 @@ over a mapped buffer. The lead's end-to-end runs 4 and 5 are the preload's devic
 
 **Implementers:** 1 (Opus: ownership and placement code), the three tasks in order, in one worktree.
 **Reviewers:** spec then quality, fresh each round, Opus. Each task is reviewed on its own commit range.
-**Merge:** A10.1 changes no behaviour and merges when it passes. A10.2 and A10.3 merge together, after the lead's
-end-to-end.
+**Merge:** A10.1 changes no behaviour and merges when it passes. A10.2, A10.2b and A10.3 merge together, after
+the lead's end-to-end.
 
 | Track | Tasks | Description |
 |-------|-------|-------------|
-| F | A10.1, A10.2, A10.3 | the preload reads the plan; the ring index reads the backing; the plan pins |
+| F | A10.1, A10.2, A10.2b, A10.3 | the preload reads the plan; the ring index reads the backing; a loan publishes its backing; the plan pins |
 
 ```dot
-digraph dependencies { rankdir=LR; "A10.1 preload reads the plan" -> "A10.2 ring index reads the backing" -> "A10.3 the plan pins"; }
+digraph dependencies { rankdir=LR; "A10.1 preload reads the plan" -> "A10.2 ring index reads the backing" -> "A10.2b a loan publishes its backing" -> "A10.3 the plan pins"; }
 ```
 
 ### File Ownership Map
@@ -196,7 +199,13 @@ digraph dependencies { rankdir=LR; "A10.1 preload reads the plan" -> "A10.2 ring
 | `ggml/src/ggml-sycl/tests/test-sycl-host-backing-plan.cpp` | A10.1 | one check in arms 1 and 2 |
 | `tests/test-sycl-host-backing-source.py` | A10.1, A10.3 | one clause each; A10.3 also updates the pinned-site list |
 | `ggml/src/ggml-sycl/moe-stream-plan.hpp` | A10.2 | `moe_stream_plan_index_build` reads `host_backing` |
-| `ggml/src/ggml-sycl/tests/test-moe-stream-plan.cpp` | A10.2 | one new test function |
+| `ggml/src/ggml-sycl/tests/test-moe-stream-plan.cpp` | A10.2, A10.2b | one new test function each |
+| `tests/test-sycl-moe-stream-enqueue-source.py` | A10.2 | the claim-guard pin follows the new guard (found by the census) |
+| `ggml/src/ggml-sycl/unified-cache.hpp` | A10.2b | `placement_plan::set_expert_host_backing` |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | A10.2b | one call in the loan transaction's publication loop |
+| `ggml/src/ggml-sycl/moe-stream-plan.hpp` | A10.2b | two comments that describe the loan |
+| `ggml/src/ggml-sycl/tests/test-sycl-host-backing-accounting.cpp` | A10.2b | one new arm |
+| `tests/test-sycl-moe-expert-loan-source.py` | A10.2b | one clause beside `FLIP` |
 | `ggml/src/ggml-sycl/unified-cache.cpp` | A10.3 | three helpers; one call before the ring room; one call ends each builder |
 | `tests/test-sycl-layout-choice.cpp` | A10.3 | one new test function in `ring_room_case` |
 | `docs/backend/sycl-env-vars.md` | A10.3 | one row |
@@ -464,6 +473,239 @@ Nothing else changes. Run the pins from the census again.
   check.
 - **Build** only on the lead's GO: targets `test-moe-stream-plan test-moe-stream-phase test-sycl-layout-choice
   llama-bench llama-cli`.
+
+---
+
+### Task A10.2b: a lent expert's plan entry reads `PINNED` while it is lent
+
+**Track:** F. **Depends on:** A10.2. **Added by amendment 1.**
+
+**Description:** the expert loan lends device-resident triplets to the host so the window ring has room, then
+streams them through the ring like any host expert. The transaction copies each lent member into a pinned
+WEIGHT-zone block (`ggml_sycl_host_expert_alloc`, `ggml-sycl.cpp:22688`) and publishes a plan whose entry says
+host. On a load that maps files every device entry reads `FILE_MAPPED`, its staging source
+(`placement_mark_device_entries_file_mapped`), and `update_expert_placement` flips `on_device` and the target only.
+So the published plan says `FILE_MAPPED` for bytes that are in pinned memory. After A10.2 the index would stage
+nothing for the triplets the loan was sized to stream. This task makes the published plan say what the loan did.
+
+It is the same rule as A10.1 and A10.2, applied to the one writer they missed: the plan's backing is the fact.
+
+**Evidence that loans are live:** a default (mapped) Qwen3.8 load on the B70 at pp2048 prints
+`[MOE-EXEC] loan device 0: 1 triplets, 2 MiB lent to the ring (OK)` (lead runs `a10-remeasure/mapped-2`,
+`a11-merged/qwen-mapped`). The copy-pin spike printed none at that prompt size.
+
+**Acceptance criteria:**
+
+- [ ] `placement_plan::set_expert_host_backing(layer, expert, role, backing)` changes one entry's backing and moves
+      its `src_size` between the host terms. Every term equals a recount afterwards.
+- [ ] After a loan each lent entry reads `PINNED`. After a refill it reads `FILE_MAPPED` when the plan's
+      `host_backing_maps_files` is set, and `PINNED` otherwise.
+- [ ] On a mapping plan, the index of the published post-loan plan stages the lent triplet exactly as the `as_host`
+      read sized it.
+- [ ] `update_expert_placement` is unchanged, and arm (h) of `test-sycl-host-backing-accounting.cpp` is green
+      unchanged.
+- [ ] A `-lm none` load publishes the same backings as today (`PINNED` before, during and after a loan).
+
+#### Step 1: census
+
+1. The refill path that leaves a triplet on the host (`[MOE-EXEC] refill device %d: layer %d expert %d stays on the
+   host`, `ggml-sycl.cpp:22745`): confirm its entry is not flipped, so it keeps `PINNED` from the loan. Cite lines.
+2. The `if (loaned)` block (`ggml-sycl.cpp:22834-22850`): confirm nothing between the flip and the publication can
+   run for one member and not the others, so a triplet is never published half set.
+3. Name the test binary that runs the in-tree loan fixtures (`ggml-sycl.cpp:~25400-26100`) and say whether any
+   fixture plan sets `host_backing_maps_files`. That binary joins the build targets.
+4. Run before editing, and report the rc: `tests/test-sycl-moe-expert-loan-source.py`,
+   `tests/test-sycl-host-backing-source.py` (its `test_only_the_helpers_write_the_host_terms` and
+   `test_update_expert_placement_moves_bytes_through_the_helpers` may name the writers of the host terms),
+   `tests/test-sycl-moe-stream-enqueue-source.py`. A pin that must follow GREEN is edited in the GREEN commit; say
+   which and why before touching one that is not on the ownership map.
+5. Report only, no code: where the host WEIGHT zone is sized, what a loan's copy allocates from on a mapping load
+   today (the 2 MiB loan above succeeds), and whether a loan larger than the zone's reserve can grow it or stops
+   with `host pinned pool exhausted`.
+
+#### Step 2: RED
+
+(a) In `ggml/src/ggml-sycl/tests/test-sycl-host-backing-accounting.cpp`, after
+`test_an_expert_moving_between_tiers_follows_its_backing`, and called from `main` after it:
+
+```cpp
+static void test_a_lent_expert_reads_pinned_until_it_is_refilled() {
+    printf("(i) set_expert_host_backing moves one entry's bytes between its backings' terms\n");
+    placement_plan plan{};
+    plan.host_backing_maps_files = true;
+    plan.entries.push_back(
+        make_entry("blk.0.ffn_gate_exps.weight", 64 * MiB, 80 * MiB, placement_host_backing::FILE_MAPPED, true, 0, 5));
+    plan.entries[0].vram_charge_size = 80 * MiB;
+    plan.entries[0].target_device    = 0;
+    plan.weight_vram_bytes           = 80 * MiB;
+    plan.vram_bytes                  = 80 * MiB;
+    plan.build_index();
+    plan.recount_host_mapped_source_bytes();
+    const expert_tensor_role gate = expert_tensor_role::GATE;
+
+    // The loan: the transaction flips the entry to the host, then says its copy is pinned.
+    check_true("lend: flip", plan.update_expert_placement(0, 5, gate, false, -1));
+    check_true("lend: backing", plan.set_expert_host_backing(0, 5, gate, placement_host_backing::PINNED));
+    check_true("lent: the entry reads PINNED", plan.entries[0].host_backing == placement_host_backing::PINNED);
+    check_eq("lent: weight_host", plan.weight_host_bytes, 64 * MiB);
+    check_eq("lent: host_mapped", plan.host_mapped_bytes, 0);
+    check_eq("lent: host_bytes", plan.host_bytes, 64 * MiB);
+    check_eq("lent: no mapped source", plan.host_mapped_source_bytes, 0);
+
+    // The refill: back on the device, it is staged from the mapping again.
+    check_true("refill: flip", plan.update_expert_placement(0, 5, gate, true, 0));
+    check_true("refill: backing", plan.set_expert_host_backing(0, 5, gate, placement_host_backing::FILE_MAPPED));
+    check_true("refilled: FILE_MAPPED", plan.entries[0].host_backing == placement_host_backing::FILE_MAPPED);
+    check_eq("refilled: weight_host", plan.weight_host_bytes, 0);
+    check_eq("refilled: host_bytes", plan.host_bytes, 0);
+    check_eq("refilled: weight_vram", plan.weight_vram_bytes, 80 * MiB);
+    check_eq("refilled: the mapped source again", plan.host_mapped_source_bytes, 64 * MiB);
+    plan.recount_host_mapped_source_bytes();
+    check_eq("refilled: the running source equals a recount", plan.host_mapped_source_bytes, 64 * MiB);
+
+    // The same backing again changes nothing, and an expert the plan does not hold is refused.
+    check_true("no-op", plan.set_expert_host_backing(0, 5, gate, placement_host_backing::FILE_MAPPED));
+    check_eq("no-op: the mapped source", plan.host_mapped_source_bytes, 64 * MiB);
+    check_true("unknown expert", !plan.set_expert_host_backing(0, 6, gate, placement_host_backing::PINNED));
+}
+```
+
+(b) In `ggml/src/ggml-sycl/tests/test-moe-stream-plan.cpp`, after `test_ring_cap_is_loan_invariant`, and called from
+`main` after it:
+
+```cpp
+// A loan on a load that maps files. Every device entry there reads FILE_MAPPED, its staging source. The transaction
+// copies a lent triplet into pinned memory and publishes it as a host entry with that backing, so the index stages it
+// as it did when it sized the loan through as_host. Published still FILE_MAPPED, the index would stage nothing for it.
+void test_a_lent_triplet_on_a_mapping_load_is_staged() {
+    ggml_sycl::moe_stream_window_hints hints;
+    hints.weight_slot_bytes = 10 * kSrc;
+
+    placement_plan plan          = make_typed_plan();
+    plan.host_backing_maps_files = true;
+    for (ggml_sycl::placement_entry & e : plan.entries) {
+        if (e.expert_id >= 0 && e.on_device) {
+            e.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+        }
+    }
+    const std::unordered_set<uint64_t> as_host{ ggml_sycl::moe_stream_table_key(0, 0, expert_tensor_role::UNKNOWN) };
+    ggml_sycl::moe_stream_plan_index   sized;
+    (void) ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, claims_all, hints, &sized, &as_host);
+    CHECK(sized.role_items_max == 4);  // layer 0: host experts 1, 5 and 6, and the lent expert 0
+    CHECK(ggml_sycl::moe_stream_layer_claimed(sized.layers.at(0)));
+
+    const expert_tensor_role roles[3] = { expert_tensor_role::GATE, expert_tensor_role::UP, expert_tensor_role::DOWN };
+
+    // The control: the flip alone publishes a mapped host triplet, and layer 0 is no longer claimed.
+    placement_plan flipped = plan;
+    for (expert_tensor_role role : roles) {
+        CHECK(flipped.update_expert_placement(0, 0, role, false, -1));
+    }
+    ggml_sycl::moe_stream_plan_index unstaged;
+    (void) ggml_sycl::moe_stream_plan_ring_geometry(flipped, 0, nullptr, claims_all, hints, &unstaged);
+    CHECK(!ggml_sycl::moe_stream_layer_claimed(unstaged.layers.at(0)));
+
+    // The transaction's two steps per member.
+    for (expert_tensor_role role : roles) {
+        CHECK(plan.update_expert_placement(0, 0, role, false, -1));
+        CHECK(plan.set_expert_host_backing(0, 0, role, ggml_sycl::placement_host_backing::PINNED));
+    }
+    ggml_sycl::moe_stream_plan_index published;
+    (void) ggml_sycl::moe_stream_plan_ring_geometry(plan, 0, nullptr, claims_all, hints, &published);
+    CHECK(published.role_items_max == sized.role_items_max);
+    CHECK(published.window_slots == sized.window_slots);
+    CHECK(ggml_sycl::moe_stream_layer_claimed(published.layers.at(0)));
+}
+```
+
+- Verify against the tree before writing: `make_entry`'s parameter order in the accounting test, that
+  `make_typed_plan` builds its index (the flips need it), and the argument order of
+  `moe_stream_plan_ring_geometry` (`plan, device, graph_ctx, library_claims, hints, index out, as_host`). STOP if one
+  does not fit.
+- RED evidence: both files fail to compile at the RED commit, on `no member named 'set_expert_host_backing'`.
+  Report the syntax-only compile output. The control block in (b) is the behavioural half: it shows the state this
+  task removes, and it stays in the test.
+
+**Commit:** `test(sycl): a lent expert's plan entry reads PINNED while it is lent (RED)`.
+
+#### Step 3: GREEN
+
+`ggml/src/ggml-sycl/unified-cache.hpp`, directly after `update_expert_placement` (`:1736-1797`):
+
+```cpp
+    // Says whose memory an expert's host bytes live in now, and moves its file bytes between the backings' terms so
+    // each term stays equal to a recount in O(1). The loan transaction calls it beside update_expert_placement: a lent
+    // expert's host copy is a pinned block the transaction minted, whatever backed the entry while it was on the
+    // device, and a re-admitted one is staged from the load's own source again.
+    bool set_expert_host_backing(int layer_id, int expert_id, expert_tensor_role role, placement_host_backing backing) {
+        const expert_placement_key key{ layer_id, expert_id, role };
+        auto                       it = expert_placement_index_.find(key);
+        if (it == expert_placement_index_.end()) {
+            return false;
+        }
+
+        placement_entry & e = entries[it->second];
+        if (e.host_backing == backing) {
+            return true;
+        }
+        if (e.on_device) {
+            // A device-planned entry is charged to no host term. Its file bytes count as a mapped staging source
+            // exactly while its backing is FILE_MAPPED.
+            if (e.host_backing == placement_host_backing::FILE_MAPPED) {
+                saturating_sub(host_mapped_source_bytes, e.src_size);
+            }
+            if (backing == placement_host_backing::FILE_MAPPED) {
+                host_mapped_source_bytes += e.src_size;
+            }
+        } else {
+            uncharge_host_weight(e.host_backing, e.src_size);
+            charge_host_weight(backing, e.src_size);
+        }
+        e.host_backing = backing;
+        return true;
+    }
+```
+
+`ggml/src/ggml-sycl/ggml-sycl.cpp`, in the loan transaction's publication loop (`:22840-22844`), directly after the
+`update_expert_placement` call and inside the same `for`:
+
+```cpp
+                // The plan says whose memory the host bytes are. A lent member's are the pinned copy this transaction
+                // minted. A re-admitted member is staged from the load's source again: the mapping when the load maps
+                // files. The ring's plan index reads this to decide what it can stage.
+                (void) next_plan->set_expert_host_backing(
+                    k.layer_id, k.expert_id, k.role,
+                    refill && next_plan->host_backing_maps_files ? ggml_sycl::placement_host_backing::FILE_MAPPED :
+                                                                   ggml_sycl::placement_host_backing::PINNED);
+```
+
+`ggml/src/ggml-sycl/moe-stream-plan.hpp`, two comments only:
+
+- above `moe_stream_plan_index_build` (`:230-233`): "the transaction's update_expert_placement flips on_device and
+  the target only" becomes "the transaction flips on_device and the target, and publishes the backing of the pinned
+  copy it made".
+- in the claim guard A10.2 added: the sentence "A lent device triplet is not asked: its host copy is the loan's
+  business." becomes "A device triplet read through as_host is not asked: the loan copies it into pinned memory and
+  publishes it PINNED."
+
+`tests/test-sycl-moe-expert-loan-source.py`: a `BACKING` constant for the new call beside `FLIP` (`:637`),
+`b.count(BACKING) == 1`, and `ordered(..., FLIP, BACKING, PUBLISH, ...)` in every sequence that names `FLIP`. Two
+mutants: the call removed, and the two enumerators swapped.
+
+**Commit:** `sycl: a loan publishes its lent triplets as pinned, and a refill gives them their source back`.
+
+#### Gotchas
+
+- **`update_expert_placement` does not change.** It still charges by the entry's current backing, so the order in
+  the transaction matters only for readability: flip, then set. Both orders give the same terms.
+- **No ledger change.** The refill does not restore a recorded backing. A device-planned expert's backing follows
+  one rule everywhere in the tree: `FILE_MAPPED` when the load maps files, else `PINNED`.
+- **The lifecycle snapshot's `planned_host_bytes` and `charged_host_bytes` are not recomputed by a loan** today.
+  This task does not change that. Say so in the report if a test reads them.
+- **The loan transaction is shared with the paused th32 plan.** Change the one loop named above and nothing else in
+  `ggml_sycl_expert_txn_run`.
+- **Build** only on the lead's GO: targets `test-sycl-host-backing-accounting test-moe-stream-plan llama-bench
+  llama-cli` and the loan fixture binary the census names.
 
 ---
 
@@ -792,6 +1034,7 @@ same binary. The mapped bench arms are reported warm and cold separately, each w
 | 12 | Mistral completion gate from CLAUDE.md | B50 | output starts `1, 2, 3, 4, 5, 6, 7, 8, 9, 10` |
 | 13 | `llama-bench` GPT-OSS 20B `-p 512 -n 128`: default, opt-out, opt-out, default | B50, then B70 | within the spread of `docs/backend/sycl-perf-baselines.md`, or explained by the opt-out pair and by today's tree measured the same way |
 | 14 | Kernel log over the whole run | both | no `GT reset`, `guc_id` or `CAT error` line on the card an arm was using, during that arm |
+| 15 | Loans: `grep -a 'MOE-EXEC\] loan device'` in the verbose logs of runs 4, 5, 8, 9 and 11 | both | record every loan line. In a default-flag run that lent, the summary shows MiB streamed above 0 and 0 misses, and no host layer prints `ring-unavailable` after the loan. If no default-flag run lends, say so: the loan under a pinned mapping plan is then covered by the unit tests only |
 
 Run 4 is the acceptance: the default load takes the ring, answers correctly, and holds the experts once. Runs 11
 and 13 matter because GPT-OSS also has host experts on the B50, so both the pin and A10.2's change can move it.
@@ -801,8 +1044,11 @@ A regression there against today's tree blocks the merge.
 
 - **`-lm none` holds each host expert twice** (124 GB for 48.7 GB). Its own ticket.
 - **Multi-device plans hold no ring room.** Its own ticket, behind the `GGML_SYCL_MOE_MULTI_GPU` opt-in.
-- **A loan on a mapping load** lends device triplets whose host bytes are the mapping. A10.2 leaves lent entries
-  as they are read today. Its own ticket.
+- ~~A loan on a mapping load~~: moved into this addendum as task A10.2b (amendment 1). The line that stood here
+  said a lent triplet's host bytes are the mapping. They are a pinned copy the loan makes.
+- **A loan's pinned copies are in no plan term.** The host WEIGHT zone is sized from the plan plus a 64 MiB
+  reserve, and a loan allocates from it. A10.2b's census reports whether a larger loan can outgrow it. Its own
+  ticket if it can.
 - **The DMA staging pool** is sized for any plan with pinned host weights (900 MB of device memory here), though
   the window ring does not use it. Its own ticket.
 - **A withdrawn pin keeps the ring's room** (119.5 MB of device memory on this pack). Its own ticket if a host
