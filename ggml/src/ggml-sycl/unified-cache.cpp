@@ -35091,6 +35091,48 @@ static void placement_mark_device_entries_file_mapped(placement_plan & plan) {
     }
 }
 
+bool placement_pin_host_experts_enabled() {
+    const char * env = std::getenv(MOE_PIN_HOST_EXPERTS_ENV);
+    return env == nullptr || std::strcmp(env, "0") != 0;
+}
+
+// Marks every routed expert PINNED on a load that maps files, before the window ring's room is sized and before any
+// expert is placed or charged. The ring copies a host expert only out of pinned memory, so its room is sized over
+// pinned experts, and the pack then charges each host group as pinned. A locked mapping keeps its experts mapped: the
+// load already holds them resident. Returns whether anything was marked; placement_plan_size_host_side keeps or
+// withdraws the answer once the plan is whole.
+static bool placement_pin_routed_experts_for_ring(placement_plan & plan, const placement_kv_info & kv_info) {
+    if (!plan.host_backing_maps_files || plan.host_mapped_locked || kv_info.moe_stream_staged_types == 0 ||
+        !placement_pin_host_experts_enabled()) {
+        return false;
+    }
+    bool any = false;
+    for (placement_entry & e : plan.entries) {
+        if (e.expert_id >= 0 && e.host_backing == placement_host_backing::FILE_MAPPED) {
+            e.host_backing = placement_host_backing::PINNED;
+            any            = true;
+        }
+    }
+    return any;
+}
+
+// Moves every host-executed routed expert from one backing to another with its charge, at src_size, the size the
+// expert pack charges a host group. Returns the bytes moved.
+static size_t placement_move_host_expert_backing(placement_plan &       plan,
+                                                 placement_host_backing from,
+                                                 placement_host_backing to) {
+    size_t moved = 0;
+    for (placement_entry & e : plan.entries) {
+        if (e.expert_id >= 0 && !e.on_device && e.host_backing == from) {
+            plan.uncharge_host_weight(e.host_backing, e.src_size);
+            e.host_backing = to;
+            plan.charge_host_weight(e.host_backing, e.src_size);
+            moved += e.src_size;
+        }
+    }
+    return moved;
+}
+
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
@@ -35794,6 +35836,48 @@ static void populate_host_zone_sizing(placement_plan &                          
         host_scratch_total = k_min_zone_bytes;
     }
     plan.host_zone_scratch_bytes = std::max<size_t>(k_min_zone_bytes, host_scratch_total);
+}
+
+// The host side of a finished placement: the device entries' staging source, the host zones, the ledger. Both builders
+// end with it. `ring_pin` says the routed experts were marked PINNED for the window ring. That answer is kept when the
+// plan holds ring room, its host bytes fit the budget and no lazy table refuses; otherwise the host experts go back to
+// the mapping, all of them, and the zones and the ledger are sized again for the plan that results. The fit is the
+// ledger's own figure, so a plan that keeps the pin never also logs the would-refuse line.
+static void placement_plan_size_host_side(placement_plan &                           plan,
+                                          const std::vector<placement_tensor_info> & tensor_inventory,
+                                          int                                        n_experts,
+                                          const placement_kv_info &                  kv_info,
+                                          size_t                                     host_budget,
+                                          const ring_lease *                         coverage_pin,
+                                          bool                                       ring_pin) {
+    const double mb = 1024.0 * 1024.0;
+    if (ring_pin && plan.moe_stream_ring_reserve_bytes == 0) {
+        // No ring exists for this plan, so nothing would stream the copies.
+        placement_move_host_expert_backing(plan, placement_host_backing::PINNED, placement_host_backing::FILE_MAPPED);
+        ring_pin = false;
+    }
+    placement_mark_device_entries_file_mapped(plan);
+    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
+    record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
+    if (!ring_pin) {
+        return;
+    }
+    const size_t pinned = plan.weight_host_bytes;
+    if (plan.host_planned_bytes <= plan.host_budget && plan.lazy_refusal.empty()) {
+        GGML_LOG_INFO(
+            "[PLACEMENT] routed host experts pinned for the window ring: %.1f MB, host plan %.1f MB of "
+            "%.1f MB\n",
+            pinned / mb, plan.host_planned_bytes / mb, plan.host_budget / mb);
+        return;
+    }
+    GGML_LOG_WARN(
+        "[PLACEMENT] routed host experts stay mapped, so prompts run them on the CPU: pinning %.1f MB "
+        "plans %.1f MB of host memory against a budget of %.1f MB (lazy refusal: %s). The host zones "
+        "are sized again without them\n",
+        pinned / mb, plan.host_planned_bytes / mb, plan.host_budget / mb, placement_lazy_refusal_text(plan).c_str());
+    placement_move_host_expert_backing(plan, placement_host_backing::PINNED, placement_host_backing::FILE_MAPPED);
+    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
+    record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
 }
 
 // Maps the int32 flash_attn_type encoding on ggml_sycl_placement_envelope
@@ -36533,6 +36617,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     }
     placement_plan plan;
     placement_plan_copy_host_backing_fact(plan, kv_info);
+    bool ring_pin                            = false;
     plan.vram_budget                         = vram_budget;
     plan.device_id                           = device_id;
     plan.multi_device                        = false;
@@ -36944,7 +37029,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 device_id, pp_alt_groups, pp_alt_entries, pp_alt_charge / (1024.0 * 1024.0), pp_alt_no_layout_bytes);
         }
         // The window ring's room, the last term held before the pack: the ring is sized over the host experts the pack
-        // leaves, so the room is sized over the pack it predicts, after every group's charge is final.
+        // leaves, so the room is sized over the pack it predicts, after every group's charge is final. On a load that
+        // maps files the routed experts are marked PINNED first, since the ring streams only pinned experts.
+        ring_pin = placement_pin_routed_experts_for_ring(plan, kv_info);
         hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining);
         moe_triplet_pack_stats stats;
         stats.groups  = moe_groups.size();
@@ -37062,9 +37149,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         !account_moe_mmid_workspaces(plan, { device_budget{ device_id, vram_budget, vram_budget } })) {
         reject_moe_mmid_workspaces(plan);
     }
-    placement_mark_device_entries_file_mapped(plan);
-    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
-    record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
+    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, host_budget, coverage_pin, ring_pin);
 
     // Build the name->index lookup for O(1) queries
     plan.build_index();
@@ -39112,9 +39197,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     if (!plan.moe_mmid_workspace_valid || !account_moe_mmid_workspaces(plan, device_budgets)) {
         reject_moe_mmid_workspaces(plan);
     }
-    placement_mark_device_entries_file_mapped(plan);
-    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
-    record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
+    // The multi-device builder sizes no window ring, so its routed experts are never pinned for one.
+    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, host_budget, coverage_pin,
+                                  /*ring_pin=*/false);
 
     plan.build_index();
     publish_moe_host_scatter_term(plan, tensor_inventory, n_experts, kv_info.n_expert_used);

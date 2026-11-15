@@ -431,6 +431,9 @@ int g_ggml_sycl_moe_pp_f16_group_experts_max = 0;
 // GGML_SYCL_MOE_EXEC_DECLINE_LAYER as the report's integer (llama.cpp-ny6i), SET from
 // ggml_sycl_moe_exec_decline_layer() after the table parse: -1 is no layer.
 int g_ggml_sycl_moe_exec_decline_layer       = -1;
+// GGML_SYCL_MOE_PIN_HOST_EXPERTS as the report's integer, SET from ggml_sycl::placement_pin_host_experts_enabled()
+// after the table parse: 1 pins a mapping load's routed host experts for the window ring, 0 keeps them mapped.
+int g_ggml_sycl_moe_pin_host_experts         = 1;
 
 int g_ggml_sycl_disable_dnn      = 0;
 int g_ggml_sycl_prioritize_dmmv  = 0;
@@ -35360,6 +35363,9 @@ static void ggml_check_sycl() try {
             // The forced-decline debugging knob (llama.cpp-ny6i), likewise overwritten from its accessor, which refuses
             // a layer this integer parse would take.
             { GGML_SYCL_MOE_EXEC_DECLINE_LAYER_ENV, &g_ggml_sycl_moe_exec_decline_layer, -1 },
+            // The planner's pin of a mapping load's routed host experts, likewise overwritten from its one reader,
+            // which the planner calls on every plan.
+            { ggml_sycl::MOE_PIN_HOST_EXPERTS_ENV, &g_ggml_sycl_moe_pin_host_experts, 1 },
             // clang-format on
         };
 
@@ -35372,6 +35378,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_moe_pp_f16_batched_aos       = ggml_sycl_moe_pp_f16_batched_aos_enabled() ? 1 : 0;
         g_ggml_sycl_moe_pp_f16_group_experts_max = static_cast<int>(ggml_sycl_moe_pp_f16_group_experts_max());
         g_ggml_sycl_moe_exec_decline_layer       = ggml_sycl_moe_exec_decline_layer();
+        g_ggml_sycl_moe_pin_host_experts         = ggml_sycl::placement_pin_host_experts_enabled() ? 1 : 0;
 
         // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
         // which makes graph replay meaningless — the graph is submitted as a

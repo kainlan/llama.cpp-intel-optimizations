@@ -91,8 +91,9 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
 The planner (§4.4)
   P1. both builders copy the fact into the plan through placement_plan_copy_host_backing_fact, and nowhere else,
       before any entry; every entry-creation site derives host_backing from the fact as the plan holds it
-      (placement_host_backing_when_host reads plan.host_backing_maps_files, never kv_info's), and both builders mark the
-      device-planned entries FILE_MAPPED before the host zones are sized;
+      (placement_host_backing_when_host reads plan.host_backing_maps_files, never kv_info's), and both builders end
+      with placement_plan_size_host_side, which marks the device-planned entries FILE_MAPPED before it sizes the host
+      zones;
   P2. every host-weight accumulation site in the planner passes the entry's host_backing (the per-entry group helper
       reads it itself);
   P3. the readers: charged_host_weight_bytes and refresh_kv_byte_totals count the mapped bytes only when locked, both
@@ -797,12 +798,9 @@ def clause_p1_derivation_sites(t: dict) -> list:
         if n != 2:
             problems.append(f"{builder}: {n} entry-creation sites derive host_backing, "
                             "expected the expert and dense one")
-        mark = body.find("placement_mark_device_entries_file_mapped(plan)")
-        zones = body.find("populate_host_zone_sizing(plan,")
-        if mark < 0:
-            problems.append(f"{builder} does not mark its device-planned entries FILE_MAPPED")
-        elif zones >= 0 and mark > zones:
-            problems.append(f"{builder} marks the device-planned entries after the host zones are sized")
+        if not re.search(r"\bplacement_plan_size_host_side\s*\(\s*plan\s*,", body):
+            problems.append(f"{builder} does not end with placement_plan_size_host_side, which marks its "
+                            "device-planned entries FILE_MAPPED")
         copy = re.search(r"placement_plan_copy_host_backing_fact\s*\(\s*plan\s*,\s*kv_info\s*\)\s*;", body)
         first_entry = body.find("placement_host_backing_when_host(")
         if not copy:
@@ -811,6 +809,13 @@ def clause_p1_derivation_sites(t: dict) -> list:
             problems.append(f"{builder} copies the fact after it derives an entry's backing")
         if re.search(r"plan\s*\.\s*(host_backing_maps_files|host_mapped_locked)\s*=", body):
             problems.append(f"{builder} writes the fact itself instead of through the one copy helper")
+    host_side = body_of(ucc, r"static\s+void\s+placement_plan_size_host_side\s*\(")
+    mark = host_side.find("placement_mark_device_entries_file_mapped(plan)")
+    zones = host_side.find("populate_host_zone_sizing(plan,")
+    if mark < 0:
+        problems.append("placement_plan_size_host_side does not mark the device-planned entries FILE_MAPPED")
+    elif zones < 0 or mark > zones:
+        problems.append("placement_plan_size_host_side marks the device-planned entries after the host zones are sized")
     helper = body_of(ucc, r"static\s+void\s+placement_plan_copy_host_backing_fact\s*\(")
     if not re.search(r"plan\s*\.\s*host_backing_maps_files\s*=\s*info\s*\.\s*load_maps_files\s*;", helper):
         problems.append("placement_plan_copy_host_backing_fact does not copy the fact into the plan")
@@ -1039,6 +1044,11 @@ MUTANTS = [
     ("a ninth resolve_or_host caller", "C1",
      lambda t: _mut(t, BINBCAST, r"(\bggml_sycl_resolve_or_host_tensor_ptr\s*\()",
                     r"ggml_sycl_resolve_or_host_tensor_ptr(nullptr, 0); \1")),
+    ("one builder does not end with the host side", "P1",
+     lambda t: _mut(t, UCC, r"placement_plan_size_host_side\s*\(\s*plan\s*,", "placement_plan_skipped(plan,")),
+    ("the host side sizes the zones before it marks the device entries", "P1",
+     lambda t: _mut(t, UCC, r"(placement_mark_device_entries_file_mapped\s*\(\s*plan\s*\)\s*;)\s*"
+                            r"(populate_host_zone_sizing\s*\([^;]*;)", r"\2 \1")),
     ("one builder skips the fact copy", "P1",
      lambda t: _mut(t, UCC, r"(placement_plan\s+plan\s*;\s*)placement_plan_copy_host_backing_fact\s*\(\s*plan\s*,\s*"
                             r"kv_info\s*\)\s*;", r"\1")),

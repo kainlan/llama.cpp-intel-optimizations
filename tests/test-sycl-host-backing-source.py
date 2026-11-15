@@ -15,6 +15,10 @@ every reader reads the meaning design 5efe §4.4 assigns it.
    lifecycle publication carries `charged_host_bytes` beside it into `ModelState`; the load summary prints placed and
    charged; both `Totals` lines print all four terms; `refresh_kv_byte_totals` counts the cpu-owned bytes and not the
    mapped ones.
+4. the opt-out of the planner's pin of routed host experts has one reader, `placement_pin_host_experts_enabled()`:
+   unified-cache.hpp names the variable once, the reader is the only place either source reads it from the
+   environment, the planner's pin asks the reader, and `ggml_check_sycl`'s settings table carries a row for it whose
+   value is overwritten from the reader after the parse, so the non-default settings line reports a `=0`.
 
 Plain file I/O, comment-stripped text.
 """
@@ -389,6 +393,75 @@ def test_the_write_scanner_sees_a_write_after_a_quote_char_or_a_raw_string():
     raw_label = 'log(R"x(host_cpu_owned_bytes = 7;\n)x");'
     assert host_term_writes(blank_string_literals(raw_label)) == []
     assert blank_string_literals('R"(a\nb)"\nc').count("\n") == 2
+
+
+# ---- 4. the pin's opt-out ----
+
+GS = "ggml-sycl.cpp"
+PIN_ENV = "MOE_PIN_HOST_EXPERTS_ENV"
+PIN_READER = "placement_pin_host_experts_enabled"
+PIN_GLOBAL = "g_ggml_sycl_moe_pin_host_experts"
+
+
+def pin_opt_out_gaps(hpp: str, cpp: str, gs: str) -> list:
+    gaps = []
+    if not re.search(rf'\bconstexpr\s+const\s+char\s*\*\s*{PIN_ENV}\s*=\s*"GGML_SYCL_MOE_PIN_HOST_EXPERTS"\s*;', hpp):
+        gaps.append(f"unified-cache.hpp does not name the variable as {PIN_ENV}")
+    if not re.search(rf"\bbool\s+{PIN_READER}\s*\(\s*\)\s*;", hpp):
+        gaps.append(f"unified-cache.hpp does not declare {PIN_READER}()")
+    readers = list(re.finditer(rf"\bbool\s+{PIN_READER}\s*\(\s*\)\s*\{{", cpp))
+    if len(readers) != 1:
+        return gaps + [f"{len(readers)} definitions of {PIN_READER}, want 1"]
+    reader = balanced(cpp, readers[0].end() - 1)
+    if not re.search(rf"\bgetenv\s*\(\s*{PIN_ENV}\s*\)", reader):
+        gaps.append(f"{PIN_READER} does not read {PIN_ENV}")
+    for name, text in (("unified-cache.cpp", cpp.replace(reader, "")), (GS, gs)):
+        if re.search(rf"\bgetenv\s*\(\s*(?:ggml_sycl\s*::\s*)?{PIN_ENV}\b|GGML_SYCL_MOE_PIN_HOST_EXPERTS", text):
+            gaps.append(f"{name} reads the variable outside {PIN_READER}")
+    pin = function_body(cpp, r"static\s+bool\s+placement_pin_routed_experts_for_ring\s*\(")
+    if not re.search(rf"\b{PIN_READER}\s*\(\s*\)", pin):
+        gaps.append(f"placement_pin_routed_experts_for_ring does not ask {PIN_READER}()")
+    table = re.search(r"\bsycl_env_settings\s*\[\s*\]\s*=\s*\{", gs)
+    if not table:
+        return gaps + ["ggml-sycl.cpp has no sycl_env_settings table"]
+    rows = balanced(gs, table.end() - 1)
+    if not re.search(rf"\{{\s*ggml_sycl\s*::\s*{PIN_ENV}\s*,\s*&\s*{PIN_GLOBAL}\s*,\s*1\s*\}}", rows):
+        gaps.append(f"the settings table has no row {{ ggml_sycl::{PIN_ENV}, &{PIN_GLOBAL}, 1 }}")
+    after = gs[table.end() :]
+    loop = re.search(r"for\s*\(\s*const\s+sycl_env_setting\s*&\s*\w+\s*:\s*sycl_env_settings\s*\)", after)
+    overwrite = re.search(rf"\b{PIN_GLOBAL}\s*=\s*ggml_sycl\s*::\s*{PIN_READER}\s*\(\s*\)", after)
+    if not overwrite:
+        gaps.append(f"{PIN_GLOBAL} is not overwritten from ggml_sycl::{PIN_READER}()")
+    elif not loop or overwrite.start() < loop.start():
+        gaps.append(f"{PIN_GLOBAL} is overwritten from the reader before the table parse, which then replaces it")
+    return gaps
+
+
+def pin_opt_out_sources() -> tuple:
+    return read(HPP), read(CPP), read(GS)
+
+
+def test_the_pin_opt_out_has_one_reader_and_a_settings_row():
+    gaps = pin_opt_out_gaps(*pin_opt_out_sources())
+    assert not gaps, "\n".join(gaps)
+
+
+def test_the_pin_opt_out_check_sees_each_dropped_piece():
+    hpp, cpp, gs = pin_opt_out_sources()
+    row = rf"\{{\s*ggml_sycl\s*::\s*{PIN_ENV}\s*,\s*&\s*{PIN_GLOBAL}\s*,\s*1\s*\}}\s*,"
+    overwrite = rf"\b{PIN_GLOBAL}\s*=\s*ggml_sycl\s*::\s*{PIN_READER}\s*\(\s*\)[^;]*;"
+    mutants = {
+        "the settings row is removed": (hpp, cpp, re.sub(row, "", gs, count=1)),
+        "the overwrite from the reader is removed": (hpp, cpp, re.sub(overwrite, ";", gs, count=1)),
+        "the planner reads the environment itself": (
+            hpp,
+            re.sub(rf"!\s*{PIN_READER}\s*\(\s*\)", f"!std::getenv({PIN_ENV})", cpp, count=1),
+            gs,
+        ),
+    }
+    for label, (m_hpp, m_cpp, m_gs) in mutants.items():
+        assert (m_hpp, m_cpp, m_gs) != (hpp, cpp, gs), f"the mutant '{label}' changed nothing"
+        assert pin_opt_out_gaps(m_hpp, m_cpp, m_gs), f"the mutant '{label}' is not caught"
 
 
 if __name__ == "__main__":

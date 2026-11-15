@@ -2538,6 +2538,13 @@ size_t lifecycle_plan_lease_count_for_test();
 void lifecycle_plan_clear_for_test();
 #endif
 
+// The opt-out of the single-device planner's pin of routed host experts on a load that maps files:
+// GGML_SYCL_MOE_PIN_HOST_EXPERTS=0 keeps them mapped. placement_pin_host_experts_enabled() is its one reader. It reads
+// the environment on every call, so a plan made after the variable changes sees it, and ggml_check_sycl reports the
+// value through it.
+static constexpr const char * MOE_PIN_HOST_EXPERTS_ENV = "GGML_SYCL_MOE_PIN_HOST_EXPERTS";
+bool                          placement_pin_host_experts_enabled();
+
 // Compute placement plan for all model weights given a VRAM budget.
 // tensor_inventory: vector of (name, src_size) pairs from model header.
 // vram_budget: available VRAM bytes for weights.

@@ -11,7 +11,10 @@ forwards that a run takes; this gate pins every one of them, including the paths
    `std::pair<std::string, size_t>` rows, forward `coverage_pin` as the last argument of the planner they call, and
    neither discards it;
 3. the multi-device planner's one-device delegation forwards `coverage_pin` to `compute_placement_plan`;
-4. both planners record their host terms with `coverage_pin`, and the record hands it to the residency decision;
+4. both planners record their host terms with `coverage_pin`: each passes it to `placement_plan_size_host_side`, the
+   sequence that ends both, as the argument at that function's `coverage_pin` parameter, the sequence passes its own
+   `coverage_pin` as the last argument of every `record_host_ledger_plan` call, and the record hands it to the
+   residency decision;
 5. only `lazy_plan_slot_scope` writes the slot, so a pin on it lives exactly as long as the scope that set it, and the
    slot is thread-local.
 
@@ -30,6 +33,9 @@ SYCL = ROOT / "ggml/src/ggml-sycl"
 SLOT = "g_sycl_lazy_plan_slot"
 PIN = "coverage_pin"
 PAIR_ROW = re.compile(r"std::pair\s*<\s*std::string\s*,\s*size_t\s*>")
+CPP, MULTI, RECORD = "compute_placement_plan", "compute_multi_device_plan", "record_host_ledger_plan"
+# The one sequence that ends both builders, which records their host terms.
+HOST_SIDE = "placement_plan_size_host_side"
 
 # One lexer for every pass: a raw string, a string, a char literal, a line comment, a block comment.
 _LEXEME_RE = re.compile(
@@ -162,13 +168,36 @@ def delegation_violations(uc: str) -> list:
             for last in lasts if last != PIN]
 
 
+def host_side_pin_index(uc: str) -> int:
+    """The position of the host-side sequence's `coverage_pin` parameter, or -1 when it has none."""
+    defs = definitions(uc, HOST_SIDE)
+    if len(defs) != 1:
+        return -1
+    params = split_args(defs[0][0])
+    hits = [i for i, p in enumerate(params) if re.search(rf"\bring_lease\s*\*\s*{PIN}$", p)]
+    return hits[0] if len(hits) == 1 else -1
+
+
 def record_violations(uc: str) -> list:
     out = []
+    defs = definitions(uc, HOST_SIDE)
+    if len(defs) != 1:
+        return [f"{len(defs)} definitions of {HOST_SIDE}, want 1"]
+    index = host_side_pin_index(uc)
+    if index < 0:
+        out.append(f"{HOST_SIDE} has no `const ring_lease * {PIN}` parameter")
     for name in ("compute_placement_plan", "compute_multi_device_plan"):
         _, start, end = the_definition(uc, name, pair=False)
-        lasts = last_args(uc, start, end, "record_host_ledger_plan")
-        if not lasts or any(last != PIN for last in lasts):
-            out.append(f"{name} records its host terms with last arguments {lasts}, want {PIN} at every record")
+        spans = calls_in(uc, start, end, HOST_SIDE)
+        pins = [split_args(uc[a:b])[index] if 0 <= index < len(split_args(uc[a:b])) else "" for a, b in spans]
+        if not pins or any(pin != PIN for pin in pins):
+            out.append(f"{name} hands {HOST_SIDE} the pins {pins}, want {PIN} at every call")
+        if calls_in(uc, start, end, RECORD):
+            out.append(f"{name} records its host terms itself instead of through {HOST_SIDE}")
+    _, start, end = defs[0]
+    lasts = last_args(uc, start, end, RECORD)
+    if not lasts or any(last != PIN for last in lasts):
+        out.append(f"{HOST_SIDE} records its host terms with last arguments {lasts}, want {PIN} at every record")
     defs = definitions(uc, "record_host_ledger_plan")
     if len(defs) != 1:
         return out + [f"{len(defs)} definitions of record_host_ledger_plan, want 1"]
@@ -232,6 +261,34 @@ def in_uc(name: str, pair: bool, callee: str, replacement):
     return mutate
 
 
+def edit_arg(text: str, start: int, end: int, callee: str, index: int, replacement: str, nth: int = 0) -> str:
+    """Replaces argument `index` of the `nth` call of `callee` in [start, end)."""
+    spans = calls_in(text, start, end, callee)
+    assert len(spans) > nth, f"no call {nth} of {callee} to mutate"
+    a, b = spans[nth]
+    args = split_args(text[a:b])
+    assert 0 <= index < len(args), f"the call of {callee} has no argument {index} to mutate"
+    args[index] = replacement
+    return text[:a] + ", ".join(args) + text[b:]
+
+
+def in_builder_host_side(name: str, replacement: str):
+    def mutate(sycl: str, uc: str) -> tuple:
+        _, start, end = the_definition(uc, name, pair=False)
+        return sycl, edit_arg(uc, start, end, HOST_SIDE, host_side_pin_index(uc), replacement)
+
+    return mutate
+
+
+def in_host_side_record(nth: int, replacement: str):
+    def mutate(sycl: str, uc: str) -> tuple:
+        _, start, end = definitions(uc, HOST_SIDE)[0]
+        args = split_args(uc[slice(*calls_in(uc, start, end, RECORD)[nth])])
+        return sycl, edit_arg(uc, start, end, RECORD, len(args) - 1, replacement, nth)
+
+    return mutate
+
+
 def in_record(replacement):
     def mutate(sycl: str, uc: str) -> tuple:
         _, start, end = definitions(uc, "record_host_ledger_plan")[0]
@@ -244,8 +301,6 @@ def stray_writer(sycl: str, uc: str) -> tuple:
     return sycl + f"\nstatic void lazy_slot_stray() {{ {SLOT} = nullptr; }}\n", uc
 
 
-CPP, MULTI, RECORD = "compute_placement_plan", "compute_multi_device_plan", "record_host_ledger_plan"
-
 MUTANTS = {
     "the single-device stage call drops the slot": in_stage(CPP, None),
     "the single-device stage call passes nullptr": in_stage(CPP, "nullptr"),
@@ -254,8 +309,10 @@ MUTANTS = {
     "the pair compute_placement_plan drops the pin": in_uc(CPP, True, CPP, None),
     "the pair compute_multi_device_plan drops the pin": in_uc(MULTI, True, MULTI, None),
     "the one-device delegation drops the pin": in_uc(MULTI, False, CPP, None),
-    "compute_placement_plan records with nullptr": in_uc(CPP, False, RECORD, "nullptr"),
-    "compute_multi_device_plan records with nullptr": in_uc(MULTI, False, RECORD, "nullptr"),
+    "compute_placement_plan records with nullptr": in_builder_host_side(CPP, "nullptr"),
+    "compute_multi_device_plan records with nullptr": in_builder_host_side(MULTI, "nullptr"),
+    "the host side's first record passes nullptr": in_host_side_record(0, "nullptr"),
+    "the host side's re-record passes nullptr": in_host_side_record(1, "nullptr"),
     "the record hands the decision nullptr": in_record("nullptr"),
     "a second writer of the slot": stray_writer,
 }
