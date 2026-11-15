@@ -832,7 +832,29 @@ int main() {
         CHECK(rule(mapped, layer_info(mapped, 1), ring_geo, true, false) == "executor does not claim");
         CHECK(rule(mapped, layer_info(mapped, 2), ring_geo, true, false) ==
               "region smaller than the largest streamable matrix");
-        // None of the seven: named anyway, so no ring-unavailable line goes unexplained.
+        // One mapped expert among pinned ones: the other two stage, and the plan is still the only cause.
+        placement_plan one_mapped = make_plan();
+        for (placement_entry & e : one_mapped.entries) {
+            if (e.layer_id == 0 && e.expert_id == 5) {
+                e.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+            }
+        }
+        const moe_stream_plan_index one = index_of(one_mapped, claims_all);
+        CHECK(rule(one, layer_info(one, 0), ring_geo, true, false) == "host experts left mapped by the plan");
+        // The plan is named only when its backing alone keeps the layer from the executor. With no claim at all, or
+        // with layer 0's up and down unclaimed (claims_l0_gate_l2), pinning the experts would not make the executor
+        // take the layer, so the claim is the cause; only the matrices the executor would stage are counted.
+        const moe_stream_plan_index   mapped_unclaimed = index_of(mapped_plan, nullptr);
+        const moe_stream_layer_info * mu0              = layer_info(mapped_unclaimed, 0);
+        CHECK(mu0 != nullptr && mu0->n_mapped_host == 0);
+        CHECK(rule(mapped_unclaimed, mu0, ring_geo, true, false) == "executor does not claim");
+        claims_probe                mapped_partial_probe;
+        const moe_stream_plan_index mapped_partial = ggml_sycl::moe_stream_plan_index_build(
+            mapped_plan, 0, &mapped_partial_probe, claims_l0_gate_l2, kWideWindow);
+        const moe_stream_layer_info * mp0 = layer_info(mapped_partial, 0);
+        CHECK(mp0 != nullptr && mp0->n_mapped_host == 3);
+        CHECK(rule(mapped_partial, mp0, ring_geo, true, false) == "executor does not claim");
+        // None of the eight: named anyway, so no ring-unavailable line goes unexplained.
         CHECK(rule(idx, c0, ring_geo, true, false) == "region smaller than the largest streamable matrix");
         CHECK(rule(partial, layer_info(partial, 2), ring_geo, true, false) ==
               "region smaller than the largest streamable matrix");

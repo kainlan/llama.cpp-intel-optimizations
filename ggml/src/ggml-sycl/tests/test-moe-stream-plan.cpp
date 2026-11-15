@@ -256,7 +256,11 @@ void test_mapped_host_experts_are_not_staged() {
     idx = ggml_sycl::moe_stream_plan_index_build(mixed, 0, nullptr, claims_all, hints);
     CHECK(!ggml_sycl::moe_stream_layer_claimed(idx.layers.at(0)));
     CHECK(ggml_sycl::moe_stream_layer_claimed(idx.layers.at(2)));
-    CHECK(idx.window_slots == 3);  // layer 2's three items per role still size the window
+    CHECK(idx.window_slots == 3);  // layers 1 and 2's three items per role still size the window
+    // The count is of items the executor would stage but for the mapping: claims_all claims each of expert 1's three
+    // matrices in layer 0, and layer 2 has none left mapped.
+    CHECK(idx.layers.at(0).n_mapped_host == 3);
+    CHECK(idx.layers.at(2).n_mapped_host == 0);
 
     // The control: the same plan with every host expert pinned is claimed, as test_window_sizing sizes it.
     const placement_plan pinned = make_typed_plan();
