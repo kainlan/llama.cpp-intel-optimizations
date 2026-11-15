@@ -85032,8 +85032,9 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) {
         return false;
     }
-    // Down never plans XMX_TILED, so the table's XMX_TILED entry (the WOQ arm's repack_mxfp4_xmx_tiled_to_woq, taken
-    // only while GGML_SYCL_MOE_PP_WOQ is on) cannot widen down's route: only gate/up's. Without oneDNN the table
+    // The executor takes XMX_TILED for gate and up only, so the table's XMX_TILED entry (the WOQ arm's
+    // repack_mxfp4_xmx_tiled_to_woq, taken only while GGML_SYCL_MOE_PP_WOQ is on) is refused for down, which plans
+    // XMX_TILED under GGML_SYCL_MOE_DOWN_XMX_TILED: a claimed tiled down would always decline. Without oneDNN the table
     // answers with neither knob, so XMX_TILED is never claimed there. That matters because the non-DNNL lambda has no
     // fail-closed throw for a claimed tiled op it declines (tiled_claimed_op exists only in the oneDNN build), so a
     // claimed tiled op would fall through to the per-expert staging path, which cannot read tiled bytes and computes
@@ -92838,8 +92839,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // llama.cpp-sr83 (C3, Option T): gate/up plan XMX_TILED by default;
         // the batched lambda now repacks that layout too
         // (repack_mxfp4_xmx_tiled_to_woq), so it must be admitted as a
-        // candidate the same as SOA. Down never plans XMX_TILED, so this
-        // does not widen its route -- ggml_sycl_moe_pp_onednn_batched_claims_tensor
+        // candidate the same as SOA, for gate and up only: the executor takes
+        // XMX_TILED for those roles alone, so down's tiled layout (planned
+        // under GGML_SYCL_MOE_DOWN_XMX_TILED) is not admitted here --
+        // ggml_sycl_moe_pp_onednn_batched_claims_tensor
         // enforces the same GATE/UP-only restriction independently. Also
         // gated on ggml_sycl_moe_pp_woq_enabled() (fix cycle, defect 1):
         // the f16 arm has no tiled-aware dequant, and this candidate check
@@ -92855,8 +92858,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                 dst->type == GGML_TYPE_F32;
         // llama.cpp-348c: the batched executor's own candidate gate asks the claim predicate's table, on the layout
         // this tensor is routed in, for every expert type; pp_mxfp4_soa_f16_candidate above stays the MXFP4 staging
-        // fallback's. XMX_TILED stays gate/up only (down never plans it). GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the
-        // executor off through the same table, and the executor reports it as route-off before it asks this.
+        // fallback's. XMX_TILED stays gate/up only: the executor takes it for gate and up alone, though down plans it
+        // under GGML_SYCL_MOE_DOWN_XMX_TILED. GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the executor off through the same
+        // table, and the executor reports it as route-off before it asks this.
         const bool pp_batched_candidate =
             ggml_sycl_moe_pp_batched_takes_layout(src0->type, route_layout) &&
             (route_layout != GGML_LAYOUT_XMX_TILED || pp_role == MOE_TENSOR_GATE || pp_role == MOE_TENSOR_UP) &&
