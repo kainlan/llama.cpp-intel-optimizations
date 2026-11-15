@@ -437,14 +437,13 @@ static inline bool moe_stream_executor_claims(const moe_stream_layer_info & li, 
 // Why a layer answered RING_UNAVAILABLE, for the phase's once-per-prompt WARN (lead ruling c-kcyf): the first rule that
 // holds, in this order. A layer only the plan's backing keeps from the executor comes first
 // (moe_stream_layer_mapped_only): the executor would claim it once its mapped experts were pinned, so the plan's choice
-// is the cause to name. Any other layer the executor does not claim comes next, since the ring serves the executor
-// only (W2). geo is what
-// moe_stream_ring_size gave for idx; its all-zero answer past the index's first three rules is the cap, an eleventh
-// of the resident plus lent expert bytes (llama.cpp-7999; its overflow guards refuse sizes far above any resident
-// expert set too). A window of 0 slots is no planned executor slot (before the load publishes the inventory globals),
-// or a slot that holds no expert. The last name is unreachable while the cost model's stage unit is one streamable
-// matrix (moe_stream_layer_info::matrix_bytes_max), since a region of window_slots >= 1 slots holds the largest
-// streamable matrix in each slot; it is there so that no ring-unavailable line goes unexplained.
+// is the cause to name. Any other layer the executor does not claim comes next, since the ring serves the executor only
+// (W2). geo is what moe_stream_ring_size gave for idx; its all-zero answer past the index's first three rules is the
+// cap, an eleventh of the resident plus lent expert bytes (llama.cpp-7999; its overflow guards refuse sizes far above
+// any resident expert set too). A window of 0 slots is no planned executor slot (before the load publishes the
+// inventory globals), or a slot that holds no expert. The last name is unreachable while the cost model's stage unit is
+// one streamable matrix (moe_stream_layer_info::matrix_bytes_max), since a region of window_slots >= 1 slots holds the
+// largest streamable matrix in each slot; it is there so that no ring-unavailable line goes unexplained.
 static inline const char * moe_stream_ring_unavailable_rule(const moe_stream_plan_index &    idx,
                                                             const moe_stream_layer_info &    li,
                                                             const moe_stream_ring_geometry & geo,

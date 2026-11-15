@@ -841,6 +841,9 @@ int main() {
         }
         const moe_stream_plan_index one = index_of(one_mapped, claims_all);
         CHECK(rule(one, layer_info(one, 0), ring_geo, true, false) == "host experts left mapped by the plan");
+        // Expert 5's three matrices are counted as mapped; experts 1 and 6 stage their six for the executor.
+        const moe_stream_layer_info * one0 = layer_info(one, 0);
+        CHECK(one0 != nullptr && one0->n_mapped_host == 3 && one0->n_streamable == 6);
         // The plan is named only when its backing alone keeps the layer from the executor. With no claim at all, or
         // with layer 0's up and down unclaimed (claims_l0_gate_l2), pinning the experts would not make the executor
         // take the layer, so the claim is the cause; only the matrices the executor would stage are counted.
@@ -851,9 +854,24 @@ int main() {
         claims_probe                mapped_partial_probe;
         const moe_stream_plan_index mapped_partial = ggml_sycl::moe_stream_plan_index_build(
             mapped_plan, 0, &mapped_partial_probe, claims_l0_gate_l2, kWideWindow);
+        // Asked once per (layer, role) with a matrix one AOS slot holds, mapped ones included: layers 0-2, three roles.
+        CHECK(mapped_partial_probe.calls == 9);
         const moe_stream_layer_info * mp0 = layer_info(mapped_partial, 0);
         CHECK(mp0 != nullptr && mp0->n_mapped_host == 3);
         CHECK(rule(mapped_partial, mp0, ring_geo, true, false) == "executor does not claim");
+        // A mapped matrix no AOS slot holds (a zeroed inventory shape) is never asked, so it is not counted: pinning
+        // its expert would not let the ring stage it, and the claim is the cause.
+        placement_plan mapped_unfit_plan = mapped_plan;
+        for (placement_entry & e : mapped_unfit_plan.entries) {
+            if (e.layer_id == 0 && e.expert_id == 5 && e.expert_role == expert_tensor_role::GATE) {
+                e.ne[0] = 0;
+            }
+        }
+        mapped_unfit_plan.build_index();
+        const moe_stream_plan_index   mapped_unfit = index_of(mapped_unfit_plan, claims_all);
+        const moe_stream_layer_info * mn0          = layer_info(mapped_unfit, 0);
+        CHECK(mn0 != nullptr && mn0->items.size() == 9 && mn0->n_mapped_host == 8 && mn0->n_streamable == 0);
+        CHECK(rule(mapped_unfit, mn0, ring_geo, true, false) == "executor does not claim");
         // A mapped layer with a fused entry: pinning its experts would still leave the entry the ring cannot stage.
         placement_plan mapped_fused_plan = make_plan();
         for (placement_entry & e : mapped_fused_plan.entries) {

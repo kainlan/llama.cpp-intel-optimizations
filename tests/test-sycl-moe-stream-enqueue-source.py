@@ -29,10 +29,10 @@ What this gate pins:
     boundary runner's REFUSED count. A loan this prompt asked for that comes back REFUSED (never BUSY, which the runner
     re-posts) latches until end_prompt, with one WARN under an explicit ring or a trace;
   - a layer answering RING_UNAVAILABLE under an explicit ring or a trace prints one WARN per prompt that names the rule
-    (the first is host experts the plan left mapped, "host experts left mapped by the plan", then the executor's claim,
-    "executor does not claim") and the ring's inputs, in a fixed format, through the decision log's WARN sink; the
-    flag is cleared by end_prompt and never per micro-batch (lead ruling c-kcyf), and the phase logs nothing else of
-    its own but the refused-loan line, under the same gating;
+    (the first is a layer only the plan's backing keeps from the executor, "host experts left mapped by the plan",
+    then the executor's claim, "executor does not claim") and the ring's inputs, in a fixed format, through the
+    decision log's WARN sink; the flag is cleared by end_prompt and never per micro-batch (lead ruling c-kcyf), and the
+    phase logs nothing else of its own but the refused-loan line, under the same gating;
   - begin_layer reports every layer it decides, under every policy, so the decision log keeps the cost model's choice;
     it weighs only its own layer, with no copy window (there is no layer-ahead copy), and stages nothing;
   - the copy is mem_copy_async on the unified cache's BCS queue, chained behind the ring region's gate (ruling A,
