@@ -135,8 +135,10 @@ The op keeps the hybrid route, which runs host rows one at a time from their
 host leases, when the island cannot run it: a fused or chunked matrix, a type
 that needs its direct kernel, an expert the plan does not place or places on
 another device, or a load that routes experts to a second device. A mixed op,
-with experts on this device and on the host, keeps the hybrid route as well.
-The ring never serves some of a layer's host matrices while the rest stay
+with experts on this device and on the host, is split when the batched executor
+takes its device experts in their planned layout: the executor runs those and
+the island runs the rest, one after the other. Otherwise it keeps the hybrid
+route. The ring never serves some of a layer's host matrices while the rest stay
 hybrid, so no staged copy is wasted on a layer that does not run on the device.
 The `STAGED_RING` resolver route is kept, but the ring stages nothing for it:
 every staged entry's consumer is the executor, so the resolver counts a lookup
