@@ -290,7 +290,20 @@ census take_census(const placement_plan & plan) {
     return c;
 }
 
-// Arm 0: the generator reproduces the dump, and the budget reproduces run2's split.
+// Routed-expert entries whose lookup result does not carry the entry's own backing.
+size_t lookup_backing_mismatches(const placement_plan & plan) {
+    size_t n = 0;
+    for (const placement_entry & e : plan.entries) {
+        if (e.expert_id < 0 || e.layer_id < 0) {
+            continue;
+        }
+        const auto found = plan.lookup_expert_placement(e.layer_id, e.expert_id, e.expert_role);
+        n += !found.found() || found.host_backing != e.host_backing;
+    }
+    return n;
+}
+
+// Arm 0:the generator reproduces the dump, and the budget reproduces run2's split.
 size_t arm0_inventory_and_budget(const std::vector<placement_tensor_info> & inv) {
     std::printf("(0) the Qwen3.8 inventory and the budget that leaves the device run2's %zu groups\n", k_device_groups);
     size_t total = 0;
@@ -347,6 +360,7 @@ void arm1_mapping_load(const std::vector<placement_tensor_info> & inv, size_t bu
              0);
     check_eq("host dense entries (all fit on the device)", c.host_dense_entries, 0);
     check_eq("host entries holding a WEIGHT-zone block", c.host_pinned_or_host_cpu, 0);
+    check_eq("routed experts whose lookup result does not carry their backing", lookup_backing_mismatches(plan), 0);
 
     check_eq("weight_host_bytes", plan.weight_host_bytes, 0);
     check_eq("host_cpu_owned_bytes", plan.host_cpu_owned_bytes, 0);
@@ -379,6 +393,7 @@ void arm2_copying_load(const std::vector<placement_tensor_info> & inv, size_t bu
 
     check_eq("entries whose backing is not PINNED", c.not_pinned, 0);
     check_eq("host routed-expert groups", c.host_expert_entries / 3, k_host_groups);
+    check_eq("routed experts whose lookup result does not carry their backing", lookup_backing_mismatches(plan), 0);
     check_eq("weight_host_bytes == the host experts' file bytes", plan.weight_host_bytes, c.host_expert_src);
     check_eq("weight_host_bytes == 102383.5 MB", plan.weight_host_bytes, k_host_mapped_bytes);
     check_eq("host_mapped_bytes", plan.host_mapped_bytes, 0);

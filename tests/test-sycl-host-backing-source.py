@@ -300,6 +300,20 @@ def test_the_refresh_counts_cpu_owned_and_not_mapped():
     assert "host_mapped_bytes" not in expr, "mapped bytes are not charged to host_bytes until locked (design 5efe §4.5)"
 
 
+# ---- 4. the preload ----
+
+
+def test_the_preload_serves_in_place_only_what_the_plan_left_mapped():
+    src = read("ggml-sycl.cpp")
+    start = src.index("auto register_host_aos_expert = [&](")
+    body = balanced(src, src.index("{", start))
+    cond = body[body.index("served_in_place ="):]
+    cond = cond[:cond.index(";")]
+    assert "host_backing_sizes_weight_zone(planned_backing)" in cond, cond
+    assert cond.index("host_backing_sizes_weight_zone") < cond.index("ggml_sycl_mapped_buffer_owner"), cond
+    assert "getenv" not in body
+
+
 # ---- positive controls ----
 
 
