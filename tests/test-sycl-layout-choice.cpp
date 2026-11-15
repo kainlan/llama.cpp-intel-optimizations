@@ -1678,6 +1678,41 @@ static size_t triplet_dst(const ggml_sycl::placement_plan & plan) {
     }
     return dst;
 }
+
+struct backing_count {
+    size_t host         = 0;  // host-planned routed-expert entries
+    size_t host_pinned  = 0;  // of those, PINNED
+    size_t host_src     = 0;  // their src_size sum
+    size_t device_other = 0;  // device-planned routed-expert entries that are not FILE_MAPPED
+};
+
+static backing_count count_backings(const ggml_sycl::placement_plan & plan) {
+    backing_count c;
+    for (const auto & e : plan.entries) {
+        if (e.expert_id < 0) {
+            continue;
+        }
+        if (e.on_device) {
+            c.device_other += e.host_backing != ggml_sycl::placement_host_backing::FILE_MAPPED;
+            continue;
+        }
+        c.host++;
+        c.host_src += e.src_size;
+        c.host_pinned += e.host_backing == ggml_sycl::placement_host_backing::PINNED;
+    }
+    return c;
+}
+
+// A load that maps files, as the loader's staging proc reports it.
+static ggml_sycl::placement_plan plan_mapping(size_t   budget,
+                                              size_t   host_budget,
+                                              uint64_t staged_types = q4_0_bit,
+                                              bool     locks        = false) {
+    ggml_sycl::placement_kv_info kv = kv_info(staged_types, 0);
+    kv.load_maps_files              = true;
+    kv.load_locks_files             = locks;
+    return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv, nullptr, n_exps, host_budget);
+}
 }  // namespace ring_room_case
 
 // A budget whose experts fill the zone exactly (40 of 64 triplets) without the room: the planner holds the window
@@ -1750,6 +1785,88 @@ static bool run_moe_stream_ring_room_before_experts_test() {
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
     if (ok) {
         printf("PASS: the planner holds the window ring's room in the WEIGHT zone before the routed experts\n");
+    }
+    return ok;
+}
+
+// A mapping load pins its routed host experts when the plan holds ring room and the host plan fits its budget, all of
+// them or none. The opt-out, a budget the pinned plan exceeds, a locked mapping and a type nothing stages each leave
+// them mapped.
+static bool run_moe_stream_ring_pins_host_experts_test() {
+    using namespace ring_room_case;
+    bool ok = true;
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
+    const size_t roomy_host = size_t(64) << 30;
+    const auto   roomy      = plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, q4_0_bit);
+    const size_t charge     = triplet_charge(roomy);
+    const size_t budget     = base + 40 * charge;
+
+    setenv("GGML_SYCL_MOE_PIN_HOST_EXPERTS", "0", 1);
+    const auto          off = plan_mapping(budget, roomy_host);
+    const backing_count oc  = count_backings(off);
+    unsetenv("GGML_SYCL_MOE_PIN_HOST_EXPERTS");
+    if (oc.host == 0 || oc.host_pinned != 0 || off.moe_stream_ring_reserve_bytes != 0 ||
+        off.host_mapped_bytes != oc.host_src || off.weight_host_bytes != 0) {
+        printf(
+            "FAIL: the opt-out keeps the host experts mapped with no ring room: host %zu, pinned %zu, room %zu, "
+            "mapped %zu (want %zu), weight %zu\n",
+            oc.host, oc.host_pinned, off.moe_stream_ring_reserve_bytes, off.host_mapped_bytes, oc.host_src,
+            off.weight_host_bytes);
+        ok = false;
+    }
+
+    const auto          pin = plan_mapping(budget, roomy_host);
+    const backing_count pc  = count_backings(pin);
+    if (pin.moe_stream_ring_reserve_bytes == 0 || pc.host == 0 || pc.host_pinned != pc.host || pc.device_other != 0 ||
+        pin.host_mapped_bytes != 0 || pin.weight_host_bytes != pc.host_src ||
+        pin.host_planned_bytes > pin.host_budget) {
+        printf(
+            "FAIL: a mapping load with ring room and host budget pins every host expert: room %zu, host %zu, "
+            "pinned %zu, device entries not mapped %zu, mapped %zu, weight %zu (want %zu), planned %zu of %zu\n",
+            pin.moe_stream_ring_reserve_bytes, pc.host, pc.host_pinned, pc.device_other, pin.host_mapped_bytes,
+            pin.weight_host_bytes, pc.host_src, pin.host_planned_bytes, pin.host_budget);
+        ok = false;
+    }
+    if (pin.host_planned_bytes < off.host_planned_bytes + pc.host_src ||
+        pin.host_zone_weight_bytes < off.host_zone_weight_bytes + pc.host_src) {
+        printf(
+            "FAIL: the pinned plan's host figures hold the experts: planned %zu (mapped %zu), WEIGHT zone %zu "
+            "(mapped %zu), experts %zu\n",
+            pin.host_planned_bytes, off.host_planned_bytes, pin.host_zone_weight_bytes, off.host_zone_weight_bytes,
+            pc.host_src);
+        ok = false;
+    }
+
+    // A budget the mapped plan fits and the pinned plan does not: the experts go back, and the host zones are sized
+    // for the mapped plan. The ring room, already taken out of the device pack, stays held.
+    const size_t        tight = off.host_planned_bytes + pc.host_src / 2;
+    const auto          back  = plan_mapping(budget, tight);
+    const backing_count bc    = count_backings(back);
+    if (bc.host == 0 || bc.host_pinned != 0 || back.weight_host_bytes != 0 || back.host_mapped_bytes != bc.host_src ||
+        back.host_zone_weight_bytes != off.host_zone_weight_bytes || back.dma_staging_pool_bytes != 0 ||
+        back.host_planned_bytes > back.host_budget) {
+        printf(
+            "FAIL: a host budget the pinned plan exceeds leaves the experts mapped: host %zu, pinned %zu, weight "
+            "%zu, mapped %zu (want %zu), WEIGHT zone %zu (want %zu), DMA pool %zu, planned %zu of %zu\n",
+            bc.host, bc.host_pinned, back.weight_host_bytes, back.host_mapped_bytes, bc.host_src,
+            back.host_zone_weight_bytes, off.host_zone_weight_bytes, back.dma_staging_pool_bytes,
+            back.host_planned_bytes, back.host_budget);
+        ok = false;
+    }
+
+    const backing_count lc = count_backings(plan_mapping(budget, roomy_host, q4_0_bit, /*locks=*/true));
+    const backing_count nc = count_backings(plan_mapping(budget, roomy_host, /*staged_types=*/0));
+    if (lc.host == 0 || lc.host_pinned != 0 || nc.host == 0 || nc.host_pinned != 0) {
+        printf(
+            "FAIL: a locked mapping and a type nothing stages keep the host experts mapped: locked %zu of %zu "
+            "pinned, unstaged %zu of %zu pinned\n",
+            lc.host_pinned, lc.host, nc.host_pinned, nc.host);
+        ok = false;
+    }
+
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    if (ok) {
+        printf("PASS: a mapping load pins its routed host experts when ring room is held and the host plan fits\n");
     }
     return ok;
 }
@@ -4151,6 +4268,7 @@ int main() {
         mock_ok = run_kv_context_room_follows_the_requested_context_test() && mock_ok;
         mock_ok = run_kv_context_room_is_cost_based_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_before_experts_test() && mock_ok;
+        mock_ok = run_moe_stream_ring_pins_host_experts_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_converges_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_cap_refuses_test() && mock_ok;
         mock_ok = run_dense_weights_before_kv_test() && mock_ok;
