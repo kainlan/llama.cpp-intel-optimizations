@@ -300,6 +300,45 @@ def test_the_refresh_counts_cpu_owned_and_not_mapped():
     assert "host_mapped_bytes" not in expr, "mapped bytes are not charged to host_bytes until locked (design 5efe §4.5)"
 
 
+# ---- 4. the preload ----
+
+
+def test_the_preload_serves_in_place_only_what_the_plan_left_mapped():
+    src = read("ggml-sycl.cpp")
+    start = src.index("auto register_host_aos_expert = [&](")
+    body = balanced(src, src.index("{", start))
+    cond = body[body.index("served_in_place ="):]
+    cond = cond[:cond.index(";")]
+    assert "host_backing_sizes_weight_zone(planned_backing)" in cond, cond
+    # In place only when the backing does NOT size the WEIGHT zone: a dropped negation serves pinned experts in place.
+    assert re.search(
+        r"!\s*(?:ggml_sycl\s*::\s*placement_plan\s*::\s*)?host_backing_sizes_weight_zone\s*\(\s*planned_backing\s*\)",
+        cond,
+    ), cond
+    assert cond.index("host_backing_sizes_weight_zone") < cond.index("ggml_sycl_mapped_buffer_owner"), cond
+    assert "getenv" not in body
+
+    # A failed pinned allocation over a mapping registers the mapping with its owner, and warns once per tensor.
+    fb_at = re.search(r"\}\s*else\s+if\s*\(\s*!\s*tensor_source_is_device\s*\)\s*\{", body)
+    assert fb_at, "the lambda has no fallback branch for a host source without pinned room"
+    fallback = balanced(body, fb_at.end() - 1)
+    owner = re.search(r"ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer\s*,\s*&\s*host_owner\s*\)", fallback)
+    assert owner, fallback
+    gate = re.search(
+        r"\bif\s*\(\s*ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer\s*,\s*&\s*host_owner\s*\)\s*\)\s*\{",
+        fallback,
+    )
+    assert gate, "the owner call does not gate the warning"
+    gated = balanced(fallback, gate.end() - 1)
+    assert re.search(r"\bGGML_LOG_WARN\s*\(", gated), "the warning is not inside the mapping-owner branch"
+    assert re.search(r"\blogged_pin_alloc_failed\s*=\s*true\s*;", gated), "the once-flag is not set inside that branch"
+    clear = re.search(r"\bhost_owner\s*=\s*\{\s*\}\s*;", fallback)
+    assert clear and clear.start() < owner.start(), "host_owner is not cleared before the owner call"
+
+    # The caller hands the plan's backing over, not a constant.
+    assert re.search(r"register_host_aos_expert\s*\(\s*e\s*,\s*expert_aos\s*,\s*placement\s*\.\s*host_backing\s*,", src)
+
+
 # ---- positive controls ----
 
 
