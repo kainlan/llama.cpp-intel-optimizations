@@ -960,7 +960,11 @@ ROUTE_CONSUMER_REFUSAL = "if (s != nullptr && s->consumer == moe_stream_consumer
 LAYER_WEIGHT_SIG = ("static const ggml_tensor * ggml_sycl_moe_stream_layer_weight(int layer, "
                     "ggml_sycl::expert_tensor_role role)")
 ITEM_DEFAULT_NONE = "moe_stream_staging staging = moe_stream_staging::NONE;"
-INDEX_CLAIM_GUARD = "if (library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {"
+# The ring copies a host expert only out of pinned memory, so a host entry the plan left mapped is never asked; an
+# entry on the device (one a loan's sizing reads as host) is asked as before.
+INDEX_MAPPED_HOST = ("const bool mapped_host = !e.on_device && "
+                     "!placement_plan::host_backing_sizes_weight_zone(e.host_backing);")
+INDEX_CLAIM_GUARD = "if (!mapped_host && library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {"
 INDEX_CLAIM_ASK = "c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;"
 INDEX_CLAIM_APPLY = ("if (c->second) { item.staging = moe_stream_staging::AOS_ONLY; "
                      "item.consumer = moe_stream_consumer::EXECUTOR; }")
@@ -989,8 +993,8 @@ def claim_claimed_weight_stages_for_the_executor(sycl: str, hpp: str, phase: str
             and ("moe_stream_library_claims_fn library_claims, const moe_stream_window_hints & hints, "
                  "const std::unordered_set<uint64_t> * as_host = nullptr)") in h
             and ITEM_DEFAULT_NONE in body(h, "struct moe_stream_item")
-            and ordered(build, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_APPLY, "li.items.push_back(item);",
-                        INDEX_SLOT_SKIP, STREAMABLE_COUNT, ROLE_COUNT)
+            and ordered(build, INDEX_MAPPED_HOST, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_APPLY,
+                        "li.items.push_back(item);", INDEX_SLOT_SKIP, STREAMABLE_COUNT, ROLE_COUNT)
             and build.count("item.staging = ") == 1
             and h.count("library_claims(graph_ctx") == 1
             and INDEX_CALL in body(p, PREPARE_SIG) and p.count("library_claims(") == 0)
@@ -1038,7 +1042,13 @@ def test_library_claim_mutants():
     # Asked only where something else staged the matrix first (the llama.cpp-v7np shape): the executor's own table is
     # not the authority.
     assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_GUARD,
-                              "if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {"), PHASE)
+                              "if (!mapped_host && item.staging != moe_stream_staging::NONE && "
+                              "library_claims != nullptr) {"), PHASE)
+    # A host expert the plan left mapped asked anyway: the ring would be sized for an expert the stager skips.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_GUARD, INDEX_CLAIM_GUARD.replace("!mapped_host && ", "")), PHASE)
+    # mapped_host read without the residency: a device entry whose backing is its mapping (its staging source), which
+    # a loan's sizing reads as host, would never be asked.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_MAPPED_HOST, INDEX_MAPPED_HOST.replace("!e.on_device && ", "")), PHASE)
     # The claim applied after the slot accounting, so a claimed matrix would take no slot.
     late = mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "")
     late = mutate(late, "++li.n_streamable;", "++li.n_streamable; " + INDEX_CLAIM_APPLY)

@@ -222,10 +222,10 @@ static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints &
 // One scan of plan.entries. Host entries carry target_device -1 and serve any device;
 // `device` selects only the resident bytes that bound the ring's size. The items take type and shape from the entry,
 // which the planner copied from the tensor inventory (a zeroed shape stages NONE). The ring serves the batched prompt
-// executor only (W2 of docs/plans/2026-10-24-prefill-window-ring.md): a matrix one AOS slot holds, whose weight the
-// library executor claims once staged, stages AOS_ONLY for the executor, whose own tables are the authority there
-// (llama.cpp-3460), and every other item stages NONE. The claim is asked once per (layer, role). No prompt kernel
-// reads the ring, so the device's prompt kernels are not asked.
+// executor only (W2 of docs/plans/2026-10-24-prefill-window-ring.md): a matrix one AOS slot holds, which the plan does
+// not leave in its mapping on the host and whose weight the library executor claims once staged, stages AOS_ONLY for
+// the executor, whose own tables are the authority there (llama.cpp-3460), and every other item stages NONE. The claim
+// is asked once per (layer, role). No prompt kernel reads the ring, so the device's prompt kernels are not asked.
 // `hints` gives the executor's phase, which with the streamable items per role decides window_slots, the region the
 // ring is sized to. `as_host`, when given, names (layer, expert) triplets, keyed moe_stream_table_key(layer, expert,
 // UNKNOWN), whose gate/up/down entries resident on `device` are read as host entries: the plan as a loan of those
@@ -285,7 +285,11 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(
         // slot (llama.cpp-3460, resolving llama.cpp-v7np): no reorder and no second slot, and the route refuses the
         // entry by its consumer. Any other matrix stages NONE (W2), and a matrix no AOS slot can hold does not ask
         // for its weight.
-        if (library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {
+        // The ring copies a host expert only out of pinned memory (moe_stream_owner_streamable). A host-planned
+        // expert whose backing holds no WEIGHT-zone block is read in place from its mapping, so it stages NONE and
+        // its layer runs on the CPU. A lent device triplet is not asked: its host copy is the loan's business.
+        const bool mapped_host = !e.on_device && !placement_plan::host_backing_sizes_weight_zone(e.host_backing);
+        if (!mapped_host && library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {
             const uint64_t ck = moe_stream_table_key(item.layer, 0, item.role);
             auto           c  = claims.find(ck);
             if (c == claims.end()) {
