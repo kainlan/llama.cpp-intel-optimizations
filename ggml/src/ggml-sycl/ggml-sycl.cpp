@@ -20103,10 +20103,10 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
     // reflected honestly, not stale from before the re-plan.
     size_t free_mem = 0, total_mem = 0;
     ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
-    // A failed query does not reach here: ggml_backend_sycl_get_device_memory()
-    // std::exit(1)s on a sycl::exception. total_mem == 0 therefore means a
-    // device that genuinely reports zero total memory -- kept as a sanity
-    // check rather than a query-failure path.
+    // A failed query does not reach here: ggml_backend_sycl_get_device_memory() ends the
+    // process through ggml_sycl_fatal_exit on a sycl::exception (exit code 69 when the device is
+    // lost, 1 otherwise). total_mem == 0 therefore means a device that genuinely reports zero
+    // total memory -- kept as a sanity check rather than a query-failure path.
     if (total_mem == 0) {
         GGML_LOG_WARN(
             "[SYCL-PLAN] non-FA attention scratch guard could not evaluate (device reports zero "

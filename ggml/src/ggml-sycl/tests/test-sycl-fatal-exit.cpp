@@ -217,9 +217,9 @@ int check_fast_exit(const char * mode, const child_result & r, int want_status) 
     return 0;
 }
 
-static ggml_backend_buffer_t alloc_tensor_buffer(ggml_backend_buffer_type_t buft,
-                                                 ggml_tensor *              tensor,
-                                                 ggml_backend_buffer_usage  usage) {
+ggml_backend_buffer_t alloc_tensor_buffer(ggml_backend_buffer_type_t buft,
+                                          ggml_tensor *              tensor,
+                                          ggml_backend_buffer_usage  usage) {
     const size_t          size   = ggml_backend_buft_get_alloc_size(buft, tensor);
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
     if (!buffer) {
@@ -230,18 +230,18 @@ static ggml_backend_buffer_t alloc_tensor_buffer(ggml_backend_buffer_type_t buft
     return buffer;
 }
 
-static void fill_random(std::vector<float> & data, float scale, std::mt19937 & rng) {
+void fill_random(std::vector<float> & data, float scale, std::mt19937 & rng) {
     std::uniform_real_distribution<float> dist(-scale, scale);
     for (float & v : data) {
         v = dist(rng);
     }
 }
 
-static void quantize_weights_mxfp4(const std::vector<float> & src,
-                                   int                        in_dim,
-                                   int                        out_dim,
-                                   int                        n_experts,
-                                   std::vector<block_mxfp4> & dst) {
+void quantize_weights_mxfp4(const std::vector<float> & src,
+                            int                        in_dim,
+                            int                        out_dim,
+                            int                        n_experts,
+                            std::vector<block_mxfp4> & dst) {
     const int blocks_per_row = in_dim / QK_MXFP4;
     dst.resize(static_cast<size_t>(n_experts) * out_dim * blocks_per_row);
     for (int e = 0; e < n_experts; ++e) {
@@ -254,17 +254,25 @@ static void quantize_weights_mxfp4(const std::vector<float> & src,
     }
 }
 
-static bool run_mul_mat_id_backend(ggml_backend_t                   backend,
-                                   ggml_backend_buffer_type_t       weight_buft,
-                                   const std::vector<block_mxfp4> & weight_data,
-                                   const std::vector<float> &       input_data,
-                                   const std::vector<int32_t> &     ids_data,
-                                   int                              in_dim,
-                                   int                              out_dim,
-                                   int                              n_experts,
-                                   int                              n_used,
-                                   int                              n_tokens,
-                                   std::vector<float> &             output) {
+// Computes one small MUL_MAT_ID graph on the SYCL backend, with its weights in host memory. Returns false when the
+// setup or the compute reported a failure. The device modes only need the compute to reach the op: a compute that
+// returns at all means the injected loss did not end the process, so nothing is read back and nothing is freed.
+bool run_one_mmid(ggml_backend_t backend) {
+    const int          in_dim = 64, out_dim = 32, n_experts = 4, n_used = 2, n_tokens = 8;
+    std::mt19937       rng(7);
+    std::vector<float> weight_data(size_t(in_dim) * out_dim * n_experts);
+    std::vector<float> input_data(size_t(in_dim) * n_tokens);
+    fill_random(weight_data, 1.0f, rng);
+    fill_random(input_data, 1.0f, rng);
+    std::vector<block_mxfp4> packed;
+    quantize_weights_mxfp4(weight_data, in_dim, out_dim, n_experts, packed);
+    std::vector<int32_t> ids_data(size_t(n_used) * n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int i = 0; i < n_used; ++i) {
+            ids_data[size_t(t) * n_used + i] = (t + i) % n_experts;
+        }
+    }
+
     const ggml_init_params params = {
         64 * 1024 * 1024,
         nullptr,
@@ -274,7 +282,6 @@ static bool run_mul_mat_id_backend(ggml_backend_t                   backend,
     if (!ctx) {
         return false;
     }
-
     ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_MXFP4, in_dim, out_dim, n_experts);
     ggml_set_name(weights, "moe_weights");
     ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in_dim, n_used, n_tokens);
@@ -284,89 +291,40 @@ static bool run_mul_mat_id_backend(ggml_backend_t                   backend,
     ggml_tensor * out = ggml_mul_mat_id(ctx, weights, input, ids);
     ggml_set_name(out, "moe_out");
 
-    ggml_backend_buffer_type_t dev_buft = ggml_backend_get_default_buffer_type(backend);
-    ggml_backend_buffer_t weight_buf    = alloc_tensor_buffer(weight_buft, weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    if (!weight_buf) {
-        ggml_free(ctx);
+    if (!alloc_tensor_buffer(ggml_backend_sycl_host_buffer_type(), weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
         return false;
     }
-
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (dev && weight_buft == ggml_backend_sycl_host_buffer_type()) {
+    if (ggml_backend_dev_t dev = ggml_backend_get_device(backend)) {
         ggml_backend_sycl_register_host_weight_tensor(dev, weights);
     }
-
-    ggml_backend_buffer_t input_buf = alloc_tensor_buffer(dev_buft, input, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-    ggml_backend_buffer_t ids_buf   = alloc_tensor_buffer(dev_buft, ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-    ggml_backend_buffer_t out_buf   = alloc_tensor_buffer(dev_buft, out, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-
-    if (!input_buf || !ids_buf || !out_buf) {
-        ggml_backend_buffer_free(weight_buf);
-        if (input_buf) {
-            ggml_backend_buffer_free(input_buf);
-        }
-        if (ids_buf) {
-            ggml_backend_buffer_free(ids_buf);
-        }
-        if (out_buf) {
-            ggml_backend_buffer_free(out_buf);
-        }
-        ggml_free(ctx);
+    ggml_backend_buffer_type_t dev_buft = ggml_backend_get_default_buffer_type(backend);
+    if (!alloc_tensor_buffer(dev_buft, input, GGML_BACKEND_BUFFER_USAGE_COMPUTE) ||
+        !alloc_tensor_buffer(dev_buft, ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE) ||
+        !alloc_tensor_buffer(dev_buft, out, GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
         return false;
     }
-
-    ggml_backend_tensor_set(weights, weight_data.data(), 0, weight_data.size() * sizeof(block_mxfp4));
+    ggml_backend_tensor_set(weights, packed.data(), 0, packed.size() * sizeof(block_mxfp4));
     ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
     ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size() * sizeof(int32_t));
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
-
-    ggml_status status = ggml_backend_graph_compute(backend, graph);
-    if (status != GGML_STATUS_SUCCESS) {
-        ggml_backend_buffer_free(weight_buf);
-        ggml_backend_buffer_free(input_buf);
-        ggml_backend_buffer_free(ids_buf);
-        ggml_backend_buffer_free(out_buf);
-        ggml_free(ctx);
-        return false;
-    }
-
-    output.resize(static_cast<size_t>(out_dim) * n_used * n_tokens);
-    ggml_backend_tensor_get(out, output.data(), 0, output.size() * sizeof(float));
-
-    ggml_backend_buffer_free(weight_buf);
-    ggml_backend_buffer_free(input_buf);
-    ggml_backend_buffer_free(ids_buf);
-    ggml_backend_buffer_free(out_buf);
-    ggml_free(ctx);
-    return true;
-}
-
-// One small MUL_MAT_ID graph on the SYCL backend. Returns false when the compute reported a failure.
-bool run_one_mmid(ggml_backend_t backend) {
-    const int          in_dim = 64, out_dim = 32, n_experts = 4, n_used = 2, n_tokens = 8;
-    std::mt19937       rng(7);
-    std::vector<float> weights(size_t(in_dim) * out_dim * n_experts);
-    std::vector<float> input(size_t(in_dim) * n_tokens);
-    fill_random(weights, 1.0f, rng);
-    fill_random(input, 1.0f, rng);
-    std::vector<block_mxfp4> packed;
-    quantize_weights_mxfp4(weights, in_dim, out_dim, n_experts, packed);
-    std::vector<int32_t> ids(size_t(n_used) * n_tokens);
-    for (int t = 0; t < n_tokens; ++t) {
-        for (int i = 0; i < n_used; ++i) {
-            ids[size_t(t) * n_used + i] = (t + i) % n_experts;
-        }
-    }
-    std::vector<float> out;
-    return run_mul_mat_id_backend(backend, ggml_backend_sycl_host_buffer_type(), packed, input, ids, in_dim, out_dim,
-                                  n_experts, n_used, n_tokens, out);
+    // The setup's copies finish before the compute starts, so copy-engine work still on the card when the process
+    // ends is the backend's own and not this test's. The injected loss is thrown at the op's entry, before any of
+    // the op's work, so waiting here does not change what the test exercises.
+    ggml_backend_synchronize(backend);
+    return ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
 }
 
 // The device modes: the injected loss is in the environment the registration sets.
 int child_device(const char * mode) {
     plant_markers();
+    // Counted before the backend is made, because on a host with no device ggml_backend_sycl_init(0) does not return
+    // null: the skip below it would not fire there.
+    if (ggml_backend_sycl_get_device_count() == 0) {
+        std::fprintf(stderr, "SKIP: no SYCL device\n");
+        return 77;
+    }
     ggml_backend_t backend = ggml_backend_sycl_init(0);
     if (backend == nullptr) {
         std::fprintf(stderr, "SKIP: no SYCL backend\n");
@@ -434,13 +392,28 @@ int parent_main(const char * self, const char * mode) {
             return 77;
         }
         if (has(r, "TEST-CHILD-SURVIVED")) {
-            return fail(mode, r, "the injected loss was never thrown: the op did not reach the site");
+            const std::string why = std::string(
+                                        "the injected loss was never thrown: the op did not reach the site "
+                                        "(GGML_SYCL_TEST_INJECT_DEVICE_LOST=") +
+                                    mode + ":1 is set by the ctest registration)";
+            return fail(mode, r, why.c_str());
         }
-        const char * site_line = std::strcmp(mode, "mmid") == 0 ? "[MUL_MAT_ID-FAIL]" : "Error OP";
+        const bool   mmid      = std::strcmp(mode, "mmid") == 0;
+        const char * site_line = mmid ? "[MUL_MAT_ID-FAIL]" : "Error OP";
         if (!has(r, site_line) || !has(r, "Exception caught at file:") || !has(r, "UR_RESULT_ERROR_DEVICE_LOST")) {
             return fail(mode, r, "the catch's own diagnostic lines are missing");
         }
-        return check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST);
+        if (const int rc = check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST)) {
+            return rc;
+        }
+        // The site's own call names its function. Without this, a site that rethrew instead would pass on the exit of
+        // the catch around it.
+        const char * banner =
+            mmid ? "[SYCL-FATAL] ggml_sycl_mul_mat_id:" : "[SYCL-FATAL] ggml_sycl_compute_forward_impl:";
+        if (!has(r, banner)) {
+            return fail(mode, r, "the process did not end through the site's own fast exit");
+        }
+        return 0;
     }
     std::fprintf(stderr, "usage: %s helper|control|classify|mmid|op\n", self);
     return 2;

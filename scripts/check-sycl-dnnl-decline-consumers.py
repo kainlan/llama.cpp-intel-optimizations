@@ -763,6 +763,7 @@ def mutants(files):
         ("the softmax #else arm calls quick_exit", edit(sm, "#else\n    (void) use_dnnl_softmax;", "#else\n    (void) use_dnnl_softmax;\n    quick_exit(1);")),
         ("the softmax #else arm calls std::terminate", edit(sm, "#else\n    (void) use_dnnl_softmax;", "#else\n    (void) use_dnnl_softmax;\n    std::terminate();")),
         ("the softmax #else arm calls longjmp", edit(sm, "#else\n    (void) use_dnnl_softmax;", "#else\n    (void) use_dnnl_softmax;\n    longjmp(0, 1);")),
+        ("the softmax #else arm calls ggml_sycl_fatal_exit", edit(sm, "#else\n    (void) use_dnnl_softmax;", "#else\n    (void) use_dnnl_softmax;\n    ggml_sycl_fatal_exit(1, \"x\");")),
         ("softmax writes src through a C-style cast before the decision", edit(h, SM_ANCHOR, "        ((float *) src)[0] = 0.0f;\n" + SM_ANCHOR)),
         ("softmax copies with std::copy_n before the decision", edit(h, SM_ANCHOR, "        std::copy_n((const float *) src, 1, (float *) src);\n" + SM_ANCHOR)),
         ("softmax fills with std::fill_n before the decision", edit(h, SM_ANCHOR, "        std::fill_n((float *) src, 1, 0.0f);\n" + SM_ANCHOR)),

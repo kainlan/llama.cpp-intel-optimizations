@@ -128,7 +128,12 @@ if len(sys.argv) > 1:
         "g_test_moe_mmid_route_reachable_override",
         "ggml_sycl_test_inject_device_lost",
     )
-    leaked = [name for name in forbidden_symbols if name in nm]
+    # These seams keep an inline stub of the same name in the ordinary build, and an unoptimised build can emit that
+    # stub as a weak symbol (nm type W). That is the ordinary build as intended; only a defined text symbol (T or t)
+    # is the private definition leaking.
+    stubbed_symbols = ("ggml_sycl_scratchpad_site_hook", "ggml_sycl_test_inject_device_lost")
+    text_symbols = "\n".join(m.group(2) for m in re.finditer(r"^\S+\s+([Tt])\s+(.*)$", nm, re.M))
+    leaked = [name for name in forbidden_symbols if name in (text_symbols if name in stubbed_symbols else nm)]
     if leaked:
         raise SystemExit(f"ordinary artifact exposes private mutable seams: {leaked}")
     forbidden_strings = (

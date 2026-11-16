@@ -1515,7 +1515,7 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
 } catch (const sycl::exception & exc) {
     // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): the commit-3 census
     // stopped at ggml-sycl.cpp; this CPY dispatch catch is the identical
-    // print+exit(1)-with-no-resource-exhaustion-routing shape the census
+    // print-then-end-the-process shape the census
     // was supposed to reach. ctx is directly available; dst.raw() is
     // const ggml_tensor* by sycl_tensor's design (it wraps a const pointer
     // unconditionally, not just when the sycl_tensor object itself is

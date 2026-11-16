@@ -6613,6 +6613,11 @@ foreach(_fatal_mode IN ITEMS helper control classify)
     )
 endforeach()
 # The device modes: the registration injects the loss a lost device throws, once at MUL_MAT_ID and once at any op.
+# Each run leaves two kernel log lines on the card it runs on: "Fault response: Unsuccessful -ENOENT" and
+# "Engine reset: engine_class=bcs ... guc_id=6". Both belong to the dying process's own context, which the driver
+# tears down when the process ends with work still queued; the card stays usable (the Mistral completion gate passed
+# straight afterwards). This guc_id=6 is not the unrecoverable-hang signature: that one leaves the card unusable
+# until a reboot, and these lines do not.
 foreach(_fatal_site IN ITEMS mmid op)
     add_test(NAME test-sycl-fatal-exit-${_fatal_site} COMMAND test-sycl-fatal-exit ${_fatal_site})
     set_tests_properties(test-sycl-fatal-exit-${_fatal_site} PROPERTIES
