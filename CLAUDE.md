@@ -105,11 +105,11 @@ Each of them ends a process through the backend's fast exit on a healthy card,
 which can leave copy-engine work in flight. About 2 exits in 40 leave a
 copy-engine CAT error in the kernel log, and four of them one second apart once
 reset the whole GT. The four host modes stay in the sweep. Run the device modes
-by name and alone, and leave `ONEAPI_DEVICE_SELECTOR` to the registration. It
-pins `level_zero:1`, and each parent waits 12 s after its child:
+by their label and alone, and leave `ONEAPI_DEVICE_SELECTOR` to the registration.
+It pins `level_zero:1`, and each parent waits 12 s after its child:
 
 ```bash
-ctest --test-dir build -R fatal-exit --output-on-failure -j 1
+ctest --test-dir build -L '^fatal-exit-device$' --output-on-failure -j 1
 ```
 
 The guard fails with `SWEEP RUNS FAST-EXIT DEVICE TEST` if form 2 still selects
