@@ -26,6 +26,8 @@
 #include <mutex>
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+#    include "exit-settle.hpp"
+
 #    include <cstdio>
 #    include <cstdlib>
 #endif
@@ -128,6 +130,7 @@ class witnessed_mutex {
         }
         std::fprintf(stderr, "witnessed_mutex: the depth table is full taking %s\n", name_);
         std::fflush(stderr);
+        ggml_sycl::exit_settle();
         std::abort();
     }
 

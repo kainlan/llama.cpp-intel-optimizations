@@ -384,5 +384,61 @@ def test_the_settle_header_reader_refuses_a_backend_include(extra):
     assert any(name in p for p in problems), f"the reader accepted {extra}"
 
 
+PROCESS_END = re.compile(r"\b(?:std::)?(?:abort|_Exit)\s*\(")
+STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"')
+# Files whose process ends are deliberate as they are, with the reason.
+UNSETTLED_ALLOWED = {
+    "a7l5w-probe.hpp": "debug instrumentation: the core dump must show the failing site at once",
+}
+
+
+def code_only(path: Path) -> str:
+    """The source with comments and string literals blanked, line for line, so a reported line is the file's line."""
+    assert path.is_file(), f"{path.relative_to(ROOT)}: missing"
+
+    def blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    text = path.read_text(encoding="utf-8")
+    text = re.sub(r"/\*.*?\*/", blank, text, flags=re.S)
+    text = re.sub(r"//[^\n]*", blank, text)
+    return STRING.sub(blank, text)
+
+
+def unsettled_process_ends(name: str, code: str) -> list:
+    """The abort() and _Exit( calls of one source that the settle does not directly precede.
+
+    Directly means the settle is the statement before the call. Inside a multi-line macro the line continuation
+    between the two does not count.
+    """
+    problems = []
+    for m in PROCESS_END.finditer(code):
+        before = re.sub(r"\\\s*$", "", code[:m.start()].rstrip()).rstrip()
+        if not before.endswith(SETTLE_CALL):
+            line = code.count("\n", 0, m.start()) + 1
+            problems.append(f"{name}:{line}: {m.group(0)} is not directly preceded by {SETTLE_CALL}")
+    return problems
+
+
+def test_every_process_end_of_the_backend_settles_first():
+    problems = []
+    for path in sorted(list(SYCL.glob("*.cpp")) + list(SYCL.glob("*.hpp"))):
+        if path.name in UNSETTLED_ALLOWED or path.name == "exit-settle.hpp":
+            continue
+        problems += unsettled_process_ends(path.name, code_only(path))
+    assert not problems, "\n".join(problems)
+
+
+def test_the_process_end_reader_refuses_a_bare_abort():
+    assert unsettled_process_ends("x.cpp", "void f() {\n    std::fflush(stderr);\n    std::abort();\n}\n")
+    assert not unsettled_process_ends("x.cpp", "void f() {\n    ggml_sycl::exit_settle();\n    std::abort();\n}\n")
+    assert not unsettled_process_ends("x.hpp", "#define A do { \\\n    ggml_sycl::exit_settle(); \\\n    abort(); \\\n} while (0)\n")
+
+
+def test_the_allowlist_names_only_files_that_still_end_the_process():
+    for name in UNSETTLED_ALLOWED:
+        assert PROCESS_END.search(code_only(SYCL / name)), f"{name}: no abort() or _Exit( left; drop it from the list"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

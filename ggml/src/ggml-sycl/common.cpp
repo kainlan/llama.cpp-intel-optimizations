@@ -772,6 +772,7 @@ static void watchdog_thread_fn(int64_t timeout_ms) {
             // No-op unless GGML_SYCL_ZONE_RESET_AUDIT is set.
             ggml_sycl::zone_reset_audit_report("sycl-watchdog-exit");
             // _Exit bypasses atexit/destructors which might deadlock on stuck threads
+            ggml_sycl::exit_settle();
             std::_Exit(1);
         }
     }

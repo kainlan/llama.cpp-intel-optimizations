@@ -34,6 +34,8 @@
 #ifndef GGML_SYCL_KV_REGION_REGISTRY_HPP
 #define GGML_SYCL_KV_REGION_REGISTRY_HPP
 
+#include "exit-settle.hpp"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -81,6 +83,7 @@ inline void kv_region_abort(const std::string & message) {
         h(message.c_str());
         return;
     }
+    ggml_sycl::exit_settle();
     std::abort();
 }
 
