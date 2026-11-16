@@ -47,11 +47,11 @@ constexpr int k_child_grace_s = 5;
 // How often the parent looks at the pipe and at the child while it waits.
 constexpr int k_child_slice_ms = 10;
 
-// How long a device mode's parent holds the next process off the card after its child ran. A child that ends through
-// the fast exit can leave copy-engine work on the card: a process that started on the same card about a second later
-// was seen to hang on its first copy, and the kernel reset the whole GT about 35 s later (B50, driver 26.44). Runs
-// spaced about 11 s apart left only lines scoped to the dead context. So the parent waits this long before it
-// returns, and the next test cannot start on the card sooner.
+// How long a device mode's parent holds the next process off the card after its child ran. A fast exit that did not
+// wait once left copy-engine work behind: a process started on the same card a second later hung on its first copy,
+// and the kernel reset the whole GT about 35 s later (B50, driver 26.44). The backend's exits now wait, but that wait
+// covers only the exits the backend owns, not a child that this parent or ctest kills. So the parent still waits this
+// long before it returns, and the next test cannot start on the card sooner.
 constexpr std::chrono::seconds k_device_settle{ 12 };
 
 // The capture switch, the line the backend prints when it wrote all the files, and the line it prints for each file

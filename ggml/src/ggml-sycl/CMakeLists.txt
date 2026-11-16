@@ -6616,16 +6616,17 @@ endforeach()
 # The device modes inject the loss a lost device throws, at MUL_MAT_ID, at any op, at the synchronize wait and at the
 # graph boundary. Each child sets its own GGML_SYCL_TEST_INJECT_DEVICE_LOST (see device_injection() in the test), so a
 # mode runs by hand with no environment beyond the device selector.
-# Kernel log lines seen in two runs of the modes on the B50 (driver 26.44). In one run mmid left none, op left one
-# "Fault response: Unsuccessful -ENOENT" and one "Engine reset: engine_class=bcs", and sync left two "Fault response"
-# lines and one engine reset each on the compute engine (ccs) and the copy engine (bcs). In the other run mmid, op and
-# sync each left one "Fault response" line and one bcs engine reset. graph, with its present graph, left none. The
-# lines vary from run to run. The resets are scoped to the dying process's own context, and the card served the next
-# process each time. This is not the unrecoverable-hang signature, which leaves the card unusable until a reboot.
-# When the modes ran one second apart under ctest, the fourth process hung on its first copy and the kernel reset the
-# whole GT about 35 s later. Each mode's parent therefore waits 12 s after its child before it returns.
-# The label fatal-exit-device keeps the four device modes out of the documented full sweep: each ends a process through
-# the fast exit on a healthy card, which can leave copy-engine work in flight. Run them by their label, one at a time:
+# Before the fatal exit waited, a fast exit on a healthy card often left "Fault response" lines and copy or compute
+# engine resets in the kernel log, scoped to the dying process's own context. When the modes ran one second apart under
+# ctest, the fourth process hung on its first copy and the kernel reset the whole GT about 35 s later.
+# The fatal exit now waits for the driver's submission rings before it ends the process, 200 ms by default
+# (GGML_SYCL_FATAL_EXIT_SETTLE_MS). On the Arc Pro B50 with compute-runtime 26.44, 20 fast exits with that wait (the
+# four modes, five rounds, 12 s apart) left no fault, engine reset or CAT error line in the kernel log, and none hung.
+# Without the wait, on the same card and driver the same day, 16 of 22 fast exits left such lines. Twenty clean runs
+# cannot rule out a rare hang.
+# The label fatal-exit-device still keeps the four device modes out of the documented full sweep: a test that ctest
+# kills at its TIMEOUT ends without the wait, and can still leave copy-engine work on the card. For the same reason each
+# mode's parent still waits 12 s after its child before it returns. Run them by their label, one at a time:
 # ctest -L '^fatal-exit-device$' -j 1. scripts/check-ctest-safety-net.sh knows the label and fails if the sweep
 # selects a test carrying it.
 set(_fatal_device_env "ONEAPI_DEVICE_SELECTOR=level_zero:1"
