@@ -204,16 +204,11 @@ void test_largest_fitting_inverts_the_capacity_formula() {
     check(largest_short_one == 480,
           "one byte short of capacity(512) rounds DOWN to 480 (the next-lower multiple of 32), not up");
 
-    // llama.cpp-ibj0 quality round 1 Q1: a SATURATING capacity must still
-    // round to a multiple of 32 -- clamping to std::numeric_limits<uint32_t>::max()
-    // (4294967295) AFTER rounding, instead of before, can return
-    // 4294967295 itself, which is NOT a multiple of 32 (4294967295 % 32 ==
-    // 31), breaking the invariant every other case above pins. weight=0,
-    // act_per_row=1, out_per_row=0, depth=1 with a huge capacity (1ull<<62)
-    // makes the raw (pre-clamp) n_ubatch astronomically larger than
-    // UINT32_MAX, forcing the clamp path.
+    // A capacity every micro-batch fits returns the largest multiple of 32 a uint32_t holds, never a value past it
+    // or one that is not a multiple of 32. With weight 0, one activation byte per row, no output and depth 1, 2^62
+    // bytes hold even the largest candidate's slot (align256(4294967264) = 2^32 bytes).
     const uint32_t saturating = unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(1ull << 62, 0, 1, 0, 1);
-    check(saturating % 32 == 0, "a saturating capacity still rounds to a multiple of 32 (clamp precedes round)");
+    check(saturating % 32 == 0, "a saturating capacity still returns a multiple of 32");
     // llama.cpp-ibj0 quality round 2 note B: the modulo check alone would
     // also be satisfied by a degenerate regression that returns 0 (0 % 32
     // == 0 too) -- pin the actual expected value as well, the same figure
@@ -222,6 +217,28 @@ void test_largest_fitting_inverts_the_capacity_formula() {
     check(saturating == 4294967264u,
           "the saturating capacity's largest-fitting value is exactly 4294967264 "
           "((UINT32_MAX / 32) * 32), not 0 or some other multiple of 32");
+}
+
+// The inverse must agree with the slot function where alignment matters. A per-row size that is not a multiple of
+// 256 rounds each slot up, so a micro-batch fits only when its aligned slots do, not when n_ubatch * per_row does.
+// 100 bytes a row, no output, weight 0: 32 rows are 3200 bytes in a 3328-byte slot, 64 rows 6400 bytes (already
+// aligned) and 96 rows 9600 bytes in a 9728-byte slot.
+void test_largest_fitting_honours_slot_alignment() {
+    printf("Largest-fitting n_ubatch with an unaligned per-row size:\n");
+
+    constexpr size_t kPerRow = 100;
+    constexpr size_t kSlot32 = 3328;  // align256(32 * 100)
+    constexpr size_t kSlot96 = 9728;  // align256(96 * 100)
+    check(unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(kSlot32, 0, kPerRow, 0, 1) == 32,
+          "unaligned rows, depth 1: 3328 B (the aligned 32-row slot) fits 32 rows");
+    check(unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(kSlot32 - 1, 0, kPerRow, 0, 1) == 0,
+          "unaligned rows, depth 1: 3327 B fits no micro-batch, though 32 rows of 100 B are 3200 B");
+    check(unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(2 * kSlot32, 0, kPerRow, 0, 2) == 32,
+          "unaligned rows, depth 2: 6656 B (two aligned 32-row slots) fits 32 rows");
+    check(unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(2 * kSlot32 - 1, 0, kPerRow, 0, 2) == 0,
+          "unaligned rows, depth 2: 6655 B fits no micro-batch, though two 32-row rings of 100 B rows are 6400 B");
+    check(unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(kSlot96 - 1, 0, kPerRow, 0, 1) == 64,
+          "unaligned rows, depth 1: 9727 B fits 64 rows, not 96 (96 rows of 100 B are 9600 B in a 9728 B slot)");
 }
 
 }  // namespace
@@ -233,6 +250,7 @@ int main() {
     test_slots_overflow_returns_false();
     test_n_ubatch_round_trips_through_setter_getter();
     test_largest_fitting_inverts_the_capacity_formula();
+    test_largest_fitting_honours_slot_alignment();
 
     printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;
