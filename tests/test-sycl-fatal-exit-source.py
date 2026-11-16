@@ -183,5 +183,55 @@ def test_graph_exit_catches_record_a_device_loss(log):
     assert hits == 1, f"ggml-sycl.cpp: the catch that logs {log!r} must record a device loss first ({hits} found)"
 
 
+SETTLE = "settle_after_device_child();"
+DEVICE_BRANCHES = [
+    'if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0) {',
+    'if (std::strcmp(mode, "sync") == 0 || std::strcmp(mode, "graph") == 0) {',
+]
+
+
+def unsettled_device_branches(test_cpp: str) -> list:
+    """Why a device branch of parent_main can return after its child ran without holding the card for the next one.
+
+    The settle call must be a statement of the branch itself, after the skip check and before every return that
+    follows it, so no path out of the branch passes it by. The skip path, where no device process ran, must not wait.
+    """
+    parent = test_cpp.find("int parent_main(")
+    if parent < 0:
+        return ["test-sycl-fatal-exit.cpp: parent_main is missing"]
+    body = braced_block(test_cpp, parent)
+    problems = []
+    for head in DEVICE_BRANCHES:
+        at = body.find(head)
+        if at < 0:
+            problems.append(f"parent_main: the branch {head!r} is missing")
+            continue
+        branch = braced_block(body, at)
+        inner = branch[branch.find("{") + 1:-1]
+        ran = inner.find("run_child(self, mode)")
+        skip_at = inner.find("if (r.exited && r.status == LLAMA_TEST_EXIT_SKIP)")
+        if ran < 0 or skip_at < ran:
+            problems.append(f"{head!r}: the branch must run its child and then check for a skip")
+            continue
+        skip = braced_block(inner, skip_at)
+        if SETTLE in skip:
+            problems.append(f"{head!r}: the skip path waits, but no device process ran")
+        rest = inner[skip_at + len(skip):]
+        depth, settled_at = 0, -1
+        for i, ch in enumerate(rest):
+            depth += {"{": 1, "}": -1}.get(ch, 0)
+            if depth == 0 and settled_at < 0 and rest.startswith(SETTLE, i):
+                settled_at = i
+        returns = [m.start() for m in re.finditer(r"\breturn\b", rest)]
+        if not returns or settled_at < 0 or any(pos < settled_at for pos in returns):
+            problems.append(f"{head!r}: a return after the child ran comes before the branch's own {SETTLE}")
+    return problems
+
+
+def test_a_device_branch_settles_the_card_before_every_return_after_its_child_ran():
+    problems = unsettled_device_branches(code_of(SYCL / "tests/test-sycl-fatal-exit.cpp"))
+    assert not problems, "\n".join(problems)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

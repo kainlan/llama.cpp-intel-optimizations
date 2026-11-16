@@ -1142,6 +1142,11 @@ This has consequences for a normal exit after the loss:
 
 Read status 69 as "the device was lost". It means that even when the run's output was complete.
 
+After such an exit, wait a few seconds before starting another process on the same card. A process started about one
+second after a fast exit on a healthy card has been seen to hang on its first copy for about 35 seconds, until the
+kernel reset the card. The same exit is taken, with status 1, when an operation fails for another reason than a lost
+device.
+
 ## Runtime Allocation Policy
 
 - Managed runtime allocations must go through unified allocator APIs in `unified-cache.cpp`.

@@ -6621,6 +6621,8 @@ endforeach()
 # sync each left one "Fault response" line and one bcs engine reset. graph, with its present graph, left none. The
 # lines vary from run to run. The resets are scoped to the dying process's own context, and the card served the next
 # process each time. This is not the unrecoverable-hang signature, which leaves the card unusable until a reboot.
+# When the modes ran one second apart under ctest, the fourth process hung on its first copy and the kernel reset the
+# whole GT 35 s later. Each mode's parent therefore waits 12 s after its child before it returns.
 set(_fatal_device_env "ONEAPI_DEVICE_SELECTOR=level_zero:1"
                       "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 foreach(_fatal_site IN ITEMS mmid op sync graph)
