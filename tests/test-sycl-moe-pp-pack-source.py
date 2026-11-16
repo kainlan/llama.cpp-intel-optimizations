@@ -1,9 +1,9 @@
 """The batched MoE prompt executor takes every activation and output offset from one helper each.
 
 The executor lambda try_pp_onednn_f16_batched (ggml/src/ggml-sycl/ggml-sycl.cpp) lays its activation and output
-scratch out per GEMM group, from moe_pp_pack_gemm_groups (moe-pp-pack.hpp). The gather, both GEMM arms and the scatter
-take every offset into that scratch from act_base and out_base, so they cannot disagree about where an expert's rows
-are, and none of the old rectangle's names remains.
+scratch out per GEMM group, from moe_pp_pack_gemm_groups (moe-pp-pack.hpp). Every reader of that scratch (the gather,
+both GEMM arms, the scatter and the debug compare) takes its offsets from act_base and out_base, so they cannot disagree
+about where an expert's rows are, and none of the old rectangle's names remains.
 
 Host-only text assertions. llama_test_pytest hands this file to pytest, so every check lives inside a test_*()
 function: a file with none is "no tests collected" (exit 5), which ctest scores as a failure. Checks run on
@@ -71,7 +71,7 @@ def test_every_offset_comes_from_one_helper(pointer, helper, uses):
 def test_the_scratch_pointers_are_read_only_through_their_helpers(pointer, pointee, field, helper):
     # A reader that takes the pointer itself assumes where an expert's rows are instead of asking, and the offset count
     # above cannot see it when the read is at offset 0 (no `+`). So the pointer may appear only where it is declared,
-    # where the reservation sets it, and inside its helper.
+    # where the reservation sets it, and inside its helper, and the reservation's field only where it sets the pointer.
     body = _executor_body()
     t = re.escape(pointee)
     allowed = {
@@ -94,6 +94,14 @@ def test_the_scratch_pointers_are_read_only_through_their_helpers(pointer, point
         failures.append(
             f"{pointer}: {uses} uses in the executor, want {len(allowed)} (its declaration, its assignment from the "
             f"reservation and {helper}); every other reader must ask {helper}"
+        )
+    # The reservation's own field is the same address under another name, so a reader that takes it bypasses the
+    # helper just as the bare pointer would. Whole words, so reserved.<field>_size does not count.
+    field_uses = len(re.findall(rf"\breserved\.{field}\b", body))
+    if field_uses != 1:
+        failures.append(
+            f"reserved.{field}: {field_uses} uses in the executor, want exactly one (the assignment to {pointer}); "
+            f"every other reader must ask {helper}"
         )
     assert not failures, "\n".join(failures)
 
