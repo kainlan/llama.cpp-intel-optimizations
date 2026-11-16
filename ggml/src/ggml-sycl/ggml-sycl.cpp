@@ -85856,6 +85856,7 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
 }
 
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
+    ggml_sycl_test_inject_device_lost("mmid");
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
     // entry, counted regardless of which internal branch/early-return this
     // call takes. The v1 census's print trigger sat at the ne12==1
@@ -98199,6 +98200,7 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
                 dst ? ggml_op_name(dst->op) : "(null)", dst && dst->name ? dst->name : "", ctx.device);
         return false;
     }
+    ggml_sycl_test_inject_device_lost("op");
 
     // TKV-13 (B2) step 3: route demoted-layer FLASH_ATTN_EXT to the host
     // instead of the normal SYCL kernel switch below. Gated behind

@@ -52,8 +52,12 @@ guarded = {
         "GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline",
         "GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset",
         "GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts",
+        "void ggml_sycl_test_inject_device_lost(const char * site) {",
     ),
-    SYCL / "common.hpp": ("bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site site);",),
+    SYCL / "common.hpp": (
+        "bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site site);",
+        "void ggml_sycl_test_inject_device_lost(const char * site);",
+    ),
     ROOT / "ggml/include/ggml-sycl.h": (
         "GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline",
         "GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset",
@@ -122,6 +126,7 @@ if len(sys.argv) > 1:
         "test_set_moe_mmid_route_reachable_override",
         "test_restore_moe_mmid_route_reachable_override",
         "g_test_moe_mmid_route_reachable_override",
+        "ggml_sycl_test_inject_device_lost",
     )
     leaked = [name for name in forbidden_symbols if name in nm]
     if leaked:
@@ -129,6 +134,7 @@ if len(sys.argv) > 1:
     forbidden_strings = (
         "GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT",
         "GGML_SYCL_TEST_DMA_FAIL",
+        "GGML_SYCL_TEST_INJECT_DEVICE_LOST",
     )
     leaked_strings = [name for name in forbidden_strings if name in strings]
     if leaked_strings:

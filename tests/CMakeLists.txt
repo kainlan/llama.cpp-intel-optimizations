@@ -4668,6 +4668,14 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-fatal-exit-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fatal-exit-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # zhcn C7b: the planned auto-ubatch ladder (design gate 34, partial). The
 # constructor decides the trial with llama_auto_ubatch_trial_runs(), the
 # trial's cap is written once by llama_auto_ubatch_cap(), and the ladder

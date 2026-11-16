@@ -321,6 +321,14 @@ constexpr bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site) {
     return false;
 }
 #endif
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// GGML_SYCL_TEST_INJECT_DEVICE_LOST=<site>:<n> throws, from the nth call at `site` onward, the exception a lost
+// device throws. It keeps throwing because a lost device stays lost: graph recording rethrows the first one and
+// runs the graph again directly.
+void ggml_sycl_test_inject_device_lost(const char * site);
+#else
+inline void ggml_sycl_test_inject_device_lost(const char *) {}
+#endif
 // Called by a wrapper once it has decided not to decline: it counts under the seam and, once per site per process,
 // says so at WARN when the SYCL debug switch is on (GGML_BACKEND_DEBUG=sycl), since INFO is dropped by default.
 void ggml_sycl_dnnl_note_engaged(ggml_sycl_scratchpad_site site);

@@ -6612,6 +6612,17 @@ foreach(_fatal_mode IN ITEMS helper control classify)
         TIMEOUT 60
     )
 endforeach()
+# The device modes: the registration injects the loss a lost device throws, once at MUL_MAT_ID and once at any op.
+foreach(_fatal_site IN ITEMS mmid op)
+    add_test(NAME test-sycl-fatal-exit-${_fatal_site} COMMAND test-sycl-fatal-exit ${_fatal_site})
+    set_tests_properties(test-sycl-fatal-exit-${_fatal_site} PROPERTIES
+        LABELS "sycl;fatal-exit;device;B50"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        ENVIRONMENT "GGML_SYCL_TEST_INJECT_DEVICE_LOST=${_fatal_site}:1;ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 120
+    )
+endforeach()
 endif() # static SYCL backend fixture
 
 # ---------------------------------------------------------------------------
