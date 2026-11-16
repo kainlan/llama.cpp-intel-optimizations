@@ -932,6 +932,29 @@ bool ggml_sycl_device_lost_latched() noexcept {
     return g_sycl_device_lost_latched.load(std::memory_order_acquire);
 }
 
+static std::atomic<ggml_abort_callback_t> g_sycl_abort_settle_previous{ nullptr };
+static std::atomic<bool>                  g_sycl_abort_settle_installed{ false };
+
+static void ggml_sycl_abort_settle_callback(const char * message) {
+    const ggml_abort_callback_t previous = g_sycl_abort_settle_previous.load(std::memory_order_acquire);
+    if (previous) {
+        previous(message);
+    } else {
+        std::fprintf(stderr, "%s\n", message);
+        ggml_print_backtrace();
+    }
+    std::fflush(stderr);
+    ggml_sycl::exit_settle();
+}
+
+void ggml_sycl_abort_settle_install() noexcept {
+    if (g_sycl_abort_settle_installed.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    g_sycl_abort_settle_previous.store(ggml_set_abort_callback(ggml_sycl_abort_settle_callback),
+                                       std::memory_order_release);
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void ggml_sycl_test_inject_device_lost(const char * site) {
     struct request {

@@ -19059,8 +19059,8 @@ static void cpu_job_signal_registry_add(const std::shared_ptr<cpu_job_signal_rin
 }
 
 // Drops the expired rings. With none left, puts the previous abort callback back, unless something replaced this
-// one meanwhile: then that one stays, so the library can be unloaded with no callback of its own installed only when
-// nothing else took over.
+// one meanwhile: then that one stays. After the backend registered, the callback put back is the backend's abort
+// settle callback, or one the application installed after it.
 static void cpu_job_signal_registry_prune() {
     cpu_job_signal_registry &         r = cpu_job_signal_registry_get();
     std::lock_guard<std::timed_mutex> lock(r.mutex);

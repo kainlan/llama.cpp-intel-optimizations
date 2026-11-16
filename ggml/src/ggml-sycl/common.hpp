@@ -860,6 +860,16 @@ int ggml_sycl_fatal_exit_code(const char * what) noexcept;
 // signal handler.
 [[noreturn]] void ggml_sycl_fatal_exit(int code, const char * message) noexcept;
 
+// Makes GGML_ABORT and GGML_ASSERT wait like the fatal exit before abort() ends the process. Installs an abort
+// callback once; it runs the callback that was installed before it, or prints the message and the backtrace when
+// there was none, and then waits. A callback the application installs later replaces it. Safe to call from every
+// registration.
+// The callback is never removed: ggml's loader pins the backend module and a static build has nothing to unload, so
+// its address stays valid after a logical unload. It must be installed before a CPU expert job ring installs its own
+// abort callback, or the two could end up as each other's previous; that holds because a ring is made only for a
+// cache's compute stream, which the backend reaches only through its registration.
+void ggml_sycl_abort_settle_install() noexcept;
+
 // Records a device loss when `what` names one. The first loss prints "[SYCL-FATAL] device lost:" and registers an
 // exit handler that ends the process through ggml_sycl_fatal_exit. A path that reports the failure to its caller
 // instead of ending the process still does so.
