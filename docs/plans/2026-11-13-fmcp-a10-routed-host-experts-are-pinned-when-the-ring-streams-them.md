@@ -284,8 +284,11 @@ over a mapped buffer. The lead's end-to-end runs 4 and 5 are the preload's devic
    leave. A pinned plan can therefore read a table from storage that a mapped plan would have held in RAM.
 5. **One opt-out, default on:** `GGML_SYCL_MOE_PIN_HOST_EXPERTS=0` keeps the experts mapped. It is read when the
    plan is made. It lets the end-to-end compare the two paths in one binary, and it is the user's way back.
-6. **`-lm mlock` and `mmap+mlock` keep their experts mapped.** The user asked for a locked mapping; pinning as
+6. **`-lm mmap+mlock` keeps its experts mapped.** The user asked for a locked mapping; pinning as
    well would hold the bytes twice. With task A10.2 those layers run on the CPU and print `cpu`, not `ring`.
+   *Corrected 2026-11-15:* this line also named `-lm mlock`. That mode reads the file and locks the buffer; it has
+   no mapping, so the plan pins as it does under `-lm none`. It also aborts at load on this pack, before and after
+   this addendum (llama.cpp-phse).
 7. **A mapped host expert is never ring-staged.** A plan that left the experts mapped sizes no ring and holds no
    ring room. Today such a load holds 119.5 MB of device room for a ring that streams nothing.
 8. **Multi-device plans are unchanged.** They hold no ring room today. Holding it per device is its own change.
@@ -2372,7 +2375,7 @@ arm or from the wall time) and its wall time.
 | 5 | Run 4 with the opt-out | B70 | the gate passes. The experts are under `mapped`. No `MoE window ring room ... held` line. `[MOE-EXEC] summary` counts the host layers under `cpu`, none under `ring`. `DMA staging pool: 0.0 MB` |
 | 6 | `llama-bench -m <exps-IQ4_NL> -p 2048 -n 0 -r 5 -o json`: default, opt-out, opt-out, default | B70 | record all four with wall times and min `MemAvailable`. Row 16 is the opt-out arm's verdict against today's tree |
 | 7 | Device experts: the `device-resident routed experts` figure of the ring-room line in runs 4 and 5 | B70 | record both. The default arm pays the ring's room and the 900 MB DMA pool |
-| 8 | Run 4 with `-lm mlock` | B70 | the gate passes; the experts stay mapped; host layers under `cpu` |
+| 8 | Run 4 with `-lm mmap+mlock` (corrected 2026-11-15: the row said `-lm mlock`, which has no mapping and aborts at load on today's tree as well, llama.cpp-phse) | B70 | the gate passes; the experts stay mapped; host layers under `cpu` |
 | 9 | Run 4 with `-lm none` | B70 | unchanged from today's pinned arm: the ring streams, 0 misses |
 | 10 | Load time: `/usr/bin/time -v` on run 4 and run 5 | B70 | record both wall times |
 | 11 | GPT-OSS 20B chat gate from CLAUDE.md, default flags, `-v`, then with the opt-out | B50 `level_zero:1` | `grep -cx '1, 2, 3, 4, 5'` = 1 in both. `grep -ac 'routed host experts stay mapped'` = 0 in both: the 20B has no host experts on the B50 (measured 2026-11-15), so there is nothing to pin and nothing to leave mapped |
@@ -2396,6 +2399,35 @@ decision line), so neither the pin nor track G can move it through host experts.
 today's tree still blocks the merge. Run 16 blocks the merge by the owner's ruling: the mapped path must not be
 slower than today's tree. Runs 21 to 24 are the wide scope's acceptance: GPT-OSS 120B on the B70 is the one load
 here with host layers the staged claim does not cover, and with a tiled mixed layer.
+
+## As implemented and measured (2026-11-15)
+
+Merged into `integ/th32` on 2026-11-15: `35109b242` (tasks A10.2, A10.2b, A10.3) and `bc495ba42` (tasks A10.4,
+A10.5, A10.6). The merged tree is `abff0804`, the tree the end-to-end ran on. Driver 26.44. The full record is on
+llama.cpp-ord4. Figures are pp t/s under the host's usual load, and are not baselines.
+
+| Row | Result |
+|-----|--------|
+| 4, 5, 9 | Pass. Default: 120 ring / 80 cpu layer-ubatches, 24017 MiB streamed, 0 misses. Opt-out: 0 ring / 200 cpu, no ring room, DMA pool 0.0 MB |
+| 6 | Qwen pp2048: default 161.6 and 161.6, opt-out 91.9 and 92.1 |
+| 7 | The default holds 119.5 MB of ring room, which costs 121.3 MB of device experts (4320 triplets against 4366), and a 900 MB DMA pool |
+| 8 | Fails as written: `-lm mlock` aborts at `llama-mmap.cpp:910` on both trees. With `-lm mmap+mlock` the row passes: experts mapped, no ring room, 0 ring / 200 cpu. Today's tree on that flag holds ring room and reads 120 ring / 80 cpu with 12518 misses |
+| 13 | B70 1628 to 1639 / 44.3 to 44.7. B50 825 to 839 / 31.3 to 31.6, the same on today's tree in an interleaved control; the gap to the documented ~894 is not from this addendum (llama.cpp-hjju) |
+| 15 | No default-flag run lent. The loan under a pinned plan is covered by the unit tests only, and `test-moe-expert-loan` passes on the B50 only (llama.cpp-tvov) |
+| 16 | **Pass.** Today's tree 60.2 and 83.4 (one arm in each of its modes), opt-out 83.6 and 89.1 |
+| 18 | Count gate passes. Forced cpu 89.9 against 14.3 |
+| 19 | The gate's `Q_decline` arm reads `NOT_EXERCISED`: its short prompt now runs every host layer on the CPU, so a decline changes no path (llama.cpp-p1ls). Run 4 with `GGML_SYCL_MOE_EXEC_DECLINE_LAYER=20` is exercised and passes: one decline line, no ring line for layer 20, 117 ring / 83 cpu against 120 / 80, count gate 1 |
+| 21 to 24 | Pass. 120B perplexity 5.4111 against 5.4112. No `planner_hybrid` line. pp2048 119.5 and 122.9 against 72.1 and 71.5 |
+| 1 to 3, 10 to 12, 14, 17, 20 | Pass or recorded. No GPU line in the kernel log in any phase |
+
+Two things the rows did not foresee:
+
+- **A capped log cannot show absence.** The extra check "no island line during generation" could not be scored from
+  the `[MOE-CPU-ISLAND]` lines: the 32-line cap was used up by `llama-cli`'s 2-token warmup batch. The island sits
+  behind the multi-token prompt test in source, and every island row-aggregate line carried `batch=2`.
+- **The cost model now prefers the CPU for short prompts.** With the island, a layer's `cpu` cost is below its ring
+  cost at a small prompt, so a short prompt runs every host layer on the CPU. That is the intended decision, and it
+  is why row 19's arm lost its subject.
 
 ## Follow-ups left out
 
