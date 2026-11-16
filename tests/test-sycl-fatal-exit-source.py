@@ -428,8 +428,8 @@ def test_every_abort_and_exit_call_of_the_backend_settles_first():
     """Every literal abort( and _Exit( call in the top-level *.cpp and *.hpp files of the backend settles first.
 
     It reaches only those literal calls. It does not reach an abort through ggml's ggml_abort (GGML_ABORT,
-    GGML_ASSERT), std::terminate from a throw out of a noexcept function, std::exit, a re-raised crash signal, or a
-    kill from outside the process.
+    GGML_ASSERT), which test_a_ggml_abort_settles checks instead, std::terminate from a throw out of a noexcept
+    function, std::exit, a re-raised crash signal, or a kill from outside the process.
     """
     problems = []
     for path in sorted(list(SYCL.glob("*.cpp")) + list(SYCL.glob("*.hpp"))):
@@ -469,6 +469,32 @@ def test_the_allowlist_holds_the_exact_number_of_unsettled_calls():
     for name, (count, _reason) in UNSETTLED_ALLOWED.items():
         found = len(PROCESS_END.findall(code_only(SYCL / name)))
         assert found == count, f"{name}: {found} abort( or _Exit( call(s), the allowlist names {count}"
+
+
+ABORT_INSTALL = "ggml_sycl_abort_settle_install();"
+
+
+def abort_settle_problems(reg_cpp: str, common_cpp: str) -> list:
+    """Why a GGML_ABORT in a process that uses the backend would not settle."""
+    problems = []
+    reg = reg_cpp.find("ggml_backend_reg_t ggml_backend_sycl_reg() {")
+    if reg < 0 or ABORT_INSTALL not in braced_block(reg_cpp, reg):
+        problems.append("ggml_backend_sycl_reg must call ggml_sycl_abort_settle_install()")
+    cb = common_cpp.find("static void ggml_sycl_abort_settle_callback(const char * message) {")
+    body = braced_block(common_cpp, cb) if cb >= 0 else ""
+    if not body.rstrip("} \n").endswith(SETTLE_CALL):
+        problems.append("ggml_sycl_abort_settle_callback must end with the settle, after the message is printed")
+    return problems
+
+
+def test_a_ggml_abort_settles():
+    problems = abort_settle_problems(code_of(SYCL / "ggml-sycl.cpp"), code_of(SYCL / "common.cpp"))
+    assert not problems, "\n".join(problems)
+
+
+def test_the_abort_reader_refuses_a_registration_without_the_install():
+    reg_cpp = code_of(SYCL / "ggml-sycl.cpp")
+    assert abort_settle_problems(reg_cpp.replace(ABORT_INSTALL, "", 1), code_of(SYCL / "common.cpp"))
 
 
 if __name__ == "__main__":

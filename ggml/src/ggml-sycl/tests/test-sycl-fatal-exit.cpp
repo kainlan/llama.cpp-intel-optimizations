@@ -524,6 +524,16 @@ int child_main(const char * mode) {
         unsetenv(k_settle_env);
         return 0;
     }
+    if (std::strcmp(mode, "abort-settle") == 0) {
+        // No core file: the abort is the test's subject, and a dump of it is of no use to anyone.
+        rlimit no_core{};
+        if (setrlimit(RLIMIT_CORE, &no_core) != 0) {
+            std::fprintf(stderr, "TEST-SETUP-FAILED setrlimit(RLIMIT_CORE): %s\n", std::strerror(errno));
+            return 4;
+        }
+        ggml_sycl_abort_settle_install();
+        GGML_ABORT("test: abort-settle mode");
+    }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0 || std::strcmp(mode, "sync") == 0 ||
         std::strcmp(mode, "graph") == 0) {
         return child_device(mode);
@@ -970,6 +980,27 @@ int parent_main(const char * self, const char * mode) {
         }
         return 0;
     }
+    if (std::strcmp(mode, "abort-settle") == 0) {
+        // Without this the abort's backtrace starts a debugger that attaches to the child, and the debugger can
+        // hold the child's output pipe past the child's end.
+        setenv("GGML_NO_BACKTRACE", "1", 1);
+        setenv(k_settle_env, "150", 1);
+        const child_result r = run_child(self, mode);
+        unsetenv(k_settle_env);
+        unsetenv("GGML_NO_BACKTRACE");
+        if (const int rc = check_ended(mode, r)) {
+            return rc;
+        }
+        const size_t message_at = r.out.find("test: abort-settle mode");
+        const size_t settle_at  = r.out.find("[SYCL-FATAL] settle: waiting 150 ms");
+        if (r.signal != SIGABRT) {
+            return fail(mode, r, "the child did not end by SIGABRT");
+        }
+        if (message_at == std::string::npos || settle_at == std::string::npos || settle_at < message_at) {
+            return fail(mode, r, "the abort message must be printed, and the settle line after it");
+        }
+        return r.seconds < 0.15 ? fail(mode, r, "the child ended sooner than the settle time") : 0;
+    }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0) {
         const child_result r = run_child(self, mode);
         if (r.exited && r.status == LLAMA_TEST_EXIT_SKIP) {
@@ -990,7 +1021,9 @@ int parent_main(const char * self, const char * mode) {
         settle_after_device_child();
         return rc;
     }
-    std::fprintf(stderr, "usage: %s helper|control|classify|capture|settle|settle-off|settle-cap|mmid|op|sync|graph\n",
+    std::fprintf(stderr,
+                 "usage: %s helper|control|classify|capture|settle|settle-off|settle-cap|abort-settle|mmid|op|sync|"
+                 "graph\n",
                  self);
     return 2;
 }
@@ -1003,7 +1036,8 @@ int main(int argc, char ** argv) {
     }
     if (argc != 2) {
         std::fprintf(stderr,
-                     "usage: %s helper|control|classify|capture|settle|settle-off|settle-cap|mmid|op|sync|graph\n",
+                     "usage: %s helper|control|classify|capture|settle|settle-off|settle-cap|abort-settle|mmid|op|"
+                     "sync|graph\n",
                      argv[0]);
         return 2;
     }
