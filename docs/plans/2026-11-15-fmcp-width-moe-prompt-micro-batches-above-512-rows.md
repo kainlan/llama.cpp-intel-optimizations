@@ -3417,3 +3417,326 @@ L2 is the validation: the finished binaries, on the B50, ending real processes t
 kernel log as the observation. **Observed success:** 20 settled exits with no kernel GPU line, against the control the
 owner chose (16 of 22 unsettled exits with lines, same day, card and driver), both correctness gates passing, and
 the record on llama.cpp-488x.
+
+---
+
+## Amendment 2 (stage 2): the plan charges a device expert what staging allocates (llama.cpp-az3g)
+
+**Status: written 2026-11-16 after the lead's spike. Awaits the owner's review. Nothing here is spawned before it.**
+
+### What gate G2 found
+
+After stage 2 the planner puts more routed experts on the B70 and holds room for the prompt ring in the WEIGHT zone
+(136 slots, 119.5 MB at 512 rows). At 512 rows the ring then got only 133 of its 136 slots. The backend fell back to
+the expert loan: the first prompt pass ran on the CPU and the unload took 7.4 minutes (the unload is
+llama.cpp-ewu1). Throughput was unchanged, the wall time doubled.
+
+The lead first blamed the indexer KV cache. That was wrong and is corrected on the tracker: the plan charges that
+cache. The real cause, read from the source and closed against the zone census to the byte:
+
+- Direct staging allocates an AOS quantized expert with a tail that completes its last row to 512 columns
+  (`MATRIX_ROW_PADDING`): `ggml_sycl_get_padded_weight_bytes`, `ggml-sycl.cpp:43693-43704`, used at `:44502` and
+  `:44568`.
+- The plan charges the unpadded size: `entry.vram_charge_size = placement_vram_charge_bytes(entry.dst_size)`
+  (`unified-cache.cpp:36774`, and `:38295` for several devices). `dst_size` is unpadded on purpose, because loans and
+  refills size their copies from the cache entry (`unified-cache.cpp:32135-32141`). A comment already admits the gap:
+  "direct staging pads an AOS quantized expert's tail to MATRIX_ROW_PADDING columns, and the plan does not count it"
+  (`unified-cache.hpp:4356-4357`).
+- Qwen3.8 exps-IQ4_NL: `ffn_down_exps` has 640 columns, so each expert gets 384 padded columns, 216 bytes. The request
+  is 921,816 bytes and the zone's 256-byte grain makes it a 921,856-byte block. The plan charged 921,600. That is 256
+  bytes per device down expert. Gate and up have 2,560 columns and no tail.
+- At 512 rows after stage 2 the plan put 7,334 triplets on the device: 7,334 x 256 = 1,877,504 bytes. The plan had
+  7,168 bytes left over. 1,877,504 - 7,168 = 1,870,336, the measured shortfall. Three ring slots did not fit.
+
+| run (B70, Qwen, 512-row prompt) | device triplets | planned weights | staged weights | ring slots | loan |
+|---|---:|---:|---:|---:|---|
+| before stage 2 | 6,113 | 21,332.9 MB | 21,334.2 MB | 136 of 136 (1.9 MB spare) | no |
+| after stage 2, `-ub 2048` | 7,144 | 24,051.4 MB | 24,052.8 MB | all (2.1 MB spare) | no |
+| after stage 2, `-ub 512` | 7,334 | 24,552.4 MB | 24,553.9 MB | 133 of 136 | yes |
+| spike (this fix), `-ub 512` | 7,333 | 24,551.5 MB | 24,551.2 MB | 136 of 136 | no |
+
+The under-charge was always there. It only showed once stage 2 packed the zone to the last byte.
+
+Dense weights are not part of it. S1-PRELOAD stages an AOS dense weight at its plain size (`ggml-sycl.cpp:45333`),
+which is what the plan charges.
+
+### The spike (lead, 2026-11-16)
+
+Branch `spike/az3g-padded-expert-charge` (cfda22969), on `integ/th32` at c36d1fbab, in the scratchpad worktree `wt-a10g`. Not for
+merging.
+
+- Host test: the new case below fails without the fix (2 `FAIL` lines: the charge is 18,432 where 18,688 is wanted,
+  and 38 triplets' staged blocks plus the ring exceed the budget) and passes with it. The other 53 cases of
+  `test-sycl-layout-choice` pass both ways, because they read charges from the plan.
+- Device, B70, driver 26.44, `llama-bench -m <Qwen exps-IQ4_NL> -p 512 -n 0 -r 1 -v`: 7,333 device triplets, no
+  `[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give` line, no `[MOE-EXEC] loan device` line, pp512 167.59 t/s
+  (168.65 unfixed), wall time 306 s against 646 s, 0 kernel GPU lines. The unfixed run prints each of the two lines
+  once, so the scorer has a positive control.
+- `python3 scripts/audit-sycl-static-storage.py --check` fails on the spike: the edit moves line numbers in
+  `ggml-sycl.cpp` and `unified-cache.cpp`, so the inventory must be regenerated in the task.
+
+### Design
+
+One fact, one source. The rule "what staging allocates for an AOS quantized weight" moves to one small header. The
+stager's helper forwards to it. The planner charges a routed expert through it at every place that sets a device
+charge from a layout that can be AOS. `dst_size` stays unpadded.
+
+Not changed, each for a reason:
+
+- The staging itself. Staging a padded tensor in bulk with one tail would also remove 7,168 small allocations, but it
+  touches the entry sizes loans and refills read. It has its own ticket (llama.cpp-g7j0).
+- Dense charges (`unified-cache.cpp:36795`, `:38316`): dense AOS staging is unpadded.
+- The charges that set a layout which is never AOS: the SOA alternate (`:33118`) and the two MXFP4_I8 upgrades
+  (`:33709`, `:33984`).
+- The host-side line at `:33264` and the host-placed entries at `:37155`: they are not VRAM charges.
+- The ring's slot size (921,600 bytes, the unpadded expert).
+
+### Decision D5 (for the owner)
+
+Charge what is staged, and leave the staging alone. The alternative, changing how padded tensors are staged, is
+larger, riskier and not needed to close the gate.
+
+### Task W2.6: a device AOS expert charges its staged block
+
+**Track:** B (the planner). **Depends on:** none. **Implementer:** Opus (placement code). **Worktree:** the
+scratchpad worktree `wt-a12-t4`, new branch `task/width-b-expert-charge` from `integ/th32` at spawn time.
+
+**File scope:**
+- Create: `ggml/src/ggml-sycl/weight-row-padding.hpp`
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp:375` (include), `:43693-43704` (the helper forwards)
+- Modify: `ggml/src/ggml-sycl/unified-cache.cpp:7` (include), `:32318` (new helper above it), `:33231`, `:33354`,
+  `:36774`, `:38295` (the four charges)
+- Modify: `ggml/src/ggml-sycl/unified-cache.hpp:4356-4357` (the comment that says the plan does not count the tail)
+- Test: `tests/test-sycl-layout-choice.cpp` (one new case and its call)
+- Regenerate: `docs/backend/sycl-static-storage-inventory.csv`
+
+Line numbers are for c36d1fbab. Find each place by its text, not by its number.
+
+**Description:** The plan under-charges every device AOS quantized expert whose column count is not a multiple of
+512, by the row-padding tail that direct staging allocates. This task makes the planner charge the staged bytes,
+from the same function the stager sizes with, so the room the plan holds for the prompt ring is really free.
+
+**Acceptance criteria:**
+- [ ] `test-sycl-layout-choice` prints `PASS: a device AOS expert charges the WEIGHT zone its staged block, so the ring's room is really there` and exits 0 with 54 `PASS` lines and no `FAIL` line (lead run).
+- [ ] The new case fails on the base: the lead's spike recorded its two `FAIL` lines with this exact test text.
+- [ ] `ggml_sycl_get_padded_weight_bytes` holds no arithmetic of its own; it returns `ggml_sycl::aos_staged_weight_bytes(...)`.
+- [ ] `entry.dst_size` of an expert is unchanged (the test checks 18,432).
+- [ ] `python3 scripts/audit-sycl-static-storage.py --check` exits 0 after the inventory is regenerated, and the regenerated file differs from the base only in line numbers.
+- [ ] `clang-format-19 --dry-run -Werror ggml/src/ggml-sycl/weight-row-padding.hpp` is clean. No `-i` on any file.
+- [ ] The whole registered Python gate set shows no new non-zero result against the base (lead run).
+
+**Implementation guide:**
+
+1. **Test (RED).** In `tests/test-sycl-layout-choice.cpp`, insert this function directly above the comment that begins
+   `// A mapping load pins its routed host experts when the plan holds ring room`:
+
+```cpp
+// A routed expert on the device costs the WEIGHT zone what direct staging allocates for it. The case's Q4_0 experts
+// have 256 columns, so staging completes each one's last row to 512 columns (MATRIX_ROW_PADDING): 256 more columns of
+// Q4_0, 144 bytes, and the zone rounds the 18576-byte request to its 256-byte grain, 18688. The entry's dst_size stays
+// the unpadded 18432 bytes, the size loans and refills read. With the ring's room held, the blocks staging allocates
+// for the device experts and the ring's slots both fit what the budget leaves after the dense weights and their KV.
+static bool run_expert_charge_is_staged_bytes_test() {
+    using namespace ring_room_case;
+    bool ok = true;
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
+
+    // The stager's rule, written here and not read from the planner.
+    const size_t tail   = ggml_row_size(GGML_TYPE_Q4_0, 512 - ncols % 512);
+    const size_t staged = matrix_bytes + tail;
+    const size_t block  = (staged + 255) / 256 * 256;
+    if (tail != 144 || block != 18688) {
+        printf("FAIL: the case's staged expert must be 18432 + 144 bytes in an 18688-byte block: tail %zu, block %zu\n",
+               tail, block);
+        ok = false;
+    }
+
+    const auto roomy   = plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, q4_0_bit);
+    size_t     checked = 0;
+    size_t     wrong   = 0;
+    for (const auto & e : roomy.entries) {
+        if (e.expert_id < 0 || !e.on_device) {
+            continue;
+        }
+        checked++;
+        if (e.layout == GGML_LAYOUT_AOS && e.dst_size == matrix_bytes && e.vram_charge_size == block) {
+            continue;
+        }
+        if (wrong++ == 0) {
+            printf(
+                "FAIL: a device AOS expert must charge its staged block and keep its unpadded dst_size: %s expert %d "
+                "layout %d dst_size %zu (want %zu) charge %zu (want %zu)\n",
+                e.name.c_str(), e.expert_id, (int) e.layout, e.dst_size, matrix_bytes, e.vram_charge_size, block);
+        }
+        ok = false;
+    }
+    if (checked != 3 * static_cast<size_t>(n_triplets)) {
+        printf("FAIL: a budget every expert fits puts all %d expert matrices on the device: %zu\n", 3 * n_triplets,
+               checked);
+        ok = false;
+    }
+
+    const size_t charge = triplet_charge(roomy);
+    const size_t budget = base + 40 * charge;
+    const auto   plan   = plan_for(budget, q4_0_bit);
+    const size_t blocks = 3 * device_triplets(plan) * block;
+    if (plan.moe_stream_ring_reserve_bytes != ring_bytes || device_triplets(plan) == 0 ||
+        base + blocks + ring_bytes > budget) {
+        printf(
+            "FAIL: the staged experts and the ring's slots must fit the budget: %zu device triplets stage %zu bytes, "
+            "the ring holds %zu (want %zu), dense and KV take %zu, the budget is %zu\n",
+            device_triplets(plan), blocks, plan.moe_stream_ring_reserve_bytes, ring_bytes, base, budget);
+        ok = false;
+    }
+
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    if (ok) {
+        printf("PASS: a device AOS expert charges the WEIGHT zone its staged block, so the ring's room is really there\n");
+    }
+    return ok;
+}
+```
+
+   Call it in `main()`, on the line after
+   `mock_ok = run_moe_stream_ring_room_before_experts_test() && mock_ok;`:
+
+```cpp
+        mock_ok = run_expert_charge_is_staged_bytes_test() && mock_ok;
+```
+
+   The implementer does not build or run it. Expected on the base (the lead's spike, same text):
+
+```
+FAIL: a device AOS expert must charge its staged block and keep its unpadded dst_size: blk.1.ffn_gate_exps.weight expert 0 layout 0 dst_size 18432 (want 18432) charge 18432 (want 18688)
+FAIL: the staged experts and the ring's slots must fit the budget: 38 device triplets stage 2130432 bytes, the ring holds 110592 (want 110592), dense and KV take 655360, the budget is 2867200
+```
+
+2. **The shared rule (GREEN).** Create `ggml/src/ggml-sycl/weight-row-padding.hpp` with exactly:
+
+```cpp
+#pragma once
+
+#include "ggml.h"
+#include "presets.hpp"
+
+#include <cstddef>
+#include <cstdint>
+
+namespace ggml_sycl {
+
+// The bytes direct staging allocates for one AOS quantized weight of `ncols` columns whose rows take `base_size`
+// bytes: the rows, plus a tail that completes the last row to a multiple of MATRIX_ROW_PADDING columns, which the
+// quantized kernels may read. The stager sizes its allocation with this and the planner charges VRAM with it, so the
+// plan and the zone cannot disagree about what one expert costs.
+inline size_t aos_staged_weight_bytes(ggml_type type, int64_t ncols, size_t base_size) {
+    if (!ggml_is_quantized(type)) {
+        return base_size;
+    }
+    const int64_t rem = ncols % MATRIX_ROW_PADDING;
+    if (rem == 0) {
+        return base_size;
+    }
+    return base_size + ggml_row_size(type, MATRIX_ROW_PADDING - rem);
+}
+
+}  // namespace ggml_sycl
+```
+
+3. **The stager forwards.** In `ggml/src/ggml-sycl/ggml-sycl.cpp`, add `#include "ggml-sycl/weight-row-padding.hpp"`
+   on the line after `#include "ggml-sycl/unified-cache.hpp"`. Replace the body of
+   `ggml_sycl_get_padded_weight_bytes` (keep its comment, its name and its six callers) so the function reads:
+
+```cpp
+static size_t ggml_sycl_get_padded_weight_bytes(ggml_type type, int64_t ncols, size_t base_size) {
+    return ggml_sycl::aos_staged_weight_bytes(type, ncols, base_size);
+}
+```
+
+4. **The planner charges through it.** In `ggml/src/ggml-sycl/unified-cache.cpp`, add
+   `#include "weight-row-padding.hpp"` on the line after `#include "unified-cache.hpp"`. Directly above
+   `static size_t planner_layout_bytes_for_entry(`, add:
+
+```cpp
+// What a routed expert costs the WEIGHT zone on a device: its staged bytes, rounded as the zone rounds them. An AOS
+// quantized expert is staged with its row-padding tail, which dst_size leaves out because loans and refills size their
+// copies from the entry.
+static size_t planner_expert_vram_charge_bytes(ggml_type type, int64_t ncols, ggml_layout_mode layout, size_t bytes) {
+    return placement_vram_charge_bytes(layout == GGML_LAYOUT_AOS ? aos_staged_weight_bytes(type, ncols, bytes) : bytes);
+}
+```
+
+   Then change four charges. Two are the routed-expert entry builders (in `compute_placement_plan` and in its
+   several-device twin; both sit between `entry.layout = layout;` and `entry.kv_size = 0;`):
+
+```cpp
+                entry.vram_charge_size =
+                    planner_expert_vram_charge_bytes(entry.type, entry.ne[0], entry.layout, entry.dst_size);
+```
+
+   Two are the layout changes of an expert already on a device, in `apply_multi_moe_per_target_layouts` and in
+   `maybe_upgrade_multi_moe_primary_layouts`. In each, the line
+   `const size_t new_charge = placement_vram_charge_bytes(new_size);` becomes:
+
+```cpp
+            const size_t new_charge =
+                planner_expert_vram_charge_bytes(entry.type, entry.ne[0], target_layout, new_size);
+```
+
+   Leave every other `placement_vram_charge_bytes(` call as it is (see "Not changed" above).
+
+5. **The comment.** In `ggml/src/ggml-sycl/unified-cache.hpp`, the sentence "Each can exceed the plan's dst_size:
+   direct staging pads an AOS quantized expert's tail to MATRIX_ROW_PADDING columns, and the plan does not count it."
+   becomes "Each can exceed the plan's dst_size: direct staging pads an AOS quantized expert's tail to
+   MATRIX_ROW_PADDING columns, which dst_size leaves out and the plan's VRAM charge counts."
+
+6. **The inventory.** Run `python3 scripts/audit-sycl-static-storage.py` (no flag) to regenerate
+   `docs/backend/sycl-static-storage-inventory.csv`, then `--check` and `--check-classification`. Confirm with
+   `git diff --stat` and a look at the diff that only line numbers changed. Report all three outputs.
+
+**Commit:**
+
+```bash
+git add ggml/src/ggml-sycl/weight-row-padding.hpp
+git commit -F <message file> -- ggml/src/ggml-sycl/weight-row-padding.hpp ggml/src/ggml-sycl/ggml-sycl.cpp \
+    ggml/src/ggml-sycl/unified-cache.cpp ggml/src/ggml-sycl/unified-cache.hpp tests/test-sycl-layout-choice.cpp \
+    docs/backend/sycl-static-storage-inventory.csv
+```
+
+Subject: `sycl: the plan charges a device AOS expert what direct staging allocates`. Trailer:
+`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`, nothing else.
+
+**Gotchas:**
+- The implementer builds nothing and runs no built binary. The lead builds `test-sycl-layout-choice` and runs it.
+- codescout's index is blind inside `ggml-sycl.cpp`. Find text there with `cat <file> | grep -n '<pattern>'`.
+- `entry.ne[0]` is the expert's column count (`copy_tensor_info_to_entry` copies the tensor's dimensions).
+- Do not pad `dst_size` and do not touch `planner_layout_bytes_for_dims`: loans, refills and the bulk path's
+  `bulk_expert_bytes != expert_size` test read it.
+- `presets.hpp` includes `common.hpp`. Both `.cpp` files already include it, so the new header adds no dependency.
+- If the W1.7 or W1.8 branch merges first, it also moves lines in `ggml-sycl.cpp` and regenerates the inventory.
+  Merge `integ/th32` into the task branch, regenerate the inventory again, and report the merge commit.
+- Comments state reasons. No ticket ids, task numbers or review rounds in code comments.
+- Never `clang-format-19 -i`. Both `.cpp` files carry old drift; leave it.
+
+### Lead task L3: the device check of W2.6
+
+After W2.6 merges and `integ/th32` is rebuilt. Under `GPU.lock`, preflight first, `GGML_SYCL_TUNING_CACHE=0`, one
+process at a time. Read the driver version first.
+
+1. Host: `test-sycl-layout-choice`, 54 `PASS`, no `FAIL`.
+2. Qwen exps-IQ4_NL on the B70, `llama-bench -p 512 -n 0 -r 1 -v`. Required: 0 lines
+   `[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give`, 0 lines `[MOE-EXEC] loan device`, the ring line shows
+   136 slots, and the `[S1-PRELOAD] async bulk` megabytes are not above the device weights of `[PLACEMENT] Totals`.
+   Positive control for the two counts: the unfixed run in the scratchpad (`fmcp/width/g2/pack/after-ub512`), 1 each.
+   Record the device triplets, pp512 and the wall time (unfixed: 7,334, 168.65 t/s, 646 s).
+3. The same with `-ub 2048`: the same two counts are 0.
+4. A model the fix must not move: GPT-OSS 20B on the B50, `llama-bench -p 512 -n 0 -r 1 -v`, before (the G2 after
+   tree's recorded log) and after: the `[PLACEMENT] Totals` line is identical. Its experts are not AOS.
+5. Correctness: the Mistral completion gate (B50) and the GPT-OSS chat gate (B50).
+6. Qwen prompt throughput, `-p 2048 -n 0 -ub 512 -lm none -r 5`, once: reported beside G2 step 8's after arms
+   (162.29, 169.92, 138.85 t/s; wall 814 s). The wall time is expected to fall; no throughput figure is required.
+7. Kernel log clean. Results on llama.cpp-az3g, which then closes.
+
+### End-to-end validation of the amendment
+
+L3 is the validation: the finished build loads the real model on the real card, the ring gets every slot the plan
+held for it, and nothing is lent. All of it is run by the lead. No step needs the owner.
