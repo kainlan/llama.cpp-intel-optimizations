@@ -432,6 +432,7 @@ For the architectural contract and migration history behind these two rows, see
 | `GGML_SYCL_KERNEL_PROFILE=1` | Default OFF. Aggregate per-kernel-label device-time census (`sycl-kernel-profiler.cpp/.hpp`). Sub-variables: `GGML_SYCL_KERNEL_PROFILE_OUTPUT=<prefix>` (a path prefix, not a directory: writes `<prefix>.json` / `<prefix>.csv`), `GGML_SYCL_KERNEL_PROFILE_FORMAT=csv\|json\|both`, `GGML_SYCL_KERNEL_PROFILE_RAW=1` (per-event rows with `timestamp_status`). Coverage, status semantics and the partial-event caveat: see below. |
 | `GGML_SYCL_E2E_TG_PROFILE=1` | Default OFF (`e2e-profile.cpp/.hpp`). Per-stage (DISPATCH/MOE/ATTENTION/KV/ELEMENTWISE/GRAPH/CACHE/TRANSFER/…) **host-time** breakdown, one `[SYCL-E2E-TG-PROFILE]` summary + `[SYCL-E2E-TG-STAGE]` rows per graph_compute (one decode token or one prefill ubatch). Its `device_us` column is host-only — see below. |
 | `GGML_SYCL_MXFP4_PP_PROFILE=1` | Default OFF (llama.cpp-6405, perf-recovery epic PP gap analysis sub-task). Device-event breakdown of the batched PP MoE oneDNN executor (`try_pp_onednn_f16_batched`, `ggml-sycl.cpp`; only compiled under `GGML_SYCL_DNNL`). Prints `[MXFP4-PP-BATCHED-PROFILE]` (one per graph eval) and `[MXFP4-PP-BATCHED-PROFILE-TENSOR]` (per-tensor detail) lines at `GGML_LOG_WARN`, partitioning each eval's device time into repack/GEMM/staging/`other` buckets. Reuses the same env var name `mmvq.cpp`'s `mmvq_moe_pp_profile_enabled()` already reads for a complementary, older instrument timing the small-batch MMVQ GEMV MoE path. See below for the exact line format, what `other` does and does not mean, the graph-replay caveat, and the host-wait/zero-cost contract. |
+| `GGML_SYCL_FATAL_CAPTURE_DIR=<dir>` | Default unset. An existing directory. At the first recorded device loss, or at the backend's fatal exit (`ggml_sycl_fatal_exit`) when no loss was recorded, the process copies `/proc/self/maps`, `smaps` and `status` to `<dir>/sycl-fatal-<pid>.*` (mode 0600), once, and prints `[SYCL-FATAL] capture: <dir>/sycl-fatal-<pid>`. A file that could not be written in full is named on a `[SYCL-FATAL] capture failed:` line with the reason, a partial copy is removed, and the capture line is not printed. The watchdog's `_Exit(1)` and an abort take no capture. Linux only. |
 
 ### `GGML_SYCL_MOE_EXEC_DECLINE_LAYER` and `GGML_SYCL_MOE_EXEC_TRACE`
 
@@ -752,8 +753,9 @@ all; a run that reached no site at all says so outright
 (`NO RESET SITE WAS VISITED … this run proves NOTHING`).
 
 A full inventory is re-emitted every 256 site visits, at process exit, from the
-SYCL watchdog before its `_Exit(1)`, and from a `SIGSEGV`/`SIGABRT` handler — the
-runs with the confirmed escapes are the runs that crash. The signal handler
+SYCL watchdog before its `_Exit(1)`, from the fatal exit (`ggml_sycl_fatal_exit`)
+before its `_Exit`, and from a `SIGSEGV`/`SIGABRT` handler — the runs with the
+confirmed escapes are the runs that crash. The signal handler
 chains to whatever handler it displaced (the planner canaries install their own),
 falling back to `SIG_DFL` only when there was none.
 
