@@ -679,7 +679,10 @@ def check_gates(s: dict) -> None:
     heads = enclosing_headers(sync, sraw) if sraw >= 0 else []
     if heads[:1] != ["try"]:
         fail("J2", "the synchronize's gate sleep is under a condition")
-    if not re.search(r"CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\); ggml_sycl_cpu_job_gates_clear\(gate_sleep\);", sf):
+    # The waits sit in the block that runs when the injected device loss ahead of them did not throw; the clear follows
+    # that block's close, so it runs whether the waits did or not.
+    if not re.search(r"CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\); \} "
+                     r"ggml_sycl_cpu_job_gates_clear\(gate_sleep\);", sf):
         fail("J2", "the statement after the synchronize's stream wait does not clear the gates it slept on")
     gs, _ = body_of(code, GATES_SLEEP_SIG, "J2")
     if "sleep.gates = ggml_sycl::unified_cache_cpu_job_gates(stream);" not in flat(gs) or \
@@ -1080,6 +1083,10 @@ def self_test(s: dict) -> int:
          sub(r"(\n(\s*))(const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep\(\*stream\);)",
              r"\1if (sycl_ctx->last_graph_event_deferred_decode) {\1    \3\1}")),
         ("J2", "backend", "the synchronize keeps its gates", sub(r"\n\s*ggml_sycl_cpu_job_gates_clear\(gate_sleep\);", "")),
+        ("J2", "backend", "the synchronize clears its gates only when it waited",
+         sub(r"(CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\);)\n(\s*)\}\n"
+             r"\s*ggml_sycl_cpu_job_gates_clear\(gate_sleep\);",
+             r"\1\n\2    ggml_sycl_cpu_job_gates_clear(gate_sleep);\n\2}")),
         ("J2", "backend", "the sleep waits part of the list",
          sub(r"sleep\.waited = sleep\.gates->wait_all\(&sleep\.newest\);", "sleep.waited = sleep.gates->wait_upto(1);")),
         ("J3", "backend", "an untraced synchronize never clears",

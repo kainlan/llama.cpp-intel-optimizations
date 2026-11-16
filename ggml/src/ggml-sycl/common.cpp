@@ -795,6 +795,36 @@ void ggml_sycl_fatal_exit(int code, const char * message) noexcept {
     std::_Exit(code);
 }
 
+static std::atomic<bool> g_sycl_device_lost_latched{ false };
+
+static void ggml_sycl_device_lost_at_exit() {
+    // A normal exit would have flushed every open C stdio stream; the fast exit flushes only stdout and stderr.
+    std::fflush(nullptr);
+    ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "process exit after a device loss");
+}
+
+void ggml_sycl_note_exception(const char * what) noexcept {
+    if (!ggml_sycl_what_is_device_lost(what)) {
+        return;
+    }
+    if (!g_sycl_device_lost_latched.exchange(true, std::memory_order_acq_rel)) {
+        std::fprintf(stderr,
+                     "[SYCL-FATAL] device lost: %s\n"
+                     "[SYCL-FATAL] the process leaves through _Exit(%d) at its next failed SYCL check (SYCL_CHECK) "
+                     "or when it exits, without running exit handlers\n",
+                     what, GGML_SYCL_EXIT_DEVICE_LOST);
+        std::fflush(stderr);
+        if (std::atexit(ggml_sycl_device_lost_at_exit) != 0) {
+            std::fprintf(stderr, "[SYCL-FATAL] could not register the exit handler; a normal exit runs teardown\n");
+            std::fflush(stderr);
+        }
+    }
+}
+
+bool ggml_sycl_device_lost_latched() noexcept {
+    return g_sycl_device_lost_latched.load(std::memory_order_acquire);
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void ggml_sycl_test_inject_device_lost(const char * site) {
     struct request {
