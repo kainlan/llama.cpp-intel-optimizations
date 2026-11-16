@@ -33,8 +33,8 @@ Outside the wrappers:
     legitimate caller is added, add it there.
 
 Before the if, between the caller's `#if GGML_SYCL_DNNL` line and the if, nothing may leave (return, goto, throw,
-GGML_ABORT, GGML_ASSERT, abort, exit, _Exit, quick_exit, terminate or longjmp): such a statement would skip the wrapper
-and the fallback alike.
+GGML_ABORT, GGML_ASSERT, abort, exit, _Exit, quick_exit, ggml_sycl_fatal_exit, terminate or longjmp): such a statement
+would skip the wrapper and the fallback alike.
 
 Between the if and the `#endif` / `#else` that ends the DNNL section only whitespace and the closing braces of its
 blocks may appear: no statement, goto, throw, abort or else can follow it. When that line is an `#else`, its arm (up to
@@ -96,7 +96,7 @@ WRITE = re.compile(r"\bparallel_for\b|\bsingle_task\b|\bmemcpy\b|\bmemmove\b|\bm
 # What may not appear in the #else arm of a caller's `#if GGML_SYCL_DNNL` section: any way to leave before the fallback
 # runs.
 LEAVE = re.compile(r"\breturn\b|\bgoto\b|\bthrow\b|\bGGML_ABORT\b|\bGGML_ASSERT\b|\babort\b|\bexit\b|\b_Exit\b|\bquick_exit\b"
-                   r"|\bterminate\b|\blongjmp\b")
+                   r"|\bggml_sycl_fatal_exit\b|\bterminate\b|\blongjmp\b")
 # A decline spelled as a return, in any of the forms an optional- or bool-returning consumer can write it.
 AFTER_NOTE_LEAVE = re.compile(r"\breturn\s+(?:false\b|std::nullopt\b|std::optional\s*<[^;{}]*>\s*(?:\(\s*\)|\{\s*\}))"
                               r"|\breturn\s*\{\s*\}")
