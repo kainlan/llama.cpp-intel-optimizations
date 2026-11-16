@@ -386,8 +386,10 @@ def test_the_settle_header_reader_refuses_a_backend_include(extra):
 
 PROCESS_END = re.compile(r"\b(?:std::)?(?:abort|_Exit)\s*\(")
 # One alternation, so whichever token starts first wins: a // inside a string is not a comment, and a quote inside a
-# comment or a character literal does not open a string.
-COMMENT_OR_LITERAL = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'", flags=re.S)
+# comment or a character literal does not open a string. A quote right after a hex digit is a digit separator
+# (1'000), not a character literal. It does not understand raw string literals (none in the backend's sources today).
+COMMENT_OR_LITERAL = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:[^\"\\\n]|\\.)*\"|(?<![0-9a-fA-F])'(?:[^'\\\n]|\\.)*'",
+                                flags=re.S)
 # Files whose process ends are deliberate as they are: the number of abort( and _Exit( calls the file keeps, and why.
 UNSETTLED_ALLOWED = {
     "a7l5w-probe.hpp": (2, "debug-build instrumentation: the dump must hold the state at the failing check, so other "
@@ -446,6 +448,7 @@ def test_the_process_end_reader_refuses_a_bare_abort():
 @pytest.mark.parametrize("source", [
     'void f() {\n    std::fprintf(stderr, "see http://x\\n"); std::abort();\n}\n',
     "void f() {\n    char c='\"'; std::abort();\n}\n",
+    "void f() {\n    const int a = 1'000; std::abort(); const int b = 2'000;\n}\n",
 ])
 def test_the_process_end_reader_sees_a_call_after_a_literal(source):
     problems = unsettled_process_ends("x.cpp", blank_comments_and_literals(source))
