@@ -99715,8 +99715,11 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*stream);
         const bool use_deferred_decode_event =
             sycl_ctx->last_graph_event.has_value() && sycl_ctx->last_graph_event_deferred_decode;
-        auto err = use_deferred_decode_event ? CHECK_TRY_ERROR(sycl_ctx->last_graph_event->wait_and_throw()) :
-                                               CHECK_TRY_ERROR(stream->wait_and_throw());
+        auto err = CHECK_TRY_ERROR(ggml_sycl_test_inject_device_lost("sync"));
+        if (err == 0) {
+            err = use_deferred_decode_event ? CHECK_TRY_ERROR(sycl_ctx->last_graph_event->wait_and_throw()) :
+                                              CHECK_TRY_ERROR(stream->wait_and_throw());
+        }
         ggml_sycl_cpu_job_gates_clear(gate_sleep);
         // GGML_SYCL_MOE_EXEC_TRACE=2's per-window timing lines: read here, after the wait, so reading the windows'
         // device times never waits on the compute path. Nothing below trace level 2.
@@ -125533,6 +125536,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     const uint64_t record_begins_before = ggml_sycl::graph_record_begins();
     const uint64_t exec_submits_before  = ggml_sycl::graph_exec_submits();
     try {
+        ggml_sycl_test_inject_device_lost("graph");
 #if GGML_SYCL_DNNL
         // llama.cpp-6405: GGML_SYCL_MXFP4_PP_PROFILE component 5 ("everything
         // else") needs this eval's whole graph device-time span. Bracketed

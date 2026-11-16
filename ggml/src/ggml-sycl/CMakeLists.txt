@@ -6612,19 +6612,24 @@ foreach(_fatal_mode IN ITEMS helper control classify)
         TIMEOUT 60
     )
 endforeach()
-# The device modes: the registration injects the loss a lost device throws, once at MUL_MAT_ID and once at any op.
-# Each run leaves two kernel log lines on the card it runs on: "Fault response: Unsuccessful -ENOENT" and
-# "Engine reset: engine_class=bcs ... guc_id=6". Both belong to the dying process's own context, which the driver
-# tears down when the process ends with work still queued; the card stays usable (the Mistral completion gate passed
-# straight afterwards). This guc_id=6 is not the unrecoverable-hang signature: that one leaves the card unusable
-# until a reboot, and these lines do not.
-foreach(_fatal_site IN ITEMS mmid op)
+# The device modes: the registration injects the loss a lost device throws, at MUL_MAT_ID, at any op, at the
+# synchronize wait and at the graph boundary. Each item is the injection, <site>:<n>, which throws from the site's
+# nth call on. The sync mode's n is 3: the test synchronizes once before its compute and ggml_backend_graph_compute
+# synchronizes once at its end, and the loss must land on the wait the test calls after the compute returns.
+# A run that ends with work still queued on the card leaves two kernel log lines there: "Fault response:
+# Unsuccessful -ENOENT" and "Engine reset: engine_class=bcs ... guc_id=6" (seen on every mmid and op run). Both belong
+# to the dying process's own context, which the driver tears down when the process ends; the card stays usable (the
+# Mistral completion gate passed straight afterwards). This guc_id=6 is not the unrecoverable-hang signature: that
+# one leaves the card unusable until a reboot, and these lines do not.
+foreach(_fatal_injection IN ITEMS mmid:1 op:1 sync:3 graph:1)
+    string(REPLACE ":" ";" _fatal_parts "${_fatal_injection}")
+    list(GET _fatal_parts 0 _fatal_site)
     add_test(NAME test-sycl-fatal-exit-${_fatal_site} COMMAND test-sycl-fatal-exit ${_fatal_site})
     set_tests_properties(test-sycl-fatal-exit-${_fatal_site} PROPERTIES
         LABELS "sycl;fatal-exit;device;B50"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
-        ENVIRONMENT "GGML_SYCL_TEST_INJECT_DEVICE_LOST=${_fatal_site}:1;ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        ENVIRONMENT "GGML_SYCL_TEST_INJECT_DEVICE_LOST=${_fatal_injection};ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         TIMEOUT 120
     )
 endforeach()

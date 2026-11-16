@@ -331,6 +331,17 @@ int child_device(const char * mode) {
         return 77;
     }
     const bool computed = run_one_mmid(backend);
+    if (std::strcmp(mode, "graph") == 0 && !computed) {
+        // The boundary reported the failure and returned. An application would now wind down and return from main.
+        std::fprintf(stderr, "TEST-GRAPH-FAILED\n");
+        return 0;
+    }
+    if (std::strcmp(mode, "sync") == 0) {
+        // The loss must land on this wait, after the compute returned, and not on an earlier one: the setup's
+        // synchronize or the one ggml_backend_graph_compute ends with. The parent requires this line.
+        std::fprintf(stderr, "TEST-SYNC-COMPUTED computed=%d\n", computed ? 1 : 0);
+        ggml_backend_synchronize(backend);
+    }
     std::fprintf(stderr, "TEST-CHILD-SURVIVED mode=%s computed=%d\n", mode, computed ? 1 : 0);
     return 3;
 }
@@ -344,11 +355,24 @@ int child_main(const char * mode) {
         plant_markers();
         std::exit(GGML_SYCL_EXIT_DEVICE_LOST);
     }
-    if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0) {
+    if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0 || std::strcmp(mode, "sync") == 0 ||
+        std::strcmp(mode, "graph") == 0) {
         return child_device(mode);
     }
     std::fprintf(stderr, "unknown child mode %s\n", mode);
     return 2;
+}
+
+// The injection the ctest registration sets for a device mode. The sync mode's count skips the two synchronize calls
+// before the one it targets: the setup's own, and the one ggml_backend_graph_compute ends with.
+const char * device_injection(const char * mode) {
+    if (std::strcmp(mode, "sync") == 0) {
+        return "sync:3";
+    }
+    if (std::strcmp(mode, "graph") == 0) {
+        return "graph:1";
+    }
+    return std::strcmp(mode, "mmid") == 0 ? "mmid:1" : "op:1";
 }
 
 int parent_main(const char * self, const char * mode) {
@@ -395,7 +419,7 @@ int parent_main(const char * self, const char * mode) {
             const std::string why = std::string(
                                         "the injected loss was never thrown: the op did not reach the site "
                                         "(GGML_SYCL_TEST_INJECT_DEVICE_LOST=") +
-                                    mode + ":1 is set by the ctest registration)";
+                                    device_injection(mode) + " is set by the ctest registration)";
             return fail(mode, r, why.c_str());
         }
         const bool   mmid      = std::strcmp(mode, "mmid") == 0;
@@ -415,7 +439,47 @@ int parent_main(const char * self, const char * mode) {
         }
         return 0;
     }
-    std::fprintf(stderr, "usage: %s helper|control|classify|mmid|op\n", self);
+    if (std::strcmp(mode, "sync") == 0 || std::strcmp(mode, "graph") == 0) {
+        const child_result r = run_child(self, mode);
+        if (r.exited && r.status == 77) {
+            std::fprintf(stderr, "%s", r.out.c_str());
+            return 77;
+        }
+        const bool sync = std::strcmp(mode, "sync") == 0;
+        if (has(r, "TEST-CHILD-SURVIVED")) {
+            const std::string why = std::string(
+                                        "the injected loss was never thrown: the wait or the boundary did not reach "
+                                        "the site (GGML_SYCL_TEST_INJECT_DEVICE_LOST=") +
+                                    device_injection(mode) + " is set by the ctest registration)";
+            return fail(mode, r, why.c_str());
+        }
+        if (sync && !has(r, "TEST-SYNC-COMPUTED computed=1")) {
+            return fail(mode, r,
+                        "the loss did not land on the synchronize after a successful compute: it landed on an "
+                        "earlier call, or the compute failed");
+        }
+        if (!sync && !has(r, "TEST-GRAPH-FAILED")) {
+            return fail(mode, r, "the graph boundary did not return a failure to its caller");
+        }
+        if (!has(r, "UR_RESULT_ERROR_DEVICE_LOST")) {
+            return fail(mode, r, "the loss was not reported");
+        }
+        if (!has(r, "[SYCL-FATAL] device lost:")) {
+            return fail(mode, r, "the loss was not recorded as a device loss");
+        }
+        if (const int rc = check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST)) {
+            return rc;
+        }
+        // The path that ended the process names itself: the fatal check after the wait in sync mode, the exit handler
+        // the loss registered in graph mode.
+        const char * banner = sync ? "[SYCL-FATAL] SYCL_CHECK failed after a device loss:" :
+                                     "[SYCL-FATAL] process exit after a device loss:";
+        if (!has(r, banner)) {
+            return fail(mode, r, "the process did not end through the path the loss's site takes");
+        }
+        return 0;
+    }
+    std::fprintf(stderr, "usage: %s helper|control|classify|mmid|op|sync|graph\n", self);
     return 2;
 }
 
@@ -426,7 +490,7 @@ int main(int argc, char ** argv) {
         return child_main(argv[2]);
     }
     if (argc != 2) {
-        std::fprintf(stderr, "usage: %s helper|control|classify|mmid|op\n", argv[0]);
+        std::fprintf(stderr, "usage: %s helper|control|classify|mmid|op|sync|graph\n", argv[0]);
         return 2;
     }
     const int rc = parent_main(argv[0], argv[1]);

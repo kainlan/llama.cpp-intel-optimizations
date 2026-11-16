@@ -557,6 +557,9 @@ def free_path_pins(source, freeb, fails):
     # the test flag skips it), the CPU expert jobs' gate sleep (llama.cpp-qwn5), the deferred-event choice, the drain.
     # The sleep is admitted as exactly its one statement: it waits nothing the drain does not, and whether it is
     # there is pinned by tests/test-sycl-moe-cpu-job-device-signal-source.py, not here.
+    # The drain is admitted under exactly one condition, that the injected device loss ahead of it did not throw. The
+    # injection is an empty inline outside a GGML_SYCL_PRIVATE_TESTING build, so there the drain still always runs;
+    # in a test build the only drain it skips is the one a lost device would have failed anyway.
     sync = function_body(source, SYNC_SIG)
     pin(fails, sync,
         r"const queue_ptr stream = sycl_ctx->stream\(sycl_ctx->device, 0\);\s*"
@@ -564,8 +567,9 @@ def free_path_pins(source, freeb, fails):
         r"(?:const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep\(\*stream\);\s*)?"
         r"const bool use_deferred_decode_event =\s*"
         r"sycl_ctx->last_graph_event\.has_value\(\) && sycl_ctx->last_graph_event_deferred_decode;\s*"
-        r"auto err = use_deferred_decode_event \? CHECK_TRY_ERROR\(sycl_ctx->last_graph_event->wait_and_throw\(\)\) :\s*"
-        r"CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\);",
+        r'auto err = CHECK_TRY_ERROR\(ggml_sycl_test_inject_device_lost\("sync"\)\);\s*if \(err == 0\) \{\s*'
+        r"err = use_deferred_decode_event \? CHECK_TRY_ERROR\(sycl_ctx->last_graph_event->wait_and_throw\(\)\) :\s*"
+        r"CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\);\s*\}",
         "L4 free path: the backend synchronize no longer drains, in sequence and unconditionally, stream 0 or the deferred "
         "decode event after the CPU-expert flush")
     # one execution queue per device: stream(device, idx) answers it for EVERY idx, and it is the TP queue or the
@@ -1431,7 +1435,12 @@ def mutations(header_raw, source):
         ("the backend synchronize's deferred-event arm is never chosen", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
          "use_deferred_decode_event ? CHECK_TRY_ERROR(", "false ? CHECK_TRY_ERROR("),
         ("the backend synchronize returns before the drain", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
-         "        auto err = use_deferred_decode_event", "        if (sycl_ctx->has_pending_barrier) {\n            return;\n        }\n        auto err = use_deferred_decode_event"),
+         "        auto err = CHECK_TRY_ERROR(ggml_sycl_test_inject_device_lost(\"sync\"));",
+         "        if (sycl_ctx->has_pending_barrier) {\n            return;\n        }\n        auto err = CHECK_TRY_ERROR(ggml_sycl_test_inject_device_lost(\"sync\"));"),
+        ("the backend synchronize's drain behind a condition besides the injection's", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "if (err == 0) {", "if (err == 0 && !sycl_ctx->has_pending_barrier) {"),
+        ("the backend synchronize drains only after an injected loss", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "if (err == 0) {", "if (err != 0) {"),
         ("the backend synchronize returns after its gate sleep", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
          "ggml_sycl_cpu_job_gates_sleep(*stream);\n", "ggml_sycl_cpu_job_gates_sleep(*stream);\n        if (gate_sleep.waited != 0) {\n            return;\n        }\n"),
         # ---- the queue aliasing: one execution queue per device, answered for every idx
