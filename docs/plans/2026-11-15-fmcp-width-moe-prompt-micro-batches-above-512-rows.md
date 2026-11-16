@@ -2730,3 +2730,687 @@ kernel log check, per stage. A stage is done when its record is complete and eve
 | Stage 4: lead measurement, owner gate, picker, cache version | W4.0, then an amendment |
 | Width gate, monotone bar, baselines, placement bar, GPT-OSS 120B, kernel log | End-to-End Validation, G1, G2 |
 | Docs | W1.4, W2.5 |
+
+---
+
+## Amendment 1 (stage 1): the process waits for the driver's submission rings before it ends (llama.cpp-488x)
+
+**Status:** written 2026-11-16 after the owner's ruling at gate G1 ("Investigate, then amend"). Not approved. No
+task below is spawned before the owner's review.
+
+**What was measured** (B50, driver 26.44, spike build db1b43cb3 on `spike/488x-exit-drain`, never merged; records on
+llama.cpp-488x, comments c-kv48, c-9rr2, c-kuwt):
+
+- A process that ends through `std::_Exit` on a healthy card usually leaves `Fault response: Unsuccessful -ENOENT`
+  and `Engine reset: engine_class=bcs` in the kernel log: 16 of 22 exits.
+- About 3 exits in 100 leave `Engine memory CAT error [18]: class=bcs` instead. In 2 of the 3 episodes seen, no bcs
+  engine reset followed. The next process on the card then hung on its first copy (1 s later once, 42 s later once),
+  and killing it reset the whole GT.
+- At the exit every reachable backend queue was already empty (21 of 21 drains under 1 ms). A drain alone changed
+  nothing (9 of 11 exits with lines).
+- A 200 ms sleep before `_Exit` removed the lines: 0 of 20 exits.
+
+**Cause, read from the compute-runtime 26.22 source** (`/Apps/compute-runtime-26.22-llama`; 26.44 is not tagged
+upstream, so this is unconfirmed for the loaded driver): Level Zero keeps a direct-submission ring running on each
+engine. The ring parks the engine on a semaphore inside the process's GPU memory. A driver thread stops an idle ring
+after one to three timeouts of 5 ms. `_Exit` lands inside that window, the kernel closes the VM at once and ends the
+exec queues later, and the parked engine faults. No Level Zero or SYCL call stops a ring without teardown, and
+teardown is what the fast exit exists to skip.
+
+**The fix.** Every exit the backend owns sleeps for a bounded time first, 200 ms by default, so the driver stops its
+idle rings while the process still exists. It is a sleep and nothing else: it touches no queue and no device, so it
+cannot hang on a lost card. `GGML_SYCL_FATAL_EXIT_SETTLE_MS` sets the time (0 disables, values above 5000 count as
+5000).
+
+**What it cannot cover.** A kill from outside (SIGKILL, the OOM killer, `timeout`, a ctest `TIMEOUT`) and a crash
+signal run no code of ours. A ring that is still running work (a stuck kernel) is not idle and is not stopped. In
+those cases the result is what it is today. The four device modes therefore stay out of the documented sweep
+(decision at G1), and the lead's rule stays: after any kill on a card, read the kernel log before the next run.
+
+**Not shipped:** the spike's drain, and a crash-signal handler (it would override the application's handlers, and
+during a core dump the driver's thread cannot run anyway).
+
+### Dependency graph and file ownership
+
+```dot
+digraph amendment1 {
+    rankdir=LR;
+    "W1.6 helper + fatal exit" -> "W1.7 watchdog + abort sites";
+    "W1.6 helper + fatal exit" -> "W1.8 abort callback";
+    "W1.7 watchdog + abort sites" -> "L2 device check";
+    "W1.8 abort callback" -> "L2 device check";
+    "L2 device check" -> "W1.9 prose";
+}
+```
+
+One track (A), one implementer at a time: W1.6, W1.7 and W1.8 all edit `common.cpp`, the test binary and the source
+pin. Base: `integ/th32` at the commit the lead names in the spawn prompt. The rules every implementer prompt carries
+(above) apply unchanged.
+
+| File | Tasks |
+|---|---|
+| `ggml/src/ggml-sycl/exit-settle.hpp` (new) | W1.6 |
+| `ggml/src/ggml-sycl/common.cpp`, `common.hpp` | W1.6, W1.7, W1.8 |
+| `ggml/src/ggml-sycl/tests/test-sycl-fatal-exit.cpp`, `ggml/src/ggml-sycl/CMakeLists.txt` | W1.6, W1.8, W1.9 |
+| `tests/test-sycl-fatal-exit-source.py` | W1.6, W1.7, W1.8 |
+| `ggml-sycl.cpp`, `pinned-pool.cpp`, `kv-region-registry.hpp`, `kv-runtime-demotion.hpp`, `pending-range.hpp`, `tlsf-allocator.hpp`, `witnessed-mutex.hpp` | W1.7 (W1.8 adds one call in `ggml-sycl.cpp`) |
+| `docs/backend/sycl-env-vars.md` | W1.6 |
+
+### Task W1.6: the settle, and the fatal exit takes it
+
+**Track:** A
+**Depends on:** None
+**File scope:**
+- Create: `ggml/src/ggml-sycl/exit-settle.hpp`
+- Modify: `ggml/src/ggml-sycl/common.cpp` (`ggml_sycl_fatal_exit`, at `common.cpp:883-894`), `ggml/src/ggml-sycl/common.hpp:850-859` (the doc comment)
+- Modify: `ggml/src/ggml-sycl/tests/test-sycl-fatal-exit.cpp`, `ggml/src/ggml-sycl/CMakeLists.txt:6607-6614`
+- Modify: `tests/test-sycl-fatal-exit-source.py`, `docs/backend/sycl-env-vars.md` (one row after the `GGML_SYCL_FATAL_CAPTURE_DIR` row at line 435)
+
+**Description:**
+
+A header-only helper sleeps for the settle time and prints one line first. `ggml_sycl_fatal_exit` calls it as its
+last step before `std::_Exit`. The latch's exit handler (`ggml_sycl_device_lost_at_exit`) already ends through
+`ggml_sycl_fatal_exit`, so it is covered with no further code.
+
+**Acceptance Criteria:**
+
+- [ ] `test-sycl-fatal-exit settle` passes: with the variable at 150 the child takes at least 0.15 s and prints the settle line with `150 ms`
+- [ ] `test-sycl-fatal-exit settle-off` passes: with the variable at 0 the child prints no settle line
+- [ ] `test-sycl-fatal-exit settle-cap` passes: with the variable at 999999 the line says `5000 ms` (the child is not left to sleep: see step 1)
+- [ ] `test-sycl-fatal-exit helper control classify capture` still pass
+- [ ] `python3 tests/test-sycl-fatal-exit-source.py` passes with the two new checks, and each new check has a mutant test that it fails on
+
+**Implementation Guide:**
+
+1. **Test first.** In `test-sycl-fatal-exit.cpp` add three child modes to `child_main`, before the `mmid` branch:
+
+```cpp
+    if (std::strcmp(mode, "settle") == 0 || std::strcmp(mode, "settle-off") == 0) {
+        plant_markers();
+        ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "test: settle mode");
+    }
+    if (std::strcmp(mode, "settle-cap") == 0) {
+        // The cap is read back, not slept through: a child that slept for it would hold the test for five seconds.
+        std::fprintf(stderr, "TEST-SETTLE-MS %ld\n", ggml_sycl::exit_settle_ms());
+        return 0;
+    }
+```
+
+   and three parent modes to `parent_main`, before the `mmid` branch. The line the helper prints is
+   `[SYCL-FATAL] settle: waiting <n> ms before the process ends`:
+
+```cpp
+    if (std::strcmp(mode, "settle") == 0 || std::strcmp(mode, "settle-off") == 0) {
+        const bool off = std::strcmp(mode, "settle-off") == 0;
+        unsetenv(k_capture_env);
+        setenv(k_settle_env, off ? "0" : "150", 1);
+        const child_result r = run_child(self, mode);
+        unsetenv(k_settle_env);
+        if (const int rc = check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST)) {
+            return rc;
+        }
+        if (off) {
+            return has(r, k_settle_line) ? fail(mode, r, "a settle line, although the settle is disabled") : 0;
+        }
+        if (!has(r, "[SYCL-FATAL] settle: waiting 150 ms")) {
+            return fail(mode, r, "no settle line with the requested time");
+        }
+        if (r.seconds < 0.15) {
+            return fail(mode, r, "the child ended sooner than the settle time");
+        }
+        return 0;
+    }
+    if (std::strcmp(mode, "settle-cap") == 0) {
+        setenv(k_settle_env, "999999", 1);
+        const child_result r = run_child(self, mode);
+        unsetenv(k_settle_env);
+        if (const int rc = check_ended(mode, r)) {
+            return rc;
+        }
+        if (!r.exited || r.status != 0 || !has(r, "TEST-SETTLE-MS 5000\n")) {
+            return fail(mode, r, "the cap is not 5000 ms");
+        }
+        return 0;
+    }
+```
+
+   with, beside `k_capture_env`:
+
+```cpp
+constexpr const char * k_settle_env  = "GGML_SYCL_FATAL_EXIT_SETTLE_MS";
+constexpr const char * k_settle_line = "[SYCL-FATAL] settle: ";
+```
+
+   Add `#include "exit-settle.hpp"` after `#include "common.hpp"`. Extend both usage strings with
+   `settle|settle-off|settle-cap`. In `CMakeLists.txt:6607` extend the host list to
+   `helper control classify capture settle settle-off settle-cap`.
+   The existing `helper` parent must stay fast and must not depend on the caller's environment: add
+   `setenv(k_settle_env, "0", 1);` next to its `unsetenv(k_capture_env);`, and the same line at the top of
+   `run_capture_child`, `run_capture_child_missing_dir` and `run_capture_child_small_files`. The device modes are
+   not changed here: their children keep the default settle.
+
+2. **Source pin first.** In `tests/test-sycl-fatal-exit-source.py` add:
+
+```python
+SETTLE_CALL = "ggml_sycl::exit_settle();"
+
+
+def fatal_exit_settle_problems(cpp: str) -> list:
+    """Why ggml_sycl_fatal_exit does not settle as its last step before the exit."""
+    at = cpp.find(FATAL_EXIT_DEF)
+    if at < 0:
+        return ["common.cpp: ggml_sycl_fatal_exit is missing"]
+    body = braced_block(cpp, at)
+    signal_at = body.find("ggml_sycl::cpu_job_signal_signal_all();")
+    settle_at = body.find(SETTLE_CALL)
+    exit_at = body.find("std::_Exit(code);")
+    problems = []
+    if body.count(SETTLE_CALL) != 1 or not 0 <= signal_at < settle_at < exit_at:
+        problems.append("ggml_sycl_fatal_exit must call ggml_sycl::exit_settle() once, after it released the CPU "
+                        "expert jobs and before std::_Exit(code): a ring parked on such a job is not idle")
+    elif body[settle_at + len(SETTLE_CALL):exit_at].strip():
+        problems.append("ggml_sycl_fatal_exit: nothing may stand between the settle and std::_Exit(code)")
+    return problems
+
+
+def test_the_fatal_exit_settles_last():
+    problems = fatal_exit_settle_problems(code_of(SYCL / "common.cpp"))
+    assert not problems, "\n".join(problems)
+
+
+def test_the_settle_reader_refuses_a_settle_before_the_job_release():
+    cpp = code_of(SYCL / "common.cpp")
+    body = braced_block(cpp, cpp.find(FATAL_EXIT_DEF))
+    moved = body.replace(SETTLE_CALL, "", 1).replace("ggml_sycl::cpu_job_signal_signal_all();",
+                                                     SETTLE_CALL + "\n    ggml_sycl::cpu_job_signal_signal_all();", 1)
+    assert fatal_exit_settle_problems(cpp.replace(body, moved, 1)), "the reader accepted a settle before the release"
+
+
+SETTLE_FORBIDDEN = ("sycl::", "queue", "event", ".wait", "ext_oneapi", "unified_cache", "mem_handle", "dpct::")
+
+
+def settle_header_problems(hpp: str) -> list:
+    """Why exit-settle.hpp could touch a device: it must be a sleep and a print, usable after a device loss."""
+    return [f"exit-settle.hpp: {word!r} must not appear: the settle may only sleep and print"
+            for word in SETTLE_FORBIDDEN if word in hpp]
+
+
+def test_the_settle_touches_no_device():
+    problems = settle_header_problems(code_of(SYCL / "exit-settle.hpp"))
+    assert not problems, "\n".join(problems)
+
+
+def test_the_settle_header_reader_refuses_a_queue_wait():
+    hpp = code_of(SYCL / "exit-settle.hpp")
+    assert settle_header_problems(hpp + "\ninline void f(sycl::queue & q) { q.wait(); }\n")
+```
+
+   `FATAL_EXIT_DEF` and `braced_block` already exist in the file; place the new code after the capture checks.
+   `test_fatal_exit_ends_in_exit_without_host_cleanup` reads only the first 900 characters of the function: change
+   its slice to `braced_block(cpp, helper)` so the longer body is still read whole.
+   Run: `python3 tests/test-sycl-fatal-exit-source.py`. Expected: the four new tests FAIL (no header, no call).
+
+3. **Implement.** New file `ggml/src/ggml-sycl/exit-settle.hpp`:
+
+```cpp
+#pragma once
+
+// The wait before the process ends on a path that runs no teardown (std::_Exit, abort).
+//
+// The GPU driver keeps a submission ring running on each engine and parks the engine on memory of this process. A
+// driver thread stops an idle ring a few milliseconds after the last submission. A process that ends before that
+// leaves the engine parked on memory the kernel has already released: the kernel log then shows a fault and an engine
+// reset, and now and then a memory error after which the next process on the card hangs. Waiting here lets the
+// driver stop its rings while the process still exists.
+//
+// It only sleeps and prints. It takes no lock and touches no queue, so it cannot hang after a device loss, and the
+// headers that end the process on misuse can include it without the backend.
+
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
+
+namespace ggml_sycl {
+
+// Measured: 200 ms left no kernel line in 20 exits, where 16 of 22 exits without a wait left some. The driver's own
+// bound is a few 5 ms timeouts.
+constexpr long k_exit_settle_default_ms = 200;
+constexpr long k_exit_settle_max_ms     = 5000;
+
+// GGML_SYCL_FATAL_EXIT_SETTLE_MS: the wait in milliseconds. 0 disables it, a value above the maximum counts as the
+// maximum, and a value that is not a whole non-negative number counts as the default.
+inline long exit_settle_ms() noexcept {
+    const char * env = std::getenv("GGML_SYCL_FATAL_EXIT_SETTLE_MS");
+    if (env == nullptr || env[0] == '\0') {
+        return k_exit_settle_default_ms;
+    }
+    char * end = nullptr;
+    errno      = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || value < 0) {
+        return k_exit_settle_default_ms;
+    }
+    return value > k_exit_settle_max_ms ? k_exit_settle_max_ms : value;
+}
+
+inline void exit_settle() noexcept {
+    const long ms = exit_settle_ms();
+    if (ms <= 0) {
+        return;
+    }
+    std::fprintf(stderr, "[SYCL-FATAL] settle: waiting %ld ms before the process ends, so the GPU driver can stop its "
+                         "idle submission rings (GGML_SYCL_FATAL_EXIT_SETTLE_MS)\n",
+                 ms);
+    std::fflush(stderr);
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
+}  // namespace ggml_sycl
+```
+
+   In `common.cpp` add `#include "exit-settle.hpp"` beside the file's other backend includes, and in
+   `ggml_sycl_fatal_exit` insert one line, so the function ends:
+
+```cpp
+    ggml_sycl::cpu_job_signal_signal_all();
+    ggml_sycl::zone_reset_audit_report("sycl-fatal-exit");
+    ggml_sycl::exit_settle();
+    std::_Exit(code);
+```
+
+   In `common.hpp:850-859` add to the doc comment of `ggml_sycl_fatal_exit`, after "prints the zone-reset audit
+   when GGML_SYCL_ZONE_RESET_AUDIT is set.": "Then it waits GGML_SYCL_FATAL_EXIT_SETTLE_MS (200 ms by default, 0
+   disables) so the GPU driver can stop its idle submission rings: a process that ends sooner can leave an engine
+   parked on memory the kernel has released."
+
+4. **Docs.** `docs/backend/sycl-env-vars.md`, a row after line 435:
+   `GGML_SYCL_FATAL_EXIT_SETTLE_MS=<n>` | "Default 200. How long, in milliseconds, the backend waits before it ends
+   the process on a path with no teardown (the fatal exit, the watchdog, an abort). The wait lets the GPU driver
+   stop its idle submission rings; without it the kernel log usually shows a fault and a copy-engine reset after
+   such an exit, and rarely the next process on the card hangs. 0 disables, values above 5000 count as 5000. It does
+   not cover a kill from outside the process."
+
+5. Report the build targets for the lead: `test-sycl-fatal-exit`. The lead builds and runs the host modes.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the fatal exit waits for the driver's submission rings before it ends the process" -- \
+    ggml/src/ggml-sycl/exit-settle.hpp ggml/src/ggml-sycl/common.cpp ggml/src/ggml-sycl/common.hpp \
+    ggml/src/ggml-sycl/tests/test-sycl-fatal-exit.cpp ggml/src/ggml-sycl/CMakeLists.txt \
+    tests/test-sycl-fatal-exit-source.py docs/backend/sycl-env-vars.md
+```
+
+**Gotchas:**
+- The settle goes after `cpu_job_signal_signal_all()`. A device command parked on a CPU expert job keeps its ring
+  busy, and the driver stops only idle rings.
+- `std::this_thread::sleep_for` and not `nanosleep`: it is portable, and the library already resumes it after a
+  signal.
+- The header must stay free of backend includes. `kv-region-registry.hpp`, `pending-range.hpp`,
+  `tlsf-allocator.hpp` and `witnessed-mutex.hpp` are compiled alone by host tests and will include it in W1.7.
+- `code_of()` strips comments, so the pin never sees the header's prose. Write the forbidden-word check against
+  code only, as given.
+- The inventory gate may flag nothing here (the header has no static storage). Run
+  `python3 scripts/audit-sycl-static-storage.py --check` anyway and report its result.
+- Every existing mode that runs a child through the fast exit would now take 200 ms longer. That is harmless, but
+  the capture and helper parents set the variable to 0 so they keep testing one thing.
+
+---
+
+### Task W1.7: the watchdog and the backend's own aborts take the settle
+
+**Track:** A
+**Depends on:** W1.6
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/common.cpp:774` (the watchdog's `std::_Exit(1)`)
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp:110326`, `:110337`; `pinned-pool.cpp:1308`; `kv-region-registry.hpp:84`; `kv-runtime-demotion.hpp:840`; `pending-range.hpp:110`, `:118`; `tlsf-allocator.hpp:36`; `witnessed-mutex.hpp:131`
+- Modify: `tests/test-sycl-fatal-exit-source.py`
+
+**Description:**
+
+The watchdog ends the process through `std::_Exit(1)`, and nine places in the backend call `abort()` directly.
+Both leave live rings exactly as the fatal exit did. Each now calls `ggml_sycl::exit_settle()` first. On the
+watchdog's path the stuck ring is busy and is not stopped; the wait still lets the driver stop every idle ring, on
+the other engine and on the other card.
+
+**Acceptance Criteria:**
+
+- [ ] `python3 tests/test-sycl-fatal-exit-source.py` passes, with a check that fails when any `abort()` or `_Exit(` in `ggml/src/ggml-sycl/*.cpp` and `*.hpp` is not directly preceded by the settle and is not on the allowlist
+- [ ] The allowlist holds exactly: `common.cpp` `std::_Exit(code)` (preceded by the settle, checked in W1.6), and `a7l5w-probe.hpp` (2 sites, debug instrumentation that must stop at the failing site)
+- [ ] Every host test that compiles one of the changed headers alone still builds (the lead builds them: see step 3)
+
+**Implementation Guide:**
+
+1. **Source pin first.** In `tests/test-sycl-fatal-exit-source.py` add:
+
+```python
+PROCESS_END = re.compile(r"\b(?:std::)?(?:abort|_Exit)\s*\(")
+STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"')
+# Files whose process ends are deliberate as they are, with the reason.
+UNSETTLED_ALLOWED = {
+    "a7l5w-probe.hpp": "debug instrumentation: the core dump must show the failing site at once",
+}
+
+
+def code_only(path: Path) -> str:
+    """The source with comments and string literals blanked, line for line, so a reported line is the file's line."""
+    assert path.is_file(), f"{path.relative_to(ROOT)}: missing"
+
+    def blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    text = path.read_text(encoding="utf-8")
+    text = re.sub(r"/\*.*?\*/", blank, text, flags=re.S)
+    text = re.sub(r"//[^\n]*", blank, text)
+    return STRING.sub(blank, text)
+
+
+def unsettled_process_ends(name: str, code: str) -> list:
+    """The abort() and _Exit( calls of one source that the settle does not directly precede.
+
+    Directly means the settle is the statement before the call. Inside a multi-line macro the line continuation
+    between the two does not count.
+    """
+    problems = []
+    for m in PROCESS_END.finditer(code):
+        before = re.sub(r"\\\s*$", "", code[:m.start()].rstrip()).rstrip()
+        if not before.endswith(SETTLE_CALL):
+            line = code.count("\n", 0, m.start()) + 1
+            problems.append(f"{name}:{line}: {m.group(0)} is not directly preceded by {SETTLE_CALL}")
+    return problems
+
+
+def test_every_process_end_of_the_backend_settles_first():
+    problems = []
+    for path in sorted(list(SYCL.glob("*.cpp")) + list(SYCL.glob("*.hpp"))):
+        if path.name in UNSETTLED_ALLOWED or path.name == "exit-settle.hpp":
+            continue
+        problems += unsettled_process_ends(path.name, code_only(path))
+    assert not problems, "\n".join(problems)
+
+
+def test_the_process_end_reader_refuses_a_bare_abort():
+    assert unsettled_process_ends("x.cpp", "void f() {\n    std::fflush(stderr);\n    std::abort();\n}\n")
+    assert not unsettled_process_ends("x.cpp", "void f() {\n    ggml_sycl::exit_settle();\n    std::abort();\n}\n")
+    assert not unsettled_process_ends("x.hpp", "#define A do { \\\n    ggml_sycl::exit_settle(); \\\n    abort(); \\\n} while (0)\n")
+
+
+def test_the_allowlist_names_only_files_that_still_end_the_process():
+    for name in UNSETTLED_ALLOWED:
+        assert PROCESS_END.search(code_only(SYCL / name)), f"{name}: no abort() or _Exit( left; drop it from the list"
+```
+
+   Run: `python3 tests/test-sycl-fatal-exit-source.py`. Expected: `test_every_process_end_of_the_backend_settles_first`
+   FAILS and lists exactly ten sites: the watchdog's `std::_Exit(` at `common.cpp:774` and the nine `abort()` sites
+   of the file scope. (The lead ran this reader on `c36d1fbab`: it lists those ten, and none after the edit.) If it
+   lists any other site, stop and report it to the lead. `code_only` blanks string literals because three messages
+   in `common.cpp` contain the text `_Exit(`, and the existing `code_of` keeps strings.
+
+2. **Implement.** At each listed site insert `ggml_sycl::exit_settle();` as the statement directly before the
+   `abort()` or `_Exit(1)`, after any `fflush`. Example, `common.cpp:773-774`:
+
+```cpp
+            // _Exit bypasses atexit/destructors which might deadlock on stuck threads
+            ggml_sycl::exit_settle();
+            std::_Exit(1);
+```
+
+   Move the existing comment above both lines, as shown. In each of the five headers and in `pinned-pool.cpp` add
+   `#include "exit-settle.hpp"` with the file's other local includes. `ggml-sycl.cpp` includes `common.hpp`; add the
+   include there too rather than rely on a transitive one. In `tlsf-allocator.hpp:36` and `pending-range.hpp:118`
+   the `abort()` sits inside a multi-line macro: keep the trailing backslashes aligned and add the call on its own
+   macro line.
+
+3. Report for the lead: targets `ggml-sycl test-sycl-fatal-exit`, plus every test target that compiles one of the
+   five headers. Find them with
+   `cat ggml/src/ggml-sycl/CMakeLists.txt | grep -n -E 'kv-region-registry|kv-runtime-demotion|pending-range|tlsf|witnessed-mutex'`
+   and by the tests' own `#include` lines under `ggml/src/ggml-sycl/tests/`, and list the targets in the report.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the watchdog and the backend's aborts wait for the driver's rings before they end the process" -- \
+    ggml/src/ggml-sycl/common.cpp ggml/src/ggml-sycl/ggml-sycl.cpp ggml/src/ggml-sycl/pinned-pool.cpp \
+    ggml/src/ggml-sycl/kv-region-registry.hpp ggml/src/ggml-sycl/kv-runtime-demotion.hpp \
+    ggml/src/ggml-sycl/pending-range.hpp ggml/src/ggml-sycl/tlsf-allocator.hpp \
+    ggml/src/ggml-sycl/witnessed-mutex.hpp tests/test-sycl-fatal-exit-source.py
+```
+
+**Gotchas:**
+- `ggml-sycl.cpp` is about 130,000 lines and the codescout index is blind inside it. Find the two sites with
+  `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n 'std::abort()'`; the line numbers above move with every merge.
+- `witnessed-mutex.hpp` may be included where `ggml_sycl` is not the enclosing namespace. Always write the call fully
+  qualified, `ggml_sycl::exit_settle();`, never unqualified.
+- The pin's "directly preceded" rule is strict on purpose: a settle three statements earlier can be skipped by a
+  branch. If a site needs something between the two, report it instead of loosening the pin.
+- A changed header moves line numbers that `scripts/audit-sycl-static-storage.py --check` compares byte for byte.
+  Run it. If it reports the inventory stale, regenerate with `python3 scripts/audit-sycl-static-storage.py`, check
+  that only line numbers changed (`git diff --stat` and a read of the diff), and add the inventory file to the
+  commit.
+- No new test binary and no device run: this task is proved by the pin and by the build.
+
+---
+
+### Task W1.8: a ggml abort settles too
+
+**Track:** A
+**Depends on:** W1.6 (and W1.7, same files)
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/common.cpp`, `ggml/src/ggml-sycl/common.hpp` (one new function)
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp` (`ggml_backend_sycl_reg`, one call)
+- Modify: `ggml/src/ggml-sycl/tests/test-sycl-fatal-exit.cpp`, `ggml/src/ggml-sycl/CMakeLists.txt`, `tests/test-sycl-fatal-exit-source.py`
+
+**Description:**
+
+`GGML_ABORT` and `GGML_ASSERT` end in `abort()` inside `ggml_abort` (`ggml/src/ggml.c:253-273`), which the backend
+cannot edit. `ggml_abort` calls the abort callback first, on the asserting thread. The backend installs a callback
+when it registers: it does what the previous callback did (or prints the message and the backtrace), then settles.
+The CPU expert job registry's own callback (`unified-cache.cpp:19037-19075`) is installed later and only while a
+ring exists; it chains to whatever was installed before it, so it reaches this one.
+
+**Acceptance Criteria:**
+
+- [ ] `test-sycl-fatal-exit abort-settle` passes: the child ends by SIGABRT, prints its abort message, then the settle line, and takes at least 0.15 s with the variable at 150
+- [ ] `python3 tests/test-sycl-fatal-exit-source.py` passes with a check that `ggml_backend_sycl_reg` installs the callback, and a mutant test for it
+- [ ] `test-sycl-fatal-exit helper control classify capture settle settle-off settle-cap` still pass
+
+**Implementation Guide:**
+
+1. **Test first.** `test-sycl-fatal-exit.cpp`, child mode (before the `mmid` branch):
+
+```cpp
+    if (std::strcmp(mode, "abort-settle") == 0) {
+        // No core file: the abort is the test's subject, and a dump of it is of no use to anyone.
+        rlimit no_core{};
+        if (setrlimit(RLIMIT_CORE, &no_core) != 0) {
+            std::fprintf(stderr, "TEST-SETUP-FAILED setrlimit(RLIMIT_CORE): %s\n", std::strerror(errno));
+            return 4;
+        }
+        ggml_sycl_abort_settle_install();
+        GGML_ABORT("test: abort-settle mode");
+    }
+```
+
+   parent mode:
+
+```cpp
+    if (std::strcmp(mode, "abort-settle") == 0) {
+        // Without this the abort's backtrace starts a debugger that attaches to the child, and the debugger can
+        // hold the child's output pipe past the child's end.
+        setenv("GGML_NO_BACKTRACE", "1", 1);
+        setenv(k_settle_env, "150", 1);
+        const child_result r = run_child(self, mode);
+        unsetenv(k_settle_env);
+        unsetenv("GGML_NO_BACKTRACE");
+        if (const int rc = check_ended(mode, r)) {
+            return rc;
+        }
+        const size_t message_at = r.out.find("test: abort-settle mode");
+        const size_t settle_at  = r.out.find("[SYCL-FATAL] settle: waiting 150 ms");
+        if (r.signal != SIGABRT) {
+            return fail(mode, r, "the child did not end by SIGABRT");
+        }
+        if (message_at == std::string::npos || settle_at == std::string::npos || settle_at < message_at) {
+            return fail(mode, r, "the abort message must be printed, and the settle line after it");
+        }
+        return r.seconds < 0.15 ? fail(mode, r, "the child ended sooner than the settle time") : 0;
+    }
+```
+
+   Add `abort-settle` to both usage strings and to the host list in `CMakeLists.txt`.
+
+2. **Source pin first.**
+
+```python
+ABORT_INSTALL = "ggml_sycl_abort_settle_install();"
+
+
+def abort_settle_problems(reg_cpp: str, common_cpp: str) -> list:
+    """Why a GGML_ABORT in a process that uses the backend would not settle."""
+    problems = []
+    reg = reg_cpp.find("ggml_backend_reg_t ggml_backend_sycl_reg() {")
+    if reg < 0 or ABORT_INSTALL not in braced_block(reg_cpp, reg):
+        problems.append("ggml_backend_sycl_reg must call ggml_sycl_abort_settle_install()")
+    cb = common_cpp.find("static void ggml_sycl_abort_settle_callback(const char * message) {")
+    body = braced_block(common_cpp, cb) if cb >= 0 else ""
+    if not body.rstrip("} \n").endswith(SETTLE_CALL):
+        problems.append("ggml_sycl_abort_settle_callback must end with the settle, after the message is printed")
+    return problems
+
+
+def test_a_ggml_abort_settles():
+    problems = abort_settle_problems(code_of(SYCL / "ggml-sycl.cpp"), code_of(SYCL / "common.cpp"))
+    assert not problems, "\n".join(problems)
+
+
+def test_the_abort_reader_refuses_a_registration_without_the_install():
+    reg_cpp = code_of(SYCL / "ggml-sycl.cpp")
+    assert abort_settle_problems(reg_cpp.replace(ABORT_INSTALL, "", 1), code_of(SYCL / "common.cpp"))
+```
+
+   Expected before step 3: `test_a_ggml_abort_settles` FAILS with both problems.
+
+3. **Implement.** `common.hpp`, after the declaration of `ggml_sycl_fatal_exit`:
+
+```cpp
+// Makes GGML_ABORT and GGML_ASSERT wait like the fatal exit before abort() ends the process. Installs an abort
+// callback once; it runs the callback that was installed before it, or prints the message and the backtrace when
+// there was none, and then waits. Safe to call from every registration.
+void ggml_sycl_abort_settle_install() noexcept;
+```
+
+   `common.cpp`, after `ggml_sycl_device_lost_latched()`:
+
+```cpp
+static std::atomic<ggml_abort_callback_t> g_sycl_abort_settle_previous{ nullptr };
+static std::atomic<bool>                  g_sycl_abort_settle_installed{ false };
+
+static void ggml_sycl_abort_settle_callback(const char * message) {
+    const ggml_abort_callback_t previous = g_sycl_abort_settle_previous.load(std::memory_order_acquire);
+    if (previous) {
+        previous(message);
+    } else {
+        std::fprintf(stderr, "%s\n", message);
+        ggml_print_backtrace();
+    }
+    std::fflush(stderr);
+    ggml_sycl::exit_settle();
+}
+
+void ggml_sycl_abort_settle_install() noexcept {
+    if (g_sycl_abort_settle_installed.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    g_sycl_abort_settle_previous.store(ggml_set_abort_callback(ggml_sycl_abort_settle_callback),
+                                       std::memory_order_release);
+}
+```
+
+   `ggml_print_backtrace` is declared in `ggml-impl.h`; include it in `common.cpp` if it is not already included.
+   In `ggml-sycl.cpp`, `ggml_backend_sycl_reg()`, add the call as the first statement after
+   `ggml_sycl::prepare_unified_cache_for_module_use();`:
+
+```cpp
+    ggml_sycl_abort_settle_install();
+```
+
+4. **Inventory.** The two new statics are process-lifetime state. Run
+   `python3 scripts/audit-sycl-static-storage.py --check-classification` and `--check`; classify the two rows as the
+   script's message directs (same class as `g_sycl_device_lost_latched`), regenerate, and commit the inventory.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: a ggml abort waits for the driver's submission rings before the process ends" -- \
+    ggml/src/ggml-sycl/common.cpp ggml/src/ggml-sycl/common.hpp ggml/src/ggml-sycl/ggml-sycl.cpp \
+    ggml/src/ggml-sycl/tests/test-sycl-fatal-exit.cpp ggml/src/ggml-sycl/CMakeLists.txt \
+    tests/test-sycl-fatal-exit-source.py <the inventory file the audit names>
+```
+
+**Gotchas:**
+- Order inside the callback: message and backtrace first, settle last. A reader of a crashed run must see the
+  assert before a 200 ms pause, and the W1.7 pin does not cover this function (it ends in a return, not an abort).
+- The CPU job registry restores "the previous callback" when its last ring goes
+  (`cpu_job_signal_registry_prune`). Installed at registration, this callback is that previous one, so it survives.
+  Do not touch `unified-cache.cpp`.
+- An application that installs its own abort callback after the backend registered replaces this one. That is the
+  application's choice; say so in the function's comment only if you can keep it to one clause.
+- The `abort-settle` child must not initialise the backend: it calls the install function and aborts. A child that
+  called `ggml_backend_sycl_reg()` would enumerate every GPU of the host from a host test.
+- The W1.7 pin scans `common.cpp` for `abort(`: `ggml_abort_callback_t`, `ggml_set_abort_callback(` and
+  `ggml_sycl_abort_settle_callback(` must not match it. The pattern's `\b(?:std::)?abort\s*\(` does not match a
+  name that continues with `_`, but run the pin and read its output before you report.
+
+---
+
+### Lead task L2: the device check of the settle
+
+Run after W1.8 merges into `integ/th32` and the tree is rebuilt. B50, `GPU.lock`, preflight, one process at a time,
+12 s between processes, the kernel log read after every process, stop at the first `Schedule disable` or GT reset.
+
+1. Host modes: `helper control classify capture settle settle-off settle-cap abort-settle` pass; the source pin and
+   the registered Python gate set show no new failure against the base.
+2. The device modes `mmid op sync graph`, each 5 times in rotated order, default settle: 20 exits. **Pass:** no exit
+   leaves a `Fault response`, `Engine reset` or `CAT error` line.
+3. The positive control. The zero in step 2 means something only against exits without the wait. Which control is
+   used is the owner's decision at the review of this amendment (a fresh interleaved arm with the variable at 0
+   costs about one chance in six of a whole-GT reset on the B50; the alternative is this morning's 22 unsettled exits
+   on the same driver and the same modes).
+4. The Mistral completion gate and the GPT-OSS chat gate on the B50. One interleaved ABBA pair, Mistral Q4_0
+   `-p 512 -n 128`, against the tree before W1.6: no difference beyond the B50's spread (the settle is on failure
+   paths only).
+5. Results on llama.cpp-488x. The lead's rule "no device modes in lead scripts" ends when this passes.
+
+### Task W1.9: the comments say what the settle changed
+
+**Track:** A
+**Depends on:** L2
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/CMakeLists.txt:6616-6631` (the comment above the device modes)
+- Modify: `ggml/src/ggml-sycl/tests/test-sycl-fatal-exit.cpp:49-54` (the comment on `k_device_settle`)
+
+**Description:** Both comments describe kernel lines as the normal result of a fast exit. After L2 they are wrong.
+The lead gives the implementer L2's counts. The CMake comment keeps the history in two sentences (what an exit without
+the wait leaves, and that four of them a second apart once reset the GT), says that the fatal exit now waits and
+what L2 measured, and keeps the reason the label stays out of the sweep: a test the harness kills at its `TIMEOUT`
+gets no wait. The 12 s spacing and `k_device_settle` stay, and the comment says why: the wait covers the exits the
+backend owns, not a killed child.
+
+**Acceptance Criteria:**
+
+- [ ] Both comments state L2's measured counts and no longer present the kernel lines as expected
+- [ ] `python3 tests/test-sycl-fatal-exit-source.py` and `bash scripts/check-ctest-safety-net.sh --self-test` still pass (the spacing pin and the label are unchanged)
+
+**Commit:** `git commit -m "sycl: the fatal-exit test's comments describe the exit as it is now" -- ggml/src/ggml-sycl/CMakeLists.txt ggml/src/ggml-sycl/tests/test-sycl-fatal-exit.cpp`
+
+**Gotchas:**
+- Prose only. No code line, no label and no constant changes; the lead checks the diff by script.
+- Comments cite the reason and the measurement, never a ticket id or a task number.
+
+### End-to-end validation of the amendment
+
+L2 is the validation: the finished binaries, on the B50, ending real processes through the fast exit, with the
+kernel log as the observation. **Observed success:** 20 settled exits with no kernel GPU line, the control arm the
+owner chose showing lines, both correctness gates passing, and the record on llama.cpp-488x.
