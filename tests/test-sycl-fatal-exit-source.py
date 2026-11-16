@@ -55,7 +55,7 @@ def test_fatal_exit_is_defined_after_the_watchdog():
 def test_fatal_exit_ends_in_exit_without_host_cleanup():
     cpp = code_of(SYCL / "common.cpp")
     helper = cpp.find("void ggml_sycl_fatal_exit(int code, const char * message) noexcept {")
-    body = cpp[helper:helper + 900] if helper >= 0 else ""
+    body = braced_block(cpp, helper) if helper >= 0 else ""
     assert "std::_Exit(code);" in body and "ggml_sycl_cleanup_host_allocations" not in body, (
         "common.cpp: ggml_sycl_fatal_exit must end in std::_Exit(code) and not call the host cleanup"
     )
@@ -321,6 +321,67 @@ def test_the_capture_is_linux_only():
     assert inner.startswith("#if defined(__linux__)") and inner.endswith("#endif"), (
         "common.cpp: the body of ggml_sycl_fatal_capture must sit inside #if defined(__linux__): it reads /proc/self"
     )
+
+
+SETTLE_CALL = "ggml_sycl::exit_settle();"
+
+
+def fatal_exit_settle_problems(cpp: str) -> list:
+    """Why ggml_sycl_fatal_exit does not settle as its last step before the exit."""
+    at = cpp.find(FATAL_EXIT_DEF)
+    if at < 0:
+        return ["common.cpp: ggml_sycl_fatal_exit is missing"]
+    body = braced_block(cpp, at)
+    signal_at = body.find("ggml_sycl::cpu_job_signal_signal_all();")
+    settle_at = body.find(SETTLE_CALL)
+    exit_at = body.find("std::_Exit(code);")
+    problems = []
+    if body.count(SETTLE_CALL) != 1 or not 0 <= signal_at < settle_at < exit_at:
+        problems.append("ggml_sycl_fatal_exit must call ggml_sycl::exit_settle() once, after it released the CPU "
+                        "expert jobs and before std::_Exit(code): a ring parked on such a job is not idle")
+    elif body[settle_at + len(SETTLE_CALL):exit_at].strip():
+        problems.append("ggml_sycl_fatal_exit: nothing may stand between the settle and std::_Exit(code)")
+    return problems
+
+
+def test_the_fatal_exit_settles_last():
+    problems = fatal_exit_settle_problems(code_of(SYCL / "common.cpp"))
+    assert not problems, "\n".join(problems)
+
+
+def test_the_settle_reader_refuses_a_settle_before_the_job_release():
+    cpp = code_of(SYCL / "common.cpp")
+    body = braced_block(cpp, cpp.find(FATAL_EXIT_DEF))
+    moved = body.replace(SETTLE_CALL, "", 1).replace("ggml_sycl::cpu_job_signal_signal_all();",
+                                                     SETTLE_CALL + "\n    ggml_sycl::cpu_job_signal_signal_all();", 1)
+    assert fatal_exit_settle_problems(cpp.replace(body, moved, 1)), "the reader accepted a settle before the release"
+
+
+SETTLE_INCLUDES = ("<cerrno>", "<chrono>", "<climits>", "<cstdio>", "<cstdlib>", "<thread>")
+INCLUDE = re.compile(r"^\s*#\s*include\s*([<\"][^>\"]+[>\"])", flags=re.M)
+
+
+def settle_header_problems(hpp: str) -> list:
+    """Why exit-settle.hpp could reach a device: it may include only the standard headers a sleep and a print need,
+    so no queue, event or wait of the backend or of SYCL is in reach, through any include."""
+    found = INCLUDE.findall(hpp)
+    problems = [f"exit-settle.hpp: #include {name} is not allowed: the settle may only sleep and print"
+                for name in found if name not in SETTLE_INCLUDES]
+    problems += [f"exit-settle.hpp: #include {name} is missing" for name in SETTLE_INCLUDES if name not in found]
+    return problems
+
+
+def test_the_settle_touches_no_device():
+    problems = settle_header_problems(code_of(SYCL / "exit-settle.hpp"))
+    assert not problems, "\n".join(problems)
+
+
+@pytest.mark.parametrize("extra", ['#include "ggml-backend.h"', "#include <sycl/sycl.hpp>"])
+def test_the_settle_header_reader_refuses_a_backend_include(extra):
+    hpp = code_of(SYCL / "exit-settle.hpp")
+    problems = settle_header_problems(hpp.replace("#include <thread>", "#include <thread>\n" + extra, 1))
+    name = extra.split(None, 1)[1]
+    assert any(name in p for p in problems), f"the reader accepted {extra}"
 
 
 if __name__ == "__main__":

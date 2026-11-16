@@ -13,6 +13,7 @@
 #include "common.hpp"
 
 #include "ccl-comm.hpp"
+#include "exit-settle.hpp"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "unified-cache.hpp"
@@ -890,6 +891,7 @@ void ggml_sycl_fatal_exit(int code, const char * message) noexcept {
     // audit an exit handler would have printed (nothing unless GGML_SYCL_ZONE_RESET_AUDIT is set).
     ggml_sycl::cpu_job_signal_signal_all();
     ggml_sycl::zone_reset_audit_report("sycl-fatal-exit");
+    ggml_sycl::exit_settle();
     std::_Exit(code);
 }
 
