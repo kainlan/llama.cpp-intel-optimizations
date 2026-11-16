@@ -7,7 +7,8 @@ cannot see:
 1. the stage's planner calls are DERIVED from the stage's own source: the calls in
    `compute_and_store_plan_for_inventory` to a function unified-cache.hpp declares returning `placement_plan`, and the
    calls in `ggml_sycl_configure_host_zones_for_plan` to one declared returning `host_zone_commit_terms`; every planner
-   so found records its host terms through `populate_host_zone_sizing` and `record_host_ledger_plan`;
+   so found records its host terms through `placement_plan_size_host_side`, which calls `populate_host_zone_sizing`
+   and `record_host_ledger_plan`;
 2. the dry run (the export and every `ggml_sycl_plan_dry_run*` helper) calls each of those functions, takes the WEIGHT
    terms from `placement_plan_host_weight_zone_terms`, reports expected_host as the plan's `host_planned_bytes`, sizes
    the commit terms from the plan's own `host_zone_terms` inputs, and shares the stage's inventory and budget helpers
@@ -27,9 +28,9 @@ cannot see:
 6. the extraction changes no behaviour: the load's early plan is the builder and the apply, the builder takes the
    steps the early plan took in the order it took them, and the load's pre-fill helper calls the record pre-fill;
 7. the dry run leaves no trace: every per-device planner global the stage planners write (in their recording
-   definitions and the static functions those reach within two calls) or the shared planner-input publish writes is
-   written again by the destructor of the dry run's saved state, so a later load reads what it would have read
-   without the dry run;
+   definitions, the host-side sequence, and the static functions those reach within two calls) or the shared
+   planner-input publish writes is written again by the destructor of the dry run's saved state, so a later load
+   reads what it would have read without the dry run;
 8. the residency decision's §10 plan lines, which the dry run's planner call prints, carry every field T3 can print,
    each from the plan's own terms: a STORAGE [PLACEMENT] line its cache's index bytes, a HOST one the host budget,
    the planned bytes and the leftover, and the [HOST-PLAN] lazy line the budget's source, the host weights, the WEIGHT
@@ -204,13 +205,24 @@ def test_the_derivation_sees_a_planner_call_and_ignores_a_comment():
     assert called_from(body(src, "f"), declared_returning(hpp, "placement_plan")) == {"compute_a"}
 
 
+# The one sequence that ends both builders: it sizes the host zones and records the ledger for the finished plan.
+HOST_SIDE = "placement_plan_size_host_side"
+
+
+def recording_bodies(cpp: str, planner: str) -> list:
+    """The planner's definitions that end with the host-side sequence."""
+    return [b for b in definitions(cpp, planner) if calls(b, HOST_SIDE)]
+
+
 def test_every_stage_planner_records_its_host_terms():
     cpp = read(SYCL / "unified-cache.cpp")
+    helper = definitions(cpp, HOST_SIDE)
+    assert len(helper) == 1, f"{len(helper)} definitions of {HOST_SIDE}, want 1"
+    for name in ("populate_host_zone_sizing", "record_host_ledger_plan"):
+        assert calls(helper[0], name), f"{HOST_SIDE} does not call {name}"
     for planner in stage_planners():
-        bodies = definitions(cpp, planner)
-        assert bodies, f"no definition of {planner}"
-        recording = [b for b in bodies if calls(b, "populate_host_zone_sizing") and calls(b, "record_host_ledger_plan")]
-        assert recording, f"no definition of {planner} calls populate_host_zone_sizing and record_host_ledger_plan"
+        assert definitions(cpp, planner), f"no definition of {planner}"
+        assert recording_bodies(cpp, planner), f"no definition of {planner} calls {HOST_SIDE}"
 
 
 # ---- 2. the dry run calls the same functions ----
@@ -1082,13 +1094,16 @@ def static_callees(cpp: str, text: str) -> list:
 
 
 def planner_written_setters() -> set:
-    """The setters the stage planners call while they plan: in their recording definitions and in the file's static
-    functions those reach within two calls (the host sizing, the host scatter term and what they call)."""
+    """The setters the stage planners call while they plan: in their recording definitions, in the host-side sequence
+    they end with, and in the file's static functions those reach within two calls (the host sizing, the host scatter
+    term and what they call)."""
     cpp = read(SYCL / "unified-cache.cpp")
     texts, seen = [], set()
     frontier = []
     for planner in stage_planners():
-        frontier.extend(b for b in definitions(cpp, planner) if calls(b, "populate_host_zone_sizing"))
+        frontier.extend(recording_bodies(cpp, planner))
+    # The host-side sequence is the builders' recording step, so the walk starts in it too.
+    frontier.extend(definitions(cpp, HOST_SIDE))
     texts.extend(frontier)
     for _ in range(2):
         nxt = []

@@ -1796,6 +1796,38 @@ struct placement_plan {
         return true;
     }
 
+    // Says whose memory an expert's host bytes live in now, and moves its file bytes between the backings' terms so
+    // each term stays equal to a recount in O(1). The loan transaction calls it beside update_expert_placement: a lent
+    // expert's host copy is a pinned block the transaction minted, whatever backed the entry while it was on the
+    // device, and a re-admitted one is staged from the load's own source again.
+    bool set_expert_host_backing(int layer_id, int expert_id, expert_tensor_role role, placement_host_backing backing) {
+        const expert_placement_key key{ layer_id, expert_id, role };
+        auto                       it = expert_placement_index_.find(key);
+        if (it == expert_placement_index_.end()) {
+            return false;
+        }
+
+        placement_entry & e = entries[it->second];
+        if (e.host_backing == backing) {
+            return true;
+        }
+        if (e.on_device) {
+            // A device-planned entry is charged to no host term. Its file bytes count as a mapped staging source
+            // exactly while its backing is FILE_MAPPED.
+            if (e.host_backing == placement_host_backing::FILE_MAPPED) {
+                saturating_sub(host_mapped_source_bytes, e.src_size);
+            }
+            if (backing == placement_host_backing::FILE_MAPPED) {
+                host_mapped_source_bytes += e.src_size;
+            }
+        } else {
+            uncharge_host_weight(e.host_backing, e.src_size);
+            charge_host_weight(backing, e.src_size);
+        }
+        e.host_backing = backing;
+        return true;
+    }
+
     bool demote_expert_placement_to_host(const std::string & tensor_name, int expert_id) {
         const int                layer_id = expert_layer_from_tensor_name(tensor_name.c_str());
         const expert_tensor_role role     = expert_tensor_role_from_tensor_name(tensor_name.c_str());
@@ -2505,6 +2537,13 @@ size_t lifecycle_plan_lease_count_for_test();
 // after the unlock.
 void lifecycle_plan_clear_for_test();
 #endif
+
+// The opt-out of the single-device planner's pin of routed host experts on a load that maps files:
+// GGML_SYCL_MOE_PIN_HOST_EXPERTS=0 keeps them mapped. placement_pin_host_experts_enabled() is its one reader. It reads
+// the environment on every call, so a plan made after the variable changes sees it, and ggml_check_sycl reports the
+// value through it.
+static constexpr const char * MOE_PIN_HOST_EXPERTS_ENV = "GGML_SYCL_MOE_PIN_HOST_EXPERTS";
+bool                          placement_pin_host_experts_enabled();
 
 // Compute placement plan for all model weights given a VRAM budget.
 // tensor_inventory: vector of (name, src_size) pairs from model header.

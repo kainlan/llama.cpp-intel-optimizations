@@ -29,7 +29,8 @@ What this gate pins:
     boundary runner's REFUSED count. A loan this prompt asked for that comes back REFUSED (never BUSY, which the runner
     re-posts) latches until end_prompt, with one WARN under an explicit ring or a trace;
   - a layer answering RING_UNAVAILABLE under an explicit ring or a trace prints one WARN per prompt that names the rule
-    (the first is the executor's claim, "executor does not claim") and the ring's inputs, in a fixed format, through the
+    (the first is a layer only the plan's backing keeps from the executor, "host experts left mapped by the plan",
+    then the executor's claim, "executor does not claim") and the ring's inputs, in a fixed format, through the
     decision log's WARN sink; the flag is cleared by end_prompt and never per micro-batch (lead ruling c-kcyf), and the
     phase logs nothing else of its own but the refused-loan line, under the same gating;
   - begin_layer reports every layer it decides, under every policy, so the decision log keeps the cost model's choice;
@@ -960,9 +961,16 @@ ROUTE_CONSUMER_REFUSAL = "if (s != nullptr && s->consumer == moe_stream_consumer
 LAYER_WEIGHT_SIG = ("static const ggml_tensor * ggml_sycl_moe_stream_layer_weight(int layer, "
                     "ggml_sycl::expert_tensor_role role)")
 ITEM_DEFAULT_NONE = "moe_stream_staging staging = moe_stream_staging::NONE;"
+# The ring copies a host expert only out of pinned memory, so a host entry the plan left mapped never stages; an entry
+# on the device (one a loan's sizing reads as host) stages as before. The claim is asked for every matrix one AOS slot
+# holds, mapped or not, so a mapped matrix the executor would claim is counted instead of staged.
+INDEX_MAPPED_HOST = ("const bool mapped_host = !e.on_device && "
+                     "!placement_plan::host_backing_sizes_weight_zone(e.host_backing);")
 INDEX_CLAIM_GUARD = "if (library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {"
 INDEX_CLAIM_ASK = "c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;"
-INDEX_CLAIM_APPLY = ("if (c->second) { item.staging = moe_stream_staging::AOS_ONLY; "
+INDEX_CLAIM_RECORD = "claimed = c->second;"
+INDEX_MAPPED_COUNT = "if (claimed && mapped_host) { ++li.n_mapped_host; }"
+INDEX_CLAIM_APPLY = ("else if (claimed) { item.staging = moe_stream_staging::AOS_ONLY; "
                      "item.consumer = moe_stream_consumer::EXECUTOR; }")
 INDEX_SLOT_SKIP = "if (item.staging == moe_stream_staging::NONE) { continue; }"
 
@@ -989,8 +997,9 @@ def claim_claimed_weight_stages_for_the_executor(sycl: str, hpp: str, phase: str
             and ("moe_stream_library_claims_fn library_claims, const moe_stream_window_hints & hints, "
                  "const std::unordered_set<uint64_t> * as_host = nullptr)") in h
             and ITEM_DEFAULT_NONE in body(h, "struct moe_stream_item")
-            and ordered(build, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_APPLY, "li.items.push_back(item);",
-                        INDEX_SLOT_SKIP, STREAMABLE_COUNT, ROLE_COUNT)
+            and ordered(build, INDEX_MAPPED_HOST, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_RECORD,
+                        INDEX_MAPPED_COUNT, INDEX_CLAIM_APPLY,
+                        "li.items.push_back(item);", INDEX_SLOT_SKIP, STREAMABLE_COUNT, ROLE_COUNT)
             and build.count("item.staging = ") == 1
             and h.count("library_claims(graph_ctx") == 1
             and INDEX_CALL in body(p, PREPARE_SIG) and p.count("library_claims(") == 0)
@@ -1025,10 +1034,11 @@ def test_library_claim_mutants():
     # The route serves the executor's entries, so a library-free reader is no longer the only one it hands them to.
     assert not c(mutate(SYCL, ROUTE_CONSUMER_REFUSAL, "if (false) {"), PLAN_HPP, PHASE)
     # The build asks and ignores the answer.
-    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "else if (claimed) { }"), PHASE)
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_RECORD, "claimed = false;"), PHASE)
     # A claimed matrix whose consumer stays the route's: the route would refuse nothing and serve it.
     assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY,
-                              "if (c->second) { item.staging = moe_stream_staging::AOS_ONLY; }"), PHASE)
+                              "else if (claimed) { item.staging = moe_stream_staging::AOS_ONLY; }"), PHASE)
     # A matrix the executor does not claim staged anyway, by default or by a second answer.
     assert not c(SYCL, mutate(PLAN_HPP, ITEM_DEFAULT_NONE,
                               "moe_stream_staging staging = moe_stream_staging::AOS_ONLY;"), PHASE)
@@ -1039,6 +1049,15 @@ def test_library_claim_mutants():
     # not the authority.
     assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_GUARD,
                               "if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {"), PHASE)
+    # A host expert the plan left mapped staged anyway: the ring would be sized for an expert the stager skips.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_MAPPED_COUNT, "if (false) { ++li.n_mapped_host; }"), PHASE)
+    # The claim not asked for a mapped matrix: the count could not tell a layer the executor refuses from one only the
+    # plan's backing keeps from it.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_GUARD, "if (!mapped_host && " + INDEX_CLAIM_GUARD[len("if ("):]),
+                 PHASE)
+    # mapped_host read without the residency: a device entry whose backing is its mapping (its staging source), which
+    # a loan's sizing reads as host, would never be asked.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_MAPPED_HOST, INDEX_MAPPED_HOST.replace("!e.on_device && ", "")), PHASE)
     # The claim applied after the slot accounting, so a claimed matrix would take no slot.
     late = mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "")
     late = mutate(late, "++li.n_streamable;", "++li.n_streamable; " + INDEX_CLAIM_APPLY)
@@ -1928,8 +1947,20 @@ DIAG_RULE_CALL = "moe_stream_ring_unavailable_rule(index_, li, geo_, in_order_, 
 WARN_SIG = ("void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, "
             "const moe_stream_layer_info & li)")
 RULE_SIG = "static inline const char * moe_stream_ring_unavailable_rule("
+# The rule names the plan only where its backing alone keeps a layer from the executor: some matrix is mapped, no fused
+# entry refuses the layer, and every matrix the ring does not stage is a mapped one the executor would claim (the index
+# counts those, INDEX_MAPPED_COUNT). Each term of the helper is one way to be wrong about that.
+MAPPED_ONLY_SIG = "static inline bool moe_stream_layer_mapped_only(const moe_stream_layer_info & li)"
+MAPPED_ONLY_ANY = "li.n_mapped_host != 0"
+MAPPED_ONLY_UNTRIPLET = " && li.n_untriplet == 0"
+MAPPED_ONLY_ALL_COUNTED = (" && li.items.size() == static_cast<size_t>(li.n_streamable) + "
+                           "static_cast<size_t>(li.n_mapped_host)")
+MAPPED_ONLY_BODY = "{ return " + MAPPED_ONLY_ANY + MAPPED_ONLY_UNTRIPLET + MAPPED_ONLY_ALL_COUNTED + "; }"
+MAPPED_RULE = 'if (moe_stream_layer_mapped_only(li)) { return "host experts left mapped by the plan"; }'
+CLAIM_RULE = 'if (!moe_stream_layer_claimed(li)) { return "executor does not claim"; }'
 # Each rule's condition, then its name, in the order the helper tests them.
 RULE_ORDER = (
+    "moe_stream_layer_mapped_only(li)", '"host experts left mapped by the plan"',
     "!moe_stream_layer_claimed(li)", '"executor does not claim"',
     "idx.host_matrices_per_layer_max == 0", '"no host matrices of a streamable type"',
     "idx.matrix_bytes_max == 0", '"no matrix bytes"',
@@ -1949,11 +1980,18 @@ WARN_CALL = ("if (st.decision.reason == moe_exec_reason::RING_UNAVAILABLE) { "
 def claim_ring_unavailable_diagnostic(phase: str, hpp: str, tree: dict) -> bool:
     """Lead ruling c-kcyf: a ring-unavailable answer is explained in the log. The fixed format exists once in the
     backend, carries the rule the helper names and the ring's inputs, and goes out through the decision log's WARN sink;
-    the helper names each rule right after testing its condition, in a fixed order, the executor's claim first (W2: a
-    layer the executor does not claim has no ring to explain)."""
+    the helper names each rule right after testing its condition, in a fixed order: a layer only the plan's backing
+    keeps from the executor first (the plan's choice is the cause there), then the executor's claim (W2: a layer the
+    executor does not claim has no ring to explain). The index build asks the claim for a mapped matrix too and counts
+    it, once, only when the executor would claim it."""
     w = body(norm(phase), WARN_SIG)
+    h = norm(hpp)
     count = sum(norm(text).count(DIAG_FMT) for text in tree.values())
     return (count == 1 and ordered(w, DIAG_FMT, DIAG_RULE_CALL, DIAG_ARGS, DIAG_EMIT)
+            and h.count("++li.n_mapped_host;") == 1
+            and ordered(body(h, INDEX_BUILD_SIG), INDEX_MAPPED_HOST, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK,
+                        INDEX_CLAIM_RECORD, INDEX_MAPPED_COUNT)
+            and h.count(MAPPED_ONLY_SIG) == 1 and body(h, MAPPED_ONLY_SIG) == MAPPED_ONLY_BODY
             and ordered(body(norm(hpp), RULE_SIG), *RULE_ORDER))
 
 
@@ -1993,8 +2031,28 @@ def test_ring_unavailable_diagnostic_mutants():
         PHASE, mutate(PLAN_HPP, '"ring exceeds an eleventh of resident plus lent expert bytes"',
                       '"ring exceeds 10% of resident expert bytes"'), SYCL_TREE)
     # The claim rule dropped, or asked after the ring's rules that it would otherwise be reported as.
-    claim_rule = 'if (!moe_stream_layer_claimed(li)) { return "executor does not claim"; }'
+    claim_rule = CLAIM_RULE
     assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, claim_rule, ""), SYCL_TREE)
+    # The mapped rule dropped: a layer whose host experts the plan left mapped would read "executor does not claim".
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, MAPPED_RULE, ""), SYCL_TREE)
+    # The mapped rule asked after the claim rule, which a mapped layer always fails first, so it would never be named.
+    after_claim = mutate(PLAN_HPP, MAPPED_RULE, "")
+    after_claim = mutate(after_claim, CLAIM_RULE, CLAIM_RULE + " " + MAPPED_RULE)
+    assert not claim_ring_unavailable_diagnostic(PHASE, after_claim, SYCL_TREE)
+    # The count never taken: the mapped rule could never hold.
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, INDEX_MAPPED_COUNT, ""), SYCL_TREE)
+    # The claim not asked for a mapped matrix: nothing would be counted, so the plan would never be named.
+    no_ask = mutate(PLAN_HPP, INDEX_CLAIM_GUARD, "if (!mapped_host && " + INDEX_CLAIM_GUARD[len("if ("):])
+    assert not claim_ring_unavailable_diagnostic(PHASE, no_ask, SYCL_TREE)
+    # The count taken without the claim: a mapped layer the executor refuses would be blamed on the plan.
+    assert not claim_ring_unavailable_diagnostic(
+        PHASE, mutate(PLAN_HPP, INDEX_MAPPED_COUNT, "if (mapped_host) { ++li.n_mapped_host; }"), SYCL_TREE)
+    # The helper without its untriplet term: a mapped layer with a fused entry the ring cannot stage would be blamed on
+    # the plan, though pinning would not make the executor take it.
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, MAPPED_ONLY_UNTRIPLET, ""), SYCL_TREE)
+    # The helper without its all-unstaged-are-counted term: a layer with one role the executor refuses would be
+    # blamed on the plan.
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, MAPPED_ONLY_ALL_COUNTED, ""), SYCL_TREE)
     late = mutate(PLAN_HPP, claim_rule, "")
     late = mutate(late, 'return "region smaller than the largest streamable matrix";',
                   claim_rule + ' return "region smaller than the largest streamable matrix";')

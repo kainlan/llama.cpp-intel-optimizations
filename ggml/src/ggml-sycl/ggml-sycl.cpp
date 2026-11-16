@@ -431,6 +431,9 @@ int g_ggml_sycl_moe_pp_f16_group_experts_max = 0;
 // GGML_SYCL_MOE_EXEC_DECLINE_LAYER as the report's integer (llama.cpp-ny6i), SET from
 // ggml_sycl_moe_exec_decline_layer() after the table parse: -1 is no layer.
 int g_ggml_sycl_moe_exec_decline_layer       = -1;
+// GGML_SYCL_MOE_PIN_HOST_EXPERTS as the report's integer, SET from ggml_sycl::placement_pin_host_experts_enabled()
+// after the table parse: 1 pins a mapping load's routed host experts for the window ring, 0 keeps them mapped.
+int g_ggml_sycl_moe_pin_host_experts         = 1;
 
 int g_ggml_sycl_disable_dnn      = 0;
 int g_ggml_sycl_prioritize_dmmv  = 0;
@@ -22841,6 +22844,13 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
                 const ggml_sycl::expert_placement_key & k = placed[r];
                 (void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, /*on_device=*/refill,
                                                           refill ? device : -1);
+                // The plan says whose memory the host bytes are. A lent member's are the pinned copy this transaction
+                // minted. A re-admitted member is staged from the load's own source again: the mapping when the load
+                // maps files. The ring's plan index reads this to decide what it can stage.
+                (void) next_plan->set_expert_host_backing(k.layer_id, k.expert_id, k.role,
+                                                          refill && next_plan->host_backing_maps_files ?
+                                                              ggml_sycl::placement_host_backing::FILE_MAPPED :
+                                                              ggml_sycl::placement_host_backing::PINNED);
             }
             if (refill) {
                 ledger.triplets.pop_back();
@@ -26104,6 +26114,102 @@ std::string test_expert_refill_returns_a_partial_bulk_refills_leftovers_per_grap
 
 std::string test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph() {
     return test_expert_bulk_refill_short_room_case(/*model_id=*/0x69346e7905ull, /*room_for_one=*/false);
+}
+
+std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned() {
+    // A mapping load leaves every device expert entry FILE_MAPPED, its staging source. The loan copies a lent triplet
+    // into pinned host memory, so the plan it publishes must say PINNED there, or the ring's plan index reads the
+    // triplet as left in its mapping and stages none of it. A refill stages from the load's source again. The second
+    // pass is a plan that maps nothing, where every backing is PINNED throughout.
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x6131306201ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    // Every member of the triplet the loan takes (layer 1 expert 2, the plan's tail) as the published plan has it, and
+    // the plan's mapped staging source: `mapped` device-planned FILE_MAPPED entries of the fixture's expert size, and
+    // equal to a recount of a copy, since the transaction moves the term per member without one.
+    auto members_read = [&](bool on_device, placement_host_backing want, size_t mapped, const char * when) {
+        const auto             published = ::ggml_sycl_global_plan_snapshot();
+        const placement_plan * plan      = published ? published->plan.get() : nullptr;
+        if (!plan) {
+            return test_loan_fail("%s: no plan published", when);
+        }
+        placement_plan recounted = *plan;
+        recounted.recount_host_mapped_source_bytes();
+        if (plan->host_mapped_source_bytes != recounted.host_mapped_source_bytes ||
+            plan->host_mapped_source_bytes != mapped * test_loan_expert_bytes()) {
+            return test_loan_fail("%s: the mapped source is %zu bytes, a recount %zu, not %zu", when,
+                                  plan->host_mapped_source_bytes, recounted.host_mapped_source_bytes,
+                                  mapped * test_loan_expert_bytes());
+        }
+        for (int s = 0; s < 3; ++s) {
+            const placement_entry * e = plan->find_expert_entry(1, 2, test_loan_fixture::role(s));
+            if (!e || e->on_device != on_device || e->host_backing != want) {
+                return test_loan_fail(
+                    "%s: layer 1 expert 2 slot %d reads on_device=%d backing=%d, not on_device=%d backing=%d "
+                    "(PINNED 0, FILE_MAPPED 1)",
+                    when, s, e ? (int) e->on_device : -1, e ? (int) e->host_backing : -1, (int) on_device, (int) want);
+            }
+        }
+        return std::string();
+    };
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+    for (const bool maps_files : { true, false }) {
+        const placement_host_backing source =
+            maps_files ? placement_host_backing::FILE_MAPPED : placement_host_backing::PINNED;
+        placement_plan plan          = fx.plan(/*host_expert=*/3);
+        plan.host_backing_maps_files = maps_files;
+        for (placement_entry & e : plan.entries) {
+            e.host_backing = e.on_device ? source : e.host_backing;
+        }
+        // A builder recounts the source once the backings are set: on the mapping pass the 18 device entries.
+        plan.recount_host_mapped_source_bytes();
+        ::ggml_sycl_publish_test_plan(std::move(plan));
+        // On the mapping pass this is the control: the triplet is on the device and reads FILE_MAPPED before the loan.
+        // On the pass that maps nothing PINNED is the default, so it cannot fail there: that pass asserts the backings
+        // a plan that maps nothing published before, unchanged, and is not a control.
+        const size_t mapped = maps_files ? 18 : 0;
+        if (std::string why = members_read(true, source, mapped, "before the loan"); !why.empty()) {
+            return why;
+        }
+        if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3); !why.empty()) {
+            return why;
+        }
+        const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
+        if (lent.size() != 1 || lent[0] != std::make_pair(1, 2)) {
+            return test_loan_fail("the loan lent %zu triplets, not layer 1 expert 2 alone", lent.size());
+        }
+        // The lent three leave the source: their bytes are the pinned copies now.
+        const size_t mapped_lent = maps_files ? 15 : 0;
+        if (std::string why = members_read(false, placement_host_backing::PINNED, mapped_lent, "after the loan");
+            !why.empty()) {
+            return why;
+        }
+        const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+        ::ggml_sycl_expert_loan_result         result;
+        const uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+        if (!result.accepted || result.n_triplets != 1 || remaining != 0) {
+            return test_loan_fail("the refill re-admitted %u triplets with %u remaining (%s), not 1 and 0",
+                                  result.n_triplets, remaining, result.reason);
+        }
+        if (std::string why = members_read(true, source, mapped, "after the refill"); !why.empty()) {
+            return why;
+        }
+        // As the cancelled-refill case does before it lends a re-admitted triplet again.
+        if (std::string why = fx.readmitted(1, 2); !why.empty()) {
+            return why;
+        }
+        if (!drain_retained_handles(true, 5000)) {
+            return "the refill's retained owners did not drain";
+        }
+    }
+    return {};
 }
 
 }  // namespace ggml_sycl
@@ -35257,6 +35363,9 @@ static void ggml_check_sycl() try {
             // The forced-decline debugging knob (llama.cpp-ny6i), likewise overwritten from its accessor, which refuses
             // a layer this integer parse would take.
             { GGML_SYCL_MOE_EXEC_DECLINE_LAYER_ENV, &g_ggml_sycl_moe_exec_decline_layer, -1 },
+            // The planner's pin of a mapping load's routed host experts, likewise overwritten from its one reader,
+            // which the planner calls on every plan.
+            { ggml_sycl::MOE_PIN_HOST_EXPERTS_ENV, &g_ggml_sycl_moe_pin_host_experts, 1 },
             // clang-format on
         };
 
@@ -35269,6 +35378,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_moe_pp_f16_batched_aos       = ggml_sycl_moe_pp_f16_batched_aos_enabled() ? 1 : 0;
         g_ggml_sycl_moe_pp_f16_group_experts_max = static_cast<int>(ggml_sycl_moe_pp_f16_group_experts_max());
         g_ggml_sycl_moe_exec_decline_layer       = ggml_sycl_moe_exec_decline_layer();
+        g_ggml_sycl_moe_pin_host_experts         = ggml_sycl::placement_pin_host_experts_enabled() ? 1 : 0;
 
         // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
         // which makes graph replay meaningless — the graph is submitted as a

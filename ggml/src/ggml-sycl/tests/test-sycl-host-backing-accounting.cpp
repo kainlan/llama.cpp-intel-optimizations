@@ -271,6 +271,46 @@ static void test_an_expert_moving_between_tiers_follows_its_backing() {
     }
 }
 
+static void test_a_lent_expert_reads_pinned_until_it_is_refilled() {
+    printf("(i) set_expert_host_backing moves one entry's bytes between its backings' terms\n");
+    placement_plan plan{};
+    plan.host_backing_maps_files = true;
+    plan.entries.push_back(
+        make_entry("blk.0.ffn_gate_exps.weight", 64 * MiB, 80 * MiB, placement_host_backing::FILE_MAPPED, true, 0, 5));
+    plan.entries[0].vram_charge_size = 80 * MiB;
+    plan.entries[0].target_device    = 0;
+    plan.weight_vram_bytes           = 80 * MiB;
+    plan.vram_bytes                  = 80 * MiB;
+    plan.build_index();
+    plan.recount_host_mapped_source_bytes();
+    const expert_tensor_role gate = expert_tensor_role::GATE;
+
+    // The loan: the transaction flips the entry to the host, then says its copy is pinned.
+    check_true("lend: flip", plan.update_expert_placement(0, 5, gate, false, -1));
+    check_true("lend: backing", plan.set_expert_host_backing(0, 5, gate, placement_host_backing::PINNED));
+    check_true("lent: the entry reads PINNED", plan.entries[0].host_backing == placement_host_backing::PINNED);
+    check_eq("lent: weight_host", plan.weight_host_bytes, 64 * MiB);
+    check_eq("lent: host_mapped", plan.host_mapped_bytes, 0);
+    check_eq("lent: host_bytes", plan.host_bytes, 64 * MiB);
+    check_eq("lent: no mapped source", plan.host_mapped_source_bytes, 0);
+
+    // The refill: back on the device, it is staged from the mapping again.
+    check_true("refill: flip", plan.update_expert_placement(0, 5, gate, true, 0));
+    check_true("refill: backing", plan.set_expert_host_backing(0, 5, gate, placement_host_backing::FILE_MAPPED));
+    check_true("refilled: FILE_MAPPED", plan.entries[0].host_backing == placement_host_backing::FILE_MAPPED);
+    check_eq("refilled: weight_host", plan.weight_host_bytes, 0);
+    check_eq("refilled: host_bytes", plan.host_bytes, 0);
+    check_eq("refilled: weight_vram", plan.weight_vram_bytes, 80 * MiB);
+    check_eq("refilled: the mapped source again", plan.host_mapped_source_bytes, 64 * MiB);
+    plan.recount_host_mapped_source_bytes();
+    check_eq("refilled: the running source equals a recount", plan.host_mapped_source_bytes, 64 * MiB);
+
+    // The same backing again changes nothing, and an expert the plan does not hold is refused.
+    check_true("no-op", plan.set_expert_host_backing(0, 5, gate, placement_host_backing::FILE_MAPPED));
+    check_eq("no-op: the mapped source", plan.host_mapped_source_bytes, 64 * MiB);
+    check_true("unknown expert", !plan.set_expert_host_backing(0, 6, gate, placement_host_backing::PINNED));
+}
+
 int main() {
     printf("=== the planner's host-weight accounting is split by backing (llama.cpp-5efe C4 part c) ===\n");
     test_defaults_are_pinned_and_zero();
@@ -281,6 +321,7 @@ int main() {
     test_the_refresh_counts_cpu_owned_and_not_mapped();
     test_the_source_recount();
     test_an_expert_moving_between_tiers_follows_its_backing();
+    test_a_lent_expert_reads_pinned_until_it_is_refilled();
     printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     if (g_fail > 0) {
         printf("FAILED\n");

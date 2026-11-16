@@ -635,6 +635,11 @@ DROP = "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.devi
 REMEMBER = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS, "
             "std::move(record.host_handles[r]), &record.copy_events[r], 0, logical);")
 FLIP = "(void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, refill, refill ? device : -1);"
+# A lent member's host bytes are the pinned copy the transaction minted; a re-admitted one is staged from the load's
+# own source again, the mapping when the load maps files. The ring's plan index reads the backing.
+BACKING = ("(void) next_plan->set_expert_host_backing(k.layer_id, k.expert_id, k.role, "
+           "refill && next_plan->host_backing_maps_files ? ggml_sycl::placement_host_backing::FILE_MAPPED : "
+           "ggml_sycl::placement_host_backing::PINNED);")
 PUBLISH = "ggml_sycl_publish_prepared_plan_locked(prepared_publication);"
 EPOCH = "ggml_sycl_optional_layouts_retired();"
 UNLOCK = "} lock.unlock(); warn_dropped(); if (!swapped) {"
@@ -642,8 +647,9 @@ UNLOCK = "} lock.unlock(); warn_dropped(); if (!swapped) {"
 
 def claim_probe_changes_nothing_and_a_loan_publishes_once(sycl: str) -> bool:
     b = body(norm(sycl), TXN_SIG)
-    return (b.count(PROBE) == 1 and b.count(PUBLISH) == 1 and b.count(FLIP) == 1
-            and ordered(b, PROBE, LEASE, HOST_ALLOC, INVENTORY_LOCK, LEND, DROP, FORGET, REMEMBER, FLIP, PUBLISH,
+    return (b.count(PROBE) == 1 and b.count(PUBLISH) == 1 and b.count(FLIP) == 1 and b.count(BACKING) == 1
+            and ordered(b, PROBE, LEASE, HOST_ALLOC, INVENTORY_LOCK, LEND, DROP, FORGET, REMEMBER, FLIP, BACKING,
+                        PUBLISH,
                         EPOCH, UNLOCK))
 
 
@@ -740,7 +746,7 @@ def claim_exception_publishes_what_was_lent(sycl: str) -> bool:
     return (lend_at >= 0 and "make_shared<" not in b[lend_at:] and b.count(CATCH_LENDING) == 1
             and b.count(RETHROW) == 3 and all(b.count(x) == 1 for x in RETHROW_EXITS)
             and ordered(b, INVENTORY_LOCK, HOIST_SNAPSHOT, HOIST_PLAN, LEND, FORGET_LOOP_END, REMEMBER, CATCH_LENDING,
-                        FLIP_IF_LOANED, FLIP, BREAK_ESCAPED, PUBLISH, UNLOCK, LOAN_WARN, RETHROW_EXITS[2]))
+                        FLIP_IF_LOANED, FLIP, BACKING, BREAK_ESCAPED, PUBLISH, UNLOCK, LOAN_WARN, RETHROW_EXITS[2]))
 
 
 # --- WARN formats ---------------------------------------------------------------------------------------------------
@@ -964,7 +970,7 @@ def claim_refill_flips_back_and_forgets_the_host_copy(sycl: str) -> bool:
     b = body(norm(sycl), TXN_SIG)
     return (b.count(FORGET_HOST) == 1 and b.count(REMEMBER_DEVICE) == 1 and b.count(POP_READMITTED) == 1
             and ordered(b, REFILL_CALL, FORGET_HOST, REMEMBER_DEVICE, LEND, CATCH_LENDING, FLIP_IF_LOANED, FLIP,
-                        POP_READMITTED, PUBLISH, EPOCH))
+                        BACKING, POP_READMITTED, PUBLISH, EPOCH))
 
 
 DISARM = "if (!refill && lent != 0) { ledger.refill_armed = false; }"
@@ -2146,6 +2152,23 @@ def test_mutant_probe_falls_through_fails():
 
 def test_mutant_publish_per_triplet_fails():
     assert not claim_probe_changes_nothing_and_a_loan_publishes_once(_once(SYCL, FLIP, FLIP + " " + PUBLISH))
+
+
+def test_mutant_backing_not_published_fails():
+    """The plan keeps a lent member's device backing: on a mapping load the index reads it as left mapped."""
+    assert not claim_probe_changes_nothing_and_a_loan_publishes_once(_once(SYCL, BACKING, ""))
+
+
+def test_mutant_backing_set_after_the_publication_fails():
+    """Set on the plan after it is published, the backing never reaches the plan the ring reads."""
+    mutant = _once(_once(SYCL, BACKING, ""), PUBLISH + " " + EPOCH, PUBLISH + " " + BACKING + " " + EPOCH)
+    assert not claim_probe_changes_nothing_and_a_loan_publishes_once(mutant)
+
+
+def test_mutant_backing_arms_swapped_fails():
+    """A lent member published FILE_MAPPED and a re-admitted one PINNED: the ring stages nothing it was lent."""
+    swapped = BACKING.replace("::FILE_MAPPED", "::@").replace("::PINNED", "::FILE_MAPPED").replace("::@", "::PINNED")
+    assert not claim_probe_changes_nothing_and_a_loan_publishes_once(_once(SYCL, BACKING, swapped))
 
 
 def test_mutant_device_lease_kept_fails():

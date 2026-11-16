@@ -61,7 +61,7 @@ CLAIM_SIG = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const gg
 
 KV_ROOM_CALL = "room = hold_kv_context_room(plan, kv_info, device_id, n_experts, room_expert_rate, remaining);"
 PP_ALT_LINE = 'GGML_LOG_INFO("[PLACEMENT-MOE] PP executable alternate reserve: '
-RING_ROOM_CALL = "hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining);"
+RING_ROOM_CALL = "hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining, host_experts_pinned);"
 PACK_STATS = "moe_triplet_pack_stats stats;"
 WITHOUT_KV_ROOM = "size_t without_room = remaining + room.held;"
 PACK_FIT = "const bool on_device = group.charge_bytes <= remaining;"
