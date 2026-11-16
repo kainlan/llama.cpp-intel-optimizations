@@ -163,8 +163,8 @@ static void test_rejections() {
     check(!moe_pp_pack_gemm_groups({ max_size }, &layout), "a row count that cannot be rounded up is refused");
     check(!moe_pp_pack_gemm_groups({ max_size / 2, max_size / 2, max_size / 2 }, &layout),
           "a total that overflows inside one group is refused");
-    // Two groups: the first ends past half of size_t, and the second overflows only when it is counted from where the
-    // first one ends. A check that forgets the rows already laid out accepts this and wraps packed_rows.
+    // Two groups: the first group ends just under half of size_t, so the second group's three slots overflow only when
+    // counted from there. A check that forgets the rows already laid out accepts this and wraps packed_rows.
     check(!moe_pp_pack_gemm_groups({ half - 64, quarter - 64, quarter - 64, quarter - 64 }, &layout),
           "a total that overflows across groups is refused");
     check(!moe_pp_pack_gemm_groups({ 4 }, nullptr), "a null output is refused");
