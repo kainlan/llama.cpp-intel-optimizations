@@ -265,5 +265,59 @@ def test_the_settle_call_waits_for_the_measured_spacing():
     assert not problems, "\n".join(problems)
 
 
+CAPTURE_CALL = "ggml_sycl_fatal_capture();"
+CAPTURE_DEF = "static void ggml_sycl_fatal_capture() noexcept"
+FATAL_EXIT_DEF = "void ggml_sycl_fatal_exit(int code, const char * message) noexcept {"
+
+
+def capture_body(cpp: str) -> str:
+    at = cpp.find(CAPTURE_DEF)
+    assert at >= 0, "common.cpp: ggml_sycl_fatal_capture is missing"
+    return braced_block(cpp, at)
+
+
+def test_a_recorded_loss_captures_before_it_registers_the_exit_handler():
+    cpp = code_of(SYCL / "common.cpp")
+    guard = cpp.find("if (!g_sycl_device_lost_latched.exchange(true")
+    assert guard >= 0, "common.cpp: the first-loss guard on g_sycl_device_lost_latched is missing"
+    block = braced_block(cpp, guard)
+    call, registration = block.find(CAPTURE_CALL), block.find(REGISTRATION)
+    assert 0 <= call < registration, (
+        "common.cpp: the first-loss block must take the capture before it registers the exit handler, so the map is "
+        "the one taken at the loss"
+    )
+
+
+def test_the_fatal_exit_captures_before_it_ends():
+    cpp = code_of(SYCL / "common.cpp")
+    at = cpp.find(FATAL_EXIT_DEF)
+    assert at >= 0, "common.cpp: the definition of ggml_sycl_fatal_exit is missing"
+    body = braced_block(cpp, at)
+    call, end = body.find(CAPTURE_CALL), body.find("std::_Exit(code);")
+    assert 0 <= call < end, (
+        "common.cpp: ggml_sycl_fatal_exit must take the capture before std::_Exit, when no loss took it earlier"
+    )
+
+
+def test_a_second_capture_call_returns_before_it_writes():
+    body = capture_body(code_of(SYCL / "common.cpp"))
+    guard = body.find("done.exchange(true")
+    first_open = body.find("open(")
+    after = body[body.find("{", guard) + 1:] if guard >= 0 else ""
+    assert "static std::atomic<bool> done" in body and 0 <= guard < first_open and after.lstrip().startswith(
+        "return;"), (
+        "common.cpp: ggml_sycl_fatal_capture must return on a second call, through done.exchange(true, ...), before "
+        "it opens a file: the loss and the fatal exit both call it, and the files are written once"
+    )
+
+
+def test_the_capture_is_linux_only():
+    body = capture_body(code_of(SYCL / "common.cpp"))
+    inner = body[body.find("{") + 1:body.rfind("}")].strip()
+    assert inner.startswith("#if defined(__linux__)") and inner.endswith("#endif"), (
+        "common.cpp: the body of ggml_sycl_fatal_capture must sit inside #if defined(__linux__): it reads /proc/self"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

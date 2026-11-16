@@ -6604,7 +6604,7 @@ target_compile_definitions(test-sycl-fatal-exit PRIVATE
 )
 target_link_libraries(test-sycl-fatal-exit PRIVATE ggml-sycl-private-fixtures)
 set_target_properties(test-sycl-fatal-exit PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-foreach(_fatal_mode IN ITEMS helper control classify)
+foreach(_fatal_mode IN ITEMS helper control classify capture)
     add_test(NAME test-sycl-fatal-exit-${_fatal_mode} COMMAND test-sycl-fatal-exit ${_fatal_mode})
     set_tests_properties(test-sycl-fatal-exit-${_fatal_mode} PROPERTIES
         LABELS "sycl;fatal-exit"

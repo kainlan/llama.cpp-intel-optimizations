@@ -11,6 +11,7 @@
 #include "ggml-sycl.h"
 #include "ggml.h"
 
+#include <dirent.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -49,6 +50,10 @@ constexpr int k_child_slice_ms = 10;
 // spaced about 11 s apart left only lines scoped to the dead context. So the parent waits this long before it
 // returns, and the next test cannot start on the card sooner.
 constexpr std::chrono::seconds k_device_settle{ 12 };
+
+// The capture switch and the line the backend prints when it wrote the files.
+constexpr const char * k_capture_env  = "GGML_SYCL_FATAL_CAPTURE_DIR";
+constexpr const char * k_capture_line = "[SYCL-FATAL] capture: ";
 
 void atexit_marker() {
     std::fprintf(stderr, "%s\n", k_atexit_marker);
@@ -420,6 +425,14 @@ int child_main(const char * mode) {
         plant_markers();
         std::exit(GGML_SYCL_EXIT_DEVICE_LOST);
     }
+    if (std::strcmp(mode, "lost-exit") == 0) {
+        // A loss recorded with no backend and no device, after which the child returns from main as an application
+        // would: the exit handler the loss registered ends the process.
+        plant_markers();
+        ggml_sycl_note_exception("level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)");
+        std::fprintf(stderr, "TEST-LOSS-RECORDED\n");
+        return 0;
+    }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0 || std::strcmp(mode, "sync") == 0 ||
         std::strcmp(mode, "graph") == 0) {
         return child_device(mode);
@@ -500,14 +513,131 @@ void settle_after_device_child() {
     std::this_thread::sleep_for(k_device_settle);
 }
 
+bool read_file(const std::string & path, std::string & text) {
+    std::FILE * f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) {
+        return false;
+    }
+    char   buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+        text.append(buf, n);
+    }
+    std::fclose(f);
+    return true;
+}
+
+// The capture a child left: one capture line naming <dir>/sycl-fatal-<pid>, and in <dir> exactly the three files under
+// that name, none of them empty, the map with the stack's mapping in it. One line and three entries are what "written
+// once" looks like from outside: a second write would print a second line or leave another file. A pass removes the
+// files and the directory; a failure leaves them for a look.
+int check_capture_files(const char * mode, const child_result & r, const std::string & dir) {
+    size_t lines = 0;
+    for (size_t at = r.out.find(k_capture_line); at != std::string::npos; at = r.out.find(k_capture_line, at + 1)) {
+        ++lines;
+    }
+    if (lines == 0) {
+        return fail(mode, r, "no capture line");
+    }
+    if (lines > 1) {
+        return fail(mode, r, "more than one capture line: the capture ran more than once");
+    }
+    const size_t      begin  = r.out.find(k_capture_line) + std::strlen(k_capture_line);
+    const std::string base   = r.out.substr(begin, r.out.find('\n', begin) - begin);
+    const std::string prefix = dir + "/sycl-fatal-";
+    if (base.compare(0, prefix.size(), prefix) != 0 || base.size() == prefix.size() ||
+        base.find_first_not_of("0123456789", prefix.size()) != std::string::npos) {
+        return fail(mode, r, "the capture line does not name <dir>/sycl-fatal-<pid> in the named directory");
+    }
+    const char * const exts[] = { ".maps", ".smaps", ".status" };
+    const size_t       n_exts = sizeof(exts) / sizeof(exts[0]);
+    for (const char * ext : exts) {
+        std::string text;
+        if (!read_file(base + ext, text)) {
+            return fail(mode, r, "a capture file is missing");
+        }
+        if (text.empty() || (std::strcmp(ext, ".maps") == 0 && text.find("[stack]") == std::string::npos)) {
+            return fail(mode, r, "a capture file is empty or is not a memory map");
+        }
+    }
+    DIR * d = opendir(dir.c_str());
+    if (d == nullptr) {
+        return fail(mode, r, "the capture directory cannot be read");
+    }
+    size_t entries = 0;
+    for (const dirent * e = readdir(d); e != nullptr; e = readdir(d)) {
+        if (std::strcmp(e->d_name, ".") != 0 && std::strcmp(e->d_name, "..") != 0) {
+            ++entries;
+        }
+    }
+    closedir(d);
+    // The three files exist, so three entries are exactly those three.
+    if (entries != n_exts) {
+        return fail(mode, r, "the capture directory holds more than the three files");
+    }
+    for (const char * ext : exts) {
+        std::remove((base + ext).c_str());
+    }
+    rmdir(dir.c_str());
+    return 0;
+}
+
+// One child of the capture mode, run with GGML_SYCL_FATAL_CAPTURE_DIR naming a new directory of its own. Every failure
+// text names that directory through the mode name.
+int run_capture_child(const char * self, const char * child_mode) {
+    char dir[] = "/tmp/sycl-fatal-capture-XXXXXX";
+    if (mkdtemp(dir) == nullptr) {
+        std::perror("mkdtemp");
+        return 1;
+    }
+    if (setenv(k_capture_env, dir, 1) != 0) {
+        std::perror("setenv");
+        return 1;
+    }
+    const child_result r = run_child(self, child_mode);
+    unsetenv(k_capture_env);
+    const std::string label     = std::string("capture child=") + child_mode + " dir=" + dir;
+    const char *      mode      = label.c_str();
+    const bool        lost_exit = std::strcmp(child_mode, "lost-exit") == 0;
+    if (lost_exit && !has(r, "TEST-LOSS-RECORDED")) {
+        return fail(mode, r, "the child did not reach the recorded loss");
+    }
+    if (lost_exit && !has(r, "[SYCL-FATAL] device lost:")) {
+        return fail(mode, r, "the loss was not recorded as a device loss");
+    }
+    if (const int rc = check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST)) {
+        return rc;
+    }
+    if (lost_exit) {
+        // The loss and the exit both reach the capture. The map must be the one taken at the loss, before the exit
+        // handler's banner: on the latch path the process may run on, and a later map no longer shows what was mapped
+        // when the device faulted.
+        const size_t banner  = r.out.find("[SYCL-FATAL] process exit after a device loss");
+        const size_t capture = r.out.find(k_capture_line);
+        if (banner == std::string::npos) {
+            return fail(mode, r, "the process did not end through the exit handler the loss registered");
+        }
+        if (capture != std::string::npos && capture > banner) {
+            return fail(mode, r, "the capture was taken at the exit, not at the loss");
+        }
+    }
+    return check_capture_files(mode, r, dir);
+}
+
 int parent_main(const char * self, const char * mode) {
     if (std::strcmp(mode, "helper") == 0) {
+        // Cleared so that a value in the caller's environment cannot make the child capture: this mode checks that a
+        // run without the variable leaves no capture.
+        unsetenv(k_capture_env);
         const child_result r = run_child(self, mode);
         if (const int rc = check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST)) {
             return rc;
         }
         if (!has(r, "[SYCL-FATAL] test: helper mode")) {
             return fail(mode, r, "the message is not on the [SYCL-FATAL] line");
+        }
+        if (has(r, k_capture_line)) {
+            return fail(mode, r, "a capture line, although GGML_SYCL_FATAL_CAPTURE_DIR is unset");
         }
         return 0;
     }
@@ -538,6 +668,15 @@ int parent_main(const char * self, const char * mode) {
         }
         return 0;
     }
+    if (std::strcmp(mode, "capture") == 0) {
+        // The two ways to the capture: the fast exit with no loss recorded (the helper child), and a recorded loss the
+        // process then leaves through its exit handler (the lost-exit child), whose map must be the one taken at the
+        // loss. A host mode: neither child uses a device, so the card needs no settling after it.
+        if (const int rc = run_capture_child(self, "helper")) {
+            return rc;
+        }
+        return run_capture_child(self, "lost-exit");
+    }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0) {
         const child_result r = run_child(self, mode);
         if (r.exited && r.status == LLAMA_TEST_EXIT_SKIP) {
@@ -558,7 +697,7 @@ int parent_main(const char * self, const char * mode) {
         settle_after_device_child();
         return rc;
     }
-    std::fprintf(stderr, "usage: %s helper|control|classify|mmid|op|sync|graph\n", self);
+    std::fprintf(stderr, "usage: %s helper|control|classify|capture|mmid|op|sync|graph\n", self);
     return 2;
 }
 
@@ -569,7 +708,7 @@ int main(int argc, char ** argv) {
         return child_main(argv[2]);
     }
     if (argc != 2) {
-        std::fprintf(stderr, "usage: %s helper|control|classify|mmid|op|sync|graph\n", argv[0]);
+        std::fprintf(stderr, "usage: %s helper|control|classify|capture|mmid|op|sync|graph\n", argv[0]);
         return 2;
     }
     const int rc = parent_main(argv[0], argv[1]);
