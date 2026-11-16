@@ -4,6 +4,7 @@
 
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "common.hpp"
+#include "exit-settle.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -58,6 +59,8 @@ constexpr std::chrono::seconds k_device_settle{ 12 };
 constexpr const char * k_capture_env         = "GGML_SYCL_FATAL_CAPTURE_DIR";
 constexpr const char * k_capture_line        = "[SYCL-FATAL] capture: ";
 constexpr const char * k_capture_failed_line = "[SYCL-FATAL] capture failed: ";
+constexpr const char * k_settle_env          = "GGML_SYCL_FATAL_EXIT_SETTLE_MS";
+constexpr const char * k_settle_line         = "[SYCL-FATAL] settle: ";
 
 // The files a capture writes, as <dir>/sycl-fatal-<pid><ext>.
 constexpr const char * k_capture_exts[] = { ".maps", ".smaps", ".status" };
@@ -460,6 +463,15 @@ int child_main(const char * mode) {
         std::fprintf(stderr, "TEST-LOSS-RECORDED\n");
         return 0;
     }
+    if (std::strcmp(mode, "settle") == 0 || std::strcmp(mode, "settle-off") == 0) {
+        plant_markers();
+        ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "test: settle mode");
+    }
+    if (std::strcmp(mode, "settle-cap") == 0) {
+        // The cap is read back, not slept through: a child that slept for it would hold the test for five seconds.
+        std::fprintf(stderr, "TEST-SETTLE-MS %ld\n", ggml_sycl::exit_settle_ms());
+        return 0;
+    }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0 || std::strcmp(mode, "sync") == 0 ||
         std::strcmp(mode, "graph") == 0) {
         return child_device(mode);
@@ -688,6 +700,7 @@ int check_capture_failed(const char * mode, const child_result & r, const std::s
 // One child of the capture mode, run with GGML_SYCL_FATAL_CAPTURE_DIR naming a new directory of its own. Every failure
 // text names that directory through the mode name.
 int run_capture_child(const char * self, const char * child_mode) {
+    setenv(k_settle_env, "0", 1);
     char dir[] = "/tmp/sycl-fatal-capture-XXXXXX";
     if (mkdtemp(dir) == nullptr) {
         std::perror("mkdtemp");
@@ -731,6 +744,7 @@ int run_capture_child(const char * self, const char * child_mode) {
 // create it and must not print the capture line, which would claim files that are not there; it must name each file
 // it could not write instead.
 int run_capture_child_missing_dir(const char * self) {
+    setenv(k_settle_env, "0", 1);
     char dir[] = "/tmp/sycl-fatal-capture-XXXXXX";
     if (mkdtemp(dir) == nullptr) {
         std::perror("mkdtemp");
@@ -764,6 +778,7 @@ int run_capture_child_missing_dir(const char * self) {
 // its file was opened. Each file must be named with the error the write gave, and none may be left behind: a partial
 // copy under the final name would read as a complete one once the log is gone.
 int run_capture_child_small_files(const char * self) {
+    setenv(k_settle_env, "0", 1);
     char dir[] = "/tmp/sycl-fatal-capture-XXXXXX";
     if (mkdtemp(dir) == nullptr) {
         std::perror("mkdtemp");
@@ -801,6 +816,7 @@ int parent_main(const char * self, const char * mode) {
         // Cleared so that a value in the caller's environment cannot make the child capture: this mode checks that a
         // run without the variable leaves no capture.
         unsetenv(k_capture_env);
+        setenv(k_settle_env, "0", 1);
         const child_result r = run_child(self, mode);
         if (const int rc = check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST)) {
             return rc;
@@ -858,6 +874,38 @@ int parent_main(const char * self, const char * mode) {
         }
         return run_capture_child_small_files(self);
     }
+    if (std::strcmp(mode, "settle") == 0 || std::strcmp(mode, "settle-off") == 0) {
+        const bool off = std::strcmp(mode, "settle-off") == 0;
+        unsetenv(k_capture_env);
+        setenv(k_settle_env, off ? "0" : "150", 1);
+        const child_result r = run_child(self, mode);
+        unsetenv(k_settle_env);
+        if (const int rc = check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST)) {
+            return rc;
+        }
+        if (off) {
+            return has(r, k_settle_line) ? fail(mode, r, "a settle line, although the settle is disabled") : 0;
+        }
+        if (!has(r, "[SYCL-FATAL] settle: waiting 150 ms")) {
+            return fail(mode, r, "no settle line with the requested time");
+        }
+        if (r.seconds < 0.15) {
+            return fail(mode, r, "the child ended sooner than the settle time");
+        }
+        return 0;
+    }
+    if (std::strcmp(mode, "settle-cap") == 0) {
+        setenv(k_settle_env, "999999", 1);
+        const child_result r = run_child(self, mode);
+        unsetenv(k_settle_env);
+        if (const int rc = check_ended(mode, r)) {
+            return rc;
+        }
+        if (!r.exited || r.status != 0 || !has(r, "TEST-SETTLE-MS 5000\n")) {
+            return fail(mode, r, "the cap is not 5000 ms");
+        }
+        return 0;
+    }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0) {
         const child_result r = run_child(self, mode);
         if (r.exited && r.status == LLAMA_TEST_EXIT_SKIP) {
@@ -878,7 +926,8 @@ int parent_main(const char * self, const char * mode) {
         settle_after_device_child();
         return rc;
     }
-    std::fprintf(stderr, "usage: %s helper|control|classify|capture|mmid|op|sync|graph\n", self);
+    std::fprintf(stderr, "usage: %s helper|control|classify|capture|settle|settle-off|settle-cap|mmid|op|sync|graph\n",
+                 self);
     return 2;
 }
 
@@ -889,7 +938,9 @@ int main(int argc, char ** argv) {
         return child_main(argv[2]);
     }
     if (argc != 2) {
-        std::fprintf(stderr, "usage: %s helper|control|classify|capture|mmid|op|sync|graph\n", argv[0]);
+        std::fprintf(stderr,
+                     "usage: %s helper|control|classify|capture|settle|settle-off|settle-cap|mmid|op|sync|graph\n",
+                     argv[0]);
         return 2;
     }
     const int rc = parent_main(argv[0], argv[1]);
