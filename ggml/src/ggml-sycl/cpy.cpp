@@ -1529,7 +1529,7 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
         return;
     }
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    ggml_sycl_fatal_exit(ggml_sycl_fatal_exit_code(exc.what()), "ggml_sycl_cpy");
 }
 
 void ggml_sycl_dup(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

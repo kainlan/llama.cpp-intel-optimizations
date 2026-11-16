@@ -924,11 +924,6 @@ static __dpct_inline__ float sycl_e8m0_to_fp32_half(uint8_t e) {
     return result;
 }
 
-static void crash() {
-    int * ptr = NULL;
-    *ptr      = 0;
-}
-
 [[noreturn]] static void ggml_sycl_error(const char * stmt,
                                          const char * func,
                                          const char * file,
@@ -1150,8 +1145,7 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
     return CHECK_TRY_ERROR(dpct::select_device(mapped_device));
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    crash();
-    std::exit(1);
+    ggml_sycl_fatal_exit(ggml_sycl_fatal_exit_code(exc.what()), "ggml_sycl_set_device");
 }
 
 //////////////////////
