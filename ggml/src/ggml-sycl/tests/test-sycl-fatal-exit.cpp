@@ -386,8 +386,9 @@ int child_device(const char * mode) {
         return LLAMA_TEST_EXIT_SKIP;
     }
     const bool sync     = std::strcmp(mode, "sync") == 0;
-    const bool computed = sync || std::strcmp(mode, "graph") == 0 ? run_one_add(backend) : run_one_mmid(backend);
-    if (std::strcmp(mode, "graph") == 0 && !computed) {
+    const bool graph    = std::strcmp(mode, "graph") == 0;
+    const bool computed = (sync || graph) ? run_one_add(backend) : run_one_mmid(backend);
+    if (graph && !computed) {
         // The boundary reported the failure and returned. An application would now wind down and return from main.
         std::fprintf(stderr, "TEST-GRAPH-FAILED\n");
         return 0;

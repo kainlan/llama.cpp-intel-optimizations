@@ -6615,11 +6615,12 @@ endforeach()
 # The device modes inject the loss a lost device throws, at MUL_MAT_ID, at any op, at the synchronize wait and at the
 # graph boundary. Each child sets its own GGML_SYCL_TEST_INJECT_DEVICE_LOST (see device_injection() in the test), so a
 # mode runs by hand with no environment beyond the device selector.
-# Kernel log lines seen in one run of each mode on the B50 (driver 26.44): mmid and graph left none; op left one
-# "Fault response: Unsuccessful -ENOENT" and one "Engine reset: engine_class=bcs"; sync left two "Fault response"
-# lines and one engine reset each on the compute engine (ccs) and the copy engine (bcs). The lines vary from run to
-# run. The resets are scoped to the dying process's own context, and the card served the next process each time.
-# This is not the unrecoverable-hang signature, which leaves the card unusable until a reboot.
+# Kernel log lines seen in two runs of the modes on the B50 (driver 26.44). In one run mmid left none, op left one
+# "Fault response: Unsuccessful -ENOENT" and one "Engine reset: engine_class=bcs", and sync left two "Fault response"
+# lines and one engine reset each on the compute engine (ccs) and the copy engine (bcs). In the other run mmid, op and
+# sync each left one "Fault response" line and one bcs engine reset. graph, with its present graph, left none. The
+# lines vary from run to run. The resets are scoped to the dying process's own context, and the card served the next
+# process each time. This is not the unrecoverable-hang signature, which leaves the card unusable until a reboot.
 set(_fatal_device_env "ONEAPI_DEVICE_SELECTOR=level_zero:1"
                       "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 foreach(_fatal_site IN ITEMS mmid op sync graph)

@@ -870,7 +870,8 @@ int ggml_sycl_fatal_exit_code(const char * what) noexcept;
 //   backend's own: the CPU worker shutdown and the end-of-run dumps such as the counter dump, the alloc-trace dump
 //   and the mem-copy census.
 // - Log lines still queued in an application's logger are lost.
-// - All open output streams are flushed first.
+// - All open C stdio streams (FILE *) are flushed first. A C++ file stream that is still open loses what its buffer
+//   holds.
 //
 // The order: on glibc the handler runs before every exit handler and static destructor registered before the loss,
 // and before the libraries' own unload destructors, the Level Zero library's among them, whose teardown can hang on
@@ -958,10 +959,10 @@ static __dpct_inline__ float sycl_e8m0_to_fp32_half(uint8_t e) {
     fprintf(stderr, "SYCL error: %s: %s\n", stmt, msg);
     fprintf(stderr, "  in function %s at %s:%d\n", func, file, line);
     if (ggml_sycl_device_lost_latched()) {
-        // After a recorded loss any failed check ends the process without teardown, whichever card or call failed:
-        // the abort path's backtrace and the teardown after it can hang on the lost card. The "SYCL error:" line
-        // and the exception line above it still name the failing call, and the loss has its own
-        // "[SYCL-FATAL] device lost:" line earlier in the log.
+        // After a recorded loss any failed check ends the process at once, whichever card or call failed: the abort
+        // path's backtrace (gdb attaches to this process) and the core dump after it keep the process, and the card's
+        // memory, alive for as long as they take. The "SYCL error:" line and the exception line above it still name
+        // the failing call, and the loss has its own "[SYCL-FATAL] device lost:" line earlier in the log.
         ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "SYCL_CHECK failed after a device loss");
     }
     GGML_ABORT("SYCL error");

@@ -1122,11 +1122,12 @@ Diagnostics for future cross-device KV tasks must report, at minimum, the planne
 
 ### Exit status 69 after a device loss
 
-When the backend sees a lost device, it prints `[SYCL-FATAL] device lost: ...`. From then on the process ends with
-status 69 at its next failed SYCL check, or when it exits.
+When the backend records a lost device, it prints `[SYCL-FATAL] device lost: ...`. From then on the process ends
+with status 69 at its next failed SYCL check, or when it exits. A site that cannot continue after a loss ends the
+process at once, with its own `[SYCL-FATAL] <function>:` line and the same status.
 
-No teardown runs on the way out. On a lost card the driver's teardown can hang, and the process would then hold its
-memory and the card until it was killed.
+No teardown runs on the way out, apart from exit handlers registered after the loss. On a lost card the driver's
+teardown can hang, and the process would then hold its memory and the card until it was killed.
 
 This has consequences for a normal exit after the loss:
 
@@ -1136,7 +1137,8 @@ This has consequences for a normal exit after the loss:
   application's own and the backend's own, such as the CPU worker shutdown and the end-of-run dumps (the counter
   dump, the alloc-trace dump and the mem-copy census).
 - Log lines still queued in the application's logger are lost.
-- Open output streams are flushed first, so output already written reaches its file.
+- C stdio streams (`FILE *`) are flushed first, so output already written through them reaches its file. A C++ file
+  stream that is still open loses what its buffer holds.
 
 Read status 69 as "the device was lost". It means that even when the run's output was complete.
 

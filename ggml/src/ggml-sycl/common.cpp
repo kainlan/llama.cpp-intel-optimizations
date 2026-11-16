@@ -798,7 +798,7 @@ void ggml_sycl_fatal_exit(int code, const char * message) noexcept {
 static std::atomic<bool> g_sycl_device_lost_latched{ false };
 
 static void ggml_sycl_device_lost_at_exit() {
-    // A normal exit would have flushed every open output stream; the fast exit flushes only stdout and stderr.
+    // A normal exit would have flushed every open C stdio stream; the fast exit flushes only stdout and stderr.
     std::fflush(nullptr);
     ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "process exit after a device loss");
 }
