@@ -93438,16 +93438,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const ggml_sycl::pp_moe_onednn_scratch_admission admission =
                 ggml_sycl::pp_moe_onednn_admit_scratch(planned_shape, required_shape);
             if (!admission.allowed) {
-                // Visible at default verbosity, once per process: a refusal here
-                // silently downgrades this op to the serialized route, and a run
-                // that quietly lost its fast path looks exactly like one that
-                // never had it. The per-dispatch trace below stays debug-gated.
+                // Visible at default verbosity, once per process: a refused SOA-claimed op
+                // falls back to the serialized route, and a run that quietly lost its fast path
+                // looks exactly like one that never had it; a refused tiled-claimed op fails
+                // its graph instead. The per-dispatch trace below stays debug-gated.
                 static ggml_sycl::pp_moe_onednn_scratch_refusal_latch batched_scratch_refusal_latch;
                 if (ggml_sycl::pp_moe_onednn_should_report_refusal(admission, batched_scratch_refusal_latch)) {
                     GGML_LOG_WARN(
                         "[SYCL] refusing unplanned PP MoE oneDNN batched scratch (reported once per process): "
-                        "device=%d reason=%s required=[%zu,%zu,%zu] planned_cap=[%zu,%zu,%zu] "
-                        "required_ring=%u planned_ring=%u; falling back to the serialized MoE route\n",
+                        "device=%d reason=%s required=[%zu,%zu,%zu] planned_cap=[%zu,%zu,%zu] required_ring=%u "
+                        "planned_ring=%u; SOA-claimed ops: serialized MoE route; a tiled-claimed op fails its graph\n",
                         ctx.device, ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason),
                         weight_bytes, act_bytes, out_bytes, planned_weight, planned_act, planned_out,
                         required_shape.ring_depth, planned_ring_depth);
