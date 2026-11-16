@@ -828,6 +828,28 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
 #    define GGML_SYCL_KTRACE(kernel_name, ...) ((void) 0)
 #endif
 
+// The exit status of a process the backend ended because a device was lost. It differs from 1, which a failed test,
+// the watchdog and every other fatal op error use, so a script can tell a lost device from a wrong result.
+constexpr int GGML_SYCL_EXIT_DEVICE_LOST = 69;
+
+// True when an exception's text names a lost device, as the Level Zero adapter prints it:
+// "level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)".
+bool ggml_sycl_what_is_device_lost(const char * what) noexcept;
+
+// GGML_SYCL_EXIT_DEVICE_LOST for a lost device's exception text, 1 for any other.
+int ggml_sycl_fatal_exit_code(const char * what) noexcept;
+
+// Ends the process at once after a failure it cannot recover from. Prints `message` on one [SYCL-FATAL] line and
+// flushes stdout and stderr. Then it releases every device command parked on a CPU expert job, and prints the
+// zone-reset audit when GGML_SYCL_ZONE_RESET_AUDIT is set. Last it leaves through std::_Exit, so no exit handler and
+// no static destructor runs: after a device loss the Level Zero library's destructor does not return, and std::exit
+// would run it.
+// The caller prints its own diagnostic first, with fprintf(stderr) or std::cerr and not GGML_LOG_*: the tools route
+// ggml logs into a queue that a worker thread prints, and std::_Exit drops whatever is still queued.
+// Not async-signal-safe (it uses stdio, the audit's mutex and the job registry's timed mutex): never call it from a
+// signal handler.
+[[noreturn]] void ggml_sycl_fatal_exit(int code, const char * message) noexcept;
+
 #define CHECK_TRY_ERROR(expr)                                                                           \
     [&]() {                                                                                             \
         try {                                                                                           \

@@ -6583,6 +6583,37 @@ set_tests_properties(test-sycl-orchestrator PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# The backend's fatal exit: a child process must end without running an exit handler or a static destructor. The
+# helper, control and classify modes touch no device.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-sycl-fatal-exit
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-sycl-fatal-exit.cpp
+)
+target_include_directories(test-sycl-fatal-exit PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-fatal-exit PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-fatal-exit PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-fatal-exit PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-fatal-exit PRIVATE ggml-sycl-private-fixtures)
+set_target_properties(test-sycl-fatal-exit PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+foreach(_fatal_mode IN ITEMS helper control classify)
+    add_test(NAME test-sycl-fatal-exit-${_fatal_mode} COMMAND test-sycl-fatal-exit ${_fatal_mode})
+    set_tests_properties(test-sycl-fatal-exit-${_fatal_mode} PROPERTIES
+        LABELS "sycl;fatal-exit"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 60
+    )
+endforeach()
+endif() # static SYCL backend fixture
+
 # ---------------------------------------------------------------------------
 # Task 16 accepted restoration set: previously inactive registrations.
 #

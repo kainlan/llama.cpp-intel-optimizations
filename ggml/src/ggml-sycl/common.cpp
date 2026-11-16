@@ -774,6 +774,26 @@ static void watchdog_thread_fn(int64_t timeout_ms) {
     }
 }
 
+bool ggml_sycl_what_is_device_lost(const char * what) noexcept {
+    return what != nullptr && std::strstr(what, "UR_RESULT_ERROR_DEVICE_LOST") != nullptr;
+}
+
+int ggml_sycl_fatal_exit_code(const char * what) noexcept {
+    return ggml_sycl_what_is_device_lost(what) ? GGML_SYCL_EXIT_DEVICE_LOST : 1;
+}
+
+void ggml_sycl_fatal_exit(int code, const char * message) noexcept {
+    std::fprintf(stderr, "[SYCL-FATAL] %s: ending the process with _Exit(%d), no teardown\n",
+                 message ? message : "(no message)", code);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    // The watchdog's order: release every device command parked on a CPU expert job, then print the zone-reset
+    // audit an exit handler would have printed (nothing unless GGML_SYCL_ZONE_RESET_AUDIT is set).
+    ggml_sycl::cpu_job_signal_signal_all();
+    ggml_sycl::zone_reset_audit_report("sycl-fatal-exit");
+    std::_Exit(code);
+}
+
 // Parse GGML_SYCL_OP_TIMEOUT_MS. Returns the parsed non-negative value, or
 // watchdog_default_timeout_ms when the value is missing, empty, negative, or
 // not a valid integer. An explicit "0" is preserved and disables the watchdog.
