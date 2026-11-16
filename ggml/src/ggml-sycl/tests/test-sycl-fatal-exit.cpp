@@ -3,6 +3,7 @@
 // that plants an atexit handler and a static destructor, and checks from outside which of them ran.
 
 #include "common.hpp"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-quants.h"
@@ -254,9 +255,11 @@ void quantize_weights_mxfp4(const std::vector<float> & src,
     }
 }
 
-// Computes one small MUL_MAT_ID graph on the SYCL backend, with its weights in host memory. Returns false when the
-// setup or the compute reported a failure. The device modes only need the compute to reach the op: a compute that
-// returns at all means the injected loss did not end the process, so nothing is read back and nothing is freed.
+// Runs one small MUL_MAT_ID graph on the SYCL backend, with its weights in host memory. Returns false when the setup
+// or the compute reported a failure. On a bare backend the compute always fails: with no model there is no planned
+// route for the MUL_MAT_ID, and the backend refuses it at the op. The modes that use this (mmid, op and graph) only
+// need the compute to reach the op or the graph boundary: a compute that returns at all means the injected loss did
+// not end the process, so nothing is read back and nothing is freed.
 bool run_one_mmid(ggml_backend_t backend) {
     const int          in_dim = 64, out_dim = 32, n_experts = 4, n_used = 2, n_tokens = 8;
     std::mt19937       rng(7);
@@ -316,6 +319,37 @@ bool run_one_mmid(ggml_backend_t backend) {
     return ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
 }
 
+// Runs one ggml_add of two F32 device tensors, a graph that needs no model, no planned route and no weight cache, so
+// it computes on a bare backend. Returns true when the compute succeeded. The sync mode uses it because its loss must
+// land on a wait after a compute that worked. Built the way test-rms-norm-mul-add-broadcast.cpp builds its graph.
+bool run_one_add(ggml_backend_t backend) {
+    const int              n      = 256;
+    const ggml_init_params params = {
+        ggml_tensor_overhead() * 4 + ggml_graph_overhead(),
+        nullptr,
+        true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_set_input(a);
+    ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_set_input(b);
+    ggml_tensor * sum = ggml_add(ctx, a, b);
+    ggml_set_output(sum);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, sum);
+    if (!ggml_backend_alloc_ctx_tensors(ctx, backend)) {
+        return false;
+    }
+    std::vector<float> data(n, 1.0f);
+    ggml_backend_tensor_set(a, data.data(), 0, data.size() * sizeof(float));
+    ggml_backend_tensor_set(b, data.data(), 0, data.size() * sizeof(float));
+    return ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+}
+
 // The device modes: the injected loss is in the environment the registration sets.
 int child_device(const char * mode) {
     plant_markers();
@@ -330,15 +364,16 @@ int child_device(const char * mode) {
         std::fprintf(stderr, "SKIP: no SYCL backend\n");
         return 77;
     }
-    const bool computed = run_one_mmid(backend);
+    const bool sync     = std::strcmp(mode, "sync") == 0;
+    const bool computed = sync ? run_one_add(backend) : run_one_mmid(backend);
     if (std::strcmp(mode, "graph") == 0 && !computed) {
         // The boundary reported the failure and returned. An application would now wind down and return from main.
         std::fprintf(stderr, "TEST-GRAPH-FAILED\n");
         return 0;
     }
-    if (std::strcmp(mode, "sync") == 0) {
-        // The loss must land on this wait, after the compute returned, and not on an earlier one: the setup's
-        // synchronize or the one ggml_backend_graph_compute ends with. The parent requires this line.
+    if (sync) {
+        // The loss must land on this wait, after the compute returned, and not on the earlier one that
+        // ggml_backend_graph_compute ends with. The parent requires this line.
         std::fprintf(stderr, "TEST-SYNC-COMPUTED computed=%d\n", computed ? 1 : 0);
         ggml_backend_synchronize(backend);
     }
@@ -363,11 +398,11 @@ int child_main(const char * mode) {
     return 2;
 }
 
-// The injection the ctest registration sets for a device mode. The sync mode's count skips the two synchronize calls
-// before the one it targets: the setup's own, and the one ggml_backend_graph_compute ends with.
+// The injection the ctest registration sets for a device mode. The sync mode's count skips the one synchronize call
+// before the one it targets: the one ggml_backend_graph_compute ends with.
 const char * device_injection(const char * mode) {
     if (std::strcmp(mode, "sync") == 0) {
-        return "sync:3";
+        return "sync:2";
     }
     if (std::strcmp(mode, "graph") == 0) {
         return "graph:1";
