@@ -2605,6 +2605,13 @@ Run after W2.5 merges. One device binary at a time, under `GPU.lock`, preflight 
    (`-lm none`): reported, expected to rise where experts moved back to the device.
 9. GPT-OSS 120B perplexity on both cards (`level_zero:0,1`), 2 chunks, before and after: the tiled layer still
    agrees within 1%.
+   **Changed on 2026-11-16 (owner ruling).** This step cannot run as written: both the before and the after tree
+   refuse the second card's prompt path on purpose (`secondary-prompt-unvalidated`) and then abort
+   (llama.cpp-dp4p). The owner accepted the same perplexity on single cards in its place, before against after:
+   GPT-OSS 20B on the B50 5.7717 and 5.7717, GPT-OSS 20B on the B70 5.7714 and 5.7731, GPT-OSS 120B on the B70
+   alone 4.8336 and 4.8324. The owner also ruled that llama.cpp-dp4p is fixed next, its task brought for review
+   before anything is spawned. No gate of this plan names GPT-OSS 120B on two cards with a prompt batch until
+   then.
 10. Kernel log clean. Results on llama.cpp-ohkx.
 
 ---
@@ -3422,7 +3429,8 @@ the record on llama.cpp-488x.
 
 ## Amendment 2 (stage 2): the plan charges a device expert what staging allocates (llama.cpp-az3g)
 
-**Status: written 2026-11-16 after the lead's spike. Awaits the owner's review. Nothing here is spawned before it.**
+**Status: approved by the owner on 2026-11-16, as written.** Decision D5 stands: charge what is staged and leave the
+staging alone. Tracker: W2.6 is llama.cpp-mvp5, L3 is llama.cpp-31ac.
 
 ### What gate G2 found
 
