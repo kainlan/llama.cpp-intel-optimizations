@@ -28,7 +28,8 @@ struct inventory_row {
 };
 
 // One MoE model's shape: every weight in `type`, `experts` experts per layer of which `experts_used` route, the
-// loader's planning shape (n_ctx, n_ubatch) and the PP MoE oneDNN ring the loader would size for it (0: none).
+// loader's planning shape (n_ctx, n_ubatch) and what the loader hands the backend for the PP MoE oneDNN ring: the
+// weight slot and the bytes of one activation and one output scratch row (0: no ring).
 struct moe_shape {
     ggml_type type;
     int       layers;
@@ -40,8 +41,8 @@ struct moe_shape {
     uint32_t  n_ctx;
     uint32_t  n_ubatch;
     size_t    ring_weight_slot_bytes;
-    size_t    ring_activation_slot_bytes;
-    size_t    ring_output_slot_bytes;
+    size_t    ring_activation_bytes_per_row;
+    size_t    ring_output_bytes_per_row;
 };
 
 // The T2 fixture: DeepSeek's quant type, at a size a test can hold, with no ring.
@@ -50,10 +51,10 @@ constexpr moe_shape q2k_shape = { GGML_TYPE_Q2_K, 2, 8, 2, 1024, 512, 4096, 16, 
 // Qwen3.8-Flash-Next Q8_0 (qwen4exp): 48 layers, 512 experts of which 10 route, hidden 2560, expert FFN 640, at its
 // real dimensions, so its ~128 GiB of experts overflow any card on this host and the plan puts experts on the host.
 // The loader's planning shape is n_ctx = n_ubatch = 512. The ring is the IQ3_XXS load's (test-kv-room-cost.cpp): a
-// 425 MiB weight slot, 2.5 MiB activation and 5 MiB output per row at n_ubatch 512, depth 1. Each row size is a
-// multiple of 256, so the slots are already at the ring's alignment.
+// 425 MiB weight slot, depth 1, and one scratch row of 2560 half floats in and 2560 floats out. The backend sizes the
+// two row slots from these and the expert counts.
 constexpr moe_shape qwen38_shape = {
-    GGML_TYPE_Q8_0, 48, 512, 10, 2560, 640, 151936, 512, 512, 425ull << 20, 512ull * 2621440ull, 512ull * 5242880ull,
+    GGML_TYPE_Q8_0, 48, 512, 10, 2560, 640, 151936, 512, 512, 425ull << 20, 2560ull * 2ull, 2560ull * 4ull,
 };
 
 inline std::vector<inventory_row> shaped_rows(const moe_shape & s) {
@@ -141,26 +142,24 @@ struct loader_inventory {
             total += t.size;
             tensors.push_back(t);
         }
-        inv.tensors                             = tensors.data();
-        inv.count                               = tensors.size();
-        inv.total_size                          = total;
-        inv.n_expert                            = s.experts;
-        inv.n_expert_used                       = s.experts_used;
-        inv.n_layer                             = static_cast<uint32_t>(s.layers);
-        inv.n_ctx                               = s.n_ctx;
-        inv.n_ubatch                            = s.n_ubatch;
-        inv.pp_moe_onednn_weight_slot_bytes     = s.ring_weight_slot_bytes;
-        inv.pp_moe_onednn_activation_slot_bytes = s.ring_activation_slot_bytes;
-        inv.pp_moe_onednn_output_slot_bytes     = s.ring_output_slot_bytes;
-        inv.pp_moe_onednn_ring_depth            = s.ring_weight_slot_bytes > 0 ? 1 : 0;
-        // The per-row bytes behind the two row slots: a stage under a load owner re-publishes the ring from these at
-        // n_ubatch, so they must give back the slots above or the stage plans another ring than the inventory names.
-        if (s.n_ubatch > 0) {
-            inv.pp_moe_onednn_activation_bytes_per_row = s.ring_activation_slot_bytes / s.n_ubatch;
-            inv.pp_moe_onednn_output_bytes_per_row     = s.ring_output_slot_bytes / s.n_ubatch;
-        }
-        inv.pp_moe_onednn_scratch_bytes =
-            s.ring_weight_slot_bytes + s.ring_activation_slot_bytes + s.ring_output_slot_bytes;
+        inv.tensors       = tensors.data();
+        inv.count         = tensors.size();
+        inv.total_size    = total;
+        inv.n_expert      = s.experts;
+        inv.n_expert_used = s.experts_used;
+        inv.n_layer       = static_cast<uint32_t>(s.layers);
+        inv.n_ctx         = s.n_ctx;
+        inv.n_ubatch      = s.n_ubatch;
+
+        // As the loader fills it: the weight slot and one scratch row's bytes. The backend sizes the activation and
+        // output slots, so the loader leaves them 0 and its scratch bytes are the weight slots alone.
+        inv.pp_moe_onednn_weight_slot_bytes        = s.ring_weight_slot_bytes;
+        inv.pp_moe_onednn_activation_slot_bytes    = 0;
+        inv.pp_moe_onednn_output_slot_bytes        = 0;
+        inv.pp_moe_onednn_ring_depth               = s.ring_weight_slot_bytes > 0 ? 1 : 0;
+        inv.pp_moe_onednn_activation_bytes_per_row = s.ring_activation_bytes_per_row;
+        inv.pp_moe_onednn_output_bytes_per_row     = s.ring_output_bytes_per_row;
+        inv.pp_moe_onednn_scratch_bytes            = s.ring_weight_slot_bytes;
     }
 
     loader_inventory(const loader_inventory &)             = delete;

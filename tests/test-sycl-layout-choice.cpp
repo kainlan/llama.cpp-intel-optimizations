@@ -649,9 +649,11 @@ static bool run_kv_context_room_before_experts_test() {
 // An explicit micro-batch's PP MoE oneDNN scratch ring that the RUNTIME zone planned for the load's own micro-batch
 // cannot hold is placed, not refused: the routed experts give up the room, and only when moving every device-resident
 // expert would not free it is the context refused, with the largest -ub that fits. The ring here has a 256 KiB weight
-// slot, 1 KiB of activation and 512 B of output per row, and depth 2; the rest of the RUNTIME requirement is 1 MiB, and
-// no floor. So the ring is 2 MiB at the default 512 and 6.5 MiB at 2048, and the zone grows from 3 MiB to 7.5 MiB: a
-// 4.5 MiB room, exactly six of the synthetic model's 768 KiB triplets.
+// slot, scratch rows of 256 B activation and 128 B output, and depth 2. The synthetic model's 4 experts with 2 used
+// pack a micro-batch that is a multiple of 64 into 4 scratch rows a row, so 1 KiB of activation and 512 B of output
+// per row. The rest of the RUNTIME requirement is 1 MiB, and no floor. So the ring is 2 MiB at the default 512 and
+// 6.5 MiB at 2048, and the zone grows from 3 MiB to 7.5 MiB: a 4.5 MiB room, exactly six of the synthetic model's
+// 768 KiB triplets.
 namespace explicit_ubatch_case {
 constexpr size_t mib           = 1024 * 1024;
 constexpr size_t zone_default  = 3 * mib;
@@ -665,8 +667,10 @@ static ggml_sycl::pp_moe_onednn_explicit_ubatch_room room_with_zone(size_t runti
     in.n_ubatch                 = 2048;
     in.n_ubatch_default         = 512;
     in.weight_slot_bytes        = 256 * 1024;
-    in.activation_bytes_per_row = 1024;
-    in.output_bytes_per_row     = 512;
+    in.activation_bytes_per_row = 256;
+    in.output_bytes_per_row     = 128;
+    in.n_expert                 = kv_order_case::n_experts;
+    in.n_expert_used            = 2;
     in.ring_depth               = 2;
     in.runtime_fixed_bytes      = runtime_fixed;
     in.runtime_floor_bytes      = 0;
@@ -1074,7 +1078,8 @@ static bool run_kv_context_room_cost_is_net_test() {
 }
 
 // The explicit micro-batch's cost is net too, on the same unequal triplets: layer 0's are four times layer 1's. The
-// ring here has a 256 KiB weight slot, 192 B of activation and 96 B of output per row, and depth 1, so the ring at 2560
+// ring here has a 256 KiB weight slot, scratch rows of 48 B activation and 24 B output, and depth 1. The 4 experts with
+// 2 used pack 2560 rows into 10240 scratch rows, 192 B of activation and 96 B of output per row, so the ring at 2560
 // is 576 KiB more than at the default 512. The RUNTIME zone already holds that room, which it took from the weight
 // capacity when it grew, so the budget the planner is given is what is left beside the zone, as for the placed plan
 // above. The hold credits what the zone holds before it charges the room, so it takes nothing more from that budget.
@@ -1102,8 +1107,10 @@ static bool run_explicit_ubatch_cost_is_net_test() {
     in.n_ubatch                 = 2560;
     in.n_ubatch_default         = 512;
     in.weight_slot_bytes        = 256 * 1024;
-    in.activation_bytes_per_row = 192;
-    in.output_bytes_per_row     = 96;
+    in.activation_bytes_per_row = 48;
+    in.output_bytes_per_row     = 24;
+    in.n_expert                 = n_experts;
+    in.n_expert_used            = 2;
     in.ring_depth               = 1;
     in.runtime_fixed_bytes      = fixed_bytes;
     in.runtime_floor_bytes      = 0;

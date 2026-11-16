@@ -141,6 +141,8 @@ FIT_INPUTS = (
     "fit.weight_slot_bytes = in.weight_slot_bytes;",
     "fit.activation_bytes_per_row = in.activation_bytes_per_row;",
     "fit.output_bytes_per_row = in.output_bytes_per_row;",
+    "fit.n_expert = in.n_expert;",
+    "fit.n_expert_used = in.n_expert_used;",
     "fit.ring_depth = in.ring_depth;",
     "fit.n_ubatch = in.n_ubatch;",
 )
