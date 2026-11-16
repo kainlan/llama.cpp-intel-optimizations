@@ -2735,8 +2735,9 @@ kernel log check, per stage. A stage is done when its record is complete and eve
 
 ## Amendment 1 (stage 1): the process waits for the driver's submission rings before it ends (llama.cpp-488x)
 
-**Status:** written 2026-11-16 after the owner's ruling at gate G1 ("Investigate, then amend"). Not approved. No
-task below is spawned before the owner's review.
+**Status:** written 2026-11-16 after the owner's ruling at gate G1 ("Investigate, then amend"). **Approved by the
+owner on 2026-11-16, as written** ("Approve as written"), with one decision: L2's positive control is the 22
+unsettled exits already measured that morning ("Reuse this morning's 22 exits"), so L2 runs no new unsettled exit.
 
 **What was measured** (B50, driver 26.44, spike build db1b43cb3 on `spike/488x-exit-drain`, never merged; records on
 llama.cpp-488x, comments c-kv48, c-9rr2, c-kuwt):
@@ -3374,10 +3375,11 @@ Run after W1.8 merges into `integ/th32` and the tree is rebuilt. B50, `GPU.lock`
    the registered Python gate set show no new failure against the base.
 2. The device modes `mmid op sync graph`, each 5 times in rotated order, default settle: 20 exits. **Pass:** no exit
    leaves a `Fault response`, `Engine reset` or `CAT error` line.
-3. The positive control. The zero in step 2 means something only against exits without the wait. Which control is
-   used is the owner's decision at the review of this amendment (a fresh interleaved arm with the variable at 0
-   costs about one chance in six of a whole-GT reset on the B50; the alternative is this morning's 22 unsettled exits
-   on the same driver and the same modes).
+3. The positive control (owner's decision, 2026-11-16): the 22 unsettled exits measured on 2026-11-16 on the same
+   card, driver and modes, of which 16 left kernel lines. L2 runs no exit with the variable at 0: a fresh arm of ten
+   would cost about one chance in six of a whole-GT reset on the B50. The record states the control's date, build
+   (db1b43cb3) and driver beside the result, and that the driver was read again before step 2: if it has changed
+   since the control was taken, the lead stops and asks the owner.
 4. The Mistral completion gate and the GPT-OSS chat gate on the B50. One interleaved ABBA pair, Mistral Q4_0
    `-p 512 -n 128`, against the tree before W1.6: no difference beyond the B50's spread (the settle is on failure
    paths only).
@@ -3412,5 +3414,6 @@ backend owns, not a killed child.
 ### End-to-end validation of the amendment
 
 L2 is the validation: the finished binaries, on the B50, ending real processes through the fast exit, with the
-kernel log as the observation. **Observed success:** 20 settled exits with no kernel GPU line, the control arm the
-owner chose showing lines, both correctness gates passing, and the record on llama.cpp-488x.
+kernel log as the observation. **Observed success:** 20 settled exits with no kernel GPU line, against the control the
+owner chose (16 of 22 unsettled exits with lines, same day, card and driver), both correctness gates passing, and
+the record on llama.cpp-488x.
