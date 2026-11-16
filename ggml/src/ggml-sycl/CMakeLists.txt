@@ -6604,12 +6604,36 @@ target_compile_definitions(test-sycl-fatal-exit PRIVATE
 )
 target_link_libraries(test-sycl-fatal-exit PRIVATE ggml-sycl-private-fixtures)
 set_target_properties(test-sycl-fatal-exit PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-foreach(_fatal_mode IN ITEMS helper control classify)
+# TIMEOUT covers the capture mode's four children, each bounded at 35 s by the parent.
+foreach(_fatal_mode IN ITEMS helper control classify capture)
     add_test(NAME test-sycl-fatal-exit-${_fatal_mode} COMMAND test-sycl-fatal-exit ${_fatal_mode})
     set_tests_properties(test-sycl-fatal-exit-${_fatal_mode} PROPERTIES
         LABELS "sycl;fatal-exit"
         ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-        TIMEOUT 60
+        TIMEOUT 150
+    )
+endforeach()
+# The device modes inject the loss a lost device throws, at MUL_MAT_ID, at any op, at the synchronize wait and at the
+# graph boundary. Each child sets its own GGML_SYCL_TEST_INJECT_DEVICE_LOST (see device_injection() in the test), so a
+# mode runs by hand with no environment beyond the device selector.
+# Kernel log lines seen in two runs of the modes on the B50 (driver 26.44). In one run mmid left none, op left one
+# "Fault response: Unsuccessful -ENOENT" and one "Engine reset: engine_class=bcs", and sync left two "Fault response"
+# lines and one engine reset each on the compute engine (ccs) and the copy engine (bcs). In the other run mmid, op and
+# sync each left one "Fault response" line and one bcs engine reset. graph, with its present graph, left none. The
+# lines vary from run to run. The resets are scoped to the dying process's own context, and the card served the next
+# process each time. This is not the unrecoverable-hang signature, which leaves the card unusable until a reboot.
+# When the modes ran one second apart under ctest, the fourth process hung on its first copy and the kernel reset the
+# whole GT about 35 s later. Each mode's parent therefore waits 12 s after its child before it returns.
+set(_fatal_device_env "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+                      "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+foreach(_fatal_site IN ITEMS mmid op sync graph)
+    add_test(NAME test-sycl-fatal-exit-${_fatal_site} COMMAND test-sycl-fatal-exit ${_fatal_site})
+    set_tests_properties(test-sycl-fatal-exit-${_fatal_site} PROPERTIES
+        LABELS "sycl;fatal-exit;device;B50"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        ENVIRONMENT "${_fatal_device_env}"
+        TIMEOUT 120
     )
 endforeach()
 endif() # static SYCL backend fixture

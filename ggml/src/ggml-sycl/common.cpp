@@ -24,12 +24,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
 #if defined(_WIN32)
 #    include <windows.h>
 #else
+#    include <fcntl.h>
 #    include <unistd.h>
 #endif
 
@@ -782,9 +784,106 @@ int ggml_sycl_fatal_exit_code(const char * what) noexcept {
     return ggml_sycl_what_is_device_lost(what) ? GGML_SYCL_EXIT_DEVICE_LOST : 1;
 }
 
+#if defined(__linux__)
+// Copies /proc/self/<name> to `to`, which must not exist yet. Returns nullptr when every byte was copied, or why not,
+// and then removes the partial copy. errno is read at the call that failed, before a close can change it.
+static const char * ggml_sycl_fatal_capture_copy(const char * name, const char * to) noexcept {
+    char from[64];
+    std::snprintf(from, sizeof(from), "/proc/self/%s", name);
+    const int in = open(from, O_RDONLY | O_CLOEXEC);
+    if (in < 0) {
+        return std::strerror(errno);
+    }
+    // Owner-only: the kernel lets only a ptrace-capable reader open /proc/<pid>/maps and smaps, and the copy must not
+    // widen that while the process may still run.
+    const int out = open(to, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (out < 0) {
+        const int err = errno;
+        close(in);
+        return std::strerror(err);
+    }
+    const char * why = nullptr;
+    char         buf[65536];
+    for (;;) {
+        const ssize_t n = read(in, buf, sizeof(buf));
+        if (n == 0) {
+            break;
+        }
+        if (n < 0) {
+            why = std::strerror(errno);
+            break;
+        }
+        // A write that runs out of space or quota returns a short count first and the error only on the next call;
+        // the loop makes that call, so the line can give the error.
+        size_t off = 0;
+        while (off < static_cast<size_t>(n)) {
+            const ssize_t w = write(out, buf + off, static_cast<size_t>(n) - off);
+            if (w <= 0) {
+                why = w < 0 ? std::strerror(errno) : "short write";
+                break;
+            }
+            off += static_cast<size_t>(w);
+        }
+        if (why != nullptr) {
+            break;
+        }
+    }
+    close(in);
+    close(out);
+    if (why != nullptr) {
+        // Reached only when this call created the file (O_EXCL), so a file an earlier process left is never removed.
+        // A partial copy under the final name would read as a complete one once the log is gone.
+        unlink(to);
+    }
+    return why;
+}
+#endif
+
+// GGML_SYCL_FATAL_CAPTURE_DIR=<dir>: copy this process's memory map, its per-mapping detail and its status into <dir>,
+// once. The kernel's GPU fault record names an address, and only a map taken while the process still exists can say
+// which mapping held it. <dir> must already exist; nothing but the three files is created, each private to the user.
+// The capture line is printed only when all three files were written, so it always means a complete capture; a file
+// that was not written in full is named on a "capture failed" line with the reason instead, and its partial copy is
+// removed.
+static void ggml_sycl_fatal_capture() noexcept {
+#if defined(__linux__)
+    static std::atomic<bool> done{ false };
+    const char *             dir = std::getenv("GGML_SYCL_FATAL_CAPTURE_DIR");
+    if (dir == nullptr || dir[0] == '\0' || done.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    const long pid = static_cast<long>(getpid());
+    char       base[1024];
+    const int  base_len  = std::snprintf(base, sizeof(base), "%s/sycl-fatal-%ld", dir, pid);
+    const bool base_fits = base_len >= 0 && static_cast<size_t>(base_len) < sizeof(base);
+
+    static const char * const names[]     = { "maps", "smaps", "status" };
+    bool                      all_written = true;
+    for (const char * name : names) {
+        char      to[1100];
+        const int to_len = base_fits ? std::snprintf(to, sizeof(to), "%s.%s", base, name) : -1;
+        if (to_len < 0 || static_cast<size_t>(to_len) >= sizeof(to)) {
+            std::fprintf(stderr, "[SYCL-FATAL] capture failed: %s/sycl-fatal-%ld.%s: path too long\n", dir, pid, name);
+            all_written = false;
+            continue;
+        }
+        const char * why = ggml_sycl_fatal_capture_copy(name, to);
+        if (why != nullptr) {
+            std::fprintf(stderr, "[SYCL-FATAL] capture failed: %s: %s\n", to, why);
+            all_written = false;
+        }
+    }
+    if (all_written) {
+        std::fprintf(stderr, "[SYCL-FATAL] capture: %s\n", base);
+    }
+    std::fflush(stderr);
+#endif
+}
+
 void ggml_sycl_fatal_exit(int code, const char * message) noexcept {
     std::fprintf(stderr, "[SYCL-FATAL] %s: ending the process with _Exit(%d), no teardown\n",
                  message ? message : "(no message)", code);
+    ggml_sycl_fatal_capture();
     std::fflush(stdout);
     std::fflush(stderr);
     // The watchdog's order: release every device command parked on a CPU expert job, then print the zone-reset
@@ -793,6 +892,68 @@ void ggml_sycl_fatal_exit(int code, const char * message) noexcept {
     ggml_sycl::zone_reset_audit_report("sycl-fatal-exit");
     std::_Exit(code);
 }
+
+static std::atomic<bool> g_sycl_device_lost_latched{ false };
+
+static void ggml_sycl_device_lost_at_exit() {
+    // A normal exit would have flushed every open C stdio stream; the fast exit flushes only stdout and stderr.
+    std::fflush(nullptr);
+    ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "process exit after a device loss");
+}
+
+void ggml_sycl_note_exception(const char * what) noexcept {
+    if (!ggml_sycl_what_is_device_lost(what)) {
+        return;
+    }
+    if (!g_sycl_device_lost_latched.exchange(true, std::memory_order_acq_rel)) {
+        std::fprintf(stderr,
+                     "[SYCL-FATAL] device lost: %s\n"
+                     "[SYCL-FATAL] the process leaves through _Exit(%d) at its next failed SYCL check (SYCL_CHECK) "
+                     "or when it exits, without running exit handlers\n",
+                     what, GGML_SYCL_EXIT_DEVICE_LOST);
+        std::fflush(stderr);
+        // Here and not at the exit: the process may run on for a while after the loss, and a map taken later no longer
+        // shows what was mapped when the device faulted.
+        ggml_sycl_fatal_capture();
+        if (std::atexit(ggml_sycl_device_lost_at_exit) != 0) {
+            std::fprintf(stderr, "[SYCL-FATAL] could not register the exit handler; a normal exit runs teardown\n");
+            std::fflush(stderr);
+        }
+    }
+}
+
+bool ggml_sycl_device_lost_latched() noexcept {
+    return g_sycl_device_lost_latched.load(std::memory_order_acquire);
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void ggml_sycl_test_inject_device_lost(const char * site) {
+    struct request {
+        std::string site;
+        long long   n = 0;
+    };
+
+    static const request req = [] {
+        request      r;
+        const char * value = std::getenv("GGML_SYCL_TEST_INJECT_DEVICE_LOST");
+        const char * colon = value != nullptr ? std::strchr(value, ':') : nullptr;
+        if (colon != nullptr) {
+            r.site.assign(value, colon);
+            r.n = std::atoll(colon + 1);
+        }
+        return r;
+    }();
+    if (req.n <= 0 || site == nullptr || req.site != site) {
+        return;
+    }
+    static std::atomic<long long> calls{ 0 };
+    if (calls.fetch_add(1, std::memory_order_relaxed) + 1 >= req.n) {
+        throw sycl::exception(sycl::make_error_code(sycl::errc::runtime),
+                              "injected test fault: level_zero backend failed with error: 20 "
+                              "(UR_RESULT_ERROR_DEVICE_LOST)");
+    }
+}
+#endif
 
 // Parse GGML_SYCL_OP_TIMEOUT_MS. Returns the parsed non-negative value, or
 // watchdog_default_timeout_ms when the value is missing, empty, negative, or

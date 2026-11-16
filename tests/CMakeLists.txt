@@ -4668,6 +4668,14 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-fatal-exit-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fatal-exit-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # The batched MoE prompt executor lays its activation and output scratch out per GEMM group
 # (moe_pp_pack_gemm_groups), and the gather, both GEMM arms and the scatter take every offset into that scratch from
 # one helper each, so they cannot disagree about where an expert's rows are. Source-only; the layout itself runs in
