@@ -108,6 +108,7 @@
 #include "ggml-sycl/dispatch-tuning.hpp"
 #include "ggml-sycl/dsv4-hc.hpp"
 #include "ggml-sycl/element_wise.hpp"
+#include "ggml-sycl/exit-settle.hpp"
 #include "ggml-sycl/fattn.hpp"
 #include "ggml-sycl/fusion-alias.hpp"
 #include "ggml-sycl/gemm.hpp"
@@ -110317,6 +110318,7 @@ gpu_dispatch:
                 } catch (const sycl::exception & e) {
                     GGML_LOG_ERROR("[SYCL] non-FA attention barrier failed after node %d (%s): %s\n", i,
                                    node->name ? node->name : "(null)", e.what());
+                    ggml_sycl::exit_settle();
                     std::abort();
                 }
             }
@@ -110328,6 +110330,7 @@ gpu_dispatch:
                 } catch (const sycl::exception & e) {
                     GGML_LOG_ERROR("[SYCL] debug sync failed after node %d (%s): %s\n", i,
                                    node->name ? node->name : "(null)", e.what());
+                    ggml_sycl::exit_settle();
                     std::abort();
                 }
             }

@@ -18,6 +18,8 @@
 #ifndef GGML_SYCL_TLSF_ALLOCATOR_HPP
 #define GGML_SYCL_TLSF_ALLOCATOR_HPP
 
+#include "exit-settle.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
@@ -33,6 +35,7 @@
 #define TLSF_ASSERT(cond) do { \
     if (!(cond)) { \
         fprintf(stderr, "TLSF_ASSERT failed: %s at %s:%d\n", #cond, __FILE__, __LINE__); \
+        ggml_sycl::exit_settle(); \
         abort(); \
     } \
 } while(0)
