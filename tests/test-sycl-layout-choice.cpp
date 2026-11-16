@@ -1864,6 +1864,44 @@ static bool run_moe_stream_ring_room_before_experts_test() {
     return ok;
 }
 
+// Checks every routed-expert entry of `plan` placed on the device (or, with `on_device` false, on the host): each must
+// be AOS, keep the unpadded `dst_size` and charge the staged `block`. It counts every mismatch rather than stopping at
+// the first, prints one line for them, and fails when there is no such entry, so it cannot pass on an empty set.
+static bool expert_charges_are_staged_blocks(const ggml_sycl::placement_plan & plan,
+                                             bool                              on_device,
+                                             size_t                            dst_size,
+                                             size_t                            block,
+                                             const char *                      what) {
+    size_t                             checked = 0;
+    size_t                             wrong   = 0;
+    const ggml_sycl::placement_entry * first   = nullptr;
+    for (const auto & e : plan.entries) {
+        if (e.expert_id < 0 || e.on_device != on_device) {
+            continue;
+        }
+        checked++;
+        if (e.layout == GGML_LAYOUT_AOS && e.dst_size == dst_size && e.vram_charge_size == block) {
+            continue;
+        }
+        if (wrong++ == 0) {
+            first = &e;
+        }
+    }
+    if (checked == 0) {
+        printf("FAIL: %s: the plan has no such expert entry to check\n", what);
+        return false;
+    }
+    if (first != nullptr) {
+        printf(
+            "FAIL: %s: an AOS expert must charge its staged block and keep its unpadded dst_size: %zu of %zu wrong, "
+            "first %s expert %d layout %d dst_size %zu (want %zu) charge %zu (want %zu)\n",
+            what, wrong, checked, first->name.c_str(), first->expert_id, (int) first->layout, first->dst_size, dst_size,
+            first->vram_charge_size, block);
+        return false;
+    }
+    return true;
+}
+
 // A routed expert on the device costs the WEIGHT zone what direct staging allocates for it. The case's Q4_0 experts
 // have 256 columns, so staging completes each one's last row to 512 columns (MATRIX_ROW_PADDING): 256 more columns of
 // Q4_0, 144 bytes, and the zone rounds the 18576-byte request to its 256-byte grain, 18688. The entry's dst_size stays
@@ -1921,11 +1959,96 @@ static bool run_expert_charge_is_staged_bytes_test() {
             device_triplets(plan), blocks, plan.moe_stream_ring_reserve_bytes, ring_bytes, base, budget);
         ok = false;
     }
+    // The experts that budget leaves on the host carry the same charge: a later move to the device charges what the
+    // entry says.
+    ok = expert_charges_are_staged_blocks(plan, false, matrix_bytes, block, "single device, host experts") && ok;
 
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
     if (ok) {
         printf(
             "PASS: a device AOS expert charges the WEIGHT zone its staged block, so the ring's room is really there\n");
+    }
+    return ok;
+}
+
+// The multi-device planner charges an AOS expert its staged block too, on a device and on the host. One layer of
+// gate/up/down experts, four of each, every matrix 256 x 128 in a type whose 256-column row takes 144 bytes, so each
+// is 18432 bytes and staging adds the same 144-byte tail as above. Two devices, so the planner takes its multi-device
+// path; the second is too small for one expert, so every device expert lands on the first.
+//
+// Q4_K: the multi-device common layout is AOS (the secondary executor takes SOA only for MXFP4, Q4_0 and Q6_K), and
+// the primary's own layout for it is AOS as well, so the entries keep the layout the entry builder gave them and its
+// charge is the one checked. Q4_0: the common layout is SOA, and the per-target pass moves every expert to the
+// primary's AOS, on the device and on the host, so the charge checked is the one that pass sets. An entry left SOA
+// fails the layout check, which proves the pass ran.
+namespace staged_charge_case {
+constexpr int    n_exps       = 4;
+constexpr int    ncols        = 256;
+constexpr int    nrows        = 128;
+constexpr size_t matrix_bytes = 18432;        // 144 bytes per 256-column row of Q4_K or Q4_0, times 128 rows
+constexpr size_t mib          = 1024u * 1024u;
+constexpr size_t tiny         = 16u * 1024u;  // less than one expert
+
+static std::vector<ggml_sycl::placement_tensor_info> inventory(ggml_type type) {
+    std::vector<ggml_sycl::placement_tensor_info> inv;
+    for (const char * role : { "gate", "up", "down" }) {
+        ggml_sycl::placement_tensor_info tensor(std::string("blk.0.ffn_") + role + "_exps.weight", 0);
+        tensor.type  = type;
+        tensor.ne[0] = ncols;
+        tensor.ne[1] = nrows;
+        tensor.ne[2] = n_exps;
+        tensor.ne[3] = 1;
+        tensor.size  = ggml_row_size(type, ncols) * static_cast<size_t>(nrows) * n_exps;
+        inv.push_back(tensor);
+    }
+    return inv;
+}
+
+static ggml_sycl::placement_plan plan_for(ggml_type type, size_t primary_budget) {
+    const std::vector<ggml_sycl::device_budget> devices = {
+        { 0, primary_budget, primary_budget, 1.0, true },
+        { 1, tiny,           tiny,           1.0, true },
+    };
+    ggml_sycl::placement_kv_info kv_info{};
+    kv_info.n_ubatch = 512;
+    return ggml_sycl::compute_multi_device_plan(devices, inventory(type), 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+                                                nullptr, n_exps, ggml_sycl::host_ledger_budget());
+}
+}  // namespace staged_charge_case
+
+static bool run_multi_device_expert_charge_is_staged_bytes_test() {
+    using namespace staged_charge_case;
+    bool ok = true;
+
+    // The stager's rule, written here and not read from the planner: 256 more columns complete the row to 512.
+    const size_t tail_q4_k = ggml_row_size(GGML_TYPE_Q4_K, 512 - ncols % 512);
+    const size_t tail_q4_0 = ggml_row_size(GGML_TYPE_Q4_0, 512 - ncols % 512);
+    const size_t block     = (matrix_bytes + tail_q4_k + 255) / 256 * 256;
+    if (ggml_row_size(GGML_TYPE_Q4_K, ncols) * nrows != matrix_bytes ||
+        ggml_row_size(GGML_TYPE_Q4_0, ncols) * nrows != matrix_bytes || tail_q4_k != 144 || tail_q4_0 != 144 ||
+        block != 18688) {
+        printf(
+            "FAIL: multi device: the case's experts must be 18432 + 144 bytes in an 18688-byte block: tail Q4_K %zu, "
+            "tail Q4_0 %zu, block %zu\n",
+            tail_q4_k, tail_q4_0, block);
+        ok = false;
+    }
+
+    ok = expert_charges_are_staged_blocks(plan_for(GGML_TYPE_Q4_K, 64 * mib), true, matrix_bytes, block,
+                                          "multi device Q4_K, device experts") &&
+         ok;
+    ok = expert_charges_are_staged_blocks(plan_for(GGML_TYPE_Q4_K, tiny), false, matrix_bytes, block,
+                                          "multi device Q4_K, host experts") &&
+         ok;
+    ok = expert_charges_are_staged_blocks(plan_for(GGML_TYPE_Q4_0, 64 * mib), true, matrix_bytes, block,
+                                          "multi device Q4_0, device experts") &&
+         ok;
+    ok = expert_charges_are_staged_blocks(plan_for(GGML_TYPE_Q4_0, tiny), false, matrix_bytes, block,
+                                          "multi device Q4_0, host experts") &&
+         ok;
+
+    if (ok) {
+        printf("PASS: the multi-device planner charges an AOS expert its staged block, on a device and on the host\n");
     }
     return ok;
 }
@@ -4454,6 +4577,7 @@ int main() {
         mock_ok = run_kv_context_room_is_cost_based_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_before_experts_test() && mock_ok;
         mock_ok = run_expert_charge_is_staged_bytes_test() && mock_ok;
+        mock_ok = run_multi_device_expert_charge_is_staged_bytes_test() && mock_ok;
         mock_ok = run_moe_stream_ring_pins_host_experts_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_converges_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_cap_refuses_test() && mock_ok;

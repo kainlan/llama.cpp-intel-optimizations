@@ -32136,9 +32136,9 @@ static size_t planner_layout_bytes_for_dims(ggml_type        type,
         case GGML_LAYOUT_AOS:
         case GGML_LAYOUT_SOA:
         default:
-            // Unpadded: a direct-staged AOS expert's entry can exceed this by the MATRIX_ROW_PADDING tail
-            // (ggml_sycl_get_padded_weight_bytes), so expert loans and refills size copies from the entry
-            // (llama.cpp-pu8v).
+            // Unpadded: direct staging adds the row-padding tail (aos_staged_weight_bytes), and the plan's VRAM charge
+            // counts it (planner_expert_vram_charge_bytes). dst_size leaves it out because loans and refills size their
+            // copies from the cache entry.
             return ggml_row_size(type, ncols) * static_cast<size_t>(nrows);
     }
 }
@@ -32316,9 +32316,10 @@ static ggml_layout_mode planner_multi_device_moe_common_layout(const placement_t
     return GGML_LAYOUT_AOS;
 }
 
-// What a routed expert costs the WEIGHT zone on a device: its staged bytes, rounded as the zone rounds them. An AOS
-// quantized expert is staged with its row-padding tail, which dst_size leaves out because loans and refills size their
-// copies from the entry.
+// What a routed expert in `layout` costs the WEIGHT zone when it is on a device: its staged bytes, rounded as the zone
+// rounds them. A host-placed expert carries the same charge, because a later move to a device charges what the entry
+// says. An AOS quantized expert is staged with its row-padding tail, which dst_size leaves out because loans and
+// refills size their copies from the entry.
 static size_t planner_expert_vram_charge_bytes(ggml_type type, int64_t ncols, ggml_layout_mode layout, size_t bytes) {
     return placement_vram_charge_bytes(layout == GGML_LAYOUT_AOS ? aos_staged_weight_bytes(type, ncols, bytes) : bytes);
 }
@@ -33270,7 +33271,7 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
                 plan.uncharge_host_weight(entry.host_backing, freed);
                 host_delta -= static_cast<int64_t>(freed);
             }
-            entry.vram_charge_size = placement_vram_charge_bytes(new_size);
+            entry.vram_charge_size = planner_expert_vram_charge_bytes(entry.type, entry.ne[0], target_layout, new_size);
             host_changed++;
         }
 
@@ -37162,7 +37163,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 if (!on_device) {
                     entry.layout           = GGML_LAYOUT_AOS;
                     entry.dst_size         = entry.src_size;
-                    entry.vram_charge_size = placement_vram_charge_bytes(entry.dst_size);
+                    entry.vram_charge_size =
+                        planner_expert_vram_charge_bytes(entry.type, entry.ne[0], entry.layout, entry.dst_size);
                 }
             }
         }
