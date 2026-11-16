@@ -61,6 +61,25 @@ constexpr const char * k_capture_line        = "[SYCL-FATAL] capture: ";
 constexpr const char * k_capture_failed_line = "[SYCL-FATAL] capture failed: ";
 constexpr const char * k_settle_env          = "GGML_SYCL_FATAL_EXIT_SETTLE_MS";
 constexpr const char * k_settle_line         = "[SYCL-FATAL] settle: ";
+constexpr const char * k_settle_t0_line      = "TEST-SETTLE-T0 ";
+
+// The values the settle-cap child gives GGML_SYCL_FATAL_EXIT_SETTLE_MS (null: unset) and the wait each must read as.
+struct settle_case {
+    const char * label;
+    const char * value;
+    long         want_ms;
+};
+
+constexpr settle_case k_settle_cases[] = {
+    { "unset",        nullptr,                200  },
+    { "empty",        "",                     200  },
+    { "garbage",      "abc",                  200  },
+    { "negative",     "-5",                   200  },
+    { "zero",         "0",                    0    },
+    { "in-range",     "150",                  150  },
+    { "above-cap",    "999999",               5000 },
+    { "out-of-range", "99999999999999999999", 5000 },
+};
 
 // The files a capture writes, as <dir>/sycl-fatal-<pid><ext>.
 constexpr const char * k_capture_exts[] = { ".maps", ".smaps", ".status" };
@@ -91,6 +110,7 @@ struct child_result {
     bool        reaped    = false;
     bool        pipe_open = false;  // something still held the child's output pipe when the parent stopped reading
     double      seconds   = 0.0;    // until the child was reaped, or until the parent stopped if it never was
+    long long   reaped_ns = 0;      // steady_clock at the reap, in the clock's own epoch; 0 if never reaped
     std::string out;                // the child's stdout and stderr, which share one pipe
 };
 
@@ -175,8 +195,10 @@ child_result run_child(const char * self, const char * mode) {
                 break;
             }
             if (done == pid) {
-                r.reaped  = true;
-                r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                const auto now = std::chrono::steady_clock::now();
+                r.reaped       = true;
+                r.seconds      = std::chrono::duration<double>(now - t0).count();
+                r.reaped_ns    = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
             }
         }
     }
@@ -193,6 +215,20 @@ child_result run_child(const char * self, const char * mode) {
 
 bool has(const child_result & r, const char * needle) {
     return r.out.find(needle) != std::string::npos;
+}
+
+// The steady_clock time, in nanoseconds, that the child printed after `tag`. steady_clock is CLOCK_MONOTONIC on
+// Linux, so it is one clock in the parent and the child. False when the line is missing or does not hold a number.
+bool child_time_ns(const child_result & r, const char * tag, long long & ns) {
+    const size_t at = r.out.find(tag);
+    if (at == std::string::npos) {
+        return false;
+    }
+    const char * begin = r.out.c_str() + at + std::strlen(tag);
+    char *       end   = nullptr;
+    errno              = 0;
+    ns                 = std::strtoll(begin, &end, 10);
+    return errno == 0 && end != begin && (*end == '\n' || *end == '\0') && ns > 0;
 }
 
 int fail(const char * mode, const child_result & r, const char * why) {
@@ -465,11 +501,27 @@ int child_main(const char * mode) {
     }
     if (std::strcmp(mode, "settle") == 0 || std::strcmp(mode, "settle-off") == 0) {
         plant_markers();
+        // The time the settle starts from. The parent measures from here to the reap, so the child's start-up, which
+        // a measure from the fork would include, cannot stand in for a settle that does not sleep.
+        const long long t0_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        std::fprintf(stderr, "%s%lld\n", k_settle_t0_line, t0_ns);
+        std::fflush(stderr);
         ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "test: settle mode");
     }
     if (std::strcmp(mode, "settle-cap") == 0) {
-        // The cap is read back, not slept through: a child that slept for it would hold the test for five seconds.
-        std::fprintf(stderr, "TEST-SETTLE-MS %ld\n", ggml_sycl::exit_settle_ms());
+        // The parser is read back, not slept through: a child that slept for the cap would hold the test for five
+        // seconds.
+        for (const settle_case & c : k_settle_cases) {
+            if (c.value == nullptr) {
+                unsetenv(k_settle_env);
+            } else {
+                setenv(k_settle_env, c.value, 1);
+            }
+            std::fprintf(stderr, "TEST-SETTLE-MS %s %ld\n", c.label, ggml_sycl::exit_settle_ms());
+        }
+        unsetenv(k_settle_env);
         return 0;
     }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0 || std::strcmp(mode, "sync") == 0 ||
@@ -889,20 +941,32 @@ int parent_main(const char * self, const char * mode) {
         if (!has(r, "[SYCL-FATAL] settle: waiting 150 ms")) {
             return fail(mode, r, "no settle line with the requested time");
         }
-        if (r.seconds < 0.15) {
-            return fail(mode, r, "the child ended sooner than the settle time");
+        long long t0_ns = 0;
+        if (!child_time_ns(r, k_settle_t0_line, t0_ns)) {
+            return fail(mode, r, "no readable TEST-SETTLE-T0 line, so the settle cannot be timed");
+        }
+        // A lower bound only: the reap is seen up to one poll slice late, and load can lengthen the wait, but neither
+        // can make a real 150 ms settle read as shorter.
+        if (r.reaped_ns - t0_ns < 150000000LL) {
+            return fail(mode, r, "the child ended less than 150 ms after it started the settle");
         }
         return 0;
     }
     if (std::strcmp(mode, "settle-cap") == 0) {
-        setenv(k_settle_env, "999999", 1);
         const child_result r = run_child(self, mode);
-        unsetenv(k_settle_env);
         if (const int rc = check_ended(mode, r)) {
             return rc;
         }
-        if (!r.exited || r.status != 0 || !has(r, "TEST-SETTLE-MS 5000\n")) {
-            return fail(mode, r, "the cap is not 5000 ms");
+        if (!r.exited || r.status != 0) {
+            return fail(mode, r, "the child did not read every value and return 0");
+        }
+        for (const settle_case & c : k_settle_cases) {
+            char line[96];
+            std::snprintf(line, sizeof(line), "TEST-SETTLE-MS %s %ld\n", c.label, c.want_ms);
+            if (!has(r, line)) {
+                const std::string why = std::string("the settle does not read as expected: want ") + line;
+                return fail(mode, r, why.c_str());
+            }
         }
         return 0;
     }

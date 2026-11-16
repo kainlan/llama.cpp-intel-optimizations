@@ -8,11 +8,13 @@
 // reset, and now and then a memory error after which the next process on the card hangs. Waiting here lets the
 // driver stop its rings while the process still exists.
 //
-// It only sleeps and prints. It takes no lock and touches no queue, so it cannot hang after a device loss, and the
-// headers that end the process on misuse can include it without the backend.
+// It only sleeps and prints. It takes no lock of the backend's (only stdio's own stderr lock) and touches no queue, so
+// it cannot hang after a device loss, and the headers that end the process on misuse can include it without the
+// backend.
 
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
@@ -34,6 +36,10 @@ inline long exit_settle_ms() noexcept {
     char * end       = nullptr;
     errno            = 0;
     const long value = std::strtol(env, &end, 10);
+    // A number too large for long is still a whole number above the maximum, so it counts as the maximum.
+    if (errno == ERANGE && value == LONG_MAX && end != env && *end == '\0') {
+        return k_exit_settle_max_ms;
+    }
     if (errno != 0 || end == env || *end != '\0' || value < 0) {
         return k_exit_settle_default_ms;
     }

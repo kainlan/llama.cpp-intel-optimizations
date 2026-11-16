@@ -357,13 +357,18 @@ def test_the_settle_reader_refuses_a_settle_before_the_job_release():
     assert fatal_exit_settle_problems(cpp.replace(body, moved, 1)), "the reader accepted a settle before the release"
 
 
-SETTLE_FORBIDDEN = ("sycl::", "queue", "event", ".wait", "ext_oneapi", "unified_cache", "mem_handle", "dpct::")
+SETTLE_INCLUDES = ("<cerrno>", "<chrono>", "<climits>", "<cstdio>", "<cstdlib>", "<thread>")
+INCLUDE = re.compile(r"^\s*#\s*include\s*([<\"][^>\"]+[>\"])", flags=re.M)
 
 
 def settle_header_problems(hpp: str) -> list:
-    """Why exit-settle.hpp could touch a device: it must be a sleep and a print, usable after a device loss."""
-    return [f"exit-settle.hpp: {word!r} must not appear: the settle may only sleep and print"
-            for word in SETTLE_FORBIDDEN if word in hpp]
+    """Why exit-settle.hpp could reach a device: it may include only the standard headers a sleep and a print need,
+    so no queue, event or wait of the backend or of SYCL is in reach, through any include."""
+    found = INCLUDE.findall(hpp)
+    problems = [f"exit-settle.hpp: #include {name} is not allowed: the settle may only sleep and print"
+                for name in found if name not in SETTLE_INCLUDES]
+    problems += [f"exit-settle.hpp: #include {name} is missing" for name in SETTLE_INCLUDES if name not in found]
+    return problems
 
 
 def test_the_settle_touches_no_device():
@@ -371,10 +376,12 @@ def test_the_settle_touches_no_device():
     assert not problems, "\n".join(problems)
 
 
-def test_the_settle_header_reader_refuses_a_queue_wait():
+@pytest.mark.parametrize("extra", ['#include "ggml-backend.h"', "#include <sycl/sycl.hpp>"])
+def test_the_settle_header_reader_refuses_a_backend_include(extra):
     hpp = code_of(SYCL / "exit-settle.hpp")
-    assert settle_header_problems(hpp + "\ninline void f(sycl::queue & q) { q.wait(); }\n")
-
+    problems = settle_header_problems(hpp.replace("#include <thread>", "#include <thread>\n" + extra, 1))
+    name = extra.split(None, 1)[1]
+    assert any(name in p for p in problems), f"the reader accepted {extra}"
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
