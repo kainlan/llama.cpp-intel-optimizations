@@ -246,16 +246,14 @@ struct expert_inventory {
 
         const size_t woq_slot = align_256(size_t(k_out) * (k_in / 2)) + align_256(size_t(k_in / 32) * k_out);
         inventory.pp_moe_onednn_weight_slot_bytes        = woq_slot * k_experts;
-        inventory.pp_moe_onednn_activation_bytes_per_row = size_t(k_experts) * k_in * sizeof(ggml_fp16_t);
-        inventory.pp_moe_onednn_output_bytes_per_row     = size_t(k_experts) * k_out * sizeof(float);
-        inventory.pp_moe_onednn_activation_slot_bytes =
-            align_256(size_t(n_ubatch) * inventory.pp_moe_onednn_activation_bytes_per_row);
-        inventory.pp_moe_onednn_output_slot_bytes =
-            align_256(size_t(n_ubatch) * inventory.pp_moe_onednn_output_bytes_per_row);
-        inventory.pp_moe_onednn_ring_depth    = 1;
-        inventory.pp_moe_onednn_scratch_bytes = inventory.pp_moe_onednn_weight_slot_bytes +
-                                                inventory.pp_moe_onednn_activation_slot_bytes +
-                                                inventory.pp_moe_onednn_output_slot_bytes;
+        // One scratch row: k_in half floats in, k_out floats out. The backend sizes the activation and output slots
+        // from these and the expert counts, so the loader leaves both slots 0 and plans only the weight slot.
+        inventory.pp_moe_onednn_activation_bytes_per_row = size_t(k_in) * sizeof(ggml_fp16_t);
+        inventory.pp_moe_onednn_output_bytes_per_row     = size_t(k_out) * sizeof(float);
+        inventory.pp_moe_onednn_activation_slot_bytes    = 0;
+        inventory.pp_moe_onednn_output_slot_bytes        = 0;
+        inventory.pp_moe_onednn_ring_depth               = 1;
+        inventory.pp_moe_onednn_scratch_bytes            = inventory.pp_moe_onednn_weight_slot_bytes;
     }
 };
 

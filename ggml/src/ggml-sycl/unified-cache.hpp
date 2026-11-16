@@ -649,7 +649,7 @@ inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
 constexpr uint32_t PLACEMENT_LOAD_N_UBATCH_DEFAULT = 512;
 
 // The micro-batch a load plans at: the inventory's n_ubatch, or PLACEMENT_LOAD_N_UBATCH_DEFAULT when it names none. The
-// one rule the stage's dense scratch and the lazy tables' cache floor both read.
+// one rule the stage's dense scratch, the lazy tables' cache floor and the MoE prompt ring all read.
 inline uint32_t placement_load_n_ubatch(uint32_t n_ubatch) {
     return n_ubatch != 0 ? n_ubatch : PLACEMENT_LOAD_N_UBATCH_DEFAULT;
 }
@@ -3132,17 +3132,23 @@ void unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(int device_id, bool a
 bool unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(int device_id);
 bool unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(int device_id);
 
-// llama.cpp-ibj0: per-row bytes behind the two ubatch-scaled slots above,
+// Bytes of one activation and one output scratch row, and the expert counts,
 // carried from the loader (src/llama-model.cpp's ggml_sycl_tensor_inventory)
-// so the runtime-context transaction can re-plan the ring for the REAL
-// runtime n_ubatch -- the load-time plan above is always sized for the
-// loader's own inventory.n_ubatch (512 today), not whatever n_ubatch the
-// context is actually created with. 0 = no MoE PP ring planned (dense model).
-void   unified_cache_set_planned_pp_moe_onednn_row_bytes(int    device_id,
-                                                         size_t activation_bytes_per_row,
-                                                         size_t output_bytes_per_row);
-size_t unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(int device_id);
-size_t unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(int device_id);
+// so the runtime-context transaction can re-plan the ring for the context's
+// own micro-batch -- the load-time plan above is sized for the load's
+// micro-batch, not whatever n_ubatch the context is actually created with.
+// The slots hold the rows the packed scratch can need, which depend on the
+// expert counts as well as the micro-batch. 0 = no MoE prompt ring planned (a
+// dense model).
+void     unified_cache_set_planned_pp_moe_onednn_row_bytes(int      device_id,
+                                                           size_t   activation_bytes_per_row,
+                                                           size_t   output_bytes_per_row,
+                                                           uint32_t n_expert,
+                                                           uint32_t n_expert_used);
+size_t   unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(int device_id);
+size_t   unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(int device_id);
+uint32_t unified_cache_get_planned_pp_moe_onednn_n_expert(int device_id);
+uint32_t unified_cache_get_planned_pp_moe_onednn_n_expert_used(int device_id);
 
 // The n_ubatch the CURRENTLY PLANNED activation/output slots above were sized
 // for -- distinct from the loader's inventory.n_ubatch (always 512 today):
@@ -3153,13 +3159,13 @@ size_t unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(int device_i
 void     unified_cache_set_planned_pp_moe_onednn_n_ubatch(int device_id, uint32_t n_ubatch);
 uint32_t unified_cache_get_planned_pp_moe_onednn_n_ubatch(int device_id);
 
-// Slot sizes the ring needs for `n_ubatch`, from the per-row bytes above:
-// align256(n_ubatch * per_row) for both activation and output, through
-// pp_moe_onednn_slots_at() (moe-scratch-admission.hpp), the helper the ring's
-// admission and the explicit micro-batch's room size their slots with, so the
-// three cannot round or overflow-check differently. Returns false (leaving the
-// output params untouched) when the per-row bytes are 0 (dense model, no ring
-// planned) or the multiply/align would overflow.
+// Slot sizes the ring needs for `n_ubatch`, from the per-row bytes and expert
+// counts above: the slots `pp_moe_onednn_slots_at()` (moe-scratch-admission.hpp)
+// gives, the helper the ring's admission and the explicit micro-batch's room
+// size their slots with, so the three cannot size a slot differently. Returns
+// false (leaving the output params untouched) when the per-row bytes are 0
+// (dense model, no ring planned), the expert counts are 0, or the
+// multiply/align would overflow.
 bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
                                                   uint32_t n_ubatch,
                                                   size_t * activation_slot_bytes,
@@ -3170,11 +3176,13 @@ bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
 // weight slot plus the two slots `pp_moe_onednn_slots_at` gives for it. Found
 // by bisection, which the slots' never shrinking with the micro-batch allows.
 // Returns 0 when not even 32 rows fit, or the inputs are degenerate
-// (ring_depth 0, or both per-row terms 0).
+// (ring_depth 0, both per-row terms 0, or no experts or none used).
 uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capacity_bytes,
                                                                   size_t   weight_slot_bytes,
                                                                   size_t   activation_bytes_per_row,
                                                                   size_t   output_bytes_per_row,
+                                                                  uint32_t n_expert,
+                                                                  uint32_t n_expert_used,
                                                                   uint32_t ring_depth);
 
 // These four figures are a HARD CAP, not a starting size. Before asking the

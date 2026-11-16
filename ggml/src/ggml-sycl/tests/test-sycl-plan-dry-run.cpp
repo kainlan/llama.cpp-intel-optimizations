@@ -87,6 +87,22 @@ uint64_t residency_entries(const ggml_sycl_plan_dry_run_plan & p) {
     return n;
 }
 
+// The ring the planner charges the RUNTIME zone for an inventory: the loader's weight slot and the activation and
+// output slots pp_moe_onednn_slots_at gives at the load's micro-batch, at the ring's effective depth. The loader sizes
+// only the weight slot, so its scratch bytes are not the ring. 0 when the slots cannot be sized.
+size_t planned_ring_bytes(const ggml_sycl_tensor_inventory & inv) {
+    size_t act = 0;
+    size_t out = 0;
+    if (!pp_moe_onednn_slots_at(placement_load_n_ubatch(inv.n_ubatch), static_cast<uint32_t>(std::max(0, inv.n_expert)),
+                                static_cast<uint32_t>(std::max(0, inv.n_expert_used)),
+                                inv.pp_moe_onednn_activation_bytes_per_row, inv.pp_moe_onednn_output_bytes_per_row,
+                                &act, &out)) {
+        return 0;
+    }
+    return test_pp_moe_onednn_planned_scratch_bytes(inv.pp_moe_onednn_weight_slot_bytes, act, out,
+                                                    inv.pp_moe_onednn_ring_depth);
+}
+
 // Zeroes the per-device planner inputs a stage publishes from an inventory (the PP pipeline scratch and the PP MoE
 // oneDNN ring), so a dry run that follows plans from what it publishes itself, not from what the stage left.
 void withdraw_published_inputs() {
@@ -211,7 +227,10 @@ arm_result arm_a_expected_host_is_the_stage_figure() {
                         num(stage.size()));
         return r;
     }
-    const size_t ring = inv.inv.pp_moe_onednn_scratch_bytes;
+    const size_t ring = planned_ring_bytes(inv.inv);
+    if (ring == 0) {
+        void_arm(r, "the inventory's ring cannot be sized, so a RUNTIME term above it proves nothing");
+    }
     for (uint32_t i = 0; i < res->n_plans; ++i) {
         const ggml_sycl_plan_dry_run_plan & p    = res->plans[i];
         const std::string                   name = "plan " + num(i) + " (device " + std::to_string(p.device) + ")";
@@ -531,7 +550,10 @@ arm_result arm_c_a_dry_run_stores_nothing() {
     if (res->host_budget == B0) {
         void_arm(r, "the dry run's own budget is B0, so a store would not show");
     }
-    const size_t ring = inv.inv.pp_moe_onednn_scratch_bytes;
+    const size_t ring = planned_ring_bytes(inv.inv);
+    if (ring == 0) {
+        void_arm(r, "the inventory's ring cannot be sized, so a RUNTIME term above it proves nothing");
+    }
     for (uint32_t i = 0; i < res->n_plans; ++i) {
         if (res->plans[i].runtime < ring) {
             void_arm(r, "plan " + num(i) + " did not plan the inventory's ring, so the dry run wrote no global");

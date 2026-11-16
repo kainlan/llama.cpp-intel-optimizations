@@ -331,18 +331,22 @@ struct ggml_sycl_tensor_inventory {
     // Computed from the largest quantized weight tensor as 2 x (n_elements * sizeof(fp16)).
     size_t                         pp_pipeline_scratch_bytes;
     // Ring-backed PP MoE oneDNN staging planned from the model inventory.
-    // Slots hold one dequantized expert weight, one f16 activation tile, and one f32 output tile.
+    // The weight slot is sized for every expert in the GEMM's weight form: the WOQ repack (4-bit values and e8m0
+    // scales) by default, or the f16 dequant when GGML_SYCL_MOE_PP_WOQ=0 at load. A type on the executor's f16 arm
+    // stages as many experts in f16 as the slot holds. The activation slot holds f16 input rows and the output slot
+    // f32 output rows.
     // The current PP path serializes slot use, so the default plan reserves one reusable slot.
     size_t                         pp_moe_onednn_weight_slot_bytes;
+    // Unused: the loader writes 0 to both, and they stay because the layout static_asserts after this struct pin its
+    // size and offsets. The backend sizes the activation and output slots (pp_moe_onednn_slots_at) from the per-row
+    // bytes and the expert counts below, for the micro-batch a context runs.
     size_t                         pp_moe_onednn_activation_slot_bytes;
     size_t                         pp_moe_onednn_output_slot_bytes;
+    // Unread by the backend, which sizes the whole ring itself. The loader writes ring_depth * weight slot.
     size_t                         pp_moe_onednn_scratch_bytes;
-    // llama.cpp-ibj0: per-row bytes behind the two slot sizes above (activation
-    // slot = align256(n_ubatch * pp_moe_onednn_activation_bytes_per_row), output
-    // slot analogous) -- carried into the backend so the runtime-context
-    // transaction can re-plan the ring for the REAL runtime n_ubatch instead of
-    // the load-time default this struct's n_ubatch field below is fixed to (512).
-    // 0 for a dense model (no MoE PP ring).
+    // Bytes of one activation scratch row (the widest expert's input width in half floats) and of one output scratch
+    // row (its output width in floats). The backend multiplies them by the rows the packed scratch can need at the
+    // context's micro-batch, which depend on n_expert and n_expert_used below. 0 for a dense model (no MoE PP ring).
     size_t                         pp_moe_onednn_activation_bytes_per_row;
     size_t                         pp_moe_onednn_output_bytes_per_row;
     uint32_t                       pp_moe_onednn_ring_depth;
