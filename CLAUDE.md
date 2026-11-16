@@ -85,7 +85,7 @@ ctest --test-dir build -R <name-or-regex> --output-on-failure
 #    naming any that this command still selects.
 bash scripts/check-ctest-safety-net.sh --build-dir build
 ctest --test-dir build --output-on-failure -j 1 \
-      -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
+      -LE 'residency|mem-handle|cache|^model$|^fatal-exit-device$' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
 
 # 3. The excluded family, serially, with monitoring. Manually only -- never in
 #    a subagent or background task. NOTE the label is 'cache|mem-handle', NOT
@@ -98,6 +98,22 @@ ctest --test-dir build -L 'cache|mem-handle' --output-on-failure -j 1
 # Run a single test by name
 ctest --test-dir build -R <test-name> -V
 ```
+
+The form 2 `-LE` also leaves out the label `fatal-exit-device`. It is on the four
+device modes of `test-sycl-fatal-exit` (`-mmid`, `-op`, `-sync` and `-graph`).
+Each of them ends a process through the backend's fast exit on a healthy card,
+which can leave copy-engine work in flight. About 2 exits in 40 leave a
+copy-engine CAT error in the kernel log, and four of them one second apart once
+reset the whole GT. The four host modes stay in the sweep. Run the device modes
+by their label and alone, and leave `ONEAPI_DEVICE_SELECTOR` to the registration.
+It pins `level_zero:1`, and each parent waits 12 s after its child:
+
+```bash
+ctest --test-dir build -L '^fatal-exit-device$' --output-on-failure -j 1
+```
+
+The guard fails with `SWEEP RUNS FAST-EXIT DEVICE TEST` if form 2 still selects
+a test that carries the label.
 
 ⚠️ **`-j N` IS A MEMORY MULTIPLIER, NOT A CPU THROTTLE. This file prescribed
 `-j 4` as the *safe* form until 2026-08-01, and it caused a global OOM.**
@@ -1433,7 +1449,7 @@ Common diagnostics: `GGML_SYCL_DEBUG=1` (verbose dispatch), `GGML_SYCL_NAN_CHECK
    on every device, the iGPU included. Prefer `-R <what your change gates>`. For
    a full sweep, run `bash scripts/check-ctest-safety-net.sh --build-dir build`
    first, then form 2 verbatim:
-   `-j 1 -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'`.
+   `-j 1 -LE 'residency|mem-handle|cache|^model$|^fatal-exit-device$' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'`.
    Do not raise `-j` to save time; it is a memory multiplier and has OOM'd this host.
 4. For ggml changes: run `test-backend-ops` on multiple backends. It is a binary, not
    a ctest (`ctest -R test-backend-ops` selects nothing), so run

@@ -38,9 +38,20 @@
 # guess.
 #
 # Half 4 (over-exclusion) takes ctest's own -LE-only listing and fails naming
-# each test the label exclusion drops that is neither a model loader nor in the
-# label net (form 3 runs those). A widened or unanchored -LE silently removes
-# tests from the sweep, and nothing else would notice.
+# each test the label exclusion drops that is neither a model loader, nor in the
+# label net (form 3 runs those), nor a fast-exit device test (below). A widened
+# or unanchored -LE silently removes tests from the sweep, and nothing else
+# would notice.
+#
+# Half 5 (fast-exit device tests) knows one class by its label,
+# FAST_EXIT_LABEL_RE: the device modes of test-sycl-fatal-exit, each of which
+# ends a process through the backend's fast exit on a healthy card and can leave
+# copy-engine work in flight. They run by name, never in the sweep. The label
+# exclusion drops them on purpose, so half 4 does not count them as wrongly
+# dropped, and this half fails naming each one the sweep still selects. The label
+# is anchored for the same reason as `model`. A registry with none of them is
+# fine: a build configured without the SYCL tests has none, and the success line
+# reports how many were left out.
 #
 # SWEEP_LE_DEFAULT and SWEEP_E_DEFAULT are the exclusions CLAUDE.md documents.
 # The guard also checks that CLAUDE.md carries both, together, in the two
@@ -50,7 +61,8 @@
 # skips the doc check.
 set -euo pipefail
 MODEL_LABEL_RE='^model$'
-SWEEP_LE_DEFAULT="residency|mem-handle|cache|$MODEL_LABEL_RE"
+FAST_EXIT_LABEL_RE='^fatal-exit-device$'
+SWEEP_LE_DEFAULT="residency|mem-handle|cache|$MODEL_LABEL_RE|$FAST_EXIT_LABEL_RE"
 SWEEP_E_DEFAULT='^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
 BUILD="build" CTEST="ctest" SWEEP_LE="$SWEEP_LE_DEFAULT" SWEEP_E="$SWEEP_E_DEFAULT"
 CLAUDE_MD="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/CLAUDE.md"
@@ -98,11 +110,13 @@ label_kept_json=$("$CTEST" --test-dir "$BUILD" -N --show-only=json-v1 -LE "$SWEE
 label_net=$(printf '%s\n' "$label_out" | sed -n 's/^  Test *#[0-9]*: //p')
 # Exit codes follow the halves above: 1 = the net has a hole, 2 = the query
 # could not be trusted. The registry, sweep and -LE-only listings arrive on
-# fds 3, 4 and 5, and the label net's test names on fd 6.
-loaders=$(python3 -c '
+# fds 3, 4 and 5, and the label net's test names on fd 6. On success it prints
+# "<model loaders> <fast-exit device tests>".
+counts=$(python3 -c '
 import json, os, re, sys
 
 MODEL_LABEL_RE = sys.argv[1]
+FAST_EXIT_LABEL_RE = sys.argv[2]
 
 def tests(fd, what):
     try:
@@ -126,6 +140,9 @@ def loader_reason(t):
         return "carries label model"
     return None
 
+def fast_exit(t):
+    return any(re.search(FAST_EXIT_LABEL_RE, label) for label in props(t).get("LABELS") or [])
+
 registry   = tests(3, "REGISTRY")
 sweep      = tests(4, "SWEEP")
 label_kept = tests(5, "LABEL-KEPT")
@@ -144,21 +161,26 @@ hits = [(t["name"], loaders.get(t["name"]) or loader_reason(t)) for t in sweep
         if t["name"] in loaders or loader_reason(t)]
 for name, why in hits:
     print(f"SWEEP RUNS MODEL LOADER: {name} ({why})")
-if hits:
+fast_hits = [t["name"] for t in sweep if fast_exit(t)]
+for name in fast_hits:
+    print(f"SWEEP RUNS FAST-EXIT DEVICE TEST: {name}")
+if hits or fast_hits:
     sys.exit(1)
 if not label_kept:
     print("LABEL-KEPT JSON LISTING EMPTY -- refusing to pass vacuously", file=sys.stderr)
     sys.exit(2)
 kept    = {t["name"] for t in label_kept}
-dropped = [t for t in registry if t["name"] not in kept and t["name"] not in loaders and t["name"] not in label_net]
+dropped = [t for t in registry if t["name"] not in kept and t["name"] not in loaders and t["name"] not in label_net
+           and not fast_exit(t)]
 for t in dropped:
     labels = ",".join(props(t).get("LABELS") or [])
     print("SWEEP DROPS NON-LOADER: " + t["name"] + " (labels " + labels + ")")
 if dropped:
     sys.exit(1)
-print(len(loaders))
-' "$MODEL_LABEL_RE" 3<<<"$registry_json" 4<<<"$sweep_json" 5<<<"$label_kept_json" 6<<<"$label_net") \
-    || { rc=$?; [ -n "$loaders" ] && printf '%s\n' "$loaders"; exit "$rc"; }
+print(len(loaders), sum(1 for t in registry if fast_exit(t)))
+' "$MODEL_LABEL_RE" "$FAST_EXIT_LABEL_RE" 3<<<"$registry_json" 4<<<"$sweep_json" 5<<<"$label_kept_json" 6<<<"$label_net") \
+    || { rc=$?; [ -n "$counts" ] && printf '%s\n' "$counts"; exit "$rc"; }
+read -r loaders fast_exit_tests <<<"$counts"
 
 if [ "$SWEEP_LE" = "$SWEEP_LE_DEFAULT" ] && [ "$SWEEP_E" = "$SWEEP_E_DEFAULT" ]; then
     [ -f "$CLAUDE_MD" ] || { echo "MISSING CLAUDE.md: $CLAUDE_MD -- refusing to pass vacuously" >&2; exit 2; }
@@ -170,4 +192,4 @@ if [ "$SWEEP_LE" = "$SWEEP_LE_DEFAULT" ] && [ "$SWEEP_E" = "$SWEEP_E_DEFAULT" ];
     fi
 fi
 
-echo "safety net intact: $sel labelled tests; sweep excludes backend-ops and all $loaders model loaders"
+echo "safety net intact: $sel labelled tests; sweep excludes backend-ops, all $loaders model loaders and $fast_exit_tests fast-exit device tests"

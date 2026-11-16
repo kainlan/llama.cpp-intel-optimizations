@@ -143,7 +143,7 @@ tests_json "$PLAIN" "$LOADER" "$GENERATOR" "$DOWNLOAD" "$ENVMODEL" > "$TMP/regis
 
 # The documented exclusions must appear in CLAUDE.md; the mocks do not exercise
 # that, so they get a doc that carries them for whatever the guard's defaults are.
-sweep_le=$(eval "$(grep -E '^(MODEL_LABEL_RE|SWEEP_LE_DEFAULT)=' "$G")"; printf '%s' "$SWEEP_LE_DEFAULT")
+sweep_le=$(eval "$(grep -E '^(MODEL_LABEL_RE|FAST_EXIT_LABEL_RE|SWEEP_LE_DEFAULT)=' "$G")"; printf '%s' "$SWEEP_LE_DEFAULT")
 sweep_e=$(sed -n "s/^SWEEP_E_DEFAULT='\(.*\)'$/\1/p" "$G")
 [ -n "$sweep_le" ] || { echo "FAIL: could not read SWEEP_LE_DEFAULT from $G"; exit 1; }
 [ -n "$sweep_e" ] || { echo "FAIL: could not read SWEEP_E_DEFAULT from $G"; exit 1; }
@@ -158,6 +158,9 @@ mock_json ctest-clean registry.json sweep-clean.json
 rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-clean" --claude-md "$TMP/doc-ok.md" 2>&1) || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: rc=$rc for mock clean listing, want 0: $out"; exit 1; }
 grep -qF "safety net intact" <<<"$out" || { echo "FAIL: GREEN-mock did not report safety net intact: $out"; exit 1; }
+# A registry with no fast-exit device test (a build configured without the SYCL
+# tests) passes, and says it excluded none: the class has no emptiness refusal.
+grep -qF "and 0 fast-exit device tests" <<<"$out" || { echo "FAIL: GREEN-mock did not report 0 fast-exit device tests: $out"; exit 1; }
 echo "GREEN-mock ok"
 
 # RED-7: the sweep keeps a test that requires a fixture. The fixture's name
@@ -231,11 +234,75 @@ rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-overdrop" --claude-md "$TMP/doc-ok
 grep -qF "SWEEP DROPS NON-LOADER: test-something-else" <<<"$out" || { echo "FAIL: RED-14 did not name the test: $out"; exit 1; }
 echo "RED-14 ok (label exclusion dropping a non-loader named)"
 
+# The fast-exit device class: tests labelled fatal-exit-device end a process
+# through the backend's fast exit on a healthy card, so the documented sweep
+# leaves them out through the label exclusion and they run by name. FASTEXIT
+# carries the label, LOOKALIKE only contains its words, and neither has a
+# fixture or the `model` label.
+FASTEXIT=$(labelled test-fast-exit-device /b/test-sycl-fatal-exit '["sycl","fatal-exit","device","B50","fatal-exit-device"]')
+LOOKALIKE=$(labelled test-lookalike-label /b/test-lookalike '["not-fatal-exit-device-x"]')
+tests_json "$PLAIN" "$LOADER" "$GENERATOR" "$DOWNLOAD" "$ENVMODEL" "$FASTEXIT" > "$TMP/registry-fe.json"
+tests_json "$PLAIN" "$LOADER" "$GENERATOR" "$DOWNLOAD" "$ENVMODEL" "$LOOKALIKE" > "$TMP/registry-lookalike.json"
+
+# RED-15: the sweep keeps a test labelled fatal-exit-device. It has no fixture
+# and no model label, so only the fast-exit label makes it a class member.
+tests_json "$PLAIN" "$DOWNLOAD" "$FASTEXIT" > "$TMP/sweep-fe-kept.json"
+mock_json ctest-fe-kept registry-fe.json sweep-fe-kept.json
+rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-fe-kept" --claude-md "$TMP/doc-ok.md" 2>&1) || rc=$?
+[ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc for a swept fast-exit device test, want 1: $out"; exit 1; }
+grep -qF "SWEEP RUNS FAST-EXIT DEVICE TEST: test-fast-exit-device" <<<"$out" \
+    || { echo "FAIL: RED-15 did not name the test: $out"; exit 1; }
+! grep -qF "SWEEP RUNS MODEL LOADER" <<<"$out" || { echo "FAIL: RED-15 named a model loader: $out"; exit 1; }
+echo "RED-15 ok (swept fast-exit device test named)"
+
+# GREEN-fast-exit: the label exclusion drops the fast-exit device test and
+# nothing else the sweep needs, so the guard passes and counts it.
+tests_json "$PLAIN" "$DOWNLOAD" > "$TMP/sweep-fe-clean.json"
+mock_json ctest-fe-clean registry-fe.json sweep-fe-clean.json
+rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-fe-clean" --claude-md "$TMP/doc-ok.md" 2>&1) || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: rc=$rc for a sweep that drops the fast-exit device test, want 0: $out"; exit 1; }
+grep -qF "safety net intact" <<<"$out" || { echo "FAIL: GREEN-fast-exit did not report safety net intact: $out"; exit 1; }
+grep -qF "and 1 fast-exit device tests" <<<"$out" || { echo "FAIL: GREEN-fast-exit did not count the dropped test: $out"; exit 1; }
+echo "GREEN-fast-exit ok (dropped fast-exit device test allowed and counted)"
+
+# RED-16: the over-exclusion half still fails for its own cause when the same
+# registry carries a fast-exit device test. PLAIN is dropped and is neither a
+# loader, in the label net, nor in the class, so it is named. The fast-exit
+# test is dropped too, and must NOT be named.
+tests_json "$DOWNLOAD" > "$TMP/sweep-fe-overdrop.json"
+mock_json ctest-fe-overdrop registry-fe.json sweep-fe-overdrop.json
+rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-fe-overdrop" --claude-md "$TMP/doc-ok.md" 2>&1) || rc=$?
+[ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc for an over-dropping exclusion beside a fast-exit test, want 1: $out"; exit 1; }
+grep -qF "SWEEP DROPS NON-LOADER: test-something-else" <<<"$out" || { echo "FAIL: RED-16 did not name the test: $out"; exit 1; }
+! grep -qF "SWEEP DROPS NON-LOADER: test-fast-exit-device" <<<"$out" \
+    || { echo "FAIL: RED-16 named the fast-exit device test as a wrong drop: $out"; exit 1; }
+echo "RED-16 ok (over-exclusion still named, fast-exit drop not counted against it)"
+
+# GREEN-lookalike: a label that only contains the class name is not the class.
+# The sweep keeps that test and the guard neither refuses it as fast-exit nor
+# counts it.
+tests_json "$PLAIN" "$DOWNLOAD" "$LOOKALIKE" > "$TMP/sweep-lookalike-kept.json"
+mock_json ctest-lookalike-kept registry-lookalike.json sweep-lookalike-kept.json
+rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-lookalike-kept" --claude-md "$TMP/doc-ok.md" 2>&1) || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: rc=$rc for a swept test with a lookalike label, want 0: $out"; exit 1; }
+grep -qF "and 0 fast-exit device tests" <<<"$out" || { echo "FAIL: GREEN-lookalike counted the lookalike label: $out"; exit 1; }
+echo "GREEN-lookalike ok (label containing the class name is not the class)"
+
+# RED-17: the same lookalike dropped by the sweep is a wrongly dropped test, not
+# an allowed fast-exit drop.
+tests_json "$PLAIN" "$DOWNLOAD" > "$TMP/sweep-lookalike-dropped.json"
+mock_json ctest-lookalike-dropped registry-lookalike.json sweep-lookalike-dropped.json
+rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-lookalike-dropped" --claude-md "$TMP/doc-ok.md" 2>&1) || rc=$?
+[ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc for a dropped lookalike label, want 1: $out"; exit 1; }
+grep -qF "SWEEP DROPS NON-LOADER: test-lookalike-label" <<<"$out" || { echo "FAIL: RED-17 did not name the test: $out"; exit 1; }
+echo "RED-17 ok (dropped lookalike label named, not allowed as fast-exit)"
+
 # RED-real-unanchored: against the real build/, an unanchored `model` in the
 # label exclusion (ctest -LE is a regex search per label) also drops the
 # `cross-model` tests and test-layout-cache (`model-load`), none of which loads
-# a model. The guard must name them.
-rc=0; out=$(bash "$G" --build-dir build --sweep-label-exclude 'residency|mem-handle|cache|model' 2>&1) || rc=$?
+# a model. The guard must name them. The override keeps the fast-exit device
+# label, so the run isolates the `model` change.
+rc=0; out=$(bash "$G" --build-dir build --sweep-label-exclude 'residency|mem-handle|cache|model|^fatal-exit-device$' 2>&1) || rc=$?
 [ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc with label model unanchored, want 1: $out"; exit 1; }
 for t in test-layout-cache cross-model-weight-usage; do
     grep -qF "SWEEP DROPS NON-LOADER: $t " <<<"$out" \
@@ -245,8 +312,9 @@ echo "RED-real-unanchored ok (unanchored model drops test-layout-cache and the c
 
 # RED-real-label: against the real build/, drop `model` from the label
 # exclusion. The guard must name the environment-model tests and the G1
-# lifecycle test, none of which has a fixture.
-rc=0; out=$(bash "$G" --build-dir build --sweep-label-exclude 'residency|mem-handle|cache' 2>&1) || rc=$?
+# lifecycle test, none of which has a fixture. The override keeps the fast-exit
+# device label, so the run isolates the `model` change.
+rc=0; out=$(bash "$G" --build-dir build --sweep-label-exclude 'residency|mem-handle|cache|^fatal-exit-device$' 2>&1) || rc=$?
 [ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc with label model dropped, want 1: $out"; exit 1; }
 for t in test-model-load-cancel test-autorelease test-backend-sampler sycl-lifecycle-gpu-sequential; do
     grep -qF "SWEEP RUNS MODEL LOADER: $t (carries label model)" <<<"$out" \
