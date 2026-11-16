@@ -828,6 +828,23 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
 #    define GGML_SYCL_KTRACE(kernel_name, ...) ((void) 0)
 #endif
 
+// The exit status of a process the backend ended because a device was lost. It differs from 1, which a failed test,
+// the watchdog and every other fatal op error use, so a script can tell a lost device from a wrong result.
+constexpr int GGML_SYCL_EXIT_DEVICE_LOST = 69;
+
+// True when an exception's text names a lost device, as the Level Zero adapter prints it:
+// "level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)".
+bool ggml_sycl_what_is_device_lost(const char * what) noexcept;
+
+// GGML_SYCL_EXIT_DEVICE_LOST for a lost device's exception text, 1 for any other.
+int ggml_sycl_fatal_exit_code(const char * what) noexcept;
+
+// Ends the process at once after a failure it cannot recover from. Prints `message` on one [SYCL-FATAL] line,
+// flushes stdout and stderr, does what the watchdog does before its exit, and leaves through std::_Exit: no exit
+// handler and no static destructor runs. After a device loss the Level Zero library's destructor does not return,
+// and std::exit would run it. The caller prints its own diagnostic first.
+[[noreturn]] void ggml_sycl_fatal_exit(int code, const char * message) noexcept;
+
 #define CHECK_TRY_ERROR(expr)                                                                           \
     [&]() {                                                                                             \
         try {                                                                                           \
