@@ -38404,6 +38404,15 @@ static size_t ggml_sycl_hold_ring_uncovered(int device) {
     return loan.geo.bytes > room_kept + lent ? loan.geo.bytes - room_kept - lent : 0;
 }
 
+// True iff `type` has a CPU vec_dot whose activation type quantizes from float: the type half of the HOST_CPU recipe's
+// condition (ggml_sycl_build_moe_resolved_batch). The recipe and the prompt CPU island's type test both ask it, so a
+// type the island takes always has a host recipe, and the two cannot drift.
+static bool ggml_sycl_moe_host_recipe_type_ok(ggml_type type) {
+    const auto * traits = ggml_sycl_get_type_traits_cpu(type);
+    const auto * vdt    = traits && traits->vec_dot ? ggml_sycl_get_type_traits_cpu(traits->vec_dot_type) : nullptr;
+    return vdt != nullptr && vdt->from_float != nullptr;
+}
+
 namespace ggml_sycl {
 
 const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
@@ -38678,8 +38687,7 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
         normalized.recipe.owner_device = normalized.owning_device;
         if (normalized.residency == moe_batch_residency::HOST) {
             const auto * traits = src0 ? ggml_sycl_get_type_traits_cpu(src0->type) : nullptr;
-            const auto * vdt = traits && traits->vec_dot ? ggml_sycl_get_type_traits_cpu(traits->vec_dot_type) : nullptr;
-            if (normalized.actual_layout == GGML_LAYOUT_AOS && traits && traits->vec_dot && vdt && vdt->from_float) {
+            if (normalized.actual_layout == GGML_LAYOUT_AOS && src0 && ggml_sycl_moe_host_recipe_type_ok(src0->type)) {
                 normalized.recipe.kind     = moe_batch_executor::HOST_CPU;
                 normalized.recipe.kernel   = moe_route_kernel::HOST_CPU;
                 normalized.recipe.queue    = moe_recipe_queue::NONE;
@@ -85031,8 +85039,9 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) {
         return false;
     }
-    // Down never plans XMX_TILED, so the table's XMX_TILED entry (the WOQ arm's repack_mxfp4_xmx_tiled_to_woq, taken
-    // only while GGML_SYCL_MOE_PP_WOQ is on) cannot widen down's route: only gate/up's. Without oneDNN the table
+    // The executor takes XMX_TILED for gate and up only, so the table's XMX_TILED entry (the WOQ arm's
+    // repack_mxfp4_xmx_tiled_to_woq, taken only while GGML_SYCL_MOE_PP_WOQ is on) is refused for down, which plans
+    // XMX_TILED under GGML_SYCL_MOE_DOWN_XMX_TILED: a claimed tiled down would always decline. Without oneDNN the table
     // answers with neither knob, so XMX_TILED is never claimed there. That matters because the non-DNNL lambda has no
     // fail-closed throw for a claimed tiled op it declines (tiled_claimed_op exists only in the oneDNN build), so a
     // claimed tiled op would fall through to the per-expert staging path, which cannot read tiled bytes and computes
@@ -85051,6 +85060,79 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor(const ggml_sycl
                                                                  const ggml_tensor *               weight,
                                                                  int                               device) {
     return ggml_sycl_moe_pp_onednn_batched_claims_tensor(&plan, weight, device, true);
+}
+
+// The batched executor's claim on the device experts of a mixed weight, for a prompt op a CPU decision splits
+// (moe_pp_cpu_split::EXECUTOR_AND_ISLAND). The device experts are resident in the one layout the plan gave them
+// (ggml_sycl_moe_tensor_plan_staged_layout reads it: every expert planned, on `device` or on the host, one at least on
+// the host), so the checks are the resident claim's, on that layout. The staged claim's type test is not asked: it
+// names the types the ring stages, and nothing is staged here. Three opt-in knobs change a device expert's bytes or
+// lifetime around the executor (the decode down hotset, the transient prompt down SOA, the gate/up bundle). The split
+// has not run under them, so the op keeps the hybrid route there.
+// Invariant: the split is correct only while the executor's route_layout equals the layout the plan gave the device
+// experts; when they differ, the executor declines the op.
+static bool ggml_sycl_moe_pp_onednn_batched_claims_device_part(const ggml_sycl::placement_plan & plan,
+                                                               const ggml_tensor *               weight,
+                                                               int                               device) {
+    if (!weight || !ggml_sycl_moe_pp_batched_takes_type(weight->type)) {
+        return false;
+    }
+    if (ggml_sycl_moe_decode_down_i8_hotset_enabled() || ggml_sycl_moe_prompt_down_transient_soa_enabled() ||
+        ggml_sycl_moe_gateup_bundle4_enabled()) {
+        return false;
+    }
+    layout_mode planned_layout = GGML_LAYOUT_AOS;
+    if (!ggml_sycl_moe_tensor_plan_staged_layout(plan, weight, device, &planned_layout)) {
+        return false;
+    }
+    const bool device_buffer = weight->buffer != nullptr && !ggml_backend_buffer_is_host(weight->buffer);
+    if (!moe_pp_batched_has_expert_entries(weight->type, planned_layout, device_buffer)) {
+        return false;
+    }
+    // The executor takes XMX_TILED for gate and up only, so a claimed tiled down would always decline, and a split
+    // op's tiled decline throws.
+    if (planned_layout == GGML_LAYOUT_XMX_TILED && moe_classify_tensor(weight->name) == MOE_TENSOR_DOWN) {
+        return false;
+    }
+    return ggml_sycl_moe_pp_batched_takes_layout(weight->type, planned_layout);
+}
+
+// Whether the prompt CPU island runs a host expert of `type`. The retained batch gives a host operand a HOST_CPU
+// recipe only for a type ggml_sycl_moe_host_recipe_type_ok accepts (the recipe's own condition, asked here rather than
+// restated), and the island's batched CPU kernel has no path for a type that needs its direct kernel
+// (moe_type_needs_direct_kernel).
+static bool ggml_sycl_moe_pp_cpu_island_runs_type(ggml_type type) {
+    if (ggml_sycl::moe_type_needs_direct_kernel(type)) {
+        return false;
+    }
+    return ggml_sycl_moe_host_recipe_type_ok(type);
+}
+
+// Which executor runs one prompt op whose layer begin_layer decided (moe_pp_cpu_split_choose): the facts are read here,
+// from the plan the phase decided by and from the weight. `cpu_decided` is the phase's answer for the op's layer.
+static ggml_sycl::moe_pp_cpu_split ggml_sycl_moe_pp_cpu_split_for_op(const ggml_sycl::placement_plan & plan,
+                                                                     const ggml_tensor *               weight,
+                                                                     int                               device,
+                                                                     bool                              cpu_decided) {
+    if (!weight) {
+        return ggml_sycl::moe_pp_cpu_split::NONE;
+    }
+    // A load that routes experts to a second device keeps the hybrid route: the island's copies and its output
+    // fill have only run where one device's queue serves the whole op.
+    if (g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
+        return ggml_sycl::moe_pp_cpu_split::NONE;
+    }
+    const moe_tensor_type             role = moe_classify_tensor(weight->name);
+    ggml_sycl::moe_pp_cpu_split_facts f;
+    f.cpu_decided      = cpu_decided;
+    f.triplet_role     = role == MOE_TENSOR_GATE || role == MOE_TENSOR_UP || role == MOE_TENSOR_DOWN;
+    f.island_runs_type = ggml_sycl_moe_pp_cpu_island_runs_type(weight->type);
+    f.experts          = weight->ne[2] > 0 ? weight->ne[2] : 1;
+    f.counts           = plan.count_planned_experts(weight->name, f.experts, device);
+    // Asked only for a mixed op: an all-host op has no device part, and an all-device op is the resident claim's.
+    f.executor_takes_part = f.counts.host > 0 && f.counts.on_target > 0 &&
+                            ggml_sycl_moe_pp_onednn_batched_claims_device_part(plan, weight, device);
+    return ggml_sycl::moe_pp_cpu_split_choose(f);
 }
 
 // Whether any role of the bundle names a staged ring slot (STAGED_RING, llama.cpp-o9uw).
@@ -86118,6 +86200,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // the executor reads the ring's slots, which it stages a window at a time. A layer the executor does not claim
     // whole stays hybrid as before.
     bool pp_onednn_batched_claims_staged_layer = false;
+    // Which executor runs this prompt op when begin_layer decided its layer for the CPU (moe_pp_cpu_split_choose). Set
+    // once, beside the staged claim. Anything but NONE takes the op out of the hybrid world the way a staged layer's op
+    // leaves it: it skips the MMVQ probes, clears plan_has_cpu_experts and drops the planner's prompt route. ISLAND
+    // also makes the batched executor decline at its head, so the retained per-expert path runs the op and its CPU
+    // island runs the host experts grouped per expert, where the hybrid route runs them a row at a time.
+    ggml_sycl::moe_pp_cpu_split pp_cpu_split                          = ggml_sycl::moe_pp_cpu_split::NONE;
     // The prompt layer's stream call, filled at the claim below and alive for the whole op (llama.cpp-8epx): the
     // batched executor hands its op to window_begin, whose host_lease reads the call back through op.graph_ctx, which
     // points at the call (so it is neither copied nor moved).
@@ -86209,6 +86297,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             ggml_sycl_moe_stream_release_payload(ctx);
             // The index and the decision are the ones begin_layer just built, for the layer begin_layer was given.
             pp_onednn_batched_claims_staged_layer = ctx.moe_stream->executor_claims(stream_call.layer);
+            pp_cpu_split = ggml_sycl_moe_pp_cpu_split_for_op(*stream_call.plan, src0, ctx.device,
+                                                             ctx.moe_stream->cpu_decided(stream_call.layer));
         }
         // llama.cpp-iikr (B50 residual-pool cycle, mechanism 1): sweep_a/
         // sweep_b below are two independent 32-expert layout-validation
@@ -87943,7 +88033,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 src0 && src0->name ? src0->name : "?", ctx.device);
                     }
                 }
-                if (!prompt_down_has_planned_specialized_layout && !pp_onednn_batched_claims_op) {
+                if (!prompt_down_has_planned_specialized_layout && !pp_onednn_batched_claims_op &&
+                    pp_cpu_split == ggml_sycl::moe_pp_cpu_split::NONE) {
                     GGML_SYCL_DEBUG("[MoE] About to try COALESCED layout\n");
                     if (!skip_coalesced_probe && try_mmvq_layout_with_trace(GGML_LAYOUT_COALESCED, "try-coalesced")) {
                         GGML_SYCL_DEBUG("[MoE] GPU-side MMVQ (coalesced) dispatch successful for type %d\n",
@@ -88937,8 +89028,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const auto    plan_owner = ggml_sycl_cache_plan_owner(route_cache);
         // llama.cpp-3460: a weight the ring staged in full for the batched executor has no routed host expert left
         // to send to the CPU (pp_onednn_batched_claims_staged_layer), so it leaves the hybrid world.
-        plan_has_cpu_experts =
-            plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && !pp_onednn_batched_claims_staged_layer;
+        plan_has_cpu_experts     = plan_owner->has_host_experts(src0->name, n_exp, ctx.device) &&
+                               !pp_onednn_batched_claims_staged_layer &&
+                               pp_cpu_split == ggml_sycl::moe_pp_cpu_split::NONE;
         // An expert planned on a device other than ctx.device (llama.cpp-5tdy: from the summary).
         const ggml_sycl::expert_residency_counts counts =
             plan_owner->count_planned_experts(src0->name, n_exp, ctx.device);
@@ -89413,6 +89505,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         prompt_batch &&
         (pp_onednn_batched_claims_staged_layer || ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));
     const bool planner_needs_prompt_route = has_placement_plan && placement_planned_moe && prompt_batch &&
+                                            pp_cpu_split == ggml_sycl::moe_pp_cpu_split::NONE &&
                                             !exact_layout_override && !pp_onednn_batched_route_claims_prompt;
     const bool selected_hybrid_route = has_placement_plan ?
                                            (plan_hybrid || planner_needs_decode_route || planner_needs_prompt_route) :
@@ -92753,8 +92846,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // llama.cpp-sr83 (C3, Option T): gate/up plan XMX_TILED by default;
         // the batched lambda now repacks that layout too
         // (repack_mxfp4_xmx_tiled_to_woq), so it must be admitted as a
-        // candidate the same as SOA. Down never plans XMX_TILED, so this
-        // does not widen its route -- ggml_sycl_moe_pp_onednn_batched_claims_tensor
+        // candidate the same as SOA, for gate and up only: the executor takes
+        // XMX_TILED for those roles alone, so down's tiled layout (planned
+        // under GGML_SYCL_MOE_DOWN_XMX_TILED) is not admitted here --
+        // ggml_sycl_moe_pp_onednn_batched_claims_tensor
         // enforces the same GATE/UP-only restriction independently. Also
         // gated on ggml_sycl_moe_pp_woq_enabled() (fix cycle, defect 1):
         // the f16 arm has no tiled-aware dequant, and this candidate check
@@ -92770,8 +92865,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                 dst->type == GGML_TYPE_F32;
         // llama.cpp-348c: the batched executor's own candidate gate asks the claim predicate's table, on the layout
         // this tensor is routed in, for every expert type; pp_mxfp4_soa_f16_candidate above stays the MXFP4 staging
-        // fallback's. XMX_TILED stays gate/up only (down never plans it). GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the
-        // executor off through the same table, and the executor reports it as route-off before it asks this.
+        // fallback's. XMX_TILED stays gate/up only: the executor takes it for gate and up alone, though down plans it
+        // under GGML_SYCL_MOE_DOWN_XMX_TILED. GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the executor off through the same
+        // table, and the executor reports it as route-off before it asks this.
         const bool pp_batched_candidate =
             ggml_sycl_moe_pp_batched_takes_layout(src0->type, route_layout) &&
             (route_layout != GGML_LAYOUT_XMX_TILED || pp_role == MOE_TENSOR_GATE || pp_role == MOE_TENSOR_UP) &&
@@ -92786,6 +92882,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const size_t src1_contiguous_f16_row_bytes = static_cast<size_t>(ne10) * sizeof(sycl::half);
 
         auto try_pp_onednn_f16_batched = [&]() -> bool {
+            // The island runs every expert of this op (moe_pp_cpu_split::ISLAND): the executor has no device expert to
+            // take, and the decision gave the layer to the CPU.
+            if (pp_cpu_split == ggml_sycl::moe_pp_cpu_split::ISLAND) {
+                return false;
+            }
 #if GGML_SYCL_DNNL
             // llama.cpp-dboi: enablement comes from the shared route policy
             // (env override + built-in default), the same predicate that made
@@ -92811,7 +92912,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // deliberate debug override to force CPU-reference computation
             // and is exempted -- it is not a failure of this executor.
             const bool tiled_claimed_op = !pp_cpu_reference && route_layout == GGML_LAYOUT_XMX_TILED &&
-                                          ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
+                                          (ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device) ||
+                                           pp_cpu_split == ggml_sycl::moe_pp_cpu_split::EXECUTOR_AND_ISLAND);
             // llama.cpp-348c: every decline names its cause from moe_pp_batched_refusal, reported once per (device,
             // cause) as a WARN beside the capped per-dispatch trace. A post-claim cause
             // (moe_pp_batched_refusal_after_claim) prints at default verbosity: the claim already steered the op past
@@ -92988,6 +93090,54 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                             ggml_sycl::detail::moe_expert_role_is_triplet(pp_stream_role) &&
                                             !pp_woq_arm;
 
+            // The host experts of a split op (moe_pp_cpu_split::EXECUTOR_AND_ISLAND), set aside by the expert loop.
+            // The list lives in this lambda: a decline drops it with its leases, and the per-expert path below then
+            // resolves every expert again and sends the host ones to the island itself.
+            struct pp_split_host_expert {
+                int32_t               expert_id;
+                size_t                row_begin;
+                size_t                row_end;
+                const void *          ptr;
+                layout_mode           layout;
+                ggml_sycl::mem_handle lease;
+                bool                  has_ready_event;
+                sycl::event           ready_event;
+            };
+            std::vector<pp_split_host_expert> pp_split_host_experts;
+            size_t                            pp_split_host_rows = 0;
+
+            // The end of an op this executor answers true for. The island runs the host experts that were set aside,
+            // now that the device half can no longer decline, and the op's rows are booked by where they ran.
+            auto finish_pp_batched_rows = [&]() {
+                if (!pp_split_host_experts.empty()) {
+                    const layout_mode host_layout = pp_split_host_experts.front().layout;
+                    for (pp_split_host_expert & h : pp_split_host_experts) {
+                        append_pp_log_entries(pp_host_entries_for_log, h.row_begin, h.row_end, h.expert_id, h.ptr,
+                                              ggml_sycl::mem_handle::HOST_DEVICE, h.layout, &h.lease);
+                        enqueue_host_expert_rows(h.expert_id, make_matched_rows(h.row_begin, h.row_end),
+                                                 std::move(h.lease), h.has_ready_event, h.ready_event);
+                    }
+                    const std::vector<expert_dispatch_entry>              no_local_entries;
+                    const std::vector<std::vector<expert_dispatch_entry>> no_gpu_entries;
+                    ggml_sycl_moe_row_agg_log_routed(src0, ctx.device, n_ids, ids->ne[1], host_layout,
+                                                     "pp_cpu_split_island", no_local_entries, no_gpu_entries,
+                                                     pp_host_entries_for_log);
+                    dispatch_host_expert_groups(pp_host_groups);
+                }
+                const int64_t host_rows   = static_cast<int64_t>(pp_split_host_rows);
+                const int64_t device_rows = static_cast<int64_t>(row_maps_total) - host_rows;
+                if (g_moe_profile_enabled) {
+                    g_moe_profile.moe_route_stats(pp_role, device_rows, 0, host_rows, 0, device_rows, host_rows, 0);
+                    g_moe_profile.moe_gpu_compute_done();
+                    g_moe_profile.moe_compute_done(static_cast<int>(host_rows), static_cast<int>(device_rows));
+                }
+                if (ggml_sycl::MoeDispatchStats::enabled()) {
+                    auto & stats = ggml_sycl::get_moe_dispatch_stats(ctx.device);
+                    stats.record_route_residency(static_cast<int>(device_rows), 0, static_cast<int>(host_rows), 0, 0,
+                                                 0);
+                }
+            };
+
             for (int64_t i02 = 0; i02 < n_as; ++i02) {
                 const size_t row_begin = row_map_offsets[static_cast<size_t>(i02)];
                 const size_t row_end   = row_map_offsets[static_cast<size_t>(i02) + 1];
@@ -93011,6 +93161,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // dequant converts each by it (ggml_get_to_fp16_sycl_for_layout,
                 // below).
                 moe_expert_route         route = retained_prompt_group_route_for_expert(static_cast<int>(i02));
+                if (pp_cpu_split == ggml_sycl::moe_pp_cpu_split::EXECUTOR_AND_ISLAND &&
+                    route.kind == moe_expert_route_kind::HOST && route.ptr && route.lease.valid()) {
+                    // A host expert of a split op: the island runs its rows once the device half has succeeded
+                    // (finish_pp_batched_rows). It takes no executor slot. A split op is never windowed (its layer's
+                    // decision is CPU, a windowed op's is RING), so the deferral below never sees one.
+                    pp_split_host_rows += rows;
+                    pp_split_host_experts.push_back({ static_cast<int32_t>(i02), row_begin, row_end, route.ptr,
+                                                      route.actual_layout, std::move(route.lease),
+                                                      route.has_ready_event, route.ready_event });
+                    continue;
+                }
                 pp_onednn_batched_expert expert;
                 expert.expert_id = static_cast<int32_t>(i02);
                 expert.row_begin = row_begin;
@@ -93047,6 +93208,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 max_rows_per_expert = std::max(max_rows_per_expert, rows);
             }
 
+            if (active_experts.empty() && !pp_split_host_experts.empty()) {
+                // Every routed row of this micro-batch belongs to a host expert of a split op: the device half has
+                // nothing to run, and the island runs the op.
+                finish_pp_batched_rows();
+                return true;
+            }
             if (active_experts.empty() || max_rows_per_expert == 0) {
                 return trace_batched_skip(moe_pp_batched_refusal::NO_ACTIVE_EXPERTS, nullptr);
             }
@@ -94245,16 +94412,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         phase_buffers);
                 }
             }
-            if (g_moe_profile_enabled) {
-                g_moe_profile.moe_route_stats(pp_role, static_cast<int64_t>(row_maps_total), 0, 0, 0,
-                                              static_cast<int64_t>(row_maps_total), 0, 0);
-                g_moe_profile.moe_gpu_compute_done();
-                g_moe_profile.moe_compute_done(0, static_cast<int>(row_maps_total));
-            }
-            if (ggml_sycl::MoeDispatchStats::enabled()) {
-                auto & stats = ggml_sycl::get_moe_dispatch_stats(ctx.device);
-                stats.record_route_residency(static_cast<int>(row_maps_total), 0, 0, 0, 0, 0);
-            }
+            finish_pp_batched_rows();
             // llama.cpp-348c: one line per (device, type, layout) saying the executor took this type in this layout,
             // in which arm, how many experts the dispatch batched, in how many groups, and the planned weight slot
             // it ran in, and how many ring windows it began (llama.cpp-8epx: one per phase on a layer the executor

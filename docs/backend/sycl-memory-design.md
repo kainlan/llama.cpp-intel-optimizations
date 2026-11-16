@@ -125,9 +125,20 @@ each host item: it stages as one AOS slot, and its consumer is the executor.
 `moe_stream_executor_claims` holds for a layer when every host matrix of it is
 such an item and a ring can exist. `begin_layer` gives a RING decision only to
 such a layer, and `executor_claims` asks again once the ring is reserved. A
-layer that the executor does not claim, or whose ring cannot exist, stays whole
-in the hybrid world and runs its host experts on the CPU from their host leases.
-The ring never serves some of a layer's host matrices while the rest stay
+layer that the executor does not claim, or whose ring cannot exist, is decided
+for the CPU. So is a layer the cost model prices for the CPU, a layer of a plan
+that left its experts mapped, and every host layer under
+`GGML_SYCL_MOE_EXEC=cpu`. A prompt op of such a layer whose experts are all on
+the host leaves the hybrid world: the retained per-expert path runs it, with the
+host experts on its CPU island, grouped per expert (`moe_pp_cpu_split_choose`).
+The op keeps the hybrid route, which runs host rows one at a time from their
+host leases, when the island cannot run it: a fused or chunked matrix, a type
+that needs its direct kernel, an expert the plan does not place or places on
+another device, or a load that routes experts to a second device. A mixed op,
+with experts on this device and on the host, is split when the batched executor
+takes its device experts in their planned layout: the executor runs those and
+the island runs the rest, one after the other. Otherwise it keeps the hybrid
+route. The ring never serves some of a layer's host matrices while the rest stay
 hybrid, so no staged copy is wasted on a layer that does not run on the device.
 The `STAGED_RING` resolver route is kept, but the ring stages nothing for it:
 every staged entry's consumer is the executor, so the resolver counts a lookup
@@ -135,7 +146,7 @@ as a handoff (`handed_off` on the trace line) when the executor takes the
 weight, and as a CLAIMED refusal otherwise. Under `ring`, a prompt that refused
 any entry logs one WARN (`report_staged_routes`).
 `GGML_SYCL_MOE_EXEC_DECLINE_LAYER` (llama.cpp-ny6i) forces one layer off the
-executor, with the reason `declined`, so a gate can prove that hybrid fallback
+executor, with the reason `declined`, so a gate can prove the CPU island
 on a layer the executor would claim.
 
 **The ring.** The ring holds one executor window per region, not a layer. The
