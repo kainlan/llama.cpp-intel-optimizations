@@ -779,7 +779,8 @@ def claim_i_slot(s):
         if gone in sycl:
             fails.append(f"{gone} is still in ggml-sycl.cpp: the planned weight slot must not be widened")
     # Every write to the planned weight slot's global is a reset or the inventory's own value: directly, or as the
-    # publish helper returned it to the stage, and every write to the helper's slot is the inventory's own value.
+    # publish helper returned it to the stage. Every write to the helper's slot is the inventory's own value or a reset
+    # to 0 (a ring that cannot be sized is planned as no ring), and at least one write takes the inventory's own value.
     publish = one_definition(sycl, PUBLISH_FN) or ""
     kept = ["0", "inventory->pp_moe_onednn_weight_slot_bytes"]
     if STAGE_PUBLISH in sycl:
@@ -793,9 +794,13 @@ def claim_i_slot(s):
     helper_writes = list(re.finditer(r"\bin\.pp_moe_onednn_weight_slot_bytes ?([-+*/|&^]?=)(?!=) ?([^;]*);", publish))
     if not helper_writes:
         fails.append("the publish helper does not take the weight slot from the inventory")
+    helper_kept = ("0", "inventory->pp_moe_onednn_weight_slot_bytes")
     for m in helper_writes:
-        if m.group(1) != "=" or m.group(2).strip() != "inventory->pp_moe_onednn_weight_slot_bytes":
-            fails.append(f"the publish helper writes the weight slot as `{m.group(0)}`, not the inventory's own value")
+        if m.group(1) != "=" or m.group(2).strip() not in helper_kept:
+            fails.append(f"the publish helper writes the weight slot as `{m.group(0)}`, "
+                         "not the inventory's own value or a reset to 0")
+    if helper_writes and not any(m.group(1) == "=" and m.group(2).strip() == helper_kept[1] for m in helper_writes):
+        fails.append("the publish helper only resets the weight slot: no write takes the inventory's own value")
     # The planner site publishes the inventory's slot, with no formula of its own between the two.
     head = publish.find(PLAN_SITE_HEAD)
     call = publish.find("unified_cache_set_planned_pp_moe_onednn_scratch(", head) if head >= 0 else -1
