@@ -12,6 +12,7 @@
 
 #include "zone-sizing.hpp"
 
+#include <algorithm>
 #include <limits>
 
 namespace ggml_sycl {
@@ -24,6 +25,30 @@ bool pp_moe_onednn_checked_align_slot_bytes(size_t value, size_t * out) {
     if (out != nullptr) {
         *out = (value + alignment - 1) / alignment * alignment;
     }
+    return true;
+}
+
+bool pp_moe_onednn_packed_rows_at(uint32_t n_ubatch, uint32_t n_expert, uint32_t n_expert_used, size_t * rows) {
+    if (rows == nullptr) {
+        return false;
+    }
+    if (n_ubatch == 0) {
+        *rows = 0;
+        return true;
+    }
+    if (n_expert == 0 || n_expert_used == 0) {
+        return false;
+    }
+    static_assert(sizeof(size_t) >= 8, "the row bound multiplies two 32-bit counts");
+    constexpr size_t kMax    = std::numeric_limits<size_t>::max();
+    const size_t     n       = n_ubatch;
+    const size_t     used    = std::min(n_expert_used, n_expert);
+    const size_t     routed  = n * used;                            // rows the micro-batch routes in all
+    const size_t     active  = std::min<size_t>(n_expert, routed);  // experts that can hold a row
+    const size_t     slack   = 63 * active;
+    const size_t     by_rows = routed > (kMax - slack) / 2 ? kMax : 2 * routed + slack;
+    const size_t     by_rect = ((n + 63) & ~static_cast<size_t>(63)) * active;
+    *rows                    = std::min(by_rows, by_rect);
     return true;
 }
 
