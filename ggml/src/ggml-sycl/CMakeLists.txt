@@ -6624,12 +6624,15 @@ endforeach()
 # process each time. This is not the unrecoverable-hang signature, which leaves the card unusable until a reboot.
 # When the modes ran one second apart under ctest, the fourth process hung on its first copy and the kernel reset the
 # whole GT about 35 s later. Each mode's parent therefore waits 12 s after its child before it returns.
+# The label fatal-exit-device keeps the four device modes out of the documented full sweep: each ends a process through
+# the fast exit on a healthy card, which can leave copy-engine work in flight. Run them by name, one at a time:
+# ctest -R fatal-exit. scripts/check-ctest-safety-net.sh knows the label and fails if the sweep selects a test carrying it.
 set(_fatal_device_env "ONEAPI_DEVICE_SELECTOR=level_zero:1"
                       "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 foreach(_fatal_site IN ITEMS mmid op sync graph)
     add_test(NAME test-sycl-fatal-exit-${_fatal_site} COMMAND test-sycl-fatal-exit ${_fatal_site})
     set_tests_properties(test-sycl-fatal-exit-${_fatal_site} PROPERTIES
-        LABELS "sycl;fatal-exit;device;B50"
+        LABELS "sycl;fatal-exit;device;B50;fatal-exit-device"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
         ENVIRONMENT "${_fatal_device_env}"
