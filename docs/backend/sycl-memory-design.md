@@ -2594,11 +2594,35 @@ and still wrong in practice, which is the whole lesson of this subsection.
 ### A context-time consumer: the PP MoE oneDNN ring above the RUNTIME zone
 
 The PP MoE oneDNN scratch ring is one weight slot plus two slots that scale with
-`n_ubatch` (activation, output), times the ring depth. On GPT-OSS 20B it is
-404.5 MB at `-ub 512` and 674.5 MB at `-ub 1024`. The RUNTIME zone is 512 MB.
-So on the B50 `-ub 1024` was refused at the runtime-context update ("the
-RUNTIME zone has 505.3 MB available; the largest -ub that fits is about 672",
-`llama.cpp-ibj0`), even with ~1.6 GB of the shared KV/weight zone free.
+`n_ubatch` (activation, output), times the ring depth. On GPT-OSS 20B, while the
+two slots were sized for a rectangle (below), it was 404.5 MB at `-ub 512` and
+674.5 MB at `-ub 1024`. The RUNTIME zone is 512 MB. So on the B50 `-ub 1024` was
+refused at the runtime-context update ("the RUNTIME zone has 505.3 MB available;
+the largest -ub that fits is about 672", `llama.cpp-ibj0`), even with ~1.6 GB of
+the shared KV/weight zone free. Sized for the packed scratch it is 235.2 MB at
+`-ub 512` and 302.7 MB at `-ub 1024`.
+
+**The MoE prompt ring.** The activation and output slots hold
+`pp_moe_onednn_packed_rows_at(n_ubatch, n_expert, n_expert_used)` rows of one
+scratch row each: one activation row is the widest expert's input width in half
+floats, one output row its output width in floats. The loader sends the one-row
+bytes and the two counts, and sizes no slot. `pp_moe_onednn_slots_at()` multiplies
+them out and rounds each slot to 256 bytes; the load-time publish, the ring's
+admission, the explicit micro-batch's room and the re-plan all size the slots
+there. With `used = min(n_expert_used, n_expert)` and
+`active = min(n_expert, n_ubatch * used)`, the bound is
+`min(2 * n_ubatch * used + 63 * active, align64(n_ubatch) * active)`. The first
+term holds because a GEMM group's members have at least half its head's rows, so
+padding to the head at most doubles a member, and rounding a slot up to 64 rows
+(`moe_pp_gemm_row_align`) adds at most 63 per expert; the second is the old
+rectangle, every active expert padded to the busiest, which is smaller for very
+few rows. The executor lays the scratch out with `moe_pp_pack_gemm_groups`
+(`moe-pp-pack.hpp`), so the plan and the layout read one row alignment. The bound
+assumes what MUL_MAT_ID routing gives, a row's picks being distinct experts. The
+executor's admission refuses a request above the plan, so a routing outside that
+assumption takes the serialized MoE route instead of overrunning the slots. On
+GPT-OSS 20B (32 experts, 4 used) `-ub 512` packs into 6,112 rows instead of the
+rectangle's 16,384: slots of 33.6 MB and 67.1 MB instead of 90 MB and 180 MB.
 
 **Why the RUNTIME zone is not grown at load (`llama.cpp-u1bb`).** Growing it at
 model load looks natural and is wrong. The arena is one chunk with fixed zones,
@@ -2657,10 +2681,11 @@ B50 GPT-OSS figures, with 370.8 MB of RUNTIME left after the weight slot:
 
 | `-ub` | activation | output | goes to the KV zone |
 |------:|-----------:|-------:|--------------------:|
-|   512 |      90 MB |  180 MB | nothing |
-|  1024 |     180 MB |  360 MB | activation, 180 MB |
-|  2048 |     360 MB |  720 MB | output, 720 MB |
-|  4096 |     720 MB | 1440 MB | both, 2160 MB |
+|   512 |    33.6 MB |  67.1 MB | nothing |
+|  1024 |    56.1 MB | 112.1 MB | nothing |
+|  2048 |   101.1 MB | 202.1 MB | nothing |
+|  3072 |   146.1 MB | 292.1 MB | activation, 146.1 MB |
+|  4096 |   191.1 MB | 382.1 MB | output, 382.1 MB |
 
 **KV wins, in both directions.** The ring never moves KV. It is admitted after KV
 and refused rather than kept when it no longer fits. A later KV re-fit (a second
@@ -2727,8 +2752,8 @@ the case where the guard sends the buffer there. The reserve applies only when
 part of the ring goes to the KV zone. The admission line names it at WARN:
 
 ```
-[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=1024 puts its activation slots (180.0 MB) in the shared
-KV zone: <free> MB free there after KV, 1024.0 MB compute-buffer reserve (an estimate of 1.0 MB per
+[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=3072 puts its activation slots (146.1 MB) in the shared
+KV zone: <free> MB free there after KV, 3072.0 MB compute-buffer reserve (an estimate of 1.0 MB per
 micro-batch row; compute buffers are not in the plan)
 ```
 

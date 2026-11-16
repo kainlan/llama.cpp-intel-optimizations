@@ -38,9 +38,10 @@ dequant. These claims pin that shape:
       planned-layout lookup refuses a layer with a host or other-device expert, so a hybrid layer is never admitted;
   (i) the f16 arm runs in the weight slot the inventory planned, never a wider one: the backend keeps the planned
       slot size as the inventory gave it (no plan-time widening, which displaced routed experts with no cost
-      decision), the planner site that publishes the ring's sizes computes no expert-count or f16 formula and hands
-      the unified cache the inventory's slot, the arm asks the admission for one f16 expert, and it groups the active
-      experts by what the slot it claimed holds;
+      decision), the planner site that publishes the ring's sizes computes no expert-count or f16 formula of its own
+      (the expert counts reach it only through the row-scaled slots' shared sizer and that sizer's refusal warning)
+      and hands the unified cache the inventory's slot, the arm asks the admission for one f16 expert, and it groups
+      the active experts by what the slot it claimed holds;
   (j) one opt-out knob, GGML_SYCL_MOE_PP_F16_BATCHED_AOS, spelled once, read once, consulted by the support helper,
       dropping every non-MXFP4 entry (SOA ones included), so it leaves exactly the MXFP4 executor, registered in
       sycl_env_settings[] so the non-default report names it, and catalogued;
@@ -811,6 +812,13 @@ def claim_i_slot(s):
         site = publish[head:call] + site
         if PLAN_SITE_CALL not in site:
             fails.append("the unified cache's planned scratch is not given the inventory's weight slot")
+        # The expert counts reach the site only through the row-scaled slots' shared sizer and the warning that names
+        # them when it cannot size a ring. Neither touches the weight slot, so both calls are left out of the scan.
+        for exempt in ("ggml_sycl::pp_moe_onednn_slots_at(", "GGML_LOG_WARN("):
+            at = site.find(exempt)
+            close = match_close(site, at + len(exempt) - 1) if at >= 0 else -1
+            if close > 0:
+                site = site[:at] + site[close:]
         for formula in ("n_expert", "255", "sizeof(sycl::half)"):
             if formula in site:
                 fails.append(f"the planner site sizes the ring with `{formula}`: the weight slot is widened again")

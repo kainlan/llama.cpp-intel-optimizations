@@ -1071,12 +1071,13 @@ static std::atomic<size_t>   g_planned_pp_moe_onednn_activation_slot_bytes[GGML_
 static std::atomic<size_t>   g_planned_pp_moe_onednn_output_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_pp_moe_onednn_ring_depth[GGML_SYCL_MAX_DEVICES]{};
-// llama.cpp-ibj0: per-row bytes (loader-supplied) and the n_ubatch the
-// CURRENTLY PLANNED activation/output slots above were sized for -- see the
-// declarations' comments in unified-cache.hpp for why these are distinct
-// from the load-time inventory.n_ubatch.
+// The bytes of one activation and one output scratch row (loader-supplied), the expert counts the packed scratch's
+// rows depend on, and the n_ubatch the CURRENTLY PLANNED activation/output slots above were sized for. See the
+// declarations' comments in unified-cache.hpp for why that n_ubatch is distinct from the load-time inventory.n_ubatch.
 static std::atomic<size_t>   g_planned_pp_moe_onednn_activation_bytes_per_row[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_output_bytes_per_row[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_pp_moe_onednn_n_expert[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_pp_moe_onednn_n_expert_used[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_pp_moe_onednn_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<bool>     g_planned_pp_moe_onednn_activation_in_kv_zone[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<bool>     g_planned_pp_moe_onednn_output_in_kv_zone[GGML_SYCL_MAX_DEVICES]{};
@@ -3659,6 +3660,8 @@ pp_moe_onednn_explicit_ubatch_room unified_cache_explicit_ubatch_room(int      d
     in.weight_slot_bytes        = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device_id);
     in.activation_bytes_per_row = unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device_id);
     in.output_bytes_per_row     = unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device_id);
+    in.n_expert                 = unified_cache_get_planned_pp_moe_onednn_n_expert(device_id);
+    in.n_expert_used            = unified_cache_get_planned_pp_moe_onednn_n_expert_used(device_id);
     in.ring_depth               = unified_cache_get_planned_pp_moe_onednn_ring_depth(device_id);
     // The requirement as ensure_planned_arena_zones() reads it, less the two terms that follow the micro-batch: the
     // ring's RUNTIME part and the dense scratch, both as published now. What is left is the same at any micro-batch.
@@ -4377,15 +4380,19 @@ static size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_i
                                                                              slot * depth;
 }
 
-void unified_cache_set_planned_pp_moe_onednn_row_bytes(int    device_id,
-                                                       size_t activation_bytes_per_row,
-                                                       size_t output_bytes_per_row) {
+void unified_cache_set_planned_pp_moe_onednn_row_bytes(int      device_id,
+                                                       size_t   activation_bytes_per_row,
+                                                       size_t   output_bytes_per_row,
+                                                       uint32_t n_expert,
+                                                       uint32_t n_expert_used) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
     g_planned_pp_moe_onednn_activation_bytes_per_row[device_id].store(activation_bytes_per_row,
                                                                       std::memory_order_release);
     g_planned_pp_moe_onednn_output_bytes_per_row[device_id].store(output_bytes_per_row, std::memory_order_release);
+    g_planned_pp_moe_onednn_n_expert[device_id].store(n_expert, std::memory_order_release);
+    g_planned_pp_moe_onednn_n_expert_used[device_id].store(n_expert_used, std::memory_order_release);
 }
 
 size_t unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(int device_id) {
@@ -4400,6 +4407,20 @@ size_t unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(int device_i
         return 0;
     }
     return g_planned_pp_moe_onednn_output_bytes_per_row[device_id].load(std::memory_order_acquire);
+}
+
+uint32_t unified_cache_get_planned_pp_moe_onednn_n_expert(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_pp_moe_onednn_n_expert[device_id].load(std::memory_order_acquire);
+}
+
+uint32_t unified_cache_get_planned_pp_moe_onednn_n_expert_used(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_pp_moe_onednn_n_expert_used[device_id].load(std::memory_order_acquire);
 }
 
 void unified_cache_set_planned_pp_moe_onednn_n_ubatch(int device_id, uint32_t n_ubatch) {
@@ -4420,15 +4441,18 @@ bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
                                                   uint32_t n_ubatch,
                                                   size_t * activation_slot_bytes,
                                                   size_t * output_slot_bytes) {
-    const size_t act_per_row = unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device_id);
-    const size_t out_per_row = unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device_id);
+    const size_t   act_per_row   = unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device_id);
+    const size_t   out_per_row   = unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device_id);
+    const uint32_t n_expert      = unified_cache_get_planned_pp_moe_onednn_n_expert(device_id);
+    const uint32_t n_expert_used = unified_cache_get_planned_pp_moe_onednn_n_expert_used(device_id);
     if (act_per_row == 0 || out_per_row == 0) {
         return false;  // dense model: no MoE PP ring planned
     }
     size_t act_aligned = 0;
     size_t out_aligned = 0;
-    if (!pp_moe_onednn_slots_at(n_ubatch, act_per_row, out_per_row, &act_aligned, &out_aligned)) {
-        return false;  // n_ubatch * per_row, or its rounding, would overflow
+    if (!pp_moe_onednn_slots_at(n_ubatch, n_expert, n_expert_used, act_per_row, out_per_row, &act_aligned,
+                                &out_aligned)) {
+        return false;  // no expert counts, or the packed rows times a row, or its rounding, would overflow
     }
     if (activation_slot_bytes != nullptr) {
         *activation_slot_bytes = act_aligned;
@@ -4443,8 +4467,11 @@ uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capac
                                                                   size_t   weight_slot_bytes,
                                                                   size_t   activation_bytes_per_row,
                                                                   size_t   output_bytes_per_row,
+                                                                  uint32_t n_expert,
+                                                                  uint32_t n_expert_used,
                                                                   uint32_t ring_depth) {
-    if (ring_depth == 0 || (activation_bytes_per_row == 0 && output_bytes_per_row == 0)) {
+    if (ring_depth == 0 || (activation_bytes_per_row == 0 && output_bytes_per_row == 0) || n_expert == 0 ||
+        n_expert_used == 0) {
         return 0;
     }
     constexpr size_t kMax = std::numeric_limits<size_t>::max();
@@ -4453,7 +4480,8 @@ uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capac
     const auto       fits = [&](uint32_t n_ubatch) -> bool {
         size_t act = 0;
         size_t out = 0;
-        if (!pp_moe_onednn_slots_at(n_ubatch, activation_bytes_per_row, output_bytes_per_row, &act, &out)) {
+        if (!pp_moe_onednn_slots_at(n_ubatch, n_expert, n_expert_used, activation_bytes_per_row, output_bytes_per_row,
+                                    &act, &out)) {
             return false;
         }
         if (weight_slot_bytes > kMax - act || weight_slot_bytes + act > kMax - out) {

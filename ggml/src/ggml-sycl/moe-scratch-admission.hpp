@@ -89,12 +89,16 @@ bool pp_moe_onednn_checked_align_slot_bytes(size_t value, size_t * out);
 // for a micro-batch with no experts or none used; n_ubatch 0 needs 0 rows.
 bool pp_moe_onednn_packed_rows_at(uint32_t n_ubatch, uint32_t n_expert, uint32_t n_expert_used, size_t * rows);
 
-// The ring's activation and output slots at `n_ubatch` rows, from their per-row bytes: n_ubatch * per_row each,
-// rounded up to the slot alignment, every multiply and rounding checked. Returns false, leaving both outputs
-// untouched, on overflow. n_ubatch 0 sizes two empty slots: 0 rows is not an overflow. The ring's admission, the
-// explicit micro-batch's room and the cache's re-plan of the ring all size the slots here, so no two of them can
-// round or overflow-check a slot differently.
+// The ring's activation and output slots at `n_ubatch` rows: the rows the packed scratch can need
+// (pp_moe_onednn_packed_rows_at) times the bytes of one scratch row, rounded up to the slot alignment, every multiply
+// and rounding checked. `activation_bytes_per_row` is one activation row of the widest expert (its input width in
+// half floats); `output_bytes_per_row` one output row (its output width in floats). Returns false, leaving both
+// outputs untouched, on overflow or when a non-empty micro-batch has no experts or none used. n_ubatch 0 sizes two
+// empty slots. The ring's admission, the explicit micro-batch's room, the load-time publish and the cache's re-plan
+// all size the slots here, so no two of them can size a slot differently.
 bool pp_moe_onednn_slots_at(uint32_t n_ubatch,
+                            uint32_t n_expert,
+                            uint32_t n_expert_used,
                             size_t   activation_bytes_per_row,
                             size_t   output_bytes_per_row,
                             size_t * activation_slot_bytes,
@@ -216,8 +220,12 @@ struct pp_moe_onednn_ring_admission_inputs {
     size_t   kv_zone_largest_block_bytes   = std::numeric_limits<size_t>::max();  // largest free KV-zone block
     size_t   vram_budget_room_bytes        = std::numeric_limits<size_t>::max();  // budget left after KV + MMID
     size_t   weight_slot_bytes             = 0;
+    // Bytes of one activation and of one output scratch row, and the expert counts the packed scratch's rows depend
+    // on (pp_moe_onednn_slots_at).
     size_t   activation_bytes_per_row      = 0;
     size_t   output_bytes_per_row          = 0;
+    uint32_t n_expert                      = 0;  // experts per layer
+    uint32_t n_expert_used                 = 0;  // experts a row routes to
     uint32_t ring_depth                    = 0;
     uint32_t n_ubatch                      = 0;
 };
@@ -226,8 +234,8 @@ struct pp_moe_onednn_ring_admission {
     bool     admit                    = false;
     bool     activation_in_kv_zone    = false;
     bool     output_in_kv_zone        = false;
-    size_t   activation_slot_bytes    = 0;  // align256(n_ubatch * activation_bytes_per_row)
-    size_t   output_slot_bytes        = 0;  // align256(n_ubatch * output_bytes_per_row)
+    size_t   activation_slot_bytes    = 0;  // pp_moe_onednn_slots_at(n_ubatch, ...)'s activation slot
+    size_t   output_slot_bytes        = 0;  // pp_moe_onednn_slots_at(n_ubatch, ...)'s output slot
     size_t   kv_zone_bytes            = 0;  // ring bytes placed in the KV zone; 0 when it all fits RUNTIME
     size_t   kv_zone_headroom_bytes   = 0;  // available - admitted, clamped at 0
     size_t   compute_reserve_bytes    = 0;  // n_ubatch * compute_reserve_bytes_per_row, saturating
@@ -238,7 +246,8 @@ struct pp_moe_onednn_ring_admission {
 };
 
 // Pure: every input is passed in. Not admitted on degenerate input (ring_depth
-// or n_ubatch 0, or both per-row terms 0) or when a slot size overflows size_t.
+// or n_ubatch 0, both per-row terms 0, or no experts or none used) or when a
+// slot size overflows size_t.
 pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_admission_inputs & in);
 
 // An explicit micro-batch (-ub N) whose ring the RUNTIME zone planned for the load's own micro-batch cannot hold is
@@ -255,8 +264,10 @@ struct pp_moe_onednn_explicit_ubatch_inputs {
     uint32_t n_ubatch                    = 0;  // the explicit micro-batch; 0 = none
     uint32_t n_ubatch_default            = 0;  // the load's own planning micro-batch
     size_t   weight_slot_bytes           = 0;
-    size_t   activation_bytes_per_row    = 0;
-    size_t   output_bytes_per_row        = 0;
+    size_t   activation_bytes_per_row    = 0;  // bytes of one activation scratch row
+    size_t   output_bytes_per_row        = 0;  // bytes of one output scratch row
+    uint32_t n_expert                    = 0;  // experts per layer
+    uint32_t n_expert_used               = 0;  // experts a row routes to
     uint32_t ring_depth                  = 0;
     size_t   runtime_fixed_bytes         = 0;  // RUNTIME requirement apart from the ring and the dense scratch
     size_t   dense_scratch_default_bytes = 0;  // the dense scratch at n_ubatch_default
@@ -293,7 +304,7 @@ struct pp_moe_onednn_explicit_ubatch_decision {
 };
 
 // Pure: the room an explicit micro-batch needs. Not valid when in.n_ubatch does not exceed in.n_ubatch_default, the
-// default is 0, or there is no ring (weight slot 0, ring_depth 0, or both per-row terms 0).
+// default is 0, or there is no ring (weight slot 0, ring_depth 0, both per-row terms 0, or no experts or none used).
 pp_moe_onednn_explicit_ubatch_room pp_moe_onednn_explicit_ubatch_plan_room(
     const pp_moe_onednn_explicit_ubatch_inputs & in);
 

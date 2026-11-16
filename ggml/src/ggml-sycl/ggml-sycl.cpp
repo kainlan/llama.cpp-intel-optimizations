@@ -17399,14 +17399,23 @@ static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_in
     in.pp_pipeline_scratch_bytes       = pp_pipeline_env_enabled() ? inventory->pp_pipeline_scratch_bytes : 0;
     in.pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;
     in.pp_moe_onednn_ring_depth        = inventory->pp_moe_onednn_ring_depth;
-    // The two row-scaled slots are sized here, by the function the ring's admission and re-plan size them with, so
-    // the ring planned at load and a ring re-planned for the same micro-batch are the same bytes.
+
+    // The two row-scaled slots are sized here, by the function the ring's admission and re-plan size them with, at
+    // the micro-batch the rest of the load plans at, so the ring planned at load and a ring re-planned for the same
+    // micro-batch are the same bytes.
+    const uint32_t n_ubatch = ggml_sycl::placement_load_n_ubatch(inventory->n_ubatch);
     if (in.pp_moe_onednn_ring_depth != 0 &&
-        !ggml_sycl::pp_moe_onednn_slots_at(inventory->n_ubatch, inventory->pp_moe_onednn_activation_bytes_per_row,
-                                           inventory->pp_moe_onednn_output_bytes_per_row,
-                                           &in.pp_moe_onednn_activation_slot_bytes,
-                                           &in.pp_moe_onednn_output_slot_bytes)) {
-        // A slot that overflows plans no ring. The executor's admission then refuses the batched path.
+        !ggml_sycl::pp_moe_onednn_slots_at(
+            n_ubatch, static_cast<uint32_t>(std::max(0, inventory->n_expert)),
+            static_cast<uint32_t>(std::max(0, inventory->n_expert_used)),
+            inventory->pp_moe_onednn_activation_bytes_per_row, inventory->pp_moe_onednn_output_bytes_per_row,
+            &in.pp_moe_onednn_activation_slot_bytes, &in.pp_moe_onednn_output_slot_bytes)) {
+        // A slot that overflows, or a ring with no expert counts, plans no ring. The executor's admission then refuses
+        // the batched path, which is a slower prompt path for the whole model, so it is said at default verbosity.
+        GGML_LOG_WARN(
+            "%s: the PP MoE oneDNN ring cannot be sized at n_ubatch=%u (n_expert=%d n_expert_used=%d) on device %d; "
+            "no ring is planned, so prompt MoE takes the serialized MoE route\n",
+            __func__, n_ubatch, inventory->n_expert, inventory->n_expert_used, device);
         in.pp_moe_onednn_weight_slot_bytes = 0;
         in.pp_moe_onednn_ring_depth        = 0;
     }
@@ -17657,19 +17666,18 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         }
     }
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(ctx->device, false, false);
-    // llama.cpp-ibj0: carry the per-row bytes behind the two slot sizes above
-    // into the backend, so the runtime-context transaction can re-plan the
-    // ring for the REAL runtime n_ubatch (ggml_sycl_replan_pp_moe_onednn_ring())
-    // instead of leaving it fixed at whatever n_ubatch this load-time plan
-    // used. The load-time plan's own micro-batch (inventory->n_ubatch, 512
-    // today) is recorded as the ring's initially-planned n_ubatch, matching
-    // the slot sizes just published above -- the re-plan's "already planned
-    // for this n_ubatch" idempotence check (unified_cache_get_planned_pp_moe_onednn_n_ubatch())
-    // would otherwise start every fresh model load believing nothing was
-    // planned yet.
+    // Carry one scratch row's bytes and the expert counts into the backend, so the runtime-context transaction can
+    // re-plan the ring for the context's own micro-batch (ggml_sycl_replan_pp_moe_onednn_ring()) instead of leaving it
+    // fixed at the micro-batch this load-time plan used. That micro-batch, by the rule the publish above sized the
+    // slots at, is recorded as the ring's initially-planned n_ubatch: the re-plan's "already planned for this n_ubatch"
+    // idempotence check (unified_cache_get_planned_pp_moe_onednn_n_ubatch()) would otherwise start every fresh model
+    // load believing nothing was planned yet.
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_row_bytes(
-        ctx->device, inventory->pp_moe_onednn_activation_bytes_per_row, inventory->pp_moe_onednn_output_bytes_per_row);
-    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(ctx->device, inventory->n_ubatch);
+        ctx->device, inventory->pp_moe_onednn_activation_bytes_per_row, inventory->pp_moe_onednn_output_bytes_per_row,
+        static_cast<uint32_t>(std::max(0, inventory->n_expert)),
+        static_cast<uint32_t>(std::max(0, inventory->n_expert_used)));
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(
+        ctx->device, ggml_sycl::placement_load_n_ubatch(inventory->n_ubatch));
     // The load's planning micro-batch, recorded beside the compute term for the hold-spill fit. Recorded here, at each
     // inventory intake, because the published plan cannot carry it: every runtime context transaction rewrites the
     // plan's planner_n_ubatch with the context's own micro-batch. A load's early plan and late intake both pass here
@@ -20672,16 +20680,20 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
         admit_in.activation_bytes_per_row =
             ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device);
         admit_in.output_bytes_per_row = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device);
+        admit_in.n_expert             = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_expert(device);
+        admit_in.n_expert_used        = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_expert_used(device);
         admit_in.ring_depth           = ring_depth;
         admit_in.n_ubatch             = n_ubatch;
         admission                     = ggml_sycl::pp_moe_onednn_admit_ring(admit_in);
     }
-    const uint32_t fits =
-        arena ? admission.largest_fitting_n_ubatch :
-                ggml_sycl::unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(
-                    capacity_bytes, weight_slot_bytes,
-                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device),
-                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device), ring_depth);
+    const uint32_t fits = arena ?
+                              admission.largest_fitting_n_ubatch :
+                              ggml_sycl::unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(
+                                  capacity_bytes, weight_slot_bytes,
+                                  ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device),
+                                  ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device),
+                                  ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_expert(device),
+                                  ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_expert_used(device), ring_depth);
 
     // Shared refusal path: restore the OLD ring (re-reserve it -- see the
     // function comment for why this cannot plausibly fail, and what it

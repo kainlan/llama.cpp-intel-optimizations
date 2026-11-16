@@ -331,18 +331,18 @@ struct ggml_sycl_tensor_inventory {
     // Computed from the largest quantized weight tensor as 2 x (n_elements * sizeof(fp16)).
     size_t                         pp_pipeline_scratch_bytes;
     // Ring-backed PP MoE oneDNN staging planned from the model inventory.
-    // Slots hold one dequantized expert weight, one f16 activation tile, and one f32 output tile.
+    // Slots hold the dequantized expert weights, the f16 activation scratch, and the f32 output scratch.
     // The current PP path serializes slot use, so the default plan reserves one reusable slot.
     size_t                         pp_moe_onednn_weight_slot_bytes;
+    // Unused: the backend sizes the activation and output slots (pp_moe_onednn_slots_at) from the per-row bytes and
+    // the expert counts below, for the micro-batch a context runs.
     size_t                         pp_moe_onednn_activation_slot_bytes;
     size_t                         pp_moe_onednn_output_slot_bytes;
+    // ring_depth * weight slot; the backend adds the row-scaled slots.
     size_t                         pp_moe_onednn_scratch_bytes;
-    // llama.cpp-ibj0: per-row bytes behind the two slot sizes above (activation
-    // slot = align256(n_ubatch * pp_moe_onednn_activation_bytes_per_row), output
-    // slot analogous) -- carried into the backend so the runtime-context
-    // transaction can re-plan the ring for the REAL runtime n_ubatch instead of
-    // the load-time default this struct's n_ubatch field below is fixed to (512).
-    // 0 for a dense model (no MoE PP ring).
+    // Bytes of one activation scratch row (the widest expert's input width in half floats) and of one output scratch
+    // row (its output width in floats). The backend multiplies them by the rows the packed scratch can need at the
+    // context's micro-batch, which depend on n_expert and n_expert_used below. 0 for a dense model (no MoE PP ring).
     size_t                         pp_moe_onednn_activation_bytes_per_row;
     size_t                         pp_moe_onednn_output_bytes_per_row;
     uint32_t                       pp_moe_onednn_ring_depth;
