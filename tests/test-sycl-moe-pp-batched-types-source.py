@@ -1060,13 +1060,13 @@ def claim_q_group_knob(s):
         fails.append("the device test does not require at least three groups at the slot's own grouping")
     if GROUP_CAPS not in test:
         fails.append(f"the device test does not run the capped cases `{GROUP_CAPS}`")
-    if "for (int cap : k_group_caps) { if (!run_capped_child(cap)) { ++failed; } }" not in test:
+    if 'for (int cap : k_group_caps) { if (!run_child_case("--group-cap", cap)) { ++failed; } }' not in test:
         fails.append("the device test does not run a child process for every cap and count each failed one")
     if "if (waited && WIFEXITED(status) && WEXITSTATUS(status) == 0) { return true; }" not in test:
         fails.append("a capped case passes on something other than its child exiting 0")
     if "make_case(GGML_TYPE_Q4_0, 300, k_used, rng), true, group_cap) ? 0 : 1;" not in test:
         fails.append("a capped case's child does not exit 1 when its case fails")
-    if 'execl("/proc/self/exe", "test-moe-pp-batched-dequant", "--group-cap",' not in test:
+    if 'execl("/proc/self/exe", "test-moe-pp-batched-dequant", flag, arg.c_str(),' not in test:
         fails.append("a capped case does not run in a fresh process of the test itself")
     sets = test.count(f'setenv("{GROUP_KNOB}",')
     if sets != 1 or f'setenv("{GROUP_KNOB}", argv[2], 1);' not in test:
@@ -1372,7 +1372,7 @@ MUTANTS = [
     ("q", "device_test", "groups < k_min_groups", "groups < 1"),
     # No single-expert case; no child run; the cap set for the whole run; the child's cap never set; a loose count.
     ("q", "device_test", GROUP_CAPS, "constexpr int k_group_caps[] = { 3 };"),
-    ("q", "device_test", "if (!run_capped_child(cap)) {", "if (false) {"),
+    ("q", "device_test", 'if (!run_child_case("--group-cap", cap)) {', "if (false) {"),
     ("q", "device_test", 'setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1);',
      f'setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1); setenv("{GROUP_KNOB}", "3", 1);'),
     ("q", "device_test", f'setenv("{GROUP_KNOB}", argv[2], 1);', ""),
@@ -1380,7 +1380,8 @@ MUTANTS = [
     # A waited child passes whatever its status; the child exits 0 on a failed case; a failed child is not counted.
     ("q", "device_test", "if (waited && WIFEXITED(status) && WEXITSTATUS(status) == 0) {", "if (waited) {"),
     ("q", "device_test", "true, group_cap) ? 0 : 1;", "true, group_cap) ? 0 : 0;"),
-    ("q", "device_test", "if (!run_capped_child(cap)) { ++failed; }", "if (!run_capped_child(cap)) { }"),
+    ("q", "device_test", 'if (!run_child_case("--group-cap", cap)) { ++failed; }',
+     'if (!run_child_case("--group-cap", cap)) { }'),
     # No barrier on the GEMMs; the scratch released before the barrier; the leases not held; the helper holds none.
     ("r", "sycl", FAIL_BARRIER, "const sycl::event drained = stream->ext_oneapi_submit_barrier();"),
     ("r", "sycl", FAIL_BARRIER + " " + FAIL_RETAIN + " " + CLAIM_RELEASE,

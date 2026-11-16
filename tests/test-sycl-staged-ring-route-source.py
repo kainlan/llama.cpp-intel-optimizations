@@ -617,8 +617,8 @@ def test_served_only_as_plain_kernel_mutants():
     assert not c(mutate(SYCL, "1.0f, phase_weights + (lo - phase.begin) * weight_elems,",
                         "1.0f, static_cast<const sycl::half *>(active_experts[lo].ptr),"))
     # The WOQ GEMM handed the repack sources instead of the WOQ slot.
-    assert not c(mutate(SYCL, "static_cast<int64_t>(act_slot_elems), batched_weight_bytes + lo * weight_slot_bytes,",
-                        "static_cast<int64_t>(act_slot_elems), (const uint8_t *) repack_srcs[lo],"))
+    assert not c(mutate(SYCL, "act_stride, batched_weight_bytes + lo * weight_slot_bytes,",
+                        "act_stride, (const uint8_t *) repack_srcs[lo],"))
     # A new reader of the expert's pointer beside the pinned kernels.
     assert not c(mutate(SYCL, "const void * expert_src = expert.ptr;",
                         "const void * expert_src = expert.ptr; ggml_sycl_onednn_read(expert.ptr);"))
