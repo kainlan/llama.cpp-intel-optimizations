@@ -129,6 +129,7 @@
 #include "ggml-sycl/moe-host-island.hpp"
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/moe-mmvq-tables.hpp"
+#include "ggml-sycl/moe-pp-pack.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
 #include "ggml-sycl/mul-mat-bf16.hpp"
 #include "ggml-sycl/nonfa-stage.hpp"
@@ -93222,47 +93223,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return reject_batched(moe_pp_batched_refusal::DIMS_OVERFLOW, "experts-or-rows");
             }
 
-            // llama.cpp-dboi: one rectangular GEMM padded to the busiest expert
-            // wastes ~5x compute on GPT-OSS routing (one hot expert takes ~510
-            // of 512 tokens each layer while the rest average ~70; measured
-            // ONEDNN_VERBOSE: 615 ms/pass at n=~510 x batch=~21 for 2048 real
-            // rows). Sort experts by row count and split into groups wherever
-            // the next expert has under half the group head's rows, then issue
-            // one strided batch per group padded only to that group's head --
-            // slot n padded to a multiple of 64 so primitive shapes recur
-            // across layers and passes instead of JITting per distinct count.
+            // One rectangular GEMM padded to the busiest expert wastes about 5x compute on GPT-OSS routing (one hot
+            // expert takes nearly every token each layer while the rest average about 70). The experts are sorted by
+            // row count and split into groups wherever the next expert has under half the group head's rows, and one
+            // strided batch is issued per group, padded only to that group's head. The scratch is laid out the same
+            // way: a strip per group, so a small group costs its own rows and not the busiest expert's.
             std::sort(active_experts.begin(), active_experts.end(),
                       [](const pp_onednn_batched_expert & a, const pp_onednn_batched_expert & b) {
                           return (a.row_end - a.row_begin) > (b.row_end - b.row_begin);
                       });
-            const auto align_rows_64 = [](size_t rows) -> size_t {
-                return (rows + 63) & ~static_cast<size_t>(63);
-            };
-            const size_t max_rows_padded = align_rows_64(max_rows_per_expert);
-
-            struct pp_gemm_group {
-                size_t begin  = 0;
-                size_t end    = 0;
-                size_t n_rows = 0;
-            };
-            std::vector<pp_gemm_group> gemm_groups;
-            {
-                size_t begin     = 0;
-                size_t head_rows = active_experts.front().row_end - active_experts.front().row_begin;
-                for (size_t i = 1; i <= active_experts.size(); ++i) {
-                    const size_t rows_i =
-                        i < active_experts.size() ? active_experts[i].row_end - active_experts[i].row_begin : 0;
-                    if (i == active_experts.size() || rows_i * 2 < head_rows) {
-                        pp_gemm_group group;
-                        group.begin  = begin;
-                        group.end    = i;
-                        group.n_rows = std::min(align_rows_64(head_rows), max_rows_padded);
-                        gemm_groups.push_back(group);
-                        begin     = i;
-                        head_rows = rows_i;
-                    }
-                }
+            std::vector<size_t> rows_desc;
+            rows_desc.reserve(active_experts.size());
+            for (const pp_onednn_batched_expert & expert : active_experts) {
+                rows_desc.push_back(expert.row_end - expert.row_begin);
             }
+            ggml_sycl::moe_pp_packed_layout pack;
+            if (!ggml_sycl::moe_pp_pack_gemm_groups(rows_desc, &pack)) {
+                return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
+            }
+            const std::vector<ggml_sycl::moe_pp_gemm_group> & gemm_groups = pack.groups;
             // host-stall attribution cycle, phase 4/6: active_experts
             // reserve+build+sort (llama.cpp-dboi's bimodal-routing sort)
             // plus the gemm_groups build above -- pure host CPU work, no
@@ -93348,8 +93327,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const size_t active_count          = active_experts.size();
             size_t       weight_elems          = 0;  // f16-arm only: half-elements per expert weight slot
             size_t       f16_expert_bytes      = 0;  // f16-arm only: one expert's f16 matrix
-            size_t       act_slot_elems        = 0;
-            size_t       out_slot_elems        = 0;
             size_t       total_act_elems       = 0;
             size_t       total_out_elems       = 0;
             size_t       weight_bytes          = 0;
@@ -93358,10 +93335,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             size_t       woq_nibble_slot_bytes = 0;  // WOQ-arm only
             size_t       woq_scale_slot_bytes  = 0;  // WOQ-arm only
             size_t       weight_slot_bytes     = 0;  // WOQ-arm only: woq_nibble_slot_bytes + woq_scale_slot_bytes
-            if (!checked_mul(max_rows_padded, static_cast<size_t>(ne10), act_slot_elems) ||
-                !checked_mul(max_rows_padded, static_cast<size_t>(ne0), out_slot_elems) ||
-                !checked_mul(act_slot_elems, active_count, total_act_elems) ||
-                !checked_mul(out_slot_elems, active_count, total_out_elems) ||
+            if (!checked_mul(pack.packed_rows, static_cast<size_t>(ne10), total_act_elems) ||
+                !checked_mul(pack.packed_rows, static_cast<size_t>(ne0), total_out_elems) ||
                 !checked_mul(total_act_elems, sizeof(sycl::half), act_bytes) ||
                 !checked_mul(total_out_elems, sizeof(float), out_bytes)) {
                 return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
@@ -93512,6 +93487,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             batched_acts = static_cast<sycl::half *>(reserved.activation);
             batched_out  = static_cast<float *>(reserved.output);
+            // Where the expert at sorted position `slot` has its rows. The gather, both GEMM arms and the scatter all
+            // ask here, so they cannot disagree about an expert's rows.
+            const auto act_base = [&](size_t slot) -> sycl::half * {
+                return batched_acts + pack.slot_base_row[slot] * static_cast<size_t>(ne10);
+            };
+            const auto out_base = [&](size_t slot) -> float * {
+                return batched_out + pack.slot_base_row[slot] * static_cast<size_t>(ne0);
+            };
             batched_scratch_claim.mark_used();
 
             // The device experts' ready events. A deferred expert's copy is ordered by its window's own barrier, in
@@ -93694,7 +93677,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     ggml_sycl_profile_submit(*stream, stage_label, [&](sycl::queue & profiled_queue) {
                         return profiled_queue.submit([&](sycl::handler & cgh) {
                             cgh.depends_on(row_mappings_ready);
-                            char * __restrict act_get = reinterpret_cast<char *>(batched_acts + slot * act_slot_elems);
+                            char * __restrict act_get                     = reinterpret_cast<char *>(act_base(slot));
                             mmid_row_mapping * __restrict row_mapping_get = dev_row_mappings.get() + expert.row_begin;
                             const size_t dst_nb1_f16                      = src1_contiguous_f16_row_bytes;
                             cgh.parallel_for(
@@ -94040,26 +94023,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         gemm_profile_begin = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_begin_marker>(*stream);
                     }
                     // Each GEMM group (experts of similar row counts) clipped to this phase's experts.
-                    for (const pp_gemm_group & group : gemm_groups) {
+                    for (const ggml_sycl::moe_pp_gemm_group & group : gemm_groups) {
                         const size_t lo = std::max(group.begin, phase.begin);
                         const size_t hi = std::min(group.end, phase.end);
                         if (lo >= hi) {
                             continue;
                         }
+                        // Slots are equal inside a group, so the batch's stride is the group's own slot.
+                        const int64_t act_stride = static_cast<int64_t>(group.n_rows * static_cast<size_t>(ne10));
+                        const int64_t out_stride = static_cast<int64_t>(group.n_rows * static_cast<size_t>(ne0));
                         // A declined scratchpad submitted nothing for this group; the groups before it wrote only the
                         // batched scratch buffers, never dst, so the whole stage takes the failure path below.
                         std::optional<sycl::event> group_event;
                         if (pp_woq_arm) {
                             group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4(
                                 ctx, /* m = */ static_cast<int>(group.n_rows), /* n = */ static_cast<int>(ne01),
-                                /* k = */ static_cast<int>(ne00), batched_acts + lo * act_slot_elems,
-                                DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int64_t>(act_slot_elems),
-                                batched_weight_bytes + lo * weight_slot_bytes,
+                                /* k = */ static_cast<int>(ne00), act_base(lo), DnnlGemmWrapper::to_dt<sycl::half>(),
+                                act_stride, batched_weight_bytes + lo * weight_slot_bytes,
                                 static_cast<int64_t>(weight_slot_bytes) * 2, /* group_size = */ QK_MXFP4,
                                 batched_weight_bytes + lo * weight_slot_bytes + woq_nibble_slot_bytes,
-                                static_cast<int64_t>(weight_slot_bytes), batched_out + lo * out_slot_elems,
-                                DnnlGemmWrapper::to_dt<float>(), static_cast<int64_t>(out_slot_elems),
-                                static_cast<int>(hi - lo), ctx.stream(), { deps_in });
+                                static_cast<int64_t>(weight_slot_bytes), out_base(lo), DnnlGemmWrapper::to_dt<float>(),
+                                out_stride, static_cast<int>(hi - lo), ctx.stream(), { deps_in });
                         } else {
                             group_event = DnnlGemmWrapper::gemm_batch_strided(
                                 ctx,
@@ -94067,12 +94051,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(group.n_rows),
                                 static_cast<int>(ne00), 1.0f, phase_weights + (lo - phase.begin) * weight_elems,
                                 DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne00),
-                                static_cast<int64_t>(weight_elems), batched_acts + lo * act_slot_elems,
-                                DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10),
-                                static_cast<int64_t>(act_slot_elems), 0.0f, batched_out + lo * out_slot_elems,
-                                DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0),
-                                static_cast<int64_t>(out_slot_elems), static_cast<int>(hi - lo), ctx.stream(),
-                                { deps_in }, pp_mxfp4_labels ? nullptr : "moe.pp.gemm.execute",
+                                static_cast<int64_t>(weight_elems), act_base(lo), DnnlGemmWrapper::to_dt<sycl::half>(),
+                                static_cast<int>(ne10), act_stride, 0.0f, out_base(lo), DnnlGemmWrapper::to_dt<float>(),
+                                static_cast<int>(ne0), out_stride, static_cast<int>(hi - lo), ctx.stream(), { deps_in },
+                                pp_mxfp4_labels ? nullptr : "moe.pp.gemm.execute",
                                 pp_mxfp4_labels ? nullptr : "moe.pp.gemm");
                         }
                         if (!group_event) {
@@ -94309,8 +94291,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 sycl::event scatter_copy_event =
                     ggml_sycl_profile_submit(*stream, stage_label, [&](sycl::queue & profiled_queue) {
                         return profiled_queue.submit([&](sycl::handler & cgh) {
-                            const char * __restrict out_get =
-                                reinterpret_cast<const char *>(batched_out + slot * out_slot_elems);
+                            const char * __restrict out_get = reinterpret_cast<const char *>(out_base(slot));
                             const mmid_row_mapping * __restrict row_mapping_get =
                                 dev_row_mappings.get() + expert.row_begin;
                             cgh.parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
