@@ -7727,6 +7727,22 @@ set_tests_properties(sycl-moe-scratch-admission PROPERTIES
     TIMEOUT 30
 )
 
+# The packed layout of the batched MoE prompt executor's scratch. moe-pp-pack.hpp is header-only and includes no SYCL
+# header, so this target takes no -fsycl and links no backend library.
+add_executable(test-moe-pp-pack
+    tests/test-moe-pp-pack.cpp
+)
+target_include_directories(test-moe-pp-pack PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-moe-pp-pack PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-pp-pack COMMAND test-moe-pp-pack)
+set_tests_properties(sycl-moe-pp-pack PROPERTIES
+    LABELS "sycl;moe;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
 # Runtime admission of the PP MoE oneDNN scratch ring (llama.cpp-u1bb): which
 # slots go to the RUNTIME zone and which to the KV zone's post-KV headroom.
 # Same dependency-free unit and registration as test-moe-scratch-admission.
