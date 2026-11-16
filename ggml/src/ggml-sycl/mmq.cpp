@@ -7753,5 +7753,5 @@ void ggml_sycl_op_mul_mat_q(ggml_backend_sycl_context & ctx,
         return;
     }
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    ggml_sycl_fatal_exit(ggml_sycl_fatal_exit_code(exc.what()), "ggml_sycl_op_mul_mat_q");
 }

@@ -157,6 +157,7 @@ SYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_synchronize\s*\("
 SET_ASYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_set_tensor_async\s*\("
 SUPPORTS_SIG = r"\bstatic\s+bool\s+ggml_backend_sycl_device_supports_buft\s*\("
 CPY_ASYNC_DEF = "static bool ggml_backend_sycl_cpy_tensor_async("
+CPY_ASYNC_FATAL = 'ggml_sycl_fatal_exit(ggml_sycl_fatal_exit_code(exc.what()), "ggml_backend_sycl_cpy_tensor_async");'
 GET_ASYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_get_tensor_async\s*\("
 LOAD_END_SIG = r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_model_load_end\s*\("
 TXN_SIG = r"\bggml_sycl_txn_result\s+ggml_sycl_run_runtime_context_transaction\s*\("
@@ -642,7 +643,9 @@ def free_path_pins(source, freeb, fails):
     supports = function_body(source, SUPPORTS_SIG)
     if supports is None or "cpu_activation_buffer_type" in supports:
         fails.append("L4 free path: the device supports the CpuActivation buffer type (a SYCL op could read a CPU activation)")
-    if source.count("ggml_backend_sycl_cpy_tensor_async") != 1:
+    # Its own catch names it in the fast exit's message: that quoted string is a diagnostic, not a reference, and only
+    # that exact literal is set aside.
+    if source.replace('"ggml_backend_sycl_cpy_tensor_async"', '""').count("ggml_backend_sycl_cpy_tensor_async") != 1:
         fails.append("L4 free path: cpy_tensor_async is referenced beyond its definition (the backend's interface wires it)")
 
 
@@ -1860,6 +1863,9 @@ def mutations(header_raw, source):
                   "auto release_rung_buffers = [&]() {\n        synchronize();\n", "auto release_rung_buffers = [&]() {\n"))
     pairs.append(("the backend interface wires cpy_tensor_async", "cpy_tensor_async is referenced beyond its definition",
                   CPY_ASYNC_DEF, "static void h_wire_cpy() { (void) ggml_backend_sycl_cpy_tensor_async; }\n" + CPY_ASYNC_DEF))
+    # On the same line as the fast exit, so an exemption by line rather than by the exact literal would let it through.
+    pairs.append(("a reference to cpy_tensor_async beside its fast-exit message", "cpy_tensor_async is referenced beyond its definition",
+                  CPY_ASYNC_FATAL, "(void) ggml_backend_sycl_cpy_tensor_async; " + CPY_ASYNC_FATAL))
     # llama.cpp-p6i0: the load's compute-term entries
     pairs.append(("the writer marked unused again", "still marked [[maybe_unused]]",
                   "static bool ggml_sycl_load_record_compute_term(",

@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -793,6 +794,35 @@ void ggml_sycl_fatal_exit(int code, const char * message) noexcept {
     ggml_sycl::zone_reset_audit_report("sycl-fatal-exit");
     std::_Exit(code);
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void ggml_sycl_test_inject_device_lost(const char * site) {
+    struct request {
+        std::string site;
+        long long   n = 0;
+    };
+
+    static const request req = [] {
+        request      r;
+        const char * value = std::getenv("GGML_SYCL_TEST_INJECT_DEVICE_LOST");
+        const char * colon = value != nullptr ? std::strchr(value, ':') : nullptr;
+        if (colon != nullptr) {
+            r.site.assign(value, colon);
+            r.n = std::atoll(colon + 1);
+        }
+        return r;
+    }();
+    if (req.n <= 0 || site == nullptr || req.site != site) {
+        return;
+    }
+    static std::atomic<long long> calls{ 0 };
+    if (calls.fetch_add(1, std::memory_order_relaxed) + 1 >= req.n) {
+        throw sycl::exception(sycl::make_error_code(sycl::errc::runtime),
+                              "injected test fault: level_zero backend failed with error: 20 "
+                              "(UR_RESULT_ERROR_DEVICE_LOST)");
+    }
+}
+#endif
 
 // Parse GGML_SYCL_OP_TIMEOUT_MS. Returns the parsed non-negative value, or
 // watchdog_default_timeout_ms when the value is missing, empty, negative, or

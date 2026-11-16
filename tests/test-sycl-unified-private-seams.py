@@ -52,8 +52,12 @@ guarded = {
         "GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline",
         "GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset",
         "GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts",
+        "void ggml_sycl_test_inject_device_lost(const char * site) {",
     ),
-    SYCL / "common.hpp": ("bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site site);",),
+    SYCL / "common.hpp": (
+        "bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site site);",
+        "void ggml_sycl_test_inject_device_lost(const char * site);",
+    ),
     ROOT / "ggml/include/ggml-sycl.h": (
         "GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline",
         "GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset",
@@ -122,13 +126,20 @@ if len(sys.argv) > 1:
         "test_set_moe_mmid_route_reachable_override",
         "test_restore_moe_mmid_route_reachable_override",
         "g_test_moe_mmid_route_reachable_override",
+        "ggml_sycl_test_inject_device_lost",
     )
-    leaked = [name for name in forbidden_symbols if name in nm]
+    # These seams keep an inline stub of the same name in the ordinary build, and an unoptimised build can emit that
+    # stub as a weak symbol (nm type W). That is the ordinary build as intended; only a defined text symbol (T or t)
+    # is the private definition leaking.
+    stubbed_symbols = ("ggml_sycl_scratchpad_site_hook", "ggml_sycl_test_inject_device_lost")
+    text_symbols = "\n".join(m.group(2) for m in re.finditer(r"^\S+\s+([Tt])\s+(.*)$", nm, re.M))
+    leaked = [name for name in forbidden_symbols if name in (text_symbols if name in stubbed_symbols else nm)]
     if leaked:
         raise SystemExit(f"ordinary artifact exposes private mutable seams: {leaked}")
     forbidden_strings = (
         "GGML_SYCL_TEST_MEM_FILL_PROFILE_ERROR_AFTER_SUBMIT",
         "GGML_SYCL_TEST_DMA_FAIL",
+        "GGML_SYCL_TEST_INJECT_DEVICE_LOST",
     )
     leaked_strings = [name for name in forbidden_strings if name in strings]
     if leaked_strings:

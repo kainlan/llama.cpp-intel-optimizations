@@ -31,12 +31,12 @@ cleanup_helper = slice_between(sycl, "static void ggml_backend_sycl_graph_bounda
 
 checks = {
     "graph_compute catches std and unknown": "catch (const std::exception & exc)" in graph_compute and "catch (...)" in graph_compute,
-    "graph_compute returns failed not escape": graph_compute.count("return GGML_STATUS_FAILED;") >= 3 and "std::exit(1)" not in graph_compute,
+    "graph_compute returns failed not escape": graph_compute.count("return GGML_STATUS_FAILED;") >= 3 and "std::exit(1)" not in graph_compute and "ggml_sycl_fatal_exit(" not in graph_compute,
     "graph_compute cleanup quarantines and releases exact invocation": "ggml_sycl_execution_quarantine_graph(cleanup_ctx)" in sycl and "ggml_sycl_execution_release_graph(cleanup_ctx)" in sycl,
     "synchronize catches std and unknown": "catch (const std::exception & exc)" in sync_body and "catch (...)" in sync_body,
-    "synchronize no c++ escape": "std::exit(1)" not in sync_body and "ggml_backend_sycl_graph_boundary_exception_cleanup(sycl_ctx, \"synchronize\"" in sync_body,
-    "event boundary logs not exits": "GGML_LOG_ERROR" in event_boundary and "std::exit(1)" not in event_boundary,
-    "device event synchronize logs not exits": "GGML_LOG_ERROR" in device_event_sync and "std::exit(1)" not in device_event_sync,
+    "synchronize no c++ escape": "std::exit(1)" not in sync_body and "ggml_sycl_fatal_exit(" not in sync_body and "ggml_backend_sycl_graph_boundary_exception_cleanup(sycl_ctx, \"synchronize\"" in sync_body,
+    "event boundary logs not exits": "GGML_LOG_ERROR" in event_boundary and "std::exit(1)" not in event_boundary and "ggml_sycl_fatal_exit(" not in event_boundary,
+    "device event synchronize logs not exits": "GGML_LOG_ERROR" in device_event_sync and "std::exit(1)" not in device_event_sync and "ggml_sycl_fatal_exit(" not in device_event_sync,
     "for_each snapshots binding before callbacks": "ggml_sycl_execution_pin_bound_backends_locked(context_id)" in for_each and "ggml_sycl_execution_release_backend_pin(pin);" in for_each,
     "extract snapshots bound backends before swaps": "std::vector<ggml_sycl_execution_bound_backend_pin> bound_backends;" in extract_body and "binding_lock(g_execution_backend_binding_mutex)" in extract_body and "ggml_sycl_execution_pin_bound_backends_locked(ticket->context_id.value)" in extract_body,
     "extract swaps control owners outside binding lock": "for (size_t index = 0; index < bound_backends.size(); ++index)" in extract_body and "control_host_allocs.swap" in extract_body,
