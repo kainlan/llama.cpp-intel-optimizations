@@ -703,7 +703,10 @@ INTERNAL_WRAPPER_SITES = {
         # "not resident" and a refill that dropped a triplet "not lent" must leave in place, and then reads the current
         # plan to show the dropped triplet is still on the host.
         "const auto now = ::ggml_sycl_global_plan_snapshot();": 2,
-        "const auto published = ::ggml_sycl_global_plan_snapshot();": 15,  # llama.cpp-7999: +1, lent_bytes_are
+        # 15 -> 16: test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned reads the published plan in
+        # its members_read helper, to show each lent member's backing and the plan's mapped staging source before the
+        # loan, while lent and after the refill. A test-only reader of the same snapshot the loan transaction publishes.
+        "const auto published = ::ggml_sycl_global_plan_snapshot();": 16,  # llama.cpp-7999: +1, lent_bytes_are
         # llama.cpp-sif1: the unpreparable-triplet case reads the publication a refill into a full WEIGHT zone must
         # leave in place, and shows it does.
         "const auto before_full = ::ggml_sycl_global_plan_snapshot();": 1,
