@@ -3425,6 +3425,44 @@ kernel log as the observation. **Observed success:** 20 settled exits with no ke
 owner chose (16 of 22 unsettled exits with lines, same day, card and driver), both correctness gates passing, and
 the record on llama.cpp-488x.
 
+### Amendment 1 as implemented and measured (2026-11-16)
+
+All four tasks are merged into `integ/th32`: W1.6 as `9064de6dc`, W1.7 as `73024b399`, W1.8 as `8d113e02a` and W1.9
+as `d0118bb6c`. L2 passed on `8d113e02a`.
+
+**What differs from the tasks above.**
+
+- W1.8 added a ninth host mode, `abort-settle-chain`. It proves that an abort callback installed before the
+  backend's still runs, and that the wait happens once. L2 step 1 therefore ran nine host modes, not eight.
+- The settle on a ggml abort depends on install order. The backend installs its callback once, at registration. An
+  application that installs its own abort callback after that replaces it, and its aborts do not wait. The comment
+  in `common.hpp` says so.
+- W1.9's acceptance names `bash scripts/check-ctest-safety-net.sh --self-test`. That flag does not exist. The check
+  that was run is `bash tests/merge-guards/test-ctest-safety-net.sh`, which passed.
+
+**L2, integ `8d113e02a`, Arc Pro B50, driver 26.44 (`libze_intel_gpu.so.1.18.40734`):**
+
+| check | without the wait (control, build `db1b43cb3`, same day) | with the wait |
+|---|---|---|
+| fast exits through the four device modes | 22 | 20 (five rounds, rotated order, 12 s apart) |
+| exits that printed the settle line | not applicable | 20 |
+| exit status | not recorded here | 69 on all 20 |
+| exits that left a `Fault response`, `Engine reset` or `CAT error` line | 16 | 0 |
+| exits that hung to the 60 s timeout | not recorded here | 0 |
+| host modes through ctest | not run | 9 of 9 pass |
+| source pin | not run | 41 cases pass |
+| Mistral completion gate, GPT-OSS chat gate | not run | pass, pass (digit line count 1, scorer control 0) |
+| Mistral Q4_0 `-p 512 -n 128`, order B A A B against the tree before the width plan (`5d3267494`) | pp512 1336.10, 1336.70; tg128 45.34, 45.34 | pp512 1337.15, 1334.08; tg128 45.43, 45.35 |
+
+The kernel log shows no GPU line in either phase. Throughput is unchanged, as expected: the wait is on failure paths
+only.
+
+**What this does not show.** Twenty clean exits cannot rule out a rare hang. A process that ctest kills at its
+`TIMEOUT` ends without the wait, and no run has checked what that leaves. So the `fatal-exit-device` label stays out
+of the documented full sweep and each mode's parent still waits 12 s after its child. The lead's rule "no device
+modes in lead scripts" ended with L2. The rule that stays: after any fast exit or kill on a card, read the kernel
+log before starting the next process there.
+
 ---
 
 ## Amendment 2 (stage 2): the plan charges a device expert what staging allocates (llama.cpp-az3g)
