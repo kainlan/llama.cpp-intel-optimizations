@@ -439,7 +439,7 @@ int child_main(const char * mode) {
         // to the parent carries the output as usual. SIGXFSZ is ignored, so a write past the limit returns EFBIG
         // instead of ending the process.
         plant_markers();
-        if (std::signal(SIGXFSZ, SIG_IGN) == SIG_ERR) {
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR) {
             std::fprintf(stderr, "TEST-SETUP-FAILED signal(SIGXFSZ): %s\n", std::strerror(errno));
             return 4;
         }
