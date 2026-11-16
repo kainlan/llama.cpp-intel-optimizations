@@ -4,9 +4,13 @@
 
 #include "common.hpp"
 
+#include <poll.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +21,14 @@ namespace {
 
 constexpr const char * k_atexit_marker = "TEST-ATEXIT-RAN";
 constexpr const char * k_dtor_marker   = "TEST-STATIC-DTOR-RAN";
+
+// A child still running after this long is hung: the parent kills it and reports what it printed, because a hang is
+// the failure the fast exit exists to prevent and must not hang the test with it.
+constexpr int k_child_limit_s = 30;
+
+// How long the parent keeps reading the pipe and waiting for the child after the kill. Bounded because a child the
+// kernel holds in an uninterruptible wait cannot be reaped, and a process the child started can still hold the pipe.
+constexpr int k_child_grace_s = 5;
 
 void atexit_marker() {
     std::fprintf(stderr, "%s\n", k_atexit_marker);
@@ -36,12 +48,39 @@ void plant_markers() {
 }
 
 struct child_result {
-    bool        exited  = false;
-    int         status  = -1;
-    int         signal  = 0;
-    double      seconds = 0.0;
+    bool        exited    = false;
+    int         status    = -1;
+    int         signal    = 0;
+    bool        timed_out = false;
+    bool        reaped    = false;
+    double      seconds   = 0.0;
     std::string err;
 };
+
+int ms_until(std::chrono::steady_clock::time_point t) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(t - std::chrono::steady_clock::now());
+    return left.count() > 0 ? static_cast<int>(left.count()) : 0;
+}
+
+// Appends what arrives on the pipe within wait_ms. Returns false once the pipe is at end of file or cannot be read,
+// true otherwise, including when nothing arrived in time.
+bool read_pipe(int fd, int wait_ms, std::string & out) {
+    pollfd    pfd   = { fd, POLLIN, 0 };
+    const int ready = poll(&pfd, 1, wait_ms);
+    if (ready < 0) {
+        return errno == EINTR;
+    }
+    if (ready == 0) {
+        return true;
+    }
+    char          buf[4096];
+    const ssize_t n = read(fd, buf, sizeof(buf));
+    if (n > 0) {
+        out.append(buf, static_cast<size_t>(n));
+        return true;
+    }
+    return n < 0 && errno == EINTR;
+}
 
 child_result run_child(const char * self, const char * mode) {
     int fds[2];
@@ -56,26 +95,53 @@ child_result run_child(const char * self, const char * mode) {
         std::exit(1);
     }
     if (pid == 0) {
-        dup2(fds[1], STDERR_FILENO);
+        if (dup2(fds[1], STDERR_FILENO) < 0) {
+            std::perror("dup2");
+            _exit(127);
+        }
         close(fds[0]);
         close(fds[1]);
-        execl(self, self, "--child", mode, static_cast<char *>(nullptr));
+        // /proc/self/exe rather than argv[0]: execl does no PATH search, so a run started by bare name would fail.
+        execl("/proc/self/exe", self, "--child", mode, static_cast<char *>(nullptr));
+        std::perror("execl");
         _exit(127);
     }
     close(fds[1]);
+    // The parent waits for both the pipe's end and the child's exit, because neither proves the other: a child stuck
+    // in the kernel while it closes its device files has already closed the pipe. Both waits are bounded, by the
+    // limit and then, after a kill, by the grace period, so a hang is reported with what the child printed before it.
     child_result r;
-    char         buf[4096];
-    ssize_t      n = 0;
-    while ((n = read(fds[0], buf, sizeof(buf))) > 0) {
-        r.err.append(buf, static_cast<size_t>(n));
+    auto         until = t0 + std::chrono::seconds(k_child_limit_s);
+    bool         open  = true;
+    int          st    = 0;
+    while (open || !r.reaped) {
+        if (ms_until(until) == 0) {
+            if (r.timed_out || r.reaped) {
+                break;
+            }
+            r.timed_out = true;
+            kill(pid, SIGKILL);
+            until = std::chrono::steady_clock::now() + std::chrono::seconds(k_child_grace_s);
+        }
+        if (open) {
+            open = read_pipe(fds[0], std::min(ms_until(until), 10), r.err);
+        } else {
+            usleep(10 * 1000);
+        }
+        if (!r.reaped) {
+            const pid_t done = waitpid(pid, &st, WNOHANG);
+            if (done < 0 && errno != EINTR) {
+                std::perror("waitpid");
+                break;
+            }
+            r.reaped = done == pid;
+        }
     }
     close(fds[0]);
-    int st = 0;
-    waitpid(pid, &st, 0);
     r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    r.exited  = WIFEXITED(st);
+    r.exited  = r.reaped && WIFEXITED(st);
     r.status  = r.exited ? WEXITSTATUS(st) : -1;
-    r.signal  = WIFSIGNALED(st) ? WTERMSIG(st) : 0;
+    r.signal  = r.reaped && WIFSIGNALED(st) ? WTERMSIG(st) : 0;
     return r;
 }
 
@@ -84,13 +150,29 @@ bool has(const child_result & r, const char * needle) {
 }
 
 int fail(const char * mode, const child_result & r, const char * why) {
-    std::fprintf(stderr, "FAIL mode=%s: %s (exited=%d status=%d signal=%d seconds=%.1f)\n--- child stderr ---\n%s\n",
-                 mode, why, r.exited ? 1 : 0, r.status, r.signal, r.seconds, r.err.c_str());
+    std::fprintf(stderr,
+                 "FAIL mode=%s: %s (exited=%d status=%d signal=%d timed_out=%d reaped=%d seconds=%.1f)\n"
+                 "--- child stderr ---\n%s\n",
+                 mode, why, r.exited ? 1 : 0, r.status, r.signal, r.timed_out ? 1 : 0, r.reaped ? 1 : 0, r.seconds,
+                 r.err.c_str());
     return 1;
+}
+
+// A child the parent had to kill is reported as a hang, before any check that would blame its status or its output.
+int check_ended(const char * mode, const child_result & r) {
+    if (!r.timed_out) {
+        return 0;
+    }
+    char why[64];
+    std::snprintf(why, sizeof(why), "the child did not end within %d s", k_child_limit_s);
+    return fail(mode, r, why);
 }
 
 // The fast exit ran: the given status, its banner, and neither marker.
 int check_fast_exit(const char * mode, const child_result & r, int want_status) {
+    if (const int rc = check_ended(mode, r)) {
+        return rc;
+    }
     if (!r.exited || r.status != want_status) {
         return fail(mode, r, "wrong exit status");
     }
@@ -100,8 +182,8 @@ int check_fast_exit(const char * mode, const child_result & r, int want_status) 
     if (has(r, k_atexit_marker) || has(r, k_dtor_marker)) {
         return fail(mode, r, "an exit handler or a static destructor ran");
     }
-    if (r.seconds > 30.0) {
-        return fail(mode, r, "the child took over 30 s to end");
+    if (r.seconds > k_child_limit_s) {
+        return fail(mode, r, "the child ended, but only after the limit");
     }
     return 0;
 }
@@ -122,13 +204,19 @@ int child_main(const char * mode) {
 int parent_main(const char * self, const char * mode) {
     if (std::strcmp(mode, "helper") == 0) {
         const child_result r = run_child(self, mode);
+        if (const int rc = check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST)) {
+            return rc;
+        }
         if (!has(r, "[SYCL-FATAL] test: helper mode")) {
             return fail(mode, r, "the message is not on the [SYCL-FATAL] line");
         }
-        return check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST);
+        return 0;
     }
     if (std::strcmp(mode, "control") == 0) {
         const child_result r = run_child(self, mode);
+        if (const int rc = check_ended(mode, r)) {
+            return rc;
+        }
         if (!r.exited || r.status != GGML_SYCL_EXIT_DEVICE_LOST || !has(r, k_atexit_marker) || !has(r, k_dtor_marker)) {
             return fail(mode, r, "std::exit did not run both markers, so their absence proves nothing");
         }

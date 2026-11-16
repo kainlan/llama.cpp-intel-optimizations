@@ -839,10 +839,15 @@ bool ggml_sycl_what_is_device_lost(const char * what) noexcept;
 // GGML_SYCL_EXIT_DEVICE_LOST for a lost device's exception text, 1 for any other.
 int ggml_sycl_fatal_exit_code(const char * what) noexcept;
 
-// Ends the process at once after a failure it cannot recover from. Prints `message` on one [SYCL-FATAL] line,
-// flushes stdout and stderr, does what the watchdog does before its exit, and leaves through std::_Exit: no exit
-// handler and no static destructor runs. After a device loss the Level Zero library's destructor does not return,
-// and std::exit would run it. The caller prints its own diagnostic first.
+// Ends the process at once after a failure it cannot recover from. Prints `message` on one [SYCL-FATAL] line and
+// flushes stdout and stderr. Then it releases every device command parked on a CPU expert job, and prints the
+// zone-reset audit when GGML_SYCL_ZONE_RESET_AUDIT is set. Last it leaves through std::_Exit, so no exit handler and
+// no static destructor runs: after a device loss the Level Zero library's destructor does not return, and std::exit
+// would run it.
+// The caller prints its own diagnostic first, with fprintf(stderr) or std::cerr and not GGML_LOG_*: the tools route
+// ggml logs into a queue that a worker thread prints, and std::_Exit drops whatever is still queued.
+// Not async-signal-safe (it uses stdio, the audit's mutex and the job registry's timed mutex): never call it from a
+// signal handler.
 [[noreturn]] void ggml_sycl_fatal_exit(int code, const char * message) noexcept;
 
 #define CHECK_TRY_ERROR(expr)                                                                           \
