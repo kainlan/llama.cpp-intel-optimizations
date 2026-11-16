@@ -858,6 +858,15 @@ int ggml_sycl_fatal_exit_code(const char * what) noexcept;
 // signal handler.
 [[noreturn]] void ggml_sycl_fatal_exit(int code, const char * message) noexcept;
 
+// Records a device loss when `what` names one. The first loss also registers an exit handler that ends the process
+// through ggml_sycl_fatal_exit. Exit handlers run latest-registered first, so it runs before the Level Zero
+// library's destructor, which does not return once a device is lost. A path that reports the failure to its caller
+// instead of ending the process stays that way; the process still cannot hang when the caller exits.
+void ggml_sycl_note_exception(const char * what) noexcept;
+
+// True once any thread has recorded a device loss.
+bool ggml_sycl_device_lost_latched() noexcept;
+
 #define CHECK_TRY_ERROR(expr)                                                                           \
     [&]() {                                                                                             \
         try {                                                                                           \
@@ -866,6 +875,7 @@ int ggml_sycl_fatal_exit_code(const char * what) noexcept;
         } catch (std::exception const & e) {                                                            \
             std::cerr << e.what() << "\nException caught at file:" << __FILE__ << ", line:" << __LINE__ \
                       << ", func:" << __func__ << std::endl;                                            \
+            ggml_sycl_note_exception(e.what());                                                         \
             return dpct::default_error;                                                                 \
         }                                                                                               \
     }()
@@ -931,6 +941,11 @@ static __dpct_inline__ float sycl_e8m0_to_fp32_half(uint8_t e) {
                                          const char * msg) {
     fprintf(stderr, "SYCL error: %s: %s\n", stmt, msg);
     fprintf(stderr, "  in function %s at %s:%d\n", func, file, line);
+    if (ggml_sycl_device_lost_latched()) {
+        // A backtrace of a lost device says nothing the lines above do not, and gdb plus a core dump keep the
+        // process, and its VRAM, alive for the time they take.
+        ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "SYCL_CHECK failed after a device loss");
+    }
     GGML_ABORT("SYCL error");
 }
 

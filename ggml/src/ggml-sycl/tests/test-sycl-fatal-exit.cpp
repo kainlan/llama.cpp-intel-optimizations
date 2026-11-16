@@ -437,7 +437,8 @@ int parent_main(const char * self, const char * mode) {
         const bool   ok   = ggml_sycl_what_is_device_lost(lost) && !ggml_sycl_what_is_device_lost(oom) &&
                         !ggml_sycl_what_is_device_lost(nullptr) &&
                         ggml_sycl_fatal_exit_code(lost) == GGML_SYCL_EXIT_DEVICE_LOST &&
-                        ggml_sycl_fatal_exit_code(oom) == 1 && ggml_sycl_fatal_exit_code(nullptr) == 1;
+                        ggml_sycl_fatal_exit_code(oom) == 1 && ggml_sycl_fatal_exit_code(nullptr) == 1 &&
+                        !ggml_sycl_device_lost_latched();
         if (!ok) {
             std::fprintf(stderr, "FAIL mode=classify\n");
             return 1;

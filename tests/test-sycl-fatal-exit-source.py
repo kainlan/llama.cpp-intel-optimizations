@@ -61,5 +61,62 @@ def test_fatal_exit_ends_in_exit_without_host_cleanup():
     )
 
 
+def test_check_try_error_records_a_device_loss():
+    hpp = code_of(SYCL / "common.hpp")
+    start = hpp.find("#define CHECK_TRY_ERROR(expr)")
+    assert start >= 0, "common.hpp: CHECK_TRY_ERROR is missing"
+    macro = hpp[start:]
+    macro = macro[:macro.find("}()")]
+    note = macro.find("ggml_sycl_note_exception(e.what());")
+    ret = macro.find("return dpct::default_error;")
+    assert 0 <= note < ret, "common.hpp: CHECK_TRY_ERROR must record a device loss before it returns the error"
+
+
+def test_sycl_error_takes_the_fast_exit_when_a_loss_is_latched():
+    hpp = code_of(SYCL / "common.hpp")
+    start = hpp.find("static void ggml_sycl_error(")
+    assert start >= 0, "common.hpp: ggml_sycl_error is missing"
+    body = hpp[start:]
+    body = body[:body.find("#define SYCL_CHECK(err)")]
+    assert re.search(r"ggml_sycl_device_lost_latched\(\).*ggml_sycl_fatal_exit\(.*GGML_ABORT", body, flags=re.S), (
+        "common.hpp: ggml_sycl_error must take the fast exit when a device loss is latched, before it aborts"
+    )
+
+
+def test_latch_registers_its_exit_handler_once():
+    cpp = code_of(SYCL / "common.cpp")
+    start = cpp.find("void ggml_sycl_note_exception(const char * what) noexcept {")
+    assert start >= 0, "common.cpp: ggml_sycl_note_exception is missing"
+    body = cpp[start:cpp.find("\n}\n", start)]
+    guard = body.find("if (!g_sycl_device_lost_latched.exchange(true")
+    handler = body.find("std::atexit(ggml_sycl_device_lost_at_exit);")
+    assert 0 <= guard < handler, "common.cpp: the exit handler must be registered only by the first recorded loss"
+    assert len(re.findall(r"\batexit\s*\(", cpp)) == 1, "common.cpp: the latch must be the only exit handler it registers"
+
+
+def test_graph_boundary_cleanup_records_a_device_loss():
+    main = code_of(SYCL / "ggml-sycl.cpp")
+    m = re.search(r"static void ggml_backend_sycl_graph_boundary_exception_cleanup\([^;{]*\)\s*noexcept\s*\{\s*", main)
+    assert m, "ggml-sycl.cpp: the definition of ggml_backend_sycl_graph_boundary_exception_cleanup is missing"
+    assert main.startswith("ggml_sycl_note_exception(what);", m.end()), (
+        "ggml-sycl.cpp: the graph boundary's cleanup must record a device loss as its first statement"
+    )
+
+
+@pytest.mark.parametrize("log", [
+    "SYCL graph completion barrier failed: %s\\n\", exc.what()",
+    "[SYCL] graph_compute deferred exit barrier failed: %s; draining queue\\n\", exc.what()",
+    "[SYCL] graph_compute exit wait failed: %s\\n\", wait_exc.what()",
+    "[SYCL] graph_compute exit wait failed: %s\\n\", exc.what()",
+])
+def test_graph_exit_catches_record_a_device_loss(log):
+    main = code_of(SYCL / "ggml-sycl.cpp")
+    var = log.rsplit(", ", 1)[1].split(".")[0]
+    want = re.compile(r"catch \(const sycl::exception & " + var + r"\) \{\s*ggml_sycl_note_exception\(" + var +
+                      r"\.what\(\)\);\s*GGML_LOG_ERROR\(\"" + re.escape(log))
+    hits = len(want.findall(main))
+    assert hits == 1, f"ggml-sycl.cpp: the catch that logs {log!r} must record a device loss first ({hits} found)"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

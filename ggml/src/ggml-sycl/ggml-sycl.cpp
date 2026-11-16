@@ -122907,6 +122907,7 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
                                 sycl_ctx && sycl_ctx->last_graph_event.has_value() ? 1 : 0);
             }
         } catch (const sycl::exception & exc) {
+            ggml_sycl_note_exception(exc.what());
             GGML_LOG_ERROR("SYCL graph completion barrier failed: %s\n", exc.what());
             sycl_ctx->last_graph_event.reset();
             sycl_ctx->last_graph_event_deferred_decode = false;
@@ -125183,12 +125184,14 @@ normal_dispatch:
             sycl_ctx->last_graph_event_deferred_decode = true;
             graph_retain_transient_leases_until_event(sycl_ctx, done);
         } catch (const sycl::exception & exc) {
+            ggml_sycl_note_exception(exc.what());
             GGML_LOG_ERROR("[SYCL] graph_compute deferred exit barrier failed: %s; draining queue\n", exc.what());
             sycl_ctx->last_graph_event.reset();
             sycl_ctx->last_graph_event_deferred_decode = false;
             try {
                 ggml_sycl_trace_queue_wait(sycl_ctx->stream(), "graph-compute-exit", sycl_ctx->device, -1, nullptr);
             } catch (const sycl::exception & wait_exc) {
+                ggml_sycl_note_exception(wait_exc.what());
                 GGML_LOG_ERROR("[SYCL] graph_compute exit wait failed: %s\n", wait_exc.what());
             }
             graph_unpin_transient_leases_after_direct_execution(sycl_ctx);
@@ -125198,6 +125201,7 @@ normal_dispatch:
         try {
             ggml_sycl_trace_queue_wait(sycl_ctx->stream(), "graph-compute-exit", sycl_ctx->device, -1, nullptr);
         } catch (const sycl::exception & exc) {
+            ggml_sycl_note_exception(exc.what());
             GGML_LOG_ERROR("[SYCL] graph_compute exit wait failed: %s\n", exc.what());
         }
         graph_unpin_transient_leases_after_direct_execution(sycl_ctx);
@@ -125447,6 +125451,7 @@ static void ggml_sycl_graph_compute_fallback_clear_graphs(ggml_backend_sycl_cont
 static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,
                                                                const char *                stage,
                                                                const char *                what) noexcept {
+    ggml_sycl_note_exception(what);
     // The boundary catch paths' order (design 5efe §4.4 "th32's cancel step"): th32's cancel step, the CPU-TG flush,
     // then the waits and drains below. No invalidate runs here: the executables a record moved into the context stay
     // there until the next record's invalidate or the context's destructor, each of which waits first (§4.4).
