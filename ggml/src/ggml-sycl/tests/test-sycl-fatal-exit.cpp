@@ -14,6 +14,8 @@
 #include <dirent.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -56,6 +58,10 @@ constexpr std::chrono::seconds k_device_settle{ 12 };
 constexpr const char * k_capture_env         = "GGML_SYCL_FATAL_CAPTURE_DIR";
 constexpr const char * k_capture_line        = "[SYCL-FATAL] capture: ";
 constexpr const char * k_capture_failed_line = "[SYCL-FATAL] capture failed: ";
+
+// The files a capture writes, as <dir>/sycl-fatal-<pid><ext>.
+constexpr const char * k_capture_exts[] = { ".maps", ".smaps", ".status" };
+constexpr size_t       k_capture_n_exts = sizeof(k_capture_exts) / sizeof(k_capture_exts[0]);
 
 void atexit_marker() {
     std::fprintf(stderr, "%s\n", k_atexit_marker);
@@ -427,6 +433,25 @@ int child_main(const char * mode) {
         plant_markers();
         std::exit(GGML_SYCL_EXIT_DEVICE_LOST);
     }
+    if (std::strcmp(mode, "helper-small-files") == 0) {
+        // The helper's fast exit under a file size limit of 64 bytes. Each of the three /proc files the capture copies
+        // is larger, so every copy fails after its file was opened. The limit applies to regular files only: the pipe
+        // to the parent carries the output as usual. SIGXFSZ is ignored, so a write past the limit returns EFBIG
+        // instead of ending the process.
+        plant_markers();
+        if (std::signal(SIGXFSZ, SIG_IGN) == SIG_ERR) {
+            std::fprintf(stderr, "TEST-SETUP-FAILED signal(SIGXFSZ): %s\n", std::strerror(errno));
+            return 4;
+        }
+        rlimit limit{};
+        limit.rlim_cur = 64;
+        limit.rlim_max = 64;
+        if (setrlimit(RLIMIT_FSIZE, &limit) != 0) {
+            std::fprintf(stderr, "TEST-SETUP-FAILED setrlimit(RLIMIT_FSIZE): %s\n", std::strerror(errno));
+            return 4;
+        }
+        ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "test: helper mode");
+    }
     if (std::strcmp(mode, "lost-exit") == 0) {
         // A loss recorded with no backend and no device, after which the child returns from main as an application
         // would: the exit handler the loss registered ends the process.
@@ -529,10 +554,26 @@ bool read_file(const std::string & path, std::string & text) {
     return true;
 }
 
+// The entries of `dir` other than . and .., in readdir order. False when the directory cannot be read.
+bool list_dir(const std::string & dir, std::vector<std::string> & names) {
+    DIR * d = opendir(dir.c_str());
+    if (d == nullptr) {
+        return false;
+    }
+    for (const dirent * e = readdir(d); e != nullptr; e = readdir(d)) {
+        if (std::strcmp(e->d_name, ".") != 0 && std::strcmp(e->d_name, "..") != 0) {
+            names.push_back(e->d_name);
+        }
+    }
+    closedir(d);
+    return true;
+}
+
 // The capture a child left: one capture line naming <dir>/sycl-fatal-<pid>, and in <dir> exactly the three files under
-// that name, none of them empty, the map with the stack's mapping in it. One line and three entries are what "written
-// once" looks like from outside: a second write would print a second line or leave another file. A pass removes the
-// files and the directory; a failure leaves them for a look.
+// that name, none of them empty, the map with the stack's mapping in it, and none open to group or others, since the
+// kernel lets only a ptrace-capable reader open a process's maps. One line and three entries are what "written once"
+// looks like from outside: a second write would print a second line or leave another file. A pass removes the files
+// and the directory; a failure leaves them for a look.
 int check_capture_files(const char * mode, const child_result & r, const std::string & dir) {
     if (has(r, k_capture_failed_line)) {
         return fail(mode, r, "a capture file could not be written, although the directory exists");
@@ -554,36 +595,93 @@ int check_capture_files(const char * mode, const child_result & r, const std::st
         base.find_first_not_of("0123456789", prefix.size()) != std::string::npos) {
         return fail(mode, r, "the capture line does not name <dir>/sycl-fatal-<pid> in the named directory");
     }
-    const char * const exts[] = { ".maps", ".smaps", ".status" };
-    const size_t       n_exts = sizeof(exts) / sizeof(exts[0]);
-    for (const char * ext : exts) {
-        std::string text;
-        if (!read_file(base + ext, text)) {
-            return fail(mode, r, "a capture file is missing");
+    std::string why;
+    for (const char * ext : k_capture_exts) {
+        const std::string path = base + ext;
+        std::string       text;
+        if (!read_file(path, text)) {
+            why = "a capture file is missing: " + path;
+            return fail(mode, r, why.c_str());
         }
         if (text.empty() || (std::strcmp(ext, ".maps") == 0 && text.find("[stack]") == std::string::npos)) {
-            return fail(mode, r, "a capture file is empty or is not a memory map");
+            why = "a capture file is empty or is not a memory map: " + path;
+            return fail(mode, r, why.c_str());
+        }
+        struct stat st{};
+        if (stat(path.c_str(), &st) != 0) {
+            why = "a capture file cannot be inspected: " + path;
+            return fail(mode, r, why.c_str());
+        }
+        if ((st.st_mode & 077) != 0) {
+            char octal[16];
+            std::snprintf(octal, sizeof(octal), "%04o", static_cast<unsigned>(st.st_mode & 07777));
+            why = "a capture file is open to group or others: " + path + " (mode " + octal + ")";
+            return fail(mode, r, why.c_str());
         }
     }
-    DIR * d = opendir(dir.c_str());
-    if (d == nullptr) {
+    std::vector<std::string> names;
+    if (!list_dir(dir, names)) {
         return fail(mode, r, "the capture directory cannot be read");
     }
-    size_t entries = 0;
-    for (const dirent * e = readdir(d); e != nullptr; e = readdir(d)) {
-        if (std::strcmp(e->d_name, ".") != 0 && std::strcmp(e->d_name, "..") != 0) {
-            ++entries;
+    // The three files exist, so any entry that is not one of them is extra.
+    const std::string file = base.substr(dir.size() + 1);
+    for (const std::string & name : names) {
+        bool expected = false;
+        for (const char * ext : k_capture_exts) {
+            expected = expected || name == file + ext;
+        }
+        if (!expected) {
+            why = "the capture directory holds more than the three files: " + name;
+            return fail(mode, r, why.c_str());
         }
     }
-    closedir(d);
-    // The three files exist, so three entries are exactly those three.
-    if (entries != n_exts) {
-        return fail(mode, r, "the capture directory holds more than the three files");
-    }
-    for (const char * ext : exts) {
+    for (const char * ext : k_capture_exts) {
         std::remove((base + ext).c_str());
     }
     rmdir(dir.c_str());
+    return 0;
+}
+
+// A capture that failed: no capture line, which would claim files that are not complete, and exactly three capture
+// failed lines, one naming each file as <dir>/sycl-fatal-<pid><ext> followed by ": " and the reason. When `reason` is
+// not null, each line must give exactly that reason.
+int check_capture_failed(const char * mode, const child_result & r, const std::string & dir, const char * reason) {
+    if (has(r, k_capture_line)) {
+        return fail(mode, r, "a capture line, although the capture failed");
+    }
+    std::vector<std::string> failed;  // each line's text after the marker
+    size_t                   at = r.out.find(k_capture_failed_line);
+    while (at != std::string::npos) {
+        at += std::strlen(k_capture_failed_line);
+        failed.push_back(r.out.substr(at, r.out.find('\n', at) - at));
+        at = r.out.find(k_capture_failed_line, at);
+    }
+    std::string why;
+    if (failed.size() != k_capture_n_exts) {
+        why = "expected one capture failed line per file, three in all, and found " + std::to_string(failed.size());
+        return fail(mode, r, why.c_str());
+    }
+    const std::string prefix = dir + "/sycl-fatal-";
+    for (const char * ext : k_capture_exts) {
+        const std::string tail  = std::string(ext) + ": ";
+        bool              named = false;
+        for (const std::string & line : failed) {
+            if (line.compare(0, prefix.size(), prefix) != 0) {
+                continue;
+            }
+            const size_t digits_end = line.find_first_not_of("0123456789", prefix.size());
+            if (digits_end == std::string::npos || digits_end == prefix.size() ||
+                line.compare(digits_end, tail.size(), tail) != 0) {
+                continue;
+            }
+            named = named || reason == nullptr || line.substr(digits_end + tail.size()) == reason;
+        }
+        if (!named) {
+            why = "no capture failed line for " + prefix + "<pid>" + ext +
+                  (reason != nullptr ? std::string(" with the reason \"") + reason + "\"" : std::string());
+            return fail(mode, r, why.c_str());
+        }
+    }
     return 0;
 }
 
@@ -653,16 +751,48 @@ int run_capture_child_missing_dir(const char * self) {
     if (const int rc = check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST)) {
         return rc;
     }
-    if (has(r, k_capture_line)) {
-        return fail(mode, r, "a capture line, although the directory does not exist");
-    }
-    const std::string failed = std::string(k_capture_failed_line) + dir + "/sycl-fatal-";
-    if (!has(r, failed.c_str())) {
-        return fail(mode, r, "no capture failed line naming a file in the directory");
+    if (const int rc = check_capture_failed(mode, r, dir, nullptr)) {
+        return rc;
     }
     if (access(dir, F_OK) == 0) {
         return fail(mode, r, "the directory exists after the run: the capture created it");
     }
+    return 0;
+}
+
+// The helper child under a file size limit below the size of every file the capture copies, so each copy fails after
+// its file was opened. Each file must be named with the error the write gave, and none may be left behind: a partial
+// copy under the final name would read as a complete one once the log is gone.
+int run_capture_child_small_files(const char * self) {
+    char dir[] = "/tmp/sycl-fatal-capture-XXXXXX";
+    if (mkdtemp(dir) == nullptr) {
+        std::perror("mkdtemp");
+        return 1;
+    }
+    if (setenv(k_capture_env, dir, 1) != 0) {
+        std::perror("setenv");
+        return 1;
+    }
+    const child_result r = run_child(self, "helper-small-files");
+    unsetenv(k_capture_env);
+    const std::string label = std::string("capture child=helper-small-files dir=") + dir;
+    const char *      mode  = label.c_str();
+    if (const int rc = check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST)) {
+        return rc;
+    }
+    const std::string efbig = std::strerror(EFBIG);
+    if (const int rc = check_capture_failed(mode, r, dir, efbig.c_str())) {
+        return rc;
+    }
+    std::vector<std::string> names;
+    if (!list_dir(dir, names)) {
+        return fail(mode, r, "the capture directory cannot be read");
+    }
+    if (!names.empty()) {
+        const std::string why = "a failed capture left a file behind: " + names.front();
+        return fail(mode, r, why.c_str());
+    }
+    rmdir(dir);
     return 0;
 }
 
@@ -678,8 +808,9 @@ int parent_main(const char * self, const char * mode) {
         if (!has(r, "[SYCL-FATAL] test: helper mode")) {
             return fail(mode, r, "the message is not on the [SYCL-FATAL] line");
         }
-        if (has(r, k_capture_line)) {
-            return fail(mode, r, "a capture line, although GGML_SYCL_FATAL_CAPTURE_DIR is unset");
+        if (has(r, k_capture_line) || has(r, k_capture_failed_line)) {
+            return fail(mode, r,
+                        "a capture line or a capture failed line, although GGML_SYCL_FATAL_CAPTURE_DIR is unset");
         }
         return 0;
     }
@@ -713,15 +844,19 @@ int parent_main(const char * self, const char * mode) {
     if (std::strcmp(mode, "capture") == 0) {
         // The two ways to the capture: the fast exit with no loss recorded (the helper child), and a recorded loss the
         // process then leaves through its exit handler (the lost-exit child), whose map must be the one taken at the
-        // loss. Then a capture that cannot be written, which must say so. A host mode: no child uses a device, so the
-        // card needs no settling after it.
+        // loss. Then two captures that cannot be written, which must say so: one whose directory does not exist and
+        // one whose files cannot grow past 64 bytes. A host mode: no child uses a device, so the card needs no settling
+        // after it.
         if (const int rc = run_capture_child(self, "helper")) {
             return rc;
         }
         if (const int rc = run_capture_child(self, "lost-exit")) {
             return rc;
         }
-        return run_capture_child_missing_dir(self);
+        if (const int rc = run_capture_child_missing_dir(self)) {
+            return rc;
+        }
+        return run_capture_child_small_files(self);
     }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0) {
         const child_result r = run_child(self, mode);
