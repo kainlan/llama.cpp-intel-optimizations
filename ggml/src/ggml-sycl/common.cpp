@@ -785,8 +785,8 @@ int ggml_sycl_fatal_exit_code(const char * what) noexcept {
 }
 
 #if defined(__linux__)
-// Copies /proc/self/<name> to `to`, which must not exist yet. Returns nullptr when every byte was copied, or why not.
-// errno is read at the call that failed, before a close can change it.
+// Copies /proc/self/<name> to `to`, which must not exist yet. Returns nullptr when every byte was copied, or why not,
+// and then removes the partial copy. errno is read at the call that failed, before a close can change it.
 static const char * ggml_sycl_fatal_capture_copy(const char * name, const char * to) noexcept {
     char from[64];
     std::snprintf(from, sizeof(from), "/proc/self/%s", name);
@@ -794,7 +794,9 @@ static const char * ggml_sycl_fatal_capture_copy(const char * name, const char *
     if (in < 0) {
         return std::strerror(errno);
     }
-    const int out = open(to, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    // Owner-only: the kernel lets only a ptrace-capable reader open /proc/<pid>/maps and smaps, and the copy must not
+    // widen that while the process may still run.
+    const int out = open(to, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (out < 0) {
         const int err = errno;
         close(in);
@@ -811,23 +813,38 @@ static const char * ggml_sycl_fatal_capture_copy(const char * name, const char *
             why = std::strerror(errno);
             break;
         }
-        const ssize_t written = write(out, buf, static_cast<size_t>(n));
-        if (written != n) {
-            why = written < 0 ? std::strerror(errno) : "short write";
+        // A write that runs out of space or quota returns a short count first and the error only on the next call;
+        // the loop makes that call, so the line can give the error.
+        size_t off = 0;
+        while (off < static_cast<size_t>(n)) {
+            const ssize_t w = write(out, buf + off, static_cast<size_t>(n) - off);
+            if (w <= 0) {
+                why = w < 0 ? std::strerror(errno) : "short write";
+                break;
+            }
+            off += static_cast<size_t>(w);
+        }
+        if (why != nullptr) {
             break;
         }
     }
     close(in);
     close(out);
+    if (why != nullptr) {
+        // Reached only when this call created the file (O_EXCL), so a file an earlier process left is never removed.
+        // A partial copy under the final name would read as a complete one once the log is gone.
+        unlink(to);
+    }
     return why;
 }
 #endif
 
 // GGML_SYCL_FATAL_CAPTURE_DIR=<dir>: copy this process's memory map, its per-mapping detail and its status into <dir>,
 // once. The kernel's GPU fault record names an address, and only a map taken while the process still exists can say
-// which mapping held it. <dir> must already exist; nothing but the three files is created. The capture line is printed
-// only when all three files were written, so it always means a complete capture; a file that was not written is named
-// on a "capture failed" line with the reason instead.
+// which mapping held it. <dir> must already exist; nothing but the three files is created, each private to the user.
+// The capture line is printed only when all three files were written, so it always means a complete capture; a file
+// that was not written in full is named on a "capture failed" line with the reason instead, and its partial copy is
+// removed.
 static void ggml_sycl_fatal_capture() noexcept {
 #if defined(__linux__)
     static std::atomic<bool> done{ false };
