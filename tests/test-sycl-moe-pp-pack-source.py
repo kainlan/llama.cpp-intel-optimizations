@@ -64,6 +64,40 @@ def test_every_offset_comes_from_one_helper(pointer, helper, uses):
     assert not failures, "\n".join(failures)
 
 
+@pytest.mark.parametrize(
+    "pointer,pointee,field,helper",
+    [("batched_acts", "sycl::half", "activation", "act_base"), ("batched_out", "float", "output", "out_base")],
+)
+def test_the_scratch_pointers_are_read_only_through_their_helpers(pointer, pointee, field, helper):
+    # A reader that takes the pointer itself assumes where an expert's rows are instead of asking, and the offset count
+    # above cannot see it when the read is at offset 0 (no `+`). So the pointer may appear only where it is declared,
+    # where the reservation sets it, and inside its helper.
+    body = _executor_body()
+    t = re.escape(pointee)
+    allowed = {
+        "its declaration": rf"\b{t}\s*\*\s*{pointer}\s*=\s*nullptr\s*;",
+        "its assignment from the reservation": (
+            rf"\b{pointer}\s*=\s*static_cast<\s*{t}\s*\*\s*>\(\s*reserved\.{field}\s*\)\s*;"
+        ),
+        helper: (
+            rf"\bconst\s+auto\s+{helper}\s*=\s*\[&\]\s*\(\s*size_t\s+slot\s*\)\s*->\s*{t}\s*\*\s*\{{\s*"
+            rf"return\s+{pointer}\s*\+"
+        ),
+    }
+    failures = []
+    for where, pattern in allowed.items():
+        found = len(re.findall(pattern, body))
+        if found != 1:
+            failures.append(f"{pointer}: {found} matches for {where}, want exactly one")
+    uses = len(re.findall(rf"\b{pointer}\b", body))
+    if uses != len(allowed):
+        failures.append(
+            f"{pointer}: {uses} uses in the executor, want {len(allowed)} (its declaration, its assignment from the "
+            f"reservation and {helper}); every other reader must ask {helper}"
+        )
+    assert not failures, "\n".join(failures)
+
+
 if __name__ == "__main__":
     import sys
 

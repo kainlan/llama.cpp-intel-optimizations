@@ -94127,8 +94127,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     bool                             readback_ok = true;
                     try {
                         ctx.stream()->wait_and_throw();
-                        ggml_sycl_safe_memcpy_sync(*ctx.stream(), gpu.data(), batched_out, gpu.size() * sizeof(float));
-                        ggml_sycl_safe_memcpy_sync(*ctx.stream(), act_half.data(), batched_acts,
+                        ggml_sycl_safe_memcpy_sync(*ctx.stream(), gpu.data(), out_base(0), gpu.size() * sizeof(float));
+                        ggml_sycl_safe_memcpy_sync(*ctx.stream(), act_half.data(), act_base(0),
                                                    act_half.size() * sizeof(sycl::half));
                         for (size_t i = 0; i < act_half.size(); ++i) {
                             act[i] = static_cast<float>(act_half[i]);
