@@ -375,6 +375,7 @@ static void pp_scratch_profile_end() {
 #include "ggml-sycl/tiered-plan-clear.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml-sycl/vmem-kv.hpp"
+#include "ggml-sycl/weight-row-padding.hpp"
 #include "ggml.h"
 #include "mem-handle.hpp"
 
@@ -43694,14 +43695,7 @@ static void ggml_sycl_release_stale_materialization_handles(const std::vector<gg
 // A direct-staged AOS expert's entry is this size, which exceeds the plan's dst_size by the row-padding tail, so an
 // expert loan or refill sizes its copy from the cache entry, not the plan (llama.cpp-pu8v).
 static size_t ggml_sycl_get_padded_weight_bytes(ggml_type type, int64_t ncols, size_t base_size) {
-    if (!ggml_is_quantized(type)) {
-        return base_size;
-    }
-    const int64_t rem = ncols % MATRIX_ROW_PADDING;
-    if (rem == 0) {
-        return base_size;
-    }
-    return base_size + ggml_row_size(type, MATRIX_ROW_PADDING - rem);
+    return ggml_sycl::aos_staged_weight_bytes(type, ncols, base_size);
 }
 
 struct ggml_sycl_shared_alloc_owner {
