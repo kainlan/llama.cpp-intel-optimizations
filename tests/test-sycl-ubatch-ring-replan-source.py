@@ -1146,6 +1146,33 @@ def test_populate_inventory_globals_wires_the_row_bytes():
     )
 
 
+def test_publish_sizes_the_slots_with_the_shared_function():
+    """The load-time publish must size the row-scaled slots with pp_moe_onednn_slots_at, the function the ring's
+    admission and re-plan use, and must not copy slot sizes the loader computed."""
+    body = _bounded_body(
+        GGML_SYCL_CPP_CODE,
+        "static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_inputs(",
+        "return in;",
+    )
+    body_norm = _normalize_ws(body)
+    assert "ggml_sycl::pp_moe_onednn_slots_at(" in body_norm
+    assert "inventory->pp_moe_onednn_activation_slot_bytes" not in body_norm
+    assert "inventory->pp_moe_onednn_output_slot_bytes" not in body_norm
+
+
+def test_largest_fitting_inverse_searches_with_the_shared_function():
+    """The inverse must ask pp_moe_onednn_slots_at for each candidate, not divide by a per-row cost: a sizing rule
+    that is not linear in the micro-batch has no per-row cost to divide by."""
+    body = _bounded_body(
+        CACHE_CPP_CODE,
+        "uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(",
+        "static std::atomic<uint64_t> g_offload_transfer_bytes_h2d_pp",
+    )
+    body_norm = _normalize_ws(body)
+    assert "pp_moe_onednn_slots_at(" in body_norm
+    assert "/ per_row_total" not in body_norm
+
+
 def test_new_functions_are_not_file_static_in_the_shared_header():
     """The new unified-cache functions must be exported (declared, and not
     `static`, in both the header and the implementation) -- ggml-sycl.cpp is

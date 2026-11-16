@@ -3165,15 +3165,12 @@ bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
                                                   size_t * activation_slot_bytes,
                                                   size_t * output_slot_bytes);
 
-// Inverse of the sizing above: the largest n_ubatch whose re-planned
-// activation+output slots -- plus the constant weight slot, both times
-// ring_depth -- fit within capacity_bytes, rounded DOWN to a multiple of 32
-// (llama's BLAS minimum; llama_context applies no 256-padding to n_ubatch).
-// Returns 0 when nothing fits (capacity_bytes does not clear the weight
-// slots' own total) or the inputs are degenerate (ring_depth == 0, or both
-// per-row terms 0). Same "hold the constant terms, divide the remainder by
-// the per-unit cost, round to the allocator granularity" method as
-// ggml_sycl_largest_fitting_n_ctx (ggml-sycl.cpp).
+// Inverse of the sizing above: the largest n_ubatch, a multiple of 32 (llama's
+// BLAS minimum), whose whole ring fits capacity_bytes: ring_depth times the
+// weight slot plus the two slots `pp_moe_onednn_slots_at` gives for it. Found
+// by bisection, which the slots' never shrinking with the micro-batch allows.
+// Returns 0 when not even 32 rows fit, or the inputs are degenerate
+// (ring_depth 0, or both per-row terms 0).
 uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capacity_bytes,
                                                                   size_t   weight_slot_bytes,
                                                                   size_t   activation_bytes_per_row,

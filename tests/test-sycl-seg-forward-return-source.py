@@ -29,7 +29,9 @@ skipped op, which is wrong tokens, not a refusal. This gate pins the fix:
    `ggml_sycl_graph_compute_lazy_cancel_step`, before `ggml_sycl_cpu_tg_flush_pending()` and before any queue wait
    (design 5efe §4.4 "th32's cancel step", lead ruling §M69 (b) fourth amendment; th32 §5.3 "Cancellation"). The
    fallback catch then runs the flush, its own waits, the cleanup step, the unpin and the execution release, in that
-   order. The step's body is th32's and is not pinned here; its position is.
+   order. The step's body is th32's and is not pinned here; its position is. The boundary cleanup may record a device
+   loss (`ggml_sycl_note_exception(what);`) ahead of it: that only latches the loss and registers an exit handler,
+   with no queue wait and no CPU-TG flush, and nothing else may come first.
 
 The runtime counterpart is the lead-run device test `test-sycl-seg-refusal-cleanup`. Plain file I/O, comment-stripped
 text.
@@ -429,11 +431,31 @@ def test_the_fallback_catch_runs_its_steps_in_the_designed_order():
     assert not fails, "\n".join(fails)
 
 
+def boundary_starts_with_the_cancel_step(body: str) -> bool:
+    return re.match(r"\s*(?:ggml_sycl_note_exception\s*\(\s*what\s*\)\s*;\s*)?"
+                    r"ggml_sycl_graph_compute_lazy_cancel_step\s*\(\s*cleanup_ctx\s*\)\s*;", body) is not None
+
+
 def test_the_boundary_cleanup_runs_the_cancel_step_first():
     body = function_body(code(), BOUNDARY)
-    first = re.match(r"\s*ggml_sycl_graph_compute_lazy_cancel_step\s*\(\s*cleanup_ctx\s*\)\s*;", body)
-    assert first, "the boundary cleanup's first statement is not th32's cancel step"
+    assert boundary_starts_with_the_cancel_step(body), (
+        "the boundary cleanup's first statement is not th32's cancel step")
     assert len(CANCEL_CALL.findall(body)) == 1, "the boundary cleanup runs the cancel step more than once"
+
+
+def test_the_first_statement_reader_admits_only_the_loss_record_ahead_of_the_cancel_step():
+    body = function_body(code(), BOUNDARY)
+    cancel = CANCEL_CALL.search(body)
+    assert cancel, "the control's anchor did not match the boundary cleanup"
+    rest = body[cancel.start():]
+    assert boundary_starts_with_the_cancel_step(rest), "the reader refuses a cleanup that starts with the cancel step"
+    assert boundary_starts_with_the_cancel_step("ggml_sycl_note_exception(what);\n" + rest), (
+        "the reader refuses the loss record ahead of the cancel step")
+    for planted in ("ggml_sycl_note_exception(what);\nggml_sycl_cpu_tg_flush_pending();\n",
+                    "ggml_sycl_cpu_tg_flush_pending();\n",
+                    "ggml_sycl_note_exception(stage);\n",
+                    "ggml_sycl_note_exception(what);\nggml_sycl_note_exception(what);\n"):
+        assert not boundary_starts_with_the_cancel_step(planted + rest), f"the reader admits {planted!r} first"
 
 
 def test_the_order_reader_flags_a_cancel_step_after_the_flush_and_a_cleanup_before_the_drain():

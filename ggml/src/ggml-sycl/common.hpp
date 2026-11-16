@@ -321,6 +321,14 @@ constexpr bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site) {
     return false;
 }
 #endif
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// GGML_SYCL_TEST_INJECT_DEVICE_LOST=<site>:<n> throws, from the nth call at `site` onward, the exception a lost
+// device throws. It keeps throwing because a lost device stays lost: graph recording rethrows the first one and
+// runs the graph again directly.
+void ggml_sycl_test_inject_device_lost(const char * site);
+#else
+inline void ggml_sycl_test_inject_device_lost(const char *) {}
+#endif
 // Called by a wrapper once it has decided not to decline: it counts under the seam and, once per site per process,
 // says so at WARN when the SYCL debug switch is on (GGML_BACKEND_DEBUG=sycl), since INFO is dropped by default.
 void ggml_sycl_dnnl_note_engaged(ggml_sycl_scratchpad_site site);
@@ -828,6 +836,54 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
 #    define GGML_SYCL_KTRACE(kernel_name, ...) ((void) 0)
 #endif
 
+// The exit status of a process the backend ended because a device was lost. It differs from 1, which a failed test,
+// the watchdog and every other fatal op error use, so a script can tell a lost device from a wrong result.
+constexpr int GGML_SYCL_EXIT_DEVICE_LOST = 69;
+
+// True when an exception's text names a lost device, as the Level Zero adapter prints it:
+// "level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)".
+bool ggml_sycl_what_is_device_lost(const char * what) noexcept;
+
+// GGML_SYCL_EXIT_DEVICE_LOST for a lost device's exception text, 1 for any other.
+int ggml_sycl_fatal_exit_code(const char * what) noexcept;
+
+// Ends the process at once after a failure it cannot recover from. Prints `message` on one [SYCL-FATAL] line and
+// flushes stdout and stderr. Then it releases every device command parked on a CPU expert job, and prints the
+// zone-reset audit when GGML_SYCL_ZONE_RESET_AUDIT is set. Last it leaves through std::_Exit, so no exit handler and
+// no static destructor runs: after a device loss the Level Zero library's destructor does not return, and std::exit
+// would run it.
+// The caller prints its own diagnostic first, with fprintf(stderr) or std::cerr and not GGML_LOG_*: the tools route
+// ggml logs into a queue that a worker thread prints, and std::_Exit drops whatever is still queued.
+// Not async-signal-safe (it uses stdio, the audit's mutex and the job registry's timed mutex): never call it from a
+// signal handler.
+[[noreturn]] void ggml_sycl_fatal_exit(int code, const char * message) noexcept;
+
+// Records a device loss when `what` names one. The first loss prints "[SYCL-FATAL] device lost:" and registers an
+// exit handler that ends the process through ggml_sycl_fatal_exit. A path that reports the failure to its caller
+// instead of ending the process still does so.
+//
+// What this does to a normal exit, once a loss is recorded:
+// - Every later normal exit ends through _Exit(69). The 69 replaces whatever main returned or exit() was given. This
+//   holds also when the loss was seen only by a start-up probe and the run then finished on another card or on the
+//   CPU.
+// - Exit handlers and static destructors registered before the loss are skipped, the application's and the
+//   backend's own: the CPU worker shutdown and the end-of-run dumps such as the counter dump, the alloc-trace dump
+//   and the mem-copy census.
+// - Log lines still queued in an application's logger are lost.
+// - All open C stdio streams (FILE *) are flushed first. A C++ file stream that is still open loses what its buffer
+//   holds.
+//
+// The order: on glibc the handler runs before every exit handler and static destructor registered before the loss,
+// and before the libraries' own unload destructors, the Level Zero library's among them, whose teardown can hang on
+// a lost card. Exit handlers and static objects registered after the loss run before it. A loss recorded after
+// exit() has finished running its handlers cannot register one. The registration is tied to this library's handle,
+// so the order rests on the backend library staying loaded until the process exits; ggml pins backend libraries
+// (ggml-backend.h, ggml_backend_unload_checked; dl_pin_library in ggml-backend-dl.cpp).
+void ggml_sycl_note_exception(const char * what) noexcept;
+
+// True once any thread has recorded a device loss.
+bool ggml_sycl_device_lost_latched() noexcept;
+
 #define CHECK_TRY_ERROR(expr)                                                                           \
     [&]() {                                                                                             \
         try {                                                                                           \
@@ -836,6 +892,7 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
         } catch (std::exception const & e) {                                                            \
             std::cerr << e.what() << "\nException caught at file:" << __FILE__ << ", line:" << __LINE__ \
                       << ", func:" << __func__ << std::endl;                                            \
+            ggml_sycl_note_exception(e.what());                                                         \
             return dpct::default_error;                                                                 \
         }                                                                                               \
     }()
@@ -894,11 +951,6 @@ static __dpct_inline__ float sycl_e8m0_to_fp32_half(uint8_t e) {
     return result;
 }
 
-static void crash() {
-    int * ptr = NULL;
-    *ptr      = 0;
-}
-
 [[noreturn]] static void ggml_sycl_error(const char * stmt,
                                          const char * func,
                                          const char * file,
@@ -906,6 +958,13 @@ static void crash() {
                                          const char * msg) {
     fprintf(stderr, "SYCL error: %s: %s\n", stmt, msg);
     fprintf(stderr, "  in function %s at %s:%d\n", func, file, line);
+    if (ggml_sycl_device_lost_latched()) {
+        // After a recorded loss any failed check ends the process at once, whichever card or call failed: the abort
+        // path's backtrace (gdb attaches to this process) and the core dump after it keep the process, and the card's
+        // memory, alive for as long as they take. The "SYCL error:" line and the exception line above it still name
+        // the failing call, and the loss has its own "[SYCL-FATAL] device lost:" line earlier in the log.
+        ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "SYCL_CHECK failed after a device loss");
+    }
     GGML_ABORT("SYCL error");
 }
 
@@ -1120,8 +1179,7 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
     return CHECK_TRY_ERROR(dpct::select_device(mapped_device));
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    crash();
-    std::exit(1);
+    ggml_sycl_fatal_exit(ggml_sycl_fatal_exit_code(exc.what()), "ggml_sycl_set_device");
 }
 
 //////////////////////

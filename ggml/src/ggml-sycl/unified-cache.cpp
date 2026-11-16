@@ -4447,37 +4447,36 @@ uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capac
     if (ring_depth == 0 || (activation_bytes_per_row == 0 && output_bytes_per_row == 0)) {
         return 0;
     }
-    // Constant term: the weight slot(s), times ring_depth -- does not scale
-    // with n_ubatch. Checked (unlike pp_moe_onednn_planned_scratch_bytes()
-    // above, which multiplies unchecked): this function's whole job is to
-    // hand back a trustworthy figure from caller-controlled capacity_bytes.
-    if (weight_slot_bytes != 0 && weight_slot_bytes > std::numeric_limits<size_t>::max() / ring_depth) {
-        return 0;
+    constexpr size_t kMax = std::numeric_limits<size_t>::max();
+    // The whole ring at `n_ubatch` fits the capacity: ring_depth * (weight slot + activation slot + output slot),
+    // the two row-scaled slots sized as the ring's admission sizes them. An overflow does not fit.
+    const auto       fits = [&](uint32_t n_ubatch) -> bool {
+        size_t act = 0;
+        size_t out = 0;
+        if (!pp_moe_onednn_slots_at(n_ubatch, activation_bytes_per_row, output_bytes_per_row, &act, &out)) {
+            return false;
+        }
+        if (weight_slot_bytes > kMax - act || weight_slot_bytes + act > kMax - out) {
+            return false;
+        }
+        return weight_slot_bytes + act + out <= capacity_bytes / ring_depth;
+    };
+    // The slots never shrink as the micro-batch grows, so the largest fitting multiple of 32 (llama's BLAS minimum)
+    // is found by bisection. 0 when not even 32 rows fit.
+    uint32_t lo = 0;                                          // lo * 32 fits, or lo is 0
+    uint32_t hi = std::numeric_limits<uint32_t>::max() / 32;  // the largest multiple of 32 a uint32_t holds
+    if (fits(hi * 32)) {
+        return hi * 32;
     }
-    const size_t weight_total = weight_slot_bytes * static_cast<size_t>(ring_depth);
-    if (capacity_bytes <= weight_total) {
-        return 0;
+    while (hi - lo > 1) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (fits(mid * 32)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
-    const size_t remainder = capacity_bytes - weight_total;
-    // Per-unit cost: one activation row + one output row, times ring_depth.
-    const size_t per_row   = activation_bytes_per_row + output_bytes_per_row;
-    if (per_row == 0 || per_row > std::numeric_limits<size_t>::max() / ring_depth) {
-        return 0;
-    }
-    const size_t per_row_total = per_row * static_cast<size_t>(ring_depth);
-    const size_t n_ubatch      = remainder / per_row_total;
-    // Clamp BEFORE rounding, not after -- std::numeric_limits<uint32_t>::max()
-    // (4294967295) is not itself a multiple of 32 (4294967295 % 32 == 31),
-    // so rounding first and clamping second could return a value that
-    // breaks the "always a multiple of 32" invariant the caller (and this
-    // function's own test) relies on, for a raw value large enough to need
-    // clamping at all. Same trap, same fix, as the sibling inverse
-    // unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch() above.
-    const size_t clamped       = std::min<size_t>(n_ubatch, std::numeric_limits<uint32_t>::max());
-    // Round DOWN to a multiple of 32 (llama's BLAS minimum; llama_context
-    // applies no 256-padding to n_ubatch itself -- the 256-alignment above is
-    // the RING's own slot granularity, a separate concern).
-    return static_cast<uint32_t>((clamped / 32) * 32);
+    return lo * 32;
 }
 
 static std::atomic<uint64_t> g_offload_transfer_bytes_h2d_pp{ 0 };
