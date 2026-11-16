@@ -63,6 +63,9 @@ constexpr const char * k_settle_env          = "GGML_SYCL_FATAL_EXIT_SETTLE_MS";
 constexpr const char * k_settle_line         = "[SYCL-FATAL] settle: ";
 constexpr const char * k_settle_t0_line      = "TEST-SETTLE-T0 ";
 
+// The line the abort-settle-chain child's own abort callback prints before the message.
+constexpr const char * k_earlier_callback_line = "TEST-EARLIER-CALLBACK ";
+
 // The values the settle-cap child gives GGML_SYCL_FATAL_EXIT_SETTLE_MS (null: unset) and the wait each must read as.
 struct settle_case {
     const char * label;
@@ -217,6 +220,16 @@ bool has(const child_result & r, const char * needle) {
     return r.out.find(needle) != std::string::npos;
 }
 
+// How many times `needle` occurs in the child's output, counted without overlap.
+size_t count_of(const child_result & r, const char * needle) {
+    const size_t len = std::strlen(needle);
+    size_t       n   = 0;
+    for (size_t at = r.out.find(needle); at != std::string::npos; at = r.out.find(needle, at + len)) {
+        ++n;
+    }
+    return n;
+}
+
 // The steady_clock time, in nanoseconds, that the child printed after `tag`. steady_clock is CLOCK_MONOTONIC on
 // Linux, so it is one clock in the parent and the child. False when the line is missing or does not hold a number.
 bool child_time_ns(const child_result & r, const char * tag, long long & ns) {
@@ -255,6 +268,20 @@ int check_ended(const char * mode, const child_result & r) {
         std::snprintf(why, sizeof(why), "the child ended, but a process it started still held its output at %d s",
                       k_child_limit_s);
         return fail(mode, r, why);
+    }
+    return 0;
+}
+
+// The child ended at least 150 ms after the TEST-SETTLE-T0 line it printed just before it entered the settle.
+int check_settle_time(const char * mode, const child_result & r) {
+    long long t0_ns = 0;
+    if (!child_time_ns(r, k_settle_t0_line, t0_ns)) {
+        return fail(mode, r, "no readable TEST-SETTLE-T0 line, so the settle cannot be timed");
+    }
+    // A lower bound only: the reap is seen up to one poll slice late, and load can lengthen the wait, but neither
+    // can make a real 150 ms settle read as shorter.
+    if (r.reaped_ns - t0_ns < 150000000LL) {
+        return fail(mode, r, "the child ended less than 150 ms after it started the settle");
     }
     return 0;
 }
@@ -463,6 +490,24 @@ int child_device(const char * mode) {
     return 3;
 }
 
+// Prints the time the settle starts from, just before the call that settles. The parent measures from here to the
+// reap, so the child's start-up, which a measure from the fork would include, cannot stand in for a settle that does
+// not sleep.
+void print_settle_t0() {
+    const long long t0_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    std::fprintf(stderr, "%s%lld\n", k_settle_t0_line, t0_ns);
+    std::fflush(stderr);
+}
+
+// An abort callback the application installed before the backend registered. The backend's callback runs it in place
+// of its own print of the message.
+void earlier_abort_callback(const char * message) {
+    std::fprintf(stderr, "%s%s\n", k_earlier_callback_line, message);
+    std::fflush(stderr);
+}
+
 int child_main(const char * mode) {
     if (std::strcmp(mode, "helper") == 0) {
         plant_markers();
@@ -501,13 +546,7 @@ int child_main(const char * mode) {
     }
     if (std::strcmp(mode, "settle") == 0 || std::strcmp(mode, "settle-off") == 0) {
         plant_markers();
-        // The time the settle starts from. The parent measures from here to the reap, so the child's start-up, which
-        // a measure from the fork would include, cannot stand in for a settle that does not sleep.
-        const long long t0_ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-                .count();
-        std::fprintf(stderr, "%s%lld\n", k_settle_t0_line, t0_ns);
-        std::fflush(stderr);
+        print_settle_t0();
         ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "test: settle mode");
     }
     if (std::strcmp(mode, "settle-cap") == 0) {
@@ -524,15 +563,19 @@ int child_main(const char * mode) {
         unsetenv(k_settle_env);
         return 0;
     }
-    if (std::strcmp(mode, "abort-settle") == 0) {
+    if (std::strcmp(mode, "abort-settle") == 0 || std::strcmp(mode, "abort-settle-chain") == 0) {
         // No core file: the abort is the test's subject, and a dump of it is of no use to anyone.
         rlimit no_core{};
         if (setrlimit(RLIMIT_CORE, &no_core) != 0) {
             std::fprintf(stderr, "TEST-SETUP-FAILED setrlimit(RLIMIT_CORE): %s\n", std::strerror(errno));
             return 4;
         }
+        if (std::strcmp(mode, "abort-settle-chain") == 0) {
+            ggml_set_abort_callback(earlier_abort_callback);
+        }
         ggml_sycl_abort_settle_install();
-        GGML_ABORT("test: abort-settle mode");
+        print_settle_t0();
+        GGML_ABORT("test: %s mode", mode);
     }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0 || std::strcmp(mode, "sync") == 0 ||
         std::strcmp(mode, "graph") == 0) {
@@ -951,16 +994,7 @@ int parent_main(const char * self, const char * mode) {
         if (!has(r, "[SYCL-FATAL] settle: waiting 150 ms")) {
             return fail(mode, r, "no settle line with the requested time");
         }
-        long long t0_ns = 0;
-        if (!child_time_ns(r, k_settle_t0_line, t0_ns)) {
-            return fail(mode, r, "no readable TEST-SETTLE-T0 line, so the settle cannot be timed");
-        }
-        // A lower bound only: the reap is seen up to one poll slice late, and load can lengthen the wait, but neither
-        // can make a real 150 ms settle read as shorter.
-        if (r.reaped_ns - t0_ns < 150000000LL) {
-            return fail(mode, r, "the child ended less than 150 ms after it started the settle");
-        }
-        return 0;
+        return check_settle_time(mode, r);
     }
     if (std::strcmp(mode, "settle-cap") == 0) {
         const child_result r = run_child(self, mode);
@@ -980,7 +1014,8 @@ int parent_main(const char * self, const char * mode) {
         }
         return 0;
     }
-    if (std::strcmp(mode, "abort-settle") == 0) {
+    if (std::strcmp(mode, "abort-settle") == 0 || std::strcmp(mode, "abort-settle-chain") == 0) {
+        const bool chain = std::strcmp(mode, "abort-settle-chain") == 0;
         // Without this the abort's backtrace starts a debugger that attaches to the child, and the debugger can
         // hold the child's output pipe past the child's end.
         setenv("GGML_NO_BACKTRACE", "1", 1);
@@ -991,15 +1026,24 @@ int parent_main(const char * self, const char * mode) {
         if (const int rc = check_ended(mode, r)) {
             return rc;
         }
-        const size_t message_at = r.out.find("test: abort-settle mode");
-        const size_t settle_at  = r.out.find("[SYCL-FATAL] settle: waiting 150 ms");
         if (r.signal != SIGABRT) {
             return fail(mode, r, "the child did not end by SIGABRT");
         }
-        if (message_at == std::string::npos || settle_at == std::string::npos || settle_at < message_at) {
-            return fail(mode, r, "the abort message must be printed, and the settle line after it");
+        const std::string message = std::string("test: ") + mode + " mode";
+        // With an earlier callback, that callback prints the message and the backend's callback must not print it
+        // again.
+        if (count_of(r, message.c_str()) != 1) {
+            return fail(mode, r, "the abort message must be printed exactly once");
         }
-        return r.seconds < 0.15 ? fail(mode, r, "the child ended sooner than the settle time") : 0;
+        if (chain && count_of(r, k_earlier_callback_line) != 1) {
+            return fail(mode, r, "the earlier abort callback must run exactly once");
+        }
+        const size_t printed_at = r.out.find(chain ? k_earlier_callback_line : message.c_str());
+        const size_t settle_at  = r.out.find("[SYCL-FATAL] settle: waiting 150 ms");
+        if (settle_at == std::string::npos || settle_at < printed_at) {
+            return fail(mode, r, "the settle line must come after the abort message");
+        }
+        return check_settle_time(mode, r);
     }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0) {
         const child_result r = run_child(self, mode);
@@ -1022,8 +1066,8 @@ int parent_main(const char * self, const char * mode) {
         return rc;
     }
     std::fprintf(stderr,
-                 "usage: %s helper|control|classify|capture|settle|settle-off|settle-cap|abort-settle|mmid|op|sync|"
-                 "graph\n",
+                 "usage: %s helper|control|classify|capture|settle|settle-off|settle-cap|abort-settle|"
+                 "abort-settle-chain|mmid|op|sync|graph\n",
                  self);
     return 2;
 }
@@ -1036,8 +1080,8 @@ int main(int argc, char ** argv) {
     }
     if (argc != 2) {
         std::fprintf(stderr,
-                     "usage: %s helper|control|classify|capture|settle|settle-off|settle-cap|abort-settle|mmid|op|"
-                     "sync|graph\n",
+                     "usage: %s helper|control|classify|capture|settle|settle-off|settle-cap|abort-settle|"
+                     "abort-settle-chain|mmid|op|sync|graph\n",
                      argv[0]);
         return 2;
     }

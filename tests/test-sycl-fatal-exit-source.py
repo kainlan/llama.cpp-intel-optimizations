@@ -472,6 +472,7 @@ def test_the_allowlist_holds_the_exact_number_of_unsettled_calls():
 
 
 ABORT_INSTALL = "ggml_sycl_abort_settle_install();"
+ABORT_CALLBACK_DEF = "static void ggml_sycl_abort_settle_callback(const char * message) {"
 
 
 def abort_settle_problems(reg_cpp: str, common_cpp: str) -> list:
@@ -480,10 +481,14 @@ def abort_settle_problems(reg_cpp: str, common_cpp: str) -> list:
     reg = reg_cpp.find("ggml_backend_reg_t ggml_backend_sycl_reg() {")
     if reg < 0 or ABORT_INSTALL not in braced_block(reg_cpp, reg):
         problems.append("ggml_backend_sycl_reg must call ggml_sycl_abort_settle_install()")
-    cb = common_cpp.find("static void ggml_sycl_abort_settle_callback(const char * message) {")
+    cb = common_cpp.find(ABORT_CALLBACK_DEF)
     body = braced_block(common_cpp, cb) if cb >= 0 else ""
     if not body.rstrip("} \n").endswith(SETTLE_CALL):
         problems.append("ggml_sycl_abort_settle_callback must end with the settle, after the message is printed")
+    if body.count(SETTLE_CALL) != 1:
+        problems.append("ggml_sycl_abort_settle_callback must call the settle exactly once")
+    if re.search(r"\breturn\b", body):
+        problems.append("ggml_sycl_abort_settle_callback must not return: a return can skip the settle")
     return problems
 
 
@@ -495,6 +500,17 @@ def test_a_ggml_abort_settles():
 def test_the_abort_reader_refuses_a_registration_without_the_install():
     reg_cpp = code_of(SYCL / "ggml-sycl.cpp")
     assert abort_settle_problems(reg_cpp.replace(ABORT_INSTALL, "", 1), code_of(SYCL / "common.cpp"))
+
+
+@pytest.mark.parametrize("old,new", [
+    ("previous(message);", "previous(message);\n        return;"),
+    (ABORT_CALLBACK_DEF, ABORT_CALLBACK_DEF + "\n    " + SETTLE_CALL),
+], ids=["return-after-the-earlier-callback", "settle-before-the-message"])
+def test_the_abort_reader_refuses_a_callback_that_can_skip_or_repeat_the_settle(old, new):
+    common_cpp = code_of(SYCL / "common.cpp")
+    mutant = common_cpp.replace(old, new, 1)
+    assert mutant != common_cpp, f"common.cpp: {old!r} not found, so the mutant is the original"
+    assert abort_settle_problems(code_of(SYCL / "ggml-sycl.cpp"), mutant), f"the reader accepted {new!r}"
 
 
 if __name__ == "__main__":
