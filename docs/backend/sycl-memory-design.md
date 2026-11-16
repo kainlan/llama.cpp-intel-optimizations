@@ -2620,7 +2620,9 @@ few rows. The executor lays the scratch out with `moe_pp_pack_gemm_groups`
 (`moe-pp-pack.hpp`), so the plan and the layout read one row alignment. The bound
 assumes what MUL_MAT_ID routing gives, a row's picks being distinct experts. The
 executor's admission refuses a request above the plan, so a routing outside that
-assumption takes the serialized MoE route instead of overrunning the slots. On
+assumption never overruns the slots: an SOA-claimed op takes the serialized MoE
+route, and a tiled-claimed op fails its graph. The same refusal meets every
+batched prompt MoE dispatch on a device whose publish could not size the ring. On
 GPT-OSS 20B (32 experts, 4 used) `-ub 512` packs into 6,112 rows instead of the
 rectangle's 16,384: slots of 33.6 MB and 67.1 MB instead of 90 MB and 180 MB.
 

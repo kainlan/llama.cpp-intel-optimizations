@@ -331,14 +331,18 @@ struct ggml_sycl_tensor_inventory {
     // Computed from the largest quantized weight tensor as 2 x (n_elements * sizeof(fp16)).
     size_t                         pp_pipeline_scratch_bytes;
     // Ring-backed PP MoE oneDNN staging planned from the model inventory.
-    // Slots hold the dequantized expert weights, the f16 activation scratch, and the f32 output scratch.
+    // The weight slot is sized for every expert in the GEMM's weight form: the WOQ repack (4-bit values and e8m0
+    // scales) by default, or the f16 dequant when GGML_SYCL_MOE_PP_WOQ=0 at load. A type on the executor's f16 arm
+    // stages as many experts in f16 as the slot holds. The activation slot holds f16 input rows and the output slot
+    // f32 output rows.
     // The current PP path serializes slot use, so the default plan reserves one reusable slot.
     size_t                         pp_moe_onednn_weight_slot_bytes;
-    // Unused: the backend sizes the activation and output slots (pp_moe_onednn_slots_at) from the per-row bytes and
-    // the expert counts below, for the micro-batch a context runs.
+    // Unused: the loader writes 0 to both, and they stay because the layout static_asserts after this struct pin its
+    // size and offsets. The backend sizes the activation and output slots (pp_moe_onednn_slots_at) from the per-row
+    // bytes and the expert counts below, for the micro-batch a context runs.
     size_t                         pp_moe_onednn_activation_slot_bytes;
     size_t                         pp_moe_onednn_output_slot_bytes;
-    // ring_depth * weight slot; the backend adds the row-scaled slots.
+    // Unread by the backend, which sizes the whole ring itself. The loader writes ring_depth * weight slot.
     size_t                         pp_moe_onednn_scratch_bytes;
     // Bytes of one activation scratch row (the widest expert's input width in half floats) and of one output scratch
     // row (its output width in floats). The backend multiplies them by the rows the packed scratch can need at the

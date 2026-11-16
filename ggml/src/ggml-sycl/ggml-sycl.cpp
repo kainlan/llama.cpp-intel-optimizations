@@ -17410,11 +17410,11 @@ static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_in
             static_cast<uint32_t>(std::max(0, inventory->n_expert_used)),
             inventory->pp_moe_onednn_activation_bytes_per_row, inventory->pp_moe_onednn_output_bytes_per_row,
             &in.pp_moe_onednn_activation_slot_bytes, &in.pp_moe_onednn_output_slot_bytes)) {
-        // A slot that overflows, or a ring with no expert counts, plans no ring. The executor's admission then refuses
-        // the batched path, which is a slower prompt path for the whole model, so it is said at default verbosity.
+        // An overflowing slot or no expert counts plan no ring; it is a WARN because a tiled-claimed op then fails.
         GGML_LOG_WARN(
             "%s: the PP MoE oneDNN ring cannot be sized at n_ubatch=%u (n_expert=%d n_expert_used=%d) on device %d; "
-            "no ring is planned, so prompt MoE takes the serialized MoE route\n",
+            "no ring is planned, so every batched prompt MoE dispatch on this device is refused: SOA-claimed ops fall "
+            "back to the serialized MoE route, and a tiled-claimed op fails its graph\n",
             __func__, n_ubatch, inventory->n_expert, inventory->n_expert_used, device);
         in.pp_moe_onednn_weight_slot_bytes = 0;
         in.pp_moe_onednn_ring_depth        = 0;
@@ -20584,14 +20584,14 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
     size_t new_output_slot_bytes     = 0;
     if (!ggml_sycl::unified_cache_pp_moe_onednn_slots_for_ubatch(device, n_ubatch, &new_activation_slot_bytes,
                                                                  &new_output_slot_bytes)) {
-        // Per-row bytes are 0 (should not happen: weight_slot_bytes != 0
-        // above already implies a ring was planned) or the multiply/align
-        // overflowed -- refuse rather than reserve a wrapped, small-looking
-        // size.
+        // The per-row bytes are 0, the device's stored n_expert or n_expert_used is 0 (neither should happen:
+        // weight_slot_bytes != 0 above already implies a ring was planned from them), or the multiply/align
+        // overflowed. Without expert counts the packed rows have no bound, so refuse rather than guess one, and
+        // refuse rather than reserve a wrapped, small-looking size.
         GGML_SYCL_RUNTIME_TXN_REFUSAL(
             probe_mode,
-            "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring slot sizing for n_ubatch=%u "
-            "overflowed (device=%d)\n",
+            "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring slots could not be sized for "
+            "n_ubatch=%u: overflow or no expert counts (device=%d)\n",
             n_ubatch, device);
         return ggml_sycl_ring_replan_result::DOES_NOT_FIT;
     }

@@ -122,8 +122,9 @@ void test_slots_shrink_correctly_after_a_grow() {
     // Direction independence at the SIZE-COMPUTATION layer: querying 2048
     // then 1024 then 512 (descending) must produce the exact same numbers as
     // querying them ascending above -- unified_cache_pp_moe_onednn_slots_for_ubatch()
-    // is a pure function of (device's planned per-row bytes, n_ubatch), with
-    // no memory of prior calls. The ACTUAL ring release+reserve sequence
+    // is a pure function of (the device's planned per-row bytes, the device's
+    // stored n_expert and n_expert_used, n_ubatch), with no memory of prior
+    // calls. The ACTUAL ring release+reserve sequence
     // (ggml_sycl_replan_pp_moe_onednn_ring() in ggml-sycl.cpp, calling
     // unified_cache::release_pp_moe_onednn_scratch_ring() then
     // reserve_pp_moe_onednn_scratch()) touches a live SYCL device queue and
