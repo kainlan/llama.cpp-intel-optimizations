@@ -17395,11 +17395,20 @@ static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_in
     int                                device,
     const ggml_sycl_tensor_inventory * inventory) {
     ggml_sycl_inventory_planner_inputs in;
-    in.pp_pipeline_scratch_bytes           = pp_pipeline_env_enabled() ? inventory->pp_pipeline_scratch_bytes : 0;
-    in.pp_moe_onednn_weight_slot_bytes     = inventory->pp_moe_onednn_weight_slot_bytes;
-    in.pp_moe_onednn_activation_slot_bytes = inventory->pp_moe_onednn_activation_slot_bytes;
-    in.pp_moe_onednn_output_slot_bytes     = inventory->pp_moe_onednn_output_slot_bytes;
-    in.pp_moe_onednn_ring_depth            = inventory->pp_moe_onednn_ring_depth;
+    in.pp_pipeline_scratch_bytes       = pp_pipeline_env_enabled() ? inventory->pp_pipeline_scratch_bytes : 0;
+    in.pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;
+    in.pp_moe_onednn_ring_depth        = inventory->pp_moe_onednn_ring_depth;
+    // The two row-scaled slots are sized here, by the function the ring's admission and re-plan size them with, so
+    // the ring planned at load and a ring re-planned for the same micro-batch are the same bytes.
+    if (in.pp_moe_onednn_ring_depth != 0 &&
+        !ggml_sycl::pp_moe_onednn_slots_at(inventory->n_ubatch, inventory->pp_moe_onednn_activation_bytes_per_row,
+                                           inventory->pp_moe_onednn_output_bytes_per_row,
+                                           &in.pp_moe_onednn_activation_slot_bytes,
+                                           &in.pp_moe_onednn_output_slot_bytes)) {
+        // A slot that overflows plans no ring. The executor's admission then refuses the batched path.
+        in.pp_moe_onednn_weight_slot_bytes = 0;
+        in.pp_moe_onednn_ring_depth        = 0;
+    }
     ggml_sycl::unified_cache_set_planned_pp_pipeline_scratch_bytes(device, in.pp_pipeline_scratch_bytes);
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(
         device, in.pp_moe_onednn_weight_slot_bytes, in.pp_moe_onednn_activation_slot_bytes,
