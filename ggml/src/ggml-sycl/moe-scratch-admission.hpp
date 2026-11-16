@@ -75,6 +75,20 @@ static constexpr size_t PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT = 256;
 // pick up a wrapped -- and therefore admissible-looking -- size.
 bool pp_moe_onednn_checked_align_slot_bytes(size_t value, size_t * out);
 
+// Rows the batched prompt executor's activation or output scratch can need for a micro-batch of `n_ubatch` rows,
+// once it is laid out per GEMM group (moe-pp-pack.hpp). With used = min(n_expert_used, n_expert) and
+// active = min(n_expert, n_ubatch * used), the experts that can hold a row:
+//
+//     min(2 * n_ubatch * used + 63 * active,  align64(n_ubatch) * active)
+//
+// First term: a group's members have at least half its head's rows, so padding to the head at most doubles a member,
+// and rounding a slot up to 64 rows adds at most 63 per expert. Second term: the rectangle, every active expert
+// padded to the busiest one, which is smaller for very few rows. Both terms rise with n_ubatch, so the bound never
+// falls as the micro-batch grows and a largest fitting micro-batch can be searched for. It assumes what MUL_MAT_ID
+// routing gives: a row's picks are distinct experts. Returns false, leaving *rows untouched, for a null output or
+// for a micro-batch with no experts or none used; n_ubatch 0 needs 0 rows.
+bool pp_moe_onednn_packed_rows_at(uint32_t n_ubatch, uint32_t n_expert, uint32_t n_expert_used, size_t * rows);
+
 // The ring's activation and output slots at `n_ubatch` rows, from their per-row bytes: n_ubatch * per_row each,
 // rounded up to the slot alignment, every multiply and rounding checked. Returns false, leaving both outputs
 // untouched, on overflow. n_ubatch 0 sizes two empty slots: 0 rows is not an overflow. The ring's admission, the
