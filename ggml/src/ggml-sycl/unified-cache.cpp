@@ -34,6 +34,7 @@
 #include "sycl-timeline.hpp"
 #include "unified-types.hpp"
 #include "vram-headroom.hpp"
+#include "weight-row-padding.hpp"
 #include "zone-sizing.hpp"
 
 #include <dlfcn.h>
@@ -32315,6 +32316,13 @@ static ggml_layout_mode planner_multi_device_moe_common_layout(const placement_t
     return GGML_LAYOUT_AOS;
 }
 
+// What a routed expert costs the WEIGHT zone on a device: its staged bytes, rounded as the zone rounds them. An AOS
+// quantized expert is staged with its row-padding tail, which dst_size leaves out because loans and refills size their
+// copies from the entry.
+static size_t planner_expert_vram_charge_bytes(ggml_type type, int64_t ncols, ggml_layout_mode layout, size_t bytes) {
+    return placement_vram_charge_bytes(layout == GGML_LAYOUT_AOS ? aos_staged_weight_bytes(type, ncols, bytes) : bytes);
+}
+
 static size_t planner_layout_bytes_for_entry(const placement_entry & entry, ggml_layout_mode layout, int device_id) {
     if (layout == GGML_LAYOUT_XMX_TILED) {
         const size_t bytes = planner_layout_bytes_xmx_tiled_for_dims(entry.type, entry.ne[0], entry.ne[1], device_id);
@@ -33228,7 +33236,8 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
             const size_t dev_index = dev_it->second;
             const size_t old_charge =
                 entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
-            const size_t new_charge = placement_vram_charge_bytes(new_size);
+            const size_t new_charge =
+                planner_expert_vram_charge_bytes(entry.type, entry.ne[0], target_layout, new_size);
             if (new_charge > old_charge) {
                 const size_t extra = new_charge - old_charge;
                 if (remaining[dev_index] < extra) {
@@ -33351,7 +33360,7 @@ static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
         }
         const size_t old_charge =
             entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
-        const size_t new_charge = placement_vram_charge_bytes(new_size);
+        const size_t new_charge = planner_expert_vram_charge_bytes(entry.type, entry.ne[0], target_layout, new_size);
         if (new_charge > old_charge) {
             const size_t extra = new_charge - old_charge;
             if (remaining <= k_layout_upgrade_guard || extra > remaining - k_layout_upgrade_guard) {
@@ -36771,7 +36780,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 entry.src_size         = expert_size;
                 entry.dst_size         = dst_size != 0 ? dst_size : expert_size;
                 entry.layout           = layout;
-                entry.vram_charge_size = placement_vram_charge_bytes(entry.dst_size);
+                entry.vram_charge_size =
+                    planner_expert_vram_charge_bytes(entry.type, entry.ne[0], entry.layout, entry.dst_size);
                 entry.kv_size          = 0;
                 entry.layer_id         = layer_id;
                 entry.expert_id        = e;
@@ -38292,7 +38302,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                 entry.src_size         = expert_size;
                 entry.dst_size         = dst_size != 0 ? dst_size : expert_size;
                 entry.layout           = layout;
-                entry.vram_charge_size = placement_vram_charge_bytes(entry.dst_size);
+                entry.vram_charge_size =
+                    planner_expert_vram_charge_bytes(entry.type, entry.ne[0], entry.layout, entry.dst_size);
                 entry.kv_size          = 0;
                 entry.layer_id         = layer_id;
                 entry.expert_id        = e;

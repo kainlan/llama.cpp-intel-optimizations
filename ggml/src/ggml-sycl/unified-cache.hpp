@@ -4354,9 +4354,9 @@ class unified_cache {
     // the transaction compares it with. loan_copy_bytes() is the AOS device entry direct staging filed under key, which
     // a loan copies whole; refill_copy_bytes() is the host copy a loan published under key, which a refill's device
     // storage must equal. Each can exceed the plan's dst_size: direct staging pads an AOS quantized expert's tail to
-    // MATRIX_ROW_PADDING columns, and the plan does not count it. Read under direct_stage_mutex_ and rw_mutex_, shared;
-    // the transaction checks again under its own locks, so an entry that changes in between is refused there. 0 when
-    // there is no such entry, or it is retired.
+    // MATRIX_ROW_PADDING columns, which dst_size leaves out and the plan's VRAM charge counts. Read under
+    // direct_stage_mutex_ and rw_mutex_, shared; the transaction checks again under its own locks, so an entry that
+    // changes in between is refused there. 0 when there is no such entry, or it is retired.
     size_t loan_copy_bytes(ggml_sycl_cache_id key) const;
     size_t refill_copy_bytes(ggml_sycl_cache_id key) const;
 

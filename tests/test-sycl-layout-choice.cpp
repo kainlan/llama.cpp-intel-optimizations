@@ -1864,6 +1864,72 @@ static bool run_moe_stream_ring_room_before_experts_test() {
     return ok;
 }
 
+// A routed expert on the device costs the WEIGHT zone what direct staging allocates for it. The case's Q4_0 experts
+// have 256 columns, so staging completes each one's last row to 512 columns (MATRIX_ROW_PADDING): 256 more columns of
+// Q4_0, 144 bytes, and the zone rounds the 18576-byte request to its 256-byte grain, 18688. The entry's dst_size stays
+// the unpadded 18432 bytes, the size loans and refills read. With the ring's room held, the blocks staging allocates
+// for the device experts and the ring's slots both fit what the budget leaves after the dense weights and their KV.
+static bool run_expert_charge_is_staged_bytes_test() {
+    using namespace ring_room_case;
+    bool ok = true;
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
+
+    // The stager's rule, written here and not read from the planner.
+    const size_t tail   = ggml_row_size(GGML_TYPE_Q4_0, 512 - ncols % 512);
+    const size_t staged = matrix_bytes + tail;
+    const size_t block  = (staged + 255) / 256 * 256;
+    if (tail != 144 || block != 18688) {
+        printf("FAIL: the case's staged expert must be 18432 + 144 bytes in an 18688-byte block: tail %zu, block %zu\n",
+               tail, block);
+        ok = false;
+    }
+
+    const auto roomy   = plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, q4_0_bit);
+    size_t     checked = 0;
+    size_t     wrong   = 0;
+    for (const auto & e : roomy.entries) {
+        if (e.expert_id < 0 || !e.on_device) {
+            continue;
+        }
+        checked++;
+        if (e.layout == GGML_LAYOUT_AOS && e.dst_size == matrix_bytes && e.vram_charge_size == block) {
+            continue;
+        }
+        if (wrong++ == 0) {
+            printf(
+                "FAIL: a device AOS expert must charge its staged block and keep its unpadded dst_size: %s expert %d "
+                "layout %d dst_size %zu (want %zu) charge %zu (want %zu)\n",
+                e.name.c_str(), e.expert_id, (int) e.layout, e.dst_size, matrix_bytes, e.vram_charge_size, block);
+        }
+        ok = false;
+    }
+    if (checked != 3 * static_cast<size_t>(n_triplets)) {
+        printf("FAIL: a budget every expert fits puts all %d expert matrices on the device: %zu\n", 3 * n_triplets,
+               checked);
+        ok = false;
+    }
+
+    const size_t charge = triplet_charge(roomy);
+    const size_t budget = base + 40 * charge;
+    const auto   plan   = plan_for(budget, q4_0_bit);
+    const size_t blocks = 3 * device_triplets(plan) * block;
+    if (plan.moe_stream_ring_reserve_bytes != ring_bytes || device_triplets(plan) == 0 ||
+        base + blocks + ring_bytes > budget) {
+        printf(
+            "FAIL: the staged experts and the ring's slots must fit the budget: %zu device triplets stage %zu bytes, "
+            "the ring holds %zu (want %zu), dense and KV take %zu, the budget is %zu\n",
+            device_triplets(plan), blocks, plan.moe_stream_ring_reserve_bytes, ring_bytes, base, budget);
+        ok = false;
+    }
+
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    if (ok) {
+        printf(
+            "PASS: a device AOS expert charges the WEIGHT zone its staged block, so the ring's room is really there\n");
+    }
+    return ok;
+}
+
 // A mapping load pins its routed host experts when the plan holds ring room, the host plan fits its budget and no lazy
 // table refuses, all of them or none. The opt-out, a plan with no ring room, a budget the pinned plan exceeds, a lazy
 // table that refuses, a locked mapping and a type nothing stages each leave them mapped.
@@ -4387,6 +4453,7 @@ int main() {
         mock_ok = run_kv_context_room_follows_the_requested_context_test() && mock_ok;
         mock_ok = run_kv_context_room_is_cost_based_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_before_experts_test() && mock_ok;
+        mock_ok = run_expert_charge_is_staged_bytes_test() && mock_ok;
         mock_ok = run_moe_stream_ring_pins_host_experts_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_converges_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_cap_refuses_test() && mock_ok;
