@@ -83,15 +83,79 @@ def test_sycl_error_takes_the_fast_exit_when_a_loss_is_latched():
     )
 
 
+def braced_block(text: str, start: int) -> str:
+    """The text from `start` to the closing brace that matches the first opening brace after it."""
+    open_at = text.find("{", start)
+    assert open_at >= 0, "no opening brace"
+    depth = 0
+    for i in range(open_at, len(text)):
+        depth += {"{": 1, "}": -1}.get(text[i], 0)
+        if depth == 0:
+            return text[start:i + 1]
+    raise AssertionError("no matching closing brace")
+
+
+REGISTRATION = "std::atexit(ggml_sycl_device_lost_at_exit)"
+
+
+def guarded_registration_problems(cpp: str) -> list:
+    """Why common.cpp does not register the exit handler exactly once, inside the first-loss block."""
+    guard = cpp.find("if (!g_sycl_device_lost_latched.exchange(true")
+    if guard < 0:
+        return ["common.cpp: the first-loss guard on g_sycl_device_lost_latched is missing"]
+    block = braced_block(cpp, guard)
+    problems = []
+    if block.count(REGISTRATION) != 1 or cpp.count(REGISTRATION) != 1:
+        problems.append("common.cpp: the exit handler must be registered once, inside the first-loss block")
+    if len(re.findall(r"\batexit\s*\(", cpp)) != 1:
+        problems.append("common.cpp: the latch must be the only exit handler it registers")
+    return problems
+
+
 def test_latch_registers_its_exit_handler_once():
+    problems = guarded_registration_problems(code_of(SYCL / "common.cpp"))
+    assert not problems, "\n".join(problems)
+
+
+def test_the_registration_reader_refuses_a_handler_registered_outside_the_block():
     cpp = code_of(SYCL / "common.cpp")
-    start = cpp.find("void ggml_sycl_note_exception(const char * what) noexcept {")
-    assert start >= 0, "common.cpp: ggml_sycl_note_exception is missing"
-    body = cpp[start:cpp.find("\n}\n", start)]
-    guard = body.find("if (!g_sycl_device_lost_latched.exchange(true")
-    handler = body.find("std::atexit(ggml_sycl_device_lost_at_exit);")
-    assert 0 <= guard < handler, "common.cpp: the exit handler must be registered only by the first recorded loss"
-    assert len(re.findall(r"\batexit\s*\(", cpp)) == 1, "common.cpp: the latch must be the only exit handler it registers"
+    guard = cpp.find("if (!g_sycl_device_lost_latched.exchange(true")
+    block = braced_block(cpp, guard)
+    moved = block.replace(REGISTRATION, "false", 1)
+    mutant = cpp.replace(block, moved + "\n    (void) " + REGISTRATION + ";", 1)
+    assert mutant != cpp and guarded_registration_problems(mutant), "the reader admits a registration past the block"
+
+
+def test_a_failed_registration_is_reported():
+    cpp = code_of(SYCL / "common.cpp")
+    assert re.search(r"if \(" + re.escape(REGISTRATION) + r" != 0\) \{\s*std::fprintf\(\s*stderr,\s*"
+                     r"\"\[SYCL-FATAL\] could not register the exit handler; a normal exit runs teardown\\n\"\);"
+                     r"\s*std::fflush\(stderr\);", cpp), (
+        "common.cpp: a failed std::atexit must print that a normal exit runs teardown")
+
+
+def test_the_exit_handler_flushes_every_stream_before_the_fast_exit():
+    cpp = code_of(SYCL / "common.cpp")
+    start = cpp.find("static void ggml_sycl_device_lost_at_exit() {")
+    assert start >= 0, "common.cpp: ggml_sycl_device_lost_at_exit is missing"
+    body = braced_block(cpp, start)
+    flush = body.find("std::fflush(nullptr);")
+    fatal = body.find("ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST,")
+    assert 0 <= flush < fatal, "common.cpp: the exit handler must flush every open stream before the fast exit"
+
+
+def test_the_sync_diagnostic_is_printed_without_the_log_queue():
+    main = code_of(SYCL / "ggml-sycl.cpp")
+    start = main.find("static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {")
+    assert start >= 0, "ggml-sycl.cpp: ggml_backend_sycl_synchronize is missing"
+    body = braced_block(main, start)
+    calls = re.findall(r"(\w+(?:::\w+)?)\s*\(\s*(?:stderr,\s*)?\"\[SYCL-SYNC-DIAG\]", body)
+    assert calls == ["std::fprintf"], (
+        f"ggml-sycl.cpp: the [SYCL-SYNC-DIAG] line must be printed with std::fprintf(stderr, ...), found {calls}")
+    diag = body.find("\"[SYCL-SYNC-DIAG]")
+    flush = body.find("std::fflush(stderr);", diag)
+    assert 0 <= flush < body.find("SYCL_CHECK(err);", diag), (
+        "ggml-sycl.cpp: the [SYCL-SYNC-DIAG] line must be flushed before SYCL_CHECK(err) can end the process")
 
 
 def test_graph_boundary_cleanup_records_a_device_loss():
@@ -104,6 +168,7 @@ def test_graph_boundary_cleanup_records_a_device_loss():
 
 
 @pytest.mark.parametrize("log", [
+    "[SYCL] graph warmup wait failed: %s\\n\", exc.what()",
     "SYCL graph completion barrier failed: %s\\n\", exc.what()",
     "[SYCL] graph_compute deferred exit barrier failed: %s; draining queue\\n\", exc.what()",
     "[SYCL] graph_compute exit wait failed: %s\\n\", wait_exc.what()",

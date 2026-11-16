@@ -858,10 +858,26 @@ int ggml_sycl_fatal_exit_code(const char * what) noexcept;
 // signal handler.
 [[noreturn]] void ggml_sycl_fatal_exit(int code, const char * message) noexcept;
 
-// Records a device loss when `what` names one. The first loss also registers an exit handler that ends the process
-// through ggml_sycl_fatal_exit. Exit handlers run latest-registered first, so it runs before the Level Zero
-// library's destructor, which does not return once a device is lost. A path that reports the failure to its caller
-// instead of ending the process stays that way; the process still cannot hang when the caller exits.
+// Records a device loss when `what` names one. The first loss prints "[SYCL-FATAL] device lost:" and registers an
+// exit handler that ends the process through ggml_sycl_fatal_exit. A path that reports the failure to its caller
+// instead of ending the process still does so.
+//
+// What this does to a normal exit, once a loss is recorded:
+// - Every later normal exit ends through _Exit(69). The 69 replaces whatever main returned or exit() was given. This
+//   holds also when the loss was seen only by a start-up probe and the run then finished on another card or on the
+//   CPU.
+// - Exit handlers and static destructors registered before the loss are skipped, the application's and the
+//   backend's own: the CPU worker shutdown and the end-of-run dumps such as the counter dump, the alloc-trace dump
+//   and the mem-copy census.
+// - Log lines still queued in an application's logger are lost.
+// - All open output streams are flushed first.
+//
+// The order: on glibc the handler runs before every exit handler and static destructor registered before the loss,
+// and before the libraries' own unload destructors, the Level Zero library's among them, whose teardown can hang on
+// a lost card. Exit handlers and static objects registered after the loss run before it. A loss recorded after
+// exit() has finished running its handlers cannot register one. The registration is tied to this library's handle,
+// so the order rests on the backend library staying loaded until the process exits; ggml pins backend libraries
+// (ggml-backend.h, ggml_backend_unload_checked; dl_pin_library in ggml-backend-dl.cpp).
 void ggml_sycl_note_exception(const char * what) noexcept;
 
 // True once any thread has recorded a device loss.
@@ -942,8 +958,10 @@ static __dpct_inline__ float sycl_e8m0_to_fp32_half(uint8_t e) {
     fprintf(stderr, "SYCL error: %s: %s\n", stmt, msg);
     fprintf(stderr, "  in function %s at %s:%d\n", func, file, line);
     if (ggml_sycl_device_lost_latched()) {
-        // A backtrace of a lost device says nothing the lines above do not, and gdb plus a core dump keep the
-        // process, and its VRAM, alive for the time they take.
+        // After a recorded loss any failed check ends the process without teardown, whichever card or call failed:
+        // the abort path's backtrace and the teardown after it can hang on the lost card. The "SYCL error:" line
+        // and the exception line above it still name the failing call, and the loss has its own
+        // "[SYCL-FATAL] device lost:" line earlier in the log.
         ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "SYCL_CHECK failed after a device loss");
     }
     GGML_ABORT("SYCL error");

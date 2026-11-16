@@ -798,6 +798,8 @@ void ggml_sycl_fatal_exit(int code, const char * message) noexcept {
 static std::atomic<bool> g_sycl_device_lost_latched{ false };
 
 static void ggml_sycl_device_lost_at_exit() {
+    // A normal exit would have flushed every open output stream; the fast exit flushes only stdout and stderr.
+    std::fflush(nullptr);
     ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "process exit after a device loss");
 }
 
@@ -808,10 +810,14 @@ void ggml_sycl_note_exception(const char * what) noexcept {
     if (!g_sycl_device_lost_latched.exchange(true, std::memory_order_acq_rel)) {
         std::fprintf(stderr,
                      "[SYCL-FATAL] device lost: %s\n"
-                     "[SYCL-FATAL] the process leaves through _Exit(%d) at its next fatal check or when it exits\n",
+                     "[SYCL-FATAL] the process leaves through _Exit(%d) at its next failed SYCL check (SYCL_CHECK) "
+                     "or when it exits, without running exit handlers\n",
                      what, GGML_SYCL_EXIT_DEVICE_LOST);
         std::fflush(stderr);
-        std::atexit(ggml_sycl_device_lost_at_exit);
+        if (std::atexit(ggml_sycl_device_lost_at_exit) != 0) {
+            std::fprintf(stderr, "[SYCL-FATAL] could not register the exit handler; a normal exit runs teardown\n");
+            std::fflush(stderr);
+        }
     }
 }
 

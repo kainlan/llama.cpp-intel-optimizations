@@ -1120,6 +1120,26 @@ Diagnostics for future cross-device KV tasks must report, at minimum, the planne
 
 ## Known Issues
 
+### Exit status 69 after a device loss
+
+When the backend sees a lost device, it prints `[SYCL-FATAL] device lost: ...`. From then on the process ends with
+status 69 at its next failed SYCL check, or when it exits.
+
+No teardown runs on the way out. On a lost card the driver's teardown can hang, and the process would then hold its
+memory and the card until it was killed.
+
+This has consequences for a normal exit after the loss:
+
+- The process exits with status 69, whatever `main` returned or `exit()` was given. This also happens when only a
+  start-up probe saw the loss and the run then finished on another card or on the CPU.
+- Exit handlers and static destructors that were registered before the loss do not run. That covers the
+  application's own and the backend's own, such as the CPU worker shutdown and the end-of-run dumps (the counter
+  dump, the alloc-trace dump and the mem-copy census).
+- Log lines still queued in the application's logger are lost.
+- Open output streams are flushed first, so output already written reaches its file.
+
+Read status 69 as "the device was lost". It means that even when the run's output was complete.
+
 ## Runtime Allocation Policy
 
 - Managed runtime allocations must go through unified allocator APIs in `unified-cache.cpp`.

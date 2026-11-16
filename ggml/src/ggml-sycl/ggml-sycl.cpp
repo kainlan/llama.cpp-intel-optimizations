@@ -99744,12 +99744,15 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
                 ggml_backend_sycl_get_device_memory(dev, &free_mem, &total_mem);
             } catch (...) {
             }
-            GGML_LOG_ERROR(
-                "[SYCL-SYNC-DIAG] DEVICE_LOST on device %d: "
-                "cache_used=%.1f MB, cache_budget=%.1f MB, "
-                "L0_free=%.1f MB, L0_total=%.1f MB\n",
-                dev, cache_used / (1024.0 * 1024.0), cache_budget / (1024.0 * 1024.0), free_mem / (1024.0 * 1024.0),
-                total_mem / (1024.0 * 1024.0));
+            // Not GGML_LOG_ERROR: the process may end at the next statement without teardown, and a line still queued
+            // in an application's logger would be lost.
+            std::fprintf(stderr,
+                         "[SYCL-SYNC-DIAG] DEVICE_LOST on device %d: "
+                         "cache_used=%.1f MB, cache_budget=%.1f MB, "
+                         "L0_free=%.1f MB, L0_total=%.1f MB\n",
+                         dev, cache_used / (1024.0 * 1024.0), cache_budget / (1024.0 * 1024.0),
+                         free_mem / (1024.0 * 1024.0), total_mem / (1024.0 * 1024.0));
+            std::fflush(stderr);
         }
         SYCL_CHECK(err);
         (void) ggml_sycl_execution_release_graph(sycl_ctx);
@@ -124635,6 +124638,7 @@ normal_dispatch:
             try {
                 ggml_sycl_trace_queue_wait(sycl_ctx->stream(), "graph-warmup-exit", sycl_ctx->device, -1, nullptr);
             } catch (const sycl::exception & exc) {
+                ggml_sycl_note_exception(exc.what());
                 GGML_LOG_ERROR("[SYCL] graph warmup wait failed: %s\n", exc.what());
             }
             graph_unpin_transient_leases_after_direct_execution(sycl_ctx);

@@ -2,6 +2,7 @@
 // device loss the Level Zero library's own destructor does not return. Each mode runs this binary again as a child
 // that plants an atexit handler and a static destructor, and checks from outside which of them ran.
 
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "common.hpp"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -257,9 +258,9 @@ void quantize_weights_mxfp4(const std::vector<float> & src,
 
 // Runs one small MUL_MAT_ID graph on the SYCL backend, with its weights in host memory. Returns false when the setup
 // or the compute reported a failure. On a bare backend the compute always fails: with no model there is no planned
-// route for the MUL_MAT_ID, and the backend refuses it at the op. The modes that use this (mmid, op and graph) only
-// need the compute to reach the op or the graph boundary: a compute that returns at all means the injected loss did
-// not end the process, so nothing is read back and nothing is freed.
+// route for the MUL_MAT_ID, and the backend refuses it at the op. The modes that use this (mmid and op) only need the
+// compute to reach the op: a compute that returns at all means the injected loss did not end the process, so nothing
+// is read back and nothing is freed.
 bool run_one_mmid(ggml_backend_t backend) {
     const int          in_dim = 64, out_dim = 32, n_experts = 4, n_used = 2, n_tokens = 8;
     std::mt19937       rng(7);
@@ -321,7 +322,9 @@ bool run_one_mmid(ggml_backend_t backend) {
 
 // Runs one ggml_add of two F32 device tensors, a graph that needs no model, no planned route and no weight cache, so
 // it computes on a bare backend. Returns true when the compute succeeded. The sync mode uses it because its loss must
-// land on a wait after a compute that worked. Built the way test-rms-norm-mul-add-broadcast.cpp builds its graph.
+// land on a wait after a compute that worked, and the graph mode because a failed compute can then only be the
+// injected one. Built the way test-rms-norm-mul-add-broadcast.cpp builds its graph. Its context and buffer are leaked
+// by intent: the child ends without teardown.
 bool run_one_add(ggml_backend_t backend) {
     const int              n      = 256;
     const ggml_init_params params = {
@@ -350,22 +353,40 @@ bool run_one_add(ggml_backend_t backend) {
     return ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
 }
 
-// The device modes: the injected loss is in the environment the registration sets.
+// The injection a device mode's child sets for itself, <site>:<n>, which throws from the site's nth call on. The sync
+// mode's count skips the one synchronize call before the one it targets: the one ggml_backend_graph_compute ends with.
+// The graph mode's 1 is the child's first graph compute.
+const char * device_injection(const char * mode) {
+    if (std::strcmp(mode, "sync") == 0) {
+        return "sync:2";
+    }
+    if (std::strcmp(mode, "graph") == 0) {
+        return "graph:1";
+    }
+    return std::strcmp(mode, "mmid") == 0 ? "mmid:1" : "op:1";
+}
+
+// The device modes. The child sets its own injection before any backend call, so the binary needs no environment
+// beyond the device selector: `test-sycl-fatal-exit sync` runs as is.
 int child_device(const char * mode) {
+    if (setenv("GGML_SYCL_TEST_INJECT_DEVICE_LOST", device_injection(mode), 1) != 0) {
+        std::perror("setenv");
+        return 2;
+    }
     plant_markers();
     // Counted before the backend is made, because on a host with no device ggml_backend_sycl_init(0) does not return
     // null: the skip below it would not fire there.
     if (ggml_backend_sycl_get_device_count() == 0) {
         std::fprintf(stderr, "SKIP: no SYCL device\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     ggml_backend_t backend = ggml_backend_sycl_init(0);
     if (backend == nullptr) {
         std::fprintf(stderr, "SKIP: no SYCL backend\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     const bool sync     = std::strcmp(mode, "sync") == 0;
-    const bool computed = sync ? run_one_add(backend) : run_one_mmid(backend);
+    const bool computed = sync || std::strcmp(mode, "graph") == 0 ? run_one_add(backend) : run_one_mmid(backend);
     if (std::strcmp(mode, "graph") == 0 && !computed) {
         // The boundary reported the failure and returned. An application would now wind down and return from main.
         std::fprintf(stderr, "TEST-GRAPH-FAILED\n");
@@ -398,18 +419,6 @@ int child_main(const char * mode) {
     return 2;
 }
 
-// The injection the ctest registration sets for a device mode. The sync mode's count skips the one synchronize call
-// before the one it targets: the one ggml_backend_graph_compute ends with.
-const char * device_injection(const char * mode) {
-    if (std::strcmp(mode, "sync") == 0) {
-        return "sync:2";
-    }
-    if (std::strcmp(mode, "graph") == 0) {
-        return "graph:1";
-    }
-    return std::strcmp(mode, "mmid") == 0 ? "mmid:1" : "op:1";
-}
-
 int parent_main(const char * self, const char * mode) {
     if (std::strcmp(mode, "helper") == 0) {
         const child_result r = run_child(self, mode);
@@ -434,7 +443,10 @@ int parent_main(const char * self, const char * mode) {
     if (std::strcmp(mode, "classify") == 0) {
         const char * lost = "level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)";
         const char * oom  = "level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)";
-        const bool   ok   = ggml_sycl_what_is_device_lost(lost) && !ggml_sycl_what_is_device_lost(oom) &&
+        // Neither another error's text nor a null records a loss, so the latch must still be clear below.
+        ggml_sycl_note_exception(oom);
+        ggml_sycl_note_exception(nullptr);
+        const bool ok = ggml_sycl_what_is_device_lost(lost) && !ggml_sycl_what_is_device_lost(oom) &&
                         !ggml_sycl_what_is_device_lost(nullptr) &&
                         ggml_sycl_fatal_exit_code(lost) == GGML_SYCL_EXIT_DEVICE_LOST &&
                         ggml_sycl_fatal_exit_code(oom) == 1 && ggml_sycl_fatal_exit_code(nullptr) == 1 &&
@@ -447,15 +459,15 @@ int parent_main(const char * self, const char * mode) {
     }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0) {
         const child_result r = run_child(self, mode);
-        if (r.exited && r.status == 77) {
+        if (r.exited && r.status == LLAMA_TEST_EXIT_SKIP) {
             std::fprintf(stderr, "%s", r.out.c_str());
-            return 77;
+            return LLAMA_TEST_EXIT_SKIP;
         }
         if (has(r, "TEST-CHILD-SURVIVED")) {
             const std::string why = std::string(
                                         "the injected loss was never thrown: the op did not reach the site "
                                         "(GGML_SYCL_TEST_INJECT_DEVICE_LOST=") +
-                                    device_injection(mode) + " is set by the ctest registration)";
+                                    device_injection(mode) + " is what the child set)";
             return fail(mode, r, why.c_str());
         }
         const bool   mmid      = std::strcmp(mode, "mmid") == 0;
@@ -477,16 +489,16 @@ int parent_main(const char * self, const char * mode) {
     }
     if (std::strcmp(mode, "sync") == 0 || std::strcmp(mode, "graph") == 0) {
         const child_result r = run_child(self, mode);
-        if (r.exited && r.status == 77) {
+        if (r.exited && r.status == LLAMA_TEST_EXIT_SKIP) {
             std::fprintf(stderr, "%s", r.out.c_str());
-            return 77;
+            return LLAMA_TEST_EXIT_SKIP;
         }
         const bool sync = std::strcmp(mode, "sync") == 0;
         if (has(r, "TEST-CHILD-SURVIVED")) {
             const std::string why = std::string(
                                         "the injected loss was never thrown: the wait or the boundary did not reach "
                                         "the site (GGML_SYCL_TEST_INJECT_DEVICE_LOST=") +
-                                    device_injection(mode) + " is set by the ctest registration)";
+                                    device_injection(mode) + " is what the child set)";
             return fail(mode, r, why.c_str());
         }
         if (sync && !has(r, "TEST-SYNC-COMPUTED computed=1")) {
