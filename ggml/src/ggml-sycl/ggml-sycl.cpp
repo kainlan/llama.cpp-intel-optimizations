@@ -93487,8 +93487,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             batched_acts = static_cast<sycl::half *>(reserved.activation);
             batched_out  = static_cast<float *>(reserved.output);
-            // Where the expert at sorted position `slot` has its rows. The gather, both GEMM arms and the scatter all
-            // ask here, so they cannot disagree about an expert's rows.
+            // Where the expert at sorted position `slot` has its rows. Every reader of the scratch asks here, so they
+            // cannot disagree about an expert's rows.
             const auto act_base = [&](size_t slot) -> sycl::half * {
                 return batched_acts + pack.slot_base_row[slot] * static_cast<size_t>(ne10);
             };

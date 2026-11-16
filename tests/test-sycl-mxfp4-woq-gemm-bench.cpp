@@ -30,7 +30,7 @@
 // actually produces (moe_pp_pack_gemm_groups' groups, each padded to
 // moe_pp_gemm_row_align, in ggml/src/ggml-sycl/moe-pp-pack.hpp; see the design
 // note on llama.cpp-iikr for the host-side grouping logic this mirrors --
-// one microbench call == one "gemm_group" call in the production executor,
+// one microbench call == one GEMM group's call in the production executor,
 // m=group.n_rows, n=ne01, k=ne00, exactly the DnnlGemmWrapper::
 // woq_gemm_batch_mxfp4 call shape in ggml-sycl.cpp).
 //
@@ -1091,7 +1091,7 @@ int main() {
         constexpr int     blocks_per_row = 90;
         constexpr int64_t N              = 2880;                                 // ne01 (output dim)
         constexpr int64_t K              = (int64_t) blocks_per_row * QK_MXFP4;  // 2880
-        // realistic gemm_group row counts (groups padded to moe_pp_gemm_row_align;
+        // realistic GEMM group row counts (groups padded to moe_pp_gemm_row_align;
         // see moe_pp_pack_gemm_groups in ggml/src/ggml-sycl/moe-pp-pack.hpp)
         const int         Ms[]           = { 32, 64, 128 };
         constexpr int     WARMUP         = 3;
