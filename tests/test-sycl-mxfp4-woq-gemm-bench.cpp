@@ -32,7 +32,7 @@
 // note on llama.cpp-iikr for the host-side grouping logic this mirrors --
 // one microbench call == one "gemm_group" call in the production executor,
 // m=group.n_rows, n=ne01, k=ne00, exactly the DnnlGemmWrapper::
-// woq_gemm_batch_mxfp4 call shape at ggml-sycl.cpp ~71440).
+// woq_gemm_batch_mxfp4 call shape in ggml-sycl.cpp).
 //
 // SCOPE NOTE (read before extrapolating these numbers to a shipped kernel):
 // both kernels below are WORK-GROUP TILED for activation reuse only (one
