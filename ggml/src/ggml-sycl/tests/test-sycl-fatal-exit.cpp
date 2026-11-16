@@ -30,6 +30,9 @@ constexpr int k_child_limit_s = 30;
 // kernel holds in an uninterruptible wait cannot be reaped, and a process the child started can still hold the pipe.
 constexpr int k_child_grace_s = 5;
 
+// How often the parent looks at the pipe and at the child while it waits.
+constexpr int k_child_slice_ms = 10;
+
 void atexit_marker() {
     std::fprintf(stderr, "%s\n", k_atexit_marker);
     std::fflush(stderr);
@@ -53,8 +56,9 @@ struct child_result {
     int         signal    = 0;
     bool        timed_out = false;
     bool        reaped    = false;
-    double      seconds   = 0.0;
-    std::string err;
+    bool        pipe_open = false;  // something still held the child's output pipe when the parent stopped reading
+    double      seconds   = 0.0;    // until the child was reaped, or until the parent stopped if it never was
+    std::string out;                // the child's stdout and stderr, which share one pipe
 };
 
 int ms_until(std::chrono::steady_clock::time_point t) {
@@ -95,7 +99,10 @@ child_result run_child(const char * self, const char * mode) {
         std::exit(1);
     }
     if (pid == 0) {
-        if (dup2(fds[1], STDERR_FILENO) < 0) {
+        // Stdout goes to the pipe as well as stderr, so the child holds no descriptor of the parent's: a child the
+        // kernel keeps alive after the kill would otherwise hold the harness's output pipe open, and the harness would
+        // wait on it past the parent's own report.
+        if (dup2(fds[1], STDOUT_FILENO) < 0 || dup2(fds[1], STDERR_FILENO) < 0) {
             std::perror("dup2");
             _exit(127);
         }
@@ -124,9 +131,9 @@ child_result run_child(const char * self, const char * mode) {
             until = std::chrono::steady_clock::now() + std::chrono::seconds(k_child_grace_s);
         }
         if (open) {
-            open = read_pipe(fds[0], std::min(ms_until(until), 10), r.err);
+            open = read_pipe(fds[0], std::min(ms_until(until), k_child_slice_ms), r.out);
         } else {
-            usleep(10 * 1000);
+            usleep(k_child_slice_ms * 1000);
         }
         if (!r.reaped) {
             const pid_t done = waitpid(pid, &st, WNOHANG);
@@ -134,38 +141,53 @@ child_result run_child(const char * self, const char * mode) {
                 std::perror("waitpid");
                 break;
             }
-            r.reaped = done == pid;
+            if (done == pid) {
+                r.reaped  = true;
+                r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            }
         }
     }
     close(fds[0]);
-    r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    r.exited  = r.reaped && WIFEXITED(st);
-    r.status  = r.exited ? WEXITSTATUS(st) : -1;
-    r.signal  = r.reaped && WIFSIGNALED(st) ? WTERMSIG(st) : 0;
+    r.pipe_open = open;
+    if (!r.reaped) {
+        r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    r.exited = r.reaped && WIFEXITED(st);
+    r.status = r.exited ? WEXITSTATUS(st) : -1;
+    r.signal = r.reaped && WIFSIGNALED(st) ? WTERMSIG(st) : 0;
     return r;
 }
 
 bool has(const child_result & r, const char * needle) {
-    return r.err.find(needle) != std::string::npos;
+    return r.out.find(needle) != std::string::npos;
 }
 
 int fail(const char * mode, const child_result & r, const char * why) {
     std::fprintf(stderr,
-                 "FAIL mode=%s: %s (exited=%d status=%d signal=%d timed_out=%d reaped=%d seconds=%.1f)\n"
-                 "--- child stderr ---\n%s\n",
-                 mode, why, r.exited ? 1 : 0, r.status, r.signal, r.timed_out ? 1 : 0, r.reaped ? 1 : 0, r.seconds,
-                 r.err.c_str());
+                 "FAIL mode=%s: %s (exited=%d status=%d signal=%d timed_out=%d reaped=%d pipe_open=%d seconds=%.1f)\n"
+                 "--- child stdout and stderr ---\n%s\n",
+                 mode, why, r.exited ? 1 : 0, r.status, r.signal, r.timed_out ? 1 : 0, r.reaped ? 1 : 0,
+                 r.pipe_open ? 1 : 0, r.seconds, r.out.c_str());
     return 1;
 }
 
-// A child the parent had to kill is reported as a hang, before any check that would blame its status or its output.
+// A run the parent could not finish cleanly is reported for what happened, before any check that would blame the
+// child's status or its output.
 int check_ended(const char * mode, const child_result & r) {
-    if (!r.timed_out) {
-        return 0;
+    char why[128];
+    if (r.timed_out) {
+        std::snprintf(why, sizeof(why), "the child did not end within %d s", k_child_limit_s);
+        return fail(mode, r, why);
     }
-    char why[64];
-    std::snprintf(why, sizeof(why), "the child did not end within %d s", k_child_limit_s);
-    return fail(mode, r, why);
+    if (!r.reaped) {
+        return fail(mode, r, "the parent could not wait for the child");
+    }
+    if (r.pipe_open) {
+        std::snprintf(why, sizeof(why), "the child ended, but a process it started still held its output at %d s",
+                      k_child_limit_s);
+        return fail(mode, r, why);
+    }
+    return 0;
 }
 
 // The fast exit ran: the given status, its banner, and neither marker.
