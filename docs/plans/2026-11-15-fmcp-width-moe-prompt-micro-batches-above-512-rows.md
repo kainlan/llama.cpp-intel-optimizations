@@ -3748,3 +3748,45 @@ process at a time. Read the driver version first.
 
 L3 is the validation: the finished build loads the real model on the real card, the ring gets every slot the plan
 held for it, and nothing is lent. All of it is run by the lead. No step needs the owner.
+
+### Amendment 2 as implemented and measured (2026-11-16)
+
+W2.6 is merged into `integ/th32` as `52a0efc56` (task commits `5b541ed26` and `74ee72f9d`). L3 passed on that tree.
+
+**One ruling changed the design above.** The "Not changed" list leaves the host-side line of the per-target pass
+and the host-placed entries of the single-device pack unpadded, because they are not VRAM charges. The quality
+review found that a host-placed entry keeps its charge when it later moves to a device, so an unpadded host charge
+would bring the defect back on that path. The lead ruled that the field means what the entry costs the WEIGHT zone
+on a device in its current layout, for a host-placed entry too. Every writer of an expert's charge that can hold an
+AOS layout now goes through the one helper: the single-device and multi-device entry builders, both arms of the
+multi-device per-target pass, the host experts of the single-device pack, and the primary-layout upgrade (which has
+no caller today). `dst_size` stays unpadded, and nothing charges the host budget from the field. The other entries
+of the list stand.
+
+**The test proves each site.** `test-sycl-layout-choice` runs 55 cases. With each charge site reverted alone in a
+scratch tree, the case that covers it fails and every other case passes: the multi-device builder (12 of 12 experts
+wrong), the per-target device arm (12 of 12), the per-target host arm (12 of 12), and the single-device host loop
+(78 of 78, charge 18,432 against 18,688 wanted).
+
+**L3, integ `52a0efc56`, driver 26.44:**
+
+| check | unfixed (stage 2 gate) | fixed |
+|---|---|---|
+| `[MOE-STREAM-RING] reserve: the WEIGHT zone cannot give` lines, 512 rows | 1 | 0 |
+| `[MOE-EXEC] loan device` lines, 512 rows | 1 | 0 |
+| preload against the plan's device weights, 512 rows | 24,553.9 MB against 24,552.4 MB | 24,548.6 MB against 24,548.9 MB |
+| device triplets, 512 rows | 7,334 | 7,332 |
+| layer-ubatches on the ring / on the CPU, one 512-row prompt | 33 / 33 | 66 / 0 |
+| wall time of the verbose 512-row run | 646 s | 308 s |
+| the same two line counts planned for 2048 rows | not measured | 0 and 0 |
+| GPT-OSS 20B on the B50, `[PLACEMENT] Totals` | 11,536.5 MB device | identical line |
+| Qwen `-p 2048 -ub 512 -lm none -r 5` | 162.29, 169.92, 138.85 t/s, wall 814 s | 161.11 ± 3.23 t/s, wall 322 s |
+
+Both correctness gates pass on the B50 and the kernel log shows no GPU line in any phase. Throughput is unchanged.
+The run is about 490 s shorter because nothing is lent, so the slow unload after a loan (llama.cpp-ewu1) is not
+entered. The single-run 512-row throughput figures (162.86 and 167.69 t/s) were taken while a Python gate sweep ran
+on the host and are not a verdict.
+
+**Left open, ticketed:** the plan can charge a layout the stager does not materialise under
+`GGML_SYCL_DISABLE_REORDER=1` or in a build without the XMX MoE kernels (llama.cpp-kboh). Staging a padded tensor
+in bulk stays llama.cpp-g7j0.
