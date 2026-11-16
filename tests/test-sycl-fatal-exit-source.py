@@ -384,5 +384,92 @@ def test_the_settle_header_reader_refuses_a_backend_include(extra):
     assert any(name in p for p in problems), f"the reader accepted {extra}"
 
 
+PROCESS_END = re.compile(r"\b(?:std::)?(?:abort|_Exit)\s*\(")
+# One alternation, so whichever token starts first wins: a // inside a string is not a comment, and a quote inside a
+# comment or a character literal does not open a string. A quote right after a hex digit is a digit separator
+# (1'000), not a character literal. It does not understand raw string literals (none in the backend's sources today).
+COMMENT_OR_LITERAL = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:[^\"\\\n]|\\.)*\"|(?<![0-9a-fA-F])'(?:[^'\\\n]|\\.)*'",
+                                flags=re.S)
+# Files whose process ends are deliberate as they are: the number of abort( and _Exit( calls the file keeps, and why.
+UNSETTLED_ALLOWED = {
+    "a7l5w-probe.hpp": (2, "debug-build instrumentation: the dump must hold the state at the failing check, so other "
+                           "threads must not run on first"),
+}
+
+
+def blank_comments_and_literals(text: str) -> str:
+    """The text with comments, string literals and character literals blanked, keeping every newline, so an offset
+    or a reported line is the file's own."""
+    return COMMENT_OR_LITERAL.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
+def code_only(path: Path) -> str:
+    """The source with comments and literals blanked, line for line, so a reported line is the file's line."""
+    assert path.is_file(), f"{path.relative_to(ROOT)}: missing"
+    return blank_comments_and_literals(path.read_text(encoding="utf-8"))
+
+
+def unsettled_process_ends(name: str, code: str) -> list:
+    """The abort() and _Exit( calls of one source that the settle does not directly precede.
+
+    Directly means the settle is the statement before the call. Inside a multi-line macro the line continuation
+    between the two does not count.
+    """
+    problems = []
+    for m in PROCESS_END.finditer(code):
+        before = re.sub(r"\\\s*$", "", code[:m.start()].rstrip()).rstrip()
+        if not before.endswith(SETTLE_CALL):
+            line = code.count("\n", 0, m.start()) + 1
+            problems.append(f"{name}:{line}: {m.group(0)} is not directly preceded by {SETTLE_CALL}")
+    return problems
+
+
+def test_every_abort_and_exit_call_of_the_backend_settles_first():
+    """Every literal abort( and _Exit( call in the top-level *.cpp and *.hpp files of the backend settles first.
+
+    It reaches only those literal calls. It does not reach an abort through ggml's ggml_abort (GGML_ABORT,
+    GGML_ASSERT), std::terminate from a throw out of a noexcept function, std::exit, a re-raised crash signal, or a
+    kill from outside the process.
+    """
+    problems = []
+    for path in sorted(list(SYCL.glob("*.cpp")) + list(SYCL.glob("*.hpp"))):
+        if path.name in UNSETTLED_ALLOWED or path.name == "exit-settle.hpp":
+            continue
+        problems += unsettled_process_ends(path.name, code_only(path))
+    assert not problems, "\n".join(problems)
+
+
+def test_the_process_end_reader_refuses_a_bare_abort():
+    assert unsettled_process_ends("x.cpp", "void f() {\n    std::fflush(stderr);\n    std::abort();\n}\n")
+    assert not unsettled_process_ends("x.cpp", "void f() {\n    ggml_sycl::exit_settle();\n    std::abort();\n}\n")
+    assert not unsettled_process_ends("x.hpp", "#define A do { \\\n    ggml_sycl::exit_settle(); \\\n    abort(); \\\n} while (0)\n")
+
+
+@pytest.mark.parametrize("source", [
+    'void f() {\n    std::fprintf(stderr, "see http://x\\n"); std::abort();\n}\n',
+    "void f() {\n    char c='\"'; std::abort();\n}\n",
+    "void f() {\n    const int a = 1'000; std::abort(); const int b = 2'000;\n}\n",
+])
+def test_the_process_end_reader_sees_a_call_after_a_literal(source):
+    problems = unsettled_process_ends("x.cpp", blank_comments_and_literals(source))
+    assert len(problems) == 1 and problems[0].startswith("x.cpp:2:"), problems
+
+
+def test_the_process_end_reader_reads_the_real_files():
+    hpp = (SYCL / "tlsf-allocator.hpp").read_text(encoding="utf-8")
+    assert hpp.count(SETTLE_CALL) == 1, "tlsf-allocator.hpp: expected one settle call in TLSF_ASSERT"
+    settle_at = hpp.find(SETTLE_CALL)
+    abort_line = hpp.count("\n", 0, hpp.find("abort();", settle_at)) + 1
+    unsettled = blank_comments_and_literals(hpp.replace(SETTLE_CALL, "", 1))
+    problems = unsettled_process_ends("tlsf-allocator.hpp", unsettled)
+    assert problems == [f"tlsf-allocator.hpp:{abort_line}: abort( is not directly preceded by {SETTLE_CALL}"], problems
+
+
+def test_the_allowlist_holds_the_exact_number_of_unsettled_calls():
+    for name, (count, _reason) in UNSETTLED_ALLOWED.items():
+        found = len(PROCESS_END.findall(code_only(SYCL / name)))
+        assert found == count, f"{name}: {found} abort( or _Exit( call(s), the allowlist names {count}"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

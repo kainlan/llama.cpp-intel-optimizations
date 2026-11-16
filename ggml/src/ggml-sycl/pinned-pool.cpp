@@ -8,6 +8,7 @@
 
 #include "allocation-provenance.hpp"
 #include "common.hpp"
+#include "exit-settle.hpp"
 #include "ggml-impl.h"
 #include "scratch-test-mutant.hpp"
 
@@ -1305,6 +1306,7 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
             GGML_LOG_ERROR("[SYCL] Pinned chunk allocation timed out after %zu ms (size=%zu). Aborting.\n",
                            alloc_timeout_ms_, backing_size);
             std::fflush(stderr);
+            ggml_sycl::exit_settle();
             std::abort();
         }
 

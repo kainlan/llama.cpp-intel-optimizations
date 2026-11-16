@@ -772,6 +772,10 @@ static void watchdog_thread_fn(int64_t timeout_ms) {
             // No-op unless GGML_SYCL_ZONE_RESET_AUDIT is set.
             ggml_sycl::zone_reset_audit_report("sycl-watchdog-exit");
             // _Exit bypasses atexit/destructors which might deadlock on stuck threads
+            // The CPU-job release above comes first so the released commands can drain inside the wait, as in the fatal
+            // exit. The cost: the stalled thread can run on for the length of the wait, on CPU-job outputs that were
+            // never computed, so anything the process prints after the watchdog's lines is void.
+            ggml_sycl::exit_settle();
             std::_Exit(1);
         }
     }

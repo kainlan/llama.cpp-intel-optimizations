@@ -28,6 +28,7 @@
 #ifndef GGML_SYCL_PENDING_RANGE_HPP
 #define GGML_SYCL_PENDING_RANGE_HPP
 
+#include "exit-settle.hpp"
 #include "tlsf-allocator.hpp"
 
 #include <algorithm>
@@ -107,6 +108,7 @@ using pending_range_misuse_fn = void (*)(const char * detail);
 inline pending_range_misuse_fn & pending_range_misuse_handler() {
     static pending_range_misuse_fn handler = [](const char * detail) {
         std::fprintf(stderr, "[PENDING-RANGE-MISUSE] %s\n", detail);
+        ggml_sycl::exit_settle();
         std::abort();
     };
     return handler;
@@ -115,6 +117,7 @@ inline pending_range_misuse_fn & pending_range_misuse_handler() {
 #define PENDING_RANGE_MISUSE(detail)                        \
     do {                                                    \
         pending_range_misuse_handler()(detail);             \
+        ggml_sycl::exit_settle();                           \
         std::abort(); /* a handler that returns is a bug */ \
     } while (0)
 
