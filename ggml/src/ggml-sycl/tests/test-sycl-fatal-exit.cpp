@@ -51,9 +51,11 @@ constexpr int k_child_slice_ms = 10;
 // returns, and the next test cannot start on the card sooner.
 constexpr std::chrono::seconds k_device_settle{ 12 };
 
-// The capture switch and the line the backend prints when it wrote the files.
-constexpr const char * k_capture_env  = "GGML_SYCL_FATAL_CAPTURE_DIR";
-constexpr const char * k_capture_line = "[SYCL-FATAL] capture: ";
+// The capture switch, the line the backend prints when it wrote all the files, and the line it prints for each file
+// it could not write. The second does not contain the first, so counting capture lines does not count failures.
+constexpr const char * k_capture_env         = "GGML_SYCL_FATAL_CAPTURE_DIR";
+constexpr const char * k_capture_line        = "[SYCL-FATAL] capture: ";
+constexpr const char * k_capture_failed_line = "[SYCL-FATAL] capture failed: ";
 
 void atexit_marker() {
     std::fprintf(stderr, "%s\n", k_atexit_marker);
@@ -532,6 +534,9 @@ bool read_file(const std::string & path, std::string & text) {
 // once" looks like from outside: a second write would print a second line or leave another file. A pass removes the
 // files and the directory; a failure leaves them for a look.
 int check_capture_files(const char * mode, const child_result & r, const std::string & dir) {
+    if (has(r, k_capture_failed_line)) {
+        return fail(mode, r, "a capture file could not be written, although the directory exists");
+    }
     size_t lines = 0;
     for (size_t at = r.out.find(k_capture_line); at != std::string::npos; at = r.out.find(k_capture_line, at + 1)) {
         ++lines;
@@ -624,6 +629,43 @@ int run_capture_child(const char * self, const char * child_mode) {
     return check_capture_files(mode, r, dir);
 }
 
+// The helper child with GGML_SYCL_FATAL_CAPTURE_DIR naming a directory that does not exist. The capture must not
+// create it and must not print the capture line, which would claim files that are not there; it must name each file
+// it could not write instead.
+int run_capture_child_missing_dir(const char * self) {
+    char dir[] = "/tmp/sycl-fatal-capture-XXXXXX";
+    if (mkdtemp(dir) == nullptr) {
+        std::perror("mkdtemp");
+        return 1;
+    }
+    if (rmdir(dir) != 0) {
+        std::perror("rmdir");
+        return 1;
+    }
+    if (setenv(k_capture_env, dir, 1) != 0) {
+        std::perror("setenv");
+        return 1;
+    }
+    const child_result r = run_child(self, "helper");
+    unsetenv(k_capture_env);
+    const std::string label = std::string("capture child=helper dir=") + dir + " (removed before the run)";
+    const char *      mode  = label.c_str();
+    if (const int rc = check_fast_exit(mode, r, GGML_SYCL_EXIT_DEVICE_LOST)) {
+        return rc;
+    }
+    if (has(r, k_capture_line)) {
+        return fail(mode, r, "a capture line, although the directory does not exist");
+    }
+    const std::string failed = std::string(k_capture_failed_line) + dir + "/sycl-fatal-";
+    if (!has(r, failed.c_str())) {
+        return fail(mode, r, "no capture failed line naming a file in the directory");
+    }
+    if (access(dir, F_OK) == 0) {
+        return fail(mode, r, "the directory exists after the run: the capture created it");
+    }
+    return 0;
+}
+
 int parent_main(const char * self, const char * mode) {
     if (std::strcmp(mode, "helper") == 0) {
         // Cleared so that a value in the caller's environment cannot make the child capture: this mode checks that a
@@ -671,11 +713,15 @@ int parent_main(const char * self, const char * mode) {
     if (std::strcmp(mode, "capture") == 0) {
         // The two ways to the capture: the fast exit with no loss recorded (the helper child), and a recorded loss the
         // process then leaves through its exit handler (the lost-exit child), whose map must be the one taken at the
-        // loss. A host mode: neither child uses a device, so the card needs no settling after it.
+        // loss. Then a capture that cannot be written, which must say so. A host mode: no child uses a device, so the
+        // card needs no settling after it.
         if (const int rc = run_capture_child(self, "helper")) {
             return rc;
         }
-        return run_capture_child(self, "lost-exit");
+        if (const int rc = run_capture_child(self, "lost-exit")) {
+            return rc;
+        }
+        return run_capture_child_missing_dir(self);
     }
     if (std::strcmp(mode, "mmid") == 0 || std::strcmp(mode, "op") == 0) {
         const child_result r = run_child(self, mode);

@@ -31,6 +31,7 @@
 #if defined(_WIN32)
 #    include <windows.h>
 #else
+#    include <fcntl.h>
 #    include <unistd.h>
 #endif
 
@@ -783,9 +784,89 @@ int ggml_sycl_fatal_exit_code(const char * what) noexcept {
     return ggml_sycl_what_is_device_lost(what) ? GGML_SYCL_EXIT_DEVICE_LOST : 1;
 }
 
+#if defined(__linux__)
+// Copies /proc/self/<name> to `to`, which must not exist yet. Returns nullptr when every byte was copied, or why not.
+// errno is read at the call that failed, before a close can change it.
+static const char * ggml_sycl_fatal_capture_copy(const char * name, const char * to) noexcept {
+    char from[64];
+    std::snprintf(from, sizeof(from), "/proc/self/%s", name);
+    const int in = open(from, O_RDONLY | O_CLOEXEC);
+    if (in < 0) {
+        return std::strerror(errno);
+    }
+    const int out = open(to, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (out < 0) {
+        const int err = errno;
+        close(in);
+        return std::strerror(err);
+    }
+    const char * why = nullptr;
+    char         buf[65536];
+    for (;;) {
+        const ssize_t n = read(in, buf, sizeof(buf));
+        if (n == 0) {
+            break;
+        }
+        if (n < 0) {
+            why = std::strerror(errno);
+            break;
+        }
+        const ssize_t written = write(out, buf, static_cast<size_t>(n));
+        if (written != n) {
+            why = written < 0 ? std::strerror(errno) : "short write";
+            break;
+        }
+    }
+    close(in);
+    close(out);
+    return why;
+}
+#endif
+
+// GGML_SYCL_FATAL_CAPTURE_DIR=<dir>: copy this process's memory map, its per-mapping detail and its status into <dir>,
+// once. The kernel's GPU fault record names an address, and only a map taken while the process still exists can say
+// which mapping held it. <dir> must already exist; nothing but the three files is created. The capture line is printed
+// only when all three files were written, so it always means a complete capture; a file that was not written is named
+// on a "capture failed" line with the reason instead.
+static void ggml_sycl_fatal_capture() noexcept {
+#if defined(__linux__)
+    static std::atomic<bool> done{ false };
+    const char *             dir = std::getenv("GGML_SYCL_FATAL_CAPTURE_DIR");
+    if (dir == nullptr || dir[0] == '\0' || done.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    const long pid = static_cast<long>(getpid());
+    char       base[1024];
+    const int  base_len  = std::snprintf(base, sizeof(base), "%s/sycl-fatal-%ld", dir, pid);
+    const bool base_fits = base_len >= 0 && static_cast<size_t>(base_len) < sizeof(base);
+
+    static const char * const names[]     = { "maps", "smaps", "status" };
+    bool                      all_written = true;
+    for (const char * name : names) {
+        char      to[1100];
+        const int to_len = base_fits ? std::snprintf(to, sizeof(to), "%s.%s", base, name) : -1;
+        if (to_len < 0 || static_cast<size_t>(to_len) >= sizeof(to)) {
+            std::fprintf(stderr, "[SYCL-FATAL] capture failed: %s/sycl-fatal-%ld.%s: path too long\n", dir, pid, name);
+            all_written = false;
+            continue;
+        }
+        const char * why = ggml_sycl_fatal_capture_copy(name, to);
+        if (why != nullptr) {
+            std::fprintf(stderr, "[SYCL-FATAL] capture failed: %s: %s\n", to, why);
+            all_written = false;
+        }
+    }
+    if (all_written) {
+        std::fprintf(stderr, "[SYCL-FATAL] capture: %s\n", base);
+    }
+    std::fflush(stderr);
+#endif
+}
+
 void ggml_sycl_fatal_exit(int code, const char * message) noexcept {
     std::fprintf(stderr, "[SYCL-FATAL] %s: ending the process with _Exit(%d), no teardown\n",
                  message ? message : "(no message)", code);
+    ggml_sycl_fatal_capture();
     std::fflush(stdout);
     std::fflush(stderr);
     // The watchdog's order: release every device command parked on a CPU expert job, then print the zone-reset
@@ -814,6 +895,9 @@ void ggml_sycl_note_exception(const char * what) noexcept {
                      "or when it exits, without running exit handlers\n",
                      what, GGML_SYCL_EXIT_DEVICE_LOST);
         std::fflush(stderr);
+        // Here and not at the exit: the process may run on for a while after the loss, and a map taken later no longer
+        // shows what was mapped when the device faulted.
+        ggml_sycl_fatal_capture();
         if (std::atexit(ggml_sycl_device_lost_at_exit) != 0) {
             std::fprintf(stderr, "[SYCL-FATAL] could not register the exit handler; a normal exit runs teardown\n");
             std::fflush(stderr);

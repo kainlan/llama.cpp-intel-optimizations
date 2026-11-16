@@ -299,15 +299,19 @@ def test_the_fatal_exit_captures_before_it_ends():
     )
 
 
+# The calls through which the capture writes a file or prints its line, directly or through its copy helper.
+CAPTURE_OUTPUTS = ("open(", "ggml_sycl_fatal_capture_copy(", "fprintf(")
+
+
 def test_a_second_capture_call_returns_before_it_writes():
     body = capture_body(code_of(SYCL / "common.cpp"))
     guard = body.find("done.exchange(true")
-    first_open = body.find("open(")
+    outputs = [at for at in (body.find(call) for call in CAPTURE_OUTPUTS) if at >= 0]
     after = body[body.find("{", guard) + 1:] if guard >= 0 else ""
-    assert "static std::atomic<bool> done" in body and 0 <= guard < first_open and after.lstrip().startswith(
-        "return;"), (
+    returns = after.lstrip().startswith("return;")
+    assert "static std::atomic<bool> done" in body and outputs and 0 <= guard < min(outputs) and returns, (
         "common.cpp: ggml_sycl_fatal_capture must return on a second call, through done.exchange(true, ...), before "
-        "it opens a file: the loss and the fatal exit both call it, and the files are written once"
+        "it writes a file or prints a line: the loss and the fatal exit both call it, and the files are written once"
     )
 
 
