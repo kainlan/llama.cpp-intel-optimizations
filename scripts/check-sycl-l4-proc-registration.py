@@ -559,7 +559,7 @@ def free_path_pins(source, freeb, fails):
     # there is pinned by tests/test-sycl-moe-cpu-job-device-signal-source.py, not here.
     # The drain is admitted under exactly one condition, that the injected device loss ahead of it did not throw. The
     # injection is an empty inline outside a GGML_SYCL_PRIVATE_TESTING build, so there the drain still always runs;
-    # in a test build the only drain it skips is the one a lost device would have failed anyway.
+    # a test build skips the drain only after an injected loss, which stands for a loss whose drain would fail.
     sync = function_body(source, SYNC_SIG)
     pin(fails, sync,
         r"const queue_ptr stream = sycl_ctx->stream\(sycl_ctx->device, 0\);\s*"
@@ -570,8 +570,8 @@ def free_path_pins(source, freeb, fails):
         r'auto err = CHECK_TRY_ERROR\(ggml_sycl_test_inject_device_lost\("sync"\)\);\s*if \(err == 0\) \{\s*'
         r"err = use_deferred_decode_event \? CHECK_TRY_ERROR\(sycl_ctx->last_graph_event->wait_and_throw\(\)\) :\s*"
         r"CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\);\s*\}",
-        "L4 free path: the backend synchronize no longer drains, in sequence and unconditionally, stream 0 or the deferred "
-        "decode event after the CPU-expert flush")
+        "L4 free path: the backend synchronize no longer drains, in sequence and unless the test-only injection threw, "
+        "stream 0 or the deferred decode event after the CPU-expert flush")
     # one execution queue per device: stream(device, idx) answers it for EVERY idx, and it is the TP queue or the
     # unified cache's own queue.  This is what makes "the queues the synchronize does not drain" an empty set.
     stream_fn = function_body(source, STREAM_SIG)
@@ -1246,6 +1246,10 @@ def check(header_raw, source):
     return fails
 
 
+# The failure the backend synchronize's drain pin reports, which each of its mutants must produce.
+SYNC_DRAIN_MSG = "the backend synchronize no longer drains, in sequence and unless the test-only injection threw"
+
+
 def mutations(header_raw, source):
     """Each entry: (label, expected message fragment, header text, source text)."""
     muts = []
@@ -1420,28 +1424,28 @@ def mutations(header_raw, source):
          re.compile(r"synchronize\(\);(\s*)(const int64_t t_start_us = ggml_time_us\(\);)"), r"\2\1synchronize();"),
         ("sched_reserve_impl's synchronize behind a condition on a flag", "does not synchronize() unconditionally on the ALLOC path", REIMPL_SIG,
          "    synchronize();\n", "    if (state.cparams.n_ctx != 0) { synchronize(); }\n"),
-        ("the backend synchronize skips stream 0", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize skips stream 0", SYNC_DRAIN_MSG, SYNC_SIG,
          "CHECK_TRY_ERROR(stream->wait_and_throw())", "0"),
-        ("the backend synchronize skips the stream's wait under a ternary", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize skips the stream's wait under a ternary", SYNC_DRAIN_MSG, SYNC_SIG,
          "CHECK_TRY_ERROR(stream->wait_and_throw())", "(false ? 0 : CHECK_TRY_ERROR(stream->wait_and_throw()))"),
-        ("the backend synchronize skips the CPU-expert flush", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize skips the CPU-expert flush", SYNC_DRAIN_MSG, SYNC_SIG,
          "            ggml_sycl_cpu_tg_flush_pending();\n", ""),
-        ("the backend synchronize's CPU-expert flush under if (false)", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize's CPU-expert flush under if (false)", SYNC_DRAIN_MSG, SYNC_SIG,
          "            ggml_sycl_cpu_tg_flush_pending();\n", "            if (false) ggml_sycl_cpu_tg_flush_pending();\n"),
-        ("the backend synchronize's CPU-expert flush behind a false condition", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize's CPU-expert flush behind a false condition", SYNC_DRAIN_MSG, SYNC_SIG,
          "if (!ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test()) {", "if (false) {"),
-        ("the backend synchronize skips the deferred decode event", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize skips the deferred decode event", SYNC_DRAIN_MSG, SYNC_SIG,
          "sycl_ctx->last_graph_event->wait_and_throw()", "0"),
-        ("the backend synchronize's deferred-event arm is never chosen", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize's deferred-event arm is never chosen", SYNC_DRAIN_MSG, SYNC_SIG,
          "use_deferred_decode_event ? CHECK_TRY_ERROR(", "false ? CHECK_TRY_ERROR("),
-        ("the backend synchronize returns before the drain", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize returns before the drain", SYNC_DRAIN_MSG, SYNC_SIG,
          "        auto err = CHECK_TRY_ERROR(ggml_sycl_test_inject_device_lost(\"sync\"));",
          "        if (sycl_ctx->has_pending_barrier) {\n            return;\n        }\n        auto err = CHECK_TRY_ERROR(ggml_sycl_test_inject_device_lost(\"sync\"));"),
-        ("the backend synchronize's drain behind a condition besides the injection's", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize's drain behind a condition besides the injection's", SYNC_DRAIN_MSG, SYNC_SIG,
          "if (err == 0) {", "if (err == 0 && !sycl_ctx->has_pending_barrier) {"),
-        ("the backend synchronize drains only after an injected loss", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize drains only after an injected loss", SYNC_DRAIN_MSG, SYNC_SIG,
          "if (err == 0) {", "if (err != 0) {"),
-        ("the backend synchronize returns after its gate sleep", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize returns after its gate sleep", SYNC_DRAIN_MSG, SYNC_SIG,
          "ggml_sycl_cpu_job_gates_sleep(*stream);\n", "ggml_sycl_cpu_job_gates_sleep(*stream);\n        if (gate_sleep.waited != 0) {\n            return;\n        }\n"),
         # ---- the queue aliasing: one execution queue per device, answered for every idx
         ("stream() answers a private queue for idx > 0 ahead of the execution queue", "no longer answers the device's one execution queue for every idx", STREAM_SIG,

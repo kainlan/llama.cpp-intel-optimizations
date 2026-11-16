@@ -31,7 +31,7 @@ skipped op, which is wrong tokens, not a refusal. This gate pins the fix:
    fallback catch then runs the flush, its own waits, the cleanup step, the unpin and the execution release, in that
    order. The step's body is th32's and is not pinned here; its position is. The boundary cleanup may record a device
    loss (`ggml_sycl_note_exception(what);`) ahead of it: that only latches the loss and registers an exit handler,
-   with no queue wait and no flush, and nothing else may come first.
+   with no queue wait and no CPU-TG flush, and nothing else may come first.
 
 The runtime counterpart is the lead-run device test `test-sycl-seg-refusal-cleanup`. Plain file I/O, comment-stripped
 text.
@@ -438,7 +438,8 @@ def boundary_starts_with_the_cancel_step(body: str) -> bool:
 
 def test_the_boundary_cleanup_runs_the_cancel_step_first():
     body = function_body(code(), BOUNDARY)
-    assert boundary_starts_with_the_cancel_step(body), "the boundary cleanup's first statement is not th32's cancel step"
+    assert boundary_starts_with_the_cancel_step(body), (
+        "the boundary cleanup's first statement is not th32's cancel step")
     assert len(CANCEL_CALL.findall(body)) == 1, "the boundary cleanup runs the cancel step more than once"
 
 
