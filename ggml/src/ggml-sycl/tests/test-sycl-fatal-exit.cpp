@@ -45,9 +45,9 @@ constexpr int k_child_slice_ms = 10;
 
 // How long a device mode's parent holds the next process off the card after its child ran. A child that ends through
 // the fast exit can leave copy-engine work on the card: a process that started on the same card about a second later
-// was seen to hang on its first copy for 30 s, until the kernel reset the whole GT (B50, driver 26.44). Runs spaced
-// about 11 s apart left only lines scoped to the dead context. So the parent waits this long before it returns, and
-// the next test cannot start on the card sooner.
+// was seen to hang on its first copy, and the kernel reset the whole GT about 35 s later (B50, driver 26.44). Runs
+// spaced about 11 s apart left only lines scoped to the dead context. So the parent waits this long before it
+// returns, and the next test cannot start on the card sooner.
 constexpr std::chrono::seconds k_device_settle{ 12 };
 
 void atexit_marker() {

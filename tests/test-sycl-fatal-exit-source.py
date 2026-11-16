@@ -194,7 +194,9 @@ def unsettled_device_branches(test_cpp: str) -> list:
     """Why a device branch of parent_main can return after its child ran without holding the card for the next one.
 
     The settle call must be a statement of the branch itself, after the skip check and before every return that
-    follows it, so no path out of the branch passes it by. The skip path, where no device process ran, must not wait.
+    follows it, so no path out of the branch passes it by. A statement of its own means nothing but whitespace stands
+    between it and the `;`, `{` or `}` before it, so a braceless `if (...) settle_after_device_child();` does not count.
+    The skip path, where no device process ran, must not wait.
     """
     parent = test_cpp.find("int parent_main(")
     if parent < 0:
@@ -221,7 +223,11 @@ def unsettled_device_branches(test_cpp: str) -> list:
         for i, ch in enumerate(rest):
             depth += {"{": 1, "}": -1}.get(ch, 0)
             if depth == 0 and settled_at < 0 and rest.startswith(SETTLE, i):
-                settled_at = i
+                before = rest[:i]
+                if before[max(before.rfind(c) for c in ";{}") + 1:].strip():
+                    problems.append(f"{head!r}: {SETTLE} is not a statement of its own")
+                else:
+                    settled_at = i
         returns = [m.start() for m in re.finditer(r"\breturn\b", rest)]
         if not returns or settled_at < 0 or any(pos < settled_at for pos in returns):
             problems.append(f"{head!r}: a return after the child ran comes before the branch's own {SETTLE}")
@@ -230,6 +236,32 @@ def unsettled_device_branches(test_cpp: str) -> list:
 
 def test_a_device_branch_settles_the_card_before_every_return_after_its_child_ran():
     problems = unsettled_device_branches(code_of(SYCL / "tests/test-sycl-fatal-exit.cpp"))
+    assert not problems, "\n".join(problems)
+
+
+SETTLE_WAIT = "std::this_thread::sleep_for(k_device_settle)"
+SETTLE_SPACING = re.compile(r"constexpr\s+std::chrono::seconds\s+k_device_settle\s*\{\s*(\d+)\s*\}\s*;")
+
+
+def settle_wait_problems(test_cpp: str) -> list:
+    """Why the settle call does not hold the next process off the card for long enough."""
+    problems = []
+    at = test_cpp.find("void settle_after_device_child()")
+    if at < 0:
+        problems.append("test-sycl-fatal-exit.cpp: settle_after_device_child is missing")
+    elif SETTLE_WAIT not in braced_block(test_cpp, at):
+        problems.append(f"settle_after_device_child must wait: {SETTLE_WAIT} is missing from its body")
+    spacing = SETTLE_SPACING.findall(test_cpp)
+    if len(spacing) != 1:
+        problems.append("test-sycl-fatal-exit.cpp: k_device_settle must be one constexpr std::chrono::seconds")
+    elif int(spacing[0]) < 10:
+        problems.append(f"k_device_settle is {spacing[0]} s: 12 s is the measured spacing, and runs one second apart "
+                        "reset the card")
+    return problems
+
+
+def test_the_settle_call_waits_for_the_measured_spacing():
+    problems = settle_wait_problems(code_of(SYCL / "tests/test-sycl-fatal-exit.cpp"))
     assert not problems, "\n".join(problems)
 
 

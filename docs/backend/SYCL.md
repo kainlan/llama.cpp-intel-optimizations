@@ -1126,8 +1126,9 @@ When the backend records a lost device, it prints `[SYCL-FATAL] device lost: ...
 with status 69 at its next failed SYCL check, or when it exits. A site that cannot continue after a loss ends the
 process at once, with its own `[SYCL-FATAL] <function>:` line and the same status.
 
-No teardown runs on the way out, apart from exit handlers registered after the loss. On a lost card the driver's
-teardown can hang, and the process would then hold its memory and the card until it was killed.
+No teardown runs on the way out. Only when the process leaves through a normal exit do exit handlers registered after
+the loss still run first. On a lost card the driver's teardown can hang, and the process would then hold its memory
+and the card until it was killed.
 
 This has consequences for a normal exit after the loss:
 
@@ -1143,9 +1144,9 @@ This has consequences for a normal exit after the loss:
 Read status 69 as "the device was lost". It means that even when the run's output was complete.
 
 After such an exit, wait a few seconds before starting another process on the same card. A process started about one
-second after a fast exit on a healthy card has been seen to hang on its first copy for about 35 seconds, until the
-kernel reset the card. The same exit is taken, with status 1, when an operation fails for another reason than a lost
-device.
+second after a fast exit on a healthy card has been seen to hang on its first copy, and the kernel reset the card
+about 35 seconds later. This applies to an exit with status 1 as well: the backend leaves the same way when an
+operation fails for a reason other than a lost device.
 
 ## Runtime Allocation Policy
 
