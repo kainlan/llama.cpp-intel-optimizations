@@ -34629,14 +34629,16 @@ static ggml_sycl_device_info ggml_sycl_init() {
         // collapsed to one visible compute device by default (a split ratio or
         // tensor split keeps every device visible, so the text follows the same
         // condition as the collapse above), but the planner still sees every
-        // card: it splits a model without experts over both, each card on its
-        // own single-device queue, and stages cross-device data explicitly.
+        // card: it splits a model without experts across every visible GPU
+        // that has a cache and queue for it (ggml_sycl_plan_device_budgets),
+        // however many are visible, each card on its own single-device queue,
+        // and stages cross-device data explicitly.
         // Only the cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1).
         if (info.total_gpu_count > 1) {
             GGML_LOG_WARN(
                 "[SYCL] WARNING: %d GPUs visible. Multi-GPU Level Zero contexts "
                 "trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). "
-                "%s; the planner splits a model without experts over both cards; "
+                "%s; the planner splits a model without experts across these GPUs; "
                 "the cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1).\n",
                 info.total_gpu_count,
                 (split_ratio || tensor_split) ? "The scheduler sees every device (a device split was requested)" :
