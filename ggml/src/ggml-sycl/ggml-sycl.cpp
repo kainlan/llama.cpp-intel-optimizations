@@ -20293,6 +20293,49 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
     return false;
 }
 
+#if GGML_SYCL_DNNL
+// The advice of the Graph scratch refusal. The refusal happens because this shape's scratch outgrows the room the load
+// planned, so the advice names the load argument in which this shape exceeds the shape the load published (the
+// micro-batch, the context, or both) and the largest -ub that fits as loaded. An automatic micro-batch plans the room
+// at its planning micro-batch, so a trial rung above it is told to pass that -ub at load, not -c. A device with no
+// published shape names both arguments without claiming which one differs.
+static std::string ggml_sycl_onednn_graph_scratch_advice(
+    uint32_t                                              n_ubatch,
+    uint32_t                                              n_ctx,
+    uint32_t                                              largest,
+    const ggml_sycl::onednn_graph_scratch_planned_shape & planned) {
+    const bool  unknown   = planned.n_ubatch == 0 && planned.n_ctx == 0;
+    const bool  ub_above  = unknown || n_ubatch > planned.n_ubatch;
+    const bool  ctx_above = unknown || n_ctx > planned.n_ctx;
+    char        buf[160];
+    std::string advice;
+    if (unknown) {
+        advice = "the load published no Graph shape for this device";
+    } else {
+        snprintf(buf, sizeof(buf), "the load planned the zone for n_ubatch=%u n_ctx=%u", planned.n_ubatch,
+                 planned.n_ctx);
+        advice = buf;
+    }
+    if (ub_above && ctx_above) {
+        snprintf(buf, sizeof(buf), "; pass -ub %u and -c %u at load so the zone is planned for them", n_ubatch, n_ctx);
+        advice += buf;
+    } else if (ub_above) {
+        snprintf(buf, sizeof(buf), "; pass -ub %u at load so the zone is planned for it", n_ubatch);
+        advice += buf;
+    } else if (ctx_above) {
+        snprintf(buf, sizeof(buf), "; pass -c %u at load so the zone is planned for it", n_ctx);
+        advice += buf;
+    }
+    if (largest != 0) {
+        snprintf(buf, sizeof(buf), "%s run -ub %u", ub_above || ctx_above ? ", or" : ";", largest);
+        advice += buf;
+    } else {
+        advice += "; no -ub fits as loaded";
+    }
+    return advice;
+}
+#endif
+
 // The context's oneDNN Graph attention scratch against what the load planned: the ONEDNN zone holds the Graph room the
 // load sized for the context it was told; the part of this context's scratch above that room is served outside the
 // arena (the DIRECT path draws raw device memory, not a zone), and it must leave the card its driver headroom beside the
@@ -20344,18 +20387,23 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
     if (largest == n_ubatch) {
         return true;
     }
-    const double mb = 1024.0 * 1024.0;
+    const double mb             = 1024.0 * 1024.0;
+    // A cap of 0 is no cap: the demand is the unbounded formula, and the refusal says nothing of a cap.
+    char         cap_clause[64] = "";
+    if (cap != 0) {
+        snprintf(cap_clause, sizeof(cap_clause), ", bounded by the %.1f MB DIRECT cap", cap / mb);
+    }
+    const std::string advice = ggml_sycl_onednn_graph_scratch_advice(
+        n_ubatch, n_ctx, largest, ggml_sycl::unified_cache_get_planned_onednn_graph_scratch_shape(device));
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: the oneDNN Graph attention scratch at n_ubatch=%u n_ctx=%u "
-        "(%.1f MB, bounded by the %.1f MB DIRECT cap) exceeds the %.1f MB of the ONEDNN zone no other planned "
-        "consumer may take (the zone less the most the primitive-API pair may grow to), and the %.1f MB above it, "
-        "with the hold's %.1f MB "
-        "worst-case spill, would leave device %d under the %.1f MB driver headroom (%.1f MB free); %s; or tell the "
-        "load this context (-c) so it plans the zone for it\n",
-        n_ubatch, n_ctx, demand / mb, cap / mb, graph_room / mb,
+        "(%.1f MB%s) exceeds the %.1f MB of the ONEDNN zone no other planned consumer may take (the zone less the "
+        "most the primitive-API pair may grow to), and the %.1f MB above it, with the hold's %.1f MB worst-case "
+        "spill, would leave device %d under the %.1f MB driver headroom (%.1f MB free); %s\n",
+        n_ubatch, n_ctx, demand / mb, cap_clause, graph_room / mb,
         ggml_sycl::zone_onednn_graph_uncovered_bytes(demand, graph_room) / mb, hold_spill / mb, device,
-        kSyclArenaMinExternalHeadroomBytes / mb, free_outside / mb, ggml_sycl_hold_fit_advice(largest).c_str());
+        kSyclArenaMinExternalHeadroomBytes / mb, free_outside / mb, advice.c_str());
     return false;
 #else
     GGML_UNUSED(device);

@@ -12,6 +12,8 @@ The arithmetic is host-tested (test-zone-sizing, Case 24h). This file pins the w
 - the check returns early when flash attention is off, and when the Graph allocator is disabled;
 - the check runs in probe mode too (the micro-batch ladder must see the verdict a real context gets);
 - the refusal names the largest -ub the same fit accepts;
+- the refusal's advice compares the context's shape with the shape the load published, so it names the load
+  argument that differs (-ub for an automatic micro-batch's trial rung, -c for a larger context);
 - the fit is handed the context's shape in the floor function's order (n_ubatch before n_ctx) and the same cap, so
   the two cannot judge different shapes;
 - the Graph room is the ONEDNN zone's capacity less the pair bound over that same capacity, from one capacity read
@@ -71,7 +73,9 @@ FA_OFF = "!flash_attn_enabled"
 ALLOCATOR_OFF = "!ggml_sycl::onednn_graph_allocator_enabled()"
 REFUSAL_TEXT = "runtime context update rejected: the oneDNN Graph attention scratch"
 LARGEST_ASSIGN = "const uint32_t largest = ggml_sycl::zone_onednn_graph_fit_largest_ub("
-ADVICE_ARG = "ggml_sycl_hold_fit_advice(largest).c_str()"
+ADVICE_ARG = "advice.c_str()"
+ADVICE_ASSIGN = "const std::string advice = ggml_sycl_onednn_graph_scratch_advice("
+PLANNED_SHAPE_ARG = "ggml_sycl::unified_cache_get_planned_onednn_graph_scratch_shape(device)"
 DEMAND_ASSIGN = "const size_t demand = ggml_sycl::zone_onednn_graph_scratch_floor_bytes("
 ROOM_SIG = "bool unified_cache_get_onednn_graph_room(int device_id, size_t * room) {"
 ROOM_READ = "const size_t capacity = cache->zone_capacity(vram_zone_id::ONEDNN);"
@@ -160,14 +164,34 @@ def _call_text(text: str, open_paren: int) -> str:
     raise AssertionError("unbalanced call")
 
 
+def _advice_args(body: str, refusal_at: int):
+    """The arguments of the one advice assignment, which must come after the fit and before the refusal."""
+    if body.count(ADVICE_ASSIGN) != 1 or body.count(LARGEST_ASSIGN) != 1:
+        return None
+    at = body.index(ADVICE_ASSIGN)
+    if not body.index(LARGEST_ASSIGN) < at < refusal_at:
+        return None
+    return _args(_call_text(body, at + len(ADVICE_ASSIGN) - 1))
+
+
 def _refusal_names_the_largest_ub(src: str) -> bool:
-    """The refusal's last argument is the advice for the -ub the fit returned."""
+    """The refusal's last argument is the advice built for the -ub the fit returned."""
     body = _body_text(src, CHECK_SIG)
     at = body.find("GGML_SYCL_RUNTIME_TXN_REFUSAL(")
-    if at < 0 or body.count(LARGEST_ASSIGN) != 1 or body.index(LARGEST_ASSIGN) > at:
+    if at < 0:
         return False
+    advice = _advice_args(body, at)
     args = _call_text(body, body.index("(", at))
-    return REFUSAL_TEXT in args and args.endswith(f"{ADVICE_ARG})")
+    return (advice is not None and advice[:3] == ["n_ubatch", "n_ctx", "largest"] and REFUSAL_TEXT in args
+            and args.endswith(f"{ADVICE_ARG})"))
+
+
+def _advice_compares_the_published_shape(src: str) -> bool:
+    """The advice is handed the Graph shape the load published, the shape the room was planned for."""
+    body = _body_text(src, CHECK_SIG)
+    at = body.find("GGML_SYCL_RUNTIME_TXN_REFUSAL(")
+    advice = _advice_args(body, at) if at >= 0 else None
+    return advice is not None and len(advice) == 4 and advice[3] == PLANNED_SHAPE_ARG
 
 
 def _args(call: str) -> list:
@@ -221,6 +245,7 @@ def _checks(src: str, cache: str = CACHE_NORM) -> dict:
         "fa_off": _returns_early_when_fa_off(src),
         "allocator_off": _returns_early_when_allocator_off(src),
         "names_ub": _refusal_names_the_largest_ub(src),
+        "advice_shape": _advice_compares_the_published_shape(src),
         "arg_order": _fit_takes_the_floor_shape_order(src),
         "room": _room_is_capacity_less_the_bound(src, cache),
         "admit_without_room": _admits_without_a_room(src),
@@ -248,7 +273,13 @@ def test_the_check_returns_early_without_flash_attention_or_the_graph_allocator(
 
 def test_the_refusal_names_the_largest_ub_that_fits():
     assert _refusal_names_the_largest_ub(SYCL_NORM), (
-        f"the refusal must end with {ADVICE_ARG}, the -ub zone_onednn_graph_fit_largest_ub() accepts"
+        f"the refusal must end with {ADVICE_ARG}, built for the -ub zone_onednn_graph_fit_largest_ub() accepts"
+    )
+
+
+def test_the_advice_compares_the_shape_the_load_published():
+    assert _advice_compares_the_published_shape(SYCL_NORM), (
+        f"the refusal's advice must be handed {PLANNED_SHAPE_ARG}, so it names the load argument that differs"
     )
 
 
@@ -317,12 +348,16 @@ def test_every_check_has_a_mutation_witness_that_fails_only_it():
     _assert_only(_mutate_in(src, CHECK_SIG, f"if ({FA_OFF} || {ALLOCATOR_OFF})", f"if ({FA_OFF})"), "allocator_off",
                  "a disabled Graph allocator judged by the Graph check")
 
-    _assert_only(_mutate_in(src, CHECK_SIG, ADVICE_ARG, "ggml_sycl_hold_fit_advice(0).c_str()"), "names_ub",
+    _assert_only(_mutate_in(src, CHECK_SIG, "n_ubatch, n_ctx, largest, " + PLANNED_SHAPE_ARG,
+                            "n_ubatch, n_ctx, 0, " + PLANNED_SHAPE_ARG), "names_ub",
                  "the refusal names no -ub")
 
     _assert_only(_mutate_in(src, CHECK_SIG, "plan.planner_n_swa, n_ubatch, n_ctx, cap, graph_room",
                             "plan.planner_n_swa, n_ctx, n_ubatch, cap, graph_room"), "arg_order",
                  "the fit handed n_ctx and n_ubatch swapped")
+
+    _assert_only(_mutate_in(src, CHECK_SIG, PLANNED_SHAPE_ARG, "ggml_sycl::onednn_graph_scratch_planned_shape{}"),
+                 "advice_shape", "the advice judged against no planned shape")
 
     _assert_only(src, "room", "the room is the whole capacity",
                  cache=_mutate_in(CACHE_NORM, ROOM_SIG, ROOM_STORE, "*room = capacity;"))

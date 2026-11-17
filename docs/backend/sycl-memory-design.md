@@ -2680,18 +2680,29 @@ covers that path) and when the Graph allocator is disabled
 layout copies have already yielded by then, as for the non-FA refusal. It has
 no side effect beyond the free-memory reading the non-FA check also takes, so
 an auto-ubatch probe asks it too and the ladder sees the verdict a real context
-would get. The refusal names the largest power-of-two `-ub` whose part fits:
+would get. The refusal (`ggml_sycl_onednn_graph_scratch_advice()` writes its
+last clause) names the load argument in which the refused shape exceeds the
+shape the load published, and the largest power-of-two `-ub` whose part fits
+as loaded. For a rung of the automatic micro-batch trial, the micro-batch
+differs:
 
 ```
 [SYCL-PLAN] runtime context update rejected: the oneDNN Graph attention scratch at n_ubatch=<N> n_ctx=<C>
 (<D> MB, bounded by the <K> MB DIRECT cap) exceeds the <R> MB of the ONEDNN zone no other planned consumer may
-take (the zone less the most the primitive-API pair may grow to), and the <U> MB above it, with the hold's <H> MB worst-case
-spill, would leave device <d> under the 256.0 MB driver headroom (<F> MB free); the largest -ub that fits is
-about <L>, a power of two, estimated by scaling; or tell the load this context (-c) so it plans the zone for it
+take (the zone less the most the primitive-API pair may grow to), and the <U> MB above it, with the hold's <H> MB
+worst-case spill, would leave device <d> under the 256.0 MB driver headroom (<F> MB free); the load planned the
+zone for n_ubatch=<PN> n_ctx=<PC>; pass -ub <N> at load so the zone is planned for it, or run -ub <L>
 ```
 
+The last clause names `-c <C>` when the context is the larger one, both
+`-ub <N> and -c <C>` when both are, and neither when the shape is not above
+the published one (the room is then smaller than the zone's plan for it, so
+only `run -ub <L>` is offered). A device with no published shape says so and
+names both. When no rung fits, `run -ub <L>` becomes `no -ub fits as loaded`.
+
 The printed figures add up: `<U>` is `<D>` less `<R>`, and `<D>` is at most
-`<K>` unless the 64 MiB minimum is larger or the cap is 0 (no cap).
+`<K>` unless the 64 MiB minimum is larger. With the cap 0 (no cap) the
+`, bounded by ... DIRECT cap` clause is left out and `<D>` is the formula.
 
 A default command reaches this check. Without `-ub`, `common` gives the load
 no micro-batch hint while its automatic micro-batch trial is on, so the load
