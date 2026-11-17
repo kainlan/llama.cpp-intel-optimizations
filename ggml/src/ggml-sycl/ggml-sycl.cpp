@@ -16057,7 +16057,8 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
         }
         return false;
     }
-    // A caller that asked ggml_backend_sycl_measure_plan_staged first never reaches this refusal; the loader does.
+    // A caller that asked ggml_backend_sycl_measure_plan_staged first never reaches this refusal for want of a plan;
+    // the loader (llama_load_measure_run) asks first.
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);
     if (!snapshot) {
         GGML_LOG_ERROR("[LOAD-PLAN] measure plan override: no plan staged for load %llu at stage %s\n",
