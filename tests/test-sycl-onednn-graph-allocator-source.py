@@ -1789,13 +1789,22 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
     )
 
 
-# The oneDNN Graph scratch floor is sized for the context shape a plan carries (plan.context_n_ubatch,
-# plan.context_n_ctx), not the load's planning shape (plan.planner_n_ubatch, plan.planner_n_ctx), because the ONEDNN
-# zone cannot grow once weights are live. The non-FA attention scratch keeps the planning shape on purpose: the load
-# cannot know whether the context runs flash attention. Both plan builders set the context shape from
-# zone_plan_context_shape() before populate_host_zone_sizing() reads it (through placement_plan_size_host_side()).
-# Every check runs on comment-stripped, whitespace-normalized text, and every mutant edits one function's body only.
+# The oneDNN Graph scratch shape sizes the ONEDNN zone a plan packs weights against, and the zone cannot grow once
+# weights are live, so the shape is a planning input with one definition:
+# unified_cache_plan_onednn_graph_scratch_shape() over the load's kv_info and envelope (the heads and the window from
+# kv_info, the context shape from zone_plan_context_shape_for_envelope()). The shape is recorded only through
+# unified_cache_publish_planned_onednn_graph_scratch_shape(), which records that function's answer:
+#   (a) a single-device stage publishes it before it sizes the arena zones, from the kv_info and envelope it builds the
+#       plan from;
+#   (b) every writer of the shape goes through the publish: populate_host_zone_sizing's write and the stage's are the
+#       same function of the same inputs, and the dry run's restore is the one direct setter call;
+#   (c) both plan builders take their context fields from the same function, before the host-side sizing reads them;
+#   (d) the dry run publishes as the stage does, for a single-device plan only.
+# The non-FA attention scratch keeps the planning shape on purpose: the load cannot know whether the context runs flash
+# attention. Every check runs on comment-stripped, whitespace-normalized text, and every mutant edits one function's
+# body only.
 CACHE_CPP_NORM = normalize_ws(CACHE_CPP_CODE)
+GGML_SYCL_CPP_NORM = normalize_ws(GGML_SYCL_CPP_CODE)
 
 POPULATE_HOST_ZONE_SIZING_SIG = "static void populate_host_zone_sizing(placement_plan & plan,"
 SINGLE_DEVICE_PLAN_SIG = (
@@ -1805,16 +1814,33 @@ MULTI_DEVICE_PLAN_SIG = (
     "placement_plan compute_multi_device_plan(const std::vector<device_budget> & device_budgets, "
     "const std::vector<placement_tensor_info> & tensor_inventory,"
 )
+GRAPH_SHAPE_PLAN = "unified_cache_plan_onednn_graph_scratch_shape"
+GRAPH_SHAPE_PUBLISH = "unified_cache_publish_planned_onednn_graph_scratch_shape"
+GRAPH_SHAPE_PLAN_SIG = f"onednn_graph_scratch_planned_shape {GRAPH_SHAPE_PLAN}("
+GRAPH_SHAPE_PUBLISH_SIG = f"onednn_graph_scratch_planned_shape {GRAPH_SHAPE_PUBLISH}("
 GRAPH_SHAPE_SETTER = "unified_cache_set_planned_onednn_graph_scratch_shape"
+GRAPH_SHAPE_FIELDS = ("n_head_ctx_max", "n_head_swa_max", "n_swa", "n_ubatch", "n_ctx")
 GRAPH_FLOOR_CALL = "onednn_graph_scratch_zone_floor_bytes_swa"
 GRAPH_FLOOR_INFO_TEXT = "[SYCL-PLAN] oneDNN Graph-scratch zone floor:"
 NONFA_SHAPE_SETTER = "unified_cache_set_planned_nonfa_attn_scratch_shape"
 HOST_SIDE_SIZING_CALL = "placement_plan_size_host_side("
-CONTEXT_SHAPE_ARGS = ["plan.context_n_ubatch", "plan.context_n_ctx"]
 PLANNING_SHAPE_ARGS = ["plan.planner_n_ubatch", "plan.planner_n_ctx"]
-CONTEXT_SHAPE_CALL_RE = re.compile(
-    r"const zone_context_shape (\w+) = zone_plan_context_shape\( ?kv_info\.n_ctx_is_runtime, plan\.planner_n_ctx, "
-    r"kv_info\.n_ctx_context, plan\.planner_n_ubatch, kv_info\.n_ubatch_context ?\);"
+CONTEXT_SHAPE_FOR_ENVELOPE_CALL = (
+    "zone_plan_context_shape_for_envelope(kv_info.n_ctx_is_runtime, kv_info.n_ctx, kv_info.n_ctx_context, "
+    "envelope ? envelope->n_ubatch : 0, kv_info.n_ubatch, kv_info.n_ubatch_context)"
+)
+CONTEXT_SHAPE_FOR_ENVELOPE_RE = re.compile(
+    r"const zone_context_shape (\w+) = zone_plan_context_shape_for_envelope\( ?kv_info\.n_ctx_is_runtime, "
+    r"kv_info\.n_ctx, kv_info\.n_ctx_context, envelope \? envelope->n_ubatch : 0, kv_info\.n_ubatch, "
+    r"kv_info\.n_ubatch_context ?\);"
+)
+STAGE_PLAN_SIG = "static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx,"
+STAGE_SINGLE_DEVICE_GUARD = "if (!ggml_sycl_plan_multi_device())"
+STAGE_ENSURE_CALL = "unified_cache_ensure_planned_arena_zones(ctx->device)"
+DRY_RUN_PLANS_SIG = "static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans("
+DRY_RUN_RESTORE_SIG = "~ggml_sycl_plan_dry_run_saved_state()"
+BUILDER_SHAPE_RE = re.compile(
+    rf"const onednn_graph_scratch_planned_shape (\w+) = {GRAPH_SHAPE_PLAN}\( ?kv_info, envelope ?\);"
 )
 
 
@@ -1831,12 +1857,33 @@ def _body_of(src: str, anchor: str) -> str:
     return src[start:end]
 
 
+def _has_function(src: str, anchor: str) -> bool:
+    return src.count(anchor) == 1
+
+
 def _mutate_in_function(src: str, anchor: str, old: str, new: str) -> str:
-    """Replace `old`, which must occur exactly once in the body of the function `anchor` names, inside that body only."""
+    """Replace `old`, which must occur exactly once in the body of the function `anchor` names, in that body only."""
     start, end = _function_body_span(src, anchor)
     body = src[start:end]
     assert body.count(old) == 1, f"mutation anchor must occur once in {anchor!r}, found {body.count(old)}: {old!r}"
     return src[:start] + body.replace(old, new, 1) + src[end:]
+
+
+def _move_in_function(src: str, anchor: str, block: str, after: str) -> str:
+    """Move `block` (once in the body) to just after the first statement that starts with `after` (an if statement or
+    a call statement: the move goes past its brace-balanced body, or its `;`)."""
+    start, end = _function_body_span(src, anchor)
+    body = src[start:end]
+    assert body.count(block) == 1, f"block must occur once in {anchor!r}: {block!r}"
+    body = body.replace(block, "", 1)
+    at = body.index(after)
+    if after.startswith("if "):
+        brace = body.index("{", at)
+        stmt_end = brace + len(extract_function_body(body[brace:], "{"))
+    else:
+        stmt_end = body.index(";", at) + 1
+    body = body[:stmt_end] + " " + block + body[stmt_end:]
+    return src[:start] + body + src[end:]
 
 
 def _call_argument_lists(body: str, callee: str) -> list:
@@ -1860,41 +1907,148 @@ def _call_argument_lists(body: str, callee: str) -> list:
     return calls
 
 
-def _graph_setter_reads_context_shape(src: str) -> bool:
-    calls = _call_argument_lists(_body_of(src, POPULATE_HOST_ZONE_SIZING_SIG), GRAPH_SHAPE_SETTER)
-    return len(calls) == 1 and calls[0][-2:] == CONTEXT_SHAPE_ARGS
+def _shape_var_args(var: str) -> list:
+    return [f"{var}.{field}" for field in GRAPH_SHAPE_FIELDS]
 
 
-def _graph_floor_reads_context_shape(src: str) -> bool:
-    calls = _call_argument_lists(_body_of(src, POPULATE_HOST_ZONE_SIZING_SIG), GRAPH_FLOOR_CALL)
-    return len(calls) == 1 and calls[0][-2:] == CONTEXT_SHAPE_ARGS
+def _plan_helper_is_the_definition(cache: str) -> bool:
+    """The helper takes the heads and the window from kv_info and the context shape from
+    zone_plan_context_shape_for_envelope() over kv_info and the envelope's micro-batch."""
+    if not _has_function(cache, GRAPH_SHAPE_PLAN_SIG):
+        return False
+    body = _body_of(cache, GRAPH_SHAPE_PLAN_SIG)
+    m = CONTEXT_SHAPE_FOR_ENVELOPE_RE.search(body)
+    if not m:
+        return False
+    ctx = m.group(1)
+    wanted = {
+        "n_head_ctx_max": "kv_info.n_head_ctx_max",
+        "n_head_swa_max": "kv_info.n_head_swa_max",
+        "n_swa": "kv_info.n_swa",
+        "n_ubatch": f"{ctx}.n_ubatch",
+        "n_ctx": f"{ctx}.n_ctx",
+    }
+    for field, value in wanted.items():
+        assigned = re.findall(rf"\bshape\.{field} = ([^;]+);", body)
+        if assigned != [value]:
+            return False
+    return re.search(r"return shape;", body) is not None
 
 
-def _graph_floor_info_prints_context_shape(src: str) -> bool:
-    calls = [
-        args
-        for args in _call_argument_lists(_body_of(src, POPULATE_HOST_ZONE_SIZING_SIG), "GGML_LOG_INFO")
-        if args and GRAPH_FLOOR_INFO_TEXT in args[0]
-    ]
-    return len(calls) == 1 and calls[0][-2:] == CONTEXT_SHAPE_ARGS
-
-
-def _nonfa_setter_reads_planning_shape(src: str) -> bool:
-    calls = _call_argument_lists(_body_of(src, POPULATE_HOST_ZONE_SIZING_SIG), NONFA_SHAPE_SETTER)
-    return len(calls) == 1 and calls[0][-2:] == PLANNING_SHAPE_ARGS
-
-
-def _builder_sets_context_shape(src: str, builder_sig: str) -> bool:
-    """The builder assigns both context fields from zone_plan_context_shape(), before its host-side sizing (which
-    runs populate_host_zone_sizing) reads them."""
-    body = _body_of(src, builder_sig)
-    m = CONTEXT_SHAPE_CALL_RE.search(body)
+def _publish_records_the_definition(cache: str) -> bool:
+    """The publish records the helper's answer for the device it is given, field for field, and returns it."""
+    if not _has_function(cache, GRAPH_SHAPE_PUBLISH_SIG):
+        return False
+    body = _body_of(cache, GRAPH_SHAPE_PUBLISH_SIG)
+    m = re.search(rf"const onednn_graph_scratch_planned_shape (\w+) = {GRAPH_SHAPE_PLAN}\(kv_info, envelope\);", body)
     if not m:
         return False
     var = m.group(1)
+    calls = _call_argument_lists(body, GRAPH_SHAPE_SETTER)
+    return calls == [["device_id"] + _shape_var_args(var)] and f"return {var};" in body
+
+
+def _setter_calls_outside(src: str, allowed_sigs: tuple) -> int:
+    """Calls of the setter in `src` (its definition excluded) that lie outside every function in `allowed_sigs`."""
+    spans = [_function_body_span(src, sig) for sig in allowed_sigs if _has_function(src, sig)]
+    outside = 0
+    for m in re.finditer(re.escape(GRAPH_SHAPE_SETTER) + r"\(", src):
+        if src[max(0, m.start() - 5) : m.start()] == "void ":
+            continue  # the definition
+        if not any(start <= m.start() < end for start, end in spans):
+            outside += 1
+    return outside
+
+
+def _every_writer_goes_through_the_publish(cache: str, sycl: str) -> bool:
+    """The setter is called only by the publish and by the dry run's restore of the value it read; the plan's write
+    (populate_host_zone_sizing) is one publish call over the kv_info and envelope the plan was built from."""
+    if _setter_calls_outside(cache, (GRAPH_SHAPE_PUBLISH_SIG,)) != 0:
+        return False
+    if _setter_calls_outside(sycl, (DRY_RUN_RESTORE_SIG,)) != 0:
+        return False
+    if not _has_function(sycl, DRY_RUN_RESTORE_SIG):
+        return False
+    restore = _call_argument_lists(_body_of(sycl, DRY_RUN_RESTORE_SIG), GRAPH_SHAPE_SETTER)
+    if restore != [["d"] + _shape_var_args("s.graph")]:
+        return False
+    populate = _call_argument_lists(_body_of(cache, POPULATE_HOST_ZONE_SIZING_SIG), GRAPH_SHAPE_PUBLISH)
+    return populate == [["plan.device_id", "kv_info", "envelope"]]
+
+
+def _populate_shape_var(cache: str):
+    m = re.search(r"const onednn_graph_scratch_planned_shape (\w+) = ", _body_of(cache, POPULATE_HOST_ZONE_SIZING_SIG))
+    return m.group(1) if m else None
+
+
+def _graph_floor_reads_the_published_shape(cache: str) -> bool:
+    var = _populate_shape_var(cache)
+    calls = _call_argument_lists(_body_of(cache, POPULATE_HOST_ZONE_SIZING_SIG), GRAPH_FLOOR_CALL)
+    return var is not None and len(calls) == 1 and calls[0] == _shape_var_args(var)
+
+
+def _graph_floor_info_prints_the_published_shape(cache: str) -> bool:
+    var = _populate_shape_var(cache)
+    calls = [
+        args
+        for args in _call_argument_lists(_body_of(cache, POPULATE_HOST_ZONE_SIZING_SIG), "GGML_LOG_INFO")
+        if args and GRAPH_FLOOR_INFO_TEXT in args[0]
+    ]
+    return var is not None and len(calls) == 1 and calls[0][-5:] == _shape_var_args(var)
+
+
+def _nonfa_setter_reads_planning_shape(cache: str) -> bool:
+    calls = _call_argument_lists(_body_of(cache, POPULATE_HOST_ZONE_SIZING_SIG), NONFA_SHAPE_SETTER)
+    return len(calls) == 1 and calls[0][-2:] == PLANNING_SHAPE_ARGS
+
+
+def _stage_publishes_before_it_sizes_the_zones(sycl: str) -> bool:
+    """On the stage's single-device path the shape is published for ctx->device, from the kv_info and envelope the
+    single-device plan is built from, before the stage's first zone sizing."""
+    body = _body_of(sycl, STAGE_PLAN_SIG)
+    publishes = _call_argument_lists(body, GRAPH_SHAPE_PUBLISH)
+    if publishes != [["ctx->device", "g_placement_kv_info", "envelope_arg"]]:
+        return False
+    if body.count(STAGE_SINGLE_DEVICE_GUARD) != 1:
+        return False
+    guard_at = body.index(STAGE_SINGLE_DEVICE_GUARD)
+    guarded = extract_function_body(body[guard_at:], STAGE_SINGLE_DEVICE_GUARD)
+    if GRAPH_SHAPE_PUBLISH not in guarded:
+        return False
+    publish_at = body.index(GRAPH_SHAPE_PUBLISH)
+    ensure_at = body.find(STAGE_ENSURE_CALL)
+    if not 0 <= publish_at < ensure_at:
+        return False
+    plans = _call_argument_lists(body, "ggml_sycl::compute_placement_plan")
+    return len(plans) == 1 and plans[0][3:5] == ["g_placement_kv_info", "envelope_arg"]
+
+
+def _dry_run_publishes_for_a_single_device_plan(sycl: str) -> bool:
+    """The dry run publishes for device i from the kv and envelope its single-device plan is built from, inside the
+    single-device branch (after the multi-device plan's call), before that plan."""
+    body = _body_of(sycl, DRY_RUN_PLANS_SIG)
+    if _call_argument_lists(body, GRAPH_SHAPE_PUBLISH) != [["i", "kv", "opts.envelope"]]:
+        return False
+    publish_at = body.index(GRAPH_SHAPE_PUBLISH)
+    multi_at = body.find("ggml_sycl::compute_multi_device_plan(")
+    single_at = body.find("ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope,")
+    return 0 <= multi_at < publish_at < single_at
+
+
+def _builder_sets_context_shape(cache: str, builder_sig: str) -> bool:
+    """The builder assigns both context fields, once each, from the Graph scratch shape function over its kv_info and
+    envelope, before its host-side sizing (which runs populate_host_zone_sizing) reads them, and computes no context
+    shape of its own."""
+    body = _body_of(cache, builder_sig)
+    m = BUILDER_SHAPE_RE.search(body)
+    if not m or "zone_plan_context_shape" in body:
+        return False
+    var = m.group(1)
     assigned_at = []
-    for stmt in (f"plan.context_n_ctx = {var}.n_ctx;", f"plan.context_n_ubatch = {var}.n_ubatch;"):
-        at = body.find(stmt, m.end())
+    for field in ("n_ctx", "n_ubatch"):
+        if len(re.findall(rf"\bplan\.context_{field} =", body)) != 1:
+            return False
+        at = body.find(f"plan.context_{field} = {var}.{field};", m.end())
         if at < 0:
             return False
         assigned_at.append(at)
@@ -1902,20 +2056,46 @@ def _builder_sets_context_shape(src: str, builder_sig: str) -> bool:
     return sizing_at > max(assigned_at)
 
 
-def test_graph_scratch_shape_setter_reads_the_context_shape() -> None:
-    assert _graph_setter_reads_context_shape(CACHE_CPP_NORM), (
-        f"populate_host_zone_sizing must call {GRAPH_SHAPE_SETTER}() once, with plan.context_n_ubatch and "
-        "plan.context_n_ctx: the ONEDNN zone is sized for the context, and it cannot grow once weights are live"
+def _graph_shape_checks(cache: str, sycl: str) -> dict:
+    return {
+        "helper": _plan_helper_is_the_definition(cache),
+        "publish": _publish_records_the_definition(cache),
+        "writers": _every_writer_goes_through_the_publish(cache, sycl),
+        "floor": _graph_floor_reads_the_published_shape(cache),
+        "info": _graph_floor_info_prints_the_published_shape(cache),
+        "nonfa": _nonfa_setter_reads_planning_shape(cache),
+        "stage": _stage_publishes_before_it_sizes_the_zones(sycl),
+        "dry_run": _dry_run_publishes_for_a_single_device_plan(sycl),
+        "single": _builder_sets_context_shape(cache, SINGLE_DEVICE_PLAN_SIG),
+        "multi": _builder_sets_context_shape(cache, MULTI_DEVICE_PLAN_SIG),
+    }
+
+
+def test_graph_scratch_shape_has_one_definition() -> None:
+    assert _plan_helper_is_the_definition(CACHE_CPP_NORM), (
+        f"{GRAPH_SHAPE_PLAN}() must take the heads and the window from kv_info and the context shape from "
+        f"{CONTEXT_SHAPE_FOR_ENVELOPE_CALL}: the planner's own micro-batch, the envelope's when it names one"
+    )
+    assert _publish_records_the_definition(CACHE_CPP_NORM), (
+        f"{GRAPH_SHAPE_PUBLISH}() must record {GRAPH_SHAPE_PLAN}(kv_info, envelope) for device_id, field for field"
     )
 
 
-def test_graph_scratch_floor_and_info_read_the_context_shape() -> None:
-    assert _graph_floor_reads_context_shape(CACHE_CPP_NORM), (
-        f"populate_host_zone_sizing's {GRAPH_FLOOR_CALL}() must read plan.context_n_ubatch and plan.context_n_ctx"
+def test_every_graph_scratch_shape_writer_goes_through_the_publish() -> None:
+    assert _every_writer_goes_through_the_publish(CACHE_CPP_NORM, GGML_SYCL_CPP_NORM), (
+        f"{GRAPH_SHAPE_SETTER}() may be called only by {GRAPH_SHAPE_PUBLISH}() and by the dry run's restore of the "
+        f"value it read, and populate_host_zone_sizing must write through {GRAPH_SHAPE_PUBLISH}(plan.device_id, "
+        "kv_info, envelope): any other writer can record a shape the zone was not sized for"
     )
-    assert _graph_floor_info_prints_context_shape(CACHE_CPP_NORM), (
-        "the Graph-scratch zone floor INFO line must print plan.context_n_ubatch and plan.context_n_ctx, the shape "
-        "the floor was sized for"
+
+
+def test_graph_scratch_floor_and_info_read_the_published_shape() -> None:
+    assert _graph_floor_reads_the_published_shape(CACHE_CPP_NORM), (
+        f"populate_host_zone_sizing's {GRAPH_FLOOR_CALL}() must read the five fields of the shape it published"
+    )
+    assert _graph_floor_info_prints_the_published_shape(CACHE_CPP_NORM), (
+        "the Graph-scratch zone floor INFO line must print the five fields of the shape populate_host_zone_sizing "
+        "published, the shape the floor was sized for"
     )
 
 
@@ -1926,88 +2106,123 @@ def test_nonfa_scratch_shape_setter_keeps_the_planning_shape() -> None:
     )
 
 
-def test_both_plan_builders_set_the_context_shape_before_host_side_sizing() -> None:
+def test_single_device_stage_publishes_the_shape_before_it_sizes_the_zones() -> None:
+    assert _stage_publishes_before_it_sizes_the_zones(GGML_SYCL_CPP_NORM), (
+        f"compute_and_store_plan_for_inventory must call {GRAPH_SHAPE_PUBLISH}(ctx->device, g_placement_kv_info, "
+        f"envelope_arg) under {STAGE_SINGLE_DEVICE_GUARD} before {STAGE_ENSURE_CALL}, with the inputs its "
+        "single-device plan takes: otherwise the plan packs against a zone sized from the previous shape"
+    )
+
+
+def test_dry_run_publishes_the_shape_for_a_single_device_plan() -> None:
+    assert _dry_run_publishes_for_a_single_device_plan(GGML_SYCL_CPP_NORM), (
+        f"ggml_sycl_plan_dry_run_plans must call {GRAPH_SHAPE_PUBLISH}(i, kv, opts.envelope) in its single-device "
+        "branch before that branch's plan, as the stage does"
+    )
+
+
+def test_both_plan_builders_take_the_context_shape_from_the_graph_shape() -> None:
     for sig in (SINGLE_DEVICE_PLAN_SIG, MULTI_DEVICE_PLAN_SIG):
         assert _builder_sets_context_shape(CACHE_CPP_NORM, sig), (
-            f"{sig!r} must set plan.context_n_ctx and plan.context_n_ubatch from zone_plan_context_shape() before "
-            f"{HOST_SIDE_SIZING_CALL}...) runs populate_host_zone_sizing"
+            f"{sig!r} must set plan.context_n_ctx and plan.context_n_ubatch from {GRAPH_SHAPE_PLAN}(kv_info, "
+            f"envelope), and compute no context shape of its own, before {HOST_SIDE_SIZING_CALL}...) runs "
+            "populate_host_zone_sizing"
         )
 
 
-def _context_shape_checks(src: str) -> dict:
-    return {
-        "setter": _graph_setter_reads_context_shape(src),
-        "floor": _graph_floor_reads_context_shape(src),
-        "info": _graph_floor_info_prints_context_shape(src),
-        "nonfa": _nonfa_setter_reads_planning_shape(src),
-        "single": _builder_sets_context_shape(src, SINGLE_DEVICE_PLAN_SIG),
-        "multi": _builder_sets_context_shape(src, MULTI_DEVICE_PLAN_SIG),
-    }
-
-
-def _assert_only_check_fails(mutant: str, failing: str, why: str) -> None:
-    results = _context_shape_checks(mutant)
+def _assert_only_check_fails(cache: str, sycl: str, failing: str, why: str) -> None:
+    results = _graph_shape_checks(cache, sycl)
     expected = {name: name != failing for name in results}
     assert results == expected, f"mutation witness for {failing!r} ({why}) is broken: {results}"
 
 
-def test_context_shape_checks_have_bounded_mutation_witnesses() -> None:
-    src = CACHE_CPP_NORM
-    assert all(_context_shape_checks(src).values()), "sanity: every check passes on the source itself"
+def test_graph_shape_checks_have_bounded_mutation_witnesses() -> None:
+    cache, sycl = CACHE_CPP_NORM, GGML_SYCL_CPP_NORM
+    assert all(_graph_shape_checks(cache, sycl).values()), "sanity: every check passes on the source itself"
     planning = ", ".join(PLANNING_SHAPE_ARGS)
-    context = ", ".join(CONTEXT_SHAPE_ARGS)
-    graph_head = "plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, "
 
-    old = f"{GRAPH_SHAPE_SETTER}(plan.device_id, {graph_head}{context})"
-    mutant = _mutate_in_function(src, POPULATE_HOST_ZONE_SIZING_SIG, old, old.replace(context, planning))
-    _assert_only_check_fails(mutant, "setter", "the Graph shape recorded at the planning shape")
+    mutant = _mutate_in_function(cache, GRAPH_SHAPE_PLAN_SIG, "envelope ? envelope->n_ubatch : 0", "0")
+    _assert_only_check_fails(mutant, sycl, "helper", "the envelope's micro-batch dropped from the definition")
 
-    old = f"{GRAPH_FLOOR_CALL}({graph_head}{context})"
-    mutant = _mutate_in_function(src, POPULATE_HOST_ZONE_SIZING_SIG, old, old.replace(context, planning))
-    _assert_only_check_fails(mutant, "floor", "the logged floor computed at the planning shape")
+    mutant = _mutate_in_function(cache, GRAPH_SHAPE_PUBLISH_SIG, "shape.n_swa, shape.n_ubatch, shape.n_ctx",
+                                 "shape.n_swa, kv_info.n_ubatch, shape.n_ctx")
+    _assert_only_check_fails(mutant, sycl, "publish", "the publish recording the model's micro-batch by hand")
 
-    old = f"(1024.0 * 1024.0), {graph_head}{context})"
-    mutant = _mutate_in_function(src, POPULATE_HOST_ZONE_SIZING_SIG, old, old.replace(context, planning))
-    _assert_only_check_fails(mutant, "info", "the INFO line printing the planning shape")
+    var = _populate_shape_var(cache)
+    old = f"const onednn_graph_scratch_planned_shape {var} = {GRAPH_SHAPE_PUBLISH}(plan.device_id, kv_info, envelope);"
+    new = (f"const onednn_graph_scratch_planned_shape {var} = {GRAPH_SHAPE_PLAN}(kv_info, envelope); "
+           f"{GRAPH_SHAPE_SETTER}(plan.device_id, plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, "
+           "plan.planner_n_swa, plan.context_n_ubatch, plan.context_n_ctx);")
+    mutant = _mutate_in_function(cache, POPULATE_HOST_ZONE_SIZING_SIG, old, new)
+    _assert_only_check_fails(mutant, sycl, "writers", "the plan writing the shape from its own fields")
 
+    old = f"{GRAPH_FLOOR_CALL}({', '.join(_shape_var_args(var))})"
+    new = old.replace(f"{var}.n_ubatch, {var}.n_ctx", planning)
+    mutant = _mutate_in_function(cache, POPULATE_HOST_ZONE_SIZING_SIG, old, new)
+    _assert_only_check_fails(mutant, sycl, "floor", "the logged floor computed at the planning shape")
+
+    old = f"(1024.0 * 1024.0), {', '.join(_shape_var_args(var))})"
+    new = old.replace(f"{var}.n_ubatch, {var}.n_ctx", planning)
+    mutant = _mutate_in_function(cache, POPULATE_HOST_ZONE_SIZING_SIG, old, new)
+    _assert_only_check_fails(mutant, sycl, "info", "the INFO line printing the planning shape")
+
+    context = "plan.context_n_ubatch, plan.context_n_ctx"
     old = f"{NONFA_SHAPE_SETTER}(plan.device_id, plan.planner_n_head_all_max, {planning})"
-    mutant = _mutate_in_function(src, POPULATE_HOST_ZONE_SIZING_SIG, old, old.replace(planning, context))
-    _assert_only_check_fails(mutant, "nonfa", "the non-FA scratch sized at the context shape")
+    mutant = _mutate_in_function(cache, POPULATE_HOST_ZONE_SIZING_SIG, old, old.replace(planning, context))
+    _assert_only_check_fails(mutant, sycl, "nonfa", "the non-FA scratch sized at the context shape")
 
-    mutant = _mutate_in_function(src, SINGLE_DEVICE_PLAN_SIG, "plan.context_n_ubatch = context_shape.n_ubatch;",
-                                 "plan.context_n_ubatch = plan.planner_n_ubatch;")
-    _assert_only_check_fails(mutant, "single", "the single-device builder's micro-batch left at the planning shape")
+    mutant = _mutate_in_function(cache, MULTI_DEVICE_PLAN_SIG, f"{GRAPH_SHAPE_PLAN}(kv_info, envelope)",
+                                 "zone_plan_context_shape(kv_info.n_ctx_is_runtime, plan.planner_n_ctx, "
+                                 "kv_info.n_ctx_context, plan.planner_n_ubatch, kv_info.n_ubatch_context)")
+    _assert_only_check_fails(mutant, sycl, "multi", "the multi-device builder computing its own context shape")
 
-    mutant = _mutate_in_function(src, MULTI_DEVICE_PLAN_SIG, "plan.planner_n_ubatch, kv_info.n_ubatch_context);",
-                                 "plan.planner_n_ubatch, 0);")
-    _assert_only_check_fails(mutant, "multi", "the multi-device builder ignoring the caller's micro-batch")
+
+def test_stage_and_dry_run_checks_have_bounded_mutation_witnesses() -> None:
+    cache, sycl = CACHE_CPP_NORM, GGML_SYCL_CPP_NORM
+    assert all(_graph_shape_checks(cache, sycl).values()), "sanity: every check passes on the source itself"
+    body = _body_of(sycl, STAGE_PLAN_SIG)
+    guard_at = body.index(STAGE_SINGLE_DEVICE_GUARD)
+    guarded = STAGE_SINGLE_DEVICE_GUARD + " " + extract_function_body(body[guard_at:], STAGE_SINGLE_DEVICE_GUARD)
+    assert guarded in body, "sanity: the guarded publish block is found whole"
+
+    # Every statement stays; the publish runs after the stage has sized the zones from the previous shape.
+    ensure_if = "if (ggml_sycl::get_unified_cache_for_device(ctx->device)"
+    mutant = _move_in_function(sycl, STAGE_PLAN_SIG, guarded, ensure_if)
+    _assert_only_check_fails(cache, mutant, "stage", "the shape published after the zones are sized")
+
+    mutant = _mutate_in_function(sycl, STAGE_PLAN_SIG, "ctx->device, g_placement_kv_info, envelope_arg)",
+                                 "ctx->device, g_placement_kv_info, nullptr)")
+    _assert_only_check_fails(cache, mutant, "stage", "the publish ignoring the envelope the plan takes")
+
+    mutant = _mutate_in_function(sycl, STAGE_PLAN_SIG, STAGE_SINGLE_DEVICE_GUARD, "if (true)")
+    _assert_only_check_fails(cache, mutant, "stage", "the publish on the multi-device path, which writes none")
+
+    publish = f"(void) ggml_sycl::{GRAPH_SHAPE_PUBLISH}(i, kv, opts.envelope);"
+    mutant = _mutate_in_function(sycl, DRY_RUN_PLANS_SIG, publish, "")
+    _assert_only_check_fails(cache, mutant, "dry_run", "the dry run planning without the stage's publish")
+
+    mutant = _move_in_function(sycl, DRY_RUN_PLANS_SIG, publish, "const bool multi_device =")
+    _assert_only_check_fails(cache, mutant, "dry_run", "the dry run publishing for a multi-device plan too")
 
 
 def test_builder_ordering_check_has_a_bounded_mutation_witness() -> None:
     """Moving the single-device builder's context-shape block after its host-side sizing keeps every statement but
     lets populate_host_zone_sizing read the fields before they are set: only the ordering catches it."""
-    src = CACHE_CPP_NORM
-    start, end = _function_body_span(src, SINGLE_DEVICE_PLAN_SIG)
-    body = src[start:end]
-    m = CONTEXT_SHAPE_CALL_RE.search(body)
-    assert m, "sanity: the single-device builder calls zone_plan_context_shape()"
-    last_stmt = "plan.context_n_ubatch = context_shape.n_ubatch;"
-    block_end = body.index(last_stmt, m.end()) + len(last_stmt)
-    block = body[m.start() : block_end]
-    moved = body[: m.start()] + body[block_end:]
-    sizing_at = moved.index(HOST_SIDE_SIZING_CALL)
-    sizing_end = moved.index(";", sizing_at) + 1
-    moved = moved[:sizing_end] + " " + block + moved[sizing_end:]
-    mutant = src[:start] + moved + src[end:]
-    assert CONTEXT_SHAPE_CALL_RE.search(_body_of(mutant, SINGLE_DEVICE_PLAN_SIG)), "sanity: the block is still there"
-    _assert_only_check_fails(mutant, "single", "the context shape set after the host-side sizing reads it")
+    cache, sycl = CACHE_CPP_NORM, GGML_SYCL_CPP_NORM
+    body = _body_of(cache, SINGLE_DEVICE_PLAN_SIG)
+    m = BUILDER_SHAPE_RE.search(body)
+    assert m, f"sanity: the single-device builder calls {GRAPH_SHAPE_PLAN}()"
+    last_stmt = f"plan.context_n_ubatch = {m.group(1)}.n_ubatch;"
+    block = body[m.start() : body.index(last_stmt, m.end()) + len(last_stmt)]
+    mutant = _move_in_function(cache, SINGLE_DEVICE_PLAN_SIG, block, HOST_SIDE_SIZING_CALL)
+    assert BUILDER_SHAPE_RE.search(_body_of(mutant, SINGLE_DEVICE_PLAN_SIG)), "sanity: the block is still there"
+    _assert_only_check_fails(mutant, sycl, "single", "the context shape set after the host-side sizing reads it")
 
 
 # The two runtime sites that copy a load's plan and re-shape it for a context: the measure of a context
 # (ggml_sycl_measure_refit_kv) and the runtime-context transaction. Each sets the copy's context shape from the same
 # zone_plan_context_shape() after update_runtime_kv_sizes() has made planner_n_ctx the context's, so the copy never
 # keeps the load's context shape it was copied from.
-GGML_SYCL_CPP_NORM = normalize_ws(GGML_SYCL_CPP_CODE)
 MEASURE_REFIT_KV_SIG = (
     "static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_measure_refit_kv("
 )
