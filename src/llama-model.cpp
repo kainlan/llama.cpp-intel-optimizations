@@ -2952,8 +2952,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, probe_weights);
         const int64_t probe_ms = (ggml_time_us() - probe_t0) / 1000;
         if (!probe.unsupported.empty()) {
-            // not a refusal of the load: this model cannot be measured, so it goes on the unplanned path
-            LLAMA_LOG_WARN("%s: probe compute-slot measure skipped, the load continues on the unplanned path: %s\n",
+            // not a refusal of the load: the probe cannot be measured (a model the measure cannot walk, or no plan
+            // staged for the probe), so no compute term is reserved; a late plan, where one is staged, still places
+            // the weights
+            LLAMA_LOG_WARN("%s: probe compute-slot measure skipped, the compute slot is not planned at load: %s\n",
                            __func__, probe.unsupported.c_str());
         }
         if (!probe.refusal.empty()) {
@@ -3166,8 +3168,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const llama_late_check_result late = llama_load_late_check(
             *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, late_weights);
         if (!late.unsupported.empty()) {
-            // not a refusal of the load: this model cannot be measured, so it goes on the unplanned path
-            LLAMA_LOG_WARN("%s: late compute-slot check skipped, the load continues on the unplanned path: %s\n",
+            // not a refusal of the load: the late check cannot be measured (a model the measure cannot walk, or no
+            // plan staged for it), so the final placement's compute term is compared with nothing
+            LLAMA_LOG_WARN("%s: late compute-slot check skipped, the compute slot is not checked at load: %s\n",
                            __func__, late.unsupported.c_str());
         }
         for (size_t i = 0; i < late.not_recorded.size(); ++i) {
