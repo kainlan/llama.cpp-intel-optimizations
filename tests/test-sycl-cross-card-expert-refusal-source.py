@@ -10,7 +10,7 @@ wiring that test cannot reach without a device:
   * at each site the cross-card refusal is asked before the lazy-plan refusal;
   * at each site it returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED, the lazy-plan refusal's return;
   * the predicate's body is exactly "wanted and not peer path" and calls nothing else, so it queries no device;
-  * the stage helper passes the predicate the peer fact read from the peer-link records;
+  * the stage helper passes the predicate the peer fact read from the peer-link records of the plan's cards;
   * the refusal is one ERROR line that names the remedy.
 
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live
@@ -135,7 +135,9 @@ EARLY_LAZY = "if (early_candidate && ggml_sycl_stage_refuse_lazy_plan(early_cand
 EARLY_BEFORE = "lifecycle_stage_probe_placement_plan("
 
 PRED_BODY = "{ return ggml_sycl_moe_multi_gpu_wanted(plan) && !peer_path; }"
-PEER_FACT = "ggml_sycl_cross_card_expert_plan_refused(*plan, ggml_sycl_cards_have_peer_path())"
+# The helper reads the peer fact for the cards the plan uses and hands it to the predicate.
+PEER_FACT = "const bool peer_path = !plan->multi_device || ggml_sycl_cards_have_peer_path(plan->devices);"
+PEER_FACT_ASKED = "if (!ggml_sycl_cross_card_expert_plan_refused(*plan, peer_path)) {"
 REFUSAL_LINE = (
     '"[MOE-MULTI-GPU] load refused: the plan puts experts on a second card and the cards have no peer path; unset '
     'GGML_SYCL_MOE_MULTI_GPU to load with the single-card plan\\n"'
@@ -166,7 +168,7 @@ def claim_predicate_is_pure(src: str) -> bool:
 
 
 def claim_helper_passes_the_peer_fact(src: str) -> bool:
-    return PEER_FACT in fn_body(view(src), HELPER_SIG)
+    return ordered(fn_body(view(src), HELPER_SIG), PEER_FACT, PEER_FACT_ASKED)
 
 
 def claim_refusal_line_names_the_remedy(src: str) -> bool:
@@ -233,7 +235,8 @@ def test_predicate_is_pure():
 
 def test_helper_passes_the_peer_fact():
     assert claim_helper_passes_the_peer_fact(SYCL), (
-        f"the stage helper does not ask {PEER_FACT!r}, so the refusal does not read the peer-link records"
+        f"the stage helper does not read {PEER_FACT!r} and pass it to the predicate, so the refusal does not read "
+        "the peer-link records of the plan's cards"
     )
 
 
@@ -297,14 +300,14 @@ def test_witness_early_returns_another_code():
 def test_witness_predicate_queries_the_cards():
     assert_only_claim_fails(
         "predicate_is_pure",
-        mutate_in(SYCL, PRED_SIG, "&& !peer_path;", "&& !peer_path && !ggml_sycl_cards_have_peer_path();"),
+        mutate_in(SYCL, PRED_SIG, "&& !peer_path;", "&& !peer_path && !ggml_sycl_cards_have_peer_path(plan.devices);"),
     )
 
 
 def test_witness_helper_assumes_a_peer_path():
     assert_only_claim_fails(
         "helper_passes_the_peer_fact",
-        mutate_in(SYCL, HELPER_SIG, "ggml_sycl_cards_have_peer_path()", "true"),
+        mutate_in(SYCL, HELPER_SIG, "ggml_sycl_cards_have_peer_path(plan->devices)", "true"),
     )
 
 

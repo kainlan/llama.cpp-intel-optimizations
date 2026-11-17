@@ -3192,7 +3192,7 @@ static bool ggml_sycl_placement_plan_needs_moe_secondary_devices(const ggml_sycl
 static bool ggml_sycl_moe_multi_gpu_requested();
 static bool ggml_sycl_moe_multi_gpu_wanted(const ggml_sycl::placement_plan & plan);
 static bool ggml_sycl_cross_card_expert_plan_refused(const ggml_sycl::placement_plan & plan, bool peer_path);
-static bool ggml_sycl_cards_have_peer_path();
+static bool ggml_sycl_cards_have_peer_path(const std::vector<int> & devices);
 static bool ggml_sycl_placement_plan_moe_needs_other_device(const ggml_sycl::placement_plan & plan,
                                                             int                               execution_device);
 
@@ -17859,8 +17859,8 @@ bool test_cross_card_expert_plan_refused(const placement_plan & plan, bool peer_
     return ggml_sycl_cross_card_expert_plan_refused(plan, peer_path);
 }
 
-bool test_cards_have_peer_path() {
-    return ggml_sycl_cards_have_peer_path();
+bool test_cards_have_peer_path(const std::vector<int> & devices) {
+    return ggml_sycl_cards_have_peer_path(devices);
 }
 #endif
 }  // namespace ggml_sycl
@@ -18801,7 +18801,12 @@ static bool ggml_sycl_cross_card_expert_plan_refused(const ggml_sycl::placement_
 // lazy-plan refusal, whose figures describe a plan that unsetting the variable replaces. Returns false, logging
 // nothing, for any other plan.
 static bool ggml_sycl_stage_refuse_cross_card_expert_plan(const ggml_sycl::placement_plan * plan) {
-    if (plan == nullptr || !ggml_sycl_cross_card_expert_plan_refused(*plan, ggml_sycl_cards_have_peer_path())) {
+    if (plan == nullptr) {
+        return false;
+    }
+    // The cards the plan uses, as the planner's own peer check reads them; a single-device plan crosses no card.
+    const bool peer_path = !plan->multi_device || ggml_sycl_cards_have_peer_path(plan->devices);
+    if (!ggml_sycl_cross_card_expert_plan_refused(*plan, peer_path)) {
         return false;
     }
     GGML_LOG_ERROR(
@@ -64505,18 +64510,19 @@ static bool ggml_sycl_devices_have_direct_peer_path(int src_device, int dst_devi
     return link && link->same_sycl_context && (link->direct_copy_measured || link->l0_can_access_peer);
 }
 
-// Whether every pair of the host's GPUs has a direct peer path both ways, by the per-pair test above, which reads the
-// fields the planner's own peer check reads. The device init records each card in its own SYCL context (the link
+// Whether every pair of the given GPUs has a direct peer path both ways, by the per-pair test above, which reads the
+// fields the planner's own peer check reads. The stage passes the plan's devices, the set the planner checks, not every
+// GPU the process can see. An id outside the device table reads as no path (ggml_sycl_get_peer_link_info bounds it
+// against total_gpu_count and GGML_SYCL_MAX_DEVICES), and a repeated id pairs a card with itself, which needs none. The device init records each card in its own SYCL context (the link
 // defaults set same_sycl_context false for two different cards, after a failed device query too, because the
 // secondary queues use single-device contexts) and nothing sets direct_copy_measured, so no pair of cards passes, even
 // when the Level Zero peer query has run. On every multi-card host today a plan that puts experts on a second card is
 // therefore refused under the opt-in. One GPU has no pair to cross.
-static bool ggml_sycl_cards_have_peer_path() {
-    const int n_gpus = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
-    for (int src = 0; src < n_gpus; ++src) {
-        for (int dst = src + 1; dst < n_gpus; ++dst) {
-            if (!ggml_sycl_devices_have_direct_peer_path(src, dst) ||
-                !ggml_sycl_devices_have_direct_peer_path(dst, src)) {
+static bool ggml_sycl_cards_have_peer_path(const std::vector<int> & devices) {
+    for (size_t i = 0; i < devices.size(); ++i) {
+        for (size_t j = i + 1; j < devices.size(); ++j) {
+            if (!ggml_sycl_devices_have_direct_peer_path(devices[i], devices[j]) ||
+                !ggml_sycl_devices_have_direct_peer_path(devices[j], devices[i])) {
                 return false;
             }
         }

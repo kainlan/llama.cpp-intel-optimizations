@@ -266,7 +266,7 @@ void test_cards_peer_path_follows_the_link_records() {
     ggml_sycl_device_info info = make_two_gpu_info();
     {
         test_sycl_info_override_guard info_guard(info);
-        CHECK(!test_cards_have_peer_path(), "cards whose links were never recorded have no peer path");
+        CHECK(!test_cards_have_peer_path({ 0, 1 }), "cards whose links were never recorded have no peer path");
     }
     // What the device init records for two cards: valid links, each card in its own context.
     for (int src = 0; src < 2; ++src) {
@@ -281,7 +281,7 @@ void test_cards_peer_path_follows_the_link_records() {
     }
     {
         test_sycl_info_override_guard info_guard(info);
-        CHECK(!test_cards_have_peer_path(), "cards in separate contexts have no peer path");
+        CHECK(!test_cards_have_peer_path({ 0, 1 }), "cards in separate contexts have no peer path");
     }
     // Each half of the per-pair rule alone: access without a shared context, and a shared context without access.
     ggml_sycl_device_info access_only = info;
@@ -292,7 +292,7 @@ void test_cards_peer_path_follows_the_link_records() {
     }
     {
         test_sycl_info_override_guard info_guard(access_only);
-        CHECK(!test_cards_have_peer_path(), "peer access across separate contexts is no peer path");
+        CHECK(!test_cards_have_peer_path({ 0, 1 }), "peer access across separate contexts is no peer path");
     }
     ggml_sycl_device_info context_only = info;
     for (int src = 0; src < 2; ++src) {
@@ -300,7 +300,7 @@ void test_cards_peer_path_follows_the_link_records() {
     }
     {
         test_sycl_info_override_guard info_guard(context_only);
-        CHECK(!test_cards_have_peer_path(), "a shared context without peer access is no peer path");
+        CHECK(!test_cards_have_peer_path({ 0, 1 }), "a shared context without peer access is no peer path");
     }
     // Each direction alone, so a read of only one direction of the pair cannot pass.
     ggml_sycl_device_info reverse_only               = info;
@@ -308,20 +308,53 @@ void test_cards_peer_path_follows_the_link_records() {
     reverse_only.peer_links[1][0].l0_can_access_peer = true;
     {
         test_sycl_info_override_guard info_guard(reverse_only);
-        CHECK(!test_cards_have_peer_path(), "peer access from the second card only is no peer path");
+        CHECK(!test_cards_have_peer_path({ 0, 1 }), "peer access from the second card only is no peer path");
     }
     info.peer_links[0][1].same_sycl_context  = true;
     info.peer_links[0][1].l0_can_access_peer = true;
     {
         test_sycl_info_override_guard info_guard(info);
-        CHECK(!test_cards_have_peer_path(), "peer access from the first card only is no peer path");
+        CHECK(!test_cards_have_peer_path({ 0, 1 }), "peer access from the first card only is no peer path");
     }
     info.peer_links[1][0].same_sycl_context    = true;
     info.peer_links[1][0].direct_copy_measured = true;
     {
         test_sycl_info_override_guard info_guard(info);
-        CHECK(test_cards_have_peer_path(), "a shared context with peer access both ways is a peer path");
+        CHECK(test_cards_have_peer_path({ 0, 1 }), "a shared context with peer access both ways is a peer path");
     }
+}
+
+// The peer path is asked of the plan's cards, not of every card the process can see: on three cards with only the
+// first two linked, a plan over those two has a path and a plan that takes in the third has none. An id outside the
+// table reads as no path and a repeated id needs none.
+void test_cards_peer_path_follows_the_plan_devices() {
+    ggml_sycl_device_info info = make_two_gpu_info();
+    info.device_count          = 3;
+    info.total_gpu_count       = 3;
+    info.devices[2]            = info.devices[1];
+    info.gpu_dpct_ids[2]       = 2;
+    for (int src = 0; src < 3; ++src) {
+        for (int dst = 0; dst < 3; ++dst) {
+            sycl_peer_link_info & link = info.peer_links[src][dst];
+            link.valid                 = true;
+            link.src_device            = src;
+            link.dst_device            = dst;
+            link.same_device           = src == dst;
+            link.same_sycl_context     = src == dst;
+        }
+    }
+    for (int src = 0; src < 2; ++src) {
+        sycl_peer_link_info & link = info.peer_links[src][1 - src];
+        link.same_sycl_context     = true;
+        link.l0_can_access_peer    = true;
+    }
+    test_sycl_info_override_guard info_guard(info);
+    CHECK(test_cards_have_peer_path({ 0, 1 }), "the two linked cards have a peer path");
+    CHECK(!test_cards_have_peer_path({ 0, 2 }), "a linked card and an unlinked one have none");
+    CHECK(!test_cards_have_peer_path({ 0, 1, 2 }), "three cards with one pair linked have none");
+    CHECK(test_cards_have_peer_path({ 1, 1 }), "a repeated card needs no peer path");
+    CHECK(!test_cards_have_peer_path({ 0, GGML_SYCL_MAX_DEVICES }), "an id outside the table has no peer path");
+    CHECK(!test_cards_have_peer_path({ -1, 0 }), "a negative id has no peer path");
 }
 
 void test_multi_device_plan_splits_by_fact() {
@@ -457,6 +490,7 @@ int main() {
     test_cross_card_expert_path_is_opt_in();
     test_cross_card_expert_plan_without_peer_path_is_refused();
     test_cards_peer_path_follows_the_link_records();
+    test_cards_peer_path_follows_the_plan_devices();
     test_multi_device_plan_splits_by_fact();
     test_install_refits_kv_for_the_shape();
     test_probe_plan_goes_with_the_candidate();
