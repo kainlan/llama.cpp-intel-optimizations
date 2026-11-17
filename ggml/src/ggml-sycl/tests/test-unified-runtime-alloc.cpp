@@ -1875,22 +1875,24 @@ struct planned_terms_found {
 // A plan that is tried and discarded publishes nothing. The load stage's fallback and the plan dry run put back the
 // terms the planner published while it computed the plan through planner_published_terms; this case checks that
 // helper against the cache's own per-device state, and the RUNTIME requirement the zones are sized from with it.
-// A load publishes its ring at the planning shape (n_ubatch 512) and its planner terms: the requirement is R0. The
-// snapshot is taken. The plan with the room publishes the run's 92160-byte host scatter term and its own oneDNN Graph
-// and non-FA shapes, and the micro-batch's publish grows the ring to n_ubatch 2048. The fallback publishes the ring
-// at 512 again. Before the restore the requirement is R0 + 92160, what the zone was asked for when the run aborted,
-// which shows the case reaches the term. After the restore it is exactly R0, and every planner term reads what the
-// load published. A second leg moves the CONTROL requirement, the other planner term the RUNTIME requirement counts,
-// and restores it the same way.
+// A load publishes its ring at the planning shape (n_ubatch 512) and its planner terms, a 4096-byte host scatter term
+// among them: the requirement is R0. The snapshot is taken. The plan with the room raises the host scatter term by the
+// run's 92160 bytes and publishes its own oneDNN Graph and non-FA shapes, and the micro-batch's publish grows the ring
+// to n_ubatch 2048. The fallback publishes the ring at 512 again. Before the restore the requirement is R0 + 92160,
+// what the zone was asked for when the run aborted, which shows the case reaches the term. After the restore it is
+// exactly R0, and every planner term reads what the load published, the host scatter term its 4096 bytes. A second
+// leg moves the CONTROL requirement, the other planner term the RUNTIME requirement counts, and restores it the same
+// way.
 // Engagement: the ring's slots grow from 512 to 2048 rows, and the requirement moves by exactly the term moved.
 // Mutants: a term left out of the snapshot or the restore (its leg reads the discarded plan's value); a restore that
-// writes a constant (the load's nonzero shapes and CONTROL bytes do not read back).
+// writes a constant, zero included (the load's nonzero shapes, host scatter and CONTROL bytes do not read back).
 // No device work: the terms are per-device process state. The case leaves every term it writes as it found it.
 static bool planner_terms_restore_returns_the_runtime_requirement() {
     TEST_BEGIN("planner_terms_restore_returns_the_runtime_requirement");
     constexpr int       device       = 0;
     constexpr size_t    mib          = 1024ull * 1024ull;
     constexpr size_t    scatter_term = 92160;
+    constexpr size_t    load_scatter = 4096;
     planned_terms_found found(device);
 
     // The load: a ring of one 64 MiB weight slot whose activation and output slots follow the micro-batch, all of it in
@@ -1911,7 +1913,7 @@ static bool planner_terms_restore_returns_the_runtime_requirement() {
     unified_cache_set_planned_onednn_graph_scratch_shape(device, 32, 0, 0, 512, 4096);
     unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
     unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ mib, true });
-    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 0);
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, load_scatter);
     size_t r0 = 0;
     TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &r0),
                 "the load's requirement is unanswerable");
@@ -1919,7 +1921,7 @@ static bool planner_terms_restore_returns_the_runtime_requirement() {
     const planner_published_terms before = planner_published_terms::snapshot(device);
 
     // The plan with the room, and the micro-batch's publish.
-    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter_term);
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, load_scatter + scatter_term);
     unified_cache_set_planned_onednn_graph_scratch_shape(device, 32, 0, 0, 2048, 4096);
     unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 2048, 4096);
     unified_cache_set_planned_pp_moe_onednn_scratch(device, 64 * mib, act_2048, out_2048, 1);
@@ -1940,8 +1942,8 @@ static bool planner_terms_restore_returns_the_runtime_requirement() {
     size_t restored = 0;
     TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &restored) && restored == r0,
                 "after the restore the requirement is not the load's R0");
-    TEST_ASSERT(unified_cache_get_planned_moe_host_scatter_scratch_bytes(device) == 0,
-                "the restore left the discarded plan's host scatter term published");
+    TEST_ASSERT(unified_cache_get_planned_moe_host_scatter_scratch_bytes(device) == load_scatter,
+                "the restore did not put back the load's 4096-byte host scatter term");
     const onednn_graph_scratch_planned_shape graph = unified_cache_get_planned_onednn_graph_scratch_shape(device);
     TEST_ASSERT(graph.n_head_ctx_max == 32 && graph.n_head_swa_max == 0 && graph.n_swa == 0 && graph.n_ubatch == 512 &&
                     graph.n_ctx == 4096,
