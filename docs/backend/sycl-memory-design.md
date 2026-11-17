@@ -635,11 +635,19 @@ ticket reproduced on:
   that. The cap is 1 GiB until the first successful
   `ensure_planned_arena_zones()` and `min(1 GiB, a quarter of the budget
   available at the last successful ensure)` after it
-  (`GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` overrides both); the first sizing
-  at the real shape runs before weights load, when the available budget
-  is largest, so a later cap can only be equal or lower. A later floor is
-  then never larger for the same shape, and a zone kept from an earlier
-  ensure is never rebuilt because of the cap.
+  (`GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` overrides both). Within one
+  model's load the cap only falls: its first sizing at the real shape runs
+  before weights load, when the available budget is largest. Across
+  tenants of one cache it can rise: when another model on the device
+  releases memory, the next successful ensure snapshots a larger budget,
+  and the ensure after that one computes a larger cap (while a quarter of
+  the snapshot is below 1 GiB) and, for a shape whose formula exceeded the
+  old cap, a larger floor. If that floor no longer fits the kept ONEDNN
+  zone, `ensure_planned_arena_zones()` does not keep the zone and leave the
+  difference to the DIRECT path: it asks for a rebuild, which it does only
+  when nothing is live in the arena. With live allocations it logs
+  `planned zones exceed active arena but live allocations prevent rebuild`
+  and fails, and a model load that called it aborts.
   ⚠️ **This gemma4 example describes the formula's behavior for the
   `n_ctx` it is actually given at PLANNING time, which is NOT today's
   real runtime context by default.** The floor is computed once, at
