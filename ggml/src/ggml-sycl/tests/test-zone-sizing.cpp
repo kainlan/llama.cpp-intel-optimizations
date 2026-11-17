@@ -2448,22 +2448,19 @@ int main() {
         CHECK(!zone_arena_rebuild_allowed(outside_and_lease), "a lease beside outside scratch allowed a rebuild");
     }
 
-    // ---- Case 37: a plan that is tried and discarded leaves the RUNTIME requirement as it found it ---------------
-    // A second load named a micro-batch whose ring the RUNTIME zone could not grow for, so it fell back to its planning
-    // shape. The plan it tried with the room had moved experts to host and, while it was computed, published their host
-    // scatter scratch. The fallback published the ring and the dense scratch at the planning shape again but left that
-    // term, so it asked the zone for 92160 bytes more than the zone held, the zone could not grow, and the load
-    // aborted. The requirement is the sum of the terms as published, so only putting back every term the discarded
-    // plan published returns it to what the zone already holds. The figures are the run's.
+    // ---- Case 37: the RUNTIME requirement is the checked sum of its terms -----------------------------------------
+    // zone_runtime_requirement, the sum the cache's getter returns, on the figures of the run where a fallback asked
+    // for 92160 bytes more than the zone held: it adds every term, a sum that would wrap is unanswerable, and so is a
+    // call with nowhere to write. That the fallback puts the discarded plan's terms back is not checked here:
+    // test-sycl-runtime-alloc's planner-terms case checks the restore helper against the cache's own state.
     {
         constexpr size_t MiB = 1024ull * 1024ull;
         using ggml_sycl::zone_runtime_requirement;
         using ggml_sycl::zone_runtime_terms;
 
-        // Before the plan with the room, at the planning shape (n_ubatch 512), as the entry ensure proved the zone
-        // holds it: the ring's RUNTIME part (weight 134.5 MB, activation 33.6 MB, output 67.1 MB at depth 1; no PP
-        // pipeline scratch and no CONTROL pool), mmq_src1 2.3 MB, dequant_f16 1108.6 MB, compute 404 MB, state 0 and
-        // no host scatter: 1750.1 MB.
+        // The planning shape (n_ubatch 512): the ring's RUNTIME part (weight 134.5 MB, activation 33.6 MB, output
+        // 67.1 MB at depth 1; no PP pipeline scratch and no CONTROL pool), mmq_src1 2.3 MB, dequant_f16 1108.6 MB,
+        // compute 404 MB, state 0 and no host scatter: 1750.1 MB.
         zone_runtime_terms planning;
         planning.base        = 141008896 + 35232256 + 70359040;
         planning.mmq_src1    = 2411520;
@@ -2473,49 +2470,39 @@ int main() {
         CHECK(zone_runtime_requirement(planning, &before), "the planning shape's requirement is unanswerable");
         CHECK(before == 1835081216, "the planning shape's requirement is not the sum of its terms");
 
-        // The snapshot of the terms the planner publishes, taken before the plan with the room.
-        const zone_runtime_terms published_before = planning;
-
-        // The plan with the room publishes its 90 KB host scatter term, and the micro-batch's publish (n_ubatch 2048)
-        // grows the ring and the dense scratch: 1971.4 MB, which the zone cannot grow to.
-        zone_runtime_terms tried = planning;
-        tried.moe_host_scatter   = 92160;
-        tried.base               = 458960896;
-        tried.mmq_src1           = 9 * MiB;
-        tried.dequant_f16        = 1175027712;
-        size_t grown             = 0;
-        CHECK(zone_runtime_requirement(tried, &grown) && grown == 2067142656,
+        // The micro-batch (n_ubatch 2048) grows the ring and the dense scratch, with a 90 KB host scatter term:
+        // 1971.4 MB.
+        zone_runtime_terms grown_terms = planning;
+        grown_terms.moe_host_scatter   = 92160;
+        grown_terms.base               = 458960896;
+        grown_terms.mmq_src1           = 9 * MiB;
+        grown_terms.dequant_f16        = 1175027712;
+        size_t grown                   = 0;
+        CHECK(zone_runtime_requirement(grown_terms, &grown) && grown == 2067142656,
               "the micro-batch's requirement is not the sum of its terms");
 
-        // The fallback publishes the ring and the dense scratch at the planning shape again. Without the restore the
-        // discarded plan's term is still published: 1750.2 MB, the refused second attempt of the run.
-        zone_runtime_terms fallback = tried;
-        fallback.base               = planning.base;
-        fallback.mmq_src1           = planning.mmq_src1;
-        fallback.dequant_f16        = planning.dequant_f16;
-        size_t unrestored           = 0;
-        CHECK(zone_runtime_requirement(fallback, &unrestored) && unrestored == before + 92160,
-              "without the restore the fallback does not ask for exactly the discarded plan's 92160 bytes more");
-
-        // Restored from the snapshot, the requirement is the one the zone holds.
-        fallback.moe_host_scatter = published_before.moe_host_scatter;
-        size_t restored           = 0;
-        CHECK(zone_runtime_requirement(fallback, &restored) && restored == before,
-              "after the restore the fallback's requirement is not the one before the plan with the room");
+        // The planning shape with the host scatter term published: exactly that term more, 1750.2 MB, the figure the
+        // run's refused second attempt asked for.
+        zone_runtime_terms with_scatter = planning;
+        with_scatter.moe_host_scatter   = 92160;
+        size_t scattered                = 0;
+        CHECK(zone_runtime_requirement(with_scatter, &scattered) && scattered == before + 92160,
+              "the host scatter term does not add exactly its 92160 bytes to the planning shape's requirement");
 
         // Every term counts, and a sum that would wrap is unanswerable: a wrapped sum would size a smaller zone.
-        size_t * const terms[] = { &fallback.base,        &fallback.moe_host_scatter, &fallback.mmq_src1,
-                                   &fallback.dequant_f16, &fallback.compute,          &fallback.state };
+        zone_runtime_terms probe   = planning;
+        size_t * const     terms[] = { &probe.base,        &probe.moe_host_scatter, &probe.mmq_src1,
+                                       &probe.dequant_f16, &probe.compute,          &probe.state };
         for (size_t * term : terms) {
             const size_t kept = *term;
             size_t       sum  = 0;
             *term += 1;
-            CHECK(zone_runtime_requirement(fallback, &sum) && sum == before + 1, "a RUNTIME term is not counted");
+            CHECK(zone_runtime_requirement(probe, &sum) && sum == before + 1, "a RUNTIME term is not counted");
             *term = SIZE_MAX;
-            CHECK(!zone_runtime_requirement(fallback, &sum), "a RUNTIME requirement that wraps was answered");
+            CHECK(!zone_runtime_requirement(probe, &sum), "a RUNTIME requirement that wraps was answered");
             *term = kept;
         }
-        CHECK(!zone_runtime_requirement(fallback, nullptr), "a requirement with nowhere to write it was answered");
+        CHECK(!zone_runtime_requirement(probe, nullptr), "a requirement with nowhere to write it was answered");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
