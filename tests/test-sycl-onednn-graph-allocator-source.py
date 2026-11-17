@@ -460,7 +460,7 @@ POOL_SIZE_READY_BODY_CODE = extract_function_body(
 # the paren would need updating again on the next parameter-list edit, and
 # the open paren alone is still a unique match: the anchor's trailing "(" is
 # what keeps it from also matching onednn_graph_scratch_zone_floor_bytes_swa(
-# below (llama.cpp-o3a0) -- that name is longer, so the literal substring
+# -- that name is longer, so the literal substring
 # "...zone_floor_bytes(" never occurs inside it.
 #
 # llama.cpp-o3a0: this is now a THIN WRAPPER delegating into the window-aware
@@ -469,9 +469,6 @@ POOL_SIZE_READY_BODY_CODE = extract_function_body(
 # PURE_FLOOR_BODY_CODE (the formula's one home, zone-sizing.cpp), not this
 # one; checks about the DELEGATION itself belong here.
 FLOOR_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_graph_scratch_zone_floor_bytes(")
-# llama.cpp-o3a0: the window-aware formula's own body -- see the comment
-# above FLOOR_BODY_CODE for why the two anchors cannot collide.
-FLOOR_SWA_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_graph_scratch_zone_floor_bytes_swa(")
 # The formula's own body: the cache's floor function keeps the env override and hands the rest to this pure function.
 PURE_FLOOR_BODY_CODE = extract_function_body(
     strip_comments(ZONE_SIZING_CPP), "size_t zone_onednn_graph_scratch_floor_bytes("
@@ -977,7 +974,7 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # would pass silently) -- not a bare "64" substring search, which would
     # match line numbers, byte counts, or anything else in the file.
     # llama.cpp-0oxf replaced the old `mb = 64` lambda-local variable with a
-    # `kFloorMinBytes` constexpr once the floor became a formula
+    # `k_floor_min_bytes` constexpr once the floor became a formula
     # (max(64 MiB, 1.5 x n_head x n_ubatch x n_ctx x 4 B)) rather than a bare
     # env-overridable constant -- anchor on that constant's own definition,
     # not a value that could coincidentally appear elsewhere in the formula
