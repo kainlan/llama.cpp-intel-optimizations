@@ -7466,6 +7466,25 @@ void unified_cache_entry::record_lease_event(bool acquire, const char * site) {
     debug_lease_ring_next    = (debug_lease_ring_next + 1) % kDebugLeaseRingSize;
 }
 
+// The cause of a refused arena teardown as the ensure's ERROR line names it.
+static const char * arena_teardown_cause_name(zone_arena_teardown_refusal cause) {
+    switch (cause) {
+        case zone_arena_teardown_refusal::HOST_STATE:
+            return "the host could not reserve its bookkeeping";
+        case zone_arena_teardown_refusal::LIVE_ALLOCATIONS:
+            return "allocations were live in it";
+        case zone_arena_teardown_refusal::DRAIN_SNAPSHOT:
+            return "the host could not record the allocations it waits on";
+        case zone_arena_teardown_refusal::DRAIN_TIMEOUT:
+            return "a lease on an allocation did not end in time";
+        case zone_arena_teardown_refusal::FREE_FAILED:
+            return "the device refused to free a chunk";
+        case zone_arena_teardown_refusal::NONE:
+            break;
+    }
+    return "no cause recorded";
+}
+
 bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
     if (!vram_arena_enabled()) {
         return true;
@@ -7699,10 +7718,37 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
         }
     };
 
+    // A refused teardown names its cause in the refusal and on its own ERROR line, with what it left: an arena closed to
+    // new allocations, over which nothing may be reserved, or the arena as it was.
+    const auto refuse_teardown = [&](zone_arena_teardown_refusal cause, const zone_arena_sizes & have) {
+        const bool closed = zone_arena_teardown_left_closed(cause);
+        GGML_LOG_ERROR(
+            "[VRAM-ARENA] the arena on device %d could not be torn down (%s); %s: need scratch=%.1f MB oneDNN=%.1f MB "
+            "runtime=%.1f MB\n",
+            dev_id, arena_teardown_cause_name(cause),
+            closed ? "it stays closed to new allocations and no arena is reserved over it" : "it is as it was",
+            scratch_zone / (1024.0 * 1024.0), onednn_zone / (1024.0 * 1024.0), runtime_zone / (1024.0 * 1024.0));
+        if (refusal != nullptr) {
+            refusal->reason   = zone_arena_refusal_reason::TEARDOWN_REFUSED;
+            refusal->device   = dev_id;
+            refusal->need     = { scratch_zone, onednn_zone, runtime_zone };
+            refusal->have     = have;
+            refusal->teardown = cause;
+        }
+        return false;
+    };
+
     // The arena's zones as this call read them, none when there is no arena. The holders refusal names them as what the
     // device has; a reserve that fails after a rebuild destroyed that arena names them as released, and the zones the
     // device has after the failure as its have.
     zone_arena_sizes arena_zones;
+    // An earlier teardown that refused after it closed the arena left it closed until a teardown completes, so no
+    // zone can be sized in it, large enough or not, and no arena may be reserved over it.
+    if (const zone_arena_teardown_refusal earlier = arena_teardown_refusal();
+        zone_arena_teardown_left_closed(earlier)) {
+        return refuse_teardown(earlier, { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN),
+                                          zone_capacity(vram_zone_id::RUNTIME) });
+    }
     if (arena_active()) {
         const bool zones_sufficient = zone_capacity(vram_zone_id::SCRATCH) >= scratch_zone &&
                                       zone_capacity(vram_zone_id::ONEDNN) >= onednn_zone &&
@@ -7812,10 +7858,10 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
             GGML_LOG_ERROR(
                 "[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "
                 "device_release_retries=%zu device_live_controls=%zu retired_pending=%zu evictions_in_flight=%d "
-                "cache_scratch_in_arena=%u cache_scratch_outside=%u\n",
+                "cache_scratch_in_arena=%u (pp_moe_ring_slots=%u) cache_scratch_outside=%u live_beside_ring=%u\n",
                 dev_id, zones_live.c_str(), deferred_in_arena_count, deferred_in_arena_bytes / (1024.0 * 1024.0),
                 device_release_retries, device_live_controls, retired_pending, evictions_in_flight,
-                holders.scratch_in_arena, holders.scratch_outside);
+                holders.scratch_in_arena, holders.ring_in_arena, holders.scratch_outside, holders.live_beside_ring);
             // Who holds the chunk leases: each site that took one, apart from the copies of its handles. The counts are
             // read after the per-chunk total above, so a lease taken or dropped in between can set the two sums one
             // apart. Then each zone with live bytes lists its live allocations, through this cache's own dump, which
@@ -7868,7 +7914,16 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
         compute_arena_size_  = 0;
         compute_arena_owner_ = {};
         compute_arena_off_.store(0, std::memory_order_relaxed);
-        arena_destroy();
+        if (!arena_destroy()) {
+            // The reserve below would take the arena it failed to tear down for a fresh one and answer for zones it
+            // never sized, so the call refuses here. A teardown that refused before it closed the arena left it as it
+            // was, and its compute zone is bound again for whoever still uses it.
+            const zone_arena_teardown_refusal cause = arena_teardown_refusal();
+            if (!zone_arena_teardown_left_closed(cause)) {
+                bind_compute_arena();
+            }
+            return refuse_teardown(cause, arena_zones);
+        }
     }
 
     if (!arena_reserve(queue_, budget_, max_alloc, safe_max_alloc, scratch_zone, onednn_zone, runtime_zone,
@@ -31514,6 +31569,12 @@ bool unified_cache_test_arena_registry_commit_reached() {
 bool unified_cache::arena_destroy() {
     std::lock_guard<std::mutex> destroy_guard(arena_destroy_mutex_);
     if (!arena_queue_) return true;
+    // Each refusal below records why, for the caller that asked for the teardown and for any later one: every cause
+    // after CLOSING leaves the arena closed to new allocations.
+    const auto refuse = [&](zone_arena_teardown_refusal cause) {
+        arena_teardown_refusal_.store(cause, std::memory_order_release);
+        return false;
+    };
 
     // Fixed-order physical-group close. KV and WEIGHT are one lock/state row,
     // so neither logical sibling can allocate while the other is closing.
@@ -31531,7 +31592,7 @@ bool unified_cache::arena_destroy() {
         }
     } catch (...) {
         GGML_LOG_ERROR("[VRAM-ARENA] could not reserve durable authority drain state; refusing destroy\n");
-        return false;
+        return refuse(zone_arena_teardown_refusal::HOST_STATE);
     }
 
     // CLOSING wins over a concurrent RESETTING transaction. That settler
@@ -31558,7 +31619,7 @@ bool unified_cache::arena_destroy() {
         if (!group.allocations.empty()) {
             GGML_LOG_ERROR("[VRAM-ARENA] allocator group %zu still owns %zu live TLSF allocations; refusing destroy\n",
                            i, group.allocations.size());
-            return false;
+            return refuse(zone_arena_teardown_refusal::LIVE_ALLOCATIONS);
         }
     }
     std::vector<std::shared_ptr<arena_authority>> drain_snapshot;
@@ -31572,7 +31633,7 @@ bool unified_cache::arena_destroy() {
         }
     } catch (...) {
         GGML_LOG_ERROR("[VRAM-ARENA] could not snapshot durable authority drains; refusing physical free\n");
-        return false;
+        return refuse(zone_arena_teardown_refusal::DRAIN_SNAPSHOT);
     }
     lifecycle_locks.clear();
 
@@ -31598,7 +31659,7 @@ bool unified_cache::arena_destroy() {
         }), drains.end());
         if (!drains.empty()) all_authorities_drained = false;
     }
-    if (!all_authorities_drained) return false;
+    if (!all_authorities_drained) return refuse(zone_arena_teardown_refusal::DRAIN_TIMEOUT);
     lifecycle_locks.clear();
     try {
         arena_queue_->wait_and_throw();
@@ -31666,7 +31727,7 @@ bool unified_cache::arena_destroy() {
     GGML_LOG_INFO("[VRAM-ARENA] Destroyed %zu chunk(s), released %.1f MB\n", released_chunk_count,
                   released_chunk_bytes / (1024.0 * 1024.0));
     if (!all_freed) {
-        return false;
+        return refuse(zone_arena_teardown_refusal::FREE_FAILED);
     }
     weight_chunk_allocators_.clear();
     for (auto & group : arena_allocator_groups_) group.allocations.clear();
@@ -31687,6 +31748,7 @@ bool unified_cache::arena_destroy() {
     }
     lifecycle_locks.clear();
     for (auto & group : arena_allocator_groups_) group.lifecycle_cv.notify_all();
+    arena_teardown_refusal_.store(zone_arena_teardown_refusal::NONE, std::memory_order_release);
     return true;
 }
 
@@ -31832,6 +31894,8 @@ void unified_cache::arena_count_scratch_holders(zone_arena_holders & holders) {
     count(onednn_weights_scratch_);
     count(onednn_activations_scratch_);
     count(reorder_temp_buffer_);
+    // The ring's slot buffers inside the arena, kept to tell them from every other allocation in the groups below.
+    std::vector<const void *> ring_in_arena;
     {
         // Retired slots count too: a slot still claimed when the ring was replaced keeps its memory until released.
         std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
@@ -31840,13 +31904,31 @@ void unified_cache::arena_count_scratch_holders(zone_arena_holders & holders) {
                 count(slot.weight);
                 count(slot.activation);
                 count(slot.output);
+                for (const void * buffer : { slot.weight, slot.activation, slot.output }) {
+                    if (buffer != nullptr && vram_owns(buffer)) {
+                        ring_in_arena.push_back(buffer);
+                    }
+                }
             }
         }
     }
+    holders.ring_in_arena += static_cast<uint32_t>(std::min<size_t>(ring_in_arena.size(), UINT32_MAX));
     {
         std::lock_guard<std::mutex> lock(persistent_scratch_mutex_);
         for (const auto & named : persistent_scratches_) {
             count(named.second.device_ptr);
+        }
+    }
+    // Every zone allocation is recorded in its allocator group before it returns, so the records are the complete set
+    // of what is live in the zones; a free still queued is among them until it runs. Saturating, so a count that would
+    // wrap still reads as held.
+    for (allocator_group & group : arena_allocator_groups_) {
+        std::lock_guard<std::mutex> lock(group.mutex);
+        for (const auto & record : group.allocations) {
+            if (std::find(ring_in_arena.begin(), ring_in_arena.end(), record.first) == ring_in_arena.end() &&
+                holders.live_beside_ring != UINT32_MAX) {
+                ++holders.live_beside_ring;
+            }
         }
     }
 }

@@ -341,7 +341,8 @@ def claim_scratch_blocks_only_inside_the_arena(uc: str) -> bool:
         and ordered(body, *COUNTED)
         and ordered(ens, *GATE)
         and not any(t in pre for t in POINTER_TESTS)
-        and "holders.scratch_in_arena, holders.scratch_outside);" in refusal_segment(uc)
+        and "holders.scratch_in_arena, holders.ring_in_arena, holders.scratch_outside, holders.live_beside_ring);"
+        in refusal_segment(uc)
     )
 
 

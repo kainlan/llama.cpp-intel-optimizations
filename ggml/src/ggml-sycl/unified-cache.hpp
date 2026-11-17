@@ -4975,6 +4975,9 @@ class unified_cache {
     // never force-reset or force-freed. False when the zones cannot be sized:
     // when `refusal` is given it is written with the reason and each zone's
     // need (the sizes this call decided on) and have (the arena's zones).
+    // A rebuild whose teardown refuses is refused too, and no arena is
+    // reserved after it; while a refused teardown has left the arena closed,
+    // every call refuses for it, whatever the zones hold.
     bool ensure_planned_arena_zones(zone_arena_refusal * refusal = nullptr);
 
     // Is arena active?
@@ -5069,8 +5072,15 @@ class unified_cache {
     // last lease releases the chunk through release_marked_chunk(), which allocates nothing.
     void     host_release_chunk_lease(uint64_t handle) noexcept;
 
-    // Destroy arena (free all chunks).
+    // Destroy arena (free all chunks). A refusal records its cause, which arena_teardown_refusal() reads.
     bool arena_destroy();
+
+    // Why the last teardown of this cache's arena refused: NONE when none refused since the last one completed. A cause
+    // zone_arena_teardown_left_closed() names left the arena closed to new allocations, and no arena may be reserved
+    // over it.
+    zone_arena_teardown_refusal arena_teardown_refusal() const {
+        return arena_teardown_refusal_.load(std::memory_order_acquire);
+    }
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
     void       test_zone_boundary_check(vram_zone_id zone) { zone_boundary_check(zone); }
     mem_handle test_scratch_pool_owner() const;
@@ -6282,8 +6292,10 @@ class unified_cache {
     }
 
     // Adds the cache's scratch buffers to `holders`: those whose pointer the arena owns, which keep it from a
-    // rebuild, and those allocated outside it, which do not. Takes the PP MoE ring's lock, then the persistent
-    // scratch lock, each alone.
+    // rebuild, and those allocated outside it, which do not; of the first, the PP MoE ring's slot buffers; and the
+    // allocations live in the zones other than those slot buffers, read from each allocator group's own record of its
+    // allocations. Takes the PP MoE ring's lock, the persistent scratch lock, then each allocator group's lock, each
+    // alone.
     void arena_count_scratch_holders(zone_arena_holders & holders);
 
     // Per-physical-chunk TLSF allocators for the WEIGHT zone in N-chunk mode.
@@ -6331,6 +6343,9 @@ class unified_cache {
     std::mutex arena_destroy_mutex_;  // serializes retryable explicit destroy transactions
     static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
+    // Written by arena_destroy() under arena_destroy_mutex_ on each refusal and cleared when a teardown completes; read
+    // without that lock.
+    std::atomic<zone_arena_teardown_refusal> arena_teardown_refusal_{ zone_arena_teardown_refusal::NONE };
     // A copy of the allocators KV is carved from (kv_zone_model), and where
     // each of `ptrs` sits in it when `blocks` is given.
     kv_zone_model kv_zone_snapshot(const std::vector<const void *> & ptrs, std::vector<kv_zone_block> * blocks);
