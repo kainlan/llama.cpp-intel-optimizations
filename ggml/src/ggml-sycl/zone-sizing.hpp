@@ -552,10 +552,15 @@ typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 // ring_bytes is the prefill ring's bytes neither the planned room nor a loan covers (llama.cpp-kjef): the ring's slots
 // are the room's bytes and lent bytes, so it is 0 when the two supply all of it, and a demand on free memory otherwise.
 //
-// compute_room_n_ubatch and compute_room_bytes name the one rung whose compute buffers the plan sized the RUNTIME zone
-// to hold beside the hold, and that room: the explicit micro-batch the load placed, whose zone holds the planned
-// compute term (the compute buffers the load measured at its planning shape) beside that micro-batch's ring and dense
-// scratch. 0 for none, the case of every load that names no micro-batch.
+// compute_room_n_ubatch and compute_room_bytes name the rung whose compute buffers the plan sized the RUNTIME zone to
+// hold beside the hold, and that room (placement_plan_compute_room): the explicit micro-batch the load placed, or, for
+// a load that named none, the load's planning micro-batch. The room is the planned compute term (the compute buffers
+// the load measured at its planning shape), held beside that micro-batch's ring and dense scratch. 0 for none: a
+// multi-device plan, another device, an unknown planning micro-batch, or a named micro-batch the plan did not place.
+//
+// compute_room_measured_n_ubatch is the micro-batch the term was measured at, 0 when unknown or when there is no room.
+// It is a separate fact from compute_room_n_ubatch because the plan can place a micro-batch above the one the load
+// measured its term at: the room's rung then says where the zone was sized, not which rung's buffers the term covers.
 struct zone_hold_fit_inputs {
     size_t                         headroom_target = 0;  // the driver headroom the arena expects outside itself
     size_t                         free_before = 0;  // the cache's ledger: the card with the rung's own buffers gone
@@ -565,12 +570,13 @@ struct zone_hold_fit_inputs {
     zone_hold_plan_fn              plan_of     = nullptr;
     void *                         plan_ctx    = nullptr;
     size_t                         ring_bytes  = 0;
-    uint32_t                       compute_room_n_ubatch = 0;
-    size_t                         compute_room_bytes    = 0;
+    uint32_t                       compute_room_n_ubatch          = 0;
+    size_t                         compute_room_bytes             = 0;
+    uint32_t                       compute_room_measured_n_ubatch = 0;
     // The rung whose own compute buffer the hold kept outside the arena (the realized check's rung, when its record
     // shows such a spill), 0 for none. The zone did not serve that rung's buffer, so the room is not credited there.
     // Every other rung keeps the credit the plan gives it.
-    uint32_t                       held_out_n_ubatch     = 0;
+    uint32_t                       held_out_n_ubatch              = 0;
 };
 
 // The worst-case compute-buffer request at `n_ubatch`: the rung's own measured record when it has one (and only
@@ -579,12 +585,14 @@ struct zone_hold_fit_inputs {
 // is recorded: the demand is then the plan alone, a lower bound.
 size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
-// Whether the RUNTIME zone was planned to serve the rung's compute buffers beside the hold. The zone holds the compute
-// term the load measured at compute_room_n_ubatch, so a rung at or below that one is served: with its own measured
-// request (`own_record`), when the request is no larger than the room (whole or nothing); without one, always,
-// because compute buffers grow with the micro-batch and a smaller rung's are no larger than the measured ones. A
-// request scaled from another rung is an estimate and does not refuse a rung the zone was planned for. Never the rung
-// whose own buffer was held out, never a rung above the room's, never n_ubatch 0.
+// Whether the RUNTIME zone was planned to serve the rung's compute buffers beside the hold. Only a rung at or below
+// compute_room_n_ubatch is, the rung the zone was sized for. With its own measured request (`own_record`) the rung is
+// served when the request is no larger than the room (whole or nothing). Without one it is served only when it is also
+// at or below compute_room_measured_n_ubatch: the room is the term measured at that rung and compute buffers grow with
+// the micro-batch, so a rung no larger needs no more than the term, while a rung above it (below a placed micro-batch)
+// can need more. A measured rung of 0 gives no such credit. A request scaled from another rung is an estimate and does
+// not refuse a rung the term covers. Never the rung whose own buffer was held out, never a rung above the room's,
+// never n_ubatch 0.
 //
 // It can over-credit a rung whose compute buffers span several chunks, because the request is the rung's largest
 // single buffer (zone_hold_fit_request) while the room is a sum of per-chunk peaks that the other chunks draw on too.

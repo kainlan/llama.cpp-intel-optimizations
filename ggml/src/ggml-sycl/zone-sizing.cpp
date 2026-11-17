@@ -586,7 +586,10 @@ bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in,
         n_ubatch == in.held_out_n_ubatch) {
         return false;
     }
-    return !own_record || request <= in.compute_room_bytes;
+    if (own_record) {
+        return request <= in.compute_room_bytes;
+    }
+    return in.compute_room_measured_n_ubatch != 0 && n_ubatch <= in.compute_room_measured_n_ubatch;
 }
 
 zone_hold_fit_terms zone_hold_fit_terms_at(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
@@ -599,8 +602,8 @@ zone_hold_fit_terms zone_hold_fit_terms_at(const zone_hold_fit_inputs & in, uint
     // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch. One
     // the zone was planned to serve is not held back, so it spills nothing; the plan stays in the bound as it is.
     t.request          = zone_hold_fit_request(in, n_ubatch);
-    t.request_credited = zone_hold_fit_rung_has_compute_room(in, n_ubatch, t.request,
-                                                             zone_hold_fit_rung_has_record(in, n_ubatch));
+    t.request_credited =
+        zone_hold_fit_rung_has_compute_room(in, n_ubatch, t.request, zone_hold_fit_rung_has_record(in, n_ubatch));
     t.kv_room          = in.kv_room;
     t.ring_uncovered   = in.ring_bytes;
     const size_t spill = zone_hold_spill_raw_demand(

@@ -19904,26 +19904,34 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device);
     // The micro-batch the published single-device plan sized this device's RUNTIME zone for: the explicit one it
     // placed, or else the load's planning micro-batch, the shape the load measured the compute term at. The zone holds
-    // that term beside the micro-batch's ring and dense scratch, so the fit credits that rung and every rung below it
+    // that term beside the micro-batch's ring and dense scratch, so the fit credits a rung at or below it: one with its
+    // own record when the record fits the term, one without only at or below the rung the term was measured at
     // (zone_hold_fit_rung_has_compute_room). Every rung above it is judged as before.
     {
         const auto room_plan     = ggml_sycl_global_plan_owner();
         uint32_t   room_n_ubatch = 0;
-        // The realized check has the rung's own record: a request the hold kept outside the arena means the zone did
-        // not serve this rung, so the fit charges it here and nowhere else. The read copies the counters and resets
-        // nothing, so the realized refusal still reports them.
+        // The realized check reads the spills of the owner's hold epoch: every publish restarts the counters under the
+        // lock that sets the epoch's rung (unified_cache_begin_planned_hold_epoch), and a release or a new owner ends
+        // the epoch, so while the owner has one the counters are that epoch's. A request the hold kept outside the
+        // arena means the zone did not serve the epoch's rung, so the fit charges that rung and no other, which is not
+        // the asked one when a settle check asks a smaller rung after a losing one. The read copies the counters and
+        // resets nothing, so the realized refusal still reports them.
         bool       held_out      = false;
         if (q.rung_live) {
             ggml_sycl::planned_hold_spill_totals totals;
             ggml_sycl::unified_cache_get_recent_planned_hold_spills(q.device, q.owner, &totals);
             held_out = totals.raw_count != 0;
         }
-        const size_t room_bytes = ggml_sycl::placement_plan_compute_room(
-            *room_plan, q.device, ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device),
-            ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device), &room_n_ubatch);
-        in.compute_room_n_ubatch = room_n_ubatch;
-        in.compute_room_bytes    = room_bytes;
-        in.held_out_n_ubatch     = held_out ? q.n_ubatch : 0;
+        // The micro-batch the load measured the term at, read once: it places the room of a plan that named none,
+        // and bounds the credit of a rung without a record of its own, which a placed micro-batch above it does not.
+        const uint32_t measured_n_ubatch = ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device);
+        const size_t   room_bytes        = ggml_sycl::placement_plan_compute_room(
+            *room_plan, q.device, ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device), measured_n_ubatch,
+            &room_n_ubatch);
+        in.compute_room_n_ubatch          = room_n_ubatch;
+        in.compute_room_bytes             = room_bytes;
+        in.compute_room_measured_n_ubatch = room_bytes != 0 ? measured_n_ubatch : 0;
+        in.held_out_n_ubatch              = held_out ? (have_epoch ? epoch_n_ubatch : q.n_ubatch) : 0;
     }
     a.terms                 = ggml_sycl::zone_hold_fit_terms_at(in, q.n_ubatch);
     a.demand                = a.terms.demand;
