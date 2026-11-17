@@ -1997,8 +1997,9 @@ int main() {
               "a saturated plan never wraps into a kept zone");
     }
 
-    // ---- Case 24f: the context shape a plan sizes the per-context scratch for. At load it is the context and
-    // micro-batch the caller named, else the load's planning shape; at a context transaction it is the context's own.
+    // ---- Case 24f: the context shape a plan sizes the per-context scratch for. At load it is the context the model
+    // opens with (the caller's, or the model's default) and the micro-batch the caller named, each else the load's
+    // planning shape; at a context transaction it is the context's own.
     {
         using ggml_sycl::zone_plan_context_shape;
         ggml_sycl::zone_context_shape s = zone_plan_context_shape(false, 512, 4096, 512, 2048);

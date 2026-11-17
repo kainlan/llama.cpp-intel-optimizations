@@ -2085,8 +2085,9 @@ GGML_BACKEND_API enum ggml_sycl_residency_probe_status ggml_backend_sycl_probe_r
 // zone reservations only on a device whose cache has an active arena, so on a device without one the plan's device
 // share is an upper bound and its host terms a lower bound, and one [PLAN-DRY-RUN] line names each such device: every
 // physical device a multi-device plan packs, and the scheduler-visible device of a single-device plan. An explicit
-// micro-batch above the load's planning shape (inventory->n_ubatch_context) is not modelled: every plan is the
-// planning-shape plan.
+// micro-batch above the load's planning shape (inventory->n_ubatch_context) is modelled only in the oneDNN Graph
+// attention floor, which is sized for it and the context the model opens with; KV and the MoE prompt path are planned
+// at the planning shape, without that micro-batch's RUNTIME room.
 
 #define GGML_SYCL_PLAN_DRY_RUN_VERSION     1
 #define GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES 16

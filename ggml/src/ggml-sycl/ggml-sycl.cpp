@@ -19198,8 +19198,9 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     lazy_infos                = kv.lazy_tables;
     if (kv.n_ubatch_context != 0) {
         GGML_LOG_INFO(
-            "[PLAN-DRY-RUN] n_ubatch_context=%u is not modelled: every plan is the load's planning shape "
-            "(n_ubatch=%u), without the explicit micro-batch's RUNTIME room\n",
+            "[PLAN-DRY-RUN] n_ubatch_context=%u is modelled only in the oneDNN Graph attention floor, which is sized "
+            "for it and the context the model opens with: KV and the MoE prompt path are planned at the load's "
+            "planning shape (n_ubatch=%u), without the explicit micro-batch's RUNTIME room\n",
             kv.n_ubatch_context, kv.n_ubatch);
     }
     const auto override_for = [&](int device) -> size_t {

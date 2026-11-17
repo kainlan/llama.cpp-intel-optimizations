@@ -1789,6 +1789,220 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
     )
 
 
+# The oneDNN Graph scratch floor is sized for the context shape a plan carries (plan.context_n_ubatch,
+# plan.context_n_ctx), not the load's planning shape (plan.planner_n_ubatch, plan.planner_n_ctx), because the ONEDNN
+# zone cannot grow once weights are live. The non-FA attention scratch keeps the planning shape on purpose: the load
+# cannot know whether the context runs flash attention. Both plan builders set the context shape from
+# zone_plan_context_shape() before populate_host_zone_sizing() reads it (through placement_plan_size_host_side()).
+# Every check runs on comment-stripped, whitespace-normalized text, and every mutant edits one function's body only.
+CACHE_CPP_NORM = normalize_ws(CACHE_CPP_CODE)
+
+POPULATE_HOST_ZONE_SIZING_SIG = "static void populate_host_zone_sizing(placement_plan & plan,"
+SINGLE_DEVICE_PLAN_SIG = (
+    "placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,"
+)
+MULTI_DEVICE_PLAN_SIG = (
+    "placement_plan compute_multi_device_plan(const std::vector<device_budget> & device_budgets, "
+    "const std::vector<placement_tensor_info> & tensor_inventory,"
+)
+GRAPH_SHAPE_SETTER = "unified_cache_set_planned_onednn_graph_scratch_shape"
+GRAPH_FLOOR_CALL = "onednn_graph_scratch_zone_floor_bytes_swa"
+GRAPH_FLOOR_INFO_TEXT = "[SYCL-PLAN] oneDNN Graph-scratch zone floor:"
+NONFA_SHAPE_SETTER = "unified_cache_set_planned_nonfa_attn_scratch_shape"
+HOST_SIDE_SIZING_CALL = "placement_plan_size_host_side("
+CONTEXT_SHAPE_ARGS = ["plan.context_n_ubatch", "plan.context_n_ctx"]
+PLANNING_SHAPE_ARGS = ["plan.planner_n_ubatch", "plan.planner_n_ctx"]
+CONTEXT_SHAPE_CALL_RE = re.compile(
+    r"const zone_context_shape (\w+) = zone_plan_context_shape\(kv_info\.n_ctx_is_runtime, plan\.planner_n_ctx, "
+    r"kv_info\.n_ctx_context, plan\.planner_n_ubatch, kv_info\.n_ubatch_context\);"
+)
+
+
+def _function_body_span(src: str, anchor: str) -> tuple:
+    """The [start, end) span of the brace-balanced body of the one function whose signature contains `anchor`."""
+    assert src.count(anchor) == 1, f"expected exactly one {anchor!r}, found {src.count(anchor)}"
+    body = extract_function_body(src, anchor)
+    start = src.index("{", src.index(anchor))
+    return start, start + len(body)
+
+
+def _body_of(src: str, anchor: str) -> str:
+    start, end = _function_body_span(src, anchor)
+    return src[start:end]
+
+
+def _mutate_in_function(src: str, anchor: str, old: str, new: str) -> str:
+    """Replace `old`, which must occur exactly once in the body of the function `anchor` names, inside that body only."""
+    start, end = _function_body_span(src, anchor)
+    body = src[start:end]
+    assert body.count(old) == 1, f"mutation anchor must occur once in {anchor!r}, found {body.count(old)}: {old!r}"
+    return src[:start] + body.replace(old, new, 1) + src[end:]
+
+
+def _call_argument_lists(body: str, callee: str) -> list:
+    """The top-level argument list of every call to `callee` in `body`."""
+    calls = []
+    for m in re.finditer(re.escape(callee) + r"\(", body):
+        depth, in_string = 0, False
+        for i in range(m.end() - 1, len(body)):
+            char = body[i]
+            if char == '"' and body[i - 1] != "\\":
+                in_string = not in_string
+            if in_string:
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    calls.append(_split_top_level_arguments(body[m.end() : i]))
+                    break
+    return calls
+
+
+def _graph_setter_reads_context_shape(src: str) -> bool:
+    calls = _call_argument_lists(_body_of(src, POPULATE_HOST_ZONE_SIZING_SIG), GRAPH_SHAPE_SETTER)
+    return len(calls) == 1 and calls[0][-2:] == CONTEXT_SHAPE_ARGS
+
+
+def _graph_floor_reads_context_shape(src: str) -> bool:
+    calls = _call_argument_lists(_body_of(src, POPULATE_HOST_ZONE_SIZING_SIG), GRAPH_FLOOR_CALL)
+    return len(calls) == 1 and calls[0][-2:] == CONTEXT_SHAPE_ARGS
+
+
+def _graph_floor_info_prints_context_shape(src: str) -> bool:
+    calls = [
+        args
+        for args in _call_argument_lists(_body_of(src, POPULATE_HOST_ZONE_SIZING_SIG), "GGML_LOG_INFO")
+        if args and GRAPH_FLOOR_INFO_TEXT in args[0]
+    ]
+    return len(calls) == 1 and calls[0][-2:] == CONTEXT_SHAPE_ARGS
+
+
+def _nonfa_setter_reads_planning_shape(src: str) -> bool:
+    calls = _call_argument_lists(_body_of(src, POPULATE_HOST_ZONE_SIZING_SIG), NONFA_SHAPE_SETTER)
+    return len(calls) == 1 and calls[0][-2:] == PLANNING_SHAPE_ARGS
+
+
+def _builder_sets_context_shape(src: str, builder_sig: str) -> bool:
+    """The builder assigns both context fields from zone_plan_context_shape(), before its host-side sizing (which
+    runs populate_host_zone_sizing) reads them."""
+    body = _body_of(src, builder_sig)
+    m = CONTEXT_SHAPE_CALL_RE.search(body)
+    if not m:
+        return False
+    var = m.group(1)
+    assigned_at = []
+    for stmt in (f"plan.context_n_ctx = {var}.n_ctx;", f"plan.context_n_ubatch = {var}.n_ubatch;"):
+        at = body.find(stmt, m.end())
+        if at < 0:
+            return False
+        assigned_at.append(at)
+    sizing_at = body.find(HOST_SIDE_SIZING_CALL)
+    return sizing_at > max(assigned_at)
+
+
+def test_graph_scratch_shape_setter_reads_the_context_shape() -> None:
+    assert _graph_setter_reads_context_shape(CACHE_CPP_NORM), (
+        f"populate_host_zone_sizing must call {GRAPH_SHAPE_SETTER}() once, with plan.context_n_ubatch and "
+        "plan.context_n_ctx: the ONEDNN zone is sized for the context, and it cannot grow once weights are live"
+    )
+
+
+def test_graph_scratch_floor_and_info_read_the_context_shape() -> None:
+    assert _graph_floor_reads_context_shape(CACHE_CPP_NORM), (
+        f"populate_host_zone_sizing's {GRAPH_FLOOR_CALL}() must read plan.context_n_ubatch and plan.context_n_ctx"
+    )
+    assert _graph_floor_info_prints_context_shape(CACHE_CPP_NORM), (
+        "the Graph-scratch zone floor INFO line must print plan.context_n_ubatch and plan.context_n_ctx, the shape "
+        "the floor was sized for"
+    )
+
+
+def test_nonfa_scratch_shape_setter_keeps_the_planning_shape() -> None:
+    assert _nonfa_setter_reads_planning_shape(CACHE_CPP_NORM), (
+        f"populate_host_zone_sizing must call {NONFA_SHAPE_SETTER}() once, with plan.planner_n_ubatch and "
+        "plan.planner_n_ctx: the load cannot know whether the context runs flash attention"
+    )
+
+
+def test_both_plan_builders_set_the_context_shape_before_host_side_sizing() -> None:
+    for sig in (SINGLE_DEVICE_PLAN_SIG, MULTI_DEVICE_PLAN_SIG):
+        assert _builder_sets_context_shape(CACHE_CPP_NORM, sig), (
+            f"{sig!r} must set plan.context_n_ctx and plan.context_n_ubatch from zone_plan_context_shape() before "
+            f"{HOST_SIDE_SIZING_CALL}...) runs populate_host_zone_sizing"
+        )
+
+
+def _context_shape_checks(src: str) -> dict:
+    return {
+        "setter": _graph_setter_reads_context_shape(src),
+        "floor": _graph_floor_reads_context_shape(src),
+        "info": _graph_floor_info_prints_context_shape(src),
+        "nonfa": _nonfa_setter_reads_planning_shape(src),
+        "single": _builder_sets_context_shape(src, SINGLE_DEVICE_PLAN_SIG),
+        "multi": _builder_sets_context_shape(src, MULTI_DEVICE_PLAN_SIG),
+    }
+
+
+def _assert_only_check_fails(mutant: str, failing: str, why: str) -> None:
+    results = _context_shape_checks(mutant)
+    expected = {name: name != failing for name in results}
+    assert results == expected, f"mutation witness for {failing!r} ({why}) is broken: {results}"
+
+
+def test_context_shape_checks_have_bounded_mutation_witnesses() -> None:
+    src = CACHE_CPP_NORM
+    assert all(_context_shape_checks(src).values()), "sanity: every check passes on the source itself"
+    planning = ", ".join(PLANNING_SHAPE_ARGS)
+    context = ", ".join(CONTEXT_SHAPE_ARGS)
+    graph_head = "plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, "
+
+    old = f"{GRAPH_SHAPE_SETTER}(plan.device_id, {graph_head}{context})"
+    mutant = _mutate_in_function(src, POPULATE_HOST_ZONE_SIZING_SIG, old, old.replace(context, planning))
+    _assert_only_check_fails(mutant, "setter", "the Graph shape recorded at the planning shape")
+
+    old = f"{GRAPH_FLOOR_CALL}({graph_head}{context})"
+    mutant = _mutate_in_function(src, POPULATE_HOST_ZONE_SIZING_SIG, old, old.replace(context, planning))
+    _assert_only_check_fails(mutant, "floor", "the logged floor computed at the planning shape")
+
+    old = f"(1024.0 * 1024.0), {graph_head}{context})"
+    mutant = _mutate_in_function(src, POPULATE_HOST_ZONE_SIZING_SIG, old, old.replace(context, planning))
+    _assert_only_check_fails(mutant, "info", "the INFO line printing the planning shape")
+
+    old = f"{NONFA_SHAPE_SETTER}(plan.device_id, plan.planner_n_head_all_max, {planning})"
+    mutant = _mutate_in_function(src, POPULATE_HOST_ZONE_SIZING_SIG, old, old.replace(planning, context))
+    _assert_only_check_fails(mutant, "nonfa", "the non-FA scratch sized at the context shape")
+
+    mutant = _mutate_in_function(src, SINGLE_DEVICE_PLAN_SIG, "plan.context_n_ubatch = context_shape.n_ubatch;",
+                                 "plan.context_n_ubatch = plan.planner_n_ubatch;")
+    _assert_only_check_fails(mutant, "single", "the single-device builder's micro-batch left at the planning shape")
+
+    mutant = _mutate_in_function(src, MULTI_DEVICE_PLAN_SIG, "plan.planner_n_ubatch, kv_info.n_ubatch_context);",
+                                 "plan.planner_n_ubatch, 0);")
+    _assert_only_check_fails(mutant, "multi", "the multi-device builder ignoring the caller's micro-batch")
+
+
+def test_builder_ordering_check_has_a_bounded_mutation_witness() -> None:
+    """Moving the single-device builder's context-shape block after its host-side sizing keeps every statement but
+    lets populate_host_zone_sizing read the fields before they are set: only the ordering catches it."""
+    src = CACHE_CPP_NORM
+    start, end = _function_body_span(src, SINGLE_DEVICE_PLAN_SIG)
+    body = src[start:end]
+    m = CONTEXT_SHAPE_CALL_RE.search(body)
+    assert m, "sanity: the single-device builder calls zone_plan_context_shape()"
+    last_stmt = "plan.context_n_ubatch = context_shape.n_ubatch;"
+    block_end = body.index(last_stmt, m.end()) + len(last_stmt)
+    block = body[m.start() : block_end]
+    moved = body[: m.start()] + body[block_end:]
+    sizing_at = moved.index(HOST_SIDE_SIZING_CALL)
+    sizing_end = moved.index(";", sizing_at) + 1
+    moved = moved[:sizing_end] + " " + block + moved[sizing_end:]
+    mutant = src[:start] + moved + src[end:]
+    assert CONTEXT_SHAPE_CALL_RE.search(_body_of(mutant, SINGLE_DEVICE_PLAN_SIG)), "sanity: the block is still there"
+    _assert_only_check_fails(mutant, "single", "the context shape set after the host-side sizing reads it")
+
+
 if __name__ == "__main__":
     import sys
 
