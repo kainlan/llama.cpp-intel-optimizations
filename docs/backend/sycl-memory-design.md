@@ -2617,6 +2617,57 @@ new hardware evidence that k1ev's consumer is understood and bounded
 — the reasoning behind each retired predicate was sound in isolation
 and still wrong in practice, which is the whole lesson of this subsection.
 
+### The flash-attention counterpart: oneDNN Graph scratch above the planned zone
+
+With flash attention on, attention runs through oneDNN Graph SDPA, whose
+scratch lives in the ONEDNN zone beside the primitive-API pair. The load sizes
+that zone's Graph room for the context it was told (the Graph floor above). A
+later context can ask for more: a larger `-c` than the hint, or an API caller
+that gave none. The part of its scratch above the room goes DIRECT
+(`onednn_graph_scratch_alloc_direct_locked()`, `unified-cache.cpp`), which
+names no zone and so draws raw device memory outside the arena, and which
+aborts the process when the card has none left.
+
+The runtime-context transaction therefore asks, right after the non-FA check
+and before anything is committed (`ggml_sycl_check_onednn_graph_scratch()`,
+`ggml-sycl.cpp`), whether that part fits outside the arena: the context's
+Graph scratch (`zone_onednn_graph_scratch_floor_bytes()` at the context's own
+shape and the DIRECT cap), less the zone's Graph room (the ONEDNN zone's
+capacity less the primitive-API pair, the bare getter), plus the hold's
+worst-case spill (`ggml_sycl_planned_scratch_hold_spill_bound()`, the figure
+the non-FA check adds), must leave the 256 MiB driver headroom
+(`kSyclArenaMinExternalHeadroomBytes`) of the free memory the non-FA check
+compares with (`unified_cache_hold_free_before()`, the cache's ledger, not a
+bare driver read). The arithmetic is `zone_onednn_graph_uncovered_bytes()` and
+`zone_onednn_graph_fit_largest_ub()` (`zone-sizing.cpp`, `test-zone-sizing`
+Case 24h).
+
+**Design choice: refuse only when the part above the zone does not fit
+outside the arena.** Refusing every context whose Graph scratch exceeds the
+zone was rejected: it would refuse Qwen at `-ub 2048`, which runs correctly
+with one DIRECT request, whenever the load's hint was smaller.
+
+The check stands aside when flash attention is off (the non-FA check above
+covers that path) and when the Graph allocator is disabled
+(`GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0`). It has no side effect, so an
+auto-ubatch probe asks it too and the ladder sees the verdict a real context
+would get. The refusal names the largest power-of-two `-ub` whose part fits:
+
+```
+[SYCL-PLAN] runtime context update rejected: the oneDNN Graph attention scratch at n_ubatch=<N> n_ctx=<C>
+(<D> MB, bounded by the <K> MB DIRECT cap) exceeds the <R> MB the load planned in the ONEDNN zone, and the
+<U> MB above it, with the hold's <H> MB worst-case spill, would leave device <d> under the 256.0 MB driver
+headroom (<F> MB free); the largest -ub that fits is about <L>, a power of two, estimated by scaling; or tell
+the load this context (-c) so it plans the zone for it
+```
+
+No tool in the tree reaches this refusal on a device: `common` and
+`llama-bench` tell the load the largest context they will open, so no context
+outgrows its hint. An API caller that opens a larger context than it named, or
+names none, can. A context that auto flash attention later resolves to off was
+judged with flash attention on here (the transaction runs before the
+resolution) and is not re-asked by the narrow recheck.
+
 ### A context-time consumer: the PP MoE oneDNN ring above the RUNTIME zone
 
 The PP MoE oneDNN scratch ring is one weight slot plus two slots that scale with
@@ -3030,7 +3081,8 @@ model's own weights is not a trade the hold may make).
 single fact, and it has a single function: `ggml_sycl_hold_spill_fit` (ggml-sycl.cpp), the composition of
 `zone_hold_fit_inputs` and `zone_hold_fit` (zone-sizing.hpp, host-tested). It is asked by three callers and by nobody
 else: the transaction-time check that F3 publishes through (`ggml_sycl_check_hold_spill_headroom`, and the non-FA check
-that counts the same bound beside the non-FA scratch), the realized check after a rung's `sched_reserve()`
+and the oneDNN Graph scratch check, which count the same bound beside their own scratch), the realized check after a
+rung's `sched_reserve()`
 (`ggml_sycl_check_hold_spill_realized`), and the constructor's pinned-`-ub` check, which reaches the realized check
 through `ggml_backend_sycl_planned_hold_spill_fits`. None of them keeps a formula, a free-memory read or a history of
 its own. Before this, F3 estimated from a running high-water mark and the driver's reading, the realized check from
@@ -3048,8 +3100,8 @@ The inputs are four facts and nothing else:
   snapshots it (`unified_cache_begin_planned_hold_epoch`), and the realized check, which runs after the KV exists, asks
   over that same room.
 - *The free memory.* One model of it: the unified cache's own ledger (`unified_cache_hold_free_before`), not a driver
-  read, and the same figure for every asker: the realized check, the constructor's check, F3, and the non-FA check, which
-  used to compare its demand with a bare driver reading. A WINDOW is the span between two publishes (a publish, or an
+  read, and the same figure for every asker: the realized check, the constructor's check, F3, the non-FA check, which
+  used to compare its demand with a bare driver reading, and the oneDNN Graph scratch check. A WINDOW is the span between two publishes (a publish, or an
   epoch begin, opens one and forgets the last). Its baseline `cold` is what the card would show with nothing of the
   cache's held outside the arena, `driver_free + raw_held` per reading (`zone_hold_free_cold`), and is the MAXIMUM
   reading taken inside the window (`zone_hold_cold_update`): the driver's credit for a freed buffer lags, a lag only
