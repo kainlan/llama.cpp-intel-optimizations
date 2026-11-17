@@ -3613,29 +3613,26 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
                                               unified_cache_get_planned_moe_control_requirement(device_id), &base)) {
         return false;
     }
-    // The host-expert MoE scatter scratch lives in this zone (llama.cpp-cre6), checked the same way.
+    // The host-expert MoE scatter scratch lives in this zone (llama.cpp-cre6).
     const size_t moe_host_scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device_id);
-    if (moe_host_scatter > SIZE_MAX - base) {
-        return false;
-    }
-    base += moe_host_scatter;
-    // The dense MMQ/MMVQ Q8_1 src1 buffer lives in this zone (llama.cpp-479i). Checked like
-    // the terms above: a wrapped sum would be a SMALLER zone, not a refusal.
+    // The dense MMQ/MMVQ Q8_1 src1 buffer lives in this zone (llama.cpp-479i).
     const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
-    // The dense f16 dequant buffer lives in this zone too (llama.cpp-479i), checked the same way.
+    // The dense f16 dequant buffer lives in this zone too (llama.cpp-479i).
     const size_t dequant_f16 = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);
-    // The scheduler's compute buffer lives in this zone too (llama.cpp-p6i0), checked the same way.
+    // The scheduler's compute buffer lives in this zone too (llama.cpp-p6i0).
     const size_t compute     = unified_cache_get_planned_compute_term_bytes(device_id);
     // The context memory the load measured on the device's plain buffer type (the recurrent state) is allocated in
-    // this zone before the compute buffer (llama.cpp-p6i0), checked the same way.
+    // this zone before the compute buffer (llama.cpp-p6i0).
     const size_t state       = unified_cache_get_planned_state_term_bytes(device_id);
-    if (mmq_src1 > SIZE_MAX - base || dequant_f16 > SIZE_MAX - base - mmq_src1 ||
-        compute > SIZE_MAX - base - mmq_src1 - dequant_f16 ||
-        state > SIZE_MAX - base - mmq_src1 - dequant_f16 - compute) {
-        return false;
-    }
-    *out = base + mmq_src1 + dequant_f16 + compute + state;
-    return true;
+    // The sum is the pure helper's, which checks every addition: a wrapped sum would be a SMALLER zone, not a refusal.
+    zone_runtime_terms terms;
+    terms.base             = base;
+    terms.moe_host_scatter = moe_host_scatter;
+    terms.mmq_src1         = mmq_src1;
+    terms.dequant_f16      = dequant_f16;
+    terms.compute          = compute;
+    terms.state            = state;
+    return zone_runtime_requirement(terms, out);
 }
 
 size_t unified_cache_runtime_zone_floor_bytes() {

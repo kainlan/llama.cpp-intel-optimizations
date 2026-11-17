@@ -498,6 +498,22 @@ inline bool zone_runtime_reserved_bytes(size_t floor_bytes, size_t requirement, 
 // rounding overflows.
 bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement);
 
+// The RUNTIME zone's planned terms, as unified_cache_get_planned_runtime_zone_requirement() reads them for the zone
+// ensure_planned_arena_zones() sizes. Each is the term as published now, so the requirement follows whatever was
+// published last: a term left behind by a plan that was then discarded is still asked for.
+struct zone_runtime_terms {
+    size_t base             = 0;  // PP pipeline scratch + the ring's RUNTIME part + MoE CONTROL, checked as one sum
+    size_t moe_host_scatter = 0;  // the host-expert MoE scatter scratch, published by the placement plan
+    size_t mmq_src1         = 0;  // the dense MMQ/MMVQ Q8_1 src1 buffer
+    size_t dequant_f16      = 0;  // the dense f16 dequant buffer
+    size_t compute          = 0;  // the compute buffer the load measured
+    size_t state            = 0;  // the context memory the load measured on the plain buffer type
+};
+
+// The RUNTIME zone's requirement: the sum of `terms`. False, with *out unwritten, when the sum would wrap or `out` is
+// null: a wrapped sum would size a smaller zone instead of refusing one.
+bool zone_runtime_requirement(const zone_runtime_terms & terms, size_t * out);
+
 // What points into a VRAM arena that a plan wants larger. The arena grows only by being destroyed and reserved again,
 // which moves every byte in it, so each of these keeps it as it is.
 struct zone_arena_holders {

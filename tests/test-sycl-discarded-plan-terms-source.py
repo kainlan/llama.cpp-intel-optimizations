@@ -193,7 +193,8 @@ def claim_requirement_is_the_pure_sum(uc: str, zs: str) -> bool:
 
 # ---- one helper snapshots and restores every term the planner publishes ----
 
-HELPER_SIG = "struct ggml_sycl_planner_published_terms {"
+# A struct's signature stops before its brace: fn_body() opens at the first brace after the signature.
+HELPER_SIG = "struct ggml_sycl_planner_published_terms"
 SNAPSHOT_SIG = "static ggml_sycl_planner_published_terms snapshot(int device)"
 RESTORE_SIG = "void restore(int device) const"
 # The planner's own functions: everything a call to compute_placement_plan or compute_multi_device_plan runs that
@@ -287,7 +288,7 @@ def claim_fallback_restores_before_the_ensure(gs: str) -> bool:
 
 # ---- the plan dry run restores through the same helper ----
 
-DRY_SIG = "struct ggml_sycl_plan_dry_run_saved_state {"
+DRY_SIG = "struct ggml_sycl_plan_dry_run_saved_state"
 DRY_FIELD = "ggml_sycl_planner_published_terms planner;"
 DRY_SNAPSHOT = "s.planner = ggml_sycl_planner_published_terms::snapshot(d);"
 DRY_RESTORE = "s.planner.restore(d);"
@@ -390,7 +391,15 @@ def test_witness_planner_publishes_a_term_the_helper_does_not_know():
 
 
 def test_witness_snapshot_after_the_plan_with_the_room():
-    m = mutate(GS, SNAPSHOT + " " + FIRST_PLAN, FIRST_PLAN + " " + SNAPSHOT)
+    m = mutate(mutate(GS, SNAPSHOT, ""), FIRST_PLAN, FIRST_PLAN + " " + SNAPSHOT)
+    assert not claim_snapshot_before_the_plan_with_room(m)
+
+
+def test_witness_snapshot_before_the_entry_ensure():
+    body = fn_body(code(GS), COMPUTE_SIG)
+    assert ENTRY_ENSURE in body, "witness anchor: the entry ensure is not in the stage"
+    m = mutate(mutate(GS, SNAPSHOT, ""), "if (ggml_sycl::get_unified_cache_for_device(ctx->device) && " + ENTRY_ENSURE,
+               SNAPSHOT + " if (ggml_sycl::get_unified_cache_for_device(ctx->device) && " + ENTRY_ENSURE)
     assert not claim_snapshot_before_the_plan_with_room(m)
 
 

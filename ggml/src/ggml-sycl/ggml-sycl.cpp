@@ -18077,6 +18077,37 @@ static bool ggml_sycl_plan_has_storage_table(const ggml_sycl::placement_plan & p
     return false;
 }
 
+// The terms the placement planners publish for a device while they compute a plan (populate_host_zone_sizing() and
+// publish_moe_host_scatter_term() in unified-cache.cpp): the MoE CONTROL requirement and the MoE host scatter scratch,
+// both in the RUNTIME zone's requirement, and the oneDNN Graph and non-FA attention scratch shapes, which floor zones the
+// same ensure sizes. A plan that is computed and then discarded publishes nothing, so a caller that may discard one
+// takes this snapshot before it plans and restores it when it does. Each setter stores what its getter reads, so the
+// restore is exact. A term the planners start to publish is added here, not at a caller.
+struct ggml_sycl_planner_published_terms {
+    ggml_sycl::onednn_graph_scratch_planned_shape graph{};
+    ggml_sycl::nonfa_attn_scratch_planned_shape   nonfa{};
+    ggml_sycl::moe_control_requirement            control{};
+    size_t                                        scatter = 0;
+
+    static ggml_sycl_planner_published_terms snapshot(int device) {
+        ggml_sycl_planner_published_terms terms;
+        terms.graph   = ggml_sycl::unified_cache_get_planned_onednn_graph_scratch_shape(device);
+        terms.nonfa   = ggml_sycl::unified_cache_get_planned_nonfa_attn_scratch_shape(device);
+        terms.control = ggml_sycl::unified_cache_get_planned_moe_control_requirement(device);
+        terms.scatter = ggml_sycl::unified_cache_get_planned_moe_host_scatter_scratch_bytes(device);
+        return terms;
+    }
+
+    void restore(int device) const {
+        ggml_sycl::unified_cache_set_planned_onednn_graph_scratch_shape(
+            device, graph.n_head_ctx_max, graph.n_head_swa_max, graph.n_swa, graph.n_ubatch, graph.n_ctx);
+        ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch,
+                                                                      nonfa.n_ctx);
+        ggml_sycl::unified_cache_set_planned_moe_control_requirement(device, control);
+        ggml_sycl::unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);
+    }
+};
+
 // Phase C helper: run compute_placement_plan (single- or multi-device) and
 // store the plan into per-device unified caches.  Idempotent — replaces any
 // previous plan.  Caller must hold g_tensor_inventory_mutex.
@@ -18209,6 +18240,11 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                                                      g_placement_kv_info, envelope_arg, g_moe_n_experts_total,
                                                      ggml_sycl::host_ledger_budget(), g_sycl_lazy_plan_slot);
         };
+        // The plans with the room may be discarded below, and a discarded plan publishes nothing. The terms the planner
+        // publishes as it plans are kept as they stand here, where the entry ensure above found the zones hold them;
+        // the micro-batch's publish just below writes the ring and the dense scratch, none of these.
+        const ggml_sycl_planner_published_terms published_before =
+            ggml_sycl_planner_published_terms::snapshot(ctx->device);
         // An explicit micro-batch's PP MoE oneDNN scratch ring: the planner holds the RUNTIME room the ring needs
         // against the routed experts. Every stage of the load re-publishes the ring and the dense scratch at the load's
         // planning shape, so a zone that an earlier stage of the load, or an earlier load in the process, already grew
@@ -18238,10 +18274,15 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                     plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE;
             }
             if (!placed) {
-                // The arena could not grow (another live model's allocations, or the tail chunk's cap): the load keeps
-                // its planning shape and plans without the room, so no expert leaves the device for a zone that did
-                // not grow, and the context's transaction re-plans the ring as it did before.
+                // The arena could not grow: something still points into it (bytes allocated in its zones, leases on
+                // its chunks, or cache scratch inside it, whichever model or context took them), or the tail chunk's
+                // cap is too small. The load keeps its planning shape and plans without the room, so no expert leaves
+                // the device for a zone that did not grow, and the context's transaction re-plans the ring as it did
+                // before. The plans with the room are discarded, so the terms they published go back before the zones
+                // are sized: the zones are asked for what the entry ensure found they hold, and the plan without the
+                // room publishes its own.
                 (void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);
+                published_before.restore(ctx->device);
                 if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) {
                     GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");
                 }
@@ -18912,20 +18953,17 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
 
 // The per-device globals a plan dry run writes while it plans, read when it starts and written back when it ends, on
 // every exit, so a later load reads what it would have read without the dry run: the planner inputs it publishes from
-// the inventory (ggml_sycl_inventory_publish_planner_inputs) and the shapes the planners publish from each plan (the
-// oneDNN Graph scratch and non-FA attention shapes, the MoE CONTROL requirement, the MoE host scatter scratch). Each
-// setter stores what its getter reads, so the write-back is exact.
+// the inventory (ggml_sycl_inventory_publish_planner_inputs) and the terms the planners publish from each plan, which
+// ggml_sycl_planner_published_terms snapshots and restores, as the load stage's fallback does for the plans it
+// discards. Each setter stores what its getter reads, so the write-back is exact.
 struct ggml_sycl_plan_dry_run_saved_state {
     struct device_state {
-        size_t                                        pp_pipeline = 0;
-        size_t                                        ring_weight = 0;
-        size_t                                        ring_act    = 0;
-        size_t                                        ring_out    = 0;
-        uint32_t                                      ring_depth  = 0;
-        ggml_sycl::onednn_graph_scratch_planned_shape graph{};
-        ggml_sycl::nonfa_attn_scratch_planned_shape   nonfa{};
-        ggml_sycl::moe_control_requirement            control{};
-        size_t                                        scatter = 0;
+        size_t                            pp_pipeline = 0;
+        size_t                            ring_weight = 0;
+        size_t                            ring_act    = 0;
+        size_t                            ring_out    = 0;
+        uint32_t                          ring_depth  = 0;
+        ggml_sycl_planner_published_terms planner;
     };
 
     std::vector<device_state> devices;
@@ -18940,10 +18978,7 @@ struct ggml_sycl_plan_dry_run_saved_state {
             s.ring_act       = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(d);
             s.ring_out       = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(d);
             s.ring_depth     = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(d);
-            s.graph          = ggml_sycl::unified_cache_get_planned_onednn_graph_scratch_shape(d);
-            s.nonfa          = ggml_sycl::unified_cache_get_planned_nonfa_attn_scratch_shape(d);
-            s.control        = ggml_sycl::unified_cache_get_planned_moe_control_requirement(d);
-            s.scatter        = ggml_sycl::unified_cache_get_planned_moe_host_scatter_scratch_bytes(d);
+            s.planner        = ggml_sycl_planner_published_terms::snapshot(d);
         }
     }
 
@@ -18954,12 +18989,7 @@ struct ggml_sycl_plan_dry_run_saved_state {
             ggml_sycl::unified_cache_set_planned_pp_pipeline_scratch_bytes(d, s.pp_pipeline);
             ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(d, s.ring_weight, s.ring_act, s.ring_out,
                                                                        s.ring_depth);
-            ggml_sycl::unified_cache_set_planned_onednn_graph_scratch_shape(
-                d, s.graph.n_head_ctx_max, s.graph.n_head_swa_max, s.graph.n_swa, s.graph.n_ubatch, s.graph.n_ctx);
-            ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(d, s.nonfa.n_head, s.nonfa.n_ubatch,
-                                                                          s.nonfa.n_ctx);
-            ggml_sycl::unified_cache_set_planned_moe_control_requirement(d, s.control);
-            ggml_sycl::unified_cache_set_planned_moe_host_scatter_scratch_bytes(d, s.scatter);
+            s.planner.restore(d);
         }
     }
 

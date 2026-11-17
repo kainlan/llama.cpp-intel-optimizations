@@ -504,6 +504,22 @@ bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, si
     return zone_runtime_reserved_bytes(floor_bytes, requirement, &reserved) && live_zone_bytes > reserved;
 }
 
+bool zone_runtime_requirement(const zone_runtime_terms & terms, size_t * out) {
+    if (out == nullptr) {
+        return false;
+    }
+    const size_t added[] = { terms.moe_host_scatter, terms.mmq_src1, terms.dequant_f16, terms.compute, terms.state };
+    size_t       total   = terms.base;
+    for (const size_t term : added) {
+        if (term > SIZE_MAX - total) {
+            return false;
+        }
+        total += term;
+    }
+    *out = total;
+    return true;
+}
+
 bool zone_arena_rebuild_allowed(const zone_arena_holders & holders) {
     // scratch_outside is not read: a rebuild leaves an allocation outside the arena where it is.
     return holders.live_zone_bytes == 0 && holders.chunk_leases == 0 && holders.scratch_in_arena == 0;

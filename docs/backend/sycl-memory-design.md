@@ -2901,6 +2901,18 @@ The arena can fail to grow for two reasons, and each prints its own line first:
 Either way the load keeps the planning shape: it re-publishes the ring and the
 dense scratch at the load's own micro-batch, sizes the zones for them, and plans
 without the room. So no expert leaves the device for a zone that did not grow.
+
+A plan that is tried and discarded publishes nothing. While a plan is computed
+the planner publishes terms of its own: the MoE host scatter scratch for the
+experts it moved to host, the MoE CONTROL requirement, and the oneDNN Graph and
+non-FA attention scratch shapes. The plan with the room is discarded here, so
+before the zones are sized the load puts those terms back as they stood before
+it planned with the room (`ggml_sycl_planner_published_terms`, which the plan
+dry run restores through as well). The zones are then asked for what the entry
+check found they hold, and the plan without the room publishes its own terms.
+Without that restore, a plan that had moved experts to host left its host
+scatter term published, and the fallback asked a RUNTIME zone that could not
+grow for 90 KB more than it held and aborted.
 One WARN line, at every verbosity, says the named micro-batch was not placed:
 
 ```
