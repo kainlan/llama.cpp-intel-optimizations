@@ -20341,7 +20341,7 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
     const size_t   demand     = ggml_sycl::zone_onednn_graph_scratch_floor_bytes(
         plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, n_ubatch, n_ctx, cap);
     const uint32_t largest = ggml_sycl::zone_onednn_graph_fit_largest_ub(
-        plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, n_ctx, n_ubatch, cap, graph_room,
+        plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, n_ubatch, n_ctx, cap, graph_room,
         free_outside, kSyclArenaMinExternalHeadroomBytes, hold_spill);
     if (largest == n_ubatch) {
         return true;

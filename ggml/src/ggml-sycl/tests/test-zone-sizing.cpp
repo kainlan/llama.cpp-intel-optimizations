@@ -2065,58 +2065,58 @@ int main() {
         // 16 heads, n_ctx 4096, a 1 GiB cap, 192 MiB of Graph room (planned at ubatch 512), 600 MiB free outside the
         // arena, 256 MiB headroom, no hold spill. 2048: 768 MiB, 576 uncovered, refused; 1024: 384 MiB, 192 uncovered,
         // 408 left: fits.
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
                   1024,
               "the refusal at 2048 names 1024");
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 1024, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 1024, 4096, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
                   1024,
               "a micro-batch that fits is returned unchanged");
         // 1500: 562.5 MiB, 370.5 uncovered, 229.5 left: refused; the rung below it is 1024, which fits.
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 1500, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 1500, 4096, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
                   1024,
               "a micro-batch that is not a power of two names the power of two below it");
         // With no Graph room every rung draws at least the 64 MiB minimum outside the arena.
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 0, 200 * MiB, 256 * MiB, 0) == 0,
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 0, 200 * MiB, 256 * MiB, 0) == 0,
               "a card already under the headroom, no room: nothing named");
         // A scratch the room holds draws nothing outside the arena, so the card's free memory and the hold's spill
         // (which the hold check judges on its own) do not refuse it: 768 MiB at 2048 inside 1024 MiB of room.
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 1024 * MiB, 200 * MiB, 256 * MiB, 0) ==
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 1024 * MiB, 200 * MiB, 256 * MiB, 0) ==
                   2048,
               "a scratch inside the room fits on a card under the headroom");
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 1024 * MiB, 200 * MiB, 256 * MiB,
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 1024 * MiB, 200 * MiB, 256 * MiB,
                                                300 * MiB) == 2048,
               "a scratch inside the room fits whatever the hold's spill");
         // 192 MiB of room on a card under the headroom: 2048 and 1024 draw outside the arena and are refused; 512
         // (192 MiB) lies inside the room and is named.
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 192 * MiB, 200 * MiB, 256 * MiB, 0) ==
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 192 * MiB, 200 * MiB, 256 * MiB, 0) ==
                   512,
               "a card under the headroom still gets the largest rung inside the room named");
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB,
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB,
                                                200 * MiB) == 512,
               "the hold's spill is charged beside the uncovered part");
         // 32 at 64 MiB with 300 MiB of spill leaves 236 of 600: no rung fits.
         CHECK(
-            zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 300 * MiB) == 0,
+            zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 300 * MiB) == 0,
             "no rung fits: nothing named");
         // The smallest rung and below it, with no room: 32 and 16 draw the 64 MiB minimum outside the arena, which
         // leaves 536 of 600 MiB (fits) and 236 of 300 MiB (refused, and no smaller rung is tried).
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 32, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 0) == 32,
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 32, 4096, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 0) == 32,
               "a micro-batch of 32 that fits is returned unchanged");
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 32, 1024 * MiB, 0, 300 * MiB, 256 * MiB, 0) == 0,
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 32, 4096, 1024 * MiB, 0, 300 * MiB, 256 * MiB, 0) == 0,
               "a micro-batch of 32 that does not fit: nothing named");
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 16, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 0) == 16,
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 16, 4096, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 0) == 16,
               "a micro-batch below 32 that fits is returned unchanged");
-        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 16, 1024 * MiB, 0, 300 * MiB, 256 * MiB, 0) == 0,
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 16, 4096, 1024 * MiB, 0, 300 * MiB, 256 * MiB, 0) == 0,
               "a micro-batch below 32 that does not fit: nothing named, no rung above it");
         // A 2^k+1 boundary. 32 heads, n_ctx 32768: 6 MiB a row. 65: 390 MiB, which leaves 250 of 640 (refused); the
         // rung below it is 64 (384 MiB, leaves exactly the 256 MiB headroom).
-        CHECK(zone_onednn_graph_fit_largest_ub(32, 0, 0, 32768, 65, 1024 * MiB, 0, 640 * MiB, 256 * MiB, 0) == 64,
+        CHECK(zone_onednn_graph_fit_largest_ub(32, 0, 0, 65, 32768, 1024 * MiB, 0, 640 * MiB, 256 * MiB, 0) == 64,
               "65 when only 64 fits names 64");
         // A sliding-window shape: 16 window heads, n_swa 1024, n_ctx 32768, no full-context heads. A window head sees
         // n_swa + n_ubatch keys: 2048 gives 16 * 3072 * 2048 f32 * 3/2 = 576 MiB, 384 above the 192 MiB room, which
         // leaves 216 of 600 (refused); 1024 gives 16 * 2048 * 1024 f32 * 3/2 = 192 MiB, inside the room. A window of
         // n_swa alone would put 2048 at 192 MiB (fits), and of n_ctx at the 1 GiB cap for 1024 (refused).
-        CHECK(zone_onednn_graph_fit_largest_ub(0, 16, 1024, 32768, 2048, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB,
+        CHECK(zone_onednn_graph_fit_largest_ub(0, 16, 1024, 2048, 32768, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB,
                                                0) == 1024,
               "a sliding-window shape is sized from its window, n_swa + n_ubatch keys");
     }

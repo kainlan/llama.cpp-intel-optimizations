@@ -11,7 +11,9 @@ The arithmetic is host-tested (test-zone-sizing, Case 24h). This file pins the w
 - the transaction calls the check after the non-FA check and before its first state that a refusal must undo;
 - the check returns early when flash attention is off, and when the Graph allocator is disabled;
 - the check runs in probe mode too (the micro-batch ladder must see the verdict a real context gets);
-- the refusal names the largest -ub the same fit accepts.
+- the refusal names the largest -ub the same fit accepts;
+- the fit is handed the context's shape in the floor function's order (n_ubatch before n_ctx) and the same cap, so
+  the two cannot judge different shapes.
 Each claim has a mutant that fails its own check and no other; the order claim has one for each half (the call
 moved above the non-FA check, and moved past the first guarded state).
 
@@ -65,6 +67,7 @@ ALLOCATOR_OFF = "!ggml_sycl::onednn_graph_allocator_enabled()"
 REFUSAL_TEXT = "runtime context update rejected: the oneDNN Graph attention scratch"
 LARGEST_ASSIGN = "const uint32_t largest = ggml_sycl::zone_onednn_graph_fit_largest_ub("
 ADVICE_ARG = "ggml_sycl_hold_fit_advice(largest).c_str()"
+DEMAND_ASSIGN = "const size_t demand = ggml_sycl::zone_onednn_graph_scratch_floor_bytes("
 
 
 def _body(src: str, sig: str) -> tuple:
@@ -157,6 +160,33 @@ def _refusal_names_the_largest_ub(src: str) -> bool:
     return REFUSAL_TEXT in args and args.endswith(f"{ADVICE_ARG})")
 
 
+def _args(call: str) -> list:
+    """The top-level arguments of a parenthesised argument text from _call_text()."""
+    out, depth, cur = [], 0, ""
+    for c in call[1:-1]:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += c
+    out.append(cur.strip())
+    return out
+
+
+def _fit_takes_the_floor_shape_order(src: str) -> bool:
+    """The fit's shape and cap arguments are the floor call's, in the floor's order: n_ubatch, then n_ctx."""
+    body = _body_text(src, CHECK_SIG)
+    if body.count(LARGEST_ASSIGN) != 1 or body.count(DEMAND_ASSIGN) != 1:
+        return False
+    fit = _args(_call_text(body, body.index(LARGEST_ASSIGN) + len(LARGEST_ASSIGN) - 1))
+    floor = _args(_call_text(body, body.index(DEMAND_ASSIGN) + len(DEMAND_ASSIGN) - 1))
+    return len(fit) >= 6 and len(floor) == 6 and fit[:6] == floor and fit[3:5] == ["n_ubatch", "n_ctx"]
+
+
 def _checks(src: str) -> dict:
     return {
         "order": _called_in_order(src),
@@ -164,6 +194,7 @@ def _checks(src: str) -> dict:
         "fa_off": _returns_early_when_fa_off(src),
         "allocator_off": _returns_early_when_allocator_off(src),
         "names_ub": _refusal_names_the_largest_ub(src),
+        "arg_order": _fit_takes_the_floor_shape_order(src),
     }
 
 
@@ -189,6 +220,13 @@ def test_the_check_returns_early_without_flash_attention_or_the_graph_allocator(
 def test_the_refusal_names_the_largest_ub_that_fits():
     assert _refusal_names_the_largest_ub(SYCL_NORM), (
         f"the refusal must end with {ADVICE_ARG}, the -ub zone_onednn_graph_fit_largest_ub() accepts"
+    )
+
+
+def test_the_fit_is_handed_the_shape_in_the_floor_functions_order():
+    assert _fit_takes_the_floor_shape_order(SYCL_NORM), (
+        "zone_onednn_graph_fit_largest_ub() must take the floor call's shape and cap arguments in the floor's order "
+        "(n_ubatch before n_ctx)"
     )
 
 
@@ -238,6 +276,10 @@ def test_every_check_has_a_mutation_witness_that_fails_only_it():
 
     _assert_only(_mutate_in(src, CHECK_SIG, ADVICE_ARG, "ggml_sycl_hold_fit_advice(0).c_str()"), "names_ub",
                  "the refusal names no -ub")
+
+    _assert_only(_mutate_in(src, CHECK_SIG, "plan.planner_n_swa, n_ubatch, n_ctx, cap, graph_room",
+                            "plan.planner_n_swa, n_ctx, n_ubatch, cap, graph_room"), "arg_order",
+                 "the fit handed n_ctx and n_ubatch swapped")
 
 
 if __name__ == "__main__":
