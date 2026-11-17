@@ -633,9 +633,10 @@ ticket reproduced on:
   halves to split each oneDNN attention execute, so a split execute holds
   no more Graph scratch than the cap, unless one query row alone exceeds
   half of it (the one-row case of the `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`
-  row), and the floor never reserves more than the larger of the cap and
-  the 64 MiB minimum (a cap below 64 MiB, a budget under 256 MiB, leaves
-  the minimum). The cap is 1 GiB until the first successful
+  row), and the floor (with a nonzero cap and no ZONE_MB override) never
+  reserves more than the larger of the cap and the 64 MiB minimum (a cap
+  below 64 MiB, a budget under 256 MiB, leaves the minimum). The cap is
+  1 GiB until the first successful
   `ensure_planned_arena_zones()` and `min(1 GiB, a quarter of the budget
   available at the last successful ensure)` after it
   (`GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` overrides both). Within one
