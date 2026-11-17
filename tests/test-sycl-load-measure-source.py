@@ -351,7 +351,9 @@ def site_ok(code: str) -> bool:
     return (
         "sycl_model_loading_guard.txn" in c[call : call + 400]
         and "LLAMA_LOG_WARN(" in unsupported
-        and "unplanned path" in unsupported
+        # true whichever stage was skipped before it: the weights may be placed, the late compute term is not compared
+        and "the compute slot is not checked at load" in unsupported
+        and "unplanned path" not in unsupported
         and "late.unsupported.c_str()" in unsupported
         and "throw" not in unsupported
         and "LLAMA_LOG_WARN(" in not_recorded
@@ -480,7 +482,9 @@ def stage_order_ok(code: str) -> bool:
         and args in c[admit : admit + 300]
         and z("admitted_weights, probe);") in c[admit : admit + 400]
         and "LLAMA_LOG_WARN(" in unsupported
-        and "unplanned path" in unsupported
+        # the weights may still be placed by the late plan; only the compute slot goes unreserved
+        and "the compute slot is not planned at load" in unsupported
+        and "unplanned path" not in unsupported
         and "throw" not in unsupported
         and z("if (!probe.refusal.empty()) { throw std::runtime_error(probe.refusal); }") in probe_seg
         and z("if (!admitted.refusal.empty()) { throw std::runtime_error(admitted.refusal); }") in admit_seg
