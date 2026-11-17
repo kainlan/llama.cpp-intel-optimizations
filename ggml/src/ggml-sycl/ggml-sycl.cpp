@@ -34609,17 +34609,17 @@ static ggml_sycl_device_info ggml_sycl_init() {
         // where a Level Zero context spanning 2+ discrete Arc GPUs triggers
         // UR_RESULT_ERROR_DEVICE_LOST (error 20) at the first MUL_MAT.
         // See intel/compute-runtime#916 and #921.  The backend scheduler is
-        // collapsed to one visible compute device by default; planner-owned MoE
-        // expert parallelism, which is opt-in (GGML_SYCL_MOE_MULTI_GPU=1), uses
-        // separate single-device queues for secondary GPUs and stages
-        // cross-device data explicitly.
+        // collapsed to one visible compute device by default, but the planner
+        // still sees every card: it splits a model without experts over both,
+        // each card on its own single-device queue, and stages cross-device
+        // data explicitly.  Only the cross-card expert path is opt-in
+        // (GGML_SYCL_MOE_MULTI_GPU=1).
         if (info.total_gpu_count > 1) {
             GGML_LOG_WARN(
                 "[SYCL] WARNING: %d GPUs visible. Multi-GPU Level Zero contexts "
                 "trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). "
-                "Scheduler multi-GPU dense/KV placement is disabled by default; "
-                "planner-owned MoE expert dispatch uses isolated per-device queues "
-                "(opt-in: GGML_SYCL_MOE_MULTI_GPU=1).\n",
+                "The scheduler sees one compute device; the planner splits a model without experts "
+                "over both cards; the cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1).\n",
                 info.total_gpu_count);
         }
     }
