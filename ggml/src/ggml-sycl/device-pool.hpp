@@ -30,7 +30,9 @@
 namespace ggml_sycl {
 
 // Forward-declare to avoid circular include with unified-cache.hpp
-size_t unified_cache_total_available_bytes(int device);
+// The raw-allocation gate (defined in unified-cache.cpp): does `bytes` of raw device memory fit beside the arena?
+// Refuses by name, at WARN, and evicts nothing.
+bool unified_cache_raw_gate_admits(int device, sycl::queue & queue, size_t bytes, const char * what);
 class alloc_handle;
 class unified_cache;
 enum class vram_zone_id : uint8_t;
@@ -57,7 +59,7 @@ class sycl_device_pool {
   public:
     // chunk_size: default size for each large allocation (256 MB).
     // Requests larger than chunk_size get their own dedicated chunk.
-    // device_id: logical device index for VRAM budget queries (-1 = no budget check).
+    // device_id: logical device index for the raw-allocation gate on a new chunk (-1 = no gate).
     sycl_device_pool(sycl::queue & queue, int device_id = -1, size_t chunk_size = 256 * 1024 * 1024) :
         queue_(queue),
         device_id_(device_id),
@@ -170,14 +172,10 @@ class sycl_device_pool {
         }
         const size_t backing_size = chunk_size + align;
 
-        // Check if we have enough VRAM for a new chunk
-        if (device_id_ >= 0) {
-            size_t available = unified_cache_total_available_bytes(device_id_);
-            if (backing_size > available) {
-                GGML_LOG_WARN("[DEVICE-POOL] chunk would exceed VRAM budget (need %.1f MB, have %.1f MB)\n",
-                              backing_size / (1024.0 * 1024.0), available / (1024.0 * 1024.0));
-                return {};
-            }
+        // A new chunk is raw device memory outside the arena: it must fit in what the device has left beside it.
+        if (device_id_ >= 0 &&
+            !unified_cache_raw_gate_admits(device_id_, queue_, backing_size, "a device-pool chunk")) {
+            return {};
         }
 
         // Drain ALL queues before allocating device memory.
@@ -302,11 +300,9 @@ class sycl_device_pool {
         }
         const size_t chunk_size   = default_chunk_size_;
         const size_t backing_size = chunk_size + 256;
-        if (device_id_ >= 0) {
-            size_t available = unified_cache_total_available_bytes(device_id_);
-            if (backing_size > available) {
-                return 0;
-            }
+        if (device_id_ >= 0 &&
+            !unified_cache_raw_gate_admits(device_id_, queue_, backing_size, "a device-pool pre-grow chunk")) {
+            return 0;
         }
         try {
             queue_.wait();

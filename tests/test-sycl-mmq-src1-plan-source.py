@@ -565,10 +565,13 @@ def evaluate(backend, common, cache, zone):
         "tag" in note_spill_fn and re.search(r"GGML_LOG_WARN\([^;]*%\.1f MB", note_spill_fn) is not None
     results["teardown reports the hold spills with the scratch stats"] = \
         "unified_cache_take_planned_hold_spills(" in stats_fn and "hold_spills_raw=" in stats_fn
-    evict_at = unified_alloc_fn.find("evict_and_flush(")
-    results["the overcommit guard refuses a hold-induced spill instead of evicting weights"] = \
-        0 <= unified_alloc_fn.find("hold_spill") < evict_at and \
-        re.search(r"if\s*\(\s*hold_spill\s*\)\s*\{[^}]*return false;", unified_alloc_fn[:evict_at]) is not None
+    # The raw device exit's gate (unified-cache.cpp unified_alloc_raw_gate): unified_alloc hands it the hold decision.
+    raw_gate_fn = function_body(cache, r"static bool unified_alloc_raw_gate\([^)]*\)\s*\{") or ""
+    evict_at = raw_gate_fn.find("evict_and_flush(")
+    results["the raw gate refuses a hold-induced spill instead of evicting weights"] = \
+        re.search(r"unified_alloc_raw_gate\(\s*req\s*,\s*alloc_size\s*,\s*hold_spill\s*\)", unified_alloc_fn) is not None and \
+        0 <= raw_gate_fn.find("hold_spill") < evict_at and \
+        re.search(r"if\s*\(\s*hold_spill\s*\)\s*\{[^}]*return false;", raw_gate_fn[:evict_at]) is not None
     results["the held-back request still takes the ordinary spill path"] = \
         re.search(r"if\s*\(\s*!hold_spill\s*\)\s*\{[^}]*zone_alloc\(", unified_alloc_fn) is not None
     results["the outside-arena headroom check is told the worst-case hold spill"] = \
@@ -707,10 +710,11 @@ def evaluate(backend, common, cache, zone):
     results["the f16 walk's success exit refreshes the hold"] = \
         re.search(r"ggml_sycl_planned_scratch_hold_refresh\(ctx\);\s*#\s*else", dq_walk) is not None
     # F1 once more, on the allocator side: a request the hold keeps out of a zone that COULD serve it never reaches
-    # zone_alloc; a request larger than the zone's free bytes is an ordinary spill, so the overcommit guard still
-    # evicts for it (the guard refuses only on hold_spill, which F1's predicate no longer sets for it).
-    results["the overcommit guard refuses only a hold-induced spill"] = \
-        re.search(r"if\s*\(\s*hold_spill\s*\)\s*\{[^{}]*return false;", unified_alloc_fn) is not None
+    # zone_alloc; a request larger than the zone's free bytes is an ordinary spill, so the raw gate treats it as any
+    # raw request (the gate's ERROR refusal for the hold is taken only on hold_spill, which F1's predicate no longer
+    # sets for it).
+    results["only a hold-induced spill takes the raw gate's hold refusal"] = \
+        re.search(r"if\s*\(\s*hold_spill\s*\)\s*\{[^{}]*GGML_LOG_ERROR[^{}]*return false;", raw_gate_fn) is not None
 
     # r2/r3 (hardware, B50 auto-ub1024): the ladder's "does this rung fit" must see a hold-induced spill that
     # pushed the card under the driver headroom. The rung's compute buffers exist only after sched_reserve()
@@ -770,20 +774,23 @@ def evaluate(backend, common, cache, zone):
     # r3 design change (hardware: a 460-512 MB compute buffer spilled to RAW device memory, outside the arena, ate the
     # driver headroom): a compute buffer the RUNTIME zone will not serve (held back by the hold, or the zone is full)
     # is placed in the arena's KV zone first; raw device memory is the last resort. The decision is made in the
-    # allocator, ahead of the overcommit guard (an in-arena placement cannot overcommit the device), so the hold's
-    # spill is attributed to where it actually landed.
+    # allocator, ahead of the raw gate (an in-arena placement never reaches it: the gate sits in the raw exit, which
+    # only a request with no pointer yet enters), so the hold's spill is attributed to where it actually landed.
     ua = unified_alloc_fn
     pred_at = ua.find("zone_runtime_spill_prefers_kv_zone(")
-    kv_at = ua.find("zone_alloc(vram_zone_id::KV")
-    guard_at = ua.find("unified_alloc_total_vram(")
+    # The compute buffer's KV-zone attempt (kv_cache), not the KV role's own route further down: the raw gate sits in
+    # the raw exit, after both.
+    kv_at = ua.find("kv_cache->zone_alloc(vram_zone_id::KV")
+    guard_at = ua.find("unified_alloc_raw_gate(")
     raw_at = ua.find("unified_cache_malloc_device_tracked(")
-    results["a compute buffer the RUNTIME zone will not serve tries the KV zone before the overcommit guard and raw memory"] = \
+    results["a compute buffer the RUNTIME zone will not serve tries the KV zone before the raw gate and raw memory"] = \
         0 <= pred_at < kv_at < guard_at < raw_at and "spill_to_kv_zone_before_raw" in ua and \
         re.search(r"zone_runtime_spill_prefers_kv_zone\([^;]*zone_available\(\s*vram_zone_id::KV\s*\)", ua) is not None
-    results["a placement in the KV zone is skipped by the guard and the zone routing, and counts as an in-arena hold spill"] = \
+    results["a placement in the KV zone is skipped by the raw gate and the zone routing, and counts as an in-arena hold spill"] = \
         re.search(r"unified_cache_note_planned_hold_spill\([^;]*,\s*true\s*\)\s*;", ua) is not None and \
         re.search(r"unified_cache_note_planned_hold_spill\([^;]*,\s*false\s*\)\s*;", ua) is not None and \
-        len(re.findall(r"!\s*kv_placed", ua)) >= 2 and "kv_placed" in ua
+        len(re.findall(r"!\s*kv_placed", ua)) >= 1 and \
+        re.search(r"if\s*\(\s*!ptr\s*&&\s*!kv_spill_to_host\s*\)\s*\{\s*if\s*\(\s*!unified_alloc_raw_gate\(", ua) is not None
     kv_flag_site = backend.find('"backend-buffer-runtime-zone"')
     results["the runtime buffer allocator asks for the KV-zone-first placement"] = \
         kv_flag_site > 0 and "spill_to_kv_zone_before_raw = kv_zone_first" in backend[kv_flag_site:kv_flag_site + 1400]
@@ -1579,9 +1586,9 @@ if args.self_test:
         ("stats omit the hold spills", "teardown reports the hold spills with the scratch stats",
          (mutate_in_func(backend, r"void ggml_backend_sycl_context::log_planned_scratch_stats\(\)",
                          "hold_spills_raw=", "hold_XXXX="), common, cache, zone)),
-        ("guard evicts weights for a hold spill", "the overcommit guard refuses a hold-induced spill instead of evicting weights",
-         (backend, common, mutate_after(cache, "used_vram + alloc_size > total_vram) {",
-                                        "if (hold_spill) {", "if (false) {"), zone)),
+        ("raw gate evicts weights for a hold spill", "the raw gate refuses a hold-induced spill instead of evicting weights",
+         (backend, common, mutate_in_func(cache, r"static bool unified_alloc_raw_gate\(",
+                                          "if (hold_spill) {", "if (false) {"), zone)),
         ("held-back request never spills", "the held-back request still takes the ordinary spill path",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
                                           "if (!hold_spill) {", "if (true) {"), zone)),
@@ -1703,9 +1710,9 @@ if args.self_test:
          (mutate_in_func(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\(",
                          "ggml_sycl_planned_scratch_hold_refresh(ctx);\n#    else", "(void) ctx;\n#    else"),
           common, cache, zone)),
-        ("guard refuses every spill", "the overcommit guard refuses only a hold-induced spill",
-         (backend, common, mutate_after(cache, "used_vram + alloc_size > total_vram) {",
-                                        "if (hold_spill) {", "if (true) {"), zone)),
+        ("raw gate gives every spill the hold refusal", "only a hold-induced spill takes the raw gate's hold refusal",
+         (backend, common, mutate_in_func(cache, r"static bool unified_alloc_raw_gate\(",
+                                          "if (hold_spill) {", "if (true) {"), zone)),
         ("realized check moved back into the recheck",
          "the recheck no longer claims the realized spill (it runs before the rung's worst-case reserves)",
          (mutate_in_func(backend, r"ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn\(",
@@ -1726,21 +1733,21 @@ if args.self_test:
          (mutate_in_func(backend, r"static void ggml_sycl_check_graph_scratch_headroom\(",
                          "= kSyclArenaMinExternalHeadroomBytes;", "= 256ull * 1024ull * 1024ull;"), common, cache, zone)),
         # r3 design change: the KV zone before raw memory
-        ("compute buffer goes raw before the KV zone", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the overcommit guard and raw memory",
+        ("compute buffer goes raw before the KV zone", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the raw gate and raw memory",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "kv_cache->zone_alloc(vram_zone_id::KV,",
                                           "kv_cache->zone_alloc(vram_zone_id::SCRATCH,"), zone)),
-        ("KV placement not asked for", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the overcommit guard and raw memory",
+        ("KV placement not asked for", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the raw gate and raw memory",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "zone_runtime_spill_prefers_kv_zone(",
                                           "zone_runtime_XXXX("), zone)),
-        ("KV placement ignores the KV room", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the overcommit guard and raw memory",
+        ("KV placement ignores the KV room", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the raw gate and raw memory",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "kv_cache->zone_available(vram_zone_id::KV), alloc_size)",
                                           "alloc_size, alloc_size)"), zone)),
-        ("guard runs for a KV placement", "a placement in the KV zone is skipped by the guard and the zone routing, and counts as an in-arena hold spill",
-         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "if (!kv_placed && req.device >= 0", "if (req.device >= 0"), zone)),
-        ("zone routing runs for a KV placement", "a placement in the KV zone is skipped by the guard and the zone routing, and counts as an in-arena hold spill",
+        ("raw gate runs for a KV placement", "a placement in the KV zone is skipped by the raw gate and the zone routing, and counts as an in-arena hold spill",
+         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "if (!ptr && !kv_spill_to_host) {", "if (!kv_spill_to_host) {"), zone)),
+        ("zone routing runs for a KV placement", "a placement in the KV zone is skipped by the raw gate and the zone routing, and counts as an in-arena hold spill",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "if (!kv_placed && req.intent.constraints.prefer_vram_zone",
                                           "if (req.intent.constraints.prefer_vram_zone"), zone)),
-        ("KV placement counted as raw", "a placement in the KV zone is skipped by the guard and the zone routing, and counts as an in-arena hold spill",
+        ("KV placement counted as raw", "a placement in the KV zone is skipped by the raw gate and the zone routing, and counts as an in-arena hold spill",
          (backend, common, mutate_after(cache, "bool kv_placed = false;", "true);", "false);"), zone)),
         ("buffer allocator does not ask for the KV zone", "the runtime buffer allocator asks for the KV-zone-first placement",
          (mutate(backend, "spill_to_kv_zone_before_raw = kv_zone_first", "spill_to_kv_zone_before_raw = false"), common, cache, zone)),

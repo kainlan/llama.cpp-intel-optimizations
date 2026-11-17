@@ -1447,7 +1447,7 @@ int main() {
               "a hold that wraps must not read as no hold");
         // Review r2 F1: held back means the ZONE ALONE would have served the request and the hold is what keeps it
         // out. A request the zone cannot hold anyway spills exactly as it always did, with no hold involved, and
-        // the overcommit guard keeps evicting for it as it did before the hold existed.
+        // meets the allocator's raw gate like any raw request.
         CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 50, 0, 100),
               "an ordinary zone-full spill with no hold is not held back");
         CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 50, 10, 100),

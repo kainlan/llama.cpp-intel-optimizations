@@ -29,6 +29,7 @@
 #include "residency-plan.hpp"
 #include "tlsf-allocator.hpp"
 #include "unified-cache-key.hpp"
+#include "zone-raw-gate.hpp"
 #include "zone-sizing.hpp"
 #include "zone-tag-census.hpp"
 
@@ -2778,6 +2779,9 @@ size_t unified_cache_get_hold_rung_requests(int device_id, uint64_t owner, zone_
 // scheduler compute buffers (rows made by a request flagged as one, by origin: the rung's own bytes, which the
 // realized check credits back). One registry pass, so the two figures are consistent with each other.
 size_t       unified_cache_raw_device_held_bytes(int device_id, size_t * compute_live);
+// The figure the raw-allocation gates compare for a device (zone-raw-gate.hpp): the device total, the arena reservation,
+// the raw rows above, and the bytes in use outside this process's accounting when the device's first cache was made.
+zone_raw_gate_inputs unified_cache_raw_gate_inputs(int device, sycl::queue & queue);
 // The card's free memory WITHOUT the rung's own compute buffers, from the ledger and never a driver read after a
 // release. A window's baseline (the free memory with no raw cache allocation held: `driver_free_now` plus the raw
 // bytes held) is the MAXIMUM reading taken since the owner's last publish (a driver's credit for a freed buffer lags,
@@ -9793,6 +9797,8 @@ bool unified_cache_test_zone_settle_reached();
 bool unified_cache_test_arena_destroy_closing_reached();
 // Whether g_device_caches holds an entry for the device; creates nothing.
 bool unified_cache_test_cache_exists(int device);
+// Sets the device total the raw-allocation gates read for `device`; 0 reads the driver's figure again.
+void unified_cache_test_set_raw_gate_device_total(int device, size_t bytes);
 // Called from cache destruction once arena_destroy() has returned, with the
 // members the cache still holds then. Pass nullptr to remove it.
 using unified_cache_test_destroy_observer = void (*)(int device, ggml_sycl_arena_backing_type backing,
