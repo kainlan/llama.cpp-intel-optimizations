@@ -2926,6 +2926,44 @@ The context then re-plans the ring as described above.
 Only the single-device plan places. A multi-device plan makes no decision, so
 its context keeps the context-time path.
 
+A load whose zones cannot be had is refused, not aborted. Both zone checks of
+the plan, the entry check and the fallback's after it put the discarded plan's
+terms back, end the same way when the arena cannot grow to what the load needs:
+after the lines above, one ERROR names the device, each zone's need and have,
+the shortfall of each short zone, why the zones cannot grow and what to free.
+
+```
+[SYCL-PLAN] model load refused on device <D>: VRAM arena zones SCRATCH need <S> MB have <S0> MB, ONEDNN need
+<O> MB have <O0> MB, RUNTIME need <R> MB have <R0> MB (<X> MB short); live allocations of a model or context
+already on the device hold the arena (the [VRAM-ARENA] lines above name them), so its zones cannot grow. Free that
+model or context, then load this one again
+```
+
+When the arena could be rebuilt but the reserve failed (the tail chunk's cap),
+the reason reads `the device could not reserve an arena with these zones. Free
+VRAM on device <D>, then load this one again`. The line offers no smaller `-c`
+or `-ub`: the load plans its zones at its fixed planning shape (ubatch 512, an
+`n_ctx` of one ubatch), so neither is the term that grew. Any term can be the
+one: whatever holds the arena keeps the zones at the size an earlier load gave
+them, and the device-wide terms (the PP MoE ring, the PP pipeline scratch) are
+this load's alone.
+
+The stage returns `GGML_SYCL_LIFECYCLE_PLAN_REJECTED` from either pass, the
+loader throws, and `llama_model_load` returns NULL, so the tool prints its own
+load failure while the model that holds the arena keeps running. The refused
+load puts back every device-wide planned term it published
+(`ggml_sycl::load_published_terms` in `unified-cache.hpp`: the PP pipeline
+scratch, the ring with its KV-zone slots, row bytes, expert counts and
+micro-batch, the oneDNN pair and its stored sum, and the planner's own terms).
+The stage captures them once per load transaction, before its first device
+plans; the abort of the load's owner effects, which every failed stage and
+every uncommitted end runs, restores them, and drops the owner-keyed terms as
+before. The compute term's micro-batch is not restored: every load records 512.
+`test-zone-sizing` Case 38 pins the line,
+`tests/test-sycl-load-zone-refusal-source.py` pins the wiring and that every
+term the publish paths set is restored, and arm (e) of `test-sycl-plan-dry-run`
+stages a refused load beside a live RUNTIME-zone allocation.
+
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
 holds the compute term the load measured at its planning shape, `n_ctx_train`
 and ubatch 512 (`llama.cpp-fkpg`), and the placed micro-batch's ring and dense
