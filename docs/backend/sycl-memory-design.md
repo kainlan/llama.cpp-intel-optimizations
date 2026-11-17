@@ -2939,6 +2939,10 @@ already on the device hold the arena (the [VRAM-ARENA] lines above name them), s
 model or context, then load this one again
 ```
 
+A zone short by less than 0.1 MB prints its need, have and shortfall in KB, or
+in bytes under 1 KB (`RUNTIME need 1835016.0 KB have 1835008.0 KB (8.0 KB
+short)`), so a shortfall never reads `0.0 MB short`.
+
 When the arena could be rebuilt but the reserve failed (the tail chunk's cap),
 the reason reads `the device could not reserve an arena with these zones. Free
 VRAM on device <D>, then load this one again`. The line offers no smaller `-c`

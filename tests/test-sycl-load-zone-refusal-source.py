@@ -20,7 +20,8 @@ void signatures across the dlopen boundary; they log the refusal and stage nothi
 The refusal names need and have: the ensure writes, at the holders refusal, the three zone sizes it decided on as the
 need and the arena's zone capacities, read before either refusal, as the have; at a failed reserve, the same need and
 those capacities, read before the rebuild destroyed the arena; the device wrapper names a device with no cache. zone_arena_refusal_text prints both for every
-zone (test-zone-sizing Case 38 checks the text).
+zone, in MB, and a short zone whose shortfall is under 0.1 MB in KB, or in bytes under 1 KB, so no shortfall prints as
+0.0 MB (test-zone-sizing Case 38 checks the text).
 
 A failed load puts back what it published: the stage captures the device-wide planned terms before its first device
 plans (load_published_terms::snapshot per device, kept for the one open load transaction), the abort of a load's owner
@@ -193,6 +194,9 @@ TEXT_SIG = "std::string zone_arena_refusal_text(const zone_arena_refusal & refus
 TEXT_ZONES = ('"SCRATCH", refusal.need.scratch, refusal.have.scratch', '"ONEDNN", refusal.need.onednn, '
               'refusal.have.onednn', '"RUNTIME", refusal.need.runtime, refusal.have.runtime')
 TEXT_FORMAT = '"%s%s need %.1f MB have %.1f MB"'
+# A short zone whose shortfall would round to nothing in MB prints its need, have and shortfall in a smaller unit.
+TEXT_SMALL = ('"%s%s need %.1f KB have %.1f KB (%.1f KB short)"',
+              '"%s%s need %zu bytes have %zu bytes (%zu bytes short)"')
 
 
 def claim_refusal_names_need_and_have(uc: str, zs: str) -> bool:
@@ -202,7 +206,7 @@ def claim_refusal_names_need_and_have(uc: str, zs: str) -> bool:
     return (ordered(ensure, ZONES_READ, "if (!zone_arena_rebuild_allowed(holders)) {", HELD_FILL, "arena_destroy();",
                     "if (!arena_reserve(", RESERVE_FILL)
             and NO_CACHE_FILL in fn_body(c, WRAPPER_SIG)
-            and all(z in text for z in TEXT_ZONES) and TEXT_FORMAT in text)
+            and all(z in text for z in TEXT_ZONES) and TEXT_FORMAT in text and all(f in text for f in TEXT_SMALL))
 
 
 # ---- a failed load puts back what it published ----
@@ -360,6 +364,11 @@ def test_witness_have_read_after_the_arena_is_destroyed():
 
 def test_witness_text_drops_the_have():
     m = mutate_in(ZS, TEXT_SIG, TEXT_FORMAT, '"%s%s need %.1f MB"')
+    assert not claim_refusal_names_need_and_have(UC, m)
+
+
+def test_witness_text_prints_a_small_shortfall_in_mb():
+    m = mutate_in(ZS, TEXT_SIG, TEXT_SMALL[0], '"%s%s need %.1f MB have %.1f MB (%.1f MB short)"')
     assert not claim_refusal_names_need_and_have(UC, m)
 
 

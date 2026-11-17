@@ -2532,6 +2532,31 @@ int main() {
         CHECK(!has(hl, "-ub") && !has(hl, "-c ") && !has(hl, "ubatch"), "the refusal offers a smaller -c or -ub");
         CHECK(!hl.empty() && hl.back() != '\n', "the refusal text carries its own newline");
 
+        // A shortfall under 0.1 MB would print as 0.0 MB short beside a need and a have that print the same: the short
+        // zone's need, have and shortfall are printed in KB then, and in bytes under 1 KB, so the line still shows which
+        // zone is short and by how much. The figures of the run whose control load was refused 8 KiB short of RUNTIME.
+        zone_arena_refusal kib_short = held;
+        kib_short.need               = { 512 * MiB, 256 * MiB, 1792 * MiB + 8192 };
+        kib_short.have               = { 512 * MiB, 256 * MiB, 1792 * MiB };
+        const std::string kl         = zone_arena_refusal_text(kib_short);
+        CHECK(has(kl, "RUNTIME need 1835016.0 KB have 1835008.0 KB (8.0 KB short)"),
+              "an 8 KiB RUNTIME shortfall is not printed in KB with the zone's need and have");
+        CHECK(has(kl, "SCRATCH need 512.0 MB have 512.0 MB, ONEDNN need 256.0 MB have 256.0 MB, RUNTIME"),
+              "a zone that fits is not printed in MB beside a short one in KB");
+        CHECK(!has(kl, "MB short"), "an 8 KiB shortfall is printed in MB");
+        zone_arena_refusal bytes_short = kib_short;
+        bytes_short.need.runtime       = 1792 * MiB + 512;
+        CHECK(has(zone_arena_refusal_text(bytes_short),
+                  "RUNTIME need 1879048704 bytes have 1879048192 bytes (512 bytes short)"),
+              "a 512-byte RUNTIME shortfall is not printed in bytes with the zone's need and have");
+        // 0.1 MB is 104857.6 bytes: a shortfall one byte under it is printed in KB, one byte over it in MB.
+        zone_arena_refusal edge = kib_short;
+        edge.need.runtime       = 1792 * MiB + 104857;
+        CHECK(has(zone_arena_refusal_text(edge), "(102.4 KB short)"), "a shortfall just under 0.1 MB is not in KB");
+        edge.need.runtime = 1792 * MiB + 104858;
+        CHECK(has(zone_arena_refusal_text(edge), "RUNTIME need 1792.1 MB have 1792.0 MB (0.1 MB short)"),
+              "a shortfall of 0.1 MB is not printed in MB");
+
         zone_arena_refusal reserve = held;
         reserve.reason             = zone_arena_refusal_reason::RESERVE_FAILED;
         reserve.have               = {};

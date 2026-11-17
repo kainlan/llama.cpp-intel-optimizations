@@ -529,19 +529,31 @@ std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {
     if (refusal.reason == zone_arena_refusal_reason::NONE) {
         return {};
     }
-    constexpr double MiB = 1024.0 * 1024.0;
+    constexpr double KiB = 1024.0;
+    constexpr double MiB = 1024.0 * KiB;
     char             part[192];
     std::snprintf(part, sizeof(part), "[SYCL-PLAN] model load refused on device %d: VRAM arena zones", refusal.device);
     std::string text = part;
     // Every zone with its need and have, and a shortfall only on a zone that is short, so the line says which did not
-    // fit.
+    // fit. A shortfall under 0.1 MB would print as 0.0 MB beside a need and a have that print the same, so that zone's
+    // three figures are printed in KB, and in bytes under 1 KB.
     const auto  zone = [&](const char * sep, const char * name, size_t need, size_t have) {
-        std::snprintf(part, sizeof(part), "%s%s need %.1f MB have %.1f MB", sep, name, need / MiB, have / MiB);
-        text += part;
-        if (need > have) {
-            std::snprintf(part, sizeof(part), " (%.1f MB short)", (need - have) / MiB);
+        const size_t short_bytes = need > have ? need - have : 0;
+        if (short_bytes != 0 && short_bytes < 1024) {
+            std::snprintf(part, sizeof(part), "%s%s need %zu bytes have %zu bytes (%zu bytes short)", sep, name, need,
+                           have, short_bytes);
+        } else if (short_bytes != 0 && static_cast<double>(short_bytes) < 0.1 * MiB) {
+            std::snprintf(part, sizeof(part), "%s%s need %.1f KB have %.1f KB (%.1f KB short)", sep, name, need / KiB,
+                           have / KiB, short_bytes / KiB);
+        } else {
+            std::snprintf(part, sizeof(part), "%s%s need %.1f MB have %.1f MB", sep, name, need / MiB, have / MiB);
             text += part;
+            if (short_bytes == 0) {
+                return;
+            }
+            std::snprintf(part, sizeof(part), " (%.1f MB short)", short_bytes / MiB);
         }
+        text += part;
     };
     zone(" ", "SCRATCH", refusal.need.scratch, refusal.have.scratch);
     zone(", ", "ONEDNN", refusal.need.onednn, refusal.have.onednn);

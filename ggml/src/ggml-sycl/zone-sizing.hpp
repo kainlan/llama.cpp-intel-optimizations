@@ -552,7 +552,8 @@ struct zone_arena_refusal {
 };
 
 // The line a model load refused for `refusal` logs, without a newline: the device, each zone's need and have in MB, the
-// shortfall of each zone that is short, the reason, and what the caller can do. Empty for NONE. The zones are planned
+// shortfall of each zone that is short (a zone short by under 0.1 MB prints its three figures in KB, or in bytes under
+// 1 KB, so no shortfall prints as nothing), the reason, and what the caller can do. Empty for NONE. The zones are planned
 // at the load's fixed planning shape, not at the context's -c or -ub, so the line never offers a smaller context or
 // micro-batch as the remedy.
 std::string zone_arena_refusal_text(const zone_arena_refusal & refusal);
