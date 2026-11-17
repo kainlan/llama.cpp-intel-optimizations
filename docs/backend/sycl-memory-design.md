@@ -2727,9 +2727,27 @@ re-fit's forced re-admission and the `vram_bytes` charge all read that. The two
 facts differ across a model load. The arena and the physical ring outlive a
 model, and a load resets the planned placement to RUNTIME. So a load releases a
 ring that still holds KV-zone bytes, because the reserve's "already sufficient"
-path would otherwise keep it. A slot claimed by an in-flight dispatch refuses
-that release, and it is never forced. The ring is then kept, KV still counts
-what it holds, and the next re-fit re-admits it.
+path would otherwise keep it. The release is an effect of the load stage
+(`ggml_sycl_release_stale_kv_zone_ring()`): it runs only after every refusal of
+the pass is decided, so a refused load leaves the ring as it found it. A slot
+claimed by an in-flight dispatch refuses that release, and it is never forced.
+The ring is then kept, KV still counts what it holds, and the next re-fit
+re-admits it.
+
+**The load stage's two passes.** `ggml_backend_sycl_stage_load_inventory_plan()`
+plans every device first and changes a device only after the last refusal of
+the load is decided. The decide pass publishes planning state, which the abort
+of a refused load puts back, and changes no device. The effect pass then runs,
+device by device and each from the snapshot that device staged: the stale ring's
+release, the layer streaming the late pass decided on, and the late pass's host
+zones (`ggml_sycl_configure_host_zones_for_plan()`). A load refused on any device
+therefore configures no device's host zones, which a later load configures from
+its own plan. The one ring release in the decide pass is the entry ensure's last
+resort (`ggml_sycl_ensure_load_arena_zones()`): when the plan's zones need a
+rebuild and the ring's slot buffers are the arena's only holders
+(`zone_arena_only_ring_holds()`), the ring is released and the zones are asked
+for again. A ring a prefill holds a slot of is kept, and the load is refused as
+for any holder.
 
 **Contiguity.** Each KV-zone slot is one allocation. So the whole KV-zone part
 must also fit the zone's largest free block, read after the old ring is
@@ -2786,8 +2804,7 @@ the prompt and generation tests of one `-b`/`-ub` pair share one model, and it
 reloads the model only when the named micro-batch changes. A reload re-plans
 the experts but not the arena's zones. The arena outlives the model and keeps a
 zone that is larger than a new plan needs. It rebuilds only a zone that is too
-small, and only while it holds nothing, which the PP MoE ring a previous context
-left prevents. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
+small, never to shrink one. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
 instances plan against the RUNTIME zone the 2048 load grew, and keep fewer
 experts on the device than a fresh process would. Such a load prints one WARN
 line after its plan, when the live zone is larger than the zone the arena
@@ -2862,7 +2879,7 @@ than the RUNTIME zone can hold with every device-resident expert re-placed to th
 largest -ub that fits is <L> (device=0)
 ```
 
-The arena can fail to grow for two reasons, and each prints its own line first:
+The arena can fail to grow for three reasons, and each prints its own line first:
 
 - **Something still points into the arena.** Zones are rebuilt only in an arena
   nothing points into: no zone byte allocated, no lease on a chunk, and no cache
@@ -2880,10 +2897,18 @@ The arena can fail to grow for two reasons, and each prints its own line first:
   oneDNN=<O> MB runtime=<R> MB; have scratch=<S0> MB oneDNN=<O0> MB runtime=<R0> MB; live_zone=<L> MB chunk_leases=<C>
   [VRAM-ARENA] live in the arena on device <D> (MB): <zone>=<MB> ...; deferred_in_arena=<n> (<MB> MB requested)
   device_release_retries=<n> device_live_controls=<n> retired_pending=<n> evictions_in_flight=<n>
-  cache_scratch_in_arena=<n> cache_scratch_outside=<n>
+  cache_scratch_in_arena=<n> (pp_moe_ring_slots=<n>) cache_scratch_outside=<n> live_beside_ring=<n>
   [VRAM-ARENA] chunk leases on device <D> by site: <site>=<n> <site>(copy)=<n> ... (sum <n> of <C>)
   [UNIFIED-ALLOC] live-zone-dump at arena-rebuild device=<D> zone=<z> used=<MB> MB ...
   ```
+
+  `pp_moe_ring_slots` counts the PP MoE ring's slot buffers among the cache's
+  scratch in the arena, and `live_beside_ring` the zone allocations that are not
+  those slots, read from each allocator group's own record. When the ring's
+  slots are the only holders (no other scratch, nothing beside the ring, no chunk
+  lease), a model load's entry ensure releases the ring after these lines and
+  asks for the zones again, with a WARN that says so; a ring a prefill holds a
+  slot of is kept, and the load is refused as for any holder.
 
   The sites are `weight_snapshot`, `weight_resolve`, `chunk_view` (a handle made
   from a raw pointer for one use), `tensor_extra`, `expert_dispatch` and
@@ -2898,9 +2923,30 @@ The arena can fail to grow for two reasons, and each prints its own line first:
   with `[VRAM-ARENA] Per-chunk cap <P> MB too small to hold tail zones (<T> MB) +
   min KV (<K> MB); refusing reservation`.
 
-Either way the load keeps the planning shape: it re-publishes the ring and the
+- **The teardown refuses.** A rebuild tears the arena down first
+  (`arena_destroy()`), and a teardown can refuse: the host cannot reserve the
+  teardown's own bookkeeping, allocations are live in the arena, the host cannot
+  record the allocations it waits on, a lease does not end in time, or the device
+  refuses to free a chunk. The ensure then refuses with its own reason
+  (`TEARDOWN_REFUSED`, the cause in `zone_arena_refusal::teardown`), no arena is
+  reserved after it, and one ERROR line names the cause:
+
+  ```
+  [VRAM-ARENA] the arena on device <D> could not be torn down (<cause>); it stays closed to new allocations and
+  no arena is reserved over it: need scratch=<S> MB oneDNN=<O> MB runtime=<R> MB
+  ```
+
+  Every cause but the host bookkeeping one refuses after the teardown closed the
+  arena, which stays closed until a teardown completes. Every later ensure on that
+  device refuses for it, whatever the zones hold, and the load's refusal says to
+  load the model in a new process. A refusal for the host bookkeeping leaves the
+  arena as it was (`it is as it was` in the line), binds its compute zone again,
+  and says to free host memory and load again.
+
+In each case the load keeps the planning shape: it re-publishes the ring and the
 dense scratch at the load's own micro-batch, sizes the zones for them, and plans
 without the room. So no expert leaves the device for a zone that did not grow.
+After a teardown that left the arena closed, that sizing refuses the load too.
 
 A plan that is tried and discarded publishes nothing. While a plan is computed
 the planner publishes terms of its own: the MoE host scatter scratch for the
