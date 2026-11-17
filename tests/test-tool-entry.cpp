@@ -2,14 +2,14 @@
 
 #include "tool-entry.h"
 
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 
-#include <unistd.h>
-
-static int g_seen_argc = -1;
+static int     g_seen_argc = -1;
 static char ** g_seen_argv = nullptr;
 
 static int entry_throws_std(int, char **) {
@@ -70,14 +70,14 @@ static int run_other() {
 
 static int g_failures = 0;
 
-#define CHECK(cond, what)                                 \
-    do {                                                  \
-        if (!(cond)) {                                    \
-            fprintf(stdout, "FAIL: %s\n", what);          \
-            g_failures++;                                 \
-        } else {                                          \
-            fprintf(stdout, "ok: %s\n", what);            \
-        }                                                 \
+#define CHECK(cond, what)                        \
+    do {                                         \
+        if (!(cond)) {                           \
+            fprintf(stdout, "FAIL: %s\n", what); \
+            g_failures++;                        \
+        } else {                                 \
+            fprintf(stdout, "ok: %s\n", what);   \
+        }                                        \
     } while (0)
 
 int main() {
