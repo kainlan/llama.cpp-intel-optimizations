@@ -543,12 +543,14 @@ struct zone_arena_sizes {
 };
 
 // A refusal to size the arena's planned zones: the device, the reason, and per zone the bytes the plan needs and the
-// bytes the arena has, both as the decision read them (have is 0 where no arena existed).
+// bytes the arena has, both as the decision read them (have is 0 where no arena existed). At REBUILD_HELD, holders is
+// what the decision found pointing into the arena, which the line names and chooses its remedy from; 0 otherwise.
 struct zone_arena_refusal {
     zone_arena_refusal_reason reason = zone_arena_refusal_reason::NONE;
     int                       device = -1;
     zone_arena_sizes          need;
     zone_arena_sizes          have;
+    zone_arena_holders        holders;
 };
 
 // The line a model load refused for `refusal` logs, without a newline: the device, each zone's need and have in MB, the

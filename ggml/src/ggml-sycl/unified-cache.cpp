@@ -7721,12 +7721,14 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
                     dump_live_zone_allocations(static_cast<vram_zone_id>(z), "arena-rebuild");
                 }
             }
-            // The caller's refusal of its load names the figures the ERROR line above printed.
+            // The caller's refusal of its load names the figures the ERROR line above printed, and the holders the gate
+            // refused on, which choose its remedy.
             if (refusal != nullptr) {
-                refusal->reason = zone_arena_refusal_reason::REBUILD_HELD;
-                refusal->device = dev_id;
-                refusal->need   = { scratch_zone, onednn_zone, runtime_zone };
-                refusal->have   = arena_zones;
+                refusal->reason  = zone_arena_refusal_reason::REBUILD_HELD;
+                refusal->device  = dev_id;
+                refusal->need    = { scratch_zone, onednn_zone, runtime_zone };
+                refusal->have    = arena_zones;
+                refusal->holders = holders;
             }
             return false;
         }

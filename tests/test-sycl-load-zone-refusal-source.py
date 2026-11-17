@@ -21,7 +21,8 @@ The refusal names need and have: the ensure writes, at the holders refusal, the 
 need and the arena's zone capacities, read before either refusal, as the have; at a failed reserve, the same need and
 those capacities, read before the rebuild destroyed the arena; the device wrapper names a device with no cache. zone_arena_refusal_text prints both for every
 zone, in MB, and a short zone whose shortfall is under 0.1 MB in KB, or in bytes under 1 KB, so no shortfall prints as
-0.0 MB (test-zone-sizing Case 38 checks the text).
+0.0 MB. At the holders refusal the ensure also writes the holders its gate refused on, and the text names them and
+chooses its remedy from them (test-zone-sizing Case 38 checks the text and each remedy).
 
 A failed load puts back what it published: the stage captures the device-wide planned terms before its first device
 plans (load_published_terms::snapshot per device, kept for the one open load transaction), the abort of a load's owner
@@ -184,8 +185,9 @@ NEED = "refusal->need = { scratch_zone, onednn_zone, runtime_zone };"
 HAVE = "refusal->have = arena_zones;"
 ZONES_READ = ("arena_zones = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN), "
               "zone_capacity(vram_zone_id::RUNTIME) };")
+HOLDERS = "refusal->holders = holders;"
 HELD_FILL = ("if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::REBUILD_HELD; refusal->device = "
-             "dev_id; " + NEED + " " + HAVE + " } return false;")
+             "dev_id; " + NEED + " " + HAVE + " " + HOLDERS + " } return false;")
 RESERVE_FILL = ("if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::RESERVE_FAILED; "
                 "refusal->device = dev_id; " + NEED + " " + HAVE + " } return false;")
 NO_CACHE_FILL = ("if (!cache) { if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::NO_CACHE; "
@@ -197,6 +199,8 @@ TEXT_FORMAT = '"%s%s need %.1f MB have %.1f MB"'
 # A short zone whose shortfall would round to nothing in MB prints its need, have and shortfall in a smaller unit.
 TEXT_SMALL = ('"%s%s need %.1f KB have %.1f KB (%.1f KB short)"',
               '"%s%s need %zu bytes have %zu bytes (%zu bytes short)"')
+# The holders refusal's clause is composed from the holders the ensure wrote.
+TEXT_HELD = "text += zone_arena_held_text(refusal.holders, refusal.device);"
 
 
 def claim_refusal_names_need_and_have(uc: str, zs: str) -> bool:
@@ -206,7 +210,8 @@ def claim_refusal_names_need_and_have(uc: str, zs: str) -> bool:
     return (ordered(ensure, ZONES_READ, "if (!zone_arena_rebuild_allowed(holders)) {", HELD_FILL, "arena_destroy();",
                     "if (!arena_reserve(", RESERVE_FILL)
             and NO_CACHE_FILL in fn_body(c, WRAPPER_SIG)
-            and all(z in text for z in TEXT_ZONES) and TEXT_FORMAT in text and all(f in text for f in TEXT_SMALL))
+            and all(z in text for z in TEXT_ZONES) and TEXT_FORMAT in text and all(f in text for f in TEXT_SMALL)
+            and TEXT_HELD in text)
 
 
 # ---- a failed load puts back what it published ----
@@ -364,6 +369,16 @@ def test_witness_have_read_after_the_arena_is_destroyed():
 
 def test_witness_text_drops_the_have():
     m = mutate_in(ZS, TEXT_SIG, TEXT_FORMAT, '"%s%s need %.1f MB"')
+    assert not claim_refusal_names_need_and_have(UC, m)
+
+
+def test_witness_held_refusal_writes_no_holders():
+    m = mutate_in(UC, ENSURE_SIG, HOLDERS, "")
+    assert not claim_refusal_names_need_and_have(m, ZS)
+
+
+def test_witness_text_remedy_ignores_the_holders():
+    m = mutate_in(ZS, TEXT_SIG, TEXT_HELD, "text += zone_arena_held_text(zone_arena_holders{}, refusal.device);")
     assert not claim_refusal_names_need_and_have(UC, m)
 
 

@@ -525,6 +525,65 @@ bool zone_arena_rebuild_allowed(const zone_arena_holders & holders) {
     return holders.live_zone_bytes == 0 && holders.chunk_leases == 0 && holders.scratch_in_arena == 0;
 }
 
+// `bytes` in MB at one decimal, in KB under 0.1 MB, and in bytes under 1 KB, so a small figure never prints as 0.0 MB.
+static std::string zone_bytes_text(size_t bytes) {
+    char out[48];
+    if (bytes < 1024) {
+        std::snprintf(out, sizeof(out), "%zu bytes", bytes);
+    } else if (static_cast<double>(bytes) < 0.1 * 1024.0 * 1024.0) {
+        std::snprintf(out, sizeof(out), "%.1f KB", bytes / 1024.0);
+    } else {
+        std::snprintf(out, sizeof(out), "%.1f MB", bytes / (1024.0 * 1024.0));
+    }
+    return out;
+}
+
+// The holders refusal's clause: each kind of holder that points into the arena with its count, and the remedy the
+// kinds allow. The cache's own scratch buffers stay in the arena until the cache is torn down at process exit, whatever
+// else holds it. Leases with nothing live in the zones outlived what they point at, so no free releases them either.
+// Live allocations belong to a model or context, which freeing releases.
+static std::string zone_arena_held_text(const zone_arena_holders & h, int device) {
+    char        part[96];
+    std::string held[3];
+    int         n = 0;
+    if (h.live_zone_bytes != 0) {
+        held[n++] = zone_bytes_text(h.live_zone_bytes) + " of live allocations in its zones";
+    }
+    if (h.chunk_leases != 0) {
+        std::snprintf(part, sizeof(part), "%u lease%s on its chunks", h.chunk_leases, h.chunk_leases == 1 ? "" : "s");
+        held[n++] = part;
+    }
+    if (h.scratch_in_arena != 0) {
+        std::snprintf(part, sizeof(part), "%u of the cache's own scratch buffers", h.scratch_in_arena);
+        held[n++] = part;
+    }
+    std::string text = "; ";
+    if (n == 0) {
+        text += "allocations of a model or context already on the device";
+    }
+    for (int i = 0; i < n; ++i) {
+        text += (i == 0 ? "" : i == n - 1 ? " and " : ", ") + held[i];
+    }
+    text += " hold the arena (the [VRAM-ARENA] lines above name them), so its zones cannot grow";
+    if (h.scratch_in_arena == 0 && (h.live_zone_bytes != 0 || h.chunk_leases == 0)) {
+        return text + ". Free the model or context they belong to, then load this one again";
+    }
+    char remedy[256];
+    if (h.scratch_in_arena != 0) {
+        std::snprintf(remedy, sizeof(remedy),
+                      ". The cache keeps its own scratch buffers in the arena until the process exits, so freeing a "
+                      "model or context does not let its zones grow. Load this model in a new process before any "
+                      "other on device %d",
+                      device);
+    } else {
+        std::snprintf(remedy, sizeof(remedy),
+                      ". No allocation is live in its zones, so the leases outlived what they point at and are held "
+                      "until the process exits. Load this model in a new process before any other on device %d",
+                      device);
+    }
+    return text + remedy;
+}
+
 std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {
     if (refusal.reason == zone_arena_refusal_reason::NONE) {
         return {};
@@ -560,9 +619,7 @@ std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {
     zone(", ", "RUNTIME", refusal.need.runtime, refusal.have.runtime);
     switch (refusal.reason) {
         case zone_arena_refusal_reason::REBUILD_HELD:
-            text +=
-                "; live allocations of a model or context already on the device hold the arena (the [VRAM-ARENA] lines "
-                "above name them), so its zones cannot grow. Free that model or context, then load this one again";
+            text += zone_arena_held_text(refusal.holders, refusal.device);
             break;
         case zone_arena_refusal_reason::RESERVE_FAILED:
             std::snprintf(part, sizeof(part),

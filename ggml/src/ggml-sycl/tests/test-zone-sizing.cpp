@@ -2519,18 +2519,62 @@ int main() {
         };
 
         zone_arena_refusal held;
-        held.reason          = zone_arena_refusal_reason::REBUILD_HELD;
-        held.device          = 1;
-        held.need            = { 512 * MiB, 300 * MiB, 1985 * MiB };
-        held.have            = { 512 * MiB, 256 * MiB, 1792 * MiB };
-        const std::string hl = zone_arena_refusal_text(held);
+        held.reason                  = zone_arena_refusal_reason::REBUILD_HELD;
+        held.device                  = 1;
+        held.need                    = { 512 * MiB, 300 * MiB, 1985 * MiB };
+        held.have                    = { 512 * MiB, 256 * MiB, 1792 * MiB };
+        held.holders.live_zone_bytes = 4096;
+        const std::string hl         = zone_arena_refusal_text(held);
         CHECK(hl.rfind("[SYCL-PLAN] model load refused on device 1: ", 0) == 0, "the refusal does not name its device");
         CHECK(has(hl, "SCRATCH need 512.0 MB have 512.0 MB, ONEDNN"), "a zone that fits is not named, or is short");
         CHECK(has(hl, "ONEDNN need 300.0 MB have 256.0 MB (44.0 MB short)"), "the ONEDNN need, have or shortfall");
         CHECK(has(hl, "RUNTIME need 1985.0 MB have 1792.0 MB (193.0 MB short)"), "the RUNTIME need, have or shortfall");
-        CHECK(has(hl, "hold the arena") && has(hl, "Free that model or context"), "a held arena's remedy is not named");
         CHECK(!has(hl, "-ub") && !has(hl, "-c ") && !has(hl, "ubatch"), "the refusal offers a smaller -c or -ub");
         CHECK(!hl.empty() && hl.back() != '\n', "the refusal text carries its own newline");
+
+        // The remedy follows what holds the arena. Live allocations in its zones belong to a model or context, which
+        // freeing releases; a byte count under 0.1 MB prints in KB, or in bytes under 1 KB, so it never reads 0.0 MB.
+        CHECK(has(hl,
+                  "; 4.0 KB of live allocations in its zones hold the arena (the [VRAM-ARENA] lines above name "
+                  "them), so its zones cannot grow. Free the model or context they belong to, then load this one "
+                  "again"),
+              "a held arena's live allocations or their remedy are not named");
+        zone_arena_refusal with_lease      = held;
+        with_lease.holders.live_zone_bytes = 512;
+        with_lease.holders.chunk_leases    = 1;
+        with_lease.holders.scratch_outside = 3;
+        const std::string wl               = zone_arena_refusal_text(with_lease);
+        CHECK(has(wl, "; 512 bytes of live allocations in its zones and 1 lease on its chunks hold the arena") &&
+                  has(wl, "Free the model or context they belong to"),
+              "live allocations with a lease beside them are not named with the free-the-model remedy");
+        CHECK(!has(wl, "outside") && !has(wl, "scratch"), "scratch allocated outside the arena is named as a holder");
+        // Leases with nothing live in the zones outlived what they point at: no free releases them.
+        zone_arena_refusal leases_only   = held;
+        leases_only.holders              = {};
+        leases_only.holders.chunk_leases = 48;
+        const std::string ll             = zone_arena_refusal_text(leases_only);
+        CHECK(has(ll,
+                  "; 48 leases on its chunks hold the arena (the [VRAM-ARENA] lines above name them), so its "
+                  "zones cannot grow. No allocation is live in its zones, so the leases outlived what they point "
+                  "at and are held until the process exits. Load this model in a new process before any other on "
+                  "device 1"),
+              "leases with nothing live in the zones are not named with the new-process remedy");
+        CHECK(!has(ll, "Free the model"), "leases with nothing live in the zones are blamed on a model to free");
+        // The cache's own scratch buffers inside the arena stay until the process exits, whatever else holds it.
+        zone_arena_refusal scratch_in       = held;
+        scratch_in.holders.live_zone_bytes  = static_cast<size_t>(269.7 * MiB);
+        scratch_in.holders.chunk_leases     = 49;
+        scratch_in.holders.scratch_in_arena = 5;
+        scratch_in.holders.scratch_outside  = 1;
+        const std::string sl                = zone_arena_refusal_text(scratch_in);
+        CHECK(has(sl,
+                  "; 269.7 MB of live allocations in its zones, 49 leases on its chunks and 5 of the cache's own "
+                  "scratch buffers hold the arena (the [VRAM-ARENA] lines above name them), so its zones cannot "
+                  "grow. The cache keeps its own scratch buffers in the arena until the process exits, so freeing "
+                  "a model or context does not let its zones grow. Load this model in a new process before any "
+                  "other on device 1"),
+              "the cache's scratch buffers inside the arena are not named with the new-process remedy");
+        CHECK(!has(sl, "Free the model"), "the cache's own scratch buffers are blamed on a model to free");
 
         // A shortfall under 0.1 MB would print as 0.0 MB short beside a need and a have that print the same: the short
         // zone's need, have and shortfall are printed in KB then, and in bytes under 1 KB, so the line still shows which

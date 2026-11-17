@@ -2934,14 +2934,25 @@ the shortfall of each short zone, why the zones cannot grow and what to free.
 
 ```
 [SYCL-PLAN] model load refused on device <D>: VRAM arena zones SCRATCH need <S> MB have <S0> MB, ONEDNN need
-<O> MB have <O0> MB, RUNTIME need <R> MB have <R0> MB (<X> MB short); live allocations of a model or context
-already on the device hold the arena (the [VRAM-ARENA] lines above name them), so its zones cannot grow. Free that
-model or context, then load this one again
+<O> MB have <O0> MB, RUNTIME need <R> MB have <R0> MB (<X> MB short); <B> MB of live allocations in its zones
+hold the arena (the [VRAM-ARENA] lines above name them), so its zones cannot grow. Free the model or context they
+belong to, then load this one again
 ```
 
 A zone short by less than 0.1 MB prints its need, have and shortfall in KB, or
 in bytes under 1 KB (`RUNTIME need 1835016.0 KB have 1835008.0 KB (8.0 KB
 short)`), so a shortfall never reads `0.0 MB short`.
+
+The clause after the zones names each kind of holder the rebuild gate refused
+on, with its count, and the remedy follows from them. Live allocations in the
+zones belong to a model or context, and freeing it lets the zones grow: the
+line above. `<N> leases on its chunks` with nothing live in the zones outlived
+what they point at, and `<M> of the cache's own scratch buffers` (the PP MoE
+ring, the oneDNN scratch pair, the reorder temp, a persistent scratch) stay in
+the arena until the cache is torn down at process exit. No free releases
+either, so the line then says to load the model in a new process before any
+other on the device. The cache's scratch decides the remedy whatever else
+holds the arena.
 
 When the arena could be rebuilt but the reserve failed (the tail chunk's cap),
 the reason reads `the device could not reserve an arena with these zones. Free
