@@ -13,7 +13,9 @@
 //  * a nest is refused and leaves the outer override in place;
 //  * a plan publication under the override is refused and publishes nothing;
 //  * the plan-derived multi-GPU latch read follows the override's plan on a mock
-//    two-GPU host, where the process latch (false) cannot.
+//    two-GPU host, where the process latch (false) cannot;
+//  * the cross-card expert path is opt-in, and the two-card plan for a model
+//    without experts does not read the opt-in.
 //
 // No queue or cache is touched: staging, the accessors and the publish store are
 // host code.
@@ -216,6 +218,20 @@ void test_cross_card_expert_path_is_opt_in() {
     unsetenv("GGML_SYCL_MOE_MULTI_GPU");
 }
 
+void test_multi_device_plan_splits_by_fact() {
+    test_sycl_info_override_guard info_guard(make_two_gpu_info());
+    unsetenv("GGML_SYCL_MOE_MULTI_GPU");
+    CHECK(ggml_backend_sycl_multi_device_plan_requested(false), "a model without experts plans both cards by default");
+    CHECK(!ggml_backend_sycl_multi_device_plan_requested(true), "a model with experts plans one card by default");
+    setenv("GGML_SYCL_MOE_MULTI_GPU", "0", 1);
+    CHECK(ggml_backend_sycl_multi_device_plan_requested(false),
+          "GGML_SYCL_MOE_MULTI_GPU=0 does not end the dense split");
+    setenv("GGML_SYCL_MOE_MULTI_GPU", "1", 1);
+    CHECK(ggml_backend_sycl_multi_device_plan_requested(true),
+          "GGML_SYCL_MOE_MULTI_GPU=1 plans experts over both cards");
+    unsetenv("GGML_SYCL_MOE_MULTI_GPU");
+}
+
 // llama.cpp-p6i0: given the measure context's KV shape, install re-fits the staged plan's KV residency for it,
 // with the runtime transaction's fit, against the headroom the plan leaves for KV (no cache exists here, so a
 // device's capacity is the plan's budget). The staged plan itself is never changed.
@@ -331,6 +347,7 @@ int main() {
     test_publish_is_refused_under_the_override();
     test_latch_read_follows_the_plan();
     test_cross_card_expert_path_is_opt_in();
+    test_multi_device_plan_splits_by_fact();
     test_install_refits_kv_for_the_shape();
     test_probe_plan_goes_with_the_candidate();
     lifecycle_abort_probe_placement_plan(PROBE_TXN);

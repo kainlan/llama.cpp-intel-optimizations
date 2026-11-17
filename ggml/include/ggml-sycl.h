@@ -978,11 +978,13 @@ GGML_BACKEND_API void ggml_backend_sycl_get_device_description(int device, char 
 GGML_BACKEND_API int  ggml_backend_sycl_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_sycl_get_device_memory(int device, size_t * free, size_t * total);
 
-// Check if MoE multi-GPU mode is requested via GGML_SYCL_MOE_MULTI_GPU=1.
-// Disabled by default while multi-device Level Zero execution is unstable.
-// When true, the SYCL backend handles multi-device MoE dispatch internally,
-// and secondary GPUs should NOT be exposed to the backend scheduler.
+// Whether the cross-card expert path is requested: two or more GPUs and GGML_SYCL_MOE_MULTI_GPU set non-zero.
+// Off by default: the cards have no peer path. When true, the backend dispatches expert work to secondary
+// GPUs itself, and those GPUs are not exposed to the backend scheduler.
 GGML_BACKEND_API bool ggml_backend_sycl_moe_multi_gpu_requested(void);
+// Whether the placement plan spans every physical GPU for a model with or without experts. A model without
+// experts gets the two-card plan whenever two GPUs are visible; one with experts only on the request above.
+GGML_BACKEND_API bool ggml_backend_sycl_multi_device_plan_requested(bool has_experts);
 GGML_BACKEND_API void ggml_backend_sycl_set_debug(int level);
 
 // llama.cpp-xojq (nphx Task 4b): the GPU MoE routing ceiling

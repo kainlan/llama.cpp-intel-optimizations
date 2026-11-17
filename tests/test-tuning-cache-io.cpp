@@ -940,8 +940,9 @@ TEST(ubatch_cache_v4_file_rejected) {
 // Test: a v5 ubatch cache file is rejected, and the next store replaces it
 // with a current-version file. v5's device_key did not record whether the
 // multi-device plan ran, so a v5 "B70,B50" entry written under that plan
-// (GGML_SYCL_MOE_MULTI_GPU unset) spells exactly what a current key spells
-// for the single-device plan (GGML_SYCL_MOE_MULTI_GPU=0) over the same two
+// (today: a model without experts, or GGML_SYCL_MOE_MULTI_GPU=1) spells
+// exactly what a current key spells for the single-device plan (a model with
+// experts and GGML_SYCL_MOE_MULTI_GPU unset or 0) over the same two
 // scheduler-visible cards -- a terminal entry from one would be trusted by
 // the other.
 TEST(ubatch_cache_v5_file_rejected_then_replaced) {
@@ -1343,11 +1344,12 @@ static const char * const k_igpu = "Intel(R) Graphics";
 
 // Test: a collapsed two-card split and the first card alone are different
 // device sets, at the same budget percentage. This is the dense case too:
-// the hidden-GPU gate (ggml_backend_sycl_moe_multi_gpu_requested()) is
-// total_gpu_count >= 2 whatever the model, so a dense Mistral
-// level_zero:0,1 run has multi_device_plan=true and places a layer
-// block on the B50. test-sycl-auto-ubatch-source pins that gate's model
-// independence.
+// the multi-device plan predicate (ggml_sycl_multi_device_plan_for_loaded_model())
+// is total_gpu_count >= 2 for a model without experts, whatever
+// GGML_SYCL_MOE_MULTI_GPU says, so a dense Mistral level_zero:0,1 run has
+// multi_device_plan=true and places a layer block on the B50.
+// test-sycl-auto-ubatch-source pins that the dense split does not read the
+// expert opt-in.
 TEST(ubatch_device_set_key_split_differs_from_first_card_alone) {
     const std::string alone =
         ubatch_device_set_key(ubatch_test_topology({ 0 }, 1, false), { ubatch_test_identity(k_b70, 100) });

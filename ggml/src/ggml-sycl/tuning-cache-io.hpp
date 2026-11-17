@@ -586,7 +586,7 @@ struct UbatchDeviceTopology {
     // ggml_sycl_info().total_gpu_count: the physical GPUs, hidden or not.
     int              total_gpu_count   = 0;
     // Whether the placement planner runs its multi-device plan
-    // (ggml_backend_sycl_moe_multi_gpu_requested(), the gate the plan itself
+    // (ggml_sycl_multi_device_plan_for_loaded_model(), the predicate the plan itself
     // uses). That plan budgets every physical GPU, the single-device plan
     // only the scheduler's, so the two divide the same devices differently.
     bool             multi_device_plan = false;

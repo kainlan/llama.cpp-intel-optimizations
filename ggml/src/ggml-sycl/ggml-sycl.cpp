@@ -3188,6 +3188,8 @@ static bool ggml_sycl_placement_plan_uses_device(const ggml_sycl::placement_plan
 static bool ggml_sycl_placement_plan_uses_other_device(const ggml_sycl::placement_plan & plan, int current_device);
 static bool ggml_sycl_placement_plan_needs_secondary_devices(const ggml_sycl::placement_plan & plan);
 static bool ggml_sycl_placement_plan_needs_moe_secondary_devices(const ggml_sycl::placement_plan & plan);
+static bool ggml_sycl_moe_multi_gpu_requested();
+static bool ggml_sycl_moe_multi_gpu_wanted(const ggml_sycl::placement_plan & plan);
 static bool ggml_sycl_placement_plan_moe_needs_other_device(const ggml_sycl::placement_plan & plan,
                                                             int                               execution_device);
 
@@ -8695,16 +8697,16 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // -----------------------------------------------------------------------
     // Early multi-GPU setup: register unified caches for secondary GPUs BEFORE
     // the eager VRAM upload so the upload loop can distribute experts across
-    // all devices. The unified cache planner drives multi-device placement
-    // automatically when multiple GPUs are visible.
+    // all devices. This is the cross-card expert path, which runs only when
+    // GGML_SYCL_MOE_MULTI_GPU asks for it and the plan puts experts on a
+    // secondary GPU.
     // -----------------------------------------------------------------------
     if (device == 0) {
-        const char * moe_opt_in = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
-        const int    total_gpus = ggml_sycl_info().total_gpu_count;
-        const bool   plan_known = ggml_sycl_has_global_plan();
-        const bool   plan_needs_secondary =
+        const int  total_gpus = ggml_sycl_info().total_gpu_count;
+        const bool plan_known = ggml_sycl_has_global_plan();
+        const bool plan_needs_secondary =
             plan_known && ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner()));
-        const bool multi_gpu_requested = total_gpus >= 2 && (!moe_opt_in || std::atoi(moe_opt_in) != 0);
+        const bool multi_gpu_requested = ggml_sycl_moe_multi_gpu_requested();
         const bool multi_gpu_on        = multi_gpu_requested && plan_known && plan_needs_secondary;
 
         if (multi_gpu_on && total_gpus >= 2) {
@@ -8729,8 +8731,8 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             }
             if (n_early_ok > 0) {
                 g_moe_multi_gpu_active.store(true, std::memory_order_release);
-                GGML_LOG_INFO("[MOE-MULTI-GPU] Enabled (%s): %d secondary GPUs registered\n",
-                              moe_opt_in ? "env override" : "planner default", n_early_ok);
+                GGML_LOG_INFO("[MOE-MULTI-GPU] Enabled (GGML_SYCL_MOE_MULTI_GPU): %d secondary GPUs registered\n",
+                              n_early_ok);
                 if (std::getenv("GGML_SYCL_MULTI_GPU_MODE") == nullptr) {
                     GGML_LOG_INFO(
                         "[SYCL] Multi-GPU auto mode: using expert locality while scheduler exposes %d/%d devices; "
@@ -8745,8 +8747,8 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             }
         } else if (!multi_gpu_on) {
             GGML_LOG_INFO("[MOE-MULTI-GPU] Disabled: %s\n",
-                          moe_opt_in && std::atoi(moe_opt_in) == 0 ?
-                              "env GGML_SYCL_MOE_MULTI_GPU=0" :
+                          total_gpus >= 2 && !multi_gpu_requested ?
+                              "cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1)" :
                               (plan_known && !plan_needs_secondary ?
                                    "planner placed all executable handles on primary" :
                                    (!plan_known && multi_gpu_requested ?
@@ -8758,23 +8760,25 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         }
     }
 
-    // Phase 3: Consult the unified cache planner's multi_device flag.
-    // When the planner detects multiple GPUs and distributes layers across
-    // devices, MoE multi-GPU must also be active so the dispatch triage
-    // checks secondary GPU caches.  Without this, the planner may place
-    // expert weights on secondary GPUs but the dispatch code ignores them.
+    // Phase 3: Consult the unified cache planner's plan.
+    // When the plan places experts on secondary devices and the cross-card expert path is requested, the latch
+    // must be on so dispatch checks the secondary caches. Without the request the plan never does that.
     {
         ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
         if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-            const auto   plan_owner           = ggml_sycl_cache_plan_owner(cache);
-            const auto & plan                 = *plan_owner;
-            const bool   plan_needs_secondary = ggml_sycl_placement_plan_needs_moe_secondary_devices(plan);
-            if (plan_needs_secondary && !g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
+            // The latch follows the same condition its other writers apply: a plan with secondary expert handles
+            // AND the opt-in. A plan alone never turns the cross-card expert path on.
+            const auto   plan_owner       = ggml_sycl_cache_plan_owner(cache);
+            const auto & plan             = *plan_owner;
+            const bool   multi_gpu_wanted = ggml_sycl_moe_multi_gpu_wanted(plan);
+            if (multi_gpu_wanted && !g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
                 g_moe_multi_gpu_active.store(true, std::memory_order_release);
                 GGML_LOG_INFO("[MOE-MULTI-GPU] Activated by unified cache planner (secondary MoE handles planned)\n");
-            } else if (!plan_needs_secondary && g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
+            } else if (!multi_gpu_wanted && g_moe_multi_gpu_active.load(std::memory_order_acquire)) {
                 g_moe_multi_gpu_active.store(false, std::memory_order_release);
-                GGML_LOG_INFO("[MOE-MULTI-GPU] Deactivated: placement plan has no secondary MoE executable handles\n");
+                GGML_LOG_INFO(
+                    "[MOE-MULTI-GPU] Deactivated: placement plan has no secondary MoE executable handles, or the "
+                    "cross-card expert path is not requested\n");
             }
         }
     }
@@ -17152,15 +17156,18 @@ static bool ggml_sycl_placement_plan_needs_moe_secondary_devices(const ggml_sycl
     return false;
 }
 
-// Was multi-GPU MoE asked for on this host?  Two or more GPUs and not switched off.
+// Was the cross-card expert path asked for on this host? Two or more GPUs and GGML_SYCL_MOE_MULTI_GPU set
+// non-zero. The path puts expert copies on a second card, keeps routing ids in a context shared by both cards
+// and dispatches expert work there. The cards have no peer path, and with this path on by default the first
+// card faulted on its first prompt expert op, so it runs only when asked for.
 static bool ggml_sycl_moe_multi_gpu_requested() {
     const char * env = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
-    return ggml_sycl_info().total_gpu_count >= 2 && (!env || std::atoi(env) != 0);
+    return ggml_sycl_info().total_gpu_count >= 2 && env != nullptr && std::atoi(env) != 0;
 }
 
 // The one function that turns a plan into "this plan wants the multi-GPU MoE path".
-// The latch's writer applies it to the plan it computes, and the measure's executor
-// reads apply it to the override's plan, so both answer from the same condition.
+// The latch's writers apply it to the plan they read, and the measure's executor
+// reads apply it to the override's plan, so all answer from the same condition.
 static bool ggml_sycl_moe_multi_gpu_wanted(const ggml_sycl::placement_plan & plan) {
     return ggml_sycl_moe_multi_gpu_requested() && ggml_sycl_placement_plan_needs_moe_secondary_devices(plan);
 }
@@ -17847,10 +17854,18 @@ static double ggml_sycl_dense_capability_score_for_device(int device_id) {
     return cu_score * xmx_factor * fp16_factor * usm_factor * subgroup_factor;
 }
 
-// Whether the stage plans one plan over every physical device: two or more GPUs and the multi-GPU MoE placement
-// requested. The stage and the plan dry run ask it.
-static bool ggml_sycl_plan_multi_device() {
-    return ggml_sycl_info().total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested();
+// Whether the stage plans one plan over every physical device. A model without experts does on two or more
+// GPUs: its layer blocks split across the cards and the dense block executor moves activations through host
+// staging. A model with experts does only when the cross-card expert path is asked for, because that plan
+// copies experts onto the second card for an executor that is opt-in. The stage, the plan dry run and the
+// tuning-cache key ask it with the same expert fact.
+static bool ggml_sycl_plan_multi_device(bool has_experts) {
+    return ggml_sycl_info().total_gpu_count >= 2 && (!has_experts || ggml_sycl_moe_multi_gpu_requested());
+}
+
+// The same answer for the model the inventory registered, read from the global the planner reads.
+bool ggml_sycl_multi_device_plan_for_loaded_model() {
+    return ggml_sycl_plan_multi_device(g_moe_n_experts_total > 0);
 }
 
 // The VRAM budget each physical device packs its share of a multi-device plan to: the device's budget authority at
@@ -18115,7 +18130,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     g_placement_kv_info.lazy_load_txn           = g_sycl_plan_load_effect_txn;
     const bool   is_moe                        = g_moe_n_experts_total > 0;
     const auto & info                          = ggml_sycl_info();
-    if (ggml_sycl_plan_multi_device()) {
+    if (ggml_sycl_plan_multi_device(is_moe)) {
         // P4.5: Multi-device placement
         ggml_sycl::init_shared_context_queues(info.total_gpu_count);
         std::array<bool, GGML_SYCL_MAX_DEVICES> cache_device_ready{};
@@ -19202,7 +19217,7 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     };
     const int  n_experts    = static_cast<int>(inventory->n_expert);
     const int  n_exposed    = std::min(ggml_backend_sycl_get_device_count(), GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES);
-    const bool multi_device = ggml_sycl_plan_multi_device();
+    const bool multi_device = ggml_sycl_plan_multi_device(n_experts > 0);
 
     // The planners subtract the arena's SCRATCH, ONEDNN and RUNTIME reservations only from the budget of a device whose
     // cache has an active arena, and the dry run creates no cache. Where they subtract none the plan packs more weight
@@ -19348,7 +19363,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(const ggml_sycl_tensor
         {
             std::lock_guard                    lock(g_tensor_inventory_mutex);
             ggml_sycl_plan_dry_run_saved_state saved(ggml_sycl_info().total_gpu_count);
-            multi_device = ggml_sycl_plan_multi_device();
+            multi_device = ggml_sycl_plan_multi_device(inventory->n_expert > 0);
             plans        = ggml_sycl_plan_dry_run_plans(inventory, in, sample, budget_result, out.device_budget_bytes,
                                                         lazy_infos, coverage.pin());
         }
@@ -125729,15 +125744,13 @@ int ggml_backend_sycl_get_device_count() {
 }
 
 bool ggml_backend_sycl_moe_multi_gpu_requested() {
-    // Multi-GPU MoE is the default when multiple GPUs are visible. The early
-    // queue setup and placement planner must agree: if this returns true,
-    // secondary queues are expected to be initialized and able to serve planned
-    // expert entries.
-    const char * env = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
-    if (env) {
-        return std::atoi(env) != 0 && ggml_sycl_info().total_gpu_count >= 2;
-    }
-    return ggml_sycl_info().total_gpu_count >= 2;
+    // The cross-card expert path is opt-in. A dense model's two-card plan does not depend on it: ask
+    // ggml_backend_sycl_multi_device_plan_requested() for that.
+    return ggml_sycl_moe_multi_gpu_requested();
+}
+
+bool ggml_backend_sycl_multi_device_plan_requested(bool has_experts) {
+    return ggml_sycl_plan_multi_device(has_experts);
 }
 
 // backend device
