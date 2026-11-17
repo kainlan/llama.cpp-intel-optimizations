@@ -246,7 +246,8 @@ void test_cross_card_expert_path_is_opt_in() {
 void test_multi_device_plan_splits_by_fact() {
     test_sycl_info_override_guard info_guard(make_two_gpu_info());
     unsetenv("GGML_SYCL_MOE_MULTI_GPU");
-    CHECK(ggml_backend_sycl_multi_device_plan_requested(false), "a model without experts plans both cards by default");
+    CHECK(ggml_backend_sycl_multi_device_plan_requested(false),
+          "a model without experts plans every visible GPU by default");
     CHECK(!ggml_backend_sycl_multi_device_plan_requested(true), "a model with experts plans one card by default");
     setenv("GGML_SYCL_MOE_MULTI_GPU", "0", 1);
     CHECK(ggml_backend_sycl_multi_device_plan_requested(false),

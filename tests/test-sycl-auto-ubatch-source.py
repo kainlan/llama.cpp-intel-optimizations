@@ -2139,7 +2139,7 @@ def _brace_block(code: str, open_idx: int) -> str:
 
 _PLANNER_FN = "static void compute_and_store_plan_for_inventory("
 # The planner asks the one multi-device gate the plan dry run also asks, with the expert fact. A model without
-# experts plans both cards; a model with experts does only on the cross-card expert opt-in.
+# experts plans every visible GPU; a model with experts does only on the cross-card expert opt-in.
 _GATE_FN = "static bool ggml_sycl_plan_multi_device(bool has_experts) {"
 _GATE_RETURN = "return ggml_sycl_info().total_gpu_count >= 2 && (!has_experts || ggml_sycl_moe_multi_gpu_requested());"
 _PLANNER_GATE = "if (ggml_sycl_plan_multi_device(is_moe)) {"
@@ -2257,7 +2257,7 @@ def _assert_expert_path_is_opt_in(code: str) -> None:
 
 
 def test_dense_plan_gate_does_not_read_the_expert_opt_in():
-    """A model without experts plans both cards whatever GGML_SYCL_MOE_MULTI_GPU says, and the cross-card
+    """A model without experts plans every visible GPU whatever GGML_SYCL_MOE_MULTI_GPU says, and the cross-card
     expert path runs only on that opt-in. One predicate per fact, read in one place each."""
     _assert_planner_branches_on_the_gate(_normalize_ws(GGML_SYCL_CPP_CODE))
     _assert_expert_path_is_opt_in(_normalize_ws(GGML_SYCL_CPP_CODE))
@@ -2298,6 +2298,18 @@ def test_init_warning_naming_two_cards_has_a_mutation_witness():
         "the planner splits a model without experts across these GPUs",
         "the planner splits a model without experts over both cards", 1)
     with pytest.raises(AssertionError, match="dense split covers every visible GPU"):
+        _assert_init_warning_counts_no_cards(mutated)
+
+
+def test_init_warning_adding_two_cards_has_a_mutation_witness():
+    """The dense-split clause kept, with a count of cards added: only the no-count assertion can catch it."""
+    assert GGML_SYCL_CPP.count("the planner splits a model without experts across these GPUs") == 1, (
+        "mutation target not found -- update this witness to match the real source"
+    )
+    mutated = GGML_SYCL_CPP.replace(
+        "the planner splits a model without experts across these GPUs",
+        "the planner splits a model without experts across these GPUs over both cards", 1)
+    with pytest.raises(AssertionError, match="must not say both cards"):
         _assert_init_warning_counts_no_cards(mutated)
 
 
