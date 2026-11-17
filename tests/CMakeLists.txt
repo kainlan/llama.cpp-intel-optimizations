@@ -4613,6 +4613,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for a second model load that cannot size the VRAM arena zones: the rebuild refusal names who holds the
+# arena (each zone's live bytes, the queued frees the zones still count, the device's releases that could not complete
+# and wait for a retry (a refused arena lease is the usual cause), the retired entries and evictions in flight) and the
+# RUNTIME requirement line names every term it sums. Host-only, reads the sources as text. Same registration shape as
+# test-sycl-compute-refusal-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-arena-zone-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-arena-zone-refusal-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Jinja fallback for a model whose chat template the built-in matcher does not know (Gemma 4 failed after the load with
 # "try using --jinja"): upstream turns the jinja engine off for llama-completion and llama-mtmd-cli.
 # test-chat-need-jinja checks common_chat_templates_need_jinja() itself. It loads no model, so it keeps the default

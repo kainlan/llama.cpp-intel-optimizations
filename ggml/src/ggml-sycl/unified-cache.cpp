@@ -7488,11 +7488,22 @@ bool unified_cache::ensure_planned_arena_zones() {
             runtime_floor / (1024.0 * 1024.0));
     }
     if (planned_runtime_scratch > runtime_floor) {
+        // Every term of the requirement is named, so two lines whose totals differ say which term moved. The ring is
+        // split as unified_cache_get_planned_runtime_zone_requirement() splits it, from the same getters: ring slots
+        // placed in the shared KV zone are not RUNTIME demand, so moe_onednn is the rest and moe_onednn_in_kv is
+        // printed apart, outside the sum.
+        const size_t ring_in_kv      = unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(dev_id);
+        const size_t ring_in_runtime = planned_pp_moe_onednn > ring_in_kv ? planned_pp_moe_onednn - ring_in_kv : 0;
         GGML_LOG_INFO(
             "[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP scratch planning "
-            "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_control=%.1f MB, compute=%.1f MB, state=%.1f MB)\n",
+            "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_onednn_in_kv=%.1f MB, moe_control=%.1f MB, "
+            "moe_host_scatter=%.1f KB, mmq_src1=%.1f MB, dequant_f16=%.1f MB, compute=%.1f MB, state=%.1f MB)\n",
             runtime_zone / (1024.0 * 1024.0), planned_pp_pipeline / (1024.0 * 1024.0),
-            planned_pp_moe_onednn / (1024.0 * 1024.0), planned_moe_control.bytes / (1024.0 * 1024.0),
+            ring_in_runtime / (1024.0 * 1024.0), ring_in_kv / (1024.0 * 1024.0),
+            planned_moe_control.bytes / (1024.0 * 1024.0),
+            unified_cache_get_planned_moe_host_scatter_scratch_bytes(dev_id) / 1024.0,
+            unified_cache_get_planned_mmq_src1_scratch_bytes(dev_id) / (1024.0 * 1024.0),
+            unified_cache_get_planned_dequant_f16_scratch_bytes(dev_id) / (1024.0 * 1024.0),
             unified_cache_get_planned_compute_term_bytes(dev_id) / (1024.0 * 1024.0),
             unified_cache_get_planned_state_term_bytes(dev_id) / (1024.0 * 1024.0));
     }
@@ -7536,9 +7547,13 @@ bool unified_cache::ensure_planned_arena_zones() {
             return true;
         }
 
-        size_t live_zone_bytes = 0;
+        // Each zone's reading is kept, so a refusal below prints the same figures it decided on: a second read could
+        // disagree with them under a concurrent release.
+        size_t live_zone_used[static_cast<size_t>(vram_zone_id::COUNT)] = {};
+        size_t live_zone_bytes                                          = 0;
         for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
-            live_zone_bytes += zone_used(static_cast<vram_zone_id>(z));
+            live_zone_used[z] = zone_used(static_cast<vram_zone_id>(z));
+            live_zone_bytes += live_zone_used[z];
         }
 
         bool     has_chunk_leases = false;
@@ -7569,6 +7584,55 @@ bool unified_cache::ensure_planned_arena_zones() {
                 zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
                 zone_capacity(vram_zone_id::RUNTIME) / (1024.0 * 1024.0), live_zone_bytes / (1024.0 * 1024.0),
                 chunk_leases);
+            // The total above cannot say who holds the arena. This line prints each zone's live bytes from the reading
+            // the refusal decided on, the queued frees those zones still count, and the device's releases that could
+            // not complete and wait for a retry (a refused arena lease is the usual cause), which tell a free that has
+            // not run yet from an owner that was never released. Retired entries not yet finalized and evictions
+            // still in flight also hold zone bytes without an owner having leaked; both are this cache's counters.
+            // deferred_in_arena counts only a queued free that is a zone sub-allocation or points into the arena:
+            // its bytes stay in the zone's used counter until the queue drains at a later allocation, while a queued
+            // direct allocation outside the arena is in no zone. Its MB figure is the requested sizes; the zones
+            // count them rounded up to the allocator's block. The retries and live controls are the whole device's
+            // release coordinator's, not only this arena's. Each lock is taken alone and released before the log,
+            // and nothing here drains, frees, evicts, resets or allocates device memory.
+            size_t deferred_in_arena_count = 0;
+            size_t deferred_in_arena_bytes = 0;
+            {
+                std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);
+                for (const deferred_free_entry & entry : deferred_frees_) {
+                    if (entry.zone_managed || vram_owns(entry.ptr)) {
+                        ++deferred_in_arena_count;
+                        deferred_in_arena_bytes += entry.size;
+                    }
+                }
+            }
+            // The coordinator is looked up, not created: the accessor that hands one out makes it when it is missing.
+            size_t device_release_retries = 0;
+            size_t device_live_controls   = 0;
+            {
+                std::lock_guard<std::mutex> coordinator_lock(g_allocation_coordinator_mutex);
+                const auto                  it = g_allocation_coordinators.find(dev_id);
+                if (it != g_allocation_coordinators.end() && it->second) {
+                    device_release_retries = it->second->retry_count();
+                    device_live_controls   = it->second->live_controls();
+                }
+            }
+            const size_t retired_pending     = retired_pending_count_.load(std::memory_order_acquire);
+            const int    evictions_in_flight = evictions_in_flight_.load(std::memory_order_relaxed);
+            std::string  zones_live;
+            for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+                char part[48];
+                snprintf(part, sizeof(part), "%s%s=%.1f", z == 0 ? "" : " ",
+                         arena_zone_name(static_cast<vram_zone_id>(z)), live_zone_used[z] / (1024.0 * 1024.0));
+                zones_live += part;
+            }
+            GGML_LOG_ERROR(
+                "[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "
+                "device_release_retries=%zu device_live_controls=%zu retired_pending=%zu evictions_in_flight=%d "
+                "cache_scratch=%d\n",
+                dev_id, zones_live.c_str(), deferred_in_arena_count, deferred_in_arena_bytes / (1024.0 * 1024.0),
+                device_release_retries, device_live_controls, retired_pending, evictions_in_flight,
+                has_live_scratch ? 1 : 0);
             return false;
         }
 
