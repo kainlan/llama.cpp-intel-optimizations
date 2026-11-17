@@ -2052,6 +2052,39 @@ int main() {
         CHECK(zone_onednn_graph_scratch_floor_bytes(0, 0, 0, 2048, 4096, 1024 * MiB) == 64 * MiB, "no eligible head");
     }
 
+    // ---- Case 24h: a context's oneDNN Graph scratch above the zone the load planned. The part above the zone's
+    // Graph room is served outside the arena and must leave the card its headroom; otherwise the refusal names the
+    // largest power-of-two micro-batch whose part fits.
+    {
+        const size_t MiB = 1024 * 1024;
+        using ggml_sycl::zone_onednn_graph_fit_largest_ub;
+        using ggml_sycl::zone_onednn_graph_uncovered_bytes;
+        CHECK(zone_onednn_graph_uncovered_bytes(768 * MiB, 1024 * MiB) == 0, "inside the zone: nothing uncovered");
+        CHECK(zone_onednn_graph_uncovered_bytes(768 * MiB, 512 * MiB) == 256 * MiB, "the part above the room");
+        // 16 heads, n_ctx 4096, a 1 GiB cap, 192 MiB of Graph room (planned at ubatch 512), 600 MiB free outside the
+        // arena, 256 MiB headroom, no hold spill. 2048: 768 MiB, 576 uncovered, refused; 1024: 384 MiB, 192 uncovered,
+        // 408 left: fits.
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
+                  1024,
+              "the refusal at 2048 names 1024");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 1024, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
+                  1024,
+              "a micro-batch that fits is returned unchanged");
+        // 1500: 562.5 MiB, 370.5 uncovered, 229.5 left: refused; the rung below it is 1024, which fits.
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 1500, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
+                  1024,
+              "a micro-batch that is not a power of two names the power of two below it");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 0, 200 * MiB, 256 * MiB, 0) == 0,
+              "a card already under the headroom: nothing named");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB,
+                                               200 * MiB) == 512,
+              "the hold's spill is charged beside the uncovered part");
+        // 32 at 64 MiB with 300 MiB of spill leaves 236 of 600: no rung fits.
+        CHECK(
+            zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 300 * MiB) == 0,
+            "no rung fits: nothing named");
+    }
+
     // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and
     // THAT rung's measured request, not of which other rungs ran before it or in what order. A rung with its own
     // record uses it and only it; a rung without one is scaled from the SET of records (order never matters). -----
