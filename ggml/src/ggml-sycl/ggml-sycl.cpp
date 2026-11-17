@@ -20323,11 +20323,11 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
     // spill with, not a bare driver reading.
     const size_t free_outside =
         ggml_sycl::unified_cache_hold_free_before(device, hold_query.owner, free_mem, hold_query.rung_live);
-    const size_t   cap        = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(device);
+    const size_t cap        = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(device);
     // The room the Graph scratch is guaranteed: the zone less the most the pair admission lets the primitive-API pair
     // grow to (max(its plan, capacity - floor)), not less the pair's live plan. A pair admitted later into the slack
     // is not given back, so a room counted above the bound could be taken from under this context.
-    size_t         pair_bound = 0;
+    size_t       pair_bound = 0;
     if (!ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound)) {
         return true;
     }
