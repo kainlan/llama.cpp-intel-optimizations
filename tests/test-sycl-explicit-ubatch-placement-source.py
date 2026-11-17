@@ -213,6 +213,18 @@ CREDIT_RULE = ("if (n_ubatch == 0 || in.compute_room_n_ubatch == 0 || n_ubatch >
                "n_ubatch == in.held_out_n_ubatch) { return false; } "
                "if (own_record) { return request <= in.compute_room_bytes; } "
                "return in.compute_room_measured_n_ubatch != 0 && n_ubatch <= in.compute_room_measured_n_ubatch;")
+# The two hold-spill refusals print the room's rung and the rung the term was measured at, which differ under a placed
+# micro-batch (the B50 gate's room read 404.0 MB at 1024 with the term measured at 512); the fit's answer carries both.
+ANSWER_SIG = "struct ggml_sycl_hold_fit_answer {"
+ANSWER_MEASURED = "uint32_t compute_room_measured_n_ubatch = 0;"
+FIT_ANSWER_MEASURED = "a.compute_room_measured_n_ubatch = in.compute_room_measured_n_ubatch;"
+REFUSAL_HEADROOM_SIG = ("static bool ggml_sycl_check_hold_spill_headroom(const ggml_sycl_hold_fit_query & q, "
+                        "bool probe_mode)")
+REFUSAL_REALIZED_SIG = "static bool ggml_sycl_check_hold_spill_realized(int device,"
+ROOM_FORMAT = "compute_room=%.1f MB@%u (measured@%u)\\n"
+ROOM_FORMAT_OLD = "compute_room=%.1f MB@%u\\n"
+ROOM_ARGS = "a.compute_room_bytes / mb, a.compute_room_n_ubatch, a.compute_room_measured_n_ubatch);"
+
 # The demand's one arithmetic lives in zone_hold_fit_terms_at, so the terms a refusal prints are the demand's;
 # zone_hold_fit_demand (and so zone_hold_fit) only reads it.
 DEMAND_SIG = "zone_hold_fit_terms zone_hold_fit_terms_at(const zone_hold_fit_inputs & in, uint32_t n_ubatch)"
@@ -412,6 +424,19 @@ def claim_fit_credits_the_placed_compute_room(sycl_cpp: str, zone_cpp: str, cach
             and body(zone, DEMAND_READER_SIG) == DEMAND_READER)
 
 
+def claim_refusals_print_the_measured_rung(sycl_cpp: str) -> bool:
+    """Both hold-spill refusals print the room as its bytes, its rung and the rung the term was measured at, from the
+    fit's answer, which copies the measured rung from the fit's inputs once; the old format, which named the room's
+    rung alone, is printed nowhere."""
+    sycl = norm(sycl_cpp)
+    answer = struct_text(sycl, ANSWER_SIG)
+    fit = body(sycl, FIT_SIG)
+    sites = (body(sycl, REFUSAL_HEADROOM_SIG), body(sycl, REFUSAL_REALIZED_SIG))
+    return (ANSWER_MEASURED in answer and bool(fit) and fit.count(FIT_ANSWER_MEASURED) == 1
+            and all(bool(site) and site.count(ROOM_FORMAT) == 1 and site.count(ROOM_ARGS) == 1 for site in sites)
+            and ROOM_FORMAT_OLD not in sycl)
+
+
 def claim_fit_reads_the_load_planning_micro_batch(sycl_cpp: str, cache_cpp: str) -> bool:
     """The planning micro-batch the fit credits at is the load's, recorded at the inventory intake through the store
     rule and read through its getter. The runtime context transaction, which rewrites the plan's planner_n_ubatch with
@@ -581,6 +606,28 @@ def test_placed_ring_is_kept_for_smaller_contexts():
 
 def test_fit_credits_the_placed_compute_room():
     assert claim_fit_credits_the_placed_compute_room(SYCL_CPP, ZONE_CPP, CACHE_CPP)
+
+
+def test_refusals_print_the_measured_rung():
+    assert claim_refusals_print_the_measured_rung(SYCL_CPP)
+
+
+def test_mutant_refusal_prints_the_room_rung_alone_fails():
+    """The old format: a log reader cannot tell the placed rung from the one the term was measured at."""
+    n = norm(SYCL_CPP)
+    assert n.count(ROOM_FORMAT) == 2
+    assert not claim_refusals_print_the_measured_rung(n.replace(ROOM_FORMAT, ROOM_FORMAT_OLD, 1))
+
+
+def test_mutant_refusal_prints_the_room_rung_twice_fails():
+    n = norm(SYCL_CPP)
+    assert n.count(ROOM_ARGS) == 2
+    assert not claim_refusals_print_the_measured_rung(
+        n.replace(ROOM_ARGS, ROOM_ARGS.replace("a.compute_room_measured_n_ubatch", "a.compute_room_n_ubatch"), 1))
+
+
+def test_mutant_answer_never_carries_the_measured_rung_fails():
+    assert not claim_refusals_print_the_measured_rung(_once(SYCL_CPP, FIT_ANSWER_MEASURED, ""))
 
 
 def test_fit_reads_the_load_planning_micro_batch():
