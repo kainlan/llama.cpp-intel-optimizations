@@ -755,8 +755,7 @@ std::string common_chat_templates_source(const struct common_chat_templates * tm
 }
 
 bool common_chat_templates_need_jinja(const struct common_chat_templates * tmpls) {
-    const std::string src = common_chat_templates_source(tmpls);
-    return !src.empty() && !common_chat_verify_template(src, /* use_jinja= */ false);
+    return !common_chat_verify_template(common_chat_templates_source(tmpls), /* use_jinja= */ false);
 }
 
 common_chat_templates_ptr common_chat_templates_init(const struct llama_model * model,

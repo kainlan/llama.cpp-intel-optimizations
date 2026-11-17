@@ -1,11 +1,10 @@
 // Host test, loads no model: common_chat_templates_need_jinja() says whether the built-in (non-jinja) chat template
-// matcher can render a template set. llama-completion runs the built-in matcher by default and has to switch to the
-// jinja engine for a model whose template the matcher does not know.
+// matcher can render a template set. llama-completion and llama-mtmd-cli run the built-in matcher by default and
+// have to switch to the jinja engine for a model whose template the matcher does not know.
 
 #include "chat.h"
 
 #include <cstdio>
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -59,13 +58,19 @@ int main() {
         CHECK(prompt.find("<<turn:user>>") != std::string::npos);
 
         // the built-in matcher refuses it, and says to use --jinja: this is why the fallback exists
-        bool threw = false;
+        bool        threw = false;
+        std::string what;
         try {
             common_chat_templates_apply(tmpls.get(), one_user_message(false));
         } catch (const std::runtime_error & e) {
-            threw = std::string(e.what()).find("try using --jinja") != std::string::npos;
+            threw = true;
+            what  = e.what();
         }
         CHECK(threw);
+        if (what.find("try using --jinja") == std::string::npos) {
+            fprintf(stderr, "unexpected exception text: %s\n", what.c_str());
+        }
+        CHECK(what.find("try using --jinja") != std::string::npos);
     }
 
     return 0;

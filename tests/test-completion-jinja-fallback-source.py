@@ -148,7 +148,7 @@ def violations_helper(chat_h: str, chat_cpp: str) -> list[str]:
         found.append("common/chat.cpp does not define " + HELPER + "()")
         return found
     body = norm(c[m.end() : match_brace(c, m.end() - 1)])
-    if not re.search(r"common_chat_verify_template\(\s*\w+\s*,\s*(/\*[^*]*\*/\s*)?false\s*\)", body):
+    if not re.search(r"common_chat_verify_template\(\s*[^,]+,\s*(/\*[^*]*\*/\s*)?false\s*\)", body):
         found.append(HELPER + "() must ask common_chat_verify_template(<source>, false), the built-in matcher")
     if "common_chat_templates_source(" not in body:
         found.append(HELPER + "() must take the template text from common_chat_templates_source()")
@@ -248,8 +248,8 @@ def move_before_resolution(raw: str) -> str:
     s, e = raw_block_span(raw)
     block = raw[s:e]
     rest = raw[:s] + raw[e:]
-    m = re.search(r"// auto enable conversation mode if chat template is available\n", rest)
-    assert m, "resolution comment not found"
+    m = re.search(r"[ \t]*const bool has_chat_template = common_chat_templates_was_explicit\(", rest)
+    assert m, "has_chat_template line not found"
     return rest[: m.start()] + block + "\n\n" + rest[m.start() :]
 
 
@@ -261,7 +261,7 @@ def mtmd_block_span(raw: str):
 
 def mtmd_drop_helper(raw: str) -> str:
     s, e = mtmd_block_span(raw)
-    block, n = re.subn(r"\s*&&\s*" + HELPER + r"\(tmpls\.get\(\)\)", "", raw[s:e], count=1)
+    block, n = re.subn(r"\s*&&\s*" + HELPER + r"\(\w+(\.get\(\))?\)", "", raw[s:e], count=1)
     assert n == 1
     return raw[:s] + block + raw[e:]
 
@@ -273,6 +273,22 @@ def mtmd_move_after_copy(raw: str) -> str:
     m = re.search(r"use_jinja = params\.use_jinja;\n", rest)
     assert m, "member copy not found"
     return rest[: m.end()] + block + "\n" + rest[m.end() :]
+
+
+def mtmd_drop_assignment(raw: str) -> str:
+    s, e = mtmd_block_span(raw)
+    block, n = re.subn(r"params\.use_jinja\s*=\s*true\s*;", "", raw[s:e])
+    assert n == 1
+    return raw[:s] + block + raw[e:]
+
+
+def mtmd_move_before_init(raw: str) -> str:
+    s, e = mtmd_block_span(raw)
+    block = raw[s:e]
+    rest = raw[:s] + raw[e:]
+    m = re.search(r"[ \t]*tmpls = common_chat_templates_init\(", rest)
+    assert m, "templates init not found"
+    return rest[: m.start()] + block + "\n" + rest[m.start() :]
 
 
 def mtmd_warn_to_info(raw: str) -> str:
@@ -292,7 +308,7 @@ def test_the_helper_is_declared_and_asks_the_builtin_matcher():
 def test_helper_gate_has_a_witness():
     assert violations_helper(CHAT_H, CHAT_CPP) == [], "the unmutated source must pass first"
     flipped = re.sub(
-        r"(common_chat_verify_template\(\s*\w+\s*,\s*(?:/\*[^*]*\*/\s*)?)false", r"\1true", CHAT_CPP
+        r"(common_chat_verify_template\(\s*[^,]+,\s*(?:/\*[^*]*\*/\s*)?)false", r"\1true", CHAT_CPP
     )
     assert flipped != CHAT_CPP
     assert violations_helper(CHAT_H, flipped), "the jinja verifier cannot detect an unsupported built-in template"
@@ -304,21 +320,30 @@ def test_completion_switches_to_jinja_when_the_matcher_cannot_render():
 
 
 @pytest.mark.parametrize(
-    "name, mutate",
+    "name, mutate, expected",
     [
-        ("drop conversation_mode term", drop_term(r"params\.conversation_mode\s*&&\s*")),
-        ("drop enable_chat_template term", drop_term(r"params\.enable_chat_template\s*&&\s*")),
-        ("drop !use_jinja term", drop_term(r"!params\.use_jinja\s*&&\s*")),
-        ("drop helper term", drop_term(HELPER + r"\(chat_templates\.get\(\)\)")),
-        ("move block after add_bos", move_after_add_bos),
-        ("move block before the resolution", move_before_resolution),
-        ("LOG_WRN to LOG_INF", warn_to_info),
-        ("drop the use_jinja assignment", drop_assignment),
+        (
+            "drop conversation_mode term",
+            drop_term(r"params\.conversation_mode\s*&&\s*"),
+            "does not name 'params.conversation_mode'",
+        ),
+        (
+            "drop enable_chat_template term",
+            drop_term(r"params\.enable_chat_template\s*&&\s*"),
+            "does not name 'params.enable_chat_template'",
+        ),
+        ("drop !use_jinja term", drop_term(r"!params\.use_jinja\s*&&\s*"), "does not name '!params.use_jinja'"),
+        ("drop helper term", drop_term(HELPER + r"\(\w+(\.get\(\))?\)"), "has no `if (..."),
+        ("move block after add_bos", move_after_add_bos, "lies after the add_bos line"),
+        ("move block before the resolution", move_before_resolution, "before the conversation-mode resolution"),
+        ("LOG_WRN to LOG_INF", warn_to_info, "must say it switched engines at LOG_WRN"),
+        ("drop the use_jinja assignment", drop_assignment, "does not set params.use_jinja = true"),
     ],
 )
-def test_completion_gate_has_a_witness(name, mutate):
+def test_completion_gate_has_a_witness(name, mutate, expected):
     assert violations_completion(COMPLETION_CPP) == [], "the unmutated source must pass first"
-    assert violations_completion(mutate(COMPLETION_CPP)), name
+    found = violations_completion(mutate(COMPLETION_CPP))
+    assert any(expected in v for v in found), f"{name}: expected a violation containing {expected!r}, got {found}"
 
 
 def test_nothing_reads_use_jinja_between_template_creation_and_the_block():
@@ -338,16 +363,19 @@ def test_mtmd_cli_switches_to_jinja_when_the_matcher_cannot_render():
 
 
 @pytest.mark.parametrize(
-    "name, mutate",
+    "name, mutate, expected",
     [
-        ("drop helper term", mtmd_drop_helper),
-        ("move block after the member copy", mtmd_move_after_copy),
-        ("LOG_WRN to LOG_INF", mtmd_warn_to_info),
+        ("drop helper term", mtmd_drop_helper, "has no `if (..."),
+        ("move block after the member copy", mtmd_move_after_copy, "lies after the member copy"),
+        ("move block before the templates are created", mtmd_move_before_init, "before the templates are created"),
+        ("LOG_WRN to LOG_INF", mtmd_warn_to_info, "must say it switched engines at LOG_WRN"),
+        ("drop the use_jinja assignment", mtmd_drop_assignment, "does not set params.use_jinja = true"),
     ],
 )
-def test_mtmd_cli_gate_has_a_witness(name, mutate):
+def test_mtmd_cli_gate_has_a_witness(name, mutate, expected):
     assert violations_mtmd(MTMD_CLI_CPP) == [], "the unmutated source must pass first"
-    assert violations_mtmd(mutate(MTMD_CLI_CPP)), name
+    found = violations_mtmd(mutate(MTMD_CLI_CPP))
+    assert any(expected in v for v in found), f"{name}: expected a violation containing {expected!r}, got {found}"
 
 
 if __name__ == "__main__":
