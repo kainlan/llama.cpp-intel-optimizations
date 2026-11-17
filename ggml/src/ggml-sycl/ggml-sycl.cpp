@@ -20338,12 +20338,12 @@ static std::string ggml_sycl_onednn_graph_scratch_advice(
 
 // The context's oneDNN Graph attention scratch against what the load planned: the ONEDNN zone holds the Graph room the
 // load sized for the context it was told; the part of this context's scratch above that room is served outside the
-// arena (the DIRECT path draws raw device memory, not a zone), and it must leave the card its driver headroom beside the
-// hold's worst-case spill. A context that would not is refused here, by name, instead of aborting at its first
+// arena (the DIRECT path draws raw device memory, not a zone), and it must leave the card its driver headroom beside
+// the hold's worst-case spill. A context that would not is refused here, by name, instead of aborting at its first
 // oversized attention. Only the part above the room is refused: a context whose scratch outgrows the zone but fits
-// outside the arena runs, as one DIRECT request per oversized execute. It is asked before the dense scratch is
-// re-planned, and it has no side effect beyond the free-memory reading the non-FA check also takes, so a probe asks it
-// too and the micro-batch ladder sees the same verdict.
+// outside the arena runs, served by the DIRECT path, at most the cap outstanding. It is asked before the dense scratch
+// is re-planned, and it has no side effect beyond the free-memory reading the non-FA check also takes, so a probe asks
+// it too and the micro-batch ladder sees the same verdict.
 static bool ggml_sycl_check_onednn_graph_scratch(int                               device,
                                                  const ggml_sycl::placement_plan & plan,
                                                  bool                              flash_attn_enabled,

@@ -2673,7 +2673,8 @@ out goes DIRECT; the check does not count them.
 **Design choice: refuse only when the part above the zone does not fit
 outside the arena.** Refusing every context whose Graph scratch exceeds the
 zone was rejected: it would refuse Qwen at `-ub 2048`, which runs correctly
-with one DIRECT request, whenever the load's hint was smaller.
+with the part above the zone served by the DIRECT path (at most the cap
+outstanding), whenever the load's hint was smaller.
 
 The check stands aside when flash attention is off (the non-FA check above
 covers that path) and when the Graph allocator is disabled
