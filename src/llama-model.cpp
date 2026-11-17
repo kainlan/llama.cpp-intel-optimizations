@@ -808,6 +808,7 @@ static bool llama_model_sycl_build_early_inventory(llama_model_loader &         
         out.swa_layer_mask[il] = hparams.is_swa(il);
     }
     out.kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(model, n_layer);
+
     const std::unique_ptr<bool[]> sinks_layer_mask = llama_model_sycl_attn_sinks_layers(ml, n_layer);
 
     ggml_sycl_tensor_inventory & inventory = out.inventory;

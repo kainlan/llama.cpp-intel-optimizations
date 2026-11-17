@@ -296,9 +296,12 @@ def test_layers_with_sinks_do_not_count_toward_the_floor() -> None:
     all_max = code.index("n_head_all_max = std::max(n_head_all_max, hparams.n_head(il));")
     skip = re.search(r"if\s*\(\s*sinks_layer_mask\s*&&\s*sinks_layer_mask\[il\]\s*\)\s*\{\s*continue;\s*\}", code)
     assert skip, "populate_inventory must skip layers with sinks before the per-class maxima"
-    assert all_max < skip.start(), "the all-layers maximum must be taken before the sinks skip"
-    assert skip.start() < code.index("n_head_ctx_max = std::max(n_head_ctx_max, hparams.n_head(il));")
-    assert LLAMA_MODEL_CPP.count("llama_model_sycl_attn_sinks_layers(ml, ") == 2, "both inventory builders build the mask"
+    assert all_max < skip.start(), "the sinks skip must come after the all-layers maximum"
+    ctx_max = code.index("n_head_ctx_max = std::max(n_head_ctx_max, hparams.n_head(il));")
+    assert skip.start() < ctx_max, "the sinks skip must come before the per-class maxima"
+    assert LLAMA_MODEL_CPP.count("llama_model_sycl_attn_sinks_layers(ml, ") == 2, (
+        "both inventory builders build the mask"
+    )
 
 
 if __name__ == "__main__":
