@@ -4600,8 +4600,9 @@ static llama_load_measure_result llama_load_stage_measure(const llama_model &   
     return measured;
 }
 
-// A stage measure that is not `ok` ends the stage: a model the measure cannot walk is unsupported (the load takes the
-// unplanned path with a WARN), anything else refuses the load, under the measure's own text either way.
+// A stage measure that is not `ok` ends the stage: a model the measure cannot walk, or a stage with no placement plan
+// staged for this load, is unsupported (the load goes on with a WARN and this stage reserves no compute term); anything
+// else refuses the load, under the measure's own text either way.
 static void llama_load_stage_fail(const llama_load_measure_result & measured,
                                   std::string &                     unsupported,
                                   std::string &                     refusal) {
