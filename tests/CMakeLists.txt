@@ -4614,7 +4614,8 @@ if (Python3_Interpreter_FOUND)
 endif()
 
 # Source gate for a second model load that cannot size the VRAM arena zones: the rebuild refusal names who holds the
-# arena (each zone's live bytes, the queued frees the zones still count, the releases an arena lease refused) and the
+# arena (each zone's live bytes, the queued frees the zones still count, the device's releases that could not complete
+# and wait for a retry (a refused arena lease is the usual cause), the retired entries and evictions in flight) and the
 # RUNTIME requirement line names every term it sums. Host-only, reads the sources as text. Same registration shape as
 # test-sycl-compute-refusal-source above.
 if (Python3_Interpreter_FOUND)

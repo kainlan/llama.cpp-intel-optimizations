@@ -3,10 +3,12 @@
 A process that frees one model and loads another sizes the arena zones again. The zones grow only by a rebuild, and a
 rebuild waits until nothing is live in the arena. These checks pin what the load does around that wait:
 
-(1) The rebuild refusal names who holds the arena: each zone's live bytes from the reading the refusal decided on,
-    the frees still queued behind a GPU event whose bytes the zones still count, and the device's releases an arena
-    lease refused. The line prints those variables, and the path only reads: it drains, frees, evicts, resets and
-    allocates nothing. The RUNTIME requirement line names every term it sums.
+The rebuild refusal names who holds the arena: each zone's live bytes from the reading the refusal decided on, the
+frees still queued behind a GPU event whose bytes the zones still count, the device's releases that could not complete
+and wait for a retry (a refused arena lease is the usual cause), and the cache's retired entries not yet finalized and
+evictions still in flight. The line prints those variables, and the path only reads: it drains, frees, evicts, settles,
+resets, reserves and allocates nothing. The RUNTIME requirement line names every term it sums, the PP MoE oneDNN ring
+split as the requirement splits it.
 
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live
 inside test_*() functions. Checks read COMMENT-STRIPPED, whitespace-normalised text. Each check has a mutation witness
@@ -17,8 +19,6 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# Plain file reads: the codescout index does not see inside ggml-sycl.cpp.
-SYCL = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 UC = (ROOT / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
 
 _LEXEME_RE = re.compile(
@@ -94,12 +94,8 @@ def mutate_in(src: str, sig: str, old: str, new: str) -> str:
 
 
 ENSURE_SIG = "bool unified_cache::ensure_planned_arena_zones()"
-STORE_SIG = "static void compute_and_store_plan_for_inventory("
-IMPL_SIG = "lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl("
-STAGE_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan("
 
-
-# ---- (1) the refusal names who holds the arena ----
+# ---- the refusal names who holds the arena ----
 
 REFUSAL_LINE = '"[VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: "'
 HOLDERS_LINE = '"[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "'
@@ -119,13 +115,19 @@ HOLDERS_ARGS = (
     "deferred_in_arena_bytes",
     "device_release_retries",
     "device_live_controls",
+    "retired_pending",
+    "evictions_in_flight",
 )
-# What the diagnostic must never do: it reads counters, and a drain, free, eviction, reset or allocation here would
-# change the state it reports on.
+# What the diagnostic must never do: it reads counters, and a drain, free, eviction, settle, reset, reservation or
+# allocation here would change the state it reports on.
 MUTATORS = (
     "process_deferred_frees",
     "zone_free(",
-    "evict",
+    "zone_settle(",
+    "host_zone_settle(",
+    "zone_alloc(",
+    "arena_reserve(",
+    "reap",
     "arena_reset(",
     "zone_reset",
     "arena_destroy(",
@@ -136,6 +138,11 @@ MUTATORS = (
     "unified_alloc",
     "unified_allocate",
 )
+# Call forms, so the line's own counters are not matches: any call of a release_* function (release_model_slot,
+# release_entry_allocation_locked, release_physical, release_registered_*, ...), not device_release_retries; and any
+# call whose name holds "evict" (evict, evict_and_flush, evict_one, finalize_evictions, ...), not the
+# evictions_in_flight_ counter the line reads.
+CALL_RES = (re.compile(r"(?<!\w)release_\w*\s*\("), re.compile(r"\w*evict\w*\s*\("))
 _STRING_RE = re.compile(r'"(?:\\.|[^"\\\n])*"')
 
 
@@ -176,7 +183,9 @@ def claim_rebuild_refusal_names_the_holders(uc: str) -> bool:
                 "device_release_retries = it->second->retry_count();",
                 "device_live_controls = it->second->live_controls();",
                 "deferred_in_arena=%zu (%.1f MB requested) ",
-                "device_release_retries=%zu device_live_controls=%zu cache_scratch=%d",
+                "device_release_retries=%zu device_live_controls=%zu retired_pending=%zu evictions_in_flight=%d ",
+                "retired_pending = retired_pending_count_.load(std::memory_order_acquire);",
+                "evictions_in_flight = evictions_in_flight_.load(std::memory_order_relaxed);",
             )
         )
     )
@@ -189,7 +198,7 @@ def claim_holders_line_prints_its_figures(uc: str) -> bool:
 
 def claim_diagnostic_mutates_nothing(uc: str) -> bool:
     seg = refusal_segment(uc)
-    return bool(seg) and not any(t in seg for t in MUTATORS)
+    return bool(seg) and not any(t in seg for t in MUTATORS) and not any(r.search(seg) for r in CALL_RES)
 
 
 def claim_zone_figures_are_the_refusals_reading(uc: str) -> bool:
@@ -202,12 +211,27 @@ def claim_zone_figures_are_the_refusals_reading(uc: str) -> bool:
     )
 
 
+# The requirement sums only the ring's share outside the shared KV zone, so the line prints that share as moe_onednn
+# and the KV share apart, from the same getters the requirement reads.
+RING_IN_KV = "const size_t ring_in_kv = unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(dev_id);"
+RING_IN_RUNTIME = (
+    "const size_t ring_in_runtime = planned_pp_moe_onednn > ring_in_kv ? planned_pp_moe_onednn - ring_in_kv : 0;"
+)
+RING_PRINT = "ring_in_runtime / (1024.0 * 1024.0)"
+
+
 def claim_runtime_line_names_every_term(uc: str) -> bool:
     ens = fn_body(code(uc), ENSURE_SIG)
     k = ens.find(RUNTIME_LINE)
     e = ens.find(");", k) if k != -1 else -1
     line = ens[k:e] if e != -1 else ""
-    return all(
+    return ordered(ens, RING_IN_KV, RING_IN_RUNTIME, RUNTIME_LINE) and ordered(
+        line,
+        "moe_onednn=%.1f MB, moe_onednn_in_kv=%.1f MB, ",
+        "planned_pp_pipeline / (1024.0 * 1024.0), ",
+        RING_PRINT + ", ",
+        "ring_in_kv / (1024.0 * 1024.0), ",
+    ) and "planned_pp_moe_onednn / (1024.0" not in line and all(
         t in line
         for t in (
             "moe_host_scatter=%.1f KB",
@@ -223,8 +247,8 @@ def claim_runtime_line_names_every_term(uc: str) -> bool:
 def test_rebuild_refusal_names_the_holders():
     assert claim_rebuild_refusal_names_the_holders(UC), (
         "ensure_planned_arena_zones() refuses a rebuild without a second ERROR line naming each zone's live bytes, the "
-        "queued deferred frees the zones still count and the device's refused releases, between the refusal line and "
-        "its return false"
+        "queued deferred frees the zones still count, the device's releases waiting for a retry, the retired entries "
+        "and the evictions in flight, between the refusal line and its return false"
     )
 
 
@@ -237,8 +261,9 @@ def test_holders_line_prints_its_figures():
 
 def test_diagnostic_mutates_nothing():
     assert claim_diagnostic_mutates_nothing(UC), (
-        f"the refusal path from its ERROR line to return false calls one of {MUTATORS}: the diagnostic must only read "
-        "counters, never drain, free, evict, reset or allocate"
+        f"the refusal path from its ERROR line to return false names one of {MUTATORS} or calls a release_* or "
+        "*evict* function: the diagnostic must only read counters, never drain, free, evict, settle, reset, reserve "
+        "or allocate"
     )
 
 
@@ -251,8 +276,9 @@ def test_zone_figures_are_the_refusals_reading():
 
 def test_runtime_line_names_every_term():
     assert claim_runtime_line_names_every_term(UC), (
-        "the 'Runtime zone raised' line omits the host scatter, mmq_src1 or dequant_f16 term it sums, so two lines "
-        "whose totals differ cannot say which term moved"
+        "the 'Runtime zone raised' line omits a term it sums (the ring's RUNTIME share, host scatter, mmq_src1, "
+        "dequant_f16) or prints the whole ring as moe_onednn, so two lines whose totals differ cannot say which term "
+        "moved"
     )
 
 
@@ -275,16 +301,53 @@ def test_witness_holders_line_prints_a_literal_for_live_controls():
         mutate_in(
             UC,
             ENSURE_SIG,
-            "device_release_retries, device_live_controls, has_live_scratch",
-            "device_release_retries, 0, has_live_scratch",
+            "device_release_retries, device_live_controls, retired_pending",
+            "device_release_retries, 0, retired_pending",
         )
     )
 
 
+def test_witness_holders_line_prints_a_literal_for_retired_pending():
+    assert not claim_holders_line_prints_its_figures(
+        mutate_in(
+            UC,
+            ENSURE_SIG,
+            "device_live_controls, retired_pending, evictions_in_flight",
+            "device_live_controls, 0, evictions_in_flight",
+        )
+    )
+
+
+DEFERRED_LOCK = "std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);"
+
+
 def test_witness_diagnostic_drains_the_queue():
-    lock = "std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);"
     assert not claim_diagnostic_mutates_nothing(
-        mutate_in(UC, ENSURE_SIG, lock, "process_deferred_frees_locked(); " + lock)
+        mutate_in(UC, ENSURE_SIG, DEFERRED_LOCK, "process_deferred_frees_locked(); " + DEFERRED_LOCK)
+    )
+
+
+def test_witness_diagnostic_settles_a_zone():
+    assert not claim_diagnostic_mutates_nothing(
+        mutate_in(UC, ENSURE_SIG, DEFERRED_LOCK, "zone_settle(vram_zone_id::WEIGHT); " + DEFERRED_LOCK)
+    )
+
+
+def test_witness_diagnostic_allocates_in_a_zone():
+    assert not claim_diagnostic_mutates_nothing(
+        mutate_in(UC, ENSURE_SIG, DEFERRED_LOCK, "zone_alloc(vram_zone_id::RUNTIME, 64, 64); " + DEFERRED_LOCK)
+    )
+
+
+def test_witness_diagnostic_evicts():
+    assert not claim_diagnostic_mutates_nothing(
+        mutate_in(UC, ENSURE_SIG, DEFERRED_LOCK, "evict_one(); " + DEFERRED_LOCK)
+    )
+
+
+def test_witness_diagnostic_releases_a_model_slot():
+    assert not claim_diagnostic_mutates_nothing(
+        mutate_in(UC, ENSURE_SIG, DEFERRED_LOCK, "release_model_slot(0); " + DEFERRED_LOCK)
     )
 
 
@@ -296,6 +359,12 @@ def test_witness_zone_figures_read_again():
 
 def test_witness_runtime_line_without_scatter():
     assert not claim_runtime_line_names_every_term(mutate_in(UC, ENSURE_SIG, "moe_host_scatter=%.1f KB, ", ""))
+
+
+def test_witness_runtime_line_prints_the_whole_ring():
+    assert not claim_runtime_line_names_every_term(
+        mutate_in(UC, ENSURE_SIG, RING_PRINT, "planned_pp_moe_onednn / (1024.0 * 1024.0)")
+    )
 
 
 if __name__ == "__main__":
