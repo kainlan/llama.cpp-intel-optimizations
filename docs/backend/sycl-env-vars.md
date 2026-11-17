@@ -128,8 +128,16 @@ Consequences worth knowing before you reach for this flag:
 - **Init-time probes.** When more than one GPU is visible and the explicit multi-GPU request is true, init runs the
   Level Zero peer-link query and the peer host-bounce measurement. `GGML_SYCL_MOE_MULTI_GPU` non-zero makes that
   request true. The peer-link dump and probe variables also turn the two on.
-- **Active only with the plan.** The path is active when the variable is non-zero, two or more GPUs are present and
-  the placement plan puts experts on a second card. A plan that keeps every expert on the first card leaves it off.
+- **What turns the path on.** The path is active when the variable is non-zero, two or more GPUs are present, the
+  placement plan puts experts on a second card, and at least one secondary queue initialised. A plan that keeps every
+  expert on the first card, or a secondary init that fails, leaves it off (a failed secondary init clears it).
+- **Routing tensors.** With a non-zero value on two or more GPUs, whether or not a plan puts experts on a second card,
+  the MoE's int32 routing tensors (the argsort output and the `ffn_moe_topk` views) become cross-device control tensors
+  held in shared host-control storage. The first one creates a shared context across the cards, and the log shows
+  `[SYCL-CONTROL] Created shared host-control context for N GPUs` (or a `[SYCL-CONTROL]` WARN when a card lacks host
+  USM and the fallback context is used).
+- **Where routing runs.** While the path is active, a MoE router logits matmul, GLU or routing subgraph is not
+  declined to the host backend, so those ops stay on the device.
 - **What is off or refused while it is active.** Each needs the path active, so each also needs two or more GPUs and
   a plan with experts on a second card:
   - oneDNN prompt processing for the MoE is refused (`REFUSED_MOE_MULTI_GPU` in the placement decision);
@@ -140,8 +148,9 @@ Consequences worth knowing before you reach for this flag:
   - the CPU-split prompt route (`moe_pp_cpu_split`) is not used, so the hybrid route stays.
 - **Log lines.** With a non-zero value, no `GGML_SYCL_SPLIT_RATIO` or `GGML_SYCL_TENSOR_SPLIT`, and
   `GGML_SYCL_MULTI_GPU_MODE` unset, init prints an INFO line starting `[SYCL] Multi-GPU auto mode: using expert
-  parallelism`. At weight load, with two or more GPUs visible and the variable not requesting the path, the backend
-  prints the WARN `[MOE-MULTI-GPU] Disabled: cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1)`.
+  parallelism`. The first compute graph that contains MUL_MAT_ID nodes runs the MoE init (a dense model never
+  does), and with two or more GPUs visible and the path not requested that init prints the WARN
+  `[MOE-MULTI-GPU] Disabled: cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1)`.
 
 ## Kernel dispatch tuning
 
