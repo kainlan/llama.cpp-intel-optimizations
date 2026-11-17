@@ -14,7 +14,8 @@
 //   - the recurrent layers are exactly the offloaded layers, with the published row widths and rows;
 //   - the memory kinds llama does not model (MSA, DSA, DSA_ISWA, DSV4) report themselves unsupported by
 //     name, and publish nothing; create_memory(no_alloc) refuses each of them with llama_measure_unsupported,
-//     which the load-time measure maps to "unsupported" (a WARN and the unplanned path, never a failed load);
+//     which the load-time measure maps to "unsupported" (one WARN, and that stage reserves no compute term;
+//     never a failed load);
 //   - every other kind's create_memory(no_alloc) builds the tensors of the real memory, the indexer cache
 //     included, on size-0 dummy buffers;
 //   - the K-shift sub-caches a memory reports (get_shift_caches) are exactly the leaf caches that can shift

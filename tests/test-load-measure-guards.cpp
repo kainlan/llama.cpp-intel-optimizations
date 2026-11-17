@@ -60,6 +60,16 @@ static void fake_clear() {
     g_clears++;
 }
 
+static bool g_staged_ok   = true;
+static int  g_staged_asks = 0;
+
+static bool fake_staged(uint64_t load_txn, enum ggml_sycl_measure_stage stage) {
+    g_staged_asks++;
+    g_txn   = load_txn;
+    g_stage = stage;
+    return g_staged_ok;
+}
+
 static void reset_fakes(bool install_ok) {
     g_installs   = 0;
     g_clears     = 0;
@@ -120,6 +130,32 @@ static void test_guard() {
         }
         CHECK(g_installs == 0 && g_clears == 0, "case %d: %d installs, %d clears", which, g_installs, g_clears);
     }
+}
+
+// A load with no plan staged at a stage is not measured there: the reason is named and the install is never asked,
+// because its refusal would fail a load that has a placement. A backend without the query leaves the install to answer.
+static void test_plan_absent() {
+    reset_fakes(true);
+    g_staged_ok   = false;
+    g_staged_asks = 0;
+
+    const llama_measure_override_procs procs = { &fake_install, &fake_clear, &fake_staged };
+    const char *                       why   = llama_load_measure_plan_absent(procs, 7, GGML_SYCL_MEASURE_STAGE_PROBE);
+    CHECK(why != nullptr && std::strstr(why, "no placement plan") != nullptr, "absent plan not named: %s",
+          why ? why : "(null)");
+    CHECK(g_staged_asks == 1 && g_txn == 7 && g_stage == GGML_SYCL_MEASURE_STAGE_PROBE,
+          "the query did not see the load and the stage");
+    CHECK(g_installs == 0, "the query installed an override");
+
+    g_staged_ok = true;
+    CHECK(llama_load_measure_plan_absent(procs, 7, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C) == nullptr,
+          "a staged plan was read as absent");
+    // reset_fakes leaves g_stage at PROBE, so only a stage other than PROBE shows the query was passed the stage
+    CHECK(g_staged_asks == 2 && g_stage == GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, "the query did not see the stage");
+
+    const llama_measure_override_procs no_query = { &fake_install, &fake_clear };
+    CHECK(llama_load_measure_plan_absent(no_query, 7, GGML_SYCL_MEASURE_STAGE_PROBE) == nullptr,
+          "a backend without the query was read as having no plan");
 }
 
 static ggml_context * new_ctx() {
@@ -1053,6 +1089,7 @@ static void test_state_excess() {
 
 int main() {
     test_guard();
+    test_plan_absent();
     test_dummies();
     test_dummies_multi_buft();
     test_late_check_fold();

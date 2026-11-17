@@ -16022,16 +16022,11 @@ static const char * ggml_sycl_measure_stage_name(ggml_sycl_measure_stage stage) 
     return "unknown";
 }
 
-bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                                  load_txn,
-                                                        ggml_sycl_measure_stage                   stage,
-                                                        const struct ggml_sycl_measure_kv_shape * kv_shape) {
-    if (g_measure_plan_override) {
-        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] measure plan override nested\n");
-        if (ggml_sycl::ggml_sycl_strict_enabled()) {
-            GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested");
-        }
-        return false;
-    }
+// The plan a measure at `stage` installs for the load `load_txn`, or null. The install and the loader's query both
+// read it here, so the loader never runs a measure the install would refuse for want of a plan.
+static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_measure_staged_plan(
+    uint64_t                load_txn,
+    ggml_sycl_measure_stage stage) {
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;
     switch (stage) {
         case GGML_SYCL_MEASURE_STAGE_PROBE:
@@ -16043,6 +16038,29 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
             break;
     }
     if (!snapshot || !snapshot->plan) {
+        return nullptr;
+    }
+    return snapshot;
+}
+
+bool ggml_backend_sycl_measure_plan_staged(uint64_t load_txn, ggml_sycl_measure_stage stage) {
+    return ggml_sycl_measure_staged_plan(load_txn, stage) != nullptr;
+}
+
+bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                                  load_txn,
+                                                        ggml_sycl_measure_stage                   stage,
+                                                        const struct ggml_sycl_measure_kv_shape * kv_shape) {
+    if (g_measure_plan_override) {
+        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] measure plan override nested\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested");
+        }
+        return false;
+    }
+    // A caller that asked ggml_backend_sycl_measure_plan_staged first never reaches this refusal for want of a plan;
+    // the loader (llama_load_measure_run) asks first.
+    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);
+    if (!snapshot) {
         GGML_LOG_ERROR("[LOAD-PLAN] measure plan override: no plan staged for load %llu at stage %s\n",
                        (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage));
         return false;
@@ -34612,14 +34630,16 @@ static ggml_sycl_device_info ggml_sycl_init() {
         // collapsed to one visible compute device by default (a split ratio or
         // tensor split keeps every device visible, so the text follows the same
         // condition as the collapse above), but the planner still sees every
-        // card: it splits a model without experts over both, each card on its
-        // own single-device queue, and stages cross-device data explicitly.
+        // card: it splits a model without experts across every visible GPU
+        // that has a cache and queue for it (ggml_sycl_plan_device_budgets),
+        // however many are visible, each card on its own single-device queue,
+        // and stages cross-device data explicitly.
         // Only the cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1).
         if (info.total_gpu_count > 1) {
             GGML_LOG_WARN(
                 "[SYCL] WARNING: %d GPUs visible. Multi-GPU Level Zero contexts "
                 "trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). "
-                "%s; the planner splits a model without experts over both cards; "
+                "%s; the planner splits a model without experts across these GPUs; "
                 "the cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1).\n",
                 info.total_gpu_count,
                 (split_ratio || tensor_split) ? "The scheduler sees every device (a device split was requested)" :
@@ -128648,6 +128668,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_measure_plan_override_clear") == 0) {
         return (void *) ggml_backend_sycl_measure_plan_override_clear;
+    }
+    if (strcmp(name, "ggml_backend_sycl_measure_plan_staged") == 0) {
+        return (void *) ggml_backend_sycl_measure_plan_staged;
     }
     if (strcmp(name, "ggml_backend_sycl_measure_backend_init") == 0) {
         return (void *) ggml_backend_sycl_measure_backend_init;
