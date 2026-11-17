@@ -50,9 +50,9 @@
 //
 // TWO PROCESSES, NOT TWO MODES IN ONE. onednn_graph_scratch_zone_floor_bytes_swa()
 // memoizes GGML_SYCL_ONEDNN_GRAPH_ZONE_MB via a function-local `static const`
-// on its FIRST call in the process (both the 3-arg and 5-arg wrappers share
-// this one memoization, since the 3-arg overload delegates straight into the
-// 5-arg formula), so "env unset" and "env set" cannot both be exercised in
+// on its FIRST call in the process (the 3-arg wrapper and the swa wrapper
+// share this one memoization, since the 3-arg overload delegates straight
+// into the swa formula), so "env unset" and "env set" cannot both be exercised in
 // one invocation -- whichever happens first wins for the rest of the
 // process. --mode=default (no override in the test's own environment)
 // covers the formula itself; --mode=override (registered with
@@ -156,7 +156,7 @@ void test_default_formula() {
     check(floor_tiny >= 64 * kMiB, "floor(1, 1, 1) still respects the 64 MiB minimum");
 }
 
-// llama.cpp-o3a0: the window-aware 5-arg formula
+// llama.cpp-o3a0: the window-aware formula behind the swa wrapper
 // (onednn_graph_scratch_zone_floor_bytes_swa()) that the 3-arg suite above
 // now delegates through with an empty SWA class. Shares the same
 // GGML_SYCL_ONEDNN_GRAPH_ZONE_MB memoization as test_default_formula() (one
@@ -307,15 +307,15 @@ void test_override() {
     check(floor_large == 99 * kMiB, "override wins at a huge shape too (the formula is bypassed entirely)");
 
     // llama.cpp-o3a0: the override is one memoized static shared by both the
-    // 3-arg and 5-arg formulas (the 3-arg overload delegates into the 5-arg
-    // one) -- confirm it also wins through the 5-arg wrapper directly,
+    // 3-arg formula and the swa formula (the 3-arg overload delegates into
+    // the swa one) -- confirm it also wins through the swa wrapper directly,
     // rather than only through the delegation path exercised above. The
     // DIRECT cap passed is nonzero and below the override, so the override
     // must win over the cap too: a cap of 0 would leave that untested.
     const size_t cap_below_override = 32 * kMiB;
     const size_t floor_swa =
         ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(128, 64, 4096, 4096, 1u << 20, cap_below_override);
-    check(floor_swa == 99 * kMiB, "override wins through the 5-arg swa wrapper too, not just via delegation");
+    check(floor_swa == 99 * kMiB, "override wins through the swa wrapper too, not just via delegation");
 }
 
 }  // namespace
