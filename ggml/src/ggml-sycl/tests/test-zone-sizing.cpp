@@ -2075,8 +2075,22 @@ int main() {
         CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 1500, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
                   1024,
               "a micro-batch that is not a power of two names the power of two below it");
+        // With no Graph room every rung draws at least the 64 MiB minimum outside the arena.
         CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 0, 200 * MiB, 256 * MiB, 0) == 0,
-              "a card already under the headroom: nothing named");
+              "a card already under the headroom, no room: nothing named");
+        // A scratch the room holds draws nothing outside the arena, so the card's free memory and the hold's spill
+        // (which the hold check judges on its own) do not refuse it: 768 MiB at 2048 inside 1024 MiB of room.
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 1024 * MiB, 200 * MiB, 256 * MiB, 0) ==
+                  2048,
+              "a scratch inside the room fits on a card under the headroom");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 1024 * MiB, 200 * MiB, 256 * MiB,
+                                               300 * MiB) == 2048,
+              "a scratch inside the room fits whatever the hold's spill");
+        // 192 MiB of room on a card under the headroom: 2048 and 1024 draw outside the arena and are refused; 512
+        // (192 MiB) lies inside the room and is named.
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 192 * MiB, 200 * MiB, 256 * MiB, 0) ==
+                  512,
+              "a card under the headroom still gets the largest rung inside the room named");
         CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB,
                                                200 * MiB) == 512,
               "the hold's spill is charged beside the uncovered part");
