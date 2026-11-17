@@ -223,12 +223,15 @@ inline uint32_t llama_load_measure_n_ctx(uint32_t n_ctx, uint32_t n_ctx_train) {
     return n_ctx != 0 ? n_ctx : n_ctx_train;
 }
 
-// The shape a load-time measure runs at, from the hints the caller gave the load (llama_model_params::n_ctx_hint and
-// n_ubatch_hint). n_ctx is the context the KV room is held for (llama_n_ctx_hint_resolve, padded as llama_context
-// pads it), or the training context when the caller names none or gives no hint. n_ubatch is the caller's
-// micro-batch, or the auto ladder's bottom rung for none, the rung a MoE model's auto pick stays at; it is clamped to
-// n_ctx because llama_context clamps a causal micro-batch to its context. The measure's params, the reservation, the
-// record and the micro-batch the backend credits the term at all read this one shape.
+// The shape a load-time measure would run at, from the hints the caller gave the load (llama_model_params::n_ctx_hint
+// and n_ubatch_hint): the context and micro-batch a real llama_context reports for the same request. The context is
+// the caller's when the hint names one (llama_n_ctx_hint_resolve, the one place the hint is resolved), or the
+// training context when the caller names none or gives no hint; either way it is padded to 256 as llama_context pads
+// it. The micro-batch is the caller's, or the auto ladder's bottom rung for none, the rung a MoE model's auto pick
+// stays at; it is clamped to the unpadded context, because llama_context clamps a causal micro-batch to its context
+// before it pads that context. A training context of 0 with no hint clamps nothing. The resolver exists so that the
+// measure's params, the reservation, the record and the micro-batch the backend credits the term at can share one
+// shape.
 struct llama_load_measure_shape {
     uint32_t n_ctx    = 0;
     uint32_t n_ubatch = 0;
@@ -237,12 +240,14 @@ struct llama_load_measure_shape {
 inline llama_load_measure_shape llama_load_measure_shape_resolve(uint32_t n_ctx_hint,
                                                                  uint32_t n_ubatch_hint,
                                                                  uint32_t n_ctx_train) {
-    const uint32_t n_ctx_context = llama_n_ctx_hint_resolve(n_ctx_hint, n_ctx_train).n_ctx_context;
-    const uint32_t n_ubatch      = n_ubatch_hint != 0 ? n_ubatch_hint : llama_auto_ubatch_ladder[0];
+    const llama_n_ctx_hint_resolution resolved = llama_n_ctx_hint_resolve(n_ctx_hint, n_ctx_train);
+    const bool                        named    = resolved.n_ctx_context != 0 && !resolved.is_default;
+    const uint32_t                    n_ctx    = llama_load_measure_n_ctx(named ? n_ctx_hint : 0, n_ctx_train);
+    const uint32_t                    n_ubatch = n_ubatch_hint != 0 ? n_ubatch_hint : llama_auto_ubatch_ladder[0];
 
     llama_load_measure_shape shape;
-    shape.n_ctx    = llama_load_measure_n_ctx(n_ctx_context, n_ctx_train);
-    shape.n_ubatch = shape.n_ctx != 0 ? std::min(n_ubatch, shape.n_ctx) : n_ubatch;
+    shape.n_ctx    = GGML_PAD(n_ctx, 256);
+    shape.n_ubatch = n_ctx != 0 ? std::min(n_ubatch, n_ctx) : n_ubatch;
     return shape;
 }
 

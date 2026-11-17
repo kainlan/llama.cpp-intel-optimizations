@@ -389,11 +389,11 @@ static void test_measure_shape_resolve() {
     // llama_context clamps the micro-batch to the context before it pads the context, so the clamp reads the
     // caller's own context, not the padded one.
     const llama_load_measure_shape small = llama_load_measure_shape_resolve(300, 512, 262144);
-    CHECK(small.n_ctx == 512 && small.n_ubatch == 300,
-          "a named micro-batch is clamped to the unpadded context: %u %u", small.n_ctx, small.n_ubatch);
+    CHECK(small.n_ctx == 512 && small.n_ubatch == 300, "a named micro-batch is clamped to the unpadded context: %u %u",
+          small.n_ctx, small.n_ubatch);
     const llama_load_measure_shape tiny = llama_load_measure_shape_resolve(100, 0, 262144);
-    CHECK(tiny.n_ctx == 256 && tiny.n_ubatch == 100,
-          "the ladder's rung is clamped to the unpadded context: %u %u", tiny.n_ctx, tiny.n_ubatch);
+    CHECK(tiny.n_ctx == 256 && tiny.n_ubatch == 100, "the ladder's rung is clamped to the unpadded context: %u %u",
+          tiny.n_ctx, tiny.n_ubatch);
     const llama_load_measure_shape wide = llama_load_measure_shape_resolve(4000, 4096, 262144);
     CHECK(wide.n_ctx == 4096 && wide.n_ubatch == 4000,
           "a micro-batch above an unpadded context is clamped to it: %u %u", wide.n_ctx, wide.n_ubatch);
