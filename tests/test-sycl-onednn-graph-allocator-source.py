@@ -27,6 +27,7 @@ CACHE_CPP = (ROOT / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
 # documents that index as blind inside this specific ~60k-line file, so a
 # tool-assisted search here would silently miss real occurrences.
 GGML_SYCL_CPP = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
+ZONE_SIZING_CPP = (ROOT / "ggml/src/ggml-sycl/zone-sizing.cpp").read_text()
 # llama.cpp-c6ah: source for the doc-presence check below.
 MEMORY_DESIGN_MD = (ROOT / "docs/backend/sycl-memory-design.md").read_text()
 
@@ -1798,7 +1799,8 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
 #       plan from;
 #   (b) every writer of the shape goes through the publish: populate_host_zone_sizing's write and the stage's are the
 #       same function of the same inputs, and the dry run's restore is the one direct setter call;
-#   (c) both plan builders take their context fields from the same function, before the host-side sizing reads them;
+#   (c) both plan builders take their context fields from the same function, so a plan's context fields are the shape
+#       the floor was published with;
 #   (d) the dry run publishes as the stage does, for a single-device plan only.
 # The non-FA attention scratch keeps the planning shape on purpose: the load cannot know whether the context runs flash
 # attention. Every check runs on comment-stripped, whitespace-normalized text, and every mutant edits one function's
@@ -1823,7 +1825,6 @@ GRAPH_SHAPE_FIELDS = ("n_head_ctx_max", "n_head_swa_max", "n_swa", "n_ubatch", "
 GRAPH_FLOOR_CALL = "onednn_graph_scratch_zone_floor_bytes_swa"
 GRAPH_FLOOR_INFO_TEXT = "[SYCL-PLAN] oneDNN Graph-scratch zone floor:"
 NONFA_SHAPE_SETTER = "unified_cache_set_planned_nonfa_attn_scratch_shape"
-HOST_SIDE_SIZING_CALL = "placement_plan_size_host_side("
 PLANNING_SHAPE_ARGS = ["plan.planner_n_ubatch", "plan.planner_n_ctx"]
 CONTEXT_SHAPE_FOR_ENVELOPE_CALL = (
     "zone_plan_context_shape_for_envelope(kv_info.n_ctx_is_runtime, kv_info.n_ctx, kv_info.n_ctx_context, "
@@ -2037,23 +2038,19 @@ def _dry_run_publishes_for_a_single_device_plan(sycl: str) -> bool:
 
 def _builder_sets_context_shape(cache: str, builder_sig: str) -> bool:
     """The builder assigns both context fields, once each, from the Graph scratch shape function over its kv_info and
-    envelope, before its host-side sizing (which runs populate_host_zone_sizing) reads them, and computes no context
-    shape of its own."""
+    envelope, and computes no context shape of its own, so the plan's context fields are the shape the floor was
+    published with. Nothing reads the fields inside the builder, so where in it they are set does not matter."""
     body = _body_of(cache, builder_sig)
     m = BUILDER_SHAPE_RE.search(body)
     if not m or "zone_plan_context_shape" in body:
         return False
     var = m.group(1)
-    assigned_at = []
     for field in ("n_ctx", "n_ubatch"):
         if len(re.findall(rf"\bplan\.context_{field} =", body)) != 1:
             return False
-        at = body.find(f"plan.context_{field} = {var}.{field};", m.end())
-        if at < 0:
+        if body.find(f"plan.context_{field} = {var}.{field};", m.end()) < 0:
             return False
-        assigned_at.append(at)
-    sizing_at = body.find(HOST_SIDE_SIZING_CALL)
-    return sizing_at > max(assigned_at)
+    return True
 
 
 def _graph_shape_checks(cache: str, sycl: str) -> dict:
@@ -2125,8 +2122,8 @@ def test_both_plan_builders_take_the_context_shape_from_the_graph_shape() -> Non
     for sig in (SINGLE_DEVICE_PLAN_SIG, MULTI_DEVICE_PLAN_SIG):
         assert _builder_sets_context_shape(CACHE_CPP_NORM, sig), (
             f"{sig!r} must set plan.context_n_ctx and plan.context_n_ubatch from {GRAPH_SHAPE_PLAN}(kv_info, "
-            f"envelope), and compute no context shape of its own, before {HOST_SIDE_SIZING_CALL}...) runs "
-            "populate_host_zone_sizing"
+            "envelope) and compute no context shape of its own, or the plan's context fields can differ from the "
+            "shape the floor was published with"
         )
 
 
@@ -2176,6 +2173,11 @@ def test_graph_shape_checks_have_bounded_mutation_witnesses() -> None:
                                  "kv_info.n_ctx_context, plan.planner_n_ubatch, kv_info.n_ubatch_context)")
     _assert_only_check_fails(mutant, sycl, "multi", "the multi-device builder computing its own context shape")
 
+    single_var = BUILDER_SHAPE_RE.search(_body_of(cache, SINGLE_DEVICE_PLAN_SIG)).group(1)
+    mutant = _mutate_in_function(cache, SINGLE_DEVICE_PLAN_SIG, f"plan.context_n_ubatch = {single_var}.n_ubatch;",
+                                 "plan.context_n_ubatch = plan.planner_n_ubatch;")
+    _assert_only_check_fails(mutant, sycl, "single", "the single-device builder's micro-batch left at the planning one")
+
 
 def test_stage_and_dry_run_checks_have_bounded_mutation_witnesses() -> None:
     cache, sycl = CACHE_CPP_NORM, GGML_SYCL_CPP_NORM
@@ -2205,18 +2207,81 @@ def test_stage_and_dry_run_checks_have_bounded_mutation_witnesses() -> None:
     _assert_only_check_fails(cache, mutant, "dry_run", "the dry run publishing for a multi-device plan too")
 
 
-def test_builder_ordering_check_has_a_bounded_mutation_witness() -> None:
-    """Moving the single-device builder's context-shape block after its host-side sizing keeps every statement but
-    lets populate_host_zone_sizing read the fields before they are set: only the ordering catches it."""
-    cache, sycl = CACHE_CPP_NORM, GGML_SYCL_CPP_NORM
-    body = _body_of(cache, SINGLE_DEVICE_PLAN_SIG)
-    m = BUILDER_SHAPE_RE.search(body)
-    assert m, f"sanity: the single-device builder calls {GRAPH_SHAPE_PLAN}()"
-    last_stmt = f"plan.context_n_ubatch = {m.group(1)}.n_ubatch;"
-    block = body[m.start() : body.index(last_stmt, m.end()) + len(last_stmt)]
-    mutant = _move_in_function(cache, SINGLE_DEVICE_PLAN_SIG, block, HOST_SIDE_SIZING_CALL)
-    assert BUILDER_SHAPE_RE.search(_body_of(mutant, SINGLE_DEVICE_PLAN_SIG)), "sanity: the block is still there"
-    _assert_only_check_fails(mutant, sycl, "single", "the context shape set after the host-side sizing reads it")
+# The planning micro-batch rule (the envelope's micro-batch when it names one, the model's otherwise) has one
+# spelling, zone_planning_n_ubatch(). Both plan builders take their planning micro-batch from it, and
+# zone_plan_context_shape_for_envelope() its default micro-batch, so the shape published before a plan exists falls
+# back to the micro-batch the plan is then built at. No site spells the rule by hand.
+ZONE_SIZING_CPP_NORM = normalize_ws(strip_comments(ZONE_SIZING_CPP))
+PLANNING_N_UBATCH = "zone_planning_n_ubatch"
+PLANNING_N_UBATCH_SIG = f"uint32_t {PLANNING_N_UBATCH}(uint32_t envelope_n_ubatch, uint32_t n_ubatch)"
+CONTEXT_SHAPE_FOR_ENVELOPE_SIG = "zone_context_shape zone_plan_context_shape_for_envelope(bool n_ctx_is_runtime,"
+PLANNING_RULE_BY_HAND_RE = re.compile(r"\? ?envelope(?:_|->)n_ubatch : (?:kv_info\.)?n_ubatch\b")
+
+
+def _planning_rule_is_defined_once(zone: str) -> bool:
+    if not _has_function(zone, PLANNING_N_UBATCH_SIG):
+        return False
+    body = _body_of(zone, PLANNING_N_UBATCH_SIG)
+    return "return envelope_n_ubatch != 0 ? envelope_n_ubatch : n_ubatch;" in body
+
+
+def _context_shape_for_envelope_uses_the_rule(zone: str) -> bool:
+    if not _has_function(zone, CONTEXT_SHAPE_FOR_ENVELOPE_SIG):
+        return False
+    body = _body_of(zone, CONTEXT_SHAPE_FOR_ENVELOPE_SIG)
+    calls = _call_argument_lists(body, PLANNING_N_UBATCH)
+    return calls == [["envelope_n_ubatch", "n_ubatch"]] and not PLANNING_RULE_BY_HAND_RE.search(body)
+
+
+def _builder_takes_the_planning_rule(cache: str, builder_sig: str) -> bool:
+    body = _body_of(cache, builder_sig)
+    assigned = re.findall(r"\bplan\.planner_n_ubatch = ([^;]+);", body)
+    wanted = f"{PLANNING_N_UBATCH}(envelope ? envelope->n_ubatch : 0, kv_info.n_ubatch)"
+    return assigned == [wanted] and not PLANNING_RULE_BY_HAND_RE.search(body)
+
+
+def _planning_rule_checks(zone: str, cache: str) -> dict:
+    return {
+        "rule": _planning_rule_is_defined_once(zone),
+        "for_envelope": _context_shape_for_envelope_uses_the_rule(zone),
+        "single": _builder_takes_the_planning_rule(cache, SINGLE_DEVICE_PLAN_SIG),
+        "multi": _builder_takes_the_planning_rule(cache, MULTI_DEVICE_PLAN_SIG),
+    }
+
+
+def test_the_planning_micro_batch_rule_has_one_spelling() -> None:
+    results = _planning_rule_checks(ZONE_SIZING_CPP_NORM, CACHE_CPP_NORM)
+    assert all(results.values()), (
+        f"{PLANNING_N_UBATCH}() must define the planning micro-batch rule, and zone_plan_context_shape_for_envelope() "
+        "and both plan builders must take it from there without spelling it by hand, or the shape published before "
+        f"the plan can fall back to another micro-batch than the plan is built at: {results}"
+    )
+
+
+def test_the_planning_rule_checks_have_bounded_mutation_witnesses() -> None:
+    zone, cache = ZONE_SIZING_CPP_NORM, CACHE_CPP_NORM
+    assert all(_planning_rule_checks(zone, cache).values()), "sanity: every check passes on the source itself"
+
+    def only(zone_m: str, cache_m: str, failing: str, why: str) -> None:
+        results = _planning_rule_checks(zone_m, cache_m)
+        expected = {name: name != failing for name in results}
+        assert results == expected, f"mutation witness for {failing!r} ({why}) is broken: {results}"
+
+    mutant = _mutate_in_function(zone, PLANNING_N_UBATCH_SIG, "envelope_n_ubatch != 0 ? envelope_n_ubatch : n_ubatch",
+                                 "n_ubatch")
+    only(mutant, cache, "rule", "the rule losing the envelope's micro-batch")
+
+    mutant = _mutate_in_function(zone, CONTEXT_SHAPE_FOR_ENVELOPE_SIG,
+                                 f"{PLANNING_N_UBATCH}(envelope_n_ubatch, n_ubatch)",
+                                 "envelope_n_ubatch != 0 ? envelope_n_ubatch : n_ubatch")
+    only(mutant, cache, "for_envelope", "the published shape spelling the rule by hand")
+
+    wanted = f"{PLANNING_N_UBATCH}(envelope ? envelope->n_ubatch : 0, kv_info.n_ubatch)"
+    by_hand = "envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch"
+    only(zone, _mutate_in_function(cache, SINGLE_DEVICE_PLAN_SIG, wanted, by_hand), "single",
+         "the single-device builder spelling the rule by hand")
+    only(zone, _mutate_in_function(cache, MULTI_DEVICE_PLAN_SIG, wanted, by_hand), "multi",
+         "the multi-device builder spelling the rule by hand")
 
 
 # The two runtime sites that copy a load's plan and re-shape it for a context: the measure of a context
