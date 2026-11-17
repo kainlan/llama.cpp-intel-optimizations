@@ -2716,14 +2716,12 @@ bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_
 bool             unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
 size_t           unified_cache_get_planned_compute_term_bytes(int device_id);
 // The micro-batch the planned compute term was measured at on the device, for the hold-spill fit to credit the term
-// at that rung and below (placement_plan_compute_room), and to bound the credit of a rung without a record of its
-// own under a placed micro-batch (zone_hold_fit_inputs::compute_room_measured_n_ubatch).
-// Each load records its planning micro-batch, the inventory's
-// n_ubatch, through zone_compute_term_n_ubatch_store: a load that disagrees with an earlier one turns the record off
-// for the rest of the process, with one WARN naming both values. The stored value is the measure's shape only while
+// at that rung and below (placement_plan_compute_room), and to bound the credit of a rung without a record of its own
+// under a placed micro-batch (zone_hold_fit_inputs::compute_room_measured_n_ubatch). Each load records its planning
+// micro-batch, the inventory's n_ubatch, through zone_compute_term_n_ubatch_store, which documents the rule; the
+// setter WARNs once when a store turns the record off. The stored value is the measure's shape only while
 // inventory.n_ubatch and llama_auto_ubatch_ladder[0] (the measure's n_ubatch) agree; a source pin holds the two to one
-// value. Nothing clears it: a term no live load owns merges to 0 bytes and credits nothing. The getter answers 0 for
-// none, for a record turned off, and for a device out of range.
+// value. The getter answers 0 for none, for a record turned off, and for a device out of range.
 void             unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch);
 uint32_t         unified_cache_get_planned_compute_term_n_ubatch(int device_id);
 // llama.cpp-p6i0: the load's planned state term, the bytes the context memory the probe measure placed on the

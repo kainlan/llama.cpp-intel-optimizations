@@ -557,10 +557,12 @@ typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 // a load that named none, the load's planning micro-batch. The room is the planned compute term (the compute buffers
 // the load measured at its planning shape), held beside that micro-batch's ring and dense scratch. 0 for none: a
 // multi-device plan, another device, an unknown planning micro-batch, or a named micro-batch the plan did not place.
-// A rung can also be named with a room of 0 bytes, when no live load owns a compute term on the device: such a room
-// credits no request above 0 bytes, and the measured rung is withheld (0) with it.
+// A rung can also be named with a room of 0 bytes, when no live load owns a compute term on the device (the record
+// keeps the last load's micro-batch until the next load replaces it): such a room credits no request above 0 bytes,
+// and the measured rung is withheld (0) with it.
 //
-// compute_room_measured_n_ubatch is the micro-batch the term was measured at, 0 when unknown or when there is no room.
+// compute_room_measured_n_ubatch is the micro-batch the term was measured at, 0 when the record names none (no load
+// recorded one, or two loads that both hold a term disagree) or when the room is none or 0 bytes.
 // It is a separate fact from compute_room_n_ubatch because the plan can place a micro-batch above the one the load
 // measured its term at: the room's rung then says where the zone was sized, not which rung's buffers the term covers.
 struct zone_hold_fit_inputs {
@@ -701,26 +703,37 @@ bool zone_route_draws_scratch(bool decision_valid,
 bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size_t alignment, size_t * out);
 
 // The micro-batch the planned compute term was measured at, as the loads on a device record it, one store per
-// inventory intake (a load's early plan and late intake carry the same inventory, so its repeat store keeps an equal
-// value and changes nothing): the hold-spill fit credits the term at that rung and below. The first load's value stands
-// while later loads agree. A load that names a different one turns the record off for good
-// (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the term was not measured at is the defect the
-// record prevents, and once off it never reads as a shape again. A load naming 0, or naming the mark itself, changes
-// nothing, so the mark only ever means two loads really disagreed and the WARN that reports it names two values loads
-// did plan. Nothing ever clears it: when every load that reserved the term is gone the term merges to 0 bytes, and a
-// 0-byte room credits nothing, so a micro-batch left behind is harmless.
+// inventory intake (a load's early plan and late intake carry the same inventory, and at its late intake the load's
+// own term is live and the record already holds its value, so the repeat store keeps an equal value and changes
+// nothing): the hold-spill fit credits the term at that rung and below. The first load's value stands while later
+// loads agree. A load that names a different one while another load still holds a compute term on the device turns
+// the record off (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the live term was not measured
+// at is the defect the record prevents. When no load holds a term (`term_live` false: the merged term is 0 bytes), the
+// earlier loads are gone and the new load's value replaces the record, even one turned off, so loads made one after
+// another at different micro-batches each get their own credit. A load's early plan is taken in before its own term
+// is reserved, so `term_live` there names only earlier loads. A load naming 0, or naming the mark itself, changes
+// nothing, so the mark only ever means two live loads really disagreed and the WARN that reports it names two values
+// loads did plan. A micro-batch left behind after every load is gone is harmless: the term merges to 0 bytes, and a
+// 0-byte room credits nothing. So a disagreement only removes the credit, never grants one, for every term on the
+// device: a load's measure can reserve a term on a device only after that device took in the load's inventory, since
+// the load's stage runs the intake on every SYCL device.
 constexpr uint32_t k_zone_compute_term_n_ubatch_disagreed = UINT32_MAX;
 
-inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_ubatch) {
-    if (n_ubatch == 0 || n_ubatch == k_zone_compute_term_n_ubatch_disagreed ||
-        stored == k_zone_compute_term_n_ubatch_disagreed) {
+inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_ubatch, bool term_live) {
+    if (n_ubatch == 0 || n_ubatch == k_zone_compute_term_n_ubatch_disagreed) {
+        return stored;
+    }
+    if (!term_live) {
+        return n_ubatch;
+    }
+    if (stored == k_zone_compute_term_n_ubatch_disagreed) {
         return stored;
     }
     return stored == 0 || stored == n_ubatch ? n_ubatch : k_zone_compute_term_n_ubatch_disagreed;
 }
 
 // Whether a store moved the record from `before` to `after` by turning it off: the one store the setter WARNs on. A
-// record already off stays off without turning off again, so a later disagreeing load does not repeat the WARN.
+// record already off that stays off does not turn off again, so a later disagreeing load does not repeat the WARN.
 inline bool zone_compute_term_n_ubatch_turns_off(uint32_t before, uint32_t after) {
     return before != k_zone_compute_term_n_ubatch_disagreed && after == k_zone_compute_term_n_ubatch_disagreed;
 }

@@ -1814,32 +1814,50 @@ int main() {
     }
 
     // The micro-batch the compute term was planned at, as each load records it: the first load's value stands while
-    // later loads agree; a load that disagrees turns the record off for good, so no rung is credited at a shape the
-    // term was not measured at.
+    // later loads agree; a load that disagrees while another load still holds a term turns the record off until a load
+    // is taken in while none holds one, so no rung is credited at a shape the live term was not measured at.
     {
         using ggml_sycl::zone_compute_term_n_ubatch_read;
         using ggml_sycl::zone_compute_term_n_ubatch_store;
         uint32_t s = 0;
         CHECK(zone_compute_term_n_ubatch_read(s) == 0, "nothing recorded reads 0");
-        s = zone_compute_term_n_ubatch_store(s, 512);
+        s = zone_compute_term_n_ubatch_store(s, 512, true);
         CHECK(zone_compute_term_n_ubatch_read(s) == 512, "0 then 512 records 512");
-        s = zone_compute_term_n_ubatch_store(s, 512);
+        s = zone_compute_term_n_ubatch_store(s, 512, true);
         CHECK(zone_compute_term_n_ubatch_read(s) == 512, "512 then 512 keeps 512");
-        CHECK(zone_compute_term_n_ubatch_store(s, 0) == s, "a load naming no micro-batch changes nothing");
-        s = zone_compute_term_n_ubatch_store(s, 1024);
+        CHECK(zone_compute_term_n_ubatch_store(s, 0, true) == s, "a load naming no micro-batch changes nothing");
+        s = zone_compute_term_n_ubatch_store(s, 1024, true);
         CHECK(zone_compute_term_n_ubatch_read(s) == 0, "512 then 1024 disagree: 0");
-        s = zone_compute_term_n_ubatch_store(s, 1024);
-        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "and a later load cannot restore it");
-        s = zone_compute_term_n_ubatch_store(s, 512);
-        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "not even with the first value");
-        CHECK(zone_compute_term_n_ubatch_store(0, UINT32_MAX) == 0,
+        s = zone_compute_term_n_ubatch_store(s, 1024, true);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "and a later load cannot restore it while a term is live");
+        s = zone_compute_term_n_ubatch_store(s, 512, true);
+        CHECK(zone_compute_term_n_ubatch_read(s) == 0, "not even with the first value, while a term is live");
+        CHECK(zone_compute_term_n_ubatch_store(0, UINT32_MAX, true) == 0,
               "a micro-batch equal to the disagreement mark records nothing on a first load");
-        CHECK(zone_compute_term_n_ubatch_read(zone_compute_term_n_ubatch_store(512, UINT32_MAX)) == 512,
+        CHECK(zone_compute_term_n_ubatch_read(zone_compute_term_n_ubatch_store(512, UINT32_MAX, true)) == 512,
               "and turns no record off: only a real disagreement does");
+        // Loads one after another (llama-bench -ub 512,1024): the first load's term is gone when the second load's
+        // inventory is taken in, so its micro-batch replaces the record instead of turning it off.
+        CHECK(zone_compute_term_n_ubatch_store(512, 1024, /*term_live=*/false) == 1024,
+              "no live term: the new load's micro-batch replaces the record");
+        CHECK(zone_compute_term_n_ubatch_store(512, 1024, /*term_live=*/true) ==
+                  ggml_sycl::k_zone_compute_term_n_ubatch_disagreed,
+              "two live loads that disagree still turn it off");
+        CHECK(zone_compute_term_n_ubatch_store(ggml_sycl::k_zone_compute_term_n_ubatch_disagreed, 1024,
+                                               /*term_live=*/false) == 1024,
+              "a record turned off restarts once no load holds a term");
+        CHECK(zone_compute_term_n_ubatch_store(ggml_sycl::k_zone_compute_term_n_ubatch_disagreed, 1024,
+                                               /*term_live=*/true) == ggml_sycl::k_zone_compute_term_n_ubatch_disagreed,
+              "but not while a load still holds one");
+        CHECK(zone_compute_term_n_ubatch_store(512, 0, /*term_live=*/false) == 512,
+              "a load naming no micro-batch changes nothing with no live term");
+        CHECK(zone_compute_term_n_ubatch_store(512, ggml_sycl::k_zone_compute_term_n_ubatch_disagreed,
+                                               /*term_live=*/false) == 512,
+              "a micro-batch equal to the mark changes nothing with no live term either");
     }
 
     // The setter WARNs on exactly the store that turns the record off: from a shape to the mark, never from the mark
-    // again, never on a first record or a repeat.
+    // again, never on a first record, a repeat or a restart.
     {
         using ggml_sycl::zone_compute_term_n_ubatch_turns_off;
         CHECK(zone_compute_term_n_ubatch_turns_off(512, UINT32_MAX), "512 to the mark turns it off");
@@ -1847,6 +1865,7 @@ int main() {
         CHECK(!zone_compute_term_n_ubatch_turns_off(0, 512), "a first record does not");
         CHECK(!zone_compute_term_n_ubatch_turns_off(512, 512), "a repeat does not");
         CHECK(!zone_compute_term_n_ubatch_turns_off(0, 0), "no record and no store does not");
+        CHECK(!zone_compute_term_n_ubatch_turns_off(UINT32_MAX, 1024), "a restart from the mark does not");
     }
 
     // ---- Case 24d (compute room, scoped): the room serves only rungs at or below the rung the plan sized it for. Over

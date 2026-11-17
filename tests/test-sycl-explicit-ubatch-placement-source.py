@@ -35,8 +35,9 @@ What this gate pins:
   every rung below it: a rung's own record no larger than the term, whole or nothing, and a rung without a record of
   its own only at or below the micro-batch the term was measured at (told to the fit only when there is a room); the
   hold epoch's rung that held a request out is charged, and every rung above the room's rung is judged as before. The
-  planning micro-batch is the load's own record, taken at the inventory stage and turned off
-  when two loads disagree (with one WARN, on the compare-exchange store that turns it off), never the plan's
+  planning micro-batch is the load's own record, taken at the inventory stage and turned off when two live loads
+  disagree (with one WARN, on the compare-exchange store that turns it off) and replaced by the next load once no load
+  holds a compute term, never the plan's
   planner_n_ubatch, which every runtime context transaction rewrites; and it
   is the shape the compute term was measured at only while the inventory's literal, the auto ladder's bottom rung and
   the load measure's n_ubatch name one value;
@@ -171,17 +172,22 @@ PLAN_ROOM_EXPLICIT = "room = placement_explicit_ubatch_compute_room(plan.explici
 PLAN_ROOM_PLANNING = ("if (n == 0 && plan.explicit_ubatch.action == pp_moe_onednn_explicit_ubatch_action::NONE && "
                       "planning_n_ubatch != 0) { n = planning_n_ubatch; room = compute_term; }")
 # The load's planning micro-batch is recorded at each inventory intake, in the inventory stage (STAGE_SIG), under the
-# inventory mutex, through the store rule that turns the record off when two loads disagree; a load's early plan and
-# late intake carry the same inventory, and the rule keeps an equal value, so the repeat changes nothing. The getter
-# reads the record.
+# inventory mutex, through the store rule that turns the record off when a load disagrees with one still holding a
+# compute term on the device, and lets the load's value replace the record when none holds one (`term_live`, read
+# once from the merged term); a load's early plan and late intake carry the same inventory, and the rule keeps an
+# equal value, so the repeat changes nothing. The getter reads the record.
 PLANNING_SET = "ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, inventory->n_ubatch);"
 PLANNING_SETTER_SIG = "void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch)"
-PLANNING_SETTER_RULE = "uint32_t next = zone_compute_term_n_ubatch_store(stored, n_ubatch);"
+PLANNING_SETTER_RULE = "uint32_t next = zone_compute_term_n_ubatch_store(stored, n_ubatch, term_live);"
+# Whether a load still holds a term is read from the device's merged compute term, once, before the rule: a constant
+# would let the last load win while two are live (false), or keep a record turned off after every load is gone (true).
+PLANNING_TERM_LIVE = ("const bool term_live = g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire) "
+                      "!= 0;")
 # The setter updates through a compare-exchange loop on the device's slot, so exactly one store sees the transition
 # to the mark, and WARNs only when that store is the one zone_compute_term_n_ubatch_turns_off() names.
 PLANNING_CAS_LOOP = ("while (next != stored && !g_planned_compute_term_n_ubatch[device_id].compare_exchange_weak("
                      "stored, next, std::memory_order_acq_rel)) { next = zone_compute_term_n_ubatch_store(stored, "
-                     "n_ubatch); }")
+                     "n_ubatch, term_live); }")
 PLANNING_WARN_GUARD = "if (zone_compute_term_n_ubatch_turns_off(stored, next)) { GGML_LOG_WARN("
 PLANNING_WARN_TEXT = '"[LOAD-PLAN] device %d: this load plans its compute term at n_ubatch=%u where an earlier load'
 PLANNING_GETTER_SIG = "uint32_t unified_cache_get_planned_compute_term_n_ubatch(int device_id)"
@@ -454,13 +460,14 @@ def claim_fit_reads_the_load_planning_micro_batch(sycl_cpp: str, cache_cpp: str)
 
 
 def claim_planning_record_warns_once(cache_cpp: str) -> bool:
-    """The setter moves the record through a compare-exchange loop, never a plain store, and WARNs only behind
+    """The setter reads whether a load holds a term from the device's merged compute term before the store rule,
+    moves the record through a compare-exchange loop, never a plain store, and WARNs only behind
     zone_compute_term_n_ubatch_turns_off(), so the one store that turns the record off is the one that WARNs; the WARN
     is written nowhere else."""
     cache = norm(cache_cpp)
     setter = body(cache, PLANNING_SETTER_SIG)
-    return (bool(setter) and ordered(setter, PLANNING_SETTER_RULE, PLANNING_CAS_LOOP, PLANNING_WARN_GUARD,
-                                     PLANNING_WARN_TEXT)
+    return (bool(setter) and ordered(setter, PLANNING_TERM_LIVE, PLANNING_SETTER_RULE, PLANNING_CAS_LOOP,
+                                     PLANNING_WARN_GUARD, PLANNING_WARN_TEXT)
             and ".store(" not in setter
             and cache.count(PLANNING_WARN_TEXT) == 1)
 
@@ -954,6 +961,14 @@ def test_mutant_planning_warn_on_any_mark_fails():
     assert not claim_planning_record_warns_once(
         _once(CACHE_CPP, "if (zone_compute_term_n_ubatch_turns_off(stored, next)) {",
               "if (next == k_zone_compute_term_n_ubatch_disagreed) {"))
+
+
+@pytest.mark.parametrize("constant", ["false", "true"])
+def test_mutant_planning_record_term_live_constant_fails(constant):
+    """A liveness that is not read from the merged term: false lets the last load win while two loads are live, a
+    credit at the wrong shape; true keeps a record turned off after every load that held a term is gone."""
+    assert not claim_planning_record_warns_once(
+        _once(CACHE_CPP, PLANNING_TERM_LIVE, f"const bool term_live = {constant};"))
 
 
 def test_mutant_planning_record_plain_store_fails():
