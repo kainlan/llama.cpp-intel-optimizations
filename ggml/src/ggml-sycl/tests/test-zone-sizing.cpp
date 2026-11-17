@@ -1997,6 +1997,22 @@ int main() {
               "a saturated plan never wraps into a kept zone");
     }
 
+    // ---- Case 24f: the context shape a plan sizes the per-context scratch for. At load it is the context and
+    // micro-batch the caller named, else the load's planning shape; at a context transaction it is the context's own.
+    {
+        using ggml_sycl::zone_plan_context_shape;
+        ggml_sycl::zone_context_shape s = zone_plan_context_shape(false, 512, 4096, 512, 2048);
+        CHECK(s.n_ctx == 4096 && s.n_ubatch == 2048, "a load the caller named a shape for: that shape");
+        s = zone_plan_context_shape(false, 512, 0, 512, 0);
+        CHECK(s.n_ctx == 512 && s.n_ubatch == 512, "a load with no shape named: the planning shape");
+        s = zone_plan_context_shape(false, 512, 4096, 512, 0);
+        CHECK(s.n_ctx == 4096 && s.n_ubatch == 512, "a context with no micro-batch named: the planning micro-batch");
+        s = zone_plan_context_shape(true, 8192, 4096, 1024, 2048);
+        CHECK(s.n_ctx == 8192 && s.n_ubatch == 1024, "a context transaction: the context's own shape");
+        s = zone_plan_context_shape(false, 512, 256, 512, 2048);
+        CHECK(s.n_ubatch == 256, "a micro-batch is never above its context");
+    }
+
     // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and
     // THAT rung's measured request, not of which other rungs ran before it or in what order. A rung with its own
     // record uses it and only it; a rung without one is scaled from the SET of records (order never matters). -----
