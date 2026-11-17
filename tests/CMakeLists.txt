@@ -4665,6 +4665,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for a placement plan that is tried and discarded: it publishes nothing. One helper snapshots and restores
+# every term the planner publishes while it plans; the load stage snapshots before the plan with the room and its
+# fallback restores before it sizes the zones; the plan dry run restores through the same helper; the RUNTIME
+# requirement is the pure zone_runtime_requirement, which test-zone-sizing Case 37 checks. Host-only, reads the sources
+# as text. Same registration shape as test-sycl-raw-gate-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-discarded-plan-terms-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-discarded-plan-terms-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Jinja fallback for a model whose chat template the built-in matcher does not know (Gemma 4 failed after the load with
 # "try using --jinja"): upstream turns the jinja engine off for llama-completion and llama-mtmd-cli.
 # test-chat-need-jinja checks common_chat_templates_need_jinja() itself. It loads no model, so it keeps the default
