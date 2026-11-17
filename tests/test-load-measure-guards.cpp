@@ -357,6 +357,27 @@ static void test_measure_n_ctx() {
           "the measure's n_ctx and the recorded n_ctx disagree");
 }
 
+// The shape a load measures its compute term at: the caller's context and micro-batch, from the two hints, with the
+// training context and the ladder's bottom rung where the caller names none. One resolver, so the KV room, the
+// measure and the micro-batch the backend credits the term at read one shape.
+static void test_measure_shape_resolve() {
+    const llama_load_measure_shape named = llama_load_measure_shape_resolve(4096, 1024, 262144);
+    CHECK(named.n_ctx == 4096 && named.n_ubatch == 1024, "the caller's shape was replaced: %u %u", named.n_ctx,
+          named.n_ubatch);
+    const llama_load_measure_shape none = llama_load_measure_shape_resolve(0, 0, 262144);
+    CHECK(none.n_ctx == 262144 && none.n_ubatch == llama_auto_ubatch_ladder[0],
+          "no hint must keep the training context and the ladder's bottom rung: %u %u", none.n_ctx, none.n_ubatch);
+    const llama_load_measure_shape dflt = llama_load_measure_shape_resolve(LLAMA_N_CTX_HINT_DEFAULT, 0, 262144);
+    CHECK(dflt.n_ctx == 262144 && dflt.n_ubatch == llama_auto_ubatch_ladder[0],
+          "the default context is the training context: %u %u", dflt.n_ctx, dflt.n_ubatch);
+    CHECK(llama_load_measure_shape_resolve(4000, 0, 262144).n_ctx == 4096,
+          "the measure's context is padded as the context pads it");
+    CHECK(llama_load_measure_shape_resolve(512, 2048, 262144).n_ubatch == 512,
+          "a micro-batch above the context is clamped to it, as llama_context clamps it");
+    CHECK(llama_load_measure_shape_resolve(0, 0, 0).n_ubatch == llama_auto_ubatch_ladder[0],
+          "an unknown training context never clamps the micro-batch to 0");
+}
+
 // The test's stand-in for the reservation's units: each nonzero chunk rounded up to 256 B, summed. The fold must
 // compare what this answers, not the raw totals; the backend's own rule is pinned by test-zone-sizing.
 static bool fake_term_bytes(const uint64_t * chunks, uint32_t n, uint64_t * out) {
@@ -1099,6 +1120,7 @@ int main() {
     test_measure_params_tie_to_the_ladder();
     test_measure_kv_shape();
     test_measure_n_ctx();
+    test_measure_shape_resolve();
     test_admitted_fold();
     test_admitted_record();
     test_probe_reserve();
