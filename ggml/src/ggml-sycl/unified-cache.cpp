@@ -20312,8 +20312,8 @@ zone_raw_gate_inputs unified_cache_raw_gate_inputs(int device, sycl::queue & que
 // The figure a raw gate compares, once per device at INFO: the first raw request on a device prints it, so a run's log
 // shows what every later decision on that device is measured against.
 static void unified_cache_raw_gate_log_figure_once(int device, const zone_raw_gate_inputs & in, size_t request) {
-    static std::array<std::atomic<bool>, GGML_SYCL_MAX_DEVICES> logged{};
-    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || logged[device].exchange(true)) {
+    static std::array<std::atomic<bool>, GGML_SYCL_MAX_DEVICES> raw_gate_figure_logged{};
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || raw_gate_figure_logged[device].exchange(true)) {
         return;
     }
     constexpr double MB = 1024.0 * 1024.0;

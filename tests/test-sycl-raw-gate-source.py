@@ -285,7 +285,7 @@ def claim_figure_is_logged_once_at_info(uc: str) -> bool:
     )
     return (
         re.search(r'GGML_LOG_INFO\( ?"\[RAW-GATE\]', figure) is not None
-        and "logged[device].exchange(true)" in figure
+        and "raw_gate_figure_logged[device].exchange(true)" in figure
         and log_first
     )
 
@@ -483,7 +483,7 @@ def test_witness_figure_at_debug():
 
 def test_witness_figure_every_request():
     assert not claim_figure_is_logged_once_at_info(
-        mutate_in_func(UC, FIGURE_SIG, "logged[device].exchange(true)", "false")
+        mutate_in_func(UC, FIGURE_SIG, "raw_gate_figure_logged[device].exchange(true)", "false")
     )
 
 
