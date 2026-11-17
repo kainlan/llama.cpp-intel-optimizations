@@ -2894,20 +2894,19 @@ scratch sit beside it. So once the plan has placed the micro-batch, the
 hold-spill fit credits rungs at or below that rung
 (`placement_explicit_ubatch_compute_room()` and
 `zone_hold_fit_rung_has_compute_room()`): a rung's own measured buffer when it
-is no larger than the term, whole or nothing, and a rung without a record of
-its own only when it is also at or below the micro-batch the term was measured
-at. The term covers the buffers of that rung, and compute buffers grow with the
+is no larger than the term, whole or nothing, and a rung without a record of its
+own only when it is also at or below the micro-batch the term was measured at.
+The term covers the buffers of that rung, and compute buffers grow with the
 micro-batch, so a smaller rung needs no more; a rung between the measured rung
 and a larger placed micro-batch can need more, and an unknown measured rung
 credits no rung without a record. The rung whose own buffer the hold kept
 outside the arena gets no credit; a rung above the room's rung gets none either.
-Without the credit the fit charges the buffer as
-if the hold kept it out of the zone. On the B70 with Qwen3.8 at `-ub 2048` that
-refused the context: 1993.8 MiB of worst-case spill against 1946.2 MiB free
-outside the arena, although the zone held the 1960 MiB buffer beside a term of
-about 2055 MiB. The 256 MiB driver headroom is not added to the hold. It is free
-memory outside the arena, which demoting experts does not change, and the fit
-still requires it there.
+Without the credit the fit charges the buffer as if the hold kept it out of the
+zone. On the B70 with Qwen3.8 at `-ub 2048` that refused the context: 1993.8 MiB
+of worst-case spill against 1946.2 MiB free outside the arena, although the zone
+held the 1960 MiB buffer beside a term of about 2055 MiB. The 256 MiB driver
+headroom is not added to the hold. It is free memory outside the arena, which
+demoting experts does not change, and the fit still requires it there.
 
 The credit can over-credit a rung whose compute buffers span several chunks,
 because the fit compares the rung's largest single buffer with a term that is a
@@ -2916,16 +2915,15 @@ the term at the placed micro-batch gets no credit, so the hold-spill refusal and
 its largest `-ub` advice still answer that case.
 
 Host tests: `test-pp-moe-ring-admission.cpp` pins the room and the decision,
-`test-zone-sizing.cpp` pins the fit's credit (Case 24c at the placed rung,
-Case 24d's sweep of the credit rule over a room measured at its own rung, below
-it and not at all, with a held-out rung, and Case 24i's B50 GPT-OSS refusal,
-which names 512 where it named 256), and that a fit given no room, and every
-rung above the room's rung, are judged as before,
-`tests/test-sycl-layout-choice.cpp` pins the planner's choice, the
-bytes it moves and the compute room it gives the fit, and
-`tests/test-sycl-explicit-ubatch-placement-source.py` pins the wiring, the fit's
-credit and the placement, refusal and failed-growth lines, with a mutant per
-claim.
+`test-zone-sizing.cpp` pins the fit's credit (Case 24c at the placed rung, Case
+24d's sweep of the credit rule over a room measured at its own rung, below it
+and not at all, with a held-out rung, and Case 24i's B50 GPT-OSS refusal, which
+names 512 where it named 256), and that a fit given no room, and every rung
+above the room's rung, are judged as before, `tests/test-sycl-layout-choice.cpp`
+pins the planner's choice, the bytes it moves and the compute room it gives the
+fit, and `tests/test-sycl-explicit-ubatch-placement-source.py` pins the wiring,
+the fit's credit and the placement, refusal and failed-growth lines, with a
+mutant per claim.
 
 ### A context-time consumer: the planned dense scratch, reserved and re-planned (`llama.cpp-kpjw`)
 
