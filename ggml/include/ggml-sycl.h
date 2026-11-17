@@ -468,7 +468,8 @@ struct ggml_sycl_tensor_inventory {
     // 0 = none named, which includes a micro-batch the backend picks itself. When it is above n_ubatch, the planner
     // plans the PP MoE oneDNN scratch ring in the RUNTIME zone for it and moves routed experts from the device to the
     // host tier for the room, as it re-places KV that does not fit. The oneDNN Graph scratch floor is sized for it and
-    // n_ctx_context (for n_ubatch when it is 0). It sits in the padding after the bools, so the
+    // n_ctx_context; when it is 0, for the planning micro-batch (the placement envelope's n_ubatch when the envelope
+    // names one, else n_ubatch). It sits in the padding after the bools, so the
     // struct stays 192 bytes (pinned below and in ggml-sycl.cpp). A libllama built before this field leaves the padding
     // as the caller's object holds it: zero for every `= {}` inventory libllama builds. libllama and libggml-sycl must
     // still be rebuilt together for the planner to see it.

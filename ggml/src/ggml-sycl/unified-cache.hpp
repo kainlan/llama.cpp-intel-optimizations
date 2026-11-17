@@ -777,8 +777,8 @@ struct placement_kv_info {
     std::vector<uint32_t> layer_idx_k_width;
 
     // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
-    // above stays the load's planning shape. It is also the plan's context micro-batch
-    // (placement_plan::context_n_ubatch), which the oneDNN Graph scratch floor is sized for.
+    // above stays the load's planning shape. When it is non-zero it is also the plan's context micro-batch
+    // (placement_plan::context_n_ubatch, which the oneDNN Graph scratch floor is sized for), held to the context.
     uint32_t                           n_ubatch_context = 0;
     // The RUNTIME zone room the PP MoE oneDNN scratch ring of that micro-batch needs above the default ring's zone. The
     // backend fills it on the single-device path before each plan (unified_cache_explicit_ubatch_room()); it is invalid
@@ -1175,9 +1175,10 @@ struct placement_plan {
     std::vector<uint32_t>                      layer_idx_k_width;
     uint32_t                     planner_n_ctx            = 0;
     uint32_t                     planner_n_ubatch         = 0;
-    // The context shape the per-context scratch is sized for (zone_plan_context_shape): at load the context the model
-    // opens with (the one the caller named, or the model's default) and the micro-batch the caller named, each else
-    // the planning shape above; at a context transaction the context's own.
+    // The context shape the per-context scratch is sized for: at load the context the model opens with (the one the
+    // caller named, or the model's default) and the micro-batch the caller named, each else the planning shape above,
+    // the micro-batch held to the context (unified_cache_plan_onednn_graph_scratch_shape(), the shape the oneDNN Graph
+    // scratch floor is published with); at a context transaction the context's own (zone_plan_context_shape()).
     uint32_t                                   context_n_ctx            = 0;
     uint32_t                                   context_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
@@ -2905,8 +2906,9 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
 onednn_graph_scratch_planned_shape unified_cache_plan_onednn_graph_scratch_shape(
     const placement_kv_info &            kv_info,
     const ggml_sycl_placement_envelope * envelope);
-// Records unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope) for `device_id` and returns it. Nothing else
-// writes the planned shape but the dry run, which puts back the value it read before it planned.
+// Records unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope) for `device_id` and returns it. The backend
+// writes the planned shape nowhere else but the dry run, which puts back the value it read before it planned; a test
+// may call the setter directly to stage a shape.
 onednn_graph_scratch_planned_shape unified_cache_publish_planned_onednn_graph_scratch_shape(
     int                                  device_id,
     const placement_kv_info &            kv_info,

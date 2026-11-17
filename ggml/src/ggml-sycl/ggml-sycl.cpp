@@ -18105,9 +18105,9 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
     if (!ggml_sycl_plan_multi_device()) {
         // The oneDNN Graph scratch shape sizes the ONEDNN zone the plan packs weights against, so it is published
-        // before the zones are sized, from the kv_info and the envelope the plan is built from below. The plan
-        // publishes it again from the same inputs through the same function, so the two writes are equal and the plan
-        // packs against a zone sized for the shape it records.
+        // before the zones are sized, from the kv_info and the envelope the plan is built from below. In a oneDNN
+        // build the plan publishes it again from the same inputs through the same function, so the two writes are
+        // equal and the plan packs against a zone sized for the shape it records; without oneDNN no sizing reads it.
         (void) ggml_sycl::unified_cache_publish_planned_onednn_graph_scratch_shape(ctx->device, g_placement_kv_info,
                                                                                    envelope_arg);
     }

@@ -1031,10 +1031,12 @@ static std::atomic<uint64_t>      g_planned_scratch_owner_next{ 1 };
 // does not set it: that owner contributes nothing to the half, and its own re-plan refuses while it is live.
 static std::atomic<bool>         g_planned_dense_scratch_invalid[GGML_SYCL_MAX_DEVICES][2]{};
 // llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
-// window class, the SWA window itself, ubatch size, context length) known at
-// the time the oneDNN scratchpad was last planned for this device
-// (compute_placement_plan()/populate_host_zone_sizing(), see the "oneDNN
-// scratchpad:" log line). Feeds onednn_graph_scratch_zone_floor_bytes_swa()'s
+// window class, the SWA window itself, ubatch size, context length) last
+// published for this device through
+// unified_cache_publish_planned_onednn_graph_scratch_shape(): by a
+// single-device stage before it sizes the arena zones, and by a plan's
+// host-side sizing (populate_host_zone_sizing(), see the "[SYCL-PLAN] oneDNN
+// Graph-scratch zone floor:" log line). Feeds onednn_graph_scratch_zone_floor_bytes_swa()'s
 // shape-derived floor -- the oneDNN Graph-scratch request is proportional to
 // n_head x n_ubatch x n_ctx for non-SWA layers and n_head x n_ubatch x
 // min(n_ctx, n_swa + n_ubatch) for SWA layers (llama.cpp-o3a0; the span a
@@ -36734,7 +36736,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.layer_v_width                       = kv_info.layer_v_width;
     plan.layer_idx_k_width                   = kv_info.layer_idx_k_width;
     plan.planner_n_ctx                       = kv_info.n_ctx;
-    plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
+    plan.planner_n_ubatch = zone_planning_n_ubatch(envelope ? envelope->n_ubatch : 0, kv_info.n_ubatch);
     plan.planner_n_seq_max =
         envelope && envelope->n_seq_max ? envelope->n_seq_max : (kv_info.n_seq_max > 0 ? kv_info.n_seq_max : 1);
     // llama.cpp-3aos: no envelope override -- kv_unified, like
@@ -38219,7 +38221,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.layer_v_width            = kv_info.layer_v_width;
     plan.layer_idx_k_width        = kv_info.layer_idx_k_width;
     plan.planner_n_ctx            = kv_info.n_ctx;
-    plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
+    plan.planner_n_ubatch         = zone_planning_n_ubatch(envelope ? envelope->n_ubatch : 0, kv_info.n_ubatch);
     plan.planner_n_seq_max =
         envelope && envelope->n_seq_max ? envelope->n_seq_max : (kv_info.n_seq_max > 0 ? kv_info.n_seq_max : 1);
     // llama.cpp-3aos: see the single-device path's identical

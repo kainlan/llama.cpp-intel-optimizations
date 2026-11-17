@@ -644,14 +644,18 @@ zone_context_shape zone_plan_context_shape(bool     n_ctx_is_runtime,
     return s;
 }
 
+uint32_t zone_planning_n_ubatch(uint32_t envelope_n_ubatch, uint32_t n_ubatch) {
+    return envelope_n_ubatch != 0 ? envelope_n_ubatch : n_ubatch;
+}
+
 zone_context_shape zone_plan_context_shape_for_envelope(bool     n_ctx_is_runtime,
                                                         uint32_t n_ctx,
                                                         uint32_t n_ctx_context,
                                                         uint32_t envelope_n_ubatch,
                                                         uint32_t n_ubatch,
                                                         uint32_t n_ubatch_context) {
-    const uint32_t planning_n_ubatch = envelope_n_ubatch != 0 ? envelope_n_ubatch : n_ubatch;
-    return zone_plan_context_shape(n_ctx_is_runtime, n_ctx, n_ctx_context, planning_n_ubatch, n_ubatch_context);
+    return zone_plan_context_shape(n_ctx_is_runtime, n_ctx, n_ctx_context,
+                                   zone_planning_n_ubatch(envelope_n_ubatch, n_ubatch), n_ubatch_context);
 }
 
 size_t zone_hold_persistent_raw(size_t raw_held, size_t compute_live, bool rung_live) {

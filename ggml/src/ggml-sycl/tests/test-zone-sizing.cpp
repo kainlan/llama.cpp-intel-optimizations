@@ -2019,6 +2019,8 @@ int main() {
 
         // Before a plan exists the planning micro-batch is the planner's own choice: the envelope's when it names
         // one, else the model's. The shape published before the zones are sized must be the one the plan records.
+        CHECK(ggml_sycl::zone_planning_n_ubatch(8, 512) == 8, "the planning micro-batch: the envelope's when named");
+        CHECK(ggml_sycl::zone_planning_n_ubatch(0, 512) == 512, "the planning micro-batch: else the model's");
         using ggml_sycl::zone_plan_context_shape_for_envelope;
         s = zone_plan_context_shape_for_envelope(false, 512, 0, 8, 512, 0);
         CHECK(s.n_ctx == 512 && s.n_ubatch == 8, "an envelope micro-batch with none named: the envelope's wins");

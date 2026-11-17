@@ -640,10 +640,14 @@ zone_context_shape zone_plan_context_shape(bool     n_ctx_is_runtime,
                                            uint32_t plan_n_ubatch,
                                            uint32_t n_ubatch_context);
 
+// The planning micro-batch a plan is built at: the envelope's when the caller's envelope names one
+// (`envelope_n_ubatch` != 0), the model's (`n_ubatch`) otherwise. The plan builders take their planning shape from it,
+// and zone_plan_context_shape_for_envelope() below its default micro-batch.
+uint32_t zone_planning_n_ubatch(uint32_t envelope_n_ubatch, uint32_t n_ubatch);
+
 // zone_plan_context_shape() over the planner's own inputs, before a plan exists: the planning context `n_ctx`, and the
-// planning micro-batch the planner takes, the envelope's when the caller's envelope names one (`envelope_n_ubatch`
-// != 0) and the model's (`n_ubatch`) otherwise. A shape published before the plan is built is then the shape the plan
-// itself sizes for.
+// planning micro-batch zone_planning_n_ubatch() gives. A shape published before the plan is built is then the shape the
+// plan itself sizes for.
 zone_context_shape zone_plan_context_shape_for_envelope(bool     n_ctx_is_runtime,
                                                         uint32_t n_ctx,
                                                         uint32_t n_ctx_context,
