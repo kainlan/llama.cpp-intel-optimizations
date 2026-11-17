@@ -462,7 +462,7 @@ bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size
 // from the zone although the zone could serve it, because the hold keeps those bytes for the planned scratch.
 // Only a spill-capable request for the RUNTIME zone is ever held back; a forbid-spill request is one of the
 // planned consumers the hold exists for, and no other zone has a hold. A request larger than the zone's free
-// bytes is NOT held back: it spills as it always did and the allocator's overcommit guard may evict for it. The
+// bytes is NOT held back: it spills as it always did and meets the allocator's raw gate like any raw request. The
 // zone's free bytes come first, then the hold, then the request size: swapped, the same numbers answer a
 // different question.
 bool zone_runtime_alloc_held_back(bool   runtime_zone,

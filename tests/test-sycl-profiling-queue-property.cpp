@@ -135,9 +135,9 @@ int main(int, char ** argv) {
     // (the default), ggml_backend_sycl_buffer_type_alloc_buffer()
     // (ggml-sycl.cpp:35280) calls the CREATING accessor
     // ggml_sycl::get_unified_cache_for_device() when routing through the
-    // RUNTIME zone; regardless of the arena, unified_alloc()'s DEVICE_VRAM
-    // tier (unified-cache.cpp:12640) calls the same creating accessor to
-    // read the cache's current VRAM usage as part of its overcommit guard.
+    // RUNTIME zone; regardless of the arena, a DEVICE_VRAM request that
+    // reaches unified_alloc()'s raw exit calls the same creating accessor
+    // in the raw gate before it reads the device's bytes.
     ggml_init_params params = { 4 * 1024, nullptr, true };
     ggml_context *   ctx    = ggml_init(params);
     if (!ctx) {

@@ -6040,8 +6040,8 @@ static void ggml_sycl_configure_host_zones_for_plan(
         // staging (staging), neither a crash. On the direct-device route (no
         // arena), forbid_vram_zone_spill never engages (F14 nests it inside
         // the arena-active branch), so this call's behavior there is
-        // unchanged by this task -- any failure is the pre-existing
-        // DEVICE_VRAM-tier overcommit guard, handled the same way.
+        // unchanged by this task -- any failure is unified_alloc()'s raw
+        // gate on the device's bytes, handled the same way.
         (void) cache->reserve_pp_moe_onednn_scratch(
             plan.pp_moe_onednn_weight_slot_bytes, plan.pp_moe_onednn_activation_slot_bytes,
             plan.pp_moe_onednn_output_slot_bytes, plan.pp_moe_onednn_ring_depth);
@@ -19912,9 +19912,10 @@ static std::string ggml_sycl_hold_fit_advice(uint32_t largest_ub) {
 }
 
 // llama.cpp-kpjw: the live outside-arena headroom check for the hold's worst-case spill, run whatever the attention
-// mode. The unified allocator's overcommit guard compares a spill with the device's TOTAL memory minus what the
-// cache itself accounts for; it cannot see another tenant on the card or the driver's own reserve, so on a shared
-// card a spill it admits can fail late as OUT_OF_DEVICE_MEMORY or DEVICE_LOST. This asks the one hold-spill fit
+// mode. The unified allocator's raw gate compares a spill with the device's total less the arena, the raw rows the
+// cache holds and what was in use outside this process's accounting when the first cache was made; it cannot see a
+// tenant that arrived on the card after that, so on a shared card a spill it admits can fail late as
+// OUT_OF_DEVICE_MEMORY or DEVICE_LOST. This asks the one hold-spill fit
 // (ggml_sycl_hold_spill_fit), once, at the transaction, so the context is refused by name. No non-FA reserve is
 // added: that constant is the empirical outside-arena consumer of the non-FA path and has no bearing on the hold's
 // spill.
@@ -20431,8 +20432,8 @@ enum class ggml_sycl_ring_replan_result { OK, RELEASE_REFUSED, DOES_NOT_FIT };
 // KV-zone bytes held back per micro-batch row when part of the ring goes to the
 // shared KV zone. It stands in for the compute buffers, which the transaction
 // cannot size: graph_reserve allocates them after it. They try the RUNTIME zone
-// first; a miss there goes to raw device memory outside the arena when the VRAM
-// overcommit guard allows it, and to the KV zone only when it does not
+// first; a miss there goes to raw device memory outside the arena when the
+// allocator's raw gate allows it, and to the KV zone only when it does not
 // (llama.cpp-23mk). GPT-OSS 20B's compute buffer is about 404 MiB
 // at n_ubatch=512 (0.79 MiB per row), rounded up here, and left linear in
 // n_ubatch like the buffer. An estimate, not a plan: neither the compute buffer
@@ -20809,9 +20810,8 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(
     // the identical refusal without depending on that allocator-level
     // behavior alone, and without burning a real allocation attempt for a
     // request that plainly cannot fit. The direct-device route has no
-    // fixed-size RUNTIME zone to overflow; it keeps its own existing
-    // VRAM-overcommit guard (unified_alloc()'s DEVICE_VRAM tier check) as
-    // its only budget check.
+    // fixed-size RUNTIME zone to overflow; unified_alloc()'s raw gate on
+    // the device's bytes is its only budget check.
     if (arena && !admission.admit) {
         return refuse_and_restore();
     }

@@ -164,6 +164,104 @@ static bool allocate_failure_rolls_back_budget(sycl::queue & q) {
     return true;
 }
 
+// A raw device request meets the device's physical bytes at unified_alloc's raw exit: the device total less the arena
+// reservation, the raw rows held outside it and what was in use outside this process's accounting at the first cache.
+// With an arena the plan placed the weights, so a raw request past those bytes is refused and evicts nothing. The case
+// seeds one evictable cache entry whose eviction would free what the request is short of, sets the device total 1 MiB
+// past what the process holds, and checks that a 4 MiB raw request is refused with that entry still cached, a 512 KiB
+// one is served, and a 2 MiB request the RUNTIME zone serves never meets the gate.
+static bool raw_gate_refuses_past_the_device_total(sycl::queue & q) {
+    TEST_BEGIN("raw_gate_refuses_past_the_device_total");
+    unified_cache * cache = get_unified_cache(q);
+    TEST_ASSERT(cache != nullptr, "cache unavailable");
+    // Without an arena the gate may evict, so the no-eviction claim below means something only with one.
+    TEST_ASSERT(cache->arena_active(), "no arena is active, so the arena's no-eviction rule cannot be exercised");
+    constexpr size_t MiB = 1024 * 1024;
+
+    alloc_request raw{};
+    raw.queue                          = &q;
+    raw.size                           = 4096;
+    raw.intent.role                    = alloc_role::COMPUTE;
+    raw.intent.category                = runtime_category::COMPUTE;
+    raw.intent.constraints.must_device = true;
+
+    // The device index the allocator resolves q to, read back from a small raw allocation.
+    alloc_handle   probe{};
+    alloc_metadata probe_meta{};
+    TEST_ASSERT(unified_alloc(raw, &probe) && unified_lookup(probe.ptr, &probe_meta), "the probe allocation failed");
+    TEST_ASSERT(unified_free(probe), "the probe free failed");
+    const int device = probe_meta.device;
+    TEST_ASSERT(cache->zone_available(vram_zone_id::RUNTIME) >= 2 * MiB,
+                "the RUNTIME zone has under 2 MiB free, so the zone half cannot run");
+
+    // One evictable entry outside the arena: a raw row the gate counts, in-use count 0, not pinned. It is the only
+    // entry an eviction for the 4 MiB request could take, and taking it would free more than that request is short of.
+    ggml_sycl_cache_id seed_id = {};
+    seed_id.valid              = true;
+    seed_id.model_id           = 0x7261772d67617465ull;  // an id no other case in this file uses
+    seed_id.name_hash          = 1;
+    seed_id.nbytes             = 4 * MiB;
+    seed_id.type               = GGML_TYPE_F32;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        seed_id.ne[i] = 1;
+    }
+    std::vector<uint8_t> seed_src(4 * MiB, 0);
+    bool                 needs_fill = false;
+    void *               seed_ptr =
+        cache->ensure_cached_alloc(seed_id, seed_src.data(), seed_src.size(), seed_src.size(),
+                                   cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false, &needs_fill);
+    TEST_ASSERT(seed_ptr != nullptr && cache->is_cached(seed_id, GGML_LAYOUT_AOS),
+                "the evictable entry was not cached");
+
+    const zone_raw_gate_inputs now = unified_cache_raw_gate_inputs(device, q);
+    TEST_ASSERT(now.device_total != 0, "the device total is unknown, so the gate gates nothing");
+    unified_cache_test_set_raw_gate_device_total(device, now.arena_bytes + now.raw_held + now.outside_accounting + MiB);
+
+    // The cache keeps no eviction count: an eviction shows as the entry gone, the entry count and the cache's used
+    // bytes down, and the sticky has_evictions flag raised (read only when it was clear before).
+    const size_t entries_before   = cache->entry_count();
+    const size_t used_before      = cache->used();
+    const size_t weight_before    = cache->zone_used(vram_zone_id::WEIGHT);
+    const bool   evictions_before = cache->has_evictions();
+    raw.size                      = 4 * MiB;
+    alloc_handle big{};
+    const bool   big_ok        = unified_alloc(raw, &big);
+    const bool   seed_kept     = cache->is_cached(seed_id, GGML_LAYOUT_AOS);
+    const bool   nothing_moved = cache->entry_count() == entries_before && cache->used() == used_before &&
+                               cache->zone_used(vram_zone_id::WEIGHT) == weight_before &&
+                               (evictions_before || !cache->has_evictions());
+    if (big_ok) {
+        unified_free(big);
+    }
+
+    raw.size = 512 * 1024;
+    alloc_handle small{};
+    const bool   small_ok = unified_alloc(raw, &small) && small.ptr != nullptr && unified_free(small);
+
+    // A request the RUNTIME zone serves is not a raw request: the gate's 1 MiB edge does not apply to it.
+    alloc_request zoned                       = raw;
+    zoned.size                                = 2 * MiB;
+    zoned.intent.role                         = alloc_role::GRAPH_TMP;
+    zoned.intent.category                     = runtime_category::GRAPH;
+    zoned.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+    alloc_handle in_zone{};
+    const bool   zone_ok = unified_alloc(zoned, &in_zone) && in_zone.ptr != nullptr && unified_free(in_zone);
+
+    unified_cache_test_set_raw_gate_device_total(device, 0);
+    if (seed_kept) {
+        cache->remove(seed_id, cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS);
+        cache->evict(0);  // runs the deferred free of the removed entry
+    }
+
+    TEST_ASSERT(!big_ok && big.ptr == nullptr, "a raw request past the device's bytes was served");
+    TEST_ASSERT(seed_kept, "the refusal evicted the cached entry an arena trip must leave alone");
+    TEST_ASSERT(nothing_moved, "the refusal evicted cache entries or moved the WEIGHT zone");
+    TEST_ASSERT(small_ok, "a raw request inside the device's bytes was refused");
+    TEST_ASSERT(zone_ok, "a RUNTIME-zone request met the raw gate");
+    TEST_PASS();
+    return true;
+}
+
 static bool free_unknown_pointer_fails() {
     TEST_BEGIN("free_unknown_pointer_fails");
     int stack_value = 0;
@@ -1910,6 +2008,7 @@ int main(int argc, char ** argv) {
     ok &= reserve_allocate_success_registers_pointer(q);
     ok &= arena_registry_commit_failure_rolls_back(q);
     ok &= allocate_failure_rolls_back_budget(q);
+    ok &= raw_gate_refuses_past_the_device_total(q);
     ok &= free_unknown_pointer_fails();
     ok &= strict_unknown_free_fails();
     ok &= double_free_fails(q);

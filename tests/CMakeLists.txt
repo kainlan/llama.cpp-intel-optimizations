@@ -4626,6 +4626,32 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for the zone counters that refusal sums: every VRAM arena zone counts its own bytes. zone_alloc() and
+# zone_free() write a counter only through zone-used-count.hpp (the allocator's delta for that one operation), and a
+# free lowers the zone its exact-allocation record names, so a WEIGHT free on an allocator KV shares never writes KV's
+# counter. Host-only, reads the sources as text; test-zone-sizing Case 34 checks the helper's arithmetic. Same
+# registration shape as test-sycl-arena-zone-refusal-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-zone-own-bytes-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-zone-own-bytes-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# Source gate for the two raw-allocation gates: unified_alloc()'s one raw device exit and the device-pool chunk sites
+# compare a raw request with the device's physical bytes (the device total less the arena reservation, the raw rows
+# held outside it and the bytes outside this process's accounting at the first cache), never a zone counter; with an
+# arena active a refusal evicts nothing, and it names every term. Host-only, reads the sources as text; test-zone-sizing
+# Case 35 checks the figure's arithmetic. Same registration shape as test-sycl-zone-own-bytes-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-raw-gate-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-raw-gate-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Jinja fallback for a model whose chat template the built-in matcher does not know (Gemma 4 failed after the load with
 # "try using --jinja"): upstream turns the jinja engine off for llama-completion and llama-mtmd-cli.
 # test-chat-need-jinja checks common_chat_templates_need_jinja() itself. It loads no model, so it keeps the default

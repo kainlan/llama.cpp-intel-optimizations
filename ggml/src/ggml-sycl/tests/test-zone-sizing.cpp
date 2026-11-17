@@ -24,11 +24,16 @@
 #include "compute-alloc-scope.hpp"
 #include "tlsf-allocator.hpp"
 #include "unified-types.hpp"
+#include "zone-raw-gate.hpp"
 #include "zone-sizing.hpp"
+#include "zone-used-count.hpp"
 
+#include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // The build is -DNDEBUG (Release), so assert() would compile away and the
@@ -1442,7 +1447,7 @@ int main() {
               "a hold that wraps must not read as no hold");
         // Review r2 F1: held back means the ZONE ALONE would have served the request and the hold is what keeps it
         // out. A request the zone cannot hold anyway spills exactly as it always did, with no hold involved, and
-        // the overcommit guard keeps evicting for it as it did before the hold existed.
+        // meets the allocator's raw gate like any raw request.
         CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 50, 0, 100),
               "an ordinary zone-full spill with no hold is not held back");
         CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 50, 10, 100),
@@ -2209,6 +2214,193 @@ int main() {
         const uint64_t top[] = { SIZE_MAX };
         CHECK(!ggml_sycl::zone_compute_term_bytes(top, 1, 128, &term), "a chunk the rounding wraps was accepted");
         CHECK(!ggml_sycl::zone_compute_term_bytes(nullptr, 1, 128, &term), "a null chunk list was accepted");
+    }
+
+    // ---- Case 34: each arena zone counts its own bytes over a shared allocator ----------------------------------
+    // KV and WEIGHT share one TLSF in a single-chunk arena. A counter that stored the allocator's total gave WEIGHT the
+    // KV bytes, and a WEIGHT free stored into KV's counter never lowered WEIGHT: a freed model read as live WEIGHT
+    // bytes and refused the next load's zone rebuild. Each counter moves by the allocator's own delta, a free lowers
+    // the zone the allocation was recorded under, and the counters of the zones sharing the allocator sum to its
+    // used(). The record and the free below have the shape unified_cache::zone_free() has: the zone comes from the
+    // exact allocation's record, looked up by offset, and the zone the caller names only finds the record.
+    {
+        constexpr int             ZONE_KV     = 0;
+        constexpr int             ZONE_WEIGHT = 1;
+        const size_t              grain       = ggml_sycl::tlsf_allocator::block_grain;
+        ggml_sycl::tlsf_allocator shared(1024 * grain);
+        std::atomic<size_t>       used[2];
+        used[ZONE_KV].store(0);
+        used[ZONE_WEIGHT].store(0);
+        std::vector<std::pair<size_t, int>> records;  // offset -> the zone the allocation was charged to
+
+        auto alloc_in = [&](int zone, size_t size) {
+            const size_t offset = ggml_sycl::zone_used_allocate(shared, used[zone], size, 64);
+            if (offset != SIZE_MAX) {
+                records.emplace_back(offset, zone);
+            }
+            return offset;
+        };
+        // The caller's zone finds nothing here: the record says whose counter the block was added to.
+        auto free_named = [&](int caller_zone, size_t offset) {
+            (void) caller_zone;
+            for (size_t i = 0; i < records.size(); ++i) {
+                if (records[i].first == offset) {
+                    const int record_zone = records[i].second;
+                    records.erase(records.begin() + static_cast<std::ptrdiff_t>(i));
+                    ggml_sycl::zone_used_free(shared, offset, used[record_zone]);
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto sum_is_used = [&] {
+            return used[ZONE_KV].load() + used[ZONE_WEIGHT].load() == shared.used();
+        };
+
+        // a WEIGHT free lowers WEIGHT, and leaves KV holding only KV's bytes
+        const size_t w = alloc_in(ZONE_WEIGHT, 64 * grain);
+        CHECK(w != SIZE_MAX && used[ZONE_WEIGHT].load() == 64 * grain && used[ZONE_KV].load() == 0,
+              "a WEIGHT allocation was not charged to WEIGHT alone");
+        const size_t k = alloc_in(ZONE_KV, 16 * grain);
+        CHECK(k != SIZE_MAX && used[ZONE_KV].load() == 16 * grain && used[ZONE_WEIGHT].load() == 64 * grain,
+              "a KV allocation on the shared allocator took WEIGHT's bytes into KV's counter");
+        CHECK(sum_is_used(), "the two counters do not sum to the shared allocator's used()");
+        CHECK(free_named(ZONE_WEIGHT, w), "the WEIGHT record was lost");
+        CHECK(used[ZONE_WEIGHT].load() == 0, "a WEIGHT free did not lower WEIGHT to zero");
+        CHECK(used[ZONE_KV].load() == 16 * grain, "a WEIGHT free changed KV's counter");
+        CHECK(sum_is_used(), "after the WEIGHT free the counters do not sum to used()");
+        CHECK(free_named(ZONE_KV, k) && used[ZONE_KV].load() == 0 && shared.used() == 0, "the KV free left bytes");
+
+        // the counter takes what the allocator took, block rounding included, not the requested size
+        const size_t odd = alloc_in(ZONE_WEIGHT, 100);
+        CHECK(odd != SIZE_MAX && used[ZONE_WEIGHT].load() == ggml_sycl::tlsf_allocator::round_request(100, 64) &&
+                  used[ZONE_WEIGHT].load() == grain && used[ZONE_WEIGHT].load() == shared.used(),
+              "the counter was charged the requested size instead of the allocator's delta");
+        const size_t odd_kv = alloc_in(ZONE_KV, grain + 1);
+        CHECK(odd_kv != SIZE_MAX && used[ZONE_KV].load() == 2 * grain && sum_is_used(),
+              "a rounded KV request was not charged as the allocator rounded it");
+        CHECK(free_named(ZONE_WEIGHT, odd) && free_named(ZONE_KV, odd_kv), "the rounded records were lost");
+        CHECK(used[ZONE_WEIGHT].load() == 0 && used[ZONE_KV].load() == 0 && shared.used() == 0,
+              "a rounded block did not come back off its counter whole");
+
+        // a free named with the other zone of the shared allocator lowers the zone the record names
+        const size_t w2 = alloc_in(ZONE_WEIGHT, 8 * grain);
+        const size_t k2 = alloc_in(ZONE_KV, 4 * grain);
+        CHECK(w2 != SIZE_MAX && k2 != SIZE_MAX, "the wrong-zone fixture did not allocate");
+        CHECK(free_named(ZONE_KV, w2), "the WEIGHT record named as KV was not found");
+        CHECK(used[ZONE_WEIGHT].load() == 0 && used[ZONE_KV].load() == 4 * grain,
+              "a WEIGHT block freed under the KV name lowered KV instead of WEIGHT");
+        CHECK(free_named(ZONE_WEIGHT, k2), "the KV record named as WEIGHT was not found");
+        CHECK(used[ZONE_KV].load() == 0 && used[ZONE_WEIGHT].load() == 0 && shared.used() == 0,
+              "a KV block freed under the WEIGHT name lowered WEIGHT instead of KV");
+
+        // a free the allocator does not recognise, and an allocation it refuses, move no counter
+        const size_t w3 = alloc_in(ZONE_WEIGHT, 2 * grain);
+        CHECK(w3 != SIZE_MAX && free_named(ZONE_WEIGHT, w3), "the double-free fixture did not allocate and free");
+        ggml_sycl::zone_used_free(shared, w3, used[ZONE_WEIGHT]);
+        CHECK(used[ZONE_WEIGHT].load() == 0 && shared.used() == 0, "a second free of a block moved the counter");
+        CHECK(ggml_sycl::zone_used_allocate(shared, used[ZONE_KV], 2048 * grain, 64) == SIZE_MAX,
+              "an allocation larger than the allocator succeeded");
+        CHECK(used[ZONE_KV].load() == 0, "a refused allocation was charged");
+
+        // interleaved allocations and frees of both zones: the sum holds after every step, and both counters end at 0
+        std::vector<size_t> live;
+        const size_t        sizes[] = { 3 * grain, 100, 7 * grain + 5, grain, 33 * grain, 2 * grain - 1 };
+        for (int round = 0; round < 3; ++round) {
+            for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+                const int    zone   = (i + static_cast<size_t>(round)) % 2 == 0 ? ZONE_WEIGHT : ZONE_KV;
+                const size_t offset = alloc_in(zone, sizes[i]);
+                CHECK(offset != SIZE_MAX, "an interleaved allocation failed");
+                live.push_back(offset);
+                CHECK(sum_is_used(), "an interleaved allocation broke the sum");
+                if (live.size() % 3 == 0) {
+                    // free the middle one, named by the other zone than the one it was charged to
+                    const size_t victim = live[live.size() / 2];
+                    int          named  = ZONE_KV;
+                    for (const auto & r : records) {
+                        if (r.first == victim) {
+                            named = r.second == ZONE_KV ? ZONE_WEIGHT : ZONE_KV;
+                        }
+                    }
+                    CHECK(free_named(named, victim), "an interleaved record was lost");
+                    live.erase(live.begin() + static_cast<std::ptrdiff_t>(live.size() / 2));
+                    CHECK(sum_is_used(), "an interleaved free broke the sum");
+                }
+            }
+        }
+        while (!live.empty()) {
+            CHECK(free_named(ZONE_WEIGHT, live.back()), "a remaining record was lost");
+            live.pop_back();
+            CHECK(sum_is_used(), "a closing free broke the sum");
+        }
+        CHECK(used[ZONE_KV].load() == 0 && used[ZONE_WEIGHT].load() == 0 && shared.used() == 0 && records.empty(),
+              "interleaved allocations and frees did not return both counters to zero");
+    }
+
+    // ---- Case 35: a raw device allocation is gated on the device's physical bytes, not on zone counters ----------
+    // A raw allocation takes device memory the arena did not reserve. The arena reservation is committed whole, so what
+    // the device has left for a raw request is its total less the arena, less the raw rows already held outside it,
+    // less what was in use outside this process's accounting when the first cache was created. A gate that read zone
+    // counters instead let a raw request past an arena whose zones were empty but whose bytes were all reserved.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_raw_gate_fits;
+        using ggml_sycl::zone_raw_gate_free_outside_arena;
+        using ggml_sycl::zone_raw_gate_inputs;
+
+        // the B50 GPT-OSS load: 16304 MiB device, 14292 MiB arena, 381 MiB in use before the first cache
+        zone_raw_gate_inputs b50;
+        b50.device_total       = 16304 * MiB;
+        b50.arena_bytes        = 14292 * MiB;
+        b50.raw_held           = 0;
+        b50.outside_accounting = 381 * MiB;
+        const size_t b50_free  = 16304 * MiB - 14292 * MiB - 381 * MiB;
+        CHECK(zone_raw_gate_free_outside_arena(b50) == b50_free, "the free figure is not total - arena - outside");
+        CHECK(zone_raw_gate_fits(b50, 5 * MiB), "a small raw request next to the B50 arena was refused");
+        CHECK(zone_raw_gate_fits(b50, b50_free), "a request of exactly the free bytes was refused");
+        CHECK(!zone_raw_gate_fits(b50, b50_free + 1), "a request one byte past the free bytes was admitted");
+
+        // the bytes outside this process's accounting are part of the figure: the same request flips with the term
+        zone_raw_gate_inputs no_outside = b50;
+        no_outside.outside_accounting   = 0;
+        CHECK(zone_raw_gate_fits(no_outside, b50_free + 200 * MiB), "without the term the larger request must fit");
+        CHECK(!zone_raw_gate_fits(b50, b50_free + 200 * MiB), "the term outside the accounting was not counted");
+
+        // raw rows already held outside the arena lower what is left
+        zone_raw_gate_inputs held = b50;
+        held.raw_held             = 1000 * MiB;
+        CHECK(zone_raw_gate_free_outside_arena(held) == b50_free - 1000 * MiB, "the raw rows held were not counted");
+        CHECK(zone_raw_gate_fits(b50, 700 * MiB) && !zone_raw_gate_fits(held, 700 * MiB),
+              "a request that fit before 1000 MiB of raw rows still fits after them");
+
+        // an arena of two chunks reserves both: the figure takes their sum, and a request that clears one is refused
+        const size_t         chunks[] = { 16384 * MiB, 13468 * MiB };
+        zone_raw_gate_inputs two_chunk;
+        two_chunk.device_total = 31104 * MiB;
+        two_chunk.arena_bytes  = chunks[0] + chunks[1];
+        CHECK(zone_raw_gate_free_outside_arena(two_chunk) == 1252 * MiB, "the two-chunk arena was not counted whole");
+        CHECK(!zone_raw_gate_fits(two_chunk, 2000 * MiB), "a request that clears only the first chunk was admitted");
+
+        // saturating: an arena larger than the device, or held bytes that would wrap, leave nothing, never a wrap
+        zone_raw_gate_inputs over;
+        over.device_total = 1000 * MiB;
+        over.arena_bytes  = 2000 * MiB;
+        CHECK(zone_raw_gate_free_outside_arena(over) == 0 && !zone_raw_gate_fits(over, 1),
+              "an arena larger than the device wrapped the figure");
+        zone_raw_gate_inputs wrap = b50;
+        wrap.raw_held             = SIZE_MAX - 10 * MiB;
+        CHECK(zone_raw_gate_free_outside_arena(wrap) == 0 && !zone_raw_gate_fits(wrap, 1),
+              "the raw rows held wrapped the sum");
+        wrap.raw_held           = 0;
+        wrap.outside_accounting = SIZE_MAX;
+        CHECK(zone_raw_gate_free_outside_arena(wrap) == 0, "the term outside the accounting wrapped the sum");
+
+        // an unknown device total gates nothing
+        zone_raw_gate_inputs unknown;
+        unknown.arena_bytes        = 14292 * MiB;
+        unknown.outside_accounting = 381 * MiB;
+        CHECK(zone_raw_gate_free_outside_arena(unknown) == SIZE_MAX && zone_raw_gate_fits(unknown, SIZE_MAX),
+              "an unknown device total gated a request");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
