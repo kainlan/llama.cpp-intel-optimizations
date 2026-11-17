@@ -2396,6 +2396,12 @@ GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install_kv(
     const struct ggml_sycl_measure_kv_shape * kv_shape);
 GGML_BACKEND_API void ggml_backend_sycl_measure_plan_override_clear(void);
 
+// Proc name: "ggml_backend_sycl_measure_plan_staged".  Whether the load `load_txn` has a plan staged for the measure
+// at `stage`, by the lookup the install makes, installing nothing.  A load the early pass could not plan stages no
+// probe plan: a model built in memory (its weights are known only after create_tensor), a no_alloc load, and a load
+// with the VRAM arena off.  The loader asks this first, so such a load is not refused for a measure it cannot run.
+GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_staged(uint64_t load_txn, enum ggml_sycl_measure_stage stage);
+
 // === Per-context chunk-cap copy and plan scopes ===
 //
 // A context that runs the placement fixpoint owns one `ggml_backend_sycl_plan_caps`.

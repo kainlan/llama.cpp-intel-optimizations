@@ -16022,16 +16022,11 @@ static const char * ggml_sycl_measure_stage_name(ggml_sycl_measure_stage stage) 
     return "unknown";
 }
 
-bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                                  load_txn,
-                                                        ggml_sycl_measure_stage                   stage,
-                                                        const struct ggml_sycl_measure_kv_shape * kv_shape) {
-    if (g_measure_plan_override) {
-        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] measure plan override nested\n");
-        if (ggml_sycl::ggml_sycl_strict_enabled()) {
-            GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested");
-        }
-        return false;
-    }
+// The plan a measure at `stage` installs for the load `load_txn`, or null. The install and the loader's query both
+// read it here, so the loader never runs a measure the install would refuse for want of a plan.
+static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_measure_staged_plan(
+    uint64_t                load_txn,
+    ggml_sycl_measure_stage stage) {
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;
     switch (stage) {
         case GGML_SYCL_MEASURE_STAGE_PROBE:
@@ -16043,6 +16038,28 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
             break;
     }
     if (!snapshot || !snapshot->plan) {
+        return nullptr;
+    }
+    return snapshot;
+}
+
+bool ggml_backend_sycl_measure_plan_staged(uint64_t load_txn, ggml_sycl_measure_stage stage) {
+    return ggml_sycl_measure_staged_plan(load_txn, stage) != nullptr;
+}
+
+bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                                  load_txn,
+                                                        ggml_sycl_measure_stage                   stage,
+                                                        const struct ggml_sycl_measure_kv_shape * kv_shape) {
+    if (g_measure_plan_override) {
+        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] measure plan override nested\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested");
+        }
+        return false;
+    }
+    // A caller that asked ggml_backend_sycl_measure_plan_staged first never reaches this refusal; the loader does.
+    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);
+    if (!snapshot) {
         GGML_LOG_ERROR("[LOAD-PLAN] measure plan override: no plan staged for load %llu at stage %s\n",
                        (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage));
         return false;
@@ -128648,6 +128665,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_measure_plan_override_clear") == 0) {
         return (void *) ggml_backend_sycl_measure_plan_override_clear;
+    }
+    if (strcmp(name, "ggml_backend_sycl_measure_plan_staged") == 0) {
+        return (void *) ggml_backend_sycl_measure_plan_staged;
     }
     if (strcmp(name, "ggml_backend_sycl_measure_backend_init") == 0) {
         return (void *) ggml_backend_sycl_measure_backend_init;

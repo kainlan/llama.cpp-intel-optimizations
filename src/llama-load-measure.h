@@ -37,14 +37,17 @@ struct llama_measure_unsupported : std::runtime_error {
 };
 
 // The two backend entry points the plan-override guard calls, taken together from one function so a
-// missing one is a named refusal and an override can never be installed without its clear.
+// missing one is a named refusal and an override can never be installed without its clear, and the query
+// the measure asks before the guard.
 struct llama_measure_override_procs {
     decltype(&ggml_backend_sycl_measure_plan_override_install_kv) install = nullptr;
-    decltype(&ggml_backend_sycl_measure_plan_override_clear)   clear   = nullptr;
+    decltype(&ggml_backend_sycl_measure_plan_override_clear)      clear   = nullptr;
+    // whether a plan is staged for the measure's stage; null leaves the install to answer
+    decltype(&ggml_backend_sycl_measure_plan_staged)              staged  = nullptr;
 };
 
-// In a static build the backend's two functions; under GGML_BACKEND_DL the entries found by name through
-// the SYCL reg of `dev`. A backend that does not export them leaves both null.
+// In a static build the backend's functions; under GGML_BACKEND_DL the entries found by name through
+// the SYCL reg of `dev`. A backend that does not export one leaves it null.
 llama_measure_override_procs llama_context_sycl_measure_override_procs(ggml_backend_dev_t dev);
 
 #ifdef LLAMA_PRIVATE_TEST_OBJECTS
@@ -185,6 +188,18 @@ inline std::string llama_load_measure_refusal_text(enum ggml_sycl_measure_stage 
                                                    const std::string &          reason) {
     return std::string("[LOAD-PLAN] compute-slot measure failed at ") + llama_load_measure_stage_name(stage) +
            " on device " + std::to_string(device) + ": " + reason + " (refused)";
+}
+
+// Why the measure at `stage` has no plan to run over, or null when it has one or the backend cannot say. A load the
+// early pass did not plan (a model built in memory, a no_alloc load, the VRAM arena off) has no probe plan, and the
+// install would refuse it; the stage is skipped instead, and the compute slot is not planned at load.
+inline const char * llama_load_measure_plan_absent(const llama_measure_override_procs & procs,
+                                                   uint64_t                             load_txn,
+                                                   enum ggml_sycl_measure_stage         stage) {
+    if (procs.staged == nullptr || procs.staged(load_txn, stage)) {
+        return nullptr;
+    }
+    return "no placement plan is staged for this load at this stage, so there is nothing to measure";
 }
 
 // The KV shape of a measure context built with `params`, which the plan override's KV re-fit sizes for

@@ -4346,11 +4346,14 @@ llama_measure_override_procs llama_context_sycl_measure_override_procs(ggml_back
 #ifdef GGML_USE_SYCL
     procs.install = &ggml_backend_sycl_measure_plan_override_install_kv;
     procs.clear   = &ggml_backend_sycl_measure_plan_override_clear;
+    procs.staged  = &ggml_backend_sycl_measure_plan_staged;
 #elif defined(GGML_BACKEND_DL)
     procs.install = reinterpret_cast<decltype(procs.install)>(
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_override_install_kv"));
     procs.clear = reinterpret_cast<decltype(procs.clear)>(
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_override_clear"));
+    procs.staged = reinterpret_cast<decltype(procs.staged)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_staged"));
 #endif
     return procs;
 }
@@ -4440,6 +4443,14 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
     llama_load_measure_result out;
 
     if (const std::string why = llama_measure_unsupported_reason(model); !why.empty()) {
+        out.unsupported = true;
+        out.refusal     = llama_load_measure_refusal_text(stage, first_device, why);
+        return out;
+    }
+
+    // A stage with no plan staged is not measured: the install would refuse it and fail the load over a measure that
+    // has nothing to run over.
+    if (const char * why = llama_load_measure_plan_absent(procs, load_txn, stage); why != nullptr) {
         out.unsupported = true;
         out.refusal     = llama_load_measure_refusal_text(stage, first_device, why);
         return out;

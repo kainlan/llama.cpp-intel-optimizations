@@ -3367,6 +3367,17 @@ shared zone, and the buffer took whatever the allocator found. On the B70 with Q
   unplanned. A device whose late state is zero is not asked, so a state that leaves a device entirely gives no shrink
   WARN. The loader prints `state term on device N` on its own line beside the compute-slot line.
 
+**A load with no plan at a stage.** A stage measures only when the backend has a plan staged for it:
+`llama_load_measure_run` asks `ggml_backend_sycl_measure_plan_staged`, which reads the install's own lookup, before it
+builds the plan override, and a stage with none is unsupported, not refused. Three loads stage no probe plan. A model
+built in memory with `llama_model_init_from_user` has an empty `weights_map`, and its weights exist only after
+`create_tensor`, so the early pass has nothing to plan. A `no_alloc` load skips the early pass. A load with the VRAM
+arena off stages an explicit no-plan row, which is no plan. Their probe is skipped with a WARN, so no compute or state
+term is reserved and the admitted stage does not run. The late plan still places the in-memory model's weights, from
+`ctx_map`, and its late check measures that plan and WARNs that no early compute term was recorded. A `no_alloc` load
+stages no late plan and an arena-off load stages another no-plan row, so their late check is skipped with a WARN as
+well. For all three the compute buffer is not planned at load.
+
 **Invariant: every RUNTIME-first consumer at context time is named in the reserve.** The real context allocates
 some memory in the RUNTIME zone first, after the load and before its compute buffer. Each such consumer needs a planned
 term of its own, or it draws down the compute term and a compute chunk lands outside the zone. In the Qwen3.8 B70

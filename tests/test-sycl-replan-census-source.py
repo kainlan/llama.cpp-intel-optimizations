@@ -970,7 +970,9 @@ def gate36(files, bad):
         if 'GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst or \
                 'GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst:
             bad("gate 36: install lacks its nesting witness")
-    for fn in ("ggml_backend_sycl_measure_plan_override_install_kv", "lifecycle_make_candidate_snapshot"):
+    # the install's lookup is ggml_sycl_measure_staged_plan, which the loader's staged-plan query reads too
+    for fn in ("ggml_backend_sycl_measure_plan_override_install_kv", "ggml_sycl_measure_staged_plan",
+               "lifecycle_make_candidate_snapshot"):
         t = ""
         for path in (MAIN, UC_C):
             cc = code(files, path)
@@ -1417,8 +1419,8 @@ def mutants(files):
                 "GGML_LOG_ERROR(\"measure plan override nested\\n\");", "g36e"),
            "install lacks its nesting witness")
     yield ("install naming the provisional builder",
-           edit(files, M, "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;\n    switch (stage) {",
-                "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;\n    (void) &ggml_sycl_make_provisional_plan_snapshot;\n    switch (stage) {", "g36f"),
+           edit(files, M, "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);",
+                "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);\n    (void) &ggml_sycl_make_provisional_plan_snapshot;", "g36f"),
            "names ggml_sycl_make_provisional_plan_snapshot")
     yield ("a measure free reaching the SYCL free",
            edit(files, M, "static void ggml_backend_sycl_measure_free(ggml_backend_t backend) {\n    delete backend;",
