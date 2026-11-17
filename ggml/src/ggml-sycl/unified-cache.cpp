@@ -20381,6 +20381,12 @@ bool unified_cache_raw_gate_admits(int device, sycl::queue & queue, size_t bytes
 // after the other. The exception is the first raw request on a device, whose lookup creates the cache: it holds L4
 // exclusive and takes g_runtime_alloc_mutex (L5) inside it for the outside-accounting note, the L4-before-L5 order.
 // Without an arena, evict_and_flush takes the cache's own locks after all of these are released.
+//
+// No lock is held from reading the figure to the driver allocation, so two raw requests on one device at once can both
+// be admitted against the same free bytes: the driver may then serve both past the physical bytes, or fail one, which
+// unified_alloc returns as false with no log of its own beyond a GGML_SYCL_DEBUG line from the tracked allocation. That
+// is accepted: raw exits are few and come at load time, and a lock held across a driver allocation would queue every
+// raw exit on the device behind it.
 static bool unified_alloc_raw_gate(const alloc_request & req, size_t alloc_size, bool hold_spill) {
     // The creating lookup, as the first raw request on a device has always made it: the cache's arena and the term
     // outside this process's accounting are in place before the first raw byte is counted.
