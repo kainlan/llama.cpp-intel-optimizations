@@ -3635,6 +3635,23 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
     return zone_runtime_requirement(terms, out);
 }
 
+planner_published_terms planner_published_terms::snapshot(int device) {
+    planner_published_terms terms;
+    terms.graph   = unified_cache_get_planned_onednn_graph_scratch_shape(device);
+    terms.nonfa   = unified_cache_get_planned_nonfa_attn_scratch_shape(device);
+    terms.control = unified_cache_get_planned_moe_control_requirement(device);
+    terms.scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device);
+    return terms;
+}
+
+void planner_published_terms::restore(int device) const {
+    unified_cache_set_planned_onednn_graph_scratch_shape(device, graph.n_head_ctx_max, graph.n_head_swa_max,
+                                                         graph.n_swa, graph.n_ubatch, graph.n_ctx);
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
+    unified_cache_set_planned_moe_control_requirement(device, control);
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);
+}
+
 size_t unified_cache_runtime_zone_floor_bytes() {
     size_t floor_bytes = 512 * 1024 * 1024;
     if (const char * env = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB")) {

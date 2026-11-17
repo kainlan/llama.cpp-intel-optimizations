@@ -2907,8 +2907,10 @@ the planner publishes terms of its own: the MoE host scatter scratch for the
 experts it moved to host, the MoE CONTROL requirement, and the oneDNN Graph and
 non-FA attention scratch shapes. The plan with the room is discarded here, so
 before the zones are sized the load puts those terms back as they stood before
-it planned with the room (`ggml_sycl_planner_published_terms`, which the plan
-dry run restores through as well). The zones are then asked for what the entry
+it planned with the room (`ggml_sycl::planner_published_terms` in
+`unified-cache.hpp`, which the plan dry run restores through as well, and which
+test-sycl-runtime-alloc checks against the cache's own state). The zones are
+then asked for what the entry
 check found they hold, and the plan without the room publishes its own terms.
 Without that restore, a plan that had moved experts to host left its host
 scatter term published, and the fallback asked a RUNTIME zone that could not

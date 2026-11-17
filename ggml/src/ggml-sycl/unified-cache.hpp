@@ -3218,6 +3218,23 @@ size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id);
 // silently becoming a smaller RUNTIME zone.
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out);
 
+// The terms the placement planners publish for a device while they compute a plan (populate_host_zone_sizing() and
+// publish_moe_host_scatter_term()): the MoE CONTROL requirement and the MoE host scatter scratch, both in the RUNTIME
+// zone's requirement, and the oneDNN Graph and non-FA attention scratch shapes, which floor zones the same ensure
+// sizes. A plan that is computed and then discarded publishes nothing, so a caller that may discard one takes this
+// snapshot before it plans and restores it when it does. Each setter stores what its getter reads, so the restore is
+// exact. A term the planners start to publish is added here, not at a caller. It lives beside the getters and setters
+// it calls, so a test that links the cache without the backend checks the restore against the cache's own state.
+struct planner_published_terms {
+    onednn_graph_scratch_planned_shape graph{};
+    nonfa_attn_scratch_planned_shape   nonfa{};
+    moe_control_requirement            control{};
+    size_t                             scatter = 0;
+
+    static planner_published_terms snapshot(int device);
+    void                           restore(int device) const;
+};
+
 // The RUNTIME zone's floor: 512 MiB, or GGML_SYCL_RUNTIME_ARENA_MB when it is set. ensure_planned_arena_zones()
 // reserves at least this, and an explicit micro-batch's room is measured against the same floor.
 size_t unified_cache_runtime_zone_floor_bytes();

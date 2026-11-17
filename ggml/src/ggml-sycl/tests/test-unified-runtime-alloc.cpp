@@ -1821,6 +1821,151 @@ static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
     return true;
 }
 
+// The planned terms of one device this case writes, read when it starts and written back when it ends, on every exit,
+// through the getters and setters themselves rather than through the helper under test.
+struct planned_terms_found {
+    int                                device;
+    size_t                             ring_weight;
+    size_t                             ring_act;
+    size_t                             ring_out;
+    uint32_t                           ring_depth;
+    uint32_t                           ring_n_ubatch;
+    size_t                             act_row;
+    size_t                             out_row;
+    uint32_t                           n_expert;
+    uint32_t                           n_expert_used;
+    bool                               act_in_kv;
+    bool                               out_in_kv;
+    onednn_graph_scratch_planned_shape graph;
+    nonfa_attn_scratch_planned_shape   nonfa;
+    moe_control_requirement            control;
+    size_t                             scatter;
+
+    explicit planned_terms_found(int d) :
+        device(d),
+        ring_weight(unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(d)),
+        ring_act(unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(d)),
+        ring_out(unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(d)),
+        ring_depth(unified_cache_get_planned_pp_moe_onednn_ring_depth(d)),
+        ring_n_ubatch(unified_cache_get_planned_pp_moe_onednn_n_ubatch(d)),
+        act_row(unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(d)),
+        out_row(unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(d)),
+        n_expert(unified_cache_get_planned_pp_moe_onednn_n_expert(d)),
+        n_expert_used(unified_cache_get_planned_pp_moe_onednn_n_expert_used(d)),
+        act_in_kv(unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(d)),
+        out_in_kv(unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(d)),
+        graph(unified_cache_get_planned_onednn_graph_scratch_shape(d)),
+        nonfa(unified_cache_get_planned_nonfa_attn_scratch_shape(d)),
+        control(unified_cache_get_planned_moe_control_requirement(d)),
+        scatter(unified_cache_get_planned_moe_host_scatter_scratch_bytes(d)) {}
+
+    ~planned_terms_found() {
+        unified_cache_set_planned_pp_moe_onednn_scratch(device, ring_weight, ring_act, ring_out, ring_depth);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, ring_n_ubatch);
+        unified_cache_set_planned_pp_moe_onednn_row_bytes(device, act_row, out_row, n_expert, n_expert_used);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, act_in_kv, out_in_kv);
+        unified_cache_set_planned_onednn_graph_scratch_shape(device, graph.n_head_ctx_max, graph.n_head_swa_max,
+                                                             graph.n_swa, graph.n_ubatch, graph.n_ctx);
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
+        unified_cache_set_planned_moe_control_requirement(device, control);
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);
+    }
+};
+
+// A plan that is tried and discarded publishes nothing. The load stage's fallback and the plan dry run put back the
+// terms the planner published while it computed the plan through planner_published_terms; this case checks that
+// helper against the cache's own per-device state, and the RUNTIME requirement the zones are sized from with it.
+// A load publishes its ring at the planning shape (n_ubatch 512) and its planner terms: the requirement is R0. The
+// snapshot is taken. The plan with the room publishes the run's 92160-byte host scatter term and its own oneDNN Graph
+// and non-FA shapes, and the micro-batch's publish grows the ring to n_ubatch 2048. The fallback publishes the ring
+// at 512 again. Before the restore the requirement is R0 + 92160, what the zone was asked for when the run aborted,
+// which shows the case reaches the term. After the restore it is exactly R0, and every planner term reads what the
+// load published. A second leg moves the CONTROL requirement, the other planner term the RUNTIME requirement counts,
+// and restores it the same way.
+// Engagement: the ring's slots grow from 512 to 2048 rows, and the requirement moves by exactly the term moved.
+// Mutants: a term left out of the snapshot or the restore (its leg reads the discarded plan's value); a restore that
+// writes a constant (the load's nonzero shapes and CONTROL bytes do not read back).
+// No device work: the terms are per-device process state. The case leaves every term it writes as it found it.
+static bool planner_terms_restore_returns_the_runtime_requirement() {
+    TEST_BEGIN("planner_terms_restore_returns_the_runtime_requirement");
+    constexpr int       device       = 0;
+    constexpr size_t    mib          = 1024ull * 1024ull;
+    constexpr size_t    scatter_term = 92160;
+    planned_terms_found found(device);
+
+    // The load: a ring of one 64 MiB weight slot whose activation and output slots follow the micro-batch, all of it in
+    // the RUNTIME zone, and the planner's terms at the planning shape.
+    unified_cache_set_planned_pp_moe_onednn_row_bytes(device, 5760, 11520, 32, 4);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+    size_t act_512  = 0;
+    size_t out_512  = 0;
+    size_t act_2048 = 0;
+    size_t out_2048 = 0;
+    TEST_ASSERT(unified_cache_pp_moe_onednn_slots_for_ubatch(device, 512, &act_512, &out_512) &&
+                    unified_cache_pp_moe_onednn_slots_for_ubatch(device, 2048, &act_2048, &out_2048),
+                "the ring's slots cannot be sized from the row bytes");
+    TEST_ASSERT(act_2048 > act_512 && out_2048 > out_512,
+                "the ring's slots do not grow from 512 to 2048 rows, so the micro-batch's publish moves nothing");
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, 64 * mib, act_512, out_512, 1);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 512);
+    unified_cache_set_planned_onednn_graph_scratch_shape(device, 32, 0, 0, 512, 4096);
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
+    unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ mib, true });
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 0);
+    size_t r0 = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &r0),
+                "the load's requirement is unanswerable");
+
+    const planner_published_terms before = planner_published_terms::snapshot(device);
+
+    // The plan with the room, and the micro-batch's publish.
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter_term);
+    unified_cache_set_planned_onednn_graph_scratch_shape(device, 32, 0, 0, 2048, 4096);
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 2048, 4096);
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, 64 * mib, act_2048, out_2048, 1);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 2048);
+    size_t grown = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &grown) && grown > r0 + scatter_term,
+                "the micro-batch's ring did not raise the requirement");
+
+    // The fallback publishes the ring at the planning shape again; the discarded plan's term is still published.
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, 64 * mib, act_512, out_512, 1);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 512);
+    size_t unrestored = 0;
+    TEST_ASSERT(
+        unified_cache_get_planned_runtime_zone_requirement(device, &unrestored) && unrestored == r0 + scatter_term,
+        "before the restore the requirement is not R0 + 92160, so the case does not reach the term");
+
+    before.restore(device);
+    size_t restored = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &restored) && restored == r0,
+                "after the restore the requirement is not the load's R0");
+    TEST_ASSERT(unified_cache_get_planned_moe_host_scatter_scratch_bytes(device) == 0,
+                "the restore left the discarded plan's host scatter term published");
+    const onednn_graph_scratch_planned_shape graph = unified_cache_get_planned_onednn_graph_scratch_shape(device);
+    TEST_ASSERT(graph.n_head_ctx_max == 32 && graph.n_head_swa_max == 0 && graph.n_swa == 0 && graph.n_ubatch == 512 &&
+                    graph.n_ctx == 4096,
+                "the restore left the discarded plan's oneDNN Graph scratch shape published");
+    const nonfa_attn_scratch_planned_shape nonfa = unified_cache_get_planned_nonfa_attn_scratch_shape(device);
+    TEST_ASSERT(nonfa.n_head == 32 && nonfa.n_ubatch == 512 && nonfa.n_ctx == 4096,
+                "the restore left the discarded plan's non-FA attention scratch shape published");
+
+    // The CONTROL requirement: a discarded plan that moved it raises the requirement by what it moved, and the
+    // restore puts the load's back.
+    unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ 2 * mib, true });
+    size_t control_moved = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &control_moved) && control_moved == r0 + mib,
+                "a CONTROL requirement 1 MiB larger does not raise the requirement by 1 MiB");
+    before.restore(device);
+    const moe_control_requirement control = unified_cache_get_planned_moe_control_requirement(device);
+    TEST_ASSERT(control.bytes == mib && control.valid, "the restore left the discarded plan's CONTROL requirement");
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &restored) && restored == r0,
+                "after the CONTROL restore the requirement is not the load's R0");
+
+    TEST_PASS();
+    return true;
+}
+
 int main(int argc, char ** argv) {
     fprintf(stderr, "===========================================\n");
     fprintf(stderr, "Unified Runtime Allocator Tests\n");
@@ -2013,6 +2158,7 @@ int main(int argc, char ** argv) {
     ok &= scratch_regrow_refusal_preserves_exact_record(q);
     ok &= concurrent_settle_destroy_closing_wins(q);
     ok &= accepted_control_publication_is_atomic_with_close_snapshot();
+    ok &= planner_terms_restore_returns_the_runtime_requirement();
     ok &= global_cache_static_destruction_exits_cleanly(argv[0]);
     // Retain a real pinned suballocation across the first shutdown attempt;
     // retry drains the process-global cache while q and SYCL are still alive.

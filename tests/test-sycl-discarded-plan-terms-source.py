@@ -13,10 +13,12 @@ These checks pin the fix:
 The RUNTIME zone's requirement is the sum of its terms as published, computed by the pure zone_runtime_requirement
 (test-zone-sizing Case 37 checks the arithmetic, the run's 92160 bytes included), which the cache's getter feeds.
 
-One helper, ggml_sycl_planner_published_terms, snapshots and restores every term the planner publishes: every
+One helper, ggml_sycl::planner_published_terms (declared in unified-cache.hpp, defined in unified-cache.cpp beside the
+getters and setters it calls), snapshots and restores every term the planner publishes: every
 unified_cache_set_planned_* call in the planner's own functions has its getter in the snapshot and its setter in the
-restore, fed from the field the snapshot filled. The plan dry run, which also discards the plans it makes, restores
-through the same helper and keeps no list of its own.
+restore, fed from the field the snapshot filled. The backend keeps no copy of its own. The plan dry run, which also
+discards the plans it makes, restores through the same helper and keeps no list of its own. test-sycl-runtime-alloc's
+planner-terms case checks the restore against the cache's own state.
 
 The scan for the planner's terms reads a fixed list of function bodies in unified-cache.cpp (PLANNER_SIGS):
 populate_host_zone_sizing, publish_moe_host_scatter_term, record_host_ledger_plan, placement_plan_size_host_side,
@@ -39,6 +41,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SYCL = ROOT / "ggml/src/ggml-sycl"
 GS = (SYCL / "ggml-sycl.cpp").read_text()
 UC = (SYCL / "unified-cache.cpp").read_text()
+UCH = (SYCL / "unified-cache.hpp").read_text()
 ZS = (SYCL / "zone-sizing.cpp").read_text()
 
 _LEXEME_RE = re.compile(
@@ -200,9 +203,13 @@ def claim_requirement_is_the_pure_sum(uc: str, zs: str) -> bool:
 # ---- one helper snapshots and restores every term the planner publishes ----
 
 # A struct's signature stops before its brace: fn_body() opens at the first brace after the signature.
-HELPER_SIG = "struct ggml_sycl_planner_published_terms"
-SNAPSHOT_SIG = "static ggml_sycl_planner_published_terms snapshot(int device)"
-RESTORE_SIG = "void restore(int device) const"
+HELPER_SIG = "struct planner_published_terms"
+HELPER_DECLS = (
+    "static planner_published_terms snapshot(int device);",
+    "void restore(int device) const;",
+)
+SNAPSHOT_SIG = "planner_published_terms planner_published_terms::snapshot(int device)"
+RESTORE_SIG = "void planner_published_terms::restore(int device) const"
 # The planner functions whose bodies the scan reads: the ones that publish a planned term today when
 # compute_placement_plan or compute_multi_device_plan runs. The scan reads these bodies only and follows no call.
 PLANNER_SIGS = (
@@ -214,7 +221,7 @@ PLANNER_SIGS = (
     "placement_plan compute_multi_device_plan(",
 )
 SETTER_RE = re.compile(r"\bunified_cache_set_planned_(\w+)\(")
-GETTER_INTO_RE = re.compile(r"\bterms\.(\w+) = ggml_sycl::unified_cache_get_planned_(\w+)\(device\);")
+GETTER_INTO_RE = re.compile(r"\bterms\.(\w+) = (?:ggml_sycl::)?unified_cache_get_planned_(\w+)\(device\);")
 # The terms the planner publishes today; the set the scan finds must hold them, so a scan that read the wrong bodies
 # cannot pass by finding nothing.
 PLANNER_TERMS_TODAY = {
@@ -234,19 +241,23 @@ def planner_published(uc: str) -> set:
     return names
 
 
-def claim_helper_restores_every_planner_term(uc: str, gs: str) -> bool:
+def claim_helper_restores_every_planner_term(uc: str, uch: str, gs: str) -> bool:
     """Every term the planner publishes is read by the helper's snapshot into a field and written back by its restore
-    from that field, through the term's own getter and setter."""
+    from that field, through the term's own getter and setter. The helper is declared in the cache's header and defined
+    in the cache, and the backend defines no helper of its own."""
     published = planner_published(uc)
-    helper = fn_body(code(gs), HELPER_SIG)
-    snap = fn_body(helper, SNAPSHOT_SIG)
-    restore = fn_body(helper, RESTORE_SIG)
-    if not (published >= PLANNER_TERMS_TODAY and snap and restore):
+    helper = fn_body(code(uch), HELPER_SIG)
+    c = code(uc)
+    snap = fn_body(c, SNAPSHOT_SIG)
+    restore = fn_body(c, RESTORE_SIG)
+    if not (published >= PLANNER_TERMS_TODAY and snap and restore and all(d in helper for d in HELPER_DECLS)):
+        return False
+    if re.search(r"\bstruct \w*planner_published_terms\b", code(gs)):
         return False
     field_of = {term: field for field, term in GETTER_INTO_RE.findall(snap)}
     for term in published:
         field = field_of.get(term)
-        call = f"ggml_sycl::unified_cache_set_planned_{term}("
+        call = f"unified_cache_set_planned_{term}("
         at = restore.find(call)
         if field is None or at == -1:
             return False
@@ -261,7 +272,8 @@ def claim_helper_restores_every_planner_term(uc: str, gs: str) -> bool:
 COMPUTE_SIG = "static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t vram_budget,"
 ENTRY_ENSURE = "!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) {"
 SNAPSHOT = (
-    "const ggml_sycl_planner_published_terms published_before = ggml_sycl_planner_published_terms::snapshot(ctx->device);"
+    "const ggml_sycl::planner_published_terms published_before = "
+    "ggml_sycl::planner_published_terms::snapshot(ctx->device);"
 )
 FIRST_PLAN = "plan_candidate = plan_single_device(true);"
 FALLBACK = "if (!placed) {"
@@ -295,8 +307,8 @@ def claim_fallback_restores_before_the_ensure(gs: str) -> bool:
 # ---- the plan dry run restores through the same helper ----
 
 DRY_SIG = "struct ggml_sycl_plan_dry_run_saved_state"
-DRY_FIELD = "ggml_sycl_planner_published_terms planner;"
-DRY_SNAPSHOT = "s.planner = ggml_sycl_planner_published_terms::snapshot(d);"
+DRY_FIELD = "ggml_sycl::planner_published_terms planner;"
+DRY_SNAPSHOT = "s.planner = ggml_sycl::planner_published_terms::snapshot(d);"
 DRY_RESTORE = "s.planner.restore(d);"
 
 
@@ -323,7 +335,7 @@ def test_the_runtime_requirement_is_the_pure_sum():
 
 
 def test_one_helper_restores_every_term_the_planner_publishes():
-    assert claim_helper_restores_every_planner_term(UC, GS)
+    assert claim_helper_restores_every_planner_term(UC, UCH, GS)
 
 
 def test_the_snapshot_is_taken_before_the_plan_with_the_room():
@@ -362,28 +374,38 @@ def test_witness_pure_sum_adds_unchecked():
 
 
 def test_witness_restore_leaves_the_host_scatter_term_published():
-    m = mutate_in(GS, HELPER_SIG, "ggml_sycl::unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);", "")
-    assert not claim_helper_restores_every_planner_term(UC, m)
+    m = mutate_in(UC, RESTORE_SIG, "unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);", "")
+    assert not claim_helper_restores_every_planner_term(m, UCH, GS)
 
 
 def test_witness_snapshot_never_reads_the_host_scatter_term():
     m = mutate_in(
-        GS,
-        HELPER_SIG,
-        "terms.scatter = ggml_sycl::unified_cache_get_planned_moe_host_scatter_scratch_bytes(device);",
+        UC,
+        SNAPSHOT_SIG,
+        "terms.scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device);",
         "terms.scatter = 0;",
     )
-    assert not claim_helper_restores_every_planner_term(UC, m)
+    assert not claim_helper_restores_every_planner_term(m, UCH, GS)
 
 
 def test_witness_restore_writes_a_constant():
     m = mutate_in(
-        GS,
-        HELPER_SIG,
-        "ggml_sycl::unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);",
-        "ggml_sycl::unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 0);",
+        UC,
+        RESTORE_SIG,
+        "unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);",
+        "unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 0);",
     )
-    assert not claim_helper_restores_every_planner_term(UC, m)
+    assert not claim_helper_restores_every_planner_term(m, UCH, GS)
+
+
+def test_witness_helper_no_longer_declared_in_the_cache_header():
+    m = mutate_in(UCH, HELPER_SIG, HELPER_DECLS[1], "")
+    assert not claim_helper_restores_every_planner_term(UC, m, GS)
+
+
+def test_witness_backend_keeps_a_helper_of_its_own():
+    m = code(GS) + " struct ggml_sycl_planner_published_terms { size_t scatter = 0; };"
+    assert not claim_helper_restores_every_planner_term(UC, UCH, m)
 
 
 def test_witness_planner_publishes_a_term_the_helper_does_not_know():
@@ -393,7 +415,7 @@ def test_witness_planner_publishes_a_term_the_helper_does_not_know():
     assert body, "witness anchor populate_host_zone_sizing is not in the source"
     s = c.find(body, c.find(sig))
     m = c[:s] + "{ unified_cache_set_planned_new_side_effect_bytes(plan.device_id, 1); " + c[s + 1 :]
-    assert not claim_helper_restores_every_planner_term(m, GS)
+    assert not claim_helper_restores_every_planner_term(m, UCH, GS)
 
 
 def test_witness_snapshot_after_the_plan_with_the_room():
@@ -420,7 +442,9 @@ def test_witness_fallback_restores_after_the_ensure():
 
 
 def test_witness_fallback_restores_a_snapshot_of_its_own():
-    m = mutate_in(GS, COMPUTE_SIG, RESTORE, "ggml_sycl_planner_published_terms::snapshot(ctx->device).restore(ctx->device);")
+    m = mutate_in(
+        GS, COMPUTE_SIG, RESTORE, "ggml_sycl::planner_published_terms::snapshot(ctx->device).restore(ctx->device);"
+    )
     assert not claim_fallback_restores_before_the_ensure(m)
 
 
