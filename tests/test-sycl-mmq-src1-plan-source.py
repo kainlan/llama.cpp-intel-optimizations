@@ -1934,9 +1934,15 @@ if args.self_test:
          (backend, common, mutate_re_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
                                              r"req\.intent\.constraints\.spill_to_kv_zone_before_raw\s*&&\s*!req\.intent\.constraints\.forbid_vram_zone_spill",
                                              "!req.intent.constraints.forbid_vram_zone_spill"), zone)),
-        ("raw spill counted for an unflagged request", "only a flagged compute request feeds the request mark and the hold-spill counters",
-         (backend, common, mutate_re_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
-                                             r"\}\s*else if\s*\(\s*req\.intent\.constraints\.spill_to_kv_zone_before_raw\s*\)\s*\{", "} else {"), zone)),
+        # The raw hold spill is noted at the raw exit, once its allocation is made, under the flag check.
+        ("raw spill counted for an unflagged request",
+         "only a flagged compute request feeds the request mark and the hold-spill counters",
+         (backend, common,
+          mutate_re_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
+                            r"if\s*\(\s*req\.intent\.constraints\.spill_to_kv_zone_before_raw\s*\)\s*\{"
+                            r"(?=\s*unified_cache_note_planned_hold_spill\()",
+                            "if (true) {"),
+          zone)),
         # rewritten claims
         ("transaction passes no hold query", "the outside-arena headroom check is told the worst-case hold spill",
          (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
