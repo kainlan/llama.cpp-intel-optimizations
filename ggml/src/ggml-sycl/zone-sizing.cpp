@@ -630,6 +630,20 @@ size_t zone_hold_free_before(size_t cold, size_t persistent_raw) {
     return persistent_raw >= cold ? 0 : cold - persistent_raw;
 }
 
+zone_context_shape zone_plan_context_shape(bool     n_ctx_is_runtime,
+                                           uint32_t plan_n_ctx,
+                                           uint32_t n_ctx_context,
+                                           uint32_t plan_n_ubatch,
+                                           uint32_t n_ubatch_context) {
+    zone_context_shape s;
+    s.n_ctx    = !n_ctx_is_runtime && n_ctx_context != 0 ? n_ctx_context : plan_n_ctx;
+    s.n_ubatch = !n_ctx_is_runtime && n_ubatch_context != 0 ? n_ubatch_context : plan_n_ubatch;
+    if (s.n_ctx != 0 && s.n_ubatch > s.n_ctx) {
+        s.n_ubatch = s.n_ctx;
+    }
+    return s;
+}
+
 size_t zone_hold_persistent_raw(size_t raw_held, size_t compute_live, bool rung_live) {
     if (!rung_live) {
         return raw_held;

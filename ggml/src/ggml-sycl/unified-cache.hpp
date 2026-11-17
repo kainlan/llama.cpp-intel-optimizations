@@ -1173,6 +1173,10 @@ struct placement_plan {
     std::vector<uint32_t>                      layer_idx_k_width;
     uint32_t                     planner_n_ctx            = 0;
     uint32_t                     planner_n_ubatch         = 0;
+    // The context shape the per-context scratch is sized for (zone_plan_context_shape): at load the context and
+    // micro-batch the caller named, else the planning shape above; at a context transaction the context's own.
+    uint32_t                     context_n_ctx            = 0;
+    uint32_t                     context_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
     // llama.cpp-3aos: mirrors placement_kv_info::kv_unified -- see that
     // field's comment. Default false matches llama_cparams::kv_unified's

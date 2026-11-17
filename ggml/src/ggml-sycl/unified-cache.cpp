@@ -35693,9 +35693,11 @@ static void populate_host_zone_sizing(placement_plan &                          
     // correction, llama.cpp-o3a0
     // (itself following an earlier correction from n_ctx alone, c-xcop).
     if (plan.device_id >= 0) {
+        // Sized for the context the caller named (plan.context_*), not the planning shape: the ONEDNN zone cannot
+        // grow once weights are live.
         unified_cache_set_planned_onednn_graph_scratch_shape(plan.device_id, plan.planner_n_head_ctx_max,
                                                              plan.planner_n_head_swa_max, plan.planner_n_swa,
-                                                             plan.planner_n_ubatch, plan.planner_n_ctx);
+                                                             plan.context_n_ubatch, plan.context_n_ctx);
         // llama.cpp-o3a0: log the floor and the shape it binds on unconditionally
         // (not only inside the exceptional DIRECT-allocation-failure path
         // further below) so a normal run's log alone answers "did the window
@@ -35706,14 +35708,14 @@ static void populate_host_zone_sizing(placement_plan &                          
             "[SYCL-PLAN] oneDNN Graph-scratch zone floor: %.1f MB (n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u "
             "n_ubatch=%u n_ctx=%u)\n",
             onednn_graph_scratch_zone_floor_bytes_swa(plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max,
-                                                      plan.planner_n_swa, plan.planner_n_ubatch, plan.planner_n_ctx) /
+                                                      plan.planner_n_swa, plan.context_n_ubatch, plan.context_n_ctx) /
                 (1024.0 * 1024.0),
-            plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, plan.planner_n_ubatch,
-            plan.planner_n_ctx);
+            plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, plan.context_n_ubatch,
+            plan.context_n_ctx);
     }
 #endif
 
-    // llama.cpp-oyfl: record the SAME shape for the non-FA batched mul_mat
+    // llama.cpp-oyfl: record the planning shape for the non-FA batched mul_mat
     // scratch floor (unified_cache_nonfa_attn_scratch_demand_bytes()).
     // Unconditional (not gated behind GGML_SYCL_DNNL, unlike the oneDNN
     // sibling above): the batched-mul_mat path this sizes is the native
@@ -35727,7 +35729,8 @@ static void populate_host_zone_sizing(placement_plan &                          
     // ggml_backend_sycl_set_runtime_context() (ggml-sycl.cpp), which cannot
     // resize this zone after the fact (the arena is a single fixed
     // allocation) but can refuse the update with the size arithmetic instead
-    // of letting prompt processing abort later.
+    // of letting prompt processing abort later. The planning shape on purpose:
+    // the load cannot know whether the context runs flash attention.
     if (plan.device_id >= 0) {
         unified_cache_set_planned_nonfa_attn_scratch_shape(plan.device_id, plan.planner_n_head_all_max,
                                                            plan.planner_n_ubatch, plan.planner_n_ctx);
@@ -36724,6 +36727,13 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.pp_moe_onednn_output_slot_bytes     = unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(device_id);
     plan.pp_moe_onednn_scratch_bytes         = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device_id);
     plan.pp_moe_onednn_ring_depth            = unified_cache_get_planned_pp_moe_onednn_ring_depth(device_id);
+
+    // The shape the per-context scratch is sized for: the context the caller named, not the planning shape above.
+    const zone_context_shape context_shape =
+        zone_plan_context_shape(kv_info.n_ctx_is_runtime, plan.planner_n_ctx, kv_info.n_ctx_context,
+                                plan.planner_n_ubatch, kv_info.n_ubatch_context);
+    plan.context_n_ctx    = context_shape.n_ctx;
+    plan.context_n_ubatch = context_shape.n_ubatch;
 
     std::map<int, bool>   layer_has_attention;
     std::map<int, size_t> layer_weight_bytes;
@@ -38191,6 +38201,14 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.planner_n_head_swa_max   = kv_info.n_head_swa_max;
     plan.planner_n_head_all_max   = kv_info.n_head_all_max;
     plan.planner_n_swa            = kv_info.n_swa;
+
+    // The shape the per-context scratch is sized for: the context the caller named, not the planning shape above.
+    const zone_context_shape context_shape =
+        zone_plan_context_shape(kv_info.n_ctx_is_runtime, plan.planner_n_ctx, kv_info.n_ctx_context,
+                                plan.planner_n_ubatch, kv_info.n_ubatch_context);
+    plan.context_n_ctx    = context_shape.n_ctx;
+    plan.context_n_ubatch = context_shape.n_ubatch;
+
     for (const auto & db : device_budgets) {
         plan.pp_pipeline_scratch_bytes =
             std::max(plan.pp_pipeline_scratch_bytes, unified_cache_get_planned_pp_pipeline_scratch_bytes(db.device_id));

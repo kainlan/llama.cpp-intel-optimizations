@@ -623,6 +623,21 @@ uint32_t zone_hold_fit_largest_ub(const zone_hold_fit_inputs & in, uint32_t n_ub
 size_t zone_hold_free_cold(size_t driver_free, size_t raw_live);
 size_t zone_hold_free_before(size_t cold, size_t persistent_raw);
 
+// The context shape a plan sizes its per-context scratch for (the oneDNN Graph attention floor, the MoE routing ids).
+// At load (`n_ctx_is_runtime` false) the plan's own shape is the load's planning shape, so the shape is the context and
+// micro-batch the caller named (`n_ctx_context`, `n_ubatch_context`), each falling back to the plan's own when 0. At a
+// context transaction the plan's own shape is the context's. The micro-batch never exceeds the context.
+struct zone_context_shape {
+    uint32_t n_ctx    = 0;
+    uint32_t n_ubatch = 0;
+};
+
+zone_context_shape zone_plan_context_shape(bool     n_ctx_is_runtime,
+                                           uint32_t plan_n_ctx,
+                                           uint32_t n_ctx_context,
+                                           uint32_t plan_n_ubatch,
+                                           uint32_t n_ubatch_context);
+
 // llama.cpp-kpjw (r7 I3: identity by ORIGIN, not by timing): what stays live without the rung is every raw byte the
 // cache holds except the rung's OWN scheduler compute buffers (rows registered by a request flagged
 // scheduler_compute), and only when the rung's buffers are live (the realized check). A raw byte allocated after an

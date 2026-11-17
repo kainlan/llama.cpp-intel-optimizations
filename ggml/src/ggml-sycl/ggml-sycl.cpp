@@ -15962,6 +15962,13 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_measu
     plan.planner_kv_unified = shape.kv_unified;
     plan.planner_swa_full   = shape.swa_full;
     plan.update_runtime_kv_sizes(shape.n_ctx, kv_info.kv_bytes_per_layer(), kv_info.kv_bytes_per_swa_layer());
+    // A context transaction sizes for the context itself (kv_info.n_ctx_is_runtime is set above), and so does the
+    // measure of one.
+    const ggml_sycl::zone_context_shape context_shape =
+        ggml_sycl::zone_plan_context_shape(kv_info.n_ctx_is_runtime, plan.planner_n_ctx, kv_info.n_ctx_context,
+                                           plan.planner_n_ubatch, kv_info.n_ubatch_context);
+    plan.context_n_ctx    = context_shape.n_ctx;
+    plan.context_n_ubatch = context_shape.n_ubatch;
     if (!plan.load_kv_device_valid) {
         plan.load_kv_device       = plan.kv_device;
         plan.load_kv_device_valid = true;
@@ -21195,6 +21202,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     next_plan.planner_kv_unified = kv_unified;
     next_plan.planner_swa_full   = swa_full;
     next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
+    // A context transaction sizes for the context itself (next_kv_info.n_ctx_is_runtime is set above).
+    const ggml_sycl::zone_context_shape context_shape = ggml_sycl::zone_plan_context_shape(
+        next_kv_info.n_ctx_is_runtime, next_plan.planner_n_ctx, next_kv_info.n_ctx_context, next_plan.planner_n_ubatch,
+        next_kv_info.n_ubatch_context);
+    next_plan.context_n_ctx    = context_shape.n_ctx;
+    next_plan.context_n_ubatch = context_shape.n_ubatch;
 
     // Filled when KV is re-placed to the host tier, here or by the over-budget
     // demotion further below; read into the probe's out->would_demote_kv/
