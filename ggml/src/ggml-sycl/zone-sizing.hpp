@@ -623,7 +623,7 @@ uint32_t zone_hold_fit_largest_ub(const zone_hold_fit_inputs & in, uint32_t n_ub
 size_t zone_hold_free_cold(size_t driver_free, size_t raw_live);
 size_t zone_hold_free_before(size_t cold, size_t persistent_raw);
 
-// The context shape a plan sizes its per-context scratch for (the oneDNN Graph attention floor, the MoE routing ids).
+// The context shape a plan sizes its per-context scratch for (the oneDNN Graph attention floor).
 // At load (`n_ctx_is_runtime` false) the plan's own shape is the load's planning shape, so the shape is the context the
 // model opens with (`n_ctx_context`: the one the caller named, or the model's default) and the micro-batch the caller
 // named (`n_ubatch_context`), each falling back to the plan's own when 0 (no request reached the load, or no

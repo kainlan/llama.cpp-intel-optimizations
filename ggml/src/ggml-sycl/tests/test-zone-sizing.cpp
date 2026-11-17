@@ -2012,6 +2012,10 @@ int main() {
         CHECK(s.n_ctx == 8192 && s.n_ubatch == 1024, "a context transaction: the context's own shape");
         s = zone_plan_context_shape(false, 512, 256, 512, 2048);
         CHECK(s.n_ubatch == 256, "a micro-batch is never above its context");
+        s = zone_plan_context_shape(false, 0, 0, 512, 0);
+        CHECK(s.n_ctx == 0 && s.n_ubatch == 512, "no context at all: the micro-batch is not clamped to 0");
+        s = zone_plan_context_shape(false, 512, 0, 512, 2048);
+        CHECK(s.n_ctx == 512 && s.n_ubatch == 512, "a named micro-batch with no context named: the planning context");
     }
 
     // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and

@@ -15962,8 +15962,8 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_measu
     plan.planner_kv_unified = shape.kv_unified;
     plan.planner_swa_full   = shape.swa_full;
     plan.update_runtime_kv_sizes(shape.n_ctx, kv_info.kv_bytes_per_layer(), kv_info.kv_bytes_per_swa_layer());
-    // A context transaction sizes for the context itself (kv_info.n_ctx_is_runtime is set above), and so does the
-    // measure of one.
+    // Keeps the measured plan's context shape equal to the measured context's own (kv_info.n_ctx_is_runtime is set
+    // above), as the transaction keeps the published plan's; no reader reads it from this plan yet.
     const ggml_sycl::zone_context_shape context_shape =
         ggml_sycl::zone_plan_context_shape(kv_info.n_ctx_is_runtime, plan.planner_n_ctx, kv_info.n_ctx_context,
                                            plan.planner_n_ubatch, kv_info.n_ubatch_context);
@@ -19198,10 +19198,19 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     lazy_infos                = kv.lazy_tables;
     if (kv.n_ubatch_context != 0) {
         GGML_LOG_INFO(
-            "[PLAN-DRY-RUN] n_ubatch_context=%u is modelled only in the oneDNN Graph attention floor, which is sized "
-            "for it and the context the model opens with: KV and the MoE prompt path are planned at the load's "
+            "[PLAN-DRY-RUN] n_ubatch_context=%u is not modelled: KV and the MoE prompt path are planned at the load's "
             "planning shape (n_ubatch=%u), without the explicit micro-batch's RUNTIME room\n",
             kv.n_ubatch_context, kv.n_ubatch);
+    }
+    // The plans size the oneDNN Graph scratch floor for the context the model opens with, but only the shape the dry
+    // run restores and the planner's [SYCL-PLAN] lines read it: a device share subtracts the ONEDNN zone an active
+    // arena already holds, or none, so no figure the dry run reports includes the floor.
+    if (kv.n_ctx_context != 0 || kv.n_ubatch_context != 0) {
+        GGML_LOG_INFO(
+            "[PLAN-DRY-RUN] the oneDNN Graph scratch floor is sized for the context the model opens with "
+            "(n_ctx_context=%u n_ubatch_context=%u) in the [SYCL-PLAN] lines only: no figure here includes it, a "
+            "device share subtracts the ONEDNN zone an active arena already holds, or none\n",
+            kv.n_ctx_context, kv.n_ubatch_context);
     }
     const auto override_for = [&](int device) -> size_t {
         return device >= 0 && static_cast<uint32_t>(device) < opts.n_device_budgets ?
@@ -21203,7 +21212,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     next_plan.planner_kv_unified = kv_unified;
     next_plan.planner_swa_full   = swa_full;
     next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
-    // A context transaction sizes for the context itself (next_kv_info.n_ctx_is_runtime is set above).
+    // Keeps the published plan's context shape equal to the context's own (next_kv_info.n_ctx_is_runtime is set
+    // above) rather than the load's it was copied from; no reader reads it at runtime yet.
     const ggml_sycl::zone_context_shape context_shape = ggml_sycl::zone_plan_context_shape(
         next_kv_info.n_ctx_is_runtime, next_plan.planner_n_ctx, next_kv_info.n_ctx_context, next_plan.planner_n_ubatch,
         next_kv_info.n_ubatch_context);

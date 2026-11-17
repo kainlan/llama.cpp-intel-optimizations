@@ -1813,8 +1813,8 @@ HOST_SIDE_SIZING_CALL = "placement_plan_size_host_side("
 CONTEXT_SHAPE_ARGS = ["plan.context_n_ubatch", "plan.context_n_ctx"]
 PLANNING_SHAPE_ARGS = ["plan.planner_n_ubatch", "plan.planner_n_ctx"]
 CONTEXT_SHAPE_CALL_RE = re.compile(
-    r"const zone_context_shape (\w+) = zone_plan_context_shape\(kv_info\.n_ctx_is_runtime, plan\.planner_n_ctx, "
-    r"kv_info\.n_ctx_context, plan\.planner_n_ubatch, kv_info\.n_ubatch_context\);"
+    r"const zone_context_shape (\w+) = zone_plan_context_shape\( ?kv_info\.n_ctx_is_runtime, plan\.planner_n_ctx, "
+    r"kv_info\.n_ctx_context, plan\.planner_n_ubatch, kv_info\.n_ubatch_context ?\);"
 )
 
 
@@ -2001,6 +2001,84 @@ def test_builder_ordering_check_has_a_bounded_mutation_witness() -> None:
     mutant = src[:start] + moved + src[end:]
     assert CONTEXT_SHAPE_CALL_RE.search(_body_of(mutant, SINGLE_DEVICE_PLAN_SIG)), "sanity: the block is still there"
     _assert_only_check_fails(mutant, "single", "the context shape set after the host-side sizing reads it")
+
+
+# The two runtime sites that copy a load's plan and re-shape it for a context: the measure of a context
+# (ggml_sycl_measure_refit_kv) and the runtime-context transaction. Each sets the copy's context shape from the same
+# zone_plan_context_shape() after update_runtime_kv_sizes() has made planner_n_ctx the context's, so the copy never
+# keeps the load's context shape it was copied from.
+GGML_SYCL_CPP_NORM = normalize_ws(GGML_SYCL_CPP_CODE)
+MEASURE_REFIT_KV_SIG = (
+    "static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_measure_refit_kv("
+)
+RUNTIME_TRANSACTION_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
+RUNTIME_CONTEXT_SHAPE_SITES = (
+    (MEASURE_REFIT_KV_SIG, "plan", "kv_info"),
+    (RUNTIME_TRANSACTION_SIG, "next_plan", "next_kv_info"),
+)
+
+
+def _runtime_site_sets_context_shape(src: str, sig: str, plan: str, kv: str) -> bool:
+    """`sig`'s body sets `plan`'s context fields from zone_plan_context_shape() over `kv` and `plan`'s planner shape,
+    after its update_runtime_kv_sizes() call."""
+    body = _body_of(src, sig)
+    call = re.compile(
+        r"const ggml_sycl::zone_context_shape (\w+) = ggml_sycl::zone_plan_context_shape\( ?"
+        + rf"{kv}\.n_ctx_is_runtime, {plan}\.planner_n_ctx, {kv}\.n_ctx_context, {plan}\.planner_n_ubatch, "
+        + rf"{kv}\.n_ubatch_context ?\);"
+    )
+    m = call.search(body)
+    if not m:
+        return False
+    var = m.group(1)
+    for stmt in (f"{plan}.context_n_ctx = {var}.n_ctx;", f"{plan}.context_n_ubatch = {var}.n_ubatch;"):
+        if body.find(stmt, m.end()) < 0:
+            return False
+    resize_at = body.find(f"{plan}.update_runtime_kv_sizes(")
+    return 0 <= resize_at < m.start()
+
+
+def test_runtime_sites_set_the_context_shape_after_the_kv_resize() -> None:
+    for sig, plan, kv in RUNTIME_CONTEXT_SHAPE_SITES:
+        assert _runtime_site_sets_context_shape(GGML_SYCL_CPP_NORM, sig, plan, kv), (
+            f"{sig!r} must set {plan}.context_n_ctx and {plan}.context_n_ubatch from zone_plan_context_shape() over "
+            f"{kv} after {plan}.update_runtime_kv_sizes(), or the copy keeps the load's context shape"
+        )
+
+
+def _runtime_site_checks(src: str) -> dict:
+    return {sig: _runtime_site_sets_context_shape(src, sig, plan, kv) for sig, plan, kv in RUNTIME_CONTEXT_SHAPE_SITES}
+
+
+def _assert_only_runtime_site_fails(mutant: str, failing: str, why: str) -> None:
+    results = _runtime_site_checks(mutant)
+    expected = {sig: sig != failing for sig in results}
+    assert results == expected, f"mutation witness for {failing!r} ({why}) is broken: {results}"
+
+
+def test_runtime_site_checks_have_bounded_mutation_witnesses() -> None:
+    src = GGML_SYCL_CPP_NORM
+    assert all(_runtime_site_checks(src).values()), "sanity: both runtime sites pass on the source itself"
+
+    mutant = _mutate_in_function(src, MEASURE_REFIT_KV_SIG, "plan.context_n_ctx = context_shape.n_ctx;", "")
+    _assert_only_runtime_site_fails(mutant, MEASURE_REFIT_KV_SIG, "the measured plan keeps the load's context")
+
+    mutant = _mutate_in_function(src, RUNTIME_TRANSACTION_SIG, "next_plan.context_n_ubatch = context_shape.n_ubatch;",
+                                 "")
+    _assert_only_runtime_site_fails(mutant, RUNTIME_TRANSACTION_SIG, "the published plan keeps the load's micro-batch")
+
+    # The context shape computed before the resize: every statement stays, only the order is wrong.
+    start, end = _function_body_span(src, RUNTIME_TRANSACTION_SIG)
+    body = src[start:end]
+    m = re.search(r"const ggml_sycl::zone_context_shape context_shape = .*?next_plan\.context_n_ubatch = "
+                  r"context_shape\.n_ubatch;", body)
+    assert m, "sanity: the transaction's context-shape block is found"
+    block = m.group(0)
+    moved = body[: m.start()] + body[m.end() :]
+    resize_at = moved.index("next_plan.update_runtime_kv_sizes(")
+    moved = moved[:resize_at] + block + " " + moved[resize_at:]
+    mutant = src[:start] + moved + src[end:]
+    _assert_only_runtime_site_fails(mutant, RUNTIME_TRANSACTION_SIG, "the context shape read before the KV resize")
 
 
 if __name__ == "__main__":

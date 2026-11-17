@@ -488,14 +488,15 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     // the one place the hint is resolved. With no hint at all (0, a caller that never sets the field) no room is held,
     // and the KV beyond the planning shape is placed when the context is created. A hint above n_ctx_train (a
     // rope-extended -c) is honoured: the caller asked for that context, and the room is already capped at what the
-    // dense weights and their KV leave. Only the room reads the hint: the planning shape above and the load measures
-    // (the placement envelope's n_ctx, still 0) keep their inputs.
+    // dense weights and their KV leave. The room and the oneDNN Graph scratch floor (sized for the context the model
+    // opens with) read the hint: the planning shape above and the load measures (the placement envelope's n_ctx,
+    // still 0) keep their inputs.
     const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);
     inventory.n_ctx_context                    = ctx_room.n_ctx_context;
     inventory.n_ctx_context_is_default         = ctx_room.is_default;
     // The micro-batch the caller named (llama_model_params::n_ubatch_hint, 0 for none): the planner plans the PP MoE
     // scratch ring in the RUNTIME zone for it and moves routed experts to the host tier for the room. Like the context
-    // room above, only that decision reads it; n_ubatch stays the load's planning shape.
+    // above, that decision and the oneDNN Graph scratch floor read it; n_ubatch stays the load's planning shape.
     inventory.n_ubatch_context                 = n_ubatch_hint;
     if (hparams.n_expert > 0 && hparams.n_expert_used_max() > 0) {
         // llama.cpp-sr83 (C3): the batched executor repacks straight to a

@@ -708,8 +708,9 @@ struct placement_kv_info {
     uint32_t          n_head_all_max   = 0;
     bool              n_ctx_is_runtime = false;
     // llama.cpp-8ecj: the context the model opens with, from ggml_sycl_tensor_inventory::n_ctx_context: the caller's
-    // request (llama.cpp-ak0p). n_ctx above stays the load's own planning shape; this one only sizes the KV room the
-    // planner holds ahead of the routed experts. 0 = no request reached the load: no room is held.
+    // request (llama.cpp-ak0p). n_ctx above stays the load's own planning shape; this one sizes the KV room the planner
+    // holds ahead of the routed experts, and the plan's context shape (placement_plan::context_n_ctx), which the oneDNN
+    // Graph scratch floor is sized for. 0 = no request reached the load: no room is held, and the floor takes n_ctx.
     uint32_t              n_ctx_context    = 0;
     // llama.cpp-7fmt: n_ctx_context is the model's default context (the training context, which a caller that names
     // no n_ctx creates) rather than one the caller named; from ggml_sycl_tensor_inventory::n_ctx_context_is_default.
@@ -776,7 +777,8 @@ struct placement_kv_info {
     std::vector<uint32_t> layer_idx_k_width;
 
     // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
-    // above stays the load's planning shape.
+    // above stays the load's planning shape. It is also the plan's context micro-batch
+    // (placement_plan::context_n_ubatch), which the oneDNN Graph scratch floor is sized for.
     uint32_t                           n_ubatch_context = 0;
     // The RUNTIME zone room the PP MoE oneDNN scratch ring of that micro-batch needs above the default ring's zone. The
     // backend fills it on the single-device path before each plan (unified_cache_explicit_ubatch_room()); it is invalid

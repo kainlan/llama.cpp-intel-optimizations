@@ -3707,8 +3707,9 @@ void unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t weig
 // onednn_graph_scratch_zone_floor_bytes_swa() can derive its floor from the
 // shape the Graph-scratch request actually scales with, instead of a flat
 // constant. Called from the same "oneDNN scratchpad:" planning step
-// (populate_host_zone_sizing()) once plan.planner_n_head_ctx_max/
-// planner_n_head_swa_max/planner_n_swa/planner_n_ubatch/planner_n_ctx are set.
+// (populate_host_zone_sizing()) with plan.planner_n_head_ctx_max/
+// planner_n_head_swa_max/planner_n_swa and the plan's context shape
+// (plan.context_n_ubatch/context_n_ctx), not its planning shape.
 void unified_cache_set_planned_onednn_graph_scratch_shape(int      device_id,
                                                           uint32_t n_head_ctx_max,
                                                           uint32_t n_head_swa_max,
