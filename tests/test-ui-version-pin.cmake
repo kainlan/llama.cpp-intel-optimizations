@@ -69,6 +69,19 @@ expect("d (HF_UI_VERSION beats pin)" "b777")
 set(ENV{HF_WEBUI_VERSION} "b555")
 expect("e (HF_WEBUI_VERSION beats HF_UI_VERSION)" "b555")
 
+# f. the default must not be a cache entry: a cached default would outlive a pin
+# moved in the tree, and every existing build tree would keep the old bundle.
+file(READ "${UI_VERSION_CMAKE}" _text)
+string(REGEX REPLACE "(^|\n)[ \t]*#[^\n]*" "\\1" _code "${_text}")
+if (NOT _code MATCHES "set\\([ \t\n]*LLAMA_UI_PINNED_VERSION")
+    message(FATAL_ERROR "test-ui-version-pin: case f: no set(LLAMA_UI_PINNED_VERSION ...) found; the check is vacuous")
+endif()
+if (_code MATCHES "set\\([ \t\n]*LLAMA_UI_PINNED_VERSION[^)]*CACHE")
+    message(FATAL_ERROR "test-ui-version-pin: case f: the default pin is a set(... CACHE ...) entry")
+endif()
+message(STATUS "PASS f (default pin is not a cache entry)")
+math(EXPR _pass "${_pass}+1")
+
 unset(ENV{HF_WEBUI_VERSION})
 unset(ENV{HF_UI_VERSION})
 message(STATUS "test-ui-version-pin: OK -- ${_pass} cases passed")

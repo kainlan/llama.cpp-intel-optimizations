@@ -7,13 +7,13 @@
 # b11204 is not published, b11203 is, and 694ec2354 itself does not touch the
 # UI). Move it when merging a newer upstream.
 #
-# The `if(NOT DEFINED ...)` guard keeps a value set before the include (a -D on
-# the command line, or a plain set() in a cmake -P test). CMP0126 can drop a
-# plain variable when a CACHE entry of the same name is set, so relying on CACHE
-# semantics alone is not safe under older policy settings.
+# The default is deliberately a plain variable, not a cache entry: a cached
+# default would outlive a pin moved in the tree, and every existing build tree
+# would keep embedding the old bundle. An explicit -DLLAMA_UI_PINNED_VERSION=...
+# is the user's override and persists as usual; an empty value restores the
+# derivation from the build number.
 if(NOT DEFINED LLAMA_UI_PINNED_VERSION)
-    set(LLAMA_UI_PINNED_VERSION "b11203" CACHE STRING
-        "Published UI bundle version matching this tree's upstream base; empty restores the derivation from the build number")
+    set(LLAMA_UI_PINNED_VERSION "b11203")
 endif()
 
 # Resolve HF asset version: env HF_WEBUI_VERSION > env HF_UI_VERSION > pin >

@@ -1989,11 +1989,11 @@ if (NOT WIN32)
     # the pin the build embeds the floating bundle, which can stop matching this
     # tree's server code at any time.
     llama_test_cmd(
-        
+        ${CMAKE_COMMAND}
         NAME test-ui-version-pin
-        WORKING_DIRECTORY 
-        ARGS -DUI_VERSION_CMAKE=/tools/ui/ui-version.cmake
-             -P /test-ui-version-pin.cmake
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS -DUI_VERSION_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/ui-version.cmake
+             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-ui-version-pin.cmake
     )
     set_tests_properties(test-ui-version-pin PROPERTIES
         LABELS "build;policy"
