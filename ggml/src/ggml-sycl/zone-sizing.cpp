@@ -584,6 +584,39 @@ static std::string zone_arena_held_text(const zone_arena_holders & h, int device
     return text + remedy;
 }
 
+// The refused teardown's clause: why it refused, and what that left. Only a refusal named as one before the teardown
+// closed the arena leaves it usable; any other, a missing cause included, is read as closed, which no reserve may follow
+// and no later load in the process can use.
+static std::string zone_arena_teardown_text(zone_arena_teardown_refusal cause, int device) {
+    std::string text = "; the arena could not be torn down";
+    switch (cause) {
+        case zone_arena_teardown_refusal::HOST_STATE:
+            return text +
+                   ": the host could not reserve the teardown's own bookkeeping, and the arena is as it was. Free "
+                   "host memory, then load this one again";
+        case zone_arena_teardown_refusal::LIVE_ALLOCATIONS:
+            text += ": allocations were still live in it when the teardown closed it";
+            break;
+        case zone_arena_teardown_refusal::DRAIN_SNAPSHOT:
+            text += ": the host could not record the allocations the teardown waits on";
+            break;
+        case zone_arena_teardown_refusal::DRAIN_TIMEOUT:
+            text += ": a lease on one of its allocations did not end while the teardown waited";
+            break;
+        case zone_arena_teardown_refusal::FREE_FAILED:
+            text += ": the device refused to free one of its chunks, so part of it may already be freed";
+            break;
+        case zone_arena_teardown_refusal::NONE:
+            break;
+    }
+    char closed[160];
+    std::snprintf(closed, sizeof(closed),
+                  ". The arena stays closed to new allocations, so no model can load on device %d in this process. "
+                  "Load this model in a new process",
+                  device);
+    return text + closed;
+}
+
 std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {
     if (refusal.reason == zone_arena_refusal_reason::NONE) {
         return {};
@@ -639,10 +672,17 @@ std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {
         case zone_arena_refusal_reason::NO_CACHE:
             text += "; the device has no unified cache to size them in";
             break;
+        case zone_arena_refusal_reason::TEARDOWN_REFUSED:
+            text += zone_arena_teardown_text(refusal.teardown, refusal.device);
+            break;
         case zone_arena_refusal_reason::NONE:
             break;
     }
     return text;
+}
+
+bool zone_arena_teardown_left_closed(zone_arena_teardown_refusal cause) {
+    return cause != zone_arena_teardown_refusal::NONE && cause != zone_arena_teardown_refusal::HOST_STATE;
 }
 
 // A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about

@@ -529,11 +529,26 @@ bool zone_arena_rebuild_allowed(const zone_arena_holders & holders);
 
 // Why the arena's planned zones could not be sized.
 enum class zone_arena_refusal_reason {
-    NONE,            // they were sized
-    REBUILD_HELD,    // a zone must grow and something points into the arena, so it cannot be rebuilt
-    RESERVE_FAILED,  // the device could not reserve an arena with the planned zones
-    NO_CACHE,        // the device has no unified cache to size them in
+    NONE,              // they were sized
+    REBUILD_HELD,      // a zone must grow and something points into the arena, so it cannot be rebuilt
+    RESERVE_FAILED,    // the device could not reserve an arena with the planned zones
+    NO_CACHE,          // the device has no unified cache to size them in
+    TEARDOWN_REFUSED,  // the arena could not be torn down, by this call's rebuild or by an earlier one
 };
+
+// Why a teardown of the VRAM arena refused, as the teardown records it. Every cause but HOST_STATE is found after the
+// teardown closed the arena to new allocations, and it stays closed until a later teardown completes.
+enum class zone_arena_teardown_refusal {
+    NONE,              // no teardown was refused
+    HOST_STATE,        // the host could not reserve the teardown's own bookkeeping; the arena is as it was
+    LIVE_ALLOCATIONS,  // allocations were still live in the arena when the teardown closed it
+    DRAIN_SNAPSHOT,    // the host could not record the allocations the teardown waits on
+    DRAIN_TIMEOUT,     // a lease on one of its allocations did not end while the teardown waited
+    FREE_FAILED,       // the device refused to free one of its chunks, after the chunks before it were freed
+};
+
+// Whether a teardown refused for `cause` left the arena closed to new allocations.
+bool zone_arena_teardown_left_closed(zone_arena_teardown_refusal cause);
 
 // The three zones a plan sizes, in bytes.
 struct zone_arena_sizes {
@@ -545,14 +560,16 @@ struct zone_arena_sizes {
 // A refusal to size the arena's planned zones: the device, the reason, and per zone the bytes the plan needs and the
 // bytes the device's arena has when the decision refuses (have is 0 where no arena exists then). At REBUILD_HELD,
 // holders is what the decision found pointing into the arena, which the line names and chooses its remedy from. At
-// RESERVE_FAILED, released is the zones of the arena a rebuild destroyed before the reserve failed. Each is 0 otherwise.
+// RESERVE_FAILED, released is the zones of the arena a rebuild destroyed before the reserve failed. At TEARDOWN_REFUSED,
+// teardown is why the teardown refused. Each is 0 or NONE otherwise.
 struct zone_arena_refusal {
-    zone_arena_refusal_reason reason = zone_arena_refusal_reason::NONE;
-    int                       device = -1;
-    zone_arena_sizes          need;
-    zone_arena_sizes          have;
-    zone_arena_holders        holders;
-    zone_arena_sizes          released;
+    zone_arena_refusal_reason   reason = zone_arena_refusal_reason::NONE;
+    int                         device = -1;
+    zone_arena_sizes            need;
+    zone_arena_sizes            have;
+    zone_arena_holders          holders;
+    zone_arena_sizes            released;
+    zone_arena_teardown_refusal teardown = zone_arena_teardown_refusal::NONE;
 };
 
 // The line a model load refused for `refusal` logs, without a newline: the device, each zone's need and have in MB, the
