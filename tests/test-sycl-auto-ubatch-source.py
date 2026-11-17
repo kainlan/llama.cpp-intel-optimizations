@@ -2137,7 +2137,7 @@ def _brace_block(code: str, open_idx: int) -> str:
     raise AssertionError("unbalanced braces")
 
 
-_PLANNER_FN = "static void compute_and_store_plan_for_inventory("
+_PLANNER_FN = "static bool compute_and_store_plan_for_inventory("
 # The planner asks the one multi-device gate the plan dry run also asks (llama.cpp-4zup), and that gate is the GPU count
 # and ggml_backend_sycl_moe_multi_gpu_requested(), nothing else.
 _GATE_FN = "static bool ggml_sycl_plan_multi_device() {"

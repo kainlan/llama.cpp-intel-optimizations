@@ -95,9 +95,11 @@ def statement_window(source: str, statement_anchor: str, window: int = 1400) -> 
 LOCK_RE = re.compile(r"std::(?:lock_guard|unique_lock)(?:<[^<>]*>)?\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\)\s*;")
 # The guard the A1 witness reintroduces, in the spelling the source uses.
 LOCK_STMT = "std::lock_guard lock(g_tensor_inventory_mutex);"
-PLAN_STORE_CALL = "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);"
-IMPL_DELEGATE_CALL = "ggml_sycl_set_tensor_inventory_impl(backend, inventory);"
-SNAPSHOT_CAPTURE = "const auto snapshot = " + IMPL_DELEGATE_CALL
+# The plan store returns false when the arena's zones cannot hold the plan; the impl branches on it.
+PLAN_STORE_CALL = "if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) {"
+# The exported setter has no result to give a refusal, so it passes no flag; the stage passes one and fails the load.
+IMPL_DELEGATE_CALL = "ggml_sycl_set_tensor_inventory_impl(backend, inventory, nullptr);"
+SNAPSHOT_CAPTURE = "const auto snapshot = ggml_sycl_set_tensor_inventory_impl(backend, inventory, &plan_refused);"
 # The retained-candidate overload (snapshot->plan), not the current-plan
 # overload S1-PRELOAD uses.
 PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, snapshot->plan);"

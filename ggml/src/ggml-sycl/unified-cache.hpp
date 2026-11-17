@@ -3235,6 +3235,36 @@ struct planner_published_terms {
     void                           restore(int device) const;
 };
 
+// The device-wide terms a model load publishes for a device as it plans, with the planners' (planner): the PP pipeline
+// scratch; the PP MoE oneDNN ring's slots and depth, which of its slots the KV zone holds, and the row bytes, expert
+// counts and micro-batch it is re-planned from; and the oneDNN scratchpad pair with its stored sum, which the pair's
+// reserve raises on its own. Each model on the device plans with these, and every load overwrites them, so a load that
+// fails puts them back as its first stage found them. The terms keyed by the load's owner are not here (they leave
+// with their owner, unified_cache_drop_planned_load_terms), nor is the compute term's micro-batch, which is sticky by
+// design and which every load records at the same planning value. Each setter stores what its getter reads, and the
+// pair's sum is written after the pair, so the restore is exact.
+struct load_published_terms {
+    size_t                  pp_pipeline           = 0;
+    size_t                  ring_weight           = 0;
+    size_t                  ring_activation       = 0;
+    size_t                  ring_output           = 0;
+    uint32_t                ring_depth            = 0;
+    bool                    ring_activation_in_kv = false;
+    bool                    ring_output_in_kv     = false;
+    size_t                  ring_activation_row   = 0;
+    size_t                  ring_output_row       = 0;
+    uint32_t                ring_n_expert         = 0;
+    uint32_t                ring_n_expert_used    = 0;
+    uint32_t                ring_n_ubatch         = 0;
+    size_t                  onednn_weights        = 0;
+    size_t                  onednn_activations    = 0;
+    size_t                  onednn_stored         = 0;
+    planner_published_terms planner{};
+
+    static load_published_terms snapshot(int device);
+    void                        restore(int device) const;
+};
+
 // The RUNTIME zone's floor: 512 MiB, or GGML_SYCL_RUNTIME_ARENA_MB when it is set. ensure_planned_arena_zones()
 // reserves at least this, and an explicit micro-batch's room is measured against the same floor.
 size_t unified_cache_runtime_zone_floor_bytes();
@@ -4902,8 +4932,10 @@ class unified_cache {
     // Ensure the VRAM arena's fixed zones match the latest planner inputs.
     // If an early arena exists but has no live zone allocations or chunk
     // leases, it may be rebuilt with larger planned zones. Live arenas are
-    // never force-reset or force-freed.
-    bool ensure_planned_arena_zones();
+    // never force-reset or force-freed. False when the zones cannot be sized:
+    // when `refusal` is given it is written with the reason and each zone's
+    // need (the sizes this call decided on) and have (the arena's zones).
+    bool ensure_planned_arena_zones(zone_arena_refusal * refusal = nullptr);
 
     // Is arena active?
     bool arena_active() const { return zone_backed(); }
@@ -9056,7 +9088,8 @@ bool unified_cache_copy_from_host_async(int                              device_
 // Reserve the compute arena (pre-reserved VRAM for compute scratch).
 // Must be called BEFORE S1-PRELOAD to guarantee VRAM availability.
 bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes);
-bool unified_cache_ensure_planned_arena_zones(int device_id);
+// unified_cache::ensure_planned_arena_zones() on the device's cache; a device with no cache is a NO_CACHE refusal.
+bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal * refusal = nullptr);
 
 #if GGML_SYCL_DNNL
 // llama.cpp-0oxf: external entry point for reclaiming (real release) every

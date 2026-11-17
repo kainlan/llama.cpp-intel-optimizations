@@ -269,8 +269,8 @@ def claim_helper_restores_every_planner_term(uc: str, uch: str, gs: str) -> bool
 
 # ---- the stage snapshots before the plan with the room and restores in the fallback before the ensure ----
 
-COMPUTE_SIG = "static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t vram_budget,"
-ENTRY_ENSURE = "!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) {"
+COMPUTE_SIG = "static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t vram_budget,"
+ENTRY_ENSURE = "!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {"
 SNAPSHOT = (
     "const ggml_sycl::planner_published_terms published_before = "
     "ggml_sycl::planner_published_terms::snapshot(ctx->device);"
@@ -279,7 +279,7 @@ FIRST_PLAN = "plan_candidate = plan_single_device(true);"
 FALLBACK = "if (!placed) {"
 REPUBLISH = "(void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);"
 RESTORE = "published_before.restore(ctx->device);"
-FALLBACK_ENSURE = "if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) {"
+FALLBACK_ENSURE = "if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {"
 FALLBACK_PLAN = "plan_candidate = plan_single_device(false);"
 
 

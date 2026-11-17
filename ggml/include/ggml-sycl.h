@@ -543,6 +543,8 @@ typedef struct ggml_sycl_host_create_record {
 // Direct calls retain legacy planning/late side effects; they do not guarantee
 // eager host-zone provisioning. The loader uses stage_load_inventory_plan(..., false)
 // to attempt that provisioning before buffer allocation, under lifecycle guards.
+// A plan the VRAM arena's zones cannot hold is logged as an ERROR and nothing is
+// planned; this entry and the early one below return no result, only the stage does.
 GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t                            backend,
                                                              const struct ggml_sycl_tensor_inventory * inventory);
 
@@ -1529,7 +1531,9 @@ enum ggml_sycl_lifecycle_result {
     GGML_SYCL_LIFECYCLE_BUSY,
     GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND,
     // A deterministic refusal of a runtime plan update (budget or accounting),
-    // as opposed to the transient BUSY above. Callers must NOT retry it: the
+    // or of a model load's plan (a lazy table it refused, or VRAM arena zones
+    // that cannot be sized for it while something holds the arena), as
+    // opposed to the transient BUSY above. Callers must NOT retry it: the
     // inputs cannot change between attempts, so a retry loop only multiplies
     // the error output. Appended last on purpose -- these values reach users as
     // `result=%d` and are quoted in tickets and logs (BUSY is 17), so inserting
@@ -1548,6 +1552,10 @@ enum ggml_sycl_lifecycle_result {
 // immutable load candidate used by direct static calls. It derives the load's
 // host-backing fact from the inventory's resolved inputs (design 5efe §4.3)
 // and the staged plan holds it.
+//
+// A plan the backend refuses returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED after
+// an ERROR or WARN line that says why, and the stage puts back the per-device
+// planned terms the load published; the load's transaction then ends failed.
 //
 // Exported under this name since the inventory began carrying those inputs.
 // The registry answers the old name, ggml_backend_sycl_stage_inventory_plan,

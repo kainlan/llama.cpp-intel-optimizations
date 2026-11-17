@@ -526,8 +526,46 @@ bool zone_arena_rebuild_allowed(const zone_arena_holders & holders) {
 }
 
 std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {
-    (void) refusal;
-    return {};
+    if (refusal.reason == zone_arena_refusal_reason::NONE) {
+        return {};
+    }
+    constexpr double MiB = 1024.0 * 1024.0;
+    char             part[192];
+    std::snprintf(part, sizeof(part), "[SYCL-PLAN] model load refused on device %d: VRAM arena zones", refusal.device);
+    std::string text = part;
+    // Every zone with its need and have, and a shortfall only on a zone that is short, so the line says which did not
+    // fit.
+    const auto  zone = [&](const char * sep, const char * name, size_t need, size_t have) {
+        std::snprintf(part, sizeof(part), "%s%s need %.1f MB have %.1f MB", sep, name, need / MiB, have / MiB);
+        text += part;
+        if (need > have) {
+            std::snprintf(part, sizeof(part), " (%.1f MB short)", (need - have) / MiB);
+            text += part;
+        }
+    };
+    zone(" ", "SCRATCH", refusal.need.scratch, refusal.have.scratch);
+    zone(", ", "ONEDNN", refusal.need.onednn, refusal.have.onednn);
+    zone(", ", "RUNTIME", refusal.need.runtime, refusal.have.runtime);
+    switch (refusal.reason) {
+        case zone_arena_refusal_reason::REBUILD_HELD:
+            text +=
+                "; live allocations of a model or context already on the device hold the arena (the [VRAM-ARENA] lines "
+                "above name them), so its zones cannot grow. Free that model or context, then load this one again";
+            break;
+        case zone_arena_refusal_reason::RESERVE_FAILED:
+            std::snprintf(part, sizeof(part),
+                          "; the device could not reserve an arena with these zones. Free VRAM on device %d, then load "
+                          "this one again",
+                          refusal.device);
+            text += part;
+            break;
+        case zone_arena_refusal_reason::NO_CACHE:
+            text += "; the device has no unified cache to size them in";
+            break;
+        case zone_arena_refusal_reason::NONE:
+            break;
+    }
+    return text;
 }
 
 // A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about

@@ -13236,6 +13236,64 @@ static void ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw() {
 #endif
 }
 
+// The device-wide planned terms as the open load transaction's first stage found them, one entry per device. One load
+// transaction is open at a time (the registry refuses a second begin), so one entry serves: a load that fails puts its
+// entry back through ggml_sycl_abort_owner_effects_noexcept, and a load that commits forgets it. The device-wide terms
+// carry no owner, so a runtime context transaction of a live model that publishes between the capture and a failed
+// load's restore loses what it published; the context's next transaction publishes it again.
+struct ggml_sycl_load_published_terms_saved {
+    std::mutex                                   mutex;
+    uint64_t                                     txn = 0;
+    std::vector<ggml_sycl::load_published_terms> devices;
+};
+
+// Allocated once and never destroyed, so an abort during static destruction still finds it.
+static ggml_sycl_load_published_terms_saved & ggml_sycl_load_published_terms_store() {
+    static ggml_sycl_load_published_terms_saved * const saved = new ggml_sycl_load_published_terms_saved;
+    return *saved;
+}
+
+// Captures the device-wide terms for load `txn` unless its earlier pass already did.
+static void ggml_sycl_load_published_terms_capture(uint64_t txn) {
+    ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
+    std::lock_guard<std::mutex>            lock(saved.mutex);
+    if (saved.txn == txn) {
+        return;
+    }
+    const int n = std::max(0, std::min(ggml_backend_sycl_get_device_count(), GGML_SYCL_MAX_DEVICES));
+    saved.devices.clear();
+    for (int d = 0; d < n; ++d) {
+        saved.devices.push_back(ggml_sycl::load_published_terms::snapshot(d));
+    }
+    saved.txn = txn;
+}
+
+// Puts back what load `txn` captured, once; a load that captured nothing, or another load's entry, is left alone.
+// noexcept like the planned-load-terms drop, and for the same reason: the owner-effects abort calls it outside every try
+// stage, so no failed stage skips it and no catch handler is added for it. Its setters are plain stores.
+static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept {
+    ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
+    std::lock_guard<std::mutex>            lock(saved.mutex);
+    if (txn == 0 || saved.txn != txn) {
+        return;
+    }
+    for (size_t d = 0; d < saved.devices.size(); ++d) {
+        saved.devices[d].restore(static_cast<int>(d));
+    }
+    saved.devices.clear();
+    saved.txn = 0;
+}
+
+// Drops load `txn`'s entry once it committed: its terms are then the live model's.
+static void ggml_sycl_load_published_terms_forget(uint64_t txn) {
+    ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
+    std::lock_guard<std::mutex>            lock(saved.mutex);
+    if (saved.txn == txn) {
+        saved.devices.clear();
+        saved.txn = 0;
+    }
+}
+
 static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner,
                                                    const char *                     site = "(unknown)") noexcept {
     // llama.cpp-fzem: WARN, not silent -- this is the function that releases
@@ -13288,6 +13346,9 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     } catch (...) {
         clean = false;
     }
+    // The device-wide terms the aborted load published go back to what its first stage found, so the models on the
+    // device plan with their own again. The restore cannot throw and runs outside any try stage.
+    ggml_sycl_load_published_terms_restore(owner.load.value);
     try {
         // Abort discards only loader-thread candidate state. The previously active
         // LIVE execution authority remains continuously published.
@@ -14291,6 +14352,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             ggml_sycl_enqueue_quarantined_result(*registry, result, model);
             (void) ggml_sycl_restore_latest_live_plan();
         }
+        // A committed load's terms are the live model's; a cleanup above already put a failed one's back.
+        ggml_sycl_load_published_terms_forget(result.token.load.value);
         if (result.committed) {
             // The committed model owns MoE discovery from here. Outside the
             // inventory lock: the outgoing owner's snapshot allocates, which
@@ -18079,8 +18142,10 @@ static bool ggml_sycl_plan_has_storage_table(const ggml_sycl::placement_plan & p
 
 // Phase C helper: run compute_placement_plan (single- or multi-device) and
 // store the plan into per-device unified caches.  Idempotent — replaces any
-// previous plan.  Caller must hold g_tensor_inventory_mutex.
-static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t vram_budget, int budget_pct) {
+// previous plan.  Caller must hold g_tensor_inventory_mutex. False when the
+// arena's zones cannot be sized for the plan: the refusal line is logged and
+// no plan is staged, and the caller refuses the load.
+static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t vram_budget, int budget_pct) {
     // Where either stage call below hands the lease of the candidate it replaces (th32 §3.3). It is empty here because
     // the stage loop drains it after every planner call; a held lease would drop under this caller's guard when the
     // stage moved the next one in.
@@ -18093,15 +18158,18 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             ggml_sycl::lifecycle_stage_no_placement_plan(g_sycl_plan_load_effect_txn, g_placement_kv_info,
                                                          g_model_n_layer, displaced_out);
         }
-        return;
+        return true;
     }
+    ggml_sycl::zone_arena_refusal refusal;
     if (ggml_sycl::get_unified_cache_for_device(ctx->device) &&
-        !ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) {
-        // The zones cannot be rebuilt while another live model holds allocations in them, and the load's planned
-        // compute term (llama.cpp-p6i0) raises the RUNTIME requirement, so a second model whose term is larger than
-        // the live one's reaches this abort where it loaded before. Refusing that load by name instead of aborting
-        // is llama.cpp-ouur.
-        GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");
+        !ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {
+        // The zones grow only by a rebuild, and the arena is not rebuilt while anything points into it: a live
+        // model's allocations, or what a freed model's context left (its PP MoE ring, chunk leases). Any term of
+        // this load can then need more than the zones hold, not only a compute term larger than a live model's:
+        // the device-wide terms are this load's alone. The load is refused by name and whatever holds the arena keeps
+        // running; the abort of the load's owner effects puts back the terms it published.
+        GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
+        return false;
     }
     // P3's reading (th32 §4.3 step 4) and the budget's source (§10): the MemAvailable and the override flag of the
     // sample this load's stored budget came from, so every plan of the load reads the values its budget does.
@@ -18252,8 +18320,11 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 // room publishes its own.
                 (void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);
                 published_before.restore(ctx->device);
-                if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) {
-                    GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");
+                // The zones are asked for no more than the entry ensure found they hold, so this refuses only when
+                // the arena changed in between; it refuses the load the same way.
+                if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {
+                    GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
+                    return false;
                 }
                 plan_candidate = plan_single_device(/*with_room=*/false);
                 GGML_LOG_WARN(
@@ -18399,6 +18470,7 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             }
         }
     }
+    return true;
 }
 
 // Compute placement plan early — before create_tensor in the llama loader.
@@ -18406,8 +18478,11 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
 // per-tensor buft selection can consult (*global_plan).  Skips the
 // late-only side effects (layer-streaming setup, host-pinned pre-allocate,
 // headroom reserve) that depend on state populated by create_tensor.
-void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t                     backend,
-                                                    const ggml_sycl_tensor_inventory * inventory) {
+// *plan_refused (when given) is set when the arena's zones cannot be sized
+// for the plan; the refusal line is already logged and nothing is staged.
+static void ggml_sycl_compute_placement_plan_early_impl(ggml_backend_t                     backend,
+                                                        const ggml_sycl_tensor_inventory * inventory,
+                                                        bool *                             plan_refused) {
     if (!backend || ggml_sycl_inventory_malformed(inventory)) {
         return;
     }
@@ -18422,7 +18497,16 @@ void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t              
     size_t vram_budget = 0, base_mem = 0, free_mem = 0;
     int    budget_pct = 0;
     compute_vram_budget_for_plan(ctx, vram_budget, budget_pct, base_mem, free_mem);
-    compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
+    if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct) && plan_refused != nullptr) {
+        *plan_refused = true;
+    }
+}
+
+// The direct entry keeps its void signature across the dlopen boundary: a refused plan is logged and stages nothing,
+// and only the stage turns it into a lifecycle result.
+void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t                     backend,
+                                                    const ggml_sycl_tensor_inventory * inventory) {
+    ggml_sycl_compute_placement_plan_early_impl(backend, inventory, nullptr);
 }
 
 // A load whose plan was packed against a RUNTIME zone an earlier load in this process grew says so, once, after its
@@ -18450,8 +18534,12 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
         device, live / mb, reserved / mb);
 }
 
+// The late inventory pass. *plan_refused (when given) is set, and no candidate is returned, when the arena's zones
+// cannot be sized for the plan; the refusal line is already logged.
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(
-    ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
+    ggml_backend_t                     backend,
+    const ggml_sycl_tensor_inventory * inventory,
+    bool *                             plan_refused) {
     if (!backend || ggml_sycl_inventory_malformed(inventory)) {
         return {};
     }
@@ -18691,7 +18779,12 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
     // Idempotent against a prior early call with the same inventory.
     // Host-pinned pool pre-sizing is plan-derived and happens when host zones
     // are configured, so all-VRAM models do not allocate a full host copy here.
-    compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
+    if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) {
+        if (plan_refused != nullptr) {
+            *plan_refused = true;
+        }
+        return {};
+    }
     ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device);
 
     GGML_LOG_INFO(
@@ -18709,7 +18802,8 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
 void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
     // Preserve the pre-091afc direct-setter contract. Eager host provisioning
     // belongs to stage_load_inventory_plan(), which owns the necessary lifetime guards.
-    (void) ggml_sycl_set_tensor_inventory_impl(backend, inventory);
+    // A refused plan is logged and stages nothing; only the stage turns it into a lifecycle result.
+    (void) ggml_sycl_set_tensor_inventory_impl(backend, inventory, nullptr);
 }
 
 void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml_sycl_placement_envelope * envelope) {
@@ -18828,6 +18922,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
             }
         } rollback{ effect.owner, false, false };
 
+        // The device-wide terms as they stand before this load's first device plans, kept for the load to put back if
+        // it fails; the late pass of the same load keeps what its early pass captured.
+        ggml_sycl_load_published_terms_capture(effect.owner.load.value);
         // the transaction's one budget store, before any device plans (th32 §4.2); the planner entries below only read
         host_budget_pass_scope host_budget;
         for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
@@ -18844,10 +18941,20 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
 
             ggml_backend_sycl_set_placement_envelope(backend, envelope);
             rollback.started = true;
+            // A plan the arena's zones cannot hold refuses the load from either pass; the rollback guard then aborts
+            // the load's owner effects, which puts back what it published. The late pass reads the refusal before it
+            // checks the candidate, which a refused plan never staged.
+            bool plan_refused = false;
             if (early) {
-                ggml_backend_sycl_compute_placement_plan_early(backend, inventory);
+                ggml_sycl_compute_placement_plan_early_impl(backend, inventory, &plan_refused);
+                if (plan_refused) {
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
             } else {
-                const auto snapshot = ggml_sycl_set_tensor_inventory_impl(backend, inventory);
+                const auto snapshot = ggml_sycl_set_tensor_inventory_impl(backend, inventory, &plan_refused);
+                if (plan_refused) {
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
                 const auto owner    = effect.owner;
                 const auto candidate_is_current = [&]() {
                     // Candidate versions/slot fields are not published identities.

@@ -3652,6 +3652,46 @@ void planner_published_terms::restore(int device) const {
     unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);
 }
 
+load_published_terms load_published_terms::snapshot(int device) {
+    load_published_terms terms;
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return terms;
+    }
+    terms.pp_pipeline           = unified_cache_get_planned_pp_pipeline_scratch_bytes(device);
+    terms.ring_weight           = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
+    terms.ring_activation       = unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device);
+    terms.ring_output           = unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(device);
+    terms.ring_depth            = unified_cache_get_planned_pp_moe_onednn_ring_depth(device);
+    terms.ring_activation_in_kv = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(device);
+    terms.ring_output_in_kv     = unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(device);
+    terms.ring_activation_row   = unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device);
+    terms.ring_output_row       = unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device);
+    terms.ring_n_expert         = unified_cache_get_planned_pp_moe_onednn_n_expert(device);
+    terms.ring_n_expert_used    = unified_cache_get_planned_pp_moe_onednn_n_expert_used(device);
+    terms.ring_n_ubatch         = unified_cache_get_planned_pp_moe_onednn_n_ubatch(device);
+    terms.onednn_weights        = g_planned_onednn_pair_weights_bytes[device].load(std::memory_order_acquire);
+    terms.onednn_activations    = g_planned_onednn_pair_activations_bytes[device].load(std::memory_order_acquire);
+    terms.onednn_stored         = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device);
+    terms.planner               = planner_published_terms::snapshot(device);
+    return terms;
+}
+
+void load_published_terms::restore(int device) const {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    unified_cache_set_planned_pp_pipeline_scratch_bytes(device, pp_pipeline);
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, ring_weight, ring_activation, ring_output, ring_depth);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, ring_activation_in_kv, ring_output_in_kv);
+    unified_cache_set_planned_pp_moe_onednn_row_bytes(device, ring_activation_row, ring_output_row, ring_n_expert,
+                                                      ring_n_expert_used);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, ring_n_ubatch);
+    // The pair's setter stores the halves' total as the sum; the sum the reserve may have raised goes back after it.
+    unified_cache_set_planned_onednn_scratchpad_pair(device, onednn_weights, onednn_activations);
+    unified_cache_set_planned_onednn_scratchpad_bytes(device, onednn_stored);
+    planner.restore(device);
+}
+
 size_t unified_cache_runtime_zone_floor_bytes() {
     size_t floor_bytes = 512 * 1024 * 1024;
     if (const char * env = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB")) {
@@ -7305,7 +7345,7 @@ void unified_cache_entry::record_lease_event(bool acquire, const char * site) {
     debug_lease_ring_next    = (debug_lease_ring_next + 1) % kDebugLeaseRingSize;
 }
 
-bool unified_cache::ensure_planned_arena_zones() {
+bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
     if (!vram_arena_enabled()) {
         return true;
     }
@@ -7538,6 +7578,9 @@ bool unified_cache::ensure_planned_arena_zones() {
         }
     };
 
+    // The arena's zones as this call read them, which a refusal below names as what the device has: none when there
+    // is no arena, and the replaced arena's when a reserve fails after a rebuild destroyed it.
+    zone_arena_sizes arena_zones;
     if (arena_active()) {
         const bool zones_sufficient = zone_capacity(vram_zone_id::SCRATCH) >= scratch_zone &&
                                       zone_capacity(vram_zone_id::ONEDNN) >= onednn_zone &&
@@ -7561,6 +7604,8 @@ bool unified_cache::ensure_planned_arena_zones() {
             onednn_zone_plan_keep_and_store(dev_id, live_plan);
             return true;
         }
+        arena_zones = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN),
+                        zone_capacity(vram_zone_id::RUNTIME) };
 
         // Each zone's reading is kept, so a refusal below prints the same figures it decided on: a second read could
         // disagree with them under a concurrent release.
@@ -7676,6 +7721,13 @@ bool unified_cache::ensure_planned_arena_zones() {
                     dump_live_zone_allocations(static_cast<vram_zone_id>(z), "arena-rebuild");
                 }
             }
+            // The caller's refusal of its load names the figures the ERROR line above printed.
+            if (refusal != nullptr) {
+                refusal->reason = zone_arena_refusal_reason::REBUILD_HELD;
+                refusal->device = dev_id;
+                refusal->need   = { scratch_zone, onednn_zone, runtime_zone };
+                refusal->have   = arena_zones;
+            }
             return false;
         }
 
@@ -7697,6 +7749,12 @@ bool unified_cache::ensure_planned_arena_zones() {
 
     if (!arena_reserve(queue_, budget_, max_alloc, safe_max_alloc, scratch_zone, onednn_zone, runtime_zone,
                        device_total_vram_)) {
+        if (refusal != nullptr) {
+            refusal->reason = zone_arena_refusal_reason::RESERVE_FAILED;
+            refusal->device = dev_id;
+            refusal->need   = { scratch_zone, onednn_zone, runtime_zone };
+            refusal->have   = arena_zones;
+        }
         return false;
     }
     bind_compute_arena();
@@ -28313,12 +28371,16 @@ bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes) {
     return cache->reserve_compute_arena(arena_bytes);
 }
 
-bool unified_cache_ensure_planned_arena_zones(int device_id) {
+bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal * refusal) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (!cache) {
+        if (refusal != nullptr) {
+            refusal->reason = zone_arena_refusal_reason::NO_CACHE;
+            refusal->device = device_id;
+        }
         return false;
     }
-    return cache->ensure_planned_arena_zones();
+    return cache->ensure_planned_arena_zones(refusal);
 }
 
 #if GGML_SYCL_DNNL

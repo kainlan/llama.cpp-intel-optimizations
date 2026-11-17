@@ -18,8 +18,8 @@ refused plan staged none, and that check would throw an anonymous EFFECT_FAILED)
 void signatures across the dlopen boundary; they log the refusal and stage nothing.
 
 The refusal names need and have: the ensure writes, at the holders refusal, the three zone sizes it decided on as the
-need and the arena's zone capacities as the have; at a failed reserve, the same need and the capacities it read before
-it destroyed the arena; the device wrapper names a device with no cache. zone_arena_refusal_text prints both for every
+need and the arena's zone capacities, read before either refusal, as the have; at a failed reserve, the same need and
+those capacities, read before the rebuild destroyed the arena; the device wrapper names a device with no cache. zone_arena_refusal_text prints both for every
 zone (test-zone-sizing Case 38 checks the text).
 
 A failed load puts back what it published: the stage captures the device-wide planned terms before its first device
@@ -177,16 +177,18 @@ def claim_every_caller_propagates(gs: str) -> bool:
 
 ENSURE_SIG = "bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal)"
 WRAPPER_SIG = "bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal * refusal)"
-NEED = "{ scratch_zone, onednn_zone, runtime_zone }"
-HAVE_LIVE = ("{ zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN), "
-             "zone_capacity(vram_zone_id::RUNTIME) }")
-HELD_FILL = ("if (refusal != nullptr) { *refusal = { zone_arena_refusal_reason::REBUILD_HELD, dev_id, " + NEED + ", "
-             + HAVE_LIVE + " }; } return false;")
-HAD_READ = "had = " + HAVE_LIVE + ";"
-RESERVE_FILL = ("if (refusal != nullptr) { *refusal = { zone_arena_refusal_reason::RESERVE_FAILED, dev_id, " + NEED
-                + ", had }; } return false;")
-NO_CACHE_FILL = ("if (!cache) { if (refusal != nullptr) { *refusal = { zone_arena_refusal_reason::NO_CACHE, "
-                 "device_id, {}, {} }; } return false; }")
+# The need is the three sizes the ensure decided on; the have is the arena's zones, read once before either refusal
+# (a failed reserve has destroyed the arena by the time it refuses).
+NEED = "refusal->need = { scratch_zone, onednn_zone, runtime_zone };"
+HAVE = "refusal->have = arena_zones;"
+ZONES_READ = ("arena_zones = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN), "
+              "zone_capacity(vram_zone_id::RUNTIME) };")
+HELD_FILL = ("if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::REBUILD_HELD; refusal->device = "
+             "dev_id; " + NEED + " " + HAVE + " } return false;")
+RESERVE_FILL = ("if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::RESERVE_FAILED; "
+                "refusal->device = dev_id; " + NEED + " " + HAVE + " } return false;")
+NO_CACHE_FILL = ("if (!cache) { if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::NO_CACHE; "
+                 "refusal->device = device_id; } return false; }")
 TEXT_SIG = "std::string zone_arena_refusal_text(const zone_arena_refusal & refusal)"
 TEXT_ZONES = ('"SCRATCH", refusal.need.scratch, refusal.have.scratch', '"ONEDNN", refusal.need.onednn, '
               'refusal.have.onednn', '"RUNTIME", refusal.need.runtime, refusal.have.runtime')
@@ -197,7 +199,7 @@ def claim_refusal_names_need_and_have(uc: str, zs: str) -> bool:
     c = code(uc)
     ensure = fn_body(c, ENSURE_SIG)
     text = fn_body(code(zs), TEXT_SIG)
-    return (ordered(ensure, "if (!zone_arena_rebuild_allowed(holders)) {", HELD_FILL, HAD_READ, "arena_destroy();",
+    return (ordered(ensure, ZONES_READ, "if (!zone_arena_rebuild_allowed(holders)) {", HELD_FILL, "arena_destroy();",
                     "if (!arena_reserve(", RESERVE_FILL)
             and NO_CACHE_FILL in fn_body(c, WRAPPER_SIG)
             and all(z in text for z in TEXT_ZONES) and TEXT_FORMAT in text)
@@ -209,7 +211,10 @@ ABORT_SIG = "static bool ggml_sycl_abort_owner_effects_noexcept("
 LOAD_END_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn txn,"
 CAPTURE = "ggml_sycl_load_published_terms_capture(effect.owner.load.value);"
 STAGE_LOOP = "for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {"
-RESTORE = "try { ggml_sycl_load_published_terms_restore(owner.load.value); } catch (...) { clean = false; }"
+# The restore runs outside every try stage of the abort, as the planned-load-terms drop does, so no failed stage skips it
+# and the abort gains no catch handler; it is noexcept where it is defined.
+RESTORE = "ggml_sycl_load_published_terms_restore(owner.load.value);"
+RESTORE_DEF = "static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept {"
 FORGET = "ggml_sycl_load_published_terms_forget(result.token.load.value);"
 COMMIT_CLEANUP = "if (result.cleanup_required) {"
 COMMITTED = "if (result.committed) {"
@@ -244,6 +249,17 @@ def publish_path_setters(gs: str) -> set:
     return found - EXEMPT_SETTERS
 
 
+def depth_at(body: str, idx: int) -> int:
+    """Brace depth at `idx` of a block that starts with its own '{': 1 is the block's top level."""
+    return body.count("{", 0, idx) - body.count("}", 0, idx)
+
+
+def restored_outside_every_try(c: str) -> bool:
+    abort = fn_body(c, ABORT_SIG)
+    k = abort.find(RESTORE)
+    return k != -1 and abort.count(RESTORE) == 1 and depth_at(abort, k) == 1 and RESTORE_DEF in c
+
+
 def claim_failed_load_restores(gs: str, uc: str) -> bool:
     c = code(gs)
     u = code(uc)
@@ -252,7 +268,7 @@ def claim_failed_load_restores(gs: str, uc: str) -> bool:
     restored = set(SETTER_RE.findall(fn_body(u, LOAD_RESTORE_SIG) + fn_body(u, PLANNER_RESTORE_SIG)))
     setters = publish_path_setters(gs)
     return (ordered(stage, CAPTURE, STAGE_LOOP)
-            and RESTORE in fn_body(c, ABORT_SIG)
+            and restored_outside_every_try(c)
             and ordered(load_end, COMMIT_CLEANUP, FORGET, COMMITTED)
             and "planner.restore(device);" in fn_body(u, LOAD_RESTORE_SIG)
             and PUBLISH_SETTERS_TODAY <= setters and setters <= restored)
@@ -326,12 +342,19 @@ def test_refusal_names_need_and_have():
 
 
 def test_witness_need_written_from_the_capacities():
-    m = mutate_in(UC, ENSURE_SIG, "REBUILD_HELD, dev_id, " + NEED, "REBUILD_HELD, dev_id, " + HAVE_LIVE)
+    m = mutate_in(UC, ENSURE_SIG, "REBUILD_HELD; refusal->device = dev_id; " + NEED,
+                  "REBUILD_HELD; refusal->device = dev_id; refusal->need = arena_zones;")
     assert not claim_refusal_names_need_and_have(m, ZS)
 
 
 def test_witness_reserve_failure_writes_nothing():
     m = mutate_in(UC, ENSURE_SIG, RESERVE_FILL, "return false;")
+    assert not claim_refusal_names_need_and_have(m, ZS)
+
+
+def test_witness_have_read_after_the_arena_is_destroyed():
+    m = mutate_in(UC, ENSURE_SIG, ZONES_READ, "")
+    m = mutate_in(m, ENSURE_SIG, "if (!arena_reserve(", ZONES_READ + " if (!arena_reserve(")
     assert not claim_refusal_names_need_and_have(m, ZS)
 
 
@@ -349,6 +372,16 @@ def test_a_failed_load_puts_back_what_it_published():
 
 def test_witness_abort_restores_nothing():
     m = mutate_in(GS, ABORT_SIG, RESTORE, "")
+    assert not claim_failed_load_restores(m, UC)
+
+
+def test_witness_restore_inside_a_try_stage():
+    m = mutate_in(GS, ABORT_SIG, RESTORE, "try { " + RESTORE + " } catch (...) { clean = false; }")
+    assert not claim_failed_load_restores(m, UC)
+
+
+def test_witness_restore_declared_throwing():
+    m = code(GS).replace(RESTORE_DEF, RESTORE_DEF.replace(" noexcept {", " {"), 1)
     assert not claim_failed_load_restores(m, UC)
 
 
@@ -374,3 +407,11 @@ def test_witness_forget_before_the_commit_cleanup():
     m = mutate_in(GS, LOAD_END_SIG, FORGET, "")
     m = mutate_in(m, LOAD_END_SIG, COMMIT_CLEANUP, FORGET + " " + COMMIT_CLEANUP)
     assert not claim_failed_load_restores(m, UC)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
