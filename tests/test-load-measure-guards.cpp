@@ -150,6 +150,8 @@ static void test_plan_absent() {
     g_staged_ok = true;
     CHECK(llama_load_measure_plan_absent(procs, 7, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C) == nullptr,
           "a staged plan was read as absent");
+    // reset_fakes leaves g_stage at PROBE, so only a stage other than PROBE shows the query was passed the stage
+    CHECK(g_staged_asks == 2 && g_stage == GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, "the query did not see the stage");
 
     const llama_measure_override_procs no_query = { &fake_install, &fake_clear };
     CHECK(llama_load_measure_plan_absent(no_query, 7, GGML_SYCL_MEASURE_STAGE_PROBE) == nullptr,
