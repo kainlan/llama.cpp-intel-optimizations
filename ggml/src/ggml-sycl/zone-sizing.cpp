@@ -658,6 +658,26 @@ zone_context_shape zone_plan_context_shape_for_envelope(bool     n_ctx_is_runtim
                                    zone_planning_n_ubatch(envelope_n_ubatch, n_ubatch), n_ubatch_context);
 }
 
+size_t zone_onednn_graph_scratch_floor_bytes(uint32_t n_head_ctx_max,
+                                             uint32_t n_head_swa_max,
+                                             uint32_t n_swa,
+                                             uint32_t n_ubatch,
+                                             uint32_t n_ctx,
+                                             size_t   direct_cap) {
+    constexpr uint64_t k_floor_min_bytes = 64ull * 1024ull * 1024ull;
+    constexpr uint64_t k_sizeof_f32      = 4;
+    const uint64_t     ctx_term          = uint64_t(n_head_ctx_max) * uint64_t(n_ctx);
+    // Widened before the add: n_swa + n_ubatch in 32 bits can wrap for a huge window.
+    const uint64_t     swa_term = uint64_t(n_head_swa_max) * std::min<uint64_t>(n_ctx, uint64_t(n_swa) + n_ubatch);
+    const uint64_t     elems    = std::max(ctx_term, swa_term) * uint64_t(n_ubatch);
+    // Fixed-point 3/2 rather than a floating-point 1.5: exact at the MiB boundaries the formula was measured at.
+    uint64_t           modeled  = (elems * k_sizeof_f32 * 3) / 2;
+    if (direct_cap != 0) {
+        modeled = std::min<uint64_t>(modeled, direct_cap);
+    }
+    return static_cast<size_t>(std::max<uint64_t>(k_floor_min_bytes, modeled));
+}
+
 size_t zone_hold_persistent_raw(size_t raw_held, size_t compute_live, bool rung_live) {
     if (!rung_live) {
         return raw_held;

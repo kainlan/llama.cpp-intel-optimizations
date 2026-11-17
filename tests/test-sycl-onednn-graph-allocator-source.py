@@ -464,14 +464,18 @@ POOL_SIZE_READY_BODY_CODE = extract_function_body(
 # "...zone_floor_bytes(" never occurs inside it.
 #
 # llama.cpp-o3a0: this is now a THIN WRAPPER delegating into the window-aware
-# onednn_graph_scratch_zone_floor_bytes_swa() (see FLOOR_SWA_BODY_CODE
-# below) -- checks about the FORMULA itself (the 64 MiB constant, the
-# min/max window logic) must read FLOOR_SWA_BODY_CODE, not this one; checks
-# about the DELEGATION itself belong here.
+# onednn_graph_scratch_zone_floor_bytes_swa() -- checks about the FORMULA
+# itself (the 64 MiB constant, the min/max window logic) must read
+# PURE_FLOOR_BODY_CODE (the formula's one home, zone-sizing.cpp), not this
+# one; checks about the DELEGATION itself belong here.
 FLOOR_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_graph_scratch_zone_floor_bytes(")
 # llama.cpp-o3a0: the window-aware formula's own body -- see the comment
 # above FLOOR_BODY_CODE for why the two anchors cannot collide.
 FLOOR_SWA_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_graph_scratch_zone_floor_bytes_swa(")
+# The formula's own body: the cache's floor function keeps the env override and hands the rest to this pure function.
+PURE_FLOOR_BODY_CODE = extract_function_body(
+    strip_comments(ZONE_SIZING_CPP), "size_t zone_onednn_graph_scratch_floor_bytes("
+)
 # llama.cpp-o3a0: the WITH-FLOOR getter that
 # actually calls the floor formula with the shape's SWA fields -- scoping
 # the "caller passes the swa fields" check (below) to this one function's
@@ -482,9 +486,9 @@ WITH_FLOOR_GETTER_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {"
 )
 # The getter reads the pair and the floor through ONE helper (so both describe the same plan); the helper is where the
-# floor formula is called with the shape's fields.
+# floor formula is called with the shape's fields and the DIRECT cap its caller passes.
 PAIR_AND_FLOOR_BODY_CODE = extract_function_body(
-    CACHE_CPP_CODE, "static zone_onednn_plan onednn_planned_pair_and_floor(int device_id) {"
+    CACHE_CPP_CODE, "static zone_onednn_plan onednn_planned_pair_and_floor(int device_id, size_t direct_cap) {"
 )
 MAKE_ENGINE_BODY_CODE = extract_function_body(COMMON_HPP_CODE, "dnnl::engine make_engine(sycl::queue * q) {")
 # llama.cpp-pqgl: the size>cap early-out's ordering relative to the eviction
@@ -936,11 +940,11 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # across lines than a shorter call ever was.
     checks["graph scratch zone floor is additive"] = (
         normalize_ws(
-            "plan.graph_floor_bytes = onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, "
-            "shape.n_head_swa_max, shape.n_swa, shape.n_ubatch, shape.n_ctx);"
+            "plan.graph_floor_bytes = onednn_graph_scratch_zone_floor_bytes_swa( shape.n_head_ctx_max, "
+            "shape.n_head_swa_max, shape.n_swa, shape.n_ubatch, shape.n_ctx, direct_cap);"
         )
         in normalize_ws(PAIR_AND_FLOOR_BODY_CODE)
-        and "onednn_planned_pair_and_floor(device_id)" in WITH_FLOOR_GETTER_BODY_CODE
+        and "onednn_planned_pair_and_floor(device_id, direct_cap)" in WITH_FLOOR_GETTER_BODY_CODE
         and "plan.bare_bytes + plan.graph_floor_bytes" in WITH_FLOOR_GETTER_BODY_CODE
     )
     # llama.cpp-o3a0: mutation witness for the caller actually passing the
@@ -966,7 +970,7 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # formula around) -- whitespace-insensitive for the same clang-format
     # re-wrap reason as the call above.
     checks["3-arg overload delegates to the swa formula"] = normalize_ws(
-        "return onednn_graph_scratch_zone_floor_bytes_swa(n_head, 0, 0, n_ubatch, n_ctx);"
+        "return onednn_graph_scratch_zone_floor_bytes_swa(n_head, 0, 0, n_ubatch, n_ctx, 0);"
     ) in normalize_ws(FLOOR_BODY_CODE)
     # Token-anchored default value (llama.cpp-gwno spec-review round 2,
     # finding: this used to be untested, so a 512->64 regression or typo
@@ -978,12 +982,10 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # env-overridable constant -- anchor on that constant's own definition,
     # not a value that could coincidentally appear elsewhere in the formula
     # (768 MiB, 1.5, sizeof(f32) as 4, etc. are all also just numbers).
-    # llama.cpp-o3a0: reads FLOOR_SWA_BODY_CODE, not FLOOR_BODY_CODE -- the
-    # constant moved into the window-aware formula when the 3-arg overload
-    # became a thin wrapper (see the comment above FLOOR_BODY_CODE's
-    # extraction).
+    # Reads PURE_FLOOR_BODY_CODE: the constant lives with the formula, in
+    # zone-sizing.cpp's pure function.
     checks["default floor is 64 MiB"] = bool(
-        re.search(r"kFloorMinBytes\s*=\s*64ull\s*\*\s*1024ull\s*\*\s*1024ull", FLOOR_SWA_BODY_CODE)
+        re.search(r"k_floor_min_bytes\s*=\s*64ull\s*\*\s*1024ull\s*\*\s*1024ull", PURE_FLOOR_BODY_CODE)
     )
     # llama.cpp-o3a0: mutation witness for the two-class window logic itself
     # -- if either the per-class min(n_ctx, n_swa + n_ubatch) window or the
@@ -996,11 +998,11 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # n_head_swa_max=0 makes the SWA term vanish there regardless of
     # whether min/max or the +n_ubatch term are present at all.
     checks["swa formula windows each class independently"] = bool(
-        re.search(r"std::min\s*\(\s*static_cast<uint64_t>\(n_ctx\)\s*,\s*static_cast<uint64_t>\(n_swa\)\s*\+\s*"
-                 r"static_cast<uint64_t>\(n_ubatch\)\s*\)", FLOOR_SWA_BODY_CODE)
+        re.search(r"std::min<uint64_t>\s*\(\s*n_ctx\s*,\s*uint64_t\(n_swa\)\s*\+\s*n_ubatch\s*\)",
+                  PURE_FLOOR_BODY_CODE)
     )
     checks["swa formula takes the max across classes, not the sum"] = bool(
-        re.search(r"std::max\s*\(\s*ctx_term\s*,\s*swa_term\s*\)", FLOOR_SWA_BODY_CODE)
+        re.search(r"std::max\s*\(\s*ctx_term\s*,\s*swa_term\s*\)", PURE_FLOOR_BODY_CODE)
     )
 
     # High-water byte counter (llama.cpp-gwno perf follow-up): peak
@@ -1982,10 +1984,14 @@ def _populate_shape_var(cache: str):
     return m.group(1) if m else None
 
 
+PLAN_DIRECT_CAP = "unified_cache_onednn_graph_scratch_direct_cap_bytes(plan.device_id)"
+
+
 def _graph_floor_reads_the_published_shape(cache: str) -> bool:
+    """The logged floor is the one the zone holds: the published shape, bounded by the plan device's DIRECT cap."""
     var = _populate_shape_var(cache)
     calls = _call_argument_lists(_body_of(cache, POPULATE_HOST_ZONE_SIZING_SIG), GRAPH_FLOOR_CALL)
-    return var is not None and len(calls) == 1 and calls[0] == _shape_var_args(var)
+    return var is not None and len(calls) == 1 and calls[0] == _shape_var_args(var) + [PLAN_DIRECT_CAP]
 
 
 def _graph_floor_info_prints_the_published_shape(cache: str) -> bool:
@@ -2153,10 +2159,13 @@ def test_graph_shape_checks_have_bounded_mutation_witnesses() -> None:
     mutant = _mutate_in_function(cache, POPULATE_HOST_ZONE_SIZING_SIG, old, new)
     _assert_only_check_fails(mutant, sycl, "writers", "the plan writing the shape from its own fields")
 
-    old = f"{GRAPH_FLOOR_CALL}({', '.join(_shape_var_args(var))})"
+    old = f"{', '.join(_shape_var_args(var))}, {PLAN_DIRECT_CAP})"
     new = old.replace(f"{var}.n_ubatch, {var}.n_ctx", planning)
     mutant = _mutate_in_function(cache, POPULATE_HOST_ZONE_SIZING_SIG, old, new)
     _assert_only_check_fails(mutant, sycl, "floor", "the logged floor computed at the planning shape")
+
+    mutant = _mutate_in_function(cache, POPULATE_HOST_ZONE_SIZING_SIG, old, old.replace(PLAN_DIRECT_CAP, "0"))
+    _assert_only_check_fails(mutant, sycl, "floor", "the logged floor sized with no cap, unlike the zone")
 
     old = f"(1024.0 * 1024.0), {', '.join(_shape_var_args(var))})"
     new = old.replace(f"{var}.n_ubatch, {var}.n_ctx", planning)
@@ -2362,16 +2371,30 @@ def test_runtime_site_checks_have_bounded_mutation_witnesses() -> None:
 
 
 # The Graph floor is one pure function in zone-sizing.cpp, bounded by the DIRECT cap the dispatcher splits each
-# execute against. The cache's floor function keeps only the env override and hands everything else to it, and the
-# zone's own reading (the planned pair and floor) passes the cap of the device whose zone it sizes, so the zone and the
-# dispatcher read one number.
-ZONE_SIZING_CPP_NORM = normalize_ws(strip_comments(ZONE_SIZING_CPP))
+# execute against. The cache's floor function keeps only the env override and hands everything else to it. The zone's
+# own reading (the planned pair and floor) takes the cap as a parameter and looks no cache up: cache creation calls it
+# with the cache registry locked exclusively, and every by-device lookup takes that lock shared. A cache sizing its own
+# zones passes its own cap; the by-device getter looks the cache up itself. So the zone and the dispatcher read one
+# number.
 FLOOR_SWA_SIG = "static size_t onednn_graph_scratch_zone_floor_bytes_swa("
 PURE_FLOOR_CALL = "zone_onednn_graph_scratch_floor_bytes"
 PURE_FLOOR_SIG = f"size_t {PURE_FLOOR_CALL}("
-PAIR_AND_FLOOR_SIG = "static zone_onednn_plan onednn_planned_pair_and_floor(int device_id) {"
+PAIR_AND_FLOOR = "onednn_planned_pair_and_floor"
+PAIR_AND_FLOOR_SIG = f"static zone_onednn_plan {PAIR_AND_FLOOR}(int device_id, size_t direct_cap) {{"
+ENSURE_ZONES_SIG = "bool unified_cache::ensure_planned_arena_zones() {"
+WITH_FLOOR_GETTER_SIG = "size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {"
 PURE_FLOOR_ARGS = ["n_head_ctx_max", "n_head_swa_max", "n_swa", "n_ubatch", "n_ctx", "direct_cap"]
 DEVICE_DIRECT_CAP = "unified_cache_onednn_graph_scratch_direct_cap_bytes(device_id)"
+ENSURE_CAP_STMT = "const size_t graph_direct_cap = onednn_graph_scratch_direct_cap();"
+GETTER_CAP_STMT = f"const size_t direct_cap = {DEVICE_DIRECT_CAP};"
+# Every way to reach a cache by device id; each takes the registry lock.
+CACHE_LOOKUPS = (
+    "unified_cache_onednn_graph_scratch_direct_cap_bytes(",
+    "get_existing_unified_cache_for_device(",
+    "get_existing_cache_for_device(",
+    "get_unified_cache_for_device(",
+    "get_cache_shared(",
+)
 # What the formula is made of; none of it belongs in the cache's floor function once the formula has one home.
 FLOOR_FORMULA_TOKENS = ("std::min", "std::max", "* 3", "/ 2", "kFloorMinBytes", "kSizeofF32", "n_ubatch) *")
 
@@ -2391,18 +2414,31 @@ def _pure_floor_is_defined_once(zone: str) -> bool:
     return _has_function(zone, PURE_FLOOR_SIG)
 
 
-def _planned_pair_passes_the_device_cap(cache: str) -> bool:
+def _planned_pair_takes_the_cap_and_looks_no_cache_up(cache: str) -> bool:
     if not _has_function(cache, PAIR_AND_FLOOR_SIG):
         return False
-    calls = _call_argument_lists(_body_of(cache, PAIR_AND_FLOOR_SIG), GRAPH_FLOOR_CALL)
-    return calls == [_shape_var_args("shape") + [DEVICE_DIRECT_CAP]]
+    body = _body_of(cache, PAIR_AND_FLOOR_SIG)
+    if _call_argument_lists(body, GRAPH_FLOOR_CALL) != [_shape_var_args("shape") + ["direct_cap"]]:
+        return False
+    return not any(lookup in body for lookup in CACHE_LOOKUPS)
+
+
+def _caller_passes_cap(cache: str, sig: str, device: str, cap_stmt: str) -> bool:
+    """`sig`'s one call of the planned pair passes the cap `cap_stmt` (in `sig`'s body) reads."""
+    if not _has_function(cache, sig):
+        return False
+    body = _body_of(cache, sig)
+    var = re.match(r"const size_t (\w+) = ", cap_stmt).group(1)
+    return _call_argument_lists(body, PAIR_AND_FLOOR) == [[device, var]] and cap_stmt in body
 
 
 def _graph_floor_cap_checks(cache: str, zone: str) -> dict:
     return {
         "delegates": _floor_delegates_to_the_pure_function(cache),
         "pure": _pure_floor_is_defined_once(zone),
-        "pair": _planned_pair_passes_the_device_cap(cache),
+        "pair": _planned_pair_takes_the_cap_and_looks_no_cache_up(cache),
+        "ensure": _caller_passes_cap(cache, ENSURE_ZONES_SIG, "dev_id", ENSURE_CAP_STMT),
+        "getter": _caller_passes_cap(cache, WITH_FLOOR_GETTER_SIG, "device_id", GETTER_CAP_STMT),
     }
 
 
@@ -2410,12 +2446,18 @@ def test_graph_floor_is_the_pure_function_bounded_by_the_device_cap() -> None:
     results = _graph_floor_cap_checks(CACHE_CPP_NORM, ZONE_SIZING_CPP_NORM)
     assert results["pure"], f"zone-sizing.cpp must define {PURE_FLOOR_CALL}() once: the formula's one home"
     assert results["delegates"], (
-        f"{FLOOR_SWA_SIG}...) must hold no formula of its own and return {PURE_FLOOR_CALL}({', '.join(PURE_FLOOR_ARGS)})"
+        f"{FLOOR_SWA_SIG}...) must hold no formula of its own and return "
+        f"{PURE_FLOOR_CALL}({', '.join(PURE_FLOOR_ARGS)})"
     )
     assert results["pair"], (
-        f"onednn_planned_pair_and_floor() must size the floor with {DEVICE_DIRECT_CAP}: the cap the dispatcher splits "
-        "each execute against, or the zone holds Graph scratch no execute uses"
+        f"{PAIR_AND_FLOOR}() must size the floor with the direct_cap it is given and look no cache up: cache creation "
+        "calls it with the cache registry locked exclusively"
     )
+    assert results["ensure"], (
+        f"ensure_planned_arena_zones() must pass its own cap ({ENSURE_CAP_STMT}) to {PAIR_AND_FLOOR}(): the cap the "
+        "dispatcher splits each execute against, or the zone holds Graph scratch no execute uses"
+    )
+    assert results["getter"], f"the with-floor getter must pass {DEVICE_DIRECT_CAP} to {PAIR_AND_FLOOR}()"
 
 
 def _assert_only_cap_check_fails(cache: str, zone: str, failing: str, why: str) -> None:
@@ -2428,8 +2470,21 @@ def test_graph_floor_cap_checks_have_bounded_mutation_witnesses() -> None:
     cache, zone = CACHE_CPP_NORM, ZONE_SIZING_CPP_NORM
     assert all(_graph_floor_cap_checks(cache, zone).values()), "sanity: every check passes on the source itself"
 
-    mutant = _mutate_in_function(cache, PAIR_AND_FLOOR_SIG, DEVICE_DIRECT_CAP, "0")
-    _assert_only_cap_check_fails(mutant, zone, "pair", "the zone's floor sized with no cap known")
+    mutant = _mutate_in_function(cache, ENSURE_ZONES_SIG, f"{PAIR_AND_FLOOR}(dev_id, graph_direct_cap)",
+                                 f"{PAIR_AND_FLOOR}(dev_id, 0)")
+    _assert_only_cap_check_fails(mutant, zone, "ensure", "the zone's floor sized with no cap known")
+
+    mutant = _mutate_in_function(cache, WITH_FLOOR_GETTER_SIG, f"{PAIR_AND_FLOOR}(device_id, direct_cap)",
+                                 f"{PAIR_AND_FLOOR}(device_id, 0)")
+    _assert_only_cap_check_fails(mutant, zone, "getter", "the predicted zone sized with no cap known")
+
+    mutant = _mutate_in_function(cache, PAIR_AND_FLOOR_SIG, "shape.n_ctx, direct_cap)",
+                                 f"shape.n_ctx, {DEVICE_DIRECT_CAP})")
+    _assert_only_cap_check_fails(mutant, zone, "pair", "the cache looked up again inside the helper")
+
+    mutant = _mutate_in_function(cache, PAIR_AND_FLOOR_SIG, "zone_onednn_plan plan;",
+                                 f"zone_onednn_plan plan; (void) {DEVICE_DIRECT_CAP};")
+    _assert_only_cap_check_fails(mutant, zone, "pair", "a lookup inside the helper beside the passed cap")
 
     call = f"return {PURE_FLOOR_CALL}({', '.join(PURE_FLOOR_ARGS)});"
     inline = (

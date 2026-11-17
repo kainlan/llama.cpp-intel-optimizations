@@ -3126,12 +3126,14 @@ void ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(bool force);
 size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx);
 // llama.cpp-o3a0: host-testable wrapper around the window-aware
 // onednn_graph_scratch_zone_floor_bytes_swa(), same internal-linkage/
-// memoization caveats as the wrapper above.
+// memoization caveats as the wrapper above. `direct_cap` bounds the floor as the zone's own reading does; 0 is no
+// cap known, the formula.
 size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
                                                                 uint32_t n_head_swa_max,
                                                                 uint32_t n_swa,
                                                                 uint32_t n_ubatch,
-                                                                uint32_t n_ctx);
+                                                                uint32_t n_ctx,
+                                                                size_t   direct_cap);
 #endif
 void     unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
                                                          size_t   weight_slot_bytes,

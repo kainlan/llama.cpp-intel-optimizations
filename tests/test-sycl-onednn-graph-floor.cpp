@@ -251,16 +251,18 @@ void test_swa_formula() {
         { 1,  64, 1024, 512, 1024, 192,
          "both classes present, swa class dominates -> raw 3 MiB from ctx alone would be wrong; correct is 192 MiB" },
     };
+    // The last argument of every _swa call below is the DIRECT cap: 0 is no cap known, so these rows test the
+    // formula. The cap's bound is tested host-only (test-zone-sizing, Case 24g).
     for (const case_t & c : cases) {
         const size_t got = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(c.n_head_ctx_max, c.n_head_swa_max,
-                                                                                    c.n_swa, c.n_ubatch, c.n_ctx);
+                                                                                    c.n_swa, c.n_ubatch, c.n_ctx, 0);
         check(got == c.expect_mib * kMiB, c.what);
     }
 
     // Cross-check: n_ctx < n_swa must produce the IDENTICAL result to the
     // no-SWA 3-arg overload at the same (n_head, n_ubatch, n_ctx) -- both
     // describe "this class's effective window is n_ctx".
-    const size_t swa_below_window  = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(0, 32, 8192, 512, 2048);
+    const size_t swa_below_window = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(0, 32, 8192, 512, 2048, 0);
     const size_t no_swa_equivalent = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(32, 512, 2048);
     check(swa_below_window == no_swa_equivalent,
           "n_ctx < n_swa matches the no-SWA overload exactly (both use n_ctx as the effective window)");
@@ -269,7 +271,7 @@ void test_swa_formula() {
     // no-SWA overload exactly, for every Mistral row above -- this is the
     // backward-compatibility contract the 3-arg overload's thin-wrapper
     // delegation depends on.
-    const size_t via_swa_empty_class = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(32, 0, 0, 512, 8192);
+    const size_t via_swa_empty_class = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(32, 0, 0, 512, 8192, 0);
     const size_t via_no_swa_overload = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(32, 512, 8192);
     check(via_swa_empty_class == via_no_swa_overload,
           "an empty SWA class (n_head_swa_max=0, n_swa=0) matches the no-SWA overload exactly");
@@ -282,7 +284,7 @@ void test_swa_formula() {
     // apart from "zeroed because the window itself was 0"); this row
     // isolates the head-count zeroing specifically.
     const size_t zero_swa_heads_big_window =
-        ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(32, 0, 8192, 512, 8192);
+        ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(32, 0, 8192, 512, 8192, 0);
     check(zero_swa_heads_big_window == via_no_swa_overload,
           "n_head_swa_max=0 zeroes the swa term even with a large nonzero n_swa window");
 }
@@ -308,7 +310,7 @@ void test_override() {
     // 3-arg and 5-arg formulas (the 3-arg overload delegates into the 5-arg
     // one) -- confirm it also wins through the 5-arg wrapper directly,
     // rather than only through the delegation path exercised above.
-    const size_t floor_swa = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(128, 64, 4096, 4096, 1u << 20);
+    const size_t floor_swa = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(128, 64, 4096, 4096, 1u << 20, 0);
     check(floor_swa == 99 * kMiB, "override wins through the 5-arg swa wrapper too, not just via delegation");
 }
 
