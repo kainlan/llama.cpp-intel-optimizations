@@ -1722,7 +1722,7 @@ int main() {
         const size_t   room            = 2055 * MiB;
         in.compute_room_n_ubatch       = 2048;
         in.compute_room_bytes          = room;
-        CHECK(ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 2048, 1960 * MiB), "the buffer fits the room");
+        CHECK(ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 2048, 1960 * MiB, true), "the buffer fits the room");
         CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB - 64 * MiB,
               "with the room the buffer spills nothing; the plan stays in the bound");
         CHECK(ggml_sycl::zone_hold_fit(in, 2048), "so 2048 fits: 1912 MiB stay free");
@@ -1734,7 +1734,7 @@ int main() {
         in.ring_bytes         = 0;
         // Whole or nothing: a room one MiB short of the buffer gives no part of itself.
         in.compute_room_bytes = 1959 * MiB;
-        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 2048, 1960 * MiB), "a buffer above the room");
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 2048, 1960 * MiB, true), "a buffer above the room");
         CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB + 1960 * MiB - 64 * MiB,
               "is charged whole, not less the room");
         CHECK(!ggml_sycl::zone_hold_fit(in, 2048), "and refused as without a room");
@@ -1746,7 +1746,7 @@ int main() {
             { 2048, 2100 * MiB }
         };
         in.rungs = above;
-        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 2048, 2100 * MiB),
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 2048, 2100 * MiB, true),
               "a 2100 MiB buffer above the term");
         CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB + 2100 * MiB - 64 * MiB, "is charged whole");
         in.rungs   = rungs;
@@ -1754,14 +1754,15 @@ int main() {
         in.n_rungs = 0;
         CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB - 64 * MiB, "no record: the plan alone");
         in.n_rungs            = 1;
-        // Only the rung the room was planned for: 1024, scaled from the 2048 record, is judged as before.
+        // A rung below the room's rung with no record of its own is served by the room: 1024 here.
         in.compute_room_bytes = room;
-        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 1024, 980 * MiB), "another rung has no room");
-        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 98 * MiB + 980 * MiB - 64 * MiB,
-              "1024 is charged its scaled buffer whole");
+        CHECK(ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 1024, 980 * MiB, false), "a rung below the room");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 98 * MiB - 64 * MiB,
+              "1024's scaled buffer is credited: the plan alone");
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 4096, 1, false), "a rung above the room is not");
         // An unknown micro-batch never matches a room, not even a room for micro-batch 0.
         in.compute_room_n_ubatch = 0;
-        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 0, 0), "n_ubatch 0 has no room");
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 0, 0, false), "n_ubatch 0 has no room");
         CHECK(ggml_sycl::zone_hold_fit_demand(in, 0) == 0, "and no demand");
         // The scaler, through the spill bound that adds a 1-byte plan to it: rounded up, unchanged for an unknown or
         // equal micro-batch, saturating on overflow.
@@ -1840,11 +1841,14 @@ int main() {
         CHECK(!zone_compute_term_n_ubatch_turns_off(0, 0), "no record and no store does not");
     }
 
-    // ---- Case 24d (compute room, scoped): only the rung the plan placed sees the room. Over every record set the
-    // cases above use, every rung from 32 to 8192 gets the demand the fit gave before the room existed (spill bound
-    // over the plan and the rung's request, net of the KV room, plus the uncovered ring) when no rung is named, even
-    // with a room of SIZE_MAX, and every rung but the named one does when one is. So a load that names no micro-batch,
-    // the auto trial included, and every other rung of one that does are judged as before. ----------------------------
+    // ---- Case 24d (compute room, scoped): the room serves the rung the plan sized it for and every rung below it, and
+    // no other. Over every record set the cases above use, every rung from 32 to 8192 gets the demand the fit gave
+    // before the room existed (spill bound over the plan and the rung's request, net of the KV room, plus the
+    // uncovered ring) when no rung is named, even with a room of SIZE_MAX. When one is named, every rung above it gets
+    // that demand too, and every rung at or below it the demand with its request credited (the plan alone, net of the
+    // KV room, plus the uncovered ring: a room of SIZE_MAX holds any request), except the rung whose own buffer was
+    // held out, which gets the demand before the room. So a fit given no room, and every rung above the room's rung
+    // of one given a room, are judged as before. --------------------------------------------------------------------
     {
         const size_t MiB = 1024 * 1024;
 
@@ -1857,6 +1861,13 @@ int main() {
             const size_t request = ggml_sycl::zone_hold_fit_request(in, n_ubatch);
             const size_t spill   = ggml_sycl::zone_hold_spill_raw_demand(
                 ggml_sycl::zone_hold_spill_bound(plan, request, n_ubatch, n_ubatch), in.kv_room);
+            return in.ring_bytes > SIZE_MAX - spill ? SIZE_MAX : spill + in.ring_bytes;
+        };
+        // The demand of a rung the room serves: its request adds nothing to the bound, the plan stays in it.
+        auto demand_credited = [](const ggml_sycl::zone_hold_fit_inputs & in, uint32_t n_ubatch) -> size_t {
+            const size_t plan  = in.plan_of ? in.plan_of(in.plan_ctx, n_ubatch) : 0;
+            const size_t spill = ggml_sycl::zone_hold_spill_raw_demand(
+                ggml_sycl::zone_hold_spill_bound(plan, 0, n_ubatch, n_ubatch), in.kv_room);
             return in.ring_bytes > SIZE_MAX - spill ? SIZE_MAX : spill + in.ring_bytes;
         };
         auto plan_76 = [](void *, uint32_t) -> size_t {
@@ -1936,16 +1947,22 @@ int main() {
                         // No rung named: a room of any size is inert.
                         ggml_sycl::zone_hold_fit_inputs unnamed = before;
                         unnamed.compute_room_bytes              = SIZE_MAX;
-                        // The rung the Qwen3.8 load placed named: every other rung is judged as before.
+                        // The rung the Qwen3.8 load placed named: it and every rung below it are served, every
+                        // rung above it is judged as before.
                         ggml_sycl::zone_hold_fit_inputs named   = unnamed;
                         named.compute_room_n_ubatch             = 2048;
+                        // A realized check at 1024 whose own buffer was held out: that rung alone loses the credit.
+                        ggml_sycl::zone_hold_fit_inputs held    = named;
+                        held.held_out_n_ubatch                  = 1024;
                         for (uint32_t n = 32; n <= 8192; n += 32) {
-                            const size_t want = demand_before_room(before, n);
+                            const size_t want   = demand_before_room(before, n);
+                            const size_t served = n <= 2048 ? demand_credited(before, n) : want;
                             ++asked;
                             if (ggml_sycl::zone_hold_fit_demand(before, n) != want ||
                                 ggml_sycl::zone_hold_fit_demand(unnamed, n) != want ||
                                 ggml_sycl::zone_hold_fit(unnamed, n) != ggml_sycl::zone_hold_fit(before, n) ||
-                                (n != 2048 && ggml_sycl::zone_hold_fit_demand(named, n) != want)) {
+                                ggml_sycl::zone_hold_fit_demand(named, n) != served ||
+                                ggml_sycl::zone_hold_fit_demand(held, n) != (n == 1024 ? want : served)) {
                                 ++mismatches;
                             }
                         }
@@ -1958,7 +1975,9 @@ int main() {
             }
         }
         CHECK(asked == 9 * 5 * 3 * 2 * 256, "the sweep asked every rung of every configuration");
-        CHECK(mismatches == 0, "no rung but the named one is judged differently from the fit before the room");
+        CHECK(mismatches == 0,
+              "the named rung and every rung below it are credited; the held-out rung and every rung above are judged "
+              "as before the room");
     }
 
     // ---- Case 24e (a RUNTIME zone an earlier load grew): the arena reserves the larger of the floor and the
@@ -2000,6 +2019,64 @@ int main() {
               "a zone below the plan is not kept above it");
         CHECK(!ggml_sycl::zone_runtime_kept_above_plan(SIZE_MAX, floor, SIZE_MAX),
               "a saturated plan never wraps into a kept zone");
+    }
+
+    // ---- Case 24f: the -ub a hold-spill refusal names is never below a rung the zone was planned to serve. The B50 /
+    // GPT-OSS 20B MXFP4 context at -ub 1024: a planned dense scratch of about 1108 MiB of f16 dequant weight plus
+    // 9 KiB per token (1117.1 MiB at 1024, 1112.6 MiB at 512), one 808 MiB compute buffer at 1024 held outside the
+    // arena, 141.3 MiB of KV-zone room, 1622.8 MiB free before the rung, and the 404.0 MiB compute term the load
+    // measured at 512. 512 runs; the refusal at 1024 named 256. -----------------------------------------------------
+    {
+        const size_t KiB  = 1024;
+        const size_t MiB  = 1024 * KiB;
+        auto         plan = [](void *, uint32_t n_ubatch) -> size_t {
+            return size_t(11081) * 1024 * 1024 / 10 + size_t(n_ubatch) * 9 * 1024;
+        };
+        // 808.04 MiB prints as 808.0: a buffer a little over twice the 512 term, as a real one can be
+        ggml_sycl::zone_hold_rung_request rungs[] = {
+            { 1024, 808 * MiB + 40 * KiB }
+        };
+        ggml_sycl::zone_hold_fit_inputs in = {};
+        in.headroom_target                 = 256 * MiB;
+        in.free_before                     = 1622 * MiB + 819 * KiB;
+        in.kv_room                         = 141 * MiB + 307 * KiB;
+        in.rungs                           = rungs;
+        in.n_rungs                         = 1;
+        in.plan_of                         = plan;
+
+        // What production fed the fit at the refused rung: the held-out buffer had switched the room off for every
+        // rung, so the descent charged 512 its scaled buffer and named 256.
+        CHECK(!ggml_sycl::zone_hold_fit(in, 1024), "1024 does not fit: 1783.8 MiB of demand on 1622.8 MiB free");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) == 256, "with no room the descent names 256");
+
+        // The room the load planned, at the rung it measured, and the rung whose buffer was held out.
+        in.compute_room_n_ubatch = 512;
+        in.compute_room_bytes    = 404 * MiB;
+        in.held_out_n_ubatch     = 1024;
+        CHECK(!ggml_sycl::zone_hold_fit(in, 1024), "1024 stays refused: its own buffer was held out");
+        CHECK(!ggml_sycl::zone_hold_fit_terms_at(in, 1024).request_credited, "and gets no credit");
+        CHECK(ggml_sycl::zone_hold_fit_terms_at(in, 512).request_credited,
+              "512 has no record of its own and is at the room's rung: the zone holds its buffers");
+        CHECK(ggml_sycl::zone_hold_fit(in, 512), "so 512 fits: 971.3 MiB of demand leaves 651.5 MiB");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) == 512, "and the refusal names 512, the width that runs");
+
+        // The room moves to the caller's micro-batch once the load measures there: a rung below it is still credited.
+        in.compute_room_n_ubatch = 1024;
+        in.compute_room_bytes    = 808 * MiB;
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) == 512, "a rung below the room's rung keeps the credit");
+
+        // A rung's own record is compared with the room, whole or nothing, as before.
+        ggml_sycl::zone_hold_rung_request own[] = {
+            { 512, 405 * MiB }
+        };
+        in.rungs                 = own;
+        in.compute_room_n_ubatch = 512;
+        in.compute_room_bytes    = 404 * MiB;
+        in.held_out_n_ubatch     = 0;
+        CHECK(!ggml_sycl::zone_hold_fit_terms_at(in, 512).request_credited, "a record above the room is not credited");
+        // A rung above the room's rung never borrows it.
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 1024, 1, false), "above the room's rung: no credit");
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 0, 0, false), "an unknown rung: no credit");
     }
 
     // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and
