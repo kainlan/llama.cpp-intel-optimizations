@@ -669,6 +669,24 @@ size_t zone_onednn_graph_scratch_floor_bytes(uint32_t n_head_ctx_max,
                                              uint32_t n_ctx,
                                              size_t   direct_cap);
 
+// The part of a context's oneDNN Graph scratch the ONEDNN zone's Graph room cannot hold: served outside the arena.
+size_t zone_onednn_graph_uncovered_bytes(size_t demand, size_t graph_room);
+
+// The largest power of two (at least 32, not above n_ubatch) whose Graph scratch, less the zone's Graph room, plus
+// the hold's worst-case spill, leaves `free_outside` at least `headroom`. n_ubatch itself when it fits; 0 when no
+// rung does or the card is under the headroom without any of it. n_ctx comes before n_ubatch here, the reverse of
+// zone_onednn_graph_scratch_floor_bytes().
+uint32_t zone_onednn_graph_fit_largest_ub(uint32_t n_head_ctx_max,
+                                          uint32_t n_head_swa_max,
+                                          uint32_t n_swa,
+                                          uint32_t n_ctx,
+                                          uint32_t n_ubatch,
+                                          size_t   direct_cap,
+                                          size_t   graph_room,
+                                          size_t   free_outside,
+                                          size_t   headroom,
+                                          size_t   hold_spill);
+
 // llama.cpp-kpjw (r7 I3: identity by ORIGIN, not by timing): what stays live without the rung is every raw byte the
 // cache holds except the rung's OWN scheduler compute buffers (rows registered by a request flagged
 // scheduler_compute), and only when the rung's buffers are live (the realized check). A raw byte allocated after an

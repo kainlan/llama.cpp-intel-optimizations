@@ -678,6 +678,52 @@ size_t zone_onednn_graph_scratch_floor_bytes(uint32_t n_head_ctx_max,
     return static_cast<size_t>(std::max<uint64_t>(k_floor_min_bytes, modeled));
 }
 
+size_t zone_onednn_graph_uncovered_bytes(size_t demand, size_t graph_room) {
+    return demand > graph_room ? demand - graph_room : 0;
+}
+
+uint32_t zone_onednn_graph_fit_largest_ub(uint32_t n_head_ctx_max,
+                                          uint32_t n_head_swa_max,
+                                          uint32_t n_swa,
+                                          uint32_t n_ctx,
+                                          uint32_t n_ubatch,
+                                          size_t   direct_cap,
+                                          size_t   graph_room,
+                                          size_t   free_outside,
+                                          size_t   headroom,
+                                          size_t   hold_spill) {
+    constexpr uint32_t k_smallest_rung = 32;
+    auto               fits            = [&](uint32_t ub) {
+        const size_t demand =
+            zone_onednn_graph_scratch_floor_bytes(n_head_ctx_max, n_head_swa_max, n_swa, ub, n_ctx, direct_cap);
+        // The same saturating sum the non-FA check charges the hold's spill with.
+        const size_t outside =
+            zone_hold_nonfa_demand(zone_onednn_graph_uncovered_bytes(demand, graph_room), hold_spill);
+        return outside <= free_outside && free_outside - outside >= headroom;
+    };
+    if (n_ubatch == 0 || free_outside < headroom) {
+        return 0;
+    }
+    if (fits(n_ubatch)) {
+        return n_ubatch;
+    }
+    if (n_ubatch <= k_smallest_rung) {
+        return 0;
+    }
+    // The largest power of two below n_ubatch, at least the smallest rung. The demand does not fall as the
+    // micro-batch grows, so the first rung that fits going down is the largest.
+    uint32_t rung = k_smallest_rung;
+    while (rung <= (n_ubatch - 1) / 2) {
+        rung <<= 1;
+    }
+    for (; rung >= k_smallest_rung; rung >>= 1) {
+        if (fits(rung)) {
+            return rung;
+        }
+    }
+    return 0;
+}
+
 size_t zone_hold_persistent_raw(size_t raw_held, size_t compute_live, bool rung_live) {
     if (!rung_live) {
         return raw_held;

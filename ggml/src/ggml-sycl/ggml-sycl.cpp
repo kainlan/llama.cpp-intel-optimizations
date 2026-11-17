@@ -20292,6 +20292,72 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
     return false;
 }
 
+// The context's oneDNN Graph attention scratch against what the load planned: the ONEDNN zone holds the Graph room the
+// load sized for the context it was told; the part of this context's scratch above that room is served outside the
+// arena (the DIRECT path draws raw device memory, not a zone), and it must leave the card its driver headroom beside the
+// hold's worst-case spill. A context that would not is refused here, by name, instead of aborting at its first
+// oversized attention. Only the part above the room is refused: a context whose scratch outgrows the zone but fits
+// outside the arena runs, as one DIRECT request per oversized execute. No side effect, so a probe asks it too and the
+// micro-batch ladder sees the same verdict.
+static bool ggml_sycl_check_onednn_graph_scratch(int                               device,
+                                                 const ggml_sycl::placement_plan & plan,
+                                                 bool                              flash_attn_enabled,
+                                                 bool                              probe_mode,
+                                                 const ggml_sycl_hold_fit_query &  hold_query) {
+#if GGML_SYCL_DNNL
+    if (!flash_attn_enabled || !ggml_sycl::onednn_graph_allocator_enabled()) {
+        return true;
+    }
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (!cache || !cache->arena_active()) {
+        return true;
+    }
+    size_t free_mem = 0, total_mem = 0;
+    ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
+    if (total_mem == 0) {
+        return true;
+    }
+    // The free memory the non-FA check compares its demand with: the ledger's figure the hold-spill fit judges its own
+    // spill with, not a bare driver reading.
+    const size_t free_outside =
+        ggml_sycl::unified_cache_hold_free_before(device, hold_query.owner, free_mem, hold_query.rung_live);
+    const size_t   cap        = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(device);
+    // The primitive-API pair alone (the bare getter): the rest of the zone is the Graph scratch's room.
+    const size_t   pair       = ggml_sycl::unified_cache_get_planned_onednn_scratchpad_bytes_stored(device);
+    const size_t   zone       = cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN);
+    const size_t   graph_room = zone > pair ? zone - pair : 0;
+    const size_t   hold_spill = ggml_sycl_planned_scratch_hold_spill_bound(hold_query);
+    const uint32_t n_ubatch   = plan.context_n_ubatch;
+    const uint32_t n_ctx      = plan.context_n_ctx;
+    const size_t   demand     = ggml_sycl::zone_onednn_graph_scratch_floor_bytes(
+        plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, n_ubatch, n_ctx, cap);
+    const uint32_t largest = ggml_sycl::zone_onednn_graph_fit_largest_ub(
+        plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, n_ctx, n_ubatch, cap, graph_room,
+        free_outside, kSyclArenaMinExternalHeadroomBytes, hold_spill);
+    if (largest == n_ubatch) {
+        return true;
+    }
+    const double mb = 1024.0 * 1024.0;
+    GGML_SYCL_RUNTIME_TXN_REFUSAL(
+        probe_mode,
+        "[SYCL-PLAN] runtime context update rejected: the oneDNN Graph attention scratch at n_ubatch=%u n_ctx=%u "
+        "(%.1f MB, bounded by the %.1f MB DIRECT cap) exceeds the %.1f MB the load planned in the ONEDNN zone, and the "
+        "%.1f MB above it, with the hold's %.1f MB worst-case spill, would leave device %d under the %.1f MB driver "
+        "headroom (%.1f MB free); %s; or tell the load this context (-c) so it plans the zone for it\n",
+        n_ubatch, n_ctx, demand / mb, cap / mb, graph_room / mb,
+        ggml_sycl::zone_onednn_graph_uncovered_bytes(demand, graph_room) / mb, hold_spill / mb, device,
+        kSyclArenaMinExternalHeadroomBytes / mb, free_outside / mb, ggml_sycl_hold_fit_advice(largest).c_str());
+    return false;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(plan);
+    GGML_UNUSED(flash_attn_enabled);
+    GGML_UNUSED(probe_mode);
+    GGML_UNUSED(hold_query);
+    return true;
+#endif
+}
+
 // llama.cpp-ibj0: the PP MoE oneDNN scratch ring is sized at model load
 // (src/llama-model.cpp) for the loader's own inventory.n_ubatch (512 today),
 // not whatever n_ubatch the context is actually created with -- a runtime
@@ -21223,7 +21289,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     next_plan.planner_swa_full   = swa_full;
     next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
     // Keeps the published plan's context shape equal to the context's own (next_kv_info.n_ctx_is_runtime is set
-    // above) rather than the load's it was copied from; no reader reads it at runtime yet.
+    // above) rather than the load's it was copied from: the oneDNN Graph scratch check below sizes this context's
+    // scratch from it.
     const ggml_sycl::zone_context_shape context_shape = ggml_sycl::zone_plan_context_shape(
         next_kv_info.n_ctx_is_runtime, next_plan.planner_n_ctx, next_kv_info.n_ctx_context, next_plan.planner_n_ubatch,
         next_kv_info.n_ubatch_context);
@@ -21810,6 +21877,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                                             flash_attn_enabled,
                                             /*allow_replan=*/!probe_mode, probe_mode, &hold_query)) {
         return refuse("non-FA attention scratch exceeds the device's outside-arena headroom");
+    }
+    if (!ggml_sycl_check_onednn_graph_scratch(ctx->device, next_plan, flash_attn_enabled, probe_mode, hold_query)) {
+        return refuse("oneDNN Graph attention scratch exceeds the ONEDNN zone and the device's outside-arena headroom");
     }
 
     // llama.cpp-kpjw: the dense MMQ/MMVQ Q8_1 src1 buffer and the dense f16 dequant buffers are planned per
