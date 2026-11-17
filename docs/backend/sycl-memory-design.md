@@ -2633,9 +2633,8 @@ The runtime-context transaction therefore asks, right after the non-FA check
 and before anything is committed (`ggml_sycl_check_onednn_graph_scratch()`,
 `ggml-sycl.cpp`), whether that part fits outside the arena. When the
 context's Graph scratch (`zone_onednn_graph_scratch_floor_bytes()` at the
-context's own shape and the DIRECT cap) exceeds the zone's Graph room (the
-ONEDNN zone's capacity less the primitive-API pair, the bare getter), the part
-above the room, plus the hold's worst-case spill
+context's own shape and the DIRECT cap) exceeds the Graph room the zone
+guarantees it, the part above the room, plus the hold's worst-case spill
 (`ggml_sycl_planned_scratch_hold_spill_bound()`, the figure the non-FA check
 adds), must leave the 256 MiB driver headroom
 (`kSyclArenaMinExternalHeadroomBytes`) of the free memory the non-FA check
@@ -2643,9 +2642,17 @@ compares with (`unified_cache_hold_free_before()`, the cache's ledger, not a
 bare driver read). A scratch the room holds draws nothing outside the arena,
 so it fits whatever the free memory and the spill are (the hold check judges
 its own spill): a card already under the headroom still runs a micro-batch
-the room holds, and a refusal there names the largest one. The arithmetic is `zone_onednn_graph_uncovered_bytes()` and
-`zone_onednn_graph_fit_largest_ub()` (`zone-sizing.cpp`, `test-zone-sizing`
-Case 24h).
+the room holds, and a refusal there names the largest one. The arithmetic is
+`zone_onednn_graph_uncovered_bytes()` and `zone_onednn_graph_fit_largest_ub()`
+(`zone-sizing.cpp`, `test-zone-sizing` Case 24h).
+
+The guaranteed room is the ONEDNN zone's capacity less the most the pair
+admission lets the primitive-API pair grow to
+(`unified_cache_get_onednn_pp_pair_bound()`: its plan, or the capacity less
+the Graph floor when that is larger, from the snapshot the zone was sized
+from). It is not the capacity less the pair's live plan: an op's pair admitted
+into the slack above its plan is not given back, so room counted there could
+be taken from under the context this check passed.
 
 **Design choice: refuse only when the part above the zone does not fit
 outside the arena.** Refusing every context whose Graph scratch exceeds the
@@ -2660,11 +2667,14 @@ would get. The refusal names the largest power-of-two `-ub` whose part fits:
 
 ```
 [SYCL-PLAN] runtime context update rejected: the oneDNN Graph attention scratch at n_ubatch=<N> n_ctx=<C>
-(<D> MB, bounded by the <K> MB DIRECT cap) exceeds the <R> MB the load planned in the ONEDNN zone, and the
-<U> MB above it, with the hold's <H> MB worst-case spill, would leave device <d> under the 256.0 MB driver
-headroom (<F> MB free); the largest -ub that fits is about <L>, a power of two, estimated by scaling; or tell
-the load this context (-c) so it plans the zone for it
+(<D> MB, bounded by the <K> MB DIRECT cap) exceeds the <R> MB of the ONEDNN zone it is guaranteed (the zone
+less the most the primitive-API pair may grow to), and the <U> MB above it, with the hold's <H> MB worst-case
+spill, would leave device <d> under the 256.0 MB driver headroom (<F> MB free); the largest -ub that fits is
+about <L>, a power of two, estimated by scaling; or tell the load this context (-c) so it plans the zone for it
 ```
+
+The printed figures add up: `<U>` is `<D>` less `<R>`, and `<D>` is at most
+`<K>` unless the 64 MiB minimum is larger or the cap is 0 (no cap).
 
 No tool in the tree reaches this refusal on a device: `common` and
 `llama-bench` tell the load the largest context they will open, so no context

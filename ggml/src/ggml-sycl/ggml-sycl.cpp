@@ -20323,10 +20323,15 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
     const size_t free_outside =
         ggml_sycl::unified_cache_hold_free_before(device, hold_query.owner, free_mem, hold_query.rung_live);
     const size_t   cap        = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(device);
-    // The primitive-API pair alone (the bare getter): the rest of the zone is the Graph scratch's room.
-    const size_t   pair       = ggml_sycl::unified_cache_get_planned_onednn_scratchpad_bytes_stored(device);
+    // The room the Graph scratch is guaranteed: the zone less the most the pair admission lets the primitive-API pair
+    // grow to (max(its plan, capacity - floor)), not less the pair's live plan. A pair admitted later into the slack
+    // is not given back, so a room counted above the bound could be taken from under this context.
+    size_t         pair_bound = 0;
+    if (!ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound)) {
+        return true;
+    }
     const size_t   zone       = cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN);
-    const size_t   graph_room = zone > pair ? zone - pair : 0;
+    const size_t   graph_room = zone > pair_bound ? zone - pair_bound : 0;
     const size_t   hold_spill = ggml_sycl_planned_scratch_hold_spill_bound(hold_query);
     const uint32_t n_ubatch   = plan.context_n_ubatch;
     const uint32_t n_ctx      = plan.context_n_ctx;
@@ -20342,9 +20347,10 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: the oneDNN Graph attention scratch at n_ubatch=%u n_ctx=%u "
-        "(%.1f MB, bounded by the %.1f MB DIRECT cap) exceeds the %.1f MB the load planned in the ONEDNN zone, and the "
-        "%.1f MB above it, with the hold's %.1f MB worst-case spill, would leave device %d under the %.1f MB driver "
-        "headroom (%.1f MB free); %s; or tell the load this context (-c) so it plans the zone for it\n",
+        "(%.1f MB, bounded by the %.1f MB DIRECT cap) exceeds the %.1f MB of the ONEDNN zone it is guaranteed (the "
+        "zone less the most the primitive-API pair may grow to), and the %.1f MB above it, with the hold's %.1f MB "
+        "worst-case spill, would leave device %d under the %.1f MB driver headroom (%.1f MB free); %s; or tell the "
+        "load this context (-c) so it plans the zone for it\n",
         n_ubatch, n_ctx, demand / mb, cap / mb, graph_room / mb,
         ggml_sycl::zone_onednn_graph_uncovered_bytes(demand, graph_room) / mb, hold_spill / mb, device,
         kSyclArenaMinExternalHeadroomBytes / mb, free_outside / mb, ggml_sycl_hold_fit_advice(largest).c_str());
