@@ -569,7 +569,8 @@ def evaluate(backend, common, cache, zone):
     raw_gate_fn = function_body(cache, r"static bool unified_alloc_raw_gate\([^)]*\)\s*\{") or ""
     evict_at = raw_gate_fn.find("evict_and_flush(")
     results["the raw gate refuses a hold-induced spill instead of evicting weights"] = \
-        re.search(r"unified_alloc_raw_gate\(\s*req\s*,\s*alloc_size\s*,\s*hold_spill\s*\)", unified_alloc_fn) is not None and \
+        re.search(r"unified_alloc_raw_gate\(\s*req\s*,\s*alloc_size\s*,\s*hold_spill\s*\)",
+                  unified_alloc_fn) is not None and \
         0 <= raw_gate_fn.find("hold_spill") < evict_at and \
         re.search(r"if\s*\(\s*hold_spill\s*\)\s*\{[^}]*return false;", raw_gate_fn[:evict_at]) is not None
     results["the held-back request still takes the ordinary spill path"] = \
@@ -786,11 +787,13 @@ def evaluate(backend, common, cache, zone):
     results["a compute buffer the RUNTIME zone will not serve tries the KV zone before the raw gate and raw memory"] = \
         0 <= pred_at < kv_at < guard_at < raw_at and "spill_to_kv_zone_before_raw" in ua and \
         re.search(r"zone_runtime_spill_prefers_kv_zone\([^;]*zone_available\(\s*vram_zone_id::KV\s*\)", ua) is not None
-    results["a placement in the KV zone is skipped by the raw gate and the zone routing, and counts as an in-arena hold spill"] = \
+    results["a placement in the KV zone is skipped by the raw gate and the zone routing, "
+            "and counts as an in-arena hold spill"] = \
         re.search(r"unified_cache_note_planned_hold_spill\([^;]*,\s*true\s*\)\s*;", ua) is not None and \
         re.search(r"unified_cache_note_planned_hold_spill\([^;]*,\s*false\s*\)\s*;", ua) is not None and \
         len(re.findall(r"!\s*kv_placed", ua)) >= 1 and \
-        re.search(r"if\s*\(\s*!ptr\s*&&\s*!kv_spill_to_host\s*\)\s*\{\s*if\s*\(\s*!unified_alloc_raw_gate\(", ua) is not None
+        re.search(r"if\s*\(\s*!ptr\s*&&\s*!kv_spill_to_host\s*\)\s*\{\s*if\s*\(\s*!unified_alloc_raw_gate\(",
+                  ua) is not None
     kv_flag_site = backend.find('"backend-buffer-runtime-zone"')
     results["the runtime buffer allocator asks for the KV-zone-first placement"] = \
         kv_flag_site > 0 and "spill_to_kv_zone_before_raw = kv_zone_first" in backend[kv_flag_site:kv_flag_site + 1400]
@@ -1586,7 +1589,8 @@ if args.self_test:
         ("stats omit the hold spills", "teardown reports the hold spills with the scratch stats",
          (mutate_in_func(backend, r"void ggml_backend_sycl_context::log_planned_scratch_stats\(\)",
                          "hold_spills_raw=", "hold_XXXX="), common, cache, zone)),
-        ("raw gate evicts weights for a hold spill", "the raw gate refuses a hold-induced spill instead of evicting weights",
+        ("raw gate evicts weights for a hold spill",
+         "the raw gate refuses a hold-induced spill instead of evicting weights",
          (backend, common, mutate_in_func(cache, r"static bool unified_alloc_raw_gate\(",
                                           "if (hold_spill) {", "if (false) {"), zone)),
         ("held-back request never spills", "the held-back request still takes the ordinary spill path",
@@ -1733,21 +1737,33 @@ if args.self_test:
          (mutate_in_func(backend, r"static void ggml_sycl_check_graph_scratch_headroom\(",
                          "= kSyclArenaMinExternalHeadroomBytes;", "= 256ull * 1024ull * 1024ull;"), common, cache, zone)),
         # r3 design change: the KV zone before raw memory
-        ("compute buffer goes raw before the KV zone", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the raw gate and raw memory",
+        ("compute buffer goes raw before the KV zone",
+         "a compute buffer the RUNTIME zone will not serve tries the KV zone before the raw gate and raw memory",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "kv_cache->zone_alloc(vram_zone_id::KV,",
                                           "kv_cache->zone_alloc(vram_zone_id::SCRATCH,"), zone)),
-        ("KV placement not asked for", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the raw gate and raw memory",
+        ("KV placement not asked for",
+         "a compute buffer the RUNTIME zone will not serve tries the KV zone before the raw gate and raw memory",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "zone_runtime_spill_prefers_kv_zone(",
                                           "zone_runtime_XXXX("), zone)),
-        ("KV placement ignores the KV room", "a compute buffer the RUNTIME zone will not serve tries the KV zone before the raw gate and raw memory",
+        ("KV placement ignores the KV room",
+         "a compute buffer the RUNTIME zone will not serve tries the KV zone before the raw gate and raw memory",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "kv_cache->zone_available(vram_zone_id::KV), alloc_size)",
                                           "alloc_size, alloc_size)"), zone)),
-        ("raw gate runs for a KV placement", "a placement in the KV zone is skipped by the raw gate and the zone routing, and counts as an in-arena hold spill",
-         (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "if (!ptr && !kv_spill_to_host) {", "if (!kv_spill_to_host) {"), zone)),
-        ("zone routing runs for a KV placement", "a placement in the KV zone is skipped by the raw gate and the zone routing, and counts as an in-arena hold spill",
+        ("raw gate runs for a KV placement",
+         "a placement in the KV zone is skipped by the raw gate and the zone routing, "
+         "and counts as an in-arena hold spill",
+         (backend, common,
+          mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
+                         "if (!ptr && !kv_spill_to_host) {", "if (!kv_spill_to_host) {"),
+          zone)),
+        ("zone routing runs for a KV placement",
+         "a placement in the KV zone is skipped by the raw gate and the zone routing, "
+         "and counts as an in-arena hold spill",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "if (!kv_placed && req.intent.constraints.prefer_vram_zone",
                                           "if (req.intent.constraints.prefer_vram_zone"), zone)),
-        ("KV placement counted as raw", "a placement in the KV zone is skipped by the raw gate and the zone routing, and counts as an in-arena hold spill",
+        ("KV placement counted as raw",
+         "a placement in the KV zone is skipped by the raw gate and the zone routing, "
+         "and counts as an in-arena hold spill",
          (backend, common, mutate_after(cache, "bool kv_placed = false;", "true);", "false);"), zone)),
         ("buffer allocator does not ask for the KV zone", "the runtime buffer allocator asks for the KV-zone-first placement",
          (mutate(backend, "spill_to_kv_zone_before_raw = kv_zone_first", "spill_to_kv_zone_before_raw = false"), common, cache, zone)),
