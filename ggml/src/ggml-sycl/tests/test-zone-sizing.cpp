@@ -24,6 +24,7 @@
 #include "compute-alloc-scope.hpp"
 #include "tlsf-allocator.hpp"
 #include "unified-types.hpp"
+#include "zone-raw-gate.hpp"
 #include "zone-sizing.hpp"
 #include "zone-used-count.hpp"
 
@@ -2334,6 +2335,72 @@ int main() {
         }
         CHECK(used[ZONE_KV].load() == 0 && used[ZONE_WEIGHT].load() == 0 && shared.used() == 0 && records.empty(),
               "interleaved allocations and frees did not return both counters to zero");
+    }
+
+    // ---- Case 35: a raw device allocation is gated on the device's physical bytes, not on zone counters ----------
+    // A raw allocation takes device memory the arena did not reserve. The arena reservation is committed whole, so what
+    // the device has left for a raw request is its total less the arena, less the raw rows already held outside it,
+    // less what was in use outside this process's accounting when the first cache was created. A gate that read zone
+    // counters instead let a raw request past an arena whose zones were empty but whose bytes were all reserved.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_raw_gate_fits;
+        using ggml_sycl::zone_raw_gate_free_outside_arena;
+        using ggml_sycl::zone_raw_gate_inputs;
+
+        // the B50 GPT-OSS load: 16304 MiB device, 14292 MiB arena, 381 MiB in use before the first cache
+        zone_raw_gate_inputs b50;
+        b50.device_total       = 16304 * MiB;
+        b50.arena_bytes        = 14292 * MiB;
+        b50.raw_held           = 0;
+        b50.outside_accounting = 381 * MiB;
+        const size_t b50_free  = 16304 * MiB - 14292 * MiB - 381 * MiB;
+        CHECK(zone_raw_gate_free_outside_arena(b50) == b50_free, "the free figure is not total - arena - outside");
+        CHECK(zone_raw_gate_fits(b50, 5 * MiB), "a small raw request next to the B50 arena was refused");
+        CHECK(zone_raw_gate_fits(b50, b50_free), "a request of exactly the free bytes was refused");
+        CHECK(!zone_raw_gate_fits(b50, b50_free + 1), "a request one byte past the free bytes was admitted");
+
+        // the bytes outside this process's accounting are part of the figure: the same request flips with the term
+        zone_raw_gate_inputs no_outside = b50;
+        no_outside.outside_accounting   = 0;
+        CHECK(zone_raw_gate_fits(no_outside, b50_free + 200 * MiB), "without the term the larger request must fit");
+        CHECK(!zone_raw_gate_fits(b50, b50_free + 200 * MiB), "the term outside the accounting was not counted");
+
+        // raw rows already held outside the arena lower what is left
+        zone_raw_gate_inputs held = b50;
+        held.raw_held             = 1000 * MiB;
+        CHECK(zone_raw_gate_free_outside_arena(held) == b50_free - 1000 * MiB, "the raw rows held were not counted");
+        CHECK(zone_raw_gate_fits(b50, 700 * MiB) && !zone_raw_gate_fits(held, 700 * MiB),
+              "a request that fit before 1000 MiB of raw rows still fits after them");
+
+        // an arena of two chunks reserves both: the figure takes their sum, and a request that clears one is refused
+        const size_t         chunks[] = { 16384 * MiB, 13468 * MiB };
+        zone_raw_gate_inputs two_chunk;
+        two_chunk.device_total = 31104 * MiB;
+        two_chunk.arena_bytes  = chunks[0] + chunks[1];
+        CHECK(zone_raw_gate_free_outside_arena(two_chunk) == 1252 * MiB, "the two-chunk arena was not counted whole");
+        CHECK(!zone_raw_gate_fits(two_chunk, 2000 * MiB), "a request that clears only the first chunk was admitted");
+
+        // saturating: an arena larger than the device, or held bytes that would wrap, leave nothing, never a wrap
+        zone_raw_gate_inputs over;
+        over.device_total = 1000 * MiB;
+        over.arena_bytes  = 2000 * MiB;
+        CHECK(zone_raw_gate_free_outside_arena(over) == 0 && !zone_raw_gate_fits(over, 1),
+              "an arena larger than the device wrapped the figure");
+        zone_raw_gate_inputs wrap = b50;
+        wrap.raw_held             = SIZE_MAX - 10 * MiB;
+        CHECK(zone_raw_gate_free_outside_arena(wrap) == 0 && !zone_raw_gate_fits(wrap, 1),
+              "the raw rows held wrapped the sum");
+        wrap.raw_held           = 0;
+        wrap.outside_accounting = SIZE_MAX;
+        CHECK(zone_raw_gate_free_outside_arena(wrap) == 0, "the term outside the accounting wrapped the sum");
+
+        // an unknown device total gates nothing
+        zone_raw_gate_inputs unknown;
+        unknown.arena_bytes        = 14292 * MiB;
+        unknown.outside_accounting = 381 * MiB;
+        CHECK(zone_raw_gate_free_outside_arena(unknown) == SIZE_MAX && zone_raw_gate_fits(unknown, SIZE_MAX),
+              "an unknown device total gated a request");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
