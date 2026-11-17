@@ -567,6 +567,10 @@ struct zone_hold_fit_inputs {
     size_t                         ring_bytes  = 0;
     uint32_t                       compute_room_n_ubatch = 0;
     size_t                         compute_room_bytes    = 0;
+    // The rung whose own compute buffer the hold kept outside the arena (the realized check's rung, when its record
+    // shows such a spill), 0 for none. The zone did not serve that rung's buffer, so the room is not credited there.
+    // Every other rung keeps the credit the plan gives it.
+    uint32_t                       held_out_n_ubatch     = 0;
 };
 
 // The worst-case compute-buffer request at `n_ubatch`: the rung's own measured record when it has one (and only
@@ -575,14 +579,24 @@ struct zone_hold_fit_inputs {
 // is recorded: the demand is then the plan alone, a lower bound.
 size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
-// Whether the RUNTIME zone was planned to serve `request` at `n_ubatch` beside the hold: the rung is the one the plan
-// sized a compute room for, and the request is no larger than that room. Whole or nothing: a request above the room
-// gets no part of it. It can over-credit a rung whose compute buffers span several chunks, because the request is the
-// rung's largest single buffer (zone_hold_fit_request) while the room is a sum of per-chunk peaks that the other
-// chunks draw on too. The bound has the same limit, since it charges one request rather than the rung's chunks. The
-// credit at the load's planning micro-batch (placement_plan_compute_room) shares the limit, since its room is the
-// same summed term.
-bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request);
+// Whether the RUNTIME zone was planned to serve the rung's compute buffers beside the hold. The zone holds the compute
+// term the load measured at compute_room_n_ubatch, so a rung at or below that one is served: with its own measured
+// request (`own_record`), when the request is no larger than the room (whole or nothing); without one, always,
+// because compute buffers grow with the micro-batch and a smaller rung's are no larger than the measured ones. A
+// request scaled from another rung is an estimate and does not refuse a rung the zone was planned for. Never the rung
+// whose own buffer was held out, never a rung above the room's, never n_ubatch 0.
+//
+// It can over-credit a rung whose compute buffers span several chunks, because the request is the rung's largest
+// single buffer (zone_hold_fit_request) while the room is a sum of per-chunk peaks that the other chunks draw on too.
+// The bound has the same limit, since it charges one request rather than the rung's chunks. The credit at the load's
+// planning micro-batch (placement_plan_compute_room) shares the limit, since its room is the same summed term.
+bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in,
+                                         uint32_t                     n_ubatch,
+                                         size_t                       request,
+                                         bool                         own_record);
+
+// Whether the rung has a measured request of its own among the records.
+bool zone_hold_fit_rung_has_record(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
 // The raw (outside-arena) demand the hold can cause at the rung: zone_hold_spill_raw_demand over
 // zone_hold_spill_bound(plan, the rung's request) and the KV room, plus the ring bytes neither the planned room nor a
@@ -677,7 +691,7 @@ bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size
 
 // The micro-batch the planned compute term was measured at, as the loads on a device record it, one store per
 // inventory intake (a load's early plan and late intake carry the same inventory, so its repeat store keeps an equal
-// value and changes nothing): the hold-spill fit credits the term at that rung only. The first load's value stands
+// value and changes nothing): the hold-spill fit credits the term at that rung and below. The first load's value stands
 // while later loads agree. A load that names a different one turns the record off for good
 // (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the term was not measured at is the defect the
 // record prevents, and once off it never reads as a shape again. A load naming 0, or naming the mark itself, changes

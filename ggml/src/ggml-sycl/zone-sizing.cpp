@@ -566,8 +566,27 @@ size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch)
     return scaled;
 }
 
-bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request) {
-    return n_ubatch != 0 && n_ubatch == in.compute_room_n_ubatch && request <= in.compute_room_bytes;
+bool zone_hold_fit_rung_has_record(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    if (!in.rungs) {
+        return false;
+    }
+    for (size_t i = 0; i < in.n_rungs; ++i) {
+        if (in.rungs[i].n_ubatch == n_ubatch) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in,
+                                         uint32_t                     n_ubatch,
+                                         size_t                       request,
+                                         bool                         own_record) {
+    if (n_ubatch == 0 || in.compute_room_n_ubatch == 0 || n_ubatch > in.compute_room_n_ubatch ||
+        n_ubatch == in.held_out_n_ubatch) {
+        return false;
+    }
+    return !own_record || request <= in.compute_room_bytes;
 }
 
 zone_hold_fit_terms zone_hold_fit_terms_at(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
@@ -580,7 +599,8 @@ zone_hold_fit_terms zone_hold_fit_terms_at(const zone_hold_fit_inputs & in, uint
     // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch. One
     // the zone was planned to serve is not held back, so it spills nothing; the plan stays in the bound as it is.
     t.request          = zone_hold_fit_request(in, n_ubatch);
-    t.request_credited = zone_hold_fit_rung_has_compute_room(in, n_ubatch, t.request);
+    t.request_credited = zone_hold_fit_rung_has_compute_room(in, n_ubatch, t.request,
+                                                             zone_hold_fit_rung_has_record(in, n_ubatch));
     t.kv_room          = in.kv_room;
     t.ring_uncovered   = in.ring_bytes;
     const size_t spill = zone_hold_spill_raw_demand(

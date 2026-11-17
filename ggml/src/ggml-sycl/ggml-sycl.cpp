@@ -19904,13 +19904,14 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device);
     // The micro-batch the published single-device plan sized this device's RUNTIME zone for: the explicit one it
     // placed, or else the load's planning micro-batch, the shape the load measured the compute term at. The zone holds
-    // that term beside the micro-batch's ring and dense scratch, so the fit credits a request of that rung no larger
-    // than the term (whole or nothing). Every other rung is judged as before.
+    // that term beside the micro-batch's ring and dense scratch, so the fit credits that rung and every rung below it
+    // (zone_hold_fit_rung_has_compute_room). Every rung above it is judged as before.
     {
         const auto room_plan     = ggml_sycl_global_plan_owner();
         uint32_t   room_n_ubatch = 0;
-        // The realized check has the rung's own record: a request the hold kept outside the arena is charged. The read
-        // copies the counters and resets nothing, so the realized refusal still reports them.
+        // The realized check has the rung's own record: a request the hold kept outside the arena means the zone did
+        // not serve this rung, so the fit charges it here and nowhere else. The read copies the counters and resets
+        // nothing, so the realized refusal still reports them.
         bool       held_out      = false;
         if (q.rung_live) {
             ggml_sycl::planned_hold_spill_totals totals;
@@ -19919,9 +19920,10 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
         }
         const size_t room_bytes = ggml_sycl::placement_plan_compute_room(
             *room_plan, q.device, ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device),
-            ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device), held_out, &room_n_ubatch);
+            ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device), &room_n_ubatch);
         in.compute_room_n_ubatch = room_n_ubatch;
         in.compute_room_bytes    = room_bytes;
+        in.held_out_n_ubatch     = held_out ? q.n_ubatch : 0;
     }
     a.terms                 = ggml_sycl::zone_hold_fit_terms_at(in, q.n_ubatch);
     a.demand                = a.terms.demand;

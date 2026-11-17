@@ -2891,10 +2891,13 @@ The room does not grow for the compute buffers. The RUNTIME zone's fixed part
 holds the compute term the load measured at its planning shape, `n_ctx_train`
 and ubatch 512 (`llama.cpp-fkpg`), and the placed micro-batch's ring and dense
 scratch sit beside it. So once the plan has placed the micro-batch, the
-hold-spill fit credits a compute buffer of that rung no larger than the term,
-whole or nothing (`placement_explicit_ubatch_compute_room()` and
-`zone_hold_fit_rung_has_compute_room()`). Every other rung, the auto trial's
-included, is judged as before. Without the credit the fit charges the buffer as
+hold-spill fit credits that rung and every rung below it
+(`placement_explicit_ubatch_compute_room()` and
+`zone_hold_fit_rung_has_compute_room()`): a rung's own measured buffer when it
+is no larger than the term, whole or nothing, and a rung without a record of
+its own always, since compute buffers grow with the micro-batch. The rung whose
+own buffer the hold kept outside the arena gets no credit; a rung above the
+room's rung gets none either. Without the credit the fit charges the buffer as
 if the hold kept it out of the zone. On the B70 with Qwen3.8 at `-ub 2048` that
 refused the context: 1993.8 MiB of worst-case spill against 1946.2 MiB free
 outside the arena, although the zone held the 1960 MiB buffer beside a term of

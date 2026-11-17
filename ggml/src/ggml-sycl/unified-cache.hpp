@@ -1040,14 +1040,12 @@ struct placement_plan;
 // plan that named no micro-batch, the zone was sized at the load's planning micro-batch, the shape the load measured
 // the compute term at, which the caller passes as `planning_n_ubatch`: the plan's planner_n_ubatch is the context's
 // micro-batch, rewritten by every runtime context transaction, so it cannot say what the load measured. The fit
-// credits that one rung only (zone_hold_fit_rung_has_compute_room). 0 with *n_ubatch 0 for a multi-device plan,
-// another device, a planning micro-batch of 0, a named micro-batch the plan did not place, and when `held_out` says
-// the rung already recorded a request outside the arena: a measured spill overrules the plan.
+// credits that rung and every rung below it (zone_hold_fit_rung_has_compute_room). 0 with *n_ubatch 0 for a
+// multi-device plan, another device, a planning micro-batch of 0 and a named micro-batch the plan did not place.
 size_t placement_plan_compute_room(const placement_plan & plan,
                                    int                    device,
                                    size_t                 compute_term,
                                    uint32_t               planning_n_ubatch,
-                                   bool                   held_out,
                                    uint32_t *             n_ubatch);
 
 // Whether a context announces the load's explicit micro-batch placement at WARN: it is the first non-probe context
@@ -2716,7 +2714,7 @@ bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_
 bool             unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
 size_t           unified_cache_get_planned_compute_term_bytes(int device_id);
 // The micro-batch the planned compute term was measured at on the device, for the hold-spill fit to credit the term
-// at that rung only (placement_plan_compute_room). Each load records its planning micro-batch, the inventory's
+// at that rung and below (placement_plan_compute_room). Each load records its planning micro-batch, the inventory's
 // n_ubatch, through zone_compute_term_n_ubatch_store: a load that disagrees with an earlier one turns the record off
 // for the rest of the process, with one WARN naming both values. The stored value is the measure's shape only while
 // inventory.n_ubatch and llama_auto_ubatch_ladder[0] (the measure's n_ubatch) agree; a source pin holds the two to one
