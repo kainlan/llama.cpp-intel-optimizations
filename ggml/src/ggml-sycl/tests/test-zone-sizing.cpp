@@ -25,10 +25,14 @@
 #include "tlsf-allocator.hpp"
 #include "unified-types.hpp"
 #include "zone-sizing.hpp"
+#include "zone-used-count.hpp"
 
+#include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // The build is -DNDEBUG (Release), so assert() would compile away and the
@@ -2209,6 +2213,127 @@ int main() {
         const uint64_t top[] = { SIZE_MAX };
         CHECK(!ggml_sycl::zone_compute_term_bytes(top, 1, 128, &term), "a chunk the rounding wraps was accepted");
         CHECK(!ggml_sycl::zone_compute_term_bytes(nullptr, 1, 128, &term), "a null chunk list was accepted");
+    }
+
+    // ---- Case 34: each arena zone counts its own bytes over a shared allocator ----------------------------------
+    // KV and WEIGHT share one TLSF in a single-chunk arena. A counter that stored the allocator's total gave WEIGHT the
+    // KV bytes, and a WEIGHT free stored into KV's counter never lowered WEIGHT: a freed model read as live WEIGHT
+    // bytes and refused the next load's zone rebuild. Each counter moves by the allocator's own delta, a free lowers
+    // the zone the allocation was recorded under, and the counters of the zones sharing the allocator sum to its
+    // used(). The record and the free below have the shape unified_cache::zone_free() has: the zone comes from the
+    // exact allocation's record, looked up by offset, and the zone the caller names only finds the record.
+    {
+        constexpr int             ZONE_KV     = 0;
+        constexpr int             ZONE_WEIGHT = 1;
+        const size_t              grain       = ggml_sycl::tlsf_allocator::block_grain;
+        ggml_sycl::tlsf_allocator shared(1024 * grain);
+        std::atomic<size_t>       used[2];
+        used[ZONE_KV].store(0);
+        used[ZONE_WEIGHT].store(0);
+        std::vector<std::pair<size_t, int>> records;  // offset -> the zone the allocation was charged to
+
+        auto alloc_in = [&](int zone, size_t size) {
+            const size_t offset = ggml_sycl::zone_used_allocate(shared, used[zone], size, 64);
+            if (offset != SIZE_MAX) {
+                records.emplace_back(offset, zone);
+            }
+            return offset;
+        };
+        // The caller's zone finds nothing here: the record says whose counter the block was added to.
+        auto free_named = [&](int caller_zone, size_t offset) {
+            (void) caller_zone;
+            for (size_t i = 0; i < records.size(); ++i) {
+                if (records[i].first == offset) {
+                    const int record_zone = records[i].second;
+                    records.erase(records.begin() + static_cast<std::ptrdiff_t>(i));
+                    ggml_sycl::zone_used_free(shared, offset, used[record_zone]);
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto sum_is_used = [&] {
+            return used[ZONE_KV].load() + used[ZONE_WEIGHT].load() == shared.used();
+        };
+
+        // a WEIGHT free lowers WEIGHT, and leaves KV holding only KV's bytes
+        const size_t w = alloc_in(ZONE_WEIGHT, 64 * grain);
+        CHECK(w != SIZE_MAX && used[ZONE_WEIGHT].load() == 64 * grain && used[ZONE_KV].load() == 0,
+              "a WEIGHT allocation was not charged to WEIGHT alone");
+        const size_t k = alloc_in(ZONE_KV, 16 * grain);
+        CHECK(k != SIZE_MAX && used[ZONE_KV].load() == 16 * grain && used[ZONE_WEIGHT].load() == 64 * grain,
+              "a KV allocation on the shared allocator took WEIGHT's bytes into KV's counter");
+        CHECK(sum_is_used(), "the two counters do not sum to the shared allocator's used()");
+        CHECK(free_named(ZONE_WEIGHT, w), "the WEIGHT record was lost");
+        CHECK(used[ZONE_WEIGHT].load() == 0, "a WEIGHT free did not lower WEIGHT to zero");
+        CHECK(used[ZONE_KV].load() == 16 * grain, "a WEIGHT free changed KV's counter");
+        CHECK(sum_is_used(), "after the WEIGHT free the counters do not sum to used()");
+        CHECK(free_named(ZONE_KV, k) && used[ZONE_KV].load() == 0 && shared.used() == 0, "the KV free left bytes");
+
+        // the counter takes what the allocator took, block rounding included, not the requested size
+        const size_t odd = alloc_in(ZONE_WEIGHT, 100);
+        CHECK(odd != SIZE_MAX && used[ZONE_WEIGHT].load() == ggml_sycl::tlsf_allocator::round_request(100, 64) &&
+                  used[ZONE_WEIGHT].load() == grain && used[ZONE_WEIGHT].load() == shared.used(),
+              "the counter was charged the requested size instead of the allocator's delta");
+        const size_t odd_kv = alloc_in(ZONE_KV, grain + 1);
+        CHECK(odd_kv != SIZE_MAX && used[ZONE_KV].load() == 2 * grain && sum_is_used(),
+              "a rounded KV request was not charged as the allocator rounded it");
+        CHECK(free_named(ZONE_WEIGHT, odd) && free_named(ZONE_KV, odd_kv), "the rounded records were lost");
+        CHECK(used[ZONE_WEIGHT].load() == 0 && used[ZONE_KV].load() == 0 && shared.used() == 0,
+              "a rounded block did not come back off its counter whole");
+
+        // a free named with the other zone of the shared allocator lowers the zone the record names
+        const size_t w2 = alloc_in(ZONE_WEIGHT, 8 * grain);
+        const size_t k2 = alloc_in(ZONE_KV, 4 * grain);
+        CHECK(w2 != SIZE_MAX && k2 != SIZE_MAX, "the wrong-zone fixture did not allocate");
+        CHECK(free_named(ZONE_KV, w2), "the WEIGHT record named as KV was not found");
+        CHECK(used[ZONE_WEIGHT].load() == 0 && used[ZONE_KV].load() == 4 * grain,
+              "a WEIGHT block freed under the KV name lowered KV instead of WEIGHT");
+        CHECK(free_named(ZONE_WEIGHT, k2), "the KV record named as WEIGHT was not found");
+        CHECK(used[ZONE_KV].load() == 0 && used[ZONE_WEIGHT].load() == 0 && shared.used() == 0,
+              "a KV block freed under the WEIGHT name lowered WEIGHT instead of KV");
+
+        // a free the allocator does not recognise, and an allocation it refuses, move no counter
+        const size_t w3 = alloc_in(ZONE_WEIGHT, 2 * grain);
+        CHECK(w3 != SIZE_MAX && free_named(ZONE_WEIGHT, w3), "the double-free fixture did not allocate and free");
+        ggml_sycl::zone_used_free(shared, w3, used[ZONE_WEIGHT]);
+        CHECK(used[ZONE_WEIGHT].load() == 0 && shared.used() == 0, "a second free of a block moved the counter");
+        CHECK(ggml_sycl::zone_used_allocate(shared, used[ZONE_KV], 2048 * grain, 64) == SIZE_MAX,
+              "an allocation larger than the allocator succeeded");
+        CHECK(used[ZONE_KV].load() == 0, "a refused allocation was charged");
+
+        // interleaved allocations and frees of both zones: the sum holds after every step, and both counters end at 0
+        std::vector<size_t> live;
+        const size_t        sizes[] = { 3 * grain, 100, 7 * grain + 5, grain, 33 * grain, 2 * grain - 1 };
+        for (int round = 0; round < 3; ++round) {
+            for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+                const int    zone   = (i + static_cast<size_t>(round)) % 2 == 0 ? ZONE_WEIGHT : ZONE_KV;
+                const size_t offset = alloc_in(zone, sizes[i]);
+                CHECK(offset != SIZE_MAX, "an interleaved allocation failed");
+                live.push_back(offset);
+                CHECK(sum_is_used(), "an interleaved allocation broke the sum");
+                if (live.size() % 3 == 0) {
+                    // free the middle one, named by the other zone than the one it was charged to
+                    const size_t victim = live[live.size() / 2];
+                    int          named  = ZONE_KV;
+                    for (const auto & r : records) {
+                        if (r.first == victim) {
+                            named = r.second == ZONE_KV ? ZONE_WEIGHT : ZONE_KV;
+                        }
+                    }
+                    CHECK(free_named(named, victim), "an interleaved record was lost");
+                    live.erase(live.begin() + static_cast<std::ptrdiff_t>(live.size() / 2));
+                    CHECK(sum_is_used(), "an interleaved free broke the sum");
+                }
+            }
+        }
+        while (!live.empty()) {
+            CHECK(free_named(ZONE_WEIGHT, live.back()), "a remaining record was lost");
+            live.pop_back();
+            CHECK(sum_is_used(), "a closing free broke the sum");
+        }
+        CHECK(used[ZONE_KV].load() == 0 && used[ZONE_WEIGHT].load() == 0 && shared.used() == 0 && records.empty(),
+              "interleaved allocations and frees did not return both counters to zero");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
