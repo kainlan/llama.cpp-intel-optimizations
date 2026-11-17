@@ -2086,6 +2086,11 @@ int main() {
         CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 1024 * MiB, 200 * MiB, 256 * MiB,
                                                300 * MiB) == 2048,
               "a scratch inside the room fits whatever the hold's spill");
+        // The cap binds: 32 heads at n_ctx 32768 and 512 rows model 3 GiB, bounded by the 1 GiB cap, and the load
+        // planned the room at that same bound, so the demand equals the room and nothing is drawn outside the arena.
+        CHECK(zone_onednn_graph_fit_largest_ub(32, 0, 0, 512, 32768, 1024 * MiB, 1024 * MiB, 200 * MiB, 256 * MiB, 0) ==
+                  512,
+              "a demand the cap bounds to the room fits on a card under the headroom");
         // 192 MiB of room on a card under the headroom: 2048 and 1024 draw outside the arena and are refused; 512
         // (192 MiB) lies inside the room and is named.
         CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 192 * MiB, 200 * MiB, 256 * MiB, 0) ==
