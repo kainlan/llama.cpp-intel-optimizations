@@ -5226,6 +5226,10 @@ if (NOT WIN32)
     )
 endif()
 
+# A tool's entry function runs under common_tool_entry (common/tool-entry.h), which turns an escaped exception into
+# an error line and status 1. Pure host test: no device, no model.
+llama_build_and_test(test-tool-entry.cpp)
+
 # llama.cpp-7n6n: unit tests for tuning-cache-io.hpp (JSON I/O, atomic
 # writes, XDG cache-dir resolution, and -- as of this task -- the "ubatch"
 # entry kind wired for the persisted auto n_ubatch cache: UbatchCacheKey/
