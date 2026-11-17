@@ -283,11 +283,19 @@ void test_cards_peer_path_follows_the_link_records() {
         test_sycl_info_override_guard info_guard(info);
         CHECK(!test_cards_have_peer_path(), "cards in separate contexts have no peer path");
     }
+    // Each direction alone, so a read of only one direction of the pair cannot pass.
+    ggml_sycl_device_info reverse_only               = info;
+    reverse_only.peer_links[1][0].same_sycl_context  = true;
+    reverse_only.peer_links[1][0].l0_can_access_peer = true;
+    {
+        test_sycl_info_override_guard info_guard(reverse_only);
+        CHECK(!test_cards_have_peer_path(), "peer access from the second card only is no peer path");
+    }
     info.peer_links[0][1].same_sycl_context  = true;
     info.peer_links[0][1].l0_can_access_peer = true;
     {
         test_sycl_info_override_guard info_guard(info);
-        CHECK(!test_cards_have_peer_path(), "peer access one way only is no peer path");
+        CHECK(!test_cards_have_peer_path(), "peer access from the first card only is no peer path");
     }
     info.peer_links[1][0].same_sycl_context    = true;
     info.peer_links[1][0].direct_copy_measured = true;
