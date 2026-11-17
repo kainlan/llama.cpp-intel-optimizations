@@ -8,6 +8,8 @@
 //
 //  * install finds the plan staged for a load, at the probe stage and at the
 //    candidate stages, and refuses a load with none;
+//  * the loader's staged-plan query answers from the install's own lookup, an
+//    explicit no-plan row included;
 //  * under the override the global plan accessors answer from it, on this thread
 //    only, and clear restores the real answers;
 //  * a nest is refused and leaves the outer override in place;
@@ -100,6 +102,29 @@ void test_install_finds_the_staged_plan() {
           "a probe plan is not found as a candidate");
     CHECK(!ggml_backend_sycl_measure_plan_override_install_kv(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
           "a candidate plan is not found as a probe plan");
+}
+
+// The loader's query answers from the install's own lookup: false where the install would refuse for want of a
+// plan, true where it would find one. An explicit no-plan row (the VRAM arena off) is no plan.
+void test_staged_query_matches_the_install() {
+    constexpr uint64_t NONE_TXN    = 41003;
+    constexpr uint64_t NO_PLAN_TXN = 41004;
+    CHECK(!ggml_backend_sycl_measure_plan_staged(NONE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE), "nothing staged: probe");
+    CHECK(!ggml_backend_sycl_measure_plan_staged(NONE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B),
+          "nothing staged: candidate");
+    CHECK(ggml_backend_sycl_measure_plan_staged(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE), "probe plan found");
+    CHECK(!ggml_backend_sycl_measure_plan_staged(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C),
+          "a probe plan is not a candidate");
+    CHECK(ggml_backend_sycl_measure_plan_staged(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B), "candidate found");
+    CHECK(!ggml_backend_sycl_measure_plan_staged(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE),
+          "a candidate is not a probe plan");
+    lifecycle_stage_no_placement_plan(NO_PLAN_TXN);
+    CHECK(!ggml_backend_sycl_measure_plan_staged(NO_PLAN_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B),
+          "an explicit no-plan row reads as a plan");
+    CHECK(
+        !ggml_backend_sycl_measure_plan_override_install_kv(NO_PLAN_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, nullptr),
+        "control: the install refuses the same row");
+    lifecycle_abort_placement_plan(NO_PLAN_TXN);
 }
 
 void test_accessors_follow_the_override() {
@@ -342,6 +367,7 @@ void test_probe_plan_goes_with_the_candidate() {
 int main() {
     setenv("GGML_SYCL_STRICT_LEASES", "0", 1);
     test_install_finds_the_staged_plan();
+    test_staged_query_matches_the_install();
     test_accessors_follow_the_override();
     test_nest_is_refused();
     test_publish_is_refused_under_the_override();

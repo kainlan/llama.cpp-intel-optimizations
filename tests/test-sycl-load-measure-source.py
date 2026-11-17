@@ -9,6 +9,9 @@ one measure-only context over a load's placement. This gate pins, on comment-str
   the context is constructed, so on every exit the override clears first, then the context goes, then the
   backends; a `llama_measure_unsupported` is caught before the generic catch and is `unsupported`, not a
   refusal;
+- the run asks the backend whether a plan is staged for its stage (`llama_load_measure_plan_absent`) before it
+  builds the guard, and a stage with none is `unsupported`, so the install never refuses a load for a plan the
+  early pass could not stage;
 - every refusal goes through the one `[LOAD-PLAN] compute-slot measure failed at ... (refused)` text, which
   occurs once in src/;
 - the shape is the auto-ubatch ladder's bottom rung (no literal 512) and the caller's n_ctx (the training
@@ -72,6 +75,10 @@ _RUN = (
     "const llama_measure_override_procs & procs, uint32_t n_ctx, uint64_t load_txn, "
     "enum ggml_sycl_measure_stage stage, int first_device)"
 )
+_PLAN_ABSENT_BLOCK = (
+    "if (const char * why = llama_load_measure_plan_absent(procs, load_txn, stage); why != nullptr) { "
+    "out.unsupported = true; out.refusal = llama_load_measure_refusal_text(stage, first_device, why); return out; }"
+)
 _LATE = (
     "llama_late_check_result llama_load_late_check(const llama_model & model, uint32_t n_ctx, "
     "struct ggml_sycl_load_txn txn, const std::vector<llama_measure_dummy_entry> & weights)"
@@ -125,6 +132,8 @@ def run_ok(code: str) -> bool:
     b = function_body(code, _RUN)
     order = [
         "llama_measure_unsupported_reason(model)",
+        # a stage with no plan staged is unsupported, asked before the guard so the install never refuses it
+        _PLAN_ABSENT_BLOCK,
         "std::unique_ptr<llama_context> holder;",
         # llama.cpp-p6i0: the params come first, so the override re-fits the plan's KV for their KV shape
         "const llama_context_params params = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train);",
@@ -145,10 +154,38 @@ def run_ok(code: str) -> bool:
     if z("llama_measure_context_args") in b[b.index("{") :]:
         return False
     # unsupported is its own outcome, never a refusal
-    if b.count(z("out.unsupported = true;")) != 2:
+    if b.count(z("out.unsupported = true;")) != 3:
         return False
     # a refusal is never built outside the one text
     return b.count(z("out.refusal = ")) == b.count(z("llama_load_measure_refusal_text(")) and "[LOAD-PLAN]" not in b
+
+
+_PLAN_ABSENT = (
+    "inline const char * llama_load_measure_plan_absent(const llama_measure_override_procs & procs, "
+    "uint64_t load_txn, enum ggml_sycl_measure_stage stage)"
+)
+_OVERRIDE_PROCS = "llama_measure_override_procs llama_context_sycl_measure_override_procs(ggml_backend_dev_t dev)"
+
+
+def plan_absent_ok(code: str) -> bool:
+    """The query is asked only when the backend has it: a backend without it leaves the install to answer."""
+    b = function_body(code, _PLAN_ABSENT)
+    return (
+        z("if (procs.staged == nullptr || procs.staged(load_txn, stage)) { return nullptr; }") in b
+        and b.count("procs.install") == 0
+        and z('"no placement plan is staged for this load at this stage') in b
+    )
+
+
+def override_procs_ok(code: str, sycl: str) -> bool:
+    """Both builds take the query from the backend, the DL build by the name the backend's proc table answers."""
+    b = function_body(code, _OVERRIDE_PROCS)
+    return (
+        z("procs.staged = &ggml_backend_sycl_measure_plan_staged;") in b
+        and z('llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_staged")') in b
+        and z('if (strcmp(name, "ggml_backend_sycl_measure_plan_staged") == 0) '
+              "{ return (void *) ggml_backend_sycl_measure_plan_staged; }") in sycl
+    )
 
 
 def refusal_ok(code: str) -> bool:
@@ -545,8 +582,41 @@ def test_run_mutants():
         ("the shape hand-written", "llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train)", "llama_context_default_params()"),
         ("no KV shape for the re-fit", "guard(procs, load_txn, stage, &kv_shape);", "guard(procs, load_txn, stage, nullptr);"),
         ("the KV shape not the context's", "llama_load_measure_kv_shape(params);", "llama_load_measure_kv_shape(llama_context_default_params());"),
+        ("no staged-plan query", _PLAN_ABSENT_BLOCK, ""),
+        ("a missing plan read as a refusal", _PLAN_ABSENT_BLOCK, _PLAN_ABSENT_BLOCK.replace("out.unsupported = true; ", "")),
     ]:
         assert not run_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
+    # the query asked after the guard, where the install has already refused
+    moved = mutate(b, _PLAN_ABSENT_BLOCK, "")
+    moved = moved.replace(z("args.stage = stage;"), z(_PLAN_ABSENT_BLOCK) + z("args.stage = stage;"), 1)
+    assert not run_ok(code.replace(b, moved, 1)), "mutant 'the query after the guard' slipped through"
+
+
+def test_the_plan_absent_query_defers_to_a_backend_without_it():
+    code = code_of(MEASURE_H)
+    assert plan_absent_ok(code)
+    b = function_body(code, _PLAN_ABSENT)
+    for name, old, new in [
+        ("a backend without the query read as having no plan", "procs.staged == nullptr ||", "procs.staged != nullptr &&"),
+        ("the query's answer ignored", "|| procs.staged(load_txn, stage)", ""),
+        ("the install asked instead", "procs.staged(load_txn, stage)", "procs.install(load_txn, stage, nullptr)"),
+    ]:
+        assert not plan_absent_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
+
+
+def test_both_builds_take_the_query_from_the_backend():
+    code = code_of(CONTEXT_CPP)
+    sycl = code_of((ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text())
+    assert override_procs_ok(code, sycl)
+    b = function_body(code, _OVERRIDE_PROCS)
+    for name, old, new in [
+        ("the static build without the query", "procs.staged = &ggml_backend_sycl_measure_plan_staged;", ""),
+        ("the DL build looking up another name", '"ggml_backend_sycl_measure_plan_staged"', '"ggml_backend_sycl_measure_plan_staged_v0"'),
+    ]:
+        assert not override_procs_ok(code.replace(b, mutate(b, old, new), 1), sycl), f"mutant {name!r} slipped through"
+    entry = z('if (strcmp(name, "ggml_backend_sycl_measure_plan_staged") == 0) '
+              "{ return (void *) ggml_backend_sycl_measure_plan_staged; }")
+    assert not override_procs_ok(code, sycl.replace(entry, "", 1)), "mutant 'the proc table without the name' slipped through"
 
 
 def test_measure_mutants():
