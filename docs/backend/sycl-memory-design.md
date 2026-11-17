@@ -570,7 +570,9 @@ ticket reproduced on:
   `zone_onednn_graph_scratch_floor_bytes()`, `zone-sizing.cpp`),
   `floor = max(64 MiB, min(1.5 x max(n_head_ctx_max x n_ctx,
   n_head_swa_max x min(n_ctx, n_swa + n_ubatch)) x n_ubatch x
-  sizeof(f32), direct_cap))`, where
+  sizeof(f32), direct_cap))`, except that a `direct_cap` of 0 (what
+  `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB=0` sets) means no cap: the floor is
+  then `max(64 MiB, 1.5 x ...)`, the formula unbounded, not 64 MiB. Here
   the `1.5x` factor covers ~5 SDPA scratch buffers measured concurrently
   in flight even on an idle host (the quantity the zone must actually
   hold is the PEAK OUTSTANDING size across whichever of those shapes are
