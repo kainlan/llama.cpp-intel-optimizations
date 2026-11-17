@@ -30099,15 +30099,16 @@ bool unified_cache::arena_record_allocation_locked(vram_zone_id zone, void * ptr
     return true;
 }
 
-bool unified_cache::arena_unregister_exact_if_unleased_locked(vram_zone_id zone, void * ptr,
+bool unified_cache::arena_unregister_exact_if_unleased_locked(vram_zone_id   zone,
+                                                              void *         ptr,
                                                               vram_zone_id & record_zone) noexcept {
     allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
     const auto found = group.allocations.find(ptr);
     if (found == group.allocations.end() || found->second.allocation_id == 0) return false;
     const allocator_group_record & exact = found->second;
     const auto authority = arena_authority_snapshot(exact.zone);
-    if (!authority || !authority->unregister_allocation_if_unleased(static_cast<int>(exact.zone),
-                                                                     exact.allocation_id, exact.offset)) {
+    if (!authority || !authority->unregister_allocation_if_unleased(static_cast<int>(exact.zone), exact.allocation_id,
+                                                                    exact.offset)) {
         return false;
     }
     // The zone whose counter the block was charged to. The caller may name the other zone of an allocator KV and
@@ -30652,7 +30653,9 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             if (arena_offset != SIZE_MAX && arena_offset >= z.start && arena_offset < z.start + z.size) {
                 const size_t                zone_offset = arena_offset - z.start;
                 std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-                if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) return false;
+                if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) {
+                    return false;
+                }
                 arena_forget_allocation_locked(zone, ptr);
                 zone_used_free(*z.allocator, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
                 if (profile_active) {
@@ -30678,7 +30681,9 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             return false;
         }
         std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-        if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) return false;
+        if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) {
+            return false;
+        }
         arena_forget_allocation_locked(zone, ptr);
         const auto   chunk_base = reinterpret_cast<uintptr_t>(arena_chunks_[chunk_idx].ptr);
         const auto   p          = reinterpret_cast<uintptr_t>(ptr);
@@ -30708,7 +30713,9 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         }
         size_t                      zone_offset = arena_offset - kv.start;
         std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-        if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) return false;
+        if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) {
+            return false;
+        }
         arena_forget_allocation_locked(zone, ptr);
         zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
         if (profile_active) {
@@ -30730,7 +30737,9 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     size_t zone_offset = arena_offset - z.start;
 
     std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-    if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) return false;
+    if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) {
+        return false;
+    }
     arena_forget_allocation_locked(zone, ptr);
     zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
     if (profile_active) {
