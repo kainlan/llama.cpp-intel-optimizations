@@ -2432,6 +2432,19 @@ def _caller_passes_cap(cache: str, sig: str, device: str, cap_stmt: str) -> bool
     return _call_argument_lists(body, PAIR_AND_FLOOR) == [[device, var]] and cap_stmt in body
 
 
+DIRECT_ALLOC_SIG = "void * unified_cache::onednn_graph_scratch_alloc_direct_locked("
+MEMBER_DIRECT_CAP = "onednn_graph_scratch_direct_cap()"
+
+
+def _direct_failure_log_floor_uses_the_cache_cap(cache: str) -> bool:
+    """The DIRECT-failure error prints the floor this cache's zone holds: the published shape bounded by the cache's
+    own cap, the same cap the message prints beside it. Any other cap logs a floor the zone was not sized for."""
+    if not _has_function(cache, DIRECT_ALLOC_SIG):
+        return False
+    calls = _call_argument_lists(_body_of(cache, DIRECT_ALLOC_SIG), GRAPH_FLOOR_CALL)
+    return calls == [_shape_var_args("shape") + [MEMBER_DIRECT_CAP]]
+
+
 def _graph_floor_cap_checks(cache: str, zone: str) -> dict:
     return {
         "delegates": _floor_delegates_to_the_pure_function(cache),
@@ -2439,6 +2452,7 @@ def _graph_floor_cap_checks(cache: str, zone: str) -> dict:
         "pair": _planned_pair_takes_the_cap_and_looks_no_cache_up(cache),
         "ensure": _caller_passes_cap(cache, ENSURE_ZONES_SIG, "dev_id", ENSURE_CAP_STMT),
         "getter": _caller_passes_cap(cache, WITH_FLOOR_GETTER_SIG, "device_id", GETTER_CAP_STMT),
+        "direct_failure_log": _direct_failure_log_floor_uses_the_cache_cap(cache),
     }
 
 
@@ -2458,6 +2472,10 @@ def test_graph_floor_is_the_pure_function_bounded_by_the_device_cap() -> None:
         "dispatcher splits each execute against, or the zone holds Graph scratch no execute uses"
     )
     assert results["getter"], f"the with-floor getter must pass {DEVICE_DIRECT_CAP} to {PAIR_AND_FLOOR}()"
+    assert results["direct_failure_log"], (
+        f"the DIRECT-failure error must log {GRAPH_FLOOR_CALL}() of the published shape with {MEMBER_DIRECT_CAP}, "
+        "the floor this cache's zone was sized with"
+    )
 
 
 def _assert_only_cap_check_fails(cache: str, zone: str, failing: str, why: str) -> None:
@@ -2502,6 +2520,9 @@ def test_graph_floor_cap_checks_have_bounded_mutation_witnesses() -> None:
 
     mutant = _mutate_in_function(cache, FLOOR_SWA_SIG, call, call.replace("direct_cap)", "0)"))
     _assert_only_cap_check_fails(mutant, zone, "delegates", "the cap dropped on the way to the pure function")
+
+    mutant = _mutate_in_function(cache, DIRECT_ALLOC_SIG, f"shape.n_ctx, {MEMBER_DIRECT_CAP})", "shape.n_ctx, 0)")
+    _assert_only_cap_check_fails(mutant, zone, "direct_failure_log", "the logged floor sized with no cap known")
 
 
 if __name__ == "__main__":
