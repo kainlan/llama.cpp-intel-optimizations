@@ -130,24 +130,31 @@ Consequences worth knowing before you reach for this flag:
   request true. The peer-link dump and probe variables also turn the two on.
 - **What turns the path on.** The path is active when the variable is non-zero, two or more GPUs are present, the
   placement plan puts experts on a second card, and at least one secondary queue initialised. A plan that keeps every
-  expert on the first card, or a secondary init that fails, leaves it off (a failed secondary init clears it).
+  expert on the first card, or a secondary init that fails, leaves it off (a failed secondary init clears it). No
+  model that loads reaches this state today: the plan that would turn the path on is refused at the load stage (next
+  bullet), so the path stays off.
 - **Refused without a peer path.** The load stage asks whether every pair of GPUs has a direct peer path both ways,
-  from the peer-link records the planner reads (one SYCL context, and peer access reported or a direct copy
-  measured). A pair whose link was never queried counts as none, and the cards on this host have none. A plan that
-  wants the path on such a host is refused before any weight is placed, in the early and in the late planning pass,
-  with the plan-rejected load result and the ERROR line `[MOE-MULTI-GPU] load refused: the plan puts experts on a
-  second card and the cards have no peer path; unset GGML_SYCL_MOE_MULTI_GPU to load with the single-card plan`.
-  Unset the variable (or set it to 0) to load the model with every expert on one card. A two-card plan for a model
-  without experts is not refused.
+  from the peer-link records the planner reads (one SYCL context, and peer access reported or a direct copy measured).
+  Init records each card in its own SYCL context (`same_sycl_context` is false for any two different cards, also when
+  the device query fails, because the secondary queues use single-device contexts) and nothing sets
+  `direct_copy_measured`, so no pair of cards has a peer path, even after the Level Zero peer query has run with the
+  opt-in set. On every multi-card host today a plan that puts experts on a second card is therefore refused under the
+  opt-in. A plan that wants the path on such a host is refused before any weight is placed, in the early and in the
+  late planning pass, with the plan-rejected load result and the ERROR line `[MOE-MULTI-GPU] load refused: the plan
+  puts experts on a second card and the cards have no peer path; unset GGML_SYCL_MOE_MULTI_GPU to load with the
+  single-card plan`. Unset the variable (or set it to 0) to load the model with every expert on one card. A two-card
+  plan for a model without experts is not refused.
 - **Routing tensors.** With a non-zero value on two or more GPUs, whether or not a plan puts experts on a second card,
   the MoE's int32 routing tensors (the argsort output and the `ffn_moe_topk` views) become cross-device control tensors
   held in shared host-control storage. The first one creates a shared context across the cards, and the log shows
   `[SYCL-CONTROL] Created shared host-control context for N GPUs` (or a `[SYCL-CONTROL]` WARN when a card lacks host
   USM and the fallback context is used).
-- **Where routing runs.** While the path is active, a MoE router logits matmul, GLU or routing subgraph is not
-  declined to the host backend, so those ops stay on the device.
+- **Where routing runs.** While the path is active (no model that loads reaches that today, see the refusal above), a
+  MoE router logits matmul, GLU or routing subgraph is not declined to the host backend, so those ops stay on the
+  device.
 - **What is off or refused while it is active.** Each needs the path active, so each also needs two or more GPUs and
-  a plan with experts on a second card:
+  a plan with experts on a second card, and none is reached today because that plan is refused at the load stage
+  (see the refusal above):
   - oneDNN prompt processing for the MoE is refused (`REFUSED_MOE_MULTI_GPU` in the placement decision);
   - MoE fusion is off (`[MOE-FUSION] Disabled under planned or multi-device residency`; a plan alone also turns it off);
   - the MXFP4 int8 grouped route for the MoE down projection is not taken;
