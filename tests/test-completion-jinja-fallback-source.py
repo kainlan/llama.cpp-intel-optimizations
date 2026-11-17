@@ -13,6 +13,10 @@ load with "this custom template is not supported, try using --jinja". The wiring
     helper says the matcher cannot render it, it sets params.use_jinja = true and says so at LOG_WRN. Raw mode (-no-cnv)
     does not apply the template, and there use_jinja also decides whether the prompt gets a BOS, so it is left alone.
 
+(C) llama-mtmd-cli has the same defect (its default is the built-in matcher too) and gets the same decision in the
+    mtmd_cli_context constructor, between common_chat_templates_init() and the first other read of params.use_jinja
+    (the member copy, the example print). It always applies the template, so there is no conversation-mode term.
+
 Host-only, pure text assertions. llama_test_pytest hands this file to pytest.main(), so the checks live inside test_*()
 functions. Checks run against COMMENT-STRIPPED text, and each has a mutation witness so it is known to fail on the
 regression it guards.
@@ -27,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPLETION_CPP = (ROOT / "tools/completion/completion.cpp").read_text()
 CHAT_H = (ROOT / "common/chat.h").read_text()
 CHAT_CPP = (ROOT / "common/chat.cpp").read_text()
+MTMD_CLI_CPP = (ROOT / "tools/mtmd/mtmd-cli.cpp").read_text()
 
 _LEXEME_RE = re.compile(
     r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
@@ -150,6 +155,51 @@ def violations_helper(chat_h: str, chat_cpp: str) -> list[str]:
     return found
 
 
+MTMD_CTOR_START = "mtmd_cli_context(common_params & params)"
+MTMD_INIT = "common_chat_templates_init("
+
+
+def mtmd_ctor_body(code: str) -> str:
+    """The constructor of mtmd_cli_context: from its signature to the first closing brace indented by one level."""
+    s = code.find(MTMD_CTOR_START)
+    assert s != -1, f"{MTMD_CTOR_START!r} not found in tools/mtmd/mtmd-cli.cpp"
+    e = code.find("\n    }\n", s)
+    assert e != -1, "could not find the end of the mtmd_cli_context constructor"
+    return code[s:e]
+
+
+def violations_mtmd(cpp: str) -> list[str]:
+    found: list[str] = []
+    body = mtmd_ctor_body(strip_comments(cpp))
+    blk = fallback_block(body)
+    if blk is None:
+        return ["the mtmd_cli_context constructor has no `if (... " + HELPER + "(...)) { ... }` fallback block"]
+    s, b, e = blk
+    cond = norm(body[s:b])
+    for term in ("!params.use_jinja", HELPER + "("):
+        if term not in cond:
+            found.append(f"the mtmd fallback condition does not name {term!r}: {cond}")
+    block = norm(body[b : e + 1])
+    if not re.search(r"params\.use_jinja\s*=\s*true\s*;", block):
+        found.append("the mtmd fallback block does not set params.use_jinja = true")
+    if "LOG_WRN(" not in block:
+        found.append("the mtmd fallback block must say it switched engines at LOG_WRN (LOG_INF is dropped by default)")
+    init = body.find(MTMD_INIT)
+    if init == -1:
+        found.append(MTMD_INIT + " not found in the mtmd_cli_context constructor")
+    elif s < init:
+        found.append("the mtmd fallback block lies before the templates are created")
+    early = [m.start() for m in re.finditer(r"use_jinja", body) if m.start() < s]
+    if early:
+        found.append("use_jinja is read before the mtmd fallback block: " + norm(body[early[0] - 40 : early[0] + 60]))
+    copy = re.search(r"\buse_jinja\s*=\s*params\.use_jinja\s*;", body)
+    if not copy:
+        found.append("the member copy `use_jinja = params.use_jinja;` was not found")
+    elif s > copy.start():
+        found.append("the mtmd fallback block lies after the member copy of use_jinja")
+    return found
+
+
 # ---------------------------------------------------------------------------
 # mutations (applied to raw source, so a mutated file is what a regression would look like)
 # ---------------------------------------------------------------------------
@@ -203,6 +253,33 @@ def move_before_resolution(raw: str) -> str:
     return rest[: m.start()] + block + "\n\n" + rest[m.start() :]
 
 
+def mtmd_block_span(raw: str):
+    m = re.search(r"if \(\s*!params\.use_jinja\b[^{]*" + HELPER + r"\([^{]*\{", raw)
+    assert m, "mtmd fallback block not found in raw source"
+    return m.start(), match_brace(raw, m.end() - 1) + 1
+
+
+def mtmd_drop_helper(raw: str) -> str:
+    s, e = mtmd_block_span(raw)
+    block, n = re.subn(r"\s*&&\s*" + HELPER + r"\(tmpls\.get\(\)\)", "", raw[s:e], count=1)
+    assert n == 1
+    return raw[:s] + block + raw[e:]
+
+
+def mtmd_move_after_copy(raw: str) -> str:
+    s, e = mtmd_block_span(raw)
+    block = raw[s:e]
+    rest = raw[:s] + raw[e:]
+    m = re.search(r"use_jinja = params\.use_jinja;\n", rest)
+    assert m, "member copy not found"
+    return rest[: m.end()] + block + "\n" + rest[m.end() :]
+
+
+def mtmd_warn_to_info(raw: str) -> str:
+    s, e = mtmd_block_span(raw)
+    return raw[:s] + raw[s:e].replace("LOG_WRN", "LOG_INF") + raw[e:]
+
+
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
@@ -254,6 +331,23 @@ def test_nothing_reads_use_jinja_between_template_creation_and_the_block():
     window = body[created : blk[0]]
     assert "use_jinja" not in window, "use_jinja is read before the fallback decides it"
     assert "g_params" not in window, "g_params->use_jinja may be read before the fallback decides it"
+
+
+def test_mtmd_cli_switches_to_jinja_when_the_matcher_cannot_render():
+    assert violations_mtmd(MTMD_CLI_CPP) == []
+
+
+@pytest.mark.parametrize(
+    "name, mutate",
+    [
+        ("drop helper term", mtmd_drop_helper),
+        ("move block after the member copy", mtmd_move_after_copy),
+        ("LOG_WRN to LOG_INF", mtmd_warn_to_info),
+    ],
+)
+def test_mtmd_cli_gate_has_a_witness(name, mutate):
+    assert violations_mtmd(MTMD_CLI_CPP) == [], "the unmutated source must pass first"
+    assert violations_mtmd(mutate(MTMD_CLI_CPP)), name
 
 
 if __name__ == "__main__":

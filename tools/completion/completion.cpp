@@ -185,7 +185,7 @@ int llama_completion(int argc, char ** argv) {
 
     // The built-in matcher knows a fixed list of templates. A model whose template is not on that list can only be
     // rendered by the jinja engine, so choose it here, once, before anything reads params.use_jinja. Raw mode does
-    // not apply the template, and there the engine choice also decides whether the prompt gets a BOS, so leave it.
+    // not apply the template, so the engine is left as the user set it there.
     if (params.conversation_mode && params.enable_chat_template && !params.use_jinja &&
         common_chat_templates_need_jinja(chat_templates.get())) {
         LOG_WRN(
