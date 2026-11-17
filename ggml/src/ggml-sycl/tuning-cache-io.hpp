@@ -878,7 +878,8 @@ inline UbatchCacheKey ubatch_key_from_json(const std::string & json) {
     k.swa_full        = parse_bool(json, "swa_full");
 
     // An entry written before the field existed has no key for it. Read it as the value no picker stores, so it
-    // misses instead of passing for a model with no experts. A value that is not a number or is past 32 bits is a damaged file, read the same.
+    // misses instead of passing for a model with no experts. A value that is not a number or is past 32 bits is a
+    // damaged file, read the same.
     k.moe_row_ceiling = parse_u32_or(json, "moe_row_ceiling", UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
     return k;
 }
