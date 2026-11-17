@@ -2630,7 +2630,8 @@ names no zone and so draws raw device memory outside the arena, and which
 aborts the process when the card has none left.
 
 The runtime-context transaction therefore asks, right after the non-FA check
-and before anything is committed (`ggml_sycl_check_onednn_graph_scratch()`,
+and before the dense scratch is re-planned
+(`ggml_sycl_check_onednn_graph_scratch()`,
 `ggml-sycl.cpp`), whether that part fits outside the arena. When the
 context's Graph scratch (`zone_onednn_graph_scratch_floor_bytes()` at the
 context's own shape and the DIRECT cap) exceeds the Graph room the zone
@@ -2661,8 +2662,10 @@ with one DIRECT request, whenever the load's hint was smaller.
 
 The check stands aside when flash attention is off (the non-FA check above
 covers that path) and when the Graph allocator is disabled
-(`GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0`). It has no side effect, so an
-auto-ubatch probe asks it too and the ladder sees the verdict a real context
+(`GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0`). On a real transaction the optional
+layout copies have already yielded by then, as for the non-FA refusal. It has
+no side effect beyond the free-memory reading the non-FA check also takes, so
+an auto-ubatch probe asks it too and the ladder sees the verdict a real context
 would get. The refusal names the largest power-of-two `-ub` whose part fits:
 
 ```
