@@ -2610,6 +2610,15 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
     )
+    # The runtime-context refusal of a oneDNN Graph attention scratch the load did not plan: where the transaction
+    # calls it, when it stands aside, that a probe asks it, and that the refusal names a -ub. Host-only text checks.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-onednn-graph-scratch-refusal-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120
+    )
     # llama.cpp-o65k: dispatch-tuning JSON becomes opt-in via
     # GGML_SYCL_DISPATCH_TUNING_JSON (no more unconditional /tmp default and
     # per-start WARN).
