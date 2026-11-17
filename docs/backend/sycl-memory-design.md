@@ -787,8 +787,10 @@ ticket reproduced on:
   executes whose scratch fits half of
   `unified_cache_onednn_graph_scratch_direct_cap_bytes()`, the cap this
   allocator enforces (`fattn-onednn-chunk.hpp`). A full chunk's buffer and
-  the shorter last chunk's buffer then fit under the cap together, so each
-  chunk goes through the bounded wait rather than the early-out. The
+  the shorter last chunk's buffer then fit under the cap together, unless
+  one query row alone exceeds half of it (the chunks are then one row each,
+  and two of them can exceed the cap together), so each chunk goes through
+  the bounded wait rather than the early-out. The
   early-out stays reachable when one query row alone exceeds the cap, and
   at a cap of 0.
 - **Pool completion checks go through a host-visible flag written by a

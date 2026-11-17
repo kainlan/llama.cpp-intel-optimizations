@@ -2031,8 +2031,8 @@ int main() {
     }
 
     // ---- Case 24g: the oneDNN Graph floor, bounded by the dispatcher's chunk budget. Each execute is split to half
-    // the DIRECT cap, so a full chunk and the last one of a split execute fit under the cap together: the floor does
-    // not hold more.
+    // the DIRECT cap, so a full chunk and the last one of a split execute fit under the cap together (unless one query
+    // row alone exceeds half of it, when the chunks are one row each): the floor does not hold more.
     {
         const size_t MiB = 1024 * 1024;
         using ggml_sycl::zone_onednn_graph_scratch_floor_bytes;
