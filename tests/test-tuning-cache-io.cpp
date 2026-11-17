@@ -791,6 +791,38 @@ TEST(ubatch_key_without_moe_row_ceiling_reads_as_unrecorded) {
     return true;
 }
 
+// A present but malformed value is a damaged entry, not a model with no experts: it reads as unrecorded, never as 0.
+TEST(ubatch_key_malformed_moe_row_ceiling_reads_as_unrecorded) {
+    UbatchCacheKey k;
+    k.device_key           = "Dev@1.0";
+    k.model_name           = "malformed";
+    k.n_ctx                = 4096;
+    k.n_batch              = 2048;
+    k.moe_row_ceiling      = 512;
+    const std::string good = "{" + ubatch_key_to_json(k) + "}";
+    const std::string from = "\"moe_row_ceiling\":512";
+    ASSERT(good.find(from) != std::string::npos);
+
+    const char * damaged[] = { "\"moe_row_ceiling\":-1",         "\"moe_row_ceiling\":null",
+                               "\"moe_row_ceiling\":\"512\"",    "\"moe_row_ceiling\":",
+                               "\"moe_row_ceiling\":4294967295", "\"moe_row_ceiling\":4294967296" };
+    for (size_t i = 0; i < sizeof(damaged) / sizeof(damaged[0]); ++i) {
+        std::string bad = good;
+        bad.replace(bad.find(from), from.size(), damaged[i]);
+        ASSERT(bad != good);
+        const UbatchCacheKey r = ubatch_key_from_json(bad);
+        ASSERT(r.model_name == "malformed");  // positive control: the rest of the key was read
+        ASSERT(r.moe_row_ceiling == UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
+    }
+
+    // One space after the colon is valid JSON and still reads as the stored value.
+    std::string spaced = good;
+    spaced.replace(spaced.find(from), from.size(), "\"moe_row_ceiling\": 512");
+    ASSERT(spaced != good);
+    ASSERT(ubatch_key_from_json(spaced).moe_row_ceiling == 512);
+    return true;
+}
+
 // The file-level behaviour the entry points rely on: a version 6 file written before the field loads, none of its
 // entries answers a lookup, and the entry a later store appends answers only a lookup under its own ceiling.
 TEST(ubatch_cache_file_written_before_the_ceiling_loads_and_misses) {
@@ -2086,6 +2118,7 @@ int main() {
     RUN_TEST(ubatch_key_moe_row_ceiling_decides_equality);
     RUN_TEST(ubatch_key_moe_row_ceiling_json_roundtrip);
     RUN_TEST(ubatch_key_without_moe_row_ceiling_reads_as_unrecorded);
+    RUN_TEST(ubatch_key_malformed_moe_row_ceiling_reads_as_unrecorded);
     RUN_TEST(ubatch_cache_file_written_before_the_ceiling_loads_and_misses);
     RUN_TEST(ubatch_entry_serialization);
     RUN_TEST(ubatch_cache_file_roundtrip);
