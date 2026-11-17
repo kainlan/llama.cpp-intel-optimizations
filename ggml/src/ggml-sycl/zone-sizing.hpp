@@ -673,9 +673,11 @@ size_t zone_onednn_graph_scratch_floor_bytes(uint32_t n_head_ctx_max,
 // The part of a context's oneDNN Graph scratch the ONEDNN zone's Graph room cannot hold: served outside the arena.
 size_t zone_onednn_graph_uncovered_bytes(size_t demand, size_t graph_room);
 
-// The largest power of two (at least 32, not above n_ubatch) whose Graph scratch, less the zone's Graph room, plus
-// the hold's worst-case spill, leaves `free_outside` at least `headroom`. n_ubatch itself when it fits; 0 when no
-// rung does or the card is under the headroom without any of it. n_ctx comes before n_ubatch here, the reverse of
+// The largest power of two (at least 32, not above n_ubatch) whose Graph scratch fits: either the zone's Graph room
+// holds all of it (nothing drawn outside the arena, so `free_outside`, `headroom` and `hold_spill` do not count; the
+// hold check judges its own spill), or the part above the room plus the hold's worst-case spill leaves
+// `free_outside` at least `headroom`. n_ubatch itself when it fits; 0 when no rung does. A card already under the
+// headroom still gets the largest rung inside the room. n_ctx comes before n_ubatch here, the reverse of
 // zone_onednn_graph_scratch_floor_bytes().
 uint32_t zone_onednn_graph_fit_largest_ub(uint32_t n_head_ctx_max,
                                           uint32_t n_head_swa_max,

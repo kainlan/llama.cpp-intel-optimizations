@@ -696,12 +696,17 @@ uint32_t zone_onednn_graph_fit_largest_ub(uint32_t n_head_ctx_max,
     auto               fits            = [&](uint32_t ub) {
         const size_t demand =
             zone_onednn_graph_scratch_floor_bytes(n_head_ctx_max, n_head_swa_max, n_swa, ub, n_ctx, direct_cap);
+        const size_t uncovered = zone_onednn_graph_uncovered_bytes(demand, graph_room);
+        // A scratch the room holds draws nothing outside the arena: this check has nothing to answer for, and the hold
+        // check judges its own spill.
+        if (uncovered == 0) {
+            return true;
+        }
         // The same saturating sum the non-FA check charges the hold's spill with.
-        const size_t outside =
-            zone_hold_nonfa_demand(zone_onednn_graph_uncovered_bytes(demand, graph_room), hold_spill);
+        const size_t outside = zone_hold_nonfa_demand(uncovered, hold_spill);
         return outside <= free_outside && free_outside - outside >= headroom;
     };
-    if (n_ubatch == 0 || free_outside < headroom) {
+    if (n_ubatch == 0) {
         return 0;
     }
     if (fits(n_ubatch)) {

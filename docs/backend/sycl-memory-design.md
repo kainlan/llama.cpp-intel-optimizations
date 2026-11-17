@@ -2631,15 +2631,19 @@ aborts the process when the card has none left.
 
 The runtime-context transaction therefore asks, right after the non-FA check
 and before anything is committed (`ggml_sycl_check_onednn_graph_scratch()`,
-`ggml-sycl.cpp`), whether that part fits outside the arena: the context's
-Graph scratch (`zone_onednn_graph_scratch_floor_bytes()` at the context's own
-shape and the DIRECT cap), less the zone's Graph room (the ONEDNN zone's
-capacity less the primitive-API pair, the bare getter), plus the hold's
-worst-case spill (`ggml_sycl_planned_scratch_hold_spill_bound()`, the figure
-the non-FA check adds), must leave the 256 MiB driver headroom
+`ggml-sycl.cpp`), whether that part fits outside the arena. When the
+context's Graph scratch (`zone_onednn_graph_scratch_floor_bytes()` at the
+context's own shape and the DIRECT cap) exceeds the zone's Graph room (the
+ONEDNN zone's capacity less the primitive-API pair, the bare getter), the part
+above the room, plus the hold's worst-case spill
+(`ggml_sycl_planned_scratch_hold_spill_bound()`, the figure the non-FA check
+adds), must leave the 256 MiB driver headroom
 (`kSyclArenaMinExternalHeadroomBytes`) of the free memory the non-FA check
 compares with (`unified_cache_hold_free_before()`, the cache's ledger, not a
-bare driver read). The arithmetic is `zone_onednn_graph_uncovered_bytes()` and
+bare driver read). A scratch the room holds draws nothing outside the arena,
+so it fits whatever the free memory and the spill are (the hold check judges
+its own spill): a card already under the headroom still runs a micro-batch
+the room holds, and a refusal there names the largest one. The arithmetic is `zone_onednn_graph_uncovered_bytes()` and
 `zone_onednn_graph_fit_largest_ub()` (`zone-sizing.cpp`, `test-zone-sizing`
 Case 24h).
 
