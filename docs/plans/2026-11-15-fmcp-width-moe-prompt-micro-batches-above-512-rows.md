@@ -73,8 +73,9 @@ most three at once, Opus for ownership and placement code).
 | C | W2.3, W2.4, W2.5 | Opus, xhigh | Stage 2: the packed bound, one sizing source, the planner switch |
 | L (lead) | L1, G1, G2, W3.0, W4.0 | lead | The fault hunt, the stage gates, the stage 3 spike, the stage 4 measurement |
 
-Stage 3 and stage 4 tasks are not in this document. Each is written as an amendment after its spike or measurement
-and comes to the owner for review before any implementer starts (sections "Stage 3" and "Stage 4").
+Stage 3's tasks are Amendment 3, written on 2026-11-16 after the W3.0 spike. Stage 4's tasks are not in this
+document yet: they are written as an amendment after the W4.0 measurement. Since the owner's ruling of 2026-11-16
+the lead decides each amendment's design and reports it; it no longer waits for a review before implementers start.
 
 ### Dependency Graph
 
@@ -2618,6 +2619,10 @@ Run after W2.5 merges. One device binary at a time, under `GPU.lock`, preflight 
 
 ## Stage 3: every per-context MoE structure is sized from the context
 
+**Status: the tasks are written. They are "Amendment 3 (stage 3)" at the end of this document, written from the
+W3.0 spike on 2026-11-16. The text below is the plan as it stood before the spike and is kept as the record of
+what the spike had to answer.**
+
 Stage 3's tasks are not written yet. Three facts found on 2026-11-15 block writing them to this plan's standard:
 
 - Several structures are sized once, at load or at backend start, for 512 rows: the routing control layout
@@ -2643,8 +2648,9 @@ Runs after G2. Read-only source work by one scout plus lead measurements. It ans
    and stage 4 (picker changed), so the picker's behaviour does not change by accident in stage 3.
 6. Probe mode skips step 9 of the transaction: which stage 3 sizing must also run there.
 
-The spike's output is an amendment to this plan with stage 3's tasks, written to the same standard. It comes to the
-owner for review before any implementer starts. The design it must realise is fixed (owner, section 5): the
+The spike's output is an amendment to this plan with stage 3's tasks, written to the same standard. The lead
+decides it and reports it (owner ruling 2026-11-16; before that ruling it came to the owner for review before any
+implementer started). The design it must realise is fixed (owner, section 5): the
 context-creation re-plan sizes the routing ids and compaction table, the CPU experts' workspace and the attention
 scratch from the context's row count and context size; `MOE_GPU_UBATCH_MAX` (`moe-control-plan.hpp:141-144`) is
 deleted and its three users take the context's row count; `exceeds_gpu_ubatch` goes; the tuning cache's key gains
@@ -2659,12 +2665,14 @@ owner accepts; and the measurement below.
 ### Lead task W4.0: displaced-wide against undisplaced-narrow
 
 After stage 3 merges. Interleaved pairs on GPT-OSS 20B (B50 and B70) and Qwen (B70): the widest rung that fits only
-by displacing routed experts against the widest rung that fits without. The lead brings the numbers and a proposed
-rule to the owner. The picker task is written after that gate, as an amendment. Its fixed parts (owner, section 3):
-the MoE ceiling leaves `llama_auto_ubatch_cap`'s inputs (`src/llama-auto-ubatch.h:187-205`,
-`src/llama-context.cpp:2372-2406`); an explicit `-ub` is honoured if it fits and refused with the largest width that
-fits; the tuning cache's version rises from 6 (`tuning-cache-io.hpp:119`) so winners picked under the 512 cap are not
-reused.
+by displacing routed experts against the widest rung that fits without. The lead decides the rule from the numbers
+and reports both (owner ruling 2026-11-16). The picker task is written after that measurement, as an amendment. Its
+fixed parts (owner, section 3): the MoE ceiling leaves `llama_auto_ubatch_cap`'s inputs
+(`src/llama-auto-ubatch.h:187-205`, `src/llama-context.cpp:2372-2406`); an explicit `-ub` is honoured if it fits and
+refused with the largest width that fits; winners picked under the 512 cap are not reused. That last part no longer
+needs a version change: the tuning cache's key records the row ceiling an entry was picked under (Amendment 3, task
+W3.8), so stage 4 passes its own ceiling in that field and the version stays 6. No code may store 4294967295 there:
+that value marks an entry written before the field existed.
 
 ---
 
@@ -3828,3 +3836,3933 @@ on the host and are not a verdict.
 **Left open, ticketed:** the plan can charge a layout the stager does not materialise under
 `GGML_SYCL_DISABLE_REORDER=1` or in a build without the XMX MoE kernels (llama.cpp-kboh). Staging a padded tensor
 in bulk stays llama.cpp-g7j0.
+
+---
+
+## Amendment 3 (stage 3): the tasks, written from the W3.0 spike (llama.cpp-5ova)
+
+**Status: decided by the lead on 2026-11-16 and reported to the owner.** The owner ruled the same day that the lead
+is the owner and long-term maintainer of this codebase and that its design is the lead's to decide. This amendment
+therefore replaces two sentences written before that ruling: "It comes to the owner for review before any implementer
+starts" (lead task W3.0) and, in stage 4, "the tuning cache's version rises from 6" (task W3.8 below adds a key field
+and leaves the version alone). The design it realises is the one fixed in "Stage 3" above. The rule for every task
+is the owner's: correct and monotone, no fixed number. A width either runs correctly or is refused cleanly with a
+message that names a width that does run.
+
+A second owner ruling of 2026-11-16 applies to every task here: an abort is a broken part, and a fit problem ends as
+a placement or a clean refusal, never an abort and never a fallback outside the plan. Tasks W3.2d and W3.1b exist
+because of it.
+
+### What the spike measured
+
+integ/th32 `d0118bb6c`, driver 26.44, `llama-bench -p N -n 0 -ub N -b N -r 1 -v`, one card, single runs, random
+tokens. Throughput figures are orientation, not baselines.
+
+| model, card | -ub 512 | -ub 1024 | -ub 2048 | -ub 4096 |
+|---|---|---|---|---|
+| Qwen 3.8 exps-IQ4_NL, B70 | 174.82 t/s | 267.87 t/s | 372.80 t/s, one direct oneDNN Graph scratch allocation outside the zone | refused at context creation: compute buffer 3880.0 MiB fits no tier |
+| GPT-OSS 20B, B50 | 804.63 t/s | refused; the message names "about 256" although 512 runs | refused | refused |
+
+Output at 2048 rows is checked: `llama-perplexity -c 2048 -b 2048 -ub 2048 --chunks 2` on Qwen gives
+`Final estimate: PPL = 1.7997 +/- 0.07116`, inside the 1.788 to 1.804 band of the 512-row reference.
+
+Every load printed `compute slot on device 0: probe bound ... measured at n_ctx 262144 ubatch 512, the caller's -c
+and -ub are not transported`. That is the binding defect: the load measures its compute term at micro-batch 512 and
+the model's training context whatever the caller asked. A full card then refuses every wider width, and a card with
+slack holds 2 GiB for a context nobody requested.
+
+### Scope the lead set
+
+| id | what | why |
+|---|---|---|
+| W3.1a to W3.1d | the load measures its compute term at the caller's context and micro-batch | the binding defect |
+| W3.2a to W3.2d | the oneDNN Graph scratch floor follows the context; a context the load did not plan for is refused by name | the direct fallback fires at 2048 rows, and its exhaustion is an abort today (llama.cpp-8aw1) |
+| W3.3 | the routing-ids staging follows the context's micro-batch | sized from the planning context today |
+| W3.4 | the refusal's "largest -ub that fits" never names a width below one that runs | "about 256" while 512 runs |
+| W3.5 | the 512 ceiling moves into the picker; the backend stops exporting it | one owner for the number until stage 4 removes it |
+| W3.6a, W3.6b | the control layout is sized from the context; `MOE_GPU_UBATCH_MAX` and `exceeds_gpu_ubatch` are deleted | a correctness item above 512 rows |
+| W3.7a, W3.7b | the host recipe workspace is sized in tokens of the context's micro-batch | the constant's second user |
+| W3.8a to W3.8c | the tuning-cache key records the row ceiling its entry was picked under | winners picked under 512 must not be reused |
+
+Left out on purpose:
+- The phase-4 buffers (`moe_preallocate_inference_buffers`) are outside the arena at every width, 512 included. They
+  are not a width blocker. They become planned memory in their own later task.
+- The transfer-rate probe was not refused in any run. Its task is dropped.
+
+### Decisions on the drafters' open questions
+
+1. W3.2a lands now. It does not wait for the replica rewrite of llama.cpp-23mk, because without it a Graph floor at a
+   real context shape puts idle VRAM on models whose attention oneDNN refuses (GPT-OSS sinks).
+2. No `flash_attn_hint` field is added to `llama_model_params`. A non-flash-attention context carries an idle Graph
+   floor of at most 1 GiB. That cost is accepted until a run shows a context refused because of it; a public field is
+   not added for a case nobody has met.
+3. `llama-server` with several slots: the compute term measured at the whole `-c` with one sequence is taken as the
+   bound. It is confirmed by one server run in the end-to-end validation below, not assumed.
+4. Stage 4 does not raise the tuning cache's version. It passes its own ceiling value in the key W3.8 adds. No code
+   may store 4294967295 as a ceiling: that value marks an entry written before the field existed.
+5. Every model re-runs its micro-batch ladder once on the first start after W3.8a lands. Accepted.
+
+### Team topology for stage 3
+
+One fresh implementer per task, at most three at a time, each in its own worktree and branch from integ/th32.
+Fresh spec reviewer, then fresh quality reviewer, each round. Opus for the tasks that touch placement, the load
+measure, the transaction or zone sizing (tracks L, M, G, C). Sonnet may take track D. Every build waits for the
+lead's GO for a named commit. Every device run and model load is the lead's. Crash fixes found by the no-crash
+census (llama.cpp-eb3s) take implementer slots ahead of these tasks.
+
+| track | tasks, in order | what it owns |
+|---|---|---|
+| L (load shape) | W3.1a and W3.1b, then W3.1c, then W3.1d | the load measure, the inventory tail, llama-bench's shared load |
+| M (monotone refusal) | W3.4 | the hold-spill fit's credit |
+| G (Graph scratch) | W3.2a, W3.2b, W3.2c, W3.2d; W3.3 after W3.2b | the oneDNN Graph floor, the plan's context shape, routing ids |
+| C (control) | W3.5, W3.7a, W3.7b, W3.6a, W3.6b | the 512 constant, the control layout, the recipe workspace |
+| D (tuning cache) | W3.8a, W3.8b, W3.8c (after W3.5) | the cache key |
+
+```dot
+digraph stage3 {
+    rankdir=LR;
+    "W3.1a" -> "W3.1c"; "W3.1b" -> "W3.1c"; "W3.1c" -> "W3.1d";
+    "W3.2a" -> "W3.2b"; "W3.2b" -> "W3.2c"; "W3.2c" -> "W3.2d"; "W3.2b" -> "W3.3";
+    "W3.5" -> "W3.6a"; "W3.7a" -> "W3.6a"; "W3.7a" -> "W3.7b"; "W3.6a" -> "W3.6b"; "W3.7b" -> "W3.6b";
+    "W3.8a" -> "W3.8b"; "W3.8b" -> "W3.8c"; "W3.5" -> "W3.8c";
+    "W3.4";
+}
+```
+
+Files that several tracks edit. Tasks in different tracks may run at the same time, but they merge one at a time,
+and each task is checked with `git merge-tree` against integ/th32 before its last review round:
+
+| file | tracks | note |
+|---|---|---|
+| `ggml/src/ggml-sycl/unified-cache.cpp`, function `populate_host_zone_sizing` | G (routing ids, Graph shape), C (control layout, recipe workspace) | separate hunks of one function |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp`, the runtime context transaction | G (W3.2b, W3.2d), C (W3.7b, W3.6b) | separate hunks of one function; W3.6b adds a pending term to the ring admission that W3.2d's check sits beside |
+| `ggml/src/ggml-sycl/zone-sizing.hpp` and `.cpp` | L (W3.1b), M (W3.4), G (new functions appended) | appended functions conflict textually: merge G's tasks in order |
+| `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` | L, M, G | new cases after Case 24c: the same |
+| `src/llama-context.cpp` | L (the measure functions), C (W3.5, the picker's ceiling), D (W3.8b, W3.8c) | distant regions |
+| `tests/test-sycl-auto-ubatch-source.py` | C (W3.5), D (W3.8b, W3.8c) | distant regions |
+| `tests/test-sycl-explicit-ubatch-placement-source.py` | L, M | re-run after each merge |
+| `docs/backend/sycl-env-vars.md` | C (one row), D (two rows) | adjacent rows |
+
+First tasks to start, as slots allow: W3.8a (started 2026-11-16), W3.5, W3.4, W3.1a, W3.1b, W3.2a.
+
+### How the lead runs the gates below
+
+The drafted gate commands show the bare binary and `tee` into `/tmp`. The lead runs each through the run wrapper
+(GPU.lock, the VRAM tenant check, the `Shmem` guard at 100 GB, the kernel log capture) with
+`GGML_SYCL_TUNING_CACHE=0` unless the gate is about the cache, one run each, and keeps the logs in the durable
+scratchpad and then in `docs/plans/data/`. A gate that names a log in `/tmp` means that run's captured log.
+
+### End-to-end validation for stage 3 (lead, after the last task merges)
+
+All on integ/th32 after a rebuild, one run each, pinned selectors, no `-ngl`, no shrunk context:
+
+1. Qwen 3.8 on the B70 at `-ub 512`, 1024, 2048 and 4096 (`llama-bench -p N -n 0 -ub N -b N -r 1 -v`): each width
+   prints its row, or is refused with a message that names a width, and that named width prints its row. No width
+   that printed a row before stage 3 is refused after it. The load line names the caller's context and micro-batch.
+   No `onednn_graph_scratch_direct` external allocation at any width that runs.
+2. Qwen 3.8 perplexity at the widest width that runs (`-c N -b N -ub N --chunks 2`): `Final estimate` inside 1.788
+   to 1.804.
+3. GPT-OSS 20B on the B50 at `-ub 1024`: a row, or a refusal naming a width of at least 512.
+4. GPT-OSS 20B on the B50, `llama-bench -p 512,2048 -n 0 -ub 512 -b 512`: one load, two rows.
+5. One `llama-server` start on the B70 with Qwen, `-c 8192 -np 2`, and one completion request: the load line names
+   context 8192, the request returns text, no refusal.
+6. The Mistral completion gate and the GPT-OSS B50 chat gate from `CLAUDE.md`, verbatim.
+7. Kernel log clean after every run.
+
+Stage 3 is done when 1 to 7 pass and every source pin registered at the merge head passes.
+
+The three parts below are the drafted tasks, each with its own open questions, lead gates and file ownership table.
+
+---
+
+### Part L, M and G: Stage 3, part "the load plan uses the shape the caller asked for" (W3.1 to W3.4)
+
+These tasks make the load measure its compute term, size its oneDNN Graph scratch and its routing ids at the
+context and micro-batch the caller named, and make a refusal name a width that runs. Tree: `integ/th32` at `d0118bb6c`.
+
+Terms used below:
+- **Compute term**: the bytes the load reserves in the RUNTIME zone for the scheduler's compute buffers. The load
+  measures them by building a measure-only context (`llama_load_measure_run`) three times: probe, admitted, late.
+- **Hint**: `llama_model_params::n_ctx_hint` and `n_ubatch_hint`, the context and micro-batch the caller is about to
+  create. `common` and `llama-bench` already fill both. The SYCL inventory already carries them as
+  `n_ctx_context` and `n_ubatch_context`.
+- **Planning shape**: `inventory.n_ubatch = 512; inventory.n_ctx = inventory.n_ubatch;` at
+  `src/llama-model.cpp:464-465`. It sizes KV planning and several zones. These tasks leave it alone (W3.5 to W3.7
+  belong to another drafter).
+- **Hold-spill fit**: the one function (`zone_hold_fit`, `ggml/src/ggml-sycl/zone-sizing.cpp:599-601`) that decides
+  whether a micro-batch's compute buffers, kept out of the RUNTIME zone by the planned dense scratch, leave the card
+  its 256 MB driver headroom. Its refusal names "the largest -ub that fits".
+
+The fkpg constraints, checked against this tree:
+- **c-z3qo** (do not fill the placement envelope's `n_ctx`): still holds. `llama_model_sycl_make_placement_envelope()`
+  (`src/llama-model.cpp:271-278`) sets `n_ctx 0, n_ubatch 0`, and the planner reads `envelope->n_ubatch` at
+  `unified-cache.cpp:36704` and `:38181`. These tasks never touch the envelope. The measures read the hint through
+  one resolver (W3.1a) instead of the envelope, so `planner_n_ubatch` and the KV planning shape do not move.
+- **c-sc3u** (a Graph floor at a real context shape puts idle VRAM on models whose attention oneDNN refuses): still
+  holds. The oneDNN SDPA gate refuses sinks (`fattn-onednn.cpp:116-117`, `if (params.sinks)`), but the floor's head
+  maxima (`src/llama-model.cpp:603-628`) count every head-dim-eligible layer, sinks or not. GPT-OSS has sinks on every
+  layer, so a floor at `n_ctx 4096, ubatch 512` would hold about 805 MB it never uses. The replica rewrite that would
+  fix this has not landed. W3.2a fixes the head maxima first; W3.2c raises the floor only after it.
+- **c-4lx9** (the zone floor and the dispatcher's chunk budget must read one number): the dispatcher splits each
+  execute to half the DIRECT cap (`fattn-onednn.cpp:1199`). W3.2c bounds the floor by that cap.
+
+---
+
+### Task W3.1a: one resolver names the shape the load measures at
+
+**Track:** L
+**Depends on:** none
+**File scope:**
+- Modify: `src/llama-load-measure.h:200-216` (after `llama_load_measure_n_ctx`, before `llama_load_measure_context_params`; find it by `inline uint32_t llama_load_measure_n_ctx(`)
+- Modify: `tests/test-load-measure-guards.cpp:316-322` (`test_measure_n_ctx`) and its `main` call list
+
+**Description:**
+
+Today the load measures its compute term at `n_ctx_train` and micro-batch 512, whatever the caller asked. This task
+adds the pure function that says which shape a load measures at, from the two hints. It changes no behavior: W3.1c
+makes the measures use it. Rules:
+- n_ctx: the caller's context, padded to 256 as `llama_context` pads it. `LLAMA_N_CTX_HINT_DEFAULT` (a caller that
+  names no `-c`) and 0 (no hint at all, as in an API caller that never sets one) both give `n_ctx_train`, today's value.
+- n_ubatch: the caller's micro-batch, or the auto ladder's bottom rung (`llama_auto_ubatch_ladder[0]`, 512) for 0.
+  Clamped to n_ctx, because `llama_context` clamps a causal micro-batch to the context.
+
+The resolver reuses `llama_n_ctx_hint_resolve` (`src/llama-n-ctx-hint.h`), the one place the hint is resolved, so the
+KV room and the compute term read one context.
+
+**Acceptance Criteria:**
+- [ ] `llama_load_measure_shape_resolve(4096, 1024, 262144)` is `{4096, 1024}`.
+- [ ] `(0, 0, 262144)` and `(LLAMA_N_CTX_HINT_DEFAULT, 0, 262144)` are `{262144, llama_auto_ubatch_ladder[0]}`.
+- [ ] `(4000, 0, 262144)` gives n_ctx 4096 (padded as the KV room pads it).
+- [ ] `(512, 2048, 262144)` gives n_ubatch 512 (clamped to the context).
+- [ ] `test-load-measure-guards` passes (lead build and run).
+
+**Implementation Guide:**
+
+1. **RED.** In `tests/test-load-measure-guards.cpp`, add after `test_measure_n_ctx()` (ends at line 322):
+
+```cpp
+// The shape a load measures its compute term at: the caller's context and micro-batch, from the two hints, with the
+// training context and the ladder's bottom rung where the caller names none. One resolver, so the KV room, the
+// measure and the micro-batch the backend credits the term at read one shape.
+static void test_measure_shape_resolve() {
+    const llama_load_measure_shape named = llama_load_measure_shape_resolve(4096, 1024, 262144);
+    CHECK(named.n_ctx == 4096 && named.n_ubatch == 1024, "the caller's shape was replaced: %u %u", named.n_ctx,
+          named.n_ubatch);
+    const llama_load_measure_shape none = llama_load_measure_shape_resolve(0, 0, 262144);
+    CHECK(none.n_ctx == 262144 && none.n_ubatch == llama_auto_ubatch_ladder[0],
+          "no hint must keep the training context and the ladder's bottom rung: %u %u", none.n_ctx, none.n_ubatch);
+    const llama_load_measure_shape dflt = llama_load_measure_shape_resolve(LLAMA_N_CTX_HINT_DEFAULT, 0, 262144);
+    CHECK(dflt.n_ctx == 262144 && dflt.n_ubatch == llama_auto_ubatch_ladder[0],
+          "the default context is the training context: %u %u", dflt.n_ctx, dflt.n_ubatch);
+    CHECK(llama_load_measure_shape_resolve(4000, 0, 262144).n_ctx == 4096,
+          "the measure's context is padded as the context pads it");
+    CHECK(llama_load_measure_shape_resolve(512, 2048, 262144).n_ubatch == 512,
+          "a micro-batch above the context is clamped to it, as llama_context clamps it");
+    CHECK(llama_load_measure_shape_resolve(0, 0, 0).n_ubatch == llama_auto_ubatch_ladder[0],
+          "an unknown training context never clamps the micro-batch to 0");
+}
+```
+
+   Add `test_measure_shape_resolve();` to `main` right after the `test_measure_n_ctx();` call
+   (`cat tests/test-load-measure-guards.cpp | grep -n 'test_measure_n_ctx();'`).
+
+   Build and run: `./scripts/sycl-build.sh test-load-measure-guards`, then
+   `source /opt/intel/oneapi/setvars.sh --force && ./build/bin/test-load-measure-guards; echo rc=$?`.
+   Expected before GREEN: the build fails with `'llama_load_measure_shape' was not declared` (or "use of undeclared
+   identifier 'llama_load_measure_shape_resolve'").
+
+2. **GREEN.** In `src/llama-load-measure.h`, add `#include "llama-n-ctx-hint.h"` beside the other includes at the
+   top (check first: `cat src/llama-load-measure.h | grep -n '#include'`). Then insert right after the closing brace
+   of `llama_load_measure_n_ctx` (line 204):
+
+```cpp
+// The shape a load-time measure runs at, from the hints the caller gave the load (llama_model_params::n_ctx_hint and
+// n_ubatch_hint). n_ctx is the context the KV room is held for (llama_n_ctx_hint_resolve, padded as llama_context
+// pads it), or the training context when the caller names none or gives no hint. n_ubatch is the caller's
+// micro-batch, or the auto ladder's bottom rung for none, the rung a MoE model's auto pick stays at; it is clamped to
+// n_ctx because llama_context clamps a causal micro-batch to its context. The measure's params, the reservation, the
+// record and the micro-batch the backend credits the term at all read this one shape.
+struct llama_load_measure_shape {
+    uint32_t n_ctx    = 0;
+    uint32_t n_ubatch = 0;
+};
+
+inline llama_load_measure_shape llama_load_measure_shape_resolve(uint32_t n_ctx_hint,
+                                                                 uint32_t n_ubatch_hint,
+                                                                 uint32_t n_ctx_train) {
+    llama_load_measure_shape shape;
+    shape.n_ctx             = llama_load_measure_n_ctx(llama_n_ctx_hint_resolve(n_ctx_hint, n_ctx_train).n_ctx_context,
+                                                       n_ctx_train);
+    const uint32_t n_ubatch = n_ubatch_hint != 0 ? n_ubatch_hint : llama_auto_ubatch_ladder[0];
+    shape.n_ubatch          = shape.n_ctx != 0 ? std::min(n_ubatch, shape.n_ctx) : n_ubatch;
+    return shape;
+}
+```
+
+   Run the build and the binary again. Expected: `rc=0`. Then run the pins this header feeds, unchanged in this task:
+   `python3 tests/test-sycl-load-measure-source.py` and `python3 tests/test-sycl-ctx-hint-default-source.py`.
+   Expected: all pass. If `test-sycl-ctx-hint-default-source.py` counts readers of `LLAMA_N_CTX_HINT_DEFAULT`, the new
+   code does not spell the sentinel, so its owner set is unchanged.
+
+**Commit:**
+
+```bash
+git commit -m "llama: one resolver names the context and micro-batch a load measures its compute term at" -- \
+    src/llama-load-measure.h tests/test-load-measure-guards.cpp
+```
+
+**Gotchas:**
+- `llama_auto_ubatch_ladder` must be visible in `llama-load-measure.h`. It already is: `llama_load_measure_context_params`
+  reads it. `std::min` needs `<algorithm>`, which the header already uses for `std::max`.
+- Do not change `llama_load_measure_context_params` here. W3.1c changes its signature together with its callers;
+  doing it here breaks the build of `llama-context.cpp`.
+- A non-causal model (embeddings) does not clamp `n_batch` to `n_ctx`. The clamp then understates nothing that
+  matters here: the measure context is causal by default (`llama_context_default_params`).
+
+---
+
+### Task W3.1b: the compute term's micro-batch record restarts when no load holds a term
+
+**Track:** L
+**Depends on:** none
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/zone-sizing.hpp:676-705` (`k_zone_compute_term_n_ubatch_disagreed`, `zone_compute_term_n_ubatch_store`; find by `inline uint32_t zone_compute_term_n_ubatch_store(`)
+- Modify: `ggml/src/ggml-sycl/unified-cache.cpp:2863-2882` (`unified_cache_set_planned_compute_term_n_ubatch`)
+- Modify: `ggml/src/ggml-sycl/unified-cache.hpp:2717-2725` (the record's comment)
+- Modify: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp:1804-1836` (the store-rule case)
+- Modify: `tests/test-sycl-explicit-ubatch-placement-source.py:175-181` (`PLANNING_SETTER_RULE`, `PLANNING_CAS_LOOP`)
+
+**Description:**
+
+The backend credits the compute term only at the micro-batch it was measured at (`zone_hold_fit_rung_has_compute_room`).
+It keeps that micro-batch in one record per device. Today every load measures at 512, so the record never changes.
+After W3.1c a load measures at the caller's `-ub`. `llama-bench -ub 512,1024` loads the model twice, one after the
+other. The store rule today turns the record off for the rest of the process when two loads disagree, so the second
+load would lose its credit and the hold-spill fit would charge its compute buffers as spills.
+
+The record is only wrong when two LIVE loads disagree. When no live load holds a compute term on the device (the
+term merges to 0 bytes), the previous load is gone and the new load's value simply replaces the record. This task
+adds that third input to the store rule.
+
+**Acceptance Criteria:**
+- [ ] `zone_compute_term_n_ubatch_store(512, 1024, false)` is 1024; `(512, 1024, true)` is the disagreement mark.
+- [ ] A record already off restarts when no term is live: `store(mark, 1024, false)` is 1024.
+- [ ] The existing cases keep their answers with `term_live = true`.
+- [ ] `test-zone-sizing` passes (lead build and run); `python3 tests/test-sycl-explicit-ubatch-placement-source.py` passes.
+
+**Implementation Guide:**
+
+1. **RED.** In `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp`, replace the store-rule block at lines 1806-1825
+   (find by `using ggml_sycl::zone_compute_term_n_ubatch_store;`) with the same checks written with a third argument
+   `true`, then add after them:
+
+```cpp
+        // Loads one after another (llama-bench -ub 512,1024): the first load's term is gone when the second load's
+        // inventory is taken in, so its micro-batch replaces the record instead of turning it off.
+        CHECK(zone_compute_term_n_ubatch_store(512, 1024, /*term_live=*/false) == 1024,
+              "no live term: the new load's micro-batch replaces the record");
+        CHECK(zone_compute_term_n_ubatch_store(512, 1024, /*term_live=*/true) == ggml_sycl::k_zone_compute_term_n_ubatch_disagreed,
+              "two live loads that disagree still turn it off");
+        CHECK(zone_compute_term_n_ubatch_store(ggml_sycl::k_zone_compute_term_n_ubatch_disagreed, 1024, false) == 1024,
+              "a record turned off restarts once no load holds a term");
+        CHECK(zone_compute_term_n_ubatch_store(ggml_sycl::k_zone_compute_term_n_ubatch_disagreed, 1024, true) ==
+                  ggml_sycl::k_zone_compute_term_n_ubatch_disagreed,
+              "but not while a load still holds one");
+        CHECK(zone_compute_term_n_ubatch_store(512, 0, false) == 512, "a load naming no micro-batch changes nothing");
+```
+
+   Build and run: `./scripts/sycl-build.sh test-zone-sizing`, then
+   `source /opt/intel/oneapi/setvars.sh --force && ./build/bin/test-zone-sizing; echo rc=$?`.
+   Expected before GREEN: the build fails, "too many arguments to function 'zone_compute_term_n_ubatch_store'".
+
+2. **GREEN.** In `zone-sizing.hpp`, replace `zone_compute_term_n_ubatch_store` and the last sentences of the comment
+   above `k_zone_compute_term_n_ubatch_disagreed` ("The first load's value stands ... is harmless."):
+
+```cpp
+// ... The first load's value stands while later loads agree. A load that names a different one while another load
+// still holds a compute term on the device turns the record off (k_zone_compute_term_n_ubatch_disagreed), because a
+// credit at a shape the live term was not measured at is the defect the record prevents. When no load holds a term
+// (`term_live` false: the merged term is 0 bytes), the earlier loads are gone and the new load's value replaces the
+// record, even one turned off, so loads made one after another at different micro-batches each get their own credit.
+// A load naming 0, or naming the mark itself, changes nothing.
+inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_ubatch, bool term_live) {
+    if (n_ubatch == 0 || n_ubatch == k_zone_compute_term_n_ubatch_disagreed) {
+        return stored;
+    }
+    if (!term_live) {
+        return n_ubatch;
+    }
+    if (stored == k_zone_compute_term_n_ubatch_disagreed) {
+        return stored;
+    }
+    return stored == 0 || stored == n_ubatch ? n_ubatch : k_zone_compute_term_n_ubatch_disagreed;
+}
+```
+
+   In `unified-cache.cpp`, in `unified_cache_set_planned_compute_term_n_ubatch`, read the merged term once before the
+   loop and pass it to both store calls:
+
+```cpp
+    // The merged term of the loads live on the device; 0 when none holds one, so this load's value replaces the record.
+    const bool term_live = g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire) != 0;
+    uint32_t   stored    = g_planned_compute_term_n_ubatch[device_id].load(std::memory_order_acquire);
+    uint32_t   next      = zone_compute_term_n_ubatch_store(stored, n_ubatch, term_live);
+    while (next != stored &&
+           !g_planned_compute_term_n_ubatch[device_id].compare_exchange_weak(stored, next, std::memory_order_acq_rel)) {
+        next = zone_compute_term_n_ubatch_store(stored, n_ubatch, term_live);
+    }
+```
+
+   In `unified-cache.hpp:2718-2722`, replace "a load that disagrees with an earlier one turns the record off for the
+   rest of the process" with "a load that disagrees with a load still holding a term turns the record off until no
+   load holds one".
+
+   In `tests/test-sycl-explicit-ubatch-placement-source.py`, change the two constants:
+
+```python
+PLANNING_SETTER_RULE = "uint32_t next = zone_compute_term_n_ubatch_store(stored, n_ubatch, term_live);"
+PLANNING_CAS_LOOP = ("while (next != stored && !g_planned_compute_term_n_ubatch[device_id].compare_exchange_weak("
+                     "stored, next, std::memory_order_acq_rel)) { next = zone_compute_term_n_ubatch_store(stored, "
+                     "n_ubatch, term_live); }")
+```
+
+   The pin's `PLANNING_SETTER_RULE` match is whitespace-normalized; the aligned spelling above normalizes to it.
+   Run `python3 tests/test-sycl-explicit-ubatch-placement-source.py`; expected all pass. Rebuild and run
+   `test-zone-sizing`; expected `rc=0`.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: a load's compute-term micro-batch replaces the record once no earlier load holds a term" -- \
+    ggml/src/ggml-sycl/zone-sizing.hpp ggml/src/ggml-sycl/unified-cache.cpp ggml/src/ggml-sycl/unified-cache.hpp \
+    ggml/src/ggml-sycl/tests/test-zone-sizing.cpp tests/test-sycl-explicit-ubatch-placement-source.py
+```
+
+**Gotchas:**
+- `claim_fit_reads_the_load_planning_micro_batch` counts `g_planned_compute_term_n_ubatch[device_id]` exactly 3
+  times in `unified-cache.cpp`. The new line reads `g_planned_compute_term_bytes`, so the count stays 3. Do not add a
+  fourth read of the n_ubatch slot.
+- The previous model's term is dropped when its slot is released. If the quarantine reaper releases it late, the
+  next load still sees a live term and the record turns off with the existing WARN: today's behavior, no worse.
+- `zone_compute_term_n_ubatch_turns_off` is unchanged; it still WARNs once per transition to the mark.
+
+---
+
+### Task W3.1c: the load measures at the caller's shape, and the backend credits the term there
+
+**Track:** L
+**Depends on:** W3.1a, W3.1b
+**File scope:**
+- Modify: `src/llama-load-measure.h:206-216` (`llama_load_measure_context_params` and its comment, find by `inline llama_context_params llama_load_measure_context_params(`), and the declarations of `llama_load_measure`, `llama_load_probe_bound`, `llama_load_admitted_check`, `llama_load_late_check` (find each by name)
+- Modify: `src/llama-context.cpp:4433-4700` (`llama_load_measure_run`, `llama_load_measure`, `llama_load_stage_measure`, `llama_load_probe_bound` at 4601, `llama_load_admitted_check` at 4636, `llama_load_late_check` at 4674)
+- Modify: `src/llama-model.cpp:2921-2931` (probe call), `:2950-2953` (admitted call), `:2961-2970` (the `[LOAD-PLAN] compute slot` WARN), `:3144-3146` (late call), `:477-486` (populate_inventory's tail, find by `inventory.n_ubatch_context = n_ubatch_hint;`)
+- Modify: `ggml/include/ggml-sycl.h:479-482` (append `n_ubatch_measure` after `lazy_table_count`) and the static_asserts at `:488-492`
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp:17262-17273` (layout static_asserts), `:17682-17688` (the record, find by `unified_cache_set_planned_compute_term_n_ubatch(ctx->device, inventory->n_ubatch);`), `:48211-48214` (comment of `ggml_backend_sycl_load_reserve_compute_term`)
+- Modify: `tests/test-sycl-load-measure-source.py:66-98, 114, 130, 175-177, 207, 236-244, 328-395, 408-413, 437`
+- Modify: `tests/test-sycl-explicit-ubatch-placement-source.py:173, 190-191, 418-425` (`PLANNING_SET`, `MEASURE_SIG`, `MEASURE_N_UBATCH`, `claim_planning_micro_batch_is_the_measure_shape`)
+- Modify: `tests/test-load-measure-guards.cpp:320, 856, 866, 887-892` (calls of `llama_load_measure_context_params`)
+
+**Description:**
+
+Three load-time measures build a measure-only context with `llama_load_measure_context_params(n_ctx, n_ctx_train)`,
+which ignores the caller's `-ub` and receives `n_ctx = 0` from the envelope, so every model is measured at
+`n_ctx_train` and 512. On Qwen 3.8 that is a 2057.7 MiB term measured at 262144 cells, whatever the context. This task:
+- replaces the `uint32_t n_ctx` parameter of the six measure functions with `const llama_load_measure_shape & shape`;
+- has the three call sites in `llama-model.cpp` pass the shape from W3.1a's resolver over the model's hints;
+- prints the measured shape in the `[LOAD-PLAN] compute slot` WARN without the old "not transported" text;
+- carries the measured micro-batch to the backend in a new inventory field, `n_ubatch_measure`, so the hold-spill
+  fit credits the term at the micro-batch it was really measured at.
+
+A hint of 0 (no `-ub`, or `-ub auto`) keeps today's 512, and no `-c` keeps today's training context.
+
+**Design choice:** the inventory carries the measured micro-batch in a new field filled from the same resolver call
+the measures use, and the backend reads it. Rejected: the backend recomputing it from `n_ubatch_context` and
+`n_ctx_context` (two places spelling the clamp and the fallback, which can drift).
+
+**Acceptance Criteria:**
+- [ ] No caller of the six measure functions passes `llama_model_sycl_make_placement_envelope().n_ctx`; the three call sites pass one local `measure_shape` from `llama_model_load_measure_shape(*this)`.
+- [ ] `llama_load_measure_context_params` takes the shape and sets `params.n_ctx = shape.n_ctx; params.n_ubatch = shape.n_ubatch;`.
+- [ ] The WARN reads `measured at n_ctx %u ubatch %u, the context and micro-batch this load was told (the training context and ubatch %u where it was told none)` and no longer contains `not transported`.
+- [ ] `inventory.n_ubatch_measure` is set in `llama_model_sycl_populate_inventory` from the same resolver, and `ggml-sycl.cpp` records `inventory->n_ubatch_measure` (falling back to `inventory->n_ubatch` for 0).
+- [ ] The struct stays 208 bytes; `offsetof(ggml_sycl_tensor_inventory, n_ubatch_measure) == 204` is asserted in both `ggml-sycl.h` and `ggml-sycl.cpp`.
+- [ ] `test-load-measure-guards` passes (lead build and run); the three pins pass.
+- [ ] (lead) Gate G-W3.1 below.
+
+**Implementation Guide:**
+
+1. **RED.** Pins first. In `tests/test-sycl-load-measure-source.py` change these constants and strings (find each by
+   its old text):
+
+```python
+_MEASURE = (
+    "llama_load_measure_result llama_load_measure(const llama_model & model, const llama_load_measure_shape & shape, "
+    "uint64_t load_txn, enum ggml_sycl_measure_stage stage)"
+)
+_RUN = (
+    "llama_load_measure_result llama_load_measure_run(const llama_model & model, llama_measure_context_args & args, "
+    "const llama_measure_override_procs & procs, const llama_load_measure_shape & shape, uint64_t load_txn, "
+    "enum ggml_sycl_measure_stage stage, int first_device)"
+)
+_LATE = (
+    "llama_late_check_result llama_load_late_check(const llama_model & model, const llama_load_measure_shape & shape, "
+    "struct ggml_sycl_load_txn txn, const std::vector<llama_measure_dummy_entry> & weights)"
+)
+_STAGE_MEASURE = (
+    "static llama_load_measure_result llama_load_stage_measure(const llama_model & model, "
+    "const llama_load_measure_shape & shape, uint64_t load_txn, enum ggml_sycl_measure_stage stage, "
+    "const std::vector<llama_measure_dummy_entry> & weights)"
+)
+_PARAMS = "inline llama_context_params llama_load_measure_context_params(const llama_load_measure_shape & shape)"
+_PROBE = (
+    "llama_load_probe_result llama_load_probe_bound(const llama_model & model, const llama_load_measure_shape & shape, "
+    "struct ggml_sycl_load_txn txn, const std::vector<llama_measure_dummy_entry> & weights)"
+)
+_ADMIT = (
+    "llama_admitted_check_result llama_load_admitted_check(const llama_model & model, "
+    "const llama_load_measure_shape & shape, struct ggml_sycl_load_txn txn, "
+    "const std::vector<llama_measure_dummy_entry> & weights, const llama_load_probe_result & probe)"
+)
+```
+
+   And in the bodies' expected strings:
+   - line 114: `"return llama_load_measure_run(model, args, llama_context_sycl_measure_override_procs(sycl_devs[0]), shape, "`
+   - line 130: `"const llama_context_params params = llama_load_measure_context_params(shape);",`
+   - lines 175-176: `z("params.n_ubatch = shape.n_ubatch;") in b` and `z("params.n_ctx = shape.n_ctx;") in b` (keep line 177's `n_batch` check).
+   - line 207: `"llama_load_measure_result measured = llama_load_measure(model, shape, load_txn, stage);",`
+   - line 236: `"llama_load_stage_measure(model, shape, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights)",`
+   - line 244: `and z("const uint32_t n_ubatch = shape.n_ubatch;")`
+   - line 348 and 381: `shape` in place of `n_ctx` in the two `llama_load_stage_measure(model, n_ctx, ...` strings.
+   - lines 350 and 383: `"const uint32_t measured_n_ctx = shape.n_ctx;",`
+   - `n_ctx_ok` (408-413): replace with a check that `llama_load_measure_shape_resolve` contains
+     `llama_load_measure_n_ctx(llama_n_ctx_hint_resolve(n_ctx_hint, n_ctx_train).n_ctx_context, n_ctx_train)` and
+     `llama_load_measure_context_params` contains `params.n_ctx = shape.n_ctx;`. Docstring: "One n_ctx rule: the
+     measure's params read the shape, and the shape reads the training-context fallback."
+   - line 437: `args = z("measure_shape, sycl_model_loading_guard.txn,")`, and add to that function a check that
+     `MODEL_CPP` holds exactly one `const llama_load_measure_shape measure_shape = llama_model_load_measure_shape(*this);`
+     per measure scope (2 occurrences: the probe/admitted scope and the late scope) and no
+     `llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn`.
+
+   Add one test function at the end of the file:
+
+```python
+def test_the_load_line_prints_the_measured_shape():
+    """The compute-slot WARN prints the shape the admitted measure ran at and no longer says the caller's shape is
+    not transported."""
+    code = z(MODEL_CPP)
+    assert z("measured at n_ctx %u ubatch %u, the context and micro-batch this load was told") in code
+    assert "are not transported" not in MODEL_CPP
+    assert "do not reach the load (fkpg)" not in MEASURE_H
+
+
+def test_the_inventory_carries_the_measured_micro_batch():
+    """The micro-batch the backend credits the term at comes from the resolver the measures use."""
+    assert z("inventory.n_ubatch_measure = llama_load_measure_shape_resolve(n_ctx_hint, n_ubatch_hint, "
+             "hparams.n_ctx_train).n_ubatch;") in z(MODEL_CPP)
+    assert z("return llama_load_measure_shape_resolve(model.get_n_ctx_hint(), model.get_n_ubatch_hint(), "
+             "model.hparams.n_ctx_train);") in z(MODEL_CPP)
+```
+
+   (`z` is the file's whitespace normalizer, already defined; check with `cat tests/test-sycl-load-measure-source.py | grep -n '^def z'`.)
+
+   In `tests/test-sycl-explicit-ubatch-placement-source.py`:
+
+```python
+PLANNING_SET = ("ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, "
+                "ggml_sycl_inventory_measure_n_ubatch(inventory));")
+MEASURE_SIG = "inline llama_context_params llama_load_measure_context_params(const llama_load_measure_shape & shape)"
+MEASURE_N_UBATCH = "params.n_ubatch = shape.n_ubatch;"
+```
+
+   and replace `claim_planning_micro_batch_is_the_measure_shape` (lines 418-425) with:
+
+```python
+SHAPE_SIG = "inline llama_load_measure_shape llama_load_measure_shape_resolve(uint32_t n_ctx_hint,"
+SHAPE_FALLBACK = "const uint32_t n_ubatch = n_ubatch_hint != 0 ? n_ubatch_hint : llama_auto_ubatch_ladder[0];"
+INVENTORY_MEASURE = ("inventory.n_ubatch_measure = llama_load_measure_shape_resolve(n_ctx_hint, n_ubatch_hint, "
+                     "hparams.n_ctx_train).n_ubatch;")
+MEASURE_READER = ("static uint32_t ggml_sycl_inventory_measure_n_ubatch(const ggml_sycl_tensor_inventory * inventory) "
+                  "{ return inventory->n_ubatch_measure != 0 ? inventory->n_ubatch_measure : inventory->n_ubatch; }")
+
+
+def claim_planning_micro_batch_is_the_measure_shape(model_cpp: str, ladder_h: str, measure_h: str,
+                                                    sycl_cpp: str = "") -> bool:
+    """The recorded micro-batch is the one the compute term was measured at: the measure's params read the shape,
+    the shape falls back to the auto ladder's bottom rung, the inventory carries the same resolver's answer, and the
+    backend records it (the planning micro-batch only for a libllama that sent none). The inventory's own planning
+    micro-batch is still the ladder's bottom rung, the fallback both sides use."""
+    inv = INVENTORY_N_UBATCH_RE.findall(model_cpp)
+    ladder = LADDER_RE.findall(ladder_h)
+    measure = body(norm(measure_h), MEASURE_SIG)
+    shape = body(norm(measure_h), SHAPE_SIG)
+    return (len(inv) == 1 and len(ladder) == 1 and inv[0] == ladder[0]
+            and bool(measure) and MEASURE_N_UBATCH in measure
+            and bool(shape) and norm(SHAPE_FALLBACK) in shape
+            and norm(INVENTORY_MEASURE) in norm(model_cpp)
+            and (not sycl_cpp or norm(MEASURE_READER) in norm(sycl_cpp)))
+```
+
+   Then find the test that calls the claim (`cat tests/test-sycl-explicit-ubatch-placement-source.py | grep -n
+   'claim_planning_micro_batch_is_the_measure_shape('`) and pass `SYCL_CPP` (the file's name for the ggml-sycl.cpp
+   text; check with `grep -n '^SYCL_CPP\|^sycl_cpp'`) as the fourth argument in the positive test. Leave the mutant
+   tests on three arguments.
+
+   In `tests/test-load-measure-guards.cpp`, change every `llama_load_measure_context_params(a, b)` to
+   `llama_load_measure_context_params(llama_load_measure_shape_resolve(a, 0, b))` at lines 320, 856, 866, 887, 892.
+   Line 892's `(1234, 4096)` then reads n_ctx 1280 (padded): change its expectation to
+   `llama_load_measure_shape_resolve(1234, 0, 4096).n_ctx == 1280` with the message "the caller's n_ctx, padded as the
+   context pads it". At line 320 compare with `llama_load_measure_shape_resolve(0, 0, 262144).n_ctx`. Add to
+   `test_measure_params_tie_to_the_ladder` (after line 892):
+
+```cpp
+    const llama_context_params wide = llama_load_measure_context_params(llama_load_measure_shape_resolve(4096, 2048, 262144));
+    CHECK(wide.n_ctx == 4096 && wide.n_ubatch == 2048 && wide.n_batch >= 2048,
+          "the measure must run at the caller's shape: %u %u %u", wide.n_ctx, wide.n_ubatch, wide.n_batch);
+```
+
+   Run `python3 tests/test-sycl-load-measure-source.py` and `python3 tests/test-sycl-explicit-ubatch-placement-source.py`.
+   Expected before GREEN: failures naming `_PARAMS`, `_RUN`, the shape claim and the two new tests. Build
+   `test-load-measure-guards`: expected compile failure, "no matching function for call to
+   'llama_load_measure_context_params'".
+
+2. **GREEN.**
+
+   a. `src/llama-load-measure.h`: replace `llama_load_measure_context_params` and its comment (206-216):
+
+```cpp
+// The params of a load-time measure: the shape resolved from the caller's hints (llama_load_measure_shape_resolve),
+// every other parameter the default. n_batch is raised to n_ubatch, as a real context would need.
+inline llama_context_params llama_load_measure_context_params(const llama_load_measure_shape & shape) {
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx                = shape.n_ctx;
+    params.n_ubatch             = shape.n_ubatch;
+    params.n_batch              = std::max(params.n_batch, params.n_ubatch);
+    return params;
+}
+```
+
+   In the same header change the four
+   declarations (`llama_load_measure`, `llama_load_probe_bound`, `llama_load_admitted_check`, `llama_load_late_check`;
+   `cat src/llama-load-measure.h | grep -n 'uint32_t n_ctx,'` lists them) from `uint32_t n_ctx` to
+   `const llama_load_measure_shape & shape`.
+
+   b. `src/llama-context.cpp`: in each of the six definitions, rename the parameter the same way and:
+   - `llama_load_measure_run`: `const llama_context_params params = llama_load_measure_context_params(shape);`
+   - `llama_load_measure` and `llama_load_stage_measure`: pass `shape` where they passed `n_ctx`.
+   - `llama_load_probe_bound` (4601): `const uint32_t measured_n_ctx = shape.n_ctx;` and delete `GGML_UNUSED(n_ctx);`
+     in its `#else` arm, replacing it with `GGML_UNUSED(shape);`.
+   - `llama_load_admitted_check` (4636): `const uint32_t measured_n_ctx = shape.n_ctx;` and
+     `const uint32_t n_ubatch = shape.n_ubatch;`; `GGML_UNUSED(shape);` in the `#else` arm.
+   - `llama_load_late_check` (4674): `const uint32_t n_ubatch = shape.n_ubatch;`; `GGML_UNUSED(shape);`.
+
+   c. `src/llama-model.cpp`: add above `llama_model_sycl_make_placement_envelope` (line 271):
+
+```cpp
+// The shape every load-time measure of this model runs at: the context and micro-batch the caller told the load
+// (llama_model_params::n_ctx_hint, n_ubatch_hint), resolved once.
+static llama_load_measure_shape llama_model_load_measure_shape(const llama_model & model) {
+    return llama_load_measure_shape_resolve(model.get_n_ctx_hint(), model.get_n_ubatch_hint(), model.hparams.n_ctx_train);
+}
+```
+
+   At the probe (2921-2931) replace the comment's last three sentences with "It is measured at the context and
+   micro-batch the caller told the load; a later context larger than that is refused at its creation." and the call:
+
+```cpp
+        const llama_load_measure_shape measure_shape = llama_model_load_measure_shape(*this);
+        const std::vector<llama_measure_dummy_entry> probe_weights = llama_model_measure_weights(ml);
+
+        const int64_t                 probe_t0 = ggml_time_us();
+        const llama_load_probe_result probe    =
+            llama_load_probe_bound(*this, measure_shape, sycl_model_loading_guard.txn, probe_weights);
+```
+
+   The admitted call (2950-2953) passes `measure_shape` in place of `llama_model_sycl_make_placement_envelope().n_ctx`.
+   The WARN (2961-2970):
+
+```cpp
+                LLAMA_LOG_WARN(
+                    "%s: [LOAD-PLAN] compute slot on device %d: probe bound %.1f MiB %s, admitted %.1f MiB (%zu of "
+                    "%zu recorded); measured at n_ctx %u ubatch %u, the context and micro-batch this load was told "
+                    "(the training context and ubatch %u where it was told none); measure %lld ms probe, %lld ms "
+                    "admitted\n",
+                    __func__, (int) t.device, t.probe_term / 1024.0 / 1024.0,
+                    t.reserved ? "reserved in RUNTIME" : "NOT reserved (the backend said why), not compared",
+                    t.admitted_term / 1024.0 / 1024.0, admitted.n_recorded, admitted.terms.size(), admitted.n_ctx,
+                    admitted.n_ubatch, llama_auto_ubatch_ladder[0], (long long) probe_ms, (long long) admitted_ms);
+```
+
+   The late call (3144-3146) is in another scope: add
+   `const llama_load_measure_shape measure_shape = llama_model_load_measure_shape(*this);` before it and pass
+   `measure_shape`.
+
+   In `llama_model_sycl_populate_inventory`, right after `inventory.n_ubatch_context = n_ubatch_hint;` (line 486):
+
+```cpp
+    // The micro-batch the load measures its compute term at, from the resolver the measures use, so the backend
+    // credits the term at the rung it was measured at.
+    inventory.n_ubatch_measure = llama_load_measure_shape_resolve(n_ctx_hint, n_ubatch_hint, hparams.n_ctx_train).n_ubatch;
+```
+
+   Also fix the comment at 477-479 that says the load measures keep their inputs: "Only the room reads the hint" becomes
+   "The room and the load measures read the hint; the planning shape above keeps its inputs."
+
+   d. `ggml/include/ggml-sycl.h`: after `uint32_t lazy_table_count;` (line 481):
+
+```c
+    // The micro-batch the load measured its compute term at (libllama's llama_load_measure_shape_resolve over the
+    // caller's hints). The backend credits the term at this rung. 0 from a libllama that predates the field: the backend
+    // then reads n_ubatch, the measure's old shape. It sits in the padding after lazy_table_count, so the struct stays
+    // 208 bytes. libllama and libggml-sycl must be rebuilt together for the backend to see it.
+    uint32_t                                 n_ubatch_measure;
+```
+
+   and beside the asserts at 488-492: `static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_measure) == 204, "n_ubatch_measure moved");`.
+   Add the same assert after `ggml-sycl.cpp:17272`.
+
+   e. `ggml/src/ggml-sycl/ggml-sycl.cpp`: above `populate_inventory_globals` (find by
+   `static void populate_inventory_globals(`) add:
+
+```cpp
+// The micro-batch the load measured its compute term at; the planning micro-batch for a libllama that sent none.
+static uint32_t ggml_sycl_inventory_measure_n_ubatch(const ggml_sycl_tensor_inventory * inventory) {
+    return inventory->n_ubatch_measure != 0 ? inventory->n_ubatch_measure : inventory->n_ubatch;
+}
+```
+
+   and at 17682-17688 replace the comment's last sentence ("It is the measure's shape only while ... a source pin
+   holds.") with "It is the micro-batch the load measured the term at, which libllama sends with the inventory." and
+   the call with `ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, ggml_sycl_inventory_measure_n_ubatch(inventory));`.
+   At 48211-48214 replace "measured at the load's measure shape (n_ctx, ubatch 512), not the caller's -c and -ub,
+   which fkpg (a) transports" with "measured at the context and micro-batch the caller told the load".
+   Update `unified-cache.hpp:2718-2722` the same way: the record is "the micro-batch the load measured the term at
+   (ggml_sycl_tensor_inventory::n_ubatch_measure)".
+
+   f. Rebuild `test-load-measure-guards` and run it: `rc=0`. Run the three pins: all pass. Then
+   `python3 tests/test-sycl-kv-before-experts-source.py` and `python3 tests/test-sycl-ctx-hint-default-source.py`:
+   all pass (line 594 of the first is a mutant text, unaffected).
+
+**Commit:**
+
+```bash
+git commit -m "llama: the load measures its compute term at the context and micro-batch the caller named" -- \
+    src/llama-load-measure.h src/llama-context.cpp src/llama-model.cpp ggml/include/ggml-sycl.h \
+    ggml/src/ggml-sycl/ggml-sycl.cpp ggml/src/ggml-sycl/unified-cache.hpp tests/test-sycl-load-measure-source.py \
+    tests/test-sycl-explicit-ubatch-placement-source.py tests/test-load-measure-guards.cpp
+```
+
+**Gotchas:**
+- Build the whole tree, not only the test target: the signature change reaches `llama-context.cpp` and `llama-model.cpp`,
+  and `ggml-sycl.h` is compiled on both sides of the dlopen boundary. `./scripts/sycl-build.sh` (all targets).
+- `get_n_ctx_hint()` returns the raw hint (`src/llama-model.h:821-825`). Do not resolve it twice: the resolver does.
+- `llama-bench` reuses a model across contexts: until W3.1d, a later instance with a larger context than the first
+  meets a smaller term and can be refused. W3.1d lands with or right after this task.
+- The late check compares the late measure with the admitted record at the same shape. Both now read `measure_shape`,
+  so they still agree.
+- The `GGML_UNUSED(n_ctx)` lines live in the `#else` arm (no SYCL); `grep -n 'GGML_UNUSED(n_ctx)' src/llama-context.cpp`
+  must print nothing after the edit, or a non-SYCL build fails.
+- Comments must not mention ticket ids (the old text cites "fkpg"; the new text must not).
+
+---
+
+### Task W3.1d: llama-bench tells the load the largest context of the instances that share the model
+
+**Track:** L
+**Depends on:** W3.1c
+**File scope:**
+- Modify: `tools/llama-bench/llama-bench.cpp:1295-1302` (`equal_mparams` comment), `:2349-2356` (the loop that loads the model, find by `auto mparams = inst.to_llama_mparams();`)
+- Modify: `tests/test-sycl-ctx-hint-default-source.py` (add one test function at the end)
+
+**Description:**
+
+`llama-bench` keeps a model loaded across consecutive instances whose model params are equal, and `equal_mparams`
+leaves `n_ctx_hint` out on purpose, so `-p 512 -n 128` shares one load between pp512 (context 512) and tg128
+(context 128). Before W3.1c the hint only sized the KV room, and a larger later context was re-placed. After W3.1c it
+also sizes the compute term, and an instance whose context is larger than the one the load was told meets a term
+measured at a smaller context. This task gives the load the largest context of the run of consecutive instances that
+will share it, so no instance meets a term smaller than its own.
+
+**Design choice:** the hint is the maximum over the instances that share the load. Rejected: comparing `n_ctx_hint`
+in `equal_mparams` (a reload for every context of a sweep, minutes per load on the 119 GiB Qwen pack).
+
+**Acceptance Criteria:**
+- [ ] The loop sets `mparams.n_ctx_hint = bench_shared_load_n_ctx(params_instances, params_idx - 1);` right after `auto mparams = inst.to_llama_mparams();`.
+- [ ] `bench_shared_load_n_ctx` returns the maximum `n_ctx()` over instance `i` and every following instance that `equal_mparams` instance `i`, stopping at the first that does not.
+- [ ] The fit path still overrides the hint with `cparams.n_ctx` (unchanged, after the new line).
+- [ ] `python3 tests/test-sycl-ctx-hint-default-source.py` passes.
+- [ ] (lead) Gate G-W3.1 run 3 below.
+
+**Implementation Guide:**
+
+1. **RED.** Append to `tests/test-sycl-ctx-hint-default-source.py`:
+
+```python
+def test_bench_tells_the_load_the_largest_shared_context():
+    """A reused model's compute term is measured at the context its load was told, so llama-bench tells it the
+    largest context of the consecutive instances that share it."""
+    bench = read(BENCH_REL)
+    assert "static uint32_t bench_shared_load_n_ctx(const std::vector<cmd_params_instance> & instances, size_t i) {" in bench
+    body = bench[bench.index("static uint32_t bench_shared_load_n_ctx("):]
+    body = body[: body.index("\n}\n")]
+    assert "instances[j].equal_mparams(instances[i])" in body
+    assert "std::max(n_ctx, instances[j].n_ctx())" in body
+    loop = bench[bench.index("auto mparams = inst.to_llama_mparams();"):]
+    assert loop.index("mparams.n_ctx_hint = bench_shared_load_n_ctx(params_instances, params_idx - 1);") < loop.index(
+        "if (do_fit) {")
+```
+
+   (`read` and `BENCH_REL` already exist in that file.) Run `python3 tests/test-sycl-ctx-hint-default-source.py`.
+   Expected: the new test fails with `AssertionError` on the first `assert`.
+
+2. **GREEN.** In `llama-bench.cpp`, after the `cmd_params_instance` struct ends (find the first top-level function
+   after it, for example by `cat tools/llama-bench/llama-bench.cpp | grep -n '^static std::vector<cmd_params_instance> get_cmd_params_instances'`,
+   and insert above that function):
+
+```cpp
+// The context a model load is told: the largest of the instances that will share it. llama-bench keeps a model for
+// the consecutive instances whose model params are equal (equal_mparams leaves the context out), and the SYCL load
+// measures its compute term at the context it is told, so a smaller first context would leave a later, larger one
+// a term too small for it.
+static uint32_t bench_shared_load_n_ctx(const std::vector<cmd_params_instance> & instances, size_t i) {
+    uint32_t n_ctx = instances[i].n_ctx();
+    for (size_t j = i + 1; j < instances.size() && instances[j].equal_mparams(instances[i]); ++j) {
+        n_ctx = std::max(n_ctx, instances[j].n_ctx());
+    }
+    return n_ctx;
+}
+```
+
+   In the loop, after `auto mparams = inst.to_llama_mparams();`:
+
+```cpp
+        // the load is told the largest context of the instances that share it (bench_shared_load_n_ctx)
+        mparams.n_ctx_hint = bench_shared_load_n_ctx(params_instances, params_idx - 1);
+```
+
+   In the `equal_mparams` comment (1295-1302), replace "a reused model keeps the first instance's room, and a larger
+   later context is re-placed at context creation" with "the load is told the largest context of the instances that
+   share it (bench_shared_load_n_ctx), so a reused model's room and compute term cover each of them".
+
+   Run the pin: all pass. Build `llama-bench` (`./scripts/sycl-build.sh llama-bench`): compiles.
+
+**Commit:**
+
+```bash
+git commit -m "llama-bench: a shared model load is told the largest context of the instances that use it" -- \
+    tools/llama-bench/llama-bench.cpp tests/test-sycl-ctx-hint-default-source.py
+```
+
+**Gotchas:**
+- `params_idx` is incremented at the top of the loop, so the current index is `params_idx - 1`.
+- `to_llama_mparams()` still sets `mparams.n_ctx_hint = n_ctx();`; the existing mutant test
+  (`test_mutant_bench_asks_for_the_default_fails`) asserts that line exists. Keep it.
+- `equal_mparams` must be callable on `const` instances (it is a `const` member).
+
+---
+
+### Task W3.4: the refusal's largest -ub never names a width below one the zone was planned to serve
+
+**Track:** M
+**Depends on:** none (it fixes today's tree and stays right after W3.1c)
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/zone-sizing.hpp:571-585` (`zone_hold_fit_inputs`, `zone_hold_fit_rung_has_compute_room` and its comment)
+- Modify: `ggml/src/ggml-sycl/zone-sizing.cpp:548-593` (`zone_hold_fit_request`, `zone_hold_fit_rung_has_compute_room`, `zone_hold_fit_terms_at`)
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp:19823-19842` (the compute-room block of `ggml_sycl_hold_spill_fit`, find by `const auto room_plan     = ggml_sycl_global_plan_owner();`)
+- Modify: `ggml/src/ggml-sycl/unified-cache.cpp:36388-36406` and `unified-cache.hpp:1038-1050` (`placement_plan_compute_room` loses its `held_out` parameter)
+- Modify: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` (new Case 24d after Case 24c, and lines 1752-1756)
+- Modify: `tests/test-sycl-layout-choice.cpp:879-895`
+- Modify: `tests/test-sycl-explicit-ubatch-placement-source.py:154-166, 200-206`
+- Modify: `docs/backend/sycl-memory-design.md:2889-2898`
+
+**Description:**
+
+GPT-OSS 20B on the B50 at `-ub 1024` is refused with "the largest -ub that fits is about 256", but `-ub 512` runs.
+The text comes from `src/llama-context.cpp:1981-1992`, which asks `ggml_backend_sycl_planned_hold_spill_fits`
+(`ggml-sycl.cpp:19980`). That asks `ggml_sycl_hold_spill_fit` (`:19782-19858`), and the number is
+`zone_hold_fit_largest_ub` (`zone-sizing.cpp:603-622`): the largest power of two at or below the asked micro-batch
+that `zone_hold_fit` accepts over the same inputs.
+
+Why it says 256, with the device numbers (B50 log in `w30-device-results.md`):
+- The planned dense scratch is about 1108 MiB of f16 dequant weight plus 9 KiB per token: 1117.1 MiB at 1024,
+  1112.6 MiB at 512, 1110.4 MiB at 256. Free before the rung: 1622.8 MiB. KV-zone room: 141.3 MiB. Headroom: 256 MiB.
+- The 1024 rung's own compute buffer, 808.0 MiB, was held outside the arena. So `held_out` is true, and
+  `placement_plan_compute_room` (`unified-cache.cpp:36389-36406`) returns no room for ANY rung (`compute_room=0.0 MB@0`
+  in the log). The descent then asks 512 with no credit: 1112.6 + 404.0 (808.0 scaled to 512) - 141.3 = 1375.3 MiB,
+  leaving 247.5 MiB, under 256. 256 leaves 451.7 MiB, so it names 256.
+- When 512 runs on its own, the load's compute term (404.0 MiB, measured at 512) is credited at 512: demand 971.3 MiB,
+  651.5 MiB left. So 512 fits.
+
+Two defects:
+1. `held_out` is a fact about the rung that ran (1024), but it switches off the room for every rung the descent asks.
+2. Even with the room, a rung without its own record gets a request scaled from another rung, compared with the room
+   whole or nothing. A 1024 buffer a few KiB over twice the 512 term (the log prints one decimal) scales above the
+   room, and 512 is refused again. After W3.1c the room moves to the caller's micro-batch (1024 here), and 512, a
+   rung below the room's rung, would never be credited at all.
+
+The fix: the held-out flag names its rung (`held_out_n_ubatch`) and only that rung loses the credit. A rung at or
+below the room's rung that has no record of its own is credited: its buffers are no larger than the ones the load
+measured at the room's rung, because compute buffers grow with the micro-batch (the scaler already assumes it). A rung
+with its own record is credited when the record fits the room, as today.
+
+**Design choice:** credit every rung at or below the room's rung. Rejected: credit only the room's rung (today), which
+makes the descent name a width below one that runs as soon as the room moves to the caller's micro-batch.
+
+**Acceptance Criteria:**
+- [ ] Case 24d (device numbers) names 512 for a refusal at 1024, and 256 when fed the inputs production fed it before (no room).
+- [ ] The 1024 rung stays refused (its own buffer was held out).
+- [ ] A rung above the room's rung is never credited.
+- [ ] `placement_plan_compute_room` has no `held_out` parameter; `ggml_sycl_hold_spill_fit` sets `in.held_out_n_ubatch = held_out ? q.n_ubatch : 0;`.
+- [ ] `test-zone-sizing` passes (lead build and run); `test-sycl-layout-choice` builds and passes (lead run, ctest `sycl-layout-choice`); the explicit-ubatch pin passes.
+- [ ] (lead) Gate G-W3.4 below.
+
+**Implementation Guide:**
+
+1. **RED.** In `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp`, insert after Case 24c's closing brace (the block
+   that ends after `"an overflowing product");` at line 1767):
+
+```cpp
+    // ---- Case 24d: the -ub a hold-spill refusal names is never below a rung the zone was planned to serve. The B50 /
+    // GPT-OSS 20B MXFP4 context at -ub 1024: a planned dense scratch of about 1108 MiB of f16 dequant weight plus
+    // 9 KiB per token (1117.1 MiB at 1024, 1112.6 MiB at 512), one 808 MiB compute buffer at 1024 held outside the
+    // arena, 141.3 MiB of KV-zone room, 1622.8 MiB free before the rung, and the 404.0 MiB compute term the load
+    // measured at 512. 512 runs; the refusal at 1024 named 256. -----------------------------------------------------
+    {
+        const size_t KiB  = 1024;
+        const size_t MiB  = 1024 * KiB;
+        auto         plan = [](void *, uint32_t n_ubatch) -> size_t {
+            return size_t(11081) * 1024 * 1024 / 10 + size_t(n_ubatch) * 9 * 1024;
+        };
+        // 808.04 MiB prints as 808.0: a buffer a little over twice the 512 term, as a real one can be
+        ggml_sycl::zone_hold_rung_request rungs[] = {
+            { 1024, 808 * MiB + 40 * KiB }
+        };
+        ggml_sycl::zone_hold_fit_inputs in = {};
+        in.headroom_target                 = 256 * MiB;
+        in.free_before                     = 1622 * MiB + 819 * KiB;
+        in.kv_room                         = 141 * MiB + 307 * KiB;
+        in.rungs                           = rungs;
+        in.n_rungs                         = 1;
+        in.plan_of                         = plan;
+
+        // What production fed the fit at the refused rung: the held-out buffer had switched the room off for every
+        // rung, so the descent charged 512 its scaled buffer and named 256.
+        CHECK(!ggml_sycl::zone_hold_fit(in, 1024), "1024 does not fit: 1783.8 MiB of demand on 1622.8 MiB free");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) == 256, "with no room the descent names 256");
+
+        // The room the load planned, at the rung it measured, and the rung whose buffer was held out.
+        in.compute_room_n_ubatch = 512;
+        in.compute_room_bytes    = 404 * MiB;
+        in.held_out_n_ubatch     = 1024;
+        CHECK(!ggml_sycl::zone_hold_fit(in, 1024), "1024 stays refused: its own buffer was held out");
+        CHECK(!ggml_sycl::zone_hold_fit_terms_at(in, 1024).request_credited, "and gets no credit");
+        CHECK(ggml_sycl::zone_hold_fit_terms_at(in, 512).request_credited,
+              "512 has no record of its own and is at the room's rung: the zone holds its buffers");
+        CHECK(ggml_sycl::zone_hold_fit(in, 512), "so 512 fits: 971.3 MiB of demand leaves 651.5 MiB");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) == 512, "and the refusal names 512, the width that runs");
+
+        // The room moves to the caller's micro-batch once the load measures there: a rung below it is still credited.
+        in.compute_room_n_ubatch = 1024;
+        in.compute_room_bytes    = 808 * MiB;
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) == 512, "a rung below the room's rung keeps the credit");
+
+        // A rung's own record is compared with the room, whole or nothing, as before.
+        ggml_sycl::zone_hold_rung_request own[] = {
+            { 512, 405 * MiB }
+        };
+        in.rungs                 = own;
+        in.compute_room_n_ubatch = 512;
+        in.compute_room_bytes    = 404 * MiB;
+        in.held_out_n_ubatch     = 0;
+        CHECK(!ggml_sycl::zone_hold_fit_terms_at(in, 512).request_credited, "a record above the room is not credited");
+        // A rung above the room's rung never borrows it.
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 1024, 1, false), "above the room's rung: no credit");
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 0, 0, false), "an unknown rung: no credit");
+    }
+```
+
+   Build and run: `./scripts/sycl-build.sh test-zone-sizing`, then
+   `source /opt/intel/oneapi/setvars.sh --force && ./build/bin/test-zone-sizing; echo rc=$?`.
+   Expected before GREEN: build error "'struct ggml_sycl::zone_hold_fit_inputs' has no member named 'held_out_n_ubatch'"
+   (and "too many arguments" for the 4-argument call). If you add only the field to see a runtime RED, the check
+   "and the refusal names 512, the width that runs" fails: today's rule scales 808.04 MiB to 404.02 MiB, above the
+   404.0 MiB room, and names 256.
+
+2. **GREEN.**
+
+   a. `zone-sizing.hpp`: in `zone_hold_fit_inputs`, after `compute_room_bytes`:
+
+```cpp
+    // The rung whose own compute buffer the hold kept outside the arena (the realized check's rung, when its record
+    // shows such a spill), 0 for none. The zone did not serve that rung's buffer, so the room is not credited there.
+    // Every other rung keeps the credit the plan gives it.
+    uint32_t                       held_out_n_ubatch     = 0;
+```
+
+   Replace the declaration of `zone_hold_fit_rung_has_compute_room` and the first sentences of its comment (571-585):
+
+```cpp
+// Whether the RUNTIME zone was planned to serve the rung's compute buffers beside the hold. The zone holds the compute
+// term the load measured at compute_room_n_ubatch, so a rung at or below that one is served: with its own measured
+// request (`own_record`), when the request is no larger than the room (whole or nothing); without one, always,
+// because compute buffers grow with the micro-batch and a smaller rung's are no larger than the measured ones. A
+// request scaled from another rung is an estimate and does not refuse a rung the zone was planned for. Never the rung
+// whose own buffer was held out, never a rung above the room's, never n_ubatch 0.
+bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request, bool own_record);
+
+// Whether the rung has a measured request of its own among the records.
+bool zone_hold_fit_rung_has_record(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
+```
+
+   Keep the comment's paragraph about multi-chunk over-credit.
+
+   b. `zone-sizing.cpp`: replace `zone_hold_fit_rung_has_compute_room` (569-571) and add the record helper:
+
+```cpp
+bool zone_hold_fit_rung_has_record(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    if (!in.rungs) {
+        return false;
+    }
+    for (size_t i = 0; i < in.n_rungs; ++i) {
+        if (in.rungs[i].n_ubatch == n_ubatch) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in,
+                                         uint32_t                     n_ubatch,
+                                         size_t                       request,
+                                         bool                         own_record) {
+    if (n_ubatch == 0 || in.compute_room_n_ubatch == 0 || n_ubatch > in.compute_room_n_ubatch ||
+        n_ubatch == in.held_out_n_ubatch) {
+        return false;
+    }
+    return !own_record || request <= in.compute_room_bytes;
+}
+```
+
+   In `zone_hold_fit_terms_at` (583):
+
+```cpp
+    t.request_credited = zone_hold_fit_rung_has_compute_room(in, n_ubatch, t.request,
+                                                             zone_hold_fit_rung_has_record(in, n_ubatch));
+```
+
+   c. `unified-cache.hpp:1038-1050` and `unified-cache.cpp:36389-36406`: delete the `bool held_out` parameter of
+   `placement_plan_compute_room`, the `!held_out &&` in its gate, and the comment sentence about a held-out request
+   (the fit now says which rung was held out). New gate: `if (!plan.multi_device && plan.device_id == device) {`.
+
+   d. `ggml-sycl.cpp:19823-19842` becomes:
+
+```cpp
+    {
+        const auto room_plan     = ggml_sycl_global_plan_owner();
+        uint32_t   room_n_ubatch = 0;
+        // The realized check has the rung's own record: a request the hold kept outside the arena means the zone did
+        // not serve this rung, so the fit charges it here and nowhere else. The read copies the counters and resets
+        // nothing, so the realized refusal still reports them.
+        bool       held_out      = false;
+        if (q.rung_live) {
+            ggml_sycl::planned_hold_spill_totals totals;
+            ggml_sycl::unified_cache_get_recent_planned_hold_spills(q.device, q.owner, &totals);
+            held_out = totals.raw_count != 0;
+        }
+        const size_t room_bytes = ggml_sycl::placement_plan_compute_room(
+            *room_plan, q.device, ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device),
+            ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device), &room_n_ubatch);
+        in.compute_room_n_ubatch = room_n_ubatch;
+        in.compute_room_bytes    = room_bytes;
+        in.held_out_n_ubatch     = held_out ? q.n_ubatch : 0;
+    }
+```
+
+   Keep the comment block above it (19818-19822) but change "credits a request of that rung no larger than the term"
+   to "credits that rung and every rung below it".
+
+   e. Tests that encode the old rule:
+   - `test-zone-sizing.cpp:1720, 1732, 1744, 1754, 1759`: add the fourth argument. 1720, 1732 and 1744 pass `true`
+     (their 2048 record is the rung's own). Replace 1752-1756 with:
+
+```cpp
+        // A rung below the room's rung with no record of its own is served by the room: 1024 here.
+        in.compute_room_bytes = room;
+        CHECK(ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 1024, 980 * MiB, false), "a rung below the room");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 98 * MiB - 64 * MiB,
+              "1024's scaled buffer is credited: the plan alone");
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 4096, 1, false), "a rung above the room is not");
+```
+
+     1759 becomes `(in, 0, 0, false)`.
+   - `tests/test-sycl-layout-choice.cpp:885-887`: the 256 rung is now credited. Replace with
+     `ggml_sycl::zone_hold_fit_rung_has_compute_room(fit, 512, compute_term, true) &&
+      ggml_sycl::zone_hold_fit_rung_has_compute_room(fit, 256, compute_term / 2, false) &&
+      !ggml_sycl::zone_hold_fit_rung_has_compute_room(fit, 1024, compute_term, false);`
+     and its comment "only the planning rung is credited ... not 256, not 1024" to "the planning rung and the rungs
+     below it are credited, never a rung above". Delete line 891 (the `held_out` call) and its comment line 890; the
+     held-out case is now Case 24d. Drop the `false` argument from the other `placement_plan_compute_room` calls
+     (879, 889, 893, 895, 902, 910). Update the FAIL text at the end of the block: "credited at that rung and below".
+   - `tests/test-sycl-explicit-ubatch-placement-source.py`:
+
+```python
+FIT_HELD_OUT = ("bool held_out = false; if (q.rung_live) { ggml_sycl::planned_hold_spill_totals totals; "
+                "ggml_sycl::unified_cache_get_recent_planned_hold_spills(q.device, q.owner, &totals); "
+                "held_out = totals.raw_count != 0; }")
+FIT_ROOM = ("const size_t room_bytes = ggml_sycl::placement_plan_compute_room(*room_plan, q.device, "
+            "ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device), "
+            "ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device), &room_n_ubatch);")
+PLAN_ROOM_GATE = "if (!plan.multi_device && plan.device_id == device) {"
+FIT_FIELDS = ("in.compute_room_n_ubatch = room_n_ubatch; in.compute_room_bytes = room_bytes; "
+              "in.held_out_n_ubatch = held_out ? q.n_ubatch : 0;")
+CREDIT_SIG = ("bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, "
+              "size_t request, bool own_record)")
+CREDIT_RULE = ("if (n_ubatch == 0 || in.compute_room_n_ubatch == 0 || n_ubatch > in.compute_room_n_ubatch || "
+               "n_ubatch == in.held_out_n_ubatch) { return false; } return !own_record || request <= in.compute_room_bytes;")
+DEMAND_CREDIT = ("t.request = zone_hold_fit_request(in, n_ubatch); "
+                 "t.request_credited = zone_hold_fit_rung_has_compute_room(in, n_ubatch, t.request, "
+                 "zone_hold_fit_rung_has_record(in, n_ubatch));")
+```
+
+     The claim at 386 also counts `fit.count("in.compute_room_n_ubatch =") == 1`; add
+     `and fit.count("in.held_out_n_ubatch =") == 1`.
+   - `docs/backend/sycl-memory-design.md:2893-2898`: "the hold-spill fit credits a compute buffer of that rung no larger
+     than the term, whole or nothing ... Every other rung, the auto trial's included, is judged as before." becomes
+     "the hold-spill fit credits that rung and every rung below it: a rung's own measured buffer when it is no larger
+     than the term, whole or nothing, and a rung without a record of its own always, since compute buffers grow with
+     the micro-batch. The rung whose own buffer the hold kept outside the arena gets no credit; a rung above the
+     room's rung gets none either."
+
+   Rebuild and run `test-zone-sizing`: `rc=0`. Run `python3 tests/test-sycl-explicit-ubatch-placement-source.py`
+   and `python3 tests/test-sycl-auto-ubatch-source.py`: all pass. The lead builds and runs
+   `ctest --test-dir build -R '^sycl-layout-choice$' --output-on-failure` (it links the SYCL private fixtures; it
+   touches no device, but it is a SYCL binary, so the lead runs it).
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the hold-spill fit credits the planned compute room below its rung and charges only the held-out rung" -- \
+    ggml/src/ggml-sycl/zone-sizing.hpp ggml/src/ggml-sycl/zone-sizing.cpp ggml/src/ggml-sycl/ggml-sycl.cpp \
+    ggml/src/ggml-sycl/unified-cache.hpp ggml/src/ggml-sycl/unified-cache.cpp \
+    ggml/src/ggml-sycl/tests/test-zone-sizing.cpp tests/test-sycl-layout-choice.cpp \
+    tests/test-sycl-explicit-ubatch-placement-source.py docs/backend/sycl-memory-design.md
+```
+
+**Gotchas:**
+- The descent asks rungs below the refused one with the refused rung's inputs. That is right for every input but the
+  held-out flag, which this task scopes. Do not add other per-rung state.
+- More rungs are now credited, so the verdict at a pinned `-ub` below the load's planning micro-batch becomes more
+  permissive. That is sound only because the zone was sized for the larger rung's buffers; do not extend the credit
+  to rungs above `compute_room_n_ubatch`.
+- `ggml-sycl.cpp` has two other "largest -ub that fits" texts (`:20736`, the ring refusal; `:21937`, the explicit
+  micro-batch refusal) with their own estimators. They are not this defect and this task does not touch them. The
+  lead's gate greps the hold-spill text only.
+- The refusal still prints `compute_room=...@...`; it now shows the room at the held-out rung too, with
+  `request_credited=0`. That is the truth; leave the format.
+
+---
+
+### Task W3.2a: the Graph floor leaves out layers whose attention oneDNN refuses (sinks)
+
+**Track:** G
+**Depends on:** none
+**File scope:**
+- Modify: `src/llama-model.cpp:422-436` (`llama_model_sycl_populate_inventory` signature), `:603-628` (the head maxima loop, find by `if (!llama_model_sycl_onednn_head_dim_eligible(`), `:796` and `:875` (its two callers), and a new helper above `llama_model_sycl_populate_inventory`
+- Modify: `tests/test-sycl-onednn-graph-floor-eligibility-source.py` (one new test, and the `POPULATE_INVENTORY_BODY` anchor if the first line of the signature changes; it does not, see Gotchas)
+
+**Description:**
+
+The oneDNN Graph scratch floor reserves VRAM in the ONEDNN zone for the attention of every layer the oneDNN SDPA path
+accepts. The inventory counts a layer as accepted when its head size and scale pass
+`llama_model_sycl_onednn_head_dim_eligible`. The real gate (`ggml_sycl_flash_attn_ext_onednn_plan`,
+`fattn-onednn.cpp`) also refuses any op with attention sinks (`if (params.sinks) return ...SINKS_UNSUPPORTED`). GPT-OSS
+has sinks on every layer, so its floor counts 64 heads it never runs through oneDNN. At the planning shape (512 x 512)
+the floor is the 64 MiB minimum, so nobody saw it. W3.2c sizes the floor at the caller's context, where GPT-OSS at
+`-c 4096` would hold about 805 MB for nothing. This task makes the head maxima skip layers with sinks, before W3.2c.
+
+**Acceptance Criteria:**
+- [ ] A layer with an `attn_sinks` weight in the file is left out of `n_head_ctx_max` and `n_head_swa_max`, and still counts in `n_head_all_max`.
+- [ ] Both inventory builders pass the same mask, built by one helper from `ml.weights_map`.
+- [ ] The new source test passes; the existing eligibility tests pass.
+- [ ] (lead) GPT-OSS 20B B50 log line `oneDNN Graph-scratch zone floor: 64.0 MB (n_head_ctx_max=0 n_head_swa_max=0` (needs `-v`; the line is INFO).
+
+**Implementation Guide:**
+
+1. **RED.** Append to `tests/test-sycl-onednn-graph-floor-eligibility-source.py`:
+
+```python
+def test_layers_with_sinks_do_not_count_toward_the_floor() -> None:
+    # The real gate refuses an op with attention sinks before it looks at the head size, so a layer that carries
+    # sinks never draws Graph scratch and must not raise the per-class head maxima the floor is sized from. The
+    # all-layers maximum feeds the non-FA guard, which runs on every layer, so it still counts them.
+    assert re.search(r"if\s*\(\s*params\.sinks\s*\)\s*\{\s*return\s+ggml_sycl_onednn_fa_reject\(",
+                     FATTN_ONEDNN_PLAN_BODY), "the real gate no longer refuses sinks: revisit this test"
+    code = strip_comments(POPULATE_INVENTORY_BODY)
+    all_max = code.index("n_head_all_max = std::max(n_head_all_max, hparams.n_head(il));")
+    skip = re.search(r"if\s*\(\s*sinks_layer_mask\s*&&\s*sinks_layer_mask\[il\]\s*\)\s*\{\s*continue;\s*\}", code)
+    assert skip, "populate_inventory must skip layers with sinks before the per-class maxima"
+    assert all_max < skip.start(), "the all-layers maximum must be taken before the sinks skip"
+    assert skip.start() < code.index("n_head_ctx_max = std::max(n_head_ctx_max, hparams.n_head(il));")
+    assert LLAMA_MODEL_CPP.count("llama_model_sycl_attn_sinks_layers(ml, ") == 2, "both inventory builders build the mask"
+```
+
+   Run `python3 tests/test-sycl-onednn-graph-floor-eligibility-source.py`. Expected: the new test fails on
+   "populate_inventory must skip layers with sinks".
+
+2. **GREEN.** In `src/llama-model.cpp`, above `llama_model_sycl_populate_inventory` (line 422):
+
+```cpp
+// Which layers carry attention sinks. The oneDNN SDPA path refuses an op with sinks, so those layers never draw
+// oneDNN Graph scratch and the floor's head maxima leave them out. Read from the file's tensor list, the same source
+// for the early and the late inventory.
+static std::unique_ptr<bool[]> llama_model_sycl_attn_sinks_layers(const llama_model_loader & ml, uint32_t n_layer) {
+    std::unique_ptr<bool[]> sinks(new bool[n_layer]());
+    const LLM_TN            tn(ml.get_arch());
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        sinks[il] = ml.weights_map.find(tn(LLM_TENSOR_ATTN_SINKS, "weight", il).str()) != ml.weights_map.end();
+    }
+    return sinks;
+}
+```
+
+   Add a parameter `const bool * sinks_layer_mask,` to `llama_model_sycl_populate_inventory` right after
+   `const bool * swa_layer_mask,` (line 424). In the loop, after `n_head_all_max = std::max(...)` and before the
+   head-dim check:
+
+```cpp
+        // The oneDNN SDPA path refuses attention with sinks, whatever the head size.
+        if (sinks_layer_mask && sinks_layer_mask[il]) {
+            continue;
+        }
+```
+
+   At both callers (796 and 875), build the mask next to `swa_layer_mask` and pass it:
+   `const std::unique_ptr<bool[]> sinks_layer_mask = llama_model_sycl_attn_sinks_layers(ml, hparams.n_layer);` and
+   `sinks_layer_mask.get()` as the new argument. (Check how each builder names `n_layer`; both read `hparams`.)
+
+   Run the eligibility pin: all pass. Build `llama-completion` (`./scripts/sycl-build.sh llama-completion`) to compile
+   `llama-model.cpp`.
+
+**Commit:**
+
+```bash
+git commit -m "llama: the oneDNN Graph floor's head maxima leave out layers with attention sinks" -- \
+    src/llama-model.cpp tests/test-sycl-onednn-graph-floor-eligibility-source.py
+```
+
+**Gotchas:**
+- `POPULATE_INVENTORY_BODY` is anchored on the signature's first line (`static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &         inventory,`).
+  Add the parameter on a later line so the anchor still matches.
+- The early inventory is built before the tensors exist, so do not read `model.layers[il].attn_sinks`; the file's
+  tensor list is the one source both builders have.
+- Confirm the tensor name GPT-OSS uses: `cat src/models/openai-moe.cpp | grep -n 'ATTN_SINKS'` (or the file that builds
+  `LLM_ARCH_OPENAI_MOE`). It is `tn(LLM_TENSOR_ATTN_SINKS, "weight", i)` in the other architectures.
+- An architecture without sinks gets an all-false mask: no change.
+
+---
+
+### Task W3.2b: the plan carries the context shape, and the Graph scratch shape reads it
+
+**Track:** G
+**Depends on:** W3.2a
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/zone-sizing.hpp` / `zone-sizing.cpp` (a new pure function, placed after `zone_hold_free_before`)
+- Modify: `ggml/src/ggml-sycl/unified-cache.hpp:1174-1176` (two new `placement_plan` fields after `planner_n_ubatch`)
+- Modify: `ggml/src/ggml-sycl/unified-cache.cpp:36703-36704` and `:38180-38181` (set them where the plan's shape is set)
+- Modify: `ggml/src/ggml-sycl/unified-cache.cpp:35696-35713` (inside `populate_host_zone_sizing`: the Graph shape setter and its INFO line)
+- Modify: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` (new case)
+
+**Description:**
+
+At load the plan's `planner_n_ctx` and `planner_n_ubatch` are the planning shape (512 and 512). They also size KV and
+the MoE prompt path, so they stay. But the Graph scratch floor is sized from them too, so the ONEDNN zone is planned
+for a 512-cell, 512-row attention whatever the caller asked, and the zone cannot grow once weights are live. On Qwen
+at `-ub 2048` one Graph request missed the zone and went DIRECT, outside the plan.
+
+The inventory already carries the context the caller named (`kv_info.n_ctx_context`) and its micro-batch
+(`kv_info.n_ubatch_context`). This task adds the context shape to the plan, from one pure function:
+- at load (`n_ctx_is_runtime` false): the caller's context and micro-batch when named, else the planning shape;
+- at a runtime context transaction (`n_ctx_is_runtime` true): the plan's own shape, which is the context's.
+
+The Graph scratch shape setter in `populate_host_zone_sizing` then reads the context shape. The non-FA scratch shape
+(`:35732-35733`) keeps the planning shape: see the design choice.
+
+**Design choice:** the non-FA attention scratch stays at the planning shape. The load cannot know whether the context
+will run flash attention (the envelope's `flash_attn_type` is always AUTO), and the non-FA demand at the real shape
+(`n_head * n_ubatch * n_ctx * 6` bytes) is several GB at `-c 32768`. Raising SCRATCH for it would displace experts on
+every flash-attention context. The runtime check (`ggml_sycl_check_nonfa_attn_scratch`, `ggml-sycl.cpp:20079`) stays
+the authority and refuses by name. Rejected: sizing it at the context shape.
+
+**Acceptance Criteria:**
+- [ ] `zone_plan_context_shape(false, 512, 4096, 512, 2048)` is `{4096, 2048}`; `(false, 512, 0, 512, 0)` is `{512, 512}`; `(true, 8192, 4096, 1024, 2048)` is `{8192, 1024}`.
+- [ ] `placement_plan` has `context_n_ctx` and `context_n_ubatch`, set at both plan builders.
+- [ ] The Graph shape setter and its INFO line read `plan.context_n_ubatch` and `plan.context_n_ctx`; the non-FA setter still reads `planner_n_ubatch`, `planner_n_ctx`.
+- [ ] `test-zone-sizing` passes (lead build and run).
+- [ ] (lead) Gate G-W3.2 below: the floor line prints the context shape.
+
+**Implementation Guide:**
+
+1. **RED.** Add to `test-zone-sizing.cpp` (a new case after Case 24d):
+
+```cpp
+    // ---- Case 24e: the context shape a plan sizes the per-context scratch for. At load it is the context and
+    // micro-batch the caller named, else the load's planning shape; at a context transaction it is the context's own.
+    {
+        using ggml_sycl::zone_plan_context_shape;
+        ggml_sycl::zone_context_shape s = zone_plan_context_shape(false, 512, 4096, 512, 2048);
+        CHECK(s.n_ctx == 4096 && s.n_ubatch == 2048, "a load the caller named a shape for: that shape");
+        s = zone_plan_context_shape(false, 512, 0, 512, 0);
+        CHECK(s.n_ctx == 512 && s.n_ubatch == 512, "a load with no shape named: the planning shape");
+        s = zone_plan_context_shape(false, 512, 4096, 512, 0);
+        CHECK(s.n_ctx == 4096 && s.n_ubatch == 512, "a context with no micro-batch named: the planning micro-batch");
+        s = zone_plan_context_shape(true, 8192, 4096, 1024, 2048);
+        CHECK(s.n_ctx == 8192 && s.n_ubatch == 1024, "a context transaction: the context's own shape");
+        s = zone_plan_context_shape(false, 512, 256, 512, 2048);
+        CHECK(s.n_ubatch == 256, "a micro-batch is never above its context");
+    }
+```
+
+   Build and run `test-zone-sizing`. Expected: compile error, "'zone_plan_context_shape' is not a member of 'ggml_sycl'".
+
+2. **GREEN.**
+
+   a. `zone-sizing.hpp`, after the `zone_hold_free_before` declaration:
+
+```cpp
+// The context shape a plan sizes its per-context scratch for (the oneDNN Graph attention floor, the MoE routing ids).
+// At load (`n_ctx_is_runtime` false) the plan's own shape is the load's planning shape, so the shape is the context and
+// micro-batch the caller named (`n_ctx_context`, `n_ubatch_context`), each falling back to the plan's own when 0. At a
+// context transaction the plan's own shape is the context's. The micro-batch never exceeds the context.
+struct zone_context_shape {
+    uint32_t n_ctx    = 0;
+    uint32_t n_ubatch = 0;
+};
+
+zone_context_shape zone_plan_context_shape(bool     n_ctx_is_runtime,
+                                           uint32_t plan_n_ctx,
+                                           uint32_t n_ctx_context,
+                                           uint32_t plan_n_ubatch,
+                                           uint32_t n_ubatch_context);
+```
+
+   `zone-sizing.cpp`:
+
+```cpp
+zone_context_shape zone_plan_context_shape(bool     n_ctx_is_runtime,
+                                           uint32_t plan_n_ctx,
+                                           uint32_t n_ctx_context,
+                                           uint32_t plan_n_ubatch,
+                                           uint32_t n_ubatch_context) {
+    zone_context_shape s;
+    s.n_ctx    = !n_ctx_is_runtime && n_ctx_context != 0 ? n_ctx_context : plan_n_ctx;
+    s.n_ubatch = !n_ctx_is_runtime && n_ubatch_context != 0 ? n_ubatch_context : plan_n_ubatch;
+    if (s.n_ctx != 0 && s.n_ubatch > s.n_ctx) {
+        s.n_ubatch = s.n_ctx;
+    }
+    return s;
+}
+```
+
+   b. `unified-cache.hpp`, after `uint32_t planner_n_ubatch = 0;` (line 1175):
+
+```cpp
+    // The context shape the per-context scratch is sized for (zone_plan_context_shape): at load the context and
+    // micro-batch the caller named, else the planning shape above; at a context transaction the context's own.
+    uint32_t                     context_n_ctx            = 0;
+    uint32_t                     context_n_ubatch         = 0;
+```
+
+   c. `unified-cache.cpp`, after line 36704 and after line 38181 (both plan builders), the same three lines:
+
+```cpp
+    const zone_context_shape context_shape = zone_plan_context_shape(
+        kv_info.n_ctx_is_runtime, plan.planner_n_ctx, kv_info.n_ctx_context, plan.planner_n_ubatch, kv_info.n_ubatch_context);
+    plan.context_n_ctx    = context_shape.n_ctx;
+    plan.context_n_ubatch = context_shape.n_ubatch;
+```
+
+   d. `unified-cache.cpp:35696-35713`: replace `plan.planner_n_ubatch, plan.planner_n_ctx` with
+   `plan.context_n_ubatch, plan.context_n_ctx` in the setter call, the floor call and the INFO arguments. Add one
+   comment line above the setter: "Sized for the context the caller named (plan.context_*), not the planning shape: the
+   ONEDNN zone cannot grow once weights are live." Leave the non-FA setter (`:35732-35733`) as it is and add to its
+   comment: "The planning shape on purpose: the load cannot know whether the context runs flash attention."
+
+   e. Any code path that mutates a plan copy at a context transaction (`ggml_sycl_run_runtime_context_transaction`,
+   which the comment at `unified-cache.cpp:36707-36711` mentions) and then reads the Graph shape must set
+   `context_n_ctx`/`context_n_ubatch` too. Find them: `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n 'planner_n_ctx *=\|planner_n_ubatch *=\|update_runtime_kv_sizes('`.
+   At each place that writes `planner_n_ubatch` or calls `update_runtime_kv_sizes`, set
+   `next_plan.context_n_ctx = next_plan.planner_n_ctx; next_plan.context_n_ubatch = next_plan.planner_n_ubatch;`
+   right after it, with the comment "A context transaction sizes for the context itself."
+
+   Rebuild and run `test-zone-sizing`: `rc=0`. Run `python3 tests/test-sycl-onednn-graph-allocator-source.py` and
+   `python3 tests/test-sycl-plan-dry-run-source.py`; if a pin asserts the setter's exact arguments, update its
+   constant to the new spelling in this task.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the plan carries the caller's context shape and the oneDNN Graph floor is sized for it" -- \
+    ggml/src/ggml-sycl/zone-sizing.hpp ggml/src/ggml-sycl/zone-sizing.cpp ggml/src/ggml-sycl/unified-cache.hpp \
+    ggml/src/ggml-sycl/unified-cache.cpp ggml/src/ggml-sycl/ggml-sycl.cpp ggml/src/ggml-sycl/tests/test-zone-sizing.cpp
+```
+
+(Add the pin files you had to update.)
+
+**Gotchas:**
+- Do not change `planner_n_ctx` or `planner_n_ubatch`: KV sizing, `planner_effective_ubatch_for_moe_pp`
+  (`unified-cache.cpp:32442-32450`) and the ring read them.
+- `populate_host_zone_sizing` is shared with another drafter (W3.5 to W3.7). Touch only `35696-35713` here. See File ownership.
+- Without W3.2c a long context makes the floor large: at `-c 32768 -ub 2048` with 32 heads the formula is 24 GiB.
+  The zone's 25% budget clamp (`ensure_planned_arena_zones`, `unified-cache.cpp:7412-7460`) bounds it, but W3.2c must
+  land before the lead's gates. Merge W3.2b and W3.2c together.
+
+---
+
+### Task W3.2c: the Graph floor is bounded by the dispatcher's chunk budget
+
+**Track:** G
+**Depends on:** W3.2b
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/zone-sizing.hpp` / `zone-sizing.cpp` (the floor formula moves here as a pure function)
+- Modify: `ggml/src/ggml-sycl/unified-cache.cpp:4148-4225` (`onednn_graph_scratch_zone_floor_bytes_swa`), `:4271-4288` (`onednn_planned_pair_and_floor`)
+- Modify: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` (new case)
+
+**Description:**
+
+The dispatcher splits each oneDNN attention execute so it needs at most half the DIRECT cap of Graph scratch
+(`fattn-onednn.cpp:1193-1201`, `chunk_budget = unified_cache_onednn_graph_scratch_direct_cap_bytes(...) / 2`); a full
+chunk and the last chunk then fit under the cap together. So the most Graph scratch attention can hold at once is the
+cap. A floor above the cap holds VRAM no execute uses. This task moves the formula into `zone-sizing.cpp` (pure,
+host-tested) and bounds the floor by the cap, so the zone and the dispatcher read one number. The cap is
+`min(1 GiB, a quarter of the budget available at plan time)` or `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`.
+
+**Acceptance Criteria:**
+- [ ] `zone_onednn_graph_scratch_floor_bytes(n_head_ctx_max, n_head_swa_max, n_swa, n_ubatch, n_ctx, cap)` returns `max(64 MiB, min(formula, cap))`, and the formula for a cap of 0 (none known).
+- [ ] `onednn_graph_scratch_zone_floor_bytes_swa` keeps the env override (`GGML_SYCL_ONEDNN_GRAPH_ZONE_MB`) and otherwise calls the pure function with the device's cap.
+- [ ] `test-zone-sizing` passes (lead build and run). `test-sycl-onednn-graph-floor` passes (lead run: it links the SYCL backend).
+- [ ] (lead) Gate G-W3.2 below.
+
+**Implementation Guide:**
+
+1. **RED.** Add to `test-zone-sizing.cpp`:
+
+```cpp
+    // ---- Case 24f: the oneDNN Graph floor, bounded by the dispatcher's chunk budget. Each execute is split to half
+    // the DIRECT cap, so a full chunk and the last one fit under the cap together: the floor never holds more.
+    {
+        const size_t MiB = 1024 * 1024;
+        using ggml_sycl::zone_onednn_graph_scratch_floor_bytes;
+        // 512 x 512, 16 heads: 16 * 512 * 512 * 4 * 3 / 2 = 24 MiB, under the 64 MiB minimum
+        CHECK(zone_onednn_graph_scratch_floor_bytes(16, 0, 0, 512, 512, 1024 * MiB) == 64 * MiB, "the minimum");
+        // 2048 x 4096, 16 heads: 768 MiB, under a 1 GiB cap
+        CHECK(zone_onednn_graph_scratch_floor_bytes(16, 0, 0, 2048, 4096, 1024 * MiB) == 768 * MiB, "the formula");
+        // 2048 x 32768, 32 heads: 12 GiB, bounded by the cap
+        CHECK(zone_onednn_graph_scratch_floor_bytes(32, 0, 0, 2048, 32768, 1024 * MiB) == 1024 * MiB, "the cap");
+        CHECK(zone_onednn_graph_scratch_floor_bytes(32, 0, 0, 2048, 32768, 0) == size_t(12) * 1024 * MiB,
+              "no cap known: the formula");
+        // SWA window: min(n_ctx, n_swa + n_ubatch)
+        CHECK(zone_onednn_graph_scratch_floor_bytes(0, 8, 512, 2048, 32768, 1024 * MiB) == 8 * 2560 * 2048 * 6,
+              "the window, not the context, for SWA heads");
+        CHECK(zone_onednn_graph_scratch_floor_bytes(0, 0, 0, 2048, 4096, 1024 * MiB) == 64 * MiB, "no eligible head");
+    }
+```
+
+   (8 * 2560 * 2048 * 6 = 251,658,240 bytes = 240 MiB, above the minimum.) Build and run: expected compile error,
+   "'zone_onednn_graph_scratch_floor_bytes' is not a member of 'ggml_sycl'".
+
+2. **GREEN.**
+
+   a. `zone-sizing.hpp`:
+
+```cpp
+// The oneDNN Graph attention scratch the ONEDNN zone holds: the modeled peak of one execute,
+// max(n_head_ctx_max * n_ctx, n_head_swa_max * min(n_ctx, n_swa + n_ubatch)) * n_ubatch f32 elements, times 3/2,
+// bounded by `direct_cap` (the dispatcher splits an execute to half the cap, so a full chunk and the last chunk fit
+// under it together and no more is ever held), and at least 64 MiB. `direct_cap` 0 is no cap known: the formula.
+size_t zone_onednn_graph_scratch_floor_bytes(uint32_t n_head_ctx_max,
+                                             uint32_t n_head_swa_max,
+                                             uint32_t n_swa,
+                                             uint32_t n_ubatch,
+                                             uint32_t n_ctx,
+                                             size_t   direct_cap);
+```
+
+   `zone-sizing.cpp`:
+
+```cpp
+size_t zone_onednn_graph_scratch_floor_bytes(uint32_t n_head_ctx_max,
+                                             uint32_t n_head_swa_max,
+                                             uint32_t n_swa,
+                                             uint32_t n_ubatch,
+                                             uint32_t n_ctx,
+                                             size_t   direct_cap) {
+    constexpr uint64_t k_floor_min_bytes = 64ull * 1024ull * 1024ull;
+    constexpr uint64_t k_sizeof_f32      = 4;
+    const uint64_t     ctx_term          = uint64_t(n_head_ctx_max) * uint64_t(n_ctx);
+    const uint64_t     swa_term = uint64_t(n_head_swa_max) * std::min<uint64_t>(n_ctx, uint64_t(n_swa) + n_ubatch);
+    const uint64_t     elems    = std::max(ctx_term, swa_term) * uint64_t(n_ubatch);
+    uint64_t           modeled  = (elems * k_sizeof_f32 * 3) / 2;
+    if (direct_cap != 0) {
+        modeled = std::min<uint64_t>(modeled, direct_cap);
+    }
+    return static_cast<size_t>(std::max<uint64_t>(k_floor_min_bytes, modeled));
+}
+```
+
+   b. `unified-cache.cpp:4148-4225`: keep the env-override comment and code, replace the formula (from
+   `static constexpr uint64_t kFloorMinBytes` to the `return`) with a call. The function needs the cap, so give it a
+   `size_t direct_cap` parameter and pass it from both callers:
+
+```cpp
+    return zone_onednn_graph_scratch_floor_bytes(n_head_ctx_max, n_head_swa_max, n_swa, n_ubatch, n_ctx, direct_cap);
+```
+
+   In `onednn_planned_pair_and_floor` (4284-4285) pass `unified_cache_onednn_graph_scratch_direct_cap_bytes(device_id)`.
+   In the DIRECT-failure log (`:15768-15775`, find by `floor %.1f MB at n_head_ctx_max=`) pass
+   `onednn_graph_scratch_direct_cap()`, and in the INFO line of W3.2b (`:35704-35708`) pass
+   `unified_cache_onednn_graph_scratch_direct_cap_bytes(plan.device_id)`. List every caller first:
+   `cat ggml/src/ggml-sycl/unified-cache.cpp | grep -n 'onednn_graph_scratch_zone_floor_bytes_swa('`.
+   Change the INFO line at `:35704` to WARN only if the lead asks; it stays INFO here (the gate passes `-v`).
+
+   Rebuild and run `test-zone-sizing`: `rc=0`. The lead runs `ctest --test-dir build -R '^test-sycl-onednn-graph-floor$' --output-on-failure`
+   (check the exact name with `ctest --test-dir build -N | grep -i graph-floor`); its expectations are at the
+   planning shape (64 MiB minimum) and do not move unless one exceeds 1 GiB. If one does, it moves to the cap for this
+   reason; change the expectation and say so in the report.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the oneDNN Graph floor is a pure function bounded by the dispatcher's chunk budget" -- \
+    ggml/src/ggml-sycl/zone-sizing.hpp ggml/src/ggml-sycl/zone-sizing.cpp ggml/src/ggml-sycl/unified-cache.cpp \
+    ggml/src/ggml-sycl/tests/test-zone-sizing.cpp
+```
+
+**Gotchas:**
+- Before the first `ensure_planned_arena_zones` the cap's plan-time snapshot is 0, and the cap is then 1 GiB
+  (`onednn_graph_scratch_direct_cap_bytes(0)`). The floor is bounded by 1 GiB at that point, then by a quarter of the
+  budget. Both are bounds the dispatcher also uses.
+- `test-zone-sizing` links no ggml-base and stubs the log macro (`ZONE_SIZING_STANDALONE`). The new function logs
+  nothing, so nothing changes there.
+- `std::min<uint64_t>(n_ctx, uint64_t(n_swa) + n_ubatch)` widens before the add; keep it, `n_swa + n_ubatch` in 32 bits
+  can wrap for a huge window.
+
+---
+
+### Task W3.2d: a context whose Graph scratch the load did not plan is refused by name, not by the DIRECT abort
+
+**Track:** G
+**Depends on:** W3.2c
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/zone-sizing.hpp` / `zone-sizing.cpp` (two pure functions)
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp` (a new check next to `ggml_sycl_check_nonfa_attn_scratch` at `:20079`, and its call in the context transaction after the non-FA check at `:21771-21775`, find by `return refuse("non-FA attention scratch exceeds the device's outside-arena headroom");`)
+- Modify: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` (new case)
+
+**Description:**
+
+After W3.2b the load plans the ONEDNN zone for the context the caller named. A later context can still ask for more:
+a larger `-c` than the hint, or an API caller that gave no hint. Its Graph requests then go DIRECT, outside the arena,
+and when the card has no room the allocator aborts the process (`unified-cache.cpp:15761-15796`,
+"oneDNN Graph scratch DIRECT allocation exhausted"). This task checks it at the context transaction, where the shape is
+known: the part of the context's Graph scratch the zone cannot hold must fit outside the arena above the driver
+headroom, together with the hold's worst-case spill (the same headroom the non-FA check guards). Otherwise the
+context is refused and the refusal names the largest power-of-two micro-batch whose Graph scratch fits.
+
+**Design choice:** refuse only when the part above the zone does not fit outside the arena. Rejected: refusing every
+context whose Graph scratch exceeds the zone, which would refuse Qwen at `-ub 2048` (one DIRECT request, ran
+correctly in W3.0) whenever the hint was smaller.
+
+**Acceptance Criteria:**
+- [ ] `zone_onednn_graph_uncovered_bytes(demand, room)` is `demand - room` above the room, else 0.
+- [ ] `zone_onednn_graph_fit_largest_ub(...)` returns the largest power of two (at least 32) not above the asked micro-batch whose uncovered part fits, 0 when none does.
+- [ ] The transaction refuses with `[SYCL-PLAN] runtime context update rejected: the oneDNN Graph attention scratch ...` naming the largest -ub that fits, when flash attention is on and the Graph allocator is enabled.
+- [ ] `test-zone-sizing` passes (lead build and run).
+- [ ] (lead) Gate G-W3.2 run 3 below.
+
+**Implementation Guide:**
+
+1. **RED.** Add to `test-zone-sizing.cpp`:
+
+```cpp
+    // ---- Case 24g: a context's oneDNN Graph scratch above the zone the load planned. The part above the zone's
+    // Graph room is served outside the arena and must leave the card its headroom; otherwise the refusal names the
+    // largest power-of-two micro-batch whose part fits.
+    {
+        const size_t MiB = 1024 * 1024;
+        using ggml_sycl::zone_onednn_graph_uncovered_bytes;
+        using ggml_sycl::zone_onednn_graph_fit_largest_ub;
+        CHECK(zone_onednn_graph_uncovered_bytes(768 * MiB, 1024 * MiB) == 0, "inside the zone: nothing uncovered");
+        CHECK(zone_onednn_graph_uncovered_bytes(768 * MiB, 512 * MiB) == 256 * MiB, "the part above the room");
+        // 16 heads, n_ctx 4096, a 1 GiB cap, 192 MiB of Graph room (planned at ubatch 512), 600 MiB free outside the
+        // arena, 256 MiB headroom, no hold spill. 2048: 768 MiB, 576 uncovered, refused; 1024: 384 MiB, 192 uncovered,
+        // 408 left: fits.
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
+                  1024,
+              "the refusal at 2048 names 1024");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 1024, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
+                  1024,
+              "a micro-batch that fits is returned unchanged");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 0, 200 * MiB, 256 * MiB, 0) == 0,
+              "a card already under the headroom: nothing named");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB,
+                                               200 * MiB) == 512,
+              "the hold's spill is charged beside the uncovered part");
+    }
+```
+
+   Check the arithmetic: at 1024, 16 * 4096 * 1024 * 6 = 384 MiB, 192 uncovered, 600 - 192 = 408 >= 256: fits. With a
+   200 MiB hold spill: 1024 leaves 208, refused; 512 is 192 MiB, inside the room, leaves 400: fits.
+
+   Build and run: expected compile error naming `zone_onednn_graph_uncovered_bytes`.
+
+2. **GREEN.**
+
+   a. `zone-sizing.hpp` and `.cpp`:
+
+```cpp
+// The part of a context's oneDNN Graph scratch the ONEDNN zone's Graph room cannot hold: served outside the arena.
+size_t zone_onednn_graph_uncovered_bytes(size_t demand, size_t graph_room);
+
+// The largest power of two (at least 32, not above n_ubatch) whose Graph scratch, less the zone's Graph room, plus
+// the hold's worst-case spill, leaves `free_outside` at least `headroom`. n_ubatch itself when it fits; 0 when no
+// rung does or the card is under the headroom without any of it.
+uint32_t zone_onednn_graph_fit_largest_ub(uint32_t n_head_ctx_max,
+                                          uint32_t n_head_swa_max,
+                                          uint32_t n_swa,
+                                          uint32_t n_ctx,
+                                          uint32_t n_ubatch,
+                                          size_t   direct_cap,
+                                          size_t   graph_room,
+                                          size_t   free_outside,
+                                          size_t   headroom,
+                                          size_t   hold_spill);
+```
+
+```cpp
+size_t zone_onednn_graph_uncovered_bytes(size_t demand, size_t graph_room) {
+    return demand > graph_room ? demand - graph_room : 0;
+}
+
+uint32_t zone_onednn_graph_fit_largest_ub(uint32_t n_head_ctx_max,
+                                          uint32_t n_head_swa_max,
+                                          uint32_t n_swa,
+                                          uint32_t n_ctx,
+                                          uint32_t n_ubatch,
+                                          size_t   direct_cap,
+                                          size_t   graph_room,
+                                          size_t   free_outside,
+                                          size_t   headroom,
+                                          size_t   hold_spill) {
+    auto fits = [&](uint32_t ub) {
+        const size_t demand = zone_onednn_graph_scratch_floor_bytes(n_head_ctx_max, n_head_swa_max, n_swa, ub, n_ctx,
+                                                                    direct_cap);
+        const size_t outside = zone_hold_nonfa_demand(zone_onednn_graph_uncovered_bytes(demand, graph_room), hold_spill);
+        return outside <= free_outside && free_outside - outside >= headroom;
+    };
+    if (n_ubatch == 0 || free_outside < headroom) {
+        return 0;
+    }
+    if (fits(n_ubatch)) {
+        return n_ubatch;
+    }
+    uint32_t rung = 32;
+    while (rung <= n_ubatch / 2) {
+        rung <<= 1;
+    }
+    for (; rung >= 32; rung >>= 1) {
+        if (fits(rung)) {
+            return rung;
+        }
+    }
+    return 0;
+}
+```
+
+   `zone_hold_nonfa_demand` is the saturating sum the non-FA check already uses (`zone-sizing.cpp`, find by
+   `size_t zone_hold_nonfa_demand(`).
+
+   b. `ggml-sycl.cpp`, right after `ggml_sycl_check_nonfa_attn_scratch` ends:
+
+```cpp
+// The context's oneDNN Graph attention scratch against what the load planned: the ONEDNN zone holds the Graph room the
+// load sized for the context it was told; the part of this context's scratch above that room is served outside the
+// arena (the DIRECT path), and it must leave the card its driver headroom beside the hold's worst-case spill. A context
+// that would not is refused here, by name, instead of aborting at its first oversized attention.
+static bool ggml_sycl_check_onednn_graph_scratch(int                              device,
+                                                 const ggml_sycl::placement_plan & plan,
+                                                 bool                             flash_attn_enabled,
+                                                 bool                             probe_mode,
+                                                 const ggml_sycl_hold_fit_query & hold_query) {
+#if GGML_SYCL_DNNL
+    if (!flash_attn_enabled || !ggml_sycl::onednn_graph_allocator_enabled()) {
+        return true;
+    }
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (!cache || !cache->arena_active()) {
+        return true;
+    }
+    size_t free_mem = 0, total_mem = 0;
+    ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
+    if (total_mem == 0) {
+        return true;
+    }
+    const size_t cap        = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(device);
+    const size_t pair       = ggml_sycl::unified_cache_get_planned_onednn_scratchpad_bytes_stored(device);
+    const size_t zone       = cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN);
+    const size_t graph_room = zone > pair ? zone - pair : 0;
+    const size_t hold_spill = ggml_sycl_planned_scratch_hold_spill_bound(hold_query);
+    const uint32_t n_ubatch = plan.context_n_ubatch;
+    const uint32_t n_ctx    = plan.context_n_ctx;
+    const size_t   demand   = ggml_sycl::zone_onednn_graph_scratch_floor_bytes(
+        plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, n_ubatch, n_ctx, cap);
+    const uint32_t largest = ggml_sycl::zone_onednn_graph_fit_largest_ub(
+        plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, n_ctx, n_ubatch, cap, graph_room,
+        free_mem, kSyclArenaMinExternalHeadroomBytes, hold_spill);
+    if (largest == n_ubatch) {
+        return true;
+    }
+    const double mb = 1024.0 * 1024.0;
+    GGML_SYCL_RUNTIME_TXN_REFUSAL(
+        probe_mode,
+        "[SYCL-PLAN] runtime context update rejected: the oneDNN Graph attention scratch at n_ubatch=%u n_ctx=%u "
+        "(%.1f MB, bounded by the %.1f MB chunk cap) exceeds the %.1f MB the load planned in the ONEDNN zone, and the "
+        "%.1f MB above it, with the hold's %.1f MB worst-case spill, would leave device %d under the %.1f MB driver "
+        "headroom (%.1f MB free); %s; or tell the load this context (-c) so it plans the zone for it\n",
+        n_ubatch, n_ctx, demand / mb, cap / mb, graph_room / mb,
+        ggml_sycl::zone_onednn_graph_uncovered_bytes(demand, graph_room) / mb, hold_spill / mb, device, free_mem / mb,
+        kSyclArenaMinExternalHeadroomBytes / mb, ggml_sycl_hold_fit_advice(largest).c_str());
+    return false;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(plan);
+    GGML_UNUSED(flash_attn_enabled);
+    GGML_UNUSED(probe_mode);
+    GGML_UNUSED(hold_query);
+    return true;
+#endif
+}
+```
+
+   In the transaction, right after the non-FA refusal (`return refuse("non-FA attention scratch exceeds the device's
+   outside-arena headroom");` and its closing brace):
+
+```cpp
+    if (!ggml_sycl_check_onednn_graph_scratch(ctx->device, next_plan, flash_attn_enabled, probe_mode, hold_query)) {
+        return refuse("oneDNN Graph attention scratch exceeds the ONEDNN zone and the device's outside-arena headroom");
+    }
+```
+
+   `next_plan` must carry `context_n_ctx`/`context_n_ubatch` for this context (W3.2b step e). Confirm with a read of
+   the lines above the call that `next_plan.planner_n_ubatch == next_kv_info.n_ubatch` at this point.
+
+   Rebuild and run `test-zone-sizing`: `rc=0`. Build `llama-completion` (compiles `ggml-sycl.cpp`). Run
+   `python3 tests/test-sycl-nonfa-attn-scratch-guard-source.py`: all pass (the non-FA check is untouched).
+
+**Commit:**
+
+```bash
+git commit -m "sycl: a context whose oneDNN Graph scratch the load did not plan is refused by name" -- \
+    ggml/src/ggml-sycl/zone-sizing.hpp ggml/src/ggml-sycl/zone-sizing.cpp ggml/src/ggml-sycl/ggml-sycl.cpp \
+    ggml/src/ggml-sycl/tests/test-zone-sizing.cpp
+```
+
+**Gotchas:**
+- Confirm where the DIRECT path draws before trusting "outside the arena": read `unified-cache.cpp` just above
+  `:15730` (the `req` it builds for `unified_alloc`). If its request is a RUNTIME-zone request rather than raw device
+  memory, the uncovered part competes with the RUNTIME zone's free bytes, not the card's free memory: then use
+  `cache->zone_largest_free(vram_zone_id::RUNTIME)` as `free_outside` and a headroom of 0, and say so in the report.
+- The hold's spill is the one `ggml_sycl_planned_scratch_hold_spill_bound` returns, the same one the non-FA check
+  adds. Do not compute a second hold figure.
+- `ggml_sycl_hold_fit_advice` prints "estimated by scaling", which is true here too (the formula is a model).
+- The check runs in probe mode too (it has no side effect), so the auto ladder sees the same verdict.
+
+---
+
+### Task W3.3: the routing-ids host staging is sized for the context's micro-batch
+
+**Track:** G
+**Depends on:** W3.2b
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/unified-cache.cpp:35402-35410` (inside `populate_host_zone_sizing`, find by `const size_t max_batch_tokens = static_cast<size_t>(std::max<uint32_t>(plan.planner_n_ctx, 1));`)
+- Modify: `ggml/src/ggml-sycl/zone-sizing.hpp` / `zone-sizing.cpp` (one pure function)
+- Modify: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` (new case)
+
+**Description:**
+
+The routing ids are the host-pinned control buffer that tells each expert which tokens it serves. One micro-batch
+writes them, so their size follows the micro-batch: at most every token of the micro-batch per expert. The code sizes
+them by `plan.planner_n_ctx` ("the maximum context length = conservative max batch size"). At load that is the
+planning shape (512), which is too small for a wider micro-batch; at a context transaction it is the context, which
+is far too large (128 experts * 4 B * 262144 = 128 MiB of host-pinned memory for a micro-batch of 512). This task
+sizes them by the plan's context micro-batch, `plan.context_n_ubatch` (W3.2b). The expert count stays `n_experts`:
+the worst case is every token routed to one expert, for each expert.
+
+**Acceptance Criteria:**
+- [ ] `zone_moe_routing_ids_bytes(128, 2048)` is `128 * 4 * 2048`; `(128, 0)` is `128 * 4` (one token, as today's `max(.., 1)`).
+- [ ] `max_batch_tokens` reads `plan.context_n_ubatch`; the INFO line at `:35508-35515` still prints it as `max_batch`.
+- [ ] `test-zone-sizing` passes (lead build and run).
+- [ ] (lead) Gate G-W3.3 below.
+
+**Implementation Guide:**
+
+1. **RED.** Add to `test-zone-sizing.cpp`:
+
+```cpp
+    // ---- Case 24h: the MoE routing ids follow the micro-batch that writes them, not the context.
+    {
+        using ggml_sycl::zone_moe_routing_ids_bytes;
+        CHECK(zone_moe_routing_ids_bytes(128, 2048) == size_t(128) * 4 * 2048, "every token, for every expert");
+        CHECK(zone_moe_routing_ids_bytes(128, 0) == size_t(128) * 4, "an unknown micro-batch is one token");
+        CHECK(zone_moe_routing_ids_bytes(0, 2048) == 0, "no experts, no ids");
+    }
+```
+
+   Build and run: expected compile error naming `zone_moe_routing_ids_bytes`.
+
+2. **GREEN.** `zone-sizing.hpp`:
+
+```cpp
+// The host-pinned MoE routing ids one micro-batch writes: for each expert, the worst case of every token of the
+// micro-batch routed to it, one int32 each. An unknown micro-batch (0) counts one token.
+size_t zone_moe_routing_ids_bytes(int n_experts, uint32_t n_ubatch);
+```
+
+   `zone-sizing.cpp`:
+
+```cpp
+size_t zone_moe_routing_ids_bytes(int n_experts, uint32_t n_ubatch) {
+    if (n_experts <= 0) {
+        return 0;
+    }
+    return static_cast<size_t>(n_experts) * sizeof(int32_t) * static_cast<size_t>(std::max<uint32_t>(n_ubatch, 1));
+}
+```
+
+   `unified-cache.cpp:35402-35410` becomes:
+
+```cpp
+        // 3b. MoE routing IDs: the per-micro-batch expert assignment control buffer, n_expert rows of int32 for the
+        //     tokens of one micro-batch (zone_moe_routing_ids_bytes). Sized for the context's micro-batch
+        //     (plan.context_n_ubatch): the micro-batch writes them, not the context. These are CPU-produced and read
+        //     by any participating GPU, so they are planned as shared-context host-pinned CONTROL memory rather than
+        //     VRAM runtime bytes.
+        const size_t max_batch_tokens = static_cast<size_t>(std::max<uint32_t>(plan.context_n_ubatch, 1));
+        plan.moe_routing_ids_bytes    = zone_moe_routing_ids_bytes(n_experts, plan.context_n_ubatch);
+```
+
+   Keep `max_batch_tokens`: the INFO line at `:35508-35515` prints it. Rebuild and run `test-zone-sizing`: `rc=0`.
+   Run `python3 tests/test-sycl-plan-dry-run-source.py`: if a pin asserts the old `planner_n_ctx` line, change its
+   constant to the new line in this task.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the MoE routing ids are sized for the context's micro-batch, not its context" -- \
+    ggml/src/ggml-sycl/zone-sizing.hpp ggml/src/ggml-sycl/zone-sizing.cpp ggml/src/ggml-sycl/unified-cache.cpp \
+    ggml/src/ggml-sycl/tests/test-zone-sizing.cpp
+```
+
+**Gotchas:**
+- The fold at `:35825` adds `plan.moe_routing_ids_bytes` into the host CONTROL total. It reads the field, so it needs
+  no change; it is shared with the other drafter's tasks.
+- Find the consumer that allocates the routing-ids buffer before you trust the "one micro-batch" bound:
+  `cat ggml/src/ggml-sycl/*.cpp | grep -n 'moe_routing_ids\|routing_ids_bytes'`. If a consumer writes more than one
+  micro-batch's ids into it (for example a pipeline holding two micro-batches in flight), multiply by that depth and
+  say so in the report.
+- At a context transaction `context_n_ubatch` is the context's own micro-batch (W3.2b), so the ids shrink from the
+  context size to the micro-batch there. That frees host-pinned memory; nothing reads the old larger size.
+
+---
+
+### Open questions (part L, M and G)
+
+1. W3.2a fixes the floor's head maxima for sinks in `llama-model.cpp`. The replica rewrite that deletes
+   `llama_model_sycl_onednn_head_dim_eligible` and reads the backend's own predicate (ticket 23mk, first part) is
+   still in progress and not in this tree. Does the lead want W3.2a now (my recommendation: c-sc3u blocks W3.2b
+   otherwise), or to wait for 23mk and drop W3.2a?
+2. Should the load be told whether the context will run flash attention (a `flash_attn_hint` beside the two hints)?
+   With it, the ONEDNN zone could be skipped for a non-FA context and the non-FA SCRATCH raised instead. Without it
+   (this plan), a non-FA context carries an idle Graph floor bounded by the 1 GiB cap. Owner input needed, since it
+   adds a public `llama_model_params` field.
+3. `llama-server` creates its context from `-c` and `-np`. `common_n_ctx_hint` passes the whole `-c`, and the
+   measure runs with one sequence. A multi-slot non-unified context pads each slot (the resolver's comment says so).
+   Is the compute term at the whole `-c` the right bound for the server? I believe yes (the KV room uses the same
+   number), but no device run has shown it.
+
+### Lead gates (part L, M and G)
+
+All runs: take `GPU.lock`, wait for `Shmem < 30 GB`, sample `grep -E '^(MemAvailable|Shmem):' /proc/meminfo` before and
+`sleep 5; grep -E '^(Shmem|MemAvailable):' /proc/meminfo` after; abort if `Shmem` passes ~100 GB. One run each, never
+repeated. Source `/opt/intel/oneapi/setvars.sh --force` first and check `grep -E '^GGML_SYCL:' build/CMakeCache.txt`.
+`<QWEN>` is the Qwen 3.8 exps-IQ4_NL pack the W3.0 runs used (path in `../exec2/runs/w30d-*/run.err`).
+
+**G-W3.1** (after W3.1a to W3.1d; the compute term follows the caller's shape):
+1. `ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 900 ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf -p 4096 -n 0 -ub 512 -b 512 -r 1 -v 2>&1 | tee /tmp/gw31-1.log`
+   Expect: `cat /tmp/gw31-1.log | grep -c 'measured at n_ctx 4096 ubatch 512, the context and micro-batch this load was told'` is 1 or more, and
+   `cat /tmp/gw31-1.log | grep -c 'n_ctx 262144'` is 0 for the `[LOAD-PLAN] compute slot` lines
+   (`cat /tmp/gw31-1.log | grep 'compute slot on device' | grep -c 262144` is 0). The load no longer reserves a
+   compute term for a 262144-token context.
+2. `ONEAPI_DEVICE_SELECTOR=level_zero:0 timeout 900 ./build/bin/llama-bench -m <QWEN> -p 2048 -n 0 -ub 2048 -b 2048 -r 1 -v 2>&1 | tee /tmp/gw31-2.log`
+   Expect: `grep -c 'measured at n_ctx 2048 ubatch 2048'` is 1 or more; a pp2048 row; no
+   `[LOAD-PLAN] device 0: this load plans its compute term at n_ubatch=` line (the record was not turned off).
+3. `ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 900 ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf -p 512,2048 -n 0 -ub 512 -b 512 -r 1 -v 2>&1 | tee /tmp/gw31-3.log`
+   (one load shared by two contexts; W3.1d). Expect: one load line `measured at n_ctx 2048 ubatch 512`, and both
+   pp512 and pp2048 rows.
+4. Correctness, unchanged by these tasks but required before any commit to load planning: the Mistral completion gate
+   and the GPT-OSS B50 chat gate in `CLAUDE.md`, verbatim (`grep -cx '1, 2, 3, 4, 5'` is 1).
+
+**G-W3.4** (after W3.4 alone, and again after W3.1c; the largest fit names a width that runs):
+- `ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 900 ./build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf -p 1024 -n 0 -ub 1024 -b 1024 -r 1 -v 2>&1 | tee /tmp/gw34.log`
+  Pass: either a pp1024 row (rc 0), or rc 1 with
+  `cat /tmp/gw34.log | grep -o 'the largest -ub that fits is about [0-9]*'` printing a number of at least 512.
+  Fail: `about 256` or lower. If refused, run the named width once
+  (`... -p N -n 0 -ub N -b N ...`) and confirm a row.
+- `ONEAPI_DEVICE_SELECTOR=level_zero:0 timeout 900 ./build/bin/llama-bench -m <QWEN> -p 4096 -n 0 -ub 4096 -b 4096 -r 1 -v 2>&1 | tee /tmp/gw34q.log`
+  Pass: a pp4096 row, or a refusal whose named width runs (one run at that width). The W3.0 refusal was the
+  compute-buffer refusal (`fits no tier of the card`), not the hold-spill one; after W3.1c the term is measured at
+  4096, so a refusal now means VRAM, and its named width must run.
+
+**G-W3.2** (after W3.2a to W3.2d; the Graph floor follows the context):
+1. GPT-OSS sinks: the G-W3.1 run 1 log. Expect
+   `cat /tmp/gw31-1.log | grep 'oneDNN Graph-scratch zone floor'` to show `n_head_ctx_max=0 n_head_swa_max=0` and
+   `64.0 MB`.
+2. Qwen at 2048: the G-W3.1 run 2 log, with `GGML_SYCL_EXT_ALLOC_TRACE=1` added to the command. Expect the floor line
+   to print `n_ubatch=2048 n_ctx=2048`, and no `onednn_graph_scratch_direct` external allocation:
+   `cat /tmp/gw31-2.log | grep -c 'onednn_graph_scratch_direct'` is 0 (W3.0 had 1).
+3. A context larger than the load was told must be refused by name, never aborted. No tool in the tree creates a
+   context larger than its own hint (`common` and `llama-bench` after W3.1d always tell the load the largest), so no
+   device command can drive this path. The refusal is covered by the host test Case 24g. On the device the lead
+   confirms only that no run of G-W3.1 and G-W3.4 aborted:
+   `cat /tmp/gw3*.log | grep -c 'DIRECT allocation exhausted'` is 0.
+
+**G-W3.3** (after W3.3): the G-W3.1 run 2 log, `-v`. Expect
+`cat /tmp/gw31-2.log | grep 'MoE routing buffer sizing'` to show `max_batch=2048` at load (it showed 512 or the
+context before).
+
+### File ownership (part L, M and G)
+
+| File | Region (tree d0118bb6c) | Tasks |
+|------|--------------------------|-------|
+| `src/llama-load-measure.h` | 200-216 (`llama_load_measure_n_ctx`, `llama_load_measure_context_params`), the four measure declarations | W3.1a, W3.1c |
+| `src/llama-context.cpp` | 4433-4700 (the six measure functions) | W3.1c |
+| `src/llama-context.cpp` | 554-582, 1975-1993 (hold-spill fit wrapper and its refusal) | read only; W3.4 changes the answer, not this code |
+| `src/llama-model.cpp` | 271-278 (new helper above the envelope; the envelope itself unchanged) | W3.1c |
+| `src/llama-model.cpp` | 422-436 (populate signature), 477-486 (tail: comment, `n_ubatch_measure`), 603-628 (head maxima loop), 796, 875 (callers) | W3.1c (477-486), W3.2a (422-436, 603-628, 796, 875) |
+| `src/llama-model.cpp` | 2921-2970 (probe, admitted, WARN), 3144-3146 (late) | W3.1c |
+| `ggml/include/ggml-sycl.h` | 479-492 (inventory tail and asserts) | W3.1c |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 17262-17273 (layout asserts), 17682-17688 (record), 48211-48214 (comment) | W3.1c |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 19818-19842 (compute-room block of `ggml_sycl_hold_spill_fit`) | W3.4 |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | after 20079's function (new check), 21771-21775 (its call in the transaction) | W3.2d |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | transaction lines that write `planner_n_ubatch` / call `update_runtime_kv_sizes` | W3.2b step e |
+| `ggml/src/ggml-sycl/zone-sizing.hpp` / `.cpp` | 548-593 / 571-616 (hold-fit credit) | W3.4 |
+| `ggml/src/ggml-sycl/zone-sizing.hpp` | 676-705 (compute-term micro-batch store rule) | W3.1b |
+| `ggml/src/ggml-sycl/zone-sizing.hpp` / `.cpp` | new functions appended: `zone_plan_context_shape`, `zone_onednn_graph_scratch_floor_bytes`, `zone_onednn_graph_uncovered_bytes`, `zone_onednn_graph_fit_largest_ub`, `zone_moe_routing_ids_bytes` | W3.2b, W3.2c, W3.2d, W3.3 |
+| `ggml/src/ggml-sycl/unified-cache.hpp` | 1038-1050 (`placement_plan_compute_room`), 1174-1176 (new plan fields), 2717-2725 (record comment) | W3.4, W3.2b, W3.1b and W3.1c |
+| `ggml/src/ggml-sycl/unified-cache.cpp` | 2863-2882 (record setter) | W3.1b |
+| `ggml/src/ggml-sycl/unified-cache.cpp` | 4148-4225, 4271-4288 (Graph floor), 15768-15775 (DIRECT-failure log argument) | W3.2c |
+| `ggml/src/ggml-sycl/unified-cache.cpp` | 36388-36406 (`placement_plan_compute_room`) | W3.4 |
+| `ggml/src/ggml-sycl/unified-cache.cpp` | 36703-36704, 38180-38181 (plan shape, new lines after them) | W3.2b |
+| `ggml/src/ggml-sycl/unified-cache.cpp`, inside `populate_host_zone_sizing` (35173-35876) | 35402-35410 (routing ids) | W3.3 |
+| same function | 35696-35713 (Graph shape setter and its INFO line) | W3.2b, W3.2c (INFO argument) |
+| same function | 35732-35733 (non-FA shape setter): comment only | W3.2b |
+| same function | 35441-35450 (control layout), 35487-35506 (host recipe workspace), 35849-35859 (fold detail) | not mine: W3.5 to W3.7 |
+| same function | 35825 (the CONTROL fold that adds `moe_routing_ids_bytes`) | shared; I change no text on this line |
+| same function | 35508-35515 (routing INFO line) | unchanged by me; it prints `max_batch_tokens`, which W3.3 recomputes |
+| `tools/llama-bench/llama-bench.cpp` | 1295-1302 (comment), 2349-2356 (loop), new helper above `get_cmd_params_instances` | W3.1d |
+| `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` | 1720-1767 (Case 24c edits), 1804-1836 (store rule), new Cases 24d to 24h after 24c | W3.4, W3.1b, W3.2b, W3.2c, W3.2d, W3.3 |
+| `tests/test-load-measure-guards.cpp` | 316-322, 856, 866, 887-892, `main` | W3.1a, W3.1c |
+| `tests/test-sycl-layout-choice.cpp` | 879-912 | W3.4 |
+| `tests/test-sycl-load-measure-source.py` | 66-98, 114, 130, 175-177, 207, 236-244, 328-413, 437, new tests at end | W3.1c |
+| `tests/test-sycl-explicit-ubatch-placement-source.py` | 154-166, 173-181, 190-206, 386, 418-425 | W3.4, W3.1b, W3.1c |
+| `tests/test-sycl-onednn-graph-floor-eligibility-source.py` | new test at end | W3.2a |
+| `tests/test-sycl-ctx-hint-default-source.py` | new test at end | W3.1d |
+| `docs/backend/sycl-memory-design.md` | 2889-2898 | W3.4 |
+
+Order across tasks: W3.1a, W3.1b and W3.4 are independent and can merge first. W3.1c needs W3.1a and W3.1b; W3.1d
+needs W3.1c and should merge with it. W3.2a, then W3.2b with W3.2c together, then W3.2d. W3.3 needs W3.2b. Three tasks
+touch `test-zone-sizing.cpp` in adjacent new cases and two touch `test-sycl-explicit-ubatch-placement-source.py`:
+merge them one at a time and re-run both after each merge.
+
+---
+
+### Part C: Stage 3, part "the 512-row constant leaves the backend": tasks W3.5, W3.7a, W3.7b, W3.6a, W3.6b
+
+This part deletes `MOE_GPU_UBATCH_MAX` and `exceeds_gpu_ubatch`, moves the picker's 512 into the picker, and sizes the MoE control layout and the CPU experts' recipe workspace from the context's micro-batch, at load and in the runtime context transaction.
+All lines are read from `integ/th32` at `d0118bb6c` (worktree `.../scratchpad/wt-integ-th32`); each site is also named by its text, because lines drift.
+
+Order: W3.5, then W3.7a, then W3.7b, then W3.6a, then W3.6b. W3.7 is ordered before W3.6, not folded into it.
+
+**Design choice:** W3.7 is ordered before W3.6 and not folded in. The recipe loop is the constant's second user (`unified-cache.cpp:35498`), so W3.6a cannot delete the constant until that loop reads the context's micro-batch. Folding both would put two behaviours, two test files and the transaction in one task. Rejected: one combined task.
+
+Terms used below:
+- **micro-batch** (`n_ubatch`, `-ub`): the number of prompt rows one graph computes.
+- **control layout** (`moe_context_control_layout`): the byte layout of the MoE CONTROL pool. It holds one expert-pointer table per expert tensor, the routing ids (`n_expert_used * n_ubatch` int32), the compaction table (`n_expert_used * n_ubatch` pointers) and a 4-byte missing flag. The tables do not depend on the micro-batch. The ids and compaction table do.
+- **recipe workspace**: the host-pinned CPU scratch an immutable Q1_0 or NVFP4 host expert recipe uses (`plan_moe_host_workspace`, `moe-resolved-batch.hpp:122-165`). It holds f32 and Q8 activations, f32 outputs and descriptors for one micro-batch of tokens.
+- **transaction**: `ggml_sycl_run_runtime_context_transaction` (`ggml-sycl.cpp:21087-22181`). It runs at context creation, once as a probe (`probe_mode`, publishes nothing) and once for real. Its steps are named S1 to S16 in the scout re-check.
+- **pending terms**: `ggml_sycl_runtime_pending_terms` (`ggml-sycl.cpp:20410-20418`). These are RUNTIME-zone bytes that are planned but not yet allocated. The ring admission keeps room for them.
+
+---
+
+### Task W3.5: the picker owns its MoE ceiling
+
+**Track:** S3-control
+**Depends on:** none
+**File scope:**
+- Modify: `src/llama-auto-ubatch.h:58-60` (the ladder; add the ceiling below it) and `:187-192` (comment of `llama_auto_ubatch_cap`)
+- Modify: `src/llama-context.cpp:423-431` (comment naming `moe_gpu_ubatch_max`), `:473-477` (`llama_context_sycl_moe_gpu_ubatch_max_proc`, delete), `:2372` (`auto moe_cap_fn = ...`, delete), `:2385-2396` (the `moe_cap` block), `:2433` (comment naming `moe_cap_fn`), `:2585-2590` (comment naming the accessor)
+- Modify: `ggml/include/ggml-sycl.h:988-996` (the accessor's comment and declaration, delete)
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp:26393-26398` (the accessor's definition, delete) and `:128912-128922` (its proc-address registration, delete; keep `auto_ubatch_enabled`'s)
+- Modify: `src/llama-load-measure.h:209` (one phrase; shared with W3.1, see File ownership)
+- Modify: `docs/backend/sycl-env-vars.md:63` (one parenthetical), `docs/backend/sycl-memory-design.md:3421` (one phrase)
+- Test: `tests/test-sycl-auto-ubatch-source.py:15-20, 445-489, 524-557, 1795, 2583-2600`
+
+**Description:**
+
+The automatic micro-batch picker (the "trial" in `llama_context::sycl_select_auto_ubatch`) caps a MoE model at 512 rows. It reads the 512 from the backend through `ggml_backend_sycl_moe_gpu_ubatch_max()`, which returns `MOE_GPU_UBATCH_MAX`. W3.6 deletes that constant, because the backend no longer has a row limit for MoE routing once stage 3 is done. The picker still keeps MoE models at 512 until stage 4 measures wide widths (lead task W4.0). So the 512 moves to the picker, as `llama_auto_ubatch_moe_ceiling` in `src/llama-auto-ubatch.h`, and the backend accessor, its declaration, its proc-address registration and the context's DL lookup are deleted.
+
+Nothing the picker does changes. `llama_auto_ubatch_cap` keeps its signature and the call site keeps its exact text, so `tests/test-sycl-planned-ladder-source.py` and the ladder unit test stay green. The stop reason `"MoE GPU routing ceiling"` keeps its text: it is the tuning cache's terminal reason and is pinned widely. Stage 4 removes the ceiling and these parameters.
+
+**Design choice:** form B, the constant moves to the picker and the backend export is deleted. Rejected form A, keeping `ggml_backend_sycl_moe_gpu_ubatch_max()` returning a literal 512: the backend would then export a "routing ceiling" it no longer enforces, a second source for a fact whose only user is the picker.
+
+**Acceptance Criteria:**
+
+- [ ] `git grep -n 'moe_gpu_ubatch_max' -- ggml src tests docs/backend | cat` prints nothing
+- [ ] `src/llama-auto-ubatch.h` declares `static const uint32_t llama_auto_ubatch_moe_ceiling = 512;`
+- [ ] The trial has one `moe_cap` declaration for both builds: `model.hparams.n_expert > 0 ? llama_auto_ubatch_moe_ceiling : 0`, and `moe_cap_available = true`
+- [ ] `python3 -m pytest tests/test-sycl-auto-ubatch-source.py -q` gives 233 passed
+- [ ] `python3 -m pytest tests/test-sycl-planned-ladder-source.py -q` gives 12 passed, unchanged
+- [ ] `./scripts/sycl-build.sh llama-cli llama-bench test-auto-ubatch-ladder` builds; `./build/bin/test-auto-ubatch-ladder` passes (after the lead's GO)
+- [ ] (lead) Gate L-W3.5 below: GPT-OSS 20B on the B50 still picks 512 with the stop reason `MoE GPU routing ceiling`, and the count gate passes
+
+**Implementation Guide:**
+
+1. **RED.** In `tests/test-sycl-auto-ubatch-source.py`, replace the function
+   `test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap` (starts at line 445, ends before
+   `def test_moe_model_cap_binds_at_equal_has_a_mutation_witness`) with:
+
+```python
+_MOE_CEILING_DECL = "static const uint32_t llama_auto_ubatch_moe_ceiling = 512;"
+
+
+def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap():
+    """For a MoE model (hparams.n_expert > 0), the cap is narrowed to the picker's own MoE ceiling,
+    llama_auto_ubatch_moe_ceiling in src/llama-auto-ubatch.h, and the "MoE GPU routing ceiling" stop reason is
+    reported whenever that ceiling BINDS (moe_cap <= cap), not only when it is strictly smaller. The backend no
+    longer has a row limit for MoE routing, so the ceiling is the picker's policy until the wide-width measurement
+    lifts it; it is read from nowhere else, and llama-context.cpp holds no bare 512 for it."""
+    helper = _cap_helper_body()
+    assert _MOE_NARROW in helper, (
+        "llama_auto_ubatch_cap must narrow `cap` only when n_expert > 0 && moe_cap_available && "
+        "moe_cap <= cap -- not on moe_cap <= cap alone"
+    )
+    assert "*moe_bound = true;" in helper and "*moe_bound = false;" in helper
+
+    header_norm = _normalize_ws(strip_comments(LLAMA_AUTO_UBATCH_H))
+    assert _MOE_CEILING_DECL in header_norm, (
+        "src/llama-auto-ubatch.h must declare the picker's MoE ceiling: " + _MOE_CEILING_DECL
+    )
+
+    body_norm = _normalize_ws(_trial_body())
+    assert "ggml_backend_sycl_moe_gpu_ubatch_max" not in body_norm, (
+        "the trial must not read a MoE ceiling from the backend: the backend has none"
+    )
+    assert "moe_cap_fn" not in body_norm, "the DL lookup of the old backend accessor must be gone"
+    assert re.search(
+        r"const\s+uint32_t\s+moe_cap\s*=\s*model\.hparams\.n_expert\s*>\s*0\s*\?\s*llama_auto_ubatch_moe_ceiling"
+        r"\s*:\s*0\s*;",
+        body_norm,
+    ), "the trial must take the picker's ceiling, and only for a MoE model"
+    assert re.search(r"const\s+bool\s+moe_cap_available\s*=\s*true\s*;", body_norm), (
+        "the ceiling is a constant of the picker, so it is always available"
+    )
+    assert re.search(r'stop\s*=\s*moe_bound\s*\?\s*"MoE GPU routing ceiling"\s*:\s*"ladder exhausted"\s*;', body_norm), (
+        "the stop reason must be the MoE ceiling exactly when the helper reports it bound"
+    )
+    assert not re.search(r"\bcap\s*=\s*512\b", body_norm), (
+        "the MoE ceiling must not be hardcoded as a bare 512 in llama-context.cpp"
+    )
+```
+
+   Replace the two functions `test_header_declares_the_moe_gpu_ubatch_max_accessor` and
+   `test_proc_address_registers_moe_gpu_ubatch_max_and_auto_ubatch_enabled` (lines 524-557) with:
+
+```python
+def _backend_moe_ceiling_violations(texts: dict) -> list:
+    """Names every file that still exports, registers or looks up the deleted backend MoE ceiling."""
+    return [name for name, code in texts.items() if "ggml_backend_sycl_moe_gpu_ubatch_max" in code]
+
+
+def test_the_backend_exports_no_moe_routing_ceiling():
+    """The backend has no micro-batch limit for MoE routing: the control layout and the CPU recipe workspace are
+    sized from the context's micro-batch. So ggml-sycl.h declares no ceiling accessor, ggml-sycl.cpp defines and
+    registers none, and llama-context.cpp looks none up."""
+    texts = {
+        "ggml/include/ggml-sycl.h": GGML_SYCL_H_CODE,
+        "ggml/src/ggml-sycl/ggml-sycl.cpp": GGML_SYCL_CPP_CODE,
+        "src/llama-context.cpp": LLAMA_CONTEXT_CPP_CODE,
+    }
+    assert _backend_moe_ceiling_violations(texts) == []
+
+
+def test_the_backend_exports_no_moe_routing_ceiling_has_a_mutation_witness():
+    """Proves the check above catches the accessor coming back in any one of the three files."""
+    mutant = GGML_SYCL_H_CODE + "\nGGML_BACKEND_API uint32_t ggml_backend_sycl_moe_gpu_ubatch_max(void);\n"
+    texts = {
+        "ggml/include/ggml-sycl.h": mutant,
+        "ggml/src/ggml-sycl/ggml-sycl.cpp": GGML_SYCL_CPP_CODE,
+        "src/llama-context.cpp": LLAMA_CONTEXT_CPP_CODE,
+    }
+    assert _backend_moe_ceiling_violations(texts) == ["ggml/include/ggml-sycl.h"]
+
+
+def test_proc_address_registers_auto_ubatch_enabled():
+    """llama.cpp-1mwi: a GGML_BACKEND_DL build's llama-context lookup needs
+    ggml_backend_sycl_auto_ubatch_enabled registered in the strcmp
+    proc-address chain, or the lookup silently returns nullptr."""
+    assert re.search(
+        r'strcmp\(\s*name\s*,\s*"ggml_backend_sycl_auto_ubatch_enabled"\s*\)\s*==\s*0\s*\)\s*\{\s*'
+        r"return\s*\(\s*void\s*\*\s*\)\s*ggml_backend_sycl_auto_ubatch_enabled\s*;",
+        GGML_SYCL_CPP_CODE,
+    ), "ggml_backend_sycl_auto_ubatch_enabled must be registered in the proc-address strcmp chain"
+```
+
+   In `test_env_vars_doc_explains_the_moe_512_pin` (starts at line 2583), add after the `"GPT-OSS" in row` assert:
+
+```python
+    assert "ggml_backend_sycl_moe_gpu_ubatch_max" not in row, (
+        "the row must name the picker's ceiling, not the deleted backend accessor"
+    )
+    assert "llama_auto_ubatch_moe_ceiling" in row, "the row must name where the 512 lives now"
+```
+
+   Docstrings: in the module docstring (lines 17-19) replace
+   `` by the GPU MoE routing ceiling\n  (`ggml_backend_sycl_moe_gpu_ubatch_max()`, comment c-s747 / llama.cpp-ohkx). ``
+   with `` by the picker's MoE ceiling\n  (`llama_auto_ubatch_moe_ceiling`, comment c-s747 / llama.cpp-ohkx). ``
+   In `test_proc_address_registers_the_four_ubatch_cache_accessors` (line 1795) replace
+   `the auto_ubatch_enabled/moe_gpu_ubatch_max precedent just above` with `the auto_ubatch_enabled precedent just above`.
+
+   Run: `python3 -m pytest tests/test-sycl-auto-ubatch-source.py -q`
+   Expected (RED): 4 failed, 229 passed. The failures are `test_moe_model_cap_binds_whenever...` (no ceiling in the
+   header), `test_the_backend_exports_no_moe_routing_ceiling` (all three files name the accessor),
+   `test_the_backend_exports_no_moe_routing_ceiling_has_a_mutation_witness` (the unmutated files already name it, so
+   the list has three entries, not one) and `test_env_vars_doc_explains_the_moe_512_pin`.
+
+2. **The picker's constant.** In `src/llama-auto-ubatch.h`, after the ladder's size line
+   (`sizeof(llama_auto_ubatch_ladder) / sizeof(llama_auto_ubatch_ladder[0]);`, line 60), add:
+
+```cpp
+
+// The largest micro-batch the trial tries for a MoE model. The backend sizes MoE routing from the context's own
+// micro-batch, so this is the picker's policy, not a backend limit: it keeps MoE models at the width the tuning cache
+// and the baselines were measured at until wider widths are measured against it.
+static const uint32_t llama_auto_ubatch_moe_ceiling = 512;
+```
+
+   Replace the comment above `llama_auto_ubatch_cap` (lines 187-192, from `// The trial's cap: min(n_batch, n_ctx),`
+   to `// happens. *moe_bound is set to whether the ceiling is the binding cap.`) with:
+
+```cpp
+// The trial's cap: min(n_batch, n_ctx), narrowed to the picker's MoE ceiling (llama_auto_ubatch_moe_ceiling) for a
+// MoE model whenever that ceiling does not exceed it. A ceiling equal to the cap still binds, so the stop reason
+// names the ceiling. `moe_cap_available` false means no narrowing happens, whatever moe_cap is.
+// *moe_bound is set to whether the ceiling is the binding cap.
+```
+
+3. **The trial.** In `src/llama-context.cpp`:
+   - Delete line 2372 (`    auto               moe_cap_fn  = llama_context_sycl_moe_gpu_ubatch_max_proc(first_dev);`).
+   - Replace lines 2385-2396 (from `    // A direct GGML_USE_SYCL build's accessor is a real, always-defined` through the `#    endif` after
+     `const bool     moe_cap_available = moe_cap_fn != nullptr;`) with:
+
+```cpp
+    // The MoE ceiling is the picker's own constant, the same in a direct and a DL build. A dense model never
+    // consults it.
+    const uint32_t moe_cap           = model.hparams.n_expert > 0 ? llama_auto_ubatch_moe_ceiling : 0;
+    const bool     moe_cap_available = true;
+```
+
+   - Keep the following comment and the call `llama_auto_ubatch_cap(cparams.n_batch, cparams.n_ctx, model.hparams.n_expert, moe_cap, moe_cap_available, &moe_bound);` exactly as they are. In that comment delete the last two lines' clause `The helper gates on\n    // moe_cap_available so a DSO without the accessor never reports a ceiling\n    // that was never consulted.` and end the sentence after `misreport why the ladder stopped.`
+   - Delete lines 473-477 (`static decltype(&ggml_backend_sycl_moe_gpu_ubatch_max) llama_context_sycl_moe_gpu_ubatch_max_proc(` through its closing `}`) and the blank line after it.
+   - In the comment at lines 423-431, replace `(the probe\n// and fallback counter) or this task (auto_ubatch_enabled's registration,\n// moe_gpu_ubatch_max) exports none of these;` with `(the probe\n// and fallback counter) or this task (auto_ubatch_enabled's registration)\n// exports none of these;`.
+   - At line 2433 replace `mirroring probe_fn/fallback_fn/moe_cap_fn's own` with `mirroring probe_fn/fallback_fn's own`.
+   - At lines 2587-2590 replace `additionally by the GPU MoE routing ceiling\n// (ggml_backend_sycl_moe_gpu_ubatch_max(), llama.cpp-ohkx) until that\n// ceiling is lifted -- a candidate whose ring still fits but whose routing\n// silently falls off the GPU path is not a win.` with `additionally by the picker's MoE ceiling\n// (llama_auto_ubatch_moe_ceiling, src/llama-auto-ubatch.h) until wider MoE\n// widths are measured against it.` Re-wrap the comment's following line if it now reads oddly; change no code.
+
+4. **The backend.** In `ggml/include/ggml-sycl.h` delete lines 988-996: the comment starting
+   `// llama.cpp-xojq (nphx Task 4b): the GPU MoE routing ceiling` through
+   `GGML_BACKEND_API uint32_t ggml_backend_sycl_moe_gpu_ubatch_max(void);` and the blank line after it.
+   In `ggml/src/ggml-sycl/ggml-sycl.cpp` delete lines 26393-26398: the comment
+   `// llama.cpp-xojq (nphx Task 4b): see the declaration in ggml-sycl.h. A thin` through the closing `}` of
+   `ggml_backend_sycl_moe_gpu_ubatch_max()`, and the blank line after it.
+   In the proc-address chain (find it with `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n '"ggml_backend_sycl_moe_gpu_ubatch_max"'`)
+   delete the three lines `if (strcmp(name, "ggml_backend_sycl_moe_gpu_ubatch_max") == 0) {`, `return (void *) ggml_backend_sycl_moe_gpu_ubatch_max;`, `}`,
+   and in the comment above `ggml_backend_sycl_auto_ubatch_enabled`'s registration replace
+   `GGML_BACKEND_DL build's llama-context lookup returned nullptr) and\n    // registers this task's own new accessor alongside it.` with `GGML_BACKEND_DL build's llama-context lookup returned nullptr).`
+
+5. **Comments and docs.**
+   - `src/llama-load-measure.h:209`: replace `(its cap is MOE_GPU_UBATCH_MAX)` with `(its cap is llama_auto_ubatch_moe_ceiling)`.
+   - `docs/backend/sycl-env-vars.md:63`: replace ``that ceiling (`ggml_backend_sycl_moe_gpu_ubatch_max()`, llama.cpp-ohkx) is the BINDING cap`` with ``that ceiling (`llama_auto_ubatch_moe_ceiling` in `src/llama-auto-ubatch.h`, the picker's own constant since the backend dropped its 512-row MoE routing limit; llama.cpp-ohkx) is the BINDING cap``. Leave the rest of the row, including `every MoE model is pinned at 512`, `GPT-OSS` and `Mistral`.
+   - `docs/backend/sycl-memory-design.md:3421`: replace ``MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the`` with ``MoE models are capped at 512 by the picker (`llama_auto_ubatch_moe_ceiling`), so their term is the`` and re-wrap the paragraph's next line if needed.
+
+   Run: `python3 -m pytest tests/test-sycl-auto-ubatch-source.py -q` (expect 233 passed) and
+   `python3 -m pytest tests/test-sycl-planned-ladder-source.py -q` (expect 12 passed).
+   After the lead's GO: `./scripts/sycl-build.sh llama-cli llama-bench test-auto-ubatch-ladder`, then
+   `source /opt/intel/oneapi/setvars.sh --force; ./build/bin/test-auto-ubatch-ladder; echo rc=$?` (expect rc=0).
+
+**Commit:**
+
+```bash
+git commit -m "llama: the auto micro-batch picker owns its MoE ceiling; the backend stops exporting one" -- \
+    src/llama-auto-ubatch.h src/llama-context.cpp src/llama-load-measure.h ggml/include/ggml-sycl.h \
+    ggml/src/ggml-sycl/ggml-sycl.cpp docs/backend/sycl-env-vars.md docs/backend/sycl-memory-design.md \
+    tests/test-sycl-auto-ubatch-source.py
+```
+
+**Gotchas:**
+- Do not touch `MOE_GPU_UBATCH_MAX` itself here. W3.6a deletes it after W3.7a removes its second user.
+- The planned-ladder pin requires the cap call's text `moe_cap, moe_cap_available, &moe_bound` unchanged. Do not drop the `moe_cap_available` argument; stage 4 removes it.
+- Deleting an exported symbol is an ABI change for a DL build. Only `llama-context.cpp` looked it up, and that lookup goes in the same commit. A stale SYCL DSO with a new libllama works; a new DSO with an old libllama returns null for the lookup, which the old code treated as "unavailable".
+- `llama-load-measure.h:209` sits in the comment W3.1 rewrites. If W3.1 lands first and the phrase is gone, skip that edit and say so in the report.
+- `git grep` on `docs/design/sycl-kv-region-segregation.md` still finds the old names. That file is history; leave it.
+
+---
+
+### Task W3.7a: the recipe workspace is sized in tokens of the planned micro-batch
+
+**Track:** S3-control
+**Depends on:** none (lands after W3.5 only to keep one order)
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/unified-cache.hpp:1115` (new struct above `struct placement_plan {` at 1116), `:1319-1320` (new field after `base_context_control_layout`), and a declaration next to the struct
+- Modify: `ggml/src/ggml-sycl/unified-cache.cpp:35172` (new function above `static void populate_host_zone_sizing(`), `:35483-35506` (the recipe loop), `:35517-35523` (the dense branch)
+- Test: `tests/test-sycl-moe-resolved-batch.cpp:704` (new test function after `test_recipe_matrix_workspace_and_immutability`) and `:1012-1024` (`main`)
+
+**Description:**
+
+The immutable Q1_0 and NVFP4 host expert recipes run a micro-batch's tokens through one host-pinned workspace. The executor sizes its request with `rows = count / slots_per_token` (`ggml-sycl.cpp:38538`), which is the number of tokens, and refuses to run when that request exceeds the plan's `moe_host_recipe_workspace_bytes` (`ggml-sycl.cpp:90231-90243`, "MUL_MAT_ID Q1/NVFP4 planned workspace unavailable"). The planner sizes the workspace at `max(n_expert_used, 1) * 512` rows. That is k times too large at 512 tokens, and too small above `512 * k` tokens.
+
+This task sizes it at the micro-batch the plan is built for, in tokens: `placement_load_n_ubatch(plan.planner_n_ubatch)`. It keeps each recipe shape (K, N, Q8 row bytes) on the plan, so the transaction (W3.7b) can re-size it for another context by the same rule. One function, `placement_moe_host_recipe_workspace_bytes_at`, holds the rule and calls `plan_moe_host_workspace`, the function the executor sizes its request with.
+
+The workspace at `-ub 512` shrinks by the factor `n_expert_used` (8 on a top-8 model). That is host-pinned memory returned, not a new risk: the executor never asked for more than one micro-batch of tokens.
+
+**Design choice:** the shapes live on the plan and one non-static function in `unified-cache.cpp` sizes them at any token count. Rejected: re-walking the tensor inventory in the transaction (a second walk with its own filters), and a closed-form "bytes per token" (the 256-byte alignment of each region makes it not linear).
+
+**Acceptance Criteria:**
+
+- [ ] `placement_moe_host_recipe_workspace_bytes_at` is declared in `unified-cache.hpp` and defined, not static, in `unified-cache.cpp`
+- [ ] `populate_host_zone_sizing`'s recipe loop no longer names `MOE_GPU_UBATCH_MAX`
+- [ ] `./build/bin/test-sycl-moe-resolved-batch` prints `PASS: retained MoE route-batch host contract` (after the lead's GO)
+- [ ] `python3 tests/test-sycl-moe-resolved-batch-source.py` and `python3 -m pytest tests/test-sycl-host-role-routing-source.py -q` pass unchanged
+- [ ] (lead) Gate L-W3.7 below
+
+**Implementation Guide:**
+
+1. **RED, behaviour.** In `tests/test-sycl-moe-resolved-batch.cpp`, add `#include "ggml-sycl/unified-cache.hpp"` after
+   `#include "ggml-sycl/moe-resolved-batch.hpp"` (line 4). After the end of `test_recipe_matrix_workspace_and_immutability`
+   (starts at line 704; put the new function after its closing `}`), add:
+
+```cpp
+static bool test_recipe_workspace_follows_the_planned_micro_batch() {
+    using namespace ggml_sycl;
+    const auto * traits = ggml_sycl_get_type_traits_cpu(GGML_TYPE_NVFP4);
+    CHECK(traits && traits->vec_dot);
+    const size_t q8_row_bytes = ggml_row_size(traits->vec_dot_type, 64);
+
+    // The planner: one NVFP4 routed expert tensor. The workspace is one micro-batch of tokens, the micro-batch the
+    // plan is built for, never top-k times a fixed 512.
+    std::vector<placement_tensor_info> inventory;
+    placement_tensor_info              item;
+    item.name  = "blk.0.ffn_up_exps.weight";
+    item.type  = GGML_TYPE_NVFP4;
+    item.ne[0] = 64;
+    item.ne[1] = 64;
+    item.ne[2] = 1;
+    item.ne[3] = 1;
+    item.size  = ggml_row_size(GGML_TYPE_NVFP4, item.ne[0]) * static_cast<size_t>(item.ne[1]);
+    inventory.push_back(item);
+    const std::vector<device_budget> devices  = { { 0, 1, 1 } };
+    size_t                           previous = 0;
+    for (uint32_t n_ubatch : { 512u, 2048u }) {
+        placement_kv_info kv{};
+        kv.n_ctx         = 4096;
+        kv.n_ubatch      = n_ubatch;
+        kv.n_expert_used = 8;
+        const placement_plan plan = compute_multi_device_plan(devices, inventory, 1, multi_gpu_mode::HYBRID, kv,
+                                                              nullptr, 1, host_ledger_budget());
+        moe_route_request    request{ moe_route_phase::PROMPT, 64, 64, n_ubatch, GGML_TYPE_NVFP4, 0 };
+        moe_workspace_recipe expected;
+        CHECK(plan_moe_host_workspace(request, q8_row_bytes, sizeof(size_t) * 4, &expected));
+        CHECK(plan.moe_host_recipe_workspace_bytes == expected.total_bytes);
+        CHECK(plan.moe_host_recipe_workspace_bytes > previous);
+        previous = plan.moe_host_recipe_workspace_bytes;
+    }
+    return true;
+}
+```
+
+   In `main` (line 1012), add `|| !test_recipe_workspace_follows_the_planned_micro_batch()` after
+   `!test_recipe_matrix_workspace_and_immutability()` in the first `if`.
+
+   Build and run (after the lead's GO):
+
+```bash
+./scripts/sycl-build.sh test-sycl-moe-resolved-batch
+source /opt/intel/oneapi/setvars.sh --force
+./build/bin/test-sycl-moe-resolved-batch; echo rc=$?
+```
+
+   Expected (RED): rc=1, and the `CHECK` failure line names
+   `plan.moe_host_recipe_workspace_bytes == expected.total_bytes` (the tree sizes 8 x 512 = 4096 rows for both widths).
+
+2. **RED, the rule.** Add to the same test function, before `return true;`:
+
+```cpp
+    // The rule: one row per token, the largest shape wins, nothing for no tokens or no shapes, and an overflow is
+    // refused without writing the answer.
+    const std::vector<moe_host_recipe_shape> shapes = { { 64, 64, q8_row_bytes }, { 64, 128, q8_row_bytes } };
+    size_t                                   bytes  = 1;
+    CHECK(placement_moe_host_recipe_workspace_bytes_at(shapes, 0, &bytes) && bytes == 0);
+    bytes = 1;
+    CHECK(placement_moe_host_recipe_workspace_bytes_at({}, 512, &bytes) && bytes == 0);
+    for (uint32_t n_tokens : { 1u, 512u, 513u, 2048u, 4096u }) {
+        moe_route_request    wide_request{ moe_route_phase::PROMPT, 64, 128, n_tokens, GGML_TYPE_NVFP4, 0 };
+        moe_workspace_recipe wide;
+        CHECK(plan_moe_host_workspace(wide_request, q8_row_bytes, sizeof(size_t) * 4, &wide));
+        CHECK(placement_moe_host_recipe_workspace_bytes_at(shapes, n_tokens, &bytes));
+        CHECK(bytes == wide.total_bytes);
+    }
+    const std::vector<moe_host_recipe_shape> huge = { { INT64_MAX / 2, 64, q8_row_bytes } };
+    bytes = 7;
+    CHECK(!placement_moe_host_recipe_workspace_bytes_at(huge, 4096, &bytes) && bytes == 7);
+```
+
+   Build as above. Expected (RED): a compile error, `'moe_host_recipe_shape' was not declared in this scope` (or
+   "is not a member of ggml_sycl").
+
+3. **GREEN, the header.** In `ggml/src/ggml-sycl/unified-cache.hpp`, directly above `struct placement_plan {` (line 1116), add:
+
+```cpp
+// One immutable Q1_0/NVFP4 host expert recipe's shape: what its CPU workspace scales with. K is the input width, N the
+// output width, q8_row_bytes one activation row in the recipe's vec-dot type.
+struct moe_host_recipe_shape {
+    int64_t K            = 0;
+    int64_t N            = 0;
+    size_t  q8_row_bytes = 0;
+};
+
+// The CPU workspace the immutable Q1_0/NVFP4 host recipes need for a micro-batch of n_tokens: the largest
+// plan_moe_host_workspace() total over `shapes`, one row per token, the request the executor sizes. 0 for no shapes or
+// no tokens. Returns false on an overflow and leaves *out untouched.
+bool placement_moe_host_recipe_workspace_bytes_at(const std::vector<moe_host_recipe_shape> & shapes,
+                                                  uint32_t                                   n_tokens,
+                                                  size_t *                                   out);
+```
+
+   After `moe_context_control_layout base_context_control_layout;` (line 1319), add:
+
+```cpp
+    // The immutable Q1_0/NVFP4 host recipes' distinct shapes, from the inventory. moe_host_recipe_workspace_bytes is
+    // placement_moe_host_recipe_workspace_bytes_at() of these at the plan's micro-batch; a context with another
+    // micro-batch re-sizes it from them.
+    std::vector<moe_host_recipe_shape> moe_host_recipe_shapes;
+```
+
+4. **GREEN, the rule.** In `ggml/src/ggml-sycl/unified-cache.cpp`, directly above `static void populate_host_zone_sizing(` (line 35173), add:
+
+```cpp
+bool placement_moe_host_recipe_workspace_bytes_at(const std::vector<moe_host_recipe_shape> & shapes,
+                                                  uint32_t                                   n_tokens,
+                                                  size_t *                                   out) {
+    if (!out) {
+        return false;
+    }
+    size_t bytes = 0;
+    if (n_tokens != 0) {
+        for (const moe_host_recipe_shape & shape : shapes) {
+            // The executor's request: the prompt phase, one row per token (ggml_sycl_build_moe_resolved_batch).
+            const moe_route_request request{ moe_route_phase::PROMPT, shape.K, shape.N, n_tokens, GGML_TYPE_COUNT, 0 };
+            moe_workspace_recipe    workspace;
+            if (!plan_moe_host_workspace(request, shape.q8_row_bytes, sizeof(size_t) * 4, &workspace)) {
+                return false;
+            }
+            bytes = std::max(bytes, workspace.total_bytes);
+        }
+    }
+    *out = bytes;
+    return true;
+}
+```
+
+5. **GREEN, the planner.** Replace the recipe block in `populate_host_zone_sizing` (lines 35483-35506: from the comment
+   `// Immutable Q1_0/NVFP4 host recipes reserve one occurrence workspace` through the closing `}` of the
+   `for (const auto & item : tensor_inventory)` loop) with:
+
+```cpp
+        // Immutable Q1_0/NVFP4 host recipes run one micro-batch's tokens through one workspace, so it is sized in
+        // tokens of the micro-batch this plan is built for. The shapes stay on the plan so a context with another
+        // micro-batch re-sizes it by the same rule. K/N and the activation vec-dot row size come from the
+        // inventory, never from a resolver-time request.
+        plan.moe_host_recipe_shapes.clear();
+        for (const auto & item : tensor_inventory) {
+            if ((item.type != GGML_TYPE_Q1_0 && item.type != GGML_TYPE_NVFP4) || !item.has_shape() ||
+                expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
+                continue;
+            }
+            const auto * traits = ggml_sycl_get_type_traits_cpu(item.type);
+            if (!traits || !traits->vec_dot || item.ne[0] <= 0 || item.ne[1] <= 0) {
+                continue;
+            }
+            const moe_host_recipe_shape shape{ item.ne[0], item.ne[1],
+                                               ggml_row_size(traits->vec_dot_type, item.ne[0]) };
+            bool known = false;
+            for (const moe_host_recipe_shape & seen : plan.moe_host_recipe_shapes) {
+                known = known || (seen.K == shape.K && seen.N == shape.N && seen.q8_row_bytes == shape.q8_row_bytes);
+            }
+            if (!known) {
+                plan.moe_host_recipe_shapes.push_back(shape);
+            }
+        }
+        const uint32_t recipe_n_ubatch = placement_load_n_ubatch(plan.planner_n_ubatch);
+        if (!placement_moe_host_recipe_workspace_bytes_at(plan.moe_host_recipe_shapes, recipe_n_ubatch,
+                                                          &plan.moe_host_recipe_workspace_bytes)) {
+            // A workspace that overflows cannot be planned. SIZE_MAX makes the host SCRATCH fold refuse the plan's
+            // MMID workspaces, and the executor's allocation fails by name, instead of a wrapped small reservation.
+            plan.moe_host_recipe_workspace_bytes = SIZE_MAX;
+        }
+        if (!plan.moe_host_recipe_shapes.empty()) {
+            GGML_LOG_WARN("[SYCL-PLAN] MoE host recipe workspace: %zu shape(s), %.2f MB of host SCRATCH at n_ubatch=%u\n",
+                          plan.moe_host_recipe_shapes.size(),
+                          plan.moe_host_recipe_workspace_bytes / (1024.0 * 1024.0), recipe_n_ubatch);
+        }
+```
+
+   In the dense `else` branch (line 35522, after `plan.moe_host_recipe_workspace_bytes = 0;`), add
+   `        plan.moe_host_recipe_shapes.clear();`.
+
+   Build and run as in step 1. Expected (GREEN): `PASS: retained MoE route-batch host contract`, rc=0.
+   Then: `python3 tests/test-sycl-moe-resolved-batch-source.py; echo rc=$?` (rc=0) and
+   `python3 -m pytest tests/test-sycl-host-role-routing-source.py -q` (all pass).
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the MoE host recipe workspace is sized in tokens of the planned micro-batch" -- \
+    ggml/src/ggml-sycl/unified-cache.hpp ggml/src/ggml-sycl/unified-cache.cpp tests/test-sycl-moe-resolved-batch.cpp
+```
+
+**Gotchas:**
+- `placement_load_n_ubatch(0)` is 512. A fixture with no micro-batch (`kv.n_ubatch` left at its default) keeps a non-zero workspace, so `tests/test-sycl-moe-handle-resolution.cpp:504-506` (workspace > 0, host SCRATCH covers it) still holds. That is a device test; the lead runs it if asked.
+- Both the executor (`ggml-sycl.cpp:38722`) and the new function spell the descriptor stride `sizeof(size_t) * 4`. They must stay equal. Do not change one.
+- The plan is built more than once per load (the builders, the dry run). The new WARN can print a few times per load, and only for a model with Q1_0 or NVFP4 routed experts. That is intended: the lead gate reads it.
+- `compute_multi_device_plan` is host arithmetic, but it writes the planner's published globals (`unified_cache_set_planned_*`). The test runs in its own process, so that is harmless there. If it touches a device in this binary (it should not), stop and report.
+- The line `max_batch=%zu` in the INFO log below the loop is W3.3's (`max_batch_tokens`). Do not touch it.
+- The loop's filters are unchanged; only the rows and the dedupe are new. Do not change which tensors count.
+
+---
+
+### Task W3.7b: the transaction re-sizes the recipe workspace at the context's micro-batch
+
+**Track:** S3-control
+**Depends on:** W3.7a
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp:21197-21199` (insert after `next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());`, before the comment `// Filled when KV is re-placed to the host tier`)
+- Create: `tests/test-sycl-moe-context-sizing-source.py`
+- Modify: `tests/CMakeLists.txt:4668` (register the new pin after `test-sycl-auto-ubatch-source`'s block)
+
+**Description:**
+
+The load sizes the recipe workspace at its own micro-batch (W3.7a). A context may name another one: the auto picker's probes try several, and a server can create a second context. The transaction already copies the published plan into `next_plan` and sets `next_plan.planner_n_ubatch` to this context's micro-batch (S1). This task recomputes `next_plan.moe_host_recipe_workspace_bytes` there, from the shapes W3.7a stored, by the same function. The published plan is what the executor's check reads (`ggml_sycl_cache_plan_owner`, `ggml-sycl.cpp:90234-90236`), so after the publish the check compares against this context's size.
+
+The block runs before the ring's pending terms (S8), which both the probe and the real call reach, so the probe answers for the same workspace the real call publishes. `next_plan` is a local copy, so a refusal leaves nothing to roll back.
+
+**Design choice:** re-size in the transaction for every context, by the load's function. Rejected: sizing once at load for the largest micro-batch any context may name (it reserves host memory for widths nobody asked for, and no fixed largest width exists under the owner's rule).
+
+**Acceptance Criteria:**
+
+- [ ] `python3 -m pytest tests/test-sycl-moe-context-sizing-source.py -q` gives 2 passed
+- [ ] `ctest --test-dir build -R '^test-sycl-moe-context-sizing-source$' --output-on-failure` passes after a reconfigure (pure Python, safe anywhere)
+- [ ] `./scripts/sycl-build.sh llama-bench` builds (after the lead's GO)
+- [ ] The existing transaction pins still pass: `python3 -m pytest tests/test-sycl-ubatch-ring-replan-source.py tests/test-sycl-compute-buffer-fallback-source.py tests/test-sycl-explicit-ubatch-placement-source.py tests/test-sycl-pp-moe-ring-kv-zone-source.py -q`
+- [ ] (lead) Gate L-W3.7, second arm
+
+**Implementation Guide:**
+
+1. **RED.** Create `tests/test-sycl-moe-context-sizing-source.py`:
+
+```python
+#!/usr/bin/env python3
+"""Source pins: the runtime context transaction sizes the per-context MoE structures from the context's micro-batch.
+
+- The immutable Q1_0/NVFP4 host recipes' CPU workspace is re-sized at the context's micro-batch, in tokens, by the
+  function the load sized it with. It sits after the transaction sets next_plan.planner_n_ubatch and before the ring's
+  pending terms are built, so the probe and the real call both run it, and an overflow refuses the context.
+"""
+
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+GGML_SYCL_CPP = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
+
+# One left-to-right pass, so a `/*` inside a `//` comment cannot open a block comment.
+_LEXEME_RE = re.compile(
+    r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
+    r"|'(?:\\.|[^'\\\n])*'"  # char literal (kept)
+    r"|//[^\n]*"  # line comment (dropped)
+    r"|/\*.*?\*/",  # block comment (dropped)
+    flags=re.DOTALL,
+)
+
+
+def strip_comments(src: str) -> str:
+    def repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if tok[0] in "\"'":
+            return tok
+        return "\n" * tok.count("\n")
+
+    return _LEXEME_RE.sub(repl, src)
+
+
+def squash(text: str) -> str:
+    """One space for every whitespace run, and none after `(` or before `)` and `,`, so a call clang-format wraps
+    still matches its one-line spelling."""
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\(\s+", "(", text)
+    text = re.sub(r"\s+\)", ")", text)
+    return re.sub(r"\s+,", ",", text)
+
+
+GGML_SYCL_CPP_CODE = squash(strip_comments(GGML_SYCL_CPP))
+
+_TXN_START = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
+_TXN_END = "#undef GGML_SYCL_RUNTIME_TXN_REFUSAL"
+_S1_ANCHOR = "next_plan.planner_n_ubatch = next_kv_info.n_ubatch;"
+_S8_ANCHOR = "ggml_sycl_ring_kv_zone_inputs ring_kv_zone;"
+
+_RECIPE_RESIZE = (
+    "ggml_sycl::placement_moe_host_recipe_workspace_bytes_at(next_plan.moe_host_recipe_shapes, "
+    "ggml_sycl::placement_load_n_ubatch(next_plan.planner_n_ubatch), &next_plan.moe_host_recipe_workspace_bytes)"
+)
+_RECIPE_REFUSE = 'return refuse("MoE host recipe workspace overflows");'
+
+
+def transaction(code: str) -> str:
+    start = code.find(_TXN_START)
+    assert start != -1, "the runtime context transaction is not found"
+    end = code.find(_TXN_END, start)
+    assert end != -1, "the transaction's end is not found"
+    return code[start:end]
+
+
+def between_s1_and_s8(txn: str, needle: str, what: str) -> list:
+    s1 = txn.find(_S1_ANCHOR)
+    s8 = txn.find(_S8_ANCHOR)
+    at = txn.find(needle)
+    if s1 == -1 or s8 == -1:
+        return [f"{what}: an anchor is missing (S1 {s1}, S8 {s8})"]
+    if at == -1:
+        return [f"{what}: not found in the transaction"]
+    if not s1 < at < s8:
+        return [f"{what}: must sit after planner_n_ubatch is set and before the ring's pending terms"]
+    return []
+
+
+def recipe_resize_violations(code: str) -> list:
+    txn = transaction(code)
+    violations = between_s1_and_s8(txn, _RECIPE_RESIZE, "the host recipe workspace re-size")
+    violations += between_s1_and_s8(txn, _RECIPE_REFUSE, "the host recipe workspace refusal")
+    return violations
+
+
+def test_transaction_resizes_the_host_recipe_workspace():
+    assert recipe_resize_violations(GGML_SYCL_CPP_CODE) == []
+
+
+def test_recipe_resize_check_has_a_mutation_witness():
+    assert GGML_SYCL_CPP_CODE.count(_RECIPE_RESIZE) == 1, "the re-size must appear exactly once"
+    mutated = GGML_SYCL_CPP_CODE.replace(_RECIPE_RESIZE, "true", 1)
+    assert recipe_resize_violations(mutated) != [], "the check must catch the re-size being removed"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
+```
+
+   Register it in `tests/CMakeLists.txt` after the `test-sycl-auto-ubatch-source` block (ends at line 4668):
+
+```cmake
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-context-sizing-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-context-sizing-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+```
+
+   Run: `python3 -m pytest tests/test-sycl-moe-context-sizing-source.py -q`
+   Expected (RED): 2 failed (`not found in the transaction`, and the count assertion in the witness).
+
+2. **GREEN.** In `ggml/src/ggml-sycl/ggml-sycl.cpp`, after the line
+   `next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());`
+   (line 21197) and its blank line, before `// Filled when KV is re-placed to the host tier`, add:
+
+```cpp
+    // The immutable Q1_0/NVFP4 host recipes' CPU workspace is one micro-batch of tokens: this context's, by the rule the
+    // load sized it with. The executor checks its request against the published plan's figure. next_plan is a local
+    // copy, so a refusal leaves nothing to roll back, and the probe sizes the same workspace the real call publishes.
+    if (!ggml_sycl::placement_moe_host_recipe_workspace_bytes_at(
+            next_plan.moe_host_recipe_shapes, ggml_sycl::placement_load_n_ubatch(next_plan.planner_n_ubatch),
+            &next_plan.moe_host_recipe_workspace_bytes)) {
+        GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode,
+                                      "[SYCL-PLAN] runtime context update rejected: the MoE host recipe workspace for "
+                                      "n_ubatch=%u overflows\n",
+                                      next_kv_info.n_ubatch);
+        return refuse("MoE host recipe workspace overflows");
+    }
+```
+
+   Run the pin: 2 passed. Run the four existing transaction pins (Acceptance). After the lead's GO:
+   `./scripts/sycl-build.sh llama-bench`.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the runtime context transaction re-sizes the MoE host recipe workspace at its micro-batch" -- \
+    ggml/src/ggml-sycl/ggml-sycl.cpp tests/test-sycl-moe-context-sizing-source.py tests/CMakeLists.txt
+```
+
+**Gotchas:**
+- The host SCRATCH zone was sized at load from the load's workspace (`unified-cache.cpp:35856-35874`) and is not re-sized here. A context wider than the load needs the host SCRATCH ledger to cover the larger request when the executor allocates it. Whether `allocate_managed_host_pinned(..., EXPERT_STAGING, ...)` grows through the ledger is not settled (Open question 1). Do not change `next_plan.host_zone_scratch_bytes` in this task: it describes a zone that is already built.
+- With W3.1 the load is planned at the caller's `-ub`, so the first context usually re-sizes to the same figure. The block matters for the picker's probes and for a second context.
+- `GGML_SYCL_RUNTIME_TXN_REFUSAL` logs INFO in a probe and ERROR otherwise. Use it, not a bare log.
+- The pin's anchors are the code's own text. If clang-format re-wraps `next_plan.planner_n_ubatch   = next_kv_info.n_ubatch;`, `squash` absorbs it; a rename does not, and is the point.
+- The macro is `#undef`-ed right after the transaction; the pin uses that line as the function's end.
+
+---
+
+### Task W3.6a: the control layout is sized from the planned micro-batch, and the 512 constant goes
+
+**Track:** S3-control
+**Depends on:** W3.5, W3.7a
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/moe-control-plan.hpp:140-144` (comment and `MOE_GPU_UBATCH_MAX`, delete), `:164` (`exceeds_gpu_ubatch`, delete), `:173-175` (add a declaration after `moe_build_context_control_layout`'s)
+- Modify: `ggml/src/ggml-sycl/moe-control-plan.cpp:380-393` (the builder's head; delete the branch at 390-393) and `:476-503` (its tail, moved into a helper)
+- Modify: `ggml/src/ggml-sycl/unified-cache.cpp:35440-35445` (the layout call and its comment)
+- Test: `ggml/src/ggml-sycl/tests/test-moe-control-plan.cpp:41, 296-302, 305-310, 615-641`
+- Test: `tests/test-sycl-moe-control-plan-contract.py:149-151`
+
+**Description:**
+
+The control layout's routing ids and compaction table are `n_expert_used * n_ubatch` entries. The planner builds the layout at `MOE_GPU_UBATCH_MAX` (512), and the builder refuses any micro-batch above 512 (`exceeds_gpu_ubatch`). Nothing reads that flag, and stage 2 made the prompt path correct above 512, so the refusal is a fixed number with no reason left behind it (owner rule: "Correct and monotone, no fixed number").
+
+This task deletes the constant, the flag and the refusal. The planner builds the layout at the micro-batch the plan is built for, `placement_load_n_ubatch(plan.planner_n_ubatch)`. A new pure function, `moe_context_control_layout_at(base, n_ubatch)`, re-lays only the row-scaled regions of an audited layout at another micro-batch. It shares one helper with the builder, so the two cannot disagree. W3.6b uses it in the transaction.
+
+**Design choice:** `moe_context_control_layout_at` re-lays a layout the builder already audited, instead of the transaction re-running the builder on the inventory. The audit (role masks, geometry, per-entry checks) does not depend on the micro-batch, and the transaction has no descriptor list. Rejected: storing the descriptor list on the plan to re-run the builder.
+
+**Acceptance Criteria:**
+
+- [ ] `git grep -n 'MOE_GPU_UBATCH_MAX\|exceeds_gpu_ubatch' -- ggml src tests | cat` prints nothing
+- [ ] `./build/bin/test-moe-control-plan` prints `moe control plan: PASS (28 cases)` (after the lead's GO; or the g++ form below, which needs no GO)
+- [ ] `python3 tests/test-sycl-moe-control-plan-contract.py` prints `PASS (20 checks)`; `--self-test` prints `PASS (5 mutants)`
+- [ ] `python3 -m pytest tests/test-sycl-plan-dry-run-source.py -q` passes unchanged
+- [ ] `./scripts/sycl-build.sh llama-bench test-sycl-moe-resolved-batch` builds (after the lead's GO)
+- [ ] (lead) Gate L-W3.6 below
+
+**Implementation Guide:**
+
+1. **RED.** In `ggml/src/ggml-sycl/tests/test-moe-control-plan.cpp`:
+   - Replace `using ggml_sycl::MOE_GPU_UBATCH_MAX;` (line 41) with `using ggml_sycl::moe_context_control_layout_at;`.
+   - Replace `case_oversized_ubatch_is_not_gpu_eligible` (lines 296-302) with these four functions:
+
+```cpp
+static void case_wide_ubatch_is_a_valid_layout() {
+    const auto plan = moe_build_ptr_table_plan(build_inventory(2, { "gate_exps", "up_exps", "down_exps" }), 32);
+    for (uint32_t n_ubatch : { 513u, 1024u, 4096u }) {
+        const auto layout = moe_build_context_control_layout(plan, 4, n_ubatch);
+        check(layout.valid && layout.gpu_eligible, "a micro-batch above 512 rows has a routable layout");
+        check(layout.ids_bytes == 4u * n_ubatch * sizeof(int32_t), "ids are n_expert_used x n_ubatch int32");
+        check(layout.compact_bytes == 4u * n_ubatch * sizeof(void *), "compact is n_expert_used x n_ubatch pointers");
+        check(!layout.arithmetic_overflow && !layout.metadata_mismatch, "and nothing is flagged");
+    }
+}
+
+static void check_same_layout(const moe_context_control_layout & a,
+                              const moe_context_control_layout & b,
+                              const std::string &                what) {
+    check(a.n_expert == b.n_expert && a.n_expert_used == b.n_expert_used && a.n_ubatch == b.n_ubatch, what + ": shape");
+    check(a.table_count == b.table_count && a.table_bytes == b.table_bytes && a.table_stride == b.table_stride,
+          what + ": tables");
+    check(a.tables_offset == b.tables_offset && a.tables_bytes == b.tables_bytes, what + ": table region");
+    check(a.ids_offset == b.ids_offset && a.ids_bytes == b.ids_bytes, what + ": ids region");
+    check(a.compact_offset == b.compact_offset && a.compact_bytes == b.compact_bytes, what + ": compact region");
+    check(a.missing_offset == b.missing_offset && a.missing_bytes == b.missing_bytes, what + ": missing flag");
+    check(a.total_bytes == b.total_bytes, what + ": total");
+    check(a.valid == b.valid && a.gpu_eligible == b.gpu_eligible, what + ": verdict");
+    check(a.metadata_mismatch == b.metadata_mismatch && a.arithmetic_overflow == b.arithmetic_overflow,
+          what + ": flags");
+}
+
+static void case_layout_at_matches_the_builder() {
+    const auto plan = moe_build_ptr_table_plan(build_inventory(4, { "gate_exps", "up_exps", "down_exps" }), 32);
+    const auto base = moe_build_context_control_layout(plan, 4, 512);
+    check(base.valid && base.gpu_eligible, "the base layout must be routable");
+    for (uint32_t n_ubatch : { 1u, 256u, 512u, 513u, 1024u, 2048u, 4096u, 65536u }) {
+        check_same_layout(moe_context_control_layout_at(base, n_ubatch),
+                          moe_build_context_control_layout(plan, 4, n_ubatch),
+                          "n_ubatch=" + std::to_string(n_ubatch));
+    }
+}
+
+static void case_layout_at_is_monotone() {
+    const auto plan     = moe_build_ptr_table_plan(build_inventory(2, { "gate_exps", "up_exps", "down_exps" }), 32);
+    const auto base     = moe_build_context_control_layout(plan, 4, 512);
+    size_t     previous = 0;
+    for (uint32_t n_ubatch = 1; n_ubatch <= 8192; ++n_ubatch) {
+        const auto layout = moe_context_control_layout_at(base, n_ubatch);
+        check(layout.valid && layout.total_bytes >= previous, "the pool never shrinks as the micro-batch grows");
+        previous = layout.total_bytes;
+    }
+}
+
+static void case_layout_at_keeps_what_it_cannot_resize() {
+    const auto plan = moe_build_ptr_table_plan(build_inventory(2, { "gate_exps", "up_exps", "down_exps" }), 32);
+
+    const auto refused = moe_build_context_control_layout(plan, 0, 512);
+    check(!refused.valid && refused.metadata_mismatch, "fixture: n_expert_used 0 is refused");
+    const auto still = moe_context_control_layout_at(refused, 2048);
+    check(!still.valid && still.metadata_mismatch && still.n_ubatch == refused.n_ubatch,
+          "a refused layout is returned unchanged");
+
+    const auto dense = moe_build_context_control_layout(moe_build_ptr_table_plan({ desc("output.weight") }, 0), 0, 512);
+    check(dense.valid && !dense.gpu_eligible && dense.total_bytes == 0, "fixture: a dense layout is valid and empty");
+    const auto dense_at = moe_context_control_layout_at(dense, 4096);
+    check(dense_at.valid && !dense_at.gpu_eligible && dense_at.total_bytes == 0,
+          "a dense layout stays valid and empty at any micro-batch");
+
+    const auto base = moe_build_context_control_layout(plan, 4, 512);
+    const auto none = moe_context_control_layout_at(base, 0);
+    check(!none.valid && none.metadata_mismatch, "no rows is refused, as the builder refuses it");
+}
+```
+
+   - In `case_checked_pool_bytes_refuses_overflow` (line 305), replace the comment's
+     `n_expert is an int and n_ubatch is capped at MOE_GPU_UBATCH_MAX, so every\n    // product stays well inside a 64-bit size_t.`
+     with `n_expert is an int and n_ubatch a uint32_t, so every\n    // product stays well inside a 64-bit size_t.`
+   - In `main`'s `cases` array replace `{ "oversized-ubatch-not-eligible",       case_oversized_ubatch_is_not_gpu_eligible            },` with:
+
+```cpp
+        { "wide-ubatch-is-valid",                case_wide_ubatch_is_a_valid_layout                   },
+        { "layout-at-matches-the-builder",       case_layout_at_matches_the_builder                   },
+        { "layout-at-is-monotone",               case_layout_at_is_monotone                           },
+        { "layout-at-keeps-what-it-cannot",      case_layout_at_keeps_what_it_cannot_resize           },
+```
+
+   In `tests/test-sycl-moe-control-plan-contract.py` line 151, replace
+   `"moe_build_context_control_layout(ptr_tables, n_expert_used, MOE_GPU_UBATCH_MAX)"` with
+   `"moe_build_context_control_layout(ptr_tables, n_expert_used, placement_load_n_ubatch(plan.planner_n_ubatch))"`.
+
+   Run from the worktree root (host-only, no GO needed):
+
+```bash
+mkdir -p build-host
+g++ -std=c++17 -I ggml/src/ggml-sycl ggml/src/ggml-sycl/tests/test-moe-control-plan.cpp \
+    ggml/src/ggml-sycl/moe-control-plan.cpp -pthread -o build-host/test-moe-control-plan \
+    && ./build-host/test-moe-control-plan | tail -1; echo "rc=${PIPESTATUS[0]}"
+python3 tests/test-sycl-moe-control-plan-contract.py; echo rc=$?
+```
+
+   Expected (RED): the compile fails with `'moe_context_control_layout_at' is not a member of 'ggml_sycl'`; the
+   contract pin exits non-zero naming `the planner builds the exact descriptor plan and control layout`.
+
+2. **GREEN, the header.** In `moe-control-plan.hpp` delete lines 140-144 (the comment
+   `// Above this micro-batch the routing ids and compaction table stop being a` through
+   `static constexpr uint32_t MOE_GPU_UBATCH_MAX = 512;`) and the blank line after them. Delete line 164
+   (`    bool     exceeds_gpu_ubatch  = false;`). After the declaration of `moe_build_context_control_layout` (ends at line 175), add:
+
+```cpp
+
+// `base` re-laid at another micro-batch: the pointer tables stay, the routing ids and the compaction table become
+// n_expert_used * n_ubatch entries, and every offset after the tables follows. `base` must come from
+// moe_build_context_control_layout, which did the audit; that audit does not depend on the micro-batch. A layout that
+// is not valid, or valid with nothing to route (a dense model), is returned unchanged. n_ubatch 0 is a metadata
+// mismatch, as in the builder.
+moe_context_control_layout moe_context_control_layout_at(const moe_context_control_layout & base, uint32_t n_ubatch);
+```
+
+3. **GREEN, the builder.** In `moe-control-plan.cpp`, directly above `moe_context_control_layout moe_build_context_control_layout(`
+   (line 380), add:
+
+```cpp
+// Lays out the routing ids, the compaction table and the missing flag after the pointer tables, for
+// layout.n_expert_used slots per token and layout.n_ubatch tokens. Sets valid and gpu_eligible on success, and
+// arithmetic_overflow otherwise. The builder and moe_context_control_layout_at both end here, so they cannot disagree.
+static moe_context_control_layout layout_routed_regions(moe_context_control_layout layout) {
+    size_t routed_slots = 0;
+    if (!moe_checked_pool_bytes(static_cast<size_t>(layout.n_expert_used), static_cast<size_t>(layout.n_ubatch),
+                                &routed_slots) ||
+        !moe_checked_pool_bytes(routed_slots, sizeof(int32_t), &layout.ids_bytes) ||
+        !moe_checked_pool_bytes(routed_slots, sizeof(void *), &layout.compact_bytes)) {
+        layout.arithmetic_overflow = true;
+        return layout;
+    }
+    layout.missing_bytes = sizeof(uint32_t);
+
+    size_t cursor = 0;
+    if (!checked_add(layout.tables_offset, layout.tables_bytes, &cursor) ||
+        !checked_align(cursor, &layout.ids_offset) || !checked_add(layout.ids_offset, layout.ids_bytes, &cursor) ||
+        !checked_align(cursor, &layout.compact_offset) ||
+        !checked_add(layout.compact_offset, layout.compact_bytes, &cursor) ||
+        !checked_align(cursor, &layout.missing_offset) ||
+        !checked_add(layout.missing_offset, layout.missing_bytes, &cursor) ||
+        !checked_align(cursor, &layout.total_bytes)) {
+        layout.arithmetic_overflow = true;
+        return layout;
+    }
+    layout.valid        = true;
+    layout.gpu_eligible = true;
+    return layout;
+}
+```
+
+   In `moe_build_context_control_layout`, delete the branch at lines 390-393:
+
+```cpp
+    if (n_ubatch > MOE_GPU_UBATCH_MAX) {
+        layout.exceeds_gpu_ubatch = true;
+        return layout;
+    }
+```
+
+   and replace its tail, everything after the dense-model block
+   (`if (plan.entries.empty()) {\n        layout.valid = true;\n        return layout;\n    }`) up to the function's closing `}`
+   (from `size_t routed_slots = 0;` through `layout.gpu_eligible = true;\n    return layout;`), with:
+
+```cpp
+    return layout_routed_regions(layout);
+```
+
+   After the builder's closing `}`, add:
+
+```cpp
+
+moe_context_control_layout moe_context_control_layout_at(const moe_context_control_layout & base, uint32_t n_ubatch) {
+    if (!base.valid || !base.gpu_eligible) {
+        return base;
+    }
+    moe_context_control_layout layout = base;
+    layout.n_ubatch                   = n_ubatch;
+    layout.valid                      = false;
+    layout.gpu_eligible               = false;
+    if (n_ubatch == 0) {
+        layout.metadata_mismatch = true;
+        return layout;
+    }
+    return layout_routed_regions(layout);
+}
+```
+
+   `checked_add` and `checked_align` are in the file's anonymous namespace above (lines 21-150), so the new static
+   function sees them.
+
+4. **GREEN, the planner.** In `unified-cache.cpp`, replace lines 35440-35445 (the comment
+   `// n_ubatch is not known at plan time, so the layout is built at the` through
+   `moe_build_context_control_layout(ptr_tables, n_expert_used, MOE_GPU_UBATCH_MAX);`) with:
+
+```cpp
+        // The layout is built at the micro-batch this plan is built for. A context with another micro-batch re-lays it
+        // in its transaction (moe_context_control_layout_at); the pointer tables do not change with it.
+        const moe_ptr_table_plan ptr_tables = moe_build_ptr_table_plan(moe_descs, n_experts);
+        plan.base_context_control_layout =
+            moe_build_context_control_layout(ptr_tables, n_expert_used, placement_load_n_ubatch(plan.planner_n_ubatch));
+```
+
+   Leave the publish block below (`// Publish the per-device CONTROL requirement`) exactly as it is: the contract pin
+   checks its text, and `tests/test-sycl-plan-dry-run-source.py` needs `placement_plan_size_host_side` to reach the
+   setter through static callees.
+
+   Run the g++ form and the contract pin again. Expected (GREEN): `moe control plan: PASS (28 cases)`, rc=0;
+   `PASS (20 checks)`; `python3 tests/test-sycl-moe-control-plan-contract.py --self-test` gives `PASS (5 mutants)`;
+   `python3 -m pytest tests/test-sycl-plan-dry-run-source.py -q` passes. After the lead's GO:
+   `./scripts/sycl-build.sh llama-bench test-moe-control-plan test-sycl-moe-resolved-batch`, then
+   `./build/bin/test-moe-control-plan` and `source /opt/intel/oneapi/setvars.sh --force; ./build/bin/test-sycl-moe-resolved-batch`.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the MoE control layout is sized from the planned micro-batch; the 512-row routing limit goes" -- \
+    ggml/src/ggml-sycl/moe-control-plan.hpp ggml/src/ggml-sycl/moe-control-plan.cpp \
+    ggml/src/ggml-sycl/unified-cache.cpp ggml/src/ggml-sycl/tests/test-moe-control-plan.cpp \
+    tests/test-sycl-moe-control-plan-contract.py
+```
+
+**Gotchas:**
+- `build-host/` is scratch. Do not commit it.
+- `layout_routed_regions` takes the layout by value and returns it; the builder's `return layout_routed_regions(layout);` is the only change to its control flow. Do not move the audit.
+- `case_layout_regions_are_aligned_and_disjoint` (line 183) still builds at 256 and still holds.
+- After this task the load's control requirement grows with the load's micro-batch: `n_expert_used * n_ubatch * 12` bytes plus alignment (about 0.14 MB more at 2048 than at 512 for a top-8 model). It enters the RUNTIME requirement (`unified-cache.cpp:3612`) and `unified_cache_dense_scratch_runtime_fit` (`:3217`) through the published requirement, at load, before the zones are built. That is correct.
+- `unified_cache_explicit_ubatch_room` (`unified-cache.cpp:3648-3700`) says the requirement less the ring and dense terms "is the same at any micro-batch". It is now off by the control delta, under 1 MB. Leave it; W3.6b's Gotchas say why.
+- `plan.moe_control_pool_bytes` and `plan.moe_vram_runtime_bytes` (`unified-cache.cpp:35450, 35627`) follow the load's layout. They feed the load's VRAM estimate.
+
+---
+
+### Task W3.6b: the transaction lays the control pool out at the context's micro-batch and keeps room for it
+
+**Track:** S3-control
+**Depends on:** W3.6a, W3.7b
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp:20410-20418` (`ggml_sycl_runtime_pending_terms`), `:20537-20549` (the ring refusal's term WARN, `ggml_sycl_log_ring_refusal_runtime_terms`), the S1 insertion W3.7b made (after `next_plan.update_runtime_kv_sizes(...)`), `:21903-21904` (S8, after the state term)
+- Modify: `tests/test-sycl-moe-context-sizing-source.py` (W3.7b's file)
+
+**Description:**
+
+After W3.6a the load lays the control pool out at its own micro-batch. A context with another micro-batch needs its own layout, and the ring admission must keep room for that pool in the RUNTIME zone. Today the admission keeps no room for it at all: the pool is in the zone's requirement but is never allocated, so the zone's free space includes it, and a ring could take it.
+
+This task does two things in the transaction, in both the probe and the real call:
+1. After S1, `next_plan.base_context_control_layout = moe_context_control_layout_at(next_plan.base_context_control_layout, placement_load_n_ubatch(next_plan.planner_n_ubatch))`. The plan is published at S16 with the context's layout. If a valid layout cannot be re-laid (an overflow), the context is refused.
+2. In S8, a new pending term `control_bytes` holds the pool at this context's micro-batch, so the ring re-plan leaves it room. The ring refusal's term line prints it as `moe_control=`.
+
+The transaction does not re-publish the control requirement global (`unified_cache_set_planned_moe_control_requirement`). That global sizes the RUNTIME zone, and the zone is built at load and cannot grow while allocations are live. A requirement raised after load can make a later `ensure_planned_arena_zones` refuse to rebuild and abort the load: W3.0 saw that abort (`need runtime=1750.2 MB` against `1750.1 MB`, bug `llama.cpp-pgay`) from a growth of a tenth of a MB. The context's pool is carried as a pending term instead, which competes for the fixed zone the way every other per-context term does.
+
+**Design choice:** the context's control pool is a pending term in the ring admission, and the published requirement stays the load's. Rejected: re-publishing the requirement from the transaction (it can trip the no-rebuild check above, and the dry run's saved state would then have to model it).
+
+**Acceptance Criteria:**
+
+- [ ] `python3 -m pytest tests/test-sycl-moe-context-sizing-source.py -q` gives 4 passed
+- [ ] The transaction does not call `unified_cache_set_planned_moe_control_requirement` (pinned)
+- [ ] The four existing transaction pins of W3.7b's Acceptance still pass
+- [ ] `./scripts/sycl-build.sh llama-bench` builds (after the lead's GO)
+- [ ] (lead) Gate L-W3.6, second arm
+
+**Implementation Guide:**
+
+1. **RED.** Append to `tests/test-sycl-moe-context-sizing-source.py`, before the `if __name__ == "__main__":` block:
+
+```python
+_CONTROL_RESIZE = (
+    "next_plan.base_context_control_layout = ggml_sycl::moe_context_control_layout_at("
+    "next_plan.base_context_control_layout, ggml_sycl::placement_load_n_ubatch(next_plan.planner_n_ubatch));"
+)
+_CONTROL_REFUSE = 'return refuse("MoE control layout overflows");'
+_CONTROL_PENDING = "ring_kv_zone.pending_terms.control_bytes ="
+_PENDING_STRUCT = "struct ggml_sycl_runtime_pending_terms {"
+
+
+def control_violations(code: str) -> list:
+    txn = transaction(code)
+    violations = between_s1_and_s8(txn, _CONTROL_RESIZE, "the control layout re-lay")
+    violations += between_s1_and_s8(txn, _CONTROL_REFUSE, "the control layout refusal")
+    s8 = txn.find(_S8_ANCHOR)
+    pending = txn.find(_CONTROL_PENDING)
+    if pending == -1 or pending < s8:
+        violations.append("the control pool must be a pending term of the ring admission (S8)")
+    if "unified_cache_set_planned_moe_control_requirement" in txn:
+        violations.append("the transaction must not re-publish the control requirement: the zone is built at load")
+    start = code.find(_PENDING_STRUCT)
+    struct = code[start : code.find("};", start)] if start != -1 else ""
+    if "size_t control_bytes = 0;" not in struct or "+ control_bytes" not in struct:
+        violations.append("ggml_sycl_runtime_pending_terms must hold control_bytes and add it in sum()")
+    return violations
+
+
+def test_transaction_lays_out_the_control_pool_at_its_micro_batch():
+    assert control_violations(GGML_SYCL_CPP_CODE) == []
+
+
+def test_control_check_has_mutation_witnesses():
+    assert GGML_SYCL_CPP_CODE.count(_CONTROL_RESIZE) == 1, "the re-lay must appear exactly once"
+    dropped = GGML_SYCL_CPP_CODE.replace(_CONTROL_RESIZE, ";", 1)
+    assert control_violations(dropped) != [], "the check must catch the re-lay being removed"
+    republish = GGML_SYCL_CPP_CODE.replace(
+        _CONTROL_PENDING, "ggml_sycl::unified_cache_set_planned_moe_control_requirement(0, {}); " + _CONTROL_PENDING, 1
+    )
+    assert control_violations(republish) != [], "the check must catch a re-publish inside the transaction"
+```
+
+   Run: `python3 -m pytest tests/test-sycl-moe-context-sizing-source.py -q`
+   Expected (RED): 2 failed (the two new tests), 2 passed.
+
+2. **GREEN, the pending term.** Replace the struct at `ggml-sycl.cpp:20410-20418` (find it by
+   `struct ggml_sycl_runtime_pending_terms {`) with:
+
+```cpp
+struct ggml_sycl_runtime_pending_terms {
+    size_t dense_scratch_bytes = 0;  // the dense scratch planned at the runtime n_ubatch
+    size_t compute_term_bytes  = 0;  // the load's planned compute term
+    size_t state_term_bytes    = 0;  // the load's planned state term
+    size_t control_bytes       = 0;  // the MoE control pool laid out at the runtime n_ubatch
+    size_t host_scatter_bytes  = 0;  // the planned host-expert scatter scratch this context does not hold yet
+    size_t mmid_pools_bytes    = 0;  // the next plan's MMID workspace pools on the device
+
+    size_t sum() const {
+        return dense_scratch_bytes + compute_term_bytes + state_term_bytes + control_bytes + host_scatter_bytes +
+               mmid_pools_bytes;
+    }
+};
+```
+
+3. **GREEN, the term line.** In `ggml_sycl_log_ring_refusal_runtime_terms` (find
+   `"pending=%zu (dense_scratch=%zu compute=%zu state=%zu host_scatter_unheld=%zu mmid_pools=%zu "`), insert a new
+   literal line directly after that one:
+
+```cpp
+        "moe_control=%zu "
+```
+
+   and in the argument list replace `pending.mmid_pools_bytes, unattributed,` with
+   `pending.mmid_pools_bytes, pending.control_bytes, unattributed,`.
+
+4. **GREEN, S1.** Directly after W3.7b's block (it ends `return refuse("MoE host recipe workspace overflows");\n    }`), add:
+
+```cpp
+    // The MoE control pool's routing ids and compaction table follow this context's micro-batch. The layout is re-laid
+    // from the audited one the plan holds; the pointer tables do not change. It is published with the plan, and the
+    // ring admission below keeps room for it. The requirement global stays the load's: the zone it sized is built.
+    const bool control_was_valid          = next_plan.base_context_control_layout.valid;
+    next_plan.base_context_control_layout = ggml_sycl::moe_context_control_layout_at(
+        next_plan.base_context_control_layout, ggml_sycl::placement_load_n_ubatch(next_plan.planner_n_ubatch));
+    if (control_was_valid && !next_plan.base_context_control_layout.valid) {
+        GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode,
+                                      "[SYCL-PLAN] runtime context update rejected: the MoE control layout for "
+                                      "n_ubatch=%u overflows\n",
+                                      next_kv_info.n_ubatch);
+        return refuse("MoE control layout overflows");
+    }
+```
+
+5. **GREEN, S8.** After the state term (find
+   `ring_kv_zone.pending_terms.state_term_bytes = ring_kv_zone.runtime_pending_bytes - ring_kv_zone.pending_terms.sum();`),
+   add:
+
+```cpp
+    // The MoE control pool at this context's micro-batch. It is part of the RUNTIME requirement the zone was sized
+    // from but is not allocated, so the zone's free space still holds it and the ring must leave it. A layout that
+    // could not be computed adds nothing here: the load already published that requirement as invalid.
+    {
+        const ggml_sycl::moe_control_requirement control = ggml_sycl::moe_control_requirement_from_layout(
+            next_plan.base_context_control_layout, next_plan.base_context_control_layout.table_count != 0);
+        ring_kv_zone.runtime_pending_bytes += control.valid ? control.bytes : 0;
+        ring_kv_zone.pending_terms.control_bytes =
+            ring_kv_zone.runtime_pending_bytes - ring_kv_zone.pending_terms.sum();
+    }
+```
+
+   Run the pin (4 passed) and the four transaction pins. After the lead's GO: `./scripts/sycl-build.sh llama-bench`.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the runtime context transaction lays the MoE control pool out at its micro-batch and keeps room for it" -- \
+    ggml/src/ggml-sycl/ggml-sycl.cpp tests/test-sycl-moe-context-sizing-source.py
+```
+
+**Gotchas:**
+- `next_plan` is moved into the published snapshot after the CAS (`std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan))`). Every use in this task is before that.
+- The S6 dense-scratch fit (`unified_cache_dense_scratch_runtime_fit`, `unified-cache.cpp:3217`) and `unified_cache_explicit_ubatch_room` (`:3683`) read the load's published control, not the context's. The difference is the control delta, under 1 MB, and the S8 term now covers the context's pool in the admission. Do not make them read the plan: that is a second source for the requirement.
+- The pending term is conservative on a re-publish for the same micro-batch, like the dense scratch and the state term above it: the pool is not allocated, so it is never counted twice in fact.
+- No source pin checks the term WARN's format. The lead greps it by `moe_control=`.
+- The phase-4 part edits S8 too (its buffers become planned terms). Land this task first, or rebase the later one onto the new `control_bytes` summand.
+
+---
+
+### Open questions (part C)
+
+1. **Host SCRATCH growth for a wider context.** W3.7b raises `moe_host_recipe_workspace_bytes` for a context wider than the load. The host SCRATCH zone was built from the load's figure. The code says a context's host demands go through the host SCRATCH ledger (`unified-cache.cpp:35852-35853`), but I could not confirm that an `EXPERT_STAGING` request from `allocate_managed_host_pinned` (`ggml-sycl.cpp:8040-8075`) is one of them. If it is not, a context wider than its load fails at the executor with "planned workspace unavailable". Gate L-W3.7's second arm answers it on the device. If it fails, the fix is a ledger notification in the transaction, which I would add to W3.7b.
+2. **Does the NVFP4 vehicle have NVFP4 routed experts?** The only candidate is `/models/qwen36-35b-a3b-nvfp4/Qwen3.6-35B-A3B-NVFP4-MTP-TURBO.gguf`. A file name is not its quant type. If its routed experts are not Q1_0 or NVFP4, there is no device vehicle for W3.7 and only the host test covers it.
+3. **Does the fallback error reach a log?** `ggml_sycl_fallback_error("MUL_MAT_ID Q1/NVFP4 planned workspace unavailable")` is caught in op dispatch. I did not trace whether its text is printed. Gate L-W3.7 greps for it and also requires rc 0, so a silent failure still fails the gate through rc or the throughput line.
+
+### Lead gates (part C)
+
+Every gate: one run per arm, pinned selector, under `timeout`, with Shmem sampled before and 5 s after. Take `GPU.lock` and wait for `Shmem < 30 GB` first. `RUN` is the lead's run directory for this stage. `GGML_SYCL_TUNING_CACHE=0` keeps the tuning cache from answering. Check the backend first: `grep -E '^GGML_SYCL:' build/CMakeCache.txt` shows `BOOL=ON`.
+
+**L-W3.5 (after W3.5): the picker still keeps MoE at 512.**
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+grep -E '^(MemAvailable|Shmem):' /proc/meminfo
+GGML_SYCL_TUNING_CACHE=0 ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 300 ./build/bin/llama-cli \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
+  -st --simple-io --no-display-prompt \
+  --chat-template-kwargs '{"reasoning_effort":"medium"}' \
+  --reasoning-format none --reasoning-budget 0 \
+  -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
+  -n 48 --seed 42 --temp 0 > "$RUN/lw35-gptoss-b50.log" 2>&1; echo "rc=$?"
+sleep 5; grep -E '^(Shmem|MemAvailable):' /proc/meminfo
+cat "$RUN/lw35-gptoss-b50.log" | grep -cx '1, 2, 3, 4, 5'                                   # want 1
+cat "$RUN/lw35-gptoss-b50.log" | grep -c 'auto n_ubatch=512 for .*; MoE GPU routing ceiling)' # want 1
+```
+
+**L-W3.7 (after W3.7b; arm 2 needs W3.1 merged): the recipe workspace follows the micro-batch.**
+First, with no GPU: confirm the routed experts' type.
+
+```bash
+python3 gguf-py/gguf/scripts/gguf_dump.py /models/qwen36-35b-a3b-nvfp4/Qwen3.6-35B-A3B-NVFP4-MTP-TURBO.gguf \
+  2>/dev/null | grep -m3 'ffn_.*_exps'      # the type column must read NVFP4 or Q1_0; otherwise stop (Open question 2)
+```
+
+Then two runs on the B50, which holds only part of the experts, so routed experts run on the host recipes:
+
+```bash
+for W in 512 2048; do
+  grep -E '^(MemAvailable|Shmem):' /proc/meminfo
+  GGML_SYCL_TUNING_CACHE=0 ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 900 ./build/bin/llama-bench \
+    -m /models/qwen36-35b-a3b-nvfp4/Qwen3.6-35B-A3B-NVFP4-MTP-TURBO.gguf \
+    -p $W -n 0 -ub $W -b $W -r 1 -v > "$RUN/lw37-nvfp4-b50-$W.log" 2>&1; echo "W=$W rc=$?"
+  sleep 5; grep -E '^(Shmem|MemAvailable):' /proc/meminfo
+done
+cat "$RUN"/lw37-nvfp4-b50-*.log | grep -c 'planned workspace unavailable'          # want 0
+cat "$RUN/lw37-nvfp4-b50-512.log"  | grep 'MoE host recipe workspace:'            # want: at n_ubatch=512
+cat "$RUN/lw37-nvfp4-b50-2048.log" | grep 'MoE host recipe workspace:'            # want: at n_ubatch=2048 (needs W3.1)
+```
+
+Expected: rc=0 for both, a `pp512` and a `pp2048` row each, and the 2048 workspace about 4 times the 512 one. Without W3.1 both lines read `n_ubatch=512`; the 2048 run then exercises the transaction's re-size and Open question 1. The two widths are separate processes on purpose: `-ub 512,2048` in one process aborts on bug `llama.cpp-pgay`.
+
+**L-W3.6 (after W3.6b; arm 1 needs W3.1 merged): the control pool follows the micro-batch.**
+
+```bash
+Q=/models/Qwen3.8-Flash-Next-GGUF/exps-IQ4_NL/Qwen3.8-Flash-Next-exps-IQ4_NL-00001-of-00006.gguf
+for W in 512 2048; do
+  grep -E '^(MemAvailable|Shmem):' /proc/meminfo
+  GGML_SYCL_TUNING_CACHE=0 ONEAPI_DEVICE_SELECTOR=level_zero:0 timeout 1800 ./build/bin/llama-bench \
+    -m "$Q" -p $W -n 0 -ub $W -b $W -r 1 -v > "$RUN/lw36-qwen-b70-$W.log" 2>&1; echo "W=$W rc=$?"
+  sleep 5; grep -E '^(Shmem|MemAvailable):' /proc/meminfo
+done
+cat "$RUN"/lw36-qwen-b70-*.log | grep -o 'moe_control=[0-9.]* MB'
+```
+
+Expected: rc=0 for both; prompt rate at 2048 not below the W3.0 figure (372.80 t/s, same card, same model; one run, under load, read with the ~10% B70 noise); `moe_control=` at 2048 larger than at 512 by `n_expert_used * 1536 * 12` bytes plus alignment (about 0.14 MB for a top-8 model; W3.0 read 0.6 MB with the 512 sizing). Without W3.1 both runs print the 512 figure, which proves only that the load is still planned at 512. Arm 2 is covered by these runs: no `runtime context update rejected: the MoE control layout` line in either log (`cat "$RUN"/lw36-qwen-b70-*.log | grep -c 'MoE control layout for'`, want 0).
+
+### Every 512 these tasks leave behind (part C)
+
+For the phase-4 part (not drafted here):
+- `ggml-sycl.cpp:9603-9621`, `moe_params.max_batch = 512;` (line 9608), the phase-4 buffers' size.
+- `unified-cache.hpp:9390`, `int max_batch = 512;`, the default of `moe_buffer_params`.
+- `unified-cache.cpp:29146-29271`, `moe_preallocate_inference_buffers`: ids `k * max_batch * 4`, compact `k * max_batch * 8`.
+- The raw fallbacks above the 512-row buffers: `ggml-sycl.cpp:70583-70613`, `ggml-sycl.cpp:73741-73775`, `mmvq.cpp:16923-17010`.
+- `ggml-sycl.cpp:28002`, `total_batches = 4`.
+- `unified-cache.cpp:29287` (expert pointer table) and `:29352` (the free function, no callers).
+- `unified-cache.cpp:28523` and `:28572`, the MoE Q8_1 scratch.
+
+Owned by others or kept on purpose:
+- `src/llama-model.cpp:464-465`, the load measure shape (W3.1, W3.2).
+- `unified-cache.cpp:35408-35410`, the routing ids term from `planner_n_ctx` (W3.3).
+- `unified-cache.hpp:649`, `PLACEMENT_LOAD_N_UBATCH_DEFAULT = 512`: the load's micro-batch when none is named. It is a default, not a limit; W3.1 decides whether it stays.
+- `src/llama-auto-ubatch.h`, `llama_auto_ubatch_moe_ceiling = 512` (new in W3.5): stage 4 removes it after W4.0.
+- `src/llama-auto-ubatch.h:59`, the ladder's 512 rung: a candidate, not a limit.
+- `ggml-sycl.cpp:20406`, `k_pp_moe_ring_compute_reserve_bytes_per_row`: a per-row reserve, not a row limit.
+
+### File ownership (part C)
+
+| file | region (lines at `d0118bb6c`) | task | shared with |
+|------|-------------------------------|------|-------------|
+| `src/llama-auto-ubatch.h` | 58-60 (after the ladder), 187-192 | W3.5 | stage 4 later |
+| `src/llama-context.cpp` | 423-431, 473-477, 2372, 2385-2396, 2433, 2585-2590 | W3.5 | none in stage 3 |
+| `src/llama-load-measure.h` | 209 (one phrase) | W3.5 | W3.1 rewrites the same comment (206-211): land W3.5's phrase in whichever lands second |
+| `ggml/include/ggml-sycl.h` | 988-996 | W3.5 | the tuning-cache task edits 760-830 |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 26393-26398, 128912-128922 | W3.5 | the tuning-cache task may edit 128934-128938 |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 20410-20418 (pending terms struct), 20537-20549 (term WARN) | W3.6b | phase-4 part |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | S1 insertion after 21197 | W3.7b, then W3.6b below it | W3.2's fit check sits near S5 (21755-21779), not here |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | S8, insertion after 21903 | W3.6b | phase-4 part (21869-21925) |
+| `ggml/src/ggml-sycl/unified-cache.hpp` | 1115 (new struct and declaration), 1319-1320 (new field) | W3.7a | none |
+| `ggml/src/ggml-sycl/unified-cache.cpp` | 35172 (new function above `populate_host_zone_sizing`) | W3.7a | none |
+| `ggml/src/ggml-sycl/unified-cache.cpp` | 35440-35445 (control layout call) | W3.6a | W3.3 edits 35402-35410 in the same function |
+| `ggml/src/ggml-sycl/unified-cache.cpp` | 35483-35506 (recipe loop), 35522 (dense branch) | W3.7a | W3.3 owns the INFO log at 35508-35515 just below |
+| `ggml/src/ggml-sycl/unified-cache.cpp` | 35696-35733 | not mine | W3.2 |
+| `ggml/src/ggml-sycl/moe-control-plan.hpp` | 140-144, 164, 173-175 | W3.6a | none |
+| `ggml/src/ggml-sycl/moe-control-plan.cpp` | 380-503 | W3.6a | none |
+| `ggml/src/ggml-sycl/tests/test-moe-control-plan.cpp` | 41, 296-310, 615-641 | W3.6a | none |
+| `tests/test-sycl-moe-resolved-batch.cpp` | 4, after 704, 1012-1024 | W3.7a | none |
+| `tests/test-sycl-moe-context-sizing-source.py` | new file | W3.7b creates, W3.6b extends | none |
+| `tests/CMakeLists.txt` | after 4668 | W3.7b | any task registering a pin nearby: append, do not reorder |
+| `tests/test-sycl-auto-ubatch-source.py` | 15-20, 445-489, 524-557, 1795, 2583-2600 | W3.5 | the tuning-cache task edits near 1792 |
+| `tests/test-sycl-moe-control-plan-contract.py` | 151 | W3.6a | none |
+| `docs/backend/sycl-env-vars.md` | 63 (one parenthetical) | W3.5 | any doc task on the same row |
+| `docs/backend/sycl-memory-design.md` | 3421 | W3.5 | none |
+
+`populate_host_zone_sizing` (`unified-cache.cpp:35173-35876`) is one function edited by W3.6a, W3.7a, W3.2 and W3.3. The transaction (`ggml-sycl.cpp:21087-22181`) is one function edited by W3.7b, W3.6b, W3.2 and the phase-4 part. Serialize the tasks within each function; the hunks are apart, so the text merges should be clean.
+
+---
+
+### Part D: Stage 3 part: the micro-batch tuning cache knows the row ceiling its entry was picked under (W3.8)
+
+The automatic micro-batch picker stores its winner in a per-device JSON cache. For a MoE model the stored entry is 512 with the stop reason "MoE GPU routing ceiling", and a hit on that reason skips the picker's ladder for good. These three tasks add the ceiling the picker used to the cache key, so an entry picked under one ceiling is never a hit under another.
+
+Order: W3.8a (the key and its JSON, host test), then W3.8b (the ABI struct and the `_layout2` entry points), then W3.8c (the picker fills the field, docs). W3.8c also waits for W3.5, which owns the `moe_cap` lines it reads.
+
+---
+
+### Task W3.8a: the cache key holds the ceiling
+
+**Track:** D (tuning cache)
+**Depends on:** none
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/tuning-cache-io.hpp` (version comment above `constexpr int CACHE_VERSION = 6;` at line 119; struct `UbatchCacheKey` at 693-745; `ubatch_key_to_json` at 811-829; `ubatch_key_from_json` at 831-847). Find each by its text.
+- Modify: `tests/test-tuning-cache-io.cpp` (new tests after `ubatch_swa_full_json_roundtrip`, which ends near line 719; new `RUN_TEST` lines in `main`, after `RUN_TEST(ubatch_swa_full_json_roundtrip);` at line 1937)
+
+**Description:**
+
+`UbatchCacheKey` says which device set, model, context shape and KV types an entry was picked for. It does not say which routing ceiling the picker applied. For a MoE model the picker caps its ladder at the ceiling (512 today), and an entry that stopped at the ceiling is stored as terminal: a later hit trusts the value and skips the ladder. When stage 4 raises the ceiling, such an entry would pin 512 forever.
+
+This task gives the key a field `moe_row_ceiling`: the ceiling the picker applied, 0 for a model with no experts. It joins `operator==`, so a lookup under one ceiling never matches an entry stored under another. It is written to the JSON as a number.
+
+An entry that has no such field (a file written before this change) is read as `UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED`, the largest 32-bit value. No picker stores that value, so the entry never equals the key a lookup builds. It misses, and the file is still read without error. The next store for that key appends a current entry beside it. The cache keeps the 64 newest entries per device, so the old one ages out.
+
+Nothing sets the field from the picker yet (W3.8c), and the ABI struct does not carry it yet (W3.8b). After this task every lookup still builds a key with ceiling 0, so every entry in an existing file misses once and the ladder runs once per model.
+
+**Design choice:** a new key field, not a `CACHE_VERSION` bump. The version is shared with the kernel tuning winners and the MoE executor's probed rates (`load_cache`, `load_ubatch_cache` and `load_moe_exec_rates` all check it). A bump discards all three kinds, and would do it again each time the ceiling moves. Neither the kernel winners nor the rates depend on the ceiling. The field also makes stage 4 need no bump. Rejected: a bump to 7 (the plan's stage 4 text proposes it), and reading an absent field as 0. The second would make every old entry of a dense model a hit, which is correct, but would also make an old MoE entry spell the same key as a stage 4 lookup that stores 0 for "no ceiling".
+
+**Acceptance Criteria:**
+
+- [ ] `CACHE_VERSION` is still 6 (the existing tests `cache_version_is_6` and `moe_exec_rates_kind_leaves_the_ubatch_file_loadable` assert it and must keep passing unchanged)
+- [ ] `UbatchCacheKey::operator==` compares `moe_row_ceiling`
+- [ ] A key serialised by `ubatch_key_to_json` carries `"moe_row_ceiling":<n>`, and `ubatch_key_from_json` returns the same value
+- [ ] A key whose JSON has no `moe_row_ceiling` reads as `UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED`, and so does a value above 32 bits
+- [ ] A version 6 file written before the field loads without error, and none of its entries equals a key built with ceiling 0, 512 or 1024
+- [ ] `test-tuning-cache-io` fails to compile before the change (RED) and passes after (GREEN)
+- [ ] `clang-format-19 --dry-run -Werror` reports nothing new on the two files (drift you did not write stays)
+
+**Implementation Guide:**
+
+1. **RED.** In `tests/test-tuning-cache-io.cpp`, insert these tests directly before the comment line `// Test: ubatch_entry_to_json / ubatch_entry_from_json round-trip every`:
+
+```cpp
+// The routing ceiling the picker applied is part of the key: an entry picked under one ceiling is no answer under
+// another, and a model with no experts (ceiling 0) is a third value.
+TEST(ubatch_key_moe_row_ceiling_decides_equality) {
+    UbatchCacheKey a;
+    a.device_key      = "Arc_Pro_B70@1.3.12345";
+    a.model_name      = "moe-model";
+    a.model_size      = 4096;
+    a.model_hash      = 17;
+    a.n_ctx           = 4096;
+    a.n_batch         = 2048;
+    a.flash_attn      = true;
+    a.n_seq_max       = 1;
+    a.moe_row_ceiling = 512;
+
+    UbatchCacheKey b = a;
+    ASSERT(a == b);
+    ASSERT(!(a != b));
+    b.moe_row_ceiling = 1024;
+    ASSERT(a != b);
+    b.moe_row_ceiling = 0;
+    ASSERT(a != b);
+
+    // A key nobody filled in holds the no-experts value, so keys built by hand elsewhere in this file keep matching.
+    const UbatchCacheKey fresh;
+    ASSERT(fresh.moe_row_ceiling == 0);
+    return true;
+}
+
+TEST(ubatch_key_moe_row_ceiling_json_roundtrip) {
+    UbatchCacheKey k;
+    k.device_key = "Dev@1.0";
+    k.model_name = "moe-json";
+    k.n_ctx      = 4096;
+    k.n_batch    = 2048;
+
+    const uint32_t ceilings[] = { 0, 512, 4096 };
+    for (size_t i = 0; i < sizeof(ceilings) / sizeof(ceilings[0]); ++i) {
+        k.moe_row_ceiling      = ceilings[i];
+        const std::string json = "{" + ubatch_key_to_json(k) + "}";
+        // The writer must name the field: a writer that dropped it would still round-trip through the default.
+        ASSERT(json.find("\"moe_row_ceiling\":" + std::to_string(ceilings[i])) != std::string::npos);
+        const UbatchCacheKey restored = ubatch_key_from_json(json);
+        ASSERT(restored.moe_row_ceiling == ceilings[i]);
+        ASSERT(restored == k);
+    }
+    return true;
+}
+
+// An entry written before the field existed has no key for it. It must not read as 0, the value a model with no
+// experts stores: it reads as the one value no picker stores.
+TEST(ubatch_key_without_moe_row_ceiling_reads_as_unrecorded) {
+    const std::string before =
+        "{\"device_key\":\"Dev@1.0\",\"model_name\":\"before\",\"model_size\":4096,\"model_hash\":17,"
+        "\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":true,\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,"
+        "\"kv_unified\":false,\"swa_full\":false}";
+    const UbatchCacheKey k = ubatch_key_from_json(before);
+    // Positive control: the other fields were read, so the key below is not just an empty parse.
+    ASSERT(k.model_name == "before" && k.n_ctx == 4096 && k.n_batch == 2048 && k.flash_attn);
+    ASSERT(k.moe_row_ceiling == UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
+
+    const uint32_t ceilings[] = { 0, 512, 1024 };
+    for (size_t i = 0; i < sizeof(ceilings) / sizeof(ceilings[0]); ++i) {
+        UbatchCacheKey lookup = k;
+        lookup.moe_row_ceiling = ceilings[i];
+        ASSERT(k != lookup);
+    }
+
+    // A value past 32 bits is a damaged file. It reads the same way and does not wrap into a real ceiling.
+    const UbatchCacheKey huge = ubatch_key_from_json("{\"model_name\":\"huge\",\"moe_row_ceiling\":4294967808}");
+    ASSERT(huge.model_name == "huge");
+    ASSERT(huge.moe_row_ceiling == UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
+    return true;
+}
+
+// The file-level behaviour the entry points rely on: a version 6 file written before the field loads, none of its
+// entries answers a lookup, and the entry a later store appends answers only a lookup under its own ceiling.
+TEST(ubatch_cache_file_written_before_the_ceiling_loads_and_misses) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_ceiling_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchCeilingDevice_" + std::to_string(getpid());
+
+    create_dir_recursive(cache_dir);
+    const std::string path = get_ubatch_cache_file(cache_dir, device_name);
+    {
+        // What save_ubatch_cache wrote at version 6 before the field existed: one dense model's entry and one MoE
+        // model's terminal entry.
+        std::ofstream f(path);
+        f << "{\n  \"version\": 6,\n  \"device\": \"" << device_name << "\",\n  \"entries\": [\n"
+          << "    {\"device_key\":\"Dev@1.0\",\"model_name\":\"dense\",\"model_size\":4096,\"model_hash\":1,"
+          << "\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":true,\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,"
+          << "\"kv_unified\":false,\"swa_full\":false,\"n_ubatch\":2048,\"reason\":\"ladder exhausted\","
+          << "\"created\":\"2026-11-01T00:00:00Z\"},\n"
+          << "    {\"device_key\":\"Dev@1.0\",\"model_name\":\"moe\",\"model_size\":4096,\"model_hash\":2,"
+          << "\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":true,\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,"
+          << "\"kv_unified\":false,\"swa_full\":false,\"n_ubatch\":512,\"reason\":\"MoE GPU routing ceiling\","
+          << "\"created\":\"2026-11-01T00:00:01Z\"}\n  ]\n}\n";
+    }
+
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));  // read without error
+    ASSERT(loaded.size() == 2);
+    ASSERT(loaded[0].n_ubatch == 2048 && loaded[1].n_ubatch == 512);  // positive control: the contents were read
+
+    // The keys a lookup builds for the same two models: ceiling 0 for the dense one, 512 for the MoE one.
+    UbatchCacheKey dense_key = loaded[0].key;
+    dense_key.moe_row_ceiling = 0;
+    UbatchCacheKey moe_key = loaded[1].key;
+    moe_key.moe_row_ceiling = 512;
+    for (size_t i = 0; i < loaded.size(); ++i) {
+        ASSERT(loaded[i].key != dense_key);
+        ASSERT(loaded[i].key != moe_key);
+    }
+
+    // A store finds no equal key, so it appends. The old entries stay, still unrecorded, and age out by `created`.
+    UbatchCacheEntry current;
+    current.key      = moe_key;
+    current.n_ubatch = 512;
+    current.reason   = "MoE GPU routing ceiling";
+    current.created  = "2026-11-16T00:00:00Z";
+    loaded.push_back(current);
+    ASSERT(save_ubatch_cache(cache_dir, device_name, loaded));
+
+    std::vector<UbatchCacheEntry> reloaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, reloaded));
+    ASSERT(reloaded.size() == 3);
+    ASSERT(reloaded[0].key.moe_row_ceiling == UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
+    ASSERT(reloaded[1].key.moe_row_ceiling == UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
+
+    // The entry picked under 512 answers a lookup under 512 and does not answer one under 1024.
+    UbatchCacheKey wide_key = moe_key;
+    wide_key.moe_row_ceiling = 1024;
+    int hits_512  = 0;
+    int hits_1024 = 0;
+    for (size_t i = 0; i < reloaded.size(); ++i) {
+        if (reloaded[i].key == moe_key) {
+            ++hits_512;
+        }
+        if (reloaded[i].key == wide_key) {
+            ++hits_1024;
+        }
+    }
+    ASSERT(hits_512 == 1);
+    ASSERT(hits_1024 == 0);
+
+    std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+```
+
+   In `main`, after the line `    RUN_TEST(ubatch_swa_full_json_roundtrip);` add:
+
+```cpp
+    RUN_TEST(ubatch_key_moe_row_ceiling_decides_equality);
+    RUN_TEST(ubatch_key_moe_row_ceiling_json_roundtrip);
+    RUN_TEST(ubatch_key_without_moe_row_ceiling_reads_as_unrecorded);
+    RUN_TEST(ubatch_cache_file_written_before_the_ceiling_loads_and_misses);
+```
+
+   Build and run (the lead's GO first; this target is host-only, a pure header and STL test):
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force >/dev/null
+./scripts/sycl-build.sh test-tuning-cache-io
+ctest --test-dir build -R '^test-tuning-cache-io$' --output-on-failure
+```
+
+   Expected (RED): the build fails with `no member named 'moe_row_ceiling' in 'ggml_sycl_tuning::UbatchCacheKey'` and `use of undeclared identifier 'UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED'`.
+
+2. **GREEN, the version note.** In `tuning-cache-io.hpp`, replace
+
+```cpp
+// every v5 file is rejected.
+constexpr int CACHE_VERSION = 6;
+```
+
+   with
+
+```cpp
+// every v5 file is rejected.
+// UbatchCacheKey::moe_row_ceiling joined the key at version 6 without a bump. This version is shared with the kernel
+// winners and the MoE executor's rates, which do not depend on the routing ceiling, and a bump would discard them
+// each time the ceiling moves. An entry written before the field has no such key; it reads as
+// UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED and misses.
+constexpr int CACHE_VERSION = 6;
+```
+
+3. **GREEN, the constant and the field.** Replace
+
+```cpp
+struct UbatchCacheKey {
+    // ubatch_device_set_key() over every participating device, in order:
+```
+
+   with
+
+```cpp
+// The moe_row_ceiling of a key read from an entry that has no such field. No picker stores this value, so such an
+// entry never equals the key a lookup builds: it misses, and the next store for that key appends a current entry.
+constexpr uint32_t UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED = UINT32_MAX;
+
+struct UbatchCacheKey {
+    // ubatch_device_set_key() over every participating device, in order:
+```
+
+   Replace
+
+```cpp
+    bool        swa_full        = false;
+
+    bool operator==(const UbatchCacheKey & other) const {
+        return device_key == other.device_key && model_name == other.model_name && model_size == other.model_size &&
+               model_hash == other.model_hash && n_ctx == other.n_ctx && n_batch == other.n_batch &&
+               flash_attn == other.flash_attn && n_seq_max == other.n_seq_max && type_k == other.type_k &&
+               type_v == other.type_v && kv_unified == other.kv_unified && swa_full == other.swa_full;
+    }
+```
+
+   with
+
+```cpp
+    bool        swa_full        = false;
+    // The routing ceiling the picker applied when it chose the entry's n_ubatch: the most rows a MoE model's
+    // micro-batch could have under it, and 0 for a model with no experts, which the ceiling never touches. The
+    // ceiling bound the choice (the stop reason "MoE GPU routing ceiling" is terminal, so a hit skips the ladder),
+    // which is why an entry picked under one ceiling must not answer a lookup made under another.
+    uint32_t    moe_row_ceiling = 0;
+
+    bool operator==(const UbatchCacheKey & other) const {
+        return device_key == other.device_key && model_name == other.model_name && model_size == other.model_size &&
+               model_hash == other.model_hash && n_ctx == other.n_ctx && n_batch == other.n_batch &&
+               flash_attn == other.flash_attn && n_seq_max == other.n_seq_max && type_k == other.type_k &&
+               type_v == other.type_v && kv_unified == other.kv_unified && swa_full == other.swa_full &&
+               moe_row_ceiling == other.moe_row_ceiling;
+    }
+```
+
+4. **GREEN, the JSON.** In `ubatch_key_to_json` replace
+
+```cpp
+       << "\"swa_full\":" << (k.swa_full ? "true" : "false");
+    return ss.str();
+```
+
+   with
+
+```cpp
+       << "\"swa_full\":" << (k.swa_full ? "true" : "false") << ","
+       << "\"moe_row_ceiling\":" << k.moe_row_ceiling;
+    return ss.str();
+```
+
+   In `ubatch_key_from_json` replace
+
+```cpp
+    k.swa_full        = parse_bool(json, "swa_full");
+    return k;
+```
+
+   with
+
+```cpp
+    k.swa_full        = parse_bool(json, "swa_full");
+
+    // An entry written before the field existed has no key for it. Read it as the value no picker stores, so it
+    // misses instead of passing for a model with no experts. A value past 32 bits is a damaged file, read the same.
+    const bool     has_ceiling = json.find("\"moe_row_ceiling\":") != std::string::npos;
+    const uint64_t ceiling     = parse_u64(json, "moe_row_ceiling");
+    k.moe_row_ceiling          = (has_ceiling && ceiling <= UINT32_MAX) ? static_cast<uint32_t>(ceiling) :
+                                                                          UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED;
+    return k;
+```
+
+   Run the build and ctest from step 1 again. Expected (GREEN): every test passes, including `cache_version_is_6` and the four new ones. The ctest line reads `100% tests passed`.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the ubatch tuning cache key holds the routing ceiling the picker applied" -- \
+    ggml/src/ggml-sycl/tuning-cache-io.hpp tests/test-tuning-cache-io.cpp
+```
+
+**Gotchas:**
+- `test-tuning-cache-io` prints SKIP and exits 77 when `XDG_CACHE_HOME` is unset, and the registration sets it. Run it through ctest as above, not as `./build/bin/test-tuning-cache-io`.
+- `parse_int` stops at `INT_MAX`; the field is read with `parse_u64` so the unrecorded value, 4294967295, round-trips (an old entry that is saved again is written with it).
+- The old entries stay in the file until the 64-entry cap evicts them. That is intended. Do not add code that drops them at load: the lookup's miss is the whole behaviour.
+- `UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED` is a value no picker may store. Stage 4's picker may use any other value, including 0, for "no ceiling".
+- The existing test `ubatch_kv_mode_json_roundtrip` builds key JSON by hand without the field. It still passes: both keys read as unrecorded and differ by `kv_unified`.
+
+---
+
+### Task W3.8b: the backend struct carries the ceiling, as layout 2
+
+**Track:** D (tuning cache)
+**Depends on:** W3.8a
+**File scope:**
+- Modify: `ggml/include/ggml-sycl.h` (comment and struct `ggml_sycl_ubatch_cache_key` at 725-780, the two `_layout1` declarations at 811 and 828)
+- Modify: `ggml/src/ggml-sycl/ubatch-tuning-cache.cpp` (`to_internal_key` at 186-201; the layout comment and asserts at 232-259; the two entry points at 274 and 304)
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp` (the two proc registrations at 128934-128938; find them with `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n 'ubatch_cache_lookup_layout1'`)
+- Modify: `src/llama-context.cpp` (the two proc helpers at 497-508, inside `#if defined(GGML_BACKEND_DL) && !defined(GGML_USE_SYCL)`; the direct-build assignments at 2438-2439)
+- Modify: `src/llama-context.h:568`
+- Modify: `docs/backend/sycl-env-vars.md:64` (the two function names)
+- Modify: `tests/test-sycl-auto-ubatch-source.py` (see the list of tests in step 1)
+
+**Description:**
+
+The key the caller hands to the backend crosses the backend's dlopen boundary as a plain C struct, `ggml_sycl_ubatch_cache_key`. It has no size or version field, so the two entry points that take it carry the layout in their names: `_layout1` today. The header's rule is that a layout change bumps the suffix, so a libllama and a backend built against different layouts fail to resolve the symbol and run the ladder instead of misreading the struct.
+
+This task adds `uint32_t moe_row_ceiling` to the struct, copies it into the internal key, and renames the two entry points to `_layout2`. The new field sits in what was tail padding (offset 68; `swa_full` is at 65), so the struct is still 72 bytes. The size assert alone would not fire, which is why the offset of the new field is pinned too. Renaming is still required: an old libllama would pass a struct whose bytes 66 to 71 are padding of unknown value.
+
+After this task the struct field is zero, because nothing fills it. `prep->cache_key` is declared `ggml_sycl_ubatch_cache_key cache_key{};` in `sycl_auto_ubatch_prep` (`src/llama-context.h`, find it by that text), so the field is 0 and not garbage. W3.8c fills it.
+
+**Design choice:** bump the suffix to `_layout2` and keep no `_layout1` alias, as the header comment says to. Rejected: reusing the padding and keeping the name. It works only while both sides are built from one tree, and the suffix exists for the day they are not.
+
+**Acceptance Criteria:**
+
+- [ ] `ggml_sycl_ubatch_cache_key` declares `uint32_t moe_row_ceiling;` after `swa_full`, `sizeof` is still 72 and the offset of the new field is asserted as 68
+- [ ] The entry points are `ggml_backend_sycl_ubatch_cache_lookup_layout2` and `ggml_backend_sycl_ubatch_cache_store_layout2` everywhere; no `_layout1` remains in code (comments may name it)
+- [ ] `to_internal_key` copies `moe_row_ceiling`
+- [ ] `python3 tests/test-sycl-auto-ubatch-source.py` passes (lead build and run is not needed for the pin)
+- [ ] `./scripts/sycl-build.sh ggml-sycl llama` builds (lead: the `static_assert`s and the direct-build call sites compile only there)
+- [ ] The DL-only proc helpers in `src/llama-context.cpp` are not compiled in a direct SYCL build. The new pin is the only check on them. Say so in the report.
+
+**Implementation Guide:**
+
+1. **RED: the pin first.** Make these edits in `tests/test-sycl-auto-ubatch-source.py`.
+
+   a. After the line `GGML_SYCL_CPP_CODE = strip_comments(GGML_SYCL_CPP)` (near line 97) add:
+
+```python
+LLAMA_CONTEXT_H_CODE = strip_comments((ROOT / "src/llama-context.h").read_text())
+```
+
+   b. Rename every `ubatch_cache_lookup_layout1` and `ubatch_cache_store_layout1` to `_layout2` in this file. They are on the lines of the tests `test_header_declares_the_ubatch_cache_key_and_four_accessors` (about 1751, 1756, 1760, 1764), `test_proc_address_registers_the_four_ubatch_cache_accessors` (1799, 1800) and `test_ubatch_cache_disabled_by_env_var_zero` (1863 to 1869). One command does all of it:
+
+```bash
+sed -i 's/ubatch_cache_\(lookup\|store\)_layout1/ubatch_cache_\1_layout2/g' tests/test-sycl-auto-ubatch-source.py
+```
+
+   c. In `test_header_declares_the_ubatch_cache_key_and_four_accessors`, replace
+
+```python
+                   # llama.cpp-uajm: swa_full, same reason (SWA layers sized as FULL under it).
+                   "bool\\s+swa_full\\s*;"):
+```
+
+   with
+
+```python
+                   # llama.cpp-uajm: swa_full, same reason (SWA layers sized as FULL under it).
+                   "bool\\s+swa_full\\s*;",
+                   # The routing ceiling the picker applied; the entry points are _layout2 because of it.
+                   "uint32_t\\s+moe_row_ceiling\\s*;"):
+```
+
+   d. In `test_ubatch_cache_key_layout_is_pinned_next_to_the_accessors`, replace
+
+```python
+                  "flash_attn", "n_seq_max", "type_k", "type_v", "kv_unified", "swa_full"):
+        assert re.search(rf"UBATCH_CACHE_KEY_FIELD_AT\s*\(\s*{field}\s*,\s*\d+\s*\)\s*;", code), (
+            f"ubatch-tuning-cache.cpp must pin the offset of ggml_sycl_ubatch_cache_key::{field}"
+        )
+```
+
+   with
+
+```python
+                  "flash_attn", "n_seq_max", "type_k", "type_v", "kv_unified", "swa_full", "moe_row_ceiling"):
+        assert re.search(rf"UBATCH_CACHE_KEY_FIELD_AT\s*\(\s*{field}\s*,\s*\d+\s*\)\s*;", code), (
+            f"ubatch-tuning-cache.cpp must pin the offset of ggml_sycl_ubatch_cache_key::{field}"
+        )
+    # The field sits in what was tail padding, so sizeof stays 72 and only its offset says the layout changed.
+    assert re.search(r"UBATCH_CACHE_KEY_FIELD_AT\s*\(\s*moe_row_ceiling\s*,\s*68\s*\)\s*;", code), (
+        "moe_row_ceiling must be pinned at offset 68, right after swa_full at 65 and its padding"
+    )
+```
+
+   e. Add these two tests directly after `test_ubatch_cache_key_layout_is_pinned_next_to_the_accessors` (before `test_proc_address_registers_the_four_ubatch_cache_accessors`):
+
+```python
+def test_ubatch_cache_entry_points_carry_the_current_layout_suffix():
+    """The key struct gained moe_row_ceiling, so the two entry points that take it are _layout2. Nothing may still
+    name _layout1: a libllama and a backend that disagree on the layout must fail to resolve the symbol, which only
+    holds if no caller kept the old name. libllama's proc helpers for the GGML_BACKEND_DL build without SYCL are not
+    compiled in a direct SYCL build, so this text check is the only one that sees them."""
+    for name, code in (
+        ("ggml-sycl.h", GGML_SYCL_H_CODE),
+        ("ggml-sycl.cpp", GGML_SYCL_CPP_CODE),
+        ("ubatch-tuning-cache.cpp", UBATCH_TUNING_CACHE_CPP_CODE),
+        ("llama-context.cpp", LLAMA_CONTEXT_CPP_CODE),
+        ("llama-context.h", LLAMA_CONTEXT_H_CODE),
+    ):
+        for entry in ("lookup", "store"):
+            assert f"ggml_backend_sycl_ubatch_cache_{entry}_layout1" not in code, (
+                f"{name} still names ggml_backend_sycl_ubatch_cache_{entry}_layout1"
+            )
+    for entry in ("lookup", "store"):
+        symbol = f"ggml_backend_sycl_ubatch_cache_{entry}_layout2"
+        assert re.search(rf"decltype\(\s*&{symbol}\s*\)", LLAMA_CONTEXT_CPP_CODE), (
+            f"llama-context.cpp's proc helper must take its type from {symbol}"
+        )
+        assert f'"{symbol}"' in LLAMA_CONTEXT_CPP_CODE, f"llama-context.cpp must look up the proc named {symbol}"
+
+
+def test_the_backend_copies_moe_row_ceiling_into_the_internal_key():
+    """The ceiling the caller passes is part of the entry's key: to_internal_key must copy it, or every entry would be
+    filed and looked up under ceiling 0."""
+    code = _normalize_ws(UBATCH_TUNING_CACHE_CPP_CODE)
+    assert re.search(r"k\.moe_row_ceiling\s*=\s*c_key\.moe_row_ceiling\s*;", code), (
+        "to_internal_key must assign k.moe_row_ceiling = c_key.moe_row_ceiling;"
+    )
+```
+
+   Run: `python3 tests/test-sycl-auto-ubatch-source.py`.
+   Expected (RED): exactly six tests fail, `test_header_declares_the_ubatch_cache_key_and_four_accessors`, `test_ubatch_cache_key_layout_is_pinned_next_to_the_accessors`, `test_proc_address_registers_the_four_ubatch_cache_accessors`, `test_ubatch_cache_disabled_by_env_var_zero`, `test_ubatch_cache_entry_points_carry_the_current_layout_suffix` and `test_the_backend_copies_moe_row_ceiling_into_the_internal_key`.
+
+2. **GREEN, the header.** In `ggml/include/ggml-sycl.h` replace
+
+```cpp
+// have different KV demand. All pointer fields are borrowed: valid
+// only for the duration of the call, never retained.
+```
+
+   with
+
+```cpp
+// have different KV demand. `moe_row_ceiling` is the routing ceiling the
+// picker applied to a model with experts (the most rows a micro-batch could
+// have under it) and 0 for a model with none: an entry that stopped at the
+// ceiling is terminal, so one picked under a ceiling must never answer a
+// lookup made under another. All pointer fields are borrowed: valid
+// only for the duration of the call, never retained.
+```
+
+   Replace
+
+```cpp
+// take it carry its LAYOUT version as a suffix (_layout1; the unsuffixed
+// names took the earlier single-device layout). A libllama and a
+```
+
+   with
+
+```cpp
+// take it carry its LAYOUT version as a suffix (_layout2; _layout1 lacked
+// moe_row_ceiling, and the unsuffixed names took the earlier single-device
+// layout). A libllama and a
+```
+
+   Replace
+
+```cpp
+    bool         kv_unified;
+    bool         swa_full;
+};
+```
+
+   with
+
+```cpp
+    bool         kv_unified;
+    bool         swa_full;
+    uint32_t     moe_row_ceiling;
+};
+```
+
+   In the same file rename the two declarations: `ggml_backend_sycl_ubatch_cache_lookup_layout1(` to `ggml_backend_sycl_ubatch_cache_lookup_layout2(` and `ggml_backend_sycl_ubatch_cache_store_layout1(` to `ggml_backend_sycl_ubatch_cache_store_layout2(`. Their continuation lines are aligned to the opening parenthesis and the name length does not change, so nothing else moves.
+
+3. **GREEN, the backend TU** (`ubatch-tuning-cache.cpp`).
+
+   In `to_internal_key` replace
+
+```cpp
+    k.swa_full        = c_key.swa_full;
+    return k;
+```
+
+   with
+
+```cpp
+    k.swa_full        = c_key.swa_full;
+    k.moe_row_ceiling = c_key.moe_row_ceiling;
+    return k;
+```
+
+   Replace the comment line `// The _layout1 suffix on the two entry points below names this exact layout` with `// The _layout2 suffix on the two entry points below names this exact layout`.
+
+   After `UBATCH_CACHE_KEY_FIELD_AT(swa_full, 65);` add:
+
+```cpp
+UBATCH_CACHE_KEY_FIELD_AT(moe_row_ceiling, 68);
+```
+
+   Leave the `sizeof(ggml_sycl_ubatch_cache_key) == 72` assert as it is: the field fills the padding.
+
+   Rename the two definitions: `bool ggml_backend_sycl_ubatch_cache_lookup_layout1(` and `bool ggml_backend_sycl_ubatch_cache_store_layout1(` become `_layout2`. Their parameter lines are aligned to the opening parenthesis, and the length does not change.
+
+4. **GREEN, the registrations** (`ggml-sycl.cpp`). Replace
+
+```cpp
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_lookup_layout1") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_lookup_layout1;
+    }
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_store_layout1") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_store_layout1;
+    }
+```
+
+   with
+
+```cpp
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_lookup_layout2") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_lookup_layout2;
+    }
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_store_layout2") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_store_layout2;
+    }
+```
+
+5. **GREEN, libllama.** In `src/llama-context.cpp` the helpers at 497-508 become:
+
+```cpp
+static decltype(&ggml_backend_sycl_ubatch_cache_lookup_layout2) llama_context_sycl_ubatch_cache_lookup_proc(
+    ggml_backend_dev_t dev) {
+    return reinterpret_cast<decltype(&ggml_backend_sycl_ubatch_cache_lookup_layout2)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_lookup_layout2"));
+}
+
+static decltype(&ggml_backend_sycl_ubatch_cache_store_layout2) llama_context_sycl_ubatch_cache_store_proc(
+    ggml_backend_dev_t dev) {
+    return reinterpret_cast<decltype(&ggml_backend_sycl_ubatch_cache_store_layout2)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_store_layout2"));
+}
+```
+
+   and the two direct-build assignments (inside `#    ifdef GGML_USE_SYCL`, near line 2438) become:
+
+```cpp
+    auto cache_lookup_fn  = &ggml_backend_sycl_ubatch_cache_lookup_layout2;
+    auto cache_store_fn   = &ggml_backend_sycl_ubatch_cache_store_layout2;
+```
+
+   In `src/llama-context.h:568` the member type becomes `decltype(&ggml_backend_sycl_ubatch_cache_store_layout2)`.
+
+6. **GREEN, the docs.** In `docs/backend/sycl-env-vars.md`, in the `GGML_SYCL_TUNING_CACHE=0` row (line 64) rename `ggml_backend_sycl_ubatch_cache_lookup_layout1()` to `ggml_backend_sycl_ubatch_cache_lookup_layout2()` and `ggml_backend_sycl_ubatch_cache_store_layout1()` to `ggml_backend_sycl_ubatch_cache_store_layout2()`. W3.8c edits the next row.
+
+7. Run `python3 tests/test-sycl-auto-ubatch-source.py`. Expected (GREEN): `234 passed` (232 before, two new). Then the lead builds (the implementer asks for GO):
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force >/dev/null
+./scripts/sycl-build.sh ggml-sycl llama
+```
+
+   Expected: the build finishes with no error. A failed `static_assert` would name `ggml_sycl_ubatch_cache_key layout changed`.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the ubatch cache key struct carries the routing ceiling, entry points are layout 2" -- \
+    ggml/include/ggml-sycl.h ggml/src/ggml-sycl/ubatch-tuning-cache.cpp ggml/src/ggml-sycl/ggml-sycl.cpp \
+    src/llama-context.cpp src/llama-context.h docs/backend/sycl-env-vars.md tests/test-sycl-auto-ubatch-source.py
+```
+
+**Gotchas:**
+- The proc helpers at `src/llama-context.cpp:497-508` compile only when `GGML_BACKEND_DL` is on and `GGML_USE_SYCL` is off. The worktree build has `GGML_BACKEND_DL=OFF`, so a typo there compiles clean. The text pin is the check; read the two helpers once more by eye after the rename.
+- `ggml-sycl.cpp` is about 129k lines and the codescout index is blind there. Use `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n 'ubatch_cache_'` to find the registrations, and check the grep shows only `_layout2` afterwards.
+- This task edits `src/llama-context.cpp` in two small hunks. W3.5 edits the `moe_cap` lines about 40 lines above the second one. The hunks do not overlap, but merge with `git merge-tree` before the lead merges.
+- The registered pin is `test-sycl-auto-ubatch-source`. The sed command in step 1b also touches the test's own failure messages, which is intended.
+- Do not add a `_layout1` alias "for compatibility". The refusal to resolve is the compatibility.
+
+---
+
+### Task W3.8c: the picker files its entry under the ceiling it used
+
+**Track:** D (tuning cache)
+**Depends on:** W3.8b, W3.5 (W3.5 owns the `moe_cap` lines that this task reads; if it renamed the variable, read the value the picker passes to `llama_auto_ubatch_cap` as its `moe_cap` argument)
+**File scope:**
+- Modify: `src/llama-context.cpp` (one new statement in `llama_context::sycl_auto_ubatch_prepare`, after `cache_key.type_v = static_cast<int32_t>(type_v);`, near line 2478)
+- Modify: `docs/backend/sycl-env-vars.md:65` (the key description of the `GGML_SYCL_TUNING_CACHE_DIR` row)
+- Modify: `tests/test-sycl-auto-ubatch-source.py` (a new test and its mutation witness, after `test_cache_key_populates_swa_full`, near line 2064)
+
+**Description:**
+
+`sycl_auto_ubatch_prepare` computes `moe_cap` (0 for a dense model; for a MoE model the backend's routing ceiling, 512 in stage 3), passes it to `llama_auto_ubatch_cap`, and later builds the cache key. This task copies the same `moe_cap` into the key, so the entry is filed under the ceiling that bound the ladder. A lookup in the same context uses the same key, so a hit needs the same ceiling.
+
+In stage 3 the value is 512 for every MoE model and 0 for every dense one, so a MoE entry stored by this build is found again by this build. When stage 4 changes the ceiling the picker applies, the key changes with it, and the stage 3 entries miss without any version bump.
+
+The DL-without-SYCL branch reports `moe_cap` as 0 when the backend lacks the accessor, and `moe_cap_available` false. The key then holds 0 for a MoE model too. That is honest: no ceiling was consulted, and a backend without the accessor also lacks the `_layout2` cache entry points, so the cache is not used there at all.
+
+**Acceptance Criteria:**
+
+- [ ] `cache_key.moe_row_ceiling` is assigned from `moe_cap`, after `moe_cap` is defined and before the key is used
+- [ ] The new pin fails before the edit and passes after, and its mutation witness (assigning a literal 512 instead) is rejected by the same check
+- [ ] The `GGML_SYCL_TUNING_CACHE_DIR` row lists `moe_row_ceiling` in the key and says what an old file does
+- [ ] `python3 tests/test-sycl-auto-ubatch-source.py` passes
+- [ ] (lead) the three-step device check in "Lead gates" shows: miss on a file written before the change, miss then a stored `"moe_row_ceiling":512` entry, then a terminal hit
+
+**Implementation Guide:**
+
+1. **RED.** In `tests/test-sycl-auto-ubatch-source.py`, add after `test_cache_key_populates_swa_full` (it ends just before `test_cache_devices_list_every_sycl_backend_in_order`):
+
+```python
+_CACHE_KEY_CEILING_RE = r"cache_key\.moe_row_ceiling\s*=\s*moe_cap\s*;"
+
+
+def test_cache_key_populates_moe_row_ceiling_from_the_pickers_ceiling():
+    """cache_key.moe_row_ceiling must be the very value the cap helper was given as the MoE ceiling. A "MoE GPU
+    routing ceiling" entry is terminal, so an entry filed under a ceiling other than the one that bound the ladder
+    would pin a stale value once the ceiling moves. Declaring the field (checked elsewhere) is not enough if nothing
+    fills it: it would stay 0 and every MoE model would file under the no-experts value."""
+    body_norm = _normalize_ws(_trial_body())
+    fill = re.search(_CACHE_KEY_CEILING_RE, body_norm)
+    assert fill, "missing cache_key.moe_row_ceiling = moe_cap; assignment"
+    # The value is the one the cap helper takes: the helper's call names moe_cap, and moe_cap is defined before
+    # the key is built.
+    assert re.search(r"llama_auto_ubatch_cap\s*\([^;]*\bmoe_cap\b", body_norm), (
+        "the cap helper must be given moe_cap, the value the key records"
+    )
+    assert body_norm.find("moe_cap") < fill.start(), "moe_cap must be defined before the key records it"
+
+
+def test_cache_key_moe_row_ceiling_has_a_mutation_witness():
+    """Mutation witness: filing the entry under a literal instead of the picker's own ceiling must be rejected."""
+    raw = LLAMA_CONTEXT_CPP
+    line = "    cache_key.moe_row_ceiling = moe_cap;\n"
+    assert raw.count(line) == 1, f"mutation target not unique -- found {raw.count(line)}"
+    mutated_raw = raw.replace(line, "    cache_key.moe_row_ceiling = 512;\n", 1)
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert not re.search(_CACHE_KEY_CEILING_RE, mutated_body_norm), (
+        "mutation witness is broken: a literal ceiling should make the key check fail"
+    )
+```
+
+   Run: `python3 tests/test-sycl-auto-ubatch-source.py`.
+   Expected (RED): `test_cache_key_populates_moe_row_ceiling_from_the_pickers_ceiling` fails with `missing cache_key.moe_row_ceiling = moe_cap; assignment`, and `test_cache_key_moe_row_ceiling_has_a_mutation_witness` fails with `mutation target not unique -- found 0`.
+
+2. **GREEN, the fill.** In `src/llama-context.cpp`, in `llama_context::sycl_auto_ubatch_prepare`, replace
+
+```cpp
+    cache_key.type_k     = static_cast<int32_t>(type_k);
+    cache_key.type_v     = static_cast<int32_t>(type_v);
+```
+
+   with
+
+```cpp
+    cache_key.type_k     = static_cast<int32_t>(type_k);
+    cache_key.type_v     = static_cast<int32_t>(type_v);
+
+    // The routing ceiling the cap above was bounded by: 0 for a model with no experts and for a backend that reports
+    // none. An entry that stopped at the ceiling is terminal, so it must answer only a context picked under the same
+    // ceiling.
+    cache_key.moe_row_ceiling = moe_cap;
+```
+
+   The blank line keeps clang-format from realigning the assignments above it (the `.clang-format` aligns consecutive assignments across comments, not across empty lines).
+
+3. **GREEN, the docs.** In `docs/backend/sycl-env-vars.md`, in the row that starts `| \`GGML_SYCL_TUNING_CACHE_DIR=<path>\``:
+
+   Replace `type_k, type_v, kv_unified, swa_full), filed under the context's first SYCL device` with `type_k, type_v, kv_unified, swa_full, moe_row_ceiling), filed under the context's first SYCL device`.
+
+   Replace `misses cleanly rather than applying a stale value. The file keeps at most the 64 newest entries per device (by \`created\`); older ones are evicted on the next store.` with
+
+   `misses cleanly rather than applying a stale value. \`moe_row_ceiling\` is the routing ceiling the picker applied to a model with experts (512 while the picker keeps that ceiling) and 0 for a model with none. An entry that stopped at the ceiling is terminal, so one picked under one ceiling is never a hit under another, and moving the ceiling needs no \`CACHE_VERSION\` bump (a bump would also discard the kernel winners and the MoE rates, which do not depend on it). A file written before the field existed is read without error: its entries read as a value no picker stores and miss, the next store appends a current entry beside them, and the 64-entry cap evicts them. The file keeps at most the 64 newest entries per device (by \`created\`); older ones are evicted on the next store.`
+
+   Check the row still renders as one table line (no newline inside).
+
+4. Run `python3 tests/test-sycl-auto-ubatch-source.py`. Expected (GREEN): `236 passed`. Then, with the lead's GO, `./scripts/sycl-build.sh llama` to compile `llama-context.cpp`; it ends with no error.
+
+**Commit:**
+
+```bash
+git commit -m "sycl: the auto ubatch picker files its cache entry under the routing ceiling it applied" -- \
+    src/llama-context.cpp docs/backend/sycl-env-vars.md tests/test-sycl-auto-ubatch-source.py
+```
+
+**Gotchas:**
+- W3.5 changes how `moe_cap` is computed (stage 3 keeps a ceiling of 512 through a shim). Do not change those lines here. If the variable was renamed or removed, stop and ask the lead: the key must record the number the cap helper was given, and a second, separately computed 512 would be two sources for one fact.
+- The pin's order check uses the first occurrence of the text `moe_cap` in the body, which is its definition (both build branches define it before the key is built).
+- The value is 0 for a MoE model when the DL backend lacks the accessor. Do not turn that into a special case.
+- Stage 4's picker, when it drops the ceiling from `llama_auto_ubatch_cap`, must still pass its own value here. It may use any value except `UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED` (4294967295). Its entries then differ from every stage 3 entry (512) without a version bump.
+- The terminal-reason test in `sycl_select_auto_ubatch` (`std::strcmp(cached_reason_buf, "MoE GPU routing ceiling") == 0`, near line 3014) is unchanged. It is now correct because a terminal entry is only reachable under its own ceiling.
+
+---
+
+### Open questions (part D)
+
+None that block these tasks. Two notes for the lead:
+
+1. The plan's stage 4 section says "the tuning cache's version rises from 6 (`tuning-cache-io.hpp:119`)". With this part merged that sentence is wrong: stage 4 changes the value it passes as `moe_row_ceiling` and needs no bump. Amend the stage 4 text when the stage 3 amendment is written. The one rule for stage 4 is that it must not store 4294967295.
+2. The first start after this change misses once per model and device, whatever the model, because every old entry reads as unrecorded. The cost is one run of the ladder (one to four reserves) and a rewritten file. Dense models pay it too. This was chosen over reading an old entry as ceiling 0 (see the design choice in W3.8a).
+
+### Lead gates (part D)
+
+**G3.8: the cache behaves across the change (lead; GPT-OSS 20B on the B50; one model load at a time, never overlapped).** It needs two builds: any build of `integ/th32` at `d0118bb6c` or earlier (call it `build-old`) and the build with W3.8a to W3.8c merged (`build`). Pin the selector, and sample `Shmem` before each run and about 5 seconds after.
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force >/dev/null
+D=$(mktemp -d)
+run() { # $1 = build dir
+  ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_TUNING_CACHE_DIR=$D timeout 900 \
+    $1/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf -p 512 -n 4 -r 1 -v 2>&1 \
+    | grep -E 'SYCL-PLAN\] (tuning cache|auto n_ubatch=)'
+}
+# step 1: an entry as the old build writes it
+run build-old;  grep -c moe_row_ceiling $D/*-ubatch.json
+# step 2: the new build, same shape
+run build;      grep -o '"moe_row_ceiling":[0-9]*' $D/*-ubatch.json
+# step 3: the new build again
+run build
+```
+
+If `auto n_ubatch=` does not appear because the context is below 512 rows, use `-p 512 -n 128` in all three steps.
+
+Expected lines:
+- Step 1: `tuning cache miss: n_ubatch=0`, then `auto n_ubatch=512 ... MoE GPU routing ceiling`. The `grep -c` prints `0`: the old file has no field.
+- Step 2: `tuning cache miss: n_ubatch=0` (not `hit`: the old entry did not answer), then the same outcome line. The `grep -o` prints `"moe_row_ceiling":4294967295` for the old entry and `"moe_row_ceiling":512` for the new one.
+- Step 3: `tuning cache hit: n_ubatch=512 (cached, terminal)`.
+
+A `hit` in step 2 is a failure. Remove `$D` afterwards.
+
+**G3.8b: the backend compiles with the new layout (lead).** `./scripts/sycl-build.sh ggml-sycl llama test-tuning-cache-io`, then `ctest --test-dir build -R '^test-tuning-cache-io$' --output-on-failure` (expect `100% tests passed`) and `python3 tests/test-sycl-auto-ubatch-source.py` (expect `236 passed`). The DL-without-SYCL build path (`src/llama-context.cpp:497-508`) is not built by any of these; only the pin reads it.
+
+### File ownership (part D)
+
+| File | Region (find by text) | Task |
+|------|------------------------|------|
+| `ggml/src/ggml-sycl/tuning-cache-io.hpp` | version comment above `constexpr int CACHE_VERSION = 6;` (about 118-119); `struct UbatchCacheKey` and `operator==` (about 693-745); `ubatch_key_to_json` and `ubatch_key_from_json` (about 811-847) | W3.8a |
+| `tests/test-tuning-cache-io.cpp` | new tests after `ubatch_swa_full_json_roundtrip` (about line 719); four `RUN_TEST` lines after line 1937 | W3.8a |
+| `ggml/include/ggml-sycl.h` | the comment and `struct ggml_sycl_ubatch_cache_key` (about 725-780); the two `_layout1` declarations (about 811, 828) | W3.8b |
+| `ggml/src/ggml-sycl/ubatch-tuning-cache.cpp` | `to_internal_key` (about 186-201); layout comment and `UBATCH_CACHE_KEY_FIELD_AT` list (about 232-259); the two entry points (about 274, 304) | W3.8b |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | the two proc registrations (about 128934-128938) | W3.8b |
+| `src/llama-context.cpp` | the two DL proc helpers (about 497-508); the direct-build assignments `cache_lookup_fn`, `cache_store_fn` (about 2438-2439) | W3.8b |
+| `src/llama-context.cpp` | one statement after `cache_key.type_v = static_cast<int32_t>(type_v);` (about 2478), in `sycl_auto_ubatch_prepare` | W3.8c (reads `moe_cap`, defined by W3.5 at about 2391-2395; order W3.5 first) |
+| `src/llama-context.h` | `cache_store_fn` member type (line 568) | W3.8b |
+| `docs/backend/sycl-env-vars.md` | row 64, the two function names | W3.8b |
+| `docs/backend/sycl-env-vars.md` | row 65, the key description and the old-file sentence | W3.8c |
+| `tests/test-sycl-auto-ubatch-source.py` | `LLAMA_CONTEXT_H_CODE` constant (about line 97); header-member and layout-pin tests (about 1733-1780); two new tests after `test_ubatch_cache_key_layout_is_pinned_next_to_the_accessors`; registration test and env-var test (about 1795-1869) | W3.8b |
+| `tests/test-sycl-auto-ubatch-source.py` | two new tests after `test_cache_key_populates_swa_full` (about 2064) | W3.8c |
+
+Other stage 3 tasks that touch the same files, from the re-check: W3.5 and the accessor-shim task edit `src/llama-context.cpp` at 428, 473-477, 2372-2406 and 2588 (no overlap with the regions above), and the shim task edits `tests/test-sycl-auto-ubatch-source.py` at 445-557 (no overlap) and `docs/backend/sycl-env-vars.md:63` (a different row). Nothing else in stage 3 touches the tuning cache files. Merge order for the shared files: W3.5, then W3.8c; W3.8a and W3.8b are independent of every other stage 3 task.
