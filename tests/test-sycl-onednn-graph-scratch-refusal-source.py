@@ -13,7 +13,10 @@ The arithmetic is host-tested (test-zone-sizing, Case 24h). This file pins the w
 - the check runs in probe mode too (the micro-batch ladder must see the verdict a real context gets);
 - the refusal names the largest -ub the same fit accepts;
 - the fit is handed the context's shape in the floor function's order (n_ubatch before n_ctx) and the same cap, so
-  the two cannot judge different shapes.
+  the two cannot judge different shapes;
+- the Graph room is the ONEDNN zone's capacity less the pair bound over that same capacity, from one capacity read
+  in the room accessor, and the check reads no capacity of its own;
+- the check admits when the room accessor fails (no cache or no active arena: no zone was planned to judge against).
 Each claim has a mutant that fails its own check and no other; the order claim has one for each half (the call
 moved above the non-FA check, and moved past the first guarded state).
 
@@ -26,6 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 GGML_SYCL_CPP = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
+UNIFIED_CACHE_CPP = (ROOT / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
 
 # One left-to-right alternation, so a `/*` inside a `//` comment's prose cannot open a block comment.
 _LEXEME_RE = re.compile(
@@ -52,6 +56,7 @@ def normalize(src: str) -> str:
 
 
 SYCL_NORM = normalize(GGML_SYCL_CPP)
+CACHE_NORM = normalize(UNIFIED_CACHE_CPP)
 
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
 CHECK_NAME = "ggml_sycl_check_onednn_graph_scratch"
@@ -68,6 +73,11 @@ REFUSAL_TEXT = "runtime context update rejected: the oneDNN Graph attention scra
 LARGEST_ASSIGN = "const uint32_t largest = ggml_sycl::zone_onednn_graph_fit_largest_ub("
 ADVICE_ARG = "ggml_sycl_hold_fit_advice(largest).c_str()"
 DEMAND_ASSIGN = "const size_t demand = ggml_sycl::zone_onednn_graph_scratch_floor_bytes("
+ROOM_SIG = "bool unified_cache_get_onednn_graph_room(int device_id, size_t * room) {"
+ROOM_READ = "const size_t capacity = cache->zone_capacity(vram_zone_id::ONEDNN);"
+ROOM_BOUND = "const size_t bound = onednn_pp_pair_bound_for(device_id, capacity);"
+ROOM_STORE = "*room = capacity > bound ? capacity - bound : 0;"
+ROOM_CALL = "if (!ggml_sycl::unified_cache_get_onednn_graph_room(device, &graph_room)) { return true; }"
 
 
 def _body(src: str, sig: str) -> tuple:
@@ -187,7 +197,24 @@ def _fit_takes_the_floor_shape_order(src: str) -> bool:
     return len(fit) >= 6 and len(floor) == 6 and fit[:6] == floor and fit[3:5] == ["n_ubatch", "n_ctx"]
 
 
-def _checks(src: str) -> dict:
+def _room_is_capacity_less_the_bound(src: str, cache: str) -> bool:
+    """The accessor reads the capacity once and subtracts the bound over that capacity; the check reads none."""
+    if cache.count(ROOM_SIG) != 1:
+        return False
+    room = _body_text(cache, ROOM_SIG)
+    check = _body_text(src, CHECK_SIG)
+    read, bound, store = room.find(ROOM_READ), room.find(ROOM_BOUND), room.find(ROOM_STORE)
+    return (room.count("zone_capacity(") == 1 and 0 <= read < bound < store and "zone_capacity(" not in check
+            and "unified_cache_get_onednn_pp_pair_bound(" not in check)
+
+
+def _admits_without_a_room(src: str) -> bool:
+    """The check takes its room from the accessor, once, and returns true (admits) when the accessor fails."""
+    check = _body_text(src, CHECK_SIG)
+    return check.count(ROOM_CALL) == 1 and check.count("unified_cache_get_onednn_graph_room(") == 1
+
+
+def _checks(src: str, cache: str = CACHE_NORM) -> dict:
     return {
         "order": _called_in_order(src),
         "probe": _runs_in_probe_mode(src),
@@ -195,6 +222,8 @@ def _checks(src: str) -> dict:
         "allocator_off": _returns_early_when_allocator_off(src),
         "names_ub": _refusal_names_the_largest_ub(src),
         "arg_order": _fit_takes_the_floor_shape_order(src),
+        "room": _room_is_capacity_less_the_bound(src, cache),
+        "admit_without_room": _admits_without_a_room(src),
     }
 
 
@@ -223,6 +252,20 @@ def test_the_refusal_names_the_largest_ub_that_fits():
     )
 
 
+def test_the_room_is_the_capacity_less_the_bound_from_one_capacity_read():
+    assert _room_is_capacity_less_the_bound(SYCL_NORM, CACHE_NORM), (
+        "unified_cache_get_onednn_graph_room() must read the ONEDNN capacity once and return it less the pair bound "
+        f"over that capacity, and {CHECK_NAME}() must read no capacity or bound of its own"
+    )
+
+
+def test_the_check_admits_when_the_room_accessor_fails():
+    assert _admits_without_a_room(SYCL_NORM), (
+        f"{CHECK_NAME}() must take its room from unified_cache_get_onednn_graph_room() once and return true when it "
+        "fails"
+    )
+
+
 def test_the_fit_is_handed_the_shape_in_the_floor_functions_order():
     assert _fit_takes_the_floor_shape_order(SYCL_NORM), (
         "zone_onednn_graph_fit_largest_ub() must take the floor call's shape and cap arguments in the floor's order "
@@ -237,8 +280,8 @@ def _mutate_in(src: str, sig: str, old: str, new: str) -> str:
     return src[:start] + body.replace(old, new, 1) + src[end:]
 
 
-def _assert_only(mutant: str, failing: str, why: str) -> None:
-    results = _checks(mutant)
+def _assert_only(mutant: str, failing: str, why: str, cache: str = CACHE_NORM) -> None:
+    results = _checks(mutant, cache)
     expected = {name: name != failing for name in results}
     assert results == expected, f"mutation witness for {failing!r} ({why}) is broken: {results}"
 
@@ -280,6 +323,19 @@ def test_every_check_has_a_mutation_witness_that_fails_only_it():
     _assert_only(_mutate_in(src, CHECK_SIG, "plan.planner_n_swa, n_ubatch, n_ctx, cap, graph_room",
                             "plan.planner_n_swa, n_ctx, n_ubatch, cap, graph_room"), "arg_order",
                  "the fit handed n_ctx and n_ubatch swapped")
+
+    _assert_only(src, "room", "the room is the whole capacity",
+                 cache=_mutate_in(CACHE_NORM, ROOM_SIG, ROOM_STORE, "*room = capacity;"))
+    _assert_only(src, "room", "the bound taken over a second capacity read",
+                 cache=_mutate_in(CACHE_NORM, ROOM_SIG, ROOM_BOUND,
+                                  "const size_t bound = onednn_pp_pair_bound_for(device_id, "
+                                  "cache->zone_capacity(vram_zone_id::ONEDNN));"))
+    _assert_only(_mutate_in(src, CHECK_SIG, ROOM_CALL,
+                            f"{ROOM_CALL} const size_t zone = cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN);"
+                            " graph_room = zone > graph_room ? graph_room : zone;"),
+                 "room", "the check reads a capacity of its own")
+    _assert_only(_mutate_in(src, CHECK_SIG, ROOM_CALL, ROOM_CALL.replace("return true;", "return false;")),
+                 "admit_without_room", "the check refuses when the accessor fails")
 
 
 if __name__ == "__main__":
