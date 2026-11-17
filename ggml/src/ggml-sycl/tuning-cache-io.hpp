@@ -116,6 +116,10 @@ inline long sycl_tuning_getpid() {
 // a v5 "B70,B50" entry written under the multi-device plan reads as a v6 key
 // for the single-device plan over the same two scheduler-visible cards -- so
 // every v5 file is rejected.
+// UbatchCacheKey::moe_row_ceiling joined the key at version 6 without a bump. This version is shared with the kernel
+// winners and the MoE executor's rates, which do not depend on the routing ceiling, and a bump would discard them
+// each time the ceiling moves. An entry written before the field has no such key; it reads as
+// UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED and misses.
 constexpr int CACHE_VERSION = 6;
 
 // =============================================================================
@@ -690,6 +694,10 @@ inline std::string ubatch_device_set_key(const UbatchDeviceTopology &           
     return key;
 }
 
+// The moe_row_ceiling of a key read from an entry that has no such field. No picker stores this value, so such an
+// entry never equals the key a lookup builds: it misses, and the next store for that key appends a current entry.
+constexpr uint32_t UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED = UINT32_MAX;
+
 struct UbatchCacheKey {
     // ubatch_device_set_key() over every participating device, in order:
     // each one's sanitized name, driver version, budget percentage and
@@ -733,12 +741,18 @@ struct UbatchCacheKey {
     // must not share one cache entry (CACHE_VERSION bumped to 4 above so a
     // v3 entry, which has no opinion on this field, cannot silently match).
     bool        swa_full        = false;
+    // The routing ceiling the picker applied when it chose the entry's n_ubatch: the most rows a MoE model's
+    // micro-batch could have under it, and 0 for a model with no experts, which the ceiling never touches. The
+    // ceiling bound the choice (the stop reason "MoE GPU routing ceiling" is terminal, so a hit skips the ladder),
+    // which is why an entry picked under one ceiling must not answer a lookup made under another.
+    uint32_t    moe_row_ceiling = 0;
 
     bool operator==(const UbatchCacheKey & other) const {
         return device_key == other.device_key && model_name == other.model_name && model_size == other.model_size &&
                model_hash == other.model_hash && n_ctx == other.n_ctx && n_batch == other.n_batch &&
                flash_attn == other.flash_attn && n_seq_max == other.n_seq_max && type_k == other.type_k &&
-               type_v == other.type_v && kv_unified == other.kv_unified && swa_full == other.swa_full;
+               type_v == other.type_v && kv_unified == other.kv_unified && swa_full == other.swa_full &&
+               moe_row_ceiling == other.moe_row_ceiling;
     }
 
     bool operator!=(const UbatchCacheKey & other) const { return !(*this == other); }
@@ -824,7 +838,8 @@ inline std::string ubatch_key_to_json(const UbatchCacheKey & k) {
        << "\"type_k\":" << k.type_k << ","
        << "\"type_v\":" << k.type_v << ","
        << "\"kv_unified\":" << (k.kv_unified ? "true" : "false") << ","
-       << "\"swa_full\":" << (k.swa_full ? "true" : "false");
+       << "\"swa_full\":" << (k.swa_full ? "true" : "false") << ","
+       << "\"moe_row_ceiling\":" << k.moe_row_ceiling;
     return ss.str();
 }
 
@@ -842,6 +857,13 @@ inline UbatchCacheKey ubatch_key_from_json(const std::string & json) {
     k.type_v          = static_cast<int32_t>(parse_int(json, "type_v"));
     k.kv_unified      = parse_bool(json, "kv_unified");
     k.swa_full        = parse_bool(json, "swa_full");
+
+    // An entry written before the field existed has no key for it. Read it as the value no picker stores, so it
+    // misses instead of passing for a model with no experts. A value past 32 bits is a damaged file, read the same.
+    const bool     has_ceiling = json.find("\"moe_row_ceiling\":") != std::string::npos;
+    const uint64_t ceiling     = parse_u64(json, "moe_row_ceiling");
+    k.moe_row_ceiling =
+        (has_ceiling && ceiling <= UINT32_MAX) ? static_cast<uint32_t>(ceiling) : UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED;
     return k;
 }
 
