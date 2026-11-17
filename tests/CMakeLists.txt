@@ -4652,6 +4652,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for who holds a VRAM arena that a second load cannot rebuild: every chunk lease a mem_handle takes is
+# counted by the site that took it (one relaxed add each way, no lock) and released against the same site; the rebuild
+# refusal prints those counts and lists the live allocations of every zone with live bytes; a cache scratch buffer
+# blocks the rebuild only when the arena owns its pointer. Host-only, reads the sources as text; test-zone-sizing
+# Case 36 checks the rebuild decision. Same registration shape as test-sycl-raw-gate-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-arena-rebuild-holders-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-arena-rebuild-holders-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Jinja fallback for a model whose chat template the built-in matcher does not know (Gemma 4 failed after the load with
 # "try using --jinja"): upstream turns the jinja engine off for llama-completion and llama-mtmd-cli.
 # test-chat-need-jinja checks common_chat_templates_need_jinja() itself. It loads no model, so it keeps the default

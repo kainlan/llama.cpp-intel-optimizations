@@ -2403,6 +2403,51 @@ int main() {
               "an unknown device total gated a request");
     }
 
+    // ---- Case 36: the arena is rebuilt only when nothing points into it ------------------------------------------
+    // A rebuild destroys the arena and reserves it again, so every byte in it moves. A zone byte still allocated, a lease
+    // on one of its chunks, or a cache scratch buffer whose pointer lies inside it each refuse the rebuild. A scratch
+    // buffer allocated outside the arena keeps its own memory through a rebuild, so it must not refuse one: a gate that
+    // read any non-null scratch pointer refused rebuilds the arena could take.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_arena_holders;
+        using ggml_sycl::zone_arena_rebuild_allowed;
+
+        // the second load of one process: 269.7 MB live in the zones, 49 chunk leases, the PP MoE ring's three slots
+        // and the oneDNN pair inside the arena, the reorder temp outside it
+        zone_arena_holders second_load;
+        second_load.live_zone_bytes  = static_cast<size_t>(269.7 * MiB);
+        second_load.chunk_leases     = 49;
+        second_load.scratch_in_arena = 5;
+        second_load.scratch_outside  = 1;
+        CHECK(!zone_arena_rebuild_allowed(second_load), "the second load's holders allowed a rebuild");
+
+        // each holder refuses on its own, down to one byte or one lease
+        zone_arena_holders leases_only;
+        leases_only.chunk_leases = 49;
+        CHECK(!zone_arena_rebuild_allowed(leases_only), "49 chunk leases alone allowed a rebuild");
+        leases_only.chunk_leases = 1;
+        CHECK(!zone_arena_rebuild_allowed(leases_only), "one chunk lease allowed a rebuild");
+        zone_arena_holders bytes_only;
+        bytes_only.live_zone_bytes = 1;
+        CHECK(!zone_arena_rebuild_allowed(bytes_only), "one live zone byte allowed a rebuild");
+        zone_arena_holders inside_only;
+        inside_only.scratch_in_arena = 1;
+        CHECK(!zone_arena_rebuild_allowed(inside_only), "a scratch buffer inside the arena allowed a rebuild");
+
+        // nothing points into the arena: the rebuild goes ahead, whatever is allocated outside it
+        zone_arena_holders nothing;
+        CHECK(zone_arena_rebuild_allowed(nothing), "an arena nothing points into was refused");
+        zone_arena_holders outside_only;
+        outside_only.scratch_outside = 7;
+        CHECK(zone_arena_rebuild_allowed(outside_only), "scratch allocated outside the arena refused a rebuild");
+
+        // scratch outside the arena does not hide a holder inside it
+        zone_arena_holders outside_and_lease = outside_only;
+        outside_and_lease.chunk_leases       = 1;
+        CHECK(!zone_arena_rebuild_allowed(outside_and_lease), "a lease beside outside scratch allowed a rebuild");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
