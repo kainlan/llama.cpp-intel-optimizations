@@ -36,6 +36,7 @@
 #include "vram-headroom.hpp"
 #include "weight-row-padding.hpp"
 #include "zone-sizing.hpp"
+#include "zone-used-count.hpp"
 
 #include <dlfcn.h>
 #include <level_zero/ze_api.h>
@@ -29978,14 +29979,21 @@ bool unified_cache::arena_record_allocation_locked(vram_zone_id zone, void * ptr
     return true;
 }
 
-bool unified_cache::arena_unregister_exact_if_unleased_locked(vram_zone_id zone, void * ptr) noexcept {
+bool unified_cache::arena_unregister_exact_if_unleased_locked(vram_zone_id zone, void * ptr,
+                                                              vram_zone_id & record_zone) noexcept {
     allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
     const auto found = group.allocations.find(ptr);
     if (found == group.allocations.end() || found->second.allocation_id == 0) return false;
     const allocator_group_record & exact = found->second;
     const auto authority = arena_authority_snapshot(exact.zone);
-    return authority && authority->unregister_allocation_if_unleased(
-                            static_cast<int>(exact.zone), exact.allocation_id, exact.offset);
+    if (!authority || !authority->unregister_allocation_if_unleased(static_cast<int>(exact.zone),
+                                                                     exact.allocation_id, exact.offset)) {
+        return false;
+    }
+    // The zone whose counter the block was charged to. The caller may name the other zone of an allocator KV and
+    // WEIGHT share, so only the record says which counter the free must lower.
+    record_zone = exact.zone;
+    return true;
 }
 
 void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id) noexcept {
@@ -30051,12 +30059,9 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
         allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
         if (group.state != allocator_group_state::OPEN || !arena_zone_open(zone)) return nullptr;
         if (zone == vram_zone_id::KV && z.allocator) {
-            const size_t before = z.allocator->used();
-            const size_t offset = z.allocator->allocate(size, align);
+            size_t       total_used = 0;
+            const size_t offset     = zone_used_allocate(*z.allocator, z.used, size, align, &total_used);
             if (offset != SIZE_MAX) {
-                const size_t after      = z.allocator->used();
-                const size_t delta      = after - before;
-                const size_t total_used = z.used.fetch_add(delta, std::memory_order_relaxed) + delta;
                 if (profile_active) {
                     const size_t idx = static_cast<size_t>(zone);
                     t_arena_pp_profile.zone_alloc_calls[idx]++;
@@ -30069,8 +30074,7 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
                 }
                 const size_t logical_offset = z.start + offset;
                 if (!arena_register_exact(zone, allocation_id, logical_offset, size)) {
-                    z.allocator->free(offset);
-                    z.used.fetch_sub(delta, std::memory_order_relaxed);
+                    zone_used_free(*z.allocator, offset, z.used);
                     return nullptr;
                 }
                 const arena_authority::allocation_record committed{ allocation_id, static_cast<int>(zone),
@@ -30079,8 +30083,7 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
                 if (!arena_record_allocation_locked(zone, ptr, allocation_id, logical_offset, size,
                                                     registry_commit, registry_context)) {
                     arena_unregister_exact(zone, logical_offset);
-                    z.allocator->free(offset);
-                    z.used.fetch_sub(delta, std::memory_order_relaxed);
+                    zone_used_free(*z.allocator, offset, z.used);
                     return nullptr;
                 }
                 if (exact) *exact = committed;
@@ -30088,19 +30091,13 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
             }
         }
         for (auto & wca : weight_chunk_allocators_) {
-            const size_t before = wca.allocator->used();
-            const size_t offset = wca.allocator->allocate(size, align);
+            // KV and WEIGHT both draw on these chunks, so the zone's counter takes this chunk allocator's delta
+            // (block rounding included), never its total; the group lock held above makes that delta this call's alone.
+            size_t       total_used = 0;
+            const size_t offset     = zone_used_allocate(*wca.allocator, z.used, size, align, &total_used);
             if (offset == SIZE_MAX) {
                 continue;
             }
-            // Incremental aggregate: alloc/free both update this zone's used under
-            // z.alloc_mutex so there's no race window.  Use the TLSF
-            // before/after delta (rather than `size`) so we account for
-            // alignment + block-header overhead consistently with what
-            // tlsf_allocator::used() reports.
-            const size_t after      = wca.allocator->used();
-            const size_t delta      = after - before;
-            const size_t total_used = z.used.fetch_add(delta, std::memory_order_relaxed) + delta;
             if (profile_active) {
                 const size_t idx = static_cast<size_t>(zone);
                 t_arena_pp_profile.zone_alloc_calls[idx]++;
@@ -30112,8 +30109,7 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
             }
             const size_t logical_offset = wca.logical_start + offset;
             if (!arena_register_exact(zone, allocation_id, logical_offset, size)) {
-                wca.allocator->free(offset);
-                z.used.fetch_sub(delta, std::memory_order_relaxed);
+                zone_used_free(*wca.allocator, offset, z.used);
                 return nullptr;
             }
             const arena_authority::allocation_record committed{ allocation_id, static_cast<int>(zone),
@@ -30122,8 +30118,7 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
             if (!arena_record_allocation_locked(zone, ptr, allocation_id, logical_offset, size,
                                                 registry_commit, registry_context)) {
                 arena_unregister_exact(zone, logical_offset);
-                wca.allocator->free(offset);
-                z.used.fetch_sub(delta, std::memory_order_relaxed);
+                zone_used_free(*wca.allocator, offset, z.used);
                 return nullptr;
             }
             if (exact) *exact = committed;
@@ -30162,25 +30157,23 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
     allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
     if (group.state != allocator_group_state::OPEN || !arena_zone_open(zone)) return nullptr;
 
-    // TLSF returns OFFSET into the managed region; convert to device pointer.
-    size_t offset = alloc->allocate(size, align);
+    // TLSF returns OFFSET into the managed region; convert to device pointer. In a single-chunk arena WEIGHT
+    // allocates from KV's allocator, whose used() is both zones' bytes: the zone's counter takes this call's delta.
+    size_t       zone_count = 0;
+    const size_t offset     = zone_used_allocate(*alloc, z.used, size, align, &zone_count);
     if (offset != SIZE_MAX) {
-        const size_t current_used         = alloc->used();
-        const size_t current_largest_free = alloc->largest_free_block();
-        z.used.store(current_used, std::memory_order_relaxed);
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_alloc_calls[idx]++;
             t_arena_pp_profile.zone_alloc_bytes[idx] += size;
             t_arena_pp_profile.zone_alloc_us[idx] += arena_profile_elapsed_us(t0);
-            t_arena_pp_profile.zone_used_peak[idx] = std::max(t_arena_pp_profile.zone_used_peak[idx], current_used);
+            t_arena_pp_profile.zone_used_peak[idx] = std::max(t_arena_pp_profile.zone_used_peak[idx], zone_count);
             t_arena_pp_profile.zone_largest_free_min[idx] =
-                std::min(t_arena_pp_profile.zone_largest_free_min[idx], current_largest_free);
+                std::min(t_arena_pp_profile.zone_largest_free_min[idx], alloc->largest_free_block());
         }
         const size_t logical_offset = z.start + offset;
         if (!arena_register_exact(zone, allocation_id, logical_offset, size)) {
-            alloc->free(offset);
-            z.used.store(alloc->used(), std::memory_order_relaxed);
+            zone_used_free(*alloc, offset, z.used);
             return nullptr;
         }
         const arena_authority::allocation_record committed{ allocation_id, static_cast<int>(zone),
@@ -30189,8 +30182,7 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
         if (!arena_record_allocation_locked(zone, ptr, allocation_id, logical_offset, size,
                                             registry_commit, registry_context)) {
             arena_unregister_exact(zone, logical_offset);
-            alloc->free(offset);
-            z.used.store(alloc->used(), std::memory_order_relaxed);
+            zone_used_free(*alloc, offset, z.used);
             return nullptr;
         }
         if (exact) *exact = committed;
@@ -30525,6 +30517,10 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
 
     auto & z = arena_zones_[static_cast<int>(zone)];
+    // Every arm lowers the counter of the zone the exact-allocation record names, which the unregister hands back:
+    // KV and WEIGHT share an allocator, so the zone the caller names does not say which counter the block was
+    // charged to.
+    vram_zone_id record_zone = vram_zone_id::COUNT;
 
     // N-chunk shared WEIGHT/KV path: route the free to the per-chunk allocator
     // that owns ptr.  Handles still carry their logical zone, so freeing a KV
@@ -30536,12 +30532,9 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             if (arena_offset != SIZE_MAX && arena_offset >= z.start && arena_offset < z.start + z.size) {
                 const size_t                zone_offset = arena_offset - z.start;
                 std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-                if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
+                if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) return false;
                 arena_forget_allocation_locked(zone, ptr);
-                const size_t                before = z.allocator->used();
-                z.allocator->free(zone_offset);
-                const size_t after = z.allocator->used();
-                z.used.fetch_sub(before - after, std::memory_order_relaxed);
+                zone_used_free(*z.allocator, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
                 if (profile_active) {
                     const size_t idx = static_cast<size_t>(zone);
                     t_arena_pp_profile.zone_free_calls[idx]++;
@@ -30565,17 +30558,12 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             return false;
         }
         std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-        if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
+        if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) return false;
         arena_forget_allocation_locked(zone, ptr);
-        const auto                  chunk_base = reinterpret_cast<uintptr_t>(arena_chunks_[chunk_idx].ptr);
-        const auto                  p          = reinterpret_cast<uintptr_t>(ptr);
-        const size_t                chunk_off  = static_cast<size_t>(p - chunk_base);
-        const size_t                before     = target->allocator->used();
-        target->allocator->free(chunk_off);
-        // Incremental aggregate: see matching fetch_add comment in zone_alloc.
-        const size_t after = target->allocator->used();
-        const size_t delta = before - after;
-        z.used.fetch_sub(delta, std::memory_order_relaxed);
+        const auto   chunk_base = reinterpret_cast<uintptr_t>(arena_chunks_[chunk_idx].ptr);
+        const auto   p          = reinterpret_cast<uintptr_t>(ptr);
+        const size_t chunk_off  = static_cast<size_t>(p - chunk_base);
+        zone_used_free(*target->allocator, chunk_off, arena_zones_[static_cast<int>(record_zone)].used);
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_free_calls[idx]++;
@@ -30600,10 +30588,9 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         }
         size_t                      zone_offset = arena_offset - kv.start;
         std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-        if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
+        if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) return false;
         arena_forget_allocation_locked(zone, ptr);
-        alloc->free(zone_offset);
-        kv.used.store(alloc->used(), std::memory_order_relaxed);
+        zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_free_calls[idx]++;
@@ -30623,10 +30610,9 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     size_t zone_offset = arena_offset - z.start;
 
     std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-    if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
+    if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) return false;
     arena_forget_allocation_locked(zone, ptr);
-    alloc->free(zone_offset);
-    z.used.store(alloc->used(), std::memory_order_relaxed);
+    zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
         t_arena_pp_profile.zone_free_calls[idx]++;

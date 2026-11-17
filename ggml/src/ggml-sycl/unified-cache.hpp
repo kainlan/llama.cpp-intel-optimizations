@@ -6228,7 +6228,8 @@ class unified_cache {
     bool arena_record_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id,
                                         size_t offset, size_t extent,
                                         zone_registry_commit_fn registry_commit, void * registry_context) noexcept;
-    bool arena_unregister_exact_if_unleased_locked(vram_zone_id zone, void * ptr) noexcept;
+    // On success `record_zone` is the zone the block was charged to, read from its record, which a free must lower.
+    bool arena_unregister_exact_if_unleased_locked(vram_zone_id zone, void * ptr, vram_zone_id & record_zone) noexcept;
     void arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id = 0) noexcept;
 
     // Zone incarnation table. The physical-group mutex above is the lifecycle
