@@ -419,9 +419,22 @@ static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(c
     return out;
 }
 
+// Which layers carry attention sinks. The oneDNN SDPA path refuses an op with sinks, so those layers never draw
+// oneDNN Graph scratch and the floor's head maxima leave them out. Read from the file's tensor list, the same source
+// for the early and the late inventory.
+static std::unique_ptr<bool[]> llama_model_sycl_attn_sinks_layers(const llama_model_loader & ml, uint32_t n_layer) {
+    std::unique_ptr<bool[]> sinks(new bool[n_layer]());
+    const LLM_TN            tn(ml.get_arch());
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        sinks[il] = ml.weights_map.find(tn(LLM_TENSOR_ATTN_SINKS, "weight", il).str()) != ml.weights_map.end();
+    }
+    return sinks;
+}
+
 static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &         inventory,
                                                 std::vector<ggml_sycl_tensor_info> & tensors,
                                                 const bool *                         swa_layer_mask,
+                                                const bool *                         sinks_layer_mask,
                                                 const uint32_t *                     kv_k_width_per_layer,
                                                 const uint32_t *                     kv_v_width_per_layer,
                                                 const uint8_t *                      kv_layer_kind,
@@ -615,6 +628,10 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
         // feeds runs on every attention layer, not just the oneDNN-eligible
         // ones the two per-class maxima below are scoped to.
         n_head_all_max = std::max(n_head_all_max, hparams.n_head(il));
+        // The oneDNN SDPA path refuses attention with sinks, whatever the head size.
+        if (sinks_layer_mask && sinks_layer_mask[il]) {
+            continue;
+        }
         if (!llama_model_sycl_onednn_head_dim_eligible(hparams.n_embd_head_k(il), model_attention_scale)) {
             continue;
         }
@@ -792,9 +809,11 @@ static bool llama_model_sycl_build_early_inventory(llama_model_loader &         
     }
     out.kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(model, n_layer);
 
+    const std::unique_ptr<bool[]> sinks_layer_mask = llama_model_sycl_attn_sinks_layers(ml, n_layer);
+
     ggml_sycl_tensor_inventory & inventory = out.inventory;
     llama_model_sycl_populate_inventory(
-        inventory, out.tensors, out.swa_layer_mask.get(), out.kv_layer_arrays.k_width.get(),
+        inventory, out.tensors, out.swa_layer_mask.get(), sinks_layer_mask.get(), out.kv_layer_arrays.k_width.get(),
         out.kv_layer_arrays.v_width.get(), out.kv_layer_arrays.kind.get(), out.kv_layer_arrays.idx_k_width.get(),
         out.total_size, max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock);
@@ -871,11 +890,13 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader & ml,
     }
     llama_model_sycl_kv_layer_arrays kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(model, n_layer);
 
+    const std::unique_ptr<bool[]> sinks_layer_mask = llama_model_sycl_attn_sinks_layers(ml, n_layer);
+
     ggml_sycl_tensor_inventory inventory = {};
-    llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
-                                        kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(),
-                                        kv_layer_arrays.idx_k_width.get(), total_size, max_pp_pipeline_weight_bytes,
-                                        hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
+    llama_model_sycl_populate_inventory(
+        inventory, tensors, swa_layer_mask.get(), sinks_layer_mask.get(), kv_layer_arrays.k_width.get(),
+        kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(), kv_layer_arrays.idx_k_width.get(), total_size,
+        max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock);
     llama_model_sycl_lazy_tables lazy;
     llama_model_sycl_set_inventory_lazy_tables(inventory, ml, lazy);
