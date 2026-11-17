@@ -1987,7 +1987,7 @@ int main() {
                         for (uint32_t n = 32; n <= 8192; n += 32) {
                             const size_t want   = demand_before_room(before, n);
                             const size_t credit = demand_credited(before, n);
-                            auto expect = [&](uint32_t measured_n, uint32_t held_n) -> size_t {
+                            auto         expect = [&](uint32_t measured_n, uint32_t held_n) -> size_t {
                                 return credited_by_rule(set, n, 2048, measured_n, held_n) ? credit : want;
                             };
                             ++asked;
