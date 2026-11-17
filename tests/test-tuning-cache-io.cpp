@@ -717,6 +717,186 @@ TEST(ubatch_swa_full_json_roundtrip) {
     return true;
 }
 
+// The routing ceiling the picker applied is part of the key: an entry picked under one ceiling is no answer under
+// another, and a model with no experts (ceiling 0) is a third value.
+TEST(ubatch_key_moe_row_ceiling_decides_equality) {
+    UbatchCacheKey a;
+    a.device_key      = "Arc_Pro_B70@1.3.12345";
+    a.model_name      = "moe-model";
+    a.model_size      = 4096;
+    a.model_hash      = 17;
+    a.n_ctx           = 4096;
+    a.n_batch         = 2048;
+    a.flash_attn      = true;
+    a.n_seq_max       = 1;
+    a.moe_row_ceiling = 512;
+
+    UbatchCacheKey b = a;
+    ASSERT(a == b);
+    ASSERT(!(a != b));
+    b.moe_row_ceiling = 1024;
+    ASSERT(a != b);
+    b.moe_row_ceiling = 0;
+    ASSERT(a != b);
+
+    // A key nobody filled in holds the no-experts value, so keys built by hand elsewhere in this file keep matching.
+    const UbatchCacheKey fresh;
+    ASSERT(fresh.moe_row_ceiling == 0);
+    return true;
+}
+
+TEST(ubatch_key_moe_row_ceiling_json_roundtrip) {
+    UbatchCacheKey k;
+    k.device_key = "Dev@1.0";
+    k.model_name = "moe-json";
+    k.n_ctx      = 4096;
+    k.n_batch    = 2048;
+
+    const uint32_t ceilings[] = { 0, 512, 4096 };
+    for (size_t i = 0; i < sizeof(ceilings) / sizeof(ceilings[0]); ++i) {
+        k.moe_row_ceiling      = ceilings[i];
+        const std::string json = "{" + ubatch_key_to_json(k) + "}";
+        // The writer must name the field: a writer that dropped it would still round-trip through the default.
+        ASSERT(json.find("\"moe_row_ceiling\":" + std::to_string(ceilings[i])) != std::string::npos);
+        const UbatchCacheKey restored = ubatch_key_from_json(json);
+        ASSERT(restored.moe_row_ceiling == ceilings[i]);
+        ASSERT(restored == k);
+    }
+    return true;
+}
+
+// An entry written before the field existed has no key for it. It must not read as 0, the value a model with no
+// experts stores: it reads as the one value no picker stores.
+TEST(ubatch_key_without_moe_row_ceiling_reads_as_unrecorded) {
+    const std::string before =
+        "{\"device_key\":\"Dev@1.0\",\"model_name\":\"before\",\"model_size\":4096,\"model_hash\":17,"
+        "\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":true,\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,"
+        "\"kv_unified\":false,\"swa_full\":false}";
+    const UbatchCacheKey k = ubatch_key_from_json(before);
+    // Positive control: the other fields were read, so the key below is not just an empty parse.
+    ASSERT(k.model_name == "before" && k.n_ctx == 4096 && k.n_batch == 2048 && k.flash_attn);
+    ASSERT(k.moe_row_ceiling == UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
+
+    const uint32_t ceilings[] = { 0, 512, 1024 };
+    for (size_t i = 0; i < sizeof(ceilings) / sizeof(ceilings[0]); ++i) {
+        UbatchCacheKey lookup  = k;
+        lookup.moe_row_ceiling = ceilings[i];
+        ASSERT(k != lookup);
+    }
+
+    // A value past 32 bits is a damaged file. It reads the same way and does not wrap into a real ceiling.
+    const UbatchCacheKey huge = ubatch_key_from_json("{\"model_name\":\"huge\",\"moe_row_ceiling\":4294967808}");
+    ASSERT(huge.model_name == "huge");
+    ASSERT(huge.moe_row_ceiling == UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
+    return true;
+}
+
+// A present but malformed value is a damaged entry, not a model with no experts: it reads as unrecorded, never as 0.
+TEST(ubatch_key_malformed_moe_row_ceiling_reads_as_unrecorded) {
+    UbatchCacheKey k;
+    k.device_key           = "Dev@1.0";
+    k.model_name           = "malformed";
+    k.n_ctx                = 4096;
+    k.n_batch              = 2048;
+    k.moe_row_ceiling      = 512;
+    const std::string good = "{" + ubatch_key_to_json(k) + "}";
+    const std::string from = "\"moe_row_ceiling\":512";
+    ASSERT(good.find(from) != std::string::npos);
+
+    const char * damaged[] = { "\"moe_row_ceiling\":-1",         "\"moe_row_ceiling\":null",
+                               "\"moe_row_ceiling\":\"512\"",    "\"moe_row_ceiling\":",
+                               "\"moe_row_ceiling\":4294967295", "\"moe_row_ceiling\":4294967296" };
+    for (size_t i = 0; i < sizeof(damaged) / sizeof(damaged[0]); ++i) {
+        std::string bad = good;
+        bad.replace(bad.find(from), from.size(), damaged[i]);
+        ASSERT(bad != good);
+        const UbatchCacheKey r = ubatch_key_from_json(bad);
+        ASSERT(r.model_name == "malformed");  // positive control: the rest of the key was read
+        ASSERT(r.moe_row_ceiling == UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
+    }
+
+    // One space after the colon is valid JSON and still reads as the stored value.
+    std::string spaced = good;
+    spaced.replace(spaced.find(from), from.size(), "\"moe_row_ceiling\": 512");
+    ASSERT(spaced != good);
+    ASSERT(ubatch_key_from_json(spaced).moe_row_ceiling == 512);
+    return true;
+}
+
+// The file-level behaviour the entry points rely on: a version 6 file written before the field loads, none of its
+// entries answers a lookup, and the entry a later store appends answers only a lookup under its own ceiling.
+TEST(ubatch_cache_file_written_before_the_ceiling_loads_and_misses) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_ceiling_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchCeilingDevice_" + std::to_string(getpid());
+
+    create_dir_recursive(cache_dir);
+    const std::string path = get_ubatch_cache_file(cache_dir, device_name);
+    {
+        // What save_ubatch_cache wrote at version 6 before the field existed: one dense model's entry and one MoE
+        // model's terminal entry.
+        std::ofstream f(path);
+        f << "{\n  \"version\": 6,\n  \"device\": \"" << device_name << "\",\n  \"entries\": [\n"
+          << "    {\"device_key\":\"Dev@1.0\",\"model_name\":\"dense\",\"model_size\":4096,\"model_hash\":1,"
+          << "\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":true,\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,"
+          << "\"kv_unified\":false,\"swa_full\":false,\"n_ubatch\":2048,\"reason\":\"ladder exhausted\","
+          << "\"created\":\"2026-11-01T00:00:00Z\"},\n"
+          << "    {\"device_key\":\"Dev@1.0\",\"model_name\":\"moe\",\"model_size\":4096,\"model_hash\":2,"
+          << "\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":true,\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,"
+          << "\"kv_unified\":false,\"swa_full\":false,\"n_ubatch\":512,\"reason\":\"MoE GPU routing ceiling\","
+          << "\"created\":\"2026-11-01T00:00:01Z\"}\n  ]\n}\n";
+    }
+
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));        // read without error
+    ASSERT(loaded.size() == 2);
+    ASSERT(loaded[0].n_ubatch == 2048 && loaded[1].n_ubatch == 512);  // positive control: the contents were read
+
+    // The keys a lookup builds for the same two models: ceiling 0 for the dense one, 512 for the MoE one.
+    UbatchCacheKey dense_key  = loaded[0].key;
+    dense_key.moe_row_ceiling = 0;
+    UbatchCacheKey moe_key    = loaded[1].key;
+    moe_key.moe_row_ceiling   = 512;
+    for (size_t i = 0; i < loaded.size(); ++i) {
+        ASSERT(loaded[i].key != dense_key);
+        ASSERT(loaded[i].key != moe_key);
+    }
+
+    // A store finds no equal key, so it appends. The old entries stay, still unrecorded, and age out by `created`.
+    UbatchCacheEntry current;
+    current.key      = moe_key;
+    current.n_ubatch = 512;
+    current.reason   = "MoE GPU routing ceiling";
+    current.created  = "2026-11-16T00:00:00Z";
+    loaded.push_back(current);
+    ASSERT(save_ubatch_cache(cache_dir, device_name, loaded));
+
+    std::vector<UbatchCacheEntry> reloaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, reloaded));
+    ASSERT(reloaded.size() == 3);
+    ASSERT(reloaded[0].key.moe_row_ceiling == UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
+    ASSERT(reloaded[1].key.moe_row_ceiling == UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
+
+    // The entry picked under 512 answers a lookup under 512 and does not answer one under 1024.
+    UbatchCacheKey wide_key  = moe_key;
+    wide_key.moe_row_ceiling = 1024;
+    int hits_512             = 0;
+    int hits_1024            = 0;
+    for (size_t i = 0; i < reloaded.size(); ++i) {
+        if (reloaded[i].key == moe_key) {
+            ++hits_512;
+        }
+        if (reloaded[i].key == wide_key) {
+            ++hits_1024;
+        }
+    }
+    ASSERT(hits_512 == 1);
+    ASSERT(hits_1024 == 0);
+
+    std::remove(path.c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
 // Test: ubatch_entry_to_json / ubatch_entry_from_json round-trip every
 // field, including the nested key.
 TEST(ubatch_entry_serialization) {
@@ -1935,6 +2115,11 @@ int main() {
     RUN_TEST(ubatch_key_equality);
     RUN_TEST(ubatch_kv_mode_json_roundtrip);
     RUN_TEST(ubatch_swa_full_json_roundtrip);
+    RUN_TEST(ubatch_key_moe_row_ceiling_decides_equality);
+    RUN_TEST(ubatch_key_moe_row_ceiling_json_roundtrip);
+    RUN_TEST(ubatch_key_without_moe_row_ceiling_reads_as_unrecorded);
+    RUN_TEST(ubatch_key_malformed_moe_row_ceiling_reads_as_unrecorded);
+    RUN_TEST(ubatch_cache_file_written_before_the_ceiling_loads_and_misses);
     RUN_TEST(ubatch_entry_serialization);
     RUN_TEST(ubatch_cache_file_roundtrip);
     RUN_TEST(ubatch_cache_v1_file_rejected);
