@@ -1435,7 +1435,11 @@ def mutants(files):
     yield ("install naming the provisional builder",
            edit(files, M, "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);",
                 "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);\n    (void) &ggml_sycl_make_provisional_plan_snapshot;", "g36f"),
-           "names ggml_sycl_make_provisional_plan_snapshot")
+           "ggml_backend_sycl_measure_plan_override_install_kv names ggml_sycl_make_provisional_plan_snapshot")
+    yield ("the install's lookup naming the provisional builder",
+           edit(files, M, "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;\n    switch (stage) {",
+                "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;\n    (void) &ggml_sycl_make_provisional_plan_snapshot;\n    switch (stage) {", "g36r"),
+           "ggml_sycl_measure_staged_plan names ggml_sycl_make_provisional_plan_snapshot")
     yield ("a measure free reaching the SYCL free",
            edit(files, M, "static void ggml_backend_sycl_measure_free(ggml_backend_t backend) {\n    delete backend;",
                 "static void ggml_backend_sycl_measure_free(ggml_backend_t backend) {\n    ggml_backend_sycl_free(backend);", "g36g"),
