@@ -557,6 +557,8 @@ typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 // a load that named none, the load's planning micro-batch. The room is the planned compute term (the compute buffers
 // the load measured at its planning shape), held beside that micro-batch's ring and dense scratch. 0 for none: a
 // multi-device plan, another device, an unknown planning micro-batch, or a named micro-batch the plan did not place.
+// A rung can also be named with a room of 0 bytes, when no live load owns a compute term on the device: such a room
+// credits no request above 0 bytes, and the measured rung is withheld (0) with it.
 //
 // compute_room_measured_n_ubatch is the micro-batch the term was measured at, 0 when unknown or when there is no room.
 // It is a separate fact from compute_room_n_ubatch because the plan can place a micro-batch above the one the load
@@ -573,9 +575,10 @@ struct zone_hold_fit_inputs {
     uint32_t                       compute_room_n_ubatch          = 0;
     size_t                         compute_room_bytes             = 0;
     uint32_t                       compute_room_measured_n_ubatch = 0;
-    // The rung whose own compute buffer the hold kept outside the arena (the realized check's rung, when its record
-    // shows such a spill), 0 for none. The zone did not serve that rung's buffer, so the room is not credited there.
-    // Every other rung keeps the credit the plan gives it.
+    // The rung whose own compute buffer the hold kept outside the arena, 0 for none: the hold epoch's rung (the asked
+    // rung when the owner has no epoch), set when the epoch's spill counters show a request held outside the arena.
+    // The zone did not serve that rung's buffer, so the room is not credited there. Every other rung keeps the credit
+    // the plan gives it.
     uint32_t                       held_out_n_ubatch              = 0;
 };
 
