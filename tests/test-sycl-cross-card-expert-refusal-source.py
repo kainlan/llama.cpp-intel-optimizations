@@ -324,4 +324,4 @@ if __name__ == "__main__":
 
     import pytest
 
-    sys.exit(pytest.main([__file__, "-q", "-p", "no:cacheprovider"]))
+    sys.exit(pytest.main([__file__, "-q"]))
