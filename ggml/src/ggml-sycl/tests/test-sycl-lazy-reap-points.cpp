@@ -12,11 +12,13 @@
 //
 // LEAD-RUN. The stage initialises the SYCL backends, constructs their caches and plans through them, so the binary is
 // registered gpu-serial, serial, with the selector pinned to both discrete cards (level_zero:0,1). It runs iff the
-// planner caller takes its multi-device path, ggml_backend_sycl_moe_multi_gpu_requested(), and exits 77 otherwise. No
-// libllama: the fixture builds each inventory and drives the load transaction itself, and the engine's reads come from
-// the PRIVATE_TESTING read source. The teardown throw, the four shutdown fixtures and their mutants run in children
-// of this binary, started before this process initialises SYCL, since a shutdown ends the backend for the process and
-// a throw that escapes a noexcept reap ends it. Only the strict shutdown's child runs under GGML_SYCL_STRICT_LEASES=1.
+// planner caller takes its multi-device path, ggml_backend_sycl_multi_device_plan_requested() asked with the fixture's
+// expert fact, and exits 77 otherwise. The fixture's model has experts, so that path is the opt-in cross-card one and
+// the registrations set GGML_SYCL_MOE_MULTI_GPU=1. No libllama: the fixture builds each inventory and drives the load
+// transaction itself, and the engine's reads come from the PRIVATE_TESTING read source. The teardown throw, the four
+// shutdown fixtures and their mutants run in children of this binary, started before this process initialises SYCL,
+// since a shutdown ends the backend for the process and a throw that escapes a noexcept reap ends it. Only the strict
+// shutdown's child runs under GGML_SYCL_STRICT_LEASES=1.
 //
 // --mutant <name> selects one runtime mutant of the PRIVATE_TESTING selector (§11) and runs only the arm that kills it;
 // each --mutant registration passes only when that arm prints its FAIL line. An arm whose engagement check fails is
@@ -51,6 +53,7 @@ using namespace host_ledger_test_harness;
 using namespace lazy_table_test;
 using namespace lazy_ring_fixture;
 using host_plan_shaped_inventory::loader_inventory;
+using host_plan_shaped_inventory::q2k_shape;
 
 namespace {
 
@@ -582,7 +585,7 @@ struct child_model {
 };
 
 void child_setup(const char * tag, child_model & m) {
-    if (!ggml_backend_sycl_moe_multi_gpu_requested()) {
+    if (!ggml_backend_sycl_multi_device_plan_requested(q2k_shape.experts > 0)) {
         child_exit(tag, "void: the planner caller takes its single-device path", SYCL_TEST_SKIP);
     }
     // A child leaves main before main installs the capture, and load_model reads each stage's ring from the captured
@@ -1024,10 +1027,10 @@ int main(int argc, char ** argv) {
     if (!sycl_test_require_gpu("the lazy reap point arms")) {
         return SYCL_TEST_SKIP;
     }
-    if (!ggml_backend_sycl_moe_multi_gpu_requested()) {
+    if (!ggml_backend_sycl_multi_device_plan_requested(q2k_shape.experts > 0)) {
         std::printf(
-            "SKIP: the planner caller takes its single-device path: ggml_backend_sycl_moe_multi_gpu_requested() "
-            "is false\n");
+            "SKIP: the planner caller takes its single-device path: "
+            "ggml_backend_sycl_multi_device_plan_requested() is false\n");
         return SYCL_TEST_SKIP;
     }
     ggml_log_set(capture_log, nullptr);

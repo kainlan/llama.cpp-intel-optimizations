@@ -11,9 +11,11 @@
 // LEAD-RUN. The stage initialises the SYCL backends, constructs their caches and plans through them, so the binary is
 // registered gpu-serial, serial, with the selector pinned to both discrete cards (level_zero:0,1). It runs iff the
 // planner caller takes its multi-device path, by the caller's own predicate,
-// ggml_backend_sycl_moe_multi_gpu_requested(), and exits 77 otherwise. No libllama: the fixture builds each inventory
-// and drives the load transaction itself, the engine's reads come from the PRIVATE_TESTING read source, and the strict
-// arm's child materializes a table from a file the fixture writes in the working directory.
+// ggml_backend_sycl_multi_device_plan_requested(), asked with the fixture's expert fact, and exits 77 otherwise. The
+// fixture's model has experts, so that path is the opt-in cross-card one and the registrations set
+// GGML_SYCL_MOE_MULTI_GPU=1. No libllama: the fixture builds each inventory and drives the load transaction itself, the
+// engine's reads come from the PRIVATE_TESTING read source, and the strict arm's child materializes a table from a file
+// the fixture writes in the working directory.
 //
 // --mutant <name> selects one runtime mutant of the PRIVATE_TESTING selector (§11) and runs only the arm that kills it;
 // each --mutant registration passes only when that arm prints its FAIL line. Every arm names its engagement check and
@@ -1533,10 +1535,10 @@ int main(int argc, char ** argv) {
     }
     // The stage plans through the multi-device planner call iff this predicate holds, which the two-device and the
     // direct planner arms score; a host on the other path would score the wrong call.
-    if (!ggml_backend_sycl_moe_multi_gpu_requested()) {
+    if (!ggml_backend_sycl_multi_device_plan_requested(q2k_shape.experts > 0)) {
         std::printf(
-            "SKIP: the planner caller takes its single-device path: ggml_backend_sycl_moe_multi_gpu_requested() "
-            "is false\n");
+            "SKIP: the planner caller takes its single-device path: "
+            "ggml_backend_sycl_multi_device_plan_requested() is false\n");
         ::unlink(g_fixture_path.c_str());
         return rc;
     }
