@@ -16026,7 +16026,7 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
                                                         ggml_sycl_measure_stage                   stage,
                                                         const struct ggml_sycl_measure_kv_shape * kv_shape) {
     if (g_measure_plan_override) {
-        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override nested\n");
+        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] measure plan override nested\n");
         if (ggml_sycl::ggml_sycl_strict_enabled()) {
             GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested");
         }
@@ -16043,8 +16043,8 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
             break;
     }
     if (!snapshot || !snapshot->plan) {
-        GGML_LOG_WARN("[LOAD-PLAN] measure plan override: no plan staged for load %llu at stage %d\n",
-                      (unsigned long long) load_txn, (int) stage);
+        GGML_LOG_ERROR("[LOAD-PLAN] measure plan override: no plan staged for load %llu at stage %s\n",
+                       (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage));
         return false;
     }
     if (kv_shape != nullptr) {
@@ -16053,7 +16053,7 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
             snapshot = ggml_sycl_measure_refit_kv(snapshot, *kv_shape, why);
         } catch (const ggml_sycl_fallback_error &) {
             // The alloc-zone contract's sanctioned form: ggml_sycl_fallback_error derives from std::exception, so it
-            // is caught first and rethrown, or the handler below would turn a planned refusal into a re-fit WARN.
+            // is caught first and rethrown, or the handler below would turn a planned refusal into a re-fit failure.
             // That makes this the one load-path export an exception can cross. The llama side would not name it:
             // llama_load_measure_run constructs its llama_measure_plan_override guard, which calls this export,
             // before the try around the measure context, so a crossing error would leave the run unnamed and fail
@@ -16066,7 +16066,7 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
             why = e.what();
         }
         if (!snapshot) {
-            GGML_LOG_WARN(
+            GGML_LOG_ERROR(
                 "[LOAD-PLAN] measure plan override: the KV re-fit for load %llu at the %s stage refused: %s\n",
                 (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage), why.c_str());
             return false;
