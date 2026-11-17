@@ -1,14 +1,17 @@
 """Source contract for the runtime-context refusal of a oneDNN Graph attention scratch the load did not plan.
 
-The ONEDNN zone holds the Graph scratch room the load sized for the context it was told. A later context can ask
-for more (a larger -c than the hint, or an API caller that gave none). The part above the room is served outside the
-arena, by the DIRECT path, which draws raw device memory and aborts the process when the card has none left. The
-runtime-context transaction therefore asks, before it commits anything, whether that part fits outside the arena
-above the driver headroom beside the hold's worst-case spill, and refuses the context by name when it does not. Only
-the part above the room is refused: a context whose scratch outgrows the zone but fits outside the arena runs.
+The ONEDNN zone holds the Graph scratch room the load sized for the shape it was told. A later context can ask for
+more (a rung the automatic micro-batch trial probes above the planned micro-batch, a larger -c than the hint, or an
+API caller that gave none). The part above the room is served outside the arena, by the DIRECT path, which draws raw
+device memory and aborts the process when the card has none left. The runtime-context transaction therefore asks,
+before the dense scratch is re-planned (its transaction guard is the first state a refusal must undo), whether that
+part fits outside the arena above the driver headroom beside the hold's worst-case spill, and refuses the context by
+name when it does not. Only the part above the room is refused: a context whose scratch outgrows the zone but fits
+outside the arena runs.
 
 The arithmetic is host-tested (test-zone-sizing, Case 24h). This file pins the wiring no host test can reach:
-- the transaction calls the check after the non-FA check and before its first state that a refusal must undo;
+- the transaction calls the check after the non-FA check and before the dense scratch guard, its first state that a
+  refusal must undo;
 - the check returns early when flash attention is off, and when the Graph allocator is disabled;
 - the check runs in probe mode too (the micro-batch ladder must see the verdict a real context gets);
 - the refusal names the largest -ub the same fit accepts;
@@ -252,7 +255,9 @@ def _checks(src: str, cache: str = CACHE_NORM) -> dict:
     }
 
 
-def test_transaction_calls_the_check_after_the_nonfa_check_and_before_any_commit():
+def test_transaction_calls_the_check_after_the_nonfa_check_and_before_the_dense_scratch_guard():
+    """The check runs once the non-FA check has passed and before the dense scratch guard, the first state the
+    transaction must undo on a refusal; a refusal returns from the transaction at once."""
     assert _called_in_order(SYCL_NORM), (
         f"the transaction must call {CHECK_NAME}() once, after the non-FA refusal and before {FIRST_GUARDED_STATE}...), "
         "and refuse when it returns false"
