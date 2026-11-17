@@ -24,7 +24,8 @@ The rules, in one place (the authoritative wording is in `CLAUDE.md`):
 4. GPU and model-loading work runs only in the lead session, one run at a time.
 5. Sample `Shmem` and `MemAvailable` before a GPU run and about 5 seconds after it.
 6. Read the kernel log with `journalctl -k`, because `dmesg` is denied for this user.
-7. Put `timeout 60` on GPT-OSS 20B test runs.
+7. Run every GPT-OSS test under `timeout`. 60 seconds covers a short 20B run; benches and default-context
+   runs need more.
 8. Never use `sycl-ls` as a health check.
 
 ## 1. The full-suite sweep and `-j`
@@ -285,6 +286,11 @@ label, so "only `main`" means "nobody classified this", not "this is safe".
   exactly, and still an OOM.** After acquiring the lock and *before* touching the device, wait
   for `Shmem < 30 GB` **and** `MemAvailable > 150 GB`; if it has not settled in ~10 minutes,
   release the lock and escalate rather than proceeding or holding it while you wait.
+
+  Correction, 2026-11-16: the `MemAvailable > 150 GB` half of that wait is retired. A ruling of 2026-11-12
+  removed free-memory conditions from run guards, because `MemAvailable` cannot tell a runaway from a 122 GiB
+  model held in host memory on purpose (55 to 60 GB available with `Shmem` flat). On this host `MemAvailable`
+  also idles near 144 GB, so the condition could never be met. Wait on `Shmem < 30 GB` and guard on `Shmem`.
 
   ⚠️ **THE CAUSE IS NOW KNOWN, AND THERE IS A ONE-LINE MITIGATION** (`llama.cpp-403s`,
   2026-08-01). It is not model size and not concurrency — it is the **iGPU**, which reports

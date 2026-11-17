@@ -270,8 +270,10 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
 # Grepping for the colon form makes a passing gate read as a failure.)
 # Use the GGUF tokenizer.chat_template metadata. Do not force
 # `--chat-template gpt-oss`; that selects the older native formatter.
+# No `-ngl`: the unified cache places every weight (ruling 2026-10-17). This command carried `-ngl 99`
+# until 2026-11-16.
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \

@@ -49,8 +49,10 @@ History and measurements: `docs/backend/sycl-host-safety.md`.
   `grep -E '^(MemAvailable|Shmem):' /proc/meminfo`. Read `Shmem`, not `free`. A reading taken in the same command
   as an exiting process is a false alarm: `sleep 5; grep -E '^(Shmem|MemAvailable):' /proc/meminfo`.
 - `GPU.lock` serialises access, not memory recovery. After you take it and before you touch the device, wait for
-  `Shmem < 30 GB` and `MemAvailable > 150 GB`. If that takes more than ~10 minutes, release it and escalate.
-- Prefix every GPT-OSS 20B test run with `timeout 60`.
+  `Shmem < 30 GB`. If that takes more than ~10 minutes, release it and escalate. Guard a run on `Shmem` only:
+  `MemAvailable` sits near 55 GB on purpose while a 122 GiB model is held in host memory (ruling 2026-11-12).
+- Run every GPT-OSS test under `timeout`, so a hang cannot hold the card. `timeout 60` covers a short 20B run;
+  a bench or a default-context run needs more (`scripts/sycl-canonical-gates.sh` uses 900).
 - `dmesg` is denied for this user. Read the kernel log with
   `journalctl -k --since "1 hour ago" --no-pager | grep -iE 'GT reset|guc_id|GPU hang|xe.*reset'`
 - After any OOM, crash or forced stop, benchmark numbers on that card are invalid until this is clean:
@@ -108,7 +110,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
   -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0
 # GPT-OSS B50 chat correctness gate. The answer is a line of its own: 1, 2, 3, 4, 5
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
@@ -121,7 +123,8 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/llama-bench \
 ```
 - Score the GPT-OSS gate with `grep -cx`, not `grep -c`: the echoed prompt ends with the same digits. The gate
   carries no `-c`. Never shrink the context to make it fit; the cache places the KV. Keep a `-c 4096` arm as
-  the all-VRAM control when you A/B.
+  the all-VRAM control when you A/B. No gate or script passes `-ngl`: the unified cache places every weight,
+  and a layer-count flag would be a second source for that fact (ruling 2026-10-17).
 - **GPT-OSS Prompt Template Rule.** Use `llama-cli` so the model's embedded chat template applies. Do not pass
   `-cnv` (invalid on `llama-cli`) or `--chat-template gpt-oss`, and do not hand-render a Harmony prompt. Always
   pin `reasoning_effort=medium` with `--chat-template-kwargs`. Rationale: `docs/backend/gpt-oss-testing.md`.
