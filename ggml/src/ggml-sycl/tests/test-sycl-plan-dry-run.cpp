@@ -730,6 +730,148 @@ arm_result arm_d_mem_available_option_is_the_sample() {
     return r;
 }
 
+// One staged early pass of `inv` in a load transaction of its own, ended uncommitted. `during` reads the planner globals
+// between the stage and the end, `published_weight` the ring weight slot the stage left on device 0.
+struct staged_early_load {
+    ggml_sycl_lifecycle_result        begin = GGML_SYCL_LIFECYCLE_OK;
+    ggml_sycl_lifecycle_result        stage = GGML_SYCL_LIFECYCLE_OK;
+    std::vector<device_planner_state> during;
+    size_t                            published_weight = 0;
+};
+
+staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv) {
+    staged_early_load  out;
+    ggml_sycl_load_txn txn{};
+    out.begin = ggml_backend_sycl_model_load_begin(&txn);
+    if (out.begin != GGML_SYCL_LIFECYCLE_OK) {
+        return out;
+    }
+    out.stage            = ggml_backend_sycl_stage_load_inventory_plan(&inv, nullptr, true);
+    out.during           = read_planner_state();
+    out.published_weight = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(0);
+    (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    return out;
+}
+
+// (e) A load whose plan needs a larger arena zone while a first allocation holds the arena is refused by name, and the
+// allocation keeps its memory. The VRAM arena's zones grow only by a rebuild, which is refused while anything points into
+// the arena, and the stage used to abort the process there. A 4 KiB RUNTIME-zone allocation on device 0 stands for the
+// first model. With a sentinel in every planner global, two loads are staged beside it, each ended uncommitted:
+//   control: the shaped inventory, whose zones the arms above already sized, stages OK, and the sentinels read back
+//            after its end;
+//   refusal: the same inventory with a PP MoE ring weight slot 256 MiB larger than device 0's RUNTIME zone, at depth 1,
+//            returns PLAN_REJECTED from the stage after one ERROR line that names device 0, the RUNTIME need and have
+//            and the allocations that hold the arena; the sentinels read back right after the stage and after the end;
+//            the RUNTIME zone keeps its capacity; the allocation resolves to the same device pointer, and the registry
+//            still holds it in the RUNTIME zone.
+// Engagement: device 0's arena is active; the allocation landed in its RUNTIME zone; the control staged OK beside it, so
+// a refusal is the oversized term's and not the allocation's alone; a refusal leg that returned OK had published the
+// oversized ring (it owed a refusal), otherwise the ring was not planned and the arm is VOID.
+// Mutants: the abort kept (the binary dies); the refusal not propagated (the stage returns OK); the published terms not
+// put back (a global reads the refused load's ring, not its sentinel); a rebuild, eviction or zone reset under the
+// allocation (the RUNTIME capacity moves, or the allocation no longer resolves where it was).
+arm_result arm_e_held_arena_refuses_the_load() {
+    arm_result      r;
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (cache == nullptr || !cache->arena_active()) {
+        void_arm(r, "device 0 has no active VRAM arena, so nothing can hold its zones");
+        return r;
+    }
+
+    alloc_request req{};
+    req.queue                               = &cache->get_queue();
+    req.device                              = 0;
+    req.size                                = 4096;
+    req.intent.role                         = alloc_role::GRAPH_TMP;
+    req.intent.category                     = runtime_category::GRAPH;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+    allocation_result allocation            = unified_allocate_owner(req);
+    if (!allocation) {
+        void_arm(r, "the 4 KiB RUNTIME-zone allocation was refused");
+        return r;
+    }
+    // The handle's destructor is the allocation's one release point, at the end of the arm.
+    const mem_handle   holder = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const resolved_ptr first  = holder.resolve();
+    alloc_metadata     meta{};
+    if (!first || !first.on_device || !unified_lookup(first.ptr, &meta) || meta.zone != vram_zone_id::RUNTIME) {
+        void_arm(r, "the allocation is not in device 0's RUNTIME zone, so it does not hold the arena");
+        return r;
+    }
+    const size_t runtime_capacity = cache->zone_capacity(vram_zone_id::RUNTIME);
+
+    const std::vector<device_planner_state> original = read_planner_state();
+    const std::vector<device_planner_state> sentinel = sentinel_planner_state(original.size());
+    write_planner_state(sentinel);
+    if (!(read_planner_state() == sentinel)) {
+        void_arm(r, "the sentinel planner state did not read back");
+    }
+
+    loader_inventory        fits(qwen38_shape);
+    const staged_early_load control = stage_early_and_end(fits.inv);
+    if (control.begin != GGML_SYCL_LIFECYCLE_OK || control.stage != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "the control load's begin returned " + num(control.begin) + " and its stage " + num(control.stage) +
+                        " beside the allocation, so a refusal would not be the oversized term's");
+    }
+    expect(r, read_planner_state() == sentinel,
+           "after the control load's uncommitted end a planner global reads that load's value, not its sentinel");
+
+    loader_inventory too_big(qwen38_shape);
+    too_big.inv.pp_moe_onednn_weight_slot_bytes = runtime_capacity + 256 * MiB;
+    too_big.inv.pp_moe_onednn_scratch_bytes     = too_big.inv.pp_moe_onednn_weight_slot_bytes;
+    too_big.inv.pp_moe_onednn_ring_depth        = 1;
+    log_clear();
+    const staged_early_load                 refused = stage_early_and_end(too_big.inv);
+    const std::vector<std::string>          named   = lines_with("[SYCL-PLAN] model load refused on device 0: ");
+    const std::vector<device_planner_state> after   = read_planner_state();
+    write_planner_state(original);
+
+    if (refused.begin != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "the refused load's transaction did not begin (" + num(refused.begin) + ")");
+        return r;
+    }
+    if (refused.stage == GGML_SYCL_LIFECYCLE_OK &&
+        refused.published_weight != too_big.inv.pp_moe_onednn_weight_slot_bytes) {
+        void_arm(r, "the stage returned OK and published a ring weight slot of " + num(refused.published_weight) +
+                        ", not the oversized " + num(too_big.inv.pp_moe_onednn_weight_slot_bytes) +
+                        ", so no zone had to grow");
+        return r;
+    }
+    expect(r, refused.stage == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
+           "a load whose ring needs " + num(too_big.inv.pp_moe_onednn_weight_slot_bytes) + " bytes beside a " +
+               num(runtime_capacity) + "-byte RUNTIME zone the allocation holds returned " + num(refused.stage) +
+               ", not PLAN_REJECTED");
+    expect(r, named.size() == 1,
+           "the refused load logged " + num(named.size()) + " refusal lines naming device 0, want 1");
+    expect(r,
+           named.empty() ||
+               (named[0].find("RUNTIME need ") != std::string::npos && named[0].find(" short)") != std::string::npos &&
+                named[0].find("hold the arena") != std::string::npos),
+           "the refusal line does not name the RUNTIME need and have, its shortfall and the holders: " +
+               (named.empty() ? std::string("(none)") : named[0]));
+    for (size_t d = 0; d < refused.during.size(); ++d) {
+        expect(r, refused.during[d] == sentinel[d],
+               "device " + num(d) + ": right after the refused stage a planner global reads the refused load's value " +
+                   "(ring weight " + num(refused.during[d].ring_weight) + "), not its sentinel");
+    }
+    for (size_t d = 0; d < after.size(); ++d) {
+        expect(r, after[d] == sentinel[d],
+               "device " + num(d) + ": after the refused load's end a planner global reads " + "ring weight " +
+                   num(after[d].ring_weight) + ", not its sentinel");
+    }
+    expect(r, cache->arena_active() && cache->zone_capacity(vram_zone_id::RUNTIME) == runtime_capacity,
+           "the RUNTIME zone moved from " + num(runtime_capacity) + " to " +
+               num(cache->zone_capacity(vram_zone_id::RUNTIME)) + " bytes under the live allocation");
+    const resolved_ptr again = holder.resolve();
+    alloc_metadata     still{};
+    expect(r, again.ptr == first.ptr && again.on_device,
+           "the allocation no longer resolves to the device pointer it had before the refused load");
+    expect(r, unified_lookup(first.ptr, &still) && still.zone == vram_zone_id::RUNTIME && still.id == meta.id,
+           "the registry no longer holds the allocation in the RUNTIME zone");
+    return r;
+}
+
 const char * outcome_name(outcome o) {
     return o == outcome::PASS ? "PASS" : o == outcome::FAIL ? "FAIL" : "VOID";
 }
@@ -762,6 +904,7 @@ int main() {
         { "(b) every term printed by name, from the plan",       arm_b_every_term_printed_from_the_plan   },
         { "(c) a dry run stores nothing and leaves no trace",    arm_c_a_dry_run_stores_nothing           },
         { "(d) --mem-available is the sample's MemAvailable",    arm_d_mem_available_option_is_the_sample },
+        { "(e) a load the held arena cannot hold is refused",    arm_e_held_arena_refuses_the_load        },
     };
     int passed = 0, failed = 0, voided = 0;
     for (const named_arm & arm : arms) {

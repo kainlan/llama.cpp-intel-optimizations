@@ -8681,8 +8681,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
 
     # The host-only plan dry run's lead-run arms (th32 §4.2, §11 T11): a caller built against another struct
     # layout is refused, expected_host is the stage's host_planned_bytes, every term is printed by name from the
-    # plan, a dry run stores no budget, and the --mem-available option is the sample's MemAvailable. The planner
-    # initialises SYCL and arm (a) stages a load through real backends that construct caches, so it carries the
+    # plan, a dry run stores no budget, the --mem-available option is the sample's MemAvailable, and a load whose plan
+    # needs a larger arena zone while an allocation holds the arena is refused, not aborted. The planner initialises
+    # SYCL and arms (a), (c) and (e) stage loads through real backends that construct caches, so it carries the
     # OOM-family labels, runs alone on the discrete cards, and exits 77 without a SYCL GPU.
     add_executable(test-sycl-plan-dry-run
         tests/test-sycl-plan-dry-run.cpp)
