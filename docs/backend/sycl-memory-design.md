@@ -2657,9 +2657,12 @@ The Graph room is the room no other planned consumer may take: the ONEDNN
 zone's capacity less the most the pair admission lets the primitive-API pair
 grow to (`unified_cache_get_onednn_pp_pair_bound()`: its plan, or the capacity
 less the Graph floor when that is larger, from the snapshot the zone was sized
-from). It is not the capacity less the pair's live plan: an op's pair admitted
-into the slack above its plan is not given back, so room counted there could
-be taken from under the context this check passed. Two draws nobody plans can
+from). `unified_cache_get_onednn_graph_room()` returns it from one read of the
+capacity, so an ensure that rebuilds the zone between two reads cannot pair
+one capacity with the bound of another. It is not the capacity less the
+pair's live plan: an op's pair admitted into the slack above its plan is not
+given back, so room counted there could be taken from under the context this
+check passed. Two draws nobody plans can
 still take part of the room: the per-op primitive user scratchpads
 (`allocate_onednn_scratchpad()`, `common.hpp`), which also prefer the ONEDNN
 zone, and the pair's growth step, which holds the superseded pair and the new

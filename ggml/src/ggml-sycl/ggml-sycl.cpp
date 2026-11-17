@@ -20329,12 +20329,10 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
     // A pair admitted later into the slack is not given back, so a room counted above the bound could be taken from
     // under this context. Unplanned draws (the primitives' user scratchpads, the pair's growth step) can still crowd a
     // Graph request onto the DIRECT path; they are not counted here.
-    size_t       pair_bound = 0;
-    if (!ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound)) {
+    size_t       graph_room = 0;
+    if (!ggml_sycl::unified_cache_get_onednn_graph_room(device, &graph_room)) {
         return true;
     }
-    const size_t   zone       = cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN);
-    const size_t   graph_room = zone > pair_bound ? zone - pair_bound : 0;
     const size_t   hold_spill = ggml_sycl_planned_scratch_hold_spill_bound(hold_query);
     const uint32_t n_ubatch   = plan.context_n_ubatch;
     const uint32_t n_ctx      = plan.context_n_ctx;

@@ -8809,6 +8809,12 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
 // for "does an op's pair fit what was planned" (zone_onednn_pp_scratch_planned).
 bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound);
 
+// The ONEDNN zone's oneDNN Graph room on `device_id`: the part of the zone no other planned consumer may take, the
+// capacity less unified_cache_get_onednn_pp_pair_bound()'s bound over that same capacity. Both come from ONE capacity
+// read, so an ensure that rebuilds the zone between two reads cannot pair one capacity with another's bound. False
+// (and *room untouched) when there is no cache or no active arena, as for the bound.
+bool unified_cache_get_onednn_graph_room(int device_id, size_t * room);
+
 // llama.cpp-8ony: whether the oneDNN PP scratch may supply a dense op's f16 copies for a weight of `type`
 // (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH, and the default type set when it is unset). ONE answer for the op arm,
 // the graph-entry walk and the zone-inventory adapter that sizes the dequant plan for the ops the scratch does not

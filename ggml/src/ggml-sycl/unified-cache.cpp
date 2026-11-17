@@ -24464,6 +24464,20 @@ bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound) {
     return true;
 }
 
+bool unified_cache_get_onednn_graph_room(int device_id, size_t * room) {
+    unified_cache * cache = get_existing_unified_cache_for_device(device_id);
+    if (!cache || !cache->arena_active()) {
+        return false;
+    }
+    if (room) {
+        // One capacity read for both terms: the bound is computed for the capacity it is subtracted from.
+        const size_t capacity = cache->zone_capacity(vram_zone_id::ONEDNN);
+        const size_t bound    = onednn_pp_pair_bound_for(device_id, capacity);
+        *room                 = capacity > bound ? capacity - bound : 0;
+    }
+    return true;
+}
+
 bool unified_cache_reserve_pp_moe_onednn_scratch(int      device_id,
                                                  size_t   weight_slot_bytes,
                                                  size_t   activation_slot_bytes,
