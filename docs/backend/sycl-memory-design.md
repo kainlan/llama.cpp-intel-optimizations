@@ -630,9 +630,10 @@ ticket reproduced on:
   modeled demand vs. the flat formula's 192 MB (still 3x after the
   64 MiB clamp).
   `direct_cap` is the DIRECT Graph-scratch cap, the one the dispatcher
-  halves to split each oneDNN attention execute, so no execute ever holds
-  more Graph scratch than the cap and the floor never reserves more than
-  that. The cap is 1 GiB until the first successful
+  halves to split each oneDNN attention execute, so a split execute holds
+  no more Graph scratch than the cap, unless one query row alone exceeds
+  half of it (the one-row case of the `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`
+  row), and the floor never reserves more than the cap. The cap is 1 GiB until the first successful
   `ensure_planned_arena_zones()` and `min(1 GiB, a quarter of the budget
   available at the last successful ensure)` after it
   (`GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` overrides both). Within one

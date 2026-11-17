@@ -657,8 +657,9 @@ zone_context_shape zone_plan_context_shape_for_envelope(bool     n_ctx_is_runtim
 
 // The oneDNN Graph attention scratch the ONEDNN zone holds: the modeled peak of one execute,
 // max(n_head_ctx_max * n_ctx, n_head_swa_max * min(n_ctx, n_swa + n_ubatch)) * n_ubatch f32 elements, times 3/2,
-// bounded by `direct_cap` (the dispatcher splits an execute to half the cap, so a full chunk and the last chunk fit
-// under it together and no more is ever held), and at least 64 MiB. `direct_cap` 0 is no cap known: the formula.
+// bounded by `direct_cap` (the dispatcher splits an execute to half the cap, so a full chunk and the last chunk of a
+// split execute fit under it together; when one query row alone exceeds half the cap the chunks are one row each and
+// can hold more), and at least 64 MiB. `direct_cap` 0 is no cap known: the formula.
 // A sliding-window head sees n_swa + n_ubatch keys, not n_swa: the first query of the micro-batch looks n_swa keys
 // back and the last one n_ubatch further along. The two head classes are never outstanding together, so the peak is
 // the larger class, not their sum. The measurements the formula was fit to are with its caller in unified-cache.cpp.

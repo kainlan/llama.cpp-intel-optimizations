@@ -4175,9 +4175,10 @@ static long onednn_graph_zone_mb_override() {
 // tests/test-sycl-onednn-graph-floor.cpp).
 //
 // The formula itself is zone_onednn_graph_scratch_floor_bytes() (zone-sizing.cpp), bounded by `direct_cap`: the
-// dispatcher splits each oneDNN attention execute to half the DIRECT cap, so a full chunk and the last chunk fit under
-// the cap together and no execute ever holds more Graph scratch than the cap. A floor above it would hold VRAM no
-// execute uses. Callers pass the cap of the device whose zone the floor sizes, or 0 where no device is known.
+// dispatcher splits each oneDNN attention execute to half the DIRECT cap, so a full chunk and the last chunk of a split
+// execute fit under the cap together, unless one query row alone exceeds half of it (fattn-onednn-chunk.hpp then runs
+// one-row chunks). A floor above the cap would hold VRAM no split execute uses. Callers pass the cap of the device
+// whose zone the floor sizes, or 0 where no device is known.
 static size_t onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
                                                         uint32_t n_head_swa_max,
                                                         uint32_t n_swa,
