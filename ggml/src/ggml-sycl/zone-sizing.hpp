@@ -527,6 +527,36 @@ struct zone_arena_holders {
 // outside the arena keeps its own memory through a rebuild, so it does not refuse one; a buffer inside it does.
 bool zone_arena_rebuild_allowed(const zone_arena_holders & holders);
 
+// Why the arena's planned zones could not be sized.
+enum class zone_arena_refusal_reason {
+    NONE,            // they were sized
+    REBUILD_HELD,    // a zone must grow and something points into the arena, so it cannot be rebuilt
+    RESERVE_FAILED,  // the device could not reserve an arena with the planned zones
+    NO_CACHE,        // the device has no unified cache to size them in
+};
+
+// The three zones a plan sizes, in bytes.
+struct zone_arena_sizes {
+    size_t scratch = 0;
+    size_t onednn  = 0;
+    size_t runtime = 0;
+};
+
+// A refusal to size the arena's planned zones: the device, the reason, and per zone the bytes the plan needs and the
+// bytes the arena has, both as the decision read them (have is 0 where no arena existed).
+struct zone_arena_refusal {
+    zone_arena_refusal_reason reason = zone_arena_refusal_reason::NONE;
+    int                       device = -1;
+    zone_arena_sizes          need;
+    zone_arena_sizes          have;
+};
+
+// The line a model load refused for `refusal` logs, without a newline: the device, each zone's need and have in MB, the
+// shortfall of each zone that is short, the reason, and what the caller can do. Empty for NONE. The zones are planned
+// at the load's fixed planning shape, not at the context's -c or -ub, so the line never offers a smaller context or
+// micro-batch as the remedy.
+std::string zone_arena_refusal_text(const zone_arena_refusal & refusal);
+
 // The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the
 // hold can be) plus the largest spill-capable RUNTIME request, because a held-back request spills whole. The
 // request was observed at `hwm_n_ubatch`; compute buffers scale about linearly with n_ubatch, so it is scaled to

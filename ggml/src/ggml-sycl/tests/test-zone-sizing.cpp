@@ -2505,6 +2505,50 @@ int main() {
         CHECK(!zone_runtime_requirement(probe, nullptr), "a requirement with nowhere to write it was answered");
     }
 
+    // ---- Case 38: a load refused for zones it cannot size says where, how much and why ----------------------------
+    // The line names the device, each zone's need and have, the shortfall of every short zone and only theirs, the
+    // reason, and what to free. The zones are planned at the load's fixed shape, so it offers no smaller -c or -ub.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_arena_refusal;
+        using ggml_sycl::zone_arena_refusal_reason;
+        using ggml_sycl::zone_arena_refusal_text;
+
+        const auto has = [](const std::string & text, const char * part) {
+            return text.find(part) != std::string::npos;
+        };
+
+        zone_arena_refusal held;
+        held.reason          = zone_arena_refusal_reason::REBUILD_HELD;
+        held.device          = 1;
+        held.need            = { 512 * MiB, 300 * MiB, 1985 * MiB };
+        held.have            = { 512 * MiB, 256 * MiB, 1792 * MiB };
+        const std::string hl = zone_arena_refusal_text(held);
+        CHECK(hl.rfind("[SYCL-PLAN] model load refused on device 1: ", 0) == 0, "the refusal does not name its device");
+        CHECK(has(hl, "SCRATCH need 512.0 MB have 512.0 MB, ONEDNN"), "a zone that fits is not named, or is short");
+        CHECK(has(hl, "ONEDNN need 300.0 MB have 256.0 MB (44.0 MB short)"), "the ONEDNN need, have or shortfall");
+        CHECK(has(hl, "RUNTIME need 1985.0 MB have 1792.0 MB (193.0 MB short)"), "the RUNTIME need, have or shortfall");
+        CHECK(has(hl, "hold the arena") && has(hl, "Free that model or context"), "a held arena's remedy is not named");
+        CHECK(!has(hl, "-ub") && !has(hl, "-c ") && !has(hl, "ubatch"), "the refusal offers a smaller -c or -ub");
+        CHECK(!hl.empty() && hl.back() != '\n', "the refusal text carries its own newline");
+
+        zone_arena_refusal reserve = held;
+        reserve.reason             = zone_arena_refusal_reason::RESERVE_FAILED;
+        reserve.have               = {};
+        const std::string rl       = zone_arena_refusal_text(reserve);
+        CHECK(has(rl, "RUNTIME need 1985.0 MB have 0.0 MB (1985.0 MB short)"), "a reserve failure's need or have");
+        CHECK(has(rl, "could not reserve") && has(rl, "Free VRAM on device 1"), "a reserve failure's remedy");
+        CHECK(!has(rl, "hold the arena"), "a reserve failure blames holders");
+
+        zone_arena_refusal no_cache;
+        no_cache.reason      = zone_arena_refusal_reason::NO_CACHE;
+        no_cache.device      = 0;
+        const std::string nl = zone_arena_refusal_text(no_cache);
+        CHECK(has(nl, "refused on device 0: ") && has(nl, "no unified cache"), "a missing cache is not named");
+
+        CHECK(zone_arena_refusal_text(zone_arena_refusal{}).empty(), "a refusal with no reason printed a line");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

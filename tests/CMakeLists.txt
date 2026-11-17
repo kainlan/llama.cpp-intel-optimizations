@@ -4678,6 +4678,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for a model load whose plan the arena's zones cannot hold: it is refused, never aborted. No GGML_ABORT on
+# the load's plan path; both zone ensures log the refusal line (each zone's need and have) and return false; each
+# planner entry reports the refusal and the stage returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED; a failed load puts back
+# the device-wide terms it published. test-zone-sizing Case 38 checks the line's text. Host-only, reads the sources as
+# text. Same registration shape as test-sycl-raw-gate-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-load-zone-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-load-zone-refusal-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Jinja fallback for a model whose chat template the built-in matcher does not know (Gemma 4 failed after the load with
 # "try using --jinja"): upstream turns the jinja engine off for llama-completion and llama-mtmd-cli.
 # test-chat-need-jinja checks common_chat_templates_need_jinja() itself. It loads no model, so it keeps the default

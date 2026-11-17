@@ -525,6 +525,11 @@ bool zone_arena_rebuild_allowed(const zone_arena_holders & holders) {
     return holders.live_zone_bytes == 0 && holders.chunk_leases == 0 && holders.scratch_in_arena == 0;
 }
 
+std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {
+    (void) refusal;
+    return {};
+}
+
 // A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about
 // linearly with the micro-batch), rounded up. Unchanged when either micro-batch is unknown, they are equal, or the
 // request is 0; SIZE_MAX when the product overflows. The hold-spill fit's one estimator for a compute buffer at a
