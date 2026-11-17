@@ -12,14 +12,16 @@ read:
   before a zone is tried, so a request an arena zone serves never meets the gate;
 - the figure is physical: the device total, arena_total_size(), the raw rows of the registry and the recorded term,
   never a zone counter, the cache's used bytes, its budget or a live driver free reading;
-- with an arena active a refusal evicts nothing (evicting cached weights frees nothing outside the reservation); only
-  with no arena, where cached weights are raw rows, does the gate evict and look again; a hold-induced spill is
-  refused at ERROR without evicting;
+- with an arena active a refusal evicts nothing (the plan placed the weights; a raw request it made no room for does not
+  trade them away); only with no arena does the gate evict, and it then reads its figure again before it compares; a
+  hold-induced spill is refused at ERROR without evicting, and is counted as a raw hold spill only once its raw
+  allocation is made;
 - both device-pool chunk sites use the same gate;
 - the term outside this process's accounting is written at one site, once per device, from the reading that sizes the
   first arena reservation, and read only by the gate's figure; only the pure helpers and the two log lines read it;
 - a refusal names the request, the arena, the raw rows, the term, the device total and what fits; the figure is
-  printed once per device at INFO.
+  printed at INFO once per device per arena size, so a line printed before the arena existed is printed again;
+- the memory design doc describes the raw gate, and no source still names the overcommit guard it replaced.
 
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live
 inside test_*() functions. Checks read COMMENT-STRIPPED, whitespace-normalised text. Each check has a mutation witness
@@ -35,6 +37,8 @@ UC = (SYCL / "unified-cache.cpp").read_text()
 UH = (SYCL / "unified-cache.hpp").read_text()
 DP = (SYCL / "device-pool.hpp").read_text()
 BACKEND = (SYCL / "ggml-sycl.cpp").read_text()
+DOC = (ROOT / "docs/backend/sycl-memory-design.md").read_text()
+E2E = (ROOT / "tests/test-sycl-unified-memory-e2e.cpp").read_text()
 
 _LEXEME_RE = re.compile(
     r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
@@ -195,6 +199,17 @@ def claim_arena_trip_evicts_nothing(uc: str) -> bool:
     )
 
 
+def claim_no_arena_eviction_reads_the_figure_again(uc: str) -> bool:
+    # Eviction frees raw rows the figure counted, so the comparison after it must use a fresh reading: against the
+    # figure read before the eviction, a request the eviction made room for is still refused.
+    gate = fn_body(code(uc), GATE_SIG)
+    arena_off = "if (cache && !cache->arena_active()) {"
+    off_block = block_at(gate, gate.find(arena_off)) if arena_off in gate else ""
+    evict_at = off_block.find("evict_and_flush(")
+    reread_at = off_block.find("in = unified_cache_raw_gate_inputs(req.device, *req.queue);")
+    return 0 <= evict_at < reread_at < off_block.find("zone_raw_gate_fits(in, alloc_size)")
+
+
 def claim_pool_sites_use_the_gate(dp: str) -> bool:
     d = code(dp)
     if "unified_cache_total_available_bytes" in d:
@@ -275,7 +290,14 @@ def claim_refusal_names_every_figure(uc: str) -> bool:
     )
 
 
-def claim_figure_is_logged_once_at_info(uc: str) -> bool:
+FIGURE_PRINTED_RE = re.compile(
+    r"const size_t (\w+) = in\.arena_bytes \+ 1; "
+    r"if \(raw_gate_figure_arena_printed\[device\]\.load\(std::memory_order_relaxed\) == \1 \|\| "
+    r"raw_gate_figure_arena_printed\[device\]\.exchange\(\1, std::memory_order_relaxed\) == \1\) \{ return; \}"
+)
+
+
+def claim_figure_is_logged_once_per_arena_size(uc: str) -> bool:
     c = code(uc)
     figure, gate, admits = fn_body(c, FIGURE_SIG), fn_body(c, GATE_SIG), fn_body(c, ADMITS_SIG)
     if not (figure and gate and admits):
@@ -283,10 +305,48 @@ def claim_figure_is_logged_once_at_info(uc: str) -> bool:
     log_first = all(
         0 <= g.find("unified_cache_raw_gate_log_figure_once(") < g.find("zone_raw_gate_fits(") for g in (gate, admits)
     )
+    printed = FIGURE_PRINTED_RE.search(figure)
+    info = re.search(r'GGML_LOG_INFO\( ?"\[RAW-GATE\]', figure)
+    # one relaxed load and compare when the arena term is the one last printed; a new term is claimed and printed
+    return printed is not None and info is not None and printed.start() < info.start() and log_first
+
+
+RAW_HOLD_NOTE_RE = re.compile(r"unified_cache_note_planned_hold_spill\([^;]*\bfalse\);")
+RAW_HOLD_IF = "if (ptr && hold_spill) {"
+
+
+def claim_raw_hold_spill_noted_after_the_raw_allocation(uc: str) -> bool:
+    ua = fn_body(code(uc), UA_SIG)
+    exit_block = block_at(ua, ua.find(RAW_EXIT)) if RAW_EXIT in ua else ""
+    notes = list(RAW_HOLD_NOTE_RE.finditer(ua))
+    if not exit_block or len(notes) != 1:
+        return False
+    held = block_at(exit_block, exit_block.find(RAW_HOLD_IF)) if RAW_HOLD_IF in exit_block else ""
+    note = notes[0].group(0)
+    # the one raw hold-spill note sits after the raw allocation, under a check that the allocation was made
+    return note in held and 0 <= exit_block.find(GATE_CALL) < exit_block.find(TRACKED_MALLOC) < exit_block.find(
+        RAW_HOLD_IF
+    )
+
+
+# What the memory design doc must say about the raw gate, and the present-tense text of the guard it replaced.
+DOC_GATE_TERMS = (
+    "unified_alloc_raw_gate",
+    "unified_cache_raw_gate_admits",
+    "zone-raw-gate.hpp",
+    "arena_total_size()",
+    "unified_cache_raw_device_held_bytes",
+    "outside this process's accounting",
+    "[RAW-GATE]",
+)
+DOC_STALE = ("before the overcommit guard", "the overcommit guard in `unified_alloc`")
+
+
+def claim_docs_describe_the_raw_gate(doc: str, uc: str, backend: str, e2e: str) -> bool:
     return (
-        re.search(r'GGML_LOG_INFO\( ?"\[RAW-GATE\]', figure) is not None
-        and "raw_gate_figure_logged[device].exchange(true)" in figure
-        and log_first
+        all(t in doc for t in DOC_GATE_TERMS)
+        and not any(s in doc for s in DOC_STALE)
+        and all("overcommit guard" not in src for src in (uc, backend, e2e))
     )
 
 
@@ -307,8 +367,15 @@ def test_figure_is_physical():
 
 def test_arena_trip_evicts_nothing():
     assert claim_arena_trip_evicts_nothing(UC), (
-        "a raw gate evicts cached weights with an arena active (they sit in the reservation, so evicting frees nothing "
-        "outside it), or a hold-induced spill is not refused at ERROR before any eviction"
+        "a raw gate evicts cached weights with an arena active (the plan placed them, and a raw request it made no "
+        "room for does not trade them away), or a hold-induced spill is not refused at ERROR before any eviction"
+    )
+
+
+def test_no_arena_eviction_reads_the_figure_again():
+    assert claim_no_arena_eviction_reads_the_figure_again(UC), (
+        "with no arena, the raw gate does not read its figure again between evicting cached weights and comparing the "
+        "request, so it refuses against the figure from before the eviction"
     )
 
 
@@ -333,8 +400,25 @@ def test_refusal_names_every_figure():
     )
 
 
-def test_figure_is_logged_once_at_info():
-    assert claim_figure_is_logged_once_at_info(UC), "the raw gate's figure is not printed once per device at INFO"
+def test_figure_is_logged_once_per_arena_size():
+    assert claim_figure_is_logged_once_per_arena_size(UC), (
+        "the raw gate's figure is not printed at INFO once per device per arena size, behind one relaxed load and "
+        "compare of the arena term it last printed"
+    )
+
+
+def test_raw_hold_spill_noted_after_the_raw_allocation():
+    assert claim_raw_hold_spill_noted_after_the_raw_allocation(UC), (
+        "a hold-induced spill is counted as a raw hold spill before its raw allocation is made, so a spill the raw "
+        "gate refuses still raises the count, prints the raw-spill WARN and marks the epoch"
+    )
+
+
+def test_docs_describe_the_raw_gate():
+    assert claim_docs_describe_the_raw_gate(DOC, UC, BACKEND, E2E), (
+        "docs/backend/sycl-memory-design.md does not describe the raw-allocation gate (its two sites, its figure and "
+        "its term), or it or a source still names the overcommit guard the gate replaced"
+    )
 
 
 HOLD_IF = "if (hold_spill) {"
@@ -396,6 +480,13 @@ def test_witness_arena_trip_evicts():
 
 def test_witness_hold_spill_evicts():
     assert not claim_arena_trip_evicts_nothing(mutate_in_func(UC, GATE_SIG, HOLD_IF, "if (false) {"))
+
+
+def test_witness_no_arena_eviction_keeps_the_stale_figure():
+    evict = "cache->evict_and_flush(short_by);"
+    assert not claim_no_arena_eviction_reads_the_figure_again(
+        mutate_in_func(UC, GATE_SIG, evict + " in = unified_cache_raw_gate_inputs(req.device, *req.queue);", evict)
+    )
 
 
 def test_witness_pool_gate_evicts():
@@ -477,14 +568,45 @@ def test_witness_refusal_aborts():
     )
 
 
+FIGURE_IF = "if (raw_gate_figure_arena_printed[device].load("
+
+
 def test_witness_figure_at_debug():
-    assert not claim_figure_is_logged_once_at_info(mutate_in_func(UC, FIGURE_SIG, "GGML_LOG_INFO(", "GGML_SYCL_DEBUG("))
+    assert not claim_figure_is_logged_once_per_arena_size(
+        mutate_in_func(UC, FIGURE_SIG, "GGML_LOG_INFO(", "GGML_SYCL_DEBUG(")
+    )
 
 
 def test_witness_figure_every_request():
-    assert not claim_figure_is_logged_once_at_info(
-        mutate_in_func(UC, FIGURE_SIG, "raw_gate_figure_logged[device].exchange(true)", "false")
+    assert not claim_figure_is_logged_once_per_arena_size(
+        mutate_in_func(UC, FIGURE_SIG, FIGURE_IF, "if (false && raw_gate_figure_arena_printed[device].load(")
     )
+
+
+def test_witness_figure_once_whatever_the_arena():
+    assert not claim_figure_is_logged_once_per_arena_size(mutate_in_func(UC, FIGURE_SIG, "in.arena_bytes + 1;", "1;"))
+
+
+def test_witness_raw_hold_spill_noted_above_the_gate():
+    ua = fn_body(code(UC), UA_SIG)
+    held_at = ua.find(RAW_HOLD_IF)
+    assert held_at != -1, f"witness anchor {RAW_HOLD_IF!r} is not in {UA_SIG!r}"
+    held = RAW_HOLD_IF[:-2] + " " + block_at(ua, held_at)
+    note = RAW_HOLD_NOTE_RE.search(held)
+    assert note is not None, "witness anchor: no raw hold-spill note under the raw-allocation check"
+    moved = mutate_in_func(UC, UA_SIG, held, "")
+    moved = mutate_in_func(moved, UA_SIG, GATE_CALL, note.group(0) + " " + GATE_CALL)
+    assert not claim_raw_hold_spill_noted_after_the_raw_allocation(moved)
+
+
+def test_witness_docs_drop_the_gate():
+    assert not claim_docs_describe_the_raw_gate(
+        DOC.replace("unified_cache_raw_gate_admits", "unified_cache_pool_check"), UC, BACKEND, E2E
+    )
+
+
+def test_witness_source_names_the_old_guard():
+    assert not claim_docs_describe_the_raw_gate(DOC, UC + "\n// the overcommit guard refuses it\n", BACKEND, E2E)
 
 
 if __name__ == "__main__":

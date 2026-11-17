@@ -540,6 +540,10 @@ void test_clear_kv_placement_plan();
 bool test_moe_multi_gpu_for_executor();
 bool test_moe_multi_gpu_latch();
 bool test_moe_multi_gpu_wanted(const placement_plan & plan);
+// The stage's refusal of a cross-card expert plan, given whether the cards have a peer path, and the peer-path
+// answer the stage passes it for a set of devices, read from the device info's peer-link records.
+bool test_cross_card_expert_plan_refused(const placement_plan & plan, bool peer_path);
+bool test_cards_have_peer_path(const std::vector<int> & devices);
 void test_set_sycl_info_override(const ggml_sycl_device_info & info);
 void test_clear_sycl_info_override();
 // Forces the planner's XMX_TILED grouped-DPAS PP route predicate on or off (its env read is latched per process).

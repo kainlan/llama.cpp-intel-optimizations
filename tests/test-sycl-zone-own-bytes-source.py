@@ -9,6 +9,8 @@ unified_cache::zone_free():
 - no arm writes a zone counter itself (an allocator total stored, or a delta applied by hand): every write goes
   through zone_used_allocate() / zone_used_free() (zone-used-count.hpp), which move a counter by exactly the
   allocator's delta for that one operation, and test-zone-sizing Case 34 checks that arithmetic;
+- every charge in zone_alloc(), and every rollback of one, moves the counter of the zone the caller asked for, which is
+  the zone arena_record_allocation_locked() records for the block, never another zone's counter;
 - a free lowers the counter of the zone the exact-allocation record names, which
   arena_unregister_exact_if_unleased_locked() reads from the record it unregisters, never the zone the caller names;
 - so a WEIGHT free writes no other zone's counter.
@@ -119,6 +121,51 @@ def call_args(text: str, start: int) -> str:
     return ""
 
 
+def top_level_args(args: str) -> list:
+    """`args` split at the commas outside any bracket, each part stripped."""
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(args):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(args[start:i].strip())
+            start = i + 1
+    parts.append(args[start:].strip())
+    return parts
+
+
+ALLOC_ZONE_DECL = "auto & z = arena_zones_[static_cast<int>(zone)];"
+# Where each helper takes its counter: zone_used_allocate(allocator, counter, ...), zone_used_free(..., counter).
+COUNTER_ARG = {"zone_used_allocate": 1, "zone_used_free": -1}
+
+
+def claim_alloc_charges_the_zone_it_records(uc: str) -> bool:
+    alloc = fn_body(code(uc), ALLOC_SIG)
+    charges = [
+        top_level_args(call_args(alloc, m.start()))[COUNTER_ARG[m.group(1)]]
+        for m in re.finditer(r"\b(zone_used_allocate|zone_used_free)\(", alloc)
+    ]
+    records = [
+        top_level_args(call_args(alloc, m.start()))[0]
+        for m in re.finditer(r"\barena_record_allocation_locked\(", alloc)
+    ]
+    return (
+        bool(alloc)
+        # z is the counter of the zone the caller asked for, and that zone is never rebound
+        and alloc.count("auto & z = ") == 1
+        and ALLOC_ZONE_DECL in alloc
+        and not re.search(r"(?<![\w.>])zone\s*=(?!=)", alloc)
+        # every charge and every rollback in every arm moves z, never another zone's counter ...
+        and "zone_used_allocate" in alloc
+        and all(counter == "z.used" for counter in charges)
+        # ... and every record names that same zone
+        and bool(records)
+        and all(zone == "zone" for zone in records)
+    )
+
+
 def claim_no_arm_writes_a_counter_itself(uc: str) -> bool:
     c = code(uc)
     bodies = (fn_body(c, ALLOC_SIG), fn_body(c, FREE_SIG))
@@ -181,6 +228,13 @@ def claim_arms_call_the_helper(uc: str) -> bool:
     )
 
 
+def test_alloc_charges_the_zone_it_records():
+    assert claim_alloc_charges_the_zone_it_records(UC), (
+        "a zone_alloc() arm charges or refunds a counter other than the one of the zone it was asked for, which is the "
+        "zone arena_record_allocation_locked() records: a KV charge for a WEIGHT block is the cross-zone count"
+    )
+
+
 def test_no_arm_writes_a_counter_itself():
     assert claim_no_arm_writes_a_counter_itself(UC), (
         "zone_alloc() or zone_free() writes a zone counter itself (an allocator total stored, or a delta applied by "
@@ -215,6 +269,18 @@ CHUNK_FREE = "zone_used_free(*target->allocator, chunk_off, " + RECORD_COUNTER +
 CHUNK_ROLLBACK = "zone_used_free(*wca.allocator, offset, z.used);"
 # What both arms did before each zone counted its own bytes: the allocator's total stored into the counter.
 TOTAL_STORE = " z.used.store(alloc->used(), std::memory_order_relaxed);"
+
+
+def test_witness_single_chunk_arm_charges_kv():
+    # the single-chunk arm's allocator is shared, so charging it to KV for every zone is the count this rule replaced
+    assert not claim_alloc_charges_the_zone_it_records(
+        mutate_in_func(
+            UC,
+            ALLOC_SIG,
+            "zone_used_allocate(*alloc, z.used,",
+            "zone_used_allocate(*alloc, arena_zones_[static_cast<int>(vram_zone_id::KV)].used,",
+        )
+    )
 
 
 def test_witness_alloc_stores_the_allocator_total():

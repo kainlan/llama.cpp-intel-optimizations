@@ -8706,6 +8706,14 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # compute_placement_plan and the one-budget delegation on the B70 alone, --devices 2 through
     # compute_multi_device_plan on both cards and exits 77 below two GPUs. The planner initialises SYCL and reads each
     # device's cache, so both carry the OOM-family labels and run alone. Lead-run.
+    #
+    # The two-card registrations here and in the lazy-plan-interface block set GGML_SYCL_MOE_MULTI_GPU=1: these arms
+    # only plan and stage across both cards, which for a fixture with experts is the opt-in path. The one-card
+    # registrations see one GPU, where the multi-device plan is off whatever the variable says, so they leave it unset.
+    string(CONCAT _lazy_two_card_env
+        "GGML_SYCL_MOE_MULTI_GPU=1;"
+        "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;"
+        "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
     add_executable(test-sycl-lazy-residency-plan
         tests/test-sycl-lazy-residency-plan.cpp)
     target_link_libraries(test-sycl-lazy-residency-plan PRIVATE
@@ -8722,7 +8730,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     add_test(NAME test-sycl-lazy-residency-plan-2dev COMMAND test-sycl-lazy-residency-plan --devices 2)
     set_tests_properties(test-sycl-lazy-residency-plan-2dev PROPERTIES
         LABELS "sycl;host;cache;mem-handle;gpu-serial"
-        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        ENVIRONMENT "${_lazy_two_card_env}"
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         TIMEOUT 300)
@@ -8753,7 +8761,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     add_test(NAME test-sycl-lazy-plan-interface-2dev COMMAND test-sycl-lazy-plan-interface --devices 2)
     set_tests_properties(test-sycl-lazy-plan-interface-2dev PROPERTIES
         LABELS "sycl;host;cache;mem-handle;gpu-serial"
-        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        ENVIRONMENT "${_lazy_two_card_env}"
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         TIMEOUT 300)
@@ -8792,7 +8800,11 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # the one executable, which passes only when that line appears. The mutant registrations carry no SKIP_RETURN_CODE:
     # ctest honours a skip code before the regex, so a mutant run that VOIDs with exit 77 would read as skipped with its
     # kill line never checked. A mutant run has no legitimate skip, so without the code that run fails.
+    #
+    # The environment sets GGML_SYCL_MOE_MULTI_GPU=1 for this binary and the reap-points one, mutants included: these
+    # arms only plan and stage across both cards, which for a fixture with experts is the opt-in path.
     string(CONCAT _lazy_ring_env
+        "GGML_SYCL_MOE_MULTI_GPU=1;"
         "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;"
         "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
     string(CONCAT _lr_re_no_span_check

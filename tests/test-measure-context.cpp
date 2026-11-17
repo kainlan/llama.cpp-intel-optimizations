@@ -469,7 +469,7 @@ static void check_run_paths() {
             llama_load_measure_run(model, args, procs, 512, 7, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, 3);
         CHECK(!r.ok && !r.unsupported, "a refused install is not a plain refusal");
         CHECK(
-            r.refusal == "[LOAD-PLAN] compute-slot measure failed at late on device 3: plan override nested (refused)",
+            r.refusal == "[LOAD-PLAN] compute-slot measure failed at late on device 3: plan override refused (refused)",
             "refusal text: %s", r.refusal.c_str());
         CHECK(g_run_installs == 1 && g_run_clears == 0, "refused install: %d installs, %d clears", g_run_installs,
               g_run_clears);

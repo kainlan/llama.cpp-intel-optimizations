@@ -4770,6 +4770,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# With GGML_SYCL_MOE_MULTI_GPU=1 and no peer path between the cards, the load stage refuses a plan that puts experts
+# on a second card, at both of its refusal sites, before the lazy-plan refusal, with the plan-rejected return and an
+# ERROR line naming the remedy. Source-only; the predicate and the peer-path read run in
+# test-sycl-measure-plan-override.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-cross-card-expert-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cross-card-expert-refusal-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # The batched MoE prompt executor lays its activation and output scratch out per GEMM group
 # (moe_pp_pack_gemm_groups), and the gather, both GEMM arms and the scatter take every offset into that scratch from
 # one helper each, so they cannot disagree about where an expert's rows are. Source-only; the layout itself runs in

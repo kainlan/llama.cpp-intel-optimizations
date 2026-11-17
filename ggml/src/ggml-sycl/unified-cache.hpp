@@ -2779,8 +2779,9 @@ size_t unified_cache_get_hold_rung_requests(int device_id, uint64_t owner, zone_
 // scheduler compute buffers (rows made by a request flagged as one, by origin: the rung's own bytes, which the
 // realized check credits back). One registry pass, so the two figures are consistent with each other.
 size_t       unified_cache_raw_device_held_bytes(int device_id, size_t * compute_live);
-// The figure the raw-allocation gates compare for a device (zone-raw-gate.hpp): the device total, the arena reservation,
-// the raw rows above, and the bytes in use outside this process's accounting when the device's first cache was made.
+// The figure the raw-allocation gates compare for a device (zone-raw-gate.hpp): the device total, the arena
+// reservation, the raw rows above, and the bytes in use outside this process's accounting when the device's first
+// cache was made.
 zone_raw_gate_inputs unified_cache_raw_gate_inputs(int device, sycl::queue & queue);
 // The card's free memory WITHOUT the rung's own compute buffers, from the ledger and never a driver read after a
 // release. A window's baseline (the free memory with no raw cache allocation held: `driver_free_now` plus the raw

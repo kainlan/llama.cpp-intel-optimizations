@@ -172,7 +172,11 @@ class sycl_device_pool {
         }
         const size_t backing_size = chunk_size + align;
 
-        // A new chunk is raw device memory outside the arena: it must fit in what the device has left beside it.
+        // A new chunk is raw device memory outside the arena: it must fit in what the device has left beside it. The
+        // chunk meets the same figure again inside device_pool_alloc_chunk (unified_alloc's raw gate). The pool asks
+        // first on purpose, and neither gate is a duplicate of the other: asked here, a chunk that does not fit is
+        // refused before the queue drains below, and it never reaches unified_alloc's gate, which without an arena
+        // evicts cached weights to make room.
         if (device_id_ >= 0 &&
             !unified_cache_raw_gate_admits(device_id_, queue_, backing_size, "a device-pool chunk")) {
             return {};
@@ -300,6 +304,7 @@ class sycl_device_pool {
         }
         const size_t chunk_size   = default_chunk_size_;
         const size_t backing_size = chunk_size + 256;
+        // Asked before the drain, for the same reasons as a new chunk in allocate().
         if (device_id_ >= 0 &&
             !unified_cache_raw_gate_admits(device_id_, queue_, backing_size, "a device-pool pre-grow chunk")) {
             return 0;

@@ -3057,10 +3057,10 @@ shortfall, because growth allocates the replacement while the old backing is liv
 consumer itself (the ring, the planned scratch) and is the claimant the hold exists for, so it is never held back.
 *Held back* means the hold is what keeps the request out: `hold > 0`, the zone alone could have served it
 (`size <= free`), and the hold refuses it (`zone_runtime_alloc_held_back`, tested on the host). A request larger than the
-zone's free bytes is an ordinary zone-full spill whatever the hold is, and keeps exactly its pre-kpjw path, eviction
-included. (The first version of the predicate was true for any request the zone could not serve, so it refused ordinary
-spills the overcommit guard used to resolve by evicting, logged a false "held back ... (hold 0.0 MB)" and inflated the
-counts; review r2 F1.)
+zone's free bytes is an ordinary zone-full spill whatever the hold is, and keeps exactly its pre-kpjw path to the raw
+exit and its raw-allocation gate. (The first version of the predicate was true for any request the zone could not
+serve, so it refused ordinary spills the overcommit guard used to resolve by evicting, logged a false "held back ...
+(hold 0.0 MB)" and inflated the counts; review r2 F1.)
 The hold is per device, published by the context that owns the buffers
 (`ggml_sycl_planned_scratch_hold_refresh()`) with that context recorded as its owner, falls as the graph-entry walks
 bring each buffer to its plan, and is released by the same context's teardown (`unified_cache_release_planned_scratch_hold`
@@ -3089,11 +3089,11 @@ buffer is the one that moves. It used to move to raw device memory outside the a
 lives (B50, Qwen PPL at auto-ub1024: a 461 MB buffer held back, 107.8 MB left against 256 MB, flash attention out of
 resources). The buffer allocator now marks its request (`alloc_constraints::spill_to_kv_zone_before_raw`), and
 `unified_alloc` places such a request, when the zone will not serve it (held back by the hold, or larger than the zone's
-free bytes), in the KV zone before the overcommit guard and before anything raw
-(`zone_runtime_spill_prefers_kv_zone`, host-tested). The attempt is ahead of the guard on purpose: an in-arena placement
-is memory the arena already reserved, so it cannot overcommit the device and must not evict cached weights. Only that
-request class takes the path; a forbid-spill claimant is still refused, and any other RUNTIME request keeps the previous
-spill path unchanged. Raw device memory is the last resort, taken only when the KV zone cannot hold the buffer whole.
+free bytes), in the KV zone before anything raw (`zone_runtime_spill_prefers_kv_zone`, host-tested). An in-arena
+placement is memory the arena already reserved, so it never reaches the raw-allocation gate at the raw exit (below) and
+never evicts cached weights. Only that request class takes the path; a forbid-spill claimant is still refused, and any
+other RUNTIME request keeps the previous spill path unchanged. Raw device memory is the last resort, taken only when the
+KV zone cannot hold the buffer whole.
 
 Only a scheduler compute buffer is marked. The same buffer type backs the model's WEIGHT tensors, which are allocated
 during the model load, before any KV cache exists; one of them sent to the KV zone would take room this context's KV is
@@ -3104,7 +3104,8 @@ step must stay unreachable for this class). Only the unflagged class (a model lo
 
 A compute buffer the RUNTIME zone did not serve is not silent, and is counted by where it landed: in the KV zone because
 the hold kept it out (`unified_cache_note_planned_hold_spill`, in-arena), in the KV zone because the zone was simply full
-(`unified_cache_note_zone_full_kv_placement`), or RAW (outside the arena, which is what eats the headroom). The first
+(`unified_cache_note_zone_full_kv_placement`), or RAW (outside the arena, which is what eats the headroom; counted at
+the raw exit once the raw allocation is made, so a spill the raw gate refuses is not one). The first
 one of each kind per context is a WARN naming the requester tag and the bytes; the counts are taken at teardown and
 printed as `hold_spills_raw` / `hold_spills_kv_zone` / `hold_spills_kv_zone_full` (with bytes) in the `[SCRATCH-STATS]`
 line, whichever of the three is non-zero. The counters restart at every publish, so the figures a finished context
@@ -3115,9 +3116,41 @@ a throughput difference between two builds can be attributed to where
 a buffer physically sits. A buffer the arena placed is logged where it is placed; one nothing in the arena placed is
 placed by the legacy path in the allocator, which logs the buffer it makes, so the line names the FINAL landing (raw
 device memory, or host-pinned) and never `none` for a buffer that then lives somewhere. A raw
-spill cannot evict weights: the overcommit guard in `unified_alloc` runs for every raw device request, and for a
-hold-induced one it refuses loudly instead of calling `evict_and_flush` (trading a planned buffer's reservation for the
-model's own weights is not a trade the hold may make).
+spill cannot evict weights: it meets the raw-allocation gate at `unified_alloc`'s raw exit (next paragraph), which with
+an arena never evicts, and a hold-induced spill that does not fit is refused at ERROR instead of calling
+`evict_and_flush` (trading a planned buffer's reservation for the model's own weights is not a trade the hold may make).
+
+*The raw-allocation gate.* Device memory outside the arena is checked against the device's physical bytes, not against
+zone counters, which say how full the arena is and not how much of the device is taken. The figure
+(`zone-raw-gate.hpp`, host-tested by `test-zone-sizing` Case 35) is what fits outside the arena: the device total, less
+the arena reservation (`arena_total_size()`; the reservation is committed whole when the arena is made, on one chunk or
+N), less the raw device rows the runtime registry holds outside it (`unified_cache_raw_device_held_bytes`, a walk of
+the registry), less the bytes in use outside this process's accounting when the device's first cache was made. That
+last term is recorded once per device in `create_cache_for_device`, from the free and total reading that sizes the
+first reserve, with no driver query of its own: the bytes the reading shows in use less the raw rows already
+registered, 0 when the reading has no total or free figure. It is a snapshot; if another process frees memory later it
+overstates what is taken and the gate refuses early, the safe direction, so it is never re-read. A device total of 0
+means the total is unknown, and the gate then gates nothing. Two places ask it. `unified_alloc`'s one raw exit asks
+`unified_alloc_raw_gate` before `unified_cache_malloc_device_tracked`; a request an arena zone serves never gets there.
+With an arena active, a request that does not fit is refused by name and nothing is evicted: the plan placed the
+weights, and a raw request the device has no room for is one the plan did not make room for. With no arena it evicts
+what the request is short of (`evict_and_flush`), reads the figure again, and refuses if it still does not fit. The
+device pool's new-chunk and pre-grow sites ask `unified_cache_raw_gate_admits` (`device-pool.hpp`) for their whole
+backing size; pool growth is gated, not forbidden, and evicts nothing. The cache's own raw exits for its entries
+(`ensure_cached`, `allocate(tag)`) do not ask the gate. A refusal is never an abort and never a fallback to another
+tier: it is a WARN (DEBUG when the caller suppresses its failure log; ERROR for the hold-induced spill above) naming the
+request, what fits, the device total, the arena, the raw rows outside the arena and the term outside this process's
+accounting. The figure prints at INFO as `[RAW-GATE] device N: arena ... vs device ...` once per device per arena size,
+so a line printed by a raw request before the arena was reserved is printed again after it is. Locks:
+`g_cache_rw_mutex` (L4) for the cache lookup, then `g_runtime_alloc_mutex` (L5) for the walk, one at a time, except
+that the first raw request on a device, whose lookup creates the cache, takes L5 under L4 exclusive for the
+outside-accounting note (the L4-before-L5 order). Source pin: `tests/test-sycl-raw-gate-source.py`.
+
+Only requests that leave through the raw driver exit reach the gate; on the default paths those are grow-only caches
+and staging buffers, a handful per process. The registry walk is therefore paid beside a driver allocation, not per
+token. A caller that reaches the gate per op is paying a driver allocation per op: that is the defect to fix at that
+caller, not a reason to make the figure cheaper.
+
 *One fit, asked three times (`llama.cpp-kpjw`).* Whether a rung's hold-induced spill leaves the driver its headroom is a
 single fact, and it has a single function: `ggml_sycl_hold_spill_fit` (ggml-sycl.cpp), the composition of
 `zone_hold_fit_inputs` and `zone_hold_fit` (zone-sizing.hpp, host-tested). It is asked by three callers and by nobody
@@ -3484,6 +3517,17 @@ shared zone, and the buffer took whatever the allocator found. On the B70 with Q
   record WARNs `late state check on device N: no state term was recorded`, because that state is allocated in RUNTIME
   unplanned. A device whose late state is zero is not asked, so a state that leaves a device entirely gives no shrink
   WARN. The loader prints `state term on device N` on its own line beside the compute-slot line.
+
+**A load with no plan at a stage.** A stage measures only when the backend has a plan staged for it:
+`llama_load_measure_run` asks `ggml_backend_sycl_measure_plan_staged`, which reads the install's own lookup, before it
+builds the plan override, and a stage with none is unsupported, not refused. Three loads stage no probe plan. A model
+built in memory with `llama_model_init_from_user` has an empty `weights_map`, and its weights exist only after
+`create_tensor`, so the early pass has nothing to plan. A `no_alloc` load skips the early pass. A load with the VRAM
+arena off stages an explicit no-plan row, which is no plan. Their probe is skipped with a WARN, so no compute or state
+term is reserved and the admitted stage does not run. The late plan still places the in-memory model's weights, from
+`ctx_map`, and its late check measures that plan and WARNs that no early compute term was recorded. A `no_alloc` load
+stages no late plan and an arena-off load stages another no-plan row, so their late check is skipped with a WARN as
+well. For all three the compute buffer is not planned at load.
 
 **Invariant: every RUNTIME-first consumer at context time is named in the reserve.** The real context allocates
 some memory in the RUNTIME zone first, after the load and before its compute buffer. Each such consumer needs a planned

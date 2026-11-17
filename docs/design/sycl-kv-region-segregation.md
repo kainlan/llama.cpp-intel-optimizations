@@ -476,6 +476,8 @@ that enforces the principle and the check that shows it.
    The only guard in front of it is the physical-VRAM overcommit check
    (`unified-cache.cpp:14963-15018`). That check uses `unified_alloc_total_vram`, not the
    PCT budget.
+   Later note: the raw-allocation gate has since replaced that check and never evicts with an
+   arena active (`docs/backend/sycl-memory-design.md`, *The raw-allocation gate*).
 7. **The mismatch backstop cannot see it.** `kv_admission_mismatch` compares byte totals
    (`ggml-sycl.cpp:38767`), and bytes agree.
 
@@ -7463,6 +7465,8 @@ L7 documents this limit, and pattern #2 remains the remedy.
     the carve enters `zone_alloc`'s locked branch directly, as the region carve does, and
     carving inside an arena reserved at load changes no physical VRAM figure, so the guard would
     have nothing to check. H7 gates both facts (§3.1 H7u).
+    Later note: the raw-allocation gate has since replaced that guard and never evicts with an
+    arena active (`docs/backend/sycl-memory-design.md`, *The raw-allocation gate*).
 
     It must be under L1 because the transaction body is: the carve's result is what the CAS
     publishes, and the CAS needs L1. With the re-fit restricted to this call's own ranges
