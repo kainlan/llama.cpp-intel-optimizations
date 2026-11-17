@@ -2185,6 +2185,7 @@ def test_planner_gate_check_has_a_mutation_witness():
     assert fn != -1, "mutation target not found -- update this witness to match the real source"
     target = ("    return ggml_sycl_info().total_gpu_count >= 2 && "
               "(!has_experts || ggml_sycl_moe_multi_gpu_requested());\n")
+    _assert_target_in_fn_body(_GATE_FN, target)
     at = raw.find(target, fn)
     assert at != -1, "mutation target not found -- update this witness to match the real source"
     mutated_raw = raw[:at] + "    return ggml_sycl_info().total_gpu_count >= 2;\n" + raw[at + len(target):]
@@ -2194,6 +2195,7 @@ def test_planner_gate_check_has_a_mutation_witness():
     fn = raw.find(_PLANNER_FN)
     assert fn != -1, "mutation target not found -- update this witness to match the real source"
     target = "    if (ggml_sycl_plan_multi_device(is_moe)) {\n"
+    _assert_target_in_fn_body(_PLANNER_FN, target)
     at = raw.find(target, fn)
     assert at != -1, "mutation target not found -- update this witness to match the real source"
     mutated_raw = raw[:at] + "    if (info.total_gpu_count >= 2) {\n" + raw[at + len(target):]
@@ -2270,29 +2272,42 @@ def _mutant(signature: str, target: str, replacement: str) -> str:
     return _normalize_ws(strip_comments(raw[:at] + replacement + raw[at + len(target):]))
 
 
+def _assert_target_in_fn_body(signature: str, target: str) -> None:
+    """A witness must mutate the function it names. A search that starts at the signature but is not bounded by the
+    function's end can match the same text in an unrelated function far below, and then mutates nothing it tests."""
+    raw = GGML_SYCL_CPP
+    fn = raw.find(signature)
+    assert fn != -1, "mutation target not found -- update this witness to match the real source"
+    body = _brace_block(raw, raw.index("{", fn))
+    assert target in body, f"mutation target {target!r} is not inside {signature!r} -- update this witness"
+
+
 def test_expert_opt_in_default_on_has_a_mutation_witness():
     """The old default-on body must fail the check."""
-    mutated = _mutant("static bool ggml_sycl_moe_multi_gpu_requested() {",
-                      "env != nullptr && std::atoi(env) != 0;",
-                      "(!env || std::atoi(env) != 0);")
+    signature = "static bool ggml_sycl_moe_multi_gpu_requested() {"
+    target = "env != nullptr && std::atoi(env) != 0;"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, "(!env || std::atoi(env) != 0);")
     with pytest.raises(AssertionError, match="must be opt-in"):
         _assert_expert_path_is_opt_in(mutated)
 
 
 def test_dense_plan_reading_the_opt_in_has_a_mutation_witness():
     """The old plan gate, where the dense split depends on the expert opt-in, must fail the check."""
-    mutated = _mutant("static bool ggml_sycl_plan_multi_device(bool has_experts) {",
-                      "(!has_experts || ggml_sycl_moe_multi_gpu_requested());",
-                      "ggml_backend_sycl_moe_multi_gpu_requested();")
+    signature = "static bool ggml_sycl_plan_multi_device(bool has_experts) {"
+    target = "(!has_experts || ggml_sycl_moe_multi_gpu_requested());"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, "ggml_backend_sycl_moe_multi_gpu_requested();")
     with pytest.raises(AssertionError, match="must branch on"):
         _assert_planner_branches_on_the_gate(mutated)
 
 
 def test_second_gate_copy_has_a_mutation_witness():
     """A fourth read of the variable, a new copy of the gate, must fail the check."""
-    mutated = _mutant("bool ggml_backend_sycl_moe_multi_gpu_requested() {",
-                      "return ggml_sycl_moe_multi_gpu_requested();",
-                      'return std::getenv("GGML_SYCL_MOE_MULTI_GPU") != nullptr;')
+    signature = "bool ggml_backend_sycl_moe_multi_gpu_requested() {"
+    target = "return ggml_sycl_moe_multi_gpu_requested();"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, 'return std::getenv("GGML_SYCL_MOE_MULTI_GPU") != nullptr;')
     with pytest.raises(AssertionError, match="exactly 3 places|return the opt-in predicate"):
         _assert_expert_path_is_opt_in(mutated)
 

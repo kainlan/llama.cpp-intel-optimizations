@@ -8745,18 +8745,19 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                     "(tried %d devices)\n",
                     total_gpus - 1);
             }
+        } else if (total_gpus >= 2 && !multi_gpu_requested) {
+            // A warning, so a default two-card run of a model with experts says that the second card holds none.
+            GGML_LOG_WARN("[MOE-MULTI-GPU] Disabled: cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1)\n");
         } else if (!multi_gpu_on) {
             GGML_LOG_INFO("[MOE-MULTI-GPU] Disabled: %s\n",
-                          total_gpus >= 2 && !multi_gpu_requested ?
-                              "cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1)" :
-                              (plan_known && !plan_needs_secondary ?
-                                   "planner placed all executable handles on primary" :
-                                   (!plan_known && multi_gpu_requested ?
-                                        "waiting for unified-cache placement plan" :
-                                        (total_gpus >= 2 ? "multi-GPU unavailable" :
-                                                           "single GPU detected "
-                                                           "(use ONEAPI_DEVICE_SELECTOR=\"level_zero:0,1\" "
-                                                           "for dual GPU)"))));
+                          plan_known && !plan_needs_secondary ?
+                              "planner placed all executable handles on primary" :
+                              (!plan_known && multi_gpu_requested ?
+                                   "waiting for unified-cache placement plan" :
+                                   (total_gpus >= 2 ? "multi-GPU unavailable" :
+                                                      "single GPU detected "
+                                                      "(use ONEAPI_DEVICE_SELECTOR=\"level_zero:0,1\" "
+                                                      "for dual GPU)")));
         }
     }
 
@@ -17864,6 +17865,9 @@ static bool ggml_sycl_plan_multi_device(bool has_experts) {
 }
 
 // The same answer for the model the inventory registered, read from the global the planner reads.
+// Its limit: the expert count is a load-time global, so this answers for the model whose load ran most recently,
+// the same fact the planner reads. With two models live, a tuning-cache key built from it describes the last model
+// loaded, not necessarily the context's own model.
 bool ggml_sycl_multi_device_plan_for_loaded_model() {
     return ggml_sycl_plan_multi_device(g_moe_n_experts_total > 0);
 }
