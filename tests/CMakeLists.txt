@@ -4613,6 +4613,22 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Jinja fallback for a model whose chat template the built-in matcher does not know (Gemma 4 failed after the load with
+# "try using --jinja"): upstream turns the jinja engine off for llama-completion and llama-mtmd-cli.
+# test-chat-need-jinja checks common_chat_templates_need_jinja() itself. It loads no model, so it keeps the default
+# label, and it sits outside any Python or SYCL guard so every build with tests registers it.
+llama_build_and_test(test-chat-need-jinja.cpp)
+
+# Source gate for the same fallback: it pins common_chat_templates_need_jinja() and the one place each of
+# llama-completion and llama-mtmd-cli decides the engine. Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-completion-jinja-fallback-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-completion-jinja-fallback-source.py
+        LABEL "python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-ii25: source gate for the runtime allocation registry's containment index: g_runtime_alloc_registry is
 # mutated only through the helpers that keep the index in step, a row's geometry is never rewritten, neither object
 # leaves unified-cache.cpp, and unified_lookup_runtime_allocation() queries the index instead of scanning. The index

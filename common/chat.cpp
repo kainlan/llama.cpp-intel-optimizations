@@ -754,6 +754,10 @@ std::string common_chat_templates_source(const struct common_chat_templates * tm
     return tmpls->template_default->source();
 }
 
+bool common_chat_templates_need_jinja(const struct common_chat_templates * tmpls) {
+    return !common_chat_verify_template(common_chat_templates_source(tmpls), /* use_jinja= */ false);
+}
+
 common_chat_templates_ptr common_chat_templates_init(const struct llama_model * model,
                                                      const std::string &        chat_template_override,
                                                      const std::string &        bos_token_override,
