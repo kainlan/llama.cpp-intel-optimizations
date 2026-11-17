@@ -1418,6 +1418,14 @@ def mutants(files):
            edit(files, M, "GGML_LOG_ERROR(\"[CONTEXT-PLAN-BUG] measure plan override nested\\n\");",
                 "GGML_LOG_ERROR(\"measure plan override nested\\n\");", "g36e"),
            "install lacks its nesting witness")
+    yield ("install's no-plan refusal downgraded to a WARN",
+           edit(files, M, "GGML_LOG_ERROR(\"[LOAD-PLAN] measure plan override: no plan staged for load",
+                "GGML_LOG_WARN(\"[LOAD-PLAN] measure plan override: no plan staged for load", "g36p"),
+           "refusal '[LOAD-PLAN] measure plan override: no plan staged for load' is not an ERROR")
+    yield ("install's KV re-fit refusal downgraded to a WARN",
+           edit(files, M, "GGML_LOG_ERROR(\"[LOAD-PLAN] measure plan override: the KV re-fit for load",
+                "GGML_LOG_WARN(\"[LOAD-PLAN] measure plan override: the KV re-fit for load", "g36q"),
+           "refusal '[LOAD-PLAN] measure plan override: the KV re-fit for load' is not an ERROR")
     yield ("install naming the provisional builder",
            edit(files, M, "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);",
                 "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);\n    (void) &ggml_sycl_make_provisional_plan_snapshot;", "g36f"),
