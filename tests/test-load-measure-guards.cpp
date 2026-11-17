@@ -99,7 +99,7 @@ static void test_guard() {
     {
         llama_measure_plan_override guard({ &fake_install, &fake_clear }, 1, GGML_SYCL_MEASURE_STAGE_PROBE, &shape);
         CHECK(!guard.installed(), "a refused install reads as installed");
-        CHECK(guard.failure() != nullptr && std::strcmp(guard.failure(), "plan override nested") == 0,
+        CHECK(guard.failure() != nullptr && std::strcmp(guard.failure(), "plan override refused") == 0,
               "the refusal is named %s", guard.failure() ? guard.failure() : "(null)");
     }
     CHECK(g_installs == 1 && g_clears == 0, "refused: %d installs, %d clears", g_installs, g_clears);

@@ -78,7 +78,9 @@ class llama_measure_plan_override {
             return;
         }
         if (!procs.install(load_txn, stage, kv_shape)) {
-            failure_text = "plan override nested";
+            // The backend refuses for a nest, for no plan staged at this stage, or for a KV re-fit
+            // that does not fit; its own error line names which.
+            failure_text = "plan override refused";
             return;
         }
         installed_ = true;

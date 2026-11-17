@@ -16026,7 +16026,7 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
                                                         ggml_sycl_measure_stage                   stage,
                                                         const struct ggml_sycl_measure_kv_shape * kv_shape) {
     if (g_measure_plan_override) {
-        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override nested\n");
+        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] measure plan override nested\n");
         if (ggml_sycl::ggml_sycl_strict_enabled()) {
             GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested");
         }
@@ -16043,8 +16043,8 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
             break;
     }
     if (!snapshot || !snapshot->plan) {
-        GGML_LOG_WARN("[LOAD-PLAN] measure plan override: no plan staged for load %llu at stage %d\n",
-                      (unsigned long long) load_txn, (int) stage);
+        GGML_LOG_ERROR("[LOAD-PLAN] measure plan override: no plan staged for load %llu at stage %s\n",
+                       (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage));
         return false;
     }
     if (kv_shape != nullptr) {
@@ -16053,7 +16053,7 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
             snapshot = ggml_sycl_measure_refit_kv(snapshot, *kv_shape, why);
         } catch (const ggml_sycl_fallback_error &) {
             // The alloc-zone contract's sanctioned form: ggml_sycl_fallback_error derives from std::exception, so it
-            // is caught first and rethrown, or the handler below would turn a planned refusal into a re-fit WARN.
+            // is caught first and rethrown, or the handler below would turn a planned refusal into a re-fit failure.
             // That makes this the one load-path export an exception can cross. The llama side would not name it:
             // llama_load_measure_run constructs its llama_measure_plan_override guard, which calls this export,
             // before the try around the measure context, so a crossing error would leave the run unnamed and fail
@@ -16066,7 +16066,7 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
             why = e.what();
         }
         if (!snapshot) {
-            GGML_LOG_WARN(
+            GGML_LOG_ERROR(
                 "[LOAD-PLAN] measure plan override: the KV re-fit for load %llu at the %s stage refused: %s\n",
                 (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage), why.c_str());
             return false;
@@ -34609,18 +34609,21 @@ static ggml_sycl_device_info ggml_sycl_init() {
         // where a Level Zero context spanning 2+ discrete Arc GPUs triggers
         // UR_RESULT_ERROR_DEVICE_LOST (error 20) at the first MUL_MAT.
         // See intel/compute-runtime#916 and #921.  The backend scheduler is
-        // collapsed to one visible compute device by default; planner-owned MoE
-        // expert parallelism, which is opt-in (GGML_SYCL_MOE_MULTI_GPU=1), uses
-        // separate single-device queues for secondary GPUs and stages
-        // cross-device data explicitly.
+        // collapsed to one visible compute device by default (a split ratio or
+        // tensor split keeps every device visible, so the text follows the same
+        // condition as the collapse above), but the planner still sees every
+        // card: it splits a model without experts over both, each card on its
+        // own single-device queue, and stages cross-device data explicitly.
+        // Only the cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1).
         if (info.total_gpu_count > 1) {
             GGML_LOG_WARN(
                 "[SYCL] WARNING: %d GPUs visible. Multi-GPU Level Zero contexts "
                 "trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). "
-                "Scheduler multi-GPU dense/KV placement is disabled by default; "
-                "planner-owned MoE expert dispatch uses isolated per-device queues "
-                "(opt-in: GGML_SYCL_MOE_MULTI_GPU=1).\n",
-                info.total_gpu_count);
+                "%s; the planner splits a model without experts over both cards; "
+                "the cross-card expert path is opt-in (GGML_SYCL_MOE_MULTI_GPU=1).\n",
+                info.total_gpu_count,
+                (split_ratio || tensor_split) ? "The scheduler sees every device (a device split was requested)" :
+                                                "The scheduler sees one compute device");
         }
     }
 
