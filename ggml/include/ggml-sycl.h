@@ -543,6 +543,8 @@ typedef struct ggml_sycl_host_create_record {
 // Direct calls retain legacy planning/late side effects; they do not guarantee
 // eager host-zone provisioning. The loader uses stage_load_inventory_plan(..., false)
 // to attempt that provisioning before buffer allocation, under lifecycle guards.
+// The stage's plan refusals (a lazy-table refusal, a cross-card expert plan with no peer path between the cards) are
+// not asked on this entry, and the model loader does not use it: only tests call it directly.
 GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t                            backend,
                                                              const struct ggml_sycl_tensor_inventory * inventory);
 
@@ -551,6 +553,9 @@ GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t     
 // Skips late-only side effects (layer-streaming setup, host-pinned pre-allocate)
 // that depend on state populated by create_tensor; those still run when
 // ggml_backend_sycl_set_tensor_inventory is called later.  Idempotent.
+// The stage's plan refusals (a lazy-table refusal, a cross-card expert plan with no peer path between the cards) are
+// not asked on this entry. The model loader reaches it only through ggml_backend_sycl_stage_load_inventory_plan(...,
+// true), which asks them once every device has planned; only tests call it directly.
 GGML_BACKEND_API void ggml_backend_sycl_compute_placement_plan_early(
     ggml_backend_t                            backend,
     const struct ggml_sycl_tensor_inventory * inventory);

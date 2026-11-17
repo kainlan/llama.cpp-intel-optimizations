@@ -3191,6 +3191,8 @@ static bool ggml_sycl_placement_plan_needs_secondary_devices(const ggml_sycl::pl
 static bool ggml_sycl_placement_plan_needs_moe_secondary_devices(const ggml_sycl::placement_plan & plan);
 static bool ggml_sycl_moe_multi_gpu_requested();
 static bool ggml_sycl_moe_multi_gpu_wanted(const ggml_sycl::placement_plan & plan);
+static bool ggml_sycl_cross_card_expert_plan_refused(const ggml_sycl::placement_plan & plan, bool peer_path);
+static bool ggml_sycl_cards_have_peer_path(const std::vector<int> & devices);
 static bool ggml_sycl_placement_plan_moe_needs_other_device(const ggml_sycl::placement_plan & plan,
                                                             int                               execution_device);
 
@@ -17852,6 +17854,14 @@ bool test_moe_multi_gpu_latch() {
 bool test_moe_multi_gpu_wanted(const placement_plan & plan) {
     return ggml_sycl_moe_multi_gpu_wanted(plan);
 }
+
+bool test_cross_card_expert_plan_refused(const placement_plan & plan, bool peer_path) {
+    return ggml_sycl_cross_card_expert_plan_refused(plan, peer_path);
+}
+
+bool test_cards_have_peer_path(const std::vector<int> & devices) {
+    return ggml_sycl_cards_have_peer_path(devices);
+}
 #endif
 }  // namespace ggml_sycl
 
@@ -18778,6 +18788,35 @@ static ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan_stale_l
     return GGML_SYCL_LIFECYCLE_UNSUPPORTED;
 }
 
+// The cross-card expert path moves expert work to a second card. Without a peer path between the cards the copies and
+// routing ids it needs have no safe route, and a two-card GPT-OSS run on that path faulted the first card. A plan that
+// wants the path on such a host is refused at the stage, before any weight is placed. The caller passes the peer fact,
+// so nothing here queries a device, a queue or a cache. It reads the opt-in through ggml_sycl_moe_multi_gpu_wanted, so
+// it is pure only in the device fact, which is its argument. This is the refusal rule; the stage helper below only logs
+// it and maps it to the load status.
+static bool ggml_sycl_cross_card_expert_plan_refused(const ggml_sycl::placement_plan & plan, bool peer_path) {
+    return ggml_sycl_moe_multi_gpu_wanted(plan) && !peer_path;
+}
+
+// Refuses the load for a plan the cross-card expert path cannot run on this host: logs one ERROR that names the remedy
+// and returns true, and the stage then returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED. The stage asks it before the
+// lazy-plan refusal, whose figures describe a plan that unsetting the variable replaces. Returns false, logging
+// nothing, for any other plan.
+static bool ggml_sycl_stage_refuse_cross_card_expert_plan(const ggml_sycl::placement_plan * plan) {
+    if (plan == nullptr) {
+        return false;
+    }
+    // The cards the plan uses, as the planner's own peer check reads them; a single-device plan crosses no card.
+    const bool peer_path = !plan->multi_device || ggml_sycl_cards_have_peer_path(plan->devices);
+    if (!ggml_sycl_cross_card_expert_plan_refused(*plan, peer_path)) {
+        return false;
+    }
+    GGML_LOG_ERROR(
+        "[MOE-MULTI-GPU] load refused: the plan puts experts on a second card and the cards have no peer path; unset "
+        "GGML_SYCL_MOE_MULTI_GPU to load with the single-card plan\n");
+    return true;
+}
+
 // Refuses the load for a plan whose lazy-table decision refused (th32 §4.3 step 4): logs one WARN naming the reason and
 // its figures and returns true, and the stage then returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED, before the probe plan is
 // staged from it and before the late pass configures a host zone for it. Returns false, logging nothing, for a plan
@@ -18887,6 +18926,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 if (!candidate_is_current()) {
                     throw std::runtime_error("stale host provisioning candidate before allocation");
                 }
+                if (ggml_sycl_stage_refuse_cross_card_expert_plan(snapshot->plan.get())) {
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
                 if (ggml_sycl_stage_refuse_lazy_plan(snapshot->plan.get(), early)) {
                     return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
                 }
@@ -18920,9 +18962,14 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
 #endif
         }
         // The early candidate is read once every device has planned it, and a refused one is never staged as the probe
-        // plan; the late pass refuses per device before it configures that device's host zones.
+        // plan; the late pass refuses per device before it configures that device's host zones. Both passes ask the
+        // cross-card refusal: the early plan steers create_tensor's buffer choice and the probe measure, and the late
+        // plan, made again after the arena is reserved, can put experts on a second card when the early one did not.
         const auto early_candidate =
             early ? ggml_sycl::lifecycle_find_candidate_placement_plan(effect.owner.load.value) : nullptr;
+        if (early_candidate && ggml_sycl_stage_refuse_cross_card_expert_plan(early_candidate->plan.get())) {
+            return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+        }
         if (early_candidate && ggml_sycl_stage_refuse_lazy_plan(early_candidate->plan.get(), early)) {
             return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
         }
@@ -64463,6 +64510,28 @@ static bool ggml_sycl_devices_have_direct_peer_path(int src_device, int dst_devi
     }
     const sycl_peer_link_info * link = ggml_sycl_get_peer_link_info(src_device, dst_device);
     return link && link->same_sycl_context && (link->direct_copy_measured || link->l0_can_access_peer);
+}
+
+// Whether every pair of the given GPUs has a direct peer path both ways, by the per-pair test above, which reads the
+// fields the planner's own peer check reads. The stage passes the plan's devices, the set the planner checks, not every
+// GPU the process can see. An id outside the device table reads as no path (ggml_sycl_get_peer_link_info bounds it
+// against total_gpu_count and GGML_SYCL_MAX_DEVICES), and a repeated id pairs a card with itself, which needs none.
+// One GPU has no pair to cross.
+//
+// No pair of different cards passes today. ggml_sycl_init_peer_link_defaults leaves same_sycl_context false for them
+// in two ways: it sets it false because the secondary queues use single-device contexts, and when its device query
+// throws the record keeps its zero-initialised value. Nothing sets direct_copy_measured. So even after the Level Zero
+// peer query has run, a plan that puts experts on a second card is refused under the opt-in on every multi-card host.
+static bool ggml_sycl_cards_have_peer_path(const std::vector<int> & devices) {
+    for (size_t i = 0; i < devices.size(); ++i) {
+        for (size_t j = i + 1; j < devices.size(); ++j) {
+            if (!ggml_sycl_devices_have_direct_peer_path(devices[i], devices[j]) ||
+                !ggml_sycl_devices_have_direct_peer_path(devices[j], devices[i])) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 static const ggml_tensor * ggml_sycl_attention_root(const ggml_tensor * tensor) {
