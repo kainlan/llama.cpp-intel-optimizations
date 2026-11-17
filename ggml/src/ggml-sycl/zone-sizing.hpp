@@ -678,24 +678,32 @@ bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size
 // The micro-batch the planned compute term was measured at, as the loads on a device record it, one store per
 // inventory intake (a load's early plan and late intake carry the same inventory, so its repeat store keeps an equal
 // value and changes nothing): the hold-spill fit credits the term at that rung only. The first load's value stands
-// while later loads agree. A load that names a different one turns the record off for good
-// (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the term was not measured at is the defect the
-// record prevents, and once off it never reads as a shape again. A load naming 0, or naming the mark itself, changes
-// nothing, so the mark only ever means two loads really disagreed and the WARN that reports it names two values loads
-// did plan. Nothing ever clears it: when every load that reserved the term is gone the term merges to 0 bytes, and a
-// 0-byte room credits nothing, so a micro-batch left behind is harmless.
+// while later loads agree. A load that names a different one while another load still holds a compute term on the
+// device turns the record off (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the live term was
+// not measured at is the defect the record prevents. When no load holds a term (`term_live` false: the merged term is
+// 0 bytes), the earlier loads are gone and the new load's value replaces the record, even one turned off, so loads
+// made one after another at different micro-batches each get their own credit. A load's early plan is taken in before
+// its own term is reserved, so `term_live` there names only earlier loads. A load naming 0, or naming the mark itself,
+// changes nothing, so the mark only ever means two loads really disagreed and the WARN that reports it names two
+// values loads did plan. A micro-batch left behind after every load is gone is harmless: the term merges to 0 bytes,
+// and a 0-byte room credits nothing.
 constexpr uint32_t k_zone_compute_term_n_ubatch_disagreed = UINT32_MAX;
 
-inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_ubatch) {
-    if (n_ubatch == 0 || n_ubatch == k_zone_compute_term_n_ubatch_disagreed ||
-        stored == k_zone_compute_term_n_ubatch_disagreed) {
+inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_ubatch, bool term_live) {
+    if (n_ubatch == 0 || n_ubatch == k_zone_compute_term_n_ubatch_disagreed) {
+        return stored;
+    }
+    if (!term_live) {
+        return n_ubatch;
+    }
+    if (stored == k_zone_compute_term_n_ubatch_disagreed) {
         return stored;
     }
     return stored == 0 || stored == n_ubatch ? n_ubatch : k_zone_compute_term_n_ubatch_disagreed;
 }
 
 // Whether a store moved the record from `before` to `after` by turning it off: the one store the setter WARNs on. A
-// record already off stays off without turning off again, so a later disagreeing load does not repeat the WARN.
+// record already off that stays off does not turn off again, so a later disagreeing load does not repeat the WARN.
 inline bool zone_compute_term_n_ubatch_turns_off(uint32_t before, uint32_t after) {
     return before != k_zone_compute_term_n_ubatch_disagreed && after == k_zone_compute_term_n_ubatch_disagreed;
 }

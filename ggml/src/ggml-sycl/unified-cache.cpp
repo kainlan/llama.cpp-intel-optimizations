@@ -2867,17 +2867,19 @@ void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_u
     }
     // A compare-exchange, so the one transition to disagreement is seen by exactly one store, whatever lock its
     // caller holds. On exit `stored` is the value this store replaced (or `next` when it changed nothing).
-    uint32_t stored = g_planned_compute_term_n_ubatch[device_id].load(std::memory_order_acquire);
-    uint32_t next   = zone_compute_term_n_ubatch_store(stored, n_ubatch);
+    // The merged term of the loads live on the device; 0 when none holds one, so this load's value replaces the record.
+    const bool term_live = g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire) != 0;
+    uint32_t   stored    = g_planned_compute_term_n_ubatch[device_id].load(std::memory_order_acquire);
+    uint32_t   next      = zone_compute_term_n_ubatch_store(stored, n_ubatch, term_live);
     while (next != stored &&
            !g_planned_compute_term_n_ubatch[device_id].compare_exchange_weak(stored, next, std::memory_order_acq_rel)) {
-        next = zone_compute_term_n_ubatch_store(stored, n_ubatch);
+        next = zone_compute_term_n_ubatch_store(stored, n_ubatch, term_live);
     }
     if (zone_compute_term_n_ubatch_turns_off(stored, next)) {
         GGML_LOG_WARN(
             "[LOAD-PLAN] device %d: this load plans its compute term at n_ubatch=%u where an earlier load planned it "
-            "at n_ubatch=%u; the hold-spill fit credits the planned compute room at no rung for the rest of the "
-            "process\n",
+            "at n_ubatch=%u; the record names no micro-batch until no load holds a compute term on the device, so "
+            "the hold-spill fit credits the planned compute room at no rung that lacks a record of its own\n",
             device_id, n_ubatch, stored);
     }
 }
