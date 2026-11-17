@@ -2962,11 +2962,17 @@ failure (0.0 MB), and the reason names the arena it had: `, and the arena it had
 (SCRATCH <S0> MB, ONEDNN <O0> MB, RUNTIME <R0> MB) was released for the rebuild`
 before the remedy. A first reserve on the device released nothing and says
 nothing about it. The line offers no smaller `-c`
-or `-ub`: the load plans its zones at its fixed planning shape (ubatch 512, an
-`n_ctx` of one ubatch), so neither is the term that grew. Any term can be the
-one: whatever holds the arena keeps the zones at the size an earlier load gave
-them, and the device-wide terms (the PP MoE ring, the PP pipeline scratch) are
-this load's alone.
+or `-ub`: the load plans its zones at its fixed planning shape, ubatch 512 with
+an `n_ctx` of one ubatch for the planner's terms, and the RUNTIME zone's
+compute term is the one the load measured at `n_ctx_train` and ubatch 512
+(below), so neither flag is the term that grew. Any term can be the one:
+whatever holds the arena keeps the zones at the size an earlier load gave them,
+and the device-wide terms the load publishes from its inventory before the
+entry check (the PP MoE ring, the PP pipeline scratch) are this load's alone.
+The planner's own terms (the MoE CONTROL requirement, the host scatter scratch)
+are published by the plan after that check, so the entry check reads them as
+they stand: the last plan's on the device, or what an uncommitted load put
+back.
 
 The stage returns `GGML_SYCL_LIFECYCLE_PLAN_REJECTED` from either pass, the
 loader throws, and `llama_model_load` returns NULL, so the tool prints its own
