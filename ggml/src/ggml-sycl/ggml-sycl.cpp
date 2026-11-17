@@ -2775,9 +2775,10 @@ static bool                         ggml_sycl_tensor_is_in_kv_host_buft(const gg
 // but ExpertPredictor indexes into fixed-size arrays sized by layer count.
 static std::unordered_map<int, int> g_moe_layer_seq[GGML_SYCL_MAX_DEVICES];
 
-// Multi-GPU MoE dispatch follows the unified-cache placement plan when more
-// than one physical GPU is visible. Secondary GPUs write outputs to host
-// staging, merged via the primary compute queue.
+// The cross-card expert path latch. It is on only when GGML_SYCL_MOE_MULTI_GPU
+// asks for that path and the placement plan puts experts on a secondary GPU.
+// Secondary GPUs then write outputs to host staging, merged via the primary
+// compute queue.
 static std::atomic<bool> g_moe_multi_gpu_active{ false };
 
 // P4: Priority-based static placement plan (computed in set_tensor_inventory,
@@ -8752,12 +8753,10 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             GGML_LOG_INFO("[MOE-MULTI-GPU] Disabled: %s\n",
                           plan_known && !plan_needs_secondary ?
                               "planner placed all executable handles on primary" :
-                              (!plan_known && multi_gpu_requested ?
-                                   "waiting for unified-cache placement plan" :
-                                   (total_gpus >= 2 ? "multi-GPU unavailable" :
-                                                      "single GPU detected "
-                                                      "(use ONEAPI_DEVICE_SELECTOR=\"level_zero:0,1\" "
-                                                      "for dual GPU)")));
+                              (!plan_known && multi_gpu_requested ? "waiting for unified-cache placement plan" :
+                                                                    "single GPU detected "
+                                                                    "(use ONEAPI_DEVICE_SELECTOR=\"level_zero:0,1\" "
+                                                                    "for dual GPU)"));
         }
     }
 
@@ -34611,14 +34610,16 @@ static ggml_sycl_device_info ggml_sycl_init() {
         // UR_RESULT_ERROR_DEVICE_LOST (error 20) at the first MUL_MAT.
         // See intel/compute-runtime#916 and #921.  The backend scheduler is
         // collapsed to one visible compute device by default; planner-owned MoE
-        // expert parallelism uses separate single-device queues for secondary
-        // GPUs and stages cross-device data explicitly.
+        // expert parallelism, which is opt-in (GGML_SYCL_MOE_MULTI_GPU=1), uses
+        // separate single-device queues for secondary GPUs and stages
+        // cross-device data explicitly.
         if (info.total_gpu_count > 1) {
             GGML_LOG_WARN(
                 "[SYCL] WARNING: %d GPUs visible. Multi-GPU Level Zero contexts "
                 "trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). "
                 "Scheduler multi-GPU dense/KV placement is disabled by default; "
-                "planner-owned MoE expert dispatch uses isolated per-device queues.\n",
+                "planner-owned MoE expert dispatch uses isolated per-device queues "
+                "(opt-in: GGML_SYCL_MOE_MULTI_GPU=1).\n",
                 info.total_gpu_count);
         }
     }

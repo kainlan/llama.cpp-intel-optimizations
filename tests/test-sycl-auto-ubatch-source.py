@@ -2251,7 +2251,7 @@ def _assert_expert_path_is_opt_in(code: str) -> None:
     assert _fn_body(code, "bool ggml_sycl_multi_device_plan_for_loaded_model() {") == _LOADED_MODEL_BODY, (
         "the key's predicate must be the planner's gate with the planner's expert fact"
     )
-    # P1 plus the two keying and logging reads; a fourth is a second copy of the gate.
+    # The predicate, the init peer-link probe gate and the device-map log line; a fourth is a second copy of the gate.
     n = code.count('std::getenv("GGML_SYCL_MOE_MULTI_GPU")')
     assert n == 3, f"GGML_SYCL_MOE_MULTI_GPU must be read in exactly 3 places, found {n}"
 
@@ -2303,12 +2303,25 @@ def test_dense_plan_reading_the_opt_in_has_a_mutation_witness():
 
 
 def test_second_gate_copy_has_a_mutation_witness():
-    """A fourth read of the variable, a new copy of the gate, must fail the check."""
+    """A fourth read of the variable, a new copy of the gate at a site no exact-body check covers, must fail the
+    count."""
+    signature = "static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {"
+    target = "const bool multi_gpu_requested = ggml_sycl_moe_multi_gpu_requested();"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, "const bool multi_gpu_requested = ggml_sycl_moe_multi_gpu_requested() || "
+                                         'std::getenv("GGML_SYCL_MOE_MULTI_GPU") != nullptr;')
+    with pytest.raises(AssertionError, match="exactly 3 places"):
+        _assert_expert_path_is_opt_in(mutated)
+
+
+def test_exported_predicate_body_has_a_mutation_witness():
+    """The exported predicate reading the variable itself, instead of returning the opt-in predicate, must fail
+    the exact-body check."""
     signature = "bool ggml_backend_sycl_moe_multi_gpu_requested() {"
     target = "return ggml_sycl_moe_multi_gpu_requested();"
     _assert_target_in_fn_body(signature, target)
     mutated = _mutant(signature, target, 'return std::getenv("GGML_SYCL_MOE_MULTI_GPU") != nullptr;')
-    with pytest.raises(AssertionError, match="exactly 3 places|return the opt-in predicate"):
+    with pytest.raises(AssertionError, match="return the opt-in predicate"):
         _assert_expert_path_is_opt_in(mutated)
 
 
