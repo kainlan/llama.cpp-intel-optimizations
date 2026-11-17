@@ -2361,6 +2361,94 @@ def test_runtime_site_checks_have_bounded_mutation_witnesses() -> None:
     _assert_only_runtime_site_fails(mutant, RUNTIME_TRANSACTION_SIG, "the context shape read before the KV resize")
 
 
+# The Graph floor is one pure function in zone-sizing.cpp, bounded by the DIRECT cap the dispatcher splits each
+# execute against. The cache's floor function keeps only the env override and hands everything else to it, and the
+# zone's own reading (the planned pair and floor) passes the cap of the device whose zone it sizes, so the zone and the
+# dispatcher read one number.
+ZONE_SIZING_CPP_NORM = normalize_ws(strip_comments(ZONE_SIZING_CPP))
+FLOOR_SWA_SIG = "static size_t onednn_graph_scratch_zone_floor_bytes_swa("
+PURE_FLOOR_CALL = "zone_onednn_graph_scratch_floor_bytes"
+PURE_FLOOR_SIG = f"size_t {PURE_FLOOR_CALL}("
+PAIR_AND_FLOOR_SIG = "static zone_onednn_plan onednn_planned_pair_and_floor(int device_id) {"
+PURE_FLOOR_ARGS = ["n_head_ctx_max", "n_head_swa_max", "n_swa", "n_ubatch", "n_ctx", "direct_cap"]
+DEVICE_DIRECT_CAP = "unified_cache_onednn_graph_scratch_direct_cap_bytes(device_id)"
+# What the formula is made of; none of it belongs in the cache's floor function once the formula has one home.
+FLOOR_FORMULA_TOKENS = ("std::min", "std::max", "* 3", "/ 2", "kFloorMinBytes", "kSizeofF32", "n_ubatch) *")
+
+
+def _floor_delegates_to_the_pure_function(cache: str) -> bool:
+    if not _has_function(cache, FLOOR_SWA_SIG):
+        return False
+    body = _body_of(cache, FLOOR_SWA_SIG)
+    if _call_argument_lists(body, PURE_FLOOR_CALL) != [PURE_FLOOR_ARGS]:
+        return False
+    if f"return {PURE_FLOOR_CALL}(" not in body:
+        return False
+    return not any(token in body for token in FLOOR_FORMULA_TOKENS)
+
+
+def _pure_floor_is_defined_once(zone: str) -> bool:
+    return _has_function(zone, PURE_FLOOR_SIG)
+
+
+def _planned_pair_passes_the_device_cap(cache: str) -> bool:
+    if not _has_function(cache, PAIR_AND_FLOOR_SIG):
+        return False
+    calls = _call_argument_lists(_body_of(cache, PAIR_AND_FLOOR_SIG), GRAPH_FLOOR_CALL)
+    return calls == [_shape_var_args("shape") + [DEVICE_DIRECT_CAP]]
+
+
+def _graph_floor_cap_checks(cache: str, zone: str) -> dict:
+    return {
+        "delegates": _floor_delegates_to_the_pure_function(cache),
+        "pure": _pure_floor_is_defined_once(zone),
+        "pair": _planned_pair_passes_the_device_cap(cache),
+    }
+
+
+def test_graph_floor_is_the_pure_function_bounded_by_the_device_cap() -> None:
+    results = _graph_floor_cap_checks(CACHE_CPP_NORM, ZONE_SIZING_CPP_NORM)
+    assert results["pure"], f"zone-sizing.cpp must define {PURE_FLOOR_CALL}() once: the formula's one home"
+    assert results["delegates"], (
+        f"{FLOOR_SWA_SIG}...) must hold no formula of its own and return {PURE_FLOOR_CALL}({', '.join(PURE_FLOOR_ARGS)})"
+    )
+    assert results["pair"], (
+        f"onednn_planned_pair_and_floor() must size the floor with {DEVICE_DIRECT_CAP}: the cap the dispatcher splits "
+        "each execute against, or the zone holds Graph scratch no execute uses"
+    )
+
+
+def _assert_only_cap_check_fails(cache: str, zone: str, failing: str, why: str) -> None:
+    results = _graph_floor_cap_checks(cache, zone)
+    expected = {name: name != failing for name in results}
+    assert results == expected, f"mutation witness for {failing!r} ({why}) is broken: {results}"
+
+
+def test_graph_floor_cap_checks_have_bounded_mutation_witnesses() -> None:
+    cache, zone = CACHE_CPP_NORM, ZONE_SIZING_CPP_NORM
+    assert all(_graph_floor_cap_checks(cache, zone).values()), "sanity: every check passes on the source itself"
+
+    mutant = _mutate_in_function(cache, PAIR_AND_FLOOR_SIG, DEVICE_DIRECT_CAP, "0")
+    _assert_only_cap_check_fails(mutant, zone, "pair", "the zone's floor sized with no cap known")
+
+    call = f"return {PURE_FLOOR_CALL}({', '.join(PURE_FLOOR_ARGS)});"
+    inline = (
+        "static constexpr uint64_t kFloorMinBytes = 64ull * 1024ull * 1024ull; "
+        "static constexpr uint64_t kSizeofF32 = 4; "
+        "const uint64_t ctx_term = static_cast<uint64_t>(n_head_ctx_max) * static_cast<uint64_t>(n_ctx); "
+        "const uint64_t swa_term = static_cast<uint64_t>(n_head_swa_max) * std::min(static_cast<uint64_t>(n_ctx), "
+        "static_cast<uint64_t>(n_swa) + static_cast<uint64_t>(n_ubatch)); "
+        "const uint64_t elems = std::max(ctx_term, swa_term) * static_cast<uint64_t>(n_ubatch); "
+        "const uint64_t modeled = (elems * kSizeofF32 * 3) / 2; "
+        "return static_cast<size_t>(std::max<uint64_t>(kFloorMinBytes, std::min<uint64_t>(modeled, direct_cap)));"
+    )
+    mutant = _mutate_in_function(cache, FLOOR_SWA_SIG, call, inline)
+    _assert_only_cap_check_fails(mutant, zone, "delegates", "the formula written back inline")
+
+    mutant = _mutate_in_function(cache, FLOOR_SWA_SIG, call, call.replace("direct_cap)", "0)"))
+    _assert_only_cap_check_fails(mutant, zone, "delegates", "the cap dropped on the way to the pure function")
+
+
 if __name__ == "__main__":
     import sys
 

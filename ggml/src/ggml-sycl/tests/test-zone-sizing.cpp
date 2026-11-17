@@ -2030,6 +2030,28 @@ int main() {
         CHECK(s.n_ctx == 4096 && s.n_ubatch == 2048, "a named micro-batch wins over the envelope's");
     }
 
+    // ---- Case 24g: the oneDNN Graph floor, bounded by the dispatcher's chunk budget. Each execute is split to half
+    // the DIRECT cap, so a full chunk and the last one fit under the cap together: the floor never holds more.
+    {
+        const size_t MiB = 1024 * 1024;
+        using ggml_sycl::zone_onednn_graph_scratch_floor_bytes;
+        // 512 x 512, 16 heads: 16 * 512 * 512 * 4 * 3 / 2 = 24 MiB, under the 64 MiB minimum
+        CHECK(zone_onednn_graph_scratch_floor_bytes(16, 0, 0, 512, 512, 1024 * MiB) == 64 * MiB, "the minimum");
+        // 2048 x 4096, 16 heads: 768 MiB, under a 1 GiB cap
+        CHECK(zone_onednn_graph_scratch_floor_bytes(16, 0, 0, 2048, 4096, 1024 * MiB) == 768 * MiB, "the formula");
+        // 2048 x 32768, 32 heads: 12 GiB, bounded by the cap
+        CHECK(zone_onednn_graph_scratch_floor_bytes(32, 0, 0, 2048, 32768, 1024 * MiB) == 1024 * MiB, "the cap");
+        CHECK(zone_onednn_graph_scratch_floor_bytes(32, 0, 0, 2048, 32768, 0) == size_t(12) * 1024 * MiB,
+              "no cap known: the formula");
+        // The cap bounds the formula, not the minimum.
+        CHECK(zone_onednn_graph_scratch_floor_bytes(32, 0, 0, 2048, 32768, 32 * MiB) == 64 * MiB,
+              "a cap below the minimum: the minimum");
+        // SWA window: min(n_ctx, n_swa + n_ubatch)
+        CHECK(zone_onednn_graph_scratch_floor_bytes(0, 8, 512, 2048, 32768, 1024 * MiB) == 8 * 2560 * 2048 * 6,
+              "the window, not the context, for SWA heads");
+        CHECK(zone_onednn_graph_scratch_floor_bytes(0, 0, 0, 2048, 4096, 1024 * MiB) == 64 * MiB, "no eligible head");
+    }
+
     // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and
     // THAT rung's measured request, not of which other rungs ran before it or in what order. A rung with its own
     // record uses it and only it; a rung without one is scaled from the SET of records (order never matters). -----
