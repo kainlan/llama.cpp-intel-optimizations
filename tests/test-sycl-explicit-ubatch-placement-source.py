@@ -175,6 +175,10 @@ PLAN_ROOM_PLANNING = ("if (n == 0 && plan.explicit_ubatch.action == pp_moe_onedn
 PLANNING_SET = "ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, inventory->n_ubatch);"
 PLANNING_SETTER_SIG = "void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch)"
 PLANNING_SETTER_RULE = "uint32_t next = zone_compute_term_n_ubatch_store(stored, n_ubatch, term_live);"
+# Whether a load still holds a term is read from the device's merged compute term, once, before the rule: a constant
+# would let the last load win while two are live (false), or keep a record turned off after every load is gone (true).
+PLANNING_TERM_LIVE = ("const bool term_live = g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire) "
+                      "!= 0;")
 # The setter updates through a compare-exchange loop on the device's slot, so exactly one store sees the transition
 # to the mark, and WARNs only when that store is the one zone_compute_term_n_ubatch_turns_off() names.
 PLANNING_CAS_LOOP = ("while (next != stored && !g_planned_compute_term_n_ubatch[device_id].compare_exchange_weak("
@@ -412,13 +416,14 @@ def claim_fit_reads_the_load_planning_micro_batch(sycl_cpp: str, cache_cpp: str)
 
 
 def claim_planning_record_warns_once(cache_cpp: str) -> bool:
-    """The setter moves the record through a compare-exchange loop, never a plain store, and WARNs only behind
+    """The setter reads whether a load holds a term from the device's merged compute term before the store rule,
+    moves the record through a compare-exchange loop, never a plain store, and WARNs only behind
     zone_compute_term_n_ubatch_turns_off(), so the one store that turns the record off is the one that WARNs; the WARN
     is written nowhere else."""
     cache = norm(cache_cpp)
     setter = body(cache, PLANNING_SETTER_SIG)
-    return (bool(setter) and ordered(setter, PLANNING_SETTER_RULE, PLANNING_CAS_LOOP, PLANNING_WARN_GUARD,
-                                     PLANNING_WARN_TEXT)
+    return (bool(setter) and ordered(setter, PLANNING_TERM_LIVE, PLANNING_SETTER_RULE, PLANNING_CAS_LOOP,
+                                     PLANNING_WARN_GUARD, PLANNING_WARN_TEXT)
             and ".store(" not in setter
             and cache.count(PLANNING_WARN_TEXT) == 1)
 
@@ -855,6 +860,14 @@ def test_mutant_planning_warn_on_any_mark_fails():
     assert not claim_planning_record_warns_once(
         _once(CACHE_CPP, "if (zone_compute_term_n_ubatch_turns_off(stored, next)) {",
               "if (next == k_zone_compute_term_n_ubatch_disagreed) {"))
+
+
+@pytest.mark.parametrize("constant", ["false", "true"])
+def test_mutant_planning_record_term_live_constant_fails(constant):
+    """A liveness that is not read from the merged term: false lets the last load win while two loads are live, a
+    credit at the wrong shape; true keeps a record turned off after every load that held a term is gone."""
+    assert not claim_planning_record_warns_once(
+        _once(CACHE_CPP, PLANNING_TERM_LIVE, f"const bool term_live = {constant};"))
 
 
 def test_mutant_planning_record_plain_store_fails():
