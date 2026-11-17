@@ -13,8 +13,9 @@ read:
 - the figure is physical: the device total, arena_total_size(), the raw rows of the registry and the recorded term,
   never a zone counter, the cache's used bytes, its budget or a live driver free reading;
 - with an arena active a refusal evicts nothing (the plan placed the weights; a raw request it made no room for does not
-  trade them away); only with no arena does the gate evict and look again; a hold-induced spill is refused at ERROR
-  without evicting, and is counted as a raw hold spill only once its raw allocation is made;
+  trade them away); only with no arena does the gate evict, and it then reads its figure again before it compares; a
+  hold-induced spill is refused at ERROR without evicting, and is counted as a raw hold spill only once its raw
+  allocation is made;
 - both device-pool chunk sites use the same gate;
 - the term outside this process's accounting is written at one site, once per device, from the reading that sizes the
   first arena reservation, and read only by the gate's figure; only the pure helpers and the two log lines read it;
@@ -198,6 +199,17 @@ def claim_arena_trip_evicts_nothing(uc: str) -> bool:
     )
 
 
+def claim_no_arena_eviction_reads_the_figure_again(uc: str) -> bool:
+    # Eviction frees raw rows the figure counted, so the comparison after it must use a fresh reading: against the
+    # figure read before the eviction, a request the eviction made room for is still refused.
+    gate = fn_body(code(uc), GATE_SIG)
+    arena_off = "if (cache && !cache->arena_active()) {"
+    off_block = block_at(gate, gate.find(arena_off)) if arena_off in gate else ""
+    evict_at = off_block.find("evict_and_flush(")
+    reread_at = off_block.find("in = unified_cache_raw_gate_inputs(req.device, *req.queue);")
+    return 0 <= evict_at < reread_at < off_block.find("zone_raw_gate_fits(in, alloc_size)")
+
+
 def claim_pool_sites_use_the_gate(dp: str) -> bool:
     d = code(dp)
     if "unified_cache_total_available_bytes" in d:
@@ -360,6 +372,13 @@ def test_arena_trip_evicts_nothing():
     )
 
 
+def test_no_arena_eviction_reads_the_figure_again():
+    assert claim_no_arena_eviction_reads_the_figure_again(UC), (
+        "with no arena, the raw gate does not read its figure again between evicting cached weights and comparing the "
+        "request, so it refuses against the figure from before the eviction"
+    )
+
+
 def test_pool_sites_use_the_gate():
     assert claim_pool_sites_use_the_gate(DP), (
         "a device-pool chunk site does not ask unified_cache_raw_gate_admits() for its whole backing size before it "
@@ -461,6 +480,13 @@ def test_witness_arena_trip_evicts():
 
 def test_witness_hold_spill_evicts():
     assert not claim_arena_trip_evicts_nothing(mutate_in_func(UC, GATE_SIG, HOLD_IF, "if (false) {"))
+
+
+def test_witness_no_arena_eviction_keeps_the_stale_figure():
+    evict = "cache->evict_and_flush(short_by);"
+    assert not claim_no_arena_eviction_reads_the_figure_again(
+        mutate_in_func(UC, GATE_SIG, evict + " in = unified_cache_raw_gate_inputs(req.device, *req.queue);", evict)
+    )
 
 
 def test_witness_pool_gate_evicts():
