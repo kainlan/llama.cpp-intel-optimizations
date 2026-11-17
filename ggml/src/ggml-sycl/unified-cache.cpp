@@ -1030,7 +1030,7 @@ static std::atomic<uint64_t>      g_planned_scratch_owner_next{ 1 };
 // set only when the merged inputs of the owners whose figure was accepted cannot be sized. A rejected owner's figure
 // does not set it: that owner contributes nothing to the half, and its own re-plan refuses while it is live.
 static std::atomic<bool>         g_planned_dense_scratch_invalid[GGML_SYCL_MAX_DEVICES][2]{};
-// llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
+// The SDPA shape (max query-head count per attention
 // window class, the SWA window itself, ubatch size, context length) last
 // published for this device through
 // unified_cache_publish_planned_onednn_graph_scratch_shape(): by a
@@ -1039,7 +1039,7 @@ static std::atomic<bool>         g_planned_dense_scratch_invalid[GGML_SYCL_MAX_D
 // Graph-scratch zone floor:" log line). Feeds onednn_graph_scratch_zone_floor_bytes_swa()'s
 // shape-derived floor -- the oneDNN Graph-scratch request is proportional to
 // n_head x n_ubatch x n_ctx for non-SWA layers and n_head x n_ubatch x
-// min(n_ctx, n_swa + n_ubatch) for SWA layers (llama.cpp-o3a0; the span a
+// min(n_ctx, n_swa + n_ubatch) for SWA layers (the span a
 // ubatch of n_ubatch queries scans over an n_swa-key sliding window, GPU-
 // verified), NOT a single n_head x n_ctx term for every layer as an
 // earlier version of this fix assumed.
@@ -3704,7 +3704,7 @@ void unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t weig
     unified_cache_set_planned_onednn_scratchpad_bytes(device_id, weights_bytes + activations_bytes);
 }
 
-// llama.cpp-0oxf/o3a0: record the SDPA shape (n_head_ctx_max, n_head_swa_max,
+// Record the SDPA shape (n_head_ctx_max, n_head_swa_max,
 // n_swa, n_ubatch, n_ctx) alongside the scratchpad bytes above so
 // onednn_graph_scratch_zone_floor_bytes_swa() can derive its floor from the
 // shape the Graph-scratch request actually scales with, instead of a flat

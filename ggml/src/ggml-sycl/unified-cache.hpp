@@ -2871,7 +2871,7 @@ void   unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t we
 size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id);
 size_t unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
 
-// llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
+// The SDPA shape (max query-head count per attention
 // window class, the SWA window itself, ubatch size, context length) recorded
 // alongside the scratchpad bytes above, feeding
 // onednn_graph_scratch_zone_floor_bytes_swa()'s shape-derived floor (see
@@ -2880,7 +2880,7 @@ size_t unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
 // min(n_ctx, n_swa + n_ubatch) for SWA layers -- a ubatch of n_ubatch
 // queries against an n_swa-key sliding window spans n_swa + n_ubatch keys
 // in total, GPU-verified -- not a single n_head x n_ctx term for every
-// layer (correction on the ticket, llama.cpp-o3a0, after an earlier
+// layer (an earlier
 // version of this fix assumed every oneDNN-served layer's window was
 // n_ctx). All-zero means "never planned for this device".
 struct onednn_graph_scratch_planned_shape {
