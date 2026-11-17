@@ -17,8 +17,9 @@ One helper, ggml_sycl::planner_published_terms (declared in unified-cache.hpp, d
 getters and setters it calls), snapshots and restores every term the planner publishes: every
 unified_cache_set_planned_* call in the planner's own functions has its getter in the snapshot and its setter in the
 restore, fed from the field the snapshot filled. The backend keeps no copy of its own. The plan dry run, which also
-discards the plans it makes, restores through the same helper and keeps no list of its own. test-sycl-runtime-alloc's
-planner-terms case checks the restore against the cache's own state.
+discards the plans it makes, restores through the same helper and keeps no list of its own. The planner-terms case of
+the sycl-runtime-alloc ctest (binary test-sycl-runtime-alloc, source
+ggml/src/ggml-sycl/tests/test-unified-runtime-alloc.cpp) checks the restore against the cache's own state.
 
 The scan for the planner's terms reads a fixed list of function bodies in unified-cache.cpp (PLANNER_SIGS):
 populate_host_zone_sizing, publish_moe_host_scatter_term, record_host_ledger_plan, placement_plan_size_host_side,
