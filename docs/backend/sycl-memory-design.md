@@ -2626,8 +2626,9 @@ and still wrong in practice, which is the whole lesson of this subsection.
 
 With flash attention on, attention runs through oneDNN Graph SDPA, whose
 scratch lives in the ONEDNN zone beside the primitive-API pair. The load sizes
-that zone's Graph room for the context it was told (the Graph floor above). A
-later context can ask for more: a larger `-c` than the hint, or an API caller
+that zone's Graph room for the shape it was told (the Graph floor above). A
+later context can ask for more: a micro-batch the automatic micro-batch trial
+probes above the planned one, a larger `-c` than the hint, or an API caller
 that gave none. The part of its scratch above the room goes DIRECT
 (`onednn_graph_scratch_alloc_direct_locked()`, `unified-cache.cpp`), which
 names no zone and so draws raw device memory outside the arena, and which
@@ -2683,10 +2684,30 @@ about <L>, a power of two, estimated by scaling; or tell the load this context (
 The printed figures add up: `<U>` is `<D>` less `<R>`, and `<D>` is at most
 `<K>` unless the 64 MiB minimum is larger or the cap is 0 (no cap).
 
-No tool in the tree reaches this refusal on a device: `common` and
-`llama-bench` tell the load the largest context they will open, so no context
-outgrows its hint. An API caller that opens a larger context than it named, or
-names none, can. A context that auto flash attention later resolves to off was
+A default command reaches this check. Without `-ub`, `common` gives the load
+no micro-batch hint while its automatic micro-batch trial is on, so the load
+plans the Graph room at its planning micro-batch, 512. The trial then probes
+its rungs above 512 through this transaction in probe mode, and each such rung
+asks for more than the room whenever the context is below the one at which
+the DIRECT cap already binds at 512. Two device runs on the B50 (Mistral 7B
+Q4_0, the Mistral gate prompt, no `-ub`):
+
+- `-c 4096`, default cap: the room is 384 MB. Rungs 1024 and 2048 ask for
+  more, the part above the room fits outside the arena, and both are
+  admitted. The trial picks 2048, the same micro-batch as before this check.
+- `-c 8192` with `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB=4096`: the room is
+  768 MB. Rung 1024 (1536 MB, 768 MB above the room, 1556.1 MB free) is
+  admitted. Rung 2048 (3072 MB, 2304 MB above the room) is refused at INFO,
+  and the refusal names 1024. The trial runs 1024 and the output is right.
+
+A probe refusal is logged at INFO and only lowers the trial's rung. With the
+default cap the demand is at most 1 GiB, so a probe is refused only when the
+free memory outside the arena is below the 256 MiB headroom plus the hold's
+spill plus (1 GiB less the room). That condition, not a known default
+command, is when a default configuration sees the refusal: Mistral on the B50
+leaves about 1.5 GB outside the arena, so no default Mistral command does. A
+context larger than the hint, or an API caller that names none, reaches the
+check the same way. A context that auto flash attention later resolves to off was
 judged with flash attention on here (the transaction runs before the
 resolution) and is not re-asked by the narrow recheck.
 
