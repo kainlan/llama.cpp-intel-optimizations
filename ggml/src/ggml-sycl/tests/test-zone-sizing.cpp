@@ -1805,8 +1805,8 @@ int main() {
     }
 
     // The micro-batch the compute term was planned at, as each load records it: the first load's value stands while
-    // later loads agree; a load that disagrees while another load still holds a term turns the record off until no
-    // load holds one, so no rung is credited at a shape the live term was not measured at.
+    // later loads agree; a load that disagrees while another load still holds a term turns the record off until a load
+    // is taken in while none holds one, so no rung is credited at a shape the live term was not measured at.
     {
         using ggml_sycl::zone_compute_term_n_ubatch_read;
         using ggml_sycl::zone_compute_term_n_ubatch_store;

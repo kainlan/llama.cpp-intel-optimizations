@@ -2878,8 +2878,8 @@ void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_u
     if (zone_compute_term_n_ubatch_turns_off(stored, next)) {
         GGML_LOG_WARN(
             "[LOAD-PLAN] device %d: this load plans its compute term at n_ubatch=%u where an earlier load planned it "
-            "at n_ubatch=%u; the record names no micro-batch until no load holds a compute term on the device, so "
-            "the hold-spill fit credits the planned compute room at no rung that lacks a record of its own\n",
+            "at n_ubatch=%u; the record names no micro-batch until a load is taken in while no load holds a compute "
+            "term on the device, so until then the hold-spill fit gets no measured micro-batch from it\n",
             device_id, n_ubatch, stored);
     }
 }

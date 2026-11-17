@@ -676,17 +676,20 @@ bool zone_route_draws_scratch(bool decision_valid,
 bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size_t alignment, size_t * out);
 
 // The micro-batch the planned compute term was measured at, as the loads on a device record it, one store per
-// inventory intake (a load's early plan and late intake carry the same inventory, so its repeat store keeps an equal
-// value and changes nothing): the hold-spill fit credits the term at that rung only. The first load's value stands
-// while later loads agree. A load that names a different one while another load still holds a compute term on the
-// device turns the record off (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the live term was
-// not measured at is the defect the record prevents. When no load holds a term (`term_live` false: the merged term is
-// 0 bytes), the earlier loads are gone and the new load's value replaces the record, even one turned off, so loads
-// made one after another at different micro-batches each get their own credit. A load's early plan is taken in before
-// its own term is reserved, so `term_live` there names only earlier loads. A load naming 0, or naming the mark itself,
-// changes nothing, so the mark only ever means two loads really disagreed and the WARN that reports it names two
-// values loads did plan. A micro-batch left behind after every load is gone is harmless: the term merges to 0 bytes,
-// and a 0-byte room credits nothing.
+// inventory intake (a load's early plan and late intake carry the same inventory, and at its late intake the load's
+// own term is live and the record already holds its value, so the repeat store keeps an equal value and changes
+// nothing): the hold-spill fit credits the term at that rung only. The first load's value stands while later loads
+// agree. A load that names a different one while another load still holds a compute term on the device turns the
+// record off (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the live term was not measured at
+// is the defect the record prevents. When no load holds a term (`term_live` false: the merged term is 0 bytes), the
+// earlier loads are gone and the new load's value replaces the record, even one turned off, so loads made one after
+// another at different micro-batches each get their own credit. A load's early plan is taken in before its own term
+// is reserved, so `term_live` there names only earlier loads. A load naming 0, or naming the mark itself, changes
+// nothing, so the mark only ever means two live loads really disagreed and the WARN that reports it names two values
+// loads did plan. A micro-batch left behind after every load is gone is harmless: the term merges to 0 bytes, and a
+// 0-byte room credits nothing. So a disagreement only removes the credit, never grants one, for every term on the
+// device: a load's measure can reserve a term on a device only after that device took in the load's inventory, since
+// the load's stage runs the intake on every SYCL device.
 constexpr uint32_t k_zone_compute_term_n_ubatch_disagreed = UINT32_MAX;
 
 inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_ubatch, bool term_live) {
