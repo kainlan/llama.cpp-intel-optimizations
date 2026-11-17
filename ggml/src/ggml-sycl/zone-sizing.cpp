@@ -504,6 +504,11 @@ bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, si
     return zone_runtime_reserved_bytes(floor_bytes, requirement, &reserved) && live_zone_bytes > reserved;
 }
 
+bool zone_arena_rebuild_allowed(const zone_arena_holders & holders) {
+    // scratch_outside is not read: a rebuild leaves an allocation outside the arena where it is.
+    return holders.live_zone_bytes == 0 && holders.chunk_leases == 0 && holders.scratch_in_arena == 0;
+}
+
 // A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about
 // linearly with the micro-batch), rounded up. Unchanged when either micro-batch is unknown, they are equal, or the
 // request is 0; SIZE_MAX when the product overflows. The hold-spill fit's one estimator for a compute buffer at a

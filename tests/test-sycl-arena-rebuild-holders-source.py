@@ -141,7 +141,8 @@ def call_args(text: str, start: int) -> list:
 # ---- every chunk lease a mem_handle takes is counted by its site ----
 
 ACQUIRE = "arena_acquire_chunk_lease("
-SNAPSHOT_SIG = "mem_handle mem_handle::from_weight_lease_snapshot("
+# The overload that takes the cache key; the one that takes a cache id forwards to it.
+SNAPSHOT_SIG = "mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,"
 CHUNK_PTR_SIG = "mem_handle mem_handle::from_chunk_ptr("
 RESOLVE_SIG = "resolved_ptr mem_handle::resolve_slow() const"
 BUMP_SIG = "static void bump_chunk_lease_for_copy("
@@ -352,9 +353,14 @@ GS_CALLS = (
 )
 
 
+def tight(src: str) -> str:
+    """code() without the space a line break after '(' leaves, so a wrapped call reads as one."""
+    return code(src).replace("( ", "(")
+
+
 def claim_kept_handles_name_their_site(common: str, gs: str) -> bool:
-    cc = code(common)
-    cg = code(gs)
+    cc = tight(common)
+    cg = tight(gs)
     return all(t in cc for t in TENSOR_EXTRA_CALLS) and all(t in cg for t in GS_CALLS)
 
 

@@ -1620,9 +1620,9 @@ not inside the "zone is big enough" branch.** The first version of this step
 put the release inside `if (total_needed <= zone_cap)`, after the
 `total_needed > zone_cap` branch's `ensure_planned_arena_zones()` re-plan
 attempt. Spec review caught the consequence: `ensure_planned_arena_zones()`'s
-`has_live_scratch` refusal check
+`has_live_scratch` refusal check of that time
 (`onednn_weights_scratch_ != nullptr || onednn_activations_scratch_ != nullptr
-|| ...`) treats a non-null pointer as still-live *regardless of who owns
+|| ...`) treated a non-null pointer as still-live *regardless of who owns
 it* — including the reservation's own predecessor, about to be replaced by
 the very call that is checking. So on exactly the path that most needed the
 fix — an existing arena reservation growing into a bigger one — the old
@@ -1651,6 +1651,12 @@ memory quietly again. A CPU-only source-contract check
 precedes the growth-path re-plan") pins the ordering the same way the
 existing hook-before-early-return checks pin theirs, and is confirmed to fail
 against the pre-fix commit.
+
+The rebuild gate has since become exact: `arena_count_scratch_holders()` counts
+a cache scratch buffer as a holder only when `vram_owns()` its pointer, and
+`zone_arena_rebuild_allowed()` decides. An arena-owned predecessor still counts,
+so the point-release above must still run first; a direct scratch outside the
+arena no longer refuses a rebuild.
 
 **Nothing else lives in the ONEDNN VRAM zone — grep-verified, not assumed.**
 The only `zone_alloc(vram_zone_id::ONEDNN, ...)` call sites in the entire
@@ -2858,14 +2864,33 @@ largest -ub that fits is <L> (device=0)
 
 The arena can fail to grow for two reasons, and each prints its own line first:
 
-- **Another live model holds allocations in the arena.** Zones are rebuilt only
-  in an unused arena, so `ensure_planned_arena_zones()` refuses the rebuild with
-  an ERROR:
+- **Something still points into the arena.** Zones are rebuilt only in an arena
+  nothing points into: no zone byte allocated, no lease on a chunk, and no cache
+  scratch buffer whose pointer the arena owns. A scratch buffer allocated outside
+  the arena keeps its memory through a rebuild and does not count
+  (`zone_arena_rebuild_allowed()` decides). Another live model's allocations are
+  one cause; scratch an earlier model left in the arena, and handles that still
+  lease a chunk, are others. `ensure_planned_arena_zones()` refuses the rebuild
+  with an ERROR, names the holders on a second ERROR, prints the chunk leases by
+  the site that took them on a WARN, and lists the live allocations of each zone
+  with live bytes:
 
   ```
   [VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: need scratch=<S> MB
   oneDNN=<O> MB runtime=<R> MB; have scratch=<S0> MB oneDNN=<O0> MB runtime=<R0> MB; live_zone=<L> MB chunk_leases=<C>
+  [VRAM-ARENA] live in the arena on device <D> (MB): <zone>=<MB> ...; deferred_in_arena=<n> (<MB> MB requested)
+  device_release_retries=<n> device_live_controls=<n> retired_pending=<n> evictions_in_flight=<n>
+  cache_scratch_in_arena=<n> cache_scratch_outside=<n>
+  [VRAM-ARENA] chunk leases on device <D> by site: <site>=<n> <site>(copy)=<n> ... (sum <n> of <C>)
+  [UNIFIED-ALLOC] live-zone-dump at arena-rebuild device=<D> zone=<z> used=<MB> MB ...
   ```
+
+  The sites are `weight_snapshot`, `weight_resolve`, `chunk_view` (a handle made
+  from a raw pointer for one use), `tensor_extra`, `expert_dispatch` and
+  `untagged` (a direct caller of the lease API). `(copy)` counts the leases that
+  copies of those handles took; a copy keeps the site of the handle it copies.
+  The counts by site sum to the chunks' leases, up to a lease taken or dropped
+  between the two reads.
 
 - **The tail chunk's cap.** The rebuilt arena's tail chunk holds the ONEDNN,
   RUNTIME and SCRATCH zones plus a minimum KV carve-out, and the device's

@@ -498,6 +498,19 @@ inline bool zone_runtime_reserved_bytes(size_t floor_bytes, size_t requirement, 
 // rounding overflows.
 bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement);
 
+// What points into a VRAM arena that a plan wants larger. The arena grows only by being destroyed and reserved again,
+// which moves every byte in it, so each of these keeps it as it is.
+struct zone_arena_holders {
+    size_t   live_zone_bytes  = 0;  // bytes the zones count as allocated
+    uint32_t chunk_leases     = 0;  // leases handles hold on the arena's chunks
+    uint32_t scratch_in_arena = 0;  // the cache's scratch buffers whose pointer lies inside the arena
+    uint32_t scratch_outside  = 0;  // the cache's scratch buffers allocated outside it, printed and never a holder
+};
+
+// Whether the arena may be rebuilt for larger zones: only when nothing points into it. A scratch buffer allocated
+// outside the arena keeps its own memory through a rebuild, so it does not refuse one; a buffer inside it does.
+bool zone_arena_rebuild_allowed(const zone_arena_holders & holders);
+
 // The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the
 // hold can be) plus the largest spill-capable RUNTIME request, because a held-back request spills whole. The
 // request was observed at `hwm_n_ubatch`; compute buffers scale about linearly with n_ubatch, so it is scaled to

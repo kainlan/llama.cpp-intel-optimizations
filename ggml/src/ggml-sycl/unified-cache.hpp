@@ -4959,11 +4959,18 @@ class unified_cache {
     //
     // Returns -1 when the pointer is not owned by the arena (safe no-op on
     // release).  Otherwise returns the chunk index (0..N-1).
+    //
+    // Each lease is also counted by the tag it was taken with, and its release
+    // names the same tag, so the counts by tag sum to the chunks' leases and an
+    // arena rebuild refused for leases can say who holds them. The count is one
+    // relaxed atomic add on each side and takes no lock: the lease paths are
+    // per-resolve hot paths and the count is read only for a diagnostic.
     int      arena_find_chunk(const void * ptr) const;
-    int      arena_acquire_chunk_lease(const void * ptr);
-    void     arena_release_chunk_lease(int chunk_idx);
+    int      arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag tag = chunk_lease_tag());
+    void     arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag = chunk_lease_tag());
     bool     arena_chunk_has_leases(int chunk_idx) const;
     uint32_t arena_chunk_lease_count(int chunk_idx) const;
+    uint32_t arena_chunk_lease_count_at(chunk_lease_tag tag) const;
 
     // Host pinned-pool chunk lease API (dyhdl) — routes through host_arena_.
     // Returns pinned_chunk_pool::INVALID_CHUNK_HANDLE (UINT64_MAX) on miss.
@@ -6171,6 +6178,24 @@ class unified_cache {
     // so the patched libze (~1.5 GB on Arc B580) does not reject the alloc.
     std::vector<arena_chunk> arena_chunks_;
     sycl::queue *            arena_queue_ = nullptr;
+
+    // The leases on all chunks by the site that took them (chunk_lease_site) and whether a handle copy took them
+    // (second index 1). Moved only beside a chunk's lease_count, so the cells sum to the chunks' leases up to a lease
+    // in flight between the two adds. Relaxed: read only by the rebuild refusal's diagnostic, never to synchronize.
+    mutable std::atomic<uint32_t> arena_chunk_leases_by_site_[static_cast<size_t>(chunk_lease_site::COUNT)][2] = {};
+
+    // The cell a lease of `tag` moves. A site out of range counts as UNTAGGED, so a corrupt tag cannot index past the
+    // array.
+    std::atomic<uint32_t> & arena_chunk_leases_of(chunk_lease_tag tag) const {
+        const size_t site = static_cast<size_t>(tag.site);
+        return arena_chunk_leases_by_site_[site < static_cast<size_t>(chunk_lease_site::COUNT) ? site : 0]
+                                          [tag.copy ? 1 : 0];
+    }
+
+    // Adds the cache's scratch buffers to `holders`: those whose pointer the arena owns, which keep it from a
+    // rebuild, and those allocated outside it, which do not. Takes the PP MoE ring's lock, then the persistent
+    // scratch lock, each alone.
+    void arena_count_scratch_holders(zone_arena_holders & holders);
 
     // Per-physical-chunk TLSF allocators for the WEIGHT zone in N-chunk mode.
     // A weight tensor must not span a chunk boundary (each chunk is its own

@@ -64570,8 +64570,9 @@ static bool ggml_sycl_publish_f16_attention_dst_handle(ggml_tensor *           d
     }
 
     if (!published_handle.valid()) {
-        published_handle = ggml_sycl::mem_handle::from_chunk_ptr(produced_base, target_device, GGML_LAYOUT_AOS,
-                                                                 /*on_device=*/true);
+        published_handle =
+            ggml_sycl::mem_handle::from_chunk_ptr(produced_base, target_device, GGML_LAYOUT_AOS,
+                                                  /*on_device=*/true, ggml_sycl::chunk_lease_site::TENSOR_EXTRA);
     }
 
     if (!ggml_sycl_persistent_publish_allowed(extra, published_handle, "publish_f16_attention_dst_handle")) {
@@ -66675,8 +66676,8 @@ bool ggml_sycl_test_f16_staged_view_resolves_through_root(ggml_tensor * view, in
     ggml_sycl::mem_handle old_handle  = std::move(extra->data_handle[target_device]);
     void *                old_data    = extra->data_device[target_device];
     extra->data_device[target_device] = staged_base;
-    extra->data_handle[target_device] =
-        ggml_sycl::mem_handle::from_chunk_ptr(staged_base, target_device, GGML_LAYOUT_AOS, /*on_device=*/true);
+    extra->data_handle[target_device] = ggml_sycl::mem_handle::from_chunk_ptr(
+        staged_base, target_device, GGML_LAYOUT_AOS, /*on_device=*/true, ggml_sycl::chunk_lease_site::TENSOR_EXTRA);
     ggml_sycl_data_ptr_cache_new_graph();
     void * resolved                   = ggml_sycl_resolve_tensor_ptr(view, target_device);
     extra->data_handle[target_device] = std::move(old_handle);
@@ -81319,7 +81320,8 @@ static expert_dispatch_entry ggml_sycl_make_secondary_expert_dispatch_entry(int6
     entry.lease              = std::move(lease);
     entry.allow_cpu_fallback = allow_cpu_fallback;
     if (!entry.lease.valid() && ptr != nullptr) {
-        entry.lease            = ggml_sycl::mem_handle::from_chunk_ptr(ptr, device_id, layout, device_id >= 0);
+        entry.lease            = ggml_sycl::mem_handle::from_chunk_ptr(ptr, device_id, layout, device_id >= 0,
+                                                                       ggml_sycl::chunk_lease_site::EXPERT_DISPATCH);
         entry.raw_compat_lease = true;
     }
     return entry;

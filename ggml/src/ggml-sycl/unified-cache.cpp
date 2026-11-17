@@ -7557,19 +7557,20 @@ bool unified_cache::ensure_planned_arena_zones() {
             live_zone_bytes += live_zone_used[z];
         }
 
-        bool     has_chunk_leases = false;
-        uint32_t chunk_leases     = 0;
+        uint32_t chunk_leases = 0;
         for (const arena_chunk & chunk : arena_chunks_) {
             const uint32_t leases = chunk.lease_count.load();
-            chunk_leases += leases;
-            has_chunk_leases = has_chunk_leases || leases != 0;
+            // Saturating, so a sum that would wrap still reads as held.
+            chunk_leases          = leases > UINT32_MAX - chunk_leases ? UINT32_MAX : chunk_leases + leases;
         }
 
-        const bool has_live_scratch = compute_arena_used() != 0 || scratch_pool_ptr_ != nullptr ||
-                                      onednn_weights_scratch_ != nullptr || onednn_activations_scratch_ != nullptr ||
-                                      reorder_temp_buffer_ != nullptr || !persistent_scratches_.empty() ||
-                                      !pp_moe_onednn_scratch_slots_.empty();
-        if (live_zone_bytes != 0 || has_chunk_leases || has_live_scratch) {
+        // A cache scratch buffer holds the arena only when the arena owns its pointer: one allocated outside it keeps
+        // its own memory through a rebuild. The SCRATCH zone's own bytes are already in live_zone_bytes.
+        zone_arena_holders holders;
+        holders.live_zone_bytes = live_zone_bytes;
+        holders.chunk_leases    = chunk_leases;
+        arena_count_scratch_holders(holders);
+        if (!zone_arena_rebuild_allowed(holders)) {
             const size_t blocked_bytes =
                 live_zone_bytes != 0 ? live_zone_bytes : (scratch_zone + onednn_zone + runtime_zone);
             residency_diagnostics_record_live_handle_for_test("arena-rebuild", "VRAM_ARENA", blocked_bytes);
@@ -7630,10 +7631,37 @@ bool unified_cache::ensure_planned_arena_zones() {
             GGML_LOG_ERROR(
                 "[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "
                 "device_release_retries=%zu device_live_controls=%zu retired_pending=%zu evictions_in_flight=%d "
-                "cache_scratch=%d\n",
+                "cache_scratch_in_arena=%u cache_scratch_outside=%u\n",
                 dev_id, zones_live.c_str(), deferred_in_arena_count, deferred_in_arena_bytes / (1024.0 * 1024.0),
                 device_release_retries, device_live_controls, retired_pending, evictions_in_flight,
-                has_live_scratch ? 1 : 0);
+                holders.scratch_in_arena, holders.scratch_outside);
+            // Who holds the chunk leases: each site that took one, apart from the copies of its handles. The counts are
+            // read after the per-chunk total above, so a lease taken or dropped in between can set the two sums one
+            // apart. Then each zone with live bytes lists its live allocations, through this cache's own dump, which
+            // takes only the runtime registry's lock; that lock ranks after every scratch lock a caller can hold here.
+            std::string leases_by_site;
+            uint32_t    site_leases = 0;
+            for (size_t s = 0; s < static_cast<size_t>(chunk_lease_site::COUNT); ++s) {
+                for (int copy = 0; copy < 2; ++copy) {
+                    const chunk_lease_tag tag{ static_cast<chunk_lease_site>(s), copy != 0 };
+                    const uint32_t        held = arena_chunk_lease_count_at(tag);
+                    site_leases += held;
+                    if (held == 0) {
+                        continue;
+                    }
+                    char part[64];
+                    snprintf(part, sizeof(part), " %s%s=%u", chunk_lease_site_name(tag.site), tag.copy ? "(copy)" : "",
+                             held);
+                    leases_by_site += part;
+                }
+            }
+            GGML_LOG_WARN("[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\n", dev_id,
+                          leases_by_site.empty() ? " none" : leases_by_site.c_str(), site_leases, chunk_leases);
+            for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+                if (live_zone_used[z] != 0) {
+                    dump_live_zone_allocations(static_cast<vram_zone_id>(z), "arena-rebuild");
+                }
+            }
             return false;
         }
 
@@ -23743,8 +23771,8 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         //
         // This must run BEFORE ensure_planned_arena_zones() below, not after
         // (a spec-review finding on the first version of this step): that
-        // function's has_live_scratch refusal check treats a non-null
-        // onednn_*_scratch_ as still-live regardless of who owns it, so a
+        // function's rebuild gate counts an onednn_*_scratch_ the arena owns
+        // as a holder (arena_count_scratch_holders), so a
         // request that needed to GROW the zone would leave its own
         // predecessor's pointers set, self-refuse its own re-plan every time,
         // and fall through to the shared direct-allocation cleanup further
@@ -31491,24 +31519,29 @@ int unified_cache::arena_find_chunk(const void * ptr) const {
     return -1;
 }
 
-int unified_cache::arena_acquire_chunk_lease(const void * ptr) {
+int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag tag) {
     const int idx = arena_find_chunk(ptr);
     if (idx < 0) {
         return -1;
     }
     arena_chunks_[idx].lease_count.fetch_add(1);
+    arena_chunk_leases_of(tag).fetch_add(1, std::memory_order_relaxed);
     return idx;
 }
 
-void unified_cache::arena_release_chunk_lease(int chunk_idx) {
+void unified_cache::arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag) {
     if (chunk_idx < 0 || chunk_idx >= static_cast<int>(arena_chunks_.size())) {
         return;
     }
     const uint32_t prev = arena_chunks_[chunk_idx].lease_count.fetch_sub(1);
     if (prev == 0) {
-        GGML_LOG_ERROR("[VRAM-ARENA] arena_release_chunk_lease: underflow on chunk idx=%d\n", chunk_idx);
+        GGML_LOG_ERROR("[VRAM-ARENA] arena_release_chunk_lease: underflow on chunk idx=%d (site %s%s)\n", chunk_idx,
+                       chunk_lease_site_name(tag.site), tag.copy ? ", copy" : "");
         arena_chunks_[chunk_idx].lease_count.fetch_add(1);
+        // The chunk's count was not lowered, so the site's is not either: the counts by site keep summing to it.
+        return;
     }
+    arena_chunk_leases_of(tag).fetch_sub(1, std::memory_order_relaxed);
 }
 
 bool unified_cache::arena_chunk_has_leases(int chunk_idx) const {
@@ -31523,6 +31556,47 @@ uint32_t unified_cache::arena_chunk_lease_count(int chunk_idx) const {
         return 0;
     }
     return arena_chunks_[chunk_idx].lease_count.load();
+}
+
+uint32_t unified_cache::arena_chunk_lease_count_at(chunk_lease_tag tag) const {
+    return arena_chunk_leases_of(tag).load(std::memory_order_relaxed);
+}
+
+void unified_cache::arena_count_scratch_holders(zone_arena_holders & holders) {
+    // A scratch buffer holds the arena only when its pointer lies inside it: one allocated outside keeps its own
+    // memory through a rebuild. The four single buffers are read without their locks, as this check always read them;
+    // the reserve path that asks for a rebuild holds the oneDNN scratch lock, so taking it here would deadlock.
+    auto count = [&](const void * ptr) {
+        if (ptr == nullptr) {
+            return;
+        }
+        if (vram_owns(ptr)) {
+            ++holders.scratch_in_arena;
+        } else {
+            ++holders.scratch_outside;
+        }
+    };
+    count(scratch_pool_ptr_);
+    count(onednn_weights_scratch_);
+    count(onednn_activations_scratch_);
+    count(reorder_temp_buffer_);
+    {
+        // Retired slots count too: a slot still claimed when the ring was replaced keeps its memory until released.
+        std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
+        for (const auto * slots : { &pp_moe_onednn_scratch_slots_, &pp_moe_onednn_retired_slots_ }) {
+            for (const pp_moe_onednn_scratch_slot & slot : *slots) {
+                count(slot.weight);
+                count(slot.activation);
+                count(slot.output);
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(persistent_scratch_mutex_);
+        for (const auto & named : persistent_scratches_) {
+            count(named.second.device_ptr);
+        }
+    }
 }
 
 // llama.cpp-dyhdl: host pinned-pool chunk lease pass-through.

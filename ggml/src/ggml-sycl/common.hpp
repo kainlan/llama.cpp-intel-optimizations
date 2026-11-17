@@ -4547,7 +4547,8 @@ struct ggml_tensor_extra_gpu {
         }
         data_device[dev] = ptr;
         if (ptr) {
-            data_handle[dev] = ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, layout, on_device);
+            data_handle[dev] = ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, layout, on_device,
+                                                                     ggml_sycl::chunk_lease_site::TENSOR_EXTRA);
         } else {
             data_handle[dev] = ggml_sycl::mem_handle{};
         }
@@ -4667,9 +4668,11 @@ struct ggml_tensor_extra_gpu {
         }
 
         if (!installed_source_handle) {
-            data_handle[dev] = on_device ? ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, storage_layout, true) :
-                                           ggml_sycl::mem_handle::from_direct(ptr, storage_layout, false,
-                                                                              ggml_sycl::mem_handle::HOST_DEVICE);
+            data_handle[dev] =
+                on_device ?
+                    ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, storage_layout, true,
+                                                          ggml_sycl::chunk_lease_site::TENSOR_EXTRA) :
+                    ggml_sycl::mem_handle::from_direct(ptr, storage_layout, false, ggml_sycl::mem_handle::HOST_DEVICE);
         }
 
         layout.mode        = storage_layout;
