@@ -32,7 +32,8 @@ keep being true, source-side.  What it checks, by gate:
       message byte for byte; the preload's witness is `held(LOAD)`.
   36  the four plan accessors consult the override first and every other read of the
       publication is theirs; the five scheduler-path latch reads go through the one
-      reader; the override has two writers, one nesting witness, and a snapshot builder
+      reader; the override has two writers, one nesting witness, its other two refusal lines (no
+      plan staged, a refused KV re-fit) at ERROR, and a snapshot builder
       that names no provisional-plan helper; the publish store refuses first; the measure
       backend is non-owning, syntactically.
   37  both pool phase gates skip only under a TRANSACTION token and name their site.
@@ -970,6 +971,11 @@ def gate36(files, bad):
         if 'GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst or \
                 'GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst:
             bad("gate 36: install lacks its nesting witness")
+        # The other two refusals are ERRORs too, so a default-verbosity log names which one failed the load.
+        for line in ("[LOAD-PLAN] measure plan override: no plan staged for load",
+                     "[LOAD-PLAN] measure plan override: the KV re-fit for load"):
+            if not re.search(r'GGML_LOG_ERROR\(\s*"' + re.escape(line), kinst):
+                bad("gate 36: install's refusal %r is not an ERROR" % line)
     # the install's lookup is ggml_sycl_measure_staged_plan, which the loader's staged-plan query reads too
     for fn in ("ggml_backend_sycl_measure_plan_override_install_kv", "ggml_sycl_measure_staged_plan",
                "lifecycle_make_candidate_snapshot"):
