@@ -4691,6 +4691,20 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for the load stage's two passes: every device plans and every refusal of the load is decided before any
+# device is changed (layer streaming, host zones, the stale ring's release), so a load refused on any device leaves
+# every device as it found it. The decide pass releases the PP MoE ring only at the entry ensure, when the ring alone
+# holds an arena that must grow; each device's effects run from its own snapshot under the last device's candidate
+# check; the replaced candidates' leases outlive the effects; a refused arena teardown reserves nothing. Host-only,
+# reads the sources as text. Same registration shape as test-sycl-load-zone-refusal-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-load-stage-effect-pass-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-load-stage-effect-pass-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Jinja fallback for a model whose chat template the built-in matcher does not know (Gemma 4 failed after the load with
 # "try using --jinja"): upstream turns the jinja engine off for llama-completion and llama-mtmd-cli.
 # test-chat-need-jinja checks common_chat_templates_need_jinja() itself. It loads no model, so it keeps the default

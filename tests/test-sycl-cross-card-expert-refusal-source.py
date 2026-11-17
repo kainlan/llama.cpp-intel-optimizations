@@ -2,10 +2,10 @@
 
 With GGML_SYCL_MOE_MULTI_GPU=1 the planner may put expert copies on a second card. The cards on this host have no
 peer path, and a two-card run on that path faulted the first card, so ggml_backend_sycl_stage_load_inventory_plan
-refuses such a plan before any weight is placed. Both of its refusal sites ask: the late pass per device, before it
-configures that device's host zones, and the early pass on the candidate, before it is staged as the probe plan. The
-behaviour of the predicate and of the peer-path read runs in test-sycl-measure-plan-override; this file pins the
-wiring that test cannot reach without a device:
+refuses such a plan before any weight is placed. Both of its refusal sites ask: the late pass per device, in the decide
+loop before any device's host zones are configured, and the early pass on the candidate, before it is staged as the
+probe plan. The behaviour of the predicate and of the peer-path read runs in test-sycl-measure-plan-override; this file
+pins the wiring that test cannot reach without a device:
 
   * at each site the cross-card refusal is asked before the lazy-plan refusal;
   * at each site it returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED, the lazy-plan refusal's return;
@@ -123,10 +123,10 @@ HELPER_SIG = "static bool ggml_sycl_stage_refuse_cross_card_expert_plan(const gg
 
 REJECTED = "return GGML_SYCL_LIFECYCLE_PLAN_REJECTED; }"
 
-# The late pass: per device, after the candidate is checked current and before that device's host zones.
+# The late pass: per device, after the candidate is checked current and before any device's host zones.
 LATE_AFTER = 'throw std::runtime_error("stale host provisioning candidate before allocation");'
-LATE_CROSS = "if (ggml_sycl_stage_refuse_cross_card_expert_plan(snapshot->plan.get())) {"
-LATE_LAZY = "if (ggml_sycl_stage_refuse_lazy_plan(snapshot->plan.get(), early)) {"
+LATE_CROSS = "if (ggml_sycl_stage_refuse_cross_card_expert_plan(decision.snapshot->plan.get())) {"
+LATE_LAZY = "if (ggml_sycl_stage_refuse_lazy_plan(decision.snapshot->plan.get(), early)) {"
 LATE_BEFORE = "ggml_sycl_configure_host_zones_for_plan("
 
 # The early pass: on the candidate every device planned, before it is staged as the probe plan.

@@ -271,7 +271,7 @@ def claim_helper_restores_every_planner_term(uc: str, uch: str, gs: str) -> bool
 # ---- the stage snapshots before the plan with the room and restores in the fallback before the ensure ----
 
 COMPUTE_SIG = "static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t vram_budget,"
-ENTRY_ENSURE = "!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {"
+ENTRY_ENSURE = "!ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)) {"
 SNAPSHOT = (
     "const ggml_sycl::planner_published_terms published_before = "
     "ggml_sycl::planner_published_terms::snapshot(ctx->device);"

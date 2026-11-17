@@ -191,7 +191,7 @@ STAGE_SIG = ("ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_
 STAGE_PROBE = ("if (early) { const uint64_t txn = effect.owner.load.value; "
                "const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(txn); "
                "if (candidate && candidate->plan) { ggml_sycl::lifecycle_stage_probe_placement_plan(txn, "
-               "ggml_sycl::placement_plan(*candidate->plan), candidate->kv_info, candidate->model_n_layer); } }")
+               "ggml_sycl::placement_plan(*candidate->plan), candidate->kv_info, candidate->model_n_layer); }")
 
 
 # ---- (a) the reservation: refusals first, the allocator's grain, the planner term only ----------------------------
@@ -387,8 +387,9 @@ def claim_early_plan_stages_the_probe_plan(sycl: str) -> bool:
     of the load's early candidate, after every device planned it. Without it every SYCL load's probe measure refuses
     (no plan staged), and nothing on the host would notice."""
     b = body(norm(sycl), STAGE_SIG)
-    return (bool(b) and ordered(b, "if (early) { ggml_sycl_compute_placement_plan_early_impl(backend, inventory, "
-                                "&plan_refused); if (plan_refused) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED; } }",
+    return (bool(b) and ordered(b, "if (early) { const int planned = ggml_sycl_compute_placement_plan_early_impl("
+                                "backend, inventory, &plan_refused); if (plan_refused) { return "
+                                "GGML_SYCL_LIFECYCLE_PLAN_REJECTED; }",
                                 STAGE_PROBE)
             and b.count("lifecycle_stage_probe_placement_plan(") == 1)
 

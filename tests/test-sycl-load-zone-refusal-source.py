@@ -132,15 +132,17 @@ def mutate_in(src: str, sig: str, old: str, new: str) -> str:
 
 # The definitions, by the part of each signature that names the return type: compute_and_store returns bool.
 COMPUTE_SIG = "static bool compute_and_store_plan_for_inventory("
-EARLY_SIG = "static void ggml_sycl_compute_placement_plan_early_impl("
+EARLY_SIG = "static int ggml_sycl_compute_placement_plan_early_impl("
 LATE_SIG = "static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl("
 STAGE_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan("
 EXPORTED_EARLY_SIG = "void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t backend,"
 EXPORTED_LATE_SIG = "void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend,"
 PATH_SIGS = (COMPUTE_SIG, EARLY_SIG, LATE_SIG, STAGE_SIG)
 
+# The entry ensure goes through the load's last-resort ring release (test-sycl-load-stage-effect-pass-source pins it),
+# which writes the same refusal.
 ENTRY_ENSURE = ("if (ggml_sycl::get_unified_cache_for_device(ctx->device) && "
-                "!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {")
+                "!ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)) {")
 FALLBACK_ENSURE = "if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {"
 REFUSE = 'GGML_LOG_ERROR("%s\\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str()); return false; }'
 ABORT_LINE = 'GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");'
@@ -162,14 +164,14 @@ def claim_both_ensures_refuse_by_name(gs: str) -> bool:
 
 # The stage's per-device calls and what each does with a refused plan. The late refusal is read before the staged
 # candidate is checked.
-STAGE_EARLY = ("bool plan_refused = false; if (early) { "
+STAGE_EARLY = ("bool plan_refused = false; if (early) { const int planned = "
                "ggml_sycl_compute_placement_plan_early_impl(backend, inventory, &plan_refused); "
-               "if (plan_refused) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED; } } else {")
-STAGE_LATE = ("const auto snapshot = ggml_sycl_set_tensor_inventory_impl(backend, inventory, &plan_refused); "
-              "if (plan_refused) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED; }")
-STAGE_CANDIDATE_CHECK = "if (!candidate_is_current()) {"
+               "if (plan_refused) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED; }")
+STAGE_LATE = ("decision.snapshot = ggml_sycl_set_tensor_inventory_impl(backend, inventory, &plan_refused, "
+              "decision.effects); if (plan_refused) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED; }")
+STAGE_CANDIDATE_CHECK = "if (!candidate_is_current(decision.snapshot)) {"
 PLAN_CALL = "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)"
-EARLY_PROPAGATE = "if (!" + PLAN_CALL + " && plan_refused != nullptr) { *plan_refused = true; }"
+EARLY_PROPAGATE = "if (!" + PLAN_CALL + ") { if (plan_refused != nullptr) { *plan_refused = true; } return -1; }"
 LATE_PROPAGATE = "if (!" + PLAN_CALL + ") { if (plan_refused != nullptr) { *plan_refused = true; } return {}; }"
 
 
@@ -181,7 +183,7 @@ def claim_every_caller_propagates(gs: str) -> bool:
             and ordered(stage, STAGE_EARLY, STAGE_LATE, STAGE_CANDIDATE_CHECK)
             and "ggml_sycl_compute_placement_plan_early_impl(backend, inventory, nullptr);" in
             fn_body(c, EXPORTED_EARLY_SIG)
-            and "(void) ggml_sycl_set_tensor_inventory_impl(backend, inventory, nullptr);" in
+            and "(void) ggml_sycl_set_tensor_inventory_impl(backend, inventory, nullptr, effects);" in
             fn_body(c, EXPORTED_LATE_SIG))
 
 
@@ -222,7 +224,7 @@ def claim_refusal_names_need_and_have(uc: str, zs: str) -> bool:
     c = code(uc)
     ensure = fn_body(c, ENSURE_SIG)
     text = fn_body(code(zs), TEXT_SIG)
-    return (ordered(ensure, ZONES_READ, "if (!zone_arena_rebuild_allowed(holders)) {", HELD_FILL, "arena_destroy();",
+    return (ordered(ensure, ZONES_READ, "if (!zone_arena_rebuild_allowed(holders)) {", HELD_FILL, "if (!arena_destroy()) {",
                     "if (!arena_reserve(", RESERVE_FILL)
             and NO_CACHE_FILL in fn_body(c, WRAPPER_SIG)
             and all(z in text for z in TEXT_ZONES) and TEXT_FORMAT in text and all(f in text for f in TEXT_SMALL)
@@ -234,7 +236,7 @@ def claim_refusal_names_need_and_have(uc: str, zs: str) -> bool:
 ABORT_SIG = "static bool ggml_sycl_abort_owner_effects_noexcept("
 LOAD_END_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn txn,"
 CAPTURE = "ggml_sycl_load_published_terms_capture(effect.owner.load.value);"
-STAGE_LOOP = "for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {"
+STAGE_LOOP = "for (int i = 0; i < n_devices; ++i) {"
 # The restore runs outside every try stage of the abort, as the planned-load-terms drop does, so no failed stage skips it
 # and the abort gains no catch handler; it is noexcept where it is defined.
 RESTORE = "ggml_sycl_load_published_terms_restore(owner.load.value);"
@@ -395,8 +397,8 @@ def test_both_ensures_refuse_by_name():
 
 
 def test_witness_entry_ensure_fills_no_refusal():
-    m = mutate_in(GS, COMPUTE_SIG, "ensure_planned_arena_zones(ctx->device, &refusal)) { GGML_LOG",
-                  "ensure_planned_arena_zones(ctx->device)) { GGML_LOG")
+    m = mutate_in(GS, COMPUTE_SIG, "!ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)) { GGML_LOG",
+                  "!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) { GGML_LOG")
     assert not claim_both_ensures_refuse_by_name(m)
 
 
@@ -417,17 +419,18 @@ def test_every_caller_propagates_the_refusal():
 
 
 def test_witness_stage_early_ignores_the_refusal():
-    m = mutate_in(GS, STAGE_SIG, "if (plan_refused) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED; } } else {",
-                  "} else {")
+    m = mutate_in(GS, STAGE_SIG, "if (plan_refused) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED; } if (planned >= 0) {",
+                  "if (planned >= 0) {")
     assert not claim_every_caller_propagates(m)
 
 
 def test_witness_stage_late_checks_the_candidate_first():
     late_check = "if (plan_refused) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED; }"
     m = mutate_in(GS, STAGE_SIG, STAGE_LATE,
-                  "const auto snapshot = ggml_sycl_set_tensor_inventory_impl(backend, inventory, &plan_refused);")
-    m = mutate_in(m, STAGE_SIG, "if (ggml_sycl_stage_refuse_lazy_plan(snapshot->plan.get(), early)) {",
-                  late_check + " if (ggml_sycl_stage_refuse_lazy_plan(snapshot->plan.get(), early)) {")
+                  "decision.snapshot = ggml_sycl_set_tensor_inventory_impl(backend, inventory, &plan_refused, "
+                  "decision.effects);")
+    m = mutate_in(m, STAGE_SIG, "if (ggml_sycl_stage_refuse_lazy_plan(decision.snapshot->plan.get(), early)) {",
+                  late_check + " if (ggml_sycl_stage_refuse_lazy_plan(decision.snapshot->plan.get(), early)) {")
     assert not claim_every_caller_propagates(m)
 
 
@@ -451,9 +454,10 @@ def test_witness_exported_early_entry_aborts_on_the_flag():
 
 
 def test_witness_exported_late_entry_aborts_on_the_flag():
-    m = mutate_in(GS, EXPORTED_LATE_SIG, "(void) ggml_sycl_set_tensor_inventory_impl(backend, inventory, nullptr);",
-                  "bool refused = false; (void) ggml_sycl_set_tensor_inventory_impl(backend, inventory, &refused); "
-                  "GGML_ASSERT(!refused);")
+    m = mutate_in(GS, EXPORTED_LATE_SIG,
+                  "(void) ggml_sycl_set_tensor_inventory_impl(backend, inventory, nullptr, effects);",
+                  "bool refused = false; (void) ggml_sycl_set_tensor_inventory_impl(backend, inventory, &refused, "
+                  "effects); GGML_ASSERT(!refused);")
     assert not claim_every_caller_propagates(m)
 
 

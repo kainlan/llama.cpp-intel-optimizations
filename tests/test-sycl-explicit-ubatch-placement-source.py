@@ -211,7 +211,8 @@ DEMAND_READER = "{ return zone_hold_fit_terms_at(in, n_ubatch).demand; }"
 
 # A RUNTIME zone an earlier load grew: one WARN after the late plan, gated by the predicate on the zone the plan sizes.
 SET_INV_SIG = ("static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl("
-               "ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory, bool * plan_refused)")
+               "ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory, bool * plan_refused, "
+               "ggml_sycl_inventory_effects & effects)")
 # The late plan, which returns before the WARN when the arena's zones cannot hold it.
 LATE_REFUSE = ("if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) { "
                "if (plan_refused != nullptr) { *plan_refused = true; } return {}; }")
@@ -1017,11 +1018,12 @@ def test_mutant_grown_zone_warn_before_the_plan_fails():
 def test_mutant_grown_zone_warn_from_the_early_plan_too_fails():
     """Asked from the early plan as well, one load prints it twice."""
     early = ("compute_vram_budget_for_plan(ctx, vram_budget, budget_pct, base_mem, free_mem); "
-             "if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct) && plan_refused != nullptr) { "
-             "*plan_refused = true; } }")
+             "if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) { "
+             "if (plan_refused != nullptr) { *plan_refused = true; } return -1; } return ctx->device; }")
     n = norm(SYCL_CPP)
     assert n.count(early) == 1
-    n = n.replace(early, early[:-1] + "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); }", 1)
+    n = n.replace(early, early[:-len("return ctx->device; }")] +
+                  "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); return ctx->device; }", 1)
     assert not claim_grown_zone_is_announced(n, ZONE_CPP)
 
 
