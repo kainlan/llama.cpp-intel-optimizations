@@ -7541,9 +7541,13 @@ bool unified_cache::ensure_planned_arena_zones() {
             return true;
         }
 
-        size_t live_zone_bytes = 0;
+        // Each zone's reading is kept, so a refusal below prints the same figures it decided on: a second read could
+        // disagree with them under a concurrent release.
+        size_t live_zone_used[static_cast<size_t>(vram_zone_id::COUNT)] = {};
+        size_t live_zone_bytes                                          = 0;
         for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
-            live_zone_bytes += zone_used(static_cast<vram_zone_id>(z));
+            live_zone_used[z] = zone_used(static_cast<vram_zone_id>(z));
+            live_zone_bytes += live_zone_used[z];
         }
 
         bool     has_chunk_leases = false;
@@ -7574,48 +7578,49 @@ bool unified_cache::ensure_planned_arena_zones() {
                 zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
                 zone_capacity(vram_zone_id::RUNTIME) / (1024.0 * 1024.0), live_zone_bytes / (1024.0 * 1024.0),
                 chunk_leases);
-            // The total above cannot say who holds the arena. Each zone's live bytes, the frees still queued behind
-            // a GPU event, and the releases an arena lease refused tell a free that has not run yet from an owner
-            // that was never released. Only a queued free that is a zone sub-allocation or points into the arena
-            // is counted: its bytes stay in the zone's used counter until the queue drains at a later allocation,
-            // while a queued direct allocation outside the arena is in no zone. The bytes are the requested sizes;
-            // the zones count them rounded up to the allocator's block. Each lock is taken alone and released
-            // before the log, and nothing here frees, drains or allocates.
-            size_t deferred_count = 0;
-            size_t deferred_bytes = 0;
+            // The total above cannot say who holds the arena. This line prints each zone's live bytes from the reading
+            // the refusal decided on, the queued frees those zones still count, and the device's releases an arena
+            // lease refused, which tell a free that has not run yet from an owner that was never released.
+            // deferred_in_arena counts only a queued free that is a zone sub-allocation or points into the arena:
+            // its bytes stay in the zone's used counter until the queue drains at a later allocation, while a queued
+            // direct allocation outside the arena is in no zone. Its MB figure is the requested sizes; the zones
+            // count them rounded up to the allocator's block. The retries and live controls are the whole device's
+            // release coordinator's, not only this arena's. Each lock is taken alone and released before the log,
+            // and nothing here drains, frees, evicts, resets or allocates device memory.
+            size_t deferred_in_arena_count = 0;
+            size_t deferred_in_arena_bytes = 0;
             {
                 std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);
                 for (const deferred_free_entry & entry : deferred_frees_) {
                     if (entry.zone_managed || vram_owns(entry.ptr)) {
-                        ++deferred_count;
-                        deferred_bytes += entry.size;
+                        ++deferred_in_arena_count;
+                        deferred_in_arena_bytes += entry.size;
                     }
                 }
             }
             // The coordinator is looked up, not created: the accessor that hands one out makes it when it is missing.
-            size_t release_retries = 0;
-            size_t live_controls   = 0;
+            size_t device_release_retries = 0;
+            size_t device_live_controls   = 0;
             {
                 std::lock_guard<std::mutex> coordinator_lock(g_allocation_coordinator_mutex);
                 const auto                  it = g_allocation_coordinators.find(dev_id);
                 if (it != g_allocation_coordinators.end() && it->second) {
-                    release_retries = it->second->retry_count();
-                    live_controls   = it->second->live_controls();
+                    device_release_retries = it->second->retry_count();
+                    device_live_controls   = it->second->live_controls();
                 }
             }
             std::string zones_live;
             for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
-                const vram_zone_id zone = static_cast<vram_zone_id>(z);
-                char               part[48];
-                snprintf(part, sizeof(part), "%s%s=%.1f", z == 0 ? "" : " ", arena_zone_name(zone),
-                         zone_used(zone) / (1024.0 * 1024.0));
+                char part[48];
+                snprintf(part, sizeof(part), "%s%s=%.1f", z == 0 ? "" : " ",
+                         arena_zone_name(static_cast<vram_zone_id>(z)), live_zone_used[z] / (1024.0 * 1024.0));
                 zones_live += part;
             }
             GGML_LOG_ERROR(
-                "[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_frees=%zu (%.1f MB) "
-                "release_retries=%zu live_controls=%zu cache_scratch=%d\n",
-                dev_id, zones_live.c_str(), deferred_count, deferred_bytes / (1024.0 * 1024.0), release_retries,
-                live_controls, has_live_scratch ? 1 : 0);
+                "[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "
+                "device_release_retries=%zu device_live_controls=%zu cache_scratch=%d\n",
+                dev_id, zones_live.c_str(), deferred_in_arena_count, deferred_in_arena_bytes / (1024.0 * 1024.0),
+                device_release_retries, device_live_controls, has_live_scratch ? 1 : 0);
             return false;
         }
 
