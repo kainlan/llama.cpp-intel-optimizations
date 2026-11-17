@@ -880,10 +880,12 @@ static bool run_explicit_ubatch_ring_placement_test() {
         const size_t at_512 = ggml_sycl::placement_plan_compute_room(shaped, 0, compute_term, 512, &n);
         bool         good   = at_512 == compute_term && n == 512;
 
-        // the planning rung and the rungs below it are credited, by the fit's own rung test, never a rung above
+        // the planning rung and the rungs below it are credited, by the fit's own rung test, never a rung above; a plan
+        // that named no micro-batch has its room at the rung the load measured the term at, so the two rungs agree
         ggml_sycl::zone_hold_fit_inputs fit = {};
         fit.compute_room_n_ubatch           = n;
         fit.compute_room_bytes              = at_512;
+        fit.compute_room_measured_n_ubatch  = n;
         good = good && ggml_sycl::zone_hold_fit_rung_has_compute_room(fit, 512, compute_term, true) &&
                ggml_sycl::zone_hold_fit_rung_has_compute_room(fit, 256, compute_term / 2, false) &&
                !ggml_sycl::zone_hold_fit_rung_has_compute_room(fit, 1024, compute_term, false);

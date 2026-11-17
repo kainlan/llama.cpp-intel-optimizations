@@ -1754,11 +1754,19 @@ int main() {
         in.n_rungs = 0;
         CHECK(ggml_sycl::zone_hold_fit_demand(in, 2048) == 98 * MiB - 64 * MiB, "no record: the plan alone");
         in.n_rungs            = 1;
-        // A rung below the room's rung with no record of its own is served by the room: 1024 here.
         in.compute_room_bytes = room;
-        CHECK(ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 1024, 980 * MiB, false), "a rung below the room");
-        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 98 * MiB - 64 * MiB,
-              "1024's scaled buffer is credited: the plan alone");
+
+        // The load measured the term at its planning shape, ubatch 512, below the placed 2048. A rung without a record
+        // of its own is served only at or below that rung, since compute buffers grow with the micro-batch: 1024,
+        // scaled from the 2048 record, is judged as before, and 512 is served.
+        in.compute_room_measured_n_ubatch = 512;
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 1024, 980 * MiB, false),
+              "1024 is above the rung the term was measured at");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 98 * MiB + 980 * MiB - 64 * MiB,
+              "so 1024 is charged its scaled buffer whole");
+        CHECK(ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 512, 490 * MiB, false), "512 is at the measured rung");
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == 98 * MiB - 64 * MiB,
+              "so 512's scaled buffer is credited: the plan alone");
         CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 4096, 1, false), "a rung above the room is not");
         // An unknown micro-batch never matches a room, not even a room for micro-batch 0.
         in.compute_room_n_ubatch = 0;
@@ -1841,14 +1849,16 @@ int main() {
         CHECK(!zone_compute_term_n_ubatch_turns_off(0, 0), "no record and no store does not");
     }
 
-    // ---- Case 24d (compute room, scoped): the room serves the rung the plan sized it for and every rung below it, and
-    // no other. Over every record set the cases above use, every rung from 32 to 8192 gets the demand the fit gave
-    // before the room existed (spill bound over the plan and the rung's request, net of the KV room, plus the
-    // uncovered ring) when no rung is named, even with a room of SIZE_MAX. When one is named, every rung above it gets
-    // that demand too, and every rung at or below it the demand with its request credited (the plan alone, net of the
-    // KV room, plus the uncovered ring: a room of SIZE_MAX holds any request), except the rung whose own buffer was
-    // held out, which gets the demand before the room. So a fit given no room, and every rung above the room's rung
-    // of one given a room, are judged as before. --------------------------------------------------------------------
+    // ---- Case 24d (compute room, scoped): the room serves only rungs at or below the rung the plan sized it for. Over
+    // every record set the cases above use, every rung from 32 to 8192 gets the demand the fit gave before the room
+    // existed (spill bound over the plan and the rung's request, net of the KV room, plus the uncovered ring) when no
+    // rung is named, even with a room of SIZE_MAX. When one is named, a rung gets the demand with its request credited
+    // (the plan alone, net of the KV room, plus the uncovered ring) exactly when the rule written out below credits
+    // it, and the demand before the room otherwise: at or below the room's rung, not the held-out rung, and either
+    // with a record of its own (a room of SIZE_MAX holds any) or at or below the rung the term was measured at. The
+    // arms name the term measured at the room's rung, below it (the planning shape under a placed micro-batch), and
+    // not at all, and hold one rung out. So a fit given no room, and every rung above the room's rung of one given a
+    // room, are judged as before. -------------------------------------------------------------------------------------
     {
         const size_t MiB = 1024 * 1024;
 
@@ -1917,6 +1927,20 @@ int main() {
             size_t                                    n;
         };
 
+        // The credit rule, written out from its statement rather than from the function under test.
+        auto credited_by_rule = [](const record_set & set, uint32_t n, uint32_t room_n, uint32_t measured_n,
+                                   uint32_t held_n) -> bool {
+            if (n > room_n || n == held_n) {
+                return false;
+            }
+            for (size_t i = 0; i < set.n; ++i) {
+                if (set.rungs[i].n_ubatch == n) {
+                    return true;
+                }
+            }
+            return measured_n != 0 && n <= measured_n;
+        };
+
         const record_set sets[] = {
             { nullptr,    0 },
             { set_g7,     2 },
@@ -1947,22 +1971,33 @@ int main() {
                         // No rung named: a room of any size is inert.
                         ggml_sycl::zone_hold_fit_inputs unnamed = before;
                         unnamed.compute_room_bytes              = SIZE_MAX;
-                        // The rung the Qwen3.8 load placed named: it and every rung below it are served, every
-                        // rung above it is judged as before.
+                        // The rung the Qwen3.8 load placed named, with the term measured at that rung.
                         ggml_sycl::zone_hold_fit_inputs named   = unnamed;
                         named.compute_room_n_ubatch             = 2048;
-                        // A realized check at 1024 whose own buffer was held out: that rung alone loses the credit.
+                        named.compute_room_measured_n_ubatch    = 2048;
+                        // The term measured at the load's planning shape, ubatch 512, below the placed rung.
+                        ggml_sycl::zone_hold_fit_inputs low     = named;
+                        low.compute_room_measured_n_ubatch      = 512;
+                        // The rung the term was measured at unknown.
+                        ggml_sycl::zone_hold_fit_inputs blind   = named;
+                        blind.compute_room_measured_n_ubatch    = 0;
+                        // A realized check at 1024 whose own buffer was held out.
                         ggml_sycl::zone_hold_fit_inputs held    = named;
                         held.held_out_n_ubatch                  = 1024;
                         for (uint32_t n = 32; n <= 8192; n += 32) {
                             const size_t want   = demand_before_room(before, n);
-                            const size_t served = n <= 2048 ? demand_credited(before, n) : want;
+                            const size_t credit = demand_credited(before, n);
+                            auto expect = [&](uint32_t measured_n, uint32_t held_n) -> size_t {
+                                return credited_by_rule(set, n, 2048, measured_n, held_n) ? credit : want;
+                            };
                             ++asked;
                             if (ggml_sycl::zone_hold_fit_demand(before, n) != want ||
                                 ggml_sycl::zone_hold_fit_demand(unnamed, n) != want ||
                                 ggml_sycl::zone_hold_fit(unnamed, n) != ggml_sycl::zone_hold_fit(before, n) ||
-                                ggml_sycl::zone_hold_fit_demand(named, n) != served ||
-                                ggml_sycl::zone_hold_fit_demand(held, n) != (n == 1024 ? want : served)) {
+                                ggml_sycl::zone_hold_fit_demand(named, n) != expect(2048, 0) ||
+                                ggml_sycl::zone_hold_fit_demand(low, n) != expect(512, 0) ||
+                                ggml_sycl::zone_hold_fit_demand(blind, n) != expect(0, 0) ||
+                                ggml_sycl::zone_hold_fit_demand(held, n) != expect(2048, 1024)) {
                                 ++mismatches;
                             }
                         }
@@ -1976,8 +2011,8 @@ int main() {
         }
         CHECK(asked == 9 * 5 * 3 * 2 * 256, "the sweep asked every rung of every configuration");
         CHECK(mismatches == 0,
-              "the named rung and every rung below it are credited; the held-out rung and every rung above are judged "
-              "as before the room");
+              "a named room credits exactly the rungs its rule credits; every other rung is judged as before the "
+              "room");
     }
 
     // ---- Case 24e (a RUNTIME zone an earlier load grew): the arena reserves the larger of the floor and the
@@ -2021,7 +2056,7 @@ int main() {
               "a saturated plan never wraps into a kept zone");
     }
 
-    // ---- Case 24f: the -ub a hold-spill refusal names is never below a rung the zone was planned to serve. The B50 /
+    // ---- Case 24i: the -ub a hold-spill refusal names is never below a rung the zone was planned to serve. The B50 /
     // GPT-OSS 20B MXFP4 context at -ub 1024: a planned dense scratch of about 1108 MiB of f16 dequant weight plus
     // 9 KiB per token (1117.1 MiB at 1024, 1112.6 MiB at 512), one 808 MiB compute buffer at 1024 held outside the
     // arena, 141.3 MiB of KV-zone room, 1622.8 MiB free before the rung, and the 404.0 MiB compute term the load
@@ -2049,30 +2084,73 @@ int main() {
         CHECK(!ggml_sycl::zone_hold_fit(in, 1024), "1024 does not fit: 1783.8 MiB of demand on 1622.8 MiB free");
         CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) == 256, "with no room the descent names 256");
 
-        // The room the load planned, at the rung it measured, and the rung whose buffer was held out.
-        in.compute_room_n_ubatch = 512;
-        in.compute_room_bytes    = 404 * MiB;
-        in.held_out_n_ubatch     = 1024;
-        CHECK(!ggml_sycl::zone_hold_fit(in, 1024), "1024 stays refused: its own buffer was held out");
+        // The room a load that named no micro-batch planned, at the rung it measured, and the rung whose buffer was
+        // held out.
+        in.compute_room_n_ubatch          = 512;
+        in.compute_room_bytes             = 404 * MiB;
+        in.compute_room_measured_n_ubatch = 512;
+        in.held_out_n_ubatch              = 1024;
+        CHECK(!ggml_sycl::zone_hold_fit(in, 1024), "1024 stays refused: it is above the room's rung");
         CHECK(!ggml_sycl::zone_hold_fit_terms_at(in, 1024).request_credited, "and gets no credit");
         CHECK(ggml_sycl::zone_hold_fit_terms_at(in, 512).request_credited,
-              "512 has no record of its own and is at the room's rung: the zone holds its buffers");
+              "512 has no record of its own and is at the room's and the measured rung: the zone holds its buffers");
         CHECK(ggml_sycl::zone_hold_fit(in, 512), "so 512 fits: 971.3 MiB of demand leaves 651.5 MiB");
         CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) == 512, "and the refusal names 512, the width that runs");
 
+        // The shape of the B50 gate log: the load placed -ub 1024, so the room's rung is 1024, but its bytes are the
+        // 404.0 MiB term measured at 512. 1024 was held out; 512 is at the measured rung.
+        in.compute_room_n_ubatch          = 1024;
+        in.compute_room_bytes             = 404 * MiB;
+        in.compute_room_measured_n_ubatch = 512;
+        in.held_out_n_ubatch              = 1024;
+        CHECK(!ggml_sycl::zone_hold_fit_terms_at(in, 1024).request_credited, "the gate's 1024 gets no credit");
+        CHECK(ggml_sycl::zone_hold_fit_terms_at(in, 512).request_credited, "the gate's 512 is credited");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) == 512, "and the gate's refusal names 512");
+
+        // A placed 2048 over a term measured at 512, before any rung has a record: a rung without one is credited
+        // only at or below the rung the term was measured at, never between it and the room's rung.
+        in.n_rungs                        = 0;
+        in.compute_room_n_ubatch          = 2048;
+        in.compute_room_measured_n_ubatch = 512;
+        in.held_out_n_ubatch              = 0;
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 1024, 0, false),
+              "1024 is above the measured rung: no credit");
+        CHECK(ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 512, 0, false), "512 is at the measured rung");
+        CHECK(ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 256, 0, false), "256 is below it");
+
+        // An unknown measured rung gives no rung without a record any credit; a rung's own record is judged as before.
+        in.compute_room_n_ubatch          = 512;
+        in.compute_room_measured_n_ubatch = 0;
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 512, 0, false), "no measured rung: 512 no credit");
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 256, 0, false), "nor 256");
+        CHECK(ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 512, 400 * MiB, true),
+              "a record within the room is still credited");
+        CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 512, 405 * MiB, true),
+              "a record above the room still is not");
+        in.n_rungs = 1;
+
         // The room moves to the caller's micro-batch once the load measures there: a rung below it is still credited.
-        in.compute_room_n_ubatch = 1024;
-        in.compute_room_bytes    = 808 * MiB;
+        in.compute_room_n_ubatch          = 1024;
+        in.compute_room_bytes             = 808 * MiB;
+        in.compute_room_measured_n_ubatch = 1024;
+        in.held_out_n_ubatch              = 1024;
         CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) == 512, "a rung below the room's rung keeps the credit");
+
+        // Only the held-out flag decides: a room that holds 1024's own record, at the rung the term was measured at.
+        in.compute_room_bytes = 809 * MiB;
+        CHECK(!ggml_sycl::zone_hold_fit_terms_at(in, 1024).request_credited,
+              "1024's record fits the room, but its own buffer was held out: no credit");
+        in.held_out_n_ubatch = 0;
+        CHECK(ggml_sycl::zone_hold_fit_terms_at(in, 1024).request_credited, "with no rung held out it is credited");
 
         // A rung's own record is compared with the room, whole or nothing, as before.
         ggml_sycl::zone_hold_rung_request own[] = {
             { 512, 405 * MiB }
         };
-        in.rungs                 = own;
-        in.compute_room_n_ubatch = 512;
-        in.compute_room_bytes    = 404 * MiB;
-        in.held_out_n_ubatch     = 0;
+        in.rungs                          = own;
+        in.compute_room_n_ubatch          = 512;
+        in.compute_room_bytes             = 404 * MiB;
+        in.compute_room_measured_n_ubatch = 512;
         CHECK(!ggml_sycl::zone_hold_fit_terms_at(in, 512).request_credited, "a record above the room is not credited");
         // A rung above the room's rung never borrows it.
         CHECK(!ggml_sycl::zone_hold_fit_rung_has_compute_room(in, 1024, 1, false), "above the room's rung: no credit");
