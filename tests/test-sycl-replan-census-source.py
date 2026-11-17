@@ -967,7 +967,7 @@ def gate36(files, bad):
         first = inst.find("g_measure_plan_override")
         if first < 0 or "return false" not in inst[:inst.find("g_measure_plan_override =") if "g_measure_plan_override =" in inst else 0]:
             bad("gate 36: install does not refuse a nest before it writes")
-        if 'GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst or \
+        if 'GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst or \
                 'GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst:
             bad("gate 36: install lacks its nesting witness")
     for fn in ("ggml_backend_sycl_measure_plan_override_install_kv", "lifecycle_make_candidate_snapshot"):
@@ -1413,8 +1413,8 @@ def mutants(files):
                 "static void ggml_sycl_stray_ov() { g_measure_plan_override.reset(); }\nstatic size_t ggml_sycl_host_chunk_cap_constant() {", "g36d"),
            "g_measure_plan_override is written in")
     yield ("install without its nesting witness",
-           edit(files, M, "GGML_LOG_WARN(\"[CONTEXT-PLAN-BUG] measure plan override nested\\n\");",
-                "GGML_LOG_WARN(\"measure plan override nested\\n\");", "g36e"),
+           edit(files, M, "GGML_LOG_ERROR(\"[CONTEXT-PLAN-BUG] measure plan override nested\\n\");",
+                "GGML_LOG_ERROR(\"measure plan override nested\\n\");", "g36e"),
            "install lacks its nesting witness")
     yield ("install naming the provisional builder",
            edit(files, M, "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;\n    switch (stage) {",
