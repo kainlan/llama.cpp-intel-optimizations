@@ -2,24 +2,23 @@
 // matcher can render a template set. llama-completion runs the built-in matcher by default and has to switch to the
 // jinja engine for a model whose template the matcher does not know.
 
+#include "chat.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
 
-#include "chat.h"
-
-#define CHECK(cond)                                                              \
-    do {                                                                         \
-        if (!(cond)) {                                                           \
+#define CHECK(cond)                                                                  \
+    do {                                                                             \
+        if (!(cond)) {                                                               \
             fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #cond); \
-            return 1;                                                            \
-        }                                                                        \
+            return 1;                                                                \
+        }                                                                            \
     } while (0)
 
 // A template no entry of the built-in matcher recognises.
-static const char * UNKNOWN_TEMPLATE =
-    "{% for m in messages %}<<turn:{{ m.role }}>>{{ m.content }}<<end>>{% endfor %}";
+static const char * UNKNOWN_TEMPLATE = "{% for m in messages %}<<turn:{{ m.role }}>>{{ m.content }}<<end>>{% endfor %}";
 
 static common_chat_templates_inputs one_user_message(bool use_jinja) {
     common_chat_msg msg;

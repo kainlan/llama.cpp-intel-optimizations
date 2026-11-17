@@ -1,5 +1,5 @@
-"""Source contract: llama-completion picks the jinja engine by itself when the built-in matcher cannot render the model's
-chat template.
+"""Source contract: llama-completion picks the jinja engine by itself when the built-in matcher cannot render the
+model's chat template.
 
 Upstream turns the jinja engine off by default for this tool (common/arg.cpp), and the built-in matcher
 (llama_chat_apply_template) knows a fixed list of templates. A model outside that list (Gemma 4) failed after the model
@@ -114,7 +114,7 @@ def violations_completion(cpp: str) -> list[str]:
     if not re.search(r"params\.use_jinja\s*=\s*true\s*;", block):
         found.append("the fallback block does not set params.use_jinja = true")
     if "LOG_WRN(" not in block:
-        found.append("the fallback block must say it switched engines at LOG_WRN (LOG_INF is dropped at default verbosity)")
+        found.append("the fallback block must say it switched engines at LOG_WRN (LOG_INF is dropped by default)")
     anchor = body.find(RESOLVED_ANCHOR)
     if anchor == -1:
         found.append(f"anchor {RESOLVED_ANCHOR!r} (conversation mode resolution) not found in llama_completion()")
@@ -123,7 +123,7 @@ def violations_completion(cpp: str) -> list[str]:
     other_reads = [m.start() for m in re.finditer(r"use_jinja", body) if not (s <= m.start() <= e)]
     early = [p for p in other_reads if p < s]
     if early:
-        found.append("something reads use_jinja before the fallback block: " + norm(body[early[0] - 40 : early[0] + 60]))
+        found.append("use_jinja is read before the fallback block: " + norm(body[early[0] - 40 : early[0] + 60]))
     add_bos = body.find("const bool add_bos")
     if add_bos == -1:
         found.append("the add_bos line was not found in llama_completion()")
@@ -218,7 +218,7 @@ def test_helper_gate_has_a_witness():
         r"(common_chat_verify_template\(\s*\w+\s*,\s*(?:/\*[^*]*\*/\s*)?)false", r"\1true", CHAT_CPP
     )
     assert flipped != CHAT_CPP
-    assert violations_helper(CHAT_H, flipped), "asking the jinja verifier cannot detect an unsupported built-in template"
+    assert violations_helper(CHAT_H, flipped), "the jinja verifier cannot detect an unsupported built-in template"
     assert violations_helper(CHAT_H.replace(HELPER, "common_chat_templates_gone"), CHAT_CPP)
 
 
