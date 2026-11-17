@@ -19882,8 +19882,9 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     return fits;
 }
 
-// What F3 and the non-FA check add to their own demand: the raw bytes the hold can push outside the arena at the rung,
-// plus the prefill-ring bytes neither the planned room nor a loan covers, from the one fit function.
+// What F3, the non-FA check and the oneDNN Graph scratch check add to their own demand: the raw bytes the hold can push
+// outside the arena at the rung, plus the prefill-ring bytes neither the planned room nor a loan covers, from the one fit
+// function.
 static size_t ggml_sycl_planned_scratch_hold_spill_bound(const ggml_sycl_hold_fit_query & q) {
     ggml_sycl_hold_fit_answer a;
     (void) ggml_sycl_hold_spill_fit(q, &a);
