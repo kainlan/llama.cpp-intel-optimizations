@@ -696,6 +696,8 @@ inline std::string ubatch_device_set_key(const UbatchDeviceTopology &           
 
 // The moe_row_ceiling of a key read from an entry that has no such field. No picker stores this value, so such an
 // entry never equals the key a lookup builds: it misses, and the next store for that key appends a current entry.
+// No code may ever store this value as a real ceiling. A save writes the old entries back with it, so a stored
+// 4294967295 in the file could not be told from an entry that never had the field.
 constexpr uint32_t UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED = UINT32_MAX;
 
 struct UbatchCacheKey {
@@ -818,6 +820,23 @@ inline uint64_t parse_u64(const std::string & json, const std::string & key) {
     return val;
 }
 
+// Parse an unsigned 32-bit value at key position, or return `fallback`. A key that is absent, a value whose first
+// character after the key and spaces is not a decimal digit (a sign, null, a quoted string, nothing), and a value above
+// 32 bits all return `fallback`: parse_u64() answers 0 for the first group, and 0 is a real value for some fields.
+inline uint32_t parse_u32_or(const std::string & json, const std::string & key, uint32_t fallback) {
+    const std::string search = "\"" + key + "\":";
+    const size_t      found  = json.find(search);
+    if (found == std::string::npos) {
+        return fallback;
+    }
+    const size_t pos = skip_whitespace(json, found + search.size());
+    if (pos >= json.size() || !std::isdigit(static_cast<unsigned char>(json[pos]))) {
+        return fallback;
+    }
+    const uint64_t val = parse_u64(json, key);
+    return val <= UINT32_MAX ? static_cast<uint32_t>(val) : fallback;
+}
+
 // Serialize a UbatchCacheKey's fields into a JSON object body (no enclosing
 // braces -- the caller wraps it alongside its own n_ubatch/reason/created
 // fields, mirroring how entry_to_json() above nests params_to_json()).
@@ -859,11 +878,8 @@ inline UbatchCacheKey ubatch_key_from_json(const std::string & json) {
     k.swa_full        = parse_bool(json, "swa_full");
 
     // An entry written before the field existed has no key for it. Read it as the value no picker stores, so it
-    // misses instead of passing for a model with no experts. A value past 32 bits is a damaged file, read the same.
-    const bool     has_ceiling = json.find("\"moe_row_ceiling\":") != std::string::npos;
-    const uint64_t ceiling     = parse_u64(json, "moe_row_ceiling");
-    k.moe_row_ceiling =
-        (has_ceiling && ceiling <= UINT32_MAX) ? static_cast<uint32_t>(ceiling) : UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED;
+    // misses instead of passing for a model with no experts. A value that is not a number or is past 32 bits is a damaged file, read the same.
+    k.moe_row_ceiling = parse_u32_or(json, "moe_row_ceiling", UBATCH_KEY_MOE_ROW_CEILING_UNRECORDED);
     return k;
 }
 
