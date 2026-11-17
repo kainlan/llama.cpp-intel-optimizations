@@ -333,7 +333,7 @@ RESTORE_LOCKS = ("std::lock_guard inventory(g_tensor_inventory_mutex);",
                  "std::lock_guard<std::mutex> lock(saved.mutex);", "saved.devices[d].restore(static_cast<int>(d));")
 # What a pass finds that this load did not write is another publisher's, and is what the restore puts back; what the load
 # published of the sum is the pair's total, which is all the pair's setter writes to it.
-NOTE_OTHER = "prior.copy(before, before.differing(written));"
+NOTE_OTHER = "prior.take_groups(before, before.differing(written));"
 NOTE_SUM = "written.onednn_stored = after.onednn_weights + after.onednn_activations;"
 # A group goes back only while it holds what the load published and differs from what it held before.
 HELD = ("const uint32_t back = ~load_published_terms::snapshot(device).differing(written) & "

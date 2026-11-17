@@ -3278,8 +3278,9 @@ struct load_published_terms {
     static load_published_terms snapshot(int device);
     // The groups whose terms differ between this and `other`.
     uint32_t                    differing(const load_published_terms & other) const;
-    // Takes the terms of `groups` from `from`.
-    void                        copy(const load_published_terms & from, uint32_t groups);
+    // Takes the terms of `groups` from `from`. Not named copy: a `.copy(` member call reads as a queue shortcut to the
+    // window-path launch census.
+    void                        take_groups(const load_published_terms & from, uint32_t groups);
 };
 
 // One device's terms for one load transaction, kept so that a load that fails puts back what it published and nothing

@@ -3714,7 +3714,7 @@ uint32_t load_published_terms::differing(const load_published_terms & other) con
            bit(a.scatter != b.scatter, LOAD_PUBLISHED_GROUP_SCATTER);
 }
 
-void load_published_terms::copy(const load_published_terms & from, uint32_t groups) {
+void load_published_terms::take_groups(const load_published_terms & from, uint32_t groups) {
     if (groups & LOAD_PUBLISHED_GROUP_PIPELINE) {
         pp_pipeline = from.pp_pipeline;
     }
@@ -3757,7 +3757,7 @@ void load_published_terms::copy(const load_published_terms & from, uint32_t grou
 void load_published_record::note(const load_published_terms & before, const load_published_terms & after) {
     // A group that changed since this load last looked was written by another publisher: what it wrote is what the
     // restore puts back if this pass wrote over it.
-    prior.copy(before, before.differing(written));
+    prior.take_groups(before, before.differing(written));
     written = after;
 
     // A pass writes the sum only through the pair's setter, so the sum it published is the pair's total. A reserve that
