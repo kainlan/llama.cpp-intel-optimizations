@@ -28,7 +28,7 @@ cannot see:
 6. the extraction changes no behaviour: the load's early plan is the builder and the apply, the builder takes the
    steps the early plan took in the order it took them, and the load's pre-fill helper calls the record pre-fill;
 7. the dry run leaves no trace: every per-device planner global the stage planners write (in their recording
-   definitions, the host-side sequence, and the static functions those reach within two calls) or the shared
+   definitions, the host-side sequence, and the static and publish functions those reach within two calls) or the shared
    planner-input publish writes is written again by the destructor of the dry run's saved state, so a later load
    reads what it would have read without the dry run;
 8. the residency decision's §10 plan lines, which the dry run's planner call prints, carry every field T3 can print,
@@ -1089,14 +1089,20 @@ def setters_in(text: str) -> set:
 
 
 def static_callees(cpp: str, text: str) -> list:
+    """The file's static functions `text` calls, and its unified_cache_publish_planned_* functions: a publish is how a
+    planner records a planned global another site also records, so it is walked as the planner's own step."""
     names = set(re.findall(r"\b([a-z_][a-z0-9_]*)\s*\(", text))
-    return [n for n in sorted(names) if re.search(rf"(?m)^static\s+[^;{{]*\b{n}\s*\(", cpp)]
+    return [
+        n for n in sorted(names)
+        if re.search(rf"(?m)^static\s+[^;{{]*\b{n}\s*\(", cpp)
+        or (n.startswith("unified_cache_publish_planned_") and definitions(cpp, n))
+    ]
 
 
 def planner_written_setters() -> set:
     """The setters the stage planners call while they plan: in their recording definitions, in the host-side sequence
-    they end with, and in the file's static functions those reach within two calls (the host sizing, the host scatter
-    term and what they call)."""
+    they end with, and in the file's static and publish functions those reach within two calls (the host sizing, the
+    host scatter term, the Graph scratch shape's publish and what they call)."""
     cpp = read(SYCL / "unified-cache.cpp")
     texts, seen = [], set()
     frontier = []

@@ -2898,6 +2898,20 @@ void                               unified_cache_set_planned_onednn_graph_scratc
                                                                                         uint32_t n_ctx);
 onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratch_shape(int device_id);
 
+// The one definition of the Graph scratch shape a load plans: the heads and the window from `kv_info`, and the context
+// shape zone_plan_context_shape_for_envelope() gives from `kv_info` and the envelope's micro-batch. The shape sizes the
+// ONEDNN zone the plan packs weights against, so a single-device stage publishes it before it sizes the zones, and the
+// plan publishes it again from the same inputs; both plan builders take their context fields from it.
+onednn_graph_scratch_planned_shape unified_cache_plan_onednn_graph_scratch_shape(
+    const placement_kv_info &            kv_info,
+    const ggml_sycl_placement_envelope * envelope);
+// Records unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope) for `device_id` and returns it. Nothing else
+// writes the planned shape but the dry run, which puts back the value it read before it planned.
+onednn_graph_scratch_planned_shape unified_cache_publish_planned_onednn_graph_scratch_shape(
+    int                                  device_id,
+    const placement_kv_info &            kv_info,
+    const ggml_sycl_placement_envelope * envelope);
+
 // llama.cpp-oyfl: the non-flash-attention batched mul_mat scratch floor.
 //
 // When flash attention is off (or resolves off at runtime), each layer's

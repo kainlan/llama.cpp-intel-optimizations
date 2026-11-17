@@ -640,6 +640,17 @@ zone_context_shape zone_plan_context_shape(bool     n_ctx_is_runtime,
                                            uint32_t plan_n_ubatch,
                                            uint32_t n_ubatch_context);
 
+// zone_plan_context_shape() over the planner's own inputs, before a plan exists: the planning context `n_ctx`, and the
+// planning micro-batch the planner takes, the envelope's when the caller's envelope names one (`envelope_n_ubatch`
+// != 0) and the model's (`n_ubatch`) otherwise. A shape published before the plan is built is then the shape the plan
+// itself sizes for.
+zone_context_shape zone_plan_context_shape_for_envelope(bool     n_ctx_is_runtime,
+                                                        uint32_t n_ctx,
+                                                        uint32_t n_ctx_context,
+                                                        uint32_t envelope_n_ubatch,
+                                                        uint32_t n_ubatch,
+                                                        uint32_t n_ubatch_context);
+
 // llama.cpp-kpjw (r7 I3: identity by ORIGIN, not by timing): what stays live without the rung is every raw byte the
 // cache holds except the rung's OWN scheduler compute buffers (rows registered by a request flagged
 // scheduler_compute), and only when the rung's buffers are live (the realized check). A raw byte allocated after an

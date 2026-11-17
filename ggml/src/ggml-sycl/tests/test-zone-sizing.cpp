@@ -2016,6 +2016,16 @@ int main() {
         CHECK(s.n_ctx == 0 && s.n_ubatch == 512, "no context at all: the micro-batch is not clamped to 0");
         s = zone_plan_context_shape(false, 512, 0, 512, 2048);
         CHECK(s.n_ctx == 512 && s.n_ubatch == 512, "a named micro-batch with no context named: the planning context");
+
+        // Before a plan exists the planning micro-batch is the planner's own choice: the envelope's when it names
+        // one, else the model's. The shape published before the zones are sized must be the one the plan records.
+        using ggml_sycl::zone_plan_context_shape_for_envelope;
+        s = zone_plan_context_shape_for_envelope(false, 512, 0, 8, 512, 0);
+        CHECK(s.n_ctx == 512 && s.n_ubatch == 8, "an envelope micro-batch with none named: the envelope's wins");
+        s = zone_plan_context_shape_for_envelope(false, 512, 0, 0, 512, 0);
+        CHECK(s.n_ubatch == 512, "no envelope micro-batch: the model's");
+        s = zone_plan_context_shape_for_envelope(false, 512, 4096, 8, 512, 2048);
+        CHECK(s.n_ctx == 4096 && s.n_ubatch == 2048, "a named micro-batch wins over the envelope's");
     }
 
     // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and

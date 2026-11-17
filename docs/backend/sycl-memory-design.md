@@ -591,9 +591,13 @@ ticket reproduced on:
   (`fattn-onednn.cpp`) since `llama-model.cpp` cannot include that
   SYCL-only source directly; the two copies are kept in sync by
   `test-sycl-onednn-graph-floor-eligibility-source.py`. Fed by
-  `unified_cache_set_planned_onednn_graph_scratch_shape()` at the same
-  "oneDNN scratchpad:" planning step (`populate_host_zone_sizing()`,
-  `unified-cache.cpp`). Fit to five Mistral 7B Q4_0 (n_head_ctx_max=32,
+  `unified_cache_publish_planned_onednn_graph_scratch_shape()`, which
+  records `unified_cache_plan_onednn_graph_scratch_shape()`'s answer from
+  the load's KV info and envelope: once before a single-device stage sizes
+  the arena zones, and again from the same inputs at the "oneDNN
+  scratchpad:" planning step (`populate_host_zone_sizing()`,
+  `unified-cache.cpp`), so the zone a plan packs against is sized for the
+  shape that plan records. Fit to five Mistral 7B Q4_0 (n_head_ctx_max=32,
   no SWA layers, so the ctx term equals the old flat formula exactly)
   measurements spanning two independent axes (48/192/768 MB at ubatch
   512 and n_ctx 512/2048/8192; 96/48 MB at n_ctx 2048 and ubatch

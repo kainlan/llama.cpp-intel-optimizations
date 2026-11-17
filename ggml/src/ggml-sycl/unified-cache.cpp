@@ -3706,10 +3706,10 @@ void unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t weig
 // n_swa, n_ubatch, n_ctx) alongside the scratchpad bytes above so
 // onednn_graph_scratch_zone_floor_bytes_swa() can derive its floor from the
 // shape the Graph-scratch request actually scales with, instead of a flat
-// constant. Called from the same "oneDNN scratchpad:" planning step
-// (populate_host_zone_sizing()) with plan.planner_n_head_ctx_max/
-// planner_n_head_swa_max/planner_n_swa and the plan's context shape
-// (plan.context_n_ubatch/context_n_ctx), not its planning shape.
+// constant. A plan's shape is recorded only through
+// unified_cache_publish_planned_onednn_graph_scratch_shape() below, so every
+// recorded shape is unified_cache_plan_onednn_graph_scratch_shape()'s; the
+// dry run calls this directly only to put back the value it read.
 void unified_cache_set_planned_onednn_graph_scratch_shape(int      device_id,
                                                           uint32_t n_head_ctx_max,
                                                           uint32_t n_head_swa_max,
@@ -3739,6 +3739,31 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
     shape.n_swa          = g_planned_onednn_graph_scratch_n_swa[device_id].load(std::memory_order_acquire);
     shape.n_ubatch       = g_planned_onednn_graph_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
     shape.n_ctx          = g_planned_onednn_graph_scratch_n_ctx[device_id].load(std::memory_order_acquire);
+    return shape;
+}
+
+onednn_graph_scratch_planned_shape unified_cache_plan_onednn_graph_scratch_shape(
+    const placement_kv_info &            kv_info,
+    const ggml_sycl_placement_envelope * envelope) {
+    const zone_context_shape context = zone_plan_context_shape_for_envelope(
+        kv_info.n_ctx_is_runtime, kv_info.n_ctx, kv_info.n_ctx_context, envelope ? envelope->n_ubatch : 0,
+        kv_info.n_ubatch, kv_info.n_ubatch_context);
+    onednn_graph_scratch_planned_shape shape;
+    shape.n_head_ctx_max = kv_info.n_head_ctx_max;
+    shape.n_head_swa_max = kv_info.n_head_swa_max;
+    shape.n_swa          = kv_info.n_swa;
+    shape.n_ubatch       = context.n_ubatch;
+    shape.n_ctx          = context.n_ctx;
+    return shape;
+}
+
+onednn_graph_scratch_planned_shape unified_cache_publish_planned_onednn_graph_scratch_shape(
+    int                                  device_id,
+    const placement_kv_info &            kv_info,
+    const ggml_sycl_placement_envelope * envelope) {
+    const onednn_graph_scratch_planned_shape shape = unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope);
+    unified_cache_set_planned_onednn_graph_scratch_shape(device_id, shape.n_head_ctx_max, shape.n_head_swa_max,
+                                                         shape.n_swa, shape.n_ubatch, shape.n_ctx);
     return shape;
 }
 
@@ -35174,7 +35199,9 @@ static size_t placement_move_host_expert_backing(placement_plan &       plan,
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
-                                      int                                        n_expert_used) {
+                                      const placement_kv_info &                  kv_info,
+                                      const ggml_sycl_placement_envelope *       envelope) {
+    const int        n_expert_used         = kv_info.n_expert_used;
     constexpr size_t k_min_zone_bytes      = 64ull * 1024ull * 1024ull;
     constexpr size_t k_tp_staging_headroom = 16ull * 1024ull * 1024ull;
     constexpr size_t k_scratch_headroom    = 32ull * 1024ull * 1024ull;
@@ -35694,11 +35721,12 @@ static void populate_host_zone_sizing(placement_plan &                          
     // correction, llama.cpp-o3a0
     // (itself following an earlier correction from n_ctx alone, c-xcop).
     if (plan.device_id >= 0) {
-        // Sized for the context the model opens with and the micro-batch the caller named (plan.context_*), not the
-        // planning shape: the ONEDNN zone cannot grow once weights are live.
-        unified_cache_set_planned_onednn_graph_scratch_shape(plan.device_id, plan.planner_n_head_ctx_max,
-                                                             plan.planner_n_head_swa_max, plan.planner_n_swa,
-                                                             plan.context_n_ubatch, plan.context_n_ctx);
+        // Sized for the context the model opens with and the micro-batch the caller named, not the planning shape: the
+        // ONEDNN zone cannot grow once weights are live. A single-device stage published this shape before it sized
+        // the zones this plan packed against, from the same kv_info and envelope through the same function, so there
+        // this write equals that one and the zone the plan packed against already holds the floor.
+        const onednn_graph_scratch_planned_shape graph_shape =
+            unified_cache_publish_planned_onednn_graph_scratch_shape(plan.device_id, kv_info, envelope);
         // llama.cpp-o3a0: log the floor and the shape it binds on unconditionally
         // (not only inside the exceptional DIRECT-allocation-failure path
         // further below) so a normal run's log alone answers "did the window
@@ -35708,11 +35736,11 @@ static void populate_host_zone_sizing(placement_plan &                          
         GGML_LOG_INFO(
             "[SYCL-PLAN] oneDNN Graph-scratch zone floor: %.1f MB (n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u "
             "n_ubatch=%u n_ctx=%u)\n",
-            onednn_graph_scratch_zone_floor_bytes_swa(plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max,
-                                                      plan.planner_n_swa, plan.context_n_ubatch, plan.context_n_ctx) /
+            onednn_graph_scratch_zone_floor_bytes_swa(graph_shape.n_head_ctx_max, graph_shape.n_head_swa_max,
+                                                      graph_shape.n_swa, graph_shape.n_ubatch, graph_shape.n_ctx) /
                 (1024.0 * 1024.0),
-            plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, plan.context_n_ubatch,
-            plan.context_n_ctx);
+            graph_shape.n_head_ctx_max, graph_shape.n_head_swa_max, graph_shape.n_swa, graph_shape.n_ubatch,
+            graph_shape.n_ctx);
     }
 #endif
 
@@ -35890,6 +35918,7 @@ static void placement_plan_size_host_side(placement_plan &                      
                                           const std::vector<placement_tensor_info> & tensor_inventory,
                                           int                                        n_experts,
                                           const placement_kv_info &                  kv_info,
+                                          const ggml_sycl_placement_envelope *       envelope,
                                           size_t                                     host_budget,
                                           const ring_lease *                         coverage_pin,
                                           bool                                       host_experts_pinned) {
@@ -35908,7 +35937,7 @@ static void placement_plan_size_host_side(placement_plan &                      
         host_experts_pinned = false;
     }
     placement_mark_device_entries_file_mapped(plan);
-    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
+    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info, envelope);
     record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
     if (!host_experts_pinned) {
         return;
@@ -35941,7 +35970,7 @@ static void placement_plan_size_host_side(placement_plan &                      
         "to the mapping, and %.1f MB of window-ring room stays held. The host-ledger and lazy-table lines above "
         "describe the pinned plan, which is not kept; the lines after this one describe the plan kept\n",
         why.c_str(), moved / mb, plan.moe_stream_ring_reserve_bytes / mb);
-    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
+    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info, envelope);
     record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
 }
 
@@ -36730,12 +36759,12 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.pp_moe_onednn_ring_depth            = unified_cache_get_planned_pp_moe_onednn_ring_depth(device_id);
 
     // The shape the per-context scratch is sized for: the context the model opens with (the caller's, or the model's
-    // default) and the micro-batch the caller named, each else the planning shape above.
-    const zone_context_shape context_shape =
-        zone_plan_context_shape(kv_info.n_ctx_is_runtime, plan.planner_n_ctx, kv_info.n_ctx_context,
-                                plan.planner_n_ubatch, kv_info.n_ubatch_context);
-    plan.context_n_ctx    = context_shape.n_ctx;
-    plan.context_n_ubatch = context_shape.n_ubatch;
+    // default) and the micro-batch the caller named, each else the planning shape above. Taken from the function the
+    // Graph scratch shape is published through, so the plan's context fields are the shape the floor is sized for.
+    const onednn_graph_scratch_planned_shape graph_shape =
+        unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope);
+    plan.context_n_ctx    = graph_shape.n_ctx;
+    plan.context_n_ubatch = graph_shape.n_ubatch;
 
     std::map<int, bool>   layer_has_attention;
     std::map<int, size_t> layer_weight_bytes;
@@ -37227,7 +37256,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         !account_moe_mmid_workspaces(plan, { device_budget{ device_id, vram_budget, vram_budget } })) {
         reject_moe_mmid_workspaces(plan);
     }
-    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, host_budget, coverage_pin,
+    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, envelope, host_budget, coverage_pin,
                                   host_experts_pinned);
 
     // Build the name->index lookup for O(1) queries
@@ -38205,12 +38234,12 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.planner_n_swa            = kv_info.n_swa;
 
     // The shape the per-context scratch is sized for: the context the model opens with (the caller's, or the model's
-    // default) and the micro-batch the caller named, each else the planning shape above.
-    const zone_context_shape context_shape =
-        zone_plan_context_shape(kv_info.n_ctx_is_runtime, plan.planner_n_ctx, kv_info.n_ctx_context,
-                                plan.planner_n_ubatch, kv_info.n_ubatch_context);
-    plan.context_n_ctx    = context_shape.n_ctx;
-    plan.context_n_ubatch = context_shape.n_ubatch;
+    // default) and the micro-batch the caller named, each else the planning shape above. Taken from the function the
+    // Graph scratch shape is published through, so the plan's context fields are the shape the floor is sized for.
+    const onednn_graph_scratch_planned_shape graph_shape =
+        unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope);
+    plan.context_n_ctx    = graph_shape.n_ctx;
+    plan.context_n_ubatch = graph_shape.n_ubatch;
 
     for (const auto & db : device_budgets) {
         plan.pp_pipeline_scratch_bytes =
@@ -39287,7 +39316,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         reject_moe_mmid_workspaces(plan);
     }
     // The multi-device builder sizes no window ring, so its routed experts are never pinned for one.
-    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, host_budget, coverage_pin,
+    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, envelope, host_budget, coverage_pin,
                                   /*host_experts_pinned=*/false);
 
     plan.build_index();

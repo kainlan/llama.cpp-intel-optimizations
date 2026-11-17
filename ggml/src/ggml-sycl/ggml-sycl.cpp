@@ -18102,6 +18102,15 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         }
         return;
     }
+    const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
+    if (!ggml_sycl_plan_multi_device()) {
+        // The oneDNN Graph scratch shape sizes the ONEDNN zone the plan packs weights against, so it is published
+        // before the zones are sized, from the kv_info and the envelope the plan is built from below. The plan
+        // publishes it again from the same inputs through the same function, so the two writes are equal and the plan
+        // packs against a zone sized for the shape it records.
+        (void) ggml_sycl::unified_cache_publish_planned_onednn_graph_scratch_shape(ctx->device, g_placement_kv_info,
+                                                                                   envelope_arg);
+    }
     if (ggml_sycl::get_unified_cache_for_device(ctx->device) &&
         !ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) {
         // The zones cannot be rebuilt while another live model holds allocations in them, and the load's planned
@@ -18151,9 +18160,8 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
 
         const std::vector<ggml_sycl::device_budget> budgets =
             ggml_sycl_plan_device_budgets(budget_pct, cache_device_ready);
-        const ggml_sycl::multi_gpu_mode      gpu_mode     = ggml_sycl_plan_multi_gpu_mode(is_moe);
-        const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
-        plan_candidate                                    = ggml_sycl::compute_multi_device_plan(
+        const ggml_sycl::multi_gpu_mode gpu_mode = ggml_sycl_plan_multi_gpu_mode(is_moe);
+        plan_candidate                           = ggml_sycl::compute_multi_device_plan(
             budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
             envelope_arg, g_moe_n_experts_total, ggml_sycl::host_ledger_budget(), g_sycl_lazy_plan_slot);
         if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
@@ -18201,7 +18209,6 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         // planner input. compute_placement_plan() owns the arena zone charge
         // (SCRATCH + ONEDNN + RUNTIME) and subtracts it exactly once before
         // packing weights/KV into the shared zone.
-        const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
 
         // with_room: the planner holds the explicit micro-batch's RUNTIME room (below) against the routed experts.
         // Without it the plan is the load's planning-shape plan.
@@ -19257,6 +19264,9 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
                 forced != 0 ? forced : ggml_sycl_plan_single_device_budget(i, authority.budget_bytes);
             device_budget[i] = plan_budget;
             unmodelled[i] |= ggml_sycl_plan_single_device_arena_cache(i) == nullptr;
+            // As the stage publishes it before a single-device plan, from the inputs the plan is built from. The dry
+            // run sizes no zone, and its saved state puts the shape back.
+            (void) ggml_sycl::unified_cache_publish_planned_onednn_graph_scratch_shape(i, kv, opts.envelope);
             plans.push_back(ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope, n_experts,
                                                               host_budget, coverage_pin));
         }
