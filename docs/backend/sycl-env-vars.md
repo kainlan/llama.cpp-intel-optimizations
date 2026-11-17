@@ -133,17 +133,17 @@ Consequences worth knowing before you reach for this flag:
   expert on the first card, or a secondary init that fails, leaves it off (a failed secondary init clears it). No
   model that loads reaches this state today: the plan that would turn the path on is refused at the load stage (next
   bullet), so the path stays off.
-- **Refused without a peer path.** The load stage asks whether every pair of GPUs has a direct peer path both ways,
-  from the peer-link records the planner reads (one SYCL context, and peer access reported or a direct copy measured).
-  Init records each card in its own SYCL context (`same_sycl_context` is false for any two different cards, also when
-  the device query fails, because the secondary queues use single-device contexts) and nothing sets
-  `direct_copy_measured`, so no pair of cards has a peer path, even after the Level Zero peer query has run with the
-  opt-in set. On every multi-card host today a plan that puts experts on a second card is therefore refused under the
-  opt-in. A plan that wants the path on such a host is refused before any weight is placed, in the early and in the
-  late planning pass, with the plan-rejected load result and the ERROR line `[MOE-MULTI-GPU] load refused: the plan
-  puts experts on a second card and the cards have no peer path; unset GGML_SYCL_MOE_MULTI_GPU to load with the
-  single-card plan`. Unset the variable (or set it to 0) to load the model with every expert on one card. A two-card
-  plan for a model without experts is not refused.
+- **Refused without a peer path.** The load stage asks whether every pair of the cards the plan uses has a direct peer
+  path both ways, from the peer-link records the planner reads (one SYCL context, and peer access reported or a direct
+  copy measured). Init leaves `same_sycl_context` false for any two different cards in two ways: it sets it false
+  because the secondary queues use single-device contexts, and when its device query fails the record keeps its
+  zero-initialised value. Nothing sets `direct_copy_measured`. So no pair of cards has a peer path, even after the
+  Level Zero peer query has run with the opt-in set. On every multi-card host today a plan that puts experts on a
+  second card is therefore refused under the opt-in. A plan that wants the path on such a host is refused before any
+  weight is placed, in the early and in the late planning pass, with the plan-rejected load result and the ERROR line
+  `[MOE-MULTI-GPU] load refused: the plan puts experts on a second card and the cards have no peer path; unset
+  GGML_SYCL_MOE_MULTI_GPU to load with the single-card plan`. Unset the variable (or set it to 0) to load the model
+  with every expert on one card. A two-card plan for a model without experts is not refused.
 - **Routing tensors.** With a non-zero value on two or more GPUs, whether or not a plan puts experts on a second card,
   the MoE's int32 routing tensors (the argsort output and the `ffn_moe_topk` views) become cross-device control tensors
   held in shared host-control storage. The first one creates a shared context across the cards, and the log shows

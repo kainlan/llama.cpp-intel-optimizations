@@ -64513,11 +64513,13 @@ static bool ggml_sycl_devices_have_direct_peer_path(int src_device, int dst_devi
 // Whether every pair of the given GPUs has a direct peer path both ways, by the per-pair test above, which reads the
 // fields the planner's own peer check reads. The stage passes the plan's devices, the set the planner checks, not every
 // GPU the process can see. An id outside the device table reads as no path (ggml_sycl_get_peer_link_info bounds it
-// against total_gpu_count and GGML_SYCL_MAX_DEVICES), and a repeated id pairs a card with itself, which needs none. The device init records each card in its own SYCL context (the link
-// defaults set same_sycl_context false for two different cards, after a failed device query too, because the
-// secondary queues use single-device contexts) and nothing sets direct_copy_measured, so no pair of cards passes, even
-// when the Level Zero peer query has run. On every multi-card host today a plan that puts experts on a second card is
-// therefore refused under the opt-in. One GPU has no pair to cross.
+// against total_gpu_count and GGML_SYCL_MAX_DEVICES), and a repeated id pairs a card with itself, which needs none.
+// One GPU has no pair to cross.
+//
+// No pair of different cards passes today. ggml_sycl_init_peer_link_defaults leaves same_sycl_context false for them
+// in two ways: it sets it false because the secondary queues use single-device contexts, and when its device query
+// throws the record keeps its zero-initialised value. Nothing sets direct_copy_measured. So even after the Level Zero
+// peer query has run, a plan that puts experts on a second card is refused under the opt-in on every multi-card host.
 static bool ggml_sycl_cards_have_peer_path(const std::vector<int> & devices) {
     for (size_t i = 0; i < devices.size(); ++i) {
         for (size_t j = i + 1; j < devices.size(); ++j) {
