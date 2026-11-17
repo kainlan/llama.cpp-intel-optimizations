@@ -17,7 +17,10 @@
 //  * the plan-derived multi-GPU latch read follows the override's plan on a mock
 //    two-GPU host, where the process latch (false) cannot;
 //  * the cross-card expert path is opt-in, and the two-card plan for a model
-//    without experts does not read the opt-in.
+//    without experts does not read the opt-in;
+//  * with the opt-in, a plan with a secondary expert is refused when the cards
+//    have no peer path, and the peer path is read from the peer-link records,
+//    where a pair nobody probed reads as none.
 //
 // No queue or cache is touched: staging, the accessors and the publish store are
 // host code.
@@ -244,6 +247,56 @@ void test_cross_card_expert_path_is_opt_in() {
     unsetenv("GGML_SYCL_MOE_MULTI_GPU");
 }
 
+// The cross-card expert path moves expert copies and routing ids between the cards; without a peer path a two-card
+// run on it faulted the first card, so the stage refuses such a plan instead of placing it.
+void test_cross_card_expert_plan_without_peer_path_is_refused() {
+    test_sycl_info_override_guard info_guard(make_two_gpu_info());
+    setenv("GGML_SYCL_MOE_MULTI_GPU", "1", 1);
+    CHECK(test_cross_card_expert_plan_refused(make_plan(true, 0), false),
+          "a plan with a secondary expert and no peer path is refused");
+    CHECK(!test_cross_card_expert_plan_refused(make_plan(true, 0), true), "with a peer path it is not");
+    CHECK(!test_cross_card_expert_plan_refused(make_plan(false, 0), false), "a primary-only plan is not");
+    unsetenv("GGML_SYCL_MOE_MULTI_GPU");
+    CHECK(!test_cross_card_expert_plan_refused(make_plan(true, 0), false), "without the opt-in nothing is refused");
+}
+
+// The peer fact the stage passes is the one the planner reads: both directions of every pair valid, in one SYCL
+// context, with peer access reported or a direct copy measured. A record the link probe never filled reads as none.
+void test_cards_peer_path_follows_the_link_records() {
+    ggml_sycl_device_info info = make_two_gpu_info();
+    {
+        test_sycl_info_override_guard info_guard(info);
+        CHECK(!test_cards_have_peer_path(), "cards whose links were never recorded have no peer path");
+    }
+    // What the device init records for two cards: valid links, each card in its own context.
+    for (int src = 0; src < 2; ++src) {
+        for (int dst = 0; dst < 2; ++dst) {
+            sycl_peer_link_info & link = info.peer_links[src][dst];
+            link.valid                 = true;
+            link.src_device            = src;
+            link.dst_device            = dst;
+            link.same_device           = src == dst;
+            link.same_sycl_context     = src == dst;
+        }
+    }
+    {
+        test_sycl_info_override_guard info_guard(info);
+        CHECK(!test_cards_have_peer_path(), "cards in separate contexts have no peer path");
+    }
+    info.peer_links[0][1].same_sycl_context  = true;
+    info.peer_links[0][1].l0_can_access_peer = true;
+    {
+        test_sycl_info_override_guard info_guard(info);
+        CHECK(!test_cards_have_peer_path(), "peer access one way only is no peer path");
+    }
+    info.peer_links[1][0].same_sycl_context    = true;
+    info.peer_links[1][0].direct_copy_measured = true;
+    {
+        test_sycl_info_override_guard info_guard(info);
+        CHECK(test_cards_have_peer_path(), "a shared context with peer access both ways is a peer path");
+    }
+}
+
 void test_multi_device_plan_splits_by_fact() {
     test_sycl_info_override_guard info_guard(make_two_gpu_info());
     unsetenv("GGML_SYCL_MOE_MULTI_GPU");
@@ -375,6 +428,8 @@ int main() {
     test_publish_is_refused_under_the_override();
     test_latch_read_follows_the_plan();
     test_cross_card_expert_path_is_opt_in();
+    test_cross_card_expert_plan_without_peer_path_is_refused();
+    test_cards_peer_path_follows_the_link_records();
     test_multi_device_plan_splits_by_fact();
     test_install_refits_kv_for_the_shape();
     test_probe_plan_goes_with_the_candidate();
