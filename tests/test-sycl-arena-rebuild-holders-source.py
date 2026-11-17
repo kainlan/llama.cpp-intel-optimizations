@@ -6,8 +6,8 @@ When it refuses, the line has to say who holds it. These checks pin the three pa
 Every lease a mem_handle takes on an arena chunk is counted by the site that took it. Each of the four acquiring paths
 in mem-handle.cpp passes a site (a weight lease snapshot, a weight resolve, a handle made from a raw pointer, whose
 caller names what keeps it, and a copy, which keeps its source's site and counts as a copy). The handle carries the tag
-to its release, so the release lowers the count the acquire raised. The count costs one relaxed atomic add on each side
-and takes no lock, and moves only when the per-chunk count moved, so the counts sum to the chunks' leases.
+to its release, and a move hands it on with the lease, so the release lowers the count the acquire raised. The count
+costs one relaxed atomic add on each side and takes no lock, and moves only when the per-chunk count moved, so the counts sum to the chunks' leases.
 
 The rebuild refusal prints those counts on a WARN line and lists the live allocations of every zone with live bytes,
 through the cache's own dump, which takes no lock above the refusal's.
@@ -199,8 +199,16 @@ def claim_copies_count_as_copies(mh: str) -> bool:
     )
 
 
-# The tag travels with the lease state, so the release lowers the site its acquire raised.
+# The tag travels with the lease state, so the release lowers the site its acquire raised. A move hands the lease to
+# the new handle: the move constructor copies the taken state field by field, the move assignment stores it whole, and
+# either way the tag goes with it, or the new handle's release would lower no site.
 RELEASE_CALL = "cache->arena_release_chunk_lease(state.vram_chunk_idx, state.chunk_tag);"
+MOVE_CTOR_SIG = "mem_handle::mem_handle(mem_handle && other) noexcept"
+MOVE_ASSIGN_SIG = "mem_handle & mem_handle::operator=(mem_handle && other) noexcept"
+MOVE_CTOR_TAKE = "const lease_state st = other.take_lease_state_locked();"
+MOVE_CTOR_TAG = "chunk_tag_ = st.chunk_tag;"
+MOVE_ASSIGN_TAKE = "fresh = other.take_lease_state_locked();"
+MOVE_ASSIGN_STORE = "store_lease_state_locked(fresh);"
 
 
 def claim_release_lowers_the_raising_site(mh: str, mhh: str) -> bool:
@@ -211,6 +219,8 @@ def claim_release_lowers_the_raising_site(mh: str, mhh: str) -> bool:
         and "chunk_tag_ = state.chunk_tag;" in fn_body(c, STORE_SIG)
         and RELEASE_CALL in fn_body(c, RELEASE_SIG)
         and "chunk_lease_tag chunk_tag;" in fn_body(code(mhh), "struct lease_state")
+        and ordered(fn_body(c, MOVE_CTOR_SIG), MOVE_CTOR_TAKE, MOVE_CTOR_TAG)
+        and ordered(fn_body(c, MOVE_ASSIGN_SIG), MOVE_ASSIGN_TAKE, MOVE_ASSIGN_STORE)
     )
 
 
@@ -383,8 +393,8 @@ def test_copies_count_as_copies():
 
 def test_release_lowers_the_raising_site():
     assert claim_release_lowers_the_raising_site(MH, MHH), (
-        "the lease state does not carry the chunk lease tag to release_lease_state, or the release does not pass it, "
-        "so a release lowers a different site than its acquire raised"
+        "the lease state does not carry the chunk lease tag to release_lease_state, a move does not hand it to the new "
+        "handle, or the release does not pass it, so a release lowers a different site than its acquire raised"
     )
 
 
@@ -464,6 +474,14 @@ def test_witness_release_drops_the_tag():
 
 def test_witness_take_loses_the_tag():
     assert not claim_release_lowers_the_raising_site(mutate_in(MH, TAKE_SIG, "state.chunk_tag = chunk_tag_;", ""), MHH)
+
+
+def test_witness_move_constructor_drops_the_tag():
+    assert not claim_release_lowers_the_raising_site(mutate_in(MH, MOVE_CTOR_SIG, MOVE_CTOR_TAG, ""), MHH)
+
+
+def test_witness_move_assignment_drops_the_lease_state():
+    assert not claim_release_lowers_the_raising_site(mutate_in(MH, MOVE_ASSIGN_SIG, MOVE_ASSIGN_STORE, ""), MHH)
 
 
 def test_witness_site_count_sequentially_consistent():
