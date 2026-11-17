@@ -20324,9 +20324,11 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
     const size_t free_outside =
         ggml_sycl::unified_cache_hold_free_before(device, hold_query.owner, free_mem, hold_query.rung_live);
     const size_t cap        = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(device);
-    // The room the Graph scratch is guaranteed: the zone less the most the pair admission lets the primitive-API pair
-    // grow to (max(its plan, capacity - floor)), not less the pair's live plan. A pair admitted later into the slack
-    // is not given back, so a room counted above the bound could be taken from under this context.
+    // The Graph room, the part of the zone no other planned consumer may take: the zone less the most the pair
+    // admission lets the primitive-API pair grow to (max(its plan, capacity - floor)), not less the pair's live plan.
+    // A pair admitted later into the slack is not given back, so a room counted above the bound could be taken from
+    // under this context. Unplanned draws (the primitives' user scratchpads, the pair's growth step) can still crowd a
+    // Graph request onto the DIRECT path; they are not counted here.
     size_t       pair_bound = 0;
     if (!ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound)) {
         return true;
@@ -20348,8 +20350,9 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: the oneDNN Graph attention scratch at n_ubatch=%u n_ctx=%u "
-        "(%.1f MB, bounded by the %.1f MB DIRECT cap) exceeds the %.1f MB of the ONEDNN zone it is guaranteed (the "
-        "zone less the most the primitive-API pair may grow to), and the %.1f MB above it, with the hold's %.1f MB "
+        "(%.1f MB, bounded by the %.1f MB DIRECT cap) exceeds the %.1f MB of the ONEDNN zone no other planned "
+        "consumer may take (the zone less the most the primitive-API pair may grow to), and the %.1f MB above it, "
+        "with the hold's %.1f MB "
         "worst-case spill, would leave device %d under the %.1f MB driver headroom (%.1f MB free); %s; or tell the "
         "load this context (-c) so it plans the zone for it\n",
         n_ubatch, n_ctx, demand / mb, cap / mb, graph_room / mb,
