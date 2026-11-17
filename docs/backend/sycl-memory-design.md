@@ -566,10 +566,11 @@ ticket reproduced on:
   combination compiles its OWN partition via `sdpa_partition_cache`, and each
   can request its own scratch the first time it executes.
   `onednn_graph_scratch_zone_floor_bytes_swa()` now computes, per
-  attention window class,
-  `floor = max(64 MiB, 1.5 x max(n_head_ctx_max x n_ctx,
+  attention window class (through the pure
+  `zone_onednn_graph_scratch_floor_bytes()`, `zone-sizing.cpp`),
+  `floor = max(64 MiB, min(1.5 x max(n_head_ctx_max x n_ctx,
   n_head_swa_max x min(n_ctx, n_swa + n_ubatch)) x n_ubatch x
-  sizeof(f32))`, where
+  sizeof(f32), direct_cap))`, where
   the `1.5x` factor covers ~5 SDPA scratch buffers measured concurrently
   in flight even on an idle host (the quantity the zone must actually
   hold is the PEAK OUTSTANDING size across whichever of those shapes are
@@ -626,6 +627,17 @@ ticket reproduced on:
   clamped to 64 MiB, matching the probe exactly — an 8x reduction in
   modeled demand vs. the flat formula's 192 MB (still 3x after the
   64 MiB clamp).
+  `direct_cap` is the DIRECT Graph-scratch cap, the one the dispatcher
+  halves to split each oneDNN attention execute, so no execute ever holds
+  more Graph scratch than the cap and the floor never reserves more than
+  that. The cap is 1 GiB until the first successful
+  `ensure_planned_arena_zones()` and `min(1 GiB, a quarter of the budget
+  available at the last successful ensure)` after it
+  (`GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` overrides both); the first sizing
+  at the real shape runs before weights load, when the available budget
+  is largest, so a later cap can only be equal or lower. A later floor is
+  then never larger for the same shape, and a zone kept from an earlier
+  ensure is never rebuilt because of the cap.
   ⚠️ **This gemma4 example describes the formula's behavior for the
   `n_ctx` it is actually given at PLANNING time, which is NOT today's
   real runtime context by default.** The floor is computed once, at
