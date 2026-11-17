@@ -14308,6 +14308,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         }
         const auto validation = registry->validate_end(ticket);
         if (validation != ggml_sycl::lifecycle::error::OK) {
+            // A commit ticket's validation fails only by poison, and finalize_end answers poison with a cleanup
+            // request, so the abort below runs and puts back the terms the load published. Only a finalize_end that
+            // failed inside returns no request; its transaction then never ends and no load can begin after it.
             const auto pending    = registry->finalize_end(ticket, true);
             bool       cleanup_ok = false;
             if (pending.cleanup_required) {

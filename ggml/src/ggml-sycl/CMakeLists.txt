@@ -943,7 +943,8 @@ if (BUILD_TESTING)
     add_test(NAME sycl-device-uuid-api COMMAND test-sycl-device-uuid-api)
     set_tests_properties(sycl-device-uuid-api PROPERTIES RUN_SERIAL TRUE LABELS "sycl;api;host")
 
-    foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
+    foreach(_case inner-failure missing-success wrong-txn depth-underflow commit-validate-fails-only-by-poison
+                  depth-overflow cancel rollback-idempotence
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown
                   runtime-update-teardown load-effect-drain load-effect-abort-drain
                   cache-effect-drain cache-effect-abort-drain
