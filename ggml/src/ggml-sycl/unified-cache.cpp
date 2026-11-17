@@ -7488,11 +7488,16 @@ bool unified_cache::ensure_planned_arena_zones() {
             runtime_floor / (1024.0 * 1024.0));
     }
     if (planned_runtime_scratch > runtime_floor) {
+        // Every term of the requirement is named, so two lines whose totals differ say which term moved.
         GGML_LOG_INFO(
             "[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP scratch planning "
-            "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_control=%.1f MB, compute=%.1f MB, state=%.1f MB)\n",
+            "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_control=%.1f MB, moe_host_scatter=%.1f KB, "
+            "mmq_src1=%.1f MB, dequant_f16=%.1f MB, compute=%.1f MB, state=%.1f MB)\n",
             runtime_zone / (1024.0 * 1024.0), planned_pp_pipeline / (1024.0 * 1024.0),
             planned_pp_moe_onednn / (1024.0 * 1024.0), planned_moe_control.bytes / (1024.0 * 1024.0),
+            unified_cache_get_planned_moe_host_scatter_scratch_bytes(dev_id) / 1024.0,
+            unified_cache_get_planned_mmq_src1_scratch_bytes(dev_id) / (1024.0 * 1024.0),
+            unified_cache_get_planned_dequant_f16_scratch_bytes(dev_id) / (1024.0 * 1024.0),
             unified_cache_get_planned_compute_term_bytes(dev_id) / (1024.0 * 1024.0),
             unified_cache_get_planned_state_term_bytes(dev_id) / (1024.0 * 1024.0));
     }
@@ -7569,6 +7574,48 @@ bool unified_cache::ensure_planned_arena_zones() {
                 zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
                 zone_capacity(vram_zone_id::RUNTIME) / (1024.0 * 1024.0), live_zone_bytes / (1024.0 * 1024.0),
                 chunk_leases);
+            // The total above cannot say who holds the arena. Each zone's live bytes, the frees still queued behind
+            // a GPU event, and the releases an arena lease refused tell a free that has not run yet from an owner
+            // that was never released. Only a queued free that is a zone sub-allocation or points into the arena
+            // is counted: its bytes stay in the zone's used counter until the queue drains at a later allocation,
+            // while a queued direct allocation outside the arena is in no zone. The bytes are the requested sizes;
+            // the zones count them rounded up to the allocator's block. Each lock is taken alone and released
+            // before the log, and nothing here frees, drains or allocates.
+            size_t deferred_count = 0;
+            size_t deferred_bytes = 0;
+            {
+                std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);
+                for (const deferred_free_entry & entry : deferred_frees_) {
+                    if (entry.zone_managed || vram_owns(entry.ptr)) {
+                        ++deferred_count;
+                        deferred_bytes += entry.size;
+                    }
+                }
+            }
+            // The coordinator is looked up, not created: the accessor that hands one out makes it when it is missing.
+            size_t release_retries = 0;
+            size_t live_controls   = 0;
+            {
+                std::lock_guard<std::mutex> coordinator_lock(g_allocation_coordinator_mutex);
+                const auto                  it = g_allocation_coordinators.find(dev_id);
+                if (it != g_allocation_coordinators.end() && it->second) {
+                    release_retries = it->second->retry_count();
+                    live_controls   = it->second->live_controls();
+                }
+            }
+            std::string zones_live;
+            for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+                const vram_zone_id zone = static_cast<vram_zone_id>(z);
+                char               part[48];
+                snprintf(part, sizeof(part), "%s%s=%.1f", z == 0 ? "" : " ", arena_zone_name(zone),
+                         zone_used(zone) / (1024.0 * 1024.0));
+                zones_live += part;
+            }
+            GGML_LOG_ERROR(
+                "[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_frees=%zu (%.1f MB) "
+                "release_retries=%zu live_controls=%zu cache_scratch=%d\n",
+                dev_id, zones_live.c_str(), deferred_count, deferred_bytes / (1024.0 * 1024.0), release_retries,
+                live_controls, has_live_scratch ? 1 : 0);
             return false;
         }
 
