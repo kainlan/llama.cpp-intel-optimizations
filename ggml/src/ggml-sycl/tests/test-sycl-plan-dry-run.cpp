@@ -730,12 +730,93 @@ arm_result arm_d_mem_available_option_is_the_sample() {
     return r;
 }
 
-// One staged early pass of `inv` in a load transaction of its own, ended uncommitted. `during` reads the planner globals
-// between the stage and the end, `published_weight` the ring weight slot the stage left on device 0.
+// The device-wide terms a load publishes beside the planner state (device_planner_state), which a refused load puts
+// back too: the ring's KV-zone slots, its row bytes and expert counts, its micro-batch, and the oneDNN pair with its
+// stored sum. The dry run publishes none of them, so they are not in the sentinel the dry-run arms share: a KV-zone
+// slot there would move the RUNTIME term those arms check. Read through load_published_terms::snapshot, the pair's one
+// reader; written through the setters.
+struct device_load_extras {
+    bool     act_in_kv          = false;
+    bool     out_in_kv          = false;
+    size_t   act_row            = 0;
+    size_t   out_row            = 0;
+    uint32_t n_expert           = 0;
+    uint32_t n_expert_used      = 0;
+    uint32_t n_ubatch           = 0;
+    size_t   onednn_weights     = 0;
+    size_t   onednn_activations = 0;
+    size_t   onednn_stored      = 0;
+
+    bool operator==(const device_load_extras & o) const {
+        return act_in_kv == o.act_in_kv && out_in_kv == o.out_in_kv && act_row == o.act_row && out_row == o.out_row &&
+               n_expert == o.n_expert && n_expert_used == o.n_expert_used && n_ubatch == o.n_ubatch &&
+               onednn_weights == o.onednn_weights && onednn_activations == o.onednn_activations &&
+               onednn_stored == o.onednn_stored;
+    }
+};
+
+std::vector<device_load_extras> read_load_extras() {
+    std::vector<device_load_extras> out;
+    for (int d = 0; d < test_physical_device_count() && d < GGML_SYCL_MAX_DEVICES; ++d) {
+        const load_published_terms t = load_published_terms::snapshot(d);
+        device_load_extras         s;
+        s.act_in_kv          = t.ring_activation_in_kv;
+        s.out_in_kv          = t.ring_output_in_kv;
+        s.act_row            = t.ring_activation_row;
+        s.out_row            = t.ring_output_row;
+        s.n_expert           = t.ring_n_expert;
+        s.n_expert_used      = t.ring_n_expert_used;
+        s.n_ubatch           = t.ring_n_ubatch;
+        s.onednn_weights     = t.onednn_weights;
+        s.onednn_activations = t.onednn_activations;
+        s.onednn_stored      = t.onednn_stored;
+        out.push_back(s);
+    }
+    return out;
+}
+
+void write_load_extras(const std::vector<device_load_extras> & extras) {
+    for (size_t d = 0; d < extras.size(); ++d) {
+        const int                  dev = static_cast<int>(d);
+        const device_load_extras & s   = extras[d];
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(dev, s.act_in_kv, s.out_in_kv);
+        unified_cache_set_planned_pp_moe_onednn_row_bytes(dev, s.act_row, s.out_row, s.n_expert, s.n_expert_used);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(dev, s.n_ubatch);
+        // The pair's setter stores the halves' total as the sum; the sum goes in after it.
+        unified_cache_set_planned_onednn_scratchpad_pair(dev, s.onednn_weights, s.onednn_activations);
+        unified_cache_set_planned_onednn_scratchpad_bytes(dev, s.onednn_stored);
+    }
+}
+
+// A value per device no load of the shaped inventories publishes: both ring slots in the KV zone, row bytes, expert
+// counts and a micro-batch no inventory here carries, and a pair whose stored sum a reserve raised above its total.
+std::vector<device_load_extras> sentinel_load_extras(size_t n) {
+    std::vector<device_load_extras> out(n);
+    for (size_t d = 0; d < n; ++d) {
+        device_load_extras & s = out[d];
+        const uint32_t       v = 7 + static_cast<uint32_t>(d);
+        s.act_in_kv            = true;
+        s.out_in_kv            = true;
+        s.act_row              = 96 * v;
+        s.out_row              = 192 * v;
+        s.n_expert             = v;
+        s.n_expert_used        = 2;
+        s.n_ubatch             = 70 + v;
+        s.onednn_weights       = 6 * MiB + d;
+        s.onednn_activations   = 1 * MiB + d;
+        s.onednn_stored        = 9 * MiB + d;
+    }
+    return out;
+}
+
+// One staged early pass of `inv` in a load transaction of its own, ended uncommitted. `during` and `during_extras` read
+// the load's device-wide terms between the stage and the end, `published_weight` the ring weight slot the stage left on
+// device 0.
 struct staged_early_load {
     ggml_sycl_lifecycle_result        begin = GGML_SYCL_LIFECYCLE_OK;
     ggml_sycl_lifecycle_result        stage = GGML_SYCL_LIFECYCLE_OK;
     std::vector<device_planner_state> during;
+    std::vector<device_load_extras>   during_extras;
     size_t                            published_weight = 0;
 };
 
@@ -748,6 +829,7 @@ staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv) {
     }
     out.stage            = ggml_backend_sycl_stage_load_inventory_plan(&inv, nullptr, true);
     out.during           = read_planner_state();
+    out.during_extras    = read_load_extras();
     out.published_weight = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(0);
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
     return out;
@@ -755,26 +837,30 @@ staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv) {
 
 // (e) A load whose plan needs a larger arena zone while a first allocation holds the arena is refused by name, and the
 // allocation keeps its memory. The VRAM arena's zones grow only by a rebuild, which is refused while anything points into
-// the arena, and the stage used to abort the process there. A sentinel goes into every planner global first. A load's
+// the arena, and the stage used to abort the process there. A sentinel goes first into every planner global and every
+// other device-wide term a load publishes (device_load_extras: the ring's KV-zone slots, row bytes, expert counts and
+// micro-batch, the oneDNN pair and its stored sum); one that does not read back VOIDs the arm before any check. A load's
 // entry ensure sizes the zones before its own planner publishes, so it reads the MoE CONTROL requirement and the host
 // scatter scratch as they stand, here the sentinels' 4 KiB and 8 KiB, which no arm above sized the arena for. So the
 // shaped inventory is staged once with nothing holding the arena, which rebuilds the zones for the sentinels too. Then a
 // 4 KiB RUNTIME-zone allocation on device 0 stands for the first model, and two loads are staged beside it, each ended
 // uncommitted:
-//   control: the shaped inventory, whose zones the sizing load sized for the sentinels, stages OK, and the sentinels
-//            read back after its end;
+//   control: the shaped inventory, whose zones the sizing load sized for the sentinels, stages OK, and every sentinel
+//            reads back after its end;
 //   refusal: the same inventory with a PP MoE ring weight slot 256 MiB larger than device 0's RUNTIME zone, at depth 1,
 //            returns PLAN_REJECTED from the stage after one ERROR line that names device 0, the RUNTIME need and have
-//            and the allocations that hold the arena; the sentinels read back right after the stage and after the end;
-//            the RUNTIME zone keeps its capacity; the allocation resolves to the same device pointer, and the registry
-//            still holds it in the RUNTIME zone.
+//            and the allocations that hold the arena; every sentinel reads back right after the stage and after the
+//            end; the RUNTIME zone keeps its capacity; the allocation resolves to the same device pointer, and the
+//            registry still holds it in the RUNTIME zone.
 // Engagement: device 0's arena is active; the sizing load staged OK with nothing holding the arena, so the zones hold
 // the sentinels' terms; the allocation landed in its RUNTIME zone; the control staged OK beside it, so a refusal is the
 // oversized term's and not the allocation's alone; a refusal leg that returned OK had published the oversized ring (it
-// owed a refusal), otherwise the ring was not planned and the arm is VOID.
+// owed a refusal), otherwise the ring was not planned and the arm is VOID. A control that did not stage leaves the
+// refusal leg running: the arm is VOID for it only if no check failed, and a FAIL carries its reason after the FAIL's.
 // Mutants: the abort kept (the binary dies); the refusal not propagated (the stage returns OK); the published terms not
-// put back (a global reads the refused load's ring, not its sentinel); a rebuild, eviction or zone reset under the
-// allocation (the RUNTIME capacity moves, or the allocation no longer resolves where it was).
+// put back (a global reads the refused load's ring, not its sentinel); a restore that leaves the KV-zone slots, row
+// bytes, expert counts, micro-batch, pair or sum (that term reads the refused load's value); a rebuild, eviction or zone
+// reset under the allocation (the RUNTIME capacity moves, or the allocation no longer resolves where it was).
 arm_result arm_e_held_arena_refuses_the_load() {
     arm_result      r;
     unified_cache * cache = get_unified_cache_for_device(0);
@@ -783,16 +869,25 @@ arm_result arm_e_held_arena_refuses_the_load() {
         return r;
     }
 
-    const std::vector<device_planner_state> original = read_planner_state();
-    const std::vector<device_planner_state> sentinel = sentinel_planner_state(original.size());
+    const std::vector<device_planner_state> original        = read_planner_state();
+    const std::vector<device_planner_state> sentinel        = sentinel_planner_state(original.size());
+    const std::vector<device_load_extras>   original_extras = read_load_extras();
+    const std::vector<device_load_extras>   sentinel_extras = sentinel_load_extras(original_extras.size());
+    const auto                              put_back        = [&]() {
+        write_planner_state(original);
+        write_load_extras(original_extras);
+    };
     write_planner_state(sentinel);
-    if (!(read_planner_state() == sentinel)) {
-        void_arm(r, "the sentinel planner state did not read back");
+    write_load_extras(sentinel_extras);
+    if (!(read_planner_state() == sentinel) || !(read_load_extras() == sentinel_extras)) {
+        put_back();
+        void_arm(r, "the sentinel planner state or load terms did not read back, so no check below has a reference");
+        return r;
     }
     loader_inventory        fits(qwen38_shape);
     const staged_early_load sizing = stage_early_and_end(fits.inv);
     if (sizing.begin != GGML_SYCL_LIFECYCLE_OK || sizing.stage != GGML_SYCL_LIFECYCLE_OK) {
-        write_planner_state(original);
+        put_back();
         void_arm(r, "the sizing load's begin returned " + num(sizing.begin) + " and its stage " + num(sizing.stage) +
                         " with nothing holding the arena, so the zones may not hold the sentinels' terms");
         return r;
@@ -808,7 +903,7 @@ arm_result arm_e_held_arena_refuses_the_load() {
     req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
     allocation_result allocation            = unified_allocate_owner(req);
     if (!allocation) {
-        write_planner_state(original);
+        put_back();
         void_arm(r, "the 4 KiB RUNTIME-zone allocation was refused");
         return r;
     }
@@ -817,19 +912,39 @@ arm_result arm_e_held_arena_refuses_the_load() {
     const resolved_ptr first  = holder.resolve();
     alloc_metadata     meta{};
     if (!first || !first.on_device || !unified_lookup(first.ptr, &meta) || meta.zone != vram_zone_id::RUNTIME) {
-        write_planner_state(original);
+        put_back();
         void_arm(r, "the allocation is not in device 0's RUNTIME zone, so it does not hold the arena");
         return r;
     }
     const size_t runtime_capacity = cache->zone_capacity(vram_zone_id::RUNTIME);
 
+    // A control that did not stage does not stop the arm: the refusal leg still runs, and settle() reports the arm VOID
+    // with the control's reason only when no check failed, and a FAIL with that reason after its own (the harness keeps
+    // the first FAIL or VOID, so a VOID taken here would hide every later FAIL).
+    std::string             control_void;
     const staged_early_load control = stage_early_and_end(fits.inv);
     if (control.begin != GGML_SYCL_LIFECYCLE_OK || control.stage != GGML_SYCL_LIFECYCLE_OK) {
-        void_arm(r, "the control load's begin returned " + num(control.begin) + " and its stage " + num(control.stage) +
-                        " beside the allocation, so a refusal would not be the oversized term's");
+        control_void = "the control load's begin returned " + num(control.begin) + " and its stage " +
+                       num(control.stage) + " beside the allocation, so a refusal would not be the oversized term's";
     }
+    const auto settle = [&]() -> arm_result {
+        if (control_void.empty()) {
+            return r;
+        }
+        arm_result out = r;
+        if (out.result == outcome::PASS) {
+            out.result = outcome::VOID;
+            out.why    = control_void;
+        } else {
+            out.why += "; and " + control_void;
+        }
+        return out;
+    };
     expect(r, read_planner_state() == sentinel,
            "after the control load's uncommitted end a planner global reads that load's value, not its sentinel");
+    expect(r, read_load_extras() == sentinel_extras,
+           "after the control load's uncommitted end a ring KV-zone slot, row byte, micro-batch or oneDNN pair term "
+           "reads that load's value, not its sentinel");
 
     loader_inventory too_big(qwen38_shape);
     too_big.inv.pp_moe_onednn_weight_slot_bytes = runtime_capacity + 256 * MiB;
@@ -839,18 +954,19 @@ arm_result arm_e_held_arena_refuses_the_load() {
     const staged_early_load                 refused = stage_early_and_end(too_big.inv);
     const std::vector<std::string>          named   = lines_with("[SYCL-PLAN] model load refused on device 0: ");
     const std::vector<device_planner_state> after   = read_planner_state();
-    write_planner_state(original);
+    const std::vector<device_load_extras>   after_x = read_load_extras();
+    put_back();
 
     if (refused.begin != GGML_SYCL_LIFECYCLE_OK) {
         void_arm(r, "the refused load's transaction did not begin (" + num(refused.begin) + ")");
-        return r;
+        return settle();
     }
     if (refused.stage == GGML_SYCL_LIFECYCLE_OK &&
         refused.published_weight != too_big.inv.pp_moe_onednn_weight_slot_bytes) {
         void_arm(r, "the stage returned OK and published a ring weight slot of " + num(refused.published_weight) +
                         ", not the oversized " + num(too_big.inv.pp_moe_onednn_weight_slot_bytes) +
                         ", so no zone had to grow");
-        return r;
+        return settle();
     }
     expect(r, refused.stage == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
            "a load whose ring needs " + num(too_big.inv.pp_moe_onednn_weight_slot_bytes) + " bytes beside a " +
@@ -874,6 +990,19 @@ arm_result arm_e_held_arena_refuses_the_load() {
                "device " + num(d) + ": after the refused load's end a planner global reads " + "ring weight " +
                    num(after[d].ring_weight) + ", not its sentinel");
     }
+    for (size_t d = 0; d < refused.during_extras.size() && d < sentinel_extras.size(); ++d) {
+        expect(r, refused.during_extras[d] == sentinel_extras[d],
+               "device " + num(d) + ": right after the refused stage the ring's KV-zone slots, row bytes, expert " +
+                   "counts or micro-batch, or the oneDNN pair or its sum, read the refused load's (micro-batch " +
+                   num(refused.during_extras[d].n_ubatch) + ", sum " + num(refused.during_extras[d].onednn_stored) +
+                   "), not their sentinels");
+    }
+    for (size_t d = 0; d < after_x.size() && d < sentinel_extras.size(); ++d) {
+        expect(r, after_x[d] == sentinel_extras[d],
+               "device " + num(d) + ": after the refused load's end the ring's KV-zone slots, row bytes, expert " +
+                   "counts or micro-batch, or the oneDNN pair or its sum, read micro-batch " +
+                   num(after_x[d].n_ubatch) + ", sum " + num(after_x[d].onednn_stored) + ", not their sentinels");
+    }
     expect(r, cache->arena_active() && cache->zone_capacity(vram_zone_id::RUNTIME) == runtime_capacity,
            "the RUNTIME zone moved from " + num(runtime_capacity) + " to " +
                num(cache->zone_capacity(vram_zone_id::RUNTIME)) + " bytes under the live allocation");
@@ -883,7 +1012,7 @@ arm_result arm_e_held_arena_refuses_the_load() {
            "the allocation no longer resolves to the device pointer it had before the refused load");
     expect(r, unified_lookup(first.ptr, &still) && still.zone == vram_zone_id::RUNTIME && still.id == meta.id,
            "the registry no longer holds the allocation in the RUNTIME zone");
-    return r;
+    return settle();
 }
 
 const char * outcome_name(outcome o) {

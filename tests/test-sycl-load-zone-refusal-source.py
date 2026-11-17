@@ -436,6 +436,27 @@ def test_witness_late_entry_drops_the_flag():
     assert not claim_every_caller_propagates(m)
 
 
+def test_witness_early_entry_drops_the_flag():
+    m = mutate_in(GS, EARLY_SIG, EARLY_PROPAGATE, "(void) " + PLAN_CALL + ";")
+    assert not claim_every_caller_propagates(m)
+
+
+# The exported entries keep their void signatures across the dlopen boundary: one that asks for the refusal itself and
+# aborts on it would take the process down where the stage refuses the load.
+def test_witness_exported_early_entry_aborts_on_the_flag():
+    m = mutate_in(GS, EXPORTED_EARLY_SIG, "ggml_sycl_compute_placement_plan_early_impl(backend, inventory, nullptr);",
+                  "bool refused = false; ggml_sycl_compute_placement_plan_early_impl(backend, inventory, &refused); "
+                  "GGML_ASSERT(!refused);")
+    assert not claim_every_caller_propagates(m)
+
+
+def test_witness_exported_late_entry_aborts_on_the_flag():
+    m = mutate_in(GS, EXPORTED_LATE_SIG, "(void) ggml_sycl_set_tensor_inventory_impl(backend, inventory, nullptr);",
+                  "bool refused = false; (void) ggml_sycl_set_tensor_inventory_impl(backend, inventory, &refused); "
+                  "GGML_ASSERT(!refused);")
+    assert not claim_every_caller_propagates(m)
+
+
 def test_refusal_names_need_and_have():
     assert claim_refusal_names_need_and_have(UC, ZS), (
         "the ensure does not write each zone's need (the sizes it decided on) and have (the arena's capacities) at "
