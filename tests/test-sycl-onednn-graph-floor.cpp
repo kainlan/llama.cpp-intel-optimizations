@@ -309,8 +309,12 @@ void test_override() {
     // llama.cpp-o3a0: the override is one memoized static shared by both the
     // 3-arg and 5-arg formulas (the 3-arg overload delegates into the 5-arg
     // one) -- confirm it also wins through the 5-arg wrapper directly,
-    // rather than only through the delegation path exercised above.
-    const size_t floor_swa = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(128, 64, 4096, 4096, 1u << 20, 0);
+    // rather than only through the delegation path exercised above. The
+    // DIRECT cap passed is nonzero and below the override, so the override
+    // must win over the cap too: a cap of 0 would leave that untested.
+    const size_t cap_below_override = 32 * kMiB;
+    const size_t floor_swa =
+        ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(128, 64, 4096, 4096, 1u << 20, cap_below_override);
     check(floor_swa == 99 * kMiB, "override wins through the 5-arg swa wrapper too, not just via delegation");
 }
 
