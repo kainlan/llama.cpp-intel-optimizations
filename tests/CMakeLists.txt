@@ -4613,6 +4613,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for a second model load that cannot size the VRAM arena zones: the rebuild refusal names who holds the
+# arena (each zone's live bytes, the queued frees the zones still count, the releases an arena lease refused) and the
+# RUNTIME requirement line names every term it sums. Host-only, reads the sources as text. Same registration shape as
+# test-sycl-compute-refusal-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-arena-zone-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-arena-zone-refusal-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-ii25: source gate for the runtime allocation registry's containment index: g_runtime_alloc_registry is
 # mutated only through the helpers that keep the index in step, a row's geometry is never rewritten, neither object
 # leaves unified-cache.cpp, and unified_lookup_runtime_allocation() queries the index instead of scanning. The index
