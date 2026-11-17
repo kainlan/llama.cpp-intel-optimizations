@@ -521,11 +521,18 @@ struct zone_arena_holders {
     uint32_t chunk_leases     = 0;  // leases handles hold on the arena's chunks
     uint32_t scratch_in_arena = 0;  // the cache's scratch buffers whose pointer lies inside the arena
     uint32_t scratch_outside  = 0;  // the cache's scratch buffers allocated outside it, printed and never a holder
+    uint32_t ring_in_arena    = 0;  // of scratch_in_arena, the PP MoE ring's slot buffers (current and retired slots)
+    uint32_t live_beside_ring = 0;  // allocations live in the zones other than the ring's slot buffers
 };
 
 // Whether the arena may be rebuilt for larger zones: only when nothing points into it. A scratch buffer allocated
 // outside the arena keeps its own memory through a rebuild, so it does not refuse one; a buffer inside it does.
 bool zone_arena_rebuild_allowed(const zone_arena_holders & holders);
+
+// Whether the PP MoE ring's slot buffers are all that keeps the arena from a rebuild it needs: a rebuild is needed, a
+// slot buffer of the ring lies inside the arena, and nothing else holds it (no other allocation live in its zones, no
+// lease on its chunks, no other cache scratch buffer inside it). Only then may a load release the ring to rebuild.
+bool zone_arena_only_ring_holds(bool rebuild_needed, const zone_arena_holders & holders);
 
 // Why the arena's planned zones could not be sized.
 enum class zone_arena_refusal_reason {

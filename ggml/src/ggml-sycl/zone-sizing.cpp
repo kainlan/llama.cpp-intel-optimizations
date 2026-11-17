@@ -525,6 +525,13 @@ bool zone_arena_rebuild_allowed(const zone_arena_holders & holders) {
     return holders.live_zone_bytes == 0 && holders.chunk_leases == 0 && holders.scratch_in_arena == 0;
 }
 
+bool zone_arena_only_ring_holds(bool rebuild_needed, const zone_arena_holders & holders) {
+    // The ring's slot buffers are among scratch_in_arena, and their bytes among live_zone_bytes, so those two are read
+    // through the ring's own counts; a lease is never the ring's.
+    return rebuild_needed && holders.ring_in_arena != 0 && holders.scratch_in_arena == holders.ring_in_arena &&
+           holders.live_beside_ring == 0 && holders.chunk_leases == 0;
+}
+
 // `bytes` in MB at one decimal, in KB under 0.1 MB, and in bytes under 1 KB, so a small figure never prints as 0.0 MB.
 static std::string zone_bytes_text(size_t bytes) {
     char out[48];
@@ -539,9 +546,11 @@ static std::string zone_bytes_text(size_t bytes) {
 }
 
 // The holders refusal's clause: each kind of holder that points into the arena with its count, and the remedy the
-// kinds allow. The cache's own scratch buffers stay in the arena until the cache is torn down at process exit, whatever
-// else holds it. Leases with nothing live in the zones outlived what they point at, so no free releases them either.
-// Live allocations belong to a model or context, which freeing releases.
+// kinds allow. The cache's own scratch buffers other than the PP MoE ring stay in the arena until the cache is torn
+// down at process exit, whatever else holds it. The ring is the cache's too, but a load releases it when it is the
+// arena's only holder and no prefill claims one of its slots. Leases with nothing but the ring live in the zones
+// outlived what they point at, so no free releases them either. Live allocations belong to a model or context, which
+// freeing releases.
 static std::string zone_arena_held_text(const zone_arena_holders & h, int device) {
     char        part[96];
     std::string held[3];
@@ -553,7 +562,11 @@ static std::string zone_arena_held_text(const zone_arena_holders & h, int device
         std::snprintf(part, sizeof(part), "%u lease%s on its chunks", h.chunk_leases, h.chunk_leases == 1 ? "" : "s");
         held[n++] = part;
     }
-    if (h.scratch_in_arena != 0) {
+    if (h.scratch_in_arena != 0 && h.ring_in_arena != 0) {
+        std::snprintf(part, sizeof(part), "%u of the cache's own scratch buffers (%u of them its PP MoE ring's slots)",
+                      h.scratch_in_arena, h.ring_in_arena);
+        held[n++] = part;
+    } else if (h.scratch_in_arena != 0) {
         std::snprintf(part, sizeof(part), "%u of the cache's own scratch buffers", h.scratch_in_arena);
         held[n++] = part;
     }
@@ -565,20 +578,28 @@ static std::string zone_arena_held_text(const zone_arena_holders & h, int device
         text += (i == 0 ? "" : i == n - 1 ? " and " : ", ") + held[i];
     }
     text += " hold the arena (the [VRAM-ARENA] lines above name them), so its zones cannot grow";
-    if (h.scratch_in_arena == 0 && (h.live_zone_bytes != 0 || h.chunk_leases == 0)) {
+    const uint32_t other_scratch = h.scratch_in_arena > h.ring_in_arena ? h.scratch_in_arena - h.ring_in_arena : 0;
+    // With no slot of the ring inside the arena, every live byte belongs to a model or context.
+    const bool     live_beside   = h.ring_in_arena == 0 ? h.live_zone_bytes != 0 : h.live_beside_ring != 0;
+    if (other_scratch == 0 && (live_beside || (h.chunk_leases == 0 && h.ring_in_arena == 0))) {
         return text + ". Free the model or context they belong to, then load this one again";
     }
     char remedy[256];
-    if (h.scratch_in_arena != 0) {
+    if (other_scratch != 0) {
         std::snprintf(remedy, sizeof(remedy),
                       ". The cache keeps its own scratch buffers in the arena until the process exits, so freeing a "
                       "model or context does not let its zones grow. Load this model in a new process before any "
                       "other on device %d",
                       device);
+    } else if (h.chunk_leases != 0) {
+        std::snprintf(remedy, sizeof(remedy),
+                      ". %s is live in its zones, so the leases outlived what they point at and are held until the "
+                      "process exits. Load this model in a new process before any other on device %d",
+                      h.ring_in_arena == 0 ? "No allocation" : "Nothing but the cache's PP MoE ring", device);
     } else {
         std::snprintf(remedy, sizeof(remedy),
-                      ". No allocation is live in its zones, so the leases outlived what they point at and are held "
-                      "until the process exits. Load this model in a new process before any other on device %d",
+                      ". Only the cache's PP MoE ring holds it, and a load releases the ring only while no prefill "
+                      "claims one of its slots. Load this one again when the prefill on device %d has finished",
                       device);
     }
     return text + remedy;

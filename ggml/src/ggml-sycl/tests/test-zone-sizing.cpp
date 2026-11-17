@@ -2716,6 +2716,95 @@ int main() {
               "a refused teardown with no cause is not read as closed");
     }
 
+    // ---- Case 40: a load releases the PP MoE ring only when the ring alone keeps the arena from a rebuild it needs ----
+    // The ring is the cache's, not a model's: it outlives the context that sized it. A load may release it to rebuild the
+    // arena, but only as the last resort, when a rebuild is needed and the ring's slot buffers are the only holders. Any
+    // other holder refuses the rebuild whatever happens to the ring, so the load must not release a ring a live context
+    // may be using. A scratch buffer outside the arena holds nothing, so it does not stop the release.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_arena_holders;
+        using ggml_sycl::zone_arena_only_ring_holds;
+        using ggml_sycl::zone_arena_refusal;
+        using ggml_sycl::zone_arena_refusal_reason;
+        using ggml_sycl::zone_arena_refusal_text;
+
+        const auto has = [](const std::string & text, const char * part) {
+            return text.find(part) != std::string::npos;
+        };
+
+        // a depth-2 ring left by a freed context: six slot buffers, 96 MB in the zones, nothing else in the arena
+        zone_arena_holders ring_only;
+        ring_only.live_zone_bytes  = 96 * MiB;
+        ring_only.scratch_in_arena = 6;
+        ring_only.ring_in_arena    = 6;
+        CHECK(zone_arena_only_ring_holds(true, ring_only), "a ring alone in an arena that must grow was not released");
+        CHECK(!zone_arena_only_ring_holds(false, ring_only), "a ring was released for an arena that need not grow");
+        zone_arena_holders ring_outside = ring_only;
+        ring_outside.scratch_outside    = 2;
+        CHECK(zone_arena_only_ring_holds(true, ring_outside), "scratch outside the arena kept a lone ring");
+
+        // each other holder keeps the ring, down to one allocation, one lease or one other scratch buffer
+        zone_arena_holders ring_and_live = ring_only;
+        ring_and_live.live_beside_ring   = 1;
+        CHECK(!zone_arena_only_ring_holds(true, ring_and_live), "a ring beside a live allocation was released");
+        zone_arena_holders ring_and_lease = ring_only;
+        ring_and_lease.chunk_leases       = 1;
+        CHECK(!zone_arena_only_ring_holds(true, ring_and_lease), "a ring beside a chunk lease was released");
+        zone_arena_holders ring_and_scratch = ring_only;
+        ring_and_scratch.scratch_in_arena   = 7;
+        CHECK(!zone_arena_only_ring_holds(true, ring_and_scratch), "a ring beside other cache scratch was released");
+        // no ring inside the arena: nothing to release
+        CHECK(!zone_arena_only_ring_holds(true, zone_arena_holders{}), "an arena with no ring had a ring to release");
+        zone_arena_holders ring_outside_only;
+        ring_outside_only.scratch_outside = 6;
+        CHECK(!zone_arena_only_ring_holds(true, ring_outside_only), "a ring outside the arena was released for it");
+
+        // The refusal a load logs when the release kept the ring (a prefill claims one of its slots): the ring is the
+        // cache's, so no model or context frees it, and it is released on a later load, not only at process exit.
+        zone_arena_refusal held;
+        held.reason          = zone_arena_refusal_reason::REBUILD_HELD;
+        held.device          = 1;
+        held.need            = { 512 * MiB, 256 * MiB, 1985 * MiB };
+        held.have            = { 512 * MiB, 256 * MiB, 1792 * MiB };
+        held.holders         = ring_only;
+        const std::string rl = zone_arena_refusal_text(held);
+        CHECK(has(rl,
+                  "; 96.0 MB of live allocations in its zones and 6 of the cache's own scratch buffers (6 of them "
+                  "its PP MoE ring's slots) hold the arena (the [VRAM-ARENA] lines above name them), so its zones "
+                  "cannot grow. Only the cache's PP MoE ring holds it, and a load releases the ring only while no "
+                  "prefill claims one of its slots. Load this one again when the prefill on device 1 has finished"),
+              "a ring alone in the arena is not named with its remedy");
+        CHECK(!has(rl, "Free the model") && !has(rl, "until the process exits"),
+              "a ring alone in the arena is blamed on a model to free or on the process");
+
+        // the ring beside a live allocation: freeing the model or context releases that, and a later load the ring
+        zone_arena_refusal with_live       = held;
+        with_live.holders.live_beside_ring = 4;
+        const std::string wl               = zone_arena_refusal_text(with_live);
+        CHECK(has(wl, ". Free the model or context they belong to, then load this one again"),
+              "a ring beside a live allocation is not given the free-the-model remedy");
+        CHECK(!has(wl, "until the process exits"), "a ring beside a live allocation is held until the process exits");
+
+        // other cache scratch inside the arena stays until the process exits, ring or no ring
+        zone_arena_refusal with_scratch       = held;
+        with_scratch.holders.scratch_in_arena = 8;
+        const std::string sl                  = zone_arena_refusal_text(with_scratch);
+        CHECK(has(sl, "8 of the cache's own scratch buffers (6 of them its PP MoE ring's slots) hold the arena") &&
+                  has(sl, "The cache keeps its own scratch buffers in the arena until the process exits"),
+              "other cache scratch beside the ring is not given the new-process remedy");
+
+        // leases beside the ring with nothing else live outlived what they point at
+        zone_arena_refusal with_lease   = held;
+        with_lease.holders.chunk_leases = 2;
+        const std::string ll            = zone_arena_refusal_text(with_lease);
+        CHECK(has(ll,
+                  ". Nothing but the cache's PP MoE ring is live in its zones, so the leases outlived what they "
+                  "point at and are held until the process exits. Load this model in a new process before any "
+                  "other on device 1"),
+              "leases beside the ring alone are not named with the new-process remedy");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
