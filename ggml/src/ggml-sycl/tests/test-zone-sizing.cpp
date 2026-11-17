@@ -2601,13 +2601,29 @@ int main() {
         CHECK(has(zone_arena_refusal_text(edge), "RUNTIME need 1792.1 MB have 1792.0 MB (0.1 MB short)"),
               "a shortfall of 0.1 MB is not printed in MB");
 
+        // A reserve that failed after a rebuild destroyed the arena: the device has no zones now, which the have says,
+        // and the arena it had is named apart as released for the rebuild.
         zone_arena_refusal reserve = held;
         reserve.reason             = zone_arena_refusal_reason::RESERVE_FAILED;
         reserve.have               = {};
+        reserve.released           = held.have;
         const std::string rl       = zone_arena_refusal_text(reserve);
         CHECK(has(rl, "RUNTIME need 1985.0 MB have 0.0 MB (1985.0 MB short)"), "a reserve failure's need or have");
-        CHECK(has(rl, "could not reserve") && has(rl, "Free VRAM on device 1"), "a reserve failure's remedy");
+        CHECK(has(rl,
+                  "; the device could not reserve an arena with these zones, and the arena it had (SCRATCH "
+                  "512.0 MB, ONEDNN 256.0 MB, RUNTIME 1792.0 MB) was released for the rebuild. Free VRAM on "
+                  "device 1, then load this one again"),
+              "a reserve failure after a rebuild does not say the arena it had was released, or its remedy");
         CHECK(!has(rl, "hold the arena"), "a reserve failure blames holders");
+        // The first reserve on a device released nothing.
+        zone_arena_refusal first_reserve = reserve;
+        first_reserve.released           = {};
+        const std::string fl             = zone_arena_refusal_text(first_reserve);
+        CHECK(has(fl,
+                  "; the device could not reserve an arena with these zones. Free VRAM on device 1, then load "
+                  "this one again") &&
+                  !has(fl, "released"),
+              "a first reserve's failure names an arena released for a rebuild");
 
         zone_arena_refusal no_cache;
         no_cache.reason      = zone_arena_refusal_reason::NO_CACHE;

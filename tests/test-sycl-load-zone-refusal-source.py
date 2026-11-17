@@ -18,10 +18,11 @@ refused plan staged none, and that check would throw an anonymous EFFECT_FAILED)
 void signatures across the dlopen boundary; they log the refusal and stage nothing.
 
 The refusal names need and have: the ensure writes, at the holders refusal, the three zone sizes it decided on as the
-need and the arena's zone capacities, read before either refusal, as the have; at a failed reserve, the same need and
-those capacities, read before the rebuild destroyed the arena; the device wrapper names a device with no cache. zone_arena_refusal_text prints both for every
+need and the arena's zone capacities, read before either refusal, as the have; at a failed reserve, the same need, the
+zones the device has after the failure as the have, and those capacities, read before the rebuild destroyed the arena,
+as released; the device wrapper names a device with no cache. zone_arena_refusal_text prints both for every
 zone, in MB, and a short zone whose shortfall is under 0.1 MB in KB, or in bytes under 1 KB, so no shortfall prints as
-0.0 MB. At the holders refusal the ensure also writes the holders its gate refused on, and the text names them and
+0.0 MB, and a failed reserve's released arena. At the holders refusal the ensure also writes the holders its gate refused on, and the text names them and
 chooses its remedy from them (test-zone-sizing Case 38 checks the text and each remedy).
 
 A failed load puts back what it published: the stage captures the device-wide planned terms before its first device
@@ -188,8 +189,12 @@ ZONES_READ = ("arena_zones = { zone_capacity(vram_zone_id::SCRATCH), zone_capaci
 HOLDERS = "refusal->holders = holders;"
 HELD_FILL = ("if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::REBUILD_HELD; refusal->device = "
              "dev_id; " + NEED + " " + HAVE + " " + HOLDERS + " } return false;")
+# A failed reserve's have is what the device has after it; the arena a rebuild destroyed for it is named as released.
+RESERVE_HAVE = ("refusal->have = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN), "
+                "zone_capacity(vram_zone_id::RUNTIME) };")
+RELEASED = "refusal->released = arena_zones;"
 RESERVE_FILL = ("if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::RESERVE_FAILED; "
-                "refusal->device = dev_id; " + NEED + " " + HAVE + " } return false;")
+                "refusal->device = dev_id; " + NEED + " " + RESERVE_HAVE + " " + RELEASED + " } return false;")
 NO_CACHE_FILL = ("if (!cache) { if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::NO_CACHE; "
                  "refusal->device = device_id; } return false; }")
 TEXT_SIG = "std::string zone_arena_refusal_text(const zone_arena_refusal & refusal)"
@@ -201,6 +206,7 @@ TEXT_SMALL = ('"%s%s need %.1f KB have %.1f KB (%.1f KB short)"',
               '"%s%s need %zu bytes have %zu bytes (%zu bytes short)"')
 # The holders refusal's clause is composed from the holders the ensure wrote.
 TEXT_HELD = "text += zone_arena_held_text(refusal.holders, refusal.device);"
+TEXT_RELEASED = "refusal.released.scratch / MiB, refusal.released.onednn / MiB, refusal.released.runtime / MiB"
 
 
 def claim_refusal_names_need_and_have(uc: str, zs: str) -> bool:
@@ -211,7 +217,7 @@ def claim_refusal_names_need_and_have(uc: str, zs: str) -> bool:
                     "if (!arena_reserve(", RESERVE_FILL)
             and NO_CACHE_FILL in fn_body(c, WRAPPER_SIG)
             and all(z in text for z in TEXT_ZONES) and TEXT_FORMAT in text and all(f in text for f in TEXT_SMALL)
-            and TEXT_HELD in text)
+            and TEXT_HELD in text and TEXT_RELEASED in text)
 
 
 # ---- a failed load puts back what it published ----
@@ -369,6 +375,16 @@ def test_witness_have_read_after_the_arena_is_destroyed():
 
 def test_witness_text_drops_the_have():
     m = mutate_in(ZS, TEXT_SIG, TEXT_FORMAT, '"%s%s need %.1f MB"')
+    assert not claim_refusal_names_need_and_have(UC, m)
+
+
+def test_witness_reserve_failure_names_the_destroyed_arena_as_have():
+    m = mutate_in(UC, ENSURE_SIG, RESERVE_HAVE + " " + RELEASED, HAVE)
+    assert not claim_refusal_names_need_and_have(m, ZS)
+
+
+def test_witness_text_drops_the_released_arena():
+    m = mutate_in(ZS, TEXT_SIG, TEXT_RELEASED, "0.0, 0.0, 0.0")
     assert not claim_refusal_names_need_and_have(UC, m)
 
 

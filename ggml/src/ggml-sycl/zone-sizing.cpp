@@ -622,10 +622,18 @@ std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {
             text += zone_arena_held_text(refusal.holders, refusal.device);
             break;
         case zone_arena_refusal_reason::RESERVE_FAILED:
-            std::snprintf(part, sizeof(part),
-                          "; the device could not reserve an arena with these zones. Free VRAM on device %d, then load "
-                          "this one again",
-                          refusal.device);
+            text += "; the device could not reserve an arena with these zones";
+            if (refusal.released.scratch != 0 || refusal.released.onednn != 0 || refusal.released.runtime != 0) {
+                // The rebuild destroyed the arena before the reserve failed, so the device now has none: the have
+                // above says so, and this names what it had.
+                std::snprintf(part, sizeof(part),
+                              ", and the arena it had (SCRATCH %.1f MB, ONEDNN %.1f MB, RUNTIME %.1f MB) was released "
+                              "for the rebuild",
+                              refusal.released.scratch / MiB, refusal.released.onednn / MiB,
+                              refusal.released.runtime / MiB);
+                text += part;
+            }
+            std::snprintf(part, sizeof(part), ". Free VRAM on device %d, then load this one again", refusal.device);
             text += part;
             break;
         case zone_arena_refusal_reason::NO_CACHE:

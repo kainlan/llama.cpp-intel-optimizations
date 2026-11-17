@@ -7578,8 +7578,9 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
         }
     };
 
-    // The arena's zones as this call read them, which a refusal below names as what the device has: none when there
-    // is no arena, and the replaced arena's when a reserve fails after a rebuild destroyed it.
+    // The arena's zones as this call read them, none when there is no arena. The holders refusal names them as what the
+    // device has; a reserve that fails after a rebuild destroyed that arena names them as released, and the zones the
+    // device has after the failure as its have.
     zone_arena_sizes arena_zones;
     if (arena_active()) {
         const bool zones_sufficient = zone_capacity(vram_zone_id::SCRATCH) >= scratch_zone &&
@@ -7751,11 +7752,15 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
 
     if (!arena_reserve(queue_, budget_, max_alloc, safe_max_alloc, scratch_zone, onednn_zone, runtime_zone,
                        device_total_vram_)) {
+        // The have is what the device has now, read after the failed reserve; the arena a rebuild destroyed for it is
+        // named apart.
         if (refusal != nullptr) {
-            refusal->reason = zone_arena_refusal_reason::RESERVE_FAILED;
-            refusal->device = dev_id;
-            refusal->need   = { scratch_zone, onednn_zone, runtime_zone };
-            refusal->have   = arena_zones;
+            refusal->reason   = zone_arena_refusal_reason::RESERVE_FAILED;
+            refusal->device   = dev_id;
+            refusal->need     = { scratch_zone, onednn_zone, runtime_zone };
+            refusal->have     = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN),
+                                  zone_capacity(vram_zone_id::RUNTIME) };
+            refusal->released = arena_zones;
         }
         return false;
     }

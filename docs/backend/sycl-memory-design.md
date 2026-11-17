@@ -2956,7 +2956,12 @@ holds the arena.
 
 When the arena could be rebuilt but the reserve failed (the tail chunk's cap),
 the reason reads `the device could not reserve an arena with these zones. Free
-VRAM on device <D>, then load this one again`. The line offers no smaller `-c`
+VRAM on device <D>, then load this one again`. The rebuild destroyed the arena
+before the reserve, so each zone's have is what the device has after the
+failure (0.0 MB), and the reason names the arena it had: `, and the arena it had
+(SCRATCH <S0> MB, ONEDNN <O0> MB, RUNTIME <R0> MB) was released for the rebuild`
+before the remedy. A first reserve on the device released nothing and says
+nothing about it. The line offers no smaller `-c`
 or `-ub`: the load plans its zones at its fixed planning shape (ubatch 512, an
 `n_ctx` of one ubatch), so neither is the term that grew. Any term can be the
 one: whatever holds the arena keeps the zones at the size an earlier load gave
