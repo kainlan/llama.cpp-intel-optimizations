@@ -2098,6 +2098,27 @@ int main() {
         CHECK(
             zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 2048, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 300 * MiB) == 0,
             "no rung fits: nothing named");
+        // The smallest rung and below it, with no room: 32 and 16 draw the 64 MiB minimum outside the arena, which
+        // leaves 536 of 600 MiB (fits) and 236 of 300 MiB (refused, and no smaller rung is tried).
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 32, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 0) == 32,
+              "a micro-batch of 32 that fits is returned unchanged");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 32, 1024 * MiB, 0, 300 * MiB, 256 * MiB, 0) == 0,
+              "a micro-batch of 32 that does not fit: nothing named");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 16, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 0) == 16,
+              "a micro-batch below 32 that fits is returned unchanged");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 4096, 16, 1024 * MiB, 0, 300 * MiB, 256 * MiB, 0) == 0,
+              "a micro-batch below 32 that does not fit: nothing named, no rung above it");
+        // A 2^k+1 boundary. 32 heads, n_ctx 32768: 6 MiB a row. 65: 390 MiB, which leaves 250 of 640 (refused); the
+        // rung below it is 64 (384 MiB, leaves exactly the 256 MiB headroom).
+        CHECK(zone_onednn_graph_fit_largest_ub(32, 0, 0, 32768, 65, 1024 * MiB, 0, 640 * MiB, 256 * MiB, 0) == 64,
+              "65 when only 64 fits names 64");
+        // A sliding-window shape: 16 window heads, n_swa 1024, n_ctx 32768, no full-context heads. A window head sees
+        // n_swa + n_ubatch keys: 2048 gives 16 * 3072 * 2048 f32 * 3/2 = 576 MiB, 384 above the 192 MiB room, which
+        // leaves 216 of 600 (refused); 1024 gives 16 * 2048 * 1024 f32 * 3/2 = 192 MiB, inside the room. A window of
+        // n_swa alone would put 2048 at 192 MiB (fits), and of n_ctx at the 1 GiB cap for 1024 (refused).
+        CHECK(zone_onednn_graph_fit_largest_ub(0, 16, 1024, 32768, 2048, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB,
+                                               0) == 1024,
+              "a sliding-window shape is sized from its window, n_swa + n_ubatch keys");
     }
 
     // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and
