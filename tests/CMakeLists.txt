@@ -801,6 +801,9 @@ llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-json-schema.cpp)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
+# Host-only: loads no model, so it keeps the default label. Checks the helper llama-completion uses to switch to the jinja
+# engine for a model whose chat template the built-in matcher does not know.
+llama_build_and_test(test-chat-need-jinja.cpp)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
@@ -4610,6 +4613,18 @@ if (Python3_Interpreter_FOUND)
         NAME test-sycl-compute-refusal-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-compute-refusal-source.py
         LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# Source gate for llama-completion's jinja fallback: upstream turns the jinja engine off for this tool, and a model whose
+# chat template the built-in matcher does not know (Gemma 4) failed after the load with "try using --jinja". The gate pins
+# common_chat_templates_need_jinja() and the one place llama_completion() decides the engine. The behaviour of the helper
+# is test-chat-need-jinja above. Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-completion-jinja-fallback-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-completion-jinja-fallback-source.py
+        LABEL "python;source-assert;mutation"
         TIMEOUT 120)
 endif()
 
