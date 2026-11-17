@@ -112,7 +112,8 @@ compute-runtime 26.x. The verdict does not rest on context scoping —
 the two BDFs.
 
 **Consequence for multi-GPU work:** `GGML_SYCL_MOE_MULTI_GPU` must stay opt-in.
-The MoE multi-device path would be moving expert data between two cards that
+It is opt-in: `GGML_SYCL_MOE_MULTI_GPU=1`. The dense two-card plan does not
+depend on it. The MoE multi-device path would be moving expert data between two cards that
 cannot DMA to each other, so any traffic host-bounces — which is also why an
 earlier two-GPU run halving throughput (32.11 → 15.81 tok/s) reads as expected
 rather than anomalous.

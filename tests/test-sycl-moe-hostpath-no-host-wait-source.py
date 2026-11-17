@@ -271,7 +271,7 @@ BOUNDARY = {
     ),
     "dispatch_experts_secondary_gpu_impl": (
         "the multi-GPU MoE path, reached only while g_moe_multi_gpu_active, which needs "
-        "GGML_SYCL_MOE_MULTI_GPU with two or more cards or a placement plan that uses a second card; a "
+        "GGML_SYCL_MOE_MULTI_GPU=1 with two or more cards and a placement plan that uses a second card; a "
         "single-card decode never runs it"
     ),
     "flush_pending_secondary_scatter": (

@@ -11,8 +11,10 @@
 // registered gpu-serial, serial, with the selector pinned: test-sycl-lazy-plan-interface-1dev runs on the B70 alone,
 // where the planner caller takes its single-device path, and test-sycl-lazy-plan-interface-2dev on both cards, where it
 // takes the multi-device path. Each runs iff the host takes its path, by the planner caller's own predicate,
-// ggml_backend_sycl_moe_multi_gpu_requested(), and exits 77 otherwise. The scheduler-exposed device count is never the
-// test: this backend exposes one device whenever more than one GPU is visible.
+// ggml_backend_sycl_multi_device_plan_requested() asked with the fixture's expert fact, and exits 77 otherwise. The
+// fixture's model has experts, so the multi-device path is the opt-in cross-card one and the two-card registration
+// sets GGML_SYCL_MOE_MULTI_GPU=1. The scheduler-exposed device count is never the test: this backend exposes one
+// device whenever more than one GPU is visible.
 //
 // Every arm names its engagement check and the mutant it kills. An arm whose engagement check fails is VOID, and a VOID
 // arm fails the binary like a FAIL. Every arm runs, so one failure does not hide the rest.
@@ -43,6 +45,7 @@ using namespace lazy_table_test;
 using ggml_sycl::host_cpu_mapped_size;
 using ggml_sycl::lazy_table_host_body_request_bytes;
 using host_plan_shaped_inventory::loader_inventory;
+using host_plan_shaped_inventory::q2k_shape;
 using lazy_io_test::file_byte;
 
 namespace {
@@ -869,11 +872,11 @@ int main(int argc, char ** argv) {
     }
     // The planner caller takes the multi-device path iff this predicate holds, so each registration scores the path
     // it names or skips; a run on the other path would score the wrong planner call.
-    const bool multi_path = ggml_backend_sycl_moe_multi_gpu_requested();
+    const bool multi_path = ggml_backend_sycl_multi_device_plan_requested(q2k_shape.experts > 0);
     if (multi_path != (g_devices == 2)) {
         std::printf(
             "SKIP: --devices %d scores the %s planner call, and this host takes the other path: "
-            "ggml_backend_sycl_moe_multi_gpu_requested() is %s\n",
+            "ggml_backend_sycl_multi_device_plan_requested() is %s\n",
             g_devices, g_devices == 2 ? "multi-device" : "single-device", multi_path ? "true" : "false");
         return SYCL_TEST_SKIP;
     }

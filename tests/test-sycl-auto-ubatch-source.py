@@ -2092,14 +2092,14 @@ def test_device_set_hash_is_gone():
 def test_backend_extends_the_device_set_with_hidden_planner_gpus():
     """ubatch-tuning-cache.cpp must compose the key over the PARTICIPATING
     set: the context's devices plus, under the multi-device plan, every other
-    physical GPU, gated on the same ggml_backend_sycl_moe_multi_gpu_requested()
-    the multi-device plan uses, with each device's budget from its budget
-    authority."""
+    physical GPU, gated on ggml_sycl_multi_device_plan_for_loaded_model(),
+    the predicate the multi-device plan uses, with each device's budget from
+    its budget authority."""
     code = _normalize_ws(UBATCH_TUNING_CACHE_CPP_CODE)
     for pattern, what in (
         (r"topo\.total_gpu_count\s*=\s*std::min\s*\(\s*info\.total_gpu_count\s*,", "the physical GPU count"),
-        (r"topo\.multi_device_plan\s*=\s*ggml_backend_sycl_moe_multi_gpu_requested\s*\(\s*\)\s*;",
-         "the planner's own multi-GPU gate"),
+        (r"topo\.multi_device_plan\s*=\s*ggml_sycl_multi_device_plan_for_loaded_model\s*\(\s*\)\s*;",
+         "the planner's own multi-device predicate"),
         (r"for\s*\(\s*int\s+device\s*:\s*ubatch_participating_devices\s*\(\s*topo\s*\)\s*\)",
          "a walk over the participating devices"),
         (r"ggml_sycl::ggml_sycl_device_budget_authority_existing\s*\(",
@@ -2138,24 +2138,26 @@ def _brace_block(code: str, open_idx: int) -> str:
 
 
 _PLANNER_FN = "static void compute_and_store_plan_for_inventory("
-# The planner asks the one multi-device gate the plan dry run also asks (llama.cpp-4zup), and that gate is the GPU count
-# and ggml_backend_sycl_moe_multi_gpu_requested(), nothing else.
-_GATE_FN = "static bool ggml_sycl_plan_multi_device() {"
-_GATE_RETURN = "return ggml_sycl_info().total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested();"
-_PLANNER_GATE = "if (ggml_sycl_plan_multi_device()) {"
+# The planner asks the one multi-device gate the plan dry run also asks, with the expert fact. A model without
+# experts plans both cards; a model with experts does only on the cross-card expert opt-in.
+_GATE_FN = "static bool ggml_sycl_plan_multi_device(bool has_experts) {"
+_GATE_RETURN = "return ggml_sycl_info().total_gpu_count >= 2 && (!has_experts || ggml_sycl_moe_multi_gpu_requested());"
+_PLANNER_GATE = "if (ggml_sycl_plan_multi_device(is_moe)) {"
 
 
 def _assert_planner_branches_on_the_gate(code: str) -> None:
     """compute_and_store_plan_for_inventory() must reach
     compute_multi_device_plan() only inside the branch taken on
-    ggml_backend_sycl_moe_multi_gpu_requested() -- the predicate the key
-    reads to decide |plan=multi. The branch asks ggml_sycl_plan_multi_device(),
-    whose whole body is the GPU count and that predicate."""
+    ggml_sycl_plan_multi_device(is_moe) -- the predicate the key reads,
+    through ggml_sycl_multi_device_plan_for_loaded_model(), to decide
+    |plan=multi. That gate's whole body is the GPU count and the expert
+    term: no experts, or the cross-card expert opt-in."""
     gate_fn = code.find(_GATE_FN)
     gate_fn_body = _brace_block(code, gate_fn + len(_GATE_FN) - 1).strip() if gate_fn != -1 else ""
     assert gate_fn_body == _GATE_RETURN, (
         "ggml_sycl_plan_multi_device(), the planner's multi-device gate, must branch on "
-        "`ggml_sycl_info().total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()` and nothing else"
+        "`ggml_sycl_info().total_gpu_count >= 2 && (!has_experts || ggml_sycl_moe_multi_gpu_requested())` and nothing "
+        "else"
     )
     fn = code.find(_PLANNER_FN)
     assert fn != -1, "could not find compute_and_store_plan_for_inventory()"
@@ -2163,7 +2165,7 @@ def _assert_planner_branches_on_the_gate(code: str) -> None:
     gate = fn_body.find(_PLANNER_GATE)
     assert gate != -1, (
         "compute_and_store_plan_for_inventory() must branch on "
-        "`ggml_sycl_plan_multi_device()`"
+        "`ggml_sycl_plan_multi_device(is_moe)`"
     )
     gate_block = _brace_block(fn_body, gate + len(_PLANNER_GATE) - 1)
     assert "compute_multi_device_plan(" in gate_block, (
@@ -2175,14 +2177,15 @@ def _assert_planner_branches_on_the_gate(code: str) -> None:
 
 
 def test_planner_gate_check_has_a_mutation_witness():
-    """Mutation witness for the planner-gate check: dropping the
-    ggml_backend_sycl_moe_multi_gpu_requested() call from the branch
-    condition must fail it, since the key would then describe a plan the
-    planner no longer gates the same way."""
+    """Mutation witness for the planner-gate check: dropping the expert
+    term from the branch condition must fail it, since the key would then
+    describe a plan the planner no longer gates the same way."""
     raw = GGML_SYCL_CPP
     fn = raw.find(_GATE_FN)
     assert fn != -1, "mutation target not found -- update this witness to match the real source"
-    target = "    return ggml_sycl_info().total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested();\n"
+    target = ("    return ggml_sycl_info().total_gpu_count >= 2 && "
+              "(!has_experts || ggml_sycl_moe_multi_gpu_requested());\n")
+    _assert_target_in_fn_body(_GATE_FN, target)
     at = raw.find(target, fn)
     assert at != -1, "mutation target not found -- update this witness to match the real source"
     mutated_raw = raw[:at] + "    return ggml_sycl_info().total_gpu_count >= 2;\n" + raw[at + len(target):]
@@ -2191,7 +2194,8 @@ def test_planner_gate_check_has_a_mutation_witness():
     # The planner stops asking the gate and branches on the GPU count alone: the gate is still right, and unasked.
     fn = raw.find(_PLANNER_FN)
     assert fn != -1, "mutation target not found -- update this witness to match the real source"
-    target = "    if (ggml_sycl_plan_multi_device()) {\n"
+    target = "    if (ggml_sycl_plan_multi_device(is_moe)) {\n"
+    _assert_target_in_fn_body(_PLANNER_FN, target)
     at = raw.find(target, fn)
     assert at != -1, "mutation target not found -- update this witness to match the real source"
     mutated_raw = raw[:at] + "    if (info.total_gpu_count >= 2) {\n" + raw[at + len(target):]
@@ -2221,86 +2225,104 @@ def test_planner_gate_check_else_branch_has_a_mutation_witness():
         _assert_planner_branches_on_the_gate(_normalize_ws(mutated))
 
 
-def test_hidden_gpu_gate_holds_for_a_dense_model():
-    """The hidden-GPU gate is named for MoE but is not MoE-specific: with
-    GGML_SYCL_MOE_MULTI_GPU unset it is just total_gpu_count >= 2, which is
-    why a dense Mistral level_zero:0,1 run takes the multi-device plan and
-    places a layer block on the B50. If it ever starts consulting the model
-    (an expert count, is_moe), a dense split would silently key as its
-    first card alone again."""
-    _assert_hidden_gpu_gate_model_independent(_normalize_ws(GGML_SYCL_CPP_CODE))
+def _fn_body(code: str, signature: str) -> str:
+    start = code.find(signature)
+    assert start != -1, f"could not find {signature!r}"
+    return _brace_block(code, code.index("{", start)).strip()
 
 
-def _hidden_gpu_gate_body(code: str) -> str:
-    start = code.find("bool ggml_backend_sycl_moe_multi_gpu_requested() {")
-    assert start != -1, "could not find ggml_backend_sycl_moe_multi_gpu_requested()'s definition"
-    open_idx = code.index("{", start)
-    depth, end = 0, -1
-    for i in range(open_idx, len(code)):
-        depth += {"{": 1, "}": -1}.get(code[i], 0)
-        if depth == 0:
-            end = i
-            break
-    return code[open_idx + 1:end].strip()
-
-
-# The whole gate, whitespace-normalized: the GGML_SYCL_MOE_MULTI_GPU override,
-# then total_gpu_count >= 2 alone. An exact match rather than a forbid-list of
-# model terms, so ANY new input -- an expert count, g_model_n_layer, a global
-# nobody has named yet -- fails it.
-_HIDDEN_GPU_GATE_BODY = _normalize_ws(
+# Exact bodies, whitespace-normalized. The cross-card expert path is opt-in and reads the variable once; the
+# exported predicate is that answer; the key asks the planner's predicate with the planner's expert fact.
+_OPT_IN_BODY = _normalize_ws(
     'const char * env = std::getenv("GGML_SYCL_MOE_MULTI_GPU"); '
-    "if (env) { return std::atoi(env) != 0 && ggml_sycl_info().total_gpu_count >= 2; } "
-    "return ggml_sycl_info().total_gpu_count >= 2;"
+    "return ggml_sycl_info().total_gpu_count >= 2 && env != nullptr && std::atoi(env) != 0;"
 )
+_EXPORTED_BODY = "return ggml_sycl_moe_multi_gpu_requested();"
+_LOADED_MODEL_BODY = "return ggml_sycl_plan_multi_device(g_moe_n_experts_total > 0);"
 
 
-def _assert_hidden_gpu_gate_model_independent(code: str) -> None:
-    body = _hidden_gpu_gate_body(code)
-    assert body == _HIDDEN_GPU_GATE_BODY, (
-        "the hidden-GPU gate must be exactly the env override plus total_gpu_count >= 2 -- it must not depend "
-        f"on the model; got: {body!r}"
+def _assert_expert_path_is_opt_in(code: str) -> None:
+    assert _fn_body(code, "static bool ggml_sycl_moe_multi_gpu_requested() {") == _OPT_IN_BODY, (
+        "the cross-card expert path must be opt-in: two GPUs and GGML_SYCL_MOE_MULTI_GPU set non-zero"
     )
+    assert _fn_body(code, "bool ggml_backend_sycl_moe_multi_gpu_requested() {") == _EXPORTED_BODY, (
+        "the exported predicate must return the opt-in predicate and nothing else"
+    )
+    assert _fn_body(code, "bool ggml_sycl_multi_device_plan_for_loaded_model() {") == _LOADED_MODEL_BODY, (
+        "the key's predicate must be the planner's gate with the planner's expert fact"
+    )
+    # The predicate, the init peer-link probe gate and the device-map log line; a fourth is a second copy of the gate.
+    n = code.count('std::getenv("GGML_SYCL_MOE_MULTI_GPU")')
+    assert n == 3, f"GGML_SYCL_MOE_MULTI_GPU must be read in exactly 3 places, found {n}"
 
 
-_HIDDEN_GPU_GATE_RETURN = "\n    return ggml_sycl_info().total_gpu_count >= 2;\n}"
+def test_dense_plan_gate_does_not_read_the_expert_opt_in():
+    """A model without experts plans both cards whatever GGML_SYCL_MOE_MULTI_GPU says, and the cross-card
+    expert path runs only on that opt-in. One predicate per fact, read in one place each."""
+    _assert_planner_branches_on_the_gate(_normalize_ws(GGML_SYCL_CPP_CODE))
+    _assert_expert_path_is_opt_in(_normalize_ws(GGML_SYCL_CPP_CODE))
 
 
-def _hidden_gpu_gate_mutant(insert_before_return: str = "", replace_return: str = "") -> str:
-    """Mutate the gate's final return, located from the function's own
-    signature so the anchor does not depend on what follows it."""
+def _mutant(signature: str, target: str, replacement: str) -> str:
     raw = GGML_SYCL_CPP
-    fn = raw.find("bool ggml_backend_sycl_moe_multi_gpu_requested() {")
+    fn = raw.find(signature)
     assert fn != -1, "mutation target not found -- update this witness to match the real source"
-    ret = raw.find(_HIDDEN_GPU_GATE_RETURN, fn)
-    assert ret != -1, "mutation target not found -- update this witness to match the real source"
-    original = _HIDDEN_GPU_GATE_RETURN
-    replacement = insert_before_return + (replace_return or original)
-    mutated_raw = raw[:ret] + replacement + raw[ret + len(original):]
-    assert mutated_raw != raw
-    return _normalize_ws(strip_comments(mutated_raw))
+    at = raw.find(target, fn)
+    assert at != -1, "mutation target not found -- update this witness to match the real source"
+    return _normalize_ws(strip_comments(raw[:at] + replacement + raw[at + len(target):]))
 
 
-def test_hidden_gpu_gate_holds_for_a_dense_model_has_a_mutation_witness():
-    """Mutation witness for the check above: an early return on the expert
-    count leaves the trailing `return ... >= 2;` intact -- the change that
-    would make a dense level_zero:0,1 split key as its first card alone."""
-    mutated = _hidden_gpu_gate_mutant(
-        insert_before_return="\n    if (g_moe_n_experts_total == 0) {\n        return false;\n    }"
-    )
-    with pytest.raises(AssertionError, match="must not depend on the model"):
-        _assert_hidden_gpu_gate_model_independent(mutated)
+def _assert_target_in_fn_body(signature: str, target: str) -> None:
+    """A witness must mutate the function it names. A search that starts at the signature but is not bounded by the
+    function's end can match the same text in an unrelated function far below, and then mutates nothing it tests."""
+    raw = GGML_SYCL_CPP
+    fn = raw.find(signature)
+    assert fn != -1, "mutation target not found -- update this witness to match the real source"
+    body = _brace_block(raw, raw.index("{", fn))
+    assert target in body, f"mutation target {target!r} is not inside {signature!r} -- update this witness"
 
 
-def test_hidden_gpu_gate_unnamed_model_input_has_a_mutation_witness():
-    """Mutation witness that the exact-shape check is not a forbid-list: a
-    model input no list names (g_model_n_layer) folded into the return is
-    caught too."""
-    mutated = _hidden_gpu_gate_mutant(
-        replace_return="\n    return ggml_sycl_info().total_gpu_count >= 2 && g_model_n_layer > 0;\n}"
-    )
-    with pytest.raises(AssertionError, match="must not depend on the model"):
-        _assert_hidden_gpu_gate_model_independent(mutated)
+def test_expert_opt_in_default_on_has_a_mutation_witness():
+    """The old default-on body must fail the check."""
+    signature = "static bool ggml_sycl_moe_multi_gpu_requested() {"
+    target = "env != nullptr && std::atoi(env) != 0;"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, "(!env || std::atoi(env) != 0);")
+    with pytest.raises(AssertionError, match="must be opt-in"):
+        _assert_expert_path_is_opt_in(mutated)
+
+
+def test_dense_plan_reading_the_opt_in_has_a_mutation_witness():
+    """The old plan gate, where the dense split depends on the expert opt-in, must fail the check."""
+    signature = "static bool ggml_sycl_plan_multi_device(bool has_experts) {"
+    target = "(!has_experts || ggml_sycl_moe_multi_gpu_requested());"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, "ggml_backend_sycl_moe_multi_gpu_requested();")
+    with pytest.raises(AssertionError, match="must branch on"):
+        _assert_planner_branches_on_the_gate(mutated)
+
+
+def test_second_gate_copy_has_a_mutation_witness():
+    """A fourth read of the variable, a new copy of the gate at a site no exact-body check covers, must fail the
+    count."""
+    signature = "static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {"
+    target = "const bool multi_gpu_requested = ggml_sycl_moe_multi_gpu_requested();"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, "const bool multi_gpu_requested = ggml_sycl_moe_multi_gpu_requested() || "
+                                         'std::getenv("GGML_SYCL_MOE_MULTI_GPU") != nullptr;')
+    with pytest.raises(AssertionError, match="exactly 3 places"):
+        _assert_expert_path_is_opt_in(mutated)
+
+
+def test_exported_predicate_body_has_a_mutation_witness():
+    """The exported predicate reading the variable itself, instead of returning the opt-in predicate, must fail
+    the exact-body check."""
+    signature = "bool ggml_backend_sycl_moe_multi_gpu_requested() {"
+    target = "return ggml_sycl_moe_multi_gpu_requested();"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, 'return std::getenv("GGML_SYCL_MOE_MULTI_GPU") != nullptr;')
+    with pytest.raises(AssertionError, match="return the opt-in predicate"):
+        _assert_expert_path_is_opt_in(mutated)
 
 
 def test_cache_hit_reads_the_stored_reason():

@@ -1909,6 +1909,8 @@ size_t                        ggml_sycl_get_free_vram_at_init(int device);
 size_t                        ggml_sycl_get_host_max_alloc_size();
 const sycl_peer_link_info *   ggml_sycl_get_peer_link_info(int src_device, int dst_device);
 void                          ggml_sycl_dump_peer_link_info();
+// Whether the placement plan for the registered model spans every physical GPU. Same predicate the planner asks.
+bool                          ggml_sycl_multi_device_plan_for_loaded_model();
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 namespace ggml_sycl {
