@@ -2263,6 +2263,44 @@ def test_dense_plan_gate_does_not_read_the_expert_opt_in():
     _assert_expert_path_is_opt_in(_normalize_ws(GGML_SYCL_CPP_CODE))
 
 
+_INIT_WARN = '"[SYCL] WARNING: %d GPUs visible. Multi-GPU Level Zero contexts "'
+
+
+def _assert_init_warning_counts_no_cards(raw: str) -> None:
+    """The init WARN prints whenever more than one GPU is visible, and the planner budgets every visible GPU
+    (ggml_sycl_plan_device_budgets walks total_gpu_count), so its dense-split clause names no count of cards."""
+    code = _normalize_ws(strip_comments(raw))
+    at = code.find(_normalize_ws(_INIT_WARN))
+    assert at != -1 and code.count(_normalize_ws(_INIT_WARN)) == 1, "the two-GPU init WARN must exist once"
+    assert "if (info.total_gpu_count > 1) { GGML_LOG_WARN(" in code[max(0, at - 200):at], (
+        "the two-GPU init WARN must print for any count above one"
+    )
+    warn = code[at:code.find(");", at)]
+    assert "the planner splits a model without experts across these GPUs" in warn, (
+        "the init WARN must say the dense split covers every visible GPU"
+    )
+    assert "both" not in warn, "the init WARN must not say both cards: it prints for three or more"
+    budgets = _fn_body(code, "static std::vector<ggml_sycl::device_budget> ggml_sycl_plan_device_budgets(")
+    assert "for (int d = 0; d < info.total_gpu_count; d++)" in budgets, (
+        "the planner must budget every visible GPU for the WARN's claim to hold"
+    )
+
+
+def test_init_warning_counts_no_cards():
+    _assert_init_warning_counts_no_cards(GGML_SYCL_CPP)
+
+
+def test_init_warning_naming_two_cards_has_a_mutation_witness():
+    assert GGML_SYCL_CPP.count("the planner splits a model without experts across these GPUs") == 1, (
+        "mutation target not found -- update this witness to match the real source"
+    )
+    mutated = GGML_SYCL_CPP.replace(
+        "the planner splits a model without experts across these GPUs",
+        "the planner splits a model without experts over both cards", 1)
+    with pytest.raises(AssertionError, match="dense split covers every visible GPU"):
+        _assert_init_warning_counts_no_cards(mutated)
+
+
 def _mutant(signature: str, target: str, replacement: str) -> str:
     raw = GGML_SYCL_CPP
     fn = raw.find(signature)
