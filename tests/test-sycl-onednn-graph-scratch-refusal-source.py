@@ -12,7 +12,8 @@ The arithmetic is host-tested (test-zone-sizing, Case 24h). This file pins the w
 - the check returns early when flash attention is off, and when the Graph allocator is disabled;
 - the check runs in probe mode too (the micro-batch ladder must see the verdict a real context gets);
 - the refusal names the largest -ub the same fit accepts.
-Each claim has one mutant that fails its own check and no other.
+Each claim has a mutant that fails its own check and no other; the order claim has one for each half (the call
+moved above the non-FA check, and moved past the first guarded state).
 
 Host-only text assertions on comment-stripped source. llama_test_pytest hands this file to pytest.main(), so every
 check lives in a test_*() function.
@@ -54,7 +55,8 @@ TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction
 CHECK_NAME = "ggml_sycl_check_onednn_graph_scratch"
 CHECK_SIG = f"static bool {CHECK_NAME}("
 CHECK_CALL = f"if (!{CHECK_NAME}(ctx->device, next_plan, flash_attn_enabled, probe_mode, hold_query)) {{"
-NONFA_REFUSE = 'return refuse("non-FA attention scratch exceeds the device\'s outside-arena headroom");'
+NONFA_CALL = "if (!ggml_sycl_check_nonfa_attn_scratch("
+NONFA_REFUSE ='return refuse("non-FA attention scratch exceeds the device\'s outside-arena headroom");'
 # The first state the transaction restores on a refusal: the dense scratch's transaction guard.
 FIRST_GUARDED_STATE = "ggml_sycl_dense_scratch_txn_guard dense_guard("
 EARLY_RETURN_RE = re.compile(r"^ #if GGML_SYCL_DNNL if \(([^{]*)\) \{ return true; \}")
@@ -217,6 +219,13 @@ def test_every_check_has_a_mutation_witness_that_fails_only_it():
     guard_end = moved.index(";", moved.index(FIRST_GUARDED_STATE)) + 1
     moved = moved[:guard_end] + " " + block + moved[guard_end:]
     _assert_only(src[:start] + moved + src[end:], "order", "the check after the dense scratch guard")
+
+    # The call moved above the non-FA check, still before the guard: the other half of the order claim.
+    moved = body[:call_at] + body[call_end:]
+    assert moved.count(NONFA_CALL) == 1, f"mutation anchor must occur once in the transaction: {NONFA_CALL!r}"
+    nonfa_at = moved.index(NONFA_CALL)
+    moved = moved[:nonfa_at] + block + " " + moved[nonfa_at:]
+    _assert_only(src[:start] + moved + src[end:], "order", "the check before the non-FA check")
 
     _assert_only(_mutate_in(src, TXN_SIG, block, f"if (!probe_mode) {{ {block} }}"), "probe",
                  "the check skipped for a probe")
