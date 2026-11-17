@@ -5,7 +5,6 @@
 #include <unistd.h>
 
 #include <cstdio>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -86,10 +85,16 @@ int main() {
     CHECK(rc == 1, "a std::exception that escapes the entry gives status 1");
     CHECK(err == "llama-test: error: this custom template is not supported\n",
           "its message is printed as one error line");
+    if (err != "llama-test: error: this custom template is not supported\n") {
+        fprintf(stdout, "  captured stderr: [%s]\n", err.c_str());
+    }
 
     const std::string err_other = captured_stderr(run_other, rc);
     CHECK(rc == 1, "an exception that is not a std::exception gives status 1");
     CHECK(err_other == "llama-test: error: unknown exception\n", "and says so");
+    if (err_other != "llama-test: error: unknown exception\n") {
+        fprintf(stdout, "  captured stderr: [%s]\n", err_other.c_str());
+    }
 
     CHECK(common_tool_entry("llama-test", entry_returns_zero, 2, g_argv) == 0, "a normal return of 0 passes through");
     CHECK(g_seen_argc == 2 && g_seen_argv == g_argv, "the entry receives argc and argv unchanged");
