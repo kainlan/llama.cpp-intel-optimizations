@@ -10,8 +10,10 @@
 # The default is deliberately a plain variable, not a cache entry: a cached
 # default would outlive a pin moved in the tree, and every existing build tree
 # would keep embedding the old bundle. An explicit -DLLAMA_UI_PINNED_VERSION=...
-# is the user's override and persists as usual; an empty value restores the
-# derivation from the build number.
+# is the user's override and persists as usual (the cached value keeps winning
+# after the -D is dropped from the command line, until it is removed with -U or
+# the build directory is recreated); an empty value restores the derivation from
+# the build number.
 if(NOT DEFINED LLAMA_UI_PINNED_VERSION)
     set(LLAMA_UI_PINNED_VERSION "b11203")
 endif()

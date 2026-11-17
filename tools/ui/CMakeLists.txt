@@ -36,8 +36,8 @@ set(UI_H   "${CMAKE_CURRENT_BINARY_DIR}/ui.h")
 # single-sourcing means this list inherits whatever sources.cmake gets wrong,
 # and it currently gets things wrong in both directions (a listed file that no
 # longer exists, real inputs that are unlisted). Tracked as llama.cpp-3658.
-set(UI_ASSET_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake"
-                     "${CMAKE_CURRENT_SOURCE_DIR}/ui-version.cmake")
+set(UI_ASSET_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake")
+list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ui-version.cmake")
 
 # Priority 1 in scripts/ui-assets.cmake is pre-built assets dropped into
 # tools/ui/dist -- the documented recovery path for disconnected builds, and

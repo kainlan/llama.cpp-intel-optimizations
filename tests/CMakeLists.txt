@@ -1993,6 +1993,7 @@ if (NOT WIN32)
         NAME test-ui-version-pin
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         ARGS -DUI_VERSION_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/ui-version.cmake
+             -DUI_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/CMakeLists.txt
              -P ${CMAKE_CURRENT_SOURCE_DIR}/test-ui-version-pin.cmake
     )
     set_tests_properties(test-ui-version-pin PROPERTIES

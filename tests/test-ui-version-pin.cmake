@@ -18,6 +18,13 @@ endif()
 if (NOT EXISTS "${UI_VERSION_CMAKE}")
     message(FATAL_ERROR "test-ui-version-pin: no such file: ${UI_VERSION_CMAKE}")
 endif()
+if (NOT DEFINED UI_CMAKE)
+    get_filename_component(_here "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
+    set(UI_CMAKE "${_here}/../tools/ui/CMakeLists.txt")
+endif()
+if (NOT EXISTS "${UI_CMAKE}")
+    message(FATAL_ERROR "test-ui-version-pin: no such file: ${UI_CMAKE}")
+endif()
 
 # The caller's environment must not change any verdict.
 unset(ENV{HF_WEBUI_VERSION})
@@ -80,6 +87,20 @@ if (_code MATCHES "set\\([ \t\n]*LLAMA_UI_PINNED_VERSION[^)]*CACHE")
     message(FATAL_ERROR "test-ui-version-pin: case f: the default pin is a set(... CACHE ...) entry")
 endif()
 message(STATUS "PASS f (default pin is not a cache entry)")
+math(EXPR _pass "${_pass}+1")
+
+# g. editing the pin must re-run provisioning: tools/ui/CMakeLists.txt has to
+# include the file (or the resolver is not defined) and list it among the
+# provisioning step's dependencies.
+file(READ "${UI_CMAKE}" _ui_text)
+string(REGEX REPLACE "(^|\n)[ \t]*#[^\n]*" "\\1" _ui_code "${_ui_text}")
+if (NOT _ui_code MATCHES "include\\([^)]*ui-version\\.cmake\"?[ \t\n]*\\)")
+    message(FATAL_ERROR "test-ui-version-pin: case g: ${UI_CMAKE} has no include() of ui-version.cmake")
+endif()
+if (NOT _ui_code MATCHES "(set|list)\\((APPEND )?UI_ASSET_DEPENDS[^)]*ui-version\\.cmake")
+    message(FATAL_ERROR "test-ui-version-pin: case g: ui-version.cmake is not in UI_ASSET_DEPENDS in ${UI_CMAKE}, so editing the pin would not re-run provisioning")
+endif()
+message(STATUS "PASS g (ui-version.cmake is included and listed in UI_ASSET_DEPENDS)")
 math(EXPR _pass "${_pass}+1")
 
 unset(ENV{HF_WEBUI_VERSION})
