@@ -30,8 +30,9 @@ struct llama_measure_context_args;
 
 // A model the load-time measure cannot measure, by name: a memory kind with no no_alloc form, an
 // architecture that needs a second context, a model with an encoder graph. It is not a failure and not a
-// refusal of the load: the measure returns it as `unsupported`, and the load goes on the unplanned path with
-// one WARN that names it. Anything else a measure throws is a failure of the measure and refuses the load.
+// refusal of the load: the measure returns it as `unsupported`, and the load goes on with one WARN that names it,
+// and that stage reserves no compute term. Anything else a measure throws is a failure of the measure and refuses
+// the load.
 struct llama_measure_unsupported : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
@@ -258,11 +259,13 @@ inline bool llama_sycl_l4_reserve_compute_term(const llama_sycl_l4_procs &      
 
 struct llama_load_measure_result {
     bool                                   ok          = false;
-    bool                                   unsupported = false;  // !ok: nothing to measure (llama_load_measure_run)
-    std::string                            refusal;              // the named refusal when !ok
+    // !ok because the stage cannot be measured (a model the measure cannot walk, or no plan staged); the load goes
+    // on with a WARN
+    bool                                   unsupported = false;
+    std::string                            refusal;       // the named refusal when !ok
     std::vector<llama_load_measure_device> devices;
-    int                                    n_splits = 0;         // the most splits any measured graph took
-    llama_kv_residency_tally               kv;                   // the KV residency of the caches the measure built
+    int                                    n_splits = 0;  // the most splits any measured graph took
+    llama_kv_residency_tally               kv;            // the KV residency of the caches the measure built
     // llama.cpp-p6i0 (the compute trace): the measure's per-buffer-type, per-graph chunk peaks and splits, its
     // shape and its KV residency, as INFO lines. The measure-only context is quiet while it lives, so
     // llama_load_measure prints them once the context is gone.
@@ -305,8 +308,10 @@ llama_load_measure_result llama_load_measure(const llama_model &          model,
 
 // What the backend said of each device's term at the late stage, and what the load does with it.
 struct llama_late_check_result {
-    std::string          refusal;       // non-empty: the load is refused, by this named text
-    std::string          unsupported;   // non-empty: the stage has nothing to measure; the load goes on, with a WARN
+    std::string          refusal;  // non-empty: the load is refused, by this named text
+    // non-empty: the stage cannot be measured (a model the measure cannot walk, or no plan staged); the load goes
+    // on with a WARN
+    std::string          unsupported;
     uint32_t             n_ubatch = 0;  // the measure's ubatch, for the text of a miss
     std::vector<int32_t> not_recorded;  // devices with no early term to compare: NOT a pass
     // the measured compute term c(P) of each not_recorded device, in the same order: what the late measure found,
@@ -440,8 +445,10 @@ inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &
 // compute buffer. A device the backend does not reserve for (it says why at WARN) keeps its compute buffer
 // unplanned. Inert, like the late check, unless the backend exports the L4 entry points and both load terms.
 struct llama_load_probe_result {
-    std::string                            refusal;           // non-empty: the measure failed, by this named text
-    std::string                            unsupported;       // non-empty: the stage has nothing to measure
+    std::string                            refusal;  // non-empty: the measure failed, by this named text
+    // non-empty: the stage cannot be measured (a model the measure cannot walk, or no plan staged); the load goes
+    // on with a WARN
+    std::string                            unsupported;
     bool                                   measured = false;
     std::vector<llama_load_measure_device> devices;           // C-hat per device when measured
     std::vector<int32_t>                   compute_declined;  // SYCL devices whose compute term the backend declined
@@ -525,8 +532,10 @@ struct llama_admitted_term {
 };
 
 struct llama_admitted_check_result {
-    std::string                      refusal;               // non-empty: the load is refused, by this named text
-    std::string                      unsupported;           // non-empty: nothing to measure; the load goes on
+    std::string                      refusal;  // non-empty: the load is refused, by this named text
+    // non-empty: the stage cannot be measured (a model the measure cannot walk, or no plan staged); the load goes
+    // on with a WARN
+    std::string                      unsupported;
     std::vector<llama_admitted_term> terms;                 // one per SYCL device, when admitted
     uint32_t                         n_ctx            = 0;  // the n_ctx and ubatch the measure ran at
     uint32_t                         n_ubatch         = 0;

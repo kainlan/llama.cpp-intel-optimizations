@@ -488,7 +488,7 @@ def stage_order_ok(code: str) -> bool:
         and "throw" not in unsupported
         and z("if (!probe.refusal.empty()) { throw std::runtime_error(probe.refusal); }") in probe_seg
         and z("if (!admitted.refusal.empty()) { throw std::runtime_error(admitted.refusal); }") in admit_seg
-        # stage (b) runs only when the probe measured: an unsupported model stays on master's unplanned path
+        # stage (b) runs only when the probe measured: an unsupported probe reserves no compute term to admit
         and z("if (probe.measured)") in c[late_inv:admit]
     )
 
