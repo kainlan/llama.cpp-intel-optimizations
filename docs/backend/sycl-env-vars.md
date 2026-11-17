@@ -153,8 +153,8 @@ Consequences worth knowing before you reach for this flag:
   MoE router logits matmul, GLU or routing subgraph is not declined to the host backend, so those ops stay on the
   device.
 - **What is off or refused while it is active.** Each needs the path active, so each also needs two or more GPUs and
-  a plan with experts on a second card, and none is reached today because that plan is refused at the load stage
-  (see the refusal above):
+  a plan with experts on a second card. None is reached through this path today, because that plan is refused at the
+  load stage (see the refusal above); MoE fusion is still off for the plan-alone reason in its sub-item below:
   - oneDNN prompt processing for the MoE is refused (`REFUSED_MOE_MULTI_GPU` in the placement decision);
   - MoE fusion is off (`[MOE-FUSION] Disabled under planned or multi-device residency`; a plan alone also turns it off);
   - the MXFP4 int8 grouped route for the MoE down projection is not taken;
