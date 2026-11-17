@@ -4639,6 +4639,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for the two raw-allocation gates: unified_alloc()'s one raw device exit and the device-pool chunk sites
+# compare a raw request with the device's physical bytes (the device total less the arena reservation, the raw rows
+# held outside it and the bytes outside this process's accounting at the first cache), never a zone counter; with an
+# arena active a refusal evicts nothing, and it names every term. Host-only, reads the sources as text; test-zone-sizing
+# Case 35 checks the figure's arithmetic. Same registration shape as test-sycl-zone-own-bytes-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-raw-gate-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-raw-gate-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Jinja fallback for a model whose chat template the built-in matcher does not know (Gemma 4 failed after the load with
 # "try using --jinja"): upstream turns the jinja engine off for llama-completion and llama-mtmd-cli.
 # test-chat-need-jinja checks common_chat_templates_need_jinja() itself. It loads no model, so it keeps the default
