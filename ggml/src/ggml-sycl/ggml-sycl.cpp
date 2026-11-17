@@ -18791,7 +18791,9 @@ static ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan_stale_l
 // The cross-card expert path moves expert work to a second card. Without a peer path between the cards the copies and
 // routing ids it needs have no safe route, and a two-card GPT-OSS run on that path faulted the first card. A plan that
 // wants the path on such a host is refused at the stage, before any weight is placed. The caller passes the peer fact,
-// so nothing here queries a device, a queue or a cache.
+// so nothing here queries a device, a queue or a cache. It reads the opt-in through ggml_sycl_moe_multi_gpu_wanted, so
+// it is pure only in the device fact, which is its argument. This is the refusal rule; the stage helper below only logs
+// it and maps it to the load status.
 static bool ggml_sycl_cross_card_expert_plan_refused(const ggml_sycl::placement_plan & plan, bool peer_path) {
     return ggml_sycl_moe_multi_gpu_wanted(plan) && !peer_path;
 }

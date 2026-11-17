@@ -9,7 +9,8 @@ wiring that test cannot reach without a device:
 
   * at each site the cross-card refusal is asked before the lazy-plan refusal;
   * at each site it returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED, the lazy-plan refusal's return;
-  * the predicate's body is exactly "wanted and not peer path" and calls nothing else, so it queries no device;
+  * the predicate's body is exactly "wanted and not peer path": it takes the peer fact as its argument and calls no
+    device query. It reads the opt-in through the wanted check, so it is pure only in the device fact;
   * the stage helper passes the predicate the peer fact read from the peer-link records of the plan's cards;
   * the refusal is one ERROR line that names the remedy.
 
@@ -163,7 +164,7 @@ def claim_early_returns_plan_rejected(src: str) -> bool:
     return (EARLY_CROSS + " " + REJECTED) in fn_body(view(src), STAGE_SIG)
 
 
-def claim_predicate_is_pure(src: str) -> bool:
+def claim_predicate_takes_the_peer_fact(src: str) -> bool:
     return fn_body(view(src), PRED_SIG) == PRED_BODY
 
 
@@ -181,7 +182,7 @@ CLAIMS = {
     "early_cross_card_before_lazy": claim_early_cross_card_before_lazy,
     "late_returns_plan_rejected": claim_late_returns_plan_rejected,
     "early_returns_plan_rejected": claim_early_returns_plan_rejected,
-    "predicate_is_pure": claim_predicate_is_pure,
+    "predicate_takes_the_peer_fact": claim_predicate_takes_the_peer_fact,
     "helper_passes_the_peer_fact": claim_helper_passes_the_peer_fact,
     "refusal_line_names_the_remedy": claim_refusal_line_names_the_remedy,
 }
@@ -226,10 +227,10 @@ def test_early_returns_plan_rejected():
     )
 
 
-def test_predicate_is_pure():
-    assert claim_predicate_is_pure(SYCL), (
+def test_predicate_takes_the_peer_fact():
+    assert claim_predicate_takes_the_peer_fact(SYCL), (
         f"ggml_sycl_cross_card_expert_plan_refused's body is not exactly {PRED_BODY!r}: it must take the peer fact "
-        "as its argument and query nothing itself"
+        "as its argument and call no device query itself"
     )
 
 
@@ -299,7 +300,7 @@ def test_witness_early_returns_another_code():
 
 def test_witness_predicate_queries_the_cards():
     assert_only_claim_fails(
-        "predicate_is_pure",
+        "predicate_takes_the_peer_fact",
         mutate_in(SYCL, PRED_SIG, "&& !peer_path;", "&& !peer_path && !ggml_sycl_cards_have_peer_path(plan.devices);"),
     )
 
