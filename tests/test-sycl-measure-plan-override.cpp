@@ -283,6 +283,25 @@ void test_cards_peer_path_follows_the_link_records() {
         test_sycl_info_override_guard info_guard(info);
         CHECK(!test_cards_have_peer_path(), "cards in separate contexts have no peer path");
     }
+    // Each half of the per-pair rule alone: access without a shared context, and a shared context without access.
+    ggml_sycl_device_info access_only = info;
+    for (int src = 0; src < 2; ++src) {
+        sycl_peer_link_info & link = access_only.peer_links[src][1 - src];
+        link.l0_can_access_peer    = true;
+        link.direct_copy_measured  = true;
+    }
+    {
+        test_sycl_info_override_guard info_guard(access_only);
+        CHECK(!test_cards_have_peer_path(), "peer access across separate contexts is no peer path");
+    }
+    ggml_sycl_device_info context_only = info;
+    for (int src = 0; src < 2; ++src) {
+        context_only.peer_links[src][1 - src].same_sycl_context = true;
+    }
+    {
+        test_sycl_info_override_guard info_guard(context_only);
+        CHECK(!test_cards_have_peer_path(), "a shared context without peer access is no peer path");
+    }
     // Each direction alone, so a read of only one direction of the pair cannot pass.
     ggml_sycl_device_info reverse_only               = info;
     reverse_only.peer_links[1][0].same_sycl_context  = true;
