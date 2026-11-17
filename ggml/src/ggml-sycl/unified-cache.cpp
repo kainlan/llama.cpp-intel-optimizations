@@ -20377,9 +20377,10 @@ bool unified_cache_raw_gate_admits(int device, sycl::queue & queue, size_t bytes
 // not per token. A caller that reaches this gate per op is paying a driver allocation per op: that is the defect to fix
 // at that caller, not a reason to make this figure cheaper.
 //
-// Locks, never two at once: g_cache_rw_mutex (L4) for the creating lookup (shared, or exclusive only while it creates
-// the cache), released; then the inputs' two, one after the other. Without an arena, evict_and_flush takes the cache's
-// own locks after all of these are released.
+// Locks, one at a time: g_cache_rw_mutex (L4) for the creating lookup, shared, released; then the inputs' two, one
+// after the other. The exception is the first raw request on a device, whose lookup creates the cache: it holds L4
+// exclusive and takes g_runtime_alloc_mutex (L5) inside it for the outside-accounting note, the L4-before-L5 order.
+// Without an arena, evict_and_flush takes the cache's own locks after all of these are released.
 static bool unified_alloc_raw_gate(const alloc_request & req, size_t alloc_size, bool hold_spill) {
     // The creating lookup, as the first raw request on a device has always made it: the cache's arena and the term
     // outside this process's accounting are in place before the first raw byte is counted.

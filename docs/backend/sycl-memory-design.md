@@ -3024,8 +3024,9 @@ tier: it is a WARN (DEBUG when the caller suppresses its failure log; ERROR for 
 request, what fits, the device total, the arena, the raw rows outside the arena and the term outside this process's
 accounting. The figure prints at INFO as `[RAW-GATE] device N: arena ... vs device ...` once per device per arena size,
 so a line printed by a raw request before the arena was reserved is printed again after it is. Locks:
-`g_cache_rw_mutex` (L4) for the cache lookup, then `g_runtime_alloc_mutex` (L5) for the walk, never both at once.
-Source pin: `tests/test-sycl-raw-gate-source.py`.
+`g_cache_rw_mutex` (L4) for the cache lookup, then `g_runtime_alloc_mutex` (L5) for the walk, one at a time, except
+that the first raw request on a device, whose lookup creates the cache, takes L5 under L4 exclusive for the
+outside-accounting note (the L4-before-L5 order). Source pin: `tests/test-sycl-raw-gate-source.py`.
 
 Only requests that leave through the raw driver exit reach the gate; on the default paths those are grow-only caches
 and staging buffers, a handful per process. The registry walk is therefore paid beside a driver allocation, not per
