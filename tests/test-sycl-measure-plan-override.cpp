@@ -107,8 +107,9 @@ void test_install_finds_the_staged_plan() {
 // The loader's query answers from the install's own lookup: false where the install would refuse for want of a
 // plan, true where it would find one. An explicit no-plan row (the VRAM arena off) is no plan.
 void test_staged_query_matches_the_install() {
-    constexpr uint64_t NONE_TXN    = 41003;
-    constexpr uint64_t NO_PLAN_TXN = 41004;
+    // ids no other test in this file stages under, so "nothing staged" does not depend on test order
+    constexpr uint64_t NONE_TXN    = 41005;
+    constexpr uint64_t NO_PLAN_TXN = 41006;
     CHECK(!ggml_backend_sycl_measure_plan_staged(NONE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE), "nothing staged: probe");
     CHECK(!ggml_backend_sycl_measure_plan_staged(NONE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B),
           "nothing staged: candidate");
