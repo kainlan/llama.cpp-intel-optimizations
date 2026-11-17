@@ -18,6 +18,12 @@ unified_cache_set_planned_* call in the planner's own functions has its getter i
 restore, fed from the field the snapshot filled. The plan dry run, which also discards the plans it makes, restores
 through the same helper and keeps no list of its own.
 
+The scan for the planner's terms reads a fixed list of function bodies in unified-cache.cpp (PLANNER_SIGS):
+populate_host_zone_sizing, publish_moe_host_scatter_term, record_host_ledger_plan, placement_plan_size_host_side,
+compute_placement_plan and compute_multi_device_plan. It does not follow the calls those bodies make, so a setter
+reached only through a function outside the list is not seen: a planner function that starts to publish a term joins
+the list. PLANNER_TERMS_TODAY keeps a scan that reads the wrong bodies from passing by finding nothing.
+
 The stage takes the snapshot after the entry ensure and before the plan with the room, and its fallback restores it
 after it publishes the planning shape again and before it sizes the zones.
 
@@ -197,8 +203,8 @@ def claim_requirement_is_the_pure_sum(uc: str, zs: str) -> bool:
 HELPER_SIG = "struct ggml_sycl_planner_published_terms"
 SNAPSHOT_SIG = "static ggml_sycl_planner_published_terms snapshot(int device)"
 RESTORE_SIG = "void restore(int device) const"
-# The planner's own functions: everything a call to compute_placement_plan or compute_multi_device_plan runs that
-# publishes a planned term.
+# The planner functions whose bodies the scan reads: the ones that publish a planned term today when
+# compute_placement_plan or compute_multi_device_plan runs. The scan reads these bodies only and follows no call.
 PLANNER_SIGS = (
     "static void populate_host_zone_sizing(",
     "static void publish_moe_host_scatter_term(",
