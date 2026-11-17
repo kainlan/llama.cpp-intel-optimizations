@@ -17,17 +17,9 @@ if(DEFINED LLAMA_WEBUI_HF_BUCKET)
     message(DEPRECATION "LLAMA_WEBUI_HF_BUCKET is deprecated, use LLAMA_UI_HF_BUCKET instead")
 endif()
 
-# Resolve HF asset version: explicit env var > derived from build number > unset
-if(DEFINED ENV{HF_WEBUI_VERSION})
-    set(HF_UI_VERSION "$ENV{HF_WEBUI_VERSION}")
-    message(DEPRECATION "HF_WEBUI_VERSION env var is deprecated, use HF_UI_VERSION instead")
-elseif(DEFINED ENV{HF_UI_VERSION})
-    set(HF_UI_VERSION "$ENV{HF_UI_VERSION}")
-elseif(DEFINED LLAMA_BUILD_NUMBER)
-    set(HF_UI_VERSION "b${LLAMA_BUILD_NUMBER}")
-else()
-    set(HF_UI_VERSION "")
-endif()
+# Resolve HF asset version: env overrides, then the pin, then the build number
+include("${CMAKE_CURRENT_LIST_DIR}/ui-version.cmake")
+llama_ui_resolve_hf_version(HF_UI_VERSION)
 
 if(NOT "${HF_UI_VERSION}" STREQUAL "" AND NOT HF_UI_VERSION MATCHES "^[A-Za-z0-9._-]+$")
     message(FATAL_ERROR "UI: invalid HF_UI_VERSION='${HF_UI_VERSION}' - must match ^[A-Za-z0-9._-]+$")
@@ -44,7 +36,8 @@ set(UI_H   "${CMAKE_CURRENT_BINARY_DIR}/ui.h")
 # single-sourcing means this list inherits whatever sources.cmake gets wrong,
 # and it currently gets things wrong in both directions (a listed file that no
 # longer exists, real inputs that are unlisted). Tracked as llama.cpp-3658.
-set(UI_ASSET_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake")
+set(UI_ASSET_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/ui-version.cmake")
 
 # Priority 1 in scripts/ui-assets.cmake is pre-built assets dropped into
 # tools/ui/dist -- the documented recovery path for disconnected builds, and
