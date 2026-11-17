@@ -3239,10 +3239,24 @@ struct planner_published_terms {
 // scratch; the PP MoE oneDNN ring's slots and depth, which of its slots the KV zone holds, and the row bytes, expert
 // counts and micro-batch it is re-planned from; and the oneDNN scratchpad pair with its stored sum, which the pair's
 // reserve raises on its own. Each model on the device plans with these, and every load overwrites them, so a load that
-// fails puts them back as its first stage found them. The terms keyed by the load's owner are not here (they leave
-// with their owner, unified_cache_drop_planned_load_terms), nor is the compute term's micro-batch, which is sticky by
-// design and which every load records at the same planning value. Each setter stores what its getter reads, and the
-// pair's sum is written after the pair, so the restore is exact.
+// fails puts back what it published (load_published_record). The terms keyed by the load's owner are not here (they
+// leave with their owner, unified_cache_drop_planned_load_terms), nor is the compute term's micro-batch, which is sticky
+// by design and which every load records at the same planning value. Each setter stores what its getter reads, so a
+// restore is exact. The terms fall in groups (load_published_group), each the terms one publisher writes together, and
+// a restore puts back whole groups, so no group holds part of one publisher's terms and part of another's.
+enum load_published_group : uint32_t {
+    LOAD_PUBLISHED_GROUP_PIPELINE    = 1u << 0,  // the PP pipeline scratch
+    LOAD_PUBLISHED_GROUP_RING        = 1u << 1,  // the ring's slots and depth, its KV-zone slots and its micro-batch
+    LOAD_PUBLISHED_GROUP_RING_ROWS   = 1u << 2,  // the row bytes and expert counts the ring is re-planned from
+    LOAD_PUBLISHED_GROUP_ONEDNN_PAIR = 1u << 3,  // the oneDNN scratchpad pair's two halves
+    LOAD_PUBLISHED_GROUP_ONEDNN_SUM  = 1u << 4,  // the pair's stored sum
+    LOAD_PUBLISHED_GROUP_GRAPH       = 1u << 5,  // the planners' oneDNN Graph scratch shape
+    LOAD_PUBLISHED_GROUP_NONFA       = 1u << 6,  // the planners' non-FA attention scratch shape
+    LOAD_PUBLISHED_GROUP_CONTROL     = 1u << 7,  // the planners' MoE CONTROL requirement
+    LOAD_PUBLISHED_GROUP_SCATTER     = 1u << 8,  // the planners' MoE host scatter scratch
+    LOAD_PUBLISHED_GROUP_ALL         = (1u << 9) - 1,
+};
+
 struct load_published_terms {
     size_t                  pp_pipeline           = 0;
     size_t                  ring_weight           = 0;
@@ -3262,7 +3276,31 @@ struct load_published_terms {
     planner_published_terms planner{};
 
     static load_published_terms snapshot(int device);
-    void                        restore(int device) const;
+    // The groups whose terms differ between this and `other`.
+    uint32_t                    differing(const load_published_terms & other) const;
+    // Takes the terms of `groups` from `from`.
+    void                        copy(const load_published_terms & from, uint32_t groups);
+};
+
+// One device's terms for one load transaction, kept so that a load that fails puts back what it published and nothing
+// another publisher wrote since. A runtime context transaction of a live model publishes some of the same terms while
+// the load runs (the ring when its micro-batch moves, the non-FA attention shape), and the oneDNN pair's reserve raises
+// the stored sum. `prior` is what each group held before this load wrote it, or what another publisher left in it
+// since; `written` is what each group held when this load last looked. note() takes one planner pass of the load: the
+// terms when it started and when it ended, both read under the inventory lock that every publisher but the reserve
+// holds, so only the pass wrote between them. restore() puts a group back only while it still holds `written`, and the
+// sum by compare-exchange, so a raise outside that lock is kept. A publisher that writes exactly what the load published
+// cannot be told from the load, and its group goes back with the load's.
+struct load_published_record {
+    load_published_terms prior{};
+    load_published_terms written{};
+
+    load_published_record() = default;
+
+    explicit load_published_record(const load_published_terms & now) : prior(now), written(now) {}
+
+    void note(const load_published_terms & before, const load_published_terms & after);
+    void restore(int device) const noexcept;
 };
 
 // The RUNTIME zone's floor: 512 MiB, or GGML_SYCL_RUNTIME_ARENA_MB when it is set. ensure_planned_arena_zones()

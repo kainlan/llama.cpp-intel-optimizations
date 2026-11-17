@@ -20,18 +20,27 @@ void signatures across the dlopen boundary; they log the refusal and stage nothi
 The refusal names need and have: the ensure writes, at the holders refusal, the three zone sizes it decided on as the
 need and the arena's zone capacities, read before either refusal, as the have; at a failed reserve, the same need, the
 zones the device has after the failure as the have, and those capacities, read before the rebuild destroyed the arena,
-as released; the device wrapper names a device with no cache. zone_arena_refusal_text prints both for every
-zone, in MB, and a short zone whose shortfall is under 0.1 MB in KB, or in bytes under 1 KB, so no shortfall prints as
-0.0 MB, and a failed reserve's released arena. At the holders refusal the ensure also writes the holders its gate refused on, and the text names them and
-chooses its remedy from them (test-zone-sizing Case 38 checks the text and each remedy).
+as released; the device wrapper names a device with no cache. zone_arena_refusal_text prints both for every zone, in
+MB, and a short zone whose shortfall is under 0.1 MB in KB, or in bytes under 1 KB, so no shortfall prints as 0.0 MB,
+and a failed reserve's released arena. At the holders refusal the ensure also writes the holders its gate refused on,
+and the text names them and chooses its remedy from them (test-zone-sizing Case 38 checks the text and each remedy).
 
 A failed load puts back what it published: the stage captures the device-wide planned terms before its first device
-plans (load_published_terms::snapshot per device, kept for the one open load transaction), the abort of a load's owner
+plans (a load_published_record per device, kept for the one open load transaction), the abort of a load's owner
 effects restores them for that transaction, and load_end forgets them once the load committed. Every device-wide
 unified_cache_set_planned_* call on the load's publish path (ggml_sycl_inventory_publish_planner_inputs,
-populate_inventory_globals, ggml_sycl_publish_load_ubatch_scratch) is restored by load_published_terms::restore or the
-planner_published_terms::restore it calls. Owner-keyed terms leave with their owner instead, and the compute term's
-micro-batch is sticky by design (EXEMPT_SETTERS).
+populate_inventory_globals, ggml_sycl_publish_load_ubatch_scratch), and each planner term, is restored by
+load_published_record::restore; the oneDNN pair's setter by the halves' store and the sum's compare-exchange.
+Owner-keyed terms leave with their owner instead, and the compute term's micro-batch is sticky by design
+(EXEMPT_SETTERS).
+
+The restore puts back only what still holds the load's value. A runtime context transaction of a live model publishes
+some of the same terms while the load runs, and the oneDNN pair's reserve raises the stored sum. Both planner entries
+construct a ggml_sycl_load_published_pass right after they take g_tensor_inventory_mutex and before they publish; it
+notes into the record what the pass changed, and the record takes what another publisher wrote between passes as the
+value to put back. The restore takes g_tensor_inventory_mutex before the record's mutex, puts a group back only while it
+still holds what the load published (each setter under its group's bit), and puts the sum back by compare-exchange from
+the pair's total the load published, so a reserve's raise outside the lock survives.
 
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live
 inside test_*() functions. Checks read COMMENT-STRIPPED, whitespace-normalised text. Each check has a mutation witness
@@ -233,8 +242,10 @@ RESTORE_DEF = "static void ggml_sycl_load_published_terms_restore(uint64_t txn) 
 FORGET = "ggml_sycl_load_published_terms_forget(result.token.load.value);"
 COMMIT_CLEANUP = "if (result.cleanup_required) {"
 COMMITTED = "if (result.committed) {"
-LOAD_RESTORE_SIG = "void load_published_terms::restore(int device) const"
-PLANNER_RESTORE_SIG = "void planner_published_terms::restore(int device) const"
+RESTORE_SIG = "static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept"
+RECORD_RESTORE_SIG = "void load_published_record::restore(int device) const noexcept"
+RECORD_NOTE_SIG = ("void load_published_record::note(const load_published_terms & before, "
+                   "const load_published_terms & after)")
 PUBLISH_SIGS = (
     "static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_inputs(",
     "static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const ggml_sycl_tensor_inventory * "
@@ -275,18 +286,93 @@ def restored_outside_every_try(c: str) -> bool:
     return k != -1 and abort.count(RESTORE) == 1 and depth_at(abort, k) == 1 and RESTORE_DEF in c
 
 
+# The terms the planners publish while they compute a plan (planner_published_terms), which the record restores too.
+PLANNER_SETTERS = {
+    "unified_cache_set_planned_onednn_graph_scratch_shape",
+    "unified_cache_set_planned_nonfa_attn_scratch_shape",
+    "unified_cache_set_planned_moe_control_requirement",
+    "unified_cache_set_planned_moe_host_scatter_scratch_bytes",
+}
+# The pair's setter stores the halves and then their total as the sum. The record puts the halves back on their own and
+# the sum by compare-exchange, so a reserve's raise of the sum survives; together those restore what the setter wrote.
+HALVES = "unified_cache_store_planned_onednn_pair_halves(device, prior.onednn_weights, prior.onednn_activations);"
+SUM_CAS = "g_planned_onednn_scratchpad_bytes[device].compare_exchange_strong(published, prior.onednn_stored,"
+PAIR_SETTER = "unified_cache_set_planned_onednn_scratchpad_pair"
+
+
+def record_restored_setters(uc: str) -> set:
+    body = fn_body(code(uc), RECORD_RESTORE_SIG)
+    restored = set(SETTER_RE.findall(body))
+    if HALVES in body and SUM_CAS in body:
+        restored.add(PAIR_SETTER)
+    return restored
+
+
 def claim_failed_load_restores(gs: str, uc: str) -> bool:
     c = code(gs)
-    u = code(uc)
     stage = fn_body(c, STAGE_SIG)
     load_end = fn_body(c, LOAD_END_SIG)
-    restored = set(SETTER_RE.findall(fn_body(u, LOAD_RESTORE_SIG) + fn_body(u, PLANNER_RESTORE_SIG)))
+    restored = record_restored_setters(uc)
     setters = publish_path_setters(gs)
     return (ordered(stage, CAPTURE, STAGE_LOOP)
             and restored_outside_every_try(c)
             and ordered(load_end, COMMIT_CLEANUP, FORGET, COMMITTED)
-            and "planner.restore(device);" in fn_body(u, LOAD_RESTORE_SIG)
-            and PUBLISH_SETTERS_TODAY <= setters and setters <= restored)
+            and PUBLISH_SETTERS_TODAY <= setters and setters <= restored and PLANNER_SETTERS <= restored)
+
+
+# ---- a failed load keeps what another publisher wrote since ----
+
+# Each planner entry records its pass under the inventory lock it takes, before it publishes anything.
+IMPL_LOCK = "std::lock_guard lock(g_tensor_inventory_mutex);"
+PASS = "ggml_sycl_load_published_pass published(g_sycl_plan_load_effect_txn);"
+IMPL_POPULATE = "populate_inventory_globals(ctx, inventory);"
+PASS_END_SIG = "~ggml_sycl_load_published_pass()"
+PASS_NOTE = "saved.devices[d].note(before[d], ggml_sycl::load_published_terms::snapshot(static_cast<int>(d)));"
+# The restore takes the inventory lock before the record's mutex, the order a pass holds them in when it notes.
+RESTORE_LOCKS = ("std::lock_guard inventory(g_tensor_inventory_mutex);",
+                 "std::lock_guard<std::mutex> lock(saved.mutex);", "saved.devices[d].restore(static_cast<int>(d));")
+# What a pass finds that this load did not write is another publisher's, and is what the restore puts back; what the load
+# published of the sum is the pair's total, which is all the pair's setter writes to it.
+NOTE_OTHER = "prior.copy(before, before.differing(written));"
+NOTE_SUM = "written.onednn_stored = after.onednn_weights + after.onednn_activations;"
+# A group goes back only while it holds what the load published and differs from what it held before.
+HELD = ("const uint32_t back = ~load_published_terms::snapshot(device).differing(written) & "
+        "prior.differing(written);")
+GROUP_SETTERS = (
+    ("LOAD_PUBLISHED_GROUP_PIPELINE", "unified_cache_set_planned_pp_pipeline_scratch_bytes("),
+    ("LOAD_PUBLISHED_GROUP_RING", "unified_cache_set_planned_pp_moe_onednn_scratch("),
+    ("LOAD_PUBLISHED_GROUP_RING", "unified_cache_set_planned_pp_moe_onednn_kv_zone_slots("),
+    ("LOAD_PUBLISHED_GROUP_RING", "unified_cache_set_planned_pp_moe_onednn_n_ubatch("),
+    ("LOAD_PUBLISHED_GROUP_RING_ROWS", "unified_cache_set_planned_pp_moe_onednn_row_bytes("),
+    ("LOAD_PUBLISHED_GROUP_ONEDNN_PAIR", "unified_cache_store_planned_onednn_pair_halves("),
+    ("LOAD_PUBLISHED_GROUP_GRAPH", "unified_cache_set_planned_onednn_graph_scratch_shape("),
+    ("LOAD_PUBLISHED_GROUP_NONFA", "unified_cache_set_planned_nonfa_attn_scratch_shape("),
+    ("LOAD_PUBLISHED_GROUP_CONTROL", "unified_cache_set_planned_moe_control_requirement("),
+    ("LOAD_PUBLISHED_GROUP_SCATTER", "unified_cache_set_planned_moe_host_scatter_scratch_bytes("),
+)
+# The sum is never stored plainly: a plain store would put back over a reserve's raise.
+SUM_PLAIN = ("unified_cache_set_planned_onednn_scratchpad_bytes(", PAIR_SETTER + "(",
+             "g_planned_onednn_scratchpad_bytes[device].store(")
+
+
+def guarded(body: str, group: str, setter: str) -> bool:
+    k = body.find("if (back & " + group + ") {")
+    return k != -1 and setter in block_at(body, k) and body.count(setter) == 1
+
+
+def claim_restore_keeps_a_later_publish(gs: str, uc: str) -> bool:
+    c = code(gs)
+    u = code(uc)
+    note = fn_body(u, RECORD_NOTE_SIG)
+    restore = fn_body(u, RECORD_RESTORE_SIG)
+    entries = [fn_body(c, sig) for sig in (EARLY_SIG, LATE_SIG)]
+    return (all(ordered(e, IMPL_LOCK, PASS, IMPL_POPULATE) and e.count(PASS) == 1 for e in entries)
+            and PASS_NOTE in fn_body(c, PASS_END_SIG)
+            and ordered(fn_body(c, RESTORE_SIG), *RESTORE_LOCKS)
+            and NOTE_OTHER in note and NOTE_SUM in note
+            and ordered(restore, HELD, *(s for _, s in GROUP_SETTERS))
+            and all(guarded(restore, g, s) for g, s in GROUP_SETTERS)
+            and SUM_CAS in restore and not any(p in restore for p in SUM_PLAIN))
 
 
 # ---- the claims, and a witness per claim ----
@@ -432,7 +518,18 @@ def test_witness_capture_after_the_first_device():
 
 
 def test_witness_restore_drops_the_slot_zones():
-    m = mutate_in(UC, LOAD_RESTORE_SIG, "unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(", "(void) (")
+    m = mutate_in(UC, RECORD_RESTORE_SIG, "unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(", "(void) (")
+    assert not claim_failed_load_restores(GS, m)
+
+
+def test_witness_restore_drops_a_planner_term():
+    m = mutate_in(UC, RECORD_RESTORE_SIG, "unified_cache_set_planned_moe_host_scatter_scratch_bytes(", "(void) (")
+    assert not claim_failed_load_restores(GS, m)
+
+
+def test_witness_restore_drops_the_sum():
+    m = mutate_in(UC, RECORD_RESTORE_SIG, SUM_CAS, "std::atomic<size_t>{}.compare_exchange_strong(published, "
+                  "prior.onednn_stored,")
     assert not claim_failed_load_restores(GS, m)
 
 
@@ -447,6 +544,67 @@ def test_witness_forget_before_the_commit_cleanup():
     m = mutate_in(GS, LOAD_END_SIG, FORGET, "")
     m = mutate_in(m, LOAD_END_SIG, COMMIT_CLEANUP, FORGET + " " + COMMIT_CLEANUP)
     assert not claim_failed_load_restores(m, UC)
+
+
+
+def test_a_failed_load_keeps_what_another_publisher_wrote_since():
+    assert claim_restore_keeps_a_later_publish(GS, UC), (
+        "a failed load's restore can put back over a live context's publish: both planner entries must record their "
+        "pass under the inventory lock before they publish, the restore must take that lock before the record's, a "
+        "group must go back only while it holds what the load published, and the sum only by compare-exchange")
+
+
+def test_witness_early_entry_records_no_pass():
+    m = mutate_in(GS, EARLY_SIG, PASS, "")
+    assert not claim_restore_keeps_a_later_publish(m, UC)
+
+
+def test_witness_late_entry_records_after_it_publishes():
+    m = mutate_in(GS, LATE_SIG, PASS, "")
+    m = mutate_in(m, LATE_SIG, IMPL_POPULATE, IMPL_POPULATE + " " + PASS)
+    assert not claim_restore_keeps_a_later_publish(m, UC)
+
+
+def test_witness_pass_notes_nothing():
+    m = mutate_in(GS, PASS_END_SIG, PASS_NOTE, "")
+    assert not claim_restore_keeps_a_later_publish(m, UC)
+
+
+def test_witness_restore_without_the_inventory_lock():
+    m = mutate_in(GS, RESTORE_SIG, RESTORE_LOCKS[0], "")
+    assert not claim_restore_keeps_a_later_publish(m, UC)
+
+
+def test_witness_restore_takes_the_locks_in_the_other_order():
+    m = mutate_in(GS, RESTORE_SIG, RESTORE_LOCKS[0], "")
+    m = mutate_in(m, RESTORE_SIG, RESTORE_LOCKS[1], RESTORE_LOCKS[1] + " " + RESTORE_LOCKS[0])
+    assert not claim_restore_keeps_a_later_publish(m, UC)
+
+
+def test_witness_note_ignores_another_publisher():
+    m = mutate_in(UC, RECORD_NOTE_SIG, NOTE_OTHER, "")
+    assert not claim_restore_keeps_a_later_publish(GS, m)
+
+
+def test_witness_note_takes_a_raised_sum_as_the_loads():
+    m = mutate_in(UC, RECORD_NOTE_SIG, NOTE_SUM, "")
+    assert not claim_restore_keeps_a_later_publish(GS, m)
+
+
+def test_witness_restore_puts_back_every_group():
+    m = mutate_in(UC, RECORD_RESTORE_SIG, HELD, "const uint32_t back = LOAD_PUBLISHED_GROUP_ALL;")
+    assert not claim_restore_keeps_a_later_publish(GS, m)
+
+
+def test_witness_restore_puts_back_the_ring_unguarded():
+    m = mutate_in(UC, RECORD_RESTORE_SIG, "if (back & LOAD_PUBLISHED_GROUP_RING) {", "{")
+    assert not claim_restore_keeps_a_later_publish(GS, m)
+
+
+def test_witness_restore_stores_the_sum_plainly():
+    m = mutate_in(UC, RECORD_RESTORE_SIG, SUM_CAS, "unified_cache_set_planned_onednn_scratchpad_bytes(device, "
+                  "prior.onednn_stored); (void) (published,")
+    assert not claim_restore_keeps_a_later_publish(GS, m)
 
 
 if __name__ == "__main__":

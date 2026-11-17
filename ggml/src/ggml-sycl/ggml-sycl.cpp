@@ -13236,15 +13236,16 @@ static void ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw() {
 #endif
 }
 
-// The device-wide planned terms as the open load transaction's first stage found them, one entry per device. One load
-// transaction is open at a time (the registry refuses a second begin), so one entry serves: a load that fails puts its
-// entry back through ggml_sycl_abort_owner_effects_noexcept, and a load that commits forgets it. The device-wide terms
-// carry no owner, so a runtime context transaction of a live model that publishes between the capture and a failed
-// load's restore loses what it published; the context's next transaction publishes it again.
+// The device-wide planned terms of the open load transaction, one record per device. One load transaction is open at a
+// time (the registry refuses a second begin), so one entry serves: a load that fails puts back what it published through
+// ggml_sycl_abort_owner_effects_noexcept, and a load that commits forgets it. The terms carry no owner, and a runtime
+// context transaction of a live model publishes some of them while the load runs. Each planner pass of the load notes
+// what it changed (ggml_sycl_load_published_pass), and the restore puts back only a group that still holds what the
+// load published, so a context's publish since survives the failed load (ggml_sycl::load_published_record).
 struct ggml_sycl_load_published_terms_saved {
-    std::mutex                                   mutex;
-    uint64_t                                     txn = 0;
-    std::vector<ggml_sycl::load_published_terms> devices;
+    std::mutex                                    mutex;
+    uint64_t                                      txn = 0;
+    std::vector<ggml_sycl::load_published_record> devices;
 };
 
 // Allocated once and never destroyed, so an abort during static destruction still finds it.
@@ -13263,15 +13264,56 @@ static void ggml_sycl_load_published_terms_capture(uint64_t txn) {
     const int n = std::max(0, std::min(ggml_backend_sycl_get_device_count(), GGML_SYCL_MAX_DEVICES));
     saved.devices.clear();
     for (int d = 0; d < n; ++d) {
-        saved.devices.push_back(ggml_sycl::load_published_terms::snapshot(d));
+        saved.devices.emplace_back(ggml_sycl::load_published_terms::snapshot(d));
     }
     saved.txn = txn;
 }
 
-// Puts back what load `txn` captured, once; a load that captured nothing, or another load's entry, is left alone.
-// noexcept like the planned-load-terms drop, and for the same reason: the owner-effects abort calls it outside every try
-// stage, so no failed stage skips it and no catch handler is added for it. Its setters are plain stores.
+// One planner pass of the open load. Its caller constructs it right after it takes g_tensor_inventory_mutex, before the
+// pass publishes anything, so the pass ends under the same lock: it reads the device-wide terms when the pass starts
+// and notes into the load's records what they hold when it ends. Every publisher of those terms but the oneDNN pair's
+// reserve holds that lock, so only this pass wrote between the two reads. A pass outside a staged load, or of a load
+// whose entry is gone, notes nothing.
+struct ggml_sycl_load_published_pass {
+    uint64_t                                     txn = 0;
+    std::vector<ggml_sycl::load_published_terms> before;
+
+    explicit ggml_sycl_load_published_pass(uint64_t load_txn) {
+        ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
+        std::lock_guard<std::mutex>            lock(saved.mutex);
+        if (load_txn == 0 || saved.txn != load_txn) {
+            return;
+        }
+        txn = load_txn;
+        before.reserve(saved.devices.size());
+        for (size_t d = 0; d < saved.devices.size(); ++d) {
+            before.push_back(ggml_sycl::load_published_terms::snapshot(static_cast<int>(d)));
+        }
+    }
+
+    ~ggml_sycl_load_published_pass() {
+        ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
+        std::lock_guard<std::mutex>            lock(saved.mutex);
+        if (txn == 0 || saved.txn != txn) {
+            return;
+        }
+        for (size_t d = 0; d < saved.devices.size() && d < before.size(); ++d) {
+            saved.devices[d].note(before[d], ggml_sycl::load_published_terms::snapshot(static_cast<int>(d)));
+        }
+    }
+
+    ggml_sycl_load_published_pass(const ggml_sycl_load_published_pass &)             = delete;
+    ggml_sycl_load_published_pass & operator=(const ggml_sycl_load_published_pass &) = delete;
+};
+
+// Puts back what load `txn` published and what still holds it, once; a load that captured nothing, or another load's
+// entry, is left alone. It takes g_tensor_inventory_mutex before the entry's mutex, the order a pass holds them in when
+// it notes, so no publisher under that lock writes between a record's read of a group and its write. noexcept like the
+// planned-load-terms drop, and for the same reason: the owner-effects abort calls it outside every try stage, so no
+// failed stage skips it and no catch handler is added for it. No caller of the abort holds the inventory lock: the
+// abort takes it itself, to reset the load's scratch state. Its setters are plain stores.
 static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept {
+    std::lock_guard                        inventory(g_tensor_inventory_mutex);
     ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
     std::lock_guard<std::mutex>            lock(saved.mutex);
     if (txn == 0 || saved.txn != txn) {
@@ -13346,8 +13388,9 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     } catch (...) {
         clean = false;
     }
-    // The device-wide terms the aborted load published go back to what its first stage found, so the models on the
-    // device plan with their own again. The restore cannot throw and runs outside any try stage.
+    // The device-wide terms the aborted load published, where they still hold what it published, go back to what they
+    // held before it, so the models on the device plan with their own again. The restore cannot throw and runs outside
+    // any try stage.
     ggml_sycl_load_published_terms_restore(owner.load.value);
     try {
         // Abort discards only loader-thread candidate state. The previously active
@@ -18493,6 +18536,8 @@ static void ggml_sycl_compute_placement_plan_early_impl(ggml_backend_t          
 
     host_budget_pass_scope      host_budget;
     std::lock_guard             lock(g_tensor_inventory_mutex);
+    // Under the lock and before the pass publishes, so a failed load puts back only what this pass wrote.
+    ggml_sycl_load_published_pass published(g_sycl_plan_load_effect_txn);
     populate_inventory_globals(ctx, inventory);
     size_t vram_budget = 0, base_mem = 0, free_mem = 0;
     int    budget_pct = 0;
@@ -18550,6 +18595,8 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
 
     host_budget_pass_scope      host_budget;
     std::lock_guard             lock(g_tensor_inventory_mutex);
+    // Under the lock and before the pass publishes, so a failed load puts back only what this pass wrote.
+    ggml_sycl_load_published_pass published(g_sycl_plan_load_effect_txn);
 
     // Phase A: inventory + KV + MoE globals.  Idempotent against a prior
     // ggml_backend_sycl_compute_placement_plan_early() call with the same
@@ -18922,8 +18969,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
             }
         } rollback{ effect.owner, false, false };
 
-        // The device-wide terms as they stand before this load's first device plans, kept for the load to put back if
-        // it fails; the late pass of the same load keeps what its early pass captured.
+        // The device-wide terms as they stand before this load's first device plans start the record a failed load
+        // puts back from; the late pass of the same load keeps the record its early pass started.
         ggml_sycl_load_published_terms_capture(effect.owner.load.value);
         // the transaction's one budget store, before any device plans (th32 §4.2); the planner entries below only read
         host_budget_pass_scope host_budget;

@@ -1966,6 +1966,120 @@ static bool planner_terms_restore_returns_the_runtime_requirement() {
     return true;
 }
 
+// The PP pipeline scratch and the oneDNN pair with its stored sum, which planned_terms_found does not keep, read when
+// the case starts and written back when it ends.
+struct pipeline_and_pair_found {
+    int                  device;
+    load_published_terms found;
+
+    explicit pipeline_and_pair_found(int d) : device(d), found(load_published_terms::snapshot(d)) {}
+
+    ~pipeline_and_pair_found() {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, found.pp_pipeline);
+        unified_cache_set_planned_onednn_scratchpad_pair(device, found.onednn_weights, found.onednn_activations);
+        unified_cache_set_planned_onednn_scratchpad_bytes(device, found.onednn_stored);
+    }
+};
+
+// A failed load puts back what it published and nothing another publisher wrote since: a runtime context transaction
+// of a live model publishes some of the same terms while the load runs, and the oneDNN pair's reserve raises the stored
+// sum outside the lock. The case drives load_published_record as the backend does: one record per load from the terms
+// as the load's first stage found them, and a note per planner pass from the terms before and after it.
+// The live model: pipeline 1 MiB, ring micro-batch 512 with no KV-zone slot, no host scatter, CONTROL 1 MiB, non-FA
+// 32 heads x 512 x 4096, the pair 4 + 2 MiB with the sum its reserve raised to 8 MiB.
+// Leg 1. Pass 1 of the load publishes all of those anew (the pair 16 + 8 MiB, so the sum 24 MiB). Between the passes a
+// live context re-plans its ring (micro-batch 1024, its activation slot in the KV zone) and the reserve raises the sum
+// to 30 MiB. Pass 2 publishes the ring and the pair again. After it a live context publishes its non-FA shape. The
+// restore puts the pipeline, the scatter, CONTROL and the pair's halves back to the live model's; the ring to the
+// context's re-plan and the sum to the reserve's raise, both of which the load wrote over; and it keeps the non-FA shape
+// the context published after the load.
+// Leg 2. A load whose one pass publishes the pair, after which the reserve raises the sum to 40 MiB: the restore keeps
+// the raise and puts the halves back.
+// Engagement: before each restore every term reads what the load or the later publisher wrote.
+// Mutants: a restore of every term to what the load's first stage found (the non-FA shape reads 32 x 512, the ring 512,
+// the sum 8 MiB); a restore of every group the load changed (the non-FA shape reads 32 x 512); a note that ignores
+// another publisher (the ring reads 512, the sum of leg 1 8 MiB); a sum stored plainly (leg 2 reads 8 MiB).
+// No device work: the terms are per-device process state. The case leaves every term it writes as it found it.
+static bool load_record_keeps_a_later_publish() {
+    TEST_BEGIN("load_record_keeps_a_later_publish");
+    constexpr int           device = 0;
+    constexpr size_t        mib    = 1024ull * 1024ull;
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+
+    const auto live = [&]() {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, mib);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 512);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 0);
+        unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ mib, true });
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
+        unified_cache_set_planned_onednn_scratchpad_pair(device, 4 * mib, 2 * mib);
+        unified_cache_set_planned_onednn_scratchpad_bytes(device, 8 * mib);
+    };
+    const auto load_pass = [&]() {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, 3 * mib);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 2048);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 92160);
+        unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ 2 * mib, true });
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 2048, 4096);
+        unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
+    };
+
+    // Leg 1.
+    live();
+    load_published_record record(load_published_terms::snapshot(device));
+    load_published_terms  before = load_published_terms::snapshot(device);
+    load_pass();
+    record.note(before, load_published_terms::snapshot(device));
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 1024);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, true, false);
+    unified_cache_set_planned_onednn_scratchpad_bytes(device, 30 * mib);
+    before = load_published_terms::snapshot(device);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 2048);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+    unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
+    record.note(before, load_published_terms::snapshot(device));
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, 64, 1024, 8192);
+
+    TEST_ASSERT(unified_cache_get_planned_pp_pipeline_scratch_bytes(device) == 3 * mib &&
+                    unified_cache_get_planned_pp_moe_onednn_n_ubatch(device) == 2048 &&
+                    unified_cache_get_planned_moe_host_scatter_scratch_bytes(device) == 92160 &&
+                    unified_cache_get_planned_onednn_scratchpad_bytes_stored(device) == 24 * mib,
+                "before the restore the load's pipeline, ring, scatter and sum do not read what it published");
+    record.restore(device);
+    const load_published_terms back = load_published_terms::snapshot(device);
+    TEST_ASSERT(back.pp_pipeline == mib, "the restore left the failed load's pipeline scratch");
+    TEST_ASSERT(back.planner.scatter == 0, "the restore left the failed load's host scatter term");
+    TEST_ASSERT(back.planner.control.bytes == mib && back.planner.control.valid,
+                "the restore left the failed load's CONTROL requirement");
+    TEST_ASSERT(back.onednn_weights == 4 * mib && back.onednn_activations == 2 * mib,
+                "the restore left the failed load's oneDNN pair");
+    TEST_ASSERT(back.ring_n_ubatch == 1024 && back.ring_activation_in_kv && !back.ring_output_in_kv,
+                "the ring is not the live context's re-plan the load wrote over");
+    TEST_ASSERT(back.onednn_stored == 30 * mib, "the sum is not the reserve's raise the load wrote over");
+    TEST_ASSERT(
+        back.planner.nonfa.n_head == 64 && back.planner.nonfa.n_ubatch == 1024 && back.planner.nonfa.n_ctx == 8192,
+        "the restore put back over the non-FA shape a live context published after the load");
+
+    // Leg 2.
+    live();
+    load_published_record raised(load_published_terms::snapshot(device));
+    before = load_published_terms::snapshot(device);
+    unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
+    raised.note(before, load_published_terms::snapshot(device));
+    unified_cache_set_planned_onednn_scratchpad_bytes(device, 40 * mib);
+    raised.restore(device);
+    const load_published_terms kept = load_published_terms::snapshot(device);
+    TEST_ASSERT(kept.onednn_stored == 40 * mib, "the restore put back over the reserve's raise of the sum");
+    TEST_ASSERT(kept.onednn_weights == 4 * mib && kept.onednn_activations == 2 * mib,
+                "the restore left the failed load's oneDNN pair under a raised sum");
+
+    TEST_PASS();
+    return true;
+}
+
 int main(int argc, char ** argv) {
     fprintf(stderr, "===========================================\n");
     fprintf(stderr, "Unified Runtime Allocator Tests\n");
@@ -2159,6 +2273,7 @@ int main(int argc, char ** argv) {
     ok &= concurrent_settle_destroy_closing_wins(q);
     ok &= accepted_control_publication_is_atomic_with_close_snapshot();
     ok &= planner_terms_restore_returns_the_runtime_requirement();
+    ok &= load_record_keeps_a_later_publish();
     ok &= global_cache_static_destruction_exits_cleanly(argv[0]);
     // Retain a real pinned suballocation across the first shutdown attempt;
     // retry drains the process-global cache while q and SYCL are still alive.

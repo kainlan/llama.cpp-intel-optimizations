@@ -3652,6 +3652,15 @@ void planner_published_terms::restore(int device) const {
     unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);
 }
 
+// The oneDNN scratchpad pair's two halves, without the sum the pair's setter stores after them: a failed load's restore
+// puts the halves back on their own and the sum by compare-exchange (load_published_record::restore).
+static void unified_cache_store_planned_onednn_pair_halves(int    device_id,
+                                                           size_t weights_bytes,
+                                                           size_t activations_bytes) {
+    g_planned_onednn_pair_weights_bytes[device_id].store(weights_bytes, std::memory_order_release);
+    g_planned_onednn_pair_activations_bytes[device_id].store(activations_bytes, std::memory_order_release);
+}
+
 load_published_terms load_published_terms::snapshot(int device) {
     load_published_terms terms;
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
@@ -3676,20 +3685,133 @@ load_published_terms load_published_terms::snapshot(int device) {
     return terms;
 }
 
-void load_published_terms::restore(int device) const {
+uint32_t load_published_terms::differing(const load_published_terms & other) const {
+    const auto bit = [](bool differs, load_published_group group) -> uint32_t {
+        return differs ? static_cast<uint32_t>(group) : 0u;
+    };
+    const planner_published_terms & a = planner;
+    const planner_published_terms & b = other.planner;
+    return bit(pp_pipeline != other.pp_pipeline, LOAD_PUBLISHED_GROUP_PIPELINE) |
+           bit(ring_weight != other.ring_weight || ring_activation != other.ring_activation ||
+                   ring_output != other.ring_output || ring_depth != other.ring_depth ||
+                   ring_activation_in_kv != other.ring_activation_in_kv ||
+                   ring_output_in_kv != other.ring_output_in_kv || ring_n_ubatch != other.ring_n_ubatch,
+               LOAD_PUBLISHED_GROUP_RING) |
+           bit(ring_activation_row != other.ring_activation_row || ring_output_row != other.ring_output_row ||
+                   ring_n_expert != other.ring_n_expert || ring_n_expert_used != other.ring_n_expert_used,
+               LOAD_PUBLISHED_GROUP_RING_ROWS) |
+           bit(onednn_weights != other.onednn_weights || onednn_activations != other.onednn_activations,
+               LOAD_PUBLISHED_GROUP_ONEDNN_PAIR) |
+           bit(onednn_stored != other.onednn_stored, LOAD_PUBLISHED_GROUP_ONEDNN_SUM) |
+           bit(a.graph.n_head_ctx_max != b.graph.n_head_ctx_max || a.graph.n_head_swa_max != b.graph.n_head_swa_max ||
+                   a.graph.n_swa != b.graph.n_swa || a.graph.n_ubatch != b.graph.n_ubatch ||
+                   a.graph.n_ctx != b.graph.n_ctx,
+               LOAD_PUBLISHED_GROUP_GRAPH) |
+           bit(a.nonfa.n_head != b.nonfa.n_head || a.nonfa.n_ubatch != b.nonfa.n_ubatch ||
+                   a.nonfa.n_ctx != b.nonfa.n_ctx,
+               LOAD_PUBLISHED_GROUP_NONFA) |
+           bit(a.control.bytes != b.control.bytes || a.control.valid != b.control.valid, LOAD_PUBLISHED_GROUP_CONTROL) |
+           bit(a.scatter != b.scatter, LOAD_PUBLISHED_GROUP_SCATTER);
+}
+
+void load_published_terms::copy(const load_published_terms & from, uint32_t groups) {
+    if (groups & LOAD_PUBLISHED_GROUP_PIPELINE) {
+        pp_pipeline = from.pp_pipeline;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_RING) {
+        ring_weight           = from.ring_weight;
+        ring_activation       = from.ring_activation;
+        ring_output           = from.ring_output;
+        ring_depth            = from.ring_depth;
+        ring_activation_in_kv = from.ring_activation_in_kv;
+        ring_output_in_kv     = from.ring_output_in_kv;
+        ring_n_ubatch         = from.ring_n_ubatch;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_RING_ROWS) {
+        ring_activation_row = from.ring_activation_row;
+        ring_output_row     = from.ring_output_row;
+        ring_n_expert       = from.ring_n_expert;
+        ring_n_expert_used  = from.ring_n_expert_used;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_ONEDNN_PAIR) {
+        onednn_weights     = from.onednn_weights;
+        onednn_activations = from.onednn_activations;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_ONEDNN_SUM) {
+        onednn_stored = from.onednn_stored;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_GRAPH) {
+        planner.graph = from.planner.graph;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_NONFA) {
+        planner.nonfa = from.planner.nonfa;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_CONTROL) {
+        planner.control = from.planner.control;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_SCATTER) {
+        planner.scatter = from.planner.scatter;
+    }
+}
+
+void load_published_record::note(const load_published_terms & before, const load_published_terms & after) {
+    // A group that changed since this load last looked was written by another publisher: what it wrote is what the
+    // restore puts back if this pass wrote over it.
+    prior.copy(before, before.differing(written));
+    written = after;
+
+    // A pass writes the sum only through the pair's setter, so the sum it published is the pair's total. A reserve that
+    // raised the sum during the pass raised it after that write, and the restore's compare-exchange keeps the raise.
+    written.onednn_stored = after.onednn_weights + after.onednn_activations;
+}
+
+void load_published_record::restore(int device) const noexcept {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
-    unified_cache_set_planned_pp_pipeline_scratch_bytes(device, pp_pipeline);
-    unified_cache_set_planned_pp_moe_onednn_scratch(device, ring_weight, ring_activation, ring_output, ring_depth);
-    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, ring_activation_in_kv, ring_output_in_kv);
-    unified_cache_set_planned_pp_moe_onednn_row_bytes(device, ring_activation_row, ring_output_row, ring_n_expert,
-                                                      ring_n_expert_used);
-    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, ring_n_ubatch);
-    // The pair's setter stores the halves' total as the sum; the sum the reserve may have raised goes back after it.
-    unified_cache_set_planned_onednn_scratchpad_pair(device, onednn_weights, onednn_activations);
-    unified_cache_set_planned_onednn_scratchpad_bytes(device, onednn_stored);
-    planner.restore(device);
+    // The groups that hold what this load published and held something else before it: each goes back whole, and
+    // every other group keeps what holds it now.
+    const uint32_t back = ~load_published_terms::snapshot(device).differing(written) & prior.differing(written);
+    if (back & LOAD_PUBLISHED_GROUP_PIPELINE) {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, prior.pp_pipeline);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_RING) {
+        unified_cache_set_planned_pp_moe_onednn_scratch(device, prior.ring_weight, prior.ring_activation,
+                                                        prior.ring_output, prior.ring_depth);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, prior.ring_activation_in_kv,
+                                                              prior.ring_output_in_kv);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, prior.ring_n_ubatch);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_RING_ROWS) {
+        unified_cache_set_planned_pp_moe_onednn_row_bytes(device, prior.ring_activation_row, prior.ring_output_row,
+                                                          prior.ring_n_expert, prior.ring_n_expert_used);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_ONEDNN_PAIR) {
+        // The halves alone: the pair's setter would also store their total over the sum, which goes back below.
+        unified_cache_store_planned_onednn_pair_halves(device, prior.onednn_weights, prior.onednn_activations);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_GRAPH) {
+        const onednn_graph_scratch_planned_shape & graph = prior.planner.graph;
+        unified_cache_set_planned_onednn_graph_scratch_shape(device, graph.n_head_ctx_max, graph.n_head_swa_max,
+                                                             graph.n_swa, graph.n_ubatch, graph.n_ctx);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_NONFA) {
+        const nonfa_attn_scratch_planned_shape & nonfa = prior.planner.nonfa;
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_CONTROL) {
+        unified_cache_set_planned_moe_control_requirement(device, prior.planner.control);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_SCATTER) {
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, prior.planner.scatter);
+    }
+    // The sum goes back from what this load published to what it held before, in one compare-exchange: the pair's
+    // reserve raises it outside the inventory lock, and a raise since this load published it is kept.
+    size_t published = written.onednn_stored;
+    if (prior.onednn_stored != published) {
+        (void) g_planned_onednn_scratchpad_bytes[device].compare_exchange_strong(published, prior.onednn_stored,
+                                                                                 std::memory_order_acq_rel);
+    }
 }
 
 size_t unified_cache_runtime_zone_floor_bytes() {
@@ -3752,8 +3874,7 @@ void unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t weig
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
-    g_planned_onednn_pair_weights_bytes[device_id].store(weights_bytes, std::memory_order_release);
-    g_planned_onednn_pair_activations_bytes[device_id].store(activations_bytes, std::memory_order_release);
+    unified_cache_store_planned_onednn_pair_halves(device_id, weights_bytes, activations_bytes);
     unified_cache_set_planned_onednn_scratchpad_bytes(device_id, weights_bytes + activations_bytes);
 }
 

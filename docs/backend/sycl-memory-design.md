@@ -2977,18 +2977,32 @@ back.
 The stage returns `GGML_SYCL_LIFECYCLE_PLAN_REJECTED` from either pass, the
 loader throws, and `llama_model_load` returns NULL, so the tool prints its own
 load failure while the model that holds the arena keeps running. The refused
-load puts back every device-wide planned term it published
+load puts back the device-wide planned terms it published
 (`ggml_sycl::load_published_terms` in `unified-cache.hpp`: the PP pipeline
 scratch, the ring with its KV-zone slots, row bytes, expert counts and
-micro-batch, the oneDNN pair and its stored sum, and the planner's own terms).
-The stage captures them once per load transaction, before its first device
-plans; the abort of the load's owner effects, which every failed stage and
-every uncommitted end runs, restores them, and drops the owner-keyed terms as
-before. The compute term's micro-batch is not restored: every load records 512.
-`test-zone-sizing` Case 38 pins the line,
-`tests/test-sycl-load-zone-refusal-source.py` pins the wiring and that every
-term the publish paths set is restored, and arm (e) of `test-sycl-plan-dry-run`
-stages a refused load beside a live RUNTIME-zone allocation.
+micro-batch, the oneDNN pair and its stored sum, and the planner's own terms),
+and nothing another publisher wrote since. The terms carry no owner: a runtime
+context of a live model publishes some of them while the load runs (its ring
+when the micro-batch moves, its non-FA attention shape), and the oneDNN pair's
+reserve raises the stored sum outside the inventory lock. The stage starts a
+record per device once per load transaction, before its first device plans,
+and each planner pass of the load notes into it what the pass changed, under
+`g_tensor_inventory_mutex` (`ggml_sycl::load_published_record`). The abort of
+the load's owner effects, which every failed stage and every uncommitted end
+runs, takes that lock and puts a group of terms back only while it still holds
+what the load published: a group another publisher wrote after the load keeps
+that publisher's terms, and one the load wrote over goes back to them. The sum
+goes back by compare-exchange, so a raise after the load's publish is kept. A
+publisher that writes exactly what the load published cannot be told from the
+load, and its group goes back with the load's. The abort drops the owner-keyed
+terms as before. The compute term's micro-batch is not restored: every load
+records 512. `test-zone-sizing` Case 38 pins the line,
+`tests/test-sycl-load-zone-refusal-source.py` pins the wiring, that every term
+the publish paths set is restored and that the restore keeps a later publish,
+`load_record_keeps_a_later_publish` in the `sycl-runtime-alloc` ctest (binary
+`test-sycl-runtime-alloc`) drives the record, and arm (e) of
+`test-sycl-plan-dry-run` stages a refused load beside a live RUNTIME-zone
+allocation.
 
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
 holds the compute term the load measured at its planning shape, `n_ctx_train`
