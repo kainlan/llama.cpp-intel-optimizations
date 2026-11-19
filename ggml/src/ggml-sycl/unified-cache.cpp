@@ -6476,7 +6476,8 @@ static size_t resolve_host_staging_bytes() {
         parse_env_mb_value("GGML_SYCL_MMAP_STAGING_MB", env_mb)) {
         staging_mb = env_mb;
     }
-    return staging_mb * 1024ULL * 1024ULL;
+    // Saturating, so an absurd value is a size the raw host exit refuses, never a wrapped small one it would allocate.
+    return staging_mb > SIZE_MAX / (1024ULL * 1024ULL) ? SIZE_MAX : staging_mb * 1024ULL * 1024ULL;
 }
 
 // llama.cpp-glkg: resolve_host_reserve_bytes() (parsed GGML_SYCL_HOST_RESERVE_MB
@@ -25577,7 +25578,14 @@ void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue) {
     return ptr;
 }
 
+// A pinned host size past the host's RAM is refused here, before the driver, as a failed allocation: the driver does
+// not fail such a request, its memory manager aborts the process on a size it cannot describe, and no catch reaches an
+// abort. The callers' own failure lines then name the size. The device exit needs no such bound: the driver fails a
+// device request past the device's physical memory.
 void * unified_cache_raw_malloc_host(size_t size, const sycl::queue & queue) {
+    if (!host_pinned_size_possible(size, ggml_sycl_get_total_system_memory_bytes())) {
+        return nullptr;
+    }
     void * ptr = nullptr;
     try {
         ptr = sycl::malloc_host(size, queue);
@@ -25588,6 +25596,9 @@ void * unified_cache_raw_malloc_host(size_t size, const sycl::queue & queue) {
 }
 
 void * unified_cache_raw_malloc_host(size_t size, const sycl::context & ctx) {
+    if (!host_pinned_size_possible(size, ggml_sycl_get_total_system_memory_bytes())) {
+        return nullptr;
+    }
     void * ptr = nullptr;
     try {
         ptr = sycl::malloc_host(size, ctx);

@@ -681,6 +681,8 @@ if (BUILD_TESTING)
         "${_hb_override}an override above the formula gives 200\\.00 GiB, want the formula's 121\\.80 GiB")
     string(CONCAT _hb_re_old_reserve
         "${_hb_table}total=246\\.9 GiB available=150\\.8 GiB gives 142\\.80 GiB \\(status ok\\), want 121\\.80 GiB")
+    set(_hb_re_pinned_unbounded
+        "FAIL \\(6\\) a pinned size past the RAM is refused: 1 byte past a 246\\.9 GiB host's RAM is allowed")
     string(CONCAT _hb_re_warn_above_threshold
         "FAIL \\(1\\) the WARN fires only past the room: "
         "mapped_ws [0-9]+ at or below resident_room [0-9]+ printed the WARN")
@@ -692,6 +694,7 @@ if (BUILD_TESTING)
         test-sycl-host-budget           HOST_BUDGET_MUTANT_CLIFF                "${_hb_re_cliff}"
         test-sycl-host-budget           HOST_BUDGET_MUTANT_OVERRIDE_REPLACES    "${_hb_re_override_replaces}"
         test-sycl-host-budget           HOST_BUDGET_MUTANT_OLD_RESERVE          "${_hb_re_old_reserve}"
+        test-sycl-host-budget           HOST_BUDGET_MUTANT_PINNED_UNBOUNDED     "${_hb_re_pinned_unbounded}"
         test-sycl-host-working-set-warn ""                                      ""
         test-sycl-host-working-set-warn HOST_BUDGET_MUTANT_WARN_ABOVE_THRESHOLD "${_hb_re_warn_above_threshold}"
         test-sycl-host-working-set-warn HOST_BUDGET_MUTANT_P3_CONSTANT          "${_hb_re_p3_constant}")
