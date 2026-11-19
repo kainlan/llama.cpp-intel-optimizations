@@ -6916,6 +6916,8 @@ cat "$RUN/lw37-nvfp4-b50-2048.log" | grep 'MoE host recipe workspace:'          
 
 Expected: rc=0 for both, a `pp512` and a `pp2048` row each, and the 2048 workspace about 4 times the 512 one. Without W3.1 both lines read `n_ubatch=512`; the 2048 run then exercises the transaction's re-size and Open question 1. The two widths are separate processes on purpose: `-ub 512,2048` in one process aborts on bug `llama.cpp-pgay`.
 
+Executed 2026-11-19 at `eb016b2f4` (merged as `e375c95a2`), and not passed as written. The vehicle had never run on this fork. It did not load until `llama.cpp-zmcl` (the loader never counted the skipped MTP block's NVFP4 scale tensors). Once it loaded, both runs ended rc=1 with no `pp` row: the prompt warmup is refused at its first `MUL_MAT_ID`, because an NVFP4 expert that is resident on the card has no production executor (`llama.cpp-dwmr`). No host recipe was dispatched, so the zero count of `planned workspace unavailable` proves nothing. What the runs did show: the load line reads 6.08 MB at `n_ubatch=512` in both, the context at 2048 is accepted, and the transaction prints `runtime context update: MoE host recipe workspace bound 24.31 MB at n_ubatch=2048 (was 6.08 MB)`, four times the load's figure; at 512 it prints nothing. W3.7a and W3.7b merged on that, their reviews, the host test of the sizing rule and the source pin. The gate as written here is owed again under `llama.cpp-dwmr`.
+
 **L-W3.6 (after W3.6b; arm 1 needs W3.1 merged): the control pool follows the micro-batch.**
 
 ```bash
