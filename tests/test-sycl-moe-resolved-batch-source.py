@@ -10,6 +10,7 @@ HOST_TEST = ROOT / "tests/test-sycl-moe-resolved-batch.cpp"
 MEM_HANDLE_SOURCE = ROOT / "ggml/src/ggml-sycl/mem-handle.cpp"
 CPU_DISPATCH_SOURCE = ROOT / "ggml/src/ggml-sycl/cpu-dispatch.cpp"
 UNIFIED_CACHE_SOURCE = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
+UNIFIED_CACHE_HEADER = ROOT / "ggml/src/ggml-sycl/unified-cache.hpp"
 MMVQ_SOURCE = ROOT / "ggml/src/ggml-sycl/mmvq.cpp"
 MMVQ_HEADER = ROOT / "ggml/src/ggml-sycl/mmvq.hpp"
 SEAM_HEADER = ROOT / "ggml/src/ggml-sycl/tests/q1-nvfp4-production-route-test-seam.hpp"
@@ -1289,6 +1290,78 @@ def test_routed_prestage_pins_released_on_every_exit() -> None:
     for name, mutated in mutants.items():
         assert mutated != fn, f"mutation changed nothing: {name}"
         assert routed_prestage_release_violations(source.replace(fn, mutated, 1)), f"mutation survived: {name}"
+
+
+PIN_DECLARATION = "bool pin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);"
+PIN_DEFINITION = "unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {"
+PIN_WAS_SET = "const bool was_pinned = entry_it->second.pinned;"
+PIN_SET = "entry_it->second.pinned = true;"
+PIN_ANSWER = "return !was_pinned;"
+PRESTAGE_SIGNATURE = "prestage_result prestage_routed_experts(void *"
+PRESTAGE_RECEIPT_PUSH = "if (cache->pin(layout_key, layout)) { result.pins.push_back({ layout_key, layout }); }"
+
+
+def prestage_receipt_violations(header: str, cache_source: str) -> list[str]:
+    """prestage_routed_experts lists in its receipt only the pins it set.
+
+    A pin is a flag, not a count. Direct staging pins what it stages, so prestage can find an entry already pinned,
+    and a receipt that listed it would make the release clear a pin the op does not own. pin() answers whether the
+    call changed the flag from unset to set, and the receipt takes an entry only on that answer.
+    """
+    failures: list[str] = []
+    if not has_tokens(header, PIN_DECLARATION):
+        failures.append("unified_cache::pin does not answer whether it set the flag")
+    if PIN_DEFINITION not in cache_source:
+        return failures + ["unified_cache::pin definition"]
+    start = cache_source.index(PIN_DEFINITION)
+    if cache_source[cache_source.rfind("\n", 0, start) + 1:start].strip() != "bool":
+        failures.append("unified_cache::pin is not defined to return bool")
+    pin = tokens(code_only(function_definition(cache_source, PIN_DEFINITION)))
+    try:
+        order = [token_sequence_index(pin, step) for step in (PIN_WAS_SET, PIN_SET, PIN_ANSWER)]
+    except ValueError as missing:
+        failures.append(f"unified_cache::pin: {missing}")
+    else:
+        if order != sorted(order):
+            failures.append("unified_cache::pin does not read the flag before it sets it and answer with the old flag")
+    answers = [pin[i + 1:i + 4] for i, tok in enumerate(pin) if tok == "return"]
+    flips = sum(answer == ["!", "was_pinned", ";"] for answer in answers)
+    others = [answer for answer in answers if answer != ["!", "was_pinned", ";"] and answer[:2] != ["false", ";"]]
+    if flips != 1 or others:
+        failures.append("unified_cache::pin answers something other than the flip on one path and false on the rest")
+    if PRESTAGE_SIGNATURE not in cache_source:
+        return failures + ["prestage_routed_experts definition"]
+    prestage = tokens(code_only(function_definition(cache_source, PRESTAGE_SIGNATURE)))
+    if not contains_tokens(prestage, PRESTAGE_RECEIPT_PUSH):
+        failures.append("prestage_routed_experts lists an entry without asking whether its pin() set the flag")
+    if prestage.count("pins") != 1 or prestage.count("pin") != 1:
+        failures.append("prestage_routed_experts pins or lists at a site other than the answered pin")
+    return failures
+
+
+def test_prestage_receipt_lists_only_pins_it_set() -> None:
+    header = UNIFIED_CACHE_HEADER.read_text()
+    source = UNIFIED_CACHE_SOURCE.read_text()
+    assert prestage_receipt_violations(header, source) == []
+
+    pin = function_definition(source, PIN_DEFINITION)
+    prestage = function_definition(source, PRESTAGE_SIGNATURE)
+    push = re.search(r"if \(cache->pin\(layout_key, layout\)\) \{\s*result\.pins\.push_back\(\{ layout_key, layout \}\);"
+                     r"\s*\}", prestage)
+    assert push, "the answered pin is not where the mutants expect it"
+    unconditional = "cache->pin(layout_key, layout);\n                result.pins.push_back({ layout_key, layout });"
+    source_mutants = {
+        "receipt-push-unconditional": source.replace(prestage, prestage.replace(push.group(0), unconditional, 1), 1),
+        "receipt-push-on-refusal": source.replace(prestage, prestage.replace("if (cache->pin(", "if (!cache->pin(", 1), 1),
+        "pin-answers-true": source.replace(pin, pin.replace(PIN_ANSWER, "return true;", 1), 1),
+        "pin-answers-new-flag": source.replace(pin, pin.replace(PIN_ANSWER, "return entry_it->second.pinned;", 1), 1),
+        "pin-answers-true-without-entry": source.replace(pin, pin.replace("return false;", "return true;", 1), 1),
+    }
+    for name, mutated in source_mutants.items():
+        assert mutated != source, f"mutation changed nothing: {name}"
+        assert prestage_receipt_violations(header, mutated), f"mutation survived: {name}"
+    void_header = header.replace(PIN_DECLARATION, PIN_DECLARATION.replace("bool pin", "void pin", 1), 1)
+    assert void_header != header and prestage_receipt_violations(void_header, source), "mutation survived: pin-void"
 
 
 if __name__ == "__main__":
