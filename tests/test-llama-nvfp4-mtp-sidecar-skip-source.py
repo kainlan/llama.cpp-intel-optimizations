@@ -139,7 +139,7 @@ def skip_flags_violations(code: str) -> list:
         violations.append('the helper must ask for the ".input_scale" sidecar once, with the skip flags')
     skips = len(re.findall(r"\bTENSOR_SKIP\b", body))
     if skips != 1:
-        violations.append(f"TENSOR_SKIP must appear once in the pass (the helper's flags), not {skips}: a loaded sidecar stays")
+        violations.append(f"TENSOR_SKIP must appear once in the pass (the helper's flags), not {skips}")
     virtual = len(re.findall(r"\bTENSOR_SKIP_IF_VIRTUAL\b", body))
     if virtual != 1:
         violations.append(f"TENSOR_SKIP_IF_VIRTUAL must appear once in the pass (the helper's flags), not {virtual}")
