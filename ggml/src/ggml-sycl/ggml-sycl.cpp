@@ -90100,6 +90100,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const bool use_routing_prestage = use_expert_cache && (n_experts > 64) && !src0_usm_accessible_prestage;
     std::vector<ggml_sycl_cache_id> routed_expert_keys;
     ggml_sycl::prestage_result      routed_prestage;
+
+    // prestage_routed_experts below pins the routed experts it finds on the card, and its receipt
+    // (routed_prestage.pins) is the sole authority for what to unpin. This guard releases them on every exit of the
+    // op: its end, a batched path that returns early, and a refusal's throw, which graph_compute turns into
+    // GGML_STATUS_FAILED. It is destroyed after the op's later locals, so their leases go before the pins; eviction
+    // skips an entry that a pin or a lease holds, so no entry the op used becomes evictable before both are gone.
+    struct routed_prestage_unpin_on_exit {
+        int                                               device;
+        const std::vector<ggml_sycl::routed_expert_pin> & pins;
+
+        ~routed_prestage_unpin_on_exit() {
+            if (!pins.empty()) {
+                ggml_sycl::unpin_routed_experts(device, pins);
+            }
+        }
+    } routed_prestage_unpin{ ctx.device, routed_prestage.pins };
     if (use_routing_prestage) {
         routed_expert_keys.reserve(static_cast<size_t>(n_experts));
         for (int e = 0; e < n_experts; ++e) {
@@ -96032,13 +96048,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
         }
         fprintf(stderr, "]\n");
-    }
-
-    // Unpin routed experts after dispatch completes (allows eviction)
-    if (use_routing_prestage) {
-        ggml_sycl::unpin_routed_experts(ctx.device, routed_prestage.pins);
-
-        GGML_SYCL_DEBUG("[MOE-UNPIN] Layer %d: Unpinned routed experts\n", layer_id);
     }
 } catch (const sycl::exception & exc) {
     // llama.cpp-o3h1 commit 3 (ticket c-aolj): this WAS the second,

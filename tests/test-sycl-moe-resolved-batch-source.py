@@ -1166,6 +1166,114 @@ def test_batched_dispatch_names_every_refusal() -> None:
         assert dispatch_reject_violations(m_mmvq, m_header, m_sycl, m_seam), f"mutation survived: {name}"
 
 
+MUL_MAT_ID_SIGNATURE = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try"
+PRESTAGE_RECEIPT = "ggml_sycl::prestage_result routed_prestage;"
+PRESTAGE_PIN = "routed_prestage = ggml_sycl::prestage_routed_experts("
+UNPIN_GUARD_TYPE = "struct routed_prestage_unpin_on_exit {"
+UNPIN_GUARD_RECEIPT = "const std::vector<ggml_sycl::routed_expert_pin> & pins;"
+UNPIN_GUARD_RELEASE = ("~routed_prestage_unpin_on_exit() { if (!pins.empty()) { "
+                       "ggml_sycl::unpin_routed_experts(device, pins); } }")
+UNPIN_GUARD_OBJECT = "routed_prestage_unpin{ ctx.device, routed_prestage.pins };"
+UNPIN_GUARD_STATEMENT = re.compile(r"[ \t]*struct routed_prestage_unpin_on_exit \{.*?\} routed_prestage_unpin\{ "
+                                   r"ctx\.device, routed_prestage\.pins \};\n", re.DOTALL)
+
+
+def code_only(text: str) -> str:
+    """text without comments and with every string or character literal emptied, so no brace inside one counts."""
+    out: list[str] = []
+    state = "code"
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if state == "code":
+            if ch == "/" and (nxt == "/" or nxt == "*"):
+                state = "line-comment" if nxt == "/" else "block-comment"
+                i += 2
+                continue
+            if ch in "\"'":
+                state = ch
+            out.append(ch)
+        elif state == "line-comment":
+            if ch == "\n":
+                state = "code"
+                out.append(ch)
+        elif state == "block-comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+                continue
+        elif ch == "\\":
+            i += 2
+            continue
+        elif ch == state:
+            state = "code"
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def routed_prestage_release_violations(source: str) -> list[str]:
+    """Every exit of ggml_sycl_mul_mat_id releases the expert pins its prestage took, once, from prestage's receipt.
+
+    The op leaves through its end, through batched paths that return early, and through the throw of a refusal, so
+    the release is a guard at the function's own scope, declared before the prestage that pins and reading the receipt
+    by reference (a copy taken before prestage fills it would release nothing).
+    """
+    if MUL_MAT_ID_SIGNATURE not in source:
+        return ["ggml_sycl_mul_mat_id definition"]
+    body = tokens(code_only(function_definition(source, MUL_MAT_ID_SIGNATURE)))
+    try:
+        receipt = token_sequence_index(body, PRESTAGE_RECEIPT)
+        pinned = token_sequence_index(body, PRESTAGE_PIN)
+        guard = token_sequence_index(body, UNPIN_GUARD_OBJECT)
+    except ValueError as missing:
+        return [f"routed prestage release: {missing}"]
+    failures: list[str] = []
+    if not receipt < guard < pinned:
+        failures.append("the unpin guard is not declared after the receipt and before the prestage that pins")
+    if body[:guard].count("{") - body[:guard].count("}") != 1:
+        failures.append("the unpin guard is not at the function's own scope, so an inner scope's end releases the pins")
+    for witness in (UNPIN_GUARD_TYPE, UNPIN_GUARD_RECEIPT, UNPIN_GUARD_RELEASE):
+        if not contains_tokens(body, witness):
+            failures.append(f"unpin guard: {witness}")
+    releases = body.count("unpin_routed_experts")
+    if releases != 1:
+        failures.append(f"ggml_sycl_mul_mat_id releases routed pins at {releases} sites; the guard is the only one")
+    return failures
+
+
+def test_routed_prestage_pins_released_on_every_exit() -> None:
+    source = SOURCE.read_text()
+    assert routed_prestage_release_violations(source) == []
+
+    # Positive control of the blanking: braces in a string, a character or a comment do not count, code braces do.
+    sample = "void f() { const char * s = \"{{\"; char c = '{'; /* { */ // {\n    int x{ 1 }; }"
+    assert sample.count("{") - sample.count("}") == 5
+    assert code_only(sample).count("{") - code_only(sample).count("}") == 0 and "int x{ 1 }" in code_only(sample)
+
+    fn = function_definition(source, MUL_MAT_ID_SIGNATURE)
+    statement = UNPIN_GUARD_STATEMENT.search(fn)
+    assert statement, "the unpin guard statement is not where the mutants expect it"
+    guard = statement.group(0)
+    without = fn.replace(guard, "", 1)
+    first_throw = re.compile(r"throw ggml_sycl_fallback_error\([^;]*\);\n").search(without, without.index(PRESTAGE_PIN))
+    prestage_block = "if (use_routing_prestage) {\n"
+    mutants = {
+        "guard-removed": without,
+        "guard-after-first-throw": (without[:first_throw.end()] + guard + without[first_throw.end():]
+                                    if first_throw else fn),
+        "guard-inside-prestage-block": without.replace(prestage_block, prestage_block + guard, 1),
+        "guard-copies-receipt": re.sub(r"const std::vector<ggml_sycl::routed_expert_pin> &\s+pins;",
+                                       "std::vector<ggml_sycl::routed_expert_pin> pins;", fn, count=1),
+        "guard-releases-nothing": fn.replace("ggml_sycl::unpin_routed_experts(device, pins);", "(void) device;", 1),
+        "explicit-release-restored": fn[:-1] + "    ggml_sycl::unpin_routed_experts(ctx.device, routed_prestage.pins);\n}",
+    }
+    for name, mutated in mutants.items():
+        assert mutated != fn, f"mutation changed nothing: {name}"
+        assert routed_prestage_release_violations(source.replace(fn, mutated, 1)), f"mutation survived: {name}"
+
+
 if __name__ == "__main__":
     import sys
 
