@@ -481,6 +481,11 @@ struct ggml_sycl_tensor_inventory {
     // count dereferences whatever lies there as an array of tables. libllama and libggml-sycl must be rebuilt together.
     const struct ggml_sycl_lazy_table_info * lazy_tables;
     uint32_t                                 lazy_table_count;
+    // The micro-batch the load measured its compute term at (libllama's llama_load_measure_shape_resolve over the
+    // caller's hints), which the backend credits the term at. It sits in the padding after lazy_table_count, so the
+    // struct stays 208 bytes. libllama and libggml-sycl are rebuilt together. When the field is 0 the backend reads
+    // n_ubatch instead.
+    uint32_t                                 n_ubatch_measure;
 };
 
 #if defined(__cplusplus) && UINTPTR_MAX == UINT64_MAX
@@ -491,6 +496,7 @@ static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inven
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_measure) == 204, "n_ubatch_measure moved");
 static_assert(sizeof(ggml_sycl_lazy_table_info) == 88, "ggml_sycl_lazy_table_info layout changed");
 static_assert(offsetof(ggml_sycl_lazy_table_info, name) == 0, "lazy table name moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, type) == 8, "lazy table type moved");

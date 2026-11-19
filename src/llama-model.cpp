@@ -268,6 +268,14 @@ static bool llama_model_buft_backend_is_sycl(ggml_backend_buffer_type_t buft) {
     return llama_model_dev_is_sycl(dev);
 }
 
+// The shape every load-time measure of this model runs at: the context and micro-batch the caller told the load
+// (llama_model_params::n_ctx_hint, n_ubatch_hint). The measures and the inventory's n_ubatch_measure read the same
+// resolver over the same hints, so the backend credits the term at the micro-batch it was measured at.
+static llama_load_measure_shape llama_model_load_measure_shape(const llama_model & model) {
+    return llama_load_measure_shape_resolve(model.get_n_ctx_hint(), model.get_n_ubatch_hint(),
+                                            model.hparams.n_ctx_train);
+}
+
 static ggml_sycl_placement_envelope llama_model_sycl_make_placement_envelope() {
     ggml_sycl_placement_envelope envelope = {};
     envelope.n_ctx                        = 0;
@@ -488,8 +496,8 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     // the one place the hint is resolved. With no hint at all (0, a caller that never sets the field) no room is held,
     // and the KV beyond the planning shape is placed when the context is created. A hint above n_ctx_train (a
     // rope-extended -c) is honoured: the caller asked for that context, and the room is already capped at what the
-    // dense weights and their KV leave. Only the room reads the hint: the planning shape above and the load measures
-    // (the placement envelope's n_ctx, still 0) keep their inputs.
+    // dense weights and their KV leave. The room and the load measures read the hint; the planning shape above keeps
+    // its inputs.
     const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);
     inventory.n_ctx_context                    = ctx_room.n_ctx_context;
     inventory.n_ctx_context_is_default         = ctx_room.is_default;
@@ -497,6 +505,11 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     // scratch ring in the RUNTIME zone for it and moves routed experts to the host tier for the room. Like the context
     // room above, only that decision reads it; n_ubatch stays the load's planning shape.
     inventory.n_ubatch_context                 = n_ubatch_hint;
+    // The micro-batch the load measures its compute term at, from the resolver the measures use
+    // (llama_model_load_measure_shape), so the backend credits the term at the rung it was measured at. The early and
+    // the late inventory are both built here from the same hints, so both carry the same value.
+    inventory.n_ubatch_measure =
+        llama_load_measure_shape_resolve(n_ctx_hint, n_ubatch_hint, hparams.n_ctx_train).n_ubatch;
     if (hparams.n_expert > 0 && hparams.n_expert_used_max() > 0) {
         // llama.cpp-sr83 (C3): the batched executor repacks straight to a
         // {nibbles,e8m0-scales} WOQ shape by default and deletes the f16
@@ -2940,16 +2953,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     const bool sycl_model_backend = sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft;
     if (sycl_model_backend) {
-        // (a) the probe measure, llama.cpp-p6i0: the probe placement's compute term C-hat, before the late plan
-        // packs the weights, handed to the backend as a planned RUNTIME term so the pack leaves the compute buffer
-        // its room. It is measured at n_ctx_train and ubatch 512: the caller's -c and -ub do not reach the load
-        // (fkpg (a)), so the term is that shape's, not the context's. A dense model's default auto ubatch climbs
-        // above 512 into whatever room is left; that part is not reserved.
+        // (a) the probe measure: the probe placement's compute term C-hat, before the late plan packs the weights,
+        // handed to the backend as a planned RUNTIME term so the pack leaves the compute buffer its room. It is
+        // measured at the context and micro-batch the caller told the load (the training context and the auto
+        // ladder's bottom rung where it told none); the admitted measure below runs at the same shape. A dense
+        // model's auto micro-batch climbs above the bottom rung into whatever room is left; that part is not reserved.
+        const llama_load_measure_shape               measure_shape = llama_model_load_measure_shape(*this);
         const std::vector<llama_measure_dummy_entry> probe_weights = llama_model_measure_weights(ml);
 
         const int64_t                 probe_t0 = ggml_time_us();
-        const llama_load_probe_result probe    = llama_load_probe_bound(
-            *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, probe_weights);
+        const llama_load_probe_result probe =
+            llama_load_probe_bound(*this, measure_shape, sycl_model_loading_guard.txn, probe_weights);
         const int64_t probe_ms = (ggml_time_us() - probe_t0) / 1000;
         if (!probe.unsupported.empty()) {
             // not a refusal of the load: the probe cannot be measured (a model the measure cannot walk, or no plan
@@ -2972,8 +2986,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             const int64_t                     admitted_t0 = ggml_time_us();
             const llama_admitted_check_result admitted =
-                llama_load_admitted_check(*this, llama_model_sycl_make_placement_envelope().n_ctx,
-                                          sycl_model_loading_guard.txn, admitted_weights, probe);
+                llama_load_admitted_check(*this, measure_shape, sycl_model_loading_guard.txn, admitted_weights, probe);
             const int64_t admitted_ms = (ggml_time_us() - admitted_t0) / 1000;
             if (!admitted.unsupported.empty()) {
                 LLAMA_LOG_WARN("%s: admitted compute-slot measure skipped, the load continues: %s\n", __func__,
@@ -2985,12 +2998,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (const llama_admitted_term & t : admitted.terms) {
                 LLAMA_LOG_WARN(
                     "%s: [LOAD-PLAN] compute slot on device %d: probe bound %.1f MiB %s, admitted %.1f MiB (%zu of "
-                    "%zu recorded); measured at n_ctx %u ubatch %u, the caller's -c and -ub are not transported "
-                    "(fkpg); measure %lld ms probe, %lld ms admitted\n",
+                    "%zu recorded); measured at n_ctx %u ubatch %u, the context and micro-batch this load was told "
+                    "(the training context and ubatch %u where it was told none); measure %lld ms probe, %lld ms "
+                    "admitted\n",
                     __func__, (int) t.device, t.probe_term / 1024.0 / 1024.0,
                     t.reserved ? "reserved in RUNTIME" : "NOT reserved (the backend said why), not compared",
                     t.admitted_term / 1024.0 / 1024.0, admitted.n_recorded, admitted.terms.size(), admitted.n_ctx,
-                    admitted.n_ubatch, (long long) probe_ms, (long long) admitted_ms);
+                    admitted.n_ubatch, llama_auto_ubatch_ladder[0], (long long) probe_ms, (long long) admitted_ms);
                 if (t.kv_excess != 0) {
                     LLAMA_LOG_WARN(
                         "%s: [LOAD-PLAN] compute slot on device %d: admitted %.1f MiB exceeds the probe bound by %.1f "
@@ -3164,9 +3178,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // (c) the late measure: the final placement's compute term, over stand-ins for the weights
         // that are not yet allocated, handed to the backend to compare with the term it admitted.
         // Inert until the backend exports the L4 entry points; a refusal is the load's.
-        const std::vector<llama_measure_dummy_entry> late_weights = llama_model_measure_weights(ml);
-        const llama_late_check_result late = llama_load_late_check(
-            *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, late_weights);
+        // It runs at the shape the admitted term was measured and recorded at, so the two compare like for like.
+        const llama_load_measure_shape               measure_shape = llama_model_load_measure_shape(*this);
+        const std::vector<llama_measure_dummy_entry> late_weights  = llama_model_measure_weights(ml);
+        const llama_late_check_result                late =
+            llama_load_late_check(*this, measure_shape, sycl_model_loading_guard.txn, late_weights);
         if (!late.unsupported.empty()) {
             // not a refusal of the load: the late check cannot be measured (a model the measure cannot walk, or no
             // plan staged for it), so the final placement's compute term is compared with nothing

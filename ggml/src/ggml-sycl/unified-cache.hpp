@@ -1037,17 +1037,17 @@ struct placement_plan;
 
 // The compute room the RUNTIME zone of `plan` holds on `device`, for the hold-spill fit to credit: `compute_term` at
 // the micro-batch the zone was sized for, in *n_ubatch. A placed explicit micro-batch names its own. Otherwise, for a
-// plan that named no micro-batch, the zone was sized at the load's planning micro-batch, the shape the load measured
-// the compute term at, which the caller passes as `planning_n_ubatch`: the plan's planner_n_ubatch is the context's
-// micro-batch, rewritten by every runtime context transaction, so it cannot say what the load measured. The fit
-// credits that rung and the rungs below it (zone_hold_fit_rung_has_compute_room), except a rung whose own record is
-// larger than the room, a rung without a record above the micro-batch the term was measured at, and the rung whose
-// own buffer was held out. 0 with *n_ubatch 0 for a multi-device plan, another device, a planning micro-batch of 0
-// and a named micro-batch the plan did not place.
+// plan that named no micro-batch, the room is credited at the micro-batch the load measured the term at (the planning
+// micro-batch only for an inventory that sent none), which the caller passes as `measured_n_ubatch`: the plan's
+// planner_n_ubatch is the context's micro-batch, rewritten by every runtime context transaction, so it cannot say what
+// the load measured. The fit credits that rung and the rungs below it (zone_hold_fit_rung_has_compute_room), except a
+// rung whose own record is larger than the room, a rung without a record above the micro-batch the term was measured
+// at, and the rung whose own buffer was held out. 0 with *n_ubatch 0 for a multi-device plan, another device, a
+// measured micro-batch of 0 and a named micro-batch the plan did not place.
 size_t placement_plan_compute_room(const placement_plan & plan,
                                    int                    device,
                                    size_t                 compute_term,
-                                   uint32_t               planning_n_ubatch,
+                                   uint32_t               measured_n_ubatch,
                                    uint32_t *             n_ubatch);
 
 // Whether a context announces the load's explicit micro-batch placement at WARN: it is the first non-probe context
@@ -2705,9 +2705,9 @@ bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_
 // llama.cpp-p6i0: the load's planned compute term, the bytes the scheduler's compute buffer occupies in the RUNTIME
 // zone (zone_compute_term_bytes over the probe measure's chunks), a named RUNTIME consumer folded into
 // unified_cache_get_planned_runtime_zone_requirement() so the zone is sized for the buffer before the weight pack.
-// It is measured at the load's measure shape (n_ctx_train and ubatch 512 until fkpg (a) transports the caller's
-// -c and -ub), so it is the planned term for that shape, not for every context. moua L6 retires it into the
-// FIRST_CONTEXT head slot.
+// It is measured at the context and micro-batch the caller told the load (the training context and the auto
+// ladder's bottom rung where it told none), so it is the planned term for that shape, not for every context. moua L6
+// retires it into the FIRST_CONTEXT head slot.
 // Owner-keyed (llama.cpp-ihk6, canonical contract 12.4): `owner` is the model slot and slot generation of the load
 // that measured it, and the setter replaces that owner's term on the device. The getter answers the merge, the largest
 // term of the owners on the device. False, storing nothing, for a device out of range, an owner that is not a model
@@ -2717,11 +2717,10 @@ bool             unified_cache_set_planned_compute_term(int device_id, lifecycle
 size_t           unified_cache_get_planned_compute_term_bytes(int device_id);
 // The micro-batch the planned compute term was measured at on the device, for the hold-spill fit to credit the term
 // at that rung and below (placement_plan_compute_room), and to bound the credit of a rung without a record of its own
-// under a placed micro-batch (zone_hold_fit_inputs::compute_room_measured_n_ubatch). Each load records its planning
-// micro-batch, the inventory's n_ubatch, through zone_compute_term_n_ubatch_store, which documents the rule; the
-// setter WARNs once when a store turns the record off. The stored value is the measure's shape only while
-// inventory.n_ubatch and llama_auto_ubatch_ladder[0] (the measure's n_ubatch) agree; a source pin holds the two to one
-// value. The getter answers 0 for none, for a record turned off, and for a device out of range.
+// under a placed micro-batch (zone_hold_fit_inputs::compute_room_measured_n_ubatch). Each load records the micro-batch
+// it measured the term at (ggml_sycl_tensor_inventory::n_ubatch_measure) through zone_compute_term_n_ubatch_store,
+// which documents the rule; the setter WARNs once when a store turns the record off. The getter answers 0 for none,
+// for a record turned off, and for a device out of range.
 void             unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch);
 uint32_t         unified_cache_get_planned_compute_term_n_ubatch(int device_id);
 // llama.cpp-p6i0: the load's planned state term, the bytes the context memory the probe measure placed on the
