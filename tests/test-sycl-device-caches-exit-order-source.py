@@ -1,4 +1,5 @@
-"""Source contract: the per-device unified caches are destroyed before dpct's device manager at exit.
+"""Source contract: the per-device unified caches are destroyed before dpct's device manager at exit, and a lookup of
+an existing cache takes the cache lock once.
 
 Static objects are destroyed in the reverse order of their construction. dpct::dev_mgr is a function-local static of
 dpct::dev_mgr::instance() (dpct/helper.hpp), constructed at its first use. A namespace-scope map of the caches is
@@ -12,8 +13,8 @@ dpct::dev_mgr::instance() first and then holds the map as its own function-local
 the manager and destroyed before it. This gate pins that:
 
   - the map is held by no namespace-scope object of any ggml-sycl source, static or not, named or in an anonymous
-    namespace: its one static declaration is inside the accessor, and the old namespace-scope name is gone, so no use
-    can bypass the accessor;
+    namespace, and by no static of another function: its one static declaration is inside the accessor, and the old
+    namespace-scope name is gone, so no use can bypass the accessor;
   - the accessor touches the device manager before the map's static is reached;
   - the exit handler that marks SYCL as shutting down is registered after the map is constructed, so it runs before
     the map is destroyed and the caches the map destroys take the abandon branch of their teardown. A handler
@@ -23,8 +24,14 @@ the manager and destroyed before it. This gate pins that:
     takes the map before it constructs a cache: in `map[id] = std::make_unique<unified_cache>(...)` the right operand
     is evaluated first, so the accessor call there must be a statement of its own, before that one.
 
-It reads comment-stripped text, and each check is proven to catch its mutant below. It cannot see code that is compiled
-out (`#if 0`) or never runs (`if (false)`); the debugger run of a directly constructed cache is the behavioural gate.
+The cache lock g_cache_rw_mutex is a std::shared_mutex. A thread that holds it, in either mode, must not reach a lookup
+that takes it again: twice shared on one thread is undefined and deadlocks once a writer queues between the two, and
+shared under unique deadlocks outright. The gate requires every mention of the lock in unified-cache.cpp to be its
+declaration or a lock the gate recognises, and no recognised lock's scope to call a lookup that takes the lock.
+
+It reads comment-stripped text, and each check is proven to catch its mutant below, by the failure text of that check.
+It cannot see code that is compiled out (`#if 0`) or never runs (`if (false)`), nor a call that reaches a lookup through
+another function; the debugger run of a directly constructed cache is the behavioural gate for the order.
 """
 
 import re
@@ -51,45 +58,49 @@ ATEXIT = r"\bstd::atexit\s*\("
 MAP_VAR_DECL = MAP_TYPE + r"\s+(\w+)\s*(?=[;={])"
 OLD_NAME = re.compile(r"\bg_device_caches\b")
 
-# literals whose text could hold a brace, blanked for the scope walk; comments are already gone
-_LITERAL_RE = re.compile(
+_LITERAL = (
     r'R"([^(\s]{0,16})\(.*?\)\1"'  # raw string literal
     r'|"(?:\\.|[^"\\\n])*"'  # string literal
-    r"|'(?:\\.|[^'\\\n])*'",  # char literal
+    r"|'(?:\\.|[^'\\\n])*'"  # char literal
+)
+_LITERAL_RE = re.compile(_LITERAL, flags=re.DOTALL)
+_LEXEME_RE = re.compile(
+    _LITERAL  # kept
+    + r"|//[^\n]*"  # line comment (dropped)
+    + r"|/\*.*?\*/",  # block comment (dropped)
     flags=re.DOTALL,
 )
 _NAMESPACE_OPENER = re.compile(r"(?:\bnamespace(?:\s+[\w:]+)?|\bextern)\s*$")
-
-_LEXEME_RE = re.compile(
-    r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
-    r"|'(?:\\.|[^'\\\n])*'"  # char literal (kept)
-    r"|//[^\n]*"  # line comment (dropped)
-    r"|/\*.*?\*/",  # block comment (dropped)
-    flags=re.DOTALL,
-)
 
 
 def strip_comments(src: str) -> str:
     def repl(m: re.Match) -> str:
         tok = m.group(0)
-        if tok[0] in "\"'":
-            return tok
+        if not tok.startswith(("//", "/*")):
+            return tok  # a literal
         return "\n" * tok.count("\n")
 
     return _LEXEME_RE.sub(repl, src)
 
 
+def blank_literals(code: str) -> str:
+    """The code with every literal's text replaced by spaces, offsets and lines kept: what every brace walk reads, so
+    a brace inside a literal never counts."""
+    return _LITERAL_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), code)
+
+
 def body_span(code: str, signature: str):
     """(start, end) of the body after the first match of `signature`, which ends at its opening brace."""
-    m = re.search(signature, code)
+    blank = blank_literals(code)
+    m = re.search(signature, blank)
     if not m:
         return None
     depth = 1
     i = m.end()
-    while i < len(code) and depth:
-        if code[i] == "{":
+    while i < len(blank) and depth:
+        if blank[i] == "{":
             depth += 1
-        elif code[i] == "}":
+        elif blank[i] == "}":
             depth -= 1
         i += 1
     return m.end(), i - 1
@@ -99,7 +110,7 @@ def namespace_scope_map_decls(code: str) -> list:
     """Names and lines of the map-typed variables declared at namespace scope: every enclosing brace opens a namespace
     or an extern block. A file whose braces do not balance (a preprocessor branch opens one twice) cannot be walked, so
     every map-typed variable in it is reported, which fails closed."""
-    blank = _LITERAL_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), code)
+    blank = blank_literals(code)
     decls = list(re.finditer(MAP_VAR_DECL, blank))
     if not decls:
         return []
@@ -179,7 +190,7 @@ def order_failures(cache_code: str, other_sources: dict) -> list:
         else:
             statement_start = cbody.rfind(";", 0, construct.start())
             statement_start = max(statement_start, cbody.rfind("{", 0, construct.start()))
-            if not re.search(r"\b" + ACCESSOR + r"\s*\(\s*\)", cbody[:statement_start]):
+            if not re.search(ACCESSOR_CALL, cbody[:statement_start]):
                 failures.append("create_cache_for_device() constructs a cache before it has taken the map")
 
     ctor = body_span(cache_code, CTOR_SIG)
@@ -213,11 +224,6 @@ def test_the_caches_are_constructed_after_the_device_manager():
     assert not failures, "\n".join(failures)
 
 
-def _accessor_body(code: str) -> str:
-    start, end = body_span(code, ACCESSOR_SIG)
-    return code[start:end]
-
-
 def _mutate_accessor(code: str, edit) -> str:
     start, end = body_span(code, ACCESSOR_SIG)
     return code[:start] + edit(code[start:end]) + code[end:]
@@ -235,11 +241,15 @@ def _touch_after_static(body: str) -> str:
 
 
 def _namespace_scope_map(code: str) -> str:
-    name = re.search(STATIC_MAP_DECL, _accessor_body(code)).group(1)
-    decl = "static std::unordered_map<int, std::shared_ptr<unified_cache>> g_device_caches;\n"
-    code = _mutate_accessor(code, lambda body: re.sub(STATIC_MAP_DECL, "", body, count=1))
-    code = re.sub(r"\breturn\s+" + name + r"\s*;", "return g_device_caches;", code, count=1)
+    # the map moved out of the accessor to a namespace-scope static under a name no other check knows
+    def edit(body: str) -> str:
+        name = re.search(STATIC_MAP_DECL, body).group(1)
+        body = re.sub(STATIC_MAP_DECL, "", body, count=1)
+        return re.sub(r"\breturn\s+" + name + r"\s*;", "return g_moved_caches;", body, count=1)
+
+    code = _mutate_accessor(code, edit)
     m = re.search(ACCESSOR_SIG, code)
+    decl = "static std::unordered_map<int, std::shared_ptr<unified_cache>> g_moved_caches;\n"
     return code[: m.start()] + decl + code[m.start() :]
 
 
@@ -248,22 +258,28 @@ def _bypass(code: str) -> str:
     return code + "\nstatic std::unordered_map<int, std::shared_ptr<unified_cache>> g_spare_caches;\n"
 
 
-def _construct_in_the_same_statement(code: str) -> str:
-    start, end = body_span(code, CREATE_SIG)
-    body = code[start:end]
-    body = re.sub(r"[^;{}]*\b" + ACCESSOR + r"\s*\(\s*\)[^;]*;", "", body)
-    body = re.sub(r"(\w+)(\s*\[\s*\w+\s*\]\s*=\s*std::make_unique\s*<\s*unified_cache\s*>)",
-                  ACCESSOR + r"()\2", body, count=1)
-    return code[:start] + body + code[end:]
-
-
 def _external_linkage_map(code: str) -> str:
     # a namespace-scope holder without `static`: external linkage, the same construction at load
-    return code + "\nstd::unordered_map<int, std::shared_ptr<unified_cache>> g_spare_caches;\n"
+    return code + "\nstd::unordered_map<int, std::shared_ptr<unified_cache>> g_extern_caches;\n"
 
 
 def _anonymous_namespace_map(code: str) -> str:
-    return code + "\nnamespace {\nstd::unordered_map<int, std::shared_ptr<unified_cache>> g_spare_caches{};\n}\n"
+    return code + "\nnamespace {\nstd::unordered_map<int, std::shared_ptr<unified_cache>> g_unnamed_caches{};\n}\n"
+
+
+def _static_in_another_function(code: str) -> str:
+    # a second function-local holder: its own first use decides its order, not the accessor's touch
+    decl = "static std::unordered_map<int, std::shared_ptr<unified_cache>> stray_caches;"
+    return code + "\nstatic void spare() {\n    " + decl + "\n}\n"
+
+
+def _construct_in_the_same_statement(code: str) -> str:
+    start, end = body_span(code, CREATE_SIG)
+    body = code[start:end]
+    body = re.sub(r"[^;{}]*" + ACCESSOR_CALL + r"[^;]*;", "", body)
+    body = re.sub(r"(\w+)(\s*\[\s*\w+\s*\]\s*=\s*std::make_unique\s*<\s*unified_cache\s*>)",
+                  ACCESSOR + r"()\2", body, count=1)
+    return code[:start] + body + code[end:]
 
 
 _CTOR_TAKE = r"[^;{}]*" + ACCESSOR_CALL + r"[^;]*;"
@@ -285,33 +301,47 @@ def _ctor_take_after_atexit(body: str) -> str:
     return body[: first.end()] + take + body[first.end() :]
 
 
+# name -> (edit, a fragment of the failure only the check meant for it reports)
 MUTANTS = {
-    "the accessor does not touch the device manager": lambda c: _mutate_accessor(c, _drop_touch),
-    "the accessor touches the device manager after the map's static": lambda c: _mutate_accessor(c, _touch_after_static),
-    "the map is a namespace-scope static again": _namespace_scope_map,
-    "a second static map of caches bypasses the accessor": _bypass,
-    "a namespace-scope map without static bypasses the accessor": _external_linkage_map,
-    "a map in an anonymous namespace bypasses the accessor": _anonymous_namespace_map,
-    "the first cache is constructed before the map": _construct_in_the_same_statement,
-    "the cache constructor does not take the map": lambda c: _mutate_ctor(c, _ctor_without_take),
-    "the cache constructor takes the map after std::atexit": lambda c: _mutate_ctor(c, _ctor_take_after_atexit),
+    "the accessor does not touch the device manager": (
+        lambda c: _mutate_accessor(c, _drop_touch), "the accessor does not touch dpct::dev_mgr::instance()"),
+    "the accessor touches the device manager after the map's static": (
+        lambda c: _mutate_accessor(c, _touch_after_static), "touches the device manager after the map's static"),
+    "the map moves to a namespace-scope static": (
+        _namespace_scope_map, "static `g_moved_caches` outside the accessor"),
+    "a second static map of caches bypasses the accessor": (
+        _bypass, "static `g_spare_caches` outside the accessor"),
+    "a namespace-scope map without static bypasses the accessor": (
+        _external_linkage_map, "namespace-scope map `g_extern_caches`"),
+    "a map in an anonymous namespace bypasses the accessor": (
+        _anonymous_namespace_map, "namespace-scope map `g_unnamed_caches`"),
+    "a function-local static map in another function bypasses the accessor": (
+        _static_in_another_function, "static `stray_caches` outside the accessor"),
+    "the first cache is constructed before the map": (
+        _construct_in_the_same_statement, "constructs a cache before it has taken the map"),
+    "the cache constructor does not take the map": (
+        lambda c: _mutate_ctor(c, _ctor_without_take), "does not take the map before it registers the exit handler"),
+    "the cache constructor takes the map after std::atexit": (
+        lambda c: _mutate_ctor(c, _ctor_take_after_atexit), "takes the map after it registers the exit handler"),
 }
 
 
 @pytest.mark.parametrize("name", sorted(MUTANTS))
 def test_each_check_catches_its_mutant(name):
     cache_code, others = sources()
-    mutant = MUTANTS[name](cache_code)
+    edit, fragment = MUTANTS[name]
+    mutant = edit(cache_code)
     assert mutant != cache_code, f"the mutant '{name}' did not change the source"
-    assert order_failures(mutant, others), f"the mutant '{name}' passed the gate"
+    failures = "\n".join(order_failures(mutant, others))
+    assert fragment in failures, f"the mutant '{name}' was not caught by its check; failures:\n{failures}"
 
 
-def test_a_namespace_scope_name_in_another_source_is_caught():
+def test_the_old_name_in_another_source_is_caught():
     cache_code, others = sources()
     rel = sorted(others)[0]
     others = dict(others)
     others[rel] = others[rel] + "\nvoid f() { g_device_caches.clear(); }\n"
-    assert order_failures(cache_code, others)
+    assert f"{rel} still names g_device_caches" in order_failures(cache_code, others)
 
 
 def test_a_map_local_to_a_function_is_not_a_holder():
@@ -323,13 +353,15 @@ def test_a_map_local_to_a_function_is_not_a_holder():
     assert order_failures(cache_code + local, others) == order_failures(cache_code, others)
 
 
-# The cache lock is a std::shared_mutex. A thread that holds it, in either mode, must not reach a lookup that takes it
-# again: twice shared on one thread is undefined and deadlocks once a writer queues between the two, and shared under
-# unique deadlocks outright. These are the lookups that take it shared for the map read.
+# A lock of g_cache_rw_mutex: explicit or deduced template argument, and an optional second constructor argument such
+# as std::defer_lock. A deferred lock counts as held for its whole scope, which can only report more.
 CACHE_LOCK = re.compile(
-    r"std::(?:shared_lock|unique_lock|lock_guard|scoped_lock)\s*<\s*std::shared_mutex\s*>\s*\w+\s*[({]\s*"
-    r"g_cache_rw_mutex\s*[)}]"
+    r"\bstd::(?:shared_lock|unique_lock|lock_guard|scoped_lock)\s*(?:<\s*std::shared_mutex\s*>)?\s*\w+\s*[({]\s*"
+    r"g_cache_rw_mutex\s*(?:,\s*[\w:]+\s*)?[)}]"
 )
+CACHE_LOCK_DECL = re.compile(r"\bstatic\s+std::shared_mutex\s+g_cache_rw_mutex\s*;")
+CACHE_LOCK_NAME = re.compile(r"\bg_cache_rw_mutex\b")
+# the lookups that take g_cache_rw_mutex shared for the map read, directly or through one of the others
 RELOCKING_LOOKUPS = (
     "get_cache_shared",
     "get_existing_cache_for_device",
@@ -337,7 +369,7 @@ RELOCKING_LOOKUPS = (
     "multi_device_plan_arena_cache",
     "multi_device_plan_subtracts_arena",
 )
-PUBLIC_LOOKUP_SIGS = {
+LOOKUP_SIGS = {
     "get_existing_unified_cache_for_device": r"(?<!static )\bunified_cache\s*\*\s*get_existing_unified_cache_for_device"
     r"\s*\(\s*int\s+\w+\s*\)\s*\{",
     "multi_device_plan_subtracts_arena": r"\bbool\s+multi_device_plan_subtracts_arena\s*\(\s*int\s+\w+\s*\)\s*\{",
@@ -345,12 +377,20 @@ PUBLIC_LOOKUP_SIGS = {
 
 
 def nested_lock_failures(cache_code: str) -> list:
-    """Every lookup of RELOCKING_LOOKUPS called while a scope holds g_cache_rw_mutex, and every public lookup that
-    names the lock at all. A lock's scope runs from its declaration to the close of the block that holds it."""
+    """Every mention of g_cache_rw_mutex that is neither its declaration nor a lock CACHE_LOCK recognises, so a new
+    lock form fails here instead of passing unseen; and every lookup of RELOCKING_LOOKUPS called while a recognised
+    lock is held. A lock's scope runs from its declaration to the close of the block that holds it."""
     failures = []
-    blank = _LITERAL_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), cache_code)
+    blank = blank_literals(cache_code)
+    locks = list(CACHE_LOCK.finditer(blank))
+    covered = [(m.start(), m.end()) for m in locks]
+    covered += [(m.start(), m.end()) for m in CACHE_LOCK_DECL.finditer(blank)]
+    for name in CACHE_LOCK_NAME.finditer(blank):
+        if not any(a <= name.start() < b for a, b in covered):
+            line = blank.count("\n", 0, name.start()) + 1
+            failures.append(f"unified-cache.cpp:{line} names g_cache_rw_mutex outside a lock the pin recognises")
     calls = re.compile(r"\b(" + "|".join(RELOCKING_LOOKUPS) + r")\s*\(")
-    for lock in CACHE_LOCK.finditer(blank):
+    for lock in locks:
         depth, j = 0, lock.end()
         while j < len(blank):
             if blank[j] == "{":
@@ -364,12 +404,6 @@ def nested_lock_failures(cache_code: str) -> list:
         for call in calls.finditer(blank, lock.end(), j):
             failures.append(f"unified-cache.cpp:{line} holds g_cache_rw_mutex and calls {call.group(1)}(), which "
                             "takes it again")
-    for name, sig in PUBLIC_LOOKUP_SIGS.items():
-        span = body_span(blank, sig)
-        if span is None:
-            failures.append(f"{name}() definition not found")
-        elif "g_cache_rw_mutex" in blank[span[0]:span[1]]:
-            failures.append(f"{name}() names g_cache_rw_mutex; the lookup inside it takes the lock")
     return failures
 
 
@@ -379,33 +413,66 @@ def test_no_cache_lookup_runs_under_the_cache_lock():
     assert not failures, "\n".join(failures)
 
 
-def _relock(name: str):
+def test_the_lock_pattern_sees_every_lock_of_the_cache_mutex():
+    # coverage's positive control: the file's own locks are all recognised, and there are some
+    cache_code, _ = sources()
+    assert len(CACHE_LOCK.findall(blank_literals(cache_code))) > 0
+
+
+def _insert_into(name: str, text: str):
     def edit(code: str) -> str:
-        start, end = body_span(code, PUBLIC_LOOKUP_SIGS[name])
-        return code[:start] + "\n    std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);" + code[start:]
+        start, _ = body_span(code, LOOKUP_SIGS[name])
+        return code[:start] + text + code[start:]
 
     return edit
 
 
+_HELD_READ_LOCK = r"std::shared_lock<std::shared_mutex>\s+read_lock\(g_cache_rw_mutex\);"
+
+
 def _lookup_under_a_held_lock(code: str) -> str:
-    # a function that already holds the lock, as unified_cache_has_evictions() does, asks a lookup
-    m = re.search(r"std::shared_lock<std::shared_mutex>\s+read_lock\(g_cache_rw_mutex\);", code)
-    return code[: m.end()] + "\n    (void) get_existing_cache_for_device(0);" + code[m.end() :]
+    # a function that already holds the lock, as get_unified_cache() does, asks a lookup
+    m = re.search(_HELD_READ_LOCK, code)
+    return code[: m.end()] + "\n    (void) get_cache_shared(0);" + code[m.end() :]
+
+
+def _lookup_under_a_deduced_lock(code: str) -> str:
+    # the same, with that function's lock written with its template argument deduced
+    m = re.search(_HELD_READ_LOCK, code)
+    return code[: m.start()] + "std::shared_lock read_lock(g_cache_rw_mutex);\n    (void) get_cache_shared(0);" + code[
+        m.end() :]
 
 
 LOCK_MUTANTS = {
-    "get_existing_unified_cache_for_device locks again": _relock("get_existing_unified_cache_for_device"),
-    "multi_device_plan_subtracts_arena locks again": _relock("multi_device_plan_subtracts_arena"),
-    "a lookup under a held lock": _lookup_under_a_held_lock,
+    "get_existing_unified_cache_for_device locks again": (
+        _insert_into("get_existing_unified_cache_for_device",
+                     "\n    std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);"),
+        "holds g_cache_rw_mutex and calls get_existing_cache_for_device()"),
+    "multi_device_plan_subtracts_arena locks again, template argument deduced": (
+        _insert_into("multi_device_plan_subtracts_arena", "\n    std::shared_lock lock(g_cache_rw_mutex);"),
+        "holds g_cache_rw_mutex and calls multi_device_plan_arena_cache()"),
+    "get_existing_unified_cache_for_device locks again, deduced and deferred": (
+        _insert_into("get_existing_unified_cache_for_device",
+                     "\n    std::unique_lock lock(g_cache_rw_mutex, std::defer_lock);\n    lock.lock();"),
+        "holds g_cache_rw_mutex and calls get_existing_cache_for_device()"),
+    "a lookup under a held lock": (
+        _lookup_under_a_held_lock, "holds g_cache_rw_mutex and calls get_cache_shared()"),
+    "a lookup under a held lock, template argument deduced": (
+        _lookup_under_a_deduced_lock, "holds g_cache_rw_mutex and calls get_cache_shared()"),
+    "a lock form the pattern does not know": (
+        _insert_into("get_existing_unified_cache_for_device", "\n    g_cache_rw_mutex.lock_shared();"),
+        "names g_cache_rw_mutex outside a lock the pin recognises"),
 }
 
 
 @pytest.mark.parametrize("name", sorted(LOCK_MUTANTS))
 def test_the_nested_lock_check_catches_its_mutant(name):
     cache_code, _ = sources()
-    mutant = LOCK_MUTANTS[name](cache_code)
+    edit, fragment = LOCK_MUTANTS[name]
+    mutant = edit(cache_code)
     assert mutant != cache_code, f"the mutant '{name}' did not change the source"
-    assert nested_lock_failures(mutant), f"the mutant '{name}' passed the gate"
+    failures = "\n".join(nested_lock_failures(mutant))
+    assert fragment in failures, f"the mutant '{name}' was not caught by its check; failures:\n{failures}"
 
 
 if __name__ == "__main__":

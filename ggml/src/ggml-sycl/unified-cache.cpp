@@ -863,8 +863,10 @@ residency_diagnostics_snapshot residency_diagnostics_snapshot_for_test() {
 }
 
 // Per-device cache synchronization (for PER_DEVICE and AUTO modes). The owner
-// map itself is declared after the allocation registry below so static teardown
-// destroys caches while their release registry is still alive.
+// map is the function-local static of unified_cache_device_caches(), constructed
+// at its first use, after every namespace-scope object of this file, so static
+// teardown destroys the caches while their release registry and this lock are
+// still alive.
 static std::shared_mutex                                       g_cache_rw_mutex;
 static size_t                                                  g_unified_cache_budget      = 0;  // 0 = auto-calculate
 static int                                                     g_unified_cache_budget_pct  = 100;
@@ -2210,9 +2212,10 @@ static size_t g_runtime_span_irregular_rows = 0;
 //  - the runtime allocation registry and its index above, whose rows the caches' destructors erase. The map is
 //    constructed at its first use, after every namespace-scope object of this file, so it is destroyed before them;
 //    that includes g_cache_rw_mutex, the lock that guards it.
-// A touch whose construction throws is left to the device manager's own users, as it was before the touch existed: the
-// map is still handed out, and the order then holds only if no later use constructs the manager. With no device at all
-// the manager constructs empty and does not throw.
+// The touch swallows a throw so that the accessor adds no exception of its own to the lookups that call it, several of
+// which are noexcept. A function-local static whose construction throws is constructed again at its next use, so the
+// manager's next real use meets the failure and reports it. The order then holds only if no later use constructs the
+// manager. With no device at all the manager constructs empty and does not throw.
 static std::unordered_map<int, std::shared_ptr<unified_cache>> & unified_cache_device_caches() {
     try {
         (void) dpct::dev_mgr::instance();
@@ -7201,10 +7204,12 @@ unified_cache::unified_cache(sycl::queue & queue,
     authority_resolved_(authority_resolved),
     device_total_vram_(device_total_vram),
     dma_reserved_bytes_(dma_reserved_bytes) {
-    // The map is constructed before the exit handler below is registered, whoever constructs this cache: a handler
-    // registered before an object's construction completes runs after that object is destroyed, so a cache made
-    // directly, before any map lookup, would otherwise let the map die first with the shutdown flag still clear and
-    // tear its caches down through the full path instead of the abandon branch.
+    // The exit handler registered below marks SYCL as shutting down, and it must run before the per-device cache map is
+    // destroyed, so that the caches the map destroys take the abandon branch of their teardown. A handler registered
+    // before an object's construction completes runs after that object is destroyed, so the map is constructed here,
+    // before the handler is registered, whoever constructs this cache. A cache made directly, before any map lookup,
+    // would otherwise let the map die first with the shutdown flag still clear and tear its caches down through the
+    // full path.
     (void) unified_cache_device_caches();
 
     // Register atexit handler once to set shutdown flag before static destructors run
@@ -19919,11 +19924,8 @@ static unified_cache * create_cache_for_device(int                     device_id
                                                size_t *                deferred_reserved_out = nullptr,
                                                const device_mem_hint * hint                  = nullptr,
                                                sycl::queue *           queue_override        = nullptr) {
-    // Taken in a statement of its own, before the cache below is constructed: the right operand of that assignment is
-    // evaluated first. The exit handler that marks SYCL as shutting down must run before the map is destroyed, so the
-    // map must be constructed before the handler is registered. A cache's constructor touches the map before it
-    // registers the handler, which keeps that order for a cache constructed anywhere; this lookup keeps it here
-    // without leaning on the constructor's body.
+    // Taken in a statement of its own, so the map exists before the cache below is constructed: the right operand of
+    // that assignment is evaluated first. The order this keeps is explained in the unified_cache constructor.
     auto & device_caches = unified_cache_device_caches();
 
     // Get queue for this device.  Always prefer the single-device context

@@ -4753,12 +4753,9 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
-# Source gate for the exit order of the per-device unified caches: the map is held only by
-# unified_cache_device_caches(), whose function-local static is reached after the accessor has touched
-# dpct::dev_mgr::instance(), so at exit the caches are destroyed before the device manager their teardown asks for a
-# device; and the exit handler a cache's constructor registers comes after the map's construction, because the
-# constructor (and create_cache_for_device()) takes the map first, so the caches take the abandon branch at exit
-# whoever constructed them. Host-only, reads the sources as text; each check is proven against its mutant.
+# Source gate for the exit order of the per-device unified caches and for the cache lock taken once per lookup; the
+# order argument is in the script's docstring and at the unified_cache constructor. Host-only, reads the sources as
+# text; each check is proven against its mutant.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-device-caches-exit-order-source
