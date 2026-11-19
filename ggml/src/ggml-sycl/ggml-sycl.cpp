@@ -18635,10 +18635,12 @@ struct ggml_sycl_inventory_effects {
 // claimed by an in-flight dispatch refuses the release, never forced: the ring is kept, KV admission still counts what
 // it holds (read from its slots), and the next KV re-fit re-admits it. The ring is per device, not per model, so this
 // also releases a ring that another still-loaded model's live context admitted: its dispatch falls back when the
-// planned scratch is unavailable, and its published charge for the ring becomes an over-count. This release never
-// comes before a refusal: it runs only after every refusal of the pass. The one ring release a refused load can have
-// made is the entry ensure's last resort (ggml_sycl_ensure_load_arena_zones), taken in a decide step only when the
-// ring's slot buffers are the only holders of an arena whose zones must grow. Caller holds g_tensor_inventory_mutex.
+// planned scratch is unavailable, and its published charge for the ring becomes an over-count. Within a pass this
+// release never comes before a refusal: it runs only after every refusal of the pass. A load stages an early pass and
+// then a late one, so a refused load can have released a ring in two places: the entry ensure's last resort
+// (ggml_sycl_ensure_load_arena_zones), taken in a decide step only when the ring's slot buffers are the only holders
+// of an arena whose zones must grow, and, when the late pass refuses, this release in the early pass's effect step.
+// Caller holds g_tensor_inventory_mutex.
 static void ggml_sycl_release_stale_kv_zone_ring(int device) {
     const size_t stale_ring_kv_zone_bytes = ggml_sycl::unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(device);
     if (stale_ring_kv_zone_bytes == 0) {
@@ -18846,7 +18848,7 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
     // Layer streaming provides a device-side copy for GPU kernels that need weights.
     // Stays in the late path because g_sycl_host_weight_extras is populated by create_tensor.
     // The decision is made here, against the plan the cache held before this pass stores its own; the streaming
-    // setup is the pass's effect, which the caller runs once every refusal of the load is decided.
+    // setup is the pass's effect, which the caller runs once every refusal of the pass is decided.
     ggml_sycl_inventory_effects decided;
     decided.device                     = ctx->device;
     const char * force_stream          = std::getenv("GGML_SYCL_FORCE_STREAMING");
@@ -19236,7 +19238,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                        ggml_sycl::lifecycle_find_candidate_placement_plan(owner.load.value).get() == snapshot.get();
             };
 
-        // The decide pass: every device plans and every refusal is decided before any device's host zones, layer
+        // The decide pass: every device plans and every refusal is decided before this pass's host zones, layer
         // streaming or stale-ring release, and the rollback guard's abort puts back what the pass published. The
         // planner's zone decision still changes a device here: the entry ensure's last resort releases a ring that
         // alone holds the arena, and an arena nothing holds may be rebuilt for the plan's zones, which a refused load
@@ -19308,13 +19310,13 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
             return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
         }
 
-        // The effect pass. Every refusal of the load is decided above, so nothing below refuses it, but an effect can
-        // still end the load after an earlier device's effects ran: the two candidate checks around each device's
-        // effects throw when the load's owner or candidate changed, and an effect's own host allocation can throw (a
-        // zone or pool that cannot be allocated falls back instead). The earlier device then keeps its configured
-        // host zones, its released stale ring and, in a late pass, the layer streaming its effects set up. The abort
-        // releases no layer streaming, and a load whose abort cleans up keeps no model token, so no model teardown
-        // releases it either: the working set stays until the next model's first weight upload on that device
+        // The effect pass. Every refusal of this early or late pass is decided above, so nothing below refuses it, but
+        // an effect can still end the load after an earlier device's effects ran: the two candidate checks around each
+        // device's effects throw when the load's owner or candidate changed, and an effect's own host allocation can
+        // throw (a zone or pool that cannot be allocated falls back instead). The earlier device then keeps its
+        // configured host zones, its released stale ring and, in a late pass, the layer streaming its effects set up.
+        // The abort releases no layer streaming, and a load whose abort cleans up keeps no model token, so no model
+        // teardown releases it either: the working set stays until the next model's first weight upload on that device
         // displaces it (register_host_ptr), or until the process exits. A load whose abort fails keeps its token, and
         // the teardown of that token releases the working set by owner.
         if (early) {

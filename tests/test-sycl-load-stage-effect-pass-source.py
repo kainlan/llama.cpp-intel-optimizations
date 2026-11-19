@@ -1,9 +1,11 @@
 """Source contract for the load stage's two passes: every refusal is decided before the stage's effects run.
 
 ggml_backend_sycl_stage_load_inventory_plan plans every device first (the decide pass) and configures a device's host
-zones, sets up its layer streaming and releases its stale ring only after the last refusal of the load is decided (the
-effect pass). A load refused on any device therefore runs none of those effects, and the rollback guard's abort puts
-back what the decide pass published. The decide pass still changes a device in the planner's zone decision: the entry
+zones, sets up its layer streaming and releases its stale ring only after the last refusal of the pass is decided (the
+effect pass). A load runs the stage twice, an early pass and then a late one, and the early pass's effect step runs
+before the late pass decides. A pass refused on any device therefore runs none of its own effects, and a load refused in
+its late pass has already run its early pass's effect, the stale ring's release. The rollback guard's abort puts back
+what the decide pass published. The decide pass still changes a device in the planner's zone decision: the entry
 ensure's last resort below releases a ring, and an arena nothing holds may be rebuilt for the plan's zones, which a
 refused load keeps (or no arena, after a failed reserve). These checks pin the rest:
 
@@ -15,12 +17,12 @@ populate keeps the planned KV-zone flag write, which the abort of a refused load
 
 The planner entries run none of the stage's effects (layer streaming, host zones, the stale ring's release); the one
 ring release they can reach is the entry ensure's last resort above. Layer streaming's build_layer_map,
-register_host_ptr and allocate_buffers, and the stale KV-zone ring's release, run only in the effect step
-(ggml_sycl_run_inventory_effects for a late pass, ggml_sycl_run_early_inventory_effect for an early one, both through
-ggml_sycl_release_stale_kv_zone_ring), and the stage configures the host zones after them. The late entry hands what
-it decided back in a ggml_sycl_inventory_effects record that carries its own copy of the streamed inventory;
-no record lives outside a function. Each effect helper takes g_tensor_inventory_mutex for its own work and the stage
-never takes it, so the stage provisions its retained snapshots outside the inventory lock.
+register_host_ptr and allocate_buffers, and the stale KV-zone ring's release, run within the stage only in the effect
+step (ggml_sycl_run_inventory_effects for a late pass, ggml_sycl_run_early_inventory_effect for an early one, both
+through ggml_sycl_release_stale_kv_zone_ring), and the stage configures the host zones after them. The late entry hands
+what it decided back in a ggml_sycl_inventory_effects record that carries its own copy of the streamed inventory; no
+record lives outside a function. Each effect helper takes g_tensor_inventory_mutex for its own work and the stage never
+takes it, so the stage provisions its retained snapshots outside the inventory lock.
 
 In the stage, the decide loop runs no effect, and the per-device test failure sits inside it, so a failure after the
 first device runs no effect for it. Every PLAN_REJECTED and EFFECT_FAILED return of the stage comes before its first
@@ -393,7 +395,7 @@ def test_witness_record_at_file_scope():
 
 def test_stage_decides_every_refusal_before_any_effect():
     assert claim_stage_decides_every_refusal_before_any_effect(GS), (
-        "the stage changes a device before every refusal of the load is decided (an effect in the decide loop, a "
+        "the stage changes a device before every refusal of the pass is decided (an effect in the decide loop, a "
         "refusal after the first effect, or the per-device test failure outside the decide loop)")
 
 

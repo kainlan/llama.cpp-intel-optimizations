@@ -1051,19 +1051,20 @@ arm_result arm_e_held_arena_refuses_the_load() {
     return settle();
 }
 
-// (f) A refused load keeps the PP MoE ring a live context left in the shared KV zone, and the ring's KV-zone flags. The
-// ring outlives the context that sized it, and a load releases a ring that still holds KV-zone bytes in the stage's
-// effect step, after every refusal of the load. The one release before them is the entry ensure's last resort, taken
-// only when the ring's slot buffers are the only holders of an arena whose zones must grow (arm (h)): a load refused in
-// its decide step must leave any other ring, which a live context may still use. Device 0 gets a one-slot ring of
-// 1 MiB slots whose activation and output slots are planned in the KV zone, and a 4 KiB RUNTIME-zone allocation beside
-// it, so the ring is never the arena's only holder and the entry ensure has no last resort to take. A load whose ring
-// weight slot is 256 MiB larger than the RUNTIME zone is then staged early and ended uncommitted.
+// (f) A load refused in its early pass keeps the PP MoE ring a live context left in the shared KV zone, and the ring's
+// KV-zone flags. The ring outlives the context that sized it, and a load releases a ring that still holds KV-zone bytes
+// in the stage's effect step, after every refusal of the pass. The one release in a decide step is the entry ensure's
+// last resort, taken only when the ring's slot buffers are the only holders of an arena whose zones must grow
+// (arm (h)): a load refused in its decide step must leave any other ring, which a live context may still use.
+// Device 0 gets a one-slot ring of 1 MiB slots whose activation and output slots are planned in the KV zone, and a
+// 4 KiB RUNTIME-zone allocation beside it, so the ring is never the arena's only holder and the entry ensure has no
+// last resort to take. A load whose ring weight slot is 256 MiB larger than the RUNTIME zone is then staged early and
+// ended uncommitted.
 // Engagement: the ring was reserved and holds KV-zone bytes, the allocation landed in the RUNTIME zone, and the stage
 // returned PLAN_REJECTED.
 // Mutant: the ring released where the load's planning state is reset, before the planner's refusals (the ring's
 // KV-zone bytes read 0 after the refused stage, and the release line is logged).
-arm_result arm_f_refused_load_keeps_the_kv_zone_ring() {
+arm_result arm_f_early_refusal_keeps_the_kv_zone_ring() {
     arm_result      r;
     unified_cache * cache = get_unified_cache_for_device(0);
     if (cache == nullptr || !cache->arena_active()) {
@@ -1170,16 +1171,18 @@ arm_result arm_f_refused_load_keeps_the_kv_zone_ring() {
 // a later load must grow; the entry ensure then releases the ring as its last resort and asks for the zones again,
 // where any other holder refuses the load. Device 0 gets arm (f)'s one-slot ring of 1 MiB slots with nothing beside it,
 // and the load arm (f) stages (a ring weight slot 256 MiB larger than the RUNTIME zone) is staged early. Between the
-// last resort's release line and device 0's plan line, which ends that device's planning before the next device's
-// begins, the stage must rebuild the arena once, to a RUNTIME zone at least the one its refused first ask needed. The
-// arm's own ensure inside the open load must then get the zones too, and may rebuild once more: the plan publishes
-// terms after the entry ensure sized the zones (the MoE control and host scatter terms), and the next ensure of a load
-// takes them in, as in every load. The load is then ended uncommitted. The rebuilt arena stays, as it does after any
-// refused or uncommitted load, so this arm runs after every arm that reads device 0's arena as found.
+// last resort's release line and device 0's first plan line, which device 0 logs after its entry ensure and before any
+// other device's planning starts, the stage must rebuild the arena once, to a RUNTIME zone at least the one its refused
+// first ask needed. The arm's own ensure inside the open load must then get the zones too, and may rebuild once more:
+// the plan publishes terms after the entry ensure sized the zones (the MoE control and host scatter terms), and the
+// next ensure of a load takes them in, as in every load. The load is then ended uncommitted. The rebuilt arena stays,
+// as it does after any refused or uncommitted load, so this arm runs after every arm that reads device 0's arena as
+// found. The arm is written for the registered environment, where GGML_SYCL_MOE_MULTI_GPU is unset: with it set to 1
+// the plan line names device -1, and the window would run to the end of the log.
 // Engagement: device 0's zones held no byte and its chunks no lease before the ring, and the ring added live bytes; a
-// stage that refused before any release for a cause this arm does not set up (another holder, another device), or for
-// a reserve the device could not make, is VOID. A refusal that names only the ring as the holder of device 0's arena,
-// and any other refusal of device 0 after the last resort's release, is a FAIL.
+// stage that refused another device, or refused device 0 before any release for a cause this arm does not set up, or
+// for a reserve the device could not make, is VOID. A refusal that names only the ring as the holder of device 0's
+// arena, and any other refusal of device 0 after the last resort's release, is a FAIL.
 // Mutants: no last resort (the stage refuses device 0 with only the ring holding it); the release not followed by a
 // second ask for the zones (the stage logs no rebuild after the release, and refuses the load if the ask's answer was
 // the refusal); the ring released twice (two release lines).
@@ -1282,7 +1285,7 @@ arm_result arm_h_load_releases_a_lone_ring() {
         }
     }
     // The RUNTIME zone the refused first ask needed ("need ... runtime=<MB>"), from its last held line before the
-    // release, and the stage's own rebuilds after the release, up to device 0's plan line.
+    // release, and the stage's own rebuilds after the release, up to device 0's first plan line.
     double need_runtime = -1.0;
     for (size_t i = 0; i < from; ++i) {
         if (has(log[i], held_line)) {
@@ -1520,7 +1523,7 @@ int main() {
         { "(c) a dry run stores nothing and leaves no trace",    arm_c_a_dry_run_stores_nothing                   },
         { "(d) --mem-available is the sample's MemAvailable",    arm_d_mem_available_option_is_the_sample         },
         { "(e) a load the held arena cannot hold is refused",    arm_e_held_arena_refuses_the_load                },
-        { "(f) a refused load keeps the KV-zone ring",           arm_f_refused_load_keeps_the_kv_zone_ring        },
+        { "(f) a load refused early keeps the KV-zone ring",     arm_f_early_refusal_keeps_the_kv_zone_ring       },
         { "(h) a load releases a ring alone holding the arena",  arm_h_load_releases_a_lone_ring                  },
         { "(g) a refused late pass configures no host zone",     arm_g_refused_late_pass_configures_no_host_zones },
     };

@@ -4708,13 +4708,14 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
-# Source gate for the load stage's two passes: every device plans and every refusal of the load is decided before the
-# stage's effects (layer streaming, host zones, the stale ring's release), so a load refused on any device runs none of
-# them; its zone decision may still rebuild an arena nothing holds, which a refused load keeps. The decide pass
-# releases the PP MoE ring only at the entry ensure, when the ring alone
-# holds an arena that must grow; each device's effects run from its own snapshot under the last device's candidate
-# check; the replaced candidates' leases outlive the effects; a refused arena teardown reserves nothing. Host-only,
-# reads the sources as text. Same registration shape as test-sycl-load-zone-refusal-source above.
+# Source gate for the load stage's two passes: every device plans and every refusal of the pass is decided before the
+# stage's effects (layer streaming, host zones, the stale ring's release), so a pass refused on any device runs none of
+# them, while a load refused in its late pass has run its early pass's effect, the stale ring's release; its zone
+# decision may still rebuild an arena nothing holds, which a refused load keeps. The decide pass releases the PP MoE
+# ring only at the entry ensure, when the ring alone holds an arena that must grow; each device's effects run from its
+# own snapshot under the last device's candidate check; the replaced candidates' leases outlive the effects; a refused
+# arena teardown reserves nothing. Host-only, reads the sources as text. Same registration shape as
+# test-sycl-load-zone-refusal-source above.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-load-stage-effect-pass-source

@@ -2729,33 +2729,37 @@ facts differ across a model load. The arena and the physical ring outlive a
 model, and a load resets the planned placement to RUNTIME. So a load releases a
 ring that still holds KV-zone bytes, because the reserve's "already sufficient"
 path would otherwise keep it. The release is an effect of the load stage
-(`ggml_sycl_release_stale_kv_zone_ring()`): it runs only after every refusal of
-the pass is decided, so a load refused in its decide pass does not release the
-ring this way (the entry ensure's last resort, below, is the one release that
-comes before the last refusal). A slot claimed by an in-flight dispatch refuses
-that release, and it is never forced. The ring is then kept, KV still counts
-what it holds, and the next re-fit re-admits it.
+(`ggml_sycl_release_stale_kv_zone_ring()`). A load runs the stage twice, an
+early pass and then a late one, and within each the release runs only after
+every refusal of that pass is decided: a pass refused before its effects does
+not release the ring this way. The early pass's effects run before the late pass
+decides, so a load refused in its late pass may already have released the ring
+in its early pass. The entry ensure's last resort, below, is the one release a
+pass makes before its last refusal. A slot claimed by an in-flight dispatch
+refuses that release, and it is never forced. The ring is then kept, KV still
+counts what it holds, and the next re-fit re-admits it.
 
 **The load stage's two passes.** `ggml_backend_sycl_stage_load_inventory_plan()`
 plans every device first. It configures a device's host zones, sets up its layer
-streaming and releases its stale ring only after the last refusal of the load is
-decided. The decide pass publishes planning state, which the abort of a refused
-load puts back, together with the two-card MoE flag its planner sets
-(`g_moe_multi_gpu_active`). The decide pass is not free of device effects. The
-planner's zone decision sizes the VRAM arena's zones, and it may rebuild an
-arena nothing holds for larger zones, at the entry ensure or at the
-micro-batch's grow leg. A refused load keeps the rebuilt arena, or leaves the
-device with no arena when the reserve after the teardown failed. A plan that
-needs the secondary MoE devices also creates their shared queues and caches,
-which stay. The effect pass then runs, device by device and each from the
-snapshot that device staged: the stale ring's release, the layer streaming the
-late pass decided on, and the late pass's host zones
+streaming and releases its stale ring only after the last refusal of the pass,
+early or late, is decided, so an early pass's effect (the stale ring's release)
+comes before any refusal of the late pass. The decide pass publishes planning
+state, which the abort of a refused load puts back, together with the two-card
+MoE flag its planner sets (`g_moe_multi_gpu_active`). The decide pass is not
+free of device effects. The planner's zone decision sizes the VRAM arena's
+zones, and it may rebuild an arena nothing holds for larger zones, at the entry
+ensure or at the micro-batch's grow leg. A refused load keeps the rebuilt arena,
+or leaves the device with no arena when the reserve after the teardown failed. A
+plan that needs the secondary MoE devices also creates their shared queues and
+caches, which stay. The effect pass then runs, device by device and each from
+the snapshot that device staged: the stale ring's release, the layer streaming
+the late pass decided on, and the late pass's host zones
 (`ggml_sycl_configure_host_zones_for_plan()`). A load refused in its decide pass
 therefore configures no device's host zones, which a later load configures from
 its own plan. An effect can still end a load after an earlier device's effects
-ran. The two candidate checks around each device's effects throw when the
-load's owner or candidate changed, and an effect's own host allocation can throw
-(a zone or pool that cannot be allocated falls back instead). The earlier device
+ran. The two candidate checks around each device's effects throw when the load's
+owner or candidate changed, and an effect's own host allocation can throw (a
+zone or pool that cannot be allocated falls back instead). The earlier device
 then keeps its configured host zones, its released stale ring and, in a late
 pass, the layer streaming its effects set up. The abort releases no layer
 streaming, and a load whose abort cleans up keeps no model token, so no model
@@ -2776,9 +2780,9 @@ release, and the load is refused as for any holder. A claim outlives its
 prefill: it is let go when a later prefill takes that slot, when a context on
 the device is freed (its backend drains the device's slots), or when it is
 released unused. A context therefore loses the ring only while no claim on its
-slots is held: before its first completed claim, when every claim was released
-unused, or after a context on the device was freed. It reserves the ring again
-at its next dispatch; that is the accepted cost of the last resort.
+slots is held: before its first claim, when every claim was released unused, or
+after a context on the device was freed. It reserves the ring again at its next
+dispatch; that is the accepted cost of the last resort.
 
 The release rests on the premise's precondition: no zone holds a live byte
 beside the ring, so no context with weights or KV on that device can be
@@ -2945,11 +2949,11 @@ The arena can fail to grow for three reasons, and each prints its own line first
   `pp_moe_ring_slots` counts the PP MoE ring's slot buffers among the cache's
   scratch in the arena, and `live_beside_ring` the zone allocations that are not
   those slots, read from each allocator group's own record. When the ring's
-  slots are the only holders (no other scratch, nothing beside the ring, no chunk
-  lease), a model load's entry ensure releases the ring after these lines and
-  asks for the zones again, with a WARN that says so; a ring while a prefill's
-  claim on one of its slots is still held is kept, with a WARN that says so, and
-  the load is refused as for any holder.
+  slots are the only holders (no other scratch, nothing beside the ring, no
+  chunk lease), a model load's entry ensure releases the ring after these lines
+  and asks for the zones again, with a WARN that says so; the ring is kept while
+  a prefill's claim on one of its slots is still held, with a WARN that says so,
+  and the load is refused as for any holder.
 
   The sites are `weight_snapshot`, `weight_resolve`, `chunk_view` (a handle made
   from a raw pointer for one use), `tensor_extra`, `expert_dispatch` and
@@ -3045,14 +3049,14 @@ the arena's only holders and no prefill's claim on one of its slots is held. A
 held claim keeps it, and the line then reads `Only the cache's PP MoE ring holds
 it, and a prefill's claim on one of its slots keeps it: the claim outlives its
 prefill until a context on device <D> is freed. Free the context that ran the
-prefill, then load this one again`. Live bytes are a model's or a context's only when the cache
-has no release of its own still to run: a free queued in the arena, a release
-waiting for a retry, a retired entry not yet finalized and an eviction in flight
-all keep zone bytes with no owner left. The refusal carries those four counts,
-read where the ERROR line above prints them, and with any of them the remedy
-reads `Some of those bytes may be releases the cache has not finished (<counts>),
-which it finishes on its own. Load this one again; if it is refused with the
-same bytes, free the model or context they belong to`.
+prefill, then load this one again`. Live bytes are a model's or a context's only
+when the cache has no release of its own still to run: a free queued in the
+arena, a release waiting for a retry, a retired entry not yet finalized and an
+eviction in flight all keep zone bytes with no owner left. The refusal carries
+those four counts, read where the ERROR line above prints them, and with any of
+them the remedy reads `Some of those bytes may be releases the cache has not
+finished (<counts>), which it finishes on its own. Load this one again; if it is
+refused with the same bytes, free the model or context they belong to`.
 
 When the arena could be rebuilt but the reserve failed (the tail chunk's cap),
 the reason reads `the device could not reserve an arena with these zones. Free
