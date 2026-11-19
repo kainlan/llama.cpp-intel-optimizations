@@ -1114,6 +1114,23 @@ struct placement_lazy_table {
     size_t         cache_floor_slots   = 0;
 };
 
+// One immutable Q1_0/NVFP4 host expert recipe's shape: what its CPU workspace scales with. K is the input width, N the
+// output width, q8_row_bytes one activation row in the recipe's vec-dot type.
+struct moe_host_recipe_shape {
+    int64_t K            = 0;
+    int64_t N            = 0;
+    size_t  q8_row_bytes = 0;
+};
+
+// The CPU workspace the immutable Q1_0/NVFP4 host recipes need for a micro-batch of n_tokens: the largest
+// plan_moe_host_workspace() total over `shapes` at one row per token, the rows the executor's own request carries
+// (ggml_sycl_build_moe_resolved_batch: count / slots_per_token). 0 for no shapes or no tokens. Returns false, and
+// leaves *out untouched when it is not null, for a null `out`, for a shape whose K, N or q8_row_bytes is not positive
+// (at any token count, 0 included) and on an overflow.
+bool placement_moe_host_recipe_workspace_bytes_at(const std::vector<moe_host_recipe_shape> & shapes,
+                                                  uint32_t                                   n_tokens,
+                                                  size_t *                                   out);
+
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
 struct placement_plan {
@@ -1261,6 +1278,16 @@ struct placement_plan {
     // smart-handle scoped ownership and routes to host SCRATCH.
     size_t   moe_cpu_expert_staging_bytes        = 0;  // Zone: SCRATCH (host pinned)
     size_t   moe_host_recipe_workspace_bytes     = 0;  // Zone: SCRATCH (host pinned)
+
+    // The immutable Q1_0/NVFP4 host recipes' distinct shapes, from the inventory. The load sets
+    // moe_host_recipe_workspace_bytes to placement_moe_host_recipe_workspace_bytes_at() of these at its planning
+    // micro-batch, or SIZE_MAX when that overflows. A context's runtime transaction re-sizes it at the context's
+    // micro-batch and never lowers a finite figure, so in a published plan it is the largest figure the load or any
+    // context of this model has asked for. The shapes stay on the plan so that the workspace can be sized by the same
+    // rule at another micro-batch. Blank lines around it keep its longer type out of the size_t block's alignment
+    // column.
+    std::vector<moe_host_recipe_shape> moe_host_recipe_shapes;
+
     // Expert bias D2H copy: float bias tensors staged to host for gate computation.
     size_t   expert_bias_bytes                   = 0;  // Zone: STAGING (host pinned)
     // MoE routing: per-batch expert ID control buffer (n_expert * max_batch_tokens * sizeof(int32_t)).

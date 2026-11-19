@@ -2,6 +2,7 @@
 #include "ggml-sycl/cpu-traits-support.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
+#include "ggml-sycl/unified-cache.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -799,6 +800,105 @@ static bool test_recipe_matrix_workspace_and_immutability() {
     return true;
 }
 
+static bool test_recipe_workspace_follows_the_planned_micro_batch() {
+    using namespace ggml_sycl;
+    const auto * traits = ggml_sycl_get_type_traits_cpu(GGML_TYPE_NVFP4);
+    CHECK(traits && traits->vec_dot);
+    const size_t q8_row_bytes = ggml_row_size(traits->vec_dot_type, 64);
+
+    // The planner: one NVFP4 routed expert tensor. The workspace is one micro-batch of tokens, the micro-batch the
+    // plan is built for, never top-k times a fixed 512.
+    std::vector<placement_tensor_info> inventory;
+    placement_tensor_info              item;
+    item.name  = "blk.0.ffn_up_exps.weight";
+    item.type  = GGML_TYPE_NVFP4;
+    item.ne[0] = 64;
+    item.ne[1] = 64;
+    item.ne[2] = 1;
+    item.ne[3] = 1;
+    item.size  = ggml_row_size(GGML_TYPE_NVFP4, item.ne[0]) * static_cast<size_t>(item.ne[1]);
+    inventory.push_back(item);
+    const std::vector<device_budget> devices = {
+        { 0, 1, 1 }
+    };
+    size_t previous = 0;
+    for (uint32_t n_ubatch : { 512u, 2048u }) {
+        placement_kv_info kv{};
+        kv.n_ctx                  = 4096;
+        kv.n_ubatch               = n_ubatch;
+        kv.n_expert_used          = 8;
+        const placement_plan plan = compute_multi_device_plan(devices, inventory, 1, multi_gpu_mode::HYBRID, kv,
+                                                              nullptr, 1, host_ledger_budget());
+        moe_route_request    request{ moe_route_phase::PROMPT, 64, 64, n_ubatch, GGML_TYPE_NVFP4, 0 };
+        moe_workspace_recipe expected;
+        CHECK(plan_moe_host_workspace(request, q8_row_bytes, sizeof(size_t) * 4, &expected));
+        CHECK(plan.moe_host_recipe_workspace_bytes == expected.total_bytes);
+        CHECK(plan.moe_host_recipe_workspace_bytes > previous);
+        previous = plan.moe_host_recipe_workspace_bytes;
+    }
+
+    // The rule: one row per token, the largest shape wins in either order, nothing for no tokens or no shapes, and
+    // an overflow is refused without writing the answer.
+    const std::vector<moe_host_recipe_shape> wide_last = {
+        { 64, 64,  q8_row_bytes },
+        { 64, 128, q8_row_bytes }
+    };
+    const std::vector<moe_host_recipe_shape> wide_first = {
+        { 64, 128, q8_row_bytes },
+        { 64, 64,  q8_row_bytes }
+    };
+    size_t bytes = 1;
+    CHECK(placement_moe_host_recipe_workspace_bytes_at(wide_last, 0, &bytes) && bytes == 0);
+    bytes = 1;
+    CHECK(placement_moe_host_recipe_workspace_bytes_at({}, 512, &bytes) && bytes == 0);
+    for (uint32_t n_tokens : { 1u, 512u, 513u, 2048u, 4096u }) {
+        moe_route_request    wide_request{ moe_route_phase::PROMPT, 64, 128, n_tokens, GGML_TYPE_NVFP4, 0 };
+        moe_workspace_recipe wide;
+        CHECK(plan_moe_host_workspace(wide_request, q8_row_bytes, sizeof(size_t) * 4, &wide));
+        CHECK(placement_moe_host_recipe_workspace_bytes_at(wide_last, n_tokens, &bytes));
+        CHECK(bytes == wide.total_bytes);
+        size_t bytes_wide_first = 0;
+        CHECK(placement_moe_host_recipe_workspace_bytes_at(wide_first, n_tokens, &bytes_wide_first));
+        CHECK(bytes_wide_first == wide.total_bytes);
+    }
+
+    // One figure built by hand, not by plan_moe_host_workspace(): a 64x64 shape at 512 tokens. NVFP4's vec-dot type
+    // is Q8_0, 34 bytes per 32 values, so one 64-wide activation row is 68 bytes. The regions, each starting on a
+    // 64-byte boundary: f32 activations 512 x 64 x 4 = 131072, Q8_0 activations 512 x 68 = 34816 (ends at 165888 =
+    // 2592 x 64), f32 output 512 x 64 x 4 = 131072 (ends at 296960 = 4640 x 64), descriptors 512 x 4 x 8 = 16384.
+    // No padding is needed, so the total is 313344.
+    const std::vector<moe_host_recipe_shape> square = {
+        { 64, 64, q8_row_bytes }
+    };
+    CHECK(q8_row_bytes == 68);
+    CHECK(placement_moe_host_recipe_workspace_bytes_at(square, 512, &bytes) && bytes == 313344);
+    size_t bytes_1024 = 0;
+    CHECK(placement_moe_host_recipe_workspace_bytes_at(square, 1024, &bytes_1024) && bytes_1024 > bytes);
+
+    const std::vector<moe_host_recipe_shape> huge = {
+        { INT64_MAX / 2, 64, q8_row_bytes }
+    };
+    bytes = 7;
+    CHECK(!placement_moe_host_recipe_workspace_bytes_at(huge, 4096, &bytes) && bytes == 7);
+
+    // A bad input is refused at every token count, 0 included, and leaves the answer unwritten.
+    CHECK(!placement_moe_host_recipe_workspace_bytes_at(square, 512, nullptr));
+    CHECK(!placement_moe_host_recipe_workspace_bytes_at(square, 0, nullptr));
+    const std::vector<moe_host_recipe_shape> bad_shapes[] = {
+        { { 0, 64, q8_row_bytes } },
+        { { 64, -1, q8_row_bytes } },
+        { { 64, 64, 0 } },
+        { { 64, 64, q8_row_bytes }, { -64, 64, q8_row_bytes } },
+    };
+    for (const std::vector<moe_host_recipe_shape> & bad : bad_shapes) {
+        for (uint32_t n_tokens : { 0u, 1u, 512u }) {
+            bytes = 7;
+            CHECK(!placement_moe_host_recipe_workspace_bytes_at(bad, n_tokens, &bytes) && bytes == 7);
+        }
+    }
+    return true;
+}
+
 static bool test_numerical_q1_nvfp4_host_executor() {
     using namespace ggml_sycl;
     int identity = 200;
@@ -1016,7 +1116,8 @@ int main() {
         !test_prompt_local_view_uses_exact_retained_handles() ||
         !test_planned_prompt_hybrid_identity_readiness_and_layout_miss() ||
         !test_retained_role_alignment_and_terminal_transaction() || !test_recipe_matrix_workspace_and_immutability() ||
-        !test_numerical_q1_nvfp4_host_executor() || !test_decode_admission_is_route_mode_independent()) {
+        !test_recipe_workspace_follows_the_planned_micro_batch() || !test_numerical_q1_nvfp4_host_executor() ||
+        !test_decode_admission_is_route_mode_independent()) {
         return 1;
     }
     if (!test_staged_ring_route_contract() || !test_admission_entry_reuse_is_graph_keyed_for_staged_bundles()) {

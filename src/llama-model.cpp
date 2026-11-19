@@ -2893,6 +2893,46 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
         }
+
+        // The loop above asks for a sidecar only when its weight was loaded. The MTP block's weights are skipped
+        // (by the caller's choice, or always by some architectures), so their pointers are null and its sidecars,
+        // which are in the file, would never be counted and done_getting_tensors() would find the count short.
+        // Skip them with their weights: a sidecar of a loaded weight is never asked for here. A virtual load has no
+        // file and ignores TENSOR_SKIP, so it would build an orphan tensor for each ask; TENSOR_SKIP_IF_VIRTUAL
+        // makes it return nullptr there, as before.
+        const auto skip_scales = [&](int il, llm_tensor tensor, const ggml_tensor * weight, int64_t n) {
+            if (weight == nullptr) {
+                const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP | TENSOR_SKIP_IF_VIRTUAL;
+                create_tensor(tn(tensor, "scale",       il), {n}, skip);
+                create_tensor(tn(tensor, "input_scale", il), {n}, skip);
+            }
+        };
+        for (int i = hparams.n_layer(); i < n_layer_all; ++i) {
+            const auto & layer = layers[i];
+
+            skip_scales(i, LLM_TENSOR_ATTN_Q,                 layer.wq,                     1);
+            skip_scales(i, LLM_TENSOR_ATTN_K,                 layer.wk,                     1);
+            skip_scales(i, LLM_TENSOR_ATTN_V,                 layer.wv,                     1);
+            skip_scales(i, LLM_TENSOR_ATTN_OUT,               layer.wo,                     1);
+            skip_scales(i, LLM_TENSOR_ATTN_QKV,               layer.wqkv,                   1);
+            skip_scales(i, LLM_TENSOR_ATTN_GATE,              layer.wqkv_gate,              1);
+            skip_scales(i, LLM_TENSOR_FFN_GATE,               layer.ffn_gate,               1);
+            skip_scales(i, LLM_TENSOR_FFN_DOWN,               layer.ffn_down,               1);
+            skip_scales(i, LLM_TENSOR_FFN_UP,                 layer.ffn_up,                 1);
+            skip_scales(i, LLM_TENSOR_FFN_GATE_SHEXP,         layer.ffn_gate_shexp,         1);
+            skip_scales(i, LLM_TENSOR_FFN_DOWN_SHEXP,         layer.ffn_down_shexp,         1);
+            skip_scales(i, LLM_TENSOR_FFN_UP_SHEXP,           layer.ffn_up_shexp,           1);
+            skip_scales(i, LLM_TENSOR_FFN_GATE_EXPS,          layer.ffn_gate_exps,          n_expert);
+            skip_scales(i, LLM_TENSOR_FFN_DOWN_EXPS,          layer.ffn_down_exps,          n_expert);
+            skip_scales(i, LLM_TENSOR_FFN_UP_EXPS,            layer.ffn_up_exps,            n_expert);
+            skip_scales(i, LLM_TENSOR_SSM_IN,                 layer.ssm_in,                 1);
+            skip_scales(i, LLM_TENSOR_SSM_OUT,                layer.ssm_out,                1);
+            skip_scales(i, LLM_TENSOR_SSM_ALPHA,              layer.ssm_alpha,              1);
+            skip_scales(i, LLM_TENSOR_SSM_BETA,               layer.ssm_beta,               1);
+            skip_scales(i, LLM_TENSOR_NEXTN_EH_PROJ,          layer.nextn.eh_proj,          1);
+            skip_scales(i, LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, layer.nextn.shared_head_head, 1);
+        }
+
         // output scales
         if (output && output->type == GGML_TYPE_NVFP4) {
             // weight scale
