@@ -17806,7 +17806,7 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // from it, so every slot starts there. Only a runtime-context transaction
     // places slots in the shared KV zone (ggml_sycl_replan_pp_moe_onednn_ring()).
     // The physical ring a previous context left with slots there is not released
-    // here: this is a decide step, and a load refused after it must leave the ring
+    // here: this is a decide step, and a pass refused after it must leave the ring
     // a live context may still use. The stage releases a stale ring in its effect
     // step (ggml_sycl_release_stale_kv_zone_ring), after every refusal of the pass.
     // The one release a decide step makes is the entry ensure's last resort

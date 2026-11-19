@@ -1055,7 +1055,7 @@ arm_result arm_e_held_arena_refuses_the_load() {
 // KV-zone flags. The ring outlives the context that sized it, and a load releases a ring that still holds KV-zone bytes
 // in the stage's effect step, after every refusal of the pass. The one release in a decide step is the entry ensure's
 // last resort, taken only when the ring's slot buffers are the only holders of an arena whose zones must grow
-// (arm (h)): a load refused in its decide step must leave any other ring, which a live context may still use.
+// (arm (h)): a load refused in its early pass must leave any other ring, which a live context may still use.
 // Device 0 gets a one-slot ring of 1 MiB slots whose activation and output slots are planned in the KV zone, and a
 // 4 KiB RUNTIME-zone allocation beside it, so the ring is never the arena's only holder and the entry ensure has no
 // last resort to take. A load whose ring weight slot is 256 MiB larger than the RUNTIME zone is then staged early and

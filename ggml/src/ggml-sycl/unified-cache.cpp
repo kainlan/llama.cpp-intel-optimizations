@@ -25578,10 +25578,11 @@ void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue) {
     return ptr;
 }
 
-// A pinned host size past the host's RAM is refused here, before the driver, as a failed allocation: the driver does
-// not fail such a request, its memory manager aborts the process on a size it cannot describe, and no catch reaches an
-// abort. The callers' own failure lines then name the size. The device exit needs no such bound: the driver fails a
-// device request past the device's physical memory.
+// A pinned host size past the host's RAM is refused here, before the driver, as a failed allocation, because the
+// driver does not always fail such a request: at 1 PiB its memory manager aborted the process, and no catch reaches an
+// abort. The callers' own failure lines then name the size. The device exit has no such bound: in the compute-runtime
+// source read (26.22, checkMemSizeLimit), a device request past the device's memory returns an error instead of
+// aborting.
 void * unified_cache_raw_malloc_host(size_t size, const sycl::queue & queue) {
     if (!host_pinned_size_possible(size, ggml_sycl_get_total_system_memory_bytes())) {
         return nullptr;

@@ -1914,10 +1914,10 @@ static size_t staging_lines_while_constructing(sycl::queue & q, size_t staging_s
 // A cache asked for no staging buffer, the size GGML_SYCL_HOST_STAGING_MB=0 asks for and the fixtures here pass,
 // allocates none, so it logs no failed allocation of one. A zero-byte host allocation fails, and the cache logged that
 // on every such construction. Engagement: a staging buffer of 1 PiB, past any host's RAM, is asked for first under the
-// same capture, and its failure line must be seen. The driver aborts the process on such a size instead of failing it,
-// so this also pins that the raw host exit refuses an impossible size before the driver and the cache logs the
-// failure. Mutants: the constructor asking the device for a zero-byte buffer; the raw host exit passing an impossible
-// size to the driver (the process aborts here).
+// same capture, and its failure line must be seen. The driver aborted the process on that 1 PiB request instead of
+// failing it, so this also pins that the raw host exit refuses a size past the RAM before the driver and the cache logs
+// the failure. Mutants: the constructor asking the device for a zero-byte buffer; the raw host exit passing a size past
+// the RAM to the driver (at 1 PiB the process aborted here).
 static bool cache_without_staging_allocates_none(sycl::queue & q) {
     TEST_BEGIN("cache_without_staging_allocates_none");
     TEST_ASSERT(staging_lines_while_constructing(q, 1ull << 50) >= 1,

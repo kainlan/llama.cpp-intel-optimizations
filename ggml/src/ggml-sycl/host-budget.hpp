@@ -142,9 +142,9 @@ inline std::string host_headroom_refusal_reason(bool exhausted, size_t available
 }
 
 // Whether a pinned host allocation of `size` bytes can exist on a host with `physical` bytes of RAM. One larger than
-// the RAM never can, and the driver does not fail such a request: its memory manager aborts the process on a size it
-// cannot describe, and no catch reaches an abort. The raw host exit asks this first and fails the allocation instead.
-// An unknown RAM size (0) bounds nothing.
+// the RAM never can, so refusing it loses nothing. The driver does not always fail such a request: at 1 PiB its memory
+// manager aborted the process, and no catch reaches an abort. The raw host exit asks this first and fails the
+// allocation instead. An unknown RAM size (0) bounds nothing.
 inline bool host_pinned_size_possible(size_t size, size_t physical) {
 #if defined(HOST_BUDGET_MUTANT_PINNED_UNBOUNDED)
     (void) size;
