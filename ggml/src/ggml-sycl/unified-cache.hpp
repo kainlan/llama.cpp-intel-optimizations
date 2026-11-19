@@ -2705,9 +2705,9 @@ bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_
 // llama.cpp-p6i0: the load's planned compute term, the bytes the scheduler's compute buffer occupies in the RUNTIME
 // zone (zone_compute_term_bytes over the probe measure's chunks), a named RUNTIME consumer folded into
 // unified_cache_get_planned_runtime_zone_requirement() so the zone is sized for the buffer before the weight pack.
-// It is measured at the load's measure shape (n_ctx_train and ubatch 512 until fkpg (a) transports the caller's
-// -c and -ub), so it is the planned term for that shape, not for every context. moua L6 retires it into the
-// FIRST_CONTEXT head slot.
+// It is measured at the context and micro-batch the caller told the load (the training context and the auto
+// ladder's bottom rung where it told none), so it is the planned term for that shape, not for every context. moua L6
+// retires it into the FIRST_CONTEXT head slot.
 // Owner-keyed (llama.cpp-ihk6, canonical contract 12.4): `owner` is the model slot and slot generation of the load
 // that measured it, and the setter replaces that owner's term on the device. The getter answers the merge, the largest
 // term of the owners on the device. False, storing nothing, for a device out of range, an owner that is not a model
@@ -2716,11 +2716,10 @@ bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_
 bool             unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
 size_t           unified_cache_get_planned_compute_term_bytes(int device_id);
 // The micro-batch the planned compute term was measured at on the device, for the hold-spill fit to credit the term
-// at that rung only (placement_plan_compute_room). Each load records its planning micro-batch, the inventory's
-// n_ubatch, through zone_compute_term_n_ubatch_store, which documents the rule; the setter WARNs once when a store
-// turns the record off. The stored value is the measure's shape only while inventory.n_ubatch and
-// llama_auto_ubatch_ladder[0] (the measure's n_ubatch) agree; a source pin holds the two to one value. The getter
-// answers 0 for none, for a record turned off, and for a device out of range.
+// at that rung only (placement_plan_compute_room). Each load records the micro-batch it measured the term at
+// (ggml_sycl_tensor_inventory::n_ubatch_measure) through zone_compute_term_n_ubatch_store, which documents the rule;
+// the setter WARNs once when a store turns the record off. The getter answers 0 for none, for a record turned off,
+// and for a device out of range.
 void             unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch);
 uint32_t         unified_cache_get_planned_compute_term_n_ubatch(int device_id);
 // llama.cpp-p6i0: the load's planned state term, the bytes the context memory the probe measure placed on the

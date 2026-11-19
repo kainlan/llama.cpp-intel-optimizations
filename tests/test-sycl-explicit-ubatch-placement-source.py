@@ -37,8 +37,9 @@ What this gate pins:
   when two live loads disagree (with one WARN, on the compare-exchange store that turns it off) and replaced by the
   next load once no load holds a compute term, never the plan's
   planner_n_ubatch, which every runtime context transaction rewrites; and it
-  is the shape the compute term was measured at only while the inventory's literal, the auto ladder's bottom rung and
-  the load measure's n_ubatch name one value;
+  is the micro-batch the compute term was measured at: the measure's params read the resolved shape, the inventory
+  carries the same resolver's micro-batch, and the backend records that (the planning micro-batch only for a libllama
+  that sent none, which is the auto ladder's bottom rung as the shape's fallback is);
 - a load whose plan was packed against a RUNTIME zone an earlier load in the process grew says so in ONE WARN after
   its late plan, only when the live zone is larger than the zone the arena reserves for that plan, so the first load
   of a process never prints it;
@@ -172,7 +173,8 @@ PLAN_ROOM_PLANNING = ("if (n == 0 && plan.explicit_ubatch.action == pp_moe_onedn
 # compute term on the device, and lets the load's value replace the record when none holds one (`term_live`, read
 # once from the merged term); a load's early plan and late intake carry the same inventory, and the rule keeps an
 # equal value, so the repeat changes nothing. The getter reads the record.
-PLANNING_SET = "ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, inventory->n_ubatch);"
+PLANNING_SET = ("ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, "
+                "ggml_sycl_inventory_measure_n_ubatch(inventory));")
 PLANNING_SETTER_SIG = "void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch)"
 PLANNING_SETTER_RULE = "uint32_t next = zone_compute_term_n_ubatch_store(stored, n_ubatch, term_live);"
 # Whether a load still holds a term is read from the device's merged compute term, once, before the rule: a constant
@@ -189,12 +191,19 @@ PLANNING_WARN_TEXT = '"[LOAD-PLAN] device %d: this load plans its compute term a
 PLANNING_GETTER_SIG = "uint32_t unified_cache_get_planned_compute_term_n_ubatch(int device_id)"
 PLANNING_GETTER_RULE = ("return zone_compute_term_n_ubatch_read("
                         "g_planned_compute_term_n_ubatch[device_id].load(std::memory_order_acquire));")
-# The three places that must name one micro-batch: the inventory's planning shape, the auto ladder's bottom rung, and
-# the load measure that sizes the compute term from that rung.
+# The micro-batch the term was measured at: the measure's params read the resolved shape, whose fallback is the auto
+# ladder's bottom rung; the inventory carries the same resolver's micro-batch and the backend records it, falling back
+# to the inventory's planning shape, the same rung, for a libllama that sent none.
 INVENTORY_N_UBATCH_RE = re.compile(r"\binventory\.n_ubatch\s*=\s*(\d+)\s*;")
 LADDER_RE = re.compile(r"llama_auto_ubatch_ladder\[\]\s*=\s*\{\s*(\d+)\s*,")
-MEASURE_SIG = "inline llama_context_params llama_load_measure_context_params(uint32_t n_ctx, uint32_t n_ctx_train)"
-MEASURE_N_UBATCH = "params.n_ubatch = llama_auto_ubatch_ladder[0];"
+MEASURE_SIG = "inline llama_context_params llama_load_measure_context_params(const llama_load_measure_shape & shape)"
+MEASURE_N_UBATCH = "params.n_ubatch = shape.n_ubatch;"
+SHAPE_SIG = "inline llama_load_measure_shape llama_load_measure_shape_resolve(uint32_t n_ctx_hint,"
+SHAPE_FALLBACK = "const uint32_t n_ubatch = n_ubatch_hint != 0 ? n_ubatch_hint : llama_auto_ubatch_ladder[0];"
+INVENTORY_MEASURE = ("inventory.n_ubatch_measure = llama_load_measure_shape_resolve(n_ctx_hint, n_ubatch_hint, "
+                     "hparams.n_ctx_train).n_ubatch;")
+MEASURE_READER = ("static uint32_t ggml_sycl_inventory_measure_n_ubatch(const ggml_sycl_tensor_inventory * inventory) "
+                  "{ return inventory->n_ubatch_measure != 0 ? inventory->n_ubatch_measure : inventory->n_ubatch; }")
 FIT_FIELDS = "in.compute_room_n_ubatch = room_n_ubatch; in.compute_room_bytes = room_bytes;"
 FIT_DEMAND = "a.terms = ggml_sycl::zone_hold_fit_terms_at(in, q.n_ubatch);"
 FIT_DEMAND_FROM_TERMS = "a.demand = a.terms.demand;"
@@ -428,14 +437,21 @@ def claim_planning_record_warns_once(cache_cpp: str) -> bool:
             and cache.count(PLANNING_WARN_TEXT) == 1)
 
 
-def claim_planning_micro_batch_is_the_measure_shape(model_cpp: str, ladder_h: str, measure_h: str) -> bool:
-    """The recorded micro-batch is the shape the compute term was measured at only while the inventory's planning
-    micro-batch is the auto ladder's bottom rung and the load measure runs at that rung: the three name one value."""
+def claim_planning_micro_batch_is_the_measure_shape(model_cpp: str, ladder_h: str, measure_h: str,
+                                                    sycl_cpp: str = "") -> bool:
+    """The recorded micro-batch is the one the compute term was measured at: the measure's params read the shape,
+    the shape falls back to the auto ladder's bottom rung, the inventory carries the same resolver's answer, and the
+    backend records it (the planning micro-batch only for a libllama that sent none). The inventory's own planning
+    micro-batch is still the ladder's bottom rung, the fallback both sides use."""
     inv = INVENTORY_N_UBATCH_RE.findall(model_cpp)
     ladder = LADDER_RE.findall(ladder_h)
     measure = body(norm(measure_h), MEASURE_SIG)
+    shape = body(norm(measure_h), SHAPE_SIG)
     return (len(inv) == 1 and len(ladder) == 1 and inv[0] == ladder[0]
-            and bool(measure) and MEASURE_N_UBATCH in measure)
+            and bool(measure) and MEASURE_N_UBATCH in measure
+            and bool(shape) and norm(SHAPE_FALLBACK) in shape
+            and norm(INVENTORY_MEASURE) in norm(model_cpp)
+            and (not sycl_cpp or norm(MEASURE_READER) in norm(sycl_cpp)))
 
 
 def claim_grown_zone_is_announced(sycl_cpp: str, zone_cpp: str, zone_hpp: str = ZONE_HPP) -> bool:
@@ -580,7 +596,7 @@ def test_planning_record_warns_once():
 
 
 def test_planning_micro_batch_is_the_measure_shape():
-    assert claim_planning_micro_batch_is_the_measure_shape(MODEL_CPP, AUTO_UBATCH_H, MEASURE_H)
+    assert claim_planning_micro_batch_is_the_measure_shape(MODEL_CPP, AUTO_UBATCH_H, MEASURE_H, SYCL_CPP)
 
 
 def test_grown_zone_is_announced():
@@ -841,7 +857,8 @@ def test_mutant_planning_micro_batch_recorded_by_the_transaction_fails():
     txn = body(norm(SYCL_CPP), TXN_SIG)
     assert txn
     n = _once(SYCL_CPP, PLANNING_SET, "")
-    n = n.replace(txn, txn[:-1] + " " + PLANNING_SET.replace("inventory->n_ubatch", "next_kv_info.n_ubatch") + " }", 1)
+    n = n.replace(txn, txn[:-1] + " " + PLANNING_SET.replace("ggml_sycl_inventory_measure_n_ubatch(inventory)",
+                                                             "next_kv_info.n_ubatch") + " }", 1)
     assert not claim_fit_reads_the_load_planning_micro_batch(n, CACHE_CPP)
 
 
@@ -897,10 +914,26 @@ def test_mutant_planning_micro_batch_moves_apart_from_the_measure_fails(where):
         assert m
         ladder = ladder[:m.start(1)] + str(int(m.group(1)) // 2) + ladder[m.end(1):]
     else:
-        measure = re.sub(r"params\.n_ubatch(\s*)=(\s*)llama_auto_ubatch_ladder\[0\];",
-                         r"params.n_ubatch\1=\2llama_auto_ubatch_ladder[1];", measure, count=1)
+        measure = re.sub(r"n_ubatch_hint(\s*):(\s*)llama_auto_ubatch_ladder\[0\];",
+                         r"n_ubatch_hint\1:\2llama_auto_ubatch_ladder[1];", measure, count=1)
         assert measure != MEASURE_H
     assert not claim_planning_micro_batch_is_the_measure_shape(model, ladder, measure)
+
+
+@pytest.mark.parametrize("where", ["params", "inventory", "reader"])
+def test_mutant_recorded_micro_batch_not_the_measured_one_fails(where):
+    """The measure back at a fixed rung, the inventory sending the planning rung, or the backend reading the planning
+    rung over the field: each records a micro-batch the term was not measured at."""
+    model, measure, sycl = MODEL_CPP, MEASURE_H, SYCL_CPP
+    if where == "params":
+        measure = _once(MEASURE_H, MEASURE_N_UBATCH, "params.n_ubatch = llama_auto_ubatch_ladder[0];")
+    elif where == "inventory":
+        model = _once(MODEL_CPP, INVENTORY_MEASURE, "inventory.n_ubatch_measure = inventory.n_ubatch;")
+    else:
+        sycl = _once(SYCL_CPP, MEASURE_READER, MEASURE_READER.replace(
+            "inventory->n_ubatch_measure != 0 ? inventory->n_ubatch_measure : inventory->n_ubatch",
+            "inventory->n_ubatch"))
+    assert not claim_planning_micro_batch_is_the_measure_shape(model, AUTO_UBATCH_H, measure, sycl)
 
 
 def test_mutant_fit_credit_after_the_demand_fails():
