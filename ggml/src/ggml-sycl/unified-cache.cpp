@@ -35361,7 +35361,10 @@ static size_t placement_move_host_expert_backing(placement_plan &       plan,
 bool placement_moe_host_recipe_workspace_bytes_at(const std::vector<moe_host_recipe_shape> & shapes,
                                                   uint32_t                                   n_tokens,
                                                   size_t *                                   out) {
-    if (!out) {
+    // A bad input is refused whatever the token count, so the answer for it never depends on n_tokens.
+    if (!out || std::any_of(shapes.begin(), shapes.end(), [](const moe_host_recipe_shape & shape) {
+            return shape.K <= 0 || shape.N <= 0 || shape.q8_row_bytes == 0;
+        })) {
         return false;
     }
     size_t bytes = 0;
@@ -35707,15 +35710,17 @@ static void populate_host_zone_sizing(placement_plan &                          
             }
             const moe_host_recipe_shape shape{ item.ne[0], item.ne[1],
                                                ggml_row_size(traits->vec_dot_type, item.ne[0]) };
-            bool                        known = false;
-            for (const moe_host_recipe_shape & seen : plan.moe_host_recipe_shapes) {
-                known = known || (seen.K == shape.K && seen.N == shape.N && seen.q8_row_bytes == shape.q8_row_bytes);
-            }
+            const bool known = std::any_of(plan.moe_host_recipe_shapes.begin(), plan.moe_host_recipe_shapes.end(),
+                                           [&](const moe_host_recipe_shape & seen) {
+                                               return seen.K == shape.K && seen.N == shape.N &&
+                                                      seen.q8_row_bytes == shape.q8_row_bytes;
+                                           });
             if (!known) {
                 plan.moe_host_recipe_shapes.push_back(shape);
             }
         }
         const uint32_t recipe_n_ubatch = placement_load_n_ubatch(plan.planner_n_ubatch);
+        // The loop above admits only shapes with a positive K, N and row size, so a false answer here is an overflow.
         if (!placement_moe_host_recipe_workspace_bytes_at(plan.moe_host_recipe_shapes, recipe_n_ubatch,
                                                           &plan.moe_host_recipe_workspace_bytes)) {
             // A workspace that overflows cannot be planned, and SIZE_MAX never becomes a small reservation: the host
@@ -35723,8 +35728,9 @@ static void populate_host_zone_sizing(placement_plan &                          
             // moe_cpu_expert_staging_bytes, or in the zone total), rejects the plan's MMID workspaces and keeps the
             // zone at its minimum.
             plan.moe_host_recipe_workspace_bytes = SIZE_MAX;
-        }
-        if (!plan.moe_host_recipe_shapes.empty()) {
+            GGML_LOG_WARN("[SYCL-PLAN] MoE host recipe workspace overflows: %zu shape(s) at n_ubatch=%u\n",
+                          plan.moe_host_recipe_shapes.size(), recipe_n_ubatch);
+        } else if (!plan.moe_host_recipe_shapes.empty()) {
             GGML_LOG_WARN(
                 "[SYCL-PLAN] MoE host recipe workspace: %zu shape(s), %.2f MB of host SCRATCH at n_ubatch=%u\n",
                 plan.moe_host_recipe_shapes.size(), plan.moe_host_recipe_workspace_bytes / (1024.0 * 1024.0),

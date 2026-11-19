@@ -1122,8 +1122,9 @@ struct moe_host_recipe_shape {
 
 // The CPU workspace the immutable Q1_0/NVFP4 host recipes need for a micro-batch of n_tokens: the largest
 // plan_moe_host_workspace() total over `shapes` at one row per token, the rows the executor's own request carries
-// (ggml_sycl_build_moe_resolved_batch: count / slots_per_token). 0 for no shapes or no tokens. Returns false on an
-// overflow and leaves *out untouched.
+// (ggml_sycl_build_moe_resolved_batch: count / slots_per_token). 0 for no shapes or no tokens. Returns false, and
+// leaves *out untouched when it is not null, for a null `out`, for a shape whose K, N or q8_row_bytes is not positive
+// (at any token count, 0 included) and on an overflow.
 bool placement_moe_host_recipe_workspace_bytes_at(const std::vector<moe_host_recipe_shape> & shapes,
                                                   uint32_t                                   n_tokens,
                                                   size_t *                                   out);
@@ -1269,6 +1270,13 @@ struct placement_plan {
     // smart-handle scoped ownership and routes to host SCRATCH.
     size_t   moe_cpu_expert_staging_bytes        = 0;  // Zone: SCRATCH (host pinned)
     size_t   moe_host_recipe_workspace_bytes     = 0;  // Zone: SCRATCH (host pinned)
+
+    // The immutable Q1_0/NVFP4 host recipes' distinct shapes, from the inventory. moe_host_recipe_workspace_bytes is
+    // placement_moe_host_recipe_workspace_bytes_at() of these at the plan's micro-batch, or SIZE_MAX when that
+    // overflows. The shapes stay on the plan so that the workspace can be sized by the same rule at another
+    // micro-batch. Blank lines around it keep its longer type out of the size_t block's alignment column.
+    std::vector<moe_host_recipe_shape> moe_host_recipe_shapes;
+
     // Expert bias D2H copy: float bias tensors staged to host for gate computation.
     size_t   expert_bias_bytes                   = 0;  // Zone: STAGING (host pinned)
     // MoE routing: per-batch expert ID control buffer (n_expert * max_batch_tokens * sizeof(int32_t)).
@@ -1334,12 +1342,6 @@ struct placement_plan {
     // populate_host_zone_sizing. Declared outside the size_t block above so its
     // longer type does not widen that block's alignment column.
     moe_context_control_layout base_context_control_layout;
-
-    // The immutable Q1_0/NVFP4 host recipes' distinct shapes, from the inventory. moe_host_recipe_workspace_bytes is
-    // placement_moe_host_recipe_workspace_bytes_at() of these at the plan's micro-batch, or SIZE_MAX when that
-    // overflows. The shapes stay on the plan so that the workspace can be sized by the same rule at another
-    // micro-batch.
-    std::vector<moe_host_recipe_shape> moe_host_recipe_shapes;
 
     // Per-device VRAM usage (multi-device only, indexed by position in devices vector)
     std::vector<int>    devices;                  // Device IDs participating in this plan

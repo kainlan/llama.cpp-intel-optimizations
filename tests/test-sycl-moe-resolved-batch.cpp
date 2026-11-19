@@ -837,28 +837,65 @@ static bool test_recipe_workspace_follows_the_planned_micro_batch() {
         previous = plan.moe_host_recipe_workspace_bytes;
     }
 
-    // The rule: one row per token, the largest shape wins, nothing for no tokens or no shapes, and an overflow is
-    // refused without writing the answer.
-    const std::vector<moe_host_recipe_shape> shapes = {
+    // The rule: one row per token, the largest shape wins in either order, nothing for no tokens or no shapes, and
+    // an overflow is refused without writing the answer.
+    const std::vector<moe_host_recipe_shape> wide_last = {
         { 64, 64,  q8_row_bytes },
         { 64, 128, q8_row_bytes }
     };
+    const std::vector<moe_host_recipe_shape> wide_first = {
+        { 64, 128, q8_row_bytes },
+        { 64, 64,  q8_row_bytes }
+    };
     size_t bytes = 1;
-    CHECK(placement_moe_host_recipe_workspace_bytes_at(shapes, 0, &bytes) && bytes == 0);
+    CHECK(placement_moe_host_recipe_workspace_bytes_at(wide_last, 0, &bytes) && bytes == 0);
     bytes = 1;
     CHECK(placement_moe_host_recipe_workspace_bytes_at({}, 512, &bytes) && bytes == 0);
     for (uint32_t n_tokens : { 1u, 512u, 513u, 2048u, 4096u }) {
         moe_route_request    wide_request{ moe_route_phase::PROMPT, 64, 128, n_tokens, GGML_TYPE_NVFP4, 0 };
         moe_workspace_recipe wide;
         CHECK(plan_moe_host_workspace(wide_request, q8_row_bytes, sizeof(size_t) * 4, &wide));
-        CHECK(placement_moe_host_recipe_workspace_bytes_at(shapes, n_tokens, &bytes));
+        CHECK(placement_moe_host_recipe_workspace_bytes_at(wide_last, n_tokens, &bytes));
         CHECK(bytes == wide.total_bytes);
+        size_t bytes_wide_first = 0;
+        CHECK(placement_moe_host_recipe_workspace_bytes_at(wide_first, n_tokens, &bytes_wide_first));
+        CHECK(bytes_wide_first == wide.total_bytes);
     }
+
+    // One figure built by hand, not by plan_moe_host_workspace(): a 64x64 shape at 512 tokens. NVFP4's vec-dot type
+    // is Q8_0, 34 bytes per 32 values, so one 64-wide activation row is 68 bytes. The regions, each starting on a
+    // 64-byte boundary: f32 activations 512 x 64 x 4 = 131072, Q8_0 activations 512 x 68 = 34816 (ends at 165888 =
+    // 2592 x 64), f32 output 512 x 64 x 4 = 131072 (ends at 296960 = 4640 x 64), descriptors 512 x 4 x 8 = 16384.
+    // No padding is needed, so the total is 313344.
+    const std::vector<moe_host_recipe_shape> square = {
+        { 64, 64, q8_row_bytes }
+    };
+    CHECK(q8_row_bytes == 68);
+    CHECK(placement_moe_host_recipe_workspace_bytes_at(square, 512, &bytes) && bytes == 313344);
+    size_t bytes_1024 = 0;
+    CHECK(placement_moe_host_recipe_workspace_bytes_at(square, 1024, &bytes_1024) && bytes_1024 > bytes);
+
     const std::vector<moe_host_recipe_shape> huge = {
         { INT64_MAX / 2, 64, q8_row_bytes }
     };
     bytes = 7;
     CHECK(!placement_moe_host_recipe_workspace_bytes_at(huge, 4096, &bytes) && bytes == 7);
+
+    // A bad input is refused at every token count, 0 included, and leaves the answer unwritten.
+    CHECK(!placement_moe_host_recipe_workspace_bytes_at(square, 512, nullptr));
+    CHECK(!placement_moe_host_recipe_workspace_bytes_at(square, 0, nullptr));
+    const std::vector<moe_host_recipe_shape> bad_shapes[] = {
+        { { 0, 64, q8_row_bytes } },
+        { { 64, -1, q8_row_bytes } },
+        { { 64, 64, 0 } },
+        { { 64, 64, q8_row_bytes }, { -64, 64, q8_row_bytes } },
+    };
+    for (const std::vector<moe_host_recipe_shape> & bad : bad_shapes) {
+        for (uint32_t n_tokens : { 0u, 1u, 512u }) {
+            bytes = 7;
+            CHECK(!placement_moe_host_recipe_workspace_bytes_at(bad, n_tokens, &bytes) && bytes == 7);
+        }
+    }
     return true;
 }
 
