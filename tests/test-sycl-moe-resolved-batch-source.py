@@ -1304,9 +1304,10 @@ PRESTAGE_RECEIPT_PUSH = "if (cache->pin(layout_key, layout)) { result.pins.push_
 def prestage_receipt_violations(header: str, cache_source: str) -> list[str]:
     """prestage_routed_experts lists in its receipt only the pins it set.
 
-    A pin is a flag, not a count. Direct staging pins what it stages, so prestage can find an entry already pinned,
-    and a receipt that listed it would make the release clear a pin the op does not own. pin() answers whether the
-    call changed the flag from unset to set, and the receipt takes an entry only on that answer.
+    A pin is a flag, not a count. Other holders pin experts on the card (bulk expert staging creates its entries
+    pinned, the popularity pass pins resident experts), so prestage can find an entry already pinned, and a receipt
+    that listed it would make the release clear a pin the op does not own. pin() answers whether the call changed the
+    flag from unset to set, and the receipt takes an entry only on that answer.
     """
     failures: list[str] = []
     if not has_tokens(header, PIN_DECLARATION):
