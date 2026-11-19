@@ -370,6 +370,10 @@ struct zone_onednn_plan {
 // directly). Pure.
 zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live);
 
+// Whether two snapshots are the same in all four figures: the test a load's published record uses to tell that the
+// stored snapshot still holds what the load left in it. Pure.
+bool zone_onednn_plan_same(const zone_onednn_plan & a, const zone_onednn_plan & b);
+
 // Whether the oneDNN PP scratch is allowed to supply a dense op's f16 copies at all, as a function of the
 // GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH setting and the weight's type (llama.cpp-8ony). `env_mode` is the parsed
 // variable: negative when unset, 0 when it turns the scratch off, positive when it turns it on for every type.
@@ -574,7 +578,10 @@ struct zone_arena_sizes {
 // bytes the device's arena has when the decision refuses (have is 0 where no arena exists then). At REBUILD_HELD,
 // holders is what the decision found pointing into the arena, which the line names and chooses its remedy from. At
 // RESERVE_FAILED, released is the zones of the arena a rebuild destroyed before the reserve failed. At
-// TEARDOWN_REFUSED, teardown is why the teardown refused. Each is 0 or NONE otherwise.
+// TEARDOWN_REFUSED, teardown is why the teardown refused. Each is 0 or NONE otherwise. keep_deferred is true at
+// REBUILD_HELD when the PP MoE ring alone holds the arena, the caller asked to release it first
+// (zone_arena_ensure_options::ring_release_first), and the zones would otherwise have been kept
+// (zone_arena_shortfall_is_reservation_only): asked again without that request, they are kept.
 struct zone_arena_refusal {
     zone_arena_refusal_reason   reason = zone_arena_refusal_reason::NONE;
     int                         device = -1;
@@ -582,8 +589,64 @@ struct zone_arena_refusal {
     zone_arena_sizes            have;
     zone_arena_holders          holders;
     zone_arena_sizes            released;
-    zone_arena_teardown_refusal teardown = zone_arena_teardown_refusal::NONE;
+    zone_arena_teardown_refusal teardown      = zone_arena_teardown_refusal::NONE;
+    bool                        keep_deferred = false;
 };
+
+// How a caller asks for the arena's planned zones (unified_cache::ensure_planned_arena_zones).
+struct zone_arena_ensure_options {
+    // The caller releases the PP MoE ring and asks again when the ring alone holds an arena that must grow (the load
+    // stage's entry ensure). A rebuild after that release gives the load its whole Graph floor, and keeping a short
+    // ONEDNN zone is the fallback for a rebuild something live blocks, so while that last resort is still to come no
+    // zone is kept: the call refuses as it would without the keep and sets the refusal's keep_deferred, and the caller
+    // asks again without this option once it has released the ring or found it kept by a prefill's claim on one of
+    // its slots. Other comments that mention this wait point here for the reason.
+    bool     ring_release_first = false;
+    // The load transaction the call is part of, 0 outside a staged load. A keep of a short ONEDNN zone warns once per
+    // load transaction and device (zone_kept_onednn_warn_due), and at every keep for 0.
+    uint64_t load_txn           = 0;
+};
+
+// Whether a rebuild of the arena that something live blocks can be answered by keeping the zones as they are: SCRATCH
+// and RUNTIME hold what the plan needs, the ONEDNN zone does not, and it still holds `onednn_pair_bytes`, the pair it
+// must keep room for (zone_onednn_kept_pair_bytes). The primitive-API pair has no DIRECT fallback, but the oneDNN
+// Graph scratch floor is a reservation, not a requirement: what the zone cannot hold of it is served on the DIRECT path
+// under its cap, or a context needing it is refused by name. A zone that is not short is not a keep (the caller has
+// nothing to decide). Pure.
+bool zone_arena_shortfall_is_reservation_only(const zone_arena_sizes & have,
+                                              const zone_arena_sizes & need,
+                                              size_t                   onednn_pair_bytes);
+
+// The pair bytes an ONEDNN zone kept short must keep room for: the pair held in the zone now (`held_pair_bytes`, 0 when
+// none is, or when it lies outside the arena) or the pair plan `kept` describes, whichever is larger. Pure.
+size_t zone_onednn_kept_pair_bytes(const zone_onednn_plan & kept, size_t held_pair_bytes);
+
+// The snapshot to store for an ONEDNN zone of `capacity_bytes` kept short for `live` while `held` describes it: the
+// pair of zone_onednn_plan_keep, and a Graph floor of what the zone holds beyond that pair (capacity less
+// zone_onednn_kept_pair_bytes, 0 when the pair fills it), never above the larger of the two plans' floors. Not
+// zone_onednn_plan_keep's maximum floor: that would raise the stored floor above what the kept zone holds, the pair
+// bound (zone_onednn_pp_pair_bound) would fall with it, and a pair already held could then exceed the bound, so the
+// Graph room a context check reads (capacity less the bound) would be larger than the zone has. Over the stored
+// snapshot the bound is the capacity less the stored floor, never below the kept pair bytes (equal to them when the
+// capacity limits the floor), so the Graph room is the stored floor. Pure.
+zone_onednn_plan zone_onednn_plan_keep_short(const zone_onednn_plan & held,
+                                             const zone_onednn_plan & live,
+                                             size_t                   capacity_bytes,
+                                             size_t                   held_pair_bytes);
+
+// The budget snapshot the DIRECT Graph-scratch cap is derived from (onednn_graph_scratch_direct_cap), stored when the
+// zones are found sufficient or kept short: it never rises while the arena is kept, so a cap that rose with the budget
+// cannot raise the Graph floor of a zone nothing rebuilt. `held_bytes` 0 is unset, and `current_bytes` is stored. A
+// rebuilt arena stores the current figure outright. Pure.
+size_t zone_graph_direct_cap_snapshot_kept(size_t held_bytes, size_t current_bytes);
+
+// Whether a call that kept an ONEDNN zone short logs its WARN: once per load transaction and device. `latched_txn` is
+// the load the device's last WARN was for. A load's stage plans in two passes, and a micro-batch's grow leg asks for
+// the zones again, so one kept zone would otherwise warn up to three times. Every call of a staged load carries its
+// transaction, a test's staged load included. A call outside a staged load (`load_txn` 0: a direct planner entry, a
+// test that asks the cache itself, a context's best-effort re-plan, the oneDNN pair's reserve) has no load to latch
+// on, and warns at every keep. Pure.
+bool zone_kept_onednn_warn_due(uint64_t latched_txn, uint64_t load_txn);
 
 // The line a model load refused for `refusal` logs, without a newline: the device, each zone's need and have in MB, the
 // shortfall of each zone that is short (a zone short by under 0.1 MB prints its three figures in KB, or in bytes under
@@ -747,6 +810,72 @@ uint32_t zone_hold_fit_largest_ub(const zone_hold_fit_inputs & in, uint32_t n_ub
 // of those still live (everything but the rung's own buffers). Saturating; never below zero.
 size_t zone_hold_free_cold(size_t driver_free, size_t raw_live);
 size_t zone_hold_free_before(size_t cold, size_t persistent_raw);
+
+// The context shape a plan sizes its per-context scratch for (the oneDNN Graph attention floor).
+// At load (`n_ctx_is_runtime` false) the plan's own shape is the load's planning shape, so the shape is the context the
+// model opens with (`n_ctx_context`: the one the caller named, or the model's default) and the micro-batch the caller
+// named (`n_ubatch_context`), each falling back to the plan's own when 0 (no request reached the load, or no
+// micro-batch was named). At a context transaction the plan's own shape is the context's. The micro-batch never exceeds
+// the context.
+struct zone_context_shape {
+    uint32_t n_ctx    = 0;
+    uint32_t n_ubatch = 0;
+};
+
+zone_context_shape zone_plan_context_shape(bool     n_ctx_is_runtime,
+                                           uint32_t plan_n_ctx,
+                                           uint32_t n_ctx_context,
+                                           uint32_t plan_n_ubatch,
+                                           uint32_t n_ubatch_context);
+
+// The planning micro-batch a plan is built at: the envelope's when the caller's envelope names one
+// (`envelope_n_ubatch` != 0), the model's (`n_ubatch`) otherwise. The plan builders take their planning shape from it,
+// and zone_plan_context_shape_for_envelope() below its default micro-batch.
+uint32_t zone_planning_n_ubatch(uint32_t envelope_n_ubatch, uint32_t n_ubatch);
+
+// zone_plan_context_shape() over the planner's own inputs, before a plan exists: the planning context `n_ctx`, and the
+// planning micro-batch zone_planning_n_ubatch() gives. A shape published before the plan is built is then the shape the
+// plan itself sizes for.
+zone_context_shape zone_plan_context_shape_for_envelope(bool     n_ctx_is_runtime,
+                                                        uint32_t n_ctx,
+                                                        uint32_t n_ctx_context,
+                                                        uint32_t envelope_n_ubatch,
+                                                        uint32_t n_ubatch,
+                                                        uint32_t n_ubatch_context);
+
+// The oneDNN Graph attention scratch the ONEDNN zone holds: the modeled peak of one execute,
+// max(n_head_ctx_max * n_ctx, n_head_swa_max * min(n_ctx, n_swa + n_ubatch)) * n_ubatch f32 elements, times 3/2,
+// bounded by `direct_cap` (the dispatcher splits an execute to half the cap, so a full chunk and the last chunk of a
+// split execute fit under it together; when one query row alone exceeds half the cap the chunks are one row each and
+// can hold more), and at least 64 MiB. `direct_cap` 0 is no cap known: the formula.
+// A sliding-window head sees n_swa + n_ubatch keys, not n_swa: the first query of the micro-batch looks n_swa keys
+// back and the last one n_ubatch further along. The two head classes are never outstanding together, so the peak is
+// the larger class, not their sum. The measurements the formula was fit to are with its caller in unified-cache.cpp.
+size_t zone_onednn_graph_scratch_floor_bytes(uint32_t n_head_ctx_max,
+                                             uint32_t n_head_swa_max,
+                                             uint32_t n_swa,
+                                             uint32_t n_ubatch,
+                                             uint32_t n_ctx,
+                                             size_t   direct_cap);
+
+// The part of a context's oneDNN Graph scratch the ONEDNN zone's Graph room cannot hold: served outside the arena.
+size_t zone_onednn_graph_uncovered_bytes(size_t demand, size_t graph_room);
+
+// The largest power of two (at least 32, not above n_ubatch) whose Graph scratch fits: either the zone's Graph room
+// holds all of it (nothing drawn outside the arena, so `free_outside`, `headroom` and `hold_spill` do not count; the
+// hold check judges its own spill), or the part above the room plus the hold's worst-case spill leaves
+// `free_outside` at least `headroom`. n_ubatch itself when it fits; 0 when no rung does. A card already under the
+// headroom still gets the largest rung inside the room.
+uint32_t zone_onednn_graph_fit_largest_ub(uint32_t n_head_ctx_max,
+                                          uint32_t n_head_swa_max,
+                                          uint32_t n_swa,
+                                          uint32_t n_ubatch,
+                                          uint32_t n_ctx,
+                                          size_t   direct_cap,
+                                          size_t   graph_room,
+                                          size_t   free_outside,
+                                          size_t   headroom,
+                                          size_t   hold_spill);
 
 // llama.cpp-kpjw (r7 I3: identity by ORIGIN, not by timing): what stays live without the rung is every raw byte the
 // cache holds except the rung's OWN scheduler compute buffers (rows registered by a request flagged

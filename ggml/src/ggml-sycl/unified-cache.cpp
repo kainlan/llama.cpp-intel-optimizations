@@ -888,10 +888,11 @@ static std::atomic<size_t>   g_planned_onednn_pair_weights_bytes[GGML_SYCL_MAX_D
 static std::atomic<size_t>   g_planned_onednn_pair_activations_bytes[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-8ony: the two figures the current ONEDNN zone was sized from -- the pair's own plan and the Graph SDPA
 // floor that shares the zone -- kept together as ONE snapshot, written by unified_cache::ensure_planned_arena_zones
-// when it keeps or builds the zone. The planner's live figures are overwritten by every model's plan (and the pair's
-// upward by reserve), and the SDPA shape the floor derives from is rewritten by runtime plans the zone was not rebuilt
-// for, so neither can describe a zone that was built earlier: a draft model loaded beside the target would hand a
-// bound derived from the draft's figures to the target's zone.
+// when it keeps or builds the zone, and by onednn_zone_plan_put_back when a failed load's restore puts it back. The
+// planner's live figures are overwritten by every model's plan (and the pair's upward by reserve), and the SDPA shape
+// the floor derives from is rewritten by runtime plans the zone was not rebuilt for, so neither can describe a zone
+// that was built earlier: a draft model loaded beside the target would hand a bound derived from the draft's figures
+// to the target's zone.
 static std::mutex            g_onednn_zone_plan_mutex;
 static zone_onednn_plan      g_onednn_zone_plan[GGML_SYCL_MAX_DEVICES]{};
 
@@ -921,6 +922,78 @@ static void onednn_zone_plan_keep_and_store(int device_id, const zone_onednn_pla
     std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
     g_onednn_zone_plan[device_id] = zone_onednn_plan_keep(g_onednn_zone_plan[device_id], plan);
 }
+
+// Whether a rebuild that something live blocks is short of the oneDNN Graph floor alone
+// (zone_arena_shortfall_is_reservation_only, over the pair zone_onednn_plan_keep_short keeps room for), and when it is
+// and `store` is true, the keep: the snapshot becomes zone_onednn_plan_keep_short over the one held, the live plan, the
+// ONEDNN zone's capacity and the pair held in it. One critical section, as in onednn_zone_plan_keep_and_store, so two
+// callers keeping on one device cannot each read the same snapshot and drop the other's figure. `kept` receives the
+// snapshot whether or not it is stored. Takes the mutex itself, so it must not call the accessors above.
+static bool onednn_zone_plan_keep_short_and_store(int                      device_id,
+                                                  const zone_onednn_plan & live,
+                                                  const zone_arena_sizes & have,
+                                                  const zone_arena_sizes & need,
+                                                  size_t                   held_pair_bytes,
+                                                  bool                     store,
+                                                  zone_onednn_plan *       kept) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
+    const zone_onednn_plan      short_plan =
+        zone_onednn_plan_keep_short(g_onednn_zone_plan[device_id], live, have.onednn, held_pair_bytes);
+    if (kept != nullptr) {
+        *kept = short_plan;
+    }
+    if (!zone_arena_shortfall_is_reservation_only(have, need,
+                                                  zone_onednn_kept_pair_bytes(short_plan, held_pair_bytes))) {
+        return false;
+    }
+    if (store) {
+        g_onednn_zone_plan[device_id] = short_plan;
+    }
+    return true;
+}
+
+// A failed load's restore of the snapshot: while it still holds `written`, what the load left in it, it becomes
+// zone_onednn_plan_keep_short(prior, prior, ...) over the ONEDNN zone's capacity and the pair held in it now. That is
+// `prior` exactly while the zone still holds it, and a smaller Graph floor when the zone was rebuilt smaller or a pair
+// was reserved under the failed load's wider bound in between: `prior` stored raw would then describe a room the zone
+// does not have, or a bound below a pair already held. The test and the store are one critical section, as in
+// onednn_zone_plan_keep_and_store, because the oneDNN pair's reserve asks for the zones without the inventory lock the
+// restore holds. Takes the mutex itself, so it must not call the accessors above.
+static void onednn_zone_plan_put_back(int                      device_id,
+                                      const zone_onednn_plan & written,
+                                      const zone_onednn_plan & prior,
+                                      size_t                   capacity_bytes,
+                                      size_t                   held_pair_bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
+    if (zone_onednn_plan_same(g_onednn_zone_plan[device_id], written)) {
+        g_onednn_zone_plan[device_id] = zone_onednn_plan_keep_short(prior, prior, capacity_bytes, held_pair_bytes);
+    }
+}
+
+#if GGML_SYCL_DNNL
+// What a line that prints the Graph floor the planned shape asks for (`formula_bytes`) adds when the ONEDNN zone's
+// stored snapshot on `device_id` holds less Graph room than that: the stored figure, so the line does not claim the
+// zone holds the formula floor. A zone kept short stores the room it holds beyond its pair
+// (zone_onednn_plan_keep_short). The snapshot is read as it stands when the line prints, which for a plan's floor line
+// can be before that load's zones are ensured (a multi-device plan sizes them after it plans). Empty while no snapshot
+// is stored, or when the stored floor is not below the formula's.
+static std::string onednn_zone_plan_short_text(int device_id, size_t formula_bytes) {
+    const zone_onednn_plan stored = onednn_zone_plan_load(device_id);
+    if (zone_onednn_plan_same(stored, zone_onednn_plan()) || stored.graph_floor_bytes >= formula_bytes) {
+        return std::string();
+    }
+    char text[128];
+    std::snprintf(text, sizeof(text), "; the ONEDNN zone's stored plan holds only %.1f MB of it as Graph room",
+                  stored.graph_floor_bytes / (1024.0 * 1024.0));
+    return text;
+}
+#endif
 
 // The most an op's f16 pair may be for the ONEDNN zone of capacity `capacity_bytes` on `device_id` to count it as
 // planned (zone_onednn_pp_pair_bound over the snapshot above). The one source for the admission accessor and for the
@@ -1033,14 +1106,16 @@ static std::atomic<uint64_t>      g_planned_scratch_owner_next{ 1 };
 // set only when the merged inputs of the owners whose figure was accepted cannot be sized. A rejected owner's figure
 // does not set it: that owner contributes nothing to the half, and its own re-plan refuses while it is live.
 static std::atomic<bool>         g_planned_dense_scratch_invalid[GGML_SYCL_MAX_DEVICES][2]{};
-// llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
-// window class, the SWA window itself, ubatch size, context length) known at
-// the time the oneDNN scratchpad was last planned for this device
-// (compute_placement_plan()/populate_host_zone_sizing(), see the "oneDNN
-// scratchpad:" log line). Feeds onednn_graph_scratch_zone_floor_bytes_swa()'s
+// The SDPA shape (max query-head count per attention
+// window class, the SWA window itself, ubatch size, context length) last
+// published for this device through
+// unified_cache_publish_planned_onednn_graph_scratch_shape(): by a
+// single-device stage before it sizes the arena zones, and by a plan's
+// host-side sizing (populate_host_zone_sizing(), see the "[SYCL-PLAN] oneDNN
+// Graph-scratch zone floor:" log line). Feeds onednn_graph_scratch_zone_floor_bytes_swa()'s
 // shape-derived floor -- the oneDNN Graph-scratch request is proportional to
 // n_head x n_ubatch x n_ctx for non-SWA layers and n_head x n_ubatch x
-// min(n_ctx, n_swa + n_ubatch) for SWA layers (llama.cpp-o3a0; the span a
+// min(n_ctx, n_swa + n_ubatch) for SWA layers (the span a
 // ubatch of n_ubatch queries scans over an n_swa-key sliding window, GPU-
 // verified), NOT a single n_head x n_ctx term for every layer as an
 // earlier version of this fix assumed.
@@ -3702,6 +3777,7 @@ load_published_terms load_published_terms::snapshot(int device) {
     terms.onednn_weights        = g_planned_onednn_pair_weights_bytes[device].load(std::memory_order_acquire);
     terms.onednn_activations    = g_planned_onednn_pair_activations_bytes[device].load(std::memory_order_acquire);
     terms.onednn_stored         = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device);
+    terms.onednn_zone_plan      = onednn_zone_plan_load(device);
     terms.planner               = planner_published_terms::snapshot(device);
     return terms;
 }
@@ -3732,7 +3808,8 @@ uint32_t load_published_terms::differing(const load_published_terms & other) con
                    a.nonfa.n_ctx != b.nonfa.n_ctx,
                LOAD_PUBLISHED_GROUP_NONFA) |
            bit(a.control.bytes != b.control.bytes || a.control.valid != b.control.valid, LOAD_PUBLISHED_GROUP_CONTROL) |
-           bit(a.scatter != b.scatter, LOAD_PUBLISHED_GROUP_SCATTER);
+           bit(a.scatter != b.scatter, LOAD_PUBLISHED_GROUP_SCATTER) |
+           bit(!zone_onednn_plan_same(onednn_zone_plan, other.onednn_zone_plan), LOAD_PUBLISHED_GROUP_ZONE_PLAN);
 }
 
 void load_published_terms::take_groups(const load_published_terms & from, uint32_t groups) {
@@ -3772,6 +3849,9 @@ void load_published_terms::take_groups(const load_published_terms & from, uint32
     }
     if (groups & LOAD_PUBLISHED_GROUP_SCATTER) {
         planner.scatter = from.planner.scatter;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_ZONE_PLAN) {
+        onednn_zone_plan = from.onednn_zone_plan;
     }
 }
 
@@ -3825,6 +3905,14 @@ void load_published_record::restore(int device) const noexcept {
     }
     if (back & LOAD_PUBLISHED_GROUP_SCATTER) {
         unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, prior.planner.scatter);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_ZONE_PLAN) {
+        // The zone the snapshot describes is read as it is now: a failed load does not shrink a zone it grew, and a
+        // pair reserved since under its bound stays where it is.
+        unified_cache * const cache    = get_existing_unified_cache_for_device(device);
+        const size_t          capacity = cache != nullptr ? cache->zone_capacity(vram_zone_id::ONEDNN) : 0;
+        const size_t          held     = cache != nullptr ? cache->arena_held_onednn_pair_bytes() : 0;
+        onednn_zone_plan_put_back(device, written.onednn_zone_plan, prior.onednn_zone_plan, capacity, held);
     }
     // The sum goes back from what this load published to what it held before, in one compare-exchange: the pair's
     // reserve raises it outside the inventory lock, and a raise since this load published it is kept.
@@ -3899,13 +3987,14 @@ void unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t weig
     unified_cache_set_planned_onednn_scratchpad_bytes(device_id, weights_bytes + activations_bytes);
 }
 
-// llama.cpp-0oxf/o3a0: record the SDPA shape (n_head_ctx_max, n_head_swa_max,
+// Record the SDPA shape (n_head_ctx_max, n_head_swa_max,
 // n_swa, n_ubatch, n_ctx) alongside the scratchpad bytes above so
 // onednn_graph_scratch_zone_floor_bytes_swa() can derive its floor from the
 // shape the Graph-scratch request actually scales with, instead of a flat
-// constant. Called from the same "oneDNN scratchpad:" planning step
-// (populate_host_zone_sizing()) once plan.planner_n_head_ctx_max/
-// planner_n_head_swa_max/planner_n_swa/planner_n_ubatch/planner_n_ctx are set.
+// constant. A plan's shape is recorded only through
+// unified_cache_publish_planned_onednn_graph_scratch_shape() below, so every
+// recorded shape is unified_cache_plan_onednn_graph_scratch_shape()'s; the
+// dry run calls this directly only to put back the value it read.
 void unified_cache_set_planned_onednn_graph_scratch_shape(int      device_id,
                                                           uint32_t n_head_ctx_max,
                                                           uint32_t n_head_swa_max,
@@ -3935,6 +4024,31 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
     shape.n_swa          = g_planned_onednn_graph_scratch_n_swa[device_id].load(std::memory_order_acquire);
     shape.n_ubatch       = g_planned_onednn_graph_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
     shape.n_ctx          = g_planned_onednn_graph_scratch_n_ctx[device_id].load(std::memory_order_acquire);
+    return shape;
+}
+
+onednn_graph_scratch_planned_shape unified_cache_plan_onednn_graph_scratch_shape(
+    const placement_kv_info &            kv_info,
+    const ggml_sycl_placement_envelope * envelope) {
+    const zone_context_shape context = zone_plan_context_shape_for_envelope(
+        kv_info.n_ctx_is_runtime, kv_info.n_ctx, kv_info.n_ctx_context, envelope ? envelope->n_ubatch : 0,
+        kv_info.n_ubatch, kv_info.n_ubatch_context);
+    onednn_graph_scratch_planned_shape shape;
+    shape.n_head_ctx_max = kv_info.n_head_ctx_max;
+    shape.n_head_swa_max = kv_info.n_head_swa_max;
+    shape.n_swa          = kv_info.n_swa;
+    shape.n_ubatch       = context.n_ubatch;
+    shape.n_ctx          = context.n_ctx;
+    return shape;
+}
+
+onednn_graph_scratch_planned_shape unified_cache_publish_planned_onednn_graph_scratch_shape(
+    int                                  device_id,
+    const placement_kv_info &            kv_info,
+    const ggml_sycl_placement_envelope * envelope) {
+    const onednn_graph_scratch_planned_shape shape = unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope);
+    unified_cache_set_planned_onednn_graph_scratch_shape(device_id, shape.n_head_ctx_max, shape.n_head_swa_max,
+                                                         shape.n_swa, shape.n_ubatch, shape.n_ctx);
     return shape;
 }
 
@@ -4342,11 +4456,18 @@ static long onednn_graph_zone_mb_override() {
 // computes 24 MiB raw at n_ubatch=512 n_ctx=8192, clamped to 64 MiB --
 // matching the GPU probe exactly (see test_swa_formula()'s gemma4 row,
 // tests/test-sycl-onednn-graph-floor.cpp).
+//
+// The formula itself is zone_onednn_graph_scratch_floor_bytes() (zone-sizing.cpp), bounded by `direct_cap`: the
+// dispatcher splits each oneDNN attention execute to half the DIRECT cap, so a full chunk and the last chunk of a split
+// execute fit under the cap together, unless one query row alone exceeds half of it (fattn-onednn-chunk.hpp then runs
+// one-row chunks). A floor above the cap would hold VRAM no split execute uses. Callers pass the cap of the device
+// whose zone the floor sizes, or 0 where no device is known.
 static size_t onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
                                                         uint32_t n_head_swa_max,
                                                         uint32_t n_swa,
                                                         uint32_t n_ubatch,
-                                                        uint32_t n_ctx) {
+                                                        uint32_t n_ctx,
+                                                        size_t   direct_cap) {
     // GGML_SYCL_ONEDNN_GRAPH_ZONE_MB always wins over the FORMULA when set
     // -- unchanged behaviour, still the escape hatch this file's header
     // comment tells you to reach for. It does NOT win over the 25% budget
@@ -4400,25 +4521,14 @@ static size_t onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
     // ticket originally cited: 1.5 x 8 x 512 x (512+512) x 4 B == the
     // historically measured 24 MB exactly -- the "window=1024" guess above
     // was wrong about WHY, but the arithmetic happened to match because
-    // 512+512 == 1024. The formula below now uses
+    // 512+512 == 1024. The formula now uses
     // min(n_ctx, n_swa + n_ubatch) as ne11 for the SWA class. An earlier
     // version of this fix used planner_n_ctx as ne11 for every layer
     // regardless of class, which over-provisions this SWA model 8x at the
     // real n_swa=512/n_ubatch=512 (192 MB flat vs. 24 MiB raw here) --
-    // safely, bounded by the 25% budget clamp below, but wasting VRAM the
+    // safely, bounded by the 25% budget clamp, but wasting VRAM the
     // model never needed.
-    static constexpr uint64_t kFloorMinBytes = 64ull * 1024ull * 1024ull;
-    static constexpr uint64_t kSizeofF32     = 4;
-    const uint64_t            ctx_term       = static_cast<uint64_t>(n_head_ctx_max) * static_cast<uint64_t>(n_ctx);
-    const uint64_t            swa_term =
-        static_cast<uint64_t>(n_head_swa_max) *
-        std::min(static_cast<uint64_t>(n_ctx), static_cast<uint64_t>(n_swa) + static_cast<uint64_t>(n_ubatch));
-    // Fixed-point 3/2 rather than a floating-point 1.5x: exact integer
-    // arithmetic, no rounding surprises near the MiB boundaries the anchor
-    // points above were measured at.
-    const uint64_t elems   = std::max(ctx_term, swa_term) * static_cast<uint64_t>(n_ubatch);
-    const uint64_t modeled = (elems * kSizeofF32 * 3) / 2;
-    return static_cast<size_t>(std::max<uint64_t>(kFloorMinBytes, modeled));
+    return zone_onednn_graph_scratch_floor_bytes(n_head_ctx_max, n_head_swa_max, n_swa, n_ubatch, n_ctx, direct_cap);
 }
 
 // llama.cpp-0oxf: thin backward-compat overload for a caller with a single
@@ -4430,8 +4540,10 @@ static size_t onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
 // of what min(n_ctx, n_swa + n_ubatch) evaluates to, since it is
 // multiplied by a zero head count and never contributes), matching this
 // overload's pre-o3a0 behaviour byte for byte.
+// Its one caller is the host-test wrapper below, which names no device, so no DIRECT cap is known and the floor is
+// the formula: that wrapper's expectations test the formula itself.
 static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
-    return onednn_graph_scratch_zone_floor_bytes_swa(n_head, 0, 0, n_ubatch, n_ctx);
+    return onednn_graph_scratch_zone_floor_bytes_swa(n_head, 0, 0, n_ubatch, n_ctx, 0);
 }
 
 // llama.cpp-0oxf: host-testable wrapper -- onednn_graph_scratch_zone_floor_bytes()
@@ -4443,13 +4555,15 @@ size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uin
 
 // llama.cpp-o3a0: host-testable wrapper around the window-aware
 // onednn_graph_scratch_zone_floor_bytes_swa() above -- same internal-linkage/
-// memoization caveats as the wrapper immediately above.
+// memoization caveats as the wrapper immediately above. `direct_cap` is passed through: 0 is no cap known.
 size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
                                                                 uint32_t n_head_swa_max,
                                                                 uint32_t n_swa,
                                                                 uint32_t n_ubatch,
-                                                                uint32_t n_ctx) {
-    return onednn_graph_scratch_zone_floor_bytes_swa(n_head_ctx_max, n_head_swa_max, n_swa, n_ubatch, n_ctx);
+                                                                uint32_t n_ctx,
+                                                                size_t   direct_cap) {
+    return onednn_graph_scratch_zone_floor_bytes_swa(n_head_ctx_max, n_head_swa_max, n_swa, n_ubatch, n_ctx,
+                                                     direct_cap);
 }
 #endif
 
@@ -4464,8 +4578,12 @@ size_t unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id) {
 }
 
 // The pair's own planned requirement and the Graph SDPA floor that shares its zone, read ONCE so the two describe
-// the same plan: the planner may overwrite the stored figure between two separate reads.
-static zone_onednn_plan onednn_planned_pair_and_floor(int device_id) {
+// the same plan: the planner may overwrite the stored figure between two separate reads. `direct_cap` is the DIRECT
+// Graph-scratch cap of the cache whose zone the floor sizes, and it is a parameter because this function must not look
+// a cache up: cache creation calls it (the constructor sizes its zones) with the cache registry, g_cache_rw_mutex,
+// locked exclusively, and every by-device lookup takes that lock shared. A cache sizing its own zones passes its own
+// cap; the by-device getter below looks the cache up itself.
+static zone_onednn_plan onednn_planned_pair_and_floor(int device_id, size_t direct_cap) {
     zone_onednn_plan plan;
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return plan;
@@ -4477,15 +4595,22 @@ static zone_onednn_plan onednn_planned_pair_and_floor(int device_id) {
     if (ggml_sycl::onednn_graph_allocator_enabled()) {
         const onednn_graph_scratch_planned_shape shape =
             unified_cache_get_planned_onednn_graph_scratch_shape(device_id);
-        plan.graph_floor_bytes = onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max,
-                                                                           shape.n_swa, shape.n_ubatch, shape.n_ctx);
+        plan.graph_floor_bytes = onednn_graph_scratch_zone_floor_bytes_swa(
+            shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa, shape.n_ubatch, shape.n_ctx, direct_cap);
     }
+#else
+    GGML_UNUSED(direct_cap);
 #endif
     return plan;
 }
 
 size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {
-    const zone_onednn_plan plan = onednn_planned_pair_and_floor(device_id);
+#if GGML_SYCL_DNNL
+    const size_t direct_cap = unified_cache_onednn_graph_scratch_direct_cap_bytes(device_id);
+#else
+    const size_t direct_cap = 0;
+#endif
+    const zone_onednn_plan plan = onednn_planned_pair_and_floor(device_id, direct_cap);
     return plan.bare_bytes + plan.graph_floor_bytes;
 }
 
@@ -7517,7 +7642,8 @@ static const char * arena_teardown_cause_name(zone_arena_teardown_refusal cause)
     return "no cause recorded";
 }
 
-bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
+bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *              refusal,
+                                               const zone_arena_ensure_options & options) {
     if (!vram_arena_enabled()) {
         return true;
     }
@@ -7643,7 +7769,12 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
     // plan and the floor are read once, as one pair: they are what the zone is
     // described by afterwards (the snapshot stored at both successful exits
     // below).
-    const zone_onednn_plan live_plan           = onednn_planned_pair_and_floor(dev_id);
+#if GGML_SYCL_DNNL
+    const size_t graph_direct_cap = onednn_graph_scratch_direct_cap();
+#else
+    const size_t graph_direct_cap = 0;
+#endif
+    const zone_onednn_plan live_plan           = onednn_planned_pair_and_floor(dev_id, graph_direct_cap);
     const size_t           planned_onednn_zone = live_plan.bare_bytes + live_plan.graph_floor_bytes;
     if (planned_onednn_zone > onednn_zone) {
         onednn_zone = planned_onednn_zone;
@@ -7790,13 +7921,10 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
                 bind_compute_arena();
             }
 #if GGML_SYCL_DNNL
-            // llama.cpp-0oxf: snapshot available_budget() at every successful
-            // plan so the DIRECT Graph-scratch cap (onednn_graph_scratch_direct_cap_bytes())
-            // tracks what THIS plan had to work with, not live budget that
-            // shrinks as the arena's own zones consume it. std::atomic store:
-            // this write is not synchronized with onednn_graph_scratch_mutex_,
-            // which guards every read.
-            onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
+            // The DIRECT Graph-scratch cap (onednn_graph_scratch_direct_cap_bytes()) is a fraction of the budget this
+            // arena was planned with, not of the live budget, which shrinks as the arena's own zones consume it. The
+            // zones are kept as they are here, so the snapshot does not rise (onednn_graph_direct_cap_snapshot_keep).
+            onednn_graph_direct_cap_snapshot_keep();
 #endif
             // The zone is kept as it was built, so it stays described by the larger plan it was built from (its whole
             // pair, with the Graph floor's own maximum): a later, smaller plan (a draft model beside the target) must
@@ -7830,6 +7958,37 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
         holders.chunk_leases    = chunk_leases;
         arena_count_scratch_holders(holders);
         if (!zone_arena_rebuild_allowed(holders)) {
+            // Keeping the zones as they are answers a rebuild something live blocks when the oneDNN Graph floor is all
+            // they lack: the floor is a reservation, served on the DIRECT path under its cap beyond what the zone
+            // holds, and a context whose Graph scratch the kept room cannot hold is refused by name at the context.
+            // A ring that alone holds the arena keeps nothing yet: see zone_arena_ensure_options::ring_release_first.
+            const zone_arena_sizes need       = { scratch_zone, onednn_zone, runtime_zone };
+            const bool             defer_keep = options.ring_release_first && zone_arena_only_ring_holds(true, holders);
+            const size_t           held_pair  = arena_held_onednn_pair_bytes();
+            zone_onednn_plan       kept;
+            const bool reservation_only = onednn_zone_plan_keep_short_and_store(dev_id, live_plan, arena_zones, need,
+                                                                                held_pair, !defer_keep, &kept);
+            if (reservation_only && !defer_keep) {
+                if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
+                    bind_compute_arena();
+                }
+#if GGML_SYCL_DNNL
+                onednn_graph_direct_cap_snapshot_keep();
+#endif
+                // When the WARN is due: see zone_kept_onednn_warn_due. The room is the kept floor: the pair bound over
+                // the stored snapshot leaves exactly that.
+                const uint64_t latched_txn = onednn_zone_kept_warn_txn_.exchange(options.load_txn);
+                if (zone_kept_onednn_warn_due(latched_txn, options.load_txn)) {
+                    GGML_LOG_WARN(
+                        "[VRAM-ARENA] device %d keeps its ONEDNN zone of %.1f MB: the plan's oneDNN Graph floor of "
+                        "%.1f MB asks for a %.1f MB zone, and live allocations block the rebuild. The zone leaves "
+                        "%.1f MB of Graph room; the rest is served on the DIRECT path under its cap, and a context "
+                        "whose Graph scratch does not fit is refused by name\n",
+                        dev_id, arena_zones.onednn / (1024.0 * 1024.0), live_plan.graph_floor_bytes / (1024.0 * 1024.0),
+                        onednn_zone / (1024.0 * 1024.0), kept.graph_floor_bytes / (1024.0 * 1024.0));
+                }
+                return true;
+            }
             const size_t blocked_bytes =
                 live_zone_bytes != 0 ? live_zone_bytes : (scratch_zone + onednn_zone + runtime_zone);
             residency_diagnostics_record_live_handle_for_test("arena-rebuild", "VRAM_ARENA", blocked_bytes);
@@ -7931,11 +8090,12 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
             // The caller's refusal of its load names the figures the ERROR line above printed, and the holders the gate
             // refused on, which choose its remedy.
             if (refusal != nullptr) {
-                refusal->reason  = zone_arena_refusal_reason::REBUILD_HELD;
-                refusal->device  = dev_id;
-                refusal->need    = { scratch_zone, onednn_zone, runtime_zone };
-                refusal->have    = arena_zones;
-                refusal->holders = holders;
+                refusal->reason        = zone_arena_refusal_reason::REBUILD_HELD;
+                refusal->device        = dev_id;
+                refusal->need          = { scratch_zone, onednn_zone, runtime_zone };
+                refusal->have          = arena_zones;
+                refusal->holders       = holders;
+                refusal->keep_deferred = reservation_only && defer_keep;
             }
             return false;
         }
@@ -7981,9 +8141,8 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
     }
     bind_compute_arena();
 #if GGML_SYCL_DNNL
-    // llama.cpp-0oxf: see the "zones_sufficient" branch above for why this is
-    // snapshotted here rather than read live from onednn_graph_scratch_alloc().
-    // std::atomic store -- see that branch's comment.
+    // The zones were rebuilt for this plan, so the DIRECT cap's snapshot is the budget it was planned with, whether
+    // that is above or below the one held (see the "zones_sufficient" branch above for why it is a snapshot).
     onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
     onednn_zone_plan_store(dev_id, live_plan);
@@ -15162,6 +15321,16 @@ static size_t onednn_graph_scratch_direct_cap_bytes(size_t plan_time_available_b
     return std::min(kOneGiB, plan_time_available_bytes / 4);
 }
 
+void unified_cache::onednn_graph_direct_cap_snapshot_keep() {
+    // One compare-exchange loop, so a store by a concurrent ensure on this device is never lost under ours.
+    const size_t current = available_budget();
+    size_t       held    = onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire);
+    while (!onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.compare_exchange_weak(
+        held, zone_graph_direct_cap_snapshot_kept(held, current), std::memory_order_acq_rel,
+        std::memory_order_acquire)) {
+    }
+}
+
 size_t unified_cache::onednn_graph_scratch_direct_cap() const {
     return onednn_graph_scratch_direct_cap_bytes(
         onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));
@@ -16150,20 +16319,22 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
     if (!ok) {
         const onednn_graph_scratch_planned_shape shape =
             unified_cache_get_planned_onednn_graph_scratch_shape(req.device);
+        const size_t formula_floor =
+            onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa,
+                                                      shape.n_ubatch, shape.n_ctx, onednn_graph_scratch_direct_cap());
+        // A zone kept short holds less of the floor than the shape asks for; the line says so after the shape.
         GGML_LOG_ERROR(
             "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT allocation failed after a drain-and-retry: requested "
             "%.2f MB, outstanding direct=%.2f MB (cap %.2f MB, %zu prior waits), ONEDNN zone %.1f MB (used %.1f "
-            "MB, floor %.1f MB at n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u n_ubatch=%u n_ctx=%u). Refusing to "
-            "hand oneDNN a null scratch pointer for this request -- see llama.cpp-0oxf for the GPU "
+            "MB, floor %.1f MB at n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u n_ubatch=%u n_ctx=%u%s). Refusing "
+            "to hand oneDNN a null scratch pointer for this request -- see llama.cpp-0oxf for the GPU "
             "page-fault/segfault this used to cause. Aborting instead.\n",
             size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
             onednn_graph_scratch_direct_cap() / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_,
             zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
-            zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
-            onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa,
-                                                      shape.n_ubatch, shape.n_ctx) /
-                (1024.0 * 1024.0),
-            shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa, shape.n_ubatch, shape.n_ctx);
+            zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0), formula_floor / (1024.0 * 1024.0),
+            shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa, shape.n_ubatch, shape.n_ctx,
+            onednn_zone_plan_short_text(req.device, formula_floor).c_str());
         if (g_onednn_graph_scratch_test_suppress_abort.load(std::memory_order_acquire)) {
             // Test build only (see the hooks declared in unified-cache.hpp):
             // report "this would have aborted" instead of actually aborting,
@@ -24943,6 +25114,20 @@ bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound) {
     return true;
 }
 
+bool unified_cache_get_onednn_graph_room(int device_id, size_t * room) {
+    unified_cache * cache = get_existing_unified_cache_for_device(device_id);
+    if (!cache || !cache->arena_active()) {
+        return false;
+    }
+    if (room) {
+        // One capacity read for both terms: the bound is computed for the capacity it is subtracted from.
+        const size_t capacity = cache->zone_capacity(vram_zone_id::ONEDNN);
+        const size_t bound    = onednn_pp_pair_bound_for(device_id, capacity);
+        *room                 = capacity > bound ? capacity - bound : 0;
+    }
+    return true;
+}
+
 bool unified_cache_reserve_pp_moe_onednn_scratch(int      device_id,
                                                  size_t   weight_slot_bytes,
                                                  size_t   activation_slot_bytes,
@@ -28657,7 +28842,9 @@ bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes) {
     return cache->reserve_compute_arena(arena_bytes);
 }
 
-bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal * refusal) {
+bool unified_cache_ensure_planned_arena_zones(int                               device_id,
+                                              zone_arena_refusal *              refusal,
+                                              const zone_arena_ensure_options & options) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (!cache) {
         if (refusal != nullptr) {
@@ -28666,7 +28853,7 @@ bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal 
         }
         return false;
     }
-    return cache->ensure_planned_arena_zones(refusal);
+    return cache->ensure_planned_arena_zones(refusal, options);
 }
 
 #if GGML_SYCL_DNNL
@@ -31939,6 +32126,18 @@ uint32_t unified_cache::arena_chunk_lease_count(int chunk_idx) const {
 
 uint32_t unified_cache::arena_chunk_lease_count_at(chunk_lease_tag tag) const {
     return arena_chunk_leases_of(tag).load(std::memory_order_relaxed);
+}
+
+size_t unified_cache::arena_held_onednn_pair_bytes() {
+    // Read without the oneDNN scratch lock, as arena_count_scratch_holders reads these buffers and for its reason.
+    size_t held = 0;
+    if (onednn_weights_scratch_ != nullptr && vram_owns(onednn_weights_scratch_)) {
+        held += onednn_weights_scratch_size_;
+    }
+    if (onednn_activations_scratch_ != nullptr && vram_owns(onednn_activations_scratch_)) {
+        held += onednn_activations_scratch_size_;
+    }
+    return held;
 }
 
 void unified_cache::arena_count_scratch_holders(zone_arena_holders & holders) {
@@ -35810,7 +36009,9 @@ bool placement_moe_host_recipe_workspace_bytes_at(const std::vector<moe_host_rec
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
-                                      int                                        n_expert_used) {
+                                      const placement_kv_info &                  kv_info,
+                                      const ggml_sycl_placement_envelope *       envelope) {
+    const int        n_expert_used         = kv_info.n_expert_used;
     constexpr size_t k_min_zone_bytes      = 64ull * 1024ull * 1024ull;
     constexpr size_t k_tp_staging_headroom = 16ull * 1024ull * 1024ull;
     constexpr size_t k_scratch_headroom    = 32ull * 1024ull * 1024ull;
@@ -36349,27 +36550,31 @@ static void populate_host_zone_sizing(placement_plan &                          
     // correction, llama.cpp-o3a0
     // (itself following an earlier correction from n_ctx alone, c-xcop).
     if (plan.device_id >= 0) {
-        unified_cache_set_planned_onednn_graph_scratch_shape(plan.device_id, plan.planner_n_head_ctx_max,
-                                                             plan.planner_n_head_swa_max, plan.planner_n_swa,
-                                                             plan.planner_n_ubatch, plan.planner_n_ctx);
+        // Sized for the context the model opens with and the micro-batch the caller named, not the planning shape: the
+        // ONEDNN zone cannot grow once weights are live. A single-device stage published this shape before it sized
+        // the zones this plan packed against, from the same kv_info and envelope through the same function, so there
+        // this write equals that one and the zone the plan packed against already holds the floor.
+        const onednn_graph_scratch_planned_shape graph_shape =
+            unified_cache_publish_planned_onednn_graph_scratch_shape(plan.device_id, kv_info, envelope);
         // llama.cpp-o3a0: log the floor and the shape it binds on unconditionally
         // (not only inside the exceptional DIRECT-allocation-failure path
         // further below) so a normal run's log alone answers "did the window
         // narrowing apply here" -- e.g. gemma4 should show n_head_ctx_max=0
         // n_head_swa_max=8 n_swa=512 (its real GGUF attention.sliding_window;
         // GPU-verified on the B50) and a 64 MiB floor, not 192 MB.
+        // The floor is the shape's; a zone stored short of it is named after the shape, as the snapshot stands now.
+        const size_t graph_floor = onednn_graph_scratch_zone_floor_bytes_swa(
+            graph_shape.n_head_ctx_max, graph_shape.n_head_swa_max, graph_shape.n_swa, graph_shape.n_ubatch,
+            graph_shape.n_ctx, unified_cache_onednn_graph_scratch_direct_cap_bytes(plan.device_id));
         GGML_LOG_INFO(
             "[SYCL-PLAN] oneDNN Graph-scratch zone floor: %.1f MB (n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u "
-            "n_ubatch=%u n_ctx=%u)\n",
-            onednn_graph_scratch_zone_floor_bytes_swa(plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max,
-                                                      plan.planner_n_swa, plan.planner_n_ubatch, plan.planner_n_ctx) /
-                (1024.0 * 1024.0),
-            plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, plan.planner_n_ubatch,
-            plan.planner_n_ctx);
+            "n_ubatch=%u n_ctx=%u)%s\n",
+            graph_floor / (1024.0 * 1024.0), graph_shape.n_head_ctx_max, graph_shape.n_head_swa_max, graph_shape.n_swa,
+            graph_shape.n_ubatch, graph_shape.n_ctx, onednn_zone_plan_short_text(plan.device_id, graph_floor).c_str());
     }
 #endif
 
-    // llama.cpp-oyfl: record the SAME shape for the non-FA batched mul_mat
+    // llama.cpp-oyfl: record the planning shape for the non-FA batched mul_mat
     // scratch floor (unified_cache_nonfa_attn_scratch_demand_bytes()).
     // Unconditional (not gated behind GGML_SYCL_DNNL, unlike the oneDNN
     // sibling above): the batched-mul_mat path this sizes is the native
@@ -36383,7 +36588,8 @@ static void populate_host_zone_sizing(placement_plan &                          
     // ggml_backend_sycl_set_runtime_context() (ggml-sycl.cpp), which cannot
     // resize this zone after the fact (the arena is a single fixed
     // allocation) but can refuse the update with the size arithmetic instead
-    // of letting prompt processing abort later.
+    // of letting prompt processing abort later. The planning shape on purpose:
+    // the load cannot know whether the context runs flash attention.
     if (plan.device_id >= 0) {
         unified_cache_set_planned_nonfa_attn_scratch_shape(plan.device_id, plan.planner_n_head_all_max,
                                                            plan.planner_n_ubatch, plan.planner_n_ctx);
@@ -36542,6 +36748,7 @@ static void placement_plan_size_host_side(placement_plan &                      
                                           const std::vector<placement_tensor_info> & tensor_inventory,
                                           int                                        n_experts,
                                           const placement_kv_info &                  kv_info,
+                                          const ggml_sycl_placement_envelope *       envelope,
                                           size_t                                     host_budget,
                                           const ring_lease *                         coverage_pin,
                                           bool                                       host_experts_pinned) {
@@ -36560,7 +36767,7 @@ static void placement_plan_size_host_side(placement_plan &                      
         host_experts_pinned = false;
     }
     placement_mark_device_entries_file_mapped(plan);
-    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
+    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info, envelope);
     record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
     if (!host_experts_pinned) {
         return;
@@ -36593,7 +36800,7 @@ static void placement_plan_size_host_side(placement_plan &                      
         "to the mapping, and %.1f MB of window-ring room stays held. The host-ledger and lazy-table lines above "
         "describe the pinned plan, which is not kept; the lines after this one describe the plan kept\n",
         why.c_str(), moved / mb, plan.moe_stream_ring_reserve_bytes / mb);
-    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
+    populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info, envelope);
     record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
 }
 
@@ -37356,7 +37563,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.layer_v_width                       = kv_info.layer_v_width;
     plan.layer_idx_k_width                   = kv_info.layer_idx_k_width;
     plan.planner_n_ctx                       = kv_info.n_ctx;
-    plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
+    plan.planner_n_ubatch = zone_planning_n_ubatch(envelope ? envelope->n_ubatch : 0, kv_info.n_ubatch);
     plan.planner_n_seq_max =
         envelope && envelope->n_seq_max ? envelope->n_seq_max : (kv_info.n_seq_max > 0 ? kv_info.n_seq_max : 1);
     // llama.cpp-3aos: no envelope override -- kv_unified, like
@@ -37379,6 +37586,14 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.pp_moe_onednn_output_slot_bytes     = unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(device_id);
     plan.pp_moe_onednn_scratch_bytes         = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device_id);
     plan.pp_moe_onednn_ring_depth            = unified_cache_get_planned_pp_moe_onednn_ring_depth(device_id);
+
+    // The shape the per-context scratch is sized for: the context the model opens with (the caller's, or the model's
+    // default) and the micro-batch the caller named, each else the planning shape above. Taken from the function the
+    // Graph scratch shape is published through, so the plan's context fields are the shape the floor is sized for.
+    const onednn_graph_scratch_planned_shape graph_shape =
+        unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope);
+    plan.context_n_ctx    = graph_shape.n_ctx;
+    plan.context_n_ubatch = graph_shape.n_ubatch;
 
     std::map<int, bool>   layer_has_attention;
     std::map<int, size_t> layer_weight_bytes;
@@ -37870,7 +38085,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         !account_moe_mmid_workspaces(plan, { device_budget{ device_id, vram_budget, vram_budget } })) {
         reject_moe_mmid_workspaces(plan);
     }
-    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, host_budget, coverage_pin,
+    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, envelope, host_budget, coverage_pin,
                                   host_experts_pinned);
 
     // Build the name->index lookup for O(1) queries
@@ -38833,7 +39048,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.layer_v_width            = kv_info.layer_v_width;
     plan.layer_idx_k_width        = kv_info.layer_idx_k_width;
     plan.planner_n_ctx            = kv_info.n_ctx;
-    plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
+    plan.planner_n_ubatch         = zone_planning_n_ubatch(envelope ? envelope->n_ubatch : 0, kv_info.n_ubatch);
     plan.planner_n_seq_max =
         envelope && envelope->n_seq_max ? envelope->n_seq_max : (kv_info.n_seq_max > 0 ? kv_info.n_seq_max : 1);
     // llama.cpp-3aos: see the single-device path's identical
@@ -38846,6 +39061,15 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.planner_n_head_swa_max   = kv_info.n_head_swa_max;
     plan.planner_n_head_all_max   = kv_info.n_head_all_max;
     plan.planner_n_swa            = kv_info.n_swa;
+
+    // The shape the per-context scratch is sized for: the context the model opens with (the caller's, or the model's
+    // default) and the micro-batch the caller named, each else the planning shape above. Taken from the function the
+    // Graph scratch shape is published through, so the plan's context fields are the shape the floor is sized for.
+    const onednn_graph_scratch_planned_shape graph_shape =
+        unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope);
+    plan.context_n_ctx    = graph_shape.n_ctx;
+    plan.context_n_ubatch = graph_shape.n_ubatch;
+
     for (const auto & db : device_budgets) {
         plan.pp_pipeline_scratch_bytes =
             std::max(plan.pp_pipeline_scratch_bytes, unified_cache_get_planned_pp_pipeline_scratch_bytes(db.device_id));
@@ -39921,7 +40145,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         reject_moe_mmid_workspaces(plan);
     }
     // The multi-device builder sizes no window ring, so its routed experts are never pinned for one.
-    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, host_budget, coverage_pin,
+    placement_plan_size_host_side(plan, tensor_inventory, n_experts, kv_info, envelope, host_budget, coverage_pin,
                                   /*host_experts_pinned=*/false);
 
     plan.build_index();

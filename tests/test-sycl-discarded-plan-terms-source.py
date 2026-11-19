@@ -15,8 +15,9 @@ The RUNTIME zone's requirement is the sum of its terms as published, computed by
 
 One helper, ggml_sycl::planner_published_terms (declared in unified-cache.hpp, defined in unified-cache.cpp beside the
 getters and setters it calls), snapshots and restores every term the planner publishes: every
-unified_cache_set_planned_* call in the planner's own functions has its getter in the snapshot and its setter in the
-restore, fed from the field the snapshot filled. The backend keeps no copy of its own. The plan dry run, which also
+unified_cache_set_planned_* call in the planner's own functions, and every unified_cache_publish_planned_* call (a
+publish computes the term and stores it through the term's setter), has its getter in the snapshot and its setter in
+the restore, fed from the field the snapshot filled. The backend keeps no copy of its own. The plan dry run, which also
 discards the plans it makes, restores through the same helper and keeps no list of its own. The planner-terms case of
 the sycl-runtime-alloc ctest (binary test-sycl-runtime-alloc, source
 ggml/src/ggml-sycl/tests/test-unified-runtime-alloc.cpp) checks the restore against the cache's own state.
@@ -221,7 +222,9 @@ PLANNER_SIGS = (
     "placement_plan compute_placement_plan(",
     "placement_plan compute_multi_device_plan(",
 )
-SETTER_RE = re.compile(r"\bunified_cache_set_planned_(\w+)\(")
+# A publish (unified_cache_publish_planned_<term>) computes its term and stores it through
+# unified_cache_set_planned_<term>, so it publishes that term as a setter call does.
+SETTER_RE = re.compile(r"\bunified_cache_(?:set|publish)_planned_(\w+)\(")
 GETTER_INTO_RE = re.compile(r"\bterms\.(\w+) = (?:ggml_sycl::)?unified_cache_get_planned_(\w+)\(device\);")
 # The terms the planner publishes today; the set the scan finds must hold them, so a scan that read the wrong bodies
 # cannot pass by finding nothing.
@@ -280,7 +283,8 @@ FIRST_PLAN = "plan_candidate = plan_single_device(true);"
 FALLBACK = "if (!placed) {"
 REPUBLISH = "(void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);"
 RESTORE = "published_before.restore(ctx->device);"
-FALLBACK_ENSURE = "if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {"
+FALLBACK_ENSURE = ("if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal, "
+                   "ggml_sycl_load_arena_options())) {")
 FALLBACK_PLAN = "plan_candidate = plan_single_device(false);"
 
 
