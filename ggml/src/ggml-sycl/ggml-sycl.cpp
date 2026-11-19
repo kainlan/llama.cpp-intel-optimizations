@@ -91608,14 +91608,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 auto &              route_host_count            = main_route_stats.host_count;
                 size_t              route_unavailable_count     = 0;
                 size_t              route_layout_mismatch_count = 0;
-                auto push_routed_entry = [](std::vector<expert_dispatch_entry> & dst_entries, int64_t iid1, int64_t id,
-                                            int32_t expert_id, int device_id, layout_mode layout,
-                                            ggml_sycl::mem_handle lease, void * ptr) {
-                    expert_dispatch_entry entry = ggml_sycl_make_secondary_expert_dispatch_entry(
-                        iid1, id, expert_id, device_id, layout, std::move(lease),
-                        /*allow_cpu_fallback=*/false, ptr);
-                    dst_entries.push_back(std::move(entry));
-                };
+
                 const ggml_sycl::moe_resolved_batch & main_batch =
                     ne12 == 1 ? retained_decode_batch_result.batch : retained_prompt_batch_result.batch;
                 const size_t selected_occurrences = static_cast<size_t>(ids->ne[1] * n_ids);
