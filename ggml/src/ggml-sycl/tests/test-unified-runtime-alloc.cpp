@@ -22,6 +22,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <thread>
@@ -1872,6 +1873,59 @@ static bool arena_teardown_refusal_reserves_nothing(sycl::queue & q) {
     return true;
 }
 
+static std::mutex               g_staging_log_mutex;
+static std::vector<std::string> g_staging_log_lines;
+
+static void staging_log_capture(ggml_log_level level, const char * text, void * user) {
+    (void) level;
+    (void) user;
+    if (text == nullptr) {
+        return;
+    }
+    fputs(text, stderr);
+    std::lock_guard<std::mutex> lock(g_staging_log_mutex);
+    g_staging_log_lines.emplace_back(text);
+}
+
+// How many of the lines logged while a cache asked for `staging_size` bytes of staging was built and destroyed name
+// its staging buffer.
+static size_t staging_lines_while_constructing(sycl::queue & q, size_t staging_size) {
+    {
+        std::lock_guard<std::mutex> lock(g_staging_log_mutex);
+        g_staging_log_lines.clear();
+    }
+
+    struct log_restore {
+        ~log_restore() { ggml_log_set(nullptr, nullptr); }
+    } restore;
+
+    ggml_log_set(staging_log_capture, nullptr);
+    {
+        unified_cache cache(q, 64ull * 1024ull * 1024ull, staging_size, 0, 0);
+    }
+    std::lock_guard<std::mutex> lock(g_staging_log_mutex);
+    return static_cast<size_t>(
+        std::count_if(g_staging_log_lines.begin(), g_staging_log_lines.end(), [](const std::string & line) {
+            return line.find("unified_cache:staging") != std::string::npos ||
+                   line.find("staging owner") != std::string::npos;
+        }));
+}
+
+// A cache asked for no staging buffer, the size GGML_SYCL_HOST_STAGING_MB=0 asks for and the fixtures here pass,
+// allocates none, so it logs no failed allocation of one. A zero-byte host allocation fails, and the cache logged that
+// on every such construction. Engagement: a buffer of 1 PiB, past any host's address space, is asked for first under
+// the same capture, and its failure line must be seen. Mutant: the constructor asking the device for a zero-byte
+// buffer.
+static bool cache_without_staging_allocates_none(sycl::queue & q) {
+    TEST_BEGIN("cache_without_staging_allocates_none");
+    TEST_ASSERT(staging_lines_while_constructing(q, 1ull << 50) >= 1,
+                "a staging buffer no host can pin failed without a line naming it, so this check cannot see one");
+    TEST_ASSERT(staging_lines_while_constructing(q, 0) == 0,
+                "a cache asked for no staging buffer asked for one anyway and logged that it failed");
+    TEST_PASS();
+    return true;
+}
+
 static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
     TEST_BEGIN("host_zone_reset_trims_released_offload_pool_slots");
     offload_buffer_pool_trim(-1);
@@ -2373,6 +2427,7 @@ int main(int argc, char ** argv) {
     ok &= scratch_regrow_refusal_preserves_exact_record(q);
     ok &= concurrent_settle_destroy_closing_wins(q);
     ok &= arena_teardown_refusal_reserves_nothing(q);
+    ok &= cache_without_staging_allocates_none(q);
     ok &= accepted_control_publication_is_atomic_with_close_snapshot();
     ok &= planner_terms_restore_returns_the_runtime_requirement();
     ok &= load_record_keeps_a_later_publish();

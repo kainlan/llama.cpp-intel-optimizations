@@ -7194,9 +7194,11 @@ unified_cache::unified_cache(sycl::queue & queue,
         std::atexit(unified_cache_test_counter_dump);
     }
 
-    // Allocate staging buffer (pinned host memory)
+    // Allocate staging buffer (pinned host memory). A size of 0 (GGML_SYCL_HOST_STAGING_MB=0) asks for none: a
+    // zero-byte host allocation only fails and logs that it did, so the cache starts as it does after a failed one.
     try {
-        staging_ = unified_cache_malloc_host_tracked(staging_size, queue_, "unified_cache:staging");
+        staging_ = staging_size > 0 ? unified_cache_malloc_host_tracked(staging_size, queue_, "unified_cache:staging") :
+                                      nullptr;
         if (staging_) {
             staging_size_ = staging_size;
             // Internal provenance mint: this helper is TU-static; the literal
