@@ -822,9 +822,9 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "-------------------------------------------------\n");
 
-    // Initialize SYCL backend for device 0 so g_device_caches[0] is populated.
+    // Initialize SYCL backend for device 0 so device 0's unified cache exists.
     // Test 5 needs unified_cache_host_zone_alloc which queries the global registry.
-    // The backend object can be freed immediately; the g_device_caches entry persists.
+    // The backend object can be freed immediately; the cache persists.
     if (sycl_info.device_count > 0) {
         ggml_backend_t backend = ggml_backend_sycl_init(0);
         if (backend) {

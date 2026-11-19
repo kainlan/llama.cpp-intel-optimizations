@@ -10014,7 +10014,7 @@ void unified_cache_test_set_arena_drain_timeout_ms(uint32_t timeout_ms);
 void unified_cache_test_pause_zone_settle(bool pause);
 bool unified_cache_test_zone_settle_reached();
 bool unified_cache_test_arena_destroy_closing_reached();
-// Whether g_device_caches holds an entry for the device; creates nothing.
+// Whether the per-device cache map holds an entry for the device; creates nothing.
 bool unified_cache_test_cache_exists(int device);
 // Sets the device total the raw-allocation gates read for `device`; 0 reads the driver's figure again.
 void unified_cache_test_set_raw_gate_device_total(int device, size_t bytes);
