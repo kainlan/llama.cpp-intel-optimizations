@@ -550,7 +550,35 @@ static std::string zone_bytes_text(size_t bytes) {
 // down at process exit, whatever else holds it. The ring is the cache's too, but a load releases it when it is the
 // arena's only holder and no prefill claims one of its slots. Leases with nothing but the ring live in the zones
 // outlived what they point at, so no free releases them either. Live allocations belong to a model or context, which
-// freeing releases.
+// freeing releases, unless the cache still has releases of its own to run: their bytes count as live too, so then the
+// remedy says they may be those and asks for the load again first.
+static std::string zone_arena_unfinished_text(const zone_arena_holders & h) {
+    struct kind {
+        size_t       count;
+        const char * one;
+        const char * many;
+    };
+
+    const kind kinds[] = {
+        { h.queued_frees,    "queued free",                 "queued frees"                 },
+        { h.release_retries, "release waiting for a retry", "releases waiting for a retry" },
+        { h.retired_pending, "retired entry",               "retired entries"              },
+        { h.evictions,       "eviction in flight",          "evictions in flight"          },
+    };
+    std::string parts[4];
+    int         n = 0;
+    for (const kind & k : kinds) {
+        if (k.count != 0) {
+            parts[n++] = std::to_string(k.count) + " " + (k.count == 1 ? k.one : k.many);
+        }
+    }
+    std::string text;
+    for (int i = 0; i < n; ++i) {
+        text += (i == 0 ? "" : i == n - 1 ? " and " : ", ") + parts[i];
+    }
+    return text;
+}
+
 static std::string zone_arena_held_text(const zone_arena_holders & h, int device) {
     char        part[96];
     std::string held[3];
@@ -582,7 +610,13 @@ static std::string zone_arena_held_text(const zone_arena_holders & h, int device
     // With no slot of the ring inside the arena, every live byte belongs to a model or context.
     const bool     live_beside   = h.ring_in_arena == 0 ? h.live_zone_bytes != 0 : h.live_beside_ring != 0;
     if (other_scratch == 0 && (live_beside || (h.chunk_leases == 0 && h.ring_in_arena == 0))) {
-        return text + ". Free the model or context they belong to, then load this one again";
+        const std::string unfinished = zone_arena_unfinished_text(h);
+        if (unfinished.empty()) {
+            return text + ". Free the model or context they belong to, then load this one again";
+        }
+        return text + ". Some of those bytes may be releases the cache has not finished (" + unfinished +
+               "), which it finishes on its own. Load this one again; if it is refused with the same bytes, free the "
+               "model or context they belong to";
     }
     char remedy[256];
     if (other_scratch != 0) {

@@ -7850,7 +7850,14 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
             }
             const size_t retired_pending     = retired_pending_count_.load(std::memory_order_acquire);
             const int    evictions_in_flight = evictions_in_flight_.load(std::memory_order_relaxed);
-            std::string  zones_live;
+
+            // The same readings go to the refusal, whose remedy tells the bytes of a release still to run from a
+            // model's or a context's.
+            holders.queued_frees    = deferred_in_arena_count;
+            holders.release_retries = device_release_retries;
+            holders.retired_pending = retired_pending;
+            holders.evictions       = evictions_in_flight > 0 ? static_cast<size_t>(evictions_in_flight) : 0;
+            std::string zones_live;
             for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
                 char part[48];
                 snprintf(part, sizeof(part), "%s%s=%.1f", z == 0 ? "" : " ",

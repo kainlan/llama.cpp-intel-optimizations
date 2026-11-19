@@ -2749,6 +2749,39 @@ int main() {
                   "other on device 1"),
               "the cache's scratch buffers inside the arena are not named with the new-process remedy");
         CHECK(!has(sl, "Free the model"), "the cache's own scratch buffers are blamed on a model to free");
+        // Live bytes are a model's or a context's only when the cache has no release of its own still to run: a free
+        // queued in the arena, a release waiting for a retry, a retired entry not yet finalized and an eviction in
+        // flight all keep zone bytes with no owner left. With any of them the remedy says the bytes may be those, and
+        // asks for the load again before it blames a model or context.
+        zone_arena_refusal pending      = held;
+        pending.holders.queued_frees    = 2;
+        pending.holders.release_retries = 1;
+        const std::string pl            = zone_arena_refusal_text(pending);
+        CHECK(has(pl,
+                  "; 4.0 KB of live allocations in its zones hold the arena (the [VRAM-ARENA] lines above name "
+                  "them), so its zones cannot grow. Some of those bytes may be releases the cache has not finished "
+                  "(2 queued frees and 1 release waiting for a retry), which it finishes on its own. Load this one "
+                  "again; if it is refused with the same bytes, free the model or context they belong to"),
+              "live bytes beside the cache's unfinished releases are not named with the load-again remedy");
+        CHECK(!has(pl, ". Free the model or context they belong to, then load this one again"),
+              "live bytes beside the cache's unfinished releases are blamed on a model to free");
+        zone_arena_refusal retiring      = held;
+        retiring.holders.retired_pending = 1;
+        retiring.holders.evictions       = 3;
+        CHECK(has(zone_arena_refusal_text(retiring), "(1 retired entry and 3 evictions in flight)"),
+              "retired entries and evictions in flight are not named as unfinished releases");
+        // Beside the ring the same holds for the bytes live beside it.
+        zone_arena_refusal ring_and_free       = held;
+        ring_and_free.holders.live_zone_bytes  = 3 * MiB;
+        ring_and_free.holders.scratch_in_arena = 3;
+        ring_and_free.holders.ring_in_arena    = 3;
+        ring_and_free.holders.live_beside_ring = 1;
+        ring_and_free.holders.queued_frees     = 1;
+        const std::string rf                   = zone_arena_refusal_text(ring_and_free);
+        CHECK(has(rf,
+                  "Some of those bytes may be releases the cache has not finished (1 queued free), which it "
+                  "finishes on its own"),
+              "a queued free beside the ring is not named as an unfinished release");
 
         // A shortfall under 0.1 MB would print as 0.0 MB short beside a need and a have that print the same: the short
         // zone's need, have and shortfall are printed in KB then, and in bytes under 1 KB, so the line still shows which

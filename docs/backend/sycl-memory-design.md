@@ -3022,7 +3022,14 @@ ring, the oneDNN scratch pair, the reorder temp, a persistent scratch) stay in
 the arena until the cache is torn down at process exit. No free releases
 either, so the line then says to load the model in a new process before any
 other on the device. The cache's scratch decides the remedy whatever else
-holds the arena.
+holds the arena. Live bytes are a model's or a context's only when the cache
+has no release of its own still to run: a free queued in the arena, a release
+waiting for a retry, a retired entry not yet finalized and an eviction in flight
+all keep zone bytes with no owner left. The refusal carries those four counts,
+read where the ERROR line above prints them, and with any of them the remedy
+reads `Some of those bytes may be releases the cache has not finished (<counts>),
+which it finishes on its own. Load this one again; if it is refused with the
+same bytes, free the model or context they belong to`.
 
 When the arena could be rebuilt but the reserve failed (the tail chunk's cap),
 the reason reads `the device could not reserve an arena with these zones. Free

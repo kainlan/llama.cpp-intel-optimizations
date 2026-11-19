@@ -515,7 +515,9 @@ struct zone_runtime_terms {
 bool zone_runtime_requirement(const zone_runtime_terms & terms, size_t * out);
 
 // What points into a VRAM arena that a plan wants larger. The arena grows only by being destroyed and reserved again,
-// which moves every byte in it, so each of these keeps it as it is.
+// which moves every byte in it, so each of these keeps it as it is. The last four are not holders: they count the
+// cache's own releases still to run, whose bytes the zones still count as allocated with no owner left, so the remedy
+// can tell those bytes from a model's or a context's. No gate reads them.
 struct zone_arena_holders {
     size_t   live_zone_bytes  = 0;  // bytes the zones count as allocated
     uint32_t chunk_leases     = 0;  // leases handles hold on the arena's chunks
@@ -523,6 +525,10 @@ struct zone_arena_holders {
     uint32_t scratch_outside  = 0;  // the cache's scratch buffers allocated outside it, printed and never a holder
     uint32_t ring_in_arena    = 0;  // of scratch_in_arena, the PP MoE ring's slot buffers (current and retired slots)
     uint32_t live_beside_ring = 0;  // allocations live in the zones other than the ring's slot buffers
+    size_t   queued_frees     = 0;  // frees queued in the arena and not yet run
+    size_t   release_retries  = 0;  // the device's releases refused once and waiting for a retry
+    size_t   retired_pending  = 0;  // the cache's retired entries not yet finalized
+    size_t   evictions        = 0;  // the cache's evictions still in flight
 };
 
 // Whether the arena may be rebuilt for larger zones: only when nothing points into it. A scratch buffer allocated
