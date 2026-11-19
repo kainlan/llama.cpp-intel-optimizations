@@ -886,10 +886,11 @@ static std::atomic<size_t>   g_planned_onednn_pair_weights_bytes[GGML_SYCL_MAX_D
 static std::atomic<size_t>   g_planned_onednn_pair_activations_bytes[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-8ony: the two figures the current ONEDNN zone was sized from -- the pair's own plan and the Graph SDPA
 // floor that shares the zone -- kept together as ONE snapshot, written by unified_cache::ensure_planned_arena_zones
-// when it keeps or builds the zone. The planner's live figures are overwritten by every model's plan (and the pair's
-// upward by reserve), and the SDPA shape the floor derives from is rewritten by runtime plans the zone was not rebuilt
-// for, so neither can describe a zone that was built earlier: a draft model loaded beside the target would hand a
-// bound derived from the draft's figures to the target's zone.
+// when it keeps or builds the zone, and by onednn_zone_plan_put_back when a failed load's restore puts it back. The
+// planner's live figures are overwritten by every model's plan (and the pair's upward by reserve), and the SDPA shape
+// the floor derives from is rewritten by runtime plans the zone was not rebuilt for, so neither can describe a zone
+// that was built earlier: a draft model loaded beside the target would hand a bound derived from the draft's figures
+// to the target's zone.
 static std::mutex            g_onednn_zone_plan_mutex;
 static zone_onednn_plan      g_onednn_zone_plan[GGML_SYCL_MAX_DEVICES]{};
 
@@ -7933,10 +7934,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             // Keeping the zones as they are answers a rebuild something live blocks when the oneDNN Graph floor is all
             // they lack: the floor is a reservation, served on the DIRECT path under its cap beyond what the zone
             // holds, and a context whose Graph scratch the kept room cannot hold is refused by name at the context.
-            // While the caller's last resort is still to come, a PP MoE ring that alone holds the arena keeps nothing:
-            // a rebuild after its release gives the load its whole Graph floor, and a short zone is the fallback for a
-            // rebuild something live blocks. The call then refuses as below and marks the refusal, and the caller asks
-            // again once it has released the ring or found it claimed.
+            // A ring that alone holds the arena keeps nothing yet: see zone_arena_ensure_options::ring_release_first.
             const zone_arena_sizes need       = { scratch_zone, onednn_zone, runtime_zone };
             const bool             defer_keep = options.ring_release_first && zone_arena_only_ring_holds(true, holders);
             const size_t           held_pair  = arena_held_onednn_pair_bytes();
@@ -7950,12 +7948,8 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
 #if GGML_SYCL_DNNL
                 onednn_graph_direct_cap_snapshot_keep();
 #endif
-                // One WARN per load transaction and device: the load stage asks for the zones in two passes per load
-                // and again in its grow leg, each with the load's transaction, a test's staged load included. A call
-                // outside a staged load (a direct planner entry, a test that asks the cache itself, a context's
-                // re-plan, the pair's reserve) carries transaction 0 and has none to latch on, so it warns at every
-                // ensure call that keeps. The room is the kept floor: the pair bound over the stored snapshot leaves
-                // exactly that.
+                // When the WARN is due: see zone_kept_onednn_warn_due. The room is the kept floor: the pair bound over
+                // the stored snapshot leaves exactly that.
                 const uint64_t latched_txn = onednn_zone_kept_warn_txn_.exchange(options.load_txn);
                 if (zone_kept_onednn_warn_due(latched_txn, options.load_txn)) {
                     GGML_LOG_WARN(

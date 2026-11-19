@@ -5079,11 +5079,6 @@ class unified_cache {
 
     // Zone capacity and usage.
     size_t zone_capacity(vram_zone_id zone) const;
-
-    // The bytes of the oneDNN weights and activations scratch pair that lie inside the arena, which a kept ONEDNN zone
-    // must go on holding, and which a failed load's restore of the zone's snapshot keeps room for. A buffer allocated
-    // outside the arena takes none of the zone. Takes no lock.
-    size_t arena_held_onednn_pair_bytes();
     // The committed planned capacity only, never a bound load's view. Read off
     // a VM device it is a plan defect.
     size_t zone_capacity_committed(vram_zone_id zone) const;
@@ -5093,6 +5088,10 @@ class unified_cache {
     size_t zone_used(vram_zone_id zone) const;
     size_t zone_available(vram_zone_id zone) const;
     size_t zone_largest_free(vram_zone_id zone) const;
+    // The bytes of the oneDNN weights and activations scratch pair that lie inside the arena, which a kept ONEDNN zone
+    // must go on holding, and which a failed load's restore of the zone's snapshot keeps room for. A buffer allocated
+    // outside the arena takes none of the zone. Takes no lock.
+    size_t arena_held_onednn_pair_bytes();
     // Both free-space figures of one zone, read together under its allocator group's mutex: the
     // allocators' figures are only coherent under it (zone_available and zone_largest_free read
     // them bare), with the zone's capacity and used bytes read at the same instant. For a zone with its

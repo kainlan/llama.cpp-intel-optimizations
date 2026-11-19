@@ -596,9 +596,11 @@ struct zone_arena_refusal {
 // How a caller asks for the arena's planned zones (unified_cache::ensure_planned_arena_zones).
 struct zone_arena_ensure_options {
     // The caller releases the PP MoE ring and asks again when the ring alone holds an arena that must grow (the load
-    // stage's entry ensure). A rebuild gives the load its whole Graph floor, and keeping a short ONEDNN zone is the
-    // fallback for a rebuild something live blocks, so while that last resort is still to come no zone is kept: the
-    // call refuses as it would without the keep and sets the refusal's keep_deferred.
+    // stage's entry ensure). A rebuild after that release gives the load its whole Graph floor, and keeping a short
+    // ONEDNN zone is the fallback for a rebuild something live blocks, so while that last resort is still to come no
+    // zone is kept: the call refuses as it would without the keep and sets the refusal's keep_deferred, and the caller
+    // asks again without this option once it has released the ring or found it kept by a prefill's claim on one of
+    // its slots. Other comments that mention this wait point here for the reason.
     bool     ring_release_first = false;
     // The load transaction the call is part of, 0 outside a staged load. A keep of a short ONEDNN zone warns once per
     // load transaction and device (zone_kept_onednn_warn_due), and at every keep for 0.

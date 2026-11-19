@@ -3151,7 +3151,8 @@ int main() {
     // which is a reservation: what the zone cannot hold of it goes to the DIRECT path under its cap. So a second load
     // whose Graph floor needs a larger zone than the live arena has keeps that zone when SCRATCH and RUNTIME hold their
     // needs and the zone still holds the pair. The kept zone is described by a floor of what it holds beyond the pair,
-    // so the pair bound over it is that pair and the Graph room a context check reads is that floor.
+    // so the pair bound over it is the capacity less that stored floor, never below the kept pair, and the Graph room a
+    // context check reads is the stored floor.
     {
         constexpr size_t MiB = 1024ull * 1024ull;
         using ggml_sycl::zone_arena_shortfall_is_reservation_only;

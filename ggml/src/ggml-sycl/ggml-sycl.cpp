@@ -18273,13 +18273,12 @@ static ggml_sycl::zone_arena_ensure_options ggml_sycl_load_arena_options() {
 // a claim outlives its prefill: it is let go when a later prefill takes that slot, when a context on the device is
 // freed (its backend drains the device's slots), or when it is released unused. It is the only ring release a decide
 // step of the load stage makes. A rebuild something live blocks keeps the zones when the oneDNN Graph floor is all they
-// lack (unified_cache::ensure_planned_arena_zones), but not before this last resort: a rebuild after the release
-// gives the load its whole Graph floor, and a short zone is the fallback for a rebuild something live blocks. So the
-// first call asks the cache to release the ring first (ring_release_first), and once the last resort is spent (the
-// ring released, or kept because a prefill's claim on one of its slots is held) the call that asks again may keep the
-// zones. The cache alone decides a keep and says through the refusal's keep_deferred that it would have kept; a kept
-// ring whose arena the cache would not keep refuses the load as any holder does. Caller holds
-// g_tensor_inventory_mutex.
+// lack (unified_cache::ensure_planned_arena_zones), but not before this last resort (why: the comment on
+// zone_arena_ensure_options::ring_release_first). So the first call asks the cache to release the ring first
+// (ring_release_first), and once the last resort is spent (the ring released, or kept because a prefill's claim on one
+// of its slots is held) the call that asks again may keep the zones. The cache alone decides a keep and says through
+// the refusal's keep_deferred that it would have kept; a kept ring whose arena the cache would not keep refuses the
+// load as any holder does. Caller holds g_tensor_inventory_mutex.
 static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_refusal & refusal) {
     ggml_sycl::zone_arena_ensure_options options = ggml_sycl_load_arena_options();
     options.ring_release_first                   = true;

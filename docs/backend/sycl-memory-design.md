@@ -652,6 +652,7 @@ ticket reproduced on:
   formula exceeded the old cap, the floor of a zone that already serves
   that shape together with the DIRECT path, and so ask for a rebuild the
   shape does not need.
+
   **A kept ONEDNN zone.** The Graph floor is a reservation, not a
   requirement: what the zone cannot hold of it is served on the DIRECT
   path under the cap, and a runtime context whose Graph scratch does not
@@ -673,11 +674,11 @@ ticket reproduced on:
   less than that, read as the plan stands when the line prints (on a
   multi-device plan the zones are ensured after the floor line). A
   rebuild, which gives the load its whole floor, is preferred to a keep:
-  when a PP MoE ring a freed
-  context left is the arena's only holder, the load stage's entry first
-  releases the ring and asks again, and a short zone is kept only once
-  that last resort is spent (the ring released with something else still
-  holding, or the ring kept because a prefill's claim on a slot is held).
+  when the arena's only holder is a PP MoE ring that a freed context left
+  behind, the load stage's entry first releases the ring and asks again,
+  and a short zone is kept only once that last resort is spent (the ring
+  released with something else still holding, or the ring kept because a
+  prefill's claim on a slot is held).
   A SCRATCH or RUNTIME shortfall, or an ONEDNN zone below the pair, is
   still the `REBUILD_HELD` refusal that names the holders. The zone plan a
   keep or the sufficient path stores is a description (the pair plan and
@@ -697,6 +698,7 @@ ticket reproduced on:
   as it stands, and a failed load that rebuilt the arena leaves the rebuilt
   arena in place, so the snapshot stored at that rebuild is the one that
   arena's cap is derived from.
+
   ⚠️ **This gemma4 example describes the formula's behavior for the
   `n_ctx` it is actually given at PLANNING time, which is NOT today's
   real runtime context by default.** The floor is computed once, at
@@ -3147,8 +3149,8 @@ The arena can fail to grow for three reasons, and each prints its own line first
   a prefill's claim on one of its slots is still held, with a WARN that says so,
   and the load is refused as for any holder, unless the Graph floor was all the
   zones lacked: the entry then asks once more and the zones are kept short. The
-  first ask, made before the release, keeps nothing, since a rebuild after the
-  release gives the load its whole floor.
+  first ask, made before the release, keeps nothing ("A kept ONEDNN zone" above
+  says why).
 
   The sites are `weight_snapshot`, `weight_resolve`, `chunk_view` (a handle made
   from a raw pointer for one use), `tensor_extra`, `expert_dispatch` and
