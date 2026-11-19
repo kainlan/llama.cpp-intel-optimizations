@@ -12,7 +12,8 @@
 // gpu-serial, serial, with the selector pinned to the discrete cards, and a host with no SYCL GPU exits 77 before any
 // arm runs (th32 §11). Arm (g) runs late passes, which configure every device's host zones from a small plan, so it
 // runs last: no earlier arm may configure them. Arm (h) rebuilds device 0's arena with a larger RUNTIME zone, which
-// stays after its uncommitted load, so it runs after every arm that reads that arena as found.
+// stays after its uncommitted load, so it runs after every arm that reads that arena as found. Arm (i) grows device
+// 0's ONEDNN zone for a 1 GiB Graph floor in its reverse leg, which stays too, so it runs after (h) and before (g).
 //
 // Every arm names its engagement check, the observation that proves it reached the mechanism it scores, and the
 // mutant it kills. An arm whose engagement check fails is VOID, and a VOID arm fails the binary like a FAIL. Every arm
@@ -1346,6 +1347,206 @@ arm_result arm_h_load_releases_a_lone_ring() {
     return r;
 }
 
+// One staged early pass of `inv` in a load transaction of its own, ended uncommitted, with what device 0's ONEDNN zone
+// was asked to hold read inside the open load: the planned requirement (the oneDNN pair and the Graph floor, as the
+// zone ensure reads it), the pair alone, and the Graph room a context check reads over the zone.
+struct graph_floor_load {
+    ggml_sycl_lifecycle_result begin          = GGML_SYCL_LIFECYCLE_OK;
+    ggml_sycl_lifecycle_result stage          = GGML_SYCL_LIFECYCLE_OK;
+    size_t                     planned_onednn = 0;
+    size_t                     planned_pair   = 0;
+    size_t                     room           = 0;
+    bool                       room_read      = false;
+};
+
+graph_floor_load stage_early_reading_the_graph_room(const ggml_sycl_tensor_inventory & inv) {
+    graph_floor_load   out;
+    ggml_sycl_load_txn txn{};
+    out.begin = ggml_backend_sycl_model_load_begin(&txn);
+    if (out.begin != GGML_SYCL_LIFECYCLE_OK) {
+        return out;
+    }
+    out.stage          = ggml_backend_sycl_stage_load_inventory_plan(&inv, nullptr, true);
+    out.planned_onednn = unified_cache_get_planned_onednn_scratchpad_bytes(0);
+    out.planned_pair   = unified_cache_get_planned_onednn_scratchpad_bytes_stored(0);
+    out.room_read      = unified_cache_get_onednn_graph_room(0, &out.room);
+    (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    return out;
+}
+
+// Device 0's three arena zone capacities.
+struct arena_zone_capacities {
+    size_t scratch = 0;
+    size_t onednn  = 0;
+    size_t runtime = 0;
+
+    bool operator==(const arena_zone_capacities & o) const {
+        return scratch == o.scratch && onednn == o.onednn && runtime == o.runtime;
+    }
+};
+
+arena_zone_capacities read_zone_capacities(unified_cache * cache) {
+    return { cache->zone_capacity(vram_zone_id::SCRATCH), cache->zone_capacity(vram_zone_id::ONEDNN),
+             cache->zone_capacity(vram_zone_id::RUNTIME) };
+}
+
+std::string zone_capacities_text(const arena_zone_capacities & z) {
+    return "SCRATCH " + num(z.scratch) + ", ONEDNN " + num(z.onednn) + ", RUNTIME " + num(z.runtime);
+}
+
+// A 4 KiB allocation in device 0's RUNTIME zone, which holds the arena as a live model's allocations would (arm (e)).
+allocation_result allocate_runtime_page(unified_cache * cache) {
+    alloc_request req{};
+    req.queue                               = &cache->get_queue();
+    req.device                              = 0;
+    req.size                                = 4096;
+    req.intent.role                         = alloc_role::GRAPH_TMP;
+    req.intent.category                     = runtime_category::GRAPH;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+    return unified_allocate_owner(req);
+}
+
+// Whether `holder` lies in device 0's RUNTIME zone, where it holds the arena.
+bool holds_the_runtime_zone(const mem_handle & holder) {
+    const resolved_ptr p = holder.resolve();
+    alloc_metadata     meta{};
+    return p && p.on_device && unified_lookup(p.ptr, &meta) && meta.zone == vram_zone_id::RUNTIME;
+}
+
+// (i) A second load whose only shortfall beside a live allocation is the oneDNN Graph floor loads and keeps the zones
+// as they are, and the reverse order takes the sufficient path. The ONEDNN zone holds the oneDNN primitive pair and the
+// Graph scratch floor. The floor is a reservation: what the zone cannot hold of it is served on the DIRECT path under
+// its cap, and a context whose Graph scratch does not fit is refused by name at the context. The zones grow only by a
+// rebuild, which nothing live allows, so such a load keeps a short zone instead of being refused. Two shaped
+// inventories differ only in n_head_ctx_max, which sizes the Graph floor and nothing else: 8 heads (a floor of a few
+// MiB at the 512 x 512 planning shape) and 2048 (3 GiB by the formula, held to the DIRECT cap of at most 1 GiB).
+//   keep:    the small load stages with nothing holding the arena, so every zone holds what the large load needs but
+//            the ONEDNN zone its floor; a 4 KiB RUNTIME-zone allocation then holds the arena, and the large load,
+//            ended uncommitted, stages OK with one "[VRAM-ARENA] device 0 keeps its ONEDNN zone" WARN and no refusal
+//            line; all three zone capacities are unchanged; the Graph room it reads inside the open load is below the
+//            planned floor (the context check reads the kept zone, not the plan); the allocation is where it was;
+//   reverse: with the allocation released, the large load stages with nothing holding, so the zones hold its floor;
+//            a new allocation holds the arena, and the small load stages OK with no keep WARN and every zone capacity
+//            unchanged.
+// Engagement: device 0's arena is active; each load beside nothing staged OK; inside the open large load beside the
+// allocation the planned ONEDNN requirement exceeds the zone, so the zones could not hold it as they stood (VOID
+// otherwise: the Graph allocator is off, the plan spans both cards, or an earlier arm left a zone that holds the
+// floor);
+// after the reverse leg's large load the zone holds that requirement; each allocation lands in the RUNTIME zone.
+// Mutants: the keep removed (the large load returns PLAN_REJECTED after a refusal line); the keep taken by a rebuild
+// (a capacity moves, or the allocation no longer resolves where it was); the WARN dropped or repeated within the load;
+// the room read from the plan rather than the kept zone (it is not below the floor); the reverse order kept short (a
+// keep WARN, or a capacity moves).
+arm_result arm_i_graph_floor_keeps_the_held_zones() {
+    arm_result      r;
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (cache == nullptr || !cache->arena_active()) {
+        void_arm(r, "device 0 has no active VRAM arena, so nothing can hold its zones");
+        return r;
+    }
+    const char * const kept_warn = "[VRAM-ARENA] device 0 keeps its ONEDNN zone of ";
+    const char * const refused   = "[SYCL-PLAN] model load refused on device 0: ";
+    loader_inventory   small(qwen38_shape);
+    loader_inventory   large(qwen38_shape);
+    small.inv.n_head_ctx_max = 8;
+    large.inv.n_head_ctx_max = 2048;
+
+    // keep
+    const staged_early_load sizing = stage_early_and_end(small.inv);
+    if (sizing.begin != GGML_SYCL_LIFECYCLE_OK || sizing.stage != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "the small load's begin returned " + num(sizing.begin) + " and its stage " + num(sizing.stage) +
+                        " with nothing holding the arena, so the zones may not hold its terms");
+        return r;
+    }
+    {
+        allocation_result allocation = allocate_runtime_page(cache);
+        if (!allocation) {
+            void_arm(r, "the 4 KiB RUNTIME-zone allocation was refused");
+            return r;
+        }
+        // The handle's destructor is the allocation's one release point, at the end of this leg.
+        const mem_handle holder = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        if (!holds_the_runtime_zone(holder)) {
+            void_arm(r, "the allocation is not in device 0's RUNTIME zone, so it does not hold the arena");
+            return r;
+        }
+        const resolved_ptr          first  = holder.resolve();
+        const arena_zone_capacities before = read_zone_capacities(cache);
+        log_clear();
+        const graph_floor_load         kept     = stage_early_reading_the_graph_room(large.inv);
+        const std::vector<std::string> warned   = lines_with(kept_warn);
+        const std::vector<std::string> refusals = lines_with(refused);
+        const arena_zone_capacities    after    = read_zone_capacities(cache);
+        if (kept.begin != GGML_SYCL_LIFECYCLE_OK) {
+            void_arm(r, "the large load's transaction did not begin (" + num(kept.begin) + ")");
+            return r;
+        }
+        if (kept.planned_onednn <= before.onednn) {
+            void_arm(r, "inside the large load the planned ONEDNN requirement is " + num(kept.planned_onednn) +
+                            " bytes, which the " + num(before.onednn) + "-byte zone holds, so nothing had to be kept " +
+                            "(the Graph allocator is off, the plan spans both cards, or an earlier arm grew the zone)");
+            return r;
+        }
+        expect(r, kept.stage == GGML_SYCL_LIFECYCLE_OK,
+               "a load whose Graph floor alone outgrows the " + num(before.onednn) +
+                   "-byte ONEDNN zone beside a live allocation returned " + num(kept.stage) + ", not OK" +
+                   (refusals.empty() ? std::string() : ": " + refusals[0]));
+        expect(r, warned.size() == 1, "the kept load logged " + num(warned.size()) + " keep WARN lines, want 1");
+        expect(r, refusals.empty(), "the kept load logged a refusal line: " + (refusals.empty() ? "" : refusals[0]));
+        expect(
+            r, after == before,
+            "a kept load moved the zones from " + zone_capacities_text(before) + " to " + zone_capacities_text(after));
+        const size_t planned_floor =
+            kept.planned_onednn > kept.planned_pair ? kept.planned_onednn - kept.planned_pair : 0;
+        expect(r, kept.room_read && kept.room < planned_floor,
+               "inside the kept load the Graph room reads " + num(kept.room) + " bytes (read " + num(kept.room_read) +
+                   "), not below the " + num(planned_floor) + "-byte planned floor the zone could not hold");
+        const resolved_ptr again = holder.resolve();
+        expect(r, again.ptr == first.ptr && again.on_device && holds_the_runtime_zone(holder),
+               "the allocation no longer resolves to its device pointer in the RUNTIME zone after the kept load");
+    }
+
+    // reverse
+    log_clear();
+    const graph_floor_load      grown       = stage_early_reading_the_graph_room(large.inv);
+    const arena_zone_capacities grown_zones = read_zone_capacities(cache);
+    if (grown.begin != GGML_SYCL_LIFECYCLE_OK || grown.stage != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "the large load's begin returned " + num(grown.begin) + " and its stage " + num(grown.stage) +
+                        " with nothing holding the arena, so the reverse order has no zone sized for its floor");
+        return r;
+    }
+    if (grown_zones.onednn < grown.planned_onednn) {
+        void_arm(r, "after the large load with nothing holding the arena the ONEDNN zone is " +
+                        num(grown_zones.onednn) + " bytes, below its " + num(grown.planned_onednn) +
+                        "-byte requirement, so the reverse order would not take the sufficient path");
+        return r;
+    }
+    allocation_result allocation = allocate_runtime_page(cache);
+    if (!allocation) {
+        void_arm(r, "the reverse order's 4 KiB RUNTIME-zone allocation was refused");
+        return r;
+    }
+    const mem_handle holder = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    if (!holds_the_runtime_zone(holder)) {
+        void_arm(r, "the reverse order's allocation is not in device 0's RUNTIME zone");
+        return r;
+    }
+    log_clear();
+    const staged_early_load        second  = stage_early_and_end(small.inv);
+    const std::vector<std::string> warned  = lines_with(kept_warn);
+    const arena_zone_capacities    settled = read_zone_capacities(cache);
+    expect(r, second.begin == GGML_SYCL_LIFECYCLE_OK && second.stage == GGML_SYCL_LIFECYCLE_OK,
+           "the smaller load beside the allocation in zones sized for the larger floor returned begin " +
+               num(second.begin) + " and stage " + num(second.stage) + ", not OK");
+    expect(r, warned.empty(),
+           "the smaller load took the keep, not the sufficient path: " + (warned.empty() ? std::string() : warned[0]));
+    expect(r, settled == grown_zones,
+           "the smaller load moved the zones from " + zone_capacities_text(grown_zones) + " to " +
+               zone_capacities_text(settled));
+    return r;
+}
+
 // The q2k fixture's shape with 256 experts: each expert tensor is 32 times larger, so the plan's host staging and
 // SCRATCH zones, which follow the largest copied tensor, are larger than the q2k shape's.
 constexpr host_plan_shaped_inventory::moe_shape q2k_wide_shape = {
@@ -1525,6 +1726,7 @@ int main() {
         { "(e) a load the held arena cannot hold is refused",    arm_e_held_arena_refuses_the_load                },
         { "(f) a load refused early keeps the KV-zone ring",     arm_f_early_refusal_keeps_the_kv_zone_ring       },
         { "(h) a load releases a ring alone holding the arena",  arm_h_load_releases_a_lone_ring                  },
+        { "(i) a Graph floor alone keeps the held zones",        arm_i_graph_floor_keeps_the_held_zones           },
         { "(g) a refused late pass configures no host zone",     arm_g_refused_late_pass_configures_no_host_zones },
     };
     int passed = 0, failed = 0, voided = 0;
