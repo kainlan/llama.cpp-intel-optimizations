@@ -4,11 +4,11 @@
 //
 // For each type, a planned model is loaded the way libllama loads one (test-moe-pp-batched-dequant.cpp describes the
 // sequence): its three expert tensors sit in the card's SYCL host buffer type and are registered while the load is
-// open. Between the inventory stage and the weight load, the fixture copies the load's candidate plan, moves the experts
-// in k_host_experts of every expert tensor to the host (placement_plan::demote_expert_placement_to_host keeps the plan's
-// byte terms consistent), and stages the copy as the candidate again. The commit's preload then materializes the other
-// experts on the card and registers the moved ones as host experts. The cases take the side each expert runs on from
-// the plan the commit published.
+// open. Between the inventory stage and the weight load, the fixture copies the load's candidate plan, moves the
+// experts in k_host_experts of every expert tensor to the host (placement_plan::demote_expert_placement_to_host keeps
+// the plan's byte terms consistent), and stages the copy as the candidate again. The commit's preload then
+// materializes the other experts on the card and registers the moved ones as host experts. The cases take the side
+// each expert runs on from the plan the commit published.
 //
 // Each case runs one MUL_MAT_ID op at 1 token (decode), 7 tokens and 512 tokens (prompt), on the gate tensor with the
 // activation broadcast to every used expert (ne11 1) and on the down tensor with one activation row per used expert
