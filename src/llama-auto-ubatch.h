@@ -60,9 +60,8 @@ static const uint32_t llama_auto_ubatch_ladder[] = { 512, 1024, 2048, 4096 };
 static const size_t   llama_auto_ubatch_ladder_size =
     sizeof(llama_auto_ubatch_ladder) / sizeof(llama_auto_ubatch_ladder[0]);
 
-// The largest micro-batch the trial tries for a MoE model. The backend sizes MoE routing from the context's own
-// micro-batch, so this is the picker's policy, not a backend limit: it keeps MoE models at the width the tuning cache
-// and the baselines were measured at until wider widths are measured against it.
+// The largest micro-batch the trial tries for a MoE model. This is the picker's own policy: it keeps MoE models at
+// the width the tuning cache and the baselines were measured at until wider widths are measured against it.
 static const uint32_t llama_auto_ubatch_moe_ceiling = 512;
 
 // The smallest n_ubatch the trial lowers itself to (llama.cpp-kpjw).

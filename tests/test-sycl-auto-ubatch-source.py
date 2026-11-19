@@ -448,9 +448,9 @@ _MOE_CEILING_DECL = "static const uint32_t llama_auto_ubatch_moe_ceiling = 512;"
 def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap():
     """For a MoE model (hparams.n_expert > 0), the cap is narrowed to the picker's own MoE ceiling,
     llama_auto_ubatch_moe_ceiling in src/llama-auto-ubatch.h, and the "MoE GPU routing ceiling" stop reason is
-    reported whenever that ceiling BINDS (moe_cap <= cap), not only when it is strictly smaller. The backend no
-    longer has a row limit for MoE routing, so the ceiling is the picker's policy until the wide-width measurement
-    lifts it; it is read from nowhere else, and llama-context.cpp holds no bare 512 for it."""
+    reported whenever that ceiling BINDS (moe_cap <= cap), not only when it is strictly smaller. The ceiling is the
+    picker's policy until the wide-width measurement lifts it; it is read from nowhere else, and llama-context.cpp
+    holds no bare 512 for it."""
     helper = _cap_helper_body()
     assert _MOE_NARROW in helper, (
         "llama_auto_ubatch_cap must narrow `cap` only when n_expert > 0 && moe_cap_available && "
@@ -521,9 +521,8 @@ def _backend_moe_ceiling_violations(texts: dict) -> list:
 
 
 def test_the_backend_exports_no_moe_routing_ceiling():
-    """The backend has no micro-batch limit for MoE routing: the control layout and the CPU recipe workspace are
-    sized from the context's micro-batch. So ggml-sycl.h declares no ceiling accessor, ggml-sycl.cpp defines and
-    registers none, and llama-context.cpp looks none up."""
+    """The MoE ceiling has one owner, the picker. So ggml-sycl.h declares no ceiling accessor, ggml-sycl.cpp defines
+    and registers none, and llama-context.cpp looks none up."""
     texts = {
         "ggml/include/ggml-sycl.h": GGML_SYCL_H_CODE,
         "ggml/src/ggml-sycl/ggml-sycl.cpp": GGML_SYCL_CPP_CODE,
@@ -533,7 +532,8 @@ def test_the_backend_exports_no_moe_routing_ceiling():
 
 
 def test_the_backend_exports_no_moe_routing_ceiling_has_a_mutation_witness():
-    """Proves the check above catches the accessor coming back in any one of the three files."""
+    """Proves the check above catches the accessor coming back. It mutates ggml-sycl.h only: the scan is one
+    substring test applied to every file in the same dict, so one mutated file shows it reports a file by name."""
     mutant = GGML_SYCL_H_CODE + "\nGGML_BACKEND_API uint32_t ggml_backend_sycl_moe_gpu_ubatch_max(void);\n"
     texts = {
         "ggml/include/ggml-sycl.h": mutant,
