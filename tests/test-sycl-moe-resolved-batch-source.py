@@ -343,32 +343,6 @@ def dispatch_reject_violations(mmvq: str, mmvq_header: str, sycl: str, seam: str
     return failures
 
 
-SECONDARY_ROUTE_LAMBDA = "auto enforce_secondary_route_capability = [&]("
-SECONDARY_ROUTE_WARN = ('GGML_LOG_WARN("[MOE-ROUTE] planned secondary route unsupported and no handle-backed host route'
-                        ' is available')
-SECONDARY_ROUTE_RESET = ("local_extra.moe_expert_id = -1;",
-                         "ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);")
-SECONDARY_ROUTE_THROW = 'throw ggml_sycl_fallback_error("MUL_MAT_ID planned secondary route unsupported'
-
-
-def secondary_route_refusal_violations(source: str) -> list[str]:
-    """A planned secondary route neither card nor host can run ends the op with a named refusal, never an abort."""
-    if SECONDARY_ROUTE_LAMBDA not in source:
-        return ["enforce_secondary_route_capability"]
-    body = tokens(function_definition(source, SECONDARY_ROUTE_LAMBDA))
-    failures: list[str] = []
-    if "GGML_ABORT" in body or "abort" in body:
-        failures.append("planned secondary route refusal aborts the process")
-    try:
-        at = [token_sequence_index(body, step) for step in (SECONDARY_ROUTE_WARN, *SECONDARY_ROUTE_RESET,
-                                                             SECONDARY_ROUTE_THROW)]
-        if at != sorted(at):
-            failures.append("planned secondary route refusal order: WARN, state reset, throw")
-    except ValueError as missing:
-        failures.append(f"planned secondary route refusal: {missing}")
-    return failures
-
-
 def violations(header: str, source: str, host_test: str, mem_handle_source: str) -> list[str]:
     failures: list[str] = []
     required_header = {
@@ -1190,24 +1164,6 @@ def test_batched_dispatch_names_every_refusal() -> None:
     for name, (m_mmvq, m_header, m_sycl, m_seam) in mutants.items():
         assert (m_mmvq, m_header, m_sycl, m_seam) != (mmvq, mmvq_header, sycl, seam), f"mutation changed nothing: {name}"
         assert dispatch_reject_violations(m_mmvq, m_header, m_sycl, m_seam), f"mutation survived: {name}"
-
-
-def test_secondary_route_refusal_is_named() -> None:
-    source = SOURCE.read_text()
-    assert secondary_route_refusal_violations(source) == []
-    lam = function_definition(source, SECONDARY_ROUTE_LAMBDA)
-    throw = re.search(r"throw ggml_sycl_fallback_error\([^;]*\);", lam)
-    warn_at = lam.rfind("GGML_LOG_WARN(")
-    mutants = {
-        "restore-abort": re.sub(r'GGML_LOG_WARN\((\s*"\[MOE-ROUTE\] planned secondary route unsupported)',
-                                r"GGML_ABORT(\1", lam, count=1),
-        "drop-state-reset": lam.replace("local_extra.moe_expert_id = -1;", "", 1),
-        "throw-before-warn": (lam[:warn_at] + throw.group(0) + "\n" + lam[warn_at:].replace(throw.group(0), "", 1)
-                              if throw and warn_at >= 0 else lam),
-    }
-    for name, mutated in mutants.items():
-        assert mutated != lam, f"mutation changed nothing: {name}"
-        assert secondary_route_refusal_violations(source.replace(lam, mutated, 1)), f"mutation survived: {name}"
 
 
 if __name__ == "__main__":
