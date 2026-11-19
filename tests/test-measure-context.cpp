@@ -504,6 +504,40 @@ static void check_run_paths() {
         CHECK(g_run_installs == g_run_clears, "a failed construction: %d installs, %d clears", g_run_installs,
               g_run_clears);
     }
+
+    // The shape the load resolves from the caller's hints is the shape the measure context runs at: the context's own
+    // n_ctx() and n_ubatch(), which the first trace line prints, against the resolver's answer. Both hints name a
+    // context above the fixture's training context (256), which a context accepts with a WARN: 300 with a micro-batch
+    // the resolver clamps to the unpadded context, and 4096 with one it keeps.
+    struct shape_case {
+        uint32_t n_ctx_hint;
+        uint32_t n_ubatch_hint;
+    };
+
+    static const shape_case shape_cases[] = {
+        { 300,  512  },
+        { 4096, 1024 }
+    };
+    for (const shape_case & c : shape_cases) {
+        const llama_load_measure_shape shape =
+            llama_load_measure_shape_resolve(c.n_ctx_hint, c.n_ubatch_hint, model.hparams.n_ctx_train);
+        g_run_installs                           = 0;
+        g_run_clears                             = 0;
+        llama_measure_context_args         args  = cpu_args();
+        const llama_measure_override_procs procs = { &fake_install_ok, &fake_clear_counted };
+        const llama_load_measure_result    r =
+            llama_load_measure_run(model, args, procs, shape, 7, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, 0);
+        unsigned     n_ctx    = 0;
+        unsigned     n_ubatch = 0;
+        const char * at       = r.trace.empty() ? nullptr : strstr(r.trace[0].c_str(), " n_ctx=");
+        const bool   parsed   = at != nullptr && sscanf(at, " n_ctx=%u n_ubatch=%u", &n_ctx, &n_ubatch) == 2;
+        CHECK(r.ok && parsed && n_ctx == shape.n_ctx && n_ubatch == shape.n_ubatch,
+              "hints %u/%u resolve to %u/%u, the measure ran at %u/%u (ok=%d parsed=%d: %s)", c.n_ctx_hint,
+              c.n_ubatch_hint, shape.n_ctx, shape.n_ubatch, n_ctx, n_ubatch, (int) r.ok, (int) parsed,
+              r.refusal.c_str());
+        printf("test-measure-context: hints %u/%u resolve to %u/%u; the measure ran at %u/%u\n", c.n_ctx_hint,
+               c.n_ubatch_hint, shape.n_ctx, shape.n_ubatch, n_ctx, n_ubatch);
+    }
 }
 
 int main() {
