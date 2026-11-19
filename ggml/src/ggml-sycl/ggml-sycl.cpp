@@ -86425,12 +86425,13 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
 
 // The exception text for a Q1_0/NVFP4 AOS operand whose batched dispatch refused, by the reason the dispatch named
 // (or no-ptr-table when it never ran). ggml_sycl_fallback_error keeps the pointer it is given, so every text is a
-// literal joined to its reason at compile time rather than a formatted string. test-failpoint comes only from the
+// literal joined to its reason at compile time rather than a formatted string. Only those literals outlive the call,
+// so the table itself is an ordinary local and holds no process state. test-failpoint comes only from the
 // private-testing build.
 static const char * ggml_sycl_moe_q1_nvfp4_refusal_text(const char * reason) {
 #define GGML_SYCL_Q1_NVFP4_REFUSAL(r) { r, "MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand refused: " r }
 
-    static constexpr struct {
+    constexpr struct {
         const char * reason;
         const char * text;
     } k_refusal_texts[] = {
