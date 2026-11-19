@@ -711,6 +711,37 @@ static std::string zone_arena_teardown_text(zone_arena_teardown_refusal cause, i
     return text + closed;
 }
 
+void zone_scratch_use_note_alloc(zone_scratch_use & use, size_t request_bytes, size_t used_bytes, size_t live) {
+    use.requests += use.requests < SIZE_MAX ? 1 : 0;
+    use.largest_request_bytes = std::max(use.largest_request_bytes, request_bytes);
+    if (used_bytes > use.high_water_bytes) {
+        use.high_water_bytes   = used_bytes;
+        use.live_at_high_water = live;
+    }
+}
+
+void zone_scratch_use_note_miss(zone_scratch_use & use, size_t request_bytes) {
+    use.misses += use.misses < SIZE_MAX ? 1 : 0;
+    use.miss_bytes         = request_bytes > SIZE_MAX - use.miss_bytes ? SIZE_MAX : use.miss_bytes + request_bytes;
+    use.largest_miss_bytes = std::max(use.largest_miss_bytes, request_bytes);
+}
+
+std::string zone_scratch_use_text(const zone_scratch_use & use, int device, size_t capacity_bytes) {
+    if (use.requests == 0 && use.misses == 0) {
+        return {};
+    }
+    constexpr double mib = 1024.0 * 1024.0;
+    char             line[512];
+    std::snprintf(line, sizeof(line),
+                  "[UNIFIED-CACHE] SCRATCH zone use: device=%d high-water=%.2f MB of %.2f MB with %zu allocations "
+                  "live, largest request=%.2f MB, requests placed=%zu; zone misses, sent to raw device memory: "
+                  "requests=%zu bytes=%.2f MB largest=%.2f MB",
+                  device, use.high_water_bytes / mib, capacity_bytes / mib, use.live_at_high_water,
+                  use.largest_request_bytes / mib, use.requests, use.misses, use.miss_bytes / mib,
+                  use.largest_miss_bytes / mib);
+    return line;
+}
+
 std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {
     if (refusal.reason == zone_arena_refusal_reason::NONE) {
         return {};

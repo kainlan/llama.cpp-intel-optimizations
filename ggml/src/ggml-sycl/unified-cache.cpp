@@ -8224,6 +8224,23 @@ bool unified_cache::shutdown_resources() {
                     ggml_sycl::zone_sizing_underestimate_count("onednn"));
     (void) ggml_sycl::zone_sizing_log_underestimate_summary();
 
+    // The SCRATCH zone's use, in the same "silent unless used" form as the oneDNN Graph high-water line below: how much
+    // of the zone was in use at once, in how many allocations, and how many requests it could not place and sent to raw
+    // device memory. WARN because INFO is dropped at default verbosity. Ahead of the early returns below for the same
+    // reason as that line, so a process-exit teardown still reports.
+    {
+        zone_scratch_use scratch_use;
+        {
+            std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(vram_zone_id::SCRATCH));
+            scratch_use = scratch_zone_use_;
+        }
+        if (scratch_use.requests != 0 || scratch_use.misses != 0) {
+            const std::string line = zone_scratch_use_text(scratch_use, ggml_sycl_get_device_id_from_queue(queue_),
+                                                           arena_zones_[static_cast<int>(vram_zone_id::SCRATCH)].size);
+            GGML_LOG_WARN("%s\n", line.c_str());
+        }
+    }
+
 #if GGML_SYCL_DNNL
     // llama.cpp-gwno: same "silent unless interesting" convention as the zone
     // sizing summary just above -- absent on a run that never used the Graph
@@ -30830,7 +30847,17 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
     // Physical group lock is common to logical sharers.
     std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
     allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
-    if (group.state != allocator_group_state::OPEN || !arena_zone_open(zone)) return nullptr;
+
+    // The SCRATCH zone's use is counted here, under the group lock this call holds: each placement, and each request
+    // the zone cannot place, which unified_allocate then sends to raw device memory. The lock covers the zone's used
+    // bytes and its group's live allocations, so a placement reads both as this call left them.
+    const bool scratch = zone == vram_zone_id::SCRATCH;
+    if (group.state != allocator_group_state::OPEN || !arena_zone_open(zone)) {
+        if (scratch) {
+            zone_scratch_use_note_miss(scratch_zone_use_, size);
+        }
+        return nullptr;
+    }
 
     // TLSF returns OFFSET into the managed region; convert to device pointer. In a single-chunk arena WEIGHT
     // allocates from KV's allocator, whose used() is both zones' bytes: the zone's counter takes this call's delta.
@@ -30860,8 +30887,14 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
             zone_used_free(*alloc, offset, z.used);
             return nullptr;
         }
+        if (scratch) {
+            zone_scratch_use_note_alloc(scratch_zone_use_, size, zone_count, group.allocations.size());
+        }
         if (exact) *exact = committed;
         return ptr;
+    }
+    if (scratch) {
+        zone_scratch_use_note_miss(scratch_zone_use_, size);
     }
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);

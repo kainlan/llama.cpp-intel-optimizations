@@ -6418,6 +6418,11 @@ class unified_cache {
     };
     static constexpr size_t ARENA_ALLOCATOR_GROUP_COUNT = 4;
     std::array<allocator_group, ARENA_ALLOCATOR_GROUP_COUNT> arena_allocator_groups_{};
+
+    // How the SCRATCH zone was used over this cache's life, logged at teardown. Written by zone_alloc under the
+    // SCRATCH group's mutex, which that allocation already holds, and read under it at teardown.
+    zone_scratch_use scratch_zone_use_{};
+
     std::mutex arena_destroy_mutex_;  // serializes retryable explicit destroy transactions
     static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;

@@ -655,6 +655,31 @@ bool zone_kept_onednn_warn_due(uint64_t latched_txn, uint64_t load_txn);
 // context or micro-batch as the remedy.
 std::string zone_arena_refusal_text(const zone_arena_refusal & refusal);
 
+// How a cache's SCRATCH zone was used over its life, for the line the cache logs at teardown. The zone is shared by
+// per-op scratch (the MoE batched MMVQ Q8_1 activations and ids among it) and is sized by no op's demand, so this is
+// what says how much of it was in use at once and how many allocations made that up. A request the zone could not
+// place goes to raw device memory outside the arena (no SCRATCH caller forbids the spill), and is counted as a miss.
+// The cache updates it under the SCRATCH allocator group's mutex, which every allocation in the zone already holds.
+struct zone_scratch_use {
+    size_t requests              = 0;  // requests the zone placed
+    size_t largest_request_bytes = 0;  // the largest of them
+    size_t high_water_bytes      = 0;  // the zone's used bytes at their highest, allocator rounding included
+    size_t live_at_high_water    = 0;  // allocations live in the zone when that high-water was set
+    size_t misses                = 0;  // requests the zone could not place
+    size_t miss_bytes            = 0;  // their bytes, summed (saturating)
+    size_t largest_miss_bytes    = 0;  // the largest of them
+};
+
+// A request of `request_bytes` the zone placed, leaving `used_bytes` in use in `live` allocations. Pure.
+void zone_scratch_use_note_alloc(zone_scratch_use & use, size_t request_bytes, size_t used_bytes, size_t live);
+
+// A request of `request_bytes` the zone could not place. Pure.
+void zone_scratch_use_note_miss(zone_scratch_use & use, size_t request_bytes);
+
+// The teardown line, without a newline, for the zone of `capacity_bytes` on `device`. Empty when the zone placed
+// nothing and missed nothing. Pure.
+std::string zone_scratch_use_text(const zone_scratch_use & use, int device, size_t capacity_bytes);
+
 // The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the
 // hold can be) plus the largest spill-capable RUNTIME request, because a held-back request spills whole. The
 // request was observed at `hwm_n_ubatch`; compute buffers scale about linearly with n_ubatch, so it is scaled to

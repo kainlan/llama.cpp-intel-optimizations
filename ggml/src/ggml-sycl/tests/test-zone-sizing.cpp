@@ -3316,6 +3316,50 @@ int main() {
         CHECK(room_over(smaller, 400 * MiB) == 200 * MiB, "the Graph room in the smaller zone is not the floor");
     }
 
+    // ---- Case 45: the SCRATCH zone's use over a cache's life, and the line its teardown logs ----------------------
+    // The high-water keeps the live allocations of the moment it was set; a later placement below it changes neither.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_scratch_use;
+        using ggml_sycl::zone_scratch_use_note_alloc;
+        using ggml_sycl::zone_scratch_use_note_miss;
+        using ggml_sycl::zone_scratch_use_text;
+
+        zone_scratch_use use;
+        CHECK(zone_scratch_use_text(use, 1, 512 * MiB).empty(), "an unused zone printed a line");
+
+        zone_scratch_use_note_alloc(use, 2 * MiB, 2 * MiB, 1);
+        zone_scratch_use_note_alloc(use, 9 * MiB, 11 * MiB, 2);
+        zone_scratch_use_note_alloc(use, 1 * MiB, 3 * MiB, 2);  // after frees: below the high-water
+        CHECK(use.requests == 3 && use.largest_request_bytes == 9 * MiB, "placements were not counted");
+        CHECK(use.high_water_bytes == 11 * MiB && use.live_at_high_water == 2,
+              "the high-water did not keep the allocations live when it was set");
+        zone_scratch_use_note_alloc(use, 4 * MiB, 11 * MiB, 5);
+        CHECK(use.live_at_high_water == 2, "an equal used figure replaced the high-water's moment");
+        CHECK(use.misses == 0 && use.miss_bytes == 0, "a placement counted as a miss");
+
+        zone_scratch_use_note_miss(use, 600 * MiB);
+        zone_scratch_use_note_miss(use, 40 * MiB);
+        CHECK(use.misses == 2 && use.miss_bytes == 640 * MiB && use.largest_miss_bytes == 600 * MiB,
+              "misses were not counted");
+        zone_scratch_use_note_miss(use, SIZE_MAX);
+        CHECK(use.miss_bytes == SIZE_MAX, "the missed bytes did not saturate");
+
+        zone_scratch_use only_misses;
+        zone_scratch_use_note_miss(only_misses, MiB);
+        CHECK(!zone_scratch_use_text(only_misses, 0, 0).empty(), "a zone that only missed printed nothing");
+
+        zone_scratch_use shown;
+        zone_scratch_use_note_alloc(shown, 9 * MiB, 13 * MiB + MiB / 2, 3);
+        zone_scratch_use_note_miss(shown, 2 * MiB);
+        const std::string line = zone_scratch_use_text(shown, 1, 512 * MiB);
+        CHECK(line ==
+                  "[UNIFIED-CACHE] SCRATCH zone use: device=1 high-water=13.50 MB of 512.00 MB with 3 allocations "
+                  "live, largest request=9.00 MB, requests placed=1; zone misses, sent to raw device memory: "
+                  "requests=1 bytes=2.00 MB largest=2.00 MB",
+              "the teardown line's text changed");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
