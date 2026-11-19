@@ -36578,11 +36578,10 @@ size_t placement_plan_compute_room(const placement_plan & plan,
                                    int                    device,
                                    size_t                 compute_term,
                                    uint32_t               planning_n_ubatch,
-                                   bool                   held_out,
                                    uint32_t *             n_ubatch) {
     uint32_t n    = 0;
     size_t   room = 0;
-    if (!held_out && !plan.multi_device && plan.device_id == device) {
+    if (!plan.multi_device && plan.device_id == device) {
         room = placement_explicit_ubatch_compute_room(plan.explicit_ubatch, compute_term, &n);
         if (n == 0 && plan.explicit_ubatch.action == pp_moe_onednn_explicit_ubatch_action::NONE &&
             planning_n_ubatch != 0) {

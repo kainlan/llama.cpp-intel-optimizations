@@ -552,10 +552,19 @@ typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 // ring_bytes is the prefill ring's bytes neither the planned room nor a loan covers (llama.cpp-kjef): the ring's slots
 // are the room's bytes and lent bytes, so it is 0 when the two supply all of it, and a demand on free memory otherwise.
 //
-// compute_room_n_ubatch and compute_room_bytes name the one rung whose compute buffers the plan sized the RUNTIME zone
-// to hold beside the hold, and that room: the explicit micro-batch the load placed, whose zone holds the planned
-// compute term (the compute buffers the load measured at its planning shape) beside that micro-batch's ring and dense
-// scratch. 0 for none, the case of every load that names no micro-batch.
+// compute_room_n_ubatch and compute_room_bytes name the rung whose compute buffers the plan sized the RUNTIME zone to
+// hold beside the hold, and that room (placement_plan_compute_room): the explicit micro-batch the load placed, or, for
+// a load that named none, the load's planning micro-batch. The room is the planned compute term (the compute buffers
+// the load measured at its planning shape), held beside that micro-batch's ring and dense scratch. 0 for none: a
+// multi-device plan, another device, an unknown planning micro-batch, or a named micro-batch the plan did not place.
+// A rung can also be named with a room of 0 bytes, when no live load owns a compute term on the device (the record
+// keeps the last load's micro-batch until the next load replaces it): such a room credits no request above 0 bytes,
+// and the measured rung is withheld (0) with it.
+//
+// compute_room_measured_n_ubatch is the micro-batch the term was measured at, 0 when the record names none (no load
+// recorded one, or two loads that both hold a term disagree) or when the room is none or 0 bytes.
+// It is a separate fact from compute_room_n_ubatch because the plan can place a micro-batch above the one the load
+// measured its term at: the room's rung then says where the zone was sized, not which rung's buffers the term covers.
 struct zone_hold_fit_inputs {
     size_t                         headroom_target = 0;  // the driver headroom the arena expects outside itself
     size_t                         free_before = 0;  // the cache's ledger: the card with the rung's own buffers gone
@@ -565,8 +574,14 @@ struct zone_hold_fit_inputs {
     zone_hold_plan_fn              plan_of     = nullptr;
     void *                         plan_ctx    = nullptr;
     size_t                         ring_bytes  = 0;
-    uint32_t                       compute_room_n_ubatch = 0;
-    size_t                         compute_room_bytes    = 0;
+    uint32_t                       compute_room_n_ubatch          = 0;
+    size_t                         compute_room_bytes             = 0;
+    uint32_t                       compute_room_measured_n_ubatch = 0;
+    // The rung whose own compute buffer the hold kept outside the arena, 0 for none: the hold epoch's rung (the asked
+    // rung when the owner has no epoch), set when the epoch's spill counters show a request held outside the arena.
+    // The zone did not serve that rung's buffer, so the room is not credited there. Every other rung keeps the credit
+    // the plan gives it.
+    uint32_t                       held_out_n_ubatch              = 0;
 };
 
 // The worst-case compute-buffer request at `n_ubatch`: the rung's own measured record when it has one (and only
@@ -575,14 +590,26 @@ struct zone_hold_fit_inputs {
 // is recorded: the demand is then the plan alone, a lower bound.
 size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
-// Whether the RUNTIME zone was planned to serve `request` at `n_ubatch` beside the hold: the rung is the one the plan
-// sized a compute room for, and the request is no larger than that room. Whole or nothing: a request above the room
-// gets no part of it. It can over-credit a rung whose compute buffers span several chunks, because the request is the
-// rung's largest single buffer (zone_hold_fit_request) while the room is a sum of per-chunk peaks that the other
-// chunks draw on too. The bound has the same limit, since it charges one request rather than the rung's chunks. The
-// credit at the load's planning micro-batch (placement_plan_compute_room) shares the limit, since its room is the
-// same summed term.
-bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request);
+// Whether the RUNTIME zone was planned to serve the rung's compute buffers beside the hold. Only a rung at or below
+// compute_room_n_ubatch is, the rung the zone was sized for. With its own measured request (`own_record`) the rung is
+// served when the request is no larger than the room (whole or nothing). Without one it is served only when it is also
+// at or below compute_room_measured_n_ubatch: the room is the term measured at that rung and compute buffers grow with
+// the micro-batch, so a rung no larger needs no more than the term, while a rung above it (below a placed micro-batch)
+// can need more. A measured rung of 0 gives no such credit. A request scaled from another rung is an estimate and does
+// not refuse a rung the term covers. Never the rung whose own buffer was held out, never a rung above the room's,
+// never n_ubatch 0.
+//
+// It can over-credit a rung whose compute buffers span several chunks, because the request is the rung's largest
+// single buffer (zone_hold_fit_request) while the room is a sum of per-chunk peaks that the other chunks draw on too.
+// The bound has the same limit, since it charges one request rather than the rung's chunks. The credit at the load's
+// planning micro-batch (placement_plan_compute_room) shares the limit, since its room is the same summed term.
+bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in,
+                                         uint32_t                     n_ubatch,
+                                         size_t                       request,
+                                         bool                         own_record);
+
+// Whether the rung has a measured request of its own among the records.
+bool zone_hold_fit_rung_has_record(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
 // The raw (outside-arena) demand the hold can cause at the rung: zone_hold_spill_raw_demand over
 // zone_hold_spill_bound(plan, the rung's request) and the KV room, plus the ring bytes neither the planned room nor a
@@ -678,10 +705,10 @@ bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size
 // The micro-batch the planned compute term was measured at, as the loads on a device record it, one store per
 // inventory intake (a load's early plan and late intake carry the same inventory, and at its late intake the load's
 // own term is live and the record already holds its value, so the repeat store keeps an equal value and changes
-// nothing): the hold-spill fit credits the term at that rung only. The first load's value stands while later loads
-// agree. A load that names a different one while another load still holds a compute term on the device turns the
-// record off (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the live term was not measured at
-// is the defect the record prevents. When no load holds a term (`term_live` false: the merged term is 0 bytes), the
+// nothing): the hold-spill fit credits the term at that rung and below. The first load's value stands while later
+// loads agree. A load that names a different one while another load still holds a compute term on the device turns
+// the record off (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the live term was not measured
+// at is the defect the record prevents. When no load holds a term (`term_live` false: the merged term is 0 bytes), the
 // earlier loads are gone and the new load's value replaces the record, even one turned off, so loads made one after
 // another at different micro-batches each get their own credit. A load's early plan is taken in before its own term
 // is reserved, so `term_live` there names only earlier loads. A load naming 0, or naming the mark itself, changes
