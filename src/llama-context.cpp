@@ -4436,7 +4436,7 @@ static void llama_load_measure_log_trace(const llama_load_measure_result & measu
 llama_load_measure_result llama_load_measure_run(const llama_model &                  model,
                                                  llama_measure_context_args &         args,
                                                  const llama_measure_override_procs & procs,
-                                                 uint32_t                             n_ctx,
+                                                 const llama_load_measure_shape &     shape,
                                                  uint64_t                             load_txn,
                                                  enum ggml_sycl_measure_stage         stage,
                                                  int                                  first_device) {
@@ -4467,7 +4467,7 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
     llama_kv_residency_tally_scope   kv_tally_scope(kv_tally);
     std::unique_ptr<llama_context> holder;
     // The context's params come first: the override re-fits the plan's KV residency for their KV shape.
-    const llama_context_params       params   = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train);
+    const llama_context_params       params   = llama_load_measure_context_params(shape);
     const ggml_sycl_measure_kv_shape kv_shape = llama_load_measure_kv_shape(params);
     llama_measure_plan_override      guard(procs, load_txn, stage, &kv_shape);
     if (!guard.installed()) {
@@ -4514,10 +4514,10 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
     return out;
 }
 
-llama_load_measure_result llama_load_measure(const llama_model &          model,
-                                             uint32_t                     n_ctx,
-                                             uint64_t                     load_txn,
-                                             enum ggml_sycl_measure_stage stage) {
+llama_load_measure_result llama_load_measure(const llama_model &              model,
+                                             const llama_load_measure_shape & shape,
+                                             uint64_t                         load_txn,
+                                             enum ggml_sycl_measure_stage     stage) {
     llama_load_measure_result out;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     std::vector<ggml_backend_dev_t> sycl_devs;
@@ -4556,11 +4556,11 @@ llama_load_measure_result llama_load_measure(const llama_model &          model,
     }
     args.backends.emplace_back(cpu);
 
-    return llama_load_measure_run(model, args, llama_context_sycl_measure_override_procs(sycl_devs[0]), n_ctx, load_txn,
+    return llama_load_measure_run(model, args, llama_context_sycl_measure_override_procs(sycl_devs[0]), shape, load_txn,
                                   stage, first_device);
 #else
     GGML_UNUSED(model);
-    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(shape);
     GGML_UNUSED(load_txn);
     GGML_UNUSED(stage);
     out.ok = true;
@@ -4585,7 +4585,7 @@ static llama_sycl_l4_procs llama_load_stage_procs(const llama_model & model) {
 // measure context see a buffer on every weight, so they end with the measure. Each stage keeps its gate before this
 // and its fold after it.
 static llama_load_measure_result llama_load_stage_measure(const llama_model &                            model,
-                                                          uint32_t                                       n_ctx,
+                                                          const llama_load_measure_shape &               shape,
                                                           uint64_t                                       load_txn,
                                                           enum ggml_sycl_measure_stage                   stage,
                                                           const std::vector<llama_measure_dummy_entry> & weights) {
@@ -4595,7 +4595,7 @@ static llama_load_measure_result llama_load_stage_measure(const llama_model &   
         out.refusal = llama_load_measure_refusal_text(stage, -1, "a weight stand-in buffer was refused");
         return out;
     }
-    llama_load_measure_result measured = llama_load_measure(model, n_ctx, load_txn, stage);
+    llama_load_measure_result measured = llama_load_measure(model, shape, load_txn, stage);
     llama_load_measure_log_trace(measured);
     return measured;
 }
@@ -4611,7 +4611,7 @@ static void llama_load_stage_fail(const llama_load_measure_result & measured,
 #endif
 
 llama_load_probe_result llama_load_probe_bound(const llama_model &                            model,
-                                               uint32_t                                       n_ctx,
+                                               const llama_load_measure_shape &               shape,
                                                struct ggml_sycl_load_txn                      txn,
                                                const std::vector<llama_measure_dummy_entry> & weights) {
     llama_load_probe_result out;
@@ -4622,7 +4622,7 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
         return out;
     }
     const llama_load_measure_result measured =
-        llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE, weights);
+        llama_load_stage_measure(model, shape, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE, weights);
     if (!measured.ok) {
         llama_load_stage_fail(measured, out.unsupported, out.refusal);
         return out;
@@ -4631,14 +4631,14 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
     out.kv       = measured.kv;
     out.measured = true;
 
-    const uint32_t                measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
+    const uint32_t                measured_n_ctx = shape.n_ctx;
     // each SYCL device's state term, then its compute term; a declined device's compute buffer stays unplanned
     llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);
     out.compute_declined                   = std::move(reserved.compute_declined);
     out.state_reserved                     = std::move(reserved.state_reserved);
 #else
     GGML_UNUSED(model);
-    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(shape);
     GGML_UNUSED(txn);
     GGML_UNUSED(weights);
 #endif
@@ -4646,7 +4646,7 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
 }
 
 llama_admitted_check_result llama_load_admitted_check(const llama_model &                            model,
-                                                      uint32_t                                       n_ctx,
+                                                      const llama_load_measure_shape &               shape,
                                                       struct ggml_sycl_load_txn                      txn,
                                                       const std::vector<llama_measure_dummy_entry> & weights,
                                                       const llama_load_probe_result &                probe) {
@@ -4657,13 +4657,13 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
         return out;
     }
     const llama_load_measure_result measured =
-        llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights);
+        llama_load_stage_measure(model, shape, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights);
     if (!measured.ok) {
         llama_load_stage_fail(measured, out.unsupported, out.refusal);
         return out;
     }
-    const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
-    const uint32_t n_ubatch       = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
+    const uint32_t measured_n_ctx = shape.n_ctx;
+    const uint32_t n_ubatch       = shape.n_ubatch;
 
     out = llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved,
                                     measured.devices, measured_n_ctx, n_ubatch, probe.kv, measured.kv);
@@ -4675,7 +4675,7 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
     out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);
 #else
     GGML_UNUSED(model);
-    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(shape);
     GGML_UNUSED(txn);
     GGML_UNUSED(weights);
     GGML_UNUSED(probe);
@@ -4684,7 +4684,7 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
 }
 
 llama_late_check_result llama_load_late_check(const llama_model &                            model,
-                                              uint32_t                                       n_ctx,
+                                              const llama_load_measure_shape &               shape,
                                               struct ggml_sycl_load_txn                      txn,
                                               const std::vector<llama_measure_dummy_entry> & weights) {
     llama_late_check_result out;
@@ -4694,17 +4694,17 @@ llama_late_check_result llama_load_late_check(const llama_model &               
         return out;  // no c(P) can have been recorded without the L4 entry points
     }
     const llama_load_measure_result measured =
-        llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights);
+        llama_load_stage_measure(model, shape, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights);
     if (!measured.ok) {
         llama_load_stage_fail(measured, out.unsupported, out.refusal);
         return out;
     }
 
-    const uint32_t n_ubatch = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
+    const uint32_t n_ubatch = shape.n_ubatch;
     return llama_late_check_fold(procs, txn, measured.devices, n_ubatch);
 #else
     GGML_UNUSED(model);
-    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(shape);
     GGML_UNUSED(txn);
     GGML_UNUSED(weights);
     return out;

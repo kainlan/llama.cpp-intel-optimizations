@@ -2638,8 +2638,9 @@ the ring. Shrinking the ring then frees RUNTIME bytes, which KV cannot use. For
 any G > 0 there is a `-c` whose KV fits in VRAM with the 512 MB zone and is
 demoted to the host with the grown one. That is the micro-batch beating KV,
 which the owner ruling forbids ("KV all-VRAM wins over a larger micro-batch").
-The real `n_ctx` is not known at load (`llama.cpp-fkpg`), so no load-time amount
-is safe.
+The load knows only the context the caller says it will create
+(`llama_model_params::n_ctx_hint`); a context created later can be larger (a
+reused model, or a caller that named none), so no load-time amount is safe.
 
 **The rule: decide at context time, after KV.** The transaction admits KV first.
 `ggml_sycl_replan_pp_moe_onednn_ring()` then places and admits the ring for the
@@ -2888,10 +2889,10 @@ Only the single-device plan places. A multi-device plan makes no decision, so
 its context keeps the context-time path.
 
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
-holds the compute term the load measured at its planning shape, `n_ctx_train`
-and ubatch 512 (`llama.cpp-fkpg`), and the placed micro-batch's ring and dense
-scratch sit beside it. So once the plan has placed the micro-batch, the
-hold-spill fit credits rungs at or below that rung
+holds the compute term the load measured at the context and micro-batch the
+caller told it (`n_ctx_train` and ubatch 512 where it told none), and the placed
+micro-batch's ring and dense scratch sit beside it. So once the plan has placed
+the micro-batch, the hold-spill fit credits rungs at or below that rung
 (`placement_explicit_ubatch_compute_room()` and
 `zone_hold_fit_rung_has_compute_room()`): a rung's own measured buffer when it
 is no larger than the term, whole or nothing, and a rung without a record of its
@@ -3459,35 +3460,37 @@ recovery path: it measures the driver's working set and sizes the headroom from 
 
 **Limits.**
 
-- The term is measured at the load's measure shape, `n_ctx_train` and ubatch 512, because the caller's `-c` and `-ub` do
-  not reach the load (`llama.cpp-fkpg`). A `-c` below `n_ctx_train`, llama-bench's small `n_ctx` and `-ub 256` all
-  over-reserve. Above 512 the term under-reserves, and that is the **default** for a dense model, not only an explicit
-  `-ub`: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch` of 2048 a dense model's auto pick
-  climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto 2048,
-  `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack is smaller. The ladder's per-rung trial
-  (`try_candidate`) does not consult the reserved RUNTIME room. It loses a rung only when the runtime-context
-  transaction is busy or not the published model's, when the probe refuses the rung, when the rung would demote KV, when
-  the candidate publish is refused, when the rung's compute buffers fail to allocate, when one falls back to host
-  memory, or when the rung would leave the card under the driver headroom (the hold-spill fit). A compute buffer that
-  does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, and the trial accepts both. So
-  a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open finding, not an invariant
-  of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
-  auto pick's. `llama.cpp-fkpg` (a) transports the caller's shape.
+- The term is measured at the context and micro-batch the caller tells the load (`n_ctx_hint`, `n_ubatch_hint`), and at
+  `n_ctx_train` and ubatch 512 where it tells none. A load whose model is reused for a later context keeps the term of
+  the shape it was loaded for. Without a named `-ub` the term is measured at 512, and above 512 it under-reserves, which
+  is the **default** for a dense model: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch`
+  of 2048 a dense model's auto pick climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a
+  448.0 MB compute buffer at the auto 2048, `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack
+  is smaller. The ladder's per-rung trial (`try_candidate`) does not consult the reserved RUNTIME room. It loses a rung
+  only when the runtime-context transaction is busy or not the published model's, when the probe refuses the rung,
+  when the rung would demote KV, when the candidate publish is refused, when the rung's compute buffers fail to
+  allocate, when one falls back to host memory, or when the rung would leave the card under the driver headroom (the
+  hold-spill fit). A compute buffer that does not fit RUNTIME takes the KV zone next, then raw device memory outside
+  the arena, and the trial accepts both. So a dense auto pick above 512 can land `zone=raw`, in the external headroom.
+  That is an open finding, not an invariant of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512
+  (`MOE_GPU_UBATCH_MAX`), so their term is the auto pick's.
 - Every load-time path runs at `n_seq_max` 1 and cannot see the context's sequence count. The probe, the admitted stage
-  and the late check all build their measure context from the default parameters. So the state term holds one sequence's
-  state, and the late check compares one sequence's state with one sequence's state. A context with `-np` above 1
-  allocates about `n_seq_max` times that state, RUNTIME-first and before its compute buffer. The excess takes RUNTIME
-  room from the compute term, and the buffer's last chunk can land `zone=raw`. The context constructor names it. Right
-  after its memory exists, it compares each SYCL device's state with the planned state term the backend holds
-  (`ggml_backend_sycl_planned_state_term`). The state is the memory's bytes for that device's buffer type. When the
-  state is larger, it WARNs `[LOAD-PLAN] state term exceeded on device N` with `n_seq_max`, both sizes and the excess. A
-  load that planned no state term at all (a model the measure cannot run, a backend without the load procs, or a
-  declined reservation) gets its own line instead, `[LOAD-PLAN] state term not planned on device N`, which does not
-  blame the one-sequence measure. It never refuses: `-np` is a normal user option, and a context the user asked for is
-  placed and warned, never shrunk or refused. `tests/test-sycl-load-measure-source.py` pins the WARN and pins that
-  neither the comparison nor its text helper refuses. The fix is to transport the caller's `n_seq_max` into the load's
-  measure, the same gap `llama.cpp-fkpg` records for `-c` and `-ub`. It is tracked as `llama.cpp-0zyy`. The state is
-  summed per buffer type, so a type holding several buffers can round up by one grain per extra buffer beyond the term.
+  and the late check all build their measure context at the caller's context and micro-batch and take every other
+  parameter from the defaults. So the state term holds one sequence's state, and the late check compares one
+  sequence's state with one sequence's state. A context with `-np` above 1 allocates about `n_seq_max` times that
+  state, RUNTIME-first and before its compute buffer. The excess takes RUNTIME room from the compute term, and the
+  buffer's last chunk can land `zone=raw`. The context constructor names it. Right after its memory exists, it compares
+  each SYCL device's state with the planned state term the backend holds (`ggml_backend_sycl_planned_state_term`). The
+  state is the memory's bytes for that device's buffer type. When the state is larger, it WARNs
+  `[LOAD-PLAN] state term exceeded on device N` with `n_seq_max`, both sizes and the excess. A load that planned no
+  state term at all (a model the measure cannot run, a backend without the load procs, or a declined reservation) gets
+  its own line instead,
+  `[LOAD-PLAN] state term not planned on device N`, which does not blame the one-sequence measure. It never refuses:
+  `-np` is a normal user option, and a context the user asked for is placed and warned, never shrunk or refused.
+  `tests/test-sycl-load-measure-source.py` pins the WARN and pins that neither the comparison nor its text helper
+  refuses. The fix is to transport the caller's `n_seq_max` into the load's measure, as `-c` and `-ub` now are. It is
+  tracked as `llama.cpp-0zyy`. The state is summed per buffer type, so a type holding several buffers can round up by
+  one grain per extra buffer beyond the term.
 - A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
   refused while the first model holds allocations, so that load reaches the abort in
   `compute_and_store_plan_for_inventory`. `llama.cpp-ouur` refuses it by name instead.

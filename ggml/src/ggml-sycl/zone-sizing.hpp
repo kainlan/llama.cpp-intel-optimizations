@@ -554,15 +554,18 @@ typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 //
 // compute_room_n_ubatch and compute_room_bytes name the rung whose compute buffers the plan sized the RUNTIME zone to
 // hold beside the hold, and that room (placement_plan_compute_room): the explicit micro-batch the load placed, or, for
-// a load that named none, the load's planning micro-batch. The room is the planned compute term (the compute buffers
-// the load measured at its planning shape), held beside that micro-batch's ring and dense scratch. 0 for none: a
-// multi-device plan, another device, an unknown planning micro-batch, or a named micro-batch the plan did not place.
+// a load that named none, the micro-batch the load measured the term at (the planning micro-batch only for an
+// inventory that sent none). The room is the planned compute term (the compute buffers the load measured at that
+// shape), held beside that micro-batch's ring and dense scratch. 0 for none: a multi-device plan, another device, an
+// unknown measured micro-batch, or a named micro-batch the plan did not place.
 // A rung can also be named with a room of 0 bytes, when no live load owns a compute term on the device (the record
 // keeps the last load's micro-batch until the next load replaces it): such a room credits no request above 0 bytes,
 // and the measured rung is withheld (0) with it.
 //
 // compute_room_measured_n_ubatch is the micro-batch the term was measured at, 0 when the record names none (no load
-// recorded one, or two loads that both hold a term disagree) or when the room is none or 0 bytes.
+// recorded one, or two loads that both held a term disagreed: that mark outlives both loads and stays until the next
+// inventory intake that finds no live term), when the record changed between the fit's two reads of it, or when the
+// room is none or 0 bytes.
 // It is a separate fact from compute_room_n_ubatch because the plan can place a micro-batch above the one the load
 // measured its term at: the room's rung then says where the zone was sized, not which rung's buffers the term covers.
 struct zone_hold_fit_inputs {
@@ -601,8 +604,9 @@ size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch)
 //
 // It can over-credit a rung whose compute buffers span several chunks, because the request is the rung's largest
 // single buffer (zone_hold_fit_request) while the room is a sum of per-chunk peaks that the other chunks draw on too.
-// The bound has the same limit, since it charges one request rather than the rung's chunks. The credit at the load's
-// planning micro-batch (placement_plan_compute_room) shares the limit, since its room is the same summed term.
+// The bound has the same limit, since it charges one request rather than the rung's chunks. The credit at the
+// micro-batch the load measured the term at (placement_plan_compute_room) shares the limit, since its room is the same
+// summed term.
 bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in,
                                          uint32_t                     n_ubatch,
                                          size_t                       request,
@@ -705,13 +709,14 @@ bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size
 // The micro-batch the planned compute term was measured at, as the loads on a device record it, one store per
 // inventory intake (a load's early plan and late intake carry the same inventory, and at its late intake the load's
 // own term is live and the record already holds its value, so the repeat store keeps an equal value and changes
-// nothing): the hold-spill fit credits the term at that rung and below. The first load's value stands while later
-// loads agree. A load that names a different one while another load still holds a compute term on the device turns
-// the record off (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the live term was not measured
-// at is the defect the record prevents. When no load holds a term (`term_live` false: the merged term is 0 bytes), the
-// earlier loads are gone and the new load's value replaces the record, even one turned off, so loads made one after
-// another at different micro-batches each get their own credit. A load's early plan is taken in before its own term
-// is reserved, so `term_live` there names only earlier loads. A load naming 0, or naming the mark itself, changes
+// nothing): the hold-spill fit reads it to place its compute room, and zone_hold_fit_rung_has_compute_room decides
+// which rungs that room credits. The first load's value stands while later loads agree. A load that names a different
+// one while another load still holds a compute term on the device turns the record off
+// (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the live term was not measured at is the
+// defect the record prevents. When no load holds a term (`term_live` false: the merged term is 0 bytes), the earlier
+// loads are gone and the new load's value replaces the record, even one turned off, so loads made one after another
+// at different micro-batches each get their own credit. A load's early plan is taken in before its own term is
+// reserved, so `term_live` there names only earlier loads. A load naming 0, or naming the mark itself, changes
 // nothing, so the mark only ever means two live loads really disagreed and the WARN that reports it names two values
 // loads did plan. A micro-batch left behind after every load is gone is harmless: the term merges to 0 bytes, and a
 // 0-byte room credits nothing. So a disagreement only removes the credit, never grants one, for every term on the

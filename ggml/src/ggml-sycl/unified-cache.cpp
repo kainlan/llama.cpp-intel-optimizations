@@ -36577,15 +36577,15 @@ size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & 
 size_t placement_plan_compute_room(const placement_plan & plan,
                                    int                    device,
                                    size_t                 compute_term,
-                                   uint32_t               planning_n_ubatch,
+                                   uint32_t               measured_n_ubatch,
                                    uint32_t *             n_ubatch) {
     uint32_t n    = 0;
     size_t   room = 0;
     if (!plan.multi_device && plan.device_id == device) {
         room = placement_explicit_ubatch_compute_room(plan.explicit_ubatch, compute_term, &n);
         if (n == 0 && plan.explicit_ubatch.action == pp_moe_onednn_explicit_ubatch_action::NONE &&
-            planning_n_ubatch != 0) {
-            n    = planning_n_ubatch;
+            measured_n_ubatch != 0) {
+            n    = measured_n_ubatch;
             room = compute_term;
         }
     }
