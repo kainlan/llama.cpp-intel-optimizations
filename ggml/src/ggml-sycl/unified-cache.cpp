@@ -25,6 +25,7 @@
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
 #include "moe-host-scatter.hpp"
+#include "moe-mmvq-tables.hpp"
 #include "moe-resolved-batch.hpp"
 #include "moe-stream-plan.hpp"
 #include "onednn-woq.hpp"
@@ -34974,7 +34975,8 @@ static size_t zone_onednn_reorder_bytes(const placement_tensor_info & item) {
 }
 
 // The pure Q8_1 src1 arithmetic in zone-sizing.hpp restates three backend constants because that TU
-// links nothing; pin each to its source so the planner cannot drift from the dispatch's required_size.
+// links nothing; pin each to its source so the planner cannot drift from the dispatch's required_size. The
+// block pair also sizes the MoE batched MMVQ scratch (zone_moe_mmvq_op_bytes), which pads K to QK8_1 only.
 static_assert(k_zone_mmq_src1_row_padding == MATRIX_ROW_PADDING, "zone-sizing.hpp Q8_1 row padding drifted");
 static_assert(k_zone_mmq_src1_block_elems == QK8_1, "zone-sizing.hpp Q8_1 block width drifted");
 static_assert(k_zone_mmq_src1_block_bytes == sizeof(block_q8_1), "zone-sizing.hpp Q8_1 block size drifted");
@@ -35011,8 +35013,8 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         desc.get_rows_only = item.get_rows_only;
         // llama.cpp-479i: Q8_1 bytes a dense quantized MUL_MAT quantizes its activations into, per
         // token. Operand-ness is decided HERE, where the traits and the name are, not in the pure
-        // classifier: a quantized weight that is not an expert stack (MUL_MAT_ID keeps its own
-        // moe_q8 workspace). Experts are recognised by the planner's own role function, the same
+        // classifier: a quantized weight that is not an expert stack (MUL_MAT_ID quantizes into
+        // per-op buffers of its own). Experts are recognised by the planner's own role function, the same
         // authority plan_moe_mmid_workspaces uses -- NOT by ne[2] > 1, which also matches dense 3-D
         // operands such as the MLA wk_b / wv_b (llama.cpp-8xbt). A mis-prediction is survivable:
         // ggml_sycl_mmq_src1_ensure_for_graph() ensures max(plan, demand) for every device that has a
@@ -36047,6 +36049,24 @@ bool placement_moe_host_recipe_workspace_bytes_at(const std::vector<moe_host_rec
     return true;
 }
 
+// One operand per expert weight that mmvq_moe_batched_dispatch can run: an expert stack by the planner's own role
+// function, of a type the batched kernels admit. The type test is load-bearing as well as exact: an NVFP4 model's F32
+// per-expert scales (ffn_down_exps.scale, ffn_down_exps.input_scale) carry the role's name too. Down reads one
+// activation row per routed slot; gate, up and fused gate_up read one row a token.
+static std::vector<zone_moe_mmvq_operand> moe_mmvq_scratch_operands(
+    const std::vector<placement_tensor_info> & tensor_inventory) {
+    std::vector<zone_moe_mmvq_operand> ops;
+    for (const auto & item : tensor_inventory) {
+        const expert_tensor_role role = expert_tensor_role_from_tensor_name(item.name.c_str());
+        if (!item.has_shape() || role == expert_tensor_role::UNKNOWN ||
+            !moe_mmvq_batched_dispatch_supports_type(item.type)) {
+            continue;
+        }
+        ops.push_back({ item.ne[0], role == expert_tensor_role::DOWN || role == expert_tensor_role::CHUNK_DOWN });
+    }
+    return ops;
+}
+
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
@@ -36251,18 +36271,27 @@ static void populate_host_zone_sizing(placement_plan &                          
     //    is correct -- see path_scoped_maxima::onednn_reorder in zone-sizing.hpp.
     plan.onednn_reorder_bytes = zone_maxima.onednn_reorder;
 
-    // 2. MoE Q8_1 workspace: n_expert_used activation rows quantized to Q8_1 for batched dispatch.
-    //    Coarse heuristic: estimate Q8_1 workspace from weight tensor size.
-    //    The actual Q8_1 row size depends on the activation K dimension (ne10),
-    //    not weight bytes. This over-estimates because quantized weight bytes
-    //    exceed the raw K dimension, making the sizing conservative.
-    //    1.1x headroom covers QK8_1 alignment padding.  Zero for dense models.
+    // 2. MoE batched MMVQ scratch: each MUL_MAT_ID op that mmvq_moe_batched_dispatch runs holds a Q8_1 copy of its
+    //    activations and an ids table in the device SCRATCH zone until its completion event. No term reserves room
+    //    for them: they share the zone with other per-op scratch, and a request the zone cannot place falls through
+    //    to raw device memory. The two bounds, the most one op holds and the sum over every expert op, are logged at
+    //    the planning micro-batch so that the zone's use line at cache teardown can be read against them.
     if (n_experts > 0 && n_expert_used > 0) {
-        const size_t expert_ffn_bytes = plan.max_tensor_bytes / static_cast<size_t>(n_experts);
-        const size_t q8_1_row_bytes   = static_cast<size_t>(static_cast<double>(expert_ffn_bytes) * 1.1);
-        plan.moe_q8_workspace_bytes   = static_cast<size_t>(n_expert_used) * q8_1_row_bytes;
-    } else {
-        plan.moe_q8_workspace_bytes = 0;
+        const std::vector<zone_moe_mmvq_operand> mmvq_ops      = moe_mmvq_scratch_operands(tensor_inventory);
+        const uint32_t                           mmvq_n_ubatch = placement_load_n_ubatch(plan.planner_n_ubatch);
+        zone_moe_mmvq_scratch                    mmvq_scratch;
+        // Every input is positive here (the guard, the planning micro-batch, the inventory's shapes), so a false
+        // answer is an overflow.
+        if (!zone_moe_mmvq_scratch_bytes(mmvq_ops, mmvq_n_ubatch, n_expert_used, &mmvq_scratch)) {
+            GGML_LOG_WARN("[SYCL-PLAN] MoE batched MMVQ scratch overflows: %zu expert op(s) at n_ubatch=%u\n",
+                          mmvq_ops.size(), mmvq_n_ubatch);
+        } else if (!mmvq_ops.empty()) {
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] MoE batched MMVQ scratch: %zu expert op(s) at n_ubatch=%u, %.2f MB for the largest op, "
+                "%.2f MB for all of them at once, in the device SCRATCH zone\n",
+                mmvq_ops.size(), mmvq_n_ubatch, mmvq_scratch.per_op / (1024.0 * 1024.0),
+                mmvq_scratch.graph / (1024.0 * 1024.0));
+        }
     }
 
     // 3. Expert bias D2H + MoE routing buffers: computed from MoE layer count.

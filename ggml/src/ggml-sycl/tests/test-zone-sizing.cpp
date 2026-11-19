@@ -622,7 +622,7 @@ int main() {
         zone_tensor_desc mla_wk_b              = desc("token_embd.weight", 9000000, TYPE_Q8_0, 128, 512, 128, 1);
         mla_wk_b.mmq_src1_bytes_per_token      = 576 * 128;
         // An expert stack the adapter did not mark: ne[2] is large and K is large, and it
-        // must not contribute (its own moe_q8 workspace sizes it).
+        // must not contribute (zone_moe_mmvq_op_bytes sizes its per-op buffers).
         zone_tensor_desc experts = desc("blk.0.ffn_down.weight", GPT_OSS_EXPERT_BYTES, TYPE_MXFP4, 2880, 2880, 32, 1);
         zone_tensor_desc lm_head = desc("output.weight", MISTRAL_OUTPUT_BYTES, TYPE_Q6_K, 4096, 32000, 1, 1);
         lm_head.mmq_src1_bytes_per_token = 4608;  // a singleton still counts: it IS a MUL_MAT src0
@@ -3358,6 +3358,94 @@ int main() {
                   "live, largest request=9.00 MB, requests placed=1; zone misses, sent to raw device memory: "
                   "requests=1 bytes=2.00 MB largest=2.00 MB",
               "the teardown line's text changed");
+    }
+
+    // ---- Case 46: the MoE batched MMVQ scratch one op holds, and the sum over a model's expert ops ---------------
+    // The figures are mmvq_moe_batched_dispatch's own: K padded to QK8_1, 36 bytes a block, ne11 * ne12 rows, and
+    // n_tokens * n_expert_used int32 ids. The vehicle is Qwen3.6-35B-A3B NVFP4 (top-8): gate and up have K = 2048 and
+    // one activation row a token, down has K = 512 and one row a slot. The file holds 41 blocks; the 41st is the MTP
+    // block, whose experts load only with MTP, so the main graph has 40 layers of gate, up and down.
+    {
+        using ggml_sycl::zone_moe_mmvq_op_bytes;
+        using ggml_sycl::zone_moe_mmvq_operand;
+        using ggml_sycl::zone_moe_mmvq_scratch;
+        using ggml_sycl::zone_moe_mmvq_scratch_bytes;
+
+        const zone_moe_mmvq_operand gate{ 2048, false };
+        const zone_moe_mmvq_operand down{ 512, true };
+        size_t                      bytes = 0;
+
+        // 512 rows: gate 512 x 2304 + 16384 ids; down 4096 x 576 + 16384 ids.
+        CHECK(zone_moe_mmvq_op_bytes(gate, 512, 8, &bytes) && bytes == 1196032, "the gate op at 512 rows is wrong");
+        CHECK(zone_moe_mmvq_op_bytes(down, 512, 8, &bytes) && bytes == 2375680, "the down op at 512 rows is wrong");
+        // 2048 rows: gate 2048 x 2304 + 65536 ids; down 16384 x 576 + 65536 ids.
+        CHECK(zone_moe_mmvq_op_bytes(gate, 2048, 8, &bytes) && bytes == 4784128, "the gate op at 2048 rows is wrong");
+        CHECK(zone_moe_mmvq_op_bytes(down, 2048, 8, &bytes) && bytes == 9502720, "the down op at 2048 rows is wrong");
+
+        // K pads to QK8_1, not to MATRIX_ROW_PADDING: 33 columns are two blocks (72 bytes), plus one id.
+        CHECK(zone_moe_mmvq_op_bytes({ 33, false }, 1, 1, &bytes) && bytes == 76, "K did not pad to one Q8_1 block");
+
+        std::vector<zone_moe_mmvq_operand> vehicle;
+        for (int layer = 0; layer < 40; ++layer) {
+            vehicle.push_back(gate);  // ffn_gate_exps
+            vehicle.push_back(gate);  // ffn_up_exps
+            vehicle.push_back(down);  // ffn_down_exps
+        }
+        zone_moe_mmvq_scratch scratch;
+        CHECK(zone_moe_mmvq_scratch_bytes(vehicle, 512, 8, &scratch), "the vehicle at 512 rows did not size");
+        CHECK(scratch.per_op == 2375680, "one op's most at 512 rows is not the down op");
+        CHECK(scratch.graph == 190709760, "the 40-layer sum at 512 rows is not 40 x 4767744");
+        CHECK(zone_moe_mmvq_scratch_bytes(vehicle, 2048, 8, &scratch), "the vehicle at 2048 rows did not size");
+        CHECK(scratch.per_op == 9502720, "one op's most at 2048 rows is not the down op");
+        CHECK(scratch.graph == 762839040, "the 40-layer sum at 2048 rows is not 40 x 19070976");
+
+        CHECK(zone_moe_mmvq_scratch_bytes({}, 512, 8, &scratch) && scratch.per_op == 0 && scratch.graph == 0,
+              "a model with no admitted expert op owes something");
+
+        // A non-positive input sizes nothing, and says so.
+        CHECK(!zone_moe_mmvq_op_bytes({ 0, false }, 512, 8, &bytes) && bytes == 0, "K = 0 sized an op");
+        CHECK(!zone_moe_mmvq_op_bytes(gate, 0, 8, &bytes) && bytes == 0, "no tokens sized an op");
+        CHECK(!zone_moe_mmvq_op_bytes(gate, 512, 0, &bytes) && bytes == 0, "no routed slot sized an op");
+        CHECK(!zone_moe_mmvq_op_bytes(gate, -1, 8, &bytes) && bytes == 0, "a negative token count sized an op");
+        const zone_moe_mmvq_operand negative_k{ -4, true };
+        CHECK(!zone_moe_mmvq_scratch_bytes({ gate, negative_k }, 512, 8, &scratch) && scratch.per_op == 0 &&
+                  scratch.graph == 0,
+              "an op with a negative K left a bound");
+        CHECK(!zone_moe_mmvq_scratch_bytes(vehicle, 512, 0, &scratch) && scratch.per_op == 0 && scratch.graph == 0,
+              "no routed slot left a bound");
+
+        // The widest K is 2^58 blocks, 9 x 2^60 bytes a row: one row fits a 64-bit size_t, two do not.
+        const zone_moe_mmvq_operand widest{ INT64_MAX, false };
+        CHECK(zone_moe_mmvq_op_bytes(widest, 1, 1, &bytes) && bytes == (size_t(9) << 60) + 4,
+              "one row of the widest K did not size exactly");
+        // Overflow saturates: in the Q8_1 bytes, the slot count, the ids, one op's two buffers, and the sum.
+        CHECK(!zone_moe_mmvq_op_bytes(widest, 2, 1, &bytes) && bytes == SIZE_MAX,
+              "the Q8_1 bytes overflow did not saturate");
+        CHECK(!zone_moe_mmvq_op_bytes(down, INT64_MAX, 8, &bytes) && bytes == SIZE_MAX,
+              "the slot count overflow did not saturate");
+        // 2^32 tokens of 2^32 slots wrap to exactly zero slots, which the later checks would pass as a zero-byte op.
+        CHECK(!zone_moe_mmvq_op_bytes(down, int64_t(1) << 32, int64_t(1) << 32, &bytes) && bytes == SIZE_MAX,
+              "a slot count that wraps to zero did not saturate");
+        CHECK(!zone_moe_mmvq_op_bytes({ 32, false }, int64_t(1) << 31, int64_t(1) << 32, &bytes) && bytes == SIZE_MAX,
+              "the ids bytes overflow did not saturate");
+        // 9 x 2^60 bytes of Q8_1 and 2^63 bytes of ids each fit; together they do not.
+        CHECK(!zone_moe_mmvq_op_bytes(widest, 1, int64_t(1) << 61, &bytes) && bytes == SIZE_MAX,
+              "the op's two buffers overflowing together did not saturate");
+        CHECK(!zone_moe_mmvq_scratch_bytes({ gate, widest }, 512, 8, &scratch) && scratch.per_op == SIZE_MAX &&
+                  scratch.graph == SIZE_MAX,
+              "an op that overflows did not saturate both bounds");
+        // Alone, the overflowing op's SIZE_MAX adds to a zero sum without overflowing it, and is still not exact.
+        CHECK(!zone_moe_mmvq_scratch_bytes({ widest }, 512, 8, &scratch) && scratch.per_op == SIZE_MAX &&
+                  scratch.graph == SIZE_MAX,
+              "a lone op that overflows answered exact");
+        // K = 32 and one slot: 40 bytes a token. Each op holds 2^63 + 32 bytes, which fits; two of them do not.
+        const zone_moe_mmvq_operand one_block{ 32, false };
+        const int64_t               half = int64_t(SIZE_MAX / 40 / 2 + 1);
+        CHECK(zone_moe_mmvq_op_bytes(one_block, half, 1, &bytes) && bytes == (size_t(1) << 63) + 32,
+              "the op just over half of SIZE_MAX did not size exactly");
+        CHECK(!zone_moe_mmvq_scratch_bytes({ one_block, one_block }, half, 1, &scratch) &&
+                  scratch.per_op == (size_t(1) << 63) + 32 && scratch.graph == SIZE_MAX,
+              "the sum overflow did not saturate the graph bound alone");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");

@@ -2326,13 +2326,26 @@ by 32×.
 comment — an unjustified `any_tensor` reintroduces exactly the over-provision
 this exists to remove.
 
-Two consumers stay on the model-wide class, and both comments say why:
-`moe_q8_workspace_bytes` is derived as `max_tensor_bytes / n_experts` and is
-therefore already a per-expert figure, and `s1_per_inflight_bytes` backs the S1
-preload, which streams every tensor bound for a device, the embeddings
-included. Narrowing that second one to a per-layer maximum would be this bug in
-reverse. It leaves out only the one class the next paragraph describes, a
-gather-only table the plan keeps on the host, which S1 never streams.
+One consumer stays on the model-wide class, and its comment says why:
+`s1_per_inflight_bytes` backs the S1 preload, which streams every tensor bound
+for a device, the embeddings included. Narrowing it to a per-layer maximum
+would be this bug in reverse. It leaves out only the one class the next
+paragraph describes, a gather-only table the plan keeps on the host, which S1
+never streams.
+
+The MoE batched MMVQ scratch has no plan term. Each MUL_MAT_ID op that
+`mmvq_moe_batched_dispatch` runs takes two buffers from the shared device
+SCRATCH zone and releases them at its completion event: a Q8_1 copy of its
+activations (K padded to `QK8_1`; one row a token for gate, up and fused
+gate_up, one row a routed slot for down) and an ids table (`n_tokens *
+n_expert_used` int32). The zone is sized by no op's demand, and a request it
+cannot place falls through to raw device memory. At load the planner logs two
+bounds at the planning micro-batch (`zone_moe_mmvq_scratch_bytes`: the most one
+op holds, and the sum over every expert op), and at teardown the cache logs the
+zone's high-water and its misses (`zone_scratch_use_text`). A planned term that
+raises the zone to one of those bounds follows. The term it replaces,
+`moe_q8_workspace_bytes` (`max_tensor_bytes / n_experts * 1.1 *
+n_expert_used`), had no reader and is gone.
 
 The host STAGING and SCRATCH zones, which hold only copies, leave out exactly
 one class: a tensor the loader marked gather-only (`get_rows_only`) that has at

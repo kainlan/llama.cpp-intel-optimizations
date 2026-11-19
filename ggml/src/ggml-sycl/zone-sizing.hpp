@@ -76,7 +76,7 @@ struct zone_tensor_desc {
     // TOKEN (llama.cpp-479i): zone_mmq_src1_bytes_per_token(ne[0], ne[2], ne[3]).
     // Supplied by the adapter, never derived here: whether a tensor is a dense
     // MUL_MAT operand is the caller's knowledge. Zero means "not one" -- an expert
-    // stack (MUL_MAT_ID, its own moe_q8 workspace), a non-quantized weight, or a
+    // stack (MUL_MAT_ID, zone_moe_mmvq_op_bytes), a non-quantized weight, or a
     // tensor with no shape. The classifier deliberately does NOT decide this from
     // ne[2] > 1: that is the expert predicate and it misclassifies dense 3-D
     // operands such as the MLA wk_b / wv_b (llama.cpp-8xbt).
@@ -234,6 +234,47 @@ bool zone_mmq_src1_bytes_per_token(int64_t ne0, int64_t ne2, int64_t ne3, size_t
 // The plan figure: n_ubatch tokens of `bytes_per_token`, plus the overflow pad,
 // aligned up to 256. Zero when bytes_per_token is zero (no dense quantized operand).
 bool zone_mmq_src1_scratch_bytes(size_t bytes_per_token, uint32_t n_ubatch, size_t * out);
+
+// ---------------------------------------------------------------------------
+// MoE batched MMVQ scratch
+// ---------------------------------------------------------------------------
+//
+// mmvq_moe_batched_dispatch quantizes a MUL_MAT_ID op's activations to Q8_1 into one buffer and, when it cannot read
+// the routing ids in place, uploads an ids table into another. Both come from the device SCRATCH zone and are released
+// at the op's completion event. These mirror the dispatch's arithmetic: K padded to QK8_1 only (not to
+// MATRIX_ROW_PADDING, as the dense buffer above is), ne11 * ne12 Q8_1 rows, and n_tokens * n_expert_used int32 ids.
+// The Q8_1 block is k_zone_mmq_src1_block_elems / k_zone_mmq_src1_block_bytes, which the backend static_asserts against
+// QK8_1 and sizeof(block_q8_1). Pure: no state, no log.
+
+// An expert weight the batched dispatch admits, as the dispatch sees its activations. `k` is the weight's ne0, the
+// activation row length. `row_per_slot` is true when each token brings one activation row per routed slot (down, which
+// reads the slots' gate/up outputs), and false when one row serves every slot (gate, up and fused gate_up, whose
+// activations are broadcast). An architecture that weights the activations before the FFN (llama4) repeats them per
+// slot, so its gate and up bring n_expert_used rows a token, which a false `row_per_slot` undercounts.
+struct zone_moe_mmvq_operand {
+    int64_t k            = 0;
+    bool    row_per_slot = false;
+};
+
+// Bytes one op holds at once for `n_tokens` tokens routed to `n_expert_used` experts each: its Q8_1 buffer (n_tokens
+// rows, times n_expert_used when row_per_slot, of K padded to QK8_1) plus its ids buffer, counted whether or not the
+// dispatch reads the ids in place. False with *out = 0 on a non-positive input, false with *out = SIZE_MAX on overflow.
+bool zone_moe_mmvq_op_bytes(const zone_moe_mmvq_operand & op, int64_t n_tokens, int64_t n_expert_used, size_t * out);
+
+// The two bounds over a model's admitted expert ops: the most any one op holds, and the sum over every op, which is
+// what the zone holds if every op's buffers are live at once.
+struct zone_moe_mmvq_scratch {
+    size_t per_op = 0;
+    size_t graph  = 0;
+};
+
+// Both bounds over `ops`, one op per admitted expert tensor. Zero for no ops. False with both bounds 0 on a
+// non-positive input. Saturating: an op whose figure overflows sets both bounds to SIZE_MAX, a sum that overflows sets
+// the graph bound to SIZE_MAX, and either answers false.
+bool zone_moe_mmvq_scratch_bytes(const std::vector<zone_moe_mmvq_operand> & ops,
+                                 int64_t                                    n_tokens,
+                                 int64_t                                    n_expert_used,
+                                 zone_moe_mmvq_scratch *                    out);
 
 // ---------------------------------------------------------------------------
 // dense f16 dequant scratch (llama.cpp-479i)

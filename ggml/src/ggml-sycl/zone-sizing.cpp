@@ -291,6 +291,66 @@ bool zone_mmq_src1_scratch_bytes(size_t bytes_per_token, uint32_t n_ubatch, size
     return true;
 }
 
+bool zone_moe_mmvq_op_bytes(const zone_moe_mmvq_operand & op, int64_t n_tokens, int64_t n_expert_used, size_t * out) {
+    if (!out) {
+        return false;
+    }
+    *out = 0;
+    if (op.k <= 0 || n_tokens <= 0 || n_expert_used <= 0) {
+        return false;
+    }
+    *out = SIZE_MAX;  // every return below is an overflow
+
+    // GGML_PAD(ne10, QK8_1) / QK8_1 blocks of sizeof(block_q8_1) bytes: the dispatch's q8_1_row_size.
+    const int64_t block  = k_zone_mmq_src1_block_elems;
+    const size_t  blocks = static_cast<size_t>(op.k / block + (op.k % block != 0 ? 1 : 0));
+    const size_t  tokens = static_cast<size_t>(n_tokens);
+    const size_t  slots  = static_cast<size_t>(n_expert_used);
+    if (blocks > SIZE_MAX / k_zone_mmq_src1_block_bytes || tokens > SIZE_MAX / slots) {
+        return false;
+    }
+    const size_t row         = blocks * k_zone_mmq_src1_block_bytes;
+    const size_t token_slots = tokens * slots;  // the dispatch's total_batches
+    const size_t rows        = op.row_per_slot ? token_slots : tokens;
+    if (rows > SIZE_MAX / row || token_slots > SIZE_MAX / sizeof(int32_t)) {
+        return false;
+    }
+    const size_t q8  = rows * row;
+    const size_t ids = token_slots * sizeof(int32_t);
+    if (ids > SIZE_MAX - q8) {
+        return false;
+    }
+    *out = q8 + ids;
+    return true;
+}
+
+bool zone_moe_mmvq_scratch_bytes(const std::vector<zone_moe_mmvq_operand> & ops,
+                                 int64_t                                    n_tokens,
+                                 int64_t                                    n_expert_used,
+                                 zone_moe_mmvq_scratch *                    out) {
+    if (!out) {
+        return false;
+    }
+    *out = {};
+    if (n_tokens <= 0 || n_expert_used <= 0 ||
+        std::any_of(ops.begin(), ops.end(), [](const zone_moe_mmvq_operand & op) { return op.k <= 0; })) {
+        return false;
+    }
+    bool exact = true;
+    for (const zone_moe_mmvq_operand & op : ops) {
+        size_t bytes = 0;
+        exact        = zone_moe_mmvq_op_bytes(op, n_tokens, n_expert_used, &bytes) && exact;
+        out->per_op  = std::max(out->per_op, bytes);
+        if (bytes > SIZE_MAX - out->graph) {
+            out->graph = SIZE_MAX;
+            exact      = false;
+        } else {
+            out->graph += bytes;
+        }
+    }
+    return exact;
+}
+
 bool zone_dequant_f16_weight_bytes(int64_t ne0, int64_t ne1, size_t * out) {
     if (!out || ne0 <= 0 || ne1 <= 0) {
         return false;

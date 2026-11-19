@@ -1272,8 +1272,6 @@ struct placement_plan {
     // oneDNN reorder: one temp buffer reused per layer, sized to the largest
     // oneDNN-eligible tensor (see zone-sizing.hpp), not the largest in the model.
     size_t   onednn_reorder_bytes                = 0;  // Zone: SCRATCH (device VRAM)
-    // MoE Q8_1 workspace: quantized activations for batched expert dispatch.
-    size_t   moe_q8_workspace_bytes              = 0;  // Zone: SCRATCH (device VRAM)
     // CPU expert fallback act/out staging. EXPERT_STAGING HOST_COMPUTE uses
     // smart-handle scoped ownership and routes to host SCRATCH.
     size_t   moe_cpu_expert_staging_bytes        = 0;  // Zone: SCRATCH (host pinned)
