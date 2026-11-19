@@ -1001,15 +1001,6 @@ GGML_BACKEND_API bool ggml_backend_sycl_moe_multi_gpu_requested(void);
 GGML_BACKEND_API bool ggml_backend_sycl_multi_device_plan_requested(bool has_experts);
 GGML_BACKEND_API void ggml_backend_sycl_set_debug(int level);
 
-// llama.cpp-xojq (nphx Task 4b): the GPU MoE routing ceiling
-// (MOE_GPU_UBATCH_MAX, ggml-sycl/moe-control-plan.hpp) exposed for
-// llama_context's auto micro-batch ladder. Above this micro-batch the
-// routing-id/compaction table stops being a control-sized allocation and
-// moe_build_context_control_layout() refuses the GPU route
-// (exceeds_gpu_ubatch), so the trial must not try a larger candidate on a
-// MoE model (hparams.n_expert > 0) until llama.cpp-ohkx lifts the ceiling.
-GGML_BACKEND_API uint32_t ggml_backend_sycl_moe_gpu_ubatch_max(void);
-
 // Device-to-host memcpy using the SYCL backend queue for the tensor's buffer.
 // This avoids mixing queues/contexts in tests.
 GGML_BACKEND_API void ggml_backend_sycl_memcpy_d2h(const struct ggml_tensor * tensor, void * dst, size_t size);

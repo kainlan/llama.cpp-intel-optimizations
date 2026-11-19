@@ -3693,7 +3693,7 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   hold-spill fit). A compute buffer that does not fit RUNTIME takes the KV zone next, then raw device memory outside
   the arena, and the trial accepts both. So a dense auto pick above 512 can land `zone=raw`, in the external headroom.
   That is an open finding, not an invariant of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512
-  (`MOE_GPU_UBATCH_MAX`), so their term is the auto pick's.
+  by the picker (`llama_auto_ubatch_moe_ceiling`), so their term is the auto pick's.
 - Every load-time path runs at `n_seq_max` 1 and cannot see the context's sequence count. The probe, the admitted stage
   and the late check all build their measure context at the caller's context and micro-batch and take every other
   parameter from the defaults. So the state term holds one sequence's state, and the late check compares one

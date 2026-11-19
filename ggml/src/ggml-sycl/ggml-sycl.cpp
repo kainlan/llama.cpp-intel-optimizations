@@ -26880,13 +26880,6 @@ bool ggml_backend_sycl_auto_ubatch_enabled() {
     return ggml_sycl::unified_cache_auto_ubatch_enabled();
 }
 
-// llama.cpp-xojq (nphx Task 4b): see the declaration in ggml-sycl.h. A thin
-// accessor so llama-context.cpp's auto micro-batch ladder can cap a MoE
-// model's candidates without depending on moe-control-plan.hpp directly.
-uint32_t ggml_backend_sycl_moe_gpu_ubatch_max() {
-    return ggml_sycl::MOE_GPU_UBATCH_MAX;
-}
-
 // The model-bound publish both entry points share.  `has_desc` selects the descriptor entry point:
 // `desc` is then read once, here, under its gates (a refusal is deterministic, so PLAN_REJECTED, the
 // same answer the inner transaction gives), and the section it yields is stored in the context's
@@ -129434,13 +129427,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     // llama.cpp-xojq (nphx Task 4b, comment c-1mwi): closes the gap the
     // comment above used to name for ggml_backend_sycl_auto_ubatch_enabled
     // (Task 4a defined the symbol but never registered it here, so a
-    // GGML_BACKEND_DL build's llama-context lookup returned nullptr) and
-    // registers this task's own new accessor alongside it.
+    // GGML_BACKEND_DL build's llama-context lookup returned nullptr).
     if (strcmp(name, "ggml_backend_sycl_auto_ubatch_enabled") == 0) {
         return (void *) ggml_backend_sycl_auto_ubatch_enabled;
-    }
-    if (strcmp(name, "ggml_backend_sycl_moe_gpu_ubatch_max") == 0) {
-        return (void *) ggml_backend_sycl_moe_gpu_ubatch_max;
     }
     // llama.cpp-7n6n (wires nphx Task 5): the persisted auto n_ubatch
     // tuning cache's four entry points (ubatch-tuning-cache.cpp),

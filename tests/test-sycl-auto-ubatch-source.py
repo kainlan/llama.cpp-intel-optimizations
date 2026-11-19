@@ -15,8 +15,8 @@ call). Per c-wgxn and the task's own acceptance criteria:
   `sched_reserve()` call, unchanged.
 - The trial tries the ascending ladder {512, 1024, 2048, 4096}, each
   candidate capped by both `n_batch` and `n_ctx`, and additionally, for a
-  MoE model, by the GPU MoE routing ceiling
-  (`ggml_backend_sycl_moe_gpu_ubatch_max()`, comment c-s747 / llama.cpp-ohkx).
+  MoE model, by the picker's MoE ceiling
+  (`llama_auto_ubatch_moe_ceiling`).
 - Per candidate: Task 2's non-publishing probe
   (`ggml_backend_sycl_probe_runtime_context_for_model`) is consulted first
   (a BUSY answer loses the candidate at once: the retry loop it once had is
@@ -442,23 +442,15 @@ def _cap_helper_body() -> str:
     return header[start : header.find("return cap;", start)]
 
 
-def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap():
-    """For a MoE model (hparams.n_expert > 0), the cap must be additionally
-    narrowed to ggml_backend_sycl_moe_gpu_ubatch_max() -- comment c-s747 /
-    llama.cpp-ohkx -- and the "MoE GPU routing ceiling" stop reason reported
-    whenever that ceiling BINDS, i.e. moe_cap <= cap, not only when it is
-    STRICTLY smaller (a MoE context whose batch/ctx cap already equals
-    moe_cap, e.g. cap == 512, is bound by the ceiling exactly as much as one
-    where moe_cap is smaller, so "ladder exhausted" would misreport why the
-    ladder stopped). The 512 constant itself must NOT be
-    hardcoded in llama-context.cpp; it must come from the accessor.
+_MOE_CEILING_DECL = "static const uint32_t llama_auto_ubatch_moe_ceiling = 512;"
 
-    The narrowing now lives in llama_auto_ubatch_cap(), gated on n_expert > 0
-    and on moe_cap_available -- the DL-without-SYCL branch reports the
-    ceiling unavailable when the accessor is absent, which would otherwise
-    report the ceiling reason for every such MoE model although no ceiling
-    was ever consulted. The trial passes the accessor's value, and reads the
-    accessor only for a MoE model."""
+
+def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap():
+    """For a MoE model (hparams.n_expert > 0), the cap is narrowed to the picker's own MoE ceiling,
+    llama_auto_ubatch_moe_ceiling in src/llama-auto-ubatch.h, and the "MoE GPU routing ceiling" stop reason is
+    reported whenever that ceiling BINDS (moe_cap <= cap), not only when it is strictly smaller. The ceiling is the
+    picker's policy until the wide-width measurement lifts it; it is read from nowhere else, and llama-context.cpp
+    holds no bare 512 for it."""
     helper = _cap_helper_body()
     assert _MOE_NARROW in helper, (
         "llama_auto_ubatch_cap must narrow `cap` only when n_expert > 0 && moe_cap_available && "
@@ -466,27 +458,26 @@ def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap(
     )
     assert "*moe_bound = true;" in helper and "*moe_bound = false;" in helper
 
+    header_norm = _normalize_ws(strip_comments(LLAMA_AUTO_UBATCH_H))
+    assert _MOE_CEILING_DECL in header_norm, (
+        "src/llama-auto-ubatch.h must declare the picker's MoE ceiling: " + _MOE_CEILING_DECL
+    )
+
     body_norm = _normalize_ws(_trial_body())
-    assert "ggml_backend_sycl_moe_gpu_ubatch_max" in body_norm, (
-        "the MoE cap must be read from ggml_backend_sycl_moe_gpu_ubatch_max(), not a local constant"
+    assert "ggml_backend_sycl_moe_gpu_ubatch_max" not in body_norm, (
+        "the trial must not read a MoE ceiling from the backend: the picker owns it"
     )
+    assert "moe_cap_fn" not in body_norm, "the DL lookup of the old backend accessor must be gone"
+    assert re.search(
+        r"const\s+uint32_t\s+moe_cap\s*=\s*model\.hparams\.n_expert\s*>\s*0\s*\?\s*llama_auto_ubatch_moe_ceiling"
+        r"\s*:\s*0\s*;",
+        body_norm,
+    ), "the trial must take the picker's ceiling, and only for a MoE model"
     assert re.search(r"const\s+bool\s+moe_cap_available\s*=\s*true\s*;", body_norm), (
-        "the direct GGML_USE_SYCL branch must declare moe_cap_available = true (the accessor is always real there)"
+        "the ceiling is a constant of the picker, so it is always available"
     )
-    assert re.search(r"const\s+bool\s+moe_cap_available\s*=\s*moe_cap_fn\s*!=\s*nullptr\s*;", body_norm), (
-        "the GGML_BACKEND_DL-without-SYCL branch must declare moe_cap_available = (moe_cap_fn != nullptr)"
-    )
-    assert re.search(
-        r"moe_cap\s*=\s*model\.hparams\.n_expert\s*>\s*0\s*\?\s*ggml_backend_sycl_moe_gpu_ubatch_max\(\s*\)\s*:\s*0\s*;", body_norm
-    ), "the direct branch must read the accessor only for a MoE model"
-    assert re.search(
-        r"moe_cap\s*=\s*\(\s*model\.hparams\.n_expert\s*>\s*0\s*&&\s*moe_cap_fn\s*\)\s*\?\s*moe_cap_fn\(\s*\)\s*:\s*0\s*;", body_norm
-    ), "the DL branch must call the looked-up accessor only for a MoE model, and only when it exists"
     assert re.search(r'stop\s*=\s*moe_bound\s*\?\s*"MoE GPU routing ceiling"\s*:\s*"ladder exhausted"\s*;', body_norm), (
         "the stop reason must be the MoE ceiling exactly when the helper reports it bound"
-    )
-    assert not re.search(r"\bcap\s*=\s*512\b", body_norm), (
-        "the MoE ceiling must not be hardcoded as a bare 512 in llama-context.cpp"
     )
 
 
@@ -505,11 +496,9 @@ def test_moe_model_cap_binds_at_equal_has_a_mutation_witness():
 
 
 def test_moe_model_cap_accessor_gate_has_a_mutation_witness():
-    """Mutation witness for the moe_cap_available gate itself: proves it
-    would actually catch the gate being dropped (which would report "MoE
-    GPU routing ceiling" for every MoE model on a GGML_BACKEND_DL build
-    whose SYCL DSO lacks the accessor, even though moe_cap was never
-    narrowed by anything)."""
+    """Mutation witness for the moe_cap_available gate itself: proves the check would catch the gate being
+    dropped, which would make the helper report "MoE GPU routing ceiling" for a MoE model even when the caller says
+    no ceiling is available. moe_cap_available false must keep meaning no narrowing."""
     header = strip_comments(LLAMA_AUTO_UBATCH_H)
     old = "n_expert > 0 && moe_cap_available && moe_cap <= cap"
     assert _normalize_ws(header).count(old) == 1, "mutation target not unique"
@@ -521,40 +510,42 @@ def test_moe_model_cap_accessor_gate_has_a_mutation_witness():
     assert _MOE_NARROW not in mutated, "dropping the n_expert gate must also fail the check"
 
 
-def test_header_declares_the_moe_gpu_ubatch_max_accessor():
-    """ggml_backend_sycl_moe_gpu_ubatch_max() must be declared in
-    ggml-sycl.h and defined (not file-static) in ggml-sycl.cpp, returning
-    the real MOE_GPU_UBATCH_MAX constant, not a re-declared literal."""
-    assert re.search(
-        r"GGML_BACKEND_API\s+uint32_t\s+ggml_backend_sycl_moe_gpu_ubatch_max\s*\(\s*void\s*\)\s*;", GGML_SYCL_H_CODE
-    ), "ggml_backend_sycl_moe_gpu_ubatch_max(void) must be declared in ggml-sycl.h"
-
-    assert re.search(
-        r"uint32_t\s+ggml_backend_sycl_moe_gpu_ubatch_max\s*\(\s*\)\s*\{\s*return\s+ggml_sycl::MOE_GPU_UBATCH_MAX\s*;"
-        r"\s*\}",
-        GGML_SYCL_CPP_CODE,
-    ), "ggml_backend_sycl_moe_gpu_ubatch_max() must be defined in ggml-sycl.cpp, returning ggml_sycl::MOE_GPU_UBATCH_MAX"
-    assert not re.search(r"static\s+uint32_t\s+ggml_backend_sycl_moe_gpu_ubatch_max\(", GGML_SYCL_CPP_CODE), (
-        "the accessor must not be file-static -- llama-context.cpp (a different translation unit) calls it"
-    )
+def _backend_moe_ceiling_violations(texts: dict) -> list:
+    """Names every file that still exports, registers or looks up the deleted backend MoE ceiling."""
+    return [name for name, code in texts.items() if "ggml_backend_sycl_moe_gpu_ubatch_max" in code]
 
 
-def test_proc_address_registers_moe_gpu_ubatch_max_and_auto_ubatch_enabled():
-    """llama.cpp-1mwi: a GGML_BACKEND_DL build's llama-context lookup needs
-    both ggml_backend_sycl_auto_ubatch_enabled (Task 4a defined it but
-    never registered it here) and this task's own new
-    ggml_backend_sycl_moe_gpu_ubatch_max registered in the strcmp
-    proc-address chain, or the lookup silently returns nullptr."""
+def test_the_backend_exports_no_moe_routing_ceiling():
+    """The MoE ceiling has one owner, the picker. So ggml-sycl.h declares no ceiling accessor, ggml-sycl.cpp defines
+    and registers none, and llama-context.cpp looks none up."""
+    texts = {
+        "ggml/include/ggml-sycl.h": GGML_SYCL_H_CODE,
+        "ggml/src/ggml-sycl/ggml-sycl.cpp": GGML_SYCL_CPP_CODE,
+        "src/llama-context.cpp": LLAMA_CONTEXT_CPP_CODE,
+    }
+    assert _backend_moe_ceiling_violations(texts) == []
+
+
+def test_the_backend_exports_no_moe_routing_ceiling_has_a_mutation_witness():
+    """Proves the check above catches the accessor coming back. It mutates ggml-sycl.h only: the scan is one
+    substring test applied to every file in the same dict, so one mutated file shows it reports a file by name."""
+    mutant = GGML_SYCL_H_CODE + "\nGGML_BACKEND_API uint32_t ggml_backend_sycl_moe_gpu_ubatch_max(void);\n"
+    texts = {
+        "ggml/include/ggml-sycl.h": mutant,
+        "ggml/src/ggml-sycl/ggml-sycl.cpp": GGML_SYCL_CPP_CODE,
+        "src/llama-context.cpp": LLAMA_CONTEXT_CPP_CODE,
+    }
+    assert _backend_moe_ceiling_violations(texts) == ["ggml/include/ggml-sycl.h"]
+
+
+def test_proc_address_registers_auto_ubatch_enabled():
+    """A GGML_BACKEND_DL build's llama-context lookup needs ggml_backend_sycl_auto_ubatch_enabled registered in the
+    strcmp proc-address chain, or the lookup silently returns nullptr."""
     assert re.search(
         r'strcmp\(\s*name\s*,\s*"ggml_backend_sycl_auto_ubatch_enabled"\s*\)\s*==\s*0\s*\)\s*\{\s*'
         r"return\s*\(\s*void\s*\*\s*\)\s*ggml_backend_sycl_auto_ubatch_enabled\s*;",
         GGML_SYCL_CPP_CODE,
     ), "ggml_backend_sycl_auto_ubatch_enabled must be registered in the proc-address strcmp chain"
-    assert re.search(
-        r'strcmp\(\s*name\s*,\s*"ggml_backend_sycl_moe_gpu_ubatch_max"\s*\)\s*==\s*0\s*\)\s*\{\s*'
-        r"return\s*\(\s*void\s*\*\s*\)\s*ggml_backend_sycl_moe_gpu_ubatch_max\s*;",
-        GGML_SYCL_CPP_CODE,
-    ), "ggml_backend_sycl_moe_gpu_ubatch_max must be registered in the proc-address strcmp chain"
 
 
 # ---------------------------------------------------------------------------
@@ -1792,7 +1783,7 @@ def test_ubatch_cache_key_layout_is_pinned_next_to_the_accessors():
 def test_proc_address_registers_the_four_ubatch_cache_accessors():
     """A GGML_BACKEND_DL build's llama-context lookup needs all four
     entry points registered in the strcmp proc-address chain, mirroring
-    the auto_ubatch_enabled/moe_gpu_ubatch_max precedent just above."""
+    the auto_ubatch_enabled precedent just above."""
     for symbol in (
         "ggml_backend_sycl_ubatch_cache_enabled",
         "ggml_backend_sycl_ubatch_cache_path",
@@ -2669,6 +2660,10 @@ def test_env_vars_doc_explains_the_moe_512_pin():
     assert "GPT-OSS" in row and "Mistral" in row, (
         "the row must name GPT-OSS (MoE, pinned) and Mistral (dense, not pinned) as the contrasting example"
     )
+    assert "ggml_backend_sycl_moe_gpu_ubatch_max" not in row, (
+        "the row must name the picker's ceiling, not the deleted backend accessor"
+    )
+    assert "llama_auto_ubatch_moe_ceiling" in row, "the row must name where the 512 lives now"
 
 
 # ---------------------------------------------------------------------------
