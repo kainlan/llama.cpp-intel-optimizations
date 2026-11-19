@@ -223,6 +223,11 @@ zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone
     return kept;
 }
 
+bool zone_onednn_plan_same(const zone_onednn_plan & a, const zone_onednn_plan & b) {
+    return a.bare_bytes == b.bare_bytes && a.graph_floor_bytes == b.graph_floor_bytes &&
+           a.weights_bytes == b.weights_bytes && a.activations_bytes == b.activations_bytes;
+}
+
 bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool pair_eligible) {
     return !(pp_scratch_type_enabled && pair_eligible);
 }
@@ -530,6 +535,38 @@ bool zone_arena_only_ring_holds(bool rebuild_needed, const zone_arena_holders & 
     // through the ring's own counts; a lease is never the ring's.
     return rebuild_needed && holders.ring_in_arena != 0 && holders.scratch_in_arena == holders.ring_in_arena &&
            holders.live_beside_ring == 0 && holders.chunk_leases == 0;
+}
+
+bool zone_arena_shortfall_is_reservation_only(const zone_arena_sizes & have,
+                                              const zone_arena_sizes & need,
+                                              size_t                   onednn_pair_bytes) {
+    // Only the ONEDNN zone is short, and it still holds the pair. Not widened to SCRATCH: the non-FA scratch it holds
+    // has no DIRECT path of its own.
+    return have.scratch >= need.scratch && have.runtime >= need.runtime && have.onednn < need.onednn &&
+           have.onednn >= onednn_pair_bytes;
+}
+
+size_t zone_onednn_kept_pair_bytes(const zone_onednn_plan & kept, size_t held_pair_bytes) {
+    return std::max(kept.bare_bytes, held_pair_bytes);
+}
+
+zone_onednn_plan zone_onednn_plan_keep_short(const zone_onednn_plan & held,
+                                             const zone_onednn_plan & live,
+                                             size_t                   capacity_bytes,
+                                             size_t                   held_pair_bytes) {
+    zone_onednn_plan kept  = zone_onednn_plan_keep(held, live);
+    const size_t     pair  = zone_onednn_kept_pair_bytes(kept, held_pair_bytes);
+    const size_t     room  = capacity_bytes > pair ? capacity_bytes - pair : 0;
+    kept.graph_floor_bytes = std::min(room, kept.graph_floor_bytes);
+    return kept;
+}
+
+size_t zone_graph_direct_cap_snapshot_kept(size_t held_bytes, size_t current_bytes) {
+    return held_bytes == 0 ? current_bytes : std::min(held_bytes, current_bytes);
+}
+
+bool zone_kept_onednn_warn_due(uint64_t latched_txn, uint64_t load_txn) {
+    return load_txn == 0 || latched_txn != load_txn;
 }
 
 // `bytes` in MB at one decimal, in KB under 0.1 MB, and in bytes under 1 KB, so a small figure never prints as 0.0 MB.
@@ -889,6 +926,105 @@ size_t zone_hold_free_cold(size_t driver_free, size_t raw_live) {
 
 size_t zone_hold_free_before(size_t cold, size_t persistent_raw) {
     return persistent_raw >= cold ? 0 : cold - persistent_raw;
+}
+
+zone_context_shape zone_plan_context_shape(bool     n_ctx_is_runtime,
+                                           uint32_t plan_n_ctx,
+                                           uint32_t n_ctx_context,
+                                           uint32_t plan_n_ubatch,
+                                           uint32_t n_ubatch_context) {
+    zone_context_shape s;
+    s.n_ctx    = !n_ctx_is_runtime && n_ctx_context != 0 ? n_ctx_context : plan_n_ctx;
+    s.n_ubatch = !n_ctx_is_runtime && n_ubatch_context != 0 ? n_ubatch_context : plan_n_ubatch;
+    if (s.n_ctx != 0 && s.n_ubatch > s.n_ctx) {
+        s.n_ubatch = s.n_ctx;
+    }
+    return s;
+}
+
+uint32_t zone_planning_n_ubatch(uint32_t envelope_n_ubatch, uint32_t n_ubatch) {
+    return envelope_n_ubatch != 0 ? envelope_n_ubatch : n_ubatch;
+}
+
+zone_context_shape zone_plan_context_shape_for_envelope(bool     n_ctx_is_runtime,
+                                                        uint32_t n_ctx,
+                                                        uint32_t n_ctx_context,
+                                                        uint32_t envelope_n_ubatch,
+                                                        uint32_t n_ubatch,
+                                                        uint32_t n_ubatch_context) {
+    return zone_plan_context_shape(n_ctx_is_runtime, n_ctx, n_ctx_context,
+                                   zone_planning_n_ubatch(envelope_n_ubatch, n_ubatch), n_ubatch_context);
+}
+
+size_t zone_onednn_graph_scratch_floor_bytes(uint32_t n_head_ctx_max,
+                                             uint32_t n_head_swa_max,
+                                             uint32_t n_swa,
+                                             uint32_t n_ubatch,
+                                             uint32_t n_ctx,
+                                             size_t   direct_cap) {
+    constexpr uint64_t k_floor_min_bytes = 64ull * 1024ull * 1024ull;
+    constexpr uint64_t k_sizeof_f32      = 4;
+    const uint64_t     ctx_term          = uint64_t(n_head_ctx_max) * uint64_t(n_ctx);
+    // Widened before the add: n_swa + n_ubatch in 32 bits can wrap for a huge window.
+    const uint64_t     swa_term = uint64_t(n_head_swa_max) * std::min<uint64_t>(n_ctx, uint64_t(n_swa) + n_ubatch);
+    const uint64_t     elems    = std::max(ctx_term, swa_term) * uint64_t(n_ubatch);
+    // Fixed-point 3/2 rather than a floating-point 1.5: exact at the MiB boundaries the formula was measured at.
+    uint64_t           modeled  = (elems * k_sizeof_f32 * 3) / 2;
+    if (direct_cap != 0) {
+        modeled = std::min<uint64_t>(modeled, direct_cap);
+    }
+    return static_cast<size_t>(std::max<uint64_t>(k_floor_min_bytes, modeled));
+}
+
+size_t zone_onednn_graph_uncovered_bytes(size_t demand, size_t graph_room) {
+    return demand > graph_room ? demand - graph_room : 0;
+}
+
+uint32_t zone_onednn_graph_fit_largest_ub(uint32_t n_head_ctx_max,
+                                          uint32_t n_head_swa_max,
+                                          uint32_t n_swa,
+                                          uint32_t n_ubatch,
+                                          uint32_t n_ctx,
+                                          size_t   direct_cap,
+                                          size_t   graph_room,
+                                          size_t   free_outside,
+                                          size_t   headroom,
+                                          size_t   hold_spill) {
+    constexpr uint32_t k_smallest_rung = 32;
+    auto               fits            = [&](uint32_t ub) {
+        const size_t demand =
+            zone_onednn_graph_scratch_floor_bytes(n_head_ctx_max, n_head_swa_max, n_swa, ub, n_ctx, direct_cap);
+        const size_t uncovered = zone_onednn_graph_uncovered_bytes(demand, graph_room);
+        // A scratch the room holds draws nothing outside the arena: this check has nothing to answer for, and the hold
+        // check judges its own spill.
+        if (uncovered == 0) {
+            return true;
+        }
+        // The same saturating sum the non-FA check charges the hold's spill with.
+        const size_t outside = zone_hold_nonfa_demand(uncovered, hold_spill);
+        return outside <= free_outside && free_outside - outside >= headroom;
+    };
+    if (n_ubatch == 0) {
+        return 0;
+    }
+    if (fits(n_ubatch)) {
+        return n_ubatch;
+    }
+    if (n_ubatch <= k_smallest_rung) {
+        return 0;
+    }
+    // The largest power of two below n_ubatch, at least the smallest rung. The demand does not fall as the
+    // micro-batch grows, so the first rung that fits going down is the largest.
+    uint32_t rung = k_smallest_rung;
+    while (rung <= (n_ubatch - 1) / 2) {
+        rung <<= 1;
+    }
+    for (; rung >= k_smallest_rung; rung >>= 1) {
+        if (fits(rung)) {
+            return rung;
+        }
+    }
+    return 0;
 }
 
 size_t zone_hold_persistent_raw(size_t raw_held, size_t compute_live, bool rung_live) {

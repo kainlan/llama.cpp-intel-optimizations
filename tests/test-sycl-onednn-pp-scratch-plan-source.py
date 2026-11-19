@@ -388,7 +388,8 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
                       r"zone_plan\.weights_bytes,\s*zone_plan\.activations_bytes,", reserve) is not None
         results["reserve reads the planned pair from the stored snapshot, only with an arena"] = \
             re.search(r"zone_plan\s*=\s*arena_on\s*\?\s*onednn_zone_plan_load\(", reserve) is not None
-    pair_reader = function_body(cache, r"static zone_onednn_plan onednn_planned_pair_and_floor\(int device_id\)\s*\{")
+    pair_reader = function_body(
+        cache, r"static zone_onednn_plan onednn_planned_pair_and_floor\(int device_id, size_t direct_cap\)\s*\{")
     results["anchor: the planned pair-and-floor reader exists"] = pair_reader is not None
     if pair_reader is not None:
         results["the planned pair reader carries both pair halves into the plan"] = \

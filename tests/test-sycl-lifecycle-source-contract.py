@@ -27,6 +27,19 @@ def function_has_guard(source, name, guard):
 def function_has_module_guard(source, name):
     return function_has_guard(source, name, "sycl_module_mutation_guard")
 
+def first_match(pattern, source):
+    """Offset of the first match, or -1: an ordered chain of these fails when any link is missing."""
+    m = re.search(pattern, source)
+    return m.start() if m else -1
+
+# shutdown_unified_cache()'s snapshot: a local copy of the cache map (line-anchored, so not the accessor's static),
+# filled from the map, and only then the caches' teardown
+cache_snapshot_decl = first_match(
+    r"(?m)^[ \t]*std::unordered_map\s*<\s*int\s*,\s*std::shared_ptr\s*<\s*unified_cache\s*>\s*>\s+caches\s*;", cache_cpp)
+cache_snapshot_fill = first_match(r"\bcaches\s*=\s*device_caches\s*;", cache_cpp)
+cache_snapshot_ok = (0 <= cache_snapshot_decl < cache_snapshot_fill
+                     and cache_snapshot_fill < cache_cpp.find("item.second->shutdown_resources()"))
+
 saveable_mutating_procs = {
     "ggml_backend_split_buffer_type": "ggml_backend_sycl_split_buffer_type",
     "ggml_backend_tp_buffer_type": "ggml_backend_sycl_tp_buffer_type",
@@ -1660,10 +1673,7 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "callback-drain unload joined" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
-    "cache shutdown owner snapshot avoids rw-lock callbacks":
-        "std::unordered_map<int, std::shared_ptr<unified_cache>> caches" in cache_cpp
-        and cache_cpp.index("caches = g_device_caches")
-            < cache_cpp.index("item.second->shutdown_resources()"),
+    "cache shutdown owner snapshot avoids rw-lock callbacks": cache_snapshot_ok,
     "bounded retained handle drain": "wait_for(lock, std::chrono::milliseconds(timeout_ms)" in
         (root / "ggml/src/ggml-sycl/mem-handle.cpp").read_text()
         and "SYCL retained-handle drain timed out" in backend,

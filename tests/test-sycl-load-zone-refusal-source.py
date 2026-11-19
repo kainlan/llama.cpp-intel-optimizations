@@ -143,7 +143,8 @@ PATH_SIGS = (COMPUTE_SIG, EARLY_SIG, LATE_SIG, STAGE_SIG)
 # which writes the same refusal.
 ENTRY_ENSURE = ("if (ggml_sycl::get_unified_cache_for_device(ctx->device) && "
                 "!ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)) {")
-FALLBACK_ENSURE = "if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {"
+FALLBACK_ENSURE = ("if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal, "
+                   "ggml_sycl_load_arena_options())) {")
 REFUSE = 'GGML_LOG_ERROR("%s\\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str()); return false; }'
 ABORT_LINE = 'GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");'
 
@@ -189,8 +190,10 @@ def claim_every_caller_propagates(gs: str) -> bool:
 
 # ---- the refusal names need and have ----
 
-ENSURE_SIG = "bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal)"
-WRAPPER_SIG = "bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal * refusal)"
+ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
+              "const zone_arena_ensure_options & options)")
+WRAPPER_SIG = ("bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal * refusal, "
+               "const zone_arena_ensure_options & options)")
 # The need is the three sizes the ensure decided on; the have is the arena's zones, read once before either refusal
 # (a failed reserve has destroyed the arena by the time it refuses).
 NEED = "refusal->need = { scratch_zone, onednn_zone, runtime_zone };"
@@ -198,8 +201,10 @@ HAVE = "refusal->have = arena_zones;"
 ZONES_READ = ("arena_zones = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN), "
               "zone_capacity(vram_zone_id::RUNTIME) };")
 HOLDERS = "refusal->holders = holders;"
+# Whether the zones would have been kept had the caller not asked to release a lone PP MoE ring first.
+KEEP_DEFERRED = "refusal->keep_deferred = reservation_only && defer_keep;"
 HELD_FILL = ("if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::REBUILD_HELD; refusal->device = "
-             "dev_id; " + NEED + " " + HAVE + " " + HOLDERS + " } return false;")
+             "dev_id; " + NEED + " " + HAVE + " " + HOLDERS + " " + KEEP_DEFERRED + " } return false;")
 # A failed reserve's have is what the device has after it; the arena a rebuild destroyed for it is named as released.
 RESERVE_HAVE = ("refusal->have = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN), "
                 "zone_capacity(vram_zone_id::RUNTIME) };")
@@ -351,6 +356,7 @@ GROUP_SETTERS = (
     ("LOAD_PUBLISHED_GROUP_NONFA", "unified_cache_set_planned_nonfa_attn_scratch_shape("),
     ("LOAD_PUBLISHED_GROUP_CONTROL", "unified_cache_set_planned_moe_control_requirement("),
     ("LOAD_PUBLISHED_GROUP_SCATTER", "unified_cache_set_planned_moe_host_scatter_scratch_bytes("),
+    ("LOAD_PUBLISHED_GROUP_ZONE_PLAN", "onednn_zone_plan_put_back("),
 )
 # The sum is never stored plainly: a plain store would put back over a reserve's raise.
 SUM_PLAIN = ("unified_cache_set_planned_onednn_scratchpad_bytes(", PAIR_SETTER + "(",

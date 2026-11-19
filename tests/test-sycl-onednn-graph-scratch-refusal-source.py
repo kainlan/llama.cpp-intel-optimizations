@@ -1,0 +1,386 @@
+"""Source contract for the runtime-context refusal of a oneDNN Graph attention scratch the load did not plan.
+
+The ONEDNN zone holds the Graph scratch room the load sized for the shape it was told. A later context can ask for
+more (a rung the automatic micro-batch trial probes above the planned micro-batch, a larger -c than the hint, or an
+API caller that gave none). The part above the room is served outside the arena, by the DIRECT path, which draws raw
+device memory and aborts the process when the card has none left. The runtime-context transaction therefore asks,
+before the dense scratch is re-planned (its transaction guard is the first state a refusal must undo), whether that
+part fits outside the arena above the driver headroom beside the hold's worst-case spill, and refuses the context by
+name when it does not. Only the part above the room is refused: a context whose scratch outgrows the zone but fits
+outside the arena runs.
+
+The arithmetic is host-tested (test-zone-sizing, Case 24h). This file pins the wiring no host test can reach:
+- the transaction calls the check after the non-FA check and before the dense scratch guard, its first state that a
+  refusal must undo;
+- the check returns early when flash attention is off, and when the Graph allocator is disabled;
+- the check runs in probe mode too (the micro-batch ladder must see the verdict a real context gets);
+- the refusal names the largest -ub the same fit accepts;
+- the refusal's advice compares the context's shape with the shape the load published, so it names the load
+  argument that differs (-ub for an automatic micro-batch's trial rung, -c for a larger context);
+- the fit is handed the context's shape in the floor function's order (n_ubatch before n_ctx) and the same cap, so
+  the two cannot judge different shapes;
+- the Graph room is the ONEDNN zone's capacity less the pair bound over that same capacity, from one capacity read
+  in the room accessor, and the check reads no capacity of its own;
+- the check admits when the room accessor fails (no cache or no active arena: no zone was planned to judge against).
+Each claim has a mutant that fails its own check and no other; the order claim has one for each half (the call
+moved above the non-FA check, and moved past the first guarded state).
+
+Host-only text assertions on comment-stripped source. llama_test_pytest hands this file to pytest.main(), so every
+check lives in a test_*() function.
+"""
+
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+GGML_SYCL_CPP = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
+UNIFIED_CACHE_CPP = (ROOT / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
+
+# One left-to-right alternation, so a `/*` inside a `//` comment's prose cannot open a block comment.
+_LEXEME_RE = re.compile(
+    r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
+    r"|'(?:\\.|[^'\\\n])*'"  # char literal (kept)
+    r"|//[^\n]*"  # line comment (dropped)
+    r"|/\*.*?\*/",  # block comment (dropped)
+    flags=re.DOTALL,
+)
+
+
+def strip_comments(src: str) -> str:
+    def repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if tok[0] in "\"'":
+            return tok
+        return "\n" * tok.count("\n")
+
+    return _LEXEME_RE.sub(repl, src)
+
+
+def normalize(src: str) -> str:
+    return re.sub(r"\s+", " ", strip_comments(src))
+
+
+SYCL_NORM = normalize(GGML_SYCL_CPP)
+CACHE_NORM = normalize(UNIFIED_CACHE_CPP)
+
+TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
+CHECK_NAME = "ggml_sycl_check_onednn_graph_scratch"
+CHECK_SIG = f"static bool {CHECK_NAME}("
+CHECK_CALL = f"if (!{CHECK_NAME}(ctx->device, next_plan, flash_attn_enabled, probe_mode, hold_query)) {{"
+NONFA_CALL = "if (!ggml_sycl_check_nonfa_attn_scratch("
+NONFA_REFUSE ='return refuse("non-FA attention scratch exceeds the device\'s outside-arena headroom");'
+# The first state the transaction restores on a refusal: the dense scratch's transaction guard.
+FIRST_GUARDED_STATE = "ggml_sycl_dense_scratch_txn_guard dense_guard("
+EARLY_RETURN_RE = re.compile(r"^ #if GGML_SYCL_DNNL if \(([^{]*)\) \{ return true; \}")
+FA_OFF = "!flash_attn_enabled"
+ALLOCATOR_OFF = "!ggml_sycl::onednn_graph_allocator_enabled()"
+REFUSAL_TEXT = "runtime context update rejected: the oneDNN Graph attention scratch"
+LARGEST_ASSIGN = "const uint32_t largest = ggml_sycl::zone_onednn_graph_fit_largest_ub("
+ADVICE_ARG = "advice.c_str()"
+ADVICE_ASSIGN = "const std::string advice = ggml_sycl_onednn_graph_scratch_advice("
+PLANNED_SHAPE_ARG = "ggml_sycl::unified_cache_get_planned_onednn_graph_scratch_shape(device)"
+DEMAND_ASSIGN = "const size_t demand = ggml_sycl::zone_onednn_graph_scratch_floor_bytes("
+ROOM_SIG = "bool unified_cache_get_onednn_graph_room(int device_id, size_t * room) {"
+ROOM_READ = "const size_t capacity = cache->zone_capacity(vram_zone_id::ONEDNN);"
+ROOM_BOUND = "const size_t bound = onednn_pp_pair_bound_for(device_id, capacity);"
+ROOM_STORE = "*room = capacity > bound ? capacity - bound : 0;"
+ROOM_CALL = "if (!ggml_sycl::unified_cache_get_onednn_graph_room(device, &graph_room)) { return true; }"
+
+
+def _body(src: str, sig: str) -> tuple:
+    """The [start, end) span of the brace-balanced body of the one function whose signature starts with `sig`."""
+    assert src.count(sig) == 1, f"expected exactly one {sig!r}, found {src.count(sig)}"
+    open_at = src.index("{", src.index(sig))
+    depth = 0
+    for i in range(open_at, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return open_at, i + 1
+    raise AssertionError(f"unbalanced body for {sig!r}")
+
+
+def _body_text(src: str, sig: str) -> str:
+    start, end = _body(src, sig)
+    return src[start:end]
+
+
+def _depth_at(body: str, pos: int) -> int:
+    return body[:pos].count("{") - body[:pos].count("}")
+
+
+def _called_in_order(src: str) -> bool:
+    """One call, after the non-FA refusal and before the first state a refusal must undo, refusing on false."""
+    body = _body_text(src, TXN_SIG)
+    if body.count(CHECK_CALL) != 1 or body.count(NONFA_REFUSE) != 1 or body.count(FIRST_GUARDED_STATE) != 1:
+        return False
+    call = body.index(CHECK_CALL)
+    after = body[call + len(CHECK_CALL) :].lstrip()
+    return body.index(NONFA_REFUSE) < call < body.index(FIRST_GUARDED_STATE) and after.startswith('return refuse("')
+
+
+def _runs_in_probe_mode(src: str) -> bool:
+    """The call sits at the transaction's top level, under no condition: a probe asks it as a real context does."""
+    body = _body_text(src, TXN_SIG)
+    if body.count(CHECK_CALL) != 1:
+        return False
+    return _depth_at(body, body.index(CHECK_CALL)) == 1
+
+
+def _early_return_condition(src: str):
+    m = EARLY_RETURN_RE.match(_body_text(src, CHECK_SIG)[1:])
+    return [term.strip() for term in m.group(1).split("||")] if m else None
+
+
+def _returns_early_when_fa_off(src: str) -> bool:
+    terms = _early_return_condition(src)
+    return terms is not None and FA_OFF in terms
+
+
+def _returns_early_when_allocator_off(src: str) -> bool:
+    terms = _early_return_condition(src)
+    return terms is not None and ALLOCATOR_OFF in terms
+
+
+def _call_text(text: str, open_paren: int) -> str:
+    """The parenthesised argument text that opens at `open_paren`, string literals skipped (a format string may hold
+    a parenthesis or a semicolon)."""
+    depth, i, in_str = 0, open_paren, False
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren : i + 1]
+        i += 1
+    raise AssertionError("unbalanced call")
+
+
+def _advice_args(body: str, refusal_at: int):
+    """The arguments of the one advice assignment, which must come after the fit and before the refusal."""
+    if body.count(ADVICE_ASSIGN) != 1 or body.count(LARGEST_ASSIGN) != 1:
+        return None
+    at = body.index(ADVICE_ASSIGN)
+    if not body.index(LARGEST_ASSIGN) < at < refusal_at:
+        return None
+    return _args(_call_text(body, at + len(ADVICE_ASSIGN) - 1))
+
+
+def _refusal_names_the_largest_ub(src: str) -> bool:
+    """The refusal's last argument is the advice built for the -ub the fit returned."""
+    body = _body_text(src, CHECK_SIG)
+    at = body.find("GGML_SYCL_RUNTIME_TXN_REFUSAL(")
+    if at < 0:
+        return False
+    advice = _advice_args(body, at)
+    args = _call_text(body, body.index("(", at))
+    return (advice is not None and advice[:3] == ["n_ubatch", "n_ctx", "largest"] and REFUSAL_TEXT in args
+            and args.endswith(f"{ADVICE_ARG})"))
+
+
+def _advice_compares_the_published_shape(src: str) -> bool:
+    """The advice is handed the Graph shape the load published, the shape the room was planned for."""
+    body = _body_text(src, CHECK_SIG)
+    at = body.find("GGML_SYCL_RUNTIME_TXN_REFUSAL(")
+    advice = _advice_args(body, at) if at >= 0 else None
+    return advice is not None and len(advice) == 4 and advice[3] == PLANNED_SHAPE_ARG
+
+
+def _args(call: str) -> list:
+    """The top-level arguments of a parenthesised argument text from _call_text()."""
+    out, depth, cur = [], 0, ""
+    for c in call[1:-1]:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += c
+    out.append(cur.strip())
+    return out
+
+
+def _fit_takes_the_floor_shape_order(src: str) -> bool:
+    """The fit's shape and cap arguments are the floor call's, in the floor's order: n_ubatch, then n_ctx."""
+    body = _body_text(src, CHECK_SIG)
+    if body.count(LARGEST_ASSIGN) != 1 or body.count(DEMAND_ASSIGN) != 1:
+        return False
+    fit = _args(_call_text(body, body.index(LARGEST_ASSIGN) + len(LARGEST_ASSIGN) - 1))
+    floor = _args(_call_text(body, body.index(DEMAND_ASSIGN) + len(DEMAND_ASSIGN) - 1))
+    return len(fit) >= 6 and len(floor) == 6 and fit[:6] == floor and fit[3:5] == ["n_ubatch", "n_ctx"]
+
+
+def _room_is_capacity_less_the_bound(src: str, cache: str) -> bool:
+    """The accessor reads the capacity once and subtracts the bound over that capacity; the check reads none."""
+    if cache.count(ROOM_SIG) != 1:
+        return False
+    room = _body_text(cache, ROOM_SIG)
+    check = _body_text(src, CHECK_SIG)
+    read, bound, store = room.find(ROOM_READ), room.find(ROOM_BOUND), room.find(ROOM_STORE)
+    return (room.count("zone_capacity(") == 1 and 0 <= read < bound < store and "zone_capacity(" not in check
+            and "unified_cache_get_onednn_pp_pair_bound(" not in check)
+
+
+def _admits_without_a_room(src: str) -> bool:
+    """The check takes its room from the accessor, once, and returns true (admits) when the accessor fails."""
+    check = _body_text(src, CHECK_SIG)
+    return check.count(ROOM_CALL) == 1 and check.count("unified_cache_get_onednn_graph_room(") == 1
+
+
+def _checks(src: str, cache: str = CACHE_NORM) -> dict:
+    return {
+        "order": _called_in_order(src),
+        "probe": _runs_in_probe_mode(src),
+        "fa_off": _returns_early_when_fa_off(src),
+        "allocator_off": _returns_early_when_allocator_off(src),
+        "names_ub": _refusal_names_the_largest_ub(src),
+        "advice_shape": _advice_compares_the_published_shape(src),
+        "arg_order": _fit_takes_the_floor_shape_order(src),
+        "room": _room_is_capacity_less_the_bound(src, cache),
+        "admit_without_room": _admits_without_a_room(src),
+    }
+
+
+def test_transaction_calls_the_check_after_the_nonfa_check_and_before_the_dense_scratch_guard():
+    """The check runs once the non-FA check has passed and before the dense scratch guard, the first state the
+    transaction must undo on a refusal; a refusal returns from the transaction at once."""
+    assert _called_in_order(SYCL_NORM), (
+        f"the transaction must call {CHECK_NAME}() once, after the non-FA refusal and before {FIRST_GUARDED_STATE}...), "
+        "and refuse when it returns false"
+    )
+
+
+def test_the_check_runs_in_probe_mode():
+    assert _runs_in_probe_mode(SYCL_NORM), (
+        f"{CHECK_NAME}() must be called at the transaction's top level, under no condition, so a probe sees the "
+        "verdict a real context gets"
+    )
+
+
+def test_the_check_returns_early_without_flash_attention_or_the_graph_allocator():
+    assert _returns_early_when_fa_off(SYCL_NORM), f"{CHECK_NAME}() must return true first when {FA_OFF}"
+    assert _returns_early_when_allocator_off(SYCL_NORM), f"{CHECK_NAME}() must return true first when {ALLOCATOR_OFF}"
+
+
+def test_the_refusal_names_the_largest_ub_that_fits():
+    assert _refusal_names_the_largest_ub(SYCL_NORM), (
+        f"the refusal must end with {ADVICE_ARG}, built for the -ub zone_onednn_graph_fit_largest_ub() accepts"
+    )
+
+
+def test_the_advice_compares_the_shape_the_load_published():
+    assert _advice_compares_the_published_shape(SYCL_NORM), (
+        f"the refusal's advice must be handed {PLANNED_SHAPE_ARG}, so it names the load argument that differs"
+    )
+
+
+def test_the_room_is_the_capacity_less_the_bound_from_one_capacity_read():
+    assert _room_is_capacity_less_the_bound(SYCL_NORM, CACHE_NORM), (
+        "unified_cache_get_onednn_graph_room() must read the ONEDNN capacity once and return it less the pair bound "
+        f"over that capacity, and {CHECK_NAME}() must read no capacity or bound of its own"
+    )
+
+
+def test_the_check_admits_when_the_room_accessor_fails():
+    assert _admits_without_a_room(SYCL_NORM), (
+        f"{CHECK_NAME}() must take its room from unified_cache_get_onednn_graph_room() once and return true when it "
+        "fails"
+    )
+
+
+def test_the_fit_is_handed_the_shape_in_the_floor_functions_order():
+    assert _fit_takes_the_floor_shape_order(SYCL_NORM), (
+        "zone_onednn_graph_fit_largest_ub() must take the floor call's shape and cap arguments in the floor's order "
+        "(n_ubatch before n_ctx)"
+    )
+
+
+def _mutate_in(src: str, sig: str, old: str, new: str) -> str:
+    start, end = _body(src, sig)
+    body = src[start:end]
+    assert body.count(old) == 1, f"mutation anchor must occur once in {sig!r}: {old!r}"
+    return src[:start] + body.replace(old, new, 1) + src[end:]
+
+
+def _assert_only(mutant: str, failing: str, why: str, cache: str = CACHE_NORM) -> None:
+    results = _checks(mutant, cache)
+    expected = {name: name != failing for name in results}
+    assert results == expected, f"mutation witness for {failing!r} ({why}) is broken: {results}"
+
+
+def test_every_check_has_a_mutation_witness_that_fails_only_it():
+    src = SYCL_NORM
+    assert all(_checks(src).values()), "sanity: every check passes on the source itself"
+
+    # The call moved past the first guarded state: everything else unchanged.
+    start, end = _body(src, TXN_SIG)
+    body = src[start:end]
+    call_at = body.index(CHECK_CALL)
+    call_end = body.index("}", body.index('return refuse("', call_at)) + 1
+    block = body[call_at:call_end]
+    moved = body[:call_at] + body[call_end:]
+    guard_end = moved.index(";", moved.index(FIRST_GUARDED_STATE)) + 1
+    moved = moved[:guard_end] + " " + block + moved[guard_end:]
+    _assert_only(src[:start] + moved + src[end:], "order", "the check after the dense scratch guard")
+
+    # The call moved above the non-FA check, still before the guard: the other half of the order claim.
+    moved = body[:call_at] + body[call_end:]
+    assert moved.count(NONFA_CALL) == 1, f"mutation anchor must occur once in the transaction: {NONFA_CALL!r}"
+    nonfa_at = moved.index(NONFA_CALL)
+    moved = moved[:nonfa_at] + block + " " + moved[nonfa_at:]
+    _assert_only(src[:start] + moved + src[end:], "order", "the check before the non-FA check")
+
+    _assert_only(_mutate_in(src, TXN_SIG, block, f"if (!probe_mode) {{ {block} }}"), "probe",
+                 "the check skipped for a probe")
+
+    _assert_only(_mutate_in(src, CHECK_SIG, f"if ({FA_OFF} || {ALLOCATOR_OFF})", f"if ({ALLOCATOR_OFF})"), "fa_off",
+                 "a context without flash attention judged by the Graph check")
+
+    _assert_only(_mutate_in(src, CHECK_SIG, f"if ({FA_OFF} || {ALLOCATOR_OFF})", f"if ({FA_OFF})"), "allocator_off",
+                 "a disabled Graph allocator judged by the Graph check")
+
+    _assert_only(_mutate_in(src, CHECK_SIG, "n_ubatch, n_ctx, largest, " + PLANNED_SHAPE_ARG,
+                            "n_ubatch, n_ctx, 0, " + PLANNED_SHAPE_ARG), "names_ub",
+                 "the refusal names no -ub")
+
+    _assert_only(_mutate_in(src, CHECK_SIG, "plan.planner_n_swa, n_ubatch, n_ctx, cap, graph_room",
+                            "plan.planner_n_swa, n_ctx, n_ubatch, cap, graph_room"), "arg_order",
+                 "the fit handed n_ctx and n_ubatch swapped")
+
+    _assert_only(_mutate_in(src, CHECK_SIG, PLANNED_SHAPE_ARG, "ggml_sycl::onednn_graph_scratch_planned_shape{}"),
+                 "advice_shape", "the advice judged against no planned shape")
+
+    _assert_only(src, "room", "the room is the whole capacity",
+                 cache=_mutate_in(CACHE_NORM, ROOM_SIG, ROOM_STORE, "*room = capacity;"))
+    _assert_only(src, "room", "the bound taken over a second capacity read",
+                 cache=_mutate_in(CACHE_NORM, ROOM_SIG, ROOM_BOUND,
+                                  "const size_t bound = onednn_pp_pair_bound_for(device_id, "
+                                  "cache->zone_capacity(vram_zone_id::ONEDNN));"))
+    _assert_only(_mutate_in(src, CHECK_SIG, ROOM_CALL,
+                            f"{ROOM_CALL} const size_t zone = cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN);"
+                            " graph_room = zone > graph_room ? graph_room : zone;"),
+                 "room", "the check reads a capacity of its own")
+    _assert_only(_mutate_in(src, CHECK_SIG, ROOM_CALL, ROOM_CALL.replace("return true;", "return false;")),
+                 "admit_without_room", "the check refuses when the accessor fails")
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
