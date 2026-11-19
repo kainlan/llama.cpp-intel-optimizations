@@ -4206,9 +4206,11 @@ if (GGML_SYCL)
     set_tests_properties(test-sycl-plan-dry-run-args PROPERTIES LABELS "sycl;host")
 endif()
 
-# Two co-resident loads of the 7B Mistral gate model on one card, planned for a 512-token and an 8192-token context,
+# Two co-resident loads of the 7B Mistral gate model on one card, planned for a 512-token and a 4096-token context,
 # in both orders: the larger second load keeps a ONEDNN zone too small for its oneDNN Graph floor (one keep WARN, no
-# refusal), the smaller second load takes the sufficient path, and every context counts on correctly. It loads a
+# refusal), the smaller second load takes the sufficient path, and every context counts on correctly. The RUNTIME
+# zone (the measure's non-flash score matrix) and the SCRATCH zone (the non-flash attention scratch) grow with the
+# context too; at 4096 both stay at their 512 MiB defaults, so the Graph floor is the only shortfall. It loads a
 # model onto a GPU twice, so it carries `model`, the label the ctest sweep excludes, and is run by hand once per order,
 # pinned to the B70. It exits 77 with no model file or no GPU device.
 if (GGML_SYCL)

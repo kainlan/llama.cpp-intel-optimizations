@@ -1,12 +1,17 @@
 // Two co-resident loads of one model with different contexts, in either order, on one card.
 //
 // The ONEDNN arena zone holds the oneDNN primitive pair and the oneDNN Graph scratch floor, which grows with the
-// context the load is planned for (n_ctx_hint). The zones grow only by a rebuild, and nothing is rebuilt while a live
-// model's allocations point into the arena. So a second load planned for a larger context than the first finds a zone
-// too small for its Graph floor and nothing else short. The floor is a reservation, not a requirement: what the zone
+// context the load is planned for (n_ctx_hint). It is not the only zone that does: the load cannot know whether its
+// contexts will run flash attention, so the RUNTIME zone holds the load measure's compute term, whose prompt graph
+// carries the non-flash attention score matrix (n_head x n_ubatch x n_ctx x 4 B), and the SCRATCH zone the planned
+// non-flash attention scratch (n_head x n_ubatch x n_ctx x 2 B x 3). The zones grow only by a rebuild, and nothing is
+// rebuilt while a live model's allocations point into the arena. So a second load planned for a larger context than
+// the first, with a context small enough that RUNTIME and SCRATCH stay at their 512 MiB defaults, finds a zone too
+// small for its Graph floor and nothing else short. The floor is a reservation, not a requirement: what the zone
 // cannot hold of it is served on the DIRECT path under its cap. The second load keeps the zones as they are, with one
-// "[VRAM-ARENA] device N keeps its ONEDNN zone of" WARN, instead of being refused. In the reverse order the first load
-// sizes the zone for the larger floor, and the second takes the sufficient path with no keep.
+// "[VRAM-ARENA] device N keeps its ONEDNN zone of" WARN, instead of being refused. A larger context that outgrows
+// RUNTIME or SCRATCH too is a shortfall the keep does not cover, and that load is refused. In the reverse order the
+// first load sizes the zone for the larger floor, and the second takes the sufficient path with no keep.
 //
 // Each run loads the model twice through the llama API, creates a context on each load at the context its load was
 // planned for, and decodes the count prompt on each. The first model's context is created and decoded before the
@@ -23,7 +28,8 @@
 //
 // What it cannot see: the Graph room the kept zone leaves, the stored zone plan, and a failed load's restore of it
 // (no load fails here). A keep that stored the plan's floor rather than what the zone holds, or a restore that left a
-// refused load's plan, still passes. Exit 0 PASS, 1 FAIL, 77 SKIP (no model file, or no GPU device).
+// refused load's plan, still passes: those are the source pin's and test-zone-sizing's to catch. Exit 0 PASS, 1 FAIL,
+// 77 SKIP (no model file, or no GPU device).
 //
 // It loads a 7B model twice, so it carries `model`, the label the ctest sweep excludes, and the lead runs it by hand,
 // once per order, pinned to one discrete card, after sourcing oneAPI's setvars.sh:
@@ -50,10 +56,13 @@ constexpr const char * k_load_refused  = "model load refused on device";
 constexpr const char * k_prompt        = "1, 2, 3, 4, 5,";
 constexpr const char * k_count_on      = " 6, 7, 8, 9, 10";
 constexpr int          k_n_predict     = 16;
-// Mistral 7B, 32 heads, at the 512-token micro-batch: the Graph floor is the 64 MiB minimum at a 512-token context
-// and 768 MiB at 8192, so a zone sized for the small one (256 MiB, the zone's minimum) cannot hold the large one's.
+// Mistral 7B, 32 heads, at the 512-token micro-batch. The Graph floor is the 64 MiB minimum at a 512-token context
+// and 384 MiB at 4096, so a ONEDNN zone sized for the small one (256 MiB, the zone's minimum) cannot hold the large
+// one's beside the pair. 4096 keeps the other zones at their 512 MiB defaults: the score matrix in the RUNTIME
+// compute term is 256 MiB and the non-flash SCRATCH need 384 MiB. At 8192 they are 512 and 768 MiB, so the large
+// load would outgrow RUNTIME and SCRATCH as well and be refused rather than keep.
 constexpr uint32_t     k_n_ctx_small   = 512;
-constexpr uint32_t     k_n_ctx_large   = 8192;
+constexpr uint32_t     k_n_ctx_large   = 4096;
 
 struct log_counts {
     std::mutex mutex;
