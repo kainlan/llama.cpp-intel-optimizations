@@ -666,19 +666,31 @@ ticket reproduced on:
   check reads is the zone's real room, and it logs one `[VRAM-ARENA]
   device N keeps its ONEDNN zone of ...` WARN per load and device (at
   every keep for a caller outside a staged load), naming the planned
-  floor, the zone kept and the Graph room left. A rebuild, which gives the
-  load its whole floor, is preferred to a keep: when a PP MoE ring a freed
+  floor, the zone kept and the Graph room left. The plan's `[SYCL-PLAN]
+  oneDNN Graph-scratch zone floor:` line and the DIRECT-failure ERROR still
+  print the formula floor, and append `; the ONEDNN zone's stored plan
+  holds only <X> MB of it as Graph room` whenever the stored plan holds
+  less than that, read as the plan stands when the line prints (on a
+  multi-device plan the zones are ensured after the floor line). A
+  rebuild, which gives the load its whole floor, is preferred to a keep:
+  when a PP MoE ring a freed
   context left is the arena's only holder, the load stage's entry first
   releases the ring and asks again, and a short zone is kept only once
   that last resort is spent (the ring released with something else still
   holding, or the ring kept because a prefill's claim on a slot is held).
   A SCRATCH or RUNTIME shortfall, or an ONEDNN zone below the pair, is
-  still the `REBUILD_HELD` refusal that names the holders. What a keep
-  stores, the zone plan and the cap snapshot, describes the physical zone,
-  which a failed load does not roll back, so it is not among the terms a
-  failed load puts back. After a failed load the zone plan therefore keeps
-  that load's larger pair, which can leave the live model a smaller Graph
-  room, as a refused load that took the sufficient path already did.
+  still the `REBUILD_HELD` refusal that names the holders. The zone plan a
+  keep or the sufficient path stores is a description (the pair plan and
+  the Graph floor) and moves no memory, so it is one more group of the
+  terms a failed load puts back (`LOAD_PUBLISHED_GROUP_ZONE_PLAN`): while
+  the stored plan still holds what the load left, the restore stores
+  `zone_onednn_plan_keep_short(prior, prior, capacity now, held pair now)`
+  under the zone-plan mutex, which is the prior plan exactly while the
+  zone still holds it, and a smaller Graph floor when the zone was rebuilt
+  smaller or a pair was reserved under the failed load's wider bound in
+  between. A failed load therefore leaves the live model the Graph room it
+  had. The cap snapshot is not put back: it does not rise while the arena
+  is kept, so a failed load never raised it.
   ⚠️ **This gemma4 example describes the formula's behavior for the
   `n_ctx` it is actually given at PLANNING time, which is NOT today's
   real runtime context by default.** The floor is computed once, at
@@ -3100,9 +3112,11 @@ The arena can fail to grow for three reasons, and each prints its own line first
   the arena keeps its memory through a rebuild and does not count
   (`zone_arena_rebuild_allowed()` decides). Another live model's allocations are
   one cause; scratch an earlier model left in the arena, and handles that still
-  lease a chunk, are others. When the ONEDNN zone's Graph floor is all the zones
-  lack, the zones are kept as they are with a WARN and no ERROR ("A kept ONEDNN
-  zone" above). Otherwise `ensure_planned_arena_zones()` refuses the rebuild
+  lack, the zones are kept as they are with a WARN ("A kept ONEDNN zone" above),
+  and with no ERROR unless a PP MoE ring alone held the arena: the load's first
+  ask, made before the ring's release, has then already printed the ERROR lines
+  below and recorded the reject before the later ask keeps the zones. Otherwise
+  `ensure_planned_arena_zones()` refuses the rebuild
   with an ERROR, names the holders on a second ERROR, prints the chunk leases by
   the site that took them on a WARN, and lists the live allocations of each zone
   with live bytes:
