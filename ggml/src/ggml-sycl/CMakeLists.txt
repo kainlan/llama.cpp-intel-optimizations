@@ -8689,9 +8689,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # sample's MemAvailable, a load whose plan needs a larger arena zone while an allocation holds the arena is refused,
     # not aborted, a load refused in its early pass keeps the PP MoE ring a context left in the KV zone, a load releases
     # a ring that alone holds the arena and its stage rebuilds the arena once for the zones it was refused, a load whose
-    # oneDNN Graph floor alone outgrows an arena one allocation holds keeps the zones and its uncommitted end puts the
-    # zone plan back (and the reverse order takes the sufficient path), and a late pass refused on its decide step
-    # configures no host zone. The planner initialises SYCL and arms
+    # oneDNN Graph floor alone outgrows an arena one allocation holds keeps the zones and its uncommitted end leaves
+    # no zone plan of its own stored (and the reverse order takes the sufficient path), and a late pass refused on its
+    # decide step configures no host zone. The planner initialises SYCL and arms
     # (a), (c), (e), (f), (h), (i) and (g) stage loads through real backends that construct caches, (h) rebuilds device
     # 0's arena, (i) grows its ONEDNN zone by about 1 GiB, and (g)'s
     # second load configures a host zone set of a few hundred MiB on each card, so it carries the OOM-family labels,

@@ -1445,9 +1445,8 @@ bool holds_the_runtime_zone(const mem_handle & holder) {
 //            the ONEDNN zone its floor; a 4 KiB RUNTIME-zone allocation then holds the arena, and the large load,
 //            ended uncommitted, stages OK with one "[VRAM-ARENA] device 0 keeps its ONEDNN zone" WARN and no refusal
 //            line; all three zone capacities are unchanged; the Graph room it reads inside the open load is below the
-//            planned floor (the context check reads the kept zone, not the plan); once the load has ended uncommitted
-//            the Graph room is what it was before the load (the failed load put the stored zone plan back); the
-//            allocation is where it was;
+//            planned floor (the zone could not hold it); once the load has ended uncommitted the Graph room is what it
+//            was before the load (the failed load did not leave its zone plan stored); the allocation is where it was;
 //   reverse: with the allocation released, the large load stages with nothing holding, so the zones hold its floor;
 //            a new allocation holds the arena, and the small load stages OK with no keep WARN and every zone capacity
 //            unchanged.
@@ -1456,13 +1455,17 @@ bool holds_the_runtime_zone(const mem_handle & holder) {
 // available budget but not below the pair) exceeds the zone, so the zones could not hold it as they stood (VOID
 // otherwise: the Graph allocator is off, the plan spans both cards, the budget clamp leaves nothing short, or an
 // earlier arm left a zone that holds it); after the reverse leg's large load the zone holds the planned requirement;
-// each allocation lands in the RUNTIME zone. The put-back check is engaged only when the room inside the open load
-// differs from the room before it; otherwise it prints that it measured nothing.
+// each allocation lands in the RUNTIME zone; the Graph room inside the open load differs from the room before it, so
+// the put-back check can see a plan left stored (VOID otherwise, with the two rooms named, once every other check of
+// the arm has run).
 // Mutants: the keep removed (the large load returns PLAN_REJECTED after a refusal line); the keep taken by a rebuild
 // (a capacity moves, or the allocation no longer resolves where it was); the WARN dropped or repeated within the load;
-// the room read from the plan rather than the kept zone (it is not below the floor); the failed load's zone plan left
-// stored (the room after the load is the kept room, not the room before it); the reverse order kept short (a keep
-// WARN, or a capacity moves).
+// the failed load's zone plan left stored (the room after the load is the kept room, not the room before it); the
+// reverse order kept short (a keep WARN, or a capacity moves).
+// Not seen: the allocation holds no oneDNN pair, so the Graph room reads the zone less the plan's own pair whether the
+// stored floor is clamped to that or larger, and the arm cannot tell a keep that stores the planned floor from the
+// correct keep, nor a restore that stores the prior plan raw from the correct restore. Those are the keep source pin's
+// (claim_one_rule_decides_the_keep and the put-back witnesses) and test-zone-sizing's (Cases 41 and 44).
 arm_result arm_i_graph_floor_keeps_an_allocation_held_arena() {
     arm_result      r;
     unified_cache * cache = get_unified_cache_for_device(0);
@@ -1476,6 +1479,8 @@ arm_result arm_i_graph_floor_keeps_an_allocation_held_arena() {
     loader_inventory   large(qwen38_shape);
     small.inv.n_head_ctx_max = 8;
     large.inv.n_head_ctx_max = 2048;
+    // Why the put-back check did not engage, if it did not: the arm is VOID for it at its end, after every FAIL.
+    std::string put_back_unseen;
 
     // keep
     const staged_early_load sizing = stage_early_and_end(small.inv);
@@ -1536,10 +1541,10 @@ arm_result arm_i_graph_floor_keeps_an_allocation_held_arena() {
                        " bytes (read " + num(kept.room_after_read) + "), not the " + num(room_before) +
                        " bytes it read before the load: the failed load's zone plan stayed stored");
         } else {
-            std::printf(
-                "arm (i): the put-back check measured nothing: the Graph room read %zu bytes before the large "
-                "load and %zu inside it (read %d and %d)\n",
-                room_before, kept.room, room_before_read ? 1 : 0, kept.room_read ? 1 : 0);
+            put_back_unseen = "the put-back check measured nothing: the Graph room read " + num(room_before) +
+                              " bytes before the large load and " + num(kept.room) + " inside it (read " +
+                              num(room_before_read) + " and " + num(kept.room_read) +
+                              "), so a plan left stored would read the same";
         }
         const resolved_ptr again = holder.resolve();
         expect(r, again.ptr == first.ptr && again.on_device && holds_the_runtime_zone(holder),
@@ -1583,6 +1588,9 @@ arm_result arm_i_graph_floor_keeps_an_allocation_held_arena() {
     expect(r, settled == grown_zones,
            "the smaller load moved the zones from " + zone_capacities_text(grown_zones) + " to " +
                zone_capacities_text(settled));
+    if (!put_back_unseen.empty()) {
+        void_arm(r, put_back_unseen);
+    }
     return r;
 }
 
