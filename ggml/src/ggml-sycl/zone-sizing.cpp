@@ -642,8 +642,8 @@ static std::string zone_arena_held_text(const zone_arena_holders & h, int device
 }
 
 // The refused teardown's clause: why it refused, and what that left. Only a refusal named as one before the teardown
-// closed the arena leaves it usable; any other, a missing cause included, is read as closed, which no reserve may follow
-// and no later load in the process can use.
+// closed the arena leaves it usable; any other, a missing cause included, is read as closed, which no reserve may
+// follow and no later load in the process can use.
 static std::string zone_arena_teardown_text(zone_arena_teardown_refusal cause, int device) {
     std::string text = "; the arena could not be torn down";
     switch (cause) {

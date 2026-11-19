@@ -872,15 +872,15 @@ staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv) {
 }
 
 // (e) A load whose plan needs a larger arena zone while a first allocation holds the arena is refused by name, and the
-// allocation keeps its memory. The VRAM arena's zones grow only by a rebuild, which is refused while anything points into
-// the arena, and the stage used to abort the process there. A sentinel goes first into every planner global and every
-// other device-wide term a load publishes (device_load_extras: the ring's KV-zone slots, row bytes, expert counts and
-// micro-batch, the oneDNN pair and its stored sum); one that does not read back VOIDs the arm before any check. A load's
-// entry ensure sizes the zones before its own planner publishes, so it reads the MoE CONTROL requirement and the host
-// scatter scratch as they stand, here the sentinels' 4 KiB and 8 KiB, which no arm above sized the arena for. So the
-// shaped inventory is staged once with nothing holding the arena, which rebuilds the zones for the sentinels too. Then a
-// 4 KiB RUNTIME-zone allocation on device 0 stands for the first model, and two loads are staged beside it, each ended
-// uncommitted:
+// allocation keeps its memory. The VRAM arena's zones grow only by a rebuild, which is refused while anything points
+// into the arena, and the stage used to abort the process there. A sentinel goes first into every planner global and
+// every other device-wide term a load publishes (device_load_extras: the ring's KV-zone slots, row bytes, expert counts
+// and micro-batch, the oneDNN pair and its stored sum); one that does not read back VOIDs the arm before any check. A
+// load's entry ensure sizes the zones before its own planner publishes, so it reads the MoE CONTROL requirement and the
+// host scatter scratch as they stand, here the sentinels' 4 KiB and 8 KiB, which no arm above sized the arena for. So
+// the shaped inventory is staged once with nothing holding the arena, which rebuilds the zones for the sentinels too.
+// Then a 4 KiB RUNTIME-zone allocation on device 0 stands for the first model, and two loads are staged beside it, each
+// ended uncommitted:
 //   control: the shaped inventory, whose zones the sizing load sized for the sentinels, stages OK, and every sentinel
 //            reads back after its end;
 //   refusal: the same inventory with a PP MoE ring weight slot 256 MiB larger than device 0's RUNTIME zone, at depth 1,
@@ -895,8 +895,8 @@ staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv) {
 // refusal leg running: the arm is VOID for it only if no check failed, and a FAIL carries its reason after the FAIL's.
 // Mutants: the abort kept (the binary dies); the refusal not propagated (the stage returns OK); the published terms not
 // put back (a global reads the refused load's ring, not its sentinel); a restore that leaves the KV-zone slots, row
-// bytes, expert counts, micro-batch, pair or sum (that term reads the refused load's value); a rebuild, eviction or zone
-// reset under the allocation (the RUNTIME capacity moves, or the allocation no longer resolves where it was).
+// bytes, expert counts, micro-batch, pair or sum (that term reads the refused load's value); a rebuild, eviction or
+// zone reset under the allocation (the RUNTIME capacity moves, or the allocation no longer resolves where it was).
 arm_result arm_e_held_arena_refuses_the_load() {
     arm_result      r;
     unified_cache * cache = get_unified_cache_for_device(0);

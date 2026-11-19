@@ -13243,11 +13243,11 @@ static void ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw() {
 }
 
 // The device-wide planned terms of the open load transaction, one record per device. One load transaction is open at a
-// time (the registry refuses a second begin), so one entry serves: a load that fails puts back what it published through
-// ggml_sycl_abort_owner_effects_noexcept, and a load that commits forgets it. The terms carry no owner, and a runtime
-// context transaction of a live model publishes some of them while the load runs. Each planner pass of the load notes
-// what it changed (ggml_sycl_load_published_pass), and the restore puts back only a group that still holds what the
-// load published, so a context's publish since survives the failed load (ggml_sycl::load_published_record).
+// time (the registry refuses a second begin), so one entry serves: a load that fails puts back what it published
+// through ggml_sycl_abort_owner_effects_noexcept, and a load that commits forgets it. The terms carry no owner, and a
+// runtime context transaction of a live model publishes some of them while the load runs. Each planner pass of the load
+// notes what it changed (ggml_sycl_load_published_pass), and the restore puts back only a group that still holds what
+// the load published, so a context's publish since survives the failed load (ggml_sycl::load_published_record).
 // The two-card MoE flag (g_moe_multi_gpu_active) is kept the same way, as one more group: the planner sets it, live
 // models' dispatch reads it, and the next load's planner reads it before it writes it, so a failed load puts it back.
 // Its other writers (the MoE init at a dispatch) do not take the inventory lock, so one that writes during a pass is
@@ -18784,9 +18784,9 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
 // streaming and releases no stale ring: what it decided to change is returned in *effects (device -1 when it planned
 // nothing or refused), for the caller to run with ggml_sycl_run_inventory_effects() once it has decided every refusal.
 // The planner's zone decision still changes the device: the entry ensure may release the PP MoE ring as its last
-// resort, and it or the micro-batch's grow leg may rebuild an arena nothing holds, which a refused load keeps (or, after
-// a failed reserve, the device keeps no arena). A plan that needs the secondary MoE devices also creates their shared
-// queues and caches, which stay.
+// resort, and it or the micro-batch's grow leg may rebuild an arena nothing holds, which a refused load keeps (or,
+// after a failed reserve, the device keeps no arena). A plan that needs the secondary MoE devices also creates their
+// shared queues and caches, which stay.
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(
     ggml_backend_t                     backend,
     const ggml_sycl_tensor_inventory * inventory,
@@ -19329,7 +19329,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 ggml_sycl::lifecycle_stage_probe_placement_plan(txn, ggml_sycl::placement_plan(*candidate->plan),
                                                                 candidate->kv_info, candidate->model_n_layer);
             }
-            // The early pass's effect on each device it planned. The helper takes the inventory lock; the stage does not.
+            // The early pass's effect on each device it planned. The helper takes the inventory lock;
+            // the stage does not.
             for (const int device : early_devices) {
                 ggml_sycl_run_early_inventory_effect(device);
             }

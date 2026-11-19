@@ -1805,10 +1805,10 @@ static bool concurrent_settle_destroy_closing_wins(sycl::queue & q) {
 }
 
 // A rebuild whose teardown refuses reserves nothing over the arena it could not tear down. The arena's 8 MiB zones are
-// smaller than the 32 MiB SCRATCH zone the ensure asks for, and nothing holds it, so the ensure tears it down to rebuild
-// it; the device refuses to free the first chunk (the PRIVATE_TESTING free failure), after the teardown closed the
-// arena. The ensure refuses with TEARDOWN_REFUSED and the cause FREE_FAILED, the arena keeps its chunks and size (no
-// reserve ran), and a second ensure refuses for the same cause, whatever the zones hold. The teardown's retry, the
+// smaller than the 32 MiB SCRATCH zone the ensure asks for, and nothing holds it, so the ensure tears it down to
+// rebuild it; the device refuses to free the first chunk (the PRIVATE_TESTING free failure), after the teardown closed
+// the arena. The ensure refuses with TEARDOWN_REFUSED and the cause FREE_FAILED, the arena keeps its chunks and size
+// (no reserve ran), and a second ensure refuses for the same cause, whatever the zones hold. The teardown's retry, the
 // cache's shutdown, frees the chunk and clears the cause.
 // Engagement: the arena is reserved with zones smaller than the ensure's, so the ensure must rebuild it.
 // Mutants: the ensure ignoring a refused teardown (it reserves, and refuses for the budget or answers for zones it
@@ -2148,8 +2148,8 @@ struct pipeline_and_pair_found {
 // live context re-plans its ring (micro-batch 1024, its activation slot in the KV zone) and the reserve raises the sum
 // to 30 MiB. Pass 2 publishes the ring and the pair again. After it a live context publishes its non-FA shape. The
 // restore puts the pipeline, the scatter, CONTROL and the pair's halves back to the live model's; the ring to the
-// context's re-plan and the sum to the reserve's raise, both of which the load wrote over; and it keeps the non-FA shape
-// the context published after the load.
+// context's re-plan and the sum to the reserve's raise, both of which the load wrote over; and it keeps the non-FA
+// shape the context published after the load.
 // Leg 2. A load whose one pass publishes the pair, after which the reserve raises the sum to 40 MiB: the restore keeps
 // the raise and puts the halves back.
 // Engagement: before each restore every term reads what the load or the later publisher wrote.

@@ -2578,10 +2578,10 @@ int main() {
     }
 
     // ---- Case 36: the arena is rebuilt only when nothing points into it ------------------------------------------
-    // A rebuild destroys the arena and reserves it again, so every byte in it moves. A zone byte still allocated, a lease
-    // on one of its chunks, or a cache scratch buffer whose pointer lies inside it each refuse the rebuild. A scratch
-    // buffer allocated outside the arena keeps its own memory through a rebuild, so it must not refuse one: a gate that
-    // read any non-null scratch pointer refused rebuilds the arena could take.
+    // A rebuild destroys the arena and reserves it again, so every byte in it moves. A zone byte still allocated, a
+    // lease on one of its chunks, or a cache scratch buffer whose pointer lies inside it each refuse the rebuild. A
+    // scratch buffer allocated outside the arena keeps its own memory through a rebuild, so it must not refuse one: a
+    // gate that read any non-null scratch pointer refused rebuilds the arena could take.
     {
         constexpr size_t MiB = 1024ull * 1024ull;
         using ggml_sycl::zone_arena_holders;
@@ -2784,8 +2784,9 @@ int main() {
               "a queued free beside the ring is not named as an unfinished release");
 
         // A shortfall under 0.1 MB would print as 0.0 MB short beside a need and a have that print the same: the short
-        // zone's need, have and shortfall are printed in KB then, and in bytes under 1 KB, so the line still shows which
-        // zone is short and by how much. The figures of the run whose control load was refused 8 KiB short of RUNTIME.
+        // zone's need, have and shortfall are printed in KB then, and in bytes under 1 KB, so the line still shows
+        // which zone is short and by how much. The figures of the run whose control load was refused 8 KiB short of
+        // RUNTIME.
         zone_arena_refusal kib_short = held;
         kib_short.need               = { 512 * MiB, 256 * MiB, 1792 * MiB + 8192 };
         kib_short.have               = { 512 * MiB, 256 * MiB, 1792 * MiB };
@@ -2841,7 +2842,7 @@ int main() {
         CHECK(zone_arena_refusal_text(zone_arena_refusal{}).empty(), "a refusal with no reason printed a line");
     }
 
-    // ---- Case 39: a load refused because the arena could not be torn down says why, and whether it is still usable ----
+    // ---- Case 39: a load refused because the arena could not be torn down says why, and whether it is still usable
     // A rebuild tears the arena down before it reserves the larger one. A teardown that refuses after it closed the
     // arena leaves it closed to new allocations, so no reserve may follow it and no later load in the process can use
     // the device's arena: the line says so and sends the load to a new process. A teardown that refused before it
@@ -2923,11 +2924,11 @@ int main() {
               "a refused teardown with no cause is not read as closed");
     }
 
-    // ---- Case 40: a load releases the PP MoE ring only when the ring alone keeps the arena from a rebuild it needs ----
-    // The ring is the cache's, not a model's: it outlives the context that sized it. A load may release it to rebuild the
-    // arena, but only as the last resort, when a rebuild is needed and the ring's slot buffers are the only holders. Any
-    // other holder refuses the rebuild whatever happens to the ring, so the load must not release a ring a live context
-    // may be using. A scratch buffer outside the arena holds nothing, so it does not stop the release.
+    // ---- Case 40: a load releases the PP MoE ring only when the ring alone keeps the arena from a rebuild it needs
+    // The ring is the cache's, not a model's: it outlives the context that sized it. A load may release it to rebuild
+    // the arena, but only as the last resort, when a rebuild is needed and the ring's slot buffers are the only
+    // holders. Any other holder refuses the rebuild whatever happens to the ring, so the load must not release a ring a
+    // live context may be using. A scratch buffer outside the arena holds nothing, so it does not stop the release.
     {
         constexpr size_t MiB = 1024ull * 1024ull;
         using ggml_sycl::zone_arena_holders;

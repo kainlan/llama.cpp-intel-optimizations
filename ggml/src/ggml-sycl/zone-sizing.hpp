@@ -573,8 +573,8 @@ struct zone_arena_sizes {
 // A refusal to size the arena's planned zones: the device, the reason, and per zone the bytes the plan needs and the
 // bytes the device's arena has when the decision refuses (have is 0 where no arena exists then). At REBUILD_HELD,
 // holders is what the decision found pointing into the arena, which the line names and chooses its remedy from. At
-// RESERVE_FAILED, released is the zones of the arena a rebuild destroyed before the reserve failed. At TEARDOWN_REFUSED,
-// teardown is why the teardown refused. Each is 0 or NONE otherwise.
+// RESERVE_FAILED, released is the zones of the arena a rebuild destroyed before the reserve failed. At
+// TEARDOWN_REFUSED, teardown is why the teardown refused. Each is 0 or NONE otherwise.
 struct zone_arena_refusal {
     zone_arena_refusal_reason   reason = zone_arena_refusal_reason::NONE;
     int                         device = -1;
@@ -587,9 +587,9 @@ struct zone_arena_refusal {
 
 // The line a model load refused for `refusal` logs, without a newline: the device, each zone's need and have in MB, the
 // shortfall of each zone that is short (a zone short by under 0.1 MB prints its three figures in KB, or in bytes under
-// 1 KB, so no shortfall prints as nothing), the reason, and what the caller can do. Empty for NONE. The zones are planned
-// at the load's fixed planning shape, not at the context's -c or -ub, so the line never offers a smaller context or
-// micro-batch as the remedy.
+// 1 KB, so no shortfall prints as nothing), the reason, and what the caller can do. Empty for NONE. The zones are
+// planned at the load's fixed planning shape, not at the context's -c or -ub, so the line never offers a smaller
+// context or micro-batch as the remedy.
 std::string zone_arena_refusal_text(const zone_arena_refusal & refusal);
 
 // The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the

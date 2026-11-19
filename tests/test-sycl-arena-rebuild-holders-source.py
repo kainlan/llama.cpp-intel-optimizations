@@ -7,7 +7,8 @@ Every lease a mem_handle takes on an arena chunk is counted by the site that too
 in mem-handle.cpp passes a site (a weight lease snapshot, a weight resolve, a handle made from a raw pointer, whose
 caller names what keeps it, and a copy, which keeps its source's site and counts as a copy). The handle carries the tag
 to its release, and a move hands it on with the lease, so the release lowers the count the acquire raised. The count
-costs one relaxed atomic add on each side and takes no lock, and moves only when the per-chunk count moved, so the counts sum to the chunks' leases.
+costs one relaxed atomic add on each side and takes no lock, and moves only when the per-chunk count moved, so the
+counts sum to the chunks' leases.
 
 The rebuild refusal prints those counts on a WARN line and lists the live allocations of every zone with live bytes,
 through the cache's own dump, which takes no lock above the refusal's.

@@ -7723,8 +7723,8 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
         }
     };
 
-    // A refused teardown names its cause in the refusal and on its own ERROR line, with what it left: an arena closed to
-    // new allocations, over which nothing may be reserved, or the arena as it was.
+    // A refused teardown names its cause in the refusal and on its own ERROR line, with what it left: an arena closed
+    // to new allocations, over which nothing may be reserved, or the arena as it was.
     const auto refuse_teardown = [&](zone_arena_teardown_refusal cause, const zone_arena_sizes & have) {
         const bool closed = zone_arena_teardown_left_closed(cause);
         GGML_LOG_ERROR(

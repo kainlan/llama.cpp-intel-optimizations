@@ -3240,10 +3240,10 @@ struct planner_published_terms {
 // counts and micro-batch it is re-planned from; and the oneDNN scratchpad pair with its stored sum, which the pair's
 // reserve raises on its own. Each model on the device plans with these, and every load overwrites them, so a load that
 // fails puts back what it published (load_published_record). The terms keyed by the load's owner are not here (they
-// leave with their owner, unified_cache_drop_planned_load_terms), nor is the compute term's micro-batch, which is sticky
-// by design and which every load records at the same planning value. Each setter stores what its getter reads, so a
-// restore is exact. The terms fall in groups (load_published_group), each the terms one publisher writes together, and
-// a restore puts back whole groups, so no group holds part of one publisher's terms and part of another's.
+// leave with their owner, unified_cache_drop_planned_load_terms), nor is the compute term's micro-batch, which is
+// sticky by design and which every load records at the same planning value. Each setter stores what its getter reads,
+// so a restore is exact. The terms fall in groups (load_published_group), each the terms one publisher writes together,
+// and a restore puts back whole groups, so no group holds part of one publisher's terms and part of another's.
 enum load_published_group : uint32_t {
     LOAD_PUBLISHED_GROUP_PIPELINE    = 1u << 0,  // the PP pipeline scratch
     LOAD_PUBLISHED_GROUP_RING        = 1u << 1,  // the ring's slots and depth, its KV-zone slots and its micro-batch
@@ -3290,8 +3290,8 @@ struct load_published_terms {
 // since; `written` is what each group held when this load last looked. note() takes one planner pass of the load: the
 // terms when it started and when it ended, both read under the inventory lock that every publisher but the reserve
 // holds, so only the pass wrote between them. restore() puts a group back only while it still holds `written`, and the
-// sum by compare-exchange, so a raise outside that lock is kept. A publisher that writes exactly what the load published
-// cannot be told from the load, and its group goes back with the load's.
+// sum by compare-exchange, so a raise outside that lock is kept. A publisher that writes exactly what the load
+// published cannot be told from the load, and its group goes back with the load's.
 struct load_published_record {
     load_published_terms prior{};
     load_published_terms written{};
