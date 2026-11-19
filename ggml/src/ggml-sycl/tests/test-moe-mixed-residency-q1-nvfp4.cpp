@@ -433,8 +433,12 @@ struct case_data {
     std::vector<int32_t> ids;
 };
 
-// Token t picks experts b, b+3, b+6 and b+9 (mod k_experts) from a base b that moves with t, so a token's picks are
-// distinct and, against k_host_experts, the picks of every op here fall on both sides; 512 tokens pick every expert.
+// Token t picks experts b, b+3, b+6 and b+9 (mod k_experts) from the base b = 5t + t/16 + 1 (mod k_experts), so a
+// token's picks are distinct. Over a run of 16 tokens 5t visits every residue once (5 and 16 are coprime), and the t/16
+// term shifts each later run by one, so every base recurs and the 512-token op picks every expert; the 7-token op's
+// seven bases (1, 6, 11, 0, 5, 10, 15) with their four offsets pick every expert too. Against k_host_experts the picks
+// fall on both sides in every op here: 1 card and 3 host occurrences at 1 token, 15 and 13 at 7 tokens, 1152 and 896
+// at 512 tokens.
 case_data make_case(ggml_type type, int role, int n_tokens, std::mt19937 & rng) {
     const int                             ne11 = role == k_gate ? 1 : k_used;
     case_data                             c{ type, role, n_tokens, ne11, {}, {} };
@@ -445,7 +449,7 @@ case_data make_case(ggml_type type, int role, int n_tokens, std::mt19937 & rng) 
     }
     c.ids.resize(size_t(k_used) * n_tokens);
     for (int t = 0; t < n_tokens; ++t) {
-        const int base = (t * 5 + t / 3 + 1) % k_experts;
+        const int base = (t * 5 + t / 16 + 1) % k_experts;
         for (int i = 0; i < k_used; ++i) {
             c.ids[size_t(t) * k_used + i] = (base + i * 3) % k_experts;
         }
