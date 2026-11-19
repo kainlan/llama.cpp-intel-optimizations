@@ -63,6 +63,7 @@ def read(rel: str) -> str:
 SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 COMMON = read("ggml/src/ggml-sycl/common.hpp")
 CACHE = read("ggml/src/ggml-sycl/unified-cache.cpp")
+ZONE = read("ggml/src/ggml-sycl/zone-sizing.cpp")
 
 
 def body(text: str, signature: str) -> str:
@@ -100,6 +101,8 @@ CLAIM_SIG = "static void ggml_sycl_mmq_src1_claim_plan(ggml_backend_sycl_context
 RING_SIG = "static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring("
 ENSURE_SIG = "inline void * ggml_sycl_runtime_scratch_ensure("
 REQ_SIG = "bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out)"
+# The pure sum the requirement hands its terms to (zone-sizing.cpp).
+ZONE_REQ_SIG = "bool zone_runtime_requirement(const zone_runtime_terms & terms, size_t * out)"
 
 
 # ---- (a) the plan-time claim ------------------------------------------------------------------------------------
@@ -188,14 +191,18 @@ def claim_ring_admission_subtracts_the_pending_demand(sycl: str) -> bool:
             in ring and "admit_in.runtime_available_bytes = runtime_net_bytes;" in ring)
 
 
-def claim_zone_requirement_folds_in_the_dense_plans(cache: str) -> bool:
-    """The RUNTIME zone is sized for both dense plans on top of the ring, pipeline and control pool, and the
-    zone sizing reads that requirement."""
+def claim_zone_requirement_folds_in_the_dense_plans(cache: str, zone: str = ZONE) -> bool:
+    """The RUNTIME zone is sized for both dense plans on top of the ring, pipeline and control pool: the requirement
+    reads both plans and hands them to the pure sum, which adds them; the zone sizing reads that requirement."""
     t = norm(cache)
     req = body(t, REQ_SIG)
-    return (bool(req) and "const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);" in req
+    pure = body(norm(zone), ZONE_REQ_SIG)
+    return (bool(req) and bool(pure)
+            and "const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);" in req
             and "const size_t dequant_f16 = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);" in req
-            and "*out = base + mmq_src1 + dequant_f16 + compute + state;" in req
+            and "terms.mmq_src1 = mmq_src1;" in req and "terms.dequant_f16 = dequant_f16;" in req
+            and "return zone_runtime_requirement(terms, out);" in req
+            and "terms.mmq_src1, terms.dequant_f16" in pure
             and re.search(r"unified_cache_get_planned_runtime_zone_requirement\(dev_id, &planned_runtime_scratch\).*?"
                           r"zone_runtime_reserved_bytes\(runtime_floor, planned_runtime_scratch, "
                           r"&runtime_zone\)", t) is not None)
@@ -338,7 +345,12 @@ def test_mutant_ring_admitted_against_the_raw_free_bytes_fails():
 
 def test_mutant_zone_requirement_without_the_q8_plan_fails():
     assert not claim_zone_requirement_folds_in_the_dense_plans(
-        _once(CACHE, "*out = base + mmq_src1 + dequant_f16 + compute + state;", "*out = base + dequant_f16 + compute + state;"))
+        CACHE, _once(ZONE, "terms.mmq_src1, terms.dequant_f16", "terms.dequant_f16"))
+
+
+def test_mutant_zone_requirement_never_hands_over_the_q8_plan_fails():
+    assert not claim_zone_requirement_folds_in_the_dense_plans(
+        re.sub(r"terms\.mmq_src1\s*= mmq_src1;", "", CACHE, count=1), ZONE)
 
 
 if __name__ == "__main__":

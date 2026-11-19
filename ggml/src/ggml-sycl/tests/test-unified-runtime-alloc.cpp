@@ -22,6 +22,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <thread>
@@ -1803,6 +1804,130 @@ static bool concurrent_settle_destroy_closing_wins(sycl::queue & q) {
     return true;
 }
 
+// A rebuild whose teardown refuses reserves nothing over the arena it could not tear down. The arena's 8 MiB zones are
+// smaller than the 32 MiB SCRATCH zone the ensure asks for, and nothing holds it, so the ensure tears it down to
+// rebuild it; the device refuses to free the first chunk (the PRIVATE_TESTING free failure), after the teardown closed
+// the arena. The ensure refuses with TEARDOWN_REFUSED and the cause FREE_FAILED, the arena keeps its chunks and size
+// (no reserve ran), and a second ensure refuses for the same cause, whatever the zones hold. The teardown's retry, the
+// cache's shutdown, frees the chunk and clears the cause.
+// Engagement: the arena is reserved with zones smaller than the ensure's, so the ensure must rebuild it.
+// Mutants: the ensure ignoring a refused teardown (it reserves, and refuses for the budget or answers for zones it
+// never sized); the cause not sticky (the second ensure tries the teardown again, which now completes, and reserves).
+static bool arena_teardown_refusal_reserves_nothing(sycl::queue & q) {
+    TEST_BEGIN("arena_teardown_refusal_reserves_nothing");
+    constexpr size_t  mib       = 1024ull * 1024ull;
+    const size_t      max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const char *      saved_env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
+    const std::string saved_mb  = saved_env != nullptr ? saved_env : "";
+    const bool        had_mb    = saved_env != nullptr;
+    unified_cache     cache(q, 64ull * mib, 0, 0, 0);
+
+    // Declared after the cache, so it runs first: a check that returns early leaves the free failure armed, and this
+    // teardown takes it, so the cache's destructor finds a teardown that completes.
+    struct teardown_retry {
+        unified_cache & cache;
+
+        ~teardown_retry() { (void) cache.shutdown_resources(); }
+    } retry{ cache };
+
+    struct env_restore {
+        bool        had;
+        std::string value;
+
+        ~env_restore() { set_env_var("GGML_SYCL_COMPUTE_ARENA_MB", had ? value.c_str() : nullptr); }
+    } restore{ had_mb, saved_mb };
+
+    TEST_ASSERT(cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0),
+                "the fixture's 64 MiB arena was not reserved");
+    set_env_var("GGML_SYCL_COMPUTE_ARENA_MB", "32");
+    TEST_ASSERT(cache.zone_capacity(vram_zone_id::SCRATCH) < 32ull * mib,
+                "the arena's SCRATCH zone already holds the ensure's 32 MiB, so no rebuild is needed");
+    const int    chunks_before = cache.chunk_count();
+    const size_t size_before   = cache.arena_total_size();
+
+    unified_cache_test_fail_next_arena_free();
+    zone_arena_refusal first;
+    TEST_ASSERT(!cache.ensure_planned_arena_zones(&first), "the ensure succeeded over a teardown that refused");
+    TEST_ASSERT(first.reason == zone_arena_refusal_reason::TEARDOWN_REFUSED,
+                "the ensure did not refuse for the refused teardown");
+    TEST_ASSERT(first.teardown == zone_arena_teardown_refusal::FREE_FAILED,
+                "the refusal does not name the chunk the device refused to free");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::FREE_FAILED,
+                "the cache does not record why its teardown refused");
+    TEST_ASSERT(cache.chunk_count() == chunks_before && cache.arena_total_size() == size_before,
+                "an arena was reserved over the one the teardown could not tear down");
+
+    zone_arena_refusal second;
+    TEST_ASSERT(!cache.ensure_planned_arena_zones(&second), "a second ensure succeeded over the closed arena");
+    TEST_ASSERT(second.reason == zone_arena_refusal_reason::TEARDOWN_REFUSED &&
+                    second.teardown == zone_arena_teardown_refusal::FREE_FAILED,
+                "a second ensure did not refuse for the arena the refused teardown left closed");
+    TEST_ASSERT(cache.chunk_count() == chunks_before && cache.arena_total_size() == size_before,
+                "the second ensure reserved an arena over the closed one");
+
+    TEST_ASSERT(cache.shutdown_resources(), "the teardown's retry did not free the chunk the refused one kept");
+    TEST_ASSERT(!cache.arena_active(), "the teardown's retry left the arena active");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::NONE,
+                "a completed teardown left the earlier refusal's cause");
+    TEST_PASS();
+    return true;
+}
+
+static std::mutex               g_staging_log_mutex;
+static std::vector<std::string> g_staging_log_lines;
+
+static void staging_log_capture(ggml_log_level level, const char * text, void * user) {
+    (void) level;
+    (void) user;
+    if (text == nullptr) {
+        return;
+    }
+    fputs(text, stderr);
+    std::lock_guard<std::mutex> lock(g_staging_log_mutex);
+    g_staging_log_lines.emplace_back(text);
+}
+
+// How many of the lines logged while a cache asked for `staging_size` bytes of staging was built and destroyed name
+// its staging buffer.
+static size_t staging_lines_while_constructing(sycl::queue & q, size_t staging_size) {
+    {
+        std::lock_guard<std::mutex> lock(g_staging_log_mutex);
+        g_staging_log_lines.clear();
+    }
+
+    struct log_restore {
+        ~log_restore() { ggml_log_set(nullptr, nullptr); }
+    } restore;
+
+    ggml_log_set(staging_log_capture, nullptr);
+    {
+        unified_cache cache(q, 64ull * 1024ull * 1024ull, staging_size, 0, 0);
+    }
+    std::lock_guard<std::mutex> lock(g_staging_log_mutex);
+    return static_cast<size_t>(
+        std::count_if(g_staging_log_lines.begin(), g_staging_log_lines.end(), [](const std::string & line) {
+            return line.find("unified_cache:staging") != std::string::npos ||
+                   line.find("staging owner") != std::string::npos;
+        }));
+}
+
+// A cache asked for no staging buffer, the size GGML_SYCL_HOST_STAGING_MB=0 asks for and the fixtures here pass,
+// allocates none, so it logs no failed allocation of one. A zero-byte host allocation fails, and the cache logged that
+// on every such construction. Engagement: a staging buffer of 1 PiB, past any host's RAM, is asked for first under the
+// same capture, and its failure line must be seen. The driver aborted the process on that 1 PiB request instead of
+// failing it, so this also pins that the raw host exit refuses a size past the RAM before the driver and the cache logs
+// the failure. Mutants: the constructor asking the device for a zero-byte buffer; the raw host exit passing a size past
+// the RAM to the driver (at 1 PiB the process aborted here).
+static bool cache_without_staging_allocates_none(sycl::queue & q) {
+    TEST_BEGIN("cache_without_staging_allocates_none");
+    TEST_ASSERT(staging_lines_while_constructing(q, 1ull << 50) >= 1,
+                "a staging buffer past the host's RAM failed without a line naming it, so this check cannot see one");
+    TEST_ASSERT(staging_lines_while_constructing(q, 0) == 0,
+                "a cache asked for no staging buffer asked for one anyway and logged that it failed");
+    TEST_PASS();
+    return true;
+}
+
 static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
     TEST_BEGIN("host_zone_reset_trims_released_offload_pool_slots");
     offload_buffer_pool_trim(-1);
@@ -1846,6 +1971,267 @@ static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
     // offload-pool registration for STAGING, not a pure no-op liveness check.
     cache->host_zone_boundary_check(host_zone_id::STAGING);
     TEST_ASSERT(!unified_lookup(ptr, &looked), "boundary check should remove released offload-pool registration");
+
+    TEST_PASS();
+    return true;
+}
+
+// The planned terms of one device this case writes, read when it starts and written back when it ends, on every exit,
+// through the getters and setters themselves rather than through the helper under test.
+struct planned_terms_found {
+    int                                device;
+    size_t                             ring_weight;
+    size_t                             ring_act;
+    size_t                             ring_out;
+    uint32_t                           ring_depth;
+    uint32_t                           ring_n_ubatch;
+    size_t                             act_row;
+    size_t                             out_row;
+    uint32_t                           n_expert;
+    uint32_t                           n_expert_used;
+    bool                               act_in_kv;
+    bool                               out_in_kv;
+    onednn_graph_scratch_planned_shape graph;
+    nonfa_attn_scratch_planned_shape   nonfa;
+    moe_control_requirement            control;
+    size_t                             scatter;
+
+    explicit planned_terms_found(int d) :
+        device(d),
+        ring_weight(unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(d)),
+        ring_act(unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(d)),
+        ring_out(unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(d)),
+        ring_depth(unified_cache_get_planned_pp_moe_onednn_ring_depth(d)),
+        ring_n_ubatch(unified_cache_get_planned_pp_moe_onednn_n_ubatch(d)),
+        act_row(unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(d)),
+        out_row(unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(d)),
+        n_expert(unified_cache_get_planned_pp_moe_onednn_n_expert(d)),
+        n_expert_used(unified_cache_get_planned_pp_moe_onednn_n_expert_used(d)),
+        act_in_kv(unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(d)),
+        out_in_kv(unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(d)),
+        graph(unified_cache_get_planned_onednn_graph_scratch_shape(d)),
+        nonfa(unified_cache_get_planned_nonfa_attn_scratch_shape(d)),
+        control(unified_cache_get_planned_moe_control_requirement(d)),
+        scatter(unified_cache_get_planned_moe_host_scatter_scratch_bytes(d)) {}
+
+    ~planned_terms_found() {
+        unified_cache_set_planned_pp_moe_onednn_scratch(device, ring_weight, ring_act, ring_out, ring_depth);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, ring_n_ubatch);
+        unified_cache_set_planned_pp_moe_onednn_row_bytes(device, act_row, out_row, n_expert, n_expert_used);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, act_in_kv, out_in_kv);
+        unified_cache_set_planned_onednn_graph_scratch_shape(device, graph.n_head_ctx_max, graph.n_head_swa_max,
+                                                             graph.n_swa, graph.n_ubatch, graph.n_ctx);
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
+        unified_cache_set_planned_moe_control_requirement(device, control);
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);
+    }
+};
+
+// A plan that is tried and discarded publishes nothing. The load stage's fallback and the plan dry run put back the
+// terms the planner published while it computed the plan through planner_published_terms; this case checks that
+// helper against the cache's own per-device state, and the RUNTIME requirement the zones are sized from with it.
+// A load publishes its ring at the planning shape (n_ubatch 512) and its planner terms, a 4096-byte host scatter term
+// among them: the requirement is R0. The snapshot is taken. The plan with the room raises the host scatter term by the
+// run's 92160 bytes and publishes its own oneDNN Graph and non-FA shapes, and the micro-batch's publish grows the ring
+// to n_ubatch 2048. The fallback publishes the ring at 512 again. Before the restore the requirement is R0 + 92160,
+// what the zone was asked for when the run aborted, which shows the case reaches the term. After the restore it is
+// exactly R0, and every planner term reads what the load published, the host scatter term its 4096 bytes. A second
+// leg moves the CONTROL requirement, the other planner term the RUNTIME requirement counts, and restores it the same
+// way.
+// Engagement: the ring's slots grow from 512 to 2048 rows, and the requirement moves by exactly the term moved.
+// Mutants: a term left out of the snapshot or the restore (its leg reads the discarded plan's value); a restore that
+// writes a constant, zero included (the load's nonzero shapes, host scatter and CONTROL bytes do not read back).
+// No device work: the terms are per-device process state. The case leaves every term it writes as it found it.
+static bool planner_terms_restore_returns_the_runtime_requirement() {
+    TEST_BEGIN("planner_terms_restore_returns_the_runtime_requirement");
+    constexpr int       device       = 0;
+    constexpr size_t    mib          = 1024ull * 1024ull;
+    constexpr size_t    scatter_term = 92160;
+    constexpr size_t    load_scatter = 4096;
+    planned_terms_found found(device);
+
+    // The load: a ring of one 64 MiB weight slot whose activation and output slots follow the micro-batch, all of it in
+    // the RUNTIME zone, and the planner's terms at the planning shape.
+    unified_cache_set_planned_pp_moe_onednn_row_bytes(device, 5760, 11520, 32, 4);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+    size_t act_512  = 0;
+    size_t out_512  = 0;
+    size_t act_2048 = 0;
+    size_t out_2048 = 0;
+    TEST_ASSERT(unified_cache_pp_moe_onednn_slots_for_ubatch(device, 512, &act_512, &out_512) &&
+                    unified_cache_pp_moe_onednn_slots_for_ubatch(device, 2048, &act_2048, &out_2048),
+                "the ring's slots cannot be sized from the row bytes");
+    TEST_ASSERT(act_2048 > act_512 && out_2048 > out_512,
+                "the ring's slots do not grow from 512 to 2048 rows, so the micro-batch's publish moves nothing");
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, 64 * mib, act_512, out_512, 1);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 512);
+    unified_cache_set_planned_onednn_graph_scratch_shape(device, 32, 0, 0, 512, 4096);
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
+    unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ mib, true });
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, load_scatter);
+    size_t r0 = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &r0),
+                "the load's requirement is unanswerable");
+
+    const planner_published_terms before = planner_published_terms::snapshot(device);
+
+    // The plan with the room, and the micro-batch's publish.
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, load_scatter + scatter_term);
+    unified_cache_set_planned_onednn_graph_scratch_shape(device, 32, 0, 0, 2048, 4096);
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 2048, 4096);
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, 64 * mib, act_2048, out_2048, 1);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 2048);
+    size_t grown = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &grown) && grown > r0 + scatter_term,
+                "the micro-batch's ring did not raise the requirement");
+
+    // The fallback publishes the ring at the planning shape again; the discarded plan's term is still published.
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, 64 * mib, act_512, out_512, 1);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 512);
+    size_t unrestored = 0;
+    TEST_ASSERT(
+        unified_cache_get_planned_runtime_zone_requirement(device, &unrestored) && unrestored == r0 + scatter_term,
+        "before the restore the requirement is not R0 + 92160, so the case does not reach the term");
+
+    before.restore(device);
+    size_t restored = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &restored) && restored == r0,
+                "after the restore the requirement is not the load's R0");
+    TEST_ASSERT(unified_cache_get_planned_moe_host_scatter_scratch_bytes(device) == load_scatter,
+                "the restore did not put back the load's 4096-byte host scatter term");
+    const onednn_graph_scratch_planned_shape graph = unified_cache_get_planned_onednn_graph_scratch_shape(device);
+    TEST_ASSERT(graph.n_head_ctx_max == 32 && graph.n_head_swa_max == 0 && graph.n_swa == 0 && graph.n_ubatch == 512 &&
+                    graph.n_ctx == 4096,
+                "the restore left the discarded plan's oneDNN Graph scratch shape published");
+    const nonfa_attn_scratch_planned_shape nonfa = unified_cache_get_planned_nonfa_attn_scratch_shape(device);
+    TEST_ASSERT(nonfa.n_head == 32 && nonfa.n_ubatch == 512 && nonfa.n_ctx == 4096,
+                "the restore left the discarded plan's non-FA attention scratch shape published");
+
+    // The CONTROL requirement: a discarded plan that moved it raises the requirement by what it moved, and the
+    // restore puts the load's back.
+    unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ 2 * mib, true });
+    size_t control_moved = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &control_moved) && control_moved == r0 + mib,
+                "a CONTROL requirement 1 MiB larger does not raise the requirement by 1 MiB");
+    before.restore(device);
+    const moe_control_requirement control = unified_cache_get_planned_moe_control_requirement(device);
+    TEST_ASSERT(control.bytes == mib && control.valid, "the restore left the discarded plan's CONTROL requirement");
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &restored) && restored == r0,
+                "after the CONTROL restore the requirement is not the load's R0");
+
+    TEST_PASS();
+    return true;
+}
+
+// The PP pipeline scratch and the oneDNN pair with its stored sum, which planned_terms_found does not keep, read when
+// the case starts and written back when it ends.
+struct pipeline_and_pair_found {
+    int                  device;
+    load_published_terms found;
+
+    explicit pipeline_and_pair_found(int d) : device(d), found(load_published_terms::snapshot(d)) {}
+
+    ~pipeline_and_pair_found() {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, found.pp_pipeline);
+        unified_cache_set_planned_onednn_scratchpad_pair(device, found.onednn_weights, found.onednn_activations);
+        unified_cache_set_planned_onednn_scratchpad_bytes(device, found.onednn_stored);
+    }
+};
+
+// A failed load puts back what it published and nothing another publisher wrote since: a runtime context transaction
+// of a live model publishes some of the same terms while the load runs, and the oneDNN pair's reserve raises the stored
+// sum outside the lock. The case drives load_published_record as the backend does: one record per load from the terms
+// as the load's first stage found them, and a note per planner pass from the terms before and after it.
+// The live model: pipeline 1 MiB, ring micro-batch 512 with no KV-zone slot, no host scatter, CONTROL 1 MiB, non-FA
+// 32 heads x 512 x 4096, the pair 4 + 2 MiB with the sum its reserve raised to 8 MiB.
+// Leg 1. Pass 1 of the load publishes all of those anew (the pair 16 + 8 MiB, so the sum 24 MiB). Between the passes a
+// live context re-plans its ring (micro-batch 1024, its activation slot in the KV zone) and the reserve raises the sum
+// to 30 MiB. Pass 2 publishes the ring and the pair again. After it a live context publishes its non-FA shape. The
+// restore puts the pipeline, the scatter, CONTROL and the pair's halves back to the live model's; the ring to the
+// context's re-plan and the sum to the reserve's raise, both of which the load wrote over; and it keeps the non-FA
+// shape the context published after the load.
+// Leg 2. A load whose one pass publishes the pair, after which the reserve raises the sum to 40 MiB: the restore keeps
+// the raise and puts the halves back.
+// Engagement: before each restore every term reads what the load or the later publisher wrote.
+// Mutants: a restore of every term to what the load's first stage found (the non-FA shape reads 32 x 512, the ring 512,
+// the sum 8 MiB); a restore of every group the load changed (the non-FA shape reads 32 x 512); a note that ignores
+// another publisher (the ring reads 512, the sum of leg 1 8 MiB); a sum stored plainly (leg 2 reads 8 MiB).
+// No device work: the terms are per-device process state. The case leaves every term it writes as it found it.
+static bool load_record_keeps_a_later_publish() {
+    TEST_BEGIN("load_record_keeps_a_later_publish");
+    constexpr int           device = 0;
+    constexpr size_t        mib    = 1024ull * 1024ull;
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+
+    const auto live = [&]() {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, mib);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 512);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 0);
+        unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ mib, true });
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
+        unified_cache_set_planned_onednn_scratchpad_pair(device, 4 * mib, 2 * mib);
+        unified_cache_set_planned_onednn_scratchpad_bytes(device, 8 * mib);
+    };
+    const auto load_pass = [&]() {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, 3 * mib);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 2048);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 92160);
+        unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ 2 * mib, true });
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 2048, 4096);
+        unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
+    };
+
+    // Leg 1.
+    live();
+    load_published_record record(load_published_terms::snapshot(device));
+    load_published_terms  before = load_published_terms::snapshot(device);
+    load_pass();
+    record.note(before, load_published_terms::snapshot(device));
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 1024);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, true, false);
+    unified_cache_set_planned_onednn_scratchpad_bytes(device, 30 * mib);
+    before = load_published_terms::snapshot(device);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 2048);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+    unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
+    record.note(before, load_published_terms::snapshot(device));
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, 64, 1024, 8192);
+
+    TEST_ASSERT(unified_cache_get_planned_pp_pipeline_scratch_bytes(device) == 3 * mib &&
+                    unified_cache_get_planned_pp_moe_onednn_n_ubatch(device) == 2048 &&
+                    unified_cache_get_planned_moe_host_scatter_scratch_bytes(device) == 92160 &&
+                    unified_cache_get_planned_onednn_scratchpad_bytes_stored(device) == 24 * mib,
+                "before the restore the load's pipeline, ring, scatter and sum do not read what it published");
+    record.restore(device);
+    const load_published_terms back = load_published_terms::snapshot(device);
+    TEST_ASSERT(back.pp_pipeline == mib, "the restore left the failed load's pipeline scratch");
+    TEST_ASSERT(back.planner.scatter == 0, "the restore left the failed load's host scatter term");
+    TEST_ASSERT(back.planner.control.bytes == mib && back.planner.control.valid,
+                "the restore left the failed load's CONTROL requirement");
+    TEST_ASSERT(back.onednn_weights == 4 * mib && back.onednn_activations == 2 * mib,
+                "the restore left the failed load's oneDNN pair");
+    TEST_ASSERT(back.ring_n_ubatch == 1024 && back.ring_activation_in_kv && !back.ring_output_in_kv,
+                "the ring is not the live context's re-plan the load wrote over");
+    TEST_ASSERT(back.onednn_stored == 30 * mib, "the sum is not the reserve's raise the load wrote over");
+    TEST_ASSERT(
+        back.planner.nonfa.n_head == 64 && back.planner.nonfa.n_ubatch == 1024 && back.planner.nonfa.n_ctx == 8192,
+        "the restore put back over the non-FA shape a live context published after the load");
+
+    // Leg 2.
+    live();
+    load_published_record raised(load_published_terms::snapshot(device));
+    before = load_published_terms::snapshot(device);
+    unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
+    raised.note(before, load_published_terms::snapshot(device));
+    unified_cache_set_planned_onednn_scratchpad_bytes(device, 40 * mib);
+    raised.restore(device);
+    const load_published_terms kept = load_published_terms::snapshot(device);
+    TEST_ASSERT(kept.onednn_stored == 40 * mib, "the restore put back over the reserve's raise of the sum");
+    TEST_ASSERT(kept.onednn_weights == 4 * mib && kept.onednn_activations == 2 * mib,
+                "the restore left the failed load's oneDNN pair under a raised sum");
 
     TEST_PASS();
     return true;
@@ -2042,7 +2428,11 @@ int main(int argc, char ** argv) {
     ok &= exact_scratch_shutdown_record_survives_for_retry(q);
     ok &= scratch_regrow_refusal_preserves_exact_record(q);
     ok &= concurrent_settle_destroy_closing_wins(q);
+    ok &= arena_teardown_refusal_reserves_nothing(q);
+    ok &= cache_without_staging_allocates_none(q);
     ok &= accepted_control_publication_is_atomic_with_close_snapshot();
+    ok &= planner_terms_restore_returns_the_runtime_requirement();
+    ok &= load_record_keeps_a_later_publish();
     ok &= global_cache_static_destruction_exits_cleanly(argv[0]);
     // Retain a real pinned suballocation across the first shutdown attempt;
     // retry drains the process-global cache while q and SYCL are still alive.

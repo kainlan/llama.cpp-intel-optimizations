@@ -17,6 +17,14 @@
 # retained snapshot OUTSIDE the lock (canonical contract 12.5). A 528397d03
 # extract is the positive control for A3 (its setter body carries the call).
 #
+# The stage now runs in two passes, so that a load refused on any device
+# configures no device's host zones: the decide loop captures each device's snapshot (and the
+# effects its impl decided) into a late_decision, and the effect loop
+# provisions each decision's retained snapshot after the last refusal. The
+# A-family anchors name those fields; the shape they pin is unchanged: capture
+# before provision, the retained snapshot, and no inventory lock in the stage
+# (the effect helpers it calls take the lock themselves).
+#
 # llama.cpp-16el: check E's anchor moved with the reserve parse (lenient
 # parse_env_mb_value -> strict ggml_sycl::detail::parse_host_reserve_mb) and
 # E1/E2 pin the strict-parse and warn-and-fall-through behaviour.
@@ -95,12 +103,15 @@ def statement_window(source: str, statement_anchor: str, window: int = 1400) -> 
 LOCK_RE = re.compile(r"std::(?:lock_guard|unique_lock)(?:<[^<>]*>)?\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\)\s*;")
 # The guard the A1 witness reintroduces, in the spelling the source uses.
 LOCK_STMT = "std::lock_guard lock(g_tensor_inventory_mutex);"
-PLAN_STORE_CALL = "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);"
-IMPL_DELEGATE_CALL = "ggml_sycl_set_tensor_inventory_impl(backend, inventory);"
-SNAPSHOT_CAPTURE = "const auto snapshot = " + IMPL_DELEGATE_CALL
-# The retained-candidate overload (snapshot->plan), not the current-plan
-# overload S1-PRELOAD uses.
-PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, snapshot->plan);"
+# The plan store returns false when the arena's zones cannot hold the plan; the impl branches on it.
+PLAN_STORE_CALL = "if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) {"
+# The exported setter has no result to give a refusal, so it passes no flag; the stage passes one and fails the load.
+# Both pass an effects record the impl fills, for the caller to run once the plan is decided.
+IMPL_DELEGATE_CALL = "ggml_sycl_set_tensor_inventory_impl(backend, inventory, nullptr, effects);"
+SNAPSHOT_CAPTURE = "ggml_sycl_set_tensor_inventory_impl(backend, inventory, &plan_refused, decision.effects);"
+# The retained-candidate overload (the decision's snapshot->plan), not the
+# current-plan overload S1-PRELOAD uses.
+PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.snapshot->plan);"
 CURRENT_PLAN_PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache);"
 CONFIGURE_TOKEN = "configure_host_zones"
 

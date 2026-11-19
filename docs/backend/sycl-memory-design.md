@@ -1620,9 +1620,9 @@ not inside the "zone is big enough" branch.** The first version of this step
 put the release inside `if (total_needed <= zone_cap)`, after the
 `total_needed > zone_cap` branch's `ensure_planned_arena_zones()` re-plan
 attempt. Spec review caught the consequence: `ensure_planned_arena_zones()`'s
-`has_live_scratch` refusal check
+`has_live_scratch` refusal check of that time
 (`onednn_weights_scratch_ != nullptr || onednn_activations_scratch_ != nullptr
-|| ...`) treats a non-null pointer as still-live *regardless of who owns
+|| ...`) treated a non-null pointer as still-live *regardless of who owns
 it* — including the reservation's own predecessor, about to be replaced by
 the very call that is checking. So on exactly the path that most needed the
 fix — an existing arena reservation growing into a bigger one — the old
@@ -1651,6 +1651,12 @@ memory quietly again. A CPU-only source-contract check
 precedes the growth-path re-plan") pins the ordering the same way the
 existing hook-before-early-return checks pin theirs, and is confirmed to fail
 against the pre-fix commit.
+
+The rebuild gate has since become exact: `arena_count_scratch_holders()` counts
+a cache scratch buffer as a holder only when `vram_owns()` its pointer, and
+`zone_arena_rebuild_allowed()` decides. An arena-owned predecessor still counts,
+so the point-release above must still run first; a direct scratch outside the
+arena no longer refuses a rebuild.
 
 **Nothing else lives in the ONEDNN VRAM zone — grep-verified, not assumed.**
 The only `zone_alloc(vram_zone_id::ONEDNN, ...)` call sites in the entire
@@ -2722,9 +2728,70 @@ re-fit's forced re-admission and the `vram_bytes` charge all read that. The two
 facts differ across a model load. The arena and the physical ring outlive a
 model, and a load resets the planned placement to RUNTIME. So a load releases a
 ring that still holds KV-zone bytes, because the reserve's "already sufficient"
-path would otherwise keep it. A slot claimed by an in-flight dispatch refuses
-that release, and it is never forced. The ring is then kept, KV still counts
-what it holds, and the next re-fit re-admits it.
+path would otherwise keep it. The release is an effect of the load stage
+(`ggml_sycl_release_stale_kv_zone_ring()`). A load runs the stage twice, an
+early pass and then a late one, and within each the release runs only after
+every refusal of that pass is decided: a pass refused before its effects does
+not release the ring this way. The early pass's effects run before the late pass
+decides, so a load refused in its late pass may already have released the ring
+in its early pass. The entry ensure's last resort, below, is the one release a
+pass makes before its last refusal. A slot claimed by an in-flight dispatch
+refuses that release, and it is never forced. The ring is then kept, KV still
+counts what it holds, and the next re-fit re-admits it.
+
+**The load stage's two passes.** `ggml_backend_sycl_stage_load_inventory_plan()`
+plans every device first. It configures a device's host zones, sets up its layer
+streaming and releases its stale ring only after the last refusal of the pass,
+early or late, is decided, so an early pass's effect (the stale ring's release)
+comes before any refusal of the late pass. The decide pass publishes planning
+state, which the abort of a refused load puts back, together with the two-card
+MoE flag its planner sets (`g_moe_multi_gpu_active`). The decide pass is not
+free of device effects. The planner's zone decision sizes the VRAM arena's
+zones, and it may rebuild an arena nothing holds for larger zones, at the entry
+ensure or at the micro-batch's grow leg. A refused load keeps the rebuilt arena,
+or leaves the device with no arena when the reserve after the teardown failed. A
+plan that needs the secondary MoE devices also creates their shared queues and
+caches, which stay. The effect pass then runs, device by device and each from
+the snapshot that device staged: the stale ring's release, the layer streaming
+the late pass decided on, and the late pass's host zones
+(`ggml_sycl_configure_host_zones_for_plan()`). A load refused in its decide pass
+therefore configures no device's host zones, which a later load configures from
+its own plan. An effect can still end a load after an earlier device's effects
+ran. The two candidate checks around each device's effects throw when the load's
+owner or candidate changed, and an effect's own host allocation can throw (a
+zone or pool that cannot be allocated falls back instead). The earlier device
+then keeps its configured host zones, its released stale ring and, in a late
+pass, the layer streaming its effects set up. The abort releases no layer
+streaming, and a load whose abort cleans up keeps no model token, so no model
+teardown releases it either: the working set stays until the next model's first
+weight upload on that device displaces it (`register_host_ptr()`), or until the
+process exits. A load whose abort fails keeps its token, and the teardown of
+that token releases the working set by owner.
+
+The one ring release in the decide pass is the entry ensure's last resort
+(`ggml_sycl_ensure_load_arena_zones()`): when the plan's zones need a rebuild
+and the ring's slot buffers are the arena's only holders
+(`zone_arena_only_ring_holds()`), the ring is released and the zones are asked
+for again. The premise is counted, not owned. The ring is the only holder when
+nothing else points into the arena: no other allocation live in its zones, no
+lease on its chunks, no other cache scratch buffer inside it. That says nothing
+about who still uses the ring. A prefill's claim on one of its slots refuses the
+release, and the load is refused as for any holder. A claim outlives its
+prefill: it is let go when a later prefill takes that slot, when a context on
+the device is freed (its backend drains the device's slots), or when it is
+released unused. A context therefore loses the ring only while no claim on its
+slots is held: before its first claim, when every claim was released unused, or
+after a context on the device was freed. It reserves the ring again at its next
+dispatch; that is the accepted cost of the last resort.
+
+The release rests on the premise's precondition: no zone holds a live byte
+beside the ring, so no context with weights or KV on that device can be
+dispatching. The slot buffers' handles are let go inside the release, before
+the second ensure counts the holders. A copy of a slot buffer's handle that
+outlived its claim's count would keep that buffer allocated: the second ensure
+counts it as a live allocation beside the ring, the rebuild is held, the load
+is refused, and the arena is never rebuilt under the buffer, so a late copy is
+never a use after free.
 
 **Contiguity.** Each KV-zone slot is one allocation. So the whole KV-zone part
 must also fit the zone's largest free block, read after the old ring is
@@ -2781,8 +2848,7 @@ the prompt and generation tests of one `-b`/`-ub` pair share one model, and it
 reloads the model only when the named micro-batch changes. A reload re-plans
 the experts but not the arena's zones. The arena outlives the model and keeps a
 zone that is larger than a new plan needs. It rebuilds only a zone that is too
-small, and only while it holds nothing, which the PP MoE ring a previous context
-left prevents. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
+small, never to shrink one. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
 instances plan against the RUNTIME zone the 2048 load grew, and keep fewer
 experts on the device than a fresh process would. Such a load prints one WARN
 line after its plan, when the live zone is larger than the zone the arena
@@ -2857,16 +2923,44 @@ than the RUNTIME zone can hold with every device-resident expert re-placed to th
 largest -ub that fits is <L> (device=0)
 ```
 
-The arena can fail to grow for two reasons, and each prints its own line first:
+The arena can fail to grow for three reasons, and each prints its own line first:
 
-- **Another live model holds allocations in the arena.** Zones are rebuilt only
-  in an unused arena, so `ensure_planned_arena_zones()` refuses the rebuild with
-  an ERROR:
+- **Something still points into the arena.** Zones are rebuilt only in an arena
+  nothing points into: no zone byte allocated, no lease on a chunk, and no cache
+  scratch buffer whose pointer the arena owns. A scratch buffer allocated outside
+  the arena keeps its memory through a rebuild and does not count
+  (`zone_arena_rebuild_allowed()` decides). Another live model's allocations are
+  one cause; scratch an earlier model left in the arena, and handles that still
+  lease a chunk, are others. `ensure_planned_arena_zones()` refuses the rebuild
+  with an ERROR, names the holders on a second ERROR, prints the chunk leases by
+  the site that took them on a WARN, and lists the live allocations of each zone
+  with live bytes:
 
   ```
   [VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: need scratch=<S> MB
   oneDNN=<O> MB runtime=<R> MB; have scratch=<S0> MB oneDNN=<O0> MB runtime=<R0> MB; live_zone=<L> MB chunk_leases=<C>
+  [VRAM-ARENA] live in the arena on device <D> (MB): <zone>=<MB> ...; deferred_in_arena=<n> (<MB> MB requested)
+  device_release_retries=<n> device_live_controls=<n> retired_pending=<n> evictions_in_flight=<n>
+  cache_scratch_in_arena=<n> (pp_moe_ring_slots=<n>) cache_scratch_outside=<n> live_beside_ring=<n>
+  [VRAM-ARENA] chunk leases on device <D> by site: <site>=<n> <site>(copy)=<n> ... (sum <n> of <C>)
+  [UNIFIED-ALLOC] live-zone-dump at arena-rebuild device=<D> zone=<z> used=<MB> MB ...
   ```
+
+  `pp_moe_ring_slots` counts the PP MoE ring's slot buffers among the cache's
+  scratch in the arena, and `live_beside_ring` the zone allocations that are not
+  those slots, read from each allocator group's own record. When the ring's
+  slots are the only holders (no other scratch, nothing beside the ring, no
+  chunk lease), a model load's entry ensure releases the ring after these lines
+  and asks for the zones again, with a WARN that says so; the ring is kept while
+  a prefill's claim on one of its slots is still held, with a WARN that says so,
+  and the load is refused as for any holder.
+
+  The sites are `weight_snapshot`, `weight_resolve`, `chunk_view` (a handle made
+  from a raw pointer for one use), `tensor_extra`, `expert_dispatch` and
+  `untagged` (a direct caller of the lease API). `(copy)` counts the leases that
+  copies of those handles took; a copy keeps the site of the handle it copies.
+  The counts by site sum to the chunks' leases, up to a lease taken or dropped
+  between the two reads.
 
 - **The tail chunk's cap.** The rebuilt arena's tail chunk holds the ONEDNN,
   RUNTIME and SCRATCH zones plus a minimum KV carve-out, and the device's
@@ -2874,9 +2968,45 @@ The arena can fail to grow for two reasons, and each prints its own line first:
   with `[VRAM-ARENA] Per-chunk cap <P> MB too small to hold tail zones (<T> MB) +
   min KV (<K> MB); refusing reservation`.
 
-Either way the load keeps the planning shape: it re-publishes the ring and the
+- **The teardown refuses.** A rebuild tears the arena down first
+  (`arena_destroy()`), and a teardown can refuse: the host cannot reserve the
+  teardown's own bookkeeping, allocations are live in the arena, the host cannot
+  record the allocations it waits on, a lease does not end in time, or the device
+  refuses to free a chunk. The ensure then refuses with its own reason
+  (`TEARDOWN_REFUSED`, the cause in `zone_arena_refusal::teardown`), no arena is
+  reserved after it, and one ERROR line names the cause:
+
+  ```
+  [VRAM-ARENA] the arena on device <D> could not be torn down (<cause>); it stays closed to new allocations and
+  no arena is reserved over it: need scratch=<S> MB oneDNN=<O> MB runtime=<R> MB
+  ```
+
+  Every cause but the host bookkeeping one refuses after the teardown closed the
+  arena, which stays closed until a teardown completes. Every later ensure on that
+  device refuses for it, whatever the zones hold, and the load's refusal says to
+  load the model in a new process. A refusal for the host bookkeeping leaves the
+  arena as it was (`it is as it was` in the line), binds its compute zone again,
+  and says to free host memory and load again.
+
+In each case the load keeps the planning shape: it re-publishes the ring and the
 dense scratch at the load's own micro-batch, sizes the zones for them, and plans
 without the room. So no expert leaves the device for a zone that did not grow.
+After a teardown that left the arena closed, that sizing refuses the load too.
+
+A plan that is tried and discarded publishes nothing. While a plan is computed
+the planner publishes terms of its own: the MoE host scatter scratch for the
+experts it moved to host, the MoE CONTROL requirement, and the oneDNN Graph and
+non-FA attention scratch shapes. The plan with the room is discarded here, so
+before the zones are sized the load puts those terms back as they stood before
+it planned with the room (`ggml_sycl::planner_published_terms` in
+`unified-cache.hpp`, which the plan dry run restores through as well, and which
+the `sycl-runtime-alloc` ctest (binary `test-sycl-runtime-alloc`, source
+`ggml/src/ggml-sycl/tests/test-unified-runtime-alloc.cpp`) checks against the
+cache's own state). The zones are then asked for what the entry check found
+they hold, and the plan without the room publishes its own terms.
+Without that restore, a plan that had moved experts to host left its host
+scatter term published, and the fallback asked a RUNTIME zone that could not
+grow for 90 KB more than it held and aborted.
 One WARN line, at every verbosity, says the named micro-batch was not placed:
 
 ```
@@ -2887,6 +3017,96 @@ not reserve on device 0; the ring is re-planned when the context opens
 The context then re-plans the ring as described above.
 Only the single-device plan places. A multi-device plan makes no decision, so
 its context keeps the context-time path.
+
+A load whose zones cannot be had is refused, not aborted. Both zone checks of
+the plan, the entry check and the fallback's after it put the discarded plan's
+terms back, end the same way when the arena cannot grow to what the load needs:
+after the lines above, one ERROR names the device, each zone's need and have,
+the shortfall of each short zone, why the zones cannot grow and what to free.
+
+```
+[SYCL-PLAN] model load refused on device <D>: VRAM arena zones SCRATCH need <S> MB have <S0> MB, ONEDNN need
+<O> MB have <O0> MB, RUNTIME need <R> MB have <R0> MB (<X> MB short); <B> MB of live allocations in its zones
+hold the arena (the [VRAM-ARENA] lines above name them), so its zones cannot grow. Free the model or context they
+belong to, then load this one again
+```
+
+A zone short by less than 0.1 MB prints its need, have and shortfall in KB, or
+in bytes under 1 KB (`RUNTIME need 1835016.0 KB have 1835008.0 KB (8.0 KB
+short)`), so a shortfall never reads `0.0 MB short`.
+
+The clause after the zones names each kind of holder the rebuild gate refused
+on, with its count, and the remedy follows from them. Live allocations in the
+zones belong to a model or context, and freeing it lets the zones grow: the
+line above. `<N> leases on its chunks` with nothing live in the zones outlived
+what they point at, and `<M> of the cache's own scratch buffers` (the oneDNN
+scratch pair, the reorder temp, a persistent scratch) stay in the arena until
+the cache is torn down at process exit. No free releases either, so the line
+then says to load the model in a new process before any other on the device.
+The cache's scratch decides the remedy whatever else holds the arena. The PP
+MoE ring is the cache's too, but a load releases it when its slot buffers are
+the arena's only holders and no prefill's claim on one of its slots is held. A
+held claim keeps it, and the line then reads `Only the cache's PP MoE ring holds
+it, and a prefill's claim on one of its slots keeps it: the claim outlives its
+prefill until a context on device <D> is freed. Free the context that ran the
+prefill, then load this one again`. Live bytes are a model's or a context's only
+when the cache has no release of its own still to run: a free queued in the
+arena, a release waiting for a retry, a retired entry not yet finalized and an
+eviction in flight all keep zone bytes with no owner left. The refusal carries
+those four counts, read where the ERROR line above prints them, and with any of
+them the remedy reads `Some of those bytes may be releases the cache has not
+finished (<counts>), which it finishes on its own. Load this one again; if it is
+refused with the same bytes, free the model or context they belong to`.
+
+When the arena could be rebuilt but the reserve failed (the tail chunk's cap),
+the reason reads `the device could not reserve an arena with these zones. Free
+VRAM on device <D>, then load this one again`. The rebuild destroyed the arena
+before the reserve, so each zone's have is what the device has after the
+failure (0.0 MB), and the reason names the arena it had: `, and the arena it had
+(SCRATCH <S0> MB, ONEDNN <O0> MB, RUNTIME <R0> MB) was released for the rebuild`
+before the remedy. A first reserve on the device released nothing and says
+nothing about it. The line offers no smaller `-c`
+or `-ub`: the load plans its zones at its fixed planning shape, ubatch 512 with
+an `n_ctx` of one ubatch for the planner's terms, and the RUNTIME zone's
+compute term is the one the load measured at `n_ctx_train` and ubatch 512
+(below), so neither flag is the term that grew. Any term can be the one:
+whatever holds the arena keeps the zones at the size an earlier load gave them,
+and the device-wide terms the load publishes from its inventory before the
+entry check (the PP MoE ring, the PP pipeline scratch) are this load's alone.
+The planner's own terms (the MoE CONTROL requirement, the host scatter scratch)
+are published by the plan after that check, so the entry check reads them as
+they stand: the last plan's on the device, or what an uncommitted load put
+back.
+
+The stage returns `GGML_SYCL_LIFECYCLE_PLAN_REJECTED` from either pass, the
+loader throws, and `llama_model_load` returns NULL, so the tool prints its own
+load failure while the model that holds the arena keeps running. The refused
+load puts back the device-wide planned terms it published
+(`ggml_sycl::load_published_terms` in `unified-cache.hpp`: the PP pipeline
+scratch, the ring with its KV-zone slots, row bytes, expert counts and
+micro-batch, the oneDNN pair and its stored sum, and the planner's own terms),
+and nothing another publisher wrote since. The terms carry no owner: a runtime
+context of a live model publishes some of them while the load runs (its ring
+when the micro-batch moves, its non-FA attention shape), and the oneDNN pair's
+reserve raises the stored sum outside the inventory lock. The stage starts a
+record per device once per load transaction, before its first device plans,
+and each planner pass of the load notes into it what the pass changed, under
+`g_tensor_inventory_mutex` (`ggml_sycl::load_published_record`). The abort of
+the load's owner effects, which every failed stage and every uncommitted end
+runs, takes that lock and puts a group of terms back only while it still holds
+what the load published: a group another publisher wrote after the load keeps
+that publisher's terms, and one the load wrote over goes back to them. The sum
+goes back by compare-exchange, so a raise after the load's publish is kept. A
+publisher that writes exactly what the load published cannot be told from the
+load, and its group goes back with the load's. The abort drops the owner-keyed
+terms as before. The compute term's micro-batch is not restored: every load
+records 512. `test-zone-sizing` Case 38 pins the line,
+`tests/test-sycl-load-zone-refusal-source.py` pins the wiring, that every term
+the publish paths set is restored and that the restore keeps a later publish,
+`load_record_keeps_a_later_publish` in the `sycl-runtime-alloc` ctest (binary
+`test-sycl-runtime-alloc`) drives the record, and arm (e) of
+`test-sycl-plan-dry-run` stages a refused load beside a live RUNTIME-zone
+allocation.
 
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
 holds the compute term the load measured at the context and micro-batch the

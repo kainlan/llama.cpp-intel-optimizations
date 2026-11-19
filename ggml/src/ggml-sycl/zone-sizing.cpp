@@ -504,6 +504,244 @@ bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, si
     return zone_runtime_reserved_bytes(floor_bytes, requirement, &reserved) && live_zone_bytes > reserved;
 }
 
+bool zone_runtime_requirement(const zone_runtime_terms & terms, size_t * out) {
+    if (out == nullptr) {
+        return false;
+    }
+    const size_t added[] = { terms.moe_host_scatter, terms.mmq_src1, terms.dequant_f16, terms.compute, terms.state };
+    size_t       total   = terms.base;
+    for (const size_t term : added) {
+        if (term > SIZE_MAX - total) {
+            return false;
+        }
+        total += term;
+    }
+    *out = total;
+    return true;
+}
+
+bool zone_arena_rebuild_allowed(const zone_arena_holders & holders) {
+    // scratch_outside is not read: a rebuild leaves an allocation outside the arena where it is.
+    return holders.live_zone_bytes == 0 && holders.chunk_leases == 0 && holders.scratch_in_arena == 0;
+}
+
+bool zone_arena_only_ring_holds(bool rebuild_needed, const zone_arena_holders & holders) {
+    // The ring's slot buffers are among scratch_in_arena, and their bytes among live_zone_bytes, so those two are read
+    // through the ring's own counts; a lease is never the ring's.
+    return rebuild_needed && holders.ring_in_arena != 0 && holders.scratch_in_arena == holders.ring_in_arena &&
+           holders.live_beside_ring == 0 && holders.chunk_leases == 0;
+}
+
+// `bytes` in MB at one decimal, in KB under 0.1 MB, and in bytes under 1 KB, so a small figure never prints as 0.0 MB.
+static std::string zone_bytes_text(size_t bytes) {
+    char out[48];
+    if (bytes < 1024) {
+        std::snprintf(out, sizeof(out), "%zu bytes", bytes);
+    } else if (static_cast<double>(bytes) < 0.1 * 1024.0 * 1024.0) {
+        std::snprintf(out, sizeof(out), "%.1f KB", bytes / 1024.0);
+    } else {
+        std::snprintf(out, sizeof(out), "%.1f MB", bytes / (1024.0 * 1024.0));
+    }
+    return out;
+}
+
+// The holders refusal's clause: each kind of holder that points into the arena with its count, and the remedy the
+// kinds allow. The cache's own scratch buffers other than the PP MoE ring stay in the arena until the cache is torn
+// down at process exit, whatever else holds it. The ring is the cache's too, but a load releases it when it is the
+// arena's only holder and no prefill's claim on one of its slots is held; a claim outlives its prefill until a context
+// on the device is freed, so freeing that context is the ring's remedy. Leases with nothing but the ring live in the
+// zones outlived what they point at, so no free releases them either. Live allocations belong to a model or context,
+// which freeing releases, unless the cache still has releases of its own to run: their bytes count as live too, so then
+// the remedy says they may be those and asks for the load again first.
+static std::string zone_arena_unfinished_text(const zone_arena_holders & h) {
+    struct kind {
+        size_t       count;
+        const char * one;
+        const char * many;
+    };
+
+    const kind kinds[] = {
+        { h.queued_frees,    "queued free",                 "queued frees"                 },
+        { h.release_retries, "release waiting for a retry", "releases waiting for a retry" },
+        { h.retired_pending, "retired entry",               "retired entries"              },
+        { h.evictions,       "eviction in flight",          "evictions in flight"          },
+    };
+    std::string parts[4];
+    int         n = 0;
+    for (const kind & k : kinds) {
+        if (k.count != 0) {
+            parts[n++] = std::to_string(k.count) + " " + (k.count == 1 ? k.one : k.many);
+        }
+    }
+    std::string text;
+    for (int i = 0; i < n; ++i) {
+        text += (i == 0 ? "" : i == n - 1 ? " and " : ", ") + parts[i];
+    }
+    return text;
+}
+
+static std::string zone_arena_held_text(const zone_arena_holders & h, int device) {
+    char        part[96];
+    std::string held[3];
+    int         n = 0;
+    if (h.live_zone_bytes != 0) {
+        held[n++] = zone_bytes_text(h.live_zone_bytes) + " of live allocations in its zones";
+    }
+    if (h.chunk_leases != 0) {
+        std::snprintf(part, sizeof(part), "%u lease%s on its chunks", h.chunk_leases, h.chunk_leases == 1 ? "" : "s");
+        held[n++] = part;
+    }
+    if (h.scratch_in_arena != 0 && h.ring_in_arena != 0) {
+        std::snprintf(part, sizeof(part), "%u of the cache's own scratch buffers (%u of them its PP MoE ring's slots)",
+                      h.scratch_in_arena, h.ring_in_arena);
+        held[n++] = part;
+    } else if (h.scratch_in_arena != 0) {
+        std::snprintf(part, sizeof(part), "%u of the cache's own scratch buffers", h.scratch_in_arena);
+        held[n++] = part;
+    }
+    std::string text = "; ";
+    if (n == 0) {
+        text += "allocations of a model or context already on the device";
+    }
+    for (int i = 0; i < n; ++i) {
+        text += (i == 0 ? "" : i == n - 1 ? " and " : ", ") + held[i];
+    }
+    text += " hold the arena (the [VRAM-ARENA] lines above name them), so its zones cannot grow";
+    const uint32_t other_scratch = h.scratch_in_arena > h.ring_in_arena ? h.scratch_in_arena - h.ring_in_arena : 0;
+    // With no slot of the ring inside the arena, every live byte belongs to a model or context.
+    const bool     live_beside   = h.ring_in_arena == 0 ? h.live_zone_bytes != 0 : h.live_beside_ring != 0;
+    if (other_scratch == 0 && (live_beside || (h.chunk_leases == 0 && h.ring_in_arena == 0))) {
+        const std::string unfinished = zone_arena_unfinished_text(h);
+        if (unfinished.empty()) {
+            return text + ". Free the model or context they belong to, then load this one again";
+        }
+        return text + ". Some of those bytes may be releases the cache has not finished (" + unfinished +
+               "), which it finishes on its own. Load this one again; if it is refused with the same bytes, free the "
+               "model or context they belong to";
+    }
+    char remedy[256];
+    if (other_scratch != 0) {
+        std::snprintf(remedy, sizeof(remedy),
+                      ". The cache keeps its own scratch buffers in the arena until the process exits, so freeing a "
+                      "model or context does not let its zones grow. Load this model in a new process before any "
+                      "other on device %d",
+                      device);
+    } else if (h.chunk_leases != 0) {
+        std::snprintf(remedy, sizeof(remedy),
+                      ". %s is live in its zones, so the leases outlived what they point at and are held until the "
+                      "process exits. Load this model in a new process before any other on device %d",
+                      h.ring_in_arena == 0 ? "No allocation" : "Nothing but the cache's PP MoE ring", device);
+    } else {
+        std::snprintf(remedy, sizeof(remedy),
+                      ". Only the cache's PP MoE ring holds it, and a prefill's claim on one of its slots keeps it: "
+                      "the claim outlives its prefill until a context on device %d is freed. Free the context that "
+                      "ran the prefill, then load this one again",
+                      device);
+    }
+    return text + remedy;
+}
+
+// The refused teardown's clause: why it refused, and what that left. Only a refusal named as one before the teardown
+// closed the arena leaves it usable; any other, a missing cause included, is read as closed, which no reserve may
+// follow and no later load in the process can use.
+static std::string zone_arena_teardown_text(zone_arena_teardown_refusal cause, int device) {
+    std::string text = "; the arena could not be torn down";
+    switch (cause) {
+        case zone_arena_teardown_refusal::HOST_STATE:
+            return text +
+                   ": the host could not reserve the teardown's own bookkeeping, and the arena is as it was. Free "
+                   "host memory, then load this one again";
+        case zone_arena_teardown_refusal::LIVE_ALLOCATIONS:
+            text += ": allocations were still live in it when the teardown closed it";
+            break;
+        case zone_arena_teardown_refusal::DRAIN_SNAPSHOT:
+            text += ": the host could not record the allocations the teardown waits on";
+            break;
+        case zone_arena_teardown_refusal::DRAIN_TIMEOUT:
+            text += ": a lease on one of its allocations did not end while the teardown waited";
+            break;
+        case zone_arena_teardown_refusal::FREE_FAILED:
+            text += ": the device refused to free one of its chunks, so part of it may already be freed";
+            break;
+        case zone_arena_teardown_refusal::NONE:
+            break;
+    }
+    char closed[160];
+    std::snprintf(closed, sizeof(closed),
+                  ". The arena stays closed to new allocations, so no model can load on device %d in this process. "
+                  "Load this model in a new process",
+                  device);
+    return text + closed;
+}
+
+std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {
+    if (refusal.reason == zone_arena_refusal_reason::NONE) {
+        return {};
+    }
+    constexpr double KiB = 1024.0;
+    constexpr double MiB = 1024.0 * KiB;
+    char             part[192];
+    std::snprintf(part, sizeof(part), "[SYCL-PLAN] model load refused on device %d: VRAM arena zones", refusal.device);
+    std::string text = part;
+    // Every zone with its need and have, and a shortfall only on a zone that is short, so the line says which did not
+    // fit. A shortfall under 0.1 MB would print as 0.0 MB beside a need and a have that print the same, so that zone's
+    // three figures are printed in KB, and in bytes under 1 KB.
+    const auto  zone = [&](const char * sep, const char * name, size_t need, size_t have) {
+        const size_t short_bytes = need > have ? need - have : 0;
+        if (short_bytes != 0 && short_bytes < 1024) {
+            std::snprintf(part, sizeof(part), "%s%s need %zu bytes have %zu bytes (%zu bytes short)", sep, name, need,
+                           have, short_bytes);
+        } else if (short_bytes != 0 && static_cast<double>(short_bytes) < 0.1 * MiB) {
+            std::snprintf(part, sizeof(part), "%s%s need %.1f KB have %.1f KB (%.1f KB short)", sep, name, need / KiB,
+                           have / KiB, short_bytes / KiB);
+        } else {
+            std::snprintf(part, sizeof(part), "%s%s need %.1f MB have %.1f MB", sep, name, need / MiB, have / MiB);
+            text += part;
+            if (short_bytes == 0) {
+                return;
+            }
+            std::snprintf(part, sizeof(part), " (%.1f MB short)", short_bytes / MiB);
+        }
+        text += part;
+    };
+    zone(" ", "SCRATCH", refusal.need.scratch, refusal.have.scratch);
+    zone(", ", "ONEDNN", refusal.need.onednn, refusal.have.onednn);
+    zone(", ", "RUNTIME", refusal.need.runtime, refusal.have.runtime);
+    switch (refusal.reason) {
+        case zone_arena_refusal_reason::REBUILD_HELD:
+            text += zone_arena_held_text(refusal.holders, refusal.device);
+            break;
+        case zone_arena_refusal_reason::RESERVE_FAILED:
+            text += "; the device could not reserve an arena with these zones";
+            if (refusal.released.scratch != 0 || refusal.released.onednn != 0 || refusal.released.runtime != 0) {
+                // The rebuild destroyed the arena before the reserve failed, so the device now has none: the have
+                // above says so, and this names what it had.
+                std::snprintf(part, sizeof(part),
+                              ", and the arena it had (SCRATCH %.1f MB, ONEDNN %.1f MB, RUNTIME %.1f MB) was released "
+                              "for the rebuild",
+                              refusal.released.scratch / MiB, refusal.released.onednn / MiB,
+                              refusal.released.runtime / MiB);
+                text += part;
+            }
+            std::snprintf(part, sizeof(part), ". Free VRAM on device %d, then load this one again", refusal.device);
+            text += part;
+            break;
+        case zone_arena_refusal_reason::NO_CACHE:
+            text += "; the device has no unified cache to size them in";
+            break;
+        case zone_arena_refusal_reason::TEARDOWN_REFUSED:
+            text += zone_arena_teardown_text(refusal.teardown, refusal.device);
+            break;
+        case zone_arena_refusal_reason::NONE:
+            break;
+    }
+    return text;
+}
+
+bool zone_arena_teardown_left_closed(zone_arena_teardown_refusal cause) {
+    return cause != zone_arena_teardown_refusal::NONE && cause != zone_arena_teardown_refusal::HOST_STATE;
+}
+
 // A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about
 // linearly with the micro-batch), rounded up. Unchanged when either micro-batch is unknown, they are equal, or the
 // request is 0; SIZE_MAX when the product overflows. The hold-spill fit's one estimator for a compute buffer at a

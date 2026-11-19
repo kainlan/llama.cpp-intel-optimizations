@@ -2577,6 +2577,446 @@ int main() {
               "an unknown device total gated a request");
     }
 
+    // ---- Case 36: the arena is rebuilt only when nothing points into it ------------------------------------------
+    // A rebuild destroys the arena and reserves it again, so every byte in it moves. A zone byte still allocated, a
+    // lease on one of its chunks, or a cache scratch buffer whose pointer lies inside it each refuse the rebuild. A
+    // scratch buffer allocated outside the arena keeps its own memory through a rebuild, so it must not refuse one: a
+    // gate that read any non-null scratch pointer refused rebuilds the arena could take.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_arena_holders;
+        using ggml_sycl::zone_arena_rebuild_allowed;
+
+        // the second load of one process: 269.7 MB live in the zones, 49 chunk leases, the PP MoE ring's three slots
+        // and the oneDNN pair inside the arena, the reorder temp outside it
+        zone_arena_holders second_load;
+        second_load.live_zone_bytes  = static_cast<size_t>(269.7 * MiB);
+        second_load.chunk_leases     = 49;
+        second_load.scratch_in_arena = 5;
+        second_load.scratch_outside  = 1;
+        CHECK(!zone_arena_rebuild_allowed(second_load), "the second load's holders allowed a rebuild");
+
+        // each holder refuses on its own, down to one byte or one lease
+        zone_arena_holders leases_only;
+        leases_only.chunk_leases = 49;
+        CHECK(!zone_arena_rebuild_allowed(leases_only), "49 chunk leases alone allowed a rebuild");
+        leases_only.chunk_leases = 1;
+        CHECK(!zone_arena_rebuild_allowed(leases_only), "one chunk lease allowed a rebuild");
+        zone_arena_holders bytes_only;
+        bytes_only.live_zone_bytes = 1;
+        CHECK(!zone_arena_rebuild_allowed(bytes_only), "one live zone byte allowed a rebuild");
+        zone_arena_holders inside_only;
+        inside_only.scratch_in_arena = 1;
+        CHECK(!zone_arena_rebuild_allowed(inside_only), "a scratch buffer inside the arena allowed a rebuild");
+
+        // nothing points into the arena: the rebuild goes ahead, whatever is allocated outside it
+        zone_arena_holders nothing;
+        CHECK(zone_arena_rebuild_allowed(nothing), "an arena nothing points into was refused");
+        zone_arena_holders outside_only;
+        outside_only.scratch_outside = 7;
+        CHECK(zone_arena_rebuild_allowed(outside_only), "scratch allocated outside the arena refused a rebuild");
+
+        // scratch outside the arena does not hide a holder inside it
+        zone_arena_holders outside_and_lease = outside_only;
+        outside_and_lease.chunk_leases       = 1;
+        CHECK(!zone_arena_rebuild_allowed(outside_and_lease), "a lease beside outside scratch allowed a rebuild");
+    }
+
+    // ---- Case 37: the RUNTIME requirement is the checked sum of its terms -----------------------------------------
+    // zone_runtime_requirement, the sum the cache's getter returns, on the figures of the run where a fallback asked
+    // for 92160 bytes more than the zone held: it adds every term, a sum that would wrap is unanswerable, and so is a
+    // call with nowhere to write. That the fallback puts the discarded plan's terms back is not checked here:
+    // test-sycl-runtime-alloc's planner-terms case checks the restore helper against the cache's own state.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_runtime_requirement;
+        using ggml_sycl::zone_runtime_terms;
+
+        // The planning shape (n_ubatch 512): the ring's RUNTIME part (weight 134.5 MB, activation 33.6 MB, output
+        // 67.1 MB at depth 1; no PP pipeline scratch and no CONTROL pool), mmq_src1 2.3 MB, dequant_f16 1108.6 MB,
+        // compute 404 MB, state 0 and no host scatter: 1750.1 MB.
+        zone_runtime_terms planning;
+        planning.base        = 141008896 + 35232256 + 70359040;
+        planning.mmq_src1    = 2411520;
+        planning.dequant_f16 = 1162444800;
+        planning.compute     = 404 * MiB;
+        size_t before        = 0;
+        CHECK(zone_runtime_requirement(planning, &before), "the planning shape's requirement is unanswerable");
+        CHECK(before == 1835081216, "the planning shape's requirement is not the sum of its terms");
+
+        // The micro-batch (n_ubatch 2048) grows the ring and the dense scratch, with a 90 KB host scatter term:
+        // 1971.4 MB.
+        zone_runtime_terms grown_terms = planning;
+        grown_terms.moe_host_scatter   = 92160;
+        grown_terms.base               = 458960896;
+        grown_terms.mmq_src1           = 9 * MiB;
+        grown_terms.dequant_f16        = 1175027712;
+        size_t grown                   = 0;
+        CHECK(zone_runtime_requirement(grown_terms, &grown) && grown == 2067142656,
+              "the micro-batch's requirement is not the sum of its terms");
+
+        // The planning shape with the host scatter term published: exactly that term more, 1750.2 MB, the figure the
+        // run's refused second attempt asked for.
+        zone_runtime_terms with_scatter = planning;
+        with_scatter.moe_host_scatter   = 92160;
+        size_t scattered                = 0;
+        CHECK(zone_runtime_requirement(with_scatter, &scattered) && scattered == before + 92160,
+              "the host scatter term does not add exactly its 92160 bytes to the planning shape's requirement");
+
+        // Every term counts, and a sum that would wrap is unanswerable: a wrapped sum would size a smaller zone.
+        zone_runtime_terms probe   = planning;
+        size_t * const     terms[] = { &probe.base,        &probe.moe_host_scatter, &probe.mmq_src1,
+                                       &probe.dequant_f16, &probe.compute,          &probe.state };
+        for (size_t * term : terms) {
+            const size_t kept = *term;
+            size_t       sum  = 0;
+            *term += 1;
+            CHECK(zone_runtime_requirement(probe, &sum) && sum == before + 1, "a RUNTIME term is not counted");
+            *term = SIZE_MAX;
+            CHECK(!zone_runtime_requirement(probe, &sum), "a RUNTIME requirement that wraps was answered");
+            *term = kept;
+        }
+        CHECK(!zone_runtime_requirement(probe, nullptr), "a requirement with nowhere to write it was answered");
+    }
+
+    // ---- Case 38: a load refused for zones it cannot size says where, how much and why ----------------------------
+    // The line names the device, each zone's need and have, the shortfall of every short zone and only theirs, the
+    // reason, and what to free. The zones are planned at the load's fixed shape, so it offers no smaller -c or -ub.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_arena_refusal;
+        using ggml_sycl::zone_arena_refusal_reason;
+        using ggml_sycl::zone_arena_refusal_text;
+
+        const auto has = [](const std::string & text, const char * part) {
+            return text.find(part) != std::string::npos;
+        };
+
+        zone_arena_refusal held;
+        held.reason                  = zone_arena_refusal_reason::REBUILD_HELD;
+        held.device                  = 1;
+        held.need                    = { 512 * MiB, 300 * MiB, 1985 * MiB };
+        held.have                    = { 512 * MiB, 256 * MiB, 1792 * MiB };
+        held.holders.live_zone_bytes = 4096;
+        const std::string hl         = zone_arena_refusal_text(held);
+        CHECK(hl.rfind("[SYCL-PLAN] model load refused on device 1: ", 0) == 0, "the refusal does not name its device");
+        CHECK(has(hl, "SCRATCH need 512.0 MB have 512.0 MB, ONEDNN"), "a zone that fits is not named, or is short");
+        CHECK(has(hl, "ONEDNN need 300.0 MB have 256.0 MB (44.0 MB short)"), "the ONEDNN need, have or shortfall");
+        CHECK(has(hl, "RUNTIME need 1985.0 MB have 1792.0 MB (193.0 MB short)"), "the RUNTIME need, have or shortfall");
+        CHECK(!has(hl, "-ub") && !has(hl, "-c ") && !has(hl, "ubatch"), "the refusal offers a smaller -c or -ub");
+        CHECK(!hl.empty() && hl.back() != '\n', "the refusal text carries its own newline");
+
+        // The remedy follows what holds the arena. Live allocations in its zones belong to a model or context, which
+        // freeing releases; a byte count under 0.1 MB prints in KB, or in bytes under 1 KB, so it never reads 0.0 MB.
+        CHECK(has(hl,
+                  "; 4.0 KB of live allocations in its zones hold the arena (the [VRAM-ARENA] lines above name "
+                  "them), so its zones cannot grow. Free the model or context they belong to, then load this one "
+                  "again"),
+              "a held arena's live allocations or their remedy are not named");
+        zone_arena_refusal with_lease      = held;
+        with_lease.holders.live_zone_bytes = 512;
+        with_lease.holders.chunk_leases    = 1;
+        with_lease.holders.scratch_outside = 3;
+        const std::string wl               = zone_arena_refusal_text(with_lease);
+        CHECK(has(wl, "; 512 bytes of live allocations in its zones and 1 lease on its chunks hold the arena") &&
+                  has(wl, "Free the model or context they belong to"),
+              "live allocations with a lease beside them are not named with the free-the-model remedy");
+        CHECK(!has(wl, "outside") && !has(wl, "scratch"), "scratch allocated outside the arena is named as a holder");
+        // Leases with nothing live in the zones outlived what they point at: no free releases them.
+        zone_arena_refusal leases_only   = held;
+        leases_only.holders              = {};
+        leases_only.holders.chunk_leases = 48;
+        const std::string ll             = zone_arena_refusal_text(leases_only);
+        CHECK(has(ll,
+                  "; 48 leases on its chunks hold the arena (the [VRAM-ARENA] lines above name them), so its "
+                  "zones cannot grow. No allocation is live in its zones, so the leases outlived what they point "
+                  "at and are held until the process exits. Load this model in a new process before any other on "
+                  "device 1"),
+              "leases with nothing live in the zones are not named with the new-process remedy");
+        CHECK(!has(ll, "Free the model"), "leases with nothing live in the zones are blamed on a model to free");
+        // The cache's own scratch buffers inside the arena stay until the process exits, whatever else holds it.
+        zone_arena_refusal scratch_in       = held;
+        scratch_in.holders.live_zone_bytes  = static_cast<size_t>(269.7 * MiB);
+        scratch_in.holders.chunk_leases     = 49;
+        scratch_in.holders.scratch_in_arena = 5;
+        scratch_in.holders.scratch_outside  = 1;
+        const std::string sl                = zone_arena_refusal_text(scratch_in);
+        CHECK(has(sl,
+                  "; 269.7 MB of live allocations in its zones, 49 leases on its chunks and 5 of the cache's own "
+                  "scratch buffers hold the arena (the [VRAM-ARENA] lines above name them), so its zones cannot "
+                  "grow. The cache keeps its own scratch buffers in the arena until the process exits, so freeing "
+                  "a model or context does not let its zones grow. Load this model in a new process before any "
+                  "other on device 1"),
+              "the cache's scratch buffers inside the arena are not named with the new-process remedy");
+        CHECK(!has(sl, "Free the model"), "the cache's own scratch buffers are blamed on a model to free");
+        // Live bytes are a model's or a context's only when the cache has no release of its own still to run: a free
+        // queued in the arena, a release waiting for a retry, a retired entry not yet finalized and an eviction in
+        // flight all keep zone bytes with no owner left. With any of them the remedy says the bytes may be those, and
+        // asks for the load again before it blames a model or context.
+        zone_arena_refusal pending      = held;
+        pending.holders.queued_frees    = 2;
+        pending.holders.release_retries = 1;
+        const std::string pl            = zone_arena_refusal_text(pending);
+        CHECK(has(pl,
+                  "; 4.0 KB of live allocations in its zones hold the arena (the [VRAM-ARENA] lines above name "
+                  "them), so its zones cannot grow. Some of those bytes may be releases the cache has not finished "
+                  "(2 queued frees and 1 release waiting for a retry), which it finishes on its own. Load this one "
+                  "again; if it is refused with the same bytes, free the model or context they belong to"),
+              "live bytes beside the cache's unfinished releases are not named with the load-again remedy");
+        CHECK(!has(pl, ". Free the model or context they belong to, then load this one again"),
+              "live bytes beside the cache's unfinished releases are blamed on a model to free");
+        zone_arena_refusal retiring      = held;
+        retiring.holders.retired_pending = 1;
+        retiring.holders.evictions       = 3;
+        CHECK(has(zone_arena_refusal_text(retiring), "(1 retired entry and 3 evictions in flight)"),
+              "retired entries and evictions in flight are not named as unfinished releases");
+        // Beside the ring the same holds for the bytes live beside it.
+        zone_arena_refusal ring_and_free       = held;
+        ring_and_free.holders.live_zone_bytes  = 3 * MiB;
+        ring_and_free.holders.scratch_in_arena = 3;
+        ring_and_free.holders.ring_in_arena    = 3;
+        ring_and_free.holders.live_beside_ring = 1;
+        ring_and_free.holders.queued_frees     = 1;
+        const std::string rf                   = zone_arena_refusal_text(ring_and_free);
+        CHECK(has(rf,
+                  "Some of those bytes may be releases the cache has not finished (1 queued free), which it "
+                  "finishes on its own"),
+              "a queued free beside the ring is not named as an unfinished release");
+
+        // A shortfall under 0.1 MB would print as 0.0 MB short beside a need and a have that print the same: the short
+        // zone's need, have and shortfall are printed in KB then, and in bytes under 1 KB, so the line still shows
+        // which zone is short and by how much. The figures of the run whose control load was refused 8 KiB short of
+        // RUNTIME.
+        zone_arena_refusal kib_short = held;
+        kib_short.need               = { 512 * MiB, 256 * MiB, 1792 * MiB + 8192 };
+        kib_short.have               = { 512 * MiB, 256 * MiB, 1792 * MiB };
+        const std::string kl         = zone_arena_refusal_text(kib_short);
+        CHECK(has(kl, "RUNTIME need 1835016.0 KB have 1835008.0 KB (8.0 KB short)"),
+              "an 8 KiB RUNTIME shortfall is not printed in KB with the zone's need and have");
+        CHECK(has(kl, "SCRATCH need 512.0 MB have 512.0 MB, ONEDNN need 256.0 MB have 256.0 MB, RUNTIME"),
+              "a zone that fits is not printed in MB beside a short one in KB");
+        CHECK(!has(kl, "MB short"), "an 8 KiB shortfall is printed in MB");
+        zone_arena_refusal bytes_short = kib_short;
+        bytes_short.need.runtime       = 1792 * MiB + 512;
+        CHECK(has(zone_arena_refusal_text(bytes_short),
+                  "RUNTIME need 1879048704 bytes have 1879048192 bytes (512 bytes short)"),
+              "a 512-byte RUNTIME shortfall is not printed in bytes with the zone's need and have");
+        // 0.1 MB is 104857.6 bytes: a shortfall one byte under it is printed in KB, one byte over it in MB.
+        zone_arena_refusal edge = kib_short;
+        edge.need.runtime       = 1792 * MiB + 104857;
+        CHECK(has(zone_arena_refusal_text(edge), "(102.4 KB short)"), "a shortfall just under 0.1 MB is not in KB");
+        edge.need.runtime = 1792 * MiB + 104858;
+        CHECK(has(zone_arena_refusal_text(edge), "RUNTIME need 1792.1 MB have 1792.0 MB (0.1 MB short)"),
+              "a shortfall of 0.1 MB is not printed in MB");
+
+        // A reserve that failed after a rebuild destroyed the arena: the device has no zones now, which the have says,
+        // and the arena it had is named apart as released for the rebuild.
+        zone_arena_refusal reserve = held;
+        reserve.reason             = zone_arena_refusal_reason::RESERVE_FAILED;
+        reserve.have               = {};
+        reserve.released           = held.have;
+        const std::string rl       = zone_arena_refusal_text(reserve);
+        CHECK(has(rl, "RUNTIME need 1985.0 MB have 0.0 MB (1985.0 MB short)"), "a reserve failure's need or have");
+        CHECK(has(rl,
+                  "; the device could not reserve an arena with these zones, and the arena it had (SCRATCH "
+                  "512.0 MB, ONEDNN 256.0 MB, RUNTIME 1792.0 MB) was released for the rebuild. Free VRAM on "
+                  "device 1, then load this one again"),
+              "a reserve failure after a rebuild does not say the arena it had was released, or its remedy");
+        CHECK(!has(rl, "hold the arena"), "a reserve failure blames holders");
+        // The first reserve on a device released nothing.
+        zone_arena_refusal first_reserve = reserve;
+        first_reserve.released           = {};
+        const std::string fl             = zone_arena_refusal_text(first_reserve);
+        CHECK(has(fl,
+                  "; the device could not reserve an arena with these zones. Free VRAM on device 1, then load "
+                  "this one again") &&
+                  !has(fl, "released"),
+              "a first reserve's failure names an arena released for a rebuild");
+
+        zone_arena_refusal no_cache;
+        no_cache.reason      = zone_arena_refusal_reason::NO_CACHE;
+        no_cache.device      = 0;
+        const std::string nl = zone_arena_refusal_text(no_cache);
+        CHECK(has(nl, "refused on device 0: ") && has(nl, "no unified cache"), "a missing cache is not named");
+
+        CHECK(zone_arena_refusal_text(zone_arena_refusal{}).empty(), "a refusal with no reason printed a line");
+    }
+
+    // ---- Case 39: a load refused because the arena could not be torn down says why, and whether it is still usable
+    // A rebuild tears the arena down before it reserves the larger one. A teardown that refuses after it closed the
+    // arena leaves it closed to new allocations, so no reserve may follow it and no later load in the process can use
+    // the device's arena: the line says so and sends the load to a new process. A teardown that refused before it
+    // closed the arena (the host could not reserve its bookkeeping) left it as it was, and the load may be retried.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_arena_refusal;
+        using ggml_sycl::zone_arena_refusal_reason;
+        using ggml_sycl::zone_arena_refusal_text;
+        using ggml_sycl::zone_arena_teardown_left_closed;
+        using ggml_sycl::zone_arena_teardown_refusal;
+
+        const auto has = [](const std::string & text, const char * part) {
+            return text.find(part) != std::string::npos;
+        };
+
+        CHECK(!zone_arena_teardown_left_closed(zone_arena_teardown_refusal::NONE), "no refusal left the arena closed");
+        CHECK(!zone_arena_teardown_left_closed(zone_arena_teardown_refusal::HOST_STATE),
+              "a refusal before the teardown closed the arena left it closed");
+        for (const zone_arena_teardown_refusal closed :
+             { zone_arena_teardown_refusal::LIVE_ALLOCATIONS, zone_arena_teardown_refusal::DRAIN_SNAPSHOT,
+               zone_arena_teardown_refusal::DRAIN_TIMEOUT, zone_arena_teardown_refusal::FREE_FAILED }) {
+            CHECK(zone_arena_teardown_left_closed(closed),
+                  "a refusal after the teardown closed the arena left it open");
+        }
+
+        zone_arena_refusal torn;
+        torn.reason          = zone_arena_refusal_reason::TEARDOWN_REFUSED;
+        torn.device          = 1;
+        torn.need            = { 512 * MiB, 256 * MiB, 1985 * MiB };
+        torn.have            = { 512 * MiB, 256 * MiB, 1792 * MiB };
+        torn.teardown        = zone_arena_teardown_refusal::FREE_FAILED;
+        const std::string fl = zone_arena_refusal_text(torn);
+        CHECK(fl.rfind("[SYCL-PLAN] model load refused on device 1: ", 0) == 0, "the refusal does not name its device");
+        CHECK(has(fl, "RUNTIME need 1985.0 MB have 1792.0 MB (193.0 MB short)"), "the RUNTIME need, have or shortfall");
+        CHECK(has(fl,
+                  "; the arena could not be torn down: the device refused to free one of its chunks, so part of it "
+                  "may already be freed. The arena stays closed to new allocations, so no model can load on device "
+                  "1 in this process. Load this model in a new process"),
+              "a chunk the device refused to free is not named with the closed arena and the new-process remedy");
+        CHECK(!has(fl, "hold the arena") && !has(fl, "Free VRAM") && !has(fl, "load this one again"),
+              "a refused teardown is given another reason's remedy");
+
+        const auto closed_text = [&](zone_arena_teardown_refusal cause) {
+            zone_arena_refusal closed = torn;
+            closed.teardown           = cause;
+            return zone_arena_refusal_text(closed);
+        };
+        const std::string ll = closed_text(zone_arena_teardown_refusal::LIVE_ALLOCATIONS);
+        const std::string sl = closed_text(zone_arena_teardown_refusal::DRAIN_SNAPSHOT);
+        const std::string tl = closed_text(zone_arena_teardown_refusal::DRAIN_TIMEOUT);
+        CHECK(has(ll, ": allocations were still live in it when the teardown closed it. The arena stays closed"),
+              "live allocations at the teardown are not named with the closed arena");
+        CHECK(has(sl, ": the host could not record the allocations the teardown waits on. The arena stays closed"),
+              "a drain snapshot the host could not take is not named with the closed arena");
+        CHECK(has(tl,
+                  ": a lease on one of its allocations did not end while the teardown waited. The arena stays "
+                  "closed"),
+              "a drain that timed out is not named with the closed arena");
+        CHECK(has(ll, "Load this model in a new process") && has(sl, "Load this model in a new process") &&
+                  has(tl, "Load this model in a new process"),
+              "a cause that left the arena closed is not given the new-process remedy");
+
+        zone_arena_refusal host_state = torn;
+        host_state.teardown           = zone_arena_teardown_refusal::HOST_STATE;
+        const std::string hl          = zone_arena_refusal_text(host_state);
+        CHECK(has(hl,
+                  "; the arena could not be torn down: the host could not reserve the teardown's own bookkeeping, "
+                  "and the arena is as it was. Free host memory, then load this one again"),
+              "a teardown refused before it closed the arena is not named with the arena intact and its remedy");
+        CHECK(!has(hl, "stays closed") && !has(hl, "new process"), "an intact arena is described as closed");
+
+        // A refusal that names no cause cannot say the arena is intact, so it is read as closed.
+        zone_arena_refusal no_cause = torn;
+        no_cause.teardown           = zone_arena_teardown_refusal::NONE;
+        const std::string nl        = zone_arena_refusal_text(no_cause);
+        CHECK(has(nl, "; the arena could not be torn down. The arena stays closed") &&
+                  has(nl, "Load this model in a new process"),
+              "a refused teardown with no cause is not read as closed");
+    }
+
+    // ---- Case 40: a load releases the PP MoE ring only when the ring alone keeps the arena from a rebuild it needs
+    // The ring is the cache's, not a model's: it outlives the context that sized it. A load may release it to rebuild
+    // the arena, but only as the last resort, when a rebuild is needed and the ring's slot buffers are the only
+    // holders. Any other holder refuses the rebuild whatever happens to the ring, so the load must not release a ring a
+    // live context may be using. A scratch buffer outside the arena holds nothing, so it does not stop the release.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_arena_holders;
+        using ggml_sycl::zone_arena_only_ring_holds;
+        using ggml_sycl::zone_arena_refusal;
+        using ggml_sycl::zone_arena_refusal_reason;
+        using ggml_sycl::zone_arena_refusal_text;
+
+        const auto has = [](const std::string & text, const char * part) {
+            return text.find(part) != std::string::npos;
+        };
+
+        // a depth-2 ring left by a freed context: six slot buffers, 96 MB in the zones, nothing else in the arena
+        zone_arena_holders ring_only;
+        ring_only.live_zone_bytes  = 96 * MiB;
+        ring_only.scratch_in_arena = 6;
+        ring_only.ring_in_arena    = 6;
+        CHECK(zone_arena_only_ring_holds(true, ring_only), "a ring alone in an arena that must grow was not released");
+        CHECK(!zone_arena_only_ring_holds(false, ring_only), "a ring was released for an arena that need not grow");
+        zone_arena_holders ring_outside = ring_only;
+        ring_outside.scratch_outside    = 2;
+        CHECK(zone_arena_only_ring_holds(true, ring_outside), "scratch outside the arena kept a lone ring");
+
+        // each other holder keeps the ring, down to one allocation, one lease or one other scratch buffer
+        zone_arena_holders ring_and_live = ring_only;
+        ring_and_live.live_beside_ring   = 1;
+        CHECK(!zone_arena_only_ring_holds(true, ring_and_live), "a ring beside a live allocation was released");
+        zone_arena_holders ring_and_lease = ring_only;
+        ring_and_lease.chunk_leases       = 1;
+        CHECK(!zone_arena_only_ring_holds(true, ring_and_lease), "a ring beside a chunk lease was released");
+        zone_arena_holders ring_and_scratch = ring_only;
+        ring_and_scratch.scratch_in_arena   = 7;
+        CHECK(!zone_arena_only_ring_holds(true, ring_and_scratch), "a ring beside other cache scratch was released");
+        // no ring inside the arena: nothing to release
+        CHECK(!zone_arena_only_ring_holds(true, zone_arena_holders{}), "an arena with no ring had a ring to release");
+        zone_arena_holders ring_outside_only;
+        ring_outside_only.scratch_outside = 6;
+        CHECK(!zone_arena_only_ring_holds(true, ring_outside_only), "a ring outside the arena was released for it");
+
+        // The refusal a load logs when the release kept the ring (a prefill's claim on one of its slots is held): the
+        // ring is the cache's, so no model or context frees it, and it is released on a later load, not only at
+        // process exit. The claim outlives its prefill, so waiting for the prefill to finish lets nothing go; freeing
+        // the context that ran it drains the device's slots.
+        zone_arena_refusal held;
+        held.reason          = zone_arena_refusal_reason::REBUILD_HELD;
+        held.device          = 1;
+        held.need            = { 512 * MiB, 256 * MiB, 1985 * MiB };
+        held.have            = { 512 * MiB, 256 * MiB, 1792 * MiB };
+        held.holders         = ring_only;
+        const std::string rl = zone_arena_refusal_text(held);
+        CHECK(has(rl,
+                  "; 96.0 MB of live allocations in its zones and 6 of the cache's own scratch buffers (6 of them "
+                  "its PP MoE ring's slots) hold the arena (the [VRAM-ARENA] lines above name them), so its zones "
+                  "cannot grow. Only the cache's PP MoE ring holds it, and a prefill's claim on one of its slots "
+                  "keeps it: the claim outlives its prefill until a context on device 1 is freed. Free the context "
+                  "that ran the prefill, then load this one again"),
+              "a ring alone in the arena is not named with its remedy");
+        CHECK(!has(rl, "Free the model") && !has(rl, "until the process exits"),
+              "a ring alone in the arena is blamed on a model to free or on the process");
+        CHECK(!has(rl, "has finished"), "a ring alone in the arena is said to be let go when its prefill finishes");
+
+        // the ring beside a live allocation: freeing the model or context releases that, and a later load the ring
+        zone_arena_refusal with_live       = held;
+        with_live.holders.live_beside_ring = 4;
+        const std::string wl               = zone_arena_refusal_text(with_live);
+        CHECK(has(wl, ". Free the model or context they belong to, then load this one again"),
+              "a ring beside a live allocation is not given the free-the-model remedy");
+        CHECK(!has(wl, "until the process exits"), "a ring beside a live allocation is held until the process exits");
+
+        // other cache scratch inside the arena stays until the process exits, ring or no ring
+        zone_arena_refusal with_scratch       = held;
+        with_scratch.holders.scratch_in_arena = 8;
+        const std::string sl                  = zone_arena_refusal_text(with_scratch);
+        CHECK(has(sl, "8 of the cache's own scratch buffers (6 of them its PP MoE ring's slots) hold the arena") &&
+                  has(sl, "The cache keeps its own scratch buffers in the arena until the process exits"),
+              "other cache scratch beside the ring is not given the new-process remedy");
+
+        // leases beside the ring with nothing else live outlived what they point at
+        zone_arena_refusal with_lease   = held;
+        with_lease.holders.chunk_leases = 2;
+        const std::string ll            = zone_arena_refusal_text(with_lease);
+        CHECK(has(ll,
+                  ". Nothing but the cache's PP MoE ring is live in its zones, so the leases outlived what they "
+                  "point at and are held until the process exits. Load this model in a new process before any "
+                  "other on device 1"),
+              "leases beside the ring alone are not named with the new-process remedy");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

@@ -2128,7 +2128,7 @@ def _brace_block(code: str, open_idx: int) -> str:
     raise AssertionError("unbalanced braces")
 
 
-_PLANNER_FN = "static void compute_and_store_plan_for_inventory("
+_PLANNER_FN = "static bool compute_and_store_plan_for_inventory("
 # The planner asks the one multi-device gate the plan dry run also asks, with the expert fact. A model without
 # experts plans every visible GPU; a model with experts does only on the cross-card expert opt-in.
 _GATE_FN = "static bool ggml_sycl_plan_multi_device(bool has_experts) {"
