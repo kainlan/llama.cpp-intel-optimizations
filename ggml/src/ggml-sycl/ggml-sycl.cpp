@@ -18655,6 +18655,14 @@ static void ggml_sycl_run_inventory_effects(const ggml_sycl_inventory_effects & 
     }
 }
 
+// An early pass's effect for the device it planned, run after every refusal of the pass is decided: the stale ring's
+// release, before create_tensor places weights in the zone the ring's slots hold. Takes g_tensor_inventory_mutex, which
+// the decide step held for the same work, so the stage that calls it never takes the inventory lock itself.
+static void ggml_sycl_run_early_inventory_effect(int device) {
+    std::lock_guard lock(g_tensor_inventory_mutex);
+    ggml_sycl_release_stale_kv_zone_ring(device);
+}
+
 // Compute placement plan early — before create_tensor in the llama loader.
 // Populates inventory globals and runs the planner so create_tensor's
 // per-tensor buft selection can consult (*global_plan).  Skips the
@@ -18700,8 +18708,7 @@ void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t              
                                                     const ggml_sycl_tensor_inventory * inventory) {
     const int device = ggml_sycl_compute_placement_plan_early_impl(backend, inventory, nullptr);
     if (device >= 0) {
-        std::lock_guard lock(g_tensor_inventory_mutex);
-        ggml_sycl_release_stale_kv_zone_ring(device);
+        ggml_sycl_run_early_inventory_effect(device);
     }
 }
 
@@ -19267,11 +19274,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 ggml_sycl::lifecycle_stage_probe_placement_plan(txn, ggml_sycl::placement_plan(*candidate->plan),
                                                                 candidate->kv_info, candidate->model_n_layer);
             }
-            // The early pass's effect: the stale ring's release on each device it planned, before create_tensor places
-            // weights in the zone the ring's slots hold.
+            // The early pass's effect on each device it planned. The helper takes the inventory lock; the stage does not.
             for (const int device : early_devices) {
-                std::lock_guard lock(g_tensor_inventory_mutex);
-                ggml_sycl_release_stale_kv_zone_ring(device);
+                ggml_sycl_run_early_inventory_effect(device);
             }
         } else {
             // The late pass's effects, device by device, each from the snapshot that device staged. Each device's

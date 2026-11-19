@@ -11,9 +11,11 @@ compute_and_store_plan_for_inventory, the micro-batch publish, either planner en
 planned KV-zone flag write, which the abort of a refused load puts back.
 
 Neither planner entry changes a device: layer streaming's build_layer_map, register_host_ptr and allocate_buffers, and
-the stale KV-zone ring's release, run only in the effect step (ggml_sycl_run_inventory_effects and
-ggml_sycl_release_stale_kv_zone_ring). The late entry hands what it decided back in a ggml_sycl_inventory_effects record
-that carries its own copy of the streamed inventory; no record lives outside a function.
+the stale KV-zone ring's release, run only in the effect step (ggml_sycl_run_inventory_effects for a late pass,
+ggml_sycl_run_early_inventory_effect for an early one, both through ggml_sycl_release_stale_kv_zone_ring). The late entry
+hands what it decided back in a ggml_sycl_inventory_effects record that carries its own copy of the streamed inventory;
+no record lives outside a function. Each effect helper takes g_tensor_inventory_mutex for its own work and the stage
+never takes it, so the stage provisions its retained snapshots outside the inventory lock.
 
 In the stage, the decide loop runs no effect, and the per-device test failure sits inside it, so a failure after the
 first device runs no effect for it. Every PLAN_REJECTED and EFFECT_FAILED return of the stage comes before its first
@@ -124,6 +126,7 @@ EARLY_SIG = "static int ggml_sycl_compute_placement_plan_early_impl("
 LATE_SIG = "static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl("
 ENSURE_LOAD_SIG = "static bool ggml_sycl_ensure_load_arena_zones("
 EFFECTS_SIG = "static void ggml_sycl_run_inventory_effects("
+EARLY_EFFECT_SIG = "static void ggml_sycl_run_early_inventory_effect("
 STALE_SIG = "static void ggml_sycl_release_stale_kv_zone_ring("
 STAGE_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan("
 EXPORTED_EARLY_SIG = "void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t backend,"
@@ -139,8 +142,9 @@ ONLY_RING_GUARD = ("if (!ggml_sycl::zone_arena_only_ring_holds(refusal.reason ==
 FLAG_WRITE = "ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(ctx->device, false, false);"
 STREAM_CALLS = ("build_layer_map(", "register_host_ptr(", "allocate_buffers(")
 CONFIGURE = "ggml_sycl_configure_host_zones_for_plan("
-EFFECT_CALLS = ("ggml_sycl_run_inventory_effects(", CONFIGURE, STALE_RELEASE, RING_RELEASE,
-                "lifecycle_stage_probe_placement_plan(") + STREAM_CALLS
+EFFECT_CALLS = ("ggml_sycl_run_inventory_effects(", "ggml_sycl_run_early_inventory_effect(", CONFIGURE, STALE_RELEASE,
+                RING_RELEASE, "lifecycle_stage_probe_placement_plan(") + STREAM_CALLS
+INVENTORY_LOCK = "g_tensor_inventory_mutex"
 DECIDE_LOOP = "for (int i = 0; i < n_devices; ++i) {"
 EFFECT_LOOP = "for (const late_decision & decision : late_decisions) {"
 TEST_FAILURE = 'throw std::runtime_error("deterministic stage_load_inventory_plan failure");'
@@ -194,7 +198,8 @@ def claim_entries_change_no_device(gs: str) -> bool:
     c = code(gs)
     early, late = fn_body(c, EARLY_SIG), fn_body(c, LATE_SIG)
     effects, stale = fn_body(c, EFFECTS_SIG), fn_body(c, STALE_SIG)
-    if not (early and late and effects and stale):
+    early_effect = fn_body(c, EARLY_EFFECT_SIG)
+    if not (early and late and effects and stale and early_effect):
         return False
     banned = STREAM_CALLS + (CONFIGURE, RING_RELEASE, STALE_RELEASE)
     if any(t in early or t in late for t in banned):
@@ -209,8 +214,10 @@ def claim_entries_change_no_device(gs: str) -> bool:
         and late.count("effects = std::move(decided);") == 1
         and ordered(late, "if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) {",
                     "return {}; }", "effects = std::move(decided);")
+        and ordered(early_effect, "std::lock_guard lock(g_tensor_inventory_mutex);",
+                    "ggml_sycl_release_stale_kv_zone_ring(device);")
         and ordered(fn_body(c, EXPORTED_EARLY_SIG), "ggml_sycl_compute_placement_plan_early_impl(backend, inventory, "
-                    "nullptr);", "if (device >= 0) {", "ggml_sycl_release_stale_kv_zone_ring(device);")
+                    "nullptr);", "if (device >= 0) {", "ggml_sycl_run_early_inventory_effect(device);")
         and ordered(fn_body(c, EXPORTED_LATE_SIG), "ggml_sycl_set_tensor_inventory_impl(backend, inventory, nullptr, "
                     "effects);", "ggml_sycl_run_inventory_effects(effects);")
     )
@@ -248,6 +255,11 @@ def claim_stage_decides_every_refusal_before_any_effect(gs: str) -> bool:
         return False
     after_configure = st[st.find(CONFIGURE) :]
     return after_configure.count("return ") == 1 and FINAL_RETURN in after_configure
+
+
+def claim_stage_takes_no_inventory_lock(gs: str) -> bool:
+    st = fn_body(code(gs), STAGE_SIG)
+    return bool(st) and INVENTORY_LOCK not in st and "ggml_sycl_run_early_inventory_effect(device);" in st
 
 
 def claim_effects_check_the_last_snapshot(gs: str) -> bool:
@@ -397,6 +409,18 @@ def test_witness_test_failure_after_the_effects():
     mutated = mutate_in(GS, STAGE_SIG, TEST_FAILURE, "")
     mutated = mutate_in(mutated, STAGE_SIG, "rollback.released = true;", TEST_FAILURE + " rollback.released = true;")
     assert not claim_stage_decides_every_refusal_before_any_effect(mutated)
+
+
+def test_stage_takes_no_inventory_lock():
+    assert claim_stage_takes_no_inventory_lock(GS), (
+        "the stage takes g_tensor_inventory_mutex itself, or its early effect does not go through the helper that "
+        "takes it: provisioning must run outside the inventory lock, which the effect helpers hold only for their work")
+
+
+def test_witness_stage_locks_the_early_effect_inline():
+    mutated = mutate_in(GS, STAGE_SIG, "ggml_sycl_run_early_inventory_effect(device);",
+                        "std::lock_guard lock(g_tensor_inventory_mutex); ggml_sycl_release_stale_kv_zone_ring(device);")
+    assert not claim_stage_takes_no_inventory_lock(mutated)
 
 
 def test_effects_check_the_last_snapshot():
