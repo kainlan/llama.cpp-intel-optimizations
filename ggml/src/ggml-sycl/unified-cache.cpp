@@ -2180,7 +2180,7 @@ static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry
 // because EVERY mutation of the registry goes through the runtime_registry_*_locked helpers below; no other code may
 // emplace, erase or assign a row (tests/test-sycl-runtime-registry-index-source.py enforces it). A registered row's
 // handle.ptr and handle.size must not change, since the index keeps the geometry it was given at insertion.
-// Declared before g_device_caches for the reason given there: the caches' destructors erase rows.
+// Outlives the caches for the reason given at unified_cache_device_caches(): the caches' destructors erase rows.
 static address_range_index g_runtime_alloc_index;
 
 // Settle-side counters over the same rows, guarded by g_runtime_alloc_mutex and written ONLY by
@@ -2200,11 +2200,27 @@ static size_t g_runtime_host_zone_rows[static_cast<size_t>(host_zone_id::COUNT)]
 static size_t g_runtime_host_zone_graph_rows[static_cast<size_t>(host_zone_id::COUNT)];
 static size_t g_runtime_span_irregular_rows = 0;
 
-// Keep cache owners later in declaration order than the registry they call from
-// unified_cache::~unified_cache(). Reverse static destruction then tears caches
-// down first instead of asking release_registered_allocation_owned() to access
-// an already-destroyed unordered_map.
-static std::unordered_map<int, std::shared_ptr<unified_cache>> g_device_caches;
+// The per-device caches, the sole owners of every unified_cache. Every use goes through this accessor; the map is never
+// a namespace-scope object, because at exit static objects are destroyed in the reverse order of their construction
+// and ~unified_cache needs two kinds of object still alive:
+//  - dpct's device manager. The teardown asks it which device a queue is on, on the abandon path too. The manager is
+//    the function-local static of dpct::dev_mgr::instance(), constructed at its first use; touching it here, before
+//    the map's own static is reached, constructs it first if nothing has yet, so the map is destroyed before it. dpct's
+//    device_memory makes the same touch for the same reason.
+//  - the runtime allocation registry and its index above, whose rows the caches' destructors erase. The map is
+//    constructed at its first use, after every namespace-scope object of this file, so it is destroyed before them;
+//    that includes g_cache_rw_mutex, the lock that guards it.
+// A touch whose construction throws is left to the device manager's own users, as it was before the touch existed: the
+// map is still handed out, and the order then holds only if no later use constructs the manager. With no device at all
+// the manager constructs empty and does not throw.
+static std::unordered_map<int, std::shared_ptr<unified_cache>> & unified_cache_device_caches() {
+    try {
+        (void) dpct::dev_mgr::instance();
+    } catch (...) {
+    }
+    static std::unordered_map<int, std::shared_ptr<unified_cache>> caches;
+    return caches;
+}
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool> g_test_pause_registry_claim{ false };
 static std::atomic<bool> g_test_registry_claim_reached{ false };
@@ -18828,11 +18844,12 @@ static int resolve_effective_device(int device) {
 
 // Helper: Look up existing cache under shared (read) lock.
 // Returns nullptr if cache doesn't exist yet.  Safe for hot-path use
-// because g_device_caches entries are never erased during inference.
+// because the map's entries are never erased during inference.
 static unified_cache * get_cache_shared(int effective_device) {
+    auto &                              device_caches = unified_cache_device_caches();
     std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-    auto                                it = g_device_caches.find(effective_device);
-    if (it == g_device_caches.end() || !it->second) {
+    auto                                it = device_caches.find(effective_device);
+    if (it == device_caches.end() || !it->second) {
         return nullptr;
     }
     return it->second.get();
@@ -19796,10 +19813,11 @@ void cpu_job_signal_ring_shutdown_for_testing(const std::shared_ptr<cpu_job_sign
 #endif
 
 // Direct arena zone query — caller MUST hold g_cache_rw_mutex.
-// Accesses g_device_caches without re-acquiring the lock.
+// Reads the per-device caches without re-acquiring the lock.
 static size_t arena_non_weight_used_locked(int device_id) {
-    auto it = g_device_caches.find(device_id);
-    if (it == g_device_caches.end() || !it->second || !it->second->arena_active()) {
+    auto & device_caches = unified_cache_device_caches();
+    auto   it            = device_caches.find(device_id);
+    if (it == device_caches.end() || !it->second || !it->second->arena_active()) {
         return 0;
     }
     return it->second->zone_used(vram_zone_id::KV) + it->second->zone_used(vram_zone_id::ONEDNN) +
@@ -19893,6 +19911,11 @@ static unified_cache * create_cache_for_device(int                     device_id
                                                size_t *                deferred_reserved_out = nullptr,
                                                const device_mem_hint * hint                  = nullptr,
                                                sycl::queue *           queue_override        = nullptr) {
+    // Taken before any cache is constructed, in a statement of its own: the right operand of the assignment below is
+    // evaluated first. A cache's constructor registers the exit handler that marks SYCL as shutting down, and that
+    // handler must run before the map is destroyed, which holds only when the map was constructed first.
+    auto & device_caches = unified_cache_device_caches();
+
     // Get queue for this device.  Always prefer the single-device context
     // queue ensure_single_device_context_queue() builds directly via `new
     // sycl::queue(ctx, dev, default_queue_properties())` over
@@ -20052,10 +20075,9 @@ static unified_cache * create_cache_for_device(int                     device_id
     // Before the cache makes its arena, from the reading taken above for it.
     unified_cache_note_raw_gate_outside_accounting(device_id, detected_total_mem, detected_free_mem);
     try {
-        g_device_caches[device_id] =
-            std::make_unique<unified_cache>(queue, budget, staging_bytes, dma_reserve_bytes, total_vram_for_ctor,
-                                            resolved_budget_pct, resolved_headroom, resolved_base_mem,
-                                            authority_resolved);
+        device_caches[device_id] = std::make_unique<unified_cache>(
+            queue, budget, staging_bytes, dma_reserve_bytes, total_vram_for_ctor, resolved_budget_pct,
+            resolved_headroom, resolved_base_mem, authority_resolved);
         // Always baseline pre-existing runtime reservations so they don't
         // eat into the cache's weight budget.  Allocations that existed before
         // cache creation (DMA pre-reserve, probe residuals) are already
@@ -20071,9 +20093,9 @@ static unified_cache * create_cache_for_device(int                     device_id
         if (deferred_reserved_out) {
             *deferred_reserved_out = reserved_adjusted;
         } else if (reserved_adjusted > 0) {
-            g_device_caches[device_id]->update_reserved_bytes(reserved_adjusted);
+            device_caches[device_id]->update_reserved_bytes(reserved_adjusted);
         }
-        return g_device_caches[device_id].get();
+        return device_caches[device_id].get();
     } catch (const sycl::exception & e) {
         GGML_LOG_ERROR("[UNIFIED-CACHE] Failed to initialize device %d: %s\n", device_id, e.what());
         return nullptr;
@@ -20084,11 +20106,12 @@ unified_cache * get_unified_cache(sycl::queue & queue) {
     unified_cache_mode mode      = get_effective_mode();
     int                device_id = (mode == unified_cache_mode::GLOBAL) ? 0 : get_device_id_from_queue(queue);
 
+    auto & device_caches = unified_cache_device_caches();
     // Fast path: check under shared lock (no contention during inference)
     {
         std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
-        auto                                it = g_device_caches.find(device_id);
-        if (it != g_device_caches.end()) {
+        auto                                it = device_caches.find(device_id);
+        if (it != device_caches.end()) {
             return it->second.get();
         }
     }
@@ -20101,8 +20124,8 @@ unified_cache * get_unified_cache(sycl::queue & queue) {
         g_cache_mode_locked = true;
 
         // Double-check after acquiring write lock
-        auto it = g_device_caches.find(device_id);
-        if (it != g_device_caches.end()) {
+        auto it = device_caches.find(device_id);
+        if (it != device_caches.end()) {
             return it->second.get();
         }
 
@@ -20123,12 +20146,13 @@ static unified_cache * get_unified_cache_for_device_impl(int device_id, const de
     if (effective_device < 0 || effective_device >= GGML_SYCL_MAX_DEVICES) {
         return nullptr;
     }
+    auto & device_caches = unified_cache_device_caches();
 
     // Fast path: check under shared lock (no contention during inference)
     {
         std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
-        auto                                it = g_device_caches.find(effective_device);
-        if (it != g_device_caches.end()) {
+        auto                                it = device_caches.find(effective_device);
+        if (it != device_caches.end()) {
             return it->second.get();
         }
     }
@@ -20153,8 +20177,8 @@ static unified_cache * get_unified_cache_for_device_impl(int device_id, const de
         g_cache_mode_locked = true;
 
         // Double-check after acquiring write lock
-        auto it = g_device_caches.find(effective_device);
-        if (it != g_device_caches.end()) {
+        auto it = device_caches.find(effective_device);
+        if (it != device_caches.end()) {
             return it->second.get();
         }
 
@@ -23535,7 +23559,7 @@ bool unified_cache_is_budget_exceeded(int device) {
 
 bool unified_cache_has_evictions() {
     std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
-    for (auto & [device_id, cache] : g_device_caches) {
+    for (auto & [device_id, cache] : unified_cache_device_caches()) {
         if (cache && cache->has_evictions()) {
             return true;
         }
@@ -23702,7 +23726,7 @@ bool unified_cache_should_offload_kv(int device, size_t kv_estimate_bytes) {
 void unpin_all_experts() {
     std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
     // Unpin in all caches (cache pointers stable during inference)
-    for (auto & [device_id, cache] : g_device_caches) {
+    for (auto & [device_id, cache] : unified_cache_device_caches()) {
         if (cache) {
             cache->unpin_experts();
         }
@@ -25401,11 +25425,12 @@ void unified_cache_free_partial_entries(int device) {
 }
 
 unified_cache * unified_cache_register_for_queue(int device_id, sycl::queue & queue) {
+    auto & device_caches = unified_cache_device_caches();
     // Fast path: check under shared lock
     {
         std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
-        auto                                it = g_device_caches.find(device_id);
-        if (it != g_device_caches.end()) {
+        auto                                it = device_caches.find(device_id);
+        if (it != device_caches.end()) {
             return it->second.get();
         }
     }
@@ -25417,8 +25442,8 @@ unified_cache * unified_cache_register_for_queue(int device_id, sycl::queue & qu
         std::unique_lock<std::shared_mutex> lock(g_cache_rw_mutex);
 
         // Double-check after acquiring write lock
-        auto it = g_device_caches.find(device_id);
-        if (it != g_device_caches.end()) {
+        auto it = device_caches.find(device_id);
+        if (it != device_caches.end()) {
             return it->second.get();
         }
 
@@ -25817,9 +25842,10 @@ static bool runtime_allocation_owned_by_cache_snapshot(const runtime_alloc_recor
 }
 
 static runtime_allocation_owner_snapshot capture_runtime_allocation_owner_snapshot() {
+    const auto &                      device_caches = unified_cache_device_caches();
     runtime_allocation_owner_snapshot snapshot;
-    snapshot.reserve(g_device_caches.size());
-    for (const auto & item : g_device_caches) {
+    snapshot.reserve(device_caches.size());
+    for (const auto & item : device_caches) {
         if (item.second) {
             snapshot.push_back(item);
         }
@@ -25877,7 +25903,7 @@ bool unified_cache_shutdown_state_clean() noexcept {
         runtime_allocation_owner_snapshot owner_snapshot;
         {
             std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-            if (!g_device_caches.empty() || g_live_arena_chunks.load(std::memory_order_acquire) != 0) {
+            if (!unified_cache_device_caches().empty() || g_live_arena_chunks.load(std::memory_order_acquire) != 0) {
                 return false;
             }
             for (const auto * queue : g_shared_ctx_queues) {
@@ -25900,9 +25926,10 @@ bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept {
     out[2] = 0;
     out[3] = 0;
     try {
+        const auto &                        device_caches = unified_cache_device_caches();
         std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-        out[0] = g_device_caches.size();
-        for (const auto & item : g_device_caches) {
+        out[0] = device_caches.size();
+        for (const auto & item : device_caches) {
             if (item.second && item.second->arena_active()) {
                 ++out[1];
             }
@@ -25983,9 +26010,10 @@ bool unified_cache_role_bytes_for_testing(int device, alloc_role role, uint64_t 
     try {
         {
             // Observational, like the validator: never create a cache merely to read it.
+            const auto &                        device_caches = unified_cache_device_caches();
             std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-            const auto                          it = g_device_caches.find(device);
-            if (it == g_device_caches.end() || !it->second) {
+            const auto                          it = device_caches.find(device);
+            if (it == device_caches.end() || !it->second) {
                 return false;
             }
         }
@@ -26103,18 +26131,19 @@ bool shutdown_unified_cache() {
     // mem_handle release callbacks cannot deadlock on cache lookup.
     //
     // llama.cpp-me60: this capture -- and owner_snapshot right beside it,
-    // which is just g_device_caches's own contents in a different container
+    // which is just the per-device caches in a different container
     // (compare capture_runtime_allocation_owner_snapshot()'s body to this
     // block) -- moved ahead of the pre-teardown census below, specifically
     // so the drain-and-reclaim pass just after it can run before that
     // census. Module mutation admission is closed. Retain a stable owner
     // snapshot, then drop the map lock before callbacks/free paths that may
     // re-enter cache lookup or allocation bookkeeping.
+    auto &                                                  device_caches = unified_cache_device_caches();
     std::unordered_map<int, std::shared_ptr<unified_cache>> caches;
     runtime_allocation_owner_snapshot                      owner_snapshot;
     {
         std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-        caches = g_device_caches;
+        caches         = device_caches;
         owner_snapshot = capture_runtime_allocation_owner_snapshot();
     }
 
@@ -26188,7 +26217,7 @@ bool shutdown_unified_cache() {
     // flag is still false (see its own comment there). A true flag on entry
     // means an earlier writer already committed to abandonment: either the
     // previously completed shutdown_unified_cache() (which cleared
-    // g_device_caches before storing the flag, so this loop would be empty),
+    // the per-device caches before storing the flag, so this loop would be empty),
     // or one of the other writers -- the atexit handler, a reactivation
     // rollback, shutdown_resources()'s invalid-context path, or this
     // function's own per-cache probe below from an earlier call whose census
@@ -26281,7 +26310,7 @@ bool shutdown_unified_cache() {
         // Detach cache owners atomically, then destroy the last shared_ptr
         // snapshots outside the lock so canonical mem_handle destruction can
         // unregister/free pinned backing exactly once.
-        g_device_caches.clear();
+        device_caches.clear();
         g_cache_mode_locked.store(false, std::memory_order_release);
         // The join queue's owner was one of these caches, and a refusal was about their streams (llama.cpp-wfsl):
         // a rebuilt backend starts the join queue's guard afresh rather than keeping a stale owner or refusal.
@@ -29168,11 +29197,12 @@ void unified_cache_host_scratch_drop_context(uint64_t context_key) {
     }
     // The caches are collected under the map's read lock and their ledgers touched after it is released, so the
     // ledger's leaf mutex is never taken under g_cache_rw_mutex. A cache lives until module shutdown.
+    const auto &                 device_caches = unified_cache_device_caches();
     std::vector<unified_cache *> caches;
     {
         std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
-        caches.reserve(g_device_caches.size());
-        for (const auto & entry : g_device_caches) {
+        caches.reserve(device_caches.size());
+        for (const auto & entry : device_caches) {
             if (entry.second) {
                 caches.push_back(entry.second.get());
             }
@@ -29318,7 +29348,7 @@ void unified_cache_reset_model_weight_entries(int device_id, weight_reclaim_mode
 // (and reserves its VRAM arena) on miss, which model teardown must never do.
 void unified_cache_set_live_model_mask(uint32_t mask) {
     std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
-    for (auto & [device_id, cache] : g_device_caches) {
+    for (auto & [device_id, cache] : unified_cache_device_caches()) {
         if (cache) {
             cache->set_live_model_mask(mask);
         }
@@ -29366,7 +29396,7 @@ bool unified_cache_note_model_load_abort(uint64_t load_txn_id) noexcept {
         lazy_decline_forget(load_txn_id);
         bool clean = true;
         std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
-        for (auto & [device_id, cache] : g_device_caches) {
+        for (auto & [device_id, cache] : unified_cache_device_caches()) {
             if (cache) {
                 clean = cache->note_model_load_abort(load_txn_id) && clean;
             }
@@ -29548,7 +29578,7 @@ static void unified_cache_dump_capture_load_end(int             dev,
 void unified_cache_note_model_load_end(uint32_t slot, uint64_t load_txn_id) {
     lazy_decline_forget(load_txn_id);
     std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
-    for (auto & [device_id, cache] : g_device_caches) {
+    for (auto & [device_id, cache] : unified_cache_device_caches()) {
         if (cache) {
             cache->note_model_load_end(slot, load_txn_id);
             unified_cache_dump_capture_load_end(device_id, cache.get(), slot, load_txn_id);
@@ -29559,7 +29589,7 @@ void unified_cache_note_model_load_end(uint32_t slot, uint64_t load_txn_id) {
 size_t unified_cache_release_model_slot(uint32_t slot) {
     size_t                              reclaimed = 0;
     std::shared_lock<std::shared_mutex> read_lock(g_cache_rw_mutex);
-    for (auto & [device_id, cache] : g_device_caches) {
+    for (auto & [device_id, cache] : unified_cache_device_caches()) {
         if (cache) {
             reclaimed += cache->release_model_slot(slot);
             if (dump_dev_valid(device_id) && slot < MODEL_SLOT_COUNT) {

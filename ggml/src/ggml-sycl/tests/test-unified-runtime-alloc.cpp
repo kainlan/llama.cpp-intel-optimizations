@@ -1349,7 +1349,7 @@ static bool explicit_global_cache_shutdown_is_clean() {
 // (1) A REFUSED shutdown_unified_cache() call is not retryable-safe here
 // -- the sibling case's own refused shutdown (by design -- see that
 // case's own comment) left ITS cache PARTIALLY torn down: its parked
-// buffer's control kept the cache registered in g_device_caches, but a
+// buffer's control kept the cache registered in the per-device cache map, but a
 // subsequent onednn_graph_scratch_alloc() on that same cache resolved
 // off-device and hit GGML_ABORT at
 // onednn_graph_scratch_alloc_direct_locked(). So this case cannot simply
@@ -1519,7 +1519,7 @@ static bool onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_r
 // be refused on unfixed code (that is the whole point of this case), and a
 // refused call is not retryable-safe here -- it leaves the cache PARTIALLY
 // torn down: its own parked buffer's control keeps the cache registered in
-// g_device_caches, but a subsequent onednn_graph_scratch_alloc() on that
+// the per-device cache map, but a subsequent onednn_graph_scratch_alloc() on that
 // same cache resolves off-device and hits GGML_ABORT at
 // onednn_graph_scratch_alloc_direct_locked(). So nothing may run in this
 // process after this case, on unfixed code.
@@ -2318,12 +2318,15 @@ int main(int argc, char ** argv) {
     }
 
     // This child intentionally omits explicit shutdown. Its ordinary return
-    // exercises the production fallback where g_device_caches destroys its
-    // cache after main. Initializing the zone-sizing diagnostics after the
-    // global cache registry reproduces the historical destructor-order crash.
+    // exercises the production exit path, where the per-device cache map
+    // destroys its cache after main. The map is made at its first use, so the
+    // cache comes first and the zone-sizing diagnostics after it: what is made
+    // later is destroyed first, the order of the historical destructor-order
+    // crash.
     if (argc == 2 && std::strcmp(argv[1], "--static-destruction-child") == 0) {
+        auto * cache = get_unified_cache(q);
         zone_sizing_record_observation("static-destruction-child");
-        return get_unified_cache(q) ? 0 : 1;
+        return cache ? 0 : 1;
     }
 
     // llama.cpp-me60: run exactly ONE of the two shutdown-poisoning cases,
