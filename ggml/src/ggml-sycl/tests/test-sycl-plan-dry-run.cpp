@@ -10,8 +10,8 @@
 // LEAD-RUN. The planner's shaped path initialises SYCL (layout_policy::get_optimal calls ggml_sycl_info()), arm (a)
 // stages a load through real SYCL backends, and the backends construct caches, so the binary is registered
 // gpu-serial, serial, with the selector pinned to the discrete cards, and a host with no SYCL GPU exits 77 before any
-// arm runs (th32 §11). Arm (g) runs a late pass, which configures the last device's host zones from a small plan, so
-// it runs last: no earlier arm may configure them.
+// arm runs (th32 §11). Arm (g) runs late passes, which configure every device's host zones from a small plan, so it
+// runs last: no earlier arm may configure them.
 //
 // Every arm names its engagement check, the observation that proves it reached the mechanism it scores, and the
 // mutant it kills. An arm whose engagement check fails is VOID, and a VOID arm fails the binary like a FAIL. Every arm
@@ -1140,24 +1140,47 @@ constexpr host_plan_shaped_inventory::moe_shape q2k_wide_shape = {
 // configured them would size them for every load after it. Load A (the q2k shape) stages its early pass, then its late
 // pass with the PRIVATE_TESTING hook that fails the stage after its first device, which on the stage's decide step is
 // before any device's effects. Load B (the same shape with 256 experts) stages both passes. Each ends uncommitted.
-// The device checked is the stage's last, whose snapshot is the load's candidate.
-// Engagement: the device's cache had no host zones before the arm; the hook is exported, and the armed late stage
+// A's refusal is checked on every device: the hook fires after the first device, so a loop that ran each device's
+// effects before the next device's decision configures the first device, and on two cards no other. B's sizes are
+// checked on the stage's last device, whose snapshot is the load's candidate, the one plan a test can read before the
+// load ends; every device is expected configured after B.
+// Engagement: no device's cache had host zones before the arm; the hook is exported, and the armed late stage
 // returned EFFECT_FAILED; B's late pass staged a plan with entries; A's and B's plans size at least one zone apart.
 // Mutant: the host zones configured inside the device loop, before a later device's refusal (A's late pass configures
-// them, and B's zones are A's sizes).
+// the first device's zones; on one card B's zones are then A's sizes).
 arm_result arm_g_refused_late_pass_configures_no_host_zones() {
-    arm_result      r;
-    const int       device = std::max(1, ggml_backend_sycl_get_device_count()) - 1;
-    unified_cache * cache  = get_unified_cache_for_device(device);
-    if (cache == nullptr || cache->pinned_pool_chunk_size() == 0) {
-        void_arm(r, "device " + num(device) + " has no cache with a pinned pool");
+    arm_result                   r;
+    std::vector<unified_cache *> caches;
+    for (int d = 0; d < ggml_backend_sycl_get_device_count(); ++d) {
+        unified_cache * c = get_unified_cache_for_device(d);
+        if (c == nullptr || c->pinned_pool_chunk_size() == 0) {
+            void_arm(r, "device " + num(d) + " has no cache with a pinned pool");
+            return r;
+        }
+        if (c->host_zones_configured()) {
+            void_arm(r, "device " + num(d) + "'s host zones were configured before the arm, so a refused load's " +
+                            "zones cannot be told from an earlier one's");
+            return r;
+        }
+        caches.push_back(c);
+    }
+    if (caches.empty()) {
+        void_arm(r, "no SYCL device");
         return r;
     }
-    if (cache->host_zones_configured()) {
-        void_arm(r, "device " + num(device) + "'s host zones were configured before the arm, so a refused load's " +
-                        "zones cannot be told from an earlier one's");
-        return r;
-    }
+    const int       device = static_cast<int>(caches.size()) - 1;
+    unified_cache * cache  = caches.back();
+
+    // The devices whose host zones are configured (`configured`) or not, as a list for a message.
+    const auto devices_where = [&](bool configured) {
+        std::string list;
+        for (size_t d = 0; d < caches.size(); ++d) {
+            if (caches[d]->host_zones_configured() == configured) {
+                list += " " + num(d);
+            }
+        }
+        return list;
+    };
     using fail_next_fn           = void (*)();
     const fail_next_fn fail_late = reinterpret_cast<fail_next_fn>(ggml_backend_reg_get_proc_address(
         ggml_backend_sycl_reg(), "ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device"));
@@ -1191,15 +1214,15 @@ arm_result arm_g_refused_late_pass_configures_no_host_zones() {
     const host_zone_commit_terms a_terms = terms_of(*a_early->plan);
     fail_late();
     const ggml_sycl_lifecycle_result a_rc = ggml_backend_sycl_stage_load_inventory_plan(&a_inv.inv, nullptr, false);
-    const bool                       a_configured = cache->host_zones_configured();
+    const std::string                a_configured = devices_where(true);
     (void) ggml_backend_sycl_model_load_end(a, false, nullptr);
     if (a_rc != GGML_SYCL_LIFECYCLE_EFFECT_FAILED) {
         // The hook fires only when the stage reaches it, so it may still be armed: no further stage runs here.
         void_arm(r, "load A's armed late pass returned " + num(a_rc) + ", not EFFECT_FAILED");
         return r;
     }
-    expect(r, !a_configured,
-           "load A's late pass, refused on its decide step, configured device " + num(device) + "'s host zones");
+    expect(r, a_configured.empty(),
+           "load A's late pass, refused on its decide step, configured the host zones of device(s)" + a_configured);
 
     loader_inventory   b_inv(q2k_wide_shape);
     ggml_sycl_load_txn b{};
@@ -1212,12 +1235,12 @@ arm_result arm_g_refused_late_pass_configures_no_host_zones() {
     const ggml_sycl_lifecycle_result b_late_rc =
         b_early_rc == GGML_SYCL_LIFECYCLE_OK ? ggml_backend_sycl_stage_load_inventory_plan(&b_inv.inv, nullptr, false) :
                                                b_early_rc;
-    const auto                   b_late       = lifecycle_find_candidate_placement_plan(b.id);
-    const bool                   b_configured = cache->host_zones_configured();
-    const size_t                 have_weight  = cache->host_zone_capacity(host_zone_id::WEIGHT);
-    const size_t                 have_kv      = cache->host_zone_capacity(host_zone_id::KV);
-    const size_t                 have_staging = cache->host_zone_capacity(host_zone_id::STAGING);
-    const size_t                 have_scratch = cache->host_zone_capacity(host_zone_id::SCRATCH);
+    const auto                   b_late         = lifecycle_find_candidate_placement_plan(b.id);
+    const std::string            b_unconfigured = devices_where(false);
+    const size_t                 have_weight    = cache->host_zone_capacity(host_zone_id::WEIGHT);
+    const size_t                 have_kv        = cache->host_zone_capacity(host_zone_id::KV);
+    const size_t                 have_staging   = cache->host_zone_capacity(host_zone_id::STAGING);
+    const size_t                 have_scratch   = cache->host_zone_capacity(host_zone_id::SCRATCH);
     const host_zone_commit_terms b_terms = b_late && b_late->plan ? terms_of(*b_late->plan) : host_zone_commit_terms{};
     (void) ggml_backend_sycl_model_load_end(b, false, nullptr);
     if (b_late_rc != GGML_SYCL_LIFECYCLE_OK || !b_late || !b_late->plan || b_late->plan->entries.empty()) {
@@ -1235,11 +1258,11 @@ arm_result arm_g_refused_late_pass_configures_no_host_zones() {
     const auto   align_up = [](size_t bytes) {
         return (bytes + align - 1) & ~(align - 1);
     };
-    expect(r, b_configured, "load B's late pass configured no host zones on device " + num(device));
+    expect(r, b_unconfigured.empty(), "load B's late pass configured no host zones on device(s)" + b_unconfigured);
     const auto zone = [&](const char * name, size_t have, size_t b_term, size_t a_term) {
         expect(r, have == align_up(b_term),
-               std::string("the ") + name + " zone holds " + num(have) + " bytes, not load B's " + num(b_term) +
-                   " (load A's plan sized it " + num(a_term) + ")");
+               std::string("device ") + num(device) + "'s " + name + " zone holds " + num(have) +
+                   " bytes, not load B's " + num(b_term) + " (load A's plan sized it " + num(a_term) + ")");
     };
     zone("WEIGHT", have_weight, b_terms.weight, a_terms.weight);
     zone("KV", have_kv, b_terms.kv, a_terms.kv);

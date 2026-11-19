@@ -8686,8 +8686,8 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # needs a larger arena zone while an allocation holds the arena is refused, not aborted, a refused load keeps the
     # PP MoE ring a context left in the KV zone, and a late pass refused on its decide step configures no host zone.
     # The planner initialises SYCL and arms (a), (c), (e), (f) and (g) stage loads through real backends that construct
-    # caches, and (g)'s second load configures a host zone set of a few hundred MiB, so it carries the OOM-family
-    # labels, runs alone on the discrete cards, and exits 77 without a SYCL GPU.
+    # caches, and (g)'s second load configures a host zone set of a few hundred MiB on each card, so it carries the
+    # OOM-family labels, runs alone on the discrete cards, and exits 77 without a SYCL GPU.
     add_executable(test-sycl-plan-dry-run
         tests/test-sycl-plan-dry-run.cpp)
     target_link_libraries(test-sycl-plan-dry-run PRIVATE
