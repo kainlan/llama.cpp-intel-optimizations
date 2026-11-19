@@ -38348,9 +38348,9 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
     }
 
     if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4) {
-        // Recipe availability is narrower than executor capability. It merely
-        // lets an exact primary decode candidate reach DIRECT admission;
-        // choose_moe_batch_executor still requires the admitted bundle.
+        // The direct recipe is narrower than the executor: only an exact primary
+        // decode candidate whose invocation holds the exact queue capability of an
+        // admitted MMID workspace gets it, and the direct decode route admits it.
         //
         // Whether the lease can be bound is the binder's question, so ask the
         // binder. A handle-kind test here was a second, narrower answer: every
@@ -38376,27 +38376,20 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
             cap.reason        = "direct-recipe-candidate";
             return cap;
         }
-        // Not selecting the DIRECT fast path is not a capability verdict. The
-        // generic batched MMVQ executor accepts these types in AOS for both
-        // phases and for rows > 1 -- mmvq_submit_q1_nvfp4_aos_id() imposes no
-        // phase or row-count constraint -- so a non-authoritative candidate
-        // falls through to the shared local admission below instead of being
-        // refused here. Returning at this point instead shadowed a kernel that
-        // already exists, and because the refusal escapes as
-        // ggml_sycl_fallback_error and ggml_backend_compare_graph_backend
-        // discards the resulting GGML_STATUS_FAILED, it surfaced as wrong
-        // numbers rather than as a clean decline.
+        // Not selecting the direct recipe is not a capability verdict. The
+        // generic batched MMVQ executor runs these types in AOS for both phases
+        // and any row count -- mmvq_moe_batched_dispatch() submits them through
+        // mmvq_submit_q1_nvfp4_aos_id(), which imposes no phase or row-count
+        // constraint -- so a candidate the direct recipe does not take falls
+        // through to the shared local admission below and answers MMVQ_COMPAT.
+        // The executor choice takes that answer as it takes it for any MMVQ id
+        // type: experts on the card run through that kernel, host experts
+        // through their HOST_CPU recipe, in one op.
         //
         // Fall through only where the executor's own preconditions hold: a K
         // that is not block-aligned would be refused at submit, which is worse
-        // than refusing here. Secondary residency keeps the old refusal -- the
-        // fall-through is validated for the local executor only.
-        //
-        // Admitting here does NOT mean Q1_0/NVFP4 execute. choose_moe_batch_executor()
-        // in moe-resolved-batch.hpp rejects them unconditionally while the B70 oracle
-        // gate is closed, so they still refuse one layer down (census 10: 85 such
-        // refusals, reason=capability_unsupported, carrying capability=local-mmvq from
-        // right here). That is deliberate, not a bug in either layer.
+        // than refusing here. Secondary residency keeps its refusal: the
+        // fall-through is checked for the local executor only.
         const bool local_executor_shape_ok = layout == GGML_LAYOUT_AOS && route_device == submit_device &&
                                              K % qk == 0 && K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
         if (!local_executor_shape_ok) {
@@ -38518,21 +38511,17 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
     return cap;
 }
 
-// What a staged ring slot is served with (c-las5): a plain MMVQ_COMPAT kernel on the submit queue, for a type that
-// does not need its own direct kernel (moe_type_needs_direct_kernel: Q1_0 and NVFP4 run on a device only through
-// DEVICE_MMVQ_Q1_NVFP4_AOS, so validate_moe_execution_recipe refuses an MMVQ_COMPAT recipe for them). NONE when the
-// capability `cap` of `type` can be served, else the cause. The resolver's staged route is its only caller: the ring
-// stages by the library claim alone, and a slot the route cannot serve is a counted refusal that runs on the CPU.
-static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const moe_route_capability & cap,
-                                                                                   ggml_type                    type) {
+// What a staged ring slot is served with: a plain MMVQ_COMPAT kernel on the submit queue, whose in-order queue orders
+// the slot's reuse after its readers, which a library's internals do not. The kernel is the one a resident expert of
+// the slot's (type, layout) runs, so the capability's kernel is the whole answer and no type is asked again. NONE when
+// the capability `cap` can be served, else the cause. The resolver's staged route is its only caller: the ring stages
+// by the library claim alone, and a slot the route cannot serve is a counted refusal that runs on the CPU.
+static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const moe_route_capability & cap) {
     if (!cap.supported) {
         return ggml_sycl::moe_staged_route_refusal::UNSUPPORTED;
     }
     if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) {
         return ggml_sycl::moe_staged_route_refusal::KERNEL;
-    }
-    if (ggml_sycl::moe_type_needs_direct_kernel(type)) {
-        return ggml_sycl::moe_staged_route_refusal::DIRECT_KERNEL;
     }
     return ggml_sycl::moe_staged_route_refusal::NONE;
 }
@@ -39148,19 +39137,18 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                     src0, submit_device, rows, invocation_backend, invocation_queue, queue_capability, staged);
                 staged.recipe.transfer                        = moe_recipe_transfer::STAGED_RING;
                 staged.recipe_reason                          = "staged-ring";
-                // c-las5 (1): a slot is read only by a plain SYCL kernel on the submit queue, whose order covers the
-                // slot's reuse; it does not order a library's internals. The route serves a slot only as a plain
+                // A slot is read only by a plain SYCL kernel on the submit queue, whose order covers the slot's
+                // reuse; it does not order a library's internals. The route serves a slot only as a plain
                 // MMVQ_COMPAT kernel: any other kernel (XMX_TILED, MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS,
-                // SECONDARY_SOA), or a type that needs its direct kernel refuses it
-                // (ggml_sycl_moe_staged_capability_refusal; the ring's staging follows the library claim alone since
-                // the window ring, W2). So does a slot whose resolved layout is not the entry's: the phase acquires
-                // each slot with the layout it writes there (lead ruling c-o9uw-1), so the two disagree only for a
-                // wrong entry. A refused entry falls through to the route core, whose HOST answer stands, and is
-                // counted with its cause and the capability's reason or the validator's reject reason, in the order
-                // asked here, so the trace says why (plan Task 8).
+                // SECONDARY_SOA) refuses it (ggml_sycl_moe_staged_capability_refusal; the ring's staging follows the
+                // library claim alone since the window ring). So does a slot whose resolved layout is not the
+                // entry's: the phase acquires each slot with the layout it writes there, so the two disagree only
+                // for a wrong entry. A refused entry falls through to the route core, whose HOST answer stands, and
+                // is counted with its cause and the capability's reason or the validator's reject reason, in the
+                // order asked here, so the trace says why.
                 const char *                   refusal_detail = nullptr;
                 const moe_staged_route_refusal refusal        = [&]() {
-                    const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap, src0->type);
+                    const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap);
                     if (by_cap != moe_staged_route_refusal::NONE) {
                         refusal_detail = cap.reason;
                         return by_cap;
@@ -85672,10 +85660,10 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_device_part(const ggml_sycl::
 
 // Whether the prompt CPU island runs a host expert of `type`. The retained batch gives a host operand a HOST_CPU
 // recipe only for a type ggml_sycl_moe_host_recipe_type_ok accepts (the recipe's own condition, asked here rather than
-// restated), and the island's batched CPU kernel has no path for a type that needs its direct kernel
-// (moe_type_needs_direct_kernel).
+// restated), and the island's batched CPU kernel has no path for a type whose host experts run their immutable host
+// recipe with its own planned workspace (moe_type_has_immutable_host_recipe).
 static bool ggml_sycl_moe_pp_cpu_island_runs_type(ggml_type type) {
-    if (ggml_sycl::moe_type_needs_direct_kernel(type)) {
+    if (ggml_sycl::moe_type_has_immutable_host_recipe(type)) {
         return false;
     }
     return ggml_sycl_moe_host_recipe_type_ok(type);
@@ -90093,11 +90081,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // index (retained_prompt_groups) is populated solely under `if (ne12 != 1)`,
     // and nothing in it ever reads the decode batch result, so a decode case
     // steered there resolves no route and dies at "selected prompt expert
-    // unresolved before submit" -- strictly worse than the honest
-    // capability-unsupported refusal that the retained partition loop below
-    // already produces through its shared dispatch helper. Tried and
-    // withdrawn for Q1_0/NVFP4 (llama.cpp-t98c); the closed capability, not the
-    // routing, is what those cases are waiting on.
+    // unresolved before submit" -- strictly worse than the honest refusal the
+    // retained partition loop below produces through its shared dispatch
+    // helper for an operand it cannot run. A carve-out for Q1_0/NVFP4 decode
+    // was tried and withdrawn: what those cases lacked was an executor in the
+    // retained partition, not a different route.
     const bool moe_hybrid_with_plan  = ne12 == 1 || selected_hybrid_route;
     const bool route_host_experts_to_cpu =
         !exact_layout_override && (has_placement_plan ? plan_has_cpu_experts : use_expert_cache);
@@ -91971,8 +91959,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                     }
 
+                    // A Q1_0/NVFP4 AOS operand runs on the card only through this batched dispatch, the executor its
+                    // capability answered (MMVQ_COMPAT, or the direct recipe). When the dispatch returns false (a
+                    // scratch allocation that fails, an index past INT_MAX, no pointer table) the op ends with a named
+                    // refusal instead of running another path, and the process goes on.
                     if (!batched_ok && direct_q1_nvfp4_aos) {
-                        GGML_ABORT("[MOE-ROUTE] admitted primary Q1/NVFP4 direct recipe failed before submit");
+                        GGML_LOG_WARN(
+                            "[MOE-ROUTE] Q1_0/NVFP4 AOS batched dispatch returned false: tensor=%s layout=%s "
+                            "entries=%zu ptr_table=%s\n",
+                            src0->name ? src0->name : "?", ggml_sycl_layout_mode_name(dispatch_layout),
+                            layout_entries.size(), expert_ptrs_dev ? "present" : "missing");
+                        local_extra.moe_expert_id = -1;
+                        ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
+                        throw ggml_sycl_fallback_error(
+                            "MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand returned false");
                     }
                     if (!batched_ok) {
                         std::vector<sycl::event> per_entry_ready;
@@ -126880,9 +126880,9 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         // planner placed some backing table in host-pinned memory.
         //
         // Residency-blind admission is not type-blind admission. MUL_MAT_ID asks
-        // the MMID coverage tables below. Q1_0 and NVFP4 are in them and stay
-        // admitted by design: they carry fp16 converters and are refused by the
-        // runtime route oracle (the sanctioned fail-closed class of c-wps7).
+        // the MMID coverage tables below. Q1_0 and NVFP4 are in them because
+        // their MMVQ id kernel runs them on the card in AOS, and the capability
+        // query and the executor choice give the same answer at run time.
         // Q2_0 joined with its kernels (llama.cpp-s36q phase 4). ADD_ID keeps
         // the dense allowlist plus Q1_0/NVFP4, so every other type without a
         // kernel -- upstream b10630's tq2_0 and anything future -- is refused
@@ -126897,13 +126897,13 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             // whole IQ1_S..IQ4_XS family because they have real *dense* kernels;
             // none of them has an _id kernel family, so admitting them handed
             // the scheduler an op this backend cannot compute. The route oracle
-            // did refuse it, but that refusal escapes as ggml_sycl_fallback_error
-            // -> GGML_STATUS_FAILED, which ggml_backend_compare_graph_backend
-            // discards -- so the op reported uncorrelated numbers (ERR 86-99)
+            // did refuse it, but that refusal escaped as ggml_sycl_fallback_error
+            // -> GGML_STATUS_FAILED, which ggml_backend_compare_graph_backend then
+            // discarded -- so the op reported uncorrelated numbers (ERR 86-99)
             // instead of falling back to the CPU backend, for 234 census cases.
             // moe_mmvq_admission_supports_type() asks the MMID tables instead;
-            // Q1_0/NVFP4 are in those tables, so their deliberate admit-then-
-            // refuse-at-the-oracle behaviour is preserved without a special case.
+            // Q1_0/NVFP4 are in those tables because their id kernel runs them,
+            // so they need no special case here.
             //
             // ADD_ID must NOT be gated on these tables: its src[0] is the F32
             // activation (ggml_add_id -> ggml_dup_tensor(ctx, a)), not an expert

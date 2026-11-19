@@ -760,14 +760,13 @@ struct moe_stream_op {
 // recipe, asked before the route, and the recipe validator's refusal, asked after it. NONE means served.
 enum class moe_staged_route_refusal : uint8_t {
     NONE,
-    CLAIMED,        // the entry's consumer is the batched prompt executor, which reads the slot itself
-    UNSUPPORTED,    // the capability query answers no kernel for the type in the entry's layout
-    KERNEL,         // it answers a kernel other than the plain MMVQ_COMPAT
-    DIRECT_KERNEL,  // Q1_0/NVFP4: only their direct kernel runs them on a device (moe_type_needs_direct_kernel)
-    VIEW,           // the slot resolves to no device pointer
-    LAYOUT,         // the slot's resolved layout is not the entry's
-    ROUTE,          // validate_moe_batch_route refuses the route
-    RECIPE,         // the recipe is missing, or validate_moe_execution_recipe refuses it
+    CLAIMED,      // the entry's consumer is the batched prompt executor, which reads the slot itself
+    UNSUPPORTED,  // the capability query answers no kernel for the type in the entry's layout
+    KERNEL,       // it answers a kernel other than the plain MMVQ_COMPAT
+    VIEW,         // the slot resolves to no device pointer
+    LAYOUT,       // the slot's resolved layout is not the entry's
+    ROUTE,        // validate_moe_batch_route refuses the route
+    RECIPE,       // the recipe is missing, or validate_moe_execution_recipe refuses it
 };
 
 inline const char * moe_staged_route_refusal_name(moe_staged_route_refusal refusal) {
@@ -780,8 +779,6 @@ inline const char * moe_staged_route_refusal_name(moe_staged_route_refusal refus
             return "unsupported";
         case moe_staged_route_refusal::KERNEL:
             return "kernel";
-        case moe_staged_route_refusal::DIRECT_KERNEL:
-            return "direct-kernel";
         case moe_staged_route_refusal::VIEW:
             return "view";
         case moe_staged_route_refusal::LAYOUT:
