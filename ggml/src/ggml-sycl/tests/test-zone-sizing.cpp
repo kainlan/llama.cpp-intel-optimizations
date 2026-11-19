@@ -2967,8 +2967,10 @@ int main() {
         ring_outside_only.scratch_outside = 6;
         CHECK(!zone_arena_only_ring_holds(true, ring_outside_only), "a ring outside the arena was released for it");
 
-        // The refusal a load logs when the release kept the ring (a prefill claims one of its slots): the ring is the
-        // cache's, so no model or context frees it, and it is released on a later load, not only at process exit.
+        // The refusal a load logs when the release kept the ring (a prefill's claim on one of its slots is held): the
+        // ring is the cache's, so no model or context frees it, and it is released on a later load, not only at
+        // process exit. The claim outlives its prefill, so waiting for the prefill to finish lets nothing go; freeing
+        // the context that ran it drains the device's slots.
         zone_arena_refusal held;
         held.reason          = zone_arena_refusal_reason::REBUILD_HELD;
         held.device          = 1;
@@ -2979,11 +2981,13 @@ int main() {
         CHECK(has(rl,
                   "; 96.0 MB of live allocations in its zones and 6 of the cache's own scratch buffers (6 of them "
                   "its PP MoE ring's slots) hold the arena (the [VRAM-ARENA] lines above name them), so its zones "
-                  "cannot grow. Only the cache's PP MoE ring holds it, and a load releases the ring only while no "
-                  "prefill claims one of its slots. Load this one again when the prefill on device 1 has finished"),
+                  "cannot grow. Only the cache's PP MoE ring holds it, and a prefill's claim on one of its slots "
+                  "keeps it: the claim outlives its prefill until a context on device 1 is freed. Free the context "
+                  "that ran the prefill, then load this one again"),
               "a ring alone in the arena is not named with its remedy");
         CHECK(!has(rl, "Free the model") && !has(rl, "until the process exits"),
               "a ring alone in the arena is blamed on a model to free or on the process");
+        CHECK(!has(rl, "has finished"), "a ring alone in the arena is said to be let go when its prefill finishes");
 
         // the ring beside a live allocation: freeing the model or context releases that, and a later load the ring
         zone_arena_refusal with_live       = held;

@@ -548,10 +548,11 @@ static std::string zone_bytes_text(size_t bytes) {
 // The holders refusal's clause: each kind of holder that points into the arena with its count, and the remedy the
 // kinds allow. The cache's own scratch buffers other than the PP MoE ring stay in the arena until the cache is torn
 // down at process exit, whatever else holds it. The ring is the cache's too, but a load releases it when it is the
-// arena's only holder and no prefill claims one of its slots. Leases with nothing but the ring live in the zones
-// outlived what they point at, so no free releases them either. Live allocations belong to a model or context, which
-// freeing releases, unless the cache still has releases of its own to run: their bytes count as live too, so then the
-// remedy says they may be those and asks for the load again first.
+// arena's only holder and no prefill's claim on one of its slots is held; a claim outlives its prefill until a context
+// on the device is freed, so freeing that context is the ring's remedy. Leases with nothing but the ring live in the
+// zones outlived what they point at, so no free releases them either. Live allocations belong to a model or context,
+// which freeing releases, unless the cache still has releases of its own to run: their bytes count as live too, so then
+// the remedy says they may be those and asks for the load again first.
 static std::string zone_arena_unfinished_text(const zone_arena_holders & h) {
     struct kind {
         size_t       count;
@@ -632,8 +633,9 @@ static std::string zone_arena_held_text(const zone_arena_holders & h, int device
                       h.ring_in_arena == 0 ? "No allocation" : "Nothing but the cache's PP MoE ring", device);
     } else {
         std::snprintf(remedy, sizeof(remedy),
-                      ". Only the cache's PP MoE ring holds it, and a load releases the ring only while no prefill "
-                      "claims one of its slots. Load this one again when the prefill on device %d has finished",
+                      ". Only the cache's PP MoE ring holds it, and a prefill's claim on one of its slots keeps it: "
+                      "the claim outlives its prefill until a context on device %d is freed. Free the context that "
+                      "ran the prefill, then load this one again",
                       device);
     }
     return text + remedy;
