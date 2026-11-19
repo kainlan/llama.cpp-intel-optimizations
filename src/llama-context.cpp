@@ -424,8 +424,8 @@ static decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn) llama_con
 // micro-batch trial's four SYCL entry points, mirroring
 // llama_context_sycl_runtime_proc()/llama_context_sycl_recheck_proc() above.
 // A GGML_BACKEND_DL build whose SYCL DSO predates llama.cpp-tsfl (the probe
-// and fallback counter) or this task (auto_ubatch_enabled's registration,
-// moe_gpu_ubatch_max) exports none of these; sycl_select_auto_ubatch()
+// and fallback counter) or this task (auto_ubatch_enabled's registration)
+// exports none of these; sycl_select_auto_ubatch()
 // treats a nullptr proc the same way every other caller in this file
 // already does for llama_context_sycl_runtime_proc() -- as "unavailable",
 // never dereferenced.
@@ -468,12 +468,6 @@ static decltype(&ggml_backend_sycl_auto_ubatch_enabled) llama_context_sycl_auto_
     ggml_backend_dev_t dev) {
     return reinterpret_cast<decltype(&ggml_backend_sycl_auto_ubatch_enabled)>(
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_auto_ubatch_enabled"));
-}
-
-static decltype(&ggml_backend_sycl_moe_gpu_ubatch_max) llama_context_sycl_moe_gpu_ubatch_max_proc(
-    ggml_backend_dev_t dev) {
-    return reinterpret_cast<decltype(&ggml_backend_sycl_moe_gpu_ubatch_max)>(
-        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_moe_gpu_ubatch_max"));
 }
 
 // llama.cpp-7n6n (wires nphx Task 5): proc-address lookups for the
@@ -2369,7 +2363,6 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     ggml_backend_dev_t first_dev   = ggml_backend_get_device(sycl_backends.front().backend);
     auto               probe_fn    = llama_context_sycl_probe_proc(first_dev);
     auto               fallback_fn = llama_context_sycl_fallbacks_proc(first_dev);
-    auto               moe_cap_fn  = llama_context_sycl_moe_gpu_ubatch_max_proc(first_dev);
     auto               hold_spill_fn = llama_context_sycl_hold_spill_proc(first_dev);
     if (!probe_fn || !fallback_fn) {
         // A SYCL DSO too old to export the trial's own entry points --
@@ -2382,25 +2375,15 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 
     const auto & ladder = llama_auto_ubatch_ladder;
 
-    // A direct GGML_USE_SYCL build's accessor is a real, always-defined
-    // function -- called unconditionally, no null check (there is nothing to
-    // be null). The DL-without-SYCL lookup genuinely can return nullptr on an
-    // older SYCL DSO, so it reports the ceiling unavailable and the cap gets
-    // no MoE-specific narrowing. A dense model never consults the ceiling.
-#    ifdef GGML_USE_SYCL
-    const uint32_t moe_cap           = model.hparams.n_expert > 0 ? ggml_backend_sycl_moe_gpu_ubatch_max() : 0;
+    // The MoE ceiling is the picker's own constant, the same in a direct and a DL build. A dense model never
+    // consults it.
+    const uint32_t moe_cap           = model.hparams.n_expert > 0 ? llama_auto_ubatch_moe_ceiling : 0;
     const bool     moe_cap_available = true;
-#    else
-    const uint32_t moe_cap           = (model.hparams.n_expert > 0 && moe_cap_fn) ? moe_cap_fn() : 0;
-    const bool     moe_cap_available = moe_cap_fn != nullptr;
-#    endif
     // The MoE ceiling is the binding cap whenever it does not exceed the
     // batch/ctx cap, not only when it strictly narrows it -- a context whose
     // batch/ctx cap already equals moe_cap is bound by the ceiling exactly as
     // much as one where moe_cap is smaller, so "ladder exhausted" would
-    // misreport why the ladder stopped. The helper gates on
-    // moe_cap_available so a DSO without the accessor never reports a ceiling
-    // that was never consulted.
+    // misreport why the ladder stopped.
     bool           moe_bound = false;
     const uint32_t cap       = llama_auto_ubatch_cap(cparams.n_batch, cparams.n_ctx, model.hparams.n_expert, moe_cap,
                                                      moe_cap_available, &moe_bound);
@@ -2430,7 +2413,7 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
         return;
     }
     // llama.cpp-7n6n (wires nphx Task 5): the persisted auto n_ubatch cache's
-    // four entry points, mirroring probe_fn/fallback_fn/moe_cap_fn's own
+    // four entry points, mirroring probe_fn/fallback_fn's own
     // direct-vs-DL resolution just above.
 #    ifdef GGML_USE_SYCL
     auto cache_enabled_fn = &ggml_backend_sycl_ubatch_cache_enabled;
@@ -2584,10 +2567,9 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 //
 // Tries the ladder {512, 1024, 2048, 4096} ascending, each candidate capped
 // by min(n_batch, n_ctx) and, for a MoE model (model.hparams.n_expert > 0),
-// additionally by the GPU MoE routing ceiling
-// (ggml_backend_sycl_moe_gpu_ubatch_max(), llama.cpp-ohkx) until that
-// ceiling is lifted -- a candidate whose ring still fits but whose routing
-// silently falls off the GPU path is not a win. A lowered context the hoisted
+// additionally by the picker's MoE ceiling
+// (llama_auto_ubatch_moe_ceiling, src/llama-auto-ubatch.h) until wider MoE
+// widths are measured against it. A lowered context the hoisted
 // block built a prep for tries that rung as its only candidate, and the
 // descent below it when it loses for fit; a lowered context whose prep is
 // empty reserves once at its rung, as every empty prep does. Per candidate, on every
