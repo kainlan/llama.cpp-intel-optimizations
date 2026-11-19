@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -57,6 +58,12 @@ std::vector<std::string> lines_with(const char * a, const char * b = nullptr) {
         }
     }
     return out;
+}
+
+// Every captured line, in the order they were logged.
+std::vector<std::string> log_snapshot() {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    return g_log_lines;
 }
 
 uint64_t stores() {
@@ -1045,12 +1052,13 @@ arm_result arm_e_held_arena_refuses_the_load() {
 }
 
 // (f) A refused load keeps the PP MoE ring a live context left in the shared KV zone, and the ring's KV-zone flags. The
-// ring outlives the context that sized it, and a load releases a ring that still holds KV-zone bytes, but only in the
-// stage's effect step, after every refusal of the load: a load refused in its decide step must leave the ring a live
-// context may still use. Device 0 gets a one-slot ring of 1 MiB slots whose activation and output slots are planned in
-// the KV zone, and a 4 KiB RUNTIME-zone allocation beside it, so the ring is never the arena's only holder and the
-// entry ensure has no last resort to take. A load whose ring weight slot is 256 MiB larger than the RUNTIME zone is then
-// staged early and ended uncommitted.
+// ring outlives the context that sized it, and a load releases a ring that still holds KV-zone bytes in the stage's
+// effect step, after every refusal of the load. The one release before them is the entry ensure's last resort, taken
+// only when the ring's slot buffers are the only holders of an arena whose zones must grow (arm (h)): a load refused in
+// its decide step must leave any other ring, which a live context may still use. Device 0 gets a one-slot ring of
+// 1 MiB slots whose activation and output slots are planned in the KV zone, and a 4 KiB RUNTIME-zone allocation beside
+// it, so the ring is never the arena's only holder and the entry ensure has no last resort to take. A load whose ring
+// weight slot is 256 MiB larger than the RUNTIME zone is then staged early and ended uncommitted.
 // Engagement: the ring was reserved and holds KV-zone bytes, the allocation landed in the RUNTIME zone, and the stage
 // returned PLAN_REJECTED.
 // Mutant: the ring released where the load's planning state is reset, before the planner's refusals (the ring's
@@ -1157,19 +1165,24 @@ arm_result arm_f_refused_load_keeps_the_kv_zone_ring() {
     return r;
 }
 
-// (h) A load releases a ring that alone holds the arena, and the arena is rebuilt to the load's zones. The ring outlives
+// (h) A load releases a ring that alone holds the arena, and asks for its zones again and gets them. The ring outlives
 // the context that sized it, so a freed context can leave its slot buffers as the only holders of an arena whose zones
 // a later load must grow; the entry ensure then releases the ring as its last resort and asks for the zones again,
 // where any other holder refuses the load. Device 0 gets arm (f)'s one-slot ring of 1 MiB slots with nothing beside it,
-// and the load arm (f) stages (a ring weight slot 256 MiB larger than the RUNTIME zone) is staged early, then a second
-// ensure inside the open load asks for its zones again, and the load is ended uncommitted. The rebuilt arena stays, as
-// it does after any refused or uncommitted load, so this arm runs after every arm that reads device 0's arena as found.
+// and the load arm (f) stages (a ring weight slot 256 MiB larger than the RUNTIME zone) is staged early. Between the
+// last resort's release line and device 0's plan line, which ends that device's planning before the next device's
+// begins, the stage must rebuild the arena once, to a RUNTIME zone at least the one its refused first ask needed. The
+// arm's own ensure inside the open load must then get the zones too, and may rebuild once more: the plan publishes
+// terms after the entry ensure sized the zones (the MoE control and host scatter terms), and the next ensure of a load
+// takes them in, as in every load. The load is then ended uncommitted. The rebuilt arena stays, as it does after any
+// refused or uncommitted load, so this arm runs after every arm that reads device 0's arena as found.
 // Engagement: device 0's zones held no byte and its chunks no lease before the ring, and the ring added live bytes; a
-// stage that refused for a cause this arm does not set up (another holder, another device, a reserve the device could
-// not make) is VOID. A refusal that names only the ring as the holder of device 0's arena is a FAIL.
+// stage that refused before any release for a cause this arm does not set up (another holder, another device), or for
+// a reserve the device could not make, is VOID. A refusal that names only the ring as the holder of device 0's arena,
+// and any other refusal of device 0 after the last resort's release, is a FAIL.
 // Mutants: no last resort (the stage refuses device 0 with only the ring holding it); the release not followed by a
-// second ensure, which refuses with no zone line or leaves the zones as found (the stage is refused, or the arm's own
-// ensure rebuilds); the ring released twice (two release lines).
+// second ask for the zones (the stage logs no rebuild after the release, and refuses the load if the ask's answer was
+// the refusal); the ring released twice (two release lines).
 arm_result arm_h_load_releases_a_lone_ring() {
     arm_result      r;
     unified_cache * cache = get_unified_cache_for_device(0);
@@ -1227,23 +1240,74 @@ arm_result arm_h_load_releases_a_lone_ring() {
         return r;
     }
     log_clear();
-    const ggml_sycl_lifecycle_result rc = ggml_backend_sycl_stage_load_inventory_plan(&too_big.inv, nullptr, true);
-    const char * const               release_line = "[SYCL-PLAN] model load released the PP MoE oneDNN scratch ring";
-    const size_t                     released     = lines_with(release_line).size();
-    const size_t last_resort = lines_with(release_line, "on device 0: it was the only holder of an arena").size();
-    const size_t kept        = lines_with("[SYCL-PLAN] model load kept the PP MoE oneDNN scratch ring").size();
-    const std::vector<std::string> refused = lines_with("[SYCL-PLAN] model load refused on device ");
-    const size_t                   ring_only =
-        lines_with("[SYCL-PLAN] model load refused on device 0:", "Only the cache's PP MoE ring holds it").size();
-    const size_t held_after = unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(0);
+    const ggml_sycl_lifecycle_result rc  = ggml_backend_sycl_stage_load_inventory_plan(&too_big.inv, nullptr, true);
+    const std::vector<std::string>   log = log_snapshot();
+    const size_t                     held_after = unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(0);
     log_clear();
     zone_arena_refusal again{};
-    const bool         zones_kept = rc == GGML_SYCL_LIFECYCLE_OK && cache->ensure_planned_arena_zones(&again);
-    const size_t       rebuilt    = lines_with("[VRAM-ARENA] Rebuilding unused early arena for planned zones").size();
+    const bool         zones_got    = rc == GGML_SYCL_LIFECYCLE_OK && cache->ensure_planned_arena_zones(&again);
+    // The arm's own ensure's rebuild lines, counted apart from the stage's: the log was cleared after the stage.
+    const size_t       own_rebuilds = log_count_with("[VRAM-ARENA] Rebuilding unused early arena for planned zones");
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
     put_back();
 
-    if (rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED && ring_only == 0 && kept == 0) {
+    const char * const release_line     = "[SYCL-PLAN] model load released the PP MoE oneDNN scratch ring";
+    const char * const last_resort_text = "on device 0: it was the only holder of an arena";
+    const char * const refusal_line     = "[SYCL-PLAN] model load refused on device ";
+    const char * const held_line        = "[VRAM-ARENA] planned zones exceed active arena but live allocations prevent";
+    const auto         has              = [](const std::string & line, const char * text) {
+        return line.find(text) != std::string::npos;
+    };
+    size_t                   released = 0, last_resort = 0, kept = 0, ring_only = 0;
+    size_t                   from = log.size();  // the last resort's release line
+    std::vector<std::string> refused;
+    std::string              device0_refusal;
+    for (size_t i = 0; i < log.size(); ++i) {
+        const std::string & line = log[i];
+        if (has(line, release_line)) {
+            ++released;
+            if (has(line, last_resort_text)) {
+                ++last_resort;
+                from = std::min(from, i);
+            }
+        }
+        kept += has(line, "[SYCL-PLAN] model load kept the PP MoE oneDNN scratch ring") ? 1 : 0;
+        if (has(line, refusal_line)) {
+            refused.push_back(line);
+            if (has(line, "refused on device 0:") && device0_refusal.empty()) {
+                device0_refusal = line;
+            }
+            ring_only +=
+                has(line, "refused on device 0:") && has(line, "Only the cache's PP MoE ring holds it") ? 1 : 0;
+        }
+    }
+    // The RUNTIME zone the refused first ask needed ("need ... runtime=<MB>"), from its last held line before the
+    // release, and the stage's own rebuilds after the release, up to device 0's plan line.
+    double need_runtime = -1.0;
+    for (size_t i = 0; i < from; ++i) {
+        if (has(log[i], held_line)) {
+            const size_t at = log[i].find(" runtime=");
+            need_runtime    = at == std::string::npos ? -1.0 : std::strtod(log[i].c_str() + at + 9, nullptr);
+        }
+    }
+    std::vector<std::string> rebuilds;
+    for (size_t i = from; i < log.size() && !has(log[i], "[HOST-LEDGER] device=0 plan host_budget="); ++i) {
+        if (has(log[i], "[VRAM-ARENA] Rebuilding unused early arena for planned zones")) {
+            rebuilds.push_back(log[i]);
+        }
+    }
+    double rebuilt_runtime = -1.0;  // the "runtime <from>-><to> MB" target of the one rebuild
+    if (rebuilds.size() == 1) {
+        const size_t at    = rebuilds[0].find("runtime ");
+        const size_t arrow = at == std::string::npos ? std::string::npos : rebuilds[0].find("->", at);
+        rebuilt_runtime    = arrow == std::string::npos ? -1.0 : std::strtod(rebuilds[0].c_str() + arrow + 2, nullptr);
+    }
+
+    // A refusal of device 0 after the last resort's release is the product's, not a missing precondition, unless the
+    // device could not reserve the arena the zones need.
+    const bool refused_after_release =
+        last_resort != 0 && !device0_refusal.empty() && !has(device0_refusal, "could not reserve an arena");
+    if (rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED && ring_only == 0 && kept == 0 && !refused_after_release) {
         if (!refused.empty()) {
             void_arm(r, "the stage refused for a cause this arm does not set up: " + refused[0]);
             return r;
@@ -1259,16 +1323,23 @@ arm_result arm_h_load_releases_a_lone_ring() {
     expect(r, ring_only == 0,
            "the stage refused device 0 with only the ring holding its arena: the ring was not released");
     expect(r, kept == 0,
-           "the stage kept the ring as the arena's only holder, though no prefill claims one of its slots");
+           "the stage kept the ring as the arena's only holder, though this arm holds no claim on a slot");
+    expect(r, !refused_after_release, "after the last resort's release the stage refused device 0: " + device0_refusal);
     expect(r, rc == GGML_SYCL_LIFECYCLE_OK,
            "the stage returned " + num(rc) + " after " + num(last_resort) + " last-resort ring release line(s)");
     expect(r, released == 1 && last_resort == 1,
            "the stage logged " + num(released) + " ring release line(s), " + num(last_resort) + " of them the last " +
                "resort's, want exactly one, the last resort's");
     expect(r, held_after == 0, "after its release line the ring still holds " + num(held_after) + " KV-zone bytes");
-    expect(r, rc != GGML_SYCL_LIFECYCLE_OK || (zones_kept && rebuilt == 0),
-           "inside the open load a second ensure " + std::string(zones_kept ? "kept" : "refused") + " the zones and " +
-               "rebuilt the arena " + num(rebuilt) + " time(s): the stage left zones other than the load's");
+    expect(r, last_resort == 0 || rebuilds.size() == 1,
+           "between the last resort's release and device 0's plan line the stage rebuilt the arena " +
+               num(rebuilds.size()) + " time(s), want 1: it did not ask for the zones again and get them");
+    expect(r, rebuilds.size() != 1 || (need_runtime >= 0.0 && rebuilt_runtime >= need_runtime),
+           "the stage rebuilt device 0's RUNTIME zone to " + std::to_string(rebuilt_runtime) + " MB, not at least " +
+               "the " + std::to_string(need_runtime) + " MB its refused first ask needed");
+    expect(r, rc != GGML_SYCL_LIFECYCLE_OK || zones_got,
+           "inside the open load the arm's own ensure refused the zones the stage left (reason " +
+               num(static_cast<int>(again.reason)) + ", after " + num(own_rebuilds) + " rebuild line(s) of its own)");
     return r;
 }
 
