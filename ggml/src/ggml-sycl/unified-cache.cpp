@@ -18872,15 +18872,17 @@ static unified_cache * get_existing_cache_for_device(int device_id) {
     return get_cache_shared(effective_device);
 }
 
+// Takes no lock of its own: get_cache_shared() holds g_cache_rw_mutex shared for the map read, and the device
+// resolution reads no state the lock guards. Holding it here too would lock a std::shared_mutex in shared mode twice on
+// one thread, which is undefined and can deadlock once a writer queues between the two.
 unified_cache * get_existing_unified_cache_for_device(int device_id) {
-    std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
     return get_existing_cache_for_device(device_id);
 }
 
 // The cache whose arena reservations compute_multi_device_plan subtracts from device_id's budget, or nullptr when it
 // subtracts none; see multi_device_plan_subtracts_arena. In GLOBAL mode there is one physical arena, and a multi-device
 // plan may be built from synthetic budgets in unit tests, so the global device-0 arena is not reused for every device.
-// Takes no lock, as the planner's own lookup did.
+// Takes no lock of its own, as the planner's own lookup did: the lookup holds the cache lock for the map read.
 static unified_cache * multi_device_plan_arena_cache(int device_id) {
     if (!vram_arena_enabled() || get_effective_mode() == unified_cache_mode::GLOBAL) {
         return nullptr;
@@ -18889,8 +18891,8 @@ static unified_cache * multi_device_plan_arena_cache(int device_id) {
     return cache != nullptr && cache->arena_active() ? cache : nullptr;
 }
 
+// No lock here, for the reason given at get_existing_unified_cache_for_device(): the lookup inside takes it.
 bool multi_device_plan_subtracts_arena(int device_id) {
-    std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
     return multi_device_plan_arena_cache(device_id) != nullptr;
 }
 

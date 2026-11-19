@@ -323,6 +323,91 @@ def test_a_map_local_to_a_function_is_not_a_holder():
     assert order_failures(cache_code + local, others) == order_failures(cache_code, others)
 
 
+# The cache lock is a std::shared_mutex. A thread that holds it, in either mode, must not reach a lookup that takes it
+# again: twice shared on one thread is undefined and deadlocks once a writer queues between the two, and shared under
+# unique deadlocks outright. These are the lookups that take it shared for the map read.
+CACHE_LOCK = re.compile(
+    r"std::(?:shared_lock|unique_lock|lock_guard|scoped_lock)\s*<\s*std::shared_mutex\s*>\s*\w+\s*[({]\s*"
+    r"g_cache_rw_mutex\s*[)}]"
+)
+RELOCKING_LOOKUPS = (
+    "get_cache_shared",
+    "get_existing_cache_for_device",
+    "get_existing_unified_cache_for_device",
+    "multi_device_plan_arena_cache",
+    "multi_device_plan_subtracts_arena",
+)
+PUBLIC_LOOKUP_SIGS = {
+    "get_existing_unified_cache_for_device": r"(?<!static )\bunified_cache\s*\*\s*get_existing_unified_cache_for_device"
+    r"\s*\(\s*int\s+\w+\s*\)\s*\{",
+    "multi_device_plan_subtracts_arena": r"\bbool\s+multi_device_plan_subtracts_arena\s*\(\s*int\s+\w+\s*\)\s*\{",
+}
+
+
+def nested_lock_failures(cache_code: str) -> list:
+    """Every lookup of RELOCKING_LOOKUPS called while a scope holds g_cache_rw_mutex, and every public lookup that
+    names the lock at all. A lock's scope runs from its declaration to the close of the block that holds it."""
+    failures = []
+    blank = _LITERAL_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), cache_code)
+    calls = re.compile(r"\b(" + "|".join(RELOCKING_LOOKUPS) + r")\s*\(")
+    for lock in CACHE_LOCK.finditer(blank):
+        depth, j = 0, lock.end()
+        while j < len(blank):
+            if blank[j] == "{":
+                depth += 1
+            elif blank[j] == "}":
+                if depth == 0:
+                    break
+                depth -= 1
+            j += 1
+        line = blank.count("\n", 0, lock.start()) + 1
+        for call in calls.finditer(blank, lock.end(), j):
+            failures.append(f"unified-cache.cpp:{line} holds g_cache_rw_mutex and calls {call.group(1)}(), which "
+                            "takes it again")
+    for name, sig in PUBLIC_LOOKUP_SIGS.items():
+        span = body_span(blank, sig)
+        if span is None:
+            failures.append(f"{name}() definition not found")
+        elif "g_cache_rw_mutex" in blank[span[0]:span[1]]:
+            failures.append(f"{name}() names g_cache_rw_mutex; the lookup inside it takes the lock")
+    return failures
+
+
+def test_no_cache_lookup_runs_under_the_cache_lock():
+    cache_code, _ = sources()
+    failures = nested_lock_failures(cache_code)
+    assert not failures, "\n".join(failures)
+
+
+def _relock(name: str):
+    def edit(code: str) -> str:
+        start, end = body_span(code, PUBLIC_LOOKUP_SIGS[name])
+        return code[:start] + "\n    std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);" + code[start:]
+
+    return edit
+
+
+def _lookup_under_a_held_lock(code: str) -> str:
+    # a function that already holds the lock, as unified_cache_has_evictions() does, asks a lookup
+    m = re.search(r"std::shared_lock<std::shared_mutex>\s+read_lock\(g_cache_rw_mutex\);", code)
+    return code[: m.end()] + "\n    (void) get_existing_cache_for_device(0);" + code[m.end() :]
+
+
+LOCK_MUTANTS = {
+    "get_existing_unified_cache_for_device locks again": _relock("get_existing_unified_cache_for_device"),
+    "multi_device_plan_subtracts_arena locks again": _relock("multi_device_plan_subtracts_arena"),
+    "a lookup under a held lock": _lookup_under_a_held_lock,
+}
+
+
+@pytest.mark.parametrize("name", sorted(LOCK_MUTANTS))
+def test_the_nested_lock_check_catches_its_mutant(name):
+    cache_code, _ = sources()
+    mutant = LOCK_MUTANTS[name](cache_code)
+    assert mutant != cache_code, f"the mutant '{name}' did not change the source"
+    assert nested_lock_failures(mutant), f"the mutant '{name}' passed the gate"
+
+
 if __name__ == "__main__":
     import sys
 
