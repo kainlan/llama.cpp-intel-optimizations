@@ -638,20 +638,47 @@ ticket reproduced on:
   below 64 MiB, a budget under 256 MiB, leaves the minimum). The cap is
   1 GiB until the first successful
   `ensure_planned_arena_zones()` and `min(1 GiB, a quarter of the budget
-  available at the last successful ensure)` after it
-  (`GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` overrides both). Within one
-  model's load the cap only falls: its first sizing at the real shape runs
-  before weights load, when the available budget is largest. Across
-  tenants of one cache it can rise: when another model on the device
-  releases memory, the next successful ensure snapshots a larger budget,
-  and the ensure after that one computes a larger cap (while a quarter of
-  the snapshot is below 1 GiB) and, for a shape whose formula exceeded the
-  old cap, a larger floor. If that floor no longer fits the kept ONEDNN
-  zone, `ensure_planned_arena_zones()` does not keep the zone and leave the
-  difference to the DIRECT path: it asks for a rebuild, which it does only
-  when nothing is live in the arena. With live allocations it logs
-  `planned zones exceed active arena but live allocations prevent rebuild`
-  and fails, and a model load that called it aborts.
+  snapshot that ensure stores)` after it
+  (`GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` overrides both). The snapshot
+  does not rise while the arena is kept: an ensure whose zones already
+  hold the plan, and one that keeps a short ONEDNN zone (next paragraph),
+  store the lower of the snapshot held and the budget now (0 is unset),
+  and only a rebuild stores the budget now, above or below the one held.
+  Within one model's load the budget only falls anyway: its first sizing
+  at the real shape runs before weights load, when the budget is largest.
+  Across tenants of one cache it could rise, when another model on the
+  device releases memory; a snapshot that followed it would raise the cap
+  (while a quarter of the snapshot is below 1 GiB) and, for a shape whose
+  formula exceeded the old cap, the floor of a zone that already serves
+  that shape together with the DIRECT path, and so ask for a rebuild the
+  shape does not need.
+  **A kept ONEDNN zone.** The Graph floor is a reservation, not a
+  requirement: what the zone cannot hold of it is served on the DIRECT
+  path under the cap, and a runtime context whose Graph scratch does not
+  fit outside the arena is refused by name at the context. So when
+  `ensure_planned_arena_zones()` needs a rebuild that something live
+  blocks, and the ONEDNN zone is the only zone short while it still holds
+  the primitive-API pair (the larger of the pair planned and the pair
+  already held in it, which has no DIRECT fallback), it keeps the zones as
+  they are instead of refusing the load. It stores a zone plan whose Graph
+  floor is what the zone holds beyond that pair, so the pair bound over
+  the stored plan still admits the pair and the Graph room the context
+  check reads is the zone's real room, and it logs one `[VRAM-ARENA]
+  device N keeps its ONEDNN zone of ...` WARN per load and device (at
+  every keep for a caller outside a staged load), naming the planned
+  floor, the zone kept and the Graph room left. A rebuild, which gives the
+  load its whole floor, is preferred to a keep: when a PP MoE ring a freed
+  context left is the arena's only holder, the load stage's entry first
+  releases the ring and asks again, and a short zone is kept only once
+  that last resort is spent (the ring released with something else still
+  holding, or the ring kept because a prefill's claim on a slot is held).
+  A SCRATCH or RUNTIME shortfall, or an ONEDNN zone below the pair, is
+  still the `REBUILD_HELD` refusal that names the holders. What a keep
+  stores, the zone plan and the cap snapshot, describes the physical zone,
+  which a failed load does not roll back, so it is not among the terms a
+  failed load puts back. After a failed load the zone plan therefore keeps
+  that load's larger pair, which can leave the live model a smaller Graph
+  room, as a refused load that took the sufficient path already did.
   ⚠️ **This gemma4 example describes the formula's behavior for the
   `n_ctx` it is actually given at PLANNING time, which is NOT today's
   real runtime context by default.** The floor is computed once, at
@@ -3073,7 +3100,9 @@ The arena can fail to grow for three reasons, and each prints its own line first
   the arena keeps its memory through a rebuild and does not count
   (`zone_arena_rebuild_allowed()` decides). Another live model's allocations are
   one cause; scratch an earlier model left in the arena, and handles that still
-  lease a chunk, are others. `ensure_planned_arena_zones()` refuses the rebuild
+  lease a chunk, are others. When the ONEDNN zone's Graph floor is all the zones
+  lack, the zones are kept as they are with a WARN and no ERROR ("A kept ONEDNN
+  zone" above). Otherwise `ensure_planned_arena_zones()` refuses the rebuild
   with an ERROR, names the holders on a second ERROR, prints the chunk leases by
   the site that took them on a WARN, and lists the live allocations of each zone
   with live bytes:
@@ -3095,7 +3124,10 @@ The arena can fail to grow for three reasons, and each prints its own line first
   chunk lease), a model load's entry ensure releases the ring after these lines
   and asks for the zones again, with a WARN that says so; the ring is kept while
   a prefill's claim on one of its slots is still held, with a WARN that says so,
-  and the load is refused as for any holder.
+  and the load is refused as for any holder, unless the Graph floor was all the
+  zones lacked: the entry then asks once more and the zones are kept short. The
+  first ask, made before the release, keeps nothing, since a rebuild after the
+  release gives the load its whole floor.
 
   The sites are `weight_snapshot`, `weight_resolve`, `chunk_view` (a handle made
   from a raw pointer for one use), `tensor_extra`, `expert_dispatch` and
