@@ -4803,6 +4803,16 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# A skipped MTP block's NVFP4 ".scale"/".input_scale" tensors are skipped with its weights, or the load's tensor
+# count comes up short. Pure source contract on src/llama-model.cpp; no model and no device.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-llama-nvfp4-mtp-sidecar-skip-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-llama-nvfp4-mtp-sidecar-skip-source.py
+        LABEL "python;source-assert"
+        TIMEOUT 120)
+endif()
+
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-fatal-exit-source
