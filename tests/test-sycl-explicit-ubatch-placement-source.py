@@ -31,8 +31,8 @@ What this gate pins:
   larger: the transaction re-plans the ring for placement_explicit_ubatch_ring_n_ubatch()'s answer, so the re-plan's
   idempotent return keeps the placed ring instead of releasing it for a smaller one the next context must re-admit;
 - the hold-spill fit credits the planned compute term at the micro-batch the published single-device plan PLACED on
-  the device, or, for a plan that named none, at the load's planning micro-batch, read once before the demand, and at
-  every rung below it: a rung's own record no larger than the term, whole or nothing, and a rung without a record of
+  the device, or, for a plan that named none, at the load's planning micro-batch, read before the demand on both sides
+  of the term's bytes (a rung that changed between the two reads credits nothing), and at every rung below it: a rung's own record no larger than the term, whole or nothing, and a rung without a record of
   its own only at or below the micro-batch the term was measured at (told to the fit only when there is a room); the
   hold epoch's rung that held a request out is charged, and every rung above the room's rung is judged as before. The
   planning micro-batch is the load's own record, taken at the inventory stage and turned off when two live loads
@@ -159,11 +159,17 @@ FIT_PLAN = "const auto room_plan = ggml_sycl_global_plan_owner();"
 FIT_HELD_OUT = ("bool held_out = false; if (q.rung_live) { ggml_sycl::planned_hold_spill_totals totals; "
                 "ggml_sycl::unified_cache_get_recent_planned_hold_spills(q.device, q.owner, &totals); "
                 "held_out = totals.raw_count != 0; }")
-# The micro-batch the load measured the term at, read once: it places a plan's room and bounds the no-record credit.
-FIT_MEASURED = ("const uint32_t measured_n_ubatch = "
+# The micro-batch the load measured the term at: it places a plan's room and bounds the no-record credit. The record
+# can be replaced by the next load once no load holds a term, so the fit reads the rung, then the term's bytes, then
+# the rung again, and a rung that changed between the two reads credits nothing: 0 term bytes into the room, rung 0.
+FIT_MEASURED = ("const uint32_t measured_first = "
                 "ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device);")
+FIT_TERM_BYTES = "const size_t term_bytes = ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device);"
+FIT_RUNG_AGAIN = ("const bool rung_unchanged = "
+                  "ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device) == measured_first;")
+FIT_WITHHOLD = "const uint32_t measured_n_ubatch = rung_unchanged ? measured_first : 0;"
 FIT_ROOM = ("const size_t room_bytes = ggml_sycl::placement_plan_compute_room(*room_plan, q.device, "
-            "ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device), measured_n_ubatch, &room_n_ubatch);")
+            "rung_unchanged ? term_bytes : 0, measured_n_ubatch, &room_n_ubatch);")
 # The plan's room: the single-device plan's own device, a placed explicit micro-batch's answer first, else the load's
 # planning micro-batch the caller passes for a plan that named none. Never the plan's planner_n_ubatch: every runtime
 # context transaction rewrites it with the context's micro-batch.
@@ -415,10 +421,10 @@ def claim_placed_ring_is_kept_for_smaller_contexts(sycl_cpp: str, cache_cpp: str
 
 def claim_fit_credits_the_placed_compute_room(sycl_cpp: str, zone_cpp: str, cache_cpp: str) -> bool:
     """The hold-spill fit credits the planned compute term at the micro-batch the published single-device plan sized
-    the device's RUNTIME zone for, read once before the demand is asked: the explicit micro-batch it PLACED, else the
+    the device's RUNTIME zone for, read before the demand is asked: the explicit micro-batch it PLACED, else the
     load's planning micro-batch for a plan that named none. At that rung and every rung below it a request credited by
     the room adds nothing to the bound (a rung's own record whole or nothing, a rung without one only at or below the
-    rung the term was measured at, read once and told only with a room), the plan stays in it, the hold epoch's rung
+    rung the term was measured at, told only with a room), the plan stays in it, the hold epoch's rung
     that held a request out is charged, and every rung above the room's rung is judged as before."""
     fit = body(norm(sycl_cpp), FIT_SIG)
     zone = norm(zone_cpp)
@@ -430,13 +436,27 @@ def claim_fit_credits_the_placed_compute_room(sycl_cpp: str, zone_cpp: str, cach
                         FIT_DEMAND_FROM_TERMS, FIT_FITS)
             and fit.count("in.compute_room_n_ubatch =") == 1 and fit.count("in.compute_room_bytes =") == 1
             and fit.count("in.compute_room_measured_n_ubatch =") == 1 and fit.count("in.held_out_n_ubatch =") == 1
-            and fit.count("unified_cache_get_planned_compute_term_n_ubatch(") == 1
+            and fit.count("unified_cache_get_planned_compute_term_n_ubatch(") == 2
             and ROOM_HELPER_RULE in body(cache, ROOM_HELPER_SIG)
             and bool(plan_room) and ordered(plan_room, PLAN_ROOM_GATE, PLAN_ROOM_EXPLICIT, PLAN_ROOM_PLANNING)
             and "planner_n_ubatch" not in plan_room and "planner_n_ubatch" not in fit
             and CREDIT_RULE in body(zone, CREDIT_SIG)
             and bool(demand) and ordered(demand, DEMAND_CREDIT, DEMAND_BOUND)
             and body(zone, DEMAND_READER_SIG) == DEMAND_READER)
+
+
+def claim_fit_reads_the_rung_around_the_bytes(sycl_cpp: str) -> bool:
+    """The fit reads the measured rung, then the term's bytes, then the rung again, in that order, before the room is
+    asked. A rung that changed between the two reads withholds both: 0 term bytes into the room and rung 0. Each getter
+    is read where the order says and nowhere else in the fit, and the first rung and the bytes reach the room only
+    through the guard, so a mismatch can remove a credit and never grant one."""
+    fit = body(norm(sycl_cpp), FIT_SIG)
+    return (bool(fit)
+            and ordered(fit, FIT_MEASURED, FIT_TERM_BYTES, FIT_RUNG_AGAIN, FIT_WITHHOLD, FIT_ROOM)
+            and fit.count("unified_cache_get_planned_compute_term_n_ubatch(") == 2
+            and fit.count("unified_cache_get_planned_compute_term_bytes(") == 1
+            and len(re.findall(r"\bterm_bytes\b", fit)) == 2 and len(re.findall(r"\bmeasured_first\b", fit)) == 3
+            and len(re.findall(r"\brung_unchanged\b", fit)) == 3)
 
 
 def claim_refusals_print_the_measured_rung(sycl_cpp: str) -> bool:
@@ -629,6 +649,10 @@ def test_placed_ring_is_kept_for_smaller_contexts():
 
 def test_fit_credits_the_placed_compute_room():
     assert claim_fit_credits_the_placed_compute_room(SYCL_CPP, ZONE_CPP, CACHE_CPP)
+
+
+def test_fit_reads_the_rung_around_the_bytes():
+    assert claim_fit_reads_the_rung_around_the_bytes(SYCL_CPP)
 
 
 def test_refusals_print_the_measured_rung():
@@ -881,6 +905,41 @@ def test_mutant_fit_planning_micro_batch_from_the_published_plan_fails():
         _once(SYCL_CPP, FIT_MEASURED,
               FIT_MEASURED.replace("ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device)",
                                    "room_plan->planner_n_ubatch", 1)), ZONE_CPP, CACHE_CPP)
+
+
+def test_mutant_fit_never_reads_the_rung_again_fails():
+    """One read of each cannot tell a rung that the next load replaced after the bytes were read."""
+    assert not claim_fit_reads_the_rung_around_the_bytes(
+        _once(SYCL_CPP, FIT_RUNG_AGAIN, "const bool rung_unchanged = true;"))
+
+
+def test_mutant_fit_passes_the_bytes_through_a_mismatch_fails():
+    """The mismatch ignored: the term's bytes reach the room whatever the second read said."""
+    assert not claim_fit_reads_the_rung_around_the_bytes(
+        _once(SYCL_CPP, FIT_ROOM, FIT_ROOM.replace("rung_unchanged ? term_bytes : 0", "term_bytes", 1)))
+
+
+def test_mutant_fit_keeps_the_rung_through_a_mismatch_fails():
+    """The mismatch ignored for the rung: a no-record rung would be credited against a replaced record."""
+    assert not claim_fit_reads_the_rung_around_the_bytes(
+        _once(SYCL_CPP, FIT_WITHHOLD, "const uint32_t measured_n_ubatch = measured_first;"))
+
+
+def test_mutant_fit_reads_the_rung_again_before_the_bytes_fails():
+    """Both rung reads before the bytes prove nothing about the bytes."""
+    n = _once(SYCL_CPP, FIT_RUNG_AGAIN, "")
+    assert n.count(FIT_TERM_BYTES) == 1
+    assert not claim_fit_reads_the_rung_around_the_bytes(
+        n.replace(FIT_TERM_BYTES, FIT_RUNG_AGAIN + " " + FIT_TERM_BYTES, 1))
+
+
+def test_mutant_fit_reads_the_bytes_a_second_time_fails():
+    """A second bytes read after the guard could belong to a later load than the rung."""
+    assert not claim_fit_reads_the_rung_around_the_bytes(
+        _once(SYCL_CPP, FIT_ROOM,
+              FIT_ROOM.replace("rung_unchanged ? term_bytes : 0",
+                               "rung_unchanged ? ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device) : 0",
+                               1)))
 
 
 def test_mutant_plan_room_reads_the_plan_field_fails():

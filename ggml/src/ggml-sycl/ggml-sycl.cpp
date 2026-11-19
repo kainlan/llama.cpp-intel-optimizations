@@ -19931,14 +19931,20 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
             ggml_sycl::unified_cache_get_recent_planned_hold_spills(q.device, q.owner, &totals);
             held_out = totals.raw_count != 0;
         }
-        // The micro-batch the load measured the term at, read once: it places the room of a plan that named none,
-        // and bounds the credit of a rung without a record of its own, which a placed micro-batch above it does not.
-        // It is withheld with a 0-byte room: the room's rung is still named when no live load owns a term on the
-        // device, and a rung without a record must not be credited against nothing.
-        const uint32_t measured_n_ubatch = ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device);
+        // The micro-batch the load measured the term at: it places the room of a plan that named none, and bounds the
+        // credit of a rung without a record of its own, which a placed micro-batch above it does not. The rung and
+        // the term's bytes are two records, and the next load can replace the rung once no load holds a term, so one
+        // read of each does not prove they belong to the same load. The rung is read again after the bytes; when the
+        // two reads differ this query credits nothing (0 term bytes, rung 0), so a mismatch can only remove a credit.
+        // The rung is also withheld with a 0-byte room: the room's rung is still named when no live load owns a term
+        // on the device, and a rung without a record must not be credited against nothing.
+        const uint32_t measured_first = ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device);
+        const size_t   term_bytes     = ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device);
+        const bool     rung_unchanged =
+            ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device) == measured_first;
+        const uint32_t measured_n_ubatch = rung_unchanged ? measured_first : 0;
         const size_t   room_bytes        = ggml_sycl::placement_plan_compute_room(
-            *room_plan, q.device, ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device), measured_n_ubatch,
-            &room_n_ubatch);
+            *room_plan, q.device, rung_unchanged ? term_bytes : 0, measured_n_ubatch, &room_n_ubatch);
         in.compute_room_n_ubatch          = room_n_ubatch;
         in.compute_room_bytes             = room_bytes;
         in.compute_room_measured_n_ubatch = room_bytes != 0 ? measured_n_ubatch : 0;

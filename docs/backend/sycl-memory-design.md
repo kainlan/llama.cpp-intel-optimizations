@@ -2888,9 +2888,9 @@ Only the single-device plan places. A multi-device plan makes no decision, so
 its context keeps the context-time path.
 
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
-holds the compute term the load measured at its planning shape, `n_ctx_train`
-and ubatch 512 (`llama.cpp-fkpg`), and the placed micro-batch's ring and dense
-scratch sit beside it. So once the plan has placed the micro-batch, the
+holds the compute term the load measured at the context and micro-batch the
+caller told it (`n_ctx_train` and ubatch 512 where it told none), and the placed
+micro-batch's ring and dense scratch sit beside it. So once the plan has placed the micro-batch, the
 hold-spill fit credits rungs at or below that rung
 (`placement_explicit_ubatch_compute_room()` and
 `zone_hold_fit_rung_has_compute_room()`): a rung's own measured buffer when it
@@ -3459,11 +3459,11 @@ recovery path: it measures the driver's working set and sizes the headroom from 
 
 **Limits.**
 
-- The term is measured at the load's measure shape, `n_ctx_train` and ubatch 512, because the caller's `-c` and `-ub` do
-  not reach the load (`llama.cpp-fkpg`). A `-c` below `n_ctx_train`, llama-bench's small `n_ctx` and `-ub 256` all
-  over-reserve. Above 512 the term under-reserves, and that is the **default** for a dense model, not only an explicit
-  `-ub`: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch` of 2048 a dense model's auto pick
-  climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto 2048,
+- The term is measured at the context and micro-batch the caller tells the load (`n_ctx_hint`, `n_ubatch_hint`), and at
+  `n_ctx_train` and ubatch 512 where it tells none. A load whose model is reused for a later context keeps the term of
+  the shape it was loaded for. Without a named `-ub` the term is measured at 512, and above 512 it under-reserves, which
+  is the **default** for a dense model: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch`
+  of 2048 a dense model's auto pick climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto 2048,
   `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack is smaller. The ladder's per-rung trial
   (`try_candidate`) does not consult the reserved RUNTIME room. It loses a rung only when the runtime-context
   transaction is busy or not the published model's, when the probe refuses the rung, when the rung would demote KV, when
@@ -3472,7 +3472,7 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, and the trial accepts both. So
   a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open finding, not an invariant
   of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
-  auto pick's. `llama.cpp-fkpg` (a) transports the caller's shape.
+  auto pick's.
 - Every load-time path runs at `n_seq_max` 1 and cannot see the context's sequence count. The probe, the admitted stage
   and the late check all build their measure context from the default parameters. So the state term holds one sequence's
   state, and the late check compares one sequence's state with one sequence's state. A context with `-np` above 1
