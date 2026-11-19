@@ -689,8 +689,14 @@ ticket reproduced on:
   zone still holds it, and a smaller Graph floor when the zone was rebuilt
   smaller or a pair was reserved under the failed load's wider bound in
   between. A failed load therefore leaves the live model the Graph room it
-  had. The cap snapshot is not put back: it does not rise while the arena
-  is kept, so a failed load never raised it.
+  had. A live model's pair reserve whose zone ensure runs between the
+  load's two passes stores outside the load's window, so the record notes
+  its plan as another publisher's prior: a refused load's put-back is still
+  sound (the floor is clamped to the zone as it is), but it keeps that
+  reserved pair. The cap snapshot is not put back: it describes the arena
+  as it stands, and a failed load that rebuilt the arena leaves the rebuilt
+  arena in place, so the snapshot stored at that rebuild is the one that
+  arena's cap is derived from.
   ⚠️ **This gemma4 example describes the formula's behavior for the
   `n_ctx` it is actually given at PLANNING time, which is NOT today's
   real runtime context by default.** The floor is computed once, at
@@ -3112,6 +3118,7 @@ The arena can fail to grow for three reasons, and each prints its own line first
   the arena keeps its memory through a rebuild and does not count
   (`zone_arena_rebuild_allowed()` decides). Another live model's allocations are
   one cause; scratch an earlier model left in the arena, and handles that still
+  lease a chunk, are others. When the ONEDNN zone's Graph floor is all the zones
   lack, the zones are kept as they are with a WARN ("A kept ONEDNN zone" above),
   and with no ERROR unless a PP MoE ring alone held the arena: the load's first
   ask, made before the ring's release, has then already printed the ERROR lines

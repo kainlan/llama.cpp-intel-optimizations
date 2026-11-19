@@ -3295,8 +3295,9 @@ struct planner_published_terms {
 // from. Each model on the device plans with these, and every load overwrites them, so a load that fails puts back what
 // it published (load_published_record). The terms keyed by the load's owner are not here (they leave with their owner,
 // unified_cache_drop_planned_load_terms), nor is the compute term's micro-batch, which is sticky by design and which
-// every load records at the same planning value, nor the DIRECT Graph-scratch cap's budget snapshot, which does not
-// rise while the arena is kept and so has nothing for a failed load to lower. Each setter stores what its getter reads,
+// every load records at the same planning value, nor the DIRECT Graph-scratch cap's budget snapshot, which describes
+// the arena as it stands: a failed load that rebuilt the arena leaves the rebuilt arena in place, and the snapshot it
+// stored at that rebuild is the one that arena's cap is derived from. Each setter stores what its getter reads,
 // so a restore is exact, but for the zone snapshot: it describes a zone the failed load may have changed, so it goes
 // back as zone_onednn_plan_keep_short of the prior snapshot over the zone as it is then. The terms fall in groups
 // (load_published_group), each the terms one publisher writes together, and a restore puts back whole groups, so no

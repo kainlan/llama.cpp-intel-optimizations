@@ -27,8 +27,9 @@ the blocked rebuild keeps the zones when the floor is all they lack. These check
   would leave the live model a smaller Graph room for nothing. The published-terms snapshot reads it as its own group
   (differing() and take_groups() carry its arm), and the restore stores zone_onednn_plan_keep_short(prior, prior,
   capacity now, held pair now) under the zone-plan mutex only while the snapshot still holds what the load left
-  (test-zone-sizing Case 44). The DIRECT cap snapshot is not put back (it does not rise while the arena is kept), so the
-  published-terms snapshot does not read it, and the keep path writes no planner-published term;
+  (test-zone-sizing Case 44). The DIRECT cap snapshot is not put back (it describes the arena as it stands, and a
+  failed load that rebuilt the arena leaves the rebuilt arena in place), so the published-terms snapshot does not read
+  it, and the keep path writes no planner-published term;
 - log: the DIRECT-failure ERROR and the plan's "[SYCL-PLAN] oneDNN Graph-scratch zone floor:" line keep their fields
   and append, through one helper, the Graph room the stored zone plan holds whenever it is below the formula floor, so
   neither claims a kept zone holds the floor.
@@ -466,7 +467,7 @@ def test_witnesses():
                GS, "restore")
     # The record not reading the zone plan: a refused load leaves its description, and a smaller Graph room, behind.
     only_fails(mutate_in(UC, TERMS_SIG, TERMS_READ, ""), GS, "restore")
-    # The record reading the DIRECT cap snapshot, which does not rise while the arena is kept and is not put back.
+    # The record reading the DIRECT cap snapshot, which describes the arena as it stands and is not put back.
     only_fails(mutate_in(UC, TERMS_SIG, TERMS_READ, TERMS_READ + f" (void) {SNAPSHOT};"), GS, "restore")
     # A changed zone plan that marks no group: the restore never sees it differ.
     only_fails(mutate_in(UC, DIFFERING_SIG, DIFFERING_ARM, f"bit(false, {ZONE_GROUP})"), GS, "restore")
