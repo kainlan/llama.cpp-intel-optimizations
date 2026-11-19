@@ -574,7 +574,10 @@ struct zone_arena_sizes {
 // bytes the device's arena has when the decision refuses (have is 0 where no arena exists then). At REBUILD_HELD,
 // holders is what the decision found pointing into the arena, which the line names and chooses its remedy from. At
 // RESERVE_FAILED, released is the zones of the arena a rebuild destroyed before the reserve failed. At
-// TEARDOWN_REFUSED, teardown is why the teardown refused. Each is 0 or NONE otherwise.
+// TEARDOWN_REFUSED, teardown is why the teardown refused. Each is 0 or NONE otherwise. keep_deferred is true at
+// REBUILD_HELD when the PP MoE ring alone holds the arena, the caller asked to release it first
+// (zone_arena_ensure_options::ring_release_first), and the zones would otherwise have been kept
+// (zone_arena_shortfall_is_reservation_only): asked again without that request, they are kept.
 struct zone_arena_refusal {
     zone_arena_refusal_reason   reason = zone_arena_refusal_reason::NONE;
     int                         device = -1;
@@ -582,7 +585,19 @@ struct zone_arena_refusal {
     zone_arena_sizes            have;
     zone_arena_holders          holders;
     zone_arena_sizes            released;
-    zone_arena_teardown_refusal teardown = zone_arena_teardown_refusal::NONE;
+    zone_arena_teardown_refusal teardown      = zone_arena_teardown_refusal::NONE;
+    bool                        keep_deferred = false;
+};
+
+// How a caller asks for the arena's planned zones (unified_cache::ensure_planned_arena_zones).
+struct zone_arena_ensure_options {
+    // The caller releases the PP MoE ring and asks again when the ring alone holds an arena that must grow (the load
+    // stage's entry ensure). A rebuild gives the load its whole Graph floor, and keeping a short ONEDNN zone is the
+    // fallback for a rebuild something live blocks, so while that last resort is still to come no zone is kept: the
+    // call refuses as it would without the keep and sets the refusal's keep_deferred.
+    bool     ring_release_first = false;
+    // The load transaction the call is part of. 0 outside a staged load.
+    uint64_t load_txn           = 0;
 };
 
 // Whether a rebuild of the arena that something live blocks can be answered by keeping the zones as they are: SCRATCH

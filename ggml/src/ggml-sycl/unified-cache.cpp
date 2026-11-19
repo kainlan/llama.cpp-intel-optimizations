@@ -920,6 +920,38 @@ static void onednn_zone_plan_keep_and_store(int device_id, const zone_onednn_pla
     g_onednn_zone_plan[device_id] = zone_onednn_plan_keep(g_onednn_zone_plan[device_id], plan);
 }
 
+// Whether a rebuild that something live blocks is short of the oneDNN Graph floor alone
+// (zone_arena_shortfall_is_reservation_only, over the pair zone_onednn_plan_keep_short keeps room for), and when it is
+// and `store` is true, the keep: the snapshot becomes zone_onednn_plan_keep_short over the one held, the live plan, the
+// ONEDNN zone's capacity and the pair held in it. One critical section, as in onednn_zone_plan_keep_and_store, so two
+// callers keeping on one device cannot each read the same snapshot and drop the other's figure. `kept` receives the
+// snapshot whether or not it is stored. Takes the mutex itself, so it must not call the accessors above.
+static bool onednn_zone_plan_keep_short_and_store(int                      device_id,
+                                                  const zone_onednn_plan & live,
+                                                  const zone_arena_sizes & have,
+                                                  const zone_arena_sizes & need,
+                                                  size_t                   held_pair_bytes,
+                                                  bool                     store,
+                                                  zone_onednn_plan *       kept) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
+    const zone_onednn_plan      short_plan =
+        zone_onednn_plan_keep_short(g_onednn_zone_plan[device_id], live, have.onednn, held_pair_bytes);
+    if (kept != nullptr) {
+        *kept = short_plan;
+    }
+    if (!zone_arena_shortfall_is_reservation_only(have, need,
+                                                  zone_onednn_kept_pair_bytes(short_plan, held_pair_bytes))) {
+        return false;
+    }
+    if (store) {
+        g_onednn_zone_plan[device_id] = short_plan;
+    }
+    return true;
+}
+
 // The most an op's f16 pair may be for the ONEDNN zone of capacity `capacity_bytes` on `device_id` to count it as
 // planned (zone_onednn_pp_pair_bound over the snapshot above). The one source for the admission accessor and for the
 // reserve's own merge and refusal, so the two cannot disagree about what the zone was planned to hold.
@@ -7529,7 +7561,8 @@ static const char * arena_teardown_cause_name(zone_arena_teardown_refusal cause)
     return "no cause recorded";
 }
 
-bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
+bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *              refusal,
+                                               const zone_arena_ensure_options & options) {
     if (!vram_arena_enabled()) {
         return true;
     }
@@ -7847,6 +7880,24 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
         holders.chunk_leases    = chunk_leases;
         arena_count_scratch_holders(holders);
         if (!zone_arena_rebuild_allowed(holders)) {
+            // Keeping the zones as they are answers a rebuild something live blocks when the oneDNN Graph floor is all
+            // they lack: the floor is a reservation, served on the DIRECT path under its cap beyond what the zone
+            // holds, and a context whose Graph scratch the kept room cannot hold is refused by name at the context.
+            // While the caller's last resort is still to come, a PP MoE ring that alone holds the arena keeps nothing:
+            // a rebuild after its release gives the load its whole Graph floor, and a short zone is the fallback for a
+            // rebuild something live blocks. The call then refuses as below and marks the refusal, and the caller asks
+            // again once it has released the ring or found it claimed.
+            const zone_arena_sizes need       = { scratch_zone, onednn_zone, runtime_zone };
+            const bool             defer_keep = options.ring_release_first && zone_arena_only_ring_holds(true, holders);
+            const size_t           held_pair  = arena_held_onednn_pair_bytes();
+            const bool reservation_only = onednn_zone_plan_keep_short_and_store(dev_id, live_plan, arena_zones, need,
+                                                                                held_pair, !defer_keep, nullptr);
+            if (reservation_only && !defer_keep) {
+                if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
+                    bind_compute_arena();
+                }
+                return true;
+            }
             const size_t blocked_bytes =
                 live_zone_bytes != 0 ? live_zone_bytes : (scratch_zone + onednn_zone + runtime_zone);
             residency_diagnostics_record_live_handle_for_test("arena-rebuild", "VRAM_ARENA", blocked_bytes);
@@ -7948,11 +7999,12 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
             // The caller's refusal of its load names the figures the ERROR line above printed, and the holders the gate
             // refused on, which choose its remedy.
             if (refusal != nullptr) {
-                refusal->reason  = zone_arena_refusal_reason::REBUILD_HELD;
-                refusal->device  = dev_id;
-                refusal->need    = { scratch_zone, onednn_zone, runtime_zone };
-                refusal->have    = arena_zones;
-                refusal->holders = holders;
+                refusal->reason        = zone_arena_refusal_reason::REBUILD_HELD;
+                refusal->device        = dev_id;
+                refusal->need          = { scratch_zone, onednn_zone, runtime_zone };
+                refusal->have          = arena_zones;
+                refusal->holders       = holders;
+                refusal->keep_deferred = reservation_only && defer_keep;
             }
             return false;
         }
@@ -28674,7 +28726,9 @@ bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes) {
     return cache->reserve_compute_arena(arena_bytes);
 }
 
-bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal * refusal) {
+bool unified_cache_ensure_planned_arena_zones(int                               device_id,
+                                              zone_arena_refusal *              refusal,
+                                              const zone_arena_ensure_options & options) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (!cache) {
         if (refusal != nullptr) {
@@ -28683,7 +28737,7 @@ bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal 
         }
         return false;
     }
-    return cache->ensure_planned_arena_zones(refusal);
+    return cache->ensure_planned_arena_zones(refusal, options);
 }
 
 #if GGML_SYCL_DNNL
@@ -31955,6 +32009,18 @@ uint32_t unified_cache::arena_chunk_lease_count(int chunk_idx) const {
 
 uint32_t unified_cache::arena_chunk_lease_count_at(chunk_lease_tag tag) const {
     return arena_chunk_leases_of(tag).load(std::memory_order_relaxed);
+}
+
+size_t unified_cache::arena_held_onednn_pair_bytes() {
+    // Read without the oneDNN scratch lock, as arena_count_scratch_holders reads these buffers and for its reason.
+    size_t held = 0;
+    if (onednn_weights_scratch_ != nullptr && vram_owns(onednn_weights_scratch_)) {
+        held += onednn_weights_scratch_size_;
+    }
+    if (onednn_activations_scratch_ != nullptr && vram_owns(onednn_activations_scratch_)) {
+        held += onednn_activations_scratch_size_;
+    }
+    return held;
 }
 
 void unified_cache::arena_count_scratch_holders(zone_arena_holders & holders) {

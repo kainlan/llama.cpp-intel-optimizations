@@ -283,7 +283,8 @@ FIRST_PLAN = "plan_candidate = plan_single_device(true);"
 FALLBACK = "if (!placed) {"
 REPUBLISH = "(void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);"
 RESTORE = "published_before.restore(ctx->device);"
-FALLBACK_ENSURE = "if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {"
+FALLBACK_ENSURE = ("if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal, "
+                   "ggml_sycl_load_arena_options())) {")
 FALLBACK_PLAN = "plan_candidate = plan_single_device(false);"
 
 

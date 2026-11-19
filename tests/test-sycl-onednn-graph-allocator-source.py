@@ -2537,7 +2537,8 @@ PURE_FLOOR_CALL = "zone_onednn_graph_scratch_floor_bytes"
 PURE_FLOOR_SIG = f"size_t {PURE_FLOOR_CALL}("
 PAIR_AND_FLOOR = "onednn_planned_pair_and_floor"
 PAIR_AND_FLOOR_SIG = f"static zone_onednn_plan {PAIR_AND_FLOOR}(int device_id, size_t direct_cap) {{"
-ENSURE_ZONES_SIG = "bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {"
+ENSURE_ZONES_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
+                    "const zone_arena_ensure_options & options) {")
 WITH_FLOOR_GETTER_SIG = "size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {"
 PURE_FLOOR_ARGS = ["n_head_ctx_max", "n_head_swa_max", "n_swa", "n_ubatch", "n_ctx", "direct_cap"]
 DEVICE_DIRECT_CAP = "unified_cache_onednn_graph_scratch_direct_cap_bytes(device_id)"

@@ -18256,21 +18256,40 @@ static bool ggml_sycl_plan_has_storage_table(const ggml_sycl::placement_plan & p
     return false;
 }
 
+// What every zone ensure of the load stage passes the cache: the load transaction it is part of, this thread's staged
+// load (0 for a direct planner entry).
+static ggml_sycl::zone_arena_ensure_options ggml_sycl_load_arena_options() {
+    ggml_sycl::zone_arena_ensure_options options;
+    options.load_txn = g_sycl_plan_load_effect_txn;
+    return options;
+}
+
 // The zones a load's plan is sized in, asked for at the planner's entry. When a rebuild is needed and the PP MoE ring's
 // slot buffers are the arena's only holders, the ring is released as the last resort through the cache's own release,
 // and the zones are asked for again. That release keeps a ring while a prefill's claim on one of its slots is held, and
 // a claim outlives its prefill: it is let go when a later prefill takes that slot, when a context on the device is
-// freed (its backend drains the device's slots), or when it is released unused. A kept ring refuses the load as any
-// holder does. It is the only ring release a decide step of the load stage makes. Caller holds
+// freed (its backend drains the device's slots), or when it is released unused. It is the only ring release a decide
+// step of the load stage makes. A rebuild something live blocks keeps the zones when the oneDNN Graph floor is all they
+// lack (unified_cache::ensure_planned_arena_zones), but not before this last resort: a rebuild after the release
+// gives the load its whole Graph floor, and a short zone is the fallback for a rebuild something live blocks. So the
+// first call asks the cache to release the ring first (ring_release_first), and once the last resort is spent (the
+// ring released, or kept because a prefill's claim on one of its slots is held) the call that asks again may keep the
+// zones. The cache alone decides a keep and says through the refusal's keep_deferred that it would have kept; a kept
+// ring whose arena the cache would not keep refuses the load as any holder does. Caller holds
 // g_tensor_inventory_mutex.
 static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_refusal & refusal) {
-    if (ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal)) {
+    ggml_sycl::zone_arena_ensure_options options = ggml_sycl_load_arena_options();
+    options.ring_release_first                   = true;
+    if (ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options)) {
         return true;
     }
     if (!ggml_sycl::zone_arena_only_ring_holds(refusal.reason == ggml_sycl::zone_arena_refusal_reason::REBUILD_HELD,
                                                refusal.holders)) {
         return false;
     }
+    // The last resort is taken below, so every call after it may keep the zones.
+    options.ring_release_first = false;
+
     // Needed only because the ring outlives the context that sized it: once a context's teardown releases its own
     // ring, no ring can be left alone in the arena and this branch can go.
     ggml_sycl::unified_cache * cache        = ggml_sycl::get_existing_unified_cache_for_device(device);
@@ -18280,14 +18299,18 @@ static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_
             "[SYCL-PLAN] model load kept the PP MoE oneDNN scratch ring (%u slot buffers) on device %d: it is the only "
             "holder of an arena whose zones must grow, and a prefill's claim on one of its slots is still held\n",
             slot_buffers, device);
-        return false;
+        if (!refusal.keep_deferred) {
+            return false;
+        }
+        refusal = {};
+        return ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options);
     }
     GGML_LOG_WARN(
         "[SYCL-PLAN] model load released the PP MoE oneDNN scratch ring (%u slot buffers) on device %d: it was the "
         "only holder of an arena whose zones must grow\n",
         slot_buffers, device);
     refusal = {};
-    return ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal);
+    return ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options);
 }
 
 // Phase C helper: run compute_placement_plan (single- or multi-device) and
@@ -18330,8 +18353,10 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         // model's allocations, or what a freed model's context left (chunk leases, or its PP MoE ring beside another
         // holder or while a prefill's claim on one of its slots is held). Any term of this load can then need more than
         // the zones hold, not only a compute term larger than a live model's: the device-wide terms are this load's
-        // alone. The load is refused by name and whatever holds the arena keeps running; the abort of the load's owner
-        // effects puts back the terms it published. A refused teardown of the arena refuses it the same way.
+        // alone. A load whose oneDNN Graph floor is all the zones lack keeps them and is not refused here (the Graph
+        // floor is a reservation; see unified_cache::ensure_planned_arena_zones). Any other shortfall refuses the load
+        // by name and whatever holds the arena keeps running; the abort of the load's owner effects puts back the terms
+        // it published. A refused teardown of the arena refuses it the same way.
         GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
         return false;
     }
@@ -18465,7 +18490,8 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             const size_t room_short =
                 plan_candidate.explicit_ubatch.room_bytes - plan_candidate.explicit_ubatch.room_reserved_bytes;
             bool placed = ggml_sycl_publish_load_ubatch_scratch(ctx->device, explicit_n_ubatch) &&
-                          ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device);
+                          ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, nullptr,
+                                                                              ggml_sycl_load_arena_options());
             if (placed) {
                 plan_candidate = plan_single_device(/*with_room=*/true);
                 placed =
@@ -18481,10 +18507,12 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 // they hold, and the plan without the room publishes its own.
                 (void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);
                 published_before.restore(ctx->device);
-                // The zones are asked for no more than the entry ensure found they hold, so this refuses only when
-                // the arena changed in between, a refused teardown above having closed it among those changes; it
-                // refuses the load the same way.
-                if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {
+                // The zones are asked for no more than the entry ensure found they hold or kept short, so this refuses
+                // only when the arena changed in between, a refused teardown above having closed it among those
+                // changes; it refuses the load the same way. The entry ensure's last resort is spent, so this call
+                // keeps a short ONEDNN zone as that one did.
+                if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal,
+                                                                         ggml_sycl_load_arena_options())) {
                     GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
                     return false;
                 }

@@ -5002,7 +5002,14 @@ class unified_cache {
     // A rebuild whose teardown refuses is refused too, and no arena is
     // reserved after it; while a refused teardown has left the arena closed,
     // every call refuses for it, whatever the zones hold.
-    bool ensure_planned_arena_zones(zone_arena_refusal * refusal = nullptr);
+    // A rebuild that live allocations block keeps the zones as they are when
+    // the oneDNN Graph scratch floor is all they lack
+    // (zone_arena_shortfall_is_reservation_only): the call returns true and
+    // describes the ONEDNN zone by what it holds (zone_onednn_plan_keep_short),
+    // unless `options` asks to release a PP MoE ring that alone holds the
+    // arena first (zone_arena_ensure_options::ring_release_first).
+    bool ensure_planned_arena_zones(zone_arena_refusal *              refusal = nullptr,
+                                    const zone_arena_ensure_options & options = {});
 
     // Is arena active?
     bool arena_active() const { return zone_backed(); }
@@ -6321,6 +6328,10 @@ class unified_cache {
     // allocations. Takes the PP MoE ring's lock, the persistent scratch lock, then each allocator group's lock, each
     // alone.
     void arena_count_scratch_holders(zone_arena_holders & holders);
+
+    // The bytes of the oneDNN weights and activations scratch pair that lie inside the arena, which a kept ONEDNN zone
+    // must go on holding. A buffer allocated outside the arena takes none of the zone. Takes no lock.
+    size_t arena_held_onednn_pair_bytes();
 
     // Per-physical-chunk TLSF allocators for the WEIGHT zone in N-chunk mode.
     // A weight tensor must not span a chunk boundary (each chunk is its own
@@ -9174,7 +9185,9 @@ bool unified_cache_copy_from_host_async(int                              device_
 // Must be called BEFORE S1-PRELOAD to guarantee VRAM availability.
 bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes);
 // unified_cache::ensure_planned_arena_zones() on the device's cache; a device with no cache is a NO_CACHE refusal.
-bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal * refusal = nullptr);
+bool unified_cache_ensure_planned_arena_zones(int                               device_id,
+                                              zone_arena_refusal *              refusal = nullptr,
+                                              const zone_arena_ensure_options & options = {});
 
 #if GGML_SYCL_DNNL
 // llama.cpp-0oxf: external entry point for reclaiming (real release) every
