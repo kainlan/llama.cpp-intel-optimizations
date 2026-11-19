@@ -93,6 +93,8 @@ void ggml_sycl_moe_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cg
 // gpu_ids: host array of expert slot indices (parallel to gpu_expert_ids)
 // n_gpu_entries: number of GPU-dispatched entries
 // Returns true if handled, false to fall back to per-expert loop.
+// reject_reason, reject_bytes: on a false return, the cause (a string literal) and, for a scratch allocation that
+// failed, the bytes it requested (0 for any other cause). Both are cleared on entry.
 bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                const ggml_tensor *              src0,
                                const ggml_tensor *              src1,
@@ -112,7 +114,9 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                int64_t                          ids_host_count       = 0,
                                sycl::event *                    completion_event     = nullptr,
                                bool *                           completion_event_set = nullptr,
-                               const std::vector<sycl::event> * deps                 = nullptr);
+                               const std::vector<sycl::event> * deps                 = nullptr,
+                               const char **                    reject_reason        = nullptr,
+                               size_t *                         reject_bytes         = nullptr);
 
 bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(ggml_backend_sycl_context & ctx,
                                               const ggml_tensor *         src0_a,

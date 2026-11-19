@@ -19,6 +19,10 @@
 #include "unified-kernel.hpp"  // For split barrier support
 #include "vecdotq.hpp"
 
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+#    include "tests/q1-nvfp4-production-route-test-seam.hpp"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -17290,11 +17294,30 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                int64_t                          ids_host_count,
                                sycl::event *                    completion_event,
                                bool *                           completion_event_set,
-                               const std::vector<sycl::event> * deps) {
+                               const std::vector<sycl::event> * deps,
+                               const char **                    reject_reason,
+                               size_t *                         reject_bytes) {
     if (completion_event_set) {
         *completion_event_set = false;
     }
-    auto log_dispatch_reject = [&](const char * reason) {
+    if (reject_reason) {
+        *reject_reason = nullptr;
+    }
+    if (reject_bytes) {
+        *reject_bytes = 0;
+    }
+    // Every false return goes through reject(), so a caller that must refuse the op (a type with no other device
+    // executor) can say which precondition failed and, for a scratch allocation, how many bytes it asked for.
+    auto reject = [&](const char * reason, size_t bytes = 0) {
+        if (reject_reason) {
+            *reject_reason = reason;
+        }
+        if (reject_bytes) {
+            *reject_bytes = bytes;
+        }
+        return false;
+    };
+    auto log_dispatch_reject = [&](const char * reason, size_t bytes = 0) {
         static std::atomic<int> reject_log{ 0 };
         const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
         if (row_agg_debug && std::atoi(row_agg_debug) != 0 && reject_log.fetch_add(1, std::memory_order_relaxed) < 96) {
@@ -17304,10 +17327,10 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     src0 && src0->name ? src0->name : "?", reason, (int) layout, n_gpu_entries,
                     (const void *) expert_ptrs_device, (const void *) ids_host, (long long) ids_host_count);
         }
+        return reject(reason, bytes);
     };
     if (n_gpu_entries <= 0 || !expert_ptrs_device) {
-        log_dispatch_reject(n_gpu_entries <= 0 ? "no-entries" : "no-expert-ptrs");
-        return false;
+        return log_dispatch_reject(n_gpu_entries <= 0 ? "no-entries" : "no-expert-ptrs");
     }
 
     // Only handle quantized types with _id kernels. The admitted set is shared
@@ -17315,10 +17338,8 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     // drift; see that header for why an over-advertised pair is worse than a
     // refusal here.
     if (!moe_mmvq_batched_dispatch_supports_layout(src0->type, layout)) {
-        const char * reject_reason =
-            moe_mmvq_batched_dispatch_supports_type(src0->type) ? "layout-unsupported" : "type-unsupported";
-        log_dispatch_reject(reject_reason);
-        return false;
+        return log_dispatch_reject(moe_mmvq_batched_dispatch_supports_type(src0->type) ? "layout-unsupported" :
+                                                                                         "type-unsupported");
     }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
@@ -17344,8 +17365,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     const int64_t total_src1_rows = ne11 * ne12;
     const size_t  required_size   = total_src1_rows * q8_1_row_size;
     if (ne10 <= 0 || ne11 <= 0 || ne12 <= 0 || total_src1_rows <= 0 || q8_1_row_size <= 0 || required_size == 0) {
-        log_dispatch_reject("invalid-q8-shape");
-        return false;
+        return log_dispatch_reject("invalid-q8-shape");
     }
 
     const int     runtime_device = ctx.device;
@@ -17353,7 +17373,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     float *       dst_d          = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(dst, runtime_device));
     if (!src1_d || !dst_d) {
         GGML_SYCL_DEBUG("[MMVQ] Missing resolved ptrs for batched MoE dispatch (%s)\n", src0->name ? src0->name : "?");
-        return false;
+        return log_dispatch_reject("unresolved-src1-dst");
     }
 
     // Use SoA quantizer if weights are in reordered layout (both SoA and COALESCED kernels expect SoA Y)
@@ -17387,7 +17407,8 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             mxfp4_moe_tg_reuse_invalidate();
         }
         if (!q8_1_buffer) {
-            return false;
+            // The allocator was told not to log a failure, so this reason is the only record of it.
+            return log_dispatch_reject("q8-scratch-alloc", required_size);
         }
         local_temps.add(std::move(q8_handle));
     }
@@ -17533,8 +17554,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     int32_t * ids_device = const_cast<int32_t *>(direct_ids_device);
     if (!can_use_direct_ids) {
         if (!gpu_expert_ids || !gpu_iid1s || !gpu_ids) {
-            log_dispatch_reject("missing-host-routing");
-            return false;
+            return log_dispatch_reject("missing-host-routing");
         }
         // Build full-size expert_id array for all slots.  GPU entries get
         // their real expert_id; CPU entries get the first GPU entry's
@@ -17568,10 +17588,11 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
 
         // Allocate device buffer for batch ids and upload.
         ggml_sycl::mem_handle ids_handle;
-        ids_device = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(
-            static_cast<size_t>(total_batches) * sizeof(int32_t), *stream, "mmvq_moe_batched_ids", ids_handle));
+        const size_t          ids_bytes = static_cast<size_t>(total_batches) * sizeof(int32_t);
+        ids_device                      = reinterpret_cast<int32_t *>(
+            mmvq_alloc_device_scratch(ids_bytes, *stream, "mmvq_moe_batched_ids", ids_handle));
         if (!ids_device) {
-            return false;
+            return log_dispatch_reject("ids-scratch-alloc", ids_bytes);
         }
         local_temps.add(std::move(ids_handle));
         kernel_deps.push_back(
@@ -17594,10 +17615,14 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     int32_t * grouped_chunk_starts_device = nullptr;
     int       grouped_n_groups            = 0;
     int       grouped_n_chunks            = 0;
+    // The size of the most recent grouped scratch request, so a chain of allocations that stops at its first
+    // failure can report what that one asked for.
+    size_t    scratch_request_bytes       = 0;
     auto      alloc_i32_scratch           = [&](int32_t *& ptr, size_t count, const char * cohort) {
         ptr = nullptr;
         ggml_sycl::mem_handle handle;
-        ptr = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(count * sizeof(int32_t), *stream, cohort, handle));
+        scratch_request_bytes = count * sizeof(int32_t);
+        ptr = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(scratch_request_bytes, *stream, cohort, handle));
         if (ptr) {
             local_temps.add(std::move(handle));
         }
@@ -17654,14 +17679,22 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_NVFP4:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
-                ne00 > INT_MAX || ne01 > INT_MAX ||
-                !mmvq_submit_q1_nvfp4_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer,
-                                              dispatch_ids, dst_d, static_cast<int>(ne00),
-                                              static_cast<int>(ne01), static_cast<int>(total_batches),
-                                              static_cast<int>(n_ids), static_cast<int>(num_tokens),
-                                              static_cast<int>(ne11), ids_nb0, ids_nb1, q8_nb11, q8_nb12,
-                                              nb1, nb2, &kernel_deps, &kernel_event)) {
-                return false;
+                ne00 > INT_MAX || ne01 > INT_MAX) {
+                return log_dispatch_reject("int-max-bound");
+            }
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+            // Private-testing failpoint: refuse once here, after every scratch is in place and before the
+            // submit, so a test can watch the caller turn a false return into a named, recoverable refusal.
+            if (ggml_sycl_q1_nvfp4_test_failure_take(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BATCHED_DISPATCH)) {
+                return log_dispatch_reject("test-failpoint");
+            }
+#endif
+            if (!mmvq_submit_q1_nvfp4_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids,
+                                             dst_d, static_cast<int>(ne00), static_cast<int>(ne01),
+                                             static_cast<int>(total_batches), static_cast<int>(n_ids),
+                                             static_cast<int>(num_tokens), static_cast<int>(ne11), ids_nb0, ids_nb1,
+                                             q8_nb11, q8_nb12, nb1, nb2, &kernel_deps, &kernel_event)) {
+                return log_dispatch_reject("submit-precondition");
             }
             have_kernel_event = true;
             break;
@@ -17681,13 +17714,15 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q2_0:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
-                ne00 > INT_MAX || ne01 > INT_MAX ||
-                !mmvq_submit_quant_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids, dst_d,
+                ne00 > INT_MAX || ne01 > INT_MAX) {
+                return log_dispatch_reject("int-max-bound");
+            }
+            if (!mmvq_submit_quant_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids, dst_d,
                                           static_cast<int>(ne00), static_cast<int>(ne01),
                                           static_cast<int>(total_batches), static_cast<int>(n_ids),
                                           static_cast<int>(num_tokens), static_cast<int>(ne11), ids_nb0, ids_nb1,
                                           q8_nb11, q8_nb12, nb1, nb2, &kernel_deps, &kernel_event)) {
-                return false;
+                return log_dispatch_reject("submit-precondition");
             }
             have_kernel_event = true;
             break;
@@ -17712,7 +17747,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         ne10,  // ncols_y: the SOA Q8_1 row's quant bytes
                         ne01, ne02, total_batches, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, nb1, nb2,
                         stream, &kernel_deps, &kernel_event)) {
-                    return false;
+                    return log_dispatch_reject("q8-0-soa-submit");
                 }
             } else {
                 mul_mat_vec_q8_0_q8_1_id_sycl(nullptr, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00, ne01,
@@ -17727,7 +17762,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 constexpr int exec_n         = GGML_SYCL_MXFP4_MOE_XMX_N;
                 constexpr int k_per          = GGML_SYCL_MXFP4_MOE_XMX_K;
                 const auto &  caps           = ggml_sycl_info().devices[ctx.device].xmx_caps;
-                auto          log_xmx_reject = [&](const char * reason) {
+                auto          log_xmx_reject = [&](const char * reason, size_t bytes = 0) {
                     static std::atomic<int> reject_log{ 0 };
                     const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
                     if (row_agg_debug && std::atoi(row_agg_debug) != 0 &&
@@ -17741,6 +17776,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                          (long long) ne00, k_per, caps.supported ? 1 : 0, caps.supports_int8 ? 1 : 0, caps.N,
                                          caps.optimal_tiles_n);
                     }
+                    return reject(reason, bytes);
                 };
                 const bool xmx_caps_ok = xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) &&
                                          xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG) &&
@@ -17752,13 +17788,11 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                                       can_use_direct_ids && route_ids_device != nullptr &&
                                                       ids_nb0 > 0 && ids_nb1 > 0;
                 if (!xmx_shape_ok || !xmx_caps_ok || (!xmx_route_arrays_ok && !device_grouped_xmx_shape)) {
-                    log_xmx_reject(!xmx_shape_ok ? "shape" : (!xmx_caps_ok ? "caps" : "route-arrays"));
-                    return false;
+                    return log_xmx_reject(!xmx_shape_ok ? "shape" : (!xmx_caps_ok ? "caps" : "route-arrays"));
                 }
                 const int tile_n_total = caps.N * caps.optimal_tiles_n;
                 if (tile_n_total < repeat || (tile_n_total % repeat) != 0) {
-                    log_xmx_reject("tile-n-total");
-                    return false;
+                    return log_xmx_reject("tile-n-total");
                 }
                 // Partial cover is a normal hybrid decode shape: the device owns some of the
                 // (id, token) slots and the host experts own the rest (their rows are the
@@ -17769,8 +17803,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 const bool grouped_decode_shape =
                     moe_mmvq_xmx_tiled_grouped_accepts_cover(full_gpu_cover, n_gpu_entries, xmx_route_arrays_ok);
                 if (!grouped_decode_shape) {
-                    log_xmx_reject("coverage");
-                    return false;
+                    return log_xmx_reject("coverage");
                 }
                 if (device_grouped_xmx_shape && !xmx_route_arrays_ok) {
                     const int n_experts_i = n_experts;
@@ -17787,8 +17820,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         !alloc_i32_scratch(grouped_chunk_starts_device, static_cast<size_t>(max_chunks),
                                            "mmvq_moe_xmx_device_grouped_chunk_starts") ||
                         !alloc_i32_scratch(active_chunks_device, 1, "mmvq_moe_xmx_device_grouped_active_chunks")) {
-                        log_xmx_reject("device-group-alloc");
-                        return false;
+                        return log_xmx_reject("device-group-alloc", scratch_request_bytes);
                     }
                     std::vector<sycl::event> grouped_deps;
                     grouped_deps.reserve(kernel_deps.size() + 1);
@@ -17828,18 +17860,15 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 for (int i = 0; i < n_gpu_entries; ++i) {
                     const int32_t eid = gpu_expert_ids[i];
                     if (eid < 0 || eid >= n_experts) {
-                        log_xmx_reject("expert-id");
-                        return false;
+                        return log_xmx_reject("expert-id");
                     }
                     const int64_t slot64 = gpu_ids[i] * num_tokens + gpu_iid1s[i];
                     if (slot64 < 0 || slot64 >= total_batches) {
-                        log_xmx_reject("slot-range");
-                        return false;
+                        return log_xmx_reject("slot-range");
                     }
                     const size_t slot = static_cast<size_t>(slot64);
                     if (seen_slots[slot]) {
-                        log_xmx_reject("slot-duplicate");
-                        return false;
+                        return log_xmx_reject("slot-duplicate");
                     }
                     seen_slots[slot] = 1;
 
@@ -17855,8 +17884,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 if (full_gpu_cover) {
                     for (uint8_t seen : seen_slots) {
                         if (!seen) {
-                            log_xmx_reject("slot-missing");
-                            return false;
+                            return log_xmx_reject("slot-missing");
                         }
                     }
                 }
@@ -17880,8 +17908,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 grouped_n_groups = static_cast<int>(grouped_experts_host.size());
                 grouped_n_chunks = static_cast<int>(grouped_chunk_groups_host.size());
                 if (grouped_n_groups <= 0 || grouped_n_chunks <= 0) {
-                    log_xmx_reject("group-empty");
-                    return false;
+                    return log_xmx_reject("group-empty");
                 }
                 // Every device entry owns a distinct slot (the slot-duplicate test above), and
                 // each contributes exactly one row, so this holds by construction.
@@ -17902,14 +17929,12 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         for (int c = 0; c < grouped_n_chunks; ++c) {
                             const int group = grouped_chunk_groups_host[static_cast<size_t>(c)];
                             if (group < 0 || group >= grouped_n_groups) {
-                                log_xmx_reject("chunk-group");
-                                return false;
+                                return log_xmx_reject("chunk-group");
                             }
                             const int row_start  = grouped_chunk_starts_host[static_cast<size_t>(c)];
                             const int group_rows = grouped_counts_host[static_cast<size_t>(group)];
                             if (row_start < 0 || row_start >= group_rows) {
-                                log_xmx_reject("chunk-row");
-                                return false;
+                                return log_xmx_reject("chunk-row");
                             }
                             const size_t chunk_rows = static_cast<size_t>(std::min(exec_n, group_rows - row_start));
                             if (pass_rows > 0 && pass_rows + chunk_rows > row_limit) {
@@ -17925,15 +17950,14 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         chunked_row_limit = !chunk_passes.empty();
                     }
                     if (!chunked_row_limit) {
-                        log_xmx_reject(occupancy.reason);
-                        return false;
+                        return log_xmx_reject(occupancy.reason);
                     }
                 }
 
                 auto * grouped_scratch_extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
                 if (!grouped_scratch_extra) {
-                    log_xmx_reject("group-alloc");
-                    return false;
+                    // No tensor extra to own the cached grouped scratch: nothing was allocated.
+                    return log_xmx_reject("group-scratch-owner");
                 }
                 auto & grouped_scratch    = grouped_scratch_extra->weight().moe_grouped_scratch[ctx.device];
                 auto   cached_i32_scratch = [&](ggml_sycl::mem_handle & cache_handle, size_t & cache_capacity,
@@ -17954,8 +17978,9 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         cache_capacity = 0;
                     }
                     ggml_sycl::mem_handle fresh_handle;
-                    ptr = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(
-                        count * sizeof(int32_t), *stream, cohort, fresh_handle, /*persistent=*/true));
+                    scratch_request_bytes = count * sizeof(int32_t);
+                    ptr = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(scratch_request_bytes, *stream, cohort,
+                                                                                fresh_handle, /*persistent=*/true));
                     if (!ptr) {
                         return false;
                     }
@@ -17977,8 +18002,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     !cached_i32_scratch(grouped_scratch.chunk_starts_handle, grouped_scratch.chunk_starts_capacity,
                                         grouped_chunk_starts_device, grouped_chunk_starts_host.size(),
                                         "mmvq_moe_batched_grouped_chunk_starts")) {
-                    log_xmx_reject("group-alloc");
-                    return false;
+                    return log_xmx_reject("group-alloc", scratch_request_bytes);
                 }
                 std::vector<sycl::event> grouped_copy_events;
                 grouped_copy_events.reserve(5);
@@ -18038,7 +18062,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 if (!reorder_mul_mat_vec_mxfp4_dpas_q8_1_id_sycl(ctx, dispatch_ptrs, q8_1_buffer, dst_d, ne00, ne10,
                                                                  ne01, total_batches, num_tokens, ne11, q8_nb11,
                                                                  q8_nb12, nb1, nb2, kernel_deps)) {
-                    return false;
+                    return log_dispatch_reject("mxfp4-dpas-submit");
                 }
             } else if (layout == GGML_LAYOUT_MXFP4_I8) {
                 constexpr int repeat          = GGML_SYCL_MXFP4_MOE_XMX_M;
@@ -18087,7 +18111,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         !alloc_i32_scratch(grouped_chunk_starts_device, static_cast<size_t>(max_chunks),
                                            "mmvq_moe_batched_device_grouped_chunk_starts") ||
                         !alloc_i32_scratch(active_chunks_device, 1, "mmvq_moe_batched_device_grouped_active_chunks")) {
-                        return false;
+                        return log_dispatch_reject("device-group-alloc", scratch_request_bytes);
                     }
                     std::vector<sycl::event> grouped_deps;
                     grouped_deps.reserve(kernel_deps.size() + 1);
@@ -18101,7 +18125,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     if (mxfp4_moe_device_grouping_sync_chunks_enabled()) {
                         device_n_chunks = mxfp4_copy_active_chunks_to_host(*stream, active_chunks_device, grouped_deps);
                         if (device_n_chunks <= 0 || device_n_chunks > max_chunks) {
-                            return false;
+                            return log_dispatch_reject("device-group-chunks");
                         }
                         active_chunks_arg = nullptr;
                     }
@@ -18352,7 +18376,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             }
             break;
         default:
-            return false;
+            return log_dispatch_reject("type-unsupported");
     }
     if (tg_profile) {
         if (have_kernel_event) {

@@ -250,8 +250,9 @@ inline size_t moe_admitted_recipe_signature(const moe_execution_recipe & recipe,
 // micro-batch (plan_moe_host_workspace) and checked exactly by validate_moe_execution_recipe, never the pinned buffer
 // pool the other host experts share. The prompt CPU island does not run them for that reason
 // (ggml_sycl_moe_pp_cpu_island_runs_type). On a device they need nothing of their own: the capability query answers
-// the MMVQ_COMPAT id kernel for them as for any MMVQ id type, and validate_moe_execution_recipe checks the direct
-// kernel's recipe by its kernel, not by this type test.
+// the MMVQ_COMPAT id kernel for them, but more narrowly than for other MMVQ id types (only an expert local to the
+// submitting card, in AOS, with a block-aligned K), and validate_moe_execution_recipe checks the direct kernel's
+// recipe by its kernel, not by this type test.
 inline bool moe_type_has_immutable_host_recipe(ggml_type type) {
     return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;
 }

@@ -801,6 +801,7 @@ static bool test_recipe_matrix_workspace_and_immutability() {
                                                q4_direct.recipe.workspace.total_bytes);
             CHECK(!choice && choice.reject == moe_batch_reject_reason::RECIPE_MISMATCH);
 
+            // Validator coverage only: no route produces a second-card direct-kernel recipe.
             auto secondary =
                 route_for(&value, 1, moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 92);
             secondary.recipe.request = request;

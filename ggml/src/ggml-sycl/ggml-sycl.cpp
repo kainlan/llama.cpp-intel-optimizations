@@ -11996,6 +11996,10 @@ void ggml_sycl_q1_nvfp4_test_counters_read(ggml_sycl_q1_nvfp4_test_counters * ou
 void ggml_sycl_q1_nvfp4_test_failure_once(ggml_sycl_q1_nvfp4_test_failure failure) {
     g_q1_nvfp4_test_failure.store(static_cast<uint32_t>(failure), std::memory_order_release);
 }
+
+bool ggml_sycl_q1_nvfp4_test_failure_take(ggml_sycl_q1_nvfp4_test_failure failure) {
+    return ggml_sycl_q1_nvfp4_test_consume_failure(failure);
+}
 #endif
 
 // The MoE MMID direct route is fail-closed by owner ruling: this stays false
@@ -38350,7 +38354,10 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
     if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4) {
         // The direct recipe is narrower than the executor: only an exact primary
         // decode candidate whose invocation holds the exact queue capability of an
-        // admitted MMID workspace gets it, and the direct decode route admits it.
+        // admitted MMID workspace gets it. In an ordinary build that never happens:
+        // ggml_sycl_moe_mmid_route_reachable_in_build() is false, no MMID pool is
+        // planned, no invocation holds that capability, and this recipe is never
+        // chosen; only the private route-testing build reaches it.
         //
         // Whether the lease can be bound is the binder's question, so ask the
         // binder. A handle-kind test here was a second, narrower answer: every
@@ -86416,6 +86423,35 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     return true;
 }
 
+// The exception text for a Q1_0/NVFP4 AOS operand whose batched dispatch refused, by the reason the dispatch named
+// (or no-ptr-table when it never ran). ggml_sycl_fallback_error keeps the pointer it is given, so every text is a
+// literal joined to its reason at compile time rather than a formatted string. test-failpoint comes only from the
+// private-testing build.
+static const char * ggml_sycl_moe_q1_nvfp4_refusal_text(const char * reason) {
+#define GGML_SYCL_Q1_NVFP4_REFUSAL(r) { r, "MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand refused: " r }
+
+    static constexpr struct {
+        const char * reason;
+        const char * text;
+    } k_refusal_texts[] = {
+        GGML_SYCL_Q1_NVFP4_REFUSAL("no-ptr-table"),         GGML_SYCL_Q1_NVFP4_REFUSAL("no-entries"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("no-expert-ptrs"),       GGML_SYCL_Q1_NVFP4_REFUSAL("layout-unsupported"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("type-unsupported"),     GGML_SYCL_Q1_NVFP4_REFUSAL("invalid-q8-shape"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("unresolved-src1-dst"),  GGML_SYCL_Q1_NVFP4_REFUSAL("q8-scratch-alloc"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("missing-host-routing"), GGML_SYCL_Q1_NVFP4_REFUSAL("ids-scratch-alloc"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("int-max-bound"),        GGML_SYCL_Q1_NVFP4_REFUSAL("test-failpoint"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("submit-precondition"),
+    };
+
+#undef GGML_SYCL_Q1_NVFP4_REFUSAL
+    for (const auto & entry : k_refusal_texts) {
+        if (reason && std::strcmp(reason, entry.reason) == 0) {
+            return entry.text;
+        }
+    }
+    return "MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand refused: unnamed reason";
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     ggml_sycl_test_inject_device_lost("mmid");
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
@@ -91541,13 +91577,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         return;
                     }
 
-                    GGML_ABORT(
+                    // Neither the planned card nor the host can run this expert: refuse the op, not the process.
+                    // This runs while the partition is built, before anything is submitted; the leases already taken
+                    // (route's and those in the entry vectors) are handles in locals that the unwind releases, and
+                    // graph_compute's catch turns the throw into GGML_STATUS_FAILED.
+                    GGML_LOG_WARN(
                         "[MOE-ROUTE] planned secondary route unsupported and no handle-backed host route is available "
                         "tensor=%s expert=%d current_device=%d planned_device=%d rows=%zu layout=%s queue_ready=%d "
-                        "supported=%d kernel=%s reason=%s",
+                        "supported=%d kernel=%s reason=%s\n",
                         src0->name ? src0->name : "?", expert_id, ctx.device, route.owning_device, rows,
                         ggml_sycl_layout_mode_name(route.actual_layout), queue_ready ? 1 : 0, cap.supported ? 1 : 0,
                         ggml_sycl::moe_route_kernel_name(cap.kernel), cap.reason ? cap.reason : "unknown");
+                    local_extra.moe_expert_id = -1;
+                    ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
+                    throw ggml_sycl_fallback_error(
+                        "MUL_MAT_ID planned secondary route unsupported and no handle-backed host route is available");
                 };
 
                 const ggml_sycl::moe_resolved_batch & main_batch =
@@ -91893,11 +91937,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         have_plan_hybrid && ggml_sycl_placement_plan_moe_needs_other_device(plan_hybrid, ctx.device);
                     const bool cohesive_hidden_plan =
                         hidden_secondary_execution && have_plan_hybrid && !cross_device_plan;
-                    const bool direct_q1_nvfp4_aos =
-                        (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) &&
-                        dispatch_layout == GGML_LAYOUT_AOS;
+                    const bool q1_nvfp4_aos = (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) &&
+                                              dispatch_layout == GGML_LAYOUT_AOS;
                     const bool planner_batched_ptr_table_safe =
-                        direct_q1_nvfp4_aos ||
+                        q1_nvfp4_aos ||
                         (!cross_device_plan && (ggml_sycl_routable_device_count() <= 1 || cohesive_hidden_plan));
                     if (!route_slots.empty() && planner_batched_ptr_table_safe) {
                         expert_ptrs_dev = ggml_sycl_upload_moe_transient_ptr_table(
@@ -91916,7 +91959,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                     }
 
-                    bool batched_ok = false;
+                    bool         batched_ok             = false;
+                    const char * dispatch_reject_reason = nullptr;
+                    size_t       dispatch_reject_bytes  = 0;
                     if (expert_ptrs_dev) {
                         if (ggml_sycl_moe_row_agg_debug_enabled()) {
                             static std::atomic<int> route_ptr_log{ 0 };
@@ -91941,8 +91986,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             ctx, src0, src1, dst, expert_ptrs_dev, gpu_expert_ids.data(), gpu_iid1s.data(),
                             gpu_id_slots.data(), static_cast<int>(layout_entries.size()), static_cast<int>(n_as), n_ids,
                             dispatch_layout, nullptr, 0, 0, ids_host.data(), static_cast<int64_t>(ids_host.size()),
-                            nullptr, nullptr, dispatch_deps.empty() ? nullptr : &dispatch_deps);
+                            nullptr, nullptr, dispatch_deps.empty() ? nullptr : &dispatch_deps, &dispatch_reject_reason,
+                            &dispatch_reject_bytes);
                     }
+                    // A string literal: the dispatch's own reason, no-ptr-table when it never ran, or unnamed if a
+                    // future false return forgets to name itself.
+                    const char * refusal_reason = !expert_ptrs_dev       ? "no-ptr-table" :
+                                                  dispatch_reject_reason ? dispatch_reject_reason :
+                                                                           "unnamed";
 
                     // Fallback: per-expert dispatch if batched path unavailable.
                     if (!batched_ok) {
@@ -91953,26 +92004,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                         "[MOE-ROW-AGG] stage=dispatch-reject path=planner_route_batched tensor=%s "
                                         "layout=%s entries=%zu reason=%s\n",
                                         src0->name ? src0->name : "?", ggml_sycl_layout_mode_name(dispatch_layout),
-                                        layout_entries.size(),
-                                        expert_ptrs_dev ? "dispatch-returned-false" : "no-ptr-table");
+                                        layout_entries.size(), refusal_reason);
                             }
                         }
                     }
 
                     // A Q1_0/NVFP4 AOS operand runs on the card only through this batched dispatch, the executor its
                     // capability answered (MMVQ_COMPAT, or the direct recipe). When the dispatch returns false (a
-                    // scratch allocation that fails, an index past INT_MAX, no pointer table) the op ends with a named
-                    // refusal instead of running another path, and the process goes on.
-                    if (!batched_ok && direct_q1_nvfp4_aos) {
+                    // scratch allocation that fails, an index past INT_MAX, no pointer table) the op ends with a
+                    // refusal that names the cause and the bytes it asked for, instead of running another path, and
+                    // the process goes on.
+                    if (!batched_ok && q1_nvfp4_aos) {
                         GGML_LOG_WARN(
                             "[MOE-ROUTE] Q1_0/NVFP4 AOS batched dispatch returned false: tensor=%s layout=%s "
-                            "entries=%zu ptr_table=%s\n",
+                            "entries=%zu ptr_table=%s reason=%s requested_bytes=%zu\n",
                             src0->name ? src0->name : "?", ggml_sycl_layout_mode_name(dispatch_layout),
-                            layout_entries.size(), expert_ptrs_dev ? "present" : "missing");
+                            layout_entries.size(), expert_ptrs_dev ? "present" : "missing", refusal_reason,
+                            dispatch_reject_bytes);
                         local_extra.moe_expert_id = -1;
                         ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
-                        throw ggml_sycl_fallback_error(
-                            "MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand returned false");
+                        throw ggml_sycl_fallback_error(ggml_sycl_moe_q1_nvfp4_refusal_text(refusal_reason));
                     }
                     if (!batched_ok) {
                         std::vector<sycl::event> per_entry_ready;
@@ -126881,9 +126932,13 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         //
         // Residency-blind admission is not type-blind admission. MUL_MAT_ID asks
         // the MMID coverage tables below. Q1_0 and NVFP4 are in them because
-        // their MMVQ id kernel runs them on the card in AOS, and the capability
-        // query and the executor choice give the same answer at run time.
-        // Q2_0 joined with its kernels (llama.cpp-s36q phase 4). ADD_ID keeps
+        // their MMVQ id kernel runs them on the card in AOS. The capability
+        // query and the executor choice agree at run time only for an expert
+        // local to the submitting card, in AOS, with a block-aligned K. For
+        // any other device expert of these types (another card's, another
+        // layout, an unaligned K) the capability query refuses, so this yes
+        // does not promise a device executor for it. Q2_0 joined with its
+        // kernels (llama.cpp-s36q phase 4). ADD_ID keeps
         // the dense allowlist plus Q1_0/NVFP4, so every other type without a
         // kernel -- upstream b10630's tq2_0 and anything future -- is refused
         // at this gate instead of reaching an executor that computes wrong

@@ -32,6 +32,8 @@ enum ggml_sycl_q1_nvfp4_test_failure {
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK,
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK,
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL,
+    // mmvq_moe_batched_dispatch refuses a Q1_0/NVFP4 operand once, just before its submit.
+    GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BATCHED_DISPATCH,
 };
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -54,3 +56,6 @@ GGML_SYCL_Q1_TEST_LOCAL void ggml_sycl_q1_nvfp4_test_counters_read(
     ggml_sycl_q1_nvfp4_test_counters * counters);
 GGML_SYCL_Q1_TEST_LOCAL void ggml_sycl_q1_nvfp4_test_failure_once(
     enum ggml_sycl_q1_nvfp4_test_failure failure);
+// Consumes an armed failure if it is this one (counted in failure_consumed). For the backend's own translation
+// units outside ggml-sycl.cpp, which arm nothing themselves.
+GGML_SYCL_Q1_TEST_LOCAL bool ggml_sycl_q1_nvfp4_test_failure_take(enum ggml_sycl_q1_nvfp4_test_failure failure);
