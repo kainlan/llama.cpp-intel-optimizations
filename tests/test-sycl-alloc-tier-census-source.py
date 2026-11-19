@@ -465,7 +465,7 @@ def test_the_role_bytes_accessor_is_unconditional_and_declared_beside_the_census
     define = declaration_at(cpp, ROLE_BYTES_CXX + r"\{")
     assert not under_private_testing(cpp, define), "the accessor is defined only under GGML_SYCL_PRIVATE_TESTING"
     body = function_body(cpp, r"\bbool\s+unified_cache_role_bytes_for_testing\s*\(")
-    assert re.search(r"g_device_caches\.end\(\)[^{]*\{\s*return\s+false\s*;", body), (
+    assert re.search(r"\bdevice_caches\.end\(\)[^{]*\{\s*return\s+false\s*;", body), (
         "the reading is not VOID for a device with no cache"
     )
     assert "g_runtime_alloc_registry" in body, "the accessor does not read the live registry"

@@ -505,7 +505,7 @@ structurally impossible.
   describe the *host*, not a model; resetting them per model load would be
   the bug, not the fix.
 - **Device-indexed arrays/singletons** (`g_expert_prefetchers[...]`,
-  `g_pinned_buffer_pools[...]`, `g_device_caches`, etc.): scoped to the
+  `g_pinned_buffer_pools[...]`, `unified_cache_device_caches()`, etc.): scoped to the
   device slot, and the unified cache's own `mem_handle`-leased weight
   entries (ref-counted per model slot via `reset_model_weight_entries()`)
   are deliberately **not** touched by anything in this audit — per

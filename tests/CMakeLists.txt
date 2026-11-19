@@ -4753,6 +4753,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for the exit order of the per-device unified caches and for the cache lock taken once per lookup; the
+# order argument is in the script's docstring and at the unified_cache constructor. Host-only, reads the sources as
+# text; each check is proven against its mutant.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-device-caches-exit-order-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-caches-exit-order-source.py
+        LABEL "sycl;python;source-assert;mutation;hostonly"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-rriv: source gate for the clean zone settle: host_zone_settle() / zone_settle() answer "is anything live in
 # this zone" from a per-host-zone row counter and the registry index's first-base-in-span query instead of walking every
 # registry row (37.3% + 20.0% of Qwen3.8 decode CPU), enumerate rows only to explain a refusal, and the counters are
