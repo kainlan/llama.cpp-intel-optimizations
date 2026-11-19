@@ -4,10 +4,9 @@
 //   source /opt/intel/oneapi/setvars.sh --force
 //   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-layout-cache
 //
-// Registered at tests/CMakeLists.txt (restored per llama.cpp-b8uv; that block's
-// comment records the adjudicated failures).  It allocates weights through real
-// device caches, so it belongs to the OOM-hazard family: run once, never in a
-// loop.
+// Registered at tests/CMakeLists.txt, whose comment on the registration records
+// the adjudicated failures.  It allocates weights through real device caches,
+// so it belongs to the OOM-hazard family: run once, never in a loop.
 //
 // main() pins ONEAPI_DEVICE_SELECTOR to level_zero:0 -- the B70 BENCHMARK
 // card -- only when nothing is already set, via the shared re-exec fallback

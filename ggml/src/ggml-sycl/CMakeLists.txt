@@ -5219,8 +5219,11 @@ add_test(NAME test-sycl-kv-planned-device-materialization COMMAND test-sycl-kv-p
 # Two cards, not one: this fixture's own main() defaults the selector to
 # "level_zero:0,1" and its cases materialize across both. Narrowing it to the
 # single validation card the other pins use would change what it tests.
+# "cache", not "hostonly": it builds a real unified cache on each card and allocates
+# through it, the GPU-allocating family rule 2 describes, so it runs by name or in the
+# serial cache|mem-handle pass.
 set_tests_properties(test-sycl-kv-planned-device-materialization PROPERTIES
-    LABELS "sycl;kv;hostonly;tdd;0igs-batch1"
+    LABELS "sycl;kv;cache;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     # Every skip path (no SYCL build, fewer than two devices) exits 77 so it
     # reads as a skip, not a pass.

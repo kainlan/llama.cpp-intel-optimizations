@@ -18,20 +18,26 @@ failed together. This gate checks, from the CMake and source text alone (no buil
   - every target that compiles a source with such a stub receives GGML_USE_SYCL;
   - every return in a stub is `return LLAMA_TEST_EXIT_SKIP;`, a stub `main` has one, and the header defines the macro
     as 77;
-  - every ctest registration that runs such a target (its command starts with the binary) carries SKIP_RETURN_CODE 77,
-    by its own properties or by the helper function that registered it. A command that hands the binary to another
-    program as an argument, such as the private carrier linkage audit, has that program's exit code, not the stub's.
+  - every ctest registration that runs such a target carries SKIP_RETURN_CODE 77, by its own properties or by the
+    helper function that registered it. The program a command runs is its first word after any pass-through wrapper
+    (`timeout`, `env`, `${CMAKE_COMMAND} -E env`, ...), named as the target, as $<TARGET_FILE:target>, or by a path
+    ending in it. A command that hands the binary to another program as an argument, such as the private carrier
+    linkage audit, has that program's exit code, not the stub's.
 
 A stub is a `return` inside `main` that is compiled only when GGML_USE_SYCL is not defined: in the branch of
-`#if !defined(GGML_USE_SYCL)` / `#ifndef GGML_USE_SYCL` that holds when it is undefined, or in the `#else` / `#elif` of
-`#if defined(GGML_USE_SYCL)` / `#ifdef GGML_USE_SYCL`. A condition that adds other terms (`|| !GGML_SYCL_DNNL`) still
-counts, because its branch is taken when GGML_USE_SYCL is undefined.
+`#if !defined(GGML_USE_SYCL)` / `#ifndef GGML_USE_SYCL` / `#if !GGML_USE_SYCL` that holds when it is undefined, or in
+the `#else` / `#elif` of `#if defined(GGML_USE_SYCL)` / `#ifdef GGML_USE_SYCL` / `#if GGML_USE_SYCL`. A condition that
+adds other terms (`|| !GGML_SYCL_DNNL`) still counts, because its branch is taken when GGML_USE_SYCL is undefined.
 
-The CMake reader follows set(), list(APPEND), foreach() over literal items and lists, the `llama_build()` and
-`llama_build_and_test()` helpers (their link libraries and skip code are read from their own bodies), and the
-ggml_add_backend() definition of GGML_USE_<backend>. It ignores if() conditions: a definition or property in any branch
-counts. A source path it cannot resolve that could name a stub source fails closed, and so does a stub source that a
-CMake file names in a form the reader cannot attribute to a target.
+The gate reads every CMake file, every C/C++ source under a `tests` directory, and every source an executable in those
+CMake files names, wherever it lives. The CMake reader follows set(), list(APPEND), cmake_parse_arguments(), foreach()
+over literal items and lists, and every function() or macro() at its call sites, with its parameters and ARGN bound;
+the `llama_*` test helpers are read by their own rules instead (link libraries and skip code from their bodies), and so
+is the ggml_add_backend() definition of GGML_USE_<backend>. It ignores if() conditions: a definition or property in any
+branch counts. A variable it does not compute (list(GET), string(), math(), a foreach(RANGE) variable) stays a pattern,
+and the reader fails closed on it: a source pattern that could name a stub source, a test command pattern that could
+run a stub target, and a stub source that a CMake file names in a form the reader cannot attribute to a target. A
+target whose name is such a pattern is matched by the same token in a test command.
 
 Each check is proven to catch its mutant below, by the failure text of that check.
 """
@@ -51,22 +57,38 @@ ROOT_MARK = "@ROOT@"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The tree: repo-relative path -> text, for every CMake file and every C/C++ source under a `tests` directory.
+# The tree: repo-relative path -> text, for the files select_tree() names.
 # ---------------------------------------------------------------------------------------------------------------------
 
 
 def load_tree(root: Path) -> dict:
-    tree = {}
+    files = []
     for dirpath, dirnames, filenames in os.walk(root):
         rel_dir = os.path.relpath(dirpath, root)
         dirnames[:] = [d for d in dirnames if not d.startswith((".", "build"))]
         parts = [] if rel_dir == "." else rel_dir.split(os.sep)
-        for name in filenames:
-            is_cmake = name == "CMakeLists.txt" or name.endswith(".cmake")
-            is_test_source = "tests" in parts and name.endswith(SOURCE_SUFFIXES)
-            if is_cmake or is_test_source or "/".join(parts + [name]) == SKIP_HEADER:
-                rel = "/".join(parts + [name])
-                tree[rel] = (Path(dirpath) / name).read_text(errors="replace")
+        files.extend("/".join(parts + [name]) for name in filenames)
+    return select_tree(files, lambda rel: (root / rel).read_text(errors="replace"))
+
+
+def select_tree(files, read) -> dict:
+    """The files the gate reads, from a listing of repo-relative paths and a reader: every CMake file, every C/C++
+    source under a `tests` directory, the skip header, and every source an executable in those CMake files names,
+    wherever it lives (a stub-carrying source outside `tests` is still a test that can compile out)."""
+    tree = {}
+    for rel in files:
+        parts = rel.split("/")
+        name = parts[-1]
+        is_cmake = name == "CMakeLists.txt" or name.endswith(".cmake")
+        is_test_source = "tests" in parts[:-1] and name.endswith(SOURCE_SUFFIXES)
+        if is_cmake or is_test_source or rel == SKIP_HEADER:
+            tree[rel] = read(rel)
+    listed = set(files)
+    for target, entries in Model(tree).executables.items():
+        for token, cm, _ in entries:
+            got = Model.resolve(token, cm)
+            if got and got not in tree and got in listed and got.endswith(SOURCE_SUFFIXES):
+                tree[got] = read(got)
     return tree
 
 
@@ -208,10 +230,69 @@ def _block_end(cmds, start, open_name, close_name):
     return len(cmds)
 
 
-def expand(cmds, env, functions, out):
-    """Replay the commands in order: set()/list(APPEND) update `env`, foreach() bodies are replayed per item,
-    function()/macro() bodies are recorded in `functions` and not replayed. Every other command is appended to `out`
-    with its variables substituted."""
+# Helpers whose registrations Model._take reads by their own rules; every other function or macro is replayed at its
+# call sites.
+HELPERS = frozenset(("llama_build", "llama_build_and_test", "llama_test", "llama_test_cmd", "llama_test_pytest"))
+
+
+def _parse_arguments(sargs, env):
+    """cmake_parse_arguments(<prefix> <options> <one_value> <multi_value> <args>...)."""
+    if len(sargs) < 4 or sargs[0] == "PARSE_ARGV":
+        return
+    prefix, options, ones, multis = sargs[0], split_list([sargs[1]]), split_list([sargs[2]]), split_list([sargs[3]])
+    values, current, unparsed = {}, None, []
+    for item in split_list(sargs[4:]):
+        if item in options:
+            values[item], current = ["TRUE"], None
+        elif item in ones or item in multis:
+            values[item], current = [], item
+        elif current is not None:
+            values[current].append(item)
+            if current in ones:
+                current = None
+        else:
+            unparsed.append(item)
+    for key in options:
+        env[f"{prefix}_{key}"] = ";".join(values.get(key, ["FALSE"]))
+    for key in ones + multis:
+        if key in values:
+            env[f"{prefix}_{key}"] = ";".join(values[key])
+        else:
+            env.pop(f"{prefix}_{key}", None)
+    env[f"{prefix}_UNPARSED_ARGUMENTS"] = ";".join(unparsed)
+
+
+def _computed(name, sargs) -> list:
+    """The variables a command other than set()/list(APPEND) assigns: the reader leaves them unset."""
+    def at(i):
+        return [sargs[i]] if -len(sargs) <= i < len(sargs) else []
+
+    op = sargs[0] if sargs else ""
+    if name == "list":
+        if op in ("GET", "LENGTH", "FIND", "JOIN", "SUBLIST"):
+            return at(-1)
+        if op in ("POP_BACK", "POP_FRONT"):
+            return sargs[1:]
+        return at(1)
+    if name == "string":
+        if op == "REGEX":
+            return at(3) if sargs[1:2] in (["MATCH"], ["MATCHALL"]) else at(4)
+        positions = {"REPLACE": 3, "FIND": 3, "SUBSTRING": 4, "JOIN": 2, "CONCAT": 1, "APPEND": 1, "PREPEND": 1}
+        return at(positions.get(op, -1))
+    if name == "math" or (name == "file" and op in ("GLOB", "GLOB_RECURSE", "RELATIVE_PATH", "TO_CMAKE_PATH")):
+        return at(1)
+    if name in ("get_filename_component", "get_target_property", "get_property", "find_program", "find_file",
+                "find_library", "find_path"):
+        return at(0)
+    return []
+
+
+def expand(cmds, env, functions, out, depth=0):
+    """Replay the commands in order: set()/list(APPEND)/cmake_parse_arguments() update `env`, foreach() bodies are
+    replayed per item, function()/macro() bodies are recorded in `functions` and replayed at each call site (the
+    HELPERS excepted) with their parameters and ARGN bound. A foreach() whose items cannot be listed (RANGE, or a
+    list the reader never saw set) is replayed once with its variable left unresolved, so what its body registers is
+    still seen, as a pattern. Every other command is appended to `out` with its variables substituted."""
     idx = 0
     while idx < len(cmds):
         name, args, line = cmds[idx]
@@ -220,6 +301,24 @@ def expand(cmds, env, functions, out):
             if args:
                 functions[args[0].lower()] = (args[1:], cmds[idx + 1:end])
             idx = end + 1
+            continue
+        if name in functions and name not in HELPERS and depth < 8:
+            params, body = functions[name]
+            argv = split_list([substitute(a, env) for a in args])
+            scope = dict(env)
+            for k, param in enumerate(params):
+                if k < len(argv):
+                    scope[param] = argv[k]
+                else:
+                    scope.pop(param, None)
+            scope["ARGN"] = ";".join(argv[len(params):])
+            scope["ARGV"] = ";".join(argv)
+            scope["ARGC"] = str(len(argv))
+            for k, a in enumerate(argv):
+                scope[f"ARGV{k}"] = a
+            expand(body, scope, functions, out, depth + 1)
+            out.append((name, [substitute(a, env) for a in args], line))
+            idx += 1
             continue
         if name == "foreach":
             end = _block_end(cmds, idx, "foreach", "endforeach")
@@ -237,13 +336,18 @@ def expand(cmds, env, functions, out):
                     elif mode == "LISTS":
                         items.extend(split_list([env.get(a, "${" + a + "}")]))
             elif rest and rest[0] == "RANGE":
-                items = []
+                items = [None]
             else:
                 items = split_list(rest)
+            if any(item is not None and _VAR_REF.search(item) for item in items):
+                items = [None]
             saved = env.get(var)
             for item in items:
-                env[var] = item
-                expand(body, env, functions, out)
+                if item is None:
+                    env.pop(var, None)  # the body is still read, with its variable left as a pattern
+                else:
+                    env[var] = item
+                expand(body, env, functions, out, depth)
             if saved is None:
                 env.pop(var, None)
             else:
@@ -259,6 +363,13 @@ def expand(cmds, env, functions, out):
         elif name == "list" and len(sargs) >= 2 and sargs[0] == "APPEND":
             cur = env.get(sargs[1], "")
             env[sargs[1]] = ";".join([x for x in [cur] if x] + sargs[2:])
+        elif name == "cmake_parse_arguments":
+            _parse_arguments(sargs, env)
+        else:
+            # A variable a command computes (list(GET), string(), math(), ...) is not evaluated: it is unset, so what
+            # uses it reads as a pattern rather than as a stale value from an earlier command.
+            for var in _computed(name, sargs):
+                env.pop(var, None)
         out.append((name, sargs, line))
         idx += 1
 
@@ -393,6 +504,12 @@ class Model:
         elif name == "llama_test" and args:
             test = args[args.index("NAME") + 1] if "NAME" in args else args[0]
             self.tests[test] = ((args[0],), path, line, None)
+        elif name == "llama_test_cmd" and args:  # runs its first argument with ARGS; llama_test_pytest runs pytest
+            test = args[args.index("NAME") + 1] if "NAME" in args else args[0]
+            rest = args[args.index("ARGS") + 1:] if "ARGS" in args else []
+            for stop in ("NAME", "LABEL", "WORKING_DIRECTORY"):
+                rest = rest[:rest.index(stop)] if stop in rest else rest
+            self.tests[test] = ((args[0], *rest), path, line, None)
         elif name == "set_tests_properties" and "PROPERTIES" in args:
             at = args.index("PROPERTIES")
             kv = args[at + 1:]
@@ -409,7 +526,8 @@ class Model:
 
     # -----------------------------------------------------------------------------------------------------------------
 
-    def resolve(self, token, cmake_path):
+    @staticmethod
+    def resolve(token, cmake_path):
         """The repo-relative path a source token names, or None when a variable or generator expression is left in it
         (the token is then returned as a regex by `pattern`)."""
         if "${" in token or "$<" in token:
@@ -464,8 +582,10 @@ def code_only(src: str) -> str:
     return _LEXEME_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), src)
 
 
-_NEG = re.compile(r"!\s*defined\s*\(?\s*" + DEFINE + r"\b")
-_POS = re.compile(r"(?<![!\w])\s*defined\s*\(?\s*" + DEFINE + r"\b")
+# Undefined, GGML_USE_SYCL reads as 0 in an #if: `!GGML_USE_SYCL` and `GGML_USE_SYCL == 0` hold exactly when
+# `!defined(GGML_USE_SYCL)` does, so the value form is a stub guard too.
+_NEG = re.compile(r"!\s*\(*\s*(?:defined\s*\(?\s*)?" + DEFINE + r"\b|\b" + DEFINE + r"\s*==\s*0\b")
+_POS = re.compile(r"\b" + DEFINE + r"\b")
 _DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
 
 
@@ -544,7 +664,7 @@ _STUBS = {}
 
 
 def stub_sources(tree):
-    """{source: stubs} for every test source with at least one stub (memoised by text)."""
+    """{source: stubs} for every source in the tree with at least one stub (memoised by text)."""
     found = {}
     for p, t in sorted(tree.items()):
         if p.endswith(SOURCE_SUFFIXES):
@@ -621,22 +741,86 @@ def stub_failures(tree):
     return failures
 
 
+# Programs that run the rest of their command line and exit with its code: {name: (options taking a value, number of
+# positional arguments before the command)}. `env` also takes NAME=VALUE assignments.
+WRAPPERS = {
+    "timeout": ({"-s", "--signal", "-k", "--kill-after"}, 1),
+    "env": ({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}, 0),
+    "nice": ({"-n", "--adjustment"}, 0),
+    "setsid": (set(), 0),
+    "stdbuf": ({"-i", "-o", "-e"}, 0),
+}
+
+
+def program(command) -> str:
+    """The program a test command runs, after any WRAPPERS (and `${CMAKE_COMMAND} -E env`) in front of it: the test's
+    exit code is that program's."""
+    cmd = list(command)
+    while cmd:
+        if cmd[0] == "${CMAKE_COMMAND}" and cmd[1:3] == ["-E", "env"]:
+            cmd = ["env"] + cmd[3:]
+        base = cmd[0].rsplit("/", 1)[-1]
+        if base not in WRAPPERS:
+            return cmd[0]
+        takes_value, positional = WRAPPERS[base]
+        i = 1
+        while i < len(cmd) and (cmd[i].startswith("-") or (base == "env" and "=" in cmd[i])):
+            i += 2 if cmd[i] in takes_value else 1
+        cmd = cmd[i + positional:]
+    return ""
+
+
+def runs_target(exe, target):
+    """True when the program token `exe` names `target`'s binary: by name, by $<TARGET_FILE:...>, or by a path that
+    ends in it (`${CMAKE_BINARY_DIR}/bin/<target>`)."""
+    return exe in (target, f"$<TARGET_FILE:{target}>") or ("/" in exe and exe.rsplit("/", 1)[1] == target)
+
+
+_TOOL_VAR = re.compile(r"\$\{(CMAKE_[A-Za-z0-9_]*|[A-Za-z0-9_]*(?:EXECUTABLE|COMMAND|PROGRAM))\}")
+
+
+def could_run_target(exe, target):
+    """True when `exe` keeps a variable the reader could not resolve and, read as a pattern, could name `target`.
+    A tool variable on its own (`${Python3_EXECUTABLE}`, `${CMAKE_COMMAND}`) names an interpreter or tool, not a test
+    binary, and is not a candidate."""
+    m = re.fullmatch(r"\$<TARGET_FILE:(.*)>", exe)
+    name = m.group(1) if m else exe
+    if not re.search(r"\$\{|\$<", name):
+        return False
+    if not m and _TOOL_VAR.fullmatch(name):
+        return False
+    last = name.rsplit("/", 1)[-1]
+    rx = "".join(".*" if p.startswith("$") else re.escape(p) for p in re.split(r"(\$\{[^}]*\}|\$<[^>]*>)", last))
+    return re.fullmatch(rx, target) is not None
+
+
 def registration_failures(tree, model=None):
     model = model or Model(tree)
     stub_targets = {}
     for src in stub_sources(tree):
         for target in compiling_targets(model, src)[0]:
             stub_targets.setdefault(target, src)
+        # An executable whose name keeps a variable (a target built in a loop the reader could not list) is matched
+        # by the same token in a test command.
+        for target, entries in model.executables.items():
+            if _VAR_REF.search(target) and any(model.resolve(tok, cm) == src for tok, cm, _ in entries):
+                stub_targets.setdefault(target, src)
     failures = []
     for test, (command, cm, line, inherent) in sorted(model.tests.items()):
-        # The test's exit code is its command's: the binary when the command starts with it. A command that hands the
-        # binary to another program as an argument (the carrier linkage audit reads the files) answers for itself.
-        exe = command[0] if command else ""
-        for target in [t for t in stub_targets if exe in (t, f"$<TARGET_FILE:{t}>")]:
-            skip = model.test_props.get(test, {}).get("SKIP_RETURN_CODE", inherent)
-            if skip != "77":
-                failures.append(f"{cm}:{line}: test {test} runs {target} (GGML_USE_SYCL stub in "
-                                f"{stub_targets[target]}) without SKIP_RETURN_CODE 77")
+        # The test's exit code is its program's: the binary when the command runs it, directly or through a wrapper
+        # such as timeout. A command that hands the binary to another program as an argument (the carrier linkage
+        # audit reads the files) answers for itself.
+        exe = program(command)
+        paired = any(runs_target(exe, t) for t in model.executables if _VAR_REF.search(t))
+        for target in sorted(stub_targets):
+            if runs_target(exe, target):
+                skip = model.test_props.get(test, {}).get("SKIP_RETURN_CODE", inherent)
+                if skip != "77":
+                    failures.append(f"{cm}:{line}: test {test} runs {target} (GGML_USE_SYCL stub in "
+                                    f"{stub_targets[target]}) without SKIP_RETURN_CODE 77")
+            elif not paired and could_run_target(exe, target):
+                failures.append(f"{cm}:{line}: cannot tell whether test {test} (command `{exe}`) runs {target} "
+                                f"(GGML_USE_SYCL stub in {stub_targets[target]}); name the binary literally")
     return failures
 
 
@@ -732,6 +916,15 @@ def _both(*edits):
     return apply
 
 
+def _relist(files):
+    """Put `files` on the listing the tree is selected from, and select again: what the gate reads of them is what
+    load_tree would read had they been on disk."""
+    def apply(t):
+        disk = dict(t, **files)
+        return select_tree(sorted(disk), disk.__getitem__)
+    return apply
+
+
 SYNTHETIC_ELSE_STUB = """
 #include "test-skip.h"
 int main() {
@@ -805,6 +998,48 @@ MUTANTS = {
                     "        LABELS \"${LLAMA_TEST_LABEL}\")\nendfunction()"),
               _add(TESTS_CMAKE, "\nllama_build_and_test(test-sycl-pointer-types.cpp)\n")),
         "test test-sycl-pointer-types runs test-sycl-pointer-types"),
+    # The value spelling of the guard: undefined, GGML_USE_SYCL reads as 0, so `#if !GGML_USE_SYCL` is a stub too.
+    "value-form-stub-returns-0": (
+        _both(_edit(UCB, "#if !defined(GGML_USE_SYCL)", "#if !GGML_USE_SYCL"),
+              _edit(UCB, f"return {SKIP_MACRO};", "return 0;")),
+        (f"{UCB}:", f"the GGML_USE_SYCL-off stub returns `0`, not {SKIP_MACRO}")),
+    # The value spelling of the positive guard, with the stub in its #else.
+    "value-form-else-stub": (
+        _add("tests/test-synthetic-else-stub.cpp", SYNTHETIC_ELSE_STUB.replace("#ifdef GGML_USE_SYCL",
+                                                                              "#if GGML_USE_SYCL")),
+        "tests/test-synthetic-else-stub.cpp:7: the GGML_USE_SYCL-off stub returns `0`"),
+    # A wrapper in front of the binary passes its exit code through: the registration still runs the stub.
+    "timeout-wrapped-registration": (
+        _add(SYCL_CMAKE, "\nadd_test(NAME ucb-timeout COMMAND timeout -k 5 60 $<TARGET_FILE:test-unified-cache-bugs>)\n"),
+        "test ucb-timeout runs test-unified-cache-bugs"),
+    # The binary named by its path in the build tree.
+    "binary-path-registration": (
+        _add(SYCL_CMAKE, "\nadd_test(NAME ucb-path COMMAND ${CMAKE_BINARY_DIR}/bin/test-unified-cache-bugs)\n"),
+        "test ucb-path runs test-unified-cache-bugs"),
+    # A registration inside a function the gate has no rule for: its call sites are replayed.
+    "function-registration-without-skip-code": (
+        _add(SYCL_CMAKE, "\nfunction(ucb_again_test suffix)\n"
+             "    add_test(NAME ucb-${suffix} COMMAND test-unified-cache-bugs ${ARGN})\nendfunction()\n"
+             "ucb_again_test(fn --again)\n"),
+        "test ucb-fn runs test-unified-cache-bugs"),
+    # A function that builds a stub source into a target of its own, without the define.
+    "function-target-without-define": (
+        _add(SYCL_CMAKE, "\nfunction(ucb_copy name)\n"
+             "    cmake_parse_arguments(UC \"\" \"\" \"LIBS\" ${ARGN})\n"
+             "    add_executable(${name} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-cache-bugs.cpp)\n"
+             "    target_link_libraries(${name} PRIVATE ${UC_LIBS})\nendfunction()\n"
+             "ucb_copy(test-ucb-fn-copy LIBS ggml-base)\n"),
+        "target test-ucb-fn-copy compiles tests/test-unified-cache-bugs.cpp"),
+    # A loop the reader cannot list (RANGE): its registration is read as a pattern that could run the stub binary.
+    "unlisted-loop-registration": (
+        _add(SYCL_CMAKE, "\nforeach(_i RANGE 1 3)\n"
+             "    add_test(NAME ucb-r${_i} COMMAND test-unified-cache-${_i})\nendforeach()\n"),
+        ("cannot tell whether test ucb-r${_i}", "runs test-unified-cache-bugs")),
+    # A stub source outside any `tests` directory, compiled by a target that does not receive the define.
+    "stub-source-outside-tests": (
+        _relist({"tools/stubbed/stubbed.cpp": SYNTHETIC_ELSE_STUB,
+                 "tools/stubbed/CMakeLists.txt": "add_executable(stubbed-tool stubbed.cpp)\n"}),
+        "target stubbed-tool compiles tools/stubbed/stubbed.cpp, which carries a GGML_USE_SYCL stub"),
 }
 
 
