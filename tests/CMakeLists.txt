@@ -4206,6 +4206,27 @@ if (GGML_SYCL)
     set_tests_properties(test-sycl-plan-dry-run-args PROPERTIES LABELS "sycl;host")
 endif()
 
+# Two co-resident loads of the 7B Mistral gate model on one card, planned for a 512-token and an 8192-token context,
+# in both orders: the larger second load keeps a ONEDNN zone too small for its oneDNN Graph floor (one keep WARN, no
+# refusal), the smaller second load takes the sufficient path, and every context counts on correctly. It loads a
+# model onto a GPU twice, so it carries `model`, the label the ctest sweep excludes, and is run by hand once per order,
+# pinned to the B70. It exits 77 with no model file or no GPU device.
+if (GGML_SYCL)
+    llama_build(test-sycl-coresident-graph-floor.cpp)
+    foreach (coresident_order small-first large-first)
+        llama_test(test-sycl-coresident-graph-floor
+            NAME test-sycl-coresident-graph-floor-${coresident_order}
+            LABEL model
+            ARGS --order ${coresident_order})
+        set_tests_properties(test-sycl-coresident-graph-floor-${coresident_order} PROPERTIES
+            LABELS "sycl;gpu-serial;model"
+            RUN_SERIAL TRUE
+            TIMEOUT 600
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0")
+    endforeach()
+endif()
+
 # The per-model lazy-range record, its pre-fill over a two-file GGUF fixture whose tables are sparse holes, the
 # converter that hands a STORAGE row to the SYCL backend as a lazy table, and (test-llama-lazy-storage) the handle
 # libllama keeps on an opened table, checked on fake procs so that it runs without SYCL. Host-only: no backend, device
