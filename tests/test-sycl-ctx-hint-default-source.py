@@ -472,6 +472,24 @@ def claim_default_only_refuses(tree: dict[str, str]) -> bool:
             and RATE_RULE in rate and HOLD_IFF in body(cost, WEIGH_SIG) and body(cost, WEIGH_SIG).count("priced") == 1)
 
 
+SHARED_CTX_SIG = ("static uint32_t bench_shared_load_n_ctx(const std::vector<cmd_params_instance> & instances, "
+                  "size_t i) {")
+SHARED_CTX_HINT = "mparams.n_ctx_hint = bench_shared_load_n_ctx(params_instances, params_idx - 1);"
+
+
+def claim_bench_tells_the_largest_shared_context(bench: str) -> bool:
+    """A reused model's compute term is measured at the context its load was told, so llama-bench tells it the
+    largest context of the consecutive instances that share it."""
+    if SHARED_CTX_SIG not in bench:
+        return False
+    fn = bench[bench.index("static uint32_t bench_shared_load_n_ctx("):]
+    fn = fn[: fn.index("\n}\n")]
+    if "instances[j].equal_mparams(instances[i])" not in fn or "std::max(n_ctx, instances[j].n_ctx())" not in fn:
+        return False
+    loop = bench[bench.index("auto mparams = inst.to_llama_mparams();"):]
+    return SHARED_CTX_HINT in loop and loop.index(SHARED_CTX_HINT) < loop.index("if (do_fit) {")
+
+
 # ---- the claims hold on the tree ------------------------------------------------------------------------------------
 
 
@@ -513,6 +531,10 @@ def test_room_lines_name_the_default():
 
 def test_default_only_refuses():
     assert claim_default_only_refuses(BACKEND_TREE)
+
+
+def test_bench_tells_the_load_the_largest_shared_context():
+    assert claim_bench_tells_the_largest_shared_context(read(BENCH_REL))
 
 
 # ---- mutants: each must turn its claim red --------------------------------------------------------------------------
@@ -714,6 +736,32 @@ def test_mutant_bench_asks_for_the_default_fails():
     assert "mparams.n_ctx_hint = n_ctx();" in bench
     text = bench.replace("mparams.n_ctx_hint = n_ctx();", "mparams.n_ctx_hint = LLAMA_N_CTX_HINT_DEFAULT;", 1)
     assert not claim_sentinel_has_one_reader(_tree_with(BENCH_REL, text), VALUE_TREE)
+
+
+def test_mutant_bench_tells_the_first_context_fails():
+    """The load is told the first instance's own context instead of the largest of the run that shares it."""
+    bench = read(BENCH_REL)
+    assert SHARED_CTX_HINT in bench
+    text = bench.replace(SHARED_CTX_HINT, "mparams.n_ctx_hint = inst.n_ctx();", 1)
+    assert not claim_bench_tells_the_largest_shared_context(text)
+
+
+def test_mutant_bench_shared_context_ignores_the_run_fails():
+    """The helper stops widening over the instances that share the model."""
+    bench = read(BENCH_REL)
+    assert "std::max(n_ctx, instances[j].n_ctx())" in bench
+    text = bench.replace("std::max(n_ctx, instances[j].n_ctx())", "n_ctx", 1)
+    assert not claim_bench_tells_the_largest_shared_context(text)
+
+
+def test_mutant_bench_hint_after_the_fit_fails():
+    """The hint is set after the fit branch instead of before it."""
+    bench = read(BENCH_REL)
+    assert SHARED_CTX_HINT in bench
+    anchor = "// keep the same model between tests when possible"
+    assert anchor in bench
+    text = bench.replace(SHARED_CTX_HINT, "", 1).replace(anchor, SHARED_CTX_HINT + "\n        " + anchor, 1)
+    assert not claim_bench_tells_the_largest_shared_context(text)
 
 
 def test_mutant_resolver_without_the_sentinel_fails():
