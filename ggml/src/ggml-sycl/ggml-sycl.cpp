@@ -13333,7 +13333,10 @@ struct ggml_sycl_load_published_pass {
 // it notes, so no publisher under that lock writes between a record's read of a group and its write. noexcept like the
 // planned-load-terms drop, and for the same reason: the owner-effects abort calls it outside every try stage, so no
 // failed stage skips it and no catch handler is added for it. No caller of the abort holds the inventory lock: the
-// abort takes it itself, to reset the load's scratch state. Its setters are plain stores.
+// abort takes it itself, to reset the load's scratch state. Its setters are plain stores, but for the zone plan's: that
+// arm looks the device's cache up under the cache map's shared lock, released when the lookup returns, reads the zone's
+// capacity and held pair without a lock, and stores the plan under the zone-plan mutex. Both are taken after the two
+// locks above and held for that step alone.
 static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept {
     std::lock_guard                        inventory(g_tensor_inventory_mutex);
     ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
