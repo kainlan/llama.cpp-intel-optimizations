@@ -1349,15 +1349,31 @@ arm_result arm_h_load_releases_a_lone_ring() {
 
 // One staged early pass of `inv` in a load transaction of its own, ended uncommitted, with what device 0's ONEDNN zone
 // was asked to hold read inside the open load: the planned requirement (the oneDNN pair and the Graph floor, as the
-// zone ensure reads it), the pair alone, and the Graph room a context check reads over the zone.
+// zone ensure reads it), the pair alone, the ONEDNN zone the ensure sizes from them, and the Graph room a context check
+// reads over the zone; and the Graph room once the load has ended.
 struct graph_floor_load {
-    ggml_sycl_lifecycle_result begin          = GGML_SYCL_LIFECYCLE_OK;
-    ggml_sycl_lifecycle_result stage          = GGML_SYCL_LIFECYCLE_OK;
-    size_t                     planned_onednn = 0;
-    size_t                     planned_pair   = 0;
-    size_t                     room           = 0;
-    bool                       room_read      = false;
+    ggml_sycl_lifecycle_result begin           = GGML_SYCL_LIFECYCLE_OK;
+    ggml_sycl_lifecycle_result stage           = GGML_SYCL_LIFECYCLE_OK;
+    size_t                     planned_onednn  = 0;
+    size_t                     planned_pair    = 0;
+    size_t                     zone_need       = 0;
+    size_t                     room            = 0;
+    bool                       room_read       = false;
+    size_t                     room_after      = 0;
+    bool                       room_after_read = false;
 };
+
+// The ONEDNN zone the ensure sizes from a planned requirement and pair: at least 256 MiB, clamped to a quarter of the
+// available budget but never below the pair, which has no DIRECT path. What the clamp removes is served on the DIRECT
+// path, so a requirement clamped to what the zone already holds leaves nothing short.
+// Zero when device 0 has no cache.
+size_t onednn_zone_need(unified_cache * cache, size_t planned_onednn, size_t planned_pair) {
+    if (cache == nullptr) {
+        return 0;
+    }
+    const size_t need = std::max<size_t>(256u * 1024 * 1024, planned_onednn);
+    return std::min(need, std::max(cache->available_budget() / 4, planned_pair));
+}
 
 graph_floor_load stage_early_reading_the_graph_room(const ggml_sycl_tensor_inventory & inv) {
     graph_floor_load   out;
@@ -1369,8 +1385,10 @@ graph_floor_load stage_early_reading_the_graph_room(const ggml_sycl_tensor_inven
     out.stage          = ggml_backend_sycl_stage_load_inventory_plan(&inv, nullptr, true);
     out.planned_onednn = unified_cache_get_planned_onednn_scratchpad_bytes(0);
     out.planned_pair   = unified_cache_get_planned_onednn_scratchpad_bytes_stored(0);
+    out.zone_need      = onednn_zone_need(get_unified_cache_for_device(0), out.planned_onednn, out.planned_pair);
     out.room_read      = unified_cache_get_onednn_graph_room(0, &out.room);
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    out.room_after_read = unified_cache_get_onednn_graph_room(0, &out.room_after);
     return out;
 }
 
@@ -1414,31 +1432,38 @@ bool holds_the_runtime_zone(const mem_handle & holder) {
     return p && p.on_device && unified_lookup(p.ptr, &meta) && meta.zone == vram_zone_id::RUNTIME;
 }
 
-// (i) A second load whose only shortfall beside a live allocation is the oneDNN Graph floor loads and keeps the zones
-// as they are, and the reverse order takes the sufficient path. The ONEDNN zone holds the oneDNN primitive pair and the
-// Graph scratch floor. The floor is a reservation: what the zone cannot hold of it is served on the DIRECT path under
-// its cap, and a context whose Graph scratch does not fit is refused by name at the context. The zones grow only by a
-// rebuild, which nothing live allows, so such a load keeps a short zone instead of being refused. Two shaped
-// inventories differ only in n_head_ctx_max, which sizes the Graph floor and nothing else: 8 heads (a floor of a few
-// MiB at the 512 x 512 planning shape) and 2048 (3 GiB by the formula, held to the DIRECT cap of at most 1 GiB).
+// (i) A load whose only shortfall is the oneDNN Graph floor, in an arena a live allocation holds, keeps the zones as
+// they are, and the reverse order takes the sufficient path. The holder is one 4 KiB allocation, not a second model:
+// this arm is the narrow control of the keep, and the two co-resident model loads in both orders are
+// test-sycl-coresident-graph-floor's. The ONEDNN zone holds the oneDNN primitive pair and the Graph scratch floor. The
+// floor is a reservation: what the zone cannot hold of it is served on the DIRECT path under its cap, and a context
+// whose Graph scratch does not fit is refused by name at the context. The zones grow only by a rebuild, which nothing
+// live allows, so such a load keeps a short zone instead of being refused. Two shaped inventories differ only in
+// n_head_ctx_max, which sizes the Graph floor and nothing else: 8 heads (a floor of a few MiB at the 512 x 512
+// planning shape) and 2048 (3 GiB by the formula, held to the DIRECT cap of at most 1 GiB).
 //   keep:    the small load stages with nothing holding the arena, so every zone holds what the large load needs but
 //            the ONEDNN zone its floor; a 4 KiB RUNTIME-zone allocation then holds the arena, and the large load,
 //            ended uncommitted, stages OK with one "[VRAM-ARENA] device 0 keeps its ONEDNN zone" WARN and no refusal
 //            line; all three zone capacities are unchanged; the Graph room it reads inside the open load is below the
-//            planned floor (the context check reads the kept zone, not the plan); the allocation is where it was;
+//            planned floor (the context check reads the kept zone, not the plan); once the load has ended uncommitted
+//            the Graph room is what it was before the load (the failed load put the stored zone plan back); the
+//            allocation is where it was;
 //   reverse: with the allocation released, the large load stages with nothing holding, so the zones hold its floor;
 //            a new allocation holds the arena, and the small load stages OK with no keep WARN and every zone capacity
 //            unchanged.
 // Engagement: device 0's arena is active; each load beside nothing staged OK; inside the open large load beside the
-// allocation the planned ONEDNN requirement exceeds the zone, so the zones could not hold it as they stood (VOID
-// otherwise: the Graph allocator is off, the plan spans both cards, or an earlier arm left a zone that holds the
-// floor);
-// after the reverse leg's large load the zone holds that requirement; each allocation lands in the RUNTIME zone.
+// allocation the ONEDNN zone the ensure sizes (the planned requirement, at least 256 MiB, clamped to a quarter of the
+// available budget but not below the pair) exceeds the zone, so the zones could not hold it as they stood (VOID
+// otherwise: the Graph allocator is off, the plan spans both cards, the budget clamp leaves nothing short, or an
+// earlier arm left a zone that holds it); after the reverse leg's large load the zone holds the planned requirement;
+// each allocation lands in the RUNTIME zone. The put-back check is engaged only when the room inside the open load
+// differs from the room before it; otherwise it prints that it measured nothing.
 // Mutants: the keep removed (the large load returns PLAN_REJECTED after a refusal line); the keep taken by a rebuild
 // (a capacity moves, or the allocation no longer resolves where it was); the WARN dropped or repeated within the load;
-// the room read from the plan rather than the kept zone (it is not below the floor); the reverse order kept short (a
-// keep WARN, or a capacity moves).
-arm_result arm_i_graph_floor_keeps_the_held_zones() {
+// the room read from the plan rather than the kept zone (it is not below the floor); the failed load's zone plan left
+// stored (the room after the load is the kept room, not the room before it); the reverse order kept short (a keep
+// WARN, or a capacity moves).
+arm_result arm_i_graph_floor_keeps_an_allocation_held_arena() {
     arm_result      r;
     unified_cache * cache = get_unified_cache_for_device(0);
     if (cache == nullptr || !cache->arena_active()) {
@@ -1473,6 +1498,8 @@ arm_result arm_i_graph_floor_keeps_the_held_zones() {
         }
         const resolved_ptr          first  = holder.resolve();
         const arena_zone_capacities before = read_zone_capacities(cache);
+        size_t                      room_before      = 0;
+        const bool                  room_before_read = unified_cache_get_onednn_graph_room(0, &room_before);
         log_clear();
         const graph_floor_load         kept     = stage_early_reading_the_graph_room(large.inv);
         const std::vector<std::string> warned   = lines_with(kept_warn);
@@ -1482,10 +1509,11 @@ arm_result arm_i_graph_floor_keeps_the_held_zones() {
             void_arm(r, "the large load's transaction did not begin (" + num(kept.begin) + ")");
             return r;
         }
-        if (kept.planned_onednn <= before.onednn) {
-            void_arm(r, "inside the large load the planned ONEDNN requirement is " + num(kept.planned_onednn) +
-                            " bytes, which the " + num(before.onednn) + "-byte zone holds, so nothing had to be kept " +
-                            "(the Graph allocator is off, the plan spans both cards, or an earlier arm grew the zone)");
+        if (kept.zone_need <= before.onednn) {
+            void_arm(r, "inside the large load the ONEDNN zone the ensure sizes is " + num(kept.zone_need) +
+                            " bytes (planned " + num(kept.planned_onednn) + "), which the " + num(before.onednn) +
+                            "-byte zone holds, so nothing had to be kept (the Graph allocator is off, the plan spans " +
+                            "both cards, the budget clamp leaves nothing short, or an earlier arm grew the zone)");
             return r;
         }
         expect(r, kept.stage == GGML_SYCL_LIFECYCLE_OK,
@@ -1502,6 +1530,17 @@ arm_result arm_i_graph_floor_keeps_the_held_zones() {
         expect(r, kept.room_read && kept.room < planned_floor,
                "inside the kept load the Graph room reads " + num(kept.room) + " bytes (read " + num(kept.room_read) +
                    "), not below the " + num(planned_floor) + "-byte planned floor the zone could not hold");
+        if (room_before_read && kept.room_read && kept.room != room_before) {
+            expect(r, kept.room_after_read && kept.room_after == room_before,
+                   "after the kept load ended uncommitted the Graph room reads " + num(kept.room_after) +
+                       " bytes (read " + num(kept.room_after_read) + "), not the " + num(room_before) +
+                       " bytes it read before the load: the failed load's zone plan stayed stored");
+        } else {
+            std::printf(
+                "arm (i): the put-back check measured nothing: the Graph room read %zu bytes before the large "
+                "load and %zu inside it (read %d and %d)\n",
+                room_before, kept.room, room_before_read ? 1 : 0, kept.room_read ? 1 : 0);
+        }
         const resolved_ptr again = holder.resolve();
         expect(r, again.ptr == first.ptr && again.on_device && holds_the_runtime_zone(holder),
                "the allocation no longer resolves to its device pointer in the RUNTIME zone after the kept load");
@@ -1726,7 +1765,7 @@ int main() {
         { "(e) a load the held arena cannot hold is refused",    arm_e_held_arena_refuses_the_load                },
         { "(f) a load refused early keeps the KV-zone ring",     arm_f_early_refusal_keeps_the_kv_zone_ring       },
         { "(h) a load releases a ring alone holding the arena",  arm_h_load_releases_a_lone_ring                  },
-        { "(i) a Graph floor alone keeps the held zones",        arm_i_graph_floor_keeps_the_held_zones           },
+        { "(i) a Graph floor keeps an allocation-held arena",    arm_i_graph_floor_keeps_an_allocation_held_arena },
         { "(g) a refused late pass configures no host zone",     arm_g_refused_late_pass_configures_no_host_zones },
     };
     int passed = 0, failed = 0, voided = 0;
