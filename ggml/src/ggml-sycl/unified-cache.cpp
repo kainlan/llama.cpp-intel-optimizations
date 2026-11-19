@@ -7840,13 +7840,10 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                 bind_compute_arena();
             }
 #if GGML_SYCL_DNNL
-            // llama.cpp-0oxf: snapshot available_budget() at every successful
-            // plan so the DIRECT Graph-scratch cap (onednn_graph_scratch_direct_cap_bytes())
-            // tracks what THIS plan had to work with, not live budget that
-            // shrinks as the arena's own zones consume it. std::atomic store:
-            // this write is not synchronized with onednn_graph_scratch_mutex_,
-            // which guards every read.
-            onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
+            // The DIRECT Graph-scratch cap (onednn_graph_scratch_direct_cap_bytes()) is a fraction of the budget this
+            // arena was planned with, not of the live budget, which shrinks as the arena's own zones consume it. The
+            // zones are kept as they are here, so the snapshot does not rise (onednn_graph_direct_cap_snapshot_keep).
+            onednn_graph_direct_cap_snapshot_keep();
 #endif
             // The zone is kept as it was built, so it stays described by the larger plan it was built from (its whole
             // pair, with the Graph floor's own maximum): a later, smaller plan (a draft model beside the target) must
@@ -7896,6 +7893,9 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                 if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
                     bind_compute_arena();
                 }
+#if GGML_SYCL_DNNL
+                onednn_graph_direct_cap_snapshot_keep();
+#endif
                 return true;
             }
             const size_t blocked_bytes =
@@ -8050,9 +8050,8 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
     }
     bind_compute_arena();
 #if GGML_SYCL_DNNL
-    // llama.cpp-0oxf: see the "zones_sufficient" branch above for why this is
-    // snapshotted here rather than read live from onednn_graph_scratch_alloc().
-    // std::atomic store -- see that branch's comment.
+    // The zones were rebuilt for this plan, so the DIRECT cap's snapshot is the budget it was planned with, whether
+    // that is above or below the one held (see the "zones_sufficient" branch above for why it is a snapshot).
     onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
     onednn_zone_plan_store(dev_id, live_plan);
@@ -15229,6 +15228,16 @@ static size_t onednn_graph_scratch_direct_cap_bytes(size_t plan_time_available_b
         return kOneGiB;
     }
     return std::min(kOneGiB, plan_time_available_bytes / 4);
+}
+
+void unified_cache::onednn_graph_direct_cap_snapshot_keep() {
+    // One compare-exchange loop, so a store by a concurrent ensure on this device is never lost under ours.
+    const size_t current = available_budget();
+    size_t       held    = onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire);
+    while (!onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.compare_exchange_weak(
+        held, zone_graph_direct_cap_snapshot_kept(held, current), std::memory_order_acq_rel,
+        std::memory_order_acquire)) {
+    }
 }
 
 size_t unified_cache::onednn_graph_scratch_direct_cap() const {

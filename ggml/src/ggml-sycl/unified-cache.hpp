@@ -6552,6 +6552,12 @@ class unified_cache {
     // size_t here would be a data race.
     std::atomic<size_t> onednn_graph_scratch_direct_cap_plan_snapshot_bytes_{ 0 };
 
+    // Stores the snapshot above for zones kept as they are: the lower of the one held and available_budget() now, 0
+    // being unset (zone_graph_direct_cap_snapshot_kept). The cap sizes the oneDNN Graph floor, so a snapshot that rose
+    // across tenants while the arena is kept would grow the floor of a zone that already serves the shape (with the
+    // DIRECT path) and ask for a rebuild. Only a rebuild stores the current budget outright.
+    void onednn_graph_direct_cap_snapshot_keep();
+
     // llama.cpp-0oxf: these three were previously
     // function-local `static` variables inside their respective member
     // functions, which means ONE instance was shared across every
