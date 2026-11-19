@@ -132,7 +132,11 @@ def check_mmvq(src: str) -> None:
             "the single xmx_caps_ok test must be the only one (llama.cpp-4hg7)"
         )
 
-    scan = re.search(r"if \(full_gpu_cover\) \{ for \(uint8_t seen : seen_slots\) \{ if \(!seen\) \{ return log_xmx_reject\(\"slot-missing\"\);", xmx)
+    scan = re.search(
+        r"if \(full_gpu_cover\) \{ for \(uint8_t seen : seen_slots\) \{ "
+        r"if \(!seen\) \{ return log_xmx_reject\(\"slot-missing\"\);",
+        xmx,
+    )
     if not scan:
         raise ContractError(
             "FAIL [pin A4]: the 'slot-missing' scan must run only for full cover; on partial cover the unseen slots belong "
