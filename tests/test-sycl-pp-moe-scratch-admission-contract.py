@@ -87,17 +87,18 @@ RESERVE_CALLS_IN_FILE = 5   # plan, replan x2, the two executors
 # process-global setter (llama.cpp-kj90); the fix for that ticket removes the write-back and lowers this pin back to 4.
 SET_PLANNED_CALLS_IN_FILE = 5
 # Whole ggml-sycl directory, comments and strings removed: reserve is definition + the wrapper's call + hpp declaration
-# + 5 calls + the dry run device test's arm (f), which reserves exactly the 1 MiB depth-1 ring it planned so the ring
-# holds KV-zone bytes a refused load must leave alone (it raises no ceiling and reads none back); setter is definition +
-# hpp declaration + the 5 calls above + load_published_terms::restore in unified-cache.cpp (a refused or failed load
-# puts back the ring that stood before it, a planned size, never a reserve) + the dry run device test's 4
-# (tests/test-sycl-plan-dry-run.cpp: withdraw_published_inputs zeroes the ring, write_planner_state puts back the saved
-# one, and arm (f) plans the ring it reserves and puts back the ring it found) + the runtime-alloc device test's 4
+# + 5 calls + the dry run device test's arms (f) and (h), each of which reserves exactly the 1 MiB depth-1 ring it
+# planned, (f) so the ring holds KV-zone bytes a refused load must leave alone and (h) so the ring alone holds the arena
+# a load must release it from (neither raises a ceiling or reads one back); setter is definition + hpp declaration + the
+# 5 calls above + load_published_terms::restore in unified-cache.cpp (a refused or failed load puts back the ring that
+# stood before it, a planned size, never a reserve) + the dry run device test's 6 (tests/test-sycl-plan-dry-run.cpp:
+# withdraw_published_inputs zeroes the ring, write_planner_state puts back the saved one, and arms (f) and (h) each
+# plan the ring they reserve and put back the ring they found) + the runtime-alloc device test's 4
 # (tests/test-unified-runtime-alloc.cpp: planned_terms_found puts back the ring it found, and the discarded-plan case
 # publishes the ring at the planning shape, at the room's micro-batch, and at the planning shape again). None of the
 # test uses reads back a ceiling. The write-back and the dry run test's first two uses follow llama.cpp-kj90; its fix
 # revisits all three.
-DIRECTORY_TOKENS = {"reserve": 9, "wrapper": 2, "setter": 16}
+DIRECTORY_TOKENS = {"reserve": 10, "wrapper": 2, "setter": 18}
 _DIRECTORY_TOKEN_PATTERNS = {
     "reserve": r"(?<!\w)reserve_pp_moe_onednn_scratch\b",
     "wrapper": r"\bunified_cache_reserve_pp_moe_onednn_scratch\b",
