@@ -21321,6 +21321,15 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                                       ggml_sycl::placement_load_n_ubatch(next_plan.planner_n_ubatch));
         return refuse("MoE host recipe workspace overflows");
     }
+    // Never lower the figure. Every context of this model shares the published plan, and nothing here knows which of
+    // them are still live, so a narrower figure could refuse the recipe dispatch of a wider context that published
+    // before. The figure is only the bound the executor checks a request against and this transaction reserves no
+    // host memory from it, so keeping it at the widest micro-batch published so far costs nothing. SIZE_MAX is the
+    // load's mark for a workspace that overflowed, not a size, so it is not kept.
+    if (current->plan->moe_host_recipe_workspace_bytes != SIZE_MAX &&
+        current->plan->moe_host_recipe_workspace_bytes > next_plan.moe_host_recipe_workspace_bytes) {
+        next_plan.moe_host_recipe_workspace_bytes = current->plan->moe_host_recipe_workspace_bytes;
+    }
 
     // Filled when KV is re-placed to the host tier, here or by the over-budget
     // demotion further below; read into the probe's out->would_demote_kv/

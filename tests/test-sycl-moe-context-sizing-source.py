@@ -4,6 +4,10 @@
 - The immutable Q1_0/NVFP4 host recipes' CPU workspace is re-sized at the context's micro-batch, in tokens, by the
   function the load sized it with. It sits after the transaction sets next_plan.planner_n_ubatch and before the ring's
   pending terms are built, so the probe and the real call both run it, and an overflow refuses the context.
+- The transaction never lowers that figure: when the plan it copied from holds a larger one, other than SIZE_MAX (the
+  load's mark for a workspace that overflowed, not a size), it keeps that one. The figure is only the bound the
+  executor checks a request against, the transaction reserves no host memory from it, and it does not know which
+  contexts of the model are still live, so a narrower figure could refuse a wider context that published before.
 """
 
 import re
@@ -53,6 +57,11 @@ _RECIPE_RESIZE = (
     "ggml_sycl::placement_load_n_ubatch(next_plan.planner_n_ubatch), &next_plan.moe_host_recipe_workspace_bytes)"
 )
 _RECIPE_REFUSE = 'return refuse("MoE host recipe workspace overflows");'
+_RECIPE_KEEP = (
+    "if (current->plan->moe_host_recipe_workspace_bytes != SIZE_MAX && "
+    "current->plan->moe_host_recipe_workspace_bytes > next_plan.moe_host_recipe_workspace_bytes) { "
+    "next_plan.moe_host_recipe_workspace_bytes = current->plan->moe_host_recipe_workspace_bytes; }"
+)
 
 
 def transaction(code: str) -> str:
@@ -83,6 +92,18 @@ def recipe_resize_violations(code: str) -> list:
     return violations
 
 
+def recipe_keep_violations(code: str) -> list:
+    txn = transaction(code)
+    violations = between_s1_and_s8(txn, _RECIPE_KEEP, "the host recipe workspace keep-larger step")
+    resize = txn.find(_RECIPE_RESIZE)
+    keep = txn.find(_RECIPE_KEEP)
+    if resize == -1:
+        violations.append("the host recipe workspace re-size: not found in the transaction")
+    elif keep != -1 and not resize < keep:
+        violations.append("the host recipe workspace keep-larger step: must follow the re-size")
+    return violations
+
+
 def test_transaction_resizes_the_host_recipe_workspace():
     assert recipe_resize_violations(GGML_SYCL_CPP_CODE) == []
 
@@ -91,6 +112,16 @@ def test_recipe_resize_check_has_a_mutation_witness():
     assert GGML_SYCL_CPP_CODE.count(_RECIPE_RESIZE) == 1, "the re-size must appear exactly once"
     mutated = GGML_SYCL_CPP_CODE.replace(_RECIPE_RESIZE, "true", 1)
     assert recipe_resize_violations(mutated) != [], "the check must catch the re-size being removed"
+
+
+def test_transaction_never_lowers_the_host_recipe_workspace():
+    assert recipe_keep_violations(GGML_SYCL_CPP_CODE) == []
+
+
+def test_recipe_keep_check_has_a_mutation_witness():
+    assert GGML_SYCL_CPP_CODE.count(_RECIPE_KEEP) == 1, "the keep-larger step must appear exactly once"
+    mutated = GGML_SYCL_CPP_CODE.replace(_RECIPE_KEEP, "", 1)
+    assert recipe_keep_violations(mutated) != [], "the check must catch the keep-larger step being removed"
 
 
 if __name__ == "__main__":
