@@ -21696,8 +21696,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             next_plan.moe_host_recipe_shapes, ggml_sycl::placement_load_n_ubatch(next_plan.planner_n_ubatch),
             &next_plan.moe_host_recipe_workspace_bytes)) {
         GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode,
-                                      "[SYCL-PLAN] runtime context update rejected: the MoE host recipe workspace for "
-                                      "%u tokens overflows\n",
+                                      "[SYCL-PLAN] runtime context update rejected: the MoE host recipe workspace "
+                                      "overflows at n_ubatch=%u\n",
                                       ggml_sycl::placement_load_n_ubatch(next_plan.planner_n_ubatch));
         return refuse("MoE host recipe workspace overflows");
     }
@@ -22639,6 +22639,23 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                                                       hold_kv_room);
     announce_kv_host_demotions(*immutable->plan);
     announce_explicit_ubatch_placement(*immutable->plan, warn_explicit_ubatch);
+    // The load reports the host recipe workspace it planned; a context that moves the bound reports it here, once the
+    // plan is published, so a log can be read against the bound its recipe dispatches were checked against. The keep
+    // step never lowers a finite figure, so a changed one is the figure re-sized at this context's micro-batch.
+    if (const ggml_sycl::placement_plan & published = *immutable->plan;
+        !published.moe_host_recipe_shapes.empty() &&
+        published.moe_host_recipe_workspace_bytes != current->plan->moe_host_recipe_workspace_bytes) {
+        char was[48];
+        if (current->plan->moe_host_recipe_workspace_bytes == SIZE_MAX) {
+            snprintf(was, sizeof(was), "unset after an overflow");
+        } else {
+            snprintf(was, sizeof(was), "%.2f MB", current->plan->moe_host_recipe_workspace_bytes / mb);
+        }
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] runtime context update: MoE host recipe workspace bound %.2f MB at n_ubatch=%u (was %s)\n",
+            published.moe_host_recipe_workspace_bytes / mb,
+            ggml_sycl::placement_load_n_ubatch(published.planner_n_ubatch), was);
+    }
     // The commit point the dump's context_txn snapshot entries name: the RUNTIME room and the ONEDNN
     // capacity as they stand once this transaction has published.
     ggml_sycl::unified_cache_dump_capture_zone_figures(ctx->device, ggml_sycl::dump_point::CONTEXT_TXN);

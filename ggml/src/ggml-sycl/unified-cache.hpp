@@ -1271,10 +1271,13 @@ struct placement_plan {
     size_t   moe_cpu_expert_staging_bytes        = 0;  // Zone: SCRATCH (host pinned)
     size_t   moe_host_recipe_workspace_bytes     = 0;  // Zone: SCRATCH (host pinned)
 
-    // The immutable Q1_0/NVFP4 host recipes' distinct shapes, from the inventory. moe_host_recipe_workspace_bytes is
-    // placement_moe_host_recipe_workspace_bytes_at() of these at the plan's micro-batch, or SIZE_MAX when that
-    // overflows. The shapes stay on the plan so that the workspace can be sized by the same rule at another
-    // micro-batch. Blank lines around it keep its longer type out of the size_t block's alignment column.
+    // The immutable Q1_0/NVFP4 host recipes' distinct shapes, from the inventory. The load sets
+    // moe_host_recipe_workspace_bytes to placement_moe_host_recipe_workspace_bytes_at() of these at its planning
+    // micro-batch, or SIZE_MAX when that overflows. A context's runtime transaction re-sizes it at the context's
+    // micro-batch and never lowers a finite figure, so in a published plan it is the largest figure the load or any
+    // context of this model has asked for. The shapes stay on the plan so that the workspace can be sized by the same
+    // rule at another micro-batch. Blank lines around it keep its longer type out of the size_t block's alignment
+    // column.
     std::vector<moe_host_recipe_shape> moe_host_recipe_shapes;
 
     // Expert bias D2H copy: float bias tensors staged to host for gate computation.
