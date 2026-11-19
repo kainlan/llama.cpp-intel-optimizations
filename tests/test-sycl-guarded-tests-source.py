@@ -1054,3 +1054,11 @@ def test_each_check_catches_its_mutant(name):
     failures = "\n".join(lines)
     assert any(all(p in line for p in parts) for line in lines), (
         f"the mutant '{name}' was not caught by its check; failures:\n{failures}")
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
