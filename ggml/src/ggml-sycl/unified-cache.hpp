@@ -1040,14 +1040,14 @@ struct placement_plan;
 // plan that named no micro-batch, the zone was sized at the load's planning micro-batch, the shape the load measured
 // the compute term at, which the caller passes as `planning_n_ubatch`: the plan's planner_n_ubatch is the context's
 // micro-batch, rewritten by every runtime context transaction, so it cannot say what the load measured. The fit
-// credits that one rung only (zone_hold_fit_rung_has_compute_room). 0 with *n_ubatch 0 for a multi-device plan,
-// another device, a planning micro-batch of 0, a named micro-batch the plan did not place, and when `held_out` says
-// the rung already recorded a request outside the arena: a measured spill overrules the plan.
+// credits that rung and the rungs below it (zone_hold_fit_rung_has_compute_room), except a rung whose own record is
+// larger than the room, a rung without a record above the micro-batch the term was measured at, and the rung whose
+// own buffer was held out. 0 with *n_ubatch 0 for a multi-device plan, another device, a planning micro-batch of 0
+// and a named micro-batch the plan did not place.
 size_t placement_plan_compute_room(const placement_plan & plan,
                                    int                    device,
                                    size_t                 compute_term,
                                    uint32_t               planning_n_ubatch,
-                                   bool                   held_out,
                                    uint32_t *             n_ubatch);
 
 // Whether a context announces the load's explicit micro-batch placement at WARN: it is the first non-probe context
@@ -2716,10 +2716,11 @@ bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_
 bool             unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
 size_t           unified_cache_get_planned_compute_term_bytes(int device_id);
 // The micro-batch the planned compute term was measured at on the device, for the hold-spill fit to credit the term
-// at that rung only (placement_plan_compute_room). Each load records the micro-batch it measured the term at
-// (ggml_sycl_tensor_inventory::n_ubatch_measure) through zone_compute_term_n_ubatch_store, which documents the rule;
-// the setter WARNs once when a store turns the record off. The getter answers 0 for none, for a record turned off,
-// and for a device out of range.
+// at that rung and below (placement_plan_compute_room), and to bound the credit of a rung without a record of its own
+// under a placed micro-batch (zone_hold_fit_inputs::compute_room_measured_n_ubatch). Each load records the micro-batch
+// it measured the term at (ggml_sycl_tensor_inventory::n_ubatch_measure) through zone_compute_term_n_ubatch_store,
+// which documents the rule; the setter WARNs once when a store turns the record off. The getter answers 0 for none,
+// for a record turned off, and for a device out of range.
 void             unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch);
 uint32_t         unified_cache_get_planned_compute_term_n_ubatch(int device_id);
 // llama.cpp-p6i0: the load's planned state term, the bytes the context memory the probe measure placed on the
