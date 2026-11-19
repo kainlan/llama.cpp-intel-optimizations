@@ -3268,6 +3268,53 @@ int main() {
               "a keep outside a staged load did not warn");
     }
 
+    // ---- Case 44: a failed load puts the stored zone plan back as the zone holds it now ----------------------------
+    // The restore stores zone_onednn_plan_keep_short(prior, prior, capacity now, held pair now): the prior plan exactly
+    // while the zone still holds it, and a smaller Graph floor when a pair reserved in between under the failed load's
+    // wider bound, or a smaller zone, leaves less room. In each outcome the pair bound over the stored plan is at least
+    // the held pair, and the Graph room a context check reads (capacity less that bound) is the stored floor.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_onednn_plan;
+        using ggml_sycl::zone_onednn_plan_keep_short;
+        using ggml_sycl::zone_onednn_plan_same;
+        using ggml_sycl::zone_onednn_pp_pair_bound;
+        const zone_onednn_plan prior{ 200 * MiB, 300 * MiB, 150 * MiB, 50 * MiB };
+        const auto             room_over = [](const zone_onednn_plan & p, size_t capacity) {
+            return capacity - zone_onednn_pp_pair_bound(capacity, p.bare_bytes, p.graph_floor_bytes);
+        };
+
+        CHECK(zone_onednn_plan_same(prior, prior), "a plan does not compare the same as itself");
+        for (int field = 0; field < 4; ++field) {
+            zone_onednn_plan other = prior;
+            size_t * const   f[]   = { &other.bare_bytes, &other.graph_floor_bytes, &other.weights_bytes,
+                                       &other.activations_bytes };
+            *f[field] += MiB;
+            CHECK(!zone_onednn_plan_same(prior, other), "plans that differ in one field compare the same");
+        }
+
+        // The zone still holds the prior plan: 600 MiB less the 200 MiB pair leaves room for its 300 MiB floor.
+        const zone_onednn_plan holds = zone_onednn_plan_keep_short(prior, prior, 600 * MiB, 100 * MiB);
+        CHECK(zone_onednn_plan_same(holds, prior),
+              "a zone that still holds the prior plan did not get it back exactly");
+        CHECK(room_over(holds, 600 * MiB) == 300 * MiB, "the Graph room over the prior plan is not its floor");
+
+        // A 360 MiB pair was reserved under the failed load's wider bound, above the prior plan's 300 MiB bound.
+        const zone_onednn_plan crowded = zone_onednn_plan_keep_short(prior, prior, 600 * MiB, 360 * MiB);
+        CHECK(crowded.bare_bytes == prior.bare_bytes && crowded.weights_bytes == prior.weights_bytes &&
+                  crowded.activations_bytes == prior.activations_bytes,
+              "a held pair above the prior bound changed the prior pair plan");
+        CHECK(crowded.graph_floor_bytes == 240 * MiB, "the floor beside a 360 MiB held pair is not 240 MiB");
+        CHECK(zone_onednn_pp_pair_bound(600 * MiB, crowded.bare_bytes, crowded.graph_floor_bytes) >= 360 * MiB,
+              "the held pair is above the bound over the restored plan");
+        CHECK(room_over(crowded, 600 * MiB) == 240 * MiB, "the Graph room beside the held pair is not the floor");
+
+        // The zone was rebuilt to 400 MiB, below the prior plan's 500 MiB.
+        const zone_onednn_plan smaller = zone_onednn_plan_keep_short(prior, prior, 400 * MiB, 0);
+        CHECK(smaller.graph_floor_bytes == 200 * MiB, "the floor in a 400 MiB zone is not 200 MiB");
+        CHECK(room_over(smaller, 400 * MiB) == 200 * MiB, "the Graph room in the smaller zone is not the floor");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

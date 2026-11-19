@@ -370,6 +370,10 @@ struct zone_onednn_plan {
 // directly). Pure.
 zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live);
 
+// Whether two snapshots are the same in all four figures: the test a load's published record uses to tell that the
+// stored snapshot still holds what the load left in it. Pure.
+bool zone_onednn_plan_same(const zone_onednn_plan & a, const zone_onednn_plan & b);
+
 // Whether the oneDNN PP scratch is allowed to supply a dense op's f16 copies at all, as a function of the
 // GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH setting and the weight's type (llama.cpp-8ony). `env_mode` is the parsed
 // variable: negative when unset, 0 when it turns the scratch off, positive when it turns it on for every type.
@@ -621,7 +625,8 @@ size_t zone_onednn_kept_pair_bytes(const zone_onednn_plan & kept, size_t held_pa
 // zone_onednn_plan_keep's maximum floor: that would raise the stored floor above what the kept zone holds, the pair
 // bound (zone_onednn_pp_pair_bound) would fall with it, and a pair already held could then exceed the bound, so the
 // Graph room a context check reads (capacity less the bound) would be larger than the zone has. Over the stored
-// snapshot the bound is the kept pair bytes and the Graph room is the stored floor. Pure.
+// snapshot the bound is the capacity less the stored floor, never below the kept pair bytes (equal to them when the
+// capacity limits the floor), so the Graph room is the stored floor. Pure.
 zone_onednn_plan zone_onednn_plan_keep_short(const zone_onednn_plan & held,
                                              const zone_onednn_plan & live,
                                              size_t                   capacity_bytes,
@@ -635,9 +640,10 @@ size_t zone_graph_direct_cap_snapshot_kept(size_t held_bytes, size_t current_byt
 
 // Whether a call that kept an ONEDNN zone short logs its WARN: once per load transaction and device. `latched_txn` is
 // the load the device's last WARN was for. A load's stage plans in two passes, and a micro-batch's grow leg asks for
-// the zones again, so one kept zone would otherwise warn up to three times. A call outside a staged load (`load_txn`
-// 0: tests, the plan dry run, a context's best-effort re-plan, the oneDNN pair's reserve) has no load to latch on, and
-// warns at every keep. Pure.
+// the zones again, so one kept zone would otherwise warn up to three times. Every call of a staged load carries its
+// transaction, a test's staged load included. A call outside a staged load (`load_txn` 0: a direct planner entry, a
+// test that asks the cache itself, a context's best-effort re-plan, the oneDNN pair's reserve) has no load to latch
+// on, and warns at every keep. Pure.
 bool zone_kept_onednn_warn_due(uint64_t latched_txn, uint64_t load_txn);
 
 // The line a model load refused for `refusal` logs, without a newline: the device, each zone's need and have in MB, the

@@ -223,6 +223,11 @@ zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone
     return kept;
 }
 
+bool zone_onednn_plan_same(const zone_onednn_plan & a, const zone_onednn_plan & b) {
+    return a.bare_bytes == b.bare_bytes && a.graph_floor_bytes == b.graph_floor_bytes &&
+           a.weights_bytes == b.weights_bytes && a.activations_bytes == b.activations_bytes;
+}
+
 bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool pair_eligible) {
     return !(pp_scratch_type_enabled && pair_eligible);
 }

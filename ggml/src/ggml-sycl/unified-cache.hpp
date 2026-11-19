@@ -3289,13 +3289,18 @@ struct planner_published_terms {
 
 // The device-wide terms a model load publishes for a device as it plans, with the planners' (planner): the PP pipeline
 // scratch; the PP MoE oneDNN ring's slots and depth, which of its slots the KV zone holds, and the row bytes, expert
-// counts and micro-batch it is re-planned from; and the oneDNN scratchpad pair with its stored sum, which the pair's
-// reserve raises on its own. Each model on the device plans with these, and every load overwrites them, so a load that
-// fails puts back what it published (load_published_record). The terms keyed by the load's owner are not here (they
-// leave with their owner, unified_cache_drop_planned_load_terms), nor is the compute term's micro-batch, which is
-// sticky by design and which every load records at the same planning value. Each setter stores what its getter reads,
-// so a restore is exact. The terms fall in groups (load_published_group), each the terms one publisher writes together,
-// and a restore puts back whole groups, so no group holds part of one publisher's terms and part of another's.
+// counts and micro-batch it is re-planned from; the oneDNN scratchpad pair with its stored sum, which the pair's
+// reserve raises on its own; and the snapshot the ONEDNN zone is described by (the pair plan and the Graph floor the
+// zone ensure stores, zone_onednn_plan), which the pair bound and the Graph room a context check reads are derived
+// from. Each model on the device plans with these, and every load overwrites them, so a load that fails puts back what
+// it published (load_published_record). The terms keyed by the load's owner are not here (they leave with their owner,
+// unified_cache_drop_planned_load_terms), nor is the compute term's micro-batch, which is sticky by design and which
+// every load records at the same planning value, nor the DIRECT Graph-scratch cap's budget snapshot, which does not
+// rise while the arena is kept and so has nothing for a failed load to lower. Each setter stores what its getter reads,
+// so a restore is exact, but for the zone snapshot: it describes a zone the failed load may have changed, so it goes
+// back as zone_onednn_plan_keep_short of the prior snapshot over the zone as it is then. The terms fall in groups
+// (load_published_group), each the terms one publisher writes together, and a restore puts back whole groups, so no
+// group holds part of one publisher's terms and part of another's.
 enum load_published_group : uint32_t {
     LOAD_PUBLISHED_GROUP_PIPELINE    = 1u << 0,  // the PP pipeline scratch
     LOAD_PUBLISHED_GROUP_RING        = 1u << 1,  // the ring's slots and depth, its KV-zone slots and its micro-batch
@@ -3306,7 +3311,8 @@ enum load_published_group : uint32_t {
     LOAD_PUBLISHED_GROUP_NONFA       = 1u << 6,  // the planners' non-FA attention scratch shape
     LOAD_PUBLISHED_GROUP_CONTROL     = 1u << 7,  // the planners' MoE CONTROL requirement
     LOAD_PUBLISHED_GROUP_SCATTER     = 1u << 8,  // the planners' MoE host scatter scratch
-    LOAD_PUBLISHED_GROUP_ALL         = (1u << 9) - 1,
+    LOAD_PUBLISHED_GROUP_ZONE_PLAN   = 1u << 9,  // the ONEDNN zone's stored snapshot
+    LOAD_PUBLISHED_GROUP_ALL         = (1u << 10) - 1,
 };
 
 struct load_published_terms {
@@ -3325,6 +3331,7 @@ struct load_published_terms {
     size_t                  onednn_weights        = 0;
     size_t                  onednn_activations    = 0;
     size_t                  onednn_stored         = 0;
+    zone_onednn_plan        onednn_zone_plan{};
     planner_published_terms planner{};
 
     static load_published_terms snapshot(int device);
@@ -3341,8 +3348,9 @@ struct load_published_terms {
 // the stored sum. `prior` is what each group held before this load wrote it, or what another publisher left in it
 // since; `written` is what each group held when this load last looked. note() takes one planner pass of the load: the
 // terms when it started and when it ended, both read under the inventory lock that every publisher but the reserve
-// holds, so only the pass wrote between them. restore() puts a group back only while it still holds `written`, and the
-// sum by compare-exchange, so a raise outside that lock is kept. A publisher that writes exactly what the load
+// holds, so only the pass wrote between them. restore() puts a group back only while it still holds `written`, the sum
+// by compare-exchange, so a raise outside that lock is kept, and the zone snapshot by a test and store under the
+// snapshot's own mutex, which the pair's reserve also writes through. A publisher that writes exactly what the load
 // published cannot be told from the load, and its group goes back with the load's.
 struct load_published_record {
     load_published_terms prior{};
@@ -5070,6 +5078,11 @@ class unified_cache {
 
     // Zone capacity and usage.
     size_t zone_capacity(vram_zone_id zone) const;
+
+    // The bytes of the oneDNN weights and activations scratch pair that lie inside the arena, which a kept ONEDNN zone
+    // must go on holding, and which a failed load's restore of the zone's snapshot keeps room for. A buffer allocated
+    // outside the arena takes none of the zone. Takes no lock.
+    size_t arena_held_onednn_pair_bytes();
     // The committed planned capacity only, never a bound load's view. Read off
     // a VM device it is a plan defect.
     size_t zone_capacity_committed(vram_zone_id zone) const;
@@ -6355,10 +6368,6 @@ class unified_cache {
     // allocations. Takes the PP MoE ring's lock, the persistent scratch lock, then each allocator group's lock, each
     // alone.
     void arena_count_scratch_holders(zone_arena_holders & holders);
-
-    // The bytes of the oneDNN weights and activations scratch pair that lie inside the arena, which a kept ONEDNN zone
-    // must go on holding. A buffer allocated outside the arena takes none of the zone. Takes no lock.
-    size_t arena_held_onednn_pair_bytes();
 
     // The load transaction whose keep of a short ONEDNN zone last warned on this device (zone_kept_onednn_warn_due). An
     // exchange, so two ensures of one load racing on the device warn once between them.

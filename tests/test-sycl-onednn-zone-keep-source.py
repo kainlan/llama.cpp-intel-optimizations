@@ -11,8 +11,8 @@ the blocked rebuild keeps the zones when the floor is all they lack. These check
 - ring: a PP MoE ring that alone holds the arena keeps nothing while the caller asked to release it first
   (ring_release_first); the call refuses and marks the refusal keep_deferred;
 - rule: one cache function decides and stores the keep, under the zone-plan mutex, through the pure rules
-  zone_onednn_plan_keep_short and zone_arena_shortfall_is_reservation_only (test-zone-sizing Case 41), and nothing
-  else calls those rules;
+  zone_onednn_plan_keep_short and zone_arena_shortfall_is_reservation_only (test-zone-sizing Case 41); nothing else
+  applies the predicate, and the only other site of zone_onednn_plan_keep_short is a failed load's put-back (restore);
 - entry: the load stage's entry ensure asks with ring_release_first first, and every call after its last resort asks
   without it; a ring the release kept is asked about again only when the refusal says the zones would be kept;
 - cap: the DIRECT Graph-scratch cap's budget snapshot does not rise while the arena is kept. The sufficient and keep
@@ -22,9 +22,13 @@ the blocked rebuild keeps the zones when the floor is all they lack. These check
 - warn: a keep logs one WARN naming the planned Graph floor, the zone kept and the Graph room it leaves, behind a
   latch (zone_kept_onednn_warn_due, Case 43) that exchanges the load transaction in: once per load and device, since
   the stage asks for the zones in two passes and again in its grow leg, and at every keep for a direct entry (0);
-- restore: the keep stores only the zone-plan and DIRECT cap snapshots, which describe the physical zone a failed
-  load does not roll back, so the failed load has nothing of the keep's to put back: the published-terms snapshot
-  reads neither, and the keep path writes no planner-published term.
+- restore: the zone-plan snapshot IS a term a failed load puts back. The keep and the sufficient path store a
+  description (the pair plan and the Graph floor) and move no memory, so a refused load that left its own description
+  would leave the live model a smaller Graph room for nothing. The published-terms snapshot reads it as its own group
+  (differing() and take_groups() carry its arm), and the restore stores zone_onednn_plan_keep_short(prior, prior,
+  capacity now, held pair now) under the zone-plan mutex only while the snapshot still holds what the load left
+  (test-zone-sizing Case 44). The DIRECT cap snapshot is not put back (it does not rise while the arena is kept), so the
+  published-terms snapshot does not read it, and the keep path writes no planner-published term.
 
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live
 inside test_*() functions. Checks read comment-stripped, whitespace-normalised text. Each check has a mutation witness
@@ -157,6 +161,22 @@ KEPT_WARN_ARGS = ("dev_id, arena_zones.onednn / (1024.0 * 1024.0), live_plan.gra
                   "onednn_zone / (1024.0 * 1024.0), kept.graph_floor_bytes / (1024.0 * 1024.0));")
 TERMS_SIG = "load_published_terms load_published_terms::snapshot(int device) {"
 PUBLISHED_WRITES = ("unified_cache_set_planned_", "g_planned_")
+ZONE_GROUP = "LOAD_PUBLISHED_GROUP_ZONE_PLAN"
+TERMS_READ = "terms.onednn_zone_plan = onednn_zone_plan_load(device);"
+DIFFERING_SIG = "uint32_t load_published_terms::differing(const load_published_terms & other) const {"
+DIFFERING_ARM = f"bit(!zone_onednn_plan_same(onednn_zone_plan, other.onednn_zone_plan), {ZONE_GROUP})"
+TAKE_SIG = "void load_published_terms::take_groups(const load_published_terms & from, uint32_t groups) {"
+TAKE_ARM = f"if (groups & {ZONE_GROUP}) {{ onednn_zone_plan = from.onednn_zone_plan; }}"
+RESTORE_SIG = "void load_published_record::restore(int device) const noexcept {"
+RESTORE_ARM = f"if (back & {ZONE_GROUP}) {{"
+RESTORE_CAPACITY = "cache->zone_capacity(vram_zone_id::ONEDNN)"
+RESTORE_HELD = "cache->arena_held_onednn_pair_bytes()"
+PUT_BACK_FN = "onednn_zone_plan_put_back"
+PUT_BACK_SIG = f"static void {PUT_BACK_FN}("
+PUT_BACK_CALL = f"{PUT_BACK_FN}(device, written.onednn_zone_plan, prior.onednn_zone_plan, capacity, held);"
+PUT_BACK_TEST = "if (zone_onednn_plan_same(g_onednn_zone_plan[device_id], written)) {"
+PUT_BACK_RULE = "zone_onednn_plan_keep_short(prior, prior, capacity_bytes, held_pair_bytes)"
+PUT_BACK_STORE = f"g_onednn_zone_plan[device_id] = {PUT_BACK_RULE};"
 
 
 def _ensure(uc: str) -> str:
@@ -186,16 +206,17 @@ def claim_ring_alone_defers_the_keep(uc: str) -> bool:
 
 
 def claim_one_rule_decides_the_keep(uc: str, gs: str) -> bool:
-    """The keep function applies both pure rules under the zone-plan mutex and stores only when asked; no other site
-    applies them."""
+    """The keep function applies both pure rules under the zone-plan mutex and stores only when asked. No other site
+    applies the predicate, and zone_onednn_plan_keep_short is applied elsewhere only by a failed load's put-back."""
     c = code(uc)
     body = fn_body(c, KEEP_SIG)
     if not ordered(body, PLAN_LOCK, SHORT_RULE, ONLY_RULE, STORE):
         return False
-    for rule in ("zone_onednn_plan_keep_short(", "zone_arena_shortfall_is_reservation_only("):
-        if c.count(rule) != 1 or rule in code(gs):
-            return False
-    return True
+    only = "zone_arena_shortfall_is_reservation_only("
+    if c.count(only) != 1 or only in code(gs):
+        return False
+    short = "zone_onednn_plan_keep_short("
+    return body.count(short) == 1 and c.count(short) == 1 + fn_body(c, PUT_BACK_SIG).count(short) and short not in code(gs)
 
 
 def claim_entry_spends_its_last_resort_first(gs: str) -> bool:
@@ -257,18 +278,26 @@ def claim_a_keep_warns_once_per_load(uc: str) -> bool:
     )
 
 
-def claim_the_keep_writes_no_published_term(uc: str) -> bool:
-    """What the keep stores (the zone-plan snapshot and the DIRECT cap snapshot) describes the physical zone, which a
-    failed load does not roll back, so it is not a term the failed load puts back: the published-terms snapshot reads
-    neither, and the keep path writes no planner-published term."""
+def claim_a_failed_load_puts_the_zone_plan_back(uc: str) -> bool:
+    """The zone-plan snapshot is one group of a load's published record: the published-terms snapshot reads it,
+    differing() and take_groups() carry its arm, and the restore puts it back through the put-back, which under the
+    zone-plan mutex stores zone_onednn_plan_keep_short(prior, prior, capacity, held pair) only while the snapshot still
+    holds what the load left. The DIRECT cap snapshot is not read into the record, and the keep path writes no
+    planner-published term."""
     c = code(uc)
     terms = fn_body(c, TERMS_SIG)
+    restore = fn_body(c, RESTORE_SIG)
+    arm = block_at(restore, restore.find(RESTORE_ARM)) if RESTORE_ARM in restore else ""
     writers = (fn_body(c, KEEP_SIG), fn_body(c, CAP_SIG), _kept_block(uc))
     return (
-        bool(terms)
-        and all(writers)
-        and "onednn_zone_plan" not in terms
+        terms.count(TERMS_READ) == 1
         and SNAPSHOT not in terms
+        and DIFFERING_ARM in fn_body(c, DIFFERING_SIG)
+        and TAKE_ARM in fn_body(c, TAKE_SIG)
+        and ordered(arm, RESTORE_CAPACITY, RESTORE_HELD, PUT_BACK_CALL)
+        and c.count(PUT_BACK_FN + "(") == 2
+        and ordered(fn_body(c, PUT_BACK_SIG), PLAN_LOCK, PUT_BACK_TEST, PUT_BACK_STORE)
+        and all(writers)
         and not any(w in body for body in writers for w in PUBLISHED_WRITES)
     )
 
@@ -281,7 +310,7 @@ def keep_checks(uc: str, gs: str) -> dict:
         "entry": claim_entry_spends_its_last_resort_first(gs),
         "cap": claim_cap_snapshot_rises_only_at_a_rebuild(uc),
         "warn": claim_a_keep_warns_once_per_load(uc),
-        "restore": claim_the_keep_writes_no_published_term(uc),
+        "restore": claim_a_failed_load_puts_the_zone_plan_back(uc),
     }
 
 
@@ -333,10 +362,13 @@ def test_a_keep_warns_once_per_load():
     )
 
 
-def test_the_keep_writes_no_published_term():
-    assert claim_the_keep_writes_no_published_term(UC), (
-        "the keep path must write no planner-published term, and the published-terms snapshot must not read the "
-        "zone-plan or DIRECT cap snapshots: they describe the physical zone, which a failed load does not roll back"
+def test_a_failed_load_puts_the_zone_plan_back():
+    assert claim_a_failed_load_puts_the_zone_plan_back(UC), (
+        "the zone-plan snapshot must be a group of the load's published record (read by snapshot(), with arms in "
+        f"differing() and take_groups()), and the restore must put it back through {PUT_BACK_FN}(), which stores "
+        "zone_onednn_plan_keep_short(prior, prior, capacity now, held pair now) under the zone-plan mutex only while "
+        "the snapshot still holds what the load left; the DIRECT cap snapshot must not be read into the record, and "
+        "the keep path must write no planner-published term"
     )
 
 
@@ -391,11 +423,18 @@ def test_witnesses():
     # The keep publishing a planner term a failed load would then have to put back.
     only_fails(mutate_in(UC, KEEP_SIG, STORE, STORE + " g_planned_onednn_scratchpad_bytes[device_id].store(0);"),
                GS, "restore")
-    # The published-terms snapshot reading the zone plan, which no failed load can put back on the zone.
-    planner_terms = "terms.planner = planner_published_terms::snapshot(device);"
-    only_fails(mutate_in(UC, TERMS_SIG, planner_terms,
-                         planner_terms + " terms.onednn_stored = onednn_zone_plan_load(device).bare_bytes;"),
-               GS, "restore")
+    # The record not reading the zone plan: a refused load leaves its description, and a smaller Graph room, behind.
+    only_fails(mutate_in(UC, TERMS_SIG, TERMS_READ, ""), GS, "restore")
+    # The record reading the DIRECT cap snapshot, which does not rise while the arena is kept and is not put back.
+    only_fails(mutate_in(UC, TERMS_SIG, TERMS_READ, TERMS_READ + f" (void) {SNAPSHOT};"), GS, "restore")
+    # A changed zone plan that marks no group: the restore never sees it differ.
+    only_fails(mutate_in(UC, DIFFERING_SIG, DIFFERING_ARM, f"bit(false, {ZONE_GROUP})"), GS, "restore")
+    # The prior plan stored raw: a zone rebuilt smaller, or a pair reserved under the wider bound, is described wrong.
+    only_fails(mutate_in(UC, PUT_BACK_SIG, PUT_BACK_RULE, "prior"), GS, "restore")
+    # The prior plan stored over another publisher's later store.
+    only_fails(mutate_in(UC, PUT_BACK_SIG, PUT_BACK_TEST, "{"), GS, "restore")
+    # The put-back reading the zone as the failed load found it rather than as it is now.
+    only_fails(mutate_in(UC, RESTORE_SIG, RESTORE_HELD, "0"), GS, "restore")
 
 
 if __name__ == "__main__":

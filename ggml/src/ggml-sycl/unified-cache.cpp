@@ -952,6 +952,27 @@ static bool onednn_zone_plan_keep_short_and_store(int                      devic
     return true;
 }
 
+// A failed load's restore of the snapshot: while it still holds `written`, what the load left in it, it becomes
+// zone_onednn_plan_keep_short(prior, prior, ...) over the ONEDNN zone's capacity and the pair held in it now. That is
+// `prior` exactly while the zone still holds it, and a smaller Graph floor when the zone was rebuilt smaller or a pair
+// was reserved under the failed load's wider bound in between: `prior` stored raw would then describe a room the zone
+// does not have, or a bound below a pair already held. The test and the store are one critical section, as in
+// onednn_zone_plan_keep_and_store, because the oneDNN pair's reserve asks for the zones without the inventory lock the
+// restore holds. Takes the mutex itself, so it must not call the accessors above.
+static void onednn_zone_plan_put_back(int                      device_id,
+                                      const zone_onednn_plan & written,
+                                      const zone_onednn_plan & prior,
+                                      size_t                   capacity_bytes,
+                                      size_t                   held_pair_bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
+    if (zone_onednn_plan_same(g_onednn_zone_plan[device_id], written)) {
+        g_onednn_zone_plan[device_id] = zone_onednn_plan_keep_short(prior, prior, capacity_bytes, held_pair_bytes);
+    }
+}
+
 // The most an op's f16 pair may be for the ONEDNN zone of capacity `capacity_bytes` on `device_id` to count it as
 // planned (zone_onednn_pp_pair_bound over the snapshot above). The one source for the admission accessor and for the
 // reserve's own merge and refusal, so the two cannot disagree about what the zone was planned to hold.
@@ -3717,6 +3738,7 @@ load_published_terms load_published_terms::snapshot(int device) {
     terms.onednn_weights        = g_planned_onednn_pair_weights_bytes[device].load(std::memory_order_acquire);
     terms.onednn_activations    = g_planned_onednn_pair_activations_bytes[device].load(std::memory_order_acquire);
     terms.onednn_stored         = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device);
+    terms.onednn_zone_plan      = onednn_zone_plan_load(device);
     terms.planner               = planner_published_terms::snapshot(device);
     return terms;
 }
@@ -3747,7 +3769,8 @@ uint32_t load_published_terms::differing(const load_published_terms & other) con
                    a.nonfa.n_ctx != b.nonfa.n_ctx,
                LOAD_PUBLISHED_GROUP_NONFA) |
            bit(a.control.bytes != b.control.bytes || a.control.valid != b.control.valid, LOAD_PUBLISHED_GROUP_CONTROL) |
-           bit(a.scatter != b.scatter, LOAD_PUBLISHED_GROUP_SCATTER);
+           bit(a.scatter != b.scatter, LOAD_PUBLISHED_GROUP_SCATTER) |
+           bit(!zone_onednn_plan_same(onednn_zone_plan, other.onednn_zone_plan), LOAD_PUBLISHED_GROUP_ZONE_PLAN);
 }
 
 void load_published_terms::take_groups(const load_published_terms & from, uint32_t groups) {
@@ -3787,6 +3810,9 @@ void load_published_terms::take_groups(const load_published_terms & from, uint32
     }
     if (groups & LOAD_PUBLISHED_GROUP_SCATTER) {
         planner.scatter = from.planner.scatter;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_ZONE_PLAN) {
+        onednn_zone_plan = from.onednn_zone_plan;
     }
 }
 
@@ -3840,6 +3866,14 @@ void load_published_record::restore(int device) const noexcept {
     }
     if (back & LOAD_PUBLISHED_GROUP_SCATTER) {
         unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, prior.planner.scatter);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_ZONE_PLAN) {
+        // The zone the snapshot describes is read as it is now: a failed load does not shrink a zone it grew, and a
+        // pair reserved since under its bound stays where it is.
+        unified_cache * const cache    = get_existing_unified_cache_for_device(device);
+        const size_t          capacity = cache != nullptr ? cache->zone_capacity(vram_zone_id::ONEDNN) : 0;
+        const size_t          held     = cache != nullptr ? cache->arena_held_onednn_pair_bytes() : 0;
+        onednn_zone_plan_put_back(device, written.onednn_zone_plan, prior.onednn_zone_plan, capacity, held);
     }
     // The sum goes back from what this load published to what it held before, in one compare-exchange: the pair's
     // reserve raises it outside the inventory lock, and a raise since this load published it is kept.
@@ -7898,9 +7932,11 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                 onednn_graph_direct_cap_snapshot_keep();
 #endif
                 // One WARN per load transaction and device: the load stage asks for the zones in two passes per load
-                // and again in its grow leg, each with the load's transaction. A direct entry (the tests and the plan
-                // dry run) carries transaction 0 and has none to latch on, so it warns at every ensure call that
-                // keeps. The room is the kept floor: the pair bound over the stored snapshot leaves exactly that.
+                // and again in its grow leg, each with the load's transaction, a test's staged load included. A call
+                // outside a staged load (a direct planner entry, a test that asks the cache itself, a context's
+                // re-plan, the pair's reserve) carries transaction 0 and has none to latch on, so it warns at every
+                // ensure call that keeps. The room is the kept floor: the pair bound over the stored snapshot leaves
+                // exactly that.
                 const uint64_t latched_txn = onednn_zone_kept_warn_txn_.exchange(options.load_txn);
                 if (zone_kept_onednn_warn_due(latched_txn, options.load_txn)) {
                     GGML_LOG_WARN(
