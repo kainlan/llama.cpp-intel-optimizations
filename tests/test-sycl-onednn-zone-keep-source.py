@@ -18,7 +18,13 @@ the blocked rebuild keeps the zones when the floor is all they lack. These check
 - cap: the DIRECT Graph-scratch cap's budget snapshot does not rise while the arena is kept. The sufficient and keep
   paths store min(held, current) through one compare-exchange helper over zone_graph_direct_cap_snapshot_kept
   (test-zone-sizing Case 42), and only a rebuild stores the current budget. A snapshot that rose across tenants would
-  grow the Graph floor of a kept zone and ask for a rebuild the zone does not need.
+  grow the Graph floor of a kept zone and ask for a rebuild the zone does not need;
+- warn: a keep logs one WARN naming the planned Graph floor, the zone kept and the Graph room it leaves, behind a
+  latch (zone_kept_onednn_warn_due, Case 43) that exchanges the load transaction in: once per load and device, since
+  the stage asks for the zones in two passes and again in its grow leg, and at every keep for a direct entry (0);
+- restore: the keep stores only the zone-plan and DIRECT cap snapshots, which describe the physical zone a failed
+  load does not roll back, so the failed load has nothing of the keep's to put back: the published-terms snapshot
+  reads neither, and the keep path writes no planner-published term.
 
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live
 inside test_*() functions. Checks read comment-stripped, whitespace-normalised text. Each check has a mutation witness
@@ -141,6 +147,16 @@ CAP_KEEP = f"{CAP_FN}();"
 SUFFICIENT = "if (zones_sufficient) {"
 REBUILD_STORE = f"{SNAPSHOT}.store(available_budget(), std::memory_order_release);"
 REBUILD_TAIL = "onednn_zone_plan_store(dev_id, live_plan);"
+KEPT_DECL = "zone_onednn_plan kept;"
+KEEP_INTO_KEPT = KEEP_CALL + "&kept);"
+LATCH_READ = "const uint64_t latched_txn = onednn_zone_kept_warn_txn_.exchange(options.load_txn);"
+LATCH = "zone_kept_onednn_warn_due(latched_txn, options.load_txn)"
+KEPT_WARN = "GGML_LOG_WARN("
+KEPT_WARN_TEXT = '"[VRAM-ARENA] device %d keeps its ONEDNN zone of %.1f MB: '
+KEPT_WARN_ARGS = ("dev_id, arena_zones.onednn / (1024.0 * 1024.0), live_plan.graph_floor_bytes / (1024.0 * 1024.0), "
+                  "onednn_zone / (1024.0 * 1024.0), kept.graph_floor_bytes / (1024.0 * 1024.0));")
+TERMS_SIG = "load_published_terms load_published_terms::snapshot(int device) {"
+PUBLISHED_WRITES = ("unified_cache_set_planned_", "g_planned_")
 
 
 def _ensure(uc: str) -> str:
@@ -219,6 +235,44 @@ def claim_cap_snapshot_rises_only_at_a_rebuild(uc: str) -> bool:
     )
 
 
+def _kept_block(uc: str) -> str:
+    ensure = _ensure(uc)
+    if BLOCKED not in ensure:
+        return ""
+    blocked = block_at(ensure, ensure.index(BLOCKED))
+    return block_at(blocked, blocked.find(KEPT_RETURN)) if KEPT_RETURN in blocked else ""
+
+
+def claim_a_keep_warns_once_per_load(uc: str) -> bool:
+    """The keep fills `kept` and, when the latch says so, logs one WARN naming the planned floor, the zone kept and the
+    Graph room it leaves (the kept floor), before the keep returns true. The latch exchanges the load transaction in,
+    so the stage's two passes and its grow leg warn once per load and device, and a direct entry (0) at every keep."""
+    ensure = _ensure(uc)
+    kept = _kept_block(uc)
+    return (
+        ordered(ensure, KEPT_DECL, KEEP_INTO_KEPT)
+        and ordered(kept, LATCH_READ, "if (" + LATCH + ") {", KEPT_WARN, KEPT_WARN_TEXT, KEPT_WARN_ARGS, "return true;")
+        and kept.count(KEPT_WARN) == 1
+        and code(uc).count("onednn_zone_kept_warn_txn_") == 1
+    )
+
+
+def claim_the_keep_writes_no_published_term(uc: str) -> bool:
+    """What the keep stores (the zone-plan snapshot and the DIRECT cap snapshot) describes the physical zone, which a
+    failed load does not roll back, so it is not a term the failed load puts back: the published-terms snapshot reads
+    neither, and the keep path writes no planner-published term."""
+    c = code(uc)
+    terms = fn_body(c, TERMS_SIG)
+    writers = (fn_body(c, KEEP_SIG), fn_body(c, CAP_SIG), _kept_block(uc))
+    return (
+        bool(terms)
+        and all(writers)
+        and "onednn_zone_plan" not in terms
+        and SNAPSHOT not in terms
+        and not any(w in body for body in writers for w in PUBLISHED_WRITES)
+    )
+
+
 def keep_checks(uc: str, gs: str) -> dict:
     return {
         "place": claim_keep_sits_in_the_blocked_branch(uc),
@@ -226,6 +280,8 @@ def keep_checks(uc: str, gs: str) -> dict:
         "rule": claim_one_rule_decides_the_keep(uc, gs),
         "entry": claim_entry_spends_its_last_resort_first(gs),
         "cap": claim_cap_snapshot_rises_only_at_a_rebuild(uc),
+        "warn": claim_a_keep_warns_once_per_load(uc),
+        "restore": claim_the_keep_writes_no_published_term(uc),
     }
 
 
@@ -270,6 +326,20 @@ def test_the_cap_snapshot_rises_only_at_a_rebuild():
     )
 
 
+def test_a_keep_warns_once_per_load():
+    assert claim_a_keep_warns_once_per_load(UC), (
+        "a keep must log one WARN naming the planned Graph floor, the zone kept and the Graph room it leaves, behind a "
+        "latch that exchanges the load transaction in (once per load and device; every keep for a direct entry)"
+    )
+
+
+def test_the_keep_writes_no_published_term():
+    assert claim_the_keep_writes_no_published_term(UC), (
+        "the keep path must write no planner-published term, and the published-terms snapshot must not read the "
+        "zone-plan or DIRECT cap snapshots: they describe the physical zone, which a failed load does not roll back"
+    )
+
+
 def test_witnesses():
     assert all(keep_checks(UC, GS).values()), f"sanity: every check passes on the source: {keep_checks(UC, GS)}"
 
@@ -304,11 +374,28 @@ def test_witnesses():
     only_fails(mutate_in(UC, ENSURE_SIG, CAP_KEEP + " #endif onednn_zone_plan_keep_and_store(",
                          REBUILD_STORE + " #endif onednn_zone_plan_keep_and_store("), GS, "cap")
     # The keep path leaving the snapshot as it was: the snapshot of a zone kept short is never bounded.
-    only_fails(mutate_in(UC, ENSURE_SIG, CAP_KEEP + " #endif return true;", "#endif return true;"), GS, "cap")
+    only_fails(mutate_in(UC, ENSURE_SIG, CAP_KEEP + " #endif " + LATCH_READ, "#endif " + LATCH_READ), GS, "cap")
     # The rebuild keeping the lower snapshot: a rebuilt arena's cap would stay at a budget it was not sized against.
     only_fails(mutate_in(UC, ENSURE_SIG, REBUILD_STORE, CAP_KEEP), GS, "cap")
     # The helper storing the current budget: the rule is not applied.
     only_fails(mutate_in(UC, CAP_SIG, CAP_RULE, "current"), GS, "cap")
+
+    # The latch read and never moved: the first load's WARN would be the last.
+    only_fails(mutate_in(UC, ENSURE_SIG, "onednn_zone_kept_warn_txn_.exchange(options.load_txn)",
+                         "onednn_zone_kept_warn_txn_.load()"), GS, "warn")
+    # No latch: the stage's second pass and its grow leg warn again for one load.
+    only_fails(mutate_in(UC, ENSURE_SIG, "if (" + LATCH + ") {", "{"), GS, "warn")
+    # The room printed from the plan's floor rather than the kept one.
+    only_fails(mutate_in(UC, ENSURE_SIG, "kept.graph_floor_bytes / (1024.0 * 1024.0));",
+                         "live_plan.graph_floor_bytes / (1024.0 * 1024.0));"), GS, "warn")
+    # The keep publishing a planner term a failed load would then have to put back.
+    only_fails(mutate_in(UC, KEEP_SIG, STORE, STORE + " g_planned_onednn_scratchpad_bytes[device_id].store(0);"),
+               GS, "restore")
+    # The published-terms snapshot reading the zone plan, which no failed load can put back on the zone.
+    planner_terms = "terms.planner = planner_published_terms::snapshot(device);"
+    only_fails(mutate_in(UC, TERMS_SIG, planner_terms,
+                         planner_terms + " terms.onednn_stored = onednn_zone_plan_load(device).bare_bytes;"),
+               GS, "restore")
 
 
 if __name__ == "__main__":

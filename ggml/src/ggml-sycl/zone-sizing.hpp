@@ -596,7 +596,8 @@ struct zone_arena_ensure_options {
     // fallback for a rebuild something live blocks, so while that last resort is still to come no zone is kept: the
     // call refuses as it would without the keep and sets the refusal's keep_deferred.
     bool     ring_release_first = false;
-    // The load transaction the call is part of. 0 outside a staged load.
+    // The load transaction the call is part of, 0 outside a staged load. A keep of a short ONEDNN zone warns once per
+    // load transaction and device (zone_kept_onednn_warn_due), and at every keep for 0.
     uint64_t load_txn           = 0;
 };
 

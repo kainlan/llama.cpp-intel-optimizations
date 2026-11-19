@@ -3206,6 +3206,21 @@ int main() {
         CHECK(ggml_sycl::zone_onednn_graph_uncovered_bytes(80 * MiB, 400 * MiB - bound) == 30 * MiB,
               "a context's Graph scratch beyond the kept room is not the part the room cannot hold");
 
+        // The runtime context's Graph scratch check over a kept zone (Case 24h's fit, with its room read as the
+        // accessor reads it: the capacity less the pair bound over the stored snapshot). The 400 MiB zone kept for
+        // the 300 MiB pair leaves 100 MiB. 16 heads at n_ctx 4096 under a 1 GiB cap: 384 KiB a row. With 600 MiB free
+        // outside the arena and 256 MiB of headroom, 2048 (768 MiB, 668 above the room) is refused and 1024 (384 MiB,
+        // 284 above, 316 left) named; on a card under the headroom only 256 (96 MiB, inside the room) is.
+        const size_t kept_room =
+            400 * MiB - ggml_sycl::zone_onednn_pp_pair_bound(400 * MiB, kept.bare_bytes, kept.graph_floor_bytes);
+        CHECK(kept_room == 100 * MiB, "the Graph room the context check reads over a kept zone is not the kept floor");
+        CHECK(ggml_sycl::zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, kept_room, 600 * MiB,
+                                                          256 * MiB, 0) == 1024,
+              "a context's Graph scratch beyond the kept room is not refused by the context check with 1024 named");
+        CHECK(ggml_sycl::zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, kept_room, 200 * MiB,
+                                                          256 * MiB, 0) == 256,
+              "on a card under the headroom the kept room does not serve the rung it holds");
+
         // zone_onednn_plan_keep's maximum floor is what the keep must not store: its bound would fall to the bare plan
         // and the 350 MiB pair already held would exceed it.
         const zone_onednn_plan maxed = ggml_sycl::zone_onednn_plan_keep(held, live);

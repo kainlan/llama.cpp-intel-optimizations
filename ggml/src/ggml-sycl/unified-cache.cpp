@@ -7887,8 +7887,9 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             const zone_arena_sizes need       = { scratch_zone, onednn_zone, runtime_zone };
             const bool             defer_keep = options.ring_release_first && zone_arena_only_ring_holds(true, holders);
             const size_t           held_pair  = arena_held_onednn_pair_bytes();
+            zone_onednn_plan       kept;
             const bool reservation_only = onednn_zone_plan_keep_short_and_store(dev_id, live_plan, arena_zones, need,
-                                                                                held_pair, !defer_keep, nullptr);
+                                                                                held_pair, !defer_keep, &kept);
             if (reservation_only && !defer_keep) {
                 if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
                     bind_compute_arena();
@@ -7896,6 +7897,20 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
 #if GGML_SYCL_DNNL
                 onednn_graph_direct_cap_snapshot_keep();
 #endif
+                // One WARN per load transaction and device: the load stage asks for the zones in two passes per load
+                // and again in its grow leg, each with the load's transaction. A direct entry (the tests and the plan
+                // dry run) carries transaction 0 and has none to latch on, so it warns at every ensure call that
+                // keeps. The room is the kept floor: the pair bound over the stored snapshot leaves exactly that.
+                const uint64_t latched_txn = onednn_zone_kept_warn_txn_.exchange(options.load_txn);
+                if (zone_kept_onednn_warn_due(latched_txn, options.load_txn)) {
+                    GGML_LOG_WARN(
+                        "[VRAM-ARENA] device %d keeps its ONEDNN zone of %.1f MB: the plan's oneDNN Graph floor of "
+                        "%.1f MB asks for a %.1f MB zone, and live allocations block the rebuild. The zone leaves "
+                        "%.1f MB of Graph room; the rest is served on the DIRECT path under its cap, and a context "
+                        "whose Graph scratch does not fit is refused by name\n",
+                        dev_id, arena_zones.onednn / (1024.0 * 1024.0), live_plan.graph_floor_bytes / (1024.0 * 1024.0),
+                        onednn_zone / (1024.0 * 1024.0), kept.graph_floor_bytes / (1024.0 * 1024.0));
+                }
                 return true;
             }
             const size_t blocked_bytes =

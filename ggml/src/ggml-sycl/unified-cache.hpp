@@ -6333,6 +6333,10 @@ class unified_cache {
     // must go on holding. A buffer allocated outside the arena takes none of the zone. Takes no lock.
     size_t arena_held_onednn_pair_bytes();
 
+    // The load transaction whose keep of a short ONEDNN zone last warned on this device (zone_kept_onednn_warn_due). An
+    // exchange, so two ensures of one load racing on the device warn once between them.
+    std::atomic<uint64_t> onednn_zone_kept_warn_txn_{ 0 };
+
     // Per-physical-chunk TLSF allocators for the WEIGHT zone in N-chunk mode.
     // A weight tensor must not span a chunk boundary (each chunk is its own
     // sycl::malloc_device USM allocation), so we use one TLSF allocator per
