@@ -2320,9 +2320,11 @@ int main(int argc, char ** argv) {
     // This child intentionally omits explicit shutdown. Its ordinary return
     // exercises the production exit path, where the per-device cache map
     // destroys its cache after main. The map is made at its first use, so the
-    // cache comes first and the zone-sizing diagnostics after it: what is made
-    // later is destroyed first, the order of the historical destructor-order
-    // crash.
+    // cache comes first and the zone-sizing diagnostics after it, the order of
+    // the historical destructor-order crash. Today the diagnostics' state is
+    // leaked on purpose and nothing of it is destroyed at exit; the order
+    // matters only if that state is given a destructor again, which would then
+    // run before the cache's teardown reports into it.
     if (argc == 2 && std::strcmp(argv[1], "--static-destruction-child") == 0) {
         auto * cache = get_unified_cache(q);
         zone_sizing_record_observation("static-destruction-child");

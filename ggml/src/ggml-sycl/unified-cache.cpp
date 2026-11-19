@@ -7201,6 +7201,12 @@ unified_cache::unified_cache(sycl::queue & queue,
     authority_resolved_(authority_resolved),
     device_total_vram_(device_total_vram),
     dma_reserved_bytes_(dma_reserved_bytes) {
+    // The map is constructed before the exit handler below is registered, whoever constructs this cache: a handler
+    // registered before an object's construction completes runs after that object is destroyed, so a cache made
+    // directly, before any map lookup, would otherwise let the map die first with the shutdown flag still clear and
+    // tear its caches down through the full path instead of the abandon branch.
+    (void) unified_cache_device_caches();
+
     // Register atexit handler once to set shutdown flag before static destructors run
     // This prevents the destructor from calling sycl::free() on invalid queue
     bool expected = false;
@@ -19911,9 +19917,11 @@ static unified_cache * create_cache_for_device(int                     device_id
                                                size_t *                deferred_reserved_out = nullptr,
                                                const device_mem_hint * hint                  = nullptr,
                                                sycl::queue *           queue_override        = nullptr) {
-    // Taken before any cache is constructed, in a statement of its own: the right operand of the assignment below is
-    // evaluated first. A cache's constructor registers the exit handler that marks SYCL as shutting down, and that
-    // handler must run before the map is destroyed, which holds only when the map was constructed first.
+    // Taken in a statement of its own, before the cache below is constructed: the right operand of that assignment is
+    // evaluated first. The exit handler that marks SYCL as shutting down must run before the map is destroyed, so the
+    // map must be constructed before the handler is registered. A cache's constructor touches the map before it
+    // registers the handler, which keeps that order for a cache constructed anywhere; this lookup keeps it here
+    // without leaning on the constructor's body.
     auto & device_caches = unified_cache_device_caches();
 
     // Get queue for this device.  Always prefer the single-device context

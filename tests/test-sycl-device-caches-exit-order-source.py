@@ -11,15 +11,20 @@ The order is held by construct-on-first-use: unified_cache_device_caches() in un
 dpct::dev_mgr::instance() first and then holds the map as its own function-local static, so the map is constructed after
 the manager and destroyed before it. This gate pins that:
 
-  - the map is held by no namespace-scope object of any ggml-sycl source: its one static declaration is inside the
-    accessor, and the old namespace-scope name is gone, so no use can bypass the accessor;
+  - the map is held by no namespace-scope object of any ggml-sycl source, static or not, named or in an anonymous
+    namespace: its one static declaration is inside the accessor, and the old namespace-scope name is gone, so no use
+    can bypass the accessor;
   - the accessor touches the device manager before the map's static is reached;
-  - create_cache_for_device() takes the map before it constructs a cache. A cache's constructor registers the exit
-    handler that marks SYCL as shutting down, and that handler must run before the map is destroyed, so the map must
-    be constructed before the first cache. In `map[id] = std::make_unique<unified_cache>(...)` the right operand is
-    evaluated first, so the accessor call must be a statement of its own, before that one.
+  - the exit handler that marks SYCL as shutting down is registered after the map is constructed, so it runs before
+    the map is destroyed and the caches the map destroys take the abandon branch of their teardown. A handler
+    registered before an object's construction completes runs after that object is destroyed. The handler is
+    registered by the first cache's constructor, and a cache may be constructed directly, by anyone, before any map
+    lookup, so the constructor calls the accessor before any std::atexit in its body. create_cache_for_device() also
+    takes the map before it constructs a cache: in `map[id] = std::make_unique<unified_cache>(...)` the right operand
+    is evaluated first, so the accessor call there must be a statement of its own, before that one.
 
-It reads comment-stripped text, and each check is proven to catch its mutant below.
+It reads comment-stripped text, and each check is proven to catch its mutant below. It cannot see code that is compiled
+out (`#if 0`) or never runs (`if (false)`); the debugger run of a directly constructed cache is the behavioural gate.
 """
 
 import re
@@ -36,8 +41,24 @@ ACCESSOR = "unified_cache_device_caches"
 ACCESSOR_SIG = r"\bstatic\s+" + MAP_TYPE + r"\s*&\s*" + ACCESSOR + r"\s*\(\s*\)\s*\{"
 STATIC_MAP_DECL = r"\bstatic\s+" + MAP_TYPE + r"\s+(\w+)\s*;"
 TOUCH = r"\bdpct::dev_mgr::instance\s*\(\s*\)"
-CREATE_SIG = r"\bstatic\s+unified_cache\s*\*\s*create_cache_for_device\s*\("
+# body_span() needs a signature that ends at the body's opening brace; the parameter list holds no brace or `;`
+CREATE_SIG = r"\bstatic\s+unified_cache\s*\*\s*create_cache_for_device\s*\([^{;]*\{"
+# the constructor's definition: its parameter and member-initializer lists hold no brace, so the first opens the body
+CTOR_SIG = r"\bunified_cache::unified_cache\s*\([^{;]*\{"
+ACCESSOR_CALL = r"\b" + ACCESSOR + r"\s*\(\s*\)"
+ATEXIT = r"\bstd::atexit\s*\("
+# any variable of the map's type, whatever its storage class: the scope is decided separately
+MAP_VAR_DECL = MAP_TYPE + r"\s+(\w+)\s*(?=[;={])"
 OLD_NAME = re.compile(r"\bg_device_caches\b")
+
+# literals whose text could hold a brace, blanked for the scope walk; comments are already gone
+_LITERAL_RE = re.compile(
+    r'R"([^(\s]{0,16})\(.*?\)\1"'  # raw string literal
+    r'|"(?:\\.|[^"\\\n])*"'  # string literal
+    r"|'(?:\\.|[^'\\\n])*'",  # char literal
+    flags=re.DOTALL,
+)
+_NAMESPACE_OPENER = re.compile(r"(?:\bnamespace(?:\s+[\w:]+)?|\bextern)\s*$")
 
 _LEXEME_RE = re.compile(
     r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
@@ -74,6 +95,38 @@ def body_span(code: str, signature: str):
     return m.end(), i - 1
 
 
+def namespace_scope_map_decls(code: str) -> list:
+    """Names and lines of the map-typed variables declared at namespace scope: every enclosing brace opens a namespace
+    or an extern block. A file whose braces do not balance (a preprocessor branch opens one twice) cannot be walked, so
+    every map-typed variable in it is reported, which fails closed."""
+    blank = _LITERAL_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), code)
+    decls = list(re.finditer(MAP_VAR_DECL, blank))
+    if not decls:
+        return []
+    kinds = []  # True: the brace at this depth opens a namespace or an extern block
+    scope_at = {}
+    pending = sorted(d.start() for d in decls)
+    balanced = True
+    p = 0
+    for i, ch in enumerate(blank):
+        while p < len(pending) and pending[p] == i:
+            scope_at[i] = all(kinds)
+            p += 1
+        if ch == "{":
+            kinds.append(bool(_NAMESPACE_OPENER.search(blank[max(0, i - 200):i])))
+        elif ch == "}":
+            if not kinds:
+                balanced = False
+                break
+            kinds.pop()
+    balanced = balanced and not kinds
+    found = []
+    for d in decls:
+        if not balanced or scope_at.get(d.start(), True):
+            found.append((d.group(1), code.count("\n", 0, d.start()) + 1))
+    return found
+
+
 def order_failures(cache_code: str, other_sources: dict) -> list:
     """Every way the code breaks the exit order; empty when it holds."""
     failures = []
@@ -97,6 +150,9 @@ def order_failures(cache_code: str, other_sources: dict) -> list:
         for d in re.finditer(STATIC_MAP_DECL, code):
             line = code.count("\n", 0, d.start()) + 1
             failures.append(f"{rel}:{line} holds a static map of caches `{d.group(1)}`")
+    for rel, code in [("unified-cache.cpp", cache_code)] + sorted(other_sources.items()):
+        for name, line in namespace_scope_map_decls(code):
+            failures.append(f"{rel}:{line} holds the caches in a namespace-scope map `{name}`")
 
     body = cache_code[start:end]
     inside = [d for d in re.finditer(STATIC_MAP_DECL, body)]
@@ -125,6 +181,20 @@ def order_failures(cache_code: str, other_sources: dict) -> list:
             statement_start = max(statement_start, cbody.rfind("{", 0, construct.start()))
             if not re.search(r"\b" + ACCESSOR + r"\s*\(\s*\)", cbody[:statement_start]):
                 failures.append("create_cache_for_device() constructs a cache before it has taken the map")
+
+    ctor = body_span(cache_code, CTOR_SIG)
+    if ctor is None:
+        failures.append("the unified_cache constructor's definition not found")
+    else:
+        kbody = cache_code[ctor[0]:ctor[1]]
+        call = re.search(ACCESSOR_CALL, kbody)
+        atexit = re.search(ATEXIT, kbody)
+        if atexit is None:
+            failures.append("the unified_cache constructor no longer registers the exit handler with std::atexit")
+        if call is None:
+            failures.append("the unified_cache constructor does not take the map before it registers the exit handler")
+        elif atexit is not None and call.start() > atexit.start():
+            failures.append("the unified_cache constructor takes the map after it registers the exit handler")
     return failures
 
 
@@ -187,12 +257,44 @@ def _construct_in_the_same_statement(code: str) -> str:
     return code[:start] + body + code[end:]
 
 
+def _external_linkage_map(code: str) -> str:
+    # a namespace-scope holder without `static`: external linkage, the same construction at load
+    return code + "\nstd::unordered_map<int, std::shared_ptr<unified_cache>> g_spare_caches;\n"
+
+
+def _anonymous_namespace_map(code: str) -> str:
+    return code + "\nnamespace {\nstd::unordered_map<int, std::shared_ptr<unified_cache>> g_spare_caches{};\n}\n"
+
+
+_CTOR_TAKE = r"[^;{}]*" + ACCESSOR_CALL + r"[^;]*;"
+
+
+def _mutate_ctor(code: str, edit) -> str:
+    start, end = body_span(code, CTOR_SIG)
+    return code[:start] + edit(code[start:end]) + code[end:]
+
+
+def _ctor_without_take(body: str) -> str:
+    return re.sub(_CTOR_TAKE, "", body, count=1)
+
+
+def _ctor_take_after_atexit(body: str) -> str:
+    take = re.search(_CTOR_TAKE, body).group(0)
+    body = body.replace(take, "", 1)
+    first = re.search(ATEXIT + r"[^;]*;", body)
+    return body[: first.end()] + take + body[first.end() :]
+
+
 MUTANTS = {
     "the accessor does not touch the device manager": lambda c: _mutate_accessor(c, _drop_touch),
     "the accessor touches the device manager after the map's static": lambda c: _mutate_accessor(c, _touch_after_static),
     "the map is a namespace-scope static again": _namespace_scope_map,
     "a second static map of caches bypasses the accessor": _bypass,
+    "a namespace-scope map without static bypasses the accessor": _external_linkage_map,
+    "a map in an anonymous namespace bypasses the accessor": _anonymous_namespace_map,
     "the first cache is constructed before the map": _construct_in_the_same_statement,
+    "the cache constructor does not take the map": lambda c: _mutate_ctor(c, _ctor_without_take),
+    "the cache constructor takes the map after std::atexit": lambda c: _mutate_ctor(c, _ctor_take_after_atexit),
 }
 
 
@@ -210,6 +312,15 @@ def test_a_namespace_scope_name_in_another_source_is_caught():
     others = dict(others)
     others[rel] = others[rel] + "\nvoid f() { g_device_caches.clear(); }\n"
     assert order_failures(cache_code, others)
+
+
+def test_a_map_local_to_a_function_is_not_a_holder():
+    # the scope walk's control: shutdown_unified_cache() copies the map into a local of the same type, and a function
+    # or class body is not a namespace scope, braces in literals included
+    cache_code, others = sources()
+    local = '\nvoid f() { const char * s = "}"; std::unordered_map<int, std::shared_ptr<unified_cache>> local; }\n'
+    assert namespace_scope_map_decls(local) == []
+    assert order_failures(cache_code + local, others) == order_failures(cache_code, others)
 
 
 if __name__ == "__main__":

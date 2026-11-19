@@ -1662,7 +1662,8 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
     "cache shutdown owner snapshot avoids rw-lock callbacks":
         "std::unordered_map<int, std::shared_ptr<unified_cache>> caches" in cache_cpp
-        and cache_cpp.index("= device_caches;")
+        and re.search(r"\bcaches\s*=\s*device_caches\s*;", cache_cpp) is not None
+        and re.search(r"\bcaches\s*=\s*device_caches\s*;", cache_cpp).start()
             < cache_cpp.index("item.second->shutdown_resources()"),
     "bounded retained handle drain": "wait_for(lock, std::chrono::milliseconds(timeout_ms)" in
         (root / "ggml/src/ggml-sycl/mem-handle.cpp").read_text()
