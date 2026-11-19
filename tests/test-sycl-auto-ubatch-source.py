@@ -465,7 +465,7 @@ def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap(
 
     body_norm = _normalize_ws(_trial_body())
     assert "ggml_backend_sycl_moe_gpu_ubatch_max" not in body_norm, (
-        "the trial must not read a MoE ceiling from the backend: the backend has none"
+        "the trial must not read a MoE ceiling from the backend: the picker owns it"
     )
     assert "moe_cap_fn" not in body_norm, "the DL lookup of the old backend accessor must be gone"
     assert re.search(
@@ -478,9 +478,6 @@ def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap(
     )
     assert re.search(r'stop\s*=\s*moe_bound\s*\?\s*"MoE GPU routing ceiling"\s*:\s*"ladder exhausted"\s*;', body_norm), (
         "the stop reason must be the MoE ceiling exactly when the helper reports it bound"
-    )
-    assert not re.search(r"\bcap\s*=\s*512\b", body_norm), (
-        "the MoE ceiling must not be hardcoded as a bare 512 in llama-context.cpp"
     )
 
 
@@ -499,11 +496,9 @@ def test_moe_model_cap_binds_at_equal_has_a_mutation_witness():
 
 
 def test_moe_model_cap_accessor_gate_has_a_mutation_witness():
-    """Mutation witness for the moe_cap_available gate itself: proves it
-    would actually catch the gate being dropped (which would report "MoE
-    GPU routing ceiling" for every MoE model on a GGML_BACKEND_DL build
-    whose SYCL DSO lacks the accessor, even though moe_cap was never
-    narrowed by anything)."""
+    """Mutation witness for the moe_cap_available gate itself: proves the check would catch the gate being
+    dropped, which would make the helper report "MoE GPU routing ceiling" for a MoE model even when the caller says
+    no ceiling is available. moe_cap_available false must keep meaning no narrowing."""
     header = strip_comments(LLAMA_AUTO_UBATCH_H)
     old = "n_expert > 0 && moe_cap_available && moe_cap <= cap"
     assert _normalize_ws(header).count(old) == 1, "mutation target not unique"

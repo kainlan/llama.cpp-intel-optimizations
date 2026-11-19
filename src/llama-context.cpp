@@ -421,14 +421,13 @@ static decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn) llama_con
 }
 
 // llama.cpp-xojq (nphx Task 4b): proc-address lookups for the auto
-// micro-batch trial's four SYCL entry points, mirroring
+// micro-batch trial's three SYCL entry points, mirroring
 // llama_context_sycl_runtime_proc()/llama_context_sycl_recheck_proc() above.
 // A GGML_BACKEND_DL build whose SYCL DSO predates llama.cpp-tsfl (the probe
 // and fallback counter) or this task (auto_ubatch_enabled's registration)
-// exports none of these; sycl_select_auto_ubatch()
-// treats a nullptr proc the same way every other caller in this file
-// already does for llama_context_sycl_runtime_proc() -- as "unavailable",
-// never dereferenced.
+// exports none of these; sycl_select_auto_ubatch() treats a nullptr proc the
+// same way every other caller in this file already does for
+// llama_context_sycl_runtime_proc() -- as "unavailable", never dereferenced.
 static decltype(&ggml_backend_sycl_probe_runtime_context_for_model) llama_context_sycl_probe_proc(
     ggml_backend_dev_t dev) {
     return reinterpret_cast<decltype(&ggml_backend_sycl_probe_runtime_context_for_model)>(
@@ -2376,7 +2375,8 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     const auto & ladder = llama_auto_ubatch_ladder;
 
     // The MoE ceiling is the picker's own constant, the same in a direct and a DL build. A dense model never
-    // consults it.
+    // consults it. It is always available: a constant cannot be absent the way a backend export could, and
+    // llama_auto_ubatch_cap keeps the flag in its signature (test-auto-ubatch-ladder still covers the false case).
     const uint32_t moe_cap           = model.hparams.n_expert > 0 ? llama_auto_ubatch_moe_ceiling : 0;
     const bool     moe_cap_available = true;
     // The MoE ceiling is the binding cap whenever it does not exceed the
