@@ -35739,6 +35739,32 @@ static size_t placement_move_host_expert_backing(placement_plan &       plan,
     return moved;
 }
 
+bool placement_moe_host_recipe_workspace_bytes_at(const std::vector<moe_host_recipe_shape> & shapes,
+                                                  uint32_t                                   n_tokens,
+                                                  size_t *                                   out) {
+    // A bad input is refused whatever the token count, so the answer for it never depends on n_tokens.
+    if (!out || std::any_of(shapes.begin(), shapes.end(), [](const moe_host_recipe_shape & shape) {
+            return shape.K <= 0 || shape.N <= 0 || shape.q8_row_bytes == 0;
+        })) {
+        return false;
+    }
+    size_t bytes = 0;
+    if (n_tokens != 0) {
+        for (const moe_host_recipe_shape & shape : shapes) {
+            // The executor's request: one row per token (ggml_sycl_build_moe_resolved_batch). plan_moe_host_workspace()
+            // sizes from K, N and the rows alone, so the phase, type and device here change nothing.
+            const moe_route_request request{ moe_route_phase::PROMPT, shape.K, shape.N, n_tokens, GGML_TYPE_COUNT, 0 };
+            moe_workspace_recipe    workspace;
+            if (!plan_moe_host_workspace(request, shape.q8_row_bytes, sizeof(size_t) * 4, &workspace)) {
+                return false;
+            }
+            bytes = std::max(bytes, workspace.total_bytes);
+        }
+    }
+    *out = bytes;
+    return true;
+}
+
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
@@ -36049,11 +36075,11 @@ static void populate_host_zone_sizing(placement_plan &                          
         }
         plan.moe_cpu_expert_staging_bytes = max_moe_tensor_bytes;
 
-        // Immutable Q1_0/NVFP4 host recipes reserve one occurrence workspace
-        // for every top-k slot in the maximum admitted micro-batch. Derive K/N
-        // and the activation vec-dot row size from the inventory, never from a
-        // resolver-time request.
-        plan.moe_host_recipe_workspace_bytes = 0;
+        // Immutable Q1_0/NVFP4 host recipes run one micro-batch's tokens through one workspace, so it is sized in
+        // tokens of the micro-batch this plan is built for. The shapes stay on the plan so that the workspace can be
+        // sized by the same rule at another micro-batch. K/N and the activation vec-dot row size come from the
+        // inventory, never from a resolver-time request.
+        plan.moe_host_recipe_shapes.clear();
         for (const auto & item : tensor_inventory) {
             if ((item.type != GGML_TYPE_Q1_0 && item.type != GGML_TYPE_NVFP4) || !item.has_shape() ||
                 expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
@@ -36063,15 +36089,33 @@ static void populate_host_zone_sizing(placement_plan &                          
             if (!traits || !traits->vec_dot || item.ne[0] <= 0 || item.ne[1] <= 0) {
                 continue;
             }
-            moe_route_request request{ moe_route_phase::PROMPT, item.ne[0], item.ne[1],
-                                       static_cast<size_t>(std::max(n_expert_used, 1)) * MOE_GPU_UBATCH_MAX,
-                                       item.type, std::max(plan.device_id, 0) };
-            moe_workspace_recipe workspace;
-            if (plan_moe_host_workspace(request, ggml_row_size(traits->vec_dot_type, item.ne[0]),
-                                        sizeof(size_t) * 4, &workspace)) {
-                plan.moe_host_recipe_workspace_bytes =
-                    std::max(plan.moe_host_recipe_workspace_bytes, workspace.total_bytes);
+            const moe_host_recipe_shape shape{ item.ne[0], item.ne[1],
+                                               ggml_row_size(traits->vec_dot_type, item.ne[0]) };
+            const bool known = std::any_of(plan.moe_host_recipe_shapes.begin(), plan.moe_host_recipe_shapes.end(),
+                                           [&](const moe_host_recipe_shape & seen) {
+                                               return seen.K == shape.K && seen.N == shape.N &&
+                                                      seen.q8_row_bytes == shape.q8_row_bytes;
+                                           });
+            if (!known) {
+                plan.moe_host_recipe_shapes.push_back(shape);
             }
+        }
+        const uint32_t recipe_n_ubatch = placement_load_n_ubatch(plan.planner_n_ubatch);
+        // The loop above admits only shapes with a positive K, N and row size, so a false answer here is an overflow.
+        if (!placement_moe_host_recipe_workspace_bytes_at(plan.moe_host_recipe_shapes, recipe_n_ubatch,
+                                                          &plan.moe_host_recipe_workspace_bytes)) {
+            // A workspace that overflows cannot be planned, and SIZE_MAX never becomes a small reservation: the host
+            // SCRATCH fold at the end of this function detects the overflow (in its sum with
+            // moe_cpu_expert_staging_bytes, or in the zone total), rejects the plan's MMID workspaces and keeps the
+            // zone at its minimum.
+            plan.moe_host_recipe_workspace_bytes = SIZE_MAX;
+            GGML_LOG_WARN("[SYCL-PLAN] MoE host recipe workspace overflows: %zu shape(s) at n_ubatch=%u\n",
+                          plan.moe_host_recipe_shapes.size(), recipe_n_ubatch);
+        } else if (!plan.moe_host_recipe_shapes.empty()) {
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] MoE host recipe workspace: %zu shape(s), %.2f MB of host SCRATCH at n_ubatch=%u\n",
+                plan.moe_host_recipe_shapes.size(), plan.moe_host_recipe_workspace_bytes / (1024.0 * 1024.0),
+                recipe_n_ubatch);
         }
 
         GGML_LOG_INFO(
@@ -36089,6 +36133,7 @@ static void populate_host_zone_sizing(placement_plan &                          
         plan.moe_control_pool_bytes       = 0;
         plan.moe_cpu_expert_staging_bytes    = 0;
         plan.moe_host_recipe_workspace_bytes = 0;
+        plan.moe_host_recipe_shapes.clear();
 
         // A dense model is a VALID zero requirement, not an unknown one: it has
         // no expert tensors to route, so its RUNTIME zone owes nothing.
