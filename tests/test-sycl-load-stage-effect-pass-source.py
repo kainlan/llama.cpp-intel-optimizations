@@ -10,13 +10,15 @@ refused load keeps (or no arena, after a failed reserve). These checks pin the r
 The decide pass releases the PP MoE oneDNN scratch ring in one place only: ggml_sycl_ensure_load_arena_zones, the
 planner's entry ensure, as its last resort when a rebuild is needed and the ring's slot buffers are the arena's only
 holders (zone_arena_only_ring_holds). Nothing else the decide pass runs (populate_inventory_globals, the VRAM budget,
-compute_and_store_plan_for_inventory, the micro-batch publish, either planner entry) releases a ring. populate keeps the
-planned KV-zone flag write, which the abort of a refused load puts back.
+compute_and_store_plan_for_inventory, the micro-batch publish, either planner entry) releases a ring in its own body.
+populate keeps the planned KV-zone flag write, which the abort of a refused load puts back.
 
-Neither planner entry changes a device: layer streaming's build_layer_map, register_host_ptr and allocate_buffers, and
-the stale KV-zone ring's release, run only in the effect step (ggml_sycl_run_inventory_effects for a late pass,
-ggml_sycl_run_early_inventory_effect for an early one, both through ggml_sycl_release_stale_kv_zone_ring). The late entry
-hands what it decided back in a ggml_sycl_inventory_effects record that carries its own copy of the streamed inventory;
+The planner entries run none of the stage's effects (layer streaming, host zones, the stale ring's release); the one
+ring release they can reach is the entry ensure's last resort above. Layer streaming's build_layer_map,
+register_host_ptr and allocate_buffers, and the stale KV-zone ring's release, run only in the effect step
+(ggml_sycl_run_inventory_effects for a late pass, ggml_sycl_run_early_inventory_effect for an early one, both through
+ggml_sycl_release_stale_kv_zone_ring), and the stage configures the host zones after them. The late entry hands what
+it decided back in a ggml_sycl_inventory_effects record that carries its own copy of the streamed inventory;
 no record lives outside a function. Each effect helper takes g_tensor_inventory_mutex for its own work and the stage
 never takes it, so the stage provisions its retained snapshots outside the inventory lock.
 
@@ -194,10 +196,10 @@ def claim_populate_keeps_the_flag_write(gs: str) -> bool:
     return FLAG_WRITE in fn_body(code(gs), POPULATE_SIG)
 
 
-# ---- the planner entries change no device ----
+# ---- the planner entries run none of the stage's effects ----
 
 
-def claim_entries_change_no_device(gs: str) -> bool:
+def claim_entries_run_no_stage_effect(gs: str) -> bool:
     c = code(gs)
     early, late = fn_body(c, EARLY_SIG), fn_body(c, LATE_SIG)
     effects, stale = fn_body(c, EFFECTS_SIG), fn_body(c, STALE_SIG)
@@ -359,24 +361,24 @@ def test_witness_flag_write_gone():
     assert not claim_populate_keeps_the_flag_write(mutate_in(GS, POPULATE_SIG, FLAG_WRITE, ""))
 
 
-def test_entries_change_no_device():
-    assert claim_entries_change_no_device(GS), (
-        "a planner entry changes a device (layer streaming, a host zone or a ring release), or the effect step lost "
-        "one of them: the change would outlive a load refused on a later device")
+def test_entries_run_no_stage_effect():
+    assert claim_entries_run_no_stage_effect(GS), (
+        "a planner entry runs one of the stage's effects (layer streaming, host zones, the stale ring's release) in "
+        "its own body, or the effect step lost one of them: the effect would outlive a load refused on a later device")
 
 
 def test_witness_late_entry_streams_again():
     mutated = mutate_in(GS, LATE_SIG, "effects = std::move(decided);",
                         "ggml_sycl::get_layer_stream_manager(ctx->device).build_layer_map(nullptr, 0); "
                         "effects = std::move(decided);")
-    assert not claim_entries_change_no_device(mutated)
+    assert not claim_entries_run_no_stage_effect(mutated)
 
 
 def test_witness_effects_before_the_refusal():
     mutated = mutate_in(GS, LATE_SIG, "if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) {",
                         "effects = std::move(decided); "
                         "if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) {")
-    assert not claim_entries_change_no_device(mutated)
+    assert not claim_entries_run_no_stage_effect(mutated)
 
 
 def test_streamed_inventory_is_a_stage_local():

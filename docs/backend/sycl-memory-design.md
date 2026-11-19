@@ -2755,7 +2755,13 @@ its own plan. An effect can still end a load after an earlier device's effects
 ran. The two candidate checks around each device's effects throw when the
 load's owner or candidate changed, and an effect's own host allocation can throw
 (a zone or pool that cannot be allocated falls back instead). The earlier device
-then keeps its configured host zones and its released stale ring.
+then keeps its configured host zones, its released stale ring and, in a late
+pass, the layer streaming its effects set up. The abort releases no layer
+streaming, and a load whose abort cleans up keeps no model token, so no model
+teardown releases it either: the working set stays until the next model's first
+weight upload on that device displaces it (`register_host_ptr()`), or until the
+process exits. A load whose abort fails keeps its token, and the teardown of
+that token releases the working set by owner.
 
 The one ring release in the decide pass is the entry ensure's last resort
 (`ggml_sycl_ensure_load_arena_zones()`): when the plan's zones need a rebuild
@@ -2764,13 +2770,23 @@ and the ring's slot buffers are the arena's only holders
 for again. The premise is counted, not owned. The ring is the only holder when
 nothing else points into the arena: no other allocation live in its zones, no
 lease on its chunks, no other cache scratch buffer inside it. That says nothing
-about who still uses the ring. A ring a prefill holds a slot of refuses the
-release, and the load is refused as for any holder. A context that held only the
-ring on that device loses it between two prefills and reserves it again at its
-next dispatch; that is the accepted cost of the last resort. The slot buffers
-are freed inside the release, before the second ensure counts the holders: no
-dispatch holds a lease on a slot buffer, so each buffer's free runs when its
-owner's last reference drops, and none is queued.
+about who still uses the ring. A prefill's claim on one of its slots refuses the
+release, and the load is refused as for any holder. A claim outlives its
+prefill: it is let go when a later prefill takes that slot, when a context on
+the device is freed (its backend drains the device's slots), or when it is
+released unused. A context therefore loses the ring only while no claim on its
+slots is held: before its first completed claim, when every claim was released
+unused, or after a context on the device was freed. It reserves the ring again
+at its next dispatch; that is the accepted cost of the last resort.
+
+The release rests on the premise's precondition: no zone holds a live byte
+beside the ring, so no context with weights or KV on that device can be
+dispatching. The slot buffers' handles are let go inside the release, before
+the second ensure counts the holders. A copy of a slot buffer's handle that
+outlived its claim's count would keep that buffer allocated: the second ensure
+counts it as a live allocation beside the ring, the rebuild is held, the load
+is refused, and the arena is never rebuilt under the buffer, so a late copy is
+never a use after free.
 
 **Contiguity.** Each KV-zone slot is one allocation. So the whole KV-zone part
 must also fit the zone's largest free block, read after the old ring is
@@ -2930,8 +2946,9 @@ The arena can fail to grow for three reasons, and each prints its own line first
   those slots, read from each allocator group's own record. When the ring's
   slots are the only holders (no other scratch, nothing beside the ring, no chunk
   lease), a model load's entry ensure releases the ring after these lines and
-  asks for the zones again, with a WARN that says so; a ring a prefill holds a
-  slot of is kept, and the load is refused as for any holder.
+  asks for the zones again, with a WARN that says so; a ring while a prefill's
+  claim on one of its slots is still held is kept, with a WARN that says so, and
+  the load is refused as for any holder.
 
   The sites are `weight_snapshot`, `weight_resolve`, `chunk_view` (a handle made
   from a raw pointer for one use), `tensor_extra`, `expert_dispatch` and
@@ -3017,12 +3034,17 @@ The clause after the zones names each kind of holder the rebuild gate refused
 on, with its count, and the remedy follows from them. Live allocations in the
 zones belong to a model or context, and freeing it lets the zones grow: the
 line above. `<N> leases on its chunks` with nothing live in the zones outlived
-what they point at, and `<M> of the cache's own scratch buffers` (the PP MoE
-ring, the oneDNN scratch pair, the reorder temp, a persistent scratch) stay in
-the arena until the cache is torn down at process exit. No free releases
-either, so the line then says to load the model in a new process before any
-other on the device. The cache's scratch decides the remedy whatever else
-holds the arena. Live bytes are a model's or a context's only when the cache
+what they point at, and `<M> of the cache's own scratch buffers` (the oneDNN
+scratch pair, the reorder temp, a persistent scratch) stay in the arena until
+the cache is torn down at process exit. No free releases either, so the line
+then says to load the model in a new process before any other on the device.
+The cache's scratch decides the remedy whatever else holds the arena. The PP
+MoE ring is the cache's too, but a load releases it when its slot buffers are
+the arena's only holders and no prefill's claim on one of its slots is held. A
+held claim keeps it, and the line then reads `Only the cache's PP MoE ring holds
+it, and a prefill's claim on one of its slots keeps it: the claim outlives its
+prefill until a context on device <D> is freed. Free the context that ran the
+prefill, then load this one again`. Live bytes are a model's or a context's only when the cache
 has no release of its own still to run: a free queued in the arena, a release
 waiting for a retry, a retired entry not yet finalized and an eviction in flight
 all keep zone bytes with no owner left. The refusal carries those four counts,

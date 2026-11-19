@@ -13285,8 +13285,9 @@ static void ggml_sycl_load_published_terms_capture(uint64_t txn) {
 // One planner pass of the open load. Its caller constructs it right after it takes g_tensor_inventory_mutex, before the
 // pass publishes anything, so the pass ends under the same lock: it reads the device-wide terms when the pass starts
 // and notes into the load's records what they hold when it ends. Every publisher of those terms but the oneDNN pair's
-// reserve holds that lock, so only this pass wrote between the two reads. A pass outside a staged load, or of a load
-// whose entry is gone, notes nothing.
+// reserve holds that lock, so only this pass wrote the terms between the two reads. The two-card flag's other writers
+// (the MoE init at a dispatch) do not hold it, so a write of theirs between the two reads is noted as the pass's. A
+// pass outside a staged load, or of a load whose entry is gone, notes nothing.
 struct ggml_sycl_load_published_pass {
     uint64_t                                     txn = 0;
     std::vector<ggml_sycl::load_published_terms> before;
@@ -13344,7 +13345,8 @@ static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept {
         saved.devices[d].restore(static_cast<int>(d));
     }
     // By compare-exchange from what the load set: a writer outside the inventory lock that changed the flag since the
-    // load's last pass keeps its value.
+    // load's last pass keeps its value. One that wrote, after that pass, exactly the value the load wrote cannot be
+    // told from the load, and its value goes back with the load's.
     bool published = saved.moe_multi_gpu_written;
     if (saved.moe_multi_gpu_prior != published) {
         (void) g_moe_multi_gpu_active.compare_exchange_strong(published, saved.moe_multi_gpu_prior,
@@ -17798,10 +17800,14 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // from it, so every slot starts there. Only a runtime-context transaction
     // places slots in the shared KV zone (ggml_sycl_replan_pp_moe_onednn_ring()).
     // The physical ring a previous context left with slots there is not released
-    // here: this is a decide step, and a load refused after it must leave a ring
-    // a live context may still use. The stage releases it in its effect step
-    // (ggml_sycl_release_stale_kv_zone_ring), after every refusal of the pass; the
-    // flags below are planning state the abort of a refused load puts back.
+    // here: this is a decide step, and a load refused after it must leave the ring
+    // a live context may still use. The stage releases a stale ring in its effect
+    // step (ggml_sycl_release_stale_kv_zone_ring), after every refusal of the pass.
+    // The one release a decide step makes is the entry ensure's last resort
+    // (ggml_sycl_ensure_load_arena_zones), taken only when the ring's slot buffers
+    // are the only holders of an arena whose zones must grow and no claim on a slot
+    // is held, and a load refused after it does not get that ring back. The flags
+    // below are planning state the abort of a refused load puts back.
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(ctx->device, false, false);
     // Carry one scratch row's bytes and the expert counts into the backend, so the runtime-context transaction can
     // re-plan the ring for the context's own micro-batch (ggml_sycl_replan_pp_moe_onednn_ring()) instead of leaving it
@@ -18237,7 +18243,9 @@ static bool ggml_sycl_plan_has_storage_table(const ggml_sycl::placement_plan & p
 
 // The zones a load's plan is sized in, asked for at the planner's entry. When a rebuild is needed and the PP MoE ring's
 // slot buffers are the arena's only holders, the ring is released as the last resort through the cache's own release,
-// which keeps a ring whose slot a prefill claims, and the zones are asked for again; a kept ring refuses the load as any
+// and the zones are asked for again. That release keeps a ring while a prefill's claim on one of its slots is held, and
+// a claim outlives its prefill: it is let go when a later prefill takes that slot, when a context on the device is
+// freed (its backend drains the device's slots), or when it is released unused. A kept ring refuses the load as any
 // holder does. It is the only ring release a decide step of the load stage makes. Caller holds
 // g_tensor_inventory_mutex.
 static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_refusal & refusal) {
@@ -18255,7 +18263,7 @@ static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_
     if (cache == nullptr || !cache->release_pp_moe_onednn_scratch_ring()) {
         GGML_LOG_WARN(
             "[SYCL-PLAN] model load kept the PP MoE oneDNN scratch ring (%u slot buffers) on device %d: it is the only "
-            "holder of an arena whose zones must grow, and a prefill claims one of its slots\n",
+            "holder of an arena whose zones must grow, and a prefill's claim on one of its slots is still held\n",
             slot_buffers, device);
         return false;
     }
@@ -18292,10 +18300,10 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         !ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)) {
         // The zones grow only by a rebuild, and the arena is not rebuilt while anything points into it: a live
         // model's allocations, or what a freed model's context left (chunk leases, or its PP MoE ring beside another
-        // holder or with a slot a prefill claims). Any term of this load can then need more than the zones hold, not
-        // only a compute term larger than a live model's: the device-wide terms are this load's alone. The load is
-        // refused by name and whatever holds the arena keeps running; the abort of the load's owner effects puts back
-        // the terms it published. A refused teardown of the arena refuses it the same way.
+        // holder or while a prefill's claim on one of its slots is held). Any term of this load can then need more than
+        // the zones hold, not only a compute term larger than a live model's: the device-wide terms are this load's
+        // alone. The load is refused by name and whatever holds the arena keeps running; the abort of the load's owner
+        // effects puts back the terms it published. A refused teardown of the arena refuses it the same way.
         GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
         return false;
     }
@@ -18619,8 +18627,10 @@ struct ggml_sycl_inventory_effects {
 // claimed by an in-flight dispatch refuses the release, never forced: the ring is kept, KV admission still counts what
 // it holds (read from its slots), and the next KV re-fit re-admits it. The ring is per device, not per model, so this
 // also releases a ring that another still-loaded model's live context admitted: its dispatch falls back when the
-// planned scratch is unavailable, and its published charge for the ring becomes an over-count. It runs only after every
-// refusal of the pass, so a refused load leaves the ring as it found it. Caller holds g_tensor_inventory_mutex.
+// planned scratch is unavailable, and its published charge for the ring becomes an over-count. This release never
+// comes before a refusal: it runs only after every refusal of the pass. The one ring release a refused load can have
+// made is the entry ensure's last resort (ggml_sycl_ensure_load_arena_zones), taken in a decide step only when the
+// ring's slot buffers are the only holders of an arena whose zones must grow. Caller holds g_tensor_inventory_mutex.
 static void ggml_sycl_release_stale_kv_zone_ring(int device) {
     const size_t stale_ring_kv_zone_bytes = ggml_sycl::unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(device);
     if (stale_ring_kv_zone_bytes == 0) {
@@ -19294,7 +19304,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
         // still end the load after an earlier device's effects ran: the two candidate checks around each device's
         // effects throw when the load's owner or candidate changed, and an effect's own host allocation can throw (a
         // zone or pool that cannot be allocated falls back instead). The earlier device then keeps its configured
-        // host zones and its released stale ring.
+        // host zones, its released stale ring and, in a late pass, the layer streaming its effects set up. The abort
+        // releases no layer streaming, and a load whose abort cleans up keeps no model token, so no model teardown
+        // releases it either: the working set stays until the next model's first weight upload on that device
+        // displaces it (register_host_ptr), or until the process exits. A load whose abort fails keeps its token, and
+        // the teardown of that token releases the working set by owner.
         if (early) {
             // llama.cpp-p6i0: the early plan is the load's probe placement. Stage a copy for the PROBE-stage
             // measure, which runs after create_tensor and before the late plan replaces the candidate. It is
