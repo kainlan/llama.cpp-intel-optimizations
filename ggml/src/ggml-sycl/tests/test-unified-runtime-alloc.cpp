@@ -1803,6 +1803,75 @@ static bool concurrent_settle_destroy_closing_wins(sycl::queue & q) {
     return true;
 }
 
+// A rebuild whose teardown refuses reserves nothing over the arena it could not tear down. The arena's 8 MiB zones are
+// smaller than the 32 MiB SCRATCH zone the ensure asks for, and nothing holds it, so the ensure tears it down to rebuild
+// it; the device refuses to free the first chunk (the PRIVATE_TESTING free failure), after the teardown closed the
+// arena. The ensure refuses with TEARDOWN_REFUSED and the cause FREE_FAILED, the arena keeps its chunks and size (no
+// reserve ran), and a second ensure refuses for the same cause, whatever the zones hold. The teardown's retry, the
+// cache's shutdown, frees the chunk and clears the cause.
+// Engagement: the arena is reserved with zones smaller than the ensure's, so the ensure must rebuild it.
+// Mutants: the ensure ignoring a refused teardown (it reserves, and refuses for the budget or answers for zones it
+// never sized); the cause not sticky (the second ensure tries the teardown again, which now completes, and reserves).
+static bool arena_teardown_refusal_reserves_nothing(sycl::queue & q) {
+    TEST_BEGIN("arena_teardown_refusal_reserves_nothing");
+    constexpr size_t  mib       = 1024ull * 1024ull;
+    const size_t      max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const char *      saved_env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
+    const std::string saved_mb  = saved_env != nullptr ? saved_env : "";
+    const bool        had_mb    = saved_env != nullptr;
+    unified_cache     cache(q, 64ull * mib, 0, 0, 0);
+
+    // Declared after the cache, so it runs first: a check that returns early leaves the free failure armed, and this
+    // teardown takes it, so the cache's destructor finds a teardown that completes.
+    struct teardown_retry {
+        unified_cache & cache;
+
+        ~teardown_retry() { (void) cache.shutdown_resources(); }
+    } retry{ cache };
+
+    struct env_restore {
+        bool        had;
+        std::string value;
+
+        ~env_restore() { set_env_var("GGML_SYCL_COMPUTE_ARENA_MB", had ? value.c_str() : nullptr); }
+    } restore{ had_mb, saved_mb };
+
+    TEST_ASSERT(cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0),
+                "the fixture's 64 MiB arena was not reserved");
+    set_env_var("GGML_SYCL_COMPUTE_ARENA_MB", "32");
+    TEST_ASSERT(cache.zone_capacity(vram_zone_id::SCRATCH) < 32ull * mib,
+                "the arena's SCRATCH zone already holds the ensure's 32 MiB, so no rebuild is needed");
+    const int    chunks_before = cache.chunk_count();
+    const size_t size_before   = cache.arena_total_size();
+
+    unified_cache_test_fail_next_arena_free();
+    zone_arena_refusal first;
+    TEST_ASSERT(!cache.ensure_planned_arena_zones(&first), "the ensure succeeded over a teardown that refused");
+    TEST_ASSERT(first.reason == zone_arena_refusal_reason::TEARDOWN_REFUSED,
+                "the ensure did not refuse for the refused teardown");
+    TEST_ASSERT(first.teardown == zone_arena_teardown_refusal::FREE_FAILED,
+                "the refusal does not name the chunk the device refused to free");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::FREE_FAILED,
+                "the cache does not record why its teardown refused");
+    TEST_ASSERT(cache.chunk_count() == chunks_before && cache.arena_total_size() == size_before,
+                "an arena was reserved over the one the teardown could not tear down");
+
+    zone_arena_refusal second;
+    TEST_ASSERT(!cache.ensure_planned_arena_zones(&second), "a second ensure succeeded over the closed arena");
+    TEST_ASSERT(second.reason == zone_arena_refusal_reason::TEARDOWN_REFUSED &&
+                    second.teardown == zone_arena_teardown_refusal::FREE_FAILED,
+                "a second ensure did not refuse for the arena the refused teardown left closed");
+    TEST_ASSERT(cache.chunk_count() == chunks_before && cache.arena_total_size() == size_before,
+                "the second ensure reserved an arena over the closed one");
+
+    TEST_ASSERT(cache.shutdown_resources(), "the teardown's retry did not free the chunk the refused one kept");
+    TEST_ASSERT(!cache.arena_active(), "the teardown's retry left the arena active");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::NONE,
+                "a completed teardown left the earlier refusal's cause");
+    TEST_PASS();
+    return true;
+}
+
 static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
     TEST_BEGIN("host_zone_reset_trims_released_offload_pool_slots");
     offload_buffer_pool_trim(-1);
@@ -2303,6 +2372,7 @@ int main(int argc, char ** argv) {
     ok &= exact_scratch_shutdown_record_survives_for_retry(q);
     ok &= scratch_regrow_refusal_preserves_exact_record(q);
     ok &= concurrent_settle_destroy_closing_wins(q);
+    ok &= arena_teardown_refusal_reserves_nothing(q);
     ok &= accepted_control_publication_is_atomic_with_close_snapshot();
     ok &= planner_terms_restore_returns_the_runtime_requirement();
     ok &= load_record_keeps_a_later_publish();

@@ -10,7 +10,8 @@
 // LEAD-RUN. The planner's shaped path initialises SYCL (layout_policy::get_optimal calls ggml_sycl_info()), arm (a)
 // stages a load through real SYCL backends, and the backends construct caches, so the binary is registered
 // gpu-serial, serial, with the selector pinned to the discrete cards, and a host with no SYCL GPU exits 77 before any
-// arm runs (th32 §11).
+// arm runs (th32 §11). Arm (g) runs a late pass, which configures the last device's host zones from a small plan, so
+// it runs last: no earlier arm may configure them.
 //
 // Every arm names its engagement check, the observation that proves it reached the mechanism it scores, and the
 // mutant it kills. An arm whose engagement check fails is VOID, and a VOID arm fails the binary like a FAIL. Every arm
@@ -1015,6 +1016,238 @@ arm_result arm_e_held_arena_refuses_the_load() {
     return settle();
 }
 
+// (f) A refused load keeps the PP MoE ring a live context left in the shared KV zone, and the ring's KV-zone flags. The
+// ring outlives the context that sized it, and a load releases a ring that still holds KV-zone bytes, but only in the
+// stage's effect step, after every refusal of the load: a load refused in its decide step must leave the ring a live
+// context may still use. Device 0 gets a one-slot ring of 1 MiB slots whose activation and output slots are planned in
+// the KV zone, and a 4 KiB RUNTIME-zone allocation beside it, so the ring is never the arena's only holder and the
+// entry ensure has no last resort to take. A load whose ring weight slot is 256 MiB larger than the RUNTIME zone is then
+// staged early and ended uncommitted.
+// Engagement: the ring was reserved and holds KV-zone bytes, the allocation landed in the RUNTIME zone, and the stage
+// returned PLAN_REJECTED.
+// Mutant: the ring released where the load's planning state is reset, before the planner's refusals (the ring's
+// KV-zone bytes read 0 after the refused stage, and the release line is logged).
+arm_result arm_f_refused_load_keeps_the_kv_zone_ring() {
+    arm_result      r;
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (cache == nullptr || !cache->arena_active()) {
+        void_arm(r, "device 0 has no active VRAM arena, so no ring can sit in its KV zone");
+        return r;
+    }
+    // The ring's planned terms and KV-zone flags as found, written back on every exit.
+    const size_t   found_weight = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(0);
+    const size_t   found_act    = unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(0);
+    const size_t   found_out    = unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(0);
+    const uint32_t found_depth  = unified_cache_get_planned_pp_moe_onednn_ring_depth(0);
+    const bool     found_act_kv = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(0);
+    const bool     found_out_kv = unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(0);
+    const auto     put_back     = [&]() {
+        unified_cache_set_planned_pp_moe_onednn_scratch(0, found_weight, found_act, found_out, found_depth);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(0, found_act_kv, found_out_kv);
+    };
+
+    constexpr size_t slot = 1 * MiB;
+    unified_cache_set_planned_pp_moe_onednn_scratch(0, slot, slot, slot, 1);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(0, true, true);
+    if (!cache->reserve_pp_moe_onednn_scratch(slot, slot, slot, 1)) {
+        put_back();
+        void_arm(r, "a one-slot ring of 1 MiB slots was not reserved on device 0");
+        return r;
+    }
+    const size_t held = unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(0);
+    if (held == 0) {
+        (void) cache->release_pp_moe_onednn_scratch_ring();
+        put_back();
+        void_arm(r, "the ring holds no bytes in the KV zone, so a release could not show");
+        return r;
+    }
+
+    alloc_request req{};
+    req.queue                               = &cache->get_queue();
+    req.device                              = 0;
+    req.size                                = 4096;
+    req.intent.role                         = alloc_role::GRAPH_TMP;
+    req.intent.category                     = runtime_category::GRAPH;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+    allocation_result allocation            = unified_allocate_owner(req);
+    mem_handle        holder;
+    alloc_metadata    meta{};
+    if (allocation) {
+        holder = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    }
+    const resolved_ptr where = holder.resolve();
+    if (!where || !where.on_device || !unified_lookup(where.ptr, &meta) || meta.zone != vram_zone_id::RUNTIME) {
+        holder = {};
+        (void) cache->release_pp_moe_onednn_scratch_ring();
+        put_back();
+        void_arm(r, "the 4 KiB allocation is not in device 0's RUNTIME zone, so the ring could be the only holder");
+        return r;
+    }
+
+    loader_inventory too_big(qwen38_shape);
+    too_big.inv.pp_moe_onednn_weight_slot_bytes = cache->zone_capacity(vram_zone_id::RUNTIME) + 256 * MiB;
+    too_big.inv.pp_moe_onednn_scratch_bytes     = too_big.inv.pp_moe_onednn_weight_slot_bytes;
+    too_big.inv.pp_moe_onednn_ring_depth        = 1;
+    ggml_sycl_load_txn txn{};
+    if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
+        holder = {};
+        (void) cache->release_pp_moe_onednn_scratch_ring();
+        put_back();
+        void_arm(r, "the load transaction did not begin");
+        return r;
+    }
+    log_clear();
+    const ggml_sycl_lifecycle_result rc = ggml_backend_sycl_stage_load_inventory_plan(&too_big.inv, nullptr, true);
+    const size_t                     held_staged   = unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(0);
+    const bool                       act_kv_staged = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(0);
+    const bool                       out_kv_staged = unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(0);
+    (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    const size_t held_ended   = unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(0);
+    const bool   act_kv_ended = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(0);
+    const bool   out_kv_ended = unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(0);
+    const size_t released     = lines_with("[SYCL-PLAN] model load released the PP MoE oneDNN scratch ring").size();
+
+    if (rc != GGML_SYCL_LIFECYCLE_PLAN_REJECTED) {
+        void_arm(r, "the load whose ring cannot fit the RUNTIME zone returned " + num(rc) + ", not PLAN_REJECTED");
+    }
+    expect(r, held_staged == held,
+           "right after the refused stage the ring holds " + num(held_staged) + " bytes in the KV zone, not its " +
+               num(held) + ": the refused load released it");
+    expect(r, held_ended == held,
+           "after the refused load's end the ring holds " + num(held_ended) + " bytes in the KV zone, not its " +
+               num(held));
+    expect(r, released == 0,
+           "the refused load logged " + num(released) + " ring release line(s), want none: it changed device 0");
+    expect(r, act_kv_staged && out_kv_staged && act_kv_ended && out_kv_ended,
+           "the ring's KV-zone flags read activation=" + num(act_kv_staged) + "/" + num(act_kv_ended) + " output=" +
+               num(out_kv_staged) + "/" + num(out_kv_ended) + " (after the stage/after the end), not the planned 1/1");
+
+    holder = {};
+    expect(r, cache->release_pp_moe_onednn_scratch_ring(), "the ring kept after the refused load did not release");
+    put_back();
+    return r;
+}
+
+// The q2k fixture's shape with 256 experts: each expert tensor is 32 times larger, so the plan's host staging and
+// SCRATCH zones, which follow the largest copied tensor, are larger than the q2k shape's.
+constexpr host_plan_shaped_inventory::moe_shape q2k_wide_shape = {
+    GGML_TYPE_Q2_K, 2, 256, 2, 1024, 512, 4096, 16, 1, 0, 0, 0,
+};
+
+// (g) A load refused in its late pass configures no host zone, and the next load's host zones come from its own plan.
+// The host zones are configured once per cache, by the first late pass that reaches the step, so a refused load that
+// configured them would size them for every load after it. Load A (the q2k shape) stages its early pass, then its late
+// pass with the PRIVATE_TESTING hook that fails the stage after its first device, which on the stage's decide step is
+// before any device's effects. Load B (the same shape with 256 experts) stages both passes. Each ends uncommitted.
+// The device checked is the stage's last, whose snapshot is the load's candidate.
+// Engagement: the device's cache had no host zones before the arm; the hook is exported, and the armed late stage
+// returned EFFECT_FAILED; B's late pass staged a plan with entries; A's and B's plans size at least one zone apart.
+// Mutant: the host zones configured inside the device loop, before a later device's refusal (A's late pass configures
+// them, and B's zones are A's sizes).
+arm_result arm_g_refused_late_pass_configures_no_host_zones() {
+    arm_result      r;
+    const int       device = std::max(1, ggml_backend_sycl_get_device_count()) - 1;
+    unified_cache * cache  = get_unified_cache_for_device(device);
+    if (cache == nullptr || cache->pinned_pool_chunk_size() == 0) {
+        void_arm(r, "device " + num(device) + " has no cache with a pinned pool");
+        return r;
+    }
+    if (cache->host_zones_configured()) {
+        void_arm(r, "device " + num(device) + "'s host zones were configured before the arm, so a refused load's " +
+                        "zones cannot be told from an earlier one's");
+        return r;
+    }
+    using fail_next_fn           = void (*)();
+    const fail_next_fn fail_late = reinterpret_cast<fail_next_fn>(ggml_backend_reg_get_proc_address(
+        ggml_backend_sycl_reg(), "ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device"));
+    if (fail_late == nullptr) {
+        void_arm(r, "the stage's late failure hook is not exported");
+        return r;
+    }
+    const auto terms_of = [&](const placement_plan & plan) {
+        return placement_plan_host_zone_commit_terms(
+            plan, cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size(),
+            cache->pinned_pool_chunk_size());
+    };
+
+    loader_inventory   a_inv(host_plan_shaped_inventory::q2k_shape);
+    ggml_sycl_load_txn a{};
+    if (ggml_backend_sycl_model_load_begin(&a) != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "load A's transaction did not begin");
+        return r;
+    }
+    if (ggml_backend_sycl_stage_load_inventory_plan(&a_inv.inv, nullptr, true) != GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_load_end(a, false, nullptr);
+        void_arm(r, "load A's early pass did not stage");
+        return r;
+    }
+    const auto a_early = lifecycle_find_candidate_placement_plan(a.id);
+    if (!a_early || !a_early->plan || a_early->plan->entries.empty()) {
+        (void) ggml_backend_sycl_model_load_end(a, false, nullptr);
+        void_arm(r, "load A's early pass staged no plan with entries");
+        return r;
+    }
+    const host_zone_commit_terms a_terms = terms_of(*a_early->plan);
+    fail_late();
+    const ggml_sycl_lifecycle_result a_rc = ggml_backend_sycl_stage_load_inventory_plan(&a_inv.inv, nullptr, false);
+    const bool                       a_configured = cache->host_zones_configured();
+    (void) ggml_backend_sycl_model_load_end(a, false, nullptr);
+    if (a_rc != GGML_SYCL_LIFECYCLE_EFFECT_FAILED) {
+        // The hook fires only when the stage reaches it, so it may still be armed: no further stage runs here.
+        void_arm(r, "load A's armed late pass returned " + num(a_rc) + ", not EFFECT_FAILED");
+        return r;
+    }
+    expect(r, !a_configured,
+           "load A's late pass, refused on its decide step, configured device " + num(device) + "'s host zones");
+
+    loader_inventory   b_inv(q2k_wide_shape);
+    ggml_sycl_load_txn b{};
+    if (ggml_backend_sycl_model_load_begin(&b) != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "load B's transaction did not begin");
+        return r;
+    }
+    const ggml_sycl_lifecycle_result b_early_rc =
+        ggml_backend_sycl_stage_load_inventory_plan(&b_inv.inv, nullptr, true);
+    const ggml_sycl_lifecycle_result b_late_rc =
+        b_early_rc == GGML_SYCL_LIFECYCLE_OK ? ggml_backend_sycl_stage_load_inventory_plan(&b_inv.inv, nullptr, false) :
+                                               b_early_rc;
+    const auto                   b_late       = lifecycle_find_candidate_placement_plan(b.id);
+    const bool                   b_configured = cache->host_zones_configured();
+    const size_t                 have_weight  = cache->host_zone_capacity(host_zone_id::WEIGHT);
+    const size_t                 have_kv      = cache->host_zone_capacity(host_zone_id::KV);
+    const size_t                 have_staging = cache->host_zone_capacity(host_zone_id::STAGING);
+    const size_t                 have_scratch = cache->host_zone_capacity(host_zone_id::SCRATCH);
+    const host_zone_commit_terms b_terms = b_late && b_late->plan ? terms_of(*b_late->plan) : host_zone_commit_terms{};
+    (void) ggml_backend_sycl_model_load_end(b, false, nullptr);
+    if (b_late_rc != GGML_SYCL_LIFECYCLE_OK || !b_late || !b_late->plan || b_late->plan->entries.empty()) {
+        void_arm(r, "load B's passes returned " + num(b_early_rc) + " and " + num(b_late_rc) +
+                        " without a staged plan with entries");
+        return r;
+    }
+    if (a_terms.weight == b_terms.weight && a_terms.kv == b_terms.kv && a_terms.staging == b_terms.staging &&
+        a_terms.scratch == b_terms.scratch) {
+        void_arm(r, "load A's and load B's plans size every host zone alike, so the zones cannot say whose plan " +
+                        std::string("configured them"));
+        return r;
+    }
+    const size_t align    = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+    const auto   align_up = [](size_t bytes) {
+        return (bytes + align - 1) & ~(align - 1);
+    };
+    expect(r, b_configured, "load B's late pass configured no host zones on device " + num(device));
+    const auto zone = [&](const char * name, size_t have, size_t b_term, size_t a_term) {
+        expect(r, have == align_up(b_term),
+               std::string("the ") + name + " zone holds " + num(have) + " bytes, not load B's " + num(b_term) +
+                   " (load A's plan sized it " + num(a_term) + ")");
+    };
+    zone("WEIGHT", have_weight, b_terms.weight, a_terms.weight);
+    zone("KV", have_kv, b_terms.kv, a_terms.kv);
+    zone("STAGING", have_staging, b_terms.staging, a_terms.staging);
+    zone("SCRATCH", have_scratch, b_terms.scratch, a_terms.scratch);
+    return r;
+}
+
 const char * outcome_name(outcome o) {
     return o == outcome::PASS ? "PASS" : o == outcome::FAIL ? "FAIL" : "VOID";
 }
@@ -1042,12 +1275,14 @@ int main() {
     };
 
     const named_arm arms[] = {
-        { "(0) a caller of another layout is refused",           arm_0_another_layout_is_refused          },
-        { "(a) expected_host is the stage's host_planned_bytes", arm_a_expected_host_is_the_stage_figure  },
-        { "(b) every term printed by name, from the plan",       arm_b_every_term_printed_from_the_plan   },
-        { "(c) a dry run stores nothing and leaves no trace",    arm_c_a_dry_run_stores_nothing           },
-        { "(d) --mem-available is the sample's MemAvailable",    arm_d_mem_available_option_is_the_sample },
-        { "(e) a load the held arena cannot hold is refused",    arm_e_held_arena_refuses_the_load        },
+        { "(0) a caller of another layout is refused",           arm_0_another_layout_is_refused                  },
+        { "(a) expected_host is the stage's host_planned_bytes", arm_a_expected_host_is_the_stage_figure          },
+        { "(b) every term printed by name, from the plan",       arm_b_every_term_printed_from_the_plan           },
+        { "(c) a dry run stores nothing and leaves no trace",    arm_c_a_dry_run_stores_nothing                   },
+        { "(d) --mem-available is the sample's MemAvailable",    arm_d_mem_available_option_is_the_sample         },
+        { "(e) a load the held arena cannot hold is refused",    arm_e_held_arena_refuses_the_load                },
+        { "(f) a refused load keeps the KV-zone ring",           arm_f_refused_load_keeps_the_kv_zone_ring        },
+        { "(g) a refused late pass configures no host zone",     arm_g_refused_late_pass_configures_no_host_zones },
     };
     int passed = 0, failed = 0, voided = 0;
     for (const named_arm & arm : arms) {
