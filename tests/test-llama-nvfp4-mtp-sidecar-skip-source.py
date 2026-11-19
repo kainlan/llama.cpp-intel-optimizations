@@ -2,22 +2,26 @@
 """Source pins: a skipped MTP block's NVFP4 scale tensors are skipped with the block's weights.
 
 An NVFP4 GGUF carries a ".scale" and an ".input_scale" tensor next to each quantized weight, and the MTP block's are in
-the file too. When the loader skips that block's weights (every architecture that has an MTP block does so when the
-caller did not ask for MTP, and some always do), their pointers stay null, and the generic sidecar pass in
+the file too. When the loader skips that block's weights, their pointers stay null, and the generic sidecar pass in
 llama_model::load_tensors only asks for the sidecar of a weight that was loaded. Nothing then counts the skipped
-block's sidecars, and ml.done_getting_tensors() throws "wrong number of tensors; expected N, got N-22".
+block's sidecars, and ml.done_getting_tensors() throws "wrong number of tensors; expected N, got N-22". The skip is
+checked in glm4, bailingmoe2, exaone4, exaone-moe and dots3note, which skip the MTP block whatever ml.load_mtp says, and
+in qwen35moe, which skips it when ml.load_mtp is false.
 
 The rule the fix pins:
 - the pass asks, for every layer in the MTP range [hparams.n_layer(), n_layer_all), for the sidecars of each weight kind
   whose pointer is null, with TENSOR_NOT_REQUIRED | TENSOR_SKIP, so a sidecar that is in the file is counted once and
   ignored, exactly as its weight was, and one that is not in the file counts nothing;
-- it never reads ml.load_mtp: glm4, bailingmoe2, exaone4, exaone-moe and dots3note skip the MTP block whatever the
-  caller asked, so the null weight, not the flag, says the loader skipped it;
+- both asks also carry TENSOR_SKIP_IF_VIRTUAL: a virtual load (no file) ignores TENSOR_SKIP and would build an orphan
+  tensor for each ask, while that flag makes it return nullptr with nothing counted;
+- it never reads ml.load_mtp: the architectures that skip the block whatever the caller asked would otherwise keep
+  the hole, so the null weight, not the flag, says the loader skipped it;
 - a sidecar of a loaded weight (non-null pointer) is asked for by the existing sites, without TENSOR_SKIP, and the
   two sets of asks are disjoint, so no sidecar is created twice (a second create_tensor of a present tensor would count
   it twice and fail with "too many tensors created");
-- every weight kind that has a sidecar site in the existing pass has its skipped counterpart, with the same dims
-  (create_tensor checks the dims before the skip path returns), so a sidecar site added later cannot leave a hole;
+- every weight kind that has a ".scale" or an ".input_scale" site in the existing pass has its skipped counterpart,
+  with the same dims (create_tensor checks the dims before the skip path returns), so a sidecar site added later
+  cannot leave a hole;
 - all of it sits after load_arch_tensors(ml) and before ml.done_getting_tensors().
 """
 
@@ -63,15 +67,21 @@ _PASS_END = "ml.done_getting_tensors();"
 _SKIP_HELPER = "const auto skip_scales = [&](int il, llm_tensor tensor, const ggml_tensor * weight, int64_t n) {"
 _SKIP_LOOP = "for (int i = hparams.n_layer(); i < n_layer_all; ++i) {"
 _SKIP_GUARD = "if (weight == nullptr) {"
-_SKIP_FLAGS = "TENSOR_NOT_REQUIRED | TENSOR_SKIP"
-_SKIP_SCALE = f'create_tensor(tn(tensor, "scale", il), {{n}}, {_SKIP_FLAGS});'
-_SKIP_INPUT_SCALE = f'create_tensor(tn(tensor, "input_scale", il), {{n}}, {_SKIP_FLAGS});'
+_SKIP_FLAGS = "TENSOR_NOT_REQUIRED | TENSOR_SKIP | TENSOR_SKIP_IF_VIRTUAL"
+_SKIP_FLAGS_DEF = f"const int skip = {_SKIP_FLAGS};"
+_SKIP_SCALE = 'create_tensor(tn(tensor, "scale", il), {n}, skip);'
+_SKIP_INPUT_SCALE = 'create_tensor(tn(tensor, "input_scale", il), {n}, skip);'
 
-# `if (!layer.wq_s && layer.wq) { layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q, "scale", i), {1}, ...); }`
-_SITE_RE = re.compile(
-    r"if \(!layer\.[\w.]+ && layer\.([\w.]+)\) \{ layer\.[\w.]+ = create_tensor\(tn\((LLM_TENSOR_\w+), "
-    r'"scale", i\), \{([^}]*)\}, TENSOR_NOT_REQUIRED\); \}'
-)
+
+def _site_re(suffix: str) -> re.Pattern:
+    # `if (!layer.wq_s && layer.wq) { layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q, "scale", i), {1}, ...); }`
+    return re.compile(
+        r"if \(!layer\.[\w.]+ && layer\.([\w.]+)\) \{ layer\.[\w.]+ = create_tensor\(tn\((LLM_TENSOR_\w+), "
+        rf'"{suffix}", i\), \{{([^}}]*)\}}, TENSOR_NOT_REQUIRED\); \}}'
+    )
+
+
+_SITE_RES = {"scale": _site_re("scale"), "input_scale": _site_re("input_scale")}
 _CALL_RE = re.compile(r"skip_scales\(i, (LLM_TENSOR_\w+), layer\.([\w.]+), ([^)]*)\);")
 
 
@@ -121,15 +131,18 @@ def skip_flags_violations(code: str) -> list:
     violations = []
     if not helper.startswith("{ " + _SKIP_GUARD):
         violations.append("the helper must ask only when the weight pointer is null")
+    if helper.count(_SKIP_FLAGS_DEF) != 1:
+        violations.append(f"the helper must define its flags once as `{_SKIP_FLAGS}` (the last keeps a virtual load clean)")
     if helper.count(_SKIP_SCALE) != 1:
-        violations.append('the helper must ask for the ".scale" sidecar once, with TENSOR_NOT_REQUIRED | TENSOR_SKIP')
+        violations.append('the helper must ask for the ".scale" sidecar once, with the skip flags')
     if helper.count(_SKIP_INPUT_SCALE) != 1:
-        violations.append('the helper must ask for the ".input_scale" sidecar once, with TENSOR_NOT_REQUIRED | TENSOR_SKIP')
-    if body.count("TENSOR_SKIP") != 2:
-        violations.append(
-            f"TENSOR_SKIP must appear exactly twice in the pass (the helper's two asks), not {body.count('TENSOR_SKIP')}: "
-            "a sidecar of a loaded weight is never skipped"
-        )
+        violations.append('the helper must ask for the ".input_scale" sidecar once, with the skip flags')
+    skips = len(re.findall(r"\bTENSOR_SKIP\b", body))
+    if skips != 1:
+        violations.append(f"TENSOR_SKIP must appear once in the pass (the helper's flags), not {skips}: a loaded sidecar stays")
+    virtual = len(re.findall(r"\bTENSOR_SKIP_IF_VIRTUAL\b", body))
+    if virtual != 1:
+        violations.append(f"TENSOR_SKIP_IF_VIRTUAL must appear once in the pass (the helper's flags), not {virtual}")
     return violations
 
 
@@ -150,8 +163,9 @@ def skip_range_violations(code: str) -> list:
     return violations
 
 
-def site_pairs(body: str) -> set:
-    return {(m.group(2), m.group(1), m.group(3)) for m in _SITE_RE.finditer(body)}
+def site_pairs(body: str, suffix: str) -> set:
+    """(tensor, weight, dims) of every `suffix` sidecar site of the loop over all layers."""
+    return {(m.group(2), m.group(1), m.group(3)) for m in _SITE_RES[suffix].finditer(body)}
 
 
 def skip_pairs_violations(code: str) -> list:
@@ -159,17 +173,18 @@ def skip_pairs_violations(code: str) -> list:
     loop = skip_loop_body(body)
     if loop is None:
         return ["the loop over the MTP range is not found in the generic pass"]
-    wanted = site_pairs(body.replace(loop, "", 1))
-    if not wanted:
-        return ["no sidecar site is found in the generic pass"]
-    have = {(m.group(1), m.group(2), "{" + m.group(3) + "}") for m in _CALL_RE.finditer(loop)}
-    # the dims of the existing sites are written `{1}` and `{n_expert}`; the helper takes the bare figure
-    have = {(t, w, d[1:-1]) for t, w, d in have}
+    # the helper takes the bare dims figure; the existing sites write `{1}` and `{n_expert}`
+    have = {(m.group(1), m.group(2), m.group(3)) for m in _CALL_RE.finditer(loop)}
     violations = []
-    for tensor, weight, dims in sorted(wanted - have):
-        violations.append(f"{tensor} (weight layer.{weight}, dims {{{dims}}}) has a sidecar site and no skipped counterpart")
-    for tensor, weight, dims in sorted(have - wanted):
-        violations.append(f"{tensor} (weight layer.{weight}, dims {{{dims}}}) is skipped but has no sidecar site")
+    for suffix in _SITE_RES:
+        wanted = site_pairs(body.replace(loop, "", 1), suffix)
+        if not wanted:
+            violations.append(f"no .{suffix} site is found in the generic pass")
+            continue
+        for tensor, weight, dims in sorted(wanted - have):
+            violations.append(f".{suffix} of {tensor} (layer.{weight}, dims {{{dims}}}) has a site, no skipped counterpart")
+        for tensor, weight, dims in sorted(have - wanted):
+            violations.append(f"{tensor} (layer.{weight}, dims {{{dims}}}) is skipped but has no .{suffix} site")
     return violations
 
 
@@ -197,21 +212,26 @@ def test_skipped_sidecars_are_asked_with_not_required_skip():
 
 def test_skip_flags_check_has_mutation_witnesses():
     assert CODE.count(_SKIP_SCALE) == 1 and CODE.count(_SKIP_INPUT_SCALE) == 1, "each ask must appear exactly once"
+    assert CODE.count(_SKIP_FLAGS_DEF) == 1, "the helper's flags must be defined exactly once"
     for needle, repl in (
-        (_SKIP_SCALE, _SKIP_SCALE.replace(" | TENSOR_SKIP", "")),
-        (_SKIP_INPUT_SCALE, _SKIP_INPUT_SCALE.replace("TENSOR_NOT_REQUIRED | ", "")),
+        (_SKIP_FLAGS_DEF, _SKIP_FLAGS_DEF.replace(" | TENSOR_SKIP_IF_VIRTUAL", "")),
+        (_SKIP_FLAGS_DEF, _SKIP_FLAGS_DEF.replace(" | TENSOR_SKIP |", " |")),
+        (_SKIP_FLAGS_DEF, _SKIP_FLAGS_DEF.replace("TENSOR_NOT_REQUIRED | ", "")),
+        (_SKIP_SCALE, _SKIP_SCALE.replace(", skip)", ", TENSOR_NOT_REQUIRED | TENSOR_SKIP)")),
+        (_SKIP_INPUT_SCALE, _SKIP_INPUT_SCALE.replace(", skip)", ", TENSOR_NOT_REQUIRED)")),
         (_SKIP_GUARD, "if (weight != nullptr) {"),
         (_SKIP_GUARD, "if (true) {"),
     ):
         mutated = CODE.replace(needle, repl, 1)
         assert mutated != CODE
         assert skip_flags_violations(mutated) != [], f"the check must catch {needle!r} becoming {repl!r}"
-    # a loaded weight's sidecar skipped too: one existing site gains TENSOR_SKIP
+    # a loaded weight's sidecar skipped too: one existing site gains the skip flags
     site = 'create_tensor(tn(LLM_TENSOR_ATTN_Q, "scale", i), {1}, TENSOR_NOT_REQUIRED);'
     assert CODE.count(site) == 1
-    mutated = CODE.replace(site, site.replace("TENSOR_NOT_REQUIRED", _SKIP_FLAGS), 1)
-    assert mutated != CODE
-    assert skip_flags_violations(mutated) != [], "the check must catch a loaded weight's sidecar being skipped"
+    for extra in ("TENSOR_NOT_REQUIRED | TENSOR_SKIP", _SKIP_FLAGS):
+        mutated = CODE.replace(site, site.replace("TENSOR_NOT_REQUIRED", extra), 1)
+        assert mutated != CODE
+        assert skip_flags_violations(mutated) != [], "the check must catch a loaded weight's sidecar being skipped"
 
 
 def test_skipped_sidecars_cover_exactly_the_mtp_range():
@@ -259,6 +279,23 @@ def test_skip_pairs_check_has_mutation_witnesses():
     added = CODE.replace(site, site + " " + extra, 1)
     assert added != CODE
     assert skip_pairs_violations(added) != [], "the check must catch a sidecar site added without a counterpart"
+    # the same three mutations on the ".input_scale" sites, which the ".scale" sites alone would not catch
+    in_site = 'create_tensor(tn(LLM_TENSOR_ATTN_Q, "input_scale", i), {1}, TENSOR_NOT_REQUIRED); }'
+    assert CODE.count(in_site) == 1
+    in_start = CODE.rfind("if (", 0, CODE.find(in_site))
+    in_text = CODE[in_start : CODE.find(in_site) + len(in_site)]
+    assert in_text.startswith("if (!layer.wq_in_s && layer.wq) {"), in_text
+    no_in = CODE.replace(in_text, "", 1)
+    assert no_in != CODE
+    assert skip_pairs_violations(no_in) != [], "the check must catch a missing .input_scale site"
+    in_added = CODE.replace(in_site, in_site + " " + extra.replace('"scale"', '"input_scale"'), 1)
+    assert in_added != CODE
+    assert skip_pairs_violations(in_added) != [], "the check must catch an .input_scale site without a counterpart"
+    in_exps = 'create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);'
+    assert CODE.count(in_exps) == 1
+    in_dims = CODE.replace(in_exps, in_exps.replace("{n_expert}", "{1}"), 1)
+    assert in_dims != CODE
+    assert skip_pairs_violations(in_dims) != [], "the check must catch an .input_scale site with other dims"
 
 
 def test_skipped_sidecars_sit_between_the_arch_loader_and_the_tensor_count():

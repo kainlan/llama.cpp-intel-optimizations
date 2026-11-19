@@ -2896,11 +2896,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // The loop above asks for a sidecar only when its weight was loaded. The MTP block's weights are skipped
         // (by the caller's choice, or always by some architectures), so their pointers are null and its sidecars,
         // which are in the file, would never be counted and done_getting_tensors() would find the count short.
-        // Skip them with their weights: a sidecar of a loaded weight is never asked for here.
+        // Skip them with their weights: a sidecar of a loaded weight is never asked for here. A virtual load has no
+        // file and ignores TENSOR_SKIP, so it would build an orphan tensor for each ask; TENSOR_SKIP_IF_VIRTUAL
+        // makes it return nullptr there, as before.
         const auto skip_scales = [&](int il, llm_tensor tensor, const ggml_tensor * weight, int64_t n) {
             if (weight == nullptr) {
-                create_tensor(tn(tensor, "scale",       il), {n}, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
-                create_tensor(tn(tensor, "input_scale", il), {n}, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+                const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP | TENSOR_SKIP_IF_VIRTUAL;
+                create_tensor(tn(tensor, "scale",       il), {n}, skip);
+                create_tensor(tn(tensor, "input_scale", il), {n}, skip);
             }
         };
         for (int i = hparams.n_layer(); i < n_layer_all; ++i) {
