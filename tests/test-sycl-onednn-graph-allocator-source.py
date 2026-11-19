@@ -2249,6 +2249,129 @@ def test_stage_and_dry_run_checks_have_bounded_mutation_witnesses() -> None:
     _assert_only_check_fails(cache, mutant, "dry_run", "the dry run publishing for a multi-device plan too")
 
 
+# The stage's Graph shape publish runs before the entry ensure, so a load the ensure refuses has already written the
+# shape. Two snapshots can put it back, and each must see the shape the other does not:
+# - The load's published-terms pass is opened by each planner entry before it calls the stage, so the pass's record
+#   holds the shape from before the publish, and a staged load the ensure refuses gets that shape back from the load's
+#   abort (load_published_record::restore, the Graph group). Outside a staged load the pass notes nothing, for this
+#   term as for every other.
+# - The discarded-plan snapshot (published_before) is taken after the entry ensure, so a discarded plan goes back to
+#   the shape the ensure sized the zones for, not to the shape from before the load.
+PLAN_ENTRY_SIGS = (
+    "static int ggml_sycl_compute_placement_plan_early_impl(",
+    "static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(",
+)
+LOAD_PASS_DECL = "ggml_sycl_load_published_pass published(g_sycl_plan_load_effect_txn);"
+STAGE_CALL = "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)"
+DISCARDED_SNAPSHOT = (
+    "const ggml_sycl::planner_published_terms published_before = "
+    "ggml_sycl::planner_published_terms::snapshot(ctx->device);"
+)
+TERMS_SNAPSHOT_SIG = "load_published_terms load_published_terms::snapshot(int device) {"
+TERMS_DIFFERING_SIG = "uint32_t load_published_terms::differing(const load_published_terms & other) const {"
+PLANNER_SNAPSHOT_SIG = "planner_published_terms planner_published_terms::snapshot(int device) {"
+GRAPH_GROUP = "LOAD_PUBLISHED_GROUP_GRAPH"
+RECORD_GRAPH_GUARD = f"if (back & {GRAPH_GROUP})"
+
+
+def _every_planner_entry_opens_the_pass_before_the_stage(sycl: str) -> bool:
+    """Each planner entry constructs the load's pass once, before its one stage call, and no other site calls the
+    stage, so every publish of the stage lies inside a pass."""
+    if sycl.count(STAGE_CALL) != len(PLAN_ENTRY_SIGS):
+        return False
+    for sig in PLAN_ENTRY_SIGS:
+        if not _has_function(sycl, sig):
+            return False
+        body = _body_of(sycl, sig)
+        if body.count(LOAD_PASS_DECL) != 1 or body.count(STAGE_CALL) != 1:
+            return False
+        if not body.index(LOAD_PASS_DECL) < body.index(STAGE_CALL):
+            return False
+    return True
+
+
+def _discarded_plan_snapshot_follows_the_entry_ensure(sycl: str) -> bool:
+    """In the stage: the Graph shape publish, then the entry ensure, then the discarded-plan snapshot."""
+    body = _body_of(sycl, STAGE_PLAN_SIG)
+    if body.count(DISCARDED_SNAPSHOT) != 1 or body.count(STAGE_ENSURE_CALL) != 1:
+        return False
+    publish_at = body.find(GRAPH_SHAPE_PUBLISH)
+    return 0 <= publish_at < body.index(STAGE_ENSURE_CALL) < body.index(DISCARDED_SNAPSHOT)
+
+
+def _load_record_restores_the_graph_shape(cache: str) -> bool:
+    """The load's terms hold the planner's (whose snapshot reads the Graph shape), a change of any of its five fields
+    marks the Graph group, and the record's restore puts the shape back under that group."""
+    for sig in (TERMS_SNAPSHOT_SIG, TERMS_DIFFERING_SIG, PLANNER_SNAPSHOT_SIG, RECORD_RESTORE_SIG):
+        if not _has_function(cache, sig):
+            return False
+    if "terms.planner = planner_published_terms::snapshot(device);" not in _body_of(cache, TERMS_SNAPSHOT_SIG):
+        return False
+    planner = _body_of(cache, PLANNER_SNAPSHOT_SIG)
+    if "terms.graph = unified_cache_get_planned_onednn_graph_scratch_shape(device);" not in planner:
+        return False
+    differing = _body_of(cache, TERMS_DIFFERING_SIG)
+    m = re.search(rf"bit\(((?:(?!bit\()[^;])*?), {GRAPH_GROUP}\)", differing)  # the Graph group's own bit() only
+    if not m or any(f"a.graph.{field} != b.graph.{field}" not in m.group(1) for field in GRAPH_SHAPE_FIELDS):
+        return False
+    restore = _body_of(cache, RECORD_RESTORE_SIG)
+    if restore.count(RECORD_GRAPH_GUARD) != 1:
+        return False
+    guard_at = restore.index(RECORD_GRAPH_GUARD)
+    guarded = extract_function_body(restore[guard_at:], RECORD_GRAPH_GUARD)
+    return GRAPH_SHAPE_SETTER in guarded
+
+
+def _graph_shape_restore_checks(cache: str, sycl: str) -> dict:
+    return {
+        "pass": _every_planner_entry_opens_the_pass_before_the_stage(sycl),
+        "discarded": _discarded_plan_snapshot_follows_the_entry_ensure(sycl),
+        "record": _load_record_restores_the_graph_shape(cache),
+    }
+
+
+def test_a_refused_load_puts_the_graph_shape_back() -> None:
+    results = _graph_shape_restore_checks(CACHE_CPP_NORM, GGML_SYCL_CPP_NORM)
+    assert results["pass"], (
+        f"each planner entry must construct `{LOAD_PASS_DECL}` before it calls {STAGE_CALL}, and nothing else may "
+        "call the stage: the stage publishes the Graph shape before its entry ensure, and a staged load the ensure "
+        "refuses puts back only what a pass noted"
+    )
+    assert results["discarded"], (
+        f"the stage must publish the Graph shape, then call {STAGE_ENSURE_CALL}, then take the discarded-plan "
+        "snapshot: a discarded plan goes back to the shape the ensure sized the zones for"
+    )
+    assert results["record"], (
+        f"the load's terms must snapshot the Graph shape through the planner's terms, mark {GRAPH_GROUP} when any of "
+        f"its fields changes, and the record's restore must put it back under {RECORD_GRAPH_GUARD}"
+    )
+
+
+def _assert_only_restore_check_fails(cache: str, sycl: str, failing: str, why: str) -> None:
+    results = _graph_shape_restore_checks(cache, sycl)
+    expected = {name: name != failing for name in results}
+    assert results == expected, f"mutation witness for {failing!r} ({why}) is broken: {results}"
+
+
+def test_graph_shape_restore_checks_have_bounded_mutation_witnesses() -> None:
+    cache, sycl = CACHE_CPP_NORM, GGML_SYCL_CPP_NORM
+    assert all(_graph_shape_restore_checks(cache, sycl).values()), "sanity: every check passes on the source itself"
+
+    for sig in PLAN_ENTRY_SIGS:
+        # Every statement stays; the pass opens after the stage has published, so it notes no Graph shape write.
+        mutant = _move_in_function(sycl, sig, LOAD_PASS_DECL, f"if (!{STAGE_CALL})")
+        _assert_only_restore_check_fails(cache, mutant, "pass", f"{sig} opening its pass after the stage")
+
+    mutant = _move_in_function(sycl, STAGE_PLAN_SIG, DISCARDED_SNAPSHOT, "ggml_sycl::zone_arena_refusal refusal;")
+    _assert_only_restore_check_fails(cache, mutant, "discarded", "the discarded-plan snapshot taken before the ensure")
+
+    mutant = _mutate_in_function(cache, TERMS_DIFFERING_SIG, "a.graph.n_ctx != b.graph.n_ctx", "false")
+    _assert_only_restore_check_fails(mutant, sycl, "record", "a context change not marking the Graph group")
+
+    mutant = _mutate_in_function(cache, RECORD_RESTORE_SIG, RECORD_GRAPH_GUARD, "if (false)")
+    _assert_only_restore_check_fails(mutant, sycl, "record", "a failed load's restore leaving the Graph shape it wrote")
+
+
 # The planning micro-batch rule (the envelope's micro-batch when it names one, the model's otherwise) has one
 # spelling, zone_planning_n_ubatch(). Both plan builders take their planning micro-batch from it, and
 # zone_plan_context_shape_for_envelope() its default micro-batch, so the shape published before a plan exists falls
