@@ -1,8 +1,11 @@
-"""Source contract for the load stage's two passes: every refusal is decided before any device is changed.
+"""Source contract for the load stage's two passes: every refusal is decided before the stage's effects run.
 
-ggml_backend_sycl_stage_load_inventory_plan plans every device first (the decide pass) and changes a device only after
-the last refusal of the load is decided (the effect pass). A load refused on any device therefore leaves every device as
-it found it, and the rollback guard's abort only has to put back what the decide pass published. These checks pin that:
+ggml_backend_sycl_stage_load_inventory_plan plans every device first (the decide pass) and configures a device's host
+zones, sets up its layer streaming and releases its stale ring only after the last refusal of the load is decided (the
+effect pass). A load refused on any device therefore runs none of those effects, and the rollback guard's abort puts
+back what the decide pass published. The decide pass still changes a device in the planner's zone decision: the entry
+ensure's last resort below releases a ring, and an arena nothing holds may be rebuilt for the plan's zones, which a
+refused load keeps (or no arena, after a failed reserve). These checks pin the rest:
 
 The decide pass releases the PP MoE oneDNN scratch ring in one place only: ggml_sycl_ensure_load_arena_zones, the
 planner's entry ensure, as its last resort when a rebuild is needed and the ring's slot buffers are the arena's only

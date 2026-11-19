@@ -18,7 +18,7 @@
 # extract is the positive control for A3 (its setter body carries the call).
 #
 # The stage now runs in two passes, so that a load refused on any device
-# changes no device: the decide loop captures each device's snapshot (and the
+# configures no device's host zones: the decide loop captures each device's snapshot (and the
 # effects its impl decided) into a late_decision, and the effect loop
 # provisions each decision's retained snapshot after the last refusal. The
 # A-family anchors name those fields; the shape they pin is unchanged: capture

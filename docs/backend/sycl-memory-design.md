@@ -2729,25 +2729,48 @@ model, and a load resets the planned placement to RUNTIME. So a load releases a
 ring that still holds KV-zone bytes, because the reserve's "already sufficient"
 path would otherwise keep it. The release is an effect of the load stage
 (`ggml_sycl_release_stale_kv_zone_ring()`): it runs only after every refusal of
-the pass is decided, so a refused load leaves the ring as it found it. A slot
-claimed by an in-flight dispatch refuses that release, and it is never forced.
-The ring is then kept, KV still counts what it holds, and the next re-fit
-re-admits it.
+the pass is decided, so a load refused in its decide pass does not release the
+ring this way (the entry ensure's last resort, below, is the one release that
+comes before the last refusal). A slot claimed by an in-flight dispatch refuses
+that release, and it is never forced. The ring is then kept, KV still counts
+what it holds, and the next re-fit re-admits it.
 
 **The load stage's two passes.** `ggml_backend_sycl_stage_load_inventory_plan()`
-plans every device first and changes a device only after the last refusal of
-the load is decided. The decide pass publishes planning state, which the abort
-of a refused load puts back, and changes no device. The effect pass then runs,
-device by device and each from the snapshot that device staged: the stale ring's
-release, the layer streaming the late pass decided on, and the late pass's host
-zones (`ggml_sycl_configure_host_zones_for_plan()`). A load refused on any device
+plans every device first. It configures a device's host zones, sets up its layer
+streaming and releases its stale ring only after the last refusal of the load is
+decided. The decide pass publishes planning state, which the abort of a refused
+load puts back, together with the two-card MoE flag its planner sets
+(`g_moe_multi_gpu_active`). The decide pass is not free of device effects. The
+planner's zone decision sizes the VRAM arena's zones, and it may rebuild an
+arena nothing holds for larger zones, at the entry ensure or at the
+micro-batch's grow leg. A refused load keeps the rebuilt arena, or leaves the
+device with no arena when the reserve after the teardown failed. A plan that
+needs the secondary MoE devices also creates their shared queues and caches,
+which stay. The effect pass then runs, device by device and each from the
+snapshot that device staged: the stale ring's release, the layer streaming the
+late pass decided on, and the late pass's host zones
+(`ggml_sycl_configure_host_zones_for_plan()`). A load refused in its decide pass
 therefore configures no device's host zones, which a later load configures from
-its own plan. The one ring release in the decide pass is the entry ensure's last
-resort (`ggml_sycl_ensure_load_arena_zones()`): when the plan's zones need a
-rebuild and the ring's slot buffers are the arena's only holders
+its own plan. An effect can still end a load after an earlier device's effects
+ran. The two candidate checks around each device's effects throw when the
+load's owner or candidate changed, and an effect's own host allocation can throw
+(a zone or pool that cannot be allocated falls back instead). The earlier device
+then keeps its configured host zones and its released stale ring.
+
+The one ring release in the decide pass is the entry ensure's last resort
+(`ggml_sycl_ensure_load_arena_zones()`): when the plan's zones need a rebuild
+and the ring's slot buffers are the arena's only holders
 (`zone_arena_only_ring_holds()`), the ring is released and the zones are asked
-for again. A ring a prefill holds a slot of is kept, and the load is refused as
-for any holder.
+for again. The premise is counted, not owned. The ring is the only holder when
+nothing else points into the arena: no other allocation live in its zones, no
+lease on its chunks, no other cache scratch buffer inside it. That says nothing
+about who still uses the ring. A ring a prefill holds a slot of refuses the
+release, and the load is refused as for any holder. A context that held only the
+ring on that device loses it between two prefills and reserves it again at its
+next dispatch; that is the accepted cost of the last resort. The slot buffers
+are freed inside the release, before the second ensure counts the holders: no
+dispatch holds a lease on a slot buffer, so each buffer's free runs when its
+owner's last reference drops, and none is queued.
 
 **Contiguity.** Each KV-zone slot is one allocation. So the whole KV-zone part
 must also fit the zone's largest free block, read after the old ring is

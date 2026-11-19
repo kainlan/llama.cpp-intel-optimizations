@@ -632,6 +632,72 @@ def test_witness_restore_stores_the_sum_plainly():
     assert not claim_restore_keeps_a_later_publish(GS, m)
 
 
+# ---- a failed load puts back the two-card MoE flag its planner set ----
+
+# The planner sets g_moe_multi_gpu_active in compute_and_store_plan_for_inventory, inside the pass of either entry, and
+# live models' dispatch reads it, as does the next load's planner before it writes it. A failed load puts back what it
+# held before, kept as a group is: the capture reads it, each pass notes it, and the restore puts the prior back by
+# compare-exchange, so a write since by another writer survives.
+COMPUTE_FLAG_WRITES = ("g_moe_multi_gpu_active.store(true, std::memory_order_release);",
+                       "g_moe_multi_gpu_active.store(false, std::memory_order_release);",
+                       "g_moe_multi_gpu_active.exchange(false, std::memory_order_acq_rel)")
+CAPTURE_SIG = "static void ggml_sycl_load_published_terms_capture(uint64_t txn)"
+PASS_START_SIG = "explicit ggml_sycl_load_published_pass(uint64_t load_txn)"
+FLAG_CAPTURE = ("saved.moe_multi_gpu_prior = saved.moe_multi_gpu_written = "
+                "g_moe_multi_gpu_active.load(std::memory_order_acquire);")
+FLAG_BEFORE = "moe_multi_gpu_before = g_moe_multi_gpu_active.load(std::memory_order_acquire);"
+FLAG_NOTE = ("if (moe_multi_gpu_before != saved.moe_multi_gpu_written) { saved.moe_multi_gpu_prior = "
+             "moe_multi_gpu_before; } saved.moe_multi_gpu_written = "
+             "g_moe_multi_gpu_active.load(std::memory_order_acquire);")
+FLAG_RESTORE = ("bool published = saved.moe_multi_gpu_written; if (saved.moe_multi_gpu_prior != published) { (void) "
+                "g_moe_multi_gpu_active.compare_exchange_strong(published, saved.moe_multi_gpu_prior, "
+                "std::memory_order_acq_rel); }")
+TXN_CHECK = "if (txn == 0 || saved.txn != txn) { return; }"
+ENTRY_PLAN_CALL = "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)"
+
+
+def claim_failed_load_restores_the_two_card_flag(gs: str) -> bool:
+    c = code(gs)
+    compute = fn_body(c, COMPUTE_SIG)
+    restore = fn_body(c, RESTORE_SIG)
+    entries = [fn_body(c, sig) for sig in (EARLY_SIG, LATE_SIG)]
+    return (all(w in compute for w in COMPUTE_FLAG_WRITES)
+            and all(ordered(e, PASS, ENTRY_PLAN_CALL) for e in entries)
+            and FLAG_CAPTURE in fn_body(c, CAPTURE_SIG)
+            and FLAG_BEFORE in fn_body(c, PASS_START_SIG)
+            and FLAG_NOTE in fn_body(c, PASS_END_SIG)
+            and ordered(restore, RESTORE_LOCKS[0], RESTORE_LOCKS[1], TXN_CHECK, FLAG_RESTORE)
+            and "g_moe_multi_gpu_active.store(" not in restore)
+
+
+def test_a_failed_load_puts_back_the_two_card_flag():
+    assert claim_failed_load_restores_the_two_card_flag(GS), (
+        "a failed load leaves the two-card MoE flag its planner set: the capture must read g_moe_multi_gpu_active, "
+        "each planner pass must note it, and the restore must put the prior back by compare-exchange after the "
+        "inventory lock and the transaction check")
+
+
+def test_witness_capture_skips_the_flag():
+    m = mutate_in(GS, CAPTURE_SIG, FLAG_CAPTURE, "")
+    assert not claim_failed_load_restores_the_two_card_flag(m)
+
+
+def test_witness_pass_does_not_note_the_flag():
+    m = mutate_in(GS, PASS_END_SIG, FLAG_NOTE, "")
+    assert not claim_failed_load_restores_the_two_card_flag(m)
+
+
+def test_witness_restore_leaves_the_flag():
+    m = mutate_in(GS, RESTORE_SIG, FLAG_RESTORE, "")
+    assert not claim_failed_load_restores_the_two_card_flag(m)
+
+
+def test_witness_restore_stores_the_flag_plainly():
+    m = mutate_in(GS, RESTORE_SIG, FLAG_RESTORE,
+                  "g_moe_multi_gpu_active.store(saved.moe_multi_gpu_prior, std::memory_order_release);")
+    assert not claim_failed_load_restores_the_two_card_flag(m)
+
+
 if __name__ == "__main__":
     import sys
 

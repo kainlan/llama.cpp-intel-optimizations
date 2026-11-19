@@ -13248,10 +13248,16 @@ static void ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw() {
 // context transaction of a live model publishes some of them while the load runs. Each planner pass of the load notes
 // what it changed (ggml_sycl_load_published_pass), and the restore puts back only a group that still holds what the
 // load published, so a context's publish since survives the failed load (ggml_sycl::load_published_record).
+// The two-card MoE flag (g_moe_multi_gpu_active) is kept the same way, as one more group: the planner sets it, live
+// models' dispatch reads it, and the next load's planner reads it before it writes it, so a failed load puts it back.
+// Its other writers (the MoE init at a dispatch) do not take the inventory lock, so one that writes during a pass is
+// taken for the load, and its write goes back with the load's.
 struct ggml_sycl_load_published_terms_saved {
     std::mutex                                    mutex;
     uint64_t                                      txn = 0;
     std::vector<ggml_sycl::load_published_record> devices;
+    bool                                          moe_multi_gpu_prior   = false;
+    bool                                          moe_multi_gpu_written = false;
 };
 
 // Allocated once and never destroyed, so an abort during static destruction still finds it.
@@ -13272,7 +13278,8 @@ static void ggml_sycl_load_published_terms_capture(uint64_t txn) {
     for (int d = 0; d < n; ++d) {
         saved.devices.emplace_back(ggml_sycl::load_published_terms::snapshot(d));
     }
-    saved.txn = txn;
+    saved.moe_multi_gpu_prior = saved.moe_multi_gpu_written = g_moe_multi_gpu_active.load(std::memory_order_acquire);
+    saved.txn                                               = txn;
 }
 
 // One planner pass of the open load. Its caller constructs it right after it takes g_tensor_inventory_mutex, before the
@@ -13283,6 +13290,7 @@ static void ggml_sycl_load_published_terms_capture(uint64_t txn) {
 struct ggml_sycl_load_published_pass {
     uint64_t                                     txn = 0;
     std::vector<ggml_sycl::load_published_terms> before;
+    bool                                         moe_multi_gpu_before = false;
 
     explicit ggml_sycl_load_published_pass(uint64_t load_txn) {
         ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
@@ -13295,6 +13303,7 @@ struct ggml_sycl_load_published_pass {
         for (size_t d = 0; d < saved.devices.size(); ++d) {
             before.push_back(ggml_sycl::load_published_terms::snapshot(static_cast<int>(d)));
         }
+        moe_multi_gpu_before = g_moe_multi_gpu_active.load(std::memory_order_acquire);
     }
 
     ~ggml_sycl_load_published_pass() {
@@ -13306,6 +13315,12 @@ struct ggml_sycl_load_published_pass {
         for (size_t d = 0; d < saved.devices.size() && d < before.size(); ++d) {
             saved.devices[d].note(before[d], ggml_sycl::load_published_terms::snapshot(static_cast<int>(d)));
         }
+        // As a record notes a group: a flag that moved since the load last looked was another writer's, and is what
+        // the restore puts back.
+        if (moe_multi_gpu_before != saved.moe_multi_gpu_written) {
+            saved.moe_multi_gpu_prior = moe_multi_gpu_before;
+        }
+        saved.moe_multi_gpu_written = g_moe_multi_gpu_active.load(std::memory_order_acquire);
     }
 
     ggml_sycl_load_published_pass(const ggml_sycl_load_published_pass &)             = delete;
@@ -13327,6 +13342,13 @@ static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept {
     }
     for (size_t d = 0; d < saved.devices.size(); ++d) {
         saved.devices[d].restore(static_cast<int>(d));
+    }
+    // By compare-exchange from what the load set: a writer outside the inventory lock that changed the flag since the
+    // load's last pass keeps its value.
+    bool published = saved.moe_multi_gpu_written;
+    if (saved.moe_multi_gpu_prior != published) {
+        (void) g_moe_multi_gpu_active.compare_exchange_strong(published, saved.moe_multi_gpu_prior,
+                                                              std::memory_order_acq_rel);
     }
     saved.devices.clear();
     saved.txn = 0;
@@ -18738,9 +18760,13 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
 }
 
 // The late inventory pass. *plan_refused (when given) is set, and no candidate is returned, when the arena's zones
-// cannot be sized for the plan; the refusal line is already logged. The pass changes no device: what it decided to
-// change is returned in *effects (device -1 when it planned nothing or refused), for the caller to run with
-// ggml_sycl_run_inventory_effects() once it has decided every refusal.
+// cannot be sized for the plan; the refusal line is already logged. The pass configures no host zone, sets up no layer
+// streaming and releases no stale ring: what it decided to change is returned in *effects (device -1 when it planned
+// nothing or refused), for the caller to run with ggml_sycl_run_inventory_effects() once it has decided every refusal.
+// The planner's zone decision still changes the device: the entry ensure may release the PP MoE ring as its last
+// resort, and it or the micro-batch's grow leg may rebuild an arena nothing holds, which a refused load keeps (or, after
+// a failed reserve, the device keeps no arena). A plan that needs the secondary MoE devices also creates their shared
+// queues and caches, which stay.
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(
     ggml_backend_t                     backend,
     const ggml_sycl_tensor_inventory * inventory,
@@ -19192,9 +19218,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                        ggml_sycl::lifecycle_find_candidate_placement_plan(owner.load.value).get() == snapshot.get();
             };
 
-        // The decide pass: every device plans and every refusal is decided before any device is changed, so a load
-        // refused on any device leaves every device as it found it, and the rollback guard's abort puts back what the
-        // pass published.
+        // The decide pass: every device plans and every refusal is decided before any device's host zones, layer
+        // streaming or stale-ring release, and the rollback guard's abort puts back what the pass published. The
+        // planner's zone decision still changes a device here: the entry ensure's last resort releases a ring that
+        // alone holds the arena, and an arena nothing holds may be rebuilt for the plan's zones, which a refused load
+        // keeps (or no arena, after a failed reserve). The secondary MoE queues and caches a plan creates stay too.
         for (int i = 0; i < n_devices; ++i) {
             ggml_backend_t backend = ggml_backend_sycl_init(i);
             if (!backend) {
@@ -19262,8 +19290,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
             return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
         }
 
-        // The effect pass. Every refusal of the load is decided above, so nothing below refuses it: the devices are
-        // changed only by a load that goes on.
+        // The effect pass. Every refusal of the load is decided above, so nothing below refuses it, but an effect can
+        // still end the load after an earlier device's effects ran: the two candidate checks around each device's
+        // effects throw when the load's owner or candidate changed, and an effect's own host allocation can throw (a
+        // zone or pool that cannot be allocated falls back instead). The earlier device then keeps its configured
+        // host zones and its released stale ring.
         if (early) {
             // llama.cpp-p6i0: the early plan is the load's probe placement. Stage a copy for the PROBE-stage
             // measure, which runs after create_tensor and before the late plan replaces the candidate. It is
