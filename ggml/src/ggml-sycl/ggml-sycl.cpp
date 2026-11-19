@@ -21307,6 +21307,21 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     next_plan.planner_swa_full   = swa_full;
     next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
 
+    // The immutable Q1_0/NVFP4 host recipes' CPU workspace is one micro-batch of tokens: this context's, by the rule
+    // the load sized it with. The load sizes it at its own planning micro-batch, and the executor refuses a recipe
+    // request larger than the published plan's figure, so a context with a wider micro-batch needs the figure re-sized
+    // here. next_plan is a local copy, so a refusal leaves nothing to roll back, and the probe sizes the same workspace
+    // the real call publishes.
+    if (!ggml_sycl::placement_moe_host_recipe_workspace_bytes_at(
+            next_plan.moe_host_recipe_shapes, ggml_sycl::placement_load_n_ubatch(next_plan.planner_n_ubatch),
+            &next_plan.moe_host_recipe_workspace_bytes)) {
+        GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode,
+                                      "[SYCL-PLAN] runtime context update rejected: the MoE host recipe workspace for "
+                                      "%u tokens overflows\n",
+                                      ggml_sycl::placement_load_n_ubatch(next_plan.planner_n_ubatch));
+        return refuse("MoE host recipe workspace overflows");
+    }
+
     // Filled when KV is re-placed to the host tier, here or by the over-budget
     // demotion further below; read into the probe's out->would_demote_kv/
     // out->host_kv_bytes on acceptance. Both passes only ever mutate

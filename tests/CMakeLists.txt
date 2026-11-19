@@ -4742,6 +4742,14 @@ endif()
 
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-context-sizing-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-context-sizing-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-fatal-exit-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fatal-exit-source.py
         LABEL "sycl;python;source-assert"
