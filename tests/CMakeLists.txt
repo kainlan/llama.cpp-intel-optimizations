@@ -1984,6 +1984,23 @@ if (NOT WIN32)
         TIMEOUT 60
     )
 
+    # Gate for the UI bundle version order in tools/ui/ui-version.cmake: env
+    # overrides, then the committed pin, then the build-number derivation. Without
+    # the pin the build embeds the floating bundle, which can stop matching this
+    # tree's server code at any time.
+    llama_test_cmd(
+        ${CMAKE_COMMAND}
+        NAME test-ui-version-pin
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS -DUI_VERSION_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/ui-version.cmake
+             -DUI_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/CMakeLists.txt
+             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-ui-version-pin.cmake
+    )
+    set_tests_properties(test-ui-version-pin PROPERTIES
+        LABELS "build;policy"
+        TIMEOUT 60
+    )
+
     # Conservation gate for parse-sycl-timeline.py's three-way gap-class split,
     # driven by the checked-in synthetic trace next to it (never live hardware).
     #
