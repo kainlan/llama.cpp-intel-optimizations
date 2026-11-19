@@ -19912,10 +19912,10 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     // (zone_hold_fit_demand).
     in.ring_bytes   = ggml_sycl_hold_ring_uncovered(q.device);
     // The micro-batch the published single-device plan sized this device's RUNTIME zone for: the explicit one it
-    // placed, or else the load's planning micro-batch, the shape the load measured the compute term at. The zone holds
-    // that term beside the micro-batch's ring and dense scratch, so the fit credits a rung at or below it: one with its
-    // own record when the record fits the term, one without only at or below the rung the term was measured at
-    // (zone_hold_fit_rung_has_compute_room). Every rung above it is judged as before.
+    // placed, or else the micro-batch the load measured the term at (the planning micro-batch only for an inventory
+    // that sent none). The zone holds that term beside the micro-batch's ring and dense scratch, so the fit credits a
+    // rung at or below it: one with its own record when the record fits the term, one without only at or below the
+    // rung the term was measured at (zone_hold_fit_rung_has_compute_room). Every rung above it is judged as before.
     {
         const auto room_plan     = ggml_sycl_global_plan_owner();
         uint32_t   room_n_ubatch = 0;

@@ -1037,17 +1037,17 @@ struct placement_plan;
 
 // The compute room the RUNTIME zone of `plan` holds on `device`, for the hold-spill fit to credit: `compute_term` at
 // the micro-batch the zone was sized for, in *n_ubatch. A placed explicit micro-batch names its own. Otherwise, for a
-// plan that named no micro-batch, the zone was sized at the load's planning micro-batch, the shape the load measured
-// the compute term at, which the caller passes as `planning_n_ubatch`: the plan's planner_n_ubatch is the context's
-// micro-batch, rewritten by every runtime context transaction, so it cannot say what the load measured. The fit
-// credits that rung and the rungs below it (zone_hold_fit_rung_has_compute_room), except a rung whose own record is
-// larger than the room, a rung without a record above the micro-batch the term was measured at, and the rung whose
-// own buffer was held out. 0 with *n_ubatch 0 for a multi-device plan, another device, a planning micro-batch of 0
-// and a named micro-batch the plan did not place.
+// plan that named no micro-batch, the room is credited at the micro-batch the load measured the term at (the planning
+// micro-batch only for an inventory that sent none), which the caller passes as `measured_n_ubatch`: the plan's
+// planner_n_ubatch is the context's micro-batch, rewritten by every runtime context transaction, so it cannot say what
+// the load measured. The fit credits that rung and the rungs below it (zone_hold_fit_rung_has_compute_room), except a
+// rung whose own record is larger than the room, a rung without a record above the micro-batch the term was measured
+// at, and the rung whose own buffer was held out. 0 with *n_ubatch 0 for a multi-device plan, another device, a
+// measured micro-batch of 0 and a named micro-batch the plan did not place.
 size_t placement_plan_compute_room(const placement_plan & plan,
                                    int                    device,
                                    size_t                 compute_term,
-                                   uint32_t               planning_n_ubatch,
+                                   uint32_t               measured_n_ubatch,
                                    uint32_t *             n_ubatch);
 
 // Whether a context announces the load's explicit micro-batch placement at WARN: it is the first non-probe context

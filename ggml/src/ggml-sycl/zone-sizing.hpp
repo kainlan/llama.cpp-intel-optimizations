@@ -554,9 +554,10 @@ typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 //
 // compute_room_n_ubatch and compute_room_bytes name the rung whose compute buffers the plan sized the RUNTIME zone to
 // hold beside the hold, and that room (placement_plan_compute_room): the explicit micro-batch the load placed, or, for
-// a load that named none, the load's planning micro-batch. The room is the planned compute term (the compute buffers
-// the load measured at its planning shape), held beside that micro-batch's ring and dense scratch. 0 for none: a
-// multi-device plan, another device, an unknown planning micro-batch, or a named micro-batch the plan did not place.
+// a load that named none, the micro-batch the load measured the term at (the planning micro-batch only for an
+// inventory that sent none). The room is the planned compute term (the compute buffers the load measured at that
+// shape), held beside that micro-batch's ring and dense scratch. 0 for none: a multi-device plan, another device, an
+// unknown measured micro-batch, or a named micro-batch the plan did not place.
 // A rung can also be named with a room of 0 bytes, when no live load owns a compute term on the device (the record
 // keeps the last load's micro-batch until the next load replaces it): such a room credits no request above 0 bytes,
 // and the measured rung is withheld (0) with it.
@@ -603,8 +604,9 @@ size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch)
 //
 // It can over-credit a rung whose compute buffers span several chunks, because the request is the rung's largest
 // single buffer (zone_hold_fit_request) while the room is a sum of per-chunk peaks that the other chunks draw on too.
-// The bound has the same limit, since it charges one request rather than the rung's chunks. The credit at the load's
-// planning micro-batch (placement_plan_compute_room) shares the limit, since its room is the same summed term.
+// The bound has the same limit, since it charges one request rather than the rung's chunks. The credit at the
+// micro-batch the load measured the term at (placement_plan_compute_room) shares the limit, since its room is the same
+// summed term.
 bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in,
                                          uint32_t                     n_ubatch,
                                          size_t                       request,
