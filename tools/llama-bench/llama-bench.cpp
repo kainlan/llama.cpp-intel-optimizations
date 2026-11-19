@@ -1293,15 +1293,15 @@ struct cmd_params_instance {
         return mparams;
     }
 
-    // n_ctx_hint is left out, so a context change does not reload the model: a reused model keeps the first
-    // instance's room, and a larger later context is re-placed at context creation (llama.cpp-ak0p). n_ubatch_hint
-    // depends on -b and -ub alone, so it does not reload on a context change either, and it is compared: the routed
-    // experts the load moved to the host tier for one micro-batch's PP MoE scratch ring stay there, so a reused model
-    // would measure a smaller micro-batch with experts it did not need to move, and a larger one would find no room for
-    // its ring. The reload re-plans the experts but not the arena's zones: the arena outlives the model and keeps the
-    // RUNTIME zone an earlier, larger micro-batch grew, so a later instance plans against that zone and keeps fewer
-    // experts on the device than a fresh process would. "-ub auto" names none, and neither does a build without the
-    // SYCL backend, so neither reloads.
+    // n_ctx_hint is left out, so a context change does not reload the model: the load is told the largest context of
+    // the instances that share it (bench_shared_load_n_ctx), so a reused model's room and compute term cover each of
+    // them. n_ubatch_hint depends on -b and -ub alone, so it does not reload on a context change either, and it is
+    // compared: the routed experts the load moved to the host tier for one micro-batch's PP MoE scratch ring stay
+    // there, so a reused model would measure a smaller micro-batch with experts it did not need to move, and a larger
+    // one would find no room for its ring. The reload re-plans the experts but not the arena's zones: the arena
+    // outlives the model and keeps the RUNTIME zone an earlier, larger micro-batch grew, so a later instance plans
+    // against that zone and keeps fewer experts on the device than a fresh process would. "-ub auto" names none, and
+    // neither does a build without the SYCL backend, so neither reloads.
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                n_ubatch_hint() == other.n_ubatch_hint() && split_mode == other.split_mode &&
@@ -1344,6 +1344,18 @@ struct cmd_params_instance {
         return cparams;
     }
 };
+
+// The context a model load is told: the largest of the instances that will share it. llama-bench keeps a model for
+// the consecutive instances whose model params are equal (equal_mparams leaves the context out), and the SYCL load
+// measures its compute term at the context it is told, so a smaller first context would leave a later, larger one
+// a term too small for it.
+static uint32_t bench_shared_load_n_ctx(const std::vector<cmd_params_instance> & instances, size_t i) {
+    uint32_t n_ctx = instances[i].n_ctx();
+    for (size_t j = i + 1; j < instances.size() && instances[j].equal_mparams(instances[i]); ++j) {
+        n_ctx = std::max(n_ctx, instances[j].n_ctx());
+    }
+    return n_ctx;
+}
 
 static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_params & params) {
     std::vector<cmd_params_instance> instances;
@@ -2356,6 +2368,8 @@ int llama_bench(int argc, char ** argv) {
         }
         auto mparams = inst.to_llama_mparams();
         auto cparams = inst.to_llama_cparams();
+        // the load is told the largest context of the instances that share it (bench_shared_load_n_ctx)
+        mparams.n_ctx_hint = bench_shared_load_n_ctx(params_instances, params_idx - 1);
 
         bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
                       inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
