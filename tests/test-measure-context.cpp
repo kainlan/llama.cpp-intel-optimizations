@@ -331,6 +331,12 @@ static void fake_clear_counted() {
 // the memory kinds (llama_memory_kind_unsupported names) the fixtures' refusals named
 static std::set<std::string> g_unsupported_kinds_seen;
 
+// The shape the run paths measure at: a context of 512 cells the caller named, with no micro-batch, which resolves to
+// the auto ladder's bottom rung, the load's own resolver over the fixture's training context.
+static llama_load_measure_shape run_shape(const llama_model & model) {
+    return llama_load_measure_shape_resolve(512, 0, model.hparams.n_ctx_train);
+}
+
 // An architecture the measure refuses by name: the constructor throws llama_measure_unsupported, the
 // load-time measure returns `unsupported` (never a failure), and the plan override it installed is cleared
 // exactly as often as it was installed. `by_memory_kind`: the refusal comes from create_memory, inside the
@@ -383,7 +389,7 @@ static bool check_unsupported_arch(llm_arch arch, bool by_memory_kind) {
         llama_measure_context_args         args        = cpu_args();
         const llama_measure_override_procs procs       = { &fake_install_ok, &fake_clear_counted };
         const llama_load_measure_result    r =
-            llama_load_measure_run(model, args, procs, 512, 7, GGML_SYCL_MEASURE_STAGE_PROBE, 0);
+            llama_load_measure_run(model, args, procs, run_shape(model), 7, GGML_SYCL_MEASURE_STAGE_PROBE, 0);
         CHECK(!r.ok && r.unsupported, "%s: the measure did not come back unsupported (ok=%d unsupported=%d)", name,
               (int) r.ok, (int) r.unsupported);
         CHECK(r.refusal.rfind("[LOAD-PLAN] compute-slot measure failed at probe on device 0: ", 0) == 0,
@@ -433,7 +439,7 @@ static void check_run_paths() {
         llama_measure_context_args         args  = cpu_args();
         const llama_measure_override_procs procs = { &fake_install_ok, &fake_clear_counted };
         const llama_load_measure_result    r =
-            llama_load_measure_run(model, args, procs, 512, 7, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, 0);
+            llama_load_measure_run(model, args, procs, run_shape(model), 7, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, 0);
         CHECK(r.ok && !r.unsupported && r.refusal.empty(), "a good measure refused: %s", r.refusal.c_str());
         CHECK(g_run_installs == 1 && g_run_clears == 1, "a good run: %d installs, %d clears", g_run_installs,
               g_run_clears);
@@ -466,7 +472,7 @@ static void check_run_paths() {
                                                     },
                                                      &fake_clear_counted };
         const llama_load_measure_result r =
-            llama_load_measure_run(model, args, procs, 512, 7, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, 3);
+            llama_load_measure_run(model, args, procs, run_shape(model), 7, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, 3);
         CHECK(!r.ok && !r.unsupported, "a refused install is not a plain refusal");
         CHECK(
             r.refusal == "[LOAD-PLAN] compute-slot measure failed at late on device 3: plan override refused (refused)",
@@ -478,8 +484,8 @@ static void check_run_paths() {
         g_run_installs                       = 0;
         g_run_clears                         = 0;
         llama_measure_context_args      args = cpu_args();
-        const llama_load_measure_result r = llama_load_measure_run(model, args, { nullptr, &fake_clear_counted }, 512,
-                                                                   7, GGML_SYCL_MEASURE_STAGE_PROBE, 0);
+        const llama_load_measure_result r    = llama_load_measure_run(
+            model, args, { nullptr, &fake_clear_counted }, run_shape(model), 7, GGML_SYCL_MEASURE_STAGE_PROBE, 0);
         CHECK(!r.ok && !r.unsupported && r.refusal.find("plan override proc missing") != std::string::npos,
               "a missing proc: %s", r.refusal.c_str());
         CHECK(g_run_clears == 0, "a missing proc cleared %d times", g_run_clears);
@@ -492,7 +498,7 @@ static void check_run_paths() {
         const llama_measure_override_procs procs = { &fake_install_ok, &fake_clear_counted };
         args.backends.clear();  // no backend at all: the constructor cannot build a scheduler
         const llama_load_measure_result r =
-            llama_load_measure_run(model, args, procs, 512, 7, GGML_SYCL_MEASURE_STAGE_PROBE, 0);
+            llama_load_measure_run(model, args, procs, run_shape(model), 7, GGML_SYCL_MEASURE_STAGE_PROBE, 0);
         CHECK(!r.ok && !r.unsupported, "a backend-less measure was not a plain failure (unsupported=%d)",
               (int) r.unsupported);
         CHECK(g_run_installs == g_run_clears, "a failed construction: %d installs, %d clears", g_run_installs,

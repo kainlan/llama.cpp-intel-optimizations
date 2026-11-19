@@ -17284,8 +17284,8 @@ static thread_local ggml_sycl::lifecycle::SlotToken g_sycl_plan_load_effect_owne
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
 // place without any error. These pin the KV tail of the layout (llama.cpp-8ecj), the context's provenance appended
 // after it (llama.cpp-7fmt), libllama's resolved storage inputs and the micro-batch the caller named, both in the
-// provenance's padding, and the lazy tables appended after them (th32 §4.1). The tables cross by pointer too, so each
-// field of a lazy table is pinned as well.
+// provenance's padding, the lazy tables appended after them (th32 §4.1), and the measured micro-batch in the tables'
+// padding. The tables cross by pointer too, so each field of a lazy table is pinned as well.
 static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
@@ -17298,6 +17298,7 @@ static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 18
               "host_weight_layout_cpu left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_measure) == 204, "n_ubatch_measure moved");
 static_assert(sizeof(ggml_sycl_lazy_table_info) == 88, "ggml_sycl_lazy_table_info layout changed");
 static_assert(offsetof(ggml_sycl_lazy_table_info, name) == 0, "lazy table name moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, type) == 8, "lazy table type moved");
@@ -17569,6 +17570,11 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
     }
 }
 
+// The micro-batch the load measured its compute term at; the planning micro-batch for a libllama that sent none.
+static uint32_t ggml_sycl_inventory_measure_n_ubatch(const ggml_sycl_tensor_inventory * inventory) {
+    return inventory->n_ubatch_measure != 0 ? inventory->n_ubatch_measure : inventory->n_ubatch;
+}
+
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
 // entry point and the late set_tensor_inventory entry.  Caller must hold
@@ -17707,12 +17713,14 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         static_cast<uint32_t>(std::max(0, inventory->n_expert_used)));
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(
         ctx->device, ggml_sycl::placement_load_n_ubatch(inventory->n_ubatch));
-    // The load's planning micro-batch, recorded beside the compute term for the hold-spill fit. Recorded here, at each
-    // inventory intake, because the published plan cannot carry it: every runtime context transaction rewrites the
+    // The load's compute-term micro-batch, recorded beside the compute term for the hold-spill fit. Recorded here, at
+    // each inventory intake, because the published plan cannot carry it: every runtime context transaction rewrites the
     // plan's planner_n_ubatch with the context's own micro-batch. A load's early plan and late intake both pass here
-    // with the same inventory, and the store rule keeps an equal value, so the repeat changes nothing. It is the
-    // measure's shape only while inventory.n_ubatch and llama_auto_ubatch_ladder[0] agree, which a source pin holds.
-    ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, inventory->n_ubatch);
+    // with inventories libllama builds from the same hints, so with the same value, and the store rule keeps an equal
+    // value, so the repeat changes nothing. It is the micro-batch the load measured the term at, which libllama sends
+    // with the inventory.
+    ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device,
+                                                               ggml_sycl_inventory_measure_n_ubatch(inventory));
 
     g_model_n_layer = inventory->n_layer;
     ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);
@@ -48298,10 +48306,10 @@ bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t * chunk_bytes, uin
 // `device`, from the probe measure's chunks.  The bytes are what those chunks occupy in the RUNTIME zone's TLSF at the
 // alignment this buffer type requests (ggml_sycl_load_compute_term_size): the allocator's grain, and no headroom.  It
 // writes the planner term only, never the ledger; c(P) is recorded at the admitted stage by
-// ggml_backend_sycl_load_record_compute_term.  The term is measured at the load's measure shape (n_ctx, ubatch 512),
-// not the caller's -c and -ub, which fkpg (a) transports.  False, reserving nothing, when txn is not the open load,
-// n_ctx is 0, the device is out of range or has no VRAM arena, or the chunk list is unusable; the load then goes on
-// with its compute buffer unplanned, as it did before this entry existed.
+// ggml_backend_sycl_load_record_compute_term.  The term is measured at the context and micro-batch the caller told the
+// load.  False, reserving nothing, when txn is not the open load, n_ctx is 0, the device is out of range or has no
+// VRAM arena, or the chunk list is unusable; the load then goes on with its compute buffer unplanned, as it did before
+// this entry existed.
 // The term is stored as the load's own contribution, keyed by the model slot and slot generation the transaction was
 // given at its begin (llama.cpp-ihk6, canonical contract 12.4): the load effect admits only the exact open
 // transaction and names that owner, and it is held across the store, so the load's end, which waits load effects
