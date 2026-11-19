@@ -51,9 +51,10 @@ What this gate pins:
     call.plan, the plan the index build holds (lead ruling c-gi44); only the check's two-argument entry point, the
     batched executor's own route, reads the device's plan, by passing no plan;
   - the staged route refuses through one helper, its only caller (llama.cpp-o9uw),
-    ggml_sycl_moe_staged_capability_refusal, which admits only a supported MMVQ_COMPAT kernel for a type with no
-    direct-kernel requirement (Q1_0 and NVFP4 run only through their direct kernel, which the recipe validator and the
-    executor choice ask through moe_type_needs_direct_kernel);
+    ggml_sycl_moe_staged_capability_refusal, which admits only a supported MMVQ_COMPAT kernel and asks no type; the
+    executor choice asks no type either, and the recipe validator checks the direct kernel's workspace by that kernel.
+    Q1_0 and NVFP4 are named once, by moe_type_has_immutable_host_recipe, which only the validator's host check and
+    the prompt CPU island ask;
   - a region closes on the event of its last copy;
   - a refilled region's copies wait for its read gate: the barrier the executor submits behind the dequants of the
     window the region last held and hands to window_done (lead ruling c-o9uw-1), recorded for the region holding that
@@ -863,73 +864,105 @@ BATCH_HPP_REL = "ggml/src/ggml-sycl/moe-resolved-batch.hpp"
 BATCH_HPP = read(BATCH_HPP_REL)
 BUILD_SIG = "moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor * src0,"
 STAGED_CAP_SIG = ("static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const "
-                  "moe_route_capability & cap, ggml_type type)")
+                  "moe_route_capability & cap)")
 STAGED_CAP_STEPS = (
     "if (!cap.supported) { return ggml_sycl::moe_staged_route_refusal::UNSUPPORTED; }",
     "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) { return ggml_sycl::moe_staged_route_refusal::KERNEL; }",
-    "if (ggml_sycl::moe_type_needs_direct_kernel(type)) { return ggml_sycl::moe_staged_route_refusal::DIRECT_KERNEL; }",
     "return ggml_sycl::moe_staged_route_refusal::NONE;",
 )
-ROUTE_CAP_ASK = "ggml_sycl_moe_staged_capability_refusal(cap, src0->type);"
-DIRECT_SIG = "inline bool moe_type_needs_direct_kernel(ggml_type type)"
-DIRECT_BODY = "{ return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4; }"
+ROUTE_CAP_ASK = "ggml_sycl_moe_staged_capability_refusal(cap);"
+IMMUTABLE_SIG = "inline bool moe_type_has_immutable_host_recipe(ggml_type type)"
+IMMUTABLE_BODY = "{ return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4; }"
+IMMUTABLE_CALL = "moe_type_has_immutable_host_recipe("
 VALIDATE_SIG = "inline bool validate_moe_execution_recipe("
 CHOOSE_SIG = "inline moe_batch_executor_choice choose_moe_batch_executor("
-DIRECT_USES = (
-    "if (recipe.kind == moe_batch_executor::HOST_CPU && moe_type_needs_direct_kernel(recipe.request.type)) {",
-    "const bool direct_q1_nvfp4 = moe_type_needs_direct_kernel(recipe.request.type);",
-    "operand.recipe().kind != moe_batch_executor::HOST_CPU && "
-    "moe_type_needs_direct_kernel(operand.recipe().request.type);",
-)
+# The predicate's only uses: the validator's exact check of a host workspace, and the prompt CPU island's refusal.
+IMMUTABLE_HOST_USE = ("if (recipe.kind == moe_batch_executor::HOST_CPU && "
+                      "moe_type_has_immutable_host_recipe(recipe.request.type)) {")
+IMMUTABLE_ISLAND_USE = "if (ggml_sycl::moe_type_has_immutable_host_recipe(type)) { return false; }"
+# The validator checks the direct kernel's recipe by the kernel the recipe names.
+DIRECT_KERNEL_KEY = "if (recipe.kernel == moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS) {"
+# The executor choice's old early return: it refused every Q1_0/NVFP4 device recipe, whatever the capability said.
+CHOOSE_EARLY_RETURN = ("if (operand.recipe().kind != moe_batch_executor::HOST_CPU && "
+                       "moe_type_has_immutable_host_recipe(operand.recipe().request.type)) { "
+                       "out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED; return out; }")
 
 
 def claim_staging_mirrors_serving(sycl: str, batch_hpp: str) -> bool:
-    """llama.cpp-o9uw: the staged-route resolver asks one helper, which admits a supported MMVQ_COMPAT kernel and
-    nothing else, and refuses a type that runs only through its direct kernel. Which types those are is one predicate,
-    the one the recipe validator and the executor choice ask, and neither of those spells the types out. The resolver
-    is the helper's only caller: the ring stages from the library claim alone (W2) and asks no kernel predicate."""
+    """The staged-route resolver asks one helper, which admits a supported MMVQ_COMPAT kernel and nothing else and asks
+    no type: the kernel is the one a resident expert of the slot's (type, layout) runs, so the capability's kernel is
+    the whole answer. The resolver is the helper's only caller: the ring stages from the library claim alone (W2) and
+    asks no kernel predicate. The executor choice asks no type either, so it takes every kernel the capability query
+    answers, Q1_0 and NVFP4 included; the recipe validator keys the direct kernel's exact workspace check by that
+    kernel. One predicate names Q1_0 and NVFP4, for their immutable host recipe, and only the validator's host check
+    and the prompt CPU island ask it; the old direct-kernel predicate and refusal are gone."""
     n = norm(sycl)
     b = norm(batch_hpp)
     cap = body(n, STAGED_CAP_SIG)
+    validate = body(b, VALIDATE_SIG)
+    choose = body(b, CHOOSE_SIG)
     return (n.count(STAGED_CAP_SIG + " {") == 1 and ordered(cap, *STAGED_CAP_STEPS)
             and re.findall(r"moe_route_kernel::(\w+)", cap) == ["MMVQ_COMPAT"]
+            and not re.search(r"\btype\b|GGML_TYPE_", cap)
             and ROUTE_CAP_ASK in body(n, BUILD_SIG)
             and n.count("ggml_sycl_moe_staged_capability_refusal(") == 2
-            and b.count(DIRECT_SIG + " " + DIRECT_BODY) == 1 and all(b.count(use) == 1 for use in DIRECT_USES)
+            and b.count(IMMUTABLE_SIG + " " + IMMUTABLE_BODY) == 1
+            and b.count(IMMUTABLE_CALL) == 2 and validate.count(IMMUTABLE_HOST_USE) == 1
+            and n.count(IMMUTABLE_CALL) == 1 and n.count(IMMUTABLE_ISLAND_USE) == 1
+            and validate.count(DIRECT_KERNEL_KEY) == 1
+            and bool(choose) and not re.search(r"request\.type|moe_type_|CAPABILITY_UNSUPPORTED", choose)
             and not any(t in body(b, sig) for t in ("GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4")
-                        for sig in (VALIDATE_SIG, CHOOSE_SIG)))
+                        for sig in (VALIDATE_SIG, CHOOSE_SIG))
+            and not any(re.search(r"\b(moe_type_needs_direct_kernel|DIRECT_KERNEL)\b", t)
+                        for t in (n, b, norm(PLAN_HPP))))
 
 
 def test_staging_mirrors_serving():
     assert claim_staging_mirrors_serving(SYCL, BATCH_HPP), first_missing(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the capability refusal body is searched in it; the "
-        "direct-kernel helpers are searched in moe-resolved-batch.hpp)",
-        norm(SYCL),
-        STAGED_CAP_SIG + " {", *STAGED_CAP_STEPS, ROUTE_CAP_ASK)
+        "ggml/src/ggml-sycl/ggml-sycl.cpp and moe-resolved-batch.hpp: whole files (the capability refusal body and the "
+        "island's use are searched in the first; the predicate, the validator and the executor choice in the second)",
+        norm(SYCL) + " " + norm(BATCH_HPP),
+        STAGED_CAP_SIG + " {", *STAGED_CAP_STEPS, ROUTE_CAP_ASK, IMMUTABLE_ISLAND_USE, IMMUTABLE_SIG,
+        IMMUTABLE_HOST_USE, DIRECT_KERNEL_KEY)
 
 
 def test_staging_mirrors_serving_mutants():
     c = claim_staging_mirrors_serving
-    # The helper admitting a direct-kernel type.
-    assert not c(mutate(SYCL, STAGED_CAP_STEPS[2], ""), BATCH_HPP)
+    # The helper asking the type again and refusing the two types, as it did before their MMVQ id kernel ran them.
+    assert not c(mutate(mutate(SYCL, STAGED_CAP_STEPS[2],
+                               "if (ggml_sycl::moe_type_has_immutable_host_recipe(type)) { "
+                               "return ggml_sycl::moe_staged_route_refusal::KERNEL; } " + STAGED_CAP_STEPS[2]),
+                        STAGED_CAP_SIG, STAGED_CAP_SIG[:-1] + ", ggml_type type)"), BATCH_HPP)
     # The helper admitting another kernel.
     assert not c(mutate(SYCL, "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) {",
                         "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT && "
                         "cap.kernel != moe_route_kernel::XMX_TILED) {"), BATCH_HPP)
     # The resolver asking a test of its own.
     assert not c(mutate(SYCL, ROUTE_CAP_ASK, "moe_staged_route_refusal::NONE;"), BATCH_HPP)
-    # The validator spelling the types out again, so the two answers can drift.
-    assert not c(SYCL, mutate(BATCH_HPP, DIRECT_USES[1],
-                              "const bool direct_q1_nvfp4 = recipe.request.type == GGML_TYPE_Q1_0 || "
-                              "recipe.request.type == GGML_TYPE_NVFP4;"))
-    # The executor choice spelling the types out again.
-    assert not c(SYCL, mutate(BATCH_HPP, DIRECT_USES[2],
-                              "operand.recipe().kind != moe_batch_executor::HOST_CPU && "
-                              "operand.recipe().request.type == GGML_TYPE_NVFP4;"))
     # A second caller of the helper beside the resolver (a kernel predicate asking it again).
     assert not c(mutate(SYCL, ROUTE_CAP_ASK, ROUTE_CAP_ASK + " (void) " + ROUTE_CAP_ASK), BATCH_HPP)
+    # The executor choice restoring its early return: Q1_0/NVFP4 device recipes refused whatever the capability said.
+    assert not c(SYCL, mutate(BATCH_HPP, "moe_batch_executor_choice out;",
+                              "moe_batch_executor_choice out; " + CHOOSE_EARLY_RETURN))
+    # The executor choice spelling the types out instead.
+    assert not c(SYCL, mutate(BATCH_HPP, "moe_batch_executor_choice out;",
+                              "moe_batch_executor_choice out; if (operand.recipe().request.type == GGML_TYPE_NVFP4) "
+                              "{ return out; }"))
+    # The validator keying the direct kernel's check by type again, so an MMVQ_COMPAT recipe for them is refused.
+    assert not c(SYCL, mutate(BATCH_HPP, DIRECT_KERNEL_KEY,
+                              "if (moe_type_has_immutable_host_recipe(recipe.request.type)) {"))
+    # The validator spelling the types out again, so the two answers can drift.
+    assert not c(SYCL, mutate(BATCH_HPP, IMMUTABLE_HOST_USE,
+                              "if (recipe.kind == moe_batch_executor::HOST_CPU && (recipe.request.type == "
+                              "GGML_TYPE_Q1_0 || recipe.request.type == GGML_TYPE_NVFP4)) {"))
+    # The island spelling the types out instead of asking the predicate.
+    assert not c(mutate(SYCL, IMMUTABLE_ISLAND_USE,
+                        "if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4) { return false; }"), BATCH_HPP)
     # The predicate losing one of its types.
-    assert not c(SYCL, mutate(BATCH_HPP, DIRECT_BODY, "{ return type == GGML_TYPE_Q1_0; }"))
+    assert not c(SYCL, mutate(BATCH_HPP, IMMUTABLE_BODY, "{ return type == GGML_TYPE_Q1_0; }"))
+    # The old predicate's name coming back.
+    assert not c(SYCL, mutate(BATCH_HPP, IMMUTABLE_SIG, IMMUTABLE_SIG + " { return false; } inline bool "
+                              "moe_type_needs_direct_kernel(ggml_type type)"))
 
 
 LIBRARY_CLAIMS_SIG = ("static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, "

@@ -257,6 +257,9 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained decode executor refused route\")",
         "main executor failure propagates":
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained hybrid executor refused route\")",
+        # A Q1_0/NVFP4 AOS operand whose batched dispatch returns false ends the op, never the process.
+        "Q1/NVFP4 batched dispatch refusal":
+            "throw ggml_sycl_fallback_error(\"MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand returned false\")",
         "ready guard suppresses exceptional publish":
             "std::uncaught_exceptions() != uncaught_on_entry",
         "ID admission failure propagates":
@@ -273,10 +276,10 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "decode GPU fast gate": "if (ne12 != 1) { if (!pp_cpu_reference_force_router",
         "decode precomputed gate": "src1 && src1->ne[2] != 1 && ggml_sycl_moe_precomputed_skip_contains",
         # Deliberately unconditional and type-blind; see the comment on the gate
-        # itself in ggml-sycl.cpp. A type carve-out here was tried and withdrawn
-        # (llama.cpp-t98c): it steers decode into the prompt-only else-branch,
-        # which resolves no route and reports a worse error than the honest
-        # capability refusal it was trying to avoid.
+        # itself in ggml-sycl.cpp. A type carve-out here was tried and withdrawn:
+        # it steers decode into the prompt-only else-branch, which resolves no
+        # route and reports a worse error than the retained partition's own
+        # refusal for an operand it cannot run.
         "all-local decode retained gate": "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route",
         "CPU-TG retains selected routing semantics":
             "const bool cpu_expert_tg_active = selected_hybrid_route && !prompt_batch",
@@ -537,6 +540,36 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
                       "mem_handle::from_chunk_ptr(", "mem_handle::from_direct("):
         if has_tokens(production, forbidden):
             failures.append(f"ownership bridge: {forbidden}")
+
+    # The executor choice asks no type: it takes the kernel the capability query answered, Q1_0 and NVFP4 included,
+    # and the recipe validator checks the direct kernel's exact workspace by that kernel.
+    choose = function_definition(header, "inline moe_batch_executor_choice choose_moe_batch_executor(")
+    for forbidden in ("CAPABILITY_UNSUPPORTED", "request.type", "moe_type_has_immutable_host_recipe(",
+                      "GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4"):
+        if has_tokens(choose, forbidden):
+            failures.append(f"executor choice refuses a type the capability admitted: {forbidden}")
+    validate = function_definition(header, "inline bool validate_moe_execution_recipe(")
+    if not has_tokens(validate, "if (recipe.kernel == moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS) {"):
+        failures.append("direct recipe workspace check keyed by its kernel")
+
+    # A Q1_0/NVFP4 AOS operand whose batched dispatch returns false: one WARN naming the tensor, the layout and the
+    # pointer table, then a named refusal that ends the op. No abort on that path, and the old abort text is gone.
+    refusal_guard = "if (!batched_ok && direct_q1_nvfp4_aos)"
+    if refusal_guard not in source:
+        failures.append("Q1/NVFP4 batched dispatch refusal block")
+    else:
+        block = tokens(function_definition(source, refusal_guard))
+        warn = '"[MOE-ROUTE] Q1_0/NVFP4 AOS batched dispatch returned false: tensor=%s layout=%s entries=%zu ptr_table=%s'
+        throw = 'throw ggml_sycl_fallback_error("MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand returned false")'
+        if "GGML_ABORT" in block or "abort" in block:
+            failures.append("Q1/NVFP4 batched dispatch refusal aborts the process")
+        if not contains_tokens(block, "GGML_LOG_WARN(" + warn) or not contains_tokens(
+                block, 'expert_ptrs_dev ? "present" : "missing"'):
+            failures.append("Q1/NVFP4 batched dispatch refusal WARN names the tensor, layout and pointer table")
+        elif not contains_tokens(block, throw) or token_sequence_index(block, warn) > token_sequence_index(block, throw):
+            failures.append("Q1/NVFP4 batched dispatch refusal throws after its WARN")
+    if has_tokens(source, "direct recipe failed before submit"):
+        failures.append("Q1/NVFP4 batched dispatch abort text remains")
     return failures
 
 
@@ -650,7 +683,7 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
 def test_refusal_behavior_never_publishes_ready_or_reports_success() -> None:
     # Behavioral model of the production exception chain: MMID ready guard
     # observes unwinding, compute_forward rethrows, and graph boundary fails.
-    for refusal in ("batch_rejected", "wrong_queue", "q1_capability", "nvfp4_capability",
+    for refusal in ("batch_rejected", "wrong_queue", "q1_nvfp4_batched_dispatch_false",
                     "planned_pointer_table_missing"):
         published = False
         graph_success = True
@@ -772,6 +805,34 @@ def test_contract_and_mutation_witnesses() -> None:
          host_test, mem_source),
         ("enable-Q1-device-route", header,
          source.replace("if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4)", "if (false)", 1),
+         host_test, mem_source),
+        # The executor choice's early return restored: every Q1_0/NVFP4 device recipe refused whatever the
+        # capability query answered, so supports_op, the capability and the choice give three answers again.
+        ("restore-chooser-early-return",
+         header.replace("    moe_batch_executor_choice out;\n",
+                        "    moe_batch_executor_choice out;\n"
+                        "    if (operand.recipe().kind != moe_batch_executor::HOST_CPU &&\n"
+                        "        moe_type_has_immutable_host_recipe(operand.recipe().request.type)) {\n"
+                        "        out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;\n"
+                        "        return out;\n"
+                        "    }\n", 1),
+         source, host_test, mem_source),
+        ("validator-keys-direct-check-by-type",
+         header.replace("if (recipe.kernel == moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS) {",
+                        "if (moe_type_has_immutable_host_recipe(recipe.request.type)) {", 1),
+         source, host_test, mem_source),
+        ("restore-q1-nvfp4-dispatch-abort", header,
+         re.sub(r'throw\s+ggml_sycl_fallback_error\(\s*"MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand '
+                r'returned false"\);',
+                'GGML_ABORT("[MOE-ROUTE] admitted primary Q1/NVFP4 direct recipe failed before submit");', source),
+         host_test, mem_source),
+        ("abort-before-q1-nvfp4-refusal", header,
+         re.sub(r'(throw\s+ggml_sycl_fallback_error\(\s*"MUL_MAT_ID batched dispatch for a Q1_0/NVFP4)',
+                r'GGML_ABORT("dispatch returned false"); \1', source),
+         host_test, mem_source),
+        ("q1-nvfp4-refusal-warn-unnamed", header,
+         source.replace('"[MOE-ROUTE] Q1_0/NVFP4 AOS batched dispatch returned false: tensor=%s layout=%s "',
+                        '"[MOE-ROUTE] Q1_0/NVFP4 AOS batched dispatch returned false "', 1),
          host_test, mem_source),
         ("refusal-return", header,
          source.replace("throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained", "return; // MUL_MAT_ID retained"),

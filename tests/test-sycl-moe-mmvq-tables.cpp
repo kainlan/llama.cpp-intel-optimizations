@@ -525,7 +525,7 @@ int main() {
     for (const ggml_type type : pp_never_types) {
         for (const ggml_layout_mode layout : all_layouts()) {
             if (moe_pp_batched_supports_layout(type, layout, true, true)) {
-                std::printf("FAIL: batched executor admits type=%s layout=%d, a direct-kernel or float type\n",
+                std::printf("FAIL: batched executor admits type=%s layout=%d, a type its dequant test does not run\n",
                             ggml_type_name(type), static_cast<int>(layout));
                 ++failures;
             }
