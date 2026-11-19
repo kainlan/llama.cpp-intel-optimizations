@@ -46,6 +46,48 @@ class alloc_owner_control;
 class allocation_release_coordinator;
 struct release_attempt;
 
+// Where a lease on a VRAM arena chunk was taken. A chunk lease keeps the arena from being destroyed, so an arena
+// rebuild that finds leases has to say who holds them: the cache counts the leases on its chunks by this site, and a
+// mem_handle keeps the site it acquired with, so its release lowers the count its acquire raised.
+enum class chunk_lease_site : uint8_t {
+    UNTAGGED,         // a caller of the cache's lease API that names no site (the device tests' probes)
+    WEIGHT_SNAPSHOT,  // a WEIGHT handle minted from a lease snapshot
+    WEIGHT_RESOLVE,   // a WEIGHT handle's resolve, which pins the chunk its pointer lies in
+    CHUNK_VIEW,       // a handle made from a raw pointer for one use (from_chunk_ptr's default)
+    TENSOR_EXTRA,     // a handle a tensor extra keeps for its data on a device
+    EXPERT_DISPATCH,  // the lease an expert dispatch entry keeps for its raw pointer
+    COUNT,
+};
+
+// The site a lease was taken at, and whether a copy of a handle took it. A copy acquires a lease of its own and keeps
+// its source's site, so copies count apart from the handles they copy and the counts by site and copy sum to the
+// chunks' leases.
+struct chunk_lease_tag {
+    chunk_lease_site site = chunk_lease_site::UNTAGGED;
+    bool             copy = false;
+};
+
+// The site's name in the lines that print the counts.
+inline const char * chunk_lease_site_name(chunk_lease_site site) {
+    switch (site) {
+        case chunk_lease_site::UNTAGGED:
+            return "untagged";
+        case chunk_lease_site::WEIGHT_SNAPSHOT:
+            return "weight_snapshot";
+        case chunk_lease_site::WEIGHT_RESOLVE:
+            return "weight_resolve";
+        case chunk_lease_site::CHUNK_VIEW:
+            return "chunk_view";
+        case chunk_lease_site::TENSOR_EXTRA:
+            return "tensor_extra";
+        case chunk_lease_site::EXPERT_DISPATCH:
+            return "expert_dispatch";
+        case chunk_lease_site::COUNT:
+            break;
+    }
+    return "unknown";
+}
+
 // Move-only allocation owner returned by unified_allocate_owner().  Its
 // intrusive control is the sole physical-release authority.
 class alloc_owner {
@@ -449,10 +491,15 @@ class mem_handle {
     // Callers MUST keep the returned handle alive across any use of `ptr`
     // that survives into another thread / queue submit / future.  The
     // destructor releases the chunk lease exactly once.
+    //
+    // `site` names what keeps the handle; a VRAM chunk lease is counted under it
+    // (chunk_lease_site), so a caller that stores the handle past one use names
+    // itself and the arena's lease counts can say who holds the arena.
     static mem_handle from_chunk_ptr(void *           ptr,
                                      int              device,
                                      ggml_layout_mode layout    = GGML_LAYOUT_AOS,
-                                     bool             on_device = false);
+                                     bool             on_device = false,
+                                     chunk_lease_site site      = chunk_lease_site::CHUNK_VIEW);
 
     // Create an owning DIRECT handle from an allocation-time handle.  Copies of
     // the mem_handle share ownership; the underlying allocation is released via
@@ -674,6 +721,7 @@ class mem_handle {
     struct lease_state {
         unified_cache_entry * entry             = nullptr;
         uint8_t               chunk_source      = 0;
+        chunk_lease_tag       chunk_tag;
         uint64_t              host_chunk_handle = UINT64_MAX;
         int32_t               vram_chunk_idx    = -1;
         int                   chunk_device      = -1;
@@ -705,7 +753,8 @@ class mem_handle {
     resolved_ptr resolved_view_locked() const;
 
     // Guards the mutable resolve state below (cached_, gen_, leased_entry_,
-    // chunk_source_, host_chunk_handle_, vram_chunk_idx_, chunk_device_).
+    // chunk_source_, host_chunk_handle_, vram_chunk_idx_, chunk_device_,
+    // chunk_tag_).
     // The immutable-after-construction fields are not covered: reassigning or
     // destroying a handle that another thread is resolving is out of contract
     // and no production path does it.
@@ -799,6 +848,11 @@ class mem_handle {
     mutable uint64_t host_chunk_handle_ = UINT64_MAX;  // GUARDED (pinned_chunk_pool::INVALID_CHUNK_HANDLE)
     mutable int32_t  vram_chunk_idx_    = -1;          // GUARDED by lock_
     mutable int32_t  chunk_device_      = -1;          // GUARDED by lock_
+
+    // The site a VRAM chunk lease was taken at (chunk_source_ == 2), carried to
+    // its release so the arena's count by site falls where it rose. A
+    // diagnostic only: never part of the handle's identity, hash or equality.
+    mutable chunk_lease_tag chunk_tag_;  // GUARDED by lock_
 
     const char * debug_owner_tag_ = "";
 };

@@ -3218,6 +3218,92 @@ size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id);
 // silently becoming a smaller RUNTIME zone.
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out);
 
+// The terms the placement planners publish for a device while they compute a plan (populate_host_zone_sizing() and
+// publish_moe_host_scatter_term()): the MoE CONTROL requirement and the MoE host scatter scratch, both in the RUNTIME
+// zone's requirement, and the oneDNN Graph and non-FA attention scratch shapes, which floor zones the same ensure
+// sizes. A plan that is computed and then discarded publishes nothing, so a caller that may discard one takes this
+// snapshot before it plans and restores it when it does. Each setter stores what its getter reads, so the restore is
+// exact. A term the planners start to publish is added here, not at a caller. It lives beside the getters and setters
+// it calls, so a test that links the cache without the backend checks the restore against the cache's own state.
+struct planner_published_terms {
+    onednn_graph_scratch_planned_shape graph{};
+    nonfa_attn_scratch_planned_shape   nonfa{};
+    moe_control_requirement            control{};
+    size_t                             scatter = 0;
+
+    static planner_published_terms snapshot(int device);
+    void                           restore(int device) const;
+};
+
+// The device-wide terms a model load publishes for a device as it plans, with the planners' (planner): the PP pipeline
+// scratch; the PP MoE oneDNN ring's slots and depth, which of its slots the KV zone holds, and the row bytes, expert
+// counts and micro-batch it is re-planned from; and the oneDNN scratchpad pair with its stored sum, which the pair's
+// reserve raises on its own. Each model on the device plans with these, and every load overwrites them, so a load that
+// fails puts back what it published (load_published_record). The terms keyed by the load's owner are not here (they
+// leave with their owner, unified_cache_drop_planned_load_terms), nor is the compute term's micro-batch, which is
+// sticky by design and which every load records at the same planning value. Each setter stores what its getter reads,
+// so a restore is exact. The terms fall in groups (load_published_group), each the terms one publisher writes together,
+// and a restore puts back whole groups, so no group holds part of one publisher's terms and part of another's.
+enum load_published_group : uint32_t {
+    LOAD_PUBLISHED_GROUP_PIPELINE    = 1u << 0,  // the PP pipeline scratch
+    LOAD_PUBLISHED_GROUP_RING        = 1u << 1,  // the ring's slots and depth, its KV-zone slots and its micro-batch
+    LOAD_PUBLISHED_GROUP_RING_ROWS   = 1u << 2,  // the row bytes and expert counts the ring is re-planned from
+    LOAD_PUBLISHED_GROUP_ONEDNN_PAIR = 1u << 3,  // the oneDNN scratchpad pair's two halves
+    LOAD_PUBLISHED_GROUP_ONEDNN_SUM  = 1u << 4,  // the pair's stored sum
+    LOAD_PUBLISHED_GROUP_GRAPH       = 1u << 5,  // the planners' oneDNN Graph scratch shape
+    LOAD_PUBLISHED_GROUP_NONFA       = 1u << 6,  // the planners' non-FA attention scratch shape
+    LOAD_PUBLISHED_GROUP_CONTROL     = 1u << 7,  // the planners' MoE CONTROL requirement
+    LOAD_PUBLISHED_GROUP_SCATTER     = 1u << 8,  // the planners' MoE host scatter scratch
+    LOAD_PUBLISHED_GROUP_ALL         = (1u << 9) - 1,
+};
+
+struct load_published_terms {
+    size_t                  pp_pipeline           = 0;
+    size_t                  ring_weight           = 0;
+    size_t                  ring_activation       = 0;
+    size_t                  ring_output           = 0;
+    uint32_t                ring_depth            = 0;
+    bool                    ring_activation_in_kv = false;
+    bool                    ring_output_in_kv     = false;
+    size_t                  ring_activation_row   = 0;
+    size_t                  ring_output_row       = 0;
+    uint32_t                ring_n_expert         = 0;
+    uint32_t                ring_n_expert_used    = 0;
+    uint32_t                ring_n_ubatch         = 0;
+    size_t                  onednn_weights        = 0;
+    size_t                  onednn_activations    = 0;
+    size_t                  onednn_stored         = 0;
+    planner_published_terms planner{};
+
+    static load_published_terms snapshot(int device);
+    // The groups whose terms differ between this and `other`.
+    uint32_t                    differing(const load_published_terms & other) const;
+    // Takes the terms of `groups` from `from`. Not named copy: a `.copy(` member call reads as a queue shortcut to the
+    // window-path launch census.
+    void                        take_groups(const load_published_terms & from, uint32_t groups);
+};
+
+// One device's terms for one load transaction, kept so that a load that fails puts back what it published and nothing
+// another publisher wrote since. A runtime context transaction of a live model publishes some of the same terms while
+// the load runs (the ring when its micro-batch moves, the non-FA attention shape), and the oneDNN pair's reserve raises
+// the stored sum. `prior` is what each group held before this load wrote it, or what another publisher left in it
+// since; `written` is what each group held when this load last looked. note() takes one planner pass of the load: the
+// terms when it started and when it ended, both read under the inventory lock that every publisher but the reserve
+// holds, so only the pass wrote between them. restore() puts a group back only while it still holds `written`, and the
+// sum by compare-exchange, so a raise outside that lock is kept. A publisher that writes exactly what the load
+// published cannot be told from the load, and its group goes back with the load's.
+struct load_published_record {
+    load_published_terms prior{};
+    load_published_terms written{};
+
+    load_published_record() = default;
+
+    explicit load_published_record(const load_published_terms & now) : prior(now), written(now) {}
+
+    void note(const load_published_terms & before, const load_published_terms & after);
+    void restore(int device) const noexcept;
+};
+
 // The RUNTIME zone's floor: 512 MiB, or GGML_SYCL_RUNTIME_ARENA_MB when it is set. ensure_planned_arena_zones()
 // reserves at least this, and an explicit micro-batch's room is measured against the same floor.
 size_t unified_cache_runtime_zone_floor_bytes();
@@ -4885,8 +4971,13 @@ class unified_cache {
     // Ensure the VRAM arena's fixed zones match the latest planner inputs.
     // If an early arena exists but has no live zone allocations or chunk
     // leases, it may be rebuilt with larger planned zones. Live arenas are
-    // never force-reset or force-freed.
-    bool ensure_planned_arena_zones();
+    // never force-reset or force-freed. False when the zones cannot be sized:
+    // when `refusal` is given it is written with the reason and each zone's
+    // need (the sizes this call decided on) and have (the arena's zones).
+    // A rebuild whose teardown refuses is refused too, and no arena is
+    // reserved after it; while a refused teardown has left the arena closed,
+    // every call refuses for it, whatever the zones hold.
+    bool ensure_planned_arena_zones(zone_arena_refusal * refusal = nullptr);
 
     // Is arena active?
     bool arena_active() const { return zone_backed(); }
@@ -4959,11 +5050,18 @@ class unified_cache {
     //
     // Returns -1 when the pointer is not owned by the arena (safe no-op on
     // release).  Otherwise returns the chunk index (0..N-1).
+    //
+    // Each lease is also counted by the tag it was taken with, and its release
+    // names the same tag, so the counts by tag sum to the chunks' leases and an
+    // arena rebuild refused for leases can say who holds them. The count is one
+    // relaxed atomic add on each side and takes no lock: the lease paths are
+    // per-resolve hot paths and the count is read only for a diagnostic.
     int      arena_find_chunk(const void * ptr) const;
-    int      arena_acquire_chunk_lease(const void * ptr);
-    void     arena_release_chunk_lease(int chunk_idx);
+    int      arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag tag = chunk_lease_tag());
+    void     arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag = chunk_lease_tag());
     bool     arena_chunk_has_leases(int chunk_idx) const;
     uint32_t arena_chunk_lease_count(int chunk_idx) const;
+    uint32_t arena_chunk_lease_count_at(chunk_lease_tag tag) const;
 
     // Host pinned-pool chunk lease API (dyhdl) — routes through host_arena_.
     // Returns pinned_chunk_pool::INVALID_CHUNK_HANDLE (UINT64_MAX) on miss.
@@ -4973,8 +5071,15 @@ class unified_cache {
     // last lease releases the chunk through release_marked_chunk(), which allocates nothing.
     void     host_release_chunk_lease(uint64_t handle) noexcept;
 
-    // Destroy arena (free all chunks).
+    // Destroy arena (free all chunks). A refusal records its cause, which arena_teardown_refusal() reads.
     bool arena_destroy();
+
+    // Why the last teardown of this cache's arena refused: NONE when none refused since the last one completed. A cause
+    // zone_arena_teardown_left_closed() names left the arena closed to new allocations, and no arena may be reserved
+    // over it.
+    zone_arena_teardown_refusal arena_teardown_refusal() const {
+        return arena_teardown_refusal_.load(std::memory_order_acquire);
+    }
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
     void       test_zone_boundary_check(vram_zone_id zone) { zone_boundary_check(zone); }
     mem_handle test_scratch_pool_owner() const;
@@ -6172,6 +6277,26 @@ class unified_cache {
     std::vector<arena_chunk> arena_chunks_;
     sycl::queue *            arena_queue_ = nullptr;
 
+    // The leases on all chunks by the site that took them (chunk_lease_site) and whether a handle copy took them
+    // (second index 1). Moved only beside a chunk's lease_count, so the cells sum to the chunks' leases up to a lease
+    // in flight between the two adds. Relaxed: read only by the rebuild refusal's diagnostic, never to synchronize.
+    mutable std::atomic<uint32_t> arena_chunk_leases_by_site_[static_cast<size_t>(chunk_lease_site::COUNT)][2] = {};
+
+    // The cell a lease of `tag` moves. A site out of range counts as UNTAGGED, so a corrupt tag cannot index past the
+    // array.
+    std::atomic<uint32_t> & arena_chunk_leases_of(chunk_lease_tag tag) const {
+        const size_t site = static_cast<size_t>(tag.site);
+        return arena_chunk_leases_by_site_[site < static_cast<size_t>(chunk_lease_site::COUNT) ? site : 0]
+                                          [tag.copy ? 1 : 0];
+    }
+
+    // Adds the cache's scratch buffers to `holders`: those whose pointer the arena owns, which keep it from a
+    // rebuild, and those allocated outside it, which do not; of the first, the PP MoE ring's slot buffers; and the
+    // allocations live in the zones other than those slot buffers, read from each allocator group's own record of its
+    // allocations. Takes the PP MoE ring's lock, the persistent scratch lock, then each allocator group's lock, each
+    // alone.
+    void arena_count_scratch_holders(zone_arena_holders & holders);
+
     // Per-physical-chunk TLSF allocators for the WEIGHT zone in N-chunk mode.
     // A weight tensor must not span a chunk boundary (each chunk is its own
     // sycl::malloc_device USM allocation), so we use one TLSF allocator per
@@ -6217,6 +6342,9 @@ class unified_cache {
     std::mutex arena_destroy_mutex_;  // serializes retryable explicit destroy transactions
     static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
+    // Written by arena_destroy() under arena_destroy_mutex_ on each refusal and cleared when a teardown completes; read
+    // without that lock.
+    std::atomic<zone_arena_teardown_refusal> arena_teardown_refusal_{ zone_arena_teardown_refusal::NONE };
     // A copy of the allocators KV is carved from (kv_zone_model), and where
     // each of `ptrs` sits in it when `blocks` is given.
     kv_zone_model kv_zone_snapshot(const std::vector<const void *> & ptrs, std::vector<kv_zone_block> * blocks);
@@ -9014,7 +9142,8 @@ bool unified_cache_copy_from_host_async(int                              device_
 // Reserve the compute arena (pre-reserved VRAM for compute scratch).
 // Must be called BEFORE S1-PRELOAD to guarantee VRAM availability.
 bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes);
-bool unified_cache_ensure_planned_arena_zones(int device_id);
+// unified_cache::ensure_planned_arena_zones() on the device's cache; a device with no cache is a NO_CACHE refusal.
+bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal * refusal = nullptr);
 
 #if GGML_SYCL_DNNL
 // llama.cpp-0oxf: external entry point for reclaiming (real release) every

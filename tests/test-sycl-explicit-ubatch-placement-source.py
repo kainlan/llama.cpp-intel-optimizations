@@ -88,7 +88,7 @@ def struct_text(text: str, head: str) -> str:
 
 
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
-STORE_SIG = "static void compute_and_store_plan_for_inventory("
+STORE_SIG = "static bool compute_and_store_plan_for_inventory("
 PLANNER_SIG = "placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,"
 DECIDE_SIG = "pp_moe_onednn_explicit_ubatch_decision pp_moe_onednn_explicit_ubatch_decide("
 POPULATE_SIG = "static void llama_model_sycl_populate_inventory("
@@ -259,9 +259,12 @@ DEMAND_READER = "{ return zone_hold_fit_terms_at(in, n_ubatch).demand; }"
 
 # A RUNTIME zone an earlier load grew: one WARN after the late plan, gated by the predicate on the zone the plan sizes.
 SET_INV_SIG = ("static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl("
-               "ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory)")
-LATE_PLAN = ("compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct); "
-             "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device);")
+               "ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory, bool * plan_refused, "
+               "ggml_sycl_inventory_effects & effects)")
+# The late plan, which returns before the WARN when the arena's zones cannot hold it.
+LATE_REFUSE = ("if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) { "
+               "if (plan_refused != nullptr) { *plan_refused = true; } return {}; }")
+LATE_PLAN = LATE_REFUSE + " ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device);"
 KEPT_SIG = "static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device)"
 KEPT_READS = ("if (cache == nullptr || !cache->arena_active() || "
               "!ggml_sycl::unified_cache_get_planned_runtime_zone_requirement(device, &requirement)) { return; }")
@@ -287,7 +290,7 @@ RESERVED_RULE = ("const size_t planned = requirement > floor_bytes ? requirement
                  "*out = (planned + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1); return true;")
 ARENA_RESERVE_SIG = "bool unified_cache::arena_reserve(sycl::queue & queue,"
 ARENA_RESERVE_CALL = "if (!zone_runtime_reserved_bytes(0, runtime_bytes, &runtime_bytes)) {"
-ENSURE_SIG = "bool unified_cache::ensure_planned_arena_zones()"
+ENSURE_SIG = "bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal)"
 ENSURE_CALL = ("if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch) || "
                "!zone_runtime_reserved_bytes(runtime_floor, planned_runtime_scratch, &runtime_zone)) {")
 ROOM_ZONE_SIG = "static bool pp_moe_onednn_runtime_zone_bytes(const pp_moe_onednn_explicit_ubatch_inputs & in,"
@@ -1229,17 +1232,19 @@ def test_mutant_grown_zone_warn_at_info_fails():
 def test_mutant_grown_zone_warn_before_the_plan_fails():
     """Asked before the late plan, the requirement is the previous stage's, not this plan's."""
     assert not claim_grown_zone_is_announced(
-        _once(SYCL_CPP, LATE_PLAN, "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); "
-                                   "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);"), ZONE_CPP)
+        _once(SYCL_CPP, LATE_PLAN, "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); " + LATE_REFUSE),
+        ZONE_CPP)
 
 
 def test_mutant_grown_zone_warn_from_the_early_plan_too_fails():
     """Asked from the early plan as well, one load prints it twice."""
     early = ("compute_vram_budget_for_plan(ctx, vram_budget, budget_pct, base_mem, free_mem); "
-             "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct); }")
+             "if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) { "
+             "if (plan_refused != nullptr) { *plan_refused = true; } return -1; } return ctx->device; }")
     n = norm(SYCL_CPP)
     assert n.count(early) == 1
-    n = n.replace(early, early[:-1] + "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); }", 1)
+    n = n.replace(early, early[:-len("return ctx->device; }")] +
+                  "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); return ctx->device; }", 1)
     assert not claim_grown_zone_is_announced(n, ZONE_CPP)
 
 

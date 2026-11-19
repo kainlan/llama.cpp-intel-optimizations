@@ -141,6 +141,20 @@ inline std::string host_headroom_refusal_reason(bool exhausted, size_t available
     return buf;
 }
 
+// Whether a pinned host allocation of `size` bytes can exist on a host with `physical` bytes of RAM. One larger than
+// the RAM never can, so refusing it loses nothing. The driver does not always fail such a request: at 1 PiB its memory
+// manager aborted the process, and no catch reaches an abort. The raw host exit asks this first and fails the
+// allocation instead. An unknown RAM size (0) bounds nothing.
+inline bool host_pinned_size_possible(size_t size, size_t physical) {
+#if defined(HOST_BUDGET_MUTANT_PINNED_UNBOUNDED)
+    (void) size;
+    (void) physical;
+    return true;
+#else
+    return physical == 0 || size <= physical;
+#endif
+}
+
 // The resident working set (§4.5): resident_room = MemAvailable_pre - expected_host - headroom, the headroom the
 // budget's sample left (host_budget_compute: host_headroom(MemTotal), or min(8 GiB, MemAvailable/4) when MemTotal is
 // unread), and mapped_ws, the host-executed mapped bytes the kernel may drop. exceeds is the WARN; a mapped overflow

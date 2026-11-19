@@ -498,6 +498,100 @@ inline bool zone_runtime_reserved_bytes(size_t floor_bytes, size_t requirement, 
 // rounding overflows.
 bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement);
 
+// The RUNTIME zone's planned terms, as unified_cache_get_planned_runtime_zone_requirement() reads them for the zone
+// ensure_planned_arena_zones() sizes. Each is the term as published now, so the requirement follows whatever was
+// published last: a term left behind by a plan that was then discarded is still asked for.
+struct zone_runtime_terms {
+    size_t base             = 0;  // PP pipeline scratch + the ring's RUNTIME part + MoE CONTROL, checked as one sum
+    size_t moe_host_scatter = 0;  // the host-expert MoE scatter scratch, published by the placement plan
+    size_t mmq_src1         = 0;  // the dense MMQ/MMVQ Q8_1 src1 buffer
+    size_t dequant_f16      = 0;  // the dense f16 dequant buffer
+    size_t compute          = 0;  // the compute buffer the load measured
+    size_t state            = 0;  // the context memory the load measured on the plain buffer type
+};
+
+// The RUNTIME zone's requirement: the sum of `terms`. False, with *out unwritten, when the sum would wrap or `out` is
+// null: a wrapped sum would size a smaller zone instead of refusing one.
+bool zone_runtime_requirement(const zone_runtime_terms & terms, size_t * out);
+
+// What points into a VRAM arena that a plan wants larger. The arena grows only by being destroyed and reserved again,
+// which moves every byte in it, so each of these keeps it as it is. The last four are not holders: they count the
+// cache's own releases still to run, whose bytes the zones still count as allocated with no owner left, so the remedy
+// can tell those bytes from a model's or a context's. No gate reads them.
+struct zone_arena_holders {
+    size_t   live_zone_bytes  = 0;  // bytes the zones count as allocated
+    uint32_t chunk_leases     = 0;  // leases handles hold on the arena's chunks
+    uint32_t scratch_in_arena = 0;  // the cache's scratch buffers whose pointer lies inside the arena
+    uint32_t scratch_outside  = 0;  // the cache's scratch buffers allocated outside it, printed and never a holder
+    uint32_t ring_in_arena    = 0;  // of scratch_in_arena, the PP MoE ring's slot buffers (current and retired slots)
+    uint32_t live_beside_ring = 0;  // allocations live in the zones other than the ring's slot buffers
+    size_t   queued_frees     = 0;  // frees queued in the arena and not yet run
+    size_t   release_retries  = 0;  // the device's releases refused once and waiting for a retry
+    size_t   retired_pending  = 0;  // the cache's retired entries not yet finalized
+    size_t   evictions        = 0;  // the cache's evictions still in flight
+};
+
+// Whether the arena may be rebuilt for larger zones: only when nothing points into it. A scratch buffer allocated
+// outside the arena keeps its own memory through a rebuild, so it does not refuse one; a buffer inside it does.
+bool zone_arena_rebuild_allowed(const zone_arena_holders & holders);
+
+// Whether the PP MoE ring's slot buffers are all that keeps the arena from a rebuild it needs: a rebuild is needed, a
+// slot buffer of the ring lies inside the arena, and nothing else holds it (no other allocation live in its zones, no
+// lease on its chunks, no other cache scratch buffer inside it). Only then may a load release the ring to rebuild.
+bool zone_arena_only_ring_holds(bool rebuild_needed, const zone_arena_holders & holders);
+
+// Why the arena's planned zones could not be sized.
+enum class zone_arena_refusal_reason {
+    NONE,              // they were sized
+    REBUILD_HELD,      // a zone must grow and something points into the arena, so it cannot be rebuilt
+    RESERVE_FAILED,    // the device could not reserve an arena with the planned zones
+    NO_CACHE,          // the device has no unified cache to size them in
+    TEARDOWN_REFUSED,  // the arena could not be torn down, by this call's rebuild or by an earlier one
+};
+
+// Why a teardown of the VRAM arena refused, as the teardown records it. Every cause but HOST_STATE is found after the
+// teardown closed the arena to new allocations, and it stays closed until a later teardown completes.
+enum class zone_arena_teardown_refusal {
+    NONE,              // no teardown was refused
+    HOST_STATE,        // the host could not reserve the teardown's own bookkeeping; the arena is as it was
+    LIVE_ALLOCATIONS,  // allocations were still live in the arena when the teardown closed it
+    DRAIN_SNAPSHOT,    // the host could not record the allocations the teardown waits on
+    DRAIN_TIMEOUT,     // a lease on one of its allocations did not end while the teardown waited
+    FREE_FAILED,       // the device refused to free one of its chunks, after the chunks before it were freed
+};
+
+// Whether a teardown refused for `cause` left the arena closed to new allocations.
+bool zone_arena_teardown_left_closed(zone_arena_teardown_refusal cause);
+
+// The three zones a plan sizes, in bytes.
+struct zone_arena_sizes {
+    size_t scratch = 0;
+    size_t onednn  = 0;
+    size_t runtime = 0;
+};
+
+// A refusal to size the arena's planned zones: the device, the reason, and per zone the bytes the plan needs and the
+// bytes the device's arena has when the decision refuses (have is 0 where no arena exists then). At REBUILD_HELD,
+// holders is what the decision found pointing into the arena, which the line names and chooses its remedy from. At
+// RESERVE_FAILED, released is the zones of the arena a rebuild destroyed before the reserve failed. At
+// TEARDOWN_REFUSED, teardown is why the teardown refused. Each is 0 or NONE otherwise.
+struct zone_arena_refusal {
+    zone_arena_refusal_reason   reason = zone_arena_refusal_reason::NONE;
+    int                         device = -1;
+    zone_arena_sizes            need;
+    zone_arena_sizes            have;
+    zone_arena_holders          holders;
+    zone_arena_sizes            released;
+    zone_arena_teardown_refusal teardown = zone_arena_teardown_refusal::NONE;
+};
+
+// The line a model load refused for `refusal` logs, without a newline: the device, each zone's need and have in MB, the
+// shortfall of each zone that is short (a zone short by under 0.1 MB prints its three figures in KB, or in bytes under
+// 1 KB, so no shortfall prints as nothing), the reason, and what the caller can do. Empty for NONE. The zones are
+// planned at the load's fixed planning shape, not at the context's -c or -ub, so the line never offers a smaller
+// context or micro-batch as the remedy.
+std::string zone_arena_refusal_text(const zone_arena_refusal & refusal);
+
 // The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the
 // hold can be) plus the largest spill-capable RUNTIME request, because a held-back request spills whole. The
 // request was observed at `hwm_n_ubatch`; compute buffers scale about linearly with n_ubatch, so it is scaled to

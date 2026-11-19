@@ -13242,6 +13242,130 @@ static void ggml_sycl_abort_owner_effects_cleanup_stage_maybe_throw() {
 #endif
 }
 
+// The device-wide planned terms of the open load transaction, one record per device. One load transaction is open at a
+// time (the registry refuses a second begin), so one entry serves: a load that fails puts back what it published
+// through ggml_sycl_abort_owner_effects_noexcept, and a load that commits forgets it. The terms carry no owner, and a
+// runtime context transaction of a live model publishes some of them while the load runs. Each planner pass of the load
+// notes what it changed (ggml_sycl_load_published_pass), and the restore puts back only a group that still holds what
+// the load published, so a context's publish since survives the failed load (ggml_sycl::load_published_record).
+// The two-card MoE flag (g_moe_multi_gpu_active) is kept the same way, as one more group: the planner sets it, live
+// models' dispatch reads it, and the next load's planner reads it before it writes it, so a failed load puts it back.
+// Its other writers (the MoE init at a dispatch) do not take the inventory lock, so one that writes during a pass is
+// taken for the load, and its write goes back with the load's.
+struct ggml_sycl_load_published_terms_saved {
+    std::mutex                                    mutex;
+    uint64_t                                      txn = 0;
+    std::vector<ggml_sycl::load_published_record> devices;
+    bool                                          moe_multi_gpu_prior   = false;
+    bool                                          moe_multi_gpu_written = false;
+};
+
+// Allocated once and never destroyed, so an abort during static destruction still finds it.
+static ggml_sycl_load_published_terms_saved & ggml_sycl_load_published_terms_store() {
+    static ggml_sycl_load_published_terms_saved * const saved = new ggml_sycl_load_published_terms_saved;
+    return *saved;
+}
+
+// Captures the device-wide terms for load `txn` unless its earlier pass already did.
+static void ggml_sycl_load_published_terms_capture(uint64_t txn) {
+    ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
+    std::lock_guard<std::mutex>            lock(saved.mutex);
+    if (saved.txn == txn) {
+        return;
+    }
+    const int n = std::max(0, std::min(ggml_backend_sycl_get_device_count(), GGML_SYCL_MAX_DEVICES));
+    saved.devices.clear();
+    for (int d = 0; d < n; ++d) {
+        saved.devices.emplace_back(ggml_sycl::load_published_terms::snapshot(d));
+    }
+    saved.moe_multi_gpu_prior = saved.moe_multi_gpu_written = g_moe_multi_gpu_active.load(std::memory_order_acquire);
+    saved.txn                                               = txn;
+}
+
+// One planner pass of the open load. Its caller constructs it right after it takes g_tensor_inventory_mutex, before the
+// pass publishes anything, so the pass ends under the same lock: it reads the device-wide terms when the pass starts
+// and notes into the load's records what they hold when it ends. Every publisher of those terms but the oneDNN pair's
+// reserve holds that lock, so only this pass wrote the terms between the two reads. The two-card flag's other writers
+// (the MoE init at a dispatch) do not hold it, so a write of theirs between the two reads is noted as the pass's. A
+// pass outside a staged load, or of a load whose entry is gone, notes nothing.
+struct ggml_sycl_load_published_pass {
+    uint64_t                                     txn = 0;
+    std::vector<ggml_sycl::load_published_terms> before;
+    bool                                         moe_multi_gpu_before = false;
+
+    explicit ggml_sycl_load_published_pass(uint64_t load_txn) {
+        ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
+        std::lock_guard<std::mutex>            lock(saved.mutex);
+        if (load_txn == 0 || saved.txn != load_txn) {
+            return;
+        }
+        txn = load_txn;
+        before.reserve(saved.devices.size());
+        for (size_t d = 0; d < saved.devices.size(); ++d) {
+            before.push_back(ggml_sycl::load_published_terms::snapshot(static_cast<int>(d)));
+        }
+        moe_multi_gpu_before = g_moe_multi_gpu_active.load(std::memory_order_acquire);
+    }
+
+    ~ggml_sycl_load_published_pass() {
+        ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
+        std::lock_guard<std::mutex>            lock(saved.mutex);
+        if (txn == 0 || saved.txn != txn) {
+            return;
+        }
+        for (size_t d = 0; d < saved.devices.size() && d < before.size(); ++d) {
+            saved.devices[d].note(before[d], ggml_sycl::load_published_terms::snapshot(static_cast<int>(d)));
+        }
+        // As a record notes a group: a flag that moved since the load last looked was another writer's, and is what
+        // the restore puts back.
+        if (moe_multi_gpu_before != saved.moe_multi_gpu_written) {
+            saved.moe_multi_gpu_prior = moe_multi_gpu_before;
+        }
+        saved.moe_multi_gpu_written = g_moe_multi_gpu_active.load(std::memory_order_acquire);
+    }
+
+    ggml_sycl_load_published_pass(const ggml_sycl_load_published_pass &)             = delete;
+    ggml_sycl_load_published_pass & operator=(const ggml_sycl_load_published_pass &) = delete;
+};
+
+// Puts back what load `txn` published and what still holds it, once; a load that captured nothing, or another load's
+// entry, is left alone. It takes g_tensor_inventory_mutex before the entry's mutex, the order a pass holds them in when
+// it notes, so no publisher under that lock writes between a record's read of a group and its write. noexcept like the
+// planned-load-terms drop, and for the same reason: the owner-effects abort calls it outside every try stage, so no
+// failed stage skips it and no catch handler is added for it. No caller of the abort holds the inventory lock: the
+// abort takes it itself, to reset the load's scratch state. Its setters are plain stores.
+static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept {
+    std::lock_guard                        inventory(g_tensor_inventory_mutex);
+    ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
+    std::lock_guard<std::mutex>            lock(saved.mutex);
+    if (txn == 0 || saved.txn != txn) {
+        return;
+    }
+    for (size_t d = 0; d < saved.devices.size(); ++d) {
+        saved.devices[d].restore(static_cast<int>(d));
+    }
+    // By compare-exchange from what the load set: a writer outside the inventory lock that changed the flag since the
+    // load's last pass keeps its value. One that wrote, after that pass, exactly the value the load wrote cannot be
+    // told from the load, and its value goes back with the load's.
+    bool published = saved.moe_multi_gpu_written;
+    if (saved.moe_multi_gpu_prior != published) {
+        (void) g_moe_multi_gpu_active.compare_exchange_strong(published, saved.moe_multi_gpu_prior,
+                                                              std::memory_order_acq_rel);
+    }
+    saved.devices.clear();
+    saved.txn = 0;
+}
+
+// Drops load `txn`'s entry once it committed: its terms are then the live model's.
+static void ggml_sycl_load_published_terms_forget(uint64_t txn) {
+    ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
+    std::lock_guard<std::mutex>            lock(saved.mutex);
+    if (saved.txn == txn) {
+        saved.devices.clear();
+        saved.txn = 0;
+    }
+}
+
 static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner,
                                                    const char *                     site = "(unknown)") noexcept {
     // llama.cpp-fzem: WARN, not silent -- this is the function that releases
@@ -13294,6 +13418,10 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     } catch (...) {
         clean = false;
     }
+    // The device-wide terms the aborted load published, where they still hold what it published, go back to what they
+    // held before it, so the models on the device plan with their own again. The restore cannot throw and runs outside
+    // any try stage.
+    ggml_sycl_load_published_terms_restore(owner.load.value);
     try {
         // Abort discards only loader-thread candidate state. The previously active
         // LIVE execution authority remains continuously published.
@@ -14210,6 +14338,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         }
         const auto validation = registry->validate_end(ticket);
         if (validation != ggml_sycl::lifecycle::error::OK) {
+            // A commit ticket's validation fails only by poison, and finalize_end answers poison with a cleanup
+            // request, so the abort below runs and puts back the terms the load published. Only a finalize_end that
+            // failed inside returns no request; its transaction then never ends and no load can begin after it.
             const auto pending    = registry->finalize_end(ticket, true);
             bool       cleanup_ok = false;
             if (pending.cleanup_required) {
@@ -14297,6 +14428,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             ggml_sycl_enqueue_quarantined_result(*registry, result, model);
             (void) ggml_sycl_restore_latest_live_plan();
         }
+        // A committed load's terms are the live model's; a cleanup above already put a failed one's back.
+        ggml_sycl_load_published_terms_forget(result.token.load.value);
         if (result.committed) {
             // The committed model owns MoE discovery from here. Outside the
             // inventory lock: the outgoing owner's snapshot allocates, which
@@ -17672,34 +17805,15 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // The load-time ring is sized for the RUNTIME zone, which the arena sizes
     // from it, so every slot starts there. Only a runtime-context transaction
     // places slots in the shared KV zone (ggml_sycl_replan_pp_moe_onednn_ring()).
-    // The arena outlives a model, and so does the physical ring a previous
-    // model's context left; the reserve's "already sufficient" path would keep
-    // it, with slots in the KV zone this plan no longer places there. So a ring
-    // holding KV-zone bytes is released here. A slot still claimed by an
-    // in-flight dispatch refuses the release, never forced: the ring is kept,
-    // KV admission still counts what it holds (read from its slots), and the
-    // next KV re-fit re-admits it. The ring is per device, not per model, so
-    // this also releases a ring that another still-loaded model's live
-    // context admitted. That is not new: the planned sizes, n_ubatch and slot
-    // flags above were already overwritten for that model here. Its dispatch
-    // falls back when the planned scratch is unavailable, and its published
-    // charge for the ring becomes an over-count.
-    const size_t stale_ring_kv_zone_bytes = ggml_sycl::unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(ctx->device);
-    if (stale_ring_kv_zone_bytes > 0) {
-        ggml_sycl::unified_cache * ring_cache = ggml_sycl::get_existing_unified_cache_for_device(ctx->device);
-        if (ring_cache && ring_cache->release_pp_moe_onednn_scratch_ring()) {
-            GGML_LOG_INFO(
-                "[SYCL-PLAN] model load released the PP MoE oneDNN scratch ring (%.1f MB in the shared KV "
-                "zone) on device %d\n",
-                stale_ring_kv_zone_bytes / (1024.0 * 1024.0), ctx->device);
-        } else {
-            GGML_LOG_WARN(
-                "[SYCL-PLAN] model load kept the PP MoE oneDNN scratch ring (%.1f MB in the shared KV "
-                "zone) on device %d: a slot is claimed by an in-flight dispatch; the next KV re-fit "
-                "re-admits it\n",
-                stale_ring_kv_zone_bytes / (1024.0 * 1024.0), ctx->device);
-        }
-    }
+    // The physical ring a previous context left with slots there is not released
+    // here: this is a decide step, and a pass refused after it must leave the ring
+    // a live context may still use. The stage releases a stale ring in its effect
+    // step (ggml_sycl_release_stale_kv_zone_ring), after every refusal of the pass.
+    // The one release a decide step makes is the entry ensure's last resort
+    // (ggml_sycl_ensure_load_arena_zones), taken only when the ring's slot buffers
+    // are the only holders of an arena whose zones must grow and no claim on a slot
+    // is held, and a load refused after it does not get that ring back. The flags
+    // below are planning state the abort of a refused load puts back.
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(ctx->device, false, false);
     // Carry one scratch row's bytes and the expert counts into the backend, so the runtime-context transaction can
     // re-plan the ring for the context's own micro-batch (ggml_sycl_replan_pp_moe_onednn_ring()) instead of leaving it
@@ -18030,16 +18144,20 @@ class lazy_plan_slot_scope {
     lazy_plan_slot_scope(const lazy_plan_slot_scope &)             = delete;
     lazy_plan_slot_scope & operator=(const lazy_plan_slot_scope &) = delete;
 
-    // Drops the lease a stage handed back through the out-slot. The stage loop calls it after each device's planner
-    // call returns, which is after that call's g_tensor_inventory_mutex guard has ended (th32 §3.3).
-    void drop_displaced() {
+    // Hands out the lease a stage handed back through the out-slot, leaving the out-slot empty for the next planner
+    // call. The load stage calls it after each device's planner call returns, which is after that call's
+    // g_tensor_inventory_mutex guard has ended (th32 §3.3), and keeps the lease until every device's effects have run.
+    ggml_sycl::ring_lease take_displaced() noexcept { return std::move(displaced_); }
+
+    // Drops a lease taken from the out-slot.
+    static void drop_displaced(ggml_sycl::ring_lease & lease) noexcept {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
         // The replace-path mutant (th32 §11 T5's two-device arm): the displaced candidate's reference is never dropped.
-        if (ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::REPLACE_KEEPS_DISPLACED) && displaced_.held()) {
-            (void) new ggml_sycl::ring_lease(std::move(displaced_));
+        if (ggml_sycl::lazy_ring_mutant_is(ggml_sycl::lazy_ring_mutant::REPLACE_KEEPS_DISPLACED) && lease.held()) {
+            (void) new ggml_sycl::ring_lease(std::move(lease));
         }
 #endif
-        displaced_.reset();
+        lease.reset();
     }
 
   private:
@@ -18131,10 +18249,46 @@ static bool ggml_sycl_plan_has_storage_table(const ggml_sycl::placement_plan & p
     return false;
 }
 
+// The zones a load's plan is sized in, asked for at the planner's entry. When a rebuild is needed and the PP MoE ring's
+// slot buffers are the arena's only holders, the ring is released as the last resort through the cache's own release,
+// and the zones are asked for again. That release keeps a ring while a prefill's claim on one of its slots is held, and
+// a claim outlives its prefill: it is let go when a later prefill takes that slot, when a context on the device is
+// freed (its backend drains the device's slots), or when it is released unused. A kept ring refuses the load as any
+// holder does. It is the only ring release a decide step of the load stage makes. Caller holds
+// g_tensor_inventory_mutex.
+static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_refusal & refusal) {
+    if (ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal)) {
+        return true;
+    }
+    if (!ggml_sycl::zone_arena_only_ring_holds(refusal.reason == ggml_sycl::zone_arena_refusal_reason::REBUILD_HELD,
+                                               refusal.holders)) {
+        return false;
+    }
+    // Needed only because the ring outlives the context that sized it: once a context's teardown releases its own
+    // ring, no ring can be left alone in the arena and this branch can go.
+    ggml_sycl::unified_cache * cache        = ggml_sycl::get_existing_unified_cache_for_device(device);
+    const uint32_t             slot_buffers = refusal.holders.ring_in_arena;
+    if (cache == nullptr || !cache->release_pp_moe_onednn_scratch_ring()) {
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] model load kept the PP MoE oneDNN scratch ring (%u slot buffers) on device %d: it is the only "
+            "holder of an arena whose zones must grow, and a prefill's claim on one of its slots is still held\n",
+            slot_buffers, device);
+        return false;
+    }
+    GGML_LOG_WARN(
+        "[SYCL-PLAN] model load released the PP MoE oneDNN scratch ring (%u slot buffers) on device %d: it was the "
+        "only holder of an arena whose zones must grow\n",
+        slot_buffers, device);
+    refusal = {};
+    return ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal);
+}
+
 // Phase C helper: run compute_placement_plan (single- or multi-device) and
 // store the plan into per-device unified caches.  Idempotent — replaces any
-// previous plan.  Caller must hold g_tensor_inventory_mutex.
-static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t vram_budget, int budget_pct) {
+// previous plan.  Caller must hold g_tensor_inventory_mutex. False when the
+// arena's zones cannot be sized for the plan: the refusal line is logged and
+// no plan is staged, and the caller refuses the load.
+static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t vram_budget, int budget_pct) {
     // Where either stage call below hands the lease of the candidate it replaces (th32 §3.3). It is empty here because
     // the stage loop drains it after every planner call; a held lease would drop under this caller's guard when the
     // stage moved the next one in.
@@ -18147,15 +18301,19 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             ggml_sycl::lifecycle_stage_no_placement_plan(g_sycl_plan_load_effect_txn, g_placement_kv_info,
                                                          g_model_n_layer, displaced_out);
         }
-        return;
+        return true;
     }
+    ggml_sycl::zone_arena_refusal refusal;
     if (ggml_sycl::get_unified_cache_for_device(ctx->device) &&
-        !ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) {
-        // The zones cannot be rebuilt while another live model holds allocations in them, and the load's planned
-        // compute term (llama.cpp-p6i0) raises the RUNTIME requirement, so a second model whose term is larger than
-        // the live one's reaches this abort where it loaded before. Refusing that load by name instead of aborting
-        // is llama.cpp-ouur.
-        GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");
+        !ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)) {
+        // The zones grow only by a rebuild, and the arena is not rebuilt while anything points into it: a live
+        // model's allocations, or what a freed model's context left (chunk leases, or its PP MoE ring beside another
+        // holder or while a prefill's claim on one of its slots is held). Any term of this load can then need more than
+        // the zones hold, not only a compute term larger than a live model's: the device-wide terms are this load's
+        // alone. The load is refused by name and whatever holds the arena keeps running; the abort of the load's owner
+        // effects puts back the terms it published. A refused teardown of the arena refuses it the same way.
+        GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
+        return false;
     }
     // P3's reading (th32 §4.3 step 4) and the budget's source (§10): the MemAvailable and the override flag of the
     // sample this load's stored budget came from, so every plan of the load reads the values its budget does.
@@ -18263,6 +18421,11 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                                                      g_placement_kv_info, envelope_arg, g_moe_n_experts_total,
                                                      ggml_sycl::host_ledger_budget(), g_sycl_lazy_plan_slot);
         };
+        // The plans with the room may be discarded below, and a discarded plan publishes nothing. The terms the planner
+        // publishes as it plans are kept as they stand here, where the entry ensure above found the zones hold them;
+        // the micro-batch's publish just below writes the ring and the dense scratch, none of these.
+        const ggml_sycl::planner_published_terms published_before =
+            ggml_sycl::planner_published_terms::snapshot(ctx->device);
         // An explicit micro-batch's PP MoE oneDNN scratch ring: the planner holds the RUNTIME room the ring needs
         // against the routed experts. Every stage of the load re-publishes the ring and the dense scratch at the load's
         // planning shape, so a zone that an earlier stage of the load, or an earlier load in the process, already grew
@@ -18292,12 +18455,21 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                     plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE;
             }
             if (!placed) {
-                // The arena could not grow (another live model's allocations, or the tail chunk's cap): the load keeps
-                // its planning shape and plans without the room, so no expert leaves the device for a zone that did
-                // not grow, and the context's transaction re-plans the ring as it did before.
+                // The arena could not grow: something still points into it (bytes allocated in its zones, leases on
+                // its chunks, or cache scratch inside it, whichever model or context took them), the tail chunk's
+                // cap is too small, or its teardown refused. The load keeps its planning shape and plans without the
+                // room, so no expert leaves the device for a zone that did not grow, and the context's transaction
+                // re-plans the ring as it did before. The plans with the room are discarded, so the terms they
+                // published go back before the zones are sized: the zones are asked for what the entry ensure found
+                // they hold, and the plan without the room publishes its own.
                 (void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);
-                if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) {
-                    GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");
+                published_before.restore(ctx->device);
+                // The zones are asked for no more than the entry ensure found they hold, so this refuses only when
+                // the arena changed in between, a refused teardown above having closed it among those changes; it
+                // refuses the load the same way.
+                if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {
+                    GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
+                    return false;
                 }
                 plan_candidate = plan_single_device(/*with_room=*/false);
                 GGML_LOG_WARN(
@@ -18443,6 +18615,94 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             }
         }
     }
+    return true;
+}
+
+// What a load stage's inventory pass decided for one device that changes the device, kept for its effect step so that
+// no such change is made before every device's refusal is decided: the layer streaming the late pass turned on, with
+// the inventory it maps (less the layers the plan put on the host or on another device). The inventory is a copy the
+// stage owns, so a later device's pass, which populates the inventory globals again, cannot change what this device's
+// effect maps.
+struct ggml_sycl_inventory_effects {
+    int                                         device        = -1;
+    bool                                        stream        = false;
+    bool                                        stream_forced = false;
+    std::vector<std::pair<std::string, size_t>> stream_inventory;
+};
+
+// The effect step's ring release: the physical ring a previous context left with slots in the shared KV zone, which
+// the reserve's "already sufficient" path would keep where this load's plan no longer places slots. A slot still
+// claimed by an in-flight dispatch refuses the release, never forced: the ring is kept, KV admission still counts what
+// it holds (read from its slots), and the next KV re-fit re-admits it. The ring is per device, not per model, so this
+// also releases a ring that another still-loaded model's live context admitted: its dispatch falls back when the
+// planned scratch is unavailable, and its published charge for the ring becomes an over-count. Within a pass this
+// release never comes before a refusal: it runs only after every refusal of the pass. A load stages an early pass and
+// then a late one, so a refused load can have released a ring in two places: the entry ensure's last resort
+// (ggml_sycl_ensure_load_arena_zones), taken in a decide step only when the ring's slot buffers are the only holders
+// of an arena whose zones must grow, and, when the late pass refuses, this release in the early pass's effect step.
+// Caller holds g_tensor_inventory_mutex.
+static void ggml_sycl_release_stale_kv_zone_ring(int device) {
+    const size_t stale_ring_kv_zone_bytes = ggml_sycl::unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(device);
+    if (stale_ring_kv_zone_bytes == 0) {
+        return;
+    }
+    ggml_sycl::unified_cache * ring_cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    if (ring_cache && ring_cache->release_pp_moe_onednn_scratch_ring()) {
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] model load released the PP MoE oneDNN scratch ring (%.1f MB in the shared KV zone) on "
+            "device %d\n",
+            stale_ring_kv_zone_bytes / (1024.0 * 1024.0), device);
+    } else {
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] model load kept the PP MoE oneDNN scratch ring (%.1f MB in the shared KV zone) on device "
+            "%d: a slot is claimed by an in-flight dispatch; the next KV re-fit re-admits it\n",
+            stale_ring_kv_zone_bytes / (1024.0 * 1024.0), device);
+    }
+}
+
+// A late pass's effects for one device, run after every device's refusal is decided: the stale ring's release and the
+// layer streaming its decide step turned on. A record of a pass that planned nothing or refused (device -1) runs
+// nothing. Takes g_tensor_inventory_mutex, which the decide step held for the same work.
+static void ggml_sycl_run_inventory_effects(const ggml_sycl_inventory_effects & effects) {
+    if (effects.device < 0) {
+        return;
+    }
+    std::lock_guard lock(g_tensor_inventory_mutex);
+    ggml_sycl_release_stale_kv_zone_ring(effects.device);
+    if (!effects.stream) {
+        return;
+    }
+    auto & mgr = ggml_sycl::get_layer_stream_manager(effects.device);
+    mgr.build_layer_map(effects.stream_inventory.data(), effects.stream_inventory.size());
+    {
+        std::lock_guard<std::mutex> extras_lock(g_sycl_host_weight_extras_mutex);
+        for (const auto & entry : g_sycl_host_weight_extras) {
+            if (!ggml_sycl_host_row_authorized(entry.second.owner)) {
+                continue;
+            }
+            const ggml_tensor * tensor = entry.second.tensor;
+            if (tensor == nullptr || tensor->name == nullptr || tensor->name[0] == '\0') {
+                continue;
+            }
+            mgr.register_host_ptr(tensor->name, ggml_sycl_host_data(tensor), ggml_nbytes(tensor));
+        }
+    }
+    sycl::queue & q = ggml_sycl_get_device(effects.device).default_queue();
+    if (mgr.allocate_buffers(q)) {
+        GGML_LOG_INFO("[SYCL-BUDGET] Layer streaming enabled%s: %d layers, 2 x %.1f MB buffers (%.1f MB budgeted)\n",
+                      effects.stream_forced ? " (forced)" : "", mgr.n_layers(),
+                      mgr.max_layer_size() / (1024.0 * 1024.0), mgr.allocated_bytes() / (1024.0 * 1024.0));
+    } else {
+        GGML_LOG_ERROR("[SYCL-BUDGET] Layer streaming buffer allocation failed\n");
+    }
+}
+
+// An early pass's effect for the device it planned, run after every refusal of the pass is decided: the stale ring's
+// release, before create_tensor places weights in the zone the ring's slots hold. Takes g_tensor_inventory_mutex, which
+// the decide step held for the same work, so the stage that calls it never takes the inventory lock itself.
+static void ggml_sycl_run_early_inventory_effect(int device) {
+    std::lock_guard lock(g_tensor_inventory_mutex);
+    ggml_sycl_release_stale_kv_zone_ring(device);
 }
 
 // Compute placement plan early — before create_tensor in the llama loader.
@@ -18450,29 +18710,54 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
 // per-tensor buft selection can consult (*global_plan).  Skips the
 // late-only side effects (layer-streaming setup, host-pinned pre-allocate,
 // headroom reserve) that depend on state populated by create_tensor.
-void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t                     backend,
-                                                    const ggml_sycl_tensor_inventory * inventory) {
+// *plan_refused (when given) is set when the arena's zones cannot be sized
+// for the plan; the refusal line is already logged and nothing is staged.
+// Returns the device the pass planned for, or -1 when it planned nothing or
+// refused; the caller runs the pass's effect (the stale ring's release) for
+// that device once it has decided every refusal.
+static int ggml_sycl_compute_placement_plan_early_impl(ggml_backend_t                     backend,
+                                                       const ggml_sycl_tensor_inventory * inventory,
+                                                       bool *                             plan_refused) {
     if (!backend || ggml_sycl_inventory_malformed(inventory)) {
-        return;
+        return -1;
     }
     ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
     if (!ctx) {
-        return;
+        return -1;
     }
 
     host_budget_pass_scope      host_budget;
     std::lock_guard             lock(g_tensor_inventory_mutex);
+    // Under the lock and before the pass publishes, so a failed load puts back only what this pass wrote.
+    ggml_sycl_load_published_pass published(g_sycl_plan_load_effect_txn);
     populate_inventory_globals(ctx, inventory);
     size_t vram_budget = 0, base_mem = 0, free_mem = 0;
     int    budget_pct = 0;
     compute_vram_budget_for_plan(ctx, vram_budget, budget_pct, base_mem, free_mem);
-    compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
+    if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) {
+        if (plan_refused != nullptr) {
+            *plan_refused = true;
+        }
+        return -1;
+    }
+    return ctx->device;
+}
+
+// The direct entry keeps its void signature across the dlopen boundary: a refused plan is logged and stages nothing,
+// and only the stage turns it into a lifecycle result. A plan it made releases the stale ring after it, as the stage's
+// effect step does.
+void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t                     backend,
+                                                    const ggml_sycl_tensor_inventory * inventory) {
+    const int device = ggml_sycl_compute_placement_plan_early_impl(backend, inventory, nullptr);
+    if (device >= 0) {
+        ggml_sycl_run_early_inventory_effect(device);
+    }
 }
 
 // A load whose plan was packed against a RUNTIME zone an earlier load in this process grew says so, once, after its
-// late plan: the arena keeps a zone larger than a plan needs and rebuilds a zone only while it holds nothing, which the
-// PP MoE oneDNN ring a previous context left prevents, so the load's routed experts give up the larger zone. The first
-// load of a process sizes its zone for its own plan and never prints it. Caller holds g_tensor_inventory_mutex.
+// late plan: the arena keeps a zone larger than a plan needs and rebuilds only a zone that is too small, never to
+// shrink one, so the load's routed experts give up the larger zone. The first load of a process sizes its zone for its
+// own plan and never prints it. Caller holds g_tensor_inventory_mutex.
 static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
     auto * cache       = ggml_sycl::get_unified_cache_for_device(device);
     size_t requirement = 0;
@@ -18494,8 +18779,20 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
         device, live / mb, reserved / mb);
 }
 
+// The late inventory pass. *plan_refused (when given) is set, and no candidate is returned, when the arena's zones
+// cannot be sized for the plan; the refusal line is already logged. The pass configures no host zone, sets up no layer
+// streaming and releases no stale ring: what it decided to change is returned in *effects (device -1 when it planned
+// nothing or refused), for the caller to run with ggml_sycl_run_inventory_effects() once it has decided every refusal.
+// The planner's zone decision still changes the device: the entry ensure may release the PP MoE ring as its last
+// resort, and it or the micro-batch's grow leg may rebuild an arena nothing holds, which a refused load keeps (or,
+// after a failed reserve, the device keeps no arena). A plan that needs the secondary MoE devices also creates their
+// shared queues and caches, which stay.
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(
-    ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
+    ggml_backend_t                     backend,
+    const ggml_sycl_tensor_inventory * inventory,
+    bool *                             plan_refused,
+    ggml_sycl_inventory_effects &      effects) {
+    effects = {};
     if (!backend || ggml_sycl_inventory_malformed(inventory)) {
         return {};
     }
@@ -18506,6 +18803,8 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
 
     host_budget_pass_scope      host_budget;
     std::lock_guard             lock(g_tensor_inventory_mutex);
+    // Under the lock and before the pass publishes, so a failed load puts back only what this pass wrote.
+    ggml_sycl_load_published_pass published(g_sycl_plan_load_effect_txn);
 
     // Phase A: inventory + KV + MoE globals.  Idempotent against a prior
     // ggml_backend_sycl_compute_placement_plan_early() call with the same
@@ -18543,11 +18842,15 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
         arena_zone_overhead / (1024.0 * 1024.0), weight_budget / (1024.0 * 1024.0),
         effective_model_size / (1024.0 * 1024.0), model_size_exceeds_budget ? "true" : "false");
 
-    // Initialize double-buffered layer streaming when:
+    // Decide double-buffered layer streaming when:
     // 1. Model exceeds effective VRAM budget (auto-activation for non-MoE dense models)
     // 2. User forces streaming via GGML_SYCL_FORCE_STREAMING=1 (testing/override)
     // Layer streaming provides a device-side copy for GPU kernels that need weights.
     // Stays in the late path because g_sycl_host_weight_extras is populated by create_tensor.
+    // The decision is made here, against the plan the cache held before this pass stores its own; the streaming
+    // setup is the pass's effect, which the caller runs once every refusal of the pass is decided.
+    ggml_sycl_inventory_effects decided;
+    decided.device                     = ctx->device;
     const char * force_stream          = std::getenv("GGML_SYCL_FORCE_STREAMING");
     const bool   streaming_forced      = force_stream && std::atoi(force_stream) == 1;
     const bool   cpu_offload_available = ggml_sycl_cpu_offload_enabled() && ggml_sycl_info().has_cpu_device;
@@ -18591,7 +18894,8 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
             weight_budget / (1024.0 * 1024.0));
     }
     if (ggml_sycl::layer_streaming_gate_enabled(stream_gate)) {
-        auto & mgr = ggml_sycl::get_layer_stream_manager(ctx->device);
+        decided.stream        = true;
+        decided.stream_forced = streaming_forced;
 
         // llama.cpp-y2zx: streaming must not claim a layer the PLANNER placed on the
         // host. build_layer_map() used to run over the whole inventory and register all
@@ -18618,76 +18922,47 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
         // buffers) to cover only the layers actually staged. That is correctness with
         // respect to the placement ruling, on no measured throughput evidence.
         //
-        // Filter the INVENTORY rather than skipping register_host_ptr() below: the
-        // manager then never learns those names, so layer_streaming_get_weight_ptr()
+        // Filter the INVENTORY rather than skipping register_host_ptr() in the effect
+        // step: the manager then never learns those names, so layer_streaming_get_weight_ptr()
         // misses and the resolver falls through to the host pointer, whereas a
         // registered entry with a null host_ptr would look streamable-but-broken.
         // register_host_ptr() needs no change -- it early-returns for any name absent
         // from name_to_location_.
-        const std::pair<std::string, size_t> *      stream_inventory       = g_tensor_inventory.data();
-        size_t                                      stream_inventory_count = g_tensor_inventory.size();
-        std::vector<std::pair<std::string, size_t>> stream_inventory_filtered;
-        {
-            if (stream_plan_owner) {
-                const auto & plan           = *stream_plan_owner;
-                size_t       excluded_bytes = 0;
-                size_t       excluded_count = 0;
-                stream_inventory_filtered.reserve(g_tensor_inventory.size());
-                for (const auto & item : g_tensor_inventory) {
-                    const int layer_id = ggml_sycl::extract_layer_id(item.first.c_str());
-                    // A non-layer tensor (embeddings, output) has no layer_device entry
-                    // and build_layer_map() skips it anyway -- keep it so the filtered
-                    // inventory stays a faithful subset rather than a reshaped one.
-                    // Layers the plan put on ANOTHER device are excluded for the
-                    // same reason: this device never executes them, and their
-                    // host_ptr is not a registered streaming source here.
-                    if (layer_id >= 0) {
-                        const auto it = plan.layer_device.find(layer_id);
-                        if (it != plan.layer_device.end() &&
-                            (it->second < 0 || (plan.multi_device && it->second != ctx->device))) {
-                            excluded_bytes += item.second;
-                            excluded_count++;
-                            continue;
-                        }
-                    }
-                    stream_inventory_filtered.push_back(item);
-                }
-                if (excluded_count > 0) {
-                    // WARN so it survives default verbosity: this line is the only
-                    // evidence that the plan's host placement was honoured, and a
-                    // silent honouring is indistinguishable from the old silent
-                    // override.
-                    GGML_LOG_WARN(
-                        "[SYCL-CPU] layer streaming excludes %zu tensors (%.1f MB) the plan placed on the host "
-                        "or on another device; their owner executes those layers\n",
-                        excluded_count, excluded_bytes / (1024.0 * 1024.0));
-                    stream_inventory       = stream_inventory_filtered.data();
-                    stream_inventory_count = stream_inventory_filtered.size();
-                }
-            }
-        }
-        mgr.build_layer_map(stream_inventory, stream_inventory_count);
-        {
-            std::lock_guard<std::mutex> lock(g_sycl_host_weight_extras_mutex);
-            for (const auto & entry : g_sycl_host_weight_extras) {
-                if (!ggml_sycl_host_row_authorized(entry.second.owner)) {
+        // The copy is the effect's own, so a later device's pass, which populates the inventory again, cannot change
+        // what this device maps.
+        std::vector<std::pair<std::string, size_t>> & stream_inventory = decided.stream_inventory;
+        stream_inventory.reserve(g_tensor_inventory.size());
+        size_t excluded_bytes = 0;
+        size_t excluded_count = 0;
+        for (const auto & item : g_tensor_inventory) {
+            const int layer_id = stream_plan_owner ? ggml_sycl::extract_layer_id(item.first.c_str()) : -1;
+            // A non-layer tensor (embeddings, output) has no layer_device entry
+            // and build_layer_map() skips it anyway -- keep it so the filtered
+            // inventory stays a faithful subset rather than a reshaped one.
+            // Layers the plan put on ANOTHER device are excluded for the
+            // same reason: this device never executes them, and their
+            // host_ptr is not a registered streaming source here.
+            if (layer_id >= 0) {
+                const ggml_sycl::placement_plan & plan = *stream_plan_owner;
+                const auto                        it   = plan.layer_device.find(layer_id);
+                if (it != plan.layer_device.end() &&
+                    (it->second < 0 || (plan.multi_device && it->second != ctx->device))) {
+                    excluded_bytes += item.second;
+                    excluded_count++;
                     continue;
                 }
-                const ggml_tensor * tensor = entry.second.tensor;
-                if (tensor == nullptr || tensor->name == nullptr || tensor->name[0] == '\0') {
-                    continue;
-                }
-                mgr.register_host_ptr(tensor->name, ggml_sycl_host_data(tensor), ggml_nbytes(tensor));
             }
+            stream_inventory.push_back(item);
         }
-        sycl::queue & q = ggml_sycl_get_device(ctx->device).default_queue();
-        if (mgr.allocate_buffers(q)) {
-            GGML_LOG_INFO(
-                "[SYCL-BUDGET] Layer streaming enabled%s: %d layers, 2 x %.1f MB buffers (%.1f MB budgeted)\n",
-                streaming_forced ? " (forced)" : "", mgr.n_layers(), mgr.max_layer_size() / (1024.0 * 1024.0),
-                mgr.allocated_bytes() / (1024.0 * 1024.0));
-        } else {
-            GGML_LOG_ERROR("[SYCL-BUDGET] Layer streaming buffer allocation failed\n");
+        if (excluded_count > 0) {
+            // WARN so it survives default verbosity: this line is the only
+            // evidence that the plan's host placement was honoured, and a
+            // silent honouring is indistinguishable from the old silent
+            // override.
+            GGML_LOG_WARN(
+                "[SYCL-CPU] layer streaming excludes %zu tensors (%.1f MB) the plan placed on the host "
+                "or on another device; their owner executes those layers\n",
+                excluded_count, excluded_bytes / (1024.0 * 1024.0));
         }
     }
 
@@ -18735,7 +19010,12 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
     // Idempotent against a prior early call with the same inventory.
     // Host-pinned pool pre-sizing is plan-derived and happens when host zones
     // are configured, so all-VRAM models do not allocate a full host copy here.
-    compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
+    if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) {
+        if (plan_refused != nullptr) {
+            *plan_refused = true;
+        }
+        return {};
+    }
     ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device);
 
     GGML_LOG_INFO(
@@ -18743,6 +19023,7 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
         "(VRAM: %.2f GB free, planner host placement: %s)\n",
         g_tensor_inventory.size(), g_tensor_inventory_total_size / (1024.0 * 1024.0 * 1024.0),
         free_mem / (1024.0 * 1024.0 * 1024.0), ggml_sycl_current_model_planner_host_placement() ? "yes" : "no");
+    effects = std::move(decided);
 
     // Capture the staged revision before releasing the inventory writer lock.
     // Without staging authority, a direct legacy setter needs no candidate.
@@ -18753,7 +19034,11 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
 void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
     // Preserve the pre-091afc direct-setter contract. Eager host provisioning
     // belongs to stage_load_inventory_plan(), which owns the necessary lifetime guards.
-    (void) ggml_sycl_set_tensor_inventory_impl(backend, inventory);
+    // A refused plan is logged and stages nothing; only the stage turns it into a lifecycle result. A plan it made
+    // runs its effects after it, as the stage's effect step does.
+    ggml_sycl_inventory_effects effects;
+    (void) ggml_sycl_set_tensor_inventory_impl(backend, inventory, nullptr, effects);
+    ggml_sycl_run_inventory_effects(effects);
 }
 
 void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml_sycl_placement_envelope * envelope) {
@@ -18873,6 +19158,12 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
 #endif
         lazy_plan_slot_scope coverage_slot(coverage);
 
+        // The leases of the candidates the stage's devices replaced (th32 §3.3), taken from the out-slot after each
+        // device's planner call has returned and kept until every device's effects have run, so no device's effects
+        // read a snapshot whose lease is gone. Declared before the rollback guard, so a refused or failed stage drops
+        // them after its abort, as it does the out-slot's.
+        std::vector<ggml_sycl::ring_lease> displaced_leases;
+
         struct plan_effect_scope {
             uint64_t                        previous;
             ggml_sycl::lifecycle::SlotToken previous_owner;
@@ -18901,67 +19192,104 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
             }
         } rollback{ effect.owner, false, false };
 
+        // The device-wide terms as they stand before this load's first device plans start the record a failed load
+        // puts back from; the late pass of the same load keeps the record its early pass started.
+        ggml_sycl_load_published_terms_capture(effect.owner.load.value);
         // the transaction's one budget store, before any device plans (th32 §4.2); the planner entries below only read
         host_budget_pass_scope host_budget;
-        for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
+        const int              n_devices = ggml_backend_sycl_get_device_count();
+
+        // The backends the decide loop opens, kept alive across the effect step's physical provisioning and freed when
+        // the stage ends. Declared after the rollback guard, so a refused or failed stage frees them before its abort.
+        struct backend_list {
+            std::vector<ggml_backend_t> backends;
+
+            ~backend_list() {
+                for (ggml_backend_t backend : backends) {
+                    ggml_backend_free(backend);
+                }
+            }
+        } opened;
+
+        // A late pass's decision for one device: the candidate it staged, which this record owns (shared_ptr) until
+        // that device's effects have run, and the effects it decided, with its own copy of the inventory they map.
+        struct late_decision {
+            int                                                       device = -1;
+            std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;
+            ggml_sycl_inventory_effects                               effects;
+        };
+
+        std::vector<late_decision> late_decisions;
+        std::vector<int>           early_devices;  // the devices the early pass planned, for its effect
+        opened.backends.reserve(static_cast<size_t>(std::max(n_devices, 0)));
+        displaced_leases.reserve(static_cast<size_t>(std::max(n_devices, 0)));
+        late_decisions.reserve(static_cast<size_t>(std::max(n_devices, 0)));
+        early_devices.reserve(static_cast<size_t>(std::max(n_devices, 0)));
+
+        const auto owner = effect.owner;
+        // Whether `snapshot` is the load's candidate now, staged by this load under an owner that is still the active
+        // token. Candidate versions/slot fields are not published identities. The effect owns the full token; object
+        // identity identifies the exact staged revision, including explicit no-plan rows.
+        const auto candidate_is_current =
+            [&](const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+                return snapshot && snapshot->load_txn_id == owner.load.value &&
+                       (snapshot->explicit_no_plan || snapshot->plan) &&
+                       ggml_sycl_same_owner(registry.current_active_token(), owner) &&
+                       ggml_sycl::lifecycle_find_candidate_placement_plan(owner.load.value).get() == snapshot.get();
+            };
+
+        // The decide pass: every device plans and every refusal is decided before this pass's host zones, layer
+        // streaming or stale-ring release, and the rollback guard's abort puts back what the pass published. The
+        // planner's zone decision still changes a device here: the entry ensure's last resort releases a ring that
+        // alone holds the arena, and an arena nothing holds may be rebuilt for the plan's zones, which a refused load
+        // keeps (or no arena, after a failed reserve). The secondary MoE queues and caches a plan creates stay too.
+        for (int i = 0; i < n_devices; ++i) {
             ggml_backend_t backend = ggml_backend_sycl_init(i);
             if (!backend) {
                 return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
             }
-
-            struct backend_guard {
-                ggml_backend_t backend;
-
-                ~backend_guard() { ggml_backend_free(backend); }
-            } guard{ backend };
+            opened.backends.push_back(backend);
 
             ggml_backend_sycl_set_placement_envelope(backend, envelope);
             rollback.started = true;
+            // A plan the arena's zones cannot hold refuses the load from either pass; the rollback guard then aborts
+            // the load's owner effects, which puts back what it published. The late pass reads the refusal before it
+            // checks the candidate, which a refused plan never staged.
+            bool plan_refused = false;
             if (early) {
-                ggml_backend_sycl_compute_placement_plan_early(backend, inventory);
+                const int planned = ggml_sycl_compute_placement_plan_early_impl(backend, inventory, &plan_refused);
+                if (plan_refused) {
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
+                if (planned >= 0) {
+                    early_devices.push_back(planned);
+                }
             } else {
-                const auto snapshot = ggml_sycl_set_tensor_inventory_impl(backend, inventory);
-                const auto owner    = effect.owner;
-                const auto candidate_is_current = [&]() {
-                    // Candidate versions/slot fields are not published identities.
-                    // The effect owns the full token; object identity identifies
-                    // the exact staged revision, including explicit no-plan rows.
-                    return snapshot && snapshot->load_txn_id == owner.load.value &&
-                           (snapshot->explicit_no_plan || snapshot->plan) &&
-                           ggml_sycl_same_owner(registry.current_active_token(), owner) &&
-                           ggml_sycl::lifecycle_find_candidate_placement_plan(owner.load.value).get() == snapshot.get();
-                };
-                if (!candidate_is_current()) {
+                late_decision decision;
+                decision.device = ((ggml_backend_sycl_context *) backend->context)->device;
+                decision.snapshot =
+                    ggml_sycl_set_tensor_inventory_impl(backend, inventory, &plan_refused, decision.effects);
+                if (plan_refused) {
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
+                if (!candidate_is_current(decision.snapshot)) {
                     throw std::runtime_error("stale host provisioning candidate before allocation");
                 }
-                if (ggml_sycl_stage_refuse_cross_card_expert_plan(snapshot->plan.get())) {
+                if (ggml_sycl_stage_refuse_cross_card_expert_plan(decision.snapshot->plan.get())) {
                     return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
                 }
-                if (ggml_sycl_stage_refuse_lazy_plan(snapshot->plan.get(), early)) {
+                if (ggml_sycl_stage_refuse_lazy_plan(decision.snapshot->plan.get(), early)) {
                     return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
                 }
-
-                // The inventory lock has been released. Keep module_guard, effect
-                // and the backend alive across physical provisioning; do not
-                // reacquire an effect after a finisher has closed admission.
-                // This is synchronous before the loader allocates weight buffers,
-                // so those buffers cannot consume the unzoned runtime pool first.
-                // Optional zone/scratch failures retain the helper's fallback policy.
-                if (!snapshot->explicit_no_plan) {
-                    const int device = ((ggml_backend_sycl_context *) backend->context)->device;
-                    auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-                    ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, snapshot->plan);
-                }
-                if (!candidate_is_current()) {
-                    // Detection, not atomic competing-provisioning or backing
-                    // rollback: the existing owner rollback handles this refusal.
-                    throw std::runtime_error("stale host provisioning candidate after allocation");
-                }
+                late_decisions.push_back(std::move(decision));
             }
-            // The lease of the candidate this device's stage replaced (th32 §3.3), dropped now that the planner call
-            // has returned and its g_tensor_inventory_mutex guard has ended. A return or throw above leaves it to the
-            // slot scope's end, which follows the rollback guard's abort.
-            coverage_slot.drop_displaced();
+            // The lease of the candidate this device's stage replaced (th32 §3.3), taken now that the planner call has
+            // returned and its g_tensor_inventory_mutex guard has ended. A return or throw above leaves it to the slot
+            // scope's end, which follows the rollback guard's abort.
+            ggml_sycl::ring_lease replaced = coverage_slot.take_displaced();
+            if (replaced.held()) {
+                displaced_leases.push_back(std::move(replaced));
+            }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
             if ((early && g_test_fail_next_stage_inventory_plan_early_after_first_device.exchange(false, std::memory_order_acq_rel)) ||
                 (!early && g_test_fail_next_stage_inventory_plan_late_after_first_device.exchange(false, std::memory_order_acq_rel))) {
@@ -18970,9 +19298,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
 #endif
         }
         // The early candidate is read once every device has planned it, and a refused one is never staged as the probe
-        // plan; the late pass refuses per device before it configures that device's host zones. Both passes ask the
-        // cross-card refusal: the early plan steers create_tensor's buffer choice and the probe measure, and the late
-        // plan, made again after the arena is reserved, can put experts on a second card when the early one did not.
+        // plan. Both passes ask the cross-card refusal: the early plan steers create_tensor's buffer choice and the
+        // probe measure, and the late plan, made again after the arena is reserved, can put experts on a second card
+        // when the early one did not.
         const auto early_candidate =
             early ? ggml_sycl::lifecycle_find_candidate_placement_plan(effect.owner.load.value) : nullptr;
         if (early_candidate && ggml_sycl_stage_refuse_cross_card_expert_plan(early_candidate->plan.get())) {
@@ -18981,6 +19309,16 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
         if (early_candidate && ggml_sycl_stage_refuse_lazy_plan(early_candidate->plan.get(), early)) {
             return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
         }
+
+        // The effect pass. Every refusal of this early or late pass is decided above, so nothing below refuses it, but
+        // an effect can still end the load after an earlier device's effects ran: the two candidate checks around each
+        // device's effects throw when the load's owner or candidate changed, and an effect's own host allocation can
+        // throw (a zone or pool that cannot be allocated falls back instead). The earlier device then keeps its
+        // configured host zones, its released stale ring and, in a late pass, the layer streaming its effects set up.
+        // The abort releases no layer streaming, and a load whose abort cleans up keeps no model token, so no model
+        // teardown releases it either: the working set stays until the next model's first weight upload on that device
+        // displaces it (register_host_ptr), or until the process exits. A load whose abort fails keeps its token, and
+        // the teardown of that token releases the working set by owner.
         if (early) {
             // llama.cpp-p6i0: the early plan is the load's probe placement. Stage a copy for the PROBE-stage
             // measure, which runs after create_tensor and before the late plan replaces the candidate. It is
@@ -18991,9 +19329,49 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 ggml_sycl::lifecycle_stage_probe_placement_plan(txn, ggml_sycl::placement_plan(*candidate->plan),
                                                                 candidate->kv_info, candidate->model_n_layer);
             }
+            // The early pass's effect on each device it planned. The helper takes the inventory lock;
+            // the stage does not.
+            for (const int device : early_devices) {
+                ggml_sycl_run_early_inventory_effect(device);
+            }
+        } else {
+            // The late pass's effects, device by device, each from the snapshot that device staged. Each device's
+            // stage replaced the candidate of the one before it, so the load's candidate is the last device's
+            // snapshot; before and after each device's effects the load's owner must still be the active token and
+            // that snapshot still the candidate. The inventory lock has been released. Keep module_guard, effect and
+            // the backends alive across physical provisioning; do not reacquire an effect after a finisher has closed
+            // admission. This is synchronous before the loader allocates weight buffers, so those buffers cannot
+            // consume the unzoned runtime pool first. Optional zone/scratch failures retain the helper's fallback
+            // policy.
+            const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> staged =
+                late_decisions.empty() ? nullptr : late_decisions.back().snapshot;
+            for (const late_decision & decision : late_decisions) {
+                const auto effects_are_current = [&]() {
+                    return decision.snapshot && decision.snapshot->load_txn_id == owner.load.value &&
+                           (decision.snapshot->explicit_no_plan || decision.snapshot->plan) &&
+                           candidate_is_current(staged);
+                };
+                if (!effects_are_current()) {
+                    throw std::runtime_error("stale host provisioning candidate before allocation");
+                }
+                ggml_sycl_run_inventory_effects(decision.effects);
+                if (!decision.snapshot->explicit_no_plan) {
+                    auto * cache = ggml_sycl::get_unified_cache_for_device(decision.device);
+                    ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.snapshot->plan);
+                }
+                if (!effects_are_current()) {
+                    // Detection, not atomic competing-provisioning or backing
+                    // rollback: the existing owner rollback handles this failure.
+                    throw std::runtime_error("stale host provisioning candidate after allocation");
+                }
+            }
+        }
+        // Every device's effects have run: the replaced candidates' leases drop now, with no lock held.
+        for (ggml_sycl::ring_lease & lease : displaced_leases) {
+            lazy_plan_slot_scope::drop_displaced(lease);
         }
         rollback.released = true;
-        return ggml_backend_sycl_get_device_count() == 0 ? GGML_SYCL_LIFECYCLE_NOT_FOUND : GGML_SYCL_LIFECYCLE_OK;
+        return n_devices == 0 ? GGML_SYCL_LIFECYCLE_NOT_FOUND : GGML_SYCL_LIFECYCLE_OK;
     } catch (...) {
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
@@ -19003,20 +19381,17 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
 
 // The per-device globals a plan dry run writes while it plans, read when it starts and written back when it ends, on
 // every exit, so a later load reads what it would have read without the dry run: the planner inputs it publishes from
-// the inventory (ggml_sycl_inventory_publish_planner_inputs) and the shapes the planners publish from each plan (the
-// oneDNN Graph scratch and non-FA attention shapes, the MoE CONTROL requirement, the MoE host scatter scratch). Each
-// setter stores what its getter reads, so the write-back is exact.
+// the inventory (ggml_sycl_inventory_publish_planner_inputs) and the terms the planners publish from each plan, which
+// ggml_sycl::planner_published_terms snapshots and restores, as the load stage's fallback does for the plans it
+// discards. Each setter stores what its getter reads, so the write-back is exact.
 struct ggml_sycl_plan_dry_run_saved_state {
     struct device_state {
-        size_t                                        pp_pipeline = 0;
-        size_t                                        ring_weight = 0;
-        size_t                                        ring_act    = 0;
-        size_t                                        ring_out    = 0;
-        uint32_t                                      ring_depth  = 0;
-        ggml_sycl::onednn_graph_scratch_planned_shape graph{};
-        ggml_sycl::nonfa_attn_scratch_planned_shape   nonfa{};
-        ggml_sycl::moe_control_requirement            control{};
-        size_t                                        scatter = 0;
+        size_t                             pp_pipeline = 0;
+        size_t                             ring_weight = 0;
+        size_t                             ring_act    = 0;
+        size_t                             ring_out    = 0;
+        uint32_t                           ring_depth  = 0;
+        ggml_sycl::planner_published_terms planner;
     };
 
     std::vector<device_state> devices;
@@ -19031,10 +19406,7 @@ struct ggml_sycl_plan_dry_run_saved_state {
             s.ring_act       = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(d);
             s.ring_out       = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(d);
             s.ring_depth     = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(d);
-            s.graph          = ggml_sycl::unified_cache_get_planned_onednn_graph_scratch_shape(d);
-            s.nonfa          = ggml_sycl::unified_cache_get_planned_nonfa_attn_scratch_shape(d);
-            s.control        = ggml_sycl::unified_cache_get_planned_moe_control_requirement(d);
-            s.scatter        = ggml_sycl::unified_cache_get_planned_moe_host_scatter_scratch_bytes(d);
+            s.planner        = ggml_sycl::planner_published_terms::snapshot(d);
         }
     }
 
@@ -19045,12 +19417,7 @@ struct ggml_sycl_plan_dry_run_saved_state {
             ggml_sycl::unified_cache_set_planned_pp_pipeline_scratch_bytes(d, s.pp_pipeline);
             ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(d, s.ring_weight, s.ring_act, s.ring_out,
                                                                        s.ring_depth);
-            ggml_sycl::unified_cache_set_planned_onednn_graph_scratch_shape(
-                d, s.graph.n_head_ctx_max, s.graph.n_head_swa_max, s.graph.n_swa, s.graph.n_ubatch, s.graph.n_ctx);
-            ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(d, s.nonfa.n_head, s.nonfa.n_ubatch,
-                                                                          s.nonfa.n_ctx);
-            ggml_sycl::unified_cache_set_planned_moe_control_requirement(d, s.control);
-            ggml_sycl::unified_cache_set_planned_moe_host_scatter_scratch_bytes(d, s.scatter);
+            s.planner.restore(d);
         }
     }
 
@@ -20267,7 +20634,20 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
         // zone was never sized for this shape to begin with.
         const size_t scratch_capacity_before = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
         ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(device, n_head, n_ubatch, n_ctx);
-        (void) ggml_sycl::unified_cache_ensure_planned_arena_zones(device);
+        ggml_sycl::zone_arena_refusal arena_refusal;
+        (void) ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &arena_refusal);
+        if (arena_refusal.reason == ggml_sycl::zone_arena_refusal_reason::TEARDOWN_REFUSED &&
+            ggml_sycl::zone_arena_teardown_left_closed(arena_refusal.teardown)) {
+            // The re-plan is best-effort, but an arena its teardown left closed takes no allocation, so no context can
+            // be created on it; the ensure's own ERROR line names why.
+            GGML_LOG_ERROR(
+                "[SYCL-PLAN] runtime context update rejected on device %d: the VRAM arena could not be torn down and "
+                "stays closed to new allocations; load the model in a new process\n",
+                device);
+            ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(device, prev_shape.n_head,
+                                                                          prev_shape.n_ubatch, prev_shape.n_ctx);
+            return false;
+        }
         const size_t scratch_capacity = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
         if (scratch_capacity > scratch_capacity_before) {
             // "(observed)": this is the guard's own re-plan attempt seeing
@@ -20281,9 +20661,9 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
                 scratch_capacity / (1024.0 * 1024.0), n_head, n_ubatch, n_ctx);
         } else {
             // State only what was actually observed (capacity unchanged).
-            // ensure_planned_arena_zones()'s return value is discarded
-            // above (this call is opportunistic/best-effort by design), so
-            // the cause is not something this code checked -- it may be
+            // ensure_planned_arena_zones()'s refusal is read above only for
+            // an arena left closed (this call is opportunistic/best-effort by
+            // design), so the cause is not something this code checked -- it may be
             // live weight leases, or simply that the estimate did not
             // exceed the zone's existing capacity. Naming a specific
             // unverified cause here would be a claim this code cannot
@@ -64703,8 +65083,9 @@ static bool ggml_sycl_publish_f16_attention_dst_handle(ggml_tensor *           d
     }
 
     if (!published_handle.valid()) {
-        published_handle = ggml_sycl::mem_handle::from_chunk_ptr(produced_base, target_device, GGML_LAYOUT_AOS,
-                                                                 /*on_device=*/true);
+        published_handle =
+            ggml_sycl::mem_handle::from_chunk_ptr(produced_base, target_device, GGML_LAYOUT_AOS,
+                                                  /*on_device=*/true, ggml_sycl::chunk_lease_site::TENSOR_EXTRA);
     }
 
     if (!ggml_sycl_persistent_publish_allowed(extra, published_handle, "publish_f16_attention_dst_handle")) {
@@ -66808,8 +67189,8 @@ bool ggml_sycl_test_f16_staged_view_resolves_through_root(ggml_tensor * view, in
     ggml_sycl::mem_handle old_handle  = std::move(extra->data_handle[target_device]);
     void *                old_data    = extra->data_device[target_device];
     extra->data_device[target_device] = staged_base;
-    extra->data_handle[target_device] =
-        ggml_sycl::mem_handle::from_chunk_ptr(staged_base, target_device, GGML_LAYOUT_AOS, /*on_device=*/true);
+    extra->data_handle[target_device] = ggml_sycl::mem_handle::from_chunk_ptr(
+        staged_base, target_device, GGML_LAYOUT_AOS, /*on_device=*/true, ggml_sycl::chunk_lease_site::TENSOR_EXTRA);
     ggml_sycl_data_ptr_cache_new_graph();
     void * resolved                   = ggml_sycl_resolve_tensor_ptr(view, target_device);
     extra->data_handle[target_device] = std::move(old_handle);
@@ -81452,7 +81833,8 @@ static expert_dispatch_entry ggml_sycl_make_secondary_expert_dispatch_entry(int6
     entry.lease              = std::move(lease);
     entry.allow_cpu_fallback = allow_cpu_fallback;
     if (!entry.lease.valid() && ptr != nullptr) {
-        entry.lease            = ggml_sycl::mem_handle::from_chunk_ptr(ptr, device_id, layout, device_id >= 0);
+        entry.lease            = ggml_sycl::mem_handle::from_chunk_ptr(ptr, device_id, layout, device_id >= 0,
+                                                                       ggml_sycl::chunk_lease_site::EXPERT_DISPATCH);
         entry.raw_compat_lease = true;
     }
     return entry;
