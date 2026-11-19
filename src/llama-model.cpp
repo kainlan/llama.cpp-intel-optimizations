@@ -269,8 +269,8 @@ static bool llama_model_buft_backend_is_sycl(ggml_backend_buffer_type_t buft) {
 }
 
 // The shape every load-time measure of this model runs at: the context and micro-batch the caller told the load
-// (llama_model_params::n_ctx_hint, n_ubatch_hint), resolved once by the resolver the inventory's n_ubatch_measure
-// reads, so the backend credits the term at the micro-batch it was measured at.
+// (llama_model_params::n_ctx_hint, n_ubatch_hint). The measures and the inventory's n_ubatch_measure read the same
+// resolver over the same hints, so the backend credits the term at the micro-batch it was measured at.
 static llama_load_measure_shape llama_model_load_measure_shape(const llama_model & model) {
     return llama_load_measure_shape_resolve(model.get_n_ctx_hint(), model.get_n_ubatch_hint(),
                                             model.hparams.n_ctx_train);

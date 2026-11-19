@@ -483,9 +483,8 @@ struct ggml_sycl_tensor_inventory {
     uint32_t                                 lazy_table_count;
     // The micro-batch the load measured its compute term at (libllama's llama_load_measure_shape_resolve over the
     // caller's hints), which the backend credits the term at. It sits in the padding after lazy_table_count, so the
-    // struct stays 208 bytes. A libllama built before this field leaves the padding as the caller's object holds it:
-    // zero for every `= {}` inventory libllama builds, and the backend then reads n_ubatch, that libllama's measure
-    // shape. libllama and libggml-sycl must still be rebuilt together for the backend to see it.
+    // struct stays 208 bytes. libllama and libggml-sycl are rebuilt together. When the field is 0 the backend reads
+    // n_ubatch instead.
     uint32_t                                 n_ubatch_measure;
 };
 

@@ -2890,8 +2890,8 @@ its context keeps the context-time path.
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
 holds the compute term the load measured at the context and micro-batch the
 caller told it (`n_ctx_train` and ubatch 512 where it told none), and the placed
-micro-batch's ring and dense scratch sit beside it. So once the plan has placed the micro-batch, the
-hold-spill fit credits rungs at or below that rung
+micro-batch's ring and dense scratch sit beside it. So once the plan has placed
+the micro-batch, the hold-spill fit credits rungs at or below that rung
 (`placement_explicit_ubatch_compute_room()` and
 `zone_hold_fit_rung_has_compute_room()`): a rung's own measured buffer when it
 is no larger than the term, whole or nothing, and a rung without a record of its
@@ -3463,16 +3463,16 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   `n_ctx_train` and ubatch 512 where it tells none. A load whose model is reused for a later context keeps the term of
   the shape it was loaded for. Without a named `-ub` the term is measured at 512, and above 512 it under-reserves, which
   is the **default** for a dense model: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch`
-  of 2048 a dense model's auto pick climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto 2048,
-  `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack is smaller. The ladder's per-rung trial
-  (`try_candidate`) does not consult the reserved RUNTIME room. It loses a rung only when the runtime-context
-  transaction is busy or not the published model's, when the probe refuses the rung, when the rung would demote KV, when
-  the candidate publish is refused, when the rung's compute buffers fail to allocate, when one falls back to host
-  memory, or when the rung would leave the card under the driver headroom (the hold-spill fit). A compute buffer that
-  does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, and the trial accepts both. So
-  a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open finding, not an invariant
-  of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
-  auto pick's.
+  of 2048 a dense model's auto pick climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a
+  448.0 MB compute buffer at the auto 2048, `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack
+  is smaller. The ladder's per-rung trial (`try_candidate`) does not consult the reserved RUNTIME room. It loses a rung
+  only when the runtime-context transaction is busy or not the published model's, when the probe refuses the rung,
+  when the rung would demote KV, when the candidate publish is refused, when the rung's compute buffers fail to
+  allocate, when one falls back to host memory, or when the rung would leave the card under the driver headroom (the
+  hold-spill fit). A compute buffer that does not fit RUNTIME takes the KV zone next, then raw device memory outside
+  the arena, and the trial accepts both. So a dense auto pick above 512 can land `zone=raw`, in the external headroom.
+  That is an open finding, not an invariant of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512
+  (`MOE_GPU_UBATCH_MAX`), so their term is the auto pick's.
 - Every load-time path runs at `n_seq_max` 1 and cannot see the context's sequence count. The probe, the admitted stage
   and the late check all build their measure context from the default parameters. So the state term holds one sequence's
   state, and the late check compares one sequence's state with one sequence's state. A context with `-np` above 1
@@ -3486,8 +3486,8 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   blame the one-sequence measure. It never refuses: `-np` is a normal user option, and a context the user asked for is
   placed and warned, never shrunk or refused. `tests/test-sycl-load-measure-source.py` pins the WARN and pins that
   neither the comparison nor its text helper refuses. The fix is to transport the caller's `n_seq_max` into the load's
-  measure, the same gap `llama.cpp-fkpg` records for `-c` and `-ub`. It is tracked as `llama.cpp-0zyy`. The state is
-  summed per buffer type, so a type holding several buffers can round up by one grain per extra buffer beyond the term.
+  measure, as `-c` and `-ub` now are. It is tracked as `llama.cpp-0zyy`. The state is summed per buffer type, so a type
+  holding several buffers can round up by one grain per extra buffer beyond the term.
 - A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
   refused while the first model holds allocations, so that load reaches the abort in
   `compute_and_store_plan_for_inventory`. `llama.cpp-ouur` refuses it by name instead.
