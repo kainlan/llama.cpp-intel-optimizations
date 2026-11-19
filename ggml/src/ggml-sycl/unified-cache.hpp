@@ -4733,7 +4733,10 @@ class unified_cache {
 
     // === Pinning for Graphs ===
 
-    void pin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);
+    // A pin is a flag, not a count: one unpin clears it whoever set it. pin() answers true only when this call set the
+    // flag on an entry where it was clear; false for an entry already pinned, no entry, or an invalid key. A caller
+    // that releases later should release only the pins it was answered true for.
+    bool pin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);
     void unpin(const ggml_sycl_cache_id &   key,
                ggml_layout_mode             layout,
                const placement_cache_read * retained_read = nullptr);

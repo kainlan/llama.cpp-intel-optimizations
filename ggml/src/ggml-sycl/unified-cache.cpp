@@ -14289,9 +14289,9 @@ void unified_cache::remove(const ggml_sycl_cache_id & key_id,
 
 // NOTE: mark_reordered/is_reordered removed - reorder state tracked in tensor->extra->optimized_feature
 
-void unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {
+bool unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {
     if (!key_id.valid) {
-        return;
+        return false;
     }
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     const unified_cache_key direct_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
@@ -14299,7 +14299,7 @@ void unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layo
     if (entry_it == entries_.end()) {
         auto id_it = id_to_key_.find(key_id);
         if (id_it == id_to_key_.end()) {
-            return;
+            return false;
         }
         entry_it = entries_.find(id_it->second);
     }
@@ -14313,11 +14313,14 @@ void unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layo
                 (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
                 (int) entry_it->second.layout, (int) layout);
         }
+        const bool was_pinned   = entry_it->second.pinned;
         entry_it->second.pinned = true;
-        GGML_SYCL_DEBUG("[UNIFIED-CACHE] pin model=%llu name_hash=0x%llx layout=%d\n",
+        GGML_SYCL_DEBUG("[UNIFIED-CACHE] pin model=%llu name_hash=0x%llx layout=%d was_pinned=%d\n",
                         (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
-                        (int) entry_it->second.layout);
+                        (int) entry_it->second.layout, was_pinned ? 1 : 0);
+        return !was_pinned;
     }
+    return false;
 }
 
 void unified_cache::unpin(const ggml_sycl_cache_id &   key_id,
@@ -23993,8 +23996,13 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
         for (ggml_layout_mode layout : pin_layouts) {
             const ggml_sycl_cache_id layout_key = detail::layout_specific_moe_expert_cache_key(key, layout);
             if (cache->get(layout_key, layout)) {
-                cache->pin(layout_key, layout);
-                result.pins.push_back({ layout_key, layout });
+                // The receipt is what the op's exit unpins, and a pin is a flag, so it lists only a pin this call
+                // set: an entry pinned before (bulk expert staging creates its entries pinned, the popularity pass
+                // pins experts on the card) keeps its pin after the release. The op's own leases, not the pin, keep
+                // the memory of an entry it uses until its work completes.
+                if (cache->pin(layout_key, layout)) {
+                    result.pins.push_back({ layout_key, layout });
+                }
                 device_resolved = true;
                 break;
             }
