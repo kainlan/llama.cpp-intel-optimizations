@@ -4714,10 +4714,9 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
-# Source gate for keeping the zones when a rebuild something live blocks lacks only the oneDNN Graph floor: the keep is
-# decided in the rebuild-blocked branch, before its refusal line, by one locked cache function over the pure rules
-# (test-zone-sizing Case 41); a PP MoE ring that alone holds the arena keeps nothing until the load stage's entry has
-# spent its last resort on it. Host-only, reads the sources as text. Same registration shape as the gate above.
+# Source gate for keeping the zones when a rebuild something live blocks lacks only the oneDNN Graph floor, and for a
+# failed load's put-back of the zone plan; the pin's docstring lists every check. Host-only, reads the sources as text.
+# Same registration shape as the gate above.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-onednn-zone-keep-source

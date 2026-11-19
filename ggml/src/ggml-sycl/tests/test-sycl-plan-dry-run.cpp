@@ -1501,8 +1501,8 @@ arm_result arm_i_graph_floor_keeps_an_allocation_held_arena() {
             void_arm(r, "the allocation is not in device 0's RUNTIME zone, so it does not hold the arena");
             return r;
         }
-        const resolved_ptr          first  = holder.resolve();
-        const arena_zone_capacities before = read_zone_capacities(cache);
+        const resolved_ptr          first            = holder.resolve();
+        const arena_zone_capacities before           = read_zone_capacities(cache);
         size_t                      room_before      = 0;
         const bool                  room_before_read = unified_cache_get_onednn_graph_room(0, &room_before);
         log_clear();

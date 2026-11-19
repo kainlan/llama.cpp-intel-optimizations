@@ -24,7 +24,9 @@
 //   no "live allocations prevent rebuild" ERROR (the held rebuild's) and no "model load refused" line (the
 //   REBUILD_HELD refusal's). Keep WARNs outside the second load (a context's re-plan, which belongs to no load and
 //   warns at every keep) are printed but not scored.
-// --order large-first: the large context first. The same, with no keep WARN anywhere in the run.
+// --order large-first: the large context first. The same, with no keep WARN anywhere in the run. A large-first PASS
+//   means something only beside a small-first PASS from the same build: "no keep WARN" also holds with the arena off
+//   or with the WARN's text renamed.
 //
 // What it cannot see: the Graph room the kept zone leaves, the stored zone plan, and a failed load's restore of it
 // (no load fails here). A keep that stored the plan's floor rather than what the zone holds, or a restore that left a

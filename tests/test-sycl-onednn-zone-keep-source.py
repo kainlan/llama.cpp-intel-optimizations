@@ -370,7 +370,8 @@ def test_a_ring_alone_defers_the_keep():
 def test_one_rule_decides_the_keep():
     assert claim_one_rule_decides_the_keep(UC, GS), (
         f"{KEEP_FN}() must apply zone_onednn_plan_keep_short and zone_arena_shortfall_is_reservation_only under the "
-        "zone-plan mutex and store only when asked, and no other site may apply them"
+        "zone-plan mutex and store only when asked, and no other site may apply them, except a failed load's put-back "
+        "(which applies zone_onednn_plan_keep_short)"
     )
 
 
@@ -475,8 +476,12 @@ def test_witnesses():
     only_fails(mutate_in(UC, PUT_BACK_SIG, PUT_BACK_RULE, "prior"), GS, "restore")
     # The prior plan stored over another publisher's later store.
     only_fails(mutate_in(UC, PUT_BACK_SIG, PUT_BACK_TEST, "{"), GS, "restore")
-    # The put-back reading the zone as the failed load found it rather than as it is now.
+    # The put-back ignoring the pair held in the zone now (read as 0): the stored floor leaves no room for that pair.
     only_fails(mutate_in(UC, RESTORE_SIG, RESTORE_HELD, "0"), GS, "restore")
+    # The put-back reading the zone's capacity as 0: every put-back would store a Graph floor of 0.
+    only_fails(mutate_in(UC, RESTORE_SIG, RESTORE_CAPACITY, "0"), GS, "restore")
+    # The take_groups arm dropped: the record never takes the zone plan as its prior, so a restore has nothing to put.
+    only_fails(mutate_in(UC, TAKE_SIG, TAKE_ARM, ""), GS, "restore")
 
     # The helper that never names the stored figure: both lines claim the zone holds the formula floor.
     only_fails(mutate_in(UC, SHORT_SIG, SHORT_TEST, "return std::string();"), GS, "log")

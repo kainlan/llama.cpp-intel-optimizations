@@ -356,6 +356,7 @@ GROUP_SETTERS = (
     ("LOAD_PUBLISHED_GROUP_NONFA", "unified_cache_set_planned_nonfa_attn_scratch_shape("),
     ("LOAD_PUBLISHED_GROUP_CONTROL", "unified_cache_set_planned_moe_control_requirement("),
     ("LOAD_PUBLISHED_GROUP_SCATTER", "unified_cache_set_planned_moe_host_scatter_scratch_bytes("),
+    ("LOAD_PUBLISHED_GROUP_ZONE_PLAN", "onednn_zone_plan_put_back("),
 )
 # The sum is never stored plainly: a plain store would put back over a reserve's raise.
 SUM_PLAIN = ("unified_cache_set_planned_onednn_scratchpad_bytes(", PAIR_SETTER + "(",
