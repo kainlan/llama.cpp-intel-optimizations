@@ -2013,14 +2013,23 @@ def _graph_floor_reads_the_published_shape(cache: str) -> bool:
     return var is not None and len(calls) == 1 and calls[0] == _shape_var_args(var) + [PLAN_DIRECT_CAP]
 
 
+GRAPH_FLOOR_SHORT_ARG = "onednn_zone_plan_short_text(plan.device_id, graph_floor).c_str()"
+
+
 def _graph_floor_info_prints_the_published_shape(cache: str) -> bool:
+    """The INFO line prints the five fields of the published shape, then what a zone stored short of its floor holds."""
     var = _populate_shape_var(cache)
     calls = [
         args
         for args in _call_argument_lists(_body_of(cache, POPULATE_HOST_ZONE_SIZING_SIG), "GGML_LOG_INFO")
         if args and GRAPH_FLOOR_INFO_TEXT in args[0]
     ]
-    return var is not None and len(calls) == 1 and calls[0][-5:] == _shape_var_args(var)
+    return (
+        var is not None
+        and len(calls) == 1
+        and calls[0][-6:-1] == _shape_var_args(var)
+        and calls[0][-1] == GRAPH_FLOOR_SHORT_ARG
+    )
 
 
 def _nonfa_setter_reads_planning_shape(cache: str) -> bool:
@@ -2200,7 +2209,7 @@ def test_graph_shape_checks_have_bounded_mutation_witnesses() -> None:
     mutant = _mutate_in_function(cache, POPULATE_HOST_ZONE_SIZING_SIG, old, old.replace(PLAN_DIRECT_CAP, "0"))
     _assert_only_check_fails(mutant, sycl, "floor", "the logged floor sized with no cap, unlike the zone")
 
-    old = f"(1024.0 * 1024.0), {', '.join(_shape_var_args(var))})"
+    old = f"(1024.0 * 1024.0), {', '.join(_shape_var_args(var))}, {GRAPH_FLOOR_SHORT_ARG})"
     new = old.replace(f"{var}.n_ubatch, {var}.n_ctx", planning)
     mutant = _mutate_in_function(cache, POPULATE_HOST_ZONE_SIZING_SIG, old, new)
     _assert_only_check_fails(mutant, sycl, "info", "the INFO line printing the planning shape")

@@ -973,6 +973,25 @@ static void onednn_zone_plan_put_back(int                      device_id,
     }
 }
 
+#if GGML_SYCL_DNNL
+// What a line that prints the Graph floor the planned shape asks for (`formula_bytes`) adds when the ONEDNN zone's
+// stored snapshot on `device_id` holds less Graph room than that: the stored figure, so the line does not claim the
+// zone holds the formula floor. A zone kept short stores the room it holds beyond its pair
+// (zone_onednn_plan_keep_short). The snapshot is read as it stands when the line prints, which for a plan's floor line
+// can be before that load's zones are ensured (a multi-device plan sizes them after it plans). Empty while no snapshot
+// is stored, or when the stored floor is not below the formula's.
+static std::string onednn_zone_plan_short_text(int device_id, size_t formula_bytes) {
+    const zone_onednn_plan stored = onednn_zone_plan_load(device_id);
+    if (zone_onednn_plan_same(stored, zone_onednn_plan()) || stored.graph_floor_bytes >= formula_bytes) {
+        return std::string();
+    }
+    char text[128];
+    std::snprintf(text, sizeof(text), "; the ONEDNN zone's stored plan holds only %.1f MB of it as Graph room",
+                  stored.graph_floor_bytes / (1024.0 * 1024.0));
+    return text;
+}
+#endif
+
 // The most an op's f16 pair may be for the ONEDNN zone of capacity `capacity_bytes` on `device_id` to count it as
 // planned (zone_onednn_pp_pair_bound over the snapshot above). The one source for the admission accessor and for the
 // reserve's own merge and refusal, so the two cannot disagree about what the zone was planned to hold.
@@ -16279,20 +16298,22 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
     if (!ok) {
         const onednn_graph_scratch_planned_shape shape =
             unified_cache_get_planned_onednn_graph_scratch_shape(req.device);
+        const size_t formula_floor =
+            onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa,
+                                                      shape.n_ubatch, shape.n_ctx, onednn_graph_scratch_direct_cap());
+        // A zone kept short holds less of the floor than the shape asks for; the line says so after the shape.
         GGML_LOG_ERROR(
             "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT allocation failed after a drain-and-retry: requested "
             "%.2f MB, outstanding direct=%.2f MB (cap %.2f MB, %zu prior waits), ONEDNN zone %.1f MB (used %.1f "
-            "MB, floor %.1f MB at n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u n_ubatch=%u n_ctx=%u). Refusing to "
-            "hand oneDNN a null scratch pointer for this request -- see llama.cpp-0oxf for the GPU "
+            "MB, floor %.1f MB at n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u n_ubatch=%u n_ctx=%u%s). Refusing "
+            "to hand oneDNN a null scratch pointer for this request -- see llama.cpp-0oxf for the GPU "
             "page-fault/segfault this used to cause. Aborting instead.\n",
             size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
             onednn_graph_scratch_direct_cap() / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_,
             zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
-            zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
-            onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa,
-                                                      shape.n_ubatch, shape.n_ctx, onednn_graph_scratch_direct_cap()) /
-                (1024.0 * 1024.0),
-            shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa, shape.n_ubatch, shape.n_ctx);
+            zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0), formula_floor / (1024.0 * 1024.0),
+            shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa, shape.n_ubatch, shape.n_ctx,
+            onednn_zone_plan_short_text(req.device, formula_floor).c_str());
         if (g_onednn_graph_scratch_test_suppress_abort.load(std::memory_order_acquire)) {
             // Test build only (see the hooks declared in unified-cache.hpp):
             // report "this would have aborted" instead of actually aborting,
@@ -36505,15 +36526,15 @@ static void populate_host_zone_sizing(placement_plan &                          
         // narrowing apply here" -- e.g. gemma4 should show n_head_ctx_max=0
         // n_head_swa_max=8 n_swa=512 (its real GGUF attention.sliding_window;
         // GPU-verified on the B50) and a 64 MiB floor, not 192 MB.
+        // The floor is the shape's; a zone stored short of it is named after the shape, as the snapshot stands now.
+        const size_t graph_floor = onednn_graph_scratch_zone_floor_bytes_swa(
+            graph_shape.n_head_ctx_max, graph_shape.n_head_swa_max, graph_shape.n_swa, graph_shape.n_ubatch,
+            graph_shape.n_ctx, unified_cache_onednn_graph_scratch_direct_cap_bytes(plan.device_id));
         GGML_LOG_INFO(
             "[SYCL-PLAN] oneDNN Graph-scratch zone floor: %.1f MB (n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u "
-            "n_ubatch=%u n_ctx=%u)\n",
-            onednn_graph_scratch_zone_floor_bytes_swa(
-                graph_shape.n_head_ctx_max, graph_shape.n_head_swa_max, graph_shape.n_swa, graph_shape.n_ubatch,
-                graph_shape.n_ctx, unified_cache_onednn_graph_scratch_direct_cap_bytes(plan.device_id)) /
-                (1024.0 * 1024.0),
-            graph_shape.n_head_ctx_max, graph_shape.n_head_swa_max, graph_shape.n_swa, graph_shape.n_ubatch,
-            graph_shape.n_ctx);
+            "n_ubatch=%u n_ctx=%u)%s\n",
+            graph_floor / (1024.0 * 1024.0), graph_shape.n_head_ctx_max, graph_shape.n_head_swa_max, graph_shape.n_swa,
+            graph_shape.n_ubatch, graph_shape.n_ctx, onednn_zone_plan_short_text(plan.device_id, graph_floor).c_str());
     }
 #endif
 

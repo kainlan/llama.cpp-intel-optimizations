@@ -28,7 +28,10 @@ the blocked rebuild keeps the zones when the floor is all they lack. These check
   (differing() and take_groups() carry its arm), and the restore stores zone_onednn_plan_keep_short(prior, prior,
   capacity now, held pair now) under the zone-plan mutex only while the snapshot still holds what the load left
   (test-zone-sizing Case 44). The DIRECT cap snapshot is not put back (it does not rise while the arena is kept), so the
-  published-terms snapshot does not read it, and the keep path writes no planner-published term.
+  published-terms snapshot does not read it, and the keep path writes no planner-published term;
+- log: the DIRECT-failure ERROR and the plan's "[SYCL-PLAN] oneDNN Graph-scratch zone floor:" line keep their fields
+  and append, through one helper, the Graph room the stored zone plan holds whenever it is below the formula floor, so
+  neither claims a kept zone holds the floor.
 
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live
 inside test_*() functions. Checks read comment-stripped, whitespace-normalised text. Each check has a mutation witness
@@ -177,6 +180,23 @@ PUT_BACK_CALL = f"{PUT_BACK_FN}(device, written.onednn_zone_plan, prior.onednn_z
 PUT_BACK_TEST = "if (zone_onednn_plan_same(g_onednn_zone_plan[device_id], written)) {"
 PUT_BACK_RULE = "zone_onednn_plan_keep_short(prior, prior, capacity_bytes, held_pair_bytes)"
 PUT_BACK_STORE = f"g_onednn_zone_plan[device_id] = {PUT_BACK_RULE};"
+SHORT_FN = "onednn_zone_plan_short_text"
+SHORT_SIG = f"static std::string {SHORT_FN}(int device_id, size_t formula_bytes) {{"
+SHORT_READ = "const zone_onednn_plan stored = onednn_zone_plan_load(device_id);"
+SHORT_TEST = (
+    "if (zone_onednn_plan_same(stored, zone_onednn_plan()) || stored.graph_floor_bytes >= formula_bytes) { "
+    "return std::string(); }"
+)
+SHORT_PRINT = "stored.graph_floor_bytes / (1024.0 * 1024.0)"
+DIRECT_SIG = "void * unified_cache::onednn_graph_scratch_alloc_direct_locked("
+DIRECT_FLOOR = "const size_t formula_floor = onednn_graph_scratch_zone_floor_bytes_swa("
+DIRECT_TEXT = "n_ctx=%u%s). Refusing"
+DIRECT_ARG = f"{SHORT_FN}(req.device, formula_floor).c_str());"
+POPULATE_SIG = "static void populate_host_zone_sizing(placement_plan & plan,"
+FLOOR_VALUE = "const size_t graph_floor = onednn_graph_scratch_zone_floor_bytes_swa("
+FLOOR_PREFIX = '"[SYCL-PLAN] oneDNN Graph-scratch zone floor: %.1f MB (n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u "'
+FLOOR_TEXT = '"n_ubatch=%u n_ctx=%u)%s\\n",'
+FLOOR_ARG = f"{SHORT_FN}(plan.device_id, graph_floor).c_str());"
 
 
 def _ensure(uc: str) -> str:
@@ -302,6 +322,18 @@ def claim_a_failed_load_puts_the_zone_plan_back(uc: str) -> bool:
     )
 
 
+def claim_both_lines_name_the_stored_floor(uc: str) -> bool:
+    """The DIRECT-failure ERROR and the plan's floor INFO line print the formula floor with their fields unchanged, then
+    the Graph room the stored zone plan holds whenever it holds less than that floor, read through one helper."""
+    c = code(uc)
+    return (
+        ordered(fn_body(c, SHORT_SIG), SHORT_READ, SHORT_TEST, SHORT_PRINT)
+        and ordered(fn_body(c, DIRECT_SIG), DIRECT_FLOOR, "GGML_LOG_ERROR(", DIRECT_TEXT, DIRECT_ARG)
+        and ordered(fn_body(c, POPULATE_SIG), FLOOR_VALUE, "GGML_LOG_INFO(", FLOOR_PREFIX, FLOOR_TEXT, FLOOR_ARG)
+        and c.count(SHORT_FN + "(") == 3
+    )
+
+
 def keep_checks(uc: str, gs: str) -> dict:
     return {
         "place": claim_keep_sits_in_the_blocked_branch(uc),
@@ -311,6 +343,7 @@ def keep_checks(uc: str, gs: str) -> dict:
         "cap": claim_cap_snapshot_rises_only_at_a_rebuild(uc),
         "warn": claim_a_keep_warns_once_per_load(uc),
         "restore": claim_a_failed_load_puts_the_zone_plan_back(uc),
+        "log": claim_both_lines_name_the_stored_floor(uc),
     }
 
 
@@ -369,6 +402,14 @@ def test_a_failed_load_puts_the_zone_plan_back():
         "zone_onednn_plan_keep_short(prior, prior, capacity now, held pair now) under the zone-plan mutex only while "
         "the snapshot still holds what the load left; the DIRECT cap snapshot must not be read into the record, and "
         "the keep path must write no planner-published term"
+    )
+
+
+def test_both_lines_name_the_stored_floor():
+    assert claim_both_lines_name_the_stored_floor(UC), (
+        "the DIRECT-failure ERROR and the '[SYCL-PLAN] oneDNN Graph-scratch zone floor:' line must keep their fields "
+        f"and append, through {SHORT_FN}(), the Graph room the stored zone plan holds whenever it is below the "
+        "formula floor, so neither line claims the zone holds the formula floor"
     )
 
 
@@ -435,6 +476,13 @@ def test_witnesses():
     only_fails(mutate_in(UC, PUT_BACK_SIG, PUT_BACK_TEST, "{"), GS, "restore")
     # The put-back reading the zone as the failed load found it rather than as it is now.
     only_fails(mutate_in(UC, RESTORE_SIG, RESTORE_HELD, "0"), GS, "restore")
+
+    # The helper that never names the stored figure: both lines claim the zone holds the formula floor.
+    only_fails(mutate_in(UC, SHORT_SIG, SHORT_TEST, "return std::string();"), GS, "log")
+    # The DIRECT-failure ERROR without the stored figure.
+    only_fails(mutate_in(UC, DIRECT_SIG, DIRECT_ARG, '"");'), GS, "log")
+    # The floor line without it.
+    only_fails(mutate_in(UC, POPULATE_SIG, FLOOR_ARG, '"");'), GS, "log")
 
 
 if __name__ == "__main__":
