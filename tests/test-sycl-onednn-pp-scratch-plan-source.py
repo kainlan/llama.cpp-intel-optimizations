@@ -322,14 +322,11 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
         zone_sizing, r"size_t zone_onednn_pp_pair_bound\([^)]*\)\s*\{")
     pair_bound = function_body(
         cache, r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\)\s*\{")
-    bound_plan = function_body(
+    bound_for = function_body(
         cache, r"static size_t onednn_pp_pair_bound_for\(const zone_onednn_plan & plan, size_t capacity_bytes\)\s*\{")
-    bound_dev = function_body(
-        cache, r"static size_t onednn_pp_pair_bound_for\(int device_id, size_t capacity_bytes\)\s*\{")
-    bound_for = bound_plan
     results["anchor: the pure pair bound exists"] = pure is not None
     results["anchor: the pair-bound accessor is defined"] = pair_bound is not None
-    results["anchor: the shared bound helper is defined"] = bound_plan is not None and bound_dev is not None
+    results["anchor: the shared bound helper is defined"] = bound_for is not None
     results["the pair-bound accessor is declared"] = \
         re.search(r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\);", cache_hpp) is not None
     if pure is not None:
@@ -345,8 +342,10 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
             "vram_zone_id::ONEDNN" in pair_bound and "arena_active()" in pair_bound
         results["the accessor answers through the shared bound helper"] = "onednn_pp_pair_bound_for(" in pair_bound
     if bound_for is not None:
-        results["the helper reads the stored zone-plan snapshot, bare plan and floor together"] = \
-            bound_dev is not None and "onednn_zone_plan_load(" in bound_dev and \
+        # The plan is the one stored on the cache whose ONEDNN capacity the accessor bounds, never another cache's.
+        results["the bound helper reads its own cache's stored plan"] = \
+            pair_bound is not None and \
+            "onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), cache->zone_capacity(" in pair_bound and \
             "plan.bare_bytes" in bound_for and "plan.graph_floor_bytes" in bound_for
         results["the helper answers through the pure bound"] = "zone_onednn_pp_pair_bound(" in bound_for
         results["the helper does not read a live planner figure or recompute the floor"] = \
@@ -357,9 +356,9 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     results["anchor: ensure_planned_arena_zones exists"] = ensure_zones is not None
     if ensure_zones is not None:
         results["the kept-zone exit stores the larger of the held and live plan, in one critical section"] = \
-            re.search(r"onednn_zone_plan_keep_and_store\(dev_id,\s*live_plan\);\s*return true;", ensure_zones) is not None
+            re.search(r"onednn_zone_plan_keep_and_store\(live_plan\);\s*return true;", ensure_zones) is not None
         keep_store = function_body(
-            cache, r"static void onednn_zone_plan_keep_and_store\(int device_id,\s*const zone_onednn_plan & plan\)\s*\{")
+            cache, r"void unified_cache::onednn_zone_plan_keep_and_store\(const zone_onednn_plan & plan\)\s*\{")
         results["anchor: the locked keep-and-store helper exists"] = keep_store is not None
         if keep_store is not None:
             # ABSENCE: calling the public load or store from inside would take the same mutex twice.
@@ -367,7 +366,7 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
                 keep_store.count("lock_guard") == 1 and "zone_onednn_plan_keep(" in keep_store and \
                 "onednn_zone_plan_load(" not in keep_store and "onednn_zone_plan_store(" not in keep_store
         results["the rebuilt-zone exit stores the live plan the zone was built from"] = \
-            re.search(r"onednn_zone_plan_store\(dev_id,\s*live_plan\);\s*return true;", ensure_zones) is not None
+            re.search(r"onednn_zone_plan_store\(live_plan\);\s*return true;", ensure_zones) is not None
         results["zone sizing reads the planned pair and floor once, as one pair"] = \
             ensure_zones.count("onednn_planned_pair_and_floor(") == 1 and \
             "unified_cache_get_planned_onednn_scratchpad_bytes" not in ensure_zones
@@ -756,13 +755,18 @@ if args.self_test and not failed:
         ("helper reads the live bare plan", "the helper does not read a live planner figure or recompute the floor",
          (backend, mutate_in_func(cache, bound_sig, "plan.bare_bytes",
                                   "unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id)"), cache_hpp)),
-        ("helper ignores the snapshot's bare plan", "the helper reads the stored zone-plan snapshot, bare plan and floor together",
+        ("helper ignores the snapshot's bare plan", "the bound helper reads its own cache's stored plan",
          (backend, mutate_in_func(cache, bound_sig, "plan.bare_bytes", "0"), cache_hpp)),
+        ("accessor bounds by another cache's plan", "the bound helper reads its own cache's stored plan",
+         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
+                                  "onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(),",
+                                  "onednn_pp_pair_bound_for(get_unified_cache_for_device(0)->onednn_zone_plan_load(),"),
+          cache_hpp)),
         ("kept-zone exit describes the zone by the live plan", "the kept-zone exit stores the larger of the held and live plan, in one critical section",
-         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(dev_id, live_plan)",
-                                  "onednn_zone_plan_store(dev_id, live_plan)"), cache_hpp)),
+         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(live_plan)",
+                                  "onednn_zone_plan_store(live_plan)"), cache_hpp)),
         ("rebuilt-zone exit stops storing", "the rebuilt-zone exit stores the live plan the zone was built from",
-         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_store(dev_id, live_plan);\n    return true;\n}",
+         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_store(live_plan);\n    return true;\n}",
                                   "return true;\n}"), cache_hpp)),
         ("zone sizing reads the live bare plan again", "zone sizing reads the planned pair and floor once, as one pair",
          (backend, mutate_in_func(cache, ensure_sig, "planned_onednn_bare)",
@@ -896,7 +900,7 @@ if args.self_test and not failed:
                          "XXXX("), cache, cache_hpp)),
         ("reserve reloads the snapshot for its bound", "the reserve's first bound comes from the snapshot it already loaded",
          (backend, mutate_in_func(cache, reserve_sig, "onednn_pp_pair_bound_for(zone_plan,",
-                                  "onednn_pp_pair_bound_for(bound_dev,"), cache_hpp)),
+                                  "onednn_pp_pair_bound_for(onednn_zone_plan_load(),"), cache_hpp)),
         ("test shim comes back", "one definition of the reserve target",
          (backend, cache, cache_hpp,
           zone_sizing + "\nvoid zone_onednn_scratch_reserve_target(bool a, size_t b, size_t c, size_t d, size_t e, size_t f, "
@@ -906,12 +910,12 @@ if args.self_test and not failed:
                                   "void * early_probe = zone_alloc(vram_zone_id::ONEDNN, weights_size); (void) early_probe; "
                                   "const size_t pair_bound_now"), cache_hpp)),
         ("kept exit loads then stores", "the kept-zone exit stores the larger of the held and live plan, in one critical section",
-         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(dev_id, live_plan)",
-                                  "onednn_zone_plan_store(dev_id, zone_onednn_plan_keep(onednn_zone_plan_load(dev_id), "
+         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(live_plan)",
+                                  "onednn_zone_plan_store(zone_onednn_plan_keep(onednn_zone_plan_load(), "
                                   "live_plan))"), cache_hpp)),
         ("keep-and-store takes two locks", "the keep-and-store helper keeps under one lock and calls neither accessor",
-         (backend, mutate_in_func(cache, r"static void onednn_zone_plan_keep_and_store\(",
-                                  "zone_onednn_plan_keep(", "zone_onednn_plan_keep(onednn_zone_plan_load(device_id), "),
+         (backend, mutate_in_func(cache, r"void unified_cache::onednn_zone_plan_keep_and_store\(",
+                                  "zone_onednn_plan_keep(", "zone_onednn_plan_keep(onednn_zone_plan_load(), "),
           cache_hpp)),
         ("accessor undeclared", "the pair-bound accessor is declared",
          (backend, cache, mutate(cache_hpp, "unified_cache_get_onednn_pp_pair_bound(", "unified_cache_get_XXXX("))),

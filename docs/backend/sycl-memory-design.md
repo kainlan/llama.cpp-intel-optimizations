@@ -686,7 +686,8 @@ ticket reproduced on:
   terms a failed load puts back (`LOAD_PUBLISHED_GROUP_ZONE_PLAN`): while
   the stored plan still holds what the load left, the restore stores
   `zone_onednn_plan_keep_short(prior, prior, capacity now, held pair now)`
-  under the zone-plan mutex, which is the prior plan exactly while the
+  on the device's cache under its zone-plan mutex, which is the prior plan
+  exactly while the
   zone still holds it, and a smaller Graph floor when the zone was rebuilt
   smaller or a pair was reserved under the failed load's wider bound in
   between. A failed load therefore leaves the live model the Graph room it
@@ -698,6 +699,24 @@ ticket reproduced on:
   as it stands, and a failed load that rebuilt the arena leaves the rebuilt
   arena in place, so the snapshot stored at that rebuild is the one that
   arena's cap is derived from.
+
+  **Where the zone plan lives.** The plan is a member of the
+  `unified_cache` that owns the zone (`unified_cache::onednn_zone_plan_`,
+  under that cache's own `onednn_zone_plan_mutex_`, which each accessor
+  takes alone and which ranks after every other lock), never a per-device
+  store. The pair reserve, its refusal and the DIRECT-failure ERROR read
+  their own cache's plan; the pair-bound and Graph-room accessors read the
+  plan of the cache whose capacity they read; the published-terms snapshot
+  and the plan's floor line, which hold only a device id, read the plan of
+  that device's existing cache (none is created for them), and a failed
+  load's restore puts the plan back on that cache. A per-device store let a
+  second cache on one device, an arena reserved by hand in a test, be
+  judged by the plan the device's own cache stored: its 8 MiB zone got a
+  pair bound of 0 and every pair was refused. A cache whose zone
+  `ensure_planned_arena_zones()` never sized holds the default plan (all
+  figures zero), and a pair in that zone is bounded by the zone's capacity
+  alone: nothing planned a Graph floor into it, and a Graph scratch the pair
+  leaves no room for takes the DIRECT path under its cap.
 
   ⚠️ **This gemma4 example describes the formula's behavior for the
   `n_ctx` it is actually given at PLANNING time, which is NOT today's
@@ -2710,8 +2729,8 @@ the room holds, and a refusal there names the largest one. The arithmetic is
 The Graph room is the room no other planned consumer may take: the ONEDNN
 zone's capacity less the most the pair admission lets the primitive-API pair
 grow to (`unified_cache_get_onednn_pp_pair_bound()`: its plan, or the capacity
-less the Graph floor when that is larger, from the snapshot the zone was sized
-from). `unified_cache_get_onednn_graph_room()` returns it from one read of the
+less the Graph floor when that is larger, from the plan the same cache stored
+when it sized the zone). `unified_cache_get_onednn_graph_room()` returns it from one read of the
 capacity, so an ensure that rebuilds the zone between two reads cannot pair
 one capacity with the bound of another. It is not the capacity less the
 pair's live plan: an op's pair admitted into the slack above its plan is not

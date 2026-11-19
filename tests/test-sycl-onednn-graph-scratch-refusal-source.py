@@ -82,7 +82,7 @@ PLANNED_SHAPE_ARG = "ggml_sycl::unified_cache_get_planned_onednn_graph_scratch_s
 DEMAND_ASSIGN = "const size_t demand = ggml_sycl::zone_onednn_graph_scratch_floor_bytes("
 ROOM_SIG = "bool unified_cache_get_onednn_graph_room(int device_id, size_t * room) {"
 ROOM_READ = "const size_t capacity = cache->zone_capacity(vram_zone_id::ONEDNN);"
-ROOM_BOUND = "const size_t bound = onednn_pp_pair_bound_for(device_id, capacity);"
+ROOM_BOUND = "const size_t bound = onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), capacity);"
 ROOM_STORE = "*room = capacity > bound ? capacity - bound : 0;"
 ROOM_CALL = "if (!ggml_sycl::unified_cache_get_onednn_graph_room(device, &graph_room)) { return true; }"
 
@@ -368,7 +368,7 @@ def test_every_check_has_a_mutation_witness_that_fails_only_it():
                  cache=_mutate_in(CACHE_NORM, ROOM_SIG, ROOM_STORE, "*room = capacity;"))
     _assert_only(src, "room", "the bound taken over a second capacity read",
                  cache=_mutate_in(CACHE_NORM, ROOM_SIG, ROOM_BOUND,
-                                  "const size_t bound = onednn_pp_pair_bound_for(device_id, "
+                                  "const size_t bound = onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), "
                                   "cache->zone_capacity(vram_zone_id::ONEDNN));"))
     _assert_only(_mutate_in(src, CHECK_SIG, ROOM_CALL,
                             f"{ROOM_CALL} const size_t zone = cache->zone_capacity(ggml_sycl::vram_zone_id::ONEDNN);"
