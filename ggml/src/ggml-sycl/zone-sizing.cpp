@@ -532,6 +532,38 @@ bool zone_arena_only_ring_holds(bool rebuild_needed, const zone_arena_holders & 
            holders.live_beside_ring == 0 && holders.chunk_leases == 0;
 }
 
+bool zone_arena_shortfall_is_reservation_only(const zone_arena_sizes & have,
+                                              const zone_arena_sizes & need,
+                                              size_t                   onednn_pair_bytes) {
+    // Only the ONEDNN zone is short, and it still holds the pair. Not widened to SCRATCH: the non-FA scratch it holds
+    // has no DIRECT path of its own.
+    return have.scratch >= need.scratch && have.runtime >= need.runtime && have.onednn < need.onednn &&
+           have.onednn >= onednn_pair_bytes;
+}
+
+size_t zone_onednn_kept_pair_bytes(const zone_onednn_plan & kept, size_t held_pair_bytes) {
+    return std::max(kept.bare_bytes, held_pair_bytes);
+}
+
+zone_onednn_plan zone_onednn_plan_keep_short(const zone_onednn_plan & held,
+                                             const zone_onednn_plan & live,
+                                             size_t                   capacity_bytes,
+                                             size_t                   held_pair_bytes) {
+    zone_onednn_plan kept  = zone_onednn_plan_keep(held, live);
+    const size_t     pair  = zone_onednn_kept_pair_bytes(kept, held_pair_bytes);
+    const size_t     room  = capacity_bytes > pair ? capacity_bytes - pair : 0;
+    kept.graph_floor_bytes = std::min(room, kept.graph_floor_bytes);
+    return kept;
+}
+
+size_t zone_graph_direct_cap_snapshot_kept(size_t held_bytes, size_t current_bytes) {
+    return held_bytes == 0 ? current_bytes : std::min(held_bytes, current_bytes);
+}
+
+bool zone_kept_onednn_warn_due(uint64_t latched_txn, uint64_t load_txn) {
+    return load_txn == 0 || latched_txn != load_txn;
+}
+
 // `bytes` in MB at one decimal, in KB under 0.1 MB, and in bytes under 1 KB, so a small figure never prints as 0.0 MB.
 static std::string zone_bytes_text(size_t bytes) {
     char out[48];

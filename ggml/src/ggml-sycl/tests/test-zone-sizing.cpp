@@ -3146,6 +3146,113 @@ int main() {
               "leases beside the ring alone are not named with the new-process remedy");
     }
 
+    // ---- Case 41: a rebuild something live blocks keeps a short ONEDNN zone when the Graph floor is what it lacks
+    // The ONEDNN zone holds the primitive-API pair, which has no DIRECT fallback, and the oneDNN Graph scratch floor,
+    // which is a reservation: what the zone cannot hold of it goes to the DIRECT path under its cap. So a second load
+    // whose Graph floor needs a larger zone than the live arena has keeps that zone when SCRATCH and RUNTIME hold their
+    // needs and the zone still holds the pair. The kept zone is described by a floor of what it holds beyond the pair,
+    // so the pair bound over it is that pair and the Graph room a context check reads is that floor.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_arena_shortfall_is_reservation_only;
+        using ggml_sycl::zone_arena_sizes;
+        using ggml_sycl::zone_onednn_kept_pair_bytes;
+        using ggml_sycl::zone_onednn_plan_keep_short;
+
+        const zone_arena_sizes have = { 512 * MiB, 400 * MiB, 2048 * MiB };
+        zone_arena_sizes       need = have;
+        need.onednn                 = 1100 * MiB;
+        CHECK(zone_arena_shortfall_is_reservation_only(have, need, 300 * MiB),
+              "a shortfall of the ONEDNN zone alone, with the pair inside the zone, was not kept");
+        CHECK(zone_arena_shortfall_is_reservation_only(have, need, 400 * MiB),
+              "a zone that holds exactly the pair was not kept");
+        CHECK(!zone_arena_shortfall_is_reservation_only(have, need, 400 * MiB + 1),
+              "a zone below the pair it must hold was kept: the pair has no DIRECT fallback");
+        zone_arena_sizes scratch_short = need;
+        scratch_short.scratch          = have.scratch + 1;
+        CHECK(!zone_arena_shortfall_is_reservation_only(have, scratch_short, 300 * MiB),
+              "a SCRATCH shortfall was kept");
+        zone_arena_sizes runtime_short = need;
+        runtime_short.runtime          = have.runtime + 1;
+        CHECK(!zone_arena_shortfall_is_reservation_only(have, runtime_short, 300 * MiB),
+              "a RUNTIME shortfall was kept");
+        CHECK(!zone_arena_shortfall_is_reservation_only(have, have, 300 * MiB),
+              "zones that hold every need were taken for a keep, though nothing is short");
+        zone_arena_sizes onednn_equal = need;
+        onednn_equal.onednn           = have.onednn;
+        CHECK(!zone_arena_shortfall_is_reservation_only(have, onednn_equal, 300 * MiB),
+              "an ONEDNN zone holding exactly its need was taken for a keep");
+
+        // The first model's zone: a 200 MiB pair and a 128 MiB floor. The second plans a 300 MiB pair (its own halves)
+        // and a 1 GiB floor in the 400 MiB zone that stays.
+        const zone_onednn_plan held = { 200 * MiB, 128 * MiB, 150 * MiB, 50 * MiB };
+        const zone_onednn_plan live = { 300 * MiB, 1024 * MiB, 200 * MiB, 100 * MiB };
+        const zone_onednn_plan kept = zone_onednn_plan_keep_short(held, live, 400 * MiB, 0);
+        CHECK(kept.bare_bytes == 300 * MiB && kept.weights_bytes == 200 * MiB && kept.activations_bytes == 100 * MiB,
+              "the kept zone is not described by the larger plan's whole pair");
+        CHECK(kept.graph_floor_bytes == 100 * MiB, "the kept floor is not the zone less the pair plan");
+        CHECK(zone_onednn_kept_pair_bytes(kept, 0) == 300 * MiB, "with no pair held, the pair plan is not kept");
+
+        // A pair already held above the plan (two plans' halves merged): the floor gives way to it, so the bound over
+        // the stored snapshot is the held pair, and the pair stays admitted.
+        const zone_onednn_plan merged = zone_onednn_plan_keep_short(held, live, 400 * MiB, 350 * MiB);
+        CHECK(zone_onednn_kept_pair_bytes(merged, 350 * MiB) == 350 * MiB, "a held pair above the plan was not kept");
+        CHECK(merged.graph_floor_bytes == 50 * MiB, "the kept floor overlaps the pair already held");
+        const size_t bound =
+            ggml_sycl::zone_onednn_pp_pair_bound(400 * MiB, merged.bare_bytes, merged.graph_floor_bytes);
+        CHECK(bound == 350 * MiB, "the pair bound over the kept snapshot fell below the pair already held");
+        CHECK(400 * MiB - bound == merged.graph_floor_bytes,
+              "the Graph room a context check reads over the kept snapshot is not the kept floor");
+        CHECK(ggml_sycl::zone_onednn_graph_uncovered_bytes(80 * MiB, 400 * MiB - bound) == 30 * MiB,
+              "a context's Graph scratch beyond the kept room is not the part the room cannot hold");
+
+        // zone_onednn_plan_keep's maximum floor is what the keep must not store: its bound would fall to the bare plan
+        // and the 350 MiB pair already held would exceed it.
+        const zone_onednn_plan maxed = ggml_sycl::zone_onednn_plan_keep(held, live);
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(400 * MiB, maxed.bare_bytes, maxed.graph_floor_bytes) < 350 * MiB,
+              "sanity: the maximum floor's bound admits the held pair, so this case proves nothing");
+
+        // The pair fills the zone: no Graph room, all Graph scratch on the DIRECT path.
+        const zone_onednn_plan full = zone_onednn_plan_keep_short(held, live, 300 * MiB, 0);
+        CHECK(full.graph_floor_bytes == 0, "a zone the pair fills was given a Graph floor");
+        const zone_onednn_plan over = zone_onednn_plan_keep_short(held, live, 250 * MiB, 0);
+        CHECK(over.graph_floor_bytes == 0, "a pair above the zone did not leave the floor at 0");
+
+        // A zone with room beyond both plans' floors stores no floor above what a plan asked for.
+        const zone_onednn_plan small_held = { 50 * MiB, 64 * MiB, 40 * MiB, 10 * MiB };
+        const zone_onednn_plan small_live = { 60 * MiB, 64 * MiB, 50 * MiB, 10 * MiB };
+        const zone_onednn_plan slack      = zone_onednn_plan_keep_short(small_held, small_live, 300 * MiB, 0);
+        CHECK(slack.graph_floor_bytes == 64 * MiB, "the kept floor rose above the larger of the plans' floors");
+
+        // A tie keeps the held pair, as zone_onednn_plan_keep does.
+        const zone_onednn_plan tie_live = { 200 * MiB, 1024 * MiB, 100 * MiB, 100 * MiB };
+        const zone_onednn_plan tie      = zone_onednn_plan_keep_short(held, tie_live, 400 * MiB, 0);
+        CHECK(tie.weights_bytes == 150 * MiB && tie.activations_bytes == 50 * MiB && tie.graph_floor_bytes == 200 * MiB,
+              "a tie did not keep the held pair, or its floor is not the zone less that pair");
+    }
+
+    // ---- Case 42: the DIRECT Graph-scratch cap's budget snapshot does not rise while the arena is kept -------------
+    // The cap bounds the Graph floor, so a snapshot that rose with the budget (another tenant leaving) would raise the
+    // floor of a zone nothing rebuilt, and a keep would be taken where a sufficient zone stood.
+    {
+        constexpr size_t GiB = 1024ull * 1024ull * 1024ull;
+        using ggml_sycl::zone_graph_direct_cap_snapshot_kept;
+        CHECK(zone_graph_direct_cap_snapshot_kept(0, 6 * GiB) == 6 * GiB, "an unset snapshot did not take the figure");
+        CHECK(zone_graph_direct_cap_snapshot_kept(8 * GiB, 6 * GiB) == 6 * GiB, "a smaller budget was not taken");
+        CHECK(zone_graph_direct_cap_snapshot_kept(6 * GiB, 8 * GiB) == 6 * GiB, "the snapshot rose while kept");
+        CHECK(zone_graph_direct_cap_snapshot_kept(6 * GiB, 6 * GiB) == 6 * GiB, "an equal budget changed the snapshot");
+    }
+
+    // ---- Case 43: a kept zone warns once per load and device, and at every keep outside a load ------------------
+    {
+        using ggml_sycl::zone_kept_onednn_warn_due;
+        CHECK(zone_kept_onednn_warn_due(0, 7), "a load's first keep did not warn");
+        CHECK(!zone_kept_onednn_warn_due(7, 7), "a load's second keep warned again");
+        CHECK(zone_kept_onednn_warn_due(7, 8), "the next load's keep did not warn");
+        CHECK(zone_kept_onednn_warn_due(0, 0) && zone_kept_onednn_warn_due(7, 0),
+              "a keep outside a staged load did not warn");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

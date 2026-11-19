@@ -585,6 +585,45 @@ struct zone_arena_refusal {
     zone_arena_teardown_refusal teardown = zone_arena_teardown_refusal::NONE;
 };
 
+// Whether a rebuild of the arena that something live blocks can be answered by keeping the zones as they are: SCRATCH
+// and RUNTIME hold what the plan needs, the ONEDNN zone does not, and it still holds `onednn_pair_bytes`, the pair it
+// must keep room for (zone_onednn_kept_pair_bytes). The primitive-API pair has no DIRECT fallback, but the oneDNN
+// Graph scratch floor is a reservation, not a requirement: what the zone cannot hold of it is served on the DIRECT path
+// under its cap, or a context needing it is refused by name. A zone that is not short is not a keep (the caller has
+// nothing to decide). Pure.
+bool zone_arena_shortfall_is_reservation_only(const zone_arena_sizes & have,
+                                              const zone_arena_sizes & need,
+                                              size_t                   onednn_pair_bytes);
+
+// The pair bytes an ONEDNN zone kept short must keep room for: the pair held in the zone now (`held_pair_bytes`, 0 when
+// none is, or when it lies outside the arena) or the pair plan `kept` describes, whichever is larger. Pure.
+size_t zone_onednn_kept_pair_bytes(const zone_onednn_plan & kept, size_t held_pair_bytes);
+
+// The snapshot to store for an ONEDNN zone of `capacity_bytes` kept short for `live` while `held` describes it: the
+// pair of zone_onednn_plan_keep, and a Graph floor of what the zone holds beyond that pair (capacity less
+// zone_onednn_kept_pair_bytes, 0 when the pair fills it), never above the larger of the two plans' floors. Not
+// zone_onednn_plan_keep's maximum floor: that would raise the stored floor above what the kept zone holds, the pair
+// bound (zone_onednn_pp_pair_bound) would fall with it, and a pair already held could then exceed the bound, so the
+// Graph room a context check reads (capacity less the bound) would be larger than the zone has. Over the stored
+// snapshot the bound is the kept pair bytes and the Graph room is the stored floor. Pure.
+zone_onednn_plan zone_onednn_plan_keep_short(const zone_onednn_plan & held,
+                                             const zone_onednn_plan & live,
+                                             size_t                   capacity_bytes,
+                                             size_t                   held_pair_bytes);
+
+// The budget snapshot the DIRECT Graph-scratch cap is derived from (onednn_graph_scratch_direct_cap), stored when the
+// zones are found sufficient or kept short: it never rises while the arena is kept, so a cap that rose with the budget
+// cannot raise the Graph floor of a zone nothing rebuilt. `held_bytes` 0 is unset, and `current_bytes` is stored. A
+// rebuilt arena stores the current figure outright. Pure.
+size_t zone_graph_direct_cap_snapshot_kept(size_t held_bytes, size_t current_bytes);
+
+// Whether a call that kept an ONEDNN zone short logs its WARN: once per load transaction and device. `latched_txn` is
+// the load the device's last WARN was for. A load's stage plans in two passes, and a micro-batch's grow leg asks for
+// the zones again, so one kept zone would otherwise warn up to three times. A call outside a staged load (`load_txn`
+// 0: tests, the plan dry run, a context's best-effort re-plan, the oneDNN pair's reserve) has no load to latch on, and
+// warns at every keep. Pure.
+bool zone_kept_onednn_warn_due(uint64_t latched_txn, uint64_t load_txn);
+
 // The line a model load refused for `refusal` logs, without a newline: the device, each zone's need and have in MB, the
 // shortfall of each zone that is short (a zone short by under 0.1 MB prints its three figures in KB, or in bytes under
 // 1 KB, so no shortfall prints as nothing), the reason, and what the caller can do. Empty for NONE. The zones are
