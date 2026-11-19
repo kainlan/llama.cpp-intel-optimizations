@@ -1240,6 +1240,18 @@ def routed_prestage_release_violations(source: str) -> list[str]:
     releases = body.count("unpin_routed_experts")
     if releases != 1:
         failures.append(f"ggml_sycl_mul_mat_id releases routed pins at {releases} sites; the guard is the only one")
+    # The guard reads the receipt when the function exits, so nothing after the prestage may change it: a clear(), a
+    # move or a reassignment would leave the guard nothing to release. After the prestage statement the result is
+    # named only to read a member other than the receipt (the counters the debug line prints).
+    statement_end = body.index(";", pinned)
+    for i in range(statement_end, len(body)):
+        if body[i] != "routed_prestage":
+            continue
+        member = body[i + 2] if i + 2 < len(body) and body[i + 1] == "." else None
+        if member is None or member == "pins":
+            failures.append("ggml_sycl_mul_mat_id names the prestage receipt after the prestage call, where the "
+                            "guard alone may read it")
+            break
     return failures
 
 
@@ -1259,6 +1271,7 @@ def test_routed_prestage_pins_released_on_every_exit() -> None:
     without = fn.replace(guard, "", 1)
     first_throw = re.compile(r"throw ggml_sycl_fallback_error\([^;]*\);\n").search(without, without.index(PRESTAGE_PIN))
     prestage_block = "if (use_routing_prestage) {\n"
+    after_prestage = "    char * src1_original"
     mutants = {
         "guard-removed": without,
         "guard-after-first-throw": (without[:first_throw.end()] + guard + without[first_throw.end():]
@@ -1268,6 +1281,10 @@ def test_routed_prestage_pins_released_on_every_exit() -> None:
                                        "std::vector<ggml_sycl::routed_expert_pin> pins;", fn, count=1),
         "guard-releases-nothing": fn.replace("ggml_sycl::unpin_routed_experts(device, pins);", "(void) device;", 1),
         "explicit-release-restored": fn[:-1] + "    ggml_sycl::unpin_routed_experts(ctx.device, routed_prestage.pins);\n}",
+        "receipt-cleared-after-prestage": fn.replace(after_prestage,
+                                                     "    routed_prestage.pins.clear();\n" + after_prestage, 1),
+        "receipt-moved-after-prestage": fn.replace(after_prestage, "    auto moved = std::move(routed_prestage.pins);\n"
+                                                   + after_prestage, 1),
     }
     for name, mutated in mutants.items():
         assert mutated != fn, f"mutation changed nothing: {name}"
