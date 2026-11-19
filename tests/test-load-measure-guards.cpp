@@ -352,8 +352,10 @@ static void test_late_check_fold() {
 static void test_measure_n_ctx() {
     CHECK(llama_load_measure_n_ctx(0, 262144) == 262144, "n_ctx 0 did not become the training context");
     CHECK(llama_load_measure_n_ctx(4096, 262144) == 4096, "the caller's n_ctx was replaced");
-    // the params use the same helper, so the recorded n_ctx is the one the measure ran at
-    CHECK(llama_load_measure_context_params(0, 262144).n_ctx == llama_load_measure_n_ctx(0, 262144),
+    // the params read the shape the reservation and the record read, so the recorded n_ctx is the one the measure
+    // ran at
+    CHECK(llama_load_measure_context_params(llama_load_measure_shape_resolve(0, 0, 262144)).n_ctx ==
+              llama_load_measure_shape_resolve(0, 0, 262144).n_ctx,
           "the measure's n_ctx and the recorded n_ctx disagree");
 }
 
@@ -386,6 +388,11 @@ static void test_measure_shape_resolve() {
     const llama_load_measure_shape dflt_odd = llama_load_measure_shape_resolve(LLAMA_N_CTX_HINT_DEFAULT, 0, 4100);
     CHECK(dflt_odd.n_ctx == 4352 && dflt_odd.n_ubatch == llama_auto_ubatch_ladder[0],
           "the default sentinel must pad the training context: %u %u", dflt_odd.n_ctx, dflt_odd.n_ubatch);
+    // Under the default sentinel the micro-batch is clamped to the unpadded training context, as a named context's is.
+    const llama_load_measure_shape dflt_short = llama_load_measure_shape_resolve(LLAMA_N_CTX_HINT_DEFAULT, 512, 300);
+    CHECK(dflt_short.n_ctx == 512 && dflt_short.n_ubatch == 300,
+          "the default sentinel must clamp the micro-batch to the unpadded training context: %u %u", dflt_short.n_ctx,
+          dflt_short.n_ubatch);
     // llama_context clamps the micro-batch to the context before it pads the context, so the clamp reads the
     // caller's own context, not the padded one.
     const llama_load_measure_shape small = llama_load_measure_shape_resolve(300, 512, 262144);
@@ -935,7 +942,8 @@ static void test_state_terms() {
 
 static void test_measure_kv_shape() {
     for (uint32_t n_ctx : { 0u, 4096u }) {
-        llama_context_params params            = llama_load_measure_context_params(n_ctx, 262144);
+        llama_context_params params =
+            llama_load_measure_context_params(llama_load_measure_shape_resolve(n_ctx, 0, 262144));
         params.n_seq_max                       = 3;
         params.kv_unified                      = true;
         params.swa_full                        = true;
@@ -945,7 +953,8 @@ static void test_measure_kv_shape() {
               "n_ctx %u: the shape is %u/%u/%u/%d/%d", n_ctx, shape.n_ctx, shape.n_ubatch, shape.n_seq_max,
               (int) shape.kv_unified, (int) shape.swa_full);
     }
-    const ggml_sycl_measure_kv_shape d = llama_load_measure_kv_shape(llama_load_measure_context_params(0, 262144));
+    const ggml_sycl_measure_kv_shape d =
+        llama_load_measure_kv_shape(llama_load_measure_context_params(llama_load_measure_shape_resolve(0, 0, 262144)));
     CHECK(d.n_ctx == 262144 && !d.kv_unified == !llama_context_default_params().kv_unified &&
               !d.swa_full == !llama_context_default_params().swa_full,
           "the default shape is %u/%d/%d", d.n_ctx, (int) d.kv_unified, (int) d.swa_full);
@@ -966,12 +975,22 @@ static void test_refusal_text() {
 // --- the measure's context shape (I3) -----------------------------------------------------------
 
 static void test_measure_params_tie_to_the_ladder() {
-    const llama_context_params p = llama_load_measure_context_params(0, 4096);
+    const llama_context_params p = llama_load_measure_context_params(llama_load_measure_shape_resolve(0, 0, 4096));
     CHECK(p.n_ubatch == llama_auto_ubatch_ladder[0], "n_ubatch %u, ladder bottom %u", p.n_ubatch,
           llama_auto_ubatch_ladder[0]);
     CHECK(p.n_batch >= p.n_ubatch, "n_batch %u below n_ubatch %u", p.n_batch, p.n_ubatch);
     CHECK(p.n_ctx == 4096, "n_ctx 0 did not become the training context: %u", p.n_ctx);
-    CHECK(llama_load_measure_context_params(1234, 4096).n_ctx == 1234, "the caller's n_ctx was replaced");
+    CHECK(llama_load_measure_context_params(llama_load_measure_shape_resolve(1234, 0, 4096)).n_ctx == 1280,
+          "the caller's n_ctx, padded as the context pads it");
+    const llama_context_params wide =
+        llama_load_measure_context_params(llama_load_measure_shape_resolve(4096, 2048, 262144));
+    CHECK(wide.n_ctx == 4096 && wide.n_ubatch == 2048 && wide.n_batch >= 2048,
+          "the measure must run at the caller's shape: %u %u %u", wide.n_ctx, wide.n_ubatch, wide.n_batch);
+    // a micro-batch above the default n_batch raises the measure's n_batch with it, so the measure context does not
+    // clamp the micro-batch it was given
+    const llama_context_params big =
+        llama_load_measure_context_params(llama_load_measure_shape_resolve(8192, 4096, 262144));
+    CHECK(big.n_ubatch == 4096 && big.n_batch == 4096, "a micro-batch above n_batch: %u %u", big.n_ubatch, big.n_batch);
     for (size_t i = 1; i < llama_auto_ubatch_ladder_size; ++i) {
         CHECK(llama_auto_ubatch_ladder[i - 1] < llama_auto_ubatch_ladder[i], "ladder is not ascending at %zu", i);
     }

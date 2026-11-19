@@ -14,8 +14,10 @@ one measure-only context over a load's placement. This gate pins, on comment-str
   early pass could not stage;
 - every refusal goes through the one `[LOAD-PLAN] compute-slot measure failed at ... (refused)` text, which
   occurs once in src/;
-- the shape is the auto-ubatch ladder's bottom rung (no literal 512) and the caller's n_ctx (the training
-  context for 0);
+- the shape is the one the caller's hints resolve to (`llama_load_measure_shape_resolve`): the context and
+  micro-batch the caller told the load, the training context and the auto-ubatch ladder's bottom rung (no literal
+  512) where it told none; the loader resolves it once per measure scope, prints it on the compute-slot line, and
+  sends the same resolver's micro-batch to the backend in the inventory;
 - the compute term is the one per-chunk peak helper of llama-measure-plan.h (no second reduction);
 - the probe, admitted and late stages measure through one helper, `llama_load_stage_measure`, which puts the
   weight stand-ins up before the measure and logs its trace, and split a failed measure through one
@@ -67,12 +69,12 @@ mutate = _gate.mutate
 function_body = _gate.function_body
 
 _MEASURE = (
-    "llama_load_measure_result llama_load_measure(const llama_model & model, uint32_t n_ctx, uint64_t load_txn, "
-    "enum ggml_sycl_measure_stage stage)"
+    "llama_load_measure_result llama_load_measure(const llama_model & model, const llama_load_measure_shape & shape, "
+    "uint64_t load_txn, enum ggml_sycl_measure_stage stage)"
 )
 _RUN = (
     "llama_load_measure_result llama_load_measure_run(const llama_model & model, llama_measure_context_args & args, "
-    "const llama_measure_override_procs & procs, uint32_t n_ctx, uint64_t load_txn, "
+    "const llama_measure_override_procs & procs, const llama_load_measure_shape & shape, uint64_t load_txn, "
     "enum ggml_sycl_measure_stage stage, int first_device)"
 )
 _PLAN_ABSENT_BLOCK = (
@@ -80,12 +82,13 @@ _PLAN_ABSENT_BLOCK = (
     "out.unsupported = true; out.refusal = llama_load_measure_refusal_text(stage, first_device, why); return out; }"
 )
 _LATE = (
-    "llama_late_check_result llama_load_late_check(const llama_model & model, uint32_t n_ctx, "
+    "llama_late_check_result llama_load_late_check(const llama_model & model, const llama_load_measure_shape & shape, "
     "struct ggml_sycl_load_txn txn, const std::vector<llama_measure_dummy_entry> & weights)"
 )
 _STAGE_MEASURE = (
-    "static llama_load_measure_result llama_load_stage_measure(const llama_model & model, uint32_t n_ctx, "
-    "uint64_t load_txn, enum ggml_sycl_measure_stage stage, const std::vector<llama_measure_dummy_entry> & weights)"
+    "static llama_load_measure_result llama_load_stage_measure(const llama_model & model, "
+    "const llama_load_measure_shape & shape, uint64_t load_txn, enum ggml_sycl_measure_stage stage, "
+    "const std::vector<llama_measure_dummy_entry> & weights)"
 )
 _STAGE_FAIL = (
     "static void llama_load_stage_fail(const llama_load_measure_result & measured, std::string & unsupported, "
@@ -98,7 +101,18 @@ _REFUSAL = (
     "inline std::string llama_load_measure_refusal_text(enum ggml_sycl_measure_stage stage, int device, "
     "const std::string & reason)"
 )
-_PARAMS = "inline llama_context_params llama_load_measure_context_params(uint32_t n_ctx, uint32_t n_ctx_train)"
+_PARAMS = "inline llama_context_params llama_load_measure_context_params(const llama_load_measure_shape & shape)"
+_SHAPE = (
+    "inline llama_load_measure_shape llama_load_measure_shape_resolve(uint32_t n_ctx_hint, uint32_t n_ubatch_hint, "
+    "uint32_t n_ctx_train)"
+)
+_SHAPE_FALLBACK = "const uint32_t n_ubatch = n_ubatch_hint != 0 ? n_ubatch_hint : llama_auto_ubatch_ladder[0];"
+_SHAPE_N_CTX = "const uint32_t n_ctx = llama_load_measure_n_ctx(named ? n_ctx_hint : 0, n_ctx_train);"
+# the loader's one shape per measure scope, from the model's hints
+_MODEL_SHAPE = (
+    "static llama_load_measure_shape llama_model_load_measure_shape(const llama_model & model)"
+)
+_MEASURE_SHAPE_LOCAL = "const llama_load_measure_shape measure_shape = llama_model_load_measure_shape(*this);"
 _FOLD = (
     "inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs & procs, "
     "struct ggml_sycl_load_txn txn, const std::vector<llama_load_measure_device> & devices, uint32_t n_ubatch)"
@@ -118,7 +132,7 @@ def measure_ok(code: str) -> bool:
         "llama_context_sycl_measure_backend_init(",
         "ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr)",
         "args.backends.emplace_back(cpu);",
-        "return llama_load_measure_run(model, args, llama_context_sycl_measure_override_procs(sycl_devs[0]), n_ctx, "
+        "return llama_load_measure_run(model, args, llama_context_sycl_measure_override_procs(sycl_devs[0]), shape, "
         "load_txn, stage, first_device);",
     ]
     pos = [b.find(z(t)) for t in order]
@@ -136,7 +150,7 @@ def run_ok(code: str) -> bool:
         _PLAN_ABSENT_BLOCK,
         "std::unique_ptr<llama_context> holder;",
         # llama.cpp-p6i0: the params come first, so the override re-fits the plan's KV for their KV shape
-        "const llama_context_params params = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train);",
+        "const llama_context_params params = llama_load_measure_context_params(shape);",
         "const ggml_sycl_measure_kv_shape kv_shape = llama_load_measure_kv_shape(params);",
         "llama_measure_plan_override guard(procs, load_txn, stage, &kv_shape);",
         "if (!guard.installed())",
@@ -207,12 +221,17 @@ def refusal_text_is_once() -> bool:
 
 
 def params_ok(code: str) -> bool:
+    """The measure's params are the resolved shape, and the shape falls back to the ladder's bottom rung (from the
+    helper the real context's trial reads), never a literal 512."""
     b = function_body(code, _PARAMS)
+    s = function_body(code, _SHAPE)
     return (
-        z("params.n_ubatch = llama_auto_ubatch_ladder[0];") in b
-        and z("params.n_ctx = llama_load_measure_n_ctx(n_ctx, n_ctx_train);") in b
+        z("params.n_ubatch = shape.n_ubatch;") in b
+        and z("params.n_ctx = shape.n_ctx;") in b
         and z("params.n_batch = std::max(params.n_batch, params.n_ubatch);") in b
         and "512" not in b
+        and z(_SHAPE_FALLBACK) in s
+        and "512" not in s
         and '#include"llama-auto-ubatch.h"' in code
     )
 
@@ -241,7 +260,7 @@ def stage_measure_ok(code: str) -> bool:
         "llama_measure_dummy_scope dummies(weights);",
         "if (dummies.failed())",
         'out.refusal = llama_load_measure_refusal_text(stage, -1, "a weight stand-in buffer was refused"); return out;',
-        "llama_load_measure_result measured = llama_load_measure(model, n_ctx, load_txn, stage);",
+        "llama_load_measure_result measured = llama_load_measure(model, shape, load_txn, stage);",
         "llama_load_measure_log_trace(measured);",
         "return measured;",
     ]
@@ -270,17 +289,12 @@ def late_ok(code: str) -> bool:
     order = [
         _STAGE_PROCS,
         "if (!procs.available())",
-        "llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights)",
+        "llama_load_stage_measure(model, shape, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights)",
         _STAGE_FAILED,
         "llama_late_check_fold(procs, txn, measured.devices, n_ubatch)",
     ]
     pos = [b.find(z(t)) for t in order]
-    return (
-        -1 not in pos
-        and pos == sorted(pos)
-        and z("const uint32_t n_ubatch = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;")
-        in b
-    )
+    return -1 not in pos and pos == sorted(pos) and z("const uint32_t n_ubatch = shape.n_ubatch;") in b
 
 
 def fold_ok(code: str) -> bool:
@@ -365,28 +379,28 @@ def site_ok(code: str) -> bool:
 
 
 _PROBE = (
-    "llama_load_probe_result llama_load_probe_bound(const llama_model & model, uint32_t n_ctx, "
+    "llama_load_probe_result llama_load_probe_bound(const llama_model & model, const llama_load_measure_shape & shape, "
     "struct ggml_sycl_load_txn txn, const std::vector<llama_measure_dummy_entry> & weights)"
 )
 _ADMIT = (
-    "llama_admitted_check_result llama_load_admitted_check(const llama_model & model, uint32_t n_ctx, "
-    "struct ggml_sycl_load_txn txn, const std::vector<llama_measure_dummy_entry> & weights, "
-    "const llama_load_probe_result & probe)"
+    "llama_admitted_check_result llama_load_admitted_check(const llama_model & model, "
+    "const llama_load_measure_shape & shape, struct ggml_sycl_load_txn txn, "
+    "const std::vector<llama_measure_dummy_entry> & weights, const llama_load_probe_result & probe)"
 )
 _N_CTX = "inline uint32_t llama_load_measure_n_ctx(uint32_t n_ctx, uint32_t n_ctx_train)"
 
 
 def probe_ok(code: str) -> bool:
     """Stage (a), llama.cpp-p6i0: C-hat is measured at PROBE over the weight stand-ins, and the measured devices are
-    handed to llama_load_probe_reserve at the n_ctx the measure ran at (never the envelope's 0), which reserves each
-    SYCL device's state then its compute term and skips the host tier (pinned by test-load-measure-guards)."""
+    handed to llama_load_probe_reserve at the shape's n_ctx, the one the measure ran at, which reserves each SYCL
+    device's state then its compute term and skips the host tier (pinned by test-load-measure-guards)."""
     b = function_body(code, _PROBE)
     order = [
         _STAGE_PROCS,
         "if (!procs.available() || !procs.load_terms_available())",
-        "llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE, weights)",
+        "llama_load_stage_measure(model, shape, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE, weights)",
         _STAGE_FAILED,
-        "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
+        "const uint32_t measured_n_ctx = shape.n_ctx;",
         "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);",
         # both outcomes kept: the declined compute terms and, apart from them, the reserved states
         "out.compute_declined = std::move(reserved.compute_declined);",
@@ -412,14 +426,15 @@ def probe_ok(code: str) -> bool:
 
 def admit_ok(code: str) -> bool:
     """Stage (b), llama.cpp-p6i0: c(P) is measured at the admitted placement, folded against the probe bound, and
-    only an admitted result is recorded, at the measure's n_ctx."""
+    only an admitted result is recorded, at the shape's n_ctx and micro-batch, the ones the measure ran at."""
     b = function_body(code, _ADMIT)
     order = [
         _STAGE_PROCS,
         "if (!procs.available() || !procs.load_terms_available())",
-        "llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights)",
+        "llama_load_stage_measure(model, shape, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights)",
         _STAGE_FAILED,
-        "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
+        "const uint32_t measured_n_ctx = shape.n_ctx;",
+        "const uint32_t n_ubatch = shape.n_ubatch;",
         "llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved, measured.devices, measured_n_ctx,",
         "if (!out.refusal.empty()) { return out; }",
         "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);",
@@ -445,19 +460,23 @@ def admit_ok(code: str) -> bool:
 
 
 def n_ctx_ok(code: str) -> bool:
-    """One n_ctx rule: the measure's params and the recorded/reserved n_ctx read the same helper."""
+    """One n_ctx rule: the measure's params read the shape, and the shape reads the training-context fallback."""
     b = function_body(code, _N_CTX)
+    s = function_body(code, _SHAPE)
     p = function_body(code, _PARAMS)
-    return z("return n_ctx != 0 ? n_ctx : n_ctx_train;") in b and z(
-        "params.n_ctx = llama_load_measure_n_ctx(n_ctx, n_ctx_train);"
-    ) in p
+    return (
+        z("return n_ctx != 0 ? n_ctx : n_ctx_train;") in b
+        and z(_SHAPE_N_CTX) in s
+        and z("params.n_ctx = shape.n_ctx;") in p
+    )
 
 
 def stage_order_ok(code: str) -> bool:
     """The loader's order (llama.cpp-p6i0): the tensors exist, the probe bound is measured and handed to the planner,
     the late inventory packs, c(P) is measured and recorded at the admitted placement, the dev_layer sync runs, and
-    the late check compares. Each new call is made once, with the same n_ctx and transaction the late check passes,
-    and each refusal is thrown."""
+    the late check compares. Each new call is made once, with the same shape and transaction the late check passes,
+    and each refusal is thrown. The shape is resolved once per measure scope from the model's hints, never the
+    placement envelope's n_ctx of 0."""
     c = code
     done = c.find(z("ml.done_getting_tensors();"))
     probe = c.find(z("llama_load_probe_bound("))
@@ -473,13 +492,21 @@ def stage_order_ok(code: str) -> bool:
         return False
     if c.count(z("llama_model_sycl_set_late_inventory(ml, *this, use_mlock, __func__);")) != 1:
         return False
-    args = z("llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn,")
+    args = z("measure_shape, sycl_model_loading_guard.txn,")
     probe_seg = c[probe:late_inv]
     admit_seg = c[admit:sync]
     unsupported = block_after(probe_seg, "if (!probe.unsupported.empty())")
+    # one local shape for the probe and admitted calls, one for the late call, both from the one model helper
+    shape_local = z(_MEASURE_SHAPE_LOCAL)
+    first_shape = c.find(shape_local)
     return (
-        args in c[probe : probe + 300]
+        c.count(shape_local) == 2
+        and -1 < first_shape < probe
+        and c.find(shape_local, first_shape + 1) in range(sync, late)
+        and z("llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn") not in c
+        and args in c[probe : probe + 300]
         and args in c[admit : admit + 300]
+        and args in c[late : late + 300]
         and z("admitted_weights, probe);") in c[admit : admit + 400]
         and "LLAMA_LOG_WARN(" in unsupported
         # the weights may still be placed by the late plan; only the compute slot goes unreserved
@@ -583,7 +610,7 @@ def test_run_mutants():
         ("status unread", "status.status != sched_reserve_status::OK", "false"),
         ("unsupported read as a refusal", "catch (const llama_measure_unsupported & e) {\n        out.unsupported = true;\n        out.refusal", "catch (const llama_measure_unsupported & e) {\n        out.refusal"),
         ("a refusal outside the text", "out.refusal = llama_load_measure_refusal_text(stage, first_device, e.what());\n        return out;\n    }\n\n    const", "out.refusal = e.what();\n        return out;\n    }\n\n    const"),
-        ("the shape hand-written", "llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train)", "llama_context_default_params()"),
+        ("the shape hand-written", "llama_load_measure_context_params(shape)", "llama_context_default_params()"),
         ("no KV shape for the re-fit", "guard(procs, load_txn, stage, &kv_shape);", "guard(procs, load_txn, stage, nullptr);"),
         ("the KV shape not the context's", "llama_load_measure_kv_shape(params);", "llama_load_measure_kv_shape(llama_context_default_params());"),
         ("no staged-plan query", _PLAN_ABSENT_BLOCK, ""),
@@ -674,8 +701,12 @@ def test_the_measure_shape_comes_from_the_ladder():
     assert params_ok(code_of(MEASURE_H))
     code = code_of(MEASURE_H)
     b = function_body(code, _PARAMS)
-    assert not params_ok(code.replace(b, mutate(b, "llama_auto_ubatch_ladder[0]", "512"), 1))
+    s = function_body(code, _SHAPE)
+    assert not params_ok(code.replace(s, mutate(s, "llama_auto_ubatch_ladder[0]", "512"), 1))
     assert not params_ok(code.replace(b, mutate(b, "std::max(params.n_batch, params.n_ubatch)", "params.n_batch"), 1))
+    # the caller's micro-batch dropped for the fixed rung the measure ran at before the shape reached it
+    assert not params_ok(code.replace(b, mutate(b, "params.n_ubatch = shape.n_ubatch;",
+                                                "params.n_ubatch = llama_auto_ubatch_ladder[0];"), 1))
 
 
 def test_one_per_chunk_peak():
@@ -698,7 +729,7 @@ def test_stage_measure_mutants():
     for name, old, new in [
         ("stand-ins dropped", "llama_measure_dummy_scope dummies(weights);", ""),
         ("a refused stand-in ignored", "if (dummies.failed()) {", "if (false) {"),
-        ("the measure at a fixed stage", "llama_load_measure(model, n_ctx, load_txn, stage);", "llama_load_measure(model, n_ctx, load_txn, GGML_SYCL_MEASURE_STAGE_PROBE);"),
+        ("the measure at a fixed stage", "llama_load_measure(model, shape, load_txn, stage);", "llama_load_measure(model, shape, load_txn, GGML_SYCL_MEASURE_STAGE_PROBE);"),
         ("the trace not logged", "llama_load_measure_log_trace(measured);", ""),
     ]:
         assert not stage_measure_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
@@ -762,6 +793,7 @@ def test_late_mutants():
         ("a failed measure ignored", "if (!measured.ok) {\n        llama_load_stage_fail(measured, out.unsupported, out.refusal);\n        return out;\n    }", ""),
         ("the fold bypassed", "return llama_late_check_fold(procs, txn, measured.devices, n_ubatch);", "return out;"),
         ("no procs", "const llama_sycl_l4_procs procs = llama_load_stage_procs(model);", "const llama_sycl_l4_procs procs = {};"),
+        ("the fold given the ladder's rung, not the shape's", "const uint32_t n_ubatch = shape.n_ubatch;", "const uint32_t n_ubatch = llama_auto_ubatch_ladder[0];"),
     ]:
         assert not late_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
 
@@ -882,7 +914,8 @@ def test_probe_mutants():
     for name, old, new in [
         ("measured at the admitted stage", "GGML_SYCL_MEASURE_STAGE_PROBE, weights)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights)"),
         ("no reservation", "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "(void) measured_n_ctx;"),
-        ("the envelope's n_ctx reserved", "llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx)", "llama_load_probe_reserve(procs, txn, measured.devices, n_ctx)"),
+        ("n_ctx 0 reserved", "llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx)", "llama_load_probe_reserve(procs, txn, measured.devices, 0)"),
+        ("the micro-batch reserved as the context", "const uint32_t measured_n_ctx = shape.n_ctx;", "const uint32_t measured_n_ctx = shape.n_ubatch;"),
         ("the probe's residency not kept", "out.kv = measured.kv;", ""),
         ("the declined devices dropped", "out.compute_declined = std::move(reserved.compute_declined);", ""),
         ("the reserved states dropped", "out.state_reserved = std::move(reserved.state_reserved);", ""),
@@ -905,7 +938,8 @@ def test_admit_mutants():
         ("measured at the late stage", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights)"),
         ("recorded despite a refusal", "if (!out.refusal.empty()) {\n        return out;\n    }", ""),
         ("never recorded", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", ""),
-        ("recorded at n_ctx 0", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", "out.n_recorded = llama_admitted_record(procs, txn, out, n_ctx);"),
+        ("recorded at n_ctx 0", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", "out.n_recorded = llama_admitted_record(procs, txn, out, 0);"),
+        ("the fold given the ladder's rung, not the shape's", "const uint32_t n_ubatch = shape.n_ubatch;", "const uint32_t n_ubatch = llama_auto_ubatch_ladder[0];"),
         ("the fold bypassed", "llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, measured.devices, probe.compute_declined, probe.state_reserved, measured.devices,"),
         ("the admitted stage reserves", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),
         ("unreserved devices compared", "llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, {}, probe.state_reserved, measured.devices,"),
@@ -915,7 +949,7 @@ def test_admit_mutants():
         ("the probe's residency judged against itself", "probe.kv, measured.kv);", "probe.kv, probe.kv);"),
         ("the admitted stage reserves state", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),
         ("the state never recorded", "out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);", ""),
-        ("the state recorded at n_ctx 0", "out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);", "out.n_state_recorded = llama_admitted_record_state(procs, txn, out, n_ctx);"),
+        ("the state recorded at n_ctx 0", "out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);", "out.n_state_recorded = llama_admitted_record_state(procs, txn, out, 0);"),
         ("the state recorded before the refusal check", "    if (!out.refusal.empty()) {\n        return out;\n    }\n    out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);\n    out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);", "    out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }\n    out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);"),
     ]:
         assert not admit_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
@@ -1095,7 +1129,10 @@ def test_one_n_ctx_rule():
     code = code_of(MEASURE_H)
     assert n_ctx_ok(code)
     p = function_body(code, _PARAMS)
-    assert not n_ctx_ok(code.replace(p, mutate(p, "llama_load_measure_n_ctx(n_ctx, n_ctx_train)", "n_ctx"), 1))
+    assert not n_ctx_ok(code.replace(p, mutate(p, "params.n_ctx = shape.n_ctx;", "params.n_ctx = 0;"), 1))
+    s = function_body(code, _SHAPE)
+    assert not n_ctx_ok(code.replace(s, mutate(s, "llama_load_measure_n_ctx(named ? n_ctx_hint : 0, n_ctx_train)",
+                                               "(named ? n_ctx_hint : 0)"), 1))
     b = function_body(code, _N_CTX)
     assert not n_ctx_ok(code.replace(b, mutate(b, "return n_ctx != 0 ? n_ctx : n_ctx_train;", "return n_ctx;"), 1))
 
@@ -1126,6 +1163,56 @@ def test_stage_order_mutants():
     assert not stage_order_ok(code.replace(z("if (probe.measured)"), z("if (true)"), 1))
     # a second probe call
     assert not stage_order_ok(code + z("llama_load_probe_bound(*this, 0, sycl_model_loading_guard.txn, w);"))
+    # a call given the placement envelope's n_ctx of 0 again
+    envelope = z("llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn,")
+    for call in ("llama_load_probe_bound(", "llama_load_admitted_check(", "llama_load_late_check("):
+        at = code.find(z(call))
+        seg = code[at : at + 300]
+        back = seg.replace(z("measure_shape, sycl_model_loading_guard.txn,"), envelope, 1)
+        assert back != seg, call
+        assert not stage_order_ok(code.replace(seg, back, 1)), f"the envelope's n_ctx at {call} slipped through"
+    local = z(_MEASURE_SHAPE_LOCAL)
+    # a third shape resolved apart from the two scopes
+    assert not stage_order_ok(code.replace(local, local + local, 1)), "a third measure shape slipped through"
+    # the late scope with no shape of its own
+    last = code.rfind(local)
+    assert not stage_order_ok(code[:last] + code[last + len(local):]), "a late scope with no shape slipped through"
+
+
+def test_the_load_line_prints_the_measured_shape():
+    """The compute-slot WARN prints the shape the admitted measure ran at and no longer says the caller's shape is
+    not transported."""
+    code = z(MODEL_CPP)
+    assert z("measured at n_ctx %u ubatch %u, the context and micro-batch this load was told") in code
+    assert "are not transported" not in MODEL_CPP
+    assert "do not reach the load (fkpg)" not in MEASURE_H
+
+
+def inventory_shape_ok(model_code: str) -> bool:
+    """The micro-batch the backend credits the term at comes from the resolver the measures use, over the same hints
+    and the same training context."""
+    helper = function_body(model_code, _MODEL_SHAPE)
+    return (
+        z("inventory.n_ubatch_measure = llama_load_measure_shape_resolve(n_ctx_hint, n_ubatch_hint, "
+          "hparams.n_ctx_train).n_ubatch;") in model_code
+        and model_code.count(z("inventory.n_ubatch_measure =")) == 1
+        and helper.endswith(z("{ return llama_load_measure_shape_resolve(model.get_n_ctx_hint(), "
+                              "model.get_n_ubatch_hint(), model.hparams.n_ctx_train); }"))
+    )
+
+
+def test_the_inventory_carries_the_measured_micro_batch():
+    code = code_of(MODEL_CPP)
+    assert inventory_shape_ok(code)
+    sent = "inventory.n_ubatch_measure = llama_load_measure_shape_resolve(n_ctx_hint, n_ubatch_hint, hparams.n_ctx_train).n_ubatch;"
+    for name, new in [
+        ("the planning rung sent", "inventory.n_ubatch_measure = inventory.n_ubatch;"),
+        ("the raw hint sent", "inventory.n_ubatch_measure = n_ubatch_hint;"),
+        ("the field never set", ""),
+    ]:
+        assert not inventory_shape_ok(mutate(code, sent, new)), f"mutant {name!r} slipped through"
+    helper = function_body(code, _MODEL_SHAPE)
+    assert not inventory_shape_ok(code.replace(helper, mutate(helper, "model.get_n_ubatch_hint()", "0"), 1))
 
 
 if __name__ == "__main__":
