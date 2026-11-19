@@ -6231,6 +6231,34 @@ set_tests_properties(test-moe-mixed-residency-q1-nvfp4 PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# The Q1_0/NVFP4 batched-dispatch refusal at run time: on the mixed-residency vehicle (NVFP4, one card expert and three
+# host experts at one token), a failpoint makes the batched dispatch refuse once, and the op must end
+# GGML_STATUS_FAILED with the WARN that names reason=test-failpoint; the same op run again in the same process must then
+# succeed and match the CPU backend on both sides. The failpoint exists only in the private backend objects, so it
+# links ggml-sycl-private-fixtures (not the ordinary DSO) and closes the MMID route those objects compile in. It loads a
+# planned model onto the card, so it carries the `model` label, which the full sweep excludes. Pinned to the B50; a run
+# with no SYCL GPU, more than one visible card, or GGML_SYCL_WEIGHTS_EVICTABLE off exits 77.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-q1-nvfp4-dispatch-refusal
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-q1-nvfp4-dispatch-refusal.cpp
+)
+target_include_directories(test-moe-q1-nvfp4-dispatch-refusal PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-moe-q1-nvfp4-dispatch-refusal PRIVATE ggml-sycl-private-fixtures)
+set_target_properties(test-moe-q1-nvfp4-dispatch-refusal PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-q1-nvfp4-dispatch-refusal COMMAND test-moe-q1-nvfp4-dispatch-refusal)
+set_tests_properties(test-moe-q1-nvfp4-dispatch-refusal PROPERTIES
+    LABELS "sycl;moe;device;B50;model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
+)
+endif() # private SYCL backend fixture
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp
