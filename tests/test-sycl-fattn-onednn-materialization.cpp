@@ -27,6 +27,7 @@
 #include "ggml-sycl/fattn-onednn.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "sycl-selector-fallback.hpp"
+#include "test-skip.h"
 
 #include <cstdint>
 #include <cmath>
@@ -37,7 +38,7 @@
 #if !defined(GGML_USE_SYCL) || !GGML_SYCL_DNNL
 int main() {
     std::printf("GGML SYCL oneDNN not enabled; skipping test.\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

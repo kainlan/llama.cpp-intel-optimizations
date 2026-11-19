@@ -11,6 +11,7 @@
 #include "ggml-sycl/tests/pinned-host-block-test-common.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "sycl-selector-fallback.hpp"
+#include "test-skip.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -27,7 +28,7 @@ bool test_moe_storage_handle_first_route_and_negatives();
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
