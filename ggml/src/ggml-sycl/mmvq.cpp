@@ -17956,7 +17956,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
 
                 auto * grouped_scratch_extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
                 if (!grouped_scratch_extra) {
-                    // No tensor extra to own the cached grouped scratch: nothing was allocated.
+                    // No tensor extra to own the cached grouped scratch: no grouped scratch was allocated.
                     return log_xmx_reject("group-scratch-owner");
                 }
                 auto & grouped_scratch    = grouped_scratch_extra->weight().moe_grouped_scratch[ctx.device];

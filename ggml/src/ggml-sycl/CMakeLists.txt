@@ -6237,7 +6237,8 @@ endif() # static SYCL backend fixture
 # succeed and match the CPU backend on both sides. The failpoint exists only in the private backend objects, so it
 # links ggml-sycl-private-fixtures (not the ordinary DSO) and closes the MMID route those objects compile in. It loads a
 # planned model onto the card, so it carries the `model` label, which the full sweep excludes. Pinned to the B50; a run
-# with no SYCL GPU, more than one visible card, or GGML_SYCL_WEIGHTS_EVICTABLE off exits 77.
+# with no SYCL GPU, more than one visible card, GGML_SYCL_WEIGHTS_EVICTABLE off, or a published plan that leaves the
+# op's experts on one side only exits 77.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-q1-nvfp4-dispatch-refusal
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-q1-nvfp4-dispatch-refusal.cpp
