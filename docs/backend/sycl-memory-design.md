@@ -2638,8 +2638,9 @@ the ring. Shrinking the ring then frees RUNTIME bytes, which KV cannot use. For
 any G > 0 there is a `-c` whose KV fits in VRAM with the 512 MB zone and is
 demoted to the host with the grown one. That is the micro-batch beating KV,
 which the owner ruling forbids ("KV all-VRAM wins over a larger micro-batch").
-The real `n_ctx` is not known at load (`llama.cpp-fkpg`), so no load-time amount
-is safe.
+The load knows only the context the caller says it will create
+(`llama_model_params::n_ctx_hint`); a context created later can be larger (a
+reused model, or a caller that named none), so no load-time amount is safe.
 
 **The rule: decide at context time, after KV.** The transaction admits KV first.
 `ggml_sycl_replan_pp_moe_onednn_ring()` then places and admits the ring for the
@@ -3474,20 +3475,22 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   That is an open finding, not an invariant of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512
   (`MOE_GPU_UBATCH_MAX`), so their term is the auto pick's.
 - Every load-time path runs at `n_seq_max` 1 and cannot see the context's sequence count. The probe, the admitted stage
-  and the late check all build their measure context from the default parameters. So the state term holds one sequence's
-  state, and the late check compares one sequence's state with one sequence's state. A context with `-np` above 1
-  allocates about `n_seq_max` times that state, RUNTIME-first and before its compute buffer. The excess takes RUNTIME
-  room from the compute term, and the buffer's last chunk can land `zone=raw`. The context constructor names it. Right
-  after its memory exists, it compares each SYCL device's state with the planned state term the backend holds
-  (`ggml_backend_sycl_planned_state_term`). The state is the memory's bytes for that device's buffer type. When the
-  state is larger, it WARNs `[LOAD-PLAN] state term exceeded on device N` with `n_seq_max`, both sizes and the excess. A
-  load that planned no state term at all (a model the measure cannot run, a backend without the load procs, or a
-  declined reservation) gets its own line instead, `[LOAD-PLAN] state term not planned on device N`, which does not
-  blame the one-sequence measure. It never refuses: `-np` is a normal user option, and a context the user asked for is
-  placed and warned, never shrunk or refused. `tests/test-sycl-load-measure-source.py` pins the WARN and pins that
-  neither the comparison nor its text helper refuses. The fix is to transport the caller's `n_seq_max` into the load's
-  measure, as `-c` and `-ub` now are. It is tracked as `llama.cpp-0zyy`. The state is summed per buffer type, so a type
-  holding several buffers can round up by one grain per extra buffer beyond the term.
+  and the late check all build their measure context at the caller's context and micro-batch and take every other
+  parameter from the defaults. So the state term holds one sequence's state, and the late check compares one
+  sequence's state with one sequence's state. A context with `-np` above 1 allocates about `n_seq_max` times that
+  state, RUNTIME-first and before its compute buffer. The excess takes RUNTIME room from the compute term, and the
+  buffer's last chunk can land `zone=raw`. The context constructor names it. Right after its memory exists, it compares
+  each SYCL device's state with the planned state term the backend holds (`ggml_backend_sycl_planned_state_term`). The
+  state is the memory's bytes for that device's buffer type. When the state is larger, it WARNs
+  `[LOAD-PLAN] state term exceeded on device N` with `n_seq_max`, both sizes and the excess. A load that planned no
+  state term at all (a model the measure cannot run, a backend without the load procs, or a declined reservation) gets
+  its own line instead,
+  `[LOAD-PLAN] state term not planned on device N`, which does not blame the one-sequence measure. It never refuses:
+  `-np` is a normal user option, and a context the user asked for is placed and warned, never shrunk or refused.
+  `tests/test-sycl-load-measure-source.py` pins the WARN and pins that neither the comparison nor its text helper
+  refuses. The fix is to transport the caller's `n_seq_max` into the load's measure, as `-c` and `-ub` now are. It is
+  tracked as `llama.cpp-0zyy`. The state is summed per buffer type, so a type holding several buffers can round up by
+  one grain per extra buffer beyond the term.
 - A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
   refused while the first model holds allocations, so that load reaches the abort in
   `compute_and_store_plan_for_inventory`. `llama.cpp-ouur` refuses it by name instead.
