@@ -1909,6 +1909,8 @@ size_t                        ggml_sycl_get_free_vram_at_init(int device);
 size_t                        ggml_sycl_get_host_max_alloc_size();
 const sycl_peer_link_info *   ggml_sycl_get_peer_link_info(int src_device, int dst_device);
 void                          ggml_sycl_dump_peer_link_info();
+// Whether the placement plan for the registered model spans every physical GPU. Same predicate the planner asks.
+bool                          ggml_sycl_multi_device_plan_for_loaded_model();
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 namespace ggml_sycl {
@@ -4547,7 +4549,8 @@ struct ggml_tensor_extra_gpu {
         }
         data_device[dev] = ptr;
         if (ptr) {
-            data_handle[dev] = ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, layout, on_device);
+            data_handle[dev] = ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, layout, on_device,
+                                                                     ggml_sycl::chunk_lease_site::TENSOR_EXTRA);
         } else {
             data_handle[dev] = ggml_sycl::mem_handle{};
         }
@@ -4667,9 +4670,11 @@ struct ggml_tensor_extra_gpu {
         }
 
         if (!installed_source_handle) {
-            data_handle[dev] = on_device ? ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, storage_layout, true) :
-                                           ggml_sycl::mem_handle::from_direct(ptr, storage_layout, false,
-                                                                              ggml_sycl::mem_handle::HOST_DEVICE);
+            data_handle[dev] =
+                on_device ?
+                    ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, storage_layout, true,
+                                                          ggml_sycl::chunk_lease_site::TENSOR_EXTRA) :
+                    ggml_sycl::mem_handle::from_direct(ptr, storage_layout, false, ggml_sycl::mem_handle::HOST_DEVICE);
         }
 
         layout.mode        = storage_layout;

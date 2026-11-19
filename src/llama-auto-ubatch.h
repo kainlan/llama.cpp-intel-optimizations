@@ -60,6 +60,10 @@ static const uint32_t llama_auto_ubatch_ladder[] = { 512, 1024, 2048, 4096 };
 static const size_t   llama_auto_ubatch_ladder_size =
     sizeof(llama_auto_ubatch_ladder) / sizeof(llama_auto_ubatch_ladder[0]);
 
+// The largest micro-batch the trial tries for a MoE model. This is the picker's own policy: it keeps MoE models at
+// the width the tuning cache and the baselines were measured at until wider widths are measured against it.
+static const uint32_t llama_auto_ubatch_moe_ceiling = 512;
+
 // The smallest n_ubatch the trial lowers itself to (llama.cpp-kpjw).
 static const uint32_t llama_auto_ubatch_descent_floor = 64;
 
@@ -184,12 +188,10 @@ inline bool llama_auto_ubatch_ctor_lowered_skips_trial(bool             ctor_low
     return ctor_lowered && !llama_auto_ubatch_ladder_has_candidate(ladder, n_ladder, lowered_ubatch, cap);
 }
 
-// The trial's cap: min(n_batch, n_ctx), narrowed to the GPU MoE routing
-// ceiling for a MoE model whenever that ceiling does not exceed it. A ceiling
-// equal to the cap still binds, so the stop reason names the ceiling.
-// `moe_cap_available` is false when the backend does not export the ceiling
-// (an older SYCL DSO); the caller then passes any moe_cap and no narrowing
-// happens. *moe_bound is set to whether the ceiling is the binding cap.
+// The trial's cap: min(n_batch, n_ctx), narrowed to the picker's MoE ceiling (llama_auto_ubatch_moe_ceiling) for a
+// MoE model whenever that ceiling does not exceed it. A ceiling equal to the cap still binds, so the stop reason
+// names the ceiling. `moe_cap_available` false means no narrowing happens, whatever moe_cap is.
+// *moe_bound is set to whether the ceiling is the binding cap.
 inline uint32_t llama_auto_ubatch_cap(uint32_t n_batch,
                                       uint32_t n_ctx,
                                       uint32_t n_expert,

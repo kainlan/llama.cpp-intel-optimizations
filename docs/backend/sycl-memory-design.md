@@ -1652,9 +1652,9 @@ not inside the "zone is big enough" branch.** The first version of this step
 put the release inside `if (total_needed <= zone_cap)`, after the
 `total_needed > zone_cap` branch's `ensure_planned_arena_zones()` re-plan
 attempt. Spec review caught the consequence: `ensure_planned_arena_zones()`'s
-`has_live_scratch` refusal check
+`has_live_scratch` refusal check of that time
 (`onednn_weights_scratch_ != nullptr || onednn_activations_scratch_ != nullptr
-|| ...`) treats a non-null pointer as still-live *regardless of who owns
+|| ...`) treated a non-null pointer as still-live *regardless of who owns
 it* — including the reservation's own predecessor, about to be replaced by
 the very call that is checking. So on exactly the path that most needed the
 fix — an existing arena reservation growing into a bigger one — the old
@@ -1683,6 +1683,12 @@ memory quietly again. A CPU-only source-contract check
 precedes the growth-path re-plan") pins the ordering the same way the
 existing hook-before-early-return checks pin theirs, and is confirmed to fail
 against the pre-fix commit.
+
+The rebuild gate has since become exact: `arena_count_scratch_holders()` counts
+a cache scratch buffer as a holder only when `vram_owns()` its pointer, and
+`zone_arena_rebuild_allowed()` decides. An arena-owned predecessor still counts,
+so the point-release above must still run first; a direct scratch outside the
+arena no longer refuses a rebuild.
 
 **Nothing else lives in the ONEDNN VRAM zone — grep-verified, not assumed.**
 The only `zone_alloc(vram_zone_id::ONEDNN, ...)` call sites in the entire
@@ -2780,8 +2786,9 @@ the ring. Shrinking the ring then frees RUNTIME bytes, which KV cannot use. For
 any G > 0 there is a `-c` whose KV fits in VRAM with the 512 MB zone and is
 demoted to the host with the grown one. That is the micro-batch beating KV,
 which the owner ruling forbids ("KV all-VRAM wins over a larger micro-batch").
-The real `n_ctx` is not known at load (`llama.cpp-fkpg`), so no load-time amount
-is safe.
+The load knows only the context the caller says it will create
+(`llama_model_params::n_ctx_hint`); a context created later can be larger (a
+reused model, or a caller that named none), so no load-time amount is safe.
 
 **The rule: decide at context time, after KV.** The transaction admits KV first.
 `ggml_sycl_replan_pp_moe_onednn_ring()` then places and admits the ring for the
@@ -2863,9 +2870,70 @@ re-fit's forced re-admission and the `vram_bytes` charge all read that. The two
 facts differ across a model load. The arena and the physical ring outlive a
 model, and a load resets the planned placement to RUNTIME. So a load releases a
 ring that still holds KV-zone bytes, because the reserve's "already sufficient"
-path would otherwise keep it. A slot claimed by an in-flight dispatch refuses
-that release, and it is never forced. The ring is then kept, KV still counts
-what it holds, and the next re-fit re-admits it.
+path would otherwise keep it. The release is an effect of the load stage
+(`ggml_sycl_release_stale_kv_zone_ring()`). A load runs the stage twice, an
+early pass and then a late one, and within each the release runs only after
+every refusal of that pass is decided: a pass refused before its effects does
+not release the ring this way. The early pass's effects run before the late pass
+decides, so a load refused in its late pass may already have released the ring
+in its early pass. The entry ensure's last resort, below, is the one release a
+pass makes before its last refusal. A slot claimed by an in-flight dispatch
+refuses that release, and it is never forced. The ring is then kept, KV still
+counts what it holds, and the next re-fit re-admits it.
+
+**The load stage's two passes.** `ggml_backend_sycl_stage_load_inventory_plan()`
+plans every device first. It configures a device's host zones, sets up its layer
+streaming and releases its stale ring only after the last refusal of the pass,
+early or late, is decided, so an early pass's effect (the stale ring's release)
+comes before any refusal of the late pass. The decide pass publishes planning
+state, which the abort of a refused load puts back, together with the two-card
+MoE flag its planner sets (`g_moe_multi_gpu_active`). The decide pass is not
+free of device effects. The planner's zone decision sizes the VRAM arena's
+zones, and it may rebuild an arena nothing holds for larger zones, at the entry
+ensure or at the micro-batch's grow leg. A refused load keeps the rebuilt arena,
+or leaves the device with no arena when the reserve after the teardown failed. A
+plan that needs the secondary MoE devices also creates their shared queues and
+caches, which stay. The effect pass then runs, device by device and each from
+the snapshot that device staged: the stale ring's release, the layer streaming
+the late pass decided on, and the late pass's host zones
+(`ggml_sycl_configure_host_zones_for_plan()`). A load refused in its decide pass
+therefore configures no device's host zones, which a later load configures from
+its own plan. An effect can still end a load after an earlier device's effects
+ran. The two candidate checks around each device's effects throw when the load's
+owner or candidate changed, and an effect's own host allocation can throw (a
+zone or pool that cannot be allocated falls back instead). The earlier device
+then keeps its configured host zones, its released stale ring and, in a late
+pass, the layer streaming its effects set up. The abort releases no layer
+streaming, and a load whose abort cleans up keeps no model token, so no model
+teardown releases it either: the working set stays until the next model's first
+weight upload on that device displaces it (`register_host_ptr()`), or until the
+process exits. A load whose abort fails keeps its token, and the teardown of
+that token releases the working set by owner.
+
+The one ring release in the decide pass is the entry ensure's last resort
+(`ggml_sycl_ensure_load_arena_zones()`): when the plan's zones need a rebuild
+and the ring's slot buffers are the arena's only holders
+(`zone_arena_only_ring_holds()`), the ring is released and the zones are asked
+for again. The premise is counted, not owned. The ring is the only holder when
+nothing else points into the arena: no other allocation live in its zones, no
+lease on its chunks, no other cache scratch buffer inside it. That says nothing
+about who still uses the ring. A prefill's claim on one of its slots refuses the
+release, and the load is refused as for any holder. A claim outlives its
+prefill: it is let go when a later prefill takes that slot, when a context on
+the device is freed (its backend drains the device's slots), or when it is
+released unused. A context therefore loses the ring only while no claim on its
+slots is held: before its first claim, when every claim was released unused, or
+after a context on the device was freed. It reserves the ring again at its next
+dispatch; that is the accepted cost of the last resort.
+
+The release rests on the premise's precondition: no zone holds a live byte
+beside the ring, so no context with weights or KV on that device can be
+dispatching. The slot buffers' handles are let go inside the release, before
+the second ensure counts the holders. A copy of a slot buffer's handle that
+outlived its claim's count would keep that buffer allocated: the second ensure
+counts it as a live allocation beside the ring, the rebuild is held, the load
+is refused, and the arena is never rebuilt under the buffer, so a late copy is
+never a use after free.
 
 **Contiguity.** Each KV-zone slot is one allocation. So the whole KV-zone part
 must also fit the zone's largest free block, read after the old ring is
@@ -2922,8 +2990,7 @@ the prompt and generation tests of one `-b`/`-ub` pair share one model, and it
 reloads the model only when the named micro-batch changes. A reload re-plans
 the experts but not the arena's zones. The arena outlives the model and keeps a
 zone that is larger than a new plan needs. It rebuilds only a zone that is too
-small, and only while it holds nothing, which the PP MoE ring a previous context
-left prevents. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
+small, never to shrink one. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
 instances plan against the RUNTIME zone the 2048 load grew, and keep fewer
 experts on the device than a fresh process would. Such a load prints one WARN
 line after its plan, when the live zone is larger than the zone the arena
@@ -2998,16 +3065,44 @@ than the RUNTIME zone can hold with every device-resident expert re-placed to th
 largest -ub that fits is <L> (device=0)
 ```
 
-The arena can fail to grow for two reasons, and each prints its own line first:
+The arena can fail to grow for three reasons, and each prints its own line first:
 
-- **Another live model holds allocations in the arena.** Zones are rebuilt only
-  in an unused arena, so `ensure_planned_arena_zones()` refuses the rebuild with
-  an ERROR:
+- **Something still points into the arena.** Zones are rebuilt only in an arena
+  nothing points into: no zone byte allocated, no lease on a chunk, and no cache
+  scratch buffer whose pointer the arena owns. A scratch buffer allocated outside
+  the arena keeps its memory through a rebuild and does not count
+  (`zone_arena_rebuild_allowed()` decides). Another live model's allocations are
+  one cause; scratch an earlier model left in the arena, and handles that still
+  lease a chunk, are others. `ensure_planned_arena_zones()` refuses the rebuild
+  with an ERROR, names the holders on a second ERROR, prints the chunk leases by
+  the site that took them on a WARN, and lists the live allocations of each zone
+  with live bytes:
 
   ```
   [VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: need scratch=<S> MB
   oneDNN=<O> MB runtime=<R> MB; have scratch=<S0> MB oneDNN=<O0> MB runtime=<R0> MB; live_zone=<L> MB chunk_leases=<C>
+  [VRAM-ARENA] live in the arena on device <D> (MB): <zone>=<MB> ...; deferred_in_arena=<n> (<MB> MB requested)
+  device_release_retries=<n> device_live_controls=<n> retired_pending=<n> evictions_in_flight=<n>
+  cache_scratch_in_arena=<n> (pp_moe_ring_slots=<n>) cache_scratch_outside=<n> live_beside_ring=<n>
+  [VRAM-ARENA] chunk leases on device <D> by site: <site>=<n> <site>(copy)=<n> ... (sum <n> of <C>)
+  [UNIFIED-ALLOC] live-zone-dump at arena-rebuild device=<D> zone=<z> used=<MB> MB ...
   ```
+
+  `pp_moe_ring_slots` counts the PP MoE ring's slot buffers among the cache's
+  scratch in the arena, and `live_beside_ring` the zone allocations that are not
+  those slots, read from each allocator group's own record. When the ring's
+  slots are the only holders (no other scratch, nothing beside the ring, no
+  chunk lease), a model load's entry ensure releases the ring after these lines
+  and asks for the zones again, with a WARN that says so; the ring is kept while
+  a prefill's claim on one of its slots is still held, with a WARN that says so,
+  and the load is refused as for any holder.
+
+  The sites are `weight_snapshot`, `weight_resolve`, `chunk_view` (a handle made
+  from a raw pointer for one use), `tensor_extra`, `expert_dispatch` and
+  `untagged` (a direct caller of the lease API). `(copy)` counts the leases that
+  copies of those handles took; a copy keeps the site of the handle it copies.
+  The counts by site sum to the chunks' leases, up to a lease taken or dropped
+  between the two reads.
 
 - **The tail chunk's cap.** The rebuilt arena's tail chunk holds the ONEDNN,
   RUNTIME and SCRATCH zones plus a minimum KV carve-out, and the device's
@@ -3015,9 +3110,45 @@ The arena can fail to grow for two reasons, and each prints its own line first:
   with `[VRAM-ARENA] Per-chunk cap <P> MB too small to hold tail zones (<T> MB) +
   min KV (<K> MB); refusing reservation`.
 
-Either way the load keeps the planning shape: it re-publishes the ring and the
+- **The teardown refuses.** A rebuild tears the arena down first
+  (`arena_destroy()`), and a teardown can refuse: the host cannot reserve the
+  teardown's own bookkeeping, allocations are live in the arena, the host cannot
+  record the allocations it waits on, a lease does not end in time, or the device
+  refuses to free a chunk. The ensure then refuses with its own reason
+  (`TEARDOWN_REFUSED`, the cause in `zone_arena_refusal::teardown`), no arena is
+  reserved after it, and one ERROR line names the cause:
+
+  ```
+  [VRAM-ARENA] the arena on device <D> could not be torn down (<cause>); it stays closed to new allocations and
+  no arena is reserved over it: need scratch=<S> MB oneDNN=<O> MB runtime=<R> MB
+  ```
+
+  Every cause but the host bookkeeping one refuses after the teardown closed the
+  arena, which stays closed until a teardown completes. Every later ensure on that
+  device refuses for it, whatever the zones hold, and the load's refusal says to
+  load the model in a new process. A refusal for the host bookkeeping leaves the
+  arena as it was (`it is as it was` in the line), binds its compute zone again,
+  and says to free host memory and load again.
+
+In each case the load keeps the planning shape: it re-publishes the ring and the
 dense scratch at the load's own micro-batch, sizes the zones for them, and plans
 without the room. So no expert leaves the device for a zone that did not grow.
+After a teardown that left the arena closed, that sizing refuses the load too.
+
+A plan that is tried and discarded publishes nothing. While a plan is computed
+the planner publishes terms of its own: the MoE host scatter scratch for the
+experts it moved to host, the MoE CONTROL requirement, and the oneDNN Graph and
+non-FA attention scratch shapes. The plan with the room is discarded here, so
+before the zones are sized the load puts those terms back as they stood before
+it planned with the room (`ggml_sycl::planner_published_terms` in
+`unified-cache.hpp`, which the plan dry run restores through as well, and which
+the `sycl-runtime-alloc` ctest (binary `test-sycl-runtime-alloc`, source
+`ggml/src/ggml-sycl/tests/test-unified-runtime-alloc.cpp`) checks against the
+cache's own state). The zones are then asked for what the entry check found
+they hold, and the plan without the room publishes its own terms.
+Without that restore, a plan that had moved experts to host left its host
+scatter term published, and the fallback asked a RUNTIME zone that could not
+grow for 90 KB more than it held and aborted.
 One WARN line, at every verbosity, says the named micro-batch was not placed:
 
 ```
@@ -3029,20 +3160,116 @@ The context then re-plans the ring as described above.
 Only the single-device plan places. A multi-device plan makes no decision, so
 its context keeps the context-time path.
 
+A load whose zones cannot be had is refused, not aborted. Both zone checks of
+the plan, the entry check and the fallback's after it put the discarded plan's
+terms back, end the same way when the arena cannot grow to what the load needs:
+after the lines above, one ERROR names the device, each zone's need and have,
+the shortfall of each short zone, why the zones cannot grow and what to free.
+
+```
+[SYCL-PLAN] model load refused on device <D>: VRAM arena zones SCRATCH need <S> MB have <S0> MB, ONEDNN need
+<O> MB have <O0> MB, RUNTIME need <R> MB have <R0> MB (<X> MB short); <B> MB of live allocations in its zones
+hold the arena (the [VRAM-ARENA] lines above name them), so its zones cannot grow. Free the model or context they
+belong to, then load this one again
+```
+
+A zone short by less than 0.1 MB prints its need, have and shortfall in KB, or
+in bytes under 1 KB (`RUNTIME need 1835016.0 KB have 1835008.0 KB (8.0 KB
+short)`), so a shortfall never reads `0.0 MB short`.
+
+The clause after the zones names each kind of holder the rebuild gate refused
+on, with its count, and the remedy follows from them. Live allocations in the
+zones belong to a model or context, and freeing it lets the zones grow: the
+line above. `<N> leases on its chunks` with nothing live in the zones outlived
+what they point at, and `<M> of the cache's own scratch buffers` (the oneDNN
+scratch pair, the reorder temp, a persistent scratch) stay in the arena until
+the cache is torn down at process exit. No free releases either, so the line
+then says to load the model in a new process before any other on the device.
+The cache's scratch decides the remedy whatever else holds the arena. The PP
+MoE ring is the cache's too, but a load releases it when its slot buffers are
+the arena's only holders and no prefill's claim on one of its slots is held. A
+held claim keeps it, and the line then reads `Only the cache's PP MoE ring holds
+it, and a prefill's claim on one of its slots keeps it: the claim outlives its
+prefill until a context on device <D> is freed. Free the context that ran the
+prefill, then load this one again`. Live bytes are a model's or a context's only
+when the cache has no release of its own still to run: a free queued in the
+arena, a release waiting for a retry, a retired entry not yet finalized and an
+eviction in flight all keep zone bytes with no owner left. The refusal carries
+those four counts, read where the ERROR line above prints them, and with any of
+them the remedy reads `Some of those bytes may be releases the cache has not
+finished (<counts>), which it finishes on its own. Load this one again; if it is
+refused with the same bytes, free the model or context they belong to`.
+
+When the arena could be rebuilt but the reserve failed (the tail chunk's cap),
+the reason reads `the device could not reserve an arena with these zones. Free
+VRAM on device <D>, then load this one again`. The rebuild destroyed the arena
+before the reserve, so each zone's have is what the device has after the
+failure (0.0 MB), and the reason names the arena it had: `, and the arena it had
+(SCRATCH <S0> MB, ONEDNN <O0> MB, RUNTIME <R0> MB) was released for the rebuild`
+before the remedy. A first reserve on the device released nothing and says
+nothing about it. The line offers no smaller `-c`
+or `-ub`: the load plans its zones at its fixed planning shape, ubatch 512 with
+an `n_ctx` of one ubatch for the planner's terms, and the RUNTIME zone's
+compute term is the one the load measured at `n_ctx_train` and ubatch 512
+(below), so neither flag is the term that grew. Any term can be the one:
+whatever holds the arena keeps the zones at the size an earlier load gave them,
+and the device-wide terms the load publishes from its inventory before the
+entry check (the PP MoE ring, the PP pipeline scratch) are this load's alone.
+The planner's own terms (the MoE CONTROL requirement, the host scatter scratch)
+are published by the plan after that check, so the entry check reads them as
+they stand: the last plan's on the device, or what an uncommitted load put
+back.
+
+The stage returns `GGML_SYCL_LIFECYCLE_PLAN_REJECTED` from either pass, the
+loader throws, and `llama_model_load` returns NULL, so the tool prints its own
+load failure while the model that holds the arena keeps running. The refused
+load puts back the device-wide planned terms it published
+(`ggml_sycl::load_published_terms` in `unified-cache.hpp`: the PP pipeline
+scratch, the ring with its KV-zone slots, row bytes, expert counts and
+micro-batch, the oneDNN pair and its stored sum, and the planner's own terms),
+and nothing another publisher wrote since. The terms carry no owner: a runtime
+context of a live model publishes some of them while the load runs (its ring
+when the micro-batch moves, its non-FA attention shape), and the oneDNN pair's
+reserve raises the stored sum outside the inventory lock. The stage starts a
+record per device once per load transaction, before its first device plans,
+and each planner pass of the load notes into it what the pass changed, under
+`g_tensor_inventory_mutex` (`ggml_sycl::load_published_record`). The abort of
+the load's owner effects, which every failed stage and every uncommitted end
+runs, takes that lock and puts a group of terms back only while it still holds
+what the load published: a group another publisher wrote after the load keeps
+that publisher's terms, and one the load wrote over goes back to them. The sum
+goes back by compare-exchange, so a raise after the load's publish is kept. A
+publisher that writes exactly what the load published cannot be told from the
+load, and its group goes back with the load's. The abort drops the owner-keyed
+terms as before. The compute term's micro-batch is not restored: every load
+records 512. `test-zone-sizing` Case 38 pins the line,
+`tests/test-sycl-load-zone-refusal-source.py` pins the wiring, that every term
+the publish paths set is restored and that the restore keeps a later publish,
+`load_record_keeps_a_later_publish` in the `sycl-runtime-alloc` ctest (binary
+`test-sycl-runtime-alloc`) drives the record, and arm (e) of
+`test-sycl-plan-dry-run` stages a refused load beside a live RUNTIME-zone
+allocation.
+
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
-holds the compute term the load measured at its planning shape, `n_ctx_train`
-and ubatch 512 (`llama.cpp-fkpg`), and the placed micro-batch's ring and dense
-scratch sit beside it. So once the plan has placed the micro-batch, the
-hold-spill fit credits a compute buffer of that rung no larger than the term,
-whole or nothing (`placement_explicit_ubatch_compute_room()` and
-`zone_hold_fit_rung_has_compute_room()`). Every other rung, the auto trial's
-included, is judged as before. Without the credit the fit charges the buffer as
-if the hold kept it out of the zone. On the B70 with Qwen3.8 at `-ub 2048` that
-refused the context: 1993.8 MiB of worst-case spill against 1946.2 MiB free
-outside the arena, although the zone held the 1960 MiB buffer beside a term of
-about 2055 MiB. The 256 MiB driver headroom is not added to the hold. It is free
-memory outside the arena, which demoting experts does not change, and the fit
-still requires it there.
+holds the compute term the load measured at the context and micro-batch the
+caller told it (`n_ctx_train` and ubatch 512 where it told none), and the placed
+micro-batch's ring and dense scratch sit beside it. So once the plan has placed
+the micro-batch, the hold-spill fit credits rungs at or below that rung
+(`placement_explicit_ubatch_compute_room()` and
+`zone_hold_fit_rung_has_compute_room()`): a rung's own measured buffer when it
+is no larger than the term, whole or nothing, and a rung without a record of its
+own only when it is also at or below the micro-batch the term was measured at.
+The term covers the buffers of that rung, and compute buffers grow with the
+micro-batch, so a smaller rung needs no more; a rung between the measured rung
+and a larger placed micro-batch can need more, and an unknown measured rung
+credits no rung without a record. The rung whose own buffer the hold kept
+outside the arena gets no credit; a rung above the room's rung gets none either.
+Without the credit the fit charges the buffer as if the hold kept it out of the
+zone. On the B70 with Qwen3.8 at `-ub 2048` that refused the context: 1993.8 MiB
+of worst-case spill against 1946.2 MiB free outside the arena, although the zone
+held the 1960 MiB buffer beside a term of about 2055 MiB. The 256 MiB driver
+headroom is not added to the hold. It is free memory outside the arena, which
+demoting experts does not change, and the fit still requires it there.
 
 The credit can over-credit a rung whose compute buffers span several chunks,
 because the fit compares the rung's largest single buffer with a term that is a
@@ -3051,12 +3278,15 @@ the term at the placed micro-batch gets no credit, so the hold-spill refusal and
 its largest `-ub` advice still answer that case.
 
 Host tests: `test-pp-moe-ring-admission.cpp` pins the room and the decision,
-`test-zone-sizing.cpp` pins the fit's credit and that every other rung is judged
-as before, `tests/test-sycl-layout-choice.cpp` pins the planner's choice, the
-bytes it moves and the compute room it gives the fit, and
-`tests/test-sycl-explicit-ubatch-placement-source.py` pins the wiring, the fit's
-credit and the placement, refusal and failed-growth lines, with a mutant per
-claim.
+`test-zone-sizing.cpp` pins the fit's credit (Case 24c at the placed rung, Case
+24d's sweep of the credit rule over a room measured at its own rung, below it
+and not at all, with a held-out rung, and Case 24i's B50 GPT-OSS refusal, which
+names 512 where it named 256), and that a fit given no room, and every rung
+above the room's rung, are judged as before, `tests/test-sycl-layout-choice.cpp`
+pins the planner's choice, the bytes it moves and the compute room it gives the
+fit, and `tests/test-sycl-explicit-ubatch-placement-source.py` pins the wiring,
+the fit's credit and the placement, refusal and failed-growth lines, with a
+mutant per claim.
 
 ### A context-time consumer: the planned dense scratch, reserved and re-planned (`llama.cpp-kpjw`)
 
@@ -3081,10 +3311,10 @@ shortfall, because growth allocates the replacement while the old backing is liv
 consumer itself (the ring, the planned scratch) and is the claimant the hold exists for, so it is never held back.
 *Held back* means the hold is what keeps the request out: `hold > 0`, the zone alone could have served it
 (`size <= free`), and the hold refuses it (`zone_runtime_alloc_held_back`, tested on the host). A request larger than the
-zone's free bytes is an ordinary zone-full spill whatever the hold is, and keeps exactly its pre-kpjw path, eviction
-included. (The first version of the predicate was true for any request the zone could not serve, so it refused ordinary
-spills the overcommit guard used to resolve by evicting, logged a false "held back ... (hold 0.0 MB)" and inflated the
-counts; review r2 F1.)
+zone's free bytes is an ordinary zone-full spill whatever the hold is, and keeps exactly its pre-kpjw path to the raw
+exit and its raw-allocation gate. (The first version of the predicate was true for any request the zone could not
+serve, so it refused ordinary spills the overcommit guard used to resolve by evicting, logged a false "held back ...
+(hold 0.0 MB)" and inflated the counts; review r2 F1.)
 The hold is per device, published by the context that owns the buffers
 (`ggml_sycl_planned_scratch_hold_refresh()`) with that context recorded as its owner, falls as the graph-entry walks
 bring each buffer to its plan, and is released by the same context's teardown (`unified_cache_release_planned_scratch_hold`
@@ -3113,11 +3343,11 @@ buffer is the one that moves. It used to move to raw device memory outside the a
 lives (B50, Qwen PPL at auto-ub1024: a 461 MB buffer held back, 107.8 MB left against 256 MB, flash attention out of
 resources). The buffer allocator now marks its request (`alloc_constraints::spill_to_kv_zone_before_raw`), and
 `unified_alloc` places such a request, when the zone will not serve it (held back by the hold, or larger than the zone's
-free bytes), in the KV zone before the overcommit guard and before anything raw
-(`zone_runtime_spill_prefers_kv_zone`, host-tested). The attempt is ahead of the guard on purpose: an in-arena placement
-is memory the arena already reserved, so it cannot overcommit the device and must not evict cached weights. Only that
-request class takes the path; a forbid-spill claimant is still refused, and any other RUNTIME request keeps the previous
-spill path unchanged. Raw device memory is the last resort, taken only when the KV zone cannot hold the buffer whole.
+free bytes), in the KV zone before anything raw (`zone_runtime_spill_prefers_kv_zone`, host-tested). An in-arena
+placement is memory the arena already reserved, so it never reaches the raw-allocation gate at the raw exit (below) and
+never evicts cached weights. Only that request class takes the path; a forbid-spill claimant is still refused, and any
+other RUNTIME request keeps the previous spill path unchanged. Raw device memory is the last resort, taken only when the
+KV zone cannot hold the buffer whole.
 
 Only a scheduler compute buffer is marked. The same buffer type backs the model's WEIGHT tensors, which are allocated
 during the model load, before any KV cache exists; one of them sent to the KV zone would take room this context's KV is
@@ -3128,7 +3358,8 @@ step must stay unreachable for this class). Only the unflagged class (a model lo
 
 A compute buffer the RUNTIME zone did not serve is not silent, and is counted by where it landed: in the KV zone because
 the hold kept it out (`unified_cache_note_planned_hold_spill`, in-arena), in the KV zone because the zone was simply full
-(`unified_cache_note_zone_full_kv_placement`), or RAW (outside the arena, which is what eats the headroom). The first
+(`unified_cache_note_zone_full_kv_placement`), or RAW (outside the arena, which is what eats the headroom; counted at
+the raw exit once the raw allocation is made, so a spill the raw gate refuses is not one). The first
 one of each kind per context is a WARN naming the requester tag and the bytes; the counts are taken at teardown and
 printed as `hold_spills_raw` / `hold_spills_kv_zone` / `hold_spills_kv_zone_full` (with bytes) in the `[SCRATCH-STATS]`
 line, whichever of the three is non-zero. The counters restart at every publish, so the figures a finished context
@@ -3139,9 +3370,41 @@ a throughput difference between two builds can be attributed to where
 a buffer physically sits. A buffer the arena placed is logged where it is placed; one nothing in the arena placed is
 placed by the legacy path in the allocator, which logs the buffer it makes, so the line names the FINAL landing (raw
 device memory, or host-pinned) and never `none` for a buffer that then lives somewhere. A raw
-spill cannot evict weights: the overcommit guard in `unified_alloc` runs for every raw device request, and for a
-hold-induced one it refuses loudly instead of calling `evict_and_flush` (trading a planned buffer's reservation for the
-model's own weights is not a trade the hold may make).
+spill cannot evict weights: it meets the raw-allocation gate at `unified_alloc`'s raw exit (next paragraph), which with
+an arena never evicts, and a hold-induced spill that does not fit is refused at ERROR instead of calling
+`evict_and_flush` (trading a planned buffer's reservation for the model's own weights is not a trade the hold may make).
+
+*The raw-allocation gate.* Device memory outside the arena is checked against the device's physical bytes, not against
+zone counters, which say how full the arena is and not how much of the device is taken. The figure
+(`zone-raw-gate.hpp`, host-tested by `test-zone-sizing` Case 35) is what fits outside the arena: the device total, less
+the arena reservation (`arena_total_size()`; the reservation is committed whole when the arena is made, on one chunk or
+N), less the raw device rows the runtime registry holds outside it (`unified_cache_raw_device_held_bytes`, a walk of
+the registry), less the bytes in use outside this process's accounting when the device's first cache was made. That
+last term is recorded once per device in `create_cache_for_device`, from the free and total reading that sizes the
+first reserve, with no driver query of its own: the bytes the reading shows in use less the raw rows already
+registered, 0 when the reading has no total or free figure. It is a snapshot; if another process frees memory later it
+overstates what is taken and the gate refuses early, the safe direction, so it is never re-read. A device total of 0
+means the total is unknown, and the gate then gates nothing. Two places ask it. `unified_alloc`'s one raw exit asks
+`unified_alloc_raw_gate` before `unified_cache_malloc_device_tracked`; a request an arena zone serves never gets there.
+With an arena active, a request that does not fit is refused by name and nothing is evicted: the plan placed the
+weights, and a raw request the device has no room for is one the plan did not make room for. With no arena it evicts
+what the request is short of (`evict_and_flush`), reads the figure again, and refuses if it still does not fit. The
+device pool's new-chunk and pre-grow sites ask `unified_cache_raw_gate_admits` (`device-pool.hpp`) for their whole
+backing size; pool growth is gated, not forbidden, and evicts nothing. The cache's own raw exits for its entries
+(`ensure_cached`, `allocate(tag)`) do not ask the gate. A refusal is never an abort and never a fallback to another
+tier: it is a WARN (DEBUG when the caller suppresses its failure log; ERROR for the hold-induced spill above) naming the
+request, what fits, the device total, the arena, the raw rows outside the arena and the term outside this process's
+accounting. The figure prints at INFO as `[RAW-GATE] device N: arena ... vs device ...` once per device per arena size,
+so a line printed by a raw request before the arena was reserved is printed again after it is. Locks:
+`g_cache_rw_mutex` (L4) for the cache lookup, then `g_runtime_alloc_mutex` (L5) for the walk, one at a time, except
+that the first raw request on a device, whose lookup creates the cache, takes L5 under L4 exclusive for the
+outside-accounting note (the L4-before-L5 order). Source pin: `tests/test-sycl-raw-gate-source.py`.
+
+Only requests that leave through the raw driver exit reach the gate; on the default paths those are grow-only caches
+and staging buffers, a handful per process. The registry walk is therefore paid beside a driver allocation, not per
+token. A caller that reaches the gate per op is paying a driver allocation per op: that is the defect to fix at that
+caller, not a reason to make the figure cheaper.
+
 *One fit, asked three times (`llama.cpp-kpjw`).* Whether a rung's hold-induced spill leaves the driver its headroom is a
 single fact, and it has a single function: `ggml_sycl_hold_spill_fit` (ggml-sycl.cpp), the composition of
 `zone_hold_fit_inputs` and `zone_hold_fit` (zone-sizing.hpp, host-tested). It is asked by three callers and by nobody
@@ -3510,6 +3773,17 @@ shared zone, and the buffer took whatever the allocator found. On the B70 with Q
   unplanned. A device whose late state is zero is not asked, so a state that leaves a device entirely gives no shrink
   WARN. The loader prints `state term on device N` on its own line beside the compute-slot line.
 
+**A load with no plan at a stage.** A stage measures only when the backend has a plan staged for it:
+`llama_load_measure_run` asks `ggml_backend_sycl_measure_plan_staged`, which reads the install's own lookup, before it
+builds the plan override, and a stage with none is unsupported, not refused. Three loads stage no probe plan. A model
+built in memory with `llama_model_init_from_user` has an empty `weights_map`, and its weights exist only after
+`create_tensor`, so the early pass has nothing to plan. A `no_alloc` load skips the early pass. A load with the VRAM
+arena off stages an explicit no-plan row, which is no plan. Their probe is skipped with a WARN, so no compute or state
+term is reserved and the admitted stage does not run. The late plan still places the in-memory model's weights, from
+`ctx_map`, and its late check measures that plan and WARNs that no early compute term was recorded. A `no_alloc` load
+stages no late plan and an arena-off load stages another no-plan row, so their late check is skipped with a WARN as
+well. For all three the compute buffer is not planned at load.
+
 **Invariant: every RUNTIME-first consumer at context time is named in the reserve.** The real context allocates
 some memory in the RUNTIME zone first, after the load and before its compute buffer. Each such consumer needs a planned
 term of its own, or it draws down the compute term and a compute chunk lands outside the zone. In the Qwen3.8 B70
@@ -3549,35 +3823,37 @@ recovery path: it measures the driver's working set and sizes the headroom from 
 
 **Limits.**
 
-- The term is measured at the load's measure shape, `n_ctx_train` and ubatch 512, because the caller's `-c` and `-ub` do
-  not reach the load (`llama.cpp-fkpg`). A `-c` below `n_ctx_train`, llama-bench's small `n_ctx` and `-ub 256` all
-  over-reserve. Above 512 the term under-reserves, and that is the **default** for a dense model, not only an explicit
-  `-ub`: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch` of 2048 a dense model's auto pick
-  climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto 2048,
-  `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack is smaller. The ladder's per-rung trial
-  (`try_candidate`) does not consult the reserved RUNTIME room. It loses a rung only when the runtime-context
-  transaction is busy or not the published model's, when the probe refuses the rung, when the rung would demote KV, when
-  the candidate publish is refused, when the rung's compute buffers fail to allocate, when one falls back to host
-  memory, or when the rung would leave the card under the driver headroom (the hold-spill fit). A compute buffer that
-  does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, and the trial accepts both. So
-  a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open finding, not an invariant
-  of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
-  auto pick's. `llama.cpp-fkpg` (a) transports the caller's shape.
+- The term is measured at the context and micro-batch the caller tells the load (`n_ctx_hint`, `n_ubatch_hint`), and at
+  `n_ctx_train` and ubatch 512 where it tells none. A load whose model is reused for a later context keeps the term of
+  the shape it was loaded for. Without a named `-ub` the term is measured at 512, and above 512 it under-reserves, which
+  is the **default** for a dense model: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch`
+  of 2048 a dense model's auto pick climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a
+  448.0 MB compute buffer at the auto 2048, `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack
+  is smaller. The ladder's per-rung trial (`try_candidate`) does not consult the reserved RUNTIME room. It loses a rung
+  only when the runtime-context transaction is busy or not the published model's, when the probe refuses the rung,
+  when the rung would demote KV, when the candidate publish is refused, when the rung's compute buffers fail to
+  allocate, when one falls back to host memory, or when the rung would leave the card under the driver headroom (the
+  hold-spill fit). A compute buffer that does not fit RUNTIME takes the KV zone next, then raw device memory outside
+  the arena, and the trial accepts both. So a dense auto pick above 512 can land `zone=raw`, in the external headroom.
+  That is an open finding, not an invariant of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512
+  by the picker (`llama_auto_ubatch_moe_ceiling`), so their term is the auto pick's.
 - Every load-time path runs at `n_seq_max` 1 and cannot see the context's sequence count. The probe, the admitted stage
-  and the late check all build their measure context from the default parameters. So the state term holds one sequence's
-  state, and the late check compares one sequence's state with one sequence's state. A context with `-np` above 1
-  allocates about `n_seq_max` times that state, RUNTIME-first and before its compute buffer. The excess takes RUNTIME
-  room from the compute term, and the buffer's last chunk can land `zone=raw`. The context constructor names it. Right
-  after its memory exists, it compares each SYCL device's state with the planned state term the backend holds
-  (`ggml_backend_sycl_planned_state_term`). The state is the memory's bytes for that device's buffer type. When the
-  state is larger, it WARNs `[LOAD-PLAN] state term exceeded on device N` with `n_seq_max`, both sizes and the excess. A
-  load that planned no state term at all (a model the measure cannot run, a backend without the load procs, or a
-  declined reservation) gets its own line instead, `[LOAD-PLAN] state term not planned on device N`, which does not
-  blame the one-sequence measure. It never refuses: `-np` is a normal user option, and a context the user asked for is
-  placed and warned, never shrunk or refused. `tests/test-sycl-load-measure-source.py` pins the WARN and pins that
-  neither the comparison nor its text helper refuses. The fix is to transport the caller's `n_seq_max` into the load's
-  measure, the same gap `llama.cpp-fkpg` records for `-c` and `-ub`. It is tracked as `llama.cpp-0zyy`. The state is
-  summed per buffer type, so a type holding several buffers can round up by one grain per extra buffer beyond the term.
+  and the late check all build their measure context at the caller's context and micro-batch and take every other
+  parameter from the defaults. So the state term holds one sequence's state, and the late check compares one
+  sequence's state with one sequence's state. A context with `-np` above 1 allocates about `n_seq_max` times that
+  state, RUNTIME-first and before its compute buffer. The excess takes RUNTIME room from the compute term, and the
+  buffer's last chunk can land `zone=raw`. The context constructor names it. Right after its memory exists, it compares
+  each SYCL device's state with the planned state term the backend holds (`ggml_backend_sycl_planned_state_term`). The
+  state is the memory's bytes for that device's buffer type. When the state is larger, it WARNs
+  `[LOAD-PLAN] state term exceeded on device N` with `n_seq_max`, both sizes and the excess. A load that planned no
+  state term at all (a model the measure cannot run, a backend without the load procs, or a declined reservation) gets
+  its own line instead,
+  `[LOAD-PLAN] state term not planned on device N`, which does not blame the one-sequence measure. It never refuses:
+  `-np` is a normal user option, and a context the user asked for is placed and warned, never shrunk or refused.
+  `tests/test-sycl-load-measure-source.py` pins the WARN and pins that neither the comparison nor its text helper
+  refuses. The fix is to transport the caller's `n_seq_max` into the load's measure, as `-c` and `-ub` now are. It is
+  tracked as `llama.cpp-0zyy`. The state is summed per buffer type, so a type holding several buffers can round up by
+  one grain per extra buffer beyond the term.
 - A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
   refused while the first model holds allocations, so that load reaches the abort in
   `compute_and_store_plan_for_inventory`. `llama.cpp-ouur` refuses it by name instead.

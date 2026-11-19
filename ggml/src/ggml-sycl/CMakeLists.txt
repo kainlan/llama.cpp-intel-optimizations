@@ -681,6 +681,8 @@ if (BUILD_TESTING)
         "${_hb_override}an override above the formula gives 200\\.00 GiB, want the formula's 121\\.80 GiB")
     string(CONCAT _hb_re_old_reserve
         "${_hb_table}total=246\\.9 GiB available=150\\.8 GiB gives 142\\.80 GiB \\(status ok\\), want 121\\.80 GiB")
+    set(_hb_re_pinned_unbounded
+        "FAIL \\(6\\) a pinned size past the RAM is refused: 1 byte past a 246\\.9 GiB host's RAM is allowed")
     string(CONCAT _hb_re_warn_above_threshold
         "FAIL \\(1\\) the WARN fires only past the room: "
         "mapped_ws [0-9]+ at or below resident_room [0-9]+ printed the WARN")
@@ -692,6 +694,7 @@ if (BUILD_TESTING)
         test-sycl-host-budget           HOST_BUDGET_MUTANT_CLIFF                "${_hb_re_cliff}"
         test-sycl-host-budget           HOST_BUDGET_MUTANT_OVERRIDE_REPLACES    "${_hb_re_override_replaces}"
         test-sycl-host-budget           HOST_BUDGET_MUTANT_OLD_RESERVE          "${_hb_re_old_reserve}"
+        test-sycl-host-budget           HOST_BUDGET_MUTANT_PINNED_UNBOUNDED     "${_hb_re_pinned_unbounded}"
         test-sycl-host-working-set-warn ""                                      ""
         test-sycl-host-working-set-warn HOST_BUDGET_MUTANT_WARN_ABOVE_THRESHOLD "${_hb_re_warn_above_threshold}"
         test-sycl-host-working-set-warn HOST_BUDGET_MUTANT_P3_CONSTANT          "${_hb_re_p3_constant}")
@@ -943,7 +946,8 @@ if (BUILD_TESTING)
     add_test(NAME sycl-device-uuid-api COMMAND test-sycl-device-uuid-api)
     set_tests_properties(sycl-device-uuid-api PROPERTIES RUN_SERIAL TRUE LABELS "sycl;api;host")
 
-    foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
+    foreach(_case inner-failure missing-success wrong-txn depth-underflow commit-validate-fails-only-by-poison
+                  depth-overflow cancel rollback-idempotence
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown
                   runtime-update-teardown load-effect-drain load-effect-abort-drain
                   cache-effect-drain cache-effect-abort-drain
@@ -8679,11 +8683,16 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         test-sycl-file-mapped-expert-owner test-sycl-file-mapped-resolve-abort test-sycl-seg-refusal-cleanup
         PROPERTIES DEPENDS test-sycl-pinned-meminfo-control)
 
-    # The host-only plan dry run's lead-run arms (th32 §4.2, §11 T11): a caller built against another struct
-    # layout is refused, expected_host is the stage's host_planned_bytes, every term is printed by name from the
-    # plan, a dry run stores no budget, and the --mem-available option is the sample's MemAvailable. The planner
-    # initialises SYCL and arm (a) stages a load through real backends that construct caches, so it carries the
-    # OOM-family labels, runs alone on the discrete cards, and exits 77 without a SYCL GPU.
+    # The host-only plan dry run's lead-run arms (th32 §4.2, §11 T11): a caller built against another struct layout is
+    # refused, expected_host is the stage's host_planned_bytes (the dry run handed the stage's own MemAvailable sample),
+    # every term is printed by name from the plan, a dry run stores no budget, the --mem-available option is the
+    # sample's MemAvailable, a load whose plan needs a larger arena zone while an allocation holds the arena is refused,
+    # not aborted, a load refused in its early pass keeps the PP MoE ring a context left in the KV zone, a load releases
+    # a ring that alone holds the arena and its stage rebuilds the arena once for the zones it was refused, and a late
+    # pass refused on its decide step configures no host zone. The planner initialises SYCL and arms (a), (c), (e), (f),
+    # (h) and (g) stage loads through real backends that construct caches, (h) rebuilds device 0's arena, and (g)'s
+    # second load configures a host zone set of a few hundred MiB on each card, so it carries the OOM-family labels,
+    # runs alone on the discrete cards, and exits 77 without a SYCL GPU.
     add_executable(test-sycl-plan-dry-run
         tests/test-sycl-plan-dry-run.cpp)
     target_link_libraries(test-sycl-plan-dry-run PRIVATE
@@ -8704,6 +8713,14 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # compute_placement_plan and the one-budget delegation on the B70 alone, --devices 2 through
     # compute_multi_device_plan on both cards and exits 77 below two GPUs. The planner initialises SYCL and reads each
     # device's cache, so both carry the OOM-family labels and run alone. Lead-run.
+    #
+    # The two-card registrations here and in the lazy-plan-interface block set GGML_SYCL_MOE_MULTI_GPU=1: these arms
+    # only plan and stage across both cards, which for a fixture with experts is the opt-in path. The one-card
+    # registrations see one GPU, where the multi-device plan is off whatever the variable says, so they leave it unset.
+    string(CONCAT _lazy_two_card_env
+        "GGML_SYCL_MOE_MULTI_GPU=1;"
+        "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;"
+        "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
     add_executable(test-sycl-lazy-residency-plan
         tests/test-sycl-lazy-residency-plan.cpp)
     target_link_libraries(test-sycl-lazy-residency-plan PRIVATE
@@ -8720,7 +8737,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     add_test(NAME test-sycl-lazy-residency-plan-2dev COMMAND test-sycl-lazy-residency-plan --devices 2)
     set_tests_properties(test-sycl-lazy-residency-plan-2dev PROPERTIES
         LABELS "sycl;host;cache;mem-handle;gpu-serial"
-        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        ENVIRONMENT "${_lazy_two_card_env}"
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         TIMEOUT 300)
@@ -8751,7 +8768,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     add_test(NAME test-sycl-lazy-plan-interface-2dev COMMAND test-sycl-lazy-plan-interface --devices 2)
     set_tests_properties(test-sycl-lazy-plan-interface-2dev PROPERTIES
         LABELS "sycl;host;cache;mem-handle;gpu-serial"
-        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        ENVIRONMENT "${_lazy_two_card_env}"
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         TIMEOUT 300)
@@ -8790,7 +8807,11 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # the one executable, which passes only when that line appears. The mutant registrations carry no SKIP_RETURN_CODE:
     # ctest honours a skip code before the regex, so a mutant run that VOIDs with exit 77 would read as skipped with its
     # kill line never checked. A mutant run has no legitimate skip, so without the code that run fails.
+    #
+    # The environment sets GGML_SYCL_MOE_MULTI_GPU=1 for this binary and the reap-points one, mutants included: these
+    # arms only plan and stage across both cards, which for a fixture with experts is the opt-in path.
     string(CONCAT _lazy_ring_env
+        "GGML_SYCL_MOE_MULTI_GPU=1;"
         "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;"
         "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
     string(CONCAT _lr_re_no_span_check

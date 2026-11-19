@@ -9,9 +9,11 @@
 //
 // LEAD-RUN. The planner's shaped path initialises SYCL and reads each device's cache, so the binary is registered
 // gpu-serial, serial, with the selector pinned to the discrete cards. --devices 2 runs iff the host takes the
-// multi-device path, which is the planner caller's own predicate, ggml_backend_sycl_moe_multi_gpu_requested();
-// otherwise it exits 77 before any arm runs. The scheduler-exposed device count is never the test: this backend exposes
-// one device whenever more than one GPU is visible.
+// multi-device path, which is the planner caller's own predicate, ggml_backend_sycl_multi_device_plan_requested(),
+// asked with the arms' expert fact; otherwise it exits 77 before any arm runs. Both shapes the arms plan have experts,
+// so that path is the opt-in cross-card one and the two-card registration sets GGML_SYCL_MOE_MULTI_GPU=1. The
+// scheduler-exposed device count is never the test: this backend exposes one device whenever more than one GPU is
+// visible.
 //
 //   test-sycl-lazy-residency-plan --devices 1   compute_placement_plan, and compute_multi_device_plan with one budget
 //                                               (its one-device delegation)
@@ -755,10 +757,12 @@ int main(int argc, char ** argv) {
     if (!sycl_test_require_gpu("the lazy residency plan arms")) {
         return SYCL_TEST_SKIP;
     }
-    if (g_devices == 2 && !ggml_backend_sycl_moe_multi_gpu_requested()) {
+    // Both shapes the arms plan have experts, so the caller's predicate is asked with that fact.
+    const bool has_experts = ds_shape.experts > 0 || qwen38_shape.experts > 0;
+    if (g_devices == 2 && !ggml_backend_sycl_multi_device_plan_requested(has_experts)) {
         std::printf(
             "SKIP: --devices 2 plans on the multi-device path, and this host does not take it: "
-            "ggml_backend_sycl_moe_multi_gpu_requested() is false\n");
+            "ggml_backend_sycl_multi_device_plan_requested() is false\n");
         return SYCL_TEST_SKIP;
     }
     ggml_log_set(capture_log, nullptr);

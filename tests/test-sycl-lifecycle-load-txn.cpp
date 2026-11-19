@@ -133,6 +133,32 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto failed = r.finalize_cleanup(ticket, true);
         require(failed.code == error::POISONED && !failed.committed, "depth underflow cleanup terminal mismatch");
         require(!r.find(b.token.model), "depth-underflow model became LIVE");
+    } else if (name == "commit-validate-fails-only-by-poison") {
+        // load_end runs the owner-effects abort after a failed validation only when finalize_end asks for cleanup, and
+        // that abort is what puts back the device-wide terms the load published. A commit ticket's validation fails
+        // only by poison, which finalize_end answers with a cleanup request: while the ticket's transaction is
+        // COMMITTING, a second end and a binding recovery wait for it and a begin is refused, so nothing but the
+        // ticket's own finalize moves the phase, serial or active transaction validate_end compares.
+        Registry r;
+        auto     b      = r.begin_outer();
+        auto     ticket = r.prepare_end(b.txn, true);
+        require(ticket.finisher && ticket.commit, "no commit finisher");
+        auto second   = std::async(std::launch::async, [&] { return r.prepare_end(b.txn, true); });
+        auto recovery = std::async(std::launch::async, [&] { return r.recover_binding_failure(b.txn); });
+        require(second.wait_for(std::chrono::milliseconds(30)) == std::future_status::timeout,
+                "a second end did not wait for the committing finisher");
+        require(recovery.wait_for(std::chrono::milliseconds(30)) == std::future_status::timeout,
+                "a binding recovery did not wait for the committing finisher");
+        require(r.begin_outer().code == error::LOAD_BUSY, "a begin was admitted while the load was committing");
+        require(r.validate_end(ticket) == error::OK, "a second end, recovery or begin made the commit ticket stale");
+        require(r.enter_nested(b.txn) == error::DEPTH_UNDERFLOW, "the post-prepare poison was not taken");
+        require(r.validate_end(ticket) == error::POISONED, "a poisoned commit ticket did not fail by poison");
+        auto pending = r.finalize_end(ticket, true);
+        require(pending.code == error::POISONED && pending.cleanup_required && !pending.committed,
+                "a commit ticket whose validation failed was finalized without a cleanup request");
+        auto failed = r.finalize_cleanup(ticket, true);
+        require(failed.code == error::POISONED && !failed.committed, "the cleanup did not end the load aborted");
+        require(!second.get().finisher && !recovery.get().finisher, "a waiter became a second finisher");
     } else if (name == "depth-overflow") {
         Registry r(UINT64_MAX, 1, mutation);
         auto     b = r.begin_outer();

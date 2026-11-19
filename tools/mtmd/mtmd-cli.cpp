@@ -135,6 +135,15 @@ struct mtmd_cli_context {
         }
 
         tmpls = common_chat_templates_init(model, params.chat_template);
+        // The built-in matcher knows a fixed list of templates. A model whose template is not on that list can only
+        // be rendered by the jinja engine, so choose it here, once, before anything reads params.use_jinja.
+        if (!params.use_jinja && common_chat_templates_need_jinja(tmpls.get())) {
+            LOG_WRN(
+                "%s: the built-in chat template matcher does not know this model's template, "
+                "using the jinja engine (same as --jinja)\n",
+                __func__);
+            params.use_jinja = true;
+        }
         use_jinja = params.use_jinja;
         chat_history.clear();
         LOG_INF("%s: chat template example:\n%s\n", __func__, common_chat_format_example(tmpls.get(), params.use_jinja, params.default_template_kwargs).c_str());

@@ -421,14 +421,13 @@ static decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn) llama_con
 }
 
 // llama.cpp-xojq (nphx Task 4b): proc-address lookups for the auto
-// micro-batch trial's four SYCL entry points, mirroring
+// micro-batch trial's three SYCL entry points, mirroring
 // llama_context_sycl_runtime_proc()/llama_context_sycl_recheck_proc() above.
 // A GGML_BACKEND_DL build whose SYCL DSO predates llama.cpp-tsfl (the probe
-// and fallback counter) or this task (auto_ubatch_enabled's registration,
-// moe_gpu_ubatch_max) exports none of these; sycl_select_auto_ubatch()
-// treats a nullptr proc the same way every other caller in this file
-// already does for llama_context_sycl_runtime_proc() -- as "unavailable",
-// never dereferenced.
+// and fallback counter) or this task (auto_ubatch_enabled's registration)
+// exports none of these; sycl_select_auto_ubatch() treats a nullptr proc the
+// same way every other caller in this file already does for
+// llama_context_sycl_runtime_proc() -- as "unavailable", never dereferenced.
 static decltype(&ggml_backend_sycl_probe_runtime_context_for_model) llama_context_sycl_probe_proc(
     ggml_backend_dev_t dev) {
     return reinterpret_cast<decltype(&ggml_backend_sycl_probe_runtime_context_for_model)>(
@@ -468,12 +467,6 @@ static decltype(&ggml_backend_sycl_auto_ubatch_enabled) llama_context_sycl_auto_
     ggml_backend_dev_t dev) {
     return reinterpret_cast<decltype(&ggml_backend_sycl_auto_ubatch_enabled)>(
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_auto_ubatch_enabled"));
-}
-
-static decltype(&ggml_backend_sycl_moe_gpu_ubatch_max) llama_context_sycl_moe_gpu_ubatch_max_proc(
-    ggml_backend_dev_t dev) {
-    return reinterpret_cast<decltype(&ggml_backend_sycl_moe_gpu_ubatch_max)>(
-        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_moe_gpu_ubatch_max"));
 }
 
 // llama.cpp-7n6n (wires nphx Task 5): proc-address lookups for the
@@ -2369,7 +2362,6 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
     ggml_backend_dev_t first_dev   = ggml_backend_get_device(sycl_backends.front().backend);
     auto               probe_fn    = llama_context_sycl_probe_proc(first_dev);
     auto               fallback_fn = llama_context_sycl_fallbacks_proc(first_dev);
-    auto               moe_cap_fn  = llama_context_sycl_moe_gpu_ubatch_max_proc(first_dev);
     auto               hold_spill_fn = llama_context_sycl_hold_spill_proc(first_dev);
     if (!probe_fn || !fallback_fn) {
         // A SYCL DSO too old to export the trial's own entry points --
@@ -2382,25 +2374,16 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 
     const auto & ladder = llama_auto_ubatch_ladder;
 
-    // A direct GGML_USE_SYCL build's accessor is a real, always-defined
-    // function -- called unconditionally, no null check (there is nothing to
-    // be null). The DL-without-SYCL lookup genuinely can return nullptr on an
-    // older SYCL DSO, so it reports the ceiling unavailable and the cap gets
-    // no MoE-specific narrowing. A dense model never consults the ceiling.
-#    ifdef GGML_USE_SYCL
-    const uint32_t moe_cap           = model.hparams.n_expert > 0 ? ggml_backend_sycl_moe_gpu_ubatch_max() : 0;
+    // The MoE ceiling is the picker's own constant, the same in a direct and a DL build. A dense model never
+    // consults it. It is always available: a constant cannot be absent the way a backend export could, and
+    // llama_auto_ubatch_cap keeps the flag in its signature (test-auto-ubatch-ladder still covers the false case).
+    const uint32_t moe_cap           = model.hparams.n_expert > 0 ? llama_auto_ubatch_moe_ceiling : 0;
     const bool     moe_cap_available = true;
-#    else
-    const uint32_t moe_cap           = (model.hparams.n_expert > 0 && moe_cap_fn) ? moe_cap_fn() : 0;
-    const bool     moe_cap_available = moe_cap_fn != nullptr;
-#    endif
     // The MoE ceiling is the binding cap whenever it does not exceed the
     // batch/ctx cap, not only when it strictly narrows it -- a context whose
     // batch/ctx cap already equals moe_cap is bound by the ceiling exactly as
     // much as one where moe_cap is smaller, so "ladder exhausted" would
-    // misreport why the ladder stopped. The helper gates on
-    // moe_cap_available so a DSO without the accessor never reports a ceiling
-    // that was never consulted.
+    // misreport why the ladder stopped.
     bool           moe_bound = false;
     const uint32_t cap       = llama_auto_ubatch_cap(cparams.n_batch, cparams.n_ctx, model.hparams.n_expert, moe_cap,
                                                      moe_cap_available, &moe_bound);
@@ -2430,7 +2413,7 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
         return;
     }
     // llama.cpp-7n6n (wires nphx Task 5): the persisted auto n_ubatch cache's
-    // four entry points, mirroring probe_fn/fallback_fn/moe_cap_fn's own
+    // four entry points, mirroring probe_fn/fallback_fn's own
     // direct-vs-DL resolution just above.
 #    ifdef GGML_USE_SYCL
     auto cache_enabled_fn = &ggml_backend_sycl_ubatch_cache_enabled;
@@ -2584,10 +2567,9 @@ void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)
 //
 // Tries the ladder {512, 1024, 2048, 4096} ascending, each candidate capped
 // by min(n_batch, n_ctx) and, for a MoE model (model.hparams.n_expert > 0),
-// additionally by the GPU MoE routing ceiling
-// (ggml_backend_sycl_moe_gpu_ubatch_max(), llama.cpp-ohkx) until that
-// ceiling is lifted -- a candidate whose ring still fits but whose routing
-// silently falls off the GPU path is not a win. A lowered context the hoisted
+// additionally by the picker's MoE ceiling
+// (llama_auto_ubatch_moe_ceiling, src/llama-auto-ubatch.h) until wider MoE
+// widths are measured against it. A lowered context the hoisted
 // block built a prep for tries that rung as its only candidate, and the
 // descent below it when it loses for fit; a lowered context whose prep is
 // empty reserves once at its rung, as every empty prep does. Per candidate, on every
@@ -4346,11 +4328,14 @@ llama_measure_override_procs llama_context_sycl_measure_override_procs(ggml_back
 #ifdef GGML_USE_SYCL
     procs.install = &ggml_backend_sycl_measure_plan_override_install_kv;
     procs.clear   = &ggml_backend_sycl_measure_plan_override_clear;
+    procs.staged  = &ggml_backend_sycl_measure_plan_staged;
 #elif defined(GGML_BACKEND_DL)
     procs.install = reinterpret_cast<decltype(procs.install)>(
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_override_install_kv"));
     procs.clear = reinterpret_cast<decltype(procs.clear)>(
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_override_clear"));
+    procs.staged = reinterpret_cast<decltype(procs.staged)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_staged"));
 #endif
     return procs;
 }
@@ -4433,13 +4418,21 @@ static void llama_load_measure_log_trace(const llama_load_measure_result & measu
 llama_load_measure_result llama_load_measure_run(const llama_model &                  model,
                                                  llama_measure_context_args &         args,
                                                  const llama_measure_override_procs & procs,
-                                                 uint32_t                             n_ctx,
+                                                 const llama_load_measure_shape &     shape,
                                                  uint64_t                             load_txn,
                                                  enum ggml_sycl_measure_stage         stage,
                                                  int                                  first_device) {
     llama_load_measure_result out;
 
     if (const std::string why = llama_measure_unsupported_reason(model); !why.empty()) {
+        out.unsupported = true;
+        out.refusal     = llama_load_measure_refusal_text(stage, first_device, why);
+        return out;
+    }
+
+    // A stage with no plan staged is not measured: the install would refuse it and fail the load over a measure that
+    // has nothing to run over.
+    if (const char * why = llama_load_measure_plan_absent(procs, load_txn, stage); why != nullptr) {
         out.unsupported = true;
         out.refusal     = llama_load_measure_refusal_text(stage, first_device, why);
         return out;
@@ -4456,7 +4449,7 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
     llama_kv_residency_tally_scope   kv_tally_scope(kv_tally);
     std::unique_ptr<llama_context> holder;
     // The context's params come first: the override re-fits the plan's KV residency for their KV shape.
-    const llama_context_params       params   = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train);
+    const llama_context_params       params   = llama_load_measure_context_params(shape);
     const ggml_sycl_measure_kv_shape kv_shape = llama_load_measure_kv_shape(params);
     llama_measure_plan_override      guard(procs, load_txn, stage, &kv_shape);
     if (!guard.installed()) {
@@ -4503,10 +4496,10 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
     return out;
 }
 
-llama_load_measure_result llama_load_measure(const llama_model &          model,
-                                             uint32_t                     n_ctx,
-                                             uint64_t                     load_txn,
-                                             enum ggml_sycl_measure_stage stage) {
+llama_load_measure_result llama_load_measure(const llama_model &              model,
+                                             const llama_load_measure_shape & shape,
+                                             uint64_t                         load_txn,
+                                             enum ggml_sycl_measure_stage     stage) {
     llama_load_measure_result out;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     std::vector<ggml_backend_dev_t> sycl_devs;
@@ -4545,11 +4538,11 @@ llama_load_measure_result llama_load_measure(const llama_model &          model,
     }
     args.backends.emplace_back(cpu);
 
-    return llama_load_measure_run(model, args, llama_context_sycl_measure_override_procs(sycl_devs[0]), n_ctx, load_txn,
+    return llama_load_measure_run(model, args, llama_context_sycl_measure_override_procs(sycl_devs[0]), shape, load_txn,
                                   stage, first_device);
 #else
     GGML_UNUSED(model);
-    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(shape);
     GGML_UNUSED(load_txn);
     GGML_UNUSED(stage);
     out.ok = true;
@@ -4574,7 +4567,7 @@ static llama_sycl_l4_procs llama_load_stage_procs(const llama_model & model) {
 // measure context see a buffer on every weight, so they end with the measure. Each stage keeps its gate before this
 // and its fold after it.
 static llama_load_measure_result llama_load_stage_measure(const llama_model &                            model,
-                                                          uint32_t                                       n_ctx,
+                                                          const llama_load_measure_shape &               shape,
                                                           uint64_t                                       load_txn,
                                                           enum ggml_sycl_measure_stage                   stage,
                                                           const std::vector<llama_measure_dummy_entry> & weights) {
@@ -4584,13 +4577,14 @@ static llama_load_measure_result llama_load_stage_measure(const llama_model &   
         out.refusal = llama_load_measure_refusal_text(stage, -1, "a weight stand-in buffer was refused");
         return out;
     }
-    llama_load_measure_result measured = llama_load_measure(model, n_ctx, load_txn, stage);
+    llama_load_measure_result measured = llama_load_measure(model, shape, load_txn, stage);
     llama_load_measure_log_trace(measured);
     return measured;
 }
 
-// A stage measure that is not `ok` ends the stage: a model the measure cannot walk is unsupported (the load takes the
-// unplanned path with a WARN), anything else refuses the load, under the measure's own text either way.
+// A stage measure that is not `ok` ends the stage: a model the measure cannot walk, or a stage with no placement plan
+// staged for this load, is unsupported (the load goes on with a WARN and this stage reserves no compute term); anything
+// else refuses the load, under the measure's own text either way.
 static void llama_load_stage_fail(const llama_load_measure_result & measured,
                                   std::string &                     unsupported,
                                   std::string &                     refusal) {
@@ -4599,7 +4593,7 @@ static void llama_load_stage_fail(const llama_load_measure_result & measured,
 #endif
 
 llama_load_probe_result llama_load_probe_bound(const llama_model &                            model,
-                                               uint32_t                                       n_ctx,
+                                               const llama_load_measure_shape &               shape,
                                                struct ggml_sycl_load_txn                      txn,
                                                const std::vector<llama_measure_dummy_entry> & weights) {
     llama_load_probe_result out;
@@ -4610,7 +4604,7 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
         return out;
     }
     const llama_load_measure_result measured =
-        llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE, weights);
+        llama_load_stage_measure(model, shape, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE, weights);
     if (!measured.ok) {
         llama_load_stage_fail(measured, out.unsupported, out.refusal);
         return out;
@@ -4619,14 +4613,14 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
     out.kv       = measured.kv;
     out.measured = true;
 
-    const uint32_t                measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
+    const uint32_t                measured_n_ctx = shape.n_ctx;
     // each SYCL device's state term, then its compute term; a declined device's compute buffer stays unplanned
     llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);
     out.compute_declined                   = std::move(reserved.compute_declined);
     out.state_reserved                     = std::move(reserved.state_reserved);
 #else
     GGML_UNUSED(model);
-    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(shape);
     GGML_UNUSED(txn);
     GGML_UNUSED(weights);
 #endif
@@ -4634,7 +4628,7 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
 }
 
 llama_admitted_check_result llama_load_admitted_check(const llama_model &                            model,
-                                                      uint32_t                                       n_ctx,
+                                                      const llama_load_measure_shape &               shape,
                                                       struct ggml_sycl_load_txn                      txn,
                                                       const std::vector<llama_measure_dummy_entry> & weights,
                                                       const llama_load_probe_result &                probe) {
@@ -4645,13 +4639,13 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
         return out;
     }
     const llama_load_measure_result measured =
-        llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights);
+        llama_load_stage_measure(model, shape, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights);
     if (!measured.ok) {
         llama_load_stage_fail(measured, out.unsupported, out.refusal);
         return out;
     }
-    const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
-    const uint32_t n_ubatch       = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
+    const uint32_t measured_n_ctx = shape.n_ctx;
+    const uint32_t n_ubatch       = shape.n_ubatch;
 
     out = llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved,
                                     measured.devices, measured_n_ctx, n_ubatch, probe.kv, measured.kv);
@@ -4663,7 +4657,7 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
     out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);
 #else
     GGML_UNUSED(model);
-    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(shape);
     GGML_UNUSED(txn);
     GGML_UNUSED(weights);
     GGML_UNUSED(probe);
@@ -4672,7 +4666,7 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
 }
 
 llama_late_check_result llama_load_late_check(const llama_model &                            model,
-                                              uint32_t                                       n_ctx,
+                                              const llama_load_measure_shape &               shape,
                                               struct ggml_sycl_load_txn                      txn,
                                               const std::vector<llama_measure_dummy_entry> & weights) {
     llama_late_check_result out;
@@ -4682,17 +4676,17 @@ llama_late_check_result llama_load_late_check(const llama_model &               
         return out;  // no c(P) can have been recorded without the L4 entry points
     }
     const llama_load_measure_result measured =
-        llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights);
+        llama_load_stage_measure(model, shape, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights);
     if (!measured.ok) {
         llama_load_stage_fail(measured, out.unsupported, out.refusal);
         return out;
     }
 
-    const uint32_t n_ubatch = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
+    const uint32_t n_ubatch = shape.n_ubatch;
     return llama_late_check_fold(procs, txn, measured.devices, n_ubatch);
 #else
     GGML_UNUSED(model);
-    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(shape);
     GGML_UNUSED(txn);
     GGML_UNUSED(weights);
     return out;

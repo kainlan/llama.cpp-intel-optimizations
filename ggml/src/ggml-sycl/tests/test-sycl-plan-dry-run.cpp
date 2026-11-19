@@ -10,7 +10,9 @@
 // LEAD-RUN. The planner's shaped path initialises SYCL (layout_policy::get_optimal calls ggml_sycl_info()), arm (a)
 // stages a load through real SYCL backends, and the backends construct caches, so the binary is registered
 // gpu-serial, serial, with the selector pinned to the discrete cards, and a host with no SYCL GPU exits 77 before any
-// arm runs (th32 §11).
+// arm runs (th32 §11). Arm (g) runs late passes, which configure every device's host zones from a small plan, so it
+// runs last: no earlier arm may configure them. Arm (h) rebuilds device 0's arena with a larger RUNTIME zone, which
+// stays after its uncommitted load, so it runs after every arm that reads that arena as found.
 //
 // Every arm names its engagement check, the observation that proves it reached the mechanism it scores, and the
 // mutant it kills. An arm whose engagement check fails is VOID, and a VOID arm fails the binary like a FAIL. Every arm
@@ -27,6 +29,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -55,6 +58,12 @@ std::vector<std::string> lines_with(const char * a, const char * b = nullptr) {
         }
     }
     return out;
+}
+
+// Every captured line, in the order they were logged.
+std::vector<std::string> log_snapshot() {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    return g_log_lines;
 }
 
 uint64_t stores() {
@@ -194,12 +203,19 @@ std::vector<device_planner_state> sentinel_planner_state(size_t n) {
 // Qwen3.8-shaped inventory on each device the scheduler exposes, and its planner records host_planned_bytes on one
 // [HOST-LEDGER] plan line per plan; the dry run over the same inventory, against the budgets the stage planned against
 // (the same process, so the same caches and arena zones), reports the same figure for each plan, in the same order.
-// Engagement: the stage run returned OK with at least one plan line, the dry run returned OK with as many plans, every
-// dry-run plan put at least one weight on the host (the shape's experts overflow any card here), and its RUNTIME term
-// carries the inventory's PP MoE ring, which the dry run published itself after the stage's publish was withdrawn.
+// The dry run is handed the stage's own MemAvailable sample through --mem-available (arm (d) proves the option is the
+// sample), read from the stage's one [HOST-LEDGER] stored-budget line, so both sides compute the budget from one
+// sample: two samples differ by the host's drift, and when the budget binds that drift moves the plan.
+// Engagement: the stage run returned OK with at least one plan line and stored one budget, the dry run returned OK with
+// as many plans, every dry-run plan put at least one weight on the host (the shape's experts overflow any card here),
+// and its RUNTIME term carries the inventory's PP MoE ring, which the dry run published itself after the stage's
+// publish was withdrawn. A budget that still differs from the stage's VOIDs the arm only when an input each side reads
+// live (the pinned share, the committed bytes, the RAM total) moved in between and the budget binds; with none moved it
+// FAILs, as one sample computed into two budgets.
 // Mutants: a term dropped from or added to expected_host (it differs from the record by that term); the dry run not
 // publishing the inventory's planner inputs (RUNTIME and expected_host lose the ring); a budget other than the stage's
-// (the host weights, and with them expected_host, move).
+// (the host weights, and with them expected_host, move); the dry run computing a budget from the sample other than the
+// stage's (the budgets differ with nothing moved).
 arm_result arm_a_expected_host_is_the_stage_figure() {
     arm_result       r;
     loader_inventory inv(qwen38_shape);
@@ -212,16 +228,27 @@ arm_result arm_a_expected_host_is_the_stage_figure() {
     log_clear();
     const ggml_sycl_lifecycle_result stage_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, nullptr, true);
     const std::vector<std::string>   stage    = lines_with("[HOST-LEDGER] device=", " plan host_budget=");
+    const std::vector<std::string>   stored   = lines_with("[HOST-LEDGER] stored budget=");
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
     if (stage_rc != GGML_SYCL_LIFECYCLE_OK || stage.empty()) {
         void_arm(r, "the early stage run returned " + num(stage_rc) + " with " + num(stage.size()) + " plan lines");
         return r;
     }
+    if (stored.size() != 1 || printed(stored[0], "available") == SIZE_MAX) {
+        void_arm(r, "the stage logged " + num(stored.size()) + " stored-budget lines, want 1 with its sample, so " +
+                        "the dry run cannot be handed the stage's MemAvailable");
+        return r;
+    }
+    const size_t stage_available = printed(stored[0], "available");
+    const size_t stage_budget    = printed(stored[0], "budget");
 
     withdraw_published_inputs();
-    ggml_sycl_plan_dry_run_opts      opts = default_opts();
-    auto                             res  = fresh_result();
-    const ggml_sycl_lifecycle_result rc   = ggml_backend_sycl_plan_dry_run(&inv.inv, &opts, res.get());
+    ggml_sycl_plan_dry_run_opts opts = default_opts();
+    opts.mem_available_set           = 1;
+    opts.mem_available_bytes         = stage_available;
+
+    auto                             res = fresh_result();
+    const ggml_sycl_lifecycle_result rc  = ggml_backend_sycl_plan_dry_run(&inv.inv, &opts, res.get());
     if (rc != GGML_SYCL_LIFECYCLE_OK || res->n_plans != stage.size()) {
         void_arm(r, "the dry run returned " + num(rc) + " with " + num(res->n_plans) + " plans; the stage made " +
                         num(stage.size()));
@@ -230,6 +257,15 @@ arm_result arm_a_expected_host_is_the_stage_figure() {
     const size_t ring = planned_ring_bytes(inv.inv);
     if (ring == 0) {
         void_arm(r, "the inventory's ring cannot be sized, so a RUNTIME term above it proves nothing");
+    }
+    // The budget's other inputs that each side reads live: the pinned share, the committed bytes and the RAM total.
+    const bool moved = res->pinned_bytes != printed(stored[0], "pinned") ||
+                       res->committed_bytes != printed(stored[0], "committed") ||
+                       res->mem_total_bytes != printed(stored[0], "total");
+    if (res->host_budget != stage_budget && !moved) {
+        fail(r, "from the stage's own sample (MemAvailable " + num(stage_available) + ", pinned " +
+                    num(res->pinned_bytes) + ", committed " + num(res->committed_bytes) + ") the dry run's host " +
+                    "budget is " + num(res->host_budget) + ", the stage stored " + num(stage_budget));
     }
     for (uint32_t i = 0; i < res->n_plans; ++i) {
         const ggml_sycl_plan_dry_run_plan & p    = res->plans[i];
@@ -240,14 +276,14 @@ arm_result arm_a_expected_host_is_the_stage_figure() {
         if (p.runtime < ring) {
             void_arm(r, name + ": RUNTIME " + num(p.runtime) + " does not carry the inventory's ring of " + num(ring));
         }
-        // Each side samples MemAvailable itself, so the two budgets can differ by the host's drift. A budget above the
-        // plan's whole host figure did not bind it, so the drift cannot move the plan; one at or below it may have,
-        // and then the comparison is not like for like.
-        const size_t stage_budget = printed(stage[i], "host_budget");
-        const size_t low_budget   = std::min<size_t>(stage_budget, p.host_budget);
-        if (stage_budget != p.host_budget && p.expected_host >= low_budget) {
-            void_arm(r, name + ": the host budget binds (" + num(p.expected_host) + " host bytes) and moved between " +
-                            "the stage (" + num(stage_budget) + ") and the dry run (" + num(p.host_budget) + ")");
+        // A budget above the plan's whole host figure did not bind it, so a moved live input cannot move the plan; one
+        // at or below it may have, and then the comparison is not like for like.
+        const size_t plan_budget = printed(stage[i], "host_budget");
+        const size_t low_budget  = std::min<size_t>(plan_budget, p.host_budget);
+        if (moved && plan_budget != p.host_budget && p.expected_host >= low_budget) {
+            void_arm(r, name + ": the host budget binds (" + num(p.expected_host) + " host bytes) and the pinned " +
+                            "share, committed bytes or RAM total moved between the stage (budget " + num(plan_budget) +
+                            ") and the dry run (" + num(p.host_budget) + ")");
         }
         expect(r, p.device == static_cast<int32_t>(printed(stage[i], "device")),
                name + ": the stage's plan line is for device " + num(printed(stage[i], "device")));
@@ -730,6 +766,730 @@ arm_result arm_d_mem_available_option_is_the_sample() {
     return r;
 }
 
+// The device-wide terms a load publishes beside the planner state (device_planner_state), which a refused load puts
+// back too: the ring's KV-zone slots, its row bytes and expert counts, its micro-batch, and the oneDNN pair with its
+// stored sum. The dry run publishes none of them, so they are not in the sentinel the dry-run arms share: a KV-zone
+// slot there would move the RUNTIME term those arms check. Read through load_published_terms::snapshot, the pair's one
+// reader; written through the setters.
+struct device_load_extras {
+    bool     act_in_kv          = false;
+    bool     out_in_kv          = false;
+    size_t   act_row            = 0;
+    size_t   out_row            = 0;
+    uint32_t n_expert           = 0;
+    uint32_t n_expert_used      = 0;
+    uint32_t n_ubatch           = 0;
+    size_t   onednn_weights     = 0;
+    size_t   onednn_activations = 0;
+    size_t   onednn_stored      = 0;
+
+    bool operator==(const device_load_extras & o) const {
+        return act_in_kv == o.act_in_kv && out_in_kv == o.out_in_kv && act_row == o.act_row && out_row == o.out_row &&
+               n_expert == o.n_expert && n_expert_used == o.n_expert_used && n_ubatch == o.n_ubatch &&
+               onednn_weights == o.onednn_weights && onednn_activations == o.onednn_activations &&
+               onednn_stored == o.onednn_stored;
+    }
+};
+
+std::vector<device_load_extras> read_load_extras() {
+    std::vector<device_load_extras> out;
+    for (int d = 0; d < test_physical_device_count() && d < GGML_SYCL_MAX_DEVICES; ++d) {
+        const load_published_terms t = load_published_terms::snapshot(d);
+        device_load_extras         s;
+        s.act_in_kv          = t.ring_activation_in_kv;
+        s.out_in_kv          = t.ring_output_in_kv;
+        s.act_row            = t.ring_activation_row;
+        s.out_row            = t.ring_output_row;
+        s.n_expert           = t.ring_n_expert;
+        s.n_expert_used      = t.ring_n_expert_used;
+        s.n_ubatch           = t.ring_n_ubatch;
+        s.onednn_weights     = t.onednn_weights;
+        s.onednn_activations = t.onednn_activations;
+        s.onednn_stored      = t.onednn_stored;
+        out.push_back(s);
+    }
+    return out;
+}
+
+void write_load_extras(const std::vector<device_load_extras> & extras) {
+    for (size_t d = 0; d < extras.size(); ++d) {
+        const int                  dev = static_cast<int>(d);
+        const device_load_extras & s   = extras[d];
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(dev, s.act_in_kv, s.out_in_kv);
+        unified_cache_set_planned_pp_moe_onednn_row_bytes(dev, s.act_row, s.out_row, s.n_expert, s.n_expert_used);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(dev, s.n_ubatch);
+        // The pair's setter stores the halves' total as the sum; the sum goes in after it.
+        unified_cache_set_planned_onednn_scratchpad_pair(dev, s.onednn_weights, s.onednn_activations);
+        unified_cache_set_planned_onednn_scratchpad_bytes(dev, s.onednn_stored);
+    }
+}
+
+// A value per device no load of the shaped inventories publishes: both ring slots in the KV zone, row bytes, expert
+// counts and a micro-batch no inventory here carries, and a pair whose stored sum a reserve raised above its total.
+std::vector<device_load_extras> sentinel_load_extras(size_t n) {
+    std::vector<device_load_extras> out(n);
+    for (size_t d = 0; d < n; ++d) {
+        device_load_extras & s = out[d];
+        const uint32_t       v = 7 + static_cast<uint32_t>(d);
+        s.act_in_kv            = true;
+        s.out_in_kv            = true;
+        s.act_row              = 96 * v;
+        s.out_row              = 192 * v;
+        s.n_expert             = v;
+        s.n_expert_used        = 2;
+        s.n_ubatch             = 70 + v;
+        s.onednn_weights       = 6 * MiB + d;
+        s.onednn_activations   = 1 * MiB + d;
+        s.onednn_stored        = 9 * MiB + d;
+    }
+    return out;
+}
+
+// One staged early pass of `inv` in a load transaction of its own, ended uncommitted. `during` and `during_extras` read
+// the load's device-wide terms between the stage and the end, `published_weight` the ring weight slot the stage left on
+// device 0.
+struct staged_early_load {
+    ggml_sycl_lifecycle_result        begin = GGML_SYCL_LIFECYCLE_OK;
+    ggml_sycl_lifecycle_result        stage = GGML_SYCL_LIFECYCLE_OK;
+    std::vector<device_planner_state> during;
+    std::vector<device_load_extras>   during_extras;
+    size_t                            published_weight = 0;
+};
+
+staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv) {
+    staged_early_load  out;
+    ggml_sycl_load_txn txn{};
+    out.begin = ggml_backend_sycl_model_load_begin(&txn);
+    if (out.begin != GGML_SYCL_LIFECYCLE_OK) {
+        return out;
+    }
+    out.stage            = ggml_backend_sycl_stage_load_inventory_plan(&inv, nullptr, true);
+    out.during           = read_planner_state();
+    out.during_extras    = read_load_extras();
+    out.published_weight = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(0);
+    (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    return out;
+}
+
+// (e) A load whose plan needs a larger arena zone while a first allocation holds the arena is refused by name, and the
+// allocation keeps its memory. The VRAM arena's zones grow only by a rebuild, which is refused while anything points
+// into the arena, and the stage used to abort the process there. A sentinel goes first into every planner global and
+// every other device-wide term a load publishes (device_load_extras: the ring's KV-zone slots, row bytes, expert counts
+// and micro-batch, the oneDNN pair and its stored sum); one that does not read back VOIDs the arm before any check. A
+// load's entry ensure sizes the zones before its own planner publishes, so it reads the MoE CONTROL requirement and the
+// host scatter scratch as they stand, here the sentinels' 4 KiB and 8 KiB, which no arm above sized the arena for. So
+// the shaped inventory is staged once with nothing holding the arena, which rebuilds the zones for the sentinels too.
+// Then a 4 KiB RUNTIME-zone allocation on device 0 stands for the first model, and two loads are staged beside it, each
+// ended uncommitted:
+//   control: the shaped inventory, whose zones the sizing load sized for the sentinels, stages OK, and every sentinel
+//            reads back after its end;
+//   refusal: the same inventory with a PP MoE ring weight slot 256 MiB larger than device 0's RUNTIME zone, at depth 1,
+//            returns PLAN_REJECTED from the stage after one ERROR line that names device 0, the RUNTIME need and have
+//            and the allocations that hold the arena; every sentinel reads back right after the stage and after the
+//            end; the RUNTIME zone keeps its capacity; the allocation resolves to the same device pointer, and the
+//            registry still holds it in the RUNTIME zone.
+// Engagement: device 0's arena is active; the sizing load staged OK with nothing holding the arena, so the zones hold
+// the sentinels' terms; the allocation landed in its RUNTIME zone; the control staged OK beside it, so a refusal is the
+// oversized term's and not the allocation's alone; a refusal leg that returned OK had published the oversized ring (it
+// owed a refusal), otherwise the ring was not planned and the arm is VOID. A control that did not stage leaves the
+// refusal leg running: the arm is VOID for it only if no check failed, and a FAIL carries its reason after the FAIL's.
+// Mutants: the abort kept (the binary dies); the refusal not propagated (the stage returns OK); the published terms not
+// put back (a global reads the refused load's ring, not its sentinel); a restore that leaves the KV-zone slots, row
+// bytes, expert counts, micro-batch, pair or sum (that term reads the refused load's value); a rebuild, eviction or
+// zone reset under the allocation (the RUNTIME capacity moves, or the allocation no longer resolves where it was).
+arm_result arm_e_held_arena_refuses_the_load() {
+    arm_result      r;
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (cache == nullptr || !cache->arena_active()) {
+        void_arm(r, "device 0 has no active VRAM arena, so nothing can hold its zones");
+        return r;
+    }
+
+    const std::vector<device_planner_state> original        = read_planner_state();
+    const std::vector<device_planner_state> sentinel        = sentinel_planner_state(original.size());
+    const std::vector<device_load_extras>   original_extras = read_load_extras();
+    const std::vector<device_load_extras>   sentinel_extras = sentinel_load_extras(original_extras.size());
+    const auto                              put_back        = [&]() {
+        write_planner_state(original);
+        write_load_extras(original_extras);
+    };
+    write_planner_state(sentinel);
+    write_load_extras(sentinel_extras);
+    if (!(read_planner_state() == sentinel) || !(read_load_extras() == sentinel_extras)) {
+        put_back();
+        void_arm(r, "the sentinel planner state or load terms did not read back, so no check below has a reference");
+        return r;
+    }
+    loader_inventory        fits(qwen38_shape);
+    const staged_early_load sizing = stage_early_and_end(fits.inv);
+    if (sizing.begin != GGML_SYCL_LIFECYCLE_OK || sizing.stage != GGML_SYCL_LIFECYCLE_OK) {
+        put_back();
+        void_arm(r, "the sizing load's begin returned " + num(sizing.begin) + " and its stage " + num(sizing.stage) +
+                        " with nothing holding the arena, so the zones may not hold the sentinels' terms");
+        return r;
+    }
+
+    alloc_request req{};
+    req.queue                               = &cache->get_queue();
+    req.device                              = 0;
+    req.size                                = 4096;
+    req.intent.role                         = alloc_role::GRAPH_TMP;
+    req.intent.category                     = runtime_category::GRAPH;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+    allocation_result allocation            = unified_allocate_owner(req);
+    if (!allocation) {
+        put_back();
+        void_arm(r, "the 4 KiB RUNTIME-zone allocation was refused");
+        return r;
+    }
+    // The handle's destructor is the allocation's one release point, at the end of the arm.
+    const mem_handle   holder = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const resolved_ptr first  = holder.resolve();
+    alloc_metadata     meta{};
+    if (!first || !first.on_device || !unified_lookup(first.ptr, &meta) || meta.zone != vram_zone_id::RUNTIME) {
+        put_back();
+        void_arm(r, "the allocation is not in device 0's RUNTIME zone, so it does not hold the arena");
+        return r;
+    }
+    const size_t runtime_capacity = cache->zone_capacity(vram_zone_id::RUNTIME);
+
+    // A control that did not stage does not stop the arm: the refusal leg still runs, and settle() reports the arm VOID
+    // with the control's reason only when no check failed, and a FAIL with that reason after its own (the harness keeps
+    // the first FAIL or VOID, so a VOID taken here would hide every later FAIL).
+    std::string             control_void;
+    const staged_early_load control = stage_early_and_end(fits.inv);
+    if (control.begin != GGML_SYCL_LIFECYCLE_OK || control.stage != GGML_SYCL_LIFECYCLE_OK) {
+        control_void = "the control load's begin returned " + num(control.begin) + " and its stage " +
+                       num(control.stage) + " beside the allocation, so a refusal would not be the oversized term's";
+    }
+    const auto settle = [&]() -> arm_result {
+        if (control_void.empty()) {
+            return r;
+        }
+        arm_result out = r;
+        if (out.result == outcome::PASS) {
+            out.result = outcome::VOID;
+            out.why    = control_void;
+        } else {
+            out.why += "; and " + control_void;
+        }
+        return out;
+    };
+    expect(r, read_planner_state() == sentinel,
+           "after the control load's uncommitted end a planner global reads that load's value, not its sentinel");
+    expect(r, read_load_extras() == sentinel_extras,
+           "after the control load's uncommitted end a ring KV-zone slot, row byte, micro-batch or oneDNN pair term "
+           "reads that load's value, not its sentinel");
+
+    loader_inventory too_big(qwen38_shape);
+    too_big.inv.pp_moe_onednn_weight_slot_bytes = runtime_capacity + 256 * MiB;
+    too_big.inv.pp_moe_onednn_scratch_bytes     = too_big.inv.pp_moe_onednn_weight_slot_bytes;
+    too_big.inv.pp_moe_onednn_ring_depth        = 1;
+    log_clear();
+    const staged_early_load                 refused = stage_early_and_end(too_big.inv);
+    const std::vector<std::string>          named   = lines_with("[SYCL-PLAN] model load refused on device 0: ");
+    const std::vector<device_planner_state> after   = read_planner_state();
+    const std::vector<device_load_extras>   after_x = read_load_extras();
+    put_back();
+
+    if (refused.begin != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "the refused load's transaction did not begin (" + num(refused.begin) + ")");
+        return settle();
+    }
+    if (refused.stage == GGML_SYCL_LIFECYCLE_OK &&
+        refused.published_weight != too_big.inv.pp_moe_onednn_weight_slot_bytes) {
+        void_arm(r, "the stage returned OK and published a ring weight slot of " + num(refused.published_weight) +
+                        ", not the oversized " + num(too_big.inv.pp_moe_onednn_weight_slot_bytes) +
+                        ", so no zone had to grow");
+        return settle();
+    }
+    expect(r, refused.stage == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
+           "a load whose ring needs " + num(too_big.inv.pp_moe_onednn_weight_slot_bytes) + " bytes beside a " +
+               num(runtime_capacity) + "-byte RUNTIME zone the allocation holds returned " + num(refused.stage) +
+               ", not PLAN_REJECTED");
+    expect(r, named.size() == 1,
+           "the refused load logged " + num(named.size()) + " refusal lines naming device 0, want 1");
+    expect(r,
+           named.empty() ||
+               (named[0].find("RUNTIME need ") != std::string::npos && named[0].find(" short)") != std::string::npos &&
+                named[0].find("hold the arena") != std::string::npos),
+           "the refusal line does not name the RUNTIME need and have, its shortfall and the holders: " +
+               (named.empty() ? std::string("(none)") : named[0]));
+    for (size_t d = 0; d < refused.during.size(); ++d) {
+        expect(r, refused.during[d] == sentinel[d],
+               "device " + num(d) + ": right after the refused stage a planner global reads the refused load's value " +
+                   "(ring weight " + num(refused.during[d].ring_weight) + "), not its sentinel");
+    }
+    for (size_t d = 0; d < after.size(); ++d) {
+        expect(r, after[d] == sentinel[d],
+               "device " + num(d) + ": after the refused load's end a planner global reads " + "ring weight " +
+                   num(after[d].ring_weight) + ", not its sentinel");
+    }
+    for (size_t d = 0; d < refused.during_extras.size() && d < sentinel_extras.size(); ++d) {
+        expect(r, refused.during_extras[d] == sentinel_extras[d],
+               "device " + num(d) + ": right after the refused stage the ring's KV-zone slots, row bytes, expert " +
+                   "counts or micro-batch, or the oneDNN pair or its sum, read the refused load's (micro-batch " +
+                   num(refused.during_extras[d].n_ubatch) + ", sum " + num(refused.during_extras[d].onednn_stored) +
+                   "), not their sentinels");
+    }
+    for (size_t d = 0; d < after_x.size() && d < sentinel_extras.size(); ++d) {
+        expect(r, after_x[d] == sentinel_extras[d],
+               "device " + num(d) + ": after the refused load's end the ring's KV-zone slots, row bytes, expert " +
+                   "counts or micro-batch, or the oneDNN pair or its sum, read micro-batch " +
+                   num(after_x[d].n_ubatch) + ", sum " + num(after_x[d].onednn_stored) + ", not their sentinels");
+    }
+    expect(r, cache->arena_active() && cache->zone_capacity(vram_zone_id::RUNTIME) == runtime_capacity,
+           "the RUNTIME zone moved from " + num(runtime_capacity) + " to " +
+               num(cache->zone_capacity(vram_zone_id::RUNTIME)) + " bytes under the live allocation");
+    const resolved_ptr again = holder.resolve();
+    alloc_metadata     still{};
+    expect(r, again.ptr == first.ptr && again.on_device,
+           "the allocation no longer resolves to the device pointer it had before the refused load");
+    expect(r, unified_lookup(first.ptr, &still) && still.zone == vram_zone_id::RUNTIME && still.id == meta.id,
+           "the registry no longer holds the allocation in the RUNTIME zone");
+    return settle();
+}
+
+// (f) A load refused in its early pass keeps the PP MoE ring a live context left in the shared KV zone, and the ring's
+// KV-zone flags. The ring outlives the context that sized it, and a load releases a ring that still holds KV-zone bytes
+// in the stage's effect step, after every refusal of the pass. The one release in a decide step is the entry ensure's
+// last resort, taken only when the ring's slot buffers are the only holders of an arena whose zones must grow
+// (arm (h)): a load refused in its early pass must leave any other ring, which a live context may still use.
+// Device 0 gets a one-slot ring of 1 MiB slots whose activation and output slots are planned in the KV zone, and a
+// 4 KiB RUNTIME-zone allocation beside it, so the ring is never the arena's only holder and the entry ensure has no
+// last resort to take. A load whose ring weight slot is 256 MiB larger than the RUNTIME zone is then staged early and
+// ended uncommitted.
+// Engagement: the ring was reserved and holds KV-zone bytes, the allocation landed in the RUNTIME zone, and the stage
+// returned PLAN_REJECTED.
+// Mutant: the ring released where the load's planning state is reset, before the planner's refusals (the ring's
+// KV-zone bytes read 0 after the refused stage, and the release line is logged).
+arm_result arm_f_early_refusal_keeps_the_kv_zone_ring() {
+    arm_result      r;
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (cache == nullptr || !cache->arena_active()) {
+        void_arm(r, "device 0 has no active VRAM arena, so no ring can sit in its KV zone");
+        return r;
+    }
+    // The ring's planned terms and KV-zone flags as found, written back on every exit.
+    const size_t   found_weight = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(0);
+    const size_t   found_act    = unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(0);
+    const size_t   found_out    = unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(0);
+    const uint32_t found_depth  = unified_cache_get_planned_pp_moe_onednn_ring_depth(0);
+    const bool     found_act_kv = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(0);
+    const bool     found_out_kv = unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(0);
+    const auto     put_back     = [&]() {
+        unified_cache_set_planned_pp_moe_onednn_scratch(0, found_weight, found_act, found_out, found_depth);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(0, found_act_kv, found_out_kv);
+    };
+
+    constexpr size_t slot = 1 * MiB;
+    unified_cache_set_planned_pp_moe_onednn_scratch(0, slot, slot, slot, 1);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(0, true, true);
+    if (!cache->reserve_pp_moe_onednn_scratch(slot, slot, slot, 1)) {
+        put_back();
+        void_arm(r, "a one-slot ring of 1 MiB slots was not reserved on device 0");
+        return r;
+    }
+    const size_t held = unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(0);
+    if (held == 0) {
+        (void) cache->release_pp_moe_onednn_scratch_ring();
+        put_back();
+        void_arm(r, "the ring holds no bytes in the KV zone, so a release could not show");
+        return r;
+    }
+
+    alloc_request req{};
+    req.queue                               = &cache->get_queue();
+    req.device                              = 0;
+    req.size                                = 4096;
+    req.intent.role                         = alloc_role::GRAPH_TMP;
+    req.intent.category                     = runtime_category::GRAPH;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+    allocation_result allocation            = unified_allocate_owner(req);
+    mem_handle        holder;
+    alloc_metadata    meta{};
+    if (allocation) {
+        holder = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    }
+    const resolved_ptr where = holder.resolve();
+    if (!where || !where.on_device || !unified_lookup(where.ptr, &meta) || meta.zone != vram_zone_id::RUNTIME) {
+        holder = {};
+        (void) cache->release_pp_moe_onednn_scratch_ring();
+        put_back();
+        void_arm(r, "the 4 KiB allocation is not in device 0's RUNTIME zone, so the ring could be the only holder");
+        return r;
+    }
+
+    loader_inventory too_big(qwen38_shape);
+    too_big.inv.pp_moe_onednn_weight_slot_bytes = cache->zone_capacity(vram_zone_id::RUNTIME) + 256 * MiB;
+    too_big.inv.pp_moe_onednn_scratch_bytes     = too_big.inv.pp_moe_onednn_weight_slot_bytes;
+    too_big.inv.pp_moe_onednn_ring_depth        = 1;
+    ggml_sycl_load_txn txn{};
+    if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
+        holder = {};
+        (void) cache->release_pp_moe_onednn_scratch_ring();
+        put_back();
+        void_arm(r, "the load transaction did not begin");
+        return r;
+    }
+    log_clear();
+    const ggml_sycl_lifecycle_result rc = ggml_backend_sycl_stage_load_inventory_plan(&too_big.inv, nullptr, true);
+    const size_t                     held_staged   = unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(0);
+    const bool                       act_kv_staged = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(0);
+    const bool                       out_kv_staged = unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(0);
+    (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    const size_t held_ended   = unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(0);
+    const bool   act_kv_ended = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(0);
+    const bool   out_kv_ended = unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(0);
+    const size_t released     = lines_with("[SYCL-PLAN] model load released the PP MoE oneDNN scratch ring").size();
+
+    if (rc != GGML_SYCL_LIFECYCLE_PLAN_REJECTED) {
+        void_arm(r, "the load whose ring cannot fit the RUNTIME zone returned " + num(rc) + ", not PLAN_REJECTED");
+    }
+    expect(r, held_staged == held,
+           "right after the refused stage the ring holds " + num(held_staged) + " bytes in the KV zone, not its " +
+               num(held) + ": the refused load released it");
+    expect(r, held_ended == held,
+           "after the refused load's end the ring holds " + num(held_ended) + " bytes in the KV zone, not its " +
+               num(held));
+    expect(r, released == 0,
+           "the refused load logged " + num(released) + " ring release line(s), want none: it changed device 0");
+    expect(r, act_kv_staged && out_kv_staged && act_kv_ended && out_kv_ended,
+           "the ring's KV-zone flags read activation=" + num(act_kv_staged) + "/" + num(act_kv_ended) + " output=" +
+               num(out_kv_staged) + "/" + num(out_kv_ended) + " (after the stage/after the end), not the planned 1/1");
+
+    holder = {};
+    expect(r, cache->release_pp_moe_onednn_scratch_ring(), "the ring kept after the refused load did not release");
+    put_back();
+    return r;
+}
+
+// (h) A load releases a ring that alone holds the arena, and asks for its zones again and gets them. The ring outlives
+// the context that sized it, so a freed context can leave its slot buffers as the only holders of an arena whose zones
+// a later load must grow; the entry ensure then releases the ring as its last resort and asks for the zones again,
+// where any other holder refuses the load. Device 0 gets arm (f)'s one-slot ring of 1 MiB slots with nothing beside it,
+// and the load arm (f) stages (a ring weight slot 256 MiB larger than the RUNTIME zone) is staged early. Between the
+// last resort's release line and device 0's first plan line, which device 0 logs after its entry ensure and before any
+// other device's planning starts, the stage must rebuild the arena once, to a RUNTIME zone at least the one its refused
+// first ask needed. The arm's own ensure inside the open load must then get the zones too, and may rebuild once more:
+// the plan publishes terms after the entry ensure sized the zones (the MoE control and host scatter terms), and the
+// next ensure of a load takes them in, as in every load. The load is then ended uncommitted. The rebuilt arena stays,
+// as it does after any refused or uncommitted load, so this arm runs after every arm that reads device 0's arena as
+// found. The arm is written for the registered environment, where GGML_SYCL_MOE_MULTI_GPU is unset: with it set to 1
+// the plan line names device -1, and the window would run to the end of the log.
+// Engagement: device 0's zones held no byte and its chunks no lease before the ring, and the ring added live bytes; a
+// stage that refused another device, or refused device 0 before any release for a cause this arm does not set up, or
+// for a reserve the device could not make, is VOID. A refusal that names only the ring as the holder of device 0's
+// arena, and any other refusal of device 0 after the last resort's release, is a FAIL.
+// Mutants: no last resort (the stage refuses device 0 with only the ring holding it); the release not followed by a
+// second ask for the zones (the stage logs no rebuild after the release, and refuses the load if the ask's answer was
+// the refusal); the ring released twice (two release lines).
+arm_result arm_h_load_releases_a_lone_ring() {
+    arm_result      r;
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (cache == nullptr || !cache->arena_active()) {
+        void_arm(r, "device 0 has no active VRAM arena, so no ring can hold it");
+        return r;
+    }
+    // Every byte the zones count and every lease on the arena's chunks: the entry ensure's own holder readings.
+    const auto zone_bytes = [&]() {
+        size_t bytes = 0;
+        for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+            bytes += cache->zone_used(static_cast<vram_zone_id>(z));
+        }
+        return bytes;
+    };
+    uint32_t leases = 0;
+    for (int c = 0; c < cache->chunk_count(); ++c) {
+        leases += cache->arena_chunk_lease_count(c);
+    }
+    const size_t before = zone_bytes();
+    if (before != 0 || leases != 0) {
+        void_arm(r, "device 0's zones hold " + num(before) + " bytes and its chunks " + num(leases) + " leases " +
+                        "before the ring, so the ring would not be the arena's only holder");
+        return r;
+    }
+    const size_t   found_weight = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(0);
+    const size_t   found_act    = unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(0);
+    const size_t   found_out    = unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(0);
+    const uint32_t found_depth  = unified_cache_get_planned_pp_moe_onednn_ring_depth(0);
+    const bool     found_act_kv = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(0);
+    const bool     found_out_kv = unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(0);
+    const auto     put_back     = [&]() {
+        (void) cache->release_pp_moe_onednn_scratch_ring();
+        unified_cache_set_planned_pp_moe_onednn_scratch(0, found_weight, found_act, found_out, found_depth);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(0, found_act_kv, found_out_kv);
+    };
+
+    constexpr size_t slot = 1 * MiB;
+    unified_cache_set_planned_pp_moe_onednn_scratch(0, slot, slot, slot, 1);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(0, true, true);
+    if (!cache->reserve_pp_moe_onednn_scratch(slot, slot, slot, 1) || zone_bytes() == 0) {
+        put_back();
+        void_arm(r, "a one-slot ring of 1 MiB slots was not reserved in device 0's arena");
+        return r;
+    }
+
+    loader_inventory too_big(qwen38_shape);
+    too_big.inv.pp_moe_onednn_weight_slot_bytes = cache->zone_capacity(vram_zone_id::RUNTIME) + 256 * MiB;
+    too_big.inv.pp_moe_onednn_scratch_bytes     = too_big.inv.pp_moe_onednn_weight_slot_bytes;
+    too_big.inv.pp_moe_onednn_ring_depth        = 1;
+    ggml_sycl_load_txn txn{};
+    if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
+        put_back();
+        void_arm(r, "the load transaction did not begin");
+        return r;
+    }
+    log_clear();
+    const ggml_sycl_lifecycle_result rc  = ggml_backend_sycl_stage_load_inventory_plan(&too_big.inv, nullptr, true);
+    const std::vector<std::string>   log = log_snapshot();
+    const size_t                     held_after = unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(0);
+    log_clear();
+    zone_arena_refusal again{};
+    const bool         zones_got    = rc == GGML_SYCL_LIFECYCLE_OK && cache->ensure_planned_arena_zones(&again);
+    // The arm's own ensure's rebuild lines, counted apart from the stage's: the log was cleared after the stage.
+    const size_t       own_rebuilds = log_count_with("[VRAM-ARENA] Rebuilding unused early arena for planned zones");
+    (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    put_back();
+
+    const char * const release_line     = "[SYCL-PLAN] model load released the PP MoE oneDNN scratch ring";
+    const char * const last_resort_text = "on device 0: it was the only holder of an arena";
+    const char * const refusal_line     = "[SYCL-PLAN] model load refused on device ";
+    const char * const held_line        = "[VRAM-ARENA] planned zones exceed active arena but live allocations prevent";
+    const auto         has              = [](const std::string & line, const char * text) {
+        return line.find(text) != std::string::npos;
+    };
+    size_t                   released = 0, last_resort = 0, kept = 0, ring_only = 0;
+    size_t                   from = log.size();  // the last resort's release line
+    std::vector<std::string> refused;
+    std::string              device0_refusal;
+    for (size_t i = 0; i < log.size(); ++i) {
+        const std::string & line = log[i];
+        if (has(line, release_line)) {
+            ++released;
+            if (has(line, last_resort_text)) {
+                ++last_resort;
+                from = std::min(from, i);
+            }
+        }
+        kept += has(line, "[SYCL-PLAN] model load kept the PP MoE oneDNN scratch ring") ? 1 : 0;
+        if (has(line, refusal_line)) {
+            refused.push_back(line);
+            if (has(line, "refused on device 0:") && device0_refusal.empty()) {
+                device0_refusal = line;
+            }
+            ring_only +=
+                has(line, "refused on device 0:") && has(line, "Only the cache's PP MoE ring holds it") ? 1 : 0;
+        }
+    }
+    // The RUNTIME zone the refused first ask needed ("need ... runtime=<MB>"), from its last held line before the
+    // release, and the stage's own rebuilds after the release, up to device 0's first plan line.
+    double need_runtime = -1.0;
+    for (size_t i = 0; i < from; ++i) {
+        if (has(log[i], held_line)) {
+            const size_t at = log[i].find(" runtime=");
+            need_runtime    = at == std::string::npos ? -1.0 : std::strtod(log[i].c_str() + at + 9, nullptr);
+        }
+    }
+    std::vector<std::string> rebuilds;
+    for (size_t i = from; i < log.size() && !has(log[i], "[HOST-LEDGER] device=0 plan host_budget="); ++i) {
+        if (has(log[i], "[VRAM-ARENA] Rebuilding unused early arena for planned zones")) {
+            rebuilds.push_back(log[i]);
+        }
+    }
+    double rebuilt_runtime = -1.0;  // the "runtime <from>-><to> MB" target of the one rebuild
+    if (rebuilds.size() == 1) {
+        const size_t at    = rebuilds[0].find("runtime ");
+        const size_t arrow = at == std::string::npos ? std::string::npos : rebuilds[0].find("->", at);
+        rebuilt_runtime    = arrow == std::string::npos ? -1.0 : std::strtod(rebuilds[0].c_str() + arrow + 2, nullptr);
+    }
+
+    // A refusal of device 0 after the last resort's release is the product's, not a missing precondition, unless the
+    // device could not reserve the arena the zones need.
+    const bool refused_after_release =
+        last_resort != 0 && !device0_refusal.empty() && !has(device0_refusal, "could not reserve an arena");
+    if (rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED && ring_only == 0 && kept == 0 && !refused_after_release) {
+        if (!refused.empty()) {
+            void_arm(r, "the stage refused for a cause this arm does not set up: " + refused[0]);
+            return r;
+        }
+        if (last_resort == 0) {
+            void_arm(r, "the stage returned PLAN_REJECTED with no zone refusal and no ring release");
+            return r;
+        }
+    } else if (rc != GGML_SYCL_LIFECYCLE_OK && rc != GGML_SYCL_LIFECYCLE_PLAN_REJECTED) {
+        void_arm(r, "the stage returned " + num(rc));
+        return r;
+    }
+    expect(r, ring_only == 0,
+           "the stage refused device 0 with only the ring holding its arena: the ring was not released");
+    expect(r, kept == 0,
+           "the stage kept the ring as the arena's only holder, though this arm holds no claim on a slot");
+    expect(r, !refused_after_release, "after the last resort's release the stage refused device 0: " + device0_refusal);
+    expect(r, rc == GGML_SYCL_LIFECYCLE_OK,
+           "the stage returned " + num(rc) + " after " + num(last_resort) + " last-resort ring release line(s)");
+    expect(r, released == 1 && last_resort == 1,
+           "the stage logged " + num(released) + " ring release line(s), " + num(last_resort) + " of them the last " +
+               "resort's, want exactly one, the last resort's");
+    expect(r, held_after == 0, "after its release line the ring still holds " + num(held_after) + " KV-zone bytes");
+    expect(r, last_resort == 0 || rebuilds.size() == 1,
+           "between the last resort's release and device 0's plan line the stage rebuilt the arena " +
+               num(rebuilds.size()) + " time(s), want 1: it did not ask for the zones again and get them");
+    expect(r, rebuilds.size() != 1 || (need_runtime >= 0.0 && rebuilt_runtime >= need_runtime),
+           "the stage rebuilt device 0's RUNTIME zone to " + std::to_string(rebuilt_runtime) + " MB, not at least " +
+               "the " + std::to_string(need_runtime) + " MB its refused first ask needed");
+    expect(r, rc != GGML_SYCL_LIFECYCLE_OK || zones_got,
+           "inside the open load the arm's own ensure refused the zones the stage left (reason " +
+               num(static_cast<int>(again.reason)) + ", after " + num(own_rebuilds) + " rebuild line(s) of its own)");
+    return r;
+}
+
+// The q2k fixture's shape with 256 experts: each expert tensor is 32 times larger, so the plan's host staging and
+// SCRATCH zones, which follow the largest copied tensor, are larger than the q2k shape's.
+constexpr host_plan_shaped_inventory::moe_shape q2k_wide_shape = {
+    GGML_TYPE_Q2_K, 2, 256, 2, 1024, 512, 4096, 16, 1, 0, 0, 0,
+};
+
+// (g) A load refused in its late pass configures no host zone, and the next load's host zones come from its own plan.
+// The host zones are configured once per cache, by the first late pass that reaches the step, so a refused load that
+// configured them would size them for every load after it. Load A (the q2k shape) stages its early pass, then its late
+// pass with the PRIVATE_TESTING hook that fails the stage after its first device, which on the stage's decide step is
+// before any device's effects. Load B (the same shape with 256 experts) stages both passes. Each ends uncommitted.
+// A's refusal is checked on every device: the hook fires after the first device, so a loop that ran each device's
+// effects before the next device's decision configures the first device, and on two cards no other. B's sizes are a
+// last-device check: each device's late stage replaces the load's candidate with its own snapshot, the snapshots of the
+// devices before it live only in the stage's own list, and a cache's plan is published only when its load commits, so
+// before B ends the last device's plan is the one plan a test can read. The devices before it are checked configured,
+// not sized; on one card the last device is device 0.
+// Engagement: no device's cache had host zones before the arm; the hook is exported, and the armed late stage
+// returned EFFECT_FAILED; B's late pass staged a plan with entries; A's and B's plans size at least one zone apart.
+// Mutant: the host zones configured inside the device loop, before a later device's refusal (A's late pass configures
+// the first device's zones; on one card B's zones are then A's sizes).
+arm_result arm_g_refused_late_pass_configures_no_host_zones() {
+    arm_result                   r;
+    std::vector<unified_cache *> caches;
+    for (int d = 0; d < ggml_backend_sycl_get_device_count(); ++d) {
+        unified_cache * c = get_unified_cache_for_device(d);
+        if (c == nullptr || c->pinned_pool_chunk_size() == 0) {
+            void_arm(r, "device " + num(d) + " has no cache with a pinned pool");
+            return r;
+        }
+        if (c->host_zones_configured()) {
+            void_arm(r, "device " + num(d) + "'s host zones were configured before the arm, so a refused load's " +
+                            "zones cannot be told from an earlier one's");
+            return r;
+        }
+        caches.push_back(c);
+    }
+    if (caches.empty()) {
+        void_arm(r, "no SYCL device");
+        return r;
+    }
+    const int       device = static_cast<int>(caches.size()) - 1;
+    unified_cache * cache  = caches.back();
+
+    // The devices whose host zones are configured (`configured`) or not, as a list for a message.
+    const auto devices_where = [&](bool configured) {
+        std::string list;
+        for (size_t d = 0; d < caches.size(); ++d) {
+            if (caches[d]->host_zones_configured() == configured) {
+                list += " " + num(d);
+            }
+        }
+        return list;
+    };
+    using fail_next_fn           = void (*)();
+    const fail_next_fn fail_late = reinterpret_cast<fail_next_fn>(ggml_backend_reg_get_proc_address(
+        ggml_backend_sycl_reg(), "ggml_backend_sycl_test_fail_next_stage_inventory_plan_late_after_first_device"));
+    if (fail_late == nullptr) {
+        void_arm(r, "the stage's late failure hook is not exported");
+        return r;
+    }
+    const auto terms_of = [&](const placement_plan & plan) {
+        return placement_plan_host_zone_commit_terms(
+            plan, cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size(),
+            cache->pinned_pool_chunk_size());
+    };
+
+    loader_inventory   a_inv(host_plan_shaped_inventory::q2k_shape);
+    ggml_sycl_load_txn a{};
+    if (ggml_backend_sycl_model_load_begin(&a) != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "load A's transaction did not begin");
+        return r;
+    }
+    if (ggml_backend_sycl_stage_load_inventory_plan(&a_inv.inv, nullptr, true) != GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_load_end(a, false, nullptr);
+        void_arm(r, "load A's early pass did not stage");
+        return r;
+    }
+    const auto a_early = lifecycle_find_candidate_placement_plan(a.id);
+    if (!a_early || !a_early->plan || a_early->plan->entries.empty()) {
+        (void) ggml_backend_sycl_model_load_end(a, false, nullptr);
+        void_arm(r, "load A's early pass staged no plan with entries");
+        return r;
+    }
+    const host_zone_commit_terms a_terms = terms_of(*a_early->plan);
+    fail_late();
+    const ggml_sycl_lifecycle_result a_rc = ggml_backend_sycl_stage_load_inventory_plan(&a_inv.inv, nullptr, false);
+    const std::string                a_configured = devices_where(true);
+    (void) ggml_backend_sycl_model_load_end(a, false, nullptr);
+    if (a_rc != GGML_SYCL_LIFECYCLE_EFFECT_FAILED) {
+        // The hook fires only when the stage reaches it, so it may still be armed: no further stage runs here.
+        void_arm(r, "load A's armed late pass returned " + num(a_rc) + ", not EFFECT_FAILED");
+        return r;
+    }
+    expect(r, a_configured.empty(),
+           "load A's late pass, refused on its decide step, configured the host zones of device(s)" + a_configured);
+
+    loader_inventory   b_inv(q2k_wide_shape);
+    ggml_sycl_load_txn b{};
+    if (ggml_backend_sycl_model_load_begin(&b) != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "load B's transaction did not begin");
+        return r;
+    }
+    const ggml_sycl_lifecycle_result b_early_rc =
+        ggml_backend_sycl_stage_load_inventory_plan(&b_inv.inv, nullptr, true);
+    const ggml_sycl_lifecycle_result b_late_rc =
+        b_early_rc == GGML_SYCL_LIFECYCLE_OK ? ggml_backend_sycl_stage_load_inventory_plan(&b_inv.inv, nullptr, false) :
+                                               b_early_rc;
+    const auto                   b_late         = lifecycle_find_candidate_placement_plan(b.id);
+    const std::string            b_unconfigured = devices_where(false);
+    const size_t                 have_weight    = cache->host_zone_capacity(host_zone_id::WEIGHT);
+    const size_t                 have_kv        = cache->host_zone_capacity(host_zone_id::KV);
+    const size_t                 have_staging   = cache->host_zone_capacity(host_zone_id::STAGING);
+    const size_t                 have_scratch   = cache->host_zone_capacity(host_zone_id::SCRATCH);
+    const host_zone_commit_terms b_terms = b_late && b_late->plan ? terms_of(*b_late->plan) : host_zone_commit_terms{};
+    (void) ggml_backend_sycl_model_load_end(b, false, nullptr);
+    if (b_late_rc != GGML_SYCL_LIFECYCLE_OK || !b_late || !b_late->plan || b_late->plan->entries.empty()) {
+        void_arm(r, "load B's passes returned " + num(b_early_rc) + " and " + num(b_late_rc) +
+                        " without a staged plan with entries");
+        return r;
+    }
+    if (a_terms.weight == b_terms.weight && a_terms.kv == b_terms.kv && a_terms.staging == b_terms.staging &&
+        a_terms.scratch == b_terms.scratch) {
+        void_arm(r, "load A's and load B's plans size every host zone alike, so the zones cannot say whose plan " +
+                        std::string("configured them"));
+        return r;
+    }
+    const size_t align    = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+    const auto   align_up = [](size_t bytes) {
+        return (bytes + align - 1) & ~(align - 1);
+    };
+    expect(r, b_unconfigured.empty(), "load B's late pass configured no host zones on device(s)" + b_unconfigured);
+    const auto zone = [&](const char * name, size_t have, size_t b_term, size_t a_term) {
+        expect(r, have == align_up(b_term),
+               std::string("the last device's (device ") + num(device) + ") " + name + " zone holds " + num(have) +
+                   " bytes, not load B's " + num(b_term) + " (load A's plan sized it " + num(a_term) + ")");
+    };
+    zone("WEIGHT", have_weight, b_terms.weight, a_terms.weight);
+    zone("KV", have_kv, b_terms.kv, a_terms.kv);
+    zone("STAGING", have_staging, b_terms.staging, a_terms.staging);
+    zone("SCRATCH", have_scratch, b_terms.scratch, a_terms.scratch);
+    return r;
+}
+
 const char * outcome_name(outcome o) {
     return o == outcome::PASS ? "PASS" : o == outcome::FAIL ? "FAIL" : "VOID";
 }
@@ -757,11 +1517,15 @@ int main() {
     };
 
     const named_arm arms[] = {
-        { "(0) a caller of another layout is refused",           arm_0_another_layout_is_refused          },
-        { "(a) expected_host is the stage's host_planned_bytes", arm_a_expected_host_is_the_stage_figure  },
-        { "(b) every term printed by name, from the plan",       arm_b_every_term_printed_from_the_plan   },
-        { "(c) a dry run stores nothing and leaves no trace",    arm_c_a_dry_run_stores_nothing           },
-        { "(d) --mem-available is the sample's MemAvailable",    arm_d_mem_available_option_is_the_sample },
+        { "(0) a caller of another layout is refused",           arm_0_another_layout_is_refused                  },
+        { "(a) expected_host is the stage's host_planned_bytes", arm_a_expected_host_is_the_stage_figure          },
+        { "(b) every term printed by name, from the plan",       arm_b_every_term_printed_from_the_plan           },
+        { "(c) a dry run stores nothing and leaves no trace",    arm_c_a_dry_run_stores_nothing                   },
+        { "(d) --mem-available is the sample's MemAvailable",    arm_d_mem_available_option_is_the_sample         },
+        { "(e) a load the held arena cannot hold is refused",    arm_e_held_arena_refuses_the_load                },
+        { "(f) a load refused early keeps the KV-zone ring",     arm_f_early_refusal_keeps_the_kv_zone_ring       },
+        { "(h) a load releases a ring alone holding the arena",  arm_h_load_releases_a_lone_ring                  },
+        { "(g) a refused late pass configures no host zone",     arm_g_refused_late_pass_configures_no_host_zones },
     };
     int passed = 0, failed = 0, voided = 0;
     for (const named_arm & arm : arms) {

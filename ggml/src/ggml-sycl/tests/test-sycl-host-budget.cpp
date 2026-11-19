@@ -14,10 +14,12 @@
 //       at zero headroom-free memory it is the named refusal either way;
 //   (4) an unknown MemTotal keeps the min(8 GiB, MemAvailable/4) reserve and stays monotone; nothing read is uncapped;
 //   (5) the refusal names itself with MemAvailable, MemTotal and the headroom it compared, and a budget that is not
-//       the refusal names nothing.
-// Every arm names its engagement check. An arm whose engagement check fails is VOID, and a VOID arm fails the binary
-// like a FAIL. Every arm runs, so one failure does not hide the rest. Each registered mutant passes only on its arm's
-// FAIL line.
+//       the refusal names nothing;
+//   (6) a pinned host size past the host's RAM is refused before the driver, a size up to it is not, and an unknown
+//       RAM size bounds nothing.
+// Every arm but (6), whose sizes are constants, names its engagement check. An arm whose engagement check fails is
+// VOID, and a VOID arm fails the binary like a FAIL. Every arm runs, so one failure does not hide the rest. Each
+// registered mutant passes only on its arm's FAIL line.
 
 #include "../host-budget.hpp"
 
@@ -252,6 +254,28 @@ void arm_refusal_reason() {
     }
 }
 
+// (6) A pinned host allocation past the host's RAM can never exist, and the driver aborted on a 1 PiB request instead
+// of failing it, so the raw host exit refuses such a size first; up to the RAM it is the driver's to answer, and an
+// unknown RAM size (0) bounds nothing. The arm models a 246.9 GiB host. Its sizes are constants, so it has no
+// engagement check.
+void arm_pinned_size_bound() {
+    const char * arm   = "(6) a pinned size past the RAM is refused";
+    const size_t total = gib(246.9);
+    const size_t pib   = 1ull << 50;  // the size the runtime-alloc staging control asks for
+    if (host_pinned_size_possible(total + 1, total)) {
+        fail(arm, "1 byte past a 246.9 GiB host's RAM is allowed");
+    }
+    if (host_pinned_size_possible(pib, total)) {
+        fail(arm, "1 PiB on a 246.9 GiB host is allowed");
+    }
+    if (!host_pinned_size_possible(total, total) || !host_pinned_size_possible(64 * MiB, total)) {
+        fail(arm, "a size up to a 246.9 GiB host's RAM is refused");
+    }
+    if (!host_pinned_size_possible(pib, 0)) {
+        fail(arm, "an unknown RAM size refuses 1 PiB");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -260,6 +284,7 @@ int main() {
     arm_override();
     arm_unknown_total();
     arm_refusal_reason();
+    arm_pinned_size_bound();
     if (g_failures != 0) {
         std::printf("test-sycl-host-budget: %d failure(s)\n", g_failures);
         return 1;

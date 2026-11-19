@@ -484,6 +484,11 @@ struct ggml_sycl_tensor_inventory {
     // count dereferences whatever lies there as an array of tables. libllama and libggml-sycl must be rebuilt together.
     const struct ggml_sycl_lazy_table_info * lazy_tables;
     uint32_t                                 lazy_table_count;
+    // The micro-batch the load measured its compute term at (libllama's llama_load_measure_shape_resolve over the
+    // caller's hints), which the backend credits the term at. It sits in the padding after lazy_table_count, so the
+    // struct stays 208 bytes. libllama and libggml-sycl are rebuilt together. When the field is 0 the backend reads
+    // n_ubatch instead.
+    uint32_t                                 n_ubatch_measure;
 };
 
 #if defined(__cplusplus) && UINTPTR_MAX == UINT64_MAX
@@ -494,6 +499,7 @@ static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inven
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_measure) == 204, "n_ubatch_measure moved");
 static_assert(sizeof(ggml_sycl_lazy_table_info) == 88, "ggml_sycl_lazy_table_info layout changed");
 static_assert(offsetof(ggml_sycl_lazy_table_info, name) == 0, "lazy table name moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, type) == 8, "lazy table type moved");
@@ -546,6 +552,10 @@ typedef struct ggml_sycl_host_create_record {
 // Direct calls retain legacy planning/late side effects; they do not guarantee
 // eager host-zone provisioning. The loader uses stage_load_inventory_plan(..., false)
 // to attempt that provisioning before buffer allocation, under lifecycle guards.
+// A plan the VRAM arena's zones cannot hold is logged as an ERROR and nothing is
+// planned; this entry and the early one below return no result, only the stage does.
+// The stage's other plan refusals (a lazy-table refusal, a cross-card expert plan with no peer path between the
+// cards) are not asked on this entry, and the model loader does not use it: only tests call it directly.
 GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t                            backend,
                                                              const struct ggml_sycl_tensor_inventory * inventory);
 
@@ -554,6 +564,10 @@ GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t     
 // Skips late-only side effects (layer-streaming setup, host-pinned pre-allocate)
 // that depend on state populated by create_tensor; those still run when
 // ggml_backend_sycl_set_tensor_inventory is called later.  Idempotent.
+// The stage's other plan refusals (a lazy-table refusal, a cross-card expert plan with no peer path between the
+// cards) are not asked on this entry. The model loader reaches it only through
+// ggml_backend_sycl_stage_load_inventory_plan(..., true), which asks them once every device has planned; only tests
+// call it directly.
 GGML_BACKEND_API void ggml_backend_sycl_compute_placement_plan_early(
     ggml_backend_t                            backend,
     const struct ggml_sycl_tensor_inventory * inventory);
@@ -981,21 +995,14 @@ GGML_BACKEND_API void ggml_backend_sycl_get_device_description(int device, char 
 GGML_BACKEND_API int  ggml_backend_sycl_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_sycl_get_device_memory(int device, size_t * free, size_t * total);
 
-// Check if MoE multi-GPU mode is requested via GGML_SYCL_MOE_MULTI_GPU=1.
-// Disabled by default while multi-device Level Zero execution is unstable.
-// When true, the SYCL backend handles multi-device MoE dispatch internally,
-// and secondary GPUs should NOT be exposed to the backend scheduler.
+// Whether the cross-card expert path is requested: two or more GPUs and GGML_SYCL_MOE_MULTI_GPU set non-zero.
+// Off by default: the cards have no peer path. When true, the backend dispatches expert work to secondary
+// GPUs itself, and those GPUs are not exposed to the backend scheduler.
 GGML_BACKEND_API bool ggml_backend_sycl_moe_multi_gpu_requested(void);
+// Whether the placement plan spans every physical GPU for a model with or without experts. A model without
+// experts gets the two-card plan whenever two GPUs are visible; one with experts only on the request above.
+GGML_BACKEND_API bool ggml_backend_sycl_multi_device_plan_requested(bool has_experts);
 GGML_BACKEND_API void ggml_backend_sycl_set_debug(int level);
-
-// llama.cpp-xojq (nphx Task 4b): the GPU MoE routing ceiling
-// (MOE_GPU_UBATCH_MAX, ggml-sycl/moe-control-plan.hpp) exposed for
-// llama_context's auto micro-batch ladder. Above this micro-batch the
-// routing-id/compaction table stops being a control-sized allocation and
-// moe_build_context_control_layout() refuses the GPU route
-// (exceeds_gpu_ubatch), so the trial must not try a larger candidate on a
-// MoE model (hparams.n_expert > 0) until llama.cpp-ohkx lifts the ceiling.
-GGML_BACKEND_API uint32_t ggml_backend_sycl_moe_gpu_ubatch_max(void);
 
 // Device-to-host memcpy using the SYCL backend queue for the tensor's buffer.
 // This avoids mixing queues/contexts in tests.
@@ -1532,7 +1539,10 @@ enum ggml_sycl_lifecycle_result {
     GGML_SYCL_LIFECYCLE_BUSY,
     GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND,
     // A deterministic refusal of a runtime plan update (budget or accounting),
-    // as opposed to the transient BUSY above. Callers must NOT retry it: the
+    // or of a model load's plan (a lazy table it refused, a cross-card expert
+    // plan with no peer path between the cards, or VRAM arena zones that
+    // cannot be sized for it while something holds the arena), as
+    // opposed to the transient BUSY above. Callers must NOT retry it: the
     // inputs cannot change between attempts, so a retry loop only multiplies
     // the error output. Appended last on purpose -- these values reach users as
     // `result=%d` and are quoted in tickets and logs (BUSY is 17), so inserting
@@ -1551,6 +1561,10 @@ enum ggml_sycl_lifecycle_result {
 // immutable load candidate used by direct static calls. It derives the load's
 // host-backing fact from the inventory's resolved inputs (design 5efe §4.3)
 // and the staged plan holds it.
+//
+// A plan the backend refuses returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED after
+// an ERROR or WARN line that says why, and the stage puts back the per-device
+// planned terms the load published; the load's transaction then ends failed.
 //
 // Exported under this name since the inventory began carrying those inputs.
 // The registry answers the old name, ggml_backend_sycl_stage_inventory_plan,
@@ -2398,6 +2412,12 @@ GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install_kv(
     enum ggml_sycl_measure_stage              stage,
     const struct ggml_sycl_measure_kv_shape * kv_shape);
 GGML_BACKEND_API void ggml_backend_sycl_measure_plan_override_clear(void);
+
+// Proc name: "ggml_backend_sycl_measure_plan_staged".  Whether the load `load_txn` has a plan staged for the measure
+// at `stage`, by the lookup the install makes, installing nothing.  A load the early pass could not plan stages no
+// probe plan: a model built in memory (its weights are known only after create_tensor), a no_alloc load, and a load
+// with the VRAM arena off.  The loader asks this first, so such a load is not refused for a measure it cannot run.
+GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_staged(uint64_t load_txn, enum ggml_sycl_measure_stage stage);
 
 // === Per-context chunk-cap copy and plan scopes ===
 //

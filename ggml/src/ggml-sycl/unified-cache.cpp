@@ -36,6 +36,7 @@
 #include "vram-headroom.hpp"
 #include "weight-row-padding.hpp"
 #include "zone-sizing.hpp"
+#include "zone-used-count.hpp"
 
 #include <dlfcn.h>
 #include <level_zero/ze_api.h>
@@ -2868,17 +2869,19 @@ void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_u
     }
     // A compare-exchange, so the one transition to disagreement is seen by exactly one store, whatever lock its
     // caller holds. On exit `stored` is the value this store replaced (or `next` when it changed nothing).
-    uint32_t stored = g_planned_compute_term_n_ubatch[device_id].load(std::memory_order_acquire);
-    uint32_t next   = zone_compute_term_n_ubatch_store(stored, n_ubatch);
+    // The merged term of the loads live on the device; 0 when none holds one, so this load's value replaces the record.
+    const bool term_live = g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire) != 0;
+    uint32_t   stored    = g_planned_compute_term_n_ubatch[device_id].load(std::memory_order_acquire);
+    uint32_t   next      = zone_compute_term_n_ubatch_store(stored, n_ubatch, term_live);
     while (next != stored &&
            !g_planned_compute_term_n_ubatch[device_id].compare_exchange_weak(stored, next, std::memory_order_acq_rel)) {
-        next = zone_compute_term_n_ubatch_store(stored, n_ubatch);
+        next = zone_compute_term_n_ubatch_store(stored, n_ubatch, term_live);
     }
     if (zone_compute_term_n_ubatch_turns_off(stored, next)) {
         GGML_LOG_WARN(
             "[LOAD-PLAN] device %d: this load plans its compute term at n_ubatch=%u where an earlier load planned it "
-            "at n_ubatch=%u; the hold-spill fit credits the planned compute room at no rung for the rest of the "
-            "process\n",
+            "at n_ubatch=%u; the record names no micro-batch until a load is taken in while no load holds a compute "
+            "term on the device, so until then the hold-spill fit gets no measured micro-batch from it\n",
             device_id, n_ubatch, stored);
     }
 }
@@ -3614,29 +3617,205 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
                                               unified_cache_get_planned_moe_control_requirement(device_id), &base)) {
         return false;
     }
-    // The host-expert MoE scatter scratch lives in this zone (llama.cpp-cre6), checked the same way.
+    // The host-expert MoE scatter scratch lives in this zone (llama.cpp-cre6).
     const size_t moe_host_scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device_id);
-    if (moe_host_scatter > SIZE_MAX - base) {
-        return false;
-    }
-    base += moe_host_scatter;
-    // The dense MMQ/MMVQ Q8_1 src1 buffer lives in this zone (llama.cpp-479i). Checked like
-    // the terms above: a wrapped sum would be a SMALLER zone, not a refusal.
+    // The dense MMQ/MMVQ Q8_1 src1 buffer lives in this zone (llama.cpp-479i).
     const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
-    // The dense f16 dequant buffer lives in this zone too (llama.cpp-479i), checked the same way.
+    // The dense f16 dequant buffer lives in this zone too (llama.cpp-479i).
     const size_t dequant_f16 = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);
-    // The scheduler's compute buffer lives in this zone too (llama.cpp-p6i0), checked the same way.
+    // The scheduler's compute buffer lives in this zone too (llama.cpp-p6i0).
     const size_t compute     = unified_cache_get_planned_compute_term_bytes(device_id);
     // The context memory the load measured on the device's plain buffer type (the recurrent state) is allocated in
-    // this zone before the compute buffer (llama.cpp-p6i0), checked the same way.
+    // this zone before the compute buffer (llama.cpp-p6i0).
     const size_t state       = unified_cache_get_planned_state_term_bytes(device_id);
-    if (mmq_src1 > SIZE_MAX - base || dequant_f16 > SIZE_MAX - base - mmq_src1 ||
-        compute > SIZE_MAX - base - mmq_src1 - dequant_f16 ||
-        state > SIZE_MAX - base - mmq_src1 - dequant_f16 - compute) {
-        return false;
+    // The sum is the pure helper's, which checks every addition: a wrapped sum would be a SMALLER zone, not a refusal.
+    zone_runtime_terms terms;
+    terms.base             = base;
+    terms.moe_host_scatter = moe_host_scatter;
+    terms.mmq_src1         = mmq_src1;
+    terms.dequant_f16      = dequant_f16;
+    terms.compute          = compute;
+    terms.state            = state;
+    return zone_runtime_requirement(terms, out);
+}
+
+planner_published_terms planner_published_terms::snapshot(int device) {
+    planner_published_terms terms;
+    terms.graph   = unified_cache_get_planned_onednn_graph_scratch_shape(device);
+    terms.nonfa   = unified_cache_get_planned_nonfa_attn_scratch_shape(device);
+    terms.control = unified_cache_get_planned_moe_control_requirement(device);
+    terms.scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device);
+    return terms;
+}
+
+void planner_published_terms::restore(int device) const {
+    unified_cache_set_planned_onednn_graph_scratch_shape(device, graph.n_head_ctx_max, graph.n_head_swa_max,
+                                                         graph.n_swa, graph.n_ubatch, graph.n_ctx);
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
+    unified_cache_set_planned_moe_control_requirement(device, control);
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);
+}
+
+// The oneDNN scratchpad pair's two halves, without the sum the pair's setter stores after them: a failed load's restore
+// puts the halves back on their own and the sum by compare-exchange (load_published_record::restore).
+static void unified_cache_store_planned_onednn_pair_halves(int    device_id,
+                                                           size_t weights_bytes,
+                                                           size_t activations_bytes) {
+    g_planned_onednn_pair_weights_bytes[device_id].store(weights_bytes, std::memory_order_release);
+    g_planned_onednn_pair_activations_bytes[device_id].store(activations_bytes, std::memory_order_release);
+}
+
+load_published_terms load_published_terms::snapshot(int device) {
+    load_published_terms terms;
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return terms;
     }
-    *out = base + mmq_src1 + dequant_f16 + compute + state;
-    return true;
+    terms.pp_pipeline           = unified_cache_get_planned_pp_pipeline_scratch_bytes(device);
+    terms.ring_weight           = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
+    terms.ring_activation       = unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device);
+    terms.ring_output           = unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(device);
+    terms.ring_depth            = unified_cache_get_planned_pp_moe_onednn_ring_depth(device);
+    terms.ring_activation_in_kv = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(device);
+    terms.ring_output_in_kv     = unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(device);
+    terms.ring_activation_row   = unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device);
+    terms.ring_output_row       = unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device);
+    terms.ring_n_expert         = unified_cache_get_planned_pp_moe_onednn_n_expert(device);
+    terms.ring_n_expert_used    = unified_cache_get_planned_pp_moe_onednn_n_expert_used(device);
+    terms.ring_n_ubatch         = unified_cache_get_planned_pp_moe_onednn_n_ubatch(device);
+    terms.onednn_weights        = g_planned_onednn_pair_weights_bytes[device].load(std::memory_order_acquire);
+    terms.onednn_activations    = g_planned_onednn_pair_activations_bytes[device].load(std::memory_order_acquire);
+    terms.onednn_stored         = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device);
+    terms.planner               = planner_published_terms::snapshot(device);
+    return terms;
+}
+
+uint32_t load_published_terms::differing(const load_published_terms & other) const {
+    const auto bit = [](bool differs, load_published_group group) -> uint32_t {
+        return differs ? static_cast<uint32_t>(group) : 0u;
+    };
+    const planner_published_terms & a = planner;
+    const planner_published_terms & b = other.planner;
+    return bit(pp_pipeline != other.pp_pipeline, LOAD_PUBLISHED_GROUP_PIPELINE) |
+           bit(ring_weight != other.ring_weight || ring_activation != other.ring_activation ||
+                   ring_output != other.ring_output || ring_depth != other.ring_depth ||
+                   ring_activation_in_kv != other.ring_activation_in_kv ||
+                   ring_output_in_kv != other.ring_output_in_kv || ring_n_ubatch != other.ring_n_ubatch,
+               LOAD_PUBLISHED_GROUP_RING) |
+           bit(ring_activation_row != other.ring_activation_row || ring_output_row != other.ring_output_row ||
+                   ring_n_expert != other.ring_n_expert || ring_n_expert_used != other.ring_n_expert_used,
+               LOAD_PUBLISHED_GROUP_RING_ROWS) |
+           bit(onednn_weights != other.onednn_weights || onednn_activations != other.onednn_activations,
+               LOAD_PUBLISHED_GROUP_ONEDNN_PAIR) |
+           bit(onednn_stored != other.onednn_stored, LOAD_PUBLISHED_GROUP_ONEDNN_SUM) |
+           bit(a.graph.n_head_ctx_max != b.graph.n_head_ctx_max || a.graph.n_head_swa_max != b.graph.n_head_swa_max ||
+                   a.graph.n_swa != b.graph.n_swa || a.graph.n_ubatch != b.graph.n_ubatch ||
+                   a.graph.n_ctx != b.graph.n_ctx,
+               LOAD_PUBLISHED_GROUP_GRAPH) |
+           bit(a.nonfa.n_head != b.nonfa.n_head || a.nonfa.n_ubatch != b.nonfa.n_ubatch ||
+                   a.nonfa.n_ctx != b.nonfa.n_ctx,
+               LOAD_PUBLISHED_GROUP_NONFA) |
+           bit(a.control.bytes != b.control.bytes || a.control.valid != b.control.valid, LOAD_PUBLISHED_GROUP_CONTROL) |
+           bit(a.scatter != b.scatter, LOAD_PUBLISHED_GROUP_SCATTER);
+}
+
+void load_published_terms::take_groups(const load_published_terms & from, uint32_t groups) {
+    if (groups & LOAD_PUBLISHED_GROUP_PIPELINE) {
+        pp_pipeline = from.pp_pipeline;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_RING) {
+        ring_weight           = from.ring_weight;
+        ring_activation       = from.ring_activation;
+        ring_output           = from.ring_output;
+        ring_depth            = from.ring_depth;
+        ring_activation_in_kv = from.ring_activation_in_kv;
+        ring_output_in_kv     = from.ring_output_in_kv;
+        ring_n_ubatch         = from.ring_n_ubatch;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_RING_ROWS) {
+        ring_activation_row = from.ring_activation_row;
+        ring_output_row     = from.ring_output_row;
+        ring_n_expert       = from.ring_n_expert;
+        ring_n_expert_used  = from.ring_n_expert_used;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_ONEDNN_PAIR) {
+        onednn_weights     = from.onednn_weights;
+        onednn_activations = from.onednn_activations;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_ONEDNN_SUM) {
+        onednn_stored = from.onednn_stored;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_GRAPH) {
+        planner.graph = from.planner.graph;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_NONFA) {
+        planner.nonfa = from.planner.nonfa;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_CONTROL) {
+        planner.control = from.planner.control;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_SCATTER) {
+        planner.scatter = from.planner.scatter;
+    }
+}
+
+void load_published_record::note(const load_published_terms & before, const load_published_terms & after) {
+    // A group that changed since this load last looked was written by another publisher: what it wrote is what the
+    // restore puts back if this pass wrote over it.
+    prior.take_groups(before, before.differing(written));
+    written = after;
+
+    // A pass writes the sum only through the pair's setter, so the sum it published is the pair's total. A reserve that
+    // raised the sum during the pass raised it after that write, and the restore's compare-exchange keeps the raise.
+    written.onednn_stored = after.onednn_weights + after.onednn_activations;
+}
+
+void load_published_record::restore(int device) const noexcept {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    // The groups that hold what this load published and held something else before it: each goes back whole, and
+    // every other group keeps what holds it now.
+    const uint32_t back = ~load_published_terms::snapshot(device).differing(written) & prior.differing(written);
+    if (back & LOAD_PUBLISHED_GROUP_PIPELINE) {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, prior.pp_pipeline);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_RING) {
+        unified_cache_set_planned_pp_moe_onednn_scratch(device, prior.ring_weight, prior.ring_activation,
+                                                        prior.ring_output, prior.ring_depth);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, prior.ring_activation_in_kv,
+                                                              prior.ring_output_in_kv);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, prior.ring_n_ubatch);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_RING_ROWS) {
+        unified_cache_set_planned_pp_moe_onednn_row_bytes(device, prior.ring_activation_row, prior.ring_output_row,
+                                                          prior.ring_n_expert, prior.ring_n_expert_used);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_ONEDNN_PAIR) {
+        // The halves alone: the pair's setter would also store their total over the sum, which goes back below.
+        unified_cache_store_planned_onednn_pair_halves(device, prior.onednn_weights, prior.onednn_activations);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_GRAPH) {
+        const onednn_graph_scratch_planned_shape & graph = prior.planner.graph;
+        unified_cache_set_planned_onednn_graph_scratch_shape(device, graph.n_head_ctx_max, graph.n_head_swa_max,
+                                                             graph.n_swa, graph.n_ubatch, graph.n_ctx);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_NONFA) {
+        const nonfa_attn_scratch_planned_shape & nonfa = prior.planner.nonfa;
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_CONTROL) {
+        unified_cache_set_planned_moe_control_requirement(device, prior.planner.control);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_SCATTER) {
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, prior.planner.scatter);
+    }
+    // The sum goes back from what this load published to what it held before, in one compare-exchange: the pair's
+    // reserve raises it outside the inventory lock, and a raise since this load published it is kept.
+    size_t published = written.onednn_stored;
+    if (prior.onednn_stored != published) {
+        (void) g_planned_onednn_scratchpad_bytes[device].compare_exchange_strong(published, prior.onednn_stored,
+                                                                                 std::memory_order_acq_rel);
+    }
 }
 
 size_t unified_cache_runtime_zone_floor_bytes() {
@@ -3699,8 +3878,7 @@ void unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t weig
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
-    g_planned_onednn_pair_weights_bytes[device_id].store(weights_bytes, std::memory_order_release);
-    g_planned_onednn_pair_activations_bytes[device_id].store(activations_bytes, std::memory_order_release);
+    unified_cache_store_planned_onednn_pair_halves(device_id, weights_bytes, activations_bytes);
     unified_cache_set_planned_onednn_scratchpad_bytes(device_id, weights_bytes + activations_bytes);
 }
 
@@ -6337,7 +6515,8 @@ static size_t resolve_host_staging_bytes() {
         parse_env_mb_value("GGML_SYCL_MMAP_STAGING_MB", env_mb)) {
         staging_mb = env_mb;
     }
-    return staging_mb * 1024ULL * 1024ULL;
+    // Saturating, so an absurd value is a size the raw host exit refuses, never a wrapped small one it would allocate.
+    return staging_mb > SIZE_MAX / (1024ULL * 1024ULL) ? SIZE_MAX : staging_mb * 1024ULL * 1024ULL;
 }
 
 // llama.cpp-glkg: resolve_host_reserve_bytes() (parsed GGML_SYCL_HOST_RESERVE_MB
@@ -7055,9 +7234,11 @@ unified_cache::unified_cache(sycl::queue & queue,
         std::atexit(unified_cache_test_counter_dump);
     }
 
-    // Allocate staging buffer (pinned host memory)
+    // Allocate staging buffer (pinned host memory). A size of 0 (GGML_SYCL_HOST_STAGING_MB=0) asks for none: a
+    // zero-byte host allocation only fails and logs that it did, so the cache starts as it does after a failed one.
     try {
-        staging_ = unified_cache_malloc_host_tracked(staging_size, queue_, "unified_cache:staging");
+        staging_ = staging_size > 0 ? unified_cache_malloc_host_tracked(staging_size, queue_, "unified_cache:staging") :
+                                      nullptr;
         if (staging_) {
             staging_size_ = staging_size;
             // Internal provenance mint: this helper is TU-static; the literal
@@ -7329,7 +7510,26 @@ void unified_cache_entry::record_lease_event(bool acquire, const char * site) {
     debug_lease_ring_next    = (debug_lease_ring_next + 1) % kDebugLeaseRingSize;
 }
 
-bool unified_cache::ensure_planned_arena_zones() {
+// The cause of a refused arena teardown as the ensure's ERROR line names it.
+static const char * arena_teardown_cause_name(zone_arena_teardown_refusal cause) {
+    switch (cause) {
+        case zone_arena_teardown_refusal::HOST_STATE:
+            return "the host could not reserve its bookkeeping";
+        case zone_arena_teardown_refusal::LIVE_ALLOCATIONS:
+            return "allocations were live in it";
+        case zone_arena_teardown_refusal::DRAIN_SNAPSHOT:
+            return "the host could not record the allocations it waits on";
+        case zone_arena_teardown_refusal::DRAIN_TIMEOUT:
+            return "a lease on an allocation did not end in time";
+        case zone_arena_teardown_refusal::FREE_FAILED:
+            return "the device refused to free a chunk";
+        case zone_arena_teardown_refusal::NONE:
+            break;
+    }
+    return "no cause recorded";
+}
+
+bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {
     if (!vram_arena_enabled()) {
         return true;
     }
@@ -7532,11 +7732,22 @@ bool unified_cache::ensure_planned_arena_zones() {
             runtime_floor / (1024.0 * 1024.0));
     }
     if (planned_runtime_scratch > runtime_floor) {
+        // Every term of the requirement is named, so two lines whose totals differ say which term moved. The ring is
+        // split as unified_cache_get_planned_runtime_zone_requirement() splits it, from the same getters: ring slots
+        // placed in the shared KV zone are not RUNTIME demand, so moe_onednn is the rest and moe_onednn_in_kv is
+        // printed apart, outside the sum.
+        const size_t ring_in_kv      = unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(dev_id);
+        const size_t ring_in_runtime = planned_pp_moe_onednn > ring_in_kv ? planned_pp_moe_onednn - ring_in_kv : 0;
         GGML_LOG_INFO(
             "[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP scratch planning "
-            "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_control=%.1f MB, compute=%.1f MB, state=%.1f MB)\n",
+            "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_onednn_in_kv=%.1f MB, moe_control=%.1f MB, "
+            "moe_host_scatter=%.1f KB, mmq_src1=%.1f MB, dequant_f16=%.1f MB, compute=%.1f MB, state=%.1f MB)\n",
             runtime_zone / (1024.0 * 1024.0), planned_pp_pipeline / (1024.0 * 1024.0),
-            planned_pp_moe_onednn / (1024.0 * 1024.0), planned_moe_control.bytes / (1024.0 * 1024.0),
+            ring_in_runtime / (1024.0 * 1024.0), ring_in_kv / (1024.0 * 1024.0),
+            planned_moe_control.bytes / (1024.0 * 1024.0),
+            unified_cache_get_planned_moe_host_scatter_scratch_bytes(dev_id) / 1024.0,
+            unified_cache_get_planned_mmq_src1_scratch_bytes(dev_id) / (1024.0 * 1024.0),
+            unified_cache_get_planned_dequant_f16_scratch_bytes(dev_id) / (1024.0 * 1024.0),
             unified_cache_get_planned_compute_term_bytes(dev_id) / (1024.0 * 1024.0),
             unified_cache_get_planned_state_term_bytes(dev_id) / (1024.0 * 1024.0));
     }
@@ -7556,6 +7767,37 @@ bool unified_cache::ensure_planned_arena_zones() {
         }
     };
 
+    // A refused teardown names its cause in the refusal and on its own ERROR line, with what it left: an arena closed
+    // to new allocations, over which nothing may be reserved, or the arena as it was.
+    const auto refuse_teardown = [&](zone_arena_teardown_refusal cause, const zone_arena_sizes & have) {
+        const bool closed = zone_arena_teardown_left_closed(cause);
+        GGML_LOG_ERROR(
+            "[VRAM-ARENA] the arena on device %d could not be torn down (%s); %s: need scratch=%.1f MB oneDNN=%.1f MB "
+            "runtime=%.1f MB\n",
+            dev_id, arena_teardown_cause_name(cause),
+            closed ? "it stays closed to new allocations and no arena is reserved over it" : "it is as it was",
+            scratch_zone / (1024.0 * 1024.0), onednn_zone / (1024.0 * 1024.0), runtime_zone / (1024.0 * 1024.0));
+        if (refusal != nullptr) {
+            refusal->reason   = zone_arena_refusal_reason::TEARDOWN_REFUSED;
+            refusal->device   = dev_id;
+            refusal->need     = { scratch_zone, onednn_zone, runtime_zone };
+            refusal->have     = have;
+            refusal->teardown = cause;
+        }
+        return false;
+    };
+
+    // The arena's zones as this call read them, none when there is no arena. The holders refusal names them as what the
+    // device has; a reserve that fails after a rebuild destroyed that arena names them as released, and the zones the
+    // device has after the failure as its have.
+    zone_arena_sizes arena_zones;
+    // An earlier teardown that refused after it closed the arena left it closed until a teardown completes, so no
+    // zone can be sized in it, large enough or not, and no arena may be reserved over it.
+    if (const zone_arena_teardown_refusal earlier = arena_teardown_refusal();
+        zone_arena_teardown_left_closed(earlier)) {
+        return refuse_teardown(earlier, { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN),
+                                          zone_capacity(vram_zone_id::RUNTIME) });
+    }
     if (arena_active()) {
         const bool zones_sufficient = zone_capacity(vram_zone_id::SCRATCH) >= scratch_zone &&
                                       zone_capacity(vram_zone_id::ONEDNN) >= onednn_zone &&
@@ -7579,25 +7821,32 @@ bool unified_cache::ensure_planned_arena_zones() {
             onednn_zone_plan_keep_and_store(dev_id, live_plan);
             return true;
         }
+        arena_zones = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN),
+                        zone_capacity(vram_zone_id::RUNTIME) };
 
-        size_t live_zone_bytes = 0;
+        // Each zone's reading is kept, so a refusal below prints the same figures it decided on: a second read could
+        // disagree with them under a concurrent release.
+        size_t live_zone_used[static_cast<size_t>(vram_zone_id::COUNT)] = {};
+        size_t live_zone_bytes                                          = 0;
         for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
-            live_zone_bytes += zone_used(static_cast<vram_zone_id>(z));
+            live_zone_used[z] = zone_used(static_cast<vram_zone_id>(z));
+            live_zone_bytes += live_zone_used[z];
         }
 
-        bool     has_chunk_leases = false;
-        uint32_t chunk_leases     = 0;
+        uint32_t chunk_leases = 0;
         for (const arena_chunk & chunk : arena_chunks_) {
             const uint32_t leases = chunk.lease_count.load();
-            chunk_leases += leases;
-            has_chunk_leases = has_chunk_leases || leases != 0;
+            // Saturating, so a sum that would wrap still reads as held.
+            chunk_leases          = leases > UINT32_MAX - chunk_leases ? UINT32_MAX : chunk_leases + leases;
         }
 
-        const bool has_live_scratch = compute_arena_used() != 0 || scratch_pool_ptr_ != nullptr ||
-                                      onednn_weights_scratch_ != nullptr || onednn_activations_scratch_ != nullptr ||
-                                      reorder_temp_buffer_ != nullptr || !persistent_scratches_.empty() ||
-                                      !pp_moe_onednn_scratch_slots_.empty();
-        if (live_zone_bytes != 0 || has_chunk_leases || has_live_scratch) {
+        // A cache scratch buffer holds the arena only when the arena owns its pointer: one allocated outside it keeps
+        // its own memory through a rebuild. The SCRATCH zone's own bytes are already in live_zone_bytes.
+        zone_arena_holders holders;
+        holders.live_zone_bytes = live_zone_bytes;
+        holders.chunk_leases    = chunk_leases;
+        arena_count_scratch_holders(holders);
+        if (!zone_arena_rebuild_allowed(holders)) {
             const size_t blocked_bytes =
                 live_zone_bytes != 0 ? live_zone_bytes : (scratch_zone + onednn_zone + runtime_zone);
             residency_diagnostics_record_live_handle_for_test("arena-rebuild", "VRAM_ARENA", blocked_bytes);
@@ -7613,6 +7862,98 @@ bool unified_cache::ensure_planned_arena_zones() {
                 zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
                 zone_capacity(vram_zone_id::RUNTIME) / (1024.0 * 1024.0), live_zone_bytes / (1024.0 * 1024.0),
                 chunk_leases);
+            // The total above cannot say who holds the arena. This line prints each zone's live bytes from the reading
+            // the refusal decided on, the queued frees those zones still count, and the device's releases that could
+            // not complete and wait for a retry (a refused arena lease is the usual cause), which tell a free that has
+            // not run yet from an owner that was never released. Retired entries not yet finalized and evictions
+            // still in flight also hold zone bytes without an owner having leaked; both are this cache's counters.
+            // deferred_in_arena counts only a queued free that is a zone sub-allocation or points into the arena:
+            // its bytes stay in the zone's used counter until the queue drains at a later allocation, while a queued
+            // direct allocation outside the arena is in no zone. Its MB figure is the requested sizes; the zones
+            // count them rounded up to the allocator's block. The retries and live controls are the whole device's
+            // release coordinator's, not only this arena's. Each lock is taken alone and released before the log,
+            // and nothing here drains, frees, evicts, resets or allocates device memory.
+            size_t deferred_in_arena_count = 0;
+            size_t deferred_in_arena_bytes = 0;
+            {
+                std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);
+                for (const deferred_free_entry & entry : deferred_frees_) {
+                    if (entry.zone_managed || vram_owns(entry.ptr)) {
+                        ++deferred_in_arena_count;
+                        deferred_in_arena_bytes += entry.size;
+                    }
+                }
+            }
+            // The coordinator is looked up, not created: the accessor that hands one out makes it when it is missing.
+            size_t device_release_retries = 0;
+            size_t device_live_controls   = 0;
+            {
+                std::lock_guard<std::mutex> coordinator_lock(g_allocation_coordinator_mutex);
+                const auto                  it = g_allocation_coordinators.find(dev_id);
+                if (it != g_allocation_coordinators.end() && it->second) {
+                    device_release_retries = it->second->retry_count();
+                    device_live_controls   = it->second->live_controls();
+                }
+            }
+            const size_t retired_pending     = retired_pending_count_.load(std::memory_order_acquire);
+            const int    evictions_in_flight = evictions_in_flight_.load(std::memory_order_relaxed);
+
+            // The same readings go to the refusal, whose remedy tells the bytes of a release still to run from a
+            // model's or a context's.
+            holders.queued_frees    = deferred_in_arena_count;
+            holders.release_retries = device_release_retries;
+            holders.retired_pending = retired_pending;
+            holders.evictions       = evictions_in_flight > 0 ? static_cast<size_t>(evictions_in_flight) : 0;
+            std::string zones_live;
+            for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+                char part[48];
+                snprintf(part, sizeof(part), "%s%s=%.1f", z == 0 ? "" : " ",
+                         arena_zone_name(static_cast<vram_zone_id>(z)), live_zone_used[z] / (1024.0 * 1024.0));
+                zones_live += part;
+            }
+            GGML_LOG_ERROR(
+                "[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "
+                "device_release_retries=%zu device_live_controls=%zu retired_pending=%zu evictions_in_flight=%d "
+                "cache_scratch_in_arena=%u (pp_moe_ring_slots=%u) cache_scratch_outside=%u live_beside_ring=%u\n",
+                dev_id, zones_live.c_str(), deferred_in_arena_count, deferred_in_arena_bytes / (1024.0 * 1024.0),
+                device_release_retries, device_live_controls, retired_pending, evictions_in_flight,
+                holders.scratch_in_arena, holders.ring_in_arena, holders.scratch_outside, holders.live_beside_ring);
+            // Who holds the chunk leases: each site that took one, apart from the copies of its handles. The counts are
+            // read after the per-chunk total above, so a lease taken or dropped in between can set the two sums one
+            // apart. Then each zone with live bytes lists its live allocations, through this cache's own dump, which
+            // takes only the runtime registry's lock; that lock ranks after every scratch lock a caller can hold here.
+            std::string leases_by_site;
+            uint32_t    site_leases = 0;
+            for (size_t s = 0; s < static_cast<size_t>(chunk_lease_site::COUNT); ++s) {
+                for (int copy = 0; copy < 2; ++copy) {
+                    const chunk_lease_tag tag{ static_cast<chunk_lease_site>(s), copy != 0 };
+                    const uint32_t        held = arena_chunk_lease_count_at(tag);
+                    site_leases += held;
+                    if (held == 0) {
+                        continue;
+                    }
+                    char part[64];
+                    snprintf(part, sizeof(part), " %s%s=%u", chunk_lease_site_name(tag.site), tag.copy ? "(copy)" : "",
+                             held);
+                    leases_by_site += part;
+                }
+            }
+            GGML_LOG_WARN("[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\n", dev_id,
+                          leases_by_site.empty() ? " none" : leases_by_site.c_str(), site_leases, chunk_leases);
+            for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+                if (live_zone_used[z] != 0) {
+                    dump_live_zone_allocations(static_cast<vram_zone_id>(z), "arena-rebuild");
+                }
+            }
+            // The caller's refusal of its load names the figures the ERROR line above printed, and the holders the gate
+            // refused on, which choose its remedy.
+            if (refusal != nullptr) {
+                refusal->reason  = zone_arena_refusal_reason::REBUILD_HELD;
+                refusal->device  = dev_id;
+                refusal->need    = { scratch_zone, onednn_zone, runtime_zone };
+                refusal->have    = arena_zones;
+                refusal->holders = holders;
+            }
             return false;
         }
 
@@ -7629,11 +7970,30 @@ bool unified_cache::ensure_planned_arena_zones() {
         compute_arena_size_  = 0;
         compute_arena_owner_ = {};
         compute_arena_off_.store(0, std::memory_order_relaxed);
-        arena_destroy();
+        if (!arena_destroy()) {
+            // The reserve below would take the arena it failed to tear down for a fresh one and answer for zones it
+            // never sized, so the call refuses here. A teardown that refused before it closed the arena left it as it
+            // was, and its compute zone is bound again for whoever still uses it.
+            const zone_arena_teardown_refusal cause = arena_teardown_refusal();
+            if (!zone_arena_teardown_left_closed(cause)) {
+                bind_compute_arena();
+            }
+            return refuse_teardown(cause, arena_zones);
+        }
     }
 
     if (!arena_reserve(queue_, budget_, max_alloc, safe_max_alloc, scratch_zone, onednn_zone, runtime_zone,
                        device_total_vram_)) {
+        // The have is what the device has now, read after the failed reserve; the arena a rebuild destroyed for it is
+        // named apart.
+        if (refusal != nullptr) {
+            refusal->reason   = zone_arena_refusal_reason::RESERVE_FAILED;
+            refusal->device   = dev_id;
+            refusal->need     = { scratch_zone, onednn_zone, runtime_zone };
+            refusal->have     = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN),
+                                  zone_capacity(vram_zone_id::RUNTIME) };
+            refusal->released = arena_zones;
+        }
         return false;
     }
     bind_compute_arena();
@@ -17865,9 +18225,9 @@ bool unified_cache::validate() const {
 }
 
 // NOTE (792vn.5 cleanup): Arena zones now handle VRAM partitioning for runtime
-// allocations (KV, oneDNN, scratch).  Dynamic budget pressure from runtime
-// allocations is handled by the overcommit guard in unified_cache_total_committed_bytes()
-// rather than by shrinking the weight cache budget via this method.  Callers that
+// allocations (KV, oneDNN, scratch).  Raw device memory outside the arena meets the
+// raw-allocation gates (unified_alloc_raw_gate, unified_cache_raw_gate_admits), which read
+// the device's physical bytes, rather than a weight cache budget shrunk via this method.  Callers that
 // previously used g_runtime_reserved_bytes to drive update_reserved_bytes() have been
 // removed.  The method is retained for unified_cache deferred-reserve patterns
 // during cache creation.
@@ -19548,6 +19908,31 @@ static std::string query_device_name_no_info(int device_id, sycl::queue & queue)
     return "unknown";
 }
 
+// Per device, the bytes the device showed in use at its first cache creation that this process's accounting does not
+// hold: the driver's own use, other processes, and in-process allocations that never reach the registry. The raw
+// gates count them as taken (zone-raw-gate.hpp). It is a snapshot: if another process frees memory later, the figure
+// overstates what is taken and a gate refuses earlier than it must. That is the safe direction, so it is never re-read.
+static std::array<std::atomic<size_t>, GGML_SYCL_MAX_DEVICES> g_raw_gate_outside_accounting{};
+static std::array<std::atomic<bool>, GGML_SYCL_MAX_DEVICES>   g_raw_gate_outside_accounting_noted{};
+
+// Records the figure above once per device, from the reading that sizes the first arena reservation: no driver query
+// of its own. The raw rows the registry already holds are this process's own and the gates count them themselves, so
+// they come off. A reading without a total or a free figure records 0. Locks: it runs inside create_cache_for_device,
+// which holds g_cache_rw_mutex (L4) exclusive, and takes g_runtime_alloc_mutex (L5) inside it for the registry walk,
+// the L4-before-L5 order.
+static void unified_cache_note_raw_gate_outside_accounting(int device, size_t total, size_t free_mem) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || g_raw_gate_outside_accounting_noted[device].exchange(true)) {
+        return;
+    }
+    size_t outside = 0;
+    if (total != 0 && free_mem != 0 && total > free_mem) {
+        const size_t in_use   = total - free_mem;
+        const size_t raw_held = unified_cache_raw_device_held_bytes(device, nullptr);
+        outside               = in_use > raw_held ? in_use - raw_held : 0;
+    }
+    g_raw_gate_outside_accounting[device].store(outside, std::memory_order_relaxed);
+}
+
 static unified_cache * create_cache_for_device(int                     device_id,
                                                size_t *                deferred_reserved_out = nullptr,
                                                const device_mem_hint * hint                  = nullptr,
@@ -19708,6 +20093,8 @@ static unified_cache * create_cache_for_device(int                     device_id
         }
         total_vram_for_ctor = detected_total_mem;
     }
+    // Before the cache makes its arena, from the reading taken above for it.
+    unified_cache_note_raw_gate_outside_accounting(device_id, detected_total_mem, detected_free_mem);
     try {
         g_device_caches[device_id] =
             std::make_unique<unified_cache>(queue, budget, staging_bytes, dma_reserve_bytes, total_vram_for_ctor,
@@ -20212,7 +20599,7 @@ static bool runtime_reset_reclaimed_matches_locked(const alloc_handle & handle) 
     return matches;
 }
 
-// Reentry-safe total-VRAM lookup for the unified_alloc overcommit guard.
+// Reentry-safe total-VRAM lookup for the raw-allocation gates.
 // unified_alloc() can run inside ggml_sycl_init()'s static initialization
 // (e.g. the peer host-bounce probe allocates device staging buffers there).
 // Calling ggml_sycl_info() on that path re-enters the function-local static
@@ -20230,6 +20617,154 @@ static size_t unified_alloc_total_vram(int device, sycl::queue & queue) {
         cached[device].store(total, std::memory_order_relaxed);
     }
     return total;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// A device total the raw gates read in place of the driver's, so a test can put the gate's edge just past what the
+// process holds now. 0 reads the driver's figure again.
+static std::array<std::atomic<size_t>, GGML_SYCL_MAX_DEVICES> g_test_raw_gate_device_total{};
+
+void unified_cache_test_set_raw_gate_device_total(int device, size_t bytes) {
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        g_test_raw_gate_device_total[device].store(bytes, std::memory_order_relaxed);
+    }
+}
+#endif
+
+// Locks, one after the other and never two at once: g_cache_rw_mutex (L4), shared, for the cache lookup, released; then
+// g_runtime_alloc_mutex (L5) alone for the registry walk, released.
+zone_raw_gate_inputs unified_cache_raw_gate_inputs(int device, sycl::queue & queue) {
+    zone_raw_gate_inputs in;
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return in;
+    }
+    in.device_total = unified_alloc_total_vram(device, queue);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const size_t test_total = g_test_raw_gate_device_total[device].load(std::memory_order_relaxed);
+    in.device_total         = test_total != 0 ? test_total : in.device_total;
+#endif
+    // The reservation is committed whole when the arena is made, on one chunk or N: all of it is taken, however empty
+    // its zones are.
+    const unified_cache * cache = get_existing_cache_for_device(device);
+    in.arena_bytes              = cache && cache->arena_active() ? cache->arena_total_size() : 0;
+    in.raw_held                 = unified_cache_raw_device_held_bytes(device, nullptr);
+    in.outside_accounting       = g_raw_gate_outside_accounting[device].load(std::memory_order_relaxed);
+    return in;
+}
+
+// The figure a raw gate compares, at INFO once per device per arena size, so a run's log shows what every later
+// decision on that device is measured against. A raw request can come before the arena is reserved and print no arena;
+// the first one after the reservation prints the figure again. Takes no lock: one relaxed load and compare when the
+// arena term is the one last printed.
+static void unified_cache_raw_gate_log_figure_once(int device, const zone_raw_gate_inputs & in, size_t request) {
+    // Per device, the arena term the line last printed, plus one: 0 means not printed yet.
+    static std::array<std::atomic<size_t>, GGML_SYCL_MAX_DEVICES> raw_gate_figure_arena_printed{};
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    const size_t printed = in.arena_bytes + 1;
+    if (raw_gate_figure_arena_printed[device].load(std::memory_order_relaxed) == printed ||
+        raw_gate_figure_arena_printed[device].exchange(printed, std::memory_order_relaxed) == printed) {
+        return;
+    }
+    constexpr double MB = 1024.0 * 1024.0;
+    GGML_LOG_INFO(
+        "[RAW-GATE] device %d: arena %.1f MB + raw outside the arena %.1f MB + outside this process's accounting "
+        "%.1f MB + request %.1f MB vs device %.1f MB\n",
+        device, in.arena_bytes / MB, in.raw_held / MB, in.outside_accounting / MB, request / MB, in.device_total / MB);
+}
+
+// A refused raw request by name: what it asked for, what fits outside the arena, and every term of that figure.
+static std::string unified_cache_raw_gate_refusal_text(int                          device,
+                                                       const char *                 what,
+                                                       const zone_raw_gate_inputs & in,
+                                                       size_t                       request) {
+    constexpr double MB = 1024.0 * 1024.0;
+    char             text[512];
+    std::snprintf(text, sizeof(text),
+                  "device %d: %s of %.1f MB needs device memory outside the arena and %.1f MB fits there (device "
+                  "%.1f MB - arena %.1f MB - raw outside the arena %.1f MB - outside this process's accounting "
+                  "%.1f MB); refused",
+                  device, what, request / MB, zone_raw_gate_free_outside_arena(in) / MB, in.device_total / MB,
+                  in.arena_bytes / MB, in.raw_held / MB, in.outside_accounting / MB);
+    return text;
+}
+
+// The raw-allocation gate for a caller that refuses on its own (a device-pool chunk): the figure unified_alloc's raw
+// exit compares, and no eviction. Locks: the inputs' two, one after the other; a device pool calls it under its own
+// mutex, as it called the budget read this replaced.
+bool unified_cache_raw_gate_admits(int device, sycl::queue & queue, size_t bytes, const char * what) {
+    const zone_raw_gate_inputs in = unified_cache_raw_gate_inputs(device, queue);
+    unified_cache_raw_gate_log_figure_once(device, in, bytes);
+    if (zone_raw_gate_fits(in, bytes)) {
+        return true;
+    }
+    GGML_LOG_WARN("[RAW-GATE] %s\n", unified_cache_raw_gate_refusal_text(device, what, in, bytes).c_str());
+    return false;
+}
+
+// unified_alloc's raw exit is the one way a request takes device memory outside the arena, so this is where it meets
+// the device's physical bytes (zone-raw-gate.hpp): past them, Level Zero can still return a pointer and a later copy
+// into it loses the device. A request an arena zone serves never gets here. With an arena, the plan has placed the
+// model; a raw request the device has no room for is one the plan did not make room for, and evicting the weights it
+// placed to admit it would trade planned residency for an unplanned buffer, so the request is refused by name. Without
+// an arena nothing was planned: evict the cached weights the request is short of, then look again. A refusal is never
+// an abort and never a fallback to another tier; the caller decides.
+//
+// Only requests that leave through the raw driver exit reach this gate. On the default paths those are grow-only caches
+// and staging buffers, a handful per process. The figure's registry walk is therefore paid beside a driver allocation,
+// not per token. A caller that reaches this gate per op is paying a driver allocation per op: that is the defect to fix
+// at that caller, not a reason to make this figure cheaper.
+//
+// Locks, one at a time: g_cache_rw_mutex (L4) for the creating lookup, shared, released; then the inputs' two, one
+// after the other. The exception is the first raw request on a device, whose lookup creates the cache: it holds L4
+// exclusive and takes g_runtime_alloc_mutex (L5) inside it for the outside-accounting note, the L4-before-L5 order.
+// Without an arena, evict_and_flush takes the cache's own locks after all of these are released.
+//
+// No lock is held from reading the figure to the driver allocation, so two raw requests on one device at once can both
+// be admitted against the same free bytes: the driver may then serve both past the physical bytes, or fail one, which
+// unified_alloc returns as false with no log of its own beyond a GGML_SYCL_DEBUG line from the tracked allocation. That
+// is accepted: raw exits are few and come at load time, and a lock held across a driver allocation would queue every
+// raw exit on the device behind it.
+static bool unified_alloc_raw_gate(const alloc_request & req, size_t alloc_size, bool hold_spill) {
+    // The creating lookup, as the first raw request on a device has always made it: the cache's arena and the term
+    // outside this process's accounting are in place before the first raw byte is counted.
+    unified_cache *      cache = get_unified_cache_for_device(req.device);
+    zone_raw_gate_inputs in    = unified_cache_raw_gate_inputs(req.device, *req.queue);
+    unified_cache_raw_gate_log_figure_once(req.device, in, alloc_size);
+    if (zone_raw_gate_fits(in, alloc_size)) {
+        return true;
+    }
+    if (hold_spill) {
+        // The hold sent this request outside the arena. Evicting cached weights for it would trade a planned buffer's
+        // reservation for the model's own weights: refuse, loudly, and let the caller pick a smaller shape.
+        GGML_LOG_ERROR("[RAW-GATE] %s instead of evicting cached weights\n",
+                       unified_cache_raw_gate_refusal_text(
+                           req.device, "a RUNTIME request held back for the planned dense scratch", in, alloc_size)
+                           .c_str());
+        return false;
+    }
+    if (cache && !cache->arena_active()) {
+        const size_t short_by = alloc_size - zone_raw_gate_free_outside_arena(in);
+        GGML_LOG_INFO("[RAW-GATE] device %d: evicting %.1f MB of cached weights for a raw request of %.1f MB\n",
+                      req.device, short_by / (1024.0 * 1024.0), alloc_size / (1024.0 * 1024.0));
+        cache->evict_and_flush(short_by);
+        in = unified_cache_raw_gate_inputs(req.device, *req.queue);
+        if (zone_raw_gate_fits(in, alloc_size)) {
+            return true;
+        }
+    }
+    const char * site = req.site_file ? std::strrchr(req.site_file, '/') : nullptr;
+    char         what[160];
+    std::snprintf(what, sizeof(what), "a raw request from %s:%d",
+                  site ? site + 1 : (req.site_file ? req.site_file : "?"), req.site_line);
+    const std::string text = unified_cache_raw_gate_refusal_text(req.device, what, in, alloc_size);
+    if (req.suppress_failure_log) {
+        GGML_SYCL_DEBUG("[RAW-GATE] %s\n", text.c_str());
+    } else {
+        GGML_LOG_WARN("[RAW-GATE] %s\n", text.c_str());
+    }
+    return false;
 }
 
 // The host zone of a zone-managed host-pinned request is select_zone()'s (host-zone-plan.hpp, §4.4 "Route by role, in
@@ -20460,11 +20995,14 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // llama.cpp-kpjw: would the hold keep this request out of the RUNTIME zone? A spill-capable RUNTIME request (a
     // compute buffer) leaves alone the bytes the planned dense scratch buffers still need and spills exactly as it
     // would if the zone were full. A forbid-spill request is a planned consumer itself (the ring, the planned
-    // scratch), the claimant the hold exists for, and is never held back. Decided before the overcommit guard
-    // below, so that guard can refuse a spill the hold caused instead of evicting cached weights to make room
-    // for it.
+    // scratch), the claimant the hold exists for, and is never held back. Decided before anything is tried, so the
+    // raw gate at the raw exit below can refuse a spill the hold caused instead of evicting cached weights to make
+    // room for it.
     bool   hold_spill       = false;
     size_t hold_at_decision = 0;
+
+    // What the RUNTIME zone had free when the hold kept a flagged request out, for the raw hold-spill count below.
+    size_t hold_spill_zone_free = 0;
     {
         const vram_zone_id zid = req.intent.constraints.prefer_vram_zone;
         if (tier == alloc_tier::DEVICE_VRAM && zid == vram_zone_id::RUNTIME && vram_arena_enabled()) {
@@ -20486,10 +21024,10 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     // llama.cpp-kpjw: a compute buffer the RUNTIME zone will not serve (held back by the hold above, or larger than
     // the zone's free bytes) is placed in the arena's KV zone before anything else is tried. Raw device memory
     // outside the arena is the last resort: it is what eats the driver headroom (B50 / B70 Qwen at auto-ub1024: a
-    // 460-512 MB buffer). The attempt is ahead of the overcommit guard below on purpose: an in-arena placement is
-    // memory the arena already reserved, so it cannot overcommit the device and must not evict cached weights.
-    // Only a request the caller marked (spill_to_kv_zone_before_raw) takes this path; every other class, and a
-    // compute buffer the KV zone cannot hold whole, falls through to the unchanged code below.
+    // 460-512 MB buffer). An in-arena placement is memory the arena already reserved, so it never reaches the raw
+    // gate at the raw exit below and never evicts cached weights. Only a request the caller marked
+    // (spill_to_kv_zone_before_raw) takes this path; every other class, and a compute buffer the KV zone cannot hold
+    // whole, falls through to the unchanged code below.
     bool kv_placed = false;
     if (tier == alloc_tier::DEVICE_VRAM && req.intent.constraints.spill_to_kv_zone_before_raw &&
         req.intent.constraints.prefer_vram_zone == vram_zone_id::RUNTIME && vram_arena_enabled()) {
@@ -20562,67 +21100,6 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         alloc_registry::instance().register_alloc(ptr, alloc_size, -1, alloc_type::HOST_CPU);
     }
     if (tier == alloc_tier::DEVICE_VRAM) {
-        // Guard against Level Zero overcommit: if this allocation would exceed
-        // the device's total VRAM, fail early so the caller can retry with
-        // host-pinned.  Without this check, L0 may return a valid pointer but
-        // a subsequent memset/memcpy triggers DEVICE_LOST.
-        if (!kv_placed && req.device >= 0 && req.device < GGML_SYCL_MAX_DEVICES) {
-            const size_t total_vram   = unified_alloc_total_vram(req.device, *req.queue);
-            const size_t runtime_vram = unified_cache_arena_non_weight_used(req.device);
-            // Include weight cache usage (SOA entries on device VRAM)
-            size_t       cache_vram   = 0;
-            auto *       cache        = get_unified_cache_for_device(req.device);
-            if (cache) {
-                cache_vram = cache->used();
-            }
-            size_t used_vram = runtime_vram + cache_vram;
-            if (total_vram > 0 && used_vram + alloc_size > total_vram) {
-                if (hold_spill) {
-                    // The hold sent this request outside the arena, where it needs physical VRAM the device does
-                    // not have. Evicting live weights for that would trade a planned buffer's reservation for the
-                    // model's own weights: refuse, loudly, and let the caller pick a smaller shape.
-                    GGML_LOG_ERROR(
-                        "[UNIFIED-ALLOC] device %d: a RUNTIME request of %.1f MB held back for the planned dense "
-                        "scratch would spill outside the arena past the device's VRAM (used %.1f MB of %.1f MB); "
-                        "refusing instead of evicting cached weights\n",
-                        req.device, alloc_size / (1024.0 * 1024.0), used_vram / (1024.0 * 1024.0),
-                        total_vram / (1024.0 * 1024.0));
-                    return false;
-                }
-                // Try evicting cache entries to make room before failing.
-                // This is the key mechanism that lets the 120B model work:
-                // model load fills VRAM with cached weights, then compute
-                // buffer allocation triggers eviction to free space.
-                if (cache) {
-                    const size_t needed = used_vram + alloc_size - total_vram;
-                    GGML_LOG_INFO(
-                        "[UNIFIED-ALLOC] Device %d VRAM pressure: "
-                        "used=%.1f MB + alloc=%.1f MB > total=%.1f MB, "
-                        "evicting %.1f MB from cache\n",
-                        req.device, used_vram / (1024.0 * 1024.0), alloc_size / (1024.0 * 1024.0),
-                        total_vram / (1024.0 * 1024.0), needed / (1024.0 * 1024.0));
-                    const size_t freed = cache->evict_and_flush(needed);
-                    // Re-check after eviction
-                    cache_vram         = cache->used();
-                    used_vram          = unified_cache_arena_non_weight_used(req.device) + cache_vram;
-                    if (freed > 0) {
-                        GGML_LOG_INFO(
-                            "[UNIFIED-ALLOC] Evicted %.1f MB, "
-                            "used now=%.1f MB (cache=%.1f MB + runtime=%.1f MB)\n",
-                            freed / (1024.0 * 1024.0), used_vram / (1024.0 * 1024.0), cache_vram / (1024.0 * 1024.0),
-                            unified_cache_arena_non_weight_used(req.device) / (1024.0 * 1024.0));
-                    }
-                }
-                if (total_vram > 0 && used_vram + alloc_size > total_vram) {
-                    GGML_SYCL_DEBUG(
-                        "[UNIFIED-ALLOC] Device %d VRAM overcommit guard: "
-                        "used=%.1f MB + alloc=%.1f MB > total=%.1f MB, failing\n",
-                        req.device, used_vram / (1024.0f * 1024.0f), alloc_size / (1024.0f * 1024.0f),
-                        total_vram / (1024.0f * 1024.0f));
-                    return false;
-                }
-            }
-        }
         // prefer_vram_zone: explicit zone routing for RUNTIME/SCRATCH/ONEDNN/KV zones.
         // Caller sets alloc_constraints::prefer_vram_zone to request a specific TLSF zone.
         // unified_free() calls cache->zone_free(vram_zone, ptr) for TLSF reclaim.
@@ -20633,14 +21110,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 if (!prepare_arena_publication(zid)) return false;
                 // llama.cpp-kpjw: a request the hold keeps out (hold_spill, decided above) that the KV zone could
                 // not take falls through to the raw device allocation below like one that found the zone full, and
-                // is counted (as a RAW spill) and warned about once.
+                // is counted (as a RAW spill) and warned about once, at the raw exit once its allocation is made.
                 if (!hold_spill) {
                     ptr = cache->zone_alloc(zid, alloc_size, req.alignment != 0 ? req.alignment : 64, reserved_alloc_id,
                                             &exact_arena, arena_runtime_registry_commit, &arena_publication);
                 } else if (req.intent.constraints.spill_to_kv_zone_before_raw) {
-                    unified_cache_note_planned_hold_spill(req.device, req.intent.cohort_id, alloc_size,
-                                                          hold_at_decision, cache->zone_available(zid),
-                                                          /*in_arena=*/false);
+                    hold_spill_zone_free = cache->zone_available(zid);
                 }
                 if (!ptr && arena_publication.attempted) return false;
                 if (ptr) {
@@ -20709,10 +21184,22 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             }
         }
         if (!ptr && !kv_spill_to_host) {
+            if (!unified_alloc_raw_gate(req, alloc_size, hold_spill)) {
+                return false;
+            }
             // The raw exit prints and counts itself; this scope hands it the
             // request that caused it (see unified_cache_raw_malloc_device).
             ext_alloc_request_scope raw_exit_request(&req);
             ptr = unified_cache_malloc_device_tracked(alloc_size, *req.queue, "unified_alloc:device");
+            // A hold-induced spill is counted once it holds raw device memory: one the raw gate refused, or the driver
+            // did not serve, spilled nothing. Only a flagged compute buffer feeds the count, as at the hold decision.
+            if (ptr && hold_spill) {
+                if (req.intent.constraints.spill_to_kv_zone_before_raw) {
+                    unified_cache_note_planned_hold_spill(req.device, req.intent.cohort_id, alloc_size,
+                                                          hold_at_decision, hold_spill_zone_free,
+                                                          /*in_arena=*/false);
+                }
+            }
         }
         // KV arena spill: redirect to host-pinned path.
         if (!ptr && kv_spill_to_host) {
@@ -23634,8 +24121,8 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         //
         // This must run BEFORE ensure_planned_arena_zones() below, not after
         // (a spec-review finding on the first version of this step): that
-        // function's has_live_scratch refusal check treats a non-null
-        // onednn_*_scratch_ as still-live regardless of who owns it, so a
+        // function's rebuild gate counts an onednn_*_scratch_ the arena owns
+        // as a holder (arena_count_scratch_holders), so a
         // request that needed to GROW the zone would leave its own
         // predecessor's pointers set, self-refuse its own re-plan every time,
         // and fall through to the shared direct-allocation cleanup further
@@ -25149,7 +25636,15 @@ void * unified_cache_raw_malloc_device(size_t size, const sycl::queue & queue) {
     return ptr;
 }
 
+// A pinned host size past the host's RAM is refused here, before the driver, as a failed allocation, because the
+// driver does not always fail such a request: at 1 PiB its memory manager aborted the process, and no catch reaches an
+// abort. The callers' own failure lines then name the size. The device exit has no such bound: in the compute-runtime
+// source read (26.22, checkMemSizeLimit), a device request past the device's memory returns an error instead of
+// aborting.
 void * unified_cache_raw_malloc_host(size_t size, const sycl::queue & queue) {
+    if (!host_pinned_size_possible(size, ggml_sycl_get_total_system_memory_bytes())) {
+        return nullptr;
+    }
     void * ptr = nullptr;
     try {
         ptr = sycl::malloc_host(size, queue);
@@ -25160,6 +25655,9 @@ void * unified_cache_raw_malloc_host(size_t size, const sycl::queue & queue) {
 }
 
 void * unified_cache_raw_malloc_host(size_t size, const sycl::context & ctx) {
+    if (!host_pinned_size_possible(size, ggml_sycl_get_total_system_memory_bytes())) {
+        return nullptr;
+    }
     void * ptr = nullptr;
     try {
         ptr = sycl::malloc_host(size, ctx);
@@ -28176,12 +28674,16 @@ bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes) {
     return cache->reserve_compute_arena(arena_bytes);
 }
 
-bool unified_cache_ensure_planned_arena_zones(int device_id) {
+bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal * refusal) {
     auto * cache = get_unified_cache_for_device(device_id);
     if (!cache) {
+        if (refusal != nullptr) {
+            refusal->reason = zone_arena_refusal_reason::NO_CACHE;
+            refusal->device = device_id;
+        }
         return false;
     }
-    return cache->ensure_planned_arena_zones();
+    return cache->ensure_planned_arena_zones(refusal);
 }
 
 #if GGML_SYCL_DNNL
@@ -29972,14 +30474,22 @@ bool unified_cache::arena_record_allocation_locked(vram_zone_id zone, void * ptr
     return true;
 }
 
-bool unified_cache::arena_unregister_exact_if_unleased_locked(vram_zone_id zone, void * ptr) noexcept {
+bool unified_cache::arena_unregister_exact_if_unleased_locked(vram_zone_id   zone,
+                                                              void *         ptr,
+                                                              vram_zone_id & record_zone) noexcept {
     allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
     const auto found = group.allocations.find(ptr);
     if (found == group.allocations.end() || found->second.allocation_id == 0) return false;
     const allocator_group_record & exact = found->second;
     const auto authority = arena_authority_snapshot(exact.zone);
-    return authority && authority->unregister_allocation_if_unleased(
-                            static_cast<int>(exact.zone), exact.allocation_id, exact.offset);
+    if (!authority || !authority->unregister_allocation_if_unleased(static_cast<int>(exact.zone), exact.allocation_id,
+                                                                    exact.offset)) {
+        return false;
+    }
+    // The zone whose counter the block was charged to. The caller may name the other zone of an allocator KV and
+    // WEIGHT share, so only the record says which counter the free must lower.
+    record_zone = exact.zone;
+    return true;
 }
 
 void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id) noexcept {
@@ -30045,12 +30555,9 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
         allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
         if (group.state != allocator_group_state::OPEN || !arena_zone_open(zone)) return nullptr;
         if (zone == vram_zone_id::KV && z.allocator) {
-            const size_t before = z.allocator->used();
-            const size_t offset = z.allocator->allocate(size, align);
+            size_t       total_used = 0;
+            const size_t offset     = zone_used_allocate(*z.allocator, z.used, size, align, &total_used);
             if (offset != SIZE_MAX) {
-                const size_t after      = z.allocator->used();
-                const size_t delta      = after - before;
-                const size_t total_used = z.used.fetch_add(delta, std::memory_order_relaxed) + delta;
                 if (profile_active) {
                     const size_t idx = static_cast<size_t>(zone);
                     t_arena_pp_profile.zone_alloc_calls[idx]++;
@@ -30063,8 +30570,7 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
                 }
                 const size_t logical_offset = z.start + offset;
                 if (!arena_register_exact(zone, allocation_id, logical_offset, size)) {
-                    z.allocator->free(offset);
-                    z.used.fetch_sub(delta, std::memory_order_relaxed);
+                    zone_used_free(*z.allocator, offset, z.used);
                     return nullptr;
                 }
                 const arena_authority::allocation_record committed{ allocation_id, static_cast<int>(zone),
@@ -30073,8 +30579,7 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
                 if (!arena_record_allocation_locked(zone, ptr, allocation_id, logical_offset, size,
                                                     registry_commit, registry_context)) {
                     arena_unregister_exact(zone, logical_offset);
-                    z.allocator->free(offset);
-                    z.used.fetch_sub(delta, std::memory_order_relaxed);
+                    zone_used_free(*z.allocator, offset, z.used);
                     return nullptr;
                 }
                 if (exact) *exact = committed;
@@ -30082,19 +30587,13 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
             }
         }
         for (auto & wca : weight_chunk_allocators_) {
-            const size_t before = wca.allocator->used();
-            const size_t offset = wca.allocator->allocate(size, align);
+            // KV and WEIGHT both draw on these chunks, so the zone's counter takes this chunk allocator's delta
+            // (block rounding included), never its total; the group lock held above makes that delta this call's alone.
+            size_t       total_used = 0;
+            const size_t offset     = zone_used_allocate(*wca.allocator, z.used, size, align, &total_used);
             if (offset == SIZE_MAX) {
                 continue;
             }
-            // Incremental aggregate: alloc/free both update this zone's used under
-            // z.alloc_mutex so there's no race window.  Use the TLSF
-            // before/after delta (rather than `size`) so we account for
-            // alignment + block-header overhead consistently with what
-            // tlsf_allocator::used() reports.
-            const size_t after      = wca.allocator->used();
-            const size_t delta      = after - before;
-            const size_t total_used = z.used.fetch_add(delta, std::memory_order_relaxed) + delta;
             if (profile_active) {
                 const size_t idx = static_cast<size_t>(zone);
                 t_arena_pp_profile.zone_alloc_calls[idx]++;
@@ -30106,8 +30605,7 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
             }
             const size_t logical_offset = wca.logical_start + offset;
             if (!arena_register_exact(zone, allocation_id, logical_offset, size)) {
-                wca.allocator->free(offset);
-                z.used.fetch_sub(delta, std::memory_order_relaxed);
+                zone_used_free(*wca.allocator, offset, z.used);
                 return nullptr;
             }
             const arena_authority::allocation_record committed{ allocation_id, static_cast<int>(zone),
@@ -30116,8 +30614,7 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
             if (!arena_record_allocation_locked(zone, ptr, allocation_id, logical_offset, size,
                                                 registry_commit, registry_context)) {
                 arena_unregister_exact(zone, logical_offset);
-                wca.allocator->free(offset);
-                z.used.fetch_sub(delta, std::memory_order_relaxed);
+                zone_used_free(*wca.allocator, offset, z.used);
                 return nullptr;
             }
             if (exact) *exact = committed;
@@ -30156,25 +30653,23 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
     allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
     if (group.state != allocator_group_state::OPEN || !arena_zone_open(zone)) return nullptr;
 
-    // TLSF returns OFFSET into the managed region; convert to device pointer.
-    size_t offset = alloc->allocate(size, align);
+    // TLSF returns OFFSET into the managed region; convert to device pointer. In a single-chunk arena WEIGHT
+    // allocates from KV's allocator, whose used() is both zones' bytes: the zone's counter takes this call's delta.
+    size_t       zone_count = 0;
+    const size_t offset     = zone_used_allocate(*alloc, z.used, size, align, &zone_count);
     if (offset != SIZE_MAX) {
-        const size_t current_used         = alloc->used();
-        const size_t current_largest_free = alloc->largest_free_block();
-        z.used.store(current_used, std::memory_order_relaxed);
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_alloc_calls[idx]++;
             t_arena_pp_profile.zone_alloc_bytes[idx] += size;
             t_arena_pp_profile.zone_alloc_us[idx] += arena_profile_elapsed_us(t0);
-            t_arena_pp_profile.zone_used_peak[idx] = std::max(t_arena_pp_profile.zone_used_peak[idx], current_used);
+            t_arena_pp_profile.zone_used_peak[idx] = std::max(t_arena_pp_profile.zone_used_peak[idx], zone_count);
             t_arena_pp_profile.zone_largest_free_min[idx] =
-                std::min(t_arena_pp_profile.zone_largest_free_min[idx], current_largest_free);
+                std::min(t_arena_pp_profile.zone_largest_free_min[idx], alloc->largest_free_block());
         }
         const size_t logical_offset = z.start + offset;
         if (!arena_register_exact(zone, allocation_id, logical_offset, size)) {
-            alloc->free(offset);
-            z.used.store(alloc->used(), std::memory_order_relaxed);
+            zone_used_free(*alloc, offset, z.used);
             return nullptr;
         }
         const arena_authority::allocation_record committed{ allocation_id, static_cast<int>(zone),
@@ -30183,8 +30678,7 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
         if (!arena_record_allocation_locked(zone, ptr, allocation_id, logical_offset, size,
                                             registry_commit, registry_context)) {
             arena_unregister_exact(zone, logical_offset);
-            alloc->free(offset);
-            z.used.store(alloc->used(), std::memory_order_relaxed);
+            zone_used_free(*alloc, offset, z.used);
             return nullptr;
         }
         if (exact) *exact = committed;
@@ -30519,6 +31013,10 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     const auto t0             = profile_active ? arena_profile_clock::now() : arena_profile_clock::time_point{};
 
     auto & z = arena_zones_[static_cast<int>(zone)];
+    // Every arm lowers the counter of the zone the exact-allocation record names, which the unregister hands back:
+    // KV and WEIGHT share an allocator, so the zone the caller names does not say which counter the block was
+    // charged to.
+    vram_zone_id record_zone = vram_zone_id::COUNT;
 
     // N-chunk shared WEIGHT/KV path: route the free to the per-chunk allocator
     // that owns ptr.  Handles still carry their logical zone, so freeing a KV
@@ -30530,12 +31028,11 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             if (arena_offset != SIZE_MAX && arena_offset >= z.start && arena_offset < z.start + z.size) {
                 const size_t                zone_offset = arena_offset - z.start;
                 std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-                if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
+                if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) {
+                    return false;
+                }
                 arena_forget_allocation_locked(zone, ptr);
-                const size_t                before = z.allocator->used();
-                z.allocator->free(zone_offset);
-                const size_t after = z.allocator->used();
-                z.used.fetch_sub(before - after, std::memory_order_relaxed);
+                zone_used_free(*z.allocator, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
                 if (profile_active) {
                     const size_t idx = static_cast<size_t>(zone);
                     t_arena_pp_profile.zone_free_calls[idx]++;
@@ -30559,17 +31056,14 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
             return false;
         }
         std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-        if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
+        if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) {
+            return false;
+        }
         arena_forget_allocation_locked(zone, ptr);
-        const auto                  chunk_base = reinterpret_cast<uintptr_t>(arena_chunks_[chunk_idx].ptr);
-        const auto                  p          = reinterpret_cast<uintptr_t>(ptr);
-        const size_t                chunk_off  = static_cast<size_t>(p - chunk_base);
-        const size_t                before     = target->allocator->used();
-        target->allocator->free(chunk_off);
-        // Incremental aggregate: see matching fetch_add comment in zone_alloc.
-        const size_t after = target->allocator->used();
-        const size_t delta = before - after;
-        z.used.fetch_sub(delta, std::memory_order_relaxed);
+        const auto   chunk_base = reinterpret_cast<uintptr_t>(arena_chunks_[chunk_idx].ptr);
+        const auto   p          = reinterpret_cast<uintptr_t>(ptr);
+        const size_t chunk_off  = static_cast<size_t>(p - chunk_base);
+        zone_used_free(*target->allocator, chunk_off, arena_zones_[static_cast<int>(record_zone)].used);
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_free_calls[idx]++;
@@ -30594,10 +31088,11 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         }
         size_t                      zone_offset = arena_offset - kv.start;
         std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-        if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
+        if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) {
+            return false;
+        }
         arena_forget_allocation_locked(zone, ptr);
-        alloc->free(zone_offset);
-        kv.used.store(alloc->used(), std::memory_order_relaxed);
+        zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_free_calls[idx]++;
@@ -30617,10 +31112,11 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     size_t zone_offset = arena_offset - z.start;
 
     std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-    if (!arena_unregister_exact_if_unleased_locked(zone, ptr)) return false;
+    if (!arena_unregister_exact_if_unleased_locked(zone, ptr, record_zone)) {
+        return false;
+    }
     arena_forget_allocation_locked(zone, ptr);
-    alloc->free(zone_offset);
-    z.used.store(alloc->used(), std::memory_order_relaxed);
+    zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
         t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31154,6 +31650,12 @@ bool unified_cache_test_arena_registry_commit_reached() {
 bool unified_cache::arena_destroy() {
     std::lock_guard<std::mutex> destroy_guard(arena_destroy_mutex_);
     if (!arena_queue_) return true;
+    // Each refusal below records why, for the caller that asked for the teardown and for any later one: every cause
+    // after CLOSING leaves the arena closed to new allocations.
+    const auto refuse = [&](zone_arena_teardown_refusal cause) {
+        arena_teardown_refusal_.store(cause, std::memory_order_release);
+        return false;
+    };
 
     // Fixed-order physical-group close. KV and WEIGHT are one lock/state row,
     // so neither logical sibling can allocate while the other is closing.
@@ -31171,7 +31673,7 @@ bool unified_cache::arena_destroy() {
         }
     } catch (...) {
         GGML_LOG_ERROR("[VRAM-ARENA] could not reserve durable authority drain state; refusing destroy\n");
-        return false;
+        return refuse(zone_arena_teardown_refusal::HOST_STATE);
     }
 
     // CLOSING wins over a concurrent RESETTING transaction. That settler
@@ -31198,7 +31700,7 @@ bool unified_cache::arena_destroy() {
         if (!group.allocations.empty()) {
             GGML_LOG_ERROR("[VRAM-ARENA] allocator group %zu still owns %zu live TLSF allocations; refusing destroy\n",
                            i, group.allocations.size());
-            return false;
+            return refuse(zone_arena_teardown_refusal::LIVE_ALLOCATIONS);
         }
     }
     std::vector<std::shared_ptr<arena_authority>> drain_snapshot;
@@ -31212,7 +31714,7 @@ bool unified_cache::arena_destroy() {
         }
     } catch (...) {
         GGML_LOG_ERROR("[VRAM-ARENA] could not snapshot durable authority drains; refusing physical free\n");
-        return false;
+        return refuse(zone_arena_teardown_refusal::DRAIN_SNAPSHOT);
     }
     lifecycle_locks.clear();
 
@@ -31238,7 +31740,7 @@ bool unified_cache::arena_destroy() {
         }), drains.end());
         if (!drains.empty()) all_authorities_drained = false;
     }
-    if (!all_authorities_drained) return false;
+    if (!all_authorities_drained) return refuse(zone_arena_teardown_refusal::DRAIN_TIMEOUT);
     lifecycle_locks.clear();
     try {
         arena_queue_->wait_and_throw();
@@ -31306,7 +31808,7 @@ bool unified_cache::arena_destroy() {
     GGML_LOG_INFO("[VRAM-ARENA] Destroyed %zu chunk(s), released %.1f MB\n", released_chunk_count,
                   released_chunk_bytes / (1024.0 * 1024.0));
     if (!all_freed) {
-        return false;
+        return refuse(zone_arena_teardown_refusal::FREE_FAILED);
     }
     weight_chunk_allocators_.clear();
     for (auto & group : arena_allocator_groups_) group.allocations.clear();
@@ -31327,6 +31829,7 @@ bool unified_cache::arena_destroy() {
     }
     lifecycle_locks.clear();
     for (auto & group : arena_allocator_groups_) group.lifecycle_cv.notify_all();
+    arena_teardown_refusal_.store(zone_arena_teardown_refusal::NONE, std::memory_order_release);
     return true;
 }
 
@@ -31411,24 +31914,29 @@ int unified_cache::arena_find_chunk(const void * ptr) const {
     return -1;
 }
 
-int unified_cache::arena_acquire_chunk_lease(const void * ptr) {
+int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag tag) {
     const int idx = arena_find_chunk(ptr);
     if (idx < 0) {
         return -1;
     }
     arena_chunks_[idx].lease_count.fetch_add(1);
+    arena_chunk_leases_of(tag).fetch_add(1, std::memory_order_relaxed);
     return idx;
 }
 
-void unified_cache::arena_release_chunk_lease(int chunk_idx) {
+void unified_cache::arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag) {
     if (chunk_idx < 0 || chunk_idx >= static_cast<int>(arena_chunks_.size())) {
         return;
     }
     const uint32_t prev = arena_chunks_[chunk_idx].lease_count.fetch_sub(1);
     if (prev == 0) {
-        GGML_LOG_ERROR("[VRAM-ARENA] arena_release_chunk_lease: underflow on chunk idx=%d\n", chunk_idx);
+        GGML_LOG_ERROR("[VRAM-ARENA] arena_release_chunk_lease: underflow on chunk idx=%d (site %s%s)\n", chunk_idx,
+                       chunk_lease_site_name(tag.site), tag.copy ? ", copy" : "");
         arena_chunks_[chunk_idx].lease_count.fetch_add(1);
+        // The chunk's count was not lowered, so the site's is not either: the counts by site keep summing to it.
+        return;
     }
+    arena_chunk_leases_of(tag).fetch_sub(1, std::memory_order_relaxed);
 }
 
 bool unified_cache::arena_chunk_has_leases(int chunk_idx) const {
@@ -31443,6 +31951,67 @@ uint32_t unified_cache::arena_chunk_lease_count(int chunk_idx) const {
         return 0;
     }
     return arena_chunks_[chunk_idx].lease_count.load();
+}
+
+uint32_t unified_cache::arena_chunk_lease_count_at(chunk_lease_tag tag) const {
+    return arena_chunk_leases_of(tag).load(std::memory_order_relaxed);
+}
+
+void unified_cache::arena_count_scratch_holders(zone_arena_holders & holders) {
+    // A scratch buffer holds the arena only when its pointer lies inside it: one allocated outside keeps its own
+    // memory through a rebuild. The four single buffers are read without their locks, as this check always read them;
+    // the reserve path that asks for a rebuild holds the oneDNN scratch lock, so taking it here would deadlock.
+    auto count = [&](const void * ptr) {
+        if (ptr == nullptr) {
+            return;
+        }
+        if (vram_owns(ptr)) {
+            ++holders.scratch_in_arena;
+        } else {
+            ++holders.scratch_outside;
+        }
+    };
+    count(scratch_pool_ptr_);
+    count(onednn_weights_scratch_);
+    count(onednn_activations_scratch_);
+    count(reorder_temp_buffer_);
+    // The ring's slot buffers inside the arena, kept to tell them from every other allocation in the groups below.
+    std::vector<const void *> ring_in_arena;
+    {
+        // Retired slots count too: a slot still claimed when the ring was replaced keeps its memory until released.
+        std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
+        for (const auto * slots : { &pp_moe_onednn_scratch_slots_, &pp_moe_onednn_retired_slots_ }) {
+            for (const pp_moe_onednn_scratch_slot & slot : *slots) {
+                count(slot.weight);
+                count(slot.activation);
+                count(slot.output);
+                for (const void * buffer : { slot.weight, slot.activation, slot.output }) {
+                    if (buffer != nullptr && vram_owns(buffer)) {
+                        ring_in_arena.push_back(buffer);
+                    }
+                }
+            }
+        }
+    }
+    holders.ring_in_arena += static_cast<uint32_t>(std::min<size_t>(ring_in_arena.size(), UINT32_MAX));
+    {
+        std::lock_guard<std::mutex> lock(persistent_scratch_mutex_);
+        for (const auto & named : persistent_scratches_) {
+            count(named.second.device_ptr);
+        }
+    }
+    // Every zone allocation is recorded in its allocator group before it returns, so the records are the complete set
+    // of what is live in the zones; a free still queued is among them until it runs. Saturating, so a count that would
+    // wrap still reads as held.
+    for (allocator_group & group : arena_allocator_groups_) {
+        std::lock_guard<std::mutex> lock(group.mutex);
+        for (const auto & record : group.allocations) {
+            if (std::find(ring_in_arena.begin(), ring_in_arena.end(), record.first) == ring_in_arena.end() &&
+                holders.live_beside_ring != UINT32_MAX) {
+                ++holders.live_beside_ring;
+            }
+        }
+    }
 }
 
 // llama.cpp-dyhdl: host pinned-pool chunk lease pass-through.
@@ -36455,16 +37024,15 @@ size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & 
 size_t placement_plan_compute_room(const placement_plan & plan,
                                    int                    device,
                                    size_t                 compute_term,
-                                   uint32_t               planning_n_ubatch,
-                                   bool                   held_out,
+                                   uint32_t               measured_n_ubatch,
                                    uint32_t *             n_ubatch) {
     uint32_t n    = 0;
     size_t   room = 0;
-    if (!held_out && !plan.multi_device && plan.device_id == device) {
+    if (!plan.multi_device && plan.device_id == device) {
         room = placement_explicit_ubatch_compute_room(plan.explicit_ubatch, compute_term, &n);
         if (n == 0 && plan.explicit_ubatch.action == pp_moe_onednn_explicit_ubatch_action::NONE &&
-            planning_n_ubatch != 0) {
-            n    = planning_n_ubatch;
+            measured_n_ubatch != 0) {
+            n    = measured_n_ubatch;
             room = compute_term;
         }
     }

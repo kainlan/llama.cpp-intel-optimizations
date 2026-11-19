@@ -1834,11 +1834,18 @@ CONTEXT_SHAPE_FOR_ENVELOPE_RE = re.compile(
     r"kv_info\.n_ctx, kv_info\.n_ctx_context, envelope \? envelope->n_ubatch : 0, kv_info\.n_ubatch, "
     r"kv_info\.n_ubatch_context ?\);"
 )
-STAGE_PLAN_SIG = "static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx,"
-STAGE_SINGLE_DEVICE_GUARD = "if (!ggml_sycl_plan_multi_device())"
-STAGE_ENSURE_CALL = "unified_cache_ensure_planned_arena_zones(ctx->device)"
+STAGE_PLAN_SIG = "static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx,"
+STAGE_SINGLE_DEVICE_GUARD = "if (!ggml_sycl_plan_multi_device(is_moe))"
+STAGE_ENSURE_CALL = "ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)"
 DRY_RUN_PLANS_SIG = "static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans("
 DRY_RUN_RESTORE_SIG = "~ggml_sycl_plan_dry_run_saved_state()"
+DRY_RUN_PLANNER_RESTORE = "s.planner.restore(d);"
+# The two restores that put a snapshot of the published terms back: the planner terms' own (the dry run's saved state
+# and the load stage's discarded-plan fallback restore through it) and a failed load's record, which puts each group
+# back from the snapshot taken before the load wrote it.
+PLANNER_RESTORE_SIG = "void planner_published_terms::restore(int device) const {"
+RECORD_RESTORE_SIG = "void load_published_record::restore(int device) const noexcept {"
+RECORD_GRAPH_BINDING = "const onednn_graph_scratch_planned_shape & graph = prior.planner.graph;"
 BUILDER_SHAPE_RE = re.compile(
     rf"const onednn_graph_scratch_planned_shape (\w+) = {GRAPH_SHAPE_PLAN}\( ?kv_info, envelope ?\);"
 )
@@ -1960,17 +1967,32 @@ def _setter_calls_outside(src: str, allowed_sigs: tuple) -> int:
     return outside
 
 
-def _every_writer_goes_through_the_publish(cache: str, sycl: str) -> bool:
-    """The setter is called only by the publish and by the dry run's restore of the value it read; the plan's write
-    (populate_host_zone_sizing) is one publish call over the kv_info and envelope the plan was built from."""
-    if _setter_calls_outside(cache, (GRAPH_SHAPE_PUBLISH_SIG,)) != 0:
+def _restore_puts_back_the_snapshot(cache: str, sig: str, binding: str = "") -> bool:
+    """The restore calls the setter once, for its device, with the five fields of the snapshot it holds (`graph`,
+    bound by `binding` when the snapshot is not the object's own field)."""
+    if not _has_function(cache, sig):
         return False
-    if _setter_calls_outside(sycl, (DRY_RUN_RESTORE_SIG,)) != 0:
+    body = _body_of(cache, sig)
+    if binding and binding not in body:
+        return False
+    return _call_argument_lists(body, GRAPH_SHAPE_SETTER) == [["device"] + _shape_var_args("graph")]
+
+
+def _every_writer_goes_through_the_publish(cache: str, sycl: str) -> bool:
+    """The setter is called only by the publish and by the two restores of a snapshot it read; the dry run restores
+    through the planner terms' restore, and the plan's write (populate_host_zone_sizing) is one publish call over the
+    kv_info and envelope the plan was built from."""
+    if _setter_calls_outside(cache, (GRAPH_SHAPE_PUBLISH_SIG, PLANNER_RESTORE_SIG, RECORD_RESTORE_SIG)) != 0:
+        return False
+    if not _restore_puts_back_the_snapshot(cache, PLANNER_RESTORE_SIG):
+        return False
+    if not _restore_puts_back_the_snapshot(cache, RECORD_RESTORE_SIG, RECORD_GRAPH_BINDING):
+        return False
+    if _setter_calls_outside(sycl, ()) != 0:
         return False
     if not _has_function(sycl, DRY_RUN_RESTORE_SIG):
         return False
-    restore = _call_argument_lists(_body_of(sycl, DRY_RUN_RESTORE_SIG), GRAPH_SHAPE_SETTER)
-    if restore != [["d"] + _shape_var_args("s.graph")]:
+    if _body_of(sycl, DRY_RUN_RESTORE_SIG).count(DRY_RUN_PLANNER_RESTORE) != 1:
         return False
     populate = _call_argument_lists(_body_of(cache, POPULATE_HOST_ZONE_SIZING_SIG), GRAPH_SHAPE_PUBLISH)
     return populate == [["plan.device_id", "kv_info", "envelope"]]
@@ -2083,9 +2105,11 @@ def test_graph_scratch_shape_has_one_definition() -> None:
 
 def test_every_graph_scratch_shape_writer_goes_through_the_publish() -> None:
     assert _every_writer_goes_through_the_publish(CACHE_CPP_NORM, GGML_SYCL_CPP_NORM), (
-        f"{GRAPH_SHAPE_SETTER}() may be called only by {GRAPH_SHAPE_PUBLISH}() and by the dry run's restore of the "
-        f"value it read, and populate_host_zone_sizing must write through {GRAPH_SHAPE_PUBLISH}(plan.device_id, "
-        "kv_info, envelope): any other writer can record a shape the zone was not sized for"
+        f"{GRAPH_SHAPE_SETTER}() may be called only by {GRAPH_SHAPE_PUBLISH}() and by the two restores of a "
+        "snapshot it read (planner_published_terms::restore, which the dry run's saved state calls, and "
+        "load_published_record::restore), and populate_host_zone_sizing must write through "
+        f"{GRAPH_SHAPE_PUBLISH}(plan.device_id, kv_info, envelope): any other writer can record a shape the zone was "
+        "not sized for"
     )
 
 
@@ -2155,6 +2179,18 @@ def test_graph_shape_checks_have_bounded_mutation_witnesses() -> None:
            "plan.planner_n_swa, plan.context_n_ubatch, plan.context_n_ctx);")
     mutant = _mutate_in_function(cache, POPULATE_HOST_ZONE_SIZING_SIG, old, new)
     _assert_only_check_fails(mutant, sycl, "writers", "the plan writing the shape from its own fields")
+
+    mutant = _mutate_in_function(cache, RECORD_RESTORE_SIG, RECORD_GRAPH_BINDING,
+                                 RECORD_GRAPH_BINDING.replace("prior.planner.graph", "written.planner.graph"))
+    _assert_only_check_fails(mutant, sycl, "writers", "a failed load's restore putting back the shape it wrote")
+
+    mutant = _mutate_in_function(sycl, DRY_RUN_RESTORE_SIG, DRY_RUN_PLANNER_RESTORE, "")
+    _assert_only_check_fails(cache, mutant, "writers", "the dry run leaving the shape it published in place")
+
+    stray = f"ggml_sycl::{GRAPH_SHAPE_SETTER}(d, 0, 0, 0, 0, 0);"
+    mutant = _mutate_in_function(sycl, DRY_RUN_RESTORE_SIG, DRY_RUN_PLANNER_RESTORE,
+                                 f"{DRY_RUN_PLANNER_RESTORE} {stray}")
+    _assert_only_check_fails(cache, mutant, "writers", "the dry run writing a shape of its own after the restore")
 
     old = f"{', '.join(_shape_var_args(var))}, {PLAN_DIRECT_CAP})"
     new = old.replace(f"{var}.n_ubatch, {var}.n_ctx", planning)
@@ -2378,7 +2414,7 @@ PURE_FLOOR_CALL = "zone_onednn_graph_scratch_floor_bytes"
 PURE_FLOOR_SIG = f"size_t {PURE_FLOOR_CALL}("
 PAIR_AND_FLOOR = "onednn_planned_pair_and_floor"
 PAIR_AND_FLOOR_SIG = f"static zone_onednn_plan {PAIR_AND_FLOOR}(int device_id, size_t direct_cap) {{"
-ENSURE_ZONES_SIG = "bool unified_cache::ensure_planned_arena_zones() {"
+ENSURE_ZONES_SIG = "bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal) {"
 WITH_FLOOR_GETTER_SIG = "size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {"
 PURE_FLOOR_ARGS = ["n_head_ctx_max", "n_head_swa_max", "n_swa", "n_ubatch", "n_ctx", "direct_cap"]
 DEVICE_DIRECT_CAP = "unified_cache_onednn_graph_scratch_direct_cap_bytes(device_id)"

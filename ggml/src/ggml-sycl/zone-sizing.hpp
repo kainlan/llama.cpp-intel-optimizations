@@ -462,7 +462,7 @@ bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size
 // from the zone although the zone could serve it, because the hold keeps those bytes for the planned scratch.
 // Only a spill-capable request for the RUNTIME zone is ever held back; a forbid-spill request is one of the
 // planned consumers the hold exists for, and no other zone has a hold. A request larger than the zone's free
-// bytes is NOT held back: it spills as it always did and the allocator's overcommit guard may evict for it. The
+// bytes is NOT held back: it spills as it always did and meets the allocator's raw gate like any raw request. The
 // zone's free bytes come first, then the hold, then the request size: swapped, the same numbers answer a
 // different question.
 bool zone_runtime_alloc_held_back(bool   runtime_zone,
@@ -497,6 +497,100 @@ inline bool zone_runtime_reserved_bytes(size_t floor_bytes, size_t requirement, 
 // load of a process does, is the zone its plan reserves and never qualifies; nor does any zone when the plan's
 // rounding overflows.
 bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement);
+
+// The RUNTIME zone's planned terms, as unified_cache_get_planned_runtime_zone_requirement() reads them for the zone
+// ensure_planned_arena_zones() sizes. Each is the term as published now, so the requirement follows whatever was
+// published last: a term left behind by a plan that was then discarded is still asked for.
+struct zone_runtime_terms {
+    size_t base             = 0;  // PP pipeline scratch + the ring's RUNTIME part + MoE CONTROL, checked as one sum
+    size_t moe_host_scatter = 0;  // the host-expert MoE scatter scratch, published by the placement plan
+    size_t mmq_src1         = 0;  // the dense MMQ/MMVQ Q8_1 src1 buffer
+    size_t dequant_f16      = 0;  // the dense f16 dequant buffer
+    size_t compute          = 0;  // the compute buffer the load measured
+    size_t state            = 0;  // the context memory the load measured on the plain buffer type
+};
+
+// The RUNTIME zone's requirement: the sum of `terms`. False, with *out unwritten, when the sum would wrap or `out` is
+// null: a wrapped sum would size a smaller zone instead of refusing one.
+bool zone_runtime_requirement(const zone_runtime_terms & terms, size_t * out);
+
+// What points into a VRAM arena that a plan wants larger. The arena grows only by being destroyed and reserved again,
+// which moves every byte in it, so each of these keeps it as it is. The last four are not holders: they count the
+// cache's own releases still to run, whose bytes the zones still count as allocated with no owner left, so the remedy
+// can tell those bytes from a model's or a context's. No gate reads them.
+struct zone_arena_holders {
+    size_t   live_zone_bytes  = 0;  // bytes the zones count as allocated
+    uint32_t chunk_leases     = 0;  // leases handles hold on the arena's chunks
+    uint32_t scratch_in_arena = 0;  // the cache's scratch buffers whose pointer lies inside the arena
+    uint32_t scratch_outside  = 0;  // the cache's scratch buffers allocated outside it, printed and never a holder
+    uint32_t ring_in_arena    = 0;  // of scratch_in_arena, the PP MoE ring's slot buffers (current and retired slots)
+    uint32_t live_beside_ring = 0;  // allocations live in the zones other than the ring's slot buffers
+    size_t   queued_frees     = 0;  // frees queued in the arena and not yet run
+    size_t   release_retries  = 0;  // the device's releases refused once and waiting for a retry
+    size_t   retired_pending  = 0;  // the cache's retired entries not yet finalized
+    size_t   evictions        = 0;  // the cache's evictions still in flight
+};
+
+// Whether the arena may be rebuilt for larger zones: only when nothing points into it. A scratch buffer allocated
+// outside the arena keeps its own memory through a rebuild, so it does not refuse one; a buffer inside it does.
+bool zone_arena_rebuild_allowed(const zone_arena_holders & holders);
+
+// Whether the PP MoE ring's slot buffers are all that keeps the arena from a rebuild it needs: a rebuild is needed, a
+// slot buffer of the ring lies inside the arena, and nothing else holds it (no other allocation live in its zones, no
+// lease on its chunks, no other cache scratch buffer inside it). Only then may a load release the ring to rebuild.
+bool zone_arena_only_ring_holds(bool rebuild_needed, const zone_arena_holders & holders);
+
+// Why the arena's planned zones could not be sized.
+enum class zone_arena_refusal_reason {
+    NONE,              // they were sized
+    REBUILD_HELD,      // a zone must grow and something points into the arena, so it cannot be rebuilt
+    RESERVE_FAILED,    // the device could not reserve an arena with the planned zones
+    NO_CACHE,          // the device has no unified cache to size them in
+    TEARDOWN_REFUSED,  // the arena could not be torn down, by this call's rebuild or by an earlier one
+};
+
+// Why a teardown of the VRAM arena refused, as the teardown records it. Every cause but HOST_STATE is found after the
+// teardown closed the arena to new allocations, and it stays closed until a later teardown completes.
+enum class zone_arena_teardown_refusal {
+    NONE,              // no teardown was refused
+    HOST_STATE,        // the host could not reserve the teardown's own bookkeeping; the arena is as it was
+    LIVE_ALLOCATIONS,  // allocations were still live in the arena when the teardown closed it
+    DRAIN_SNAPSHOT,    // the host could not record the allocations the teardown waits on
+    DRAIN_TIMEOUT,     // a lease on one of its allocations did not end while the teardown waited
+    FREE_FAILED,       // the device refused to free one of its chunks, after the chunks before it were freed
+};
+
+// Whether a teardown refused for `cause` left the arena closed to new allocations.
+bool zone_arena_teardown_left_closed(zone_arena_teardown_refusal cause);
+
+// The three zones a plan sizes, in bytes.
+struct zone_arena_sizes {
+    size_t scratch = 0;
+    size_t onednn  = 0;
+    size_t runtime = 0;
+};
+
+// A refusal to size the arena's planned zones: the device, the reason, and per zone the bytes the plan needs and the
+// bytes the device's arena has when the decision refuses (have is 0 where no arena exists then). At REBUILD_HELD,
+// holders is what the decision found pointing into the arena, which the line names and chooses its remedy from. At
+// RESERVE_FAILED, released is the zones of the arena a rebuild destroyed before the reserve failed. At
+// TEARDOWN_REFUSED, teardown is why the teardown refused. Each is 0 or NONE otherwise.
+struct zone_arena_refusal {
+    zone_arena_refusal_reason   reason = zone_arena_refusal_reason::NONE;
+    int                         device = -1;
+    zone_arena_sizes            need;
+    zone_arena_sizes            have;
+    zone_arena_holders          holders;
+    zone_arena_sizes            released;
+    zone_arena_teardown_refusal teardown = zone_arena_teardown_refusal::NONE;
+};
+
+// The line a model load refused for `refusal` logs, without a newline: the device, each zone's need and have in MB, the
+// shortfall of each zone that is short (a zone short by under 0.1 MB prints its three figures in KB, or in bytes under
+// 1 KB, so no shortfall prints as nothing), the reason, and what the caller can do. Empty for NONE. The zones are
+// planned at the load's fixed planning shape, not at the context's -c or -ub, so the line never offers a smaller
+// context or micro-batch as the remedy.
+std::string zone_arena_refusal_text(const zone_arena_refusal & refusal);
 
 // The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the
 // hold can be) plus the largest spill-capable RUNTIME request, because a held-back request spills whole. The
@@ -552,10 +646,22 @@ typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 // ring_bytes is the prefill ring's bytes neither the planned room nor a loan covers (llama.cpp-kjef): the ring's slots
 // are the room's bytes and lent bytes, so it is 0 when the two supply all of it, and a demand on free memory otherwise.
 //
-// compute_room_n_ubatch and compute_room_bytes name the one rung whose compute buffers the plan sized the RUNTIME zone
-// to hold beside the hold, and that room: the explicit micro-batch the load placed, whose zone holds the planned
-// compute term (the compute buffers the load measured at its planning shape) beside that micro-batch's ring and dense
-// scratch. 0 for none, the case of every load that names no micro-batch.
+// compute_room_n_ubatch and compute_room_bytes name the rung whose compute buffers the plan sized the RUNTIME zone to
+// hold beside the hold, and that room (placement_plan_compute_room): the explicit micro-batch the load placed, or, for
+// a load that named none, the micro-batch the load measured the term at (the planning micro-batch only for an
+// inventory that sent none). The room is the planned compute term (the compute buffers the load measured at that
+// shape), held beside that micro-batch's ring and dense scratch. 0 for none: a multi-device plan, another device, an
+// unknown measured micro-batch, or a named micro-batch the plan did not place.
+// A rung can also be named with a room of 0 bytes, when no live load owns a compute term on the device (the record
+// keeps the last load's micro-batch until the next load replaces it): such a room credits no request above 0 bytes,
+// and the measured rung is withheld (0) with it.
+//
+// compute_room_measured_n_ubatch is the micro-batch the term was measured at, 0 when the record names none (no load
+// recorded one, or two loads that both held a term disagreed: that mark outlives both loads and stays until the next
+// inventory intake that finds no live term), when the record changed between the fit's two reads of it, or when the
+// room is none or 0 bytes.
+// It is a separate fact from compute_room_n_ubatch because the plan can place a micro-batch above the one the load
+// measured its term at: the room's rung then says where the zone was sized, not which rung's buffers the term covers.
 struct zone_hold_fit_inputs {
     size_t                         headroom_target = 0;  // the driver headroom the arena expects outside itself
     size_t                         free_before = 0;  // the cache's ledger: the card with the rung's own buffers gone
@@ -565,8 +671,14 @@ struct zone_hold_fit_inputs {
     zone_hold_plan_fn              plan_of     = nullptr;
     void *                         plan_ctx    = nullptr;
     size_t                         ring_bytes  = 0;
-    uint32_t                       compute_room_n_ubatch = 0;
-    size_t                         compute_room_bytes    = 0;
+    uint32_t                       compute_room_n_ubatch          = 0;
+    size_t                         compute_room_bytes             = 0;
+    uint32_t                       compute_room_measured_n_ubatch = 0;
+    // The rung whose own compute buffer the hold kept outside the arena, 0 for none: the hold epoch's rung (the asked
+    // rung when the owner has no epoch), set when the epoch's spill counters show a request held outside the arena.
+    // The zone did not serve that rung's buffer, so the room is not credited there. Every other rung keeps the credit
+    // the plan gives it.
+    uint32_t                       held_out_n_ubatch              = 0;
 };
 
 // The worst-case compute-buffer request at `n_ubatch`: the rung's own measured record when it has one (and only
@@ -575,14 +687,27 @@ struct zone_hold_fit_inputs {
 // is recorded: the demand is then the plan alone, a lower bound.
 size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
-// Whether the RUNTIME zone was planned to serve `request` at `n_ubatch` beside the hold: the rung is the one the plan
-// sized a compute room for, and the request is no larger than that room. Whole or nothing: a request above the room
-// gets no part of it. It can over-credit a rung whose compute buffers span several chunks, because the request is the
-// rung's largest single buffer (zone_hold_fit_request) while the room is a sum of per-chunk peaks that the other
-// chunks draw on too. The bound has the same limit, since it charges one request rather than the rung's chunks. The
-// credit at the load's planning micro-batch (placement_plan_compute_room) shares the limit, since its room is the
-// same summed term.
-bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request);
+// Whether the RUNTIME zone was planned to serve the rung's compute buffers beside the hold. Only a rung at or below
+// compute_room_n_ubatch is, the rung the zone was sized for. With its own measured request (`own_record`) the rung is
+// served when the request is no larger than the room (whole or nothing). Without one it is served only when it is also
+// at or below compute_room_measured_n_ubatch: the room is the term measured at that rung and compute buffers grow with
+// the micro-batch, so a rung no larger needs no more than the term, while a rung above it (below a placed micro-batch)
+// can need more. A measured rung of 0 gives no such credit. A request scaled from another rung is an estimate and does
+// not refuse a rung the term covers. Never the rung whose own buffer was held out, never a rung above the room's,
+// never n_ubatch 0.
+//
+// It can over-credit a rung whose compute buffers span several chunks, because the request is the rung's largest
+// single buffer (zone_hold_fit_request) while the room is a sum of per-chunk peaks that the other chunks draw on too.
+// The bound has the same limit, since it charges one request rather than the rung's chunks. The credit at the
+// micro-batch the load measured the term at (placement_plan_compute_room) shares the limit, since its room is the same
+// summed term.
+bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in,
+                                         uint32_t                     n_ubatch,
+                                         size_t                       request,
+                                         bool                         own_record);
+
+// Whether the rung has a measured request of its own among the records.
+bool zone_hold_fit_rung_has_record(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
 
 // The raw (outside-arena) demand the hold can cause at the rung: zone_hold_spill_raw_demand over
 // zone_hold_spill_bound(plan, the rung's request) and the KV room, plus the ring bytes neither the planned room nor a
@@ -742,26 +867,38 @@ bool zone_route_draws_scratch(bool decision_valid,
 bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size_t alignment, size_t * out);
 
 // The micro-batch the planned compute term was measured at, as the loads on a device record it, one store per
-// inventory intake (a load's early plan and late intake carry the same inventory, so its repeat store keeps an equal
-// value and changes nothing): the hold-spill fit credits the term at that rung only. The first load's value stands
-// while later loads agree. A load that names a different one turns the record off for good
-// (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the term was not measured at is the defect the
-// record prevents, and once off it never reads as a shape again. A load naming 0, or naming the mark itself, changes
-// nothing, so the mark only ever means two loads really disagreed and the WARN that reports it names two values loads
-// did plan. Nothing ever clears it: when every load that reserved the term is gone the term merges to 0 bytes, and a
-// 0-byte room credits nothing, so a micro-batch left behind is harmless.
+// inventory intake (a load's early plan and late intake carry the same inventory, and at its late intake the load's
+// own term is live and the record already holds its value, so the repeat store keeps an equal value and changes
+// nothing): the hold-spill fit reads it to place its compute room, and zone_hold_fit_rung_has_compute_room decides
+// which rungs that room credits. The first load's value stands while later loads agree. A load that names a different
+// one while another load still holds a compute term on the device turns the record off
+// (k_zone_compute_term_n_ubatch_disagreed), because a credit at a shape the live term was not measured at is the
+// defect the record prevents. When no load holds a term (`term_live` false: the merged term is 0 bytes), the earlier
+// loads are gone and the new load's value replaces the record, even one turned off, so loads made one after another
+// at different micro-batches each get their own credit. A load's early plan is taken in before its own term is
+// reserved, so `term_live` there names only earlier loads. A load naming 0, or naming the mark itself, changes
+// nothing, so the mark only ever means two live loads really disagreed and the WARN that reports it names two values
+// loads did plan. A micro-batch left behind after every load is gone is harmless: the term merges to 0 bytes, and a
+// 0-byte room credits nothing. So a disagreement only removes the credit, never grants one, for every term on the
+// device: a load's measure can reserve a term on a device only after that device took in the load's inventory, since
+// the load's stage runs the intake on every SYCL device.
 constexpr uint32_t k_zone_compute_term_n_ubatch_disagreed = UINT32_MAX;
 
-inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_ubatch) {
-    if (n_ubatch == 0 || n_ubatch == k_zone_compute_term_n_ubatch_disagreed ||
-        stored == k_zone_compute_term_n_ubatch_disagreed) {
+inline uint32_t zone_compute_term_n_ubatch_store(uint32_t stored, uint32_t n_ubatch, bool term_live) {
+    if (n_ubatch == 0 || n_ubatch == k_zone_compute_term_n_ubatch_disagreed) {
+        return stored;
+    }
+    if (!term_live) {
+        return n_ubatch;
+    }
+    if (stored == k_zone_compute_term_n_ubatch_disagreed) {
         return stored;
     }
     return stored == 0 || stored == n_ubatch ? n_ubatch : k_zone_compute_term_n_ubatch_disagreed;
 }
 
 // Whether a store moved the record from `before` to `after` by turning it off: the one store the setter WARNs on. A
-// record already off stays off without turning off again, so a later disagreeing load does not repeat the WARN.
+// record already off that stays off does not turn off again, so a later disagreeing load does not repeat the WARN.
 inline bool zone_compute_term_n_ubatch_turns_off(uint32_t before, uint32_t after) {
     return before != k_zone_compute_term_n_ubatch_disagreed && after == k_zone_compute_term_n_ubatch_disagreed;
 }

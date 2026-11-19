@@ -1984,6 +1984,23 @@ if (NOT WIN32)
         TIMEOUT 60
     )
 
+    # Gate for the UI bundle version order in tools/ui/ui-version.cmake: env
+    # overrides, then the committed pin, then the build-number derivation. Without
+    # the pin the build embeds the floating bundle, which can stop matching this
+    # tree's server code at any time.
+    llama_test_cmd(
+        ${CMAKE_COMMAND}
+        NAME test-ui-version-pin
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS -DUI_VERSION_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/ui-version.cmake
+             -DUI_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/CMakeLists.txt
+             -P ${CMAKE_CURRENT_SOURCE_DIR}/test-ui-version-pin.cmake
+    )
+    set_tests_properties(test-ui-version-pin PROPERTIES
+        LABELS "build;policy"
+        TIMEOUT 60
+    )
+
     # Conservation gate for parse-sycl-timeline.py's three-way gap-class split,
     # driven by the checked-in synthetic trace next to it (never live hardware).
     #
@@ -4622,6 +4639,116 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for a second model load that cannot size the VRAM arena zones: the rebuild refusal names who holds the
+# arena (each zone's live bytes, the queued frees the zones still count, the device's releases that could not complete
+# and wait for a retry (a refused arena lease is the usual cause), the retired entries and evictions in flight) and the
+# RUNTIME requirement line names every term it sums. Host-only, reads the sources as text. Same registration shape as
+# test-sycl-compute-refusal-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-arena-zone-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-arena-zone-refusal-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# Source gate for the zone counters that refusal sums: every VRAM arena zone counts its own bytes. zone_alloc() and
+# zone_free() write a counter only through zone-used-count.hpp (the allocator's delta for that one operation), and a
+# free lowers the zone its exact-allocation record names, so a WEIGHT free on an allocator KV shares never writes KV's
+# counter. Host-only, reads the sources as text; test-zone-sizing Case 34 checks the helper's arithmetic. Same
+# registration shape as test-sycl-arena-zone-refusal-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-zone-own-bytes-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-zone-own-bytes-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# Source gate for the two raw-allocation gates: unified_alloc()'s one raw device exit and the device-pool chunk sites
+# compare a raw request with the device's physical bytes (the device total less the arena reservation, the raw rows
+# held outside it and the bytes outside this process's accounting at the first cache), never a zone counter; with an
+# arena active a refusal evicts nothing, and it names every term. Host-only, reads the sources as text; test-zone-sizing
+# Case 35 checks the figure's arithmetic. Same registration shape as test-sycl-zone-own-bytes-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-raw-gate-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-raw-gate-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# Source gate for who holds a VRAM arena that a second load cannot rebuild: every chunk lease a mem_handle takes is
+# counted by the site that took it (one relaxed add each way, no lock) and released against the same site; the rebuild
+# refusal prints those counts and lists the live allocations of every zone with live bytes; a cache scratch buffer
+# blocks the rebuild only when the arena owns its pointer. Host-only, reads the sources as text; test-zone-sizing
+# Case 36 checks the rebuild decision. Same registration shape as test-sycl-raw-gate-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-arena-rebuild-holders-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-arena-rebuild-holders-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# Source gate for a placement plan that is tried and discarded: it publishes nothing. One helper snapshots and restores
+# every term the planner publishes while it plans; the load stage snapshots before the plan with the room and its
+# fallback restores before it sizes the zones; the plan dry run restores through the same helper; the RUNTIME
+# requirement is the pure zone_runtime_requirement, which test-zone-sizing Case 37 checks. Host-only, reads the sources
+# as text. Same registration shape as test-sycl-raw-gate-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-discarded-plan-terms-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-discarded-plan-terms-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# Source gate for a model load whose plan the arena's zones cannot hold: it is refused, never aborted. No GGML_ABORT on
+# the load's plan path; both zone ensures log the refusal line (each zone's need and have) and return false; each
+# planner entry reports the refusal and the stage returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED; a failed load puts back
+# the device-wide terms it published. test-zone-sizing Case 38 checks the line's text. Host-only, reads the sources as
+# text. Same registration shape as test-sycl-raw-gate-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-load-zone-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-load-zone-refusal-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# Source gate for the load stage's two passes: every device plans and every refusal of the pass is decided before the
+# stage's effects (layer streaming, host zones, the stale ring's release), so a pass refused on any device runs none of
+# them, while a load refused in its late pass has run its early pass's effect, the stale ring's release; the decide
+# step's zone decision may still rebuild an arena nothing holds, which a refused load keeps. The decide pass releases
+# the PP MoE ring only at the entry ensure, when the ring alone holds an arena that must grow; each device's effects run
+# from its own snapshot under the last device's candidate check; the replaced candidates' leases outlive the effects; a
+# refused arena teardown reserves nothing. Host-only, reads the sources as text. Same registration shape as
+# test-sycl-load-zone-refusal-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-load-stage-effect-pass-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-load-stage-effect-pass-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# Jinja fallback for a model whose chat template the built-in matcher does not know (Gemma 4 failed after the load with
+# "try using --jinja"): upstream turns the jinja engine off for llama-completion and llama-mtmd-cli.
+# test-chat-need-jinja checks common_chat_templates_need_jinja() itself. It loads no model, so it keeps the default
+# label, and it sits outside any Python or SYCL guard so every build with tests registers it.
+llama_build_and_test(test-chat-need-jinja.cpp)
+
+# Source gate for the same fallback: it pins common_chat_templates_need_jinja() and the one place each of
+# llama-completion and llama-mtmd-cli decides the engine. Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-completion-jinja-fallback-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-completion-jinja-fallback-source.py
+        LABEL "python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-ii25: source gate for the runtime allocation registry's containment index: g_runtime_alloc_registry is
 # mutated only through the helpers that keep the index in step, a row's geometry is never rewritten, neither object
 # leaves unified-cache.cpp, and unified_lookup_runtime_allocation() queries the index instead of scanning. The index
@@ -4681,6 +4808,18 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-fatal-exit-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fatal-exit-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# With GGML_SYCL_MOE_MULTI_GPU=1 and no peer path between the cards, the load stage refuses a plan that puts experts
+# on a second card, at both of its refusal sites, before the lazy-plan refusal, with the plan-rejected return and an
+# ERROR line naming the remedy. Source-only; the predicate and the peer-path read run in
+# test-sycl-measure-plan-override.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-cross-card-expert-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cross-card-expert-refusal-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()

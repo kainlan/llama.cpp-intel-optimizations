@@ -29,8 +29,9 @@ cannot see:
    steps the early plan took in the order it took them, and the load's pre-fill helper calls the record pre-fill;
 7. the dry run leaves no trace: every per-device planner global the stage planners write (in their recording
    definitions, the host-side sequence, and the static and publish functions those reach within two calls) or the shared
-   planner-input publish writes is written again by the destructor of the dry run's saved state, so a later load
-   reads what it would have read without the dry run;
+   planner-input publish writes is written again by the destructor of the dry run's saved state, itself or through
+   planner_published_terms::restore (unified-cache.cpp), the helper the load stage's fallback restores through, when
+   the destructor calls it on a field of that type, so a later load reads what it would have read without the dry run;
 8. the residency decision's §10 plan lines, which the dry run's planner call prints, carry every field T3 can print,
    each from the plan's own terms: a STORAGE [PLACEMENT] line its cache's index bytes, a HOST one the host budget,
    the planned bytes and the leftover, and the [HOST-PLAN] lazy line the budget's source, the host weights, the WEIGHT
@@ -1135,21 +1136,55 @@ def test_the_planner_writes_the_known_globals():
         assert name in found, f"the derivation misses {name}: {sorted(found)}"
 
 
-def test_the_saved_state_restores_every_written_global():
-    cpp = sycl_cpp()
+# The helper the load stage's fallback restores the planner's terms through. A destructor that calls its restore on a
+# field of its type writes every setter that restore calls, read from the helper's definition in the cache.
+HELPER_TYPE = "planner_published_terms"
+HELPER_RESTORE = "planner_published_terms::restore"
+DRY_HELPER_RESTORE = "s.planner.restore(d);"
+
+
+def saved_state_name_and_missing(cpp: str, uc: str):
+    """The dry run's saved-state struct and the written globals its destructor does not write again, sorted."""
     hit = re.search(r"struct\s+(ggml_sycl_plan_dry_run_\w*state\w*)\s*\{", cpp)
     assert hit, "the dry run has no saved-state struct"
     name = hit.group(1)
     struct_body = balanced(cpp, hit.end() - 1)
     dtor = re.search(rf"~\s*{name}\s*\(\s*\)\s*(?:noexcept\s*)?\{{", struct_body)
     assert dtor, f"{name} has no destructor"
-    restored = setters_in(balanced(struct_body, dtor.end() - 1))
+    dtor_body = balanced(struct_body, dtor.end() - 1)
+    restored = setters_in(dtor_body)
+    fields = re.findall(rf"\b(?:ggml_sycl::)?{HELPER_TYPE}\s+(\w+)\s*;", struct_body)
+    if any(re.search(rf"\b{f}\s*\.\s*restore\s*\(", dtor_body) for f in fields):
+        restored |= setters_in(body(uc, HELPER_RESTORE))
     written = planner_written_setters() | setters_in(body(cpp, "ggml_sycl_inventory_publish_planner_inputs"))
-    missing = sorted(written - restored)
+    return name, sorted(written - restored)
+
+
+def test_the_saved_state_restores_every_written_global():
+    cpp = sycl_cpp()
+    name, missing = saved_state_name_and_missing(cpp, read(SYCL / "unified-cache.cpp"))
     assert not missing, f"the dry run's saved state does not restore {missing}"
     assert re.search(rf"\b{name}\s+\w+\s*[;({{]", body(cpp, EXPORT) + dry_run_closure(cpp)), (
         f"the dry run never holds a {name}"
     )
+
+
+def test_the_restore_check_sees_a_dropped_helper_restore():
+    # The destructor no longer restores through the helper: the planner's terms are not written again.
+    cpp = sycl_cpp()
+    assert DRY_HELPER_RESTORE in cpp, "witness anchor: the saved state does not restore through the helper"
+    _, missing = saved_state_name_and_missing(cpp.replace(DRY_HELPER_RESTORE, "", 1), read(SYCL / "unified-cache.cpp"))
+    assert "unified_cache_set_planned_moe_host_scatter_scratch_bytes" in missing, missing
+
+
+def test_the_restore_check_sees_a_term_dropped_from_the_helper():
+    # The helper's restore no longer writes the host scatter term: the dry run leaves it as its plan wrote it.
+    uc = read(SYCL / "unified-cache.cpp")
+    restore = body(uc, HELPER_RESTORE)
+    setter = "unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);"
+    assert setter in restore, "witness anchor: the helper's restore does not write the host scatter term"
+    _, missing = saved_state_name_and_missing(sycl_cpp(), uc.replace(restore, restore.replace(setter, ""), 1))
+    assert missing == ["unified_cache_set_planned_moe_host_scatter_scratch_bytes"], missing
 
 
 if __name__ == "__main__":

@@ -105,13 +105,14 @@ bool resolve_file_device_name(int device, std::string & out_device_name) {
 // derived here, not by the caller: a level_zero:0,1 run without
 // GGML_SYCL_SPLIT_RATIO/TENSOR_SPLIT gives the context ONE SYCL backend
 // (device 0), while the placement planner still puts layers and KV on the
-// hidden device 1 whenever ggml_backend_sycl_moe_multi_gpu_requested() --
-// the same gate the multi-device plan uses. That plan budgets every physical
-// GPU, so under it each one the context does not list is keyed as hidden,
-// and the key records that the plan ran. Each device's budget comes from
-// ggml_sycl_device_budget_authority_existing(), which reads the live cache's
-// resolved authority when there is one and never constructs a cache (see the
-// loop below). Returns false for an empty or out-of-range device list.
+// hidden device 1 whenever ggml_sycl_multi_device_plan_for_loaded_model()
+// says so: the predicate the planner asks, with the same expert fact. That
+// plan budgets every physical GPU, so under it each one the context does not
+// list is keyed as hidden, and the key records that the plan ran. Each
+// device's budget comes from ggml_sycl_device_budget_authority_existing(),
+// which reads the live cache's resolved authority when there is one and never
+// constructs a cache (see the loop below). Returns false for an empty or
+// out-of-range device list.
 bool resolve_device_set_key(const ggml_sycl_ubatch_cache_key & c_key,
                             std::string &                      out_device_name,
                             std::string &                      out_device_key) {
@@ -129,7 +130,7 @@ bool resolve_device_set_key(const ggml_sycl_ubatch_cache_key & c_key,
         topo.scheduler_devices.push_back(device);
     }
     topo.total_gpu_count   = std::min(info.total_gpu_count, GGML_SYCL_MAX_DEVICES);
-    topo.multi_device_plan = ggml_backend_sycl_moe_multi_gpu_requested();
+    topo.multi_device_plan = ggml_sycl_multi_device_plan_for_loaded_model();
 
     // How the work is divided across that set is as budget-relevant as the
     // set itself: the same two cards at a different split ratio put a

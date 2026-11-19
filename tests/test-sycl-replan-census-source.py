@@ -32,7 +32,8 @@ keep being true, source-side.  What it checks, by gate:
       message byte for byte; the preload's witness is `held(LOAD)`.
   36  the four plan accessors consult the override first and every other read of the
       publication is theirs; the five scheduler-path latch reads go through the one
-      reader; the override has two writers, one nesting witness, and a snapshot builder
+      reader; the override has two writers, one nesting witness, its other two refusal lines (no
+      plan staged, a refused KV re-fit) at ERROR, and a snapshot builder
       that names no provisional-plan helper; the publish store refuses first; the measure
       backend is non-owning, syntactically.
   37  both pool phase gates skip only under a TRANSACTION token and name their site.
@@ -967,10 +968,17 @@ def gate36(files, bad):
         first = inst.find("g_measure_plan_override")
         if first < 0 or "return false" not in inst[:inst.find("g_measure_plan_override =") if "g_measure_plan_override =" in inst else 0]:
             bad("gate 36: install does not refuse a nest before it writes")
-        if 'GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst or \
+        if 'GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst or \
                 'GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst:
             bad("gate 36: install lacks its nesting witness")
-    for fn in ("ggml_backend_sycl_measure_plan_override_install_kv", "lifecycle_make_candidate_snapshot"):
+        # The other two refusals are ERRORs too, so a default-verbosity log names which one failed the load.
+        for line in ("[LOAD-PLAN] measure plan override: no plan staged for load",
+                     "[LOAD-PLAN] measure plan override: the KV re-fit for load"):
+            if not re.search(r'GGML_LOG_ERROR\(\s*"' + re.escape(line), kinst):
+                bad("gate 36: install's refusal %r is not an ERROR" % line)
+    # the install's lookup is ggml_sycl_measure_staged_plan, which the loader's staged-plan query reads too
+    for fn in ("ggml_backend_sycl_measure_plan_override_install_kv", "ggml_sycl_measure_staged_plan",
+               "lifecycle_make_candidate_snapshot"):
         t = ""
         for path in (MAIN, UC_C):
             cc = code(files, path)
@@ -1413,13 +1421,25 @@ def mutants(files):
                 "static void ggml_sycl_stray_ov() { g_measure_plan_override.reset(); }\nstatic size_t ggml_sycl_host_chunk_cap_constant() {", "g36d"),
            "g_measure_plan_override is written in")
     yield ("install without its nesting witness",
-           edit(files, M, "GGML_LOG_WARN(\"[CONTEXT-PLAN-BUG] measure plan override nested\\n\");",
-                "GGML_LOG_WARN(\"measure plan override nested\\n\");", "g36e"),
+           edit(files, M, "GGML_LOG_ERROR(\"[CONTEXT-PLAN-BUG] measure plan override nested\\n\");",
+                "GGML_LOG_ERROR(\"measure plan override nested\\n\");", "g36e"),
            "install lacks its nesting witness")
+    yield ("install's no-plan refusal downgraded to a WARN",
+           edit(files, M, "GGML_LOG_ERROR(\"[LOAD-PLAN] measure plan override: no plan staged for load",
+                "GGML_LOG_WARN(\"[LOAD-PLAN] measure plan override: no plan staged for load", "g36p"),
+           "refusal '[LOAD-PLAN] measure plan override: no plan staged for load' is not an ERROR")
+    yield ("install's KV re-fit refusal downgraded to a WARN",
+           edit(files, M, "GGML_LOG_ERROR(\"[LOAD-PLAN] measure plan override: the KV re-fit for load",
+                "GGML_LOG_WARN(\"[LOAD-PLAN] measure plan override: the KV re-fit for load", "g36q"),
+           "refusal '[LOAD-PLAN] measure plan override: the KV re-fit for load' is not an ERROR")
     yield ("install naming the provisional builder",
+           edit(files, M, "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);",
+                "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);\n    (void) &ggml_sycl_make_provisional_plan_snapshot;", "g36f"),
+           "ggml_backend_sycl_measure_plan_override_install_kv names ggml_sycl_make_provisional_plan_snapshot")
+    yield ("the install's lookup naming the provisional builder",
            edit(files, M, "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;\n    switch (stage) {",
-                "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;\n    (void) &ggml_sycl_make_provisional_plan_snapshot;\n    switch (stage) {", "g36f"),
-           "names ggml_sycl_make_provisional_plan_snapshot")
+                "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;\n    (void) &ggml_sycl_make_provisional_plan_snapshot;\n    switch (stage) {", "g36r"),
+           "ggml_sycl_measure_staged_plan names ggml_sycl_make_provisional_plan_snapshot")
     yield ("a measure free reaching the SYCL free",
            edit(files, M, "static void ggml_backend_sycl_measure_free(ggml_backend_t backend) {\n    delete backend;",
                 "static void ggml_backend_sycl_measure_free(ggml_backend_t backend) {\n    ggml_backend_sycl_free(backend);", "g36g"),
