@@ -3236,33 +3236,47 @@ The arena can fail to grow for three reasons, and each prints its own line first
     reserve the teardown's own bookkeeping (`HOST_STATE`), allocations are live
     in the arena (`LIVE_ALLOCATIONS`), a lease on an allocation does not end
     within the drain wait (`DRAIN_TIMEOUT`), a lease on the first chunk the
-    teardown tries outlives its 5 s wait (`LEASES_OUTSTANDING`), or the device
-    refuses to free that chunk (`FIRST_FREE_FAILED`). The first two refuse
-    before anything is closed. The other three refuse after the close, and put
-    back what it changed while every allocator group lock is held. Each zone's
-    generation is restored, and the authority the close retired is reopened at
-    that generation and published again: the same object, so a handle minted
-    before the attempt resolves to the same pointer and keeps its leases. Each
-    group gets its state and epoch back. A settle the close interrupted is
-    finished as the settle would finish it when its drains are empty (allocators
-    reset, replacements published, OPEN), and otherwise left RESETTING to its own
-    wait. New allocations are admitted again, and a later load may retry.
+    teardown tries outlives its wait, which is the drain wait's timeout (5 s)
+    (`LEASES_OUTSTANDING`), or the device refuses to free that chunk
+    (`FIRST_FREE_FAILED`). The first two refuse before anything is closed. The
+    other three refuse after the close, and put back what it changed while every
+    allocator group lock is held. Each zone's generation is restored, and the
+    authority the close retired is reopened at that generation and published
+    again: the same object, so a handle minted before the attempt resolves to the
+    same pointer and keeps its leases. Each group gets its state and epoch back. A
+    settle the close interrupted is finished as the settle would finish it when
+    its drains are empty and its group holds no allocation (allocators reset,
+    replacements published, OPEN). Otherwise it is left RESETTING to its own wait;
+    a group that holds an allocation there also logs an ERROR line, and its
+    allocators are not reset under it. New allocations are admitted again, and a
+    later load may retry.
   - *A chunk freed: the arena is partly freed and stays closed.* A freed chunk
     cannot be taken back, so once one is freed the teardown frees every chunk it
     can. It keeps a chunk the device refuses to free (`FREE_FAILED`) or one a
     lease still holds after its wait (`LEASES_OUTSTANDING_AFTER_FREE`). The groups
-    stay CLOSING and the authorities stay retired. The cause outlives any later
-    refusal until a teardown frees the rest.
+    stay CLOSING and the authorities stay retired. The recorded cause stays the
+    first one that left the arena partly freed until a teardown frees the rest. A
+    later teardown that refuses before it frees a further chunk puts back what its
+    own close changed, and its lines say the arena is still partly freed and
+    closed, as the earlier teardown left it.
 
-  A chunk a lease still holds is never freed, nothing in the teardown aborts,
-  and nothing is reaped, evicted or reset to make a teardown succeed. The
-  teardown's own ERROR lines say what it did:
+  Every exit after the close releases the allocator group locks and wakes every
+  thread waiting on a group's state, so a `zone_settle()` caller parked behind a
+  settle the close interrupted returns whatever the teardown decided. Nothing in
+  the teardown aborts, and nothing is reaped, evicted or reset to make a teardown
+  succeed. The teardown never frees a chunk whose lease count it read as nonzero
+  when its wait for that chunk ended. That read is the only check: a lease is
+  taken without a lock, so a lease taken on a chunk after the teardown read its
+  count as zero is not seen, and that chunk is freed. The teardown's own ERROR
+  lines say what it did (`<T>` is the wait in ms):
 
   ```
-  [VRAM-ARENA] chunk <i> of the arena on device <D> (<ptr>, <M> MB) still has <n> lease(s) after 5 s, so it is not
-  freed (no chunk was freed, the arena is as it was | chunks before it were freed, the arena is partly freed);
-  leases on the arena by site: <site>=<n> ...
-  [VRAM-ARENA] the teardown of the arena on device <D> freed no chunk (<cause> at chunk <i>); the arena is as it was
+  [VRAM-ARENA] chunk <i> of the arena on device <D> (<ptr>, <M> MB) still has <n> lease(s) after <T> ms, so it is
+  not freed (no chunk was freed, the arena is as it was | this teardown freed no chunk, and an earlier one left the
+  arena partly freed | chunks before it were freed, the arena is partly freed); leases on the arena by site:
+  <site>=<n> ...
+  [VRAM-ARENA] the teardown of the arena on device <D> freed no chunk (<cause>[ at chunk <i>]); the arena is as it
+  was | the arena is still partly freed and closed to new allocations, as an earlier teardown left it
   [VRAM-ARENA] the teardown of the arena on device <D> freed <F> of its <N> chunk(s) (<M> MB) and then could not
   free chunk <i> (<cause>); the arena is partly freed and stays closed to new allocations
   ```
