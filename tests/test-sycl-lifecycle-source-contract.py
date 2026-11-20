@@ -1128,7 +1128,7 @@ checks = {
     and re.search(r"\bggml_sycl::mem_handle\s+host_owner\s*;.*?(?<![\w.>])host_owner\s*=\s*"
                   r"ggml_sycl_host_expert_alloc\s*\(\s*device\s*,\s*expert_size\s*\)\s*;", preload_body,
                   re.S) is not None,
-    "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
+    "cache reuse stamps exact bound transaction": "void * unified_cache::try_get_cached_with_event(" in cache_cpp
     and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
     and "stamp_pending_owner(entry_it->second, load_effect_guard)" in cache_cpp
     and "stamp_pending_owner(it->second, load_effect_guard)" in cache_cpp

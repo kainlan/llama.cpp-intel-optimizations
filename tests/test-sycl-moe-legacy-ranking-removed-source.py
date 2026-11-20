@@ -82,6 +82,9 @@ REMOVED_WORDS = (
     "reorder_q4_k_gpu",
     "reorder_q6_k_gpu",
     "reorder_mxfp4_gpu",
+    # The cache's atomic expert-group staging, whose only caller was the prestage.
+    "stage_expert_group",
+    "staging_tensor_data",
 )
 REMOVED_TAGS = ("[MOE-WARMUP]", "[MOE-GATE-NORM]", "[MOE-RERANK]", "[ADAPTIVE-PRESTAGE]")
 

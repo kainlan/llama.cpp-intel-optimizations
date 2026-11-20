@@ -13132,8 +13132,8 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
     }
 
     if (!device_ptr && arena_active()) {
-        // Allocation-time exact arena owner: stage_expert_group copies and the
-        // published entry retain this same capability through terminal use.
+        // Allocation-time exact arena owner: the published entry, and any copy
+        // into it, retain this same capability through terminal use.
         const int device = get_device_id_from_queue(queue_);
         allocation_result allocation =
             unified_cache_zone_allocate_owner(device, vram_zone_id::WEIGHT, size);
@@ -13308,315 +13308,6 @@ void unified_cache::register_ready(const ggml_sycl_cache_id & key,
     entry_cv_.notify_all();
 
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] register_ready: layout=%d size=%zu ptr=%p\n", (int) layout, size, device_ptr);
-}
-
-// ---------------------------------------------------------------------------
-// Atomic expert group staging: all 3 tensors stage or none stage.
-// ---------------------------------------------------------------------------
-bool unified_cache::stage_expert_group(int                          block_id,
-                                       int                          expert_id_arg,
-                                       const expert_tensor_group &  keys,
-                                       const staging_tensor_data &  gate_data,
-                                       const staging_tensor_data &  up_data,
-                                       const staging_tensor_data &  down_data,
-                                       ggml_layout_mode             layout,
-                                       const cache_layout_request * gate_req,
-                                       const cache_layout_request * up_req,
-                                       const cache_layout_request * down_req) {
-    file_mapped_materialization_scope materialization_copies;  // its copies are the materialization (§5.3)
-
-    // Collect the tensors that need staging (skip unregistered roles)
-    struct slot_info {
-        const ggml_sycl_cache_id *   key;
-        const staging_tensor_data *  data;
-        const cache_layout_request * req;
-        void *                       ptr;
-        bool                         was_existing;
-        mem_handle                   allocation_owner;
-    };
-
-    std::vector<slot_info> slots;
-    slots.reserve(3);
-
-    if (keys.has_gate && gate_data.src_ptr && gate_data.dst_size > 0) {
-        slots.push_back({ &keys.gate_key, &gate_data, gate_req, nullptr, false, {} });
-    }
-    if (keys.has_up && up_data.src_ptr && up_data.dst_size > 0) {
-        slots.push_back({ &keys.up_key, &up_data, up_req, nullptr, false, {} });
-    }
-    if (keys.has_down && down_data.src_ptr && down_data.dst_size > 0) {
-        slots.push_back({ &keys.down_key, &down_data, down_req, nullptr, false, {} });
-    }
-
-    if (slots.empty()) {
-        return false;
-    }
-    const int cache_device = get_device_id_from_queue(queue_);
-
-    // Calculate total VRAM needed (only for tensors not already cached)
-    size_t total_needed = 0;
-    for (auto & s : slots) {
-        void * existing = lookup(*s.key, layout);
-        if (existing) {
-            s.ptr          = existing;  // Already cached -- skip allocation
-            s.was_existing = true;
-        } else {
-            total_needed += s.data->dst_size;
-        }
-    }
-
-    // All already cached? Success.
-    if (total_needed == 0) {
-        GGML_SYCL_DEBUG(
-            "[UNIFIED-CACHE] stage_expert_group: blk=%d exp=%d "
-            "all %zu tensors already cached\n",
-            block_id, expert_id_arg, slots.size());
-        return true;
-    }
-
-    // Check VRAM availability and evict if needed
-    if (available() < total_needed) {
-        size_t freed = evict(total_needed - available());
-        (void) freed;
-    }
-
-    if (available() < total_needed) {
-        GGML_SYCL_DEBUG(
-            "[UNIFIED-CACHE] stage_expert_group: blk=%d exp=%d "
-            "insufficient VRAM (need=%zu avail=%zu)\n",
-            block_id, expert_id_arg, total_needed, available());
-        return false;
-    }
-
-    // Explicit allocate + fill + register path.
-    {
-        bool all_ok = true;
-        for (auto & s : slots) {
-            if (s.was_existing) {
-                continue;
-            }
-
-            // 1. Allocate VRAM slot (device only, no host fallback)
-            s.ptr = allocate_slot(*s.key, s.data->dst_size, layout, cache_entry_type::MOE_EXPERT, s.data->layer_id,
-                                  s.data->expert_id);
-            if (!s.ptr) {
-                all_ok = false;
-                break;
-            }
-        }
-
-        if (!all_ok) {
-            // Rollback partial allocations
-            for (auto & s : slots) {
-                if (s.was_existing || !s.ptr) {
-                    continue;
-                }
-                remove(*s.key, cache_entry_type::MOE_EXPERT, s.data->layer_id, s.data->expert_id, layout);
-                s.ptr = nullptr;
-            }
-            return false;
-        }
-
-        // Capture the allocation-time owner from each slot before submitting
-        // copies. Arena staging must never recover a lease from its raw ptr.
-        {
-            std::shared_lock<std::shared_mutex> lock(rw_mutex_);
-            for (auto & s : slots) {
-                if (s.was_existing) continue;
-                unified_cache_key ckey{ cache_entry_type::MOE_EXPERT, *s.key, s.data->layer_id, s.data->expert_id };
-                auto it = entries_.find(ckey);
-                if (it != entries_.end()) s.allocation_owner = it->second.direct_alloc_owner;
-            }
-        }
-
-        // 2. Fill all slots (DMA + optional reorder via fill_fn from request).
-        //    Fills are submitted WITHOUT a per-expert dq.wait().  This allows
-        //    BCS H2D copies and CCS reorder kernels to pipeline across experts.
-        //    The caller batches experts and calls get_dma_queue().wait() +
-        //    Raw H2D copies go through BCS (copy-only engine) to keep CCS free.
-        //    Fill functions receive DMA queue and internally route H2D to BCS.
-        //
-        //    IMPORTANT: When using a pre-allocated temp buffer (prealloc_temp),
-        //    consecutive fills share the same staging VRAM.  The BCS H2D for
-        //    tensor N+1 must not overwrite the temp buffer while the CCS reorder
-        //    for tensor N is still reading it.  We chain fills via deps: each
-        //    fill's H2D depends on the previous fill's reorder submission event.
-        //    Without this, the BCS and CCS queues race on the shared temp buffer
-        //    (WAR hazard) causing corrupted SOA layouts or BCS CAT faults.
-        sycl::queue & dq  = get_dma_queue();
-        sycl::queue & bcs = get_bcs_queue();
-        sycl::event   last_event;
-        bool          has_last_event = false;
-        for (auto & s : slots) {
-            if (s.was_existing) {
-                continue;
-            }
-            if (s.req && s.req->fill_fn) {
-                // Use the caller-provided fill function (GPU reorder, CPU reorder, etc.)
-                // Fill functions route H2D to BCS internally via ctx->bcs_queue.
-                // Pass last_event as dependency so BCS H2D waits for previous
-                // CCS reorder to finish reading the shared prealloc_temp buffer.
-                std::vector<sycl::event> fill_deps;
-                if (has_last_event) {
-                    fill_deps.push_back(last_event);
-                }
-                last_event     = s.req->fill_fn(dq, s.ptr, s.data->dst_size, s.data->src_ptr, s.data->src_size,
-                                                s.req->fill_ctx, fill_deps);
-                has_last_event = true;
-            } else if (s.data->src_ptr && s.data->src_size > 0) {
-                // Raw pointer ABI at the fill boundary only: resolve both
-                // sides into smart handles so mem-ops owns queue selection,
-                // staging, and async lifetime retention.
-                const size_t copy_size  = std::min(s.data->dst_size, s.data->src_size);
-                auto         dst_handle = s.allocation_owner.valid() ? s.allocation_owner :
-                                      make_copy_handle_for_raw_ptr(s.ptr, layout, cache_device, s.data->dst_size);
-                auto         src_handle =
-                    make_copy_handle_for_raw_ptr(const_cast<void *>(s.data->src_ptr), GGML_LAYOUT_AOS, cache_device, s.data->src_size);
-                std::vector<sycl::event> copy_deps;
-                if (has_last_event) {
-                    copy_deps.push_back(last_event);
-                }
-                last_event     = mem_copy_async(dst_handle, src_handle, copy_size, bcs, copy_deps);
-                has_last_event = true;
-            }
-        }
-
-        // 3. Mark entries as IN_PROGRESS with ready_event (deferred READY).
-        //    Entries remain IN_PROGRESS with ready_event until downstream
-        //    try_get_cached_with_event chains the event.  This avoids the
-        //    per-expert dq.wait() that serialized all BCS/CCS work and caused
-        //    GT engine resets.
-        {
-            std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-            for (auto & s : slots) {
-                if (s.was_existing) {
-                    continue;
-                }
-                unified_cache_key ckey{ cache_entry_type::MOE_EXPERT, *s.key, s.data->layer_id, s.data->expert_id };
-                auto              it = entries_.find(ckey);
-                if (it != entries_.end()) {
-                    it->second.has_ready_event = true;
-                    it->second.ready_event     = last_event;
-                    it->second.layout          = layout;
-                    it->second.size            = s.data->dst_size;
-                    if (has_last_event) {
-                        it->second.last_write_event = last_event;
-                        it->second.has_write_event  = true;
-                    }
-                }
-            }
-        }
-
-        // Verify (first 3 experts only)
-        for (auto & s : slots) {
-            if (s.was_existing) {
-                continue;
-            }
-            static std::atomic<int> verify_log{ 0 };
-            if (verify_log.fetch_add(1, std::memory_order_relaxed) < 3) {
-                fprintf(stderr,
-                        "[STAGE-SUBMIT] blk=%d exp=%d layout=%d ptr=%p "
-                        "model=%llu hash=0x%llx aux=0x%llx (deferred READY)\n",
-                        block_id, expert_id_arg, (int) layout, s.ptr, (unsigned long long) s.key->model_id,
-                        (unsigned long long) s.key->name_hash, (unsigned long long) s.key->aux_id);
-            }
-        }
-
-        return true;
-    }
-
-    // Fallback: allocate + raw DMA fill + register_ready
-    bool alloc_ok = true;
-    for (auto & s : slots) {
-        if (s.was_existing) {
-            continue;  // Already cached
-        }
-        s.ptr = allocate_slot(*s.key, s.data->dst_size, layout, cache_entry_type::MOE_EXPERT, s.data->layer_id,
-                              s.data->expert_id);
-        if (!s.ptr) {
-            alloc_ok = false;
-            break;
-        }
-    }
-
-    // Rollback on partial allocation failure
-    if (!alloc_ok) {
-        for (auto & s : slots) {
-            if (s.ptr && !s.was_existing) {
-                std::shared_lock<std::shared_mutex> lock(rw_mutex_);
-                unified_cache_key ckey{ cache_entry_type::MOE_EXPERT, *s.key, s.data->layer_id, s.data->expert_id };
-                auto              it = entries_.find(ckey);
-                if (it != entries_.end() && it->second.state == cache_entry_state::IN_PROGRESS) {
-                    lock.unlock();
-                    remove(*s.key, cache_entry_type::MOE_EXPERT, s.data->layer_id, s.data->expert_id, layout);
-                }
-            }
-        }
-        GGML_LOG_WARN(
-            "[UNIFIED-CACHE] stage_expert_group: blk=%d exp=%d "
-            "allocation rollback\n",
-            block_id, expert_id_arg);
-        return false;
-    }
-
-    // Fill all tensors using BCS queue (copy-only engine) — no per-expert wait.
-    // Raw H2D copies go through BCS to keep CCS free and prevent GT engine resets.
-    sycl::queue & bcs = get_bcs_queue();
-    sycl::event   last_event;
-    for (auto & s : slots) {
-        if (s.was_existing) {
-            continue;
-        }
-
-        try {
-            size_t copy_size  = std::min(s.data->src_size, s.data->dst_size);
-            auto   dst_handle = s.allocation_owner.valid() ? s.allocation_owner :
-                                    make_copy_handle_for_raw_ptr(s.ptr, layout, cache_device, s.data->dst_size);
-            auto   src_handle =
-                make_copy_handle_for_raw_ptr(const_cast<void *>(s.data->src_ptr), GGML_LAYOUT_AOS, cache_device, s.data->src_size);
-            last_event = mem_copy_async(dst_handle, src_handle, copy_size, bcs);
-        } catch (...) {
-            GGML_LOG_WARN(
-                "[UNIFIED-CACHE] stage_expert_group: DMA memcpy "
-                "failed blk=%d exp=%d\n",
-                block_id, expert_id_arg);
-            // Rollback all new allocations
-            for (auto & s2 : slots) {
-                if (s2.ptr && !s2.was_existing) {
-                    remove(*s2.key, cache_entry_type::MOE_EXPERT, s2.data->layer_id, s2.data->expert_id, layout);
-                }
-            }
-            return false;
-        }
-    }
-
-    // Mark entries as IN_PROGRESS with ready_event (deferred READY).
-    // try_get_cached_with_event chains the event for downstream callers.
-    {
-        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-        for (auto & s : slots) {
-            if (s.was_existing) {
-                continue;
-            }
-            unified_cache_key ckey{ cache_entry_type::MOE_EXPERT, *s.key, s.data->layer_id, s.data->expert_id };
-            auto              it = entries_.find(ckey);
-            if (it != entries_.end()) {
-                it->second.has_ready_event  = true;
-                it->second.ready_event      = last_event;
-                it->second.layout           = layout;
-                it->second.size             = s.data->dst_size;
-                it->second.src_ptr          = s.data->src_ptr;
-                it->second.last_write_event = last_event;
-                it->second.has_write_event  = true;
-            }
-        }
-    }
-
-    GGML_SYCL_DEBUG(
-        "[UNIFIED-CACHE] stage_expert_group: blk=%d exp=%d "
-        "staged %zu tensors (total=%zu bytes)\n",
-        block_id, expert_id_arg, slots.size(), total_needed);
-    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -14878,14 +14569,14 @@ static int eviction_tier(const unified_cache_entry & entry) {
 }
 
 size_t unified_cache::evict_one(size_t /* new_size */) {
-    // NOTE: process_deferred_frees() was removed from here to fix a BCS CAT
-    // error [18].  The race: evict_one is called from stage_expert_group
-    // during prestage, which also submits BCS copies.  Processing deferred
-    // frees here would call sycl::free on entries whose barrier was submitted
-    // BEFORE the current batch's BCS copies — unmapping VRAM while BCS is
-    // still writing to nearby pages.  Callers must drain all queues and call
-    // process_deferred_frees() explicitly at safe synchronization points
-    // (e.g., the prestage yield loop after queue drain).
+    // NOTE: process_deferred_frees() is not called here (it caused a BCS CAT
+    // error [18]).  evict_one runs inside the allocation paths (ensure_cached,
+    // ensure_cached_alloc, allocate_slot), while copies that earlier fills
+    // submitted on BCS may still be in flight.  Processing deferred frees here
+    // would free entries whose barrier was submitted BEFORE those copies,
+    // unmapping VRAM while BCS is still writing to nearby pages.  Callers
+    // drain the queues and call process_deferred_frees() at safe
+    // synchronization points.
 
     // Block eviction while GPU kernels are in flight (graph_compute_impl).
     // Evicting frees VRAM that MUL_MAT_ID kernels may still reference via
@@ -15064,10 +14755,10 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
 
             // Synchronous eviction fallback (original path)
             // Always defer device memory frees.  Direct sycl::free inside evict_one
-            // causes BCS CAT errors: eviction during prestage unmaps VRAM pages
-            // while concurrent BCS copies (from stage_expert_group in the same
-            // prestage loop) are still writing to nearby pages in the same L0
-            // allocation region.  Deferred frees are processed at safe sync points
+            // causes BCS CAT errors: an eviction unmaps VRAM pages while copies
+            // that earlier fills submitted on BCS may still be writing to nearby
+            // pages in the same L0 allocation region.  Deferred frees are
+            // processed at safe sync points
             // (after queue drains) where no BCS work is in-flight.
             if (it->second.storage_owner) {
                 evicted_bytes = 0;

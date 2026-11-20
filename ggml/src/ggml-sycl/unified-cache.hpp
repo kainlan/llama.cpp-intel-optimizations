@@ -3560,17 +3560,6 @@ inline int64_t expert_group_key(int block_id, int expert_id) {
     return (static_cast<int64_t>(block_id) << 16) | static_cast<int64_t>(expert_id & 0xFFFF);
 }
 
-// Data needed to stage one tensor of an expert group.
-// fill_fn/fill_ctx allow per-tensor reorder (GPU or CPU).
-// When fill_fn is nullptr, a raw DMA memcpy is used.
-struct staging_tensor_data {
-    const void * src_ptr   = nullptr;  // host-accessible source data (AOS)
-    size_t       src_size  = 0;        // source bytes (AOS)
-    size_t       dst_size  = 0;        // destination bytes (SOA)
-    int          layer_id  = -1;
-    int          expert_id = -1;
-};
-
 // Cache entry readiness
 enum class cache_entry_state {
     READY,
@@ -4758,27 +4747,8 @@ class unified_cache {
 
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not in cache
 
-    // === Atomic Expert Group Staging/Eviction ===
-    // All 3 tensors (gate, up, down) stage or evict together -- never partial.
-
-    // Stage all 3 tensors for an expert atomically.
-    // If VRAM is insufficient, evicts cold expert groups first.
-    // If any allocation fails after eviction, rolls back partial allocations.
-    // Each staging_tensor_data provides source pointer and sizes.
-    // Each cache_layout_request provides fill_fn/fill_ctx for reorder.
-    // When request pointers are non-null, fill_fn is called per tensor.
-    // When null, raw DMA memcpy via get_dma_queue() is used.
-    // Returns true if all 3 tensors were staged successfully.
-    bool stage_expert_group(int                          block_id,
-                            int                          expert_id,
-                            const expert_tensor_group &  keys,
-                            const staging_tensor_data &  gate_data,
-                            const staging_tensor_data &  up_data,
-                            const staging_tensor_data &  down_data,
-                            ggml_layout_mode             layout,
-                            const cache_layout_request * gate_req = nullptr,
-                            const cache_layout_request * up_req   = nullptr,
-                            const cache_layout_request * down_req = nullptr);
+    // === Atomic Expert Group Eviction ===
+    // All 3 tensors (gate, up, down) evict together -- never partial.
 
     // Evict all 3 tensors for an expert atomically.
     // Removes gate, up, and down from the cache together.
@@ -4876,8 +4846,9 @@ class unified_cache {
     // Drain pending deferred frees at safe sync points (public accessor).
     // NEVER call during graph_compute — sycl::free() unmaps GPU page table
     // entries while in-flight kernels may still reference those addresses.
-    // The ONLY safe time is after queue.wait() in ggml_backend_sycl_synchronize()
-    // or during prestage yield loops (outside graph_compute_impl).
+    // Call it only outside graph_compute_impl, after the queues that could
+    // still read the freed memory have drained (for example after queue.wait()
+    // in ggml_backend_sycl_synchronize()).
     void process_deferred_frees_public();
 
     // Check if there are any pending deferred frees (device or host)

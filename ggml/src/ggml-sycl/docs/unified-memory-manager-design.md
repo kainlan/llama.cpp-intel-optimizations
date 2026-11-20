@@ -400,7 +400,7 @@ This pattern already exists and works correctly. It needs to be extended to non-
 | Unified allocation API | COMPLETE | unified_cache_allocate, unified_alloc |
 | Location-transparent weight lookup | COMPLETE | resolve_weight, weight_ptr_result |
 | Alloc registry (pointer type tracking) | COMPLETE | alloc_registry with binary search |
-| Expert group atomic staging/eviction | COMPLETE | stage_expert_group, evict_expert_group |
+| Expert group atomic eviction | COMPLETE | evict_expert_group |
 | Deferred free (safe async release) | COMPLETE | enqueue_deferred_free, process_deferred_frees |
 | Graph replay pin/unpin coordination | COMPLETE | pin, unpin, unpin_on_event |
 | Async layer prefetch | COMPLETE | queue_layer_prefetch, prefetch_worker_loop |

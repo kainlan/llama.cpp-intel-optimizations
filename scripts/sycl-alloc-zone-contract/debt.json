@@ -789,7 +789,6 @@
     {"code": "G-CATCH", "key": "unified-cache.cpp::unified_cache::shutdown_resources::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "unified-cache.cpp::unified_cache::shutdown_resources::catch_clause:all#1"},
     {"code": "G-CATCH", "key": "unified-cache.cpp::unified_cache::shutdown_resources::catch_clause:all#2"},
-    {"code": "G-CATCH", "key": "unified-cache.cpp::unified_cache::stage_expert_group::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "unified-cache.cpp::unified_cache::stream_dma::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "unified-cache.cpp::unified_cache::stream_dma::catch_clause:all#1"},
     {"code": "G-CATCH", "key": "unified-cache.cpp::unified_cache::stream_dma::catch_clause:all#2"},
