@@ -1005,6 +1005,15 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-route-counts-source.py --self-test)
     set_tests_properties(test-sycl-moe-route-counts-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The legacy expert ranking is gone: no warmup profile, gate-norm placement, periodic rerank, runtime or adaptive
+    # prestage, hash-keyed rank or eviction frequency term is left in the backend, while the planner's block-keyed rank
+    # API and its one writer stay. Run WITH --self-test so each mutant is caught by the pin it names. Text only: no
+    # device, no model.
+    add_test(NAME test-sycl-moe-legacy-ranking-removed-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-legacy-ranking-removed-source.py
+            --self-test)
+    set_tests_properties(test-sycl-moe-legacy-ranking-removed-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # llama.cpp-36j0 Task 4: the MoE executor knobs' literals, log formats, env-report rows and teardown summary.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-exec-knobs-source
