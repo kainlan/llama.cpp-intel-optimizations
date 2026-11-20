@@ -3229,29 +3229,83 @@ The arena can fail to grow for three reasons, and each prints its own line first
   min KV (<K> MB); refusing reservation`.
 
 - **The teardown refuses.** A rebuild tears the arena down first
-  (`arena_destroy()`), and a teardown can refuse: the host cannot reserve the
-  teardown's own bookkeeping, allocations are live in the arena, the host cannot
-  record the allocations it waits on, a lease does not end in time, or the device
-  refuses to free a chunk. The ensure then refuses with its own reason
-  (`TEARDOWN_REFUSED`, the cause in `zone_arena_refusal::teardown`), no arena is
-  reserved after it, and one ERROR line names the cause:
+  (`arena_destroy()`), and a teardown can refuse. What a refusal leaves depends
+  on one fact: whether the teardown had freed a chunk when it refused.
+
+  - *No chunk freed: the arena is as it was.* The causes are: the host cannot
+    reserve the teardown's own bookkeeping (`HOST_STATE`), allocations are live
+    in the arena (`LIVE_ALLOCATIONS`), a lease on an allocation does not end
+    within the drain wait (`DRAIN_TIMEOUT`), a lease on the first chunk the
+    teardown tries outlives its wait, which is the drain wait's timeout (5 s)
+    (`LEASES_OUTSTANDING`), or the device refuses to free that chunk
+    (`FIRST_FREE_FAILED`). The first two refuse before anything is closed. The
+    other three refuse after the close, and put back what it changed while every
+    allocator group lock is held. Each zone's generation is restored, and the
+    authority the close retired is reopened at that generation and published
+    again: the same object, so a handle minted before the attempt resolves to the
+    same pointer and keeps its leases. Each group gets its state and epoch back. A
+    settle the close interrupted is finished as the settle would finish it when
+    its drains are empty and its group holds no allocation (allocators reset,
+    replacements published, OPEN). Otherwise it is left RESETTING to its own wait;
+    a group that holds an allocation there also logs an ERROR line, and its
+    allocators are not reset under it. New allocations are admitted again, and a
+    later load may retry.
+  - *A chunk freed: the arena is partly freed and stays closed.* A freed chunk
+    cannot be taken back, so once one is freed the teardown frees every chunk it
+    can. It keeps a chunk the device refuses to free (`FREE_FAILED`) or one a
+    lease still holds after its wait (`LEASES_OUTSTANDING_AFTER_FREE`). The groups
+    stay CLOSING and the authorities stay retired. The recorded cause stays the
+    first one that left the arena partly freed until a teardown frees the rest. A
+    later teardown that refuses before it frees a further chunk puts back what its
+    own close changed, and its lines say the arena is still partly freed and
+    closed, as the earlier teardown left it.
+
+  Every exit after the close releases the allocator group locks and wakes every
+  thread waiting on a group's state, so a `zone_settle()` caller parked behind a
+  settle the close interrupted returns, unless the teardown gives its group back
+  RESETTING: then it waits for that settle, as it did before the teardown. Nothing in
+  the teardown aborts, and nothing is reaped, evicted or reset to make a teardown
+  succeed. The teardown never frees a chunk whose lease count it read as nonzero
+  when its wait for that chunk ended. That read is the only check: a lease is
+  taken without a lock, so a lease taken on a chunk after the teardown read its
+  count as zero is not seen, and that chunk is freed. The teardown's own ERROR
+  lines say what it did (`<T>` is the wait in ms):
 
   ```
-  [VRAM-ARENA] the arena on device <D> could not be torn down (<cause>); it stays closed to new allocations and
-  no arena is reserved over it: need scratch=<S> MB oneDNN=<O> MB runtime=<R> MB
+  [VRAM-ARENA] chunk <i> of the arena on device <D> (<ptr>, <M> MB) still has <n> lease(s) after <T> ms, so it is
+  not freed (no chunk was freed, the arena is as it was | this teardown freed no chunk, and an earlier one left the
+  arena partly freed | chunks before it were freed, the arena is partly freed); leases on the arena by site:
+  <site>=<n> ...
+  [VRAM-ARENA] the teardown of the arena on device <D> freed no chunk (<cause>[ at chunk <i>]); the arena is as it
+  was | the arena is still partly freed and closed to new allocations, as an earlier teardown left it
+  [VRAM-ARENA] the teardown of the arena on device <D> freed <F> of its <N> chunk(s) (<M> MB) and then could not
+  free chunk <i> (<cause>); the arena is partly freed and stays closed to new allocations
   ```
 
-  Every cause but the host bookkeeping one refuses after the teardown closed the
-  arena, which stays closed until a teardown completes. Every later ensure on that
-  device refuses for it, whatever the zones hold, and the load's refusal says to
-  load the model in a new process. A refusal for the host bookkeeping leaves the
-  arena as it was (`it is as it was` in the line), binds its compute zone again,
-  and says to free host memory and load again.
+  The ensure then refuses with its own reason (`TEARDOWN_REFUSED`, the cause in
+  `zone_arena_refusal::teardown`), no arena is reserved after it, and one ERROR
+  line names the cause and what the teardown left:
+
+  ```
+  [VRAM-ARENA] the arena on device <D> could not be torn down (<cause>); it is as it was: need scratch=<S> MB
+  oneDNN=<O> MB runtime=<R> MB
+  [VRAM-ARENA] the arena on device <D> could not be torn down (<cause>); it is partly freed and stays closed to new
+  allocations, and no arena is reserved over it: need scratch=<S> MB oneDNN=<O> MB runtime=<R> MB
+  ```
+
+  After a refusal that freed no chunk, the ensure binds the compute zone again,
+  and the load's refusal names the remedy for its cause (free the models and
+  contexts that hold the allocations, wait for the work on the device, free what
+  holds a pointer into the chunk, or free host memory) and says to load again.
+  After a partly freed arena, every later ensure on that device refuses for it
+  before it tries a teardown, whatever the zones hold. The load's refusal says to
+  load the model in a new process.
 
 In each case the load keeps the planning shape: it re-publishes the ring and the
 dense scratch at the load's own micro-batch, sizes the zones for them, and plans
 without the room. So no expert leaves the device for a zone that did not grow.
-After a teardown that left the arena closed, that sizing refuses the load too.
+After a teardown that left the arena partly freed and closed, that sizing refuses
+the load too.
 
 A plan that is tried and discarded publishes nothing. While a plan is computed
 the planner publishes terms of its own: the MoE host scatter scratch for the

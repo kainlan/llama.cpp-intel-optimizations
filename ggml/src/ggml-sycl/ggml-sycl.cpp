@@ -20701,11 +20701,12 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
         (void) ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &arena_refusal);
         if (arena_refusal.reason == ggml_sycl::zone_arena_refusal_reason::TEARDOWN_REFUSED &&
             ggml_sycl::zone_arena_teardown_left_closed(arena_refusal.teardown)) {
-            // The re-plan is best-effort, but an arena its teardown left closed takes no allocation, so no context can
-            // be created on it; the ensure's own ERROR line names why.
+            // The re-plan is best-effort, but an arena a teardown left partly freed and closed takes no allocation, so
+            // no context can be created on it; the ensure's own ERROR line names why. A teardown that refused before
+            // it freed a chunk left the arena as it was, and the context goes on.
             GGML_LOG_ERROR(
-                "[SYCL-PLAN] runtime context update rejected on device %d: the VRAM arena could not be torn down and "
-                "stays closed to new allocations; load the model in a new process\n",
+                "[SYCL-PLAN] runtime context update rejected on device %d: the VRAM arena is partly freed and stays "
+                "closed to new allocations; load the model in a new process\n",
                 device);
             ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(device, prev_shape.n_head,
                                                                           prev_shape.n_ubatch, prev_shape.n_ctx);
@@ -128541,7 +128542,10 @@ static void ggml_sycl_reset_moe_module_state() {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static void ggml_backend_sycl_test_fail_next_arena_free_guarded() {
     sycl_module_mutation_guard module_guard;
-    if (module_guard) ggml_sycl::unified_cache_test_fail_next_arena_free();
+    if (module_guard) {
+        // The first free a teardown tries, before it has freed any chunk.
+        ggml_sycl::unified_cache_test_fail_next_arena_free(0);
+    }
 }
 
 static void ggml_backend_sycl_test_block_finalize_reactivate() {

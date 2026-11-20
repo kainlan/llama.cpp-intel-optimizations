@@ -553,18 +553,27 @@ enum class zone_arena_refusal_reason {
     TEARDOWN_REFUSED,  // the arena could not be torn down, by this call's rebuild or by an earlier one
 };
 
-// Why a teardown of the VRAM arena refused, as the teardown records it. Every cause but HOST_STATE is found after the
-// teardown closed the arena to new allocations, and it stays closed until a later teardown completes.
+// Why a teardown of the VRAM arena refused, as the teardown records it. A teardown that refuses before it has freed
+// any chunk puts the arena back as it was before the attempt, so a later load may try the rebuild again. Only the two
+// causes found after the teardown freed a chunk, FREE_FAILED and LEASES_OUTSTANDING_AFTER_FREE, leave the arena partly
+// freed and closed to new allocations until a later teardown completes.
 enum class zone_arena_teardown_refusal {
-    NONE,              // no teardown was refused
-    HOST_STATE,        // the host could not reserve the teardown's own bookkeeping; the arena is as it was
-    LIVE_ALLOCATIONS,  // allocations were still live in the arena when the teardown closed it
-    DRAIN_SNAPSHOT,    // the host could not record the allocations the teardown waits on
-    DRAIN_TIMEOUT,     // a lease on one of its allocations did not end while the teardown waited
-    FREE_FAILED,       // the device refused to free one of its chunks, after the chunks before it were freed
+    NONE,                           // no teardown was refused
+    HOST_STATE,                     // the host could not reserve the teardown's own bookkeeping
+    LIVE_ALLOCATIONS,               // allocations were still live in the arena
+    DRAIN_TIMEOUT,                  // a lease on one of its allocations did not end while the teardown waited
+    LEASES_OUTSTANDING,             // a lease on the first chunk the teardown tried outlived its wait, so it freed none
+    FIRST_FREE_FAILED,              // the device refused to free the first chunk the teardown tried, so it freed none
+    LEASES_OUTSTANDING_AFTER_FREE,  // a lease on a chunk outlived the wait, after the chunks before it were freed
+    FREE_FAILED,                    // the device refused to free a chunk, after the chunks before it were freed
 };
 
-// Whether a teardown refused for `cause` left the arena closed to new allocations.
+// The cause of a teardown that could not free a chunk: a lease that outlived its wait kept the chunk, or the device
+// refused the free, and `chunk_freed_before` says whether the teardown had already freed a chunk.
+zone_arena_teardown_refusal zone_arena_unfreed_chunk_refusal(bool leases_outstanding, bool chunk_freed_before);
+
+// Whether a teardown refused for `cause` left the arena closed to new allocations: only one that had freed a chunk.
+// NONE, which the arena records while no teardown has refused since the last one completed, reads as open.
 bool zone_arena_teardown_left_closed(zone_arena_teardown_refusal cause);
 
 // The three zones a plan sizes, in bytes.

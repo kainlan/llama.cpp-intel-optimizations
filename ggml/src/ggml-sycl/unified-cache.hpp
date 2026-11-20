@@ -5037,8 +5037,10 @@ class unified_cache {
     // when `refusal` is given it is written with the reason and each zone's
     // need (the sizes this call decided on) and have (the arena's zones).
     // A rebuild whose teardown refuses is refused too, and no arena is
-    // reserved after it; while a refused teardown has left the arena closed,
-    // every call refuses for it, whatever the zones hold.
+    // reserved after it. A teardown that refused before it freed a chunk left
+    // the arena as it was, so a later call may try the rebuild again; while
+    // one that refused after it freed a chunk has left the arena partly freed
+    // and closed, every call refuses for it, whatever the zones hold.
     // A rebuild that live allocations block keeps the zones as they are when
     // the oneDNN Graph scratch floor is all they lack
     // (zone_arena_shortfall_is_reservation_only): the call returns true and
@@ -5141,6 +5143,11 @@ class unified_cache {
     bool     arena_chunk_has_leases(int chunk_idx) const;
     uint32_t arena_chunk_lease_count(int chunk_idx) const;
     uint32_t arena_chunk_lease_count_at(chunk_lease_tag tag) const;
+    // The leases by site, each site apart from the copies of its handles, written into `out` (`size` bytes, always
+    // NUL-terminated when `size` is not 0) as " site=N" for every count that is not zero, and empty when all are.
+    // Returns the counts' sum. It writes only into the caller's buffer and allocates nothing, so a teardown can call it
+    // after it has closed the arena.
+    uint32_t arena_chunk_lease_census(char * out, size_t size) const noexcept;
 
     // Host pinned-pool chunk lease API (dyhdl) — routes through host_arena_.
     // Returns pinned_chunk_pool::INVALID_CHUNK_HANDLE (UINT64_MAX) on miss.
@@ -5150,12 +5157,15 @@ class unified_cache {
     // last lease releases the chunk through release_marked_chunk(), which allocates nothing.
     void     host_release_chunk_lease(uint64_t handle) noexcept;
 
-    // Destroy arena (free all chunks). A refusal records its cause, which arena_teardown_refusal() reads.
+    // Destroy arena (free all chunks). A refusal records its cause, which arena_teardown_refusal() reads. One that
+    // refuses before it has freed a chunk puts the arena back as it was: each allocator group in the state it had, each
+    // retired authority reopened at the generation its handles carry. One that could not free a chunk after it freed
+    // another leaves the arena partly freed and closed, and frees no chunk a lease still holds.
     bool arena_destroy();
 
     // Why the last teardown of this cache's arena refused: NONE when none refused since the last one completed. A cause
-    // zone_arena_teardown_left_closed() names left the arena closed to new allocations, and no arena may be reserved
-    // over it.
+    // zone_arena_teardown_left_closed() names left the arena partly freed and closed to new allocations, no arena may
+    // be reserved over it, and a later refusal keeps that cause.
     zone_arena_teardown_refusal arena_teardown_refusal() const {
         return arena_teardown_refusal_.load(std::memory_order_acquire);
     }
@@ -6496,6 +6506,12 @@ class unified_cache {
     void arena_publish_authorities();
     std::shared_ptr<arena_authority> arena_close_authority(vram_zone_id zone);
     bool arena_zone_open(vram_zone_id zone) const;
+
+    // Empties the allocators of physical group `group` (KV and WEIGHT share group 0) and zeroes its zones' used
+    // counters, as a settle does once every lease on the group has ended. The caller holds that group's lock and no
+    // allocation is live in the group. It allocates nothing: a TLSF reset keeps its containers' capacity and rebuilds
+    // its one free block in it.
+    void arena_group_reset_allocators_locked(size_t group) noexcept;
 
     // Compute arena: pre-reserved VRAM for compute scratch buffers.
     // Single unified_alloc-owned device allocation made BEFORE S1-PRELOAD fills VRAM.
@@ -10053,8 +10069,21 @@ bool unified_cache_shutdown_allocation_control_census_for_test(uint64_t out[3]) 
 // arguments are invalid: the reading is VOID, never a zero that could be mistaken for "nothing allocated".
 bool unified_cache_role_bytes_for_testing(int device, alloc_role role, uint64_t * out) noexcept;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-void unified_cache_test_fail_next_arena_free();
+// The free hook: a teardown reads one free as refused by the device, the free it tries once it has freed exactly
+// `freed_chunks` of its chunks (0 fails the first free, before any chunk is freed, and 1 fails the free after the first
+// chunk was freed). The teardown that tries that free consumes the hook. One that stops before it, at a refusal before
+// the free loop or at a leased chunk before any chunk is freed, leaves it armed.
+void unified_cache_test_fail_next_arena_free(size_t freed_chunks);
+// The drain hook: the next teardown that reaches its wait for the leases on its retired authorities reads that wait as
+// timed out, and consumes the hook. A teardown that refuses before it closes the arena never reaches the wait and
+// leaves the hook armed.
+void unified_cache_test_fail_next_arena_drain();
+// Disarms both hooks above. A test that arms one calls this when it is done, so a hook no teardown reached cannot fire
+// in a later teardown or in the cache's destructor.
+void unified_cache_test_disarm_arena_teardown_failures();
 void unified_cache_test_fail_next_shutdown_clean();
+// How long a settle waits for its drains, and a teardown for the leases on its retired authorities and on each chunk
+// (5000 ms unless set). A test that sets it puts it back when it is done.
 void unified_cache_test_set_arena_drain_timeout_ms(uint32_t timeout_ms);
 void unified_cache_test_pause_zone_settle(bool pause);
 bool unified_cache_test_zone_settle_reached();
