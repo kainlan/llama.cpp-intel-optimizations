@@ -617,10 +617,11 @@ def _owning_reader_sites():
 # llama.cpp-kjef: the auto-ubatch fit's ring term (ggml_sycl_hold_ring_uncovered) reads the published plan once,
 # `const auto current`, to size the prefill ring the way the stream phase does; it reads the same snapshot the expert
 # loan transaction reads, so no new reader kind, and the statement count under that name moves 4 -> 5.
+# The per-tensor MoE expert preload that nothing called is gone, and its two cache plan reads (the non-empty test
+# before its loop and the expert placement lookup inside it) with it; the live preload keeps its own.
 INTERNAL_WRAPPER_SITES = {
     "ggml_sycl_cache_plan_owner": Counter({
         "(*ggml_sycl_cache_plan_owner(cache))": 1,
-        "(*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(tname, static_cast<int>(e));": 1,
         "(*ggml_sycl_cache_plan_owner(cache)).moe_pp_soa_promoted;": 1,
         "(*ggml_sycl_cache_plan_owner(plan_cache)).multi_device;": 1,
         "(plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty());": 1,
@@ -655,7 +656,6 @@ INTERNAL_WRAPPER_SITES = {
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() &&": 2,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !dense_name.empty()) {": 2,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !meta.tensor_name.empty()) {": 1,
-        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty()) {": 1,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 3,
         "if (!route_cache || ggml_sycl_cache_plan_owner(route_cache)->entries.empty()) {": 1,
         "if (!sec_cache || ggml_sycl_cache_plan_owner(sec_cache)->entries.empty()) {": 1,
