@@ -126640,9 +126640,10 @@ bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32
 
 // llama.cpp-38af: whether the CPU will execute any part of this model's graph,
 // read from the PUBLISHED placement plan -- the same authority supports_op
-// consults when it declines an op because its data is host-planned. The result
-// names the clause that fired (nullptr = none), and each clause is one of those
-// declines:
+// consults when it declines an op because its data is host-planned, together
+// with the one type decline that holds wherever the plan put the weight. The
+// result names the clause that fired (nullptr = none), and each clause is one of
+// those declines:
 //   "layer"   a dense layer planned on the host (layer_device < 0;
 //             ggml_sycl_op_is_planned_on_host's "layer_device<0").
 //   "kv"      a layer whose KV is planned on the host, using the plan's own
@@ -126650,6 +126651,16 @@ bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32
 //             refresh_kv_byte_totals counts it); a layer with no KV bytes (a
 //             recurrent or KV-less layer) owes nothing here
 //             (ggml_sycl_tensor_is_in_kv_host_buft).
+//   "dense-type" a dense weight whose type has no device MUL_MAT kernel: the
+//             MUL_MAT case of supports_op refuses it at its type check
+//             (ggml_sycl_mul_mat_type_supported, which delegates to
+//             dense_mul_mat_type_supported in unified-types.hpp, the list this
+//             clause asks) wherever the weight sits, so the CPU runs that MUL_MAT
+//             even inside a device-planned layer. BF16 counts as run on the
+//             device: supports_op admits a BF16 weight through its native route
+//             before that check, by shape and placement the plan cannot see. A
+//             gather-only weight (get_rows_only) is never a MUL_MAT operand, and a
+//             type the inventory did not carry (GGML_TYPE_COUNT) gives no verdict.
 //   "dense"   a dense weight whose residency is host by supports_op's exact rule,
 //             ggml_sycl_get_planned_weight_residency (common.hpp): when the plan
 //             has a layer_device row for the weight's layer that row decides and
@@ -126702,6 +126713,11 @@ static const char * ggml_sycl_plan_cpu_work_reason(const ggml_sycl::placement_pl
     std::unordered_map<std::string, bool> expert_tensor_has_device_expert;
     for (const auto & e : plan.entries) {
         if (e.expert_id < 0) {
+            // Ahead of the layer_device skip: a type decline holds wherever the weight sits.
+            if (!e.get_rows_only && e.type < GGML_TYPE_COUNT && e.type != GGML_TYPE_BF16 &&
+                !ggml_sycl::dense_mul_mat_type_supported(e.type)) {
+                return "dense-type";
+            }
             if (e.layer_id >= 0 && plan.layer_device.count(e.layer_id) != 0) {
                 continue;  // layer_device decides this layer's dense weights
             }

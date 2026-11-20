@@ -23,7 +23,8 @@
 # graph and trip the dkw0 replay-futility detector. So the backend exports ONE
 # predicate computed from its own placement plan (ggml_backend_sycl_plan_has_cpu_work:
 # a host-planned dense layer or weight under supports_op's own residency rule,
-# host-planned KV, or a fully host-planned expert tensor), llama-context ORs it
+# host-planned KV, a dense weight whose type has no device MUL_MAT kernel, or a
+# fully host-planned expert tensor), llama-context ORs it
 # with its own partial-offload test, and the choice is re-made right before every
 # ggml_backend_sched_new() because the auto-ubatch resyncs re-plan after the
 # constructor's buft enumeration.
@@ -232,6 +233,8 @@ def check_vi_predicate_reads_the_plan(t):
             and "[SYCL-CPU-ACT]" in wrapper     # which clause fired, for the -v log
             and "layer_device" in helper        # host-planned dense layer
             and "get_kv_device(" in helper      # host-planned KV
+            and "dense_mul_mat_type_supported(" in helper  # a dense weight type with no device MUL_MAT kernel
+            and "get_rows_only" in helper       # a gather-only weight is never a MUL_MAT operand
             and "expert_on_device(" in helper   # fully host-planned expert tensor
             and "multi_device" in helper        # dense residency follows supports_op's rule
             and "target_device" in helper

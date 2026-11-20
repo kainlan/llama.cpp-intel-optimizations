@@ -703,7 +703,8 @@ static ggml_backend_buffer_type_t llama_context_sycl_cpu_activation_buft(ggml_ba
 
 // llama.cpp-38af: the backend's own answer to "will the CPU execute any part of
 // this graph", read from its published placement plan (host-planned dense layer,
-// host-planned KV, or a fully host-planned expert tensor). False for a non-SYCL
+// host-planned KV, a dense weight whose type has no device MUL_MAT kernel, a
+// host-planned dense weight, or a fully host-planned expert tensor). False for a non-SYCL
 // device, no active plan, or a SYCL module that predates the export, in which
 // case the caller keeps the generic host buft.
 static bool llama_context_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
