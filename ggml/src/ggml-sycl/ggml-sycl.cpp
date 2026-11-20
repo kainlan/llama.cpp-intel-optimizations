@@ -7286,15 +7286,12 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         // to GPU0 (device_id=0) even though GPU0 can't hold them all.  The fused
         // dispatch would hang trying to upload 128 experts per layer into 10GB.
         //
-        // Phase 4 SKIPPED: dispatch handles CPU fallback itself.
-        // Experts stay device_id=0 from Phase 1 with device_ptr=nullptr, and
-        // dispatch asks the unified cache where each one is: an expert resident
-        // in VRAM dispatches on the GPU, any other falls back to the CPU.
-        // Phase 4 had bugs: gate/up/down spilled independently, ran before
-        // popularity ranking. The dispatch fallback chain handles it correctly.
-        // Phase 4 (CPU spill) REMOVED — dispatch handles CPU fallback via
-        // is_expert_resident() checks.  Experts not in VRAM fall through to
-        // CPU dispatch naturally.
+        // Phase 4 SKIPPED: no CPU spill here. Experts stay device_id=0 from
+        // Phase 1 with device_ptr=nullptr, and dispatch asks the unified cache
+        // where each one is. An expert resident in VRAM runs on the GPU. A miss
+        // runs on the CPU under hybrid dispatch (skip_cpu_routed_experts);
+        // otherwise update_moe_ptr_table installs the expert's host-pinned AOS
+        // copy in the pointer table and the GPU kernel reads it in place.
 
         // Log distribution summary (cache-based, after Phase 2 upload)
         {
