@@ -12,8 +12,8 @@ passed in. This gate holds that by text:
   S1  the header includes the standard library only, from a short list of headers a pure computation needs: no quoted
       include, no ggml, no SYCL, nothing outside the list;
   S2  nothing mutable lives outside a state struct the caller owns: no `static`, `thread_local`, `extern`, `mutable`
-      or `volatile` anywhere (a namespace constant is `constexpr`), and no atomic or lock, so the policy has nothing
-      to synchronise because it shares nothing;
+      or `volatile` anywhere (a namespace constant is `constexpr`), no non-const `inline` variable, and no atomic
+      or lock, so the policy has nothing to synchronise because it shares nothing;
   S3  no device, allocation-through-the-cache, logging or environment access: no `sycl`, `malloc`/`free`, the unified
       cache's names, `GGML_LOG`, `printf`, `std::cout`/`cerr` or `getenv`.
 
@@ -40,6 +40,10 @@ ALLOWED_INCLUDES = {
     "algorithm", "array", "cmath", "cstddef", "cstdint", "cstring", "limits", "numeric", "utility", "vector",
 }
 STATE_KEYWORDS = re.compile(r"\b(?:static|thread_local|extern|mutable|volatile)\b")
+# A C++17 `inline` variable is a global with external linkage and needs none of the words above. `inline` followed by
+# a declaration with no parenthesis before its `=`, `;` or `{` is a variable; a function has its `(` first. `inline
+# const` and `inline constexpr` are constants and allowed.
+INLINE_VARIABLE = re.compile(r"\binline\s+(?!const\b|constexpr\b)[^;(){}=]*[\w>&*]\s*(?:=|;|\{)")
 SYNC_NAMES = re.compile(
     r"\bstd::(?:atomic\w*|mutex|shared_mutex|recursive_mutex|lock_guard|unique_lock|call_once|once_flag)\b"
 )
@@ -93,6 +97,10 @@ def check(raw: str) -> None:
     if m:
         line = stateless.count("\n", 0, m.start()) + 1
         raise ContractError(f"FAIL [pin S2]: `{m.group(0)}` at line {line}: state outside the caller's struct")
+    m = INLINE_VARIABLE.search(stateless)
+    if m:
+        line = stateless.count("\n", 0, m.start()) + 1
+        raise ContractError(f"FAIL [pin S2]: an inline variable at line {line}: global state outside the caller")
     m = SYNC_NAMES.search(code)
     if m:
         raise ContractError(f"FAIL [pin S2]: `{m.group(0)}`: the policy shares nothing and needs no atomic or lock")
@@ -147,6 +155,9 @@ def self_test(raw: str) -> int:
                                                 ("#include <cstdint>\n", ""), (anchor + "\n", "")])
     expect_fail("static-counter", "S2",
                 [(ns, ns + "inline int next_id() {\n    static int n = 0;\n    return ++n;\n}\n")])
+    expect_fail("inline-global-vector", "S2", [(ns, ns + "inline std::vector<int> g_scratch;\n")])
+    expect_fail("inline-global-counter", "S2", [(ns, ns + "inline int g_n = 0;\n")])
+    expect_fail("inline-global-braced", "S2", [(ns, ns + "inline int g_k{5};\n")])
     expect_fail("thread-local-scratch", "S2", [(ns, ns + "thread_local std::vector<int> scratch;\n")])
     expect_fail("extern-state", "S2", [(ns, ns + "extern int g_swaps;\n")])
     expect_fail("mutable-member", "S2", [("    int                            n_blocks  = 0;",

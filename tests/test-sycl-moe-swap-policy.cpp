@@ -159,23 +159,55 @@ static void test_defaults() {
     CHECK(near(p.margin, 1.5));
 }
 
-// A host expert whose usage is under min_usage is not proposed, one at min_usage is.
+// A host expert whose usage is under min_usage is not proposed, one at min_usage is. Each sub-case says which rule it
+// isolates: the margin test (host >= victim + margin) is the other rule that refuses a cold host expert, so a case only
+// has power over min_usage when the margin would let the host expert through.
 static void test_candidate_below_min_usage_is_not_proposed() {
     const moe_swap_params          p;
     std::vector<moe_swap_proposal> out;
     {
         table t(1, 8);
         t.resident_prefix(0, 4);
-        t.decode[0][5] = 1;  // usage 1 < 2.0
+        t.decode[0][5] = 1;  // usage 1 < 2.0 (and 1 < 0 + 1.5: both rules refuse it, so this is the plain case)
         moe_swap_state s(1, 8);
         CHECK(run_period(s, p, t, out) == MOE_SWAP_STATUS_ADAPTED);
         CHECK(out.empty());
         CHECK(near(s.usage_of(0, 5), 0.7));  // it still counted, and decayed
     }
     {
+        // Isolates min_usage: with a margin of 0.5 the margin lets usage 1 through (1 >= 0 + 0.5), only the default
+        // min_usage of 2.0 refuses it.
+        moe_swap_params loose;
+        loose.margin = 0.5;
         table t(1, 8);
         t.resident_prefix(0, 4);
-        t.decode[0][5] = 2;  // usage exactly min_usage, resident experts at 0
+        t.decode[0][5] = 1;
+        moe_swap_state s(1, 8);
+        CHECK(run_period(s, loose, t, out) == MOE_SWAP_STATUS_ADAPTED);
+        CHECK(out.empty());
+    }
+    {
+        // Isolates min_usage the other way: at the default margin usage 2 clears 0 + 1.5, only a min_usage of 3
+        // refuses it, and usage 3 is at that min_usage and proposed.
+        moe_swap_params strict;
+        strict.min_usage = 3.0;
+        table t2(1, 8);
+        t2.resident_prefix(0, 4);
+        t2.decode[0][5] = 2;
+        moe_swap_state s2(1, 8);
+        CHECK(run_period(s2, strict, t2, out) == MOE_SWAP_STATUS_ADAPTED);
+        CHECK(out.empty());
+        table t3(1, 8);
+        t3.resident_prefix(0, 4);
+        t3.decode[0][5] = 3;
+        moe_swap_state s3(1, 8);
+        CHECK(run_period(s3, strict, t3, out) == MOE_SWAP_STATUS_ADAPTED);
+        CHECK(out.size() == 1);
+    }
+    {
+        table t(1, 8);
+        t.resident_prefix(0, 4);
+        t.decode[0][5] = 2;  // usage exactly min_usage (and 2 >= 0 + 1.5), resident experts at 0
         moe_swap_state s(1, 8);
         CHECK(run_period(s, p, t, out) == MOE_SWAP_STATUS_ADAPTED);
         CHECK(out.size() == 1);
@@ -403,6 +435,7 @@ static void test_a_blocks_resident_count_is_invariant() {
     CHECK(r.proposals > 0);  // positive control: the run did swap
     CHECK(r.counts_invariant);
     CHECK(r.moves_are_real);
+    CHECK(!r.skipped_block_chosen);  // the block with no slot and the block with every slot got no proposal
 }
 
 // One call never admits and evicts the same expert, and never proposes an expert twice.
@@ -638,9 +671,11 @@ static void test_cumulative_counts_are_absorbed_as_deltas() {
 // A call that reaches no period boundary reads nothing and allocates nothing, and a boundary with no candidate
 // allocates nothing either once the state exists.
 static void test_a_call_without_a_boundary_is_cheap_and_does_not_allocate() {
-    const moe_swap_params          p;
-    table                          t(48, 512);
-    moe_swap_state                 s(48, 512);
+    const moe_swap_params p;
+    table                 t(48, 512);
+    const size_t          at_start = g_allocs;
+    moe_swap_state        s(48, 512);
+    CHECK(g_allocs > at_start);  // positive control: the replaced operator new does count (the state's vectors)
     std::vector<moe_swap_proposal> out;
     for (int b = 0; b < 48; ++b) {
         t.resident_prefix(b, 92);
@@ -678,7 +713,10 @@ static void test_a_call_of_the_wrong_shape_is_rejected() {
 
 // The call sits at a graph boundary on the decode path of a 48 x 512 model, so replay one at that size: skewed routing,
 // 92 resident experts per block, every boundary's proposals executed. The cost is a bound on the host, stated here and
-// in the header, loose enough for a loaded machine and far under a quadratic or per-token cost.
+// in the header. The time check is loose on purpose (measured about 25 ms, bound two seconds) so a loaded host cannot
+// fail it: it catches a gross regression only, such as a quadratic pass or an allocation per call. That a boundary is
+// not taken at every token, which would cost about four times as much and still pass a time bound, is held by
+// counting the statuses instead: one boundary in four, the rest cheap WAITING calls.
 static void test_replay_at_the_size_of_a_48_by_512_model_stays_within_a_time_bound() {
     const moe_swap_params          p;
     table                          t(48, 512);
@@ -692,6 +730,7 @@ static void test_replay_at_the_size_of_a_48_by_512_model_stays_within_a_time_bou
     uint32_t  seed        = 777;
     size_t    proposals   = 0;
     size_t    boundaries  = 0;
+    size_t    waiting     = 0;
     bool      cap_held    = true;
     const int tokens      = 1024;
     double    boundary_us = 0.0;
@@ -716,9 +755,11 @@ static void test_replay_at_the_size_of_a_48_by_512_model_stays_within_a_time_bou
             t.apply(out);
         } else {
             other_us += us;
+            waiting += st == MOE_SWAP_STATUS_WAITING ? 1 : 0;
         }
     }
     CHECK(boundaries == static_cast<size_t>(tokens / p.period));
+    CHECK(waiting == static_cast<size_t>(tokens) - boundaries);
     CHECK(proposals > 0);
     CHECK(cap_held);
     for (int b = 0; b < 48; ++b) {
@@ -727,7 +768,7 @@ static void test_replay_at_the_size_of_a_48_by_512_model_stays_within_a_time_bou
     std::printf("replay 48 x 512: %zu boundaries, %.1f us per boundary, %.3f us per other call, %zu swaps\n",
                 boundaries, boundary_us / static_cast<double>(boundaries),
                 other_us / static_cast<double>(tokens - static_cast<int>(boundaries)), proposals);
-    CHECK(boundary_us + other_us < 2.0e6);  // all 1024 calls together under two seconds
+    CHECK(boundary_us + other_us < 2.0e6);  // all 1024 calls together under two seconds: a gross regression only
 }
 
 int main() {

@@ -18,6 +18,8 @@
 //     still follows its counts and still decays, so its usage is current when it becomes eligible.
 //   - The two sets that make a pair are disjoint (host and resident), and each expert is in at most one pair, so an
 //     expert is never both admitted and evicted in one call and never proposed twice.
+//   - When a swap lands and which swaps count as in flight is the driver's business: the header takes one `in_flight`
+//     flag and never learns of a swap's progress.
 //   - While the caller reports swaps in flight, a period boundary proposes nothing and does not decay, and that
 //     boundary is not made up: the next one is `period` tokens later. The counts it did not absorb are absorbed by
 //     the next boundary, so nothing is lost.
@@ -108,8 +110,9 @@ struct moe_swap_ranked {
     int    expert = 0;
 };
 
-// Usage below this cannot change any decision (it is far under any min_usage) and would reach denormal numbers after a
-// few thousand periods, where a multiply is slow, so a decay flushes it to zero.
+// Usage below this would reach denormal numbers after a few thousand periods, where a multiply is slow, so a decay
+// flushes it to zero. Values below it are all zero afterwards and tie by expert index, which is far under any
+// min_usage and below any difference that matters to the margin.
 constexpr double MOE_SWAP_USAGE_FLOOR = 1e-12;
 
 // Everything the policy remembers between calls. Built once for a model's dimensions and owned by the caller.
