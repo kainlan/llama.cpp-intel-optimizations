@@ -8,7 +8,9 @@ the rows and bytes asked and the device; graph_compute's catch drains the queue 
 Host-only: reads sources, builds nothing, loads no model and touches no device.
 
 What this gate pins:
-  - the helper: [[noreturn]], one WARN naming tensor, buffer, rows, bytes and device, then the throw, and no abort;
+  - the helper: [[noreturn]], one WARN naming tensor, buffer, rows, bytes and device, then the throw, and no abort; it
+    takes `reason` as a reference to a character array, because the exception keeps that pointer and a `const char *`
+    from a temporary would dangle;
   - the row-map staging (moe_pp_row_mappings) refuses when its allocation is null;
   - the per-expert path's output staging (moe_pp_dst_contiguous) refuses when its allocation is null, where it used to
     run on with a null base that every later kernel wrote through;
@@ -22,6 +24,9 @@ What this gate pins:
     expert unresolved before submit) and the island all sit inside it, and its handler for ggml_sycl_fallback_error
     runs the exit work and rethrows. The normal exit and that handler are the lambda's only callers: a refusal only
     refuses. The row-map refusal stays before the try (nothing is claimed or submitted there yet);
+  - the transient down SOA: one lambda releases it, at most once (a flag set before the release). The exit work calls
+    it, and so do the two refusals that leave before the try (the row-map staging and a staged ring batch), each right
+    before it throws, so no exit of the op keeps the transient layout resident. No other site of the op calls it;
   - none of the old abort texts is left in the backend;
   - the private-testing failpoints that let the device test force each refusal exist only under
     GGML_SYCL_Q1_NVFP4_ROUTE_TESTING (the private fixture objects), fold to the constant false otherwise, and sit in
@@ -48,14 +53,16 @@ CMAKE = read(CMAKE_REL)
 TEST = read(TEST_REL)
 
 MMID_SIG = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {"
-HELPER_SIG = "[[noreturn]] static void ggml_sycl_moe_pp_refuse_staging("
+HELPER_SIG = "template <size_t N> [[noreturn]] static void ggml_sycl_moe_pp_refuse_staging("
+HELPER_DECL = (HELPER_SIG + "const ggml_tensor * src0, int device, const char * buffer, size_t rows, size_t bytes, "
+               "const char (&reason)[N]) {")
 HELPER_WARN = ('GGML_LOG_WARN("[MOE-PP-STAGING] refused tensor=%s buffer=%s rows=%zu bytes=%zu device=%d')
 HELPER_THROW = "throw ggml_sycl_fallback_error(reason);"
 REFUSE = "ggml_sycl_moe_pp_refuse_staging("
 
 ROW_MAP_SITE = ("if (!GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_ROW_MAP_STAGING)) { "
                 "dev_row_mappings.alloc(*stream, ctx.device, row_maps_total, \"moe_pp_row_mappings\"); } "
-                "if (!dev_row_mappings.get()) { "
+                "if (!dev_row_mappings.get()) { release_prompt_down_soa_once(false); "
                 "ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, \"moe_pp_row_mappings\", row_maps_total,")
 
 DST_SITE = ("if (!GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_DST_STAGING)) { "
@@ -86,7 +93,7 @@ RETAIN_STEPS = (
     "pp_moe_onednn_scratch_claim_state.record(prompt_down_dispatch_done);",
     "ggml_sycl::retain_handles_until_event(std::move(pp_gpu_leases),",
     "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device);",
-    "ggml_sycl_release_moe_tensor_layout(src0, ctx.device, GGML_LAYOUT_SOA);",
+    "release_prompt_down_soa_once(true);",
 )
 RETAIN_ONCE = ("bool pp_exit_work_done = false; auto retain_pp_dispatch_until_done = [&]() { "
                "if (pp_exit_work_done) { return; } pp_exit_work_done = true; sycl::event prompt_down_dispatch_done;")
@@ -100,6 +107,20 @@ SECONDARY_THROW = "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained prompt s
 UNRESOLVED_THROW = "throw ggml_sycl_fallback_error(\"MUL_MAT_ID selected prompt expert unresolved before submit\");"
 ISLAND_CALL = "dispatch_host_expert_groups(pp_host_groups); pp_phase_log(\"pp-host-dispatch-done\","
 NORMAL_EXIT = "retain_pp_dispatch_until_done(); pp_phase_log(\"pp-retain-submitted\","
+
+SOA_FLAG = ("const bool release_prompt_down_soa_after_dispatch = "
+            "prompt_down_soa_planned_pp && ggml_sycl_moe_prompt_down_transient_soa_enabled();")
+SOA_SIG = "auto release_prompt_down_soa_once = [&](bool after_dispatch) {"
+SOA_ONCE = ("bool pp_down_soa_released = false; " + SOA_SIG + " if (!release_prompt_down_soa_after_dispatch || "
+            "pp_down_soa_released) { return; } pp_down_soa_released = true;")
+SOA_STEPS = (
+    "(void) graph_release_moe_expert_leases_for_tensor_layout(&ctx, src0, ctx.device, GGML_LAYOUT_SOA);",
+    "const bool released = ggml_sycl_release_moe_tensor_layout(src0, ctx.device, GGML_LAYOUT_SOA);",
+)
+SOA_CALL = "release_prompt_down_soa_once("
+STAGED_RING_SITE = ("if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt_batch_result.batch)) { "
+                    "release_prompt_down_soa_once(false); throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained prompt "
+                    "per-expert path refused a staged ring slot\"); }")
 
 OLD_ABORTS = (
     "failed to allocate PP row-map staging",
@@ -144,10 +165,11 @@ def mutate_in(sycl: str, signature: str, old: str, new: str) -> str:
 
 
 def claim_helper(sycl: str) -> bool:
-    """One [[noreturn]] helper: a WARN naming tensor, buffer, rows, bytes and device, then the fallback throw."""
+    """One [[noreturn]] helper, taking `reason` as an array reference: a WARN naming tensor, buffer, rows, bytes and
+    device, then the fallback throw."""
     n = norm(sycl)
     h = body(n, HELPER_SIG)
-    return (n.count(HELPER_SIG) == 1 and h != "" and ordered(h, HELPER_WARN, HELPER_THROW)
+    return (n.count(HELPER_SIG) == 1 and n.count(HELPER_DECL) == 1 and h != "" and ordered(h, HELPER_WARN, HELPER_THROW)
             and "GGML_ABORT" not in h and "GGML_LOG_INFO" not in h)
 
 
@@ -157,10 +179,17 @@ def test_helper():
 
 
 def test_helper_mutants():
-    assert not claim_helper(mutate(SYCL, "bytes, device); " + HELPER_THROW, 'bytes, device); GGML_ABORT("%s", reason);'))
-    assert not claim_helper(mutate(SYCL, "GGML_LOG_WARN(\"[MOE-PP-STAGING]", "GGML_LOG_INFO(\"[MOE-PP-STAGING]"))
-    assert not claim_helper(mutate(SYCL, "rows=%zu bytes=%zu", "rows=%zu"))
-    assert not claim_helper(mutate(SYCL, HELPER_SIG, "static void ggml_sycl_moe_pp_refuse_staging("))
+    c = claim_helper
+    # The helper aborts instead of throwing (killed by the ordered WARN then throw, and by the no-abort check).
+    assert not c(mutate(SYCL, "bytes, device); " + HELPER_THROW, 'bytes, device); GGML_ABORT("%s", reason);'))
+    # The refusal logs below the default verbosity (killed by HELPER_WARN and by the no-INFO check).
+    assert not c(mutate(SYCL, "GGML_LOG_WARN(\"[MOE-PP-STAGING]", "GGML_LOG_INFO(\"[MOE-PP-STAGING]"))
+    # The WARN stops naming the bytes asked (killed by HELPER_WARN).
+    assert not c(mutate(SYCL, "rows=%zu bytes=%zu", "rows=%zu"))
+    # The helper loses [[noreturn]] (killed by the HELPER_SIG count).
+    assert not c(mutate(SYCL, "template <size_t N> [[noreturn]] static", "template <size_t N> static"))
+    # `reason` goes back to a plain pointer, so a temporary's c_str() compiles again (killed by HELPER_DECL).
+    assert not c(mutate(SYCL, "const char (&reason)[N]) {", "const char * reason) {"))
 
 
 # ---- each site refuses ------------------------------------------------------------------------------------------------
@@ -188,8 +217,8 @@ def test_sites():
 def test_sites_mutants():
     c = claim_sites
     # The row-map site aborts again, or reads past a null buffer.
-    assert not c(mutate(SYCL, "if (!dev_row_mappings.get()) { ggml_sycl_moe_pp_refuse_staging(",
-                        "if (!dev_row_mappings.get()) { GGML_ABORT(\"x\"); ggml_sycl_moe_pp_refuse_staging_x("))
+    assert not c(mutate(SYCL, "release_prompt_down_soa_once(false); ggml_sycl_moe_pp_refuse_staging(src0",
+                        "release_prompt_down_soa_once(false); GGML_ABORT(\"x\"); ggml_sycl_moe_pp_refuse_staging_x(src0"))
     # The output staging is used with no check, as it was.
     assert not c(mutate(SYCL, "if (!dst_contiguous_ptr) { ggml_sycl_moe_pp_refuse_staging(",
                         "if (false) { ggml_sycl_moe_pp_refuse_staging("))
@@ -287,6 +316,54 @@ def test_unwind_mutants():
     assert not c(m)
 
 
+def claim_soa_release(sycl: str) -> bool:
+    """One lambda releases the transient down SOA at most once. The exit work, the row-map refusal and the staged ring
+    refusal call it (each refusal right before its throw), and nothing else in the op does."""
+    m = mmid_of(sycl)
+    s = body(m, SOA_SIG)
+    r = body(m, RETAIN_SIG)
+    return (m.count(SOA_FLAG) == 1 and m.count(SOA_ONCE) == 1 and m.count("pp_down_soa_released = true;") == 1
+            and s != "" and ordered(s, *SOA_STEPS)
+            and ordered(m, SOA_FLAG, SOA_ONCE, ROW_MAP_SITE, STAGED_RING_SITE, RETAIN_SIG)
+            and m.count(ROW_MAP_SITE) == 1 and m.count(STAGED_RING_SITE) == 1
+            and r.count("release_prompt_down_soa_once(true);") == 1 and m.count(SOA_CALL) == 3
+            and m.count(SOA_STEPS[1]) == 2)
+
+
+def test_soa_release():
+    m = mmid_of(SYCL)
+    assert claim_soa_release(SYCL), first_missing(SYCL_REL + ": body of ggml_sycl_mul_mat_id", m, SOA_FLAG, SOA_ONCE,
+                                                  *SOA_STEPS, ROW_MAP_SITE, STAGED_RING_SITE, signature=MMID_SIG)
+
+
+def test_soa_release_mutants():
+    c = claim_soa_release
+    # The row-map refusal throws without releasing the transient SOA (killed by ROW_MAP_SITE).
+    assert not c(mutate(SYCL, "if (!dev_row_mappings.get()) { release_prompt_down_soa_once(false); ",
+                        "if (!dev_row_mappings.get()) { "))
+    # The staged ring refusal throws without releasing it (killed by STAGED_RING_SITE).
+    assert not c(mutate(SYCL, "release_prompt_down_soa_once(false); throw ggml_sycl_fallback_error(\"MUL_MAT_ID "
+                              "retained prompt per-expert path", "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained "
+                              "prompt per-expert path"))
+    # The staged ring release placed after the throw, where it never runs (killed by STAGED_RING_SITE).
+    assert not c(mutate(SYCL, STAGED_RING_SITE, STAGED_RING_SITE.replace("release_prompt_down_soa_once(false); ", "")
+                        .replace("slot\"); }", "slot\"); release_prompt_down_soa_once(false); }")))
+    # The once guard no longer checks its flag, or never sets it (killed by SOA_ONCE and the flag-set count).
+    assert not c(mutate(SYCL, "|| pp_down_soa_released) { return; }", ") { return; }"))
+    assert not c(mutate(SYCL, "{ return; } pp_down_soa_released = true; (void) graph_release",
+                        "{ return; } (void) graph_release"))
+    # The lambda forgets a release step (each killed by the ordered SOA_STEPS).
+    assert not c(mutate_in(SYCL, SOA_SIG, SOA_STEPS[0], "(void) 0;"))
+    assert not c(mutate_in(SYCL, SOA_SIG, SOA_STEPS[1], "const bool released = false;"))
+    # The exit work stops calling it (killed by the call in the exit work's body), or releases inline again (killed
+    # by that call and by the count of the release step, which the batched executor's own release shares).
+    assert not c(mutate_in(SYCL, RETAIN_SIG, "release_prompt_down_soa_once(true);", "(void) 0;"))
+    assert not c(mutate_in(SYCL, RETAIN_SIG, "release_prompt_down_soa_once(true);", " ".join(SOA_STEPS)))
+    # A refusal inside the try releases it itself, before the exit work's marker (killed by the call count).
+    assert not c(mutate(SYCL, SRC1_REFUSE_LAMBDA, SRC1_REFUSE_LAMBDA.replace("{ ", "{ release_prompt_down_soa_once("
+                                                                                   "false); ", 1)))
+
+
 def claim_no_old_aborts(sycl: str) -> bool:
     """None of the abort texts the staging sites carried is left anywhere in the backend file."""
     n = norm(sycl)
@@ -299,6 +376,7 @@ def test_no_old_aborts():
 
 
 def test_no_old_aborts_mutants():
+    # An old abort text comes back anywhere in the file (each killed by its own entry in OLD_ABORTS).
     for t in OLD_ABORTS:
         assert not claim_no_old_aborts(SYCL + '\nvoid f() { GGML_ABORT("' + t + '"); }\n')
 
@@ -350,10 +428,13 @@ def test_device_test():
 def test_device_test_mutants():
     c = claim_device_test
     flat = " ".join(CMAKE.split())
+    # The test loses its `model` label, so a sweep that excludes model-loading tests runs it (killed by REG_STEPS[3]).
     assert not c(flat.replace("LABELS \"sycl;moe;device;B50;model\" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE",
                               "LABELS \"sycl;moe;device;B50\" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE"), TEST)
+    # The test links the plain backend, which has no failpoints (killed by REG_STEPS[1]).
     assert not c(flat.replace("target_link_libraries(test-moe-pp-staging-refusal PRIVATE ggml-sycl-private-fixtures)",
                               "target_link_libraries(test-moe-pp-staging-refusal PRIVATE ggml-sycl)"), TEST)
+    # The test stops arming one failpoint (killed by the FAILURES check on the test source).
     assert not c(CMAKE, TEST.replace(FAILURES[0], "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_NONE"))
 
 

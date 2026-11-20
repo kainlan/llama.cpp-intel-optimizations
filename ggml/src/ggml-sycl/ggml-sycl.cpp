@@ -86610,13 +86610,16 @@ static const char * ggml_sycl_moe_q1_nvfp4_refusal_text(const char * reason) {
 
 // A staging buffer the MoE prompt path asks for and does not get is a fit problem, not a broken part: the op is
 // refused and the process goes on. The WARN names what did not fit; graph_compute's catch drains the queue and turns
-// the exception into GGML_STATUS_FAILED. `reason` must be a string literal: the exception keeps the pointer.
+// the exception into GGML_STATUS_FAILED. ggml_sycl_fallback_error keeps the pointer it is given, not a copy, so
+// `reason` must outlive the unwind: it is taken as a reference to a character array, which a string literal binds
+// to and a `const char *` (a temporary std::string's c_str() among them) does not, so that mistake does not compile.
+template <size_t N>
 [[noreturn]] static void ggml_sycl_moe_pp_refuse_staging(const ggml_tensor * src0,
                                                          int                 device,
                                                          const char *        buffer,
                                                          size_t              rows,
                                                          size_t              bytes,
-                                                         const char *        reason) {
+                                                         const char (&reason)[N]) {
     GGML_LOG_WARN(
         "[MOE-PP-STAGING] refused tensor=%s buffer=%s rows=%zu bytes=%zu device=%d: the allocation was not granted\n",
         src0 ? src0->name : "?", buffer, rows, bytes, device);
@@ -93122,6 +93125,31 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                 !g_ggml_sycl_graph_recording;
         const bool release_prompt_down_soa_after_dispatch =
             prompt_down_soa_planned_pp && ggml_sycl_moe_prompt_down_transient_soa_enabled();
+        // Releases the transient down-projection SOA of this op, at most once. The per-expert path's exit work calls
+        // it behind its done marker, and the two refusals that leave before that path's try (the row-map staging and
+        // a staged ring batch) call it before they throw, so no exit of this op keeps the transient layout resident.
+        // The batched executor releases it behind its own marker and keeps its expert leases until that marker.
+        // after_dispatch says which exit it is in the log line: 0 for a refusal that submitted nothing.
+        bool pp_down_soa_released         = false;
+        auto release_prompt_down_soa_once = [&](bool after_dispatch) {
+            if (!release_prompt_down_soa_after_dispatch || pp_down_soa_released) {
+                return;
+            }
+            pp_down_soa_released = true;
+            (void) graph_release_moe_expert_leases_for_tensor_layout(&ctx, src0, ctx.device, GGML_LAYOUT_SOA);
+            const bool released = ggml_sycl_release_moe_tensor_layout(src0, ctx.device, GGML_LAYOUT_SOA);
+            if (released && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                static std::atomic<int> transient_down_release_log{ 0 };
+                if (transient_down_release_log.fetch_add(1, std::memory_order_relaxed) < 96) {
+                    fprintf(stderr,
+                            "[MOE-PHASE-LAYOUT] tensor=%s device=%d layout=%s released_after_dispatch=%d "
+                            "waited_after_dispatch=0 reason=%s\n",
+                            src0 && src0->name ? src0->name : "?", ctx.device,
+                            ggml_sycl_layout_mode_name(GGML_LAYOUT_SOA), after_dispatch ? 1 : 0,
+                            after_dispatch ? "prompt-down-transient" : "prompt-down-transient-refused");
+                }
+            }
+        };
         secondary_dispatch_ctx pp_sec_ctx = { stream, src0,  src1_original, dst_original,  ne00,
                                               ne01,   ne11,  nb11,          nb12,          nb1,
                                               nb2,    false, nullptr,       sycl::event{}, dst };
@@ -93556,10 +93584,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 dev_row_mappings.alloc(*stream, ctx.device, row_maps_total, "moe_pp_row_mappings");
             }
             if (!dev_row_mappings.get()) {
-                // No scratch slot is claimed and no other staging is allocated yet. What is live here releases through
-                // its owner on unwind (the retained prompt batch's leases, the ids snapshot), the eviction guard of
-                // graph compute holds until graph_compute's catch has drained the queue, and nothing of this op that
-                // reads the row maps has been submitted.
+                // No scratch slot is claimed and no other staging is allocated yet, and nothing of this op that reads
+                // the row maps or the expert weights has been submitted. The retained prompt batch's leases and the
+                // ids snapshot release through their owners on unwind, and the eviction guard of graph compute holds
+                // until graph_compute's catch has drained the queue. The transient down SOA has no owner on this
+                // frame, so it is released here; with nothing submitted that reads it, the release needs no marker.
+                release_prompt_down_soa_once(false);
                 ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, "moe_pp_row_mappings", row_maps_total,
                                                 row_maps_total * sizeof(mmid_row_mapping),
                                                 "MUL_MAT_ID prompt row-map staging did not fit");
@@ -95213,8 +95243,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // above never meets a slot as a route (the staged route refuses an entry the executor consumes, and serves
         // the others only to a layer the executor does not claim). A staged batch is refused here, before the
         // scratch setup below claims the oneDNN scratch slot or allocates the staging, so it reaches its fallback
-        // with neither taken.
+        // with neither taken. This path has submitted nothing, and a batched executor that declined after submitting
+        // phases holds the leases of the experts they read until its drain barrier, so the transient down SOA is
+        // released here with no marker, as at the row-map refusal.
         if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt_batch_result.batch)) {
+            release_prompt_down_soa_once(false);
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt per-expert path refused a staged ring slot");
         }
 
@@ -95280,20 +95313,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                               stream->ext_oneapi_submit_barrier());
                 }
             }
-            if (release_prompt_down_soa_after_dispatch) {
-                (void) graph_release_moe_expert_leases_for_tensor_layout(&ctx, src0, ctx.device, GGML_LAYOUT_SOA);
-                const bool released = ggml_sycl_release_moe_tensor_layout(src0, ctx.device, GGML_LAYOUT_SOA);
-                if (released && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-                    static std::atomic<int> transient_down_release_log{ 0 };
-                    if (transient_down_release_log.fetch_add(1, std::memory_order_relaxed) < 96) {
-                        fprintf(stderr,
-                                "[MOE-PHASE-LAYOUT] tensor=%s device=%d layout=%s released_after_dispatch=1 "
-                                "waited_after_dispatch=0 reason=prompt-down-transient\n",
-                                src0 && src0->name ? src0->name : "?", ctx.device,
-                                ggml_sycl_layout_mode_name(GGML_LAYOUT_SOA));
-                    }
-                }
-            }
+            release_prompt_down_soa_once(true);
         };
 
         auto ensure_src1_contiguous_f32 = [&]() -> bool {
@@ -96152,8 +96172,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 };
 
                 // The f16 arm's only dequant (dequantize_row_mxfp4_soa_to_fp16_rowmajor) reads SOA bytes whatever the
-                // op's route is, so the arm takes only an expert whose bytes are SOA. An expert in any other layout takes
-                // the F32 route, which dispatches at expert_layout.
+                // op's route is, so the arm takes only an expert whose bytes are SOA. An expert in any other layout
+                // takes the F32 route, which dispatches at expert_layout.
                 const bool expert_use_mxfp4_soa_f16 = !pp_cpu_reference && pp_mxfp4_soa_f16_ready &&
                                                       num_src1_rows >= 1 && expert_layout == GGML_LAYOUT_SOA;
 
