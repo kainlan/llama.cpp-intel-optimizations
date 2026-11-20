@@ -31,7 +31,9 @@ staged size. What this gate pins:
       write), as the device record the transaction remembers is, whose logical bytes are the tensor's bytes per
       expert, the range the record's readers resolve;
   A6  one publish per call: the body publishes once and bumps the exec-graph epoch with it, unconditionally, and the
-      entry runs the body once;
+      entry runs the body once. An exception propagates: the entry catches nothing, and the body's only rethrow after
+      a publish comes after it, so the triplets moved before the exception are published and the plan, not an
+      outcome list, records them;
   A7  the ledger is untouched by a named move: no ledger room reserved, no lent triplet appended or removed, no cursor
       disarmed, no ledger mirror or total stored;
   A8  the cache's admit is the refill body with the admit's source rule: refill_lent_triplet passes false and stays as
@@ -227,6 +229,8 @@ REMEMBER_DEVICE = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_
 PUBLISH = "ggml_sycl_publish_prepared_plan_locked(prepared_publication);"
 SWAP_PUBLISH = ("if (swapped) { ggml_sycl_publish_prepared_plan_locked(prepared_publication); "
                 "ggml_sycl_optional_layouts_retired(); }")
+RETHROW = "std::rethrow_exception(escaped);"
+RETHROW_LAST = "if (escaped) { std::rethrow_exception(escaped); } return finish(ggml_sycl_txn_result::ACCEPTED, reason);"
 NAMED_CALL = ("const ggml_sycl_txn_result code = ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::NAMED, "
               "device, moves.size(), 0, false, resolver, &answer, false, &moves);")
 
@@ -364,6 +368,10 @@ def check(raw: dict[str, str]) -> None:
         fail("A6", "the entry does not run the body exactly once in the NAMED direction")
     if entry[:at].count("{") - entry[:at].count("}") != 1:
         fail("A6", "the entry runs the body inside a nested block, so it may run it more than once")
+    if re.search(r"\b(try|catch)\b", entry):
+        fail("A6", "the entry catches what the body throws, so a caller could read outcomes of a call that did not end")
+    if txn.count(RETHROW) != 3 or txn.count(RETHROW_LAST) != 1 or not ordered(txn, SWAP_PUBLISH, RETHROW_LAST):
+        fail("A6", "the body can rethrow before it publishes what it moved, or rethrows at a place not accounted for")
 
     # A7 ---------------------------------------------------------------------------------------------------------------
     if txn.count(RESERVE_GUARD) != 1 or txn.count(MOVED_BRANCH) != 1 or txn.count(CURSOR) != 1:
@@ -504,6 +512,11 @@ def self_test(raw: dict[str, str]) -> int:
                                                  "    (void) ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::"
                                                  "NAMED, device, moves.size(), 0, false, resolver, &answer, false, "
                                                  "&moves);\n    if (out) {")])
+    expect_fail("entry-catches-body", "A6", [("sycl", ENTRY_SIG, "    if (out) {",
+                                               "    try {\n    } catch (...) {\n    }\n    if (out) {")])
+    expect_fail("rethrow-before-publish", "A6", [("sycl", TXN_SIG, "    auto prepared_publication = ",
+                                                   "    if (escaped) {\n        std::rethrow_exception(escaped);\n"
+                                                   "    }\n    auto prepared_publication = ")])
     expect_fail("epoch-conditional", "A6", [("sycl", TXN_SIG, "        ggml_sycl_optional_layouts_retired();",
                                              "        if (!named) {\n            ggml_sycl_optional_layouts_retired();"
                                              "\n        }")])

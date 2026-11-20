@@ -24159,7 +24159,7 @@ struct ggml_sycl_expert_move_request {
 // What a named move did. accepted when a triplet moved and the plan that says so was published: the call is then
 // ACCEPTED, and `reason` is "OK" or, when a triplet was refused, its refusal. Otherwise the call is BUSY when any
 // refusal was (a later boundary may move that triplet) and REFUSED when none was. admitted holds one outcome per
-// admit-list triplet, in its order.
+// admit-list triplet, in its order. A call that ends in an exception writes none of it (see the entry).
 struct ggml_sycl_expert_move_result {
     bool                                       accepted       = false;
     uint32_t                                   n_moved        = 0;
@@ -24171,6 +24171,10 @@ struct ggml_sycl_expert_move_result {
 // The named move: each named triplet moved on its own, everything that moved published in one plan. It runs between
 // graphs; its caller is a boundary driver, and the private device tests call it with their own resolver. Until that
 // driver lands only the private device tests call it, so a build without them does not.
+// An exception inside the body propagates out of this call, as it does out of the loan's and the refill's, and *out is
+// left unwritten. The body publishes what it moved before the exception, as it would have without one, and only then
+// rethrows, so those triplets stay published and resolvable: their device entries are in the cache and the plan places
+// them on the card. The published plan, not an outcome list, is then the record of what moved.
 [[maybe_unused]] static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(
     int                                    device,
     const ggml_sycl_expert_move_request &  request,

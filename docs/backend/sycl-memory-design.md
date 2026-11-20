@@ -315,7 +315,12 @@ is checked against the published plan by `moe_expert_move_validate`
 ("incomplete triplet", "duplicate triplet", "wrong device", "not on host",
 "layout") and moves whole or not at all. A refused triplet leaves the others to
 move, and every triplet gets an outcome: moved, or refused with its reason and a
-BUSY or REFUSED class. A named admit runs only while nothing is lent: with a
+BUSY or REFUSED class. An exception inside the transaction propagates out of
+the call, as the loan's and the refill's do, and the caller gets no outcome
+list. The triplets moved before it are published first, as they would have
+been without it, and stay published and resolvable, so the published plan, not
+the outcome list, is then the record of what moved. A named admit runs only
+while nothing is lent: with a
 loan outstanding the request is refused "loans outstanding", BUSY, because lent
 triplets come back through the refill, which finds them by the ledger. The
 source is a whole pinned host copy that is a slice of a host zone. Whole means
