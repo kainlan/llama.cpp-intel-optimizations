@@ -17854,9 +17854,10 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // (unified-cache.cpp, "8. oneDNN scratchpad") reports through too: the weights half is the largest dequantized
     // eligible weight, the activations half n_ubatch rows of the widest f16 row of the weights the scratch takes, at
     // the micro-batch of the Graph scratch shape this stage publishes before it sizes the zones. The pair and the
-    // floor are then sized for one shape at one ensure; a pair re-planned after that ensure (as the dense RUNTIME
-    // scratch is, for an explicit micro-batch) would raise the bare plan above the zone the ensure built, and the pair
-    // bound would then reach into the Graph floor.
+    // floor are then sized for one shape at one ensure. The explicit micro-batch's publish (the dense RUNTIME scratch)
+    // does not re-plan the pair: that micro-batch is the context's (n_ubatch_context, capped at n_ctx), the one the
+    // Graph shape already takes when the load is told the context, so the pair is planned at it before the entry
+    // ensure and a re-publish would write the same value.
     {
         const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
         const ggml_sycl::zone_onednn_pp_pair pair =

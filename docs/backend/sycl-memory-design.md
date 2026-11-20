@@ -4186,12 +4186,17 @@ recovery path: it measures the driver's working set and sizes the headroom from 
      f16 row of the weights the scratch takes, at the micro-batch the Graph
      floor sharing the zone is sized at (the context shape the load is told,
      else the planning micro-batch). Pair and floor are then sized for one shape
-     at one zone ensure. It is deliberately not re-planned with the dense
-     RUNTIME scratch when an explicit micro-batch is placed: that publish comes
-     after the ensure that built the ONEDNN zone, and a larger bare plan there
-     would raise the pair bound into the Graph floor. A context that later runs
-     a wider micro-batch than the load planned cannot grow the zone; its wider
-     ops are refused at acquire and take the dequant buffers.
+     at one zone ensure. The explicit micro-batch's publish of the dense
+     RUNTIME scratch does not re-plan the pair: that micro-batch is the
+     context's (`n_ubatch_context`, capped at `n_ctx`), the one the Graph shape
+     already takes when the load is told the context, so the pair is planned at
+     it before the entry ensure and a re-publish would write the same value.
+     A context that later runs a wider micro-batch than the load planned cannot
+     grow the zone, with two outcomes. An op whose own pair exceeds the pair
+     bound is refused at acquire and draws the dequant buffers. An op whose own
+     pair fits the bound, but whose merge with the planned weights half does
+     not, is reserved as asked and replaces the held pair
+     (`zone_onednn_scratch_reserve_target`).
 
    Until 2026-11-20 this half was `onednn_eligible`, the largest eligible weight
    *as stored*: a placeholder with no relation to a micro-batch. It covered

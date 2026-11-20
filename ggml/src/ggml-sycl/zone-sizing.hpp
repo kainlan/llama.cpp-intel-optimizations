@@ -438,8 +438,10 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
 // An eligible weight of an enabled type is therefore supplied, and needs no dequant plan, on the condition that the
 // pair is within the pair bound. The pair plan's activations half is sized at the micro-batch the load planned the
 // context for (zone_onednn_pp_pair_plan), so the condition holds up to that micro-batch. A context that later runs a
-// wider micro-batch than the load planned (the zone cannot grow once weights are live) can push an op's pair over the
-// bound: the op is then refused by the scratch, draws the dequant buffers, and the graph-entry walk grows them.
+// wider micro-batch than the load planned (the zone cannot grow once weights are live) asks for a wider activations
+// half, with two outcomes. An op whose own pair exceeds the pair bound is refused by the scratch, draws the dequant
+// buffers, and the graph-entry walk grows them. An op whose own pair fits the bound, but whose merge with the planned
+// weights half does not, is reserved as asked and replaces the held pair (zone_onednn_scratch_reserve_target).
 // A weight the zone was not sized for (the LM head, a tied embedding) or a type the scratch is off for
 // (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=0) draws the dequant buffers instead. A head that the zone's slack happens to
 // supply is still planned: whether the head runs on many rows or on the last row only is unknown until llama.cpp-fkpg
