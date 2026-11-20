@@ -20944,6 +20944,67 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
 #endif
 }
 
+// The MoE batched MMVQ scratch bound at the context's micro-batch (placement_plan::moe_mmvq_scratch_bytes), re-sized
+// from the plan's operands at next_plan.context_n_ubatch and never below the published plan's figure: every context of
+// this model shares that plan, and nothing here knows which of them are still live. A real transaction raises the
+// device's published bound to it and, when the SCRATCH zone is smaller than the bound now published, asks for the
+// arena's zones again. That ask is best-effort, as the non-FA re-plan's is: a zone that live allocations keep short of
+// the bound stays as it is and says so once (unified_cache::ensure_planned_arena_zones), since the ops it cannot place
+// are served outside the arena. False only when the arena's teardown left it closed to new allocations. A probe sizes
+// the figure and changes nothing else.
+static bool ggml_sycl_replan_moe_mmvq_scratch(int                               device,
+                                              const ggml_sycl::placement_plan & current,
+                                              ggml_sycl::placement_plan &       next_plan,
+                                              bool                              probe_mode) {
+    const uint32_t n_ubatch = next_plan.context_n_ubatch;
+    if (next_plan.moe_mmvq_scratch_ops.empty() || next_plan.moe_mmvq_scratch_n_expert_used <= 0 || n_ubatch == 0) {
+        return true;
+    }
+    ggml_sycl::zone_moe_mmvq_scratch scratch;
+    if (!ggml_sycl::zone_moe_mmvq_scratch_bytes(next_plan.moe_mmvq_scratch_ops, n_ubatch,
+                                                next_plan.moe_mmvq_scratch_n_expert_used, &scratch)) {
+        if (!probe_mode) {
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] MoE batched MMVQ scratch overflows: %zu expert op(s) at n_ubatch=%u; the SCRATCH zone "
+                "keeps its size\n",
+                next_plan.moe_mmvq_scratch_ops.size(), n_ubatch);
+        }
+        return true;
+    }
+    next_plan.moe_mmvq_scratch_bytes    = scratch.graph;
+    next_plan.moe_mmvq_scratch_n_ubatch = n_ubatch;
+    if (current.moe_mmvq_scratch_bytes >= next_plan.moe_mmvq_scratch_bytes) {
+        next_plan.moe_mmvq_scratch_bytes    = current.moe_mmvq_scratch_bytes;
+        next_plan.moe_mmvq_scratch_n_ubatch = current.moe_mmvq_scratch_n_ubatch;
+        return true;
+    }
+    if (probe_mode) {
+        return true;
+    }
+    const size_t n_ops = next_plan.moe_mmvq_scratch_ops.size();
+    GGML_LOG_WARN(
+        "[SYCL-PLAN] MoE batched MMVQ scratch re-sized for the context on device %d: %zu expert op(s) at n_ubatch=%u, "
+        "depth %zu (every op), %.2f MB, the largest op %.2f MB, up from %.2f MB at n_ubatch=%u\n",
+        device, n_ops, n_ubatch, n_ops, scratch.graph / (1024.0 * 1024.0), scratch.per_op / (1024.0 * 1024.0),
+        current.moe_mmvq_scratch_bytes / (1024.0 * 1024.0), current.moe_mmvq_scratch_n_ubatch);
+    const size_t published = ggml_sycl::unified_cache_raise_planned_moe_mmvq_scratch_bytes(device, scratch.graph);
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    if (cache == nullptr || cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH) >= published) {
+        return true;
+    }
+    ggml_sycl::zone_arena_refusal arena_refusal;
+    (void) ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &arena_refusal);
+    if (arena_refusal.reason == ggml_sycl::zone_arena_refusal_reason::TEARDOWN_REFUSED &&
+        ggml_sycl::zone_arena_teardown_left_closed(arena_refusal.teardown)) {
+        GGML_LOG_ERROR(
+            "[SYCL-PLAN] runtime context update rejected on device %d: the VRAM arena could not be torn down and stays "
+            "closed to new allocations; load the model in a new process\n",
+            device);
+        return false;
+    }
+    return true;
+}
+
 // llama.cpp-ibj0: the PP MoE oneDNN scratch ring is sized at model load
 // (src/llama-model.cpp) for the loader's own inventory.n_ubatch (512 today),
 // not whatever n_ubatch the context is actually created with -- a runtime
@@ -22489,6 +22550,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     }
     if (!ggml_sycl_check_onednn_graph_scratch(ctx->device, next_plan, flash_attn_enabled, probe_mode, hold_query)) {
         return refuse("oneDNN Graph attention scratch exceeds the ONEDNN zone and the device's outside-arena headroom");
+    }
+    if (!ggml_sycl_replan_moe_mmvq_scratch(ctx->device, *current->plan, next_plan, probe_mode)) {
+        return refuse("the VRAM arena stays closed to new allocations");
     }
 
     // llama.cpp-kpjw: the dense MMQ/MMVQ Q8_1 src1 buffer and the dense f16 dequant buffers are planned per
@@ -91604,11 +91668,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 retained_decode_partition_stats main_route_stats{
                     std::vector<size_t>(static_cast<size_t>(std::max(1, n_gpu_devs)), 0), 0
                 };
-                auto &              route_dev_counts            = main_route_stats.device_counts;
-                auto &              route_host_count            = main_route_stats.host_count;
-                size_t              route_unavailable_count     = 0;
-                size_t              route_layout_mismatch_count = 0;
-
+                auto &                                route_dev_counts            = main_route_stats.device_counts;
+                auto &                                route_host_count            = main_route_stats.host_count;
+                size_t                                route_unavailable_count     = 0;
+                size_t                                route_layout_mismatch_count = 0;
                 const ggml_sycl::moe_resolved_batch & main_batch =
                     ne12 == 1 ? retained_decode_batch_result.batch : retained_prompt_batch_result.batch;
                 const size_t selected_occurrences = static_cast<size_t>(ids->ne[1] * n_ids);

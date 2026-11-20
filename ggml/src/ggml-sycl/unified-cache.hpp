@@ -1286,6 +1286,17 @@ struct placement_plan {
     // column.
     std::vector<moe_host_recipe_shape> moe_host_recipe_shapes;
 
+    // The MoE batched MMVQ scratch the SCRATCH zone is sized to hold (zone_scratch_zone_plan): one operand per admitted
+    // expert op, the routed slots a token, and the bound over every op at once at a micro-batch, with the micro-batch
+    // it was computed at. The load computes it at the context's micro-batch (context_n_ubatch); a context's runtime
+    // transaction re-sizes it at its own and never lowers it. The operands stay on the plan so that the bound can be
+    // computed by the same rule at another micro-batch.
+    std::vector<zone_moe_mmvq_operand> moe_mmvq_scratch_ops;
+
+    int      moe_mmvq_scratch_n_expert_used = 0;
+    size_t   moe_mmvq_scratch_bytes         = 0;  // Zone: SCRATCH (device VRAM)
+    uint32_t moe_mmvq_scratch_n_ubatch      = 0;
+
     // Expert bias D2H copy: float bias tensors staged to host for gate computation.
     size_t   expert_bias_bytes                   = 0;  // Zone: STAGING (host pinned)
     // MoE routing: per-batch expert ID control buffer (n_expert * max_batch_tokens * sizeof(int32_t)).
@@ -3262,6 +3273,15 @@ moe_control_requirement unified_cache_get_planned_moe_control_requirement(int de
 void   unified_cache_set_planned_moe_host_scatter_scratch_bytes(int device_id, size_t bytes);
 size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id);
 
+// The MoE batched MMVQ scratch bound the SCRATCH zone is sized to hold (zone_scratch_zone_plan): every expert op's Q8_1
+// activations and ids at the context's micro-batch (placement_plan::moe_mmvq_scratch_bytes). populate_host_zone_sizing
+// publishes it with every plan, 0 for a model with no admitted expert op or a bound that overflows. A context's runtime
+// transaction raises it to its own micro-batch's figure and never lowers it (the raise answers the figure now
+// published); the next ensure of the arena's zones reads it.
+void   unified_cache_set_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes);
+size_t unified_cache_raise_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes);
+size_t unified_cache_get_planned_moe_mmvq_scratch_bytes(int device_id);
+
 // pp_pipeline + pp_moe_onednn + MoE CONTROL for one device, with every addition
 // checked. Returns false without writing *out when the device's CONTROL
 // requirement could not be computed, which is what stops an unsizable plan from
@@ -3270,16 +3290,18 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
 
 // The terms the placement planners publish for a device while they compute a plan (populate_host_zone_sizing() and
 // publish_moe_host_scatter_term()): the MoE CONTROL requirement and the MoE host scatter scratch, both in the RUNTIME
-// zone's requirement, and the oneDNN Graph and non-FA attention scratch shapes, which floor zones the same ensure
-// sizes. A plan that is computed and then discarded publishes nothing, so a caller that may discard one takes this
-// snapshot before it plans and restores it when it does. Each setter stores what its getter reads, so the restore is
-// exact. A term the planners start to publish is added here, not at a caller. It lives beside the getters and setters
-// it calls, so a test that links the cache without the backend checks the restore against the cache's own state.
+// zone's requirement, the oneDNN Graph and non-FA attention scratch shapes, which floor zones the same ensure sizes,
+// and the MoE batched MMVQ scratch bound, which raises the SCRATCH zone. A plan that is computed and then discarded
+// publishes nothing, so a caller that may discard one takes this snapshot before it plans and restores it when it does.
+// Each setter stores what its getter reads, so the restore is exact. A term the planners start to publish is added
+// here, not at a caller. It lives beside the getters and setters it calls, so a test that links the cache without the
+// backend checks the restore against the cache's own state.
 struct planner_published_terms {
     onednn_graph_scratch_planned_shape graph{};
     nonfa_attn_scratch_planned_shape   nonfa{};
     moe_control_requirement            control{};
-    size_t                             scatter = 0;
+    size_t                             scatter  = 0;
+    size_t                             moe_mmvq = 0;
 
     static planner_published_terms snapshot(int device);
     void                           restore(int device) const;
@@ -3311,7 +3333,9 @@ enum load_published_group : uint32_t {
     LOAD_PUBLISHED_GROUP_CONTROL     = 1u << 7,  // the planners' MoE CONTROL requirement
     LOAD_PUBLISHED_GROUP_SCATTER     = 1u << 8,  // the planners' MoE host scatter scratch
     LOAD_PUBLISHED_GROUP_ZONE_PLAN   = 1u << 9,  // the ONEDNN zone's stored snapshot
-    LOAD_PUBLISHED_GROUP_ALL         = (1u << 10) - 1,
+    // the planners' MoE batched MMVQ scratch bound
+    LOAD_PUBLISHED_GROUP_MOE_MMVQ    = 1u << 10,
+    LOAD_PUBLISHED_GROUP_ALL         = (1u << 11) - 1,
 };
 
 struct load_published_terms {
@@ -6373,6 +6397,14 @@ class unified_cache {
     // The load transaction whose keep of a short ONEDNN zone last warned on this device (zone_kept_onednn_warn_due). An
     // exchange, so two ensures of one load racing on the device warn once between them.
     std::atomic<uint64_t> onednn_zone_kept_warn_txn_{ 0 };
+
+    // The largest SCRATCH figure a keep of a short SCRATCH zone has warned about on this device, 0 for none
+    // (zone_kept_scratch_warn_due). Raised by compare-exchange, so two ensures that keep the zone short of one figure
+    // warn once between them.
+    std::atomic<size_t> scratch_zone_kept_warn_bytes_{ 0 };
+
+    // Logs the WARN of a call that kept the SCRATCH zone of `kept_bytes` short of `plan`, when one is due.
+    void scratch_zone_kept_warn(int dev_id, const zone_scratch_plan & plan, size_t kept_bytes);
 
     // Per-physical-chunk TLSF allocators for the WEIGHT zone in N-chunk mode.
     // A weight tensor must not span a chunk boundary (each chunk is its own

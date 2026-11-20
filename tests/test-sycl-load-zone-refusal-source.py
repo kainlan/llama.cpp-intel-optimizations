@@ -205,6 +205,11 @@ HOLDERS = "refusal->holders = holders;"
 KEEP_DEFERRED = "refusal->keep_deferred = reservation_only && defer_keep;"
 HELD_FILL = ("if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::REBUILD_HELD; refusal->device = "
              "dev_id; " + NEED + " " + HAVE + " " + HOLDERS + " " + KEEP_DEFERRED + " } return false;")
+# A SCRATCH zone short of the MoE batched MMVQ bound alone, in an arena a lone ring holds, is kept only after the ring's
+# release is tried: that refusal names the same need, have and holders, and says the zones would have been kept.
+SCRATCH_HELD_FILL = ("if (refusal != nullptr) { refusal->reason = zone_arena_refusal_reason::REBUILD_HELD; "
+                     "refusal->device = dev_id; " + NEED + " " + HAVE + " " + HOLDERS +
+                     " refusal->keep_deferred = true; } return false;")
 # A failed reserve's have is what the device has after it; the arena a rebuild destroyed for it is named as released.
 RESERVE_HAVE = ("refusal->have = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN), "
                 "zone_capacity(vram_zone_id::RUNTIME) };")
@@ -229,8 +234,9 @@ def claim_refusal_names_need_and_have(uc: str, zs: str) -> bool:
     c = code(uc)
     ensure = fn_body(c, ENSURE_SIG)
     text = fn_body(code(zs), TEXT_SIG)
-    return (ordered(ensure, ZONES_READ, "if (!zone_arena_rebuild_allowed(holders)) {", HELD_FILL, "if (!arena_destroy()) {",
-                    "if (!arena_reserve(", RESERVE_FILL)
+    return (ordered(ensure, ZONES_READ, SCRATCH_HELD_FILL, "if (!zone_arena_rebuild_allowed(holders)) {", HELD_FILL,
+                    "if (!arena_destroy()) {", "if (!arena_reserve(", RESERVE_FILL)
+            and ensure.count("zone_arena_refusal_reason::REBUILD_HELD;") == 2
             and NO_CACHE_FILL in fn_body(c, WRAPPER_SIG)
             and all(z in text for z in TEXT_ZONES) and TEXT_FORMAT in text and all(f in text for f in TEXT_SMALL)
             and TEXT_HELD in text and TEXT_RELEASED in text)
@@ -299,6 +305,7 @@ PLANNER_SETTERS = {
     "unified_cache_set_planned_nonfa_attn_scratch_shape",
     "unified_cache_set_planned_moe_control_requirement",
     "unified_cache_set_planned_moe_host_scatter_scratch_bytes",
+    "unified_cache_set_planned_moe_mmvq_scratch_bytes",
 }
 # The pair's setter stores the halves and then their total as the sum. The record puts the halves back on their own and
 # the sum by compare-exchange, so a reserve's raise of the sum survives; together those restore what the setter wrote.
@@ -357,6 +364,7 @@ GROUP_SETTERS = (
     ("LOAD_PUBLISHED_GROUP_CONTROL", "unified_cache_set_planned_moe_control_requirement("),
     ("LOAD_PUBLISHED_GROUP_SCATTER", "unified_cache_set_planned_moe_host_scatter_scratch_bytes("),
     ("LOAD_PUBLISHED_GROUP_ZONE_PLAN", "onednn_zone_plan_put_back("),
+    ("LOAD_PUBLISHED_GROUP_MOE_MMVQ", "unified_cache_set_planned_moe_mmvq_scratch_bytes("),
 )
 # The sum is never stored plainly: a plain store would put back over a reserve's raise.
 SUM_PLAIN = ("unified_cache_set_planned_onednn_scratchpad_bytes(", PAIR_SETTER + "(",
@@ -479,6 +487,27 @@ def test_witness_need_written_from_the_capacities():
     assert not claim_refusal_names_need_and_have(m, ZS)
 
 
+def test_witness_held_refusal_writes_its_need_from_the_capacities():
+    m = mutate_in(UC, ENSURE_SIG, HELD_FILL, HELD_FILL.replace(NEED, "refusal->need = arena_zones;"))
+    assert not claim_refusal_names_need_and_have(m, ZS)
+
+
+def test_witness_held_refusal_drops_its_holders():
+    m = mutate_in(UC, ENSURE_SIG, HELD_FILL, HELD_FILL.replace(HOLDERS, ""))
+    assert not claim_refusal_names_need_and_have(m, ZS)
+
+
+def test_witness_scratch_refusal_says_nothing_would_be_kept():
+    m = mutate_in(UC, ENSURE_SIG, "refusal->keep_deferred = true;", "refusal->keep_deferred = false;")
+    assert not claim_refusal_names_need_and_have(m, ZS)
+
+
+def test_witness_a_third_held_refusal_that_names_nothing():
+    m = mutate_in(UC, ENSURE_SIG, "if (!arena_destroy()) {", "if (refusal != nullptr) { refusal->reason = "
+                  "zone_arena_refusal_reason::REBUILD_HELD; } if (!arena_destroy()) {")
+    assert not claim_refusal_names_need_and_have(m, ZS)
+
+
 def test_witness_reserve_failure_writes_nothing():
     m = mutate_in(UC, ENSURE_SIG, RESERVE_FILL, "return false;")
     assert not claim_refusal_names_need_and_have(m, ZS)
@@ -558,6 +587,11 @@ def test_witness_restore_drops_a_planner_term():
     assert not claim_failed_load_restores(GS, m)
 
 
+def test_witness_restore_drops_the_moe_mmvq_bound():
+    m = mutate_in(UC, RECORD_RESTORE_SIG, "unified_cache_set_planned_moe_mmvq_scratch_bytes(", "(void) (")
+    assert not claim_failed_load_restores(GS, m)
+
+
 def test_witness_restore_drops_the_sum():
     m = mutate_in(UC, RECORD_RESTORE_SIG, SUM_CAS, "std::atomic<size_t>{}.compare_exchange_strong(published, "
                   "prior.onednn_stored,")
@@ -629,6 +663,11 @@ def test_witness_restore_puts_back_every_group():
 
 def test_witness_restore_puts_back_the_ring_unguarded():
     m = mutate_in(UC, RECORD_RESTORE_SIG, "if (back & LOAD_PUBLISHED_GROUP_RING) {", "{")
+    assert not claim_restore_keeps_a_later_publish(GS, m)
+
+
+def test_witness_restore_puts_back_the_moe_mmvq_bound_unguarded():
+    m = mutate_in(UC, RECORD_RESTORE_SIG, "if (back & LOAD_PUBLISHED_GROUP_MOE_MMVQ) {", "{")
     assert not claim_restore_keeps_a_later_publish(GS, m)
 
 

@@ -2817,6 +2817,34 @@ size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id) {
     return g_planned_moe_host_scatter_bytes[device_id].load(std::memory_order_acquire);
 }
 
+// The MoE batched MMVQ scratch bound the SCRATCH zone is sized to hold; see the declaration.
+static std::atomic<size_t> g_planned_moe_mmvq_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
+
+void unified_cache_set_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_moe_mmvq_scratch_bytes[device_id].store(bytes, std::memory_order_release);
+}
+
+size_t unified_cache_raise_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    std::atomic<size_t> & term = g_planned_moe_mmvq_scratch_bytes[device_id];
+    size_t                held = term.load(std::memory_order_acquire);
+    while (held < bytes && !term.compare_exchange_weak(held, bytes, std::memory_order_acq_rel)) {
+    }
+    return std::max(held, bytes);
+}
+
+size_t unified_cache_get_planned_moe_mmvq_scratch_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_moe_mmvq_scratch_bytes[device_id].load(std::memory_order_acquire);
+}
+
 void unified_cache_set_planned_moe_control_requirement(int device_id, const moe_control_requirement & requirement) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return;
@@ -3734,10 +3762,11 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
 
 planner_published_terms planner_published_terms::snapshot(int device) {
     planner_published_terms terms;
-    terms.graph   = unified_cache_get_planned_onednn_graph_scratch_shape(device);
-    terms.nonfa   = unified_cache_get_planned_nonfa_attn_scratch_shape(device);
-    terms.control = unified_cache_get_planned_moe_control_requirement(device);
-    terms.scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device);
+    terms.graph    = unified_cache_get_planned_onednn_graph_scratch_shape(device);
+    terms.nonfa    = unified_cache_get_planned_nonfa_attn_scratch_shape(device);
+    terms.control  = unified_cache_get_planned_moe_control_requirement(device);
+    terms.scatter  = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device);
+    terms.moe_mmvq = unified_cache_get_planned_moe_mmvq_scratch_bytes(device);
     return terms;
 }
 
@@ -3747,6 +3776,7 @@ void planner_published_terms::restore(int device) const {
     unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
     unified_cache_set_planned_moe_control_requirement(device, control);
     unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);
+    unified_cache_set_planned_moe_mmvq_scratch_bytes(device, moe_mmvq);
 }
 
 // The oneDNN scratchpad pair's two halves, without the sum the pair's setter stores after them: a failed load's restore
@@ -3810,7 +3840,8 @@ uint32_t load_published_terms::differing(const load_published_terms & other) con
                LOAD_PUBLISHED_GROUP_NONFA) |
            bit(a.control.bytes != b.control.bytes || a.control.valid != b.control.valid, LOAD_PUBLISHED_GROUP_CONTROL) |
            bit(a.scatter != b.scatter, LOAD_PUBLISHED_GROUP_SCATTER) |
-           bit(!zone_onednn_plan_same(onednn_zone_plan, other.onednn_zone_plan), LOAD_PUBLISHED_GROUP_ZONE_PLAN);
+           bit(!zone_onednn_plan_same(onednn_zone_plan, other.onednn_zone_plan), LOAD_PUBLISHED_GROUP_ZONE_PLAN) |
+           bit(a.moe_mmvq != b.moe_mmvq, LOAD_PUBLISHED_GROUP_MOE_MMVQ);
 }
 
 void load_published_terms::take_groups(const load_published_terms & from, uint32_t groups) {
@@ -3853,6 +3884,9 @@ void load_published_terms::take_groups(const load_published_terms & from, uint32
     }
     if (groups & LOAD_PUBLISHED_GROUP_ZONE_PLAN) {
         onednn_zone_plan = from.onednn_zone_plan;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_MOE_MMVQ) {
+        planner.moe_mmvq = from.planner.moe_mmvq;
     }
 }
 
@@ -3914,6 +3948,9 @@ void load_published_record::restore(int device) const noexcept {
         const size_t          capacity = cache != nullptr ? cache->zone_capacity(vram_zone_id::ONEDNN) : 0;
         const size_t          held     = cache != nullptr ? cache->arena_held_onednn_pair_bytes() : 0;
         onednn_zone_plan_put_back(device, written.onednn_zone_plan, prior.onednn_zone_plan, capacity, held);
+    }
+    if (back & LOAD_PUBLISHED_GROUP_MOE_MMVQ) {
+        unified_cache_set_planned_moe_mmvq_scratch_bytes(device, prior.planner.moe_mmvq);
     }
     // The sum goes back from what this load published to what it held before, in one compare-exchange: the pair's
     // reserve raises it outside the inventory lock, and a raise since this load published it is kept.
@@ -7643,6 +7680,21 @@ static const char * arena_teardown_cause_name(zone_arena_teardown_refusal cause)
     return "no cause recorded";
 }
 
+void unified_cache::scratch_zone_kept_warn(int dev_id, const zone_scratch_plan & plan, size_t kept_bytes) {
+    size_t latched = scratch_zone_kept_warn_bytes_.load(std::memory_order_relaxed);
+    do {
+        if (!zone_kept_scratch_warn_due(latched, plan.wanted)) {
+            return;
+        }
+    } while (!scratch_zone_kept_warn_bytes_.compare_exchange_weak(latched, plan.wanted, std::memory_order_relaxed));
+    GGML_LOG_WARN(
+        "[VRAM-ARENA] device %d keeps its SCRATCH zone of %.1f MB: the MoE batched MMVQ scratch bound asks for a "
+        "%.1f MB zone (the zone must hold %.1f MB without it), and live allocations block the rebuild. Expert ops "
+        "whose scratch the zone cannot place are served from device memory outside the arena; the zone's use line "
+        "at teardown counts them as misses\n",
+        dev_id, kept_bytes / (1024.0 * 1024.0), plan.wanted / (1024.0 * 1024.0), plan.required / (1024.0 * 1024.0));
+}
+
 bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *              refusal,
                                                const zone_arena_ensure_options & options) {
     if (!vram_arena_enabled()) {
@@ -7661,7 +7713,8 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
 
     // The zone is sized by the one function the model-load reservation and the
     // chunk cap's probe set also call, so the three cannot disagree.
-    size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);
+    size_t scratch_zone  = ggml_sycl_compute_arena_bytes(dev_id);
+    size_t scratch_nonfa = 0;
     // llama.cpp-oyfl: raise the SCRATCH zone for the non-FA batched mul_mat
     // floor the same way onednn_zone is raised below for its own planned
     // estimate. Best-effort and, for the standard model-load flow, NOT
@@ -7759,10 +7812,23 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                         planned_nonfa_attn_scratch / (1024.0 * 1024.0),
                         kNonfaAttnScratchFloorBytes / (1024.0 * 1024.0));
                 }
-                scratch_zone = planned_nonfa_attn_scratch;
+                scratch_nonfa = planned_nonfa_attn_scratch;
             }
         }
     }
+    // The MoE batched MMVQ scratch bound raises the zone on top of what it must hold (zone_scratch_zone_plan says why
+    // the bound is every expert op's buffers at once). Unlike the non-FA scratch, a request of those ops the zone
+    // cannot place has somewhere to go, so a rebuild that something live blocks keeps a zone short of the bound alone
+    // (below) rather than refuse.
+    const zone_scratch_plan scratch_plan =
+        zone_scratch_zone_plan(scratch_zone, scratch_nonfa, unified_cache_get_planned_moe_mmvq_scratch_bytes(dev_id));
+    if (scratch_plan.wanted > scratch_plan.required) {
+        GGML_LOG_INFO(
+            "[UNIFIED-CACHE] SCRATCH zone planned at %.1f MB for the MoE batched MMVQ scratch bound (the zone "
+            "must hold %.1f MB without it)\n",
+            scratch_plan.wanted / (1024.0 * 1024.0), scratch_plan.required / (1024.0 * 1024.0));
+    }
+    scratch_zone = scratch_plan.wanted;
 
     size_t       onednn_zone         = 256 * 1024 * 1024;
     // This sizes the REAL physical ONEDNN zone, which has to hold both the
@@ -7958,6 +8024,39 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         holders.live_zone_bytes = live_zone_bytes;
         holders.chunk_leases    = chunk_leases;
         arena_count_scratch_holders(holders);
+        // A rebuild that something live blocks keeps a SCRATCH zone that holds what it must and is short of the MoE
+        // batched MMVQ bound alone (zone_scratch_kept_bytes), so the zones are asked for no more SCRATCH than they
+        // hold. When the other zones hold their plan the arena is kept as it is; otherwise the keep of a short ONEDNN
+        // zone below decides. A ring that alone holds the arena keeps nothing yet (see
+        // zone_arena_ensure_options::ring_release_first): the call refuses with keep_deferred set, the caller releases
+        // the ring, and the rebuild that follows sizes the zone whole.
+        const size_t scratch_kept = zone_scratch_kept_bytes(scratch_plan, arena_zones.scratch);
+        if (scratch_kept < scratch_zone && !zone_arena_rebuild_allowed(holders)) {
+            const bool others_hold = arena_zones.onednn >= onednn_zone && arena_zones.runtime >= runtime_zone;
+            if (others_hold && options.ring_release_first && zone_arena_only_ring_holds(true, holders)) {
+                if (refusal != nullptr) {
+                    refusal->reason        = zone_arena_refusal_reason::REBUILD_HELD;
+                    refusal->device        = dev_id;
+                    refusal->need          = { scratch_zone, onednn_zone, runtime_zone };
+                    refusal->have          = arena_zones;
+                    refusal->holders       = holders;
+                    refusal->keep_deferred = true;
+                }
+                return false;
+            }
+            scratch_zone = scratch_kept;
+            if (others_hold) {
+                if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
+                    bind_compute_arena();
+                }
+#if GGML_SYCL_DNNL
+                onednn_graph_direct_cap_snapshot_keep();
+#endif
+                onednn_zone_plan_keep_and_store(dev_id, live_plan);
+                scratch_zone_kept_warn(dev_id, scratch_plan, scratch_kept);
+                return true;
+            }
+        }
         if (!zone_arena_rebuild_allowed(holders)) {
             // Keeping the zones as they are answers a rebuild something live blocks when the oneDNN Graph floor is all
             // they lack: the floor is a reservation, served on the DIRECT path under its cap beyond what the zone
@@ -7987,6 +8086,9 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                         "whose Graph scratch does not fit is refused by name\n",
                         dev_id, arena_zones.onednn / (1024.0 * 1024.0), live_plan.graph_floor_bytes / (1024.0 * 1024.0),
                         onednn_zone / (1024.0 * 1024.0), kept.graph_floor_bytes / (1024.0 * 1024.0));
+                }
+                if (scratch_zone < scratch_plan.wanted) {
+                    scratch_zone_kept_warn(dev_id, scratch_plan, scratch_zone);
                 }
                 return true;
             }
@@ -36272,25 +36374,50 @@ static void populate_host_zone_sizing(placement_plan &                          
     plan.onednn_reorder_bytes = zone_maxima.onednn_reorder;
 
     // 2. MoE batched MMVQ scratch: each MUL_MAT_ID op that mmvq_moe_batched_dispatch runs holds a Q8_1 copy of its
-    //    activations and an ids table in the device SCRATCH zone until its completion event. No term reserves room
-    //    for them: they share the zone with other per-op scratch, and a request the zone cannot place falls through
-    //    to raw device memory. The two bounds, the most one op holds and the sum over every expert op, are logged at
-    //    the planning micro-batch so that the zone's use line at cache teardown can be read against them.
+    //    activations and an ids table in the device SCRATCH zone until a thread that waits on the op's completion
+    //    event releases them, and no later op's allocation waits for that release, so the zone is sized for every
+    //    op's buffers at once (zone_scratch_zone_plan), at the micro-batch the context runs. The bound is published
+    //    for the ensure that sizes the zone. A request the zone cannot place still falls through to raw device
+    //    memory, and the zone's use line at cache teardown counts it as a miss. A load plans twice, from the file's
+    //    weights and then from the tensors it created, so the line names the tensor count of the plan it describes.
+    plan.moe_mmvq_scratch_ops.clear();
+    plan.moe_mmvq_scratch_n_expert_used = 0;
+    plan.moe_mmvq_scratch_bytes         = 0;
+    plan.moe_mmvq_scratch_n_ubatch      = 0;
     if (n_experts > 0 && n_expert_used > 0) {
-        const std::vector<zone_moe_mmvq_operand> mmvq_ops      = moe_mmvq_scratch_operands(tensor_inventory);
-        const uint32_t                           mmvq_n_ubatch = placement_load_n_ubatch(plan.planner_n_ubatch);
-        zone_moe_mmvq_scratch                    mmvq_scratch;
-        // Every input is positive here (the guard, the planning micro-batch, the inventory's shapes), so a false
-        // answer is an overflow.
-        if (!zone_moe_mmvq_scratch_bytes(mmvq_ops, mmvq_n_ubatch, n_expert_used, &mmvq_scratch)) {
-            GGML_LOG_WARN("[SYCL-PLAN] MoE batched MMVQ scratch overflows: %zu expert op(s) at n_ubatch=%u\n",
-                          mmvq_ops.size(), mmvq_n_ubatch);
-        } else if (!mmvq_ops.empty()) {
+        plan.moe_mmvq_scratch_ops           = moe_mmvq_scratch_operands(tensor_inventory);
+        plan.moe_mmvq_scratch_n_expert_used = n_expert_used;
+        plan.moe_mmvq_scratch_n_ubatch =
+            plan.context_n_ubatch != 0 ? plan.context_n_ubatch : placement_load_n_ubatch(plan.planner_n_ubatch);
+        const size_t          n_ops = plan.moe_mmvq_scratch_ops.size();
+        zone_moe_mmvq_scratch mmvq_scratch;
+        // Every input is positive here (the guard, the micro-batch, the inventory's shapes), so a false answer is an
+        // overflow, and an overflowed bound is no size to reserve.
+        if (!zone_moe_mmvq_scratch_bytes(plan.moe_mmvq_scratch_ops, plan.moe_mmvq_scratch_n_ubatch, n_expert_used,
+                                         &mmvq_scratch)) {
             GGML_LOG_WARN(
-                "[SYCL-PLAN] MoE batched MMVQ scratch: %zu expert op(s) at n_ubatch=%u, %.2f MB for the largest op, "
-                "%.2f MB for all of them at once, in the device SCRATCH zone\n",
-                mmvq_ops.size(), mmvq_n_ubatch, mmvq_scratch.per_op / (1024.0 * 1024.0),
-                mmvq_scratch.graph / (1024.0 * 1024.0));
+                "[SYCL-PLAN] MoE batched MMVQ scratch overflows: %zu expert op(s) at n_ubatch=%u; the SCRATCH zone is "
+                "not raised for it\n",
+                n_ops, plan.moe_mmvq_scratch_n_ubatch);
+        } else if (n_ops != 0) {
+            plan.moe_mmvq_scratch_bytes = mmvq_scratch.graph;
+            const size_t zone_default   = ggml_sycl_compute_arena_bytes(plan.device_id);
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] MoE batched MMVQ scratch, plan of %zu tensors: %zu expert op(s) at n_ubatch=%u, depth %zu "
+                "(every op: no op's allocation waits for an earlier op's release), %.2f MB, the largest op %.2f MB; "
+                "the SCRATCH zone is sized from %.2f MB, the larger of that and its %.1f MB default (a larger non-FA "
+                "attention raise sizes it instead)\n",
+                tensor_inventory.size(), n_ops, plan.moe_mmvq_scratch_n_ubatch, n_ops,
+                mmvq_scratch.graph / (1024.0 * 1024.0), mmvq_scratch.per_op / (1024.0 * 1024.0),
+                zone_scratch_zone_plan(zone_default, 0, mmvq_scratch.graph).wanted / (1024.0 * 1024.0),
+                zone_default / (1024.0 * 1024.0));
+        }
+    }
+    if (plan.devices.empty()) {
+        unified_cache_set_planned_moe_mmvq_scratch_bytes(plan.device_id, plan.moe_mmvq_scratch_bytes);
+    } else {
+        for (int device : plan.devices) {
+            unified_cache_set_planned_moe_mmvq_scratch_bytes(device, plan.moe_mmvq_scratch_bytes);
         }
     }
 

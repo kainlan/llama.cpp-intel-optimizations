@@ -30,7 +30,7 @@ that covers:
 | KV cache (per layer) | `kv_device`, `kv_vram_bytes`, `kv_host_bytes` |
 | oneDNN reorder scratch | `onednn_reorder_bytes` → Zone: SCRATCH |
 | oneDNN scratchpad | `onednn_scratchpad_bytes` → Zone: ONEDNN |
-| MoE batched MMVQ Q8_1 and ids scratch | none: per-op buffers draw on the shared Zone: SCRATCH and fall through to raw device memory when it is full (bounds logged at load; a planned term follows) |
+| MoE batched MMVQ Q8_1 and ids scratch | `moe_mmvq_scratch_bytes` → Zone: SCRATCH (every expert op at once) |
 | MoE routing IDs | `moe_routing_ids_bytes` → Zone: RUNTIME |
 | MoE expert pointer tables | `moe_expert_ptrs_bytes` → Zone: RUNTIME |
 | DMA staging pool | `dma_staging_pool_bytes` → Zone: RUNTIME |

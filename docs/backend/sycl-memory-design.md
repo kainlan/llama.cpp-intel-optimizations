@@ -2333,19 +2333,49 @@ would be this bug in reverse. It leaves out only the one class the next
 paragraph describes, a gather-only table the plan keeps on the host, which S1
 never streams.
 
-The MoE batched MMVQ scratch has no plan term. Each MUL_MAT_ID op that
-`mmvq_moe_batched_dispatch` runs takes two buffers from the shared device
-SCRATCH zone and releases them at its completion event: a Q8_1 copy of its
-activations (K padded to `QK8_1`; one row a token for gate, up and fused
+The MoE batched MMVQ scratch is a planned term of the device SCRATCH zone,
+`placement_plan::moe_mmvq_scratch_bytes`. Each MUL_MAT_ID op that
+`mmvq_moe_batched_dispatch` runs takes two buffers from that zone: a Q8_1 copy
+of its activations (K padded to `QK8_1`; one row a token for gate, up and fused
 gate_up, one row a routed slot for down) and an ids table (`n_tokens *
-n_expert_used` int32). The zone is sized by no op's demand, and a request it
-cannot place falls through to raw device memory. At load the planner logs two
-bounds at the planning micro-batch (`zone_moe_mmvq_scratch_bytes`: the most one
-op holds, and the sum over every expert op), and at teardown the cache logs the
-zone's high-water and its misses (`zone_scratch_use_text`). A planned term that
-raises the zone to one of those bounds follows. The term it replaces,
-`moe_q8_workspace_bytes` (`max_tensor_bytes / n_experts * 1.1 *
-n_expert_used`), had no reader and is gone.
+n_expert_used` int32). It hands both to `retain_handles_until_event`
+(`mem-handle.cpp`), whose detached drain thread drops them once the op's
+completion event fires. Nothing makes a later op wait for that release: no
+allocation waits on an earlier op's event, the zone's allocator reclaims
+nothing when it is asked for room, and the host waits a prompt does run (the
+routing-ids snapshot, once per ids tensor per graph; the scheduler's split
+syncs) order device work, not the drain. Gate, up and down of one layer even
+share one ids snapshot with no wait between them. So nothing bounds how many
+ops hold their scratch at once, and the bound is every expert op's buffers
+together (`zone_moe_mmvq_scratch_bytes`'s `graph` sum) at the micro-batch the
+context runs. A measured high-water of one op's demand is the drain winning a
+race, not a depth to plan on, and no host wait is added to force a depth of one
+(every wait is event-chained). The bound is sized whole because a request the
+zone cannot place is an unplanned raw device allocation, the failure the plan
+exists to prevent on a card with no headroom.
+
+The rule, `zone_scratch_zone_plan` (test-zone-sizing Case 47): the zone is the
+largest of its default (`GGML_SYCL_COMPUTE_ARENA_MB`, 512 MiB), the non-FA
+attention raise, and the bound. The planner computes the bound at the context's
+micro-batch (the load's planning micro-batch until a context names one) and
+publishes it; `ensure_planned_arena_zones` sizes the zone from it; the runtime
+context transaction re-sizes it at the context's micro-batch, raises the
+published bound (it is never lowered within a module's life) and asks for the
+zones again when the zone is smaller. A rebuild that live allocations block
+keeps a zone that holds what it must without the bound
+(`zone_scratch_kept_bytes`) and says so once per wanted size at WARN. That is
+never a refusal and never a reset of a zone with live handles: a request the
+kept zone cannot place still falls through to raw device memory, and the zone's
+use line at cache teardown (`zone_scratch_use_text`) counts it as a miss, so a
+miss count above zero is how an under-sized zone shows. On Qwen3.6-35B-A3B
+NVFP4 one layer's three expert ops take 9312 bytes a row (gate 2336, up 2336,
+down 4640): over 40 layers that is 181.9 MiB at 512 rows, below the default,
+and 727.5 MiB at 2048 rows; the bound passes the default between 1441 and 1442
+rows. A load plans twice, from the file's tensors (the MTP block's experts
+included) and then from the tensors it created, so each plan's line names its
+tensor count. The term this replaces, `moe_q8_workspace_bytes`
+(`max_tensor_bytes / n_experts * 1.1 * n_expert_used`), had no reader and is
+gone.
 
 The host STAGING and SCRATCH zones, which hold only copies, leave out exactly
 one class: a tensor the loader marked gather-only (`get_rows_only`) that has at
