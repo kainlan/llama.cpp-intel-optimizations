@@ -25183,10 +25183,11 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
 // plan), nor above the capacity. No figure is read live or recomputed here: both are overwritten by later plans the
 // zone was not rebuilt for. The planned halves let the admission refuse an op whose per-half maximum with the planned
 // pair leaves the bound (zone_onednn_pp_scratch_planned), the one kind of op that made the reserve replace its held
-// pair. Not covered: where a growth step is still reached (a zone clamped below its plan, or two admitted ops above
-// the plan in different halves of a zone with slack; see zone_onednn_scratch_reserve_target), it needs the superseded
-// pair and the new one in the zone at once (see the note in reserve_onednn_scratch), so a pair inside the bound can
-// still fall through to the unplanned direct allocation while its predecessor drains.
+// pair. Not covered: where a growth step is still reached (a zone clamped below its plan, no planned pair stored, a
+// pair held from an earlier stored plan of a zone that was kept, or two admitted ops above the plan in different
+// halves of a zone with slack; see zone_onednn_scratch_reserve_target), it needs the superseded pair and the new one
+// in the zone at once (see the note in reserve_onednn_scratch), so a pair inside the bound can still fall through to
+// the unplanned direct allocation while its predecessor drains.
 bool unified_cache_get_onednn_pp_pair_bound(int      device_id,
                                             size_t * bound,
                                             size_t * planned_weights,

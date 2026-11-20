@@ -443,7 +443,9 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
 // (zone_onednn_pp_scratch_planned); otherwise it is refused at acquire and by the graph-entry walk alike, draws the
 // dequant buffers, and the walk grows them past their plan. An admitted op is reserved at the per-half maximum of the
 // planned, held and requested pairs (zone_onednn_scratch_reserve_target), which never shrinks a half, so the held pair
-// is not replaced inside a graph.
+// is not replaced inside a graph, except in the cases that target's comment lists (a clamped zone, no planned pair
+// stored, a pair held from an earlier stored plan of a kept zone, two admitted ops above the plan in different halves
+// of a zone with slack).
 // A weight the zone was not sized for (the LM head, a tied embedding) or a type the scratch is off for
 // (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=0) draws the dequant buffers instead. A head that the zone's slack happens to
 // supply is still planned: whether the head runs on many rows or on the last row only is unknown until llama.cpp-fkpg
