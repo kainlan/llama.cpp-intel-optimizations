@@ -1287,30 +1287,34 @@ struct moe_route_counts_slot {
 
 // Never destroyed: the final report can run from an atexit path after this translation unit's statics are gone,
 // and a destroyed mutex there would be a use after destruction. The slots hold one small host table each.
-moe_route_counts_slot & moe_route_counts_slot_of(int device) {
+// A device index outside the table has no slot (null), so a bad index never reads or writes another device's table.
+moe_route_counts_slot * moe_route_counts_slot_of(int device) {
     static moe_route_counts_slot * const slots = new moe_route_counts_slot[GGML_SYCL_MAX_DEVICES];
-    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
-        device = 0;
-    }
-    return slots[device];
+    return device >= 0 && device < GGML_SYCL_MAX_DEVICES ? &slots[device] : nullptr;
 }
 
 }  // namespace
 
 std::shared_ptr<moe_route_counts> moe_route_counts_install(int device, int n_blocks, int n_experts) {
-    auto                        fresh = std::make_shared<moe_route_counts>(n_blocks, n_experts);
-    moe_route_counts_slot &     slot  = moe_route_counts_slot_of(device);
-    std::lock_guard<std::mutex> lock(slot.mutex);
+    auto                    fresh = std::make_shared<moe_route_counts>(n_blocks, n_experts);
+    moe_route_counts_slot * slot  = moe_route_counts_slot_of(device);
+    if (slot == nullptr) {
+        return fresh;  // not registered: nothing reads it, and no other device's table is replaced
+    }
+    std::lock_guard<std::mutex> lock(slot->mutex);
     // The replaced table is released here only if nothing else holds it; a record or a job that counts into it
     // keeps it alive until its last use, so a worker never writes into freed storage.
-    slot.table = fresh;
+    slot->table = fresh;
     return fresh;
 }
 
 std::shared_ptr<moe_route_counts> moe_route_counts_current(int device) {
-    moe_route_counts_slot &     slot = moe_route_counts_slot_of(device);
-    std::lock_guard<std::mutex> lock(slot.mutex);
-    return slot.table;
+    moe_route_counts_slot * slot = moe_route_counts_slot_of(device);
+    if (slot == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(slot->mutex);
+    return slot->table;
 }
 
 void moe_route_counts_report_final(int device, int64_t tokens) {
@@ -1331,14 +1335,15 @@ void moe_route_counts_report_final(int device, int64_t tokens) {
     GGML_LOG_WARN("%s", moe_route_block_table(*table).c_str());
     const std::string csv = moe_route_csv(*table);
     FILE *            f   = std::fopen(path, "wb");
-    if (f == nullptr || std::fwrite(csv.data(), 1, csv.size(), f) != csv.size()) {
-        GGML_LOG_WARN("[MOE-ROUTE-COUNTS] could not write %s\n", path);
-    } else {
+    bool              ok  = f != nullptr && std::fwrite(csv.data(), 1, csv.size(), f) == csv.size();
+    if (f != nullptr) {
+        ok = std::fclose(f) == 0 && ok;
+    }
+    if (ok) {
         GGML_LOG_WARN("[MOE-ROUTE-COUNTS] wrote %d blocks x %d experts to %s\n", table->n_blocks(), table->n_experts(),
                       path);
-    }
-    if (f != nullptr) {
-        std::fclose(f);
+    } else {
+        GGML_LOG_WARN("[MOE-ROUTE-COUNTS] could not write %s\n", path);
     }
 }
 

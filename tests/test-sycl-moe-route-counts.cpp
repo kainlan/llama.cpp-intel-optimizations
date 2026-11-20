@@ -43,6 +43,15 @@ static void route_block(moe_route_counts & c, int b, const std::vector<int> & co
     }
 }
 
+// The same for the prompt counts of block `b`.
+static void prompt_block(moe_route_counts & c, int b, const std::vector<int> & counts) {
+    for (size_t e = 0; e < counts.size(); ++e) {
+        for (int i = 0; i < counts[e]; ++i) {
+            CHECK(c.add_prompt(b, static_cast<int>(e)));
+        }
+    }
+}
+
 int main() {
     // 1. The table is sized from the model's dimensions and keeps them exactly, above the 128 x 256 the backend's
     //    layer counters clamp to. Every cell starts at zero, no expert has been seen, no residency is known.
@@ -120,6 +129,48 @@ int main() {
         CHECK(near(ggml_sycl::moe_route_block_hit_rate(c, 1), 0.0));
         CHECK(near(ggml_sycl::moe_route_top_n_coverage(c, 1, 4), 0.0));
         CHECK(ggml_sycl::moe_route_blocks_counted(c) == 1);
+    }
+    // 4b. Prompt-ranked coverage: the experts are ranked by their PROMPT counts, ties to the lower expert index, and
+    //     the figure is the share of the block's decode pairs those experts took.
+    {
+        moe_route_counts       c(4, 8);
+        const std::vector<int> decode0 = { 50, 30, 10, 5, 3, 1, 1, 0 };  // 100 pairs
+        const std::vector<int> decode1 = { 0, 0, 0, 0, 10, 10, 0, 0 };   // 20 pairs
+        route_block(c, 0, decode0, 2);
+        route_block(c, 1, decode1, 0);
+        // Block 0: the prompt ranks the experts the way decode does, so it equals the decode top-N coverage.
+        prompt_block(c, 0, { 9, 7, 5, 3, 2, 1, 1, 0 });
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(c, 0, 0), 0.0));
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(c, 0, 1), 0.5));
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(c, 0, 2), 0.8));
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(c, 0, 5), 0.98));
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(c, 0, 8), 1.0));
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(c, 0, 100), 1.0));
+        // Block 1: the prompt favours experts 0, 1 and 2 and decode used 4 and 5, so the sets are disjoint until the
+        // zero-count ties, broken by lower index, bring in expert 3, then 4 and 5.
+        prompt_block(c, 1, { 3, 2, 1, 0, 0, 0, 0, 0 });
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(c, 1, 3), 0.0));
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(c, 1, 4), 0.0));  // + expert 3 (tie at 0, lower index)
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(c, 1, 5), 0.5));  // + expert 4
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(c, 1, 6), 1.0));  // + expert 5
+        // Block 2: prompt counts only, no decode pairs: 0, and left out of the overall figure.
+        prompt_block(c, 2, { 4, 4, 4, 4, 4, 4, 4, 4 });
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(c, 2, 3), 0.0));
+        // Overall: (98 + 10) / (100 + 20) at n = 5, (80 + 0) / 120 at n = 2.
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage_overall(c, 5), 108.0 / 120.0));
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage_overall(c, 2), 80.0 / 120.0));
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage_overall(c, 0), 0.0));
+        // Nothing counted: 0.
+        moe_route_counts empty(2, 8);
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage_overall(empty, 4), 0.0));
+        // A tie: every expert has the same prompt count, so the first n by index are taken, not the hottest in decode.
+        moe_route_counts t(1, 8);
+        route_block(t, 0, decode0, 2);
+        prompt_block(t, 0, { 1, 1, 1, 1, 1, 1, 1, 1 });
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(t, 0, 2), 0.8));
+        CHECK(near(ggml_sycl::moe_route_prompt_ranked_coverage(t, 0, 3), 0.9));
+        // The reverse tie order would take experts 7 and 6 first: that gives 1 / 100 at n = 2, which it is not.
+        CHECK(!near(ggml_sycl::moe_route_prompt_ranked_coverage(t, 0, 2), 0.01));
     }
     // 5. The top experts are the most-routed, not the lowest ids, and ties do not change a sum.
     {
@@ -228,13 +279,15 @@ int main() {
         moe_route_counts c(4, 8);
         route_block(c, 0, { 50, 30, 10, 5, 3, 1, 1, 0 }, 2);
         route_block(c, 2, { 0, 0, 0, 0, 10, 10, 0, 0 }, 0);
+        prompt_block(c, 0, { 9, 7, 5, 3, 2, 1, 1, 0 });  // ranks like decode: its top 5 take 98 of 100
+        prompt_block(c, 2, { 3, 2, 1, 0, 0, 0, 0, 0 });  // ranks experts 0, 1, 2, 3, 4: takes only 10 of 20
         c.set_block_resident(0, 2);
         c.set_block_resident(2, 0);
         // mean resident = (2 + 0 + 8 + 8) / 4 = 4.5, which the line rounds to 5 slots per block
         const std::string line = ggml_sycl::moe_route_summary_line(c, 7);
         CHECK(line.find('\n') == std::string::npos);
         CHECK(line.find("[MOE-ROUTE-COUNTS]") == 0);
-        CHECK(line.find("tokens=7") != std::string::npos);
+        CHECK(line.find("process tokens=7") != std::string::npos);
         CHECK(line.find("blocks counted=2") != std::string::npos);
         CHECK(line.find("not counted=2 (all resident, not counted)") != std::string::npos);
         CHECK(line.find("of 4") != std::string::npos);
@@ -246,7 +299,10 @@ int main() {
         CHECK(line.find("top-5 coverage=") != std::string::npos);
         // top-5 of block 0 = 98, of block 2 = 20: 118 / 120 = 98.3%
         CHECK(line.find("top-5 coverage=98.3%") != std::string::npos);
-        CHECK(line.find("prompt routed pairs=0") != std::string::npos);
+        CHECK(line.find("over the counted blocks (each given the model's mean 4.5 slots);") != std::string::npos);
+        // prompt-ranked top-5: block 0 takes 98, block 2 takes 10: 108 / 120 = 90.0%
+        CHECK(line.find("; prompt-ranked top-5 coverage=90.0%; ") != std::string::npos);
+        CHECK(line.find("prompt routed pairs=34") != std::string::npos);
     }
     // 11. The per-block table: one line per block, naming a block that was not counted as all resident.
     {
@@ -312,7 +368,7 @@ int main() {
         const int                per       = 20000;
         std::vector<std::thread> threads;
         for (int t = 0; t < n_threads; ++t) {
-            threads.emplace_back([&c, per, t]() {
+            threads.emplace_back([&c, t]() {
                 for (int i = 0; i < per; ++i) {
                     c.add_decode(1, 2, (t & 1) != 0);
                     c.add_prompt(1, 2);

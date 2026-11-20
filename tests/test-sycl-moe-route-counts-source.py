@@ -32,6 +32,10 @@ shows that. This gate holds them:
       device-or-host sense are held;
   P15 the report prints when the decode pairs have grown since the last report (a compare-exchange on one atomic), not
       once; the env-var row says so;
+  P16 the summary line says `process tokens`, labels the top-N coverage as over the counted blocks with the mean slots
+      each, and carries the prompt-ranked coverage right after it; the prompt-ranked figure ranks by prompt counts with
+      ties to the lower expert index and sums decode counts, and is weighed by decode pairs; the comments and the
+      env-var row say what each figure covers;
   P13 the summary line carries the derived model-wide hit rate, labelled as derived, right after the counted-block
       figure, computed by the one inline function with its guard for no counted block; the line's buffer holds its
       longest possible text; the env-var row of docs/backend/sycl-env-vars.md names it.
@@ -101,6 +105,9 @@ MODEL_GUARD = "if (counted <= 0) { return 0.0; }"
 # Widest text each conversion can print: a 64-bit integer is 20 characters, an int 11, a percentage "100.0" plus its
 # sign, a double the mean of resident experts (at most 2^31 here) with one decimal.
 CONVERSION_WIDTH = {"%lld": 20, "%llu": 20, "%d": 11, "%.1f%%": 8, "%.1f": 14}
+COVERAGE_LABEL = "top-%d coverage=%.1f%% over the counted blocks (each given the model's mean %.1f slots); "
+PROMPT_LABEL = "prompt-ranked top-%d coverage=%.1f%%"
+TIE_COMPARE = "return pa != pb ? pa > pb : a < b;"
 ENV_GUARD = "if (path == nullptr || path[0] == '\\0') { return; }"
 FORBIDDEN_IN_COUNT = re.compile(
     r"\b(?:wait|wait_and_throw|lock|lock_guard|unique_lock|mutex|malloc|calloc|new|delete|push_back|emplace_back|"
@@ -339,12 +346,13 @@ def check(s: Sources) -> None:
     if "ggml_sycl::moe_route_counts *" in squash(be.code) or "moe_route_counts *" in s.prefetch.code:
         raise ContractError("FAIL [pin P12]: a raw pointer to the table is held")
     install = pf.block_text(INSTALL_FN, "P12")
-    if "std::lock_guard<std::mutex> lock(slot.mutex);" not in install or "slot.table = fresh;" not in install:
+    if "std::lock_guard<std::mutex> lock(slot->mutex);" not in install or "slot->table = fresh;" not in install:
         raise ContractError("FAIL [pin P12]: the install does not replace the table under the slot's lock")
     if squash(SLOTS_NEW) not in squash(pf.code):
         raise ContractError("FAIL [pin P12]: the table registry is destroyed at exit, where a late report reads it")
 
     check_model_rate(s)
+    check_prompt_ranked(s)
     check_counting_tensor(s, count_block, build)
     check_report_when_grown(s, report)
 
@@ -353,7 +361,7 @@ def summary_format(header_code: str) -> tuple[str, int]:
     """The summary line's format text (its adjacent string literals) and the size of its buffer."""
     at = header_code.find("moe_route_summary_line(")
     body = header_code[at:]
-    m = re.search(r'(?:"\[MOE-ROUTE-COUNTS\] tokens=(?:\\.|[^"\\])*"\s*)(?:"(?:\\.|[^"\\])*"\s*)*', body)
+    m = re.search(r'(?:"\[MOE-ROUTE-COUNTS\] (?:process )?tokens=(?:\\.|[^"\\])*"\s*)(?:"(?:\\.|[^"\\])*"\s*)*', body)
     buf = re.search(r"char\s+line\[(\d+)\]", body)
     if at < 0 or not m or not buf:
         raise ContractError("FAIL [pin P13]: the summary line's format or buffer is not found")
@@ -385,6 +393,41 @@ def check_model_rate(s: Sources) -> None:
     row = next((ln for ln in s.docs.split("\n") if ln.startswith(f"| `{ENV_NAME}=")), "")
     if "model hit rate" not in row or "taken as all device" not in row:
         raise ContractError("FAIL [pin P13]: the env-var row does not name the model-wide hit rate and its assumption")
+
+
+def check_prompt_ranked(s: Sources) -> None:
+    hdr = squash(s.header.code)
+    fmt, _ = summary_format(s.header.code)
+    if not fmt.startswith("[MOE-ROUTE-COUNTS] process tokens=%lld "):
+        raise ContractError("FAIL [pin P16]: the summary line does not label its token count as `process tokens`")
+    if fmt.count(COVERAGE_LABEL) != 1:
+        raise ContractError("FAIL [pin P16]: the top-N coverage is not labelled as over the counted blocks, once")
+    if fmt.count(PROMPT_LABEL) != 1 or fmt.find(COVERAGE_LABEL + PROMPT_LABEL) < 0:
+        raise ContractError("FAIL [pin P16]: the prompt-ranked coverage does not follow the top-N coverage directly")
+    if "100.0 * moe_route_prompt_ranked_coverage_overall(c, top_n)," not in hdr:
+        raise ContractError("FAIL [pin P16]: the summary does not print the overall prompt-ranked coverage at top_n")
+    for fn in ("inline double moe_route_prompt_ranked_coverage(", "inline double moe_route_prompt_ranked_coverage_overall("):
+        if hdr.count(fn) != 1:
+            raise ContractError(f"FAIL [pin P16]: `{fn}` is not defined once")
+    ranked = s.header.block_text("inline void prompt_ranked_sum(", "P16")
+    by_prompt = "c.prompt_count(block, a)" in ranked and "c.prompt_count(block, b)" in ranked
+    if ranked.count(squash(TIE_COMPARE)) != 1 or not by_prompt:
+        raise ContractError("FAIL [pin P16]: the ranking is not by prompt count, ties to the lower expert index")
+    if "top_sum += c.decode_count(block, rank[i]);" not in ranked or "sum += c.decode_count(block, e);" not in ranked:
+        raise ContractError("FAIL [pin P16]: the ranked set's share is not a sum of decode counts over the decode total")
+    overall = hdr[hdr.find("inline double moe_route_prompt_ranked_coverage_overall(") :]
+    if "top_all += top;" not in overall or "sum_all += sum;" not in overall or "sum_all > 0" not in overall:
+        raise ContractError("FAIL [pin P16]: the overall prompt-ranked coverage is not weighed by the decode pairs")
+    raw = s.header.raw
+    if raw.count("lower expert index") != 2:
+        raise ContractError("FAIL [pin P16]: the tie-break to the lower expert index is not stated by both comments")
+    flat = " ".join(raw.replace("//", " ").split())
+    if "an upper bound for those blocks under equal slots, not a model-wide rate" not in flat:
+        raise ContractError("FAIL [pin P16]: the coverage comment does not say it is an upper bound, not a model-wide rate")
+    row = next((ln for ln in s.docs.split("\n") if ln.startswith(f"| `{ENV_NAME}=")), "")
+    for need in ("`process tokens`", "prompt-ranked top-N coverage", "upper bound", "lower expert index"):
+        if need not in row:
+            raise ContractError(f"FAIL [pin P16]: the env-var row does not say `{need}`")
 
 
 def check_counting_tensor(s: Sources, count_block: str, build: str) -> None:
@@ -516,8 +559,7 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("count-waits", "P5", B, [(count_loop, "ctx.stream()->wait();\n                " + count_loop)])
     expect_fail("count-locks", "P5", B,
                 [(count_loop, "std::lock_guard<std::mutex> g(unused_mutex);\n                " + count_loop)])
-    expect_fail("summary-at-info", "P6", "prefetch", [(WARN_LINE.replace("GGML_LOG_WARN", "GGML_LOG_WARN"),
-                                                       WARN_LINE.replace("GGML_LOG_WARN", "GGML_LOG_INFO"))])
+    expect_fail("summary-at-info", "P6", "prefetch", [(WARN_LINE, WARN_LINE.replace("GGML_LOG_WARN", "GGML_LOG_INFO"))])
     expect_fail("backend-final-site-no-report", "P6", B,
                 [("ggml_sycl::moe_route_counts_report_final(d, stats.total_tokens.load(std::memory_order_relaxed));",
                   "")])
@@ -561,7 +603,7 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("registry-destroyed-at-exit", "P12", "prefetch",
                 [(SLOTS_NEW, "static moe_route_counts_slot slots[GGML_SYCL_MAX_DEVICES];")])
     expect_fail("install-without-lock", "P12", "prefetch",
-                [("    std::lock_guard<std::mutex> lock(slot.mutex);\n    // The replaced table",
+                [("    std::lock_guard<std::mutex> lock(slot->mutex);\n    // The replaced table",
                   "    // The replaced table")])
 
     expect_fail("model-label-dropped", "P13", "header",
@@ -579,8 +621,45 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    if (counted <= 0) {\n        return 0.0;\n    }\n    const double pairs  ",
                   "    const double pairs  ")])
     expect_fail("summary-buffer-too-small", "P13", "header", [("char         line[768];", "char         line[400];")])
+    # The line's longest text, with the prompt-ranked figure, is 532 bytes: a buffer just below it must be caught.
+    expect_fail("summary-buffer-below-the-longest-line", "P13", "header",
+                [("char         line[768];", "char         line[500];")])
     expect_fail("docs-row-lacks-model-rate", "P13", "docs",
                 [("(blocks not counted taken as all device)", "(blocks not counted)")])
+
+    # The relabelled figures and the prompt-ranked coverage.
+    H = "header"
+    expect_fail("tokens-label-unqualified", "P16", H, [("process tokens=%lld", "tokens=%lld")])
+    expect_fail("coverage-label-old", "P16", H,
+                [("over the counted blocks (each given the model's mean %.1f slots); ",
+                  "(a use-ranked set of the mean %.1f resident experts per block); ")])
+    expect_fail("prompt-ranked-label-dropped", "P16", H,
+                [("prompt-ranked top-%d coverage=%.1f%%; prompt routed", "prompt routed")])
+    expect_fail("prompt-ranked-not-after-coverage", "P16", H,
+                [("slots); \"", "slots); prompt routed pairs=%llu; \"")])
+    expect_fail("prompt-ranked-prints-per-block-figure", "P16", H,
+                [("100.0 * moe_route_prompt_ranked_coverage_overall(c, top_n),",
+                  "100.0 * moe_route_prompt_ranked_coverage(c, 0, top_n),")])
+    expect_fail("tie-break-reversed", "P16", H, [(TIE_COMPARE, "return pa != pb ? pa > pb : a > b;")])
+    expect_fail("ranks-ascending", "P16", H, [(TIE_COMPARE, "return pa != pb ? pa < pb : a < b;")])
+    expect_fail("ranks-by-decode-counts", "P16", H,
+                [("const uint64_t pa = c.prompt_count(block, a);", "const uint64_t pa = c.decode_count(block, a);")])
+    expect_fail("share-sums-prompt-counts", "P16", H,
+                [("top_sum += c.decode_count(block, rank[i]);", "top_sum += c.prompt_count(block, rank[i]);")])
+    expect_fail("overall-not-weighed-by-pairs", "P16", H,
+                [("prompt_ranked_sum(c, b, n, &top, &sum);\n        top_all += top;\n        sum_all += sum;",
+                  "prompt_ranked_sum(c, b, n, &top, &sum);\n        top_all += top;\n        sum_all += 1;")])
+    expect_fail("tie-break-comment-dropped", "P16", H,
+                [("is deterministic; a block", "is stable; a block"),
+                 ("Ties in the prompt count go to the lower expert index, so", "Ties in the prompt count are kept, so")])
+    expect_fail("upper-bound-comment-dropped", "P16", H,
+                [("an upper bound for those blocks under equal slots, not a model-wide rate.", "the coverage.")])
+    D = "docs"
+    expect_fail("docs-row-lacks-process-tokens", "P16", D, [("`process tokens` (the process", "tokens (the process")])
+    expect_fail("docs-row-lacks-prompt-ranked", "P16", D,
+                [("(`prompt-ranked top-N coverage=...`:", "(`prompt-ranked coverage=...`:")])
+    expect_fail("docs-row-lacks-upper-bound", "P16", D,
+                [("an upper bound for the counted blocks", "a rate for the counted blocks")])
 
     # The fused gate/up tensor, the loop's bound and sense, the negative block, and the report that grows.
     fused = ' || std::strstr(name, "ffn_gate_up_exps") != nullptr'

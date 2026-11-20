@@ -8413,7 +8413,9 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     int     n_moe_layers        = 0;
     int     n_experts_per_layer = 0;
     int     n_experts_used      = 0;  // top-K from ids tensor
-    int     n_route_blocks      = 0;  // highest block number of an expert tensor + 1, for the routed-expert counts
+    // Highest block number of an expert tensor + 1, for the routed-expert counts. The table is sized from the graph
+    // this init sees: a block the graph did not hold falls into out_of_range, which the summary line prints.
+    int     n_route_blocks      = 0;
     size_t  expert_weight_bytes = 0;
     // (D, K, N) over the nodes registered below, those whose src0 has storage: D = max top-K x tokens, K = max ne00,
     // N = max ne01, for n_embd and the secondary staging buffer. What the plan walk shares with it is the fold
@@ -86160,14 +86162,13 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
         }
         record->lease[e] = operand.lease();
     }
-    const bool any_host = std::find_if(record->host_weight.begin(), record->host_weight.end(),
-                                       [](const void * w) { return w != nullptr; }) != record->host_weight.end();
+    const size_t n_host   = static_cast<size_t>(std::count_if(record->host_weight.begin(), record->host_weight.end(),
+                                                              [](const void * w) { return w != nullptr; }));
+    const bool   any_host = n_host > 0;
     if ((!all_host && !substitute) || !any_host) {
         return refuse(any_host ? "no device expert pointer stands in for the host slots" : "no expert runs on the CPU");
     }
     if (record->route_counts) {
-        const auto n_host = static_cast<size_t>(std::count_if(record->host_weight.begin(), record->host_weight.end(),
-                                                              [](const void * w) { return w != nullptr; }));
         record->route_counts->set_block_resident(record->route_block, static_cast<int>(record->n_as - n_host));
     }
 
@@ -86192,9 +86193,7 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
         GGML_LOG_INFO(
             "[MOE-ROUTE] hybrid decode record tensor=%s device=%d all_host=%d layout=%s experts=%zu host=%zu\n",
-            src0->name, device, all_host ? 1 : 0, ggml_sycl_layout_mode_name(layout), record->n_as,
-            static_cast<size_t>(std::count_if(record->host_weight.begin(), record->host_weight.end(),
-                                              [](const void * w) { return w != nullptr; })));
+            src0->name, device, all_host ? 1 : 0, ggml_sycl_layout_mode_name(layout), record->n_as, n_host);
     }
     *out = std::move(record);
     return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE;

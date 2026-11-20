@@ -96,6 +96,7 @@ class moe_route_counts {
     }
 
     // Zero every counter, forget every residency, and forget the last reported total (claim_report() claims afresh).
+    // Call only while no thread counts: it is not atomic as a whole.
     void reset() {
         const size_t cells = cells_total();
         for (size_t i = 0; i < cells; ++i) {
@@ -289,6 +290,33 @@ inline void top_n_sum(const moe_route_counts & c, int block, int n, uint64_t * t
     *total = sum;
 }
 
+// The decode counts, summed, of the block's `n` experts with the highest PROMPT counts, and the block's decode total.
+// Ties in the prompt count go to the lower expert index, so the ranking, and the result, is deterministic; a block with
+// no prompt counts ranks its experts by index.
+inline void prompt_ranked_sum(const moe_route_counts & c, int block, int n, uint64_t * top, uint64_t * total) {
+    std::vector<int> rank(static_cast<size_t>(c.n_experts()));
+    uint64_t         sum = 0;
+    for (int e = 0; e < c.n_experts(); ++e) {
+        rank[static_cast<size_t>(e)] = e;
+        sum += c.decode_count(block, e);
+    }
+    const size_t keep = n <= 0 ? 0 : std::min(static_cast<size_t>(n), rank.size());
+    if (keep > 0 && keep < rank.size()) {
+        std::partial_sort(rank.begin(), rank.begin() + static_cast<std::ptrdiff_t>(keep), rank.end(),
+                          [&c, block](int a, int b) {
+                              const uint64_t pa = c.prompt_count(block, a);
+                              const uint64_t pb = c.prompt_count(block, b);
+                              return pa != pb ? pa > pb : a < b;
+                          });
+    }
+    uint64_t top_sum = 0;
+    for (size_t i = 0; i < keep; ++i) {
+        top_sum += c.decode_count(block, rank[i]);
+    }
+    *top   = top_sum;
+    *total = sum;
+}
+
 }  // namespace moe_route_detail
 
 // The share of the block's routed pairs that its `n` most-routed experts account for: the hit rate a use-ranked
@@ -300,7 +328,9 @@ inline double moe_route_top_n_coverage(const moe_route_counts & c, int block, in
     return sum > 0 ? static_cast<double>(top) / static_cast<double>(sum) : 0.0;
 }
 
-// The same over every block, weighing each by its routed pairs: n slots in every block.
+// The same over every block, weighing each by its routed pairs: n slots in every block. A block that was not counted
+// has no decode counts and adds nothing, so this is the figure over the COUNTED blocks only, given the same n slots
+// each: an upper bound for those blocks under equal slots, not a model-wide rate.
 inline double moe_route_top_n_coverage_overall(const moe_route_counts & c, int n) {
     uint64_t top_all = 0;
     uint64_t sum_all = 0;
@@ -308,6 +338,31 @@ inline double moe_route_top_n_coverage_overall(const moe_route_counts & c, int n
         uint64_t top = 0;
         uint64_t sum = 0;
         moe_route_detail::top_n_sum(c, b, n, &top, &sum);
+        top_all += top;
+        sum_all += sum;
+    }
+    return sum_all > 0 ? static_cast<double>(top_all) / static_cast<double>(sum_all) : 0.0;
+}
+
+// The share of the block's decode pairs that fall on the `n` experts with the highest prompt counts in the same block:
+// how well the prompt's routing predicts decode's. Ties in the prompt count go to the lower expert index. 0 for a
+// block nothing was routed in during decode.
+inline double moe_route_prompt_ranked_coverage(const moe_route_counts & c, int block, int n) {
+    uint64_t top = 0;
+    uint64_t sum = 0;
+    moe_route_detail::prompt_ranked_sum(c, block, n, &top, &sum);
+    return sum > 0 ? static_cast<double>(top) / static_cast<double>(sum) : 0.0;
+}
+
+// The same over every counted block, weighing each by its decode pairs; a block with no decode pairs is left out. 0
+// when no block was counted.
+inline double moe_route_prompt_ranked_coverage_overall(const moe_route_counts & c, int n) {
+    uint64_t top_all = 0;
+    uint64_t sum_all = 0;
+    for (int b = 0; b < c.n_blocks(); ++b) {
+        uint64_t top = 0;
+        uint64_t sum = 0;
+        moe_route_detail::prompt_ranked_sum(c, b, n, &top, &sum);
         top_all += top;
         sum_all += sum;
     }
@@ -384,9 +439,10 @@ inline std::string moe_route_block_table(const moe_route_counts & c) {
     return out;
 }
 
-// The one-line final summary: tokens, blocks counted and not counted, routed pairs, the decode hit rate, and the top-N
-// coverage at N = the model's mean number of resident experts per block, rounded: the hit rate a use-ranked set with
-// the same slots in every block would have had.
+// The one-line final summary: the process's decode tokens (MoeDispatchStats' total, not a count of this table), blocks
+// counted and not counted, routed pairs, the decode hit rate, and, at N = the model's mean number of resident experts
+// per block, rounded: the top-N coverage over the counted blocks (the hit rate a use-ranked set of N slots in each of
+// them would have had) and the prompt-ranked top-N coverage (the same, with the set chosen by prompt counts).
 inline std::string moe_route_summary_line(const moe_route_counts & c, int64_t tokens) {
     const int    counted = moe_route_blocks_counted(c);
     const double mean    = moe_route_mean_resident_experts(c);
@@ -394,15 +450,17 @@ inline std::string moe_route_summary_line(const moe_route_counts & c, int64_t to
     char         line[768];
     int          n = std::snprintf(
         line, sizeof(line),
-        "[MOE-ROUTE-COUNTS] tokens=%lld blocks counted=%d not counted=%d (all resident, not counted) of %d; "
+        "[MOE-ROUTE-COUNTS] process tokens=%lld blocks counted=%d not counted=%d (all resident, not counted) of %d; "
                  "decode routed pairs=%llu hit rate=%.1f%% (device %llu, host %llu) "
                  "model hit rate=%.1f%% (blocks not counted taken as all device); top-%d coverage=%.1f%% "
-                 "(a use-ranked set of the mean %.1f resident experts per block); prompt routed pairs=%llu",
+                 "over the counted blocks (each given the model's mean %.1f slots); "
+                 "prompt-ranked top-%d coverage=%.1f%%; prompt routed pairs=%llu",
         static_cast<long long>(tokens), counted, c.n_blocks() - counted, c.n_blocks(),
         static_cast<unsigned long long>(moe_route_decode_pairs(c)), 100.0 * moe_route_overall_hit_rate(c),
         static_cast<unsigned long long>(moe_route_decode_hits(c)),
         static_cast<unsigned long long>(moe_route_decode_misses(c)), 100.0 * moe_route_model_hit_rate(c), top_n,
-        100.0 * moe_route_top_n_coverage_overall(c, top_n), mean,
+        100.0 * moe_route_top_n_coverage_overall(c, top_n), mean, top_n,
+        100.0 * moe_route_prompt_ranked_coverage_overall(c, top_n),
         static_cast<unsigned long long>(moe_route_prompt_pairs(c)));
     std::string out(line,
                     n > 0 ? (static_cast<size_t>(n) < sizeof(line) ? static_cast<size_t>(n) : sizeof(line) - 1) : 0);
