@@ -4470,11 +4470,6 @@ static bool ggml_sycl_graph_has_host_inputs(const ggml_cgraph * cgraph) {
     return false;
 }
 
-// ---------------------------------------------------------------------------
-// SOA-correct expert caching: single-expert wrapper around direct_stage_expert.
-// Used by ExpertPrefetcher::hint() to upload experts with correct SOA layout
-// instead of raw AOS memcpy.  Returns device pointer on success, nullptr on failure.
-// ---------------------------------------------------------------------------
 struct ggml_sycl_xmx_tiled_fill_ctx {
     moe_xmx_fused::MXFPXMXLayoutInfo info;
     int64_t                          n_experts;
@@ -4620,101 +4615,6 @@ static void moe_decode_route_census_maybe_print() {
 }
 
 namespace ggml_sycl {
-void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id) {
-    moe_expert_meta meta{};
-    bool            found = false;
-    {
-        std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-        for (const auto & m : g_moe_expert_meta) {
-            if (m.layer_id == layer_idx && m.expert_idx == expert_idx) {
-                meta  = m;
-                found = true;
-                break;
-            }
-        }
-    }
-    if (!found) {
-        return nullptr;
-    }
-    moe_expert_source source = ggml_sycl_resolve_moe_meta_source(meta, device_id);
-    if (!source) {
-        return nullptr;
-    }
-    if (source.has_ready) {
-        source.ready.wait();
-    }
-
-    // Get unified cache for target device
-    unified_cache * cache = get_unified_cache_for_device(device_id);
-    if (!cache) {
-        return nullptr;
-    }
-
-    // P4: Check placement plan — skip device staging for experts planned for host.
-    // Without this, a caller that stages an expert by its coordinates
-    // (ExpertPrefetcher::preload_experts) bypasses the plan and exhausts the
-    // WEIGHT zone on MoE models that exceed VRAM.
-    if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !meta.tensor_name.empty()) {
-        if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(meta.tensor_name, expert_idx, device_id)) {
-            return nullptr;  // Expert planned for host — caller handles host fallback
-        }
-    }
-
-    // Build cache key from expert tensor metadata
-    ggml_sycl_cache_id key = meta.canonical_key;
-
-    if (!ggml_sycl_layout_supports_soa(meta.type)) {
-        return nullptr;
-    }
-
-    key = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_SOA);
-
-    if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-        return cache->lookup(key, GGML_LAYOUT_SOA);
-    }
-
-    // Compute SOA byte count for this expert's dimensions
-    const size_t soa_bytes =
-        ggml_sycl_layout_bytes_for_dims(meta.type, meta.ne0, meta.ne1, GGML_LAYOUT_SOA, device_id);
-    const size_t dst_bytes = (soa_bytes > 0) ? soa_bytes : meta.bytes;
-
-    // Build AOS→SOA reorder context
-    ggml_sycl_reorder_fill_ctx reorder_ctx{};
-    reorder_ctx.type             = meta.type;
-    reorder_ctx.ncols            = meta.ne0;
-    reorder_ctx.nrows            = meta.ne1;
-    reorder_ctx.nbytes           = meta.bytes;
-    reorder_ctx.dst_bytes        = dst_bytes;
-    reorder_ctx.layout           = GGML_LAYOUT_SOA;
-    reorder_ctx.src_is_device    = source.owning_device >= 0;
-    reorder_ctx.device_id        = device_id;
-    reorder_ctx.source_device_id = source.owning_device;
-
-    // Route H2D to BCS (copy-only) queue to keep SOA reorder off CCS.
-    // Without this, runtime expert staging during inference monopolizes CCS
-    // and can trigger xe driver GT engine resets (>640ms preempt timeout).
-    sycl::queue * bcs_q = &cache->get_bcs_queue();
-
-    ggml_sycl_direct_stage_owner_handoff handoff(source.handle);
-    try {
-        ggml_sycl::mem_handle storage_handle;
-        auto result = cache->direct_stage_expert(key, source.ptr, meta.bytes, dst_bytes, GGML_LAYOUT_SOA,
-                                                 ggml_sycl_fill_reordered_host, &reorder_ctx, bcs_q,
-                                                 &storage_handle);
-        handoff.set_destination(storage_handle);
-        ggml_sycl_retain_direct_stage_owners(handoff, result, *bcs_q);
-        if (result.ok && result.ptr) {
-            return result.ptr;
-        }
-    } catch (...) {
-        // A throw provides no terminal event. Drain before the local source
-        // lease is released, then let the caller fall back to CPU dispatch.
-        ggml_sycl_drain_direct_stage_queue(*bcs_q);
-    }
-
-    return nullptr;
-}
-
 static void ggml_sycl_configure_host_zones_for_plan(
     ggml_sycl::unified_cache * cache, const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner) {
     if (!cache || !plan_owner || plan_owner->entries.empty()) {

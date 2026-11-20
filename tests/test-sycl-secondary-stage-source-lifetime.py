@@ -70,12 +70,6 @@ def verify(source: str) -> None:
     drain = function_body(source, "ggml_sycl_drain_direct_stage_queue(")
     require(drain, "queue.wait_and_throw()", "failure path does not synchronously drain its exact queue")
 
-    ensure = function_body(source, "moe_expert_ensure_soa_cached(")
-    require(ensure, "ggml_sycl_direct_stage_owner_handoff handoff(source.handle)",
-            "async SOA materialization omits the retained handoff")
-    require(ensure, "handoff.set_destination(storage_handle)",
-            "async SOA materialization omits its destination owner")
-
     materialize = function_body(source, "ggml_sycl_materialize_planned_expert_layout(")
     require(materialize,
             "ggml_sycl_direct_stage_owner_handoff handoff(stage_from_soa ? source_layout_handle : source.handle)",

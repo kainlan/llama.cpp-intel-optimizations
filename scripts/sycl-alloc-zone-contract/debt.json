@@ -526,7 +526,6 @@
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::lambda in moe_graph_record_block_graphs::catch_clause:exception#0"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::moe_direct_event_terminal::ready::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::moe_direct_event_terminal::wait::catch_clause:all#0"},
-    {"code": "G-CATCH", "key": "ggml-sycl.cpp::moe_expert_ensure_soa_cached::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::moe_graph_record_moe_dispatch_graph::catch_clause:exception#0"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::moe_graph_record_segment_slot::catch_clause:exception#0"},
     {"code": "G-CATCH", "key": "ggml-sycl.cpp::moe_graph_record_segments::catch_clause:all#0"},

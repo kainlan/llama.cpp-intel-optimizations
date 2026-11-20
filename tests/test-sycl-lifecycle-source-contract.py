@@ -619,7 +619,9 @@ def _owning_reader_sites():
 # The legacy expert prestage left with the name-hash expert ranking, and six of these statements with it: its
 # per-expert plan check and plan read, its secondary-device loop's three plan reads and its runtime switch's check.
 # The MoE reorder temp buffer's reservation, which only that prestage read, took four more: its multi-card
-# condition's two global-plan checks and two global-plan reads.
+# condition's two global-plan checks and two global-plan reads. The single-expert SOA upload, reachable only from an
+# init-time preload nothing called, took three cache-plan statements: its plan check, its plan-and-name check and
+# its per-expert device check.
 INTERNAL_WRAPPER_SITES = {
     "ggml_sycl_cache_plan_owner": Counter({
         "(*ggml_sycl_cache_plan_owner(cache))": 1,
@@ -649,15 +651,12 @@ INTERNAL_WRAPPER_SITES = {
         "ggml_sycl_cache_plan_owner(cache)->count_planned_experts(src0->name, n_experts, device);": 1,
         "ggml_sycl_cache_plan_owner(cache)->is_on_device(dense_name, device);": 1,
         "ggml_sycl_configure_host_zones_for_plan(cache, ggml_sycl_cache_plan_owner(cache));": 1,
-        "if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(meta.tensor_name, expert_idx, device_id)) {": 1,
         "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty() || tensor->name[0] == '\\0') {": 1,
         "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 16,
         "if (!cgraph || !cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 2,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() &&": 2,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !dense_name.empty()) {": 2,
-        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !meta.tensor_name.empty()) {": 1,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty()) {": 1,
-        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 1,
         "if (!route_cache || ggml_sycl_cache_plan_owner(route_cache)->entries.empty()) {": 1,
         "if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 4,
         "if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() && src0->name && src0->name[0] != '\\0') {": 1,

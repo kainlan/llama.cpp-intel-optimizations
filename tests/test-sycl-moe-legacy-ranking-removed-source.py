@@ -85,6 +85,9 @@ REMOVED_WORDS = (
     # The cache's atomic expert-group staging, whose only caller was the prestage.
     "stage_expert_group",
     "staging_tensor_data",
+    # The single-expert SOA upload and the init-time preload, its only caller, which nothing called.
+    "moe_expert_ensure_soa_cached",
+    "preload_experts",
 )
 REMOVED_TAGS = ("[MOE-WARMUP]", "[MOE-GATE-NORM]", "[MOE-RERANK]", "[ADAPTIVE-PRESTAGE]")
 
@@ -296,8 +299,8 @@ def self_test(raws: dict[str, str]) -> int:
                 'static bool f() { return std::getenv("GGML_SYCL_LEGACY_PRESTAGE"); }\n' + hotset_anchor)
     expect_fail("adaptive-prestage-back", "L1", BACKEND, hotset_anchor,
                 "static int g_adaptive_prestage;\n" + hotset_anchor)
-    expect_fail("frequency-api-back", "L1", "expert-prefetch.hpp", "void * moe_expert_ensure_soa_cached(",
-                "uint32_t get_expert_frequency(int layer_hash, int expert_id);\nvoid * moe_expert_ensure_soa_cached(")
+    expect_fail("frequency-api-back", "L1", "expert-prefetch.hpp", "struct expert_stage_descriptor {",
+                "uint32_t get_expert_frequency(int layer_hash, int expert_id);\nstruct expert_stage_descriptor {")
     expect_fail("rank-api-undeclared", "L2", CACHE_HPP, "bool is_expert_popularity_initialized();",
                 "bool expert_popularity_ready();")
     expect_fail("rank-api-undefined", "L2", BACKEND, ranks_anchor, "bool expert_popularity_ready() {")

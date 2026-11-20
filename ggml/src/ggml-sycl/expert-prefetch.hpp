@@ -39,14 +39,6 @@
 
 namespace ggml_sycl {
 
-// SOA-correct expert caching via unified cache.
-// Looks up expert metadata, performs AOS->SOA layout conversion, and uploads
-// to VRAM on the specified device using direct_stage_expert().
-// Returns device pointer if expert was successfully cached in SOA layout.
-// Returns nullptr if caching failed (no metadata, VRAM full, etc.).
-// Thread-safe: acquires g_moe_expert_meta_mutex and unified cache locks internally.
-void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id);
-
 // Value-owned description of one expert staging operation. Metadata is copied
 // under the model registry lock; source_owner pins the canonical AOS entry and
 // deps carries any publication event that must precede the reorder submission.
@@ -219,11 +211,6 @@ class ExpertPrefetcher {
     int completed_count() const;
 
     bool is_active() const { return is_initialized(); }
-
-    // Pre-fill the cache with popular experts at model init time.
-    // Called from moe_hybrid_init_once() after Phase 2.
-    // Routes through unified cache (no private pool).
-    void preload_experts(int layer_idx, const std::vector<int> & expert_ids);
 
   private:
     std::shared_ptr<sycl::queue>
