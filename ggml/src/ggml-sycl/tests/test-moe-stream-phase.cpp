@@ -1208,19 +1208,15 @@ int main() {
               "layout=2 unsupported(local-layout-unsupported)=2 recipe(RECIPE_MISMATCH)=1 recipe(RECIPE_MISSING)=1");
         // Every cause has a name of its own.
         const moe_staged_route_refusal all[] = {
-            moe_staged_route_refusal::NONE,          moe_staged_route_refusal::CLAIMED,
-            moe_staged_route_refusal::UNSUPPORTED,   moe_staged_route_refusal::KERNEL,
-            moe_staged_route_refusal::DIRECT_KERNEL, moe_staged_route_refusal::VIEW,
-            moe_staged_route_refusal::LAYOUT,        moe_staged_route_refusal::ROUTE,
-            moe_staged_route_refusal::RECIPE,
+            moe_staged_route_refusal::NONE,   moe_staged_route_refusal::CLAIMED, moe_staged_route_refusal::UNSUPPORTED,
+            moe_staged_route_refusal::KERNEL, moe_staged_route_refusal::VIEW,    moe_staged_route_refusal::LAYOUT,
+            moe_staged_route_refusal::ROUTE,  moe_staged_route_refusal::RECIPE,
         };
         std::unordered_set<std::string> names;
         for (moe_staged_route_refusal r : all) {
             names.insert(ggml_sycl::moe_staged_route_refusal_name(r));
         }
         CHECK(names.size() == sizeof(all) / sizeof(all[0]) && names.count("unknown") == 0);
-        CHECK(std::strcmp(ggml_sycl::moe_staged_route_refusal_name(moe_staged_route_refusal::DIRECT_KERNEL),
-                          "direct-kernel") == 0);
     }
 
     // ---- the regions' last uses, by window: what stage_window() refills, window_done() gates and reset_regions()

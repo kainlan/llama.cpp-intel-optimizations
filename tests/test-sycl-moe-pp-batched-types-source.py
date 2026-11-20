@@ -11,7 +11,7 @@ dequant. These claims pin that shape:
       ggml_sycl_moe_pp_batched_takes_layout(), which asks moe_pp_batched_supports_layout() in moe-mmvq-tables.hpp,
       and neither tests GGML_TYPE_MXFP4 itself;
   (b) the f16 table lists each required type on AOS, Q4_0, Q8_0, Q4_K and Q6_K on AOS and SOA, MXFP4 on SOA only,
-      never the direct-kernel types, its non-MXFP4 types and REQUIRED_AOS are one set (a type added to the table
+      never Q1_0 or NVFP4, its non-MXFP4 types and REQUIRED_AOS are one set (a type added to the table
       without a pin is red), and every type it lists has a case in convert.cpp's
       ggml_get_to_fp16_sycl_for_layout; that case decodes SOA with a reorder kernel for Q4_0, Q4_K and Q6_K, and
       since it answers Q8_0 with the AOS kernel for every layout, the lambda takes Q8_0 SOA to
@@ -132,8 +132,8 @@ REQUIRED_AOS = [
 # experts SOA; the device test's RED run refused both).
 REQUIRED_SOA = ["GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_Q4_K", "GGML_TYPE_Q6_K"]
 AOS_SOA_EXPR = "layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA"
-# Q1_0 and NVFP4 run on a device only through their direct kernel (moe_type_needs_direct_kernel); float experts are
-# not a dequant case.
+# Q1_0 and NVFP4 run on a device through their MMVQ id kernel, and the table lists them only once
+# test-moe-pp-batched-dequant runs them against the CPU; float experts are not a dequant case.
 FORBIDDEN = ["GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4", "GGML_TYPE_F16", "GGML_TYPE_F32", "GGML_TYPE_BF16"]
 AOS_EXPR = "layout == GGML_LAYOUT_AOS"
 KNOB = "GGML_SYCL_MOE_PP_F16_BATCHED_AOS"

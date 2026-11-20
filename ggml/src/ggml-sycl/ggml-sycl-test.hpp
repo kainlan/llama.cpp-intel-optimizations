@@ -28,6 +28,9 @@ bool       test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle l
 // ggml_sycl_plan_has_cpu_work() on a synthetic plan: true when the CPU would
 // execute any part of the graph (llama.cpp-38af).
 bool test_plan_has_cpu_work(const placement_plan & plan);
+// The clause of that predicate which fired, by the name the "[SYCL-CPU-ACT] plan CPU work:" line prints, or nullptr
+// when the plan leaves the CPU no work.
+const char * test_plan_cpu_work_reason(const placement_plan & plan);
 
 // Mutable controls are declared only for private direct-source fixtures.
 #if defined(GGML_SYCL_PRIVATE_TESTING)

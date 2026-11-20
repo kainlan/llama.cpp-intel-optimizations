@@ -23,7 +23,8 @@
 # graph and trip the dkw0 replay-futility detector. So the backend exports ONE
 # predicate computed from its own placement plan (ggml_backend_sycl_plan_has_cpu_work:
 # a host-planned dense layer or weight under supports_op's own residency rule,
-# host-planned KV, or a fully host-planned expert tensor), llama-context ORs it
+# host-planned KV, a dense weight whose type has no device MUL_MAT kernel, or a
+# fully host-planned expert tensor), llama-context ORs it
 # with its own partial-offload test, and the choice is re-made right before every
 # ggml_backend_sched_new() because the auto-ubatch resyncs re-plan after the
 # constructor's buft enumeration.
@@ -46,11 +47,16 @@ root = Path(args.root).resolve() if args.root else Path(__file__).resolve().pare
 sycl_cpp = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 sycl_h = (root / "ggml/include/ggml-sycl.h").read_text()
 ctx_cpp = (root / "src/llama-context.cpp").read_text()
+cache_cpp = (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
 
 BUFT_FN = "ggml_backend_sycl_cpu_activation_buffer_type"
 NAME_FN = BUFT_FN + "_name"
 PRED_FN = "ggml_backend_sycl_plan_has_cpu_work"
 PLAN_HELPER = "ggml_sycl_plan_cpu_work_reason"
+# The "dense-type" clause's test for one plan entry, which the plan helper calls.
+DENSE_TYPE_FN = "ggml_sycl_plan_cpu_work_is_dense_type"
+# Where a plan entry takes the loader's facts (type, get_rows_only) from the inventory.
+COPY_ENTRY_FN = "copy_tensor_info_to_entry"
 CTX_PRED = "llama_context_sycl_plan_has_cpu_work"
 CTX_SELECT = "llama_context_cpu_compute_buft"
 NEW_CALL = "ggml_backend_sched_new(backend_ptrs"
@@ -106,6 +112,12 @@ texts = {
     "ctx_cpp": ctx_cpp,
     "plan_helper": function_window(
         sycl_cpp, "static const char * " + PLAN_HELPER + "(const ggml_sycl::placement_plan & plan) {", window=8000),
+    "dense_type_fn": function_window(
+        sycl_cpp, "static bool " + DENSE_TYPE_FN + "(const ggml_sycl::placement_entry & e) {", window=2000),
+    "copy_entry_fn": function_window(
+        cache_cpp,
+        "static void " + COPY_ENTRY_FN + "(placement_entry & entry, const placement_tensor_info & tensor) {",
+        window=2000),
     "pred_fn": function_window(sycl_cpp, "bool " + PRED_FN + "(ggml_backend_dev_t dev) {"),
     "ctx_select_fn": function_window(
         ctx_cpp, "static ggml_backend_buffer_type_t " + CTX_SELECT + "(", window=4000),
@@ -226,12 +238,16 @@ def witness_vi(t):
 def check_vi_predicate_reads_the_plan(t):
     wrapper = t["pred_fn"]
     helper = t["plan_helper"]
-    return (bool(wrapper) and bool(helper)
+    dense_type = t["dense_type_fn"]
+    return (bool(wrapper) and bool(helper) and bool(dense_type)
             and "ggml_sycl_global_plan_snapshot()" in wrapper
             and PLAN_HELPER + "(" in wrapper
             and "[SYCL-CPU-ACT]" in wrapper     # which clause fired, for the -v log
             and "layer_device" in helper        # host-planned dense layer
             and "get_kv_device(" in helper      # host-planned KV
+            and DENSE_TYPE_FN + "(e)" in helper  # a dense weight type with no device MUL_MAT kernel ...
+            and "dense_mul_mat_type_supported(" in dense_type  # ... asked of supports_op's MUL_MAT allowlist
+            and "get_rows_only" in dense_type   # a gather-only weight is never a MUL_MAT operand
             and "expert_on_device(" in helper   # fully host-planned expert tensor
             and "multi_device" in helper        # dense residency follows supports_op's rule
             and "target_device" in helper
@@ -241,6 +257,21 @@ def check_vi_predicate_reads_the_plan(t):
 
 def witness_vi_plan(t):
     t["plan_helper"] = "{ return true; }"
+    return t
+
+
+# --- (vi-c) the plan entry carries the loader's facts the "dense-type" clause reads: copy_tensor_info_to_entry
+# copies the type and the gather-only role from the inventory, so a weight the loader marked gather-only reaches
+# the predicate as gather-only. RED at c9f464b48: the copy carried the type but not get_rows_only.
+def check_vi_entry_carries_loader_role(t):
+    body = " ".join(t["copy_entry_fn"].split())  # alignment padding is not part of the contract
+    return (bool(body)
+            and "entry.type = tensor.type;" in body
+            and "entry.get_rows_only = tensor.get_rows_only;" in body)
+
+
+def witness_vi_entry(t):
+    t["copy_entry_fn"] = t["copy_entry_fn"].replace("tensor.get_rows_only;", "false;")
     return t
 
 
@@ -341,8 +372,10 @@ checks = [
      check_v_not_whitelisted, witness_v),
     ("vi-a: the plan predicate is exported in ggml-sycl.h and through the proc-address table",
      check_vi_predicate_exported, witness_vi),
-    ("vi-b: the plan predicate reads layer_device / KV device / expert residency and is not a constant",
-     check_vi_predicate_reads_the_plan, witness_vi_plan),
+    ("vi-b: the plan predicate reads layer_device / KV device / dense weight type / expert residency and is not a "
+     "constant", check_vi_predicate_reads_the_plan, witness_vi_plan),
+    ("vi-c: the plan entry copies the type and the gather-only role from the inventory",
+     check_vi_entry_carries_loader_role, witness_vi_entry),
     ("vii: llama-context reaches the predicate in both the GGML_USE_SYCL and BACKEND_DL arms",
      check_vii_context_predicate_both_arms, witness_vii),
     ("viii-a: the buft selection is gated by (plan predicate OR partial offload)",

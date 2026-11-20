@@ -6248,6 +6248,76 @@ set_tests_properties(test-moe-decode-q8-0-soa-mutant-wrong-scale PROPERTIES
 )
 endif() # private SYCL backend fixture
 
+# Mixed residency for Q1_0 and NVFP4 experts: on a planned model whose plan the fixture edits to put 7 of 16 experts on
+# the host, each MUL_MAT_ID op runs its card experts through the batched dispatch and its host experts through the
+# HOST_CPU recipe, at 1, 7 and 512 tokens, on the gate (ne11 1) and down (ne11 4) tensors. Each case must match the CPU
+# backend on the device rows and on the host rows apart, log one [MOE-ROUTE] partition line whose local= and host=
+# counts are the occurrences the plan puts on each side, and refuse nothing. A case whose op picked experts from one
+# side only makes the run exit 77. It links the ordinary DSO, so it runs the production route, and it reads and stages
+# placement plans through the C++ lifecycle entry points the DSO exports (unified-cache.hpp, hence GGML_SYCL_DNNL as
+# the DSO was built). Pinned to the B50; a run with no SYCL GPU, more than one visible card, or
+# GGML_SYCL_WEIGHTS_EVICTABLE off exits 77. It loads a planned model onto the card, so it carries the `model` label,
+# which the full sweep excludes.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-mixed-residency-q1-nvfp4
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-mixed-residency-q1-nvfp4.cpp
+)
+target_include_directories(test-moe-mixed-residency-q1-nvfp4 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_definitions(test-moe-mixed-residency-q1-nvfp4 PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_compile_options(test-moe-mixed-residency-q1-nvfp4 PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-mixed-residency-q1-nvfp4 PRIVATE "-fsycl")
+target_link_libraries(test-moe-mixed-residency-q1-nvfp4 PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-mixed-residency-q1-nvfp4 PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-moe-mixed-residency-q1-nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-mixed-residency-q1-nvfp4 COMMAND test-moe-mixed-residency-q1-nvfp4)
+set_tests_properties(test-moe-mixed-residency-q1-nvfp4 PROPERTIES
+    LABELS "sycl;moe;device;B50;model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
+)
+endif() # static SYCL backend fixture
+
+# The Q1_0/NVFP4 batched-dispatch refusal at run time: on the mixed-residency vehicle (NVFP4, one card expert and three
+# host experts at one token), a failpoint makes the batched dispatch refuse once, and the op must end
+# GGML_STATUS_FAILED with the WARN that names reason=test-failpoint; the same op run again in the same process must then
+# succeed and match the CPU backend on both sides. The failpoint exists only in the private backend objects, so it
+# links ggml-sycl-private-fixtures (not the ordinary DSO) and closes the MMID route those objects compile in. It loads a
+# planned model onto the card, so it carries the `model` label, which the full sweep excludes. Pinned to the B50; a run
+# with no SYCL GPU, more than one visible card, GGML_SYCL_WEIGHTS_EVICTABLE off, or a published plan that leaves the
+# op's experts on one side only exits 77.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-q1-nvfp4-dispatch-refusal
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-q1-nvfp4-dispatch-refusal.cpp
+)
+target_include_directories(test-moe-q1-nvfp4-dispatch-refusal PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-moe-q1-nvfp4-dispatch-refusal PRIVATE ggml-sycl-private-fixtures)
+set_target_properties(test-moe-q1-nvfp4-dispatch-refusal PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-q1-nvfp4-dispatch-refusal COMMAND test-moe-q1-nvfp4-dispatch-refusal)
+set_tests_properties(test-moe-q1-nvfp4-dispatch-refusal PROPERTIES
+    LABELS "sycl;moe;device;B50;model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
+)
+endif() # private SYCL backend fixture
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp

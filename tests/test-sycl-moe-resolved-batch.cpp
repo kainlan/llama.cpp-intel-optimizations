@@ -755,6 +755,17 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             choice = choose_moe_batch_executor(admitted.batch.operands[0], 0, false, ws.total_bytes - 1);
             CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
 
+            // On the card these types run through the MMVQ id kernel the capability query answers for any MMVQ id
+            // type: an MMVQ_COMPAT recipe carries no workspace, and the choice takes it as it takes Q4_0's.
+            auto compat =
+                route_for(&value, 0, moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 93);
+            compat.recipe.request = request;
+            auto compat_batch     = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return compat; });
+            CHECK(compat_batch);
+            choice = choose_moe_batch_executor(compat_batch.batch.operands[0], 0, true, 0);
+            CHECK(choice && choice.executor == moe_batch_executor::PRIMARY_DEVICE);
+
+            // The direct kernel's recipe is checked by its kernel: it binds its bounded workspace exactly.
             auto device =
                 route_for(&value, 0, moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 91);
             device.recipe.request = request;
@@ -764,12 +775,33 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             CHECK(device_batch);
             choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
                                                device.recipe.workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
-            moe_admitted_workspace_bundle ordinary_bundle;
+            CHECK(choice && choice.executor == moe_batch_executor::PRIMARY_DEVICE);
             choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
-                                               device.recipe.workspace.total_bytes, &ordinary_bundle);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
+                                               device.recipe.workspace.total_bytes - 1);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
 
+            // A direct recipe whose workspace is not the one its plan gives is refused, although it was admitted.
+            auto resized = device;
+            resized.recipe.workspace.output_f32_bytes += resized.recipe.workspace.alignment;
+            resized.recipe.workspace.total_bytes += resized.recipe.workspace.alignment;
+            auto resized_batch = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return resized; });
+            CHECK(resized_batch);
+            choice = choose_moe_batch_executor(resized_batch.batch.operands[0], 0, true,
+                                               resized.recipe.workspace.total_bytes);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::RECIPE_MISMATCH);
+
+            // The direct kernel stays bound to its types without a type test of the choice: its plan refuses Q4_0.
+            auto q4_direct =
+                route_for(&value, 0, moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 94);
+            q4_direct.recipe.kernel    = moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS;
+            q4_direct.recipe.workspace = device.recipe.workspace;
+            auto q4_direct_batch       = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return q4_direct; });
+            CHECK(q4_direct_batch);
+            choice = choose_moe_batch_executor(q4_direct_batch.batch.operands[0], 0, true,
+                                               q4_direct.recipe.workspace.total_bytes);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::RECIPE_MISMATCH);
+
+            // Validator coverage only: no route produces a second-card direct-kernel recipe.
             auto secondary =
                 route_for(&value, 1, moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 92);
             secondary.recipe.request = request;
@@ -783,7 +815,10 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             CHECK(secondary_batch);
             choice = choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true,
                                                secondary.recipe.workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
+            CHECK(choice && choice.executor == moe_batch_executor::SECONDARY_DEVICE);
+            choice = choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, false,
+                                               secondary.recipe.workspace.total_bytes);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::WRONG_QUEUE);
 
             auto soa                                 = device_batch.batch.operands[0];
             auto soa_canonical                       = std::make_shared<moe_resolved_operand_canonical>(soa.c());
@@ -791,7 +826,7 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             soa_canonical->admitted_recipe_signature = moe_execution_recipe_signature(soa_canonical->recipe);
             soa.canonical                            = soa_canonical;
             choice = choose_moe_batch_executor(soa, 0, true, soa.recipe().workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::RECIPE_MISMATCH);
         }
     }
     moe_workspace_recipe overflow;

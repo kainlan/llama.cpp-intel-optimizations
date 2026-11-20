@@ -21,12 +21,12 @@ What this gate pins:
     it on every resolve and all four special members carry it; the ring slices each slot with the layout it is
     acquired for, the phase acquires its one slot per matrix as AOS and records AOS (the SOA staging is retired,
     llama.cpp-9433), and the resolver still refuses a slot whose resolved layout is not the entry's;
-  - c-las5 (1): a staged expert is served only as a plain MMVQ_COMPAT kernel on the submit queue, for a type that
-    does not need its direct kernel. A weight the oneDNN batched prompt executor claims, any other kernel, a Q1_0 or
-    NVFP4 matrix, a slice whose resolved layout is not the entry's, or a route either validator refuses falls through
-    to the route core. Every lookup is counted served or refused, and every refusal with its cause, in the order
-    asked, and with the capability's reason or the validator's reject reason (plan Task 8: the trace says why); the
-    capability part is one helper, which the route alone asks;
+  - c-las5 (1): a staged expert is served only as a plain MMVQ_COMPAT kernel on the submit queue, the kernel a
+    resident expert of its (type, layout) runs, so the capability helper asks no type. A weight the oneDNN batched
+    prompt executor claims, any other kernel, a slice whose resolved layout is not the entry's, or a route either
+    validator refuses falls through to the route core. Every lookup is counted served or refused, and every refusal
+    with its cause, in the order asked, and with the capability's reason or the validator's reject reason (plan Task
+    8: the trace says why); the capability part is one helper, which the route alone asks;
   - the batched executor consumes a staged slot whose entry names it as the consumer, for an expert it would otherwise
     decline (llama.cpp-3460): its expert loop defers a claimed layer's HOST expert to its window (llama.cpp-8epx),
     and one stage-table lookup per deferred expert after that window's window_begin, keyed as the staged route keys
@@ -148,7 +148,7 @@ def call_args(text: str, name: str) -> list:
 
 BUILD_SIG = "moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor * src0,"
 STAGED_CAP_SIG = ("static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const "
-                  "moe_route_capability & cap, ggml_type type)")
+                  "moe_route_capability & cap)")
 XMX_SIG = "static bool try_xmx_sorted_moe(ggml_backend_sycl_context & ctx,"
 RECIPE_SIG = "static moe_route_capability ggml_sycl_moe_build_device_recipe("
 UPLOAD_SIG = "static const void * const * ggml_sycl_upload_moe_transient_ptr_table("
@@ -217,7 +217,7 @@ ENTRY_FIELDS = (
 REFUSAL_OPEN = ("const char * refusal_detail = nullptr; const moe_staged_route_refusal refusal = [&]() {")
 # The resolver's refusals, in the order it asks them; each names its cause and, where there is one, its detail.
 REFUSAL_STEPS = (
-    "const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap, src0->type);",
+    "const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap);",
     "if (by_cap != moe_staged_route_refusal::NONE) { refusal_detail = cap.reason; return by_cap; }",
     "if (view.ptr == nullptr || !view.on_device) { return moe_staged_route_refusal::VIEW; }",
     "if (view.layout != s->layout) { return moe_staged_route_refusal::LAYOUT; }",
@@ -232,11 +232,10 @@ REFUSAL_STEPS = (
     "refusal_detail = moe_batch_reject_reason_name(why); return moe_staged_route_refusal::RECIPE; }",
     "return moe_staged_route_refusal::NONE; }();",
 )
-# What a staged slot is served with: the plain MMVQ_COMPAT kernel, for a type with no direct-kernel requirement.
+# What a staged slot is served with: the plain MMVQ_COMPAT kernel, whatever the type, as a resident expert is.
 STAGED_CAP_STEPS = (
     "if (!cap.supported) { return ggml_sycl::moe_staged_route_refusal::UNSUPPORTED; }",
     "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) { return ggml_sycl::moe_staged_route_refusal::KERNEL; }",
-    "if (ggml_sycl::moe_type_needs_direct_kernel(type)) { return ggml_sycl::moe_staged_route_refusal::DIRECT_KERNEL; }",
     "return ggml_sycl::moe_staged_route_refusal::NONE;",
 )
 STAGED_RECIPE_CALL = ("const moe_route_capability cap = ggml_sycl_moe_build_device_recipe(src0, submit_device, rows, "
@@ -567,9 +566,9 @@ def executor_reads_through_plain_kernels(sycl: str) -> bool:
 
 def claim_served_only_as_plain_kernel(sycl: str) -> bool:
     """c-las5 (1): a ring slot is read only by plain kernels on the submit queue, never by a library. It has two
-    readers, pinned by name (llama.cpp-3460). The route serves a slot only as MMVQ_COMPAT, for a type with no
-    direct-kernel requirement, never for an entry the batched executor consumes, never for a slice whose layout is not
-    the entry's, and only when both validators pass. Every lookup is counted, a refusal with its cause and detail, in
+    readers, pinned by name (llama.cpp-3460). The route serves a slot only as MMVQ_COMPAT, whatever the type (the
+    helper asks none), never for an entry the batched executor consumes, never for a slice whose layout is not the
+    entry's, and only when both validators pass. Every lookup is counted, a refusal with its cause and detail, in
     the order asked (plan Task 8: the trace says why), and the slot is served only when nothing refused it. The
     capability part is one helper, which names MMVQ_COMPAT and no other kernel. An entry the executor consumes is read
     by the executor's dequant kernels (executor_reads_through_plain_kernels), never handed to oneDNN."""
@@ -580,6 +579,7 @@ def claim_served_only_as_plain_kernel(sycl: str) -> bool:
     return (ordered(br, EXECUTOR_FIRST, ASSIGN, REFUSAL_OPEN, *REFUSAL_STEPS, SERVE_RETURN)
             and lam.count("return moe_staged_route_refusal::NONE;") == 1 and br.count("return staged;") == 1
             and ordered(cap, *STAGED_CAP_STEPS) and re.findall(r"moe_route_kernel::(\w+)", cap) == ["MMVQ_COMPAT"]
+            and not re.search(r"\btype\b|GGML_TYPE_", cap)
             and norm(sycl).count(STAGED_CAP_SIG + " {") == 1 and executor_reads_through_plain_kernels(sycl))
 
 
@@ -600,8 +600,15 @@ def test_served_only_as_plain_kernel_mutants():
     assert not c(mutate(SYCL, "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) {",
                         "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT && "
                         "cap.kernel != moe_route_kernel::XMX_TILED) {"))
-    # A Q1_0/NVFP4 slot staged and served past the capability helper.
-    assert not c(mutate(SYCL, STAGED_CAP_STEPS[2], ""))
+    # The helper asking the type again and refusing Q1_0/NVFP4 slots, which their MMVQ id kernel serves.
+    assert not c(mutate(mutate(SYCL, STAGED_CAP_STEPS[2],
+                               "if (ggml_sycl::moe_type_has_immutable_host_recipe(type)) { "
+                               "return ggml_sycl::moe_staged_route_refusal::KERNEL; } " + STAGED_CAP_STEPS[2]),
+                        STAGED_CAP_SIG, STAGED_CAP_SIG[:-1] + ", ggml_type type)"))
+    # A type test with the helper's signature kept.
+    assert not c(mutate(SYCL, STAGED_CAP_STEPS[2],
+                        "if (GGML_TYPE_NVFP4 == GGML_TYPE_Q1_0) { return ggml_sycl::moe_staged_route_refusal::KERNEL; } "
+                        + STAGED_CAP_STEPS[2]))
     # A slot whose resolved layout is not the entry's.
     assert not c(mutate(SYCL, REFUSAL_STEPS[3], ""))
     # The route validator skipped.
@@ -997,7 +1004,7 @@ CPU_SPLIT_CHOOSE = "return ggml_sycl::moe_pp_cpu_split_choose(f);"
 CPU_SPLIT_MULTI = ("if (g_moe_multi_gpu_active.load(std::memory_order_acquire)) { "
                    "return ggml_sycl::moe_pp_cpu_split::NONE; }")
 ISLAND_TYPE_SIG = "static bool ggml_sycl_moe_pp_cpu_island_runs_type(ggml_type type)"
-ISLAND_TYPE_DIRECT = "if (ggml_sycl::moe_type_needs_direct_kernel(type)) { return false; }"
+ISLAND_TYPE_IMMUTABLE = "if (ggml_sycl::moe_type_has_immutable_host_recipe(type)) { return false; }"
 ISLAND_TYPE_CALL = "return ggml_sycl_moe_host_recipe_type_ok(type);"
 HOST_RECIPE_TYPE_SIG = "static bool ggml_sycl_moe_host_recipe_type_ok(ggml_type type)"
 HOST_RECIPE_TRAITS = "const auto * traits = ggml_sycl_get_type_traits_cpu(type);"
@@ -1019,7 +1026,8 @@ def claim_cpu_decided_op_leaves_hybrid(sycl: str) -> bool:
     plan_has_cpu_experts and the planner's prompt route, so any split takes the op out of the hybrid world the way a
     staged layer's op leaves it. The batched executor declines an ISLAND op at its head, ahead of the build guard,
     so the retained per-expert path runs it in every build. The island's type test is the retained batch's own
-    condition for a host recipe, less the two types that need their direct kernel: one helper holds that condition's
+    condition for a host recipe, less the two types whose host experts run their own immutable host recipe
+    (moe_type_has_immutable_host_recipe: Q1_0 and NVFP4): one helper holds that condition's
     type half (a CPU vec_dot, looked up through the type's vec_dot_type, whose activation type quantizes from float),
     and both the recipe and the island call it, so the two cannot drift. A load that routes experts to a second device
     answers NONE before any fact is read, so it keeps the route it has."""
@@ -1040,7 +1048,7 @@ def claim_cpu_decided_op_leaves_hybrid(sycl: str) -> bool:
                         CPU_SPLIT_EXECUTOR, PER_EXPERT_ANCHOR)
             and h != "" and ordered(h, CPU_SPLIT_MULTI, CPU_SPLIT_FACTS, CPU_SPLIT_CHOOSE)
             and h.count("f.cpu_decided =") == 1
-            and i != "" and ordered(i, ISLAND_TYPE_DIRECT, ISLAND_TYPE_CALL)
+            and i != "" and ordered(i, ISLAND_TYPE_IMMUTABLE, ISLAND_TYPE_CALL)
             and "ggml_sycl_get_type_traits_cpu(" not in i
             and r != "" and r.count("return ") == 1
             and ordered(r, HOST_RECIPE_TRAITS, HOST_RECIPE_VDT, HOST_RECIPE_FROM_FLOAT)
@@ -1099,8 +1107,8 @@ def test_cpu_decided_op_leaves_hybrid_mutants():
     # The counts asked for every device: an expert on another card would look local.
     assert not c(mutate(SYCL, "plan.count_planned_experts(weight->name, f.experts, device);",
                         "plan.count_planned_experts(weight->name, f.experts, -1);"))
-    # The island handed a type that needs its direct kernel.
-    assert not c(mutate(SYCL, ISLAND_TYPE_DIRECT + " " + ISLAND_TYPE_CALL, ISLAND_TYPE_CALL))
+    # The island handed a type whose host experts run their immutable host recipe.
+    assert not c(mutate(SYCL, ISLAND_TYPE_IMMUTABLE + " " + ISLAND_TYPE_CALL, ISLAND_TYPE_CALL))
     # The island handed a type the retained batch gives no host recipe.
     assert not c(mutate(SYCL, HOST_RECIPE_FROM_FLOAT, "return true;"))
     # The activation type looked up without asking for a vec_dot: a type with no CPU dot product would pass.
@@ -1110,8 +1118,8 @@ def test_cpu_decided_op_leaves_hybrid_mutants():
     assert not c(mutate(SYCL, HOST_RECIPE_VDT,
                         "const auto * vdt = traits ? ggml_sycl_get_type_traits_cpu(type) : nullptr;"))
     # The island restates the condition instead of asking the helper: two sources that can drift.
-    assert not c(mutate(SYCL, ISLAND_TYPE_DIRECT + " " + ISLAND_TYPE_CALL,
-                        ISLAND_TYPE_DIRECT + " " + HOST_RECIPE_TRAITS + " " + HOST_RECIPE_VDT + " "
+    assert not c(mutate(SYCL, ISLAND_TYPE_IMMUTABLE + " " + ISLAND_TYPE_CALL,
+                        ISLAND_TYPE_IMMUTABLE + " " + HOST_RECIPE_TRAITS + " " + HOST_RECIPE_VDT + " "
                         + HOST_RECIPE_FROM_FLOAT))
     # The recipe restates the condition instead of asking the helper.
     assert not c(mutate(SYCL, HOST_RECIPE_CALL,

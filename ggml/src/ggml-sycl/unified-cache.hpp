@@ -440,6 +440,9 @@ struct placement_entry {
     std::string            name;  // Tensor name (for logging and S1-PRELOAD lookup)
     ggml_type              type              = GGML_TYPE_COUNT;
     int64_t                ne[GGML_MAX_DIMS] = {};
+    // The loader's role, copied from placement_tensor_info: the weight is consumed only by a row gather (GET_ROWS) and
+    // is never a MUL_MAT operand, so a question about its MUL_MAT kernel has no answer for it.
+    bool                   get_rows_only     = false;
     size_t                 src_size          = 0;  // AOS source bytes
     size_t                 dst_size          = 0;  // Layout-converted destination bytes (SOA/COALESCED)
     // The layer's KV bytes, on one anchor entry per layer (its attention entry when it has one) and 0 on the rest. It
@@ -1272,8 +1275,6 @@ struct placement_plan {
     // oneDNN reorder: one temp buffer reused per layer, sized to the largest
     // oneDNN-eligible tensor (see zone-sizing.hpp), not the largest in the model.
     size_t   onednn_reorder_bytes                = 0;  // Zone: SCRATCH (device VRAM)
-    // MoE Q8_1 workspace: quantized activations for batched expert dispatch.
-    size_t   moe_q8_workspace_bytes              = 0;  // Zone: SCRATCH (device VRAM)
     // CPU expert fallback act/out staging. EXPERT_STAGING HOST_COMPUTE uses
     // smart-handle scoped ownership and routes to host SCRATCH.
     size_t   moe_cpu_expert_staging_bytes        = 0;  // Zone: SCRATCH (host pinned)
@@ -1287,6 +1288,17 @@ struct placement_plan {
     // rule at another micro-batch. Blank lines around it keep its longer type out of the size_t block's alignment
     // column.
     std::vector<moe_host_recipe_shape> moe_host_recipe_shapes;
+
+    // The MoE batched MMVQ scratch the SCRATCH zone is sized to hold (zone_scratch_zone_plan): one operand per admitted
+    // expert op, the routed slots a token, and the bound over every op at once at a micro-batch, with the micro-batch
+    // it was computed at. The load computes it at the context's micro-batch (context_n_ubatch); a context's runtime
+    // transaction re-sizes it at its own and never lowers it. The operands stay on the plan so that the bound can be
+    // computed by the same rule at another micro-batch.
+    std::vector<zone_moe_mmvq_operand> moe_mmvq_scratch_ops;
+
+    int      moe_mmvq_scratch_n_expert_used = 0;
+    size_t   moe_mmvq_scratch_bytes         = 0;  // Zone: SCRATCH (device VRAM)
+    uint32_t moe_mmvq_scratch_n_ubatch      = 0;
 
     // Expert bias D2H copy: float bias tensors staged to host for gate computation.
     size_t   expert_bias_bytes                   = 0;  // Zone: STAGING (host pinned)
@@ -3264,6 +3276,15 @@ moe_control_requirement unified_cache_get_planned_moe_control_requirement(int de
 void   unified_cache_set_planned_moe_host_scatter_scratch_bytes(int device_id, size_t bytes);
 size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id);
 
+// The MoE batched MMVQ scratch bound the SCRATCH zone is sized to hold (zone_scratch_zone_plan): every expert op's Q8_1
+// activations and ids at the context's micro-batch (placement_plan::moe_mmvq_scratch_bytes). populate_host_zone_sizing
+// publishes it with every plan, 0 for a model with no admitted expert op or a bound that overflows. A context's runtime
+// transaction raises it to its own micro-batch's figure and never lowers it (the raise answers the figure now
+// published); the next ensure of the arena's zones reads it.
+void   unified_cache_set_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes);
+size_t unified_cache_raise_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes);
+size_t unified_cache_get_planned_moe_mmvq_scratch_bytes(int device_id);
+
 // pp_pipeline + pp_moe_onednn + MoE CONTROL for one device, with every addition
 // checked. Returns false without writing *out when the device's CONTROL
 // requirement could not be computed, which is what stops an unsizable plan from
@@ -3272,16 +3293,18 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
 
 // The terms the placement planners publish for a device while they compute a plan (populate_host_zone_sizing() and
 // publish_moe_host_scatter_term()): the MoE CONTROL requirement and the MoE host scatter scratch, both in the RUNTIME
-// zone's requirement, and the oneDNN Graph and non-FA attention scratch shapes, which floor zones the same ensure
-// sizes. A plan that is computed and then discarded publishes nothing, so a caller that may discard one takes this
-// snapshot before it plans and restores it when it does. Each setter stores what its getter reads, so the restore is
-// exact. A term the planners start to publish is added here, not at a caller. It lives beside the getters and setters
-// it calls, so a test that links the cache without the backend checks the restore against the cache's own state.
+// zone's requirement, the oneDNN Graph and non-FA attention scratch shapes, which floor zones the same ensure sizes,
+// and the MoE batched MMVQ scratch bound, which raises the SCRATCH zone. A plan that is computed and then discarded
+// publishes nothing, so a caller that may discard one takes this snapshot before it plans and restores it when it does.
+// Each setter stores what its getter reads, so the restore is exact. A term the planners start to publish is added
+// here, not at a caller. It lives beside the getters and setters it calls, so a test that links the cache without the
+// backend checks the restore against the cache's own state.
 struct planner_published_terms {
     onednn_graph_scratch_planned_shape graph{};
     nonfa_attn_scratch_planned_shape   nonfa{};
     moe_control_requirement            control{};
-    size_t                             scatter = 0;
+    size_t                             scatter  = 0;
+    size_t                             moe_mmvq = 0;
 
     static planner_published_terms snapshot(int device);
     void                           restore(int device) const;
@@ -3313,7 +3336,9 @@ enum load_published_group : uint32_t {
     LOAD_PUBLISHED_GROUP_CONTROL     = 1u << 7,  // the planners' MoE CONTROL requirement
     LOAD_PUBLISHED_GROUP_SCATTER     = 1u << 8,  // the planners' MoE host scatter scratch
     LOAD_PUBLISHED_GROUP_ZONE_PLAN   = 1u << 9,  // the plan the device's cache stores for its ONEDNN zone
-    LOAD_PUBLISHED_GROUP_ALL         = (1u << 10) - 1,
+    // the planners' MoE batched MMVQ scratch bound
+    LOAD_PUBLISHED_GROUP_MOE_MMVQ    = 1u << 10,
+    LOAD_PUBLISHED_GROUP_ALL         = (1u << 11) - 1,
 };
 
 struct load_published_terms {
@@ -4757,7 +4782,10 @@ class unified_cache {
 
     // === Pinning for Graphs ===
 
-    void pin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);
+    // A pin is a flag, not a count: one unpin clears it whoever set it. pin() answers true only when this call set the
+    // flag on an entry where it was clear; false for an entry already pinned, no entry, or an invalid key. A caller
+    // that releases later should release only the pins it was answered true for.
+    bool pin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);
     void unpin(const ggml_sycl_cache_id &   key,
                ggml_layout_mode             layout,
                const placement_cache_read * retained_read = nullptr);
@@ -6460,6 +6488,28 @@ class unified_cache {
     // exchange, so two ensures of one load racing on the device warn once between them.
     std::atomic<uint64_t> onednn_zone_kept_warn_txn_{ 0 };
 
+    // The largest SCRATCH figure a keep of a short SCRATCH zone has warned about on this device, 0 for none
+    // (zone_scratch_warn_due). Raised by compare-exchange, so two ensures that keep the zone short of one figure
+    // warn once between them.
+    std::atomic<size_t> scratch_zone_kept_warn_bytes_{ 0 };
+
+    // Logs the WARN of a call that kept the SCRATCH zone of `kept_bytes` short of `plan`, when one is due.
+    void scratch_zone_kept_warn(int dev_id, const zone_scratch_plan & plan, size_t kept_bytes);
+
+    // The largest MoE batched MMVQ bound a clamp of the SCRATCH zone has warned about on this device, 0 for none
+    // (zone_scratch_warn_due), raised the same way.
+    std::atomic<size_t> scratch_zone_clamp_warn_bytes_{ 0 };
+
+    // Logs the WARN of a plan whose limit (plan.clamp: the budget quarter `budget_cap_bytes`, or the reserve's room
+    // `room_bytes` above plan.required) held the planned SCRATCH zone below the bound of `bound_bytes`, when one is
+    // due. The line is zone_scratch_clamp_text's; `reserve_accepts` says whether the reserve accepts plan.required.
+    void scratch_zone_clamp_warn(int                       dev_id,
+                                 const zone_scratch_plan & plan,
+                                 size_t                    bound_bytes,
+                                 size_t                    budget_cap_bytes,
+                                 size_t                    room_bytes,
+                                 bool                      reserve_accepts);
+
     // The plan this cache's ONEDNN zone was sized from (zone_onednn_plan says what it holds and why it is kept apart
     // from the planner's live figures). ensure_planned_arena_zones() writes it when it keeps or builds this cache's
     // zone, and onednn_zone_plan_put_back() when a failed load's restore puts it back. The pair reserve reads it, and
@@ -6536,6 +6586,11 @@ class unified_cache {
     };
     static constexpr size_t ARENA_ALLOCATOR_GROUP_COUNT = 4;
     std::array<allocator_group, ARENA_ALLOCATOR_GROUP_COUNT> arena_allocator_groups_{};
+
+    // How the SCRATCH zone was used over this cache's life, logged at teardown. Written by zone_alloc under the
+    // SCRATCH group's mutex, which that allocation already holds, and read under it at teardown.
+    zone_scratch_use scratch_zone_use_{};
+
     std::mutex arena_destroy_mutex_;  // serializes retryable explicit destroy transactions
     static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;

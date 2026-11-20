@@ -12010,6 +12010,10 @@ void ggml_sycl_q1_nvfp4_test_counters_read(ggml_sycl_q1_nvfp4_test_counters * ou
 void ggml_sycl_q1_nvfp4_test_failure_once(ggml_sycl_q1_nvfp4_test_failure failure) {
     g_q1_nvfp4_test_failure.store(static_cast<uint32_t>(failure), std::memory_order_release);
 }
+
+bool ggml_sycl_q1_nvfp4_test_failure_take(ggml_sycl_q1_nvfp4_test_failure failure) {
+    return ggml_sycl_q1_nvfp4_test_consume_failure(failure);
+}
 #endif
 
 // The MoE MMID direct route is fail-closed by owner ruling: this stays false
@@ -21040,6 +21044,71 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
 #endif
 }
 
+// The MoE batched MMVQ scratch bound at the context's micro-batch (placement_plan::moe_mmvq_scratch_bytes), re-sized
+// from the plan's operands at next_plan.context_n_ubatch and never below the published plan's figure: every context of
+// this model shares that plan, and nothing here knows which of them are still live. A real transaction raises the
+// device's published bound to it and, when the SCRATCH zone is smaller than the bound now published, asks for the
+// arena's zones again. That ask is best-effort, as the non-FA re-plan's is: the ensure holds the zone to the budget
+// quarter and the arena reserve's room, and a zone that live allocations keep short of the bound stays as it is; each
+// says so once (unified_cache::ensure_planned_arena_zones). Neither refuses, since the ops the zone cannot place take
+// the miss path: raw device memory while the card has room outside the arena, else the dispatch refuses the buffer by
+// name (q8-scratch-alloc) and the op takes its fallback where its type has one, while a Q1_0 or NVFP4 op, which has no
+// other executor on the card, ends with that named refusal and a failed compute (zone_scratch_zone_plan lists the
+// types). False only when the arena's teardown left it closed to new allocations. A probe sizes the figure and changes
+// nothing else.
+static bool ggml_sycl_replan_moe_mmvq_scratch(int                               device,
+                                              const ggml_sycl::placement_plan & current,
+                                              ggml_sycl::placement_plan &       next_plan,
+                                              bool                              probe_mode) {
+    const uint32_t n_ubatch = next_plan.context_n_ubatch;
+    if (next_plan.moe_mmvq_scratch_ops.empty() || next_plan.moe_mmvq_scratch_n_expert_used <= 0 || n_ubatch == 0) {
+        return true;
+    }
+    ggml_sycl::zone_moe_mmvq_scratch scratch;
+    if (!ggml_sycl::zone_moe_mmvq_scratch_bytes(next_plan.moe_mmvq_scratch_ops, n_ubatch,
+                                                next_plan.moe_mmvq_scratch_n_expert_used, &scratch)) {
+        if (!probe_mode) {
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] MoE batched MMVQ scratch overflows: %zu expert op(s) at n_ubatch=%u; the SCRATCH zone "
+                "keeps its size\n",
+                next_plan.moe_mmvq_scratch_ops.size(), n_ubatch);
+        }
+        return true;
+    }
+    next_plan.moe_mmvq_scratch_bytes    = scratch.graph;
+    next_plan.moe_mmvq_scratch_n_ubatch = n_ubatch;
+    if (current.moe_mmvq_scratch_bytes >= next_plan.moe_mmvq_scratch_bytes) {
+        next_plan.moe_mmvq_scratch_bytes    = current.moe_mmvq_scratch_bytes;
+        next_plan.moe_mmvq_scratch_n_ubatch = current.moe_mmvq_scratch_n_ubatch;
+        return true;
+    }
+    if (probe_mode) {
+        return true;
+    }
+    const size_t n_ops = next_plan.moe_mmvq_scratch_ops.size();
+    GGML_LOG_WARN(
+        "[SYCL-PLAN] MoE batched MMVQ scratch re-sized for the context on device %d: %zu expert op(s) at n_ubatch=%u, "
+        "depth %zu (every op), %.2f MB, the largest op %.2f MB, up from %.2f MB at n_ubatch=%u\n",
+        device, n_ops, n_ubatch, n_ops, scratch.graph / (1024.0 * 1024.0), scratch.per_op / (1024.0 * 1024.0),
+        current.moe_mmvq_scratch_bytes / (1024.0 * 1024.0), current.moe_mmvq_scratch_n_ubatch);
+    const size_t published = ggml_sycl::unified_cache_raise_planned_moe_mmvq_scratch_bytes(device, scratch.graph);
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    if (cache == nullptr || cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH) >= published) {
+        return true;
+    }
+    ggml_sycl::zone_arena_refusal arena_refusal;
+    (void) ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &arena_refusal);
+    if (arena_refusal.reason == ggml_sycl::zone_arena_refusal_reason::TEARDOWN_REFUSED &&
+        ggml_sycl::zone_arena_teardown_left_closed(arena_refusal.teardown)) {
+        GGML_LOG_ERROR(
+            "[SYCL-PLAN] runtime context update rejected on device %d: the VRAM arena could not be torn down and stays "
+            "closed to new allocations; load the model in a new process\n",
+            device);
+        return false;
+    }
+    return true;
+}
+
 // llama.cpp-ibj0: the PP MoE oneDNN scratch ring is sized at model load
 // (src/llama-model.cpp) for the loader's own inventory.n_ubatch (512 today),
 // not whatever n_ubatch the context is actually created with -- a runtime
@@ -22585,6 +22654,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     }
     if (!ggml_sycl_check_onednn_graph_scratch(ctx->device, next_plan, flash_attn_enabled, probe_mode, hold_query)) {
         return refuse("oneDNN Graph attention scratch exceeds the ONEDNN zone and the device's outside-arena headroom");
+    }
+    if (!ggml_sycl_replan_moe_mmvq_scratch(ctx->device, *current->plan, next_plan, probe_mode)) {
+        return refuse("the VRAM arena stays closed to new allocations");
     }
 
     // llama.cpp-kpjw: the dense MMQ/MMVQ Q8_1 src1 buffer and the dense f16 dequant buffers are planned per
@@ -38642,9 +38714,12 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
     }
 
     if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4) {
-        // Recipe availability is narrower than executor capability. It merely
-        // lets an exact primary decode candidate reach DIRECT admission;
-        // choose_moe_batch_executor still requires the admitted bundle.
+        // The direct recipe is narrower than the executor: only an exact primary
+        // decode candidate whose invocation holds the exact queue capability of an
+        // admitted MMID workspace gets it. In an ordinary build that never happens:
+        // ggml_sycl_moe_mmid_route_reachable_in_build() is false, no MMID pool is
+        // planned, no invocation holds that capability, and this recipe is never
+        // chosen; only the private route-testing build reaches it.
         //
         // Whether the lease can be bound is the binder's question, so ask the
         // binder. A handle-kind test here was a second, narrower answer: every
@@ -38670,27 +38745,20 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
             cap.reason        = "direct-recipe-candidate";
             return cap;
         }
-        // Not selecting the DIRECT fast path is not a capability verdict. The
-        // generic batched MMVQ executor accepts these types in AOS for both
-        // phases and for rows > 1 -- mmvq_submit_q1_nvfp4_aos_id() imposes no
-        // phase or row-count constraint -- so a non-authoritative candidate
-        // falls through to the shared local admission below instead of being
-        // refused here. Returning at this point instead shadowed a kernel that
-        // already exists, and because the refusal escapes as
-        // ggml_sycl_fallback_error and ggml_backend_compare_graph_backend
-        // discards the resulting GGML_STATUS_FAILED, it surfaced as wrong
-        // numbers rather than as a clean decline.
+        // Not selecting the direct recipe is not a capability verdict. The
+        // generic batched MMVQ executor runs these types in AOS for both phases
+        // and any row count -- mmvq_moe_batched_dispatch() submits them through
+        // mmvq_submit_q1_nvfp4_aos_id(), which imposes no phase or row-count
+        // constraint -- so a candidate the direct recipe does not take falls
+        // through to the shared local admission below and answers MMVQ_COMPAT.
+        // The executor choice takes that answer as it takes it for any MMVQ id
+        // type: experts on the card run through that kernel, host experts
+        // through their HOST_CPU recipe, in one op.
         //
         // Fall through only where the executor's own preconditions hold: a K
         // that is not block-aligned would be refused at submit, which is worse
-        // than refusing here. Secondary residency keeps the old refusal -- the
-        // fall-through is validated for the local executor only.
-        //
-        // Admitting here does NOT mean Q1_0/NVFP4 execute. choose_moe_batch_executor()
-        // in moe-resolved-batch.hpp rejects them unconditionally while the B70 oracle
-        // gate is closed, so they still refuse one layer down (census 10: 85 such
-        // refusals, reason=capability_unsupported, carrying capability=local-mmvq from
-        // right here). That is deliberate, not a bug in either layer.
+        // than refusing here. Secondary residency keeps its refusal: the
+        // fall-through is checked for the local executor only.
         const bool local_executor_shape_ok = layout == GGML_LAYOUT_AOS && route_device == submit_device &&
                                              K % qk == 0 && K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
         if (!local_executor_shape_ok) {
@@ -38812,21 +38880,17 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
     return cap;
 }
 
-// What a staged ring slot is served with (c-las5): a plain MMVQ_COMPAT kernel on the submit queue, for a type that
-// does not need its own direct kernel (moe_type_needs_direct_kernel: Q1_0 and NVFP4 run on a device only through
-// DEVICE_MMVQ_Q1_NVFP4_AOS, so validate_moe_execution_recipe refuses an MMVQ_COMPAT recipe for them). NONE when the
-// capability `cap` of `type` can be served, else the cause. The resolver's staged route is its only caller: the ring
-// stages by the library claim alone, and a slot the route cannot serve is a counted refusal that runs on the CPU.
-static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const moe_route_capability & cap,
-                                                                                   ggml_type                    type) {
+// What a staged ring slot is served with: a plain MMVQ_COMPAT kernel on the submit queue, whose in-order queue orders
+// the slot's reuse after its readers, which a library's internals do not. The kernel is the one a resident expert of
+// the slot's (type, layout) runs, so the capability's kernel is the whole answer and no type is asked again. NONE when
+// the capability `cap` can be served, else the cause. The resolver's staged route is its only caller: the ring stages
+// by the library claim alone, and a slot the route cannot serve is a counted refusal that runs on the CPU.
+static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const moe_route_capability & cap) {
     if (!cap.supported) {
         return ggml_sycl::moe_staged_route_refusal::UNSUPPORTED;
     }
     if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) {
         return ggml_sycl::moe_staged_route_refusal::KERNEL;
-    }
-    if (ggml_sycl::moe_type_needs_direct_kernel(type)) {
-        return ggml_sycl::moe_staged_route_refusal::DIRECT_KERNEL;
     }
     return ggml_sycl::moe_staged_route_refusal::NONE;
 }
@@ -39442,19 +39506,18 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                     src0, submit_device, rows, invocation_backend, invocation_queue, queue_capability, staged);
                 staged.recipe.transfer                        = moe_recipe_transfer::STAGED_RING;
                 staged.recipe_reason                          = "staged-ring";
-                // c-las5 (1): a slot is read only by a plain SYCL kernel on the submit queue, whose order covers the
-                // slot's reuse; it does not order a library's internals. The route serves a slot only as a plain
+                // A slot is read only by a plain SYCL kernel on the submit queue, whose order covers the slot's
+                // reuse; it does not order a library's internals. The route serves a slot only as a plain
                 // MMVQ_COMPAT kernel: any other kernel (XMX_TILED, MXFP4_I8, MXFP4_DPAS, DEVICE_MMVQ_Q1_NVFP4_AOS,
-                // SECONDARY_SOA), or a type that needs its direct kernel refuses it
-                // (ggml_sycl_moe_staged_capability_refusal; the ring's staging follows the library claim alone since
-                // the window ring, W2). So does a slot whose resolved layout is not the entry's: the phase acquires
-                // each slot with the layout it writes there (lead ruling c-o9uw-1), so the two disagree only for a
-                // wrong entry. A refused entry falls through to the route core, whose HOST answer stands, and is
-                // counted with its cause and the capability's reason or the validator's reject reason, in the order
-                // asked here, so the trace says why (plan Task 8).
+                // SECONDARY_SOA) refuses it (ggml_sycl_moe_staged_capability_refusal; the ring's staging follows the
+                // library claim alone since the window ring). So does a slot whose resolved layout is not the
+                // entry's: the phase acquires each slot with the layout it writes there, so the two disagree only
+                // for a wrong entry. A refused entry falls through to the route core, whose HOST answer stands, and
+                // is counted with its cause and the capability's reason or the validator's reject reason, in the
+                // order asked here, so the trace says why.
                 const char *                   refusal_detail = nullptr;
                 const moe_staged_route_refusal refusal        = [&]() {
-                    const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap, src0->type);
+                    const moe_staged_route_refusal by_cap = ggml_sycl_moe_staged_capability_refusal(cap);
                     if (by_cap != moe_staged_route_refusal::NONE) {
                         refusal_detail = cap.reason;
                         return by_cap;
@@ -39840,144 +39903,6 @@ static bool ggml_sycl_try_pp_local_moe_route(const ggml_tensor *                
         ggml_sycl::expert_resolve_result resolved = cache->resolve_expert(req);
         if (resolved) {
             fill_route(std::move(resolved));
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool ggml_sycl_try_pp_host_moe_route(const ggml_tensor *                 src0,
-                                            int                                 current_device,
-                                            int                                 expert_id,
-                                            size_t                              expert_size,
-                                            const ggml_sycl::moe_expert_route & planned_route,
-                                            ggml_sycl::moe_expert_route &       host_route) {
-    if (!src0 || current_device < 0 || expert_id < 0 || expert_size == 0) {
-        return false;
-    }
-    const bool planned_host_route = planned_route.plan_found && !planned_route.planned_device_residency;
-    if (!planned_host_route) {
-        return false;
-    }
-
-    auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-    if (!extra) {
-        return false;
-    }
-
-    const void * host_ptr       = nullptr;
-    size_t       host_bytes     = expert_size;
-    const char * host_src_label = "tensor";
-    const void * host_base      = ggml_sycl_host_data(src0);
-    if (host_base) {
-        host_ptr = static_cast<const void *>(static_cast<const char *>(host_base) +
-                                             static_cast<size_t>(expert_id) * expert_size);
-    }
-    if (!host_ptr || ggml_sycl::ggml_sycl_is_device_expert_ptr(host_ptr)) {
-        return false;
-    }
-
-    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(current_device);
-    if (!cache) {
-        return false;
-    }
-
-    const ggml_sycl_cache_id base_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, expert_id);
-    if (!base_key.valid) {
-        return false;
-    }
-
-    std::vector<ggml_sycl_cache_id> base_keys = ggml_sycl::ggml_sycl_get_canonical_moe_expert_keys(src0, expert_id);
-    if (std::find_if(base_keys.begin(), base_keys.end(), [&](const ggml_sycl_cache_id & key) {
-            return ggml_sycl::detail::cache_id_equal(key, base_key);
-        }) == base_keys.end()) {
-        base_keys.insert(base_keys.begin(), base_key);
-    }
-
-    auto fill_route = [&](ggml_sycl::expert_resolve_result && resolved) {
-        host_route                          = {};
-        host_route.ptr                      = resolved.ptr;
-        host_route.owning_device            = ggml_sycl::mem_handle::HOST_DEVICE;
-        host_route.planned_device           = planned_route.planned_device;
-        host_route.plan_found               = planned_route.plan_found;
-        host_route.plan_missing             = planned_route.plan_missing;
-        host_route.planned_device_residency = planned_route.planned_device_residency;
-        host_route.requested_layout         = planned_route.requested_layout;
-        host_route.actual_layout            = resolved.actual_layout;
-        host_route.tier                     = resolved.tier;
-        host_route.reason                   = resolved.reason;
-        host_route.kind                     = ggml_sycl::moe_expert_route_kind::HOST;
-        host_route.has_ready_event          = resolved.has_ready_event;
-        host_route.ready_event              = resolved.has_ready_event ? resolved.ready_event : sycl::event{};
-        if (resolved.lifetime) {
-            host_route.lease = std::move(*resolved.lifetime);
-        }
-    };
-
-    auto resolve_host = [&](const ggml_sycl_cache_id & layout_key) {
-        ggml_sycl::expert_resolve_request req{};
-        req.key              = layout_key;
-        req.requested_layout = GGML_LAYOUT_AOS;
-        req.layer_id         = ggml_sycl_tp_extract_layer_number(src0->name);
-        req.expert_id        = expert_id;
-        req.current_device   = current_device;
-        req.preferred_device = current_device;
-        req.device_policy    = ggml_sycl::expert_resolve_device_policy::ANY;
-        req.allow_host       = true;
-        req.allow_mmap_host  = true;
-        req.require_ready    = false;
-        return cache->resolve_expert(req);
-    };
-
-    for (const ggml_sycl_cache_id & key : base_keys) {
-        const ggml_sycl_cache_id layout_key = ggml_sycl_layout_specific_moe_expert_cache_key(key, GGML_LAYOUT_AOS);
-        ggml_sycl::expert_resolve_result resolved = resolve_host(layout_key);
-        if (resolved && resolved.cpu_accessible) {
-            fill_route(std::move(resolved));
-            return true;
-        }
-
-        ggml_sycl::mem_handle host_handle;
-        {
-            ggml_sycl::scoped_planned_materialization planned_materialization(cache, "MoE PP host cost fallback");
-            cache->register_host_expert(layout_key, const_cast<void *>(host_ptr), host_bytes, GGML_LAYOUT_AOS,
-                                        &host_handle);
-        }
-
-        resolved = resolve_host(layout_key);
-        if (!resolved && host_handle.valid()) {
-            auto direct = host_handle.resolve();
-            if (direct.ptr && !direct.on_device) {
-                host_route                          = {};
-                host_route.ptr                      = direct.ptr;
-                host_route.owning_device            = ggml_sycl::mem_handle::HOST_DEVICE;
-                host_route.planned_device           = planned_route.planned_device;
-                host_route.plan_found               = planned_route.plan_found;
-                host_route.plan_missing             = planned_route.plan_missing;
-                host_route.planned_device_residency = planned_route.planned_device_residency;
-                host_route.requested_layout         = planned_route.requested_layout;
-                host_route.actual_layout            = direct.layout;
-                host_route.tier                     = ggml_sycl::expert_resolve_tier::HOST_MMAP;
-                host_route.reason                   = ggml_sycl::expert_resolve_reason::FOUND;
-                host_route.kind                     = ggml_sycl::moe_expert_route_kind::HOST;
-                host_route.lease                    = std::move(host_handle);
-                return true;
-            }
-        }
-        if (resolved && resolved.cpu_accessible) {
-            fill_route(std::move(resolved));
-            if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-                static std::atomic<int> logged{ 0 };
-                const int               n = logged.fetch_add(1, std::memory_order_relaxed);
-                if (n < 80) {
-                    fprintf(stderr,
-                            "[MOE-PP-HOST-ROUTE] tensor=%s expert=%d current=%d planned=%d source=%s "
-                            "reason=no-peer-no-local-space\n",
-                            src0->name ? src0->name : "?", expert_id, current_device, planned_route.planned_device,
-                            host_src_label);
-                }
-            }
             return true;
         }
     }
@@ -85994,10 +85919,10 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_device_part(const ggml_sycl::
 
 // Whether the prompt CPU island runs a host expert of `type`. The retained batch gives a host operand a HOST_CPU
 // recipe only for a type ggml_sycl_moe_host_recipe_type_ok accepts (the recipe's own condition, asked here rather than
-// restated), and the island's batched CPU kernel has no path for a type that needs its direct kernel
-// (moe_type_needs_direct_kernel).
+// restated), and the island's batched CPU kernel has no path for a type whose host experts run their immutable host
+// recipe with its own planned workspace (moe_type_has_immutable_host_recipe).
 static bool ggml_sycl_moe_pp_cpu_island_runs_type(ggml_type type) {
-    if (ggml_sycl::moe_type_needs_direct_kernel(type)) {
+    if (ggml_sycl::moe_type_has_immutable_host_recipe(type)) {
         return false;
     }
     return ggml_sycl_moe_host_recipe_type_ok(type);
@@ -86748,6 +86673,36 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     slot.active                 = true;
     pending_cpu_scatter_bind_scratch(slot, ctx);
     return true;
+}
+
+// The exception text for a Q1_0/NVFP4 AOS operand whose batched dispatch refused, by the reason the dispatch named
+// (or no-ptr-table when it never ran). ggml_sycl_fallback_error keeps the pointer it is given, so every text is a
+// literal joined to its reason at compile time rather than a formatted string. Only those literals outlive the call,
+// so the table itself is an ordinary local and holds no process state. test-failpoint comes only from the
+// private-testing build.
+static const char * ggml_sycl_moe_q1_nvfp4_refusal_text(const char * reason) {
+#define GGML_SYCL_Q1_NVFP4_REFUSAL(r) { r, "MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand refused: " r }
+
+    constexpr struct {
+        const char * reason;
+        const char * text;
+    } k_refusal_texts[] = {
+        GGML_SYCL_Q1_NVFP4_REFUSAL("no-ptr-table"),         GGML_SYCL_Q1_NVFP4_REFUSAL("no-entries"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("no-expert-ptrs"),       GGML_SYCL_Q1_NVFP4_REFUSAL("layout-unsupported"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("type-unsupported"),     GGML_SYCL_Q1_NVFP4_REFUSAL("invalid-q8-shape"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("unresolved-src1-dst"),  GGML_SYCL_Q1_NVFP4_REFUSAL("q8-scratch-alloc"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("missing-host-routing"), GGML_SYCL_Q1_NVFP4_REFUSAL("ids-scratch-alloc"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("int-max-bound"),        GGML_SYCL_Q1_NVFP4_REFUSAL("test-failpoint"),
+        GGML_SYCL_Q1_NVFP4_REFUSAL("submit-precondition"),
+    };
+
+#undef GGML_SYCL_Q1_NVFP4_REFUSAL
+    for (const auto & entry : k_refusal_texts) {
+        if (reason && std::strcmp(reason, entry.reason) == 0) {
+            return entry.text;
+        }
+    }
+    return "MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand refused: unnamed reason";
 }
 
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
@@ -90415,11 +90370,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // index (retained_prompt_groups) is populated solely under `if (ne12 != 1)`,
     // and nothing in it ever reads the decode batch result, so a decode case
     // steered there resolves no route and dies at "selected prompt expert
-    // unresolved before submit" -- strictly worse than the honest
-    // capability-unsupported refusal that the retained partition loop below
-    // already produces through its shared dispatch helper. Tried and
-    // withdrawn for Q1_0/NVFP4 (llama.cpp-t98c); the closed capability, not the
-    // routing, is what those cases are waiting on.
+    // unresolved before submit" -- strictly worse than the honest refusal the
+    // retained partition loop below produces through its shared dispatch
+    // helper for an operand it cannot run. A carve-out for Q1_0/NVFP4 decode
+    // was tried and withdrawn: what those cases lacked was an executor in the
+    // retained partition, not a different route.
     const bool moe_hybrid_with_plan  = ne12 == 1 || selected_hybrid_route;
     const bool route_host_experts_to_cpu =
         !exact_layout_override && (has_placement_plan ? plan_has_cpu_experts : use_expert_cache);
@@ -90535,6 +90490,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const bool use_routing_prestage = use_expert_cache && (n_experts > 64) && !src0_usm_accessible_prestage;
     std::vector<ggml_sycl_cache_id> routed_expert_keys;
     ggml_sycl::prestage_result      routed_prestage;
+
+    // prestage_routed_experts below pins the routed experts it finds on the card, and its receipt
+    // (routed_prestage.pins) is the sole authority for what to unpin. This guard releases them on every exit of the
+    // op: its end, a batched path that returns early, and a refusal's throw, which graph_compute turns into
+    // GGML_STATUS_FAILED. It is destroyed after the op's later locals, so their leases go before the pins; eviction
+    // skips an entry that a pin or a lease holds, so no entry the op used becomes evictable before both are gone.
+    struct routed_prestage_unpin_on_exit {
+        int                                               device;
+        const std::vector<ggml_sycl::routed_expert_pin> & pins;
+
+        ~routed_prestage_unpin_on_exit() {
+            if (!pins.empty()) {
+                ggml_sycl::unpin_routed_experts(device, pins);
+            }
+        }
+    } routed_prestage_unpin{ ctx.device, routed_prestage.pins };
     if (use_routing_prestage) {
         routed_expert_keys.reserve(static_cast<size_t>(n_experts));
         for (int e = 0; e < n_experts; ++e) {
@@ -91833,56 +91804,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 auto &              route_host_count            = main_route_stats.host_count;
                 size_t              route_unavailable_count     = 0;
                 size_t              route_layout_mismatch_count = 0;
-                auto push_routed_entry = [](std::vector<expert_dispatch_entry> & dst_entries, int64_t iid1, int64_t id,
-                                            int32_t expert_id, int device_id, layout_mode layout,
-                                            ggml_sycl::mem_handle lease, void * ptr) {
-                    expert_dispatch_entry entry = ggml_sycl_make_secondary_expert_dispatch_entry(
-                        iid1, id, expert_id, device_id, layout, std::move(lease),
-                        /*allow_cpu_fallback=*/false, ptr);
-                    dst_entries.push_back(std::move(entry));
-                };
-                auto enforce_secondary_route_capability = [&](moe_expert_route & route, int32_t expert_id,
-                                                              moe_route_phase phase, size_t rows) {
-                    if (route.kind != moe_expert_route_kind::SECONDARY_DEVICE || !route.ptr) {
-                        return;
-                    }
-
-                    const bool queue_ready = route.owning_device >= 0 && route.owning_device < n_gpu_devs &&
-                                             ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
-                                                 ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(
-                                                     route.owning_device, mmid_owner_ptr));
-                    const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
-                        src0->type, route.actual_layout, phase, src0->ne[0], src0->ne[1], rows, route.owning_device,
-                        moe_layer_route_residency::DEVICE, ctx.device);
-                    if (queue_ready && cap.supported) {
-                        return;
-                    }
-
-                    moe_expert_route host_route;
-                    if (ggml_sycl_try_pp_host_moe_route(src0, ctx.device, expert_id, expert_size, route, host_route)) {
-                        static std::atomic<int> host_fallback_log{ 0 };
-                        if (host_fallback_log.fetch_add(1, std::memory_order_relaxed) < 64) {
-                            GGML_LOG_WARN(
-                                "[MOE-ROUTE] planned secondary route falling back to host tensor=%s expert=%d "
-                                "planned_device=%d rows=%zu layout=%s queue_ready=%d supported=%d kernel=%s "
-                                "reason=%s\n",
-                                src0->name ? src0->name : "?", expert_id, route.owning_device, rows,
-                                ggml_sycl_layout_mode_name(route.actual_layout), queue_ready ? 1 : 0,
-                                cap.supported ? 1 : 0, ggml_sycl::moe_route_kernel_name(cap.kernel),
-                                cap.reason ? cap.reason : "unknown");
-                        }
-                        route = std::move(host_route);
-                        return;
-                    }
-
-                    GGML_ABORT(
-                        "[MOE-ROUTE] planned secondary route unsupported and no handle-backed host route is available "
-                        "tensor=%s expert=%d current_device=%d planned_device=%d rows=%zu layout=%s queue_ready=%d "
-                        "supported=%d kernel=%s reason=%s",
-                        src0->name ? src0->name : "?", expert_id, ctx.device, route.owning_device, rows,
-                        ggml_sycl_layout_mode_name(route.actual_layout), queue_ready ? 1 : 0, cap.supported ? 1 : 0,
-                        ggml_sycl::moe_route_kernel_name(cap.kernel), cap.reason ? cap.reason : "unknown");
-                };
 
                 const ggml_sycl::moe_resolved_batch & main_batch =
                     ne12 == 1 ? retained_decode_batch_result.batch : retained_prompt_batch_result.batch;
@@ -92227,11 +92148,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         have_plan_hybrid && ggml_sycl_placement_plan_moe_needs_other_device(plan_hybrid, ctx.device);
                     const bool cohesive_hidden_plan =
                         hidden_secondary_execution && have_plan_hybrid && !cross_device_plan;
-                    const bool direct_q1_nvfp4_aos =
-                        (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) &&
-                        dispatch_layout == GGML_LAYOUT_AOS;
+                    const bool q1_nvfp4_aos = (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) &&
+                                              dispatch_layout == GGML_LAYOUT_AOS;
                     const bool planner_batched_ptr_table_safe =
-                        direct_q1_nvfp4_aos ||
+                        q1_nvfp4_aos ||
                         (!cross_device_plan && (ggml_sycl_routable_device_count() <= 1 || cohesive_hidden_plan));
                     if (!route_slots.empty() && planner_batched_ptr_table_safe) {
                         expert_ptrs_dev = ggml_sycl_upload_moe_transient_ptr_table(
@@ -92250,7 +92170,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                     }
 
-                    bool batched_ok = false;
+                    bool         batched_ok             = false;
+                    const char * dispatch_reject_reason = nullptr;
+                    size_t       dispatch_reject_bytes  = 0;
                     if (expert_ptrs_dev) {
                         if (ggml_sycl_moe_row_agg_debug_enabled()) {
                             static std::atomic<int> route_ptr_log{ 0 };
@@ -92275,8 +92197,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             ctx, src0, src1, dst, expert_ptrs_dev, gpu_expert_ids.data(), gpu_iid1s.data(),
                             gpu_id_slots.data(), static_cast<int>(layout_entries.size()), static_cast<int>(n_as), n_ids,
                             dispatch_layout, nullptr, 0, 0, ids_host.data(), static_cast<int64_t>(ids_host.size()),
-                            nullptr, nullptr, dispatch_deps.empty() ? nullptr : &dispatch_deps);
+                            nullptr, nullptr, dispatch_deps.empty() ? nullptr : &dispatch_deps, &dispatch_reject_reason,
+                            &dispatch_reject_bytes);
                     }
+                    // A string literal: the dispatch's own reason, no-ptr-table when it never ran, or unnamed if a
+                    // future false return forgets to name itself.
+                    const char * refusal_reason = !expert_ptrs_dev       ? "no-ptr-table" :
+                                                  dispatch_reject_reason ? dispatch_reject_reason :
+                                                                           "unnamed";
 
                     // Fallback: per-expert dispatch if batched path unavailable.
                     if (!batched_ok) {
@@ -92287,14 +92215,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                         "[MOE-ROW-AGG] stage=dispatch-reject path=planner_route_batched tensor=%s "
                                         "layout=%s entries=%zu reason=%s\n",
                                         src0->name ? src0->name : "?", ggml_sycl_layout_mode_name(dispatch_layout),
-                                        layout_entries.size(),
-                                        expert_ptrs_dev ? "dispatch-returned-false" : "no-ptr-table");
+                                        layout_entries.size(), refusal_reason);
                             }
                         }
                     }
 
-                    if (!batched_ok && direct_q1_nvfp4_aos) {
-                        GGML_ABORT("[MOE-ROUTE] admitted primary Q1/NVFP4 direct recipe failed before submit");
+                    // A Q1_0/NVFP4 AOS operand runs on the card only through this batched dispatch, the executor its
+                    // capability answered (MMVQ_COMPAT, or the direct recipe). When the dispatch returns false (a
+                    // scratch allocation that fails, an index past INT_MAX, no pointer table) the op ends with a
+                    // refusal that names the cause and the bytes it asked for, instead of running another path, and
+                    // the process goes on.
+                    if (!batched_ok && q1_nvfp4_aos) {
+                        GGML_LOG_WARN(
+                            "[MOE-ROUTE] Q1_0/NVFP4 AOS batched dispatch returned false: tensor=%s layout=%s "
+                            "entries=%zu ptr_table=%s reason=%s requested_bytes=%zu\n",
+                            src0->name ? src0->name : "?", ggml_sycl_layout_mode_name(dispatch_layout),
+                            layout_entries.size(), expert_ptrs_dev ? "present" : "missing", refusal_reason,
+                            dispatch_reject_bytes);
+                        local_extra.moe_expert_id = -1;
+                        ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
+                        throw ggml_sycl_fallback_error(ggml_sycl_moe_q1_nvfp4_refusal_text(refusal_reason));
                     }
                     if (!batched_ok) {
                         std::vector<sycl::event> per_entry_ready;
@@ -96495,13 +96435,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
         }
         fprintf(stderr, "]\n");
-    }
-
-    // Unpin routed experts after dispatch completes (allows eviction)
-    if (use_routing_prestage) {
-        ggml_sycl::unpin_routed_experts(ctx.device, routed_prestage.pins);
-
-        GGML_SYCL_DEBUG("[MOE-UNPIN] Layer %d: Unpinned routed experts\n", layer_id);
     }
 } catch (const sycl::exception & exc) {
     // llama.cpp-o3h1 commit 3 (ticket c-aolj): this WAS the second,
@@ -126806,31 +126739,57 @@ bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32
     return snapshot->plan->get_kv_device(static_cast<int>(il)) >= 0;
 }
 
+// The "dense-type" clause of ggml_sycl_plan_cpu_work_reason (below) for one dense,
+// non-expert plan entry: a weight a MUL_MAT reads, of a type the inventory
+// carried, that supports_op's MUL_MAT allowlist refuses. BF16 stays out because
+// supports_op admits it through its native route before it asks the allowlist.
+static bool ggml_sycl_plan_cpu_work_is_dense_type(const ggml_sycl::placement_entry & e) {
+    return !e.get_rows_only && e.type < GGML_TYPE_COUNT && e.type != GGML_TYPE_BF16 &&
+           !ggml_sycl::dense_mul_mat_type_supported(e.type);
+}
+
 // llama.cpp-38af: whether the CPU will execute any part of this model's graph,
 // read from the PUBLISHED placement plan -- the same authority supports_op
-// consults when it declines an op because its data is host-planned. The result
-// names the clause that fired (nullptr = none), and each clause is one of those
-// declines:
-//   "layer"   a dense layer planned on the host (layer_device < 0;
-//             ggml_sycl_op_is_planned_on_host's "layer_device<0").
-//   "kv"      a layer whose KV is planned on the host, using the plan's own
-//             host-KV accounting (kv_size_for_layer > 0 && no device owner, as
-//             refresh_kv_byte_totals counts it); a layer with no KV bytes (a
-//             recurrent or KV-less layer) owes nothing here
-//             (ggml_sycl_tensor_is_in_kv_host_buft).
-//   "dense"   a dense weight whose residency is host by supports_op's exact rule,
-//             ggml_sycl_get_planned_weight_residency (common.hpp): when the plan
-//             has a layer_device row for the weight's layer that row decides and
-//             the layer clause above has already covered it (so a stray
-//             off-device entry inside a device-planned layer is NOT CPU work);
-//             otherwise -- including every weight outside any layer, such as
-//             token_embd, output, output_norm, rope_freqs or gemma's
-//             per_layer_token_embd -- the entry decides: !on_device on one
-//             device, target_device < 0 on several.
-//   "experts" an expert tensor with NO expert on a device
-//             (ggml_sycl_moe_tensor_all_experts_on_host). A partially-host
-//             expert tensor deliberately does not count: those experts run
-//             in-backend through the CPU expert pool, never as a CPU split.
+// consults when it declines an op because its data is host-planned, together
+// with supports_op's MUL_MAT allowlist type decline, which holds wherever the
+// plan put the weight. supports_op's other declines are outside this predicate:
+// those by the activation's shape (Q4_1 against a one-row activation, for one)
+// need the graph, which the plan does not carry, and those by op kind (a
+// GET_ROWS of a type with no SYCL gather kernel, for one) are not questions of
+// the MUL_MAT allowlist. The result names the clause that fired (nullptr =
+// none); each clause is a residency decline or the allowlist type decline:
+//   "layer"      a dense layer planned on the host (layer_device < 0;
+//                ggml_sycl_op_is_planned_on_host's "layer_device<0").
+//   "kv"         a layer whose KV is planned on the host, using the plan's own
+//                host-KV accounting (kv_size_for_layer > 0 && no device owner, as
+//                refresh_kv_byte_totals counts it); a layer with no KV bytes (a
+//                recurrent or KV-less layer) owes nothing here
+//                (ggml_sycl_tensor_is_in_kv_host_buft).
+//   "dense-type" a dense weight whose type has no device MUL_MAT kernel: the
+//                MUL_MAT case of supports_op refuses it at its type check
+//                (ggml_sycl_mul_mat_type_supported, which delegates to
+//                dense_mul_mat_type_supported in unified-types.hpp, the list this
+//                clause asks) wherever the weight sits, so the CPU runs that
+//                MUL_MAT even inside a device-planned layer. BF16 counts as run on
+//                the device: supports_op admits a BF16 weight through its native
+//                route before that check, by shape and placement the plan cannot
+//                see. A gather-only weight (get_rows_only) is never a MUL_MAT
+//                operand, and a type the inventory did not carry (GGML_TYPE_COUNT)
+//                gives no verdict. ggml_sycl_plan_cpu_work_is_dense_type, above,
+//                asks this for one entry.
+//   "dense"      a dense weight whose residency is host by supports_op's exact rule,
+//                ggml_sycl_get_planned_weight_residency (common.hpp): when the plan
+//                has a layer_device row for the weight's layer that row decides and
+//                the layer clause above has already covered it (so a stray
+//                off-device entry inside a device-planned layer is NOT CPU work);
+//                otherwise -- including every weight outside any layer, such as
+//                token_embd, output, output_norm, rope_freqs or gemma's
+//                per_layer_token_embd -- the entry decides: !on_device on one
+//                device, target_device < 0 on several.
+//   "experts"    an expert tensor with NO expert on a device
+//                (ggml_sycl_moe_tensor_all_experts_on_host). A partially-host
+//                expert tensor deliberately does not count: those experts run
+//                in-backend through the CPU expert pool, never as a CPU split.
 //
 // The expert clause asks "any device" (expert_on_device with device -1), where
 // ggml_sycl_moe_tensor_all_experts_on_host asks one device at a time. They differ
@@ -126870,6 +126829,10 @@ static const char * ggml_sycl_plan_cpu_work_reason(const ggml_sycl::placement_pl
     std::unordered_map<std::string, bool> expert_tensor_has_device_expert;
     for (const auto & e : plan.entries) {
         if (e.expert_id < 0) {
+            // Ahead of the layer_device skip: a type decline holds wherever the weight sits.
+            if (ggml_sycl_plan_cpu_work_is_dense_type(e)) {
+                return "dense-type";
+            }
             if (e.layer_id >= 0 && plan.layer_device.count(e.layer_id) != 0) {
                 continue;  // layer_device decides this layer's dense weights
             }
@@ -126922,12 +126885,16 @@ bool ggml_backend_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
 }
 
 namespace ggml_sycl {
-// Pure plan -> verdict seam for tests/test-sycl-plan-cpu-work.cpp. It skips the
+// Pure plan -> verdict seams for tests/test-sycl-plan-cpu-work.cpp. They skip the
 // snapshot publication on purpose: publishing enumerates devices
 // (ggml_sycl_prepare_plan_publication_locked), and the predicate itself reads
 // nothing but the plan.
 bool test_plan_has_cpu_work(const placement_plan & plan) {
     return ::ggml_sycl_plan_has_cpu_work(plan);
+}
+
+const char * test_plan_cpu_work_reason(const placement_plan & plan) {
+    return ::ggml_sycl_plan_cpu_work_reason(plan);
 }
 }  // namespace ggml_sycl
 
@@ -127206,10 +127173,14 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         // planner placed some backing table in host-pinned memory.
         //
         // Residency-blind admission is not type-blind admission. MUL_MAT_ID asks
-        // the MMID coverage tables below. Q1_0 and NVFP4 are in them and stay
-        // admitted by design: they carry fp16 converters and are refused by the
-        // runtime route oracle (the sanctioned fail-closed class of c-wps7).
-        // Q2_0 joined with its kernels (llama.cpp-s36q phase 4). ADD_ID keeps
+        // the MMID coverage tables below. Q1_0 and NVFP4 are in them because
+        // their MMVQ id kernel runs them on the card in AOS. The capability
+        // query and the executor choice agree at run time only for an expert
+        // local to the submitting card, in AOS, with a block-aligned K. For
+        // any other device expert of these types (another card's, another
+        // layout, an unaligned K) the capability query refuses, so this yes
+        // does not promise a device executor for it. Q2_0 joined with its
+        // kernels (llama.cpp-s36q phase 4). ADD_ID keeps
         // the dense allowlist plus Q1_0/NVFP4, so every other type without a
         // kernel -- upstream b10630's tq2_0 and anything future -- is refused
         // at this gate instead of reaching an executor that computes wrong
@@ -127223,13 +127194,13 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             // whole IQ1_S..IQ4_XS family because they have real *dense* kernels;
             // none of them has an _id kernel family, so admitting them handed
             // the scheduler an op this backend cannot compute. The route oracle
-            // did refuse it, but that refusal escapes as ggml_sycl_fallback_error
-            // -> GGML_STATUS_FAILED, which ggml_backend_compare_graph_backend
-            // discards -- so the op reported uncorrelated numbers (ERR 86-99)
+            // did refuse it, but that refusal escaped as ggml_sycl_fallback_error
+            // -> GGML_STATUS_FAILED, which ggml_backend_compare_graph_backend then
+            // discarded -- so the op reported uncorrelated numbers (ERR 86-99)
             // instead of falling back to the CPU backend, for 234 census cases.
             // moe_mmvq_admission_supports_type() asks the MMID tables instead;
-            // Q1_0/NVFP4 are in those tables, so their deliberate admit-then-
-            // refuse-at-the-oracle behaviour is preserved without a special case.
+            // Q1_0/NVFP4 are in those tables because their id kernel runs them,
+            // so they need no special case here.
             //
             // ADD_ID must NOT be gated on these tables: its src[0] is the F32
             // activation (ggml_add_id -> ggml_dup_tensor(ctx, a)), not an expert

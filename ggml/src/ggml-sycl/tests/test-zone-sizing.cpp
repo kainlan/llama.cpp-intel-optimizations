@@ -28,6 +28,7 @@
 #include "zone-sizing.hpp"
 #include "zone-used-count.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
@@ -622,7 +623,7 @@ int main() {
         zone_tensor_desc mla_wk_b              = desc("token_embd.weight", 9000000, TYPE_Q8_0, 128, 512, 128, 1);
         mla_wk_b.mmq_src1_bytes_per_token      = 576 * 128;
         // An expert stack the adapter did not mark: ne[2] is large and K is large, and it
-        // must not contribute (its own moe_q8 workspace sizes it).
+        // must not contribute (zone_moe_mmvq_op_bytes sizes its per-op buffers).
         zone_tensor_desc experts = desc("blk.0.ffn_down.weight", GPT_OSS_EXPERT_BYTES, TYPE_MXFP4, 2880, 2880, 32, 1);
         zone_tensor_desc lm_head = desc("output.weight", MISTRAL_OUTPUT_BYTES, TYPE_Q6_K, 4096, 32000, 1, 1);
         lm_head.mmq_src1_bytes_per_token = 4608;  // a singleton still counts: it IS a MUL_MAT src0
@@ -3370,6 +3371,710 @@ int main() {
         const zone_onednn_plan smaller = zone_onednn_plan_keep_short(prior, prior, 400 * MiB, 0);
         CHECK(smaller.graph_floor_bytes == 200 * MiB, "the floor in a 400 MiB zone is not 200 MiB");
         CHECK(room_over(smaller, 400 * MiB) == 200 * MiB, "the Graph room in the smaller zone is not the floor");
+    }
+
+    // ---- Case 45: the SCRATCH zone's use over a cache's life, and the line its teardown logs ----------------------
+    // The high-water keeps the live allocations of the moment it was set; a later placement below it changes neither.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_scratch_use;
+        using ggml_sycl::zone_scratch_use_note_alloc;
+        using ggml_sycl::zone_scratch_use_note_miss;
+        using ggml_sycl::zone_scratch_use_text;
+
+        zone_scratch_use use;
+        CHECK(zone_scratch_use_text(use, 1, 512 * MiB).empty(), "an unused zone printed a line");
+
+        zone_scratch_use_note_alloc(use, 2 * MiB, 2 * MiB, 1);
+        zone_scratch_use_note_alloc(use, 9 * MiB, 11 * MiB, 2);
+        zone_scratch_use_note_alloc(use, 1 * MiB, 3 * MiB, 2);  // after frees: below the high-water
+        CHECK(use.requests == 3 && use.largest_request_bytes == 9 * MiB, "placements were not counted");
+        CHECK(use.high_water_bytes == 11 * MiB && use.live_at_high_water == 2,
+              "the high-water did not keep the allocations live when it was set");
+        zone_scratch_use_note_alloc(use, 4 * MiB, 11 * MiB, 5);
+        CHECK(use.live_at_high_water == 2, "an equal used figure replaced the high-water's moment");
+        CHECK(use.misses == 0 && use.miss_bytes == 0, "a placement counted as a miss");
+
+        zone_scratch_use_note_miss(use, 600 * MiB);
+        zone_scratch_use_note_miss(use, 40 * MiB);
+        CHECK(use.misses == 2 && use.miss_bytes == 640 * MiB && use.largest_miss_bytes == 600 * MiB,
+              "misses were not counted");
+        zone_scratch_use_note_miss(use, SIZE_MAX);
+        CHECK(use.miss_bytes == SIZE_MAX, "the missed bytes did not saturate");
+
+        zone_scratch_use only_misses;
+        zone_scratch_use_note_miss(only_misses, MiB);
+        CHECK(!zone_scratch_use_text(only_misses, 0, 0).empty(), "a zone that only missed printed nothing");
+
+        zone_scratch_use shown;
+        zone_scratch_use_note_alloc(shown, 9 * MiB, 13 * MiB + MiB / 2, 3);
+        zone_scratch_use_note_miss(shown, 2 * MiB);
+        const std::string line = zone_scratch_use_text(shown, 1, 512 * MiB);
+        CHECK(line ==
+                  "[UNIFIED-CACHE] SCRATCH zone use: device=1 high-water=13.50 MB of 512.00 MB with 3 allocations "
+                  "live, largest request=9.00 MB, requests placed=1; zone misses (placements the zone refused, "
+                  "each spilled to raw device memory or refused by its caller): requests=1 bytes=2.00 MB "
+                  "largest=2.00 MB",
+              "the teardown line's text changed");
+    }
+
+    // ---- Case 46: the MoE batched MMVQ scratch one op holds, and the sum over a model's expert ops ---------------
+    // The figures are mmvq_moe_batched_dispatch's own: K padded to QK8_1, 36 bytes a block, ne11 * ne12 rows, and
+    // n_tokens * n_expert_used int32 ids, each buffer as the SCRATCH zone's allocator places it: rounded up to its
+    // 256-byte block grain (k_zone_arena_alignment). The vehicle is Qwen3.6-35B-A3B NVFP4 (top-8): gate and up have
+    // K = 2048 and one activation row a token, down has K = 512 and one row a slot. The file holds 41 blocks; the 41st
+    // is the MTP block, whose experts load only with MTP, so the main graph has 40 layers of gate, up and down.
+    {
+        using ggml_sycl::zone_moe_mmvq_op_bytes;
+        using ggml_sycl::zone_moe_mmvq_operand;
+        using ggml_sycl::zone_moe_mmvq_scratch;
+        using ggml_sycl::zone_moe_mmvq_scratch_bytes;
+
+        const zone_moe_mmvq_operand gate{ 2048, false };
+        const zone_moe_mmvq_operand down{ 512, true };
+        size_t                      bytes = 0;
+
+        // 512 rows: gate 512 x 2304 + 16384 ids; down 4096 x 576 + 16384 ids. Every buffer is whole grains already.
+        CHECK(zone_moe_mmvq_op_bytes(gate, 512, 8, &bytes) && bytes == 1196032, "the gate op at 512 rows is wrong");
+        CHECK(zone_moe_mmvq_op_bytes(down, 512, 8, &bytes) && bytes == 2375680, "the down op at 512 rows is wrong");
+        // 2048 rows: gate 2048 x 2304 + 65536 ids; down 16384 x 576 + 65536 ids.
+        CHECK(zone_moe_mmvq_op_bytes(gate, 2048, 8, &bytes) && bytes == 4784128, "the gate op at 2048 rows is wrong");
+        CHECK(zone_moe_mmvq_op_bytes(down, 2048, 8, &bytes) && bytes == 9502720, "the down op at 2048 rows is wrong");
+
+        // K pads to QK8_1, not to MATRIX_ROW_PADDING: 33 columns are two blocks (72 bytes), and one id (4 bytes). The
+        // allocator places each in one grain.
+        CHECK(zone_moe_mmvq_op_bytes({ 33, false }, 1, 1, &bytes) && bytes == 256 + 256,
+              "K did not pad to one Q8_1 block, or a buffer was not placed in a whole grain");
+
+        // Each buffer is placed on its own, so each rounds up alone: one token of 8 slots takes a 2304-byte gate row
+        // (nine grains exactly) and 32 bytes of ids (one grain); a 288-byte row (K = 256) takes two grains; 8 tokens
+        // of 8 slots take exactly one grain of ids, and a ninth token a second.
+        CHECK(zone_moe_mmvq_op_bytes(gate, 1, 8, &bytes) && bytes == 2304 + 256,
+              "a whole-grain buffer was rounded, or the ids were not");
+        CHECK(zone_moe_mmvq_op_bytes(down, 1, 8, &bytes) && bytes == 4608 + 256, "the down op's ids were not rounded");
+        CHECK(zone_moe_mmvq_op_bytes({ 256, false }, 1, 1, &bytes) && bytes == 512 + 256,
+              "a buffer one block over a grain did not take two");
+        CHECK(zone_moe_mmvq_op_bytes(gate, 8, 8, &bytes) && bytes == 8 * 2304 + 256,
+              "ids of exactly one grain were rounded");
+        CHECK(zone_moe_mmvq_op_bytes(gate, 9, 8, &bytes) && bytes == 9 * 2304 + 512,
+              "ids one token over a grain did not take two");
+        // A buffer within one grain of SIZE_MAX is one the allocator refuses (tlsf_allocator::round_request): K = 32
+        // and one slot is 36 bytes a token, so 2^64 / 36 tokens are 2^64 - 16 bytes of Q8_1, which only wraps.
+        CHECK(!zone_moe_mmvq_op_bytes({ 32, false }, int64_t(SIZE_MAX / 36), 1, &bytes) && bytes == SIZE_MAX,
+              "a buffer the rounding wraps did not saturate");
+
+        // An MXFP4 stack's grouped dispatch also takes its tables from the zone, six buffers of int32 apiece. GPT-OSS
+        // 20B's shape: K = 2880 (90 blocks, 3240 bytes a row), 32 experts, top-4. At 512 tokens: 2048 routed rows,
+        // 128 chunks of 16 an expert, so the tables are 32 experts (128 bytes, one grain), 33 offsets (132, one grain),
+        // 2048 rows (8192), two of 4096 chunks (16384 each) and the counter (4, one grain): 41728 bytes beside the
+        // Q8_1 rows and 8192 ids bytes, which are whole grains.
+        const zone_moe_mmvq_operand mxfp4_gate{ 2880, false, 32 };
+        const zone_moe_mmvq_operand mxfp4_down{ 2880, true, 32 };
+        CHECK(zone_moe_mmvq_op_bytes({ 2880, false, 0 }, 512, 4, &bytes) && bytes == 1658880 + 8192,
+              "an ungrouped op took grouped tables");
+        CHECK(zone_moe_mmvq_op_bytes(mxfp4_gate, 512, 4, &bytes) && bytes == 1658880 + 8192 + 41728,
+              "the grouped gate op at 512 rows is wrong");
+        CHECK(zone_moe_mmvq_op_bytes(mxfp4_down, 512, 4, &bytes) && bytes == 6635520 + 8192 + 41728,
+              "the grouped down op at 512 rows is wrong");
+        // 3 tokens of 4 slots: 12 rows make one chunk an expert (rounded up), so every table is under one grain. The
+        // 9720 Q8_1 bytes take 38 grains, the 48 ids bytes one, and the six tables one each.
+        CHECK(zone_moe_mmvq_op_bytes(mxfp4_gate, 3, 4, &bytes) && bytes == 9728 + 256 + 6 * 256,
+              "a partial chunk did not round up to one chunk an expert, or a table was not placed in a grain");
+        // 17 tokens of one slot: two chunks an expert, 64 chunks (256 bytes a table). 55080 Q8_1 bytes take 216
+        // grains.
+        CHECK(zone_moe_mmvq_op_bytes(mxfp4_gate, 17, 1, &bytes) && bytes == 55296 + 256 + 6 * 256,
+              "17 rows did not make two chunks an expert");
+        // 64 experts fill the experts table's grain exactly, so the 65 offsets (260 bytes) take two. 11776 bytes: 9728
+        // Q8_1 and 256 ids, then experts 256, offsets 512, rows 256 (12), two chunk tables of 256 (64), counter 256.
+        CHECK(zone_moe_mmvq_op_bytes({ 2880, false, 64 }, 3, 4, &bytes) && bytes == 11776,
+              "the offsets table is not one entry longer than the experts table");
+        CHECK(!zone_moe_mmvq_op_bytes({ 2880, false, -1 }, 512, 4, &bytes) && bytes == 0,
+              "a negative expert count sized an op");
+        CHECK(!zone_moe_mmvq_op_bytes({ 32, false, INT64_MAX }, 1, 1, &bytes) && bytes == SIZE_MAX,
+              "an expert count whose tables overflow did not saturate");
+        // Overflows whose wrapped products are small, which only the tables' guard sees: 2^62 experts are 2^64 bytes
+        // of expert ids (0 once wrapped), and 2^40 experts of 2^22 chunks each (2^26 rows) are 2^64 bytes a chunk
+        // table.
+        CHECK(!zone_moe_mmvq_op_bytes({ 32, false, int64_t(1) << 62 }, 1, 1, &bytes) && bytes == SIZE_MAX,
+              "2^62 experts wrapped to an expert table of no bytes");
+        const int64_t chunk_rows = int64_t(1) << 26;
+        CHECK(!zone_moe_mmvq_op_bytes({ 32, false, int64_t(1) << 40 }, chunk_rows, 1, &bytes) && bytes == SIZE_MAX,
+              "2^62 chunks wrapped to a chunk table of no bytes");
+
+        std::vector<zone_moe_mmvq_operand> vehicle;
+        for (int layer = 0; layer < 40; ++layer) {
+            vehicle.push_back(gate);  // ffn_gate_exps
+            vehicle.push_back(gate);  // ffn_up_exps
+            vehicle.push_back(down);  // ffn_down_exps
+        }
+        zone_moe_mmvq_scratch scratch;
+        CHECK(zone_moe_mmvq_scratch_bytes(vehicle, 512, 8, &scratch), "the vehicle at 512 rows did not size");
+        CHECK(scratch.per_op == 2375680, "one op's most at 512 rows is not the down op");
+        CHECK(scratch.graph == 190709760, "the 40-layer sum at 512 rows is not 40 x 4767744");
+        CHECK(zone_moe_mmvq_scratch_bytes(vehicle, 2048, 8, &scratch), "the vehicle at 2048 rows did not size");
+        CHECK(scratch.per_op == 9502720, "one op's most at 2048 rows is not the down op");
+        CHECK(scratch.graph == 762839040, "the 40-layer sum at 2048 rows is not 40 x 19070976");
+
+        CHECK(zone_moe_mmvq_scratch_bytes({}, 512, 8, &scratch) && scratch.per_op == 0 && scratch.graph == 0,
+              "a model with no admitted expert op owes something");
+
+        // A non-positive input sizes nothing, and says so.
+        CHECK(!zone_moe_mmvq_op_bytes({ 0, false }, 512, 8, &bytes) && bytes == 0, "K = 0 sized an op");
+        CHECK(!zone_moe_mmvq_op_bytes(gate, 0, 8, &bytes) && bytes == 0, "no tokens sized an op");
+        CHECK(!zone_moe_mmvq_op_bytes(gate, 512, 0, &bytes) && bytes == 0, "no routed slot sized an op");
+        CHECK(!zone_moe_mmvq_op_bytes(gate, -1, 8, &bytes) && bytes == 0, "a negative token count sized an op");
+        const zone_moe_mmvq_operand negative_k{ -4, true };
+        CHECK(!zone_moe_mmvq_scratch_bytes({ gate, negative_k }, 512, 8, &scratch) && scratch.per_op == 0 &&
+                  scratch.graph == 0,
+              "an op with a negative K left a bound");
+        const zone_moe_mmvq_operand negative_experts{ 2880, false, -32 };
+        CHECK(!zone_moe_mmvq_scratch_bytes({ gate, negative_experts }, 512, 8, &scratch) && scratch.per_op == 0 &&
+                  scratch.graph == 0,
+              "an op with a negative expert count left a bound");
+        CHECK(!zone_moe_mmvq_scratch_bytes(vehicle, 512, 0, &scratch) && scratch.per_op == 0 && scratch.graph == 0,
+              "no routed slot left a bound");
+
+        // The widest K is 2^58 blocks, 9 x 2^60 bytes a row: one row fits a 64-bit size_t, two do not.
+        const zone_moe_mmvq_operand widest{ INT64_MAX, false };
+        CHECK(zone_moe_mmvq_op_bytes(widest, 1, 1, &bytes) && bytes == (size_t(9) << 60) + 256,
+              "one row of the widest K did not size exactly");
+        // Overflow saturates: in the Q8_1 bytes, the slot count, the ids, one op's two buffers, and the sum.
+        CHECK(!zone_moe_mmvq_op_bytes(widest, 2, 1, &bytes) && bytes == SIZE_MAX,
+              "the Q8_1 bytes overflow did not saturate");
+        CHECK(!zone_moe_mmvq_op_bytes(down, INT64_MAX, 8, &bytes) && bytes == SIZE_MAX,
+              "the slot count overflow did not saturate");
+        // 2^32 tokens of 2^32 slots wrap to exactly zero slots, which the later checks would pass as a zero-byte op.
+        CHECK(!zone_moe_mmvq_op_bytes(down, int64_t(1) << 32, int64_t(1) << 32, &bytes) && bytes == SIZE_MAX,
+              "a slot count that wraps to zero did not saturate");
+        CHECK(!zone_moe_mmvq_op_bytes({ 32, false }, int64_t(1) << 31, int64_t(1) << 32, &bytes) && bytes == SIZE_MAX,
+              "the ids bytes overflow did not saturate");
+        // 9 x 2^60 bytes of Q8_1 and 2^63 bytes of ids each fit; together they do not.
+        CHECK(!zone_moe_mmvq_op_bytes(widest, 1, int64_t(1) << 61, &bytes) && bytes == SIZE_MAX,
+              "the op's two buffers overflowing together did not saturate");
+        CHECK(!zone_moe_mmvq_scratch_bytes({ gate, widest }, 512, 8, &scratch) && scratch.per_op == SIZE_MAX &&
+                  scratch.graph == SIZE_MAX,
+              "an op that overflows did not saturate both bounds");
+        // Alone, the overflowing op's SIZE_MAX adds to a zero sum without overflowing it, and is still not exact.
+        CHECK(!zone_moe_mmvq_scratch_bytes({ widest }, 512, 8, &scratch) && scratch.per_op == SIZE_MAX &&
+                  scratch.graph == SIZE_MAX,
+              "a lone op that overflows answered exact");
+        // K = 32 and one slot: 40 bytes a token. Each op holds 2^63 + 256 bytes as the allocator places its two
+        // buffers (2^63 + 32 requested), which fits; two of them do not.
+        const zone_moe_mmvq_operand one_block{ 32, false };
+        const int64_t               half = int64_t(SIZE_MAX / 40 / 2 + 1);
+        CHECK(zone_moe_mmvq_op_bytes(one_block, half, 1, &bytes) && bytes == (size_t(1) << 63) + 256,
+              "the op just over half of SIZE_MAX did not size exactly");
+        CHECK(!zone_moe_mmvq_scratch_bytes({ one_block, one_block }, half, 1, &scratch) &&
+                  scratch.per_op == (size_t(1) << 63) + 256 && scratch.graph == SIZE_MAX,
+              "the sum overflow did not saturate the graph bound alone");
+    }
+
+    // ---- Case 47: the SCRATCH zone's size, raised by the MoE batched MMVQ bound at the context's micro-batch -------
+    // The bound is every expert op's buffers at once (zone_scratch_plan says why no smaller depth holds). The vehicle
+    // is Case 46's. At a row count that is a multiple of 8 every buffer is whole grains, and its down op holds 4640
+    // bytes a row, the figure the zone's use line measured (2.27 MB at 512 rows and 9.06 MB at 2048, one op live), and
+    // gate and up 2336 each. The expected zones below are the rule applied to those figures: the larger of the default
+    // and layers x (2 x 2336 + 4640) x rows there, and at any other row count the same with each op's 32 bytes of ids a
+    // row rounded up to the grain. Neither limit binds here (Case 49 has them): `plan_of` passes SIZE_MAX for both,
+    // which is no limit.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_moe_mmvq_op_bytes;
+        using ggml_sycl::zone_moe_mmvq_operand;
+        using ggml_sycl::zone_moe_mmvq_scratch;
+        using ggml_sycl::zone_moe_mmvq_scratch_bytes;
+        using ggml_sycl::zone_scratch_clamp;
+        using ggml_sycl::zone_scratch_kept_bytes;
+        using ggml_sycl::zone_scratch_plan;
+        using ggml_sycl::zone_scratch_warn_due;
+        using ggml_sycl::zone_scratch_zone_plan;
+
+        const size_t default_bytes = 512 * MiB;
+        // SIZE_MAX is no limit: this case holds neither the budget quarter nor the reserve's room (Case 49 does).
+        const auto   plan_of       = [&](size_t nonfa_bytes, size_t bound_bytes) {
+            return zone_scratch_zone_plan(default_bytes, nonfa_bytes, bound_bytes, SIZE_MAX, SIZE_MAX);
+        };
+        const zone_moe_mmvq_operand gate{ 2048, false };
+        const zone_moe_mmvq_operand down{ 512, true };
+        size_t                      down_rows = 0;
+        size_t                      gate_rows = 0;
+        CHECK(zone_moe_mmvq_op_bytes(down, 8, 8, &down_rows) && down_rows == 8 * 4640,
+              "the down op does not hold the measured 4640 bytes a row");
+        CHECK(zone_moe_mmvq_op_bytes(gate, 8, 8, &gate_rows) && gate_rows == 8 * 2336,
+              "the gate op does not hold 2336 bytes a row");
+        const size_t layer_row = (2 * gate_rows + down_rows) / 8;
+        // One layer at `rows`: the Q8_1 rows (2 x 2304 + 4608 a row, whole grains) and three ops' ids, each rounded up.
+        const auto   layer_at  = [](size_t rows) {
+            const size_t ids = (32 * rows + 255) / 256 * 256;
+            return (2 * 2304 + 4608) * rows + 3 * ids;
+        };
+
+        // The late plan reads the tensors the load created: 40 layers. The early plan reads the file's weights, which
+        // hold the MTP block's experts too: 41 layers.
+        std::vector<zone_moe_mmvq_operand> main_graph;
+        for (int layer = 0; layer < 40; ++layer) {
+            main_graph.insert(main_graph.end(), { gate, gate, down });
+        }
+        std::vector<zone_moe_mmvq_operand> with_mtp = main_graph;
+        with_mtp.insert(with_mtp.end(), { gate, gate, down });
+
+        zone_moe_mmvq_scratch scratch;
+        CHECK(zone_moe_mmvq_scratch_bytes(main_graph, 512, 8, &scratch), "the vehicle at 512 rows did not size");
+        zone_scratch_plan plan = plan_of(0, scratch.graph);
+        CHECK(plan.required == default_bytes && plan.wanted == default_bytes,
+              "at 512 rows the bound (181.9 MiB) moved the zone off its default");
+        CHECK(plan.wanted == std::max(default_bytes, 40 * layer_row * 512), "the zone at 512 rows is not the rule's");
+
+        CHECK(zone_moe_mmvq_scratch_bytes(main_graph, 2048, 8, &scratch), "the vehicle at 2048 rows did not size");
+        plan = plan_of(0, scratch.graph);
+        CHECK(plan.required == default_bytes && plan.wanted == 40 * layer_row * 2048 && plan.wanted > default_bytes,
+              "at 2048 rows the zone is not the bound (727.5 MiB)");
+        CHECK(zone_moe_mmvq_scratch_bytes(with_mtp, 2048, 8, &scratch), "the early plan at 2048 rows did not size");
+        CHECK(plan_of(0, scratch.graph).wanted == 41 * layer_row * 2048,
+              "the early plan's 123 ops at 2048 rows do not ask 745.7 MiB");
+
+        // Monotone in the micro-batch, never below the default, and the rule's at every row count to 4096. The bound
+        // passes the default between 1441 and 1442 rows: 536770560 bytes at 1441, 537139200 at 1442.
+        size_t previous = 0;
+        for (int64_t rows = 1; rows <= 4096; ++rows) {
+            CHECK(zone_moe_mmvq_scratch_bytes(main_graph, rows, 8, &scratch), "the vehicle did not size");
+            const size_t wanted = plan_of(0, scratch.graph).wanted;
+            CHECK(wanted >= previous, "the zone shrank as the micro-batch grew");
+            CHECK(wanted == std::max(default_bytes, 40 * layer_at(size_t(rows))), "the zone is not the rule's");
+            CHECK(rows % 8 != 0 || layer_at(size_t(rows)) == layer_row * size_t(rows),
+                  "a row count of whole-grain ids is not the per-row figure");
+            previous = wanted;
+        }
+        CHECK(zone_moe_mmvq_scratch_bytes(main_graph, 1441, 8, &scratch) && scratch.graph == 536770560 &&
+                  plan_of(0, scratch.graph).wanted == default_bytes,
+              "the zone left its default at 1441 rows");
+        CHECK(zone_moe_mmvq_scratch_bytes(main_graph, 1442, 8, &scratch) && scratch.graph == 537139200 &&
+                  plan_of(0, scratch.graph).wanted > default_bytes,
+              "the zone stayed at its default at 1442 rows");
+
+        // The non-FA estimate raises what the zone must hold; the bound raises only what it is sized to.
+        plan = plan_of(640 * MiB, 100 * MiB);
+        CHECK(plan.required == 640 * MiB && plan.wanted == 640 * MiB, "a bound under the non-FA raise moved the zone");
+        plan = plan_of(640 * MiB, 700 * MiB);
+        CHECK(plan.required == 640 * MiB && plan.wanted == 700 * MiB, "the bound is not on top of the non-FA raise");
+        plan = plan_of(100 * MiB, 0);
+        CHECK(plan.required == default_bytes && plan.wanted == default_bytes,
+              "a small non-FA estimate shrank the zone");
+        plan = zone_scratch_zone_plan(16 * MiB, 0, 0, SIZE_MAX, SIZE_MAX);
+        CHECK(plan.required == 16 * MiB && plan.wanted == 16 * MiB, "a zone with no raise is not its default");
+        CHECK(plan_of(0, 40 * layer_row * 2048).clamp == zone_scratch_clamp::NONE, "no limit clamped the bound");
+
+        // A rebuild something live blocks keeps a zone short of the bound alone, and asks the whole plan of one short
+        // of what it must hold, or of one that holds it all.
+        plan = plan_of(0, 40 * layer_row * 2048);
+        CHECK(zone_scratch_kept_bytes(plan, 1024 * MiB) == plan.wanted, "a zone that holds the bound was kept short");
+        CHECK(zone_scratch_kept_bytes(plan, plan.wanted) == plan.wanted, "a zone of exactly the bound was kept short");
+        CHECK(zone_scratch_kept_bytes(plan, 600 * MiB) == 600 * MiB, "a zone short of the bound alone was not kept");
+        CHECK(zone_scratch_kept_bytes(plan, default_bytes) == default_bytes,
+              "a zone of exactly what it must hold was not kept");
+        CHECK(zone_scratch_kept_bytes(plan, 256 * MiB) == plan.wanted,
+              "a zone short of what it must hold was kept as if only the bound were short");
+        plan = plan_of(640 * MiB, 700 * MiB);
+        CHECK(zone_scratch_kept_bytes(plan, 600 * MiB) == 700 * MiB, "a zone short of the non-FA raise was kept");
+        CHECK(zone_scratch_kept_bytes(plan, 660 * MiB) == 660 * MiB, "a zone that holds the non-FA raise was not kept");
+
+        // A SCRATCH WARN that latches on a figure: once per figure, again only for a larger one.
+        CHECK(zone_scratch_warn_due(0, 700 * MiB), "the first keep did not warn");
+        CHECK(!zone_scratch_warn_due(700 * MiB, 700 * MiB), "a keep of the same figure warned again");
+        CHECK(!zone_scratch_warn_due(745 * MiB, 700 * MiB), "a keep of a smaller figure warned again");
+        CHECK(zone_scratch_warn_due(700 * MiB, 745 * MiB), "a keep of a larger figure did not warn");
+    }
+
+    // ---- Case 48: the arena reserve's checks on its tail zones, and the SCRATCH zone's room ----------------------
+    // arena_reserve calls these checks itself. The room is the most SCRATCH the reserve accepts on top of what the
+    // zone must hold with every check it passed still passing. Each of the three ways a larger SCRATCH zone makes the
+    // reserve refuse where the zone without it passed is a scenario below, and the room keeps each one a pass.
+    {
+        constexpr size_t MiB   = 1024ull * 1024ull;
+        constexpr size_t GiB   = 1024ull * MiB;
+        constexpr size_t M     = ggml_sycl::k_zone_arena_min_shared_bytes;
+        constexpr size_t grain = ggml_sycl::k_zone_arena_alignment;
+        using ggml_sycl::zone_arena_chunk_holds_tail;
+        using ggml_sycl::zone_arena_n_chunk_accepts;
+        using ggml_sycl::zone_arena_per_chunk_cap;
+        using ggml_sycl::zone_arena_reserve_shape;
+        using ggml_sycl::zone_arena_reserve_shape_of;
+        using ggml_sycl::zone_arena_round_alloc_bytes;
+        using ggml_sycl::zone_arena_scratch_accepts;
+        using ggml_sycl::zone_arena_scratch_room;
+        using ggml_sycl::zone_arena_single_chunk_accepts;
+        using ggml_sycl::zone_arena_single_chunk_tried;
+        using ggml_sycl::zone_arena_tail_bytes;
+        using ggml_sycl::zone_arena_tail_chunk_bytes;
+        using ggml_sycl::zone_arena_tail_kv_reserve;
+        using ggml_sycl::zone_arena_weight_chunks_fit;
+        using ggml_sycl::zone_arena_zone_bytes;
+        using ggml_sycl::zone_scratch_clamp;
+        using ggml_sycl::zone_scratch_plan;
+        using ggml_sycl::zone_scratch_zone_plan;
+
+        CHECK(M == 16 * MiB && grain == 256, "the reserve's minimum or grain moved");
+
+        // The sizes, as arena_reserve derives them.
+        CHECK(zone_arena_zone_bytes(1) == 256 && zone_arena_zone_bytes(256) == 256 && zone_arena_zone_bytes(257) == 512,
+              "a zone did not round up to the grain");
+        CHECK(zone_arena_round_alloc_bytes(5 * MiB + 1) == 4 * MiB && zone_arena_round_alloc_bytes(4 * MiB) == 4 * MiB,
+              "the arena did not round down to 2 MiB");
+        CHECK(zone_arena_per_chunk_cap(8 * GiB, 0) == 8 * GiB, "no safe cap did not leave the device's cap");
+        CHECK(zone_arena_per_chunk_cap(8 * GiB, 7 * GiB) == 7 * GiB, "the safe cap below the device's did not hold");
+        CHECK(zone_arena_per_chunk_cap(4 * GiB, 6 * GiB) == 4 * GiB, "a safe cap above the device's replaced it");
+        CHECK(zone_arena_per_chunk_cap(0, 5 * GiB) == 5 * GiB, "the safe cap alone was not the cap");
+        CHECK(zone_arena_per_chunk_cap(0, 0) == 0, "no cap at all named one");
+        CHECK(zone_arena_single_chunk_tried(9 * GiB, 0, 0), "a device with no cap did not try one chunk");
+        CHECK(zone_arena_single_chunk_tried(4 * GiB, 8 * GiB, 4 * GiB),
+              "an arena of exactly the cap was not one chunk");
+        CHECK(!zone_arena_single_chunk_tried(4 * GiB + 1, 8 * GiB, 4 * GiB), "an arena above the cap tried one chunk");
+        CHECK(zone_arena_tail_kv_reserve(1 * GiB) == 128 * MiB, "a small arena's KV share is not 128 MiB");
+        CHECK(zone_arena_tail_kv_reserve(32 * GiB) == 256 * MiB, "a 32 GiB arena's KV share is not a 128th");
+        CHECK(zone_arena_tail_kv_reserve(128 * GiB) == 512 * MiB, "a large arena's KV share is not 512 MiB");
+
+        // The tail's sum refuses a wrap at either add and holds a sum of exactly SIZE_MAX, leaving *out alone when it
+        // refuses.
+        size_t tail_sum = 7;
+        CHECK(zone_arena_tail_bytes({ 256, 512, 1024 }, &tail_sum) && tail_sum == 1792,
+              "the tail is not its zones' sum");
+        tail_sum = 7;
+        CHECK(!zone_arena_tail_bytes({ SIZE_MAX, 1, 0 }, &tail_sum) && tail_sum == 7,
+              "a wrap on the first add was a tail");
+        CHECK(!zone_arena_tail_bytes({ SIZE_MAX - 1, 1, 1 }, &tail_sum) && tail_sum == 7,
+              "a wrap on the second add was a tail");
+        CHECK(zone_arena_tail_bytes({ SIZE_MAX - 2, 1, 1 }, &tail_sum) && tail_sum == SIZE_MAX,
+              "a tail of exactly SIZE_MAX was refused");
+        CHECK(zone_arena_tail_bytes({ SIZE_MAX - 256, 256 }, &tail_sum) && tail_sum == SIZE_MAX &&
+                  !zone_arena_tail_bytes({ SIZE_MAX - 255, 256 }, &tail_sum),
+              "a two-zone tail did not refuse exactly at the wrap");
+        CHECK(zone_arena_tail_chunk_bytes(12 * GiB, 1459 * MiB, 1280 * MiB, 128 * MiB) == 1408 * MiB,
+              "the tail chunk is not the tail and its KV share");
+        CHECK(zone_arena_tail_chunk_bytes(12 * GiB, 1459 * MiB, 1400 * MiB, 128 * MiB) == 1459 * MiB,
+              "the tail chunk is above the per-chunk cap");
+        CHECK(zone_arena_tail_chunk_bytes(1 * GiB, 4 * GiB, 1000 * MiB, 128 * MiB) == 1 * GiB,
+              "the tail chunk is above the arena");
+        CHECK(zone_arena_tail_chunk_bytes(SIZE_MAX, SIZE_MAX, SIZE_MAX, 128 * MiB) == SIZE_MAX,
+              "the tail chunk wrapped");
+        CHECK(zone_arena_chunk_holds_tail(100 * MiB, 84 * MiB), "a chunk of exactly the tail and the minimum refused");
+        CHECK(!zone_arena_chunk_holds_tail(100 * MiB, 84 * MiB + 1), "a chunk one byte short held the tail");
+        CHECK(!zone_arena_chunk_holds_tail(SIZE_MAX, SIZE_MAX - M + 1), "a tail at the top of size_t wrapped");
+        CHECK(zone_arena_weight_chunks_fit(100 * MiB, 84 * MiB), "weight chunks of exactly the minimum refused");
+        CHECK(!zone_arena_weight_chunks_fit(100 * MiB, 84 * MiB + 1), "weight chunks one byte short fit");
+        CHECK(!zone_arena_weight_chunks_fit(100 * MiB, 101 * MiB), "a tail chunk above the arena fit");
+
+        zone_arena_reserve_shape shape = zone_arena_reserve_shape_of(20 * GiB + 3 * MiB, 16 * GiB, 0, 0);
+        CHECK(shape.alloc_bytes == 16 * GiB && shape.per_chunk_cap == 0 && shape.single_chunk &&
+                  shape.tail_kv_reserve == 128 * MiB,
+              "the shape did not hold the arena to the device's VRAM");
+        shape = zone_arena_reserve_shape_of(14 * GiB + 3 * MiB, 0, 16 * GiB, 15 * GiB);
+        CHECK(shape.alloc_bytes == 14 * GiB + 2 * MiB && shape.per_chunk_cap == 15 * GiB && shape.single_chunk,
+              "an unknown device size clamped the arena, or it did not round");
+        shape = zone_arena_reserve_shape_of(30 * GiB, 32 * GiB, 30 * GiB, 29 * GiB);
+        CHECK(!shape.single_chunk && shape.per_chunk_cap == 29 * GiB && shape.tail_kv_reserve == 240 * MiB,
+              "an arena above the safe cap tried one chunk");
+
+        // Every check a tail of `base` passes still passes at `base` + `room`, and one grain more fails one of them.
+        const auto room_is_tight = [&](const zone_arena_reserve_shape & s, size_t base, size_t room) {
+            const bool single  = zone_arena_single_chunk_accepts(s, base);
+            const bool n_chunk = zone_arena_n_chunk_accepts(s, base);
+            const auto passes  = [&](size_t tail) {
+                return (!single || zone_arena_single_chunk_accepts(s, tail)) &&
+                       (!n_chunk || zone_arena_n_chunk_accepts(s, tail));
+            };
+            return room % grain == 0 && passes(base + room) && !passes(base + room + grain);
+        };
+        const size_t required     = 512 * MiB;
+        const size_t bound        = 1 * GiB;
+        const auto   reserve_tail = [&](size_t other_tail, size_t scratch) {
+            return other_tail + zone_arena_zone_bytes(scratch);
+        };
+
+        // Case (i), one chunk: a 4 GiB arena on a device with no per-allocation cap (P = 0, max_alloc = 0) whose
+        // ONEDNN and RUNTIME zones take 3 GiB. The zone it must hold passes; the 1 GiB bound under the 1 GiB quarter
+        // would leave no 16 MiB beside the tail. The room is 4096 - 16 - 3584 = 496 MiB.
+        shape        = zone_arena_reserve_shape_of(4 * GiB, 0, 0, 0);
+        size_t other = 3 * GiB;
+        CHECK(shape.single_chunk && shape.per_chunk_cap == 0, "case (i) is not a single chunk with no cap");
+        CHECK(!zone_arena_n_chunk_accepts(shape, 0), "a device with no cap accepted an N-chunk arena");
+        CHECK(zone_arena_single_chunk_accepts(shape, reserve_tail(other, required)), "case (i): required refused");
+        CHECK(!zone_arena_single_chunk_accepts(shape, reserve_tail(other, bound)), "case (i): the bound passed alone");
+        size_t room = zone_arena_scratch_room(shape, other, required);
+        CHECK(room == 496 * MiB && room_is_tight(shape, reserve_tail(other, required), room),
+              "case (i): the room is not 496 MiB");
+        zone_scratch_plan plan = zone_scratch_zone_plan(required, 0, bound, 1 * GiB, room);
+        CHECK(plan.wanted == 1008 * MiB && plan.clamp == zone_scratch_clamp::ROOM, "case (i): the room did not hold");
+        CHECK(zone_arena_single_chunk_accepts(shape, reserve_tail(other, plan.wanted)), "case (i): the zone refused");
+
+        // Case (ii), the N-chunk tail: a 12 GiB arena whose per-chunk cap is 1459 MiB (a 1.5 GiB device cap at 95%),
+        // ONEDNN 256 MiB and RUNTIME 512 MiB. The quarter (3 GiB) is no limit next to the tail chunk: the most tail
+        // the cap holds is 1443 MiB, so the room is 1443 - 1280 = 163 MiB.
+        shape = zone_arena_reserve_shape_of(12 * GiB, 0, 1536 * MiB, 1459 * MiB);
+        other = 768 * MiB;
+        CHECK(!shape.single_chunk && shape.tail_kv_reserve == 128 * MiB, "case (ii) is not an N-chunk arena");
+        CHECK(zone_arena_n_chunk_accepts(shape, reserve_tail(other, required)), "case (ii): required refused");
+        CHECK(!zone_arena_n_chunk_accepts(shape, reserve_tail(other, bound)), "case (ii): the bound passed alone");
+        room = zone_arena_scratch_room(shape, other, required);
+        CHECK(room == 163 * MiB && room_is_tight(shape, reserve_tail(other, required), room),
+              "case (ii): the room is not 163 MiB");
+        plan = zone_scratch_zone_plan(required, 0, bound, 3 * GiB, room);
+        CHECK(plan.wanted == 675 * MiB && plan.clamp == zone_scratch_clamp::ROOM, "case (ii): the room did not hold");
+        CHECK(zone_arena_n_chunk_accepts(shape, reserve_tail(other, plan.wanted)), "case (ii): the zone refused");
+        // An arena above the cap never tries one chunk, so a 700 MiB zone, which the tail chunk refuses (1468 + 16 >
+        // 1459), has no room although the whole arena would hold it.
+        CHECK(!zone_arena_single_chunk_accepts(shape, reserve_tail(other, required)),
+              "case (ii): an arena above the cap accepted one chunk");
+        CHECK(zone_arena_scratch_room(shape, other, 700 * MiB) == 0, "case (ii): a zone the reserve refuses had room");
+
+        // Case (iii), the weight remainder: a 4096 MiB arena 6 MiB above a 4090 MiB per-chunk cap, with 3000 MiB of
+        // ONEDNN and RUNTIME. Past a tail of 3952 MiB the tail chunk and its 128 MiB KV share leave the weight chunks
+        // under 16 MiB, so the room is 3952 - 3512 = 440 MiB.
+        shape = zone_arena_reserve_shape_of(4096 * MiB, 0, 4090 * MiB, 0);
+        other = 3000 * MiB;
+        CHECK(!shape.single_chunk && shape.per_chunk_cap == 4090 * MiB, "case (iii) is not an N-chunk arena");
+        CHECK(zone_arena_n_chunk_accepts(shape, reserve_tail(other, required)), "case (iii): required refused");
+        CHECK(!zone_arena_n_chunk_accepts(shape, reserve_tail(other, bound)), "case (iii): the bound passed alone");
+        CHECK(zone_arena_chunk_holds_tail(shape.per_chunk_cap, reserve_tail(other, bound)),
+              "case (iii): the bound failed on the per-chunk cap, not on the weight chunks");
+        room = zone_arena_scratch_room(shape, other, required);
+        CHECK(room == 440 * MiB && room_is_tight(shape, reserve_tail(other, required), room),
+              "case (iii): the room is not 440 MiB");
+        plan = zone_scratch_zone_plan(required, 0, bound, 1 * GiB, room);
+        CHECK(plan.wanted == 952 * MiB && plan.clamp == zone_scratch_clamp::ROOM, "case (iii): the room did not hold");
+        CHECK(zone_arena_n_chunk_accepts(shape, reserve_tail(other, plan.wanted)), "case (iii): the zone refused");
+
+        // A single-chunk arena's N-chunk fallback, reached when its one allocation fails, keeps its own checks: a
+        // 16 GiB arena with 1 GiB of other zones passes both, and the room holds both (the fallback's KV share is the
+        // tighter: 16384 - 16 - 128 - 1536 = 14704 MiB).
+        shape = zone_arena_reserve_shape_of(16 * GiB, 0, 16 * GiB, 0);
+        other = 1 * GiB;
+        CHECK(shape.single_chunk && zone_arena_n_chunk_accepts(shape, reserve_tail(other, required)),
+              "the single chunk's fallback refused the zone it must hold");
+        room = zone_arena_scratch_room(shape, other, required);
+        CHECK(room == 14704 * MiB && room_is_tight(shape, reserve_tail(other, required), room),
+              "the room did not keep the single chunk's fallback");
+
+        // The boundaries: a zone that leaves exactly 16 MiB beside the tail has no room; one grain less of the other
+        // zones gives one grain of room; one grain more refuses the zone it must hold, and nothing is added to it.
+        shape = zone_arena_reserve_shape_of(4096 * MiB, 0, 0, 0);
+        CHECK(zone_arena_scratch_room(shape, 3568 * MiB, required) == 0, "a full single chunk had room");
+        CHECK(zone_arena_scratch_room(shape, 3568 * MiB - grain, required) == grain, "one grain of room was not one");
+        CHECK(zone_arena_scratch_room(shape, 3568 * MiB + grain, required) == 0, "a refused zone had room");
+        // A room of 0 does not say which of those two it is; whether the reserve accepts the zone at all does.
+        CHECK(zone_arena_scratch_accepts(shape, 3568 * MiB, required), "a full single chunk refused the zone");
+        CHECK(!zone_arena_scratch_accepts(shape, 3568 * MiB + grain, required), "a refused zone was accepted");
+        CHECK(!zone_arena_scratch_accepts(shape, SIZE_MAX - 100, required), "a wrapped tail was accepted");
+        CHECK(!zone_arena_scratch_accepts(shape, 0, SIZE_MAX - 100), "a zone whose rounding wraps was accepted");
+        plan = zone_scratch_zone_plan(required, 0, bound, SIZE_MAX, 0);
+        CHECK(plan.wanted == required && plan.clamp == zone_scratch_clamp::ROOM, "no room still raised the zone");
+        // The room is on the zone as the reserve rounds it: 156 bytes beside a zone the reserve rounds up by 200 are
+        // no room, where the unrounded zone would leave 356 bytes (one grain).
+        CHECK(zone_arena_scratch_room(shape, 3568 * MiB - 156, required - 200) == 0,
+              "the room did not count the zone as the reserve rounds it");
+        CHECK(zone_arena_scratch_room(shape, 3568 * MiB - grain - 156, required - 200) == grain,
+              "the room did not count the zone as the reserve rounds it");
+        CHECK(zone_arena_scratch_room(shape, SIZE_MAX - 100, required) == 0, "a wrapped tail had room");
+
+        // The grid: on every shape and zone mix, the zone the rule sizes passes every check the zone it must hold
+        // passed, whatever the bound and the quarter, and with no other limit binding it is the room's whole.
+        const size_t budgets[]    = { 1 * GiB, 4 * GiB, 4096 * MiB + 3 * MiB, 12 * GiB, 16 * GiB, 30 * GiB };
+        const size_t max_allocs[] = { 0, 1536 * MiB, 4090 * MiB, 8 * GiB, 32 * GiB };
+        const size_t others[]     = { 0, 256 * MiB, 768 * MiB, 3 * GiB, 3568 * MiB, 11 * GiB };
+        const size_t requireds[]  = { 16 * MiB, 512 * MiB + 1, 2 * GiB };
+        const size_t bounds[]     = { 0, 100 * MiB, 1 * GiB, 6 * GiB, SIZE_MAX };
+        for (size_t budget : budgets) {
+            for (size_t max_alloc : max_allocs) {
+                const size_t safe = max_alloc / 20 * 19;
+                shape             = zone_arena_reserve_shape_of(budget, 0, max_alloc, safe);
+                for (size_t other_tail : others) {
+                    for (size_t req : requireds) {
+                        const size_t base    = reserve_tail(other_tail, req);
+                        const bool   single  = zone_arena_single_chunk_accepts(shape, base);
+                        const bool   n_chunk = zone_arena_n_chunk_accepts(shape, base);
+                        room                 = zone_arena_scratch_room(shape, other_tail, req);
+                        CHECK((single || n_chunk) ? room_is_tight(shape, base, room) : room == 0,
+                              "the room is not the largest every passed check keeps");
+                        CHECK(zone_arena_scratch_accepts(shape, other_tail, req) == (single || n_chunk),
+                              "the reserve's acceptance of the zone is not its single-chunk or N-chunk check's");
+                        for (size_t b : bounds) {
+                            for (size_t quarter : { budget / 4, SIZE_MAX }) {
+                                plan              = zone_scratch_zone_plan(req, 0, b, quarter, room);
+                                const size_t tail = reserve_tail(other_tail, plan.wanted);
+                                CHECK(plan.wanted >= req && plan.wanted <= std::max(req, b),
+                                      "the zone left the span between what it must hold and the bound");
+                                CHECK(!single || zone_arena_single_chunk_accepts(shape, tail),
+                                      "the zone broke a single chunk the zone it must hold fit");
+                                CHECK(!n_chunk || zone_arena_n_chunk_accepts(shape, tail),
+                                      "the zone broke an N-chunk arena the zone it must hold fit");
+                                if (quarter == SIZE_MAX && b == SIZE_MAX) {
+                                    CHECK(zone_arena_zone_bytes(plan.wanted) == zone_arena_zone_bytes(req) + room,
+                                          "an unlimited bound did not take the whole room");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Case 49: the two limits on the MoE batched MMVQ bound -----------------------------------------------------
+    // wanted = max(required, min(bound, budget quarter, required + room)). Which limit held the zone below the bound is
+    // named, the room on a tie. A limit below what the zone must hold leaves it at that, clamped.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_moe_mmvq_operand;
+        using ggml_sycl::zone_moe_mmvq_scratch;
+        using ggml_sycl::zone_moe_mmvq_scratch_bytes;
+        using ggml_sycl::zone_scratch_clamp;
+        using ggml_sycl::zone_scratch_kept_bytes;
+        using ggml_sycl::zone_scratch_plan;
+        using ggml_sycl::zone_scratch_required_bytes;
+        using ggml_sycl::zone_scratch_warn_due;
+        using ggml_sycl::zone_scratch_zone_plan;
+
+        const size_t base = 512 * MiB;
+        CHECK(zone_scratch_required_bytes(base, 640 * MiB) == 640 * MiB &&
+                  zone_scratch_required_bytes(base, 100 * MiB) == base,
+              "what the zone must hold is not the larger of the default and the non-FA estimate");
+
+        // The bound below, at and above the quarter, with room to spare.
+        zone_scratch_plan plan = zone_scratch_zone_plan(base, 0, 700 * MiB, 800 * MiB, 4096 * MiB);
+        CHECK(plan.wanted == 700 * MiB && plan.clamp == zone_scratch_clamp::NONE, "a bound below the quarter moved");
+        plan = zone_scratch_zone_plan(base, 0, 800 * MiB, 800 * MiB, 4096 * MiB);
+        CHECK(plan.wanted == 800 * MiB && plan.clamp == zone_scratch_clamp::NONE, "a bound at the quarter clamped");
+        plan = zone_scratch_zone_plan(base, 0, 900 * MiB, 800 * MiB, 4096 * MiB);
+        CHECK(plan.wanted == 800 * MiB && plan.clamp == zone_scratch_clamp::BUDGET, "the quarter did not hold");
+        // The room is on top of what the zone must hold, not a size of its own.
+        plan = zone_scratch_zone_plan(base, 0, 900 * MiB, SIZE_MAX, 100 * MiB);
+        CHECK(plan.wanted == 612 * MiB && plan.clamp == zone_scratch_clamp::ROOM, "the room is not on top of required");
+        plan = zone_scratch_zone_plan(base, 0, 900 * MiB, 612 * MiB, 100 * MiB);
+        CHECK(plan.wanted == 612 * MiB && plan.clamp == zone_scratch_clamp::ROOM, "a tie did not name the room");
+        plan = zone_scratch_zone_plan(base, 0, 900 * MiB, 611 * MiB, 100 * MiB);
+        CHECK(plan.wanted == 611 * MiB && plan.clamp == zone_scratch_clamp::BUDGET, "the lower quarter did not hold");
+        // A quarter below what the zone must hold: the zone holds that, and the bound is clamped.
+        plan = zone_scratch_zone_plan(base, 640 * MiB, 900 * MiB, 300 * MiB, 4096 * MiB);
+        CHECK(plan.required == 640 * MiB && plan.wanted == 640 * MiB && plan.clamp == zone_scratch_clamp::BUDGET,
+              "a quarter below what the zone must hold shrank it");
+        // A bound not above what the zone must hold is no clamp, whatever the limits.
+        plan = zone_scratch_zone_plan(base, 0, 400 * MiB, 100 * MiB, 0);
+        CHECK(plan.wanted == base && plan.clamp == zone_scratch_clamp::NONE, "a bound below the default clamped");
+        // SIZE_MAX is no limit, and the room's sum with what the zone must hold saturates.
+        plan = zone_scratch_zone_plan(base, 0, SIZE_MAX - 1, SIZE_MAX, SIZE_MAX);
+        CHECK(plan.wanted == SIZE_MAX - 1 && plan.clamp == zone_scratch_clamp::NONE, "no limit was a limit");
+
+        // The vehicle at every micro-batch to 4096 rows with the quarter at 600 MiB: the zone follows the bound,
+        // never shrinks, and is flat at the quarter once the bound passes it (the bound is exactly 600 MiB at 1689
+        // rows and above it at 1690).
+        const zone_moe_mmvq_operand        gate{ 2048, false };
+        const zone_moe_mmvq_operand        down{ 512, true };
+        std::vector<zone_moe_mmvq_operand> vehicle;
+        for (int layer = 0; layer < 40; ++layer) {
+            vehicle.insert(vehicle.end(), { gate, gate, down });
+        }
+        zone_moe_mmvq_scratch scratch;
+        size_t                previous = 0;
+        for (int64_t rows = 1; rows <= 4096; ++rows) {
+            CHECK(zone_moe_mmvq_scratch_bytes(vehicle, rows, 8, &scratch), "the vehicle did not size");
+            plan = zone_scratch_zone_plan(base, 0, scratch.graph, 600 * MiB, 4096 * MiB);
+            CHECK(plan.wanted >= previous, "the clamped zone shrank as the micro-batch grew");
+            CHECK(plan.wanted == std::max(base, std::min(scratch.graph, 600 * MiB)),
+                  "the clamped zone is not the rule's");
+            CHECK((plan.clamp == zone_scratch_clamp::BUDGET) == (scratch.graph > 600 * MiB),
+                  "the quarter was named where it did not hold, or not where it did");
+            previous = plan.wanted;
+        }
+        CHECK(previous == 600 * MiB, "the zone is not flat at the quarter at 4096 rows");
+        CHECK(
+            zone_moe_mmvq_scratch_bytes(vehicle, 1689, 8, &scratch) && scratch.graph == 600 * MiB &&
+                zone_scratch_zone_plan(base, 0, scratch.graph, 600 * MiB, 4096 * MiB).clamp == zone_scratch_clamp::NONE,
+            "a bound of exactly the quarter at 1689 rows was clamped, or the rows' ids were not placed in grains");
+
+        // The keep rule and the WARN latch on a clamped zone: a zone between what it must hold and the clamped figure
+        // is kept, and the clamp WARN latches on the bound it held back.
+        plan = zone_scratch_zone_plan(base, 0, 900 * MiB, 675 * MiB, 4096 * MiB);
+        CHECK(zone_scratch_kept_bytes(plan, 600 * MiB) == 600 * MiB, "a zone short of the clamped figure was not kept");
+        CHECK(zone_scratch_kept_bytes(plan, 700 * MiB) == 675 * MiB, "a zone above the clamped figure was kept short");
+        CHECK(zone_scratch_warn_due(0, 900 * MiB), "the first clamp did not warn");
+        CHECK(!zone_scratch_warn_due(900 * MiB, 900 * MiB), "a clamp of the same bound warned again");
+        CHECK(zone_scratch_warn_due(900 * MiB, 1200 * MiB), "a clamp of a larger bound did not warn");
+    }
+
+    // ---- Case 50: the WARN a clamp of the MoE batched MMVQ bound logs -----------------------------------------------
+    // The line states the zone the plan asks for ("plans": an arena kept as it was built may hold more), the bound, the
+    // limit that held it with its figures, what the zone must hold, the miss path as the dispatch takes it, and the one
+    // remedy a user has. A room of 0 because the reserve refuses even the zone the plan must hold names no zone the
+    // reserve accepts, so that line says the reserve refuses the zone instead.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::k_zone_scratch_miss_path_text;
+        using ggml_sycl::zone_scratch_clamp;
+        using ggml_sycl::zone_scratch_clamp_text;
+        using ggml_sycl::zone_scratch_plan;
+        using ggml_sycl::zone_scratch_zone_plan;
+
+        // The miss path names the consequence for an op whose type has a fallback and for one whose type has none.
+        const std::string miss = k_zone_scratch_miss_path_text;
+        CHECK(miss ==
+                  "Expert ops whose scratch the zone cannot place take the miss path: device memory outside the arena "
+                  "while the card has room for it, else the dispatch refuses the buffer by name (q8-scratch-alloc) and "
+                  "the op takes its fallback where its type has one, while a Q1_0 or NVFP4 op, which has no other "
+                  "executor on the card, ends with that named refusal and a failed compute",
+              "the miss path does not name what an op with no fallback does");
+        const std::string head   = "[VRAM-ARENA] device 1 plans its SCRATCH zone at ";
+        const std::string remedy = ". " + miss + ". The bound follows the micro-batch, so a smaller -ub lowers it";
+
+        // The quarter held it, beside a room that would have taken 812 MiB.
+        zone_scratch_plan plan = zone_scratch_zone_plan(512 * MiB, 0, 900 * MiB, 600 * MiB, 300 * MiB);
+        CHECK(plan.clamp == zone_scratch_clamp::BUDGET, "the quarter case is not the quarter's clamp");
+        CHECK(zone_scratch_clamp_text(1, plan, 900 * MiB, 600 * MiB, 300 * MiB, true) ==
+                  head +
+                      "600.0 MB, short of the 900.0 MB MoE batched MMVQ scratch bound: a quarter of the available "
+                      "budget holds it (600.0 MB; a quarter of the available budget is 600.0 MB, the arena's reserve "
+                      "accepts a 812.0 MB zone, and the zone must hold 512.0 MB without the bound)" +
+                      remedy,
+              "the quarter's line is not the plan's");
+
+        // The room held it.
+        plan = zone_scratch_zone_plan(512 * MiB, 0, 900 * MiB, 1000 * MiB, 100 * MiB);
+        CHECK(plan.clamp == zone_scratch_clamp::ROOM, "the room case is not the room's clamp");
+        CHECK(zone_scratch_clamp_text(1, plan, 900 * MiB, 1000 * MiB, 100 * MiB, true) ==
+                  head +
+                      "612.0 MB, short of the 900.0 MB MoE batched MMVQ scratch bound: the room the arena's reserve "
+                      "accepts holds it (612.0 MB; a quarter of the available budget is 1000.0 MB, the arena's reserve "
+                      "accepts a 612.0 MB zone, and the zone must hold 512.0 MB without the bound)" +
+                      remedy,
+              "the room's line is not the plan's");
+
+        // No room above what the zone must hold, which the reserve accepts: the line names that zone.
+        plan = zone_scratch_zone_plan(512 * MiB, 0, 900 * MiB, 1000 * MiB, 0);
+        CHECK(zone_scratch_clamp_text(1, plan, 900 * MiB, 1000 * MiB, 0, true) ==
+                  head +
+                      "512.0 MB, short of the 900.0 MB MoE batched MMVQ scratch bound: the room the arena's reserve "
+                      "accepts holds it (512.0 MB; a quarter of the available budget is 1000.0 MB, the arena's reserve "
+                      "accepts a 512.0 MB zone, and the zone must hold 512.0 MB without the bound)" +
+                      remedy,
+              "a zone the reserve accepts with no room was not named as accepted");
+
+        // The reserve refuses even the zone the plan must hold: whichever limit held the bound, the line says the
+        // reserve refuses that zone and names no zone it accepts.
+        const std::string refused_head =
+            head +
+            "512.0 MB, short of the 900.0 MB MoE batched MMVQ scratch bound: the arena's reserve refuses even the "
+            "512.0 MB zone the plan must hold, so the bound adds nothing to it (a quarter of the available budget is ";
+        CHECK(zone_scratch_clamp_text(1, plan, 900 * MiB, 1000 * MiB, 0, false) == refused_head + "1000.0 MB)" + remedy,
+              "a room of 0 from a refused zone named a zone the reserve accepts");
+        plan = zone_scratch_zone_plan(512 * MiB, 0, 900 * MiB, 300 * MiB, 0);
+        CHECK(plan.clamp == zone_scratch_clamp::BUDGET && plan.wanted == 512 * MiB,
+              "a quarter below what the zone must hold is not the quarter's clamp");
+        CHECK(zone_scratch_clamp_text(1, plan, 900 * MiB, 300 * MiB, 0, false) == refused_head + "300.0 MB)" + remedy,
+              "the quarter's clamp of a refused zone named a zone the reserve accepts");
+
+        // No clamp, no line.
+        plan = zone_scratch_zone_plan(512 * MiB, 0, 400 * MiB, 1000 * MiB, 100 * MiB);
+        CHECK(plan.clamp == zone_scratch_clamp::NONE &&
+                  zone_scratch_clamp_text(1, plan, 400 * MiB, 1000 * MiB, 100 * MiB, true).empty(),
+              "a plan with no clamp had a clamp line");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");

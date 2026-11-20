@@ -338,14 +338,33 @@ static bool test_routed_prestage_exact_layout_receipt(sycl::queue & q) {
     auto overflow = ggml_sycl::prestage_routed_experts(&q, ids, INT32_MAX, 2, data.data(), data.size(), data.size(), 7,
                                                         1, 0, &base);
     TEST_ASSERT(!overflow.success && overflow.n_unique == 0, "routing cardinality overflow was multiplied first");
+
+    // An entry nobody pinned (staging one expert on the device leaves it unpinned): prestage pins it, lists it under
+    // the exact writer key, and the release unpins it.
+    TEST_ASSERT(!cache->is_pinned(soa_key, GGML_LAYOUT_SOA), "device staging of one expert left it pinned");
     auto receipt = ggml_sycl::prestage_routed_experts(&q, ids, 1, 1, data.data(), data.size(), data.size(), 7, 1, 0,
                                                        &base);
     TEST_ASSERT(receipt.success && receipt.n_gpu == 1 && receipt.pins.size() == 1,
-                "layout-specific routed prestage did not pin exact writer key");
+                "layout-specific routed prestage did not list the pin it set");
     TEST_ASSERT(receipt.pins[0].layout == GGML_LAYOUT_SOA &&
                     ggml_sycl::detail::cache_id_equal(receipt.pins[0].key, soa_key),
                 "prestage receipt reconstructed a base AOS key");
+    TEST_ASSERT(cache->is_pinned(soa_key, GGML_LAYOUT_SOA), "routed prestage did not pin the expert");
     ggml_sycl::unpin_routed_experts(0, receipt.pins);
+    TEST_ASSERT(!cache->is_pinned(soa_key, GGML_LAYOUT_SOA), "releasing the receipt left the prestage pin set");
+
+    // An entry another holder pinned (bulk expert staging creates its entries pinned, and the popularity pass pins
+    // device-resident experts). A pin is a flag, not a count, so the receipt may list only the pins this prestage
+    // set: releasing this entry would clear a pin the op does not own.
+    cache->pin(soa_key, GGML_LAYOUT_SOA);
+    TEST_ASSERT(cache->is_pinned(soa_key, GGML_LAYOUT_SOA), "the other holder's pin did not take");
+    auto already =
+        ggml_sycl::prestage_routed_experts(&q, ids, 1, 1, data.data(), data.size(), data.size(), 7, 1, 0, &base);
+    TEST_ASSERT(already.success && already.n_gpu == 1, "routed prestage did not resolve the pinned expert");
+    TEST_ASSERT(already.pins.empty(), "prestage listed a pin that another holder set");
+    ggml_sycl::unpin_routed_experts(0, already.pins);
+    TEST_ASSERT(cache->is_pinned(soa_key, GGML_LAYOUT_SOA), "releasing the receipt cleared another holder's pin");
+    cache->unpin(soa_key, GGML_LAYOUT_SOA);
     return true;
 }
 

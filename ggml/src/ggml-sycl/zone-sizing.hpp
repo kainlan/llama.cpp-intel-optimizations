@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -76,7 +77,7 @@ struct zone_tensor_desc {
     // TOKEN (llama.cpp-479i): zone_mmq_src1_bytes_per_token(ne[0], ne[2], ne[3]).
     // Supplied by the adapter, never derived here: whether a tensor is a dense
     // MUL_MAT operand is the caller's knowledge. Zero means "not one" -- an expert
-    // stack (MUL_MAT_ID, its own moe_q8 workspace), a non-quantized weight, or a
+    // stack (MUL_MAT_ID, zone_moe_mmvq_op_bytes), a non-quantized weight, or a
     // tensor with no shape. The classifier deliberately does NOT decide this from
     // ne[2] > 1: that is the expert predicate and it misclassifies dense 3-D
     // operands such as the MLA wk_b / wv_b (llama.cpp-8xbt).
@@ -234,6 +235,158 @@ bool zone_mmq_src1_bytes_per_token(int64_t ne0, int64_t ne2, int64_t ne3, size_t
 // The plan figure: n_ubatch tokens of `bytes_per_token`, plus the overflow pad,
 // aligned up to 256. Zero when bytes_per_token is zero (no dense quantized operand).
 bool zone_mmq_src1_scratch_bytes(size_t bytes_per_token, uint32_t n_ubatch, size_t * out);
+
+// ---------------------------------------------------------------------------
+// MoE batched MMVQ scratch
+// ---------------------------------------------------------------------------
+//
+// mmvq_moe_batched_dispatch quantizes a MUL_MAT_ID op's activations to Q8_1 into one buffer and, when it cannot read
+// the routing ids in place, uploads an ids table into another. An MXFP4 op whose expert rows the dispatch groups on the
+// device (the XMX-tiled and grouped-DPAS paths) also takes five int32 tables and a one-entry counter
+// (mmvq_moe_xmx_device_grouped_* and mmvq_moe_batched_device_grouped_*, and the host-grouped DPAS path's smaller
+// tables). All of these come from the device SCRATCH zone and are released at the op's completion event. The
+// host-grouped XMX-tiled path's tables are not counted: they are persistent, cached on the weight
+// (moe_grouped_scratch), and allocated outside the zone. These mirror the dispatch's arithmetic: K padded to QK8_1
+// only (not to MATRIX_ROW_PADDING, as the dense buffer above is), ne11 * ne12 Q8_1 rows, n_tokens * n_expert_used
+// int32 ids, and the grouped tables' worst case. The Q8_1 block is k_zone_mmq_src1_block_elems /
+// k_zone_mmq_src1_block_bytes and a group's row chunk is k_zone_mxfp4_moe_group_rows, which the backend static_asserts
+// against QK8_1, sizeof(block_q8_1) and GGML_SYCL_MXFP4_MOE_XMX_N.
+//
+// Each buffer is counted as the zone's allocator places it: its request rounded up to the block grain
+// (k_zone_arena_alignment, which unified-cache.cpp asserts is tlsf_allocator::block_grain; every request here asks an
+// alignment no larger, so tlsf_allocator::round_request rounds by the grain). A placed block costs nothing more: the
+// allocator keeps its metadata in host memory, so no header sits in the zone, and it splits a free block only where a
+// whole grain is left over, which in a zone of whole grains leaves every block exactly its rounded request. The bound
+// counts bytes, not where they land: a zone whose free bytes are split into pieces smaller than one buffer can still
+// miss that buffer. Pure: no state, no log.
+constexpr int64_t k_zone_mxfp4_moe_group_rows = 16;  // GGML_SYCL_MXFP4_MOE_XMX_N
+
+// An expert weight the batched dispatch admits, as the dispatch sees its activations. `k` is the weight's ne0, the
+// activation row length. `row_per_slot` is true when each token brings one activation row per routed slot (down, which
+// reads the slots' gate/up outputs), and false when one row serves every slot (gate, up and fused gate_up, whose
+// activations are broadcast). An architecture that weights the activations before the FFN (llama4) repeats them per
+// slot, so its gate and up bring n_expert_used rows a token, which a false `row_per_slot` undercounts.
+// `grouped_experts` is the stack's expert count (ne2) for an MXFP4 weight, whose grouped dispatch sizes its tables by
+// it, and 0 for every other type.
+struct zone_moe_mmvq_operand {
+    int64_t k               = 0;
+    bool    row_per_slot    = false;
+    int64_t grouped_experts = 0;
+};
+
+// Bytes one op holds at once for `n_tokens` tokens routed to `n_expert_used` experts each: its Q8_1 buffer (n_tokens
+// rows, times n_expert_used when row_per_slot, of K padded to QK8_1) plus its ids buffer, counted whether or not the
+// dispatch reads the ids in place, plus, for a grouped op, its six tables in their device-grouped size: E expert ids,
+// E + 1 offsets, n_tokens * n_expert_used rows, two tables of E * ceil(rows / k_zone_mxfp4_moe_group_rows) chunks and
+// the counter, every entry an int32 (the host-grouped tables are no larger). Every buffer is rounded up to the block
+// grain on its own, as the allocator places it. False with *out = 0 on a non-positive input (a negative
+// `grouped_experts` included), false with *out = SIZE_MAX on overflow, a buffer within one grain of SIZE_MAX included
+// (the allocator refuses that size too).
+bool zone_moe_mmvq_op_bytes(const zone_moe_mmvq_operand & op, int64_t n_tokens, int64_t n_expert_used, size_t * out);
+
+// The two bounds over a model's admitted expert ops: the most any one op holds, and the sum over every op, which is
+// what the zone holds if every op's buffers are live at once.
+struct zone_moe_mmvq_scratch {
+    size_t per_op = 0;
+    size_t graph  = 0;
+};
+
+// Both bounds over `ops`, one op per admitted expert tensor. Zero for no ops. False with both bounds 0 on a
+// non-positive input. Saturating: an op whose figure overflows sets both bounds to SIZE_MAX, a sum that overflows sets
+// the graph bound to SIZE_MAX, and either answers false.
+bool zone_moe_mmvq_scratch_bytes(const std::vector<zone_moe_mmvq_operand> & ops,
+                                 int64_t                                    n_tokens,
+                                 int64_t                                    n_expert_used,
+                                 zone_moe_mmvq_scratch *                    out);
+
+// The SCRATCH zone's size. `required` is what the zone must hold (zone_scratch_required_bytes): the arena's default
+// (`default_bytes`) or the non-FA attention scratch estimate (`nonfa_bytes`), whichever is larger, which has no other
+// place to go. `wanted` is what the zone is sized to: `required`, or the MoE batched MMVQ bound (`moe_mmvq_bytes`)
+// under two limits, whichever is larger. The bound is zone_moe_mmvq_scratch::graph at the context's micro-batch, every
+// expert op's buffers at once: an op's buffers are released by a thread that waits on the op's completion event, and
+// nothing on the prompt path makes a later op's allocation wait for that release, so no depth smaller than the op
+// count holds by construction. A request of those ops the zone cannot place is a miss. When the card has room outside
+// the arena it is served from raw device memory. When it has none, the allocation fails and the dispatch refuses by
+// name (q8-scratch-alloc, ids-scratch-alloc, device-group-alloc). What the op does then depends on its expert type
+// (k_zone_scratch_miss_path_text is the WARNs' short form):
+//   - Q1_0 and NVFP4 have one executor on the card, this dispatch in AOS (moe-mmvq-tables.hpp admits them in no
+//     other layout, and ggml-sycl.cpp gives the direct recipe only to the private route-testing build). The planner
+//     route ends the op with a named refusal (ggml_sycl_moe_q1_nvfp4_refusal_text, thrown as ggml_sycl_fallback_error)
+//     and the graph compute returns GGML_STATUS_FAILED; test-moe-q1-nvfp4-dispatch-refusal holds it to that.
+//   - Every other type the dispatch admits (moe-mmvq-tables.hpp) takes another route: the planner route's per-entry
+//     dispatch, or the route the batched one was tried ahead of (decode-direct, hybrid decode, MXFP4 grouped down,
+//     planned PP).
+// The zone is planned for the whole bound where it can be, under two limits, for every type alike:
+//   - `budget_cap_bytes`, the quarter of the available budget the non-FA raise is clamped to, keeps the bound from
+//     starving the WEIGHT zone;
+//   - `room_bytes` (zone_arena_scratch_room) is the most the arena's reserve accepts on top of `required` with the
+//     other zones as planned, so a bound the reserve cannot hold leaves the reserve as it would be without it.
+// So the bound never makes a load fail where the zone without it would not, a type with no fallback included. The
+// bound is a worst case, every expert op's buffers live at once, and far from what a run holds: on the
+// Qwen3.6-35B-A3B NVFP4 vehicle at 2048 rows the zone's use line measured a high-water of 9.06 MB (one op's two
+// buffers live) in a 727.5 MB zone. A load refused for a bound the arena cannot hold would refuse a model that runs.
+// A clamped zone still holds the quarter or the room, and only a true miss beyond it on a card with no room outside
+// the arena costs anything: the dispatch refuses the buffer late and by name, a refusal that never aborts and that
+// for a type with no fallback is a failed compute. The route an op of another type falls to then makes its own
+// allocations.
+// SIZE_MAX for either limit is no limit, for a caller with no budget or no reserve to answer to. `clamp` names the
+// limit that held the zone below the bound. A zone that live allocations keep below the bound misses the same way, so
+// it is kept rather than refused. Pure.
+enum class zone_scratch_clamp {
+    NONE,    // the zone holds the bound, or the bound is not above `required`
+    BUDGET,  // the budget quarter held the zone below the bound
+    ROOM,    // the reserve's room held the zone below the bound, alone or tied with the quarter
+};
+
+struct zone_scratch_plan {
+    size_t             required = 0;
+    size_t             wanted   = 0;
+    zone_scratch_clamp clamp    = zone_scratch_clamp::NONE;
+};
+
+// What the SCRATCH zone must hold: the larger of the arena's default and the non-FA attention estimate. Pure.
+size_t zone_scratch_required_bytes(size_t default_bytes, size_t nonfa_bytes);
+
+zone_scratch_plan zone_scratch_zone_plan(size_t default_bytes,
+                                         size_t nonfa_bytes,
+                                         size_t moe_mmvq_bytes,
+                                         size_t budget_cap_bytes,
+                                         size_t room_bytes);
+
+// The SCRATCH bytes a rebuild that something live blocks asks of a zone of `capacity_bytes`: `plan.wanted` when the
+// zone holds it (nothing to keep) or when it holds less than `plan.required` (it is short of what it must hold), and
+// the capacity itself between the two, where only the MoE batched MMVQ bound is short and the zone is kept as it is.
+// Pure.
+size_t zone_scratch_kept_bytes(const zone_scratch_plan & plan, size_t capacity_bytes);
+
+// Whether a SCRATCH zone WARN that latches on a figure logs: once per figure. A call whose figure is larger than the
+// one the device's last WARN of its kind named (`latched_bytes`, 0 for none) warns again; the same figure, or a
+// smaller one, does not. The kept zone's WARN latches on the zone it wants, the clamp's on the bound it held back.
+// Pure.
+bool zone_scratch_warn_due(size_t latched_bytes, size_t bytes);
+
+// What the SCRATCH zone's WARNs say becomes of an expert op whose scratch the zone cannot place; zone_scratch_zone_plan
+// gives the type split with its lines in the backend. One text, so the kept zone's WARN and the clamp's agree.
+constexpr const char * k_zone_scratch_miss_path_text =
+    "Expert ops whose scratch the zone cannot place take the miss path: device memory outside the arena while the card "
+    "has room for it, else the dispatch refuses the buffer by name (q8-scratch-alloc) and the op takes its fallback "
+    "where its type has one, while a Q1_0 or NVFP4 op, which has no other executor on the card, ends with that named "
+    "refusal and a failed compute";
+
+// The WARN a plan whose limit held the SCRATCH zone below the MoE batched MMVQ bound logs, without a newline: the zone
+// the plan asks for (plan.wanted: "plans", since an arena kept as it was built may hold more), the bound
+// (`bound_bytes`), the limit that held it (plan.clamp) with the budget quarter (`budget_cap_bytes`) and the largest
+// zone the reserve accepts (plan.required + `room_bytes`), what the zone must hold, the miss path, and the remedy: the
+// bound follows the micro-batch, so a smaller -ub lowers it. `reserve_accepts` is zone_arena_scratch_accepts at
+// plan.required. When it is false the reserve refuses even the zone the plan must hold and the room is 0, which names
+// no zone the reserve accepts, so the line says the reserve refuses that zone instead. Empty when plan.clamp is NONE.
+// Pure.
+std::string zone_scratch_clamp_text(int                       device,
+                                    const zone_scratch_plan & plan,
+                                    size_t                    bound_bytes,
+                                    size_t                    budget_cap_bytes,
+                                    size_t                    room_bytes,
+                                    bool                      reserve_accepts);
 
 // ---------------------------------------------------------------------------
 // dense f16 dequant scratch (llama.cpp-479i)
@@ -477,7 +630,7 @@ bool zone_runtime_alloc_held_back(bool   runtime_zone,
 
 // The arena's grain: it reserves every zone as a whole number of these bytes. It is the zone allocator's block grain
 // (tlsf_allocator::block_grain), which this dependency-free header cannot include, so unified-cache.cpp asserts the
-// two are equal.
+// two are equal. The MoE batched MMVQ bound rounds each buffer up to it, as the allocator places a request.
 constexpr size_t k_zone_arena_alignment = 256;
 
 // The RUNTIME zone the arena reserves for a plan into *out: the larger of `floor_bytes` and `requirement`, rounded up
@@ -501,6 +654,95 @@ inline bool zone_runtime_reserved_bytes(size_t floor_bytes, size_t requirement, 
 // load of a process does, is the zone its plan reserves and never qualifies; nor does any zone when the plan's
 // rounding overflows.
 bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, size_t requirement);
+
+// ---------------------------------------------------------------------------
+// The arena reserve's checks on its tail zones
+// ---------------------------------------------------------------------------
+//
+// unified_cache::arena_reserve carves the ONEDNN, RUNTIME and SCRATCH zones (the tail) from the end of one chunk: the
+// whole arena when it tries a single chunk, else the last of several. It refuses when the tail leaves too little
+// beside it. These are its sizes and the checks that depend on the tail; arena_reserve calls them itself, so the
+// SCRATCH zone's room (zone_arena_scratch_room) is built from the same tests the reserve makes. Pure.
+
+// The least shared (KV + WEIGHT) zone the reserve carves beside the tail, in a single chunk, in the tail chunk and in
+// the weight chunks together.
+constexpr size_t k_zone_arena_min_shared_bytes = 16ull * 1024ull * 1024ull;
+
+// The grain the arena's whole size is rounded down to, so that every zone carved from its end starts aligned.
+constexpr size_t k_zone_arena_size_alignment = 2ull * 1024ull * 1024ull;
+
+// A ONEDNN or SCRATCH zone of `bytes` as the reserve holds it: rounded up to k_zone_arena_alignment. It wraps as the
+// reserve's own arithmetic always has; a planned zone is far below SIZE_MAX.
+size_t zone_arena_zone_bytes(size_t bytes);
+
+// An arena of `bytes`, rounded down to k_zone_arena_size_alignment.
+size_t zone_arena_round_alloc_bytes(size_t bytes);
+
+// The largest chunk the reserve allocates: the device's largest allocation (`max_alloc_size`), or the safe cap below it
+// when one is known (non-zero), or the safe cap alone when the device names none. 0 when neither is known.
+size_t zone_arena_per_chunk_cap(size_t max_alloc_size, size_t safe_max_alloc_size);
+
+// Whether the reserve tries one chunk of the whole arena first: when the device names no per-allocation cap, or the
+// arena is within the per-chunk cap.
+bool zone_arena_single_chunk_tried(size_t alloc_bytes, size_t max_alloc_size, size_t per_chunk_cap);
+
+// The KV share an N-chunk arena's tail chunk keeps beside the tail: a 128th of the arena, at least the least shared
+// zone, held between 128 and 512 MiB.
+size_t zone_arena_tail_kv_reserve(size_t alloc_bytes);
+
+// The tail into *out: the sum of `zones`, the ONEDNN, RUNTIME and SCRATCH zones as the reserve rounds them, given one
+// by one or with some already summed. False, with *out untouched, when the sum wraps, a tail no chunk holds:
+// arena_reserve refuses that tail before any check reads it, and zone_arena_scratch_room and
+// zone_arena_scratch_accepts sum the tails they test the same way.
+bool zone_arena_tail_bytes(std::initializer_list<size_t> zones, size_t * out);
+
+// The N-chunk arena's tail chunk: the tail and its KV share, no larger than the per-chunk cap or the arena.
+// Saturating.
+size_t zone_arena_tail_chunk_bytes(size_t alloc_bytes, size_t per_chunk_cap, size_t tail_bytes, size_t tail_kv_reserve);
+
+// Whether a chunk of `chunk_bytes` holds a tail of `tail_bytes` and the least shared zone beside it. The reserve asks
+// it of the single chunk, of the per-chunk cap and of the tail chunk. Saturating.
+bool zone_arena_chunk_holds_tail(size_t chunk_bytes, size_t tail_bytes);
+
+// Whether the weight chunks an N-chunk arena of `alloc_bytes` leaves beside its tail chunk hold the least shared zone.
+bool zone_arena_weight_chunks_fit(size_t alloc_bytes, size_t tail_chunk_bytes);
+
+// What the reserve sizes its chunks from, none of it by the tail: the arena (the budget, no larger than the device's
+// VRAM when that is known, rounded), the per-chunk cap, whether one chunk is tried, and the tail chunk's KV share.
+struct zone_arena_reserve_shape {
+    size_t alloc_bytes     = 0;
+    size_t per_chunk_cap   = 0;
+    bool   single_chunk    = false;
+    size_t tail_kv_reserve = 0;
+};
+
+// The shape of a reserve called with these arguments, as arena_reserve derives it.
+zone_arena_reserve_shape zone_arena_reserve_shape_of(size_t budget_bytes,
+                                                     size_t device_total_vram,
+                                                     size_t max_alloc_size,
+                                                     size_t safe_max_alloc_size);
+
+// Whether the reserve's single-chunk check passes a tail of `tail_bytes`: false when the shape tries no single chunk.
+bool zone_arena_single_chunk_accepts(const zone_arena_reserve_shape & shape, size_t tail_bytes);
+
+// Whether the reserve's N-chunk checks pass a tail of `tail_bytes`: the tail chunk holds the tail beside the least
+// shared zone, and the weight chunks hold the least shared zone. The reserve also refuses first when the per-chunk cap
+// cannot hold the tail beside the least shared zone; the tail chunk is never above that cap, so this is the same
+// refusal and is not asked twice. The reserve reaches these checks when it tries no single chunk, when the
+// single-chunk check fails, and when the single chunk's allocation fails.
+bool zone_arena_n_chunk_accepts(const zone_arena_reserve_shape & shape, size_t tail_bytes);
+
+// The SCRATCH zone's room: the most bytes, a whole number of k_zone_arena_alignment, the reserve accepts on top of a
+// SCRATCH zone of `scratch_bytes` with the other tail zones at `other_tail_bytes` (the ONEDNN and RUNTIME zones as the
+// reserve rounds them): every check the reserve passes at `scratch_bytes`, single-chunk and N-chunk, still passes. Each
+// check fails only as the tail grows, so the room is the least of the checks' own. 0 when no check passes at
+// `scratch_bytes`: the reserve refuses that zone as it is, and nothing is added to it. 0 is also the room of a zone
+// the reserve accepts with nothing to spare; zone_arena_scratch_accepts tells the two apart.
+size_t zone_arena_scratch_room(const zone_arena_reserve_shape & shape, size_t other_tail_bytes, size_t scratch_bytes);
+
+// Whether the reserve accepts a SCRATCH zone of `scratch_bytes` beside the other tail zones at `other_tail_bytes`:
+// the zone's rounding and the tail's sum do not wrap, and the single-chunk or the N-chunk check passes. Pure.
+bool zone_arena_scratch_accepts(const zone_arena_reserve_shape & shape, size_t other_tail_bytes, size_t scratch_bytes);
 
 // The RUNTIME zone's planned terms, as unified_cache_get_planned_runtime_zone_requirement() reads them for the zone
 // ensure_planned_arena_zones() sizes. Each is the term as published now, so the requirement follows whatever was
@@ -659,10 +901,38 @@ bool zone_kept_onednn_warn_due(uint64_t latched_txn, uint64_t load_txn);
 
 // The line a model load refused for `refusal` logs, without a newline: the device, each zone's need and have in MB, the
 // shortfall of each zone that is short (a zone short by under 0.1 MB prints its three figures in KB, or in bytes under
-// 1 KB, so no shortfall prints as nothing), the reason, and what the caller can do. Empty for NONE. The zones are
-// planned at the load's fixed planning shape, not at the context's -c or -ub, so the line never offers a smaller
-// context or micro-batch as the remedy.
+// 1 KB, so no shortfall prints as nothing), the reason, and what the caller can do. Empty for NONE. The line never
+// offers a smaller context or micro-batch as the remedy, because no zone that can refuse a load follows them: the
+// zones are planned at the load's fixed planning shape, except the SCRATCH zone's MoE batched MMVQ bound, which follows
+// the context's micro-batch and is held to what the reserve accepts (zone_scratch_zone_plan), and a zone short of that
+// bound alone is kept rather than refused.
 std::string zone_arena_refusal_text(const zone_arena_refusal & refusal);
+
+// How a cache's SCRATCH zone was used over its life, for the line the cache logs at teardown. The zone is shared by
+// per-op scratch and is sized for the MoE batched MMVQ bound (zone_scratch_zone_plan), so this is what says how much
+// of it was in use at once against that size and how many allocations made that up. A miss is a placement the zone
+// refused: its caller either spilled it to raw device memory outside the arena (the MoE batched MMVQ scratch among
+// them) or refused it (reserve_persistent_scratch and unified_cache::arena_alloc do).
+// The cache updates it under the SCRATCH allocator group's mutex, which every allocation in the zone already holds.
+struct zone_scratch_use {
+    size_t requests              = 0;  // requests the zone placed
+    size_t largest_request_bytes = 0;  // the largest of them
+    size_t high_water_bytes      = 0;  // the zone's used bytes at their highest, allocator rounding included
+    size_t live_at_high_water    = 0;  // allocations live in the zone when that high-water was set
+    size_t misses                = 0;  // requests the zone could not place
+    size_t miss_bytes            = 0;  // their bytes, summed (saturating)
+    size_t largest_miss_bytes    = 0;  // the largest of them
+};
+
+// A request of `request_bytes` the zone placed, leaving `used_bytes` in use in `live` allocations. Pure.
+void zone_scratch_use_note_alloc(zone_scratch_use & use, size_t request_bytes, size_t used_bytes, size_t live);
+
+// A request of `request_bytes` the zone could not place. Pure.
+void zone_scratch_use_note_miss(zone_scratch_use & use, size_t request_bytes);
+
+// The teardown line, without a newline, for the zone of `capacity_bytes` on `device`. Empty when the zone placed
+// nothing and missed nothing. Pure.
+std::string zone_scratch_use_text(const zone_scratch_use & use, int device, size_t capacity_bytes);
 
 // The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the
 // hold can be) plus the largest spill-capable RUNTIME request, because a held-back request spills whole. The
