@@ -3591,11 +3591,19 @@ step again, inside its transaction and before its reserve, asking only the
 marked caches (`ggml_sycl_last_release_scope::DEFERRED_CACHES`). A cache that
 empties clears its mark and gets its published terms back, and the start
 reserve then reserves its early arena, so that load plans as the first load of
-a process does. A cache whose arena the buffers still hold answers the same WARN
-(site `load-start`) and keeps its mark, and that load runs on the arena as it
-is; the next load's start asks again. Only a release that empties the cache
-clears the mark, and a cache made fresh carries none, so a process's first load
-tears nothing down. A cache the step does not ask keeps its terms, and counts
+a process does. The start runs the step with a cause of its own
+(`unified_cache_release_cause::LOAD_START`), which never sets the mark. A cache
+whose arena something still holds keeps its mark and answers a WARN of its own
+(site `load-start`): that load runs on the arena as it is, and a holder still
+there once the failed model is freed is a leak. A start between the abort and
+that free still finds the failed model's buffers, so the line is a WARN, and
+the holders are named after it at WARN as well (`arena_report_holders()` logs
+its holders line at the level its caller passes, ERROR at a refused rebuild and
+at a model release). The next load's start asks again.
+`test-unified-runtime-alloc` scores the start's lines on a hand-built cache, and
+`test-sycl-plan-dry-run` arm (k) scores a load's begin through the backend, held
+and freed. Only a release that empties the cache clears the mark, and a cache
+made fresh carries none, so a process's first load tears nothing down. A cache the step does not ask keeps its terms, and counts
 as emptied for the two-card MoE flag only when it holds no arena; a start that
 asks no cache leaves the flag as it is. A teardown that refuses is an
 ERROR with its cause. Liveness is process-wide, so a model live on either card
