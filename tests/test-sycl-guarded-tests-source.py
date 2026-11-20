@@ -37,13 +37,19 @@ foreach() over literal items and lists, and every function() or macro() at its c
 bound; llama_build, llama_build_and_test, llama_test and llama_test_cmd are read by their own rules instead (link
 libraries and skip code from their bodies; only llama_build takes a caller's LLAMA_TEST_NAME), and so is the
 ggml_add_backend() definition of GGML_USE_<backend>. It ignores if() conditions: a definition or property in any branch
-counts. A variable it does not compute (list(GET), string(), math(), a foreach(RANGE) variable) stays a pattern, and
-the reader fails closed on it: a source pattern that could name a stub source, and a test command word that could name
-a stub target, fail. A target whose name is such a pattern is matched by the same token in a test command.
+counts. A variable it does not compute (list(GET), string(), math(), a foreach(RANGE) variable) stays a pattern. A
+source token left with a pattern fails when, read as a pattern, it could name a stub source and its own text spells the
+stub's stem (`${dir}/test-x.cpp`); a bare `${files}` could name any source and does not fail by itself. In a test
+command without SKIP_RETURN_CODE 77, a word left with a pattern fails when it could name a stub target; a tool variable
+(`${Python3_EXECUTABLE}`) and a bare variable after the first word are argument values and do not. A target whose name
+is such a pattern is matched by the same token in a test command.
 
-Every CMake command that names a stub source (its file name, a path ending in it, or its stem in set(), list(),
-foreach() or a replayed function call) must be one whose text the reader followed into a source list of a target, or
-into a test command that names a target compiling that source; any other mention fails.
+Every CMake command that names a stub source (its file name or a path ending in it, except a literal path that resolves
+to a different file of the same name; or its stem, as an argument or as an argument's last path component, in set(),
+list(), foreach(), string() or a replayed function call) must be one whose text the reader followed into a source list
+of a target, or into a test command that names a target compiling that source; any other mention fails. That is what
+catches a stub source compiled through a variable the reader does not compute, as long as some argument spells its file
+name or stem.
 
 What the gate does NOT model:
   - a chain whose first branch tests another macro: in `#if X ... #elif defined(GGML_USE_SYCL) ... #else <stub>` the
@@ -53,6 +59,9 @@ What the gate does NOT model:
   - a stub in a header that a test source includes: only `main` in the source itself is read;
   - a variable that the reader follows into a test command and that also reaches a source through an expression it
     does not compute (string(CONCAT), list(GET), ...): the mention counts as attributed, the second use is not seen;
+  - an executable whose source is a variable the reader cannot compute and that no CMake argument spells as the stub's
+    file name or stem (a name assembled from smaller fragments such as `test-unified-${part}`, or read from a file): it
+    passes here; at run time the stub exits 77, which ctest shows as Skipped with the property and Failed without it;
   - variables crossing files (PARENT_SCOPE, include(), add_subdirectory()): each file is replayed with its own
     variables, which is why a mention that reaches no target in its own file fails.
 
@@ -773,9 +782,9 @@ def _stem(path):
 
 def compiling_targets(model, src):
     """(targets, unresolved, origins): the targets whose resolved sources include `src`; the unresolved source tokens
-    that could name it (a token is a candidate only when it spells the file's stem: a bare `${files}` could name
-    anything, and a stub source compiled that way is caught by `unattributed_mentions` instead); and the (file, line)
-    of every CMake command whose text reached either."""
+    that, read as a pattern, could name it and whose own text spells the file's stem (a bare `${files}` could name any
+    source and is not one: a stub source reached that way is caught only when some CMake argument spells its file name
+    or stem, by `unattributed_mentions`); and the (file, line) of every CMake command whose text reached either."""
     if src in model.compiling:
         targets, unresolved, origins = model.compiling[src]
         return set(targets), list(unresolved), set(origins)
@@ -795,9 +804,10 @@ def compiling_targets(model, src):
     return targets, unresolved, origins
 
 
-# Commands whose arguments can carry a bare stem into a source name later (`set(n test-x)` ... `${n}.cpp`); in any
-# other command a stem names a target or a test, which shares it by convention.
-_STEM_CARRIERS = frozenset(("set", "list", "foreach"))
+# Commands whose arguments can carry a stem into a source name later (`set(n test-x)` ... `${n}.cpp`,
+# `string(CONCAT p <dir>/test-x ".cpp")`); in any other command a stem names a target or a test, which shares it by
+# convention.
+_STEM_CARRIERS = frozenset(("set", "list", "foreach", "string"))
 
 
 def unattributed_mentions(tree, model, src, attributed):
@@ -812,8 +822,8 @@ def unattributed_mentions(tree, model, src, attributed):
             literal = "${" not in a and "$<" not in a
             if (cm, line) not in attributed and not (literal and model.resolve(a, cm) != src):
                 hits.add((cm, line))
-        for name, a, line in index.get(stem, []):
-            if a == stem and name in carriers and (cm, line) not in attributed:
+        for name, a, line in index.get(stem, []):  # the stem as the argument or as its last path component
+            if name in carriers and (cm, line) not in attributed:
                 hits.add((cm, line))
     return sorted(hits)
 
@@ -1192,6 +1202,11 @@ MUTANTS = {
         _both(_add(TESTS_CMAKE, "\nset(UCB_COPY_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/test-unified-cache-bugs.cpp "
                    "PARENT_SCOPE)\n"),
               _add("CMakeLists.txt", "\nadd_executable(test-ucb-parent ${UCB_COPY_SOURCE})\n")),
+        (f"{TESTS_CMAKE}:", f"names {UCB}", "cannot attribute to a target")),
+    # A second target compiles a stub source through a path the reader does not compute, joined from the stem.
+    "concat-second-target": (
+        _add(TESTS_CMAKE, "\nstring(CONCAT _p ${CMAKE_CURRENT_SOURCE_DIR}/test-unified-cache-bugs \".cpp\")\n"
+             "add_executable(test-ucb-cc ${_p})\n"),
         (f"{TESTS_CMAKE}:", f"names {UCB}", "cannot attribute to a target")),
     # A stub's stem in a variable that reaches neither a test command nor an attributed source.
     "stem-reaching-no-test": (
