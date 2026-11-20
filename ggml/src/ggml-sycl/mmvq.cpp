@@ -4264,10 +4264,11 @@ static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesc
 
 // Column-split form of mul_mat_vec_q8_0_coalesced, for matrices with too few rows to occupy the card
 // (mmvq-launch-geometry.hpp says when and why). A step of the row form is one tile, so sub-group `chunk` of a row
-// walks tiles chunk, chunk + chunks, ... through the same per-tile body. The reduction is the SOA column-split
-// kernel's: sub-group reduce, one partial per sub-group in local memory, a work-group barrier, then the row's chunk-0
-// sub-group adds the partials in chunk order. Padded rows reach the barrier and write nothing. The coalesced layout
-// is never sliced (the dispatcher asserts it), so nrows is the tensor's row count, as in the row form.
+// walks the tiles mmvq_column_split_first_step / step_stride give it through the same per-tile body. The reduction
+// is the SOA column-split kernel's: sub-group reduce, one partial per sub-group in local memory, a work-group
+// barrier, then the row's chunk-0 sub-group adds the partials in chunk order. Padded rows reach the barrier and
+// write nothing. The coalesced layout is never sliced (the dispatcher asserts it), so nrows is the tensor's row
+// count, as in the row form.
 static void mul_mat_vec_q8_0_coalesced_column_split(const void * __restrict__ vx,
                                                     const void * __restrict__ vy,
                                                     float *                  dst,
@@ -4298,7 +4299,9 @@ static void mul_mat_vec_q8_0_coalesced_column_split(const void * __restrict__ vx
 
     float partial_sum = 0.0f;
     if (row < nrows) {
-        for (int tile = chunk; tile < tiles_per_row; tile += chunks) {
+        // The shared step walk, in tiles: the host test sweeps these same two functions.
+        const int tile_stride = ggml_sycl::mmvq_column_split_step_stride(chunks);
+        for (int tile = ggml_sycl::mmvq_column_split_first_step(chunk); tile < tiles_per_row; tile += tile_stride) {
             mmvq_q8_0_coalesced_accumulate_tile(x_qs, x_d, y_qs, y_ds, row, tile, x_row_stride, blocks_per_row, lane,
                                                 partial_sum);
         }
@@ -4459,7 +4462,8 @@ static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
                                                  int *           chunks_out         = nullptr) {
     GGML_ASSERT(ncols % QK8_0 == 0);
 
-    // The row form's sub-group step is one tile: one lane per block of a MMVQ_COALESCED_TILE_BLOCKS-block tile.
+    // The row form's sub-group step is one tile of MMVQ_COALESCED_TILE_BLOCKS blocks, so the rule's step count is the
+    // kernel's tiles_per_row (both round the row's blocks up to whole tiles).
     constexpr int blocks_per_step = MMVQ_COALESCED_TILE_BLOCKS;
     const int     chunks = ggml_sycl::mmvq_column_split_chunks(nrows, ncols / QK8_0, blocks_per_step, compute_units);
     if (chunks_out) {

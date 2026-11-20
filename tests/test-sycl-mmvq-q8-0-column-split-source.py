@@ -19,6 +19,10 @@ gate holds those by text:
   D2  the same for the coalesced launcher, whose step is one MMVQ_COALESCED_TILE_BLOCKS tile;
   D3  the dispatcher passes the card's compute-unit count (ggml_sycl_info().devices[id].nsm, 0 for an unknown index)
       to both launchers, and nothing in either launcher's rule call names a tensor;
+  W1  both split kernels walk a row through the one shared step walk the host test sweeps
+      (mmvq_column_split_first_step / mmvq_column_split_step_stride): the coalesced kernel calls it directly over tile
+      indices, the SOA kernel through mmvq_column_split_first_block / block_stride, which the header defines through
+      it;
   K1  each split kernel reduces its sub-group, publishes one partial per sub-group to local memory, passes a
       work-group barrier with no early return before it, and only then lets the row's chunk-0 sub-group add the
       partials in chunk order and the fused addend once;
@@ -155,8 +159,7 @@ def check_launcher(launcher: str, pin: str, step_decl: str, split_kernel_call: s
     need(launcher.count("sycl::local_accessor<") == 1, "A1", "the split path holds memory other than one accessor")
 
 
-def check_split_kernel(kernel: str, pin: str, walk: tuple[str, ...]) -> None:
-    need(ordered(kernel, *walk), pin, "the split kernel does not walk its chunk's steps")
+def check_split_kernel(kernel: str, pin: str) -> None:
     barrier = "nd_item.barrier(sycl::access::fence_space::local_space);"
     need(
         ordered(
@@ -231,25 +234,40 @@ def check(mmvq_raw: str, header_raw: str) -> None:
         "the dispatcher does not pass the card's compute units to the SOA launcher",
     )
 
-    # K1 ---------------------------------------------------------------------------------------------------------------
-    check_split_kernel(
-        body(code, SOA_SPLIT, "K1"),
-        "K1",
-        (
+    # W1 ---------------------------------------------------------------------------------------------------------------
+    first_block = body(header, "inline int mmvq_column_split_first_block(", "W1")
+    need("return mmvq_column_split_first_step(chunk) * blocks_per_step + lane_block;" in first_block, "W1",
+         "the SOA block walk does not start from the shared step walk")
+    block_stride = body(header, "inline int mmvq_column_split_block_stride(", "W1")
+    need("return mmvq_column_split_step_stride(chunks) * blocks_per_step;" in block_stride, "W1",
+         "the SOA block stride is not the shared step stride")
+    soa_split = body(code, SOA_SPLIT, "W1")
+    need(
+        ordered(
+            soa_split,
             "ggml_sycl::mmvq_column_split_block_stride(chunks, blocks_per_subgroup);",
             "for (int i = ggml_sycl::mmvq_column_split_first_block(chunk, lane / block_elements_per_subgroup, "
             "blocks_per_subgroup); i < blocks_per_row; i += block_stride) {",
         ),
+        "W1",
+        "the SOA split kernel does not walk its chunk's blocks through the shared walk",
     )
-    check_split_kernel(
-        body(code, COALESCED_SPLIT, "K1"),
-        "K1",
-        (
-            "for (int tile = chunk; tile < tiles_per_row; tile += chunks) {",
+    coalesced_split = body(code, COALESCED_SPLIT, "W1")
+    need(
+        ordered(
+            coalesced_split,
+            "const int tile_stride = ggml_sycl::mmvq_column_split_step_stride(chunks);",
+            "for (int tile = ggml_sycl::mmvq_column_split_first_step(chunk); tile < tiles_per_row; tile += tile_stride) {",
             "mmvq_q8_0_coalesced_accumulate_tile(x_qs, x_d, y_qs, y_ds, row, tile, x_row_stride, blocks_per_row, lane,"
             " partial_sum);",
         ),
+        "W1",
+        "the coalesced split kernel does not walk its chunk's tiles through the shared walk",
     )
+
+    # K1 ---------------------------------------------------------------------------------------------------------------
+    check_split_kernel(soa_split, "K1")
+    check_split_kernel(coalesced_split, "K1")
 
     # K2 ---------------------------------------------------------------------------------------------------------------
     need(
@@ -340,9 +358,16 @@ MUTANTS = [
        "            row_sum += row_partials[c];\n        }\n"
        + SPLIT_DST
        + "\n    }\n}\n\n// Multi-row")]),
-    ("the SOA split chunks all start at the row's first step", "K1", "mmvq",
+    ("the SOA split chunks all start at the row's first step", "W1", "mmvq",
      [("ggml_sycl::mmvq_column_split_first_block(chunk, lane / block_elements_per_subgroup,",
        "ggml_sycl::mmvq_column_split_first_block(0, lane / block_elements_per_subgroup,")]),
+    ("the coalesced split kernel walks its tiles with its own arithmetic", "W1", "mmvq",
+     [("        for (int tile = ggml_sycl::mmvq_column_split_first_step(chunk); tile < tiles_per_row; "
+       "tile += tile_stride) {",
+       "        for (int tile = chunk; tile < tiles_per_row; tile += chunks) {")]),
+    ("the SOA block walk stops going through the shared step walk", "W1", "header",
+     [("    return mmvq_column_split_first_step(chunk) * blocks_per_step + lane_block;",
+       "    return chunk * blocks_per_step + lane_block;")]),
     ("the coalesced row form skips its first tile", "K2", "mmvq",
      [("    for (int tile = 0; tile < tiles_per_row; tile++) {\n        mmvq_q8_0_coalesced_accumulate_tile(",
        "    for (int tile = 1; tile < tiles_per_row; tile++) {\n        mmvq_q8_0_coalesced_accumulate_tile(")]),

@@ -9,7 +9,8 @@
 //   * that a chunk count is always a power of two that divides the work-group's sub-groups, never more than the row's
 //     sub-group steps;
 //   * that the chunks of a row read every quant of every block exactly once, for the SOA lane mapping (four lanes per
-//     block, two ints each) and the coalesced one (one lane per block of a 32-block tile);
+//     block, two ints each) and the coalesced one (the shared step walk over tiles, then the per-tile lane loop), the
+//     latter at several tile sizes so it holds without the tile matching the sub-group;
 //   * that one chunk is the row form's own indexing, and that the work-groups cover the rows with whole work-groups.
 // The device test (test-sycl-mmvq-q8-0-column-split) shows the kernels compute the right numbers; this one shows the
 // numbers it needs are the right ones on shapes no single device run can sweep.
@@ -23,7 +24,9 @@
 using ggml_sycl::mmvq_column_split_block_stride;
 using ggml_sycl::mmvq_column_split_chunks;
 using ggml_sycl::mmvq_column_split_first_block;
+using ggml_sycl::mmvq_column_split_first_step;
 using ggml_sycl::mmvq_column_split_rows_per_workgroup;
+using ggml_sycl::mmvq_column_split_step_stride;
 using ggml_sycl::mmvq_column_split_steps;
 using ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;
 using ggml_sycl::mmvq_column_split_workgroups;
@@ -35,7 +38,9 @@ static constexpr int QI8_0              = 8;
 static constexpr int VDR                = 2;
 static constexpr int SOA_STEP           = (VDR * WARP + QI8_0 - 1) / QI8_0;  // blocks one sub-group covers per step: 8
 static constexpr int SOA_BLOCK_LANES    = QI8_0 / VDR;                       // lanes per block: 4
-static constexpr int COALESCED_STEP     = WARP;                              // one tile of 32 blocks, one lane each
+// MMVQ_COALESCED_TILE_BLOCKS (common.hpp): the coalesced row form's step is one tile of this many blocks.
+static constexpr int TILE_BLOCKS        = 32;
+static constexpr int COALESCED_STEP     = TILE_BLOCKS;
 // The 16 sub-groups of the row form's work-group (`num_subgroups` at every mmvq.cpp launch site).
 static constexpr int ROW_FORM_SUBGROUPS = 16;
 // SYCL max_compute_units on the two cards (EUs): Arc Pro B70 and Arc Pro B50.
@@ -177,14 +182,22 @@ static bool soa_coverage_is_exact(int blocks, int chunks) {
     return true;
 }
 
-// The coalesced mapping: chunk -> tiles chunk, chunk + chunks, ...; lane -> block lane of the tile.
-static bool coalesced_coverage_is_exact(int blocks, int chunks) {
+// The coalesced mapping, as mul_mat_vec_q8_0_coalesced_column_split walks it: chunk -> the tiles the shared step walk
+// gives it (first_step, step_stride, in tile units), up to the row's tiles; then mmvq_q8_0_coalesced_accumulate_tile's
+// lane loop inside each tile (blocks lane, lane + WARP, ... of the tile, skipping blocks past the row).
+static bool coalesced_coverage_is_exact(int blocks, int chunks, int tile_blocks) {
+    const int        tiles = mmvq_column_split_steps(blocks, tile_blocks);
     std::vector<int> hits(static_cast<size_t>(blocks), 0);
     for (int chunk = 0; chunk < chunks; ++chunk) {
-        for (int lane = 0; lane < WARP; ++lane) {
-            const int stride = mmvq_column_split_block_stride(chunks, COALESCED_STEP);
-            for (int i = mmvq_column_split_first_block(chunk, lane, COALESCED_STEP); i < blocks; i += stride) {
-                ++hits[static_cast<size_t>(i)];
+        const int tile_stride = mmvq_column_split_step_stride(chunks);
+        for (int tile = mmvq_column_split_first_step(chunk); tile < tiles; tile += tile_stride) {
+            for (int lane = 0; lane < WARP; ++lane) {
+                for (int block_in_tile = lane; block_in_tile < tile_blocks; block_in_tile += WARP) {
+                    const int block = tile * tile_blocks + block_in_tile;
+                    if (block < blocks) {
+                        ++hits[static_cast<size_t>(block)];
+                    }
+                }
             }
         }
     }
@@ -203,25 +216,30 @@ static void test_chunks_read_every_quant_exactly_once() {
                 expect(false, "soa coverage: blocks=" + std::to_string(blocks) + " chunks=" + std::to_string(chunks));
                 return;
             }
-            if (!coalesced_coverage_is_exact(blocks, chunks)) {
-                expect(false,
-                       "coalesced coverage: blocks=" + std::to_string(blocks) + " chunks=" + std::to_string(chunks));
-                return;
+            // The production tile, and tiles smaller and larger than a sub-group: the walk is over tile indices.
+            for (const int tile_blocks : { TILE_BLOCKS, 16, 64 }) {
+                if (!coalesced_coverage_is_exact(blocks, chunks, tile_blocks)) {
+                    expect(false, "coalesced coverage: blocks=" + std::to_string(blocks) +
+                                      " chunks=" + std::to_string(chunks) + " tile=" + std::to_string(tile_blocks));
+                    return;
+                }
             }
         }
     }
     expect(true, "coverage");
-    std::printf("PASS: every quant read exactly once, chunks 1..16, blocks 1..400, both layouts\n");
+    std::printf("PASS: every quant read exactly once, chunks 1..16, blocks 1..400, both layouts, tiles 16/32/64\n");
 }
 
-// One chunk is the row form's loop: start at lane / 4 (SOA) or the lane (coalesced tile 0), step by one sub-group step.
+// One chunk is the row form's loop: every step in order (the coalesced row form's tile loop), and in blocks a start at
+// lane / 4 stepping by one sub-group step (the SOA row form's loop).
 static void test_one_chunk_is_the_row_form_indexing() {
+    expect(mmvq_column_split_first_step(0) == 0, "one chunk starts at the row's first step");
+    expect(mmvq_column_split_step_stride(1) == 1, "one chunk takes every step");
     for (int lane_block = 0; lane_block < WARP; ++lane_block) {
         expect(mmvq_column_split_first_block(0, lane_block, SOA_STEP) == lane_block,
                "one chunk starts where a row does");
     }
     expect(mmvq_column_split_block_stride(1, SOA_STEP) == SOA_STEP, "one SOA chunk strides one sub-group step");
-    expect(mmvq_column_split_block_stride(1, COALESCED_STEP) == COALESCED_STEP, "one coalesced chunk strides a tile");
 }
 
 // Rows per work-group times work-groups covers the slice with whole work-groups and no wholly padded work-group.

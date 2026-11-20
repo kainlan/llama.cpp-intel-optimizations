@@ -84,10 +84,12 @@ inline bool mmvq_launch_covers_rows(const int padded_rows, const int rows) {
 //
 // The column-split form keeps the row form's work-group (16 sub-groups) and
 // gives each row `chunks` of them. Chunk c walks the row form's steps c,
-// c + chunks, c + 2 * chunks, ...; each sub-group reduces its lanes as the row
-// form does, the partials meet in the work-group's local memory (a work-group
-// runs on one Xe-core), and one sub-group per row adds them in chunk order. A
-// work-group holds 16 / chunks rows.
+// c + chunks, c + 2 * chunks, ... (`mmvq_column_split_first_step` and
+// `mmvq_column_split_step_stride`, which both kernels call, so the host test
+// sweeps the walk the kernels take). Each sub-group reduces its lanes as the
+// row form does, the partials meet in the work-group's local memory (a
+// work-group runs on one Xe-core), and one sub-group per row adds them in
+// chunk order. A work-group holds 16 / chunks rows.
 //
 // When it is chosen (`mmvq_column_split_chunks`), from the launch geometry and
 // one device fact, never from a tensor or model name:
@@ -150,17 +152,31 @@ inline int mmvq_column_split_workgroups(const int rows, const int chunks) {
     return (rows + rows_per_workgroup - 1) / rows_per_workgroup;
 }
 
-// The first block a lane of chunk `chunk` reads, where `lane_block` is the
-// lane's block within one step (lane / 4 for SOA, the lane for a coalesced
-// tile). With one chunk this is the row form's own start.
+// The walk, in the row form's steps: chunk `chunk` of `chunks` takes steps
+// first_step(chunk), then every step_stride(chunks) further. The coalesced
+// kernel walks these directly, its step being one tile (so the walk is over
+// tile indices and needs no tile-size or sub-group-size relation); the SOA
+// kernel walks them through the block forms below. With one chunk this is the
+// row form's walk, every step in order.
+inline int mmvq_column_split_first_step(const int chunk) {
+    return chunk;
+}
+
+inline int mmvq_column_split_step_stride(const int chunks) {
+    return chunks;
+}
+
+// The SOA kernel's form of the walk, in blocks: the first block a lane of
+// chunk `chunk` reads, where `lane_block` is the lane's block within one step
+// (lane / 4). With one chunk this is the row form's own start.
 inline int mmvq_column_split_first_block(const int chunk, const int lane_block, const int blocks_per_step) {
-    return chunk * blocks_per_step + lane_block;
+    return mmvq_column_split_first_step(chunk) * blocks_per_step + lane_block;
 }
 
 // The distance between a chunk's consecutive blocks. With one chunk this is
 // the row form's own stride, one step.
 inline int mmvq_column_split_block_stride(const int chunks, const int blocks_per_step) {
-    return chunks * blocks_per_step;
+    return mmvq_column_split_step_stride(chunks) * blocks_per_step;
 }
 
 }  // namespace ggml_sycl
