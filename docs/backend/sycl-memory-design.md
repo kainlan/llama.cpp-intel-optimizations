@@ -3124,11 +3124,14 @@ zones, and it may rebuild an arena nothing holds for larger zones, at the entry
 ensure or at the micro-batch's grow leg. When no model is live, the refused
 load's abort ends with the release of the last model (below), which tears that
 arena down again unless something still holds it, and the next load's start
-reserves the early arena; the end of the refused load reserves nothing. While a
-model is live, on this device or the other (liveness is process-wide), a refused
-load keeps the rebuilt arena, or leaves the device with no arena when the
-reserve after the teardown failed. A plan that needs the secondary MoE devices also creates their shared queues and
-caches, which stay. The effect pass then runs, device by device and each from
+reserves the early arena; the end of the refused load reserves nothing. An arena
+the refused load's own buffers still hold at its abort stays, and its release is
+deferred to the next load's start, which runs it again before its reserve.
+While a model is live, on this device or the other (liveness is
+process-wide), a refused load keeps the rebuilt arena, or leaves the device
+with no arena when the reserve after the teardown failed. A plan that needs the
+secondary MoE devices also creates their shared queues and caches, which stay.
+The effect pass then runs, device by device and each from
 the snapshot that device staged: the stale ring's release, the layer streaming
 the late pass decided on, and the late pass's host zones
 (`ggml_sycl_configure_host_zones_for_plan()`). A load refused in its decide pass
@@ -3560,9 +3563,9 @@ allocation.
 **The release of the last model.** The per-device cache lives for the process,
 but nothing in it stays sized for a model once no model is live. The model
 release hook, when it drops the last model, and a failed load's abort, when no
-model is live, run one step last (`ggml_sycl_release_last_model_effects()`),
-after each has dropped and put back what its model published. Each existing
-cache gives back what it sized for a model
+model is live, run one step last (`ggml_sycl_release_last_model_effects()`,
+asking every cache), after each has dropped and put back what its model
+published. Each cache it asks gives back what it sized for a model
 (`unified_cache::release_for_no_live_model()`): it waits once for the device's
 queued work, then releases the PP MoE oneDNN ring, the oneDNN scratchpad pair
 and the reorder temp, reclaims the graph scratch and the deferred frees, and
@@ -3580,9 +3583,21 @@ first load of a process does, and the two-card MoE flag goes back to its start
 once every cache emptied. Nothing is reaped or forced. A claimed ring slot, a
 reserved oneDNN pair or a held arena keeps what it holds, its cache keeps the
 terms that describe it, and the step names the holder at ERROR
-(`[VRAM-ARENA] last release on device <D> (<site>): ...`); at a failed load's
-abort, an arena the failed load's own buffers hold is a WARN, and it stays
-until a later release finds nothing holding it. A teardown that refuses is an
+(`[VRAM-ARENA] last release on device <D> (<site>): ...`). At a failed load's
+abort, an arena the failed load's own buffers hold is a WARN: the arena stays,
+and the cache marks its release deferred
+(`unified_cache::last_release_deferred()`). The next load's start runs the same
+step again, inside its transaction and before its reserve, asking only the
+marked caches (`ggml_sycl_last_release_scope::DEFERRED_CACHES`). A cache that
+empties clears its mark and gets its published terms back, and the start
+reserve then reserves its early arena, so that load plans as the first load of
+a process does. A cache whose arena the buffers still hold answers the same WARN
+(site `load-start`) and keeps its mark, and that load runs on the arena as it
+is; the next load's start asks again. Only a release that empties the cache
+clears the mark, and a cache made fresh carries none, so a process's first load
+tears nothing down. A cache the step does not ask keeps its terms, and counts
+as emptied for the two-card MoE flag only when it holds no arena; a start that
+asks no cache leaves the flag as it is. A teardown that refuses is an
 ERROR with its cause. Liveness is process-wide, so a model live on either card
 keeps every device's arena, and the entry ensure's last resort (above) stays
 reachable for that case. The MoE inference buffers the first MoE model
@@ -3593,10 +3608,13 @@ non-owning views into three of them, and a later model that needs larger ones
 falls back to runtime allocations. `tests/test-sycl-last-release-source.py` pins the
 wiring, `last_release_empties_the_arena` in the
 `sycl-runtime-alloc-last-release-empties-the-arena` ctest (binary
-`test-sycl-runtime-alloc`) drives the step and its refusals on a hand-built
-cache, and arm (j) of `test-sycl-plan-dry-run` stages a refused load with no
-model live and checks that the next load's start rebuilds the first load's
-zones.
+`test-sycl-runtime-alloc`) drives the step, its refusals and a deferred release
+on a hand-built cache, and arm (j) of `test-sycl-plan-dry-run` ends a refused
+load with no model live (the stage's early failure hook refuses it after
+device 0 rebuilt its arena for the load) and checks that the next load's start
+reserves the first arena's zones and that its early pass decides the zones the
+process's first load of the same inventory decided, read by `main` before any
+arm.
 
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
 holds the compute term the load measured at the context and micro-batch the
