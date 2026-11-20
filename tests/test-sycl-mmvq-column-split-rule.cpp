@@ -34,21 +34,21 @@ using ggml_sycl::mmvq_column_split_steps;
 using ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;
 using ggml_sycl::mmvq_column_split_workgroups;
 
-// The row form's constants, transcribed here because this test includes no backend header. WARP_SIZE is 32 on every
-// Intel build (presets.hpp, ggml-sycl/CMakeLists.txt); Q8_0 has QI8_0 = 8 ints per block and vdr_mmvq = 2.
-static constexpr int WARP               = 32;
-static constexpr int QI8_0              = 8;
-static constexpr int VDR                = 2;
-static constexpr int SOA_STEP           = (VDR * WARP + QI8_0 - 1) / QI8_0;  // blocks one sub-group covers per step: 8
-static constexpr int SOA_BLOCK_LANES    = QI8_0 / VDR;                       // lanes per block: 4
+// The row form's constants, transcribed here because this test includes no backend header: WARP_SIZE, Q8_0's QI8_0
+// ints per block and vdr_mmvq, and the coalesced tile. test-sycl-mmvq-q8-0-column-split-source (pin T1) reads each
+// literal below and fails if it differs from its production definition, so a production change cannot leave this
+// table silently stale.
+static constexpr int WARP            = 32;
+static constexpr int QI8_0           = 8;
+static constexpr int VDR             = 2;
+static constexpr int SOA_STEP        = (VDR * WARP + QI8_0 - 1) / QI8_0;  // blocks one sub-group covers per step: 8
+static constexpr int SOA_BLOCK_LANES = QI8_0 / VDR;                       // lanes per block: 4
 // MMVQ_COALESCED_TILE_BLOCKS (common.hpp): the coalesced row form's step is one tile of this many blocks.
-static constexpr int TILE_BLOCKS        = 32;
-static constexpr int COALESCED_STEP     = TILE_BLOCKS;
-// The 16 sub-groups of the row form's work-group (`num_subgroups` at every mmvq.cpp launch site).
-static constexpr int ROW_FORM_SUBGROUPS = 16;
+static constexpr int TILE_BLOCKS     = 32;
+static constexpr int COALESCED_STEP  = TILE_BLOCKS;
 // SYCL max_compute_units on the two cards (EUs): Arc Pro B70 and Arc Pro B50.
-static constexpr int B70_EUS            = 256;
-static constexpr int B50_EUS            = 128;
+static constexpr int B70_EUS         = 256;
+static constexpr int B50_EUS         = 128;
 
 static int g_failures = 0;
 static int g_checks   = 0;
@@ -155,11 +155,6 @@ static void test_chunk_count_invariants_over_a_sweep() {
     }
     expect(checked == 2 * 2 * 300 * 400, "the sweep visited every shape");
     std::printf("PASS: chunk-count invariants over %d shapes\n", checked);
-}
-
-// The split's work-group is the row form's: same sub-group count, so the size already known to launch on these cards.
-static void test_work_group_matches_the_row_form() {
-    expect(MMVQ_COLUMN_SPLIT_SUBGROUPS == ROW_FORM_SUBGROUPS, "the split work-group has the row form's 16 sub-groups");
 }
 
 // Every (block, quant int) of a row is read by exactly one lane of exactly one chunk, for the SOA lane mapping:
@@ -298,7 +293,6 @@ int main() {
     test_short_rows_keep_the_row_form();
     test_unknown_inputs_keep_the_row_form();
     test_chunk_count_invariants_over_a_sweep();
-    test_work_group_matches_the_row_form();
     test_chunks_read_every_quant_exactly_once();
     test_one_chunk_is_the_row_form_indexing();
     test_work_groups_cover_the_rows();

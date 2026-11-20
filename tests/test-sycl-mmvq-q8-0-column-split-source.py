@@ -30,6 +30,11 @@ gate holds those by text:
       one and ends in the other, with no return, barrier or dst write of its own;
   P1  padded rows read nothing: in both split kernels the walk sits inside `if (row < nrows) {`, which opens right
       after the partial sum and closes before the finish helper;
+  T1  the host rule test includes no backend header, so it transcribes WARP, QI8_0, VDR and TILE_BLOCKS; each copy
+      must equal its production definition (the Intel GGML_SYCL_WARP_SIZE in ggml-sycl/CMakeLists.txt and the
+      presets.hpp default, QI8_0 as ggml-common.h computes it and the Q8_0 trait's qi, the Q8_0 trait's vdr_mmvq,
+      common.hpp's MMVQ_COALESCED_TILE_BLOCKS), and MMVQ_COLUMN_SPLIT_SUBGROUPS must equal the row form's
+      num_subgroups in both Q8_0 launchers;
   K2  the row forms still walk what they walked: the SOA row kernel's block loop, and the coalesced row kernel's
       every-tile loop through the shared per-tile body;
   E1  no host wait and no new dependency in either launcher: both forms go through the one ggml_sycl_profile_submit
@@ -55,6 +60,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MMVQ = ROOT / "ggml/src/ggml-sycl/mmvq.cpp"
 HEADER = ROOT / "ggml/src/ggml-sycl/mmvq-launch-geometry.hpp"
+# T1 reads the host test's transcribed constants and the production definitions they copy.
+TRANSCRIBED = {
+    "host": ROOT / "tests/test-sycl-mmvq-column-split-rule.cpp",
+    "cmake": ROOT / "ggml/src/ggml-sycl/CMakeLists.txt",
+    "presets": ROOT / "ggml/src/ggml-sycl/presets.hpp",
+    "ggml_common": ROOT / "ggml/src/ggml-common.h",
+    "quants": ROOT / "ggml/src/ggml-sycl/quants.hpp",
+    "common": ROOT / "ggml/src/ggml-sycl/common.hpp",
+}
 
 _COMMENT_OR_LITERAL = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.DOTALL)
 
@@ -252,7 +266,65 @@ def check_split_kernel(kernel: str) -> None:
     need("if (row < nrows) {" in kernel, "K1", "padded rows are not kept from computing")
 
 
-def check(mmvq_raw: str, header_raw: str) -> None:
+def one_int(text: str, pattern: str, pin: str, what: str) -> int:
+    found = re.findall(pattern, text)
+    need(len(found) == 1, pin, f"{what}: {len(found)} definitions, not one")
+    return int(found[0])
+
+
+def intel_warp_size(cmake: str) -> int:
+    """GGML_SYCL_WARP_SIZE as the Intel arm of the target selection in ggml-sycl/CMakeLists.txt defines it."""
+    values = []
+    for m in re.finditer(r'^if \(GGML_SYCL_TARGET STREQUAL "INTEL"\)$', cmake, re.MULTILINE):
+        # The arm ends at the first top-level elseif, else or endif after it.
+        end = re.search(r"^(?:elseif|else|endif)\b", cmake[m.end() :], re.MULTILINE)
+        span = cmake[m.end() : m.end() + end.start() if end else len(cmake)]
+        values += re.findall(r"^\s*add_compile_definitions\(GGML_SYCL_WARP_SIZE=(\d+)\)", span, re.MULTILINE)
+    need(len(values) == 1, "T1", f"the Intel GGML_SYCL_WARP_SIZE: {len(values)} definitions, not one")
+    return int(values[0])
+
+
+def check_transcribed(src: dict[str, str], code: str, header: str) -> None:
+    host = squeeze(blank(src["host"]))
+
+    def host_int(name: str) -> int:
+        return one_int(host, rf"static constexpr int {name} = (\d+);", "T1", f"the host test's {name}")
+
+    warp = intel_warp_size(src["cmake"])
+    preset = one_int(src["presets"], r"#ifndef GGML_SYCL_WARP_SIZE\s*\n#define GGML_SYCL_WARP_SIZE (\d+)", "T1",
+                     "the presets.hpp GGML_SYCL_WARP_SIZE default")
+    need(preset == warp, "T1", f"the presets.hpp WARP_SIZE default {preset} is not the Intel build's {warp}")
+    need("#define WARP_SIZE GGML_SYCL_WARP_SIZE" in src["presets"], "T1", "WARP_SIZE is not GGML_SYCL_WARP_SIZE")
+    need(host_int("WARP") == warp, "T1", f"the host test's WARP is not the Intel build's WARP_SIZE {warp}")
+
+    gc = src["ggml_common"]
+    qk = one_int(gc, r"#define QK8_0 (\d+)\b", "T1", "QK8_0")
+    qr = one_int(gc, r"#define QR8_0 (\d+)\b", "T1", "QR8_0")
+    need("#define QI8_0 (QK8_0 / (4 * QR8_0))" in gc, "T1", "QI8_0 is no longer QK8_0 / (4 * QR8_0)")
+    quants = squeeze(blank(src["quants"]))
+    q8 = body(quants, "template <> struct block_q_t<GGML_TYPE_Q8_0> {", "T1")
+    need("static constexpr uint32_t qi = QI8_0;" in q8, "T1", "the Q8_0 trait's qi is not QI8_0")
+    need(host_int("QI8_0") == qk // (4 * qr), "T1", f"the host test's QI8_0 is not QK8_0 / (4 * QR8_0) = {qk // (4 * qr)}")
+    vdr = one_int(q8, r"static constexpr uint32_t vdr_mmvq = (\d+);", "T1", "the Q8_0 trait's vdr_mmvq")
+    need(host_int("VDR") == vdr, "T1", f"the host test's VDR is not the Q8_0 trait's vdr_mmvq {vdr}")
+
+    common = squeeze(blank(src["common"]))
+    tile = re.findall(r"constexpr int MMVQ_COALESCED_TILE_BLOCKS = (WARP_SIZE|\d+);", common)
+    need(len(tile) == 1, "T1", f"MMVQ_COALESCED_TILE_BLOCKS: {len(tile)} definitions, not one")
+    tile_blocks = warp if tile[0] == "WARP_SIZE" else int(tile[0])
+    need(host_int("TILE_BLOCKS") == tile_blocks, "T1",
+         f"the host test's TILE_BLOCKS is not MMVQ_COALESCED_TILE_BLOCKS {tile_blocks}")
+
+    split = one_int(header, r"constexpr int MMVQ_COLUMN_SPLIT_SUBGROUPS = (\d+);", "T1", "MMVQ_COLUMN_SPLIT_SUBGROUPS")
+    for signature in (SOA_LAUNCHER, COALESCED_LAUNCHER):
+        row = one_int(body(code, signature, "T1"), r"constexpr size_t num_subgroups = (\d+);", "T1",
+                      f"the row form's num_subgroups in {signature}")
+        need(row == split, "T1", f"MMVQ_COLUMN_SPLIT_SUBGROUPS {split} is not the row form's {row} in {signature}")
+
+
+def check(src: dict[str, str]) -> None:
+    mmvq_raw = src["mmvq"]
+    header_raw = src["header"]
     code = squeeze(blank(mmvq_raw))
     header = squeeze(blank(header_raw))
 
@@ -344,6 +416,9 @@ def check(mmvq_raw: str, header_raw: str) -> None:
     # P1 ---------------------------------------------------------------------------------------------------------------
     check_guarded_walk(soa_split, "for (int i = ggml_sycl::mmvq_column_split_first_block(", "SOA")
     check_guarded_walk(coalesced_split, "for (int tile = ggml_sycl::mmvq_column_split_first_step(chunk);", "coalesced")
+
+    # T1 ---------------------------------------------------------------------------------------------------------------
+    check_transcribed(src, code, header)
 
     # K2 ---------------------------------------------------------------------------------------------------------------
     need(
@@ -463,6 +538,16 @@ MUTANTS = [
        "                cgh.parallel_for<mmvq_coalesced_column_split_kernel_name",
        "                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(chunks), cgh);\n"
        "                cgh.parallel_for<mmvq_coalesced_column_split_kernel_name")]),
+    ("the host test's VDR copy drifts from the Q8_0 trait", "T1", "host",
+     [("static constexpr int VDR             = 2;", "static constexpr int VDR             = 4;")]),
+    ("the coalesced tile grows past the host test's copy", "T1", "common",
+     [("constexpr int MMVQ_COALESCED_TILE_BLOCKS      = WARP_SIZE;",
+       "constexpr int MMVQ_COALESCED_TILE_BLOCKS      = 64;")]),
+    ("the Intel build changes its sub-group size", "T1", "cmake",
+     [("    # issues in load_tiles_q4_0. Intel hardware supports subgroup size 32.\n"
+       "    add_compile_definitions(GGML_SYCL_WARP_SIZE=32)",
+       "    # issues in load_tiles_q4_0. Intel hardware supports subgroup size 32.\n"
+       "    add_compile_definitions(GGML_SYCL_WARP_SIZE=16)")]),
     ("the coalesced row form skips its first tile", "K2", "mmvq",
      [("    for (int tile = 0; tile < tiles_per_row; tile++) {\n        mmvq_q8_0_coalesced_accumulate_tile(",
        "    for (int tile = 1; tile < tiles_per_row; tile++) {\n        mmvq_q8_0_coalesced_accumulate_tile(")]),
@@ -486,17 +571,17 @@ MUTANTS = [
 ]
 
 
-def self_test(mmvq_raw: str, header_raw: str) -> int:
+def self_test(src: dict[str, str]) -> int:
     failures: list[str] = []
     for name, pin, target, edits in MUTANTS:
         try:
-            m = mutate(mmvq_raw, edits) if target == "mmvq" else mmvq_raw
-            h = mutate(header_raw, edits) if target == "header" else header_raw
+            mutated = dict(src)
+            mutated[target] = mutate(src[target], edits)
         except MutantNotApplied as e:
             failures.append(f"{name}: {e}")
             continue
         try:
-            check(m, h)
+            check(mutated)
         except ContractError as e:
             caught = re.search(r"\[pin (\w+)\]", str(e))
             if not caught or caught.group(1) != pin:
@@ -506,7 +591,7 @@ def self_test(mmvq_raw: str, header_raw: str) -> int:
 
     # The NOT APPLIED report must itself fire, or a drifted anchor would read as a kill.
     try:
-        mutate(mmvq_raw, [("this text is not in mmvq.cpp", "")])
+        mutate(src["mmvq"], [("this text is not in mmvq.cpp", "")])
         failures.append("NOT APPLIED does not fire on a missing anchor")
     except MutantNotApplied:
         pass
@@ -520,16 +605,17 @@ def self_test(mmvq_raw: str, header_raw: str) -> int:
 
 
 def main() -> int:
-    mmvq_raw = MMVQ.read_text(encoding="utf-8")
-    header_raw = HEADER.read_text(encoding="utf-8")
+    src = {"mmvq": MMVQ.read_text(encoding="utf-8"), "header": HEADER.read_text(encoding="utf-8")}
+    for key, path in TRANSCRIBED.items():
+        src[key] = path.read_text(encoding="utf-8")
     try:
-        check(mmvq_raw, header_raw)
+        check(src)
     except ContractError as e:
         print(e)
         return 1
     print("mmvq q8_0 column-split source contract: PASS")
     if "--self-test" in sys.argv[1:]:
-        return self_test(mmvq_raw, header_raw)
+        return self_test(src)
     return 0
 
 
