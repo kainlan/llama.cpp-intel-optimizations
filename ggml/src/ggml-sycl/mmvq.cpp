@@ -4140,7 +4140,10 @@ static void coalesced_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
 // Source (block-major): [B0.W0-W7][B1.W0-W7]...[B(TILE_BLOCKS-1).W0-W7]
 // Dest (word-major):    [W0:B0-B(TILE_BLOCKS-1)]...[W7:B0-B(TILE_BLOCKS-1)]
 //
-// Thread mapping: threads iterate block_in_tile and process both halves per block
+// Thread mapping: within a tile, lane l takes blocks l, l + WARP_SIZE, ... and processes both 16-byte halves of
+// each. The per-tile body below holds that mapping; the row form and the column-split form differ only in which
+// tiles of a row a sub-group passes to it.
+
 // One tile of one row of the coalesced Q8_0 x Q8_1 dot product, added into this lane's `partial_sum`. The row form
 // walks every tile of a row; the column-split form walks one chunk's tiles. One body, so both forms read the layout
 // the same way and add a tile's terms in the same order.
