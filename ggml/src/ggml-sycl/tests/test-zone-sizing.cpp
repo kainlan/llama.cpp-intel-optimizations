@@ -1328,6 +1328,118 @@ int main() {
               "a smaller later plan does not shrink the pair halves the kept zone was built for");
     }
 
+    // ---- Case 14m: the planned pair's activations half is the micro-batch times the widest row the scratch takes ----
+    // Qwen3.8 Flash Next IQ4_NL on the B70 at -p 2048 -ub 2048: the pair was planned as (largest dequantized eligible
+    // weight, largest eligible weight AS STORED) = (60.0, 31.9) MB. The second figure is no activation size: the ops
+    // ask for 2048 rows x 10240 x f16 = 40.0 MB. With the zone exactly pair + Graph floor the pair bound was 91.9 MB,
+    // the per-component maximum (60, 40) did not fit it, and every op of a layer replaced the held pair.
+    {
+        const size_t mib = 1024u * 1024u;
+
+        // The classifier: the row is the widest marked row inside the eligible set the weights half covers. Names are
+        // wrong for the GGUF convention on purpose, as in every fixture of this file.
+        std::vector<zone_tensor_desc> inv;
+        const auto                    marked = [](zone_tensor_desc d) {
+            d.onednn_pp_src1_bytes_per_token = static_cast<size_t>(d.ne[0]) * F16_BYTES;
+            return d;
+        };
+        for (int i = 0; i < 6; ++i) {
+            const std::string n = std::to_string(i);
+            // the widest row the scratch takes: K = 10240, 20480 B/token (reorder 40 MiB)
+            inv.push_back(marked(desc("token_embd.weight.a" + n, 11796480, TYPE_Q4_0, 10240, 2048, 1, 1)));
+            // the largest dequantized weight: 60 MiB, and the largest eligible weight as stored (31.9 MB)
+            inv.push_back(marked(desc("token_embd.weight.b" + n, 33423360, TYPE_Q8_0, 2048, 15360, 1, 1)));
+            // an eligible weight of a type the scratch is not enabled for: the adapter leaves it unmarked
+            inv.push_back(desc("token_embd.weight.c" + n, 9437184, TYPE_Q4_K, 16384, 1024, 1, 1));
+            // an expert stack with a wider row: the PP MoE ring takes it, not this scratch
+            inv.push_back(marked(desc("token_embd.weight.d" + n, 570425344, TYPE_MXFP4, 16384, 2048, 32, 1)));
+        }
+        // a singleton (the head) with a wider row: outside the eligible set, so outside the pair plan
+        inv.push_back(marked(desc("blk.0.ffn_up.weight", 2644901888, TYPE_Q8_0, 16384, 151936, 1, 1)));
+        for (int i = 0; i < 4; ++i) {
+            // a gather-only family with a wider row: no MUL_MAT operand
+            zone_tensor_desc g = marked(desc("blk.9" + std::to_string(i), 14155776, TYPE_Q4_0, 24576, 1024, 1, 1));
+            g.get_rows_only    = true;
+            inv.push_back(g);
+        }
+        const path_scoped_maxima m = zone_scoped_maxima(inv);
+        CHECK(m.onednn_pp_src1_bytes_per_token == 20480,
+              "the activations row is the widest marked row of the eligible set, no expert, head or gather row");
+        CHECK(m.onednn_reorder == 60 * mib, "the weights half is the largest dequantized eligible weight");
+        CHECK(m.onednn_eligible == 33423360, "the largest eligible weight as stored is the 31.9 MB placeholder");
+
+        // The pure plan: n_ubatch rows of that row, beside the weights half.
+        const ggml_sycl::zone_onednn_pp_pair at_2048 =
+            ggml_sycl::zone_onednn_pp_pair_plan(m.onednn_reorder, m.onednn_pp_src1_bytes_per_token, 2048);
+        CHECK(at_2048.sized && at_2048.weights_bytes == 60 * mib && at_2048.activations_bytes == 40 * mib,
+              "the planned pair at n_ubatch=2048 is (60 MiB, 40 MiB)");
+        CHECK(at_2048.src1_bytes_per_token == 20480 && at_2048.n_ubatch == 2048,
+              "the plan records the row and the micro-batch it was sized from");
+        CHECK(at_2048.activations_bytes != m.onednn_eligible,
+              "the activations half is not the stored-weight placeholder");
+        const ggml_sycl::zone_onednn_pp_pair at_512 =
+            ggml_sycl::zone_onednn_pp_pair_plan(m.onednn_reorder, m.onednn_pp_src1_bytes_per_token, 512);
+        CHECK(at_512.sized && at_512.weights_bytes == 60 * mib && at_512.activations_bytes == 10 * mib,
+              "the activations half follows the micro-batch: 10 MiB at n_ubatch=512");
+        const ggml_sycl::zone_onednn_pp_pair no_rows = ggml_sycl::zone_onednn_pp_pair_plan(60 * mib, 20480, 0);
+        CHECK(no_rows.sized && no_rows.weights_bytes == 60 * mib && no_rows.activations_bytes == 0,
+              "no micro-batch plans no activations half");
+        const ggml_sycl::zone_onednn_pp_pair no_row = ggml_sycl::zone_onednn_pp_pair_plan(60 * mib, 0, 2048);
+        CHECK(no_row.sized && no_row.activations_bytes == 0, "no marked row plans no activations half");
+        const ggml_sycl::zone_onednn_pp_pair wrapped =
+            ggml_sycl::zone_onednn_pp_pair_plan(60 * mib, SIZE_MAX / 2 + 1, 2);
+        CHECK(!wrapped.sized && wrapped.weights_bytes == 60 * mib && wrapped.activations_bytes == 0,
+              "an overflowing activations half is not wrapped into a small one: it is 0 and the pair is unsized");
+        const ggml_sycl::zone_onednn_pp_pair wrapped_sum = ggml_sycl::zone_onednn_pp_pair_plan(SIZE_MAX, 1, 1);
+        CHECK(!wrapped_sum.sized && wrapped_sum.weights_bytes == SIZE_MAX && wrapped_sum.activations_bytes == 0,
+              "a pair whose sum overflows keeps only the weights half");
+
+        // The reserve over the layer's five requests: with the zone exactly pair + Graph floor (576 MiB at
+        // n_head_ctx_max=24, n_ubatch=2048, n_ctx=2048), the first reservation is the planned pair and no later op of
+        // the layer replaces it.
+        const size_t floor_b        = 576 * mib;
+        const size_t requests[5][2] = {
+            { 62 * mib / 10, 40 * mib       },
+            { 50 * mib,      40 * mib       },
+            { 60 * mib,      10 * mib       },
+            { 60 * mib,      319 * mib / 10 },
+            { mib / 10,      40 * mib       },
+        };
+        const size_t bare  = at_2048.weights_bytes + at_2048.activations_bytes;
+        const size_t bound = ggml_sycl::zone_onednn_pp_pair_bound(bare + floor_b, bare, floor_b);
+        CHECK(bound == 100 * mib, "a zone of exactly pair + floor bounds the pair at its plan");
+        size_t held_w = 0, held_a = 0;
+        for (const auto & r : requests) {
+            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, r[0], r[1]), "every request is admitted");
+            size_t w = 0, a = 0;
+            ggml_sycl::zone_onednn_scratch_reserve_target(true, bound, held_w, held_a, at_2048.weights_bytes,
+                                                          at_2048.activations_bytes, r[0], r[1], &w, &a);
+            CHECK(w == 60 * mib && a == 40 * mib, "the target is (60, 40) from the first request on and never changes");
+            held_w = w;
+            held_a = a;
+        }
+
+        // Control: the placeholder plan (60, 31.9) at the same floor replaces the held pair on every op after the
+        // first, which is what filled the zone with superseded blocks inside one graph.
+        const size_t old_a     = 319 * mib / 10;
+        const size_t old_bare  = 60 * mib + old_a;
+        const size_t old_bound = ggml_sycl::zone_onednn_pp_pair_bound(old_bare + floor_b, old_bare, floor_b);
+        held_w                 = 0;
+        held_a                 = 0;
+        int replaced           = 0;
+        for (size_t i = 0; i < 5; ++i) {
+            size_t w = 0, a = 0;
+            ggml_sycl::zone_onednn_scratch_reserve_target(true, old_bound, held_w, held_a, 60 * mib, old_a,
+                                                          requests[i][0], requests[i][1], &w, &a);
+            if (i > 0 && (w != held_w || a != held_a)) {
+                ++replaced;
+            }
+            held_w = w;
+            held_a = a;
+        }
+        CHECK(replaced == 4, "the placeholder plan replaces the pair four times in the five-op layer");
+    }
+
     // ---- Case 14: the planned dense scratch is ONE reservation that follows the runtime n_ubatch (llama.cpp-kpjw) --
     // B70, full card, Qwen3.6-27B perplexity (-c 512 gives n_ctx 2048 with 4 sequences, n_batch 2048): the plan was
     // sized at the load-time n_ubatch (512, 10027264 B), auto-ubatch then chose 2048 (40108288 B), and the compute

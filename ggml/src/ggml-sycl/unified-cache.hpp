@@ -2957,6 +2957,15 @@ onednn_graph_scratch_planned_shape unified_cache_publish_planned_onednn_graph_sc
     const placement_kv_info &            kv_info,
     const ggml_sycl_placement_envelope * envelope);
 
+// The one definition of the oneDNN PP scratch pair a load plans into the ONEDNN zone (zone_onednn_pp_pair_plan over
+// `maxima`): its activations half is sized at the micro-batch of the Graph scratch shape above, the one the Graph floor
+// that shares the zone is sized at (the load's planning micro-batch when that shape names none). Both formula sites
+// call it: the inventory intake, whose pair is the one the arena sizes the zone from, and the plan's host zone sizing,
+// which reports it, so the two cannot size the zone differently.
+zone_onednn_pp_pair unified_cache_plan_onednn_pp_pair(const path_scoped_maxima &           maxima,
+                                                      const placement_kv_info &            kv_info,
+                                                      const ggml_sycl_placement_envelope * envelope);
+
 // llama.cpp-oyfl: the non-flash-attention batched mul_mat scratch floor.
 //
 // When flash attention is off (or resolves off at runtime), each layer's
@@ -2977,9 +2986,8 @@ onednn_graph_scratch_planned_shape unified_cache_publish_planned_onednn_graph_sc
 // The KQV call's staged operand is kq_soft_max, shaped
 // [n_kv, n_ubatch, n_head] -- at long context this dominates the KQ call's
 // staged Q operand ([head_dim, n_ubatch, n_head]), so the formula keeps only
-// this term, the same simplification the oneDNN activations-half placeholder
-// documented in docs/backend/sycl-memory-design.md's "Known limits" already
-// accepts. n_ctx stands in for n_kv the same way the oneDNN floor above uses
+// this term, accepting an under-count at a short context, where the Q operand
+// can be the larger and both are small. n_ctx stands in for n_kv the same way the oneDNN floor above uses
 // it for ne11: the planned/runtime context length is the worst-case n_kv a
 // layer's attention will ever see, and it is what every call site has on
 // hand. All-zero means "never planned for this device".

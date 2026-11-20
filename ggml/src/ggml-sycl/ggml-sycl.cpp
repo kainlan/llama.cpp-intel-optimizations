@@ -17761,34 +17761,17 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         g_tensor_inventory_total_size += info.size;
         max_tensor_bytes = std::max(max_tensor_bytes, info.size);
     }
-    // This — not plan.onednn_scratchpad_bytes — is what actually sizes the VRAM
-    // ONEDNN zone: it lands in g_planned_onednn_scratchpad_bytes[device] and is
-    // read back by ensure_planned_arena_zones. So it must be narrowed by the
-    // same structural classifier the plan uses, or the zone keeps paying for the
-    // vocabulary embedding / LM head, which no oneDNN matmul reorder ever sees.
+    // The maxima go through the same structural classifier the plan uses, or the
+    // zone keeps paying for the vocabulary embedding / LM head, which no oneDNN
+    // matmul reorder ever sees.
     // g_tensor_inventory_detail carries type and ne under the same validity
     // condition zone-sizing's has_shape() tests, so the classifier applies to it
     // directly.
     const ggml_sycl::path_scoped_maxima inventory_maxima =
         ggml_sycl::zone_scoped_maxima(ggml_sycl::unified_cache_adapt_zone_inventory(g_tensor_inventory_detail));
     GGML_ASSERT(inventory_maxima.any_tensor == max_tensor_bytes);
-    // Weights half expanded, activations half a placeholder -- this MUST stay
-    // identical to the formula in populate_host_zone_sizing (unified-cache.cpp,
-    // "8. oneDNN scratchpad"), where the reasoning for the two units is written
-    // out in full. The two sites size the same zone from the same maxima and
-    // will disagree silently if only one is changed: this one sets the real
-    // arena zone, the other only reports. Sizing the weights half from the
-    // stored bytes under-provisioned the zone by the quantization ratio
-    // (llama.cpp-2wgg).
-    g_tensor_inventory_onednn_scratchpad_bytes = inventory_maxima.onednn_reorder + inventory_maxima.onednn_eligible;
-    GGML_LOG_INFO(
-        "[SYCL-PLAN] inventory oneDNN scratchpad: %.1f MB (onednn_reorder %.1f MB + onednn_eligible %.1f MB; global "
-        "max %.1f MB)\n",
-        g_tensor_inventory_onednn_scratchpad_bytes / (1024.0 * 1024.0),
-        inventory_maxima.onednn_reorder / (1024.0 * 1024.0), inventory_maxima.onednn_eligible / (1024.0 * 1024.0),
-        max_tensor_bytes / (1024.0 * 1024.0));
-    ggml_sycl::unified_cache_set_planned_onednn_scratchpad_pair(ctx->device, inventory_maxima.onednn_reorder,
-                                                                inventory_maxima.onednn_eligible);
+    // The oneDNN scratchpad pair is published below, once the KV inputs give the context shape its activations half is
+    // sized at.
     // llama.cpp-479i: the dense MMQ/MMVQ Q8_1 src1 buffer is a planned byte. Sized here from the
     // same inventory maxima, at the load-time n_ubatch (512 when the loader says 0); the graph-entry
     // check ggml_sycl_mmq_src1_ensure_for_graph() sizes the exact demand at the real n_ubatch.
@@ -17871,6 +17854,31 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
             g_placement_kv_info.n_layer, g_placement_kv_info.n_embd_k_gqa, g_placement_kv_info.n_embd_v_gqa,
             g_placement_kv_info.n_ctx, g_placement_kv_info.n_ctx_is_runtime ? "runtime" : "conservative",
             g_placement_kv_info.kv_bytes_per_layer() / (1024.0 * 1024.0), g_placement_kv_info.n_ctx_context);
+    }
+
+    // The oneDNN PP scratch pair. This, not plan.onednn_scratchpad_bytes, is what sizes the VRAM ONEDNN zone: it lands
+    // in g_planned_onednn_scratchpad_bytes[device] and its halves, which ensure_planned_arena_zones reads back beside
+    // the Graph floor. unified_cache_plan_onednn_pp_pair is the one definition, which populate_host_zone_sizing
+    // (unified-cache.cpp, "8. oneDNN scratchpad") reports through too: the weights half is the largest dequantized
+    // eligible weight, the activations half n_ubatch rows of the widest f16 row of the weights the scratch takes, at
+    // the micro-batch of the Graph scratch shape this stage publishes before it sizes the zones. The pair and the
+    // floor are then sized for one shape at one ensure. The explicit micro-batch's publish (the dense RUNTIME scratch)
+    // does not re-plan the pair: that micro-batch is the context's (n_ubatch_context, capped at n_ctx), the one the
+    // Graph shape already takes when the load is told the context, so the pair is planned at it before the entry
+    // ensure and a re-publish would write the same value.
+    {
+        const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
+        const ggml_sycl::zone_onednn_pp_pair pair =
+            ggml_sycl::unified_cache_plan_onednn_pp_pair(inventory_maxima, g_placement_kv_info, envelope_arg);
+        g_tensor_inventory_onednn_scratchpad_bytes = pair.weights_bytes + pair.activations_bytes;
+        GGML_LOG_INFO(
+            "[SYCL-PLAN] inventory oneDNN scratchpad: %.1f MB (weights half onednn_reorder %.1f MB + activations half "
+            "%zu B/token x n_ubatch=%u = %.1f MB%s; global max %.1f MB)\n",
+            g_tensor_inventory_onednn_scratchpad_bytes / (1024.0 * 1024.0), pair.weights_bytes / (1024.0 * 1024.0),
+            pair.src1_bytes_per_token, pair.n_ubatch, pair.activations_bytes / (1024.0 * 1024.0),
+            pair.sized ? "" : ", overflowed, planned as 0", max_tensor_bytes / (1024.0 * 1024.0));
+        ggml_sycl::unified_cache_set_planned_onednn_scratchpad_pair(ctx->device, pair.weights_bytes,
+                                                                    pair.activations_bytes);
     }
 
     g_moe_n_experts_total             = inventory->n_expert;
