@@ -317,3 +317,11 @@ def test_witness_context_sizes_at_the_planning_micro_batch():
 def test_witness_raise_lowers():
     m = mutate_in(UC, RAISE_SIG, RAISE_LOOP, "term.store(bytes, std::memory_order_release);")
     assert not claim_context_raises_the_bound(GS, m)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

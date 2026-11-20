@@ -737,13 +737,15 @@ def test_probe_branch_ordering_has_a_mutation_witness():
     # ring-replan success branch at 8), since "    if (probe_mode) {\n" is itself a trailing substring of both.
     # So the indent narrows the candidates and the CONTENT picks the branch: the exit branch is the only one whose
     # own text captures a rollback result into `rollback_ok` (_ROLLBACK_CAPTURE). This looks for that capture in the
-    # raw text up to the branch's first ACCEPTED return; _find_probe_exit_branch() looks for it in comment-stripped
-    # text within a fixed window after the `if`. The two are separate searches. If they ever disagree, the re-find
-    # assertion further down fires only when the helper finds nothing in the mutated text; when the helper still
-    # finds the real, unmoved branch, the ordering assertion at the end fails instead, with its "branch still appears
-    # to precede it" message, which then points at the wrong cause.
+    # raw text up to the branch's first ACCEPTED return, when that return closes the branch itself (a 4-space probe
+    # branch that closes earlier, in a helper above the transaction, is not a candidate); _find_probe_exit_branch()
+    # looks for it in comment-stripped text within a fixed window after the `if`. The two are separate searches. If
+    # they ever disagree, the re-find assertion further down fires only when the helper finds nothing in the mutated
+    # text; when the helper still finds the real, unmoved branch, the ordering assertion at the end fails instead, with
+    # its "branch still appears to precede it" message, which then points at the wrong cause.
     branch_start_marker = "\n    if (probe_mode) {\n"
     branch_end_marker = "        return ggml_sycl_txn_result::ACCEPTED;\n    }\n"
+    branch_close_marker = "\n    }\n"
     publish_marker = "    ggml_sycl_publish_prepared_plan_locked(prepared_publication);\n"
 
     candidates = []
@@ -760,6 +762,10 @@ def test_probe_branch_ordering_has_a_mutation_witness():
         if candidate_end == -1:
             continue  # a 4-space probe branch with no ACCEPTED exit after it (the loan transaction's)
         candidate_end += len(branch_end_marker)
+        # The branch's own text ends at its own closing brace, the first one at its indent: a branch that closes
+        # before that ACCEPTED exit (a helper's probe branch above the transaction) does not own the exit.
+        if raw.find(branch_close_marker, candidate_start) + len(branch_close_marker) != candidate_end:
+            continue
         if _ROLLBACK_CAPTURE in raw[candidate_start:candidate_end]:
             candidates.append((candidate_start, candidate_end))
     assert len(candidates) == 1, (
