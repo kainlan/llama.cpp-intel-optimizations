@@ -73,6 +73,15 @@ REMOVED_WORDS = (
     "reorder_temp_buffer_",
     "ggml_sycl_gpu_reorder_disabled",
     "GGML_SYCL_NO_GPU_REORDER",
+    # The prestage's GPU-side AOS to SOA fill and the kernels only it launched.
+    "ggml_sycl_fill_reordered_gpu",
+    "ggml_sycl_gpu_reorder_fill_ctx",
+    "ggml_sycl_reorder_weight_gpu",
+    "reorder_q4_0_gpu",
+    "reorder_q8_0_gpu",
+    "reorder_q4_k_gpu",
+    "reorder_q6_k_gpu",
+    "reorder_mxfp4_gpu",
 )
 REMOVED_TAGS = ("[MOE-WARMUP]", "[MOE-GATE-NORM]", "[MOE-RERANK]", "[ADAPTIVE-PRESTAGE]")
 

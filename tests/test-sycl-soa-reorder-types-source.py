@@ -14,17 +14,17 @@ is the single list. Its readers:
 
 The fill itself is the materializer: every per-type switch of reorder kernels
 (reorder_aos_to_soa_device, reorder_rows_to_soa, reorder_data_internal_,
-ggml_sycl_reorder_weight_gpu, ggml_sycl_reorder_weight_cpu and the size helper
-ggml_sycl_reorder_expected_size) must carry exactly the table's types, so the
-table cannot name a type the fill has no kernel for (the planner would then plan
-a layout nothing materializes) nor omit one it has (a kernel nothing reaches).
+ggml_sycl_reorder_weight_cpu and the size helper ggml_sycl_reorder_expected_size)
+must carry exactly the table's types, so the table cannot name a type the fill
+has no kernel for (the planner would then plan a layout nothing materializes) nor
+omit one it has (a kernel nothing reaches).
 
 The other readers are the buffer-side eligibility checks (init_tensor, set_tensor,
 should_cpu_reorder, reorder_tensor_to_soa, the dispatch's type_has_reorder_support):
 none may keep a private `type == Q4_0 || ... || type == MXFP4` chain. The chain scan
 is narrow on purpose and flags only a statement that compares against all five
 table types with ==/!=, the type literal on the right, in ggml-sycl.cpp,
-unified-cache.cpp or common.hpp; `switch` statements are exempt (the six fill
+unified-cache.cpp or common.hpp; `switch` statements are exempt (the five fill
 switches are held to the table by the exact-set check above).
 
 ggml_sycl_supports_reorder_mmvq (ggml-sycl.cpp) is an intentionally SEPARATE fact
@@ -148,7 +148,6 @@ FILL_SWITCH_SIGS = {
     "reorder_aos_to_soa_device": (r"static\s+bool\s+reorder_aos_to_soa_device\s*\(", "backend"),
     "reorder_rows_to_soa": (r"\bbool\s+reorder_rows_to_soa\s*\(", "backend"),
     "reorder_data_internal_": (r"static\s+bool\s+reorder_data_internal_\s*\(", "backend"),
-    "ggml_sycl_reorder_weight_gpu": (r"(?:static\s+)?sycl::event\s+ggml_sycl_reorder_weight_gpu\s*\(", "backend"),
     "ggml_sycl_reorder_weight_cpu": (r"static\s+bool\s+ggml_sycl_reorder_weight_cpu\s*\(", "backend"),
     "ggml_sycl_reorder_expected_size": (r"static\s+bool\s+ggml_sycl_reorder_expected_size\s*\(", "backend"),
 }

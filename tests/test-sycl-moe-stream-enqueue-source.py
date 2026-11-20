@@ -2453,42 +2453,38 @@ def test_context_mutants():
     assert not claim_context_owns_and_ends_the_phase(COMMON, late)
 
 
-REORDER_DEF = "sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue,"
-LOAD_FILL = "ggml_sycl_reorder_weight_gpu(queue, static_cast<const uint8_t *>(temp_vram),"
-
-
+REORDER_DEF = "static sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue,"
 REORDER_DECL = ("sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue, const uint8_t * aos_device, "
                 "uint8_t * soa_device, ggml_type type, int64_t ncols, int64_t nrows, size_t src_bytes, "
                 "const std::vector<sycl::event> & deps);")
+REORDER_NAME = "ggml_sycl_reorder_weight_gpu"
 
 
-def claim_reorder_is_the_load_fills_own(sycl: str, hpp: str) -> bool:
-    """The load path's reorder dispatch is a static function of ggml-sycl.cpp, defined once and called once, by the
-    load-time fill, and moe-stream-plan.hpp names it nowhere outside comments: the SOA staging that shared it is
-    retired, and the ring copies AOS and reorders nothing (test_window_copy_is_the_only_submission)."""
-    n = norm(sycl)
-    return (n.count("static " + REORDER_DEF) == 1 and n.count(REORDER_DEF) == 1
-            and n.count(REORDER_CALL) == 2 and n.count(LOAD_FILL) == 1 and REORDER_CALL not in norm(hpp))
+def claim_no_gpu_reorder_dispatch(sycl: str, hpp: str) -> bool:
+    """No GPU-side AOS-to-SOA reorder dispatch is left: ggml-sycl.cpp neither defines nor calls it, and
+    moe-stream-plan.hpp declares it nowhere. Its one caller was the removed MoE prestage's fill; the weight-load fill
+    reorders through reorder_aos_to_soa_device, and the ring copies AOS and reorders nothing
+    (test_window_copy_is_the_only_submission)."""
+    return REORDER_NAME not in norm(sycl) and REORDER_NAME not in norm(hpp)
 
 
-def test_reorder_is_the_load_fills_own():
-    assert claim_reorder_is_the_load_fills_own(SYCL, PLAN_HPP), first_missing(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the reorder is also searched for in "
-        "moe-stream-plan.hpp, where it must be absent)",
-        norm(SYCL),
-        "static " + REORDER_DEF, REORDER_CALL, LOAD_FILL)
+def test_no_gpu_reorder_dispatch():
+    assert claim_no_gpu_reorder_dispatch(SYCL, PLAN_HPP), (
+        f"{REORDER_NAME} is back in ggml/src/ggml-sycl/ggml-sycl.cpp or moe-stream-plan.hpp")
 
 
-def test_reorder_load_fill_mutants():
-    c = claim_reorder_is_the_load_fills_own
+def test_no_gpu_reorder_dispatch_mutants():
+    c = claim_no_gpu_reorder_dispatch
     # The stream header declares it again.
     assert not c(SYCL, mutate(PLAN_HPP, "namespace ggml_sycl {", REORDER_DECL + " namespace ggml_sycl {"))
-    # The definition is external again.
-    assert not c(mutate(SYCL, "static " + REORDER_DEF, REORDER_DEF), PLAN_HPP)
-    # A second caller.
-    assert not c(mutate(SYCL, LOAD_FILL, REORDER_CALL + "q2, a, s, t, c, r, b, d); " + LOAD_FILL), PLAN_HPP)
-    # The load-time fill moved off the dispatch.
-    assert not c(mutate(SYCL, LOAD_FILL, "other_reorder(queue, static_cast<const uint8_t *>(temp_vram),"), PLAN_HPP)
+    # The backend defines it again.
+    assert not c(mutate(SYCL, "static bool ggml_sycl_graph_has_host_inputs(",
+                        REORDER_DEF + " const uint8_t * a, uint8_t * s, ggml_type t, int64_t c, int64_t r, size_t b, "
+                        "const std::vector<sycl::event> & d); static bool ggml_sycl_graph_has_host_inputs("), PLAN_HPP)
+    # A call comes back.
+    assert not c(mutate(SYCL, "static bool ggml_sycl_graph_has_host_inputs(",
+                        "static void f(sycl::queue & q) { (void) " + REORDER_NAME + "(q, nullptr, nullptr, "
+                        "GGML_TYPE_Q4_0, 0, 0, 0, {}); } static bool ggml_sycl_graph_has_host_inputs("), PLAN_HPP)
 
 
 # ---- the trace -------------------------------------------------------------------------------------------------------

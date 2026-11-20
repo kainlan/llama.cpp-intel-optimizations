@@ -4503,9 +4503,9 @@ endif()
 
 # llama.cpp-76os: source gate -- the SOA-reorder type table
 # (ggml/src/ggml-sycl/soa-reorder-types.hpp) is the one list of types whose
-# AOS->SOA reorder exists. The six per-type fill switches (reorder_aos_to_soa_device,
-# reorder_rows_to_soa, reorder_data_internal_, ggml_sycl_reorder_weight_gpu,
-# ggml_sycl_reorder_weight_cpu, ggml_sycl_reorder_expected_size) must carry exactly
+# AOS->SOA reorder exists. The five per-type fill switches (reorder_aos_to_soa_device,
+# reorder_rows_to_soa, reorder_data_internal_, ggml_sycl_reorder_weight_cpu,
+# ggml_sycl_reorder_expected_size) must carry exactly
 # its types; the runtime clamp, reorder_tensor_to_soa, the partial-row fill and
 # layout_policy::get_optimal (the planner's layout source) must read it; and a chain
 # comparing against all five types is flagged. Host-only, reads the sources as text.
