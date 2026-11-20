@@ -131,6 +131,35 @@
 //                           FILE_MAPPED on the device before the loan. Then the same on a plan that maps nothing,
 //                           PINNED throughout.
 //
+// The named move's admit, through the same transaction, each host triplet copied to the pinned pool and registered
+// as S1-PRELOAD registers an expert the plan keeps on the host:
+//
+//   admit_zero_fills_a_padded_tail
+//                           The resolver reports Q4_0 rows of 640 columns, so each device copy is minted 216 bytes
+//                           past the host bytes. With the free WEIGHT zone poisoned first (each tail checked to lie in
+//                           poisoned storage), one admit moves the triplet: accepted with its outcome "OK", three
+//                           staged sizes admitted, no staged copy, a new plan, no ledger or teardown count written.
+//                           Each record covers the host bytes from offset 0, each entry resolves on the device at the
+//                           staged size, the payload equals the host bytes and the tail reads zero.
+//   admit_refuses_a_file_mapped_member
+//                           A triplet whose gate copy is served from a file mapping, named before a pinned triplet:
+//                           the first is REFUSED "host copy not pinned" and stays on the host with its entries and
+//                           records, the second moves, the call is accepted with the refusal as its reason, and the
+//                           WEIGHT zone keeps nothing of the refused triplet.
+//   admit_is_busy_while_lent_or_the_zone_is_full
+//                           With a loan outstanding the admit is BUSY "loans outstanding"; after the refill, with room
+//                           for one member, BUSY "WEIGHT zone full" and the room comes back. Neither publishes or
+//                           moves anything. With the room back the admit moves the triplet, and the teardown counts
+//                           stay the loan's and the refill's, 1/1.
+//   admit_returns_the_host_zone_bytes
+//                           The WEIGHT host zone counts the three pinned host copies, and within 2 s of the admit their
+//                           host entries are gone and the zone uses what it did before they were pinned.
+//   admit_completes_a_block_read_through_its_table
+//                           The admit of a block's only host triplet leaves every expert of the block on the device.
+//                           The three pointer tables built right after it, with no wait, for a ubatch routing that
+//                           expert each chain a ready event and name the admitted device copy, and a kernel behind
+//                           each upload on the same stream reads the original bytes through the table.
+//
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
 // without staging. Every lend in the refill cases checks it. The zones cannot be unconfigured, so the one case that
@@ -208,6 +237,13 @@ int main() {
                    ggml_sycl::test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph);
     ok &= run_case("loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned",
                    ggml_sycl::test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned);
+    ok &= run_case("admit_zero_fills_a_padded_tail", ggml_sycl::test_expert_admit_zero_fills_a_padded_tail);
+    ok &= run_case("admit_refuses_a_file_mapped_member", ggml_sycl::test_expert_admit_refuses_a_file_mapped_member);
+    ok &= run_case("admit_is_busy_while_lent_or_the_zone_is_full",
+                   ggml_sycl::test_expert_admit_is_busy_while_lent_or_the_zone_is_full);
+    ok &= run_case("admit_returns_the_host_zone_bytes", ggml_sycl::test_expert_admit_returns_the_host_zone_bytes);
+    ok &= run_case("admit_completes_a_block_read_through_its_table",
+                   ggml_sycl::test_expert_admit_completes_a_block_read_through_its_table);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;
