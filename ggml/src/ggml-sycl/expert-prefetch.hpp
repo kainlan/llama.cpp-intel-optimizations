@@ -345,8 +345,10 @@ class ExpertPredictor {
     // Checked by ExpertPrefetcher to short-circuit hint().
     bool is_prefetch_disabled() const;
 
-    // Get frequency ranking for a layer: sorted (expert_id, count) pairs,
-    // most-activated first. Used for popularity-based prestage ordering.
+    // Frequency ranking for a layer from the counts record_actual() keeps: sorted
+    // (expert_id, count) pairs, most-activated first. No backend code reads it; the
+    // predictor guard test calls it as one of the accessors that must take mutex_
+    // before the init guard.
     std::vector<std::pair<int, uint32_t>> get_frequency_ranking(int layer_idx) const;
 
   private:

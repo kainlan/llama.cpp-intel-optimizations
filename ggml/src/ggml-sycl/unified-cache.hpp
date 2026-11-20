@@ -5040,8 +5040,7 @@ class unified_cache {
 
     void set_into_empty_foreign_key(uint64_t key) { into_empty_foreign_key_.store(key, std::memory_order_release); }
 
-    // Access the internal SYCL queue (for deferred free of temp allocations
-    // made on this queue's context, e.g. GPU-side reorder temp buffers).
+    // The queue the cache was built on (queue_), which the cache's own allocations and copies use.
     sycl::queue & get_queue() { return queue_; }
 
     // Memset/memcpy operations that dispatch to GPU or CPU based on handle location.

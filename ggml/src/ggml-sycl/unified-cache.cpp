@@ -7461,12 +7461,12 @@ unified_cache::unified_cache(sycl::queue & queue,
         dma_queue_.reset();
     }
 
-    // Create a BCS (copy-only) queue for H2D transfers during expert prestaging.
-    // On Intel GPUs, Level Zero exposes queue groups: ordinal 0 = CCS (compute+copy),
-    // ordinal 1 = BCS (copy-only / blitter).  By routing H2D memcpy to a separate
-    // in-order queue, the runtime can assign it to the BCS engine, keeping CCS free
-    // for SOA reorder kernels.  This prevents CCS monopolization during the ~6000
-    // kernel submissions of MoE expert prestaging that trigger GT engine resets.
+    // Create a BCS (copy-only) queue for host-to-device transfers: the model-load weight
+    // preload, the planned expert materialization and the MoE stream ring's window copies
+    // submit their copies here. On Intel GPUs, Level Zero exposes queue groups: ordinal
+    // 0 = CCS (compute+copy), ordinal 1 = BCS (copy-only / blitter).  By routing H2D
+    // memcpy to a separate in-order queue, the runtime can assign it to the BCS engine,
+    // keeping CCS free for compute and the SOA reorder kernels that follow the copies.
     //
     // Even if the runtime routes both queues to CCS, having separate queues still
     // enables pipelining: H2D copies and reorder kernels interleave via event deps

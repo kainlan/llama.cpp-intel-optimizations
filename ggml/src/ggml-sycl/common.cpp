@@ -760,7 +760,7 @@ static void watchdog_thread_fn(int64_t timeout_ms) {
                     "[SYCL-WATCHDOG] in that time: a hung submit, or one command or graph segment slower than\n"
                     "[SYCL-WATCHDOG] the timeout. Forcing cleanup + _Exit(1).\n"
                     "[SYCL-WATCHDOG] Set GGML_SYCL_OP_TIMEOUT_MS=0 to disable, or raise the value for\n"
-                    "[SYCL-WATCHDOG] known-slow workloads (large model prestage, cold warmup).\n",
+                    "[SYCL-WATCHDOG] known-slow workloads (large model weight preload, cold warmup).\n",
                     elapsed_ms, (long long) timeout_ms, n_devices);
             fflush(stderr);
             // llama.cpp-qwn5: _Exit runs no destructor, so a CPU expert job's event would stay unsignalled and a
