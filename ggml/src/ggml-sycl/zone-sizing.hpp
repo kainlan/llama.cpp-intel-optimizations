@@ -276,6 +276,33 @@ bool zone_moe_mmvq_scratch_bytes(const std::vector<zone_moe_mmvq_operand> & ops,
                                  int64_t                                    n_expert_used,
                                  zone_moe_mmvq_scratch *                    out);
 
+// The SCRATCH zone's size. `required` is what the zone must hold: the arena's default (`default_bytes`) or the non-FA
+// attention scratch estimate (`nonfa_bytes`), whichever is larger, which has no other place to go. `wanted` is what the
+// zone is sized to: `required` or the MoE batched MMVQ bound (`moe_mmvq_bytes`), whichever is larger. The bound is
+// zone_moe_mmvq_scratch::graph at the context's micro-batch, every expert op's buffers at once: an op's buffers are
+// released by a thread that waits on the op's completion event, and nothing on the prompt path makes a later op's
+// allocation wait for that release, so no depth smaller than the op count holds by construction. A request of those
+// ops the zone cannot place is served from raw device memory and counted as a miss: an allocation no plan counted,
+// which a card with no room outside the arena cannot serve, so the zone is planned for the whole bound. A zone that
+// live allocations keep below the bound is still served that way, so it is kept rather than refused. Pure.
+struct zone_scratch_plan {
+    size_t required = 0;
+    size_t wanted   = 0;
+};
+
+zone_scratch_plan zone_scratch_zone_plan(size_t default_bytes, size_t nonfa_bytes, size_t moe_mmvq_bytes);
+
+// The SCRATCH bytes a rebuild that something live blocks asks of a zone of `capacity_bytes`: `plan.wanted` when the
+// zone holds it (nothing to keep) or when it holds less than `plan.required` (it is short of what it must hold), and
+// the capacity itself between the two, where only the MoE batched MMVQ bound is short and the zone is kept as it is.
+// Pure.
+size_t zone_scratch_kept_bytes(const zone_scratch_plan & plan, size_t capacity_bytes);
+
+// Whether a call that kept the SCRATCH zone short logs its WARN: once per figure the zone is kept short of. A call
+// that wants more than the device's last WARN named (`latched_wanted_bytes`, 0 for none) warns again; a later plan
+// that asks the same figure, or less, does not. Pure.
+bool zone_kept_scratch_warn_due(size_t latched_wanted_bytes, size_t wanted_bytes);
+
 // ---------------------------------------------------------------------------
 // dense f16 dequant scratch (llama.cpp-479i)
 // ---------------------------------------------------------------------------

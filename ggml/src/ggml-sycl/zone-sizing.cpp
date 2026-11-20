@@ -351,6 +351,24 @@ bool zone_moe_mmvq_scratch_bytes(const std::vector<zone_moe_mmvq_operand> & ops,
     return exact;
 }
 
+zone_scratch_plan zone_scratch_zone_plan(size_t default_bytes, size_t nonfa_bytes, size_t moe_mmvq_bytes) {
+    zone_scratch_plan plan;
+    plan.required = std::max(default_bytes, nonfa_bytes);
+    plan.wanted   = std::max(plan.required, moe_mmvq_bytes);
+    return plan;
+}
+
+size_t zone_scratch_kept_bytes(const zone_scratch_plan & plan, size_t capacity_bytes) {
+    if (capacity_bytes >= plan.wanted || capacity_bytes < plan.required) {
+        return plan.wanted;
+    }
+    return capacity_bytes;
+}
+
+bool zone_kept_scratch_warn_due(size_t latched_wanted_bytes, size_t wanted_bytes) {
+    return wanted_bytes > latched_wanted_bytes;
+}
+
 bool zone_dequant_f16_weight_bytes(int64_t ne0, int64_t ne1, size_t * out) {
     if (!out || ne0 <= 0 || ne1 <= 0) {
         return false;

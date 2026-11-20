@@ -28,6 +28,7 @@
 #include "zone-sizing.hpp"
 #include "zone-used-count.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
@@ -3446,6 +3447,106 @@ int main() {
         CHECK(!zone_moe_mmvq_scratch_bytes({ one_block, one_block }, half, 1, &scratch) &&
                   scratch.per_op == (size_t(1) << 63) + 32 && scratch.graph == SIZE_MAX,
               "the sum overflow did not saturate the graph bound alone");
+    }
+
+    // ---- Case 47: the SCRATCH zone's size, raised by the MoE batched MMVQ bound at the context's micro-batch -------
+    // The bound is every expert op's buffers at once (zone_scratch_plan says why no smaller depth holds). The vehicle
+    // is Case 46's. Its down op holds 4640 bytes a row, the figure the zone's use line measured (2.27 MB at 512 rows
+    // and 9.06 MB at 2048, one op live), and gate and up 2336 each. The expected zones below are the rule applied to
+    // those per-row figures: the larger of the default and layers x (2 x 2336 + 4640) x rows.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_kept_scratch_warn_due;
+        using ggml_sycl::zone_moe_mmvq_op_bytes;
+        using ggml_sycl::zone_moe_mmvq_operand;
+        using ggml_sycl::zone_moe_mmvq_scratch;
+        using ggml_sycl::zone_moe_mmvq_scratch_bytes;
+        using ggml_sycl::zone_scratch_kept_bytes;
+        using ggml_sycl::zone_scratch_plan;
+        using ggml_sycl::zone_scratch_zone_plan;
+
+        const size_t                default_bytes = 512 * MiB;
+        const zone_moe_mmvq_operand gate{ 2048, false };
+        const zone_moe_mmvq_operand down{ 512, true };
+        size_t                      down_row = 0;
+        size_t                      gate_row = 0;
+        CHECK(zone_moe_mmvq_op_bytes(down, 1, 8, &down_row) && down_row == 4640,
+              "the down op does not hold the measured 4640 bytes a row");
+        CHECK(zone_moe_mmvq_op_bytes(gate, 1, 8, &gate_row) && gate_row == 2336,
+              "the gate op does not hold 2336 bytes a row");
+        const size_t layer_row = 2 * gate_row + down_row;
+
+        // The late plan reads the tensors the load created: 40 layers. The early plan reads the file's weights, which
+        // hold the MTP block's experts too: 41 layers.
+        std::vector<zone_moe_mmvq_operand> main_graph;
+        for (int layer = 0; layer < 40; ++layer) {
+            main_graph.insert(main_graph.end(), { gate, gate, down });
+        }
+        std::vector<zone_moe_mmvq_operand> with_mtp = main_graph;
+        with_mtp.insert(with_mtp.end(), { gate, gate, down });
+
+        zone_moe_mmvq_scratch scratch;
+        CHECK(zone_moe_mmvq_scratch_bytes(main_graph, 512, 8, &scratch), "the vehicle at 512 rows did not size");
+        zone_scratch_plan plan = zone_scratch_zone_plan(default_bytes, 0, scratch.graph);
+        CHECK(plan.required == default_bytes && plan.wanted == default_bytes,
+              "at 512 rows the bound (181.9 MiB) moved the zone off its default");
+        CHECK(plan.wanted == std::max(default_bytes, 40 * layer_row * 512), "the zone at 512 rows is not the rule's");
+
+        CHECK(zone_moe_mmvq_scratch_bytes(main_graph, 2048, 8, &scratch), "the vehicle at 2048 rows did not size");
+        plan = zone_scratch_zone_plan(default_bytes, 0, scratch.graph);
+        CHECK(plan.required == default_bytes && plan.wanted == 40 * layer_row * 2048 && plan.wanted > default_bytes,
+              "at 2048 rows the zone is not the bound (727.5 MiB)");
+        CHECK(zone_moe_mmvq_scratch_bytes(with_mtp, 2048, 8, &scratch), "the early plan at 2048 rows did not size");
+        CHECK(zone_scratch_zone_plan(default_bytes, 0, scratch.graph).wanted == 41 * layer_row * 2048,
+              "the early plan's 123 ops at 2048 rows do not ask 745.7 MiB");
+
+        // Monotone in the micro-batch, never below the default, and the rule's at every row count to 4096. The bound
+        // passes the default between 1441 and 1442 rows (512 MiB / 372480 bytes a row is 1441.3).
+        size_t previous = 0;
+        for (int64_t rows = 1; rows <= 4096; ++rows) {
+            CHECK(zone_moe_mmvq_scratch_bytes(main_graph, rows, 8, &scratch), "the vehicle did not size");
+            const size_t wanted = zone_scratch_zone_plan(default_bytes, 0, scratch.graph).wanted;
+            CHECK(wanted >= previous, "the zone shrank as the micro-batch grew");
+            CHECK(wanted == std::max(default_bytes, 40 * layer_row * size_t(rows)), "the zone is not the rule's");
+            previous = wanted;
+        }
+        CHECK(zone_moe_mmvq_scratch_bytes(main_graph, 1441, 8, &scratch) &&
+                  zone_scratch_zone_plan(default_bytes, 0, scratch.graph).wanted == default_bytes,
+              "the zone left its default below 1441.3 rows");
+        CHECK(zone_moe_mmvq_scratch_bytes(main_graph, 1442, 8, &scratch) &&
+                  zone_scratch_zone_plan(default_bytes, 0, scratch.graph).wanted > default_bytes,
+              "the zone stayed at its default above 1441.3 rows");
+
+        // The non-FA estimate raises what the zone must hold; the bound raises only what it is sized to.
+        plan = zone_scratch_zone_plan(default_bytes, 640 * MiB, 100 * MiB);
+        CHECK(plan.required == 640 * MiB && plan.wanted == 640 * MiB, "a bound under the non-FA raise moved the zone");
+        plan = zone_scratch_zone_plan(default_bytes, 640 * MiB, 700 * MiB);
+        CHECK(plan.required == 640 * MiB && plan.wanted == 700 * MiB, "the bound is not on top of the non-FA raise");
+        plan = zone_scratch_zone_plan(default_bytes, 100 * MiB, 0);
+        CHECK(plan.required == default_bytes && plan.wanted == default_bytes,
+              "a small non-FA estimate shrank the zone");
+        plan = zone_scratch_zone_plan(16 * MiB, 0, 0);
+        CHECK(plan.required == 16 * MiB && plan.wanted == 16 * MiB, "a zone with no raise is not its default");
+
+        // A rebuild something live blocks keeps a zone short of the bound alone, and asks the whole plan of one short
+        // of what it must hold, or of one that holds it all.
+        plan = zone_scratch_zone_plan(default_bytes, 0, 40 * layer_row * 2048);
+        CHECK(zone_scratch_kept_bytes(plan, 1024 * MiB) == plan.wanted, "a zone that holds the bound was kept short");
+        CHECK(zone_scratch_kept_bytes(plan, plan.wanted) == plan.wanted, "a zone of exactly the bound was kept short");
+        CHECK(zone_scratch_kept_bytes(plan, 600 * MiB) == 600 * MiB, "a zone short of the bound alone was not kept");
+        CHECK(zone_scratch_kept_bytes(plan, default_bytes) == default_bytes,
+              "a zone of exactly what it must hold was not kept");
+        CHECK(zone_scratch_kept_bytes(plan, 256 * MiB) == plan.wanted,
+              "a zone short of what it must hold was kept as if only the bound were short");
+        plan = zone_scratch_zone_plan(default_bytes, 640 * MiB, 700 * MiB);
+        CHECK(zone_scratch_kept_bytes(plan, 600 * MiB) == 700 * MiB, "a zone short of the non-FA raise was kept");
+        CHECK(zone_scratch_kept_bytes(plan, 660 * MiB) == 660 * MiB, "a zone that holds the non-FA raise was not kept");
+
+        // The kept zone's WARN: once per figure, again only for a larger one.
+        CHECK(zone_kept_scratch_warn_due(0, 700 * MiB), "the first keep did not warn");
+        CHECK(!zone_kept_scratch_warn_due(700 * MiB, 700 * MiB), "a keep of the same figure warned again");
+        CHECK(!zone_kept_scratch_warn_due(745 * MiB, 700 * MiB), "a keep of a smaller figure warned again");
+        CHECK(zone_kept_scratch_warn_due(700 * MiB, 745 * MiB), "a keep of a larger figure did not warn");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
