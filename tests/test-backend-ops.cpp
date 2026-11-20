@@ -55,11 +55,12 @@
 // base seed, so a failing draw can be run again: GGML_TEST_SEED=<n> sets the base, and without it the run draws one.
 // Either way the run prints it once as "[TEST-SEED] base=<n>". The k-th draw is the same in every run that has the
 // same base and the same list of test cases (so the same -o and -p filters) and runs them with one worker (no -j > 1:
-// workers take draws in the order they reach them). Not seeded: every other initializer in this file (the attention
-// masks, the rand() and std::random_device draws of other ops' index tensors), which draw fresh values each run.
+// workers take draws in the order they reach them). Not derived from this seed: every other initializer in this file.
+// Of those, the attention masks and the rand() and std::random_device draws of other ops' index tensors draw fresh
+// values each run; the others use fixed seeds of their own.
 static uint32_t test_seed_next() {
     static const uint32_t base = [] {
-        const char *   env  = getenv("GGML_TEST_SEED");
+        const char *   env = getenv("GGML_TEST_SEED");
         const uint32_t seed =
             (env != nullptr && *env != '\0') ? (uint32_t) strtoul(env, nullptr, 0) : std::random_device{}();
         printf("[TEST-SEED] base=%u\n", seed);
@@ -67,7 +68,7 @@ static uint32_t test_seed_next() {
     }();
     static std::atomic<uint32_t> counter{ 0 };
     // A splitmix-style finalizer of base + k * golden ratio: distinct, well-mixed engine seeds for consecutive k.
-    uint32_t x = base + 0x9E3779B9u * (counter.fetch_add(1, std::memory_order_relaxed) + 1);
+    uint32_t                     x = base + 0x9E3779B9u * (counter.fetch_add(1, std::memory_order_relaxed) + 1);
     x ^= x >> 16;
     x *= 0x85EBCA6Bu;
     x ^= x >> 13;
@@ -90,7 +91,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         // Each slice draws from its own engine, seeded on this thread before the slice is handed out, so the values do
         // not depend on which pool thread runs which slice.
         auto init_thread = [&](size_t start, size_t end, uint32_t seed) {
-            std::default_random_engine gen(seed);
+            std::default_random_engine            gen(seed);
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -5258,8 +5259,10 @@ struct test_mul_mat_w4a4 : public test_mul_mat {
 // GGML_TEST_MMID_TRACE=1 prints, per ids tensor, how many rows name each expert in each of the first four id columns,
 // as "[MMID-IDS] seed=<s> rows=<n> n_mats=<e> col0:<c0>,<c1>,... col1:...". With n_used columns in use, the rows an
 // expert receives are the sum of its counts over the first n_used columns.
-static void print_mul_mat_id_ids(const ggml_tensor * t, const std::vector<int64_t> & counts, int n_mats,
-                                 uint32_t seed) {
+static void print_mul_mat_id_ids(const ggml_tensor *          t,
+                                 const std::vector<int64_t> & counts,
+                                 int                          n_mats,
+                                 uint32_t                     seed) {
     printf("[MMID-IDS] seed=%u rows=%lld n_mats=%d", seed, (long long) ggml_nrows(t), n_mats);
     for (int c = 0; c < t->ne[0] && c < 4; c++) {
         printf(" col%d:", c);
@@ -5432,15 +5435,15 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
 // smallest group above it, and an expert no row names, in every run. The random cases reach those sizes only by
 // chance. "groups=" in vars() lists the counts per expert, so -p 'groups=' selects these cases.
 struct test_mul_mat_id_groups : public test_mul_mat_id {
-    std::vector<int64_t> groups; // selections per expert, summing to n * n_used
+    std::vector<int64_t> groups;  // selections per expert, summing to n * n_used
 
     static std::vector<int64_t> make_groups(int n_mats, int n_used, int64_t n) {
         static const int64_t fixed[] = { 1, 8, 9, 0 };
         const int            n_fixed = (int) (sizeof(fixed) / sizeof(fixed[0]));
         GGML_ASSERT(n_mats > n_fixed);
         std::vector<int64_t> g(fixed, fixed + n_fixed);
-        const int64_t rest   = n * n_used - (1 + 8 + 9);
-        const int64_t n_rest = n_mats - n_fixed;
+        const int64_t        rest   = n * n_used - (1 + 8 + 9);
+        const int64_t        n_rest = n_mats - n_fixed;
         GGML_ASSERT(rest >= 0);
         for (int64_t e = 0; e < n_rest; e++) {
             g.push_back(rest / n_rest + (e < rest % n_rest ? 1 : 0));
@@ -5448,9 +5451,9 @@ struct test_mul_mat_id_groups : public test_mul_mat_id {
         return g;
     }
 
-    test_mul_mat_id_groups(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k)
-        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k),
-          groups(make_groups(n_mats, n_used, n)) {
+    test_mul_mat_id_groups(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k) :
+        test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k),
+        groups(make_groups(n_mats, n_used, n)) {
         for (int64_t g : groups) {
             // An expert named by more than n selections would have to appear twice in some row.
             GGML_ASSERT(g <= n);
@@ -5515,9 +5518,7 @@ struct test_mul_mat_id_groups : public test_mul_mat_id {
         set_ids(ctx);
     }
 
-    void reinit_perf_iter(ggml_context * ctx) override {
-        set_ids(ctx);
-    }
+    void reinit_perf_iter(ggml_context * ctx) override { set_ids(ctx); }
 };
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
@@ -10980,13 +10981,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Constructed expert groups of 1, 8, 9 and 0 rows (test_mul_mat_id_groups) for the two types that have
     // reordered MoE layouts on the SYCL backend, at n = 33 (the first batch above the 32-row fused MoE ceiling) and
     // n = 129 (above the 128-row MoE prompt threshold). MXFP4 also runs with two experts per row.
-    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_MXFP4}) {
-        for (int n_used : {1, 2}) {
+    for (ggml_type type_a : { GGML_TYPE_Q8_0, GGML_TYPE_MXFP4 }) {
+        for (int n_used : { 1, 2 }) {
             if (n_used == 2 && type_a != GGML_TYPE_MXFP4) {
                 continue;
             }
-            for (bool b : {false, true}) {
-                for (int64_t n : {33, 129}) {
+            for (bool b : { false, true }) {
+                for (int64_t n : { 33, 129 }) {
                     test_cases.emplace_back(new test_mul_mat_id_groups(type_a, 8, n_used, b, 512, n, 256));
                 }
             }
