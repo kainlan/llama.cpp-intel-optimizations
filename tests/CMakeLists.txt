@@ -4751,6 +4751,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for the SCRATCH zone's MoE batched MMVQ scratch bound: nothing waits for an op's scratch release before
+# the next op allocates, so the zone is sized for every expert op's buffers at once. The planner sizes the bound at the
+# context's micro-batch and publishes it, the ensure sizes the zone from it, a rebuild live allocations block keeps the
+# zone and warns once, and the runtime context raises the bound and never lowers it. test-zone-sizing Case 47 checks
+# the rules. Host-only, reads the sources as text. Same registration shape as test-sycl-load-zone-refusal-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-mmvq-scratch-zone-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-mmvq-scratch-zone-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Source gate for the load stage's two passes: every device plans and every refusal of the pass is decided before the
 # stage's effects (layer streaming, host zones, the stale ring's release), so a pass refused on any device runs none of
 # them, while a load refused in its late pass has run its early pass's effect, the stale ring's release; the decide
