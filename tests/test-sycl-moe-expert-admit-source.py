@@ -36,7 +36,8 @@ staged size. What this gate pins:
       disarmed, no ledger mirror or total stored;
   A8  the cache's admit is the refill body with the admit's source rule: refill_lent_triplet passes false and stays as
       strict ("not lent", "not a lent copy"), admit_host_triplet passes true, and an admit's host copy must be pinned
-      storage it owns whole and a host-zone slice ("host copy not pinned" otherwise);
+      storage it owns whole, its owner exactly the entry's base and size, and a host-zone slice ("host copy not
+      pinned" otherwise), while a refill's owner need only hold the entry, as the loan that lent it requires;
   A9  a named move WARNs nothing (its refusals skip the loan's WARN, its result line is DEBUG), and nothing but the
       private test fixtures calls the entry;
   A10 the named selection takes the published plan's verdict (moe_expert_move_validate) and moves only the triplets it
@@ -246,7 +247,7 @@ ADMIT_WRAP = "{ return copy_host_triplet_to_device(members, true, out); }"
 NOT_THERE = 'refusal = admit ? "not on host" : "not lent";'
 PINNED_CHECK = ("if (e.location != cache_location::HOST_PINNED || !e.host_resident || "
                 "!e.direct_alloc_owner.owner_metadata(&md) || md.ptr != e.device_ptr || "
-                "md.tier != alloc_tier::HOST_PINNED || md.size < e.size || "
+                "md.tier != alloc_tier::HOST_PINNED || (admit ? md.size != e.size : md.size < e.size) || "
                 "(admit && md.host_zone == host_zone_id::COUNT)) "
                 '{ refusal = admit ? "host copy not pinned" : "not a lent copy"; break; }')
 
@@ -379,7 +380,8 @@ def check(raw: dict[str, str]) -> None:
     if REFILL_WRAP not in refill or ADMIT_WRAP not in admit:
         fail("A8", "the refill and the admit do not run the shared body with false and true")
     if copy.count(NOT_THERE) != 1 or copy.count(PINNED_CHECK) != 1:
-        fail("A8", "the admit's host copy is not required to be whole pinned storage in a host zone")
+        fail("A8", "the admit's host copy is not required to be exactly its whole pinned storage in a host zone, or the "
+                   "refill's owner bound is not the loan's")
 
     # A9 ---------------------------------------------------------------------------------------------------------------
     if txn.count(REFUSE_GATE) != 1 or txn.count(NAMED_DEBUG) != 1:
@@ -516,6 +518,10 @@ def self_test(raw: dict[str, str]) -> int:
                                           "    if (true) {\n        // An accepted loan")])
     expect_fail("refill-as-lax-as-admit", "A8", [("cache", REFILL_SIG, "(members, /*admit=*/false, out)",
                                                   "(members, /*admit=*/true, out)")])
+    expect_fail("wider-host-owner-admitted", "A8", [("cache", COPY_SIG, "(admit ? md.size != e.size : md.size < e.size)",
+                                                     "md.size < e.size")])
+    expect_fail("refill-owner-made-exact", "A8", [("cache", COPY_SIG, "(admit ? md.size != e.size : md.size < e.size)",
+                                                   "md.size != e.size")])
     expect_fail("unzoned-host-copy-admitted", "A8", [("cache", COPY_SIG,
                                                       " ||\n                (admit && md.host_zone == host_zone_id::COUNT)",
                                                       "")])

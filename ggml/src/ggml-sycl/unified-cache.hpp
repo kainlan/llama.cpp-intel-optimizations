@@ -4596,9 +4596,11 @@ class unified_cache {
 
     // Admit one host triplet to the device by name: refill_lent_triplet() with any pinned host copy as the source, not
     // only a loan's, and the device storage at the staged size. Each member's host copy must be a live AOS entry under
-    // key whose direct_alloc_owner is its whole pinned storage and a slice of a host zone, the provenance the copy path
-    // proves host USM by, so the copy is a direct DMA; any other ("host copy not pinned", a copy served in place from
-    // a file mapping among them) would bounce through a synchronous staged copy. A missing host copy refuses as "not
+    // key whose direct_alloc_owner is its whole pinned storage, the same base and the same size, so retiring the entry
+    // gives back exactly its bytes, and a slice of a host zone, the provenance the copy path proves host USM by, so the
+    // copy is a direct DMA. Any other is refused "host copy not pinned": an owner wider than its entry, or a copy that
+    // is no host-zone slice, such as one served in place from a file mapping, which would bounce through a synchronous
+    // staged copy. A missing host copy refuses as "not
     // on host", and one holding fewer than the member's logical_bytes as "host copy size". Each member's device_owner
     // must be exactly staged_expert_bytes() of the host copy's layout and the member's type, ncols and logical_bytes,
     // never less than logical_bytes ("device storage size"). The copy moves logical_bytes from offset 0 of the host

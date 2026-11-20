@@ -11802,10 +11802,16 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
             // the pinned pool, read from offset 0 of its owner. It must also be a host-zone slice: the copy path
             // proves a pinned endpoint host USM only from such an owner, and any other copy takes the synchronous
             // staged branch, a wait. A copy served in place from a file mapping owns the mapping, not its storage.
+            // For an admit, whole means the same base and the same size. An owner's size is the size it was requested
+            // at, which is the entry's for a loan's copy and for a preloaded one, so an owner wider than its entry may
+            // hold another expert's bytes (expert 0 of a bulk allocation starts at the owner's base), and retiring the
+            // entry would not give back the zone bytes the admit counts as moved. A refill keeps the loan's own bound:
+            // a loan refuses only a host owner smaller than the entry it copies and registers its copy at that entry's
+            // size, so nothing makes a lent copy's owner exactly its entry, and a refill reads only the entry's bytes.
             alloc_metadata md{};
             if (e.location != cache_location::HOST_PINNED || !e.host_resident ||
                 !e.direct_alloc_owner.owner_metadata(&md) || md.ptr != e.device_ptr ||
-                md.tier != alloc_tier::HOST_PINNED || md.size < e.size ||
+                md.tier != alloc_tier::HOST_PINNED || (admit ? md.size != e.size : md.size < e.size) ||
                 (admit && md.host_zone == host_zone_id::COUNT)) {
                 refusal = admit ? "host copy not pinned" : "not a lent copy";
                 break;

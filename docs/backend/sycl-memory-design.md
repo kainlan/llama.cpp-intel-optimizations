@@ -318,9 +318,11 @@ move, and every triplet gets an outcome: moved, or refused with its reason and a
 BUSY or REFUSED class. A named admit runs only while nothing is lent: with a
 loan outstanding the request is refused "loans outstanding", BUSY, because lent
 triplets come back through the refill, which finds them by the ledger. The
-source is a whole pinned host copy that is a slice of a host zone. A copy served
-in place from a file mapping is refused "host copy not pinned", REFUSED, and
-stays on the host.
+source is a whole pinned host copy that is a slice of a host zone. Whole means
+its owner has the entry's base and the entry's size, so retiring the entry gives
+back exactly its bytes; an owner wider than its entry may hold another expert.
+A copy served in place from a file mapping, or one whose owner is wider than
+its entry, is refused "host copy not pinned", REFUSED, and stays on the host.
 
 An expert's size is a fact of its tensor, never of a cache entry: the
 transaction reads the tensor's bytes per expert (`nb[2]`), its type and its
