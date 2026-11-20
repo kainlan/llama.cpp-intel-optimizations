@@ -26,7 +26,10 @@ shows that. This gate holds them:
       build and the prompt helper);
   P11 the header is plain host code: standard includes only, no SYCL, no device allocation;
   P12 lifetime: the record holds the table by shared_ptr, the registry replaces it under its lock and is never
-      destroyed.
+      destroyed;
+  P13 the summary line carries the derived model-wide hit rate, labelled as derived, right after the counted-block
+      figure, computed by the one inline function with its guard for no counted block; the line's buffer holds its
+      longest possible text; the env-var row of docs/backend/sycl-env-vars.md names it.
 
 Checks run on comment-blanked text. NOT VACUOUS: --self-test runs the gate on in-memory mutants of the real sources.
 Each mutant names the pin that must catch it, and is reported if it survives, if a different pin catches it, or if its
@@ -47,6 +50,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 PREFETCH = ROOT / "ggml/src/ggml-sycl/expert-prefetch.cpp"
 HEADER = ROOT / "ggml/src/ggml-sycl/moe-route-counts.hpp"
+DOCS = ROOT / "docs/backend/sycl-env-vars.md"
 
 HYBRID_FN = "static bool ggml_sycl_moe_hybrid_decode_event_chained("
 RESOLVE = "auto resolve = ["
@@ -79,6 +83,13 @@ FINAL_PREFETCH = (
 )
 WARN_LINE = 'GGML_LOG_WARN("%s\\n", moe_route_summary_line(*table, tokens).c_str());'
 ENV_NAME = "GGML_SYCL_MOE_ROUTE_COUNTS_CSV"
+MODEL_LABEL = "model hit rate=%.1f%% (blocks not counted taken as all device)"
+COUNTED_FIGURE = "hit rate=%.1f%% (device %llu, host %llu) "
+MODEL_FORMULA = "return (hits + not_all) / (pairs + not_all);"
+MODEL_GUARD = "if (counted <= 0) { return 0.0; }"
+# Widest text each conversion can print: a 64-bit integer is 20 characters, an int 11, a percentage "100.0" plus its
+# sign, a double the mean of resident experts (at most 2^31 here) with one decimal.
+CONVERSION_WIDTH = {"%lld": 20, "%llu": 20, "%d": 11, "%.1f%%": 8, "%.1f": 14}
 ENV_GUARD = "if (path == nullptr || path[0] == '\\0') { return; }"
 FORBIDDEN_IN_COUNT = re.compile(
     r"\b(?:wait|wait_and_throw|lock|lock_guard|unique_lock|mutex|malloc|calloc|new|delete|push_back|emplace_back|"
@@ -183,10 +194,11 @@ def squash(text: str) -> str:
 
 
 class Sources:
-    def __init__(self, backend: str, prefetch: str, header: str):
+    def __init__(self, backend: str, prefetch: str, header: str, docs: str):
         self.backend = Source(backend)
         self.prefetch = Source(prefetch)
         self.header = Source(header)
+        self.docs = docs
 
 
 def need_once(hay: str, needle: str, pin: str, what: str) -> int:
@@ -319,6 +331,46 @@ def check(s: Sources) -> None:
     if squash(SLOTS_NEW) not in squash(pf.code):
         raise ContractError("FAIL [pin P12]: the table registry is destroyed at exit, where a late report reads it")
 
+    check_model_rate(s)
+
+
+def summary_format(header_code: str) -> tuple[str, int]:
+    """The summary line's format text (its adjacent string literals) and the size of its buffer."""
+    at = header_code.find("moe_route_summary_line(")
+    body = header_code[at:]
+    m = re.search(r'(?:"\[MOE-ROUTE-COUNTS\] tokens=(?:\\.|[^"\\])*"\s*)(?:"(?:\\.|[^"\\])*"\s*)*', body)
+    buf = re.search(r"char\s+line\[(\d+)\]", body)
+    if at < 0 or not m or not buf:
+        raise ContractError("FAIL [pin P13]: the summary line's format or buffer is not found")
+    fmt = "".join(re.findall(r'"((?:\\.|[^"\\])*)"', m.group(0)))
+    return fmt, int(buf.group(1))
+
+
+def check_model_rate(s: Sources) -> None:
+    hdr = squash(s.header.code)
+    fmt, buf = summary_format(s.header.code)
+    if fmt.count(MODEL_LABEL) != 1:
+        raise ContractError(f"FAIL [pin P13]: the summary line does not carry `{MODEL_LABEL}` once")
+    if fmt.find(COUNTED_FIGURE) < 0 or fmt.find(MODEL_LABEL) != fmt.find(COUNTED_FIGURE) + len(COUNTED_FIGURE):
+        raise ContractError("FAIL [pin P13]: the model hit rate does not follow the counted-block hit rate directly")
+    if "moe_route_model_hit_rate(c)" not in hdr or hdr.count("inline double moe_route_model_hit_rate(") != 1:
+        raise ContractError("FAIL [pin P13]: the model hit rate is not computed by moe_route_model_hit_rate")
+    fn_at = hdr.find("inline double moe_route_model_hit_rate(")
+    fn = brace_text(hdr, hdr.find("{", fn_at), "P13")
+    if squash(MODEL_GUARD) not in fn or squash(MODEL_FORMULA) not in fn:
+        raise ContractError("FAIL [pin P13]: the model hit rate is not (H + U*P/C) / (P + U*P/C) with a guard for C = 0")
+    if "c.n_blocks() - counted" not in fn or "pairs / static_cast<double>(counted)" not in fn:
+        raise ContractError("FAIL [pin P13]: the model hit rate does not take U from the blocks not counted, P/C each")
+    worst = len(fmt)
+    for conv in ("%.1f%%", "%lld", "%llu", "%d", "%.1f"):
+        worst += fmt.count(conv) * (CONVERSION_WIDTH[conv] - len(conv))
+        fmt = fmt.replace(conv, "\0" * len(conv))
+    if buf < worst + 1:
+        raise ContractError(f"FAIL [pin P13]: the summary buffer ({buf}) may not hold its longest line ({worst + 1})")
+    row = next((ln for ln in s.docs.split("\n") if ln.startswith(f"| `{ENV_NAME}=")), "")
+    if "model hit rate" not in row or "taken as all device" not in row:
+        raise ContractError("FAIL [pin P13]: the env-var row does not name the model-wide hit rate and its assumption")
+
 
 def self_test(raws: dict[str, str]) -> int:
     failures: list[str] = []
@@ -369,7 +421,7 @@ def self_test(raws: dict[str, str]) -> int:
             print(f"  mutant {name}: NOT APPLIED ({e})")
             return
         try:
-            check(Sources(mutated["backend"], mutated["prefetch"], mutated["header"]))
+            check(Sources(mutated["backend"], mutated["prefetch"], mutated["header"], mutated["docs"]))
         except ContractError as e:
             if f"[pin {pin}]" not in str(e):
                 failures.append(f"{name}: caught, but not by pin {pin}: {str(e)[:120]}")
@@ -462,6 +514,24 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    std::lock_guard<std::mutex> lock(slot.mutex);\n    // The replaced table",
                   "    // The replaced table")])
 
+    expect_fail("model-label-dropped", "P13", "header",
+                [('"model hit rate=%.1f%% (blocks not counted taken as all device); top-%d', '"top-%d')])
+    expect_fail("model-label-not-marked-derived", "P13", "header",
+                [("(blocks not counted taken as all device)", "(model)")])
+    expect_fail("model-rate-before-counted-figure", "P13", "header",
+                [('"decode routed pairs=%llu hit rate=%.1f%% (device %llu, host %llu) "\n'
+                  '                 "model hit rate=%.1f%% (blocks not counted taken as all device); ',
+                  '"decode routed pairs=%llu model hit rate=%.1f%% (blocks not counted taken as all device); '
+                  'hit rate=%.1f%% (device %llu, host %llu) ')])
+    expect_fail("model-rate-ignores-uncounted", "P13", "header",
+                [("return (hits + not_all) / (pairs + not_all);", "return hits / pairs;")])
+    expect_fail("model-rate-guard-dropped", "P13", "header",
+                [("    if (counted <= 0) {\n        return 0.0;\n    }\n    const double pairs  ",
+                  "    const double pairs  ")])
+    expect_fail("summary-buffer-too-small", "P13", "header", [("char         line[768];", "char         line[400];")])
+    expect_fail("docs-row-lacks-model-rate", "P13", "docs",
+                [("(blocks not counted taken as all device)", "(blocks not counted)")])
+
     # The NOT APPLIED report must fire on an anchor the sources do not hold, or a stale mutant would pass unseen.
     try:
         mutate(B, [("this anchor is in no source", "x")])
@@ -471,7 +541,7 @@ def self_test(raws: dict[str, str]) -> int:
         print("  self-test: a stale mutant anchor is reported")
 
     try:
-        check(Sources(raws["backend"], raws["prefetch"], raws["header"]))
+        check(Sources(raws["backend"], raws["prefetch"], raws["header"], raws["docs"]))
         print("  self-test: unmodified tree passes")
     except ContractError as e:
         print(f"  self-test: unmodified tree FAILS: {e}")
@@ -485,11 +555,16 @@ def self_test(raws: dict[str, str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    raws = {"backend": BACKEND.read_text(), "prefetch": PREFETCH.read_text(), "header": HEADER.read_text()}
+    raws = {
+        "backend": BACKEND.read_text(),
+        "prefetch": PREFETCH.read_text(),
+        "header": HEADER.read_text(),
+        "docs": DOCS.read_text(),
+    }
     if "--self-test" in argv:
         return self_test(raws)
     try:
-        check(Sources(raws["backend"], raws["prefetch"], raws["header"]))
+        check(Sources(raws["backend"], raws["prefetch"], raws["header"], raws["docs"]))
     except ContractError as e:
         print(e)
         return 1

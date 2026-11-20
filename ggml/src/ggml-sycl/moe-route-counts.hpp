@@ -236,6 +236,25 @@ inline double moe_route_overall_hit_rate(const moe_route_counts & c) {
     return pairs > 0 ? static_cast<double>(moe_route_decode_hits(c)) / static_cast<double>(pairs) : 0.0;
 }
 
+// The hit rate of the whole model, derived: a block that was not counted took the direct route, so every pair it
+// routed was a device hit and none was seen. Every block routes the same number of pairs per token (top-k experts for
+// each token), so a block not counted routed as many pairs as the counted blocks do on average. With P the decode
+// pairs, H the device hits, C the counted blocks and U the blocks not counted:
+//     model hit rate = (H + U * P / C) / (P + U * P / C), and 0 when C is 0 (nothing to take the average from).
+// This is an estimate from that assumption, not a measurement; moe_route_overall_hit_rate is the measured figure over
+// the counted blocks alone.
+inline double moe_route_model_hit_rate(const moe_route_counts & c) {
+    const int counted = moe_route_blocks_counted(c);
+    if (counted <= 0) {
+        return 0.0;
+    }
+    const double pairs   = static_cast<double>(moe_route_decode_pairs(c));
+    const double hits    = static_cast<double>(moe_route_decode_hits(c));
+    const double per_not = pairs / static_cast<double>(counted);  // pairs a block that was not counted routed
+    const double not_all = static_cast<double>(c.n_blocks() - counted) * per_not;
+    return (hits + not_all) / (pairs + not_all);
+}
+
 namespace moe_route_detail {
 
 // The decode counts of the block's `n` most-routed experts, and the block's total.
@@ -361,16 +380,17 @@ inline std::string moe_route_summary_line(const moe_route_counts & c, int64_t to
     const int    counted = moe_route_blocks_counted(c);
     const double mean    = moe_route_mean_resident_experts(c);
     const int    top_n   = static_cast<int>(std::lround(mean));
-    char         line[640];
+    char         line[768];
     int          n = std::snprintf(
         line, sizeof(line),
         "[MOE-ROUTE-COUNTS] tokens=%lld blocks counted=%d not counted=%d (all resident, not counted) of %d; "
-                 "decode routed pairs=%llu hit rate=%.1f%% (device %llu, host %llu); top-%d coverage=%.1f%% "
+                 "decode routed pairs=%llu hit rate=%.1f%% (device %llu, host %llu) "
+                 "model hit rate=%.1f%% (blocks not counted taken as all device); top-%d coverage=%.1f%% "
                  "(a use-ranked set of the mean %.1f resident experts per block); prompt routed pairs=%llu",
         static_cast<long long>(tokens), counted, c.n_blocks() - counted, c.n_blocks(),
         static_cast<unsigned long long>(moe_route_decode_pairs(c)), 100.0 * moe_route_overall_hit_rate(c),
         static_cast<unsigned long long>(moe_route_decode_hits(c)),
-        static_cast<unsigned long long>(moe_route_decode_misses(c)), top_n,
+        static_cast<unsigned long long>(moe_route_decode_misses(c)), 100.0 * moe_route_model_hit_rate(c), top_n,
         100.0 * moe_route_top_n_coverage_overall(c, top_n), mean,
         static_cast<unsigned long long>(moe_route_prompt_pairs(c)));
     std::string out(line,

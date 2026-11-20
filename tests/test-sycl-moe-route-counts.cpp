@@ -146,6 +146,28 @@ int main() {
         moe_route_counts none(4, 8);
         CHECK(near(ggml_sycl::moe_route_overall_hit_rate(none), 0.0));
         CHECK(near(ggml_sycl::moe_route_top_n_coverage_overall(none, 2), 0.0));
+        // The measured figure covers the counted blocks only: 80 / 120 above. The model's figure takes the 2 blocks
+        // not counted as routing 60 pairs each (120 / 2), all device hits: (80 + 120) / (120 + 120).
+        CHECK(near(ggml_sycl::moe_route_model_hit_rate(c), 200.0 / 240.0));
+    }
+    // 6b. The model hit rate by hand: 2 counted blocks with 100 pairs and 10 hits between them, 1 block not counted,
+    //     which routed 100 / 2 = 50 pairs, all hits: (10 + 50) / (100 + 50) = 40 %.
+    {
+        moe_route_counts c(3, 8);
+        route_block(c, 0, { 10, 50, 0, 0, 0, 0, 0, 0 }, 1);  // 60 pairs, 10 hits
+        route_block(c, 1, { 0, 40, 0, 0, 0, 0, 0, 0 }, 1);   // 40 pairs, 0 hits
+        CHECK(ggml_sycl::moe_route_decode_pairs(c) == 100 && ggml_sycl::moe_route_decode_hits(c) == 10);
+        CHECK(near(ggml_sycl::moe_route_overall_hit_rate(c), 0.1));
+        CHECK(near(ggml_sycl::moe_route_model_hit_rate(c), 0.4));
+        // Every block counted: nothing to take as all device, so the two figures agree.
+        route_block(c, 2, { 5, 5, 0, 0, 0, 0, 0, 0 }, 1);  // 10 pairs, 5 hits
+        CHECK(near(ggml_sycl::moe_route_model_hit_rate(c), ggml_sycl::moe_route_overall_hit_rate(c)));
+        CHECK(near(ggml_sycl::moe_route_model_hit_rate(c), 15.0 / 110.0));
+        // Nothing counted: no average to take from, so 0 and not a division by zero.
+        moe_route_counts none(3, 8);
+        CHECK(near(ggml_sycl::moe_route_model_hit_rate(none), 0.0));
+        moe_route_counts empty(0, 8);
+        CHECK(near(ggml_sycl::moe_route_model_hit_rate(empty), 0.0));
     }
     // 7. Mean resident experts per block: a counted block contributes what the plan holds on the device, a block
     //    that was not counted is all resident (the direct route reports nothing), a counted block with no recorded
@@ -216,7 +238,10 @@ int main() {
         CHECK(line.find("not counted=2 (all resident, not counted)") != std::string::npos);
         CHECK(line.find("of 4") != std::string::npos);
         CHECK(line.find("decode routed pairs=120") != std::string::npos);
-        CHECK(line.find("hit rate=66.7%") != std::string::npos);
+        CHECK(
+            line.find(
+                "hit rate=66.7% (device 80, host 40) model hit rate=83.3% (blocks not counted taken as all device);") !=
+            std::string::npos);
         CHECK(line.find("top-5 coverage=") != std::string::npos);
         // top-5 of block 0 = 98, of block 2 = 20: 118 / 120 = 98.3%
         CHECK(line.find("top-5 coverage=98.3%") != std::string::npos);
