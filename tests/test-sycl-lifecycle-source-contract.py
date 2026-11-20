@@ -618,6 +618,8 @@ def _owning_reader_sites():
 # loan transaction reads, so no new reader kind, and the statement count under that name moves 4 -> 5.
 # The legacy expert prestage left with the name-hash expert ranking, and six of these statements with it: its
 # per-expert plan check and plan read, its secondary-device loop's three plan reads and its runtime switch's check.
+# The MoE reorder temp buffer's reservation, which only that prestage read, took four more: its multi-card
+# condition's two global-plan checks and two global-plan reads.
 INTERNAL_WRAPPER_SITES = {
     "ggml_sycl_cache_plan_owner": Counter({
         "(*ggml_sycl_cache_plan_owner(cache))": 1,
@@ -677,14 +679,12 @@ INTERNAL_WRAPPER_SITES = {
         "stream_plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;": 1,
     }),
     "ggml_sycl_global_plan_owner": Counter({
-        "!ggml_sycl_placement_plan_uses_device((*ggml_sycl_global_plan_owner()), d)) {": 1,
         "!ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_global_plan_owner()), current_device);": 1,
         "const auto plan_owner = ggml_sycl_global_plan_owner();": 2,
         # The hold-spill fit (ggml_sycl_hold_spill_fit) reads the published plan once for the explicit micro-batch it
         # placed, whose RUNTIME zone holds the planned compute term: the fit credits a buffer no larger at that rung.
         "const auto room_plan = ggml_sycl_global_plan_owner();": 1,
         "ggml_sycl_placement_plan_moe_needs_other_device((*ggml_sycl_global_plan_owner()), ctx.device);": 1,
-        "ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner())))) {": 1,
         "ggml_sycl_placement_plan_needs_secondary_devices((*ggml_sycl_global_plan_owner()));": 1,
         "ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_global_plan_owner()), current_device);": 1,
         "plan_known && ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner()));": 1,
@@ -746,12 +746,10 @@ INTERNAL_WRAPPER_SITES = {
     }),
     "ggml_sycl_has_global_plan": Counter({
         "((ggml_sycl_has_global_plan() || ggml_sycl_planner_authoritative_residency_active(sycl_ctx->device)) &&": 1,
-        "(ggml_sycl_has_global_plan() &&": 1,
         "const bool has_host_inputs = ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph);": 1,
         "const bool plan_known = ggml_sycl_has_global_plan();": 1,
         "gpu_prefix_end < 0 && !(ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph)) &&": 1,
         "if (!ggml_sycl_has_global_plan() || !plan_owner->has_dense_entry(tensor_name)) {": 1,
-        "if (ggml_sycl_has_global_plan() &&": 1,
         "if (ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph) &&": 1,
         "if (ggml_sycl_has_global_plan() || has_runtime_plan() || g_moe_multi_gpu_active.load(std::memory_order_acquire)) {": 1,
         "if (ggml_sycl_has_global_plan()) {": 2,
