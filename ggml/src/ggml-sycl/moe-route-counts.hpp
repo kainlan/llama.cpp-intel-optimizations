@@ -95,7 +95,7 @@ class moe_route_counts {
         }
     }
 
-    // Zero every counter, forget every residency, and re-arm claim_report().
+    // Zero every counter, forget every residency, and forget the last reported total (claim_report() claims afresh).
     void reset() {
         const size_t cells = cells_total();
         for (size_t i = 0; i < cells; ++i) {
@@ -109,11 +109,22 @@ class moe_route_counts {
             resident_[b].store(-1, std::memory_order_relaxed);
         }
         out_of_range_.store(0, std::memory_order_relaxed);
-        reported_.store(false, std::memory_order_relaxed);
+        reported_pairs_.store(0, std::memory_order_relaxed);
     }
 
-    // True for the first caller since construction or reset(): the one printer of the final report.
-    bool claim_report() { return !reported_.exchange(true, std::memory_order_acq_rel); }
+    // True when `decode_pairs`, the decode pairs the caller counted, is above the total last reported, which it then
+    // records: the caller prints the report. Two threads that race with the same total print once, and a table that
+    // has counted more since its last report prints again with its cumulative counts.
+    bool claim_report(uint64_t decode_pairs) {
+        uint64_t last = reported_pairs_.load(std::memory_order_acquire);
+        while (decode_pairs > last) {
+            if (reported_pairs_.compare_exchange_weak(last, decode_pairs, std::memory_order_acq_rel,
+                                                      std::memory_order_acquire)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     uint64_t decode_count(int block, int expert) const {
         return in_range(block, expert) ? decode_[index(block, expert)].load(std::memory_order_relaxed) : 0;
@@ -172,7 +183,7 @@ class moe_route_counts {
     std::unique_ptr<std::atomic<uint64_t>[]> misses_;
     std::unique_ptr<std::atomic<int32_t>[]>  resident_;
     std::atomic<uint64_t>                    out_of_range_{ 0 };
-    std::atomic<bool>                        reported_{ false };
+    std::atomic<uint64_t>                    reported_pairs_{ 0 };
 };
 
 // ---------------------------------------------------------------------------------------------------------------

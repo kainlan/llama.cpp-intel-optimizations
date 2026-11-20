@@ -1315,7 +1315,11 @@ std::shared_ptr<moe_route_counts> moe_route_counts_current(int device) {
 
 void moe_route_counts_report_final(int device, int64_t tokens) {
     const std::shared_ptr<moe_route_counts> table = moe_route_counts_current(device);
-    if (!table || moe_route_decode_pairs(*table) == 0 || !table->claim_report()) {
+    if (!table) {
+        return;
+    }
+    const uint64_t pairs = moe_route_decode_pairs(*table);
+    if (pairs == 0 || !table->claim_report(pairs)) {
         return;
     }
     GGML_LOG_WARN("%s\n", moe_route_summary_line(*table, tokens).c_str());

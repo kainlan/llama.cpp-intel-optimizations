@@ -8597,7 +8597,9 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     g_moe_warmup.init(n_moe_layers, n_experts_per_layer);
 
     // A fresh routed-expert table for this model, sized from its own blocks and experts: the counts of an earlier
-    // model in this process stay with the records that were counting into them.
+    // model in this process stay with the records that were counting into them. This init runs again until it
+    // succeeds and after a model-owner switch, and each run installs a fresh table: a record built before the run
+    // keeps counting into the table it holds, which is no longer the one the report reads.
     (void) ggml_sycl::moe_route_counts_install(device, n_route_blocks, n_experts_per_layer);
 
     // Initialize adaptive prestage background thread (if enabled via env var)
@@ -85944,18 +85946,28 @@ struct moe_hybrid_decode_record {
     std::vector<ggml_sycl::mem_handle> lease;             // every expert's route lease
     sycl::event                        ready;             // one barrier over the leases' producer events
     bool                               has_ready = false;
-    // The routed-expert counts of this tensor's block: set on the block's gate tensor only, so a (token, expert)
-    // pair counts once and not for each of gate, up and down. The record holds the table, so a job still running on
-    // the CPU pool when a later model installs its own table counts into the one it was built for.
+    // The routed-expert counts of this tensor's block: set on the block's counting tensor only (its gate tensor, or its
+    // fused gate/up tensor), so a (token, expert) pair counts once and not for each of gate, up and down. The record
+    // holds the table, so a job still running on the CPU pool when a later model installs its own table counts into
+    // the one it was built for.
     int                                          route_block = -1;  // blk.N, -1 when this tensor does not count
     std::shared_ptr<ggml_sycl::moe_route_counts> route_counts;
 };
 
+// The one tensor of a block whose op counts the routed experts: its gate tensor, or its fused gate/up tensor when the
+// pack stores the two as one (moe_classify_tensor knows only the separate names, and other code keys off it, so the
+// fused spelling is named here). Gate, up and down of a block route the same ids, so counting on one of them counts a
+// (token, expert) pair once per block.
+static bool ggml_sycl_moe_route_counts_tensor(const char * name) {
+    return name != nullptr &&
+           (moe_classify_tensor(name) == MOE_TENSOR_GATE || std::strstr(name, "ffn_gate_up_exps") != nullptr);
+}
+
 // Counts the experts a prompt op routed, from its host ids snapshot (the ids tensor's n_used ids per token),
-// into the model's table: the gate tensor's op only, as the hybrid decode route counts. A prompt op reads its ids on
-// this thread already, so this adds increments and no wait.
+// into the model's table: the block's counting tensor's op only, as the hybrid decode route counts. A prompt op reads
+// its ids on this thread already, so this adds increments and no wait.
 static void ggml_sycl_moe_route_counts_add_prompt(int device, const ggml_tensor * src0, const int32_t * ids, size_t n) {
-    if (!src0 || moe_classify_tensor(src0->name) != MOE_TENSOR_GATE) {
+    if (!src0 || !ggml_sycl_moe_route_counts_tensor(src0->name)) {
         return;
     }
     const std::shared_ptr<ggml_sycl::moe_route_counts> table = ggml_sycl::moe_route_counts_current(device);
@@ -85963,6 +85975,9 @@ static void ggml_sycl_moe_route_counts_add_prompt(int device, const ggml_tensor 
         return;
     }
     const int block = ggml_sycl_tp_extract_layer_number(src0->name);
+    if (block < 0) {
+        return;
+    }
     for (size_t i = 0; i < n; ++i) {
         table->add_prompt(block, ids[i]);
     }
@@ -86095,7 +86110,7 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     record->layer       = parse_layer_id_from_name(src0->name);
     record->cache_layer = moe_cache_layer_id(src0->name);
     record->all_host    = all_host;
-    if (moe_classify_tensor(src0->name) == MOE_TENSOR_GATE) {
+    if (ggml_sycl_moe_route_counts_tensor(src0->name)) {
         record->route_block  = ggml_sycl_tp_extract_layer_number(src0->name);
         record->route_counts = ggml_sycl::moe_route_counts_current(device);
     }

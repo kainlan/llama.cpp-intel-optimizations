@@ -2,6 +2,7 @@
 // (ggml-sycl/moe-route-counts.hpp). SYCL-free: no device is opened and no model is loaded.
 #include "ggml-sycl/moe-route-counts.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -258,22 +259,51 @@ int main() {
         CHECK(table.find("block 0 all resident, not counted") != std::string::npos);
         CHECK(table.find("block 2 all resident, not counted") != std::string::npos);
     }
-    // 12. reset() zeroes every counter and the residency, and re-arms the one-shot report claim.
+    // 12. reset() zeroes every counter and the residency, and forgets the last reported total.
     {
         moe_route_counts c(2, 4);
         CHECK(c.add_decode(1, 1, true));
         CHECK(c.add_prompt(1, 1));
         c.set_block_resident(1, 2);
         CHECK(!c.add_decode(2, 0, true));
-        CHECK(c.claim_report());
-        CHECK(!c.claim_report());
+        CHECK(c.claim_report(1));
+        CHECK(!c.claim_report(1));
         c.reset();
         CHECK(c.decode_count(1, 1) == 0 && c.prompt_count(1, 1) == 0);
         CHECK(c.block_hits(1) == 0 && c.block_misses(1) == 0);
         CHECK(c.resident_at_last_use(1, 1) == -1 && c.block_resident(1) == -1);
         CHECK(c.out_of_range() == 0);
-        CHECK(c.claim_report());
+        CHECK(c.claim_report(1));
         CHECK(c.n_blocks() == 2 && c.n_experts() == 4);
+    }
+    // 12b. A report is claimed when the decode pairs grew since the last one claimed: nothing counted claims nothing,
+    //      the same total claims once, a larger total claims again, and a smaller one never does.
+    {
+        moe_route_counts c(2, 4);
+        CHECK(!c.claim_report(0));
+        CHECK(c.claim_report(3));
+        CHECK(!c.claim_report(3));
+        CHECK(!c.claim_report(2));
+        CHECK(c.claim_report(4));
+        CHECK(!c.claim_report(4));
+        CHECK(c.claim_report(1000));
+        // Several threads that count the same total claim it once between them.
+        moe_route_counts         racy(1, 1);
+        std::atomic<int>         claims{ 0 };
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 4; ++t) {
+            threads.emplace_back([&racy, &claims]() {
+                for (uint64_t total = 1; total <= 50; ++total) {
+                    claims.fetch_add(racy.claim_report(total) ? 1 : 0);
+                }
+            });
+        }
+        for (std::thread & th : threads) {
+            th.join();
+        }
+        CHECK(claims.load() >= 1 && claims.load() <= 50);
+        CHECK(!racy.claim_report(50));
+        CHECK(racy.claim_report(51));
     }
     // 13. Increments from several threads at once do not lose a count (the pool worker and the prompt thread).
     {

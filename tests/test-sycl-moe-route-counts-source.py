@@ -27,6 +27,11 @@ shows that. This gate holds them:
   P11 the header is plain host code: standard includes only, no SYCL, no device allocation;
   P12 lifetime: the record holds the table by shared_ptr, the registry replaces it under its lock and is never
       destroyed;
+  P14 the one counting tensor of a block is named by one predicate, true for its gate tensor and for its fused gate/up
+      tensor and for no other, which both counting sites call; the count loop's bound, its range test and its
+      device-or-host sense are held;
+  P15 the report prints when the decode pairs have grown since the last report (a compare-exchange on one atomic), not
+      once; the env-var row says so;
   P13 the summary line carries the derived model-wide hit rate, labelled as derived, right after the counted-block
       figure, computed by the one inline function with its guard for no counted block; the line's buffer holds its
       longest possible text; the env-var row of docs/backend/sycl-env-vars.md names it.
@@ -60,7 +65,13 @@ PROMPT_HELPER = "static void ggml_sycl_moe_route_counts_add_prompt("
 REPORT_FN = "void moe_route_counts_report_final(int device, int64_t tokens) {"
 INSTALL_FN = "std::shared_ptr<moe_route_counts> moe_route_counts_install("
 COUNT_GUARD = "if (record->route_counts && record->route_block >= 0) {"
-BUILD_GATE_TEST = "if (moe_classify_tensor(src0->name) == MOE_TENSOR_GATE) {"
+BUILD_GATE_TEST = "if (ggml_sycl_moe_route_counts_tensor(src0->name)) {"
+PREDICATE_FN = "static bool ggml_sycl_moe_route_counts_tensor(const char * name) {"
+COUNT_FOR = "for (int64_t k = 0; k < n_ids; ++k) {"
+COUNT_IDS = "const int32_t e = ids_rows[k];"
+COUNT_RANGE = "if (e >= 0 && static_cast<size_t>(e) < record->n_as) {"
+COUNT_SENSE = "record->host_weight[static_cast<size_t>(e)] == nullptr);"
+CLAIM_FN = "bool claim_report(uint64_t decode_pairs) {"
 ROUTE_BLOCK_ASSIGN = "record->route_block = ggml_sycl_tp_extract_layer_number(src0->name);"
 RAW_ROUTE_BLOCK_ASSIGN = "record->route_block  = ggml_sycl_tp_extract_layer_number(src0->name);"
 ADD_DECODE_CALL = "record->route_counts->add_decode(record->route_block, e,"
@@ -276,12 +287,14 @@ def check(s: Sources) -> None:
 
     # P8 -------------------------------------------------------------------------------------------------------------
     helper = be.block_text(PROMPT_HELPER, "P8")
-    if not helper.startswith("{ if (!src0 || moe_classify_tensor(src0->name) != MOE_TENSOR_GATE) { return; }"):
+    if not helper.startswith("{ if (!src0 || !ggml_sycl_moe_route_counts_tensor(src0->name)) { return; }"):
         raise ContractError("FAIL [pin P8]: the prompt helper does not leave at once for a tensor that is not gate")
     if be.code.count("->add_prompt(") != 1 or "table->add_prompt(block, ids[i])" not in helper or "add_decode" in helper:
         raise ContractError("FAIL [pin P8]: the prompt helper does not count into the prompt counts alone")
     if "ggml_sycl_tp_extract_layer_number(src0->name)" not in helper:
         raise ContractError("FAIL [pin P8]: the prompt helper's key is not the block number")
+    if "const int block = ggml_sycl_tp_extract_layer_number(src0->name); if (block < 0) { return; } for (" not in helper:
+        raise ContractError("FAIL [pin P8]: the prompt helper does not leave at once for a tensor with no block number")
     if be.code.count("ggml_sycl_moe_route_counts_add_prompt(") != 2:
         raise ContractError("FAIL [pin P8]: the prompt helper is not defined once and called once")
     snaps = list(SNAPSHOT.finditer(be.code))
@@ -332,6 +345,8 @@ def check(s: Sources) -> None:
         raise ContractError("FAIL [pin P12]: the table registry is destroyed at exit, where a late report reads it")
 
     check_model_rate(s)
+    check_counting_tensor(s, count_block, build)
+    check_report_when_grown(s, report)
 
 
 def summary_format(header_code: str) -> tuple[str, int]:
@@ -370,6 +385,42 @@ def check_model_rate(s: Sources) -> None:
     row = next((ln for ln in s.docs.split("\n") if ln.startswith(f"| `{ENV_NAME}=")), "")
     if "model hit rate" not in row or "taken as all device" not in row:
         raise ContractError("FAIL [pin P13]: the env-var row does not name the model-wide hit rate and its assumption")
+
+
+def check_counting_tensor(s: Sources, count_block: str, build: str) -> None:
+    be = s.backend
+    if be.code.count("ggml_sycl_moe_route_counts_tensor(") != 3:
+        raise ContractError("FAIL [pin P14]: the counting-tensor predicate is not defined once and called twice")
+    pred = be.block_text(PREDICATE_FN, "P14")
+    if "MOE_TENSOR_GATE" not in pred or '"ffn_gate_up_exps"' not in pred:
+        raise ContractError("FAIL [pin P14]: the predicate does not name both the gate tensor and ffn_gate_up_exps")
+    if re.search(r"MOE_TENSOR_(?:UP|DOWN|UNKNOWN)|ffn_up_exps|ffn_down_exps|ffn_gate_exps", pred):
+        raise ContractError("FAIL [pin P14]: the predicate admits a tensor that is neither gate nor fused gate/up")
+    helper = be.block_text(PROMPT_HELPER, "P14")
+    if "moe_classify_tensor(" in build or "moe_classify_tensor(" in helper:
+        raise ContractError("FAIL [pin P14]: a counting site classifies the tensor itself, not through the predicate")
+    for part in (COUNT_FOR, COUNT_IDS, COUNT_RANGE):
+        if squash(part) not in count_block:
+            raise ContractError(f"FAIL [pin P14]: the count loop lost `{part}`")
+    if squash(COUNT_SENSE) not in count_block or "== nullptr" not in count_block or "!= nullptr" in count_block:
+        raise ContractError("FAIL [pin P14]: a hit is not an expert whose host weight is null")
+
+
+def check_report_when_grown(s: Sources, report: str) -> None:
+    hdr = squash(s.header.code)
+    at = hdr.find(squash(CLAIM_FN))
+    if hdr.count(squash(CLAIM_FN)) != 1:
+        raise ContractError("FAIL [pin P15]: claim_report(decode_pairs) is not defined once")
+    claim = brace_text(hdr, hdr.find("{", at + len(squash(CLAIM_FN)) - 1), "P15")
+    if "while (decode_pairs > last) {" not in claim or "compare_exchange_weak(last, decode_pairs," not in claim:
+        raise ContractError("FAIL [pin P15]: claim_report is not a compare-exchange while the pairs are above the last")
+    if re.search(r"\.exchange\(|reported_\b", hdr):
+        raise ContractError("FAIL [pin P15]: the once-latch is back in the table")
+    if "const uint64_t pairs = moe_route_decode_pairs(*table);" not in report or "table->claim_report(pairs)" not in report:
+        raise ContractError("FAIL [pin P15]: the report does not claim by the decode pairs counted")
+    row = next((ln for ln in s.docs.split("\n") if ln.startswith(f"| `{ENV_NAME}=")), "")
+    if "grown since the table's last report" not in row:
+        raise ContractError("FAIL [pin P15]: the env-var row does not say the report prints when the pairs have grown")
 
 
 def self_test(raws: dict[str, str]) -> int:
@@ -479,14 +530,13 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("prompt-counts-into-decode", "P1", B,
                 [("table->add_prompt(block, ids[i]);", "table->add_decode(block, ids[i], false);")])
     expect_fail("prompt-counts-every-tensor", "P8", B,
-                [("moe_classify_tensor(src0->name) != MOE_TENSOR_GATE) {\n        return;",
+                [("!ggml_sycl_moe_route_counts_tensor(src0->name)) {\n        return;",
                   "moe_classify_tensor(src0->name) == MOE_TENSOR_UNKNOWN) {\n        return;")])
     expect_fail("prompt-count-before-snapshot", "P8", B,
                 [(PROMPT_CALL, ""), (RAW_SNAPSHOT, PROMPT_CALL + "\n        " + RAW_SNAPSHOT)])
     expect_fail("prompt-key-is-hash", "P8", B,
-                [("    const int block = ggml_sycl_tp_extract_layer_number(src0->name);\n"
-                  "    for (size_t i = 0; i < n; ++i) {",
-                  "    const int block = moe_cache_layer_id(src0->name);\n    for (size_t i = 0; i < n; ++i) {")])
+                [("    const int block = ggml_sycl_tp_extract_layer_number(src0->name);\n    if (block < 0) {",
+                  "    const int block = moe_cache_layer_id(src0->name);\n    if (block < 0) {")])
     expect_fail("table-clamped", "P9", B,
                 [(INSTALL_CALL, "(void) ggml_sycl::moe_route_counts_install(device, std::min(n_route_blocks, 128), "
                                 "std::min(n_experts_per_layer, 256));")])
@@ -531,6 +581,33 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("summary-buffer-too-small", "P13", "header", [("char         line[768];", "char         line[400];")])
     expect_fail("docs-row-lacks-model-rate", "P13", "docs",
                 [("(blocks not counted taken as all device)", "(blocks not counted)")])
+
+    # The fused gate/up tensor, the loop's bound and sense, the negative block, and the report that grows.
+    fused = ' || std::strstr(name, "ffn_gate_up_exps") != nullptr'
+    expect_fail("predicate-lacks-fused-spelling", "P14", B, [(fused, "")])
+    expect_fail("predicate-fused-misspelt", "P14", B,
+                [("ffn_gate_up_exps\") != nullptr", "ffn_gate_up_expert\") != nullptr")])
+    expect_fail("predicate-admits-down", "P14", B, [(fused, fused + " || moe_classify_tensor(name) == MOE_TENSOR_DOWN")])
+    expect_fail("predicate-called-a-third-time", "P14", B,
+                [(INSTALL_CALL, '(void) ggml_sycl_moe_route_counts_tensor("x");\n    ' + INSTALL_CALL)])
+    expect_fail("build-site-classifies-itself", "P2", B,
+                [(BUILD_GATE_TEST, "if (moe_classify_tensor(src0->name) == MOE_TENSOR_GATE) {")])
+    expect_fail("count-sense-flipped", "P14", B,
+                [("record->host_weight[static_cast<size_t>(e)] == nullptr);",
+                  "record->host_weight[static_cast<size_t>(e)] != nullptr);")])
+    expect_fail("count-loop-one-too-far", "P14", B, [(COUNT_FOR, "for (int64_t k = 0; k < n_ids + 1; ++k) {")])
+    expect_fail("count-loop-starts-at-one", "P14", B, [(COUNT_FOR, "for (int64_t k = 1; k < n_ids; ++k) {")])
+    expect_fail("count-range-test-dropped", "P14", B, [(COUNT_RANGE, "if (e >= 0) {")])
+    expect_fail("prompt-negative-block-guard-dropped", "P8", B,
+                [("    if (block < 0) {\n        return;\n    }\n    for (size_t i = 0; i < n; ++i) {",
+                  "    for (size_t i = 0; i < n; ++i) {")])
+    expect_fail("report-claims-by-latch", "P15", "header",
+                [("while (decode_pairs > last) {", "while (decode_pairs != last) {")])
+    expect_fail("report-claim-not-compare-exchange", "P15", "header",
+                [("compare_exchange_weak(last, decode_pairs,", "compare_exchange_weak(last, last,")])
+    expect_fail("report-claims-constant", "P15", "prefetch", [("table->claim_report(pairs)", "table->claim_report(1)")])
+    expect_fail("docs-row-says-once", "P15", "docs",
+                [("grown since the table's last report", "grown since the start")])
 
     # The NOT APPLIED report must fire on an anchor the sources do not hold, or a stale mutant would pass unseen.
     try:
