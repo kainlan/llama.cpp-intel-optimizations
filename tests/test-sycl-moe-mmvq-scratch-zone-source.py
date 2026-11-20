@@ -22,7 +22,8 @@ is called with. Beside the room it reads whether the reserve accepts the zone th
 of 0 does not say. A clamp logs, latched, the line zone_scratch_clamp_text builds from those figures; that line and the
 kept zone's WARN share k_zone_scratch_miss_path_text. arena_reserve makes its tail checks through the same zone-sizing
 functions the room is built from, so the bound never makes the reserve refuse a zone it would have reserved without
-it.
+it. It sums its tail once, after rounding the three zones and before any check reads it, with the wrap-checked sum the
+room's tails are summed with, and refuses a sum that wraps with one ERROR line.
 
 A rebuild that something live blocks keeps a SCRATCH zone short of the bound alone when the ONEDNN and RUNTIME zones
 hold their plan, binds the compute arena and keeps the ONEDNN plan, says so through the latched WARN and returns true
@@ -425,7 +426,11 @@ R_CLAMP = "if (device_total_vram > 0 && alloc_size > device_total_vram) {"
 R_CLAMPED = "alloc_size = device_total_vram;"
 R_ROUND = "alloc_size = zone_arena_round_alloc_bytes(alloc_size);"
 R_SINGLE = "const bool try_single_chunk = zone_arena_single_chunk_tried(alloc_size, max_alloc_size, per_chunk_cap);"
-R_TAIL = "const size_t tail_bytes = onednn_bytes + runtime_bytes + scratch_bytes;"
+R_TAIL_DECL = "size_t tail_bytes = 0;"
+R_TAIL = "if (!zone_arena_tail_bytes({ onednn_bytes, runtime_bytes, scratch_bytes }, &tail_bytes)) {"
+R_TAIL_REFUSAL = ("GGML_LOG_ERROR(\"[VRAM-ARENA] Tail zones ONEDNN %zu + RUNTIME %zu + SCRATCH %zu bytes sum past "
+                  "SIZE_MAX\\n\", onednn_bytes, runtime_bytes, scratch_bytes); return false; }")
+R_TAIL_CHECK = R_TAIL + " " + R_TAIL_REFUSAL
 R_SINGLE_CHECK = "if (!zone_arena_chunk_holds_tail(alloc_size, tail_bytes)) {"
 R_CAP_CHECK = "if (!zone_arena_chunk_holds_tail(per_chunk_cap, tail_bytes)) {"
 R_KV = "const size_t tail_kv_reserve = zone_arena_tail_kv_reserve(alloc_size);"
@@ -454,9 +459,8 @@ def claim_reserve_checks_are_the_rooms(uc: str, zs: str) -> bool:
     the reserve's order, and the shape the room reads derives the arena as the reserve does."""
     reserve = fn_body(code(uc), RESERVE_SIG)
     z = code(zs)
-    return (ordered(reserve, R_ZONES, R_CAP, R_CLAMP, R_CLAMPED, R_ROUND, R_SINGLE, R_TAIL, R_SINGLE_CHECK, R_TAIL,
-                    R_CAP_CHECK, R_KV, R_LAST, R_LAST_CHECK, R_WEIGHT_CHECK)
-            and reserve.count(R_TAIL) == 2
+    return (ordered(reserve, R_ZONES, R_TAIL_DECL + " " + R_TAIL, R_CAP, R_CLAMP, R_CLAMPED, R_ROUND, R_SINGLE,
+                    R_SINGLE_CHECK, R_CAP_CHECK, R_KV, R_LAST, R_LAST_CHECK, R_WEIGHT_CHECK)
             and "k_min_shared_bytes) {" not in reserve
             and SHAPE in fn_body(z, SHAPE_SIG)
             and SINGLE_ACCEPTS in fn_body(z, SINGLE_SIG)
@@ -482,6 +486,7 @@ RESERVE_WITNESSES = {
     "KV share fixed": (R_KV, "const size_t tail_kv_reserve = 128ull * 1024ull * 1024ull;"),
     "arena not rounded": (R_ROUND, ""),
     "zones not rounded": ("scratch_bytes = zone_arena_zone_bytes(scratch_bytes);", ""),
+    "tail never summed": (R_TAIL, "if (false) {"),
 }
 
 
@@ -499,6 +504,73 @@ def test_witness_shape_skips_the_device_clamp():
 def test_witness_n_chunk_skips_the_weight_chunks():
     m = mutate_in(ZS, N_CHUNK_SIG, N_CHUNK_WEIGHT, ";")
     assert not claim_reserve_checks_are_the_rooms(UC, m)
+
+
+# ---- the reserve refuses a tail whose sum wraps before either layout reads it ----
+
+SCRATCH_TAIL_SIG = "static bool zone_arena_scratch_tail(size_t other_tail_bytes, size_t scratch_bytes, size_t * tail)"
+SCRATCH_TAIL_SUM = "zone_arena_tail_bytes({ other_tail_bytes, scratch }, tail)"
+TAIL_INLINE = "onednn_bytes + runtime_bytes + scratch_bytes"
+TAIL_INLINE_DECL = "const size_t tail_bytes = " + TAIL_INLINE + ";"
+TAIL_WORD = re.compile(r"\btail_bytes\b")
+TAIL_DECLS = re.compile(r"\bsize_t tail_bytes\w* =")
+
+
+def claim_reserve_refuses_a_wrapped_tail(uc: str, zs: str) -> bool:
+    """arena_reserve declares its tail once and sums it after rounding the three zones, through the wrap-checked sum
+    zone_arena_scratch_tail uses, and refuses a sum that wraps with one ERROR and false before either layout's check,
+    the single chunk's or the N-chunk cap's, reads it. No other sum of the three zones is left in the reserve."""
+    reserve = fn_body(code(uc), RESERVE_SIG)
+    decl = reserve.find(R_TAIL_DECL)
+    check = reserve.find(R_TAIL_CHECK)
+    words = [m.start() for m in TAIL_WORD.finditer(reserve)]
+    return (ordered(reserve, R_ZONES, R_TAIL_DECL, R_TAIL_CHECK, R_SINGLE_CHECK, R_CAP_CHECK)
+            and 0 <= decl < check
+            and words[:2] == [decl + R_TAIL_DECL.index("tail_bytes"), check + R_TAIL.index("&tail_bytes") + 1]
+            and len(TAIL_DECLS.findall(reserve)) == 1
+            and TAIL_INLINE not in reserve
+            and SCRATCH_TAIL_SUM in fn_body(code(zs), SCRATCH_TAIL_SIG))
+
+
+def test_the_reserve_refuses_a_wrapped_tail():
+    assert claim_reserve_refuses_a_wrapped_tail(UC, ZS), (
+        "arena_reserve must sum its tail once through zone_arena_tail_bytes after rounding its zones, refuse a sum "
+        "that wraps with one ERROR and false before either layout reads the tail, and sum it nowhere else; "
+        "zone_arena_scratch_tail must sum the room's tails through the same function")
+
+
+TAIL_WITNESSES = {
+    "tail summed inline, unchecked": (R_TAIL_DECL + " " + R_TAIL_CHECK, TAIL_INLINE_DECL),
+    "refusal does not return": (R_TAIL_REFUSAL, R_TAIL_REFUSAL.replace(" return false;", "")),
+    "single chunk sums its own tail": (R_SINGLE_CHECK, TAIL_INLINE_DECL + " " + R_SINGLE_CHECK),
+    "N-chunk sums its own tail": (R_CAP_CHECK, TAIL_INLINE_DECL + " " + R_CAP_CHECK),
+    "layout re-sums the tail": ("const size_t shared_bytes = alloc_size - tail_bytes;",
+                                "const size_t tail_bytes_final = " + TAIL_INLINE + "; const size_t shared_bytes = "
+                                "alloc_size - tail_bytes_final;"),
+}
+
+
+def test_witnesses_reserve_tail_unchecked():
+    for name, (old, new) in TAIL_WITNESSES.items():
+        m = mutate_in(UC, RESERVE_SIG, old, new)
+        assert not claim_reserve_refuses_a_wrapped_tail(m, ZS), name
+
+
+def test_witness_tail_checked_after_the_single_chunk_reads_it():
+    m = mutate_in(UC, RESERVE_SIG, R_TAIL_CHECK, "")
+    m = mutate_in(m, RESERVE_SIG, R_CAP_CHECK, R_TAIL_CHECK + " " + R_CAP_CHECK)
+    assert not claim_reserve_refuses_a_wrapped_tail(m, ZS)
+
+
+def test_witness_tail_summed_before_the_zones_are_rounded():
+    m = mutate_in(UC, RESERVE_SIG, R_TAIL_DECL + " " + R_TAIL_CHECK, "")
+    m = mutate_in(m, RESERVE_SIG, R_ZONES, R_TAIL_DECL + " " + R_TAIL_CHECK + " " + R_ZONES)
+    assert not claim_reserve_refuses_a_wrapped_tail(m, ZS)
+
+
+def test_witness_scratch_tail_sums_inline():
+    m = mutate_in(ZS, SCRATCH_TAIL_SIG, SCRATCH_TAIL_SUM, "(*tail = other_tail_bytes + scratch, true)")
+    assert not claim_reserve_refuses_a_wrapped_tail(UC, m)
 
 
 # ---- a blocked rebuild keeps the zone and says so ----

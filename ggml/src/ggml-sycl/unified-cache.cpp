@@ -30360,16 +30360,22 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     arena_queue_ = &queue;
 
     // Align zone sizes to the arena's grain. The RUNTIME zone is rounded by the function every RUNTIME plan counts on,
-    // with no floor: the callers apply it. The sizes and the checks on the tail below are zone-sizing.hpp's (its
-    // "arena reserve's checks" section), so the SCRATCH zone's room is planned from the tests made here. Their
-    // zone_arena_chunk_holds_tail refuses a tail whose sum with the 16 MiB shared-zone minimum wraps, where the inline
-    // comparisons it replaced at the single-chunk and per-chunk-cap checks wrapped, accepted, and would have carved
-    // a corrupt layout.
+    // with no floor: the callers apply it. The sizes, the tail's sum and the checks on the tail below are
+    // zone-sizing.hpp's (its "arena reserve's checks" section), so the SCRATCH zone's room is planned from the tests
+    // made here. The tail is summed once, by zone_arena_tail_bytes, and a sum that wraps is refused before either
+    // layout reads it; zone_arena_chunk_holds_tail then refuses a tail whose sum with the 16 MiB shared-zone minimum
+    // wraps. A wrapped sum at either point would pass the chunk checks and carve a corrupt layout.
     scratch_bytes = zone_arena_zone_bytes(scratch_bytes);
     onednn_bytes  = zone_arena_zone_bytes(onednn_bytes);
     if (!zone_runtime_reserved_bytes(0, runtime_bytes, &runtime_bytes)) {
         GGML_LOG_ERROR("[VRAM-ARENA] RUNTIME zone of %zu bytes cannot be rounded to the arena's grain\n",
                        runtime_bytes);
+        return false;
+    }
+    size_t tail_bytes = 0;
+    if (!zone_arena_tail_bytes({ onednn_bytes, runtime_bytes, scratch_bytes }, &tail_bytes)) {
+        GGML_LOG_ERROR("[VRAM-ARENA] Tail zones ONEDNN %zu + RUNTIME %zu + SCRATCH %zu bytes sum past SIZE_MAX\n",
+                       onednn_bytes, runtime_bytes, scratch_bytes);
         return false;
     }
 
@@ -30451,7 +30457,6 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             alloc_size / (1024.0 * 1024.0), per_chunk_cap / (1024.0 * 1024.0), max_alloc_size / (1024.0 * 1024.0));
     }
     if (try_single_chunk) {
-        const size_t tail_bytes = onednn_bytes + runtime_bytes + scratch_bytes;
         if (!zone_arena_chunk_holds_tail(alloc_size, tail_bytes)) {
             GGML_LOG_WARN(
                 "[VRAM-ARENA] Insufficient budget for single-chunk arena: "
@@ -30488,8 +30493,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             // Invariant: alloc_size >= tail_bytes + k_min_shared_bytes
             // (verified above) so shared_bytes > 0 here — there is no
             // silent zero-sized KV+WEIGHT zone.
-            const size_t tail_bytes_final = onednn_bytes + runtime_bytes + scratch_bytes;
-            const size_t shared_bytes     = alloc_size - tail_bytes_final;
+            const size_t shared_bytes = alloc_size - tail_bytes;
 
             auto & kz = arena_zones_[static_cast<int>(vram_zone_id::KV)];
             kz.start  = 0;
@@ -30564,7 +30568,6 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // Rationale for "tail-last": logical offset 0 maps to chunks[0] (the
     // first weight chunk), preserving the single-chunk invariant that the
     // WEIGHT zone starts at offset 0 from the layout pool's perspective.
-    const size_t tail_bytes = onednn_bytes + runtime_bytes + scratch_bytes;
 
     // Pick the last (tail) chunk size: at most per_chunk_cap, at least
     // tail_bytes + k_min_shared_bytes (so KV has a sane carve-out).  If the
