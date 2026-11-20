@@ -1968,6 +1968,46 @@ struct compute_arena_mb_restore {
     ~compute_arena_mb_restore() { set_env_var("GGML_SYCL_COMPUTE_ARENA_MB", had ? value.c_str() : nullptr); }
 };
 
+// The teardown's waits for leases, on its retired authorities and on each chunk, shortened to 100 ms for an arm that
+// holds a chunk lease through a teardown, so the arm does not wait out the 5000 ms default; put back when it returns.
+struct arena_lease_wait_short {
+    arena_lease_wait_short() { unified_cache_test_set_arena_drain_timeout_ms(100); }
+
+    ~arena_lease_wait_short() { unified_cache_test_set_arena_drain_timeout_ms(5000); }
+};
+
+// A chunk lease an arm holds through the cache's chunk lease API (the primitive mem_handle::from_chunk_ptr takes,
+// called directly because that bridge finds the per-device cache, not the arm's own). Declared after the arm's
+// arena_teardown_retry, so the lease is released before the retry's teardown on every return.
+struct held_chunk_lease {
+    unified_cache & cache;
+    int             chunk = -1;
+
+    ~held_chunk_lease() { release(); }
+
+    void release() {
+        if (chunk >= 0) {
+            cache.arena_release_chunk_lease(chunk);
+            chunk = -1;
+        }
+    }
+};
+
+// One pointer inside each chunk of the cache's arena, by chunk index: the first byte of the logical range each chunk
+// starts, or nullptr for a chunk the scan finds no pointer in.
+static std::vector<const void *> arena_pointer_in_each_chunk(unified_cache & cache) {
+    constexpr size_t          mib = 1024ull * 1024ull;
+    std::vector<const void *> in_chunk(static_cast<size_t>(cache.chunk_count()), nullptr);
+    for (size_t offset = 0; offset < cache.arena_total_size(); offset += 1ull * mib) {
+        const void * p     = cache.offset_to_ptr(offset);
+        const int    chunk = cache.arena_find_chunk(p);
+        if (chunk >= 0 && in_chunk[static_cast<size_t>(chunk)] == nullptr) {
+            in_chunk[static_cast<size_t>(chunk)] = p;
+        }
+    }
+    return in_chunk;
+}
+
 // A rebuild whose teardown the device refuses at its first free leaves the arena as it was, and a later load tries the
 // rebuild again. The arena's 8 MiB zones are smaller than the 32 MiB SCRATCH zone the ensure asks for, and nothing
 // holds it, so the ensure tears it down to rebuild it; the device refuses to free the first chunk (the PRIVATE_TESTING
@@ -1976,9 +2016,10 @@ struct compute_arena_mb_restore {
 // SCRATCH zone serves a new allocation inside it. A second ensure tries the teardown again, and that teardown
 // completes.
 // Engagement: the arena is reserved with zones smaller than the ensure's, so the ensure must rebuild it.
-// Mutants: the refused first free not restoring (the authorities stay retired, the SCRATCH zone refuses the
-// allocation, and the second ensure refuses for the earlier cause without trying); the cause read as closed (the second
-// ensure refuses without trying).
+// Mutants: the refused first free not restoring (the authorities stay retired, so the incarnation check finds them
+// changed and the SCRATCH zone refuses the new allocation; FIRST_FREE_FAILED is not read as closed, so the second
+// ensure would still try the teardown and complete it); the cause read as closed (the second ensure refuses without
+// trying).
 static bool arena_teardown_first_free_refusal_restores(sycl::queue & q, bool & skipped) {
     TEST_BEGIN("arena_teardown_first_free_refusal_restores");
     constexpr size_t         mib       = 1024ull * 1024ull;
@@ -2086,7 +2127,9 @@ static bool arena_teardown_restore_finishes_an_interrupted_settle(sycl::queue & 
 
     unified_cache_test_pause_zone_settle(true);
     held.settler        = std::thread([&] { cache.test_zone_boundary_check(vram_zone_id::ONEDNN); });
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    // A deadline, not a measure: the settle thread reaches its barrier at once on an idle host, and this host's
+    // permanent load must not turn a slow start into a failure.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (!unified_cache_test_zone_settle_reached() && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::yield();
     }
@@ -2143,15 +2186,7 @@ static bool arena_teardown_partly_freed_stays_closed(sycl::queue & q, bool & ski
     if (cache.chunk_count() < 3) {
         TEST_SKIP(skipped, "the fixture's arena has fewer than three chunks, so no teardown can fail between frees");
     }
-    // One pointer inside each chunk: the first byte of the logical range each chunk starts.
-    std::vector<const void *> in_chunk(static_cast<size_t>(cache.chunk_count()), nullptr);
-    for (size_t offset = 0; offset < cache.arena_total_size(); offset += 1ull * mib) {
-        const void * p     = cache.offset_to_ptr(offset);
-        const int    chunk = cache.arena_find_chunk(p);
-        if (chunk >= 0 && in_chunk[static_cast<size_t>(chunk)] == nullptr) {
-            in_chunk[static_cast<size_t>(chunk)] = p;
-        }
-    }
+    const std::vector<const void *> in_chunk = arena_pointer_in_each_chunk(cache);
     for (const void * p : in_chunk) {
         TEST_ASSERT(p != nullptr, "a chunk of the fixture's arena has no pointer the test could find");
     }
@@ -2182,38 +2217,24 @@ static bool arena_teardown_partly_freed_stays_closed(sycl::queue & q, bool & ski
 }
 
 // A teardown that finds a lease on the first chunk it tries, which outlives the wait, frees nothing and leaves the
-// arena as it was. The fixture holds a lease on the arena's only chunk through the cache's chunk lease API (the
-// primitive mem_handle::from_chunk_ptr takes, called directly because that bridge finds the per-device cache, not
-// this arm's own); the lease is not an allocation, so the teardown reaches the chunk and waits its 5 s. The refusal
-// naming LEASES_OUTSTANDING is the positive control, and no abort. Then the arena is as it was; once the lease is
-// released, a second teardown completes. The only arm that waits out the 5 s.
+// arena as it was. The fixture holds a lease on the arena's only chunk; the lease is not an allocation, so the
+// teardown reaches the chunk and waits for it, 100 ms here (the arm shortens the wait). The refusal naming
+// LEASES_OUTSTANDING is the positive control, and no abort. Then the arena is as it was; once the lease is released,
+// a second teardown completes.
 // Mutants: the timed-out lease aborting the process, or the chunk freed under the lease (the teardown completes); the
 // refusal not restoring (the SCRATCH zone refuses the allocation).
 static bool arena_teardown_outstanding_lease_restores(sycl::queue & q, bool & skipped) {
     TEST_BEGIN("arena_teardown_outstanding_lease_restores");
-    constexpr size_t     mib       = 1024ull * 1024ull;
-    const size_t         max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
-    unified_cache        cache(q, 64ull * mib, 0, 0, 0);
-    arena_teardown_retry retry{ cache };
+    constexpr size_t       mib       = 1024ull * 1024ull;
+    const size_t           max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    arena_lease_wait_short short_wait;
+    unified_cache          cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry   retry{ cache };
     if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
         TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no teardown was measured");
     }
 
-    // Declared after the retry, so the lease is released before the retry's teardown on every return.
-    struct chunk_lease {
-        unified_cache & cache;
-        int             chunk = -1;
-
-        ~chunk_lease() { release(); }
-
-        void release() {
-            if (chunk >= 0) {
-                cache.arena_release_chunk_lease(chunk);
-                chunk = -1;
-            }
-        }
-    } lease{ cache };
-
+    held_chunk_lease lease{ cache };
     lease.chunk = cache.arena_acquire_chunk_lease(cache.arena_base());
     TEST_ASSERT(lease.chunk == 0 && cache.chunk_count() == 1,
                 "the fixture's lease is not on the only chunk of the arena");
@@ -2236,6 +2257,64 @@ static bool arena_teardown_outstanding_lease_restores(sycl::queue & q, bool & sk
     return true;
 }
 
+// A teardown that finds a lease on a later chunk, after it freed an earlier one, keeps the leased chunk and leaves the
+// arena partly freed and closed: the path where the teardown used to abort. The arena is reserved in three chunks (a
+// 48 MiB per-chunk cap under a 128 MiB budget), and the fixture holds a lease on the second. The teardown frees the
+// first chunk, waits out the lease on the second (100 ms, as the arm shortens the wait), keeps it, and frees the
+// third. The refusal naming LEASES_OUTSTANDING_AFTER_FREE is the positive control, and no abort. The arena refuses a
+// new allocation. Then the lease is released, and an ensure still refuses for the partly freed arena without trying
+// the teardown: the kept chunk is still there. A later teardown frees it and completes.
+// Engagement: the arena has at least three chunks, so a chunk is freed before the leased one and one after it.
+// Mutants: the leased chunk freed after its wait (the first teardown completes); the free loop stopping at the leased
+// chunk (the third chunk is still found); the cause read as restorable (the ensure tries the teardown, which now
+// completes, and does not refuse for the partly freed arena).
+static bool arena_teardown_late_lease_stays_closed(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("arena_teardown_late_lease_stays_closed");
+    constexpr size_t       mib       = 1024ull * 1024ull;
+    const size_t           max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    arena_lease_wait_short short_wait;
+    unified_cache          cache(q, 128ull * mib, 0, 0, 0);
+    arena_teardown_retry   retry{ cache };
+    if (!cache.arena_reserve(q, 128ull * mib, max_alloc, 48ull * mib, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 128 MiB arena, so no teardown was measured");
+    }
+    if (cache.chunk_count() < 3) {
+        TEST_SKIP(skipped, "the fixture's arena has fewer than three chunks, so no lease can sit between frees");
+    }
+    const std::vector<const void *> in_chunk = arena_pointer_in_each_chunk(cache);
+    for (const void * p : in_chunk) {
+        TEST_ASSERT(p != nullptr, "a chunk of the fixture's arena has no pointer the test could find");
+    }
+    held_chunk_lease lease{ cache };
+    lease.chunk = cache.arena_acquire_chunk_lease(in_chunk[1]);
+    TEST_ASSERT(lease.chunk == 1, "the fixture's lease is not on the arena's second chunk");
+
+    TEST_ASSERT(!cache.arena_destroy(), "the teardown completed although a lease held the arena's second chunk");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE,
+                "the teardown did not record the lease that outlived its wait after a chunk was freed");
+    TEST_ASSERT(cache.arena_find_chunk(in_chunk[0]) < 0 && cache.arena_find_chunk(in_chunk[1]) == 1,
+                "the teardown did not free the first chunk, or freed the chunk the lease holds");
+    for (size_t chunk = 2; chunk < in_chunk.size(); ++chunk) {
+        TEST_ASSERT(cache.arena_find_chunk(in_chunk[chunk]) < 0,
+                    "the teardown stopped at the leased chunk instead of freeing the chunks after it");
+    }
+    TEST_ASSERT(!arena_serves_a_new_allocation(cache), "the partly freed arena served a new allocation");
+
+    lease.release();
+    zone_arena_refusal refused;
+    TEST_ASSERT(!cache.ensure_planned_arena_zones(&refused) &&
+                    refused.reason == zone_arena_refusal_reason::TEARDOWN_REFUSED &&
+                    refused.teardown == zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE,
+                "an ensure did not refuse for the partly freed arena");
+    TEST_ASSERT(cache.arena_find_chunk(in_chunk[1]) == 1, "the ensure tried the teardown of the partly freed arena");
+
+    TEST_ASSERT(cache.arena_destroy(), "a teardown after the lease ended did not free the chunk it held");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::NONE && !cache.arena_active(),
+                "the completed teardown left the arena active or the earlier cause recorded");
+    TEST_PASS();
+    return true;
+}
+
 // The arena teardown's refusal classes, each arm on a cache of its own. It runs alone in its process (`--case
 // arena_teardown_refusal_classes`): its arms arm process-wide test hooks, and a refused teardown must not reach another
 // case's cache. Exits 0 when every arm passed, 1 when one failed, and 77 when none failed but one measured nothing.
@@ -2248,6 +2327,7 @@ static int arena_teardown_refusal_classes(sycl::queue & q) {
     ok &= arena_teardown_restore_finishes_an_interrupted_settle(q, skipped);
     ok &= arena_teardown_partly_freed_stays_closed(q, skipped);
     ok &= arena_teardown_outstanding_lease_restores(q, skipped);
+    ok &= arena_teardown_late_lease_stays_closed(q, skipped);
     if (!ok) {
         return 1;
     }

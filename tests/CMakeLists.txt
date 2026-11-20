@@ -4787,9 +4787,9 @@ endif()
 
 # Source gate for a refused VRAM arena teardown: a refusal before the teardown freed any chunk puts the arena back as it
 # was (each group's state, each zone's generation, the retired authority reopened, under every group lock), and a
-# refusal after it freed a chunk restores nothing and leaves FREE_FAILED, the only cause read as closed, until a
-# teardown completes. Host-only, reads the sources as text. Same registration shape as
-# test-sycl-load-stage-effect-pass-source above.
+# refusal after it freed a chunk restores nothing and leaves its cause recorded until a teardown completes: FREE_FAILED
+# or LEASES_OUTSTANDING_AFTER_FREE, the two causes read as closed. Host-only, reads the sources as text. Same
+# registration shape as test-sycl-load-stage-effect-pass-source above.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-arena-destroy-restore-source

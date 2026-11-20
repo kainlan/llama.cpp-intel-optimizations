@@ -3940,7 +3940,8 @@ set_tests_properties(sycl-runtime-alloc-flag-slab-released-at-shutdown PROPERTIE
 )
 # The arena teardown's refusal classes: a teardown refused before it freed any chunk leaves the arena as it was, one
 # refused after it freed a chunk leaves it partly freed and closed. Its own process, because its arms arm process-wide
-# test hooks. It allocates arenas on the device, so it carries `cache` and runs with that family, not in the sweep.
+# test hooks. It allocates arenas on the device, so it carries `cache` and runs with that family, not in the sweep, and
+# alone (RUN_SERIAL): one arm holds a settle thread at a barrier, and a parallel test's load would only slow it.
 set(SYCL_ARENA_TEARDOWN_TEST_ENV
     "ONEAPI_DEVICE_SELECTOR=level_zero:1"
     "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
@@ -3952,6 +3953,7 @@ set_tests_properties(sycl-runtime-alloc-arena-teardown-refusal-classes PROPERTIE
     LABELS "sycl;allocator;runtime;cache;tdd"
     ENVIRONMENT "${SYCL_ARENA_TEARDOWN_TEST_ENV}"
     TIMEOUT 180
+    RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77
 )
 endif() # direct-source static SYCL fixture
