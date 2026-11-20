@@ -94,6 +94,9 @@ REMOVED_WORDS = (
     "DECAY_ALPHA",
     # The lock-free residency overload, kept for a paired-registry reader that the prestage was and nothing else is.
     "is_expert_resident_in",
+    # The SCRATCH-zone device helper only the GPU reorder fill called, and the PP profile counter only it fed.
+    "arena_device_alloc",
+    "pp_scratch_profile_note_device_alloc",
 )
 REMOVED_TAGS = ("[MOE-WARMUP]", "[MOE-GATE-NORM]", "[MOE-RERANK]", "[ADAPTIVE-PRESTAGE]")
 

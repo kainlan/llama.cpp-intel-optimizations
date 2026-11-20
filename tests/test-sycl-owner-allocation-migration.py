@@ -156,6 +156,8 @@ with gate('fattn-failure-atomicity'):
 # leases report through owner_metadata() -- 53->52 unified_alloc( code sites.
 # Removing the legacy expert prestage retired two legacy pairs, its host staging and its reorder buffer --
 # 52->50 unified_alloc( and 41->39 from_legacy_owned_alloc( code sites.
+# arena_device_alloc, the SCRATCH-zone device helper whose only caller was the removed GPU reorder fill, went with
+# it: 50->49 unified_alloc( and 39->38 from_legacy_owned_alloc( code sites.
 RUNTIME_CODE     = _blank_comments(RUNTIME)
 COMMON_CODE      = _blank_comments(COMMON)
 COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
@@ -285,7 +287,7 @@ with gate("every named owner-first site in ggml-sycl.cpp is a guarded, owner-fir
         RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + len(_spans)
 
 for _label, _code, _pins in (
-    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (50, 39, OWNER_FIRST_BASELINE_SITES)),
+    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (49, 38, OWNER_FIRST_BASELINE_SITES)),
     ("common.hpp", COMMON_CODE, (3, 4, 3)),
     ("common.cpp", COMMON_IMPL_CODE, (8, 8, 4)),
 ):

@@ -232,8 +232,6 @@ struct pp_scratch_op_stats {
     uint64_t pool_alloc_failures = 0;
     uint64_t pool_alloc_bytes    = 0;
     uint64_t pool_free_bytes     = 0;
-    uint64_t device_alloc_calls  = 0;
-    uint64_t device_alloc_bytes  = 0;
 };
 
 struct pp_scratch_profile_state {
@@ -304,15 +302,6 @@ static void pp_scratch_profile_note_pool_free(size_t bytes) {
     bucket.pool_free_bytes += bytes;
 }
 
-static void pp_scratch_profile_note_device_alloc(size_t bytes) {
-    if (!t_pp_scratch_profile.active) {
-        return;
-    }
-    auto & bucket = pp_scratch_profile_current_bucket();
-    bucket.device_alloc_calls++;
-    bucket.device_alloc_bytes += bytes;
-}
-
 static void pp_scratch_profile_end() {
     pp_scratch_profile_state stats = t_pp_scratch_profile;
     t_pp_scratch_profile           = {};
@@ -323,10 +312,8 @@ static void pp_scratch_profile_end() {
 
     std::vector<std::pair<int, pp_scratch_op_stats>> sorted(stats.by_op.begin(), stats.by_op.end());
     std::sort(sorted.begin(), sorted.end(), [](const auto & a, const auto & b) {
-        const uint64_t a_bytes = a.second.pool_alloc_bytes + a.second.device_alloc_bytes;
-        const uint64_t b_bytes = b.second.pool_alloc_bytes + b.second.device_alloc_bytes;
-        if (a_bytes != b_bytes) {
-            return a_bytes > b_bytes;
+        if (a.second.pool_alloc_bytes != b.second.pool_alloc_bytes) {
+            return a.second.pool_alloc_bytes > b.second.pool_alloc_bytes;
         }
         return a.second.pool_alloc_calls > b.second.pool_alloc_calls;
     });
@@ -334,25 +321,19 @@ static void pp_scratch_profile_end() {
     fprintf(stderr, "[ARENA-PP-OPS]");
     int printed = 0;
     for (const auto & [op_i, bucket] : sorted) {
-        const uint64_t total_bytes = bucket.pool_alloc_bytes + bucket.device_alloc_bytes;
-        if (total_bytes == 0) {
+        if (bucket.pool_alloc_bytes == 0) {
             continue;
         }
-        fprintf(stderr, " %s:visits=%llu pool=%llu/%llu pool_mb=%.1f device=%llu device_mb=%.1f",
-                ggml_op_name(static_cast<ggml_op>(op_i)), (unsigned long long) bucket.node_visits,
-                (unsigned long long) bucket.pool_alloc_calls, (unsigned long long) bucket.pool_free_calls,
-                bucket.pool_alloc_bytes / (1024.0 * 1024.0), (unsigned long long) bucket.device_alloc_calls,
-                bucket.device_alloc_bytes / (1024.0 * 1024.0));
+        fprintf(stderr, " %s:visits=%llu pool=%llu/%llu pool_mb=%.1f", ggml_op_name(static_cast<ggml_op>(op_i)),
+                (unsigned long long) bucket.node_visits, (unsigned long long) bucket.pool_alloc_calls,
+                (unsigned long long) bucket.pool_free_calls, bucket.pool_alloc_bytes / (1024.0 * 1024.0));
         if (++printed >= 6) {
             break;
         }
     }
-    if (stats.out_of_op.pool_alloc_calls || stats.out_of_op.device_alloc_calls) {
-        fprintf(stderr, " out_of_op:pool=%llu pool_mb=%.1f device=%llu device_mb=%.1f",
-                (unsigned long long) stats.out_of_op.pool_alloc_calls,
-                stats.out_of_op.pool_alloc_bytes / (1024.0 * 1024.0),
-                (unsigned long long) stats.out_of_op.device_alloc_calls,
-                stats.out_of_op.device_alloc_bytes / (1024.0 * 1024.0));
+    if (stats.out_of_op.pool_alloc_calls) {
+        fprintf(stderr, " out_of_op:pool=%llu pool_mb=%.1f", (unsigned long long) stats.out_of_op.pool_alloc_calls,
+                stats.out_of_op.pool_alloc_bytes / (1024.0 * 1024.0));
     }
     fprintf(stderr, "\n");
 }
@@ -29330,30 +29311,6 @@ static ggml_sycl::mem_handle arena_pinned_alloc(size_t bytes, sycl::queue & queu
         return {};
     }
     return ggml_sycl::detail::from_legacy_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
-}
-
-// Device allocation through unified-cache, preferring the SCRATCH zone when available.
-static ggml_sycl::mem_handle arena_device_alloc(size_t bytes, int device_id, sycl::queue & queue) {
-    if (bytes == 0) {
-        return {};
-    }
-    pp_scratch_profile_note_device_alloc(bytes);
-    ggml_sycl::alloc_request req{};
-    req.queue                               = &queue;
-    req.device                              = device_id;
-    req.size                                = bytes;
-    req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
-    req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
-    req.intent.cohort_id                    = "arena-device-scratch";
-    req.intent.constraints.must_device      = true;
-    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
-    ggml_sycl::alloc_handle h{};
-    ggml_sycl::unified_alloc(req, &h);
-    if (!h.ptr) {
-        GGML_LOG_WARN("[arena_device_alloc] device allocation failed for %zu bytes\n", bytes);
-        return {};
-    }
-    return ggml_sycl::detail::from_legacy_owned_alloc(std::move(h), GGML_LAYOUT_AOS);
 }
 
 enum moe_fusion_phase : int {

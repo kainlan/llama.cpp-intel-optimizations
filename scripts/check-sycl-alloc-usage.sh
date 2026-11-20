@@ -167,7 +167,7 @@ MOE_FUSION_LEGACY_PATTERN='fused_alloc'
 # mem_handle built by unified_allocate_owner + mem_handle::from_owned_alloc (canonical contract 1.3, 3.1).
 MOE_PTR_TABLE_LEGACY_PATTERN='\btable_alloc\b'
 MOE_GPU_PROBE_LEGACY_PATTERN='\bprobe_alloc\b'
-GPU_REORDER_TEMP_LEGACY_PATTERN='(std::vector<ggml_sycl::alloc_handle>[[:space:]]+temp_vram_bufs|std::unordered_map<int, std::vector<ggml_sycl::alloc_handle>>[[:space:]]+sec_temp_bufs|alloc_handle[[:space:]]+temp_vram_h|arena_device_alloc\(.*alloc_handle)'
+GPU_REORDER_TEMP_LEGACY_PATTERN='(std::vector<ggml_sycl::alloc_handle>[[:space:]]+temp_vram_bufs|std::unordered_map<int, std::vector<ggml_sycl::alloc_handle>>[[:space:]]+sec_temp_bufs|alloc_handle[[:space:]]+temp_vram_h)'
 REORDER_D2H_STAGE_LEGACY_PATTERN='\bsrc_stage_alloc\b'
 PAYLOAD_STAGE_LEGACY_PATTERN='from_owned_alloc\(std::move\(host_alloc\)'
 GENERIC_OWNED_ALLOC_HANDOFF_PATTERN='from_owned_alloc\(std::move\(alloc\)'

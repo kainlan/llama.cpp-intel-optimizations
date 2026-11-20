@@ -45,7 +45,6 @@
     {"code": "D-FORBID", "key": "gemm.hpp::woq_gemm_q4_0_impl::declaration:req:4bbb0509#0"},
     {"code": "D-FORBID", "key": "getrows.cpp::ggml_sycl_get_rows_device_temp::alloc::declaration:req:7f9c1628#0"},
     {"code": "D-FORBID", "key": "getrows.cpp::ggml_sycl_stage_get_rows_indices::declaration:req:455e47f8#0"},
-    {"code": "D-FORBID", "key": "ggml-sycl.cpp::arena_device_alloc::declaration:req:29bf0e1f#0"},
     {"code": "D-FORBID", "key": "ggml-sycl.cpp::convert_tensor_layout::declaration:staging_req:9d2dd97e#0"},
     {"code": "D-FORBID", "key": "ggml-sycl.cpp::convert_tensor_layout::declaration:tiled_req:c5d5b6d7#0"},
     {"code": "D-FORBID", "key": "ggml-sycl.cpp::debug_validate_persistent_set_rows::declaration:tmp_req:aee79488#0"},

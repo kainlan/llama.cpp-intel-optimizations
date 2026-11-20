@@ -175,7 +175,7 @@ pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause
   `ggml_sycl_set_rows_stage_ptr`, the oneDNN graph `execute`) must sit in a function with a census row (`O_ROWS`), and each
   consuming call of that row pins its queue argument by position and exact text; a callee that takes no queue pins its own
   stream declarations.
-- Witness 9 `Z9-SITE`, `Z9-SIZING`: each of `load_reorder_temp_bytes` (five sites, the fifth being
+- Witness 9 `Z9-SITE`, `Z9-SIZING`: each of `load_reorder_temp_bytes` (four sites, the fourth being
   `sycl_unified_device_temp_alloc`), `woq_packed_bytes`, `mmq_work_counter_bytes`, `set_rows_stage_bytes` that is defined
   must be called by each of its allocation sites and, from a function that is not one of those sites, by `zone-sizing.cpp` or
   `unified-cache.cpp`.

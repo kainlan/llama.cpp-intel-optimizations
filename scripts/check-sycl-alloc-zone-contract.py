@@ -2570,7 +2570,7 @@ O_EXECUTE = "dnnl::graph::sycl_interop::execute"
 # zone sizing. (function, [(file, site function)]). The subjects are absent from the tree today.
 Z9_SIZING_FILES = ("zone-sizing.cpp", "unified-cache.cpp")
 Z9_SITES = (
-    ("load_reorder_temp_bytes", (("convert.cpp", "convert_alloc_device_scratch"), ("ggml-sycl.cpp", "arena_device_alloc"),
+    ("load_reorder_temp_bytes", (("convert.cpp", "convert_alloc_device_scratch"),
                                  ("ggml-sycl.cpp", "ggml_sycl_fill_xmx_tiled"), ("ggml-sycl.cpp", "ggml_sycl_fill_xmx_tiled_host"),
                                  ("ggml-sycl.cpp", "sycl_unified_device_temp_alloc"))),
     ("woq_packed_bytes", (("gemm.hpp", "woq_gemm_q4_0_impl"),)),
