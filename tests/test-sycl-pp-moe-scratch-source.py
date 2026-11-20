@@ -193,6 +193,14 @@ MUTANTS = {
          "        if (ggml_sycl::unified_cache * cache"),
     "the batched claim holds the slot's owners from its activation":
         ("backend", "batched_scratch_claim.take_owners(reserved);", ""),
+    # The claim declared below the result: on an exit the claim then releases its slot while the result still holds
+    # the slot's owners.
+    "the legacy claim is declared before the scratch result it outlives":
+        ("backend",
+         "        pp_moe_onednn_scratch_claim             pp_moe_onednn_scratch_claim_state;\n"
+         "        ggml_sycl::pp_moe_onednn_scratch_result pp_moe_onednn_scratch;",
+         "        ggml_sycl::pp_moe_onednn_scratch_result pp_moe_onednn_scratch;\n"
+         "        pp_moe_onednn_scratch_claim             pp_moe_onednn_scratch_claim_state;"),
     "the legacy result moves the slot's owners out of the cache's claim copy":
         ("backend", "= std::move(reserved.activation_owner);", "= reserved.activation_owner;"),
     "a refused legacy result drops its owners before the claim's release":

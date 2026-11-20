@@ -3571,10 +3571,11 @@ queued work, then releases the PP MoE oneDNN ring, the oneDNN scratchpad pair
 and the reorder temp, reclaims the graph scratch and the deferred frees, and
 tears the arena down when nothing holds it. An arena nothing holds is released,
 its device memory goes back to the card, and the next load's start reserves the
-early arena from start values (`ggml_sycl_load_start_reserve_released_arenas()`).
-A cache with no arena at the release returns `EMPTIED` without marking an arena
-released (`arena_released_`), so the next load's start reserves nothing there
-and that load's entry ensure builds the arena. A start reserve that fails refuses that load by name
+early arena from start values
+(`ggml_sycl_load_start_reserve_released_arenas()`). A cache with no arena at the
+release returns `EMPTIED` without marking an arena released (`arena_released_`),
+so the next load's start reserves nothing there and that load's entry ensure
+builds the arena. A start reserve that fails refuses that load by name
 (`[SYCL] model load refused at its start: <reason>`), and the end of a refused
 load reserves nothing. A device whose cache emptied then holds the published
 terms a device no load has planned on reads (`load_published_terms{}.restore()`,
@@ -3589,40 +3590,39 @@ and the cache marks its release deferred
 (`unified_cache::last_release_deferred()`). The next load's start runs the same
 step again, inside its transaction and before its reserve, asking only the
 marked caches (`ggml_sycl_last_release_scope::DEFERRED_CACHES`). A cache that
-empties clears its mark and gets its published terms back, and the start
-reserve then reserves its early arena, so that load plans as the first load of
-a process does. The start runs the step with a cause of its own
+empties clears its mark and gets its published terms back, and the start reserve
+then reserves its early arena, so that load plans as the first load of a process
+does. The start runs the step with a cause of its own
 (`unified_cache_release_cause::LOAD_START`), which never sets the mark. A cache
 whose arena something still holds keeps its mark and answers a WARN of its own
 (site `load-start`): that load runs on the arena as it is, and a holder still
 there once the failed model is freed is a leak. A start between the abort and
-that free still finds the failed model's buffers, so the line is a WARN, and
-the holders are named after it at WARN as well (`arena_report_holders()` logs
-its holders line at the level its caller passes, ERROR at a refused rebuild and
-at a model release). The next load's start asks again.
-`test-unified-runtime-alloc` scores the start's lines on a hand-built cache, and
-`test-sycl-plan-dry-run` arm (k) scores a load's begin through the backend, held
-and freed. Only a release that empties the cache clears the mark, and a cache
-made fresh carries none, so a process's first load tears nothing down. A cache the step does not ask keeps its terms, and counts
-as emptied for the two-card MoE flag only when it holds no arena; a start that
-asks no cache leaves the flag as it is. A teardown that refuses is an
-ERROR with its cause. Liveness is process-wide, so a model live on either card
-keeps every device's arena, and the entry ensure's last resort (above) stays
-reachable for that case. The MoE inference buffers the first MoE model
-preallocates outside the arena (`moe_preallocate_inference_buffers()`: the
+that free still finds the failed model's buffers, so the line is a WARN, and the
+holders are named after it at WARN as well (`arena_report_holders()` logs its
+holders line at the level its caller passes, ERROR at a refused rebuild and at a
+model release). The next load's start asks again. `test-unified-runtime-alloc`
+scores the start's lines on a hand-built cache, and `test-sycl-plan-dry-run` arm
+(k) scores a load's begin through the backend, held and freed. Only a release
+that empties the cache clears the mark, and a cache made fresh carries none, so
+a process's first load tears nothing down. A cache the step does not ask keeps
+its terms, and counts as emptied for the two-card MoE flag only when it holds no
+arena; a start that asks no cache leaves the flag as it is. A teardown that
+refuses is an ERROR with its cause. Liveness is process-wide, so a model live on
+either card keeps every device's arena, and the entry ensure's last resort
+(above) stays reachable for that case. The MoE inference buffers the first MoE
+model preallocates outside the arena (`moe_preallocate_inference_buffers()`: the
 expert pointer tables, the IDs staging, the compact pointer list and its missing
 flag) are not released here and are kept for the process: readers hold
 non-owning views into three of them, and a later model that needs larger ones
-falls back to runtime allocations. `tests/test-sycl-last-release-source.py` pins the
-wiring, `last_release_empties_the_arena` in the
+falls back to runtime allocations. `tests/test-sycl-last-release-source.py` pins
+the wiring, `last_release_empties_the_arena` in the
 `sycl-runtime-alloc-last-release-empties-the-arena` ctest (binary
 `test-sycl-runtime-alloc`) drives the step, its refusals and a deferred release
 on a hand-built cache, and arm (j) of `test-sycl-plan-dry-run` ends a refused
-load with no model live (the stage's early failure hook refuses it after
-device 0 rebuilt its arena for the load) and checks that the next load's start
-reserves the first arena's zones and that its early pass decides the zones the
-process's first load of the same inventory decided, read by `main` before any
-arm.
+load with no model live (the stage's early failure hook refuses it after device
+0 rebuilt its arena for the load) and checks that the next load's start reserves
+the first arena's zones and that its early pass decides the zones the process's
+first load of the same inventory decided, read by `main` before any arm.
 
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
 holds the compute term the load measured at the context and micro-batch the

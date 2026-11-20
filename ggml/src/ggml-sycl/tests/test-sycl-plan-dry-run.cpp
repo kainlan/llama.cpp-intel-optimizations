@@ -1930,7 +1930,8 @@ arm_result arm_j_refused_load_leaves_nothing_sized_for_it() {
 //   L3's begin, the page dropped: one line names the start on device 0, the INFO that the arena is released; the mark
 //              is clear, the begin's reserve built the first arena's zones (g_first_zones), and device 0's published
 //              terms are at their start values, but for the zone plan, which that reserve stores for the arena it
-//              built. Device 1, which carried no mark, keeps a scatter sentinel written before L3's begin. L3 ends
+//              built. Device 1, which carried no mark, keeps a scatter sentinel written before L3's begin; with no
+//              device 1, or one that shares device 0's cache, that leg does not run and a WARN line says why. L3 ends
 //              uncommitted, which releases every arena.
 // Engagement: the first arena's zones were read before any arm; L1's begin returned OK and the sentinels read back;
 // after L1's end the page lies in device 0's RUNTIME zone, that arena is active with a RUNTIME zone above the first
@@ -2039,6 +2040,15 @@ arm_result arm_k_load_start_runs_the_deferred_release() {
     // Device 1, when it has a cache of its own, carries no mark: a start that asked it would put its terms back.
     const bool other =
         ggml_backend_sycl_get_device_count() > 1 && sentinel.size() > 1 && get_unified_cache_for_device(1) != cache;
+    if (!other) {
+        // The other legs stand without device 1, so the arm is not VOID; the line says the start's scope went
+        // unscored, so a start that asks every cache would still pass.
+        const char * why = ggml_backend_sycl_get_device_count() > 1 && sentinel.size() > 1 ?
+                               "device 1 shares device 0's cache" :
+                               "there is no device 1";
+        std::printf("WARN (k) the leg that a load's start asks only the marked caches did not run: %s\n", why);
+        std::fflush(stdout);
+    }
     const size_t scatter = other ? sentinel[1].scatter : 0;
     page.clear();
     if (other) {
