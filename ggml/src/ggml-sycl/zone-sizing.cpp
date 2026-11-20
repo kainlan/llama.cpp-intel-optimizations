@@ -296,7 +296,7 @@ bool zone_moe_mmvq_op_bytes(const zone_moe_mmvq_operand & op, int64_t n_tokens, 
         return false;
     }
     *out = 0;
-    if (op.k <= 0 || n_tokens <= 0 || n_expert_used <= 0) {
+    if (op.k <= 0 || op.grouped_experts < 0 || n_tokens <= 0 || n_expert_used <= 0) {
         return false;
     }
     *out = SIZE_MAX;  // every return below is an overflow
@@ -320,7 +320,32 @@ bool zone_moe_mmvq_op_bytes(const zone_moe_mmvq_operand & op, int64_t n_tokens, 
     if (ids > SIZE_MAX - q8) {
         return false;
     }
-    *out = q8 + ids;
+
+    // The grouped tables, in entries: experts, offsets (experts + 1), rows (total_batches), chunk groups and chunk
+    // starts (max_chunks each: every expert's rows cut into chunks of k_zone_mxfp4_moe_group_rows), and the counter.
+    size_t tables = 0;
+    if (op.grouped_experts > 0) {
+        const size_t experts         = static_cast<size_t>(op.grouped_experts);
+        const size_t group_rows      = static_cast<size_t>(k_zone_mxfp4_moe_group_rows);
+        const size_t chunks_a_expert = token_slots / group_rows + (token_slots % group_rows != 0 ? 1 : 0);
+        if (experts > (SIZE_MAX - 2) / 2 || chunks_a_expert > SIZE_MAX / experts) {
+            return false;
+        }
+        const size_t max_chunks = experts * chunks_a_expert;
+        const size_t fixed      = 2 * experts + 2;  // experts, offsets, and the counter
+        if (max_chunks > (SIZE_MAX - fixed) / 2 || token_slots > SIZE_MAX - fixed - 2 * max_chunks) {
+            return false;
+        }
+        const size_t entries = fixed + token_slots + 2 * max_chunks;
+        if (entries > SIZE_MAX / sizeof(int32_t)) {
+            return false;
+        }
+        tables = entries * sizeof(int32_t);
+    }
+    if (tables > SIZE_MAX - q8 - ids) {
+        return false;
+    }
+    *out = q8 + ids + tables;
     return true;
 }
 
@@ -333,7 +358,8 @@ bool zone_moe_mmvq_scratch_bytes(const std::vector<zone_moe_mmvq_operand> & ops,
     }
     *out = {};
     if (n_tokens <= 0 || n_expert_used <= 0 ||
-        std::any_of(ops.begin(), ops.end(), [](const zone_moe_mmvq_operand & op) { return op.k <= 0; })) {
+        std::any_of(ops.begin(), ops.end(),
+                    [](const zone_moe_mmvq_operand & op) { return op.k <= 0 || op.grouped_experts < 0; })) {
         return false;
     }
     bool exact = true;
@@ -351,10 +377,24 @@ bool zone_moe_mmvq_scratch_bytes(const std::vector<zone_moe_mmvq_operand> & ops,
     return exact;
 }
 
-zone_scratch_plan zone_scratch_zone_plan(size_t default_bytes, size_t nonfa_bytes, size_t moe_mmvq_bytes) {
+size_t zone_scratch_required_bytes(size_t default_bytes, size_t nonfa_bytes) {
+    return std::max(default_bytes, nonfa_bytes);
+}
+
+zone_scratch_plan zone_scratch_zone_plan(size_t default_bytes,
+                                         size_t nonfa_bytes,
+                                         size_t moe_mmvq_bytes,
+                                         size_t budget_cap_bytes,
+                                         size_t room_bytes) {
     zone_scratch_plan plan;
-    plan.required = std::max(default_bytes, nonfa_bytes);
-    plan.wanted   = std::max(plan.required, moe_mmvq_bytes);
+    plan.required         = zone_scratch_required_bytes(default_bytes, nonfa_bytes);
+    // The room is on top of what the zone must hold; SIZE_MAX, no limit, saturates.
+    const size_t room_cap = room_bytes > SIZE_MAX - plan.required ? SIZE_MAX : plan.required + room_bytes;
+    const size_t limit    = std::min(budget_cap_bytes, room_cap);
+    plan.wanted           = std::max(plan.required, std::min(moe_mmvq_bytes, limit));
+    if (moe_mmvq_bytes > plan.required && moe_mmvq_bytes > limit) {
+        plan.clamp = room_cap <= budget_cap_bytes ? zone_scratch_clamp::ROOM : zone_scratch_clamp::BUDGET;
+    }
     return plan;
 }
 
@@ -365,8 +405,8 @@ size_t zone_scratch_kept_bytes(const zone_scratch_plan & plan, size_t capacity_b
     return capacity_bytes;
 }
 
-bool zone_kept_scratch_warn_due(size_t latched_wanted_bytes, size_t wanted_bytes) {
-    return wanted_bytes > latched_wanted_bytes;
+bool zone_scratch_warn_due(size_t latched_bytes, size_t bytes) {
+    return bytes > latched_bytes;
 }
 
 bool zone_dequant_f16_weight_bytes(int64_t ne0, int64_t ne1, size_t * out) {
@@ -585,6 +625,103 @@ bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, si
     // The reserved zone already carries the arena's rounding, so every byte above it was grown.
     size_t reserved = 0;
     return zone_runtime_reserved_bytes(floor_bytes, requirement, &reserved) && live_zone_bytes > reserved;
+}
+
+size_t zone_arena_zone_bytes(size_t bytes) {
+    return (bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+}
+
+size_t zone_arena_round_alloc_bytes(size_t bytes) {
+    return (bytes / k_zone_arena_size_alignment) * k_zone_arena_size_alignment;
+}
+
+size_t zone_arena_per_chunk_cap(size_t max_alloc_size, size_t safe_max_alloc_size) {
+    if (safe_max_alloc_size == 0) {
+        return max_alloc_size;
+    }
+    return max_alloc_size > 0 ? std::min(max_alloc_size, safe_max_alloc_size) : safe_max_alloc_size;
+}
+
+bool zone_arena_single_chunk_tried(size_t alloc_bytes, size_t max_alloc_size, size_t per_chunk_cap) {
+    return max_alloc_size == 0 || alloc_bytes <= per_chunk_cap;
+}
+
+size_t zone_arena_tail_kv_reserve(size_t alloc_bytes) {
+    constexpr size_t k_min_tail_kv_reserve = 128ull * 1024ull * 1024ull;
+    constexpr size_t k_max_tail_kv_reserve = 512ull * 1024ull * 1024ull;
+    const size_t     proportional_kv       = std::max<size_t>(alloc_bytes / 128, k_zone_arena_min_shared_bytes);
+    return std::min(k_max_tail_kv_reserve, std::max(k_min_tail_kv_reserve, proportional_kv));
+}
+
+size_t zone_arena_tail_chunk_bytes(size_t alloc_bytes,
+                                   size_t per_chunk_cap,
+                                   size_t tail_bytes,
+                                   size_t tail_kv_reserve) {
+    const size_t wanted = tail_kv_reserve > SIZE_MAX - tail_bytes ? SIZE_MAX : tail_bytes + tail_kv_reserve;
+    return std::min({ wanted, per_chunk_cap, alloc_bytes });
+}
+
+bool zone_arena_chunk_holds_tail(size_t chunk_bytes, size_t tail_bytes) {
+    return tail_bytes <= SIZE_MAX - k_zone_arena_min_shared_bytes &&
+           chunk_bytes >= tail_bytes + k_zone_arena_min_shared_bytes;
+}
+
+bool zone_arena_weight_chunks_fit(size_t alloc_bytes, size_t tail_chunk_bytes) {
+    return tail_chunk_bytes <= alloc_bytes && alloc_bytes - tail_chunk_bytes >= k_zone_arena_min_shared_bytes;
+}
+
+zone_arena_reserve_shape zone_arena_reserve_shape_of(size_t budget_bytes,
+                                                     size_t device_total_vram,
+                                                     size_t max_alloc_size,
+                                                     size_t safe_max_alloc_size) {
+    zone_arena_reserve_shape shape;
+    const size_t arena  = device_total_vram > 0 && budget_bytes > device_total_vram ? device_total_vram : budget_bytes;
+    shape.alloc_bytes   = zone_arena_round_alloc_bytes(arena);
+    shape.per_chunk_cap = zone_arena_per_chunk_cap(max_alloc_size, safe_max_alloc_size);
+    shape.single_chunk  = zone_arena_single_chunk_tried(shape.alloc_bytes, max_alloc_size, shape.per_chunk_cap);
+    shape.tail_kv_reserve = zone_arena_tail_kv_reserve(shape.alloc_bytes);
+    return shape;
+}
+
+bool zone_arena_single_chunk_accepts(const zone_arena_reserve_shape & shape, size_t tail_bytes) {
+    return shape.single_chunk && zone_arena_chunk_holds_tail(shape.alloc_bytes, tail_bytes);
+}
+
+bool zone_arena_n_chunk_accepts(const zone_arena_reserve_shape & shape, size_t tail_bytes) {
+    const size_t tail_chunk =
+        zone_arena_tail_chunk_bytes(shape.alloc_bytes, shape.per_chunk_cap, tail_bytes, shape.tail_kv_reserve);
+    return zone_arena_chunk_holds_tail(tail_chunk, tail_bytes) &&
+           zone_arena_weight_chunks_fit(shape.alloc_bytes, tail_chunk);
+}
+
+size_t zone_arena_scratch_room(const zone_arena_reserve_shape & shape, size_t other_tail_bytes, size_t scratch_bytes) {
+    const size_t scratch = zone_arena_zone_bytes(scratch_bytes);
+    if (scratch < scratch_bytes || other_tail_bytes > SIZE_MAX - scratch) {
+        return 0;  // the rounding or the tail wrapped: no zone the reserve could carve
+    }
+    const size_t base    = other_tail_bytes + scratch;
+    const bool   single  = zone_arena_single_chunk_accepts(shape, base);
+    const bool   n_chunk = zone_arena_n_chunk_accepts(shape, base);
+    if (!single && !n_chunk) {
+        return 0;
+    }
+    // Each check fails only as the tail grows, so the tails that keep every check passing are those up to one largest.
+    const auto passes = [&](size_t tail) {
+        return (!single || zone_arena_single_chunk_accepts(shape, tail)) &&
+               (!n_chunk || zone_arena_n_chunk_accepts(shape, tail));
+    };
+    // Every passing tail lies inside the arena (base passed one check, so base < alloc), which bounds the search.
+    size_t lo = 0;
+    size_t hi = (shape.alloc_bytes - base) / k_zone_arena_alignment;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo + 1) / 2;
+        if (passes(base + mid * k_zone_arena_alignment)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo * k_zone_arena_alignment;
 }
 
 bool zone_runtime_requirement(const zone_runtime_terms & terms, size_t * out) {
@@ -812,8 +949,9 @@ std::string zone_scratch_use_text(const zone_scratch_use & use, int device, size
     char             line[512];
     std::snprintf(line, sizeof(line),
                   "[UNIFIED-CACHE] SCRATCH zone use: device=%d high-water=%.2f MB of %.2f MB with %zu allocations "
-                  "live, largest request=%.2f MB, requests placed=%zu; zone misses, sent to raw device memory: "
-                  "requests=%zu bytes=%.2f MB largest=%.2f MB",
+                  "live, largest request=%.2f MB, requests placed=%zu; zone misses (placements the zone refused, "
+                  "each spilled to raw device memory or refused by its caller): requests=%zu bytes=%.2f MB "
+                  "largest=%.2f MB",
                   device, use.high_water_bytes / mib, capacity_bytes / mib, use.live_at_high_water,
                   use.largest_request_bytes / mib, use.requests, use.misses, use.miss_bytes / mib,
                   use.largest_miss_bytes / mib);
