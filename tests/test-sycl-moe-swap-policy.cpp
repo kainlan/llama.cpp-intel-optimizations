@@ -712,15 +712,27 @@ static void test_a_call_of_the_wrong_shape_is_rejected() {
     {
         moe_swap_state s(2, 8);
         table          t(3, 8);
-        CHECK(step(s, p, t, out) == MOE_SWAP_STATUS_REJECTED);
-        CHECK(out.empty());
-        CHECK(s.tokens == 0);
+        t.decode[0][6] = 10;           // a count the refused calls must not absorb, as they must not move the clock
+        for (int i = 0; i < 4; ++i) {  // a whole period, so a boundary would have absorbed it
+            out.resize(1);
+            CHECK(step(s, p, t, out) == MOE_SWAP_STATUS_REJECTED);
+            CHECK(out.empty());
+            CHECK(s.tokens == 0);
+            CHECK(s.usage_of(0, 6) == 0.0);
+        }
 
         table t16(2, 16);  // the right number of blocks, the wrong number of experts
+        t16.decode[0][6] = 10;
+        for (int i = 0; i < 4; ++i) {
+            out.resize(1);
+            CHECK(step(s, p, t16, out) == MOE_SWAP_STATUS_REJECTED);
+            CHECK(out.empty());
+            CHECK(s.tokens == 0);
+            CHECK(s.usage_of(0, 6) == 0.0);
+        }
         out.resize(1);
-        CHECK(step(s, p, t16, out) == MOE_SWAP_STATUS_REJECTED);
-        CHECK(out.empty());
-        CHECK(s.tokens == 0);
+        CHECK(step(s, p, t16, out, false, true) == MOE_SWAP_STATUS_REJECTED);  // and a prompt call
+        CHECK(s.usage_of(0, 6) == 0.0);
 
         moe_swap_call c;
         c.n_blocks  = 2;
@@ -908,6 +920,15 @@ static void test_null_counts_mean_unchanged_and_a_block_without_residency_is_ski
     CHECK(moe_swap_step(s, p, c, out) == MOE_SWAP_STATUS_ADAPTED);
     CHECK(out.empty());
     CHECK(near(s.usage_of(0, 6), 49.0));  // it still decayed
+
+    in.resident      = resident.data();   // both count arrays null in the same call: nothing to absorb, usage decays
+    in.decode_counts = nullptr;
+    in.prompt_counts = nullptr;
+    for (int i = 0; i < 3; ++i) {
+        CHECK(moe_swap_step(s, p, c, out) == MOE_SWAP_STATUS_WAITING);
+    }
+    CHECK(moe_swap_step(s, p, c, out) == MOE_SWAP_STATUS_ADAPTED);
+    CHECK(near(s.usage_of(0, 6), 34.3));  // 49 * 0.7, no count added
 }
 
 // A max_swaps below zero proposes nothing, like zero, and usage still decays.
