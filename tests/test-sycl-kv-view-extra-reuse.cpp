@@ -152,6 +152,25 @@
 // forever, making the "count stayed bounded" assertion pass for the wrong
 // reason) fails loudly instead of passing vacuously.
 //
+// THE BUFFER'S OWN EXTRAS (check_kv_buffer_releases_its_extras, run first on
+// a buffer of its own, with no graph, so nothing but that buffer's init and
+// free moves the count it reads). init_tensor also makes an extra for each
+// of the buffer's own K and V tensors, and set_data_device gives it a data
+// handle that, for a layer in the arena, is a chunk lease on the layer's
+// arena chunk (site tensor_extra). The buffer must release those extras at
+// its free; without that each one and its lease would outlive the buffer,
+// the context and the model, two per layer, and the read after the free
+// would be the first read plus 2 * N_LAYERS. The case reads
+// unified_cache::arena_chunk_lease_count_at({tensor_extra, copy=false})
+// before the buffer, after init (at least 2 * N_LAYERS above that: the
+// positive control, and a failure when it does not hold) and after
+// ggml_backend_buffer_free (must equal the first read). `copy = true`
+// counts the leases copies of such handles took; the buffer makes none, so
+// that count must not move at all. It reserves a small arena first if the
+// process has none (as test-sycl-compute-buffer-kv-zone does), because a KV
+// layer outside the arena takes no chunk lease. It returns 0 on a pass, 1
+// on a failure, and LLAMA_TEST_EXIT_SKIP when the arena is switched off.
+//
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-kv-view-extra-reuse
 
@@ -232,6 +251,116 @@ void build_graph(ggml_context * ctx,
     }
 }
 
+// The extra-release case: see "THE BUFFER'S OWN EXTRAS" in the file header.
+int check_kv_buffer_releases_its_extras(ggml_backend_buffer_type_t kv_buft) {
+    const int                  device = 0;  // in-process index after selector filtering
+    ggml_sycl::unified_cache * cache  = ggml_sycl::get_unified_cache_for_device(device);
+    if (cache == nullptr) {
+        fprintf(stderr, "FAIL: no unified cache for device %d; the lease counts cannot be read\n", device);
+        return 1;
+    }
+    if (!ggml_sycl::vram_arena_enabled()) {
+        fprintf(stderr,
+                "SKIP: the VRAM arena is switched off (GGML_SYCL_VRAM_ARENA=0), so no KV layer is an arena chunk "
+                "sub-allocation and no tensor extra takes a chunk lease -- the extra-release case measured "
+                "nothing.\n");
+        return LLAMA_TEST_EXIT_SKIP;
+    }
+    // A process that loads no model has no arena until something reserves one; the KV zone lives in it.
+    if (!cache->arena_active()) {
+        ggml_sycl::unified_cache_reserve_compute_arena(device, 64u << 20);
+    }
+    if (!cache->arena_active() || cache->zone_available(ggml_sycl::vram_zone_id::KV) < TOTAL_BYTES) {
+        fprintf(stderr,
+                "FAIL: precondition: no active VRAM arena with %zu bytes free in its KV zone (arena_active=%d) -- "
+                "the KV layers would not be arena chunk sub-allocations and the lease count could not move\n",
+                TOTAL_BYTES, cache->arena_active() ? 1 : 0);
+        return 1;
+    }
+
+    const ggml_sycl::chunk_lease_tag held{ ggml_sycl::chunk_lease_site::TENSOR_EXTRA, false };
+    const ggml_sycl::chunk_lease_tag copied{ ggml_sycl::chunk_lease_site::TENSOR_EXTRA, true };
+    const uint32_t                   before      = cache->arena_chunk_lease_count_at(held);
+    const uint32_t                   before_copy = cache->arena_chunk_lease_count_at(copied);
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 2 * N_LAYERS + 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * tctx = ggml_init(params);
+    if (!tctx) {
+        fprintf(stderr, "FAIL: ggml_init (extra-release case) failed\n");
+        return 1;
+    }
+    std::vector<ggml_tensor *> tensors;
+    for (uint32_t l = 0; l < N_LAYERS; ++l) {
+        char name[32];
+        snprintf(name, sizeof(name), "cache_k_l%u", l);
+        tensors.push_back(ggml_new_tensor_1d(tctx, GGML_TYPE_F16, static_cast<int64_t>(K_BYTES / sizeof(ggml_fp16_t))));
+        ggml_set_name(tensors.back(), name);
+        snprintf(name, sizeof(name), "cache_v_l%u", l);
+        tensors.push_back(ggml_new_tensor_1d(tctx, GGML_TYPE_F16, static_cast<int64_t>(V_BYTES / sizeof(ggml_fp16_t))));
+        ggml_set_name(tensors.back(), name);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(kv_buft, TOTAL_BYTES);
+    if (!buf) {
+        fprintf(stderr, "FAIL: tiered KV buffer allocation failed (extra-release case)\n");
+        ggml_free(tctx);
+        return 1;
+    }
+    uint8_t * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buf));
+    bool      ok   = true;
+    for (size_t i = 0; i < tensors.size() && ok; ++i) {
+        const size_t layer_off = (i / 2) * KV_PER_LAYER + (i % 2) * K_BYTES;
+        if (ggml_backend_tensor_alloc(buf, tensors[i], base + layer_off) != GGML_STATUS_SUCCESS ||
+            tensors[i]->extra == nullptr) {
+            fprintf(stderr, "FAIL: %s did not initialise with an extra (extra-release case)\n", tensors[i]->name);
+            ok = false;
+        }
+    }
+    const uint32_t after_init      = cache->arena_chunk_lease_count_at(held);
+    const uint32_t after_init_copy = cache->arena_chunk_lease_count_at(copied);
+    printf("extra-release: tensor_extra leases before=%u after_init=%u (copy before=%u after_init=%u)\n", before,
+           after_init, before_copy, after_init_copy);
+    // The positive control: without it a count that never moved would read as a clean release.
+    if (ok && after_init < before + 2 * N_LAYERS) {
+        fprintf(stderr,
+                "FAIL: positive control: init raised the tensor_extra lease count by %d, expected at least %u (one "
+                "per K and V tensor) -- the case cannot see whether the free releases them\n",
+                static_cast<int>(after_init) - static_cast<int>(before), 2 * N_LAYERS);
+        ok = false;
+    }
+    if (ok && after_init_copy != before_copy) {
+        fprintf(stderr, "FAIL: init took %d copied tensor_extra leases, expected none\n",
+                static_cast<int>(after_init_copy) - static_cast<int>(before_copy));
+        ok = false;
+    }
+
+    ggml_backend_buffer_free(buf);
+    const uint32_t after_free      = cache->arena_chunk_lease_count_at(held);
+    const uint32_t after_free_copy = cache->arena_chunk_lease_count_at(copied);
+    printf("extra-release: tensor_extra leases after_free=%u (copy after_free=%u)\n", after_free, after_free_copy);
+    if (ok && after_free != before) {
+        fprintf(stderr,
+                "FAIL: %d tensor_extra chunk leases outlive the KV buffer (before=%u after_free=%u) -- the buffer did "
+                "not release the extras its init_tensor made\n",
+                static_cast<int>(after_free) - static_cast<int>(before), before, after_free);
+        ok = false;
+    }
+    if (ok && after_free_copy != before_copy) {
+        fprintf(stderr, "FAIL: %d copied tensor_extra chunk leases outlive the KV buffer (before=%u after_free=%u)\n",
+                static_cast<int>(after_free_copy) - static_cast<int>(before_copy), before_copy, after_free_copy);
+        ok = false;
+    }
+    // The tensors' ->extra fields dangle from the free on, as they do in llama's KV cache; nothing reads them.
+    ggml_free(tctx);
+    if (ok) {
+        printf("extra-release: PASS\n");
+    }
+    return ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int, char ** argv) {
@@ -277,6 +406,20 @@ int main(int, char ** argv) {
         plan.layer_device[l] = 0;
     }
     ggml_sycl::test_set_kv_placement_plan(plan, N_LAYERS, KV_PER_LAYER);
+
+    // Runs first, on its own buffer, so its lease count is read before any graph has run in this process. A skip
+    // (the arena is off) still runs the view checks below and turns the exit into a skip only if they pass.
+    // The case reserves a 64 MiB arena when the process has none and leaves it reserved, so after a pass the view loop
+    // below runs on the arena path: its KV layers are arena KV-zone sub-allocations, not separate device allocations.
+    // After a skip no arena was reserved and the loop runs on the non-arena path.
+    const int extra_release_rc = check_kv_buffer_releases_its_extras(ggml_backend_sycl_kv_buffer_type(0));
+    if (extra_release_rc != 0 && extra_release_rc != LLAMA_TEST_EXIT_SKIP) {
+        ggml_sycl::test_clear_kv_placement_plan();
+        ggml_backend_free(cpu);
+        ggml_backend_free(backend);
+        fprintf(stderr, "test-sycl-kv-view-extra-reuse: FAIL\n");
+        return 1;
+    }
 
     // Persistent K/V tensors, allocated once through the tiered KV buffer --
     // mirrors how llama's KV cache tensors outlive every ephemeral per-decode
@@ -542,6 +685,12 @@ int main(int, char ** argv) {
     if (!ok) {
         fprintf(stderr, "test-sycl-kv-view-extra-reuse: FAIL\n");
         return 1;
+    }
+    if (extra_release_rc == LLAMA_TEST_EXIT_SKIP) {
+        fprintf(stderr,
+                "SKIP: the view checks passed, but the extra-release case measured nothing (the VRAM arena is "
+                "off)\n");
+        return LLAMA_TEST_EXIT_SKIP;
     }
     printf("test-sycl-kv-view-extra-reuse: PASS\n");
     return 0;
