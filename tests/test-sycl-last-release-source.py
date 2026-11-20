@@ -648,3 +648,11 @@ def test_witness_last_resort_comment_without_why():
     k = GS_RAW.find(LAST_RESORT_SIG)
     assert k != -1
     assert check_last_resort_comment(GS_RAW[:k] + GS_RAW[k:].replace("another device", "the device", 1))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
