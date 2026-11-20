@@ -5425,6 +5425,101 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     }
 };
 
+// MUL_MAT_ID whose ids are constructed, not shuffled: experts 0, 1, 2 and 3 receive exactly 1, 8, 9 and 0 of the
+// n * n_used selections, and the rest are spread over the other experts as evenly as possible. A backend that runs
+// a prompt as one multiplication per expert sizes each one by its expert's row count, so these counts hold a group
+// of a single row, the largest group a mat-vec kernel takes on the SYCL backend (8, MMVQ_MAX_BATCH_SIZE), the
+// smallest group above it, and an expert no row names, in every run. The random cases reach those sizes only by
+// chance. "groups=" in vars() lists the counts per expert, so -p 'groups=' selects these cases.
+struct test_mul_mat_id_groups : public test_mul_mat_id {
+    std::vector<int64_t> groups; // selections per expert, summing to n * n_used
+
+    static std::vector<int64_t> make_groups(int n_mats, int n_used, int64_t n) {
+        static const int64_t fixed[] = { 1, 8, 9, 0 };
+        const int            n_fixed = (int) (sizeof(fixed) / sizeof(fixed[0]));
+        GGML_ASSERT(n_mats > n_fixed);
+        std::vector<int64_t> g(fixed, fixed + n_fixed);
+        const int64_t rest   = n * n_used - (1 + 8 + 9);
+        const int64_t n_rest = n_mats - n_fixed;
+        GGML_ASSERT(rest >= 0);
+        for (int64_t e = 0; e < n_rest; e++) {
+            g.push_back(rest / n_rest + (e < rest % n_rest ? 1 : 0));
+        }
+        return g;
+    }
+
+    test_mul_mat_id_groups(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k),
+          groups(make_groups(n_mats, n_used, n)) {
+        for (int64_t g : groups) {
+            // An expert named by more than n selections would have to appear twice in some row.
+            GGML_ASSERT(g <= n);
+        }
+    }
+
+    std::string vars() override {
+        std::string s = test_mul_mat_id::vars() + ",groups=";
+        for (size_t e = 0; e < groups.size(); e++) {
+            s += (e == 0 ? "" : "/") + std::to_string(groups[e]);
+        }
+        return s;
+    }
+
+    // Lay the selections out expert by expert in one list of n * n_used entries and give row r, column c the entry
+    // c * n + r. An expert's entries are a run no longer than n, so they land on distinct rows, and a row's n_used
+    // columns hold distinct experts. The columns past n_used (not read) take the row's unused experts in order.
+    void set_ids(ggml_context * ctx) {
+        std::vector<int32_t> list;
+        list.reserve((size_t) (n * n_used));
+        for (size_t e = 0; e < groups.size(); e++) {
+            list.insert(list.end(), (size_t) groups[e], (int32_t) e);
+        }
+        GGML_ASSERT((int64_t) list.size() == n * n_used);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            GGML_ASSERT(t->ne[0] == n_mats && ggml_nrows(t) == n);
+            std::vector<int64_t> counts((size_t) n_mats * (size_t) n_mats, 0);
+            for (int64_t r = 0; r < n; r++) {
+                std::vector<int32_t> row;
+                std::vector<bool>    used((size_t) n_mats, false);
+                for (int c = 0; c < n_used; c++) {
+                    const int32_t e = list[(size_t) (c * n + r)];
+                    GGML_ASSERT(!used[(size_t) e]);
+                    used[(size_t) e] = true;
+                    row.push_back(e);
+                }
+                for (int32_t e = 0; e < n_mats; e++) {
+                    if (!used[(size_t) e]) {
+                        row.push_back(e);
+                    }
+                }
+                for (int c = 0; c < n_mats; c++) {
+                    counts[(size_t) c * (size_t) n_mats + (size_t) row[(size_t) c]]++;
+                }
+                ggml_backend_tensor_set(t, row.data(), r * t->nb[1], n_mats * sizeof(int32_t));
+            }
+            if (mul_mat_id_ids_trace_enabled()) {
+                print_mul_mat_id_ids(t, counts, n_mats, 0);
+            }
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+        set_ids(ctx);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        set_ids(ctx);
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -10880,6 +10975,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : {16, 32, 64}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 4, false, 4096, n, 2048, 1e5f));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8,   2, false, 512,  n, 256,  1e5f));
+    }
+
+    // Constructed expert groups of 1, 8, 9 and 0 rows (test_mul_mat_id_groups) for the two types that have
+    // reordered MoE layouts on the SYCL backend, at n = 33 (the first batch above the 32-row fused MoE ceiling) and
+    // n = 129 (above the 128-row MoE prompt threshold). MXFP4 also runs with two experts per row.
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_MXFP4}) {
+        for (int n_used : {1, 2}) {
+            if (n_used == 2 && type_a != GGML_TYPE_MXFP4) {
+                continue;
+            }
+            for (bool b : {false, true}) {
+                for (int64_t n : {33, 129}) {
+                    test_cases.emplace_back(new test_mul_mat_id_groups(type_a, 8, n_used, b, 512, n, 256));
+                }
+            }
+        }
     }
 
     for (ggml_type type_a : base_types) {
