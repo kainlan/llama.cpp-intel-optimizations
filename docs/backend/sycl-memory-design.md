@@ -3563,27 +3563,32 @@ allocation.
 **The release of the last model.** The per-device cache lives for the process,
 but nothing in it stays sized for a model once no model is live. The model
 release hook, when it drops the last model, and a failed load's abort, when no
-model is live, run one step last (`ggml_sycl_release_last_model_effects()`,
-asking every cache), after each has dropped and put back what its model
-published. Each cache it asks gives back what it sized for a model
-(`unified_cache::release_for_no_live_model()`): it waits once for the device's
-queued work, then releases the PP MoE oneDNN ring, the oneDNN scratchpad pair
-and the reorder temp, reclaims the graph scratch and the deferred frees, and
-tears the arena down when nothing holds it. An arena nothing holds is released,
-its device memory goes back to the card, and the next load's start reserves the
-early arena from start values
-(`ggml_sycl_load_start_reserve_released_arenas()`). A cache with no arena at the
-release returns `EMPTIED` without marking an arena released (`arena_released_`),
-so the next load's start reserves nothing there and that load's entry ensure
-builds the arena. A start reserve that fails refuses that load by name
-(`[SYCL] model load refused at its start: <reason>`), and the end of a refused
-load reserves nothing. A device whose cache emptied then holds the published
-terms a device no load has planned on reads (`load_published_terms{}.restore()`,
-under `g_tensor_inventory_mutex`), so the next load plans and builds as the
-first load of a process does, and the two-card MoE flag goes back to its start
-once every cache emptied. Nothing is reaped or forced. A claimed ring slot, a
-reserved oneDNN pair or a held arena keeps what it holds, its cache keeps the
-terms that describe it, and the step names the holder at ERROR
+model is live, run one step last (`ggml_sycl_release_last_model_effects()`),
+after each has dropped and put back what its model published. The step asks the
+cache of each device the scheduler sees
+(`ggml_backend_sycl_get_device_count()`). Each cache it asks gives back what it
+sized for a model (`unified_cache::release_for_no_live_model()`): it waits once
+for the device's queued work, then releases the PP MoE oneDNN ring, the oneDNN
+scratchpad pair and the reorder temp, reclaims the graph scratch and the
+deferred frees, and tears the arena down when nothing holds it. An arena nothing
+holds is released, its device memory goes back to the card, and the next load's
+start reserves the early arena from start values
+(`ggml_sycl_load_start_reserve_released_arenas()`), which walks the same
+devices. On a two-card host that shows the scheduler one device, device 1's
+cache is built at a load's begin and neither walk reaches it, so its early arena
+stays reserved after the last model's release. This is a known gap. A cache with
+no arena at the release returns `EMPTIED` without marking an arena released
+(`arena_released_`), so the next load's start reserves nothing there and that
+load's entry ensure builds the arena. A start reserve that fails refuses that
+load by name (`[SYCL] model load refused at its start: <reason>`), and the end
+of a refused load reserves nothing. A device whose cache emptied then holds the
+published terms a device no load has planned on reads
+(`load_published_terms{}.restore()`, under `g_tensor_inventory_mutex`), so the
+next load plans and builds as the first load of a process does, and the two-card
+MoE flag goes back to its start once every cache it walks emptied. Nothing is
+reaped or forced. A claimed ring slot, a reserved oneDNN pair or a held arena
+keeps what it holds, its cache keeps the terms that describe it, and the step
+names the holder at ERROR
 (`[VRAM-ARENA] last release on device <D> (<site>): ...`). At a failed load's
 abort, an arena the failed load's own buffers hold is a WARN: the arena stays,
 and the cache marks its release deferred

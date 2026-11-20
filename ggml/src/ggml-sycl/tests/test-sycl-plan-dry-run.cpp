@@ -24,7 +24,9 @@
 // floor after its hold goes, so (i) runs after (h), and the next load's start, arm (j)'s first, releases that arena.
 // Before any arm, main stages the plain shaped inventory once in a load of its own and keeps device 0's zones from it:
 // the zone decision of a first load, which arm (j) checks a later load against. That load's end releases every arena,
-// and main reserves each again as a load's start would, so the arms find the arenas the caches were made with.
+// and main reserves each again as a load's start would, so the arms find the arenas the caches were made with. Every
+// device, arena and cache these comments name is one of the devices the scheduler sees, the ones the release of the
+// last model walks; on a two-card host that shows the scheduler one device, device 1's cache is outside them.
 //
 // Every arm names its engagement check, the observation that proves it reached the mechanism it scores, and the
 // mutant it kills. An arm whose engagement check fails is VOID, and a VOID arm fails the binary like a FAIL. Every arm

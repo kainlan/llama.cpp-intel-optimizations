@@ -12719,26 +12719,26 @@ static void ggml_sycl_diag_emit_warn(const char * fmt, ...) {
     fflush(stderr);
 }
 
-// The caches the release of the last model asks: every existing cache, at the model release hook and at a failed
-// load's abort, or, at a load's start, only those whose release a failed load's buffers deferred
+// The caches the release of the last model asks, of the devices the scheduler sees: every one at the model release hook
+// and at a failed load's abort, or, at a load's start, only those whose release a failed load's buffers deferred
 // (unified_cache::last_release_deferred).
 enum class ggml_sycl_last_release_scope { EVERY_CACHE, DEFERRED_CACHES };
 
-// The release of the last model in the process, run last by the model release hook (`cause` MODEL_RELEASED) and by a
-// failed load's abort (LOAD_ABORTED), after each has dropped and put back what the model published, and at a load's
-// start for the caches a failed load's buffers held at its abort (LOAD_START, DEFERRED_CACHES). Each cache asked
-// gives back what it sized for a model (unified_cache::release_for_no_live_model), so the next load plans and builds
-// as the first load of a process does. Liveness is process-wide, every cache holds the same mask, so walking every
-// existing cache when that mask is 0 is right; in GLOBAL cache mode several devices share one cache, which is asked
-// once. Nothing makes a model live while this runs: the registry begins no load while a model is tearing down or a
-// load transaction is open (begin_outer answers LOAD_BUSY), the hook runs in the first, and the abort and the load's
-// start run in the second, beside which no teardown begins. A device whose cache was asked and emptied, or that has
-// none and every cache was asked, then holds the published terms a device no load has planned on reads, stored under
-// the inventory lock every planner pass publishes under; a cache that kept something keeps its terms, which describe
-// what it kept, and so does a cache the scope left out. The two-card MoE flag goes back to its start once every cache
-// emptied: a cache left out counts as emptied when it holds no arena, as every release that stops on a refusal stops
-// before the teardown, and a step that asked no cache leaves the flag as it is. Not at static destruction, where the
-// caches go with the module. It reserves nothing and never throws.
+// The release of the last model in the process, run last by the model release hook (MODEL_RELEASED) and by a failed
+// load's abort (LOAD_ABORTED), after each has dropped and put back what the model published, and at a load's start for
+// the caches a failed load's buffers held at its abort (LOAD_START, DEFERRED_CACHES). Each cache asked gives back what
+// it sized for a model (unified_cache::release_for_no_live_model), so the next load plans and builds as a first load
+// does. It walks the scheduler's devices (ggml_backend_sycl_get_device_count()), as the start's reserve does: a
+// two-card host that shows the scheduler one device builds device 1's cache at a load's begin, and it goes unreached.
+// Liveness is process-wide, every cache holds the same mask, so with it 0 asking each walked cache is right; GLOBAL
+// mode's shared cache is asked once. Nothing makes a model live while this runs: the registry begins no load during a
+// model's teardown or an open load transaction (begin_outer answers LOAD_BUSY); the hook runs in the first, the abort
+// and the start in the second, where no teardown begins. A walked device whose cache was asked and emptied, or that has
+// none when every cache was asked, then holds the start terms (load_published_terms{}), under the inventory lock; a
+// cache that kept something keeps the terms that describe it, as does one the scope left out. The two-card MoE flag
+// goes back to its start once every walked cache emptied: a cache left out counts as emptied when it holds no arena, as
+// every release that stops on a refusal stops before the teardown, and a step that asked no cache leaves the flag as it
+// is. Not at static destruction, where the caches go with the module. It reserves nothing and never throws.
 static void ggml_sycl_release_last_model_effects(const char *                           site,
                                                  ggml_sycl::unified_cache_release_cause cause,
                                                  ggml_sycl_last_release_scope           scope) noexcept {
