@@ -47,6 +47,18 @@ None of them can swallow a planned refusal, and none is lane code:
   either would terminate the process.
 - `moe_segment_slots_drain_retired`'s `std::exception` handler wraps only the retire drain. It keeps the slots alive and reports failure.
 
+Three `catch (...)` handlers that landed without debt entries, each in a try that nothing able to raise a planned refusal reaches,
+so the baseline stayed red until they were recorded (G-CATCH, written with `--write-debt --allow-growth`):
+- `moe_stream_ring_warn_weight_zone` (`4155b78bd`) is a `noexcept` diagnostic. Its try calls `unified_cache_zone_tag_census` and
+  formats the WEIGHT zone line; the handler prints a literal. A rethrow would terminate the reserve that called it.
+- `unified_cache_device_caches` (`f3071da4e`) wraps only `(void) dpct::dev_mgr::instance()`, the touch that constructs dpct's device
+  manager before the cache map so the map is destroyed first. The clause does not resolve this function, so its key reads
+  `unified-cache.cpp::?`.
+- `unified_cache_zone_tag_census` (`4155b78bd`) is `noexcept`. Its try reads the zone allocator group and the runtime registry under
+  scoped locks and builds host containers; the handler resets `out` and returns false. A rethrow would terminate its caller.
+Nothing in unified-cache.cpp, moe-stream-ring.cpp or zone-tag-census.hpp throws `ggml_sycl_fallback_error`, and dpct does not know
+the type.
+
 Clause (q), libc allocation primitives (S3-0): `mmap`, `mmap64`, `mremap`, `posix_memalign`, `memalign`, `aligned_alloc`, `valloc`,
 `pvalloc`, `malloc`, `calloc`, `realloc`, `reallocarray`, `strdup`, `strndup` and `VirtualAlloc`, called bare or through `std::` / `::` (or taken as a value, or spelled in a `#define` body), are E-LIBC findings. A member
 (`pool.realloc`), a name qualified by another scope (`sycl::malloc` stays clause (e)'s) and a declaration are not. Seven allowlist entries
