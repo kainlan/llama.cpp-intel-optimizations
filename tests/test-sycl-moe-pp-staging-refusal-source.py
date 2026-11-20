@@ -265,7 +265,19 @@ def test_unwind_mutants():
     # The island's call sits outside the try.
     assert not c(mutate(SYCL, ISLAND_CALL, "pp_phase_log(\"pp-host-dispatch-done\",")
                  .replace(HANDLER, HANDLER + " dispatch_host_expert_groups(pp_host_groups);", 1))
-    # The lambda forgets a step the normal exit performs.
+    # The once-flag is set only after the first submit, so a throw from that submit leaves it unset and the handler
+    # submits a second marker (killed by the RETAIN_ONCE prefix).
+    assert not c(mutate(SYCL, "pp_exit_work_done = true; sycl::event prompt_down_dispatch_done;",
+                        "sycl::event prompt_down_dispatch_done;").replace(
+        RETAIN_STEPS[0], RETAIN_STEPS[0] + " pp_exit_work_done = true;", 1))
+    # A handler that catches everything, not only a refusal (killed by the handler following the try body).
+    assert not c(mutate(SYCL, HANDLER, " catch (...) { retain_pp_dispatch_until_done(); throw; }"))
+    # The claim state declared inside the try, where the handler cannot reach it (killed by the declaration order).
+    assert not c(mutate(SYCL, CLAIM_DECL, "").replace(TRY_SIG, TRY_SIG + " " + CLAIM_DECL, 1))
+    # The lambda forgets a step the normal exit performs (each killed by the ordered RETAIN_STEPS).
+    assert not c(mutate_in(SYCL, RETAIN_SIG, RETAIN_STEPS[0], "(void) 0;"))
+    assert not c(mutate_in(SYCL, RETAIN_SIG, RETAIN_STEPS[1], "(void) 0;"))
+    assert not c(mutate_in(SYCL, RETAIN_SIG, RETAIN_STEPS[4], "(void) 0;"))
     assert not c(mutate_in(SYCL, RETAIN_SIG, RETAIN_STEPS[5], "(void) 0;"))
     assert not c(mutate_in(SYCL, RETAIN_SIG, RETAIN_STEPS[2], "(void) 0;"))
     assert not c(mutate_in(SYCL, RETAIN_SIG, RETAIN_STEPS[3], "(void) (std::move(pp_gpu_leases),"))

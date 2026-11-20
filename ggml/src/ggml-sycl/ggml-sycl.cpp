@@ -95323,9 +95323,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
         // From here on a scratch slot can be claimed and experts submitted. A refusal anywhere below (a staging
         // buffer the card did not grant, a secondary executor that refused, an expert left unresolved, the CPU
-        // island) reaches this one handler, which runs the exit work before the unwind and rethrows it to
-        // graph_compute. The refusals themselves only refuse. The row-map refusal above stays outside: it comes
-        // before any claim or submit.
+        // island) reaches this one handler, which runs the exit work and rethrows it to graph_compute. The refusals
+        // themselves only refuse. The row-map refusal above stays outside: it comes before any claim or submit.
+        //
+        // The handler runs after this block's own locals are destroyed, and that is safe for what a submitted kernel
+        // reads. The f16 weight staging declared inside (pp_mxfp4_src0_f16) is a queue-scoped temporary: its
+        // destructor releases it behind a marker on the same in-order queue, so after every kernel already
+        // submitted. Each expert's lease is moved into pp_gpu_leases, declared before the try, before the first
+        // submit that reads that expert's weight, so the handler still holds every lease a kernel can read. The claim
+        // and the other staging buffers are declared before the try as well.
         try {
             bool pp_mxfp4_soa_f16_ready = !pp_cpu_reference && pp_mxfp4_soa_f16_candidate;
             scoped_unified_queue_temp<sycl::half> pp_mxfp4_src0_f16;
@@ -95477,8 +95483,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 dst_contiguous_ptr = dst_contiguous.get();
                 if (!dst_contiguous_ptr) {
                     // Every expert's multiply and scatter write through this base, so the op cannot run without it. No
-                    // expert of this path has been submitted yet; the try's handler records the scratch slot if one was
-                    // claimed above and releases what the normal exit releases.
+                    // expert of this path has been submitted yet, and no scratch slot is held here: a slot the setup
+                    // above used supplies dst_contiguous_ptr, so this branch is not taken, and one it did not use was
+                    // released there. The try's handler releases what the normal exit releases.
                     ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, "moe_pp_dst_contiguous", src1_contiguous_rows,
                                                     sizeof(float) * ggml_nelements(dst),
                                                     "MUL_MAT_ID prompt output staging did not fit");
@@ -96429,8 +96436,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         } catch (const ggml_sycl_fallback_error &) {
             // Exactly once with the normal exit: the exit work is a no-op when it already ran (see its flag). An
             // exception the exit work throws here replaces this one and leaves through the function-try-block
-            // below (a sycl::exception) or to graph_compute, past the scoped owners and the claim, whose
-            // destructors still release.
+            // below (a sycl::exception) or to graph_compute. That case is degraded: the expert leases not yet
+            // handed to retain_handles_until_event and the slot owners not yet bound to the claim are released by
+            // their destructors, in no order with the queue, while a submitted kernel may still read them. It is
+            // the same case as the normal exit's exit work throwing.
             retain_pp_dispatch_until_done();
             throw;
         }
