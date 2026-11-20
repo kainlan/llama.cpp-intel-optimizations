@@ -53,17 +53,20 @@
 
 // The uniform tensors (init_tensor_uniform) and the MUL_MAT_ID ids (init_mul_mat_id_ids) of a run derive from one
 // base seed, so a failing draw can be run again: GGML_TEST_SEED=<n> sets the base, and without it the run draws one.
-// Either way the run prints it once as "[TEST-SEED] base=<n>". The k-th draw is the same in every run that has the
-// same base and the same list of test cases (so the same -o and -p filters) and runs them with one worker (no -j > 1:
-// workers take draws in the order they reach them). Not derived from this seed: every other initializer in this file.
-// Of those, the attention masks and the rand() and std::random_device draws of other ops' index tensors draw fresh
-// values each run; the others use fixed seeds of their own.
+// Either way the run prints it once to stderr as "[TEST-SEED] base=<n>", outside the stdout stream the printers write
+// (so a csv or sql output stays machine-readable). The k-th draw is the same in every run that has the same base and
+// the same list of test cases (so the same -o and -p filters), runs them with one worker (no -j > 1: workers take
+// draws in the order they reach them), and runs on a host with the same hardware thread count (init_tensor_uniform
+// splits a tensor into slices, one draw each, and fixes the slice count on first use from that count and the first
+// tensor's size). Not derived from this seed: every other initializer in this file. Of those, the dense attention
+// mask (init_tensor_kq_mask) and the rand() and std::random_device draws of other ops' index tensors draw fresh values
+// each run; the others use fixed seeds of their own.
 static uint32_t test_seed_next() {
     static const uint32_t base = [] {
         const char *   env = getenv("GGML_TEST_SEED");
         const uint32_t seed =
             (env != nullptr && *env != '\0') ? (uint32_t) strtoul(env, nullptr, 0) : std::random_device{}();
-        printf("[TEST-SEED] base=%u\n", seed);
+        fprintf(stderr, "[TEST-SEED] base=%u\n", seed);
         return seed;
     }();
     static std::atomic<uint32_t> counter{ 0 };
@@ -5256,21 +5259,21 @@ struct test_mul_mat_w4a4 : public test_mul_mat {
     }
 };
 
-// GGML_TEST_MMID_TRACE=1 prints, per ids tensor, how many rows name each expert in each of the first four id columns,
-// as "[MMID-IDS] seed=<s> rows=<n> n_mats=<e> col0:<c0>,<c1>,... col1:...". With n_used columns in use, the rows an
-// expert receives are the sum of its counts over the first n_used columns.
+// GGML_TEST_MMID_TRACE=1 prints to stderr, beside the seed line, per ids tensor, how many rows name each expert in
+// each of the first four id columns, as "[MMID-IDS] seed=<s> rows=<n> n_mats=<e> col0:<c0>,<c1>,... col1:...". With
+// n_used columns in use, the rows an expert receives are the sum of its counts over the first n_used columns.
 static void print_mul_mat_id_ids(const ggml_tensor *          t,
                                  const std::vector<int64_t> & counts,
                                  int                          n_mats,
                                  uint32_t                     seed) {
-    printf("[MMID-IDS] seed=%u rows=%lld n_mats=%d", seed, (long long) ggml_nrows(t), n_mats);
+    fprintf(stderr, "[MMID-IDS] seed=%u rows=%lld n_mats=%d", seed, (long long) ggml_nrows(t), n_mats);
     for (int c = 0; c < t->ne[0] && c < 4; c++) {
-        printf(" col%d:", c);
+        fprintf(stderr, " col%d:", c);
         for (int e = 0; e < n_mats; e++) {
-            printf("%s%lld", e == 0 ? "" : ",", (long long) counts[(size_t) c * (size_t) n_mats + (size_t) e]);
+            fprintf(stderr, "%s%lld", e == 0 ? "" : ",", (long long) counts[(size_t) c * (size_t) n_mats + (size_t) e]);
         }
     }
-    printf("\n");
+    fprintf(stderr, "\n");
 }
 
 static bool mul_mat_id_ids_trace_enabled() {
@@ -10979,8 +10982,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Constructed expert groups of 1, 8, 9 and 0 rows (test_mul_mat_id_groups) for the two types that have
-    // reordered MoE layouts on the SYCL backend, at n = 33 (the first batch above the 32-row fused MoE ceiling) and
-    // n = 129 (above the 128-row MoE prompt threshold). MXFP4 also runs with two experts per row.
+    // reordered MoE layouts on the SYCL backend, with 8 experts, at two batch sizes. On the SYCL backend the grouped
+    // MoE mat-vec (ggml_sycl_mul_mat_id_vec_q) declines a batch above n_experts * GGML_SYCL_ONEDNN_PP_MIN_BATCH (16)
+    // / n_used: 128 with one expert per row, 64 with two. n = 33 is above the 32-row fused MoE ceiling
+    // (get_fused_moe_max_batch) and below that threshold, so it stays on the grouped mat-vec; n = 129 is above it, so
+    // the op reaches the per-expert prompt loop. MXFP4 also runs with two experts per row.
     for (ggml_type type_a : { GGML_TYPE_Q8_0, GGML_TYPE_MXFP4 }) {
         for (int n_used : { 1, 2 }) {
             if (n_used == 2 && type_a != GGML_TYPE_MXFP4) {
