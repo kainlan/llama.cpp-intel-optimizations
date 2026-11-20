@@ -8,9 +8,10 @@
 // which compile the MMID route in; ggml_sycl::test_moe_mmid_route_reachable_override_guard(false) closes that route for
 // the whole run, so the model plans, binds and executes as in an ordinary build.
 //
-// The vehicle is the mixed-residency fixture's (test-moe-mixed-residency-q1-nvfp4.cpp describes the load): a planned
-// NVFP4 model of three expert tensors whose plan the fixture edits to put 7 of 16 experts on the host. The op is the
-// gate tensor at one token with ids {1, 4, 7, 10}: expert 7 runs on the card and the other three on the host.
+// The vehicle is the mixed-residency fixture's (moe-mixed-residency-fixture.hpp, which both tests include;
+// test-moe-mixed-residency-q1-nvfp4.cpp describes the load): a planned NVFP4 model of three expert tensors whose plan
+// the fixture edits to put 7 of 16 experts on the host. The op is the gate tensor at one token with ids {1, 4, 7, 10}:
+// expert 7 runs on the card and the other three on the host.
 //
 // The first run, with the failpoint armed, passes when:
 //   * the compute returns GGML_STATUS_FAILED;
@@ -33,44 +34,31 @@
 #include "ggml-sycl-test.hpp"  // test_moe_mmid_route_reachable_override_guard
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "moe-mixed-residency-fixture.hpp"  // the shape, the log capture, the route parser and the model's lifecycle
 #include "q1-nvfp4-production-route-test-seam.hpp"  // the batched-dispatch failpoint and its counter
-#include "unified-cache.hpp"                        // the load's candidate plan, edited and staged again
 
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <initializer_list>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <vector>
 
+using namespace moe_mixed_residency_fixture;
+
 namespace {
 
-constexpr ggml_type k_type     = GGML_TYPE_NVFP4;
-constexpr int       k_experts  = 16;
-constexpr int       k_used     = 4;
-constexpr int       k_in       = 2048;  // k: a whole number of NVFP4 (64) blocks
-constexpr int       k_out      = 512;   // m: output rows per expert
-constexpr uint32_t  k_n_ubatch = 512;
-constexpr uint32_t  k_n_ctx    = 512;
-constexpr double    k_nmse_tol = 5e-4;
+constexpr ggml_type k_type = GGML_TYPE_NVFP4;
 
-constexpr const char * k_tensor_names[3] = { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
-                                             "blk.0.ffn_down_exps.weight" };
-constexpr int          k_gate            = 0;
-
-// The experts the fixture moves to the host in every expert tensor, and the op's picks: 7 on the card, 1, 4 and 10 on
-// the host, so a route line that swapped the two counts fails.
-constexpr int     k_host_experts[] = { 1, 4, 6, 9, 10, 13, 15 };
-constexpr int32_t k_ids[k_used]    = { 1, 4, 7, 10 };
+// The op's picks: 7 on the card, 1, 4 and 10 on the host (k_host_experts), so a route line that swapped the two
+// counts fails.
+constexpr int32_t k_ids[k_used] = { 1, 4, 7, 10 };
 
 constexpr const char * k_refused_warn  = "[MOE-ROUTE] Q1_0/NVFP4 AOS batched dispatch returned false";
 constexpr const char * k_refused_cause = "reason=test-failpoint requested_bytes=0";
@@ -78,329 +66,10 @@ constexpr const char * k_fallback_line =
     "recoverable runtime fallback failed: MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand refused: "
     "test-failpoint";
 
-// Lines that say the op refused a route, routed a side some other way, or failed after the throw that ends it.
-constexpr const char * k_refusal_needles[] = {
-    "[MOE-DECODE-REFUSAL]",
-    "[MOE-PROMPT-REFUSAL]",
-    "batched dispatch returned false",
-    "skipping planner batched pointer-table dispatch",
-    "falling back to host",
-    "[CONTEXT-PLAN-BUG]",
-    "recoverable runtime fallback failed",
-};
-
-void require(bool condition, const std::string & message) {
-    if (!condition) {
-        throw std::runtime_error(message);
-    }
-}
-
-// The environment cannot exercise what this test covers; main() reports it as ctest's skip (77), never as a pass, on a
-// line prefixed SKIP[<tag>] so each cause stays distinguishable in a log.
-struct test_skip : std::runtime_error {
-    test_skip(const char * tag, const std::string & why) : std::runtime_error(why), tag(tag) {}
-
-    const char * tag;
-};
-
-// Every log chunk the backend emits, in order, so a run can read what appeared while it ran. Also echoed to stderr, so
-// the run's log carries the backend's own lines.
-struct log_capture {
-    std::mutex               mu;
-    std::vector<std::string> chunks;
-
-    size_t mark() {
-        std::lock_guard<std::mutex> lock(mu);
-        return chunks.size();
-    }
-
-    // The chunks from `from` on that contain every needle.
-    std::vector<std::string> since(size_t from, std::initializer_list<const char *> needles) {
-        std::lock_guard<std::mutex> lock(mu);
-        std::vector<std::string>    found;
-        for (size_t i = from; i < chunks.size(); ++i) {
-            bool all = true;
-            for (const char * needle : needles) {
-                all = all && chunks[i].find(needle) != std::string::npos;
-            }
-            if (all) {
-                found.push_back(chunks[i]);
-            }
-        }
-        return found;
-    }
-};
-
-log_capture g_log;
-
-void log_callback(ggml_log_level level, const char * text, void * user_data) {
-    (void) level;
-    (void) user_data;
-    if (!text) {
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_log.mu);
-        g_log.chunks.emplace_back(text);
-    }
-    std::fputs(text, stderr);
-}
-
-// The count that follows " <name>=" in a [MOE-ROUTE] line, or -1 when the field is missing or is not a plain count.
-long long route_field(const std::string & line, const char * name) {
-    const std::string key = std::string(" ") + name + "=";
-    const size_t      at  = line.find(key);
-    if (at == std::string::npos) {
-        return -1;
-    }
-    const char *    digits = line.c_str() + at + key.size();
-    char *          end    = nullptr;
-    const long long value  = std::strtoll(digits, &end, 10);
-    if (end == digits || (*end != ' ' && *end != '\n' && *end != '\0')) {
-        return -1;
-    }
-    return value;
-}
-
-struct route_counts {
-    long long local           = -1;
-    long long other_gpu       = -1;
-    long long host            = -1;
-    long long missing         = -1;
-    long long layout_mismatch = -1;
-};
-
-route_counts parse_route_line(const std::string & line) {
-    route_counts counts;
-    counts.local           = route_field(line, "local");
-    counts.other_gpu       = route_field(line, "other_gpu");
-    counts.host            = route_field(line, "host");
-    counts.missing         = route_field(line, "missing");
-    counts.layout_mismatch = route_field(line, "layout_mismatch");
-    return counts;
-}
-
-// The parser's own control, run before anything else: it must read a partition line's counts, or every run would fail
-// its route check for the wrong reason.
-void check_route_parser() {
-    const route_counts partition = parse_route_line(
-        "[MOE-ROUTE] tensor=blk.0.ffn_gate_exps.weight layer=0 submit_device=0 layout=0 local=1 other_gpu=0 host=3 "
-        "missing=0 layout_mismatch=0 unsupported=0\n");
-    require(partition.local == 1 && partition.other_gpu == 0 && partition.host == 3 && partition.missing == 0 &&
-                partition.layout_mismatch == 0,
-            "the route parser misread a partition line");
-}
-
 uint64_t failures_consumed() {
     ggml_sycl_q1_nvfp4_test_counters counters{};
     ggml_sycl_q1_nvfp4_test_counters_read(&counters);
     return counters.failure_consumed;
-}
-
-// One planned model: three expert tensors of one shape.
-struct expert_inventory {
-    ggml_sycl_tensor_info        tensors[3]{};
-    ggml_sycl_tensor_inventory   inventory{};
-    ggml_sycl_placement_envelope envelope{ k_n_ctx, k_n_ubatch, 1, -1 };
-
-    expert_inventory() {
-        for (int i = 0; i < 3; ++i) {
-            tensors[i].name  = k_tensor_names[i];
-            tensors[i].type  = k_type;
-            tensors[i].ne[0] = k_in;
-            tensors[i].ne[1] = k_out;
-            tensors[i].ne[2] = k_experts;
-            tensors[i].ne[3] = 1;
-            tensors[i].size  = ggml_row_size(k_type, k_in) * k_out * k_experts;
-            inventory.total_size += tensors[i].size;
-        }
-        inventory.tensors       = tensors;
-        inventory.count         = 3;
-        inventory.n_expert      = k_experts;
-        inventory.n_expert_used = k_used;
-        inventory.n_layer       = 1;
-        inventory.n_ctx         = k_n_ctx;
-        inventory.n_ubatch      = k_n_ubatch;
-    }
-};
-
-std::vector<uint8_t> make_weights(std::mt19937 & rng) {
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    std::vector<float>                    weight_f32(size_t(k_experts) * k_out * k_in);
-    for (float & v : weight_f32) {
-        v = 0.5f * dist(rng);
-    }
-    std::vector<uint8_t> bytes(ggml_row_size(k_type, k_in) * k_out * k_experts);
-    const size_t         written =
-        ggml_quantize_chunk(k_type, weight_f32.data(), bytes.data(), 0, int64_t(k_experts) * k_out, k_in, nullptr);
-    require(written == bytes.size(), "quantize wrote a short buffer");
-    return bytes;
-}
-
-// The mixed-residency fixture's model lifecycle: the public entry points a real load drives, with the plan edit between
-// the inventory stage and the weight load (demote_host_experts).
-struct lifecycle_fixture {
-    ggml_backend_t              backend = nullptr;
-    ggml_sycl_load_txn          load{};
-    bool                        load_open = false;
-    ggml_sycl_model_token       model{};
-    ggml_sycl_exec_context_id   context{};
-    ggml_context *              weight_ctx    = nullptr;
-    ggml_backend_buffer_t       weight_buffer = nullptr;
-    ggml_tensor *               tensors[3]    = {};
-    std::vector<uint8_t>        weight_bytes;  // every expert tensor's quantized bytes, for the CPU reference
-    // Per expert of the gate tensor: true when the plan the commit published puts the expert on the host.
-    std::array<bool, k_experts> gate_on_host{};
-
-    explicit lifecycle_fixture(std::mt19937 & rng) {
-        try {
-            require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK, "load begin failed");
-            load_open = true;
-            expert_inventory fixture;
-            const auto       stage =
-                ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, &fixture.envelope, false);
-            require(stage == GGML_SYCL_LIFECYCLE_OK,
-                    "inventory staging result=" + std::to_string(static_cast<int>(stage)));
-            demote_host_experts();
-            // Staging uses temporary backends; the retained backend is created after it, so load_end's exact-queue
-            // lookup cannot observe a transient context that was cleared.
-            backend = ggml_backend_sycl_init(0);
-            require(backend != nullptr, "ggml_backend_sycl_init(0) returned null");
-            load_weights(rng);
-            const auto commit = ggml_backend_sycl_model_load_end(load, true, &model);
-            if (commit != GGML_SYCL_LIFECYCLE_BUSY) {
-                load_open = false;
-            }
-            require(commit == GGML_SYCL_LIFECYCLE_OK, "load commit result=" + std::to_string(static_cast<int>(commit)));
-            read_published_residency();
-            require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK, "plan activation failed");
-            require(ggml_backend_sycl_execution_context_create(&context) == GGML_SYCL_EXECUTION_OK,
-                    "context create failed");
-            require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,
-                    "context bind failed");
-            require(
-                ggml_backend_sycl_set_runtime_context_for_model(backend, model, k_n_ctx, k_n_ubatch, 1,
-                                                                /*kv_unified=*/false, /*swa_full=*/false,
-                                                                /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
-                "runtime context bind failed");
-        } catch (...) {
-            cleanup();
-            throw;
-        }
-    }
-
-    void demote_host_experts() {
-        const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(load.id);
-        require(candidate && candidate->plan, "the inventory stage left no candidate plan");
-        require(candidate->plan->lazy_tables.empty(), "the candidate plan carries a STORAGE table");
-        ggml_sycl::placement_plan plan(*candidate->plan);
-        for (const char * name : k_tensor_names) {
-            for (int expert : k_host_experts) {
-                require(plan.demote_expert_placement_to_host(name, expert),
-                        std::string("the candidate plan has no placement entry for ") + name + " expert " +
-                            std::to_string(expert));
-            }
-        }
-        ggml_sycl::lifecycle_stage_placement_plan(load.id, std::move(plan), candidate->kv_info,
-                                                  candidate->model_n_layer);
-    }
-
-    void load_weights(std::mt19937 & rng) {
-        ggml_init_params params = { 3 * ggml_tensor_overhead(), nullptr, true };
-        weight_ctx              = ggml_init(params);
-        require(weight_ctx != nullptr, "ggml_init for the weights failed");
-        ggml_backend_dev_t dev        = ggml_backend_get_device(backend);
-        const std::string  split_path = "test-moe-q1-nvfp4-dispatch-refusal.gguf";
-        for (int i = 0; i < 3; ++i) {
-            tensors[i] = ggml_new_tensor_3d(weight_ctx, k_type, k_in, k_out, k_experts);
-            ggml_set_name(tensors[i], k_tensor_names[i]);
-            const size_t nbytes = ggml_nbytes(tensors[i]);
-            ggml_backend_sycl_register_gguf_file_identity(0, split_path.c_str(), uint64_t(3 * nbytes));
-            ggml_backend_sycl_register_weight_identity(tensors[i], 0, size_t(i) * nbytes, nbytes, 0);
-            ggml_backend_sycl_register_host_weight_tensor(dev, tensors[i]);
-            require(ggml_backend_sycl_try_register_weight_usage(k_tensor_names[i],
-                                                                GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT),
-                    std::string("usage registration refused for ") + k_tensor_names[i]);
-        }
-        ggml_backend_buffer_type_t buft = ggml_backend_sycl_host_buffer_type_for_device(dev);
-        require(buft != nullptr, "no SYCL host buffer type for the pinned card");
-        weight_buffer = ggml_backend_alloc_ctx_tensors_from_buft(weight_ctx, buft);
-        require(weight_buffer != nullptr, "host weight buffer allocation failed");
-        ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        weight_bytes = make_weights(rng);
-        for (int i = 0; i < 3; ++i) {
-            ggml_backend_tensor_set(tensors[i], weight_bytes.data(), 0, weight_bytes.size());
-        }
-    }
-
-    // The side each gate expert runs on, from the plan the commit published: every moved expert on the host, every
-    // other one on this card.
-    void read_published_residency() {
-        const auto published = ggml_sycl::lifecycle_find_placement_plan(model.model_id, model.load_txn_id);
-        require(published && published->plan, "the commit published no plan");
-        for (int e = 0; e < k_experts; ++e) {
-            const auto placement = published->plan->lookup_expert_placement(k_tensor_names[k_gate], e);
-            require(placement.status == ggml_sycl::expert_placement_status::FOUND,
-                    "the published plan has no placement for gate expert " + std::to_string(e));
-            require(!placement.on_device || placement.target_device == 0,
-                    "the published plan puts gate expert " + std::to_string(e) + " on device " +
-                        std::to_string(placement.target_device) + ", not this card");
-            gate_on_host[e] = !placement.on_device;
-        }
-        for (int e : k_host_experts) {
-            require(gate_on_host[e], "the published plan keeps moved gate expert " + std::to_string(e) +
-                                         " on the card: the edited candidate did not reach the commit");
-        }
-    }
-
-    void cleanup() noexcept {
-        ggml_sycl_exec_drain_ticket             ticket{};
-        ggml_sycl_exec_control_host_alloc_batch batch{};
-        if (context.value &&
-            ggml_backend_sycl_execution_context_begin_drain(context, &ticket) == GGML_SYCL_EXECUTION_OK &&
-            ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch) ==
-                GGML_SYCL_EXECUTION_OK) {
-            (void) ggml_backend_sycl_execution_context_release_control_host_allocs(ticket, &batch);
-            (void) ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
-        }
-        context = {};
-        if (weight_buffer) {
-            ggml_backend_buffer_free(weight_buffer);
-            weight_buffer = nullptr;
-        }
-        if (weight_ctx) {
-            ggml_free(weight_ctx);
-            weight_ctx = nullptr;
-        }
-        for (ggml_tensor *& tensor : tensors) {
-            tensor = nullptr;
-        }
-        if (model.model_id) {
-            (void) ggml_backend_sycl_model_unloaded_token(model);
-            model = {};
-        } else if (load_open) {
-            (void) ggml_backend_sycl_model_load_end(load, false, nullptr);
-            load_open = false;
-        }
-        if (backend) {
-            ggml_backend_free(backend);
-            backend = nullptr;
-        }
-    }
-
-    ~lifecycle_fixture() { cleanup(); }
-};
-
-ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft,
-                                   ggml_tensor *              tensor,
-                                   ggml_backend_buffer_usage  usage) {
-    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, tensor));
-    if (!buffer) {
-        return nullptr;
-    }
-    ggml_backend_buffer_set_usage(buffer, usage);
-    ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer));
-    return buffer;
 }
 
 // One MUL_MAT_ID op on the gate tensor at one token, its activation broadcast to every used expert, built once on
@@ -541,7 +210,7 @@ bool run_recovered(gate_op &                  op,
     size_t nonfinite = 0;
     if (status == GGML_STATUS_SUCCESS) {
         for (size_t o = 0; o < size_t(k_used); ++o) {
-            const int side = life.gate_on_host[k_ids[o]] ? 1 : 0;
+            const int side = life.on_host[k_gate][k_ids[o]] ? 1 : 0;
             for (size_t n = 0; n < size_t(k_out); ++n) {
                 const size_t i = o * k_out + n;
                 if (!std::isfinite(got[i])) {
@@ -636,12 +305,12 @@ int main() {
         require(cpu != nullptr, "CPU backend init failed");
 
         std::mt19937      rng(1931);
-        lifecycle_fixture life(rng);
+        lifecycle_fixture life(k_type, "test-moe-q1-nvfp4-dispatch-refusal.gguf", rng);
 
         size_t want_local = 0;
         size_t want_host  = 0;
         for (int32_t expert : k_ids) {
-            ++(life.gate_on_host[expert] ? want_host : want_local);
+            ++(life.on_host[k_gate][expert] ? want_host : want_local);
         }
         if (want_local == 0 || want_host == 0) {
             throw test_skip("one-sided", "the published plan puts the op's experts on one side only (local=" +
