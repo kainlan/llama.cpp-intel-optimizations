@@ -3784,16 +3784,19 @@ struct expert_loan_record {
 // AOS device entry is staged under and its host copy is published under; host_keys are every id the host copy is
 // published under, key first. device_owner is the member's device storage, minted owner-first by the caller from the
 // WEIGHT zone before it took any listed lock, so no allocation for the bytes runs under one. A refill's must be the
-// host copy's size (refill_copy_bytes()). An admit's must be the staged size, staged_expert_bytes() of the host copy's
-// layout and size and this member's type and ncols, the weight's type and row width the caller resolved from its
-// tensor; a refill leaves those two unset.
+// host copy's size (refill_copy_bytes()), and a refill reads none of the three fields below. An admit's must be the
+// staged size, staged_expert_bytes() of the host copy's layout and this member's type, ncols and logical_bytes: the
+// weight's type, row width and bytes per expert (nb[2]) the caller resolved from its tensor. The expert's size is a
+// fact of its tensor, never of the host copy, which a padded copy exceeds; the admit copies logical_bytes from offset
+// 0 of the host copy and refuses one that holds fewer.
 struct expert_refill_member {
     expert_placement_key            placement;
     ggml_sycl_cache_id              key;
     std::vector<ggml_sycl_cache_id> host_keys;
     mem_handle                      device_owner;
-    ggml_type                       type  = GGML_TYPE_COUNT;
-    int64_t                         ncols = 0;
+    ggml_type                       type          = GGML_TYPE_COUNT;
+    int64_t                         ncols         = 0;
+    size_t                          logical_bytes = 0;
 };
 
 // What one refill or admit did. A refusal changes nothing: reason names why and every other field keeps its default.
@@ -4569,11 +4572,11 @@ class unified_cache {
     // The size each direction's copy must be minted at (llama.cpp-pu8v): the size of the entry it will hold, which
     // the transaction compares it with. loan_copy_bytes() is the AOS device entry direct staging filed under key, which
     // a loan copies whole; refill_copy_bytes() is the host copy published under key, a loan's, which a refill's device
-    // storage must equal, or the load's, which an admit copies and pads to the staged size. Each can exceed the plan's
-    // dst_size: direct staging pads an AOS quantized expert's tail to MATRIX_ROW_PADDING columns, which dst_size leaves
-    // out and the plan's VRAM charge counts. Read under direct_stage_mutex_ and rw_mutex_, shared; the transaction
-    // checks again under its own locks, so an entry that changes in between is refused there. 0 when there is no such
-    // entry, or it is retired.
+    // storage must equal. An admit asks it only whether there is a host copy, since it sizes from the tensor. Each can
+    // exceed the plan's dst_size: direct staging pads an AOS quantized expert's tail to MATRIX_ROW_PADDING columns,
+    // which dst_size leaves out and the plan's VRAM charge counts. Read under direct_stage_mutex_ and rw_mutex_,
+    // shared; the transaction checks again under its own locks, so an entry that changes in between is refused there.
+    // 0 when there is no such entry, or it is retired.
     size_t loan_copy_bytes(ggml_sycl_cache_id key) const;
     size_t refill_copy_bytes(ggml_sycl_cache_id key) const;
 
@@ -4596,11 +4599,13 @@ class unified_cache {
     // key whose direct_alloc_owner is its whole pinned storage and a slice of a host zone, the provenance the copy path
     // proves host USM by, so the copy is a direct DMA; any other ("host copy not pinned", a copy served in place from
     // a file mapping among them) would bounce through a synchronous staged copy. A missing host copy refuses as "not
-    // on host". Each member's device_owner must be exactly staged_expert_bytes() of the host copy's layout and size
-    // and the member's type and ncols, never less than the host bytes ("device storage size"). The copy moves the host
-    // bytes; the tail past them is zero-filled on the same queue behind the copy, so the device entry, sized as its
-    // storage and published behind the fill, reads as direct staging leaves an expert. The rest is the refill's: the
-    // same checks before anything is copied, all three or none, and nothing waits or asks an event's status.
+    // on host", and one holding fewer than the member's logical_bytes as "host copy size". Each member's device_owner
+    // must be exactly staged_expert_bytes() of the host copy's layout and the member's type, ncols and logical_bytes,
+    // never less than logical_bytes ("device storage size"). The copy moves logical_bytes from offset 0 of the host
+    // copy, so a padded copy's tail is never read; the tail past them is zero-filled on the same queue behind the
+    // copy, so the device entry, sized as its storage and published behind the fill, reads as direct staging leaves an
+    // expert. The whole host entry is retired, its storage with it. The rest is the refill's: the same checks before
+    // anything is copied, all three or none, and nothing waits or asks an event's status.
     bool admit_host_triplet(const expert_refill_member members[3], expert_refill_record & out);
 
     // Optional layout copies (unified_cache_entry::optional_layout).
@@ -7570,7 +7575,8 @@ class unified_cache {
 
     // The body refill_lent_triplet() and admit_host_triplet() share: one set of checks, copies and publication, so the
     // two cannot drift apart. `admit` widens the source from a loan's host copy to any pinned host copy in a host zone
-    // and sizes the device storage at the staged size, whose tail the copy zero-fills; it never loosens the refill.
+    // that holds the member's logical_bytes, copies only those, and sizes the device storage at their staged size,
+    // whose tail the copy zero-fills; it never loosens the refill.
     bool copy_host_triplet_to_device(const expert_refill_member members[3], bool admit, expert_refill_record & out);
 
     // Undo retire_expert_entry_at_locked() for an entry the caller still holds a lease on: live again, counted out of

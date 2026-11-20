@@ -717,12 +717,15 @@ INTERNAL_WRAPPER_SITES = {
         # plan to show the dropped triplet is still on the host.
         # 2 -> 5: the padded, file-mapped and block-completing admit cases read the plan an accepted admit published.
         "const auto now = ::ggml_sycl_global_plan_snapshot();": 5,
+        # 14 -> 15: the fixture's lent_bytes_are helper reads the current plan to show which bytes are lent.
         # 15 -> 16: test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned reads the published plan in
         # its members_read helper, to show each lent member's backing and the plan's mapped staging source before the
         # loan, while lent and after the refill. A test-only reader of the same snapshot the loan transaction publishes.
         # 16 -> 20: the padded, file-mapped and block-completing admit cases read the publication an admit starts from,
         # and the busy admit case's refusal check reads the one a refused admit must leave in place.
-        "const auto published = ::ggml_sycl_global_plan_snapshot();": 20,  # llama.cpp-7999: +1, lent_bytes_are
+        # 20 -> 21: the case that admits from a host copy shorter than the tensor reads the publication its refusal
+        # must leave in place.
+        "const auto published = ::ggml_sycl_global_plan_snapshot();": 21,
         # llama.cpp-sif1: the unpreparable-triplet case reads the publication a refill into a full WEIGHT zone must
         # leave in place, and shows it does.
         "const auto before_full = ::ggml_sycl_global_plan_snapshot();": 1,
@@ -734,8 +737,9 @@ INTERNAL_WRAPPER_SITES = {
         # llama.cpp-sif1 took this from 4 to 6: the refill cases show a refill with nothing to do, and one cancelled
         # by a loan, published nothing. It then took it to 7: a loan refused without host zones published nothing. It
         # then took it to 9: a boundary with no decode graph since the refill, and a refill whose only triplet was
-        # dropped, published nothing. 9 -> 10: the busy admit case shows each BUSY admit published nothing.
-        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 10,
+        # dropped, published nothing. 9 -> 10: the busy admit case shows each BUSY admit published nothing. 10 -> 11:
+        # the case that admits from a host copy shorter than the tensor shows that refusal published nothing.
+        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 11,
         # llama.cpp-pu8v: test_expert_loan_and_refill_stop_on_a_missing_entry checks, in one condition each, that the
         # refused loan and the refill that dropped a triplet published nothing and left the request and the ledger
         # as they must be.

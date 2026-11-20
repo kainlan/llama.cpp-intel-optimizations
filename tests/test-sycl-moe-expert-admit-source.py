@@ -20,13 +20,16 @@ staged size. What this gate pins:
       cache never takes it, so no unified-cache allocation runs under it;
   A3  a named move is refused BUSY "loans outstanding" while the device's lent count is not zero, before the
       live-update lease, and again under the inventory lock while the ledger holds a lent triplet;
-  A4  an admitted expert's device storage is the padded staged size, asked of the layout (staged_expert_bytes), never
-      the host size and never computed for one type: the transaction mints it from the resolved tensor's type and
-      width, the cache refuses storage that is not exactly that size or is smaller than the host bytes, and the device
-      entry takes the storage's size;
-  A5  the padded tail is zero-filled on the copy's queue behind the copy, and the device entry is published behind
-      the fill (its ready event and last write), as the device record the transaction remembers is, whose logical
-      bytes are the host bytes the record's readers expect;
+  A4  an expert's size is its tensor's, never a cache entry's: the resolver reads the tensor's bytes per expert
+      (nb[2]) with its type and width, and the transaction hands all three to the cache. An admitted expert's device
+      storage is the padded staged size of those bytes, asked of the layout (staged_expert_bytes), never the host
+      copy's size and never computed for one type: the transaction mints it so, the cache refuses a host copy shorter
+      than the expert ("host copy size", a refusal a later boundary meets again) and storage that is not exactly the
+      staged size or is smaller than the expert, and the device entry takes the storage's size;
+  A5  the copy moves exactly the expert's bytes from offset 0 of the host copy, the padded tail is zero-filled on the
+      copy's queue behind the copy, and the device entry is published behind the fill (its ready event and last
+      write), as the device record the transaction remembers is, whose logical bytes are the tensor's bytes per
+      expert, the range the record's readers resolve;
   A6  one publish per call: the body publishes once and bumps the exec-graph epoch with it, unconditionally, and the
       entry runs the body once;
   A7  the ledger is untouched by a named move: no ledger room reserved, no lent triplet appended or removed, no cursor
@@ -189,17 +192,23 @@ LEASE = "registry.acquire_live_update(current_token)"
 LEDGER_LOCKED = "ggml_sycl_expert_lent_ledger & ledger = ggml_sycl_expert_lent_ledger_locked(device, *current);"
 
 STAGED_SIZE = ("const size_t device_bytes = named ? "
-               "ggml_sycl::staged_expert_bytes(e->layout, target.type, target.ncols, bytes) : bytes;")
+               "ggml_sycl::staged_expert_bytes(e->layout, target.type, target.ncols, target.logical_bytes) : bytes;")
 MINT = "ggml_sycl::mem_handle storage = ggml_sycl_device_expert_alloc(device, device_bytes);"
 MEMBER_TYPE = "triplet.refill_members[r].type = target.type;"
 MEMBER_NCOLS = "triplet.refill_members[r].ncols = target.ncols;"
+MEMBER_LOGICAL = "triplet.refill_members[r].logical_bytes = target.logical_bytes;"
 RESOLVED_TYPE = "out.type = tensor->type;"
 RESOLVED_NCOLS = "out.ncols = tensor->ne[0];"
+RESOLVED_LOGICAL = "out.logical_bytes = tensor->nb[2];"
 STAGED_GUARD = "if (layout != GGML_LAYOUT_AOS ||"
 STAGED_AOS = "return aos_staged_weight_bytes(type, ncols, host_bytes);"
+CACHE_LOGICAL = "const size_t logical = admit ? members[i].logical_bytes : e.size;"
+HOST_SIZE_GUARD = 'if (e.size < logical) { refusal = "host copy size"; break; }'
 CACHE_STAGED = ("const size_t staged = admit ? "
-                "staged_expert_bytes(e.layout, members[i].type, members[i].ncols, e.size) : e.size;")
-SIZE_GUARD = 'if (device_size[i] != staged || staged < e.size) { refusal = "device storage size"; break; }'
+                "staged_expert_bytes(e.layout, members[i].type, members[i].ncols, logical) : e.size;")
+SIZE_GUARD = 'if (device_size[i] != staged || staged < logical) { refusal = "device storage size"; break; }'
+COPY_BYTES = "bytes[i] = logical;"
+FINAL_SIG = "static bool ggml_sycl_expert_refill_refusal_is_final("
 ENTRY_SIZE = "entry.size = device_size[i];"
 MIRROR_SIZE = "mirror.size = device_size[i];"
 
@@ -209,7 +218,8 @@ FILL = ("if (device_size[i] > bytes[i]) { out.copy_events[i] = mem_fill_async(me
 ENTRY_READY = "entry.ready_event = out.copy_events[i];"
 ENTRY_WRITE = "entry.last_write_event = out.copy_events[i];"
 EMPLACE = "entries_.emplace(device_key, device_entry[i]);"
-ADMIT_LOGICAL = "const size_t logical = named ? triplet.host_bytes[r] : refilled.device_handles[r].size();"
+ADMIT_LOGICAL = ("const size_t logical = named ? triplet.refill_members[r].logical_bytes : "
+                 "refilled.device_handles[r].size();")
 REMEMBER_DEVICE = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS, "
                    "std::move(refilled.device_handles[r]), &refilled.copy_events[r], 0, logical);")
 
@@ -280,11 +290,12 @@ def check(raw: dict[str, str]) -> None:
     admit = body(cache, ADMIT_SIG)
     refill = body(cache, REFILL_SIG)
     staged = body(pad, STAGED_SIG)
+    final = body(sycl, FINAL_SIG)
 
     # A0 ---------------------------------------------------------------------------------------------------------------
     named = {"transaction body": txn, "entry": entry, "named selection": select, "named stop": stop,
              "registered resolver": resolve, "cache shared body": copy, "cache admit": admit, "cache refill": refill,
-             "staged-size helper": staged}
+             "staged-size helper": staged, "final refusal list": final}
     for name, text in named.items():
         if not text:
             fail("A0", f"the {name} is missing, so every pin reading it would pass on nothing")
@@ -319,6 +330,11 @@ def check(raw: dict[str, str]) -> None:
     if not (txn.count(MEMBER_TYPE) == 1 and txn.count(MEMBER_NCOLS) == 1 and RESOLVED_TYPE in resolve
             and RESOLVED_NCOLS in resolve):
         fail("A4", "the type and width the staged size is asked with are not the resolved tensor's")
+    if not (txn.count(MEMBER_LOGICAL) == 1 and RESOLVED_LOGICAL in resolve):
+        fail("A4", "the expert's bytes the admit sizes, copies and records are not its tensor's nb[2]")
+    if not (copy.count(CACHE_LOGICAL) == 1 and copy.count(HOST_SIZE_GUARD) == 1
+            and ordered(copy, CACHE_LOGICAL, HOST_SIZE_GUARD, CACHE_STAGED) and '"host copy size"' in final):
+        fail("A4", "the cache does not refuse, as final, a host copy shorter than the expert's tensor bytes")
     if not (STAGED_GUARD in staged and staged.count(STAGED_AOS) == 1):
         fail("A4", "staged_expert_bytes does not ask the layout, or does not give AOS the padded size")
     if not (copy.count(CACHE_STAGED) == 1 and copy.count(SIZE_GUARD) == 1 and ordered(copy, CACHE_STAGED, SIZE_GUARD)):
@@ -333,9 +349,11 @@ def check(raw: dict[str, str]) -> None:
     if not (copy.count(COPY) == 1 and copy.count(FILL) == 1 and copy.count(ENTRY_READY) == 1
             and copy.count(ENTRY_WRITE) == 1 and ordered(copy, COPY, FILL, ENTRY_READY, ENTRY_WRITE, EMPLACE)):
         fail("A5", "the tail fill is not behind the copy on its queue, or the entry is not published behind the fill")
+    if not (copy.count(COPY_BYTES) == 1 and ordered(copy, SIZE_GUARD, COPY_BYTES, COPY)):
+        fail("A5", "the copy does not move exactly the expert's bytes, so a longer host copy's tail would be read")
     if not (txn.count(ADMIT_LOGICAL) == 1 and txn.count(REMEMBER_DEVICE) == 1
             and ordered(txn, ADMIT_CALL, ADMIT_LOGICAL, REMEMBER_DEVICE)):
-        fail("A5", "the admitted device record is not remembered behind the fill with the host bytes as its range")
+        fail("A5", "the admitted device record is not remembered behind the fill with the tensor's bytes as its range")
 
     # A6 ---------------------------------------------------------------------------------------------------------------
     if txn.count(PUBLISH) != 1 or txn.count(SWAP_PUBLISH) != 1:
@@ -452,20 +470,33 @@ def self_test(raw: dict[str, str]) -> int:
                                                "ggml_sycl_device_expert_alloc(device, bytes)")])
     expect_fail("cache-checks-host-size", "A4", [("cache", COPY_SIG,
                                                   "admit ? staged_expert_bytes(e.layout, members[i].type, "
-                                                  "members[i].ncols, e.size) : e.size",
+                                                  "members[i].ncols, logical) : e.size",
                                                   "e.size")])
+    expect_fail("logical-not-resolved", "A4", [("sycl", RESOLVE_SIG, "    out.logical_bytes = tensor->nb[2];\n", "")])
+    expect_fail("minted-from-host-copy-size", "A4", [("sycl", TXN_SIG, "target.ncols, target.logical_bytes)",
+                                                      "target.ncols, bytes)")])
+    expect_fail("logical-not-handed-to-cache", "A4",
+                [("sycl", TXN_SIG, "                triplet.refill_members[r].logical_bytes = target.logical_bytes;\n",
+                  "")])
+    expect_fail("cache-stages-host-copy-size", "A4", [("cache", COPY_SIG, "members[i].ncols, logical)",
+                                                       "members[i].ncols, e.size)")])
+    expect_fail("shorter-host-copy-admitted", "A4", [("cache", COPY_SIG, "if (e.size < logical) {", "if (false) {")])
+    expect_fail("host-copy-size-retried", "A4", [("sycl", FINAL_SIG, '"host copy size",', "")])
+    expect_fail("copies-the-host-copy-whole", "A5", [("cache", COPY_SIG, "bytes[i]       = logical;",
+                                                      "bytes[i]       = e.size;")])
     expect_fail("helper-ignores-layout", "A4", [("pad", STAGED_SIG, "layout != GGML_LAYOUT_AOS || ", "")])
     expect_fail("helper-computed-for-iq4-nl", "A4", [("pad", STAGED_SIG, "    return aos_staged_weight_bytes(",
                                                       "    if (type == GGML_TYPE_IQ4_NL) {\n        return host_bytes "
                                                       "+ 216;\n    }\n    return aos_staged_weight_bytes(")])
-    expect_fail("width-not-resolved", "A4", [("sycl", RESOLVE_SIG, "    out.ncols = tensor->ne[0];\n", "")])
+    expect_fail("width-not-resolved", "A4", [("sycl", RESOLVE_SIG, "    out.ncols         = tensor->ne[0];\n", "")])
     expect_fail("entry-sized-at-host-bytes", "A4", [("cache", COPY_SIG, "entry.size                  = device_size[i];",
                                                      "entry.size                  = bytes[i];")])
     expect_fail("fill-not-behind-copy", "A5", [("cache", COPY_SIG, "{ out.copy_events[i] });", "{});")])
     expect_fail("entry-not-behind-fill", "A5", [("cache", COPY_SIG, "out.copy_events[i] = mem_fill_async(",
                                                  "(void) mem_fill_async(")])
     expect_fail("record-at-padded-size", "A5", [("sycl", TXN_SIG,
-                                                 "named ? triplet.host_bytes[r] : refilled.device_handles[r].size()",
+                                                 "named ? triplet.refill_members[r].logical_bytes : "
+                                                 "refilled.device_handles[r].size()",
                                                  "refilled.device_handles[r].size()")])
     expect_fail("entry-runs-body-twice", "A6", [("sycl", ENTRY_SIG, "    if (out) {",
                                                  "    (void) ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::"

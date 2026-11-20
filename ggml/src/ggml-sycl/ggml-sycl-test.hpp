@@ -672,7 +672,7 @@ std::string test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph();
 // them FILE_MAPPED again; on a plan that maps nothing they read PINNED throughout.
 std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned();
 // The named move's admit, on the same fixture with each host triplet copied to the pinned pool as S1-PRELOAD copies
-// one. A padded width's tail reads zero in storage poisoned before the admit, and the payload is the host bytes; a
+// one. A padded width's tail reads zero in storage poisoned before the admit, and the payload is the expert's bytes; a
 // member served from a file mapping refuses its triplet and leaves it as it was, while a triplet named after it moves;
 // a loan outstanding and a WEIGHT zone with room for one member are BUSY and leave no state; the host zone gets the
 // moved copies' bytes back once their retired entries go; and the admit that completes a block is read from the card
@@ -682,6 +682,11 @@ std::string test_expert_admit_refuses_a_file_mapped_member();
 std::string test_expert_admit_is_busy_while_lent_or_the_zone_is_full();
 std::string test_expert_admit_returns_the_host_zone_bytes();
 std::string test_expert_admit_completes_a_block_read_through_its_table();
+// An admit sizes from the tensor, never the host copy: from a host copy longer than the expert it copies only the
+// tensor's bytes, mints their staged size, zero-fills the tail and records the tensor's bytes; a host copy shorter
+// than the expert is refused "host copy size" and leaves the triplet as it was.
+std::string test_expert_admit_reads_the_tensor_bytes_from_a_longer_host_copy();
+std::string test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor();
 #endif
 
 }  // namespace ggml_sycl

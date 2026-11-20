@@ -11824,18 +11824,26 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
                 refusal = "device entry exists";
                 break;
             }
+            // A refill copies the lent copy whole. An admit copies the expert's own bytes, its tensor's bytes per
+            // expert, from offset 0 of a host copy that holds at least them: a padded copy's tail is never read, so an
+            // expert that goes to the host and back does not grow, and its record keeps resolving.
+            const size_t logical = admit ? members[i].logical_bytes : e.size;
+            if (e.size < logical) {
+                refusal = "host copy size";
+                break;
+            }
             // A refill's storage is exactly the lent copy's size: a loan that later lends this entry again requires
-            // its owner to be its whole allocation. An admit's is the size direct staging gives the expert, the host
-            // bytes and the padded tail the copy below zero-fills, asked of the layout; never less than the host bytes.
+            // its owner to be its whole allocation. An admit's is the size direct staging gives the expert, its bytes
+            // and the padded tail the copy below zero-fills, asked of the layout; never less than its bytes.
             const size_t staged =
-                admit ? staged_expert_bytes(e.layout, members[i].type, members[i].ncols, e.size) : e.size;
-            if (device_size[i] != staged || staged < e.size) {
+                admit ? staged_expert_bytes(e.layout, members[i].type, members[i].ncols, logical) : e.size;
+            if (device_size[i] != staged || staged < logical) {
                 refusal = "device storage size";
                 break;
             }
             src_owner[i]   = e.direct_alloc_owner;
             src_control[i] = e.direct_alloc_owner.owner_control_id();
-            bytes[i]       = e.size;
+            bytes[i]       = logical;
             if (e.has_write_event) {
                 deps[i].push_back(e.last_write_event);
             }
@@ -11856,8 +11864,8 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
         sycl::queue & bq = get_bcs_queue();
         for (int i = 0; i < 3; ++i) {
             out.copy_events[i] = mem_copy_async(members[i].device_owner, src_owner[i], bytes[i], bq, deps[i]);
-            // An admit's tail past the host bytes reads as zero, as direct staging leaves it. The fill runs behind the
-            // copy on the same queue, and its event becomes the entry's ready event and last write.
+            // An admit's tail past the expert's bytes reads as zero, as direct staging leaves it. The fill runs behind
+            // the copy on the same queue, and its event becomes the entry's ready event and last write.
             if (device_size[i] > bytes[i]) {
                 out.copy_events[i] = mem_fill_async(members[i].device_owner, bytes[i], 0, device_size[i] - bytes[i], bq,
                                                     { out.copy_events[i] });

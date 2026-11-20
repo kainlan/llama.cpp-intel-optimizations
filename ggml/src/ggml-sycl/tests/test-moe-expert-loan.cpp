@@ -139,8 +139,8 @@
 //                           past the host bytes. With the free WEIGHT zone poisoned first (each tail checked to lie in
 //                           poisoned storage), one admit moves the triplet: accepted with its outcome "OK", three
 //                           staged sizes admitted, no staged copy, a new plan, no ledger or teardown count written.
-//                           Each record covers the host bytes from offset 0, each entry resolves on the device at the
-//                           staged size, the payload equals the host bytes and the tail reads zero.
+//                           Each record covers the tensor's bytes from offset 0, each entry resolves on the device at
+//                           the staged size, the payload equals the host bytes and the tail reads zero.
 //   admit_refuses_a_file_mapped_member
 //                           A triplet whose gate copy is served from a file mapping, named before a pinned triplet:
 //                           the first is REFUSED "host copy not pinned" and stays on the host with its entries and
@@ -159,6 +159,15 @@
 //                           The three pointer tables built right after it, with no wait, for a ubatch routing that
 //                           expert each chain a ready event and name the admitted device copy, and a kernel behind
 //                           each upload on the same stream reads the original bytes through the table.
+//   admit_reads_the_tensor_bytes_from_a_longer_host_copy
+//                           Each host copy is one staged tail longer than the Q4_0 expert, its tail 0x5a. The admit
+//                           mints the tensor's staged size, not the longer copy's, admits three of them, records the
+//                           tensor's bytes from offset 0, reads the payload equal and the tail zero, and the WEIGHT
+//                           host zone gets the whole longer copies' bytes back.
+//   admit_refuses_a_host_copy_shorter_than_the_tensor
+//                           The resolver reports a tensor 4 KiB longer per expert than the host copies. The cache
+//                           refuses the triplet REFUSED "host copy size", nothing is published, the triplet stays on
+//                           the host with its entries and records, and the minted storage's room comes back.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -244,6 +253,10 @@ int main() {
     ok &= run_case("admit_returns_the_host_zone_bytes", ggml_sycl::test_expert_admit_returns_the_host_zone_bytes);
     ok &= run_case("admit_completes_a_block_read_through_its_table",
                    ggml_sycl::test_expert_admit_completes_a_block_read_through_its_table);
+    ok &= run_case("admit_reads_the_tensor_bytes_from_a_longer_host_copy",
+                   ggml_sycl::test_expert_admit_reads_the_tensor_bytes_from_a_longer_host_copy);
+    ok &= run_case("admit_refuses_a_host_copy_shorter_than_the_tensor",
+                   ggml_sycl::test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;

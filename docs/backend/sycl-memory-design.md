@@ -322,19 +322,25 @@ source is a whole pinned host copy that is a slice of a host zone. A copy served
 in place from a file mapping is refused "host copy not pinned", REFUSED, and
 stays on the host.
 
-The device copy is minted from the WEIGHT zone through
-`ggml_sycl_device_expert_alloc` at `staged_expert_bytes()`, the size direct
-staging gives the expert, never at the host size. For AOS that is
-`aos_staged_weight_bytes(type, ncols, host size)`: a quantized weight gets a
-tail that completes its last row to a multiple of `MATRIX_ROW_PADDING` columns,
-which the quantized kernels may read. The type and width come from the resolved
-tensor, and the size is asked of the layout, so a layout that stages another
-way adds its own case in one place. The cache requires the device size to be at
-least the host size and equal to the staged size. The copy moves the host
-bytes, the tail is zero-filled behind it on the same queue, and the device
-entry is published behind the fill; the extra's record covers the host bytes,
-as direct staging's does. A Q4_0 expert 640 columns wide gains 216 bytes. The
-first graph after the publish serves the admitted expert from the card: the
+An expert's size is a fact of its tensor, never of a cache entry: the
+transaction reads the tensor's bytes per expert (`nb[2]`), its type and its
+width, and hands the three to the cache. The device copy is minted from the
+WEIGHT zone through `ggml_sycl_device_expert_alloc` at `staged_expert_bytes()`,
+the size direct staging gives the expert, never at the host copy's size. For
+AOS that is `aos_staged_weight_bytes(type, ncols, nb[2])`: a quantized weight
+gets a tail that completes its last row to a multiple of `MATRIX_ROW_PADDING`
+columns, which the quantized kernels may read. The size is asked of the
+layout, so a layout that stages another way adds its own case in one place. A
+host copy may be longer than the expert: a loan of a padded device entry lends
+its tail too. The copy moves exactly `nb[2]` bytes from the host copy's offset
+0 and never reads past them, so an expert that goes to the host and back does
+not grow. A host copy shorter than `nb[2]` is refused "host copy size",
+REFUSED. The cache requires the device size to equal the staged size and to be
+at least `nb[2]`. The tail is zero-filled behind the copy on the same queue,
+the device entry is published behind the fill, and the extra's record covers
+`nb[2]` bytes, as direct staging's does, while the entry holds the staged size.
+The admit gives back the whole host entry, all of its zone bytes. A Q4_0
+expert 640 columns wide gains 216 bytes. The first graph after the publish serves the admitted expert from the card: the
 pointer-table update orders behind the entry's ready event on the context's
 in-order stream, so nothing waits on the host, and that graph queues behind at
 most the admitted triplets' copy and fill.

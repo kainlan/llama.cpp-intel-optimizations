@@ -933,7 +933,7 @@ def claim_refill_retires_the_host_copy_exactly(cache: str) -> bool:
 REFILL_CHECKS = ('refusal = admit ? "not on host" : "not lent";', 'refusal = "layout";',
                  'refusal = admit ? "host copy not pinned" : "not a lent copy";',
                  'refusal = "host copy not published";', 'refusal = "device entry exists";',
-                 'refusal = "device storage size";')
+                 'refusal = "host copy size";', 'refusal = "device storage size";')
 REFILL_LOAD_EFFECT = ('const cache_load_effect load_effect = acquire_bound_load_effect(); if (load_effect.failed()) '
                       '{ out.reason = "load effect unavailable"; return false; }')
 
@@ -949,9 +949,10 @@ def claim_refill_checks_before_copying(cache: str) -> bool:
             and ordered(b, REFILL_LOAD_EFFECT, COHERENCE, *REFILL_CHECKS, REFILL_SRC, REFUSE_EARLY, REFILL_COPY))
 
 
-# A refill's device storage is the lent copy's size; an admit's is the staged size the layout gives the host copy.
+# A refill's device storage is the lent copy's size; an admit's is the staged size the layout gives the expert's
+# tensor's bytes per expert, never its host copy's size.
 DEVICE_BYTES = ("const size_t device_bytes = named ? ggml_sycl::staged_expert_bytes(e->layout, target.type, "
-                "target.ncols, bytes) : bytes;")
+                "target.ncols, target.logical_bytes) : bytes;")
 DEVICE_ALLOC = "ggml_sycl::mem_handle storage = ggml_sycl_device_expert_alloc(device, device_bytes);"
 ZONE_ALLOC = ("ggml_sycl::allocation_result allocation = ggml_sycl::unified_cache_zone_allocate_owner(device, "
               "ggml_sycl::vram_zone_id::WEIGHT, size);")
@@ -1142,7 +1143,7 @@ def claim_refill_warn_formats(sycl: str) -> bool:
 
 
 FINAL_REASONS = ("invalid member", "not lent", "not on host", "layout", "not a lent copy", "host copy not pinned",
-                 "host copy not published", "device storage size")
+                 "host copy not published", "host copy size", "device storage size")
 # Where the shared cache body returns each: a refusal the refill and the admit name differently is one ternary.
 FINAL_REFUSALS = {
     "invalid member": 'refusal = "invalid member";',
@@ -1152,6 +1153,7 @@ FINAL_REFUSALS = {
     "not a lent copy": 'refusal = admit ? "host copy not pinned" : "not a lent copy";',
     "host copy not pinned": 'refusal = admit ? "host copy not pinned" : "not a lent copy";',
     "host copy not published": 'refusal = "host copy not published";',
+    "host copy size": 'refusal = "host copy size";',
     "device storage size": 'refusal = "device storage size";',
 }
 FINAL_POP = ("stop = refilled.reason; transient = !ggml_sycl_expert_refill_refusal_is_final(stop); "
@@ -1479,15 +1481,19 @@ LOAN_BYTES_FIND = ("const auto it = entries_.find(make_direct_stage_key(cache_en
 REFILL_BYTES_FIND = "const auto it = entries_.find({ cache_entry_type::MOE_EXPERT, key, -1, -1 });"
 BYTES_RETURN = "return it != entries_.end() && !it->second.retired ? it->second.size : 0;"
 LOAN_SIZE_GUARD = 'if (host_md[i].size < e.size) { refusal = "host storage too small"; break; }'
-REFILL_SIZE_GUARD = ("const size_t staged = admit ? staged_expert_bytes(e.layout, members[i].type, members[i].ncols, "
-                     'e.size) : e.size; if (device_size[i] != staged || staged < e.size) { '
-                     'refusal = "device storage size"; break; }')
+# A refill copies and sizes from the lent copy whole; an admit from its tensor's bytes per expert, which the host copy
+# must hold.
+REFILL_SIZE_GUARD = ("const size_t logical = admit ? members[i].logical_bytes : e.size; if (e.size < logical) { "
+                     'refusal = "host copy size"; break; } const size_t staged = admit ? staged_expert_bytes(e.layout, '
+                     "members[i].type, members[i].ncols, logical) : e.size; if (device_size[i] != staged || "
+                     'staged < logical) { refusal = "device storage size"; break; }')
 
 
 def claim_copies_are_sized_from_the_entry(cache: str, sycl: str) -> bool:
     """The preparation mints each member's copy at the size of the cache entry it will hold, which the cache reads
     under its two locks, and never at the plan's dst_size: a loan's and a refill's at the entry's size, an admit's at
-    the staged size of it. The cache's size checks stay as the guards, a refill's against the host copy's size."""
+    the staged size of its tensor's bytes per expert. The cache's size checks stay as the guards, a refill's against
+    the host copy's size."""
     txn = body(norm(sycl), TXN_SIG)
     c = norm(cache)
     loan_bytes = body(c, LOAN_BYTES_SIG)
@@ -2812,6 +2818,13 @@ def test_mutant_refill_device_bytes_from_dst_size_fails():
     """The refill's arm of the device size taken from the plan's dst_size: the padded tail its lent copy holds is lost."""
     mutant = _once_in(SYCL, TXN_SIG, DEVICE_BYTES, DEVICE_BYTES.replace(": bytes;", ": e->dst_size;"))
     assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
+
+
+def test_mutant_refill_copies_the_members_logical_bytes_fails():
+    """The refill reading the member's logical_bytes, which its preparation does not size from: it must copy and size
+    from the lent copy whole, as it did before the admit came."""
+    mutant = _once_in(CACHE, REFILL_BODY_SIG, "admit ? members[i].logical_bytes : e.size", "members[i].logical_bytes")
+    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
 
 
 def test_mutant_refill_runs_the_admit_checks_fails():
