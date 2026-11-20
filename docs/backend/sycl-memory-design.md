@@ -3569,7 +3569,9 @@ and the reorder temp, reclaims the graph scratch and the deferred frees, and
 tears the arena down when nothing holds it. An arena nothing holds is released,
 its device memory goes back to the card, and the next load's start reserves the
 early arena from start values (`ggml_sycl_load_start_reserve_released_arenas()`).
-A start reserve that fails refuses that load by name
+A cache with no arena at the release returns `EMPTIED` without marking an arena
+released (`arena_released_`), so the next load's start reserves nothing there
+and that load's entry ensure builds the arena. A start reserve that fails refuses that load by name
 (`[SYCL] model load refused at its start: <reason>`), and the end of a refused
 load reserves nothing. A device whose cache emptied then holds the published
 terms a device no load has planned on reads (`load_published_terms{}.restore()`,
