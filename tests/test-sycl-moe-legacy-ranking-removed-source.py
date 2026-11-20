@@ -97,6 +97,10 @@ REMOVED_WORDS = (
     # The SCRATCH-zone device helper only the GPU reorder fill called, and the PP profile counter only it fed.
     "arena_device_alloc",
     "pp_scratch_profile_note_device_alloc",
+    # The expert-group eviction pair, which called only each other, and with it the cache entry's access counter
+    # (the counter's name stays legal: heat-aware-eviction.hpp and layout-scheduler.hpp have their own).
+    "evict_expert_group",
+    "evict_coldest_expert_group",
 )
 REMOVED_TAGS = ("[MOE-WARMUP]", "[MOE-GATE-NORM]", "[MOE-RERANK]", "[ADAPTIVE-PRESTAGE]")
 

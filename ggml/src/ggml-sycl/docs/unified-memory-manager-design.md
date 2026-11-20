@@ -400,7 +400,6 @@ This pattern already exists and works correctly. It needs to be extended to non-
 | Unified allocation API | COMPLETE | unified_cache_allocate, unified_alloc |
 | Location-transparent weight lookup | COMPLETE | resolve_weight, weight_ptr_result |
 | Alloc registry (pointer type tracking) | COMPLETE | alloc_registry with binary search |
-| Expert group atomic eviction | COMPLETE | evict_expert_group |
 | Deferred free (safe async release) | COMPLETE | enqueue_deferred_free, process_deferred_frees |
 | Graph replay pin/unpin coordination | COMPLETE | pin, unpin, unpin_on_event |
 | Async layer prefetch | COMPLETE | queue_layer_prefetch, prefetch_worker_loop |
@@ -501,7 +500,7 @@ Priority 4 (always host-eligible):
   - Debug/profiling allocations
 ```
 
-Eviction scans from highest priority number (coldest) to lowest. Within a tier, existing LRU+LFU scoring determines victim selection.
+Eviction scans from highest priority number (coldest) to lowest. Within a tier, the least recently used entry is the victim (evict_one).
 
 ### 6.4 Core API (Target)
 

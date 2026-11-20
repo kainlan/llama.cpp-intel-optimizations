@@ -3994,7 +3994,6 @@ struct unified_cache_entry {
     ggml_layout_mode      layout;           // Target layout for this entry
     int64_t               onednn_pack_m;    // M dimension used for ONEDNN_PACKED/ONEDNN_WOQ (0 when unused)
     cache_layout_xmx_info xmx_info;         // XMX metadata (when applicable)
-    uint32_t              access_count;     // Access frequency for LFU
     int64_t               last_access;      // Timestamp for recency
     bool                  pinned;           // Protected from eviction
     bool                  hot;              // Hot-set hint for MoE experts
@@ -4163,11 +4162,11 @@ enum class unified_cache_last_release {
 // 1. Single memory budget - avoids OOM from competing caches
 // 2. Type-aware eviction - dense weights and experts have equal priority
 // 3. Automatic partitioning - no manual budget splitting needed
-// 4. LFU+LRU hybrid eviction - keeps frequently used entries
+// 4. Tier-then-LRU eviction - evict_one takes the lowest eviction tier, then the least recently used entry
 //
 // Usage:
 // - call ensure_cached() for any weight (dense or expert)
-// - cache automatically evicts lowest-scoring entries when full
+// - cache automatically evicts by tier, then least recent access, when full
 // - for MoE: call with layer_id and expert_id
 // - for dense: call with layer_id=-1, expert_id=-1
 class unified_cache {
@@ -4723,7 +4722,7 @@ class unified_cache {
     // Get device pointer, waiting for IN_PROGRESS entries to complete.
     // Fast path for cache lookup using shared_lock (reader-writer lock).
     // Returns device_ptr if entry exists, is READY, and layout matches.
-    // Otherwise returns nullptr. Does not update LRU/LFU stats.
+    // Otherwise returns nullptr. Does not update the entry's last access.
     void * try_get_cached_fast(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout);
 
     // Like try_get_cached_fast, but also returns device_ptr for IN_PROGRESS
@@ -4746,20 +4745,6 @@ class unified_cache {
                 ggml_layout_mode           layout);
 
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not in cache
-
-    // === Atomic Expert Group Eviction ===
-    // All 3 tensors (gate, up, down) evict together -- never partial.
-
-    // Evict all 3 tensors for an expert atomically.
-    // Removes gate, up, and down from the cache together.
-    void evict_expert_group(const expert_tensor_group & keys, ggml_layout_mode layout);
-
-    // Evict the coldest expert group to free VRAM.
-    // Uses combined access frequency across all 3 tensors as coldness metric.
-    // expert_groups: the global registry mapping (block,expert) -> keys.
-    // Returns bytes freed, or 0 if no evictable expert group was found.
-    size_t evict_coldest_expert_group(const std::unordered_map<int64_t, expert_tensor_group> & expert_groups,
-                                      ggml_layout_mode                                         layout);
 
     // === Pinning for Graphs ===
 

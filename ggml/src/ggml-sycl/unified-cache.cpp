@@ -9302,7 +9302,6 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
         }
         hits_++;
         // Update access stats
-        it->second.access_count++;
         it->second.last_access = time_++;
         return it->second.device_ptr;
     }
@@ -9429,7 +9428,6 @@ void * unified_cache::ensure_cached(const ggml_sycl_cache_id & key_id,
     entry.layer_id     = layer_id;
     entry.expert_id    = expert_id;
     entry.layout       = layout;
-    entry.access_count = 1;
     entry.last_access  = time_++;
     entry.pinned       = false;
     entry.hot          = false;
@@ -9850,7 +9848,6 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         entry.layer_id           = -1;
         entry.expert_id          = -1;
         entry.layout             = layout;
-        entry.access_count       = 0;
         entry.last_access        = time_++;
         entry.pinned             = true;
         entry.hot                = true;
@@ -10230,7 +10227,6 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             entry.layer_id         = -1;
             entry.expert_id        = -1;
             entry.layout           = GGML_LAYOUT_AOS;
-            entry.access_count     = 0;
             entry.last_access      = time_++;
             entry.pinned           = true;
             entry.hot              = true;
@@ -10396,7 +10392,6 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         entry.layer_id           = -1;
         entry.expert_id          = -1;
         entry.layout             = layout;
-        entry.access_count       = 0;
         entry.last_access        = time_++;
         entry.pinned             = false;
         entry.hot                = true;
@@ -10696,7 +10691,6 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
             entry.layer_id         = -1;
             entry.expert_id        = -1;
             entry.layout           = layout;
-            entry.access_count     = 0;
             entry.last_access      = time_++;
             entry.pinned           = true;
             entry.hot              = true;
@@ -11844,7 +11838,6 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
         entry.layer_id              = -1;
         entry.expert_id             = -1;
         entry.layout                = GGML_LAYOUT_AOS;
-        entry.access_count          = 0;
         entry.pinned                = false;
         entry.hot                   = true;
         entry.state                 = cache_entry_state::IN_PROGRESS;
@@ -12530,7 +12523,6 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
                         old->second.direct_alloc_owner = typed_owner;
                     }
                 }
-                old->second.access_count++;
                 old->second.last_access = time_++;
                 direct_handle =
                     make_direct_entry_handle(cache_key, dev, old->second, "register_host_expert/existing-mirror");
@@ -12557,7 +12549,6 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         cache_entry.layer_id         = -1;
         cache_entry.expert_id        = -1;
         cache_entry.layout           = layout;
-        cache_entry.access_count     = 0;
         cache_entry.last_access      = time_++;
         cache_entry.pinned           = true;
         cache_entry.hot              = true;
@@ -12681,7 +12672,6 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
                     old->second.storage_owner = allocation_owner;
                     old->second.non_owning_external_host = !allocation_owner;
                 }
-                old->second.access_count++;
                 old->second.last_access = time_++;
                 direct_handle =
                     make_direct_entry_handle(cache_key, dev, old->second, "register_host_weight/existing-mirror");
@@ -12709,7 +12699,6 @@ bool unified_cache::register_host_weight(ggml_sycl_cache_id    key,
         cache_entry.layer_id         = -1;
         cache_entry.expert_id        = -1;
         cache_entry.layout           = layout;
-        cache_entry.access_count     = 0;
         cache_entry.last_access      = time_++;
         cache_entry.pinned           = true;
         cache_entry.hot              = true;
@@ -13211,7 +13200,6 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
     entry.layout               = layout;
     entry.onednn_pack_m        = 0;
     entry.xmx_info             = {};
-    entry.access_count         = 1;
     entry.last_access          = time_++;
     entry.pinned               = is_pool_alloc;
     entry.hot                  = false;
@@ -13298,7 +13286,6 @@ void unified_cache::register_ready(const ggml_sycl_cache_id & key,
         entry.has_ready_event = false;
         entry.src_ptr         = src_ptr;
         entry.onednn_pack_m   = onednn_pack_m;
-        entry.access_count++;
         entry.last_access = time_++;
     } else {
         // Capability creation is cache-owned: callers must allocate_slot first.
@@ -13308,150 +13295,6 @@ void unified_cache::register_ready(const ggml_sycl_cache_id & key,
     entry_cv_.notify_all();
 
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] register_ready: layout=%d size=%zu ptr=%p\n", (int) layout, size, device_ptr);
-}
-
-// ---------------------------------------------------------------------------
-// Atomic expert group eviction: all 3 tensors evict together.
-// ---------------------------------------------------------------------------
-void unified_cache::evict_expert_group(const expert_tensor_group & keys, ggml_layout_mode layout) {
-    auto evict_one_key = [&](const ggml_sycl_cache_id & key) {
-        if (!key.valid) {
-            return;
-        }
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
-        auto                                id_it = id_to_key_.find(key);
-        if (id_it == id_to_key_.end()) {
-            return;
-        }
-        auto entry_it = entries_.find(id_it->second);
-        if (entry_it == entries_.end()) {
-            return;
-        }
-        int lid = entry_it->second.layer_id;
-        int eid = entry_it->second.expert_id;
-        lock.unlock();
-        remove(key, cache_entry_type::MOE_EXPERT, lid, eid, layout);
-    };
-
-    if (keys.has_gate) {
-        evict_one_key(keys.gate_key);
-    }
-    if (keys.has_up) {
-        evict_one_key(keys.up_key);
-    }
-    if (keys.has_down) {
-        evict_one_key(keys.down_key);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Expert-granularity LRU eviction: find coldest expert group, evict all 3.
-// ---------------------------------------------------------------------------
-size_t unified_cache::evict_coldest_expert_group(const std::unordered_map<int64_t, expert_tensor_group> & expert_groups,
-                                                 ggml_layout_mode                                         layout) {
-    // Scan all expert groups to find the coldest one (lowest combined frequency).
-    int64_t  coldest_gkey        = -1;
-    uint32_t coldest_freq        = UINT32_MAX;
-    int64_t  coldest_last_access = std::numeric_limits<int64_t>::max();
-    size_t   coldest_total_bytes = 0;
-
-    auto get_entry_info = [&](const ggml_sycl_cache_id & key) -> std::tuple<bool, uint32_t, int64_t, size_t, bool> {
-        // Returns: (found, access_count, last_access, size, pinned_or_leased)
-        if (!key.valid) {
-            return { false, 0, 0, 0, false };
-        }
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
-        auto                                id_it = id_to_key_.find(key);
-        if (id_it == id_to_key_.end()) {
-            return { false, 0, 0, 0, false };
-        }
-        auto entry_it = entries_.find(id_it->second);
-        if (entry_it == entries_.end()) {
-            return { false, 0, 0, 0, false };
-        }
-        const auto &   e    = entry_it->second;
-        // llama.cpp-vtf7f: treat live mem_handle leases as pinned for the
-        // purposes of group eviction.  evict_expert_group() below issues
-        // per-tensor remove() which itself refuses on in_use_count > 0, so
-        // this is defence-in-depth — without it, the scoring loop might
-        // select a leased group only to have the actual remove() skip.
-        const uint32_t live = e.in_use_count.load();
-        if (live > 0) {
-            residency_diagnostics_record_live_handle_for_test("evict-coldest-expert-group-scan", "WEIGHT", e.size);
-            residency_diagnostics_record_reject_for_test(residency_reject_reason::LIVE_LEASE_PRESSURE, e.size,
-                                                         zone_available(vram_zone_id::WEIGHT),
-                                                         zone_largest_free(vram_zone_id::WEIGHT));
-        }
-        const bool held = e.pinned || live > 0;
-        return { true, e.access_count, e.last_access, e.size, held };
-    };
-
-    for (const auto & [gkey, grp] : expert_groups) {
-        uint32_t combined_freq = 0;
-        int64_t  oldest_access = std::numeric_limits<int64_t>::max();
-        size_t   total_bytes   = 0;
-        bool     any_found     = false;
-        bool     any_pinned    = false;
-
-        auto check_tensor = [&](const ggml_sycl_cache_id & key, bool has_key) {
-            if (!has_key || !key.valid) {
-                return;
-            }
-            auto [found, freq, last_access, sz, pinned] = get_entry_info(key);
-            if (!found) {
-                return;
-            }
-            any_found = true;
-            combined_freq += freq;
-            oldest_access = std::min(oldest_access, last_access);
-            total_bytes += sz;
-            if (pinned) {
-                any_pinned = true;
-            }
-        };
-
-        check_tensor(grp.gate_key, grp.has_gate);
-        check_tensor(grp.up_key, grp.has_up);
-        check_tensor(grp.down_key, grp.has_down);
-
-        if (!any_found || any_pinned || total_bytes == 0) {
-            continue;
-        }
-
-        // Compare: lower frequency wins, then older last_access as tiebreaker
-        bool is_colder =
-            (combined_freq < coldest_freq) || (combined_freq == coldest_freq && oldest_access < coldest_last_access);
-
-        if (is_colder) {
-            coldest_gkey        = gkey;
-            coldest_freq        = combined_freq;
-            coldest_last_access = oldest_access;
-            coldest_total_bytes = total_bytes;
-        }
-    }
-
-    if (coldest_gkey < 0) {
-        GGML_SYCL_DEBUG(
-            "[UNIFIED-CACHE] evict_coldest_expert_group: "
-            "no evictable group found\n");
-        return 0;
-    }
-
-    // Evict the coldest group
-    auto it = expert_groups.find(coldest_gkey);
-    if (it == expert_groups.end()) {
-        return 0;
-    }
-
-    const int block = static_cast<int>(coldest_gkey >> 16);
-    const int exp   = static_cast<int>(coldest_gkey & 0xFFFF);
-    GGML_SYCL_DEBUG(
-        "[UNIFIED-CACHE] evict_coldest_expert_group: blk=%d exp=%d "
-        "freq=%u bytes=%zu\n",
-        block, exp, coldest_freq, coldest_total_bytes);
-
-    evict_expert_group(it->second, layout);
-    return coldest_total_bytes;
 }
 
 void * unified_cache::lookup(const ggml_sycl_cache_id & key, ggml_layout_mode layout) {
@@ -26435,9 +26278,8 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
                 it->second.replacement_generation_ = reserved_entry.replacement_identity();
             }
 
-            it->second.src_ptr      = src_ptr;
-            it->second.content_hash = new_hash;
-            it->second.access_count++;
+            it->second.src_ptr         = src_ptr;
+            it->second.content_hash    = new_hash;
             it->second.last_access     = time_++;
             it->second.state           = cache_entry_state::READY;
             it->second.has_ready_event = false;
@@ -26489,7 +26331,6 @@ void * unified_cache::ensure_cached_alloc(const ggml_sycl_cache_id & key_id,
     entry.layer_id             = layer_id;
     entry.expert_id            = expert_id;
     entry.layout               = layout;
-    entry.access_count         = 1;
     entry.last_access          = time_++;
     entry.pinned               = false;
     entry.hot                  = false;
