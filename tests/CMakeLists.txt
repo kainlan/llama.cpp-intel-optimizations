@@ -3779,11 +3779,12 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         TIMEOUT 300
     )
 
-    # Column-split form of the Q8_0 matvec against its row form and a CPU reference, SOA and coalesced, on the
-    # 4 x 10240 and 48 x 2560 shapes, with and without a fused addend, plus a SOA row slice. It runs the production
+    # Column-split form of the Q8_0 matvec against its row form and a CPU reference, SOA and coalesced. The cases are
+    # in test-sycl-mmvq-q8-0-column-split-cases.h: the decode-profile shapes with and without a fused addend, SOA row
+    # slices, and row counts that leave padded rows in the last work-group of each layout. It runs the production
     # launchers through the GGML_SYCL_PRIVATE_TESTING entry mmvq_test_q8_0_launch, so it links the private backend
     # objects. It loads no model and allocates under 2 MB of device memory. Pinned to the B70, the card whose decode
-    # profile found the shapes; it exits 77 when no GPU is usable.
+    # profile found the shapes; it exits 77 when no GPU is usable or the card would not take the split.
     add_executable(test-sycl-mmvq-q8-0-column-split test-sycl-mmvq-q8-0-column-split.cpp)
     target_link_libraries(test-sycl-mmvq-q8-0-column-split PRIVATE ggml-sycl-private-fixtures)
     target_include_directories(test-sycl-mmvq-q8-0-column-split PRIVATE
