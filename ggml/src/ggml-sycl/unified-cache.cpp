@@ -32091,8 +32091,8 @@ bool unified_cache::arena_destroy() {
         // The chunk is freed, so a broken invariant below is reported, not aborted on: the teardown goes on.
         alloc_registry::instance().unregister_alloc(c.ptr);
         if (alloc_registry::instance().lookup(c.ptr) != nullptr) {
-            GGML_LOG_ERROR("[VRAM-ARENA] freed chunk %zu (%p) on device %d is still registered after unregister\n", ci,
-                           c.ptr, dev_id);
+            GGML_LOG_ERROR("[VRAM-ARENA] arena chunk remained registered after unregister: chunk %zu, device %d\n", ci,
+                           dev_id);
         }
         const size_t live_before = g_live_arena_chunks.fetch_sub(1, std::memory_order_acq_rel);
         if (live_before == 0) {
