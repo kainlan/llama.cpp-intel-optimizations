@@ -1514,6 +1514,19 @@ graph. Device-only FIFO ownership of pending KV masks is likewise forbidden.
 Whole-zone reset remains a refusal, not a force-free, if any non-target or
 in-flight allocation would be affected.
 
+The per-device cache lives for the process; nothing in it stays sized for a
+model once no model is live. After the last model's release, and after a failed
+load's abort with no model live, each cache releases the PP MoE oneDNN ring, the
+oneDNN scratchpad pair and the reorder temp. An arena nothing holds is released,
+its device memory goes back to the card, and the next load's start reserves the
+early arena from start values; the end of a refused load reserves nothing. A
+cache that gave everything back has its published planning terms put back to
+their start values. A holder is named, never reaped: a claimed ring slot, a
+reserved pair or a live lease keeps what it holds, and its cache keeps its
+terms. Liveness is process-wide, so a model live on any device keeps every
+device's arena. Detail: `docs/backend/sycl-memory-design.md`, "The release of
+the last model".
+
 ### 12.5 Locking and waiting
 
 The target lock inventory and mandatory order is concrete:

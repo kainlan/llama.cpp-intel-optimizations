@@ -855,8 +855,8 @@ def test_mutant_probe_called_from_init_fails():
 
 def test_mutant_probe_called_from_load_begin_fails():
     assert not claim_probe_runs_after_preload_through_the_mutable_accessor(
-        _once(SYCL, "ggml_sycl_model_loading_effects(true, true); registry->bind_candidate(result.txn);",
-              "ggml_sycl_model_loading_effects(true, true); " + CALL + "; registry->bind_candidate(result.txn);"))
+        _once(SYCL, "ggml_sycl_model_loading_effects(true, true);",
+              "ggml_sycl_model_loading_effects(true, true); " + CALL + ";"))
 
 
 def test_mutant_const_cast_fails():

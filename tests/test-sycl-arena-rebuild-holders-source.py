@@ -256,7 +256,7 @@ def claim_site_count_costs_one_relaxed_add(uc: str, uch: str) -> bool:
 ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
               "const zone_arena_ensure_options & options)")
 REFUSAL_LINE = '"[VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: "'
-HOLDERS_LINE = '"[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "'
+HOLDERS_LINE = '"[VRAM-ARENA] live in the arena on device %d (MB): %s; "'
 SITE_LINE = '"[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\\n"'
 CENSUS_SIG = "uint32_t unified_cache::arena_chunk_lease_census(char * out, size_t size) const noexcept"
 CENSUS_CALL = "const uint32_t site_leases = arena_chunk_lease_census(leases_by_site, sizeof(leases_by_site));"
@@ -269,19 +269,30 @@ SITE_LOOP = (
     'chunk_lease_site_name(tag.site), tag.copy ? "(copy)" : "", held);',
     "return sum;",
 )
-SITE_WARN_ARGS = "site_leases, chunk_leases);"
+SITE_WARN_ARGS = "site_leases, holders.chunk_leases);"
 ZONE_DUMP = (
     "if (live_zone_used[z] != 0) {",
-    'dump_live_zone_allocations(static_cast<vram_zone_id>(z), "arena-rebuild");',
+    "dump_live_zone_allocations(static_cast<vram_zone_id>(z), site);",
 )
+# The refusal reads the holders through arena_read_holders and names them through arena_report_holders, under its own
+# site name, at ERROR.
+READ_SIG = "zone_arena_holders unified_cache::arena_read_holders(size_t * live_zone_used)"
+REPORT_SIG = ("void unified_cache::arena_report_holders(int dev_id, const size_t * live_zone_used, "
+              "zone_arena_holders & holders, const char * site, ggml_log_level level)")
+READ_CALL = "zone_arena_holders holders = arena_read_holders(live_zone_used);"
+REPORT_CALL = 'arena_report_holders(dev_id, live_zone_used, holders, "arena-rebuild", GGML_LOG_LEVEL_ERROR);'
 
 
 def refusal_segment(uc: str) -> str:
-    """ensure_planned_arena_zones() from the refusal line up to its return false, or "" when the shape is gone."""
-    ens = fn_body(code(uc), ENSURE_SIG)
+    """ensure_planned_arena_zones() from the refusal line up to its return false, followed by the body of the holders
+    report it calls there, or "" when the shape is gone or the segment does not call the report."""
+    c = code(uc)
+    ens = fn_body(c, ENSURE_SIG)
     i = ens.find(REFUSAL_LINE)
     r = ens.find("return false;", max(i, 0))
-    return ens[i:r] if -1 not in (i, r) else ""
+    if -1 in (i, r) or REPORT_CALL not in ens[i:r]:
+        return ""
+    return ens[i:r] + " " + fn_body(c, REPORT_SIG)
 
 
 def claim_refusal_prints_leases_by_site(uc: str) -> bool:
@@ -320,11 +331,15 @@ COUNTED = (
     "std::lock_guard<std::mutex> lock(persistent_scratch_mutex_);",
     "count(named.second.device_ptr);",
 )
-GATE = (
+GATE_READ = (
     "zone_arena_holders holders;",
     "holders.live_zone_bytes = live_zone_bytes;",
     "holders.chunk_leases = chunk_leases;",
     "arena_count_scratch_holders(holders);",
+    "return holders;",
+)
+GATE = (
+    READ_CALL,
     "if (!zone_arena_rebuild_allowed(holders)) {",
     REFUSAL_LINE,
 )
@@ -343,10 +358,12 @@ def claim_scratch_blocks_only_inside_the_arena(uc: str) -> bool:
     c = code(uc)
     body = fn_body(c, COUNT_SIG)
     ens = fn_body(c, ENSURE_SIG)
-    pre = ens[: ens.find(REFUSAL_LINE)] if REFUSAL_LINE in ens else ""
+    read = fn_body(c, READ_SIG)
+    pre = (ens[: ens.find(REFUSAL_LINE)] + " " + read) if REFUSAL_LINE in ens else ""
     return (
         OWNS_TEST in body
         and ordered(body, *COUNTED)
+        and ordered(read, *GATE_READ)
         and ordered(ens, *GATE)
         and not any(t in pre for t in POINTER_TESTS)
         and "holders.scratch_in_arena, holders.ring_in_arena, holders.scratch_outside, holders.live_beside_ring);"
@@ -512,19 +529,23 @@ def test_witness_site_count_lowered_on_underflow():
 
 
 def test_witness_refusal_without_site_line():
-    assert not claim_refusal_prints_leases_by_site(mutate_in(UC, ENSURE_SIG, SITE_LINE, '"x"'))
+    assert not claim_refusal_prints_leases_by_site(mutate_in(UC, REPORT_SIG, SITE_LINE, '"x"'))
 
 
 def test_witness_site_line_at_info():
     assert not claim_refusal_prints_leases_by_site(
-        mutate_in(UC, ENSURE_SIG, "GGML_LOG_WARN(" + SITE_LINE, "GGML_LOG_INFO(" + SITE_LINE)
+        mutate_in(UC, REPORT_SIG, "GGML_LOG_WARN(" + SITE_LINE, "GGML_LOG_INFO(" + SITE_LINE)
     )
 
 
 def test_witness_refusal_without_census():
     assert not claim_refusal_prints_leases_by_site(
-        mutate_in(UC, ENSURE_SIG, CENSUS_CALL, "const uint32_t site_leases = 0;")
+        mutate_in(UC, REPORT_SIG, CENSUS_CALL, "const uint32_t site_leases = 0;")
     )
+
+
+def test_witness_refusal_does_not_call_the_report():
+    assert not claim_refusal_prints_leases_by_site(mutate_in(UC, ENSURE_SIG, REPORT_CALL, ""))
 
 
 def test_witness_census_counts_no_copies():
@@ -540,17 +561,23 @@ def test_witness_census_sum_skips_an_unwritten_site():
 
 
 def test_witness_refusal_without_zone_dump():
-    assert not claim_refusal_dumps_every_live_zone(mutate_in(UC, ENSURE_SIG, ZONE_DUMP[1], ""))
+    assert not claim_refusal_dumps_every_live_zone(mutate_in(UC, REPORT_SIG, ZONE_DUMP[1], ""))
 
 
 def test_witness_refusal_dumps_through_the_wrapper():
     assert not claim_refusal_dumps_every_live_zone(
         mutate_in(
             UC,
-            ENSURE_SIG,
+            REPORT_SIG,
             ZONE_DUMP[1],
-            'unified_cache_dump_live_zone_allocations(dev_id, static_cast<vram_zone_id>(z), "arena-rebuild", 32);',
+            "unified_cache_dump_live_zone_allocations(dev_id, static_cast<vram_zone_id>(z), site, 32);",
         )
+    )
+
+
+def test_witness_reading_drops_the_scratch_count():
+    assert not claim_scratch_blocks_only_inside_the_arena(
+        mutate_in(UC, READ_SIG, "arena_count_scratch_holders(holders);", "")
     )
 
 

@@ -167,7 +167,7 @@ CAP_KEEP = f"{CAP_FN}();"
 # The one lambda every keep calls: it binds the compute arena when it is unbound, then keeps the snapshot.
 KEEP_ARENA = "keep_arena_as_built();"
 KEEP_ARENA_DEF = "const auto keep_arena_as_built = [&]() {"
-KEEP_ARENA_BIND = "if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) { bind_compute_arena(); }"
+KEEP_ARENA_BIND = "if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) { compute_arena_bind(); }"
 SUFFICIENT = "if (zones_sufficient) {"
 # A blocked rebuild keeps a SCRATCH zone short of the MoE batched MMVQ bound alone before the ONEDNN keep is decided.
 SCRATCH_BLOCKED = "if (scratch_kept < scratch_zone && !zone_arena_rebuild_allowed(holders)) {"

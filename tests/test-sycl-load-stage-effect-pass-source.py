@@ -6,8 +6,9 @@ effect pass). A load runs the stage twice, an early pass and then a late one, an
 before the late pass decides. A pass refused on any device therefore runs none of its own effects, and a load refused in
 its late pass has already run its early pass's effect, the stale ring's release. The rollback guard's abort puts back
 what the decide pass published. The decide pass still changes a device in the planner's zone decision: the entry
-ensure's last resort below releases a ring, and an arena nothing holds may be rebuilt for the plan's zones, which a
-refused load keeps (or no arena, after a failed reserve). These checks pin the rest:
+ensure's last resort below releases a ring, and an arena nothing holds may be rebuilt for the plan's zones, which the
+refused load's abort tears down again when no model is live (pinned by test-sycl-last-release-source.py). These checks
+pin the rest:
 
 The decide pass releases the PP MoE oneDNN scratch ring in one place only: ggml_sycl_ensure_load_arena_zones, the
 planner's entry ensure, as its last resort when a rebuild is needed and the ring's slot buffers are the arena's only

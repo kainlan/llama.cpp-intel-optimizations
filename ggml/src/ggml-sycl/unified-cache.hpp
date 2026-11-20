@@ -3374,6 +3374,12 @@ struct load_published_terms {
     // Takes the terms of `groups` from `from`. Not named copy: a `.copy(` member call reads as a queue shortcut to the
     // window-path launch census.
     void                        take_groups(const load_published_terms & from, uint32_t groups);
+    // Stores the terms of `groups` as the device's published terms, each group through its own setters: the one list
+    // of what a load publishes. A failed load's record puts groups back through it, and the last release of a device
+    // stores a default-constructed set through it, which is what a device no load has planned on reads. The zone plan
+    // is stored as given, onto the device's existing cache; a caller that puts a plan back over a zone that may have
+    // changed since leaves that group out and uses unified_cache::onednn_zone_plan_put_back.
+    void                        restore(int device, uint32_t groups = LOAD_PUBLISHED_GROUP_ALL) const noexcept;
 };
 
 // One device's terms for one load transaction, kept so that a load that fails puts back what it published and nothing
@@ -4140,6 +4146,26 @@ struct layer_weight_pointers {
     void * down_proj        = nullptr;
     void * attn_qkv_proj    = nullptr;  // Fused QKV (optional)
     void * ffn_gate_up_proj = nullptr;  // Fused gate+up (optional)
+};
+
+// Why the release of the last model runs: the model's release, the abort of a load that failed, or the start of a
+// load, which runs again a release the failed load's buffers held off. At an abort those buffers are still alive (they
+// go with the model, after the abort), so what holds the arena then is no leak. At a start it may be either: before the
+// failed model is freed its buffers hold the arena, after that a holder is a leak, so the start names the holders at
+// WARN. Only the abort marks a release deferred.
+enum class unified_cache_release_cause { MODEL_RELEASED, LOAD_ABORTED, LOAD_START };
+
+// What unified_cache::release_for_no_live_model() did: EMPTIED when the cache holds nothing sized for a model (or held
+// nothing), otherwise what kept it, and nothing after that was released.
+enum class unified_cache_last_release {
+    EMPTIED,
+    MODEL_LIVE,        // a model is live, so nothing was released
+    BARRIER_FAILED,    // the device work before the release could not be waited for
+    RING_CLAIMED,      // a slot of the PP MoE oneDNN ring is claimed
+    PAIR_HELD,         // the oneDNN scratchpad pair is reserved
+    ARENA_HELD,        // something still holds the arena
+    TEARDOWN_REFUSED,  // the arena's teardown refused
+    FAILED,            // an exception ended the release
 };
 
 // Unified GPU cache for both dense weights and MoE experts
@@ -5137,6 +5163,11 @@ class unified_cache {
     zone_onednn_plan onednn_zone_plan_load() const;
     // A failed load's restore (load_published_record::restore); see the definition. Takes onednn_zone_plan_mutex_.
     void             onednn_zone_plan_put_back(const zone_onednn_plan & written, const zone_onednn_plan & prior);
+    // Stores `plan` as the zone plan. Only two callers may: the ensure, for the zone it built from that plan, and the
+    // published terms' restore (load_published_terms::restore), which stores it with the device's other terms. It is
+    // public for the restore alone; any other caller would describe the zone by a plan it was not built from. Takes
+    // onednn_zone_plan_mutex_ alone.
+    void             onednn_zone_plan_store(const zone_onednn_plan & plan);
     // Both free-space figures of one zone, read together under its allocator group's mutex: the
     // allocators' figures are only coherent under it (zone_available and zone_largest_free read
     // them bare), with the zone's capacity and used bytes read at the same instant. For a zone with its
@@ -5205,6 +5236,28 @@ class unified_cache {
     zone_arena_teardown_refusal arena_teardown_refusal() const {
         return arena_teardown_refusal_.load(std::memory_order_acquire);
     }
+
+    // The release of the last model: with no model live, it gives back what this cache sized for one, so the next load
+    // plans and builds as a first load does. In order: it waits once for the device work submitted before it, releases
+    // the PP MoE oneDNN ring, the oneDNN scratchpad pair, the MoE reorder temp buffer and the pooled oneDNN Graph
+    // scratch, drains the queued frees, then tears the arena down, which hands its memory back to the device. It stops
+    // at the first thing that holds on, with an ERROR line that names it (a WARN for what a failed load's own buffers
+    // hold at its abort, and at a load's start, LOAD_START, a WARN that names the holders, since one still there once
+    // the failed model is freed is a leak), and releases nothing after it; nothing is reaped, evicted or reset over a
+    // live handle. An arena a failed load's buffers hold at its abort (LOAD_ABORTED) marks the release deferred
+    // (last_release_deferred); the start never sets that mark, and only a release that empties the cache clears it.
+    // The next load's start reserves the arena of a cache it emptied again (reserve_released_arena). It reserves
+    // nothing itself and never throws: an exception ends it with an ERROR naming `site`.
+    unified_cache_last_release release_for_no_live_model(const char * site, unified_cache_release_cause cause) noexcept;
+
+    // The start of a load: a cache whose arena the last release tore down reserves its early arena again from the
+    // published terms, as the constructor did. True when there is nothing to reserve or the reserve succeeded; false
+    // with `refusal` written when it failed, and the cache stays released, so the next load's start tries again.
+    bool reserve_released_arena(zone_arena_refusal * refusal);
+
+    // A failed load's buffers held this cache's arena at its abort's release, and no release has emptied the cache
+    // since. The next load's start, before its reserve, runs that release again for a cache that answers true.
+    bool last_release_deferred() const { return last_release_deferred_.load(std::memory_order_acquire); }
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
     void       test_zone_boundary_check(vram_zone_id zone) { zone_boundary_check(zone); }
     mem_handle test_scratch_pool_owner() const;
@@ -6422,6 +6475,39 @@ class unified_cache {
     // alone.
     void arena_count_scratch_holders(zone_arena_holders & holders);
 
+    // What holds the arena now: each zone's live bytes, written into `live_zone_used` (one figure per vram_zone_id),
+    // their sum, the chunk leases, and the cache's scratch buffers (arena_count_scratch_holders). A caller that decides
+    // on these figures prints them, not a second reading, which could disagree with them under a concurrent release.
+    zone_arena_holders arena_read_holders(size_t * live_zone_used);
+
+    // Names who holds the arena on `dev_id`, from the figures arena_read_holders() read: one line at `level` with each
+    // zone's live bytes, the queued frees those zones still count, the device's releases waiting for a retry, the
+    // retired entries not yet finalized and the evictions in flight, which it also fills into `holders`; one WARN
+    // line with the chunk leases by site; then each zone with live bytes lists its live allocations under `site`.
+    // `level` is ERROR where a holder refuses what the caller needs (a rebuild, a model's release) and WARN at a
+    // load's start, where the holder may still be the failed model's buffers. It only reads: it drains, frees,
+    // evicts, resets and allocates nothing.
+    void arena_report_holders(int                  dev_id,
+                              const size_t *       live_zone_used,
+                              zone_arena_holders & holders,
+                              const char *         site,
+                              ggml_log_level       level);
+
+    // The oneDNN scratchpad pair's release for the last model. False, with nothing released, while a reservation holds
+    // the pair. The fields are emptied under onednn_scratch_mutex_ and the blocks freed after it is released, so no
+    // other lock is taken under it. A caller first waits for the device work that read the pair.
+    bool              release_onednn_scratch_pair();
+    // The MoE reorder temp buffer's release for the last model; the next model's MoE init reserves it again.
+    void              release_reorder_temp();
+    // Binds the compute arena to the SCRATCH zone, or unbinds it before the zones go.
+    void              compute_arena_bind();
+    void              compute_arena_unbind();
+    // The last release tore this cache's arena down, and no load's start has reserved it since.
+    std::atomic<bool> arena_released_{ false };
+    // Set where a failed load's buffers hold the arena at its abort's release, cleared where a release empties the
+    // cache (last_release_deferred).
+    std::atomic<bool> last_release_deferred_{ false };
+
     // The load transaction whose keep of a short ONEDNN zone last warned on this device (zone_kept_onednn_warn_due). An
     // exchange, so two ensures of one load racing on the device warn once between them.
     std::atomic<uint64_t> onednn_zone_kept_warn_txn_{ 0 };
@@ -6464,14 +6550,12 @@ class unified_cache {
     // no floor for the bound to keep free, and a Graph scratch the pair leaves no room for takes the DIRECT path under
     // its cap, as one that misses any full ONEDNN zone does.
     //
-    // onednn_zone_plan_mutex_ guards the plan alone. Each of the five accessors (the load and the put-back declared
-    // above, the three below) takes it alone and calls only the pure rules of zone-sizing.hpp while it holds it, so it
-    // is a leaf: nothing is taken under it, and it may be taken under any lock.
+    // onednn_zone_plan_mutex_ guards the plan alone. Each of the five accessors (the load, the put-back and the store
+    // declared above, the two below) takes it alone and calls only the pure rules of zone-sizing.hpp while it holds it,
+    // so it is a leaf: nothing is taken under it, and it may be taken under any lock.
     mutable std::mutex onednn_zone_plan_mutex_;
     zone_onednn_plan   onednn_zone_plan_{};
 
-    // Stores `plan` as the zone plan: the zone was rebuilt for it. Takes onednn_zone_plan_mutex_ alone.
-    void onednn_zone_plan_store(const zone_onednn_plan & plan);
     // Keeps the larger plan (zone_onednn_plan_keep) as the zone plan, in ONE critical section: the zone was found
     // sufficient for `plan` and kept as built. Takes onednn_zone_plan_mutex_ alone.
     void onednn_zone_plan_keep_and_store(const zone_onednn_plan & plan);

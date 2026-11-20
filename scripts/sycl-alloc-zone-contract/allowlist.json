@@ -303,6 +303,22 @@
       "reason": "unified_cache_role_bytes_for_testing is the noexcept read-only query behind ggml_backend_sycl_role_bytes_for_testing: its try body takes the cache map's shared lock to see whether the device has a cache (it never creates one) and sums one role's live registry records under the registry mutex, with no allocation of backend memory and no planned-refusal path. The catch-all turns a lock failure into false with the figure zeroed, the answer the caller already reads as no figure; a rethrow out of a noexcept function would std::terminate a test process. Permanent; test-only."
     },
     {
+      "id": "E-LAST-RELEASE-STEP-CATCH",
+      "code": "G-CATCH",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache::release_for_no_live_model",
+      "count": 2,
+      "reason": "unified_cache::release_for_no_live_model is noexcept and runs from the model release hook, from a failed load's abort and, for a cache whose release a failed load deferred, from the next load's start before its reserve, all outside graph compute: the release of the last model must not throw out of a teardown or a load's start. Its inner catch-all turns a failed wait on the barrier before the releases into BARRIER_FAILED with nothing released; its outer catch-all logs one ERROR naming the site and returns FAILED, releasing nothing further. The try body waits on the device, releases the PP MoE ring, the oneDNN scratchpad pair, the reorder temp and the Graph scratch pool, runs the existing deferred-free drain and tears the arena down. ggml_sycl_fallback_error is thrown only in graph compute's record and replay paths and its ops, which this body never reaches, so a rethrow-first clause would guard nothing, and a rethrow would std::terminate through the noexcept boundary. Permanent; docs/backend/sycl-memory-design.md, The release of the last model."
+    },
+    {
+      "id": "E-LAST-RELEASE-EFFECTS-CATCH",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_release_last_model_effects",
+      "count": 1,
+      "reason": "ggml_sycl_release_last_model_effects is noexcept and is the last step of the model release hook and of a failed load's abort, and a load's start runs it before its reserve for the caches whose release a failed load deferred: its try body walks the existing caches, each lookup under the cache map's shared lock (g_cache_rw_mutex), asks each to release what it sized for a model (unified_cache::release_for_no_live_model, itself noexcept) and puts the published terms back under g_tensor_inventory_mutex, where the ZONE_PLAN arm of the restore takes the cache map's shared lock again for its lookup. What it can throw is either lock's std::system_error; the catch-all logs one ERROR naming the site and leaves what it had not released. Nothing in it reaches graph compute, where ggml_sycl_fallback_error is thrown, so a rethrow-first clause would guard nothing, and a rethrow would std::terminate a teardown or a load's start through the noexcept boundary. Permanent; docs/backend/sycl-memory-design.md, The release of the last model."
+    },
+    {
       "id": "E-L4-CABI-SET-RUNTIME-CONTEXT",
       "code": "G-CATCH",
       "file": "ggml-sycl.cpp",

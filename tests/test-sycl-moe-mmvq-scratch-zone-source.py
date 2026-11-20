@@ -575,7 +575,7 @@ def test_witness_scratch_tail_sums_inline():
 
 # ---- a blocked rebuild keeps the zone and says so ----
 
-KEEP_BINDS = "{ bind_compute_arena(); } #if GGML_SYCL_DNNL onednn_graph_direct_cap_snapshot_keep(); #endif };"
+KEEP_BINDS = "{ compute_arena_bind(); } #if GGML_SYCL_DNNL onednn_graph_direct_cap_snapshot_keep(); #endif };"
 KEEP_DEF = ("const auto keep_arena_as_built = [&]() { if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) "
             + KEEP_BINDS)
 KEPT = "const size_t scratch_kept = zone_scratch_kept_bytes(scratch_plan, arena_zones.scratch);"
@@ -644,7 +644,7 @@ def test_witness_scratch_keep_leaves_the_compute_arena_unbound():
 
 
 def test_witness_kept_arena_never_binds():
-    m = mutate_in(UC, ENSURE_SIG, KEEP_BINDS, KEEP_BINDS.replace("bind_compute_arena(); ", "", 1))
+    m = mutate_in(UC, ENSURE_SIG, KEEP_BINDS, KEEP_BINDS.replace("compute_arena_bind(); ", "", 1))
     assert not claim_blocked_rebuild_keeps_the_zone(m)
 
 
