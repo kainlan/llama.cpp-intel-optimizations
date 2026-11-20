@@ -3770,6 +3770,29 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         SKIP_RETURN_CODE 77
         TIMEOUT 300
     )
+
+    # Column-split form of the Q8_0 matvec against its row form and a CPU reference, SOA and coalesced, on the
+    # 4 x 10240 and 48 x 2560 shapes, with and without a fused addend, plus a SOA row slice. It runs the production
+    # launchers through the GGML_SYCL_PRIVATE_TESTING entry mmvq_test_q8_0_launch, so it links the private backend
+    # objects. It loads no model and allocates under 2 MB of device memory. Pinned to the B70, the card whose decode
+    # profile found the shapes; it exits 77 when no GPU is usable.
+    add_executable(test-sycl-mmvq-q8-0-column-split test-sycl-mmvq-q8-0-column-split.cpp)
+    target_link_libraries(test-sycl-mmvq-q8-0-column-split PRIVATE ggml-sycl-private-fixtures)
+    target_include_directories(test-sycl-mmvq-q8-0-column-split PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-sycl-mmvq-q8-0-column-split PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_PRIVATE_TESTING=1)
+    target_compile_options(test-sycl-mmvq-q8-0-column-split PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-mmvq-q8-0-column-split PRIVATE "-fsycl")
+    add_test(NAME test-sycl-mmvq-q8-0-column-split COMMAND $<TARGET_FILE:test-sycl-mmvq-q8-0-column-split>)
+    set_tests_properties(test-sycl-mmvq-q8-0-column-split PROPERTIES
+        LABELS "sycl;mmvq;quant;device;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
 endif()
 
 # test-sycl-fattn-onednn-gates: oneDNN SDPA must reject unsafe FA layouts.
