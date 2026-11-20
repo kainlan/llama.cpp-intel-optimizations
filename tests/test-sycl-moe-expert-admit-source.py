@@ -107,7 +107,8 @@ def body_span(text: str, signature: str) -> tuple[int, int]:
 
 
 def block_span(text: str, open_at: int) -> tuple[int, int]:
-    """The [start, end) span of the brace-balanced block opening at `open_at`; (-1, -1) when there is none."""
+    """The [start, end) span of the brace-balanced block opening at `open_at`; (-1, -1) when there is none. Comments
+    are skipped as well as literals: the mutants edit raw text, whose comments hold apostrophes ("a loan's")."""
     if open_at < 0:
         return -1, -1
     depth = 0
@@ -115,6 +116,14 @@ def block_span(text: str, open_at: int) -> tuple[int, int]:
     n = len(text)
     while i < n:
         ch = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
         if ch in "\"'":
             j = i + 1
             while j < n and text[j] != ch:
@@ -413,8 +422,8 @@ def self_test(raw: dict[str, str]) -> int:
         failures.append(name)
         print(f"  self-test: {name}: SURVIVED (pin {pin} did not catch it)")
 
-    expect_fail("entry-renamed", "A0", [("sycl", "", "ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int",
-                                         "ggml_sycl_txn_result ggml_sycl_expert_move_run(int")])
+    expect_fail("entry-renamed", "A0", [("sycl", "", "ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(\n",
+                                         "ggml_sycl_txn_result ggml_sycl_expert_move_run(\n")])
     expect_fail("fill-waited", "A1", [("cache", COPY_SIG, "bq,\n                                                    "
                                        "{ out.copy_events[i] });",
                                        "bq,\n                                                    "
@@ -465,11 +474,13 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("epoch-conditional", "A6", [("sycl", TXN_SIG, "        ggml_sycl_optional_layouts_retired();",
                                              "        if (!named) {\n            ggml_sycl_optional_layouts_retired();"
                                              "\n        }")])
-    expect_fail("publishes-twice", "A6", [("sycl", TXN_SIG, "    lock.unlock();\n    warn_dropped();\n    if (named) {",
+    expect_fail("publishes-twice", "A6", [("sycl", TXN_SIG, "    lock.unlock();\n    warn_dropped();\n    if (!swapped) {",
                                            "    ggml_sycl_publish_prepared_plan_locked(prepared_publication);\n"
-                                           "    lock.unlock();\n    warn_dropped();\n    if (named) {")])
+                                           "    lock.unlock();\n    warn_dropped();\n    if (!swapped) {")])
     expect_fail("named-reserves-ledger", "A7", [("sycl", TXN_SIG, "if (!refill && !named) {", "if (!refill) {")])
-    expect_fail("named-appends-to-ledger", "A7", [("sycl", TXN_SIG, "} else if (named) {\n", "} else if (false) {\n")])
+    expect_fail("named-appends-to-ledger", "A7", [("sycl", TXN_SIG,
+                                                   "} else if (named) {\n                (*named_moves)[",
+                                                   "} else if (false) {\n                (*named_moves)[")])
     expect_fail("tail-unguarded", "A7", [("sycl", TXN_SIG, "    if (!named) {\n        // An accepted loan",
                                           "    if (true) {\n        // An accepted loan")])
     expect_fail("refill-as-lax-as-admit", "A8", [("cache", REFILL_SIG, "(members, /*admit=*/false, out)",

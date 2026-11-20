@@ -11714,13 +11714,25 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
     return true;
 }
 
-// llama.cpp-sif1: re-admit one lent triplet to the device after a prompt phase, loan_expert_triplet() inverted. The
-// copies go first, from each host copy's typed pinned owner into the caller's device owner, so the copy path takes the
-// direct DMA and both owners stay retained until it completes. Each device entry is then published behind its copy and
-// takes over the direct mirror and the id mapping from the host copy, which is withdrawn exactly; a host copy still
-// leased (an extra's record, a ring copy reading it) stays retired until its last lease goes, and its pinned storage
-// until the copies reading it complete. Nothing here waits or asks an event's status.
 bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], expert_refill_record & out) {
+    return copy_host_triplet_to_device(members, /*admit=*/false, out);
+}
+
+bool unified_cache::admit_host_triplet(const expert_refill_member members[3], expert_refill_record & out) {
+    return copy_host_triplet_to_device(members, /*admit=*/true, out);
+}
+
+// llama.cpp-sif1: move one triplet from its host copies to the device, loan_expert_triplet() inverted; a refill takes
+// back a loan's host copy, an admit any pinned host copy in a host zone. The copies go first, from each host copy's
+// typed pinned owner into the caller's device owner, so the copy path takes the direct DMA and both owners stay
+// retained until it completes; an admit's storage is longer by the padded tail, which is zero-filled behind the copy.
+// Each device entry is then published behind its last write and takes over the direct mirror and the id mapping from
+// the host copy, which is withdrawn exactly; a host copy still leased (an extra's record, a ring copy reading it) stays
+// retired until its last lease goes, and its pinned storage until the copies reading it complete. Nothing here waits
+// or asks an event's status.
+bool unified_cache::copy_host_triplet_to_device(const expert_refill_member members[3],
+                                                bool                       admit,
+                                                expert_refill_record &     out) {
     out = expert_refill_record{};
     if (!members) {
         out.reason = "invalid arguments";
@@ -11763,7 +11775,8 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
         deps[i].reserve(2);
     }
 
-    // 1. Each member's host copy is the one a loan published, all three members before anything changes.
+    // 1. Each member's host copy is one the direction copies from, a loan's for a refill and any whole pinned
+    // host-zone copy for an admit, all three members before anything changes.
     if (!refusal) {
         std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
@@ -11774,22 +11787,27 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
             const auto                 it = entries_.find(host_key);
             if (it == entries_.end() || it->second.retired || !it->second.device_ptr ||
                 it->second.state == cache_entry_state::EVICTING || it->second.state == cache_entry_state::FAILED) {
-                refusal = "not lent";
+                refusal = admit ? "not on host" : "not lent";
                 break;
             }
             const unified_cache_entry & e = it->second;
-            // c-n4gw: a loan copies AOS bytes only, so a lent copy is AOS.
+            // c-n4gw: a loan copies AOS bytes only, so a lent copy is AOS; an admit stages AOS only.
             if (e.layout != GGML_LAYOUT_AOS) {
                 refusal = "layout";
                 break;
             }
             // A loan's host copy owns its whole pinned storage (register_host_expert_owned's typed owner). A host
             // copy S1-PRELOAD registered over planner-placed storage is not lent and stays where the planner put it.
+            // An admit takes any host copy that owns its whole pinned storage, a loan's or one S1-PRELOAD copied to
+            // the pinned pool, read from offset 0 of its owner. It must also be a host-zone slice: the copy path
+            // proves a pinned endpoint host USM only from such an owner, and any other copy takes the synchronous
+            // staged branch, a wait. A copy served in place from a file mapping owns the mapping, not its storage.
             alloc_metadata md{};
             if (e.location != cache_location::HOST_PINNED || !e.host_resident ||
                 !e.direct_alloc_owner.owner_metadata(&md) || md.ptr != e.device_ptr ||
-                md.tier != alloc_tier::HOST_PINNED || md.size < e.size) {
-                refusal = "not a lent copy";
+                md.tier != alloc_tier::HOST_PINNED || md.size < e.size ||
+                (admit && md.host_zone == host_zone_id::COUNT)) {
+                refusal = admit ? "host copy not pinned" : "not a lent copy";
                 break;
             }
             // What resolves the id today: the mirror and the id mapping both name this host copy.
@@ -11806,8 +11824,12 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
                 refusal = "device entry exists";
                 break;
             }
-            // Exact: a loan that later lends this entry again requires its owner to be its whole allocation.
-            if (device_size[i] != e.size) {
+            // A refill's storage is exactly the lent copy's size: a loan that later lends this entry again requires
+            // its owner to be its whole allocation. An admit's is the size direct staging gives the expert, the host
+            // bytes and the padded tail the copy below zero-fills, asked of the layout; never less than the host bytes.
+            const size_t staged =
+                admit ? staged_expert_bytes(e.layout, members[i].type, members[i].ncols, e.size) : e.size;
+            if (device_size[i] != staged || staged < e.size) {
                 refusal = "device storage size";
                 break;
             }
@@ -11828,12 +11850,18 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
     }
 
     // 2. The copies, on the BCS queue (the copy engine, off the compute engine the decode graph runs on) behind what
-    // wrote each host copy: the loan's D2H copy. Both endpoints are typed owners, so the copy is a direct DMA, and
-    // mem_copy_async retains both until it completes.
+    // wrote each host copy: a loan's D2H copy, or the load's. Both endpoints are typed owners, so the copy is a direct
+    // DMA, and mem_copy_async retains both until it completes.
     try {
         sycl::queue & bq = get_bcs_queue();
         for (int i = 0; i < 3; ++i) {
             out.copy_events[i] = mem_copy_async(members[i].device_owner, src_owner[i], bytes[i], bq, deps[i]);
+            // An admit's tail past the host bytes reads as zero, as direct staging leaves it. The fill runs behind the
+            // copy on the same queue, and its event becomes the entry's ready event and last write.
+            if (device_size[i] > bytes[i]) {
+                out.copy_events[i] = mem_fill_async(members[i].device_owner, bytes[i], 0, device_size[i] - bytes[i], bq,
+                                                    { out.copy_events[i] });
+            }
         }
     } catch (const ggml_sycl_fallback_error &) {
         // G-CATCH requires this clause before catch (...). A copy submission never throws the op fallback (dispatch
@@ -11855,7 +11883,7 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
         entry.device_ptr            = device_ptr[i];
         entry.src_ptr               = nullptr;
         entry.content_hash          = 0;
-        entry.size                  = bytes[i];
+        entry.size                  = device_size[i];
         entry.type                  = cache_entry_type::MOE_EXPERT;
         entry.layer_id              = -1;
         entry.expert_id             = -1;
@@ -11877,7 +11905,7 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
 
         weight_entry & mirror      = device_mirror[i];
         mirror.ptr                 = device_ptr[i];
-        mirror.size                = bytes[i];
+        mirror.size                = device_size[i];
         mirror.layout              = GGML_LAYOUT_AOS;
         mirror.location            = cache_location::DEVICE;
         mirror.has_ready_event     = true;
@@ -11886,7 +11914,7 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
     }
     // The publication runs inside a planned materialization session, as the loan's host registration does: the plan,
     // not a runtime miss, asked for these device copies (llama.cpp-sif1).
-    scoped_planned_materialization   materialization(this, "expert refill");
+    scoped_planned_materialization   materialization(this, admit ? "expert admit" : "expert refill");
     std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
                                                 members[2].host_keys.size());
     int                              inserted = 0;
@@ -11995,7 +12023,7 @@ bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], e
     out.accepted = true;
     out.reason   = "OK";
     for (int i = 0; i < 3; ++i) {
-        out.bytes_readmitted += bytes[i];
+        out.bytes_readmitted += device_size[i];
     }
     return true;
 }

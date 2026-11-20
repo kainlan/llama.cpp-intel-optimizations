@@ -23,4 +23,17 @@ inline size_t aos_staged_weight_bytes(ggml_type type, int64_t ncols, size_t base
     return base_size + ggml_row_size(type, MATRIX_ROW_PADDING - rem);
 }
 
+// The bytes a device copy of one expert in `layout` takes when it is staged from a host copy of `host_bytes`: what
+// direct staging allocates for it. For AOS that is the host bytes and the tail aos_staged_weight_bytes() adds, which
+// the quantized kernels may read and which reads as zero. 0 for a layout this does not stage and for a type or width
+// that names no weight, so a caller refuses rather than mints. The plan transaction mints an admitted expert's device
+// storage at this size and the cache checks the storage against it, so the two cannot disagree; a layout that stages
+// another way (SOA's reorder) adds its own case here rather than at either caller.
+inline size_t staged_expert_bytes(ggml_layout_mode layout, ggml_type type, int64_t ncols, size_t host_bytes) {
+    if (layout != GGML_LAYOUT_AOS || type >= GGML_TYPE_COUNT || ncols <= 0 || host_bytes == 0) {
+        return 0;
+    }
+    return aos_staged_weight_bytes(type, ncols, host_bytes);
+}
+
 }  // namespace ggml_sycl
