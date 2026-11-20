@@ -15240,8 +15240,8 @@ float unified_cache::compute_score(const unified_cache_entry & entry) const {
         constexpr float k_hot_boost = 1.5f;
         return base_score * k_hot_boost;
     }
-    // Boost MoE experts with high popularity (low rank = more popular), so
-    // popular experts resist VRAM eviction.
+    // Boost MoE experts with high popularity (low rank = more popular). No
+    // caller reads this score: evict_one orders by tier, then by last access.
     if (entry.type == cache_entry_type::MOE_EXPERT && entry.layer_id >= 0 && entry.expert_id >= 0) {
         if (is_expert_popularity_initialized()) {
             int pop_rank = get_expert_popularity_rank(entry.layer_id, entry.expert_id);

@@ -18,7 +18,10 @@ This gate holds the removal and what must survive it:
       which is defined once and called once, and keyed by its layer_id parameter;
   L4  no rank is looked up under the hash layer id: the backend's get_expert_popularity_rank calls never take a
       moe_cache_layer_id() value;
-  L5  eviction carries no frequency term: unified_cache::evict_one reads no per-expert frequency.
+  L5  eviction carries no frequency term: unified_cache::evict_one reads no per-expert frequency;
+  L6  the down-I8 hot set ranks only by usage score and the block-keyed rank: an expert is pushed only when the tensor
+      has scores or the expert has a block-keyed rank, the rank comes from that lookup alone, and a tensor with
+      neither returns before any materialization (it keeps its loaded layout until scores exist).
 
 Checks run on comment-blanked text except L1, which reads the raw text so a comment cannot keep a removed name alive.
 NOT VACUOUS: --self-test runs the gate on in-memory mutants of the real sources. Each mutant names the pin that must
@@ -74,6 +77,13 @@ HOTSET_CALL = "ggml_sycl_update_moe_hotset(cache, src0, extra, ids_host,"
 HOTSET_WRITE = "ggml_sycl::set_expert_popularity_rank(layer_id, indices[i], static_cast<int>(i));"
 TRIPLET_DEF = "static std::vector<moe_triplet_group> build_moe_triplet_groups("
 EVICT_ONE_DEF = "size_t unified_cache::evict_one(size_t"
+DOWN_I8_HOTSET_DEF = "static size_t ggml_sycl_materialize_moe_down_i8_hotset_for_tensor("
+DOWN_I8_RULE = (
+    "const int block_rank = block_layer >= 0 ? ggml_sycl::get_expert_popularity_rank(block_layer, item.expert_id) : -1;",
+    "if (block_rank >= 0) { item.rank = block_rank; }",
+    "if (have_scores || item.rank != INT_MAX) { ranked.push_back(item); }",
+    "if (ranked.empty()) { return 0; }",
+)
 
 
 class ContractError(AssertionError):
@@ -207,6 +217,17 @@ def check(raws: dict[str, str]) -> None:
     if re.search(r"\bfreq\b|frequency", evict):
         raise ContractError("FAIL [pin L5]: unified_cache::evict_one still reads a per-expert frequency")
 
+    # L6: the down-I8 hot set has no rank source but the block-keyed lookup, and no hot set without score or rank.
+    hot = body(code[BACKEND], DOWN_I8_HOTSET_DEF, "L6")
+    for needle in DOWN_I8_RULE:
+        if hot.count(needle) != 1:
+            raise ContractError(f"FAIL [pin L6]: the down-I8 hot set no longer holds `{needle}` once")
+    for needle, n in (("ranked.push_back(", 1), ("item.rank =", 1), ("get_expert_popularity_rank(", 1)):
+        if hot.count(needle) != n:
+            raise ContractError(f"FAIL [pin L6]: the down-I8 hot set has {hot.count(needle)} `{needle}`, not {n}")
+    if hot.find(DOWN_I8_RULE[3]) > hot.find("std::sort(ranked.begin()"):
+        raise ContractError("FAIL [pin L6]: the down-I8 hot set sorts before returning on an empty ranking")
+
 
 def self_test(raws: dict[str, str]) -> int:
     failures: list[str] = []
@@ -272,6 +293,13 @@ def self_test(raws: dict[str, str]) -> int:
                 "    return ggml_sycl::get_expert_popularity_rank(hash_layer, 0);\n}\n" + hotset_anchor)
     expect_fail("eviction-frequency-back", "L5", CACHE_CPP, evict_anchor,
                 evict_anchor + "        uint32_t freq = 0;\n")
+    push_rule = "        if (have_scores || item.rank != INT_MAX) {\n            ranked.push_back(item);\n        }\n"
+    expect_fail("down-i8-hotset-pushes-unranked", "L6", BACKEND, push_rule, "        ranked.push_back(item);\n")
+    expect_fail("down-i8-hotset-no-empty-return", "L6", BACKEND,
+                "    if (ranked.empty()) {\n        return 0;\n    }\n    std::sort(ranked.begin()",
+                "    std::sort(ranked.begin()")
+    expect_fail("down-i8-hotset-second-rank-source", "L6", BACKEND, push_rule,
+                "        if (item.rank == INT_MAX) {\n            item.rank = static_cast<int>(e);\n        }\n" + push_rule)
 
     try:
         mutate(BACKEND, "this anchor is in no source", "x")

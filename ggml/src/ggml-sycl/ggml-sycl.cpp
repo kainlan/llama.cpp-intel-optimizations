@@ -4005,8 +4005,8 @@ bool is_expert_popularity_initialized() {
 
 }  // namespace ggml_sycl
 
-// Upfront VRAM budget reserved for MoE experts at inventory time (Phase 1).
-// Released after prestage completes and actual usage is tracked in cache (Phase 2).
+// Upfront VRAM budget reserved for MoE experts at inventory time. Cleared at
+// each model-load boundary and at module reset.
 static std::array<size_t, GGML_SYCL_MAX_DEVICES> g_moe_expert_vram_reserve = {};
 
 // ---------------------------------------------------------------------------
@@ -4675,8 +4675,9 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
     }
 
     // P4: Check placement plan — skip device staging for experts planned for host.
-    // Without this, adaptive prestage and ExpertPrefetcher::hint() bypass the plan
-    // and exhaust the WEIGHT zone on MoE models that exceed VRAM.
+    // Without this, a caller that stages an expert by its coordinates
+    // (ExpertPrefetcher::preload_experts) bypasses the plan and exhausts the
+    // WEIGHT zone on MoE models that exceed VRAM.
     if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !meta.tensor_name.empty()) {
         if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(meta.tensor_name, expert_idx, device_id)) {
             return nullptr;  // Expert planned for host — caller handles host fallback
@@ -68663,8 +68664,9 @@ static void ggml_sycl_update_moe_hotset(ggml_sycl::unified_cache *   cache,
         cache->set_hot(layout_key, ggml_sycl::cache_entry_type::MOE_EXPERT, layer_id, expert_id, layout, true);
     }
 
-    // Feedback popularity data so N-device dispatch and eviction scoring
-    // can use it for placement decisions.
+    // Publish the order as block-keyed popularity ranks: the placement planner
+    // orders expert triplets by them, and the down-I8 hot set breaks score ties
+    // with them.
     for (size_t i = 0; i < static_cast<size_t>(n_experts) && i < indices.size(); ++i) {
         ggml_sycl::set_expert_popularity_rank(layer_id, indices[i], static_cast<int>(i));
     }
@@ -68983,6 +68985,8 @@ static size_t ggml_sycl_materialize_moe_down_i8_hotset_for_tensor(ggml_backend_s
             have_scores = have_scores || score > 0.0f;
         }
     }
+    // Experts are ordered by usage score, ties by the block-keyed popularity rank. A tensor with neither a positive
+    // score nor a block-keyed rank gets no hot set and keeps its loaded layout until scores exist.
     const int block_layer = ggml_sycl_tp_extract_layer_number(src0->name);
     for (int64_t e = 0; e < n_experts; ++e) {
         ranked_expert item{};
@@ -126805,8 +126809,8 @@ static void ggml_sycl_reset_moe_module_state() {
     // drift out of step with it. What remains below is exactly what
     // install_fresh() deliberately does not own: the device-resident
     // predictors, the inventory-time VRAM reserve, and the routing flags. The
-    // bias and fused-activation registries are no longer on that list --
-    // install_fresh() owns them as of llama.cpp-nlww, so repeating their clear
+    // bias and fused-activation registries are not on that list: they are
+    // per-owner state that install_fresh() clears, so repeating their clear
     // here would be the second copy this comment warns about.
     g_moe_live_discovery.install_fresh();
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {

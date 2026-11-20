@@ -1007,8 +1007,8 @@ if (Python3_Interpreter_FOUND)
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # The legacy expert ranking is gone: no warmup profile, gate-norm placement, periodic rerank, runtime or adaptive
     # prestage, hash-keyed rank or eviction frequency term is left in the backend, while the planner's block-keyed rank
-    # API and its one writer stay. Run WITH --self-test so each mutant is caught by the pin it names. Text only: no
-    # device, no model.
+    # API and its one writer stay, and the down-I8 hot set ranks by usage score and that rank alone. Run WITH
+    # --self-test so each mutant is caught by the pin it names. Text only: no device, no model.
     add_test(NAME test-sycl-moe-legacy-ranking-removed-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-legacy-ranking-removed-source.py
             --self-test)

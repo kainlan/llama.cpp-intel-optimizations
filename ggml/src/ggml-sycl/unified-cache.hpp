@@ -10284,7 +10284,7 @@ size_t ggml_sycl_compute_arena_bytes(int device);
 
 // (ExpertPlacementTable removed — the cache IS the placement.
 //  Use is_expert_resident() / get_expert_device_ptr() for residency,
-//  get_expert_popularity_rank() for eviction scoring.)
+//  get_expert_popularity_rank() for the planner's expert order.)
 
 }  // namespace ggml_sycl
 
