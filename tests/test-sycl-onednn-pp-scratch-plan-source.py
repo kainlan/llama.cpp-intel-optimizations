@@ -586,6 +586,47 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     # ---- the 8-argument reserve-target overload was a test-only shim; one definition remains ----
     results["one definition of the reserve target"] = zone_sizing.count("void zone_onednn_scratch_reserve_target(") == 1
 
+    # ---- the admission requires the per-half merge with the planned pair ----
+    # An op whose own pair fits the bound but whose per-half maximum with the planned pair does not was admitted, and
+    # the reserve then replaced the held pair with it as asked; the superseded block stayed in the zone until its
+    # deferred release, so a graph of such ops filled the zone. The pure arithmetic is test-zone-sizing Case 14n.
+    admit = function_body(zone_sizing, r"bool zone_onednn_pp_scratch_planned\([^)]*\)\s*\{")
+    pure_supplies = function_body(zone_sizing, r"bool zone_onednn_pp_scratch_supplies\([^)]*\)\s*\{")
+    target_fn = function_body(zone_sizing, r"void zone_onednn_scratch_reserve_target\([^)]*\)\s*\{")
+    results["anchor: the pure admission exists"] = admit is not None
+    results["anchor: the pure supplies verdict exists"] = pure_supplies is not None
+    results["anchor: the pure reserve target exists"] = target_fn is not None
+    if admit is not None:
+        admit_norm = " ".join(admit.split())
+        clamp = "if (!zone_onednn_pair_fits(pair_bound_bytes, planned_weights_bytes, planned_activations_bytes)) " \
+                "{ return true; }"
+        merge = "return zone_onednn_pair_fits(pair_bound_bytes, std::max(planned_weights_bytes, weights_bytes), " \
+                "std::max(planned_activations_bytes, activations_bytes));"
+        alone = "if (!zone_onednn_pair_fits(pair_bound_bytes, weights_bytes, activations_bytes)) { return false; }"
+        results["the admission requires the request alone to fit the bound"] = alone in admit_norm
+        results["the admission requires the per-half merge with the planned pair to fit the bound"] = \
+            merge in admit_norm
+        results["a zone clamped below its plan keeps the request-only rule, before the merge is asked"] = \
+            0 <= admit_norm.find(alone) < admit_norm.find(clamp) < admit_norm.find(merge)
+    if pure_supplies is not None:
+        results["the pure supplies verdict passes the planned halves to the admission"] = \
+            "zone_onednn_pp_scratch_planned(arena_active, pair_bound_bytes, planned_weights_bytes, " \
+            "planned_activations_bytes, weights_bytes, activations_bytes)" in " ".join(pure_supplies.split())
+    if target_fn is not None:
+        results["the reserve target and the admission share one fit test"] = "zone_onednn_pair_fits(" in target_fn
+    ACCESSOR_CALL = "unified_cache_get_onednn_pp_pair_bound(device, &pair_bound, &planned_weights, &planned_activations)"
+    bytes_norm = " ".join(bytes_helper.split())
+    results["the by-bytes core reads the planned halves with the bound and passes them on"] = \
+        ACCESSOR_CALL in bytes_norm and \
+        "zone_onednn_pp_scratch_planned(arena_active, pair_bound, planned_weights, planned_activations, " \
+        "weights_bytes, activations_bytes)" in bytes_norm
+    if supplies_helper is not None:
+        sup_norm = " ".join(supplies_helper.split())
+        results["the supplies helper reads the planned halves with the bound and passes them on"] = \
+            ACCESSOR_CALL in sup_norm and \
+            "arena_active, pair_bound, planned_weights, planned_activations, w_elems * elem_bytes, " \
+            "a_elems * elem_bytes)" in sup_norm
+
     # ---- the conditional plan follows the same PP admission gates the op takes (llama.cpp-8ony) ----
     admitted = function_body(backend, r"bool ggml_sycl_onednn_pp_type_admitted\(ggml_type type\)\s*\{")
     results["anchor: the shared PP type admission exists"] = admitted is not None
@@ -695,6 +736,7 @@ if args.self_test and not failed:
     pair_def_sig = r"zone_onednn_pp_pair unified_cache_plan_onednn_pp_pair\([^)]*\)\s*\{"
     pure_pair_sig = r"zone_onednn_pp_pair zone_onednn_pp_pair_plan\([^)]*\)\s*\{"
     maxima_sig = r"path_scoped_maxima zone_scoped_maxima\("
+    admit_sig = r"bool zone_onednn_pp_scratch_planned\("
     SUPPLIES_NAME = "ggml_sycl_onednn_pp_scratch_supplies("
     mutants = [
         ("op arm ignores the shared question", "the op arm's candidate asks the shared supplies helper with its column tile",
@@ -1008,6 +1050,60 @@ if args.self_test and not failed:
          (backend, mutate_in_func(cache, r"void unified_cache::onednn_zone_plan_keep_and_store\(",
                                   "zone_onednn_plan_keep(", "zone_onednn_plan_keep(onednn_zone_plan_load(), "),
           cache_hpp)),
+        # ---- the admission's per-half merge with the planned pair ----
+        ("admission drops the merge requirement",
+         "the admission requires the per-half merge with the planned pair to fit the bound",
+         (backend, cache, cache_hpp,
+          mutate_in_func(mutate_in_func(zone_sizing, admit_sig, "std::max(planned_weights_bytes, weights_bytes)",
+                                        "weights_bytes"),
+                         admit_sig, "std::max(planned_activations_bytes, activations_bytes)", "activations_bytes"))),
+        ("admission merges the weights half only",
+         "the admission requires the per-half merge with the planned pair to fit the bound",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, admit_sig, "std::max(planned_activations_bytes, activations_bytes)",
+                         "activations_bytes"))),
+        ("admission merges with the request in place of the plan",
+         "the admission requires the per-half merge with the planned pair to fit the bound",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, admit_sig, "std::max(planned_weights_bytes, weights_bytes)",
+                         "std::max(weights_bytes, weights_bytes)"))),
+        ("admission drops the clamped-zone rule",
+         "a zone clamped below its plan keeps the request-only rule, before the merge is asked",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, admit_sig,
+                         "if (!zone_onednn_pair_fits(pair_bound_bytes, planned_weights_bytes, planned_activations_bytes)) {",
+                         "if (false) {"))),
+        ("admission drops the request-alone test",
+         "the admission requires the request alone to fit the bound",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, admit_sig,
+                         "if (!zone_onednn_pair_fits(pair_bound_bytes, weights_bytes, activations_bytes)) {",
+                         "if (false) {"))),
+        ("supplies verdict drops the planned halves",
+         "the pure supplies verdict passes the planned halves to the admission",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, r"bool zone_onednn_pp_scratch_supplies\(", "pair_bound_bytes, planned_weights_bytes,",
+                         "pair_bound_bytes, 0,"))),
+        ("reserve target keeps its own fit test", "the reserve target and the admission share one fit test",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, r"void zone_onednn_scratch_reserve_target\(", "zone_onednn_pair_fits(",
+                         "zone_XXXX("))),
+        ("by-bytes core passes no planned pair",
+         "the by-bytes core reads the planned halves with the bound and passes them on",
+         (mutate_in_func(backend, helper_sig, "pair_bound, planned_weights, planned_activations,", "pair_bound, 0, 0,"),
+          cache, cache_hpp)),
+        ("by-bytes core asks for the bound alone",
+         "the by-bytes core reads the planned halves with the bound and passes them on",
+         (mutate_in_func(backend, helper_sig, "&planned_weights, &planned_activations", "nullptr, nullptr"),
+          cache, cache_hpp)),
+        ("supplies helper passes no planned pair",
+         "the supplies helper reads the planned halves with the bound and passes them on",
+         (mutate_in_func(backend, supplies_sig, "planned_weights, planned_activations, w_elems", "0, 0, w_elems"),
+          cache, cache_hpp)),
+        ("supplies helper asks for the bound alone",
+         "the supplies helper reads the planned halves with the bound and passes them on",
+         (mutate_in_func(backend, supplies_sig, "&planned_weights, &planned_activations", "nullptr, nullptr"),
+          cache, cache_hpp)),
         ("accessor undeclared", "the pair-bound accessor is declared",
          (backend, cache, mutate(cache_hpp, "unified_cache_get_onednn_pp_pair_bound(", "unified_cache_get_XXXX("))),
         # ---- the planned pair's activations half ----

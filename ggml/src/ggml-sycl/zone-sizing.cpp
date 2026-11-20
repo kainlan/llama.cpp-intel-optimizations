@@ -527,21 +527,32 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
     return true;
 }
 
+// Whether a (weights, activations) pair fits `pair_bound_bytes`; a sum that is not representable does not fit.
+static bool zone_onednn_pair_fits(size_t pair_bound_bytes, size_t weights_bytes, size_t activations_bytes) {
+    return weights_bytes <= SIZE_MAX - activations_bytes && weights_bytes + activations_bytes <= pair_bound_bytes;
+}
+
 bool zone_onednn_pp_scratch_planned(bool   arena_active,
                                     size_t pair_bound_bytes,
                                     size_t planned_weights_bytes,
                                     size_t planned_activations_bytes,
                                     size_t weights_bytes,
                                     size_t activations_bytes) {
-    (void) planned_weights_bytes;
-    (void) planned_activations_bytes;
     if (!arena_active) {
         return true;
     }
-    if (weights_bytes > SIZE_MAX - activations_bytes) {
+    if (!zone_onednn_pair_fits(pair_bound_bytes, weights_bytes, activations_bytes)) {
         return false;
     }
-    return weights_bytes + activations_bytes <= pair_bound_bytes;
+    // A zone clamped below its plan cannot hold the planned pair, so no request can merge with it: the request alone
+    // is the rule there.
+    if (!zone_onednn_pair_fits(pair_bound_bytes, planned_weights_bytes, planned_activations_bytes)) {
+        return true;
+    }
+    // The reserve holds max(planned, held, request) per half. An op whose merge with the planned pair leaves the bound
+    // could only be reserved by replacing the held pair, so it is refused here, where the graph-entry walk asks too.
+    return zone_onednn_pair_fits(pair_bound_bytes, std::max(planned_weights_bytes, weights_bytes),
+                                 std::max(planned_activations_bytes, activations_bytes));
 }
 
 void zone_onednn_scratch_reserve_target(bool     arena_active,
@@ -556,7 +567,7 @@ void zone_onednn_scratch_reserve_target(bool     arena_active,
                                         size_t * activations_bytes) {
     // A pair that cannot exist inside the bound (or whose sum is unrepresentable) is not a target.
     const auto fits = [&](size_t w, size_t a) {
-        return !arena_active || (w <= SIZE_MAX - a && w + a <= pair_bound_bytes);
+        return !arena_active || zone_onednn_pair_fits(pair_bound_bytes, w, a);
     };
     const size_t merged_weights     = std::max(held_weights_bytes, requested_weights_bytes);
     const size_t merged_activations = std::max(held_activations_bytes, requested_activations_bytes);
