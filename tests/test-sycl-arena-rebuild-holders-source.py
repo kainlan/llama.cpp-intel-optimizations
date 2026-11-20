@@ -11,7 +11,8 @@ costs one relaxed atomic add on each side and takes no lock, and moves only when
 counts sum to the chunks' leases.
 
 The rebuild refusal prints those counts on a WARN line and lists the live allocations of every zone with live bytes,
-through the cache's own dump, which takes no lock above the refusal's.
+through the cache's own dump, which takes no lock above the refusal's. The counts come from the one census helper the
+arena teardown's lease line also calls, which counts every site and copy and writes each one that holds a lease.
 
 A cache scratch buffer blocks the rebuild only when the arena owns its pointer. The decision is the pure predicate
 zone_arena_rebuild_allowed (test-zone-sizing Case 36 checks it), fed by a count that asks vram_owns for every scratch
@@ -257,13 +258,16 @@ ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal
 REFUSAL_LINE = '"[VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: "'
 HOLDERS_LINE = '"[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "'
 SITE_LINE = '"[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\\n"'
+CENSUS_SIG = "uint32_t unified_cache::arena_chunk_lease_census(char * out, size_t size) const noexcept"
+CENSUS_CALL = "const uint32_t site_leases = arena_chunk_lease_census(leases_by_site, sizeof(leases_by_site));"
 SITE_LOOP = (
     "for (size_t s = 0; s < static_cast<size_t>(chunk_lease_site::COUNT); ++s) {",
     "for (int copy = 0; copy < 2; ++copy) {",
     "const chunk_lease_tag tag{ static_cast<chunk_lease_site>(s), copy != 0 };",
-    "const uint32_t held = arena_chunk_lease_count_at(tag);",
-    "site_leases += held;",
+    # The sum counts a site before the census decides whether there is room to write it.
+    "const uint32_t held = arena_chunk_lease_count_at(tag); sum += held;",
     'chunk_lease_site_name(tag.site), tag.copy ? "(copy)" : "", held);',
+    "return sum;",
 )
 SITE_WARN_ARGS = "site_leases, chunk_leases);"
 ZONE_DUMP = (
@@ -281,11 +285,13 @@ def refusal_segment(uc: str) -> str:
 
 
 def claim_refusal_prints_leases_by_site(uc: str) -> bool:
+    """After the holders line the refusal takes the census and prints it on a WARN line, its sum beside the per-chunk
+    total; the census counts every site and copy into the sum and writes each one that holds a lease."""
     seg = refusal_segment(uc)
-    w = seg.find("GGML_LOG_WARN(" + SITE_LINE)
+    census = fn_body(code(uc), CENSUS_SIG)
     return (
-        w != -1
-        and ordered(seg, HOLDERS_LINE, *SITE_LOOP, "GGML_LOG_WARN(" + SITE_LINE, SITE_WARN_ARGS)
+        ordered(seg, HOLDERS_LINE, CENSUS_CALL, "GGML_LOG_WARN(" + SITE_LINE, SITE_WARN_ARGS)
+        and ordered(census, *SITE_LOOP)
         and "GGML_LOG_INFO(" not in seg
     )
 
@@ -512,6 +518,24 @@ def test_witness_refusal_without_site_line():
 def test_witness_site_line_at_info():
     assert not claim_refusal_prints_leases_by_site(
         mutate_in(UC, ENSURE_SIG, "GGML_LOG_WARN(" + SITE_LINE, "GGML_LOG_INFO(" + SITE_LINE)
+    )
+
+
+def test_witness_refusal_without_census():
+    assert not claim_refusal_prints_leases_by_site(
+        mutate_in(UC, ENSURE_SIG, CENSUS_CALL, "const uint32_t site_leases = 0;")
+    )
+
+
+def test_witness_census_counts_no_copies():
+    assert not claim_refusal_prints_leases_by_site(mutate_in(UC, CENSUS_SIG, "copy < 2", "copy < 1"))
+
+
+def test_witness_census_sum_skips_an_unwritten_site():
+    # A site that holds leases but is not written, because the buffer is full, still counts in the sum.
+    assert not claim_refusal_prints_leases_by_site(
+        mutate_in(UC, CENSUS_SIG, "sum += held; if (held == 0 || used >= size) { continue; }",
+                  "if (held == 0 || used >= size) { continue; } sum += held;")
     )
 
 
