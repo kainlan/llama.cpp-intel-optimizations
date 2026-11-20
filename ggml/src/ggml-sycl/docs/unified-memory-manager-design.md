@@ -328,7 +328,7 @@ The `unified_cache` class (unified-cache.hpp/cpp, ~1400 lines header, ~9100 line
 - `entries_` hashmap: `unified_cache_key -> unified_cache_entry` mapping cache keys to device pointers
 - `id_to_key_` reverse map for fast lookup
 - Layout-aware: supports AOS, SOA, COALESCED, ONEDNN_PACKED layouts per entry
-- LRU+LFU hybrid eviction via `compute_score()` (access_count * exp(-decay * age))
+- Victim selection in `evict_one()`: the lowest `eviction_tier()` first, then the least recent access
 - Tier-based eviction ordering via `eviction_tier()` with priority boost from `alloc_category_priority()`
 
 **Sub-allocators owned by the cache**:
@@ -390,7 +390,7 @@ This pattern already exists and works correctly. It needs to be extended to non-
 | Capability | Status | Implementation |
 |-----------|--------|----------------|
 | Weight caching with layout support | COMPLETE | ensure_cached_layout, 4 layout modes |
-| LRU+LFU eviction with tier ordering | COMPLETE | evict_one, compute_score, eviction_tier |
+| LRU eviction with tier ordering | COMPLETE | evict_one, eviction_tier |
 | Host fallback for weights | COMPLETE | host_cache, host_resident entries |
 | Budget tracking (weights + runtime) | COMPLETE | used_, reserved_, available() |
 | Pre-allocated compute arena | COMPLETE | reserve_compute_arena, arena_alloc |
@@ -690,7 +690,6 @@ struct vram_arena {
 | `unified-cache.cpp` | `evict_below_priority()` | NEW: Evict only entries with priority > threshold. Used when specific priority class needs space |
 | `unified-cache.cpp` | `ensure_cached_layout()` | Set priority based on entry type and layer position |
 | `unified-cache.cpp` | `allocate()` | Accept priority parameter. If VRAM full, evict entries with lower priority |
-| `unified-cache.cpp` | `compute_score()` | Factor in priority: `score = priority_weight * (access_count * decay)` |
 
 **Current state**: `eviction_tier()` already assigns tiers (0=cold MoE, 1=hot MoE, 2=dense weight, 3=hot dense). `alloc_category_priority()` returns 0-4 for different allocation categories. The gap is that eviction does not consider what is requesting the space -- it just evicts the globally coldest entry.
 

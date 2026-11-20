@@ -19,7 +19,8 @@ This gate holds the removal and what must survive it:
       which is defined once and called once, and keyed by its layer_id parameter;
   L4  no rank is looked up under the hash layer id: the backend's get_expert_popularity_rank calls never take a
       moe_cache_layer_id() value;
-  L5  eviction carries no frequency term: unified_cache::evict_one reads no per-expert frequency;
+  L5  eviction carries no frequency or rank term: unified_cache::evict_one reads no per-expert frequency, no
+      popularity rank and no access score;
   L6  the down-I8 hot set ranks only by usage score and the block-keyed rank: an expert is pushed only when the tensor
       has scores or the expert has a block-keyed rank, the rank comes from that lookup alone, and a tensor with
       neither returns before any materialization (it keeps its loaded layout until scores exist).
@@ -88,6 +89,9 @@ REMOVED_WORDS = (
     # The single-expert SOA upload and the init-time preload, its only caller, which nothing called.
     "moe_expert_ensure_soa_cached",
     "preload_experts",
+    # The LRU+LFU access score, which nothing read after eviction moved to tier then last access.
+    "compute_score",
+    "DECAY_ALPHA",
 )
 REMOVED_TAGS = ("[MOE-WARMUP]", "[MOE-GATE-NORM]", "[MOE-RERANK]", "[ADAPTIVE-PRESTAGE]")
 
@@ -238,8 +242,8 @@ def check(raws: dict[str, str]) -> None:
 
     # L5: eviction picks its victim by tier and age, with no per-expert frequency.
     evict = body(code[CACHE_CPP], EVICT_ONE_DEF, "L5")
-    if re.search(r"\bfreq\b|frequency", evict):
-        raise ContractError("FAIL [pin L5]: unified_cache::evict_one still reads a per-expert frequency")
+    if re.search(r"\bfreq\b|frequency|popularity|\bcompute_score\(", evict):
+        raise ContractError("FAIL [pin L5]: unified_cache::evict_one still reads a per-expert frequency or rank")
 
     # L6: the down-I8 hot set has no rank source but the block-keyed lookup, and no hot set without score or rank.
     hot = body(code[BACKEND], DOWN_I8_HOTSET_DEF, "L6")
@@ -317,6 +321,8 @@ def self_test(raws: dict[str, str]) -> int:
                 "    return ggml_sycl::get_expert_popularity_rank(hash_layer, 0);\n}\n" + hotset_anchor)
     expect_fail("eviction-frequency-back", "L5", CACHE_CPP, evict_anchor,
                 evict_anchor + "        uint32_t freq = 0;\n")
+    expect_fail("eviction-rank-back", "L5", CACHE_CPP, evict_anchor,
+                evict_anchor + "        const int rank = get_expert_popularity_rank(entry.layer_id, entry.expert_id);\n")
     push_rule = "        if (have_scores || item.rank != INT_MAX) {\n            ranked.push_back(item);\n        }\n"
     expect_fail("down-i8-hotset-pushes-unranked", "L6", BACKEND, push_rule, "        ranked.push_back(item);\n")
     expect_fail("down-i8-hotset-no-empty-return", "L6", BACKEND,

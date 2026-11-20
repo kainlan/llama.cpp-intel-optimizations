@@ -14895,43 +14895,6 @@ void * unified_cache::promote_to_device(const unified_cache_key & key, size_t si
     return nullptr;
 }
 
-float unified_cache::compute_score(const unified_cache_entry & entry) const {
-    int64_t age        = time_.load() - entry.last_access;
-    float   decay      = std::exp(-DECAY_ALPHA * static_cast<float>(age));
-    float   base_score = static_cast<float>(entry.access_count) * decay;
-
-    // Higher VRAM priority (lower priority number) → higher score → harder to evict.
-    // Dense weights (priority 1) get more boost than MoE experts (priority 2).
-    const alloc_category cat =
-        (entry.type == cache_entry_type::MOE_EXPERT) ? alloc_category::EXPERT_CACHE : alloc_category::WEIGHT;
-    constexpr int k_max_priority = 4;
-    const float   priority_boost = static_cast<float>(k_max_priority - alloc_category_priority(cat) + 1);
-    base_score *= priority_boost;  // WEIGHT → 4x, EXPERT_CACHE → 3x
-
-    if (entry.type == cache_entry_type::DENSE_WEIGHT) {
-        return base_score;
-    }
-    if (entry.hot) {
-        constexpr float k_hot_boost = 1.5f;
-        return base_score * k_hot_boost;
-    }
-    // Boost MoE experts with high popularity (low rank = more popular). No
-    // caller reads this score: evict_one orders by tier, then by last access.
-    if (entry.type == cache_entry_type::MOE_EXPERT && entry.layer_id >= 0 && entry.expert_id >= 0) {
-        if (is_expert_popularity_initialized()) {
-            int pop_rank = get_expert_popularity_rank(entry.layer_id, entry.expert_id);
-            if (pop_rank >= 0) {
-                int boost_slots = 4;
-                if (pop_rank < boost_slots) {
-                    float boost = static_cast<float>(boost_slots - pop_rank);
-                    base_score *= (1.0f + boost);
-                }
-            }
-        }
-    }
-    return base_score;
-}
-
 sycl::event unified_cache::copy_to_device(void * dst, const void * src, size_t size) {
     return copy_to_device_async(dst, src, size, {}, &queue_);
 }

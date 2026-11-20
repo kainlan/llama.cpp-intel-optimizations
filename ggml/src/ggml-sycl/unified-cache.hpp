@@ -6134,10 +6134,6 @@ class unified_cache {
         std::equal_to<unified_cache_key>,
         detail::cache_guard_allocator<std::pair<const unified_cache_key, unified_cache_entry>>>;
 
-    // Compute eviction score: higher = more valuable (keep longer)
-    // score = access_count * exp(-decay * age)
-    float compute_score(const unified_cache_entry & entry) const;
-
     // Copy data from mmap to device via staging. Returns event for the last transfer.
     sycl::event copy_to_device(void * dst, const void * src, size_t size);
     sycl::event copy_to_device_async(void *                           dst,
@@ -7509,8 +7505,6 @@ class unified_cache {
     // Stats
     mutable std::atomic<size_t> hits_{ 0 };
     mutable std::atomic<size_t> misses_{ 0 };
-
-    static constexpr float DECAY_ALPHA = 0.01f;
 
     mutable std::shared_mutex           rw_mutex_;
     mutable std::condition_variable_any entry_cv_;
