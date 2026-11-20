@@ -5468,14 +5468,14 @@ def matrix_cases_s2d1():
         "unified-cache.cpp", 'const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");',
         "const char * env = nullptr;"), "FAIL", "M-FLOOR", "does not apply"))
     A(Case("32", "ensure_planned_arena_zones stops calling the reader while rows still draw", replace_once(
-        "unified-cache.cpp", "size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);",
+        "unified-cache.cpp", "size_t scratch_zone  = ggml_sycl_compute_arena_bytes(dev_id);",
         "size_t scratch_zone = 512ULL * 1024 * 1024;"), "FAIL", "M-FLOOR", "does not apply"))
     A(Case("32", "the reader's getenv commented out while rows still draw", replace_once(
         "unified-cache.cpp", 'const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");',
         'const char * env = nullptr;  // const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");'),
            "FAIL", "M-FLOOR", "does not apply"))
     A(Case("32", "ensure_planned_arena_zones' call of the reader commented out while rows still draw", replace_once(
-        "unified-cache.cpp", "size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);",
+        "unified-cache.cpp", "size_t scratch_zone  = ggml_sycl_compute_arena_bytes(dev_id);",
         "size_t scratch_zone = 512ULL * 1024 * 1024;  // was ggml_sycl_compute_arena_bytes(dev_id);"),
            "FAIL", "M-FLOOR", "does not apply"))
     A(Case("32", "the unmutated tables and floor (control)", plant("void zzplant_m() {\n}\n"), "PASS", planted=False))
