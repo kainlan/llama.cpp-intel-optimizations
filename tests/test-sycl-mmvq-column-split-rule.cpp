@@ -25,22 +25,22 @@ using ggml_sycl::mmvq_column_split_chunks;
 using ggml_sycl::mmvq_column_split_first_block;
 using ggml_sycl::mmvq_column_split_rows_per_workgroup;
 using ggml_sycl::mmvq_column_split_steps;
-using ggml_sycl::mmvq_column_split_workgroups;
 using ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;
+using ggml_sycl::mmvq_column_split_workgroups;
 
 // The row form's constants, transcribed here because this test includes no backend header. WARP_SIZE is 32 on every
 // Intel build (presets.hpp, ggml-sycl/CMakeLists.txt); Q8_0 has QI8_0 = 8 ints per block and vdr_mmvq = 2.
-static constexpr int WARP           = 32;
-static constexpr int QI8_0          = 8;
-static constexpr int VDR            = 2;
-static constexpr int SOA_STEP       = (VDR * WARP + QI8_0 - 1) / QI8_0;  // blocks one sub-group covers per step: 8
-static constexpr int SOA_BLOCK_LANES = QI8_0 / VDR;                      // lanes per block: 4
-static constexpr int COALESCED_STEP = WARP;                              // one tile of 32 blocks, one lane each
+static constexpr int WARP               = 32;
+static constexpr int QI8_0              = 8;
+static constexpr int VDR                = 2;
+static constexpr int SOA_STEP           = (VDR * WARP + QI8_0 - 1) / QI8_0;  // blocks one sub-group covers per step: 8
+static constexpr int SOA_BLOCK_LANES    = QI8_0 / VDR;                       // lanes per block: 4
+static constexpr int COALESCED_STEP     = WARP;                              // one tile of 32 blocks, one lane each
 // The 16 sub-groups of the row form's work-group (`num_subgroups` at every mmvq.cpp launch site).
 static constexpr int ROW_FORM_SUBGROUPS = 16;
 // SYCL max_compute_units on the two cards (EUs): Arc Pro B70 and Arc Pro B50.
-static constexpr int B70_EUS = 256;
-static constexpr int B50_EUS = 128;
+static constexpr int B70_EUS            = 256;
+static constexpr int B50_EUS            = 128;
 
 static int g_failures = 0;
 static int g_checks   = 0;
@@ -54,9 +54,9 @@ static void expect(bool ok, const std::string & what) {
 }
 
 static void expect_chunks(int rows, int ncols, int step, int eus, int want, const char * what) {
-    const int got = mmvq_column_split_chunks(rows, ncols / 32, step, eus);
-    const std::string label = std::string(what) + ": rows=" + std::to_string(rows) + " ncols=" +
-                              std::to_string(ncols) + " step=" + std::to_string(step) + " eus=" + std::to_string(eus) +
+    const int         got   = mmvq_column_split_chunks(rows, ncols / 32, step, eus);
+    const std::string label = std::string(what) + ": rows=" + std::to_string(rows) + " ncols=" + std::to_string(ncols) +
+                              " step=" + std::to_string(step) + " eus=" + std::to_string(eus) +
                               " -> chunks=" + std::to_string(got) + " (want " + std::to_string(want) + ")";
     expect(got == want, label);
     if (got == want) {
@@ -128,16 +128,16 @@ static void test_chunk_count_invariants_over_a_sweep() {
         for (const int step : { SOA_STEP, COALESCED_STEP }) {
             for (int rows = 1; rows <= 300; ++rows) {
                 for (int blocks = 1; blocks <= 400; ++blocks) {
-                    const int chunks = mmvq_column_split_chunks(rows, blocks, step, eus);
-                    const int steps  = mmvq_column_split_steps(blocks, step);
-                    const bool ok = is_power_of_two(chunks) && chunks <= MMVQ_COLUMN_SPLIT_SUBGROUPS &&
+                    const int  chunks = mmvq_column_split_chunks(rows, blocks, step, eus);
+                    const int  steps  = mmvq_column_split_steps(blocks, step);
+                    const bool ok     = is_power_of_two(chunks) && chunks <= MMVQ_COLUMN_SPLIT_SUBGROUPS &&
                                     MMVQ_COLUMN_SPLIT_SUBGROUPS % chunks == 0 && chunks <= steps &&
                                     (chunks == 1) == (rows >= eus || steps < 2) &&
                                     (chunks == 1 || chunks * 2 > steps || chunks == MMVQ_COLUMN_SPLIT_SUBGROUPS);
                     if (!ok) {
-                        expect(false, "invariant: rows=" + std::to_string(rows) + " blocks=" +
-                                          std::to_string(blocks) + " step=" + std::to_string(step) + " eus=" +
-                                          std::to_string(eus) + " chunks=" + std::to_string(chunks));
+                        expect(false, "invariant: rows=" + std::to_string(rows) + " blocks=" + std::to_string(blocks) +
+                                          " step=" + std::to_string(step) + " eus=" + std::to_string(eus) +
+                                          " chunks=" + std::to_string(chunks));
                         return;
                     }
                     ++checked;
@@ -217,7 +217,8 @@ static void test_chunks_read_every_quant_exactly_once() {
 // One chunk is the row form's loop: start at lane / 4 (SOA) or the lane (coalesced tile 0), step by one sub-group step.
 static void test_one_chunk_is_the_row_form_indexing() {
     for (int lane_block = 0; lane_block < WARP; ++lane_block) {
-        expect(mmvq_column_split_first_block(0, lane_block, SOA_STEP) == lane_block, "one chunk starts where a row does");
+        expect(mmvq_column_split_first_block(0, lane_block, SOA_STEP) == lane_block,
+               "one chunk starts where a row does");
     }
     expect(mmvq_column_split_block_stride(1, SOA_STEP) == SOA_STEP, "one SOA chunk strides one sub-group step");
     expect(mmvq_column_split_block_stride(1, COALESCED_STEP) == COALESCED_STEP, "one coalesced chunk strides a tile");

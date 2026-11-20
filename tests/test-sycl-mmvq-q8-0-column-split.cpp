@@ -35,9 +35,8 @@
 #include <limits>
 #include <random>
 #include <string>
-#include <vector>
-
 #include <sycl/sycl.hpp>
+#include <vector>
 
 namespace {
 
@@ -50,10 +49,9 @@ constexpr int TILE_WORD_STRIDE = TILE_BLOCKS * 4;
 constexpr int TILE_BYTES       = MMVQ_COALESCED_TILE_BYTES_Q8_0;
 // The blocks one sub-group covers per step of the SOA row form (mul_mat_vec_q_reorder's blocks_per_subgroup) and of
 // the coalesced row form (one tile). The dispatch rule takes these as its step.
-constexpr int SOA_STEP_BLOCKS =
-    (q8_0_soa_traits::vdr_mmvq * WARP_SIZE + q8_0_soa_traits::qi - 1) / q8_0_soa_traits::qi;
-constexpr int COALESCED_STEP = TILE_BLOCKS;
-constexpr int DST_GUARD      = 16;  // sentinel floats past the slice; a padded row writing there fails
+constexpr int SOA_STEP_BLOCKS = (q8_0_soa_traits::vdr_mmvq * WARP_SIZE + q8_0_soa_traits::qi - 1) / q8_0_soa_traits::qi;
+constexpr int COALESCED_STEP  = TILE_BLOCKS;
+constexpr int DST_GUARD       = 16;  // sentinel floats past the slice; a padded row writing there fails
 
 constexpr float REF_REL_TOL    = 1e-3f;
 constexpr float REF_ABS_TOL    = 1e-2f;
@@ -115,10 +113,10 @@ q8_1_vector make_activations(std::mt19937 & rng, int ncols) {
         const float d   = amax / 127.0f;
         int         sum = 0;
         for (int k = 0; k < QK; ++k) {
-            const int q              = d > 0.0f ? static_cast<int>(std::lround(vals[k] / d)) : 0;
-            y.qs[b * QK + k]         = static_cast<int8_t>(q);
-            y.bytes[b * QK + k]      = static_cast<uint8_t>(static_cast<int8_t>(q));
-            sum                     += q;
+            const int q         = d > 0.0f ? static_cast<int>(std::lround(vals[k] / d)) : 0;
+            y.qs[b * QK + k]    = static_cast<int8_t>(q);
+            y.bytes[b * QK + k] = static_cast<uint8_t>(static_cast<int8_t>(q));
+            sum += q;
         }
         const sycl::half2 ds(sycl::half(d), sycl::half(d * static_cast<float>(sum)));
         std::memcpy(y.bytes.data() + ncols + static_cast<size_t>(b) * sizeof(sycl::half2), &ds, sizeof(ds));
@@ -139,15 +137,15 @@ std::vector<uint8_t> soa_bytes(const q8_0_matrix & m) {
 // of a row whose block count is not a multiple of 32 is padded); after all rows' quants, the fp16 scales in block
 // order (mul_mat_vec_q8_0_coalesced's addressing).
 std::vector<uint8_t> coalesced_bytes(const q8_0_matrix & m, int rows, int ncols) {
-    const int    blocks_per_row = ncols / QK;
-    const int    tiles          = (blocks_per_row + TILE_BLOCKS - 1) / TILE_BLOCKS;
-    const size_t row_stride     = static_cast<size_t>(tiles) * TILE_BYTES;
+    const int            blocks_per_row = ncols / QK;
+    const int            tiles          = (blocks_per_row + TILE_BLOCKS - 1) / TILE_BLOCKS;
+    const size_t         row_stride     = static_cast<size_t>(tiles) * TILE_BYTES;
     std::vector<uint8_t> out(static_cast<size_t>(rows) * row_stride + m.d.size() * sizeof(sycl::half), 0);
     for (int r = 0; r < rows; ++r) {
         for (int b = 0; b < blocks_per_row; ++b) {
-            const int     tile = b / TILE_BLOCKS;
-            const int     bit  = b % TILE_BLOCKS;
-            const int8_t * src = m.qs.data() + (static_cast<size_t>(r) * blocks_per_row + b) * QK;
+            const int      tile = b / TILE_BLOCKS;
+            const int      bit  = b % TILE_BLOCKS;
+            const int8_t * src  = m.qs.data() + (static_cast<size_t>(r) * blocks_per_row + b) * QK;
             for (int w = 0; w < QK / 4; ++w) {
                 uint8_t * dst = out.data() + r * row_stride + static_cast<size_t>(tile) * TILE_BYTES +
                                 static_cast<size_t>(w) * TILE_WORD_STRIDE + static_cast<size_t>(bit) * 4;
@@ -159,7 +157,9 @@ std::vector<uint8_t> coalesced_bytes(const q8_0_matrix & m, int rows, int ncols)
     return out;
 }
 
-std::vector<float> reference(const test_case & tc, const q8_0_matrix & m, const q8_1_vector & y,
+std::vector<float> reference(const test_case &          tc,
+                             const q8_0_matrix &        m,
+                             const q8_1_vector &        y,
                              const std::vector<float> & addend) {
     const int          blocks_per_row = tc.ncols / QK;
     std::vector<float> out(static_cast<size_t>(tc.nrows));
@@ -207,8 +207,13 @@ struct device_run {
     bool               guard_clean = true;
 };
 
-device_run run(sycl::queue & q, const test_case & tc, const void * vx, const void * vy, const float * addend_d,
-               float * dst_d, int compute_units) {
+device_run run(sycl::queue &     q,
+               const test_case & tc,
+               const void *      vx,
+               const void *      vy,
+               const float *     addend_d,
+               float *           dst_d,
+               int               compute_units) {
     const size_t       n = static_cast<size_t>(tc.nrows) + DST_GUARD;
     std::vector<float> fill(n, std::numeric_limits<float>::quiet_NaN());
     const float        sentinel = -12345.0f;
@@ -218,9 +223,9 @@ device_run run(sycl::queue & q, const test_case & tc, const void * vx, const voi
     q.memcpy(dst_d, fill.data(), n * sizeof(float)).wait();
 
     device_run r;
-    r.chunks = mmvq_test_q8_0_launch(q, tc.coalesced, vx, vy, dst_d, tc.ncols, tc.nrows, tc.total_rows, tc.row_low,
-                                     compute_units, tc.fused ? addend_d : nullptr, tc.fused ? tc.total_rows : 0,
-                                     tc.row_low);
+    r.chunks =
+        mmvq_test_q8_0_launch(q, tc.coalesced, vx, vy, dst_d, tc.ncols, tc.nrows, tc.total_rows, tc.row_low,
+                              compute_units, tc.fused ? addend_d : nullptr, tc.fused ? tc.total_rows : 0, tc.row_low);
     q.wait_and_throw();
 
     std::vector<float> all(n);
@@ -249,17 +254,17 @@ int main() {
                 compute_units);
 
     const test_case cases[] = {
-        { "soa-4x10240",                false, 10240, 4,  0,  4,  false },
-        { "soa-4x10240-fused",          false, 10240, 4,  0,  4,  true  },
-        { "soa-48x2560",                false, 2560,  48, 0,  48, false },
-        { "soa-48x2560-fused",          false, 2560,  48, 0,  48, true  },
+        { "soa-4x10240",                   false, 10240, 4,  0,  4,  false },
+        { "soa-4x10240-fused",             false, 10240, 4,  0,  4,  true  },
+        { "soa-48x2560",                   false, 2560,  48, 0,  48, false },
+        { "soa-48x2560-fused",             false, 2560,  48, 0,  48, true  },
         // A row slice of a SOA tensor, as a split-tensor dispatch passes it: the kernel addresses blocks by
         // row_low + row against the whole tensor's planes and the addend by its row base.
-        { "soa-48x2560-slice-16-40-fused", false, 2560, 48, 16, 24, true },
-        { "coalesced-4x10240",          true,  10240, 4,  0,  4,  false },
-        { "coalesced-4x10240-fused",    true,  10240, 4,  0,  4,  true  },
-        { "coalesced-48x2560",          true,  2560,  48, 0,  48, false },
-        { "coalesced-48x2560-fused",    true,  2560,  48, 0,  48, true  },
+        { "soa-48x2560-slice-16-40-fused", false, 2560,  48, 16, 24, true  },
+        { "coalesced-4x10240",             true,  10240, 4,  0,  4,  false },
+        { "coalesced-4x10240-fused",       true,  10240, 4,  0,  4,  true  },
+        { "coalesced-48x2560",             true,  2560,  48, 0,  48, false },
+        { "coalesced-48x2560-fused",       true,  2560,  48, 0,  48, true  },
     };
 
     for (const test_case & tc : cases) {
@@ -277,10 +282,10 @@ int main() {
 
     try {
         for (const test_case & tc : cases) {
-            const q8_0_matrix    m      = make_weights(rng, tc.total_rows, tc.ncols);
-            const q8_1_vector    y      = make_activations(rng, tc.ncols);
+            const q8_0_matrix          m = make_weights(rng, tc.total_rows, tc.ncols);
+            const q8_1_vector          y = make_activations(rng, tc.ncols);
             const std::vector<uint8_t> x = tc.coalesced ? coalesced_bytes(m, tc.total_rows, tc.ncols) : soa_bytes(m);
-            std::vector<float>   addend(static_cast<size_t>(tc.total_rows));
+            std::vector<float>         addend(static_cast<size_t>(tc.total_rows));
             std::uniform_real_distribution<float> a(-4.0f, 4.0f);
             for (auto & v : addend) {
                 v = a(rng);
@@ -307,9 +312,8 @@ int main() {
             const compare_result     row_ref   = compare(row.out, ref, REF_REL_TOL, REF_ABS_TOL);
             const compare_result     split_row = compare(split.out, row.out, KERNEL_REL_TOL, KERNEL_ABS_TOL);
             const compare_result     split_ref = compare(split.out, ref, REF_REL_TOL, REF_ABS_TOL);
-            const int want = ggml_sycl::mmvq_column_split_chunks(tc.nrows, tc.ncols / QK,
-                                                                 tc.coalesced ? COALESCED_STEP : SOA_STEP_BLOCKS,
-                                                                 compute_units);
+            const int                want      = ggml_sycl::mmvq_column_split_chunks(
+                tc.nrows, tc.ncols / QK, tc.coalesced ? COALESCED_STEP : SOA_STEP_BLOCKS, compute_units);
 
             std::string why;
             if (row.chunks != 1) {
