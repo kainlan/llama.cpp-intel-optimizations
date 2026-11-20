@@ -12,8 +12,9 @@ passed in. This gate holds that by text:
   S1  the header includes the standard library only, from a short list of headers a pure computation needs: no quoted
       include, no ggml, no SYCL, nothing outside the list;
   S2  nothing mutable lives outside a state struct the caller owns: no `static`, `thread_local`, `extern`, `mutable`
-      or `volatile` anywhere (a namespace constant is `constexpr`), no non-const `inline` variable, and no atomic
-      or lock, so the policy has nothing to synchronise because it shares nothing;
+      or `volatile` anywhere (a namespace constant is `constexpr`), no non-const `inline` variable (the object's
+      constness is read from where `const` binds: `inline const int * p` is a mutable pointer, `inline int * const p`
+      is not), and no atomic or lock, so the policy has nothing to synchronise because it shares nothing;
   S3  no device, allocation-through-the-cache, logging or environment access: no `sycl`, `malloc`/`free`, the unified
       cache's names, `GGML_LOG`, `printf`, `std::cout`/`cerr` or `getenv`.
 
@@ -22,8 +23,11 @@ NOT VACUOUS: --self-test runs the gate on in-memory mutants of the real header. 
 catch it, and is reported if it survives, if a different pin catches it, or if its anchor no longer matches exactly
 once (NOT APPLIED). The self-test also proves that last report fires. ctest registers it with --self-test.
 
-WHAT THIS DOES NOT PROVE. It reads text. That the policy decides correctly and stays inside its time bound is the unit
-test's job; that a caller keeps one state per model and passes it by reference is the caller's.
+WHAT THIS DOES NOT PROVE. It reads text. An `inline` variable with a parenthesised initializer that is made only of
+identifiers, such as `inline int g(x);`, cannot be told from a function declaration by text and is not caught; a
+literal argument (`inline int g(5);`) is. A mutable object reached through a typedef or `using` alias that hides a
+`const` is judged by the spelling in front of it. That the policy decides correctly and stays inside its time bound
+is the unit test's job; that a caller keeps one state per model and passes it by reference is the caller's.
 """
 
 from __future__ import annotations
@@ -40,10 +44,73 @@ ALLOWED_INCLUDES = {
     "algorithm", "array", "cmath", "cstddef", "cstdint", "cstring", "limits", "numeric", "utility", "vector",
 }
 STATE_KEYWORDS = re.compile(r"\b(?:static|thread_local|extern|mutable|volatile)\b")
-# A C++17 `inline` variable is a global with external linkage and needs none of the words above. `inline` followed by
-# a declaration with no parenthesis before its `=`, `;` or `{` is a variable; a function has its `(` first. `inline
-# const` and `inline constexpr` are constants and allowed.
-INLINE_VARIABLE = re.compile(r"\binline\s+(?!const\b|constexpr\b)[^;(){}=]*[\w>&*]\s*(?:=|;|\{)")
+# A C++17 `inline` variable is a global with external linkage and needs none of the words above.
+INLINE = re.compile(r"\binline\b")
+TEMPLATE_ARGS = re.compile(r"<[^<>]*>")
+# An argument list that holds a literal argument cannot be a parameter list: `inline int g(5);` is a variable.
+LITERAL_ARG = re.compile(r"^(?:[+-]?\d[\w.']*|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|nullptr|true|false)$")
+
+
+def _matching_paren(text: str, open_at: int) -> int:
+    depth = 0
+    for k in range(open_at, len(text)):
+        if text[k] == "(":
+            depth += 1
+        elif text[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return k
+    return -1
+
+
+def _top_level_args(text: str) -> list[str]:
+    args, depth, cur = [], 0, ""
+    for c in text:
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth -= 1
+        if c == "," and depth == 0:
+            args.append(cur.strip())
+            cur = ""
+        else:
+            cur += c
+    if cur.strip():
+        args.append(cur.strip())
+    return args
+
+
+def _is_const_object(head: str) -> bool:
+    """Is the object a declaration head declares immutable? `constexpr` makes it so; otherwise a pointer is const only
+    if `const` follows its last `*` (`int * const p`), and anything else only needs a `const`. Template arguments are
+    cut first, so `std::vector<const int>` is a mutable vector."""
+    while TEMPLATE_ARGS.search(head):
+        head = TEMPLATE_ARGS.sub(" ", head)
+    if re.search(r"\bconstexpr\b", head):
+        return True
+    if "*" in head:
+        head = head[head.rfind("*") + 1 :]
+    return re.search(r"\bconst\b", head) is not None
+
+
+def find_inline_variable(code: str) -> int | None:
+    """The offset of the first non-const `inline` variable in `code`, or None. `inline` starts a function when a `(`
+    comes before any `=`, `;` or `{`; that is a variable only if its parentheses hold a literal argument."""
+    for m in INLINE.finditer(code):
+        rest = code[m.end() :]
+        t = re.search(r"[;={(]", rest)
+        if not t:
+            continue
+        head = rest[: t.start()]
+        if re.search(r"\boperator\b", head) or len(head.split()) < 2:
+            continue
+        if t.group() == "(":
+            close = _matching_paren(rest, t.start())
+            if close < 0 or not any(LITERAL_ARG.match(a) for a in _top_level_args(rest[t.start() + 1 : close])):
+                continue
+        if not _is_const_object(head):
+            return m.start()
+    return None
 SYNC_NAMES = re.compile(
     r"\bstd::(?:atomic\w*|mutex|shared_mutex|recursive_mutex|lock_guard|unique_lock|call_once|once_flag)\b"
 )
@@ -97,9 +164,9 @@ def check(raw: str) -> None:
     if m:
         line = stateless.count("\n", 0, m.start()) + 1
         raise ContractError(f"FAIL [pin S2]: `{m.group(0)}` at line {line}: state outside the caller's struct")
-    m = INLINE_VARIABLE.search(stateless)
-    if m:
-        line = stateless.count("\n", 0, m.start()) + 1
+    at = find_inline_variable(stateless)
+    if at is not None:
+        line = stateless.count("\n", 0, at) + 1
         raise ContractError(f"FAIL [pin S2]: an inline variable at line {line}: global state outside the caller")
     m = SYNC_NAMES.search(code)
     if m:
@@ -124,6 +191,20 @@ def mutate(raw: str, edits: list[tuple[str, str]]) -> str:
 def self_test(raw: str) -> int:
     failures: list[str] = []
     n_mutants = 0
+    n_negatives = 0
+
+    def expect_pass(name: str, edits: list[tuple[str, str]]) -> None:
+        """A mutant that is legal for this header and must NOT be caught: the false-positive side of the pins."""
+        nonlocal n_negatives
+        n_negatives += 1
+        try:
+            check(mutate(raw, edits))
+        except MutantNotApplied as e:
+            failures.append(name)
+            print(f"  self-test: {name}: {e}")
+        except ContractError as e:
+            failures.append(name)
+            print(f"  self-test: {name}: a legal declaration was caught: {e}")
 
     def expect_fail(name: str, pin: str, edits: list[tuple[str, str]]) -> None:
         nonlocal n_mutants
@@ -158,6 +239,14 @@ def self_test(raw: str) -> int:
     expect_fail("inline-global-vector", "S2", [(ns, ns + "inline std::vector<int> g_scratch;\n")])
     expect_fail("inline-global-counter", "S2", [(ns, ns + "inline int g_n = 0;\n")])
     expect_fail("inline-global-braced", "S2", [(ns, ns + "inline int g_k{5};\n")])
+    expect_fail("inline-global-array", "S2", [(ns, ns + "inline int g_a[4];\n")])
+    expect_fail("inline-global-array-initialised", "S2", [(ns, ns + "inline int g_b[4] = {};\n")])
+    expect_fail("inline-global-paren-literal", "S2", [(ns, ns + "inline int g_p(5);\n")])
+    expect_fail("inline-global-paren-string", "S2", [(ns, ns + 'inline std::string g_s("x");\n')])
+    expect_fail("inline-pointer-to-const-is-mutable", "S2", [(ns, ns + "inline const int * g_q = nullptr;\n")])
+    expect_fail("inline-pointer", "S2", [(ns, ns + "inline int * g_r = nullptr;\n")])
+    expect_fail("inline-vector-of-const-is-mutable", "S2", [(ns, ns + "inline std::vector<const int> g_v;\n")])
+    expect_fail("inline-lambda-variable", "S2", [(ns, ns + "inline auto g_f = [](int a) { return a; };\n")])
     expect_fail("thread-local-scratch", "S2", [(ns, ns + "thread_local std::vector<int> scratch;\n")])
     expect_fail("extern-state", "S2", [(ns, ns + "extern int g_swaps;\n")])
     expect_fail("mutable-member", "S2", [("    int                            n_blocks  = 0;",
@@ -171,6 +260,21 @@ def self_test(raw: str) -> int:
     expect_fail("logs", "S3", [(ns, ns + "inline void say() { GGML_LOG_INFO(\"x\"); }\n")])
     expect_fail("prints", "S3", [(ns, ns + "inline void say() { printf(\"x\"); }\n")])
     expect_fail("reads-the-environment", "S3", [(ns, ns + "inline bool on() { return getenv(\"X\") != nullptr; }\n")])
+
+    # The false-positive side: legal declarations the pin must let through.
+    expect_pass("legal-inline-function", [(ns, ns + "inline int twice(int a) { return a * 2; }\n")])
+    expect_pass("legal-inline-function-declaration", [(ns, ns + "inline int twice(int a);\n")])
+    expect_pass("legal-inline-function-no-parameters", [(ns, ns + "inline int zero();\n")])
+    expect_pass("legal-inline-function-default-argument", [(ns, ns + "inline void put(int a = 5);\n")])
+    expect_pass("legal-inline-function-templated-return",
+                [(ns, ns + "inline std::vector<int> make(int n) { return std::vector<int>(n); }\n")])
+    expect_pass("legal-inline-operator",
+                [(ns, ns + "inline bool operator==(const int & a, const int & b) { return a == b; }\n")])
+    expect_pass("legal-inline-constexpr", [(ns, ns + "inline constexpr int k_three = 3;\n")])
+    expect_pass("legal-inline-const", [(ns, ns + "inline const int k_four = 4;\n")])
+    expect_pass("legal-inline-const-pointer", [(ns, ns + "inline int * const k_ptr = nullptr;\n")])
+    expect_pass("legal-inline-const-array", [(ns, ns + "inline const int k_arr[2] = { 1, 2 };\n")])
+    expect_pass("legal-inline-constexpr-pointer", [(ns, ns + "inline constexpr const char * k_name = \"x\";\n")])
 
     # The NOT APPLIED report must fire on an anchor the header does not hold, or a stale mutant would pass unseen.
     try:
@@ -190,7 +294,10 @@ def self_test(raw: str) -> int:
     if failures:
         print(f"SELF-TEST FAIL: {', '.join(failures)}")
         return 1
-    print(f"SELF-TEST PASS: {n_mutants} mutants caught by their pins, unmodified header passes")
+    print(
+        f"SELF-TEST PASS: {n_mutants} mutants caught by their pins, {n_negatives} legal declarations let through, "
+        "unmodified header passes"
+    )
     return 0
 
 
