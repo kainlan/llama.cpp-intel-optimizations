@@ -6395,6 +6395,21 @@ class unified_cache {
     // alone.
     void arena_count_scratch_holders(zone_arena_holders & holders);
 
+    // What holds the arena now: each zone's live bytes, written into `live_zone_used` (one figure per vram_zone_id),
+    // their sum, the chunk leases, and the cache's scratch buffers (arena_count_scratch_holders). A caller that decides
+    // on these figures prints them, not a second reading, which could disagree with them under a concurrent release.
+    zone_arena_holders arena_read_holders(size_t * live_zone_used);
+
+    // Names who holds the arena on `dev_id`, from the figures arena_read_holders() read: one ERROR line with each
+    // zone's live bytes, the queued frees those zones still count, the device's releases waiting for a retry, the
+    // retired entries not yet finalized and the evictions in flight, which it also fills into `holders`; one WARN
+    // line with the chunk leases by site; then each zone with live bytes lists its live allocations under `site`. It
+    // only reads: it drains, frees, evicts, resets and allocates nothing.
+    void arena_report_holders(int                  dev_id,
+                              const size_t *       live_zone_used,
+                              zone_arena_holders & holders,
+                              const char *         site);
+
     // The load transaction whose keep of a short ONEDNN zone last warned on this device (zone_kept_onednn_warn_due). An
     // exchange, so two ensures of one load racing on the device warn once between them.
     std::atomic<uint64_t> onednn_zone_kept_warn_txn_{ 0 };

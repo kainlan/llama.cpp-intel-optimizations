@@ -7,8 +7,10 @@ The rebuild refusal names who holds the arena: each zone's live bytes from the r
 frees still queued behind a GPU event whose bytes the zones still count, the device's releases that could not complete
 and wait for a retry (a refused arena lease is the usual cause), and the cache's retired entries not yet finalized and
 evictions still in flight. The line prints those variables, and the path only reads: it drains, frees, evicts, settles,
-resets, reserves and allocates nothing. The RUNTIME requirement line names every term it sums, the PP MoE oneDNN ring
-split as the requirement splits it.
+resets, reserves and allocates nothing. The figures are read by unified_cache::arena_read_holders and named by
+unified_cache::arena_report_holders, which the refusal calls, so the refusal segment read here is the ensure's own
+text with the report's body. The RUNTIME requirement line names every term it sums, the PP MoE oneDNN ring split as
+the requirement splits it.
 
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live
 inside test_*() functions. Checks read COMMENT-STRIPPED, whitespace-normalised text. Each check has a mutation witness
@@ -95,6 +97,11 @@ def mutate_in(src: str, sig: str, old: str, new: str) -> str:
 
 ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
               "const zone_arena_ensure_options & options)")
+READ_SIG = "zone_arena_holders unified_cache::arena_read_holders(size_t * live_zone_used)"
+REPORT_SIG = ("void unified_cache::arena_report_holders(int dev_id, const size_t * live_zone_used, "
+              "zone_arena_holders & holders, const char * site)")
+READ_CALL = "zone_arena_holders holders = arena_read_holders(live_zone_used);"
+REPORT_CALL = 'arena_report_holders(dev_id, live_zone_used, holders, "arena-rebuild");'
 
 # ---- the refusal names who holds the arena ----
 
@@ -148,11 +155,15 @@ _STRING_RE = re.compile(r'"(?:\\.|[^"\\\n])*"')
 
 
 def refusal_segment(uc: str) -> str:
-    """ensure_planned_arena_zones() from the refusal line up to its return false, or "" when the shape is gone."""
-    ens = fn_body(code(uc), ENSURE_SIG)
+    """ensure_planned_arena_zones() from the refusal line up to its return false, followed by the body of the holders
+    report it calls there, or "" when the shape is gone or the segment does not call the report."""
+    c = code(uc)
+    ens = fn_body(c, ENSURE_SIG)
     i = ens.find(REFUSAL_LINE)
     r = ens.find("return false;", max(i, 0))
-    return ens[i:r] if -1 not in (i, r) else ""
+    if -1 in (i, r) or REPORT_CALL not in ens[i:r]:
+        return ""
+    return ens[i:r] + " " + fn_body(c, REPORT_SIG)
 
 
 def holders_call_args(seg: str) -> str:
@@ -203,10 +214,12 @@ def claim_diagnostic_mutates_nothing(uc: str) -> bool:
 
 
 def claim_zone_figures_are_the_refusals_reading(uc: str) -> bool:
-    ens = fn_body(code(uc), ENSURE_SIG)
+    c = code(uc)
+    ens = fn_body(c, ENSURE_SIG)
     seg = refusal_segment(uc)
     return (
-        ordered(ens, ZONE_RECORD, ZONE_SUM, REFUSAL_LINE)
+        ordered(fn_body(c, READ_SIG), ZONE_RECORD, ZONE_SUM)
+        and ordered(ens, READ_CALL, REFUSAL_LINE)
         and ZONE_PRINT in seg
         and "zone_used(" not in seg
     )
@@ -285,23 +298,27 @@ def test_runtime_line_names_every_term():
 
 def test_witness_holders_line_without_deferred_bytes():
     assert not claim_rebuild_refusal_names_the_holders(
-        mutate_in(UC, ENSURE_SIG, "deferred_in_arena_bytes += entry.size;", "")
+        mutate_in(UC, REPORT_SIG, "deferred_in_arena_bytes += entry.size;", "")
     )
 
 
 def test_witness_deferred_frees_outside_the_arena_counted():
-    assert not claim_rebuild_refusal_names_the_holders(mutate_in(UC, ENSURE_SIG, DEFERRED_IN_ARENA, "{"))
+    assert not claim_rebuild_refusal_names_the_holders(mutate_in(UC, REPORT_SIG, DEFERRED_IN_ARENA, "{"))
 
 
 def test_witness_holders_line_dropped():
-    assert not claim_rebuild_refusal_names_the_holders(mutate_in(UC, ENSURE_SIG, HOLDERS_LINE, '"x"'))
+    assert not claim_rebuild_refusal_names_the_holders(mutate_in(UC, REPORT_SIG, HOLDERS_LINE, '"x"'))
+
+
+def test_witness_refusal_does_not_call_the_report():
+    assert not claim_rebuild_refusal_names_the_holders(mutate_in(UC, ENSURE_SIG, REPORT_CALL, ""))
 
 
 def test_witness_holders_line_prints_a_literal_for_live_controls():
     assert not claim_holders_line_prints_its_figures(
         mutate_in(
             UC,
-            ENSURE_SIG,
+            REPORT_SIG,
             "device_release_retries, device_live_controls, retired_pending",
             "device_release_retries, 0, retired_pending",
         )
@@ -312,7 +329,7 @@ def test_witness_holders_line_prints_a_literal_for_retired_pending():
     assert not claim_holders_line_prints_its_figures(
         mutate_in(
             UC,
-            ENSURE_SIG,
+            REPORT_SIG,
             "device_live_controls, retired_pending, evictions_in_flight",
             "device_live_controls, 0, evictions_in_flight",
         )
@@ -324,38 +341,42 @@ DEFERRED_LOCK = "std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_
 
 def test_witness_diagnostic_drains_the_queue():
     assert not claim_diagnostic_mutates_nothing(
-        mutate_in(UC, ENSURE_SIG, DEFERRED_LOCK, "process_deferred_frees_locked(); " + DEFERRED_LOCK)
+        mutate_in(UC, REPORT_SIG, DEFERRED_LOCK, "process_deferred_frees_locked(); " + DEFERRED_LOCK)
     )
 
 
 def test_witness_diagnostic_settles_a_zone():
     assert not claim_diagnostic_mutates_nothing(
-        mutate_in(UC, ENSURE_SIG, DEFERRED_LOCK, "zone_settle(vram_zone_id::WEIGHT); " + DEFERRED_LOCK)
+        mutate_in(UC, REPORT_SIG, DEFERRED_LOCK, "zone_settle(vram_zone_id::WEIGHT); " + DEFERRED_LOCK)
     )
 
 
 def test_witness_diagnostic_allocates_in_a_zone():
     assert not claim_diagnostic_mutates_nothing(
-        mutate_in(UC, ENSURE_SIG, DEFERRED_LOCK, "zone_alloc(vram_zone_id::RUNTIME, 64, 64); " + DEFERRED_LOCK)
+        mutate_in(UC, REPORT_SIG, DEFERRED_LOCK, "zone_alloc(vram_zone_id::RUNTIME, 64, 64); " + DEFERRED_LOCK)
     )
 
 
 def test_witness_diagnostic_evicts():
     assert not claim_diagnostic_mutates_nothing(
-        mutate_in(UC, ENSURE_SIG, DEFERRED_LOCK, "evict_one(); " + DEFERRED_LOCK)
+        mutate_in(UC, REPORT_SIG, DEFERRED_LOCK, "evict_one(); " + DEFERRED_LOCK)
     )
 
 
 def test_witness_diagnostic_releases_a_model_slot():
     assert not claim_diagnostic_mutates_nothing(
-        mutate_in(UC, ENSURE_SIG, DEFERRED_LOCK, "release_model_slot(0); " + DEFERRED_LOCK)
+        mutate_in(UC, REPORT_SIG, DEFERRED_LOCK, "release_model_slot(0); " + DEFERRED_LOCK)
     )
 
 
 def test_witness_zone_figures_read_again():
     assert not claim_zone_figures_are_the_refusals_reading(
-        mutate_in(UC, ENSURE_SIG, ZONE_PRINT, "zone_used(static_cast<vram_zone_id>(z)) / (1024.0 * 1024.0)")
+        mutate_in(UC, REPORT_SIG, ZONE_PRINT, "zone_used(static_cast<vram_zone_id>(z)) / (1024.0 * 1024.0)")
     )
+
+
+def test_witness_zone_figures_not_summed_from_the_reading():
+    assert not claim_zone_figures_are_the_refusals_reading(mutate_in(UC, READ_SIG, ZONE_SUM, ""))
 
 
 def test_witness_runtime_line_without_scatter():
