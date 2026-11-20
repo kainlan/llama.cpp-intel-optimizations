@@ -61,7 +61,9 @@ runs in exactly one direction:
 
 Placement is chosen for fit and for where execution will be most optimal — e.g.
 **dense weights fill VRAM first, before MoE experts are placed there** — and
-that decision is made once, in the planning pass. The dispatcher never
+that decision is made in the planning pass and revised only by the plan
+transaction at a graph boundary (the loan, the refill and the named admit,
+below), which republishes the plan the next graph reads. The dispatcher never
 re-litigates it at op time. Two symmetric failure modes are therefore forbidden:
 
 - **No GPU "zero-copy" reads of host memory.** Feeding a host-pinned pointer to
@@ -302,6 +304,52 @@ first graph entry, before any MUL_MAT_ID, returns them in one transaction. A
 process that exits after its last context pays nothing. The fit's
 ring term charges the ring bytes that neither the room nor a loan would cover to
 the rung's demand, so a rung that needs them is refused with a figure.
+
+**The named admit.** A third plan transaction brings named host triplets onto
+the card at a graph boundary. `ggml_sycl_expert_move_transaction_run` takes a
+request listing (block, expert) triplets to admit and runs the NAMED direction
+of `ggml_sycl_expert_txn_run`, the loan's and the refill's body: lease, mint
+outside the locks, inventory mutex, the cache's lock pair, plan flip, one CAS,
+one publish and the unconditional epoch bump. It keeps no ledger. Each triplet
+is checked against the published plan by `moe_expert_move_validate`
+("incomplete triplet", "duplicate triplet", "wrong device", "not on host",
+"layout") and moves whole or not at all. A refused triplet leaves the others to
+move, and every triplet gets an outcome: moved, or refused with its reason and a
+BUSY or REFUSED class. A named admit runs only while nothing is lent: with a
+loan outstanding the request is refused "loans outstanding", BUSY, because lent
+triplets come back through the refill, which finds them by the ledger. The
+source is a whole pinned host copy that is a slice of a host zone. A copy served
+in place from a file mapping is refused "host copy not pinned", REFUSED, and
+stays on the host.
+
+The device copy is minted from the WEIGHT zone through
+`ggml_sycl_device_expert_alloc` at `staged_expert_bytes()`, the size direct
+staging gives the expert, never at the host size. For AOS that is
+`aos_staged_weight_bytes(type, ncols, host size)`: a quantized weight gets a
+tail that completes its last row to a multiple of `MATRIX_ROW_PADDING` columns,
+which the quantized kernels may read. The type and width come from the resolved
+tensor, and the size is asked of the layout, so a layout that stages another
+way adds its own case in one place. The cache requires the device size to be at
+least the host size and equal to the staged size. The copy moves the host
+bytes, the tail is zero-filled behind it on the same queue, and the device
+entry is published behind the fill; the extra's record covers the host bytes,
+as direct staging's does. A Q4_0 expert 640 columns wide gains 216 bytes. The
+first graph after the publish serves the admitted expert from the card: the
+pointer-table update orders behind the entry's ready event on the context's
+in-order stream, so nothing waits on the host, and that graph queues behind at
+most the admitted triplets' copy and fill.
+
+The admit bounds memory as follows. It returns each admitted triplet's pinned
+host copy once that copy's last lease drains, so the experts' host pinned use
+stays within the triplets not on the card times the triplet size. It mints its
+device copies before it frees anything, so a boundary admits only as many
+triplets as the WEIGHT zone has room for. A triplet the zone cannot hold is
+refused "WEIGHT zone full", BUSY, after giving back what its other members
+minted, and the plan the transaction publishes leaves it on the host; when no
+triplet fits, nothing is published. The caller retries at a later boundary.
+Planned headroom in the zone is the planner's job, not the transaction's. Only
+the private fixtures call the named admit for now; the boundary driver that
+will name triplets is not yet written.
 
 **Gates.** Three gates keep the rule enforceable.
 

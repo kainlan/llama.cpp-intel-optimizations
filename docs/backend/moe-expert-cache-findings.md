@@ -535,6 +535,12 @@ into device scratch per dispatch). Two readings are open:
   VRAM-starved configuration that is too slow on the CPU is fixed by "placement (budget,
   eviction priority)" would then mean changes to the plan, not a run-time policy.
 
+Since 2026-11-20 the memory design's sentence reads differently from the quote above:
+placement is made in the planning pass and revised only by the plan transaction at a
+graph boundary, and the named admit is such a transaction. A move made that way, between
+graphs and through a republished plan, is inside the ruling. Which triplets a
+routing-driven policy names, and how often, is what the data below bear on.
+
 The data in this document are what the owner would weigh against either reading.
 
 If run-time re-placement is allowed, what the data support:
