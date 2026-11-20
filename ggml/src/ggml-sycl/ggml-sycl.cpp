@@ -89973,44 +89973,62 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // tensor is not necessarily a full device allocation.
     const bool plan_host_routing = has_placement_plan && plan_has_cpu_experts;
 
+    // The layout the experts this op multiplies are in. A prompt (ne12 != 1) requested its retained expert batch at
+    // retained_prompt_layout, above, so that is its route: one source for the fact. Selecting the route again here
+    // with a second selector disagreed with it whenever no placement plan exists (the expert-cache selector reads
+    // policy, not the operands: SOA for q8_0 and mxfp4 over operands resolved AOS), and the kernels then read those
+    // operands in a layout their bytes are not in. A single operand can still resolve to another layout than the one
+    // requested (the host recipe takes only AOS, every staged ring slot is AOS, and the resolver can fall back to a
+    // secondary layout), so a per-expert consumer reads its expert's route.actual_layout, not this. A decode op
+    // selects its route here and resolves its experts at it below.
     layout_mode route_layout = src0_layout;
-    if (use_expert_cache) {
-        if (accepted_layout_override) {
-            route_layout = override_layout;
-        } else if (has_override) {
-            if (has_placement_plan) {
-                route_layout = ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, host_weights, ne12);
-            } else {
-                GGML_LOG_WARN("[MoE] Override layout=%d unsupported for %s; falling back to AoS\n",
-                              (int) override_layout, src0->name ? src0->name : "?");
-                route_layout = GGML_LAYOUT_AOS;
-            }
-
-        } else if (has_placement_plan) {
-            route_layout = ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, host_weights, ne12);
-        } else {
-            route_layout = ggml_sycl_select_moe_expert_cache_layout(src0, ctx.device, ne12);
-        }
-    } else if (has_override) {
-        if (accepted_layout_override) {
-            route_layout = override_layout;
-        } else {
-            GGML_LOG_WARN("[MoE] Override layout=%d unsupported for %s; keeping resolved layout=%d\n",
+    if (ne12 != 1) {
+        route_layout = retained_prompt_layout;
+        if (has_override && !accepted_layout_override) {
+            // The prompt requested its batch at the override as adjusted for this tensor, exact (no row-count
+            // rewrite), so it routes there; the decode arm below names its own fallback for the same override.
+            GGML_LOG_WARN("[MoE] Override layout=%d unsupported for %s; prompt routes at layout=%d\n",
                           (int) override_layout, src0->name ? src0->name : "?", (int) route_layout);
         }
-    }
-    route_layout = ggml_sycl_moe_layout_for_selected_rows(
-        src0, ctx.device, route_layout, static_cast<size_t>(std::max<int64_t>(0, moe_selected_entries)),
-        exact_layout_override, ne12);
-    const bool direct_down_i8_hotset_enabled = ggml_sycl_moe_decode_down_i8_hotset_enabled();
-    if (direct_down_i8_hotset_enabled && !exact_layout_override && has_placement_plan && !ids_host.empty()) {
-        (void) ggml_sycl_moe_maybe_use_down_i8_hotset(src0, ctx.device, ids_host, n_experts, ne12, &route_layout,
-                                                      "direct-dispatch");
-    }
-    if (!use_expert_cache && route_layout != GGML_LAYOUT_AOS) {
-        GGML_SYCL_DEBUG("[MoE] Host routing uses AoS layout for %s (requested=%d)\n", src0->name ? src0->name : "?",
-                        (int) route_layout);
-        route_layout = GGML_LAYOUT_AOS;
+    } else {
+        if (use_expert_cache) {
+            if (accepted_layout_override) {
+                route_layout = override_layout;
+            } else if (has_override) {
+                if (has_placement_plan) {
+                    route_layout = ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, host_weights, ne12);
+                } else {
+                    GGML_LOG_WARN("[MoE] Override layout=%d unsupported for %s; falling back to AoS\n",
+                                  (int) override_layout, src0->name ? src0->name : "?");
+                    route_layout = GGML_LAYOUT_AOS;
+                }
+
+            } else if (has_placement_plan) {
+                route_layout = ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, host_weights, ne12);
+            } else {
+                route_layout = ggml_sycl_select_moe_expert_cache_layout(src0, ctx.device, ne12);
+            }
+        } else if (has_override) {
+            if (accepted_layout_override) {
+                route_layout = override_layout;
+            } else {
+                GGML_LOG_WARN("[MoE] Override layout=%d unsupported for %s; keeping resolved layout=%d\n",
+                              (int) override_layout, src0->name ? src0->name : "?", (int) route_layout);
+            }
+        }
+        route_layout = ggml_sycl_moe_layout_for_selected_rows(
+            src0, ctx.device, route_layout, static_cast<size_t>(std::max<int64_t>(0, moe_selected_entries)),
+            exact_layout_override, ne12);
+        const bool direct_down_i8_hotset_enabled = ggml_sycl_moe_decode_down_i8_hotset_enabled();
+        if (direct_down_i8_hotset_enabled && !exact_layout_override && has_placement_plan && !ids_host.empty()) {
+            (void) ggml_sycl_moe_maybe_use_down_i8_hotset(src0, ctx.device, ids_host, n_experts, ne12, &route_layout,
+                                                          "direct-dispatch");
+        }
+        if (!use_expert_cache && route_layout != GGML_LAYOUT_AOS) {
+            GGML_SYCL_DEBUG("[MoE] Host routing uses AoS layout for %s (requested=%d)\n", src0->name ? src0->name : "?",
+                            (int) route_layout);
+            route_layout = GGML_LAYOUT_AOS;
+        }
     }
     pp_phase_log("layout-selected", route_layout, ids_host.size());
     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
@@ -93712,31 +93730,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
 #if GGML_SYCL_DNNL
         const bool pp_mxfp4_soa_f16_env_enabled = ggml_sycl_moe_pp_onednn_f16_enabled();
-        // llama.cpp-sr83 (C3, Option T): gate/up plan XMX_TILED by default;
-        // the batched lambda now repacks that layout too
-        // (repack_mxfp4_xmx_tiled_to_woq), so it must be admitted as a
-        // candidate the same as SOA, for gate and up only: the executor takes
-        // XMX_TILED for those roles alone, so down's tiled layout (planned
-        // under GGML_SYCL_MOE_DOWN_XMX_TILED) is not admitted here --
-        // ggml_sycl_moe_pp_onednn_batched_claims_tensor
-        // enforces the same GATE/UP-only restriction independently. Also
-        // gated on ggml_sycl_moe_pp_woq_enabled() (fix cycle, defect 1):
-        // the f16 arm has no tiled-aware dequant, and this candidate check
-        // must stay consistent with the claims predicate the other three
-        // call sites use, or this lambda could be entered for an op the
-        // outer dispatch did not actually steer here for.
-        const bool pp_mxfp4_soa_or_tiled_route =
-            route_layout == GGML_LAYOUT_SOA ||
-            (route_layout == GGML_LAYOUT_XMX_TILED && (pp_role == MOE_TENSOR_GATE || pp_role == MOE_TENSOR_UP) &&
-             ggml_sycl_moe_pp_woq_enabled());
-        const bool pp_mxfp4_soa_f16_candidate = pp_mxfp4_soa_f16_env_enabled && src0->type == GGML_TYPE_MXFP4 &&
-                                                pp_mxfp4_soa_or_tiled_route && src1->type == GGML_TYPE_F32 &&
+        // Two candidates, one per oneDNN prompt executor, and neither reads the other.
+        // pp_mxfp4_soa_f16_candidate readies the per-expert loop's MXFP4 f16 staging: it claims the planned oneDNN
+        // scratch slot and allocates the f16 weight and activation staging for the f16 arm. That arm's only dequant
+        // reads SOA bytes, so it takes only an expert whose bytes are SOA, and the staging is readied only for an op
+        // routed SOA: an op routed in any other layout (gate and up planned XMX_TILED included) would claim and
+        // allocate staging no expert of it can use.
+        const bool pp_mxfp4_soa_f16_candidate   = pp_mxfp4_soa_f16_env_enabled && src0->type == GGML_TYPE_MXFP4 &&
+                                                route_layout == GGML_LAYOUT_SOA && src1->type == GGML_TYPE_F32 &&
                                                 dst->type == GGML_TYPE_F32;
-        // llama.cpp-348c: the batched executor's own candidate gate asks the claim predicate's table, on the layout
-        // this tensor is routed in, for every expert type; pp_mxfp4_soa_f16_candidate above stays the MXFP4 staging
-        // fallback's. XMX_TILED stays gate/up only: the executor takes it for gate and up alone, though down plans it
-        // under GGML_SYCL_MOE_DOWN_XMX_TILED. GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the executor off through the same
-        // table, and the executor reports it as route-off before it asks this.
+        // pp_batched_candidate gates the batched executor. It asks the claim predicate's table, on the layout this
+        // tensor is routed in, for every expert type. The executor repacks XMX_TILED itself, so it takes that layout,
+        // for gate and up alone, though down plans it under GGML_SYCL_MOE_DOWN_XMX_TILED.
+        // GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the executor off through the same table, and the executor reports it as
+        // route-off before it asks this.
         const bool pp_batched_candidate =
             ggml_sycl_moe_pp_batched_takes_layout(src0->type, route_layout) &&
             (route_layout != GGML_LAYOUT_XMX_TILED || pp_role == MOE_TENSOR_GATE || pp_role == MOE_TENSOR_UP) &&
@@ -95295,12 +95302,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             return;
         }
 
-        // A staged ring slot (STAGED_RING, llama.cpp-o9uw) holds the layout its stage-table entry records, and the
-        // per-expert path below multiplies every expert at the tensor's route_layout from route.ptr. The batched
-        // executor above never meets one as a route (the staged route refuses an entry the executor consumes, and
-        // serves the others only to a layer the executor does not claim). A staged batch is
-        // refused here, before the scratch setup below claims the oneDNN scratch slot, allocates the staging, or can
-        // abort on a failed allocation, so it reaches its fallback instead.
+        // A staged ring slot (STAGED_RING) is reused once the submit queue has passed its reader, and that order
+        // covers only a plain SYCL kernel on that queue, not a library's internals. The per-expert path below
+        // multiplies through ggml_sycl_mul_mat, which reaches oneDNN for a q8_0 group above the 8-row mat-vec limit
+        // and for an mxfp4 group of 2 rows or more, and its mxfp4 f16 arm is oneDNN as well. The batched executor
+        // above never meets a slot as a route (the staged route refuses an entry the executor consumes, and serves
+        // the others only to a layer the executor does not claim). A staged batch is refused here, before the
+        // scratch setup below claims the oneDNN scratch slot, allocates the staging, or can abort on a failed
+        // allocation, so it reaches its fallback instead.
         if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt_batch_result.batch)) {
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt per-expert path refused a staged ring slot");
         }
@@ -95707,6 +95716,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             const void *          expert_ptr = nullptr;
             ggml_sycl::mem_handle expert_gpu_lease{};
+            // The layout of the bytes expert_gpu_lease holds. The slice storage installed from that lease and the
+            // layout forced on the matmul below both read this one variable, so the kernel is chosen for the
+            // layout the operand is in. Only a local expert reaches those consumers (any other route continues or
+            // throws before them, as does an expert left without a pointer), and it takes the layout from its route,
+            // whose lease the resolver checked to resolve at that layout; the initial value is never read.
+            layout_mode           expert_layout = route_layout;
 
             if (ne12 != 1) {
                 const auto       route_resolve_start = moe_profile_state::hrc::now();
@@ -95744,6 +95759,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                     expert_ptr       = route.ptr;
                     expert_gpu_lease = std::move(route.lease);
+                    expert_layout    = route.actual_layout;
                     pp_route_dev0++;
                     if (pp_oor_trace) {
                         fprintf(stderr,
@@ -96122,7 +96138,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return true;
             };
 
-            const bool expert_use_mxfp4_soa_f16 = !pp_cpu_reference && pp_mxfp4_soa_f16_ready && num_src1_rows >= 1;
+            // The f16 arm's only dequant (dequantize_row_mxfp4_soa_to_fp16_rowmajor) reads SOA bytes whatever the op's
+            // route is, so the arm takes only an expert whose bytes are SOA. An expert in any other layout takes the
+            // F32 route, which dispatches at expert_layout.
+            const bool expert_use_mxfp4_soa_f16 =
+                !pp_cpu_reference && pp_mxfp4_soa_f16_ready && num_src1_rows >= 1 && expert_layout == GGML_LAYOUT_SOA;
 
             bool f16_activation_staged = false;
             if (expert_use_mxfp4_soa_f16) {
@@ -96199,7 +96219,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     dst_row.nb[3]             = batch * nb1;
                     dst_row.data              = dst_contiguous_expert + dst_offset;
                     const auto dispatch_start = moe_profile_state::hrc::now();
-                    ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &route_layout);
+                    ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &expert_layout);
                     if (pp_local_trace) {
                         pp_local_accum.f32_dispatch_us +=
                             moe_profile_state::us(dispatch_start, moe_profile_state::hrc::now());
@@ -96209,8 +96229,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             };
             append_pp_log_entries(pp_local_entries_for_log, row_begin, row_end, static_cast<int32_t>(i02), expert_ptr,
-                                  ctx.device, route_layout, &expert_gpu_lease);
-            install_expert_slice_storage(const_cast<void *>(expert_ptr), static_cast<int>(i02), route_layout,
+                                  ctx.device, expert_layout, &expert_gpu_lease);
+            install_expert_slice_storage(const_cast<void *>(expert_ptr), static_cast<int>(i02), expert_layout,
                                          &expert_gpu_lease);
             if (expert_gpu_lease.resolve(ctx.device).ptr != nullptr) {
                 pp_gpu_leases.push_back(std::move(expert_gpu_lease));
