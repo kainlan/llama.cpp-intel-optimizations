@@ -9,11 +9,12 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/unified-cache.hpp"
+#include "test-skip.h"
 
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

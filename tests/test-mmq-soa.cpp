@@ -11,6 +11,7 @@
 
 #include "ggml.h"
 #include "ggml-sycl.h"
+#include "test-skip.h"
 
 #ifdef GGML_USE_SYCL
 
@@ -667,6 +668,6 @@ int main() {
     return failed > 0 ? 1 : 0;
 #else
     printf("SYCL not enabled, skipping tests\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 #endif
 }

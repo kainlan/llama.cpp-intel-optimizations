@@ -5,6 +5,7 @@
 #include "ggml-sycl/fattn-xmx-f16-v2.hpp"
 #include "ggml-sycl/fattn-xmx-f16.hpp"
 #include "ggml-sycl/fattn.hpp"
+#include "test-skip.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,7 +22,7 @@
 #if !defined(GGML_USE_SYCL)
 int main() {
     std::printf("GGML SYCL not enabled; skipping bench.\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
