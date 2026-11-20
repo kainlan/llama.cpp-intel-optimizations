@@ -122480,9 +122480,10 @@ normal_dispatch:
         GGML_SYCL_DEBUG("[SYCL-GRAPH] MoE detected — enabling selective graph re-record\n");
     }
 
-    // The PP->TG refresh: process-wide work once per prompt (refresh_moe_after_pp, on the first decode split), and
-    // per-split work on each split's own first decode occurrence after a prompt (post_prompt_refresh_due), so every
-    // split's tensors get it once and none gets it per token.
+    // The PP->TG refresh. Its work is per split: on each split's own first decode occurrence after a prompt
+    // (post_prompt_refresh_due) the split materializes its down-I8 hot set, so every split's tensors get it once and
+    // none gets it per token. refresh_moe_after_pp (the first decode split after a prompt) does no work here; it only
+    // lets that split into the block, so the GGML_SYCL_HOSTMEM before/after host-memory log brackets it too.
     const bool post_prompt_refresh_due =
         cached_is_decode && ggml_sycl_moe_post_prompt_claim(cgraph, sycl_ctx->device, /*refresh=*/true);
     if (refresh_moe_after_pp || post_prompt_refresh_due) {
