@@ -1955,6 +1955,18 @@ struct pp_moe_onednn_scratch_claim {
         owners = std::move(slot_owners);
     }
 
+    // Moves the slot's owners out of the copy the cache's claim filled in, so the claim alone holds them: they go
+    // before the slot's release when the claim is released unused, and with its done event when it is recorded.
+    void take_owners(ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot & reserved) {
+        owners.reserve(owners.size() + 3);
+        for (ggml_sycl::mem_handle * owner :
+             { &reserved.weight_owner, &reserved.activation_owner, &reserved.output_owner }) {
+            if (owner->valid()) {
+                owners.push_back(std::move(*owner));
+            }
+        }
+    }
+
     void record(sycl::event done) {
         if (!active) {
             return;
@@ -1968,11 +1980,13 @@ struct pp_moe_onednn_scratch_claim {
         if (!active) {
             return;
         }
+        // The owners go first. Each keeps its allocation, and the arena under it, alive, and once the cache counts the
+        // slot free nothing holds the ring: the last release of the device's models releases it and empties the arena.
+        owners.clear();
         if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
             cache->release_pp_moe_onednn_scratch_slot(slot, generation);
         }
         pp_moe_onednn_release_scratch_slot(device, ring_depth, slot, generation);
-        owners.clear();
         active = false;
     }
 
@@ -94263,6 +94277,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return reject_batched(moe_pp_batched_refusal::SCRATCH_SLOT, "cache-slot");
             }
             batched_scratch_claim.activate(ctx.device, ring_depth, scratch_slot, reserved.generation, ctx.stream());
+            batched_scratch_claim.take_owners(reserved);
             if (reserved.weight_size < weight_bytes || reserved.activation_size < act_bytes ||
                 reserved.output_size < out_bytes) {
                 batched_scratch_claim.release_unused();
@@ -95240,8 +95255,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         char *                                  src1_contiguous_f16_ptr = nullptr;
         char *                                  dst_contiguous_ptr      = nullptr;
         sycl::half *                            pp_mxfp4_src0_f16_ptr   = nullptr;
-        ggml_sycl::pp_moe_onednn_scratch_result pp_moe_onednn_scratch;
+        // The claim is declared first, so on any exit the result's owners are dropped before the claim releases its
+        // slot: once the slot is free, a last release may empty the arena those owners would still hold.
         pp_moe_onednn_scratch_claim             pp_moe_onednn_scratch_claim_state;
+        ggml_sycl::pp_moe_onednn_scratch_result pp_moe_onednn_scratch;
 
         auto ensure_src1_contiguous_f32 = [&]() -> bool {
             if (src1_contiguous_f32.get()) {
@@ -95345,9 +95362,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     pp_moe_onednn_scratch.weight_size      = reserved.weight_size;
                     pp_moe_onednn_scratch.activation_size  = reserved.activation_size;
                     pp_moe_onednn_scratch.output_size      = reserved.output_size;
-                    pp_moe_onednn_scratch.weight_owner     = reserved.weight_owner;
-                    pp_moe_onednn_scratch.activation_owner = reserved.activation_owner;
-                    pp_moe_onednn_scratch.output_owner     = reserved.output_owner;
+                    pp_moe_onednn_scratch.weight_owner     = std::move(reserved.weight_owner);
+                    pp_moe_onednn_scratch.activation_owner = std::move(reserved.activation_owner);
+                    pp_moe_onednn_scratch.output_owner     = std::move(reserved.output_owner);
                     pp_moe_onednn_scratch.ok               = true;
                 } else {
                     pp_moe_onednn_scratch_claim_state.release_unused();
@@ -95361,7 +95378,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 dst_contiguous_ptr      = static_cast<char *>(pp_moe_onednn_scratch.output);
                 pp_moe_onednn_scratch_claim_state.mark_used();
             } else {
-                pp_moe_onednn_scratch.ok = false;
+                // Not ok, and its owners go before the claim's release, as the claim's own do.
+                pp_moe_onednn_scratch = {};
                 pp_moe_onednn_scratch_claim_state.release_unused();
             }
             try {

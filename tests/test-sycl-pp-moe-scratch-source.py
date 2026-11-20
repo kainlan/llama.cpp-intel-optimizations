@@ -77,16 +77,32 @@ def exact_generation_guard_dominates_refcount_mutation(cache_release):
     return bool(mutations) and all(guard.end() < mutation.start() for mutation in mutations)
 
 
+OWNERS_TAKEN = re.compile(r"batched_scratch_claim\.take_owners\(reserved\);")
+LEGACY_CLAIM_DECL = re.compile(r"pp_moe_onednn_scratch_claim\s+pp_moe_onednn_scratch_claim_state;")
+LEGACY_RESULT_DECL = re.compile(r"ggml_sycl::pp_moe_onednn_scratch_result\s+pp_moe_onednn_scratch;")
+LEGACY_OWNER_MOVE = re.compile(r"pp_moe_onednn_scratch\.(\w+_owner)\s*=\s*std::move\(reserved\.\1\);")
+LEGACY_OWNER_COPY = re.compile(r"pp_moe_onednn_scratch\.\w+_owner\s*=\s*reserved\.\w+_owner;")
+LEGACY_REFUSED_RELEASE = re.compile(r"pp_moe_onednn_scratch = \{\};\s*"
+                                    r"pp_moe_onednn_scratch_claim_state\.release_unused\(\);")
+
+
 def evaluate(header, cache, backend):
     claim = function_body(backend, "static bool pp_moe_onednn_claim_scratch_slot(")
     drain = function_body(backend, "static void pp_moe_onednn_drain_scratch_slots(")
     record = function_body(backend, "static void pp_moe_onednn_record_scratch_slot_event(")
     cache_release = function_body(cache, "void unified_cache::release_pp_moe_onednn_scratch_slot(")
+    release_unused = function_body(backend, "void release_unused() {")
+    take_owners = function_body(backend, "void take_owners(")
+    activation = backend.find("batched_scratch_claim.activate(")
+    batched_from_activation = backend[activation:] if activation >= 0 else ""
     anchors = {
         "runtime claim": claim,
         "runtime drain": drain,
         "runtime record": record,
         "cache exact release": cache_release,
+        "unused claim release": release_unused,
+        "claim takes owners": take_owners,
+        "batched claim activation": batched_from_activation,
     }
     checks = {
         "slot struct carries generation/refcount":
@@ -132,6 +148,23 @@ def evaluate(header, cache, backend):
         "slot owners remain retained to the done event":
             "bind_owners(std::move(pp_moe_slot_owners))" in backend
             and "state.retained_owners[slot]  = std::move(owners)" in record,
+        # A copy of a slot's owner keeps its allocation, and the arena under it, alive. Once the cache counts the slot
+        # free, a last release may release the ring and empty the arena, so no copy may outlive the slot's claim.
+        "an unused claim drops its owners before the cache slot release":
+            precedes(release_unused, "owners.clear();", "release_pp_moe_onednn_scratch_slot(slot, generation)")
+            and release_unused.count("owners.clear();") == 1,
+        "the batched claim holds the slot's owners from its activation":
+            OWNERS_TAKEN.search(batched_from_activation) is not None
+            and OWNERS_TAKEN.search(batched_from_activation).start()
+            < batched_from_activation.find("batched_scratch_claim.release_unused();")
+            and re.search(r"owners\.push_back\(std::move\(\*owner\)\);", take_owners) is not None,
+        "the legacy claim is declared before the scratch result it outlives":
+            LEGACY_CLAIM_DECL.search(backend) is not None and LEGACY_RESULT_DECL.search(backend) is not None
+            and LEGACY_CLAIM_DECL.search(backend).start() < LEGACY_RESULT_DECL.search(backend).start(),
+        "the legacy result moves the slot's owners out of the cache's claim copy":
+            len(LEGACY_OWNER_MOVE.findall(backend)) == 3 and LEGACY_OWNER_COPY.search(backend) is None,
+        "a refused legacy result drops its owners before the claim's release":
+            LEGACY_REFUSED_RELEASE.search(backend) is not None,
         "legacy arena generation bump helper is absent":
             all("arena_generation_bump" not in source for source in (header, cache, backend)),
     }
@@ -155,6 +188,15 @@ MUTANTS = {
          "auto & candidate = slots[i];\n                candidate.refcount--;"),
     "retired owners are destroyed before pointer metadata is cleared":
         ("cache", "retired.weight_owner     = {};", ""),
+    "an unused claim drops its owners before the cache slot release":
+        ("backend", "        owners.clear();\n        if (ggml_sycl::unified_cache * cache",
+         "        if (ggml_sycl::unified_cache * cache"),
+    "the batched claim holds the slot's owners from its activation":
+        ("backend", "batched_scratch_claim.take_owners(reserved);", ""),
+    "the legacy result moves the slot's owners out of the cache's claim copy":
+        ("backend", "= std::move(reserved.activation_owner);", "= reserved.activation_owner;"),
+    "a refused legacy result drops its owners before the claim's release":
+        ("backend", "pp_moe_onednn_scratch = {};", ""),
     "legacy arena generation bump helper is absent":
         ("cache", "void unified_cache::release_pp_moe_onednn_scratch_slot(uint32_t slot, uint64_t generation) {",
          "void unified_cache::release_pp_moe_onednn_scratch_slot(uint32_t slot, uint64_t generation) {\n    arena_generation_bump();"),
