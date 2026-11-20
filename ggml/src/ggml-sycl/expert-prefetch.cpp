@@ -15,6 +15,7 @@
 #include "unified-cache.hpp"  // ggml_sycl_is_shutting_down()
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <numeric>
 #include <utility>
@@ -81,6 +82,7 @@ void ExpertPrefetcher::shutdown() {
             auto & stats = get_moe_dispatch_stats(d);
             if (stats.total_experts_dispatched.load(std::memory_order_relaxed) > 0) {
                 stats.print_summary("FINAL");
+                moe_route_counts_report_final(d, stats.total_tokens.load(std::memory_order_relaxed));
             }
         }
     }
@@ -1270,6 +1272,70 @@ MoeDispatchStats & get_moe_dispatch_stats(int device) {
     // Previously tunable via GGML_SYCL_MOE_STATS_INTERVAL; now hardcoded.
 
     return stats[device];
+}
+
+// ============================================================================
+// MoE routed-expert counts: the table's owner and its final report
+// ============================================================================
+
+namespace {
+
+struct moe_route_counts_slot {
+    std::mutex                        mutex;
+    std::shared_ptr<moe_route_counts> table;
+};
+
+// Never destroyed: the final report can run from an atexit path after this translation unit's statics are gone,
+// and a destroyed mutex there would be a use after destruction. The slots hold one small host table each.
+moe_route_counts_slot & moe_route_counts_slot_of(int device) {
+    static moe_route_counts_slot * const slots = new moe_route_counts_slot[GGML_SYCL_MAX_DEVICES];
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        device = 0;
+    }
+    return slots[device];
+}
+
+}  // namespace
+
+std::shared_ptr<moe_route_counts> moe_route_counts_install(int device, int n_blocks, int n_experts) {
+    auto                        fresh = std::make_shared<moe_route_counts>(n_blocks, n_experts);
+    moe_route_counts_slot &     slot  = moe_route_counts_slot_of(device);
+    std::lock_guard<std::mutex> lock(slot.mutex);
+    // The replaced table is released here only if nothing else holds it; a record or a job that counts into it
+    // keeps it alive until its last use, so a worker never writes into freed storage.
+    slot.table = fresh;
+    return fresh;
+}
+
+std::shared_ptr<moe_route_counts> moe_route_counts_current(int device) {
+    moe_route_counts_slot &     slot = moe_route_counts_slot_of(device);
+    std::lock_guard<std::mutex> lock(slot.mutex);
+    return slot.table;
+}
+
+void moe_route_counts_report_final(int device, int64_t tokens) {
+    const std::shared_ptr<moe_route_counts> table = moe_route_counts_current(device);
+    if (!table || moe_route_decode_pairs(*table) == 0 || !table->claim_report()) {
+        return;
+    }
+    GGML_LOG_WARN("%s\n", moe_route_summary_line(*table, tokens).c_str());
+
+    const char * path = std::getenv("GGML_SYCL_MOE_ROUTE_COUNTS_CSV");
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+    GGML_LOG_WARN("%s", moe_route_block_table(*table).c_str());
+    const std::string csv = moe_route_csv(*table);
+    FILE *            f   = std::fopen(path, "wb");
+    if (f == nullptr || std::fwrite(csv.data(), 1, csv.size(), f) != csv.size()) {
+        GGML_LOG_WARN("[MOE-ROUTE-COUNTS] could not write %s\n", path);
+    } else {
+        GGML_LOG_WARN("[MOE-ROUTE-COUNTS] wrote %d blocks x %d experts to %s\n", table->n_blocks(), table->n_experts(),
+                      path);
+    }
+    if (f != nullptr) {
+        std::fclose(f);
+    }
 }
 
 }  // namespace ggml_sycl

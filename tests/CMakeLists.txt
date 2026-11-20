@@ -997,6 +997,14 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-host-island-source.py --self-test)
     set_tests_properties(test-sycl-moe-host-island-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+    # Where the routed-expert counts are taken: the decode count in the hybrid route's pool-worker lambda on the gate
+    # op only, keyed by block number, before the ids are overwritten with flags; the prompt count from the ids
+    # snapshot; the WARN summary and the CSV guard; the table's size and lifetime. Run WITH --self-test so each
+    # mutant is caught by the pin it names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-route-counts-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-route-counts-source.py --self-test)
+    set_tests_properties(test-sycl-moe-route-counts-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # llama.cpp-36j0 Task 4: the MoE executor knobs' literals, log formats, env-report rows and teardown summary.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-exec-knobs-source

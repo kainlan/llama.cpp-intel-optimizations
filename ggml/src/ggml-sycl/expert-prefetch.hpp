@@ -25,6 +25,7 @@
 #include "ggml-sycl.h"
 #include "ggml.h"
 #include "mem-handle.hpp"
+#include "moe-route-counts.hpp"
 #include "unified-cache.hpp"
 
 #include <atomic>
@@ -494,6 +495,19 @@ struct MoeDispatchStats {
 
 // Global stats instance (one per device, indexed by device id)
 MoeDispatchStats & get_moe_dispatch_stats(int device);
+
+// The routed-expert counts of `device`'s current model (moe-route-counts.hpp): plain host heap, no SYCL allocation.
+// Each model's hybrid init installs a fresh table sized from its own blocks and experts, so the counts of two loads
+// in one process never mix. The returned table stays alive as long as any holder keeps the pointer: a record that
+// counts into it, a job still running on the CPU pool, the final report. Nothing resizes or frees a table in place.
+std::shared_ptr<moe_route_counts> moe_route_counts_install(int device, int n_blocks, int n_experts);
+
+// The table the last install made, or null before the first one.
+std::shared_ptr<moe_route_counts> moe_route_counts_current(int device);
+
+// The final report of `device`'s table, once: one WARN line, and with GGML_SYCL_MOE_ROUTE_COUNTS_CSV=<path> the
+// per-block table and the CSV file too. Prints nothing when no decode pair was counted.
+void moe_route_counts_report_final(int device, int64_t tokens);
 
 // Check if expert prediction is enabled via environment variable.
 // Default: ON (returns true unless GGML_SYCL_EXPERT_PREDICT=0).
