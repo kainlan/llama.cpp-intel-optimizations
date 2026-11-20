@@ -1995,6 +1995,7 @@ struct planned_terms_found {
     nonfa_attn_scratch_planned_shape   nonfa;
     moe_control_requirement            control;
     size_t                             scatter;
+    size_t                             moe_mmvq;
 
     explicit planned_terms_found(int d) :
         device(d),
@@ -2012,7 +2013,8 @@ struct planned_terms_found {
         graph(unified_cache_get_planned_onednn_graph_scratch_shape(d)),
         nonfa(unified_cache_get_planned_nonfa_attn_scratch_shape(d)),
         control(unified_cache_get_planned_moe_control_requirement(d)),
-        scatter(unified_cache_get_planned_moe_host_scatter_scratch_bytes(d)) {}
+        scatter(unified_cache_get_planned_moe_host_scatter_scratch_bytes(d)),
+        moe_mmvq(unified_cache_get_planned_moe_mmvq_scratch_bytes(d)) {}
 
     ~planned_terms_found() {
         unified_cache_set_planned_pp_moe_onednn_scratch(device, ring_weight, ring_act, ring_out, ring_depth);
@@ -2024,6 +2026,7 @@ struct planned_terms_found {
         unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
         unified_cache_set_planned_moe_control_requirement(device, control);
         unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);
+        unified_cache_set_planned_moe_mmvq_scratch_bytes(device, moe_mmvq);
     }
 };
 
@@ -2035,12 +2038,14 @@ struct planned_terms_found {
 // run's 92160 bytes and publishes its own oneDNN Graph and non-FA shapes, and the micro-batch's publish grows the ring
 // to n_ubatch 2048. The fallback publishes the ring at 512 again. Before the restore the requirement is R0 + 92160,
 // what the zone was asked for when the run aborted, which shows the case reaches the term. After the restore it is
-// exactly R0, and every planner term reads what the load published, the host scatter term its 4096 bytes. A second
-// leg moves the CONTROL requirement, the other planner term the RUNTIME requirement counts, and restores it the same
-// way.
-// Engagement: the ring's slots grow from 512 to 2048 rows, and the requirement moves by exactly the term moved.
+// exactly R0, and every planner term reads what the load published, the host scatter term its 4096 bytes and the MoE
+// batched MMVQ bound the vehicle's 40-layer figure at 512 rows (the plan with the room published it at 2048 rows). A
+// second leg moves the CONTROL requirement, the other planner term the RUNTIME requirement counts, and restores it the
+// same way.
+// Engagement: the ring's slots grow from 512 to 2048 rows, the requirement moves by exactly the term moved, and the
+// MMVQ bound reads the discarded plan's figure before the restore.
 // Mutants: a term left out of the snapshot or the restore (its leg reads the discarded plan's value); a restore that
-// writes a constant, zero included (the load's nonzero shapes, host scatter and CONTROL bytes do not read back).
+// writes a constant, zero included (the load's nonzero shapes, host scatter, MMVQ and CONTROL bytes do not read back).
 // No device work: the terms are per-device process state. The case leaves every term it writes as it found it.
 static bool planner_terms_restore_returns_the_runtime_requirement() {
     TEST_BEGIN("planner_terms_restore_returns_the_runtime_requirement");
@@ -2048,6 +2053,9 @@ static bool planner_terms_restore_returns_the_runtime_requirement() {
     constexpr size_t    mib          = 1024ull * 1024ull;
     constexpr size_t    scatter_term = 92160;
     constexpr size_t    load_scatter = 4096;
+    // The vehicle's MoE batched MMVQ bound over 40 layers at 512 and at 2048 rows (test-zone-sizing Case 46).
+    constexpr size_t    load_mmvq    = 190709760;
+    constexpr size_t    wide_mmvq    = 762839040;
     planned_terms_found found(device);
 
     // The load: a ring of one 64 MiB weight slot whose activation and output slots follow the micro-batch, all of it in
@@ -2069,6 +2077,7 @@ static bool planner_terms_restore_returns_the_runtime_requirement() {
     unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
     unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ mib, true });
     unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, load_scatter);
+    unified_cache_set_planned_moe_mmvq_scratch_bytes(device, load_mmvq);
     size_t r0 = 0;
     TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &r0),
                 "the load's requirement is unanswerable");
@@ -2077,6 +2086,7 @@ static bool planner_terms_restore_returns_the_runtime_requirement() {
 
     // The plan with the room, and the micro-batch's publish.
     unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, load_scatter + scatter_term);
+    unified_cache_set_planned_moe_mmvq_scratch_bytes(device, wide_mmvq);
     unified_cache_set_planned_onednn_graph_scratch_shape(device, 32, 0, 0, 2048, 4096);
     unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 2048, 4096);
     unified_cache_set_planned_pp_moe_onednn_scratch(device, 64 * mib, act_2048, out_2048, 1);
@@ -2092,6 +2102,8 @@ static bool planner_terms_restore_returns_the_runtime_requirement() {
     TEST_ASSERT(
         unified_cache_get_planned_runtime_zone_requirement(device, &unrestored) && unrestored == r0 + scatter_term,
         "before the restore the requirement is not R0 + 92160, so the case does not reach the term");
+    TEST_ASSERT(unified_cache_get_planned_moe_mmvq_scratch_bytes(device) == wide_mmvq,
+                "before the restore the MMVQ bound is not the discarded plan's, so the case does not reach the term");
 
     before.restore(device);
     size_t restored = 0;
@@ -2099,6 +2111,8 @@ static bool planner_terms_restore_returns_the_runtime_requirement() {
                 "after the restore the requirement is not the load's R0");
     TEST_ASSERT(unified_cache_get_planned_moe_host_scatter_scratch_bytes(device) == load_scatter,
                 "the restore did not put back the load's 4096-byte host scatter term");
+    TEST_ASSERT(unified_cache_get_planned_moe_mmvq_scratch_bytes(device) == load_mmvq,
+                "the restore left the discarded plan's MoE batched MMVQ bound published");
     const onednn_graph_scratch_planned_shape graph = unified_cache_get_planned_onednn_graph_scratch_shape(device);
     TEST_ASSERT(graph.n_head_ctx_max == 32 && graph.n_head_swa_max == 0 && graph.n_swa == 0 && graph.n_ubatch == 512 &&
                     graph.n_ctx == 4096,
@@ -2143,24 +2157,31 @@ struct pipeline_and_pair_found {
 // sum outside the lock. The case drives load_published_record as the backend does: one record per load from the terms
 // as the load's first stage found them, and a note per planner pass from the terms before and after it.
 // The live model: pipeline 1 MiB, ring micro-batch 512 with no KV-zone slot, no host scatter, CONTROL 1 MiB, non-FA
-// 32 heads x 512 x 4096, the pair 4 + 2 MiB with the sum its reserve raised to 8 MiB.
-// Leg 1. Pass 1 of the load publishes all of those anew (the pair 16 + 8 MiB, so the sum 24 MiB). Between the passes a
-// live context re-plans its ring (micro-batch 1024, its activation slot in the KV zone) and the reserve raises the sum
-// to 30 MiB. Pass 2 publishes the ring and the pair again. After it a live context publishes its non-FA shape. The
-// restore puts the pipeline, the scatter, CONTROL and the pair's halves back to the live model's; the ring to the
-// context's re-plan and the sum to the reserve's raise, both of which the load wrote over; and it keeps the non-FA
-// shape the context published after the load.
-// Leg 2. A load whose one pass publishes the pair, after which the reserve raises the sum to 40 MiB: the restore keeps
-// the raise and puts the halves back.
+// 32 heads x 512 x 4096, the pair 4 + 2 MiB with the sum its reserve raised to 8 MiB, the MoE batched MMVQ bound at its
+// 512-row figure.
+// Leg 1. Pass 1 of the load publishes all of those anew (the pair 16 + 8 MiB, so the sum 24 MiB; the MMVQ bound at
+// 2048 rows). Between the passes a live context re-plans its ring (micro-batch 1024, its activation slot in the KV
+// zone) and the reserve raises the sum to 30 MiB. Pass 2 publishes the ring and the pair again. After it a live context
+// publishes its non-FA shape and raises the MMVQ bound to 1 GiB. The restore puts the pipeline, the scatter, CONTROL
+// and the pair's halves back to the live model's; the ring to the context's re-plan and the sum to the reserve's
+// raise, both of which the load wrote over; and it keeps the non-FA shape and the MMVQ bound the context published
+// after the load.
+// Leg 2. A load whose one pass publishes the pair and the MMVQ bound, after which the reserve raises the sum to 40 MiB:
+// the restore keeps the raise and puts the halves and the live model's MMVQ bound back.
 // Engagement: before each restore every term reads what the load or the later publisher wrote.
 // Mutants: a restore of every term to what the load's first stage found (the non-FA shape reads 32 x 512, the ring 512,
-// the sum 8 MiB); a restore of every group the load changed (the non-FA shape reads 32 x 512); a note that ignores
-// another publisher (the ring reads 512, the sum of leg 1 8 MiB); a sum stored plainly (leg 2 reads 8 MiB).
+// the sum 8 MiB, the MMVQ bound its 512-row figure); a restore of every group the load changed (the non-FA shape reads
+// 32 x 512, the MMVQ bound its 512-row figure); a note that ignores another publisher (the ring reads 512, the sum of
+// leg 1 8 MiB); a sum stored plainly (leg 2 reads 8 MiB); the MMVQ group left out of the restore (leg 2 reads the
+// load's 2048-row figure).
 // No device work: the terms are per-device process state. The case leaves every term it writes as it found it.
 static bool load_record_keeps_a_later_publish() {
     TEST_BEGIN("load_record_keeps_a_later_publish");
-    constexpr int           device = 0;
-    constexpr size_t        mib    = 1024ull * 1024ull;
+    constexpr int           device    = 0;
+    constexpr size_t        mib       = 1024ull * 1024ull;
+    // The vehicle's MoE batched MMVQ bound over 40 layers at 512 and at 2048 rows (test-zone-sizing Case 46).
+    constexpr size_t        live_mmvq = 190709760;
+    constexpr size_t        load_mmvq = 762839040;
     planned_terms_found     found(device);
     pipeline_and_pair_found found_pair(device);
 
@@ -2173,6 +2194,7 @@ static bool load_record_keeps_a_later_publish() {
         unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
         unified_cache_set_planned_onednn_scratchpad_pair(device, 4 * mib, 2 * mib);
         unified_cache_set_planned_onednn_scratchpad_bytes(device, 8 * mib);
+        unified_cache_set_planned_moe_mmvq_scratch_bytes(device, live_mmvq);
     };
     const auto load_pass = [&]() {
         unified_cache_set_planned_pp_pipeline_scratch_bytes(device, 3 * mib);
@@ -2182,6 +2204,7 @@ static bool load_record_keeps_a_later_publish() {
         unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ 2 * mib, true });
         unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 2048, 4096);
         unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
+        unified_cache_set_planned_moe_mmvq_scratch_bytes(device, load_mmvq);
     };
 
     // Leg 1.
@@ -2199,6 +2222,8 @@ static bool load_record_keeps_a_later_publish() {
     unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
     record.note(before, load_published_terms::snapshot(device));
     unified_cache_set_planned_nonfa_attn_scratch_shape(device, 64, 1024, 8192);
+    TEST_ASSERT(unified_cache_raise_planned_moe_mmvq_scratch_bytes(device, 1024 * mib) == 1024 * mib,
+                "a live context's raise of the MMVQ bound does not answer the raised figure");
 
     TEST_ASSERT(unified_cache_get_planned_pp_pipeline_scratch_bytes(device) == 3 * mib &&
                     unified_cache_get_planned_pp_moe_onednn_n_ubatch(device) == 2048 &&
@@ -2219,19 +2244,25 @@ static bool load_record_keeps_a_later_publish() {
     TEST_ASSERT(
         back.planner.nonfa.n_head == 64 && back.planner.nonfa.n_ubatch == 1024 && back.planner.nonfa.n_ctx == 8192,
         "the restore put back over the non-FA shape a live context published after the load");
+    TEST_ASSERT(back.planner.moe_mmvq == 1024 * mib,
+                "the restore put back over the MMVQ bound a live context raised after the load");
 
     // Leg 2.
     live();
     load_published_record raised(load_published_terms::snapshot(device));
     before = load_published_terms::snapshot(device);
     unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
+    unified_cache_set_planned_moe_mmvq_scratch_bytes(device, load_mmvq);
     raised.note(before, load_published_terms::snapshot(device));
     unified_cache_set_planned_onednn_scratchpad_bytes(device, 40 * mib);
+    TEST_ASSERT(unified_cache_get_planned_moe_mmvq_scratch_bytes(device) == load_mmvq,
+                "before the restore the MMVQ bound does not read what the load published");
     raised.restore(device);
     const load_published_terms kept = load_published_terms::snapshot(device);
     TEST_ASSERT(kept.onednn_stored == 40 * mib, "the restore put back over the reserve's raise of the sum");
     TEST_ASSERT(kept.onednn_weights == 4 * mib && kept.onednn_activations == 2 * mib,
                 "the restore left the failed load's oneDNN pair under a raised sum");
+    TEST_ASSERT(kept.planner.moe_mmvq == live_mmvq, "the restore left the failed load's MMVQ bound");
 
     TEST_PASS();
     return true;
