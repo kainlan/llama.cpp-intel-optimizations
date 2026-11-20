@@ -8138,7 +8138,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                 chunk_leases);
             // The total above cannot say who holds the arena: these lines name it, and fill the holders the refusal
             // below carries.
-            arena_report_holders(dev_id, live_zone_used, holders, "arena-rebuild");
+            arena_report_holders(dev_id, live_zone_used, holders, "arena-rebuild", GGML_LOG_LEVEL_ERROR);
             // The caller's refusal of its load names the figures the ERROR line above printed, and the holders the gate
             // refused on, which choose its remedy.
             if (refusal != nullptr) {
@@ -32554,7 +32554,8 @@ zone_arena_holders unified_cache::arena_read_holders(size_t * live_zone_used) {
 void unified_cache::arena_report_holders(int                  dev_id,
                                          const size_t *       live_zone_used,
                                          zone_arena_holders & holders,
-                                         const char *         site) {
+                                         const char *         site,
+                                         ggml_log_level       level) {
     // The first line prints each zone's live bytes from the reading the caller decided on, the queued frees those
     // zones still count, and the device's releases that could not complete and wait for a retry (a refused arena lease
     // is the usual cause), which tell a free that has not run yet from an owner that was never released. Retired
@@ -32603,13 +32604,17 @@ void unified_cache::arena_report_holders(int                  dev_id,
                  live_zone_used[z] / (1024.0 * 1024.0));
         zones_live += part;
     }
-    GGML_LOG_ERROR(
-        "[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "
-        "device_release_retries=%zu device_live_controls=%zu retired_pending=%zu evictions_in_flight=%d "
-        "cache_scratch_in_arena=%u (pp_moe_ring_slots=%u) cache_scratch_outside=%u live_beside_ring=%u\n",
-        dev_id, zones_live.c_str(), deferred_in_arena_count, deferred_in_arena_bytes / (1024.0 * 1024.0),
-        device_release_retries, device_live_controls, retired_pending, evictions_in_flight, holders.scratch_in_arena,
-        holders.ring_in_arena, holders.scratch_outside, holders.live_beside_ring);
+    // ggml_log_internal, not the GGML_LOG_* macros, so the caller's level is chosen at run time and the arguments are
+    // written once.
+    ggml_log_internal(level,
+                      "[VRAM-ARENA] live in the arena on device %d (MB): %s; "
+                      "deferred_in_arena=%zu (%.1f MB requested) "
+                      "device_release_retries=%zu device_live_controls=%zu retired_pending=%zu evictions_in_flight=%d "
+                      "cache_scratch_in_arena=%u (pp_moe_ring_slots=%u) cache_scratch_outside=%u live_beside_ring=%u\n",
+                      dev_id, zones_live.c_str(), deferred_in_arena_count, deferred_in_arena_bytes / (1024.0 * 1024.0),
+                      device_release_retries, device_live_controls, retired_pending, evictions_in_flight,
+                      holders.scratch_in_arena, holders.ring_in_arena, holders.scratch_outside,
+                      holders.live_beside_ring);
     // Who holds the chunk leases: each site that took one, apart from the copies of its handles. The counts are read
     // after the per-chunk total the caller read, so a lease taken or dropped in between can set the two sums one apart.
     // Then each zone with live bytes lists its live allocations, through this cache's own dump, which takes only the
@@ -32782,12 +32787,24 @@ unified_cache_last_release unified_cache::release_for_no_live_model(const char *
                     dev_id, site, holders.live_zone_bytes / (1024.0 * 1024.0), holders.chunk_leases);
                 return unified_cache_last_release::ARENA_HELD;
             }
+            if (cause == unified_cache_release_cause::LOAD_START) {
+                // A start between the failed load's abort and the free of its model finds that model's buffers here;
+                // a start after the free finds a leak. This cannot tell the two apart, so it is a WARN that names the
+                // holders, and the mark stays: only a release that empties the cache clears it.
+                GGML_LOG_WARN(
+                    "[VRAM-ARENA] last release on device %d (%s): a load is starting on an arena a failed load left "
+                    "held (live_zone=%.1f MB chunk_leases=%u); it runs on the arena as it is, and a holder still "
+                    "present after that failed model was freed is a leak\n",
+                    dev_id, site, holders.live_zone_bytes / (1024.0 * 1024.0), holders.chunk_leases);
+                arena_report_holders(dev_id, live_zone_used, holders, site, GGML_LOG_LEVEL_WARN);
+                return unified_cache_last_release::ARENA_HELD;
+            }
             GGML_LOG_ERROR(
                 "[VRAM-ARENA] last release on device %d (%s): no model is live but the arena is held: live_zone=%.1f "
                 "MB chunk_leases=%u cache_scratch_in_arena=%u; it stays\n",
                 dev_id, site, holders.live_zone_bytes / (1024.0 * 1024.0), holders.chunk_leases,
                 holders.scratch_in_arena);
-            arena_report_holders(dev_id, live_zone_used, holders, "last-release");
+            arena_report_holders(dev_id, live_zone_used, holders, "last-release", GGML_LOG_LEVEL_ERROR);
             return unified_cache_last_release::ARENA_HELD;
         }
 

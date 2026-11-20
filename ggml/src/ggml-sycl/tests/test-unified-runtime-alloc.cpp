@@ -3092,15 +3092,18 @@ static bool last_release_names_a_held_arena(sycl::queue & q, bool & skipped) {
 // A failed load whose buffers hold the arena at its abort defers the release to the next load's start, which runs it
 // again and, once nothing holds the arena, starts from the zones a last model's release leaves. The reference: a
 // model's release empties the hand-built cache and a load's start reserve builds the early arena, whose zones every
-// later start must match. Then a lease on that arena's first chunk holds it through a failed load's abort: ARENA_HELD,
-// and the release is marked deferred. A load's start while the lease still holds the arena runs the release again, as
-// ggml_backend_sycl_model_load_begin does for a marked cache: ARENA_HELD with one WARN line that says the load runs on
-// the arena as it is, the mark stays, the reserve does nothing and the chunk is still leased. Once the lease ends, a
-// load's start empties the cache, clears the mark and reserves the early arena again at the reference zones, with
-// nothing used in them.
+// later start must match. Then a lease on that arena's first chunk holds it. A load's start that finds it held on a
+// cache with no mark keeps the arena and sets no mark: only the abort sets it. Through a failed load's abort the lease
+// gives ARENA_HELD, and the release is marked deferred. A load's start while the lease still holds the arena runs the
+// release again, as ggml_backend_sycl_model_load_begin does for a marked cache: ARENA_HELD with one WARN line that says
+// the load runs on the arena as it is and that a holder left once the failed model is freed is a leak, the holders
+// named on a WARN line too and nothing at ERROR; the mark stays, the reserve does nothing and the chunk is still
+// leased. Once the lease ends, a load's start empties the cache, clears the mark and reserves the early arena again at
+// the reference zones, with nothing used in them.
 // Engagement: the reference reserve built an arena, and the lease is on its first chunk.
-// Mutants: the mark not set at the abort; the mark cleared by a release that kept the arena; the mark kept after the
-// cache emptied; a start that rebuilds other zones than a last release's (the zones differ from the reference).
+// Mutants: the mark not set at the abort, or set at a start; the mark cleared by a release that kept the arena; the
+// mark kept after the cache emptied; the start's held arena logged with the abort's text, at ERROR or without its
+// holders; a start that rebuilds other zones than a last release's (the zones differ from the reference).
 static bool last_release_deferred_by_a_failed_load(sycl::queue & q, bool & skipped) {
     TEST_BEGIN("last_release_deferred_by_a_failed_load");
     constexpr size_t        mib       = 1024ull * 1024ull;
@@ -3126,6 +3129,10 @@ static bool last_release_deferred_by_a_failed_load(sycl::queue & q, bool & skipp
     held_chunk_lease lease{ cache };
     lease.chunk = cache.arena_acquire_chunk_lease(cache.arena_base());
     TEST_ASSERT(lease.chunk >= 0, "the fixture's lease on the early arena's first chunk was not taken");
+    TEST_ASSERT(cache.release_for_no_live_model("unmarked-start", unified_cache_release_cause::LOAD_START) ==
+                    unified_cache_last_release::ARENA_HELD,
+                "a load's start released an arena a lease holds");
+    TEST_ASSERT(!cache.last_release_deferred(), "a load's start marked a release deferred: only the abort marks it");
     TEST_ASSERT(cache.release_for_no_live_model("aborted", unified_cache_release_cause::LOAD_ABORTED) ==
                     unified_cache_last_release::ARENA_HELD,
                 "at an abort a held arena did not refuse the release");
@@ -3133,24 +3140,30 @@ static bool last_release_deferred_by_a_failed_load(sycl::queue & q, bool & skipp
 
     unified_cache_last_release held_start = unified_cache_last_release::FAILED;
     bool                       held_kept  = false;
-    size_t                     warned     = 0;
+    size_t                     warned = 0, holders_named = 0, abort_text = 0, errored = 0;
     {
         const last_release_log log;
-        held_start = cache.release_for_no_live_model("load-start", unified_cache_release_cause::LOAD_ABORTED);
+        held_start = cache.release_for_no_live_model("load-start", unified_cache_release_cause::LOAD_START);
         held_kept  = cache.reserve_released_arena(&refusal);
-        warned     = log.count(GGML_LOG_LEVEL_WARN, "(load-start): the failed load's buffers still hold the arena",
-                               "a load that starts while it is held runs on it as it is");
+        warned = log.count(GGML_LOG_LEVEL_WARN, "(load-start): a load is starting on an arena a failed load left held",
+                           "a holder still present after that failed model was freed is a leak");
+        holders_named = log.count(GGML_LOG_LEVEL_WARN, "[VRAM-ARENA] live in the arena on device");
+        abort_text    = log.count(GGML_LOG_LEVEL_WARN, "the failed load's buffers still hold the arena");
+        errored       = log.count(GGML_LOG_LEVEL_ERROR, "[VRAM-ARENA]");
     }
     TEST_ASSERT(held_start == unified_cache_last_release::ARENA_HELD,
                 "a load's start released an arena the failed load's buffers still hold");
-    TEST_ASSERT(warned == 1, "the start's release did not log one WARN line saying the load runs on the held arena");
+    TEST_ASSERT(warned == 1 && abort_text == 0,
+                "the start's release did not log its one WARN line saying a holder left after the free is a leak");
+    TEST_ASSERT(holders_named == 1 && errored == 0,
+                "the start's release did not name the holders at WARN, or logged an ERROR line");
     TEST_ASSERT(cache.last_release_deferred(), "a release that kept the arena cleared the deferred mark");
     TEST_ASSERT(held_kept && cache.arena_active() && cache.arena_find_chunk(cache.arena_base()) == lease.chunk,
                 "a load's start on the held arena refused, tore it down or freed the leased chunk");
 
     lease.release();
     const unified_cache_last_release free_start =
-        cache.release_for_no_live_model("load-start", unified_cache_release_cause::LOAD_ABORTED);
+        cache.release_for_no_live_model("load-start", unified_cache_release_cause::LOAD_START);
     TEST_ASSERT(free_start == unified_cache_last_release::EMPTIED,
                 "once the lease ended a load's start did not empty the cache");
     TEST_ASSERT(!cache.last_release_deferred(), "the deferred mark stayed after the cache emptied");

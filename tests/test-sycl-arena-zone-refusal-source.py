@@ -99,14 +99,15 @@ ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal
               "const zone_arena_ensure_options & options)")
 READ_SIG = "zone_arena_holders unified_cache::arena_read_holders(size_t * live_zone_used)"
 REPORT_SIG = ("void unified_cache::arena_report_holders(int dev_id, const size_t * live_zone_used, "
-              "zone_arena_holders & holders, const char * site)")
+              "zone_arena_holders & holders, const char * site, ggml_log_level level)")
 READ_CALL = "zone_arena_holders holders = arena_read_holders(live_zone_used);"
-REPORT_CALL = 'arena_report_holders(dev_id, live_zone_used, holders, "arena-rebuild");'
+# The refusal passes ERROR; the report logs its holders line at the level its caller passes.
+REPORT_CALL = 'arena_report_holders(dev_id, live_zone_used, holders, "arena-rebuild", GGML_LOG_LEVEL_ERROR);'
 
 # ---- the refusal names who holds the arena ----
 
 REFUSAL_LINE = '"[VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: "'
-HOLDERS_LINE = '"[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "'
+HOLDERS_LINE = '"[VRAM-ARENA] live in the arena on device %d (MB): %s; "'
 RUNTIME_LINE = '"[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP scratch planning "'
 # A queued free holds zone bytes only when it is a zone sub-allocation or points into the arena: a direct allocation
 # outside the arena is in no zone's `used`, so counting it would overstate what the queue explains.
@@ -167,10 +168,15 @@ def refusal_segment(uc: str) -> str:
 
 
 def holders_call_args(seg: str) -> str:
-    """The holders ERROR call from its format string to its closing ');', with every string literal emptied."""
+    """The holders line's call from its format string to its closing ');', with every string literal emptied."""
     j = seg.find(HOLDERS_LINE)
     e = seg.find(");", j) if j != -1 else -1
     return _STRING_RE.sub('""', seg[j:e]) if e != -1 else ""
+
+
+# The report's one holders line, at the level the refusal passes it (ERROR, in REPORT_CALL). code() leaves one space
+# after the parenthesis when the call breaks its line there.
+HOLDERS_AT_LEVEL = re.compile(r"ggml_log_internal\( ?level, " + re.escape(HOLDERS_LINE))
 
 
 def claim_rebuild_refusal_names_the_holders(uc: str) -> bool:
@@ -178,7 +184,8 @@ def claim_rebuild_refusal_names_the_holders(uc: str) -> bool:
     if HOLDERS_LINE not in seg:
         return False
     return (
-        seg.count("GGML_LOG_ERROR(") == 1
+        len(HOLDERS_AT_LEVEL.findall(seg)) == 1
+        and "GGML_LOG_ERROR(" not in seg
         and ordered(
             seg,
             "for (const deferred_free_entry & entry : deferred_frees_) {",
@@ -312,6 +319,18 @@ def test_witness_holders_line_dropped():
 
 def test_witness_refusal_does_not_call_the_report():
     assert not claim_rebuild_refusal_names_the_holders(mutate_in(UC, ENSURE_SIG, REPORT_CALL, ""))
+
+
+def test_witness_refusal_names_the_holders_at_warn():
+    m = mutate_in(UC, ENSURE_SIG, REPORT_CALL, REPORT_CALL.replace("_ERROR", "_WARN"))
+    assert not claim_rebuild_refusal_names_the_holders(m)
+
+
+def test_witness_report_ignores_its_level():
+    line = HOLDERS_AT_LEVEL.search(fn_body(code(UC), REPORT_SIG))
+    assert line, "witness anchor: the holders report's line at its level"
+    assert not claim_rebuild_refusal_names_the_holders(
+        mutate_in(UC, REPORT_SIG, line.group(0), "GGML_LOG_WARN(" + HOLDERS_LINE))
 
 
 def test_witness_holders_line_prints_a_literal_for_live_controls():

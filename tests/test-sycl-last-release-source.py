@@ -15,20 +15,24 @@ cache once (GLOBAL mode shares one cache between devices), does nothing more whe
 terms back only when its cache was asked and emptied, through the one list (load_published_terms{}.restore) under the
 inventory lock, never through setters of its own. With the scope DEFERRED_CACHES it asks only a cache whose release a
 failed load's buffers deferred; a cache it leaves out keeps what it holds and its terms, and counts as emptied for the
-two-card flag only when it holds no arena. A step that asked no cache leaves that flag as it is.
+two-card flag only when it holds no arena. A step that asked no cache leaves that flag as it is: it records that it
+asked one only once the scope let it, before it asks.
 
 The cache member it calls, unified_cache::release_for_no_live_model, is noexcept and catches. In order: it returns when
 a model is live; waits once for one barrier over the cache's queues; releases the PP MoE oneDNN ring, the oneDNN
 scratchpad pair and the reorder temp buffer; drains the queued frees through the existing drain, once; reads the
 arena's holders; unbinds the compute arena; tears the arena down; and only then marks the cache released. Each release
 that refuses stops it with a line that names the refusal. A held arena is an ERROR with the holders named for a model
-release, a WARN at a failed load's abort (the failed model's buffers still hold it then); the release is INFO. At the
-abort the held arena also marks the release deferred (last_release_deferred_), and only a release that empties the
-cache clears that mark. The pair release refuses while a reservation holds the pair and frees outside the pair's lock.
-None of the new code aborts or asserts, and none of the release path reserves: no ensure, reserve or allocation.
+release; one WARN line at a failed load's abort (the failed model's buffers still hold it then); and at a load's start,
+which has its own cause (LOAD_START), a WARN that says a holder still there once the failed model is freed is a leak,
+with the holders named at WARN too, through the holders report's level, which logs its holders line at the level its
+caller passes. The release is INFO. At the abort the held arena also marks the release deferred
+(last_release_deferred_); the start's cause never sets that mark, its held arena keeps it, and only a release that
+empties the cache clears it. The pair release refuses while a reservation holds the pair and frees outside the pair's
+lock. None of the new code aborts or asserts, and none of the release path reserves: no ensure, reserve or allocation.
 
 The load's start (ggml_backend_sycl_model_load_begin), inside its transaction and once the caches exist, first runs
-the step again for the deferred caches (LOAD_ABORTED, DEFERRED_CACHES), then reserves a released cache's early arena
+the step again for the deferred caches (LOAD_START, DEFERRED_CACHES), then reserves a released cache's early arena
 before the candidate is bound, and a reserve it cannot make refuses the load with PLAN_REJECTED after an ERROR line
 that names it. The released flag clears only after the arena is back.
 
@@ -170,8 +174,8 @@ DEFERRED = "ggml_sycl_last_release_scope::DEFERRED_CACHES"
 HOOK_CALL = ('ggml_sycl_release_last_model_effects("model-release", '
              f"ggml_sycl::unified_cache_release_cause::MODEL_RELEASED, {EVERY});")
 ABORT_CALL = f"ggml_sycl_release_last_model_effects(site, ggml_sycl::unified_cache_release_cause::LOAD_ABORTED, {EVERY});"
-START_CALL = ('ggml_sycl_release_last_model_effects("load-start", '
-              f"ggml_sycl::unified_cache_release_cause::LOAD_ABORTED, {DEFERRED});")
+START_CAUSE = "ggml_sycl::unified_cache_release_cause::LOAD_START"
+START_CALL = f'ggml_sycl_release_last_model_effects("load-start", {START_CAUSE}, {DEFERRED});'
 STEP_NAME = "ggml_sycl_release_last_model_effects("
 DROP = "(void) ggml_sycl::unified_cache_drop_planned_load_terms(owner.owner);"
 ABORT_RESTORE = "ggml_sycl_load_published_terms_restore(owner.load.value);"
@@ -188,12 +192,27 @@ ASK = "asked[d] = first == d ? (every || caches[d]->last_release_deferred()) : a
 LEFT_OUT = "if (!asked[d]) { all_emptied = all_emptied && !caches[d]->arena_active(); continue; }"
 TERMS_RESET_IF = f"if (asked[d] && released[d] == {EMPTIED}) {{"
 TWO_CARD = "if (all_emptied && (every || asked_any)) { g_moe_multi_gpu_active.store(false"
+ASKED_ANY = "asked_any = true;"
 DEFER_SET = "last_release_deferred_.store(true, std::memory_order_release);"
 DEFER_CLEAR = "last_release_deferred_.store(false, std::memory_order_release);"
 DEFER_MEMBER = "std::atomic<bool> last_release_deferred_{ false };"
 DEFER_READ = "bool last_release_deferred() const { return last_release_deferred_.load(std::memory_order_acquire); }"
 HELD_HEAD = "if (!zone_arena_rebuild_allowed(holders)) {"
 ABORTED_HEAD = "if (cause == unified_cache_release_cause::LOAD_ABORTED) {"
+STARTED_HEAD = "if (cause == unified_cache_release_cause::LOAD_START) {"
+CAUSE_ENUM = "enum class unified_cache_release_cause { MODEL_RELEASED, LOAD_ABORTED, LOAD_START };"
+ABORTED_TEXT = "(%s): the failed load's buffers still hold the arena \""
+STARTED_TEXT = "(%s): a load is starting on an arena a failed load left \""
+LEAK_TEXT = 'is a leak\\n"'
+START_HOLDERS = "arena_report_holders(dev_id, live_zone_used, holders, site, GGML_LOG_LEVEL_WARN);"
+RELEASE_HOLDERS = 'arena_report_holders(dev_id, live_zone_used, holders, "last-release", GGML_LOG_LEVEL_ERROR);'
+REBUILD_HOLDERS = 'arena_report_holders(dev_id, live_zone_used, holders, "arena-rebuild", GGML_LOG_LEVEL_ERROR);'
+REPORT_SIG = ("void unified_cache::arena_report_holders(int dev_id, const size_t * live_zone_used, "
+              "zone_arena_holders & holders, const char * site, ggml_log_level level)")
+HOLDERS_LINE = '"[VRAM-ARENA] live in the arena on device %d (MB): %s; "'
+# The holders line goes out at the caller's level: ERROR for a refused rebuild and a model release, WARN at a load's
+# start. code() leaves one space after the parenthesis when the call breaks its line there.
+HOLDERS_AT_LEVEL = re.compile(r"ggml_log_internal\( ?level, " + re.escape(HOLDERS_LINE))
 
 MEMBER_ORDER = (
     "if (live_model_mask() != 0) { return unified_cache_last_release::MODEL_LIVE; }",
@@ -278,6 +297,10 @@ def check_step(gs: str) -> list:
         out.append("the step asks a cache it already asked")
     if SCOPE_EVERY not in body or not ordered(body, "if (caches[e] == caches[d]) {", ASK, LEFT_OUT, DEDUPE):
         out.append("the step asks a cache its scope leaves out, or counts one it left out as emptied with an arena")
+    # Without the record a start that asked a cache could never put the two-card flag back; set before the scope's
+    # filter, it would put it back for a start that asked none.
+    if body.count(ASKED_ANY) != 1 or not ordered(body, LEFT_OUT, ASKED_ANY, DEDUPE):
+        out.append("the step does not record that it asked a cache, once, after the scope let it and before it asks")
     if not ordered(body, DEDUPE, f"if (released[d] == {MODEL_LIVE}) {{ return; }}", TERMS_RESET_IF, INVENTORY_LOCK,
                    TERMS_RESET):
         out.append("the step resets a device's terms while a model is live, or when its cache was not asked or did not "
@@ -339,16 +362,31 @@ def check_refusals_named(uc: str) -> list:
             out.append(f"the refusal {result} is not an ERROR line that stops the release")
     if "arena_teardown_cause_name(teardown)" not in _branch(body, "if (!arena_destroy()) {"):
         out.append("a refused teardown does not name its cause")
-    held = _branch(body, "if (!zone_arena_rebuild_allowed(holders)) {")
-    aborted = _branch(held, "if (cause == unified_cache_release_cause::LOAD_ABORTED) {")
-    rest = held.replace(aborted, "", 1) if aborted else held
-    if "GGML_LOG_WARN(" not in aborted or "GGML_LOG_ERROR(" in aborted or "arena_report_holders" in aborted:
-        out.append("a held arena at a failed load's abort is not one WARN line")
+    held = _branch(body, HELD_HEAD)
+    aborted = _branch(held, ABORTED_HEAD)
+    started = _branch(held, STARTED_HEAD)
+    rest = held
+    for branch in (aborted, started):
+        rest = rest.replace(branch, "", 1) if branch else rest
+    if "GGML_LOG_WARN(" not in aborted or "GGML_LOG_ERROR(" in aborted or "arena_report_holders" in aborted \
+            or ABORTED_TEXT not in aborted:
+        out.append("a held arena at a failed load's abort is not its one WARN line")
     if "return unified_cache_last_release::ARENA_HELD;" not in aborted:
         out.append("a held arena at a failed load's abort does not stop the release")
-    if not ordered(rest, "GGML_LOG_ERROR(", 'arena_report_holders(dev_id, live_zone_used, holders, "last-release");',
-                   "return unified_cache_last_release::ARENA_HELD;"):
-        out.append("a held arena at a model release is not an ERROR line with its holders named")
+    # Between the abort and the free of the failed model its buffers hold the arena; after that free a holder is a
+    # leak. A start can come in either window, so it is a WARN that says so and names the holders, at WARN.
+    if not ordered(started, "GGML_LOG_WARN(", STARTED_TEXT, LEAK_TEXT, START_HOLDERS,
+                   "return unified_cache_last_release::ARENA_HELD;") or "GGML_LOG_ERROR(" in started:
+        out.append("a held arena at a load's start is not a WARN line with its holders named at WARN")
+    if not ordered(rest, "GGML_LOG_ERROR(", RELEASE_HOLDERS, "return unified_cache_last_release::ARENA_HELD;"):
+        out.append("a held arena at a model release is not an ERROR line with its holders named at ERROR")
+    report = fn_body(uc, REPORT_SIG)
+    if len(HOLDERS_AT_LEVEL.findall(report)) != 1 or "GGML_LOG_ERROR(" in report:
+        out.append("the holders report does not log its holders line at the level its caller passes")
+    # Its definition and three callers: the refused rebuild and the model release at ERROR, the load's start at WARN.
+    if uc.count("arena_report_holders(") != 4 or REBUILD_HOLDERS not in uc:
+        out.append("the holders report has a caller beyond the three, or a refused rebuild names its holders below "
+                   "ERROR")
     if not ordered(body, "arena_released_.store(true, std::memory_order_release);", "GGML_LOG_INFO(",
                    "return unified_cache_last_release::EMPTIED;"):
         out.append("the release is not an INFO line")
@@ -361,8 +399,12 @@ def check_deferred_mark(uc: str, uh: str) -> list:
         return ["the cache's last release member is missing"]
     out = []
     aborted = _branch(_branch(body, HELD_HEAD), ABORTED_HEAD)
+    started = _branch(_branch(body, HELD_HEAD), STARTED_HEAD)
     if not ordered(aborted, DEFER_SET, "return unified_cache_last_release::ARENA_HELD;"):
         out.append("a held arena at a failed load's abort does not mark the release deferred")
+    # The start's cause only keeps the mark (a held arena) or clears it (a release that empties): only the abort sets it.
+    if CAUSE_ENUM not in uh or not started or "last_release_deferred_" in started:
+        out.append("a load's start has no cause of its own, or its held arena touches the deferred mark")
     if uc.count("last_release_deferred_.store(true") != 1:
         out.append("the deferred mark is set somewhere other than at a failed load's held arena")
     if f"if (!arena_active()) {{ {DEFER_CLEAR} return unified_cache_last_release::EMPTIED; }}" not in body \
@@ -433,6 +475,8 @@ def check_load_start(gs: str, uc: str) -> list:
                    "exist and before its reserve")
     if gs.count(DEFERRED) != 1 or begin.count(START_CALL) != 1:
         out.append("the deferred release runs somewhere other than once at the load's start")
+    if gs.count(START_CAUSE) != 1:
+        out.append("the start's cause is passed somewhere other than the load's start")
     # One roll-back path below the try, for a refused reserve and an exception alike, so the abort keeps its one
     # literal site tag: a refused reserve leaves the try with PLAN_REJECTED, an exception with EFFECT_FAILED.
     if "ggml_sycl_lifecycle_result rollback_code = GGML_SYCL_LIFECYCLE_PLAN_REJECTED; try {" not in begin:
@@ -601,6 +645,15 @@ def test_witness_start_that_asked_none_puts_the_two_card_flag_back():
     assert check_step(mutate_in(GS, STEP_SIG, "if (all_emptied && (every || asked_any)) {", "if (all_emptied) {"))
 
 
+def test_witness_start_that_asked_a_cache_never_puts_the_two_card_flag_back():
+    assert check_step(mutate_in(GS, STEP_SIG, ASKED_ANY, ""))
+
+
+def test_witness_step_records_a_cache_its_scope_left_out():
+    m = mutate_in(GS, STEP_SIG, ASKED_ANY, "")
+    assert check_step(mutate_in(m, STEP_SIG, LEFT_OUT, ASKED_ANY + " " + LEFT_OUT))
+
+
 def test_witness_step_resets_terms_while_a_model_is_live():
     assert check_step(mutate_in(GS, STEP_SIG, f"if (released[d] == {MODEL_LIVE}) {{ return; }}", ""))
 
@@ -652,9 +705,16 @@ def test_witness_ring_refusal_goes_on():
 
 
 def test_witness_held_arena_not_named():
-    assert check_refusals_named(mutate_in(UC, MEMBER_SIG,
-                                          'arena_report_holders(dev_id, live_zone_used, holders, "last-release");',
-                                          ""))
+    assert check_refusals_named(mutate_in(UC, MEMBER_SIG, RELEASE_HOLDERS, ""))
+
+
+def test_witness_held_arena_named_below_error():
+    m = mutate_in(UC, MEMBER_SIG, RELEASE_HOLDERS, RELEASE_HOLDERS.replace("_ERROR", "_WARN"))
+    assert check_refusals_named(m)
+
+
+def test_witness_refused_rebuild_names_its_holders_at_warn():
+    assert check_refusals_named(mutate_in(UC, ENSURE_SIG, REBUILD_HOLDERS, REBUILD_HOLDERS.replace("_ERROR", "_WARN")))
 
 
 def test_witness_held_arena_at_abort_is_an_error():
@@ -663,8 +723,62 @@ def test_witness_held_arena_at_abort_is_an_error():
     assert check_refusals_named(m)
 
 
+def test_witness_abort_says_what_the_start_says():
+    assert check_refusals_named(mutate_in(UC, MEMBER_SIG, ABORTED_TEXT, STARTED_TEXT))
+
+
+def test_witness_held_arena_at_start_is_an_error():
+    assert check_refusals_named(mutate_in(UC, MEMBER_SIG, f"{STARTED_HEAD} GGML_LOG_WARN(",
+                                          f"{STARTED_HEAD} GGML_LOG_ERROR("))
+
+
+def test_witness_held_arena_at_start_not_named():
+    assert check_refusals_named(mutate_in(UC, MEMBER_SIG, START_HOLDERS, ""))
+
+
+def test_witness_held_arena_at_start_named_at_error():
+    assert check_refusals_named(mutate_in(UC, MEMBER_SIG, START_HOLDERS, START_HOLDERS.replace("_WARN", "_ERROR")))
+
+
+def test_witness_held_arena_at_start_does_not_call_it_a_leak():
+    assert check_refusals_named(mutate_in(UC, MEMBER_SIG, LEAK_TEXT, '"'))
+
+
+def test_witness_held_arena_at_start_takes_the_model_release_path():
+    started = _branch(_branch(fn_body(UC, MEMBER_SIG), HELD_HEAD), STARTED_HEAD)
+    m = mutate_in(UC, MEMBER_SIG, STARTED_HEAD[:-1] + started, "")
+    assert check_refusals_named(m) and check_deferred_mark(m, UH)
+
+
+def test_witness_report_ignores_its_level():
+    line = HOLDERS_AT_LEVEL.search(fn_body(UC, REPORT_SIG))
+    assert line, "witness anchor: the holders report's line at its level"
+    assert check_refusals_named(mutate_in(UC, REPORT_SIG, line.group(0), "GGML_LOG_ERROR(" + HOLDERS_LINE))
+
+
+def test_witness_report_has_a_fourth_caller():
+    m = mutate_in(UC, MEMBER_SIG, "compute_arena_unbind();",
+                  "arena_report_holders(dev_id, live_zone_used, holders, site, GGML_LOG_LEVEL_INFO); "
+                  "compute_arena_unbind();")
+    assert check_refusals_named(m)
+
+
 def test_witness_abort_does_not_mark_the_release_deferred():
     assert check_deferred_mark(mutate_in(UC, MEMBER_SIG, DEFER_SET, ""), UH)
+
+
+def test_witness_held_arena_at_start_marks_the_release_deferred():
+    m = mutate_in(UC, MEMBER_SIG, f"{STARTED_HEAD} GGML_LOG_WARN(", f"{STARTED_HEAD} {DEFER_SET} GGML_LOG_WARN(")
+    assert check_deferred_mark(m, UH)
+
+
+def test_witness_held_arena_at_start_clears_the_mark():
+    m = mutate_in(UC, MEMBER_SIG, f"{STARTED_HEAD} GGML_LOG_WARN(", f"{STARTED_HEAD} {DEFER_CLEAR} GGML_LOG_WARN(")
+    assert check_deferred_mark(m, UH)
+
+
+def test_witness_start_has_no_cause_of_its_own():
+    assert check_deferred_mark(UC, UH.replace(CAUSE_ENUM, CAUSE_ENUM.replace(", LOAD_START", ""), 1))
 
 
 def test_witness_model_release_marks_the_release_deferred():
@@ -709,6 +823,16 @@ def test_witness_load_binds_before_the_reserve():
 
 def test_witness_load_start_skips_the_deferred_release():
     assert check_load_start(mutate_in(GS, BEGIN_SIG, START_CALL, ""), UC)
+
+
+def test_witness_load_start_passes_the_aborts_cause():
+    m = mutate_in(GS, BEGIN_SIG, START_CALL, START_CALL.replace(START_CAUSE, START_CAUSE.replace("_START", "_ABORTED")))
+    assert check_load_start(m, UC)
+
+
+def test_witness_abort_passes_the_starts_cause():
+    m = mutate_in(GS, ABORT_SIG, ABORT_CALL, ABORT_CALL.replace("::LOAD_ABORTED", "::LOAD_START"))
+    assert check_abort(m) and check_load_start(m, UC)
 
 
 def test_witness_deferred_release_after_the_reserve():

@@ -12726,7 +12726,7 @@ enum class ggml_sycl_last_release_scope { EVERY_CACHE, DEFERRED_CACHES };
 
 // The release of the last model in the process, run last by the model release hook (`cause` MODEL_RELEASED) and by a
 // failed load's abort (LOAD_ABORTED), after each has dropped and put back what the model published, and at a load's
-// start for the caches a failed load's buffers held at its abort (LOAD_ABORTED, DEFERRED_CACHES). Each cache asked
+// start for the caches a failed load's buffers held at its abort (LOAD_START, DEFERRED_CACHES). Each cache asked
 // gives back what it sized for a model (unified_cache::release_for_no_live_model), so the next load plans and builds
 // as the first load of a process does. Liveness is process-wide, every cache holds the same mask, so walking every
 // existing cache when that mask is 0 is right; in GLOBAL cache mode several devices share one cache, which is asked
@@ -14014,9 +14014,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
         ggml_sycl_model_loading_effects(true, true);
         // The release a failed load's buffers held off at its abort runs again before the reserve, inside this
         // transaction, beside which no model's teardown begins. With no model live, a cache they no longer hold empties
-        // and its terms go back, so the reserve below starts this load as after the last model's release; a cache they
-        // still hold keeps its mark and its arena, and this load runs on that arena as it is.
-        ggml_sycl_release_last_model_effects("load-start", ggml_sycl::unified_cache_release_cause::LOAD_ABORTED,
+        // and its terms go back, so the reserve below starts this load as after the last model's release; a cache
+        // something still holds keeps its mark and its arena, names the holders at WARN (once the failed model is
+        // freed, a holder is a leak), and this load runs on that arena as it is.
+        ggml_sycl_release_last_model_effects("load-start", ggml_sycl::unified_cache_release_cause::LOAD_START,
                                              ggml_sycl_last_release_scope::DEFERRED_CACHES);
         if (ggml_sycl_load_start_reserve_released_arenas()) {
             registry->bind_candidate(result.txn);

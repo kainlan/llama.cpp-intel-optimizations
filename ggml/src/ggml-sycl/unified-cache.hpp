@@ -4140,9 +4140,12 @@ struct layer_weight_pointers {
     void * ffn_gate_up_proj = nullptr;  // Fused gate+up (optional)
 };
 
-// How the last model of the process left: its release, or the abort of a load that failed. At an abort the failed
-// model's buffers are still alive (they go with the model, after the abort), so what holds the arena then is no leak.
-enum class unified_cache_release_cause { MODEL_RELEASED, LOAD_ABORTED };
+// Why the release of the last model runs: the model's release, the abort of a load that failed, or the start of a
+// load, which runs again a release the failed load's buffers held off. At an abort those buffers are still alive (they
+// go with the model, after the abort), so what holds the arena then is no leak. At a start it may be either: before the
+// failed model is freed its buffers hold the arena, after that a holder is a leak, so the start names the holders at
+// WARN. Only the abort marks a release deferred.
+enum class unified_cache_release_cause { MODEL_RELEASED, LOAD_ABORTED, LOAD_START };
 
 // What unified_cache::release_for_no_live_model() did: EMPTIED when the cache holds nothing sized for a model (or held
 // nothing), otherwise what kept it, and nothing after that was released.
@@ -5231,11 +5234,12 @@ class unified_cache {
     // the PP MoE oneDNN ring, the oneDNN scratchpad pair, the MoE reorder temp buffer and the pooled oneDNN Graph
     // scratch, drains the queued frees, then tears the arena down, which hands its memory back to the device. It stops
     // at the first thing that holds on, with an ERROR line that names it (a WARN for what a failed load's own buffers
-    // hold at its abort), and releases nothing after it; nothing is reaped, evicted or reset over a live handle. An
-    // arena a failed load's buffers hold at its abort (LOAD_ABORTED) marks the release deferred
-    // (last_release_deferred), and only a release that empties the cache clears that mark. The next load's start
-    // reserves the arena of a cache it emptied again (reserve_released_arena). It reserves nothing itself and never
-    // throws: an exception ends it with an ERROR naming `site`.
+    // hold at its abort, and at a load's start, LOAD_START, a WARN that names the holders, since one still there once
+    // the failed model is freed is a leak), and releases nothing after it; nothing is reaped, evicted or reset over a
+    // live handle. An arena a failed load's buffers hold at its abort (LOAD_ABORTED) marks the release deferred
+    // (last_release_deferred); the start never sets that mark, and only a release that empties the cache clears it.
+    // The next load's start reserves the arena of a cache it emptied again (reserve_released_arena). It reserves
+    // nothing itself and never throws: an exception ends it with an ERROR naming `site`.
     unified_cache_last_release release_for_no_live_model(const char * site, unified_cache_release_cause cause) noexcept;
 
     // The start of a load: a cache whose arena the last release tore down reserves its early arena again from the
@@ -6468,15 +6472,18 @@ class unified_cache {
     // on these figures prints them, not a second reading, which could disagree with them under a concurrent release.
     zone_arena_holders arena_read_holders(size_t * live_zone_used);
 
-    // Names who holds the arena on `dev_id`, from the figures arena_read_holders() read: one ERROR line with each
+    // Names who holds the arena on `dev_id`, from the figures arena_read_holders() read: one line at `level` with each
     // zone's live bytes, the queued frees those zones still count, the device's releases waiting for a retry, the
     // retired entries not yet finalized and the evictions in flight, which it also fills into `holders`; one WARN
-    // line with the chunk leases by site; then each zone with live bytes lists its live allocations under `site`. It
-    // only reads: it drains, frees, evicts, resets and allocates nothing.
+    // line with the chunk leases by site; then each zone with live bytes lists its live allocations under `site`.
+    // `level` is ERROR where a holder refuses what the caller needs (a rebuild, a model's release) and WARN at a
+    // load's start, where the holder may still be the failed model's buffers. It only reads: it drains, frees,
+    // evicts, resets and allocates nothing.
     void arena_report_holders(int                  dev_id,
                               const size_t *       live_zone_used,
                               zone_arena_holders & holders,
-                              const char *         site);
+                              const char *         site,
+                              ggml_log_level       level);
 
     // The oneDNN scratchpad pair's release for the last model. False, with nothing released, while a reservation holds
     // the pair. The fields are emptied under onednn_scratch_mutex_ and the blocks freed after it is released, so no

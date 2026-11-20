@@ -256,7 +256,7 @@ def claim_site_count_costs_one_relaxed_add(uc: str, uch: str) -> bool:
 ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
               "const zone_arena_ensure_options & options)")
 REFUSAL_LINE = '"[VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: "'
-HOLDERS_LINE = '"[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "'
+HOLDERS_LINE = '"[VRAM-ARENA] live in the arena on device %d (MB): %s; "'
 SITE_LINE = '"[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\\n"'
 CENSUS_SIG = "uint32_t unified_cache::arena_chunk_lease_census(char * out, size_t size) const noexcept"
 CENSUS_CALL = "const uint32_t site_leases = arena_chunk_lease_census(leases_by_site, sizeof(leases_by_site));"
@@ -275,12 +275,12 @@ ZONE_DUMP = (
     "dump_live_zone_allocations(static_cast<vram_zone_id>(z), site);",
 )
 # The refusal reads the holders through arena_read_holders and names them through arena_report_holders, under its own
-# site name.
+# site name, at ERROR.
 READ_SIG = "zone_arena_holders unified_cache::arena_read_holders(size_t * live_zone_used)"
 REPORT_SIG = ("void unified_cache::arena_report_holders(int dev_id, const size_t * live_zone_used, "
-              "zone_arena_holders & holders, const char * site)")
+              "zone_arena_holders & holders, const char * site, ggml_log_level level)")
 READ_CALL = "zone_arena_holders holders = arena_read_holders(live_zone_used);"
-REPORT_CALL = 'arena_report_holders(dev_id, live_zone_used, holders, "arena-rebuild");'
+REPORT_CALL = 'arena_report_holders(dev_id, live_zone_used, holders, "arena-rebuild", GGML_LOG_LEVEL_ERROR);'
 
 
 def refusal_segment(uc: str) -> str:
