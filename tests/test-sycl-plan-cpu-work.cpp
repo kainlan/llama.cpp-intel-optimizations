@@ -4,7 +4,8 @@
 // The CPU backend's compute buffer gets the dedicated activation buft only when
 // the placement plan leaves some of the graph to the CPU. The predicate must say
 // exactly what supports_op says when it declines an op because its data is
-// host-planned -- if it says "no CPU work" while supports_op hands the CPU an
+// host-planned, or because the device has no dense MUL_MAT kernel for a planned
+// weight's type -- if it says "no CPU work" while supports_op hands the CPU an
 // op, a CPU-produced activation reaches a SYCL op raw (the 38af defect); if it
 // says "CPU work" for a full-offload plan, the run gets split-copy names and
 // loses command-graph replay.
@@ -19,6 +20,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace {
@@ -36,6 +38,17 @@ void expect(bool got, bool want, const char * what) {
     }
     std::printf("  FAIL: %s -> %s, wanted %s\n", what, got ? "CPU work" : "no CPU work",
                 want ? "CPU work" : "no CPU work");
+    ++failures;
+}
+
+// The clause name the "[SYCL-CPU-ACT] plan CPU work:" line prints; nullptr stands for "none".
+void expect_reason(const char * got, const char * want, const char * what) {
+    const bool same = (got == nullptr || want == nullptr) ? got == want : std::strcmp(got, want) == 0;
+    if (same) {
+        std::printf("  ok  : %s -> %s\n", what, got ? got : "none");
+        return;
+    }
+    std::printf("  FAIL: %s -> %s, wanted %s\n", what, got ? got : "none", want ? want : "none");
     ++failures;
 }
 
@@ -81,6 +94,41 @@ void add_experts(placement_plan & plan, int layer, int n_experts, int n_on_devic
 bool has_cpu_work(placement_plan plan) {
     plan.build_index();
     return ggml_sycl::test_plan_has_cpu_work(plan);
+}
+
+const char * cpu_work_reason(placement_plan plan) {
+    plan.build_index();
+    return ggml_sycl::test_plan_cpu_work_reason(plan);
+}
+
+// The loader's facts for one entry, as copy_tensor_info_to_entry() carries them from the inventory.
+placement_plan & set_weight(placement_plan & plan, const char * name, ggml_type type, bool get_rows_only = false) {
+    for (auto & e : plan.entries) {
+        if (e.name == name) {
+            e.type          = type;
+            e.get_rows_only = get_rows_only;
+        }
+    }
+    return plan;
+}
+
+// The NVFP4 MoE shape with nothing on the host: both layers, their KV and every expert on device 0, NVFP4 experts,
+// a gather-only NVFP4 token_embd, a Q6_K output head and BF16 attention weights. Nothing in it is a type the device
+// declines for MUL_MAT, so the cases below add the one weight that is.
+placement_plan nvfp4_moe_full_offload_plan() {
+    placement_plan plan = full_offload_plan();
+    add_experts(plan, 0, 4, 4);
+    add_experts(plan, 1, 4, 4);
+    for (auto & e : plan.entries) {
+        if (e.expert_id >= 0) {
+            e.type = GGML_TYPE_NVFP4;
+        }
+    }
+    set_weight(plan, "token_embd.weight", GGML_TYPE_NVFP4, /*get_rows_only=*/true);
+    set_weight(plan, "output.weight", GGML_TYPE_Q6_K);
+    set_weight(plan, "blk.0.attn_q.weight", GGML_TYPE_BF16);
+    set_weight(plan, "blk.1.attn_q.weight", GGML_TYPE_BF16);
+    return plan;
 }
 
 placement_plan & entry_off_device(placement_plan & plan, const char * name) {
@@ -250,6 +298,69 @@ int main() {
         entry_off_device(plan, "blk.1.attn_q.weight");
         expect(has_cpu_work(std::move(plan)), true,
                "a layer weight off-device when layer_device has no row for the layer (entry decides)");
+    }
+
+    std::printf("=== a dense weight whose type has no device MUL_MAT kernel (supports_op's type decline) ===\n");
+    // supports_op declines such a MUL_MAT wherever the plan put the weight, so ggml-cpu runs it and its output
+    // reaches a SYCL op. Every layer and its KV are on the device here, so no residency clause can fire.
+    {
+        auto plan = full_offload_plan();
+        set_weight(plan, "blk.0.attn_q.weight", GGML_TYPE_NVFP4);
+        expect_reason(cpu_work_reason(std::move(plan)), "dense-type", "an NVFP4 attn_q in a device-planned layer");
+    }
+    {
+        auto plan = full_offload_plan();
+        set_weight(plan, "blk.0.attn_q.weight", GGML_TYPE_Q1_0);
+        expect_reason(cpu_work_reason(std::move(plan)), "dense-type", "a Q1_0 attn_q in a device-planned layer");
+    }
+    {
+        auto plan = full_offload_plan();
+        set_weight(plan, "blk.0.attn_q.weight", GGML_TYPE_Q4_0);
+        expect_reason(cpu_work_reason(std::move(plan)), nullptr, "a Q4_0 attn_q: the device has its kernel");
+    }
+    {
+        auto plan = full_offload_plan();
+        set_weight(plan, "blk.0.attn_q.weight", GGML_TYPE_BF16);
+        expect_reason(cpu_work_reason(std::move(plan)), nullptr, "a BF16 attn_q counts as run on the device");
+    }
+    expect_reason(cpu_work_reason(full_offload_plan()), nullptr,
+                  "every type unknown (GGML_TYPE_COUNT): no data, no verdict");
+    {
+        // The pair that pins the carrier: the same NVFP4 entry, gather-only or not.
+        auto plan = full_offload_plan();
+        set_weight(plan, "token_embd.weight", GGML_TYPE_NVFP4, /*get_rows_only=*/true);
+        expect_reason(cpu_work_reason(std::move(plan)), nullptr,
+                      "an NVFP4 token_embd read only by GET_ROWS is never a MUL_MAT operand");
+    }
+    {
+        auto plan = full_offload_plan();
+        set_weight(plan, "token_embd.weight", GGML_TYPE_NVFP4, /*get_rows_only=*/false);
+        expect_reason(cpu_work_reason(std::move(plan)), "dense-type",
+                      "the same NVFP4 token_embd as a MUL_MAT operand (a tied output head)");
+    }
+    expect_reason(cpu_work_reason(nvfp4_moe_full_offload_plan()), nullptr,
+                  "NVFP4 MoE, all on device: NVFP4 experts, gather-only NVFP4 token_embd, BF16 attention");
+    {
+        auto plan = nvfp4_moe_full_offload_plan();
+        plan.entries.push_back({ "blk.1.attn_qkv.weight", kBytes, kBytes, 0, placement_priority::ATTENTION, 1, -1,
+                                 expert_tensor_role::UNKNOWN, true, 0 });
+        plan.entries.back().type = GGML_TYPE_NVFP4;
+        expect_reason(cpu_work_reason(std::move(plan)), "dense-type",
+                      "NVFP4 MoE, all on device, plus one dense NVFP4 attn_qkv");
+    }
+
+    std::printf("=== clause order: the residency clauses answer first ===\n");
+    {
+        auto plan            = full_offload_plan();
+        plan.layer_device[1] = -1;
+        set_weight(plan, "blk.0.attn_q.weight", GGML_TYPE_NVFP4);
+        expect_reason(cpu_work_reason(std::move(plan)), "layer", "a host layer AND a dense NVFP4 weight");
+    }
+    {
+        auto plan         = full_offload_plan();
+        plan.kv_device[1] = -1;
+        set_weight(plan, "blk.0.attn_q.weight", GGML_TYPE_NVFP4);
+        expect_reason(cpu_work_reason(std::move(plan)), "kv", "a host KV layer AND a dense NVFP4 weight");
     }
 
     if (failures != 0) {

@@ -440,6 +440,9 @@ struct placement_entry {
     std::string            name;  // Tensor name (for logging and S1-PRELOAD lookup)
     ggml_type              type              = GGML_TYPE_COUNT;
     int64_t                ne[GGML_MAX_DIMS] = {};
+    // The loader's role, copied from placement_tensor_info: the weight is consumed only by a row gather (GET_ROWS) and
+    // is never a MUL_MAT operand, so a question about its MUL_MAT kernel has no answer for it.
+    bool                   get_rows_only     = false;
     size_t                 src_size          = 0;  // AOS source bytes
     size_t                 dst_size          = 0;  // Layout-converted destination bytes (SOA/COALESCED)
     // The layer's KV bytes, on one anchor entry per layer (its attention entry when it has one) and 0 on the rest. It

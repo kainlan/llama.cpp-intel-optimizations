@@ -33045,8 +33045,9 @@ static std::vector<placement_tensor_info> placement_tensor_inventory_from_pairs(
 }
 
 static void copy_tensor_info_to_entry(placement_entry & entry, const placement_tensor_info & tensor) {
-    entry.name = tensor.name;
-    entry.type = tensor.type;
+    entry.name          = tensor.name;
+    entry.type          = tensor.type;
+    entry.get_rows_only = tensor.get_rows_only;
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         entry.ne[i] = tensor.ne[i];
     }
