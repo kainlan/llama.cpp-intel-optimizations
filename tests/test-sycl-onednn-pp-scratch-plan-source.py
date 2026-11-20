@@ -606,7 +606,7 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
         results["the admission requires the request alone to fit the bound"] = alone in admit_norm
         results["the admission requires the per-half merge with the planned pair to fit the bound"] = \
             merge in admit_norm
-        results["a zone clamped below its plan keeps the request-only rule, before the merge is asked"] = \
+        results["a stored plan whose halves miss the bound keeps the request-only rule, before the merge is asked"] = \
             0 <= admit_norm.find(alone) < admit_norm.find(clamp) < admit_norm.find(merge)
     if pure_supplies is not None:
         results["the pure supplies verdict passes the planned halves to the admission"] = \
@@ -1067,8 +1067,8 @@ if args.self_test and not failed:
          (backend, cache, cache_hpp,
           mutate_in_func(zone_sizing, admit_sig, "std::max(planned_weights_bytes, weights_bytes)",
                          "std::max(weights_bytes, weights_bytes)"))),
-        ("admission drops the clamped-zone rule",
-         "a zone clamped below its plan keeps the request-only rule, before the merge is asked",
+        ("admission drops the rule for a stored plan whose halves miss the bound",
+         "a stored plan whose halves miss the bound keeps the request-only rule, before the merge is asked",
          (backend, cache, cache_hpp,
           mutate_in_func(zone_sizing, admit_sig,
                          "if (!zone_onednn_pair_fits(pair_bound_bytes, planned_weights_bytes, planned_activations_bytes)) {",
