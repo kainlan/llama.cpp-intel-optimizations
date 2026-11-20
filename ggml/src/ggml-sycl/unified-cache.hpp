@@ -5210,12 +5210,12 @@ class unified_cache {
 
     // The release of the last model: with no model live, it gives back what this cache sized for one, so the next load
     // plans and builds as a first load does. In order: it waits once for the device work submitted before it, releases
-    // the PP MoE oneDNN ring, the oneDNN scratchpad pair, the MoE reorder temp buffer and the pooled oneDNN Graph
-    // scratch, drains the queued frees, then tears the arena down, which hands its memory back to the device. It stops
-    // at the first thing that holds on, with an ERROR line that names it (a WARN for what a failed load's own buffers
-    // hold at its abort, and at a load's start, LOAD_START, a WARN that names the holders, since one still there once
-    // the failed model is freed is a leak), and releases nothing after it; nothing is reaped, evicted or reset over a
-    // live handle. An arena a failed load's buffers hold at its abort (LOAD_ABORTED) marks the release deferred
+    // the PP MoE oneDNN ring, the oneDNN scratchpad pair and the pooled oneDNN Graph scratch, drains the queued frees,
+    // then tears the arena down, which hands its memory back to the device. It stops at the first thing that holds on,
+    // with an ERROR line that names it (a WARN for what a failed load's own buffers hold at its abort, and at a load's
+    // start, LOAD_START, a WARN that names the holders, since one still there once the failed model is freed is a
+    // leak), and releases nothing after it; nothing is reaped, evicted or reset over a live handle. An arena a failed
+    // load's buffers hold at its abort (LOAD_ABORTED) marks the release deferred
     // (last_release_deferred); the start never sets that mark, and only a release that empties the cache clears it.
     // The next load's start reserves the arena of a cache it emptied again (reserve_released_arena). It reserves
     // nothing itself and never throws: an exception ends it with an ERROR naming `site`.

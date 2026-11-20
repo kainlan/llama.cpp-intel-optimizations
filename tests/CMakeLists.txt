@@ -4797,7 +4797,7 @@ endif()
 
 # Source gate for the release of the last model: the model release hook and a failed load's abort each end in the one
 # step, which with no model live has the cache of each device the scheduler sees give back what it sized for a model
-# (the ring, the oneDNN pair, the reorder temp buffer, the arena) in a fixed order, names what holds on and reserves
+# (the ring, the oneDNN pair, the arena) in a fixed order, names what holds on and reserves
 # nothing, then puts the device's published terms back to their start through the one list; the next load's start
 # reserves the early arena again and refuses the load by name when it cannot. Host-only, reads the sources as text.
 # Same registration shape as test-sycl-load-zone-refusal-source above.

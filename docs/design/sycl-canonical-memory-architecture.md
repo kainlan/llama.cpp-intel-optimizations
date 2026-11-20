@@ -1513,8 +1513,8 @@ in-flight allocation would be affected.
 
 The per-device cache lives for the process; nothing in it stays sized for a
 model once no model is live. After the last model's release, and after a failed
-load's abort with no model live, each cache releases the PP MoE oneDNN ring, the
-oneDNN scratchpad pair and the reorder temp. An arena nothing holds is released,
+load's abort with no model live, each cache releases the PP MoE oneDNN ring and
+the oneDNN scratchpad pair. An arena nothing holds is released,
 its device memory goes back to the card, and the next load's start reserves the
 early arena from start values; the end of a refused load reserves nothing. A
 cache that gave everything back has its published planning terms put back to

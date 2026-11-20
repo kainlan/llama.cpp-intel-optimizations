@@ -3502,7 +3502,7 @@ on, with its count, and the remedy follows from them. Live allocations in the
 zones belong to a model or context, and freeing it lets the zones grow: the
 line above. `<N> leases on its chunks` with nothing live in the zones outlived
 what they point at, and `<M> of the cache's own scratch buffers` (the oneDNN
-scratch pair, the reorder temp, a persistent scratch) stay in the arena until
+scratch pair and a persistent scratch) stay in the arena until
 the cache is torn down at process exit. No free releases either, so the line
 then says to load the model in a new process before any other on the device.
 The cache's scratch decides the remedy whatever else holds the arena. The PP
@@ -3581,8 +3581,8 @@ after each has dropped and put back what its model published. The step asks the
 cache of each device the scheduler sees
 (`ggml_backend_sycl_get_device_count()`). Each cache it asks gives back what it
 sized for a model (`unified_cache::release_for_no_live_model()`): it waits once
-for the device's queued work, then releases the PP MoE oneDNN ring, the oneDNN
-scratchpad pair and the reorder temp, reclaims the graph scratch and the
+for the device's queued work, then releases the PP MoE oneDNN ring and the
+oneDNN scratchpad pair, reclaims the graph scratch and the
 deferred frees, and tears the arena down when nothing holds it. An arena nothing
 holds is released, its device memory goes back to the card, and the next load's
 start reserves the early arena from start values
