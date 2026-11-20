@@ -2013,7 +2013,7 @@ def _graph_floor_reads_the_published_shape(cache: str) -> bool:
     return var is not None and len(calls) == 1 and calls[0] == _shape_var_args(var) + [PLAN_DIRECT_CAP]
 
 
-GRAPH_FLOOR_SHORT_ARG = "onednn_zone_plan_short_text(onednn_zone_plan_of_device(plan.device_id), graph_floor).c_str()"
+GRAPH_FLOOR_SHORT_ARG = "onednn_zone_plan_short_text(onednn_zone_plan_load_of_device(plan.device_id), graph_floor).c_str()"
 
 
 def _graph_floor_info_prints_the_published_shape(cache: str) -> bool:

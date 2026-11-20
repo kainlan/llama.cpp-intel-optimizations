@@ -341,11 +341,11 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
         results["the accessor reads the arena's real ONEDNN zone capacity"] = \
             "vram_zone_id::ONEDNN" in pair_bound and "arena_active()" in pair_bound
         results["the accessor answers through the shared bound helper"] = "onednn_pp_pair_bound_for(" in pair_bound
-    if bound_for is not None:
         # The plan is the one stored on the cache whose ONEDNN capacity the accessor bounds, never another cache's.
-        results["the bound helper reads its own cache's stored plan"] = \
-            pair_bound is not None and \
-            "onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), cache->zone_capacity(" in pair_bound and \
+        results["the accessor bounds by its own cache's plan"] = \
+            "onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), cache->zone_capacity(" in pair_bound
+    if bound_for is not None:
+        results["the helper reads the stored plan's bare plan and floor together"] = \
             "plan.bare_bytes" in bound_for and "plan.graph_floor_bytes" in bound_for
         results["the helper answers through the pure bound"] = "zone_onednn_pp_pair_bound(" in bound_for
         results["the helper does not read a live planner figure or recompute the floor"] = \
@@ -755,9 +755,9 @@ if args.self_test and not failed:
         ("helper reads the live bare plan", "the helper does not read a live planner figure or recompute the floor",
          (backend, mutate_in_func(cache, bound_sig, "plan.bare_bytes",
                                   "unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id)"), cache_hpp)),
-        ("helper ignores the snapshot's bare plan", "the bound helper reads its own cache's stored plan",
+        ("helper ignores the plan's bare plan", "the helper reads the stored plan's bare plan and floor together",
          (backend, mutate_in_func(cache, bound_sig, "plan.bare_bytes", "0"), cache_hpp)),
-        ("accessor bounds by another cache's plan", "the bound helper reads its own cache's stored plan",
+        ("accessor bounds by another cache's plan", "the accessor bounds by its own cache's plan",
          (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
                                   "onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(),",
                                   "onednn_pp_pair_bound_for(get_unified_cache_for_device(0)->onednn_zone_plan_load(),"),

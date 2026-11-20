@@ -938,19 +938,20 @@ bool unified_cache::onednn_zone_plan_keep_short_and_store(const zone_onednn_plan
 }
 
 // A failed load's restore of the plan: while it still holds `written`, what the load left in it, it becomes
-// zone_onednn_plan_keep_short(prior, prior, ...) over the ONEDNN zone's capacity and the pair held in it now. That is
-// `prior` exactly while the zone still holds it, and a smaller Graph floor when the zone was rebuilt smaller or a pair
-// was reserved under the failed load's wider bound in between: `prior` stored raw would then describe a room the zone
-// does not have, or a bound below a pair already held. The test and the store are one critical section, as in
-// onednn_zone_plan_keep_and_store, because the oneDNN pair's reserve asks for the zones without the inventory lock the
-// restore holds. Takes the mutex itself, so it must not call the accessors above.
-void unified_cache::onednn_zone_plan_put_back(const zone_onednn_plan & written,
-                                              const zone_onednn_plan & prior,
-                                              size_t                   capacity_bytes,
-                                              size_t                   held_pair_bytes) {
+// zone_onednn_plan_keep_short(prior, prior, ...) over this cache's ONEDNN zone capacity and the pair held in it now.
+// That is `prior` exactly while the zone still holds it, and a smaller Graph floor when the zone was rebuilt smaller or
+// a pair was reserved under the failed load's wider bound in between: `prior` stored raw would then describe a room the
+// zone does not have, or a bound below a pair already held. The zone is read from this cache, so the plan is never
+// clamped to another cache's zone; both reads take no lock and come before the mutex, which stays a leaf. The test and
+// the store are one critical section, as in onednn_zone_plan_keep_and_store, because the oneDNN pair's reserve asks
+// for the zones without the inventory lock the restore holds. Takes the mutex itself, so it must not call the
+// accessors above.
+void unified_cache::onednn_zone_plan_put_back(const zone_onednn_plan & written, const zone_onednn_plan & prior) {
+    const size_t                capacity = zone_capacity(vram_zone_id::ONEDNN);
+    const size_t                held     = arena_held_onednn_pair_bytes();
     std::lock_guard<std::mutex> lock(onednn_zone_plan_mutex_);
     if (zone_onednn_plan_same(onednn_zone_plan_, written)) {
-        onednn_zone_plan_ = zone_onednn_plan_keep_short(prior, prior, capacity_bytes, held_pair_bytes);
+        onednn_zone_plan_ = zone_onednn_plan_keep_short(prior, prior, capacity, held);
     }
 }
 
@@ -959,7 +960,7 @@ void unified_cache::onednn_zone_plan_put_back(const zone_onednn_plan & written,
 // one after the other and never both: g_cache_rw_mutex, shared, for the lookup, released; then that cache's
 // onednn_zone_plan_mutex_. Cache creation holds g_cache_rw_mutex exclusively while the constructor sizes its zones, so
 // the zone sizing never calls this: it reads and writes its own cache's plan through the members above.
-static zone_onednn_plan onednn_zone_plan_of_device(int device_id) {
+static zone_onednn_plan onednn_zone_plan_load_of_device(int device_id) {
     const unified_cache * const cache = get_existing_unified_cache_for_device(device_id);
     return cache != nullptr ? cache->onednn_zone_plan_load() : zone_onednn_plan();
 }
@@ -3761,7 +3762,7 @@ load_published_terms load_published_terms::snapshot(int device) {
     terms.onednn_weights        = g_planned_onednn_pair_weights_bytes[device].load(std::memory_order_acquire);
     terms.onednn_activations    = g_planned_onednn_pair_activations_bytes[device].load(std::memory_order_acquire);
     terms.onednn_stored         = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device);
-    terms.onednn_zone_plan      = onednn_zone_plan_of_device(device);
+    terms.onednn_zone_plan      = onednn_zone_plan_load_of_device(device);
     terms.planner               = planner_published_terms::snapshot(device);
     return terms;
 }
@@ -3896,9 +3897,7 @@ void load_published_record::restore(int device) const noexcept {
         // from; a device whose cache is gone has no zone and no plan to put back.
         unified_cache * const cache = get_existing_unified_cache_for_device(device);
         if (cache != nullptr) {
-            const size_t capacity = cache->zone_capacity(vram_zone_id::ONEDNN);
-            const size_t held     = cache->arena_held_onednn_pair_bytes();
-            cache->onednn_zone_plan_put_back(written.onednn_zone_plan, prior.onednn_zone_plan, capacity, held);
+            cache->onednn_zone_plan_put_back(written.onednn_zone_plan, prior.onednn_zone_plan);
         }
     }
     // The sum goes back from what this load published to what it held before, in one compare-exchange: the pair's
@@ -36559,7 +36558,7 @@ static void populate_host_zone_sizing(placement_plan &                          
             "n_ubatch=%u n_ctx=%u)%s\n",
             graph_floor / (1024.0 * 1024.0), graph_shape.n_head_ctx_max, graph_shape.n_head_swa_max, graph_shape.n_swa,
             graph_shape.n_ubatch, graph_shape.n_ctx,
-            onednn_zone_plan_short_text(onednn_zone_plan_of_device(plan.device_id), graph_floor).c_str());
+            onednn_zone_plan_short_text(onednn_zone_plan_load_of_device(plan.device_id), graph_floor).c_str());
     }
 #endif
 

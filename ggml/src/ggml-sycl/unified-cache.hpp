@@ -3290,16 +3290,16 @@ struct planner_published_terms {
 // The device-wide terms a model load publishes for a device as it plans, with the planners' (planner): the PP pipeline
 // scratch; the PP MoE oneDNN ring's slots and depth, which of its slots the KV zone holds, and the row bytes, expert
 // counts and micro-batch it is re-planned from; the oneDNN scratchpad pair with its stored sum, which the pair's
-// reserve raises on its own; and the snapshot the ONEDNN zone is described by (the pair plan and the Graph floor the
-// zone ensure stores on the device's cache, unified_cache::onednn_zone_plan_), which the pair bound and the Graph room
+// reserve raises on its own; and the zone plan (the pair plan and the Graph floor the zone ensure stores on the
+// device's cache, unified_cache::onednn_zone_plan_), which the pair bound and the Graph room
 // a context check reads are derived from. Each model on the device plans with these, and every load overwrites them,
 // so a load that fails puts back what it published (load_published_record). The terms keyed by the load's owner are
 // not here (they leave with their owner, unified_cache_drop_planned_load_terms), nor is the compute term's
 // micro-batch, which is sticky by design and which every load records at the same planning value, nor the DIRECT
 // Graph-scratch cap's budget snapshot, which describes the arena as it stands: a failed load that rebuilt the arena
 // leaves the rebuilt arena in place, and the snapshot it stored at that rebuild is the one that arena's cap is derived
-// from. Each setter stores what its getter reads, so a restore is exact, but for the zone snapshot: it describes a
-// zone the failed load may have changed, so it goes back as zone_onednn_plan_keep_short of the prior snapshot over the
+// from. Each setter stores what its getter reads, so a restore is exact, but for the zone plan: it describes a
+// zone the failed load may have changed, so it goes back as zone_onednn_plan_keep_short of the prior plan over the
 // zone as it is then. The terms fall in groups (load_published_group), each the terms one publisher writes together,
 // and a restore puts back whole groups, so no group holds part of one publisher's terms and part of another's.
 enum load_published_group : uint32_t {
@@ -3350,7 +3350,7 @@ struct load_published_terms {
 // since; `written` is what each group held when this load last looked. note() takes one planner pass of the load: the
 // terms when it started and when it ended, both read under the inventory lock that every publisher but the reserve
 // holds, so only the pass wrote between them. restore() puts a group back only while it still holds `written`, the sum
-// by compare-exchange, so a raise outside that lock is kept, and the zone snapshot by a test and store on the device's
+// by compare-exchange, so a raise outside that lock is kept, and the zone plan by a test and store on the device's
 // cache under that cache's zone-plan mutex (unified_cache::onednn_zone_plan_put_back), which the pair's reserve also
 // writes through. A publisher that writes exactly what the load published cannot be told from the load, and its group
 // goes back with the load's.
@@ -5097,13 +5097,8 @@ class unified_cache {
     // stored). A reader that holds only a device id asks that device's existing cache. Takes onednn_zone_plan_mutex_
     // alone.
     zone_onednn_plan onednn_zone_plan_load() const;
-    // A failed load's restore of that plan (load_published_record::restore): while it still holds `written`, what the
-    // load left in it, it becomes zone_onednn_plan_keep_short(prior, prior, ...) over the ONEDNN zone's capacity and
-    // the pair held in it now. Takes onednn_zone_plan_mutex_ alone; the test and the store are one critical section.
-    void             onednn_zone_plan_put_back(const zone_onednn_plan & written,
-                                               const zone_onednn_plan & prior,
-                                               size_t                   capacity_bytes,
-                                               size_t                   held_pair_bytes);
+    // A failed load's restore (load_published_record::restore); see the definition. Takes onednn_zone_plan_mutex_.
+    void             onednn_zone_plan_put_back(const zone_onednn_plan & written, const zone_onednn_plan & prior);
     // Both free-space figures of one zone, read together under its allocator group's mutex: the
     // allocators' figures are only coherent under it (zone_available and zone_largest_free read
     // them bare), with the zone's capacity and used bytes read at the same instant. For a zone with its
@@ -6385,17 +6380,14 @@ class unified_cache {
     // exchange, so two ensures of one load racing on the device warn once between them.
     std::atomic<uint64_t> onednn_zone_kept_warn_txn_{ 0 };
 
-    // The two figures this cache's ONEDNN zone was sized from, kept together as ONE snapshot (zone_onednn_plan): the
-    // pair's own plan and the oneDNN Graph SDPA floor that shares the zone. ensure_planned_arena_zones() writes it when
-    // it keeps or builds this cache's zone, and onednn_zone_plan_put_back() when a failed load's restore puts it back.
-    // The pair reserve reads it, and every reader of the pair bound reads it from the cache whose zone capacity it
-    // reads. It lives on the cache that owns the zone, so a zone is never judged by a plan another cache stored: a
-    // second cache on one device (an arena reserved by hand) has its own. The planner's live figures are overwritten by
-    // every model's plan, and the SDPA shape the floor derives from is rewritten by runtime plans the zone was not
-    // rebuilt for, so neither can describe a zone that was built earlier: a draft model loaded beside the target would
-    // hand a bound derived from the draft's figures to the target's zone.
+    // The plan this cache's ONEDNN zone was sized from (zone_onednn_plan says what it holds and why it is kept apart
+    // from the planner's live figures). ensure_planned_arena_zones() writes it when it keeps or builds this cache's
+    // zone, and onednn_zone_plan_put_back() when a failed load's restore puts it back. The pair reserve reads it, and
+    // every reader of the pair bound reads it from the cache whose zone capacity it reads. It lives on the cache that
+    // owns the zone, so a zone is never judged by a plan another cache stored: a second cache on one device (an arena
+    // reserved by hand) has its own.
     //
-    // No plan stored: a cache holds the default plan (all four figures zero) until ensure_planned_arena_zones() sizes
+    // No plan stored: a cache holds the default plan (every figure zero) until ensure_planned_arena_zones() sizes
     // its zone, and that stores a plan whenever it builds or keeps one, so a zone with no plan stored was reserved by a
     // direct arena_reserve() call, which only tests make. A pair in that zone is bounded by the zone's capacity alone
     // (zone_onednn_pp_pair_bound of a zero plan and a zero floor is the capacity, as for a stored plan with neither a
@@ -6404,8 +6396,9 @@ class unified_cache {
     // no floor for the bound to keep free, and a Graph scratch the pair leaves no room for takes the DIRECT path under
     // its cap, as one that misses any full ONEDNN zone does.
     //
-    // onednn_zone_plan_mutex_ guards the plan alone. Each accessor below takes it alone and calls only the pure rules
-    // of zone-sizing.hpp while it holds it, so it ranks after every other lock a caller may hold.
+    // onednn_zone_plan_mutex_ guards the plan alone. Each of the five accessors (the load and the put-back declared
+    // above, the three below) takes it alone and calls only the pure rules of zone-sizing.hpp while it holds it, so it
+    // is a leaf: nothing is taken under it, and it may be taken under any lock.
     mutable std::mutex onednn_zone_plan_mutex_;
     zone_onednn_plan   onednn_zone_plan_{};
 

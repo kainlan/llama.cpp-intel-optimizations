@@ -27,7 +27,8 @@ the blocked rebuild keeps the zones when the floor is all they lack. These check
   would leave the live model a smaller Graph room for nothing. The published-terms snapshot reads it as its own group
   (differing() and take_groups() carry its arm), and the restore stores zone_onednn_plan_keep_short(prior, prior,
   capacity now, held pair now) under the zone-plan mutex only while the snapshot still holds what the load left
-  (test-zone-sizing Case 44). The DIRECT cap snapshot is not put back (it describes the arena as it stands, and a
+  (test-zone-sizing Case 44), through the put-back of the device's cache, which reads that cache's zone itself before
+  it takes the mutex. The DIRECT cap snapshot is not put back (it describes the arena as it stands, and a
   failed load that rebuilt the arena leaves the rebuilt arena in place), so the published-terms snapshot does not read
   it, and the keep path writes no planner-published term;
 - log: the DIRECT-failure ERROR and the plan's "[SYCL-PLAN] oneDNN Graph-scratch zone floor:" line keep their fields
@@ -37,9 +38,10 @@ the blocked rebuild keeps the zones when the floor is all they lack. These check
   per-device store, so a zone cannot be judged by a plan another cache stored on the same device. A cache whose arena
   was reserved by hand stored none, and test-unified-runtime-alloc's arena_owned_shutdown_and_lifecycle_serialization
   was refused its pair because the device's own cache had stored a plan whose Graph floor exceeded the hand-built zone.
-  Every accessor is a member that takes that mutex; the pair reserve and its refusal read their own cache's plan; the
-  pair-bound and Graph-room accessors read the plan of the cache whose capacity they read; a reader that holds only a
-  device id (the published-terms snapshot, the plan's floor line) asks that device's existing cache through one helper.
+  Every accessor is a member that takes that mutex, and nothing else touches the member;
+- readers: the pair reserve and its refusal read their own cache's plan; the pair-bound and Graph-room accessors read
+  the plan of the cache whose capacity they read; a reader that holds only a device id (the published-terms snapshot,
+  the plan's floor line) asks that device's existing cache through one helper, which creates none.
 
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live
 inside test_*() functions. Checks read comment-stripped, whitespace-normalised text. Each check has a mutation witness
@@ -174,20 +176,23 @@ KEPT_WARN_ARGS = ("dev_id, arena_zones.onednn / (1024.0 * 1024.0), live_plan.gra
 TERMS_SIG = "load_published_terms load_published_terms::snapshot(int device) {"
 PUBLISHED_WRITES = ("unified_cache_set_planned_", "g_planned_")
 ZONE_GROUP = "LOAD_PUBLISHED_GROUP_ZONE_PLAN"
-TERMS_READ = "terms.onednn_zone_plan = onednn_zone_plan_of_device(device);"
+TERMS_READ = "terms.onednn_zone_plan = onednn_zone_plan_load_of_device(device);"
 DIFFERING_SIG = "uint32_t load_published_terms::differing(const load_published_terms & other) const {"
 DIFFERING_ARM = f"bit(!zone_onednn_plan_same(onednn_zone_plan, other.onednn_zone_plan), {ZONE_GROUP})"
 TAKE_SIG = "void load_published_terms::take_groups(const load_published_terms & from, uint32_t groups) {"
 TAKE_ARM = f"if (groups & {ZONE_GROUP}) {{ onednn_zone_plan = from.onednn_zone_plan; }}"
 RESTORE_SIG = "void load_published_record::restore(int device) const noexcept {"
 RESTORE_ARM = f"if (back & {ZONE_GROUP}) {{"
-RESTORE_CAPACITY = "cache->zone_capacity(vram_zone_id::ONEDNN)"
-RESTORE_HELD = "cache->arena_held_onednn_pair_bytes()"
 PUT_BACK_FN = "onednn_zone_plan_put_back"
 PUT_BACK_SIG = f"void unified_cache::{PUT_BACK_FN}("
-PUT_BACK_CALL = f"cache->{PUT_BACK_FN}(written.onednn_zone_plan, prior.onednn_zone_plan, capacity, held);"
+PUT_BACK_CALL = f"cache->{PUT_BACK_FN}(written.onednn_zone_plan, prior.onednn_zone_plan);"
+# The put-back reads its own cache's zone, before it takes the zone-plan mutex.
+CAPACITY_READ = "zone_capacity(vram_zone_id::ONEDNN)"
+HELD_READ = "arena_held_onednn_pair_bytes()"
+PUT_BACK_CAPACITY = f"const size_t capacity = {CAPACITY_READ};"
+PUT_BACK_HELD = f"const size_t held = {HELD_READ};"
 PUT_BACK_TEST = "if (zone_onednn_plan_same(onednn_zone_plan_, written)) {"
-PUT_BACK_RULE = "zone_onednn_plan_keep_short(prior, prior, capacity_bytes, held_pair_bytes)"
+PUT_BACK_RULE = "zone_onednn_plan_keep_short(prior, prior, capacity, held)"
 PUT_BACK_STORE = f"onednn_zone_plan_ = {PUT_BACK_RULE};"
 SHORT_FN = "onednn_zone_plan_short_text"
 SHORT_SIG = f"static std::string {SHORT_FN}(const zone_onednn_plan & stored, size_t formula_bytes) {{"
@@ -204,7 +209,7 @@ POPULATE_SIG = "static void populate_host_zone_sizing(placement_plan & plan,"
 FLOOR_VALUE = "const size_t graph_floor = onednn_graph_scratch_zone_floor_bytes_swa("
 FLOOR_PREFIX = '"[SYCL-PLAN] oneDNN Graph-scratch zone floor: %.1f MB (n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u "'
 FLOOR_TEXT = '"n_ubatch=%u n_ctx=%u)%s\\n",'
-FLOOR_ARG = f"{SHORT_FN}(onednn_zone_plan_of_device(plan.device_id), graph_floor).c_str());"
+FLOOR_ARG = f"{SHORT_FN}(onednn_zone_plan_load_of_device(plan.device_id), graph_floor).c_str());"
 CLASS_OPEN = "class unified_cache {"
 HOME_MUTEX = "mutable std::mutex onednn_zone_plan_mutex_;"
 HOME_MEMBER = "zone_onednn_plan onednn_zone_plan_{};"
@@ -217,7 +222,7 @@ ACCESSOR_SIGS = (
     "bool unified_cache::onednn_zone_plan_keep_short_and_store(",
     "void unified_cache::onednn_zone_plan_put_back(",
 )
-OF_DEVICE_FN = "onednn_zone_plan_of_device"
+OF_DEVICE_FN = "onednn_zone_plan_load_of_device"
 OF_DEVICE_SIG = f"static zone_onednn_plan {OF_DEVICE_FN}(int device_id) {{"
 OF_DEVICE_LOOKUP = "const unified_cache * const cache = get_existing_unified_cache_for_device(device_id);"
 OF_DEVICE_READ = "return cache != nullptr ? cache->onednn_zone_plan_load() : zone_onednn_plan();"
@@ -225,11 +230,7 @@ RESERVE_SIG = "bool unified_cache::reserve_onednn_scratch(size_t weights_size, s
 RESERVE_FIRST = "const zone_onednn_plan zone_plan = arena_on ? onednn_zone_plan_load() : zone_onednn_plan();"
 RESERVE_REFUSAL = "const size_t pair_bound_now = onednn_pp_pair_bound_for(onednn_zone_plan_load(), zone_cap);"
 PAIR_BOUND_SIG = "bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound) {"
-PAIR_BOUND_READ = (
-    "*bound = onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), cache->zone_capacity(vram_zone_id::ONEDNN));"
-)
 ROOM_SIG = "bool unified_cache_get_onednn_graph_room(int device_id, size_t * room) {"
-ROOM_READ = "const size_t bound = onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), capacity);"
 BOUND_FN = "onednn_pp_pair_bound_for"
 # The first argument every use of the bound helper may pass: its own parameter at the definition, the reserve's loaded
 # plan, this cache's plan, or the plan of the cache whose capacity the accessor reads.
@@ -338,10 +339,11 @@ def claim_a_keep_warns_once_per_load(uc: str) -> bool:
 
 def claim_a_failed_load_puts_the_zone_plan_back(uc: str) -> bool:
     """The zone-plan snapshot is one group of a load's published record: the published-terms snapshot reads it,
-    differing() and take_groups() carry its arm, and the restore puts it back through the put-back, which under the
-    zone-plan mutex stores zone_onednn_plan_keep_short(prior, prior, capacity, held pair) only while the snapshot still
-    holds what the load left. The DIRECT cap snapshot is not read into the record, and the keep path writes no
-    planner-published term."""
+    differing() and take_groups() carry its arm, and the restore puts it back through the put-back of the device's
+    cache. The put-back reads that cache's ONEDNN zone capacity and the pair held in it, then under the zone-plan mutex
+    stores zone_onednn_plan_keep_short(prior, prior, capacity, held pair) only while the snapshot still holds what the
+    load left; it takes no figure from its caller, so the plan is never clamped to another cache's zone. The DIRECT cap
+    snapshot is not read into the record, and the keep path writes no planner-published term."""
     c = code(uc)
     terms = fn_body(c, TERMS_SIG)
     restore = fn_body(c, RESTORE_SIG)
@@ -352,9 +354,9 @@ def claim_a_failed_load_puts_the_zone_plan_back(uc: str) -> bool:
         and SNAPSHOT not in terms
         and DIFFERING_ARM in fn_body(c, DIFFERING_SIG)
         and TAKE_ARM in fn_body(c, TAKE_SIG)
-        and ordered(arm, RESTORE_CAPACITY, RESTORE_HELD, PUT_BACK_CALL)
+        and arm.count(PUT_BACK_CALL) == 1
         and c.count(PUT_BACK_FN + "(") == 2
-        and ordered(fn_body(c, PUT_BACK_SIG), PLAN_LOCK, PUT_BACK_TEST, PUT_BACK_STORE)
+        and ordered(fn_body(c, PUT_BACK_SIG), PUT_BACK_CAPACITY, PUT_BACK_HELD, PLAN_LOCK, PUT_BACK_TEST, PUT_BACK_STORE)
         and all(writers)
         and not any(w in body for body in writers for w in PUBLISHED_WRITES)
     )
@@ -396,22 +398,14 @@ def first_args(text: str, fn: str) -> list:
 
 def claim_the_zone_plan_lives_on_its_cache(uc: str, hpp: str) -> bool:
     """The plan is a member of the cache that owns the zone, under that cache's own mutex, and no per-device store of
-    it exists. Each accessor takes the mutex once, and no other site takes it or touches the member. The pair reserve
-    and its refusal read their own cache's plan; the pair-bound and Graph-room accessors read the plan of the cache
-    whose capacity they read; the readers that hold only a device id ask that device's existing cache through one
-    helper."""
+    it exists. Each accessor takes the mutex once, no other site takes it or touches the member, and the load takes no
+    argument a device could key it by."""
     c = code(uc)
     h = code(hpp)
     cls = block_at(h, h.find(CLASS_OPEN)) if CLASS_OPEN in h else ""
     bodies = [fn_body(c, sig) for sig in ACCESSOR_SIGS]
-    reserve = fn_body(c, RESERVE_SIG)
-    pair_bound = fn_body(c, PAIR_BOUND_SIG)
-    room = fn_body(c, ROOM_SIG)
     member = r"\bonednn_zone_plan_(?!\w)"
     member_uses = len(re.findall(member, c))
-    of_device = OF_DEVICE_FN + "("
-    # The helper's definition and the two readers that hold only a device id are its only sites.
-    of_device_sites = 1 + fn_body(c, TERMS_SIG).count(of_device) + fn_body(c, POPULATE_SIG).count(of_device)
     return (
         "g_onednn_zone_plan" not in c
         and re.search(r"\bzone_onednn_plan\s+\w+\s*\[", c) is None
@@ -422,15 +416,32 @@ def claim_the_zone_plan_lives_on_its_cache(uc: str, hpp: str) -> bool:
         and member_uses > 0
         and member_uses == sum(len(re.findall(member, body)) for body in bodies)
         and re.search(r"\bonednn_zone_plan_load\(\s*[^)\s]", c) is None
-        and set(first_args(c, BOUND_FN)) <= BOUND_FIRST_ARGS
+    )
+
+
+def claim_readers_ask_the_cache_that_owns_the_zone(uc: str) -> bool:
+    """Every use of the pair-bound helper passes a plan read from a cache it already holds: the reserve and its refusal
+    their own cache's, the pair-bound and Graph-room accessors the cache whose capacity they read (the exact reads are
+    pinned in test-sycl-onednn-pp-scratch-plan-source.py and test-sycl-onednn-graph-scratch-refusal-source.py). None of
+    those three bodies reads a plan through the device-id helper, and the reserve looks no cache up. The readers that
+    hold only a device id (the published-terms snapshot and the plan's floor line) ask that device's existing cache
+    through that one helper, which creates none."""
+    c = code(uc)
+    reserve = fn_body(c, RESERVE_SIG)
+    pair_bound = fn_body(c, PAIR_BOUND_SIG)
+    room = fn_body(c, ROOM_SIG)
+    of_device = OF_DEVICE_FN + "("
+    # The helper's definition and the two readers that hold only a device id are its only sites.
+    of_device_sites = 1 + fn_body(c, TERMS_SIG).count(of_device) + fn_body(c, POPULATE_SIG).count(of_device)
+    return (
+        set(first_args(c, BOUND_FN)) <= BOUND_FIRST_ARGS
+        and all(BOUND_FN + "(" in body for body in (reserve, pair_bound, room))
         and ordered(fn_body(c, OF_DEVICE_SIG), OF_DEVICE_LOOKUP, OF_DEVICE_READ)
         and c.count(of_device) == of_device_sites
         and RESERVE_FIRST in reserve
         and RESERVE_REFUSAL in reserve
         and "get_existing_unified_cache_for_device(" not in reserve
-        and PAIR_BOUND_READ in pair_bound
-        and ROOM_READ in room
-        and not any(OF_DEVICE_FN + "(" in body for body in (reserve, pair_bound, room))
+        and not any(of_device in body for body in (reserve, pair_bound, room))
     )
 
 
@@ -445,6 +456,7 @@ def keep_checks(uc: str, gs: str, hpp: str = HPP) -> dict:
         "restore": claim_a_failed_load_puts_the_zone_plan_back(uc),
         "log": claim_both_lines_name_the_stored_floor(uc),
         "home": claim_the_zone_plan_lives_on_its_cache(uc, hpp),
+        "readers": claim_readers_ask_the_cache_that_owns_the_zone(uc),
     }
 
 
@@ -518,11 +530,17 @@ def test_both_lines_name_the_stored_floor():
 def test_the_zone_plan_lives_on_its_cache():
     assert claim_the_zone_plan_lives_on_its_cache(UC, HPP), (
         "the ONEDNN zone plan must be a member of the unified_cache that owns the zone, under its own mutex, with no "
-        "per-device store: every accessor a member that takes that mutex, the pair reserve and its refusal reading "
-        "their own cache's plan, the pair-bound and Graph-room accessors reading the plan of the cache whose capacity "
-        f"they read, and a reader with only a device id asking that device's existing cache through {OF_DEVICE_FN}(). "
-        "A per-device store judges a zone by a plan another cache stored: a cache whose arena was reserved by hand "
-        "was refused every oneDNN pair because the device's own cache had stored a larger Graph floor"
+        "per-device store, and every accessor a member that takes that mutex. A per-device store judges a zone by a "
+        "plan another cache stored: a cache whose arena was reserved by hand was refused every oneDNN pair because the "
+        "device's own cache had stored a larger Graph floor"
+    )
+
+
+def test_readers_ask_the_cache_that_owns_the_zone():
+    assert claim_readers_ask_the_cache_that_owns_the_zone(UC), (
+        "the pair reserve and its refusal must read their own cache's plan, the pair-bound and Graph-room accessors "
+        f"the plan of the cache whose capacity they read, and a reader with only a device id must ask that device's "
+        f"existing cache through {OF_DEVICE_FN}(), which no other reader calls"
     )
 
 
@@ -586,9 +604,16 @@ def test_witnesses():
     # The prior plan stored over another publisher's later store.
     only_fails(mutate_in(UC, PUT_BACK_SIG, PUT_BACK_TEST, "{"), GS, "restore")
     # The put-back ignoring the pair held in the zone now (read as 0): the stored floor leaves no room for that pair.
-    only_fails(mutate_in(UC, RESTORE_SIG, RESTORE_HELD, "0"), GS, "restore")
+    only_fails(mutate_in(UC, PUT_BACK_SIG, HELD_READ, "0"), GS, "restore")
     # The put-back reading the zone's capacity as 0: every put-back would store a Graph floor of 0.
-    only_fails(mutate_in(UC, RESTORE_SIG, RESTORE_CAPACITY, "0"), GS, "restore")
+    only_fails(mutate_in(UC, PUT_BACK_SIG, CAPACITY_READ, "0"), GS, "restore")
+    # The zone read under the zone-plan mutex: the mutex is no longer a leaf.
+    only_fails(mutate_in(UC, PUT_BACK_SIG, PUT_BACK_CAPACITY + " " + PUT_BACK_HELD + " " + PLAN_LOCK,
+                         PLAN_LOCK + " " + PUT_BACK_CAPACITY + " " + PUT_BACK_HELD), GS, "restore")
+    # The caller handing the put-back a zone's figures again: they can be another cache's.
+    only_fails(mutate_in(UC, RESTORE_SIG, PUT_BACK_CALL,
+                         f"cache->{PUT_BACK_FN}(written.onednn_zone_plan, prior.onednn_zone_plan, 0, 0);"), GS,
+               "restore")
     # The take_groups arm dropped: the record never takes the zone plan as its prior, so a restore has nothing to put.
     only_fails(mutate_in(UC, TAKE_SIG, TAKE_ARM, ""), GS, "restore")
 
@@ -601,23 +626,29 @@ def test_witnesses():
 
     # A per-device store of the plan again: a zone is judged by whichever cache on the device stored last.
     only_fails(code(UC) + " static zone_onednn_plan g_onednn_zone_plan[GGML_SYCL_MAX_DEVICES]{};", GS, "home")
-    # The reserve's refusal judged by the device's cache rather than its own: the hand-built arena's defect.
-    only_fails(mutate_in(UC, RESERVE_SIG, "onednn_pp_pair_bound_for(onednn_zone_plan_load(), zone_cap)",
-                         f"onednn_pp_pair_bound_for({OF_DEVICE_FN}(ggml_sycl_get_device_id_from_queue(queue_)), "
-                         "zone_cap)"), GS, "home")
-    # The pair-bound accessor reading a plan through a second lookup, which can find another cache than the one
-    # whose capacity it reads.
-    only_fails(mutate_in(UC, PAIR_BOUND_SIG, "cache->onednn_zone_plan_load(), cache->zone_capacity",
-                         f"{OF_DEVICE_FN}(device_id), cache->zone_capacity"), GS, "home")
-    # The Graph-room accessor the same way.
-    only_fails(mutate_in(UC, ROOM_SIG, "cache->onednn_zone_plan_load(), capacity",
-                         f"{OF_DEVICE_FN}(device_id), capacity"), GS, "home")
     # The plan read without its mutex: a store and a read race.
     only_fails(mutate_in(UC, LOAD_SIG, MEMBER_LOCK, ""), GS, "home")
+    # The member read outside the accessors, without the mutex.
+    only_fails(code(UC) + " zone_onednn_plan peek(const unified_cache & c) { return c.onednn_zone_plan_; }", GS, "home")
     # The plan no longer a member of the cache.
     hpp_code = code(HPP)
     assert hpp_code.count(HOME_MEMBER) == 1, "witness anchor: the plan member is not declared once"
     only_fails(UC, GS, "home", hpp_code.replace(HOME_MEMBER, ""))
+
+    # The reserve's refusal judged by the device's cache rather than its own: the hand-built arena's defect.
+    only_fails(mutate_in(UC, RESERVE_SIG, "onednn_pp_pair_bound_for(onednn_zone_plan_load(), zone_cap)",
+                         f"onednn_pp_pair_bound_for({OF_DEVICE_FN}(ggml_sycl_get_device_id_from_queue(queue_)), "
+                         "zone_cap)"), GS, "readers")
+    # The pair-bound accessor reading a plan through a second lookup, which can find another cache than the one
+    # whose capacity it reads.
+    only_fails(mutate_in(UC, PAIR_BOUND_SIG, "cache->onednn_zone_plan_load(), cache->zone_capacity",
+                         f"{OF_DEVICE_FN}(device_id), cache->zone_capacity"), GS, "readers")
+    # The Graph-room accessor the same way.
+    only_fails(mutate_in(UC, ROOM_SIG, "cache->onednn_zone_plan_load(), capacity",
+                         f"{OF_DEVICE_FN}(device_id), capacity"), GS, "readers")
+    # The device-id helper creating a cache for a reader that only asks.
+    only_fails(mutate_in(UC, OF_DEVICE_SIG, "get_existing_unified_cache_for_device(device_id)",
+                         "get_unified_cache_for_device(device_id)"), GS, "readers")
 
 
 if __name__ == "__main__":
