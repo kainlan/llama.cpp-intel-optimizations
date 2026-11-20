@@ -443,9 +443,9 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
 // (zone_onednn_pp_scratch_planned); otherwise it is refused at acquire and by the graph-entry walk alike, draws the
 // dequant buffers, and the walk grows them past their plan. An admitted op is reserved at the per-half maximum of the
 // planned, held and requested pairs (zone_onednn_scratch_reserve_target), which never shrinks a half, so the held pair
-// is not replaced inside a graph, except in the cases that target's comment lists (a clamped zone, no planned pair
-// stored, a pair held from an earlier stored plan of a kept zone, two admitted ops above the plan in different halves
-// of a zone with slack).
+// is not replaced inside a graph, except in the cases that target's comment lists (a stored plan whose halves do not
+// fit the bound, which the arena does not build from a consistent plan; no planned pair stored; a pair held from an
+// earlier stored plan of a kept zone; two admitted ops above the plan in different halves of a zone with slack).
 // A weight the zone was not sized for (the LM head, a tied embedding) or a type the scratch is off for
 // (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=0) draws the dequant buffers instead. A head that the zone's slack happens to
 // supply is still planned: whether the head runs on many rows or on the last row only is unknown until llama.cpp-fkpg
@@ -478,9 +478,10 @@ bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool
 // planned). So whenever the planned pair (`planned_weights_bytes`, `planned_activations_bytes`, the halves of the
 // zone_onednn_plan the bound was computed from) fits the bound, max(planned, request) per half must fit it too. The
 // rule reads the planned pair, not the held one, so the op arm and the graph-entry walk, which asks before anything
-// is held, give the same answer; a refused op draws the planned dequant buffers the walk sizes for it. In a zone
-// clamped below its plan (the planned pair itself does not fit the bound) nothing can merge with the plan and the
-// request alone is the rule. Pass 0, 0 for no planned pair. Pure.
+// is held, give the same answer; a refused op draws the planned dequant buffers the walk sizes for it. When the
+// planned pair itself does not fit the bound, nothing can merge with it and the request alone is the rule. The arena
+// floors the zone at the bare plan, so that is only a stored plan whose halves exceed the sum they were stored with,
+// not a state it builds from a consistent plan. Pass 0, 0 for no planned pair. Pure.
 bool zone_onednn_pp_scratch_planned(bool   arena_active,
                                     size_t pair_bound_bytes,
                                     size_t planned_weights_bytes,
@@ -507,10 +508,11 @@ bool zone_onednn_pp_scratch_planned(bool   arena_active,
 // wider micro-batch's (10, 55) against a planned (60, 40) at a bound of 120) each merge with the plan but not with
 // each other.
 //
-// Two targets remain below the first. In a zone clamped below its plan (the planned pair does not fit
-// `pair_bound_bytes`), or with no planned pair stored, the target is the held-and-requested merge. When that does not
-// fit either (in those zones, in the slack exception above, or against a pair held from an earlier plan of a zone
-// that was kept) the request is used as asked, so a held pair that cannot merge does not wedge every later request.
+// Two targets remain below the first. With a stored plan whose halves do not fit `pair_bound_bytes` (not a state the
+// arena builds from a consistent plan, since it floors the zone at the bare plan), or with no planned pair stored,
+// the target is the held-and-requested merge. When that does not fit either (in those cases, in the slack exception
+// above, or against a pair held from an earlier plan of a zone that was kept) the request is used as asked, so a held
+// pair that cannot merge does not wedge every later request.
 // It replaces the held pair, whose release is event-deferred, so for a moment the superseded block and the new one
 // can both occupy the zone, and if the zone allocation then fails the request is served through the unified-cache
 // direct path (the transient old-plus-new case in reserve_onednn_scratch). The request fits the bound alone, which
@@ -579,10 +581,11 @@ struct zone_onednn_plan {
 // smaller one's. The pair is kept whole (its halves sum into its bare plan): the pair of whichever plan has the larger
 // bare plan, the held one on a tie. Maxing each half on its own would build a pair no plan had, above what the zone
 // holds. Keeping one pair means an op sized by the other plan's halves, whose per-half maximum with the kept pair
-// leaves the bound, is refused at admission (zone_onednn_pp_scratch_planned) and draws the planned dequant buffers,
-// rather than replacing the kept pair. The Graph floor is a separate requirement on the same
-// zone and keeps its own maximum. A rebuilt zone is described by the live plan outright (the caller stores it
-// directly). Pure.
+// leaves the bound, is refused at admission (zone_onednn_pp_scratch_planned) rather than replacing the kept pair. It
+// draws the f16 dequant buffers, whose plan does not count a pair-eligible weight, so the graph-entry walk grows them
+// in the RUNTIME zone past their plan and refuses the graph when that zone cannot hold them. The Graph floor is a
+// separate requirement on the same zone and keeps its own maximum. A rebuilt zone is described by the live plan
+// outright (the caller stores it directly). Pure.
 zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live);
 
 // Whether two snapshots are the same in all four figures: the test a load's published record uses to tell that the

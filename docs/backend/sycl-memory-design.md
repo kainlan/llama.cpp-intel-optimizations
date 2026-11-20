@@ -2919,9 +2919,11 @@ take part of the room: the per-op primitive user scratchpads
 zone, and the pair's growth step, which holds the superseded pair and the new
 one in the zone at once while the old one drains. A Graph request they crowd
 out goes DIRECT; the check does not count them. The growth step is reached
-only in a zone clamped below its plan, with no planned pair stored, against
-a pair held from an earlier stored plan of a zone that was kept, or when two
-admitted ops exceed the plan in different halves of a zone with slack: the
+only with a stored plan whose halves do not fit the pair bound (not a state
+the arena builds from a consistent plan: it floors the zone at the bare
+plan), with no planned pair stored, against a pair held from an earlier
+stored plan of a zone that was kept, or when two admitted ops exceed the
+plan in different halves of a zone with slack: the
 admission refuses an op whose per-half maximum with the planned pair leaves
 the bound (`zone_onednn_pp_scratch_planned`).
 
@@ -4289,16 +4291,24 @@ recovery path: it measures the driver's working set and sizes the headroom from 
      entry. An admitted op is reserved (`zone_onednn_scratch_reserve_target`)
      at the per-component maximum of the planned, held and requested pairs,
      which never shrinks a half, so the held pair is not replaced inside a
-     graph (test-zone-sizing Case 14n), except in the cases below. In a zone
-     clamped below its plan the request alone is the rule, and there, with no
-     planned pair stored, against a pair held from an earlier stored plan of
-     a zone that was kept, or when two admitted ops exceed the plan in
-     different halves of a zone with slack above the plan, the target falls
-     back to the held-and-requested merge and then to the request as asked,
-     which replaces the held pair. The kept-zone case: a context holds
-     (60, 40); a draft model's plan (100, 10) is kept because its bare plan is
-     larger, so the bound becomes 110; its op (100, 10) is admitted, but
-     max(held, planned) is (100, 40) = 140, so it is reserved as asked.
+     graph (test-zone-sizing Case 14n), except in the cases below. With a
+     stored plan whose halves do not fit the pair bound the request alone is
+     the rule; that is not a state the arena builds from a consistent plan,
+     since it floors the zone at the bare plan. There, with no planned pair
+     stored, against a pair held from an earlier stored plan of a zone that
+     was kept, or when two admitted ops exceed the plan in different halves
+     of a zone with slack above the plan, the target falls back to the
+     held-and-requested merge and then to the request as asked, which
+     replaces the held pair. The kept-zone case: a context holds (60, 40); a
+     draft model's plan (100, 10) is kept because its bare plan is larger, so
+     the bound becomes 110; its op (100, 10) is admitted, but
+     max(held, planned) is (100, 40) = 140, so it is reserved as asked. From
+     then on the holding context's own (60, 40) ops merge with the kept pair
+     to (100, 40) = 140, exceed the bound of 110 and are refused at
+     admission; on the routes that draw them they draw the f16 dequant
+     buffers, which the graph-entry walk grows in the RUNTIME zone past their
+     plan (pair-eligible weights get no dequant plan), and a graph is refused
+     if RUNTIME cannot hold that growth.
 
    Until 2026-11-20 this half was `onednn_eligible`, the largest eligible weight
    *as stored*: a placeholder with no relation to a micro-batch. It covered

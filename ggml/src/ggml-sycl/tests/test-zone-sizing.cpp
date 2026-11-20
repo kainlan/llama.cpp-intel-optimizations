@@ -1488,8 +1488,9 @@ int main() {
         CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 120 * mib, plan_w, plan_a, 10 * mib, 60 * mib + 1),
               "slack: one byte past the bound in the merge is refused although the request alone is 70 MiB");
 
-        // A zone clamped below its plan (the planned pair itself does not fit the bound) keeps the request-only rule:
-        // no request can merge with a pair the zone cannot hold.
+        // A stored plan whose halves do not fit the bound keeps the request-only rule: no request can merge with a
+        // pair the zone cannot hold. The arena floors the zone at the bare plan, so only an inconsistent stored plan
+        // reaches this.
         CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, 80 * mib, plan_w, plan_a, 10 * mib, 70 * mib),
               "clamped zone: a request that fits the bound alone is admitted");
         CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 80 * mib, plan_w, plan_a, 10 * mib, 70 * mib + 1),

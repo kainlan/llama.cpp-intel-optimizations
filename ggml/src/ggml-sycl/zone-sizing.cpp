@@ -544,8 +544,8 @@ bool zone_onednn_pp_scratch_planned(bool   arena_active,
     if (!zone_onednn_pair_fits(pair_bound_bytes, weights_bytes, activations_bytes)) {
         return false;
     }
-    // A zone clamped below its plan cannot hold the planned pair, so no request can merge with it: the request alone
-    // is the rule there.
+    // The stored halves do not fit the bound. The arena floors the zone at the bare plan, so this is only a plan whose
+    // halves exceed the sum they were stored with; with nothing to merge with, the request alone is the rule.
     if (!zone_onednn_pair_fits(pair_bound_bytes, planned_weights_bytes, planned_activations_bytes)) {
         return true;
     }
