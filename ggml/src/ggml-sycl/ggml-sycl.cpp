@@ -13335,8 +13335,10 @@ struct ggml_sycl_load_published_pass {
 // failed stage skips it and no catch handler is added for it. No caller of the abort holds the inventory lock: the
 // abort takes it itself, to reset the load's scratch state. Its setters are plain stores, but for the zone plan's: that
 // arm looks the device's cache up under the cache map's shared lock, released when the lookup returns, reads the zone's
-// capacity and held pair without a lock, and stores the plan under the zone-plan mutex. Both are taken after the two
-// locks above and held for that step alone.
+// capacity and held pair without a lock, and stores the plan on that cache under its zone-plan mutex. Both are taken
+// after the two locks above and held for that step alone. Every snapshot of the terms (the capture, both reads of a
+// pass, the restore's own) reads the zone plan the same way: the device's existing cache is looked up under the map's
+// shared lock, then its plan read under its zone-plan mutex, one after the other, after the entry's mutex.
 static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept {
     std::lock_guard                        inventory(g_tensor_inventory_mutex);
     ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
