@@ -1478,6 +1478,110 @@ static inline size_t moe_expert_triplet_dst_bytes(const placement_plan & plan,
     return bytes;
 }
 
+// ---- Named moves: the plan transaction's explicit lists. ------------------------------------------------------------
+// A boundary driver names whole triplets to move: an evict list (device to host) and an admit list (host to device).
+// What the published plan says of each is checked here, before anything is minted or moved. Pure over the plan; the
+// plan's build_index() must have run. The cache checks the storage itself under its own locks, and its refusal is the
+// authority on whether a copy can move: this check says only what the plan already rules out.
+
+// One named triplet: the (gate, up, down) entries of expert_id in layer_id.
+struct moe_expert_triplet_ref {
+    int layer_id  = -1;
+    int expert_id = -1;
+};
+
+// The plan's verdict on named moves. evict and admit hold one reason per list entry, in list order: null when the
+// triplet may move, else why it may not. A refusal refuses that triplet alone. net_by_layer is, for each layer with a
+// movable triplet, the admits less the evicts there, sorted by layer: how the transaction would change the number of
+// that block's experts resident on the device.
+struct moe_expert_move_check {
+    std::vector<const char *>        evict;
+    std::vector<const char *>        admit;
+    std::vector<std::pair<int, int>> net_by_layer;
+};
+
+namespace detail {
+
+// The layouts an admit can stage from a host copy: AOS, whose device size and padded tail the transaction and the
+// cache both take from staged_expert_bytes (weight-row-padding.hpp). A SOA device copy is the load's reorder of the AOS
+// bytes, which an admit does not run yet; add the layout here when it does.
+static inline bool moe_admit_layout_stageable(const placement_entry & e) {
+    return e.layout == GGML_LAYOUT_AOS;
+}
+
+// The verdict on one named triplet of the list that moves it to the device (admit) or to the host (evict). `named`
+// holds every triplet named so far, so a later naming of one is a duplicate whatever the first naming's verdict: the
+// transaction moves a triplet at most once.
+static inline const char * moe_expert_move_refusal(const placement_plan &         plan,
+                                                   int                            device,
+                                                   const moe_expert_triplet_ref & ref,
+                                                   bool                           to_device,
+                                                   std::unordered_set<uint64_t> & named) {
+    if (ref.layer_id < 0 || ref.expert_id < 0) {
+        return "incomplete triplet";
+    }
+    if (!named.insert(moe_loan_triplet_key(ref.layer_id, ref.expert_id)).second) {
+        return "duplicate triplet";
+    }
+    const moe_loan_triplet t = moe_loan_triplet_of(plan, ref.layer_id, ref.expert_id);
+    if (!t.complete()) {
+        return "incomplete triplet";
+    }
+    for (int r = 0; r < 3; ++r) {
+        const placement_entry & e = *t.e[r];
+        if (e.on_device && e.target_device != device) {
+            return "wrong device";
+        }
+        if (e.on_device == to_device) {
+            return to_device ? "not on host" : "not on device";
+        }
+        if (to_device ? !moe_admit_layout_stageable(e) : !moe_loan_layout_lendable(e)) {
+            return "layout";
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace detail
+
+// Check named moves against `plan` for `device`: the evicts first, then the admits, as the transaction runs them.
+// A triplet is refused for a member the plan does not have or an id no entry can carry ("incomplete triplet"), for a
+// second naming in either list ("duplicate triplet"), for a member on another device ("wrong device"), for a member
+// already where the list would move it ("not on host" for an admit, "not on device" for an evict, so a triplet split
+// across the two is refused by both), or for a member in a layout that direction cannot copy ("layout"). Whether a
+// device copy is a view into a bulk tensor's shared allocation is the cache's question, asked under its locks.
+static inline moe_expert_move_check moe_expert_move_validate(const placement_plan &                      plan,
+                                                             int                                         device,
+                                                             const std::vector<moe_expert_triplet_ref> & evict,
+                                                             const std::vector<moe_expert_triplet_ref> & admit) {
+    moe_expert_move_check            out;
+    std::unordered_set<uint64_t>     named;
+    std::vector<std::pair<int, int>> moves;  // (layer, +1 for an admit, -1 for an evict), movable triplets only
+    out.evict.reserve(evict.size());
+    out.admit.reserve(admit.size());
+    for (const moe_expert_triplet_ref & ref : evict) {
+        out.evict.push_back(detail::moe_expert_move_refusal(plan, device, ref, /*to_device=*/false, named));
+        if (!out.evict.back()) {
+            moves.emplace_back(ref.layer_id, -1);
+        }
+    }
+    for (const moe_expert_triplet_ref & ref : admit) {
+        out.admit.push_back(detail::moe_expert_move_refusal(plan, device, ref, /*to_device=*/true, named));
+        if (!out.admit.back()) {
+            moves.emplace_back(ref.layer_id, +1);
+        }
+    }
+    std::stable_sort(moves.begin(), moves.end(),
+                     [](const std::pair<int, int> & a, const std::pair<int, int> & b) { return a.first < b.first; });
+    for (const std::pair<int, int> & m : moves) {
+        if (out.net_by_layer.empty() || out.net_by_layer.back().first != m.first) {
+            out.net_by_layer.emplace_back(m.first, 0);
+        }
+        out.net_by_layer.back().second += m.second;
+    }
+    return out;
+}
+
 // ---- Loan sizing: a short ring's loan, sized from the plan the loan leaves. ----------------------------------------
 //
 // A loan flips its triplets to the host, and a host matrix the executor claims takes a ring slot, so the ring the next
