@@ -16,9 +16,12 @@ What this gate pins:
     and the F32 batch dispatch) through one lambda;
   - the CPU island's host-pinned staging (moe_pp_cpu_island_act / _out) refuses when either handle does not resolve;
   - the unwind: the per-expert path's exit work (the done marker, the scratch slot recorded with its owners, the expert
-    leases and the pointer-table bundle retained until that marker, the transient down SOA released) is one lambda,
-    run by the normal exit and by every refusal of that path before it throws, and by the island's caller there
-    before it rethrows the island's refusal; the expert leases are declared before the first refusal that reads them;
+    leases and the pointer-table bundle retained until that marker, the transient down SOA released) is one lambda
+    that runs at most once (a flag set before its first submit). One try covers the path from the scratch setup to the
+    normal exit: the output and activation refusals, the loop's own fallback throws (a refused secondary executor, an
+    expert unresolved before submit) and the island all sit inside it, and its handler for ggml_sycl_fallback_error
+    runs the exit work and rethrows. The normal exit and that handler are the lambda's only callers: a refusal only
+    refuses. The row-map refusal stays before the try (nothing is claimed or submitted there yet);
   - none of the old abort texts is left in the backend;
   - the private-testing failpoints that let the device test force each refusal exist only under
     GGML_SYCL_Q1_NVFP4_ROUTE_TESTING (the private fixture objects), fold to the constant false otherwise, and sit in
@@ -58,13 +61,12 @@ ROW_MAP_SITE = ("if (!GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST
 DST_SITE = ("if (!GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_DST_STAGING)) { "
             "dst_contiguous.alloc(*stream, ctx.device, sizeof(float) * ggml_nelements(dst), "
             "\"moe_pp_dst_contiguous\"); } dst_contiguous_ptr = dst_contiguous.get(); if (!dst_contiguous_ptr) { "
-            "retain_pp_dispatch_until_done(); "
             "ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, \"moe_pp_dst_contiguous\",")
 
 SRC1_FAILPOINT = ("if (src1_contiguous_f32.get()) { return true; } "
                   "if (GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_SRC1_F32_STAGING)) { "
                   "return false; } try { src1_contiguous_f32.alloc(")
-SRC1_REFUSE_LAMBDA = ("auto refuse_src1_f32_staging = [&]() { retain_pp_dispatch_until_done(); "
+SRC1_REFUSE_LAMBDA = ("auto refuse_src1_f32_staging = [&]() { "
                       "ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, \"moe_pp_src1_f32\",")
 SRC1_SETUP = "if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) { refuse_src1_f32_staging(); }"
 SRC1_EXPERT = "if (!expert_use_mxfp4_soa_f16 && !copy_src1_current_f32()) { refuse_src1_f32_staging(); }"
@@ -86,8 +88,17 @@ RETAIN_STEPS = (
     "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device);",
     "ggml_sycl_release_moe_tensor_layout(src0, ctx.device, GGML_LAYOUT_SOA);",
 )
-ISLAND_CALLER = ("try { dispatch_host_expert_groups(pp_host_groups); } catch (const ggml_sycl_fallback_error &) { "
-                 "retain_pp_dispatch_until_done(); throw; }")
+RETAIN_ONCE = ("bool pp_exit_work_done = false; auto retain_pp_dispatch_until_done = [&]() { "
+               "if (pp_exit_work_done) { return; } pp_exit_work_done = true; sycl::event prompt_down_dispatch_done;")
+RETAIN_CALL = "retain_pp_dispatch_until_done();"
+# The try opens right after the activation refusal lambda, before the scratch setup; its handler follows its body.
+TRY_SIG = "\"MUL_MAT_ID prompt activation staging did not fit\"); }; try {"
+HANDLER = " catch (const ggml_sycl_fallback_error &) { retain_pp_dispatch_until_done(); throw; }"
+SCRATCH_CLAIM = "pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot)"
+LOOP_HEAD = "for (int64_t i02 = 0; i02 < n_as; i02++) {"
+SECONDARY_THROW = "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained prompt secondary executor refused exact handle\");"
+UNRESOLVED_THROW = "throw ggml_sycl_fallback_error(\"MUL_MAT_ID selected prompt expert unresolved before submit\");"
+ISLAND_CALL = "dispatch_host_expert_groups(pp_host_groups); pp_phase_log(\"pp-host-dispatch-done\","
 NORMAL_EXIT = "retain_pp_dispatch_until_done(); pp_phase_log(\"pp-retain-submitted\","
 
 OLD_ABORTS = (
@@ -180,8 +191,8 @@ def test_sites_mutants():
     assert not c(mutate(SYCL, "if (!dev_row_mappings.get()) { ggml_sycl_moe_pp_refuse_staging(",
                         "if (!dev_row_mappings.get()) { GGML_ABORT(\"x\"); ggml_sycl_moe_pp_refuse_staging_x("))
     # The output staging is used with no check, as it was.
-    assert not c(mutate(SYCL, "if (!dst_contiguous_ptr) { retain_pp_dispatch_until_done(); "
-                              "ggml_sycl_moe_pp_refuse_staging(", "if (false) { ggml_sycl_moe_pp_refuse_staging("))
+    assert not c(mutate(SYCL, "if (!dst_contiguous_ptr) { ggml_sycl_moe_pp_refuse_staging(",
+                        "if (false) { ggml_sycl_moe_pp_refuse_staging("))
     # One F32 site aborts instead of refusing.
     assert not c(mutate(SYCL, SRC1_EXPERT, "if (!expert_use_mxfp4_soa_f16 && !copy_src1_current_f32()) { "
                                            "GGML_ABORT(\"x\"); }"))
@@ -189,8 +200,6 @@ def test_sites_mutants():
                                             "GGML_ABORT(\"x\"); }"))
     assert not c(mutate(SYCL, SRC1_SETUP, "if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) { "
                                           "GGML_ABORT(\"x\"); }"))
-    # The refusal lambda skips the retention.
-    assert not c(mutate(SYCL, SRC1_REFUSE_LAMBDA, SRC1_REFUSE_LAMBDA.replace("retain_pp_dispatch_until_done(); ", "")))
     # The island aborts again.
     assert not c(mutate(SYCL, ISLAND_CHECK + " const bool act_missing", ISLAND_CHECK + " GGML_ABORT(\"x\"); "
                                                                                        "const bool act_missing"))
@@ -199,37 +208,68 @@ def test_sites_mutants():
 # ---- the unwind ------------------------------------------------------------------------------------------------------
 
 
+def try_of(m: str) -> tuple[str, str]:
+    """The body of the try that covers the per-expert path, and the text that follows it."""
+    t = body(m, TRY_SIG)
+    at = m.find(t) if t else -1
+    return (t, m[at + len(t):]) if at >= 0 else ("", "")
+
+
 def claim_unwind(sycl: str) -> bool:
-    """The per-expert path's exit work is one lambda, declared after the scratch claim and the expert leases it hands
-    on; the normal exit runs it after the island, and the island's caller runs it before rethrowing a refusal."""
+    """The per-expert path's exit work is one lambda, run at most once, declared after the scratch claim and the expert
+    leases it hands on. One try covers that path from the scratch setup to the normal exit, and its handler runs the
+    exit work and rethrows; the normal exit and the handler are the lambda's only callers."""
     m = mmid_of(sycl)
     r = body(m, RETAIN_SIG)
+    t, after = try_of(m)
     return (m.count(RETAIN_SIG) == 1 and r != "" and ordered(r, *RETAIN_STEPS)
+            and m.count(RETAIN_ONCE) == 1 and m.count("pp_exit_work_done = true;") == 1
             and m.count(LEASES_DECL) == 1 and m.count("std::move(pp_gpu_leases)") == 1
             and m.count(RETAIN_STEPS[2]) == 1 and r.count(RETAIN_STEPS[5]) == 1
-            and ordered(m, CLAIM_DECL, LEASES_DECL, RETAIN_SIG, DST_SITE, SRC1_SETUP, SRC1_EXPERT, ISLAND_CALLER,
-                        NORMAL_EXIT)
-            and m.count(ISLAND_CALLER) == 1 and m.count(NORMAL_EXIT) == 1)
+            and m.count(TRY_SIG) == 1 and ordered(m, ROW_MAP_SITE, CLAIM_DECL, LEASES_DECL, RETAIN_ONCE, TRY_SIG)
+            and t != "" and ROW_MAP_SITE not in t and after.startswith(HANDLER)
+            and ordered(t, SCRATCH_CLAIM, DST_SITE, SRC1_SETUP, LOOP_HEAD, SECONDARY_THROW, UNRESOLVED_THROW,
+                        SRC1_EXPERT, SRC1_BATCHES, ISLAND_CALL, NORMAL_EXIT)
+            and m.count(NORMAL_EXIT) == 1 and m.count(RETAIN_CALL) == 2)
 
 
 def test_unwind():
     m = mmid_of(SYCL)
+    t, _ = try_of(m)
     assert claim_unwind(SYCL), first_missing(SYCL_REL + ": body of ggml_sycl_mul_mat_id", m, CLAIM_DECL, LEASES_DECL,
-                                             RETAIN_SIG, *RETAIN_STEPS, ISLAND_CALLER, NORMAL_EXIT,
-                                             signature=MMID_SIG)
+                                             RETAIN_ONCE, *RETAIN_STEPS, TRY_SIG, HANDLER.strip(), SCRATCH_CLAIM,
+                                             DST_SITE, SRC1_SETUP, LOOP_HEAD, SECONDARY_THROW, UNRESOLVED_THROW,
+                                             SRC1_EXPERT, SRC1_BATCHES, ISLAND_CALL, NORMAL_EXIT, signature=MMID_SIG)
 
 
 def test_unwind_mutants():
     c = claim_unwind
     # The normal exit stops running the shared exit work.
     assert not c(mutate(SYCL, NORMAL_EXIT, "pp_phase_log(\"pp-retain-submitted\","))
-    # The island's refusal unwinds without it.
-    assert not c(mutate(SYCL, ISLAND_CALLER, "dispatch_host_expert_groups(pp_host_groups);"))
+    # The handler stops running it, or swallows the refusal instead of rethrowing it.
+    assert not c(mutate(SYCL, HANDLER, " catch (const ggml_sycl_fallback_error &) { throw; }"))
+    assert not c(mutate(SYCL, HANDLER, " catch (const ggml_sycl_fallback_error &) { retain_pp_dispatch_until_done(); }"))
+    # The exit work can run twice: its once-flag is not checked.
+    assert not c(mutate(SYCL, "if (pp_exit_work_done) { return; } ", ""))
+    # A refusal runs the exit work itself again instead of only refusing.
+    assert not c(mutate(SYCL, SRC1_REFUSE_LAMBDA, SRC1_REFUSE_LAMBDA.replace("{ ", "{ " + RETAIN_CALL + " ", 1)))
+    # A fallback throw inside the loop no longer reaches the handler: the try closes before the loop, so both of the
+    # loop's existing throws (the refused secondary executor, the unresolved expert) unwind past it.
+    assert not c(mutate(SYCL, LOOP_HEAD, "} catch (const ggml_sycl_fallback_error &) { throw; } { " + LOOP_HEAD))
+    # One of those throws moved out of the try's reach.
+    assert not c(mutate(SYCL, UNRESOLVED_THROW, "").replace(HANDLER, HANDLER + " " + UNRESOLVED_THROW, 1))
+    assert not c(mutate(SYCL, SECONDARY_THROW, "").replace(HANDLER, HANDLER + " " + SECONDARY_THROW, 1))
+    # The scratch slot is claimed before the try opens, where a refusal would leave it unrecorded.
+    assert not c(mutate(SYCL, SCRATCH_CLAIM, "false").replace(
+        "auto refuse_src1_f32_staging = [&]() {", SCRATCH_CLAIM + "; auto refuse_src1_f32_staging = [&]() {", 1))
+    # The island's call sits outside the try.
+    assert not c(mutate(SYCL, ISLAND_CALL, "pp_phase_log(\"pp-host-dispatch-done\",")
+                 .replace(HANDLER, HANDLER + " dispatch_host_expert_groups(pp_host_groups);", 1))
     # The lambda forgets a step the normal exit performs.
     assert not c(mutate_in(SYCL, RETAIN_SIG, RETAIN_STEPS[5], "(void) 0;"))
     assert not c(mutate_in(SYCL, RETAIN_SIG, RETAIN_STEPS[2], "(void) 0;"))
     assert not c(mutate_in(SYCL, RETAIN_SIG, RETAIN_STEPS[3], "(void) (std::move(pp_gpu_leases),"))
-    # The expert leases declared after the first refusal that must retain them.
+    # The expert leases declared after the try opens, where the handler cannot reach them.
     m = mutate(SYCL, LEASES_DECL, "")
     m = m.replace("size_t pp_route_dev0 = 0;", LEASES_DECL + " size_t pp_route_dev0 = 0;", 1)
     assert not c(m)
