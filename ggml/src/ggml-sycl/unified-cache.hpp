@@ -8675,7 +8675,7 @@ enum class alloc_category : uint8_t {
 // 0 = compute scratch (pre-reserved arena, must stay in VRAM for FP16 attention)
 // 1 = KV cache (hot tokens, latency-critical)
 // 2 = attention weights / control buffers (used every token)
-// 3 = MoE expert cache (evictable via LRU/frequency)
+// 3 = MoE expert cache (evicted before weights; within a tier, least recently used first)
 // 4 = staging buffers (always host-ok)
 int alloc_category_priority(alloc_category cat);
 

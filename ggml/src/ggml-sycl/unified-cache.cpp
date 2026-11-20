@@ -22752,7 +22752,7 @@ int alloc_category_priority(alloc_category cat) {
         case alloc_category::CONTROL:
             return 4;  // host-control, not a VRAM eviction participant
         case alloc_category::EXPERT_CACHE:
-            return 3;  // MoE experts: evictable via LRU/frequency
+            return 3;  // MoE experts: evicted before weights; within a tier, least recently used first
         case alloc_category::STAGING:
             return 4;  // always host-ok
     }
