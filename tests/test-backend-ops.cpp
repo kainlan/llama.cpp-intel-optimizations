@@ -51,6 +51,31 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// The uniform tensors (init_tensor_uniform) and the MUL_MAT_ID ids (init_mul_mat_id_ids) of a run derive from one
+// base seed, so a failing draw can be run again: GGML_TEST_SEED=<n> sets the base, and without it the run draws one.
+// Either way the run prints it once as "[TEST-SEED] base=<n>". The k-th draw is the same in every run that has the
+// same base and the same list of test cases (so the same -o and -p filters) and runs them with one worker (no -j > 1:
+// workers take draws in the order they reach them). Not seeded: every other initializer in this file (the attention
+// masks, the rand() and std::random_device draws of other ops' index tensors), which draw fresh values each run.
+static uint32_t test_seed_next() {
+    static const uint32_t base = [] {
+        const char *   env  = getenv("GGML_TEST_SEED");
+        const uint32_t seed =
+            (env != nullptr && *env != '\0') ? (uint32_t) strtoul(env, nullptr, 0) : std::random_device{}();
+        printf("[TEST-SEED] base=%u\n", seed);
+        return seed;
+    }();
+    static std::atomic<uint32_t> counter{ 0 };
+    // A splitmix-style finalizer of base + k * golden ratio: distinct, well-mixed engine seeds for consecutive k.
+    uint32_t x = base + 0x9E3779B9u * (counter.fetch_add(1, std::memory_order_relaxed) + 1);
+    x ^= x >> 16;
+    x *= 0x85EBCA6Bu;
+    x ^= x >> 13;
+    x *= 0xC2B2AE35u;
+    x ^= x >> 16;
+    return x;
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
         return;
@@ -62,8 +87,10 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         // parallel initialization
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
-        auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+        // Each slice draws from its own engine, seeded on this thread before the slice is handed out, so the values do
+        // not depend on which pool thread runs which slice.
+        auto init_thread = [&](size_t start, size_t end, uint32_t seed) {
+            std::default_random_engine gen(seed);
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -71,14 +98,14 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         };
 
         if (n_threads == 1) {
-            init_thread(0, nels);
+            init_thread(0, nels, test_seed_next());
         } else {
             std::vector<std::future<void>> tasks;
             tasks.reserve(n_threads);
             for (size_t i = 0; i < n_threads; i++) {
                 size_t start =     i*nels/n_threads;
                 size_t end   = (i+1)*nels/n_threads;
-                tasks.push_back(std::async(std::launch::async, init_thread, start, end));
+                tasks.push_back(std::async(std::launch::async, init_thread, start, end, test_seed_next()));
             }
             for (auto & t : tasks) {
                 t.get();
@@ -5228,20 +5255,47 @@ struct test_mul_mat_w4a4 : public test_mul_mat {
     }
 };
 
+// GGML_TEST_MMID_TRACE=1 prints, per ids tensor, how many rows name each expert in each of the first four id columns,
+// as "[MMID-IDS] seed=<s> rows=<n> n_mats=<e> col0:<c0>,<c1>,... col1:...". With n_used columns in use, the rows an
+// expert receives are the sum of its counts over the first n_used columns.
+static void print_mul_mat_id_ids(const ggml_tensor * t, const std::vector<int64_t> & counts, int n_mats,
+                                 uint32_t seed) {
+    printf("[MMID-IDS] seed=%u rows=%lld n_mats=%d", seed, (long long) ggml_nrows(t), n_mats);
+    for (int c = 0; c < t->ne[0] && c < 4; c++) {
+        printf(" col%d:", c);
+        for (int e = 0; e < n_mats; e++) {
+            printf("%s%lld", e == 0 ? "" : ",", (long long) counts[(size_t) c * (size_t) n_mats + (size_t) e]);
+        }
+    }
+    printf("\n");
+}
+
+static bool mul_mat_id_ids_trace_enabled() {
+    static const bool trace = getenv("GGML_TEST_MMID_TRACE") != nullptr;
+    return trace;
+}
+
 static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
+    const uint32_t             seed = test_seed_next();
+    std::default_random_engine rng(seed);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
             continue;
         }
+        std::vector<int64_t> counts((size_t) t->ne[0] * (size_t) n_mats, 0);
         for (int64_t r = 0; r < ggml_nrows(t); r++) {
             std::vector<int32_t> data(t->ne[0]);
             for (int i = 0; i < t->ne[0]; i++) {
                 data[i] = i % n_mats;
             }
             std::shuffle(data.begin(), data.end(), rng);
+            for (int i = 0; i < t->ne[0]; i++) {
+                counts[(size_t) i * (size_t) n_mats + (size_t) data[i]]++;
+            }
             ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+        }
+        if (mul_mat_id_ids_trace_enabled()) {
+            print_mul_mat_id_ids(t, counts, n_mats, seed);
         }
     }
 }
