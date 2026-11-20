@@ -3957,10 +3957,12 @@ set_tests_properties(sycl-runtime-alloc-arena-teardown-refusal-classes PROPERTIE
     SKIP_RETURN_CODE 77
 )
 # The release of the last model: with no model live a cache gives back its PP MoE ring, its oneDNN pair and the arena
-# nothing holds; a claimed ring slot, a reserved pair or a chunk lease keeps them and is named; and a device's published
-# terms go back to a default load_published_terms, their start values. Its own process, because its first arm reads a
-# process where nothing has been published. It allocates small arenas on the device, so it carries `cache` and runs
-# alone with that family, not in the sweep.
+# nothing holds; a claimed ring slot, a reserved pair or a chunk lease keeps them and is named; a load's start reserves
+# the released arena again and runs the release a failed load deferred; and a device's published terms go back to a
+# default load_published_terms, their start values. Its own process, because its first arm reads a process where
+# nothing has been published. It allocates arenas on the device, one at a time: 64 MiB ones, and for the two arms whose
+# start reserves the arena again a 2 GiB early arena, which holds the 1296 MiB of the start's default zones with room.
+# So it carries `cache` and runs alone with that family, not in the sweep.
 add_test(NAME sycl-runtime-alloc-last-release-empties-the-arena
     COMMAND test-sycl-runtime-alloc --case last_release_empties_the_arena
 )

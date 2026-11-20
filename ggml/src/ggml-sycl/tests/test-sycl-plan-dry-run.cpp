@@ -1922,7 +1922,7 @@ arm_result arm_j_refused_load_leaves_nothing_sized_for_it() {
 // sentinel goes into every planner global and every other device-wide term after L1's begin, and a RUNTIME-zone page
 // taken in device 0's arena before L1's uncommitted end holds that arena through the end. The end cannot tell the page
 // from a failed load's buffers: device 0 keeps its arena and the terms the end put back (the sentinels), and its cache
-// is marked; every other device empties.
+// is marked; every other device the release walks empties.
 //   L2's begin, the page held: one line names the start on device 0, the WARN that a load is starting on an arena a
 //              failed load left held and that a holder still there after the failed model's free is a leak, and one
 //              line names the holders; the mark stays, and device 0 keeps L1's zones, the page and its terms. L2 ends
@@ -1930,12 +1930,15 @@ arm_result arm_j_refused_load_leaves_nothing_sized_for_it() {
 //   L3's begin, the page dropped: one line names the start on device 0, the INFO that the arena is released; the mark
 //              is clear, the begin's reserve built the first arena's zones (g_first_zones), and device 0's published
 //              terms are at their start values, but for the zone plan, which that reserve stores for the arena it
-//              built. Device 1, which carried no mark, keeps a scatter sentinel written before L3's begin; with no
-//              device 1, or one that shares device 0's cache, that leg does not run and a WARN line says why. L3 ends
-//              uncommitted, which releases every arena.
+//              built. Device 1, which carried no mark, keeps a scatter sentinel written before L3's begin. The start's
+//              release walks only the devices the scheduler sees, so that leg needs device 1 among them, with a cache
+//              of its own. A two-card host that shows the scheduler only device 0 still makes device 1's cache, with
+//              its early arena, at a load's begin, but no scope of the start's release reaches it. Without such a
+//              device 1 the leg does not run and a WARN line says why. L3 ends uncommitted, which releases every arena
+//              the release walks.
 // Engagement: the first arena's zones were read before any arm; L1's begin returned OK and the sentinels read back;
 // after L1's end the page lies in device 0's RUNTIME zone, that arena is active with a RUNTIME zone above the first
-// arena's, device 0 is marked and reads terms other than the start values, and no device with a cache of its own is.
+// arena's, device 0 is marked and reads terms other than the start values, and no other device the release walks is.
 // Mutants: the start's release dropped (L3 logs no line and finds the mark, L1's zones and the sentinels); the start
 // asking every cache (device 1's scatter goes back to its start value); the start's held arena logged as the abort's
 // or as a model release's (no start WARN, or a second line naming the start), or without its holders; a start that
@@ -2037,16 +2040,22 @@ arm_result arm_k_load_start_runs_the_deferred_release() {
         (void) ggml_backend_sycl_model_load_end(l2, false, nullptr);
     }
 
-    // Device 1, when it has a cache of its own, carries no mark: a start that asked it would put its terms back.
-    const bool other =
-        ggml_backend_sycl_get_device_count() > 1 && sentinel.size() > 1 && get_unified_cache_for_device(1) != cache;
+    // Device 1, when it has a cache of its own, carries no mark: a start that asked it would put its terms back. The
+    // start's release walks the devices the scheduler sees (ggml_backend_sycl_get_device_count()), so a scope can reach
+    // device 1 only when the scheduler sees it.
+    const int  scheduled = ggml_backend_sycl_get_device_count();
+    const bool other     = scheduled > 1 && sentinel.size() > 1 && get_unified_cache_for_device(1) != cache;
     if (!other) {
         // The other legs stand without device 1, so the arm is not VOID; the line says the start's scope went
         // unscored, so a start that asks every cache would still pass.
-        const char * why = ggml_backend_sycl_get_device_count() > 1 && sentinel.size() > 1 ?
-                               "device 1 shares device 0's cache" :
-                               "there is no device 1";
-        std::printf("WARN (k) the leg that a load's start asks only the marked caches did not run: %s\n", why);
+        std::string why = "device 1 shares device 0's cache";
+        if (sentinel.size() < 2) {
+            why = "there is no device 1";
+        } else if (scheduled < 2) {
+            why = "the start's release walks only the devices the scheduler sees (" + num(scheduled) + " of " +
+                  num(sentinel.size()) + " GPUs), so no scope reaches device 1's cache";
+        }
+        std::printf("WARN (k) the leg that a load's start asks only the marked caches did not run: %s\n", why.c_str());
         std::fflush(stdout);
     }
     const size_t scatter = other ? sentinel[1].scatter : 0;

@@ -2815,6 +2815,16 @@ static bool reserve_ring_and_pair(unified_cache & cache, int device) {
            cache.reserve_onednn_scratch(mib, mib) && cache.has_onednn_scratch();
 }
 
+// The budget of a hand-built cache in which a load's start reserves the arena again (reserve_released_arena). That
+// reserve builds the early arena the cache's constructor builds: the whole budget, with zones sized from the start
+// terms, a 512 MiB SCRATCH zone and a 512 MiB RUNTIME zone (the GGML_SYCL_COMPUTE_ARENA_MB and
+// GGML_SYCL_RUNTIME_ARENA_MB defaults) and a 256 MiB ONEDNN zone, beside a KV and weight zone of at least 16 MiB:
+// 1296 MiB. Published terms only raise those zones, so a 64 MiB cache's start reserve is refused on every card, and
+// an arm on one measures no start. The arms that score the start's reserve run it at the zones a real start builds,
+// on a cache that holds them: 2 GiB of VRAM, held from the cache's construction to the arm's end (well under a
+// second), except between a release and the reserve after it. A card that cannot reserve it skips the arm.
+static constexpr size_t last_release_early_arena_budget = 2048ull * 1024ull * 1024ull;
+
 static std::mutex                                          g_last_release_log_mutex;
 static std::vector<std::pair<ggml_log_level, std::string>> g_last_release_log_lines;
 
@@ -2887,25 +2897,25 @@ struct reserved_onednn_pair {
 };
 
 // The release of the last model gives back what a cache sized for a model when no model is live, and nothing while one
-// is. A hand-built cache holds the fixture's ring and pair in its 64 MiB arena. With a bit in its live mask the release
-// returns MODEL_LIVE and the ring, the pair and the arena stay. With the mask 0 it returns EMPTIED: no ring slot reads
-// back, the pair is gone, the arena is not active and no zone counts a used byte. A second release of the emptied cache
-// returns EMPTIED again. A load's start then reserves the early arena again (reserve_released_arena): an arena with
-// nothing used in it, or a refusal that names its reason.
-// Engagement: the ring and the pair were reserved and the zones count their bytes.
+// is. A hand-built cache holds the fixture's ring and pair in the early arena its constructor reserved
+// (last_release_early_arena_budget). With a bit in its live mask the release returns MODEL_LIVE and the ring, the pair
+// and the arena stay. With the mask 0 it returns EMPTIED: no ring slot reads back, the pair is gone, the arena is not
+// active and no zone counts a used byte. A second release of the emptied cache returns EMPTIED again. A load's start
+// then reserves the early arena again (reserve_released_arena): an active arena with nothing used in it.
+// Engagement: the constructor reserved the early arena; the ring and the pair were reserved and the zones count their
+// bytes.
 // Mutants: the liveness check dropped (the first release empties the cache); a step left out of the release (the ring,
-// the pair or the arena stays, or a zone counts bytes); a release that cannot run twice.
+// the pair or the arena stays, or a zone counts bytes); a release that cannot run twice; a start that does not reserve
+// the released arena again.
 static bool last_release_empties_ring_pair_and_arena(sycl::queue & q, bool & skipped) {
     TEST_BEGIN("last_release_empties_ring_pair_and_arena");
-    constexpr size_t        mib       = 1024ull * 1024ull;
-    const size_t            max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
-    const int               device    = ggml_sycl_get_device_id_from_queue(q);
+    const int               device = ggml_sycl_get_device_id_from_queue(q);
     planned_terms_found     found(device);
     pipeline_and_pair_found found_pair(device);
-    unified_cache           cache(q, 64ull * mib, 0, 0, 0);
+    unified_cache           cache(q, last_release_early_arena_budget, 0, 0, 0);
     arena_teardown_retry    retry{ cache };
-    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
-        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no release was measured");
+    if (!cache.arena_active()) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 2 GiB early arena, so no release was measured");
     }
     TEST_ASSERT(reserve_ring_and_pair(cache, device), "the fixture's ring or its oneDNN pair was not reserved");
     TEST_ASSERT(zone_bytes_used(cache) > 0, "the zones count no byte of the fixture's ring and pair");
@@ -2931,13 +2941,10 @@ static bool last_release_empties_ring_pair_and_arena(sycl::queue & q, bool & ski
                 "a second release of the emptied cache did not return EMPTIED");
 
     zone_arena_refusal refusal;
-    if (cache.reserve_released_arena(&refusal)) {
-        TEST_ASSERT(cache.arena_active() && zone_bytes_used(cache) == 0,
-                    "the arena a load's start reserved again is not active, or a zone counts used bytes in it");
-    } else {
-        TEST_ASSERT(refusal.reason != zone_arena_refusal_reason::NONE,
-                    "a load's start reserve of the released arena was refused without a reason");
-    }
+    TEST_ASSERT(cache.reserve_released_arena(&refusal),
+                "a load's start did not reserve again the early arena the cache's constructor reserved");
+    TEST_ASSERT(cache.arena_active() && zone_bytes_used(cache) == 0,
+                "the arena a load's start reserved again is not active, or a zone counts used bytes in it");
     TEST_PASS();
     return true;
 }
@@ -3090,9 +3097,10 @@ static bool last_release_names_a_held_arena(sycl::queue & q, bool & skipped) {
 }
 
 // A failed load whose buffers hold the arena at its abort defers the release to the next load's start, which runs it
-// again and, once nothing holds the arena, starts from the zones a last model's release leaves. The reference: a
-// model's release empties the hand-built cache and a load's start reserve builds the early arena, whose zones every
-// later start must match. Then a lease on that arena's first chunk holds it. A load's start that finds it held on a
+// again and, once nothing holds the arena, starts from the zones a last model's release leaves. The hand-built cache's
+// constructor reserves the early arena (last_release_early_arena_budget). The reference: a model's release empties the
+// cache and a load's start reserve builds the early arena again, at the constructor's zones, which every later start
+// must match. Then a lease on that arena's first chunk holds it. A load's start that finds it held on a
 // cache with no mark keeps the arena and sets no mark: only the abort sets it. Through a failed load's abort the lease
 // gives ARENA_HELD, and the release is marked deferred. A load's start while the lease still holds the arena runs the
 // release again, as ggml_backend_sycl_model_load_begin does for a marked cache: ARENA_HELD with one WARN line that says
@@ -3100,30 +3108,31 @@ static bool last_release_names_a_held_arena(sycl::queue & q, bool & skipped) {
 // named on a WARN line too and nothing at ERROR; the mark stays, the reserve does nothing and the chunk is still
 // leased. Once the lease ends, a load's start empties the cache, clears the mark and reserves the early arena again at
 // the reference zones, with nothing used in them.
-// Engagement: the reference reserve built an arena, and the lease is on its first chunk.
+// Engagement: the constructor reserved the early arena, the reference reserve built it again, and the lease is on its
+// first chunk.
 // Mutants: the mark not set at the abort, or set at a start; the mark cleared by a release that kept the arena; the
 // mark kept after the cache emptied; the start's held arena logged with the abort's text, at ERROR or without its
-// holders; a start that rebuilds other zones than a last release's (the zones differ from the reference).
+// holders; a start that rebuilds other zones than a last release's (the zones differ from the reference) or than the
+// constructor's (the reference differs from them).
 static bool last_release_deferred_by_a_failed_load(sycl::queue & q, bool & skipped) {
     TEST_BEGIN("last_release_deferred_by_a_failed_load");
-    constexpr size_t        mib       = 1024ull * 1024ull;
-    const size_t            max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
-    const int               device    = ggml_sycl_get_device_id_from_queue(q);
+    const int               device = ggml_sycl_get_device_id_from_queue(q);
     planned_terms_found     found(device);
     pipeline_and_pair_found found_pair(device);
-    unified_cache           cache(q, 64ull * mib, 0, 0, 0);
+    unified_cache           cache(q, last_release_early_arena_budget, 0, 0, 0);
     arena_teardown_retry    retry{ cache };
-    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
-        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no release was measured");
+    if (!cache.arena_active()) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 2 GiB early arena, so no start was compared");
     }
+    const std::vector<size_t> built_zones = zone_capacities(cache);
     TEST_ASSERT(cache.release_for_no_live_model("reference", unified_cache_release_cause::MODEL_RELEASED) ==
                     unified_cache_last_release::EMPTIED,
                 "the reference's model release did not empty the cache");
     zone_arena_refusal refusal;
-    if (!cache.reserve_released_arena(&refusal)) {
-        TEST_SKIP(skipped, "the device refused a load's start reserve of the early arena, so no start was compared");
-    }
+    TEST_ASSERT(cache.reserve_released_arena(&refusal),
+                "a load's start did not reserve again the early arena the cache's constructor reserved");
     const std::vector<size_t> first_zones = zone_capacities(cache);
+    TEST_ASSERT(first_zones == built_zones, "a load's start built other zones than the cache's constructor built");
     TEST_ASSERT(!cache.last_release_deferred(), "a model's release that emptied the cache left a deferred mark");
 
     held_chunk_lease lease{ cache };
