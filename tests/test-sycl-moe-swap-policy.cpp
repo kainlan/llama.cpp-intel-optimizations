@@ -186,12 +186,12 @@ static void test_candidate_below_min_usage_is_not_proposed() {
     }
 }
 
-// A host expert under margin times the coldest resident expert is not proposed, one at the margin is, and the first
-// pair that fails the margin ends the block.
-static void test_candidate_below_margin_times_victim_is_not_proposed() {
+// A host expert under the coldest resident expert's usage plus the margin is not proposed, one at it is, and the first
+// pair that fails the margin ends the block. The margin is additive, as simulated.
+static void test_candidate_below_victim_plus_margin_is_not_proposed() {
     const moe_swap_params          p;
     std::vector<moe_swap_proposal> out;
-    // Residents 0..3 route 4, 5, 6, 7 times. The coldest is expert 0 at 4, so a candidate needs 6.
+    // Residents 0..3 route 4, 5, 6, 7 times. The coldest is expert 0 at 4, so a candidate needs 5.5.
     auto                           make = [](uint64_t host4, uint64_t host5) {
         table t(1, 8);
         t.resident_prefix(0, 4);
@@ -204,13 +204,13 @@ static void test_candidate_below_margin_times_victim_is_not_proposed() {
         return t;
     };
     {
-        table          t = make(5, 0);  // 5 < 1.5 * 4
+        table          t = make(5, 0);  // 5 < 4 + 1.5
         moe_swap_state s(1, 8);
         CHECK(run_period(s, p, t, out) == MOE_SWAP_STATUS_ADAPTED);
         CHECK(out.empty());
     }
     {
-        table          t = make(6, 0);  // 6 == 1.5 * 4: at the margin is proposed
+        table          t = make(6, 0);  // 6 >= 4 + 1.5
         moe_swap_state s(1, 8);
         CHECK(run_period(s, p, t, out) == MOE_SWAP_STATUS_ADAPTED);
         CHECK(out.size() == 1);
@@ -219,7 +219,35 @@ static void test_candidate_below_margin_times_victim_is_not_proposed() {
         }
     }
     {
-        // Host 4 at 20 passes against resident 0 (4). Host 5 at 6 meets resident 1 (5): 6 < 7.5, and the block ends.
+        // A margin of 2: 6 == 4 + 2 is at the margin and proposed, 5 is not.
+        moe_swap_params wide;
+        wide.margin      = 2.0;
+        table          t = make(6, 0);
+        moe_swap_state s(1, 8);
+        CHECK(run_period(s, wide, t, out) == MOE_SWAP_STATUS_ADAPTED);
+        CHECK(out.size() == 1);
+        table          t5 = make(5, 0);
+        moe_swap_state s5(1, 8);
+        CHECK(run_period(s5, wide, t5, out) == MOE_SWAP_STATUS_ADAPTED);
+        CHECK(out.empty());
+    }
+    {
+        // The margin is added, not multiplied: against a victim at 2 a host expert at 3 clears 1.5 times (3.0) but
+        // not 2 + 1.5 (3.5).
+        table t(1, 8);
+        t.resident_prefix(0, 4);
+        t.decode[0][0] = 2;
+        t.decode[0][1] = 9;
+        t.decode[0][2] = 9;
+        t.decode[0][3] = 9;
+        t.decode[0][4] = 3;
+        moe_swap_state s(1, 8);
+        CHECK(run_period(s, p, t, out) == MOE_SWAP_STATUS_ADAPTED);
+        CHECK(out.empty());
+    }
+    {
+        // Host 4 at 20 passes against resident 0 (4). Host 5 at 6 meets resident 1 (5): 6 < 5 + 1.5, so the block
+        // ends.
         table          t = make(20, 6);
         moe_swap_state s(1, 8);
         CHECK(run_period(s, p, t, out) == MOE_SWAP_STATUS_ADAPTED);
@@ -705,7 +733,7 @@ static void test_replay_at_the_size_of_a_48_by_512_model_stays_within_a_time_bou
 int main() {
     test_defaults();
     test_candidate_below_min_usage_is_not_proposed();
-    test_candidate_below_margin_times_victim_is_not_proposed();
+    test_candidate_below_victim_plus_margin_is_not_proposed();
     test_max_swaps_caps_the_proposals();
     test_proposals_are_ordered_by_gain_and_the_cap_keeps_the_best();
     test_a_blocks_resident_count_is_invariant();

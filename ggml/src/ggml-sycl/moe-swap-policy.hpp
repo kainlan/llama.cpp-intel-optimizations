@@ -3,18 +3,19 @@
 // static state: the caller owns one moe_swap_state and passes it in. The driver that reads the counters and the
 // ADMIT/EVICT transaction that executes the proposals are other code.
 //
-// The rule. The policy keeps a decayed usage value per (block, expert), fed with the routed pairs the counters saw
-// since it last looked. Every `period` decode tokens it proposes swaps and then multiplies every usage by `decay`. A
-// swap pairs, inside one block, a host expert with a resident expert: the k-th hottest host expert with the k-th
-// coldest resident one, k = 0, 1, ..., and stops at the first pair that fails. A pair is proposed only if the host
-// expert's usage is at least `min_usage` and at least `margin` times the resident expert's usage. Its gain is the
-// difference of the two usages. All blocks' pairs are ranked by gain and the best `max_swaps` are returned, so the
-// cap keeps the best.
-//   - A block's slot count is the number of its experts the caller flags resident, and a swap exchanges one resident
-//     expert for one host expert, so no swap changes a block's resident count. A block with no resident expert has
-//     nothing to evict and a block with no host expert nothing to admit: both are skipped. A block the caller
-//     marks not eligible (fully resident, a loan outstanding, ...) is skipped for proposals but still follows its
-//     counts and still decays, so its usage is current when it becomes eligible.
+// The rule, its numbers and its form are the simulated ones: scripts/moe-cache-sim.py, `_adapt`, with the results in
+// docs/backend/moe-expert-cache-findings.md. The policy keeps a decayed usage value per (block, expert), fed with the
+// routed pairs the counters saw since it last looked. Every `period` decode tokens it proposes swaps and then
+// multiplies every usage by `decay`. A swap pairs, inside one block, a host expert with a resident expert: the k-th
+// hottest host expert with the k-th coldest resident one, k = 0, 1, ..., and stops at the first pair that fails. A
+// pair is proposed only if the host expert's usage is at least `min_usage` and at least the resident expert's usage
+// plus `margin` (an additive margin, as simulated). Its gain is the difference of the two usages. All blocks' pairs
+// are ranked by gain and the best `max_swaps` are returned, so the cap keeps the best.
+//   - A block's slot count is its number of resident flags: a block with a free slot is outside this rule, which only
+//     exchanges one resident expert for one host expert, so no swap changes a block's resident count. A block with
+//     no resident expert has nothing to evict and a block with no host expert nothing to admit: both are skipped. A
+//     block the caller marks not eligible (fully resident, a loan outstanding, ...) is skipped for proposals but
+//     still follows its counts and still decays, so its usage is current when it becomes eligible.
 //   - The two sets that make a pair are disjoint (host and resident), and each expert is in at most one pair, so an
 //     expert is never both admitted and evicted in one call and never proposed twice.
 //   - While the caller reports swaps in flight, a period boundary proposes nothing and does not decay, and that
@@ -31,9 +32,13 @@
 //
 // Determinism. The same state and the same inputs give the same output. Ties in usage go to the lower expert index,
 // the proposals are totally ordered by gain (higher first), then by admitted expert (lower first), then by block
-// (lower first), then by evicted expert (lower first). Nothing depends on addresses, threads or time.
+// (lower first), then by evicted expert (lower first). That tie order is this header's own; the simulator sorts equal
+// gains by block and then by rank, so the two differ only on exactly equal gains. Nothing depends on addresses,
+// threads or time.
 //
-// Cost, for a model of B blocks of E experts (Qwen3.8 Flash Next: 48 x 512 = 24576 cells), R resident experts per
+// Cost as measured on the host by tests/test-sycl-moe-swap-policy.cpp at 48 x 512 with 92 resident experts per block:
+// about 90 us a boundary (one boundary every `period` = 4 tokens) and under 0.1 us for every other call. The terms,
+// for a model of B blocks of E experts (Qwen3.8 Flash Next: 48 x 512 = 24576 cells), R resident experts per
 // block and P proposals before the cap (P is at most B * min(R, max_swaps)):
 //   - a call that reaches no boundary does O(1) work and allocates nothing;
 //   - a prompt call and a boundary absorb the counts: two passes over the B * E counters;
@@ -54,13 +59,13 @@
 
 namespace ggml_sycl {
 
-// The five numbers of the rule. The defaults are the simulated ones. `margin` must not be negative.
+// The five numbers of the rule. The defaults are the simulated ones. `margin` should not be negative.
 struct moe_swap_params {
     int    period    = 4;    // decode tokens between boundaries; a value below 1 never reaches one
     double decay     = 0.7;  // usage is multiplied by this at every boundary that was not skipped
     int    max_swaps = 96;   // proposals per boundary over the whole model
     double min_usage = 2.0;  // a host expert below this is not a candidate
-    double margin    = 1.5;  // a host expert must be at least this many times the resident expert it replaces
+    double margin    = 1.5;  // a host expert must exceed the resident expert it replaces by at least this much
 };
 
 // One proposed swap: evict `evict_expert` from `block` and admit `admit_expert` into it.
@@ -201,7 +206,7 @@ inline void moe_swap_collect_block(moe_swap_state & s, const moe_swap_params & p
                       });
 
     for (size_t i = 0; i < k; ++i) {
-        if (!(s.cands[i].usage >= p.margin * s.victs[i].usage)) {
+        if (!(s.cands[i].usage >= s.victs[i].usage + p.margin)) {
             break;
         }
         s.pool.push_back({ block, s.victs[i].expert, s.cands[i].expert, s.cands[i].usage - s.victs[i].usage });
