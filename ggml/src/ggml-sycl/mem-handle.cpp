@@ -486,14 +486,14 @@ void arena_authority::release_lease(size_t chunk_index, uint64_t allocation_id) 
     }
 }
 
-void arena_authority::close_and_invalidate(uint64_t next) {
+void arena_authority::close_and_invalidate(uint64_t next) noexcept {
     std::lock_guard<std::mutex> guard(mutex);
     admission_open = false;
     alive = false;
     generation = next;
 }
 
-void arena_authority::reopen(uint64_t restored_generation) {
+void arena_authority::reopen(uint64_t restored_generation) noexcept {
     std::lock_guard<std::mutex> guard(mutex);
     generation     = restored_generation;
     alive          = true;

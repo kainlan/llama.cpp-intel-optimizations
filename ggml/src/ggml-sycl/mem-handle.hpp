@@ -262,12 +262,14 @@ struct arena_authority : std::enable_shared_from_this<arena_authority> {
                                  uint64_t expected_allocation_id, size_t offset, size_t extent);
     void * resolve_allocation(int allocation_zone, uint64_t expected_generation,
                               uint64_t allocation_id, size_t offset, size_t extent) const;
-    void close_and_invalidate(uint64_t replacement_generation);
+
+    void close_and_invalidate(uint64_t replacement_generation) noexcept;
 
     // The inverse of close_and_invalidate(), for a teardown that refused before it freed anything: the authority
     // takes back the generation its records and handles carry and admits again. Records and leases are untouched, so
-    // a handle that resolved before the close resolves to the same pointer after it.
-    void reopen(uint64_t restored_generation);
+    // a handle that resolved before the close resolves to the same pointer after it. Neither allocates; a mutex error
+    // in either is a program bug, so both are noexcept.
+    void reopen(uint64_t restored_generation) noexcept;
 
     bool wait_for_terminal_leases(uint32_t timeout_ms = 5000) const;
     void bump_generation(uint64_t replacement_generation);

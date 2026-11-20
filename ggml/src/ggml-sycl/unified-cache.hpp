@@ -5143,6 +5143,11 @@ class unified_cache {
     bool     arena_chunk_has_leases(int chunk_idx) const;
     uint32_t arena_chunk_lease_count(int chunk_idx) const;
     uint32_t arena_chunk_lease_count_at(chunk_lease_tag tag) const;
+    // The leases by site, each site apart from the copies of its handles, written into `out` (`size` bytes, always
+    // NUL-terminated when `size` is not 0) as " site=N" for every count that is not zero, and empty when all are.
+    // Returns the counts' sum. It writes only into the caller's buffer and allocates nothing, so a teardown can call it
+    // after it has closed the arena.
+    uint32_t arena_chunk_lease_census(char * out, size_t size) const noexcept;
 
     // Host pinned-pool chunk lease API (dyhdl) — routes through host_arena_.
     // Returns pinned_chunk_pool::INVALID_CHUNK_HANDLE (UINT64_MAX) on miss.
@@ -6504,8 +6509,9 @@ class unified_cache {
 
     // Empties the allocators of physical group `group` (KV and WEIGHT share group 0) and zeroes its zones' used
     // counters, as a settle does once every lease on the group has ended. The caller holds that group's lock and no
-    // allocation is live in the group.
-    void arena_group_reset_allocators_locked(size_t group);
+    // allocation is live in the group. It allocates nothing: a TLSF reset keeps its containers' capacity and rebuilds
+    // its one free block in it.
+    void arena_group_reset_allocators_locked(size_t group) noexcept;
 
     // Compute arena: pre-reserved VRAM for compute scratch buffers.
     // Single unified_alloc-owned device allocation made BEFORE S1-PRELOAD fills VRAM.
@@ -10076,6 +10082,8 @@ void unified_cache_test_fail_next_arena_drain();
 // in a later teardown or in the cache's destructor.
 void unified_cache_test_disarm_arena_teardown_failures();
 void unified_cache_test_fail_next_shutdown_clean();
+// How long a settle waits for its drains, and a teardown for the leases on its retired authorities and on each chunk
+// (5000 ms unless set). A test that sets it puts it back when it is done.
 void unified_cache_test_set_arena_drain_timeout_ms(uint32_t timeout_ms);
 void unified_cache_test_pause_zone_settle(bool pause);
 bool unified_cache_test_zone_settle_reached();
