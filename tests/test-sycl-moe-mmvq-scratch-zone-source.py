@@ -3,11 +3,11 @@
 Each MUL_MAT_ID op that mmvq_moe_batched_dispatch runs takes a Q8_1 copy of its activations and an ids table from the
 device SCRATCH zone and hands both to retain_handles_until_event. A detached drain thread releases them once the op's
 completion event fires; no later op's allocation waits for that release, and the zone's allocator reclaims nothing on
-its own. So nothing bounds how many ops hold their scratch at once, and the zone is sized for every op's buffers
-together: zone_moe_mmvq_scratch_bytes's graph figure, at the micro-batch the context runs. The pure rules
-(zone_scratch_zone_plan, zone_scratch_kept_bytes, zone_scratch_warn_due, and the arena reserve's checks with
-zone_arena_scratch_room) are checked by test-zone-sizing Cases 47 to 49. These checks pin how the cache and the backend
-use them:
+its own. So nothing bounds how many ops hold their scratch at once, and the bound counts every op's buffers together,
+each rounded to the allocator's grain: zone_moe_mmvq_scratch_bytes's graph figure, at the micro-batch the context runs.
+The pure rules (zone_moe_mmvq_op_bytes, zone_scratch_zone_plan, zone_scratch_kept_bytes, zone_scratch_warn_due,
+zone_scratch_clamp_text, and the arena reserve's checks with zone_arena_scratch_room and zone_arena_scratch_accepts)
+are checked by test-zone-sizing Cases 46 to 50. These checks pin how the cache and the backend use them:
 
 The planner computes the bound at the context's micro-batch (the load's planning micro-batch until a context names
 one), stores the graph figure in the plan, and publishes it to every device the plan places. Its line names the plan's
@@ -15,12 +15,14 @@ tensor count, the micro-batch and the depth, and states no zone size: the ensure
 planner does not see, so only the ensure's line states the zone. An MXFP4 operand names its expert count, which sizes
 its grouped dispatch's per-op tables, and the tables' rows a chunk stay pinned to the dispatch's constant.
 
-The ensure sizes the SCRATCH zone from zone_scratch_zone_plan over the arena's default, the non-FA attention raise and
+The ensure plans the SCRATCH zone from zone_scratch_zone_plan over the arena's default, the non-FA attention raise and
 the published bound, held to the quarter of the available budget the non-FA raise is held to (one figure, read once)
 and to the room the arena's reserve accepts, computed after the ONEDNN and RUNTIME zones from the arguments the reserve
-is called with. A clamp logs a latched WARN that names the limit and the miss path. arena_reserve makes its tail checks
-through the same zone-sizing functions the room is built from, so the bound never makes the reserve refuse a zone it
-would have reserved without it.
+is called with. Beside the room it reads whether the reserve accepts the zone the plan must hold at all, since a room
+of 0 does not say. A clamp logs, latched, the line zone_scratch_clamp_text builds from those figures; that line and the
+kept zone's WARN share k_zone_scratch_miss_path_text. arena_reserve makes its tail checks through the same zone-sizing
+functions the room is built from, so the bound never makes the reserve refuse a zone it would have reserved without
+it.
 
 A rebuild that something live blocks keeps a SCRATCH zone short of the bound alone when the ONEDNN and RUNTIME zones
 hold their plan, binds the compute arena and keeps the ONEDNN plan, says so through the latched WARN and returns true
@@ -215,7 +217,7 @@ def test_witness_group_rows_unpinned():
     assert m != c and not claim_mxfp4_operands_name_their_experts(m)
 
 
-# ---- the ensure sizes the SCRATCH zone from the bound, under the budget quarter and the reserve's room ----
+# ---- the ensure plans the SCRATCH zone from the bound, under the budget quarter and the reserve's room ----
 
 ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
               "const zone_arena_ensure_options & options)")
@@ -230,13 +232,16 @@ OTHER_TAIL = ("if (zone_runtime_reserved_bytes(0, runtime_zone, &scratch_other_t
               "scratch_other_tail <= SIZE_MAX - zone_arena_zone_bytes(onednn_zone)) {")
 OTHER_ONEDNN = "scratch_other_tail += zone_arena_zone_bytes(onednn_zone);"
 ROOM_SHAPE = "zone_arena_reserve_shape_of(budget_, device_total_vram_, max_alloc, safe_max_alloc)"
-ROOM = f"scratch_room = zone_arena_scratch_room({ROOM_SHAPE}, scratch_other_tail, scratch_required);"
+ROOM_SHAPE_DEF = f"const zone_arena_reserve_shape scratch_shape = {ROOM_SHAPE};"
+ROOM = "scratch_room = zone_arena_scratch_room(scratch_shape, scratch_other_tail, scratch_required);"
+ACCEPTED_INIT = "bool scratch_accepted = false;"
+ACCEPTS = "scratch_accepted = zone_arena_scratch_accepts(scratch_shape, scratch_other_tail, scratch_required);"
 BOUND = "const size_t moe_mmvq_bound = unified_cache_get_planned_moe_mmvq_scratch_bytes(dev_id);"
 PLAN_ARGS = "moe_mmvq_bound, scratch_budget_cap, scratch_room);"
 ZONE_PLAN = ("const zone_scratch_plan scratch_plan = zone_scratch_zone_plan(scratch_zone, scratch_nonfa, "
              + PLAN_ARGS)
 CLAMP_WARN = ("if (scratch_plan.clamp != zone_scratch_clamp::NONE) { scratch_zone_clamp_warn(dev_id, scratch_plan, "
-              "moe_mmvq_bound, scratch_budget_cap, scratch_room); }")
+              "moe_mmvq_bound, scratch_budget_cap, scratch_room, scratch_accepted); }")
 ZONE_WANTED = "scratch_zone = scratch_plan.wanted;"
 RESERVE_CALL = ("if (!arena_reserve(queue_, budget_, max_alloc, safe_max_alloc, scratch_zone, onednn_zone, "
                 "runtime_zone, device_total_vram_)) {")
@@ -246,8 +251,8 @@ def claim_zone_sized_from_the_bound(uc: str) -> bool:
     """The room is computed after the ONEDNN and RUNTIME zones, on what the zone must hold, from the reserve's own
     arguments, and both limits reach the rule."""
     body = fn_body(code(uc), ENSURE_SIG)
-    return ordered(body, NONFA_TERM, ONEDNN_ZONE, RUNTIME_ZONE, REQUIRED, OTHER_TAIL, OTHER_ONEDNN, ROOM, BOUND,
-                   ZONE_PLAN, ZONE_WANTED, RESERVE_CALL)
+    return ordered(body, NONFA_TERM, ONEDNN_ZONE, RUNTIME_ZONE, REQUIRED, OTHER_TAIL, OTHER_ONEDNN, ROOM_SHAPE_DEF,
+                   ROOM, BOUND, ZONE_PLAN, ZONE_WANTED, RESERVE_CALL)
 
 
 def claim_ensure_passes_the_nonfa_cap(uc: str) -> bool:
@@ -259,7 +264,7 @@ def claim_ensure_passes_the_nonfa_cap(uc: str) -> bool:
 
 def test_the_zone_is_sized_from_the_bound():
     assert claim_zone_sized_from_the_bound(UC), (
-        "the ensure does not size the SCRATCH zone as zone_scratch_zone_plan's wanted figure over the default, the "
+        "the ensure does not plan the SCRATCH zone as zone_scratch_zone_plan's wanted figure over the default, the "
         "non-FA attention raise and the published MoE batched MMVQ bound, held to the room the arena's reserve "
         "accepts beside the ONEDNN and RUNTIME zones, computed from the arguments the reserve is called with")
 
@@ -325,33 +330,39 @@ def test_witness_nonfa_with_its_own_fraction():
     assert not claim_ensure_passes_the_nonfa_cap(m)
 
 
-# ---- a clamp of the bound says so once, naming the limit and the miss path ----
+# ---- a clamp of the bound says so once, in the line zone_scratch_clamp_text builds ----
 
 CLAMP_SIG = "void unified_cache::scratch_zone_clamp_warn("
 CLAMP_GATE = "if (!scratch_zone_warn_latch(scratch_zone_clamp_warn_bytes_, bound_bytes)) { return; }"
-CLAMP_LIMIT = ('room ? "the room the arena\'s reserve accepts holds it" : '
-               '"a quarter of the available budget holds it"')
-CLAMP_FIGURES = ('"bound: %s (%.1f MB; a quarter of the available budget is %.1f MB, the arena\'s reserve accepts a '
-                 '%.1f MB "')
-MISS_PATH = "by name (q8-scratch-alloc) and the op takes its fallback"
+CLAMP_TEXT = ("const std::string line = zone_scratch_clamp_text(dev_id, plan, bound_bytes, budget_cap_bytes, "
+              "room_bytes, reserve_accepts);")
+CLAMP_PRINT = 'GGML_LOG_WARN("%s\\n", line.c_str());'
+MISS_PATH = "k_zone_scratch_miss_path_text"
+TEXT_SIG = "std::string zone_scratch_clamp_text("
 LATCH_SIG = "static bool scratch_zone_warn_latch(std::atomic<size_t> & latch, size_t bytes)"
 LATCH_DUE = "if (!zone_scratch_warn_due(latched, bytes)) { return false; }"
 LATCH_CAS = "} while (!latch.compare_exchange_weak(latched, bytes, std::memory_order_relaxed)); return true;"
 
 
-def claim_clamp_warns_once(uc: str) -> bool:
+def claim_clamp_warns_once(uc: str, zs: str = ZS) -> bool:
+    """The ensure reads the reserve's answer at what the zone must hold beside the room, and the WARN prints the
+    builder's line from its own arguments, once per bound. The builder carries the shared miss-path text; its forms
+    are test-zone-sizing Case 50's."""
     c = code(uc)
     body = fn_body(c, ENSURE_SIG)
     warn = fn_body(c, CLAMP_SIG)
-    return (ordered(body, ZONE_PLAN, CLAMP_WARN, ZONE_WANTED)
-            and ordered(warn, CLAMP_GATE, "GGML_LOG_WARN(", CLAMP_FIGURES, "the miss path", MISS_PATH, CLAMP_LIMIT)
+    return (ordered(body, ACCEPTED_INIT, OTHER_TAIL, ROOM_SHAPE_DEF, ROOM, ACCEPTS, ZONE_PLAN, CLAMP_WARN, ZONE_WANTED)
+            and body.count("scratch_accepted =") == 2
+            and ordered(warn, CLAMP_GATE, CLAMP_TEXT, CLAMP_PRINT) and warn.count("GGML_LOG_") == 1
+            and MISS_PATH in fn_body(code(zs), TEXT_SIG)
             and ordered(fn_body(c, LATCH_SIG), LATCH_DUE, LATCH_CAS))
 
 
-def test_a_clamp_warns_once_naming_the_limit_and_the_miss_path():
+def test_a_clamp_warns_once_in_the_builders_line():
     assert claim_clamp_warns_once(UC), (
         "a plan whose budget quarter or reserve room holds the SCRATCH zone below the MoE batched MMVQ bound must log "
-        "one latched WARN naming the limit, its figures and the miss path")
+        "one latched WARN, the line zone_scratch_clamp_text builds from the plan, the bound, the quarter, the room and "
+        "whether the reserve accepts the zone the plan must hold, with the shared miss-path text")
 
 
 def test_witness_clamp_is_silent():
@@ -364,14 +375,39 @@ def test_witness_clamp_warns_every_plan():
     assert not claim_clamp_warns_once(m)
 
 
-def test_witness_clamp_names_one_limit():
-    m = mutate_in(UC, CLAMP_SIG, CLAMP_LIMIT, '"a quarter of the available budget holds it"')
+def test_witness_clamp_prints_its_own_text():
+    m = mutate_in(UC, CLAMP_SIG, CLAMP_PRINT, 'GGML_LOG_WARN("[VRAM-ARENA] SCRATCH zone clamped\\n");')
     assert not claim_clamp_warns_once(m)
 
 
-def test_witness_clamp_drops_the_miss_path():
-    m = mutate_in(UC, CLAMP_SIG, MISS_PATH, "and the op is served")
+def test_witness_clamp_text_always_accepted():
+    m = mutate_in(UC, CLAMP_SIG, "room_bytes, reserve_accepts);", "room_bytes, true);")
     assert not claim_clamp_warns_once(m)
+
+
+def test_witness_clamp_reads_acceptance_from_the_room():
+    m = mutate_in(UC, ENSURE_SIG, "scratch_room, scratch_accepted); }", "scratch_room, scratch_room > 0); }")
+    assert not claim_clamp_warns_once(m)
+
+
+def test_witness_acceptance_never_read():
+    m = mutate_in(UC, ENSURE_SIG, ACCEPTS, "")
+    assert not claim_clamp_warns_once(m)
+
+
+def test_witness_acceptance_assumed():
+    m = mutate_in(UC, ENSURE_SIG, ACCEPTED_INIT, "bool scratch_accepted = true;")
+    assert not claim_clamp_warns_once(m)
+
+
+def test_witness_acceptance_on_the_default_alone():
+    m = mutate_in(UC, ENSURE_SIG, ACCEPTS, ACCEPTS.replace("scratch_required);", "scratch_zone);"))
+    assert not claim_clamp_warns_once(m)
+
+
+def test_witness_clamp_text_drops_the_miss_path():
+    m = mutate_in(ZS, TEXT_SIG, MISS_PATH, '"the op is served"')
+    assert not claim_clamp_warns_once(UC, m)
 
 
 def test_witness_latch_never_due():
@@ -482,6 +518,8 @@ SHORT_KEEP_RETURN = ("if (scratch_zone < scratch_plan.wanted) { scratch_zone_kep
 DESTROY = "if (!arena_destroy()) {"
 WARN_SIG = "void unified_cache::scratch_zone_kept_warn(int dev_id, const zone_scratch_plan & plan, size_t kept_bytes)"
 WARN_GATE = "if (!scratch_zone_warn_latch(scratch_zone_kept_warn_bytes_, plan.wanted)) { return; }"
+WARN_MISS = ("and live allocations block the rebuild. %s. The zone's \" \"use line at teardown counts each such "
+             "request as a miss")
 
 
 def claim_blocked_rebuild_keeps_the_zone(uc: str) -> bool:
@@ -490,7 +528,7 @@ def claim_blocked_rebuild_keeps_the_zone(uc: str) -> bool:
     warn = fn_body(c, WARN_SIG)
     return (ordered(body, KEEP_DEF, KEPT, BLOCKED, OTHERS_HOLD, KEEP_AT, KEEP_BIND, KEEP_RETURN, HELD,
                     SHORT_KEEP_RETURN, DESTROY)
-            and ordered(warn, WARN_GATE, "GGML_LOG_WARN(", "the miss path", MISS_PATH)
+            and ordered(warn, WARN_GATE, "GGML_LOG_WARN(", WARN_MISS, MISS_PATH)
             and ordered(fn_body(c, LATCH_SIG), LATCH_DUE, LATCH_CAS))
 
 
@@ -519,6 +557,12 @@ def test_witness_short_onednn_keep_drops_the_scratch_warn():
 
 def test_witness_warn_every_keep():
     m = mutate_in(UC, WARN_SIG, WARN_GATE, "")
+    assert not claim_blocked_rebuild_keeps_the_zone(m)
+
+
+def test_witness_kept_warn_drops_the_shared_miss_path():
+    m = mutate_in(UC, WARN_SIG, "plan.required / (1024.0 * 1024.0), " + MISS_PATH,
+                  'plan.required / (1024.0 * 1024.0), "the op is served"')
     assert not claim_blocked_rebuild_keeps_the_zone(m)
 
 
@@ -580,6 +624,24 @@ def test_witness_deferred_scratch_keep_names_no_holders():
     m = mutate_in(UC, ENSURE_SIG, "refusal->holders = holders; refusal->keep_deferred = true; } return false; }",
                   "refusal->keep_deferred = true; } return false; }")
     assert not claim_entry_recovers_a_deferred_scratch_keep(m, GS)
+
+
+# The caller's own recovery steps, each broken alone in the entry: a kept ring gives up on a deferred keep, the call
+# that asks again still asks the cache to release the ring first (so it defers again), a released ring is never
+# followed by the second ask.
+ENTRY_WITNESSES = {
+    "kept ring gives up on a deferred keep": (ENTRY_STEPS[5], "return false; }"),
+    "asks again with ring_release_first": (ENTRY_STEPS[3], ""),
+    # The kept-ring branch ends in the same two statements, so the released ring's are anchored on the WARN before them.
+    "released ring never asks again": ("slot_buffers, device); " + ENTRY_STEPS[6],
+                                       "slot_buffers, device); return true;"),
+}
+
+
+def test_witnesses_entry_recovery_steps():
+    for name, (old, new) in ENTRY_WITNESSES.items():
+        m = mutate_in(GS, ENTRY_SIG, old, new)
+        assert not claim_entry_recovers_a_deferred_scratch_keep(UC, m), name
 
 
 # ---- the context re-sizes the bound and never lowers it ----
