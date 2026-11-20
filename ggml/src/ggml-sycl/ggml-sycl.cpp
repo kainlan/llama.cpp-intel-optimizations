@@ -7287,10 +7287,10 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         // to GPU0 (device_id=0) even though GPU0 can't hold them all.  The fused
         // dispatch would hang trying to upload 128 experts per layer into 10GB.
         //
-        // Phase 4 SKIPPED: dispatch handles CPU fallback via device_ptr check.
-        // Experts stay device_id=0 from Phase 1 with device_ptr=nullptr.
-        // Prestage sets device_ptr for popular experts → GPU0 dispatch.
-        // Unprestaged experts (device_ptr==nullptr) → CPU fallback naturally.
+        // Phase 4 SKIPPED: dispatch handles CPU fallback itself.
+        // Experts stay device_id=0 from Phase 1 with device_ptr=nullptr, and
+        // dispatch asks the unified cache where each one is: an expert resident
+        // in VRAM dispatches on the GPU, any other falls back to the CPU.
         // Phase 4 had bugs: gate/up/down spilled independently, ran before
         // popularity ranking. The dispatch fallback chain handles it correctly.
         // Phase 4 (CPU spill) REMOVED — dispatch handles CPU fallback via
@@ -7340,7 +7340,8 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // S1-PRELOAD is the authoritative model-load materialization step.
     // Device-planned experts are staged into the layout selected by the
     // execution policy; host-planned experts stay as AOS host-pinned entries.
-    // Runtime prestage must not create a second, independent residency policy.
+    // Nothing stages a planned expert at runtime, so the plan stays the only
+    // residency policy.
     if (device == 0 && n_experts_per_layer > 0) {
         GGML_LOG_INFO("[MOE-HYBRID] Phase 3: skipped; unified cache owns planned expert residency/layout\n");
     }
@@ -70115,7 +70116,8 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
             // SOA/COALESCED dispatch fails and cascade falls through to AOS
             // zero-copy via host storage (USM host-pinned, GPU-accessible via PCIe).
             // Do NOT call blocking staging here — it blocks on malloc + CPU reorder.
-            // The background prestage system will populate the cache for future tokens.
+            // Under a placement plan nothing fills the cache at runtime either, so
+            // the miss stays a miss and this expert keeps the host AOS zero-copy path.
             if (plan_active) {
                 static std::atomic<int> plan_miss_log{ 0 };
                 if (plan_miss_log.fetch_add(1, std::memory_order_relaxed) < 5) {
@@ -70332,10 +70334,11 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
     // the kernel would receive nullptr expert pointers for the missed entries
     // and read garbage/zeros from device address 0.
     // This is critical for:
-    //   1. test-backend-ops where no background prestage runs to populate the
-    //      cache before the first (and only) inference pass
-    //   2. First-token inference before prestage has warmed up the cache
-    //   3. Rare experts that haven't been cached yet
+    //   1. test-backend-ops, whose single pass runs with no placement plan and
+    //      nothing cached for the experts it routes to
+    //   2. A device-planned expert the model-load preload did not stage: nothing
+    //      stages it at runtime, so it misses on every token (logged below)
+    //   3. A layout the cache does not hold the expert in
     // When skip_cpu_routed_experts is true (hybrid dispatch), misses are expected
     // and handled by CPU fallback — don't interfere with that path.
     const bool unresolved_needed_experts = stats_miss > 0 || stats_layout_mismatch > 0;

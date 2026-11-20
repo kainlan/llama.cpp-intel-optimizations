@@ -676,7 +676,7 @@ static void ggml_sycl_cleanup_host_allocations() {
 // requires a reboot. This watchdog fires *before* the driver's cascade:
 // callers sprinkle ggml_sycl_watchdog_heartbeat() at natural progress points
 // (graph_compute exit, every whole-queue wait of the graph code that returns,
-// every CPU expert batch and host-recipe task, per-layer prestage loops,
+// every CPU expert batch and host-recipe task, per-layer weight preload loops,
 // persistent TG dispatch), a polling thread checks elapsed time since the last
 // heartbeat, and if it exceeds GGML_SYCL_OP_TIMEOUT_MS the process is _Exit(1)'d
 // with a diagnostic.
@@ -687,7 +687,7 @@ static void ggml_sycl_cleanup_host_allocations() {
 //
 // Environment:
 //   GGML_SYCL_OP_TIMEOUT_MS=<N>  timeout in milliseconds (default 30000)
-//   GGML_SYCL_OP_TIMEOUT_MS=0    disable the watchdog (long prestage, debug)
+//   GGML_SYCL_OP_TIMEOUT_MS=0    disable the watchdog (long weight preload, debug)
 // ============================================================================
 
 // Default timeout: ~3x the xe driver's 10s GT-reset window so we fire
