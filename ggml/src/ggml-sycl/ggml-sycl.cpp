@@ -7269,10 +7269,15 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         //
         // Phase 4 SKIPPED: no CPU spill here. Experts stay device_id=0 from
         // Phase 1 with device_ptr=nullptr, and dispatch asks the unified cache
-        // where each one is. An expert resident in VRAM runs on the GPU. A miss
-        // runs on the CPU under hybrid dispatch (skip_cpu_routed_experts);
-        // otherwise update_moe_ptr_table installs the expert's host-pinned AOS
-        // copy in the pointer table and the GPU kernel reads it in place.
+        // where each one is. An expert resident in VRAM runs on the GPU. On a
+        // miss, update_moe_ptr_table installs the expert's host-pinned AOS copy
+        // in the pointer table, for the GPU kernel to read in place, in two
+        // cases only: an exact-layout AOS request on a USM-accessible source,
+        // and a source that is not USM-accessible while CPU-routed experts are
+        // not skipped. Any other miss leaves the slot empty. Under hybrid
+        // dispatch (skip_cpu_routed_experts) that expert runs on the CPU;
+        // otherwise update_moe_ptr_table returns false and its caller handles
+        // the miss.
 
         // Log distribution summary (cache-based, after Phase 2 upload)
         {
@@ -70040,9 +70045,9 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
 
         // OPT-FUSED: For SOA/COALESCED layouts with USM-accessible (host-pinned) source,
         // avoid blocking CPU reorder on cache miss. Instead, check if the entry is already
-        // cached (fast path). On miss, leave pointer as nullptr so the SOA/COALESCED
-        // dispatch fails gracefully, and the cascade falls through to AOS which reads
-        // host-pinned data directly via PCIe zero-copy.
+        // cached (fast path). On miss, leave pointer as nullptr; unless CPU-routed
+        // experts are skipped, this call then returns false and its caller handles
+        // the miss.
         //
         // CRITICAL: Do NOT call blocking staging on cache miss during inference.
         // Blocking staging may:
@@ -70051,7 +70056,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         //   3. Acquire rw_mutex_ under contention
         // All three block the inference thread and cause 120B MoE hangs.
         // Non-blocking path for ALL layouts when source is USM-accessible.
-        // On cache hit: use cached pointer. On miss: use host-pinned AOS zero-copy.
+        // On cache hit: use cached pointer. On miss: leave the slot empty.
         // NEVER call blocking staging during inference (blocks on fill/DMA).
         // Try the requested layout first. Non-forced routing may fall back to
         // compatible prestaged layouts; forced diagnostics require exact layout.
@@ -70065,12 +70070,12 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
                                 (int) layout, (int) route.actual_layout, route.has_ready_event ? 1 : 0);
                 continue;
             }
-            // Cache miss: fully non-blocking path. Leave pointer as nullptr so
-            // SOA/COALESCED dispatch fails and cascade falls through to AOS
-            // zero-copy via host storage (USM host-pinned, GPU-accessible via PCIe).
-            // Do NOT call blocking staging here — it blocks on malloc + CPU reorder.
-            // Under a placement plan nothing fills the cache at runtime either, so
-            // the miss stays a miss and this expert keeps the host AOS zero-copy path.
+            // Cache miss, for every layout: the slot stays empty and the expert
+            // counts as a miss or a layout mismatch. Unless CPU-routed experts are
+            // skipped, the function then returns false and its caller handles the
+            // miss. Do NOT call blocking staging here — it blocks on malloc + CPU
+            // reorder. Under a placement plan nothing fills the cache at runtime
+            // either.
             if (plan_active) {
                 static std::atomic<int> plan_miss_log{ 0 };
                 if (plan_miss_log.fetch_add(1, std::memory_order_relaxed) < 5) {
@@ -70104,6 +70109,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
             continue;
         }
 
+        // Unreachable: the src0_is_usm_accessible block above continues on every path.
         // For AOS layout with USM-accessible source, also use non-blocking zero-copy.
         // The GPU can read host-pinned AOS data directly via PCIe (~8 GB/s) without
         // any staging, SOA reorder, or SYCL queue operations. This avoids blocking
