@@ -2386,15 +2386,66 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx,
     }
 }
 
+// Where a sub-group of a column-split work-group works. A work-group holds 16 / chunks rows; a row's chunks are
+// consecutive sub-groups, chunk 0 first, so sub-group sg_id works on chunk sg_id % chunks of row sg_id / chunks.
+struct mmvq_column_split_slot {
+    int sg_id;  // the sub-group's index in its work-group, which is also its slot in the row partials
+    int chunk;  // which of its row's chunks the sub-group walks
+    int row;    // the output row, in the slice; past nrows in the padded tail of the last work-group
+};
+
+static __dpct_inline__ mmvq_column_split_slot mmvq_column_split_slot_locate(const sycl::nd_item<3> & nd_item,
+                                                                            const int                chunks) {
+    const int              workgroup = static_cast<int>(nd_item.get_group_linear_id());
+    mmvq_column_split_slot slot;
+    slot.sg_id = static_cast<int>(nd_item.get_sub_group().get_group_linear_id());
+    slot.chunk = slot.sg_id % chunks;
+    slot.row   = workgroup * ggml_sycl::mmvq_column_split_rows_per_workgroup(chunks) + slot.sg_id / chunks;
+    return slot;
+}
+
+// The end of a column-split kernel, once for both layouts: every sub-group reduces its lanes' partial sum, its leader
+// publishes it to the sub-group's slot in `row_partials` (local memory, one float per sub-group), the work-group
+// barrier makes all of them visible, and the leader of the row's chunk-0 sub-group adds the row's partials in chunk
+// order, a fixed order so the result is deterministic, then the fused addend once. Every sub-group of the work-group
+// must call this, padded rows included: they bring a zero partial to the barrier and write nothing.
+static __dpct_inline__ void mmvq_column_split_finish_row(const sycl::nd_item<3> &       nd_item,
+                                                         const mmvq_column_split_slot & slot,
+                                                         const int                      chunks,
+                                                         const int                      nrows,
+                                                         const float                    partial_sum,
+                                                         float * __restrict__ row_partials,
+                                                         float *       dst,
+                                                         const float * fused_add,
+                                                         const int64_t fused_add_ne0,
+                                                         const int64_t fused_add_nb0,
+                                                         const int64_t fused_add_row_base) {
+    const auto  sg  = nd_item.get_sub_group();
+    const float sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
+    if (sg.leader()) {
+        row_partials[slot.sg_id] = sum;
+    }
+    nd_item.barrier(sycl::access::fence_space::local_space);
+
+    if (slot.chunk == 0 && slot.row < nrows && sg.leader()) {
+        float row_sum = 0.0f;
+        for (int c = 0; c < chunks; ++c) {
+            row_sum += row_partials[slot.sg_id + c];
+        }
+        dst[slot.row] =
+            row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base + slot.row);
+    }
+}
+
 // Column-split form of mul_mat_vec_q_reorder, for matrices with too few rows to occupy the card
 // (mmvq-launch-geometry.hpp says when and why). A work-group's 16 sub-groups hold 16 / chunks rows; sub-group
-// `chunk` of a row walks the row form's sub-group steps chunk, chunk + chunks, ... with the row form's per-block body,
-// so with chunks == 1 it reads exactly what the row form reads. Each sub-group reduces its lanes as the row form does,
-// writes one partial to `row_partials` (one float per sub-group, in local memory), and after the work-group barrier
-// the row's chunk-0 sub-group adds the partials in chunk order: a fixed order, so the result is deterministic, but not
-// the row form's order, so it matches the row form to rounding rather than bit for bit.
-// Rows past nrows in the last work-group compute nothing and write nothing, but cannot return early: every sub-group
-// of the work-group must reach the barrier.
+// `chunk` of a row walks the row form's sub-group steps chunk, chunk + chunks, ... The per-block body is a copy of
+// mul_mat_vec_q_reorder's loop body, not a call: that template serves every reorder type and walks a whole row, and
+// splitting it would touch every type's row form for the sake of this one. With chunks == 1 the copy reads exactly
+// what the row form reads. mmvq_column_split_finish_row then reduces and adds the row's chunks in chunk order: a fixed
+// order, so the result is deterministic, but not the row form's order, so it matches the row form to rounding rather
+// than bit for bit. Rows past nrows in the last work-group compute nothing and write nothing, but cannot return early:
+// every sub-group of the work-group must reach the barrier inside mmvq_column_split_finish_row.
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder_column_split(const void * __restrict__ vx,
                                                const void * __restrict__ vy,
@@ -2413,12 +2464,10 @@ static void mul_mat_vec_q_reorder_column_split(const void * __restrict__ vx,
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
 
-    const auto sg    = nd_item.get_sub_group();
-    const int  sg_id = sg.get_group_linear_id();
-    const int  lane  = sg.get_local_linear_id();
-    const int  chunk = sg_id % chunks;
-    const int  row =
-        nd_item.get_group_linear_id() * ggml_sycl::mmvq_column_split_rows_per_workgroup(chunks) + sg_id / chunks;
+    const mmvq_column_split_slot slot  = mmvq_column_split_slot_locate(nd_item, chunks);
+    const int                    chunk = slot.chunk;
+    const int                    row   = slot.row;
+    const int                    lane  = nd_item.get_sub_group().get_local_linear_id();
 
     const int     blocks_per_row              = ncols / block_traits::qk;
     constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
@@ -2454,19 +2503,8 @@ static void mul_mat_vec_q_reorder_column_split(const void * __restrict__ vx,
         }
     }
 
-    const float sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
-    if (sg.leader()) {
-        row_partials[sg_id] = sum;
-    }
-    nd_item.barrier(sycl::access::fence_space::local_space);
-
-    if (chunk == 0 && row < nrows && sg.leader()) {
-        float row_sum = 0.0f;
-        for (int c = 0; c < chunks; ++c) {
-            row_sum += row_partials[sg_id + c];
-        }
-        dst[row] = row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base + row);
-    }
+    mmvq_column_split_finish_row(nd_item, slot, chunks, nrows, partial_sum, row_partials, dst, fused_add, fused_add_ne0,
+                                 fused_add_nb0, fused_add_row_base);
 }
 
 // Multi-row reordered kernel with SLM Y-vector sharing
@@ -4265,9 +4303,8 @@ static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesc
 // Column-split form of mul_mat_vec_q8_0_coalesced, for matrices with too few rows to occupy the card
 // (mmvq-launch-geometry.hpp says when and why). A step of the row form is one tile, so sub-group `chunk` of a row
 // walks the tiles mmvq_column_split_first_step / step_stride give it through the same per-tile body. The reduction
-// is the SOA column-split kernel's: sub-group reduce, one partial per sub-group in local memory, a work-group
-// barrier, then the row's chunk-0 sub-group adds the partials in chunk order. Padded rows reach the barrier and
-// write nothing. The coalesced layout is never sliced (the dispatcher asserts it), so nrows is the tensor's row
+// is the SOA column-split kernel's own, mmvq_column_split_finish_row. Padded rows reach its barrier and write
+// nothing. The coalesced layout is never sliced (the dispatcher asserts it), so nrows is the tensor's row
 // count, as in the row form.
 static void mul_mat_vec_q8_0_coalesced_column_split(const void * __restrict__ vx,
                                                     const void * __restrict__ vy,
@@ -4281,12 +4318,10 @@ static void mul_mat_vec_q8_0_coalesced_column_split(const void * __restrict__ vx
                                                     const int64_t fused_add_ne0,
                                                     const int64_t fused_add_nb0,
                                                     const int64_t fused_add_row_base) {
-    const auto sg    = nd_item.get_sub_group();
-    const int  sg_id = sg.get_group_linear_id();
-    const int  lane  = sg.get_local_linear_id();
-    const int  chunk = sg_id % chunks;
-    const int  row =
-        nd_item.get_group_linear_id() * ggml_sycl::mmvq_column_split_rows_per_workgroup(chunks) + sg_id / chunks;
+    const mmvq_column_split_slot slot  = mmvq_column_split_slot_locate(nd_item, chunks);
+    const int                    chunk = slot.chunk;
+    const int                    row   = slot.row;
+    const int                    lane  = nd_item.get_sub_group().get_local_linear_id();
 
     const int blocks_per_row = ncols / QK8_0;
     const int tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
@@ -4307,19 +4342,8 @@ static void mul_mat_vec_q8_0_coalesced_column_split(const void * __restrict__ vx
         }
     }
 
-    const float sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
-    if (sg.leader()) {
-        row_partials[sg_id] = sum;
-    }
-    nd_item.barrier(sycl::access::fence_space::local_space);
-
-    if (chunk == 0 && row < nrows && sg.leader()) {
-        float row_sum = 0.0f;
-        for (int c = 0; c < chunks; ++c) {
-            row_sum += row_partials[sg_id + c];
-        }
-        dst[row] = row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base + row);
-    }
+    mmvq_column_split_finish_row(nd_item, slot, chunks, nrows, partial_sum, row_partials, dst, fused_add, fused_add_ne0,
+                                 fused_add_nb0, fused_add_row_base);
 }
 
 // GPU kernel to convert Q8_0 reordered format to warp-coalesced format

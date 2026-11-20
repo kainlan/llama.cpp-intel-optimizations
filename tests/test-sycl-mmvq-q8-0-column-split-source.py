@@ -23,9 +23,11 @@ gate holds those by text:
       (mmvq_column_split_first_step / mmvq_column_split_step_stride): the coalesced kernel calls it directly over tile
       indices, the SOA kernel through mmvq_column_split_first_block / block_stride, which the header defines through
       it;
-  K1  each split kernel reduces its sub-group, publishes one partial per sub-group to local memory, passes a
-      work-group barrier with no early return before it, and only then lets the row's chunk-0 sub-group add the
-      partials in chunk order and the fused addend once;
+  K1  the reduction protocol exists once, in mmvq_column_split_finish_row: reduce the sub-group, publish one partial
+      per sub-group to local memory, one work-group barrier with no early return before it, and only then the row's
+      chunk-0 sub-group adds the partials in chunk order and the fused addend once; the sub-group's slot (its index,
+      chunk and row) is derived once, in mmvq_column_split_slot_locate; each split kernel locates its slot through the
+      one and ends in the other, with no return, barrier or dst write of its own;
   K2  the row forms still walk what they walked: the SOA row kernel's block loop, and the coalesced row kernel's
       every-tile loop through the shared per-tile body;
   E1  no host wait and no new dependency in either launcher: both forms go through the one ggml_sycl_profile_submit
@@ -121,6 +123,11 @@ SOA_ROW = "static void mul_mat_vec_q_reorder("
 COALESCED_ROW = "static void mul_mat_vec_q8_0_coalesced("
 DISPATCH = "static void ggml_sycl_mmvq_dispatch("
 UNITS = "static int mmvq_device_compute_units("
+SLOT = "static __dpct_inline__ mmvq_column_split_slot mmvq_column_split_slot_locate("
+FINISH = "static __dpct_inline__ void mmvq_column_split_finish_row("
+LOCATE_CALL = "const mmvq_column_split_slot slot = mmvq_column_split_slot_locate(nd_item, chunks);"
+FINISH_CALL = ("mmvq_column_split_finish_row(nd_item, slot, chunks, nrows, partial_sum, row_partials, dst, fused_add, "
+               "fused_add_ne0, fused_add_nb0, fused_add_row_base); }")
 ROW_ANCHOR = "constexpr size_t num_subgroups = 16;"
 
 
@@ -159,26 +166,47 @@ def check_launcher(launcher: str, pin: str, step_decl: str, split_kernel_call: s
     need(launcher.count("sycl::local_accessor<") == 1, "A1", "the split path holds memory other than one accessor")
 
 
-def check_split_kernel(kernel: str, pin: str) -> None:
+def check_finish_row(finish: str, slot: str) -> None:
     barrier = "nd_item.barrier(sycl::access::fence_space::local_space);"
     need(
         ordered(
-            kernel,
-            "sycl::reduce_over_group(sg, partial_sum, std::plus<>());",
-            "if (sg.leader()) { row_partials[sg_id] = sum; }",
+            finish,
+            "const auto sg = nd_item.get_sub_group();",
+            "const float sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());",
+            "if (sg.leader()) { row_partials[slot.sg_id] = sum; }",
             barrier,
-            "if (chunk == 0 && row < nrows && sg.leader()) {",
-            "for (int c = 0; c < chunks; ++c) { row_sum += row_partials[sg_id + c]; }",
-            "dst[row] = row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, "
-            "fused_add_row_base + row);",
+            "if (slot.chunk == 0 && slot.row < nrows && sg.leader()) {",
+            "for (int c = 0; c < chunks; ++c) { row_sum += row_partials[slot.sg_id + c]; }",
+            "dst[slot.row] = row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, "
+            "fused_add_row_base + slot.row);",
         ),
-        pin,
+        "K1",
         "reduce, publish, barrier, then the chunk-0 sum and the fused addend, in that order",
     )
-    need(kernel.count(barrier) == 1, pin, "the split kernel does not have exactly one barrier")
-    need("return" not in kernel[: kernel.index(barrier)], pin, "a return before the barrier: a work-group would hang")
-    need(kernel.count("dst[") == 1, pin, "the split kernel writes dst more than once")
-    need("if (row < nrows) {" in kernel, pin, "padded rows are not kept from computing")
+    need(finish.count(barrier) == 1, "K1", "the finish helper does not have exactly one barrier")
+    need("return" not in finish[: finish.index(barrier)], "K1", "a return before the barrier: a work-group would hang")
+    need(finish.count("dst[") == 1, "K1", "the finish helper writes dst more than once")
+    need(
+        ordered(
+            slot,
+            "slot.sg_id = static_cast<int>(nd_item.get_sub_group().get_group_linear_id());",
+            "slot.chunk = slot.sg_id % chunks;",
+            "slot.row = workgroup * ggml_sycl::mmvq_column_split_rows_per_workgroup(chunks) + slot.sg_id / chunks;",
+        ),
+        "K1",
+        "a sub-group's slot is not chunk sg_id % chunks of row sg_id / chunks of its work-group's rows",
+    )
+
+
+def check_split_kernel(kernel: str) -> None:
+    need(kernel.count(LOCATE_CALL) == 1, "K1", "the split kernel does not locate its slot through the shared helper")
+    need(kernel.count(FINISH_CALL) == 1 and kernel.endswith(FINISH_CALL), "K1",
+         "the split kernel does not end in the shared finish helper")
+    need("return" not in kernel and "barrier" not in kernel and "dst[" not in kernel, "K1",
+         "the split kernel returns, waits or writes dst outside the shared finish helper")
+    need("const int chunk = slot.chunk; const int row = slot.row;" in kernel, "K1",
+         "the split kernel derives its chunk or row other than from its slot")
+    need("if (row < nrows) {" in kernel, "K1", "padded rows are not kept from computing")
 
 
 def check(mmvq_raw: str, header_raw: str) -> None:
@@ -266,8 +294,9 @@ def check(mmvq_raw: str, header_raw: str) -> None:
     )
 
     # K1 ---------------------------------------------------------------------------------------------------------------
-    check_split_kernel(soa_split, "K1")
-    check_split_kernel(coalesced_split, "K1")
+    check_finish_row(body(code, FINISH, "K1"), body(code, SLOT, "K1"))
+    check_split_kernel(soa_split)
+    check_split_kernel(coalesced_split)
 
     # K2 ---------------------------------------------------------------------------------------------------------------
     need(
@@ -328,36 +357,37 @@ MUTANTS = [
        " + (int) sizeof(src0_name));\n"
        "    if (chunks_out) {\n        *chunks_out = chunks;\n    }\n\n"
        "    // P4 TG-cost-visibility (llama.cpp-os8k): SOA")]),
-    ("the SOA split kernel loses its barrier", "K1", "mmvq",
-     [("        row_partials[sg_id] = sum;\n    }\n    nd_item.barrier(sycl::access::fence_space::local_space);\n\n"
-       "    if (chunk == 0 && row < nrows && sg.leader()) {\n        float row_sum = 0.0f;\n"
-       "        for (int c = 0; c < chunks; ++c) {\n            row_sum += row_partials[sg_id + c];\n        }\n"
-       + SPLIT_DST
-       + "\n    }\n}\n\n// Multi-row",
-       "        row_partials[sg_id] = sum;\n    }\n\n"
-       "    if (chunk == 0 && row < nrows && sg.leader()) {\n        float row_sum = 0.0f;\n"
-       "        for (int c = 0; c < chunks; ++c) {\n            row_sum += row_partials[sg_id + c];\n        }\n"
-       + SPLIT_DST
-       + "\n    }\n}\n\n// Multi-row")]),
     ("the coalesced split kernel returns early for padded rows", "K1", "mmvq",
      [("    const int blocks_per_row = ncols / QK8_0;\n    const int tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count"
        "(blocks_per_row);\n\n    const uint8_t *     x_qs",
        "    if (row >= nrows) {\n        return;\n    }\n    const int blocks_per_row = ncols / QK8_0;\n"
        "    const int tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);\n\n"
        "    const uint8_t *     x_qs")]),
-    ("the coalesced split kernel drops the fused addend", "K1", "mmvq",
-     [("            row_sum += row_partials[sg_id + c];\n        }\n"
-       + SPLIT_DST
-       + "\n    }\n}\n\n// GPU kernel to convert Q8_0",
-       "            row_sum += row_partials[sg_id + c];\n        }\n        dst[row] = row_sum;\n    }\n}\n\n"
-       "// GPU kernel to convert Q8_0")]),
-    ("the SOA split kernel sums the first row's partials for every row", "K1", "mmvq",
-     [("            row_sum += row_partials[sg_id + c];\n        }\n"
-       + SPLIT_DST
-       + "\n    }\n}\n\n// Multi-row",
-       "            row_sum += row_partials[c];\n        }\n"
-       + SPLIT_DST
-       + "\n    }\n}\n\n// Multi-row")]),
+    ("the finish helper loses its barrier", "K1", "mmvq",
+     [("        row_partials[slot.sg_id] = sum;\n    }\n    nd_item.barrier(sycl::access::fence_space::local_space);\n",
+       "        row_partials[slot.sg_id] = sum;\n    }\n")]),
+    ("the finish helper drops the fused addend", "K1", "mmvq",
+     [("        dst[slot.row] =\n            row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, "
+       "fused_add_row_base + slot.row);",
+       "        dst[slot.row] = row_sum;")]),
+    ("the finish helper sums the first row's partials for every row", "K1", "mmvq",
+     [("            row_sum += row_partials[slot.sg_id + c];", "            row_sum += row_partials[c];")]),
+    ("a sub-group's slot puts consecutive sub-groups on different rows", "K1", "mmvq",
+     [("    slot.chunk = slot.sg_id % chunks;", "    slot.chunk = slot.sg_id / chunks;")]),
+    ("the SOA split kernel ends in its own reduction", "K1", "mmvq",
+     [("partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);\n"
+       "            }\n        }\n    }\n\n    mmvq_column_split_finish_row(nd_item, slot, chunks, nrows, partial_sum, "
+       "row_partials, dst, fused_add, fused_add_ne0,\n"
+       "                                 fused_add_nb0, fused_add_row_base);\n",
+       "partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);\n"
+       "            }\n        }\n    }\n\n    dst[row] = sycl::reduce_over_group(nd_item.get_sub_group(), partial_sum, "
+       "std::plus<>());\n")]),
+    ("the coalesced split kernel derives its row with its own arithmetic", "K1", "mmvq",
+     [("    const int                    row   = slot.row;\n    const int                    lane  = "
+       "nd_item.get_sub_group().get_local_linear_id();\n\n    const int blocks_per_row = ncols / QK8_0;",
+       "    const int                    row   = (int) nd_item.get_group_linear_id() * 2 + slot.sg_id / chunks;\n"
+       "    const int                    lane  = nd_item.get_sub_group().get_local_linear_id();\n\n"
+       "    const int blocks_per_row = ncols / QK8_0;")]),
     ("the SOA split chunks all start at the row's first step", "W1", "mmvq",
      [("ggml_sycl::mmvq_column_split_first_block(chunk, lane / block_elements_per_subgroup,",
        "ggml_sycl::mmvq_column_split_first_block(0, lane / block_elements_per_subgroup,")]),
