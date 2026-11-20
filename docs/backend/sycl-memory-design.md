@@ -2446,7 +2446,7 @@ happens next depends on the expert type:
   (test-moe-q1-nvfp4-dispatch-refusal).
 - Every other type the dispatch admits takes another route: the planner
   route's per-entry dispatch, or the route the batched dispatch was tried ahead
-  of (decode-direct, hybrid decode, MXFP4 grouped down, legacy and planned PP).
+  of (decode-direct, hybrid decode, MXFP4 grouped down, planned PP).
 
 The rule, `zone_scratch_zone_plan` (test-zone-sizing Cases 47 to 49): what the
 zone must hold (`required`) is the larger of its default
@@ -2465,7 +2465,9 @@ to two limits, `wanted = max(required, min(bound, quarter, required + room))`:
   16 MiB left beside the tail, a tail plus 16 MiB that the per-chunk cap
   cannot hold, or weight chunks below 16 MiB. `arena_reserve` makes each of
   those checks through the zone-sizing functions the room is built from, so
-  the two cannot disagree.
+  the two cannot disagree. It sums the tail once, with the same
+  `zone_arena_tail_bytes` the room sums its tails with, and refuses a sum that
+  wraps before either layout reads it.
 
 Both limits apply to every expert type, the two with no fallback included. The
 bound is a worst case, every expert op's buffers live at once, and far from
@@ -2474,8 +2476,9 @@ use line measured a high-water of 9.06 MB, one op's two buffers live, in a
 727.5 MB zone. Refusing a load because the arena cannot hold that bound would
 refuse a model that runs. A clamped zone still holds the quarter or the room,
 and only a true miss beyond it, on a card with no room outside the arena, costs
-anything: late and by name, and for Q1_0 or NVFP4 a failed compute, never an
-abort.
+anything: the dispatch refuses the buffer late and by name, a refusal that
+never aborts and that for Q1_0 or NVFP4 is a failed compute. The route an op of
+another type falls to then makes its own allocations.
 
 Either limit can hold the zone below the bound; the ensure then logs one WARN
 per bound figure, the line `zone_scratch_clamp_text` builds (test-zone-sizing
