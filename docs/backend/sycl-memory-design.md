@@ -3457,7 +3457,12 @@ abort, an arena the failed load's own buffers hold is a WARN, and it stays
 until a later release finds nothing holding it. A teardown that refuses is an
 ERROR with its cause. Liveness is process-wide, so a model live on either card
 keeps every device's arena, and the entry ensure's last resort (above) stays
-reachable for that case. `tests/test-sycl-last-release-source.py` pins the
+reachable for that case. The MoE inference buffers the first MoE model
+preallocates outside the arena (`moe_preallocate_inference_buffers()`: the
+expert pointer tables, the IDs staging, the compact pointer list and its missing
+flag) are not released here and are kept for the process: readers hold
+non-owning views into three of them, and a later model that needs larger ones
+falls back to runtime allocations. `tests/test-sycl-last-release-source.py` pins the
 wiring, `last_release_empties_the_arena` in the
 `sycl-runtime-alloc-last-release-empties-the-arena` ctest (binary
 `test-sycl-runtime-alloc`) drives the step and its refusals on a hand-built
