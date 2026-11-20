@@ -298,6 +298,42 @@ static int test_arena_allocation_vs_settle_linearization() {
     return 0;
 }
 
+// A teardown that refuses before it freed anything reopens the authority it closed, at the generation it had. The
+// handle minted before the close stops resolving while the authority is closed (the positive control), and after the
+// reopen resolves to the same pointer; the records and leases the authority held are what they were, and it admits a
+// new exact lease again. Mutant: a reopen that also clears the leases (the counts differ after it).
+static int test_reopened_authority_resolves_its_handles_again() {
+    alignas(64) unsigned char storage[64]   = {};
+    const int                 zone          = static_cast<int>(ggml_sycl::vram_zone_id::SCRATCH);
+    auto                      authority     = make_authority(zone, 5, storage, sizeof(storage));
+    constexpr uint64_t        allocation_id = 301;
+    CHECK(authority->register_allocation(zone, allocation_id, 16, 16), "the fake allocator record must register");
+    auto handle = ggml_sycl::mem_handle::from_arena_zone(zone, 16, 16, 0, 5, allocation_id, 16, authority);
+    CHECK(handle.resolve().ptr == storage + 16, "the handle did not resolve before the close");
+    const size_t   chunk_leases      = authority->terminal_lease_count();
+    const uint32_t allocation_leases = allocation_lease_count(authority, allocation_id);
+    CHECK(chunk_leases == 1 && allocation_leases == 1, "the handle did not take its lease");
+
+    authority->close_and_invalidate(6);
+    CHECK(!handle.resolve() && !authority->accepts(5) && !authority->accepts(6),
+          "the closed authority still resolved the handle or admitted");
+
+    authority->reopen(5);
+    CHECK(authority->accepts(5) && !authority->accepts(6), "the reopened authority does not admit at its generation");
+    CHECK(handle.resolve().ptr == storage + 16,
+          "the handle minted before the close does not resolve to the same pointer after the reopen");
+    CHECK(authority->terminal_lease_count() == chunk_leases &&
+              allocation_lease_count(authority, allocation_id) == allocation_leases,
+          "the reopen changed the leases the authority held");
+    auto again = authority->acquire_allocation(zone, 5, allocation_id, 16, 16);
+    CHECK(again, "the reopened authority did not admit a new exact lease");
+    again.lease.reset();
+    handle = {};
+    CHECK(authority->terminal_lease_count() == 0, "a lease outlived its handle");
+    CHECK(authority->unregister_allocation(zone, 16), "the fake record must unregister");
+    return 0;
+}
+
 static int test_unrelated_zone_incarnations_are_independent() {
     alignas(64) unsigned char runtime_bytes[64] = {}, scratch_bytes[64] = {};
     auto runtime = make_authority(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 8,
@@ -427,6 +463,9 @@ int main() {
         return rc;
     }
     if (int rc = test_arena_allocation_vs_settle_linearization()) return rc;
+    if (int rc = test_reopened_authority_resolves_its_handles_again()) {
+        return rc;
+    }
     if (int rc = test_unrelated_zone_incarnations_are_independent()) return rc;
     if (int rc = test_arena_alias_count_and_publish_race()) return rc;
     std::puts("PASS: mem_handle lifetime diagnostics");

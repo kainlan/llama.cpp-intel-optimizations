@@ -2984,6 +2984,7 @@ int main() {
         using ggml_sycl::zone_arena_refusal_text;
         using ggml_sycl::zone_arena_teardown_left_closed;
         using ggml_sycl::zone_arena_teardown_refusal;
+        using ggml_sycl::zone_arena_unfreed_chunk_refusal;
 
         const auto has = [](const std::string & text, const char * part) {
             return text.find(part) != std::string::npos;
@@ -2992,12 +2993,31 @@ int main() {
         CHECK(!zone_arena_teardown_left_closed(zone_arena_teardown_refusal::NONE), "no refusal left the arena closed");
         for (const zone_arena_teardown_refusal restored :
              { zone_arena_teardown_refusal::HOST_STATE, zone_arena_teardown_refusal::LIVE_ALLOCATIONS,
-               zone_arena_teardown_refusal::DRAIN_TIMEOUT }) {
+               zone_arena_teardown_refusal::DRAIN_TIMEOUT, zone_arena_teardown_refusal::LEASES_OUTSTANDING,
+               zone_arena_teardown_refusal::FIRST_FREE_FAILED }) {
             CHECK(!zone_arena_teardown_left_closed(restored),
                   "a teardown refused before it freed any chunk left the arena closed");
         }
-        CHECK(zone_arena_teardown_left_closed(zone_arena_teardown_refusal::FREE_FAILED),
-              "a teardown refused after it freed a chunk left the arena open");
+        for (const zone_arena_teardown_refusal partly :
+             { zone_arena_teardown_refusal::FREE_FAILED, zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE }) {
+            CHECK(zone_arena_teardown_left_closed(partly),
+                  "a teardown refused after it freed a chunk left the arena open");
+        }
+
+        // A chunk the teardown could not free names a restorable cause only while no chunk was freed before it, and
+        // says whether a lease kept it or the device refused it.
+        CHECK(zone_arena_unfreed_chunk_refusal(true, false) == zone_arena_teardown_refusal::LEASES_OUTSTANDING &&
+                  zone_arena_unfreed_chunk_refusal(false, false) == zone_arena_teardown_refusal::FIRST_FREE_FAILED,
+              "a chunk the teardown could not free before any was freed is given the wrong cause");
+        CHECK(zone_arena_unfreed_chunk_refusal(true, true) ==
+                      zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE &&
+                  zone_arena_unfreed_chunk_refusal(false, true) == zone_arena_teardown_refusal::FREE_FAILED,
+              "a chunk the teardown could not free after one was freed is given the wrong cause");
+        for (const bool leased : { false, true }) {
+            CHECK(!zone_arena_teardown_left_closed(zone_arena_unfreed_chunk_refusal(leased, false)) &&
+                      zone_arena_teardown_left_closed(zone_arena_unfreed_chunk_refusal(leased, true)),
+                  "whether a chunk was freed before the failed one does not decide whether the arena stays closed");
+        }
 
         zone_arena_refusal torn;
         torn.reason          = zone_arena_refusal_reason::TEARDOWN_REFUSED;
@@ -3038,10 +3058,35 @@ int main() {
                   "teardown waited, and the arena is as it was. Load this one again once the work on device 1 has "
                   "finished"),
               "a drain that timed out is not named with the arena intact and its remedy");
-        for (const std::string * intact : { &hl, &ll, &tl }) {
-            CHECK(!has(*intact, "stays closed") && !has(*intact, "new process") && !has(*intact, "partly freed"),
+        const std::string ol = text_for(zone_arena_teardown_refusal::LEASES_OUTSTANDING);
+        const std::string fx = text_for(zone_arena_teardown_refusal::FIRST_FREE_FAILED);
+        CHECK(has(ol,
+                  "; the arena could not be torn down: a lease on the first chunk the teardown tried outlived its "
+                  "wait, so none was freed and the arena is as it was. Free what holds a pointer into it on device 1, "
+                  "then load this one again"),
+              "a chunk lease that outlived the wait before any chunk was freed is not named with the arena intact");
+        CHECK(has(fx,
+                  "; the arena could not be torn down: the device refused to free the first chunk the teardown tried, "
+                  "so none was freed and the arena is as it was. Load this one again, and load it in a new process if "
+                  "the device refuses again"),
+              "a refused first free is not named with the arena intact and its remedy");
+        for (const std::string * intact : { &hl, &ll, &tl, &ol, &fx }) {
+            CHECK(!has(*intact, "stays closed") && !has(*intact, "partly freed"),
                   "an arena a refused teardown put back is described as closed");
         }
+        for (const std::string * intact : { &hl, &ll, &tl, &ol }) {
+            CHECK(!has(*intact, "new process"), "an arena a refused teardown put back is sent to a new process");
+        }
+
+        // A lease that outlived the wait after a chunk was freed leaves the arena partly freed, like a refused free.
+        const std::string pl = text_for(zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE);
+        CHECK(has(pl,
+                  "; the arena could not be torn down: a lease on one of its chunks outlived the teardown's wait after "
+                  "the chunks before it were freed, so the arena is partly freed. The arena stays closed to new "
+                  "allocations, so no model can load on device 1 in this process. Load this model in a new process"),
+              "a chunk lease that outlived the wait after a chunk was freed is not named as a partly freed arena");
+        CHECK(!has(pl, "as it was") && !has(pl, "load this one again"),
+              "a partly freed arena is described as intact or given an intact arena's remedy");
 
         // A refusal that names no cause cannot say the arena is intact, so it is read as closed.
         zone_arena_refusal no_cause = torn;

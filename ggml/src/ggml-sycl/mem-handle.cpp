@@ -493,6 +493,13 @@ void arena_authority::close_and_invalidate(uint64_t next) {
     generation = next;
 }
 
+void arena_authority::reopen(uint64_t restored_generation) {
+    std::lock_guard<std::mutex> guard(mutex);
+    generation     = restored_generation;
+    alive          = true;
+    admission_open = true;
+}
+
 bool arena_authority::wait_for_terminal_leases(uint32_t timeout_ms) const {
     std::unique_lock<std::mutex> lock(mutex);
     return leases_drained.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] {

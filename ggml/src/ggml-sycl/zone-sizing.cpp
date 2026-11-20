@@ -678,27 +678,50 @@ static std::string zone_arena_held_text(const zone_arena_holders & h, int device
     return text + remedy;
 }
 
-// The refused teardown's clause: why it refused, and what that left. Only a refusal named as one before the teardown
-// closed the arena leaves it usable; any other, a missing cause included, is read as closed, which no reserve may
-// follow and no later load in the process can use.
+// The refused teardown's clause: why it refused, and what that left. A teardown refused before it freed any chunk put
+// the arena back as it was, and the clause names what to do before the load is tried again. A teardown that could not
+// free a chunk after it had freed one left the arena partly freed, and a missing cause cannot say the arena is
+// intact: both are read as closed, which no reserve may follow and no later load in the process can use.
 static std::string zone_arena_teardown_text(zone_arena_teardown_refusal cause, int device) {
     std::string text = "; the arena could not be torn down";
+    char        remedy[256];
     switch (cause) {
         case zone_arena_teardown_refusal::HOST_STATE:
             return text +
                    ": the host could not reserve the teardown's own bookkeeping, and the arena is as it was. Free "
                    "host memory, then load this one again";
         case zone_arena_teardown_refusal::LIVE_ALLOCATIONS:
-            text += ": allocations were still live in it when the teardown closed it";
-            break;
-        case zone_arena_teardown_refusal::DRAIN_SNAPSHOT:
-            text += ": the host could not record the allocations the teardown waits on";
-            break;
+            std::snprintf(remedy, sizeof(remedy),
+                          ": allocations were still live in it, and the arena is as it was. Free the models and "
+                          "contexts on device %d that hold them, then load this one again",
+                          device);
+            return text + remedy;
         case zone_arena_teardown_refusal::DRAIN_TIMEOUT:
-            text += ": a lease on one of its allocations did not end while the teardown waited";
+            std::snprintf(remedy, sizeof(remedy),
+                          ": a lease on one of its allocations did not end while the teardown waited, and the arena "
+                          "is as it was. Load this one again once the work on device %d has finished",
+                          device);
+            return text + remedy;
+        case zone_arena_teardown_refusal::LEASES_OUTSTANDING:
+            std::snprintf(remedy, sizeof(remedy),
+                          ": a lease on the first chunk the teardown tried outlived its wait, so none was freed and "
+                          "the arena is as it was. Free what holds a pointer into it on device %d, then load this one "
+                          "again",
+                          device);
+            return text + remedy;
+        case zone_arena_teardown_refusal::FIRST_FREE_FAILED:
+            return text +
+                   ": the device refused to free the first chunk the teardown tried, so none was freed and the arena "
+                   "is as it was. Load this one again, and load it in a new process if the device refuses again";
+        case zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE:
+            text +=
+                ": a lease on one of its chunks outlived the teardown's wait after the chunks before it were freed, so "
+                "the arena is partly freed";
             break;
         case zone_arena_teardown_refusal::FREE_FAILED:
-            text += ": the device refused to free one of its chunks, so part of it may already be freed";
+            text +=
+                ": the device refused to free one of its chunks after the chunks before it were freed, so the arena is "
+                "partly freed";
             break;
         case zone_arena_teardown_refusal::NONE:
             break;
@@ -775,8 +798,18 @@ std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {
     return text;
 }
 
+zone_arena_teardown_refusal zone_arena_unfreed_chunk_refusal(bool leases_outstanding, bool chunk_freed_before) {
+    if (leases_outstanding) {
+        return chunk_freed_before ? zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE :
+                                    zone_arena_teardown_refusal::LEASES_OUTSTANDING;
+    }
+    return chunk_freed_before ? zone_arena_teardown_refusal::FREE_FAILED :
+                                zone_arena_teardown_refusal::FIRST_FREE_FAILED;
+}
+
 bool zone_arena_teardown_left_closed(zone_arena_teardown_refusal cause) {
-    return cause != zone_arena_teardown_refusal::NONE && cause != zone_arena_teardown_refusal::HOST_STATE;
+    return cause == zone_arena_teardown_refusal::FREE_FAILED ||
+           cause == zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE;
 }
 
 // A compute-buffer request observed at `from_n_ubatch`, scaled linearly to `to_n_ubatch` (compute buffers grow about

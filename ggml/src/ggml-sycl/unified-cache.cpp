@@ -1152,6 +1152,10 @@ static std::atomic<bool>     g_graph_compute_active{ false };
 static std::atomic<size_t>   g_live_arena_chunks{ 0 };
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool>     g_test_fail_next_arena_free{ false };
+
+static std::atomic<size_t> g_test_arena_free_failure_after{ 0 };
+static std::atomic<bool>   g_test_fail_next_arena_drain{ false };
+
 static std::atomic<bool>     g_test_fail_next_shutdown_clean{ false };
 static std::atomic<uint32_t> g_test_arena_drain_timeout_ms{ 5000 };
 static std::atomic<bool>     g_test_pause_zone_settle{ false };
@@ -7616,12 +7620,16 @@ static const char * arena_teardown_cause_name(zone_arena_teardown_refusal cause)
             return "the host could not reserve its bookkeeping";
         case zone_arena_teardown_refusal::LIVE_ALLOCATIONS:
             return "allocations were live in it";
-        case zone_arena_teardown_refusal::DRAIN_SNAPSHOT:
-            return "the host could not record the allocations it waits on";
         case zone_arena_teardown_refusal::DRAIN_TIMEOUT:
             return "a lease on an allocation did not end in time";
+        case zone_arena_teardown_refusal::LEASES_OUTSTANDING:
+            return "a lease on the first chunk it tried outlived its wait";
+        case zone_arena_teardown_refusal::FIRST_FREE_FAILED:
+            return "the device refused to free the first chunk it tried";
+        case zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE:
+            return "a lease on a chunk outlived its wait after other chunks were freed";
         case zone_arena_teardown_refusal::FREE_FAILED:
-            return "the device refused to free a chunk";
+            return "the device refused to free a chunk after other chunks were freed";
         case zone_arena_teardown_refusal::NONE:
             break;
     }
@@ -7867,15 +7875,16 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         }
     };
 
-    // A refused teardown names its cause in the refusal and on its own ERROR line, with what it left: an arena closed
-    // to new allocations, over which nothing may be reserved, or the arena as it was.
+    // A refused teardown names its cause in the refusal and on its own ERROR line, with what it left: a partly freed
+    // arena closed to new allocations, over which nothing may be reserved, or the arena as it was.
     const auto refuse_teardown = [&](zone_arena_teardown_refusal cause, const zone_arena_sizes & have) {
         const bool closed = zone_arena_teardown_left_closed(cause);
         GGML_LOG_ERROR(
             "[VRAM-ARENA] the arena on device %d could not be torn down (%s); %s: need scratch=%.1f MB oneDNN=%.1f MB "
             "runtime=%.1f MB\n",
             dev_id, arena_teardown_cause_name(cause),
-            closed ? "it stays closed to new allocations and no arena is reserved over it" : "it is as it was",
+            closed ? "it is partly freed and stays closed to new allocations, and no arena is reserved over it" :
+                     "it is as it was",
             scratch_zone / (1024.0 * 1024.0), onednn_zone / (1024.0 * 1024.0), runtime_zone / (1024.0 * 1024.0));
         if (refusal != nullptr) {
             refusal->reason   = zone_arena_refusal_reason::TEARDOWN_REFUSED;
@@ -7891,8 +7900,8 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
     // device has; a reserve that fails after a rebuild destroyed that arena names them as released, and the zones the
     // device has after the failure as its have.
     zone_arena_sizes arena_zones;
-    // An earlier teardown that refused after it closed the arena left it closed until a teardown completes, so no
-    // zone can be sized in it, large enough or not, and no arena may be reserved over it.
+    // An earlier teardown that refused after it freed a chunk left the arena partly freed and closed until a teardown
+    // completes, so no zone can be sized in it, large enough or not, and no arena may be reserved over it.
     if (const zone_arena_teardown_refusal earlier = arena_teardown_refusal();
         zone_arena_teardown_left_closed(earlier)) {
         return refuse_teardown(earlier, { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN),
@@ -8101,8 +8110,8 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         compute_arena_off_.store(0, std::memory_order_relaxed);
         if (!arena_destroy()) {
             // The reserve below would take the arena it failed to tear down for a fresh one and answer for zones it
-            // never sized, so the call refuses here. A teardown that refused before it closed the arena left it as it
-            // was, and its compute zone is bound again for whoever still uses it.
+            // never sized, so the call refuses here. A teardown that refused before it freed a chunk left the arena as
+            // it was, and its compute zone is bound again for whoever still uses it.
             const zone_arena_teardown_refusal cause = arena_teardown_refusal();
             if (!zone_arena_teardown_left_closed(cause)) {
                 bind_compute_arena();
@@ -31108,24 +31117,17 @@ void unified_cache::zone_settle(vram_zone_id zone) {
     if (!all_drained) return; // exact authorities remain durable and RESETTING stays fail-closed
     if (physical_group.state != allocator_group_state::RESETTING ||
         physical_group.lifecycle_epoch != settle_epoch) {
-        return; // CLOSING won; destroy owns publication and the persistent drains
+        // CLOSING won: destroy owns publication and the persistent drains, or a destroy that refused before it freed a
+        // chunk finished this settle itself (OPEN). One that refused and left the group RESETTING gave back this
+        // epoch, so the settle goes on below.
+        return;
     }
     for (const auto & retired : retired_authorities) {
         if (!retired) continue;
         auto & drains = physical_group.draining_authorities;
         drains.erase(std::remove(drains.begin(), drains.end(), retired), drains.end());
     }
-    if (shared_group0) {
-        if (arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator) {
-            arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator->reset();
-        }
-        for (auto & wca : weight_chunk_allocators_) wca.allocator->reset();
-        arena_zones_[static_cast<int>(vram_zone_id::KV)].used.store(0, std::memory_order_relaxed);
-        arena_zones_[static_cast<int>(vram_zone_id::WEIGHT)].used.store(0, std::memory_order_relaxed);
-    } else {
-        if (z.allocator) z.allocator->reset();
-        z.used.store(0, std::memory_order_relaxed);
-    }
+    arena_group_reset_allocators_locked(arena_allocator_group_index(zone));
     for (size_t i = 0; i < reset_zone_count; ++i) {
         arena_publish_prebuilt(reset_zones[i], std::move(next_authorities[i]));
     }
@@ -31752,8 +31754,13 @@ void unified_cache_dump_capture_zone_figures(int dev, dump_point point) noexcept
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-void unified_cache_test_fail_next_arena_free() {
+void unified_cache_test_fail_next_arena_free(size_t freed_chunks) {
+    g_test_arena_free_failure_after.store(freed_chunks, std::memory_order_release);
     g_test_fail_next_arena_free.store(true, std::memory_order_release);
+}
+
+void unified_cache_test_fail_next_arena_drain() {
+    g_test_fail_next_arena_drain.store(true, std::memory_order_release);
 }
 
 void unified_cache_test_fail_next_shutdown_clean() {
@@ -31807,51 +31814,66 @@ bool unified_cache_test_arena_registry_commit_reached() {
 bool unified_cache::arena_destroy() {
     std::lock_guard<std::mutex> destroy_guard(arena_destroy_mutex_);
     if (!arena_queue_) return true;
-    // Each refusal below records why, for the caller that asked for the teardown and for any later one: every cause
-    // after CLOSING leaves the arena closed to new allocations.
+    // The device the refusal lines name. Read before anything is closed: the teardown also runs at shutdown, and
+    // nothing after the close may throw.
+    int dev_id = -1;
+    try {
+        dev_id = ggml_sycl_get_device_id_from_queue(queue_);
+    } catch (...) {
+    }
+    // Each refusal below records why, for the caller that asked for the teardown and for any later one. A cause that
+    // left the arena partly freed outlives any later refusal, so the arena reads as closed until a teardown completes.
     const auto refuse = [&](zone_arena_teardown_refusal cause) {
-        arena_teardown_refusal_.store(cause, std::memory_order_release);
+        const zone_arena_teardown_refusal earlier = arena_teardown_refusal_.load(std::memory_order_acquire);
+        arena_teardown_refusal_.store(zone_arena_teardown_left_closed(earlier) ? earlier : cause,
+                                      std::memory_order_release);
         return false;
     };
+
+    constexpr size_t zone_count = static_cast<size_t>(vram_zone_id::COUNT);
+    // What the close below changes, recorded so that a refusal before any chunk is freed can put it back.
+    std::array<allocator_group_state, ARENA_ALLOCATOR_GROUP_COUNT> prior_states{};
+    std::array<uint64_t, ARENA_ALLOCATOR_GROUP_COUNT>              prior_epochs{};
+    std::array<uint64_t, zone_count>                               prior_generations{};
+    std::array<std::shared_ptr<arena_authority>, zone_count>       retired{};
+    // For each zone of a group a settle is resetting: the authority that settle would publish, so a refusal can finish
+    // the settle the close interrupted.
+    std::array<std::shared_ptr<arena_authority>, zone_count>       settle_replacements{};
+    std::vector<std::shared_ptr<arena_authority>>                  drain_snapshot;
 
     // Fixed-order physical-group close. KV and WEIGHT are one lock/state row,
     // so neither logical sibling can allocate while the other is closing.
     std::vector<std::unique_lock<std::mutex>> lifecycle_locks;
-    lifecycle_locks.reserve(ARENA_ALLOCATOR_GROUP_COUNT);
+    try {
+        lifecycle_locks.reserve(ARENA_ALLOCATOR_GROUP_COUNT);
+    } catch (...) {
+        GGML_LOG_ERROR("[VRAM-ARENA] could not reserve the teardown's group locks; refusing destroy\n");
+        return refuse(zone_arena_teardown_refusal::HOST_STATE);
+    }
     for (size_t i = 0; i < ARENA_ALLOCATOR_GROUP_COUNT; ++i) {
         lifecycle_locks.emplace_back(arena_allocator_groups_[i].mutex);
     }
-    // Preallocate durable slots before closing admission. Once an authority is
-    // retired, no allocation failure or refusal path may lose its identity.
+    // All the host state the teardown needs is reserved before it closes anything, so no refusal after the close is
+    // for host memory: the durable drain slots, which keep every retired authority's identity, the snapshot the
+    // unlocked drain waits on, and the replacements for a settle the close interrupts.
     try {
+        size_t drain_count = zone_count;
         for (auto & group : arena_allocator_groups_) {
-            group.draining_authorities.reserve(group.draining_authorities.size() +
-                                               static_cast<size_t>(vram_zone_id::COUNT));
+            group.draining_authorities.reserve(group.draining_authorities.size() + zone_count);
+            drain_count += group.draining_authorities.size();
+        }
+        drain_snapshot.reserve(drain_count);
+        for (size_t i = 0; i < zone_count; ++i) {
+            const auto zone = static_cast<vram_zone_id>(i);
+            if (arena_allocator_groups_[arena_allocator_group_index(zone)].state == allocator_group_state::RESETTING) {
+                settle_replacements[i] = arena_make_authority(zone, arena_generation(zone));
+            }
         }
     } catch (...) {
         GGML_LOG_ERROR("[VRAM-ARENA] could not reserve durable authority drain state; refusing destroy\n");
         return refuse(zone_arena_teardown_refusal::HOST_STATE);
     }
-
-    // CLOSING wins over a concurrent RESETTING transaction. That settler
-    // already persisted its retired authorities before unlocking, so destroy
-    // can take ownership immediately and no later publication can reopen it.
-    for (auto & group : arena_allocator_groups_) {
-        group.state = allocator_group_state::CLOSING;
-        ++group.lifecycle_epoch;
-    }
-#if defined(GGML_SYCL_PRIVATE_TESTING)
-    g_test_arena_destroy_closing_reached.store(true, std::memory_order_release);
-#endif
-    for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
-        auto retired = arena_close_authority(static_cast<vram_zone_id>(i));
-        if (retired) {
-            arena_allocator_groups_[arena_allocator_group_index(static_cast<vram_zone_id>(i))]
-                .draining_authorities.push_back(std::move(retired));
-        }
-    }
-    // Allocation refusal is now retryable without authority loss: every
-    // current and inherited authority above is already member-persistent.
+    // A live allocation refuses before anything is closed, so that refusal leaves every group and authority as it was.
     for (size_t i = 0; i < ARENA_ALLOCATOR_GROUP_COUNT; ++i) {
         const allocator_group & group = arena_allocator_groups_[i];
         if (!group.allocations.empty()) {
@@ -31860,18 +31882,81 @@ bool unified_cache::arena_destroy() {
             return refuse(zone_arena_teardown_refusal::LIVE_ALLOCATIONS);
         }
     }
-    std::vector<std::shared_ptr<arena_authority>> drain_snapshot;
-    try {
-        size_t drain_count = 0;
-        for (const auto & group : arena_allocator_groups_) drain_count += group.draining_authorities.size();
-        drain_snapshot.reserve(drain_count);
-        for (const auto & group : arena_allocator_groups_) {
-            drain_snapshot.insert(drain_snapshot.end(), group.draining_authorities.begin(),
-                                  group.draining_authorities.end());
+
+    // Puts back what the close below changed, for a refusal before any chunk was freed, with every group lock held.
+    // Each zone's generation counter returns to its value before the close, and the authority the close retired is
+    // reopened at it and published again, the same object: a handle minted before the attempt resolves to the same
+    // pointer and keeps its leases. Each group gets back its state and its epoch. It allocates nothing.
+    //
+    // A group that was RESETTING belongs to a settle the close interrupted. Its zones' authorities were already
+    // retired by that settle and sit in the group's drains, so the close retired nothing there. With its state and
+    // epoch back, one of three outcomes:
+    //   - Its drains are empty: every lease on the settle's retired authorities has ended, and no allocation is live,
+    //     as a settle starts only with none and RESETTING admits none. The settle may already have returned when it
+    //     saw CLOSING, so the restore finishes it: it resets the group's allocators, publishes the replacements built
+    //     before the close at the generation the settle's own would carry, and opens the group. A settle still in
+    //     flight then sees OPEN and returns without touching anything.
+    //   - Its drains are not empty: the group stays RESETTING. The settle, which holds the epoch given back, finishes
+    //     when its own wait succeeds, or leaves the group RESETTING when it times out, as it would have without the
+    //     teardown.
+    //   - The group was not RESETTING: no settle was in flight, there is nothing to take over, and the group only gets
+    //     its state back.
+    // The four group locks exclude every allocation, settle step and publication while this runs.
+    const auto restore = [&]() {
+        for (size_t i = 0; i < zone_count; ++i) {
+            const auto zone = static_cast<vram_zone_id>(i);
+            arena_generations_[i].store(prior_generations[i], std::memory_order_release);
+            if (!retired[i]) {
+                continue;
+            }
+            auto & drains = arena_allocator_groups_[arena_allocator_group_index(zone)].draining_authorities;
+            drains.erase(std::remove(drains.begin(), drains.end(), retired[i]), drains.end());
+            retired[i]->reopen(prior_generations[i]);
+            arena_publish_prebuilt(zone, std::move(retired[i]));
         }
-    } catch (...) {
-        GGML_LOG_ERROR("[VRAM-ARENA] could not snapshot durable authority drains; refusing physical free\n");
-        return refuse(zone_arena_teardown_refusal::DRAIN_SNAPSHOT);
+        for (size_t g = 0; g < ARENA_ALLOCATOR_GROUP_COUNT; ++g) {
+            allocator_group & group = arena_allocator_groups_[g];
+            group.state             = prior_states[g];
+            group.lifecycle_epoch   = prior_epochs[g];
+            if (group.state != allocator_group_state::RESETTING || !group.draining_authorities.empty()) {
+                continue;
+            }
+            arena_group_reset_allocators_locked(g);
+            for (size_t i = 0; i < zone_count; ++i) {
+                const auto zone = static_cast<vram_zone_id>(i);
+                if (arena_allocator_group_index(zone) == g && settle_replacements[i]) {
+                    arena_publish_prebuilt(zone, std::move(settle_replacements[i]));
+                }
+            }
+            group.state = allocator_group_state::OPEN;
+        }
+    };
+
+    // CLOSING wins over a concurrent RESETTING transaction. That settler
+    // already persisted its retired authorities before unlocking, so destroy
+    // can take ownership immediately and no later publication can reopen it.
+    for (size_t g = 0; g < ARENA_ALLOCATOR_GROUP_COUNT; ++g) {
+        allocator_group & group = arena_allocator_groups_[g];
+        prior_states[g]         = group.state;
+        prior_epochs[g]         = group.lifecycle_epoch;
+        group.state = allocator_group_state::CLOSING;
+        ++group.lifecycle_epoch;
+    }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_test_arena_destroy_closing_reached.store(true, std::memory_order_release);
+#endif
+    for (size_t i = 0; i < zone_count; ++i) {
+        const auto zone      = static_cast<vram_zone_id>(i);
+        prior_generations[i] = arena_generation(zone);
+        retired[i]           = arena_close_authority(zone);
+        if (retired[i]) {
+            arena_allocator_groups_[arena_allocator_group_index(zone)].draining_authorities.push_back(retired[i]);
+        }
+    }
+    // The pushes above and the copy below fit the capacity reserved before the close, so none of them allocates.
+    for (const auto & group : arena_allocator_groups_) {
+        drain_snapshot.insert(drain_snapshot.end(), group.draining_authorities.begin(),
+                              group.draining_authorities.end());
     }
     lifecycle_locks.clear();
 
@@ -31889,6 +31974,13 @@ bool unified_cache::arena_destroy() {
             all_authorities_drained = false;
         }
     }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (g_test_fail_next_arena_drain.exchange(false, std::memory_order_acq_rel)) {
+        GGML_LOG_ERROR("[VRAM-ARENA] deterministic test drain timeout; refusing physical free\n");
+        all_authorities_drained = false;
+    }
+#endif
+    // The relocks below and after the free loop reuse the capacity reserved above, which clear() keeps.
     for (size_t i = 0; i < ARENA_ALLOCATOR_GROUP_COUNT; ++i) {
         lifecycle_locks.emplace_back(arena_allocator_groups_[i].mutex);
         auto & drains = arena_allocator_groups_[i].draining_authorities;
@@ -31897,7 +31989,14 @@ bool unified_cache::arena_destroy() {
         }), drains.end());
         if (!drains.empty()) all_authorities_drained = false;
     }
-    if (!all_authorities_drained) return refuse(zone_arena_teardown_refusal::DRAIN_TIMEOUT);
+    if (!all_authorities_drained) {
+        restore();
+        lifecycle_locks.clear();
+        for (auto & group : arena_allocator_groups_) {
+            group.lifecycle_cv.notify_all();
+        }
+        return refuse(zone_arena_teardown_refusal::DRAIN_TIMEOUT);
+    }
     lifecycle_locks.clear();
     try {
         arena_queue_->wait_and_throw();
@@ -31906,38 +32005,67 @@ bool unified_cache::arena_destroy() {
     } catch (...) {
         GGML_LOG_WARN("[VRAM-ARENA] pre-destroy queue drain failed\n");
     }
-    size_t released_chunk_count = 0;
-    size_t released_chunk_bytes = 0;
-    bool all_freed = true;
-    for (auto & c : arena_chunks_) {
-        if (c.ptr) {
-            // llama.cpp-dyhdl: wait for chunk leases to drain before sycl::free.
-            // A lease outstanding at destruction means a downstream caller holds
-            // a raw pointer into this chunk — assert-with-detail after 5 s rather
-            // than SEGV silently after free.
-            const auto deadline    = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            uint32_t   outstanding = c.lease_count.load();
-            if (outstanding > 0) {
-                GGML_LOG_WARN(
-                    "[VRAM-ARENA] chunk %p size=%.1f MB has %u outstanding lease(s) at arena_destroy, waiting ≤5s\n",
-                    c.ptr, c.size / (1024.0 * 1024.0), outstanding);
-                while ((outstanding = c.lease_count.load()) > 0) {
-                    if (std::chrono::steady_clock::now() > deadline) {
-                        GGML_LOG_ERROR(
-                            "[VRAM-ARENA] chunk %p size=%.1f MB still has %u outstanding lease(s) after 5s — "
-                            "aborting (llama.cpp-dyhdl)\n",
-                            c.ptr, c.size / (1024.0 * 1024.0), outstanding);
-                        GGML_ASSERT(false && "VRAM arena chunk freed while leases outstanding (dyhdl timeout)");
+    // Free the chunks in order. A chunk a lease still holds when its wait ends, or one the device refuses to free, is
+    // kept, never freed, and nothing aborts. Until a chunk has been freed the loop stops at the first such chunk, so
+    // the teardown can put the arena back as it was. Once one has been freed the arena cannot be put back, so the loop
+    // frees every chunk it can and the arena stays partly freed.
+    size_t                      released_chunk_count = 0;
+    size_t                      released_chunk_bytes = 0;
+    bool                        all_freed            = true;
+    zone_arena_teardown_refusal unfreed              = zone_arena_teardown_refusal::NONE;
+    size_t                      unfreed_chunk        = 0;
+    for (size_t ci = 0; ci < arena_chunks_.size(); ++ci) {
+        arena_chunk & c = arena_chunks_[ci];
+        if (!c.ptr) {
+            continue;
+        }
+        // A lease on the chunk means a caller still holds a raw pointer into it (a CHUNK_LEASE mem_handle). The
+        // teardown waits up to 5 s for the lease to end, and frees no chunk a lease outlives that wait on.
+        const auto deadline    = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        uint32_t   outstanding = c.lease_count.load();
+        if (outstanding > 0) {
+            GGML_LOG_WARN(
+                "[VRAM-ARENA] chunk %p size=%.1f MB has %u outstanding lease(s) at arena_destroy, waiting ≤5s\n", c.ptr,
+                c.size / (1024.0 * 1024.0), outstanding);
+            while ((outstanding = c.lease_count.load()) > 0 && std::chrono::steady_clock::now() <= deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        const bool leases_outstanding = outstanding > 0;
+        bool       fail_for_test      = false;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        fail_for_test = !leases_outstanding &&
+                        released_chunk_count >= g_test_arena_free_failure_after.load(std::memory_order_acquire) &&
+                        g_test_fail_next_arena_free.exchange(false, std::memory_order_acq_rel);
+#endif
+        bool freed = false;
+        if (leases_outstanding) {
+            // Who holds leases, by the site that took them. The counts cover every chunk of the arena, so they name
+            // the holders, not which of their leases sit on this chunk. A fixed buffer: nothing here allocates.
+            char   sites[512] = "";
+            size_t used       = 0;
+            for (size_t s = 0; s < static_cast<size_t>(chunk_lease_site::COUNT); ++s) {
+                for (int copy = 0; copy < 2 && used < sizeof(sites); ++copy) {
+                    const chunk_lease_tag tag{ static_cast<chunk_lease_site>(s), copy != 0 };
+                    const uint32_t        on_site = arena_chunk_lease_count_at(tag);
+                    if (on_site == 0) {
+                        continue;
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    const int n = snprintf(sites + used, sizeof(sites) - used, " %s%s=%u",
+                                           chunk_lease_site_name(tag.site), tag.copy ? "(copy)" : "", on_site);
+                    used += n > 0 ? static_cast<size_t>(n) : 0;
                 }
             }
-            bool freed = false;
-#if defined(GGML_SYCL_PRIVATE_TESTING)
-            if (g_test_fail_next_arena_free.exchange(false, std::memory_order_acq_rel)) {
-                GGML_LOG_ERROR("[VRAM-ARENA] deterministic test free failure for chunk %p\n", c.ptr);
-            } else
-#endif
+            GGML_LOG_ERROR(
+                "[VRAM-ARENA] chunk %zu of the arena on device %d (%p, %.1f MB) still has %u lease(s) after 5 s, so "
+                "it is not freed (%s); leases on the arena by site:%s\n",
+                ci, dev_id, c.ptr, c.size / (1024.0 * 1024.0), outstanding,
+                released_chunk_count == 0 ? "no chunk was freed, the arena is as it was" :
+                                            "chunks before it were freed, the arena is partly freed",
+                sites[0] != '\0' ? sites : " none");
+        } else if (fail_for_test) {
+            GGML_LOG_ERROR("[VRAM-ARENA] deterministic test free failure for chunk %p\n", c.ptr);
+        } else {
             try {
                 sycl::free(c.ptr, arena_queue_->get_context());
                 freed = true;
@@ -31948,24 +32076,60 @@ bool unified_cache::arena_destroy() {
                 GGML_LOG_ERROR("[VRAM-ARENA] free of chunk %p (%.1f MB) failed\n", c.ptr,
                                c.size / (1024.0 * 1024.0));
             }
-            if (!freed) {
-                all_freed = false;
-                continue;
-            }
-            alloc_registry::instance().unregister_alloc(c.ptr);
-            GGML_ASSERT(alloc_registry::instance().lookup(c.ptr) == nullptr &&
-                        "arena chunk remained registered after unregister");
-            const size_t live_before = g_live_arena_chunks.fetch_sub(1, std::memory_order_acq_rel);
-            GGML_ASSERT(live_before > 0 && "arena chunk ownership counter underflow");
-            c.ptr = nullptr;
-            ++released_chunk_count;
-            released_chunk_bytes += c.size;
         }
+        if (!freed) {
+            all_freed = false;
+            if (unfreed == zone_arena_teardown_refusal::NONE) {
+                unfreed       = zone_arena_unfreed_chunk_refusal(leases_outstanding, released_chunk_count > 0);
+                unfreed_chunk = ci;
+            }
+            if (released_chunk_count == 0) {
+                break;
+            }
+            continue;
+        }
+        // The chunk is freed, so a broken invariant below is reported, not aborted on: the teardown goes on.
+        alloc_registry::instance().unregister_alloc(c.ptr);
+        if (alloc_registry::instance().lookup(c.ptr) != nullptr) {
+            GGML_LOG_ERROR("[VRAM-ARENA] freed chunk %zu (%p) on device %d is still registered after unregister\n", ci,
+                           c.ptr, dev_id);
+        }
+        const size_t live_before = g_live_arena_chunks.fetch_sub(1, std::memory_order_acq_rel);
+        if (live_before == 0) {
+            GGML_LOG_ERROR("[VRAM-ARENA] the live arena chunk count underflowed freeing chunk %zu on device %d\n", ci,
+                           dev_id);
+        }
+        c.ptr = nullptr;
+        ++released_chunk_count;
+        released_chunk_bytes += c.size;
+    }
+    for (size_t i = 0; i < ARENA_ALLOCATOR_GROUP_COUNT; ++i) {
+        lifecycle_locks.emplace_back(arena_allocator_groups_[i].mutex);
+    }
+    if (!all_freed && released_chunk_count == 0) {
+        restore();
+        lifecycle_locks.clear();
+        for (auto & group : arena_allocator_groups_) {
+            group.lifecycle_cv.notify_all();
+        }
+        GGML_LOG_ERROR(
+            "[VRAM-ARENA] the teardown of the arena on device %d freed no chunk (%s at chunk %zu); the arena is as it "
+            "was\n",
+            dev_id, arena_teardown_cause_name(unfreed), unfreed_chunk);
+        return refuse(unfreed);
     }
     GGML_LOG_INFO("[VRAM-ARENA] Destroyed %zu chunk(s), released %.1f MB\n", released_chunk_count,
                   released_chunk_bytes / (1024.0 * 1024.0));
     if (!all_freed) {
-        return refuse(zone_arena_teardown_refusal::FREE_FAILED);
+        // Freed chunks cannot be taken back, so the groups stay CLOSING, the authorities stay retired, and every
+        // later teardown refusal and load names this cause until a teardown frees the rest.
+        GGML_LOG_ERROR(
+            "[VRAM-ARENA] the teardown of the arena on device %d freed %zu of its %zu chunk(s) (%.1f MB) and then "
+            "could not free chunk %zu (%s); the arena is partly freed and stays closed to new allocations\n",
+            dev_id, released_chunk_count, arena_chunks_.size(), released_chunk_bytes / (1024.0 * 1024.0), unfreed_chunk,
+            arena_teardown_cause_name(unfreed));
+        lifecycle_locks.clear();
+        return refuse(unfreed);
     }
     weight_chunk_allocators_.clear();
     for (auto & group : arena_allocator_groups_) group.allocations.clear();
@@ -32053,6 +32217,33 @@ std::shared_ptr<arena_authority> unified_cache::arena_close_authority(vram_zone_
     }
     if (authority) authority->close_and_invalidate(next);
     return authority;
+}
+
+void unified_cache::arena_group_reset_allocators_locked(size_t group) {
+    if (group == arena_allocator_group_index(vram_zone_id::KV)) {
+        // KV and WEIGHT share the KV allocator and every per-chunk allocator.
+        vram_zone & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
+        if (kv.allocator) {
+            kv.allocator->reset();
+        }
+        for (auto & wca : weight_chunk_allocators_) {
+            wca.allocator->reset();
+        }
+        kv.used.store(0, std::memory_order_relaxed);
+        arena_zones_[static_cast<int>(vram_zone_id::WEIGHT)].used.store(0, std::memory_order_relaxed);
+        return;
+    }
+    for (size_t i = 0; i < static_cast<size_t>(vram_zone_id::COUNT); ++i) {
+        const auto zone = static_cast<vram_zone_id>(i);
+        if (arena_allocator_group_index(zone) != group) {
+            continue;
+        }
+        vram_zone & z = arena_zones_[i];
+        if (z.allocator) {
+            z.allocator->reset();
+        }
+        z.used.store(0, std::memory_order_relaxed);
+    }
 }
 
 // === Arena chunk lease API (llama.cpp-dyhdl) ===

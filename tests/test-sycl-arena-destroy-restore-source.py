@@ -2,15 +2,19 @@
 
 unified_cache::arena_destroy() closes every allocator group (CLOSING) and retires every zone's authority before it
 frees the arena's chunks. A teardown that refuses before it has freed any chunk puts the arena back as it was before
-the attempt: every group gets the state it had, every retired authority is reopened at the generation its handles
-carry, so a handle that resolved before the attempt resolves to the same pointer after it, and new allocations are
-admitted. A teardown that refuses after it freed a chunk cannot put it back: the arena is partly freed and stays
-closed, and that cause outlives any later refusal until a teardown completes.
+the attempt: every group gets the state and epoch it had, every retired authority is reopened at the generation its
+handles carry, so a handle that resolved before the attempt resolves to the same pointer after it, and new allocations
+are admitted. A settle the close interrupted is finished by the restore when its drains are empty. A teardown that
+cannot free a chunk after it freed one cannot put it back: the arena is partly freed and stays closed, and that cause
+outlives any later refusal until a teardown completes. A chunk a lease still holds when the teardown's wait for it
+ends is never freed, and nothing in the free loop aborts: the lease refuses the teardown like a refused free.
 
 These checks pin the ordering facts a device test cannot see: a live allocation refuses before anything is closed;
 the teardown allocates nothing after it starts closing; every refusal between the close and the first free restores,
 under every group lock; no refusal after a chunk was freed restores; the restore reopens what it retired instead of
-building a fresh authority; reopening keeps every record and lease; and only FREE_FAILED reads as closed.
+building a fresh authority, and finishes an interrupted settle with the settle's own reset; reopening keeps every
+record and lease; a leased chunk never reaches the free; no assert or abort is left in the teardown; and only the two
+causes found after a chunk was freed read as closed.
 
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live
 inside test_*() functions. Checks read COMMENT-STRIPPED, whitespace-normalised text. Each check has a mutation witness
@@ -73,9 +77,23 @@ def block_at(text: str, start: int) -> str:
     return ""
 
 
+def block_end(text: str, opener_at: int, opener: str) -> int:
+    """The index just past the block of the `opener` (which ends in '{') found at `opener_at`."""
+    return opener_at + len(opener) - 1 + len(block_at(text, opener_at))
+
+
 def fn_body(text: str, sig: str) -> str:
     s = text.find(sig)
     return block_at(text, s + len(sig)) if s != -1 else ""
+
+
+def ordered(text: str, *needles: str) -> bool:
+    at = -1
+    for n in needles:
+        at = text.find(n, at + 1)
+        if at == -1:
+            return False
+    return True
 
 
 def mutate_in(src: str, sig: str, old: str, new: str) -> str:
@@ -88,12 +106,18 @@ def mutate_in(src: str, sig: str, old: str, new: str) -> str:
 
 
 DESTROY_SIG = "bool unified_cache::arena_destroy()"
+SETTLE_SIG = "void unified_cache::zone_settle(vram_zone_id zone)"
 PREDICATE_SIG = "bool zone_arena_teardown_left_closed(zone_arena_teardown_refusal cause)"
 REOPEN_SIG = "void arena_authority::reopen(uint64_t restored_generation)"
 
 CLOSING_RE = re.compile(r"\.state = allocator_group_state::CLOSING;")
-REFUSAL_RE = re.compile(r"return refuse\(zone_arena_teardown_refusal::(\w+)\);")
+REFUSAL_RE = re.compile(r"return refuse\(([\w:]+)\);")
 FREE_RE = re.compile(r"sycl::free\s*\(")
+
+HOST_STATE = "zone_arena_teardown_refusal::HOST_STATE"
+LIVE_ALLOCATIONS = "zone_arena_teardown_refusal::LIVE_ALLOCATIONS"
+DRAIN_TIMEOUT = "zone_arena_teardown_refusal::DRAIN_TIMEOUT"
+UNFREED = "unfreed"
 
 ALLOC_CHECK = "if (!group.allocations.empty()) {"
 RESTORE = "restore();"
@@ -102,8 +126,23 @@ RELOCK = ("for (size_t i = 0; i < ARENA_ALLOCATOR_GROUP_COUNT; ++i) { "
 UNLOCK = "lifecycle_locks.clear();"
 RESTORE_LAMBDA = "const auto restore = [&]() {"
 STICKY = "arena_teardown_refusal_.store(zone_arena_teardown_left_closed(earlier) ? earlier : cause,"
-STOP_BEFORE_FIRST_FREE = "if (released_chunk_count == 0) break;"
+STOP_BEFORE_FIRST_FREE = "if (released_chunk_count == 0) { break; } continue;"
 NOTHING_FREED = "if (!all_freed && released_chunk_count == 0) {"
+PARTLY_FREED = "if (!all_freed) {"
+UNFREED_CAUSE = "unfreed = zone_arena_unfreed_chunk_refusal(leases_outstanding, released_chunk_count > 0);"
+
+FREE_LOOP = "for (size_t ci = 0; ci < arena_chunks_.size(); ++ci) {"
+LEASE_WAIT = "while ((outstanding = c.lease_count.load()) > 0 && std::chrono::steady_clock::now() <= deadline) {"
+LEASED = "const bool leases_outstanding = outstanding > 0;"
+LEASE_GUARD = "if (leases_outstanding) {"
+TEST_GUARD = "else if (fail_for_test) {"
+FREE_BRANCH = "else {"
+ABORTS = ("GGML_ASSERT(", "GGML_ABORT(", "abort(", "std::terminate(")
+
+TAKE_OVER = ("if (group.state != allocator_group_state::RESETTING || !group.draining_authorities.empty()) "
+             "{ continue; }")
+SETTLE_RESET = "arena_group_reset_allocators_locked(arena_allocator_group_index(zone));"
+REPLACEMENT = "settle_replacements[i] = arena_make_authority(zone, arena_generation(zone));"
 
 
 def destroy(uc: str) -> str:
@@ -116,7 +155,7 @@ def closing_at(d: str) -> int:
 
 
 def refusals(d: str):
-    """(cause, position) of every refusal in the teardown, in source order."""
+    """(argument, position) of every refusal in the teardown, in source order."""
     return [(m.group(1), m.start()) for m in REFUSAL_RE.finditer(d)]
 
 
@@ -124,6 +163,28 @@ def guard_of(d: str, at: int) -> str:
     """The text from the `if (` that guards the statement at `at` up to it."""
     g = d.rfind("if (", 0, at)
     return d[g:at] if g != -1 else ""
+
+
+def nothing_freed_block(d: str):
+    """(start, end) of the block for a teardown that freed nothing, or (-1, -1)."""
+    s = d.find(NOTHING_FREED)
+    return (s, block_end(d, s, NOTHING_FREED)) if s != -1 else (-1, -1)
+
+
+def partly_freed_at(d: str) -> int:
+    """The guard of the partly freed refusal: the first PARTLY_FREED after the nothing-freed block."""
+    _, end = nothing_freed_block(d)
+    return d.find(PARTLY_FREED, end) if end != -1 else -1
+
+
+def free_loop(d: str) -> str:
+    s = d.find(FREE_LOOP)
+    return block_at(d, s) if s != -1 else ""
+
+
+def restore_body(d: str) -> str:
+    start = d.find(RESTORE_LAMBDA)
+    return block_at(d, start + len(RESTORE_LAMBDA) - 1) if start != -1 else ""
 
 
 # ---- the claims ----
@@ -141,9 +202,9 @@ def claim_nothing_changes_before_a_live_allocation_refuses(uc: str) -> bool:
     after = d[closing:]
     return (
         check < closing
-        and "return refuse(zone_arena_teardown_refusal::LIVE_ALLOCATIONS);" in block_at(d, check)
-        and any(c == "HOST_STATE" for c, _ in causes)
-        and all(p < closing for c, p in causes if c in ("HOST_STATE", "LIVE_ALLOCATIONS"))
+        and f"return refuse({LIVE_ALLOCATIONS});" in block_at(d, check)
+        and any(c == HOST_STATE for c, _ in causes)
+        and all(p < closing for c, p in causes if c in (HOST_STATE, LIVE_ALLOCATIONS))
         and ".reserve(" not in after
         and "arena_make_authority(" not in after
         and "make_shared" not in after
@@ -151,15 +212,19 @@ def claim_nothing_changes_before_a_live_allocation_refuses(uc: str) -> bool:
 
 
 def claim_every_refusal_before_a_free_restores(uc: str) -> bool:
-    """Every refusal after the close but FREE_FAILED restores in its own guard, and both restorable ones exist."""
+    """Every refusal after the close but the partly freed one restores in its own guard: the timed-out drain and the
+    teardown that freed no chunk, whose cause says whether a lease kept the chunk or the device refused it."""
     d = destroy(uc)
     closing = closing_at(d)
+    partly = partly_freed_at(d)
     late = [(c, p) for c, p in refusals(d) if p > closing]
-    restorable = [(c, p) for c, p in late if c != "FREE_FAILED"]
+    restorable = [(c, p) for c, p in late if p < partly]
     return (
         closing != -1
-        and {c for c, _ in restorable} == {"DRAIN_TIMEOUT", "FIRST_FREE_FAILED"}
+        and partly != -1
+        and sorted(c for c, _ in restorable) == sorted([DRAIN_TIMEOUT, UNFREED])
         and all(RESTORE in guard_of(d, p) for _, p in restorable)
+        and UNFREED_CAUSE in d
     )
 
 
@@ -180,24 +245,26 @@ def claim_restore_holds_every_group_lock(uc: str) -> bool:
 
 
 def claim_no_restore_after_a_chunk_is_freed(uc: str) -> bool:
-    """The free loop stops at a failed free only while nothing is freed, the only restore after the first free is
-    the one for a teardown that freed nothing, and FREE_FAILED, the partly freed arena, restores nothing."""
+    """The free loop stops at a chunk it could not free only while nothing is freed and goes on past it after, the
+    only restore after the first free is the one for a teardown that freed nothing, and the partly freed refusal
+    restores nothing."""
     d = destroy(uc)
     free = FREE_RE.search(d)
-    nothing_freed = d.find(NOTHING_FREED)
-    partly = [p for c, p in refusals(d) if c == "FREE_FAILED"]
-    if free is None or nothing_freed == -1 or len(partly) != 1:
+    nothing_start, nothing_end = nothing_freed_block(d)
+    partly = partly_freed_at(d)
+    if free is None or nothing_start == -1 or partly == -1:
         return False
-    restored = block_at(d, nothing_freed)
+    restored = d[nothing_start:nothing_end]
+    partly_block = block_at(d, partly)
     after_free = [m.start() for m in re.finditer(re.escape(RESTORE), d) if m.start() > free.start()]
     return (
         d.count("break;") == 1
-        and STOP_BEFORE_FIRST_FREE in d
+        and STOP_BEFORE_FIRST_FREE in free_loop(d)
         and len(after_free) == 1
-        and nothing_freed < after_free[0] < nothing_freed + len(restored)
-        and "return refuse(zone_arena_teardown_refusal::FIRST_FREE_FAILED);" in restored
-        and RESTORE not in guard_of(d, partly[0])
-        and partly[0] > nothing_freed + len(restored)
+        and nothing_start < after_free[0] < nothing_end
+        and f"return refuse({UNFREED});" in restored
+        and f"return refuse({UNFREED});" in partly_block
+        and RESTORE not in partly_block
     )
 
 
@@ -209,28 +276,79 @@ def claim_partly_freed_cause_is_sticky(uc: str) -> bool:
 
 def claim_restore_reopens_what_it_retired(uc: str) -> bool:
     """The restore puts back each zone's generation, reopens the authority it retired at that generation and
-    publishes that same object, and allocates nothing."""
+    publishes that same object, gives each group its state and epoch back, and allocates nothing."""
     d = destroy(uc)
-    start = d.find(RESTORE_LAMBDA)
-    body = block_at(d, start + len(RESTORE_LAMBDA) - 1) if start != -1 else ""
-    closing = closing_at(d)
+    body = restore_body(d)
     return (
         bool(body)
-        and start < closing
+        and d.find(RESTORE_LAMBDA) < closing_at(d)
         and "arena_generations_[i].store(prior_generations[i], std::memory_order_release);" in body
         and "retired[i]->reopen(prior_generations[i]);" in body
         and "arena_publish_prebuilt(zone, std::move(retired[i]));" in body
         and "drains.erase(std::remove(drains.begin(), drains.end(), retired[i]), drains.end());" in body
         and "group.state = prior_states[g];" in body
+        and "group.lifecycle_epoch = prior_epochs[g];" in body
         and "arena_make_authority(" not in body
         and ".reserve(" not in body
         and "push_back(" not in body
     )
 
 
+def claim_restore_finishes_an_interrupted_settle(uc: str) -> bool:
+    """A group the restore gives back RESETTING with empty drains is finished as the settle would have: its
+    allocators reset by the settle's own helper, the replacements built before the close published, then OPEN."""
+    c = code(uc)
+    d = destroy(uc)
+    body = restore_body(d)
+    take_over = body.find(TAKE_OVER)
+    closing = closing_at(d)
+    return (
+        take_over != -1
+        and "group.state = prior_states[g];" in body[:take_over]
+        and ordered(body[take_over:], "arena_group_reset_allocators_locked(g);",
+                    "arena_publish_prebuilt(zone, std::move(settle_replacements[i]));",
+                    "group.state = allocator_group_state::OPEN;")
+        and -1 < d.find(REPLACEMENT) < closing
+        and SETTLE_RESET in fn_body(c, SETTLE_SIG)
+    )
+
+
+def claim_a_leased_chunk_is_never_freed(uc: str) -> bool:
+    """The free loop reads the lease count its wait ended on, and the free sits only in the else branch of the
+    lease check: a chunk a lease still holds is reported and kept, and its cause is a lease."""
+    loop = free_loop(destroy(uc))
+    g = loop.find(LEASE_GUARD)
+    if not loop or g == -1 or loop.count(LEASE_GUARD) != 1:
+        return False
+    lease_block = block_at(loop, g)
+    after = loop[block_end(loop, g, LEASE_GUARD):].lstrip()
+    if not after.startswith(TEST_GUARD):
+        return False
+    test_block = block_at(after, 0)
+    rest = after[block_end(after, 0, TEST_GUARD):].lstrip()
+    if not rest.startswith(FREE_BRANCH):
+        return False
+    free_block = block_at(rest, 0)
+    return (
+        ordered(loop, LEASE_WAIT, LEASED, LEASE_GUARD)
+        and FREE_RE.search(lease_block) is None
+        and FREE_RE.search(test_block) is None
+        and FREE_RE.search(free_block) is not None
+        and len(FREE_RE.findall(loop)) == 1
+        and UNFREED_CAUSE in loop
+    )
+
+
+def claim_the_teardown_never_aborts(uc: str) -> bool:
+    """No assert or abort is left in arena_destroy, its free loop included: a lease that outlives the wait refuses."""
+    d = destroy(uc)
+    return bool(free_loop(d)) and not any(a in d for a in ABORTS)
+
+
 def claim_only_a_partly_freed_arena_stays_closed(zs: str) -> bool:
     return fn_body(code(zs), PREDICATE_SIG).strip() == (
-        "{ return cause == zone_arena_teardown_refusal::FREE_FAILED; }"
+        "{ return cause == zone_arena_teardown_refusal::FREE_FAILED || "
+        "cause == zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE; }"
     )
 
 
@@ -279,13 +397,29 @@ def test_partly_freed_cause_is_sticky():
 
 def test_restore_reopens_what_it_retired():
     assert claim_restore_reopens_what_it_retired(UC), (
-        "arena_destroy()'s restore does not reopen and republish the authority it retired at its generation, or "
-        "allocates")
+        "arena_destroy()'s restore does not reopen and republish the authority it retired at its generation, does "
+        "not give a group its state and epoch back, or allocates")
+
+
+def test_restore_finishes_an_interrupted_settle():
+    assert claim_restore_finishes_an_interrupted_settle(UC), (
+        "arena_destroy()'s restore leaves a drained settle it interrupted RESETTING, or finishes it other than the "
+        "settle would")
+
+
+def test_a_leased_chunk_is_never_freed():
+    assert claim_a_leased_chunk_is_never_freed(UC), (
+        "arena_destroy() can pass a chunk a lease still holds to sycl::free")
+
+
+def test_the_teardown_never_aborts():
+    assert claim_the_teardown_never_aborts(UC), (
+        "arena_destroy() keeps an assert or abort, so a lease that outlives the wait kills the process")
 
 
 def test_only_a_partly_freed_arena_stays_closed():
     assert claim_only_a_partly_freed_arena_stays_closed(ZS), (
-        "zone_arena_teardown_left_closed() reads a cause other than FREE_FAILED as closed")
+        "zone_arena_teardown_left_closed() reads a cause other than the two found after a chunk was freed as closed")
 
 
 def test_reopen_is_the_inverse_of_close():
@@ -316,17 +450,16 @@ def test_witness_drain_timeout_without_restore():
     )
 
 
-def test_witness_first_free_failure_without_restore():
+def test_witness_nothing_freed_without_restore():
     assert not claim_every_refusal_before_a_free_restores(
-        mutate_in(UC, DESTROY_SIG, "} restore(); lifecycle_locks.clear();", "} lifecycle_locks.clear();")
+        mutate_in(UC, DESTROY_SIG, NOTHING_FREED + " restore();", NOTHING_FREED)
     )
 
 
 def test_witness_new_pre_free_refusal_without_restore():
     assert not claim_every_refusal_before_a_free_restores(
-        mutate_in(UC, DESTROY_SIG, "bool all_freed = true;",
-                  "if (arena_chunks_.empty()) { return refuse(zone_arena_teardown_refusal::HOST_STATE); } "
-                  "bool all_freed = true;")
+        mutate_in(UC, DESTROY_SIG, "size_t released_chunk_count = 0;",
+                  f"if (arena_chunks_.empty()) {{ return refuse({HOST_STATE}); }} size_t released_chunk_count = 0;")
     )
 
 
@@ -337,22 +470,22 @@ def test_witness_restore_after_locks_dropped():
     )
 
 
-def test_witness_first_free_restore_without_relock():
+def test_witness_nothing_freed_restore_without_relock():
     assert not claim_restore_holds_every_group_lock(
-        mutate_in(UC, DESTROY_SIG, RELOCK + " } restore();", "restore();")
+        mutate_in(UC, DESTROY_SIG, RELOCK + " } " + NOTHING_FREED, NOTHING_FREED)
     )
 
 
 def test_witness_restore_after_a_chunk_was_freed():
     assert not claim_no_restore_after_a_chunk_is_freed(
-        mutate_in(UC, DESTROY_SIG, NOTHING_FREED, "if (!all_freed) {")
+        mutate_in(UC, DESTROY_SIG, NOTHING_FREED, PARTLY_FREED)
     )
 
 
 def test_witness_partly_freed_arena_restored():
     assert not claim_no_restore_after_a_chunk_is_freed(
-        mutate_in(UC, DESTROY_SIG, "return refuse(zone_arena_teardown_refusal::FREE_FAILED);",
-                  "restore(); return refuse(zone_arena_teardown_refusal::FREE_FAILED);")
+        mutate_in(UC, DESTROY_SIG, f"lifecycle_locks.clear(); return refuse({UNFREED});",
+                  f"restore(); lifecycle_locks.clear(); return refuse({UNFREED});")
     )
 
 
@@ -383,11 +516,67 @@ def test_witness_restore_keeps_the_bumped_generation():
     )
 
 
+def test_witness_restore_keeps_the_bumped_epoch():
+    assert not claim_restore_reopens_what_it_retired(
+        mutate_in(UC, DESTROY_SIG, "group.lifecycle_epoch = prior_epochs[g];", "")
+    )
+
+
+def test_witness_interrupted_settle_left_resetting():
+    assert not claim_restore_finishes_an_interrupted_settle(
+        mutate_in(UC, DESTROY_SIG, TAKE_OVER, "continue;")
+    )
+
+
+def test_witness_interrupted_settle_opened_without_its_reset():
+    assert not claim_restore_finishes_an_interrupted_settle(
+        mutate_in(UC, DESTROY_SIG, "arena_group_reset_allocators_locked(g);", "")
+    )
+
+
+def test_witness_settle_resets_by_its_own_code():
+    assert not claim_restore_finishes_an_interrupted_settle(
+        mutate_in(UC, SETTLE_SIG, SETTLE_RESET, "z.allocator->reset();")
+    )
+
+
+def test_witness_lease_timeout_asserts_again():
+    mutant = mutate_in(UC, DESTROY_SIG, LEASE_GUARD,
+                       LEASE_GUARD + ' GGML_ASSERT(false && "VRAM arena chunk freed while leases outstanding");')
+    assert not claim_the_teardown_never_aborts(mutant)
+
+
+def test_witness_lease_timeout_aborts():
+    mutant = mutate_in(UC, DESTROY_SIG, LEASE_GUARD,
+                       LEASE_GUARD + ' GGML_ABORT("VRAM arena chunk freed while leases outstanding");')
+    assert not claim_the_teardown_never_aborts(mutant)
+
+
+def test_witness_leased_chunk_falls_through_to_the_free():
+    assert not claim_a_leased_chunk_is_never_freed(
+        mutate_in(UC, DESTROY_SIG, "} " + TEST_GUARD, "} if (fail_for_test) {")
+    )
+
+
+def test_witness_lease_count_ignored():
+    assert not claim_a_leased_chunk_is_never_freed(
+        mutate_in(UC, DESTROY_SIG, LEASED, "const bool leases_outstanding = false;")
+    )
+
+
 def test_witness_predicate_reads_every_late_cause_as_closed():
     assert not claim_only_a_partly_freed_arena_stays_closed(
-        mutate_in(ZS, PREDICATE_SIG, "return cause == zone_arena_teardown_refusal::FREE_FAILED;",
+        mutate_in(ZS, PREDICATE_SIG,
+                  "return cause == zone_arena_teardown_refusal::FREE_FAILED || "
+                  "cause == zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE;",
                   "return cause != zone_arena_teardown_refusal::NONE && "
                   "cause != zone_arena_teardown_refusal::HOST_STATE;")
+    )
+
+
+def test_witness_predicate_reads_a_late_lease_as_restorable():
+    assert not claim_only_a_partly_freed_arena_stays_closed(
+        mutate_in(ZS, PREDICATE_SIG, " || cause == zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE", "")
     )
 
 
