@@ -4099,6 +4099,16 @@ onednn_graph_scratch_planned_shape unified_cache_publish_planned_onednn_graph_sc
     return shape;
 }
 
+zone_onednn_pp_pair unified_cache_plan_onednn_pp_pair(const path_scoped_maxima &           maxima,
+                                                      const placement_kv_info &            kv_info,
+                                                      const ggml_sycl_placement_envelope * envelope) {
+    // The micro-batch the Graph floor beside the pair is sized at: the ONEDNN zone cannot grow once weights are live,
+    // so both are sized for the context the model opens with, at the same ensure.
+    const uint32_t n_ubatch =
+        placement_load_n_ubatch(unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope).n_ubatch);
+    return zone_onednn_pp_pair_plan(maxima.onednn_reorder, maxima.onednn_pp_src1_bytes_per_token, n_ubatch);
+}
+
 // llama.cpp-oyfl: see the declaration in unified-cache.hpp for the shape this
 // records and why it is a separate triplet from the oneDNN one above.
 void unified_cache_set_planned_nonfa_attn_scratch_shape(int      device_id,
@@ -35727,6 +35737,19 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
                     onednn_pp_unified_scratch_enabled(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type);
             }
         }
+        // The f16 activation row the oneDNN PP scratch is asked for when it supplies this weight's op (both callers of
+        // acquire_onednn_pp_scratch ask for src1 columns x K x sizeof(f16)). Marked for a quantized weight that is not
+        // an expert stack, of a type acquire is enabled for and the op's PP candidate admits: the two type gates every
+        // route to the scratch passes. The classifier keeps the mark only inside the eligible set the pair plan's
+        // weights half covers, so the planned pair's activations half is the widest row of the ops that take the pair.
+        if (quantized && !is_expert && onednn_pp_unified_scratch_enabled(item.type) &&
+            ggml_sycl_onednn_pp_type_admitted(item.type)) {
+            size_t src1_bytes = 0;
+            if (zone_dequant_f16_src1_bytes_per_token(item.ne[0], item.ne[2] > 0 ? item.ne[2] : 1,
+                                                      item.ne[3] > 0 ? item.ne[3] : 1, &src1_bytes)) {
+                desc.onednn_pp_src1_bytes_per_token = src1_bytes;
+            }
+        }
         zone_inventory.push_back(std::move(desc));
     }
     return zone_inventory;
@@ -37227,28 +37250,33 @@ static void populate_host_zone_sizing(placement_plan &                          
     //    Neither can be the vocab embedding or the LM head, so both halves are scoped to the
     //    oneDNN-eligible set rather than the largest tensor in the model.
     //
-    //    The two halves are deliberately in DIFFERENT units and that is not drift:
+    //    Both halves are what the ops ask acquire_onednn_pp_scratch for, in f16:
     //
     //    - weights: the reorder holds a dequantized f16 copy, so it is the EXPANDED maximum.
     //      This half used to read onednn_eligible (stored bytes) and under-sized the zone by
     //      the whole quantization ratio -- llama.cpp-2wgg.
-    //    - activations: onednn_eligible is a PLACEHOLDER, not a measurement. The real buffer
-    //      is batch_tokens x K x sizeof(f16) (measured 14.0 MB on Mistral 7B Q4_0 at -p 512,
-    //      against the 31.5 MB this reserves). Sizing it properly needs a batch bound the
-    //      planner does not have here -- planner_n_ctx is the context length, not n_ubatch,
-    //      and using it would inflate this half to the weights half's size for no gain.
-    //      It over-covers on both reference models; revisit it with a real bound, not by
-    //      swapping in the expanded maximum, which would over-provision ~78%.
+    //    - activations: n_ubatch rows of the widest f16 src1 row of the weights the scratch
+    //      takes (onednn_pp_src1_bytes_per_token), at the micro-batch the Graph floor below is
+    //      sized at. It used to read onednn_eligible, the largest eligible weight AS STORED, a
+    //      placeholder unrelated to any micro-batch: it covered 512 and under-planned 2048
+    //      (Qwen3.8 at -ub 2048 asks 40.0 MB, the placeholder was 31.9 MB). With the zone
+    //      exactly pair + Graph floor the ops' halves then could not merge inside the pair
+    //      bound, and every op of a layer replaced the held pair.
     //
-    //    Measured against this formula: Mistral 7B Q4_0 plans 143.5 MB (112.0 + 31.5) for a
-    //    126.0 MB peak. The ONEDNN zone has a 256 MB floor, so this estimate is what
-    //    validates the floor is adequate -- do not lower the floor without re-measuring.
-    plan.onednn_scratchpad_bytes = zone_maxima.onednn_reorder + zone_maxima.onednn_eligible;
+    //    unified_cache_plan_onednn_pp_pair is the one definition; the inventory intake
+    //    (populate_inventory_globals in ggml-sycl.cpp) calls it too and publishes the pair the
+    //    arena sizes the zone from, so the two sites cannot size the zone differently.
+    //    Mistral 7B Q4_0 at n_ubatch=512 plans 126.0 MB (112.0 + 28672 B/token x 512 = 14.0),
+    //    its measured peak. The ONEDNN zone has a 256 MB floor; do not lower the floor
+    //    without re-measuring.
+    const zone_onednn_pp_pair onednn_pair = unified_cache_plan_onednn_pp_pair(zone_maxima, kv_info, envelope);
+    plan.onednn_scratchpad_bytes          = onednn_pair.weights_bytes + onednn_pair.activations_bytes;
     GGML_LOG_INFO(
-        "[SYCL-PLAN] oneDNN scratchpad: %.1f MB (onednn_reorder %.1f MB + onednn_eligible %.1f MB; global max %.1f "
-        "MB)\n",
-        plan.onednn_scratchpad_bytes / (1024.0 * 1024.0), zone_maxima.onednn_reorder / (1024.0 * 1024.0),
-        zone_maxima.onednn_eligible / (1024.0 * 1024.0), plan.max_tensor_bytes / (1024.0 * 1024.0));
+        "[SYCL-PLAN] oneDNN scratchpad: %.1f MB (weights half onednn_reorder %.1f MB + activations half %zu B/token x "
+        "n_ubatch=%u = %.1f MB%s; global max %.1f MB)\n",
+        plan.onednn_scratchpad_bytes / (1024.0 * 1024.0), onednn_pair.weights_bytes / (1024.0 * 1024.0),
+        onednn_pair.src1_bytes_per_token, onednn_pair.n_ubatch, onednn_pair.activations_bytes / (1024.0 * 1024.0),
+        onednn_pair.sized ? "" : ", overflowed, planned as 0", plan.max_tensor_bytes / (1024.0 * 1024.0));
 #if GGML_SYCL_DNNL
     // llama.cpp-0oxf/o3a0: record the SDPA shape alongside the scratchpad
     // bytes so onednn_graph_scratch_zone_floor_bytes_swa() can size the

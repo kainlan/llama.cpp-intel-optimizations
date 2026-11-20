@@ -519,6 +519,15 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-moe-host-island PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# The per-(block, expert) routed-expert counters of the MoE hybrid decode and prompt routes, their hit-rate and
+# top-N coverage summaries and their CSV text. ggml-sycl/moe-route-counts.hpp includes only the standard library, so
+# this loads no model and needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-moe-route-counts.cpp)
+    set_tests_properties(test-sycl-moe-route-counts PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-moe-route-counts PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # Decode/prompt classification of a scheduler split (llama.cpp-7pm2): MUL_MAT_ID is batch evidence and a split with
 # no matmul keeps the previous phase. ggml-sycl/graph-phase.hpp includes only ggml.h; the test builds synthetic
 # graphs on a no-alloc ggml context, so it needs no device.
@@ -988,6 +997,14 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-host-island-source.py --self-test)
     set_tests_properties(test-sycl-moe-host-island-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+    # Where the routed-expert counts are taken: the decode count in the hybrid route's pool-worker lambda on the gate
+    # op only, keyed by block number, before the ids are overwritten with flags; the prompt count from the ids
+    # snapshot; the WARN summary and the CSV guard; the table's size and lifetime. Run WITH --self-test so each
+    # mutant is caught by the pin it names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-route-counts-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-route-counts-source.py --self-test)
+    set_tests_properties(test-sycl-moe-route-counts-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # llama.cpp-36j0 Task 4: the MoE executor knobs' literals, log formats, env-report rows and teardown summary.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-exec-knobs-source
@@ -5283,6 +5300,17 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-staged-ring-route-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-staged-ring-route-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# A staging allocation the card does not grant on the MoE prompt path of ggml_sycl_mul_mat_id refuses the op by name
+# through ggml_sycl_fallback_error, never an abort, and the throw keeps what in-flight kernels read alive until they
+# are done, as the normal exit does. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-pp-staging-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-pp-staging-refusal-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()

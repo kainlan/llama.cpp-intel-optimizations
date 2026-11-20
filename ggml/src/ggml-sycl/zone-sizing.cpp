@@ -197,6 +197,12 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
         if (tensor.get_rows_only) {
             continue;
         }
+        // The pair plan's activations row comes from the same eligible set as its weights half: a weight the zone was
+        // not sized for (the head, an expert stack) does not take the scratch's planned pair.
+        if (onednn_eligible) {
+            maxima.onednn_pp_src1_bytes_per_token =
+                std::max(maxima.onednn_pp_src1_bytes_per_token, tensor.onednn_pp_src1_bytes_per_token);
+        }
         // Not gated on a per-layer family or on the expert predicate: the adapter
         // already said whether this is a dense MUL_MAT operand (non-zero).
         maxima.mmq_src1_bytes_per_token = std::max(maxima.mmq_src1_bytes_per_token, tensor.mmq_src1_bytes_per_token);
@@ -574,6 +580,26 @@ void zone_onednn_scratch_reserve_target(bool     arena_active,
 size_t zone_onednn_pp_pair_bound(size_t capacity_bytes, size_t bare_plan_bytes, size_t graph_floor_bytes) {
     const size_t slack_bound = capacity_bytes > graph_floor_bytes ? capacity_bytes - graph_floor_bytes : 0;
     return std::min(capacity_bytes, std::max(bare_plan_bytes, slack_bound));
+}
+
+zone_onednn_pp_pair zone_onednn_pp_pair_plan(size_t   reorder_weights_bytes,
+                                             size_t   src1_bytes_per_token,
+                                             uint32_t n_ubatch) {
+    zone_onednn_pp_pair pair;
+    pair.weights_bytes        = reorder_weights_bytes;
+    pair.src1_bytes_per_token = src1_bytes_per_token;
+    pair.n_ubatch             = n_ubatch;
+    if (n_ubatch != 0 && src1_bytes_per_token > SIZE_MAX / n_ubatch) {
+        return pair;
+    }
+    const size_t activations = src1_bytes_per_token * n_ubatch;
+    // The pair is stored as its two halves and their sum, so the sum must be representable too.
+    if (reorder_weights_bytes > SIZE_MAX - activations) {
+        return pair;
+    }
+    pair.activations_bytes = activations;
+    pair.sized             = true;
+    return pair;
 }
 
 bool zone_onednn_pp_scratch_type_enabled(int env_mode, bool default_type) {

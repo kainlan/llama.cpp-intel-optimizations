@@ -2355,8 +2355,14 @@ in `zone-sizing.hpp`; read it there rather than restating it here.
 | `any_tensor` | the legacy global maximum; use only when the path genuinely accepts any tensor |
 | `onednn_eligible` | largest tensor that can be a oneDNN matmul reorder subject, **as stored** |
 | `onednn_reorder` | largest oneDNN reorder buffer, i.e. that same eligible set **dequantized to f16** |
+| `onednn_pp_src1_bytes_per_token` | widest f16 src1 row (bytes/token) of the eligible weights the PP scratch takes |
 | `cpu_quant_eligible` | largest tensor the CPU quantization slots can hold |
 | `dma_streamed` | largest tensor the host→device weight stream carries |
+
+`onednn_pp_src1_bytes_per_token` counts only the rows the inventory adapter marks:
+a quantized weight that is not an expert stack, of a type the oneDNN PP scratch is
+enabled for and the PP admission serves. That is the set `acquire_onednn_pp_scratch`
+supplies, so the activations half is sized from the ops that ask for it.
 
 **`onednn_reorder` is not `onednn_eligible` times a constant, and it is not
 bounded by `any_tensor`.** Both surprises are load-bearing:
@@ -2541,18 +2547,25 @@ This is the trap most likely to waste a future change:
 - `plan.onednn_scratchpad_bytes`, set in `populate_host_zone_sizing`, is the
   plan-level figure and the one the `[SYCL-PLAN]` line reports. **It does not
   size the VRAM ONEDNN zone.**
-- `g_tensor_inventory_onednn_scratchpad_bytes`, set in
-  `populate_inventory_globals` (`ggml/src/ggml-sycl/ggml-sycl.cpp`), is what
-  actually sizes it: it flows through
-  `unified_cache_set_planned_onednn_scratchpad_bytes` into
-  `g_planned_onednn_scratchpad_bytes[device]`, which `ensure_planned_arena_zones`
-  reads when it lays out the arena.
+- The pair published in `populate_inventory_globals`
+  (`ggml/src/ggml-sycl/ggml-sycl.cpp`) is what actually sizes it:
+  `unified_cache_set_planned_onednn_scratchpad_pair` stores the two halves
+  and writes their sum into `g_planned_onednn_scratchpad_bytes[device]`, which
+  `ensure_planned_arena_zones` reads when it lays out the arena. The global
+  `g_tensor_inventory_onednn_scratchpad_bytes` beside it holds the same sum
+  for the `[SYCL-PLAN] inventory oneDNN scratchpad` log line only.
 
-Both now narrow through the same `unified_cache_adapt_zone_inventory` +
-`zone_scoped_maxima` pair, and both compute the identical
-`onednn_reorder + onednn_eligible` sum. **A future consumer that changes only
-one of the two will appear to work and change nothing** — the plan figure moves
-in the log while the zone stays exactly as large as it was. Note the second site
+Both narrow through the same `unified_cache_adapt_zone_inventory` +
+`zone_scoped_maxima` pair, and both take the pair from ONE definition,
+`unified_cache_plan_onednn_pp_pair` (weights half `onednn_reorder`, activations
+half `onednn_pp_src1_bytes_per_token × n_ubatch` at the Graph scratch shape's
+micro-batch, through the pure `zone_onednn_pp_pair_plan`). The intake publishes
+the pair's two halves with `unified_cache_set_planned_onednn_scratchpad_pair`
+after the KV inputs give it the context shape.
+`tests/test-sycl-onednn-pp-scratch-plan-source.py` fails when either site
+leaves the shared definition. **A future consumer that changes only one of the
+two will appear to work and change nothing** — the plan figure moves in the log
+while the zone stays exactly as large as it was. Note the second site
 lives in `ggml-sycl.cpp`, where codescout's index is blind; `search_text` for a
 symbol there returns the `unified-cache.cpp` occurrences and silently omits it.
 Verify with `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n '<pattern>'`.
@@ -4242,21 +4255,50 @@ recovery path: it measures the driver's working set and sizes the headroom from 
 
 ### Known limits (load-bearing — read before changing any of this)
 
-1. **The ONEDNN scratchpad's two halves are in different units, deliberately.**
-   The formula is `onednn_reorder + onednn_eligible` — expanded weights plus a
-   *stored-bytes placeholder* for the activations. That asymmetry is the current
-   state of knowledge, not drift:
+1. **The ONEDNN scratchpad's two halves are both what the ops ask for, in f16.**
+   The formula is `onednn_reorder + onednn_pp_src1_bytes_per_token × n_ubatch`
+   (`unified_cache_plan_onednn_pp_pair`, pure arithmetic in
+   `zone_onednn_pp_pair_plan`, test-zone-sizing Case 14m):
 
    - **The weights half is exact.** It is the f16 reorder buffer, and the size
      matches what the consumers request to the byte.
-   - **The activations half is a placeholder that happens to cover.** The real
-     buffer is `batch_tokens × K × sizeof(f16)` — measured 14.0 MB on Mistral 7B
-     Q4_0 at `-p 512`, against the 31.5 MB `onednn_eligible` reserves for it.
-     Sizing it properly needs a batch bound the planner does not have at that
-     point: `planner_n_ctx` is the context length, not `n_ubatch`, and using it
-     would inflate this half to the weights half's size for no gain. **If you
-     revisit it, find a real bound — do not substitute `onednn_reorder`**, which
-     would over-provision ~78% and start pushing models past the floor.
+   - **The activations half is the micro-batch times the widest row.** The real
+     buffer is `src1 columns × K × sizeof(f16)` (both callers of
+     `acquire_onednn_pp_scratch`), so the plan is `n_ubatch` rows of the widest
+     f16 row of the weights the scratch takes, at the micro-batch the Graph
+     floor sharing the zone is sized at (the context shape the load is told,
+     else the planning micro-batch). Pair and floor are then sized for one shape
+     at one zone ensure. The explicit micro-batch's publish of the dense
+     RUNTIME scratch does not re-plan the pair: that micro-batch is the
+     context's (`n_ubatch_context`, capped at `n_ctx`), the one the Graph shape
+     already takes when the load is told the context, so the pair is planned at
+     it before the entry ensure and a re-publish would write the same value.
+     A context that later runs a wider micro-batch than the load planned cannot
+     grow the zone. An op whose own pair exceeds the pair bound is refused at
+     acquire and draws the dequant buffers. An op whose own pair fits is
+     reserved (`zone_onednn_scratch_reserve_target`) at the first of three
+     targets that fits the bound:
+     1. the per-component maximum of the planned, held and requested pairs
+        (the zone has slack above the plan);
+     2. else the per-component maximum of the held and requested pairs;
+     3. else the request as asked.
+
+     The first two never shrink a half, so a later op the new pair covers
+     reuses it. The third replaces the held pair with the request, which can
+     shrink the other half, so a later op that asks for more of that half
+     replaces it again.
+
+   Until 2026-11-20 this half was `onednn_eligible`, the largest eligible weight
+   *as stored*: a placeholder with no relation to a micro-batch. It covered
+   Mistral at `-p 512` (31.5 MB against the 14.0 MB measured) and under-planned
+   Qwen3.8 at `-ub 2048` (31.9 MB against the 40.0 MB the ops ask). Once the
+   Graph floor followed the real context shape, the zone was exactly pair +
+   floor, the pair bound was the plan, the ops' per-component maximum (60, 40)
+   did not fit it, and `zone_onednn_scratch_reserve_target` replaced the held
+   pair on nearly every op; the event-deferred releases of the superseded
+   blocks filled the zone inside one graph (pp2048 373.81 → 241 t/s,
+   `llama.cpp-hv5c`). **Do not substitute `onednn_reorder` for this half either**:
+   it would over-provision ~78% on Mistral and push models past the floor.
 
    This replaces the earlier defect (`llama.cpp-2wgg`, fixed): the weights half
    used to read `onednn_eligible`, sizing a dequantized buffer from a quantized
@@ -4274,7 +4316,8 @@ recovery path: it measures the driver's working set and sizes the headroom from 
    it is model-dependent rather than a fixed factor.
 
    **The floor is no longer masking a known defect, but it is still a floor.**
-   Mistral now plans 143.5 MB, still under 256 MB, so `underestimate_count`
+   By the formula Mistral plans 126.0 MB at `n_ubatch=512` (112.0 + 28672 B/token
+   × 512 = 14.0), its measured peak, still under 256 MB, so `underestimate_count`
    remains an insensitive instrument for this path on that model. Compare
    planned-vs-observed in the logs — `[SYCL-PLAN] oneDNN scratchpad` against
    `[UNIFIED-CACHE] Runtime breakdown … ONEDNN_ZONE` — rather than reading the
