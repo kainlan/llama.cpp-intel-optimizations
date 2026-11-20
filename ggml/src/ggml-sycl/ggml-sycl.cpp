@@ -128542,7 +128542,10 @@ static void ggml_sycl_reset_moe_module_state() {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static void ggml_backend_sycl_test_fail_next_arena_free_guarded() {
     sycl_module_mutation_guard module_guard;
-    if (module_guard) ggml_sycl::unified_cache_test_fail_next_arena_free();
+    if (module_guard) {
+        // The first free a teardown tries, before it has freed any chunk.
+        ggml_sycl::unified_cache_test_fail_next_arena_free(0);
+    }
 }
 
 static void ggml_backend_sycl_test_block_finalize_reactivate() {

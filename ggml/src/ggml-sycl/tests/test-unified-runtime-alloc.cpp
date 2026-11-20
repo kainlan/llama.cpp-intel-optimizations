@@ -1939,13 +1939,15 @@ static bool arena_teardown_live_allocations_restores(sycl::queue & q, bool & ski
     return true;
 }
 
-// Declared after an arm's cache, so it runs before the cache's destructor. A check that returns early can leave a
-// failure hook armed: the first teardown here takes it, the second completes, and the destructor finds no arena (a
-// shutdown it cannot complete aborts the process).
+// Declared after an arm's cache, so it runs before the cache's destructor. An arm that returns early, or whose
+// teardown never reached a failure hook it armed, leaves that hook armed: the hooks are disarmed first, so none fires
+// here, in a later arm or in the destructor. Then the arena is torn down, a second time if the first is refused, so
+// the destructor finds no arena (a shutdown it cannot complete aborts the process).
 struct arena_teardown_retry {
     unified_cache & cache;
 
     ~arena_teardown_retry() {
+        unified_cache_test_disarm_arena_teardown_failures();
         if (!cache.shutdown_resources()) {
             (void) cache.shutdown_resources();
         }

@@ -1151,9 +1151,10 @@ static std::atomic<int>      g_copy_trace_enabled{ -1 };
 static std::atomic<bool>     g_graph_compute_active{ false };
 static std::atomic<size_t>   g_live_arena_chunks{ 0 };
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-static std::atomic<bool>     g_test_fail_next_arena_free{ false };
 
-static std::atomic<size_t> g_test_arena_free_failure_after{ 0 };
+// The free hook's arming and its threshold in one word, so the two cannot be seen apart: the count of freed chunks
+// after which the next free reads as refused, or SIZE_MAX when the hook is not armed.
+static std::atomic<size_t> g_test_arena_free_failure_after{ SIZE_MAX };
 static std::atomic<bool>   g_test_fail_next_arena_drain{ false };
 
 static std::atomic<bool>     g_test_fail_next_shutdown_clean{ false };
@@ -31756,11 +31757,15 @@ void unified_cache_dump_capture_zone_figures(int dev, dump_point point) noexcept
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void unified_cache_test_fail_next_arena_free(size_t freed_chunks) {
     g_test_arena_free_failure_after.store(freed_chunks, std::memory_order_release);
-    g_test_fail_next_arena_free.store(true, std::memory_order_release);
 }
 
 void unified_cache_test_fail_next_arena_drain() {
     g_test_fail_next_arena_drain.store(true, std::memory_order_release);
+}
+
+void unified_cache_test_disarm_arena_teardown_failures() {
+    g_test_arena_free_failure_after.store(SIZE_MAX, std::memory_order_release);
+    g_test_fail_next_arena_drain.store(false, std::memory_order_release);
 }
 
 void unified_cache_test_fail_next_shutdown_clean() {
@@ -32047,9 +32052,11 @@ bool unified_cache::arena_destroy() {
         const bool leases_outstanding = outstanding > 0;
         bool       fail_for_test      = false;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-        fail_for_test = !leases_outstanding &&
-                        released_chunk_count >= g_test_arena_free_failure_after.load(std::memory_order_acquire) &&
-                        g_test_fail_next_arena_free.exchange(false, std::memory_order_acq_rel);
+        // The free hook fires once, at the free tried after exactly its threshold of chunks was freed: one
+        // compare-exchange both matches the threshold and disarms the hook.
+        size_t armed_after = released_chunk_count;
+        fail_for_test      = !leases_outstanding && g_test_arena_free_failure_after.compare_exchange_strong(
+                                                   armed_after, SIZE_MAX, std::memory_order_acq_rel);
 #endif
         bool freed = false;
         if (leases_outstanding) {

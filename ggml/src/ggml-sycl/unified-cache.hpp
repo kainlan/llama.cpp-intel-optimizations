@@ -10063,11 +10063,18 @@ bool unified_cache_shutdown_allocation_control_census_for_test(uint64_t out[3]) 
 // arguments are invalid: the reading is VOID, never a zero that could be mistaken for "nothing allocated".
 bool unified_cache_role_bytes_for_testing(int device, alloc_role role, uint64_t * out) noexcept;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-// The next teardown that has freed `freed_chunks` of its chunks reads its next free as refused by the device: 0 fails
-// the first free, before any chunk is freed, and 1 fails the free after the first chunk was freed.
-void unified_cache_test_fail_next_arena_free(size_t freed_chunks = 0);
-// The next teardown reads its wait for the leases on its retired authorities as timed out.
+// The free hook: a teardown reads one free as refused by the device, the free it tries once it has freed exactly
+// `freed_chunks` of its chunks (0 fails the first free, before any chunk is freed, and 1 fails the free after the first
+// chunk was freed). The teardown that tries that free consumes the hook. One that stops before it, at a refusal before
+// the free loop or at a leased chunk before any chunk is freed, leaves it armed.
+void unified_cache_test_fail_next_arena_free(size_t freed_chunks);
+// The drain hook: the next teardown that reaches its wait for the leases on its retired authorities reads that wait as
+// timed out, and consumes the hook. A teardown that refuses before it closes the arena never reaches the wait and
+// leaves the hook armed.
 void unified_cache_test_fail_next_arena_drain();
+// Disarms both hooks above. A test that arms one calls this when it is done, so a hook no teardown reached cannot fire
+// in a later teardown or in the cache's destructor.
+void unified_cache_test_disarm_arena_teardown_failures();
 void unified_cache_test_fail_next_shutdown_clean();
 void unified_cache_test_set_arena_drain_timeout_ms(uint32_t timeout_ms);
 void unified_cache_test_pause_zone_settle(bool pause);
