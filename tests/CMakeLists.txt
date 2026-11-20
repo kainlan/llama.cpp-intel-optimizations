@@ -4779,6 +4779,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for a refused VRAM arena teardown: a refusal before the teardown freed any chunk puts the arena back as it
+# was (each group's state, each zone's generation, the retired authority reopened, under every group lock), and a
+# refusal after it freed a chunk restores nothing and leaves FREE_FAILED, the only cause read as closed, until a
+# teardown completes. Host-only, reads the sources as text. Same registration shape as
+# test-sycl-load-stage-effect-pass-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-arena-destroy-restore-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-arena-destroy-restore-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Jinja fallback for a model whose chat template the built-in matcher does not know (Gemma 4 failed after the load with
 # "try using --jinja"): upstream turns the jinja engine off for llama-completion and llama-mtmd-cli.
 # test-chat-need-jinja checks common_chat_templates_need_jinja() itself. It loads no model, so it keeps the default

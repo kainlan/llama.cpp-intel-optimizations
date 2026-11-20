@@ -3934,6 +3934,22 @@ set_tests_properties(sycl-runtime-alloc-flag-slab-released-at-shutdown PROPERTIE
     TIMEOUT 180
     SKIP_RETURN_CODE 77
 )
+# The arena teardown's refusal classes: a teardown refused before it freed any chunk leaves the arena as it was, one
+# refused after it freed a chunk leaves it partly freed and closed. Its own process, because its arms arm process-wide
+# test hooks. It allocates arenas on the device, so it carries `cache` and runs with that family, not in the sweep.
+set(SYCL_ARENA_TEARDOWN_TEST_ENV
+    "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+    "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+)
+add_test(NAME sycl-runtime-alloc-arena-teardown-refusal-classes
+    COMMAND test-sycl-runtime-alloc --case arena_teardown_refusal_classes
+)
+set_tests_properties(sycl-runtime-alloc-arena-teardown-refusal-classes PROPERTIES
+    LABELS "sycl;allocator;runtime;cache;tdd"
+    ENVIRONMENT "${SYCL_ARENA_TEARDOWN_TEST_ENV}"
+    TIMEOUT 180
+    SKIP_RETURN_CODE 77
+)
 endif() # direct-source static SYCL fixture
 
 # Test: numerics of the SYCL Q2_0 device functions (dequantize_q2_0, vec_dot_q2_0_q8_1)

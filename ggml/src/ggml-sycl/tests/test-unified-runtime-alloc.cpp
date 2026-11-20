@@ -15,6 +15,7 @@
 #include "sycl-test-skip.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -1916,6 +1917,114 @@ static bool arena_teardown_refusal_reserves_nothing(sycl::queue & q) {
     return true;
 }
 
+// An arm that cannot build its fixture on this device measures nothing: it says why and marks the run skipped, and the
+// case then exits 77, never 0.
+#define TEST_SKIP(skipped, why)                \
+    do {                                       \
+        fprintf(stderr, "SKIPPED: %s\n", why); \
+        (skipped) = true;                      \
+        return true;                           \
+    } while (0)
+
+// Every zone's live authority and the generation it was minted at. A handle minted in a zone resolves only through
+// that authority object at that generation, so an arena whose incarnations are all unchanged resolves every handle it
+// resolved before to the same pointer.
+struct arena_incarnations {
+    std::array<std::shared_ptr<arena_authority>, static_cast<size_t>(vram_zone_id::COUNT)> authority{};
+    std::array<uint64_t, static_cast<size_t>(vram_zone_id::COUNT)>                         generation{};
+};
+
+static arena_incarnations arena_incarnations_of(const unified_cache & cache) {
+    arena_incarnations seen;
+    for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+        seen.authority[z]  = cache.arena_authority_snapshot(static_cast<vram_zone_id>(z));
+        seen.generation[z] = cache.arena_generation(static_cast<vram_zone_id>(z));
+    }
+    return seen;
+}
+
+// True when every zone has the authority object and generation it had, and that authority admits again.
+static bool arena_incarnations_unchanged(const unified_cache & cache, const arena_incarnations & before) {
+    const arena_incarnations now = arena_incarnations_of(cache);
+    for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+        if (now.authority[z] != before.authority[z] || now.generation[z] != before.generation[z]) {
+            return false;
+        }
+        if (now.authority[z] && !now.authority[z]->accepts(now.generation[z])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The SCRATCH zone of the arena serves a new allocation, inside the arena, and takes it back.
+static bool arena_serves_a_new_allocation(unified_cache & cache) {
+    constexpr size_t mib = 1024ull * 1024ull;
+    if (!cache.reserve_persistent_scratch("arena-teardown-restored", 1ull * mib)) {
+        return false;
+    }
+    void * const fresh  = cache.get_persistent_scratch("arena-teardown-restored");
+    const bool   inside = fresh != nullptr && cache.vram_owns(fresh);
+    cache.release_persistent_scratch("arena-teardown-restored");
+    return inside;
+}
+
+// A teardown refused because allocations are live in the arena leaves the arena as it was. The fixture holds the
+// scratch pool's exact allocation through a copy of its owner and asks the arena to tear itself down; the refusal is
+// the positive control. Then the arena is as it was: the held handle resolves to the pointer it resolved to before,
+// every zone keeps its authority and generation, and the SCRATCH zone serves a new allocation inside the arena.
+// Mutant: the teardown closing the allocator groups and retiring the authorities before it finds the allocations, and
+// not putting them back (the held handle stops resolving, the SCRATCH zone refuses the allocation).
+static bool arena_teardown_live_allocations_restores(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("arena_teardown_live_allocations_restores");
+    constexpr size_t mib       = 1024ull * 1024ull;
+    const size_t     max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    unified_cache    cache(q, 64ull * mib, 0, 0, 0);
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no teardown was measured");
+    }
+    TEST_ASSERT(cache.reserve_scratch_pool(1ull * mib), "the fixture's scratch pool was not reserved");
+    mem_handle         held   = cache.test_scratch_pool_owner();
+    const resolved_ptr before = held.resolve();
+    TEST_ASSERT(before, "the held scratch pool owner did not resolve before the teardown");
+    const arena_incarnations incarnations = arena_incarnations_of(cache);
+    const int                chunks       = cache.chunk_count();
+
+    TEST_ASSERT(!cache.arena_destroy(), "the teardown freed an arena a live allocation is in");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::LIVE_ALLOCATIONS,
+                "the teardown did not record the live allocation as its cause");
+    TEST_ASSERT(cache.arena_active() && cache.chunk_count() == chunks, "the refused teardown changed the chunks");
+    const resolved_ptr after = held.resolve();
+    TEST_ASSERT(after && after.ptr == before.ptr,
+                "the held handle does not resolve to the pointer it resolved to before the refused teardown");
+    TEST_ASSERT(arena_incarnations_unchanged(cache, incarnations),
+                "a zone's authority or generation is not the one it had before the refused teardown");
+    TEST_ASSERT(arena_serves_a_new_allocation(cache), "the arena refused a new allocation after the refused teardown");
+
+    held = {};
+    TEST_ASSERT(cache.shutdown_resources(), "the arena was not torn down once its last holder was released");
+    TEST_ASSERT(!cache.arena_active(), "the completed teardown left the arena active");
+    TEST_PASS();
+    return true;
+}
+
+// The arena teardown's refusal classes, each arm on a cache of its own. It runs alone in its process (`--case
+// arena_teardown_refusal_classes`): its arms arm process-wide test hooks, and a refused teardown must not reach another
+// case's cache. Exits 0 when every arm passed, 1 when one failed, and 77 when none failed but one measured nothing.
+static int arena_teardown_refusal_classes(sycl::queue & q) {
+    bool skipped = false;
+    bool ok      = true;
+    ok &= arena_teardown_live_allocations_restores(q, skipped);
+    if (!ok) {
+        return 1;
+    }
+    if (skipped) {
+        fprintf(stderr, "SKIP: an arena teardown arm measured nothing on this device (its SKIPPED line says why)\n");
+        return SYCL_TEST_SKIP;
+    }
+    return 0;
+}
+
 static std::mutex               g_staging_log_mutex;
 static std::vector<std::string> g_staging_log_lines;
 
@@ -2411,6 +2520,13 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "-------------------------------------------\n");
             fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
             return case_ok ? 0 : 1;
+        }
+        // No oneDNN dependency either; it allocates its own small arenas on the device.
+        if (std::strcmp(argv[2], "arena_teardown_refusal_classes") == 0) {
+            const int case_rc = arena_teardown_refusal_classes(q);
+            fprintf(stderr, "-------------------------------------------\n");
+            fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
+            return case_rc;
         }
 #if GGML_SYCL_DNNL
         const char * case_name = argv[2];
