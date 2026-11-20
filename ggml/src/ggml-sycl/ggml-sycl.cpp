@@ -50422,11 +50422,13 @@ struct tiered_kv_buffer_context {
     std::vector<kv_view_extra_entry> view_extras;
 
     // The extras init_tensor made for this buffer's own K and V tensors (its vmem and per-layer remap branches), one
-    // record per extra it made and only those. The buffer owns them: each one's data handle is a chunk lease on the
-    // arena chunk its layer lives in, and tiered_kv_buffer_free releases every record before the layer owners and the
-    // vmem pool go, so no handle outlives the bytes it views. A tensor's ->extra is a view of one of these, never the
-    // record. Nothing else releases them: every other path that sets an extra does so only on a tensor that has none,
-    // and every other holder takes its own retain_extra_gpu(). A view tensor's extra is kept in view_extras instead.
+    // record per extra it made and only those. The buffer owns them. Each one's data handle is, when the layer is an
+    // arena chunk sub-allocation, a chunk lease (site tensor_extra) on that chunk; otherwise a direct handle (a vmem,
+    // host-pinned or other non-arena layer). tiered_kv_buffer_free releases every record before the layer owners and
+    // the vmem pool go, so no handle outlives the bytes it views. A tensor's ->extra is a view of one of these, never
+    // the record. Nothing else releases them: every other path that can reach one of these tensors sets an extra only
+    // when the tensor has none, and every other holder takes its own retain_extra_gpu(). A view tensor's extra is kept
+    // in view_extras instead.
     std::vector<ggml_tensor_extra_gpu *> owned_extras;
 };
 

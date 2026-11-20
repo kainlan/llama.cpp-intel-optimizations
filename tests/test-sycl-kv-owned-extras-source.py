@@ -18,6 +18,10 @@ The checks pin the fix:
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live inside
 test_*() functions. Checks read COMMENT-STRIPPED, whitespace-normalised text. Each check has a mutation witness that
 applies the regression it guards and must make the check fail.
+
+The structural anchors (the remap branch's `if (la.ptr) {`, the free's `delete ctx; return; }` at the vmem exit and its
+`alloc_base` line) are deliberate tripwires: a refactor that moves the helper call or reshapes the free turns this pin
+red, and the pin must then be re-anchored to the new shape, not deleted or loosened.
 """
 
 import re

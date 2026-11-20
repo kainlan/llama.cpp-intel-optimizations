@@ -153,19 +153,23 @@
 // reason) fails loudly instead of passing vacuously.
 //
 // THE BUFFER'S OWN EXTRAS (check_kv_buffer_releases_its_extras, run first on
-// a buffer of its own). init_tensor also makes an extra for each of the
-// buffer's own K and V tensors, and set_data_device gives it a chunk lease
-// on the arena chunk the layer lives in (site tensor_extra). The buffer
-// must release those extras at its free, or each one and its lease outlive
-// the buffer, the context and the model: two per layer. The case reads
+// a buffer of its own, with no graph, so nothing but that buffer's init and
+// free moves the count it reads). init_tensor also makes an extra for each
+// of the buffer's own K and V tensors, and set_data_device gives it a data
+// handle that, for a layer in the arena, is a chunk lease on the layer's
+// arena chunk (site tensor_extra). The buffer must release those extras at
+// its free; without that each one and its lease would outlive the buffer,
+// the context and the model, two per layer, and the read after the free
+// would be the first read plus 2 * N_LAYERS. The case reads
 // unified_cache::arena_chunk_lease_count_at({tensor_extra, copy=false})
 // before the buffer, after init (at least 2 * N_LAYERS above that: the
 // positive control, and a failure when it does not hold) and after
-// ggml_backend_buffer_free (must equal the first read); the copy count must
-// not move. Before the buffer kept a list of those extras, the read after
-// the free was the first read plus 2 * N_LAYERS. It reserves a small
-// arena first if the process has none (as test-sycl-compute-buffer-kv-zone
-// does), because a KV layer outside the arena takes no chunk lease.
+// ggml_backend_buffer_free (must equal the first read). `copy = true`
+// counts the leases copies of such handles took; the buffer makes none, so
+// that count must not move at all. It reserves a small arena first if the
+// process has none (as test-sycl-compute-buffer-kv-zone does), because a KV
+// layer outside the arena takes no chunk lease. It returns 0 on a pass, 1
+// on a failure, and LLAMA_TEST_EXIT_SKIP when the arena is switched off.
 //
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-kv-view-extra-reuse
@@ -247,12 +251,7 @@ void build_graph(ggml_context * ctx,
     }
 }
 
-// The tiered KV buffer owns the extras its init_tensor makes for its own K and V tensors. Each extra's data handle is
-// a chunk lease, counted at the tensor_extra site, on the arena chunk its layer lives in: the count read there rises by
-// one per K or V tensor when the buffer initialises them, and must fall back to where it started when the buffer is
-// freed. The case runs on a buffer of its own with no graph, so nothing but that buffer's init and free moves the
-// count. `copy = true` counts the leases copies of such handles took; the buffer makes none, so that count must not
-// move at all. Returns 0 on a pass, 1 on a failure, LLAMA_TEST_EXIT_SKIP when the arena is switched off.
+// The extra-release case: see "THE BUFFER'S OWN EXTRAS" in the file header.
 int check_kv_buffer_releases_its_extras(ggml_backend_buffer_type_t kv_buft) {
     const int                  device = 0;  // in-process index after selector filtering
     ggml_sycl::unified_cache * cache  = ggml_sycl::get_unified_cache_for_device(device);
@@ -410,6 +409,9 @@ int main(int, char ** argv) {
 
     // Runs first, on its own buffer, so its lease count is read before any graph has run in this process. A skip
     // (the arena is off) still runs the view checks below and turns the exit into a skip only if they pass.
+    // The case reserves a 64 MiB arena when the process has none and leaves it reserved, so after a pass the view loop
+    // below runs on the arena path: its KV layers are arena KV-zone sub-allocations, not separate device allocations.
+    // After a skip no arena was reserved and the loop runs on the non-arena path.
     const int extra_release_rc = check_kv_buffer_releases_its_extras(ggml_backend_sycl_kv_buffer_type(0));
     if (extra_release_rc != 0 && extra_release_rc != LLAMA_TEST_EXIT_SKIP) {
         ggml_sycl::test_clear_kv_placement_plan();

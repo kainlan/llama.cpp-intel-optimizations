@@ -1313,8 +1313,12 @@ record of each in its own context:
 
 - **Its own K and V tensors**, in the vmem branch and the per-layer remap
   branch of `tiered_kv_buffer_init_tensor`. `set_data_device` gives the extra
-  a data handle made by `from_chunk_ptr`, which takes a chunk lease (site
-  `tensor_extra`) on the arena chunk the layer lives in. The extra comes from
+  a data handle made by `from_chunk_ptr`: when the layer is an arena chunk
+  sub-allocation, a chunk lease (site `tensor_extra`) on that chunk; otherwise
+  (a vmem, host-pinned or other non-arena layer) a direct handle. A refused
+  arena rebuild prints its chunk leases by that site (the bullet "Something
+  still points into the arena" under "Explicit micro-batch placement" lists
+  the sites). The extra comes from
   `tiered_kv_buffer_own_extra`, which makes it and records it in
   `owned_extras` only when the tensor has none, so a second `init_tensor` on
   one tensor records nothing twice.
@@ -1329,18 +1333,19 @@ the bytes it views. That runs when the context frees its KV cache, whatever
 other models are live, and it reaps nothing: each record holds the reference
 the extra was made with. Any other holder of such an extra takes its own
 `retain_extra_gpu()`, and no other path frees or replaces one: every other
-place that sets `tensor->extra` does so only on a tensor that has none. The
-list holds extras and never tensors. A tensor's `->extra` is a view of a
-record, and it dangles after the free; nothing reads it, because llama's KV
-cache frees the buffer and then the `ggml_context` that holds the tensors.
+path that can reach one of these tensors sets an extra only when the tensor
+has none. The list holds extras and never tensors. A tensor's `->extra` is a
+view of a record, and it dangles after the free; nothing reads it, because
+llama's KV cache frees the buffer and then the `ggml_context` that holds the
+tensors.
 
-Before the buffer kept `owned_extras`, the K and V extras were recorded
-nowhere, so each one and its chunk lease outlived the buffer, the context and
-the model, two per layer, and kept the arena from being rebuilt after the last
-model was released. Checks: `test-sycl-kv-owned-extras-source` (the recording
-and the release order, with mutation witnesses) and the extra-release case of
-`test-sycl-kv-view-extra-reuse` (the `tensor_extra` lease count before the
-buffer, after init and after the free, on a device).
+The record is what ends these extras. Without it each K and V extra and its
+data handle would outlive the buffer, the context and the model, two per
+layer, and a chunk lease among them would keep the arena from being rebuilt
+after the last model is released. Checks: `test-sycl-kv-owned-extras-source`
+(the recording and the release order, with mutation witnesses) and the
+extra-release case of `test-sycl-kv-view-extra-reuse` (the `tensor_extra`
+lease count before the buffer, after init and after the free, on a device).
 
 ## The rules that fall out of this
 
@@ -3213,7 +3218,9 @@ The arena can fail to grow for three reasons, and each prints its own line first
   `untagged` (a direct caller of the lease API). `(copy)` counts the leases that
   copies of those handles took; a copy keeps the site of the handle it copies.
   The counts by site sum to the chunks' leases, up to a lease taken or dropped
-  between the two reads.
+  between the two reads. The tiered KV buffer's own K and V extras hold
+  `tensor_extra` leases until the buffer is freed ("The tiered KV buffer owns
+  the extras its init_tensor makes" above).
 
 - **The tail chunk's cap.** The rebuilt arena's tail chunk holds the ONEDNN,
   RUNTIME and SCRATCH zones plus a minimum KV carve-out, and the device's
