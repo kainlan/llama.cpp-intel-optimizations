@@ -3262,7 +3262,8 @@ The arena can fail to grow for three reasons, and each prints its own line first
 
   Every exit after the close releases the allocator group locks and wakes every
   thread waiting on a group's state, so a `zone_settle()` caller parked behind a
-  settle the close interrupted returns whatever the teardown decided. Nothing in
+  settle the close interrupted returns, unless the teardown gives its group back
+  RESETTING: then it waits for that settle, as it did before the teardown. Nothing in
   the teardown aborts, and nothing is reaped, evicted or reset to make a teardown
   succeed. The teardown never frees a chunk whose lease count it read as nonzero
   when its wait for that chunk ended. That read is the only check: a lease is

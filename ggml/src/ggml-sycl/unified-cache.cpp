@@ -31835,8 +31835,10 @@ bool unified_cache::arena_destroy() {
     // The four group locks, taken in the fixed group order. KV and WEIGHT are one lock/state row, so neither logical
     // sibling can allocate while the other is closing. Every exit after the close leaves through release_groups(),
     // which also wakes every thread parked on a group's state: a zone_settle caller behind a settle the close
-    // interrupted waits for its group to leave RESETTING, and once the close has run nothing else wakes it. The unlocks
-    // inside the teardown wake no one, since the teardown has not yet decided what it leaves.
+    // interrupted waits for its group to leave RESETTING, and once the close has run only this wake ends that wait,
+    // unless the restore gives the group back RESETTING to that settle: the woken caller then parks again, and the
+    // settle's own notify ends the wait. The unlocks inside the teardown wake no one, since the teardown has not yet
+    // decided what it leaves.
     std::array<std::unique_lock<std::mutex>, ARENA_ALLOCATOR_GROUP_COUNT> group_locks;
 
     const auto lock_groups = [&]() {
@@ -31923,8 +31925,9 @@ bool unified_cache::arena_destroy() {
     //   - The group was not RESETTING: no settle was in flight, there is nothing to take over, and the group only gets
     //     its state back.
     // The four group locks exclude every allocation, settle step and publication while this runs. It is noexcept, as
-    // is everything it calls: none of it allocates (the one ERROR line goes through ggml's C logger), and a mutex
-    // error inside it is a program bug, not a condition a refusal could recover from.
+    // is everything it calls: nothing in it throws. Its bookkeeping allocates nothing, and its one ERROR line goes
+    // through ggml's C logger, which may allocate for a long line and reports no failure. A mutex error inside it is a
+    // program bug, not a condition a refusal could recover from.
     const auto restore = [&]() noexcept {
         for (size_t i = 0; i < zone_count; ++i) {
             const auto zone = static_cast<vram_zone_id>(i);

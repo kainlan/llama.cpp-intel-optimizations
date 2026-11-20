@@ -16,7 +16,8 @@ the close and the first free restores, under every group lock; every exit after 
 through the one helper that also wakes the threads parked on a group's state; no refusal after a chunk was freed
 restores; the restore reopens what it retired instead of building a fresh authority, finishes an interrupted settle
 with the settle's own reset and never over a live allocation, and cannot throw; reopening keeps every record and
-lease; a leased chunk never reaches the free; no assert or abort is left in the teardown; the test hooks are read
+lease; a leased chunk never reaches the free; each chunk's lease wait ends at the drain wait's timeout, which a
+test can shorten; no assert or abort is left in the teardown; the test hooks are read
 only in private-testing builds; a refusal that frees no chunk says whether an earlier teardown left the arena partly
 freed; and only the two causes found after a chunk was freed read as closed.
 
@@ -153,6 +154,11 @@ PARTLY_FREED_EXIT = f"release_groups(); return refuse({UNFREED}); }}"
 
 FREE_LOOP = "for (size_t ci = 0; ci < arena_chunks_.size(); ++ci) {"
 LEASE_WAIT = "while ((outstanding = c.lease_count.load()) > 0 && std::chrono::steady_clock::now() <= deadline) {"
+LEASE_DEADLINE = ("const auto deadline = std::chrono::steady_clock::now() + "
+                  "std::chrono::milliseconds(drain_timeout_ms);")
+DRAIN_TIMEOUT_SOURCE = ("#if defined(GGML_SYCL_PRIVATE_TESTING) const uint32_t drain_timeout_ms = "
+                        "g_test_arena_drain_timeout_ms.load(std::memory_order_acquire); #else "
+                        "constexpr uint32_t drain_timeout_ms = 5000; #endif")
 LEASED = "const bool leases_outstanding = outstanding > 0;"
 LEASE_GUARD = "if (leases_outstanding) {"
 TEST_GUARD = "else if (fail_for_test) {"
@@ -471,6 +477,18 @@ def claim_a_leased_chunk_is_never_freed(uc: str) -> bool:
     )
 
 
+def claim_the_lease_wait_is_the_drain_timeout(uc: str) -> bool:
+    """Each chunk's lease wait ends at the drain wait's timeout: 5000 ms outside private testing, and the knob a test
+    sets inside it, so a test that shortens the drain wait shortens this one too."""
+    d = destroy(uc)
+    loop = free_loop(d)
+    return (
+        -1 < d.find(DRAIN_TIMEOUT_SOURCE) < d.find(FREE_LOOP)
+        and loop.count("deadline =") == 1
+        and ordered(loop, LEASE_DEADLINE, LEASE_WAIT)
+    )
+
+
 def claim_the_teardown_never_aborts(uc: str) -> bool:
     """No assert or abort is left in arena_destroy, its free loop included: a lease that outlives the wait refuses."""
     d = destroy(uc)
@@ -589,6 +607,12 @@ def test_restore_finishes_an_interrupted_settle():
 def test_a_leased_chunk_is_never_freed():
     assert claim_a_leased_chunk_is_never_freed(UC), (
         "arena_destroy() can pass a chunk a lease still holds to sycl::free")
+
+
+def test_the_lease_wait_is_the_drain_timeout():
+    assert claim_the_lease_wait_is_the_drain_timeout(UC), (
+        "arena_destroy()'s wait for the leases on a chunk no longer ends at the drain wait's timeout, so the test knob "
+        "no longer sets it, or the timeout outside private testing is no longer 5000 ms")
 
 
 def test_the_teardown_never_aborts():
@@ -833,6 +857,20 @@ def test_witness_leased_chunk_falls_through_to_the_free():
 def test_witness_lease_count_ignored():
     assert not claim_a_leased_chunk_is_never_freed(
         mutate_in(UC, DESTROY_SIG, LEASED, "const bool leases_outstanding = false;")
+    )
+
+
+def test_witness_lease_wait_fixed_at_five_seconds():
+    assert not claim_the_lease_wait_is_the_drain_timeout(
+        mutate_in(UC, DESTROY_SIG, LEASE_DEADLINE,
+                  "const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);")
+    )
+
+
+def test_witness_drain_timeout_changed_outside_private_testing():
+    assert not claim_the_lease_wait_is_the_drain_timeout(
+        mutate_in(UC, DESTROY_SIG, "constexpr uint32_t drain_timeout_ms = 5000;",
+                  "constexpr uint32_t drain_timeout_ms = 2000;")
     )
 
 
