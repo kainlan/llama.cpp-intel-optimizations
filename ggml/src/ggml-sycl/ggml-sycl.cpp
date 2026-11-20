@@ -4438,7 +4438,6 @@ static sycl::event ggml_sycl_fill_reordered_gpu(sycl::queue &                   
                                                 size_t                           src_size,
                                                 const void *                     ctx_void,
                                                 const std::vector<sycl::event> & deps);
-static bool        ggml_sycl_gpu_reorder_disabled();
 
 static bool ggml_sycl_graph_has_host_inputs(const ggml_cgraph * cgraph) {
     if (!cgraph) {
@@ -6721,35 +6720,6 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         "%d/%zu host-resident\n",
         n_moe_layers, n_experts_per_layer, n_experts_used, expert_weight_bytes / 1024.0, n_host_experts,
         expert_list.size());
-
-    // Pre-allocate a reusable temp VRAM buffer for GPU-side AOS→SOA reorder.
-    // Must happen BEFORE S1-PRELOAD fills VRAM with dense weights, otherwise
-    // per-expert sycl::malloc_device fails and all expert prestaging is lost.
-    // The buffer is reused sequentially by each expert's fill_fn during prestage.
-    // Allocate with ~12.5% margin over the largest expert tensor size.
-    if (expert_weight_bytes > 0 && !ggml_sycl_gpu_reorder_disabled()) {
-        const size_t               reorder_temp_size = expert_weight_bytes + (expert_weight_bytes / 8);
-        ggml_sycl::unified_cache * gpu0_cache        = ggml_sycl::get_unified_cache_for_device(device);
-        if (gpu0_cache) {
-            gpu0_cache->reserve_reorder_temp(reorder_temp_size);
-        }
-        // Also reserve on secondary GPUs (for Phase 2 prestage)
-        if (g_moe_multi_gpu_active.load(std::memory_order_acquire) ||
-            (ggml_sycl_has_global_plan() &&
-             ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner())))) {
-            const int total_gpus = ggml_sycl_info().total_gpu_count;
-            for (int d = 1; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
-                if (ggml_sycl_has_global_plan() &&
-                    !ggml_sycl_placement_plan_uses_device((*ggml_sycl_global_plan_owner()), d)) {
-                    continue;
-                }
-                ggml_sycl::unified_cache * sec_cache = ggml_sycl::get_unified_cache_for_device(d);
-                if (sec_cache) {
-                    sec_cache->reserve_reorder_temp(reorder_temp_size);
-                }
-            }
-        }
-    }
 
     // A fresh routed-expert table for this model, sized from its own blocks and experts: the counts of an earlier
     // model in this process stay with the records that were counting into them. This init runs again until it
@@ -36211,12 +36181,6 @@ static sycl::event ggml_sycl_fill_reordered_gpu(sycl::queue &                   
                                      ctx->type, ctx->ncols, ctx->nrows, ctx->src_bytes, { dma_event });
 
     return reorder_event;
-}
-
-// Check env var to force CPU reorder path (for A/B testing)
-static bool ggml_sycl_gpu_reorder_disabled() {
-    static const bool disabled = (std::getenv("GGML_SYCL_NO_GPU_REORDER") != nullptr);
-    return disabled;
 }
 
 static bool ggml_sycl_xmx_tiled_enabled_for_device(int device_id) {

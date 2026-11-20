@@ -322,7 +322,6 @@ COUNTED = (
     "count(scratch_pool_ptr_);",
     "count(onednn_weights_scratch_);",
     "count(onednn_activations_scratch_);",
-    "count(reorder_temp_buffer_);",
     "std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);",
     "for (const auto * slots : { &pp_moe_onednn_scratch_slots_, &pp_moe_onednn_retired_slots_ }) {",
     "count(slot.weight);",
@@ -348,7 +347,6 @@ POINTER_TESTS = (
     "scratch_pool_ptr_ != nullptr",
     "onednn_weights_scratch_ != nullptr",
     "onednn_activations_scratch_ != nullptr",
-    "reorder_temp_buffer_ != nullptr",
     "!persistent_scratches_.empty()",
     "!pp_moe_onednn_scratch_slots_.empty()",
 )
@@ -587,8 +585,10 @@ def test_witness_gate_tests_the_pointer():
     )
 
 
-def test_witness_gate_skips_the_reorder_temp():
-    assert not claim_scratch_blocks_only_inside_the_arena(mutate_in(UC, COUNT_SIG, "count(reorder_temp_buffer_);", ""))
+def test_witness_gate_skips_the_activations_scratch():
+    assert not claim_scratch_blocks_only_inside_the_arena(
+        mutate_in(UC, COUNT_SIG, "count(onednn_activations_scratch_);", "")
+    )
 
 
 def test_witness_gate_restores_a_pointer_test():
@@ -597,7 +597,7 @@ def test_witness_gate_restores_a_pointer_test():
             UC,
             ENSURE_SIG,
             "if (!zone_arena_rebuild_allowed(holders)) {",
-            "if (!zone_arena_rebuild_allowed(holders) || reorder_temp_buffer_ != nullptr) {",
+            "if (!zone_arena_rebuild_allowed(holders) || onednn_activations_scratch_ != nullptr) {",
         )
     )
 

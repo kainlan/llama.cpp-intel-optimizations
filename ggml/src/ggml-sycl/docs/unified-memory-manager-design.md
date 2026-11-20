@@ -336,7 +336,6 @@ The `unified_cache` class (unified-cache.hpp/cpp, ~1400 lines header, ~9100 line
 - `compute_arena_ptr_`: Single pre-reserved VRAM block for compute scratch
 - `scratch_pool_ptr_`: Pre-allocated VRAM for per-op temporaries
 - `onednn_weights_scratch_` / `onednn_activations_scratch_`: Fixed buffers for oneDNN FP16 path
-- `reorder_temp_buffer_`: Single buffer for GPU-side AOS->SOA reorder
 - `persistent_scratches_`: Named scratch buffers for persistent TG kernel
 
 **Host-side pools**:

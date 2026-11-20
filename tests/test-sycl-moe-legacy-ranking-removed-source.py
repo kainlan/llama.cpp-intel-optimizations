@@ -10,7 +10,8 @@ by block number, so none of those ranks reached a plan. Their only consumers wer
 placement plan), the opt-in adaptive prestage and the eviction frequency term, which read the profile's epoch counts.
 This gate holds the removal and what must survive it:
 
-  L1  no removed symbol, environment switch or log tag appears anywhere in the backend sources (comments included);
+  L1  no removed symbol, environment switch or log tag appears anywhere in the backend sources (comments included),
+      including the code that existed only to serve the removed prestage;
   L2  the block-keyed rank API stays: get_expert_popularity_rank, set_expert_popularity_rank and
       is_expert_popularity_initialized are declared once in unified-cache.hpp and defined once in ggml-sycl.cpp, and
       build_moe_triplet_groups still reads them;
@@ -64,6 +65,14 @@ REMOVED_WORDS = (
     "GGML_SYCL_ADAPTIVE_PRESTAGE_INTERVAL",
     "GGML_SYCL_ADAPTIVE_PRESTAGE_THRESHOLD",
     "get_expert_frequency",
+    # The MoE reorder temp buffer, reserved for the prestage's GPU reorder and read by nothing else.
+    "reserve_reorder_temp",
+    "release_reorder_temp",
+    "get_reorder_temp_buffer",
+    "get_reorder_temp_size",
+    "reorder_temp_buffer_",
+    "ggml_sycl_gpu_reorder_disabled",
+    "GGML_SYCL_NO_GPU_REORDER",
 )
 REMOVED_TAGS = ("[MOE-WARMUP]", "[MOE-GATE-NORM]", "[MOE-RERANK]", "[ADAPTIVE-PRESTAGE]")
 

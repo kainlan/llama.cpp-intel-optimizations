@@ -2572,8 +2572,7 @@ Z9_SIZING_FILES = ("zone-sizing.cpp", "unified-cache.cpp")
 Z9_SITES = (
     ("load_reorder_temp_bytes", (("convert.cpp", "convert_alloc_device_scratch"), ("ggml-sycl.cpp", "arena_device_alloc"),
                                  ("ggml-sycl.cpp", "ggml_sycl_fill_xmx_tiled"), ("ggml-sycl.cpp", "ggml_sycl_fill_xmx_tiled_host"),
-                                 ("ggml-sycl.cpp", "sycl_unified_device_temp_alloc"),
-                                 ("unified-cache.cpp", "unified_cache::reserve_reorder_temp"))),
+                                 ("ggml-sycl.cpp", "sycl_unified_device_temp_alloc"))),
     ("woq_packed_bytes", (("gemm.hpp", "woq_gemm_q4_0_impl"),)),
     ("mmq_work_counter_bytes", (("mmq.cpp", "get_mmq_work_counter"),)),
     ("set_rows_stage_bytes", (("set_rows.cpp", "ggml_sycl_set_rows_stage_ptr"),)),
@@ -5713,9 +5712,10 @@ def matrix_cases_s2d3():
         "constexpr auto REAP_NOW = RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER;\n" + INTERIM), "FAIL", "X-LATCH", "latch:k", planted=False))
     A(Case("30", "the COMPLETE mode behind a macro: the latch fails", plant(
         "#define REAP_NOW RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER\n" + INTERIM), "FAIL", "X-LATCH", "latch:k", planted=False))
-    # m-1: the sixth allocation site of witness 9
-    A(Case("9", "load_reorder_temp_bytes defined, but unified_cache::reserve_reorder_temp does not call it", plant(
-        "size_t load_reorder_temp_bytes(int n) {\n    return (size_t) n;\n}\n"), "FAIL", "Z9-SITE", "unified_cache::reserve_reorder_temp"))
+    # The last allocation site of witness 9's first subject is checked like the others
+    A(Case("9", "load_reorder_temp_bytes defined, but sycl_unified_device_temp_alloc does not call it", plant(
+        "size_t load_reorder_temp_bytes(int n) {\n    return (size_t) n;\n}\n"), "FAIL", "Z9-SITE",
+        "sycl_unified_device_temp_alloc"))
     # m-4: an allowlist entry can never exempt an S2d finding that must be fixed
     for code in ("X-LATCH", "P-ROUTE", "P-CHARGE"):
         A(Case("m5", "an allowlist entry for %s is refused" % code, lambda f: f, "FAIL", "allowlist", "never exempted",

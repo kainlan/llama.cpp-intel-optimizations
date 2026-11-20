@@ -8635,22 +8635,6 @@ bool unified_cache::shutdown_resources() {
         onednn_activations_scratch_size_ = 0;
     }
 
-    // Free reorder temp buffer BEFORE arena destroy.
-    if (reorder_temp_buffer_) {
-        if (reorder_temp_owner_.valid()) {
-            reorder_temp_owner_ = {};
-        } else if (had_arena && vram_owns(reorder_temp_buffer_)) {
-            zone_free(vram_zone_id::SCRATCH, reorder_temp_buffer_);
-        } else {
-            GGML_LOG_ERROR("[UNIFIED-CACHE] direct reorder temp buffer missing alloc_handle owner ptr=%p\n",
-                           reorder_temp_buffer_);
-            GGML_ASSERT(false && "direct reorder temp buffer missing alloc_handle owner");
-        }
-        reorder_temp_buffer_ = nullptr;
-        reorder_temp_size_   = 0;
-        reorder_temp_owner_  = {};
-    }
-
     // PP oneDNN slots are cache-owned RUNTIME allocations. Refuse to tear
     // down beneath a caller that still owns a claimed generation.
     //
@@ -25088,63 +25072,6 @@ bool unified_cache::get_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_
     return true;
 }
 
-bool unified_cache::reserve_reorder_temp(size_t size_bytes) {
-    // Already reserved with sufficient size?
-    if (reorder_temp_buffer_ && reorder_temp_size_ >= size_bytes) {
-        return true;
-    }
-
-    // Allocate and validate a replacement before disturbing the published buffer.
-    // Called from moe_hybrid_init_once under std::call_once — single-threaded.
-    if (arena_active()) {
-        alloc_request req{};
-        req.queue                               = &queue_;
-        req.device                              = ggml_sycl_get_device_id_from_queue(queue_);
-        req.size                                = size_bytes;
-        req.intent.role                         = alloc_role::STAGING;
-        req.intent.category                     = runtime_category::STAGING;
-        req.intent.cohort_id                    = "moe-reorder-temp";
-        req.intent.constraints.must_device      = true;
-        req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
-        allocation_result allocation = unified_allocate_owner(req);
-        if (!allocation) {
-            GGML_LOG_WARN("[UNIFIED-CACHE] failed to reserve GPU reorder temp buffer (%.1f MB)\n",
-                          size_bytes / (1024.0f * 1024.0f));
-            return false;
-        }
-        mem_handle replacement = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
-        const auto resolved = replacement.resolve(req.device);
-        if (!resolved.ptr || !resolved.on_device) {
-            GGML_LOG_WARN("[UNIFIED-CACHE] failed to resolve GPU reorder temp buffer owner (%.1f MB)\n",
-                          size_bytes / (1024.0f * 1024.0f));
-            return false;
-        }
-        if (reorder_temp_buffer_ && !reorder_temp_owner_.valid()) {
-            if (vram_owns(reorder_temp_buffer_)) {
-                zone_free(vram_zone_id::SCRATCH, reorder_temp_buffer_);
-            } else {
-                GGML_LOG_ERROR("[UNIFIED-CACHE] direct reorder temp buffer missing owner ptr=%p\n",
-                               reorder_temp_buffer_);
-                GGML_ASSERT(false && "direct reorder temp buffer missing owner");
-            }
-        }
-        reorder_temp_owner_  = std::move(replacement);
-        reorder_temp_buffer_ = resolved.ptr;
-        reorder_temp_size_   = size_bytes;
-        GGML_LOG_INFO("[UNIFIED-CACHE] Reserved GPU reorder temp buffer (unified): %.1f MB\n",
-                      size_bytes / (1024.0f * 1024.0f));
-        return true;
-    }
-    // Arena is not active — cannot allocate reorder temp buffer.
-    // This is acceptable at early model-load before arena is configured;
-    // the reorder path will be disabled for this invocation.
-    GGML_LOG_WARN(
-        "[UNIFIED-CACHE] reserve_reorder_temp: arena inactive, cannot allocate "
-        "%.1f MB reorder temp buffer — reorder path disabled\n",
-        size_bytes / (1024.0f * 1024.0f));
-    return false;
-}
-
 bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, size_t activations_size) {
     unified_cache * cache = get_unified_cache_for_device(device_id);
     if (!cache) {
@@ -32462,7 +32389,7 @@ size_t unified_cache::arena_held_onednn_pair_bytes() {
 
 void unified_cache::arena_count_scratch_holders(zone_arena_holders & holders) {
     // A scratch buffer holds the arena only when its pointer lies inside it: one allocated outside keeps its own
-    // memory through a rebuild. The four single buffers are read without their locks, as this check always read them;
+    // memory through a rebuild. The three single buffers are read without their locks, as this check always read them;
     // the reserve path that asks for a rebuild holds the oneDNN scratch lock, so taking it here would deadlock.
     auto count = [&](const void * ptr) {
         if (ptr == nullptr) {
@@ -32477,7 +32404,6 @@ void unified_cache::arena_count_scratch_holders(zone_arena_holders & holders) {
     count(scratch_pool_ptr_);
     count(onednn_weights_scratch_);
     count(onednn_activations_scratch_);
-    count(reorder_temp_buffer_);
     // The ring's slot buffers inside the arena, kept to tell them from every other allocation in the groups below.
     std::vector<const void *> ring_in_arena;
     {
@@ -32698,20 +32624,6 @@ bool unified_cache::release_onednn_scratch_pair() {
     return true;
 }
 
-void unified_cache::release_reorder_temp() {
-    if (reorder_temp_buffer_ != nullptr && !reorder_temp_owner_.valid()) {
-        if (!vram_owns(reorder_temp_buffer_)) {
-            GGML_LOG_ERROR("[UNIFIED-CACHE] reorder temp buffer ptr=%p has no owner and is no zone block; kept\n",
-                           reorder_temp_buffer_);
-            return;
-        }
-        zone_free(vram_zone_id::SCRATCH, reorder_temp_buffer_);
-    }
-    reorder_temp_owner_  = {};
-    reorder_temp_buffer_ = nullptr;
-    reorder_temp_size_   = 0;
-}
-
 unified_cache_last_release unified_cache::release_for_no_live_model(const char *                site,
                                                                     unified_cache_release_cause cause) noexcept {
     int dev_id = -1;
@@ -32747,7 +32659,6 @@ unified_cache_last_release unified_cache::release_for_no_live_model(const char *
                 dev_id, site);
             return unified_cache_last_release::PAIR_HELD;
         }
-        release_reorder_temp();
 #if GGML_SYCL_DNNL
         // The pooled Graph scratch is sized for the last model's attention shape. Its blocks lie outside the arena.
         onednn_graph_scratch_reclaim_pool("last release");

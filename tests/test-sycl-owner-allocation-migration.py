@@ -351,9 +351,10 @@ CACHE_FROM_LEGACY_SITES = Counter({
     ("out = std::make_shared<mem_handle>(detail::", "std::move(moe_owner)"): 1,  # moe_preallocate_inference_buffers
 })
 CACHE_OWNER_FIRST_SITES = Counter({
-    # The eighth (llama.cpp-42zj) is unified_cache::arm_cpu_job_input_marker's word: a CONTROL request with
-    # must_host_pinned and no private token, so section 3.1 classifies it CACHE_SUBALLOCATION, a pinned-pool slice.
-    ("allocation_result allocation =", "req"): 8,
+    # One is unified_cache::arm_cpu_job_input_marker's word: a CONTROL request with must_host_pinned and no private
+    # token, so section 3.1 classifies it CACHE_SUBALLOCATION, a pinned-pool slice. The MoE reorder temp buffer's
+    # reservation was another until it left with the prestage that read it: 8 -> 7.
+    ("allocation_result allocation =", "req"): 7,
     ("allocation_result host_allocation =", "host_req"): 1,
     ("allocation_result result =", "req"): 1,  # unified_cache_zone_alloc
     ("allocation_result", "const alloc_request & req"): 1,  # the definition of unified_allocate_owner itself
@@ -460,8 +461,6 @@ with gate('staging-legacy-names-forbidden'):
 # unified-cache and pp-stage staging owners. The common.hpp one (the MMQ src1 Q8_1 buffer)
 # is the shared planned-scratch helper pinned above; it is part of this seam too.
 STAGING_BLOCKS = (
-    ("cache reserve_reorder_temp", CACHE, "bool unified_cache::reserve_reorder_temp",
-     "bool unified_cache::reserve_persistent_scratch", "reorder_temp_owner_  = std::move(replacement)"),
     ("cache fill_with_host_copy", CACHE, "bool unified_cache_fill_with_host_copy",
      "bool unified_cache_copy_from_host_async", None),
     ("common planned scratch", COMMON, PLANNED_SCRATCH_HELPER[0], PLANNED_SCRATCH_HELPER[1],

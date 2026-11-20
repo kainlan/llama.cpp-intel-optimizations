@@ -120,7 +120,6 @@
     {"code": "D-FORBID", "key": "unified-cache.cpp::unified_cache::onednn_graph_scratch_alloc_direct_locked::declaration:req:08608a9d#0"},
     {"code": "D-FORBID", "key": "unified-cache.cpp::unified_cache::reserve_compute_arena::declaration:req:90c2dd19#0"},
     {"code": "D-FORBID", "key": "unified-cache.cpp::unified_cache::reserve_persistent_scratch::declaration:req:322ed082#0"},
-    {"code": "D-FORBID", "key": "unified-cache.cpp::unified_cache::reserve_reorder_temp::declaration:req:f493f8b5#0"},
     {"code": "D-FORBID", "key": "unified-cache.cpp::unified_cache::reserve_scratch_pool::declaration:req:332ceab2#0"},
     {"code": "D-FORBID", "key": "unified-cache.cpp::unified_cache_allocate_moe_q8_1_graph_scratch::declaration:req:00db8199#0"},
     {"code": "D-FORBID", "key": "unified-cache.cpp::unified_cache_zone_allocate::declaration:req:180eda9f#0"},
