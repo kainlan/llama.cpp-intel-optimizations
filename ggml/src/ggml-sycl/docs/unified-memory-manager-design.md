@@ -492,7 +492,7 @@ Priority 2 (evictable under moderate pressure):
   - Shared MoE expert weights
 
 Priority 3 (readily evictable):
-  - Cold MoE expert weights (LFU-ordered)
+  - Cold MoE expert weights (least recently used first)
   - Staging buffers
 
 Priority 4 (always host-eligible):
