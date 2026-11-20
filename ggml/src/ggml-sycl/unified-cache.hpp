@@ -2957,6 +2957,15 @@ onednn_graph_scratch_planned_shape unified_cache_publish_planned_onednn_graph_sc
     const placement_kv_info &            kv_info,
     const ggml_sycl_placement_envelope * envelope);
 
+// The one definition of the oneDNN PP scratch pair a load plans into the ONEDNN zone (zone_onednn_pp_pair_plan over
+// `maxima`): its activations half is sized at the micro-batch of the Graph scratch shape above, the one the Graph floor
+// that shares the zone is sized at (the load's planning micro-batch when that shape names none). Both formula sites
+// call it: the inventory intake, whose pair is the one the arena sizes the zone from, and the plan's host zone sizing,
+// which reports it, so the two cannot size the zone differently.
+zone_onednn_pp_pair unified_cache_plan_onednn_pp_pair(const path_scoped_maxima &           maxima,
+                                                      const placement_kv_info &            kv_info,
+                                                      const ggml_sycl_placement_envelope * envelope);
+
 // llama.cpp-oyfl: the non-flash-attention batched mul_mat scratch floor.
 //
 // When flash attention is off (or resolves off at runtime), each layer's

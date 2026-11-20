@@ -108,6 +108,13 @@ struct zone_tensor_desc {
     // MUL_MAT operand and so NOT gather-only. The marks are the adapter's to set; a gather-only tensor is
     // excluded from every one of them here, in one place, rather than by each mark's own condition.
     bool   get_rows_only                                  = false;
+
+    // f16 activation bytes per token the oneDNN PP scratch is asked for when it supplies this weight's op
+    // (acquire_onednn_pp_scratch: src1 columns x K x sizeof(f16), so zone_dequant_f16_src1_bytes_per_token(ne[0],
+    // ne[2], ne[3])). Supplied by the adapter for a quantized weight that is not an expert stack, of a type the
+    // scratch is enabled for and the oneDNN PP admission serves. The classifier keeps it only inside the oneDNN
+    // reorder eligible set, the set the pair plan's weights half covers. Zero means "not such a weight".
+    size_t onednn_pp_src1_bytes_per_token = 0;
 };
 
 struct path_scoped_maxima {
@@ -145,6 +152,13 @@ struct path_scoped_maxima {
     // candidates. Both are plain maxima over marked tensors, like mmq_src1_bytes_per_token.
     size_t dequant_f16_weight_bytes         = 0;
     size_t dequant_f16_src1_bytes_per_token = 0;
+
+    // Widest f16 activation row (bytes per token) the oneDNN PP scratch is asked for: the maximum of the adapter's
+    // marks (zone_tensor_desc::onednn_pp_src1_bytes_per_token) over the oneDNN reorder eligible set onednn_reorder is
+    // the maximum over, gather-only tensors excluded. Not dequant_f16_src1_bytes_per_token: that one covers the ops
+    // the scratch does NOT supply. Times the planning micro-batch it is the planned pair's activations half
+    // (zone_onednn_pp_pair_plan).
+    size_t onednn_pp_src1_bytes_per_token = 0;
 };
 
 // A (type, ne) group must have at least this many members to be a per-layer
@@ -421,11 +435,11 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
 // Whether a dense weight's f16 copies are planned into the dequant buffers because the oneDNN PP scratch will not
 // supply them (llama.cpp-8ony). The scratch supplies an op when it is enabled for the weight's type and the pair
 // fits the ONEDNN zone; the zone's own plan covers exactly the per-layer weights (zone_is_onednn_reorder_eligible).
-// An eligible weight of an enabled type is therefore supplied, and needs no dequant plan, on the condition that its
-// activations half is within the placeholder the zone is sized with (the largest eligible STORED weight) and the pair
-// is within the pair bound. That condition fails at a large -ub (Mistral ffn_down at -ub 4096 needs ~234 MB against a
-// ~223 MB bound): the op is then refused by the scratch, draws the dequant buffers, and nothing planned them. Closing
-// that gap needs the real n_ubatch at planning time, which is llama.cpp-fkpg; until then it is walk-grown.
+// An eligible weight of an enabled type is therefore supplied, and needs no dequant plan, on the condition that the
+// pair is within the pair bound. The pair plan's activations half is sized at the micro-batch the load planned the
+// context for (zone_onednn_pp_pair_plan), so the condition holds up to that micro-batch. A context that later runs a
+// wider micro-batch than the load planned (the zone cannot grow once weights are live) can push an op's pair over the
+// bound: the op is then refused by the scratch, draws the dequant buffers, and the graph-entry walk grows them.
 // A weight the zone was not sized for (the LM head, a tied embedding) or a type the scratch is off for
 // (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=0) draws the dequant buffers instead. A head that the zone's slack happens to
 // supply is still planned: whether the head runs on many rows or on the last row only is unknown until llama.cpp-fkpg
@@ -499,6 +513,28 @@ void zone_onednn_scratch_reserve_target(bool     arena_active,
 // `bare_plan_bytes` and `graph_floor_bytes` are the stored figures the zone was sized from; neither is recomputed
 // by the caller. A floor larger than the capacity leaves only the plan. Pure.
 size_t zone_onednn_pp_pair_bound(size_t capacity_bytes, size_t bare_plan_bytes, size_t graph_floor_bytes);
+
+// The oneDNN PP scratch pair the ONEDNN zone is planned to hold, beside the Graph SDPA floor that shares the zone.
+struct zone_onednn_pp_pair {
+    size_t   weights_bytes        = 0;      // the largest dequantized eligible weight (onednn_reorder)
+    size_t   activations_bytes    = 0;      // n_ubatch rows of src1_bytes_per_token
+    size_t   src1_bytes_per_token = 0;      // the row it was sized from (onednn_pp_src1_bytes_per_token)
+    uint32_t n_ubatch             = 0;      // the micro-batch it was sized at
+    bool     sized                = false;  // false: the activations half overflowed and is 0
+};
+
+// The planned pair: the weights half `reorder_weights_bytes`, and an activations half of `n_ubatch` rows of the widest
+// f16 activation row the scratch is asked for (`src1_bytes_per_token`). That is exactly what an op over a full
+// micro-batch asks acquire_onednn_pp_scratch for (src1 columns x K x sizeof(f16)), unaligned like the request, so the
+// first reservation covers every op the plan sized and is never replaced inside a graph. It is NOT the largest
+// eligible weight as stored (path_scoped_maxima::onednn_eligible): that figure has no relation to a micro-batch, and
+// once the zone is exactly pair + Graph floor a pair planned with it cannot merge the ops' halves inside the bound.
+// The caller passes the micro-batch the Graph floor beside the pair is sized at, so the zone holds both for one shape.
+// When the activations half or the pair's sum would overflow, the activations half is 0 and `sized` is false: the
+// zone is then planned for the weights half alone, and an op above the bound is refused at acquire. Pure.
+zone_onednn_pp_pair zone_onednn_pp_pair_plan(size_t   reorder_weights_bytes,
+                                             size_t   src1_bytes_per_token,
+                                             uint32_t n_ubatch);
 
 // The two figures the ONEDNN zone was sized from, kept together as ONE snapshot (llama.cpp-8ony): the pair's own
 // plan and the Graph SDPA floor that shares the zone. Each is a plain number the planner can overwrite for the next
