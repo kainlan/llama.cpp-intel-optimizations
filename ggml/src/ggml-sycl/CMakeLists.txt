@@ -4878,6 +4878,13 @@ set_tests_properties(test-sycl-bf16-mul-mat-backend PROPERTIES
 # test-thread-safety, test-backend-ops). RUN_SERIAL TRUE is still set below,
 # matching every other gpu-serial-labelled GPU test in this repo.
 #
+# It also checks that the buffer releases the extras its init_tensor made for
+# its own K/V tensors: it reserves a small VRAM arena when the process has
+# none and counts mem_handle chunk leases at the tensor_extra site before the
+# buffer, after init and after the free. Because it allocates on the GPU it
+# carries `mem-handle`, so the form 2 sweep leaves it to the serial
+# `-L 'cache|mem-handle'` family.
+#
 # Shares the enclosing `if (NOT GGML_BACKEND_DL)` opened above for
 # test-sycl-compute-buffer-extra-reuse rather than opening a redundant nested
 # one -- both tests close together at the single endif below.
@@ -4903,7 +4910,7 @@ target_compile_definitions(test-sycl-kv-view-extra-reuse PRIVATE
 target_link_libraries(test-sycl-kv-view-extra-reuse PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-kv-view-extra-reuse COMMAND test-sycl-kv-view-extra-reuse)
 set_tests_properties(test-sycl-kv-view-extra-reuse PROPERTIES
-    LABELS "sycl;memory;kv;tensor-extras;gpu-serial"
+    LABELS "sycl;memory;kv;tensor-extras;gpu-serial;mem-handle"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77

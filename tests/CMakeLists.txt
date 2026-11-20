@@ -4714,6 +4714,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for the tiered KV buffer owning the tensor extras its init_tensor makes for its own K and V tensors:
+# both base-tensor branches record the extra they make in the buffer's list, and the free releases that list before
+# the vmem pool and the layer owners go. Host-only, reads the sources as text; the device case is the extra-release
+# case of test-sycl-kv-view-extra-reuse. Same registration shape as the gate above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kv-owned-extras-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-owned-extras-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Source gate for keeping the zones when a rebuild something live blocks lacks only the oneDNN Graph floor, and for a
 # failed load's put-back of the zone plan; the pin's docstring lists every check. Host-only, reads the sources as text.
 # Same registration shape as the gate above.
