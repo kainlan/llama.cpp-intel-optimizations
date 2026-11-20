@@ -2998,9 +2998,13 @@ state, which the abort of a refused load puts back, together with the two-card
 MoE flag its planner sets (`g_moe_multi_gpu_active`). The decide pass is not
 free of device effects. The planner's zone decision sizes the VRAM arena's
 zones, and it may rebuild an arena nothing holds for larger zones, at the entry
-ensure or at the micro-batch's grow leg. A refused load keeps the rebuilt arena,
-or leaves the device with no arena when the reserve after the teardown failed. A
-plan that needs the secondary MoE devices also creates their shared queues and
+ensure or at the micro-batch's grow leg. When no model is live, the refused
+load's abort ends with the release of the last model (below), which tears that
+arena down again unless something still holds it, and the next load's start
+reserves the early arena; the end of the refused load reserves nothing. While a
+model is live, on this device or the other (liveness is process-wide), a refused
+load keeps the rebuilt arena, or leaves the device with no arena when the
+reserve after the teardown failed. A plan that needs the secondary MoE devices also creates their shared queues and
 caches, which stay. The effect pass then runs, device by device and each from
 the snapshot that device staged: the stale ring's release, the layer streaming
 the late pass decided on, and the late pass's host zones
@@ -3095,13 +3099,17 @@ for an automatic micro-batch, so the auto-ubatch trial is unchanged.
 `llama-bench` names the micro-batch from `-b` and `-ub` alone, not clamped by
 each test's context, and names none on a build without the SYCL backend. So
 the prompt and generation tests of one `-b`/`-ub` pair share one model, and it
-reloads the model only when the named micro-batch changes. A reload re-plans
-the experts but not the arena's zones. The arena outlives the model and keeps a
-zone that is larger than a new plan needs. It rebuilds only a zone that is too
-small, never to shrink one. So in a `-ub 2048,512` or `-ub 2048,auto` sweep the later
-instances plan against the RUNTIME zone the 2048 load grew, and keep fewer
-experts on the device than a fresh process would. Such a load prints one WARN
-line after its plan, when the live zone is larger than the zone the arena
+reloads the model only when the named micro-batch changes. It frees the model
+before it loads the next one, and with no other model live that free is the
+release of the last model: the arena is torn down, and the reload reserves the
+early arena at its start and plans its zones as a fresh process would. So each
+instance of a `-ub 2048,512` or `-ub 2048,auto` sweep plans its own zones. An
+arena that something still holds is kept, and a kept arena keeps a zone that is
+larger than a new plan needs: it rebuilds only a zone that is too small, never
+to shrink one. A load that plans against such a zone (one a model still live in
+the process grew, or one a refused load's buffers still held when it ended)
+keeps fewer experts on the device than a fresh process would, and prints one
+WARN line after its plan, when the live zone is larger than the zone the arena
 reserves for its own plan (`zone_runtime_kept_above_plan()`):
 
 ```
@@ -3109,8 +3117,9 @@ reserves for its own plan (`zone_runtime_kept_above_plan()`):
 process grew it, and the routed experts are planned against the grown zone
 ```
 
-The first load of a process never prints it, because its zone is the one its
-own plan sized. Re-planning the zone at such a load is future work.
+The first load of a process never prints it, and neither does a load after the
+release of the last model, because its zone is the one its own plan sized.
+Re-planning a zone that a live model's arena keeps is future work.
 
 That reserved zone is one figure, from one function. The function
 `zone_runtime_reserved_bytes()` takes the larger of the floor and the
@@ -3421,6 +3430,40 @@ the publish paths set is restored and that the restore keeps a later publish,
 `test-sycl-runtime-alloc`) drives the record, and arm (e) of
 `test-sycl-plan-dry-run` stages a refused load beside a live RUNTIME-zone
 allocation.
+
+**The release of the last model.** The per-device cache lives for the process,
+but nothing in it stays sized for a model once no model is live. The model
+release hook, when it drops the last model, and a failed load's abort, when no
+model is live, run one step last (`ggml_sycl_release_last_model_effects()`),
+after each has dropped and put back what its model published. Each existing
+cache gives back what it sized for a model
+(`unified_cache::release_for_no_live_model()`): it waits once for the device's
+queued work, then releases the PP MoE oneDNN ring, the oneDNN scratchpad pair
+and the reorder temp, reclaims the graph scratch and the deferred frees, and
+tears the arena down when nothing holds it. An arena nothing holds is released,
+its device memory goes back to the card, and the next load's start reserves the
+early arena from start values (`ggml_sycl_load_start_reserve_released_arenas()`).
+A start reserve that fails refuses that load by name
+(`[SYCL] model load refused at its start: <reason>`), and the end of a refused
+load reserves nothing. A device whose cache emptied then holds the published
+terms a device no load has planned on reads (`load_published_terms{}.restore()`,
+under `g_tensor_inventory_mutex`), so the next load plans and builds as the
+first load of a process does, and the two-card MoE flag goes back to its start
+once every cache emptied. Nothing is reaped or forced. A claimed ring slot, a
+reserved oneDNN pair or a held arena keeps what it holds, its cache keeps the
+terms that describe it, and the step names the holder at ERROR
+(`[VRAM-ARENA] last release on device <D> (<site>): ...`); at a failed load's
+abort, an arena the failed load's own buffers hold is a WARN, and it stays
+until a later release finds nothing holding it. A teardown that refuses is an
+ERROR with its cause. Liveness is process-wide, so a model live on either card
+keeps every device's arena, and the entry ensure's last resort (above) stays
+reachable for that case. `tests/test-sycl-last-release-source.py` pins the
+wiring, `last_release_empties_the_arena` in the
+`sycl-runtime-alloc-last-release-empties-the-arena` ctest (binary
+`test-sycl-runtime-alloc`) drives the step and its refusals on a hand-built
+cache, and arm (j) of `test-sycl-plan-dry-run` stages a refused load with no
+model live and checks that the next load's start rebuilds the first load's
+zones.
 
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
 holds the compute term the load measured at the context and micro-batch the

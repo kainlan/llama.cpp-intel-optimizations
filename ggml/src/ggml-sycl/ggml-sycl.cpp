@@ -18907,8 +18907,9 @@ void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t              
 
 // A load whose plan was packed against a RUNTIME zone an earlier load in this process grew says so, once, after its
 // late plan: the arena keeps a zone larger than a plan needs and rebuilds only a zone that is too small, never to
-// shrink one, so the load's routed experts give up the larger zone. The first load of a process sizes its zone for its
-// own plan and never prints it. Caller holds g_tensor_inventory_mutex.
+// shrink one, so the load's routed experts give up the larger zone. Only an arena something still holds is kept: the
+// first load of a process, and a load after the last model's release tore the arena down, size the zone for their own
+// plan and never print it. Caller holds g_tensor_inventory_mutex.
 static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
     auto * cache       = ggml_sycl::get_unified_cache_for_device(device);
     size_t requirement = 0;
