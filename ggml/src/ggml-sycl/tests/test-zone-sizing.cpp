@@ -1323,11 +1323,11 @@ int main() {
         CHECK(w == 120 * mib && a == plan_a, "a request above the plan in one half still grows that half");
         ggml_sycl::zone_onednn_scratch_reserve_target(true, 100 * mib, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib, &w,
                                                       &a);
-        CHECK(w == 40 * mib && a == 10 * mib, "a zone clamped below its plan reserves what is asked, not the plan");
+        CHECK(w == 40 * mib && a == 10 * mib, "a stored plan whose halves do not fit the bound reserves the request");
         ggml_sycl::zone_onednn_scratch_reserve_target(true, 100 * mib, 60 * mib, 5 * mib, plan_w, plan_a, 50 * mib,
                                                       12 * mib, &w, &a);
         CHECK(w == 60 * mib && a == 12 * mib,
-              "a clamped zone still never shrinks what is held: the held-and-requested merge, without the plan");
+              "a stored plan whose halves do not fit the bound never shrinks what is held: held-and-requested merge");
         ggml_sycl::zone_onednn_scratch_reserve_target(false, 0, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib, &w, &a);
         CHECK(w == 40 * mib && a == 10 * mib, "without an arena there is no planned pair to reserve");
         ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib,
@@ -1492,9 +1492,9 @@ int main() {
         // pair the zone cannot hold. The arena floors the zone at the bare plan, so only an inconsistent stored plan
         // reaches this.
         CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, 80 * mib, plan_w, plan_a, 10 * mib, 70 * mib),
-              "clamped zone: a request that fits the bound alone is admitted");
+              "stored plan whose halves do not fit the bound: a request that fits the bound alone is admitted");
         CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 80 * mib, plan_w, plan_a, 10 * mib, 70 * mib + 1),
-              "clamped zone: a request above the bound alone is refused");
+              "stored plan whose halves do not fit the bound: a request above the bound alone is refused");
         // No planned pair, and no arena.
         CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 0, 0, mib / 10, 80 * mib),
               "no planned pair: the request alone is held against the bound");

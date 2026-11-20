@@ -478,10 +478,11 @@ bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool
 // planned). So whenever the planned pair (`planned_weights_bytes`, `planned_activations_bytes`, the halves of the
 // zone_onednn_plan the bound was computed from) fits the bound, max(planned, request) per half must fit it too. The
 // rule reads the planned pair, not the held one, so the op arm and the graph-entry walk, which asks before anything
-// is held, give the same answer; a refused op draws the planned dequant buffers the walk sizes for it. When the
-// planned pair itself does not fit the bound, nothing can merge with it and the request alone is the rule. The arena
-// floors the zone at the bare plan, so that is only a stored plan whose halves exceed the sum they were stored with,
-// not a state it builds from a consistent plan. Pass 0, 0 for no planned pair. Pure.
+// is held, give the same answer; a refused op draws the f16 dequant buffers on the routes that draw them, and the
+// walk sizes them for it at max(plan, demand). When the planned pair itself does not fit the bound, nothing can
+// merge with it and the request alone is the rule. The arena floors the zone at the bare plan, so that is only a
+// stored plan whose halves exceed the sum they were stored with, not a state it builds from a consistent plan.
+// Pass 0, 0 for no planned pair. Pure.
 bool zone_onednn_pp_scratch_planned(bool   arena_active,
                                     size_t pair_bound_bytes,
                                     size_t planned_weights_bytes,
