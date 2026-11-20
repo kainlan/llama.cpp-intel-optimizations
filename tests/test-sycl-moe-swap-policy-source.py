@@ -40,9 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "ggml/src/ggml-sycl/moe-swap-policy.hpp"
 
 # The standard headers a pure computation over vectors and integers needs. Adding one is a decision, so it is listed.
-ALLOWED_INCLUDES = {
-    "algorithm", "array", "cmath", "cstddef", "cstdint", "cstring", "limits", "numeric", "utility", "vector",
-}
+ALLOWED_INCLUDES = {"algorithm", "cstddef", "cstdint", "vector"}
 STATE_KEYWORDS = re.compile(r"\b(?:static|thread_local|extern|mutable|volatile)\b")
 # A C++17 `inline` variable is a global with external linkage and needs none of the words above.
 INLINE = re.compile(r"\binline\b")
@@ -249,11 +247,10 @@ def self_test(raw: str) -> int:
     expect_fail("inline-lambda-variable", "S2", [(ns, ns + "inline auto g_f = [](int a) { return a; };\n")])
     expect_fail("thread-local-scratch", "S2", [(ns, ns + "thread_local std::vector<int> scratch;\n")])
     expect_fail("extern-state", "S2", [(ns, ns + "extern int g_swaps;\n")])
-    expect_fail("mutable-member", "S2", [("    int                            n_blocks  = 0;",
-                                          "    mutable int                    n_blocks  = 0;")])
+    member_anchor = "    // The usage of one cell as of the last absorb;"
+    expect_fail("mutable-member", "S2", [(member_anchor, "    mutable int scratch_n = 0;\n" + member_anchor)])
     expect_fail("atomic-counter", "S2", [(ns, ns + "inline int bump(std::atomic<int> & a) { return ++a; }\n")])
-    tokens_member = "    uint64_t                       tokens    = 0;"
-    expect_fail("mutex-member", "S2", [(tokens_member, "    std::mutex                     lock;\n" + tokens_member)])
+    expect_fail("mutex-member", "S2", [(member_anchor, "    std::mutex lock;\n" + member_anchor)])
     expect_fail("device-use", "S3", [(ns, ns + "inline void * dev(sycl::queue & q) { return nullptr; }\n")])
     expect_fail("malloc-use", "S3", [(ns, ns + "inline void * grab() { return malloc(8); }\n")])
     expect_fail("unified-cache-use", "S3", [(ns, ns + "inline void * grab() { return unified_alloc(8); }\n")])

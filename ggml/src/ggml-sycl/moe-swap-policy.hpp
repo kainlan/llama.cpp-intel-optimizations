@@ -29,8 +29,10 @@
 // Inputs are cumulative counts, as the route counters keep them, not deltas: the state remembers the counts it last
 // saw and absorbs the difference. A count that is lower than the remembered one means the counter restarted, and
 // its new value is taken as the difference. Usage is a sum of differences and decay only happens at a boundary, so
-// absorbing the counts at the boundary instead of at every token gives exactly the value an eager absorb would, and
-// a call that reaches no boundary has nothing to read.
+// absorbing the counts at the boundary instead of at every token gives the value an eager absorb would, as long as
+// no counter restarts and then passes its old value between two boundaries: a counter that read 1000 at the last
+// absorb, was reset, and reached 1200 by the next one looks like a plain increase of 200, which is what is absorbed.
+// A call that reaches no boundary has nothing to read.
 //
 // Determinism. The same state and the same inputs give the same output. Ties in usage go to the lower expert index,
 // the proposals are totally ordered by gain (higher first), then by admitted expert (lower first), then by block
@@ -61,7 +63,10 @@
 
 namespace ggml_sycl {
 
-// The five numbers of the rule. The defaults are the simulated ones. `margin` should not be negative.
+// The five numbers of the rule. The defaults are the simulated ones. The contract: period >= 1, decay in [0, 1],
+// max_swaps >= 0, min_usage and margin finite and margin >= 0. moe_swap_step refuses (MOE_SWAP_STATUS_REJECTED, no
+// state touched) a NaN or out-of-range decay, a NaN or negative margin and a NaN min_usage. A period below 1 and a
+// max_swaps at or below 0 are not errors: the first never reaches a boundary, the second never proposes.
 struct moe_swap_params {
     int    period    = 4;    // decode tokens between boundaries; a value below 1 never reaches one
     double decay     = 0.7;  // usage is multiplied by this at every boundary that was not skipped
@@ -80,6 +85,10 @@ struct moe_swap_proposal {
 
 // A block as the caller sees it at this boundary. The count arrays hold n_experts cumulative counts each; a null
 // array is a block whose counts did not change. A block with a null `resident` is not eligible.
+// The two count arrays are a SNAPSHOT the caller took for this call. The route counters are atomic arrays read one
+// cell at a time, so the caller copies them into plain arrays it owns and reuses call after call; the policy must
+// never be handed memory another thread is writing. The statement that a boundary without a candidate allocates
+// nothing assumes the caller reuses that buffer.
 struct moe_swap_block_input {
     const uint64_t * decode_counts = nullptr;  // cumulative routed (token, expert) pairs of the decode route
     const uint64_t * prompt_counts = nullptr;  // the same for the prompt route
@@ -91,6 +100,7 @@ struct moe_swap_block_input {
 struct moe_swap_call {
     const moe_swap_block_input * blocks       = nullptr;  // n_blocks entries
     int                          n_blocks     = 0;
+    int                          n_experts    = 0;        // experts per block, which must equal the state's
     int                          n_tokens     = 1;  // decode tokens this boundary stands for; ignored after a prompt
     bool                         in_flight    = false;  // an earlier swap has not finished
     bool                         after_prompt = false;  // this boundary follows a prompt pass, not a decode token
@@ -101,8 +111,10 @@ enum moe_swap_status {
     MOE_SWAP_STATUS_SEEDED,     // a prompt pass: counts absorbed, no decay, no proposal
     MOE_SWAP_STATUS_IN_FLIGHT,  // a period boundary skipped because swaps are in flight: no absorb, no decay
     MOE_SWAP_STATUS_ADAPTED,    // a period boundary taken: proposals (possibly none) returned, usage decayed
-    MOE_SWAP_STATUS_REJECTED,   // the call does not fit the state's shape: nothing was touched
+    MOE_SWAP_STATUS_REJECTED,   // a shape or parameter that does not fit the contract: nothing was touched
 };
+
+namespace moe_swap_detail {
 
 // A usage value with its expert, for ranking inside one block.
 struct moe_swap_ranked {
@@ -115,7 +127,10 @@ struct moe_swap_ranked {
 // min_usage and below any difference that matters to the margin.
 constexpr double MOE_SWAP_USAGE_FLOOR = 1e-12;
 
-// Everything the policy remembers between calls. Built once for a model's dimensions and owned by the caller.
+}  // namespace moe_swap_detail
+
+// Everything the policy remembers between calls. Built once for a model's dimensions and owned by the caller. A state
+// with no block or no expert is not a model: every step on it returns MOE_SWAP_STATUS_REJECTED.
 struct moe_swap_state {
     moe_swap_state(int n_blocks_, int n_experts_) :
         n_blocks(n_blocks_ > 0 ? n_blocks_ : 0),
@@ -128,15 +143,15 @@ struct moe_swap_state {
         victs.reserve(static_cast<size_t>(n_experts));
     }
 
-    int                            n_blocks  = 0;
-    int                            n_experts = 0;
-    uint64_t                       tokens    = 0;  // decode tokens seen, the period's clock
-    std::vector<double>            usage;          // decayed usage per (block, expert), as of the last absorb
-    std::vector<uint64_t>          last_decode;    // cumulative decode counts at the last absorb
-    std::vector<uint64_t>          last_prompt;    // cumulative prompt counts at the last absorb
-    std::vector<moe_swap_ranked>   cands;          // scratch: host experts of one block above min_usage
-    std::vector<moe_swap_ranked>   victs;          // scratch: resident experts of one block
-    std::vector<moe_swap_proposal> pool;           // scratch: every block's proposals before the cap
+    int                                           n_blocks  = 0;
+    int                                           n_experts = 0;
+    uint64_t                                      tokens    = 0;  // decode tokens seen, the period's clock
+    std::vector<double>                           usage;  // decayed usage per (block, expert), as of the last absorb
+    std::vector<uint64_t>                         last_decode;  // cumulative decode counts at the last absorb
+    std::vector<uint64_t>                         last_prompt;  // cumulative prompt counts at the last absorb
+    std::vector<moe_swap_detail::moe_swap_ranked> cands;        // scratch: host experts of one block above min_usage
+    std::vector<moe_swap_detail::moe_swap_ranked> victs;        // scratch: resident experts of one block
+    std::vector<moe_swap_proposal>                pool;         // scratch: every block's proposals before the cap
 
     // The usage of one cell as of the last absorb; zero for a cell the state does not hold.
     double usage_of(int block, int expert) const {
@@ -146,6 +161,8 @@ struct moe_swap_state {
         return usage[static_cast<size_t>(block) * static_cast<size_t>(n_experts) + static_cast<size_t>(expert)];
     }
 };
+
+namespace moe_swap_detail {
 
 // Add what `cur` counted since `last` to `usage` and remember `cur`. A count below the remembered one is a counter
 // that restarted: its value is the difference.
@@ -163,10 +180,10 @@ inline void moe_swap_absorb(moe_swap_state & s, const moe_swap_block_input * blo
     for (int b = 0; b < s.n_blocks; ++b) {
         const size_t base = static_cast<size_t>(b) * ne;
         if (blocks[b].decode_counts != nullptr) {
-            moe_swap_absorb_row(&s.usage[base], &s.last_decode[base], blocks[b].decode_counts, ne);
+            moe_swap_absorb_row(s.usage.data() + base, s.last_decode.data() + base, blocks[b].decode_counts, ne);
         }
         if (blocks[b].prompt_counts != nullptr) {
-            moe_swap_absorb_row(&s.usage[base], &s.last_prompt[base], blocks[b].prompt_counts, ne);
+            moe_swap_absorb_row(s.usage.data() + base, s.last_prompt.data() + base, blocks[b].prompt_counts, ne);
         }
     }
 }
@@ -176,7 +193,7 @@ inline void moe_swap_absorb(moe_swap_state & s, const moe_swap_block_input * blo
 // residents rise along the ranking, so the first pair that fails ends the block.
 inline void moe_swap_collect_block(moe_swap_state & s, const moe_swap_params & p, int block, const uint8_t * resident) {
     const size_t   ne = static_cast<size_t>(s.n_experts);
-    const double * u  = &s.usage[static_cast<size_t>(block) * ne];
+    const double * u  = s.usage.data() + static_cast<size_t>(block) * ne;
 
     s.cands.clear();
     size_t n_res = 0;
@@ -231,20 +248,29 @@ inline bool moe_swap_proposal_before(const moe_swap_proposal & a, const moe_swap
     return a.evict_expert < b.evict_expert;
 }
 
+}  // namespace moe_swap_detail
+
 // One call at a graph boundary. `out` is cleared, and holds the proposals in execution order when the status is
 // MOE_SWAP_STATUS_ADAPTED. The caller applies them (a proposal whose block it can no longer swap it may drop; the
 // rest are independent of each other).
+// A call that stands for several decode tokens (n_tokens > 1) that cross more than one period boundary is ONE
+// boundary: one absorb, one proposal pass, one decay. A call with n_tokens <= 0 stands for no token. A call that is
+// refused (MOE_SWAP_STATUS_REJECTED) changes nothing in the state; the parameter checks are a few compares.
 inline moe_swap_status moe_swap_step(moe_swap_state &                 s,
                                      const moe_swap_params &          p,
                                      const moe_swap_call &            c,
                                      std::vector<moe_swap_proposal> & out) {
     out.clear();
-    if (c.n_blocks != s.n_blocks || (c.n_blocks > 0 && c.blocks == nullptr)) {
+    if (!(p.decay >= 0.0 && p.decay <= 1.0) || !(p.margin >= 0.0) || p.min_usage != p.min_usage) {
+        return MOE_SWAP_STATUS_REJECTED;
+    }
+    if (s.n_blocks == 0 || s.n_experts == 0 || c.n_blocks != s.n_blocks || c.n_experts != s.n_experts ||
+        c.blocks == nullptr) {
         return MOE_SWAP_STATUS_REJECTED;
     }
 
     if (c.after_prompt) {
-        moe_swap_absorb(s, c.blocks);
+        moe_swap_detail::moe_swap_absorb(s, c.blocks);
         return MOE_SWAP_STATUS_SEEDED;
     }
 
@@ -257,26 +283,26 @@ inline moe_swap_status moe_swap_step(moe_swap_state &                 s,
         return MOE_SWAP_STATUS_IN_FLIGHT;
     }
 
-    moe_swap_absorb(s, c.blocks);
+    moe_swap_detail::moe_swap_absorb(s, c.blocks);
 
     s.pool.clear();
     if (p.max_swaps > 0) {
         for (int b = 0; b < s.n_blocks; ++b) {
             if (c.blocks[b].eligible && c.blocks[b].resident != nullptr) {
-                moe_swap_collect_block(s, p, b, c.blocks[b].resident);
+                moe_swap_detail::moe_swap_collect_block(s, p, b, c.blocks[b].resident);
             }
         }
     }
 
     for (double & x : s.usage) {
         const double v = x * p.decay;
-        x              = v < MOE_SWAP_USAGE_FLOOR ? 0.0 : v;
+        x              = v < moe_swap_detail::MOE_SWAP_USAGE_FLOOR ? 0.0 : v;
     }
 
     if (!s.pool.empty()) {
         const size_t k = std::min(s.pool.size(), static_cast<size_t>(p.max_swaps));
         std::partial_sort(s.pool.begin(), s.pool.begin() + static_cast<std::ptrdiff_t>(k), s.pool.end(),
-                          moe_swap_proposal_before);
+                          moe_swap_detail::moe_swap_proposal_before);
         out.assign(s.pool.begin(), s.pool.begin() + static_cast<std::ptrdiff_t>(k));
     }
     return MOE_SWAP_STATUS_ADAPTED;

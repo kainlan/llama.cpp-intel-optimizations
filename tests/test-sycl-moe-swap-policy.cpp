@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <new>
 #include <set>
 #include <utility>
@@ -121,6 +122,7 @@ static moe_swap_status step(moe_swap_state &                 s,
     moe_swap_call c;
     c.blocks       = t.blocks();
     c.n_blocks     = t.n_blocks;
+    c.n_experts    = t.n_experts;
     c.n_tokens     = n_tokens;
     c.in_flight    = in_flight;
     c.after_prompt = after_prompt;
@@ -429,9 +431,15 @@ static random_run_result random_run() {
     return r;
 }
 
+// The randomized run is deterministic, so the two tests that read it share one.
+static const random_run_result & shared_random_run() {
+    static const random_run_result r = random_run();
+    return r;
+}
+
 // A swap exchanges one resident expert for one host expert, so a block's resident count never changes.
 static void test_a_blocks_resident_count_is_invariant() {
-    const random_run_result r = random_run();
+    const random_run_result & r = shared_random_run();
     CHECK(r.proposals > 0);  // positive control: the run did swap
     CHECK(r.counts_invariant);
     CHECK(r.moves_are_real);
@@ -440,7 +448,7 @@ static void test_a_blocks_resident_count_is_invariant() {
 
 // One call never admits and evicts the same expert, and never proposes an expert twice.
 static void test_an_expert_is_never_admitted_and_evicted_or_proposed_twice() {
-    const random_run_result r = random_run();
+    const random_run_result & r = shared_random_run();
     CHECK(r.proposals > 0);
     CHECK(r.never_both);
     CHECK(r.never_twice);
@@ -696,19 +704,224 @@ static void test_a_call_without_a_boundary_is_cheap_and_does_not_allocate() {
     CHECK(g_allocs == before);
 }
 
-// A call whose shape does not fit the state is refused and touches nothing.
+// A call whose shape does not fit the state is refused and touches nothing, and so is a state with no blocks or no
+// experts, which is not a model.
 static void test_a_call_of_the_wrong_shape_is_rejected() {
     const moe_swap_params          p;
-    moe_swap_state                 s(2, 8);
-    table                          t(3, 8);
-    std::vector<moe_swap_proposal> out;
-    CHECK(step(s, p, t, out) == MOE_SWAP_STATUS_REJECTED);
-    CHECK(s.tokens == 0);
+    std::vector<moe_swap_proposal> out(1);  // a stale entry the refused call must clear
+    {
+        moe_swap_state s(2, 8);
+        table          t(3, 8);
+        CHECK(step(s, p, t, out) == MOE_SWAP_STATUS_REJECTED);
+        CHECK(out.empty());
+        CHECK(s.tokens == 0);
 
+        table t16(2, 16);  // the right number of blocks, the wrong number of experts
+        out.resize(1);
+        CHECK(step(s, p, t16, out) == MOE_SWAP_STATUS_REJECTED);
+        CHECK(out.empty());
+        CHECK(s.tokens == 0);
+
+        moe_swap_call c;
+        c.n_blocks  = 2;
+        c.n_experts = 8;  // blocks left null
+        out.resize(1);
+        CHECK(moe_swap_step(s, p, c, out) == MOE_SWAP_STATUS_REJECTED);
+        CHECK(out.empty());
+        CHECK(s.tokens == 0);
+    }
+    {
+        // A state with no block, no expert, or a negative dimension (clamped to none) refuses every call, including
+        // one that matches its empty shape, and reads nothing.
+        const int dims[3][2] = {
+            { 0,  8 },
+            { 3,  0 },
+            { -1, 5 }
+        };
+        for (const auto & d : dims) {
+            const int      nb = d[0] > 0 ? d[0] : 0;
+            const int      ne = d[1] > 0 ? d[1] : 0;
+            moe_swap_state s(d[0], d[1]);
+            table          t(nb, ne);
+            CHECK(step(s, p, t, out) == MOE_SWAP_STATUS_REJECTED);
+            CHECK(step(s, p, t, out, false, true) == MOE_SWAP_STATUS_REJECTED);
+            CHECK(s.tokens == 0);
+            CHECK(s.usage.empty());
+        }
+    }
+}
+
+// A parameter outside the contract is refused on every kind of call, and nothing moves: not usage, not the token
+// clock, and `out` is left empty.
+static void test_parameters_outside_the_contract_are_rejected_and_move_nothing() {
+    const moe_swap_params          good;
+    table                          t(1, 8);
+    moe_swap_state                 s(1, 8);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 4);
+    t.decode[0][6] = 10;
+    CHECK(run_period(s, good, t, out) == MOE_SWAP_STATUS_ADAPTED);
+    CHECK(near(s.usage_of(0, 6), 7.0));
+    CHECK(s.tokens == 4);
+
+    const double                 nan = std::numeric_limits<double>::quiet_NaN();
+    std::vector<moe_swap_params> bad(6, good);
+    bad[0].decay     = nan;
+    bad[1].decay     = 1.5;
+    bad[2].decay     = -0.1;
+    bad[3].margin    = nan;
+    bad[4].margin    = -1.0;
+    bad[5].min_usage = nan;
+    t.decode[0][6]   = 50;             // counts a refused call must not absorb
+    for (const moe_swap_params & p : bad) {
+        for (int i = 0; i < 4; ++i) {  // a whole period of decode calls
+            out.assign(1, moe_swap_proposal());
+            CHECK(step(s, p, t, out) == MOE_SWAP_STATUS_REJECTED);
+            CHECK(out.empty());
+        }
+        out.assign(1, moe_swap_proposal());
+        CHECK(step(s, p, t, out, false, true) == MOE_SWAP_STATUS_REJECTED);  // and a prompt call
+        CHECK(out.empty());
+        CHECK(s.tokens == 4);
+        CHECK(near(s.usage_of(0, 6), 7.0));
+    }
+    // The edges of the contract are accepted: decay 0 and 1, margin 0, min_usage 0.
+    moe_swap_params edge;
+    edge.decay     = 1.0;
+    edge.margin    = 0.0;
+    edge.min_usage = 0.0;
+    CHECK(run_period(s, edge, t, out) == MOE_SWAP_STATUS_ADAPTED);
+    edge.decay = 0.0;
+    CHECK(run_period(s, edge, t, out) == MOE_SWAP_STATUS_ADAPTED);
+    CHECK(s.usage_of(0, 6) == 0.0);
+}
+
+// A call that stands for several decode tokens advances the clock by all of them, and crossing one or two period
+// boundaries is one boundary: one absorb, one proposal pass, one decay.
+static void test_a_call_of_several_tokens_is_one_boundary_however_many_it_crosses() {
+    const moe_swap_params          p;
+    table                          t(1, 8);
+    moe_swap_state                 s(1, 8);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 4);
+    t.decode[0][6] = 10;
+
+    CHECK(step(s, p, t, out, false, false, 3) == MOE_SWAP_STATUS_WAITING);  // clock 3
+    CHECK(s.tokens == 3);
+    CHECK(step(s, p, t, out, false, false, 2) == MOE_SWAP_STATUS_ADAPTED);  // clock 5 crosses 4
+    CHECK(s.tokens == 5);
+    CHECK(out.size() == 1);
+    CHECK(near(s.usage_of(0, 6), 7.0));
+
+    t.decode[0][6] = 20;
+    CHECK(step(s, p, t, out, false, false, 8) == MOE_SWAP_STATUS_ADAPTED);  // clock 13 crosses 8 and 12
+    CHECK(s.tokens == 13);
+    CHECK(near(s.usage_of(0, 6), 11.9));  // (7 + 10) * 0.7 once; two decays would leave 8.33
+
+    CHECK(step(s, p, t, out, false, false, 2) == MOE_SWAP_STATUS_WAITING);  // clock 15
+    CHECK(step(s, p, t, out, false, false, 1) == MOE_SWAP_STATUS_ADAPTED);  // clock 16 lands on a boundary
+    CHECK(s.tokens == 16);
+
+    // In flight, the crossing is skipped like any other boundary.
+    CHECK(step(s, p, t, out, true, false, 9) == MOE_SWAP_STATUS_IN_FLIGHT);
+    CHECK(s.tokens == 25);
+}
+
+// A call for no token, or a negative count, moves nothing.
+static void test_a_call_of_no_tokens_is_waiting_and_moves_nothing() {
+    const moe_swap_params          p;
+    table                          t(1, 8);
+    moe_swap_state                 s(1, 8);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 4);
+    t.decode[0][6] = 10;
+    for (int n : { 0, -1, -1000000 }) {
+        CHECK(step(s, p, t, out, false, false, n) == MOE_SWAP_STATUS_WAITING);
+        CHECK(s.tokens == 0);
+        CHECK(s.usage_of(0, 6) == 0.0);
+    }
+    CHECK(run_period(s, p, t, out) == MOE_SWAP_STATUS_ADAPTED);  // the clock was not disturbed
+}
+
+// A period below 1 never reaches a boundary: every call waits, the clock still runs, nothing is read.
+static void test_a_period_below_one_never_reaches_a_boundary() {
+    table                          t(1, 8);
+    moe_swap_state                 s(1, 8);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 4);
+    t.decode[0][6] = 10;
+    for (int period : { 0, -3 }) {
+        moe_swap_params p;
+        p.period = period;
+        for (int i = 0; i < 10; ++i) {
+            CHECK(step(s, p, t, out) == MOE_SWAP_STATUS_WAITING);
+            CHECK(out.empty());
+        }
+    }
+    CHECK(s.tokens == 20);
+    CHECK(s.usage_of(0, 6) == 0.0);
+}
+
+// A null count array is a block whose counts did not change; a block that is eligible but has no residency array
+// cannot swap, and neither reads memory it was not given.
+static void test_null_counts_mean_unchanged_and_a_block_without_residency_is_skipped() {
+    const moe_swap_params          p;
+    moe_swap_state                 s(1, 8);
+    std::vector<moe_swap_proposal> out;
+    std::vector<uint64_t>          decode(8, 0);
+    std::vector<uint64_t>          prompt(8, 0);
+    std::vector<uint8_t>           resident = { 1, 1, 1, 1, 0, 0, 0, 0 };
+    decode[6]                               = 100;  // never read: the pointer below is null
+    prompt[5]                               = 6;
+
+    moe_swap_block_input in;
+    in.decode_counts = nullptr;
+    in.prompt_counts = prompt.data();
+    in.resident      = resident.data();
+    in.eligible      = true;
     moe_swap_call c;
-    c.n_blocks = 2;  // blocks left null
-    CHECK(moe_swap_step(s, p, c, out) == MOE_SWAP_STATUS_REJECTED);
-    CHECK(s.tokens == 0);
+    c.blocks    = &in;
+    c.n_blocks  = 1;
+    c.n_experts = 8;
+    for (int i = 0; i < 4; ++i) {
+        moe_swap_step(s, p, c, out);
+    }
+    CHECK(out.size() == 1);  // the prompt counts alone were absorbed, and are enough to swap
+    if (out.size() == 1) {
+        CHECK(out[0].admit_expert == 5 && near(out[0].gain, 6.0));
+    }
+    CHECK(near(s.usage_of(0, 5), 4.2));  // 6 * 0.7
+    CHECK(s.usage_of(0, 6) == 0.0);
+
+    in.decode_counts = decode.data();  // now the decode array arrives, and the prompt array is the one that is null
+    in.prompt_counts = nullptr;
+    for (int i = 0; i < 4; ++i) {
+        moe_swap_step(s, p, c, out);
+    }
+    CHECK(near(s.usage_of(0, 6), 70.0));  // 100 * 0.7
+    CHECK(near(s.usage_of(0, 5), 2.94));  // 4.2 * 0.7: unchanged counts add nothing
+
+    in.resident = nullptr;                // eligible, but nothing to say which experts are resident
+    for (int i = 0; i < 3; ++i) {
+        CHECK(moe_swap_step(s, p, c, out) == MOE_SWAP_STATUS_WAITING);
+    }
+    CHECK(moe_swap_step(s, p, c, out) == MOE_SWAP_STATUS_ADAPTED);
+    CHECK(out.empty());
+    CHECK(near(s.usage_of(0, 6), 49.0));  // it still decayed
+}
+
+// A max_swaps below zero proposes nothing, like zero, and usage still decays.
+static void test_a_negative_max_swaps_proposes_nothing() {
+    moe_swap_params p;
+    p.max_swaps = -5;
+    table                          t(1, 8);
+    moe_swap_state                 s(1, 8);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 4);
+    t.decode[0][6] = 10;
+    CHECK(run_period(s, p, t, out) == MOE_SWAP_STATUS_ADAPTED);
+    CHECK(out.empty());
+    CHECK(near(s.usage_of(0, 6), 7.0));
 }
 
 // The call sits at a graph boundary on the decode path of a 48 x 512 model, so replay one at that size: skewed routing,
@@ -788,6 +1001,12 @@ int main() {
     test_cumulative_counts_are_absorbed_as_deltas();
     test_a_call_without_a_boundary_is_cheap_and_does_not_allocate();
     test_a_call_of_the_wrong_shape_is_rejected();
+    test_parameters_outside_the_contract_are_rejected_and_move_nothing();
+    test_a_call_of_several_tokens_is_one_boundary_however_many_it_crosses();
+    test_a_call_of_no_tokens_is_waiting_and_moves_nothing();
+    test_a_period_below_one_never_reaches_a_boundary();
+    test_null_counts_mean_unchanged_and_a_block_without_residency_is_skipped();
+    test_a_negative_max_swaps_proposes_nothing();
     test_replay_at_the_size_of_a_48_by_512_model_stays_within_a_time_bound();
 
     if (g_failed != 0) {
