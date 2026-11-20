@@ -3095,6 +3095,18 @@ int main() {
         CHECK(has(nl, "; the arena could not be torn down. The arena stays closed") &&
                   has(nl, "Load this model in a new process"),
               "a refused teardown with no cause is not read as closed");
+
+        // The clause and the predicate agree for every cause: the clause calls the arena closed for exactly the causes
+        // the predicate reads as closed, and for NONE, a refusal that lost its cause, and calls it as it was for every
+        // other. FREE_FAILED is the last enumerator, so the loop covers them all.
+        for (int v = static_cast<int>(zone_arena_teardown_refusal::NONE);
+             v <= static_cast<int>(zone_arena_teardown_refusal::FREE_FAILED); ++v) {
+            const auto        cause = static_cast<zone_arena_teardown_refusal>(v);
+            const std::string text  = text_for(cause);
+            const bool closed = cause == zone_arena_teardown_refusal::NONE || zone_arena_teardown_left_closed(cause);
+            CHECK(has(text, "The arena stays closed to new allocations") == closed && has(text, "as it was") == !closed,
+                  "a teardown clause and zone_arena_teardown_left_closed disagree about whether the arena is closed");
+        }
     }
 
     // ---- Case 40: a load releases the PP MoE ring only when the ring alone keeps the arena from a rebuild it needs

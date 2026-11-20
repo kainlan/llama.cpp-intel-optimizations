@@ -573,6 +573,7 @@ enum class zone_arena_teardown_refusal {
 zone_arena_teardown_refusal zone_arena_unfreed_chunk_refusal(bool leases_outstanding, bool chunk_freed_before);
 
 // Whether a teardown refused for `cause` left the arena closed to new allocations: only one that had freed a chunk.
+// NONE, which the arena records while no teardown has refused since the last one completed, reads as open.
 bool zone_arena_teardown_left_closed(zone_arena_teardown_refusal cause);
 
 // The three zones a plan sizes, in bytes.
