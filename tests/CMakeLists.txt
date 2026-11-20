@@ -5272,6 +5272,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# A staging allocation the card does not grant on the MoE prompt path of ggml_sycl_mul_mat_id refuses the op by name
+# through ggml_sycl_fallback_error, never an abort, and the throw keeps what in-flight kernels read alive until they
+# are done, as the normal exit does. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-pp-staging-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-pp-staging-refusal-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-zujy (plan Task 3 of llama.cpp-36j0): each device probes its pinned host-to-device rate once and keeps it in
 # the tuning cache. Both buffers go through unified_allocate with the literal tier flags, the copy is chunked
 # mem_copy_async with one wait per iteration, the WARN line and the GGML_SYCL_H2D_PROBE switch each appear once, and

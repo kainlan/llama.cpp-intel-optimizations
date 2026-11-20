@@ -63,7 +63,7 @@ What this gate pins:
   - the two executors that cannot read a staged slot refuse a staged batch by name: the non-hybrid retained prompt
     per-expert path, which multiplies each expert at its own resolved layout through ggml_sycl_mul_mat (a path that
     can reach oneDNN, while a slot's reuse is ordered only for a plain kernel on the submit queue), throws a fallback
-    error directly after the batched executor's try, before its scratch setup claims, allocates or can abort, and
+    error directly after the batched executor's try, before its scratch setup claims or allocates, and
     before its first route; try_xmx_sorted_moe rejects it at its head, before it uploads anything;
   - that per-expert path reads each expert at the layout its route resolved, one variable taken from the route
     (route.actual_layout) beside the route's lease: the multiply's forced layout and the slice storage installed from
@@ -1532,8 +1532,8 @@ PER_EXPERT_REFUSE = ("if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt
 PER_EXPERT_ANCHOR = "if (try_pp_onednn_f16_batched()) { return; }"
 PER_EXPERT_STEPS = (
     "pp_moe_onednn_scratch_claim pp_moe_onednn_scratch_claim_state;",
-    'GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for',
     "std::vector<ggml_sycl::mem_handle> pp_gpu_leases;",
+    "if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) { refuse_src1_f32_staging(); }",
     "moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));",
     "expert_ptr = route.ptr;",
     "ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &expert_layout);",
@@ -1551,7 +1551,7 @@ def claim_staged_batch_refused_by_name(sycl: str) -> bool:
     """The non-hybrid retained prompt per-expert path multiplies each expert at its own resolved layout through
     ggml_sycl_mul_mat, which can reach oneDNN, while a staged slot's reuse is ordered only for a plain kernel on the
     submit queue: a batch naming a staged slot throws a fallback error directly after the batched executor's try,
-    before the path's scratch setup claims the oneDNN scratch slot, allocates its staging or aborts on a failed
+    before the path's scratch setup claims the oneDNN scratch slot, allocates its staging or refuses on a failed
     allocation, and before its first route and its multiply.
     try_xmx_sorted_moe reads each expert through a payload with no staged slot: it rejects such a batch at its head,
     before the policy check and before any upload, instead of through the payload's missing entry."""
@@ -1580,7 +1580,7 @@ def test_staged_batch_refused_by_name_mutants():
     m = mutate(SYCL, PER_EXPERT_REFUSE + " ", "")
     m = m.replace(PER_EXPERT_STEPS[-1], PER_EXPERT_STEPS[-1] + " " + PER_EXPERT_REFUSE, 1)
     assert not c(m)
-    # Refused after the scratch setup, where a staged batch can hit the staging allocation's abort first.
+    # Refused after the scratch setup, where a staged batch can hit the staging allocation's refusal first.
     m = mutate(SYCL, PER_EXPERT_REFUSE + " ", "")
     m = m.replace(PER_EXPERT_STEPS[2], PER_EXPERT_REFUSE + " " + PER_EXPERT_STEPS[2], 1)
     assert not c(m)

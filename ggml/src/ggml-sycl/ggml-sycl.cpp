@@ -86608,6 +86608,29 @@ static const char * ggml_sycl_moe_q1_nvfp4_refusal_text(const char * reason) {
     return "MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand refused: unnamed reason";
 }
 
+// A staging buffer the MoE prompt path asks for and does not get is a fit problem, not a broken part: the op is
+// refused and the process goes on. The WARN names what did not fit; graph_compute's catch drains the queue and turns
+// the exception into GGML_STATUS_FAILED. `reason` must be a string literal: the exception keeps the pointer.
+[[noreturn]] static void ggml_sycl_moe_pp_refuse_staging(const ggml_tensor * src0,
+                                                         int                 device,
+                                                         const char *        buffer,
+                                                         size_t              rows,
+                                                         size_t              bytes,
+                                                         const char *        reason) {
+    GGML_LOG_WARN(
+        "[MOE-PP-STAGING] refused tensor=%s buffer=%s rows=%zu bytes=%zu device=%d: the allocation was not granted\n",
+        src0 ? src0->name : "?", buffer, rows, bytes, device);
+    throw ggml_sycl_fallback_error(reason);
+}
+
+// The private-testing failpoints for those staging buffers: true once when the test armed `failure`, and the site then
+// acts as if its allocation had returned null. Outside the private route build it is the constant false.
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+#    define GGML_SYCL_MOE_PP_STAGING_FAILPOINT(failure) ggml_sycl_q1_nvfp4_test_consume_failure(failure)
+#else
+#    define GGML_SYCL_MOE_PP_STAGING_FAILPOINT(failure) false
+#endif
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     ggml_sycl_test_inject_device_lost("mmid");
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
@@ -93381,10 +93404,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             auto                  act_r      = act_handle.resolve();
             auto                  out_r      = out_handle.resolve();
             if (!act_r || !out_r) {
-                GGML_ABORT(
-                    "[MoE] Failed host-pinned alloc for PP CPU island act/out: %s groups=%zu rows=%zu\n"
-                    "Ensure host zone has enough capacity (populate_host_zone_sizing).",
-                    src0->name ? src0->name : "?", groups.size(), n_rows);
+                // Nothing of the island is on a queue yet, and the groups' host leases are read only by the CPU work
+                // below. Each caller has what it submitted kept before the unwind: the per-expert path's catch around
+                // its call, the batched executor its done marker above its finish, and the all-host micro-batch
+                // submitted nothing.
+                const bool act_missing = !act_r;
+                ggml_sycl_moe_pp_refuse_staging(src0, act_missing ? act_req.device : out_req.device,
+                                                act_missing ? "moe_pp_cpu_island_act" : "moe_pp_cpu_island_out",
+                                                act_missing ? island.n_act_rows : n_rows,
+                                                act_missing ? act_req.size : out_req.size,
+                                                "MUL_MAT_ID prompt CPU island staging did not fit");
             }
 
             float * act_pinned = static_cast<float *>(act_r.ptr);
@@ -93523,11 +93552,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         src0 && src0->name ? src0->name : "?", ctx.device, row_maps_total);
                 fflush(stderr);
             }
-            dev_row_mappings.alloc(*stream, ctx.device, row_maps_total, "moe_pp_row_mappings");
+            if (!GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_ROW_MAP_STAGING)) {
+                dev_row_mappings.alloc(*stream, ctx.device, row_maps_total, "moe_pp_row_mappings");
+            }
             if (!dev_row_mappings.get()) {
-                GGML_ABORT("[MOE-ROUTE] failed to allocate PP row-map staging tensor=%s rows=%zu bytes=%zu device=%d",
-                           src0 && src0->name ? src0->name : "?", row_maps_total,
-                           row_maps_total * sizeof(mmid_row_mapping), ctx.device);
+                // No scratch slot is claimed and no other staging is allocated yet. What is live here releases through
+                // its owner on unwind (the retained prompt batch's leases, the ids snapshot), the eviction guard of
+                // graph compute holds until graph_compute's catch has drained the queue, and nothing of this op that
+                // reads the row maps has been submitted.
+                ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, "moe_pp_row_mappings", row_maps_total,
+                                                row_maps_total * sizeof(mmid_row_mapping),
+                                                "MUL_MAT_ID prompt row-map staging did not fit");
             }
             if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                 fprintf(stderr, "[MOE-STAGE] tensor=%s stage=pp-rowmap-copy-begin device=%d rows=%zu dst_handle=%d\n",
@@ -95177,8 +95212,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // and for an mxfp4 group of 2 rows or more, and its mxfp4 f16 arm is oneDNN as well. The batched executor
         // above never meets a slot as a route (the staged route refuses an entry the executor consumes, and serves
         // the others only to a layer the executor does not claim). A staged batch is refused here, before the
-        // scratch setup below claims the oneDNN scratch slot, allocates the staging, or can abort on a failed
-        // allocation, so it reaches its fallback instead.
+        // scratch setup below claims the oneDNN scratch slot or allocates the staging, so it reaches its fallback
+        // with neither taken.
         if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt_batch_result.batch)) {
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt per-expert path refused a staged ring slot");
         }
@@ -95191,10 +95226,72 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         sycl::half *                            pp_mxfp4_src0_f16_ptr   = nullptr;
         ggml_sycl::pp_moe_onednn_scratch_result pp_moe_onednn_scratch;
         pp_moe_onednn_scratch_claim             pp_moe_onednn_scratch_claim_state;
+        // The leases of the device experts whose multiplies this path submits.
+        std::vector<ggml_sycl::mem_handle>      pp_gpu_leases;
+
+        // This path's exit work, once its last submit is on the queue: one marker after that submit, the claimed
+        // scratch slot recorded on it with its owners, the expert leases and the pointer-table bundle kept until it,
+        // and the transient down-projection SOA released. The normal exit runs it, and so does every refusal of this
+        // path before it throws, so the unwind frees nothing a submitted kernel still reads and skips no release the
+        // normal exit performs. The scoped staging buffers need nothing from it: each releases in queue order.
+        auto retain_pp_dispatch_until_done = [&]() {
+            sycl::event prompt_down_dispatch_done;
+            bool        prompt_down_dispatch_done_set = false;
+            if (release_prompt_down_soa_after_dispatch || pp_moe_onednn_scratch_claim_state.claimed()) {
+                prompt_down_dispatch_done = ggml_sycl_submit_marker<pp_moe_prompt_down_dispatch_done_marker>(*stream);
+                prompt_down_dispatch_done_set = true;
+            }
+            if (pp_moe_onednn_scratch_claim_state.claimed()) {
+                std::vector<ggml_sycl::mem_handle> pp_moe_slot_owners;
+                if (pp_moe_onednn_scratch.weight_owner.valid()) {
+                    pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.weight_owner));
+                }
+                if (pp_moe_onednn_scratch.activation_owner.valid()) {
+                    pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.activation_owner));
+                }
+                if (pp_moe_onednn_scratch.output_owner.valid()) {
+                    pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.output_owner));
+                }
+                pp_moe_onednn_scratch_claim_state.bind_owners(std::move(pp_moe_slot_owners));
+                pp_moe_onednn_scratch_claim_state.record(prompt_down_dispatch_done);
+            }
+            if (!pp_gpu_leases.empty()) {
+                ggml_sycl::retain_handles_until_event(
+                    std::move(pp_gpu_leases),
+                    prompt_down_dispatch_done_set ? prompt_down_dispatch_done : stream->ext_oneapi_submit_barrier());
+            }
+            if (use_expert_cache && src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
+                std::vector<ggml_sycl::mem_handle> ptr_table_dispatch_bundle =
+                    ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device);
+                if (!ptr_table_dispatch_bundle.empty()) {
+                    ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle),
+                                                          prompt_down_dispatch_done_set ?
+                                                              prompt_down_dispatch_done :
+                                                              stream->ext_oneapi_submit_barrier());
+                }
+            }
+            if (release_prompt_down_soa_after_dispatch) {
+                (void) graph_release_moe_expert_leases_for_tensor_layout(&ctx, src0, ctx.device, GGML_LAYOUT_SOA);
+                const bool released = ggml_sycl_release_moe_tensor_layout(src0, ctx.device, GGML_LAYOUT_SOA);
+                if (released && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                    static std::atomic<int> transient_down_release_log{ 0 };
+                    if (transient_down_release_log.fetch_add(1, std::memory_order_relaxed) < 96) {
+                        fprintf(stderr,
+                                "[MOE-PHASE-LAYOUT] tensor=%s device=%d layout=%s released_after_dispatch=1 "
+                                "waited_after_dispatch=0 reason=prompt-down-transient\n",
+                                src0 && src0->name ? src0->name : "?", ctx.device,
+                                ggml_sycl_layout_mode_name(GGML_LAYOUT_SOA));
+                    }
+                }
+            }
+        };
 
         auto ensure_src1_contiguous_f32 = [&]() -> bool {
             if (src1_contiguous_f32.get()) {
                 return true;
+            }
+            if (GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_SRC1_F32_STAGING)) {
+                return false;
             }
             try {
                 src1_contiguous_f32.alloc(*stream, ctx.device, src1_contiguous_f32_row_bytes * src1_contiguous_rows,
@@ -95203,6 +95300,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return false;
             }
             return src1_contiguous_f32.get() != nullptr;
+        };
+        // The F32 activation staging is allocated once per op, by whichever of its three sites needs it first (the
+        // setup below, an expert the f16 arm does not take, the f16 arm's fallback to F32 batches); a refusal from
+        // any of them runs the exit work first, so what earlier experts submitted keeps what it reads.
+        auto refuse_src1_f32_staging = [&]() {
+            retain_pp_dispatch_until_done();
+            ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, "moe_pp_src1_f32", src1_contiguous_rows,
+                                            src1_contiguous_f32_row_bytes * src1_contiguous_rows,
+                                            "MUL_MAT_ID prompt activation staging did not fit");
         };
 
         bool                                  pp_mxfp4_soa_f16_ready = !pp_cpu_reference && pp_mxfp4_soa_f16_candidate;
@@ -95345,12 +95451,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
 #endif
         if (!dst_contiguous_ptr) {
-            dst_contiguous.alloc(*stream, ctx.device, sizeof(float) * ggml_nelements(dst), "moe_pp_dst_contiguous");
+            if (!GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_DST_STAGING)) {
+                dst_contiguous.alloc(*stream, ctx.device, sizeof(float) * ggml_nelements(dst), "moe_pp_dst_contiguous");
+            }
             dst_contiguous_ptr = dst_contiguous.get();
+            if (!dst_contiguous_ptr) {
+                // Every expert's multiply and scatter write through this base, so the op cannot run without it. No
+                // expert of this path has been submitted yet; the exit work records the scratch slot if one was
+                // claimed above and releases what the normal exit releases.
+                retain_pp_dispatch_until_done();
+                ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, "moe_pp_dst_contiguous", src1_contiguous_rows,
+                                                sizeof(float) * ggml_nelements(dst),
+                                                "MUL_MAT_ID prompt output staging did not fit");
+            }
         }
         if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) {
-            GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for %s rows=%zu row_bytes=%zu",
-                       src0->name ? src0->name : "?", src1_contiguous_rows, src1_contiguous_f32_row_bytes);
+            refuse_src1_f32_staging();
         }
         if (pp_oor_trace) {
             fprintf(stderr,
@@ -95558,21 +95674,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #endif
         };
 
-        std::vector<ggml_sycl::mem_handle> pp_gpu_leases;
-        size_t                             pp_route_dev0                           = 0;
-        size_t                             pp_route_dev1                           = 0;
-        size_t                             pp_route_host                           = 0;
-        size_t                             pp_route_unavailable                    = 0;
-        size_t                             pp_route_localized                      = 0;
-        size_t                             pp_route_host_rerouted                  = 0;
-        size_t                             pp_planned_device_to_host_fallback_rows = 0;
-        size_t                             pp_planned_host_rows                    = 0;
-        size_t                             pp_true_host_rows                       = 0;
-        size_t                             pp_unsupported_device_rows              = 0;
-        size_t                             pp_entries_dev0                         = 0;
-        size_t                             pp_entries_dev1                         = 0;
-        size_t                             pp_entries_host                         = 0;
-        size_t                             pp_entries_unavailable                  = 0;
+        size_t pp_route_dev0                           = 0;
+        size_t pp_route_dev1                           = 0;
+        size_t pp_route_host                           = 0;
+        size_t pp_route_unavailable                    = 0;
+        size_t pp_route_localized                      = 0;
+        size_t pp_route_host_rerouted                  = 0;
+        size_t pp_planned_device_to_host_fallback_rows = 0;
+        size_t pp_planned_host_rows                    = 0;
+        size_t pp_true_host_rows                       = 0;
+        size_t pp_unsupported_device_rows              = 0;
+        size_t pp_entries_dev0                         = 0;
+        size_t pp_entries_dev1                         = 0;
+        size_t pp_entries_host                         = 0;
+        size_t pp_entries_unavailable                  = 0;
         for (int64_t i02 = 0; i02 < n_as; i02++) {
             const size_t  row_begin     = row_map_offsets[static_cast<size_t>(i02)];
             const size_t  row_end       = row_map_offsets[static_cast<size_t>(i02) + 1];
@@ -96055,8 +96170,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
             if (!expert_use_mxfp4_soa_f16 && !copy_src1_current_f32()) {
-                GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for %s rows=%lld row_bytes=%zu",
-                           src0->name ? src0->name : "?", (long long) num_src1_rows, src1_contiguous_f32_row_bytes);
+                refuse_src1_f32_staging();
             }
             if (pp_oor_trace && !f16_activation_staged) {
                 pp_trace_wait("activation-staged", i02, num_src1_rows);
@@ -96067,8 +96181,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             auto dispatch_f32_batches = [&]() {
                 if (!copy_src1_current_f32()) {
-                    GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for %s rows=%lld row_bytes=%zu",
-                               src0->name ? src0->name : "?", (long long) num_src1_rows, src1_contiguous_f32_row_bytes);
+                    refuse_src1_f32_staging();
                 }
                 const int64_t max_batch_f32 = std::max<int64_t>(1, MMQ_MAX_BATCH_SIZE);
                 int64_t       batch_start   = 0;
@@ -96238,56 +96351,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                      "pp_planned_descriptor", pp_local_entries_for_log,
                                                      pp_per_gpu_entries_for_log, pp_host_entries_for_log);
         pp_phase_log("pp-route-log-done", route_layout, row_maps_total, pp_entries_dev0 + pp_entries_dev1);
-        dispatch_host_expert_groups(pp_host_groups);
+        try {
+            dispatch_host_expert_groups(pp_host_groups);
+        } catch (const ggml_sycl_fallback_error &) {
+            // The island refused (a staging buffer it did not get, or a handle it could not wrap) after the device
+            // experts above were submitted: their exit work runs before the unwind, as on the normal exit below.
+            retain_pp_dispatch_until_done();
+            throw;
+        }
         pp_phase_log("pp-host-dispatch-done", route_layout, row_maps_total, pp_entries_host);
-        sycl::event prompt_down_dispatch_done;
-        bool        prompt_down_dispatch_done_set = false;
-        if (release_prompt_down_soa_after_dispatch || pp_moe_onednn_scratch_claim_state.claimed()) {
-            prompt_down_dispatch_done     = ggml_sycl_submit_marker<pp_moe_prompt_down_dispatch_done_marker>(*stream);
-            prompt_down_dispatch_done_set = true;
-        }
-        if (pp_moe_onednn_scratch_claim_state.claimed()) {
-            std::vector<ggml_sycl::mem_handle> pp_moe_slot_owners;
-            if (pp_moe_onednn_scratch.weight_owner.valid()) {
-                pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.weight_owner));
-            }
-            if (pp_moe_onednn_scratch.activation_owner.valid()) {
-                pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.activation_owner));
-            }
-            if (pp_moe_onednn_scratch.output_owner.valid()) {
-                pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.output_owner));
-            }
-            pp_moe_onednn_scratch_claim_state.bind_owners(std::move(pp_moe_slot_owners));
-            pp_moe_onednn_scratch_claim_state.record(prompt_down_dispatch_done);
-        }
-        if (!pp_gpu_leases.empty()) {
-            ggml_sycl::retain_handles_until_event(std::move(pp_gpu_leases), prompt_down_dispatch_done_set ?
-                                                                                prompt_down_dispatch_done :
-                                                                                stream->ext_oneapi_submit_barrier());
-        }
-        if (use_expert_cache && src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
-            std::vector<ggml_sycl::mem_handle> ptr_table_dispatch_bundle =
-                ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device);
-            if (!ptr_table_dispatch_bundle.empty()) {
-                ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle),
-                                                      prompt_down_dispatch_done_set ? prompt_down_dispatch_done :
-                                                                                     stream->ext_oneapi_submit_barrier());
-            }
-        }
-        if (release_prompt_down_soa_after_dispatch) {
-            (void) graph_release_moe_expert_leases_for_tensor_layout(&ctx, src0, ctx.device, GGML_LAYOUT_SOA);
-            const bool released = ggml_sycl_release_moe_tensor_layout(src0, ctx.device, GGML_LAYOUT_SOA);
-            if (released && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-                static std::atomic<int> transient_down_release_log{ 0 };
-                if (transient_down_release_log.fetch_add(1, std::memory_order_relaxed) < 96) {
-                    fprintf(stderr,
-                            "[MOE-PHASE-LAYOUT] tensor=%s device=%d layout=%s released_after_dispatch=1 "
-                            "waited_after_dispatch=0 reason=prompt-down-transient\n",
-                            src0 && src0->name ? src0->name : "?", ctx.device,
-                            ggml_sycl_layout_mode_name(GGML_LAYOUT_SOA));
-                }
-            }
-        }
+        retain_pp_dispatch_until_done();
         pp_phase_log("pp-retain-submitted", route_layout, row_maps_total,
                      pp_entries_dev0 + pp_entries_dev1 + pp_entries_host + pp_entries_unavailable);
         if (ggml_sycl::ggml_sycl_moe_route_log_enabled() &&
@@ -96387,6 +96460,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     ggml_sycl_fatal_exit(ggml_sycl_fatal_exit_code(exc.what()), "ggml_sycl_mul_mat_id");
 }
+
+#undef GGML_SYCL_MOE_PP_STAGING_FAILPOINT
 
 static void ggml_sycl_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);
