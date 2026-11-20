@@ -3877,10 +3877,10 @@ struct expert_resolve_result {
 // which check the unified cache directly.
 
 // Get popularity rank for a specific expert (0 = most popular, -1 = unranked).
-// Called by cache eviction scoring to boost popular experts.
+// Keyed by block number; the placement planner orders expert triplets by it.
 int get_expert_popularity_rank(int layer_id, int expert_id);
 
-// Set popularity rank for a specific expert (called after warmup profiling).
+// Set popularity rank for a specific expert, keyed by block number.
 void set_expert_popularity_rank(int layer_id, int expert_id, int rank);
 
 // Returns true if any popularity ranks have been set.

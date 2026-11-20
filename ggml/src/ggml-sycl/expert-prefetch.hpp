@@ -96,11 +96,6 @@ sycl::event fill_reordered_host(sycl::queue &                    queue,
                                 const void *                     ctx,
                                 const std::vector<sycl::event> & deps);
 
-// Look up expert frequency from epoch counters (recorded during MoE warmup/re-ranking).
-// Maps hash-based layer_id -> sequential index, then reads atomic epoch_counts.
-// Returns 0 if the expert has no recorded frequency (unknown layer or expert).
-uint32_t get_expert_frequency(int layer_hash, int expert_id);
-
 // Tracks a single in-flight async DMA prefetch operation.
 // The event is from direct_stage_expert() and completes when H2D DMA +
 // AOS->SOA reorder finish on the cache's DMA queue.

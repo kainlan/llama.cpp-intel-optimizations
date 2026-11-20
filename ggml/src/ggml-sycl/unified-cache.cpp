@@ -14915,7 +14915,6 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
 
     unified_cache_key evict_key{};
     int               best_tier        = std::numeric_limits<int>::max();
-    uint32_t          best_freq        = UINT32_MAX;  // Lower frequency = evict first (MoE only)
     int64_t           best_last_access = std::numeric_limits<int64_t>::max();
     bool              found            = false;
 
@@ -14959,32 +14958,12 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
             continue;
         }
 
-        const int tier = eviction_tier(entry);
-
-        // For MoE expert entries (tier 0/1): use frequency as primary signal
-        // within the same tier, with last_access as tiebreaker.
-        // For dense weights (tier 2/3) and host-resident (tier -1): pure LRU.
-        uint32_t freq = 0;
-        if (entry.type == cache_entry_type::MOE_EXPERT && entry.expert_id >= 0) {
-            freq = ggml_sycl::get_expert_frequency(entry.layer_id, entry.expert_id);
-        }
-
-        bool is_better = false;
-        if (tier < best_tier) {
-            is_better = true;
-        } else if (tier == best_tier) {
-            if (entry.type == cache_entry_type::MOE_EXPERT && entry.expert_id >= 0) {
-                // Frequency-weighted: evict lowest frequency first, LRU tiebreaker
-                is_better = (freq < best_freq) || (freq == best_freq && entry.last_access < best_last_access);
-            } else {
-                // Pure LRU for dense weights and host-resident entries
-                is_better = (entry.last_access < best_last_access);
-            }
-        }
+        // The lowest tier goes first; within a tier, the least recently used entry.
+        const int  tier      = eviction_tier(entry);
+        const bool is_better = tier < best_tier || (tier == best_tier && entry.last_access < best_last_access);
 
         if (is_better) {
             best_tier        = tier;
-            best_freq        = freq;
             best_last_access = entry.last_access;
             evict_key        = pair.first;
             found            = true;
@@ -15261,8 +15240,8 @@ float unified_cache::compute_score(const unified_cache_entry & entry) const {
         constexpr float k_hot_boost = 1.5f;
         return base_score * k_hot_boost;
     }
-    // Boost MoE experts with high popularity (low rank = more popular).
-    // This makes popular experts resist VRAM eviction after warmup profiling.
+    // Boost MoE experts with high popularity (low rank = more popular), so
+    // popular experts resist VRAM eviction.
     if (entry.type == cache_entry_type::MOE_EXPERT && entry.layer_id >= 0 && entry.expert_id >= 0) {
         if (is_expert_popularity_initialized()) {
             int pop_rank = get_expert_popularity_rank(entry.layer_id, entry.expert_id);

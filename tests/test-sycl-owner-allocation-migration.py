@@ -154,6 +154,8 @@ with gate('fattn-failure-atomicity'):
 # llama.cpp-36j0 retired one more legacy unified_alloc(: S1-PRELOAD's host-planned expert storage is minted
 # owner-first by the named ggml_sycl_host_expert_alloc, so the expert's cache entry carries a typed owner that its
 # leases report through owner_metadata() -- 53->52 unified_alloc( code sites.
+# Removing the legacy expert prestage retired two legacy pairs, its host staging and its reorder buffer --
+# 52->50 unified_alloc( and 41->39 from_legacy_owned_alloc( code sites.
 RUNTIME_CODE     = _blank_comments(RUNTIME)
 COMMON_CODE      = _blank_comments(COMMON)
 COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
@@ -283,7 +285,7 @@ with gate("every named owner-first site in ggml-sycl.cpp is a guarded, owner-fir
         RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + len(_spans)
 
 for _label, _code, _pins in (
-    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (52, 41, OWNER_FIRST_BASELINE_SITES)),
+    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (50, 39, OWNER_FIRST_BASELINE_SITES)),
     ("common.hpp", COMMON_CODE, (3, 4, 3)),
     ("common.cpp", COMMON_IMPL_CODE, (8, 8, 4)),
 ):
@@ -667,7 +669,7 @@ with gate('graph-preload-not-in-refresh'):
                      "if (refresh_moe_after_pp || post_prompt_refresh_due)", "const int descriptor_moe_graph_candidates")
     assert not re.search(r"\bgraph_preload_moe_experts\s*\(", refresh)
     assert not re.search(r"\bggml_sycl_moe_graph_preload_decide\s*\(", refresh)
-    assert "ggml_sycl_materialize_moe_down_i8_hotset(" in refresh and "moe_prestage_popular_experts();" in refresh
+    assert "ggml_sycl_materialize_moe_down_i8_hotset(" in refresh
     print("PASS graph-preload-not-in-refresh-source-gate")
 
 with gate('decode-env-reads-once'):
@@ -1655,34 +1657,17 @@ with gate('moe-metadata'):
 
 with gate('moe-paired-snapshot'):
     # Reader side of the same contract. The writer publishing both registries under
-    # one scoped_lock buys nothing if readers acquire them separately: a reader that
-    # consults BOTH within one logical operation can otherwise pair one model's
-    # metadata with the next model's groups, and expert_group_key carries no model
-    # identity to catch it. Every such reader must go through one paired snapshot.
-    snapshot = region(RUNTIME, "static moe_registry_snapshot moe_snapshot_registries", "// Residency against a caller-held")
-    assert "std::scoped_lock      lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" in snapshot
-    assert snapshot.index("scoped_lock") < snapshot.index("snapshot.meta   = g_moe_expert_meta")
-    assert snapshot.index("snapshot.meta   = g_moe_expert_meta") < snapshot.index("snapshot.groups = g_expert_groups")
-
-    # is_expert_resident must keep a lock-free overload, or a dual reader holding a
-    # paired snapshot would have to re-enter the group lock to ask about residency --
-    # reading a newer epoch than the metadata it holds, and deadlocking outright if
-    # the snapshot lock were still held (shared_mutex is not recursive).
+    # one scoped_lock buys nothing if a reader that consults BOTH within one logical
+    # operation acquires them separately: it can pair one model's metadata with the
+    # next model's groups, and expert_group_key carries no model identity to catch it.
+    # Such a reader copies both under one scoped_lock and asks about residency on its
+    # copy, so is_expert_resident must keep a lock-free overload: re-entering the group
+    # lock would read a newer epoch than the metadata it holds, and deadlock outright
+    # under the held scoped_lock (shared_mutex is not recursive).
     assert "static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tensor_group> & groups" in RUNTIME
-    resident = region(RUNTIME, "static bool is_expert_resident(int block_id", "// Forward declarations needed by moe_prestage")
+    resident = region(RUNTIME, "static bool is_expert_resident(int block_id",
+                      "// Forward declarations (defined later in file).")
     assert "return is_expert_resident_in(g_expert_groups, block_id, expert_id, device_id)" in resident
-
-    # The two dual-consumer readers take the paired snapshot and never re-acquire
-    # either mutex for the rest of the operation.
-    for start, end, name in (
-        ("static void moe_prestage_popular_experts", "// SOA-correct expert caching: single-expert wrapper", "prestage"),
-        ("        // We need block_num for the residency checks", "    void worker_loop()", "rebalance"),
-    ):
-        block = region(RUNTIME, start, end)
-        assert "moe_snapshot_registries()" in block, name
-        assert "g_expert_groups_mutex" not in block, name
-        assert "g_moe_expert_meta_mutex" not in block, name
-        assert "is_expert_resident(" not in block, name
     print("PASS moe-registry-paired-snapshot-reader-source-gate")
 # HM Task 2 (llama.cpp-81gt): CACHE_BACKING classification must be unforgeable.
 # `alloc_constraints.cache_backing` was a public caller-writable bool, so any

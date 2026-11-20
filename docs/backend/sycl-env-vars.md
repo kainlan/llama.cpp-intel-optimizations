@@ -891,9 +891,7 @@ materialized by `ggml_sycl_materialize_moe_tensor_phase_layout()`'s bulk-XMX
 branch (role/`cache_layout` 4 = `GGML_LAYOUT_XMX_TILED`), reached from the
 graph-compute path's `GGML_OP_MUL_MAT_ID` scan — a runtime path with no load
 transaction bound, so the load-transaction-scoped `stamp_pending_owner()` /
-`note_model_load_end()` tagging never reaches them. (`moe_prestage_popular_experts()`
-is a different function; it stages only `GGML_LAYOUT_SOA`/`GGML_LAYOUT_AOS`
-and merely *pins* an already-existing `XMX_TILED` entry, never creates one.)
+`note_model_load_end()` tagging never reaches them.
 `MODEL_TEARDOWN` preserves untagged entries unconditionally, so they are not
 reclaimed until the next `MID_LOAD_REPLAN` (immediately, regardless of
 `live_mask` — untagged means `owner_mask == 0`, which never overlaps

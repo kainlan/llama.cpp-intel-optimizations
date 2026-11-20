@@ -3429,229 +3429,6 @@ static bool ggml_sycl_secondary_local_agg_enabled() {
     return v != 0;
 }
 
-// -----------------------------------------------------------------------
-// Popularity-aware expert placement: warmup profiling + re-placement.
-// During the first WARMUP_TOKENS tokens, count activations per expert per
-// layer.  After warmup, sort experts by frequency and update the placement
-// table with popularity ranks.  Hot experts are placed on B580 (GPU0),
-// warm on B50 (GPU1), cold remain on CPU.
-// -----------------------------------------------------------------------
-static constexpr int MOE_MAX_LAYERS  = 128;
-static constexpr int MOE_MAX_EXPERTS = 256;
-
-struct moe_warmup_state {
-    std::atomic<uint32_t> counts[MOE_MAX_LAYERS][MOE_MAX_EXPERTS] = {};
-    std::atomic<int>      token_count{ 0 };
-    std::atomic<bool>     warmup_done{ false };
-    int                   warmup_tokens = 8;  // configurable via env
-    int                   n_layers      = 0;
-    int                   n_experts     = 0;
-
-    // Periodic re-ranking state (active after initial warmup completes)
-    std::atomic<uint32_t> epoch_counts[MOE_MAX_LAYERS][MOE_MAX_EXPERTS] = {};
-    std::atomic<int>      epoch_token_count{ 0 };
-    std::atomic<bool>     reranking_enabled{ false };
-    int                   rerank_interval = 100;  // tokens between re-ranks
-
-    void init(int nl, int ne) {
-        n_layers      = std::min(nl, MOE_MAX_LAYERS);
-        n_experts     = std::min(ne, MOE_MAX_EXPERTS);
-        // Default to gate norms instead of inference-based profiling.
-        // Gate norms take ~100-200ms vs 5-10s for synthetic inference, with comparable
-        // cache hit rates.
-        warmup_tokens = 0;  // Use gate norms, skip inference profiling
-        // Warmup tokens and rerank interval are auto-determined by the unified
-        // cache planner. Rerank is disabled by default (interval=0).
-        if (warmup_tokens == 0) {
-            GGML_LOG_INFO(
-                "[MOE-WARMUP] Zero-warmup mode: %d layers x %d experts, "
-                "using gate weight norms for initial placement\n",
-                n_layers, n_experts);
-        } else {
-            GGML_LOG_INFO(
-                "[MOE-WARMUP] Profiling %d layers x %d experts for %d tokens, "
-                "re-rank every %d tokens\n",
-                n_layers, n_experts, warmup_tokens, rerank_interval);
-        }
-    }
-
-    void record(int layer_id, const int32_t * expert_ids, int n_selected) {
-        if (layer_id < 0 || layer_id >= n_layers) {
-            return;
-        }
-        // Always record into epoch counters (for periodic re-ranking)
-        if (reranking_enabled.load(std::memory_order_acquire)) {
-            for (int i = 0; i < n_selected; i++) {
-                int eid = expert_ids[i];
-                if (eid >= 0 && eid < n_experts) {
-                    epoch_counts[layer_id][eid].fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-            return;  // Warmup counters frozen after initial warmup
-        }
-        // During initial warmup: record into warmup counters
-        if (warmup_done.load(std::memory_order_acquire)) {
-            return;
-        }
-        for (int i = 0; i < n_selected; i++) {
-            int eid = expert_ids[i];
-            if (eid >= 0 && eid < n_experts) {
-                counts[layer_id][eid].fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-    }
-
-    // Called once per token.  Returns true on the token that ends warmup.
-    bool tick_token() {
-        if (warmup_done.load(std::memory_order_acquire)) {
-            return false;
-        }
-        int t = token_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (t >= warmup_tokens) {
-            warmup_done.store(true, std::memory_order_release);
-            return true;
-        }
-        return false;
-    }
-
-    // Called once per token after warmup.  Returns true when a re-rank epoch completes.
-    // Uses aggressive initial re-ranking: first 5 epochs use interval/10 (min 10)
-    // to fill VRAM cache 10x faster during warmup, then settles to normal interval.
-    std::atomic<int> epoch_number{ 0 };
-
-    bool tick_epoch() {
-        if (!reranking_enabled.load(std::memory_order_acquire)) {
-            return false;
-        }
-        if (rerank_interval <= 0) {
-            return false;
-        }
-        int t = epoch_token_count.fetch_add(1, std::memory_order_relaxed) + 1;
-
-        int effective_interval = rerank_interval;
-        if (epoch_number.load(std::memory_order_relaxed) < 5) {
-            effective_interval = std::max(10, rerank_interval / 10);
-        }
-
-        if (t >= effective_interval) {
-            epoch_token_count.store(0, std::memory_order_relaxed);
-            epoch_number.fetch_add(1, std::memory_order_relaxed);
-            return true;
-        }
-        return false;
-    }
-
-    void reset() {
-        for (int l = 0; l < MOE_MAX_LAYERS; ++l) {
-            for (int e = 0; e < MOE_MAX_EXPERTS; ++e) {
-                counts[l][e].store(0, std::memory_order_relaxed);
-                epoch_counts[l][e].store(0, std::memory_order_relaxed);
-            }
-        }
-        token_count.store(0, std::memory_order_relaxed);
-        warmup_done.store(false, std::memory_order_relaxed);
-        epoch_token_count.store(0, std::memory_order_relaxed);
-        epoch_number.store(0, std::memory_order_relaxed);
-        reranking_enabled.store(false, std::memory_order_relaxed);
-        n_layers = 0;
-        n_experts = 0;
-    }
-
-    // Enable periodic re-ranking (called after initial warmup + prestage completes)
-    void enable_reranking() {
-        if (rerank_interval <= 0) {
-            return;
-        }
-        // Zero out epoch counters for fresh accumulation
-        for (int l = 0; l < n_layers; l++) {
-            for (int e = 0; e < n_experts; e++) {
-                epoch_counts[l][e].store(0, std::memory_order_relaxed);
-            }
-        }
-        epoch_token_count.store(0, std::memory_order_relaxed);
-        reranking_enabled.store(true, std::memory_order_release);
-    }
-};
-
-static moe_warmup_state g_moe_warmup;
-
-// Apply warmup results: sort experts by popularity and update popularity ranks.
-// Called once after warmup completes.
-static void moe_apply_popularity_placement() {
-    const int nl = g_moe_warmup.n_layers;
-    const int ne = g_moe_warmup.n_experts;
-    if (nl <= 0 || ne <= 0) {
-        return;
-    }
-
-    // Build reverse map: sequential layer index -> hash-based layer_id.
-    // g_moe_layer_seq[device] maps hash -> sequential; we invert it.
-    // Use device 0 as the canonical source (all devices share the same mapping).
-    std::unordered_map<int, int> seq_to_hash;
-    for (const auto & [hash_id, seq_id] : g_moe_layer_seq[0]) {
-        seq_to_hash[seq_id] = hash_id;
-    }
-
-    int total_placed = 0;
-    for (int l = 0; l < nl; l++) {
-        // Map sequential index back to hash-based layer_id for popularity ranking
-        auto it = seq_to_hash.find(l);
-        if (it == seq_to_hash.end()) {
-            continue;
-        }
-        int hash_layer_id = it->second;
-
-        // Collect (count, expert_id) pairs and sort descending by count
-        std::vector<std::pair<uint32_t, int>> sorted_experts;
-        sorted_experts.reserve(ne);
-        for (int e = 0; e < ne; e++) {
-            uint32_t c = g_moe_warmup.counts[l][e].load(std::memory_order_relaxed);
-            sorted_experts.push_back({ c, e });
-        }
-        std::sort(sorted_experts.begin(), sorted_experts.end(),
-                  [](const auto & a, const auto & b) { return a.first > b.first; });
-
-        // Assign popularity ranks using hash-based layer_id
-        for (int rank = 0; rank < (int) sorted_experts.size(); rank++) {
-            int eid = sorted_experts[rank].second;
-            ggml_sycl::set_expert_popularity_rank(hash_layer_id, eid, rank);
-        }
-        total_placed += (int) sorted_experts.size();
-    }
-
-    GGML_LOG_INFO("[MOE-WARMUP] Popularity profiling complete: %d layers, %d total experts ranked\n", nl, total_placed);
-
-    // Log top-3 most popular experts per layer (first 4 layers)
-    for (int l = 0; l < std::min(nl, 4); l++) {
-        std::vector<std::pair<uint32_t, int>> layer_counts;
-        for (int e = 0; e < ne; e++) {
-            uint32_t c = g_moe_warmup.counts[l][e].load(std::memory_order_relaxed);
-            if (c > 0) {
-                layer_counts.push_back({ c, e });
-            }
-        }
-        std::sort(layer_counts.begin(), layer_counts.end(),
-                  [](const auto & a, const auto & b) { return a.first > b.first; });
-        if (layer_counts.size() >= 3) {
-            GGML_LOG_INFO("[MOE-WARMUP] Layer %d top-3: expert %d (%u), expert %d (%u), expert %d (%u)\n", l,
-                          layer_counts[0].second, layer_counts[0].first, layer_counts[1].second, layer_counts[1].first,
-                          layer_counts[2].second, layer_counts[2].first);
-        }
-    }
-
-    // Signal that popularity data is now available.
-    // The next update_moe_ptr_table call for each layer will use
-    // direct_stage_expert to pre-stage popular experts that weren't
-    // already GPU-resident. The eviction scoring in unified-cache.cpp
-    // also uses popularity_rank to retain hot experts in cache.
-    GGML_LOG_INFO(
-        "[MOE-WARMUP] Popularity ranks applied. Cache eviction "
-        "now favors popular experts; pre-staging on next dispatch.\n");
-}
-
-// Forward declaration: zero-warmup gate-norm placement (defined before moe_hybrid_init_once).
-static void moe_compute_gate_norm_placement(ggml_cgraph * cgraph, int device);
-
 // ---------------------------------------------------------------------------
 // MoE expert tensor type classification.
 // In MoE FFN: hidden -> gate*up -> SiLU -> down -> output
@@ -3751,7 +3528,7 @@ static int moe_extract_block_number(const char * name) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-expert metadata for proactive pre-staging after warmup.
+// Per-expert metadata of the MoE expert tensors (gate, up and down of each block).
 // Populated once during moe_hybrid_init_once(), keyed by (hash_layer_id, expert_idx).
 // ---------------------------------------------------------------------------
 struct moe_expert_meta {
@@ -4134,10 +3911,11 @@ static moe_expert_source ggml_sycl_resolve_moe_meta_source(const moe_expert_meta
 }
 
 // ---------------------------------------------------------------------------
-// Lightweight popularity ranking: maps (layer_id, expert_id) -> popularity rank.
-// Replaces ExpertPlacementTable's popularity_rank field.
+// Lightweight popularity ranking: maps (block number, expert_id) -> popularity rank.
+// The key is the block number, as the planner (build_moe_triplet_groups) asks for
+// it; the one writer is ggml_sycl_update_moe_hotset on the retained route.
 // Rank 0 = most popular, -1 = unranked.
-// Thread-safe via shared_mutex (writes rare, reads frequent on eviction path).
+// Thread-safe via shared_mutex (writes rare, reads frequent).
 // ---------------------------------------------------------------------------
 static std::unordered_map<int64_t, int> g_expert_popularity;
 static std::shared_mutex                g_expert_popularity_mutex;
@@ -4226,10 +4004,6 @@ bool is_expert_popularity_initialized() {
 }
 
 }  // namespace ggml_sycl
-
-// Tracks whether initial expert prestage has completed. Defined here (before
-// is_expert_resident) so startup-time cache misses can be suppressed.
-static std::atomic<bool> g_prestage_completed{ false };
 
 // Upfront VRAM budget reserved for MoE experts at inventory time (Phase 1).
 // Released after prestage completes and actual usage is tracked in cache (Phase 2).
@@ -4326,10 +4100,10 @@ static void ggml_sycl_moe_bias_state_clear() {
 //
 // Everything the two classes below touch is host metadata that exactly one
 // model's graph produces: the hash -> sequential layer map, the hybrid-init
-// guards, the warmup counters, the popularity ranks, the expert metadata and
-// group registries, and the prestage flags. None of it owns a mem_handle, a
-// device allocation or an event, which is why it can be parked for a model that
-// is still loaded and handed back when that model is activated again.
+// guards, the popularity ranks, the expert metadata and the group registries.
+// None of it owns a mem_handle, a device allocation or an event, which is why it
+// can be parked for a model that is still loaded and handed back when that model
+// is activated again.
 //
 // It was previously written once, by whichever model reached
 // moe_hybrid_init_once() first, and cleared only at module shutdown:
@@ -4345,15 +4119,9 @@ static void ggml_sycl_moe_bias_state_clear() {
 // graph.
 // ---------------------------------------------------------------------------
 struct ggml_sycl_moe_parked_discovery : public ggml_sycl::moe_discovery_parked_state {
-    std::unordered_map<int, int>     layer_seq[GGML_SYCL_MAX_DEVICES];
-    std::unordered_map<int64_t, int> popularity;
-    bool                             popularity_initialized = false;
-    int                              warmup_n_layers        = 0;
-    int                              warmup_n_experts       = 0;
-    bool                             warmup_done            = false;
-    // Sequential-layer major, warmup_n_layers * warmup_n_experts entries. Epoch
-    // counters are not carried: enable_reranking() zeroes them by design.
-    std::vector<uint32_t>            warmup_counts;
+    std::unordered_map<int, int>         layer_seq[GGML_SYCL_MAX_DEVICES];
+    std::unordered_map<int64_t, int>     popularity;
+    bool                                 popularity_initialized = false;
     // The owner's expert-bias and fused-activation working set (llama.cpp-nlww).
     // Unlike every other member here it is MOVED out of the live state rather
     // than copied out of it, because the map's pointers address the host buffers
@@ -4374,20 +4142,6 @@ class ggml_sycl_moe_live_discovery final : public ggml_sycl::moe_discovery_live_
                 std::shared_lock<std::shared_mutex> lock(g_expert_popularity_mutex);
                 parked->popularity             = g_expert_popularity;
                 parked->popularity_initialized = g_expert_popularity_initialized;
-            }
-            const int nl             = g_moe_warmup.n_layers;
-            const int ne             = g_moe_warmup.n_experts;
-            parked->warmup_n_layers  = nl;
-            parked->warmup_n_experts = ne;
-            parked->warmup_done      = g_moe_warmup.warmup_done.load(std::memory_order_acquire);
-            if (nl > 0 && ne > 0) {
-                parked->warmup_counts.resize(static_cast<size_t>(nl) * static_cast<size_t>(ne));
-                for (int l = 0; l < nl; ++l) {
-                    for (int e = 0; e < ne; ++e) {
-                        parked->warmup_counts[static_cast<size_t>(l) * static_cast<size_t>(ne) + e] =
-                            g_moe_warmup.counts[l][e].load(std::memory_order_relaxed);
-                    }
-                }
             }
             // Last, so that a throw above leaves the live bias state where
             // install_fresh() will clear it rather than half-detached. Either
@@ -4424,23 +4178,6 @@ class ggml_sycl_moe_live_discovery final : public ggml_sycl::moe_discovery_live_
                 g_expert_popularity             = state->popularity;
                 g_expert_popularity_initialized = state->popularity_initialized;
             }
-            const int nl = std::min(state->warmup_n_layers, MOE_MAX_LAYERS);
-            const int ne = std::min(state->warmup_n_experts, MOE_MAX_EXPERTS);
-            if (nl > 0 && ne > 0 &&
-                state->warmup_counts.size() ==
-                    static_cast<size_t>(state->warmup_n_layers) * static_cast<size_t>(state->warmup_n_experts)) {
-                for (int l = 0; l < nl; ++l) {
-                    for (int e = 0; e < ne; ++e) {
-                        g_moe_warmup.counts[l][e].store(
-                            state->warmup_counts[static_cast<size_t>(l) * static_cast<size_t>(state->warmup_n_experts) +
-                                                 e],
-                            std::memory_order_relaxed);
-                    }
-                }
-            }
-            g_moe_warmup.n_layers  = nl;
-            g_moe_warmup.n_experts = ne;
-            g_moe_warmup.warmup_done.store(state->warmup_done, std::memory_order_release);
         } catch (...) {
             // A partially restored set is indistinguishable from another
             // model's, so discard it entirely and let the owner rediscover.
@@ -4461,8 +4198,6 @@ class ggml_sycl_moe_live_discovery final : public ggml_sycl::moe_discovery_live_
                 g_moe_layer_seq[d].clear();
             }
             g_moe_hybrid_init_done.store(false, std::memory_order_release);
-            g_prestage_completed.store(false, std::memory_order_release);
-            g_moe_warmup.reset();
             {
                 std::unique_lock<std::shared_mutex> lock(g_expert_popularity_mutex);
                 g_expert_popularity.clear();
@@ -4488,32 +4223,13 @@ static ggml_sycl::moe_discovery_registry g_moe_discovery_registry(g_moe_live_dis
 // Checks the unified cache for ALL 3 tensors (gate, up, down) across multiple
 // layout modes (SOA, COALESCED, AOS, XMX_TILED).
 // Returns true only if all 3 tensors that have been registered are found.
-// One consistent view of both MoE registries. moe_hybrid_init_once publishes
-// g_moe_expert_meta and g_expert_groups together under a single scoped_lock, so
-// a reader that consults BOTH within one logical operation has to acquire them
-// the same way. Taking them under separate locks admits a window in which a
-// concurrent init has swapped one and not the other, and expert_group_key
-// carries no model identity -- so a torn pair can resolve one model's metadata
-// against another model's group.
-struct moe_registry_snapshot {
-    std::vector<moe_expert_meta>                     meta;
-    std::unordered_map<int64_t, expert_tensor_group> groups;
-};
-
-static moe_registry_snapshot moe_snapshot_registries() {
-    moe_registry_snapshot snapshot;
-    std::scoped_lock      lock(g_moe_expert_meta_mutex, g_expert_groups_mutex);
-    snapshot.meta   = g_moe_expert_meta;
-    snapshot.groups = g_expert_groups;
-    return snapshot;
-}
-
 // Residency against a caller-held group view. Callers touching only the group
 // registry use the locking wrapper below. A caller that also reads the expert
-// metadata in the same operation must pass its paired snapshot here instead:
-// re-entering the group lock would read a possibly newer epoch than the
-// metadata it already holds, and doing so under a held scoped_lock would
-// deadlock on a non-recursive shared_mutex.
+// metadata in the same operation must copy both registries under one
+// scoped_lock and pass its copy of the groups here: re-entering the group lock
+// would read a possibly newer epoch than the metadata it already holds, and
+// doing so under a held scoped_lock would deadlock on a non-recursive
+// shared_mutex.
 static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tensor_group> & groups,
                                   int                                                      block_id,
                                   int                                                      expert_id,
@@ -4551,11 +4267,8 @@ static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tenso
 
     // All registered roles must be cached
     if (grp.has_gate && !check_key(grp.gate_key, "gate")) {
-        // Suppress during startup: before initial prestage completes, experts
-        // aren't cached yet (expected).  Only log after prestage has run.
         const char * route_log_env = std::getenv("GGML_SYCL_MOE_ROUTE_LOG");
-        if (g_prestage_completed.load(std::memory_order_acquire) &&
-            (g_ggml_sycl_debug || (route_log_env && std::atoi(route_log_env) != 0))) {
+        if (g_ggml_sycl_debug || (route_log_env && std::atoi(route_log_env) != 0)) {
             static std::atomic<int> fail_log{ 0 };
             if (fail_log.fetch_add(1, std::memory_order_relaxed) < 3) {
                 fprintf(stderr,
@@ -4584,7 +4297,7 @@ static bool is_expert_resident(int block_id, int expert_id, int device_id) {
     return is_expert_resident_in(g_expert_groups, block_id, expert_id, device_id);
 }
 
-// Forward declarations needed by moe_prestage_popular_experts (defined later in file).
+// Forward declarations (defined later in file).
 static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *     tensor,
                                                              ggml_tensor_extra_gpu * extra,
                                                              int                     expert_id);
@@ -4779,983 +4492,6 @@ static bool ggml_sycl_graph_has_host_inputs(const ggml_cgraph * cgraph) {
     }
 
     return false;
-}
-
-static bool ggml_sycl_legacy_prestage_enabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char * env = std::getenv("GGML_SYCL_LEGACY_PRESTAGE");
-        cached           = (env && std::atoi(env) != 0) ? 1 : 0;
-    }
-    return cached != 0;
-}
-
-static bool ggml_sycl_runtime_prestage_enabled() {
-    if (ggml_sycl_legacy_prestage_enabled()) {
-        return true;
-    }
-    const int n_devs = std::min<int>(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
-    for (int d = 0; d < n_devs; ++d) {
-        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(d)) {
-            if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Proactive pre-staging: upload popular experts to GPU0 VRAM after warmup.
-// Called immediately after moe_apply_popularity_placement() sets popularity ranks.
-// ---------------------------------------------------------------------------
-// g_prestage_completed defined earlier (before is_expert_resident).
-
-static void moe_prestage_popular_experts() {
-    if (!ggml_sycl_runtime_prestage_enabled()) {
-        static std::atomic<int> logged{ 0 };
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 1) {
-            GGML_LOG_INFO(
-                "[MOE-PRESTAGE] Placement-plan preload active; runtime prestage disabled "
-                "(set GGML_SYCL_LEGACY_PRESTAGE=1 to restore legacy behavior)\n");
-        }
-        g_prestage_completed.store(true, std::memory_order_release);
-        return;
-    }
-    if (g_prestage_completed.load(std::memory_order_acquire)) {
-        return;
-    }
-    if (!ggml_sycl::is_expert_popularity_initialized()) {
-        return;
-    }
-
-    // Copy descriptors under the registry mutexes. No registry element address
-    // may escape the critical section or be used by background staging.
-    //
-    // Both registries are taken as ONE paired snapshot: this pass reads the
-    // metadata here and then consults the group registry repeatedly (directly,
-    // and through is_expert_resident_in) far below. Acquiring them separately
-    // would let a moe_hybrid_init_once land in between and pair this model's
-    // metadata with the next model's groups.
-    const moe_registry_snapshot          registries  = moe_snapshot_registries();
-    const std::vector<moe_expert_meta> & expert_meta = registries.meta;
-    if (expert_meta.empty()) {
-        return;
-    }
-
-    // Count unique layer IDs for budget calculations.
-    std::unordered_set<int> layer_ids;
-    for (const auto & meta : expert_meta) {
-        layer_ids.insert(meta.layer_id);
-    }
-
-    const int n_layers = static_cast<int>(layer_ids.size());
-    if (n_layers == 0) {
-        return;
-    }
-
-    const size_t expert_bytes = expert_meta[0].bytes;
-    if (expert_bytes == 0) {
-        return;
-    }
-
-    // Phase 1: Pre-stage popular experts to GPU0 VRAM.
-    // S1-PRELOAD fills VRAM with AOS copies of dense weights —
-    // available_for_compute() may return 0.  But these AOS entries are evictable:
-    // the cache does LRU eviction internally.  Use total managed cache capacity MINUS
-    // a compute reserve as the budget so hot SOA experts can replace cold AOS entries
-    // while leaving room for compute buffers, KV cache, and other runtime allocations
-    // that will be reserved after prestage.
-    // Without this reserve, prestage fills ALL VRAM and later runtime reservations
-    // trigger "Budget exceeded" when update_reserved_bytes shrinks the budget.
-    const int                  device = 0;
-    ggml_sycl::unified_cache * cache  = ggml_sycl::get_unified_cache_for_device(device);
-    size_t                     avail;
-    if (cache) {
-        // AOS entries are evictable — use total managed capacity minus compute reserve
-        // and runtime reservations (KV cache, compute buffers).
-        // Runtime bytes include device-side KV cache which must not be evicted.
-        cache->unpin_experts();
-        const size_t total_managed = ggml_sycl::unified_cache_total_managed(device);
-        const size_t runtime_bytes = ggml_sycl::unified_cache_get_runtime_bytes(device);
-        size_t       free_vram = 0, total_vram = 0;
-        ggml_backend_sycl_get_device_memory(device, &free_vram, &total_vram);
-        const size_t compute_reserve = std::max(size_t(256) << 20, total_vram / 10);
-        const size_t total_reserve   = compute_reserve + runtime_bytes;
-        avail                        = (total_managed > total_reserve) ? total_managed - total_reserve : 0;
-        GGML_LOG_INFO(
-            "[MOE-PRESTAGE] total_managed=%zu MB, compute_reserve=%zu MB, "
-            "runtime_reserved=%zu MB, prestage budget=%zu MB (evictable AOS entries)\n",
-            total_managed >> 20, compute_reserve >> 20, runtime_bytes >> 20, avail >> 20);
-    } else {
-        avail = ggml_sycl::unified_cache_available_for_compute(device);
-    }
-
-    // Build a global priority list shared by Phase 1 (GPU0) and Phase 2 (secondary GPUs).
-    // Sort order: popularity rank (ascending), then tensor_role (gate < up < down).
-    // This ensures gate+up tensors are cached before down tensors for each expert,
-    // which matches MoE FFN data flow: gate*up computed first, down computed second.
-    // Under VRAM pressure, down_exps are dropped first since they can be prefetched
-    // during the gate*up -> SiLU computation.
-    std::vector<const moe_expert_meta *> priority_list;
-    priority_list.reserve(expert_meta.size());
-    for (const auto & meta : expert_meta) {
-        priority_list.push_back(&meta);
-    }
-    std::sort(priority_list.begin(), priority_list.end(), [&](const moe_expert_meta * a, const moe_expert_meta * b) {
-        int ra_raw = ggml_sycl::get_expert_popularity_rank(a->layer_id, a->expert_idx);
-        int rb_raw = ggml_sycl::get_expert_popularity_rank(b->layer_id, b->expert_idx);
-        int ra     = (ra_raw >= 0) ? ra_raw : INT_MAX;
-        int rb     = (rb_raw >= 0) ? rb_raw : INT_MAX;
-        if (ra != rb) {
-            return ra < rb;
-        }
-        // Same popularity: gate before up before down
-        return static_cast<int>(a->tensor_role) < static_cast<int>(b->tensor_role);
-    });
-
-    int prestaged     = 0;
-    int skipped       = 0;
-    int down_deferred = 0;
-
-    if (avail > 0 && cache) {
-        // --- Phase 1a: Group metadata by (block_num, expert_idx) for atomic staging ---
-        // Instead of per-tensor work items, we build per-expert groups.  Each group
-        // contains the gate/up/down metadata.  stage_expert_group stages all 3
-        // atomically (all succeed or none).
-        struct expert_meta_group {
-            const moe_expert_meta * gate       = nullptr;
-            const moe_expert_meta * up         = nullptr;
-            const moe_expert_meta * down       = nullptr;
-            int                     block_num  = -1;
-            int                     expert_idx = -1;
-            int                     pop_rank   = INT_MAX;
-        };
-
-        // Build expert groups from the metadata, keyed by (block_num, expert_idx)
-        std::unordered_map<int64_t, expert_meta_group> meta_groups;
-        for (const auto & meta : expert_meta) {
-            if (meta.block_num < 0) {
-                continue;
-            }
-
-            // Skip experts already resident in VRAM on any device
-            if (is_expert_resident_in(registries.groups, meta.block_num, meta.expert_idx, device)) {
-                skipped++;
-                continue;
-            }
-
-            const int64_t gkey = expert_group_key(meta.block_num, meta.expert_idx);
-            auto &        mg   = meta_groups[gkey];
-            mg.block_num       = meta.block_num;
-            mg.expert_idx      = meta.expert_idx;
-
-            int pop_rank = ggml_sycl::get_expert_popularity_rank(meta.layer_id, meta.expert_idx);
-            int rank     = (pop_rank >= 0) ? pop_rank : INT_MAX;
-            mg.pop_rank  = std::min(mg.pop_rank, rank);
-
-            switch (meta.tensor_role) {
-                case MOE_TENSOR_GATE:
-                    mg.gate = &meta;
-                    break;
-                case MOE_TENSOR_UP:
-                    mg.up = &meta;
-                    break;
-                case MOE_TENSOR_DOWN:
-                    mg.down = &meta;
-                    break;
-                default:
-                    break;
-            }
-        }
-
-        // Sort expert groups by popularity rank
-        std::vector<const expert_meta_group *> sorted_groups;
-        sorted_groups.reserve(meta_groups.size());
-        for (const auto & [gkey, mg] : meta_groups) {
-            sorted_groups.push_back(&mg);
-        }
-        std::sort(sorted_groups.begin(), sorted_groups.end(),
-                  [](const expert_meta_group * a, const expert_meta_group * b) { return a->pop_rank < b->pop_rank; });
-
-        // Decide whether to use GPU-side or CPU-side reorder
-        const bool use_gpu_reorder = !ggml_sycl_gpu_reorder_disabled();
-
-        // Get pre-allocated reorder temp buffer from cache (reserved during moe_hybrid_init_once).
-        // Falls back to per-expert dynamic alloc if not reserved.
-        void * prealloc_temp      = cache ? cache->get_reorder_temp_buffer() : nullptr;
-        size_t prealloc_temp_size = cache ? cache->get_reorder_temp_size() : 0;
-
-        // Fallback: deferred free list for dynamically allocated temp buffers
-        // (only used if pre-allocated buffer is unavailable or too small).
-        std::vector<ggml_sycl::mem_handle> temp_vram_bufs;
-        if (use_gpu_reorder && !prealloc_temp) {
-            temp_vram_bufs.reserve(sorted_groups.size() * 3);
-        }
-
-        auto t0 = std::chrono::high_resolution_clock::now();
-
-        // Source leases remain live until every staging queue is drained.
-        std::vector<moe_expert_source> source_leases;
-        source_leases.reserve(sorted_groups.size() * 3);
-
-        // Helper: build staging data + cache_layout_request for one tensor
-        auto build_tensor_data = [&](const moe_expert_meta * meta, ggml_sycl::staging_tensor_data & sd,
-                                     ggml_sycl::cache_layout_request & req, ggml_sycl_gpu_reorder_fill_ctx & gpu_fctx,
-                                     ggml_sycl_reorder_fill_ctx & host_fctx) -> bool {
-            if (!meta || !meta->canonical_key.valid) {
-                return false;
-            }
-            if (!ggml_sycl_layout_supports_soa(meta->type)) {
-                return false;
-            }
-
-            const ggml_sycl_cache_id ckey = meta->canonical_key;
-            moe_expert_source source = ggml_sycl_resolve_moe_meta_source(*meta, device);
-            if (!source) {
-                return false;
-            }
-            if (source.has_ready) {
-                source.ready.wait();
-            }
-            source_leases.push_back(std::move(source));
-            const void * source_ptr = source_leases.back().ptr;
-
-            const size_t soa_bytes =
-                ggml_sycl_layout_bytes_for_dims(meta->type, meta->ne0, meta->ne1, GGML_LAYOUT_SOA, device);
-            const size_t dst_bytes = (soa_bytes > 0) ? soa_bytes : meta->bytes;
-
-            sd.src_ptr   = source_ptr;
-            sd.src_size  = meta->bytes;
-            sd.dst_size  = dst_bytes;
-            sd.layer_id  = meta->layer_id;
-            sd.expert_id = meta->expert_idx;
-
-            req.key              = ggml_sycl_layout_specific_moe_expert_cache_key(ckey, GGML_LAYOUT_SOA);
-            req.src_ptr          = source_ptr;
-            req.src_size         = meta->bytes;
-            req.dst_size         = dst_bytes;
-            req.type             = ggml_sycl::cache_entry_type::MOE_EXPERT;
-            req.layer_id         = meta->layer_id;
-            req.expert_id        = meta->expert_idx;
-            req.layout           = GGML_LAYOUT_SOA;
-            req.validate_content = false;
-
-            if (use_gpu_reorder) {
-                gpu_fctx.type               = meta->type;
-                gpu_fctx.ncols              = meta->ne0;
-                gpu_fctx.nrows              = meta->ne1;
-                gpu_fctx.src_bytes          = meta->bytes;
-                gpu_fctx.dst_bytes          = dst_bytes;
-                gpu_fctx.temp_bufs          = prealloc_temp ? nullptr : &temp_vram_bufs;
-                gpu_fctx.owner_queue        = nullptr;
-                gpu_fctx.prealloc_temp      = prealloc_temp;
-                gpu_fctx.prealloc_temp_size = prealloc_temp_size;
-                gpu_fctx.bcs_queue          = cache ? &cache->get_bcs_queue() : nullptr;
-
-                req.fill_fn  = ggml_sycl_fill_reordered_gpu;
-                req.fill_ctx = &gpu_fctx;
-            } else {
-                host_fctx.type             = meta->type;
-                host_fctx.ncols            = meta->ne0;
-                host_fctx.nrows            = meta->ne1;
-                host_fctx.nbytes           = meta->bytes;
-                host_fctx.dst_bytes        = dst_bytes;
-                host_fctx.layout           = GGML_LAYOUT_SOA;
-                host_fctx.src_is_device    = source_leases.back().owning_device >= 0;
-                host_fctx.device_id        = device;
-                host_fctx.source_device_id = source_leases.back().owning_device;
-
-                req.fill_fn  = ggml_sycl_fill_reordered_host;
-                req.fill_ctx = &host_fctx;
-            }
-
-            return true;
-        };
-
-        int expert_groups_staged = 0;
-
-        // Pre-allocate fill context storage (must outlive stage_expert_group calls)
-        // 3 fill contexts per expert group for GPU and host paths
-        std::vector<ggml_sycl_gpu_reorder_fill_ctx> all_gpu_fill_ctxs(sorted_groups.size() * 3);
-        std::vector<ggml_sycl_reorder_fill_ctx>     all_host_fill_ctxs(sorted_groups.size() * 3);
-
-        for (size_t gi = 0; gi < sorted_groups.size(); gi++) {
-            const auto & mg = *sorted_groups[gi];
-
-            // Look up the expert group registry to get canonical cache keys.
-            // Reads the paired snapshot taken at entry, so these keys belong to
-            // the same publication epoch as the metadata that selected them.
-            const int64_t gkey   = expert_group_key(mg.block_num, mg.expert_idx);
-            auto          grp_it = registries.groups.find(gkey);
-            if (grp_it == registries.groups.end()) {
-                continue;
-            }
-            const auto & grp = grp_it->second;
-
-            // Build staging data for each tensor
-            ggml_sycl::staging_tensor_data  gate_sd{}, up_sd{}, down_sd{};
-            ggml_sycl::cache_layout_request gate_req{}, up_req{}, down_req{};
-            auto &                          gate_gpu_fctx  = all_gpu_fill_ctxs[gi * 3 + 0];
-            auto &                          up_gpu_fctx    = all_gpu_fill_ctxs[gi * 3 + 1];
-            auto &                          down_gpu_fctx  = all_gpu_fill_ctxs[gi * 3 + 2];
-            auto &                          gate_host_fctx = all_host_fill_ctxs[gi * 3 + 0];
-            auto &                          up_host_fctx   = all_host_fill_ctxs[gi * 3 + 1];
-            auto &                          down_host_fctx = all_host_fill_ctxs[gi * 3 + 2];
-
-            // P4: Check placement plan — skip experts planned for host.
-            // Each tensor (gate/up/down) is checked individually.  If the plan
-            // says an expert is not on device, skip its staging to avoid
-            // exhausting the WEIGHT zone on MoE models.
-            if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-                const auto   pp_owner            = ggml_sycl_cache_plan_owner(cache);
-                const auto & pp                  = *pp_owner;
-                auto         check_expert_tensor = [&](const moe_expert_meta * meta) -> bool {
-                    if (!meta || meta->tensor_name.empty()) {
-                        return true;
-                    }
-                    return pp.expert_on_device(meta->tensor_name, mg.expert_idx, device);
-                };
-                bool gate_on_dev = check_expert_tensor(mg.gate);
-                bool up_on_dev   = check_expert_tensor(mg.up);
-                bool down_on_dev = check_expert_tensor(mg.down);
-                if (!gate_on_dev && !up_on_dev && !down_on_dev) {
-                    skipped++;
-                    continue;
-                }
-            }
-
-            bool gate_ok = build_tensor_data(mg.gate, gate_sd, gate_req, gate_gpu_fctx, gate_host_fctx);
-            bool up_ok   = build_tensor_data(mg.up, up_sd, up_req, up_gpu_fctx, up_host_fctx);
-            bool down_ok = build_tensor_data(mg.down, down_sd, down_req, down_gpu_fctx, down_host_fctx);
-
-            if (!gate_ok && !up_ok && !down_ok) {
-                continue;
-            }
-
-            // Stage all 3 tensors atomically
-            ggml_sycl::expert_tensor_group layout_grp = grp;
-            if (layout_grp.has_gate) {
-                layout_grp.gate_key =
-                    ggml_sycl_layout_specific_moe_expert_cache_key(layout_grp.gate_key, GGML_LAYOUT_SOA);
-            }
-            if (layout_grp.has_up) {
-                layout_grp.up_key = ggml_sycl_layout_specific_moe_expert_cache_key(layout_grp.up_key, GGML_LAYOUT_SOA);
-            }
-            if (layout_grp.has_down) {
-                layout_grp.down_key =
-                    ggml_sycl_layout_specific_moe_expert_cache_key(layout_grp.down_key, GGML_LAYOUT_SOA);
-            }
-
-            bool ok = cache->stage_expert_group(mg.block_num, mg.expert_idx, layout_grp, gate_sd, up_sd, down_sd,
-                                                GGML_LAYOUT_SOA, gate_ok ? &gate_req : nullptr,
-                                                up_ok ? &up_req : nullptr, down_ok ? &down_req : nullptr);
-
-            if (ok) {
-                // Cache already has the staged handles — no separate ownership table needed.
-                // Dispatch resolves experts through the unified cache route resolver.
-                expert_groups_staged++;
-                prestaged += (gate_ok ? 1 : 0) + (up_ok ? 1 : 0) + (down_ok ? 1 : 0);
-            } else {
-                // VRAM exhausted — stop pre-staging
-                break;
-            }
-
-            // Periodic batch yield every 2 expert groups.
-            // With BCS/CCS engine split, individual CCS reorder kernels are ~10us
-            // and naturally preemptible.  The yield ensures:
-            //   1. ALL queues (CCS compute, DMA, BCS) drain pending work
-            //   2. Watchdog heartbeat prevents host-side timeout
-            // Without this, back-to-back submissions accumulate a non-preemptible
-            // command list that triggers xe driver GT engine resets.
-            // Reduced from 8 to 2 after 120B stability testing showed engine
-            // resets even with BCS/DMA draining — CCS compute queue was the
-            // missing piece (reorder kernels submit to CCS, not BCS).
-            constexpr int YIELD_BATCH = 2;
-            if (expert_groups_staged > 0 && expert_groups_staged % YIELD_BATCH == 0) {
-                try {
-                    cache->get_queue().wait();  // CCS compute queue
-                    cache->get_dma_queue().wait();
-                    cache->get_bcs_queue().wait();
-                    // Process deferred frees NOW — all queues drained, safe to unmap VRAM.
-                    // evict_one defers frees to prevent BCS CAT errors during prestage.
-                    cache->process_deferred_frees_public();
-                } catch (...) {
-                }
-                ggml_sycl_watchdog_heartbeat();
-            }
-        }
-
-        // Final flush: wait for all remaining in-flight fills
-        if (prestaged > 0) {
-            try {
-                cache->get_queue().wait();  // CCS compute queue
-                cache->get_dma_queue().wait();
-                cache->get_bcs_queue().wait();
-                // Process any deferred frees accumulated during eviction.
-                cache->process_deferred_frees_public();
-            } catch (...) {
-            }
-        }
-
-        // Free temp VRAM buffers (GPU reorder path)
-        if (use_gpu_reorder && !temp_vram_bufs.empty()) {
-            sycl::queue & cache_queue = cache->get_queue();
-            cache_queue.wait();
-            size_t temp_freed = 0;
-            for (const ggml_sycl::mem_handle & handle : temp_vram_bufs) {
-                if (const void * ptr = handle.resolve(device).ptr) {
-                    GGML_UNUSED(ptr);
-                    temp_freed++;
-                }
-            }
-            temp_vram_bufs.clear();
-            (void) temp_freed;
-        }
-
-        auto   t1       = std::chrono::high_resolution_clock::now();
-        double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        GGML_LOG_INFO(
-            "[MOE-PRESTAGE] Staged %d expert groups (%d tensors, 3 tensors each), "
-            "%.1f ms total (%s reorder)\n",
-            expert_groups_staged, prestaged, total_ms, use_gpu_reorder ? "GPU" : "CPU");
-
-        // Post-prestage verification: re-check residency for STAGED experts,
-        // against the snapshot this pass has been using throughout.
-        // Uses sorted_groups (popularity-sorted) to check the ones we actually staged.
-        {
-            int ok = 0, fail = 0, checked = 0;
-            for (size_t gi = 0; gi < sorted_groups.size() && checked < 10; gi++) {
-                const auto & mg = *sorted_groups[gi];
-                checked++;
-                if (is_expert_resident_in(registries.groups, mg.block_num, mg.expert_idx, device)) {
-                    ok++;
-                } else {
-                    fail++;
-                }
-            }
-            GGML_LOG_INFO(
-                "[MOE-PRESTAGE] Verification: %d/%d expert groups resident on device %d "
-                "(cache entries=%zu)\n",
-                ok, checked, device, cache->entry_count());
-        }
-    }
-
-    GGML_LOG_INFO(
-        "[MOE-PRESTAGE] Pre-staged %d popular expert tensors to GPU0 VRAM "
-        "(%d already cached, %d down_exps deferred, %d layers, avail=%zu)\n",
-        prestaged, skipped, down_deferred, n_layers, avail);
-
-    ggml_sycl_watchdog_heartbeat();
-
-    // Release per-device expert reserves now that actual staging is tracked
-    // in the cache's used_ bytes via allocate_slot().  Keeping the reserve would
-    // double-count: reserved_ + used_ both consuming budget.
-    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; d++) {
-        if (g_moe_expert_vram_reserve[d] > 0) {
-            GGML_LOG_INFO("[MOE-PRESTAGE] Released device %d upfront VRAM reserve: %.1f MB\n", d,
-                          g_moe_expert_vram_reserve[d] / (1024.0 * 1024.0));
-            g_moe_expert_vram_reserve[d] = 0;
-        }
-    }
-
-    // Phase 2: Fill secondary GPUs with the NEXT TIER of popular experts.
-    // Uses the same global priority list from Phase 1 (sorted by popularity
-    // rank then tensor_role: gate < up < down).  Experts already placed on
-    // GPU0 are skipped — only experts that did NOT fit on GPU0 overflow here.
-    // Under tight VRAM, down_exps tensors are deferred (gate+up are needed
-    // first in MoE FFN; down can be prefetched during the SiLU computation).
-    //
-    // Budget is SOA-aware: each device tracks remaining bytes, not just slot
-    // counts, because SOA layout may expand expert size beyond AOS bytes.
-    {
-        struct sec_budget {
-            int                        dev;
-            size_t                     bytes_remaining;
-            ggml_sycl::unified_cache * cache;
-            int                        staged;
-            int                        skipped;
-            int                        down_deferred;
-        };
-
-        std::vector<sec_budget> sec_budgets;
-
-        for (int dev = 1; dev < GGML_SYCL_MAX_DEVICES; dev++) {
-            if (!g_expert_prefetchers[dev].is_initialized()) {
-                continue;
-            }
-
-            ggml_sycl::unified_cache * sec_cache = ggml_sycl::get_unified_cache_for_device(dev);
-            if (!sec_cache) {
-                continue;
-            }
-
-            // Use total cache capacity minus compute reserve: after unpinning,
-            // init-time entries are evictable.  The cache handles LRU
-            // eviction internally.  Reserve space for compute buffers + runtime.
-            const size_t sec_managed = ggml_sycl::unified_cache_total_managed(dev);
-            size_t       sec_free = 0, sec_total_vram = 0;
-            ggml_backend_sycl_get_device_memory(dev, &sec_free, &sec_total_vram);
-            const size_t sec_reserve = std::max(size_t(256) << 20, sec_total_vram / 10);
-            const size_t sec_total   = (sec_managed > sec_reserve) ? sec_managed - sec_reserve : 0;
-            if (sec_total == 0 || expert_bytes == 0) {
-                continue;
-            }
-
-            // Unpin expert entries so the cache can evict cold experts when full.
-            sec_cache->unpin_experts();
-
-            sec_budgets.push_back({ dev, sec_total, sec_cache, 0, 0, 0 });
-        }
-
-        GGML_LOG_INFO("[MOE-PRESTAGE] Phase 2: %zu secondary device(s) with budget\n", sec_budgets.size());
-        for (const auto & b : sec_budgets) {
-            GGML_LOG_INFO("[MOE-PRESTAGE] Phase 2: GPU%d budget=%.1f MB\n", b.dev,
-                          b.bytes_remaining / (1024.0 * 1024.0));
-        }
-
-        if (!sec_budgets.empty()) {
-            // --- Phase 2a: Collect work items for secondary GPUs ---
-            struct sec_work_item {
-                const moe_expert_meta * meta;
-                ggml_sycl_cache_id      key;
-                size_t                  dst_bytes;
-                int                     budget_idx;  // index into sec_budgets
-                moe_expert_source       source;
-            };
-
-            std::vector<sec_work_item> sec_work;
-
-            for (const auto * meta : priority_list) {
-                if (sec_budgets.empty()) {
-                    break;
-                }
-
-                // Skip experts already resident on GPU0 (cache IS the placement)
-                if (meta->block_num >= 0 &&
-                    is_expert_resident_in(registries.groups, meta->block_num, meta->expert_idx, 0)) {
-                    continue;
-                }
-
-                // Skip experts already resident on a secondary GPU
-                bool already_on_secondary = false;
-                for (auto & b : sec_budgets) {
-                    if (meta->block_num >= 0 &&
-                        is_expert_resident_in(registries.groups, meta->block_num, meta->expert_idx, b.dev)) {
-                        b.skipped++;
-                        already_on_secondary = true;
-                        break;
-                    }
-                }
-                if (already_on_secondary) {
-                    continue;
-                }
-
-                int planned_budget_idx = -1;
-                // P4: Check placement plan — skip experts not planned for a
-                // specific secondary device. Without this, Phase 2 can stage
-                // host-planned experts onto secondary GPUs or move a role to a
-                // different secondary device than the planner selected.
-                if (!meta->tensor_name.empty()) {
-                    const std::string & tname = meta->tensor_name;
-                    for (int i = 0; i < static_cast<int>(sec_budgets.size()); ++i) {
-                        const auto & b         = sec_budgets[i];
-                        auto *       sec_cache = b.cache;
-                        if (!sec_cache || ggml_sycl_cache_plan_owner(sec_cache)->entries.empty()) {
-                            continue;
-                        }
-                        const auto                         sec_plan = ggml_sycl_cache_plan_owner(sec_cache);
-                        const ggml_sycl::placement_entry * placement =
-                            sec_plan->find_expert_entry(tname.c_str(), meta->expert_idx);
-                        if (!placement || !placement->on_device) {
-                            continue;
-                        }
-                        if (placement->target_device != b.dev) {
-                            continue;
-                        }
-                        planned_budget_idx = i;
-                        break;
-                    }
-                    if (planned_budget_idx < 0) {
-                        continue;
-                    }
-                }
-
-                if (planned_budget_idx < 0) {
-                    for (int i = 0; i < static_cast<int>(sec_budgets.size()); ++i) {
-                        if (sec_budgets[i].cache && ggml_sycl_cache_plan_owner(sec_budgets[i].cache)->entries.empty()) {
-                            planned_budget_idx = i;
-                            break;
-                        }
-                    }
-                    if (planned_budget_idx < 0) {
-                        continue;
-                    }
-                }
-
-                if (!ggml_sycl_layout_supports_soa(meta->type)) {
-                    continue;
-                }
-
-                const size_t soa_bytes =
-                    ggml_sycl_layout_bytes_for_dims(meta->type, meta->ne0, meta->ne1, GGML_LAYOUT_SOA, 0);
-                const size_t dst_bytes = (soa_bytes > 0) ? soa_bytes : meta->bytes;
-
-                if (sec_budgets[planned_budget_idx].bytes_remaining < dst_bytes) {
-                    continue;
-                }
-
-                auto & budget = sec_budgets[planned_budget_idx];
-
-                const size_t total_slots = budget.bytes_remaining / dst_bytes;
-                if (total_slots < 32 && meta->tensor_role == MOE_TENSOR_DOWN) {
-                    budget.down_deferred++;
-                    continue;
-                }
-
-                ggml_sycl_cache_id key =
-                    ggml_sycl_layout_specific_moe_expert_cache_key(meta->canonical_key, GGML_LAYOUT_SOA);
-
-                moe_expert_source source = ggml_sycl_resolve_moe_meta_source(*meta, budget.dev);
-                if (!source) {
-                    continue;
-                }
-                if (source.has_ready) {
-                    source.ready.wait();
-                }
-
-                // Deduct budget eagerly during collection so device selection
-                // remains accurate for subsequent experts.
-                budget.bytes_remaining -= std::min(dst_bytes, budget.bytes_remaining);
-
-                sec_work.push_back({ meta, key, dst_bytes, planned_budget_idx, std::move(source) });
-            }
-
-            const bool sec_use_gpu = !ggml_sycl_gpu_reorder_disabled();
-
-            if (sec_use_gpu && !sec_work.empty()) {
-                // --- Phase 2b (GPU path): GPU reorder for secondary devices ---
-                // Per-device fallback temp buffer tracking for deferred free
-                // (only used when pre-allocated buffer is unavailable).
-                std::unordered_map<int, std::vector<ggml_sycl::mem_handle>> sec_temp_bufs;
-                std::vector<ggml_sycl_gpu_reorder_fill_ctx>                 sec_fill_ctxs(sec_work.size());
-
-                auto t0 = std::chrono::high_resolution_clock::now();
-
-                for (size_t i = 0; i < sec_work.size(); i++) {
-                    auto & item   = sec_work[i];
-                    auto & budget = sec_budgets[item.budget_idx];
-                    auto & fctx   = sec_fill_ctxs[i];
-
-                    // Get pre-allocated reorder temp buffer for this secondary device
-                    void * sec_prealloc      = budget.cache ? budget.cache->get_reorder_temp_buffer() : nullptr;
-                    size_t sec_prealloc_size = budget.cache ? budget.cache->get_reorder_temp_size() : 0;
-
-                    fctx.type               = item.meta->type;
-                    fctx.ncols              = item.meta->ne0;
-                    fctx.nrows              = item.meta->ne1;
-                    fctx.src_bytes          = item.meta->bytes;
-                    fctx.dst_bytes          = item.dst_bytes;
-                    fctx.temp_bufs          = sec_prealloc ? nullptr : &sec_temp_bufs[budget.dev];
-                    fctx.owner_queue        = nullptr;
-                    fctx.prealloc_temp      = sec_prealloc;
-                    fctx.prealloc_temp_size = sec_prealloc_size;
-                    fctx.bcs_queue          = budget.cache ? &budget.cache->get_bcs_queue() : nullptr;
-
-                    sycl::queue &                       stage_queue = budget.cache->get_queue();
-                    ggml_sycl_direct_stage_owner_handoff handoff(item.source.handle);
-                    ggml_sycl::mem_handle                storage_handle;
-                    ggml_sycl::direct_stage_result       result{};
-                    try {
-                        result = budget.cache->direct_stage_expert(
-                            item.key, item.source.ptr, item.meta->bytes, item.dst_bytes, GGML_LAYOUT_SOA,
-                            ggml_sycl_fill_reordered_gpu, &fctx, &stage_queue, &storage_handle);
-                        handoff.set_destination(storage_handle);
-                        ggml_sycl_retain_direct_stage_owners(handoff, result, stage_queue);
-                        if (result.ok && result.ptr) {
-                            budget.staged++;
-                        }
-                    } catch (...) {
-                        ggml_sycl_drain_direct_stage_queue(stage_queue);
-                    }
-                }
-
-                // Finalize + free temp VRAM per secondary device
-                for (auto & b : sec_budgets) {
-                    auto & temp_handles = sec_temp_bufs[b.dev];
-                    if (!temp_handles.empty()) {
-                        sycl::queue & q = b.cache->get_queue();
-                        q.wait();
-                        temp_handles.clear();
-                    }
-                }
-
-                auto   t1     = std::chrono::high_resolution_clock::now();
-                double sec_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                GGML_LOG_INFO("[MOE-PRESTAGE] Phase 2 GPU reorder: %d experts, %.1f ms\n",
-                              static_cast<int>(sec_work.size()), sec_ms);
-            } else if (!sec_work.empty()) {
-                // --- Phase 2b (CPU fallback): Parallel CPU reorder + DMA ---
-                struct sec_cpu_item {
-                    const moe_expert_meta *    meta;
-                    ggml_sycl_cache_id         key;
-                    size_t                     dst_bytes;
-                    int                        budget_idx;
-                    ggml_sycl_reorder_fill_ctx reorder_ctx;
-                    ggml_sycl::mem_handle      reorder_handle;
-                    void *                     reorder_buf;
-                    std::vector<uint8_t>       source_host;
-                    const void *               source_ptr;
-                    bool                       ok;
-                };
-
-                std::vector<sec_cpu_item> sec_cpu;
-                sec_cpu.reserve(sec_work.size());
-
-                for (auto & item : sec_work) {
-                    auto &       budget = sec_budgets[item.budget_idx];
-                    sec_cpu_item ci{};
-                    ci.meta       = item.meta;
-                    ci.key        = item.key;
-                    ci.dst_bytes  = item.dst_bytes;
-                    ci.budget_idx = item.budget_idx;
-                    ci.source_ptr = item.source.ptr;
-                    ci.ok         = false;
-
-                    ci.reorder_ctx.type          = item.meta->type;
-                    ci.reorder_ctx.ncols         = item.meta->ne0;
-                    ci.reorder_ctx.nrows         = item.meta->ne1;
-                    ci.reorder_ctx.nbytes        = item.meta->bytes;
-                    ci.reorder_ctx.dst_bytes     = item.dst_bytes;
-                    ci.reorder_ctx.layout        = GGML_LAYOUT_SOA;
-                    ci.reorder_ctx.src_is_device = false;
-                    ci.reorder_ctx.device_id     = budget.dev;
-
-                    const bool source_is_device = item.source.owning_device >= 0;
-                    if (source_is_device) {
-                        sycl::queue & fallback_queue =
-                            budget.cache ? budget.cache->get_queue() : ggml_sycl_get_device(budget.dev).default_queue();
-                        sycl::queue * source_queue = ggml_sycl_owner_queue_for_ptr(
-                            item.source.ptr, item.source.owning_device, fallback_queue);
-                        ci.source_host.resize(item.meta->bytes);
-                        ggml_sycl::alloc_handle host_owner{};
-                        ggml_sycl::alloc_request host_req{};
-                        host_req.queue = source_queue;
-                        host_req.device = item.source.owning_device;
-                        host_req.size = item.meta->bytes;
-                        host_req.intent.role = ggml_sycl::alloc_role::EXPERT_STAGING;
-                        host_req.intent.category = ggml_sycl::runtime_category::STAGING;
-                        host_req.intent.constraints.must_host_pinned = true;
-                        if (!ggml_sycl::unified_alloc(host_req, &host_owner) || !host_owner.ptr) {
-                            continue;
-                        }
-                        ggml_sycl::mem_handle dst_handle =
-                            ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_owner), GGML_LAYOUT_AOS);
-                        ggml_sycl::mem_copy(dst_handle, item.source.handle, item.meta->bytes, *source_queue);
-                        ci.source_host.assign(static_cast<const uint8_t *>(dst_handle.resolve().ptr),
-                                              static_cast<const uint8_t *>(dst_handle.resolve().ptr) + item.meta->bytes);
-                        ci.source_ptr = ci.source_host.data();
-                    }
-
-                    sycl::queue & alloc_queue =
-                        budget.cache ? budget.cache->get_bcs_queue() : ggml_sycl_get_device(budget.dev).default_queue();
-                    ggml_sycl::alloc_request req{};
-                    req.queue                               = &alloc_queue;
-                    req.device                              = budget.dev;
-                    req.size                                = item.dst_bytes;
-                    req.intent.role                         = ggml_sycl::alloc_role::EXPERT_STAGING;
-                    req.intent.category                     = ggml_sycl::runtime_category::STAGING;
-                    req.intent.cohort_id                    = "moe-prestage-cpu-reorder";
-                    req.intent.constraints.must_host_pinned = true;
-                    req.intent.constraints.use_pinned_pool  = true;
-                    req.suppress_failure_log                = true;
-                    ggml_sycl::alloc_handle reorder_owner{};
-                    if (ggml_sycl::unified_alloc(req, &reorder_owner) && reorder_owner.ptr) {
-                        ci.reorder_handle =
-                            ggml_sycl::detail::from_legacy_owned_alloc(std::move(reorder_owner), GGML_LAYOUT_AOS);
-                    }
-                    ci.reorder_buf = ci.reorder_handle.resolve(budget.dev).ptr;
-                    if (!ci.reorder_buf) {
-                        continue;
-                    }
-
-                    sec_cpu.push_back(std::move(ci));
-                }
-
-                auto release_reorder_buffer = [](sec_cpu_item & ci) {
-                    ci.reorder_handle = {};
-                    ci.reorder_buf    = nullptr;
-                };
-
-                // Parallel CPU reorder
-                if (!sec_cpu.empty()) {
-                    const int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
-                    const int n_threads  = std::max(1, std::min(hw_threads - 2, 16));
-                    const int n_items    = static_cast<int>(sec_cpu.size());
-
-                    auto t0 = std::chrono::high_resolution_clock::now();
-
-                    if (n_items <= n_threads || n_threads <= 1) {
-                        for (auto & ci : sec_cpu) {
-                            ci.ok = ggml_sycl_reorder_weight_cpu(ci.reorder_buf, ci.source_ptr, ci.reorder_ctx);
-                        }
-                    } else {
-                        std::vector<std::thread> threads;
-                        threads.reserve(n_threads);
-                        const int items_per_thread = (n_items + n_threads - 1) / n_threads;
-
-                        for (int t = 0; t < n_threads; t++) {
-                            const int begin = t * items_per_thread;
-                            const int end   = std::min(begin + items_per_thread, n_items);
-                            if (begin >= end) {
-                                break;
-                            }
-
-                            threads.emplace_back([&sec_cpu, begin, end]() {
-                                for (int i = begin; i < end; i++) {
-                                    auto & ci = sec_cpu[i];
-                                    ci.ok = ggml_sycl_reorder_weight_cpu(ci.reorder_buf, ci.source_ptr, ci.reorder_ctx);
-                                }
-                            });
-                        }
-                        for (auto & t : threads) {
-                            t.join();
-                        }
-                    }
-
-                    auto   t1         = std::chrono::high_resolution_clock::now();
-                    double reorder_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                    GGML_LOG_INFO("[MOE-PRESTAGE] Phase 2 CPU reorder fallback: %d experts, %d threads, %.1f ms\n",
-                                  n_items, n_threads, reorder_ms);
-                }
-
-                // DMA pre-reordered data to secondary devices
-                for (auto & ci : sec_cpu) {
-                    if (!ci.ok) {
-                        release_reorder_buffer(ci);
-                        continue;
-                    }
-
-                    auto & budget = sec_budgets[ci.budget_idx];
-
-                    // Route raw H2D to BCS (copy engine) on the secondary GPU.
-                    // The handoff is established before submission: a failure
-                    // after enqueue is not reflected in budget.staged.
-                    sycl::queue *                       sec_bcs = &budget.cache->get_bcs_queue();
-                    ggml_sycl_direct_stage_owner_handoff handoff(ci.reorder_handle);
-                    ggml_sycl::mem_handle                storage_handle;
-                    try {
-                        auto result =
-                            budget.cache->direct_stage_expert(ci.key, ci.reorder_buf, ci.dst_bytes, ci.dst_bytes,
-                                                              GGML_LAYOUT_SOA, nullptr, nullptr, sec_bcs,
-                                                              &storage_handle);
-                        handoff.set_destination(storage_handle);
-                        ggml_sycl_retain_direct_stage_owners(handoff, result, *sec_bcs);
-                        if (result.ok && result.ptr) {
-                            budget.staged++;
-                        }
-                    } catch (...) {
-                        // direct_stage_expert() or retained publication may
-                        // throw after enqueue; drain regardless of staged count.
-                        ggml_sycl_drain_direct_stage_queue(*sec_bcs);
-                    }
-                }
-
-                for (const auto & b : sec_budgets) {
-                    if (b.staged > 0 && b.cache) {
-                        b.cache->get_bcs_queue().wait();
-                    }
-                }
-
-                // Free staging buffers
-                for (auto & ci : sec_cpu) {
-                    release_reorder_buffer(ci);
-                }
-            }
-
-            // Log summary per secondary device
-            for (const auto & b : sec_budgets) {
-                if (b.staged > 0 || b.skipped > 0) {
-                    GGML_LOG_INFO(
-                        "[MOE-PRESTAGE] Secondary GPU %d: %d experts staged, "
-                        "%d already cached, %d down_exps deferred "
-                        "(budget remaining=%.1f MB)\n",
-                        b.dev, b.staged, b.skipped, b.down_deferred, b.bytes_remaining / (1024.0 * 1024.0));
-                }
-            }
-        }
-    }
-    ggml_sycl_watchdog_heartbeat();
-
-    // --- Initial Zipf-biased pinning: pin the top 25% of experts per layer ---
-    // Experts staged during Phase 1 + Phase 2 are now in cache. Pin the hottest
-    // ones so they survive LRU eviction under memory pressure.
-    {
-        const int n_experts_total = g_moe_warmup.n_experts;
-        const int hot_per_layer   = std::max(1, n_experts_total / 4);
-        int       pinned_init     = 0;
-
-        for (const auto * meta_ptr : priority_list) {
-            if (meta_ptr->block_num < 0) {
-                continue;
-            }
-            int rank_raw = ggml_sycl::get_expert_popularity_rank(meta_ptr->layer_id, meta_ptr->expert_idx);
-            int rank     = (rank_raw >= 0) ? rank_raw : INT_MAX;
-            if (rank >= hot_per_layer) {
-                continue;  // only pin top 25%
-            }
-
-            const int n_gpus_pin = ggml_sycl_info().total_gpu_count;
-            for (int d = 0; d < n_gpus_pin && d < GGML_SYCL_MAX_DEVICES; d++) {
-                if (!is_expert_resident_in(registries.groups, meta_ptr->block_num, meta_ptr->expert_idx, d)) {
-                    continue;
-                }
-                ggml_sycl::unified_cache * pin_cache = ggml_sycl::get_unified_cache_for_device(d);
-                if (!pin_cache) {
-                    continue;
-                }
-
-                auto grp_it = registries.groups.find(expert_group_key(meta_ptr->block_num, meta_ptr->expert_idx));
-                if (grp_it == registries.groups.end()) {
-                    continue;
-                }
-                const auto & grp = grp_it->second;
-
-                static const ggml_layout_mode pin_layouts[] = { GGML_LAYOUT_SOA, GGML_LAYOUT_COALESCED,
-                                                                GGML_LAYOUT_XMX_TILED, GGML_LAYOUT_AOS };
-                auto                          pin_key       = [&](const ggml_sycl_cache_id & key) {
-                    if (!key.valid) {
-                        return;
-                    }
-                    for (auto layout : pin_layouts) {
-                        const ggml_sycl_cache_id layout_key =
-                            ggml_sycl_layout_specific_moe_expert_cache_key(key, layout);
-                        if (pin_cache->lookup(layout_key, layout)) {
-                            pin_cache->pin(layout_key, layout);
-                            break;
-                        }
-                    }
-                };
-                if (grp.has_gate) {
-                    pin_key(grp.gate_key);
-                }
-                if (grp.has_up) {
-                    pin_key(grp.up_key);
-                }
-                if (grp.has_down) {
-                    pin_key(grp.down_key);
-                }
-                pinned_init++;
-            }
-        }
-
-        if (pinned_init > 0) {
-            GGML_LOG_INFO("[MOE-PRESTAGE] Zipf pinning: %d expert groups pinned (top %d per layer)\n", pinned_init,
-                          hot_per_layer);
-        }
-    }
-
-    g_prestage_completed.store(true, std::memory_order_release);
 }
 
 // ---------------------------------------------------------------------------
@@ -7521,92 +6257,7 @@ sycl::event fill_reordered_host(sycl::queue &                    queue,
     return ggml_sycl_fill_reordered_host(queue, dst, dst_size, src, src_size, &internal_ctx, deps);
 }
 
-uint32_t get_expert_frequency(int layer_hash, int expert_id) {
-    auto & seq_map = g_moe_layer_seq[0];
-    auto   it      = seq_map.find(layer_hash);
-    if (it == seq_map.end()) {
-        return 0;
-    }
-    int seq_layer = it->second;
-    if (seq_layer < 0 || seq_layer >= g_moe_warmup.n_layers) {
-        return 0;
-    }
-    if (expert_id < 0 || expert_id >= g_moe_warmup.n_experts) {
-        return 0;
-    }
-    return g_moe_warmup.epoch_counts[seq_layer][expert_id].load(std::memory_order_relaxed);
-}
-
 }  // namespace ggml_sycl
-
-// ---------------------------------------------------------------------------
-// Periodic re-ranking: re-evaluate expert popularity from epoch counters and
-// update placement table ranks.  Called every rerank_interval tokens after the
-// initial warmup.  Only updates ranks — triggers re-staging of newly-popular
-// experts via moe_prestage_popular_experts() when ranks change.
-// ---------------------------------------------------------------------------
-static void moe_periodic_rerank() {
-    if (!ggml_sycl::is_expert_popularity_initialized()) {
-        return;
-    }
-
-    const int nl = g_moe_warmup.n_layers;
-    const int ne = g_moe_warmup.n_experts;
-
-    // Build reverse map: sequential layer index -> hash-based layer_id.
-    std::unordered_map<int, int> seq_to_hash;
-    for (const auto & [hash_id, seq_id] : g_moe_layer_seq[0]) {
-        seq_to_hash[seq_id] = hash_id;
-    }
-
-    int ranks_changed = 0;
-    for (int l = 0; l < nl; l++) {
-        auto it = seq_to_hash.find(l);
-        if (it == seq_to_hash.end()) {
-            continue;
-        }
-        int hash_layer_id = it->second;
-
-        // Collect epoch counts and sort descending
-        std::vector<std::pair<uint32_t, int>> sorted_experts;
-        sorted_experts.reserve(ne);
-        for (int e = 0; e < ne; e++) {
-            uint32_t c = g_moe_warmup.epoch_counts[l][e].load(std::memory_order_relaxed);
-            sorted_experts.push_back({ c, e });
-        }
-        std::sort(sorted_experts.begin(), sorted_experts.end(),
-                  [](const auto & a, const auto & b) { return a.first > b.first; });
-
-        // Update ranks, count changes
-        for (int rank = 0; rank < (int) sorted_experts.size(); rank++) {
-            int eid      = sorted_experts[rank].second;
-            int old_rank = ggml_sycl::get_expert_popularity_rank(hash_layer_id, eid);
-            if (old_rank != rank) {
-                ranks_changed++;
-            }
-            ggml_sycl::set_expert_popularity_rank(hash_layer_id, eid, rank);
-        }
-
-        // Reset epoch counters for this layer for the next epoch
-        for (int e = 0; e < ne; e++) {
-            g_moe_warmup.epoch_counts[l][e].store(0, std::memory_order_relaxed);
-        }
-    }
-
-    // Query VRAM budget for logging
-    size_t vram_avail = ggml_sycl::unified_cache_available_for_compute(0);
-
-    GGML_SYCL_DEBUG(
-        "[MOE-RERANK] Periodic re-rank complete: %d rank changes, "
-        "VRAM available=%.1f MB\n",
-        ranks_changed, vram_avail / (1024.0 * 1024.0));
-
-    // If significant rank changes occurred, trigger pre-staging of newly
-    // popular experts that may not yet be in VRAM.
-    if (ranks_changed > 0) {
-        moe_prestage_popular_experts();
-    }
-}
 
 // ---------------------------------------------------------------------------
 // KV-expert rebalance monitoring: periodically checks whether cold KV layers
@@ -7658,292 +6309,6 @@ static void kv_expert_rebalance_check(int device) {
         "(evictable expert VRAM: %.1f MB, KV/layer: %.1f MB)\n",
         new_hot - current_hot, evictable / (1024.0 * 1024.0), kv_per_layer / (1024.0 * 1024.0));
 }
-
-// ---------------------------------------------------------------------------
-// Adaptive expert prestage: background thread that promotes hot CPU-resident
-// experts to VRAM based on runtime routing frequency.  Gated by env var
-// GGML_SYCL_ADAPTIVE_PRESTAGE=1 (off by default).
-//
-// Unlike periodic re-ranking (which updates popularity ranks and re-runs the
-// full moe_prestage_popular_experts on the inference thread), adaptive prestage
-// runs on a BACKGROUND thread and only promotes individual experts that cross a
-// hit-count threshold while the inference thread is free to continue.
-// ---------------------------------------------------------------------------
-struct adaptive_prestage_state {
-    std::atomic<bool>       enabled{ false };
-    std::atomic<bool>       shutdown{ false };
-    std::atomic<int>        token_count{ 0 };
-    int                     check_interval = 10;  // tokens between checks
-    uint32_t                hit_threshold  = 3;   // min hits to trigger promotion
-    std::thread             worker_thread;
-    std::mutex              wake_mutex;
-    std::condition_variable wake_cv;
-
-    // Snapshot of epoch counts -- the background thread reads these to decide
-    // which experts to promote.
-    struct promotion_candidate {
-        int      seq_layer;      // sequential layer index
-        int      hash_layer_id;  // hash-based layer_id for cache/placement table
-        int      expert_id;
-        uint32_t hit_count;
-    };
-
-    std::mutex                       candidates_mutex;
-    std::vector<promotion_candidate> pending_candidates;
-
-    void init() {
-        const char * env = getenv("GGML_SYCL_ADAPTIVE_PRESTAGE");
-        if (!env || std::atoi(env) != 1) {
-            return;
-        }
-
-        const char * interval_env = getenv("GGML_SYCL_ADAPTIVE_PRESTAGE_INTERVAL");
-        if (interval_env) {
-            check_interval = std::max(1, std::atoi(interval_env));
-        }
-
-        const char * threshold_env = getenv("GGML_SYCL_ADAPTIVE_PRESTAGE_THRESHOLD");
-        if (threshold_env) {
-            hit_threshold = static_cast<uint32_t>(std::max(1, std::atoi(threshold_env)));
-        }
-
-        enabled.store(true, std::memory_order_release);
-        shutdown.store(false, std::memory_order_release);
-
-        worker_thread = std::thread([this]() { worker_loop(); });
-
-        GGML_LOG_INFO(
-            "[ADAPTIVE-PRESTAGE] Enabled: check every %d tokens, "
-            "promote threshold=%u hits\\n",
-            check_interval, hit_threshold);
-    }
-
-    void stop() {
-        shutdown.store(true, std::memory_order_release);
-        wake_cv.notify_all();
-        if (worker_thread.joinable()) {
-            worker_thread.join();
-        }
-        enabled.store(false, std::memory_order_release);
-    }
-
-    void reset_after_stop() {
-        stop();
-        token_count.store(0, std::memory_order_relaxed);
-        shutdown.store(false, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lock(candidates_mutex);
-        pending_candidates.clear();
-    }
-
-    void test_seed_pending() {
-        std::lock_guard<std::mutex> lock(candidates_mutex);
-        pending_candidates.push_back({ 1, 2, 3, 4 });
-    }
-
-    bool test_pending_empty() {
-        std::lock_guard<std::mutex> lock(candidates_mutex);
-        return pending_candidates.empty();
-    }
-
-    // Called from inference thread after expert recording.
-    // Lightweight: just increments a counter and occasionally signals the worker.
-    void tick() {
-        if (!enabled.load(std::memory_order_acquire)) {
-            return;
-        }
-        int t = token_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (t % check_interval != 0) {
-            return;
-        }
-
-        // Build candidate list from current epoch counts
-        scan_candidates();
-
-        // Signal the background worker
-        wake_cv.notify_one();
-    }
-
-  private:
-    void scan_candidates() {
-        if (!ggml_sycl::is_expert_popularity_initialized()) {
-            return;
-        }
-
-        const int nl = g_moe_warmup.n_layers;
-        const int ne = g_moe_warmup.n_experts;
-        if (nl <= 0 || ne <= 0) {
-            return;
-        }
-
-        // Build reverse map: sequential layer index -> hash-based layer_id
-        std::unordered_map<int, int> seq_to_hash;
-        for (const auto & [hash_id, seq_id] : g_moe_layer_seq[0]) {
-            seq_to_hash[seq_id] = hash_id;
-        }
-
-        std::vector<promotion_candidate> candidates;
-
-        // We need block_num for the residency checks. Build layer_hash->block_num
-        // from the metadata, and keep the group registry from the SAME snapshot:
-        // the residency check below consults the groups these block numbers were
-        // derived from, so the two must come from one publication epoch.
-        const moe_registry_snapshot      registries = moe_snapshot_registries();
-        std::unordered_map<int64_t, int> expert_block_nums;
-        for (const auto & meta : registries.meta) {
-            if (meta.block_num >= 0) {
-                int64_t key            = (int64_t(meta.layer_id) << 32) | int64_t(uint32_t(meta.expert_idx));
-                expert_block_nums[key] = meta.block_num;
-            }
-        }
-
-        for (int l = 0; l < nl; l++) {
-            auto it = seq_to_hash.find(l);
-            if (it == seq_to_hash.end()) {
-                continue;
-            }
-            int hash_layer_id = it->second;
-
-            for (int e = 0; e < ne; e++) {
-                uint32_t count = g_moe_warmup.epoch_counts[l][e].load(std::memory_order_relaxed);
-                if (count < hit_threshold) {
-                    continue;
-                }
-
-                // Check if expert is already in VRAM via the cache
-                int64_t ekey  = (int64_t(hash_layer_id) << 32) | int64_t(uint32_t(e));
-                auto    bn_it = expert_block_nums.find(ekey);
-                if (bn_it != expert_block_nums.end() && is_expert_resident_in(registries.groups, bn_it->second, e, 0)) {
-                    continue;
-                }
-
-                // CPU-resident expert with high hit count -- candidate for promotion
-                candidates.push_back({ l, hash_layer_id, e, count });
-            }
-        }
-
-        if (!candidates.empty()) {
-            // Sort by hit count descending so hottest experts are promoted first
-            std::sort(
-                candidates.begin(), candidates.end(),
-                [](const promotion_candidate & a, const promotion_candidate & b) { return a.hit_count > b.hit_count; });
-
-            std::lock_guard<std::mutex> lock(candidates_mutex);
-            pending_candidates = std::move(candidates);
-        }
-    }
-
-    void worker_loop() {
-        while (!shutdown.load(std::memory_order_acquire)) {
-            // Wait for signal from inference thread
-            {
-                std::unique_lock<std::mutex> lock(wake_mutex);
-                wake_cv.wait_for(lock, std::chrono::milliseconds(500), [this]() {
-                    return shutdown.load(std::memory_order_acquire) || !pending_candidates_empty();
-                });
-            }
-
-            if (shutdown.load(std::memory_order_acquire)) {
-                break;
-            }
-
-            // Grab candidates
-            std::vector<promotion_candidate> work;
-            {
-                std::lock_guard<std::mutex> lock(candidates_mutex);
-                work.swap(pending_candidates);
-            }
-
-            if (work.empty()) {
-                continue;
-            }
-
-            // Check VRAM budget before promoting
-            size_t vram_avail = ggml_sycl::unified_cache_available_for_compute(0);
-            if (vram_avail == 0) {
-                continue;
-            }
-
-            // Estimate per-expert size from metadata
-            size_t expert_bytes = 0;
-            {
-                std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-                if (!g_moe_expert_meta.empty()) {
-                    expert_bytes = g_moe_expert_meta[0].bytes;
-                }
-            }
-            if (expert_bytes == 0) {
-                continue;
-            }
-
-            int promoted = 0;
-            int skipped  = 0;
-
-            for (const auto & c : work) {
-                // Re-check VRAM budget -- stop if exhausted
-                vram_avail = ggml_sycl::unified_cache_available_for_compute(0);
-                if (vram_avail < expert_bytes) {
-                    skipped += static_cast<int>(work.size()) - promoted - skipped;
-                    break;
-                }
-
-                // Re-check cache -- another thread may have promoted it.
-                // Use metadata to get block_num for is_expert_resident check.
-                {
-                    // Paired snapshot: the block number comes from the metadata
-                    // and the residency answer from the groups, so both must be
-                    // read from one publication epoch. Re-snapshotted per
-                    // candidate on purpose -- this loop wants fresh state
-                    // between promotions, just not a torn pair within one.
-                    const moe_registry_snapshot registries = moe_snapshot_registries();
-                    int                         block_num  = -1;
-                    for (const auto & meta : registries.meta) {
-                        if (meta.layer_id == c.hash_layer_id && meta.expert_idx == c.expert_id && meta.block_num >= 0) {
-                            block_num = meta.block_num;
-                            break;
-                        }
-                    }
-                    if (block_num >= 0 && is_expert_resident_in(registries.groups, block_num, c.expert_id, 0)) {
-                        skipped++;
-                        continue;
-                    }
-                }
-
-                // Use the existing SOA caching infrastructure for promotion.
-                // moe_expert_ensure_soa_cached handles: metadata lookup, cache key,
-                // SOA reorder, direct_stage_expert, and placement table update.
-                void * result = ggml_sycl::moe_expert_ensure_soa_cached(c.hash_layer_id, c.expert_id, /*device_id=*/0);
-
-                if (result) {
-                    promoted++;
-                    GGML_SYCL_DEBUG(
-                        "[ADAPTIVE-PRESTAGE] Promoted expert L%d/E%d "
-                        "to VRAM (hits=%u)\\n",
-                        c.seq_layer, c.expert_id, c.hit_count);
-                } else {
-                    skipped++;
-                }
-
-                if (shutdown.load(std::memory_order_acquire)) {
-                    break;
-                }
-            }
-
-            if (promoted > 0) {
-                GGML_LOG_INFO(
-                    "[ADAPTIVE-PRESTAGE] Background promotion: %d promoted, "
-                    "%d skipped (VRAM avail=%.1f MB)\\n",
-                    promoted, skipped, ggml_sycl::unified_cache_available_for_compute(0) / (1024.0 * 1024.0));
-            }
-        }
-    }
-
-    bool pending_candidates_empty() {
-        std::lock_guard<std::mutex> lock(candidates_mutex);
-        return pending_candidates.empty();
-    }
-};
-
-static adaptive_prestage_state g_adaptive_prestage;
 
 struct managed_host_pinned_buffer {
     ggml_sycl::mem_handle handle;
@@ -8195,223 +6560,6 @@ static bool ggml_sycl_weight_residency_is_observable(const ggml_tensor * tensor)
 // Forward declaration: check if blind preload should be skipped (defined in MoE preload section).
 bool        ggml_sycl_should_skip_blind_preload(int64_t n_experts);
 
-// ---------------------------------------------------------------------------
-// Zero-warmup expert staging via gate weight norm sorting.
-//
-// Computes ||W_gate[i,:]||^2 for each expert row in each layer's
-// ffn_gate_inp tensor.  Higher gate norm correlates with higher routing
-// probability, so sorting by norm gives a good initial popularity ranking
-// without running any inference tokens.
-//
-// Called from moe_hybrid_init_once() when GGML_SYCL_MOE_WARMUP_TOKENS=0.
-// Fills g_moe_warmup.counts with synthetic frequencies proportional to
-// gate norms, then calls moe_apply_popularity_placement() and
-// moe_prestage_popular_experts() to upload hot experts to VRAM immediately.
-// ---------------------------------------------------------------------------
-static void moe_compute_gate_norm_placement(ggml_cgraph * cgraph, int device) {
-    const int nl = g_moe_warmup.n_layers;
-    const int ne = g_moe_warmup.n_experts;
-    if (nl <= 0 || ne <= 0) {
-        return;
-    }
-
-    // Collect gate_inp tensors from the graph.
-    // Gate tensors appear as src of MUL_MAT ops with name pattern "blk.N.ffn_gate_inp".
-    // Shape: [n_embd, n_experts] stored as f32.
-    struct gate_info {
-        const ggml_tensor * tensor;
-        int                 block_num;
-        int                 n_embd;
-        int                 n_experts;
-    };
-
-    std::vector<gate_info> gates;
-
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        for (int s = 0; s < GGML_MAX_SRC; s++) {
-            const ggml_tensor * src = node->src[s];
-            if (!src || !src->name || !src->data) {
-                continue;
-            }
-            if (!strstr(src->name, "ffn_gate_inp")) {
-                continue;
-            }
-            // Skip shared expert gate and bias variants
-            if (strstr(src->name, "ffn_gate_inp_shexp") || strstr(src->name, "ffn_gate_inp_b")) {
-                continue;
-            }
-
-            int block_id = moe_extract_block_number(src->name);
-            if (block_id < 0) {
-                continue;
-            }
-
-            // Check for duplicates (same tensor can appear in multiple nodes)
-            bool dup = false;
-            for (const auto & g : gates) {
-                if (g.block_num == block_id) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (dup) {
-                continue;
-            }
-
-            const int gate_n_embd    = static_cast<int>(src->ne[0]);
-            const int gate_n_experts = static_cast<int>(src->ne[1]);
-            if (gate_n_embd <= 0 || gate_n_experts <= 0) {
-                continue;
-            }
-
-            gates.push_back({ src, block_id, gate_n_embd, gate_n_experts });
-        }
-    }
-
-    if (gates.empty()) {
-        GGML_LOG_WARN(
-            "[MOE-GATE-NORM] No ffn_gate_inp tensors found in graph, "
-            "cannot compute gate norms. Falling back to uniform placement.\n");
-        return;
-    }
-
-    GGML_LOG_INFO(
-        "[MOE-GATE-NORM] Computing gate weight norms for %zu blocks, "
-        "%d experts/block\n",
-        gates.size(), ne);
-
-    // For each gate tensor, compute ||W_gate[expert_i,:]||^2 per expert row.
-    // Map block_num to all sequential layer indices in that block (gate/up/down
-    // each have a separate sequential layer index).
-    //
-    // Build block_num -> set of sequential layer indices mapping.
-    std::unordered_map<int, std::vector<int>> block_to_seq_layers;
-    {
-        std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-        for (const auto & [hash_id, seq_id] : g_moe_layer_seq[device]) {
-            for (const auto & meta : g_moe_expert_meta) {
-                if (meta.layer_id == hash_id && meta.expert_idx == 0) {
-                    if (meta.block_num >= 0) {
-                        block_to_seq_layers[meta.block_num].push_back(seq_id);
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    int n_blocks_computed = 0;
-    for (const auto & gate : gates) {
-        // Get host-accessible pointer to gate weight data.
-        // Gate weights are f32, typically in host or unified memory.
-        const float * gate_data = nullptr;
-
-        // Check if data is host-accessible via buffer type
-        if (!gate.tensor->buffer || !ggml_backend_buffer_is_host(gate.tensor->buffer)) {
-            // Data is in device VRAM — cannot read from host.
-            // This shouldn't happen for gate_inp (usually f32 in host memory).
-            GGML_LOG_WARN("[MOE-GATE-NORM] Gate tensor blk.%d is device-only, skipping\n", gate.block_num);
-            continue;
-        }
-
-        // Host buffer — directly accessible
-        gate_data = static_cast<const float *>(gate.tensor->data);
-        if (!gate_data) {
-            continue;
-        }
-
-        // Compute L2 norm squared for each expert row.
-        // Gate shape: [n_embd, n_experts] — row stride = n_embd floats.
-        const int n_exp  = std::min(gate.n_experts, ne);
-        const int n_embd = gate.n_embd;
-
-        std::vector<double> norms(n_exp, 0.0);
-        for (int e = 0; e < n_exp; e++) {
-            const float * row = gate_data + static_cast<size_t>(e) * n_embd;
-            double        sum = 0.0;
-            for (int d = 0; d < n_embd; d++) {
-                double v = static_cast<double>(row[d]);
-                sum += v * v;
-            }
-            norms[e] = sum;
-        }
-
-        // Convert norms to synthetic frequency counts.
-        // Scale so that the max norm maps to 1000 and min maps to 1.
-        // This preserves relative ordering for moe_apply_popularity_placement().
-        double max_norm = *std::max_element(norms.begin(), norms.end());
-        double min_norm = *std::min_element(norms.begin(), norms.end());
-        double range    = max_norm - min_norm;
-        if (range < 1e-12) {
-            range = 1.0;  // all norms equal — uniform counts
-        }
-
-        // Find all sequential layer indices for this block
-        auto it = block_to_seq_layers.find(gate.block_num);
-        if (it == block_to_seq_layers.end()) {
-            GGML_LOG_WARN("[MOE-GATE-NORM] No sequential layers found for block %d\n", gate.block_num);
-            continue;
-        }
-
-        for (int seq_l : it->second) {
-            if (seq_l < 0 || seq_l >= nl) {
-                continue;
-            }
-            for (int e = 0; e < n_exp; e++) {
-                // Map norm to synthetic count: higher norm = higher count
-                uint32_t count = static_cast<uint32_t>(1.0 + 999.0 * (norms[e] - min_norm) / range);
-                g_moe_warmup.counts[seq_l][e].store(count, std::memory_order_relaxed);
-            }
-        }
-
-        n_blocks_computed++;
-
-        // Log top-3 experts by gate norm for first few blocks
-        if (n_blocks_computed <= 4) {
-            std::vector<std::pair<double, int>> sorted;
-            sorted.reserve(n_exp);
-            for (int e = 0; e < n_exp; e++) {
-                sorted.push_back({ norms[e], e });
-            }
-            std::sort(sorted.begin(), sorted.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
-            if (sorted.size() >= 3) {
-                GGML_LOG_INFO(
-                    "[MOE-GATE-NORM] Block %d top-3 by norm: "
-                    "expert %d (%.2f), expert %d (%.2f), expert %d (%.2f)\n",
-                    gate.block_num, sorted[0].second, sorted[0].first, sorted[1].second, sorted[1].first,
-                    sorted[2].second, sorted[2].first);
-            }
-        }
-    }
-
-    if (n_blocks_computed == 0) {
-        GGML_LOG_WARN("[MOE-GATE-NORM] Failed to compute norms for any block\n");
-        return;
-    }
-
-    GGML_LOG_INFO(
-        "[MOE-GATE-NORM] Computed gate norms for %d/%zu blocks, "
-        "applying popularity placement\n",
-        n_blocks_computed, gates.size());
-
-    // Apply the synthetic frequency counts as popularity ranks
-    moe_apply_popularity_placement();
-
-    // Pre-stage hot experts to VRAM immediately
-    moe_prestage_popular_experts();
-
-    // Mark warmup as complete — skip the inference-based warmup loop
-    g_moe_warmup.warmup_done.store(true, std::memory_order_release);
-
-    // Enable periodic re-ranking for runtime adaptation
-    g_moe_warmup.enable_reranking();
-
-    GGML_LOG_INFO(
-        "[MOE-GATE-NORM] Zero-warmup placement complete. "
-        "Skipping inference-based warmup entirely.\n");
-}
-
 // Placement's executor fact for the pools, the plan walk's (defined with the walk's environment, below): the pools'
 // over-plan check reads the nodes the plan folded through it.
 static bool ggml_sycl_host_holder_host_experts(const ggml_tensor * src0, int device, bool * known, const char ** cause);
@@ -8602,24 +6750,11 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Initialize popularity tracking and warmup profiling
-    // (ExpertPlacementTable removed — the cache IS the placement.)
-    // -----------------------------------------------------------------------
-    GGML_SYCL_DEBUG("[MOE-HYBRID] Popularity tracking initialized: %d layers, %d experts/layer\n", n_moe_layers,
-                    n_experts_per_layer);
-
-    // Initialize warmup profiling for popularity-aware placement
-    g_moe_warmup.init(n_moe_layers, n_experts_per_layer);
-
     // A fresh routed-expert table for this model, sized from its own blocks and experts: the counts of an earlier
     // model in this process stay with the records that were counting into them. This init runs again until it
     // succeeds and after a model-owner switch, and each run installs a fresh table: a record built before the run
     // keeps counting into the table it holds, which is no longer the one the report reads.
     (void) ggml_sycl::moe_route_counts_install(device, n_route_blocks, n_experts_per_layer);
-
-    // Initialize adaptive prestage background thread (if enabled via env var)
-    g_adaptive_prestage.init();
 
     // No separate placement table needed — the unified cache tracks all
     // expert tensors.  Dispatch resolves experts through cache-backed
@@ -8714,8 +6849,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         g_moe_expert_meta.swap(new_expert_meta);
         g_expert_groups.swap(new_expert_groups);
     }
-    GGML_LOG_INFO("[MOE-HYBRID] Expert metadata stored: %zu entries for post-warmup pre-staging\n",
-                  published_meta_count);
+    GGML_LOG_INFO("[MOE-HYBRID] Expert metadata stored: %zu entries\n", published_meta_count);
     GGML_LOG_INFO(
         "[MOE-HYBRID] Expert group registry: %zu groups (%d complete with gate+up+down), "
         "%d entries registered\n",
@@ -9074,7 +7208,6 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                     }
                     ggml_sycl_retain_direct_stage_owners(handoff, stage_result, *phase2_bcs);
                     if (stage_result.ok && stage_result.ptr) {
-                        set_expert_popularity_rank(info.layer_id, info.expert_idx, static_cast<int>(total_uploaded));
                         budget.n_slots--;
                         budget.n_uploaded++;
                         budget.bytes_remaining -= std::min(dst_bytes, budget.bytes_remaining);
@@ -9232,7 +7365,6 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                     }
                     ggml_sycl_retain_direct_stage_owners(handoff, stage_result, *phase2_bcs);
                     if (stage_result.ok && stage_result.ptr) {
-                        set_expert_popularity_rank(info.layer_id, info.expert_idx, static_cast<int>(total_uploaded));
                         budget.n_slots--;
                         budget.n_uploaded++;
                         budget.bytes_remaining -= std::min(dst_bytes, budget.bytes_remaining);
@@ -9585,15 +7717,6 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // Build gate→up tensor pairing map for fused CPU expert dispatch.
     // Scans MUL_MAT_ID nodes for paired ffn_gate_exps/ffn_up_exps tensors.
     // -----------------------------------------------------------------------
-    // -----------------------------------------------------------------------
-    // Zero-warmup gate-norm placement: when GGML_SYCL_MOE_WARMUP_TOKENS=0,
-    // compute gate weight norms to rank experts by routing probability and
-    // pre-stage hot experts to VRAM immediately — no inference warmup needed.
-    // -----------------------------------------------------------------------
-    if (g_moe_warmup.warmup_tokens == 0) {
-        moe_compute_gate_norm_placement(cgraph, device);
-    }
-
     // -----------------------------------------------------------------------
     // Pre-allocate pinned host memory chunks so that inference-time allocations
     // in the host arena never call sycl::malloc_host (which blocks the Level
@@ -70861,7 +68984,6 @@ static size_t ggml_sycl_materialize_moe_down_i8_hotset_for_tensor(ggml_backend_s
         }
     }
     const int block_layer = ggml_sycl_tp_extract_layer_number(src0->name);
-    const int hash_layer  = moe_cache_layer_id(src0->name);
     for (int64_t e = 0; e < n_experts; ++e) {
         ranked_expert item{};
         item.expert_id = static_cast<int>(e);
@@ -70870,13 +68992,8 @@ static size_t ggml_sycl_materialize_moe_down_i8_hotset_for_tensor(ggml_backend_s
         }
         const int block_rank =
             block_layer >= 0 ? ggml_sycl::get_expert_popularity_rank(block_layer, item.expert_id) : -1;
-        const int hash_rank = hash_layer >= 0 ? ggml_sycl::get_expert_popularity_rank(hash_layer, item.expert_id) : -1;
-        if (block_rank >= 0 && hash_rank >= 0) {
-            item.rank = std::min(block_rank, hash_rank);
-        } else if (block_rank >= 0) {
+        if (block_rank >= 0) {
             item.rank = block_rank;
-        } else if (hash_rank >= 0) {
-            item.rank = hash_rank;
         }
         if (have_scores || item.rank != INT_MAX) {
             ranked.push_back(item);
@@ -72478,8 +70595,6 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         //   2. Call fill_fn (synchronous CPU SOA reorder on calling thread)
         //   3. Acquire rw_mutex_ under contention
         // All three block the inference thread and cause 120B MoE hangs.
-        // The background async prestage (moe_prestage_popular_experts) will
-        // eventually cache the SOA version for future tokens.
         // Non-blocking path for ALL layouts when source is USM-accessible.
         // On cache hit: use cached pointer. On miss: use host-pinned AOS zero-copy.
         // NEVER call blocking staging during inference (blocks on fill/DMA).
@@ -86422,10 +84537,9 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
 // a pending job kept beside this op holds disjoint entries (moe_sibling_pending_keep). So unlike the retained route
 // the job needs no moe_cpu_job_order_decide() wait.
 // Observations: the retained CPU-TG block's per-op records are kept, not refused (the dispatch stats are always on).
-// The job records the expert-popularity counts, the predictor's actual experts and the dispatch stats' residency on
-// the pool worker, where the ids are, so a rerank or a stats interval on this thread may miss the jobs still in
-// flight; the next one counts them. The token tick stays on this thread, on the tracker the retained block uses.
-// Warmup, whose counts drive placement, never routes here.
+// The job records the predictor's actual experts, the routed-expert counts and the dispatch stats' residency on the
+// pool worker, where the ids are, so a stats interval on this thread may miss the jobs still in flight; the next one
+// counts them. The token tick stays on this thread, on the tracker the retained block uses.
 // Returns false, having taken nothing that changes the retained route's result, when the route does not apply.
 static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context & ctx,
                                                       const ggml_tensor *         src0,
@@ -86460,9 +84574,7 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     // Modes in which the retained route does more per op than this route reproduces.
     const auto * cpu_traits = ggml_sycl_get_type_traits_cpu(src0->type);
     if (!cpu_traits || !cpu_traits->vec_dot || g_moe_multi_gpu_active.load(std::memory_order_acquire) ||
-        g_pending_secondary_scatter.active || !g_moe_warmup.warmup_done.load(std::memory_order_acquire) ||
-        g_adaptive_prestage.enabled.load(std::memory_order_acquire) || g_moe_profile_enabled ||
-        g_moe_pp_profile_enabled) {
+        g_pending_secondary_scatter.active || g_moe_profile_enabled || g_moe_pp_profile_enabled) {
         return false;
     }
     std::shared_ptr<const moe_hybrid_decode_record> record;
@@ -86665,14 +84777,13 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     // No zeroing of the output rows: the flush places only flagged rows, and the CPU kernel writes all N floats of
     // each of them.
 
-    // What the retained CPU-TG block observes per op, keyed by the op's MoE sequence layer: the warmup counts
-    // (while reranking), the predictor's actual experts and the dispatch stats.
+    // What the retained CPU-TG block observes per op, keyed by the op's MoE sequence layer: the predictor's actual
+    // experts and the dispatch stats.
     int seq_layer = -1;
     {
         const auto it = g_moe_layer_seq[device].find(record->cache_layer);
         seq_layer     = it != g_moe_layer_seq[device].end() ? it->second : -1;
     }
-    const bool record_warmup = seq_layer >= 0 && g_moe_warmup.reranking_enabled.load(std::memory_order_acquire);
     ggml_sycl::ExpertPredictor * const predictor =
         seq_layer >= 0 && g_expert_predictors[device].is_active() ? &g_expert_predictors[device] : nullptr;
     ggml_sycl::MoeDispatchStats * const stats =
@@ -86681,11 +84792,8 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     const ggml_type type     = src0->type;
 
     // Runs on the pool worker after the prologue: the ids have landed and nothing else writes these entries.
-    auto resolve = [record, ids_rows, act_host, out_rows, shares_row, n_ids, K, N, type, seq_layer, record_warmup,
-                    predictor, stats](std::vector<cpu_expert_task> & tasks) {
-        if (record_warmup) {
-            g_moe_warmup.record(seq_layer, ids_rows, static_cast<int>(n_ids));
-        }
+    auto resolve = [record, ids_rows, act_host, out_rows, shares_row, n_ids, K, N, type, seq_layer, predictor,
+                    stats](std::vector<cpu_expert_task> & tasks) {
         if (predictor) {
             predictor->record_actual(seq_layer, std::vector<int>(ids_rows, ids_rows + n_ids));
         }
@@ -86733,9 +84841,6 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     moe_cpu_job_device_signal_acquire(*stream, &job_signal, &job_signal_ref);
     std::future<void> job = cpu_pool.submit_batch({}, std::move(job_prologue), std::move(resolve),
                                                   moe_cpu_job_trace_request(job_trace, src0), std::move(job_signal));
-    if (record_warmup && g_moe_warmup.tick_epoch()) {
-        moe_periodic_rerank();
-    }
     if (stats) {
         if (seq_layer >= 0 && seq_layer <= g_moe_cputg_last_seq_layer) {
             stats->tick_token();
@@ -88692,33 +86797,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             if (g_moe_pp_profile_enabled) {
                 g_moe_profile.moe_dispatch_path(0, 1, 0, 0);
             }
-            // Record expert activations for warmup + adaptive prestage (fused PP path)
-            {
-                const bool in_warmup_e = !g_moe_warmup.warmup_done.load(std::memory_order_acquire);
-                const bool in_rerank_e = g_moe_warmup.reranking_enabled.load(std::memory_order_acquire);
-                if (in_warmup_e || in_rerank_e) {
-                    const int cur_layer_hash = moe_cache_layer_id(src0->name);
-                    auto &    seq_map        = g_moe_layer_seq[ctx.device];
-                    auto      it             = seq_map.find(cur_layer_hash);
-                    if (it != seq_map.end()) {
-                        int                  seq_layer_id = it->second;
-                        // The retained prompt snapshot is also the recording input.
-                        const std::vector<int32_t> & ids_host_fused = prompt_ids_snapshot;
-                        if (!ids_host_fused.empty()) {
-                            g_moe_warmup.record(seq_layer_id, ids_host_fused.data(),
-                                                static_cast<int>(ids_host_fused.size()));
-                            if (g_moe_warmup.tick_token()) {
-                                moe_apply_popularity_placement();
-                                moe_prestage_popular_experts();
-                                g_moe_warmup.enable_reranking();
-                            } else if (g_moe_warmup.tick_epoch()) {
-                                moe_periodic_rerank();
-                            }
-                            g_adaptive_prestage.tick();
-                        }
-                    }
-                }
-            }
             record_moe_gpu_path("fused_esimd", GGML_LAYOUT_AOS, moe_selected_entries);
             return;
         }
@@ -90595,34 +88673,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         fflush(stderr);
     }
 
-    // After first full PP pass through all MoE layers, trigger popularity-based
-    // pre-staging so that TG starts with GPU0 placement table entries populated.
-    // The warmup system (g_moe_warmup) requires 32 tokens — too late for short benchmarks.
-    {
-        static std::atomic<bool> first_pass_staged{ false };
-        if (use_expert_cache && !has_placement_plan && !first_pass_staged.load(std::memory_order_acquire)) {
-            const char * name = src0->name ? src0->name : "";
-            if (strstr(name, "ffn_down")) {
-                auto &    seq_map      = g_moe_layer_seq[ctx.device];
-                auto      it           = seq_map.find(layer_id);
-                const int n_moe_layers = g_moe_warmup.n_layers;
-                if (it != seq_map.end() && n_moe_layers > 0 && it->second == n_moe_layers - 1 &&
-                    !first_pass_staged.exchange(true, std::memory_order_acq_rel)) {
-                    moe_apply_popularity_placement();
-                    if (ggml_sycl_runtime_prestage_enabled()) {
-                        moe_prestage_popular_experts();
-                        GGML_LOG_INFO("[MOE-PRESTAGE] First PP pass complete — triggered popularity pre-staging\n");
-                    } else {
-                        g_prestage_completed.store(true, std::memory_order_release);
-                        GGML_SYCL_DEBUG(
-                            "[MOE-PRESTAGE] First PP pass complete — skipping popularity prestage under placement "
-                            "plan\n");
-                    }
-                }
-            }
-        }
-    }
-
     // Routing-aware pre-staging: stage only needed experts for large MoE models (>64 experts)
     // This avoids blind preloading all experts which is wasteful for 128+ expert models.
     // Only valid when use_expert_cache is true — src0 host storage is a host (mmap) pointer.
@@ -91730,50 +89780,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         static_cast<int64_t>(cpu_entries.size()), static_cast<int64_t>(route_unavailable_count));
                 }
 
-                // Compute sequential layer ID for warmup/stats (CPU-TG path)
+                // Compute sequential layer ID for the stats and the predictor (CPU-TG path)
                 int seq_layer_id_cputg = -1;
                 {
                     auto & seq_map = g_moe_layer_seq[ctx.device];
                     auto   it      = seq_map.find(layer_id);
                     if (it != seq_map.end()) {
                         seq_layer_id_cputg = it->second;
-                    }
-                }
-
-                // Record expert activations for warmup + adaptive prestage (CPU-TG path)
-                {
-                    const bool in_warmup_ct = !g_moe_warmup.warmup_done.load(std::memory_order_acquire);
-                    const bool in_rerank_ct = g_moe_warmup.reranking_enabled.load(std::memory_order_acquire);
-                    if ((in_warmup_ct || in_rerank_ct) && seq_layer_id_cputg >= 0) {
-                        int scratch_ids[32];
-                        int n_ids_total = 0;
-                        for (const auto & e : gpu_entries) {
-                            if (n_ids_total < 32) {
-                                scratch_ids[n_ids_total++] = e.expert_id;
-                            }
-                        }
-                        for (int d = 1; d < n_gpu_devs; d++) {
-                            for (const auto & e : per_gpu_entries[d]) {
-                                if (n_ids_total < 32) {
-                                    scratch_ids[n_ids_total++] = e.expert_id;
-                                }
-                            }
-                        }
-                        for (const auto & e : cpu_entries) {
-                            if (n_ids_total < 32) {
-                                scratch_ids[n_ids_total++] = e.expert_id;
-                            }
-                        }
-                        g_moe_warmup.record(seq_layer_id_cputg, scratch_ids, n_ids_total);
-
-                        if (g_moe_warmup.tick_token()) {
-                            moe_apply_popularity_placement();
-                            moe_prestage_popular_experts();
-                            g_moe_warmup.enable_reranking();
-                        } else if (g_moe_warmup.tick_epoch()) {
-                            moe_periodic_rerank();
-                        }
-                        g_adaptive_prestage.tick();
                     }
                 }
 
@@ -92012,45 +90025,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         static_cast<int64_t>(cpu_entries.size()), static_cast<int64_t>(route_unavailable_count),
                         static_cast<int64_t>(gpu_entries.size() + pp_sec_count),
                         static_cast<int64_t>(cpu_entries.size()), static_cast<int64_t>(route_unavailable_count));
-                }
-
-                // Record expert activations for warmup + adaptive prestage
-                {
-                    const bool in_warmup_p = !g_moe_warmup.warmup_done.load(std::memory_order_acquire);
-                    const bool in_rerank_p = g_moe_warmup.reranking_enabled.load(std::memory_order_acquire);
-                    if (in_warmup_p || in_rerank_p) {
-                        // Collect all dispatched expert IDs (GPU0 + secondary + CPU)
-                        int scratch_ids[32];
-                        int n_ids_total = 0;
-                        for (const auto & e : gpu_entries) {
-                            if (n_ids_total < 32) {
-                                scratch_ids[n_ids_total++] = e.expert_id;
-                            }
-                        }
-                        for (int d = 1; d < n_gpu_devs; d++) {
-                            for (const auto & e : per_gpu_entries[d]) {
-                                if (n_ids_total < 32) {
-                                    scratch_ids[n_ids_total++] = e.expert_id;
-                                }
-                            }
-                        }
-                        for (const auto & e : cpu_entries) {
-                            if (n_ids_total < 32) {
-                                scratch_ids[n_ids_total++] = e.expert_id;
-                            }
-                        }
-                        g_moe_warmup.record(seq_layer_id, scratch_ids, n_ids_total);
-
-                        // Tick token and trigger re-placement when warmup ends
-                        if (g_moe_warmup.tick_token()) {
-                            moe_apply_popularity_placement();
-                            moe_prestage_popular_experts();
-                            g_moe_warmup.enable_reranking();
-                        } else if (g_moe_warmup.tick_epoch()) {
-                            moe_periodic_rerank();
-                        }
-                        g_adaptive_prestage.tick();
-                    }
                 }
 
                 const size_t route_missing_count = route_unavailable_count > route_layout_mismatch_count ?
@@ -100356,8 +98330,6 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     }
     ggml_sycl_moe_exec_log_report();       // the [MOE-EXEC] summary line, if any layer was consulted (llama.cpp-36j0)
     ggml_sycl_expert_refill_log_report();  // the [MOE-EXEC] refill line, if any triplet was lent (llama.cpp-sif1)
-    // Stop adaptive prestage background thread before tearing down SYCL resources.
-    g_adaptive_prestage.stop();
     // Flush any deferred CPU scatter before tearing down SYCL resources.
     // Without this, the thread_local g_pending_scatter may hold a
     // sycl::context reference that outlives the SYCL runtime, causing
@@ -108434,9 +106406,6 @@ static void moe_prefetch_scan(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph 
         return;
     }
     if (predictor.is_prefetch_disabled()) {
-        return;
-    }
-    if (!g_moe_warmup.warmup_done.load(std::memory_order_acquire)) {
         return;
     }
     auto & seq_map = g_moe_layer_seq[device];
@@ -124080,10 +122049,7 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
             sycl_ctx, cached_is_decode ? "phase-change-before-tg-layout" : "phase-change-before-pp-layout");
     }
 
-    // PP→TG transition: force-fire warmup completion if it hasn't triggered yet.
-    // During PP, the fused MoE kernel records expert activations.  If PP ends
-    // before warmup_tokens is reached (short prompt), we force-complete warmup
-    // so that TG starts with popular experts pre-staged in VRAM.
+    // PP→TG transition: the per-split and process-wide work a decode does once after a prompt.
     bool refresh_moe_after_pp = false;
     {
         // These helpers act on this split's tensors only, so each split does them on its own first decode
@@ -124132,7 +122098,6 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
             }
         }
 
-        static bool prev_was_decode = true;  // start true to avoid false trigger on first call
         if (!cached_is_decode) {
             g_moe_post_pp_preload_pending.store(true, std::memory_order_release);
             g_moe_prompt_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -124149,21 +122114,6 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
                 fprintf(stderr, "[SYCL-GRAPH] checked PP->TG MoE refresh pending=%d\n", refresh_moe_after_pp ? 1 : 0);
             }
         }
-        if (cached_is_decode && !prev_was_decode) {
-            // Transition from PP to TG detected
-            if (!g_moe_warmup.warmup_done.load(std::memory_order_acquire) &&
-                g_moe_warmup.token_count.load(std::memory_order_relaxed) > 0) {
-                GGML_LOG_INFO(
-                    "[MOE-WARMUP] PP→TG transition: force-completing warmup "
-                    "(%d/%d tokens recorded)\n",
-                    g_moe_warmup.token_count.load(std::memory_order_relaxed), g_moe_warmup.warmup_tokens);
-                g_moe_warmup.warmup_done.store(true, std::memory_order_release);
-                moe_apply_popularity_placement();
-                moe_prestage_popular_experts();
-                g_moe_warmup.enable_reranking();
-            }
-        }
-        prev_was_decode = cached_is_decode;
     }
 
     // Periodic KV-expert rebalance check (advisory — logs opportunities only).
@@ -125040,9 +122990,6 @@ normal_dispatch:
             ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase::PP_TO_TG_BEFORE, "pp-to-tg-before-refresh");
         if (post_prompt_refresh_due && ggml_sycl_materialize_moe_down_i8_hotset(*sycl_ctx, cgraph) > 0) {
             sycl_ctx->invalidate_moe_phase_layout_cache();
-        }
-        if (refresh_moe_after_pp) {
-            moe_prestage_popular_experts();
         }
         // No pointer-table preload here. Its tables and leases serve a recorded graph, and the graph path prepares
         // them right before every record or replay. Direct dispatch and the descriptor graphlets build their own
@@ -128856,14 +126803,12 @@ static void ggml_sycl_reset_moe_module_state() {
     // The owner path already encodes what a pristine MoE working set is, so
     // reuse it instead of maintaining a second copy of the same list that can
     // drift out of step with it. What remains below is exactly what
-    // install_fresh() deliberately does not own: the background prestage
-    // thread, the device-resident predictors, the inventory-time VRAM reserve,
-    // and the routing flags. The bias and fused-activation registries are no
-    // longer on that list -- install_fresh() owns them as of llama.cpp-nlww, so
-    // repeating their clear here would be the second copy this comment warns
-    // about.
+    // install_fresh() deliberately does not own: the device-resident
+    // predictors, the inventory-time VRAM reserve, and the routing flags. The
+    // bias and fused-activation registries are no longer on that list --
+    // install_fresh() owns them as of llama.cpp-nlww, so repeating their clear
+    // here would be the second copy this comment warns about.
     g_moe_live_discovery.install_fresh();
-    g_adaptive_prestage.reset_after_stop();
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
         g_expert_predictors[d].reset();
         g_moe_expert_vram_reserve[d] = 0;
@@ -128964,9 +126909,6 @@ extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
     g_moe_hybrid_init_success[0].store(true, std::memory_order_relaxed);
     g_moe_hybrid_init_done.store(true, std::memory_order_relaxed);
     g_moe_post_pp_preload_pending.store(true, std::memory_order_relaxed);
-    g_prestage_completed.store(true, std::memory_order_relaxed);
-    g_moe_warmup.n_layers = 1;
-    g_adaptive_prestage.test_seed_pending();
     {
         std::unique_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
         g_moe_expert_meta.push_back({});
@@ -129357,8 +127299,6 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
            !g_moe_hybrid_init_done.load(std::memory_order_relaxed) &&
            !g_moe_post_pp_preload_pending.load(std::memory_order_relaxed) &&
            !g_moe_discovery_registry.has_active_owner() && g_moe_discovery_registry.parked_owner_count() == 0 &&
-           !g_prestage_completed.load(std::memory_order_relaxed) && g_moe_warmup.n_layers == 0 &&
-           g_adaptive_prestage.test_pending_empty() &&
            !g_expert_prefetchers[0].is_initialized() && !g_pinned_buffer_pools[0].is_initialized() &&
            !g_cpu_expert_pools[0].is_active() && !g_expert_predictors[0].test_scores_allocated() &&
            !ggml_sycl_cpu_retained_active() && ggml_sycl::unified_cache_shutdown_state_clean() &&
@@ -129413,7 +127353,6 @@ void ggml_backend_sycl_shutdown(void) {
 
     // Stop producers before queues/caches they may reference. Every operation
     // here is idempotent because static builds may call this during tests too.
-    g_adaptive_prestage.stop();
     ggml_sycl_tp_worker_shutdown();
     cpu_worker_shutdown();
     // The IO pool's reads (th32 §3.3): a read can complete after its context was freed, so its queued reads are

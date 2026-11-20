@@ -70,18 +70,6 @@ def verify(source: str) -> None:
     drain = function_body(source, "ggml_sycl_drain_direct_stage_queue(")
     require(drain, "queue.wait_and_throw()", "failure path does not synchronously drain its exact queue")
 
-    prestage = function_body(source, "moe_prestage_popular_experts(")
-    require(prestage, "ggml_sycl_direct_stage_owner_handoff handoff(item.source.handle)",
-            "secondary GPU reorder does not open a retained handoff before submit")
-    require(prestage, "ggml_sycl_direct_stage_owner_handoff handoff(ci.reorder_handle)",
-            "CPU reorder fallback does not retain its staging source")
-    require(prestage, "&storage_handle", "secondary staging does not request a destination handle")
-    require(prestage, "handoff.set_destination(storage_handle)",
-            "secondary staging does not install the destination owner")
-    cpu = prestage[prestage.index("// DMA pre-reordered data to secondary devices"):]
-    require(cpu, "ggml_sycl_drain_direct_stage_queue(*sec_bcs)",
-            "CPU failure-after-enqueue still relies on the staged counter to drain")
-
     ensure = function_body(source, "moe_expert_ensure_soa_cached(")
     require(ensure, "ggml_sycl_direct_stage_owner_handoff handoff(source.handle)",
             "async SOA materialization omits the retained handoff")
