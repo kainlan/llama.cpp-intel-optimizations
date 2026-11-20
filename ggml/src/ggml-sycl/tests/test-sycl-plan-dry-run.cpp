@@ -16,7 +16,8 @@
 // every arena through the end of each load whose zones or terms they read after it, as a first model's allocations
 // would. That end cannot tell such a page from a failed load's own buffers, so it marks the release deferred, and the
 // next load's start runs it again: while the page is held the arena stays and that load runs on it, and once the page
-// is gone the start empties the cache and puts its terms back at their start values. Arm (f) marks a model live from
+// is gone the start empties the cache and puts its terms back at their start values; arm (k) scores that start, after
+// (j), and its last load's end leaves every arena released, as (j)'s does. Arm (f) marks a model live from
 // its load's begin to its end, as the live context its ring stands for would, and arms (f) and (h) first run any
 // release an earlier arm's pages deferred (settle_deferred_releases), then reserve device 0's arena as a load's start
 // does, before they put a ring in it. Arm (i)'s reverse leg leaves device 0's ONEDNN zone grown for a 1 GiB Graph
@@ -1916,6 +1917,185 @@ arm_result arm_j_refused_load_leaves_nothing_sized_for_it() {
     return r;
 }
 
+// (k) A load's start runs the release a failed load's end deferred, for the caches that end marked and no other. Load
+// L1 is arm (j)'s grown inventory, whose early pass rebuilds device 0's arena above the first arena's RUNTIME zone; a
+// sentinel goes into every planner global and every other device-wide term after L1's begin, and a RUNTIME-zone page
+// taken in device 0's arena before L1's uncommitted end holds that arena through the end. The end cannot tell the page
+// from a failed load's buffers: device 0 keeps its arena and the terms the end put back (the sentinels), and its cache
+// is marked; every other device empties.
+//   L2's begin, the page held: one line names the start on device 0, the WARN that a load is starting on an arena a
+//              failed load left held and that a holder still there after the failed model's free is a leak, and one
+//              line names the holders; the mark stays, and device 0 keeps L1's zones, the page and its terms. L2 ends
+//              uncommitted, which defers device 0's release again.
+//   L3's begin, the page dropped: one line names the start on device 0, the INFO that the arena is released; the mark
+//              is clear, the begin's reserve built the first arena's zones (g_first_zones), and device 0's published
+//              terms are at their start values, but for the zone plan, which that reserve stores for the arena it
+//              built. Device 1, which carried no mark, keeps a scatter sentinel written before L3's begin. L3 ends
+//              uncommitted, which releases every arena.
+// Engagement: the first arena's zones were read before any arm; L1's begin returned OK and the sentinels read back;
+// after L1's end the page lies in device 0's RUNTIME zone, that arena is active with a RUNTIME zone above the first
+// arena's, device 0 is marked and reads terms other than the start values, and no device with a cache of its own is.
+// Mutants: the start's release dropped (L3 logs no line and finds the mark, L1's zones and the sentinels); the start
+// asking every cache (device 1's scatter goes back to its start value); the start's held arena logged as the abort's
+// or as a model release's (no start WARN, or a second line naming the start), or without its holders; a start that
+// reaps the page or tears the arena down (L2's zones or page move); a start that puts back the terms of a cache it did
+// not empty (device 0's terms move at L2's begin); the mark cleared by a start that kept the arena, or kept by one that
+// emptied it.
+arm_result arm_k_load_start_runs_the_deferred_release() {
+    arm_result      r;
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (cache == nullptr || !g_first_zones_read) {
+        void_arm(r, "device 0's first arena was not read before the arms, so the start's reserve has nothing to equal");
+        return r;
+    }
+    ggml_sycl_load_txn               l1{};
+    const ggml_sycl_lifecycle_result l1_begin = ggml_backend_sycl_model_load_begin(&l1);
+    if (l1_begin != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "load L1's transaction did not begin (" + num(l1_begin) + ")");
+        return r;
+    }
+    const std::vector<device_planner_state> original        = read_planner_state();
+    const std::vector<device_planner_state> sentinel        = sentinel_planner_state(original.size());
+    const std::vector<device_load_extras>   original_extras = read_load_extras();
+    const std::vector<device_load_extras>   sentinel_extras = sentinel_load_extras(original_extras.size());
+    // The page's handle is its one release point: dropped before L3, or by put_back on a VOID, whose settle then runs
+    // the release the page deferred.
+    std::vector<mem_handle>                 page;
+    const auto                              put_back = [&]() {
+        page.clear();
+        settle_deferred_releases();
+        write_planner_state(original);
+        write_load_extras(original_extras);
+    };
+    write_planner_state(sentinel);
+    write_load_extras(sentinel_extras);
+    if (!(read_planner_state() == sentinel) || !(read_load_extras() == sentinel_extras)) {
+        (void) ggml_backend_sycl_model_load_end(l1, false, nullptr);
+        put_back();
+        void_arm(r, "the sentinel planner state or load terms did not read back, so a put-back to them would not show");
+        return r;
+    }
+
+    loader_inventory grown(qwen38_shape);
+    grown.inv.pp_moe_onednn_weight_slot_bytes = g_first_zones.runtime + 256 * MiB;
+    grown.inv.pp_moe_onednn_scratch_bytes     = grown.inv.pp_moe_onednn_weight_slot_bytes;
+    grown.inv.pp_moe_onednn_ring_depth        = 1;
+    const ggml_sycl_lifecycle_result l1_stage = ggml_backend_sycl_stage_load_inventory_plan(&grown.inv, nullptr, true);
+    if (allocation_result allocation = allocate_runtime_page(cache, 0)) {
+        page.push_back(mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS));
+    }
+    const bool held = !page.empty() && holds_the_runtime_zone(page.back());
+    (void) ggml_backend_sycl_model_load_end(l1, false, nullptr);
+
+    // The groups of device `d`'s published terms that are not at their start values, the zone plan left out: a start
+    // reserve stores the plan of the arena it builds.
+    const auto off_start = [](int d) {
+        return load_published_terms::snapshot(d).differing(load_published_terms{}) & ~LOAD_PUBLISHED_GROUP_ZONE_PLAN;
+    };
+    const bool                  marked      = cache->last_release_deferred();
+    const bool                  l1_active   = cache->arena_active();
+    const arena_zone_capacities grown_zones = l1_active ? read_zone_capacities(cache) : arena_zone_capacities{};
+    const load_published_terms  l1_left     = load_published_terms::snapshot(0);
+    const uint32_t              l1_terms    = off_start(0);
+    std::string                 other_marked;
+    for (int d = 1; d < ggml_backend_sycl_get_device_count() && d < GGML_SYCL_MAX_DEVICES; ++d) {
+        const unified_cache * c = get_unified_cache_for_device(d);
+        if (c != nullptr && c != cache && c->last_release_deferred()) {
+            other_marked += " " + num(d);
+        }
+    }
+    if (!held || !l1_active || grown_zones.runtime <= g_first_zones.runtime || !marked || l1_terms == 0 ||
+        !other_marked.empty()) {
+        put_back();
+        void_arm(r, "after load L1 (stage " + num(l1_stage) + ") the page is " + (held ? "" : "not ") +
+                        "in device 0's RUNTIME zone, its arena " +
+                        (l1_active ? "has zones " + zone_capacities_text(grown_zones) : std::string("is not active")) +
+                        " against the first arena's RUNTIME " + num(g_first_zones.runtime) + ", its cache is " +
+                        (marked ? "" : "not ") + "marked, its terms differ from the start values in groups " +
+                        num(l1_terms) + (other_marked.empty() ? "" : ", and devices" + other_marked + " are marked"));
+        return r;
+    }
+
+    // The start's site is in every line its release logs: the start's own lines, and the abort's or a model release's
+    // when the start takes their path.
+    const char * const named_start = "(load-start)";
+    const char * const start_line  = "[VRAM-ARENA] last release on device 0 (load-start)";
+    log_clear();
+    ggml_sycl_load_txn               l2{};
+    const ggml_sycl_lifecycle_result l2_begin = ggml_backend_sycl_model_load_begin(&l2);
+    const size_t                     l2_named = lines_with(named_start).size();
+    const size_t l2_warned  = lines_with(start_line, "a load is starting on an arena a failed load left held").size();
+    const size_t l2_leak    = lines_with(start_line, "after that failed model was freed is a leak").size();
+    const size_t l2_holders = lines_with("[VRAM-ARENA] live in the arena on device 0 (MB): ").size();
+    const bool   l2_marked  = cache->last_release_deferred();
+    const bool   l2_active  = cache->arena_active();
+    const arena_zone_capacities l2_zones = l2_active ? read_zone_capacities(cache) : arena_zone_capacities{};
+    const bool                  l2_held  = holds_the_runtime_zone(page.back());
+    const uint32_t              l2_moved = load_published_terms::snapshot(0).differing(l1_left);
+    if (l2_begin == GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_load_end(l2, false, nullptr);
+    }
+
+    // Device 1, when it has a cache of its own, carries no mark: a start that asked it would put its terms back.
+    const bool other =
+        ggml_backend_sycl_get_device_count() > 1 && sentinel.size() > 1 && get_unified_cache_for_device(1) != cache;
+    const size_t scatter = other ? sentinel[1].scatter : 0;
+    page.clear();
+    if (other) {
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(1, scatter);
+    }
+    log_clear();
+    ggml_sycl_load_txn               l3{};
+    const ggml_sycl_lifecycle_result l3_begin   = ggml_backend_sycl_model_load_begin(&l3);
+    const size_t                     l3_named   = lines_with(named_start).size();
+    const size_t                     l3_emptied = lines_with(start_line, "no model is live; the arena").size();
+    const bool                       l3_marked  = cache->last_release_deferred();
+    const bool                       l3_active  = cache->arena_active();
+    const arena_zone_capacities      l3_zones   = l3_active ? read_zone_capacities(cache) : arena_zone_capacities{};
+    const uint32_t                   l3_terms   = off_start(0);
+    const size_t l3_scatter = other ? unified_cache_get_planned_moe_host_scatter_scratch_bytes(1) : 0;
+    if (l3_begin == GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_load_end(l3, false, nullptr);
+    }
+    put_back();
+
+    expect(r, l2_begin == GGML_SYCL_LIFECYCLE_OK, "load L2's begin returned " + num(l2_begin) + ", not OK");
+    expect(r, l2_warned == 1 && l2_leak == 1 && l2_named == 1,
+           "load L2's begin, the page held, logged " + num(l2_warned) +
+               " lines saying a load is starting on device 0's arena a failed load left held, " + num(l2_leak) +
+               " saying a holder after the failed model's free is a leak, and " + num(l2_named) +
+               " lines naming the start; want 1, 1 and 1");
+    expect(r, l2_holders == 1, "load L2's begin named device 0's holders on " + num(l2_holders) + " lines, want 1");
+    expect(r, l2_marked, "load L2's begin, which kept device 0's arena, cleared its mark");
+    expect(r, l2_active && l2_zones == grown_zones && l2_held,
+           "load L2's begin left device 0's arena " +
+               (l2_active ? "with zones " + zone_capacities_text(l2_zones) : std::string("not active")) +
+               (l2_held ? "" : " and the page out of its RUNTIME zone") + ", not as L1 left it, with zones " +
+               zone_capacities_text(grown_zones));
+    expect(r, l2_moved == 0,
+           "load L2's begin moved device 0's published terms of load_published_group mask " + num(l2_moved) +
+               ", which a cache the start did not empty keeps");
+    expect(r, l3_begin == GGML_SYCL_LIFECYCLE_OK, "load L3's begin returned " + num(l3_begin) + ", not OK");
+    expect(r, l3_emptied == 1 && l3_named == 1,
+           "load L3's begin, the page dropped, logged " + num(l3_emptied) +
+               " lines saying device 0's arena is released, and " + num(l3_named) +
+               " lines naming the start; want 1 and 1");
+    expect(r, !l3_marked, "load L3's begin, which emptied device 0's cache, left its mark");
+    expect(r, l3_active && l3_zones == g_first_zones,
+           "load L3's begin left device 0's arena " +
+               (l3_active ? "with zones " + zone_capacities_text(l3_zones) : std::string("not active")) +
+               ", not with the first arena's " + zone_capacities_text(g_first_zones));
+    expect(r, l3_terms == 0,
+           "after load L3's begin device 0's published terms of load_published_group mask " + num(l3_terms) +
+               " are not at their start values");
+    if (other) {
+        expect(r, l3_scatter == scatter,
+               "load L3's begin put device 1's terms back (scatter " + num(l3_scatter) + ", want " + num(scatter) +
+                   "), though its cache carried no mark");
+    }
+    return r;
+}
+
 // The q2k fixture's shape with 256 experts: each expert tensor is 32 times larger, so the plan's host staging and
 // SCRATCH zones, which follow the largest copied tensor, are larger than the q2k shape's.
 constexpr host_plan_shaped_inventory::moe_shape q2k_wide_shape = {
@@ -2103,6 +2283,7 @@ int main() {
         { "(h) a load releases a ring alone holding the arena",  arm_h_load_releases_a_lone_ring                  },
         { "(i) a Graph floor keeps an allocation-held arena",    arm_i_graph_floor_keeps_an_allocation_held_arena },
         { "(j) a refused load leaves nothing sized for it",      arm_j_refused_load_leaves_nothing_sized_for_it   },
+        { "(k) a load's start runs a deferred release",          arm_k_load_start_runs_the_deferred_release       },
         { "(g) a refused late pass configures no host zone",     arm_g_refused_late_pass_configures_no_host_zones },
     };
     int passed = 0, failed = 0, voided = 0;
