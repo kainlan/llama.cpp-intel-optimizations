@@ -20954,8 +20954,10 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
 // quarter and the arena reserve's room, and a zone that live allocations keep short of the bound stays as it is; each
 // says so once (unified_cache::ensure_planned_arena_zones). Neither refuses, since the ops the zone cannot place take
 // the miss path: raw device memory while the card has room outside the arena, else the dispatch refuses the buffer by
-// name (q8-scratch-alloc) and the op takes its fallback. False only when the arena's teardown left it closed to new
-// allocations. A probe sizes the figure and changes nothing else.
+// name (q8-scratch-alloc) and the op takes its fallback where its type has one, while a Q1_0 or NVFP4 op, which has no
+// other executor on the card, ends with that named refusal and a failed compute (zone_scratch_zone_plan lists the
+// types). False only when the arena's teardown left it closed to new allocations. A probe sizes the figure and changes
+// nothing else.
 static bool ggml_sycl_replan_moe_mmvq_scratch(int                               device,
                                               const ggml_sycl::placement_plan & current,
                                               ggml_sycl::placement_plan &       next_plan,

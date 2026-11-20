@@ -6418,12 +6418,14 @@ class unified_cache {
     std::atomic<size_t> scratch_zone_clamp_warn_bytes_{ 0 };
 
     // Logs the WARN of a plan whose limit (plan.clamp: the budget quarter `budget_cap_bytes`, or the reserve's room
-    // `room_bytes` above plan.required) held the SCRATCH zone below the bound of `bound_bytes`, when one is due.
+    // `room_bytes` above plan.required) held the planned SCRATCH zone below the bound of `bound_bytes`, when one is
+    // due. The line is zone_scratch_clamp_text's; `reserve_accepts` says whether the reserve accepts plan.required.
     void scratch_zone_clamp_warn(int                       dev_id,
                                  const zone_scratch_plan & plan,
                                  size_t                    bound_bytes,
                                  size_t                    budget_cap_bytes,
-                                 size_t                    room_bytes);
+                                 size_t                    room_bytes,
+                                 bool                      reserve_accepts);
 
     // The plan this cache's ONEDNN zone was sized from (zone_onednn_plan says what it holds and why it is kept apart
     // from the planner's live figures). ensure_planned_arena_zones() writes it when it keeps or builds this cache's

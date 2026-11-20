@@ -7684,33 +7684,24 @@ void unified_cache::scratch_zone_kept_warn(int dev_id, const zone_scratch_plan &
     }
     GGML_LOG_WARN(
         "[VRAM-ARENA] device %d keeps its SCRATCH zone of %.1f MB: the MoE batched MMVQ scratch bound asks for a "
-        "%.1f MB zone (the zone must hold %.1f MB without it), and live allocations block the rebuild. Expert ops "
-        "whose scratch the zone cannot place take the miss path: device memory outside the arena while the card has "
-        "room for it, else the dispatch refuses the buffer by name (q8-scratch-alloc) and the op takes its fallback; "
-        "the zone's use line at teardown counts them as misses\n",
-        dev_id, kept_bytes / (1024.0 * 1024.0), plan.wanted / (1024.0 * 1024.0), plan.required / (1024.0 * 1024.0));
+        "%.1f MB zone (the zone must hold %.1f MB without it), and live allocations block the rebuild. %s. The zone's "
+        "use line at teardown counts each such request as a miss\n",
+        dev_id, kept_bytes / (1024.0 * 1024.0), plan.wanted / (1024.0 * 1024.0), plan.required / (1024.0 * 1024.0),
+        k_zone_scratch_miss_path_text);
 }
 
 void unified_cache::scratch_zone_clamp_warn(int                       dev_id,
                                             const zone_scratch_plan & plan,
                                             size_t                    bound_bytes,
                                             size_t                    budget_cap_bytes,
-                                            size_t                    room_bytes) {
+                                            size_t                    room_bytes,
+                                            bool                      reserve_accepts) {
     if (!scratch_zone_warn_latch(scratch_zone_clamp_warn_bytes_, bound_bytes)) {
         return;
     }
-    const bool   room     = plan.clamp == zone_scratch_clamp::ROOM;
-    const size_t accepted = room_bytes > SIZE_MAX - plan.required ? SIZE_MAX : plan.required + room_bytes;
-    GGML_LOG_WARN(
-        "[VRAM-ARENA] device %d sizes its SCRATCH zone at %.1f MB, short of the %.1f MB MoE batched MMVQ scratch "
-        "bound: %s (%.1f MB; a quarter of the available budget is %.1f MB, the arena's reserve accepts a %.1f MB "
-        "zone, and the zone must hold %.1f MB without the bound). Expert ops whose scratch the zone cannot place take "
-        "the miss path: device memory outside the arena while the card has room for it, else the dispatch refuses the "
-        "buffer by name (q8-scratch-alloc) and the op takes its fallback\n",
-        dev_id, plan.wanted / (1024.0 * 1024.0), bound_bytes / (1024.0 * 1024.0),
-        room ? "the room the arena's reserve accepts holds it" : "a quarter of the available budget holds it",
-        (room ? accepted : budget_cap_bytes) / (1024.0 * 1024.0), budget_cap_bytes / (1024.0 * 1024.0),
-        accepted / (1024.0 * 1024.0), plan.required / (1024.0 * 1024.0));
+    const std::string line =
+        zone_scratch_clamp_text(dev_id, plan, bound_bytes, budget_cap_bytes, room_bytes, reserve_accepts);
+    GGML_LOG_WARN("%s\n", line.c_str());
 }
 
 bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *              refusal,
@@ -7941,21 +7932,27 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             unified_cache_get_planned_state_term_bytes(dev_id) / (1024.0 * 1024.0));
     }
 
-    // The MoE batched MMVQ scratch bound raises the zone on top of what it must hold (zone_scratch_zone_plan says why
-    // the bound is every expert op's buffers at once). Unlike the non-FA scratch, a request of those ops the zone
-    // cannot place has a miss path, so the bound never makes the load refuse: it is held to the quarter of the budget
-    // the non-FA raise is held to, and to the room the arena's reserve accepts beside the ONEDNN and RUNTIME zones
-    // sized above (zone_arena_scratch_room, from the arguments the reserve below is called with). A rebuild that
-    // something live blocks keeps a zone short of the bound alone (below) rather than refuse.
+    // The MoE batched MMVQ scratch bound raises the zone's plan on top of what it must hold (zone_scratch_zone_plan
+    // says why the bound is every expert op's buffers at once, and what a miss costs each expert type). Unlike the
+    // non-FA scratch, a request of those ops the zone cannot place has a miss path, so the bound never makes the load
+    // refuse: it is held to the quarter of the budget the non-FA raise is held to, and to the room the arena's reserve
+    // accepts beside the ONEDNN and RUNTIME zones sized above (zone_arena_scratch_room, from the arguments the reserve
+    // below is called with). The plan, and the INFO and WARN lines that state it, are what this call asks for: an
+    // arena kept as it was built below may hold more. A rebuild that something live blocks keeps a zone short of the
+    // bound alone (below) rather than refuse. A room of 0 is also the room of a zone the reserve refuses outright,
+    // which the clamp WARN must not call accepted, so whether the reserve accepts the zone it must hold is read beside
+    // the room.
     const size_t scratch_required   = zone_scratch_required_bytes(scratch_zone, scratch_nonfa);
     size_t       scratch_other_tail = 0;
     size_t       scratch_room       = 0;
+    bool         scratch_accepted   = false;
     if (zone_runtime_reserved_bytes(0, runtime_zone, &scratch_other_tail) &&
         scratch_other_tail <= SIZE_MAX - zone_arena_zone_bytes(onednn_zone)) {
         scratch_other_tail += zone_arena_zone_bytes(onednn_zone);
-        scratch_room =
-            zone_arena_scratch_room(zone_arena_reserve_shape_of(budget_, device_total_vram_, max_alloc, safe_max_alloc),
-                                    scratch_other_tail, scratch_required);
+        const zone_arena_reserve_shape scratch_shape =
+            zone_arena_reserve_shape_of(budget_, device_total_vram_, max_alloc, safe_max_alloc);
+        scratch_room     = zone_arena_scratch_room(scratch_shape, scratch_other_tail, scratch_required);
+        scratch_accepted = zone_arena_scratch_accepts(scratch_shape, scratch_other_tail, scratch_required);
     }
     const size_t            moe_mmvq_bound = unified_cache_get_planned_moe_mmvq_scratch_bytes(dev_id);
     const zone_scratch_plan scratch_plan =
@@ -7967,7 +7964,8 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             scratch_plan.wanted / (1024.0 * 1024.0), scratch_plan.required / (1024.0 * 1024.0));
     }
     if (scratch_plan.clamp != zone_scratch_clamp::NONE) {
-        scratch_zone_clamp_warn(dev_id, scratch_plan, moe_mmvq_bound, scratch_budget_cap, scratch_room);
+        scratch_zone_clamp_warn(dev_id, scratch_plan, moe_mmvq_bound, scratch_budget_cap, scratch_room,
+                                scratch_accepted);
     }
     scratch_zone = scratch_plan.wanted;
 
@@ -30363,7 +30361,10 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
     // Align zone sizes to the arena's grain. The RUNTIME zone is rounded by the function every RUNTIME plan counts on,
     // with no floor: the callers apply it. The sizes and the checks on the tail below are zone-sizing.hpp's (its
-    // "arena reserve's checks" section), so the SCRATCH zone's room is planned from the tests made here.
+    // "arena reserve's checks" section), so the SCRATCH zone's room is planned from the tests made here. Their
+    // zone_arena_chunk_holds_tail refuses a tail whose sum with the 16 MiB shared-zone minimum wraps, where the inline
+    // comparisons it replaced at the single-chunk and per-chunk-cap checks wrapped, accepted, and would have carved
+    // a corrupt layout.
     scratch_bytes = zone_arena_zone_bytes(scratch_bytes);
     onednn_bytes  = zone_arena_zone_bytes(onednn_bytes);
     if (!zone_runtime_reserved_bytes(0, runtime_bytes, &runtime_bytes)) {
@@ -36403,15 +36404,15 @@ static void populate_host_zone_sizing(placement_plan &                          
     plan.onednn_reorder_bytes = zone_maxima.onednn_reorder;
 
     // 2. MoE batched MMVQ scratch: each MUL_MAT_ID op that mmvq_moe_batched_dispatch runs holds a Q8_1 copy of its
-    //    activations and an ids table in the device SCRATCH zone until a thread that waits on the op's completion
-    //    event releases them, and no later op's allocation waits for that release, so the zone is sized for every
-    //    op's buffers at once (zone_scratch_zone_plan), at the micro-batch the context runs. The bound is published
-    //    for the ensure that sizes the zone, which holds it to the budget quarter and the arena reserve's room and
-    //    states the zone it sizes; this line states only the bound, so the two cannot disagree. A request the zone
-    //    cannot place is a miss, served from raw device memory while the card has room outside the arena and
-    //    otherwise refused by name, and the zone's use line at cache teardown counts it. A load plans twice, from the
-    //    file's weights and then from the tensors it created, so the line names the tensor count of the plan it
-    //    describes.
+    //    activations and an ids table (and, grouped on the device, its grouping tables) in the device SCRATCH zone
+    //    until a thread that waits on the op's completion event releases them, and no later op's allocation waits for
+    //    that release, so the bound counts every op's buffers at once (zone_scratch_zone_plan), at the micro-batch the
+    //    context runs. The bound is published for the ensure that plans the zone, which holds it to the budget quarter
+    //    and the arena reserve's room and states the zone it plans; this line states only the bound, so the two cannot
+    //    disagree. A request the zone cannot place is a miss, served from raw device memory while the card has room
+    //    outside the arena and otherwise refused by name (zone_scratch_zone_plan says what that refusal costs each
+    //    expert type), and the zone's use line at cache teardown counts it. A load plans twice, from the file's weights
+    //    and then from the tensors it created, so the line names the tensor count of the plan it describes.
     plan.moe_mmvq_scratch_ops.clear();
     plan.moe_mmvq_scratch_n_expert_used = 0;
     plan.moe_mmvq_scratch_bytes         = 0;
@@ -36436,7 +36437,7 @@ static void populate_host_zone_sizing(placement_plan &                          
             GGML_LOG_WARN(
                 "[SYCL-PLAN] MoE batched MMVQ scratch, plan of %zu tensors: %zu expert op(s) at n_ubatch=%u, depth %zu "
                 "(every op: no op's allocation waits for an earlier op's release), %.2f MB, the largest op %.2f MB; "
-                "the arena's ensure sizes the SCRATCH zone for this bound and states what it holds of it\n",
+                "the arena's ensure plans the SCRATCH zone for this bound and states the zone it plans\n",
                 tensor_inventory.size(), n_ops, plan.moe_mmvq_scratch_n_ubatch, n_ops,
                 mmvq_scratch.graph / (1024.0 * 1024.0), mmvq_scratch.per_op / (1024.0 * 1024.0));
         }
