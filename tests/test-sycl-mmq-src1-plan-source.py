@@ -1792,7 +1792,8 @@ if args.self_test:
          (backend, common, mutate_in_func(cache, r"void unified_cache_set_planned_scratch_hold\(", "spill_count", "spill_XXXX"),
           zone)),
         ("f16 dispatch arm outside the macro", "both f16 buffer acquisitions in the dispatch arm sit under the one macro",
-         (mutate(backend, "#if GGML_SYCL_DEQUANT_F16_ARM", "#if 1", 1), common, cache, zone)),        # review r4
+         (mutate_in_func(backend, r"inline void ggml_sycl_op_mul_mat_sycl\([^)]*\)\s*try\s*\{",
+                         "#if GGML_SYCL_DEQUANT_F16_ARM", "#if 1"), common, cache, zone)),
         ("KV placement published as RUNTIME", "the KV pre-placement publishes through the KV zone (record, allocation, metadata)",
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", "output_metadata.vram_zone    = vram_zone_id::KV;",
                                           "output_metadata.vram_zone    = vram_zone_id::RUNTIME;"), zone)),
