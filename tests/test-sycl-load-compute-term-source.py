@@ -169,6 +169,7 @@ LOAD_SIG = "static void ggml_sycl_model_loading_effects(bool loading, bool outer
 TEARDOWN_SIG = "static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner)"
 ABORT_SIG = "static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner,"
 DROP_CALL = "(void) ggml_sycl::unified_cache_drop_planned_load_terms(owner.owner);"
+LAST_RELEASE_CALL = "ggml_sycl_release_last_model_effects(site, ggml_sycl::unified_cache_release_cause::LOAD_ABORTED);"
 DROP_DECL = "bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept;"
 DROP_DEF = "bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept {"
 STALE_LOOP = "for (int stale_device = 0; stale_device < GGML_SYCL_MAX_DEVICES; ++stale_device) {"
@@ -348,9 +349,10 @@ def claim_teardown_drops_only_its_slot(sycl: str) -> bool:
 def claim_abort_drops_only_its_owner(sycl: str) -> bool:
     """The aborted load drops its own contribution after the last try stage, whichever stage that is, unconditionally
     and outside any try, so no failed stage before it skips it and no catch handler is added for it; whatever is live
-    is left alone."""
+    is left alone. Only the last release follows it, which decides for itself whether a model is live."""
     b = body(norm(sycl), ABORT_SIG)
-    return (bool(b) and b.endswith("} catch (...) { clean = false; } " + DROP_CALL + " return clean; }")
+    return (bool(b) and b.endswith("} catch (...) { clean = false; } " + DROP_CALL + " " + LAST_RELEASE_CALL
+                                   + " return clean; }")
             and b.count("unified_cache_drop_planned_load_terms(") == 1 and depth_at(b, b.find(DROP_CALL)) == 1
             and "live_mask" not in b)
 

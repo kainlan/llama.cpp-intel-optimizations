@@ -4115,6 +4115,23 @@ struct layer_weight_pointers {
     void * ffn_gate_up_proj = nullptr;  // Fused gate+up (optional)
 };
 
+// How the last model of the process left: its release, or the abort of a load that failed. At an abort the failed
+// model's buffers are still alive (they go with the model, after the abort), so what holds the arena then is no leak.
+enum class unified_cache_release_cause { MODEL_RELEASED, LOAD_ABORTED };
+
+// What unified_cache::release_for_no_live_model() did: EMPTIED when the cache holds nothing sized for a model (or held
+// nothing), otherwise what kept it, and nothing after that was released.
+enum class unified_cache_last_release {
+    EMPTIED,
+    MODEL_LIVE,        // a model is live, so nothing was released
+    BARRIER_FAILED,    // the device work before the release could not be waited for
+    RING_CLAIMED,      // a slot of the PP MoE oneDNN ring is claimed
+    PAIR_HELD,         // the oneDNN scratchpad pair is reserved
+    ARENA_HELD,        // something still holds the arena
+    TEARDOWN_REFUSED,  // the arena's teardown refused
+    FAILED,            // an exception ended the release
+};
+
 // Unified GPU cache for both dense weights and MoE experts
 //
 // Design principles:
@@ -5107,8 +5124,10 @@ class unified_cache {
     zone_onednn_plan onednn_zone_plan_load() const;
     // A failed load's restore (load_published_record::restore); see the definition. Takes onednn_zone_plan_mutex_.
     void             onednn_zone_plan_put_back(const zone_onednn_plan & written, const zone_onednn_plan & prior);
-    // Stores `plan` as the zone plan: the zone was rebuilt for it, or the published terms' restore stores it with the
-    // device's other terms (load_published_terms::restore). Takes onednn_zone_plan_mutex_ alone.
+    // Stores `plan` as the zone plan. Only two callers may: the ensure, for the zone it built from that plan, and the
+    // published terms' restore (load_published_terms::restore), which stores it with the device's other terms. It is
+    // public for the restore alone; any other caller would describe the zone by a plan it was not built from. Takes
+    // onednn_zone_plan_mutex_ alone.
     void             onednn_zone_plan_store(const zone_onednn_plan & plan);
     // Both free-space figures of one zone, read together under its allocator group's mutex: the
     // allocators' figures are only coherent under it (zone_available and zone_largest_free read
@@ -5178,6 +5197,21 @@ class unified_cache {
     zone_arena_teardown_refusal arena_teardown_refusal() const {
         return arena_teardown_refusal_.load(std::memory_order_acquire);
     }
+
+    // The release of the last model: with no model live, it gives back what this cache sized for one, so the next load
+    // plans and builds as a first load does. In order: it waits once for the device work submitted before it, releases
+    // the PP MoE oneDNN ring, the oneDNN scratchpad pair, the MoE reorder temp buffer and the pooled oneDNN Graph
+    // scratch, drains the queued frees, then tears the arena down, which hands its memory back to the device. It stops
+    // at the first thing that holds on, with an ERROR line that names it (a WARN for what a failed load's own buffers
+    // hold at its abort), and releases nothing after it; nothing is reaped, evicted or reset over a live handle. The
+    // next load's start reserves the arena of a cache it emptied again (reserve_released_arena). It reserves nothing
+    // itself and never throws: an exception ends it with an ERROR naming `site`.
+    unified_cache_last_release release_for_no_live_model(const char * site, unified_cache_release_cause cause) noexcept;
+
+    // The start of a load: a cache whose arena the last release tore down reserves its early arena again from the
+    // published terms, as the constructor did. True when there is nothing to reserve or the reserve succeeded; false
+    // with `refusal` written when it failed, and the cache stays released, so the next load's start tries again.
+    bool reserve_released_arena(zone_arena_refusal * refusal);
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
     void       test_zone_boundary_check(vram_zone_id zone) { zone_boundary_check(zone); }
     mem_handle test_scratch_pool_owner() const;
@@ -6409,6 +6443,18 @@ class unified_cache {
                               const size_t *       live_zone_used,
                               zone_arena_holders & holders,
                               const char *         site);
+
+    // The oneDNN scratchpad pair's release for the last model. False, with nothing released, while a reservation holds
+    // the pair. The fields are emptied under onednn_scratch_mutex_ and the blocks freed after it is released, so no
+    // other lock is taken under it. A caller first waits for the device work that read the pair.
+    bool              release_onednn_scratch_pair();
+    // The MoE reorder temp buffer's release for the last model; the next model's MoE init reserves it again.
+    void              release_reorder_temp();
+    // Binds the compute arena to the SCRATCH zone, or unbinds it before the zones go.
+    void              compute_arena_bind();
+    void              compute_arena_unbind();
+    // The last release tore this cache's arena down, and no load's start has reserved it since.
+    std::atomic<bool> arena_released_{ false };
 
     // The load transaction whose keep of a short ONEDNN zone last warned on this device (zone_kept_onednn_warn_due). An
     // exchange, so two ensures of one load racing on the device warn once between them.

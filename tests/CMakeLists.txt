@@ -4769,10 +4769,25 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for the release of the last model: the model release hook and a failed load's abort each end in the one
+# step, which with no model live has every cache give back what it sized for a model (the ring, the oneDNN pair, the
+# reorder temp buffer, the arena) in a fixed order, names what holds on and reserves nothing, then puts the device's
+# published terms back to their start through the one list; the next load's start reserves the early arena again and
+# refuses the load by name when it cannot. Host-only, reads the sources as text. Same registration shape as
+# test-sycl-load-zone-refusal-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-last-release-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-last-release-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Source gate for the load stage's two passes: every device plans and every refusal of the pass is decided before the
 # stage's effects (layer streaming, host zones, the stale ring's release), so a pass refused on any device runs none of
 # them, while a load refused in its late pass has run its early pass's effect, the stale ring's release; the decide
-# step's zone decision may still rebuild an arena nothing holds, which a refused load keeps. The decide pass releases
+# step's zone decision may still rebuild an arena nothing holds, which the refused load's abort tears down again when
+# no model is live. The decide pass releases
 # the PP MoE ring only at the entry ensure, when the ring alone holds an arena that must grow; each device's effects run
 # from its own snapshot under the last device's candidate check; the replaced candidates' leases outlive the effects; a
 # refused arena teardown reserves nothing. Host-only, reads the sources as text. Same registration shape as

@@ -12715,6 +12715,61 @@ static void ggml_sycl_diag_emit_warn(const char * fmt, ...) {
     fflush(stderr);
 }
 
+// The release of the last model in the process, run last by the model release hook (`cause` MODEL_RELEASED) and by a
+// failed load's abort (LOAD_ABORTED), after each has dropped and put back what the model published. Each cache gives
+// back what it sized for a model (unified_cache::release_for_no_live_model), so the next load plans and builds as the
+// first load of a process does. Liveness is process-wide, every cache holds the same mask, so walking every existing
+// cache when that mask is 0 is right; in GLOBAL cache mode several devices share one cache, which is asked once.
+// Nothing makes a model live while this runs: the registry begins no load while a model is tearing down or a load
+// transaction is open (begin_outer answers LOAD_BUSY), and the hook runs in the first and the abort in the second.
+// A device whose cache emptied, or that has none, then holds the published terms a device no load has planned on
+// reads, stored under the inventory lock every planner pass publishes under; a cache that kept something keeps its
+// terms, which describe what it kept. The two-card MoE flag goes back to its start once every cache emptied. Not at
+// static destruction, where the caches go with the module. It reserves nothing and never throws.
+static void ggml_sycl_release_last_model_effects(const char *                           site,
+                                                 ggml_sycl::unified_cache_release_cause cause) noexcept {
+    try {
+        if (ggml_sycl::ggml_sycl_is_shutting_down()) {
+            return;
+        }
+        const int n = std::max(0, std::min(ggml_backend_sycl_get_device_count(), GGML_SYCL_MAX_DEVICES));
+        std::array<ggml_sycl::unified_cache *, GGML_SYCL_MAX_DEVICES>            caches{};
+        std::array<ggml_sycl::unified_cache_last_release, GGML_SYCL_MAX_DEVICES> released{};
+        bool                                                                     all_emptied = true;
+        for (int d = 0; d < n; ++d) {
+            caches[d]   = ggml_sycl::get_existing_unified_cache_for_device(d);
+            released[d] = ggml_sycl::unified_cache_last_release::EMPTIED;
+            if (caches[d] == nullptr) {
+                continue;
+            }
+            int first = d;
+            for (int e = 0; e < d; ++e) {
+                if (caches[e] == caches[d]) {
+                    first = e;
+                    break;
+                }
+            }
+            released[d] = first == d ? caches[d]->release_for_no_live_model(site, cause) : released[first];
+            all_emptied = all_emptied && released[d] == ggml_sycl::unified_cache_last_release::EMPTIED;
+            if (released[d] == ggml_sycl::unified_cache_last_release::MODEL_LIVE) {
+                return;
+            }
+        }
+        for (int d = 0; d < n; ++d) {
+            if (released[d] == ggml_sycl::unified_cache_last_release::EMPTIED) {
+                std::lock_guard inventory(g_tensor_inventory_mutex);
+                ggml_sycl::load_published_terms{}.restore(d);
+            }
+        }
+        if (all_emptied) {
+            g_moe_multi_gpu_active.store(false, std::memory_order_release);
+        }
+    } catch (...) {
+        GGML_LOG_ERROR(
+            "[SYCL] the release of the last model (%s) ended on an exception; what it had not released stays\n", site);
+    }
+}
+
 static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner) {
     const uint32_t slot      = owner.owner.slot;
     const size_t   rows      = ggml_sycl_release_host_weight_extras_for_owner(owner);
@@ -12778,6 +12833,8 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     // this line while it was INFO-only.
     ggml_sycl_diag_emit_warn("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed\n", slot,
                              rows, reclaimed);
+    // Last, once this model's slot and terms are gone: with no model left live, what the caches sized for it goes too.
+    ggml_sycl_release_last_model_effects("model-release", ggml_sycl::unified_cache_release_cause::MODEL_RELEASED);
 }
 
 static ggml_sycl::lifecycle::quarantine_queue g_sycl_quarantine_queue;
@@ -13452,6 +13509,10 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     // models' contributions, and the device's merge of them, are what remains. The drop is noexcept and runs after
     // every stage unconditionally, so no failed stage above can skip it.
     (void) ggml_sycl::unified_cache_drop_planned_load_terms(owner.owner);
+    // With no model left live, what the failed load made the caches size goes as at the last model's release, and it
+    // reserves nothing: the next load's start does. noexcept and outside every try stage like the two steps above; it
+    // reports through its own lines, not through `clean`.
+    ggml_sycl_release_last_model_effects(site, ggml_sycl::unified_cache_release_cause::LOAD_ABORTED);
     return clean;
 }
 
@@ -13876,6 +13937,26 @@ extern "C" size_t ggml_backend_sycl_test_compute_term_count() {
 }
 #endif
 
+// The start of a load: a cache whose arena the last model's release tore down reserves its early arena again
+// (unified_cache::reserve_released_arena), from the start terms that release left, as a first load's cache did when
+// it was made. Only here: the end of a refused load reserves nothing. A reserve that fails refuses the load by name.
+static bool ggml_sycl_load_start_reserve_released_arenas() {
+    const int n = std::max(0, std::min(ggml_backend_sycl_get_device_count(), GGML_SYCL_MAX_DEVICES));
+    for (int d = 0; d < n; ++d) {
+        ggml_sycl::unified_cache * const cache = ggml_sycl::get_existing_unified_cache_for_device(d);
+        if (cache == nullptr) {
+            continue;
+        }
+        ggml_sycl::zone_arena_refusal refusal;
+        if (!cache->reserve_released_arena(&refusal)) {
+            GGML_LOG_ERROR("[SYCL] model load refused at its start: %s\n",
+                           ggml_sycl::zone_arena_refusal_text(refusal).c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
     ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
     sycl_module_mutation_guard module_guard;
@@ -13887,6 +13968,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
     }
     ggml_sycl::lifecycle::Registry *   registry = nullptr;
     ggml_sycl::lifecycle::begin_result result;
+    // What a load that cannot start returns: PLAN_REJECTED when a cache could not reserve its early arena again, a
+    // refusal by name that is not retried, as no reserve refusal is; EFFECT_FAILED when a step threw. Either way its
+    // transaction ends failed and its owner effects are aborted, below the try.
+    ggml_sycl_lifecycle_result         rollback_code = GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
     try {
         ggml_sycl_quarantine_reap();
         registry = &ggml_sycl::lifecycle::global_registry();
@@ -13899,24 +13984,27 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
         // explicit UNKNOWN/no-plan candidate before any load effects.
         ggml_sycl::lifecycle_stage_no_placement_plan(result.txn.value);
         ggml_sycl_model_loading_effects(true, true);
-        registry->bind_candidate(result.txn);
-        // The load's span opens: its copies of mapped bytes are the load's (docs/design/sycl-mmap-host-tier.md §5.3).
-        ggml_sycl::unified_cache_file_mapped_load_enter();
-        return GGML_SYCL_LIFECYCLE_OK;
-    } catch (...) {
-        g_sycl_in_model_load.store(false, std::memory_order_release);
-        ggml_sycl::offload_stats_set_phase(ggml_sycl::offload_phase::UNKNOWN);
-        g_sycl_abort_load_exit = false;
-        const auto ticket = registry ? registry->prepare_end(result.txn, false) : ggml_sycl::lifecycle::finish_ticket{};
-        if (ticket.finisher) {
-            const bool cleanup_ok =
-                ggml_sycl_abort_owner_effects_noexcept(ticket.token, "load_begin/exception-rollback");
-            const auto failed = registry->finalize_end(ticket, cleanup_ok);
-            ggml_sycl_enqueue_quarantined_result(*registry, failed, nullptr);
+        if (ggml_sycl_load_start_reserve_released_arenas()) {
+            registry->bind_candidate(result.txn);
+            // The load's span opens: its copies of mapped bytes are the load's (docs/design/sycl-mmap-host-tier.md
+            // §5.3).
+            ggml_sycl::unified_cache_file_mapped_load_enter();
+            return GGML_SYCL_LIFECYCLE_OK;
         }
-        txn->id = 0;
-        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+    } catch (...) {
+        rollback_code = GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
+    g_sycl_in_model_load.store(false, std::memory_order_release);
+    ggml_sycl::offload_stats_set_phase(ggml_sycl::offload_phase::UNKNOWN);
+    g_sycl_abort_load_exit = false;
+    const auto ticket = registry ? registry->prepare_end(result.txn, false) : ggml_sycl::lifecycle::finish_ticket{};
+    if (ticket.finisher) {
+        const bool cleanup_ok = ggml_sycl_abort_owner_effects_noexcept(ticket.token, "load_begin/rollback");
+        const auto failed     = registry->finalize_end(ticket, cleanup_ok);
+        ggml_sycl_enqueue_quarantined_result(*registry, failed, nullptr);
+    }
+    txn->id = 0;
+    return rollback_code;
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -17383,8 +17471,6 @@ void ggml_backend_sycl_set_sched_placement_plan(ggml_backend_sched_t sched) {
     // information here for multi-backend coordination.
 }
 
-static std::array<size_t, GGML_SYCL_MAX_DEVICES> g_tiered_headroom_reserve = {};
-
 // Layer-to-device map for CPU offload dispatch
 // Built lazily on first compute pass; maps layer_id -> true if layer's weights are host-resident
 static std::vector<bool> g_layer_on_cpu;
@@ -18308,8 +18394,10 @@ static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_
     // The last resort is taken below, so every call after it may keep the zones.
     options.ring_release_first = false;
 
-    // Needed only because the ring outlives the context that sized it: once a context's teardown releases its own
-    // ring, no ring can be left alone in the arena and this branch can go.
+    // Reachable while a model is live somewhere. The last model's release frees the ring, but liveness is process-wide,
+    // so a model live on another device keeps this device's ring past this device's last model, and a live model's
+    // ring outlives the context that sized it. Once a context's teardown releases its own ring and liveness is kept per
+    // device, no ring can be left alone in the arena and this branch can go.
     ggml_sycl::unified_cache * cache        = ggml_sycl::get_existing_unified_cache_for_device(device);
     const uint32_t             slot_buffers = refusal.holders.ring_in_arena;
     if (cache == nullptr || !cache->release_pp_moe_onednn_scratch_ring()) {
@@ -18847,9 +18935,10 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
 // streaming and releases no stale ring: what it decided to change is returned in *effects (device -1 when it planned
 // nothing or refused), for the caller to run with ggml_sycl_run_inventory_effects() once it has decided every refusal.
 // The planner's zone decision still changes the device: the entry ensure may release the PP MoE ring as its last
-// resort, and it or the micro-batch's grow leg may rebuild an arena nothing holds, which a refused load keeps (or,
-// after a failed reserve, the device keeps no arena). A plan that needs the secondary MoE devices also creates their
-// shared queues and caches, which stay.
+// resort, and it or the micro-batch's grow leg may rebuild an arena nothing holds. A refused load's abort tears that
+// arena down again when no model is live (ggml_sycl_release_last_model_effects), and the next load's start reserves
+// the early arena; while a model is live on another device, the rebuilt arena (or, after a failed reserve, no arena)
+// stays. A plan that needs the secondary MoE devices also creates their shared queues and caches, which stay.
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(
     ggml_backend_t                     backend,
     const ggml_sycl_tensor_inventory * inventory,
@@ -19035,20 +19124,13 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
     GGML_LOG_INFO("[SYCL-BUDGET] vram_budget_base=%.1f MB, final_budget=%.1f MB, model_size=%.1f MB\n",
                   vram_budget_base / (1024.0 * 1024.0), vram_budget / (1024.0 * 1024.0),
                   g_tensor_inventory_total_size / (1024.0 * 1024.0));
-    // Reserve extra VRAM headroom for large models (onemath/DNN scratch).
-    // When CPU offload is available, CPU-dispatched layers don't need GPU scratch,
-    // so skip the extra reservation to maximize VRAM available for weight caching.
+    // The headroom the [VRAM-BUDGET] lines below print: a quarter of the device for a model larger than the budget
+    // with no CPU offload. It is a figure in those lines only, and nothing reserves it.
     const size_t desired_headroom = std::max(base_headroom, base_mem / 4);
     const size_t desired_extra =
         model_size_exceeds_budget && desired_headroom > base_headroom && !cpu_offload_available ?
             (desired_headroom - base_headroom) :
             0;
-    g_tiered_headroom_reserve[ctx->device] = desired_extra;
-    if (desired_extra > 0) {
-        GGML_LOG_INFO("[SYCL] Tiered headroom reserve: %.1f MB (base headroom %.1f MB, total %.1f MB)\n",
-                      desired_extra / (1024.0 * 1024.0), base_headroom / (1024.0 * 1024.0),
-                      base_mem / (1024.0 * 1024.0));
-    }
     {
         const double MB                = 1024.0 * 1024.0;
         const size_t dense_weights     = g_tensor_inventory_total_size - g_moe_expert_total_bytes;

@@ -1103,9 +1103,9 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
                 "inventory would exceed the conservative ONEDNN tail bound");
     fprintf(stderr, "host_zones=%zu host_runtime=%zu committed_bound=%zu\n",
             host_zones, host_runtime, host_committed_bound);
-    // Now cross the real late-inventory boundary. Its tiered_headroom
-    // diagnostic (base_mem/4 when weights exceed shared capacity) is not a
-    // second budget subtraction: g_tiered_headroom_reserve has no readers.
+    // Now cross the real late-inventory boundary. The headroom its
+    // [VRAM-BUDGET] lines print (base_mem/4 when weights exceed shared
+    // capacity) is a figure in those lines, not a second budget subtraction.
     TEST_ASSERT(ggml_backend_sycl_stage_load_inventory_plan(&inventory, nullptr, false) == GGML_SYCL_LIFECYCLE_OK,
                 "public late inventory staging failed");
     const auto late_snapshot = lifecycle_find_candidate_placement_plan(load.txn.id);
