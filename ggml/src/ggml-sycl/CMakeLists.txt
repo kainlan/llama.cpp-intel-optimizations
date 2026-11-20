@@ -3956,6 +3956,21 @@ set_tests_properties(sycl-runtime-alloc-arena-teardown-refusal-classes PROPERTIE
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77
 )
+# The release of the last model: with no model live a cache gives back its PP MoE ring, its oneDNN pair and the arena
+# nothing holds; a claimed ring slot, a reserved pair or a chunk lease keeps them and is named; and a device's published
+# terms go back to a default load_published_terms, their start values. Its own process, because its first arm reads a
+# process where nothing has been published. It allocates small arenas on the device, so it carries `cache` and runs
+# alone with that family, not in the sweep.
+add_test(NAME sycl-runtime-alloc-last-release-empties-the-arena
+    COMMAND test-sycl-runtime-alloc --case last_release_empties_the_arena
+)
+set_tests_properties(sycl-runtime-alloc-last-release-empties-the-arena PROPERTIES
+    LABELS "sycl;allocator;runtime;cache;tdd"
+    ENVIRONMENT "${SYCL_ARENA_TEARDOWN_TEST_ENV}"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+)
 endif() # direct-source static SYCL fixture
 
 # Test: numerics of the SYCL Q2_0 device functions (dequantize_q2_0, vec_dot_q2_0_q8_1)
@@ -8739,11 +8754,13 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     # not aborted, a load refused in its early pass keeps the PP MoE ring a context left in the KV zone, a load releases
     # a ring that alone holds the arena and its stage rebuilds the arena once for the zones it was refused, a load whose
     # oneDNN Graph floor alone outgrows an arena one allocation holds keeps the zones and its uncommitted end leaves
-    # no zone plan of its own stored (and the reverse order takes the sufficient path), and a late pass refused on its
-    # decide step configures no host zone. The planner initialises SYCL and arms (a), (c), (e), (f), (h), (i) and (g)
-    # stage loads through real backends that construct caches, (h) rebuilds device 0's arena, (i) grows its ONEDNN zone
-    # by about 1 GiB, and (g)'s second load configures a host zone set of a few hundred MiB on each card, so it carries
-    # the OOM-family labels, runs alone on the discrete cards, and exits 77 without a SYCL GPU.
+    # no zone plan of its own stored (and the reverse order takes the sufficient path), a load that ends refused with no
+    # model live leaves nothing sized for it and the next load's start reserves the first load's arena, and a late pass
+    # refused on its decide step configures no host zone. The planner initialises SYCL and arms (a), (c), (e), (f),
+    # (h), (i), (j) and (g) stage loads through real backends that construct caches, (h) and (j) rebuild device 0's
+    # arena, (i) grows its ONEDNN zone by about 1 GiB, and (g)'s second load configures a host zone set of a few hundred
+    # MiB on each card, so it carries the OOM-family labels, runs alone on the discrete cards, and exits 77 without a
+    # SYCL GPU.
     add_executable(test-sycl-plan-dry-run
         tests/test-sycl-plan-dry-run.cpp)
     target_link_libraries(test-sycl-plan-dry-run PRIVATE

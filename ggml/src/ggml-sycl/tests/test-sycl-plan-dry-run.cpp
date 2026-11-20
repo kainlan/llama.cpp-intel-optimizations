@@ -11,9 +11,13 @@
 // stages a load through real SYCL backends, and the backends construct caches, so the binary is registered
 // gpu-serial, serial, with the selector pinned to the discrete cards, and a host with no SYCL GPU exits 77 before any
 // arm runs (th32 §11). Arm (g) runs late passes, which configure every device's host zones from a small plan, so it
-// runs last: no earlier arm may configure them. Arm (h) rebuilds device 0's arena with a larger RUNTIME zone, which
-// stays after its uncommitted load, so it runs after every arm that reads that arena as found. Arm (i) grows device
-// 0's ONEDNN zone for a 1 GiB Graph floor in its reverse leg, which stays too, so it runs after (h) and before (g).
+// runs last: no earlier arm may configure them. A load that ends with no model live releases every arena nothing
+// holds, and the next load's start reserves the early arena again (arm (j)). So arms (a), (e) and (i) hold a page in
+// every arena through the end of each load whose zones or terms they read after it, as a first model's allocations
+// would, arm (f) marks a model live around its load's end, and arms (f) and (h) reserve device 0's arena as a load's
+// start does before they put a ring in it. Arm (i)'s reverse leg leaves device 0's ONEDNN zone grown for a 1 GiB
+// Graph floor after its hold goes, until a later load's end releases the arena, so (i) runs after (h), and (j) runs
+// after (i): its first load rebuilds that arena and its end releases it.
 //
 // Every arm names its engagement check, the observation that proves it reached the mechanism it scores, and the
 // mutant it kills. An arm whose engagement check fails is VOID, and a VOID arm fails the binary like a FAIL. Every arm
@@ -32,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -200,19 +205,96 @@ std::vector<device_planner_state> sentinel_planner_state(size_t n) {
     return out;
 }
 
+// A 4 KiB allocation in `device`'s RUNTIME zone, which holds that device's arena as a live model's allocations would.
+allocation_result allocate_runtime_page(unified_cache * cache, int device) {
+    alloc_request req{};
+    req.queue                               = &cache->get_queue();
+    req.device                              = device;
+    req.size                                = 4096;
+    req.intent.role                         = alloc_role::GRAPH_TMP;
+    req.intent.category                     = runtime_category::GRAPH;
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+    return unified_allocate_owner(req);
+}
+
+// Whether `holder` lies in a RUNTIME zone, where it holds its device's arena.
+bool holds_the_runtime_zone(const mem_handle & holder) {
+    const resolved_ptr p = holder.resolve();
+    alloc_metadata     meta{};
+    return p && p.on_device && unified_lookup(p.ptr, &meta) && meta.zone == vram_zone_id::RUNTIME;
+}
+
+// A RUNTIME-zone page in every device's arena, device 0's first, appended to the empty `pages`. With no model live a
+// load's end releases every arena nothing holds, and on each device it emptied puts the published terms back at their
+// start values (ggml_sycl_release_last_model_effects). An arm that reads a load's zones or terms after its end takes
+// these pages inside the load, before the end, as the first model's allocations would hold the arenas. False when a
+// device has no active arena or its page is not in that arena's RUNTIME zone.
+bool hold_arenas(std::vector<mem_handle> & pages) {
+    for (int d = 0; d < ggml_backend_sycl_get_device_count(); ++d) {
+        unified_cache * cache = get_unified_cache_for_device(d);
+        if (cache == nullptr || !cache->arena_active()) {
+            return false;
+        }
+        allocation_result allocation = allocate_runtime_page(cache, d);
+        if (!allocation) {
+            return false;
+        }
+        // The handle's destructor is the page's one release point, when the arm clears `pages` or returns.
+        pages.push_back(mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS));
+        if (!holds_the_runtime_zone(pages.back())) {
+            return false;
+        }
+    }
+    return !pages.empty();
+}
+
+// A model live in the process, as the release of the last model reads it: every cache's live mask gains a slot no
+// model holds. A load's begin publishes the registry's mask to every cache, so the mark goes on after the begin; it
+// comes off with the mask device 0's cache held before it.
+struct live_model_mark {
+    uint32_t prior = 0;
+
+    live_model_mark() {
+        if (unified_cache * cache = get_unified_cache_for_device(0)) {
+            prior = cache->live_model_mask();
+        }
+        unified_cache_set_live_model_mask(prior | (1u << 31));
+    }
+
+    ~live_model_mark() { unified_cache_set_live_model_mask(prior); }
+
+    live_model_mark(const live_model_mark &)             = delete;
+    live_model_mark & operator=(const live_model_mark &) = delete;
+};
+
+// Device 0's cache, its arena reserved as a load's start reserves it (unified_cache::reserve_released_arena): a load
+// that ended with no model live released the arena nothing held. An arm that puts a ring in the arena before its load
+// begins reserves it here, as a live model's state would have it. Null when device 0 has no cache or no arena.
+unified_cache * device0_arena_cache() {
+    unified_cache *    cache = get_unified_cache_for_device(0);
+    zone_arena_refusal refusal{};
+    if (cache == nullptr || !cache->reserve_released_arena(&refusal) || !cache->arena_active()) {
+        return nullptr;
+    }
+    return cache;
+}
+
 // (a) expected_host is the stage's host_planned_bytes. An early stage run in a load transaction plans the
 // Qwen3.8-shaped inventory on each device the scheduler exposes, and its planner records host_planned_bytes on one
 // [HOST-LEDGER] plan line per plan; the dry run over the same inventory, against the budgets the stage planned against
 // (the same process, so the same caches and arena zones), reports the same figure for each plan, in the same order.
+// The dry run's VRAM budget is the arena's whole reservation while the arena is active, so the stage's load holds a
+// page in every arena through its end, which would otherwise release them, until the dry run has run.
 // The dry run is handed the stage's own MemAvailable sample through --mem-available (arm (d) proves the option is the
 // sample), read from the stage's one [HOST-LEDGER] stored-budget line, so both sides compute the budget from one
 // sample: two samples differ by the host's drift, and when the budget binds that drift moves the plan.
-// Engagement: the stage run returned OK with at least one plan line and stored one budget, the dry run returned OK with
-// as many plans, every dry-run plan put at least one weight on the host (the shape's experts overflow any card here),
-// and its RUNTIME term carries the inventory's PP MoE ring, which the dry run published itself after the stage's
-// publish was withdrawn. A budget that still differs from the stage's VOIDs the arm only when an input each side reads
-// live (the pinned share, the committed bytes, the RAM total) moved in between and the budget binds; with none moved it
-// FAILs, as one sample computed into two budgets.
+// Engagement: the stage run returned OK with at least one plan line and stored one budget, every arena was held through
+// its end, the dry run returned OK with as many plans, every dry-run plan put at least one weight on the host (the
+// shape's experts overflow any card here), and its RUNTIME term carries the inventory's PP MoE ring, which the dry run
+// published itself after the stage's publish was withdrawn. A budget that still differs from the stage's VOIDs the arm
+// only when an input each side reads live (the pinned share, the committed bytes, the RAM total) moved in between and
+// the budget binds; with none moved it FAILs, as one sample computed into two budgets.
 // Mutants: a term dropped from or added to expected_host (it differs from the record by that term); the dry run not
 // publishing the inventory's planner inputs (RUNTIME and expected_host lose the ring); a budget other than the stage's
 // (the host weights, and with them expected_host, move); the dry run computing a budget from the sample other than the
@@ -230,9 +312,16 @@ arm_result arm_a_expected_host_is_the_stage_figure() {
     const ggml_sycl_lifecycle_result stage_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, nullptr, true);
     const std::vector<std::string>   stage    = lines_with("[HOST-LEDGER] device=", " plan host_budget=");
     const std::vector<std::string>   stored   = lines_with("[HOST-LEDGER] stored budget=");
+    std::vector<mem_handle>          held;  // the arenas the stage planned against, until the dry run has run
+    const bool                       arenas_held = hold_arenas(held);
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
     if (stage_rc != GGML_SYCL_LIFECYCLE_OK || stage.empty()) {
         void_arm(r, "the early stage run returned " + num(stage_rc) + " with " + num(stage.size()) + " plan lines");
+        return r;
+    }
+    if (!arenas_held) {
+        void_arm(r, "an arena could not be held through the load's end, so the dry run would not plan against the " +
+                        std::string("arena zones the stage planned against"));
         return r;
     }
     if (stored.size() != 1 || printed(stored[0], "available") == SIZE_MAX) {
@@ -848,7 +937,7 @@ std::vector<device_load_extras> sentinel_load_extras(size_t n) {
 
 // One staged early pass of `inv` in a load transaction of its own, ended uncommitted. `during` and `during_extras` read
 // the load's device-wide terms between the stage and the end, `published_weight` the ring weight slot the stage left on
-// device 0.
+// device 0. `before_end`, when given, runs last before the end: an arm takes its holds there (hold_arenas).
 struct staged_early_load {
     ggml_sycl_lifecycle_result        begin = GGML_SYCL_LIFECYCLE_OK;
     ggml_sycl_lifecycle_result        stage = GGML_SYCL_LIFECYCLE_OK;
@@ -857,7 +946,8 @@ struct staged_early_load {
     size_t                            published_weight = 0;
 };
 
-staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv) {
+staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv,
+                                      const std::function<void()> &      before_end = nullptr) {
     staged_early_load  out;
     ggml_sycl_load_txn txn{};
     out.begin = ggml_backend_sycl_model_load_begin(&txn);
@@ -868,6 +958,9 @@ staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv) {
     out.during           = read_planner_state();
     out.during_extras    = read_load_extras();
     out.published_weight = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(0);
+    if (before_end) {
+        before_end();
+    }
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
     return out;
 }
@@ -880,8 +973,9 @@ staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv) {
 // load's entry ensure sizes the zones before its own planner publishes, so it reads the MoE CONTROL requirement and the
 // host scatter scratch as they stand, here the sentinels' 4 KiB and 8 KiB, which no arm above sized the arena for. So
 // the shaped inventory is staged once with nothing holding the arena, which rebuilds the zones for the sentinels too.
-// Then a 4 KiB RUNTIME-zone allocation on device 0 stands for the first model, and two loads are staged beside it, each
-// ended uncommitted:
+// Before its end a 4 KiB RUNTIME-zone page in every device's arena stands for the first model, device 0's being the
+// allocation followed below: with no model live the end would release each arena nothing holds, and put the published
+// terms back at their start values over the sentinels. Two loads are staged beside the pages, each ended uncommitted:
 //   control: the shaped inventory, whose zones the sizing load sized for the sentinels, stages OK, and every sentinel
 //            reads back after its end;
 //   refusal: the same inventory with a PP MoE ring weight slot 256 MiB larger than device 0's RUNTIME zone, at depth 1,
@@ -889,8 +983,9 @@ staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv) {
 //            and the allocations that hold the arena; every sentinel reads back right after the stage and after the
 //            end; the RUNTIME zone keeps its capacity; the allocation resolves to the same device pointer, and the
 //            registry still holds it in the RUNTIME zone.
-// Engagement: device 0's arena is active; the sizing load staged OK with nothing holding the arena, so the zones hold
-// the sentinels' terms; the allocation landed in its RUNTIME zone; the control staged OK beside it, so a refusal is the
+// Engagement: the sizing load staged OK with nothing holding the arena, so the zones hold the sentinels' terms, and
+// every device's arena was active before its end and held through it; the allocation landed in device 0's RUNTIME
+// zone; the control staged OK beside it, so a refusal is the
 // oversized term's and not the allocation's alone; a refusal leg that returned OK had published the oversized ring (it
 // owed a refusal), otherwise the ring was not planned and the arm is VOID. A control that did not stage leaves the
 // refusal leg running: the arm is VOID for it only if no check failed, and a FAIL carries its reason after the FAIL's.
@@ -901,8 +996,8 @@ staged_early_load stage_early_and_end(const ggml_sycl_tensor_inventory & inv) {
 arm_result arm_e_held_arena_refuses_the_load() {
     arm_result      r;
     unified_cache * cache = get_unified_cache_for_device(0);
-    if (cache == nullptr || !cache->arena_active()) {
-        void_arm(r, "device 0 has no active VRAM arena, so nothing can hold its zones");
+    if (cache == nullptr) {
+        void_arm(r, "device 0 has no cache, so nothing can hold its arena's zones");
         return r;
     }
 
@@ -922,30 +1017,22 @@ arm_result arm_e_held_arena_refuses_the_load() {
         return r;
     }
     loader_inventory        fits(qwen38_shape);
-    const staged_early_load sizing = stage_early_and_end(fits.inv);
+    std::vector<mem_handle> held;  // released at the end of the arm
+    bool                    arenas_held = false;
+    const staged_early_load sizing      = stage_early_and_end(fits.inv, [&]() { arenas_held = hold_arenas(held); });
     if (sizing.begin != GGML_SYCL_LIFECYCLE_OK || sizing.stage != GGML_SYCL_LIFECYCLE_OK) {
         put_back();
         void_arm(r, "the sizing load's begin returned " + num(sizing.begin) + " and its stage " + num(sizing.stage) +
                         " with nothing holding the arena, so the zones may not hold the sentinels' terms");
         return r;
     }
-
-    alloc_request req{};
-    req.queue                               = &cache->get_queue();
-    req.device                              = 0;
-    req.size                                = 4096;
-    req.intent.role                         = alloc_role::GRAPH_TMP;
-    req.intent.category                     = runtime_category::GRAPH;
-    req.intent.constraints.must_device      = true;
-    req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
-    allocation_result allocation            = unified_allocate_owner(req);
-    if (!allocation) {
+    if (!arenas_held) {
         put_back();
-        void_arm(r, "the 4 KiB RUNTIME-zone allocation was refused");
+        void_arm(r, "an arena was not active before the sizing load's end, or its 4 KiB RUNTIME-zone page was refused");
         return r;
     }
-    // The handle's destructor is the allocation's one release point, at the end of the arm.
-    const mem_handle   holder = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+
+    const mem_handle & holder = held.front();
     const resolved_ptr first  = holder.resolve();
     alloc_metadata     meta{};
     if (!first || !first.on_device || !unified_lookup(first.ptr, &meta) || meta.zone != vram_zone_id::RUNTIME) {
@@ -1057,18 +1144,21 @@ arm_result arm_e_held_arena_refuses_the_load() {
 // in the stage's effect step, after every refusal of the pass. The one release in a decide step is the entry ensure's
 // last resort, taken only when the ring's slot buffers are the only holders of an arena whose zones must grow
 // (arm (h)): a load refused in its early pass must leave any other ring, which a live context may still use.
-// Device 0 gets a one-slot ring of 1 MiB slots whose activation and output slots are planned in the KV zone, and a
-// 4 KiB RUNTIME-zone allocation beside it, so the ring is never the arena's only holder and the entry ensure has no
-// last resort to take. A load whose ring weight slot is 256 MiB larger than the RUNTIME zone is then staged early and
-// ended uncommitted.
+// Device 0's arena is reserved as a load's start reserves it, and device 0 gets a one-slot ring of 1 MiB slots whose
+// activation and output slots are planned in the KV zone, and a 4 KiB RUNTIME-zone allocation beside it, so the ring
+// is never the arena's only holder and the entry ensure has no last resort to take. A load whose ring weight slot is
+// 256 MiB larger than the RUNTIME zone is then staged early and ended uncommitted. The ring is a live context's, so a
+// model is marked live around the end: with none live, the end releases the ring with everything else sized for the
+// last model (arm (j)).
 // Engagement: the ring was reserved and holds KV-zone bytes, the allocation landed in the RUNTIME zone, and the stage
 // returned PLAN_REJECTED.
-// Mutant: the ring released where the load's planning state is reset, before the planner's refusals (the ring's
-// KV-zone bytes read 0 after the refused stage, and the release line is logged).
+// Mutants: the ring released where the load's planning state is reset, before the planner's refusals (the ring's
+// KV-zone bytes read 0 after the refused stage, and the release line is logged); the release of the last model run
+// while a model is live (the ring's KV-zone bytes read 0 after the end).
 arm_result arm_f_early_refusal_keeps_the_kv_zone_ring() {
     arm_result      r;
-    unified_cache * cache = get_unified_cache_for_device(0);
-    if (cache == nullptr || !cache->arena_active()) {
+    unified_cache * cache = device0_arena_cache();
+    if (cache == nullptr) {
         void_arm(r, "device 0 has no active VRAM arena, so no ring can sit in its KV zone");
         return r;
     }
@@ -1140,7 +1230,10 @@ arm_result arm_f_early_refusal_keeps_the_kv_zone_ring() {
     const size_t                     held_staged   = unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(0);
     const bool                       act_kv_staged = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(0);
     const bool                       out_kv_staged = unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(0);
-    (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    {
+        const live_model_mark live;
+        (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    }
     const size_t held_ended   = unified_cache_get_pp_moe_onednn_kv_zone_bytes_held(0);
     const bool   act_kv_ended = unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(0);
     const bool   out_kv_ended = unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(0);
@@ -1170,16 +1263,16 @@ arm_result arm_f_early_refusal_keeps_the_kv_zone_ring() {
 // (h) A load releases a ring that alone holds the arena, and asks for its zones again and gets them. The ring outlives
 // the context that sized it, so a freed context can leave its slot buffers as the only holders of an arena whose zones
 // a later load must grow; the entry ensure then releases the ring as its last resort and asks for the zones again,
-// where any other holder refuses the load. Device 0 gets arm (f)'s one-slot ring of 1 MiB slots with nothing beside it,
-// and the load arm (f) stages (a ring weight slot 256 MiB larger than the RUNTIME zone) is staged early. Between the
-// last resort's release line and device 0's first plan line, which device 0 logs after its entry ensure and before any
-// other device's planning starts, the stage must rebuild the arena once, to a RUNTIME zone at least the one its refused
-// first ask needed. The arm's own ensure inside the open load must then get the zones too, and may rebuild once more:
-// the plan publishes terms after the entry ensure sized the zones (the MoE control and host scatter terms), and the
-// next ensure of a load takes them in, as in every load. The load is then ended uncommitted. The rebuilt arena stays,
-// as it does after any refused or uncommitted load, so this arm runs after every arm that reads device 0's arena as
-// found. The arm is written for the registered environment, where GGML_SYCL_MOE_MULTI_GPU is unset: with it set to 1
-// the plan line names device -1, and the window would run to the end of the log.
+// where any other holder refuses the load. Device 0's arena is reserved as a load's start reserves it, device 0 gets
+// arm (f)'s one-slot ring of 1 MiB slots with nothing beside it, and the load arm (f) stages (a ring weight slot
+// 256 MiB larger than the RUNTIME zone) is staged early. Between the last resort's release line and device 0's first
+// plan line, which device 0 logs after its entry ensure and before any other device's planning starts, the stage must
+// rebuild the arena once, to a RUNTIME zone at least the one its refused first ask needed. The arm's own ensure inside
+// the open load must then get the zones too, and may rebuild once more: the plan publishes terms after the entry
+// ensure sized the zones (the MoE control and host scatter terms), and the next ensure of a load takes them in, as in
+// every load. The load is then ended uncommitted, and with no model live and nothing holding the rebuilt arena, its
+// end releases the arena. The arm is written for the registered environment, where GGML_SYCL_MOE_MULTI_GPU is unset:
+// with it set to 1 the plan line names device -1, and the window would run to the end of the log.
 // Engagement: device 0's zones held no byte and its chunks no lease before the ring, and the ring added live bytes; a
 // stage that refused another device, or refused device 0 before any release for a cause this arm does not set up, or
 // for a reserve the device could not make, is VOID. A refusal that names only the ring as the holder of device 0's
@@ -1189,8 +1282,8 @@ arm_result arm_f_early_refusal_keeps_the_kv_zone_ring() {
 // the refusal); the ring released twice (two release lines).
 arm_result arm_h_load_releases_a_lone_ring() {
     arm_result      r;
-    unified_cache * cache = get_unified_cache_for_device(0);
-    if (cache == nullptr || !cache->arena_active()) {
+    unified_cache * cache = device0_arena_cache();
+    if (cache == nullptr) {
         void_arm(r, "device 0 has no active VRAM arena, so no ring can hold it");
         return r;
     }
@@ -1375,7 +1468,9 @@ size_t onednn_zone_need(unified_cache * cache, size_t planned_onednn, size_t pla
     return std::min(need, std::max(cache->available_budget() / 4, planned_pair));
 }
 
-graph_floor_load stage_early_reading_the_graph_room(const ggml_sycl_tensor_inventory & inv) {
+// `before_end`, when given, runs last before the end, as stage_early_and_end's does.
+graph_floor_load stage_early_reading_the_graph_room(const ggml_sycl_tensor_inventory & inv,
+                                                    const std::function<void()> &      before_end = nullptr) {
     graph_floor_load   out;
     ggml_sycl_load_txn txn{};
     out.begin = ggml_backend_sycl_model_load_begin(&txn);
@@ -1387,6 +1482,9 @@ graph_floor_load stage_early_reading_the_graph_room(const ggml_sycl_tensor_inven
     out.planned_pair   = unified_cache_get_planned_onednn_scratchpad_bytes_stored(0);
     out.zone_need      = onednn_zone_need(get_unified_cache_for_device(0), out.planned_onednn, out.planned_pair);
     out.room_read      = unified_cache_get_onednn_graph_room(0, &out.room);
+    if (before_end) {
+        before_end();
+    }
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
     out.room_after_read = unified_cache_get_onednn_graph_room(0, &out.room_after);
     return out;
@@ -1412,25 +1510,11 @@ std::string zone_capacities_text(const arena_zone_capacities & z) {
     return "SCRATCH " + num(z.scratch) + ", ONEDNN " + num(z.onednn) + ", RUNTIME " + num(z.runtime);
 }
 
-// A 4 KiB allocation in device 0's RUNTIME zone, which holds the arena as a live model's allocations would (arm (e)).
-allocation_result allocate_runtime_page(unified_cache * cache) {
-    alloc_request req{};
-    req.queue                               = &cache->get_queue();
-    req.device                              = 0;
-    req.size                                = 4096;
-    req.intent.role                         = alloc_role::GRAPH_TMP;
-    req.intent.category                     = runtime_category::GRAPH;
-    req.intent.constraints.must_device      = true;
-    req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
-    return unified_allocate_owner(req);
-}
-
-// Whether `holder` lies in device 0's RUNTIME zone, where it holds the arena.
-bool holds_the_runtime_zone(const mem_handle & holder) {
-    const resolved_ptr p = holder.resolve();
-    alloc_metadata     meta{};
-    return p && p.on_device && unified_lookup(p.ptr, &meta) && meta.zone == vram_zone_id::RUNTIME;
-}
+// Device 0's zones as the process's first load finds them, read by main before any arm: the arena the cache reserved
+// when it was made, from the start values of every term a load publishes. Arm (j) checks the arena a load's start
+// reserves after a refused load against them.
+arena_zone_capacities g_first_zones;
+bool                  g_first_zones_read = false;
 
 // (i) A load whose only shortfall is the oneDNN Graph floor, in an arena a live allocation holds, keeps the zones as
 // they are, and the reverse order takes the sufficient path. The holder is one 4 KiB allocation, not a second model:
@@ -1442,15 +1526,18 @@ bool holds_the_runtime_zone(const mem_handle & holder) {
 // n_head_ctx_max, which sizes the Graph floor and nothing else: 8 heads (a floor of a few MiB at the 512 x 512
 // planning shape) and 2048 (3 GiB by the formula, held to the DIRECT cap of at most 1 GiB).
 //   keep:    the small load stages with nothing holding the arena, so every zone holds what the large load needs but
-//            the ONEDNN zone its floor; a 4 KiB RUNTIME-zone allocation then holds the arena, and the large load,
-//            ended uncommitted, stages OK with one "[VRAM-ARENA] device 0 keeps its ONEDNN zone" WARN and no refusal
-//            line; all three zone capacities are unchanged; the Graph room it reads inside the open load is below the
-//            planned floor (the zone could not hold it); once the load has ended uncommitted the Graph room is what it
-//            was before the load (the failed load did not leave its zone plan stored); the allocation is where it was;
-//   reverse: with the allocation released, the large load stages with nothing holding, so the zones hold its floor;
-//            a new allocation holds the arena, and the small load stages OK with no keep WARN and every zone capacity
-//            unchanged.
-// Engagement: device 0's arena is active; each load beside nothing staged OK; inside the open large load beside the
+//            the ONEDNN zone its floor; before its end, which would otherwise release every arena nothing holds, a
+//            4 KiB RUNTIME-zone page in every device's arena holds it, device 0's being the allocation, and the large
+//            load, ended uncommitted, stages OK with one "[VRAM-ARENA] device 0 keeps its ONEDNN zone" WARN and no
+//            refusal line; all three zone capacities are unchanged; the Graph room it reads inside the open load is
+//            below the planned floor (the zone could not hold it); once the load has ended uncommitted the Graph room
+//            is what it was before the load (the failed load did not leave its zone plan stored); the allocation is
+//            where it was;
+//   reverse: with the pages released, the large load stages with nothing holding, so the zones hold its floor; before
+//            its end new pages hold every arena, and the small load stages OK with no keep WARN and every zone
+//            capacity unchanged.
+// Engagement: each load beside nothing staged OK, and every device's arena was active before its end and held through
+// it; inside the open large load beside the
 // allocation the ONEDNN zone the ensure sizes (the planned requirement, at least 256 MiB, clamped to a quarter of the
 // available budget but not below the pair) exceeds the zone, so the zones could not hold it as they stood (VOID
 // otherwise: the Graph allocator is off, the plan spans both cards, the budget clamp leaves nothing short, or an
@@ -1469,8 +1556,8 @@ bool holds_the_runtime_zone(const mem_handle & holder) {
 arm_result arm_i_graph_floor_keeps_an_allocation_held_arena() {
     arm_result      r;
     unified_cache * cache = get_unified_cache_for_device(0);
-    if (cache == nullptr || !cache->arena_active()) {
-        void_arm(r, "device 0 has no active VRAM arena, so nothing can hold its zones");
+    if (cache == nullptr) {
+        void_arm(r, "device 0 has no cache, so nothing can hold its arena's zones");
         return r;
     }
     const char * const kept_warn = "[VRAM-ARENA] device 0 keeps its ONEDNN zone of ";
@@ -1483,24 +1570,21 @@ arm_result arm_i_graph_floor_keeps_an_allocation_held_arena() {
     std::string put_back_unseen;
 
     // keep
-    const staged_early_load sizing = stage_early_and_end(small.inv);
+    std::vector<mem_handle> keep_held;  // released at the end of this leg
+    bool                    keep_arenas_held = false;
+    const staged_early_load sizing =
+        stage_early_and_end(small.inv, [&]() { keep_arenas_held = hold_arenas(keep_held); });
     if (sizing.begin != GGML_SYCL_LIFECYCLE_OK || sizing.stage != GGML_SYCL_LIFECYCLE_OK) {
         void_arm(r, "the small load's begin returned " + num(sizing.begin) + " and its stage " + num(sizing.stage) +
                         " with nothing holding the arena, so the zones may not hold its terms");
         return r;
     }
+    if (!keep_arenas_held) {
+        void_arm(r, "an arena was not active before the small load's end, or its 4 KiB RUNTIME-zone page was refused");
+        return r;
+    }
     {
-        allocation_result allocation = allocate_runtime_page(cache);
-        if (!allocation) {
-            void_arm(r, "the 4 KiB RUNTIME-zone allocation was refused");
-            return r;
-        }
-        // The handle's destructor is the allocation's one release point, at the end of this leg.
-        const mem_handle holder = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
-        if (!holds_the_runtime_zone(holder)) {
-            void_arm(r, "the allocation is not in device 0's RUNTIME zone, so it does not hold the arena");
-            return r;
-        }
+        const mem_handle &          holder           = keep_held.front();
         const resolved_ptr          first            = holder.resolve();
         const arena_zone_capacities before           = read_zone_capacities(cache);
         size_t                      room_before      = 0;
@@ -1550,30 +1634,28 @@ arm_result arm_i_graph_floor_keeps_an_allocation_held_arena() {
         expect(r, again.ptr == first.ptr && again.on_device && holds_the_runtime_zone(holder),
                "the allocation no longer resolves to its device pointer in the RUNTIME zone after the kept load");
     }
+    keep_held.clear();
 
     // reverse
+    std::vector<mem_handle> reverse_held;  // released at the end of the arm
+    bool                    reverse_arenas_held = false;
     log_clear();
-    const graph_floor_load      grown       = stage_early_reading_the_graph_room(large.inv);
+    const graph_floor_load grown =
+        stage_early_reading_the_graph_room(large.inv, [&]() { reverse_arenas_held = hold_arenas(reverse_held); });
     const arena_zone_capacities grown_zones = read_zone_capacities(cache);
     if (grown.begin != GGML_SYCL_LIFECYCLE_OK || grown.stage != GGML_SYCL_LIFECYCLE_OK) {
         void_arm(r, "the large load's begin returned " + num(grown.begin) + " and its stage " + num(grown.stage) +
                         " with nothing holding the arena, so the reverse order has no zone sized for its floor");
         return r;
     }
+    if (!reverse_arenas_held) {
+        void_arm(r, "an arena was not active before the large load's end, or its 4 KiB RUNTIME-zone page was refused");
+        return r;
+    }
     if (grown_zones.onednn < grown.planned_onednn) {
         void_arm(r, "after the large load with nothing holding the arena the ONEDNN zone is " +
                         num(grown_zones.onednn) + " bytes, below its " + num(grown.planned_onednn) +
                         "-byte requirement, so the reverse order would not take the sufficient path");
-        return r;
-    }
-    allocation_result allocation = allocate_runtime_page(cache);
-    if (!allocation) {
-        void_arm(r, "the reverse order's 4 KiB RUNTIME-zone allocation was refused");
-        return r;
-    }
-    const mem_handle holder = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
-    if (!holds_the_runtime_zone(holder)) {
-        void_arm(r, "the reverse order's allocation is not in device 0's RUNTIME zone");
         return r;
     }
     log_clear();
@@ -1591,6 +1673,105 @@ arm_result arm_i_graph_floor_keeps_an_allocation_held_arena() {
     if (!put_back_unseen.empty()) {
         void_arm(r, put_back_unseen);
     }
+    return r;
+}
+
+// (j) A load that ends refused while no model is live leaves nothing sized for it, and the next load plans and builds
+// as the first load of the process did. The end runs the release of the last model: every cache releases what it sized
+// for a model and the arena nothing holds, and each device it emptied gets its published terms back at their start
+// values, not at the values that stood before the load; the next load's start reserves the early arena again, from
+// those values. A sentinel goes first into every planner global and every other device-wide term a load publishes, so
+// terms put back to the values before the load read the sentinels. Load A is the shaped inventory with a PP MoE ring
+// weight slot 256 MiB larger than the RUNTIME zone of device 0's first arena, at depth 1, so with nothing holding the
+// arena its stage rebuilds the arena for it; it is ended uncommitted, the end a refused load takes. Load B is begun
+// with nothing staged and ended uncommitted.
+//   A's end:   device 0's arena is not active, one line says device 0's last release emptied it, and every device's
+//              published terms equal a load_published_terms{} of start values;
+//   B's begin: device 0's arena is active again, and its SCRATCH, ONEDNN and RUNTIME zones are those of the arena
+//              device 0's cache reserved when it was made (g_first_zones).
+// Engagement: the first arena's zones were read before any arm; the sentinels read back; inside A device 0's RUNTIME
+// zone is larger than the first arena's, so A sized the arena for itself.
+// Mutants: no release at a refused load's end (the arena stays active, at A's zones); the terms put back to the values
+// before the load (a device reads its sentinels); a reserve at the end (the arena is active after A's end); the start's
+// reserve dropped (B's begin finds no arena); a reserve from terms other than the start values (B's zones differ from
+// the first arena's).
+arm_result arm_j_refused_load_leaves_nothing_sized_for_it() {
+    arm_result      r;
+    unified_cache * cache = get_unified_cache_for_device(0);
+    if (cache == nullptr || !g_first_zones_read) {
+        void_arm(r, "device 0's first arena was not read before the arms, so a later reserve has nothing to equal");
+        return r;
+    }
+    const std::vector<device_planner_state> original        = read_planner_state();
+    const std::vector<device_planner_state> sentinel        = sentinel_planner_state(original.size());
+    const std::vector<device_load_extras>   original_extras = read_load_extras();
+    const std::vector<device_load_extras>   sentinel_extras = sentinel_load_extras(original_extras.size());
+    const auto                              put_back        = [&]() {
+        write_planner_state(original);
+        write_load_extras(original_extras);
+    };
+    write_planner_state(sentinel);
+    write_load_extras(sentinel_extras);
+    if (!(read_planner_state() == sentinel) || !(read_load_extras() == sentinel_extras)) {
+        put_back();
+        void_arm(r, "the sentinel planner state or load terms did not read back, so a put-back to them would not show");
+        return r;
+    }
+
+    loader_inventory grown(qwen38_shape);
+    grown.inv.pp_moe_onednn_weight_slot_bytes = g_first_zones.runtime + 256 * MiB;
+    grown.inv.pp_moe_onednn_scratch_bytes     = grown.inv.pp_moe_onednn_weight_slot_bytes;
+    grown.inv.pp_moe_onednn_ring_depth        = 1;
+    size_t runtime_inside                     = 0;
+    log_clear();
+    const staged_early_load a = stage_early_and_end(
+        grown.inv, [&]() { runtime_inside = cache->arena_active() ? cache->zone_capacity(vram_zone_id::RUNTIME) : 0; });
+    const bool                     active_after  = cache->arena_active();
+    const size_t                   runtime_after = active_after ? cache->zone_capacity(vram_zone_id::RUNTIME) : 0;
+    const char * const             last_release  = "[VRAM-ARENA] last release on device 0 (";
+    const std::vector<std::string> released      = lines_with(last_release);
+    const size_t                   emptied       = lines_with(last_release, "no model is live; the arena").size();
+    std::vector<uint32_t>          differing;
+    for (int d = 0; d < ggml_backend_sycl_get_device_count() && d < GGML_SYCL_MAX_DEVICES; ++d) {
+        differing.push_back(load_published_terms::snapshot(d).differing(load_published_terms{}));
+    }
+
+    ggml_sycl_load_txn               b{};
+    const ggml_sycl_lifecycle_result b_begin  = ggml_backend_sycl_model_load_begin(&b);
+    const bool                       b_active = cache->arena_active();
+    const arena_zone_capacities      b_zones  = b_active ? read_zone_capacities(cache) : arena_zone_capacities{};
+    if (b_begin == GGML_SYCL_LIFECYCLE_OK) {
+        (void) ggml_backend_sycl_model_load_end(b, false, nullptr);
+    }
+    put_back();
+
+    if (a.begin != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "load A's transaction did not begin (" + num(a.begin) + ")");
+        return r;
+    }
+    if (runtime_inside <= g_first_zones.runtime) {
+        void_arm(r, "inside load A device 0's RUNTIME zone is " + num(runtime_inside) + " bytes, not above the " +
+                        num(g_first_zones.runtime) + " bytes of the first arena's (stage " + num(a.stage) +
+                        "), so A did not size the arena for itself");
+        return r;
+    }
+    const std::string first_line = released.empty() ? std::string("none") : released[0];
+    expect(r, !active_after,
+           "after load A's uncommitted end with no model live device 0's arena is still active, its RUNTIME zone " +
+               num(runtime_after) + " bytes; first last-release line: " + first_line);
+    expect(r, emptied == 1,
+           "load A's end logged " + num(emptied) + " lines saying device 0's last release emptied it, want 1; " +
+               "first last-release line: " + first_line);
+    for (size_t d = 0; d < differing.size(); ++d) {
+        expect(r, differing[d] == 0,
+               "device " + num(d) + ": after load A's end the published terms of load_published_group mask " +
+                   num(differing[d]) + " are not at their start values");
+    }
+    expect(r, b_begin == GGML_SYCL_LIFECYCLE_OK, "load B's begin after load A returned " + num(b_begin) + ", not OK");
+    expect(r, b_active && b_zones == g_first_zones,
+           "load B's begin left device 0's arena " +
+               (b_active ? "with zones " + zone_capacities_text(b_zones) : std::string("not active")) +
+               ", not with the first arena's " + zone_capacities_text(g_first_zones));
     return r;
 }
 
@@ -1750,13 +1931,18 @@ int main() {
     }
     ggml_log_set(capture_log, nullptr);
 
-    // The backends stay alive across the arms, so every arm plans against the same caches and arena zones.
+    // The backends stay alive across the arms, so every arm plans against the same caches. An arena lives until a load
+    // ends with nothing holding it, so an arm that reads one across a load's end holds it (hold_arenas).
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> b0(ggml_backend_sycl_init(0), ggml_backend_free);
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> b1(
         ggml_backend_sycl_get_device_count() > 1 ? ggml_backend_sycl_init(1) : nullptr, ggml_backend_free);
     if (!b0) {
         std::printf("FAIL: backend 0 did not initialise\n");
         return 1;
+    }
+    if (unified_cache * cache = get_unified_cache_for_device(0); cache != nullptr && cache->arena_active()) {
+        g_first_zones      = read_zone_capacities(cache);
+        g_first_zones_read = true;
     }
 
     struct named_arm {
@@ -1774,6 +1960,7 @@ int main() {
         { "(f) a load refused early keeps the KV-zone ring",     arm_f_early_refusal_keeps_the_kv_zone_ring       },
         { "(h) a load releases a ring alone holding the arena",  arm_h_load_releases_a_lone_ring                  },
         { "(i) a Graph floor keeps an allocation-held arena",    arm_i_graph_floor_keeps_an_allocation_held_arena },
+        { "(j) a refused load leaves nothing sized for it",      arm_j_refused_load_leaves_nothing_sized_for_it   },
         { "(g) a refused late pass configures no host zone",     arm_g_refused_late_pass_configures_no_host_zones },
     };
     int passed = 0, failed = 0, voided = 0;

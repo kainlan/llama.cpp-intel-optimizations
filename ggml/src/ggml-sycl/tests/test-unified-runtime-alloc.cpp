@@ -2702,6 +2702,374 @@ static bool load_record_keeps_a_later_publish() {
     return true;
 }
 
+// The start values of every term a load publishes are a default load_published_terms, and its restore writes every
+// group: the release of the last model puts each device it emptied back through load_published_terms{}.restore. In a
+// process where no cache of any device has been made and nothing has been published, every device's snapshot equals
+// the default. One value is then published in every group but the zone plan, which only a cache's own ensure stores,
+// and the snapshot differs in exactly those groups; after load_published_terms{}.restore it equals the default again.
+// Mutants: a term whose start value is not its default (the first check names the device); a group that restore()
+// does not write (the last check reads its mask).
+// No device work: the terms are per-device process state, and the case leaves them at their start values.
+static bool fresh_published_terms_are_the_default(int device) {
+    TEST_BEGIN("fresh_published_terms_are_the_default");
+    constexpr size_t           mib = 1024ull * 1024ull;
+    const load_published_terms start{};
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        const uint32_t differs = load_published_terms::snapshot(d).differing(start);
+        TEST_ASSERT(differs == 0, ("device " + std::to_string(d) + " reads group mask " + std::to_string(differs) +
+                                   " away from a default load_published_terms before anything was published")
+                                      .c_str());
+    }
+
+    unified_cache_set_planned_pp_pipeline_scratch_bytes(device, 3 * mib);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 71);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, true, true);
+    unified_cache_set_planned_pp_moe_onednn_row_bytes(device, 96, 192, 8, 2);
+    unified_cache_set_planned_onednn_scratchpad_pair(device, 4 * mib, 2 * mib);
+    unified_cache_set_planned_onednn_scratchpad_bytes(device, 8 * mib);
+    unified_cache_set_planned_onednn_graph_scratch_shape(device, 8, 8, 0, 512, 4096);
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
+    unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ mib, true });
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 8192);
+    const uint32_t published = load_published_terms::snapshot(device).differing(start);
+    start.restore(device);
+    const uint32_t restored = load_published_terms::snapshot(device).differing(start);
+
+    const uint32_t want = LOAD_PUBLISHED_GROUP_ALL & ~static_cast<uint32_t>(LOAD_PUBLISHED_GROUP_ZONE_PLAN);
+    TEST_ASSERT(published == want, ("one value in every group but the zone plan moved group mask " +
+                                    std::to_string(published) + ", not " + std::to_string(want))
+                                       .c_str());
+    TEST_ASSERT(restored == 0, ("after load_published_terms{}.restore the groups of mask " + std::to_string(restored) +
+                                " are not at their start values")
+                                   .c_str());
+    TEST_PASS();
+    return true;
+}
+
+// Whether the cache's PP MoE oneDNN ring has a reserved slot 0. The read's copy holds the slot's owners, so it goes
+// before this returns.
+static bool ring_reserved(unified_cache & cache) {
+    unified_cache::pp_moe_onednn_scratch_slot read;
+    return cache.get_pp_moe_onednn_scratch_slot(0, read);
+}
+
+// Every byte the cache's VRAM zones count as used.
+static size_t zone_bytes_used(unified_cache & cache) {
+    size_t used = 0;
+    for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+        used += cache.zone_used(static_cast<vram_zone_id>(z));
+    }
+    return used;
+}
+
+// The fixture's scratch on a hand-built cache, what a model's first prompt leaves: a one-slot PP MoE oneDNN ring of
+// 1 MiB slots in the RUNTIME zone, planned on the cache's device first (the reserve admits only a planned ring), and a
+// 1 + 1 MiB oneDNN pair from the ONEDNN zone. The caller's planned_terms_found and pipeline_and_pair_found put the
+// device's terms back.
+static bool reserve_ring_and_pair(unified_cache & cache, int device) {
+    constexpr size_t mib = 1024ull * 1024ull;
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, mib, mib, mib, 1);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+    return cache.reserve_pp_moe_onednn_scratch(mib, mib, mib, 1) && ring_reserved(cache) &&
+           cache.reserve_onednn_scratch(mib, mib) && cache.has_onednn_scratch();
+}
+
+static std::mutex                                          g_last_release_log_mutex;
+static std::vector<std::pair<ggml_log_level, std::string>> g_last_release_log_lines;
+
+static void last_release_log_capture(ggml_log_level level, const char * text, void * user) {
+    (void) user;
+    if (text == nullptr) {
+        return;
+    }
+    fputs(text, stderr);
+    std::lock_guard<std::mutex> lock(g_last_release_log_mutex);
+    g_last_release_log_lines.emplace_back(level, text);
+}
+
+// The lines logged, with their levels, while the guard lives.
+struct last_release_log {
+    last_release_log() {
+        {
+            std::lock_guard<std::mutex> lock(g_last_release_log_mutex);
+            g_last_release_log_lines.clear();
+        }
+        ggml_log_set(last_release_log_capture, nullptr);
+    }
+
+    ~last_release_log() { ggml_log_set(nullptr, nullptr); }
+
+    // How many captured lines at `level` contain `a`, and `b` too when it is given.
+    size_t count(ggml_log_level level, const char * a, const char * b = nullptr) const {
+        std::lock_guard<std::mutex> lock(g_last_release_log_mutex);
+        size_t                      n = 0;
+        for (const auto & [at, line] : g_last_release_log_lines) {
+            n +=
+                at == level && line.find(a) != std::string::npos && (b == nullptr || line.find(b) != std::string::npos);
+        }
+        return n;
+    }
+};
+
+// A claimed slot of a cache's ring, released on every return. The claim's copy holds the slot's owners; they go before
+// the slot is released, as a dispatch drops its copy before it releases its claim. Declared after the arm's
+// arena_teardown_retry, so the claim ends before the retry's teardown.
+struct claimed_ring_slot {
+    unified_cache &                           cache;
+    unified_cache::pp_moe_onednn_scratch_slot slot{};
+    bool                                      held = false;
+
+    ~claimed_ring_slot() { release(); }
+
+    void release() {
+        if (held) {
+            const uint64_t generation = slot.generation;
+            slot                      = {};
+            cache.release_pp_moe_onednn_scratch_slot(0, generation);
+            held = false;
+        }
+    }
+};
+
+// A reservation of a cache's oneDNN pair, as a matmul takes it, released on every return; declared after the arm's
+// arena_teardown_retry.
+struct reserved_onednn_pair {
+    unified_cache &      cache;
+    onednn_scratch_token token{};
+
+    ~reserved_onednn_pair() { release(); }
+
+    void release() {
+        cache.release_onednn_scratch_reservation(token);
+        token = {};
+    }
+};
+
+// The release of the last model gives back what a cache sized for a model when no model is live, and nothing while one
+// is. A hand-built cache holds the fixture's ring and pair in its 64 MiB arena. With a bit in its live mask the release
+// returns MODEL_LIVE and the ring, the pair and the arena stay. With the mask 0 it returns EMPTIED: no ring slot reads
+// back, the pair is gone, the arena is not active and no zone counts a used byte. A second release of the emptied cache
+// returns EMPTIED again. A load's start then reserves the early arena again (reserve_released_arena): an arena with
+// nothing used in it, or a refusal that names its reason.
+// Engagement: the ring and the pair were reserved and the zones count their bytes.
+// Mutants: the liveness check dropped (the first release empties the cache); a step left out of the release (the ring,
+// the pair or the arena stays, or a zone counts bytes); a release that cannot run twice.
+static bool last_release_empties_ring_pair_and_arena(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("last_release_empties_ring_pair_and_arena");
+    constexpr size_t        mib       = 1024ull * 1024ull;
+    const size_t            max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const int               device    = ggml_sycl_get_device_id_from_queue(q);
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+    unified_cache           cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry    retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no release was measured");
+    }
+    TEST_ASSERT(reserve_ring_and_pair(cache, device), "the fixture's ring or its oneDNN pair was not reserved");
+    TEST_ASSERT(zone_bytes_used(cache) > 0, "the zones count no byte of the fixture's ring and pair");
+
+    cache.set_live_model_mask(1u);
+    const unified_cache_last_release live =
+        cache.release_for_no_live_model("live-model", unified_cache_release_cause::MODEL_RELEASED);
+    cache.set_live_model_mask(0u);
+    TEST_ASSERT(live == unified_cache_last_release::MODEL_LIVE, "with a model live the release did not say so");
+    TEST_ASSERT(ring_reserved(cache) && cache.has_onednn_scratch() && cache.arena_active(),
+                "with a model live the release gave back the ring, the pair or the arena");
+
+    const unified_cache_last_release emptied =
+        cache.release_for_no_live_model("last-model", unified_cache_release_cause::MODEL_RELEASED);
+    TEST_ASSERT(emptied == unified_cache_last_release::EMPTIED,
+                "with no model live the release did not empty the cache");
+    TEST_ASSERT(!ring_reserved(cache), "the PP MoE oneDNN ring stayed after the last release");
+    TEST_ASSERT(!cache.has_onednn_scratch(), "the oneDNN pair stayed after the last release");
+    TEST_ASSERT(!cache.arena_active(), "the arena stayed after the last release");
+    TEST_ASSERT(zone_bytes_used(cache) == 0, "a zone counts used bytes after the last release");
+    TEST_ASSERT(cache.release_for_no_live_model("again", unified_cache_release_cause::MODEL_RELEASED) ==
+                    unified_cache_last_release::EMPTIED,
+                "a second release of the emptied cache did not return EMPTIED");
+
+    zone_arena_refusal refusal;
+    if (cache.reserve_released_arena(&refusal)) {
+        TEST_ASSERT(cache.arena_active() && zone_bytes_used(cache) == 0,
+                    "the arena a load's start reserved again is not active, or a zone counts used bytes in it");
+    } else {
+        TEST_ASSERT(refusal.reason != zone_arena_refusal_reason::NONE,
+                    "a load's start reserve of the released arena was refused without a reason");
+    }
+    TEST_PASS();
+    return true;
+}
+
+// A claimed slot of the ring keeps the ring and the arena: the release refuses with RING_CLAIMED and one ERROR line
+// that says so, and gives back nothing, the pair included. Once the claim ends the release empties the cache.
+// Engagement: slot 0 of the fixture's ring was claimed.
+// Mutants: a claimed slot released (the ring is gone after the refused release); the release going on past the refusal
+// (the pair or the arena is gone); the refusal silent (no ERROR line).
+static bool last_release_keeps_a_claimed_ring(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("last_release_keeps_a_claimed_ring");
+    constexpr size_t        mib       = 1024ull * 1024ull;
+    const size_t            max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const int               device    = ggml_sycl_get_device_id_from_queue(q);
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+    unified_cache           cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry    retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no release was measured");
+    }
+    TEST_ASSERT(reserve_ring_and_pair(cache, device), "the fixture's ring or its oneDNN pair was not reserved");
+    claimed_ring_slot claim{ cache };
+    claim.held = cache.claim_pp_moe_onednn_scratch_slot(0, claim.slot);
+    TEST_ASSERT(claim.held, "slot 0 of the fixture's ring was not claimed");
+
+    unified_cache_last_release refused = unified_cache_last_release::FAILED;
+    size_t                     errors  = 0;
+    {
+        const last_release_log log;
+        refused = cache.release_for_no_live_model("claimed", unified_cache_release_cause::MODEL_RELEASED);
+        errors  = log.count(GGML_LOG_LEVEL_ERROR, "[VRAM-ARENA] last release on device ",
+                            "a slot of the PP MoE oneDNN ring is still claimed");
+    }
+    TEST_ASSERT(refused == unified_cache_last_release::RING_CLAIMED, "a claimed slot did not refuse the release");
+    TEST_ASSERT(errors == 1, "the refused release did not log one ERROR line naming the claimed slot");
+    TEST_ASSERT(ring_reserved(cache) && cache.has_onednn_scratch() && cache.arena_active(),
+                "a release refused by a claimed slot gave back the ring, the pair or the arena");
+
+    claim.release();
+    TEST_ASSERT(cache.release_for_no_live_model("unclaimed", unified_cache_release_cause::MODEL_RELEASED) ==
+                    unified_cache_last_release::EMPTIED,
+                "once the claim ended the release did not empty the cache");
+    TEST_ASSERT(!ring_reserved(cache) && !cache.arena_active(), "the ring or the arena stayed after the claim ended");
+    TEST_PASS();
+    return true;
+}
+
+// A reservation of the oneDNN pair keeps the pair and the arena: the release gives back the ring, then refuses with
+// PAIR_HELD and one ERROR line that says so. Once the reservation ends the release empties the cache.
+// Engagement: the fixture's pair was reserved as a matmul reserves it.
+// Mutants: a reserved pair freed (the pair is gone after the refused release); the release going on past the refusal
+// (the arena is gone); the refusal silent (no ERROR line).
+static bool last_release_keeps_a_reserved_pair(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("last_release_keeps_a_reserved_pair");
+    constexpr size_t        mib       = 1024ull * 1024ull;
+    const size_t            max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const int               device    = ggml_sycl_get_device_id_from_queue(q);
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+    unified_cache           cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry    retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no release was measured");
+    }
+    TEST_ASSERT(reserve_ring_and_pair(cache, device), "the fixture's ring or its oneDNN pair was not reserved");
+    reserved_onednn_pair                  pair{ cache };
+    unified_cache::onednn_scratch_buffers buffers;
+    TEST_ASSERT(cache.acquire_onednn_scratch_reservation(mib, mib, buffers, &pair.token),
+                "the fixture's oneDNN pair was not reserved as a matmul reserves it");
+
+    unified_cache_last_release refused = unified_cache_last_release::FAILED;
+    size_t                     errors  = 0;
+    {
+        const last_release_log log;
+        refused = cache.release_for_no_live_model("pair-held", unified_cache_release_cause::MODEL_RELEASED);
+        errors  = log.count(GGML_LOG_LEVEL_ERROR, "[VRAM-ARENA] last release on device ",
+                            "the oneDNN scratchpad pair is still reserved");
+    }
+    TEST_ASSERT(refused == unified_cache_last_release::PAIR_HELD, "a reserved pair did not refuse the release");
+    TEST_ASSERT(errors == 1, "the refused release did not log one ERROR line naming the reserved pair");
+    TEST_ASSERT(!ring_reserved(cache), "the ring, released before the pair, stayed");
+    TEST_ASSERT(cache.has_onednn_scratch() && cache.arena_active(),
+                "a release refused by a reserved pair gave back the pair or the arena");
+
+    pair.release();
+    TEST_ASSERT(cache.release_for_no_live_model("pair-free", unified_cache_release_cause::MODEL_RELEASED) ==
+                    unified_cache_last_release::EMPTIED,
+                "once the reservation ended the release did not empty the cache");
+    TEST_ASSERT(!cache.has_onednn_scratch() && !cache.arena_active(),
+                "the pair or the arena stayed after the reservation ended");
+    TEST_PASS();
+    return true;
+}
+
+// A lease on the arena's chunk keeps the arena, and the release names what holds it without reaping it. The ring and
+// the pair go, then the release returns ARENA_HELD: at a failed load's abort with one WARN line, as the failed model's
+// buffers go after it, and after a model's release with one ERROR line, as nothing should hold the arena then. Each
+// line names the lease. Once the lease ends the release empties the cache.
+// Engagement: the lease is on the arena's first chunk.
+// Mutants: the lease reaped or the arena torn down under it (the arena is not active after the release); the holder
+// not named (no line with chunk_leases=1); the levels swapped (an ERROR at the abort, a WARN after the release).
+static bool last_release_names_a_held_arena(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("last_release_names_a_held_arena");
+    constexpr size_t        mib       = 1024ull * 1024ull;
+    const size_t            max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const int               device    = ggml_sycl_get_device_id_from_queue(q);
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+    unified_cache           cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry    retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no release was measured");
+    }
+    TEST_ASSERT(reserve_ring_and_pair(cache, device), "the fixture's ring or its oneDNN pair was not reserved");
+    held_chunk_lease lease{ cache };
+    lease.chunk = cache.arena_acquire_chunk_lease(cache.arena_base());
+    TEST_ASSERT(lease.chunk >= 0, "the fixture's lease on the arena's first chunk was not taken");
+
+    unified_cache_last_release aborted = unified_cache_last_release::FAILED;
+    unified_cache_last_release after   = unified_cache_last_release::FAILED;
+    size_t                     warned = 0, warned_as_error = 0, errored = 0, errored_as_warn = 0;
+    {
+        const last_release_log log;
+        const char * const     abort_text   = "the failed load's buffers still hold the arena";
+        const char * const     release_text = "no model is live but the arena is held";
+        aborted         = cache.release_for_no_live_model("aborted", unified_cache_release_cause::LOAD_ABORTED);
+        warned          = log.count(GGML_LOG_LEVEL_WARN, abort_text, "chunk_leases=1");
+        warned_as_error = log.count(GGML_LOG_LEVEL_ERROR, abort_text);
+        after           = cache.release_for_no_live_model("released", unified_cache_release_cause::MODEL_RELEASED);
+        errored         = log.count(GGML_LOG_LEVEL_ERROR, release_text, "chunk_leases=1");
+        errored_as_warn = log.count(GGML_LOG_LEVEL_WARN, release_text);
+    }
+    TEST_ASSERT(aborted == unified_cache_last_release::ARENA_HELD,
+                "at an abort a held arena did not refuse the release");
+    TEST_ASSERT(warned == 1 && warned_as_error == 0, "the abort's release did not log one WARN line naming the lease");
+    TEST_ASSERT(after == unified_cache_last_release::ARENA_HELD, "after a release a held arena did not refuse it");
+    TEST_ASSERT(errored == 1 && errored_as_warn == 0, "the model release did not log one ERROR line naming the lease");
+    TEST_ASSERT(!ring_reserved(cache) && !cache.has_onednn_scratch(), "the ring or the pair stayed in a held arena");
+    TEST_ASSERT(cache.arena_active() && cache.arena_find_chunk(cache.arena_base()) == lease.chunk,
+                "the release tore down or freed the chunk a lease holds");
+
+    lease.release();
+    TEST_ASSERT(cache.release_for_no_live_model("lease-ended", unified_cache_release_cause::MODEL_RELEASED) ==
+                    unified_cache_last_release::EMPTIED,
+                "once the lease ended the release did not empty the cache");
+    TEST_ASSERT(!cache.arena_active(), "the arena stayed after the lease ended");
+    TEST_PASS();
+    return true;
+}
+
+// The release of the last model, each arm on a cache of its own, and the start values it puts a device's published
+// terms back to. Its own process (`--case last_release_empties_the_arena`): the terms arm must read a process where
+// nothing has been published, and the arms publish the device's ring and pair terms. Exits 0 when every arm passed, 1
+// when one failed, and 77 when none failed but one measured nothing.
+static int last_release_empties_the_arena(sycl::queue & q) {
+    bool skipped = false;
+    bool ok      = true;
+    ok &= fresh_published_terms_are_the_default(ggml_sycl_get_device_id_from_queue(q));
+    ok &= last_release_empties_ring_pair_and_arena(q, skipped);
+    ok &= last_release_keeps_a_claimed_ring(q, skipped);
+    ok &= last_release_keeps_a_reserved_pair(q, skipped);
+    ok &= last_release_names_a_held_arena(q, skipped);
+    if (!ok) {
+        return 1;
+    }
+    if (skipped) {
+        fprintf(stderr, "SKIP: a last-release arm measured nothing on this device (its SKIPPED line says why)\n");
+        return SYCL_TEST_SKIP;
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     fprintf(stderr, "===========================================\n");
     fprintf(stderr, "Unified Runtime Allocator Tests\n");
@@ -2841,6 +3209,13 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
             return case_rc;
         }
+        // No oneDNN dependency; its first arm needs a process where nothing has been published.
+        if (std::strcmp(argv[2], "last_release_empties_the_arena") == 0) {
+            const int case_rc = last_release_empties_the_arena(q);
+            fprintf(stderr, "-------------------------------------------\n");
+            fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
+            return case_rc;
+        }
 #if GGML_SYCL_DNNL
         const char * case_name = argv[2];
         bool         case_ok;
@@ -2908,6 +3283,8 @@ int main(int argc, char ** argv) {
     ok &= concurrent_settle_destroy_closing_wins(q);
     // The refused-teardown arms arm process-wide failure hooks, so they run in a process of their own.
     fprintf(stderr, "(the arena teardown refusal arms run only via --case arena_teardown_refusal_classes)\n");
+    // The last-release arms read a process where nothing has been published, so they too run in a process of their own.
+    fprintf(stderr, "(the last-release arms run only via --case last_release_empties_the_arena)\n");
     ok &= cache_without_staging_allocates_none(q);
     ok &= accepted_control_publication_is_atomic_with_close_snapshot();
     ok &= planner_terms_restore_returns_the_runtime_requirement();
