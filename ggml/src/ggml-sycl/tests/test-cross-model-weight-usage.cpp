@@ -15,6 +15,7 @@
 // load boundary. The B or reactivated-A exact-owner checks then fail.
 
 #include "../../../../tests/sycl-selector-fallback.hpp"
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/common.hpp"
@@ -26,7 +27,7 @@
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

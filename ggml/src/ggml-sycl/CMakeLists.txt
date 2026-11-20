@@ -3396,7 +3396,9 @@ set_tests_properties(expert-prefetch-runtime PROPERTIES
 endif()
 
 # Evict accounting, realloc failure handling, unaligned hash.
-# LABELS drop the old "cache" -- see rule 2 above.
+# LABELS carry "cache": it allocates through a real device cache and peaks near
+# 8.5 GB RSS, so it is a member of the family rule 2 describes and runs by name
+# or in the serial cache|mem-handle pass, never in the throttled sweep.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-unified-cache-bugs
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-cache-bugs.cpp
@@ -3417,8 +3419,9 @@ target_compile_definitions(test-unified-cache-bugs PRIVATE
 target_link_libraries(test-unified-cache-bugs PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME unified-cache-bugs COMMAND test-unified-cache-bugs)
 set_tests_properties(unified-cache-bugs PROPERTIES
-    LABELS "sycl;unified;bugfix;tdd"
+    LABELS "sycl;unified;cache;bugfix;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 180
 )
 
@@ -3448,6 +3451,7 @@ add_test(NAME sycl-kv-view-resolution COMMAND test-sycl-kv-view-resolution)
 set_tests_properties(sycl-kv-view-resolution PROPERTIES
     LABELS "sycl;kv;view;handle;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_TEST_KV_VIEW_RUNTIME=0"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
@@ -4689,6 +4693,7 @@ add_test(NAME test-sycl-tensor-usage COMMAND test-sycl-tensor-usage)
 set_tests_properties(test-sycl-tensor-usage PROPERTIES
     LABELS "sycl;moe;tensor-placement;tdd"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
@@ -5165,6 +5170,7 @@ add_test(NAME test-sycl-weight-key-stability COMMAND test-sycl-weight-key-stabil
 set_tests_properties(test-sycl-weight-key-stability PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5213,17 +5219,18 @@ target_compile_definitions(test-sycl-kv-planned-device-materialization PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_PRIVATE_TESTING=1
-    # The test body sits behind #if defined(GGML_USE_SYCL); without this the
-    # whole body compiled out and the binary exited 0 without running anything.
-    GGML_USE_SYCL=1
 )
+# GGML_USE_SYCL arrives with ggml-sycl-private-fixtures (ggml-private-test-registry publishes it).
 target_link_libraries(test-sycl-kv-planned-device-materialization PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-kv-planned-device-materialization COMMAND test-sycl-kv-planned-device-materialization)
 # Two cards, not one: this fixture's own main() defaults the selector to
 # "level_zero:0,1" and its cases materialize across both. Narrowing it to the
 # single validation card the other pins use would change what it tests.
+# "cache", not "hostonly": it builds a real unified cache on each card and allocates
+# through it, the GPU-allocating family rule 2 describes, so it runs by name or in the
+# serial cache|mem-handle pass.
 set_tests_properties(test-sycl-kv-planned-device-materialization PROPERTIES
-    LABELS "sycl;kv;hostonly;tdd;0igs-batch1"
+    LABELS "sycl;kv;cache;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     # Every skip path (no SYCL build, fewer than two devices) exits 77 so it
     # reads as a skip, not a pass.
@@ -5316,6 +5323,7 @@ add_test(NAME test-sycl-weight-key-uniqueness COMMAND test-sycl-weight-key-uniqu
 set_tests_properties(test-sycl-weight-key-uniqueness PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5344,6 +5352,7 @@ add_test(NAME test-unified-cache-integrity COMMAND test-unified-cache-integrity)
 set_tests_properties(test-unified-cache-integrity PROPERTIES
     LABELS "sycl;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5382,6 +5391,7 @@ add_test(NAME test-sycl-fattn-onednn-materialization COMMAND test-sycl-fattn-one
 set_tests_properties(test-sycl-fattn-onednn-materialization PROPERTIES
     LABELS "sycl;fattn;onednn;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_FA_ONEDNN_MATERIALIZE=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5603,6 +5613,7 @@ add_test(NAME test-unified-cache-concurrent COMMAND test-unified-cache-concurren
 set_tests_properties(test-unified-cache-concurrent PROPERTIES
     LABELS "sycl;hostonly;concurrency;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5825,6 +5836,7 @@ add_test(NAME test-sycl-moe-handle-resolution COMMAND test-sycl-moe-handle-resol
 set_tests_properties(test-sycl-moe-handle-resolution PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
@@ -5915,9 +5927,12 @@ target_compile_definitions(test-fattn-thread-local PRIVATE
 )
 target_link_libraries(test-fattn-thread-local PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-fattn-thread-local COMMAND test-fattn-thread-local)
+# "cache": it allocates device buffers on a real queue, the GPU-allocating family
+# rule 2 describes, so it runs by name or in the serial cache|mem-handle pass.
 set_tests_properties(test-fattn-thread-local PROPERTIES
-    LABELS "sycl;fattn;tdd;0igs-batch2"
+    LABELS "sycl;fattn;cache;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5972,6 +5987,7 @@ add_test(NAME test-layout-bytes COMMAND test-layout-bytes)
 set_tests_properties(test-layout-bytes PROPERTIES
     LABELS "sycl;layout;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -6060,6 +6076,7 @@ add_test(NAME test-moe-mul-mat-id COMMAND test-moe-mul-mat-id)
 set_tests_properties(test-moe-mul-mat-id PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -6088,6 +6105,7 @@ add_test(NAME test-moe-mul-mat-id-q4q8 COMMAND test-moe-mul-mat-id-q4q8)
 set_tests_properties(test-moe-mul-mat-id-q4q8 PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -6221,6 +6239,7 @@ add_test(NAME test-mul-mat-host-streaming COMMAND test-mul-mat-host-streaming)
 set_tests_properties(test-mul-mat-host-streaming PROPERTIES
     LABELS "sycl;dispatch;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -6465,6 +6484,7 @@ add_test(NAME test-sycl-moe-expert-parallelism COMMAND test-sycl-moe-expert-para
 set_tests_properties(test-sycl-moe-expert-parallelism PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -6915,6 +6935,7 @@ if (NOT GGML_BACKEND_DL)
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         LABELS "sycl;sycl-restored;gpu;set-rows;owner-routing;restored"
         RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
     )
 endif()
 
@@ -7152,8 +7173,11 @@ endif()
 # backend; the ordinary DSO carries no layout-override seam.
 target_link_libraries(test-xmx-host-streaming PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-xmx-host-streaming COMMAND test-xmx-host-streaming)
+# "cache": with XMX on it builds backend buffers and computes on the device, the
+# GPU-allocating family rule 2 describes, so it runs by name or in the serial
+# cache|mem-handle pass.
 set_tests_properties(test-xmx-host-streaming PROPERTIES
-    LABELS "sycl;xmx;tdd;0igs-batch2"
+    LABELS "sycl;xmx;cache;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     # 77 = XMX off at build time, no SYCL backend, or a device without XMX
     # INT8/Q4_0. With both options OFF (the default) this test SKIPS -- which is

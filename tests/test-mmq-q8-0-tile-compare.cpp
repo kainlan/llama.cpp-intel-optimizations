@@ -4,6 +4,8 @@
 // Build: Requires SYCL, use cmake with GGML_SYCL=ON
 // Run: ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mmq-q8-0-tile-compare
 
+#include "test-skip.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -352,6 +354,6 @@ int main() {
 // Non-SYCL build
 int main() {
     printf("This test requires SYCL. Build with GGML_SYCL=ON\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #endif

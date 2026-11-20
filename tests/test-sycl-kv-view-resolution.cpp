@@ -8,6 +8,7 @@
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml.h"
+#include "test-skip.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -40,7 +41,7 @@ bool ggml_sycl_test_binbcast_needs_raw_host_staging(const ggml_tensor * tensor, 
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
