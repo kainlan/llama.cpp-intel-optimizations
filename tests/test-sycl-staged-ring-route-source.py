@@ -1598,7 +1598,8 @@ def test_staged_batch_refused_by_name_mutants():
 
 # ---- the per-expert path reads each expert at its resolved layout ----------------------------------------------------
 
-EXPERT_LAYOUT_DECL = "layout_mode expert_layout = route_layout;"
+# Its initial value is not pinned: only a local expert reaches a consumer, and it has taken the route's layout by then.
+EXPERT_LAYOUT_DECL = "layout_mode expert_layout"
 EXPERT_LAYOUT_FROM_ROUTE = ("expert_ptr = route.ptr; expert_gpu_lease = std::move(route.lease); "
                             "expert_layout = route.actual_layout;")
 EXPERT_F16_GATE = "num_src1_rows >= 1 && expert_layout == GGML_LAYOUT_SOA;"
@@ -1618,18 +1619,22 @@ def claim_per_expert_reads_resolved_layout(sycl: str) -> bool:
     equals the route's."""
     n = norm(sycl)
     mmid = body(n, MMID_SIG)
+    # The multiply is counted, not ordered: it sits in the dispatch_f32_batches lambda, whose place in the text is
+    # where the lambda is defined, not when it runs.
     return (mmid.count(EXPERT_LAYOUT_FROM_ROUTE) == 1 and mmid.count(EXPERT_MULTIPLY) == 1
             and mmid.count(EXPERT_INSTALL) == 1 and mmid.count(ROUTE_MULTIPLY) == 0
             and ordered(mmid, PER_EXPERT_REFUSE, EXPERT_LAYOUT_DECL, EXPERT_LAYOUT_FROM_ROUTE, EXPERT_F16_GATE,
-                        EXPERT_MULTIPLY, EXPERT_INSTALL))
+                        EXPERT_INSTALL))
 
 
 def test_per_expert_reads_resolved_layout():
+    mmid = body(norm(SYCL), MMID_SIG)
     assert claim_per_expert_reads_resolved_layout(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id",
-        body(norm(SYCL), MMID_SIG),
-        PER_EXPERT_REFUSE, EXPERT_LAYOUT_DECL, EXPERT_LAYOUT_FROM_ROUTE, EXPERT_F16_GATE, EXPERT_MULTIPLY,
-        EXPERT_INSTALL, signature=MMID_SIG)
+        mmid,
+        PER_EXPERT_REFUSE, EXPERT_LAYOUT_DECL, EXPERT_LAYOUT_FROM_ROUTE, EXPERT_F16_GATE, EXPERT_INSTALL,
+        signature=MMID_SIG) + f" (per-expert multiply with &expert_layout: {mmid.count(EXPERT_MULTIPLY)}, with " \
+        f"&route_layout: {mmid.count(ROUTE_MULTIPLY)})"
 
 
 def test_per_expert_reads_resolved_layout_mutants():
