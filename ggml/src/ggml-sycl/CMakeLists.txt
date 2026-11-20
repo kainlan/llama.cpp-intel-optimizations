@@ -6303,6 +6303,33 @@ set_tests_properties(test-moe-q1-nvfp4-dispatch-refusal PROPERTIES
 )
 endif() # private SYCL backend fixture
 
+# The MoE prompt staging refusal at run time: on an unplanned Q4_0 MoE model at 128 tokens, which takes the per-expert
+# prompt route, one failpoint per staging site (the row maps, the output, the F32 activation) makes that allocation act
+# as not granted once, and the op must end GGML_STATUS_FAILED with the [MOE-PP-STAGING] WARN that names the tensor, the
+# buffer, the rows and bytes and the device; the same op run again in the same process must then succeed and match the
+# CPU backend. The failpoints exist only in the private backend objects, so it links ggml-sycl-private-fixtures (not
+# the ordinary DSO) and closes the MMID route those objects compile in. It loads a model onto the card, so it carries
+# the `model` label, which the full sweep excludes. Pinned to the B50; a run with no SYCL GPU or more than one visible
+# card exits 77.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-pp-staging-refusal ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-pp-staging-refusal.cpp)
+target_include_directories(test-moe-pp-staging-refusal PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-moe-pp-staging-refusal PRIVATE ggml-sycl-private-fixtures)
+set_target_properties(test-moe-pp-staging-refusal PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-pp-staging-refusal COMMAND test-moe-pp-staging-refusal)
+set_tests_properties(test-moe-pp-staging-refusal PROPERTIES
+    LABELS "sycl;moe;device;B50;model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
+)
+endif() # private SYCL backend fixture
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp

@@ -86671,6 +86671,32 @@ static const char * ggml_sycl_moe_q1_nvfp4_refusal_text(const char * reason) {
     return "MUL_MAT_ID batched dispatch for a Q1_0/NVFP4 AOS operand refused: unnamed reason";
 }
 
+// A staging buffer the MoE prompt path asks for and does not get is a fit problem, not a broken part: the op is
+// refused and the process goes on. The WARN names what did not fit; graph_compute's catch drains the queue and turns
+// the exception into GGML_STATUS_FAILED. ggml_sycl_fallback_error keeps the pointer it is given, not a copy, so
+// `reason` must outlive the unwind: it is taken as a reference to a character array, which a string literal binds
+// to and a `const char *` (a temporary std::string's c_str() among them) does not, so that mistake does not compile.
+template <size_t N>
+[[noreturn]] static void ggml_sycl_moe_pp_refuse_staging(const ggml_tensor * src0,
+                                                         int                 device,
+                                                         const char *        buffer,
+                                                         size_t              rows,
+                                                         size_t              bytes,
+                                                         const char (&reason)[N]) {
+    GGML_LOG_WARN(
+        "[MOE-PP-STAGING] refused tensor=%s buffer=%s rows=%zu bytes=%zu device=%d: the allocation was not granted\n",
+        src0 ? src0->name : "?", buffer, rows, bytes, device);
+    throw ggml_sycl_fallback_error(reason);
+}
+
+// The private-testing failpoints for those staging buffers: true once when the test armed `failure`, and the site then
+// acts as if its allocation had returned null. Outside the private route build it is the constant false.
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+#    define GGML_SYCL_MOE_PP_STAGING_FAILPOINT(failure) ggml_sycl_q1_nvfp4_test_consume_failure(failure)
+#else
+#    define GGML_SYCL_MOE_PP_STAGING_FAILPOINT(failure) false
+#endif
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     ggml_sycl_test_inject_device_lost("mmid");
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
@@ -93163,6 +93189,31 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                 !g_ggml_sycl_graph_recording;
         const bool release_prompt_down_soa_after_dispatch =
             prompt_down_soa_planned_pp && ggml_sycl_moe_prompt_down_transient_soa_enabled();
+        // Releases the transient down-projection SOA of this op, at most once. The per-expert path's exit work calls
+        // it behind its done marker, and the two refusals that leave before that path's try (the row-map staging and
+        // a staged ring batch) call it before they throw, so no exit of this op keeps the transient layout resident.
+        // The batched executor releases it behind its own marker and keeps its expert leases until that marker.
+        // after_dispatch says which exit it is in the log line: 0 for a refusal that submitted nothing.
+        bool pp_down_soa_released         = false;
+        auto release_prompt_down_soa_once = [&](bool after_dispatch) {
+            if (!release_prompt_down_soa_after_dispatch || pp_down_soa_released) {
+                return;
+            }
+            pp_down_soa_released = true;
+            (void) graph_release_moe_expert_leases_for_tensor_layout(&ctx, src0, ctx.device, GGML_LAYOUT_SOA);
+            const bool released = ggml_sycl_release_moe_tensor_layout(src0, ctx.device, GGML_LAYOUT_SOA);
+            if (released && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                static std::atomic<int> transient_down_release_log{ 0 };
+                if (transient_down_release_log.fetch_add(1, std::memory_order_relaxed) < 96) {
+                    fprintf(stderr,
+                            "[MOE-PHASE-LAYOUT] tensor=%s device=%d layout=%s released_after_dispatch=%d "
+                            "waited_after_dispatch=0 reason=%s\n",
+                            src0 && src0->name ? src0->name : "?", ctx.device,
+                            ggml_sycl_layout_mode_name(GGML_LAYOUT_SOA), after_dispatch ? 1 : 0,
+                            after_dispatch ? "prompt-down-transient" : "prompt-down-transient-refused");
+                }
+            }
+        };
         secondary_dispatch_ctx pp_sec_ctx = { stream, src0,  src1_original, dst_original,  ne00,
                                               ne01,   ne11,  nb11,          nb12,          nb1,
                                               nb2,    false, nullptr,       sycl::event{}, dst };
@@ -93445,10 +93496,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             auto                  act_r      = act_handle.resolve();
             auto                  out_r      = out_handle.resolve();
             if (!act_r || !out_r) {
-                GGML_ABORT(
-                    "[MoE] Failed host-pinned alloc for PP CPU island act/out: %s groups=%zu rows=%zu\n"
-                    "Ensure host zone has enough capacity (populate_host_zone_sizing).",
-                    src0->name ? src0->name : "?", groups.size(), n_rows);
+                // Nothing of the island is on a queue yet, and the groups' host leases are read only by the CPU work
+                // below. Each caller has what it submitted kept before the unwind: the per-expert path's catch around
+                // its call, the batched executor its done marker above its finish, and the all-host micro-batch
+                // submitted nothing.
+                const bool act_missing = !act_r;
+                ggml_sycl_moe_pp_refuse_staging(src0, act_missing ? act_req.device : out_req.device,
+                                                act_missing ? "moe_pp_cpu_island_act" : "moe_pp_cpu_island_out",
+                                                act_missing ? island.n_act_rows : n_rows,
+                                                act_missing ? act_req.size : out_req.size,
+                                                "MUL_MAT_ID prompt CPU island staging did not fit");
             }
 
             float * act_pinned = static_cast<float *>(act_r.ptr);
@@ -93587,11 +93644,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         src0 && src0->name ? src0->name : "?", ctx.device, row_maps_total);
                 fflush(stderr);
             }
-            dev_row_mappings.alloc(*stream, ctx.device, row_maps_total, "moe_pp_row_mappings");
+            if (!GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_ROW_MAP_STAGING)) {
+                dev_row_mappings.alloc(*stream, ctx.device, row_maps_total, "moe_pp_row_mappings");
+            }
             if (!dev_row_mappings.get()) {
-                GGML_ABORT("[MOE-ROUTE] failed to allocate PP row-map staging tensor=%s rows=%zu bytes=%zu device=%d",
-                           src0 && src0->name ? src0->name : "?", row_maps_total,
-                           row_maps_total * sizeof(mmid_row_mapping), ctx.device);
+                // No scratch slot is claimed and no other staging is allocated yet, and nothing of this op that reads
+                // the row maps or the expert weights has been submitted. The retained prompt batch's leases and the
+                // ids snapshot release through their owners on unwind, and the eviction guard of graph compute holds
+                // until graph_compute's catch has drained the queue. The transient down SOA has no owner on this
+                // frame, so it is released here; with nothing submitted that reads it, the release needs no marker.
+                release_prompt_down_soa_once(false);
+                ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, "moe_pp_row_mappings", row_maps_total,
+                                                row_maps_total * sizeof(mmid_row_mapping),
+                                                "MUL_MAT_ID prompt row-map staging did not fit");
             }
             if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                 fprintf(stderr, "[MOE-STAGE] tensor=%s stage=pp-rowmap-copy-begin device=%d rows=%zu dst_handle=%d\n",
@@ -95241,9 +95306,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // and for an mxfp4 group of 2 rows or more, and its mxfp4 f16 arm is oneDNN as well. The batched executor
         // above never meets a slot as a route (the staged route refuses an entry the executor consumes, and serves
         // the others only to a layer the executor does not claim). A staged batch is refused here, before the
-        // scratch setup below claims the oneDNN scratch slot, allocates the staging, or can abort on a failed
-        // allocation, so it reaches its fallback instead.
+        // scratch setup below claims the oneDNN scratch slot or allocates the staging, so it reaches its fallback
+        // with neither taken. This path has submitted nothing, and a batched executor that declined after submitting
+        // phases holds the leases of the experts they read until its drain barrier, so the transient down SOA is
+        // released here with no marker, as at the row-map refusal.
         if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt_batch_result.batch)) {
+            release_prompt_down_soa_once(false);
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt per-expert path refused a staged ring slot");
         }
 
@@ -95255,10 +95323,69 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         sycl::half *                            pp_mxfp4_src0_f16_ptr   = nullptr;
         ggml_sycl::pp_moe_onednn_scratch_result pp_moe_onednn_scratch;
         pp_moe_onednn_scratch_claim             pp_moe_onednn_scratch_claim_state;
+        // The leases of the device experts whose multiplies this path submits.
+        std::vector<ggml_sycl::mem_handle>      pp_gpu_leases;
+
+        // This path's exit work, once its last submit is on the queue: one marker after that submit, the claimed
+        // scratch slot recorded on it with its owners, the expert leases and the pointer-table bundle kept until it,
+        // and the transient down-projection SOA released. The normal exit runs it, and so does the handler of the try
+        // below, which covers everything from the scratch setup on and rethrows any refusal of this path, so the
+        // unwind frees nothing a submitted kernel still reads and skips no release the normal exit performs. The
+        // scoped staging buffers need nothing from it: each releases in queue order.
+        //
+        // It runs at most once per op: the flag is set before its first submit, so neither the handler (after a
+        // refusal thrown past the normal exit's call, or from inside the exit work itself) nor any later call can
+        // submit a second marker or record the claim twice.
+        bool pp_exit_work_done             = false;
+        auto retain_pp_dispatch_until_done = [&]() {
+            if (pp_exit_work_done) {
+                return;
+            }
+            pp_exit_work_done = true;
+            sycl::event prompt_down_dispatch_done;
+            bool        prompt_down_dispatch_done_set = false;
+            if (release_prompt_down_soa_after_dispatch || pp_moe_onednn_scratch_claim_state.claimed()) {
+                prompt_down_dispatch_done = ggml_sycl_submit_marker<pp_moe_prompt_down_dispatch_done_marker>(*stream);
+                prompt_down_dispatch_done_set = true;
+            }
+            if (pp_moe_onednn_scratch_claim_state.claimed()) {
+                std::vector<ggml_sycl::mem_handle> pp_moe_slot_owners;
+                if (pp_moe_onednn_scratch.weight_owner.valid()) {
+                    pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.weight_owner));
+                }
+                if (pp_moe_onednn_scratch.activation_owner.valid()) {
+                    pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.activation_owner));
+                }
+                if (pp_moe_onednn_scratch.output_owner.valid()) {
+                    pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.output_owner));
+                }
+                pp_moe_onednn_scratch_claim_state.bind_owners(std::move(pp_moe_slot_owners));
+                pp_moe_onednn_scratch_claim_state.record(prompt_down_dispatch_done);
+            }
+            if (!pp_gpu_leases.empty()) {
+                ggml_sycl::retain_handles_until_event(
+                    std::move(pp_gpu_leases),
+                    prompt_down_dispatch_done_set ? prompt_down_dispatch_done : stream->ext_oneapi_submit_barrier());
+            }
+            if (use_expert_cache && src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
+                std::vector<ggml_sycl::mem_handle> ptr_table_dispatch_bundle =
+                    ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device);
+                if (!ptr_table_dispatch_bundle.empty()) {
+                    ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle),
+                                                          prompt_down_dispatch_done_set ?
+                                                              prompt_down_dispatch_done :
+                                                              stream->ext_oneapi_submit_barrier());
+                }
+            }
+            release_prompt_down_soa_once(true);
+        };
 
         auto ensure_src1_contiguous_f32 = [&]() -> bool {
             if (src1_contiguous_f32.get()) {
                 return true;
+            }
+            if (GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_SRC1_F32_STAGING)) {
+                return false;
             }
             try {
                 src1_contiguous_f32.alloc(*stream, ctx.device, src1_contiguous_f32_row_bytes * src1_contiguous_rows,
@@ -95268,1002 +95395,1043 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             return src1_contiguous_f32.get() != nullptr;
         };
+        // The F32 activation staging is allocated once per op, by whichever of its three sites needs it first (the
+        // setup below, an expert the f16 arm does not take, the f16 arm's fallback to F32 batches). All three are
+        // inside the try below, whose handler runs the exit work, so what earlier experts submitted keeps what it
+        // reads.
+        auto refuse_src1_f32_staging = [&]() {
+            ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, "moe_pp_src1_f32", src1_contiguous_rows,
+                                            src1_contiguous_f32_row_bytes * src1_contiguous_rows,
+                                            "MUL_MAT_ID prompt activation staging did not fit");
+        };
 
-        bool                                  pp_mxfp4_soa_f16_ready = !pp_cpu_reference && pp_mxfp4_soa_f16_candidate;
-        scoped_unified_queue_temp<sycl::half> pp_mxfp4_src0_f16;
+        // From here on a scratch slot can be claimed and experts submitted. A refusal anywhere below (a staging
+        // buffer the card did not grant, a secondary executor that refused, an expert left unresolved, the CPU
+        // island) reaches this one handler, which runs the exit work and rethrows it to graph_compute. The refusals
+        // themselves only refuse. The row-map refusal above stays outside: it comes before any claim or submit.
+        //
+        // The handler runs after this block's own locals are destroyed, and that is safe for what a submitted kernel
+        // reads. The f16 weight staging declared inside (pp_mxfp4_src0_f16) is a queue-scoped temporary: its
+        // destructor releases it behind a marker on the same in-order queue, so after every kernel already
+        // submitted. Each expert's lease is moved into pp_gpu_leases, declared before the try, before the first
+        // submit that reads that expert's weight, so the handler still holds every lease a kernel can read. The claim
+        // and the other staging buffers are declared before the try as well.
+        try {
+            bool pp_mxfp4_soa_f16_ready = !pp_cpu_reference && pp_mxfp4_soa_f16_candidate;
+            scoped_unified_queue_temp<sycl::half> pp_mxfp4_src0_f16;
 #if GGML_SYCL_DNNL
-        if (pp_mxfp4_soa_f16_ready) {
-            const size_t pp_mxfp4_src0_f16_bytes =
-                static_cast<size_t>(ne01) * static_cast<size_t>(ne00) * sizeof(sycl::half);
-            const size_t src1_contiguous_f16_bytes = src1_contiguous_f16_row_bytes * src1_contiguous_rows;
-            const size_t dst_contiguous_bytes      = sizeof(float) * ggml_nelements(dst);
-            const size_t planned_weight_slot =
-                ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(ctx.device);
-            const size_t planned_activation_slot =
-                ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(ctx.device);
-            const size_t planned_output_slot =
-                ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(ctx.device);
-            const uint32_t planned_ring_depth_raw =
-                ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx.device);
-            const ggml_sycl::pp_moe_onednn_scratch_shape planned_shape = {
-                planned_weight_slot,
-                planned_activation_slot,
-                planned_output_slot,
-                planned_ring_depth_raw,
-            };
-            const ggml_sycl::pp_moe_onednn_scratch_shape required_shape = {
-                pp_mxfp4_src0_f16_bytes,
-                src1_contiguous_f16_bytes,
-                dst_contiguous_bytes,
-                1,
-            };
-            // Same hard cap as the batched executor: the planned slot sizes are
-            // a ceiling, so this staging never asks for max(planned, required).
-            // Refusing here does NOT abort the op -- unlike the batched lambda
-            // this IS the terminal MoE PP route, so it falls through to its own
-            // transient per-dispatch staging below, which is a different
-            // placement category (queue-scoped temporaries released at scope
-            // exit) rather than an enlargement of the planned ring.
-            const ggml_sycl::pp_moe_onednn_scratch_admission admission =
-                ggml_sycl::pp_moe_onednn_admit_scratch(planned_shape, required_shape);
-            // Same reasoning as the batched site: default-verbosity, once per
-            // process. Here the op still runs, on its own transient staging, so
-            // the cost is the planned ring going unused -- which is invisible in
-            // a token stream and shows up only as throughput.
-            static ggml_sycl::pp_moe_onednn_scratch_refusal_latch staging_scratch_refusal_latch;
-            if (ggml_sycl::pp_moe_onednn_should_report_refusal(admission, staging_scratch_refusal_latch)) {
-                GGML_LOG_WARN(
-                    "[SYCL] refusing unplanned PP MoE oneDNN staging scratch (reported once per process): "
-                    "device=%d reason=%s required=[%zu,%zu,%zu] planned_cap=[%zu,%zu,%zu] "
-                    "required_ring=%u planned_ring=%u; staging from transient per-dispatch temporaries\n",
-                    ctx.device, ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason),
-                    pp_mxfp4_src0_f16_bytes, src1_contiguous_f16_bytes, dst_contiguous_bytes, planned_weight_slot,
-                    planned_activation_slot, planned_output_slot, required_shape.ring_depth, planned_ring_depth_raw);
-            }
-            if (!admission.allowed && pp_oor_trace) {
-                fprintf(stderr,
-                        "[MOE-OOR-TRACE] stage=pp-moe-onednn-scratch-refused tensor=%s device=%d reason=%s "
-                        "planned_weight=%zu required_weight=%zu planned_act=%zu required_act=%zu "
-                        "planned_out=%zu required_out=%zu planned_ring=%u\n",
-                        src0 && src0->name ? src0->name : "?", ctx.device,
-                        ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason), planned_weight_slot,
-                        pp_mxfp4_src0_f16_bytes, planned_activation_slot, src1_contiguous_f16_bytes,
-                        planned_output_slot, dst_contiguous_bytes, planned_ring_depth_raw);
-            }
-            const uint32_t             planned_ring_depth = pp_moe_onednn_runtime_ring_depth(planned_ring_depth_raw);
-            ggml_sycl::unified_cache * cache =
-                admission.allowed ? ggml_sycl::get_unified_cache(*ctx.stream()) : nullptr;
-            if (cache != nullptr) {
-                (void) cache->reserve_pp_moe_onednn_scratch(planned_weight_slot, planned_activation_slot,
-                                                            planned_output_slot, planned_ring_depth);
-                ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot reserved;
-                uint32_t scratch_slot = std::numeric_limits<uint32_t>::max();
-                if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot)) {
-                    const bool fail_after_local_reservation = pp_moe_onednn_claim_fail_after_local_reservation();
-                    const bool cache_claimed = !fail_after_local_reservation &&
-                                               cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved);
-                    if (cache_claimed) {
-                        pp_moe_onednn_scratch_claim_state.activate(ctx.device, planned_ring_depth, scratch_slot,
-                                                                   reserved.generation, ctx.stream());
+            if (pp_mxfp4_soa_f16_ready) {
+                const size_t pp_mxfp4_src0_f16_bytes =
+                    static_cast<size_t>(ne01) * static_cast<size_t>(ne00) * sizeof(sycl::half);
+                const size_t src1_contiguous_f16_bytes = src1_contiguous_f16_row_bytes * src1_contiguous_rows;
+                const size_t dst_contiguous_bytes      = sizeof(float) * ggml_nelements(dst);
+                const size_t planned_weight_slot =
+                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(ctx.device);
+                const size_t planned_activation_slot =
+                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(ctx.device);
+                const size_t planned_output_slot =
+                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(ctx.device);
+                const uint32_t planned_ring_depth_raw =
+                    ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx.device);
+                const ggml_sycl::pp_moe_onednn_scratch_shape planned_shape = {
+                    planned_weight_slot,
+                    planned_activation_slot,
+                    planned_output_slot,
+                    planned_ring_depth_raw,
+                };
+                const ggml_sycl::pp_moe_onednn_scratch_shape required_shape = {
+                    pp_mxfp4_src0_f16_bytes,
+                    src1_contiguous_f16_bytes,
+                    dst_contiguous_bytes,
+                    1,
+                };
+                // Same hard cap as the batched executor: the planned slot sizes are
+                // a ceiling, so this staging never asks for max(planned, required).
+                // Refusing here does NOT abort the op -- unlike the batched lambda
+                // this IS the terminal MoE PP route, so it falls through to its own
+                // transient per-dispatch staging below, which is a different
+                // placement category (queue-scoped temporaries released at scope
+                // exit) rather than an enlargement of the planned ring.
+                const ggml_sycl::pp_moe_onednn_scratch_admission admission =
+                    ggml_sycl::pp_moe_onednn_admit_scratch(planned_shape, required_shape);
+                // Same reasoning as the batched site: default-verbosity, once per
+                // process. Here the op still runs, on its own transient staging, so
+                // the cost is the planned ring going unused -- which is invisible in
+                // a token stream and shows up only as throughput.
+                static ggml_sycl::pp_moe_onednn_scratch_refusal_latch staging_scratch_refusal_latch;
+                if (ggml_sycl::pp_moe_onednn_should_report_refusal(admission, staging_scratch_refusal_latch)) {
+                    GGML_LOG_WARN(
+                        "[SYCL] refusing unplanned PP MoE oneDNN staging scratch (reported once per process): "
+                        "device=%d reason=%s required=[%zu,%zu,%zu] planned_cap=[%zu,%zu,%zu] "
+                        "required_ring=%u planned_ring=%u; staging from transient per-dispatch temporaries\n",
+                        ctx.device, ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason),
+                        pp_mxfp4_src0_f16_bytes, src1_contiguous_f16_bytes, dst_contiguous_bytes, planned_weight_slot,
+                        planned_activation_slot, planned_output_slot, required_shape.ring_depth,
+                        planned_ring_depth_raw);
+                }
+                if (!admission.allowed && pp_oor_trace) {
+                    fprintf(stderr,
+                            "[MOE-OOR-TRACE] stage=pp-moe-onednn-scratch-refused tensor=%s device=%d reason=%s "
+                            "planned_weight=%zu required_weight=%zu planned_act=%zu required_act=%zu "
+                            "planned_out=%zu required_out=%zu planned_ring=%u\n",
+                            src0 && src0->name ? src0->name : "?", ctx.device,
+                            ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason),
+                            planned_weight_slot, pp_mxfp4_src0_f16_bytes, planned_activation_slot,
+                            src1_contiguous_f16_bytes, planned_output_slot, dst_contiguous_bytes,
+                            planned_ring_depth_raw);
+                }
+                const uint32_t planned_ring_depth = pp_moe_onednn_runtime_ring_depth(planned_ring_depth_raw);
+                ggml_sycl::unified_cache * cache =
+                    admission.allowed ? ggml_sycl::get_unified_cache(*ctx.stream()) : nullptr;
+                if (cache != nullptr) {
+                    (void) cache->reserve_pp_moe_onednn_scratch(planned_weight_slot, planned_activation_slot,
+                                                                planned_output_slot, planned_ring_depth);
+                    ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot reserved;
+                    uint32_t scratch_slot = std::numeric_limits<uint32_t>::max();
+                    if (pp_moe_onednn_claim_scratch_slot(ctx.device, planned_ring_depth, scratch_slot)) {
+                        const bool fail_after_local_reservation = pp_moe_onednn_claim_fail_after_local_reservation();
+                        const bool cache_claimed                = !fail_after_local_reservation &&
+                                                   cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved);
+                        if (cache_claimed) {
+                            pp_moe_onednn_scratch_claim_state.activate(ctx.device, planned_ring_depth, scratch_slot,
+                                                                       reserved.generation, ctx.stream());
+                        } else {
+                            pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, planned_ring_depth, scratch_slot);
+                        }
+                    }
+                    if (pp_moe_onednn_scratch_claim_state.claimed()) {
+                        pp_moe_onednn_scratch.slot             = reserved.slot;
+                        pp_moe_onednn_scratch.generation       = reserved.generation;
+                        pp_moe_onednn_scratch.weight           = reserved.weight;
+                        pp_moe_onednn_scratch.activation       = reserved.activation;
+                        pp_moe_onednn_scratch.output           = reserved.output;
+                        pp_moe_onednn_scratch.weight_size      = reserved.weight_size;
+                        pp_moe_onednn_scratch.activation_size  = reserved.activation_size;
+                        pp_moe_onednn_scratch.output_size      = reserved.output_size;
+                        pp_moe_onednn_scratch.weight_owner     = reserved.weight_owner;
+                        pp_moe_onednn_scratch.activation_owner = reserved.activation_owner;
+                        pp_moe_onednn_scratch.output_owner     = reserved.output_owner;
+                        pp_moe_onednn_scratch.ok               = true;
                     } else {
-                        pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, planned_ring_depth, scratch_slot);
+                        pp_moe_onednn_scratch_claim_state.release_unused();
                     }
                 }
-                if (pp_moe_onednn_scratch_claim_state.claimed()) {
-                    pp_moe_onednn_scratch.slot             = reserved.slot;
-                    pp_moe_onednn_scratch.generation       = reserved.generation;
-                    pp_moe_onednn_scratch.weight           = reserved.weight;
-                    pp_moe_onednn_scratch.activation       = reserved.activation;
-                    pp_moe_onednn_scratch.output           = reserved.output;
-                    pp_moe_onednn_scratch.weight_size      = reserved.weight_size;
-                    pp_moe_onednn_scratch.activation_size  = reserved.activation_size;
-                    pp_moe_onednn_scratch.output_size      = reserved.output_size;
-                    pp_moe_onednn_scratch.weight_owner     = reserved.weight_owner;
-                    pp_moe_onednn_scratch.activation_owner = reserved.activation_owner;
-                    pp_moe_onednn_scratch.output_owner     = reserved.output_owner;
-                    pp_moe_onednn_scratch.ok               = true;
+                if (pp_moe_onednn_scratch.ok && pp_moe_onednn_scratch.weight_size >= pp_mxfp4_src0_f16_bytes &&
+                    pp_moe_onednn_scratch.activation_size >= src1_contiguous_f16_bytes &&
+                    pp_moe_onednn_scratch.output_size >= dst_contiguous_bytes) {
+                    pp_mxfp4_src0_f16_ptr   = static_cast<sycl::half *>(pp_moe_onednn_scratch.weight);
+                    src1_contiguous_f16_ptr = static_cast<char *>(pp_moe_onednn_scratch.activation);
+                    dst_contiguous_ptr      = static_cast<char *>(pp_moe_onednn_scratch.output);
+                    pp_moe_onednn_scratch_claim_state.mark_used();
                 } else {
+                    pp_moe_onednn_scratch.ok = false;
                     pp_moe_onednn_scratch_claim_state.release_unused();
                 }
-            }
-            if (pp_moe_onednn_scratch.ok && pp_moe_onednn_scratch.weight_size >= pp_mxfp4_src0_f16_bytes &&
-                pp_moe_onednn_scratch.activation_size >= src1_contiguous_f16_bytes &&
-                pp_moe_onednn_scratch.output_size >= dst_contiguous_bytes) {
-                pp_mxfp4_src0_f16_ptr   = static_cast<sycl::half *>(pp_moe_onednn_scratch.weight);
-                src1_contiguous_f16_ptr = static_cast<char *>(pp_moe_onednn_scratch.activation);
-                dst_contiguous_ptr      = static_cast<char *>(pp_moe_onednn_scratch.output);
-                pp_moe_onednn_scratch_claim_state.mark_used();
-            } else {
-                pp_moe_onednn_scratch.ok = false;
-                pp_moe_onednn_scratch_claim_state.release_unused();
-            }
-            try {
-                if (!pp_mxfp4_src0_f16_ptr) {
-                    pp_mxfp4_src0_f16.alloc(*stream, ctx.device, static_cast<size_t>(ne01) * static_cast<size_t>(ne00),
-                                            "moe_pp_mxfp4_f16_weight");
-                    pp_mxfp4_src0_f16_ptr = pp_mxfp4_src0_f16.get();
+                try {
+                    if (!pp_mxfp4_src0_f16_ptr) {
+                        pp_mxfp4_src0_f16.alloc(*stream, ctx.device,
+                                                static_cast<size_t>(ne01) * static_cast<size_t>(ne00),
+                                                "moe_pp_mxfp4_f16_weight");
+                        pp_mxfp4_src0_f16_ptr = pp_mxfp4_src0_f16.get();
+                    }
+                    if (!src1_contiguous_f16_ptr) {
+                        src1_contiguous_f16.alloc(*stream, ctx.device, src1_contiguous_f16_bytes, "moe_pp_src1_f16");
+                        src1_contiguous_f16_ptr = src1_contiguous_f16.get();
+                    }
+                } catch (...) {
+                    if (pp_oor_trace) {
+                        fprintf(stderr,
+                                "[MOE-OOR-TRACE] stage=f16-staging-alloc-failed tensor=%s src0_bytes=%zu "
+                                "src1_bytes=%zu\n",
+                                src0 && src0->name ? src0->name : "?",
+                                static_cast<size_t>(ne01) * static_cast<size_t>(ne00) * sizeof(sycl::half),
+                                src1_contiguous_f16_row_bytes * src1_contiguous_rows);
+                    }
+                    pp_mxfp4_soa_f16_ready = false;
                 }
-                if (!src1_contiguous_f16_ptr) {
-                    src1_contiguous_f16.alloc(*stream, ctx.device, src1_contiguous_f16_bytes, "moe_pp_src1_f16");
-                    src1_contiguous_f16_ptr = src1_contiguous_f16.get();
+                if (!pp_mxfp4_src0_f16_ptr || !src1_contiguous_f16_ptr) {
+                    if (pp_oor_trace) {
+                        fprintf(stderr, "[MOE-OOR-TRACE] stage=f16-staging-null tensor=%s src0_ptr=%p src1_ptr=%p\n",
+                                src0 && src0->name ? src0->name : "?", (void *) pp_mxfp4_src0_f16_ptr,
+                                (void *) src1_contiguous_f16_ptr);
+                    }
+                    pp_mxfp4_soa_f16_ready = false;
                 }
-            } catch (...) {
-                if (pp_oor_trace) {
-                    fprintf(stderr,
-                            "[MOE-OOR-TRACE] stage=f16-staging-alloc-failed tensor=%s src0_bytes=%zu "
-                            "src1_bytes=%zu\n",
-                            src0 && src0->name ? src0->name : "?",
-                            static_cast<size_t>(ne01) * static_cast<size_t>(ne00) * sizeof(sycl::half),
-                            src1_contiguous_f16_row_bytes * src1_contiguous_rows);
-                }
-                pp_mxfp4_soa_f16_ready = false;
             }
-            if (!pp_mxfp4_src0_f16_ptr || !src1_contiguous_f16_ptr) {
-                if (pp_oor_trace) {
-                    fprintf(stderr, "[MOE-OOR-TRACE] stage=f16-staging-null tensor=%s src0_ptr=%p src1_ptr=%p\n",
-                            src0 && src0->name ? src0->name : "?", (void *) pp_mxfp4_src0_f16_ptr,
-                            (void *) src1_contiguous_f16_ptr);
-                }
-                pp_mxfp4_soa_f16_ready = false;
-            }
-        }
 #endif
-        if (!dst_contiguous_ptr) {
-            dst_contiguous.alloc(*stream, ctx.device, sizeof(float) * ggml_nelements(dst), "moe_pp_dst_contiguous");
-            dst_contiguous_ptr = dst_contiguous.get();
-        }
-        if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) {
-            GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for %s rows=%zu row_bytes=%zu",
-                       src0->name ? src0->name : "?", src1_contiguous_rows, src1_contiguous_f32_row_bytes);
-        }
-        if (pp_oor_trace) {
-            fprintf(stderr,
-                    "[MOE-OOR-TRACE] stage=pp-staging-ready tensor=%s f16_ready=%d f32_ptr=%p f16_src0=%p "
-                    "f16_src1=%p dst=%p rows=%zu\n",
-                    src0 && src0->name ? src0->name : "?", pp_mxfp4_soa_f16_ready ? 1 : 0,
-                    (void *) src1_contiguous_f32.get(), (void *) pp_mxfp4_src0_f16_ptr,
-                    (void *) src1_contiguous_f16_ptr, (void *) dst_contiguous_ptr, src1_contiguous_rows);
-        }
-        pp_phase_log("pp-staging-ready", route_layout, src1_contiguous_rows, ids_host.size());
-        src1_row.data = src1_contiguous_f32.get();
-        dst_row.data  = dst_contiguous_ptr;
+            if (!dst_contiguous_ptr) {
+                if (!GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_DST_STAGING)) {
+                    dst_contiguous.alloc(*stream, ctx.device, sizeof(float) * ggml_nelements(dst),
+                                         "moe_pp_dst_contiguous");
+                }
+                dst_contiguous_ptr = dst_contiguous.get();
+                if (!dst_contiguous_ptr) {
+                    // Every expert's multiply and scatter write through this base, so the op cannot run without it. No
+                    // expert of this path has been submitted yet, and no scratch slot is held here: a slot the setup
+                    // above used supplies dst_contiguous_ptr, so this branch is not taken, and one it did not use was
+                    // released there. The try's handler releases what the normal exit releases.
+                    ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, "moe_pp_dst_contiguous", src1_contiguous_rows,
+                                                    sizeof(float) * ggml_nelements(dst),
+                                                    "MUL_MAT_ID prompt output staging did not fit");
+                }
+            }
+            if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) {
+                refuse_src1_f32_staging();
+            }
+            if (pp_oor_trace) {
+                fprintf(stderr,
+                        "[MOE-OOR-TRACE] stage=pp-staging-ready tensor=%s f16_ready=%d f32_ptr=%p f16_src0=%p "
+                        "f16_src1=%p dst=%p rows=%zu\n",
+                        src0 && src0->name ? src0->name : "?", pp_mxfp4_soa_f16_ready ? 1 : 0,
+                        (void *) src1_contiguous_f32.get(), (void *) pp_mxfp4_src0_f16_ptr,
+                        (void *) src1_contiguous_f16_ptr, (void *) dst_contiguous_ptr, src1_contiguous_rows);
+            }
+            pp_phase_log("pp-staging-ready", route_layout, src1_contiguous_rows, ids_host.size());
+            src1_row.data = src1_contiguous_f32.get();
+            dst_row.data  = dst_contiguous_ptr;
 
-        const bool pp_local_trace = ggml_sycl_moe_pp_local_trace_enabled();
+            const bool pp_local_trace = ggml_sycl_moe_pp_local_trace_enabled();
 
-        struct pp_local_trace_accum {
-            double route_resolve_us      = 0.0;
-            double f16_stage_submit_us   = 0.0;
-            double f16_stage_wait_us     = 0.0;
-            double f32_stage_submit_us   = 0.0;
-            double dequant_submit_us     = 0.0;
-            double onednn_submit_us      = 0.0;
-            double onednn_wait_us        = 0.0;
-            double f32_dispatch_us       = 0.0;
-            double dst_scatter_submit_us = 0.0;
-            size_t active_experts        = 0;
-            size_t rows                  = 0;
-            size_t f16_batches           = 0;
-            size_t f32_batches           = 0;
-            size_t f16_fallbacks         = 0;
-            size_t f16_scratch_slots     = 0;
-            size_t dst_scatter_experts   = 0;
-        };
-
-        pp_local_trace_accum pp_local_accum;
-        if (pp_moe_onednn_scratch.ok) {
-            pp_local_accum.f16_scratch_slots = 1;
-        }
-        const bool pp_scratch_validate = [] {
-            const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_VALIDATE");
-            return env && std::atoi(env) != 0;
-        }();
-        const int pp_scratch_validate_limit = [] {
-            const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_VALIDATE_LIMIT");
-            return env ? std::max(1, std::atoi(env)) : 64;
-        }();
-        const bool pp_scratch_validate_detail = [] {
-            const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_VALIDATE_DETAIL");
-            return env && std::atoi(env) != 0;
-        }();
-        const bool pp_scratch_compare = [] {
-            const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_COMPARE");
-            return env && std::atoi(env) != 0;
-        }();
-        const int pp_scratch_compare_layer = [] {
-            const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_COMPARE_LAYER");
-            return env ? std::atoi(env) : -1;
-        }();
-        const int pp_scratch_compare_limit = [] {
-            const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_COMPARE_LIMIT");
-            return env ? std::max(1, std::atoi(env)) : 16;
-        }();
-        auto validate_pp_scratch_rows = [&](const char * label, int64_t expert_id, int64_t rows, const char * base) {
-            if (!pp_scratch_validate || !base || rows <= 0 || ne0 <= 0) {
-                return;
-            }
-            static std::atomic<int> validate_count{ 0 };
-            const int               idx = validate_count.fetch_add(1, std::memory_order_relaxed);
-            if (idx >= pp_scratch_validate_limit) {
-                return;
-            }
-            const size_t       row_elems = static_cast<size_t>(ne0);
-            const size_t       n_rows    = static_cast<size_t>(rows);
-            std::vector<float> host(row_elems * n_rows);
-            try {
-                ctx.stream()->wait_and_throw();
-                ggml_sycl_safe_memcpy_sync(*ctx.stream(), host.data(), base, host.size() * sizeof(float));
-            } catch (const std::exception & e) {
-                fprintf(stderr, "[MOE-PP-SCRATCH] label=%s tensor=%s expert=%lld rows=%lld ne0=%lld copy_failed=%s\n",
-                        label ? label : "?", src0 && src0->name ? src0->name : "?", (long long) expert_id,
-                        (long long) rows, (long long) ne0, e.what());
-                return;
-            }
-            size_t finite     = 0;
-            size_t nan        = 0;
-            size_t inf        = 0;
-            float  min_v      = std::numeric_limits<float>::infinity();
-            float  max_v      = -std::numeric_limits<float>::infinity();
-            size_t min_prefix = row_elems;
-            size_t max_prefix = 0;
-            for (size_t r = 0; r < n_rows; ++r) {
-                size_t prefix = 0;
-                for (; prefix < row_elems; ++prefix) {
-                    const float v = host[r * row_elems + prefix];
-                    if (!std::isfinite(static_cast<double>(v))) {
-                        break;
-                    }
-                }
-                min_prefix = std::min(min_prefix, prefix);
-                max_prefix = std::max(max_prefix, prefix);
-                for (size_t c = 0; c < row_elems; ++c) {
-                    const float v = host[r * row_elems + c];
-                    if (std::isnan(v)) {
-                        ++nan;
-                    } else if (std::isinf(v)) {
-                        ++inf;
-                    } else {
-                        ++finite;
-                        min_v = std::min(min_v, v);
-                        max_v = std::max(max_v, v);
-                    }
-                }
-            }
-            if (finite == 0) {
-                min_v = 0.0f;
-                max_v = 0.0f;
-            }
-            fprintf(stderr,
-                    "[MOE-PP-SCRATCH] label=%s tensor=%s layer=%d role=%s expert=%lld rows=%lld ne0=%lld "
-                    "finite=%zu nan=%zu inf=%zu min_prefix=%zu max_prefix=%zu min=%g max=%g\n",
-                    label ? label : "?", src0 && src0->name ? src0->name : "?", blk_layer_id,
-                    moe_tensor_type_name(pp_role), (long long) expert_id, (long long) rows, (long long) ne0, finite,
-                    nan, inf, min_prefix, max_prefix, (double) min_v, (double) max_v);
-            if (pp_scratch_validate_detail) {
-                for (size_t r = 0; r < std::min<size_t>(n_rows, 2); ++r) {
-                    size_t        row_finite = 0;
-                    size_t        first_finite[16];
-                    size_t        first_count = 0;
-                    size_t        last_finite = row_elems;
-                    const float * row         = host.data() + r * row_elems;
-                    for (size_t c = 0; c < row_elems; ++c) {
-                        if (std::isfinite(static_cast<double>(row[c]))) {
-                            if (first_count < 16) {
-                                first_finite[first_count++] = c;
-                            }
-                            last_finite = c;
-                            ++row_finite;
-                        }
-                    }
-                    fprintf(stderr,
-                            "[MOE-PP-SCRATCH-DETAIL] label=%s tensor=%s layer=%d role=%s expert=%lld row=%zu "
-                            "finite=%zu last_finite=%zu first_finite=",
-                            label ? label : "?", src0 && src0->name ? src0->name : "?", blk_layer_id,
-                            moe_tensor_type_name(pp_role), (long long) expert_id, r, row_finite, last_finite);
-                    for (size_t i = 0; i < first_count; ++i) {
-                        fprintf(stderr, "%s%zu", i == 0 ? "" : ",", first_finite[i]);
-                    }
-                    fprintf(stderr, "\n");
-                }
-            }
-        };
-
-        auto dispatch_mxfp4_soa_pp_f16_input = [&](const void * expert_ptr, int64_t batch, const void * src1_f16_ptr,
-                                                   void * dst_f32_ptr, pp_local_trace_accum * local_trace) -> bool {
-#if GGML_SYCL_DNNL
-            if (!pp_mxfp4_soa_f16_ready || !expert_ptr || !src1_f16_ptr || !dst_f32_ptr || batch <= 0) {
-                return false;
-            }
-            if (ne00 <= 0 || ne01 <= 0 || (ne00 % QK_MXFP4) != 0) {
-                return false;
-            }
-            if (!pp_mxfp4_src0_f16_ptr) {
-                return false;
-            }
-            try {
-                const int  blocks_per_row = static_cast<int>(ne00 / QK_MXFP4);
-                const auto dequant_start  = moe_profile_state::hrc::now();
-                dequantize_row_mxfp4_soa_to_fp16_rowmajor(static_cast<const char *>(expert_ptr), pp_mxfp4_src0_f16_ptr,
-                                                          blocks_per_row, static_cast<int>(ne01), ctx.stream());
-                const auto dequant_done = moe_profile_state::hrc::now();
-                if (!DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(ne01), static_cast<int>(batch),
-                                               static_cast<int>(ne00), pp_mxfp4_src0_f16_ptr,
-                                               DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
-                                               DnnlGemmWrapper::to_dt<sycl::half>(), dst_f32_ptr,
-                                               DnnlGemmWrapper::to_dt<float>(), ctx.stream())) {
-                    return false;  // a declined scratchpad: the caller's next path, as the catches below
-                }
-                const auto gemm_submit_done = moe_profile_state::hrc::now();
-                if (local_trace) {
-                    local_trace->dequant_submit_us += moe_profile_state::us(dequant_start, dequant_done);
-                    local_trace->onednn_submit_us += moe_profile_state::us(dequant_done, gemm_submit_done);
-                    local_trace->f16_batches++;
-                }
-                return true;
-            } catch (const std::exception & e) {
-                static std::atomic<int> warned{ 0 };
-                if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
-                    GGML_LOG_WARN("[MXFP4-DIRECT] oneDNN SOA PP f16-input failed: %s\n", e.what());
-                }
-                return false;
-            } catch (...) {
-                static std::atomic<int> warned{ 0 };
-                if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
-                    GGML_LOG_WARN("[MXFP4-DIRECT] oneDNN SOA PP f16-input failed with unknown exception\n");
-                }
-                return false;
-            }
-#else
-            GGML_UNUSED(expert_ptr);
-            GGML_UNUSED(batch);
-            GGML_UNUSED(src1_f16_ptr);
-            GGML_UNUSED(dst_f32_ptr);
-            GGML_UNUSED(local_trace);
-            return false;
-#endif
-        };
-
-        std::vector<ggml_sycl::mem_handle> pp_gpu_leases;
-        size_t                             pp_route_dev0                           = 0;
-        size_t                             pp_route_dev1                           = 0;
-        size_t                             pp_route_host                           = 0;
-        size_t                             pp_route_unavailable                    = 0;
-        size_t                             pp_route_localized                      = 0;
-        size_t                             pp_route_host_rerouted                  = 0;
-        size_t                             pp_planned_device_to_host_fallback_rows = 0;
-        size_t                             pp_planned_host_rows                    = 0;
-        size_t                             pp_true_host_rows                       = 0;
-        size_t                             pp_unsupported_device_rows              = 0;
-        size_t                             pp_entries_dev0                         = 0;
-        size_t                             pp_entries_dev1                         = 0;
-        size_t                             pp_entries_host                         = 0;
-        size_t                             pp_entries_unavailable                  = 0;
-        for (int64_t i02 = 0; i02 < n_as; i02++) {
-            const size_t  row_begin     = row_map_offsets[static_cast<size_t>(i02)];
-            const size_t  row_end       = row_map_offsets[static_cast<size_t>(i02) + 1];
-            const int64_t num_src1_rows = static_cast<int64_t>(row_end - row_begin);
-            if (num_src1_rows == 0) {
-                continue;
-            }
-            const void *          expert_ptr = nullptr;
-            ggml_sycl::mem_handle expert_gpu_lease{};
-            // The layout of the bytes expert_gpu_lease holds. The slice storage installed from that lease and the
-            // layout forced on the matmul below both read this one variable, so the kernel is chosen for the
-            // layout the operand is in. Only a local expert reaches those consumers (any other route continues or
-            // throws before them, as does an expert left without a pointer), and it takes the layout from its route,
-            // whose lease the resolver checked to resolve at that layout; the initial value is never read.
-            layout_mode           expert_layout = route_layout;
-
-            if (ne12 != 1) {
-                const auto       route_resolve_start = moe_profile_state::hrc::now();
-                moe_expert_route route               = retained_prompt_group_route_for_expert(static_cast<int>(i02));
-                if (pp_local_trace) {
-                    pp_local_accum.route_resolve_us +=
-                        moe_profile_state::us(route_resolve_start, moe_profile_state::hrc::now());
-                }
-                if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr) {
-                    const bool queue_ready = route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
-                                             ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
-                                                 ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(
-                                                     route.owning_device, mmid_owner_ptr));
-                    const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
-                        src0->type, route.actual_layout, moe_route_phase::PROMPT, src0->ne[0], src0->ne[1],
-                        static_cast<size_t>(num_src1_rows), route.owning_device, moe_layer_route_residency::DEVICE,
-                        ctx.device);
-                    if (!queue_ready || !cap.supported) {
-                        pp_unsupported_device_rows += static_cast<size_t>(num_src1_rows);
-                        throw ggml_sycl_fallback_error(
-                            "MUL_MAT_ID retained prompt secondary executor refused exact handle");
-                    }
-                }
-                if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr) {
-                    if (route.has_ready_event) {
-                        stream->ext_oneapi_submit_barrier({ route.ready_event });
-                    }
-                    if (use_expert_cache && has_placement_plan && !route.lease.valid()) {
-                        GGML_ABORT(
-                            "[MOE-ROUTE] planned local PP expert resolved without smart mem_handle tensor=%s "
-                            "expert=%lld "
-                            "layout=%s device=%d",
-                            src0 && src0->name ? src0->name : "?", (long long) i02,
-                            ggml_sycl_layout_mode_name(route.actual_layout), ctx.device);
-                    }
-                    expert_ptr       = route.ptr;
-                    expert_gpu_lease = std::move(route.lease);
-                    expert_layout    = route.actual_layout;
-                    pp_route_dev0++;
-                    if (pp_oor_trace) {
-                        fprintf(stderr,
-                                "[MOE-OOR-TRACE] stage=expert-route tensor=%s expert=%lld rows=%lld kind=%d "
-                                "ptr=%p owning=%d layout=%s reason=%s\n",
-                                src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
-                                (int) route.kind, route.ptr, route.owning_device,
-                                ggml_sycl_layout_mode_name(route.actual_layout),
-                                ggml_sycl_expert_resolve_reason_name(route.reason));
-                    }
-                } else if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr &&
-                           route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
-                           ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
-                               ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device,
-                                                                                         mmid_owner_ptr))) {
-                    if (use_expert_cache && has_placement_plan && !route.lease.valid()) {
-                        GGML_ABORT(
-                            "[MOE-ROUTE] planned secondary PP expert resolved without smart mem_handle tensor=%s "
-                            "expert=%lld layout=%s device=%d",
-                            src0 && src0->name ? src0->name : "?", (long long) i02,
-                            ggml_sycl_layout_mode_name(route.actual_layout), route.owning_device);
-                    }
-                    if (pp_oor_trace) {
-                        fprintf(stderr,
-                                "[MOE-OOR-TRACE] stage=expert-route tensor=%s expert=%lld rows=%lld kind=%d "
-                                "ptr=%p owning=%d layout=%s reason=%s\n",
-                                src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
-                                (int) route.kind, route.ptr, route.owning_device,
-                                ggml_sycl_layout_mode_name(route.actual_layout),
-                                ggml_sycl_expert_resolve_reason_name(route.reason));
-                    }
-                    std::vector<expert_dispatch_entry> & sec_entries =
-                        pp_secondary_entries_by_device[static_cast<size_t>(route.owning_device)];
-                    append_secondary_entries(sec_entries, row_begin, row_end, static_cast<int32_t>(i02), route.ptr,
-                                             route.owning_device, route.actual_layout, &route.lease,
-                                             route.has_ready_event, route.ready_event);
-                    if (pp_route_descriptor_debug &&
-                        static_cast<size_t>(route.owning_device) < pp_per_gpu_entries_for_log.size()) {
-                        append_pp_log_entries(pp_per_gpu_entries_for_log[static_cast<size_t>(route.owning_device)],
-                                              row_begin, row_end, static_cast<int32_t>(i02), route.ptr,
-                                              route.owning_device, route.actual_layout, &route.lease);
-                    }
-                    pp_route_dev1++;
-                    pp_entries_dev1 += static_cast<size_t>(num_src1_rows);
-                    continue;
-                } else if (route.kind == moe_expert_route_kind::HOST && route.ptr) {
-                    if (use_expert_cache && has_placement_plan && !route.lease.valid()) {
-                        GGML_ABORT(
-                            "[MOE-ROUTE] planned host PP expert resolved without smart mem_handle tensor=%s "
-                            "expert=%lld "
-                            "layout=%s",
-                            src0 && src0->name ? src0->name : "?", (long long) i02,
-                            ggml_sycl_layout_mode_name(route.actual_layout));
-                    }
-                    if (pp_oor_trace) {
-                        fprintf(stderr,
-                                "[MOE-OOR-TRACE] stage=expert-route tensor=%s expert=%lld rows=%lld kind=%d "
-                                "ptr=%p owning=%d layout=%s reason=%s\n",
-                                src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
-                                (int) route.kind, route.ptr, route.owning_device,
-                                ggml_sycl_layout_mode_name(route.actual_layout),
-                                ggml_sycl_expert_resolve_reason_name(route.reason));
-                    }
-                    auto matched_rows = make_matched_rows(row_begin, row_end);
-                    append_pp_log_entries(pp_host_entries_for_log, row_begin, row_end, static_cast<int32_t>(i02),
-                                          route.ptr, ggml_sycl::mem_handle::HOST_DEVICE, route.actual_layout,
-                                          &route.lease);
-                    enqueue_host_expert_rows(static_cast<int32_t>(i02), std::move(matched_rows), std::move(route.lease),
-                                             route.has_ready_event, route.ready_event);
-                    pp_route_host++;
-                    pp_entries_host += static_cast<size_t>(num_src1_rows);
-                    if (route.plan_found && !route.planned_device_residency) {
-                        pp_planned_host_rows += static_cast<size_t>(num_src1_rows);
-                    } else {
-                        pp_true_host_rows += static_cast<size_t>(num_src1_rows);
-                    }
-                    continue;
-                } else {
-                    pp_route_unavailable++;
-                    pp_entries_unavailable += static_cast<size_t>(num_src1_rows);
-                    if (pp_oor_trace) {
-                        fprintf(stderr,
-                                "[MOE-OOR-TRACE] stage=expert-route tensor=%s expert=%lld rows=%lld kind=%d "
-                                "ptr=%p owning=%d layout=%s reason=%s unavailable=1\n",
-                                src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
-                                (int) route.kind, route.ptr, route.owning_device,
-                                ggml_sycl_layout_mode_name(route.actual_layout),
-                                ggml_sycl_expert_resolve_reason_name(route.reason));
-                    }
-                    if (!ggml_sycl_moe_route_is_layout_miss(route)) {
-                        ggml_sycl_abort_unresolved_device_expert(src0, static_cast<int>(i02), ctx.device, route);
-                        GGML_UNREACHABLE();
-                    }
-                }
-            }
-
-            if (!expert_ptr) {
-                throw ggml_sycl_fallback_error("MUL_MAT_ID selected prompt expert unresolved before submit");
-            }
-
-            const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
-            const auto &       xmx_caps            = ggml_sycl_info().devices[ctx.device].xmx_caps;
-            const unsigned int preferred_sg        = static_cast<unsigned int>(
-                xmx_caps.preferred_sub_group_size ? xmx_caps.preferred_sub_group_size : WARP_SIZE);
-            if (pp_local_trace) {
-                pp_local_accum.active_experts++;
-                pp_local_accum.rows += static_cast<size_t>(num_src1_rows);
-            }
-            auto pp_copy_work_group_size = [&](int64_t cols) -> unsigned int {
-                const unsigned int sg             = std::max(1u, preferred_sg);
-                const unsigned int max_wg         = std::max(sg, std::max(1u, max_work_group_size));
-                // Copy/convert kernels are bandwidth kernels.  The advertised maximum
-                // work-group size is a legal limit, not the right launch shape; use
-                // a few subgroup lanes per row to avoid exhausting per-kernel resources.
-                const unsigned int subgroup_lanes = std::max(sg, max_wg / 4);
-                const unsigned int row_lanes =
-                    cols > 0 ? static_cast<unsigned int>(((static_cast<uint64_t>(cols) + sg - 1) / sg) * sg) : sg;
-                unsigned int wg = std::min(max_wg, std::min(subgroup_lanes, row_lanes));
-                wg              = std::max(sg, wg);
-                wg              = (wg / sg) * sg;
-                return std::max(sg, wg);
+            struct pp_local_trace_accum {
+                double route_resolve_us      = 0.0;
+                double f16_stage_submit_us   = 0.0;
+                double f16_stage_wait_us     = 0.0;
+                double f32_stage_submit_us   = 0.0;
+                double dequant_submit_us     = 0.0;
+                double onednn_submit_us      = 0.0;
+                double onednn_wait_us        = 0.0;
+                double f32_dispatch_us       = 0.0;
+                double dst_scatter_submit_us = 0.0;
+                size_t active_experts        = 0;
+                size_t rows                  = 0;
+                size_t f16_batches           = 0;
+                size_t f32_batches           = 0;
+                size_t f16_fallbacks         = 0;
+                size_t f16_scratch_slots     = 0;
+                size_t dst_scatter_experts   = 0;
             };
-            mmid_row_mapping * dev_row_mapping            = dev_row_mappings.get() + row_begin;
-            const size_t       expert_src1_f32_offset     = row_begin * src1_contiguous_f32_row_bytes;
-            const size_t       expert_src1_f16_offset     = row_begin * src1_contiguous_f16_row_bytes;
-            const size_t       expert_dst_offset          = row_begin * static_cast<size_t>(nb1);
-            char *             dst_contiguous_expert      = dst_contiguous_ptr + expert_dst_offset;
-            auto               src1_contiguous_f32_expert = [&]() -> char * {
-                return src1_contiguous_f32.get() ? src1_contiguous_f32.get() + expert_src1_f32_offset : nullptr;
-            };
-            auto src1_contiguous_f16_expert = [&]() -> char * {
-                return src1_contiguous_f16_ptr ? src1_contiguous_f16_ptr + expert_src1_f16_offset : nullptr;
-            };
-            bool src1_contiguous_f32_current = false;
-            auto copy_src1_current_f32       = [&]() -> bool {
-                if (src1_contiguous_f32_current) {
-                    return true;
-                }
-                if (!ensure_src1_contiguous_f32()) {
-                    return false;
-                }
-                sycl::range<3> block_dims(1, 1, pp_copy_work_group_size(ne10));
-                sycl::range<3> grid_dims(1, 1, num_src1_rows);
-                const auto     f32_submit_start = moe_profile_state::hrc::now();
-                stream->submit([&](sycl::handler & cgh) {
-                    cgh.depends_on(row_mappings_ready);
-                    char * __restrict src1_contiguous_get             = src1_contiguous_f32_expert();
-                    mmid_row_mapping * __restrict dev_row_mapping_get = dev_row_mapping;
-                    cgh.parallel_for(
-                        sycl::nd_range<3>(grid_dims * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-                            k_copy_src1_to_contiguous_mapped(src1_original, src1_contiguous_get, dev_row_mapping_get,
-                                                                   ne11, ne10, nb11, nb12, item_ct1);
-                        });
-                });
-                if (pp_local_trace) {
-                    pp_local_accum.f32_stage_submit_us +=
-                        moe_profile_state::us(f32_submit_start, moe_profile_state::hrc::now());
-                }
-                src1_contiguous_f32_current = true;
-                return true;
-            };
-            auto compare_pp_scratch_cpu = [&](const char * label, int64_t expert_id, int64_t rows, const char * base,
-                                              bool base_is_scattered_dst = false) {
-                if (!pp_scratch_compare || !base || rows <= 0 || ne0 <= 0 || ne10 <= 0) {
+
+            pp_local_trace_accum pp_local_accum;
+            if (pp_moe_onednn_scratch.ok) {
+                pp_local_accum.f16_scratch_slots = 1;
+            }
+            const bool pp_scratch_validate = [] {
+                const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_VALIDATE");
+                return env && std::atoi(env) != 0;
+            }();
+            const int pp_scratch_validate_limit = [] {
+                const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_VALIDATE_LIMIT");
+                return env ? std::max(1, std::atoi(env)) : 64;
+            }();
+            const bool pp_scratch_validate_detail = [] {
+                const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_VALIDATE_DETAIL");
+                return env && std::atoi(env) != 0;
+            }();
+            const bool pp_scratch_compare = [] {
+                const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_COMPARE");
+                return env && std::atoi(env) != 0;
+            }();
+            const int pp_scratch_compare_layer = [] {
+                const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_COMPARE_LAYER");
+                return env ? std::atoi(env) : -1;
+            }();
+            const int pp_scratch_compare_limit = [] {
+                const char * env = std::getenv("GGML_SYCL_MOE_PP_SCRATCH_COMPARE_LIMIT");
+                return env ? std::max(1, std::atoi(env)) : 16;
+            }();
+            auto validate_pp_scratch_rows = [&](const char * label, int64_t expert_id, int64_t rows,
+                                                const char * base) {
+                if (!pp_scratch_validate || !base || rows <= 0 || ne0 <= 0) {
                     return;
                 }
-                if (pp_scratch_compare_layer >= 0 && pp_scratch_compare_layer != blk_layer_id) {
+                static std::atomic<int> validate_count{ 0 };
+                const int               idx = validate_count.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= pp_scratch_validate_limit) {
                     return;
                 }
-                static std::atomic<int> compare_count{ 0 };
-                const int               cmp_idx = compare_count.fetch_add(1, std::memory_order_relaxed);
-                if (cmp_idx >= pp_scratch_compare_limit) {
-                    return;
-                }
-                if (!copy_src1_current_f32()) {
-                    fprintf(stderr,
-                            "[MOE-PP-SCRATCH-COMPARE] label=%s tensor=%s layer=%d role=%s expert=%lld rows=%lld "
-                            "failed=activation-stage\n",
-                            label ? label : "?", src0 && src0->name ? src0->name : "?", blk_layer_id,
-                            moe_tensor_type_name(pp_role), (long long) expert_id, (long long) rows);
-                    return;
-                }
-                const void * weight_base =
-                    src0 && src0->name ? ggml_sycl_cpu_dispatch_get_host_ptr(src0->name) : nullptr;
-                if (!weight_base) {
-                    weight_base = ggml_sycl_host_data(src0);
-                }
-                if (!weight_base || expert_id < 0 || expert_id >= src0->ne[2]) {
-                    fprintf(stderr,
-                            "[MOE-PP-SCRATCH-COMPARE] label=%s tensor=%s layer=%d role=%s expert=%lld rows=%lld "
-                            "failed=weight-host\n",
-                            label ? label : "?", src0 && src0->name ? src0->name : "?", blk_layer_id,
-                            moe_tensor_type_name(pp_role), (long long) expert_id, (long long) rows);
-                    return;
-                }
-                const char * expert_weight = static_cast<const char *>(weight_base) +
-                                             static_cast<size_t>(expert_id) * static_cast<size_t>(src0->nb[2]);
-                const size_t       n_rows   = static_cast<size_t>(rows);
-                const size_t       out_cols = static_cast<size_t>(ne0);
-                const size_t       act_cols = static_cast<size_t>(ne10);
-                std::vector<float> gpu(out_cols * n_rows);
-                std::vector<float> act(act_cols * n_rows);
-                std::vector<float> cpu(out_cols * n_rows);
+                const size_t       row_elems = static_cast<size_t>(ne0);
+                const size_t       n_rows    = static_cast<size_t>(rows);
+                std::vector<float> host(row_elems * n_rows);
                 try {
                     ctx.stream()->wait_and_throw();
-                    if (base_is_scattered_dst) {
-                        for (size_t r = 0; r < n_rows; ++r) {
-                            const mmid_row_mapping & row = row_maps_flat[row_begin + r];
-                            const char *             src_row =
-                                base + static_cast<size_t>(row.i1) * nb1 + static_cast<size_t>(row.i2) * nb2;
-                            ggml_sycl_safe_memcpy_sync(*ctx.stream(), gpu.data() + r * out_cols, src_row,
-                                                       out_cols * sizeof(float));
-                        }
-                    } else {
-                        ggml_sycl_safe_memcpy_sync(*ctx.stream(), gpu.data(), base, gpu.size() * sizeof(float));
-                    }
-                    ggml_sycl_safe_memcpy_sync(*ctx.stream(), act.data(), src1_contiguous_f32_expert(),
-                                               act.size() * sizeof(float));
+                    ggml_sycl_safe_memcpy_sync(*ctx.stream(), host.data(), base, host.size() * sizeof(float));
                 } catch (const std::exception & e) {
                     fprintf(stderr,
-                            "[MOE-PP-SCRATCH-COMPARE] label=%s tensor=%s layer=%d role=%s expert=%lld rows=%lld "
-                            "failed=copy err=%s\n",
-                            label ? label : "?", src0 && src0->name ? src0->name : "?", blk_layer_id,
-                            moe_tensor_type_name(pp_role), (long long) expert_id, (long long) rows, e.what());
+                            "[MOE-PP-SCRATCH] label=%s tensor=%s expert=%lld rows=%lld ne0=%lld copy_failed=%s\n",
+                            label ? label : "?", src0 && src0->name ? src0->name : "?", (long long) expert_id,
+                            (long long) rows, (long long) ne0, e.what());
                     return;
                 }
-                ggml_sycl_cpu_dispatch_buffers_init();
+                size_t finite     = 0;
+                size_t nan        = 0;
+                size_t inf        = 0;
+                float  min_v      = std::numeric_limits<float>::infinity();
+                float  max_v      = -std::numeric_limits<float>::infinity();
+                size_t min_prefix = row_elems;
+                size_t max_prefix = 0;
                 for (size_t r = 0; r < n_rows; ++r) {
-                    cpu_expert_task task{};
-                    task.weight_host = expert_weight;
-                    task.act_host    = act.data() + r * act_cols;
-                    task.output_host = cpu.data() + r * out_cols;
-                    task.type        = src0->type;
-                    task.K           = static_cast<int>(ne10);
-                    task.N           = static_cast<int>(ne0);
-                    ggml_sycl_cpu_expert_mul_mat(task);
-                }
-                double max_abs            = 0.0;
-                double max_rel            = 0.0;
-                size_t max_row            = 0;
-                size_t max_col            = 0;
-                float  max_gpu            = 0.0f;
-                float  max_cpu            = 0.0f;
-                size_t actual_nonfinite   = 0;
-                size_t expect_nonfinite   = 0;
-                size_t nonfinite_mismatch = 0;
-                for (size_t r = 0; r < n_rows; ++r) {
-                    for (size_t c = 0; c < out_cols; ++c) {
-                        const size_t idx = r * out_cols + c;
-                        const float  a   = gpu[idx];
-                        const float  b   = cpu[idx];
-                        const bool   af  = std::isfinite(static_cast<double>(a));
-                        const bool   bf  = std::isfinite(static_cast<double>(b));
-                        if (!af) {
-                            ++actual_nonfinite;
-                        }
-                        if (!bf) {
-                            ++expect_nonfinite;
-                        }
-                        if (!af || !bf) {
-                            if (af != bf || std::signbit(a) != std::signbit(b)) {
-                                ++nonfinite_mismatch;
-                                if (!std::isinf(max_abs)) {
-                                    max_abs = std::numeric_limits<double>::infinity();
-                                    max_rel = std::numeric_limits<double>::infinity();
-                                    max_row = r;
-                                    max_col = c;
-                                    max_gpu = a;
-                                    max_cpu = b;
-                                }
-                            }
-                            continue;
-                        }
-                        const double diff = std::fabs(static_cast<double>(a) - static_cast<double>(b));
-                        if (diff > max_abs) {
-                            max_abs = diff;
-                            max_rel = diff / std::max(1.0, std::fabs(static_cast<double>(b)));
-                            max_row = r;
-                            max_col = c;
-                            max_gpu = a;
-                            max_cpu = b;
+                    size_t prefix = 0;
+                    for (; prefix < row_elems; ++prefix) {
+                        const float v = host[r * row_elems + prefix];
+                        if (!std::isfinite(static_cast<double>(v))) {
+                            break;
                         }
                     }
+                    min_prefix = std::min(min_prefix, prefix);
+                    max_prefix = std::max(max_prefix, prefix);
+                    for (size_t c = 0; c < row_elems; ++c) {
+                        const float v = host[r * row_elems + c];
+                        if (std::isnan(v)) {
+                            ++nan;
+                        } else if (std::isinf(v)) {
+                            ++inf;
+                        } else {
+                            ++finite;
+                            min_v = std::min(min_v, v);
+                            max_v = std::max(max_v, v);
+                        }
+                    }
+                }
+                if (finite == 0) {
+                    min_v = 0.0f;
+                    max_v = 0.0f;
                 }
                 fprintf(stderr,
-                        "[MOE-PP-SCRATCH-COMPARE] label=%s tensor=%s layer=%d role=%s expert=%lld rows=%lld "
-                        "max_abs=%.8g max_rel=%.8g row=%zu col=%zu gpu=%.8g cpu=%.8g actual_nonfinite=%zu "
-                        "expect_nonfinite=%zu nonfinite_mismatch=%zu\n",
+                        "[MOE-PP-SCRATCH] label=%s tensor=%s layer=%d role=%s expert=%lld rows=%lld ne0=%lld "
+                        "finite=%zu nan=%zu inf=%zu min_prefix=%zu max_prefix=%zu min=%g max=%g\n",
                         label ? label : "?", src0 && src0->name ? src0->name : "?", blk_layer_id,
-                        moe_tensor_type_name(pp_role), (long long) expert_id, (long long) rows, max_abs, max_rel,
-                        max_row, max_col, static_cast<double>(max_gpu), static_cast<double>(max_cpu), actual_nonfinite,
-                        expect_nonfinite, nonfinite_mismatch);
-            };
-            auto dispatch_cpu_reference_to_contiguous = [&]() -> bool {
-                if (!pp_cpu_reference || num_src1_rows <= 0 || ne0 <= 0 || ne10 <= 0) {
-                    return false;
-                }
-                if (!copy_src1_current_f32()) {
-                    return false;
-                }
-                const void * weight_base =
-                    src0 && src0->name ? ggml_sycl_cpu_dispatch_get_host_ptr(src0->name) : nullptr;
-                if (!weight_base) {
-                    weight_base = ggml_sycl_host_data(src0);
-                }
-                if (!weight_base || i02 < 0 || i02 >= src0->ne[2]) {
-                    static std::atomic<int> missing_weight_warn{ 0 };
-                    if (missing_weight_warn.fetch_add(1, std::memory_order_relaxed) < 16) {
-                        GGML_LOG_WARN(
-                            "[MOE-PP-CPU-REFERENCE] missing host weight tensor=%s expert=%lld layer=%d role=%s\n",
-                            src0 && src0->name ? src0->name : "?", (long long) i02, blk_layer_id,
-                            moe_tensor_type_name(pp_role));
-                    }
-                    return false;
-                }
-                if (num_src1_rows > std::numeric_limits<int>::max() || ne10 > std::numeric_limits<int>::max() ||
-                    ne0 > std::numeric_limits<int>::max()) {
-                    return false;
-                }
-
-                const char * expert_weight = static_cast<const char *>(weight_base) +
-                                             static_cast<size_t>(i02) * static_cast<size_t>(src0->nb[2]);
-                const size_t       n_rows   = static_cast<size_t>(num_src1_rows);
-                const size_t       act_cols = static_cast<size_t>(ne10);
-                const size_t       out_cols = static_cast<size_t>(ne0);
-                std::vector<float> act(act_cols * n_rows);
-                std::vector<float> out(out_cols * n_rows);
-                try {
-                    ctx.stream()->wait_and_throw();
-                    ggml_sycl_safe_memcpy_sync(*ctx.stream(), act.data(), src1_contiguous_f32_expert(),
-                                               act.size() * sizeof(float));
-                } catch (const std::exception & e) {
-                    static std::atomic<int> copy_warn{ 0 };
-                    if (copy_warn.fetch_add(1, std::memory_order_relaxed) < 16) {
-                        GGML_LOG_WARN(
-                            "[MOE-PP-CPU-REFERENCE] activation copy failed tensor=%s expert=%lld rows=%lld: %s\n",
-                            src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
-                            e.what());
-                    }
-                    return false;
-                }
-
-                std::vector<cpu_expert_task> tasks(n_rows);
-                ggml_sycl_cpu_dispatch_buffers_init();
-                for (size_t r = 0; r < n_rows; ++r) {
-                    tasks[r].weight_host = expert_weight;
-                    tasks[r].act_host    = act.data() + r * act_cols;
-                    tasks[r].output_host = out.data() + r * out_cols;
-                    tasks[r].type        = src0->type;
-                    tasks[r].K           = static_cast<int>(ne10);
-                    tasks[r].N           = static_cast<int>(ne0);
-                }
-                ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
-
-                try {
-                    ggml_sycl_safe_memcpy_sync(*ctx.stream(), dst_contiguous_expert, out.data(),
-                                               out.size() * sizeof(float));
-                } catch (const std::exception & e) {
-                    static std::atomic<int> copy_warn{ 0 };
-                    if (copy_warn.fetch_add(1, std::memory_order_relaxed) < 16) {
-                        GGML_LOG_WARN("[MOE-PP-CPU-REFERENCE] output copy failed tensor=%s expert=%lld rows=%lld: %s\n",
-                                      src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
-                                      e.what());
-                    }
-                    return false;
-                }
-                if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-                    static std::atomic<int> cpu_ref_log{ 0 };
-                    if (cpu_ref_log.fetch_add(1, std::memory_order_relaxed) < 96) {
-                        GGML_LOG_INFO(
-                            "[MOE-PP-CPU-REFERENCE] tensor=%s layer=%d role=%s expert=%lld rows=%lld K=%lld N=%lld\n",
-                            src0 && src0->name ? src0->name : "?", blk_layer_id, moe_tensor_type_name(pp_role),
-                            (long long) i02, (long long) num_src1_rows, (long long) ne10, (long long) ne0);
+                        moe_tensor_type_name(pp_role), (long long) expert_id, (long long) rows, (long long) ne0, finite,
+                        nan, inf, min_prefix, max_prefix, (double) min_v, (double) max_v);
+                if (pp_scratch_validate_detail) {
+                    for (size_t r = 0; r < std::min<size_t>(n_rows, 2); ++r) {
+                        size_t        row_finite = 0;
+                        size_t        first_finite[16];
+                        size_t        first_count = 0;
+                        size_t        last_finite = row_elems;
+                        const float * row         = host.data() + r * row_elems;
+                        for (size_t c = 0; c < row_elems; ++c) {
+                            if (std::isfinite(static_cast<double>(row[c]))) {
+                                if (first_count < 16) {
+                                    first_finite[first_count++] = c;
+                                }
+                                last_finite = c;
+                                ++row_finite;
+                            }
+                        }
+                        fprintf(stderr,
+                                "[MOE-PP-SCRATCH-DETAIL] label=%s tensor=%s layer=%d role=%s expert=%lld row=%zu "
+                                "finite=%zu last_finite=%zu first_finite=",
+                                label ? label : "?", src0 && src0->name ? src0->name : "?", blk_layer_id,
+                                moe_tensor_type_name(pp_role), (long long) expert_id, r, row_finite, last_finite);
+                        for (size_t i = 0; i < first_count; ++i) {
+                            fprintf(stderr, "%s%zu", i == 0 ? "" : ",", first_finite[i]);
+                        }
+                        fprintf(stderr, "\n");
                     }
                 }
-                return true;
             };
 
-            // The f16 arm's only dequant (dequantize_row_mxfp4_soa_to_fp16_rowmajor) reads SOA bytes whatever the op's
-            // route is, so the arm takes only an expert whose bytes are SOA. An expert in any other layout takes the
-            // F32 route, which dispatches at expert_layout.
-            const bool expert_use_mxfp4_soa_f16 =
-                !pp_cpu_reference && pp_mxfp4_soa_f16_ready && num_src1_rows >= 1 && expert_layout == GGML_LAYOUT_SOA;
-
-            bool f16_activation_staged = false;
-            if (expert_use_mxfp4_soa_f16) {
-                sycl::range<3> block_dims(1, 1, pp_copy_work_group_size(ne10));
-                sycl::range<3> grid_dims(1, 1, num_src1_rows);
-                sycl::event    f16_staging_event;
+            auto dispatch_mxfp4_soa_pp_f16_input = [&](const void * expert_ptr, int64_t batch,
+                                                       const void * src1_f16_ptr, void * dst_f32_ptr,
+                                                       pp_local_trace_accum * local_trace) -> bool {
+#if GGML_SYCL_DNNL
+                if (!pp_mxfp4_soa_f16_ready || !expert_ptr || !src1_f16_ptr || !dst_f32_ptr || batch <= 0) {
+                    return false;
+                }
+                if (ne00 <= 0 || ne01 <= 0 || (ne00 % QK_MXFP4) != 0) {
+                    return false;
+                }
+                if (!pp_mxfp4_src0_f16_ptr) {
+                    return false;
+                }
                 try {
-                    const auto f16_submit_start = moe_profile_state::hrc::now();
-                    f16_staging_event           = stream->submit([&](sycl::handler & cgh) {
-                        cgh.depends_on(row_mappings_ready);
-                        char * __restrict src1_contiguous_get             = src1_contiguous_f16_expert();
-                        mmid_row_mapping * __restrict dev_row_mapping_get = dev_row_mapping;
-                        const size_t dst_nb1_f16                          = src1_contiguous_f16_row_bytes;
-                        cgh.parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                                                   [=](sycl::nd_item<3> item_ct1) {
-                                             k_copy_src1_to_contiguous_f16_mapped(src1_original, src1_contiguous_get,
-                                                                                            dev_row_mapping_get, ne11, ne10, nb11,
-                                                                                            nb12, dst_nb1_f16, item_ct1);
-                                         });
-                    });
-                    const auto f16_submit_done  = moe_profile_state::hrc::now();
-                    if (pp_local_trace) {
-                        pp_local_accum.f16_stage_submit_us += moe_profile_state::us(f16_submit_start, f16_submit_done);
+                    const int  blocks_per_row = static_cast<int>(ne00 / QK_MXFP4);
+                    const auto dequant_start  = moe_profile_state::hrc::now();
+                    dequantize_row_mxfp4_soa_to_fp16_rowmajor(static_cast<const char *>(expert_ptr),
+                                                              pp_mxfp4_src0_f16_ptr, blocks_per_row,
+                                                              static_cast<int>(ne01), ctx.stream());
+                    const auto dequant_done = moe_profile_state::hrc::now();
+                    if (!DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(ne01), static_cast<int>(batch),
+                                                   static_cast<int>(ne00), pp_mxfp4_src0_f16_ptr,
+                                                   DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
+                                                   DnnlGemmWrapper::to_dt<sycl::half>(), dst_f32_ptr,
+                                                   DnnlGemmWrapper::to_dt<float>(), ctx.stream())) {
+                        return false;  // a declined scratchpad: the caller's next path, as the catches below
                     }
-                    f16_activation_staged = true;
+                    const auto gemm_submit_done = moe_profile_state::hrc::now();
+                    if (local_trace) {
+                        local_trace->dequant_submit_us += moe_profile_state::us(dequant_start, dequant_done);
+                        local_trace->onednn_submit_us += moe_profile_state::us(dequant_done, gemm_submit_done);
+                        local_trace->f16_batches++;
+                    }
+                    return true;
                 } catch (const std::exception & e) {
                     static std::atomic<int> warned{ 0 };
                     if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
-                        GGML_LOG_WARN(
-                            "[MXFP4-DIRECT] SOA PP f16 activation staging failed for %s expert=%lld rows=%lld; "
-                            "falling back to F32 route: %s\n",
-                            src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows, e.what());
+                        GGML_LOG_WARN("[MXFP4-DIRECT] oneDNN SOA PP f16-input failed: %s\n", e.what());
                     }
-                    pp_mxfp4_soa_f16_ready = false;
+                    return false;
                 } catch (...) {
                     static std::atomic<int> warned{ 0 };
                     if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
-                        GGML_LOG_WARN(
-                            "[MXFP4-DIRECT] SOA PP f16 activation staging failed for %s expert=%lld rows=%lld with "
-                            "unknown exception; falling back to F32 route\n",
-                            src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows);
+                        GGML_LOG_WARN("[MXFP4-DIRECT] oneDNN SOA PP f16-input failed with unknown exception\n");
                     }
-                    pp_mxfp4_soa_f16_ready = false;
+                    return false;
                 }
-            }
-            if (!expert_use_mxfp4_soa_f16 && !copy_src1_current_f32()) {
-                GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for %s rows=%lld row_bytes=%zu",
-                           src0->name ? src0->name : "?", (long long) num_src1_rows, src1_contiguous_f32_row_bytes);
-            }
-            if (pp_oor_trace && !f16_activation_staged) {
-                pp_trace_wait("activation-staged", i02, num_src1_rows);
-            } else if (pp_oor_trace) {
-                fprintf(stderr,
+#else
+                GGML_UNUSED(expert_ptr);
+                GGML_UNUSED(batch);
+                GGML_UNUSED(src1_f16_ptr);
+                GGML_UNUSED(dst_f32_ptr);
+                GGML_UNUSED(local_trace);
+                return false;
+#endif
+            };
+
+            size_t pp_route_dev0                           = 0;
+            size_t pp_route_dev1                           = 0;
+            size_t pp_route_host                           = 0;
+            size_t pp_route_unavailable                    = 0;
+            size_t pp_route_localized                      = 0;
+            size_t pp_route_host_rerouted                  = 0;
+            size_t pp_planned_device_to_host_fallback_rows = 0;
+            size_t pp_planned_host_rows                    = 0;
+            size_t pp_true_host_rows                       = 0;
+            size_t pp_unsupported_device_rows              = 0;
+            size_t pp_entries_dev0                         = 0;
+            size_t pp_entries_dev1                         = 0;
+            size_t pp_entries_host                         = 0;
+            size_t pp_entries_unavailable                  = 0;
+            for (int64_t i02 = 0; i02 < n_as; i02++) {
+                const size_t  row_begin     = row_map_offsets[static_cast<size_t>(i02)];
+                const size_t  row_end       = row_map_offsets[static_cast<size_t>(i02) + 1];
+                const int64_t num_src1_rows = static_cast<int64_t>(row_end - row_begin);
+                if (num_src1_rows == 0) {
+                    continue;
+                }
+                const void *          expert_ptr = nullptr;
+                ggml_sycl::mem_handle expert_gpu_lease{};
+                // The layout of the bytes expert_gpu_lease holds. The slice storage installed from that lease and the
+                // layout forced on the matmul below both read this one variable, so the kernel is chosen for the
+                // layout the operand is in. Only a local expert reaches those consumers (any other route continues or
+                // throws before them, as does an expert left without a pointer), and it takes the layout from its
+                // route, whose lease the resolver checked to resolve at that layout; the initial value is never read.
+                layout_mode           expert_layout = route_layout;
+
+                if (ne12 != 1) {
+                    const auto       route_resolve_start = moe_profile_state::hrc::now();
+                    moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));
+                    if (pp_local_trace) {
+                        pp_local_accum.route_resolve_us +=
+                            moe_profile_state::us(route_resolve_start, moe_profile_state::hrc::now());
+                    }
+                    if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr) {
+                        const bool queue_ready = route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
+                                                 ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
+                                                     ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(
+                                                         route.owning_device, mmid_owner_ptr));
+                        const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
+                            src0->type, route.actual_layout, moe_route_phase::PROMPT, src0->ne[0], src0->ne[1],
+                            static_cast<size_t>(num_src1_rows), route.owning_device, moe_layer_route_residency::DEVICE,
+                            ctx.device);
+                        if (!queue_ready || !cap.supported) {
+                            pp_unsupported_device_rows += static_cast<size_t>(num_src1_rows);
+                            throw ggml_sycl_fallback_error(
+                                "MUL_MAT_ID retained prompt secondary executor refused exact handle");
+                        }
+                    }
+                    if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr) {
+                        if (route.has_ready_event) {
+                            stream->ext_oneapi_submit_barrier({ route.ready_event });
+                        }
+                        if (use_expert_cache && has_placement_plan && !route.lease.valid()) {
+                            GGML_ABORT(
+                                "[MOE-ROUTE] planned local PP expert resolved without smart mem_handle tensor=%s "
+                                "expert=%lld "
+                                "layout=%s device=%d",
+                                src0 && src0->name ? src0->name : "?", (long long) i02,
+                                ggml_sycl_layout_mode_name(route.actual_layout), ctx.device);
+                        }
+                        expert_ptr       = route.ptr;
+                        expert_gpu_lease = std::move(route.lease);
+                        expert_layout    = route.actual_layout;
+                        pp_route_dev0++;
+                        if (pp_oor_trace) {
+                            fprintf(stderr,
+                                    "[MOE-OOR-TRACE] stage=expert-route tensor=%s expert=%lld rows=%lld kind=%d "
+                                    "ptr=%p owning=%d layout=%s reason=%s\n",
+                                    src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
+                                    (int) route.kind, route.ptr, route.owning_device,
+                                    ggml_sycl_layout_mode_name(route.actual_layout),
+                                    ggml_sycl_expert_resolve_reason_name(route.reason));
+                        }
+                    } else if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr &&
+                               route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
+                               ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
+                                   ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device,
+                                                                                             mmid_owner_ptr))) {
+                        if (use_expert_cache && has_placement_plan && !route.lease.valid()) {
+                            GGML_ABORT(
+                                "[MOE-ROUTE] planned secondary PP expert resolved without smart mem_handle tensor=%s "
+                                "expert=%lld layout=%s device=%d",
+                                src0 && src0->name ? src0->name : "?", (long long) i02,
+                                ggml_sycl_layout_mode_name(route.actual_layout), route.owning_device);
+                        }
+                        if (pp_oor_trace) {
+                            fprintf(stderr,
+                                    "[MOE-OOR-TRACE] stage=expert-route tensor=%s expert=%lld rows=%lld kind=%d "
+                                    "ptr=%p owning=%d layout=%s reason=%s\n",
+                                    src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
+                                    (int) route.kind, route.ptr, route.owning_device,
+                                    ggml_sycl_layout_mode_name(route.actual_layout),
+                                    ggml_sycl_expert_resolve_reason_name(route.reason));
+                        }
+                        std::vector<expert_dispatch_entry> & sec_entries =
+                            pp_secondary_entries_by_device[static_cast<size_t>(route.owning_device)];
+                        append_secondary_entries(sec_entries, row_begin, row_end, static_cast<int32_t>(i02), route.ptr,
+                                                 route.owning_device, route.actual_layout, &route.lease,
+                                                 route.has_ready_event, route.ready_event);
+                        if (pp_route_descriptor_debug &&
+                            static_cast<size_t>(route.owning_device) < pp_per_gpu_entries_for_log.size()) {
+                            append_pp_log_entries(pp_per_gpu_entries_for_log[static_cast<size_t>(route.owning_device)],
+                                                  row_begin, row_end, static_cast<int32_t>(i02), route.ptr,
+                                                  route.owning_device, route.actual_layout, &route.lease);
+                        }
+                        pp_route_dev1++;
+                        pp_entries_dev1 += static_cast<size_t>(num_src1_rows);
+                        continue;
+                    } else if (route.kind == moe_expert_route_kind::HOST && route.ptr) {
+                        if (use_expert_cache && has_placement_plan && !route.lease.valid()) {
+                            GGML_ABORT(
+                                "[MOE-ROUTE] planned host PP expert resolved without smart mem_handle tensor=%s "
+                                "expert=%lld "
+                                "layout=%s",
+                                src0 && src0->name ? src0->name : "?", (long long) i02,
+                                ggml_sycl_layout_mode_name(route.actual_layout));
+                        }
+                        if (pp_oor_trace) {
+                            fprintf(stderr,
+                                    "[MOE-OOR-TRACE] stage=expert-route tensor=%s expert=%lld rows=%lld kind=%d "
+                                    "ptr=%p owning=%d layout=%s reason=%s\n",
+                                    src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
+                                    (int) route.kind, route.ptr, route.owning_device,
+                                    ggml_sycl_layout_mode_name(route.actual_layout),
+                                    ggml_sycl_expert_resolve_reason_name(route.reason));
+                        }
+                        auto matched_rows = make_matched_rows(row_begin, row_end);
+                        append_pp_log_entries(pp_host_entries_for_log, row_begin, row_end, static_cast<int32_t>(i02),
+                                              route.ptr, ggml_sycl::mem_handle::HOST_DEVICE, route.actual_layout,
+                                              &route.lease);
+                        enqueue_host_expert_rows(static_cast<int32_t>(i02), std::move(matched_rows),
+                                                 std::move(route.lease), route.has_ready_event, route.ready_event);
+                        pp_route_host++;
+                        pp_entries_host += static_cast<size_t>(num_src1_rows);
+                        if (route.plan_found && !route.planned_device_residency) {
+                            pp_planned_host_rows += static_cast<size_t>(num_src1_rows);
+                        } else {
+                            pp_true_host_rows += static_cast<size_t>(num_src1_rows);
+                        }
+                        continue;
+                    } else {
+                        pp_route_unavailable++;
+                        pp_entries_unavailable += static_cast<size_t>(num_src1_rows);
+                        if (pp_oor_trace) {
+                            fprintf(stderr,
+                                    "[MOE-OOR-TRACE] stage=expert-route tensor=%s expert=%lld rows=%lld kind=%d "
+                                    "ptr=%p owning=%d layout=%s reason=%s unavailable=1\n",
+                                    src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
+                                    (int) route.kind, route.ptr, route.owning_device,
+                                    ggml_sycl_layout_mode_name(route.actual_layout),
+                                    ggml_sycl_expert_resolve_reason_name(route.reason));
+                        }
+                        if (!ggml_sycl_moe_route_is_layout_miss(route)) {
+                            ggml_sycl_abort_unresolved_device_expert(src0, static_cast<int>(i02), ctx.device, route);
+                            GGML_UNREACHABLE();
+                        }
+                    }
+                }
+
+                if (!expert_ptr) {
+                    throw ggml_sycl_fallback_error("MUL_MAT_ID selected prompt expert unresolved before submit");
+                }
+
+                const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
+                const auto &       xmx_caps            = ggml_sycl_info().devices[ctx.device].xmx_caps;
+                const unsigned int preferred_sg        = static_cast<unsigned int>(
+                    xmx_caps.preferred_sub_group_size ? xmx_caps.preferred_sub_group_size : WARP_SIZE);
+                if (pp_local_trace) {
+                    pp_local_accum.active_experts++;
+                    pp_local_accum.rows += static_cast<size_t>(num_src1_rows);
+                }
+                auto pp_copy_work_group_size = [&](int64_t cols) -> unsigned int {
+                    const unsigned int sg             = std::max(1u, preferred_sg);
+                    const unsigned int max_wg         = std::max(sg, std::max(1u, max_work_group_size));
+                    // Copy/convert kernels are bandwidth kernels.  The advertised maximum
+                    // work-group size is a legal limit, not the right launch shape; use
+                    // a few subgroup lanes per row to avoid exhausting per-kernel resources.
+                    const unsigned int subgroup_lanes = std::max(sg, max_wg / 4);
+                    const unsigned int row_lanes =
+                        cols > 0 ? static_cast<unsigned int>(((static_cast<uint64_t>(cols) + sg - 1) / sg) * sg) : sg;
+                    unsigned int wg = std::min(max_wg, std::min(subgroup_lanes, row_lanes));
+                    wg              = std::max(sg, wg);
+                    wg              = (wg / sg) * sg;
+                    return std::max(sg, wg);
+                };
+                mmid_row_mapping * dev_row_mapping            = dev_row_mappings.get() + row_begin;
+                const size_t       expert_src1_f32_offset     = row_begin * src1_contiguous_f32_row_bytes;
+                const size_t       expert_src1_f16_offset     = row_begin * src1_contiguous_f16_row_bytes;
+                const size_t       expert_dst_offset          = row_begin * static_cast<size_t>(nb1);
+                char *             dst_contiguous_expert      = dst_contiguous_ptr + expert_dst_offset;
+                auto               src1_contiguous_f32_expert = [&]() -> char * {
+                    return src1_contiguous_f32.get() ? src1_contiguous_f32.get() + expert_src1_f32_offset : nullptr;
+                };
+                auto src1_contiguous_f16_expert = [&]() -> char * {
+                    return src1_contiguous_f16_ptr ? src1_contiguous_f16_ptr + expert_src1_f16_offset : nullptr;
+                };
+                bool src1_contiguous_f32_current = false;
+                auto copy_src1_current_f32       = [&]() -> bool {
+                    if (src1_contiguous_f32_current) {
+                        return true;
+                    }
+                    if (!ensure_src1_contiguous_f32()) {
+                        return false;
+                    }
+                    sycl::range<3> block_dims(1, 1, pp_copy_work_group_size(ne10));
+                    sycl::range<3> grid_dims(1, 1, num_src1_rows);
+                    const auto     f32_submit_start = moe_profile_state::hrc::now();
+                    stream->submit([&](sycl::handler & cgh) {
+                        cgh.depends_on(row_mappings_ready);
+                        char * __restrict src1_contiguous_get             = src1_contiguous_f32_expert();
+                        mmid_row_mapping * __restrict dev_row_mapping_get = dev_row_mapping;
+                        cgh.parallel_for(
+                            sycl::nd_range<3>(grid_dims * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
+                                k_copy_src1_to_contiguous_mapped(src1_original, src1_contiguous_get,
+                                                                       dev_row_mapping_get, ne11, ne10, nb11, nb12, item_ct1);
+                            });
+                    });
+                    if (pp_local_trace) {
+                        pp_local_accum.f32_stage_submit_us +=
+                            moe_profile_state::us(f32_submit_start, moe_profile_state::hrc::now());
+                    }
+                    src1_contiguous_f32_current = true;
+                    return true;
+                };
+                auto compare_pp_scratch_cpu = [&](const char * label, int64_t expert_id, int64_t rows,
+                                                  const char * base, bool base_is_scattered_dst = false) {
+                    if (!pp_scratch_compare || !base || rows <= 0 || ne0 <= 0 || ne10 <= 0) {
+                        return;
+                    }
+                    if (pp_scratch_compare_layer >= 0 && pp_scratch_compare_layer != blk_layer_id) {
+                        return;
+                    }
+                    static std::atomic<int> compare_count{ 0 };
+                    const int               cmp_idx = compare_count.fetch_add(1, std::memory_order_relaxed);
+                    if (cmp_idx >= pp_scratch_compare_limit) {
+                        return;
+                    }
+                    if (!copy_src1_current_f32()) {
+                        fprintf(stderr,
+                                "[MOE-PP-SCRATCH-COMPARE] label=%s tensor=%s layer=%d role=%s expert=%lld rows=%lld "
+                                "failed=activation-stage\n",
+                                label ? label : "?", src0 && src0->name ? src0->name : "?", blk_layer_id,
+                                moe_tensor_type_name(pp_role), (long long) expert_id, (long long) rows);
+                        return;
+                    }
+                    const void * weight_base =
+                        src0 && src0->name ? ggml_sycl_cpu_dispatch_get_host_ptr(src0->name) : nullptr;
+                    if (!weight_base) {
+                        weight_base = ggml_sycl_host_data(src0);
+                    }
+                    if (!weight_base || expert_id < 0 || expert_id >= src0->ne[2]) {
+                        fprintf(stderr,
+                                "[MOE-PP-SCRATCH-COMPARE] label=%s tensor=%s layer=%d role=%s expert=%lld rows=%lld "
+                                "failed=weight-host\n",
+                                label ? label : "?", src0 && src0->name ? src0->name : "?", blk_layer_id,
+                                moe_tensor_type_name(pp_role), (long long) expert_id, (long long) rows);
+                        return;
+                    }
+                    const char * expert_weight = static_cast<const char *>(weight_base) +
+                                                 static_cast<size_t>(expert_id) * static_cast<size_t>(src0->nb[2]);
+                    const size_t       n_rows   = static_cast<size_t>(rows);
+                    const size_t       out_cols = static_cast<size_t>(ne0);
+                    const size_t       act_cols = static_cast<size_t>(ne10);
+                    std::vector<float> gpu(out_cols * n_rows);
+                    std::vector<float> act(act_cols * n_rows);
+                    std::vector<float> cpu(out_cols * n_rows);
+                    try {
+                        ctx.stream()->wait_and_throw();
+                        if (base_is_scattered_dst) {
+                            for (size_t r = 0; r < n_rows; ++r) {
+                                const mmid_row_mapping & row = row_maps_flat[row_begin + r];
+                                const char *             src_row =
+                                    base + static_cast<size_t>(row.i1) * nb1 + static_cast<size_t>(row.i2) * nb2;
+                                ggml_sycl_safe_memcpy_sync(*ctx.stream(), gpu.data() + r * out_cols, src_row,
+                                                           out_cols * sizeof(float));
+                            }
+                        } else {
+                            ggml_sycl_safe_memcpy_sync(*ctx.stream(), gpu.data(), base, gpu.size() * sizeof(float));
+                        }
+                        ggml_sycl_safe_memcpy_sync(*ctx.stream(), act.data(), src1_contiguous_f32_expert(),
+                                                   act.size() * sizeof(float));
+                    } catch (const std::exception & e) {
+                        fprintf(stderr,
+                                "[MOE-PP-SCRATCH-COMPARE] label=%s tensor=%s layer=%d role=%s expert=%lld rows=%lld "
+                                "failed=copy err=%s\n",
+                                label ? label : "?", src0 && src0->name ? src0->name : "?", blk_layer_id,
+                                moe_tensor_type_name(pp_role), (long long) expert_id, (long long) rows, e.what());
+                        return;
+                    }
+                    ggml_sycl_cpu_dispatch_buffers_init();
+                    for (size_t r = 0; r < n_rows; ++r) {
+                        cpu_expert_task task{};
+                        task.weight_host = expert_weight;
+                        task.act_host    = act.data() + r * act_cols;
+                        task.output_host = cpu.data() + r * out_cols;
+                        task.type        = src0->type;
+                        task.K           = static_cast<int>(ne10);
+                        task.N           = static_cast<int>(ne0);
+                        ggml_sycl_cpu_expert_mul_mat(task);
+                    }
+                    double max_abs            = 0.0;
+                    double max_rel            = 0.0;
+                    size_t max_row            = 0;
+                    size_t max_col            = 0;
+                    float  max_gpu            = 0.0f;
+                    float  max_cpu            = 0.0f;
+                    size_t actual_nonfinite   = 0;
+                    size_t expect_nonfinite   = 0;
+                    size_t nonfinite_mismatch = 0;
+                    for (size_t r = 0; r < n_rows; ++r) {
+                        for (size_t c = 0; c < out_cols; ++c) {
+                            const size_t idx = r * out_cols + c;
+                            const float  a   = gpu[idx];
+                            const float  b   = cpu[idx];
+                            const bool   af  = std::isfinite(static_cast<double>(a));
+                            const bool   bf  = std::isfinite(static_cast<double>(b));
+                            if (!af) {
+                                ++actual_nonfinite;
+                            }
+                            if (!bf) {
+                                ++expect_nonfinite;
+                            }
+                            if (!af || !bf) {
+                                if (af != bf || std::signbit(a) != std::signbit(b)) {
+                                    ++nonfinite_mismatch;
+                                    if (!std::isinf(max_abs)) {
+                                        max_abs = std::numeric_limits<double>::infinity();
+                                        max_rel = std::numeric_limits<double>::infinity();
+                                        max_row = r;
+                                        max_col = c;
+                                        max_gpu = a;
+                                        max_cpu = b;
+                                    }
+                                }
+                                continue;
+                            }
+                            const double diff = std::fabs(static_cast<double>(a) - static_cast<double>(b));
+                            if (diff > max_abs) {
+                                max_abs = diff;
+                                max_rel = diff / std::max(1.0, std::fabs(static_cast<double>(b)));
+                                max_row = r;
+                                max_col = c;
+                                max_gpu = a;
+                                max_cpu = b;
+                            }
+                        }
+                    }
+                    fprintf(stderr,
+                            "[MOE-PP-SCRATCH-COMPARE] label=%s tensor=%s layer=%d role=%s expert=%lld rows=%lld "
+                            "max_abs=%.8g max_rel=%.8g row=%zu col=%zu gpu=%.8g cpu=%.8g actual_nonfinite=%zu "
+                            "expect_nonfinite=%zu nonfinite_mismatch=%zu\n",
+                            label ? label : "?", src0 && src0->name ? src0->name : "?", blk_layer_id,
+                            moe_tensor_type_name(pp_role), (long long) expert_id, (long long) rows, max_abs, max_rel,
+                            max_row, max_col, static_cast<double>(max_gpu), static_cast<double>(max_cpu),
+                            actual_nonfinite, expect_nonfinite, nonfinite_mismatch);
+                };
+                auto dispatch_cpu_reference_to_contiguous = [&]() -> bool {
+                    if (!pp_cpu_reference || num_src1_rows <= 0 || ne0 <= 0 || ne10 <= 0) {
+                        return false;
+                    }
+                    if (!copy_src1_current_f32()) {
+                        return false;
+                    }
+                    const void * weight_base =
+                        src0 && src0->name ? ggml_sycl_cpu_dispatch_get_host_ptr(src0->name) : nullptr;
+                    if (!weight_base) {
+                        weight_base = ggml_sycl_host_data(src0);
+                    }
+                    if (!weight_base || i02 < 0 || i02 >= src0->ne[2]) {
+                        static std::atomic<int> missing_weight_warn{ 0 };
+                        if (missing_weight_warn.fetch_add(1, std::memory_order_relaxed) < 16) {
+                            GGML_LOG_WARN(
+                                "[MOE-PP-CPU-REFERENCE] missing host weight tensor=%s expert=%lld layer=%d role=%s\n",
+                                src0 && src0->name ? src0->name : "?", (long long) i02, blk_layer_id,
+                                moe_tensor_type_name(pp_role));
+                        }
+                        return false;
+                    }
+                    if (num_src1_rows > std::numeric_limits<int>::max() || ne10 > std::numeric_limits<int>::max() ||
+                        ne0 > std::numeric_limits<int>::max()) {
+                        return false;
+                    }
+
+                    const char * expert_weight = static_cast<const char *>(weight_base) +
+                                                 static_cast<size_t>(i02) * static_cast<size_t>(src0->nb[2]);
+                    const size_t       n_rows   = static_cast<size_t>(num_src1_rows);
+                    const size_t       act_cols = static_cast<size_t>(ne10);
+                    const size_t       out_cols = static_cast<size_t>(ne0);
+                    std::vector<float> act(act_cols * n_rows);
+                    std::vector<float> out(out_cols * n_rows);
+                    try {
+                        ctx.stream()->wait_and_throw();
+                        ggml_sycl_safe_memcpy_sync(*ctx.stream(), act.data(), src1_contiguous_f32_expert(),
+                                                   act.size() * sizeof(float));
+                    } catch (const std::exception & e) {
+                        static std::atomic<int> copy_warn{ 0 };
+                        if (copy_warn.fetch_add(1, std::memory_order_relaxed) < 16) {
+                            GGML_LOG_WARN(
+                                "[MOE-PP-CPU-REFERENCE] activation copy failed tensor=%s expert=%lld rows=%lld: %s\n",
+                                src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
+                                e.what());
+                        }
+                        return false;
+                    }
+
+                    std::vector<cpu_expert_task> tasks(n_rows);
+                    ggml_sycl_cpu_dispatch_buffers_init();
+                    for (size_t r = 0; r < n_rows; ++r) {
+                        tasks[r].weight_host = expert_weight;
+                        tasks[r].act_host    = act.data() + r * act_cols;
+                        tasks[r].output_host = out.data() + r * out_cols;
+                        tasks[r].type        = src0->type;
+                        tasks[r].K           = static_cast<int>(ne10);
+                        tasks[r].N           = static_cast<int>(ne0);
+                    }
+                    ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
+
+                    try {
+                        ggml_sycl_safe_memcpy_sync(*ctx.stream(), dst_contiguous_expert, out.data(),
+                                                   out.size() * sizeof(float));
+                    } catch (const std::exception & e) {
+                        static std::atomic<int> copy_warn{ 0 };
+                        if (copy_warn.fetch_add(1, std::memory_order_relaxed) < 16) {
+                            GGML_LOG_WARN(
+                                "[MOE-PP-CPU-REFERENCE] output copy failed tensor=%s expert=%lld rows=%lld: %s\n",
+                                src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
+                                e.what());
+                        }
+                        return false;
+                    }
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        static std::atomic<int> cpu_ref_log{ 0 };
+                        if (cpu_ref_log.fetch_add(1, std::memory_order_relaxed) < 96) {
+                            GGML_LOG_INFO(
+                                "[MOE-PP-CPU-REFERENCE] tensor=%s layer=%d role=%s expert=%lld rows=%lld K=%lld "
+                                "N=%lld\n",
+                                src0 && src0->name ? src0->name : "?", blk_layer_id, moe_tensor_type_name(pp_role),
+                                (long long) i02, (long long) num_src1_rows, (long long) ne10, (long long) ne0);
+                        }
+                    }
+                    return true;
+                };
+
+                // The f16 arm's only dequant (dequantize_row_mxfp4_soa_to_fp16_rowmajor) reads SOA bytes whatever the
+                // op's route is, so the arm takes only an expert whose bytes are SOA. An expert in any other layout
+                // takes the F32 route, which dispatches at expert_layout.
+                const bool expert_use_mxfp4_soa_f16 = !pp_cpu_reference && pp_mxfp4_soa_f16_ready &&
+                                                      num_src1_rows >= 1 && expert_layout == GGML_LAYOUT_SOA;
+
+                bool f16_activation_staged = false;
+                if (expert_use_mxfp4_soa_f16) {
+                    sycl::range<3> block_dims(1, 1, pp_copy_work_group_size(ne10));
+                    sycl::range<3> grid_dims(1, 1, num_src1_rows);
+                    sycl::event    f16_staging_event;
+                    try {
+                        const auto f16_submit_start = moe_profile_state::hrc::now();
+                        f16_staging_event           = stream->submit([&](sycl::handler & cgh) {
+                            cgh.depends_on(row_mappings_ready);
+                            char * __restrict src1_contiguous_get             = src1_contiguous_f16_expert();
+                            mmid_row_mapping * __restrict dev_row_mapping_get = dev_row_mapping;
+                            const size_t dst_nb1_f16                          = src1_contiguous_f16_row_bytes;
+                            cgh.parallel_for(
+                                sycl::nd_range<3>(grid_dims * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
+                                    k_copy_src1_to_contiguous_f16_mapped(src1_original, src1_contiguous_get,
+                                                                                   dev_row_mapping_get, ne11, ne10, nb11, nb12,
+                                                                                   dst_nb1_f16, item_ct1);
+                                });
+                        });
+                        const auto f16_submit_done  = moe_profile_state::hrc::now();
+                        if (pp_local_trace) {
+                            pp_local_accum.f16_stage_submit_us +=
+                                moe_profile_state::us(f16_submit_start, f16_submit_done);
+                        }
+                        f16_activation_staged = true;
+                    } catch (const std::exception & e) {
+                        static std::atomic<int> warned{ 0 };
+                        if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
+                            GGML_LOG_WARN(
+                                "[MXFP4-DIRECT] SOA PP f16 activation staging failed for %s expert=%lld rows=%lld; "
+                                "falling back to F32 route: %s\n",
+                                src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows, e.what());
+                        }
+                        pp_mxfp4_soa_f16_ready = false;
+                    } catch (...) {
+                        static std::atomic<int> warned{ 0 };
+                        if (warned.fetch_add(1, std::memory_order_relaxed) < 4) {
+                            GGML_LOG_WARN(
+                                "[MXFP4-DIRECT] SOA PP f16 activation staging failed for %s expert=%lld rows=%lld with "
+                                "unknown exception; falling back to F32 route\n",
+                                src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows);
+                        }
+                        pp_mxfp4_soa_f16_ready = false;
+                    }
+                }
+                if (!expert_use_mxfp4_soa_f16 && !copy_src1_current_f32()) {
+                    refuse_src1_f32_staging();
+                }
+                if (pp_oor_trace && !f16_activation_staged) {
+                    pp_trace_wait("activation-staged", i02, num_src1_rows);
+                } else if (pp_oor_trace) {
+                    fprintf(
+                        stderr,
                         "[MOE-OOR-TRACE] stage=activation-staged tensor=%s expert=%lld rows=%lld f16_event_wait=1\n",
                         src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows);
-            }
-            auto dispatch_f32_batches = [&]() {
-                if (!copy_src1_current_f32()) {
-                    GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for %s rows=%lld row_bytes=%zu",
-                               src0->name ? src0->name : "?", (long long) num_src1_rows, src1_contiguous_f32_row_bytes);
                 }
-                const int64_t max_batch_f32 = std::max<int64_t>(1, MMQ_MAX_BATCH_SIZE);
-                int64_t       batch_start   = 0;
-                while (batch_start < num_src1_rows) {
-                    const int64_t batch       = std::min<int64_t>(max_batch_f32, num_src1_rows - batch_start);
-                    const size_t  src1_offset = static_cast<size_t>(batch_start) * src1_contiguous_f32_row_bytes;
-                    const size_t  dst_offset  = static_cast<size_t>(batch_start) * nb1;
-                    src1_row.ne[1]            = batch;
-                    src1_row.nb[2]            = batch * nb11;
-                    src1_row.nb[3]            = batch * nb11;
-                    src1_row.data             = src1_contiguous_f32_expert() + src1_offset;
-                    dst_row.ne[1]             = batch;
-                    dst_row.nb[2]             = batch * nb1;
-                    dst_row.nb[3]             = batch * nb1;
-                    dst_row.data              = dst_contiguous_expert + dst_offset;
-                    const auto dispatch_start = moe_profile_state::hrc::now();
-                    ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &expert_layout);
+                auto dispatch_f32_batches = [&]() {
+                    if (!copy_src1_current_f32()) {
+                        refuse_src1_f32_staging();
+                    }
+                    const int64_t max_batch_f32 = std::max<int64_t>(1, MMQ_MAX_BATCH_SIZE);
+                    int64_t       batch_start   = 0;
+                    while (batch_start < num_src1_rows) {
+                        const int64_t batch       = std::min<int64_t>(max_batch_f32, num_src1_rows - batch_start);
+                        const size_t  src1_offset = static_cast<size_t>(batch_start) * src1_contiguous_f32_row_bytes;
+                        const size_t  dst_offset  = static_cast<size_t>(batch_start) * nb1;
+                        src1_row.ne[1]            = batch;
+                        src1_row.nb[2]            = batch * nb11;
+                        src1_row.nb[3]            = batch * nb11;
+                        src1_row.data             = src1_contiguous_f32_expert() + src1_offset;
+                        dst_row.ne[1]             = batch;
+                        dst_row.nb[2]             = batch * nb1;
+                        dst_row.nb[3]             = batch * nb1;
+                        dst_row.data              = dst_contiguous_expert + dst_offset;
+                        const auto dispatch_start = moe_profile_state::hrc::now();
+                        ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &expert_layout);
+                        if (pp_local_trace) {
+                            pp_local_accum.f32_dispatch_us +=
+                                moe_profile_state::us(dispatch_start, moe_profile_state::hrc::now());
+                            pp_local_accum.f32_batches++;
+                        }
+                        batch_start += batch;
+                    }
+                };
+                append_pp_log_entries(pp_local_entries_for_log, row_begin, row_end, static_cast<int32_t>(i02),
+                                      expert_ptr, ctx.device, expert_layout, &expert_gpu_lease);
+                install_expert_slice_storage(const_cast<void *>(expert_ptr), static_cast<int>(i02), expert_layout,
+                                             &expert_gpu_lease);
+                if (expert_gpu_lease.resolve(ctx.device).ptr != nullptr) {
+                    pp_gpu_leases.push_back(std::move(expert_gpu_lease));
+                }
+                GGML_ASSERT(nb11 == sizeof(float) * ne10);
+
+                GGML_ASSERT(nb1 == sizeof(float) * ne0);
+                src1_row.ne[1] = num_src1_rows;
+                src1_row.nb[1] = nb11;
+                dst_row.nb[1]  = nb1;
+
+                bool f16_dispatched_all       = false;
+                bool cpu_reference_dispatched = false;
+                if (pp_cpu_reference) {
+                    cpu_reference_dispatched = dispatch_cpu_reference_to_contiguous();
+                    if (!cpu_reference_dispatched) {
+                        GGML_ABORT("[MOE-PP-CPU-REFERENCE] failed tensor=%s expert=%lld rows=%lld layer=%d role=%s",
+                                   src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
+                                   blk_layer_id, moe_tensor_type_name(pp_role));
+                    }
+                } else if (expert_use_mxfp4_soa_f16) {
+                    f16_dispatched_all        = true;
+                    const int64_t max_batch   = std::max<int64_t>(1, MMQ_MAX_BATCH_SIZE);
+                    int64_t       batch_start = 0;
+                    while (batch_start < num_src1_rows) {
+                        const int64_t batch       = std::min<int64_t>(max_batch, num_src1_rows - batch_start);
+                        const size_t  src1_offset = static_cast<size_t>(batch_start) * src1_contiguous_f16_row_bytes;
+                        const size_t  dst_offset  = static_cast<size_t>(batch_start) * nb1;
+                        dst_row.ne[1]             = batch;
+                        dst_row.nb[2]             = batch * nb1;
+                        dst_row.nb[3]             = batch * nb1;
+                        dst_row.data              = dst_contiguous_expert + dst_offset;
+                        const bool dispatched     = dispatch_mxfp4_soa_pp_f16_input(
+                            expert_ptr, batch, src1_contiguous_f16_expert() + src1_offset,
+                            dst_contiguous_expert + dst_offset, pp_local_trace ? &pp_local_accum : nullptr);
+                        if (!dispatched) {
+                            f16_dispatched_all = false;
+                            break;
+                        }
+                        batch_start += batch;
+                    }
+                }
+                if (!pp_cpu_reference && (!expert_use_mxfp4_soa_f16 || !f16_dispatched_all)) {
+                    if (expert_use_mxfp4_soa_f16 && !f16_dispatched_all) {
+                        static std::atomic<int> f16_fallback_warned{ 0 };
+                        if (f16_fallback_warned.fetch_add(1, std::memory_order_relaxed) < 8) {
+                            GGML_LOG_WARN(
+                                "[MXFP4-DIRECT] oneDNN SOA PP f16-input declined for %s; falling back to F32 route "
+                                "rows=%lld K=%lld N=%lld\n",
+                                src0->name ? src0->name : "?", (long long) num_src1_rows, (long long) ne00,
+                                (long long) ne01);
+                        }
+                        pp_mxfp4_soa_f16_ready = false;
+                        if (pp_local_trace) {
+                            pp_local_accum.f16_fallbacks++;
+                        }
+                    }
+                    dispatch_f32_batches();
+                }
+                pp_trace_wait("matmul-dispatched", i02, num_src1_rows);
+                compare_pp_scratch_cpu(cpu_reference_dispatched ? "after-matmul-before-scatter:cpu-reference" :
+                                       (expert_use_mxfp4_soa_f16 && f16_dispatched_all) ?
+                                                                  "after-matmul-before-scatter:f16-onednn" :
+                                                                  "after-matmul-before-scatter:f32-fallback",
+                                       i02, num_src1_rows, dst_contiguous_expert);
+                validate_pp_scratch_rows(cpu_reference_dispatched ? "after-matmul-before-scatter:cpu-reference" :
+                                         (expert_use_mxfp4_soa_f16 && f16_dispatched_all) ?
+                                                                    "after-matmul-before-scatter:f16-onednn" :
+                                                                    "after-matmul-before-scatter:f32-fallback",
+                                         i02, num_src1_rows, dst_contiguous_expert);
+                pp_entries_dev0 += static_cast<size_t>(num_src1_rows);
+                {
+                    sycl::range<3> block_dims(1, 1, pp_copy_work_group_size(ne0));
+
+                    sycl::range<3> grid_dims(1, 1, num_src1_rows);
+                    const auto     scatter_submit_start = moe_profile_state::hrc::now();
+                    stream->submit([&](sycl::handler & cgh) {
+                        const char * __restrict dst_contiguous_get              = dst_contiguous_expert;
+                        const mmid_row_mapping * __restrict dev_row_mapping_get = dev_row_mapping;
+                        cgh.parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+
+                                         [=](sycl::nd_item<3> item_ct1) {
+                                             k_copy_dst_from_contiguous(dst_original, dst_contiguous_get,
+                                                                        dev_row_mapping_get, ne0, nb1, nb2, item_ct1);
+                                         });
+                    });
                     if (pp_local_trace) {
-                        pp_local_accum.f32_dispatch_us +=
-                            moe_profile_state::us(dispatch_start, moe_profile_state::hrc::now());
-                        pp_local_accum.f32_batches++;
-                    }
-                    batch_start += batch;
-                }
-            };
-            append_pp_log_entries(pp_local_entries_for_log, row_begin, row_end, static_cast<int32_t>(i02), expert_ptr,
-                                  ctx.device, expert_layout, &expert_gpu_lease);
-            install_expert_slice_storage(const_cast<void *>(expert_ptr), static_cast<int>(i02), expert_layout,
-                                         &expert_gpu_lease);
-            if (expert_gpu_lease.resolve(ctx.device).ptr != nullptr) {
-                pp_gpu_leases.push_back(std::move(expert_gpu_lease));
-            }
-            GGML_ASSERT(nb11 == sizeof(float) * ne10);
-
-            GGML_ASSERT(nb1 == sizeof(float) * ne0);
-            src1_row.ne[1] = num_src1_rows;
-            src1_row.nb[1] = nb11;
-            dst_row.nb[1]  = nb1;
-
-            bool f16_dispatched_all       = false;
-            bool cpu_reference_dispatched = false;
-            if (pp_cpu_reference) {
-                cpu_reference_dispatched = dispatch_cpu_reference_to_contiguous();
-                if (!cpu_reference_dispatched) {
-                    GGML_ABORT("[MOE-PP-CPU-REFERENCE] failed tensor=%s expert=%lld rows=%lld layer=%d role=%s",
-                               src0 && src0->name ? src0->name : "?", (long long) i02, (long long) num_src1_rows,
-                               blk_layer_id, moe_tensor_type_name(pp_role));
-                }
-            } else if (expert_use_mxfp4_soa_f16) {
-                f16_dispatched_all        = true;
-                const int64_t max_batch   = std::max<int64_t>(1, MMQ_MAX_BATCH_SIZE);
-                int64_t       batch_start = 0;
-                while (batch_start < num_src1_rows) {
-                    const int64_t batch       = std::min<int64_t>(max_batch, num_src1_rows - batch_start);
-                    const size_t  src1_offset = static_cast<size_t>(batch_start) * src1_contiguous_f16_row_bytes;
-                    const size_t  dst_offset  = static_cast<size_t>(batch_start) * nb1;
-                    dst_row.ne[1]             = batch;
-                    dst_row.nb[2]             = batch * nb1;
-                    dst_row.nb[3]             = batch * nb1;
-                    dst_row.data              = dst_contiguous_expert + dst_offset;
-                    const bool dispatched     = dispatch_mxfp4_soa_pp_f16_input(
-                        expert_ptr, batch, src1_contiguous_f16_expert() + src1_offset,
-                        dst_contiguous_expert + dst_offset, pp_local_trace ? &pp_local_accum : nullptr);
-                    if (!dispatched) {
-                        f16_dispatched_all = false;
-                        break;
-                    }
-                    batch_start += batch;
-                }
-            }
-            if (!pp_cpu_reference && (!expert_use_mxfp4_soa_f16 || !f16_dispatched_all)) {
-                if (expert_use_mxfp4_soa_f16 && !f16_dispatched_all) {
-                    static std::atomic<int> f16_fallback_warned{ 0 };
-                    if (f16_fallback_warned.fetch_add(1, std::memory_order_relaxed) < 8) {
-                        GGML_LOG_WARN(
-                            "[MXFP4-DIRECT] oneDNN SOA PP f16-input declined for %s; falling back to F32 route "
-                            "rows=%lld K=%lld N=%lld\n",
-                            src0->name ? src0->name : "?", (long long) num_src1_rows, (long long) ne00,
-                            (long long) ne01);
-                    }
-                    pp_mxfp4_soa_f16_ready = false;
-                    if (pp_local_trace) {
-                        pp_local_accum.f16_fallbacks++;
+                        pp_local_accum.dst_scatter_submit_us +=
+                            moe_profile_state::us(scatter_submit_start, moe_profile_state::hrc::now());
+                        pp_local_accum.dst_scatter_experts++;
                     }
                 }
-                dispatch_f32_batches();
+                pp_trace_wait("dst-scatter", i02, num_src1_rows);
+                compare_pp_scratch_cpu(cpu_reference_dispatched ? "after-scatter:cpu-reference" :
+                                       (expert_use_mxfp4_soa_f16 && f16_dispatched_all) ? "after-scatter:f16-onednn" :
+                                                                                          "after-scatter:f32-fallback",
+                                       i02, num_src1_rows, dst_original, true);
             }
-            pp_trace_wait("matmul-dispatched", i02, num_src1_rows);
-            compare_pp_scratch_cpu(cpu_reference_dispatched ? "after-matmul-before-scatter:cpu-reference" :
-                                   (expert_use_mxfp4_soa_f16 && f16_dispatched_all) ?
-                                                              "after-matmul-before-scatter:f16-onednn" :
-                                                              "after-matmul-before-scatter:f32-fallback",
-                                   i02, num_src1_rows, dst_contiguous_expert);
-            validate_pp_scratch_rows(cpu_reference_dispatched ? "after-matmul-before-scatter:cpu-reference" :
-                                     (expert_use_mxfp4_soa_f16 && f16_dispatched_all) ?
-                                                                "after-matmul-before-scatter:f16-onednn" :
-                                                                "after-matmul-before-scatter:f32-fallback",
-                                     i02, num_src1_rows, dst_contiguous_expert);
-            pp_entries_dev0 += static_cast<size_t>(num_src1_rows);
-            {
-                sycl::range<3> block_dims(1, 1, pp_copy_work_group_size(ne0));
-
-                sycl::range<3> grid_dims(1, 1, num_src1_rows);
-                const auto     scatter_submit_start = moe_profile_state::hrc::now();
-                stream->submit([&](sycl::handler & cgh) {
-                    const char * __restrict dst_contiguous_get              = dst_contiguous_expert;
-                    const mmid_row_mapping * __restrict dev_row_mapping_get = dev_row_mapping;
-                    cgh.parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-
-                                     [=](sycl::nd_item<3> item_ct1) {
-                                         k_copy_dst_from_contiguous(dst_original, dst_contiguous_get,
-                                                                    dev_row_mapping_get, ne0, nb1, nb2, item_ct1);
-                                     });
-                });
-                if (pp_local_trace) {
-                    pp_local_accum.dst_scatter_submit_us +=
-                        moe_profile_state::us(scatter_submit_start, moe_profile_state::hrc::now());
-                    pp_local_accum.dst_scatter_experts++;
-                }
-            }
-            pp_trace_wait("dst-scatter", i02, num_src1_rows);
-            compare_pp_scratch_cpu(cpu_reference_dispatched                         ? "after-scatter:cpu-reference" :
-                                   (expert_use_mxfp4_soa_f16 && f16_dispatched_all) ? "after-scatter:f16-onednn" :
-                                                                                      "after-scatter:f32-fallback",
-                                   i02, num_src1_rows, dst_original, true);
-        }
-        if (pp_local_trace) {
-            static std::atomic<int> local_trace_count{ 0 };
-            const int               n = local_trace_count.fetch_add(1, std::memory_order_relaxed);
-            if (n < 256) {
-                fprintf(stderr,
+            if (pp_local_trace) {
+                static std::atomic<int> local_trace_count{ 0 };
+                const int               n = local_trace_count.fetch_add(1, std::memory_order_relaxed);
+                if (n < 256) {
+                    fprintf(
+                        stderr,
                         "[MOE-PP-LOCAL] tensor=%s layer=%d role=%s device=%d layout=%s experts=%zu rows=%zu "
                         "f16_batches=%zu f32_batches=%zu f16_fallbacks=%zu f16_scratch_slots=%zu route_resolve_us=%.1f "
                         "f16_stage_submit_us=%.1f f16_stage_wait_us=%.1f f32_stage_submit_us=%.1f "
@@ -96278,122 +96446,86 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         pp_local_accum.f32_stage_submit_us, pp_local_accum.dequant_submit_us,
                         pp_local_accum.onednn_submit_us, pp_local_accum.onednn_wait_us, pp_local_accum.f32_dispatch_us,
                         pp_local_accum.dst_scatter_submit_us, pp_local_accum.dst_scatter_experts, (long long) ne12);
-            }
-        }
-        pp_phase_log("pp-local-dispatch-loop-done", route_layout, row_maps_total, pp_entries_dev0);
-        for (size_t d = 0; d < pp_secondary_entries_by_device.size(); ++d) {
-            if (static_cast<int>(d) == ctx.device || pp_secondary_entries_by_device[d].empty()) {
-                continue;
-            }
-            std::vector<expert_dispatch_entry> cpu_fallback;
-            dispatch_experts_secondary_gpu_impl(pp_secondary_entries_by_device[d], static_cast<int>(d), pp_sec_ctx,
-                                                cpu_fallback);
-            if (!cpu_fallback.empty()) {
-                GGML_ABORT(
-                    "[MOE-ROUTE] PP secondary dispatch returned unexpected CPU fallback tensor=%s device=%zu "
-                    "fallback_entries=%zu",
-                    src0 && src0->name ? src0->name : "?", d, cpu_fallback.size());
-            }
-        }
-        pp_phase_log("pp-secondary-dispatch-done", route_layout, row_maps_total, pp_entries_dev1);
-        ggml_sycl_moe_row_agg_log_routed(src0, ctx.device, n_ids, ids->ne[1], route_layout, "pp_planned_route",
-                                         pp_local_entries_for_log, pp_per_gpu_entries_for_log, pp_host_entries_for_log);
-        ggml_sycl_moe_row_agg_log_entries_descriptor(src0, ctx.device, n_ids, ids->ne[1], route_layout,
-                                                     "pp_planned_descriptor", pp_local_entries_for_log,
-                                                     pp_per_gpu_entries_for_log, pp_host_entries_for_log);
-        pp_phase_log("pp-route-log-done", route_layout, row_maps_total, pp_entries_dev0 + pp_entries_dev1);
-        dispatch_host_expert_groups(pp_host_groups);
-        pp_phase_log("pp-host-dispatch-done", route_layout, row_maps_total, pp_entries_host);
-        sycl::event prompt_down_dispatch_done;
-        bool        prompt_down_dispatch_done_set = false;
-        if (release_prompt_down_soa_after_dispatch || pp_moe_onednn_scratch_claim_state.claimed()) {
-            prompt_down_dispatch_done     = ggml_sycl_submit_marker<pp_moe_prompt_down_dispatch_done_marker>(*stream);
-            prompt_down_dispatch_done_set = true;
-        }
-        if (pp_moe_onednn_scratch_claim_state.claimed()) {
-            std::vector<ggml_sycl::mem_handle> pp_moe_slot_owners;
-            if (pp_moe_onednn_scratch.weight_owner.valid()) {
-                pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.weight_owner));
-            }
-            if (pp_moe_onednn_scratch.activation_owner.valid()) {
-                pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.activation_owner));
-            }
-            if (pp_moe_onednn_scratch.output_owner.valid()) {
-                pp_moe_slot_owners.push_back(std::move(pp_moe_onednn_scratch.output_owner));
-            }
-            pp_moe_onednn_scratch_claim_state.bind_owners(std::move(pp_moe_slot_owners));
-            pp_moe_onednn_scratch_claim_state.record(prompt_down_dispatch_done);
-        }
-        if (!pp_gpu_leases.empty()) {
-            ggml_sycl::retain_handles_until_event(std::move(pp_gpu_leases), prompt_down_dispatch_done_set ?
-                                                                                prompt_down_dispatch_done :
-                                                                                stream->ext_oneapi_submit_barrier());
-        }
-        if (use_expert_cache && src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {
-            std::vector<ggml_sycl::mem_handle> ptr_table_dispatch_bundle =
-                ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device);
-            if (!ptr_table_dispatch_bundle.empty()) {
-                ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle),
-                                                      prompt_down_dispatch_done_set ? prompt_down_dispatch_done :
-                                                                                     stream->ext_oneapi_submit_barrier());
-            }
-        }
-        if (release_prompt_down_soa_after_dispatch) {
-            (void) graph_release_moe_expert_leases_for_tensor_layout(&ctx, src0, ctx.device, GGML_LAYOUT_SOA);
-            const bool released = ggml_sycl_release_moe_tensor_layout(src0, ctx.device, GGML_LAYOUT_SOA);
-            if (released && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-                static std::atomic<int> transient_down_release_log{ 0 };
-                if (transient_down_release_log.fetch_add(1, std::memory_order_relaxed) < 96) {
-                    fprintf(stderr,
-                            "[MOE-PHASE-LAYOUT] tensor=%s device=%d layout=%s released_after_dispatch=1 "
-                            "waited_after_dispatch=0 reason=prompt-down-transient\n",
-                            src0 && src0->name ? src0->name : "?", ctx.device,
-                            ggml_sycl_layout_mode_name(GGML_LAYOUT_SOA));
                 }
             }
-        }
-        pp_phase_log("pp-retain-submitted", route_layout, row_maps_total,
-                     pp_entries_dev0 + pp_entries_dev1 + pp_entries_host + pp_entries_unavailable);
-        if (ggml_sycl::ggml_sycl_moe_route_log_enabled() &&
-            (pp_route_dev0 || pp_route_dev1 || pp_route_host || pp_route_unavailable)) {
-            GGML_LOG_INFO(
-                "[MOE-ROUTE] tensor=%s layer=%d submit_device=%d layout=%d local=%zu/%zu other_gpu=%zu/%zu "
-                "host=%zu/%zu unavailable=%zu/%zu localized=%zu host_rerouted=%zu planned_device_to_host_rows=%zu "
-                "planned_host_rows=%zu "
-                "true_host_rows=%zu unsupported_device_rows=%zu\n",
-                src0->name ? src0->name : "?", layer_id, ctx.device, (int) route_layout, pp_route_dev0, pp_entries_dev0,
-                pp_route_dev1, pp_entries_dev1, pp_route_host, pp_entries_host, pp_route_unavailable,
-                pp_entries_unavailable, pp_route_localized, pp_route_host_rerouted,
-                pp_planned_device_to_host_fallback_rows, pp_planned_host_rows, pp_true_host_rows,
-                pp_unsupported_device_rows);
-        }
-        if (g_moe_profile_enabled) {
-            const int pp_gpu_entries = static_cast<int>(pp_entries_dev0 + pp_entries_dev1);
-            const int pp_cpu_entries = static_cast<int>(pp_entries_host);
-            g_moe_profile.moe_route_stats(
-                pp_role, static_cast<int64_t>(pp_entries_dev0), static_cast<int64_t>(pp_entries_dev1),
-                static_cast<int64_t>(pp_entries_host), static_cast<int64_t>(pp_entries_unavailable),
-                static_cast<int64_t>(pp_entries_dev0 + pp_entries_dev1), static_cast<int64_t>(pp_entries_host),
-                static_cast<int64_t>(pp_entries_unavailable), static_cast<int64_t>(pp_route_localized),
-                static_cast<int64_t>(pp_route_host_rerouted),
-                static_cast<int64_t>(pp_planned_device_to_host_fallback_rows),
-                static_cast<int64_t>(pp_planned_host_rows), static_cast<int64_t>(pp_true_host_rows),
-                static_cast<int64_t>(pp_unsupported_device_rows));
-            g_moe_profile.moe_gpu_compute_done();
-            g_moe_profile.moe_compute_done(pp_cpu_entries, pp_gpu_entries);
-            if (g_moe_pp_profile_enabled) {
-                g_moe_profile.moe_cache_stats(static_cast<int>(pp_entries_dev0), static_cast<int>(pp_entries_host),
-                                              static_cast<int>(pp_entries_dev1));
-                g_moe_profile.moe_dispatch_path(0, 0, 0, pp_entries_host > 0 ? 1 : 0);
+            pp_phase_log("pp-local-dispatch-loop-done", route_layout, row_maps_total, pp_entries_dev0);
+            for (size_t d = 0; d < pp_secondary_entries_by_device.size(); ++d) {
+                if (static_cast<int>(d) == ctx.device || pp_secondary_entries_by_device[d].empty()) {
+                    continue;
+                }
+                std::vector<expert_dispatch_entry> cpu_fallback;
+                dispatch_experts_secondary_gpu_impl(pp_secondary_entries_by_device[d], static_cast<int>(d), pp_sec_ctx,
+                                                    cpu_fallback);
+                if (!cpu_fallback.empty()) {
+                    GGML_ABORT(
+                        "[MOE-ROUTE] PP secondary dispatch returned unexpected CPU fallback tensor=%s device=%zu "
+                        "fallback_entries=%zu",
+                        src0 && src0->name ? src0->name : "?", d, cpu_fallback.size());
+                }
             }
-        }
-        pp_phase_log("pp-profile-accounted", route_layout, row_maps_total,
-                     pp_entries_dev0 + pp_entries_dev1 + pp_entries_host + pp_entries_unavailable);
-        if (ggml_sycl::MoeDispatchStats::enabled()) {
-            auto & stats = ggml_sycl::get_moe_dispatch_stats(ctx.device);
-            stats.record_route_residency(static_cast<int>(pp_entries_dev0), static_cast<int>(pp_entries_dev1),
-                                         static_cast<int>(pp_entries_host), static_cast<int>(pp_entries_unavailable), 0,
-                                         0);
+            pp_phase_log("pp-secondary-dispatch-done", route_layout, row_maps_total, pp_entries_dev1);
+            ggml_sycl_moe_row_agg_log_routed(src0, ctx.device, n_ids, ids->ne[1], route_layout, "pp_planned_route",
+                                             pp_local_entries_for_log, pp_per_gpu_entries_for_log,
+                                             pp_host_entries_for_log);
+            ggml_sycl_moe_row_agg_log_entries_descriptor(src0, ctx.device, n_ids, ids->ne[1], route_layout,
+                                                         "pp_planned_descriptor", pp_local_entries_for_log,
+                                                         pp_per_gpu_entries_for_log, pp_host_entries_for_log);
+            pp_phase_log("pp-route-log-done", route_layout, row_maps_total, pp_entries_dev0 + pp_entries_dev1);
+            dispatch_host_expert_groups(pp_host_groups);
+            pp_phase_log("pp-host-dispatch-done", route_layout, row_maps_total, pp_entries_host);
+            retain_pp_dispatch_until_done();
+            pp_phase_log("pp-retain-submitted", route_layout, row_maps_total,
+                         pp_entries_dev0 + pp_entries_dev1 + pp_entries_host + pp_entries_unavailable);
+            if (ggml_sycl::ggml_sycl_moe_route_log_enabled() &&
+                (pp_route_dev0 || pp_route_dev1 || pp_route_host || pp_route_unavailable)) {
+                GGML_LOG_INFO(
+                    "[MOE-ROUTE] tensor=%s layer=%d submit_device=%d layout=%d local=%zu/%zu other_gpu=%zu/%zu "
+                    "host=%zu/%zu unavailable=%zu/%zu localized=%zu host_rerouted=%zu planned_device_to_host_rows=%zu "
+                    "planned_host_rows=%zu "
+                    "true_host_rows=%zu unsupported_device_rows=%zu\n",
+                    src0->name ? src0->name : "?", layer_id, ctx.device, (int) route_layout, pp_route_dev0,
+                    pp_entries_dev0, pp_route_dev1, pp_entries_dev1, pp_route_host, pp_entries_host,
+                    pp_route_unavailable, pp_entries_unavailable, pp_route_localized, pp_route_host_rerouted,
+                    pp_planned_device_to_host_fallback_rows, pp_planned_host_rows, pp_true_host_rows,
+                    pp_unsupported_device_rows);
+            }
+            if (g_moe_profile_enabled) {
+                const int pp_gpu_entries = static_cast<int>(pp_entries_dev0 + pp_entries_dev1);
+                const int pp_cpu_entries = static_cast<int>(pp_entries_host);
+                g_moe_profile.moe_route_stats(
+                    pp_role, static_cast<int64_t>(pp_entries_dev0), static_cast<int64_t>(pp_entries_dev1),
+                    static_cast<int64_t>(pp_entries_host), static_cast<int64_t>(pp_entries_unavailable),
+                    static_cast<int64_t>(pp_entries_dev0 + pp_entries_dev1), static_cast<int64_t>(pp_entries_host),
+                    static_cast<int64_t>(pp_entries_unavailable), static_cast<int64_t>(pp_route_localized),
+                    static_cast<int64_t>(pp_route_host_rerouted),
+                    static_cast<int64_t>(pp_planned_device_to_host_fallback_rows),
+                    static_cast<int64_t>(pp_planned_host_rows), static_cast<int64_t>(pp_true_host_rows),
+                    static_cast<int64_t>(pp_unsupported_device_rows));
+                g_moe_profile.moe_gpu_compute_done();
+                g_moe_profile.moe_compute_done(pp_cpu_entries, pp_gpu_entries);
+                if (g_moe_pp_profile_enabled) {
+                    g_moe_profile.moe_cache_stats(static_cast<int>(pp_entries_dev0), static_cast<int>(pp_entries_host),
+                                                  static_cast<int>(pp_entries_dev1));
+                    g_moe_profile.moe_dispatch_path(0, 0, 0, pp_entries_host > 0 ? 1 : 0);
+                }
+            }
+            pp_phase_log("pp-profile-accounted", route_layout, row_maps_total,
+                         pp_entries_dev0 + pp_entries_dev1 + pp_entries_host + pp_entries_unavailable);
+            if (ggml_sycl::MoeDispatchStats::enabled()) {
+                auto & stats = ggml_sycl::get_moe_dispatch_stats(ctx.device);
+                stats.record_route_residency(static_cast<int>(pp_entries_dev0), static_cast<int>(pp_entries_dev1),
+                                             static_cast<int>(pp_entries_host),
+                                             static_cast<int>(pp_entries_unavailable), 0, 0);
+            }
+        } catch (const ggml_sycl_fallback_error &) {
+            // Exactly once with the normal exit: the exit work is a no-op when it already ran (see its flag). An
+            // exception the exit work throws here replaces this one and leaves through the function-try-block
+            // below (a sycl::exception) or to graph_compute. That case is degraded: the expert leases not yet
+            // handed to retain_handles_until_event and the slot owners not yet bound to the claim are released by
+            // their destructors, in no order with the queue, while a submitted kernel may still read them. It is
+            // the same case as the normal exit's exit work throwing.
+            retain_pp_dispatch_until_done();
+            throw;
         }
     }
     local_extra.moe_expert_id = -1;  // Reset after per-expert dispatch
@@ -96451,6 +96583,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     ggml_sycl_fatal_exit(ggml_sycl_fatal_exit_code(exc.what()), "ggml_sycl_mul_mat_id");
 }
+
+#undef GGML_SYCL_MOE_PP_STAGING_FAILPOINT
 
 static void ggml_sycl_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);

@@ -34,6 +34,12 @@ enum ggml_sycl_q1_nvfp4_test_failure {
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL,
     // mmvq_moe_batched_dispatch refuses a Q1_0/NVFP4 operand once, just before its submit.
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BATCHED_DISPATCH,
+    // The MoE prompt path of ggml_sycl_mul_mat_id, any expert type: one staging allocation acts as if the card had
+    // not granted it, once, so the op refuses by name (test-moe-pp-staging-refusal). The row-map staging, the
+    // per-expert path's output staging, and its F32 activation staging at whichever site allocates it first.
+    GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_ROW_MAP_STAGING,
+    GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_DST_STAGING,
+    GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_SRC1_F32_STAGING,
 };
 
 #if defined(__GNUC__) || defined(__clang__)
