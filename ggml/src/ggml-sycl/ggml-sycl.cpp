@@ -89843,44 +89843,54 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // tensor is not necessarily a full device allocation.
     const bool plan_host_routing = has_placement_plan && plan_has_cpu_experts;
 
+    // The layout the experts this op multiplies are in. A prompt (ne12 != 1) resolved every expert operand it reads
+    // at retained_prompt_layout, above, so that is its route: one source for the fact. Selecting the route again
+    // here with a second selector disagreed with it whenever no placement plan exists (the expert-cache selector
+    // reads policy, not the operands: SOA for q8_0 and mxfp4 over operands resolved AOS), and the kernels then read
+    // those operands in a layout their bytes are not in. A decode op selects its route here and resolves its experts
+    // at it below.
     layout_mode route_layout = src0_layout;
-    if (use_expert_cache) {
-        if (accepted_layout_override) {
-            route_layout = override_layout;
-        } else if (has_override) {
-            if (has_placement_plan) {
+    if (ne12 != 1) {
+        route_layout = retained_prompt_layout;
+    } else {
+        if (use_expert_cache) {
+            if (accepted_layout_override) {
+                route_layout = override_layout;
+            } else if (has_override) {
+                if (has_placement_plan) {
+                    route_layout = ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, host_weights, ne12);
+                } else {
+                    GGML_LOG_WARN("[MoE] Override layout=%d unsupported for %s; falling back to AoS\n",
+                                  (int) override_layout, src0->name ? src0->name : "?");
+                    route_layout = GGML_LAYOUT_AOS;
+                }
+
+            } else if (has_placement_plan) {
                 route_layout = ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, host_weights, ne12);
             } else {
-                GGML_LOG_WARN("[MoE] Override layout=%d unsupported for %s; falling back to AoS\n",
-                              (int) override_layout, src0->name ? src0->name : "?");
-                route_layout = GGML_LAYOUT_AOS;
+                route_layout = ggml_sycl_select_moe_expert_cache_layout(src0, ctx.device, ne12);
             }
-
-        } else if (has_placement_plan) {
-            route_layout = ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, host_weights, ne12);
-        } else {
-            route_layout = ggml_sycl_select_moe_expert_cache_layout(src0, ctx.device, ne12);
+        } else if (has_override) {
+            if (accepted_layout_override) {
+                route_layout = override_layout;
+            } else {
+                GGML_LOG_WARN("[MoE] Override layout=%d unsupported for %s; keeping resolved layout=%d\n",
+                              (int) override_layout, src0->name ? src0->name : "?", (int) route_layout);
+            }
         }
-    } else if (has_override) {
-        if (accepted_layout_override) {
-            route_layout = override_layout;
-        } else {
-            GGML_LOG_WARN("[MoE] Override layout=%d unsupported for %s; keeping resolved layout=%d\n",
-                          (int) override_layout, src0->name ? src0->name : "?", (int) route_layout);
+        route_layout = ggml_sycl_moe_layout_for_selected_rows(
+            src0, ctx.device, route_layout, static_cast<size_t>(std::max<int64_t>(0, moe_selected_entries)),
+            exact_layout_override, ne12);
+        const bool direct_down_i8_hotset_enabled = ggml_sycl_moe_decode_down_i8_hotset_enabled();
+        if (direct_down_i8_hotset_enabled && !exact_layout_override && has_placement_plan && !ids_host.empty()) {
+            (void) ggml_sycl_moe_maybe_use_down_i8_hotset(src0, ctx.device, ids_host, n_experts, ne12, &route_layout,
+                                                          "direct-dispatch");
         }
-    }
-    route_layout = ggml_sycl_moe_layout_for_selected_rows(
-        src0, ctx.device, route_layout, static_cast<size_t>(std::max<int64_t>(0, moe_selected_entries)),
-        exact_layout_override, ne12);
-    const bool direct_down_i8_hotset_enabled = ggml_sycl_moe_decode_down_i8_hotset_enabled();
-    if (direct_down_i8_hotset_enabled && !exact_layout_override && has_placement_plan && !ids_host.empty()) {
-        (void) ggml_sycl_moe_maybe_use_down_i8_hotset(src0, ctx.device, ids_host, n_experts, ne12, &route_layout,
-                                                      "direct-dispatch");
-    }
-    if (!use_expert_cache && route_layout != GGML_LAYOUT_AOS) {
-        GGML_SYCL_DEBUG("[MoE] Host routing uses AoS layout for %s (requested=%d)\n", src0->name ? src0->name : "?",
-                        (int) route_layout);
-        route_layout = GGML_LAYOUT_AOS;
+        if (!use_expert_cache && route_layout != GGML_LAYOUT_AOS) {
+            GGML_SYCL_DEBUG("[MoE] Host routing uses AoS layout for %s (requested=%d)\n", src0->name ? src0->name : "?",
+                            (int) route_layout);
+            route_layout = GGML_LAYOUT_AOS;
+        }
     }
     pp_phase_log("layout-selected", route_layout, ids_host.size());
     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
@@ -95573,6 +95583,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             const void *          expert_ptr = nullptr;
             ggml_sycl::mem_handle expert_gpu_lease{};
+            // The layout of the bytes expert_gpu_lease holds. The slice storage installed from that lease and the
+            // layout forced on the matmul below both read this one variable, so the kernel is chosen for the
+            // layout the operand is in. A local prompt expert takes it from its route, whose lease the resolver
+            // checked to resolve at that layout.
+            layout_mode           expert_layout = route_layout;
 
             if (ne12 != 1) {
                 const auto       route_resolve_start = moe_profile_state::hrc::now();
@@ -95610,6 +95625,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                     expert_ptr       = route.ptr;
                     expert_gpu_lease = std::move(route.lease);
+                    expert_layout    = route.actual_layout;
                     pp_route_dev0++;
                     if (pp_oor_trace) {
                         fprintf(stderr,
@@ -95988,7 +96004,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return true;
             };
 
-            const bool expert_use_mxfp4_soa_f16 = !pp_cpu_reference && pp_mxfp4_soa_f16_ready && num_src1_rows >= 1;
+            // The f16 arm reads expert_ptr as the layout the op's route was readied for; an expert in another layout
+            // takes the F32 route, which dispatches at expert_layout.
+            const bool expert_use_mxfp4_soa_f16 =
+                !pp_cpu_reference && pp_mxfp4_soa_f16_ready && num_src1_rows >= 1 && expert_layout == route_layout;
 
             bool f16_activation_staged = false;
             if (expert_use_mxfp4_soa_f16) {
@@ -96065,7 +96084,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     dst_row.nb[3]             = batch * nb1;
                     dst_row.data              = dst_contiguous_expert + dst_offset;
                     const auto dispatch_start = moe_profile_state::hrc::now();
-                    ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &route_layout);
+                    ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &expert_layout);
                     if (pp_local_trace) {
                         pp_local_accum.f32_dispatch_us +=
                             moe_profile_state::us(dispatch_start, moe_profile_state::hrc::now());
@@ -96075,8 +96094,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             };
             append_pp_log_entries(pp_local_entries_for_log, row_begin, row_end, static_cast<int32_t>(i02), expert_ptr,
-                                  ctx.device, route_layout, &expert_gpu_lease);
-            install_expert_slice_storage(const_cast<void *>(expert_ptr), static_cast<int>(i02), route_layout,
+                                  ctx.device, expert_layout, &expert_gpu_lease);
+            install_expert_slice_storage(const_cast<void *>(expert_ptr), static_cast<int>(i02), expert_layout,
                                          &expert_gpu_lease);
             if (expert_gpu_lease.resolve(ctx.device).ptr != nullptr) {
                 pp_gpu_leases.push_back(std::move(expert_gpu_lease));
