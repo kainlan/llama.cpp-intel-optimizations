@@ -14,8 +14,11 @@
 //   2. the split form against the row form (rel 1e-4, abs 1e-2, that test's kernel-vs-kernel tolerance). The split
 //      sums each row's chunks in a different order, so it is close to the row form, not bit-equal;
 //   3. the split launched with the chunks the dispatch rule names for this shape and card, and more than one;
-//   4. no row past the slice was written (padded rows of the last work-group compute nothing and write nothing) and
-//      every row of the slice was (dst is filled with NaN first, and NaN fails every comparison).
+//   4. no row past the slice was written and every row of the slice was (dst is filled with NaN first, and NaN fails
+//      every comparison). Cases whose row count leaves padded rows in the last work-group (one per layout at least,
+//      which the host test asserts of the table) show that those rows reach the barrier and write nothing: a write
+//      from one lands in the 16 sentinel floats past the slice. The CASE line prints the padded-row count.
+// The case table, with the chunks each case gets on both cards, is in test-sycl-mmvq-q8-0-column-split-cases.h.
 // Every element is compared numpy-allclose style: |got - ref| <= abs + rel * |ref|.
 //
 // Exit 0 with a final PASS line when every case passes, 1 on any FAIL, 77 when no SYCL GPU is usable or the card has
@@ -27,6 +30,7 @@
 #include "mmvq.hpp"
 #include "quants.hpp"
 #include "test-skip.h"
+#include "test-sycl-mmvq-q8-0-column-split-cases.h"
 
 #include <cmath>
 #include <cstdint>
@@ -58,15 +62,7 @@ constexpr float REF_ABS_TOL    = 1e-2f;
 constexpr float KERNEL_REL_TOL = 1e-4f;
 constexpr float KERNEL_ABS_TOL = 1e-2f;
 
-struct test_case {
-    const char * name;
-    bool         coalesced;
-    int          ncols;
-    int          total_rows;
-    int          row_low;
-    int          nrows;
-    bool         fused;
-};
+using test_case = mmvq_q8_0_column_split_case;
 
 struct q8_0_matrix {
     std::vector<int8_t>     qs;  // total_rows * blocks_per_row * 32, block-major
@@ -253,19 +249,7 @@ int main() {
     std::printf("device: %s compute_units=%d\n", q.get_device().get_info<sycl::info::device::name>().c_str(),
                 compute_units);
 
-    const test_case cases[] = {
-        { "soa-4x10240",                   false, 10240, 4,  0,  4,  false },
-        { "soa-4x10240-fused",             false, 10240, 4,  0,  4,  true  },
-        { "soa-48x2560",                   false, 2560,  48, 0,  48, false },
-        { "soa-48x2560-fused",             false, 2560,  48, 0,  48, true  },
-        // A row slice of a SOA tensor, as a split-tensor dispatch passes it: the kernel addresses blocks by
-        // row_low + row against the whole tensor's planes and the addend by its row base.
-        { "soa-48x2560-slice-16-40-fused", false, 2560,  48, 16, 24, true  },
-        { "coalesced-4x10240",             true,  10240, 4,  0,  4,  false },
-        { "coalesced-4x10240-fused",       true,  10240, 4,  0,  4,  true  },
-        { "coalesced-48x2560",             true,  2560,  48, 0,  48, false },
-        { "coalesced-48x2560-fused",       true,  2560,  48, 0,  48, true  },
-    };
+    const auto & cases = MMVQ_Q8_0_COLUMN_SPLIT_CASES;
 
     for (const test_case & tc : cases) {
         const int step = tc.coalesced ? COALESCED_STEP : SOA_STEP_BLOCKS;
@@ -334,13 +318,16 @@ int main() {
             if (!row.guard_clean || !split.guard_clean) {
                 why += " wrote-past-slice";
             }
-            const bool ok = why.empty();
+            const bool ok     = why.empty();
+            const int  padded = ggml_sycl::mmvq_column_split_workgroups(tc.nrows, want) *
+                                   ggml_sycl::mmvq_column_split_rows_per_workgroup(want) -
+                               tc.nrows;
             std::printf(
-                "CASE name=%s layout=%s rows=%d/%d row_low=%d ncols=%d fused=%d chunks=%d (rule %d) "
+                "CASE name=%s layout=%s rows=%d/%d row_low=%d ncols=%d fused=%d chunks=%d (rule %d) padded=%d "
                 "row-vs-ref max_diff=%.3e viol=%zu split-vs-row max_diff=%.3e viol=%zu split-vs-ref max_diff=%.3e "
                 "-> %s%s\n",
                 tc.name, tc.coalesced ? "coalesced" : "soa", tc.nrows, tc.total_rows, tc.row_low, tc.ncols,
-                tc.fused ? 1 : 0, split.chunks, want, row_ref.max_diff, row_ref.violations, split_row.max_diff,
+                tc.fused ? 1 : 0, split.chunks, want, padded, row_ref.max_diff, row_ref.violations, split_row.max_diff,
                 split_row.violations, split_ref.max_diff, ok ? "PASS" : "FAIL:", why.c_str());
             ++ran;
             if (!ok) {

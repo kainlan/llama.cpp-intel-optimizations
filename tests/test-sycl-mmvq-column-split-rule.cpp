@@ -11,11 +11,14 @@
 //   * that the chunks of a row read every quant of every block exactly once, for the SOA lane mapping (four lanes per
 //     block, two ints each) and the coalesced one (the shared step walk over tiles, then the per-tile lane loop), the
 //     latter at several tile sizes so it holds without the tile matching the sub-group;
-//   * that one chunk is the row form's own indexing, and that the work-groups cover the rows with whole work-groups.
+//   * that one chunk is the row form's own indexing, and that the work-groups cover the rows with whole work-groups;
+//   * of the device test's case table: every case takes the split on both cards, and each layout has a case whose
+//     last work-group holds padded rows, so the device run exercises padded sub-groups at the barrier.
 // The device test (test-sycl-mmvq-q8-0-column-split) shows the kernels compute the right numbers; this one shows the
 // numbers it needs are the right ones on shapes no single device run can sweep.
 
 #include "ggml-sycl/mmvq-launch-geometry.hpp"
+#include "test-sycl-mmvq-q8-0-column-split-cases.h"
 
 #include <cstdio>
 #include <string>
@@ -262,6 +265,33 @@ static void test_work_groups_cover_the_rows() {
     std::printf("PASS: work-groups cover every slice up to 600 rows\n");
 }
 
+// The device test's cases, on both cards: each one splits (or the device run would compare the row form with itself),
+// and per layout at least one leaves padded rows in its last work-group.
+static void test_device_cases_split_and_pad() {
+    for (const int eus : { B70_EUS, B50_EUS }) {
+        int padded_soa       = 0;
+        int padded_coalesced = 0;
+        for (const mmvq_q8_0_column_split_case & tc : MMVQ_Q8_0_COLUMN_SPLIT_CASES) {
+            const int         step   = tc.coalesced ? COALESCED_STEP : SOA_STEP;
+            const int         chunks = mmvq_column_split_chunks(tc.nrows, tc.ncols / 32, step, eus);
+            const int         per_wg = mmvq_column_split_rows_per_workgroup(chunks);
+            const int         padded = mmvq_column_split_workgroups(tc.nrows, chunks) * per_wg - tc.nrows;
+            const std::string label  = std::string("device case ") + tc.name + " eus=" + std::to_string(eus) +
+                                      ": chunks=" + std::to_string(chunks) + " padded=" + std::to_string(padded);
+            expect(chunks > 1, label + " takes the split");
+            expect(tc.row_low >= 0 && tc.row_low + tc.nrows <= tc.total_rows, label + " is a slice of its tensor");
+            expect(!tc.coalesced || (tc.row_low == 0 && tc.nrows == tc.total_rows),
+                   label + " (the coalesced layout is never sliced)");
+            if (padded > 0) {
+                ++(tc.coalesced ? padded_coalesced : padded_soa);
+            }
+            std::printf("%s: %s\n", chunks > 1 ? "PASS" : "FAIL", label.c_str());
+        }
+        expect(padded_soa > 0, "a SOA device case pads its last work-group on eus=" + std::to_string(eus));
+        expect(padded_coalesced > 0, "a coalesced device case pads its last work-group on eus=" + std::to_string(eus));
+    }
+}
+
 int main() {
     test_task_shapes_take_the_column_split_form();
     test_shapes_with_enough_rows_keep_the_row_form();
@@ -272,6 +302,7 @@ int main() {
     test_chunks_read_every_quant_exactly_once();
     test_one_chunk_is_the_row_form_indexing();
     test_work_groups_cover_the_rows();
+    test_device_cases_split_and_pad();
 
     if (g_failures != 0) {
         std::printf("FAIL: mmvq column-split rule: %d of %d checks failed\n", g_failures, g_checks);
