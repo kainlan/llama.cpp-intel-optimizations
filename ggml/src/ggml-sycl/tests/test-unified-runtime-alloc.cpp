@@ -2794,6 +2794,15 @@ static size_t zone_bytes_used(unified_cache & cache) {
     return used;
 }
 
+// The capacity of each of the cache's VRAM zones, by zone.
+static std::vector<size_t> zone_capacities(unified_cache & cache) {
+    std::vector<size_t> capacity(static_cast<size_t>(vram_zone_id::COUNT), 0);
+    for (size_t z = 0; z < capacity.size(); ++z) {
+        capacity[z] = cache.zone_capacity(static_cast<vram_zone_id>(z));
+    }
+    return capacity;
+}
+
 // The fixture's scratch on a hand-built cache, what a model's first prompt leaves: a one-slot PP MoE oneDNN ring of
 // 1 MiB slots in the RUNTIME zone, planned on the cache's device first (the reserve admits only a planned ring), and a
 // 1 + 1 MiB oneDNN pair from the ONEDNN zone. The caller's planned_terms_found and pipeline_and_pair_found put the
@@ -3080,6 +3089,79 @@ static bool last_release_names_a_held_arena(sycl::queue & q, bool & skipped) {
     return true;
 }
 
+// A failed load whose buffers hold the arena at its abort defers the release to the next load's start, which runs it
+// again and, once nothing holds the arena, starts from the zones a last model's release leaves. The reference: a
+// model's release empties the hand-built cache and a load's start reserve builds the early arena, whose zones every
+// later start must match. Then a lease on that arena's first chunk holds it through a failed load's abort: ARENA_HELD,
+// and the release is marked deferred. A load's start while the lease still holds the arena runs the release again, as
+// ggml_backend_sycl_model_load_begin does for a marked cache: ARENA_HELD with one WARN line that says the load runs on
+// the arena as it is, the mark stays, the reserve does nothing and the chunk is still leased. Once the lease ends, a
+// load's start empties the cache, clears the mark and reserves the early arena again at the reference zones, with
+// nothing used in them.
+// Engagement: the reference reserve built an arena, and the lease is on its first chunk.
+// Mutants: the mark not set at the abort; the mark cleared by a release that kept the arena; the mark kept after the
+// cache emptied; a start that rebuilds other zones than a last release's (the zones differ from the reference).
+static bool last_release_deferred_by_a_failed_load(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("last_release_deferred_by_a_failed_load");
+    constexpr size_t        mib       = 1024ull * 1024ull;
+    const size_t            max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const int               device    = ggml_sycl_get_device_id_from_queue(q);
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+    unified_cache           cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry    retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no release was measured");
+    }
+    TEST_ASSERT(cache.release_for_no_live_model("reference", unified_cache_release_cause::MODEL_RELEASED) ==
+                    unified_cache_last_release::EMPTIED,
+                "the reference's model release did not empty the cache");
+    zone_arena_refusal refusal;
+    if (!cache.reserve_released_arena(&refusal)) {
+        TEST_SKIP(skipped, "the device refused a load's start reserve of the early arena, so no start was compared");
+    }
+    const std::vector<size_t> first_zones = zone_capacities(cache);
+    TEST_ASSERT(!cache.last_release_deferred(), "a model's release that emptied the cache left a deferred mark");
+
+    held_chunk_lease lease{ cache };
+    lease.chunk = cache.arena_acquire_chunk_lease(cache.arena_base());
+    TEST_ASSERT(lease.chunk >= 0, "the fixture's lease on the early arena's first chunk was not taken");
+    TEST_ASSERT(cache.release_for_no_live_model("aborted", unified_cache_release_cause::LOAD_ABORTED) ==
+                    unified_cache_last_release::ARENA_HELD,
+                "at an abort a held arena did not refuse the release");
+    TEST_ASSERT(cache.last_release_deferred(), "a failed load's held arena did not mark its release deferred");
+
+    unified_cache_last_release held_start = unified_cache_last_release::FAILED;
+    bool                       held_kept  = false;
+    size_t                     warned     = 0;
+    {
+        const last_release_log log;
+        held_start = cache.release_for_no_live_model("load-start", unified_cache_release_cause::LOAD_ABORTED);
+        held_kept  = cache.reserve_released_arena(&refusal);
+        warned     = log.count(GGML_LOG_LEVEL_WARN, "(load-start): the failed load's buffers still hold the arena",
+                               "a load that starts while it is held runs on it as it is");
+    }
+    TEST_ASSERT(held_start == unified_cache_last_release::ARENA_HELD,
+                "a load's start released an arena the failed load's buffers still hold");
+    TEST_ASSERT(warned == 1, "the start's release did not log one WARN line saying the load runs on the held arena");
+    TEST_ASSERT(cache.last_release_deferred(), "a release that kept the arena cleared the deferred mark");
+    TEST_ASSERT(held_kept && cache.arena_active() && cache.arena_find_chunk(cache.arena_base()) == lease.chunk,
+                "a load's start on the held arena refused, tore it down or freed the leased chunk");
+
+    lease.release();
+    const unified_cache_last_release free_start =
+        cache.release_for_no_live_model("load-start", unified_cache_release_cause::LOAD_ABORTED);
+    TEST_ASSERT(free_start == unified_cache_last_release::EMPTIED,
+                "once the lease ended a load's start did not empty the cache");
+    TEST_ASSERT(!cache.last_release_deferred(), "the deferred mark stayed after the cache emptied");
+    TEST_ASSERT(cache.reserve_released_arena(&refusal), "a load's start did not reserve the early arena again");
+    TEST_ASSERT(zone_capacities(cache) == first_zones,
+                "a load's start after the deferred release built other zones than a last model's release leaves");
+    TEST_ASSERT(zone_bytes_used(cache) == 0, "a zone counts used bytes in the early arena the load's start reserved");
+    TEST_PASS();
+    return true;
+}
+
 // The release of the last model, each arm on a cache of its own, and the start values it puts a device's published
 // terms back to. Its own process (`--case last_release_empties_the_arena`): the terms arm must read a process where
 // nothing has been published, and the arms publish the device's ring and pair terms. Exits 0 when every arm passed, 1
@@ -3092,6 +3174,7 @@ static int last_release_empties_the_arena(sycl::queue & q) {
     ok &= last_release_keeps_a_claimed_ring(q, skipped);
     ok &= last_release_keeps_a_reserved_pair(q, skipped);
     ok &= last_release_names_a_held_arena(q, skipped);
+    ok &= last_release_deferred_by_a_failed_load(q, skipped);
     if (!ok) {
         return 1;
     }

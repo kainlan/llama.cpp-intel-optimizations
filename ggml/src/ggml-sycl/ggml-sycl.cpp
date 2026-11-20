@@ -12719,30 +12719,44 @@ static void ggml_sycl_diag_emit_warn(const char * fmt, ...) {
     fflush(stderr);
 }
 
+// The caches the release of the last model asks: every existing cache, at the model release hook and at a failed
+// load's abort, or, at a load's start, only those whose release a failed load's buffers deferred
+// (unified_cache::last_release_deferred).
+enum class ggml_sycl_last_release_scope { EVERY_CACHE, DEFERRED_CACHES };
+
 // The release of the last model in the process, run last by the model release hook (`cause` MODEL_RELEASED) and by a
-// failed load's abort (LOAD_ABORTED), after each has dropped and put back what the model published. Each cache gives
-// back what it sized for a model (unified_cache::release_for_no_live_model), so the next load plans and builds as the
-// first load of a process does. Liveness is process-wide, every cache holds the same mask, so walking every existing
-// cache when that mask is 0 is right; in GLOBAL cache mode several devices share one cache, which is asked once.
-// Nothing makes a model live while this runs: the registry begins no load while a model is tearing down or a load
-// transaction is open (begin_outer answers LOAD_BUSY), and the hook runs in the first and the abort in the second.
-// A device whose cache emptied, or that has none, then holds the published terms a device no load has planned on
-// reads, stored under the inventory lock every planner pass publishes under; a cache that kept something keeps its
-// terms, which describe what it kept. The two-card MoE flag goes back to its start once every cache emptied. Not at
-// static destruction, where the caches go with the module. It reserves nothing and never throws.
+// failed load's abort (LOAD_ABORTED), after each has dropped and put back what the model published, and at a load's
+// start for the caches a failed load's buffers held at its abort (LOAD_ABORTED, DEFERRED_CACHES). Each cache asked
+// gives back what it sized for a model (unified_cache::release_for_no_live_model), so the next load plans and builds
+// as the first load of a process does. Liveness is process-wide, every cache holds the same mask, so walking every
+// existing cache when that mask is 0 is right; in GLOBAL cache mode several devices share one cache, which is asked
+// once. Nothing makes a model live while this runs: the registry begins no load while a model is tearing down or a
+// load transaction is open (begin_outer answers LOAD_BUSY), the hook runs in the first, and the abort and the load's
+// start run in the second, beside which no teardown begins. A device whose cache was asked and emptied, or that has
+// none and every cache was asked, then holds the published terms a device no load has planned on reads, stored under
+// the inventory lock every planner pass publishes under; a cache that kept something keeps its terms, which describe
+// what it kept, and so does a cache the scope left out. The two-card MoE flag goes back to its start once every cache
+// emptied: a cache left out counts as emptied when it holds no arena, as every release that stops on a refusal stops
+// before the teardown, and a step that asked no cache leaves the flag as it is. Not at static destruction, where the
+// caches go with the module. It reserves nothing and never throws.
 static void ggml_sycl_release_last_model_effects(const char *                           site,
-                                                 ggml_sycl::unified_cache_release_cause cause) noexcept {
+                                                 ggml_sycl::unified_cache_release_cause cause,
+                                                 ggml_sycl_last_release_scope           scope) noexcept {
     try {
         if (ggml_sycl::ggml_sycl_is_shutting_down()) {
             return;
         }
-        const int n = std::max(0, std::min(ggml_backend_sycl_get_device_count(), GGML_SYCL_MAX_DEVICES));
+        const bool every = scope == ggml_sycl_last_release_scope::EVERY_CACHE;
+        const int  n     = std::max(0, std::min(ggml_backend_sycl_get_device_count(), GGML_SYCL_MAX_DEVICES));
         std::array<ggml_sycl::unified_cache *, GGML_SYCL_MAX_DEVICES>            caches{};
         std::array<ggml_sycl::unified_cache_last_release, GGML_SYCL_MAX_DEVICES> released{};
+        std::array<bool, GGML_SYCL_MAX_DEVICES>                                  asked{};
         bool                                                                     all_emptied = true;
+        bool                                                                     asked_any   = false;
         for (int d = 0; d < n; ++d) {
             caches[d]   = ggml_sycl::get_existing_unified_cache_for_device(d);
             released[d] = ggml_sycl::unified_cache_last_release::EMPTIED;
+            asked[d]    = every;
             if (caches[d] == nullptr) {
                 continue;
             }
@@ -12753,6 +12767,13 @@ static void ggml_sycl_release_last_model_effects(const char *                   
                     break;
                 }
             }
+            // A shared cache answers once: its release clears the mark the later devices would read.
+            asked[d] = first == d ? (every || caches[d]->last_release_deferred()) : asked[first];
+            if (!asked[d]) {
+                all_emptied = all_emptied && !caches[d]->arena_active();
+                continue;
+            }
+            asked_any   = true;
             released[d] = first == d ? caches[d]->release_for_no_live_model(site, cause) : released[first];
             all_emptied = all_emptied && released[d] == ggml_sycl::unified_cache_last_release::EMPTIED;
             if (released[d] == ggml_sycl::unified_cache_last_release::MODEL_LIVE) {
@@ -12760,12 +12781,12 @@ static void ggml_sycl_release_last_model_effects(const char *                   
             }
         }
         for (int d = 0; d < n; ++d) {
-            if (released[d] == ggml_sycl::unified_cache_last_release::EMPTIED) {
+            if (asked[d] && released[d] == ggml_sycl::unified_cache_last_release::EMPTIED) {
                 std::lock_guard inventory(g_tensor_inventory_mutex);
                 ggml_sycl::load_published_terms{}.restore(d);
             }
         }
-        if (all_emptied) {
+        if (all_emptied && (every || asked_any)) {
             g_moe_multi_gpu_active.store(false, std::memory_order_release);
         }
     } catch (...) {
@@ -12838,7 +12859,8 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     ggml_sycl_diag_emit_warn("[SYCL] model slot %u released: %zu registry rows, %zu cache entries reclaimed\n", slot,
                              rows, reclaimed);
     // Last, once this model's slot and terms are gone: with no model left live, what the caches sized for it goes too.
-    ggml_sycl_release_last_model_effects("model-release", ggml_sycl::unified_cache_release_cause::MODEL_RELEASED);
+    ggml_sycl_release_last_model_effects("model-release", ggml_sycl::unified_cache_release_cause::MODEL_RELEASED,
+                                         ggml_sycl_last_release_scope::EVERY_CACHE);
 }
 
 static ggml_sycl::lifecycle::quarantine_queue g_sycl_quarantine_queue;
@@ -13514,9 +13536,11 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     // every stage unconditionally, so no failed stage above can skip it.
     (void) ggml_sycl::unified_cache_drop_planned_load_terms(owner.owner);
     // With no model left live, what the failed load made the caches size goes as at the last model's release, and it
-    // reserves nothing: the next load's start does. noexcept and outside every try stage like the two steps above; it
-    // reports through its own lines, not through `clean`.
-    ggml_sycl_release_last_model_effects(site, ggml_sycl::unified_cache_release_cause::LOAD_ABORTED);
+    // reserves nothing: the next load's start does. A cache the failed load's own buffers still hold is marked, and
+    // the next load's start runs the release again for it. noexcept and outside every try stage like the two steps
+    // above; it reports through its own lines, not through `clean`.
+    ggml_sycl_release_last_model_effects(site, ggml_sycl::unified_cache_release_cause::LOAD_ABORTED,
+                                         ggml_sycl_last_release_scope::EVERY_CACHE);
     return clean;
 }
 
@@ -13988,6 +14012,12 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn
         // explicit UNKNOWN/no-plan candidate before any load effects.
         ggml_sycl::lifecycle_stage_no_placement_plan(result.txn.value);
         ggml_sycl_model_loading_effects(true, true);
+        // The release a failed load's buffers held off at its abort runs again before the reserve, inside this
+        // transaction, beside which no model's teardown begins. With no model live, a cache they no longer hold empties
+        // and its terms go back, so the reserve below starts this load as after the last model's release; a cache they
+        // still hold keeps its mark and its arena, and this load runs on that arena as it is.
+        ggml_sycl_release_last_model_effects("load-start", ggml_sycl::unified_cache_release_cause::LOAD_ABORTED,
+                                             ggml_sycl_last_release_scope::DEFERRED_CACHES);
         if (ggml_sycl_load_start_reserve_released_arenas()) {
             registry->bind_candidate(result.txn);
             // The load's span opens: its copies of mapped bytes are the load's (docs/design/sycl-mmap-host-tier.md
@@ -18942,8 +18972,9 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
 // The planner's zone decision still changes the device: the entry ensure may release the PP MoE ring as its last
 // resort, and it or the micro-batch's grow leg may rebuild an arena nothing holds. A refused load's abort tears that
 // arena down again when no model is live (ggml_sycl_release_last_model_effects), and the next load's start reserves
-// the early arena; while a model is live on another device, the rebuilt arena (or, after a failed reserve, no arena)
-// stays. A plan that needs the secondary MoE devices also creates their shared queues and caches, which stay.
+// the early arena; an arena the load's own buffers still hold at the abort stays, and that start runs the release
+// again before its reserve. While a model is live on another device, the rebuilt arena (or, after a failed reserve,
+// no arena) stays. A plan that needs the secondary MoE devices also creates their shared queues and caches, which stay.
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(
     ggml_backend_t                     backend,
     const ggml_sycl_tensor_inventory * inventory,
@@ -19391,8 +19422,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
         // The decide pass: every device plans and every refusal is decided before this pass's host zones, layer
         // streaming or stale-ring release, and the rollback guard's abort puts back what the pass published. The
         // planner's zone decision still changes a device here: the entry ensure's last resort releases a ring that
-        // alone holds the arena, and an arena nothing holds may be rebuilt for the plan's zones, which a refused load
-        // keeps (or no arena, after a failed reserve). The secondary MoE queues and caches a plan creates stay too.
+        // alone holds the arena, and an arena nothing holds may be rebuilt for the plan's zones. With no model live
+        // the abort's release of the last model tears that arena down again, or the next load's start does when the
+        // load's own buffers still hold it; while a model is live a refused load keeps it (or no arena, after a failed
+        // reserve). The secondary MoE queues and caches a plan creates stay too.
         for (int i = 0; i < n_devices; ++i) {
             ggml_backend_t backend = ggml_backend_sycl_init(i);
             if (!backend) {

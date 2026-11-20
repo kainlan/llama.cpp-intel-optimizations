@@ -32762,6 +32762,7 @@ unified_cache_last_release unified_cache::release_for_no_live_model(const char *
         // after the releases and before the teardown.
         process_deferred_frees_public();
         if (!arena_active()) {
+            last_release_deferred_.store(false, std::memory_order_release);
             return unified_cache_last_release::EMPTIED;
         }
 
@@ -32770,11 +32771,14 @@ unified_cache_last_release unified_cache::release_for_no_live_model(const char *
         zone_arena_holders holders = arena_read_holders(live_zone_used);
         if (!zone_arena_rebuild_allowed(holders)) {
             if (cause == unified_cache_release_cause::LOAD_ABORTED) {
-                // The failed model's buffers go with the model, after its abort: they are not a leak, and the next
-                // load's zone decision rebuilds the arena once nothing holds it.
+                // The failed model's buffers go with the model, after its abort: they are not a leak. The release is
+                // deferred, not dropped: the next load's start runs it again before its reserve, and empties the cache
+                // once nothing holds the arena; a load that starts while the buffers still hold it runs on it as it is.
+                last_release_deferred_.store(true, std::memory_order_release);
                 GGML_LOG_WARN(
                     "[VRAM-ARENA] last release on device %d (%s): the failed load's buffers still hold the arena "
-                    "(live_zone=%.1f MB chunk_leases=%u); it stays\n",
+                    "(live_zone=%.1f MB chunk_leases=%u); it stays: the next load's start releases it once nothing "
+                    "holds it, and a load that starts while it is held runs on it as it is\n",
                     dev_id, site, holders.live_zone_bytes / (1024.0 * 1024.0), holders.chunk_leases);
                 return unified_cache_last_release::ARENA_HELD;
             }
@@ -32802,6 +32806,7 @@ unified_cache_last_release unified_cache::release_for_no_live_model(const char *
             return unified_cache_last_release::TEARDOWN_REFUSED;
         }
         arena_released_.store(true, std::memory_order_release);
+        last_release_deferred_.store(false, std::memory_order_release);
         GGML_LOG_INFO(
             "[VRAM-ARENA] last release on device %d (%s): no model is live; the arena and the scratch sized for the "
             "last model are released, and the next load reserves the early arena again\n",

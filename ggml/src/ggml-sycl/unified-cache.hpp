@@ -5231,15 +5231,21 @@ class unified_cache {
     // the PP MoE oneDNN ring, the oneDNN scratchpad pair, the MoE reorder temp buffer and the pooled oneDNN Graph
     // scratch, drains the queued frees, then tears the arena down, which hands its memory back to the device. It stops
     // at the first thing that holds on, with an ERROR line that names it (a WARN for what a failed load's own buffers
-    // hold at its abort), and releases nothing after it; nothing is reaped, evicted or reset over a live handle. The
-    // next load's start reserves the arena of a cache it emptied again (reserve_released_arena). It reserves nothing
-    // itself and never throws: an exception ends it with an ERROR naming `site`.
+    // hold at its abort), and releases nothing after it; nothing is reaped, evicted or reset over a live handle. An
+    // arena a failed load's buffers hold at its abort (LOAD_ABORTED) marks the release deferred
+    // (last_release_deferred), and only a release that empties the cache clears that mark. The next load's start
+    // reserves the arena of a cache it emptied again (reserve_released_arena). It reserves nothing itself and never
+    // throws: an exception ends it with an ERROR naming `site`.
     unified_cache_last_release release_for_no_live_model(const char * site, unified_cache_release_cause cause) noexcept;
 
     // The start of a load: a cache whose arena the last release tore down reserves its early arena again from the
     // published terms, as the constructor did. True when there is nothing to reserve or the reserve succeeded; false
     // with `refusal` written when it failed, and the cache stays released, so the next load's start tries again.
     bool reserve_released_arena(zone_arena_refusal * refusal);
+
+    // A failed load's buffers held this cache's arena at its abort's release, and no release has emptied the cache
+    // since. The next load's start, before its reserve, runs that release again for a cache that answers true.
+    bool last_release_deferred() const { return last_release_deferred_.load(std::memory_order_acquire); }
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
     void       test_zone_boundary_check(vram_zone_id zone) { zone_boundary_check(zone); }
     mem_handle test_scratch_pool_owner() const;
@@ -6483,6 +6489,9 @@ class unified_cache {
     void              compute_arena_unbind();
     // The last release tore this cache's arena down, and no load's start has reserved it since.
     std::atomic<bool> arena_released_{ false };
+    // Set where a failed load's buffers hold the arena at its abort's release, cleared where a release empties the
+    // cache (last_release_deferred).
+    std::atomic<bool> last_release_deferred_{ false };
 
     // The load transaction whose keep of a short ONEDNN zone last warned on this device (zone_kept_onednn_warn_due). An
     // exchange, so two ensures of one load racing on the device warn once between them.

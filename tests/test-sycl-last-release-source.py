@@ -10,25 +10,29 @@ These checks pin the code that does it:
 The model release hook (ggml_sycl_release_model_slot_resources) and a failed load's abort
 (ggml_sycl_abort_owner_effects_noexcept) each end in one call of the one step, ggml_sycl_release_last_model_effects:
 the hook after its slot release and its terms' drop, the abort after the published terms' restore and the drop, outside
-every try stage. The step is noexcept, skips static destruction, asks each existing cache once (GLOBAL mode shares one
-cache between devices), does nothing more when a model is live, and puts a device's terms back only when its cache
-emptied, through the one list (load_published_terms{}.restore) under the inventory lock, never through setters of its
-own.
+every try stage, both with the scope EVERY_CACHE. The step is noexcept, skips static destruction, asks each existing
+cache once (GLOBAL mode shares one cache between devices), does nothing more when a model is live, and puts a device's
+terms back only when its cache was asked and emptied, through the one list (load_published_terms{}.restore) under the
+inventory lock, never through setters of its own. With the scope DEFERRED_CACHES it asks only a cache whose release a
+failed load's buffers deferred; a cache it leaves out keeps what it holds and its terms, and counts as emptied for the
+two-card flag only when it holds no arena. A step that asked no cache leaves that flag as it is.
 
 The cache member it calls, unified_cache::release_for_no_live_model, is noexcept and catches. In order: it returns when
 a model is live; waits once for one barrier over the cache's queues; releases the PP MoE oneDNN ring, the oneDNN
 scratchpad pair and the reorder temp buffer; drains the queued frees through the existing drain, once; reads the
 arena's holders; unbinds the compute arena; tears the arena down; and only then marks the cache released. Each release
 that refuses stops it with a line that names the refusal. A held arena is an ERROR with the holders named for a model
-release, a WARN at a failed load's abort (the failed model's buffers still hold it then); the release is INFO. The pair
-release refuses while a reservation holds the pair and frees outside the pair's lock. None of the new code aborts or
-asserts, and none of the release path reserves: no ensure, reserve or allocation.
+release, a WARN at a failed load's abort (the failed model's buffers still hold it then); the release is INFO. At the
+abort the held arena also marks the release deferred (last_release_deferred_), and only a release that empties the
+cache clears that mark. The pair release refuses while a reservation holds the pair and frees outside the pair's lock.
+None of the new code aborts or asserts, and none of the release path reserves: no ensure, reserve or allocation.
 
-The load's start (ggml_backend_sycl_model_load_begin) reserves a released cache's early arena after the caches exist
-and before the candidate is bound, and a reserve it cannot make refuses the load with PLAN_REJECTED after an ERROR line
+The load's start (ggml_backend_sycl_model_load_begin), inside its transaction and once the caches exist, first runs
+the step again for the deferred caches (LOAD_ABORTED, DEFERRED_CACHES), then reserves a released cache's early arena
+before the candidate is bound, and a reserve it cannot make refuses the load with PLAN_REJECTED after an ERROR line
 that names it. The released flag clears only after the arena is back.
 
-ji71: g_tiered_headroom_reserve, which nothing read, is gone with its INFO line and its static-storage census row. The
+g_tiered_headroom_reserve, which nothing read, is gone with its INFO line and its static-storage census row. The
 decide pass's last-resort ring release stays, and its comment says why: liveness is process-wide, so a model live on
 another device keeps this device's ring.
 
@@ -142,7 +146,7 @@ def mutate_in(src: str, sig: str, old: str, new: str) -> str:
 
 
 STEP_SIG = ("static void ggml_sycl_release_last_model_effects(const char * site, "
-            "ggml_sycl::unified_cache_release_cause cause) noexcept")
+            "ggml_sycl::unified_cache_release_cause cause, ggml_sycl_last_release_scope scope) noexcept")
 HOOK_SIG = "static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner)"
 ABORT_SIG = ('static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner, '
              'const char * site = "(unknown)") noexcept')
@@ -161,9 +165,13 @@ ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal
               "const zone_arena_ensure_options & options)")
 TERMS_RESTORE_SIG = "void load_published_terms::restore(int device, uint32_t groups) const noexcept"
 
+EVERY = "ggml_sycl_last_release_scope::EVERY_CACHE"
+DEFERRED = "ggml_sycl_last_release_scope::DEFERRED_CACHES"
 HOOK_CALL = ('ggml_sycl_release_last_model_effects("model-release", '
-             'ggml_sycl::unified_cache_release_cause::MODEL_RELEASED);')
-ABORT_CALL = "ggml_sycl_release_last_model_effects(site, ggml_sycl::unified_cache_release_cause::LOAD_ABORTED);"
+             f"ggml_sycl::unified_cache_release_cause::MODEL_RELEASED, {EVERY});")
+ABORT_CALL = f"ggml_sycl_release_last_model_effects(site, ggml_sycl::unified_cache_release_cause::LOAD_ABORTED, {EVERY});"
+START_CALL = ('ggml_sycl_release_last_model_effects("load-start", '
+              f"ggml_sycl::unified_cache_release_cause::LOAD_ABORTED, {DEFERRED});")
 STEP_NAME = "ggml_sycl_release_last_model_effects("
 DROP = "(void) ggml_sycl::unified_cache_drop_planned_load_terms(owner.owner);"
 ABORT_RESTORE = "ggml_sycl_load_published_terms_restore(owner.load.value);"
@@ -175,6 +183,17 @@ TERMS_RESET = "ggml_sycl::load_published_terms{}.restore(d);"
 INVENTORY_LOCK = "std::lock_guard inventory(g_tensor_inventory_mutex);"
 DEDUPE = "released[d] = first == d ? caches[d]->release_for_no_live_model(site, cause) : released[first];"
 SHUTDOWN_SKIP = "if (ggml_sycl::ggml_sycl_is_shutting_down()) { return; }"
+SCOPE_EVERY = f"const bool every = scope == {EVERY};"
+ASK = "asked[d] = first == d ? (every || caches[d]->last_release_deferred()) : asked[first];"
+LEFT_OUT = "if (!asked[d]) { all_emptied = all_emptied && !caches[d]->arena_active(); continue; }"
+TERMS_RESET_IF = f"if (asked[d] && released[d] == {EMPTIED}) {{"
+TWO_CARD = "if (all_emptied && (every || asked_any)) { g_moe_multi_gpu_active.store(false"
+DEFER_SET = "last_release_deferred_.store(true, std::memory_order_release);"
+DEFER_CLEAR = "last_release_deferred_.store(false, std::memory_order_release);"
+DEFER_MEMBER = "std::atomic<bool> last_release_deferred_{ false };"
+DEFER_READ = "bool last_release_deferred() const { return last_release_deferred_.load(std::memory_order_acquire); }"
+HELD_HEAD = "if (!zone_arena_rebuild_allowed(holders)) {"
+ABORTED_HEAD = "if (cause == unified_cache_release_cause::LOAD_ABORTED) {"
 
 MEMBER_ORDER = (
     "if (live_model_mask() != 0) { return unified_cache_last_release::MODEL_LIVE; }",
@@ -257,17 +276,20 @@ def check_step(gs: str) -> list:
         out.append("the step does not skip static destruction")
     if DEDUPE not in body or "if (caches[e] == caches[d]) {" not in body:
         out.append("the step asks a cache it already asked")
-    if not ordered(body, DEDUPE, f"if (released[d] == {MODEL_LIVE}) {{ return; }}", f"if (released[d] == {EMPTIED}) {{",
-                   INVENTORY_LOCK, TERMS_RESET):
-        out.append("the step resets a device's terms while a model is live or when its cache did not empty")
+    if SCOPE_EVERY not in body or not ordered(body, "if (caches[e] == caches[d]) {", ASK, LEFT_OUT, DEDUPE):
+        out.append("the step asks a cache its scope leaves out, or counts one it left out as emptied with an arena")
+    if not ordered(body, DEDUPE, f"if (released[d] == {MODEL_LIVE}) {{ return; }}", TERMS_RESET_IF, INVENTORY_LOCK,
+                   TERMS_RESET):
+        out.append("the step resets a device's terms while a model is live, or when its cache was not asked or did not "
+                   "empty")
     if body.count(TERMS_RESET) != 1:
         out.append("the step does not reset the terms through the one list exactly once")
     for setter in ("unified_cache_set_planned_", "unified_cache_store_planned_", "onednn_zone_plan_store",
                    "onednn_zone_plan_put_back"):
         if setter in body:
             out.append(f"the step sets a term itself: {setter}")
-    if f"if (all_emptied) {{ g_moe_multi_gpu_active.store(false" not in body:
-        out.append("the step does not put the two-card flag back once every cache emptied")
+    if TWO_CARD not in body:
+        out.append("the step does not put the two-card flag back once every cache emptied, or does when it asked none")
     for reserve in RESERVERS:
         if reserve in body:
             out.append(f"the step reserves: {reserve}")
@@ -333,6 +355,27 @@ def check_refusals_named(uc: str) -> list:
     return out
 
 
+def check_deferred_mark(uc: str, uh: str) -> list:
+    body = fn_body(uc, MEMBER_SIG)
+    if not body:
+        return ["the cache's last release member is missing"]
+    out = []
+    aborted = _branch(_branch(body, HELD_HEAD), ABORTED_HEAD)
+    if not ordered(aborted, DEFER_SET, "return unified_cache_last_release::ARENA_HELD;"):
+        out.append("a held arena at a failed load's abort does not mark the release deferred")
+    if uc.count("last_release_deferred_.store(true") != 1:
+        out.append("the deferred mark is set somewhere other than at a failed load's held arena")
+    if f"if (!arena_active()) {{ {DEFER_CLEAR} return unified_cache_last_release::EMPTIED; }}" not in body \
+            or not ordered(body, "arena_released_.store(true, std::memory_order_release);", DEFER_CLEAR,
+                           "return unified_cache_last_release::EMPTIED;"):
+        out.append("a release that empties the cache does not clear the deferred mark")
+    if uc.count("last_release_deferred_.store(false") != 2 or body.count(DEFER_CLEAR) != 2:
+        out.append("the deferred mark clears somewhere other than where the release empties the cache")
+    if DEFER_MEMBER not in uh or DEFER_READ not in uh:
+        out.append("the cache does not carry the deferred mark, or does not answer it")
+    return out
+
+
 def check_pair(uc: str) -> list:
     body = fn_body(uc, PAIR_SIG)
     if not body:
@@ -382,6 +425,14 @@ def check_load_start(gs: str, uc: str) -> list:
                    "if (ggml_sycl_load_start_reserve_released_arenas()) {", "registry->bind_candidate(result.txn);",
                    "return GGML_SYCL_LIFECYCLE_OK;"):
         out.append("the load's start does not reserve the released arenas after the caches exist and before binding")
+    # Inside the load's transaction, which no model's teardown can begin beside, and before the reserve, which then
+    # reserves the arena of a cache the deferred release emptied.
+    if not ordered(begin, "result = registry->begin_outer();", "ggml_sycl_model_loading_effects(true, true);",
+                   START_CALL, "if (ggml_sycl_load_start_reserve_released_arenas()) {"):
+        out.append("the load's start does not run the deferred release inside its transaction, once the caches "
+                   "exist and before its reserve")
+    if gs.count(DEFERRED) != 1 or begin.count(START_CALL) != 1:
+        out.append("the deferred release runs somewhere other than once at the load's start")
     # One roll-back path below the try, for a refused reserve and an exception alike, so the abort keeps its one
     # literal site tag: a refused reserve leaves the try with PLAN_REJECTED, an exception with EFFECT_FAILED.
     if "ggml_sycl_lifecycle_result rollback_code = GGML_SYCL_LIFECYCLE_PLAN_REJECTED; try {" not in begin:
@@ -470,6 +521,10 @@ def test_member_names_what_holds_on():
     assert check_refusals_named(UC) == []
 
 
+def test_member_marks_a_deferred_release():
+    assert check_deferred_mark(UC, UH) == []
+
+
 def test_pair_release_frees_outside_its_lock():
     assert check_pair(UC) == []
 
@@ -526,7 +581,24 @@ def test_witness_step_resets_terms_by_setter():
 
 
 def test_witness_step_resets_terms_of_a_cache_that_kept_its_arena():
-    assert check_step(mutate_in(GS, STEP_SIG, f"if (released[d] == {EMPTIED}) {{", "if (true) {"))
+    assert check_step(mutate_in(GS, STEP_SIG, TERMS_RESET_IF, "if (true) {"))
+
+
+def test_witness_step_resets_terms_of_a_cache_it_left_out():
+    assert check_step(mutate_in(GS, STEP_SIG, TERMS_RESET_IF, f"if (released[d] == {EMPTIED}) {{"))
+
+
+def test_witness_start_asks_every_cache():
+    assert check_step(mutate_in(GS, STEP_SIG, ASK, "asked[d] = first == d ? true : asked[first];"))
+
+
+def test_witness_left_out_cache_counts_as_emptied():
+    assert check_step(mutate_in(GS, STEP_SIG, "all_emptied = all_emptied && !caches[d]->arena_active(); continue;",
+                                "continue;"))
+
+
+def test_witness_start_that_asked_none_puts_the_two_card_flag_back():
+    assert check_step(mutate_in(GS, STEP_SIG, "if (all_emptied && (every || asked_any)) {", "if (all_emptied) {"))
 
 
 def test_witness_step_resets_terms_while_a_model_is_live():
@@ -586,9 +658,28 @@ def test_witness_held_arena_not_named():
 
 
 def test_witness_held_arena_at_abort_is_an_error():
-    m = mutate_in(UC, MEMBER_SIG, "if (cause == unified_cache_release_cause::LOAD_ABORTED) { GGML_LOG_WARN(",
-                  "if (cause == unified_cache_release_cause::LOAD_ABORTED) { GGML_LOG_ERROR(")
+    m = mutate_in(UC, MEMBER_SIG, f"{ABORTED_HEAD} {DEFER_SET} GGML_LOG_WARN(",
+                  f"{ABORTED_HEAD} {DEFER_SET} GGML_LOG_ERROR(")
     assert check_refusals_named(m)
+
+
+def test_witness_abort_does_not_mark_the_release_deferred():
+    assert check_deferred_mark(mutate_in(UC, MEMBER_SIG, DEFER_SET, ""), UH)
+
+
+def test_witness_model_release_marks_the_release_deferred():
+    m = mutate_in(UC, MEMBER_SIG, DEFER_SET, "")
+    assert check_deferred_mark(mutate_in(m, MEMBER_SIG, HELD_HEAD, DEFER_SET + " " + HELD_HEAD), UH)
+
+
+def test_witness_refused_release_clears_the_mark():
+    assert check_deferred_mark(mutate_in(UC, MEMBER_SIG, "return unified_cache_last_release::RING_CLAIMED;",
+                                         DEFER_CLEAR + " return unified_cache_last_release::RING_CLAIMED;"), UH)
+
+
+def test_witness_emptied_cache_without_an_arena_keeps_the_mark():
+    assert check_deferred_mark(mutate_in(UC, MEMBER_SIG, "if (!arena_active()) { " + DEFER_CLEAR,
+                                         "if (!arena_active()) {"), UH)
 
 
 def test_witness_teardown_refusal_unnamed():
@@ -614,6 +705,27 @@ def test_witness_load_binds_before_the_reserve():
                                  "result.txn);",
                   "registry->bind_candidate(result.txn); if (ggml_sycl_load_start_reserve_released_arenas()) {")
     assert check_load_start(m, UC)
+
+
+def test_witness_load_start_skips_the_deferred_release():
+    assert check_load_start(mutate_in(GS, BEGIN_SIG, START_CALL, ""), UC)
+
+
+def test_witness_deferred_release_after_the_reserve():
+    m = mutate_in(GS, BEGIN_SIG, START_CALL, "")
+    assert check_load_start(mutate_in(m, BEGIN_SIG, "registry->bind_candidate(result.txn);",
+                                      START_CALL + " registry->bind_candidate(result.txn);"), UC)
+
+
+def test_witness_deferred_release_outside_the_transaction():
+    m = mutate_in(GS, BEGIN_SIG, START_CALL, "")
+    assert check_load_start(mutate_in(m, BEGIN_SIG, "registry = &ggml_sycl::lifecycle::global_registry();",
+                                      START_CALL + " registry = &ggml_sycl::lifecycle::global_registry();"), UC)
+
+
+def test_witness_abort_asks_only_the_deferred_caches():
+    m = mutate_in(GS, ABORT_SIG, ABORT_CALL, ABORT_CALL.replace(EVERY, DEFERRED))
+    assert check_abort(m) and check_load_start(m, UC)
 
 
 def test_witness_start_refusal_is_retried():
