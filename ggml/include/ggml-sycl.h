@@ -417,10 +417,11 @@ struct ggml_sycl_tensor_inventory {
     const uint8_t *                kv_layer_kind;         // Per-layer enum ggml_sycl_kv_layer_kind [kv_layer_count]
     uint32_t                       kv_layer_count;        // Length of the three arrays above (0 = not populated)
     // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds on the device ahead of the
-    // routed experts; n_ctx above stays the load's own planning shape. llama.cpp-ak0p: libllama fills it with the
-    // context the caller is about to create (llama_model_params::n_ctx_hint), padded as llama_context pads n_ctx for
-    // a single sequence; a caller that names no n_ctx asks for the model's default context, n_ctx_train
-    // (n_ctx_context_is_default, llama.cpp-7fmt). 0 = no request reached the load: no room is held. libllama and
+    // routed experts and which the oneDNN Graph scratch floor is sized for; n_ctx above stays the load's own planning
+    // shape. llama.cpp-ak0p: libllama fills it with the context the caller is about to create
+    // (llama_model_params::n_ctx_hint), padded as llama_context pads n_ctx for a single sequence; a caller that names
+    // no n_ctx asks for the model's default context, n_ctx_train (n_ctx_context_is_default, llama.cpp-7fmt). 0 = no
+    // request reached the load: no room is held, and the floor takes the planning shape's n_ctx. libllama and
     // libggml-sycl must be rebuilt together for the planner to see it (see n_ctx_context_is_default for the layout).
     uint32_t                       n_ctx_context;
     // llama.cpp-8ecj: the key width of each layer's indexer key cache (llama_memory_hybrid_idx, qwen4exp: one key head
@@ -466,7 +467,9 @@ struct ggml_sycl_tensor_inventory {
     // The micro-batch the caller named for the context it is about to create (llama_model_params::n_ubatch_hint);
     // 0 = none named, which includes a micro-batch the backend picks itself. When it is above n_ubatch, the planner
     // plans the PP MoE oneDNN scratch ring in the RUNTIME zone for it and moves routed experts from the device to the
-    // host tier for the room, as it re-places KV that does not fit. It sits in the padding after the bools, so the
+    // host tier for the room, as it re-places KV that does not fit. The oneDNN Graph scratch floor is sized for it and
+    // n_ctx_context; when it is 0, for the planning micro-batch (the placement envelope's n_ubatch when the envelope
+    // names one, else n_ubatch). It sits in the padding after the bools, so the
     // struct stays 192 bytes (pinned below and in ggml-sycl.cpp). A libllama built before this field leaves the padding
     // as the caller's object holds it: zero for every `= {}` inventory libllama builds. libllama and libggml-sycl must
     // still be rebuilt together for the planner to see it.
@@ -2099,8 +2102,10 @@ GGML_BACKEND_API enum ggml_sycl_residency_probe_status ggml_backend_sycl_probe_r
 // zone reservations only on a device whose cache has an active arena, so on a device without one the plan's device
 // share is an upper bound and its host terms a lower bound, and one [PLAN-DRY-RUN] line names each such device: every
 // physical device a multi-device plan packs, and the scheduler-visible device of a single-device plan. An explicit
-// micro-batch above the load's planning shape (inventory->n_ubatch_context) is not modelled: every plan is the
-// planning-shape plan.
+// micro-batch above the load's planning shape (inventory->n_ubatch_context) is not modelled: KV and the MoE prompt path
+// are planned at the planning shape, without that micro-batch's RUNTIME room. The plans size the oneDNN Graph scratch
+// floor for the context the model opens with (n_ctx_context, n_ubatch_context), but no figure the dry run reports
+// includes it: a device share subtracts the ONEDNN zone an active arena already holds, or none.
 
 #define GGML_SYCL_PLAN_DRY_RUN_VERSION     1
 #define GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES 16

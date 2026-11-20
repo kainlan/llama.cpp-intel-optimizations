@@ -252,7 +252,8 @@ def claim_site_count_costs_one_relaxed_add(uc: str, uch: str) -> bool:
 
 # ---- the refusal names the holders by site and lists each live zone ----
 
-ENSURE_SIG = "bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal)"
+ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
+              "const zone_arena_ensure_options & options)")
 REFUSAL_LINE = '"[VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: "'
 HOLDERS_LINE = '"[VRAM-ARENA] live in the arena on device %d (MB): %s; deferred_in_arena=%zu (%.1f MB requested) "'
 SITE_LINE = '"[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\\n"'

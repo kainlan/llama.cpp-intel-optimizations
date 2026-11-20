@@ -138,7 +138,8 @@ STALE_SIG = "static void ggml_sycl_release_stale_kv_zone_ring("
 STAGE_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan("
 EXPORTED_EARLY_SIG = "void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t backend,"
 EXPORTED_LATE_SIG = "void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend,"
-UC_ENSURE_SIG = "bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal)"
+UC_ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
+                 "const zone_arena_ensure_options & options)")
 DECIDE_SIGS = (POPULATE_SIG, BUDGET_SIG, COMPUTE_SIG, PUBLISH_SIG, EARLY_SIG, LATE_SIG)
 
 RING_RELEASE = "release_pp_moe_onednn_scratch_ring("
@@ -182,9 +183,9 @@ def claim_decide_pass_releases_the_ring_only_at_the_entry_ensure(gs: str) -> boo
     loop = block_at(stage_try(gs), stage_try(gs).find(DECIDE_LOOP))
     return (
         ensure.count(RING_RELEASE) == 1
-        and ordered(ensure, "ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal)", ONLY_RING_GUARD,
-                    "cache->" + RING_RELEASE, "refusal = {};",
-                    "return ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal);")
+        and ordered(ensure, "ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options)",
+                    ONLY_RING_GUARD, "cache->" + RING_RELEASE, "refusal = {};",
+                    "return ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options);")
         and compute.count("ggml_sycl_ensure_load_arena_zones(") == 1
         and ordered(compute, ENTRY_ENSURE, "compute_multi_device_plan(")
         and c.count("ggml_sycl_ensure_load_arena_zones(") == 2  # the definition and the entry ensure
@@ -350,7 +351,8 @@ def test_witness_last_resort_without_its_guard():
 
 def test_witness_fallback_ensure_releases_the_ring_too():
     mutated = mutate_in(GS, COMPUTE_SIG, "if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, "
-                        "&refusal)) {", "if (!ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)) {")
+                        "&refusal, ggml_sycl_load_arena_options())) {",
+                        "if (!ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)) {")
     assert not claim_decide_pass_releases_the_ring_only_at_the_entry_ensure(mutated)
 
 

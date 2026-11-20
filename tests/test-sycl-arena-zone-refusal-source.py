@@ -93,7 +93,8 @@ def mutate_in(src: str, sig: str, old: str, new: str) -> str:
     return c[:s] + body.replace(old, new, 1) + c[s + len(body) :]
 
 
-ENSURE_SIG = "bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal)"
+ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
+              "const zone_arena_ensure_options & options)")
 
 # ---- the refusal names who holds the arena ----
 

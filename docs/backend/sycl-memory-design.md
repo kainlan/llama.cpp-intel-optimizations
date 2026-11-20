@@ -566,10 +566,13 @@ ticket reproduced on:
   combination compiles its OWN partition via `sdpa_partition_cache`, and each
   can request its own scratch the first time it executes.
   `onednn_graph_scratch_zone_floor_bytes_swa()` now computes, per
-  attention window class,
-  `floor = max(64 MiB, 1.5 x max(n_head_ctx_max x n_ctx,
+  attention window class (through the pure
+  `zone_onednn_graph_scratch_floor_bytes()`, `zone-sizing.cpp`),
+  `floor = max(64 MiB, min(1.5 x max(n_head_ctx_max x n_ctx,
   n_head_swa_max x min(n_ctx, n_swa + n_ubatch)) x n_ubatch x
-  sizeof(f32))`, where
+  sizeof(f32), direct_cap))`, except that a `direct_cap` of 0 (what
+  `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB=0` sets) means no cap: the floor is
+  then `max(64 MiB, 1.5 x ...)`, the formula unbounded, not 64 MiB. Here
   the `1.5x` factor covers ~5 SDPA scratch buffers measured concurrently
   in flight even on an idle host (the quantity the zone must actually
   hold is the PEAK OUTSTANDING size across whichever of those shapes are
@@ -591,9 +594,13 @@ ticket reproduced on:
   (`fattn-onednn.cpp`) since `llama-model.cpp` cannot include that
   SYCL-only source directly; the two copies are kept in sync by
   `test-sycl-onednn-graph-floor-eligibility-source.py`. Fed by
-  `unified_cache_set_planned_onednn_graph_scratch_shape()` at the same
-  "oneDNN scratchpad:" planning step (`populate_host_zone_sizing()`,
-  `unified-cache.cpp`). Fit to five Mistral 7B Q4_0 (n_head_ctx_max=32,
+  `unified_cache_publish_planned_onednn_graph_scratch_shape()`, which
+  records `unified_cache_plan_onednn_graph_scratch_shape()`'s answer from
+  the load's KV info and envelope: once before a single-device stage sizes
+  the arena zones, and again from the same inputs at the "oneDNN
+  scratchpad:" planning step (`populate_host_zone_sizing()`,
+  `unified-cache.cpp`), so the zone a plan packs against is sized for the
+  shape that plan records. Fit to five Mistral 7B Q4_0 (n_head_ctx_max=32,
   no SWA layers, so the ctx term equals the old flat formula exactly)
   measurements spanning two independent axes (48/192/768 MB at ubatch
   512 and n_ctx 512/2048/8192; 96/48 MB at n_ctx 2048 and ubatch
@@ -622,6 +629,95 @@ ticket reproduced on:
   clamped to 64 MiB, matching the probe exactly — an 8x reduction in
   modeled demand vs. the flat formula's 192 MB (still 3x after the
   64 MiB clamp).
+  `direct_cap` is the DIRECT Graph-scratch cap, the one the dispatcher
+  halves to split each oneDNN attention execute, so a split execute holds
+  no more Graph scratch than the cap, unless one query row alone exceeds
+  half of it (the one-row case of the `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`
+  row), and the floor (with a nonzero cap and no ZONE_MB override) never
+  reserves more than the larger of the cap and the 64 MiB minimum (a cap
+  below 64 MiB, a budget under 256 MiB, leaves the minimum). The cap is
+  1 GiB until the first successful
+  `ensure_planned_arena_zones()` and `min(1 GiB, a quarter of the budget
+  snapshot that ensure stores)` after it
+  (`GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` overrides both). The snapshot
+  does not rise while the arena is kept: an ensure whose zones already
+  hold the plan, and one that keeps a short ONEDNN zone (next paragraph),
+  store the lower of the snapshot held and the budget now (0 is unset),
+  and only a rebuild stores the budget now, above or below the one held.
+  Within one model's load the budget only falls anyway: its first sizing
+  at the real shape runs before weights load, when the budget is largest.
+  Across tenants of one cache it could rise, when another model on the
+  device releases memory; a snapshot that followed it would raise the cap
+  (while a quarter of the snapshot is below 1 GiB) and, for a shape whose
+  formula exceeded the old cap, the floor of a zone that already serves
+  that shape together with the DIRECT path, and so ask for a rebuild the
+  shape does not need.
+
+  **A kept ONEDNN zone.** The Graph floor is a reservation, not a
+  requirement: what the zone cannot hold of it is served on the DIRECT
+  path under the cap, and a runtime context whose Graph scratch does not
+  fit outside the arena is refused by name at the context. So when
+  `ensure_planned_arena_zones()` needs a rebuild that something live
+  blocks, and the ONEDNN zone is the only zone short while it still holds
+  the primitive-API pair (the larger of the pair planned and the pair
+  already held in it, which has no DIRECT fallback), it keeps the zones as
+  they are instead of refusing the load. It stores a zone plan whose Graph
+  floor is what the zone holds beyond that pair, so the pair bound over
+  the stored plan still admits the pair and the Graph room the context
+  check reads is the zone's real room, and it logs one `[VRAM-ARENA]
+  device N keeps its ONEDNN zone of ...` WARN per load and device (at
+  every keep for a caller outside a staged load), naming the planned
+  floor, the zone kept and the Graph room left. The plan's `[SYCL-PLAN]
+  oneDNN Graph-scratch zone floor:` line and the DIRECT-failure ERROR still
+  print the formula floor, and append `; the ONEDNN zone's stored plan
+  holds only <X> MB of it as Graph room` whenever the stored plan holds
+  less than that, read as the plan stands when the line prints (on a
+  multi-device plan the zones are ensured after the floor line). A
+  rebuild, which gives the load its whole floor, is preferred to a keep:
+  when the arena's only holder is a PP MoE ring that a freed context left
+  behind, the load stage's entry first releases the ring and asks again,
+  and a short zone is kept only once that last resort is spent (the ring
+  released with something else still holding, or the ring kept because a
+  prefill's claim on a slot is held).
+  A SCRATCH or RUNTIME shortfall, or an ONEDNN zone below the pair, is
+  still the `REBUILD_HELD` refusal that names the holders. The zone plan a
+  keep or the sufficient path stores is a description (the pair plan and
+  the Graph floor) and moves no memory, so it is one more group of the
+  terms a failed load puts back (`LOAD_PUBLISHED_GROUP_ZONE_PLAN`): while
+  the stored plan still holds what the load left, the restore stores
+  `zone_onednn_plan_keep_short(prior, prior, capacity now, held pair now)`
+  on the device's cache under its zone-plan mutex, which is the prior plan
+  exactly while the zone still holds it, and a smaller Graph floor when the
+  zone was rebuilt smaller or a pair was reserved under the failed load's
+  wider bound in between. A failed load therefore leaves the live model the
+  Graph room it had. A live model's pair reserve whose zone ensure runs
+  between the load's two passes stores outside the load's window, so the
+  record notes its plan as another publisher's prior: a refused load's
+  put-back is still sound (the floor is clamped to the zone as it is), but
+  it keeps that reserved pair. The cap snapshot is not put back: it
+  describes the arena as it stands, and a failed load that rebuilt the
+  arena leaves the rebuilt arena in place, so the snapshot stored at that
+  rebuild is the one that arena's cap is derived from.
+
+  **Where the zone plan lives.** The plan is a member of the `unified_cache`
+  that owns the zone (`unified_cache::onednn_zone_plan_`, under that cache's
+  own `onednn_zone_plan_mutex_`, a leaf: each accessor takes it alone and
+  takes nothing under it, so it may be taken under any lock), never a
+  per-device store. The pair reserve, its refusal and the DIRECT-failure
+  ERROR read their own cache's plan; the pair-bound and Graph-room accessors
+  read the plan of the cache whose capacity they read; the published-terms
+  snapshot and the plan's floor line, which hold only a device id, read the
+  plan of that device's existing cache (none is created for them), and a
+  failed load's restore puts the plan back on that cache, clamped to that
+  cache's own zone. A per-device store let a second cache on one device, an
+  arena reserved by hand in a test, be judged by the plan the device's own
+  cache stored: its 8 MiB zone got a pair bound of 0 and every pair was
+  refused. A cache whose zone `ensure_planned_arena_zones()` never sized
+  holds the default plan (all figures zero), and a pair in that zone is
+  bounded by the zone's capacity alone: nothing planned a Graph floor into
+  it, and a Graph scratch the pair leaves no room for takes the DIRECT path
+  under its cap.
+
   ⚠️ **This gemma4 example describes the formula's behavior for the
   `n_ctx` it is actually given at PLANNING time, which is NOT today's
   real runtime context by default.** The floor is computed once, at
@@ -760,8 +856,10 @@ ticket reproduced on:
   executes whose scratch fits half of
   `unified_cache_onednn_graph_scratch_direct_cap_bytes()`, the cap this
   allocator enforces (`fattn-onednn-chunk.hpp`). A full chunk's buffer and
-  the shorter last chunk's buffer then fit under the cap together, so each
-  chunk goes through the bounded wait rather than the early-out. The
+  the shorter last chunk's buffer then fit under the cap together, unless
+  one query row alone exceeds half of it (the chunks are then one row each,
+  and two of them can exceed the cap together), so each chunk goes through
+  the bounded wait rather than the early-out. The
   early-out stays reachable when one query row alone exceeds the cap, and
   at a cap of 0.
 - **Pool completion checks go through a host-visible flag written by a
@@ -2597,6 +2695,116 @@ new hardware evidence that k1ev's consumer is understood and bounded
 — the reasoning behind each retired predicate was sound in isolation
 and still wrong in practice, which is the whole lesson of this subsection.
 
+### The flash-attention counterpart: oneDNN Graph scratch above the planned zone
+
+With flash attention on, attention runs through oneDNN Graph SDPA, whose
+scratch lives in the ONEDNN zone beside the primitive-API pair. The load sizes
+that zone's Graph room for the shape it was told (the Graph floor above). A
+later context can ask for more: a micro-batch the automatic micro-batch trial
+probes above the planned one, a larger `-c` than the hint, or an API caller
+that gave none. The part of its scratch above the room goes DIRECT
+(`onednn_graph_scratch_alloc_direct_locked()`, `unified-cache.cpp`), which
+names no zone and so draws raw device memory outside the arena, and which
+aborts the process when the card has none left.
+
+The runtime-context transaction therefore asks, right after the non-FA check
+and before the dense scratch is re-planned
+(`ggml_sycl_check_onednn_graph_scratch()`,
+`ggml-sycl.cpp`), whether that part fits outside the arena. When the
+context's Graph scratch (`zone_onednn_graph_scratch_floor_bytes()` at the
+context's own shape and the DIRECT cap) exceeds the Graph room (the part of
+the zone no other planned consumer may take), the part above the room, plus
+the hold's worst-case spill
+(`ggml_sycl_planned_scratch_hold_spill_bound()`, the figure the non-FA check
+adds), must leave the 256 MiB driver headroom
+(`kSyclArenaMinExternalHeadroomBytes`) of the free memory the non-FA check
+compares with (`unified_cache_hold_free_before()`, the cache's ledger, not a
+bare driver read). A scratch the room holds draws nothing outside the arena,
+so it fits whatever the free memory and the spill are (the hold check judges
+its own spill): a card already under the headroom still runs a micro-batch
+the room holds, and a refusal there names the largest one. The arithmetic is
+`zone_onednn_graph_uncovered_bytes()` and `zone_onednn_graph_fit_largest_ub()`
+(`zone-sizing.cpp`, `test-zone-sizing` Case 24h).
+
+The Graph room is the room no other planned consumer may take: the ONEDNN
+zone's capacity less the most the pair admission lets the primitive-API pair
+grow to (`unified_cache_get_onednn_pp_pair_bound()`: its plan, or the capacity
+less the Graph floor when that is larger, from the plan the same cache stored
+when it sized the zone). `unified_cache_get_onednn_graph_room()` returns it
+from one read of the capacity, so an ensure that rebuilds the zone between
+two reads cannot pair one capacity with the bound of another. It is not the
+capacity less the pair's live plan: an op's pair admitted into the slack
+above its plan is not given back, so room counted there could be taken from
+under the context this check passed. Two draws nobody plans can still
+take part of the room: the per-op primitive user scratchpads
+(`allocate_onednn_scratchpad()`, `common.hpp`), which also prefer the ONEDNN
+zone, and the pair's growth step, which holds the superseded pair and the new
+one in the zone at once while the old one drains. A Graph request they crowd
+out goes DIRECT; the check does not count them.
+
+**Design choice: refuse only when the part above the zone does not fit
+outside the arena.** Refusing every context whose Graph scratch exceeds the
+zone was rejected: it would refuse Qwen at `-ub 2048`, which runs correctly
+with the part above the zone served by the DIRECT path (at most the cap
+outstanding), whenever the load's hint was smaller.
+
+The check stands aside when flash attention is off (the non-FA check above
+covers that path) and when the Graph allocator is disabled
+(`GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0`). On a real transaction the optional
+layout copies have already yielded by then, as for the non-FA refusal. It has
+no side effect beyond the free-memory reading the non-FA check also takes, so
+an auto-ubatch probe asks it too and the ladder sees the verdict a real context
+would get. The refusal (`ggml_sycl_onednn_graph_scratch_advice()` writes its
+last clause) names the load argument in which the refused shape exceeds the
+shape the load published, and the largest power-of-two `-ub` whose part fits
+as loaded. For a rung of the automatic micro-batch trial, the micro-batch
+differs:
+
+```
+[SYCL-PLAN] runtime context update rejected: the oneDNN Graph attention scratch at n_ubatch=<N> n_ctx=<C>
+(<D> MB, bounded by the <K> MB DIRECT cap) exceeds the <R> MB of the ONEDNN zone no other planned consumer may
+take (the zone less the most the primitive-API pair may grow to), and the <U> MB above it, with the hold's <H> MB
+worst-case spill, would leave device <d> under the 256.0 MB driver headroom (<F> MB free); the load planned the
+zone for n_ubatch=<PN> n_ctx=<PC>; pass -ub <N> at load so the zone is planned for it, or run -ub <L>
+```
+
+The last clause names `-c <C>` when the context is the larger one, both
+`-ub <N> and -c <C>` when both are, and neither when the shape is not above
+the published one (the room is then smaller than the zone's plan for it, so
+only `run -ub <L>` is offered). A device with no published shape says so and
+names both. When no rung fits, `run -ub <L>` becomes `no -ub fits as loaded`.
+
+The printed figures add up: `<U>` is `<D>` less `<R>`, and `<D>` is at most
+`<K>` unless the 64 MiB minimum is larger. With the cap 0 (no cap) the
+`, bounded by ... DIRECT cap` clause is left out and `<D>` is the formula.
+
+A default command reaches this check. Without `-ub`, `common` gives the load
+no micro-batch hint while its automatic micro-batch trial is on, so the load
+plans the Graph room at its planning micro-batch, 512. The trial then probes
+its rungs above 512 through this transaction in probe mode, and each such rung
+asks for more than the room whenever the context is below the one at which
+the DIRECT cap already binds at 512. Two device runs on the B50 (Mistral 7B
+Q4_0, the Mistral gate prompt, no `-ub`):
+
+- `-c 4096`, default cap: the room is 384 MB. Rungs 1024 and 2048 ask for
+  more, the part above the room fits outside the arena, and both are
+  admitted. The trial picks 2048, the same micro-batch as before this check.
+- `-c 8192` with `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB=4096`: the room is
+  768 MB. Rung 1024 (1536 MB, 768 MB above the room, 1556.1 MB free) is
+  admitted. Rung 2048 (3072 MB, 2304 MB above the room) is refused at INFO,
+  and the refusal names 1024. The trial runs 1024 and the output is right.
+
+A probe refusal is logged at INFO and only lowers the trial's rung. With the
+default cap the demand is at most 1 GiB, so a probe is refused only when the
+free memory outside the arena is below the 256 MiB headroom plus the hold's
+spill plus (1 GiB less the room). That condition, not a known default
+command, is when a default configuration sees the refusal: Mistral on the B50
+leaves about 1.5 GB outside the arena, so no default Mistral command does. A
+context larger than the hint, or an API caller that names none, reaches the
+check the same way. A context that auto flash attention later resolves to off was
+judged with flash attention on here (the transaction runs before the
+resolution) and is not re-asked by the narrow recheck.
+
 ### A context-time consumer: the PP MoE oneDNN ring above the RUNTIME zone
 
 The PP MoE oneDNN scratch ring is one weight slot plus two slots that scale with
@@ -2931,7 +3139,12 @@ The arena can fail to grow for three reasons, and each prints its own line first
   the arena keeps its memory through a rebuild and does not count
   (`zone_arena_rebuild_allowed()` decides). Another live model's allocations are
   one cause; scratch an earlier model left in the arena, and handles that still
-  lease a chunk, are others. `ensure_planned_arena_zones()` refuses the rebuild
+  lease a chunk, are others. When the ONEDNN zone's Graph floor is all the zones
+  lack, the zones are kept as they are with a WARN ("A kept ONEDNN zone" above),
+  and with no ERROR unless a PP MoE ring alone held the arena: the load's first
+  ask, made before the ring's release, has then already printed the ERROR lines
+  below and recorded the reject before the later ask keeps the zones. Otherwise
+  `ensure_planned_arena_zones()` refuses the rebuild
   with an ERROR, names the holders on a second ERROR, prints the chunk leases by
   the site that took them on a WARN, and lists the live allocations of each zone
   with live bytes:
@@ -2953,7 +3166,10 @@ The arena can fail to grow for three reasons, and each prints its own line first
   chunk lease), a model load's entry ensure releases the ring after these lines
   and asks for the zones again, with a WARN that says so; the ring is kept while
   a prefill's claim on one of its slots is still held, with a WARN that says so,
-  and the load is refused as for any holder.
+  and the load is refused as for any holder, unless the Graph floor was all the
+  zones lacked: the entry then asks once more and the zones are kept short. The
+  first ask, made before the release, keeps nothing ("A kept ONEDNN zone" above
+  says why).
 
   The sites are `weight_snapshot`, `weight_resolve`, `chunk_view` (a handle made
   from a raw pointer for one use), `tensor_extra`, `expert_dispatch` and
@@ -3267,7 +3483,8 @@ caller, not a reason to make the figure cheaper.
 single fact, and it has a single function: `ggml_sycl_hold_spill_fit` (ggml-sycl.cpp), the composition of
 `zone_hold_fit_inputs` and `zone_hold_fit` (zone-sizing.hpp, host-tested). It is asked by three callers and by nobody
 else: the transaction-time check that F3 publishes through (`ggml_sycl_check_hold_spill_headroom`, and the non-FA check
-that counts the same bound beside the non-FA scratch), the realized check after a rung's `sched_reserve()`
+and the oneDNN Graph scratch check, which count the same bound beside their own scratch), the realized check after a
+rung's `sched_reserve()`
 (`ggml_sycl_check_hold_spill_realized`), and the constructor's pinned-`-ub` check, which reaches the realized check
 through `ggml_backend_sycl_planned_hold_spill_fits`. None of them keeps a formula, a free-memory read or a history of
 its own. Before this, F3 estimated from a running high-water mark and the driver's reading, the realized check from
@@ -3285,8 +3502,8 @@ The inputs are four facts and nothing else:
   snapshots it (`unified_cache_begin_planned_hold_epoch`), and the realized check, which runs after the KV exists, asks
   over that same room.
 - *The free memory.* One model of it: the unified cache's own ledger (`unified_cache_hold_free_before`), not a driver
-  read, and the same figure for every asker: the realized check, the constructor's check, F3, and the non-FA check, which
-  used to compare its demand with a bare driver reading. A WINDOW is the span between two publishes (a publish, or an
+  read, and the same figure for every asker: the realized check, the constructor's check, F3, the non-FA check, which
+  used to compare its demand with a bare driver reading, and the oneDNN Graph scratch check. A WINDOW is the span between two publishes (a publish, or an
   epoch begin, opens one and forgets the last). Its baseline `cold` is what the card would show with nothing of the
   cache's held outside the arena, `driver_free + raw_held` per reading (`zone_hold_free_cold`), and is the MAXIMUM
   reading taken inside the window (`zone_hold_cold_update`): the driver's credit for a freed buffer lags, a lag only

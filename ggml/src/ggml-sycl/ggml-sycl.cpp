@@ -13333,7 +13333,12 @@ struct ggml_sycl_load_published_pass {
 // it notes, so no publisher under that lock writes between a record's read of a group and its write. noexcept like the
 // planned-load-terms drop, and for the same reason: the owner-effects abort calls it outside every try stage, so no
 // failed stage skips it and no catch handler is added for it. No caller of the abort holds the inventory lock: the
-// abort takes it itself, to reset the load's scratch state. Its setters are plain stores.
+// abort takes it itself, to reset the load's scratch state. Its setters are plain stores, but for the zone plan's: that
+// arm looks the device's cache up under the cache map's shared lock, released when the lookup returns, reads the zone's
+// capacity and held pair without a lock, and stores the plan on that cache under its zone-plan mutex. Both are taken
+// after the two locks above and held for that step alone. Every snapshot of the terms (the capture, both reads of a
+// pass, the restore's own) reads the zone plan the same way: the device's existing cache is looked up under the map's
+// shared lock, then its plan read under its zone-plan mutex, one after the other, after the entry's mutex.
 static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept {
     std::lock_guard                        inventory(g_tensor_inventory_mutex);
     ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
@@ -16101,6 +16106,13 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_measu
     plan.planner_kv_unified = shape.kv_unified;
     plan.planner_swa_full   = shape.swa_full;
     plan.update_runtime_kv_sizes(shape.n_ctx, kv_info.kv_bytes_per_layer(), kv_info.kv_bytes_per_swa_layer());
+    // Keeps the measured plan's context shape equal to the measured context's own (kv_info.n_ctx_is_runtime is set
+    // above), as the transaction keeps the published plan's; no reader reads it from this plan yet.
+    const ggml_sycl::zone_context_shape context_shape =
+        ggml_sycl::zone_plan_context_shape(kv_info.n_ctx_is_runtime, plan.planner_n_ctx, kv_info.n_ctx_context,
+                                           plan.planner_n_ubatch, kv_info.n_ubatch_context);
+    plan.context_n_ctx    = context_shape.n_ctx;
+    plan.context_n_ubatch = context_shape.n_ubatch;
     if (!plan.load_kv_device_valid) {
         plan.load_kv_device       = plan.kv_device;
         plan.load_kv_device_valid = true;
@@ -18249,21 +18261,39 @@ static bool ggml_sycl_plan_has_storage_table(const ggml_sycl::placement_plan & p
     return false;
 }
 
+// What every zone ensure of the load stage passes the cache: the load transaction it is part of, this thread's staged
+// load (0 for a direct planner entry).
+static ggml_sycl::zone_arena_ensure_options ggml_sycl_load_arena_options() {
+    ggml_sycl::zone_arena_ensure_options options;
+    options.load_txn = g_sycl_plan_load_effect_txn;
+    return options;
+}
+
 // The zones a load's plan is sized in, asked for at the planner's entry. When a rebuild is needed and the PP MoE ring's
 // slot buffers are the arena's only holders, the ring is released as the last resort through the cache's own release,
 // and the zones are asked for again. That release keeps a ring while a prefill's claim on one of its slots is held, and
 // a claim outlives its prefill: it is let go when a later prefill takes that slot, when a context on the device is
-// freed (its backend drains the device's slots), or when it is released unused. A kept ring refuses the load as any
-// holder does. It is the only ring release a decide step of the load stage makes. Caller holds
-// g_tensor_inventory_mutex.
+// freed (its backend drains the device's slots), or when it is released unused. It is the only ring release a decide
+// step of the load stage makes. A rebuild something live blocks keeps the zones when the oneDNN Graph floor is all they
+// lack (unified_cache::ensure_planned_arena_zones), but not before this last resort (why: the comment on
+// zone_arena_ensure_options::ring_release_first). So the first call asks the cache to release the ring first
+// (ring_release_first), and once the last resort is spent (the ring released, or kept because a prefill's claim on one
+// of its slots is held) the call that asks again may keep the zones. The cache alone decides a keep and says through
+// the refusal's keep_deferred that it would have kept; a kept ring whose arena the cache would not keep refuses the
+// load as any holder does. Caller holds g_tensor_inventory_mutex.
 static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_refusal & refusal) {
-    if (ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal)) {
+    ggml_sycl::zone_arena_ensure_options options = ggml_sycl_load_arena_options();
+    options.ring_release_first                   = true;
+    if (ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options)) {
         return true;
     }
     if (!ggml_sycl::zone_arena_only_ring_holds(refusal.reason == ggml_sycl::zone_arena_refusal_reason::REBUILD_HELD,
                                                refusal.holders)) {
         return false;
     }
+    // The last resort is taken below, so every call after it may keep the zones.
+    options.ring_release_first = false;
+
     // Needed only because the ring outlives the context that sized it: once a context's teardown releases its own
     // ring, no ring can be left alone in the arena and this branch can go.
     ggml_sycl::unified_cache * cache        = ggml_sycl::get_existing_unified_cache_for_device(device);
@@ -18273,14 +18303,18 @@ static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_
             "[SYCL-PLAN] model load kept the PP MoE oneDNN scratch ring (%u slot buffers) on device %d: it is the only "
             "holder of an arena whose zones must grow, and a prefill's claim on one of its slots is still held\n",
             slot_buffers, device);
-        return false;
+        if (!refusal.keep_deferred) {
+            return false;
+        }
+        refusal = {};
+        return ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options);
     }
     GGML_LOG_WARN(
         "[SYCL-PLAN] model load released the PP MoE oneDNN scratch ring (%u slot buffers) on device %d: it was the "
         "only holder of an arena whose zones must grow\n",
         slot_buffers, device);
     refusal = {};
-    return ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal);
+    return ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options);
 }
 
 // Phase C helper: run compute_placement_plan (single- or multi-device) and
@@ -18303,6 +18337,19 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         }
         return true;
     }
+    const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
+    const bool                           is_moe       = g_moe_n_experts_total > 0;
+    if (!ggml_sycl_plan_multi_device(is_moe)) {
+        // The oneDNN Graph scratch shape sizes the ONEDNN zone the plan packs weights against, so it is published
+        // before the zones are sized, from the kv_info and the envelope the plan is built from below. In a oneDNN
+        // build the plan publishes it again from the same inputs through the same function, so the two writes are
+        // equal and the plan packs against a zone sized for the shape it records; without oneDNN no sizing reads it.
+        // The caller opened its published-terms pass before this write, so a staged load the ensure below refuses
+        // puts the shape back with the pass's other terms; the discarded-plan snapshot below is taken after it,
+        // because a discarded plan goes back to the shape the ensure sized the zones for.
+        (void) ggml_sycl::unified_cache_publish_planned_onednn_graph_scratch_shape(ctx->device, g_placement_kv_info,
+                                                                                   envelope_arg);
+    }
     ggml_sycl::zone_arena_refusal refusal;
     if (ggml_sycl::get_unified_cache_for_device(ctx->device) &&
         !ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)) {
@@ -18310,8 +18357,10 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         // model's allocations, or what a freed model's context left (chunk leases, or its PP MoE ring beside another
         // holder or while a prefill's claim on one of its slots is held). Any term of this load can then need more than
         // the zones hold, not only a compute term larger than a live model's: the device-wide terms are this load's
-        // alone. The load is refused by name and whatever holds the arena keeps running; the abort of the load's owner
-        // effects puts back the terms it published. A refused teardown of the arena refuses it the same way.
+        // alone. A load whose oneDNN Graph floor is all the zones lack keeps them and is not refused here (the Graph
+        // floor is a reservation; see unified_cache::ensure_planned_arena_zones). Any other shortfall refuses the load
+        // by name and whatever holds the arena keeps running; the abort of the load's owner effects puts back the terms
+        // it published. A refused teardown of the arena refuses it the same way.
         GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
         return false;
     }
@@ -18325,7 +18374,6 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     g_placement_kv_info.host_headroom           = ggml_sycl::host_ledger_headroom();
     // The load a STORAGE decline line names (§3.3): this thread's staged transaction, 0 for a direct planner entry.
     g_placement_kv_info.lazy_load_txn           = g_sycl_plan_load_effect_txn;
-    const bool   is_moe                        = g_moe_n_experts_total > 0;
     const auto & info                          = ggml_sycl_info();
     if (ggml_sycl_plan_multi_device(is_moe)) {
         // P4.5: Multi-device placement
@@ -18356,9 +18404,8 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
 
         const std::vector<ggml_sycl::device_budget> budgets =
             ggml_sycl_plan_device_budgets(budget_pct, cache_device_ready);
-        const ggml_sycl::multi_gpu_mode      gpu_mode     = ggml_sycl_plan_multi_gpu_mode(is_moe);
-        const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
-        plan_candidate                                    = ggml_sycl::compute_multi_device_plan(
+        const ggml_sycl::multi_gpu_mode gpu_mode = ggml_sycl_plan_multi_gpu_mode(is_moe);
+        plan_candidate                           = ggml_sycl::compute_multi_device_plan(
             budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
             envelope_arg, g_moe_n_experts_total, ggml_sycl::host_ledger_budget(), g_sycl_lazy_plan_slot);
         if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
@@ -18406,7 +18453,6 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         // planner input. compute_placement_plan() owns the arena zone charge
         // (SCRATCH + ONEDNN + RUNTIME) and subtracts it exactly once before
         // packing weights/KV into the shared zone.
-        const ggml_sycl_placement_envelope * envelope_arg = g_placement_envelope_set ? &g_placement_envelope : nullptr;
 
         // with_room: the planner holds the explicit micro-batch's RUNTIME room (below) against the routed experts.
         // Without it the plan is the load's planning-shape plan.
@@ -18448,7 +18494,8 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             const size_t room_short =
                 plan_candidate.explicit_ubatch.room_bytes - plan_candidate.explicit_ubatch.room_reserved_bytes;
             bool placed = ggml_sycl_publish_load_ubatch_scratch(ctx->device, explicit_n_ubatch) &&
-                          ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device);
+                          ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, nullptr,
+                                                                              ggml_sycl_load_arena_options());
             if (placed) {
                 plan_candidate = plan_single_device(/*with_room=*/true);
                 placed =
@@ -18464,10 +18511,12 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 // they hold, and the plan without the room publishes its own.
                 (void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);
                 published_before.restore(ctx->device);
-                // The zones are asked for no more than the entry ensure found they hold, so this refuses only when
-                // the arena changed in between, a refused teardown above having closed it among those changes; it
-                // refuses the load the same way.
-                if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal)) {
+                // The zones are asked for no more than the entry ensure found they hold or kept short, so this refuses
+                // only when the arena changed in between, a refused teardown above having closed it among those
+                // changes; it refuses the load the same way. The entry ensure's last resort is spent, so this call
+                // keeps a short ONEDNN zone as that one did.
+                if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, &refusal,
+                                                                         ggml_sycl_load_arena_options())) {
                     GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
                     return false;
                 }
@@ -19649,9 +19698,19 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     lazy_infos                = kv.lazy_tables;
     if (kv.n_ubatch_context != 0) {
         GGML_LOG_INFO(
-            "[PLAN-DRY-RUN] n_ubatch_context=%u is not modelled: every plan is the load's planning shape "
-            "(n_ubatch=%u), without the explicit micro-batch's RUNTIME room\n",
+            "[PLAN-DRY-RUN] n_ubatch_context=%u is not modelled: KV and the MoE prompt path are planned at the load's "
+            "planning shape (n_ubatch=%u), without the explicit micro-batch's RUNTIME room\n",
             kv.n_ubatch_context, kv.n_ubatch);
+    }
+    // The plans size the oneDNN Graph scratch floor for the context the model opens with, but only the shape the dry
+    // run restores and the planner's [SYCL-PLAN] lines read it: a device share subtracts the ONEDNN zone an active
+    // arena already holds, or none, so no figure the dry run reports includes the floor.
+    if (kv.n_ctx_context != 0 || kv.n_ubatch_context != 0) {
+        GGML_LOG_INFO(
+            "[PLAN-DRY-RUN] the oneDNN Graph scratch floor is sized for the context the model opens with "
+            "(n_ctx_context=%u n_ubatch_context=%u) in the [SYCL-PLAN] lines only: no figure here includes it, a "
+            "device share subtracts the ONEDNN zone an active arena already holds, or none\n",
+            kv.n_ctx_context, kv.n_ubatch_context);
     }
     const auto override_for = [&](int device) -> size_t {
         return device >= 0 && static_cast<uint32_t>(device) < opts.n_device_budgets ?
@@ -19698,6 +19757,9 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
                 forced != 0 ? forced : ggml_sycl_plan_single_device_budget(i, authority.budget_bytes);
             device_budget[i] = plan_budget;
             unmodelled[i] |= ggml_sycl_plan_single_device_arena_cache(i) == nullptr;
+            // As the stage publishes it before a single-device plan, from the inputs the plan is built from. The dry
+            // run sizes no zone, and its saved state puts the shape back.
+            (void) ggml_sycl::unified_cache_publish_planned_onednn_graph_scratch_shape(i, kv, opts.envelope);
             plans.push_back(ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope, n_experts,
                                                               host_budget, coverage_pin));
         }
@@ -20333,8 +20395,9 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
     return fits;
 }
 
-// What F3 and the non-FA check add to their own demand: the raw bytes the hold can push outside the arena at the rung,
-// plus the prefill-ring bytes neither the planned room nor a loan covers, from the one fit function.
+// What F3, the non-FA check and the oneDNN Graph scratch check add to their own demand: the raw bytes the hold can push
+// outside the arena at the rung, plus the prefill-ring bytes neither the planned room nor a loan covers, from the one fit
+// function.
 static size_t ggml_sycl_planned_scratch_hold_spill_bound(const ggml_sycl_hold_fit_query & q) {
     ggml_sycl_hold_fit_answer a;
     (void) ggml_sycl_hold_spill_fit(q, &a);
@@ -20755,6 +20818,128 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
                                                                       prev_shape.n_ctx);
     }
     return false;
+}
+
+#if GGML_SYCL_DNNL
+// The advice of the Graph scratch refusal. The refusal happens because this shape's scratch outgrows the room the load
+// planned, so the advice names the load argument in which this shape exceeds the shape the load published (the
+// micro-batch, the context, or both) and the largest -ub that fits as loaded. An automatic micro-batch plans the room
+// at its planning micro-batch, so a trial rung above it is told to pass that -ub at load, not -c. A device with no
+// published shape names both arguments without claiming which one differs.
+static std::string ggml_sycl_onednn_graph_scratch_advice(
+    uint32_t                                              n_ubatch,
+    uint32_t                                              n_ctx,
+    uint32_t                                              largest,
+    const ggml_sycl::onednn_graph_scratch_planned_shape & planned) {
+    const bool  unknown   = planned.n_ubatch == 0 && planned.n_ctx == 0;
+    const bool  ub_above  = unknown || n_ubatch > planned.n_ubatch;
+    const bool  ctx_above = unknown || n_ctx > planned.n_ctx;
+    char        buf[160];
+    std::string advice;
+    if (unknown) {
+        advice = "the load published no Graph shape for this device";
+    } else {
+        snprintf(buf, sizeof(buf), "the load planned the zone for n_ubatch=%u n_ctx=%u", planned.n_ubatch,
+                 planned.n_ctx);
+        advice = buf;
+    }
+    if (ub_above && ctx_above) {
+        snprintf(buf, sizeof(buf), "; pass -ub %u and -c %u at load so the zone is planned for them", n_ubatch, n_ctx);
+        advice += buf;
+    } else if (ub_above) {
+        snprintf(buf, sizeof(buf), "; pass -ub %u at load so the zone is planned for it", n_ubatch);
+        advice += buf;
+    } else if (ctx_above) {
+        snprintf(buf, sizeof(buf), "; pass -c %u at load so the zone is planned for it", n_ctx);
+        advice += buf;
+    }
+    if (largest != 0) {
+        snprintf(buf, sizeof(buf), "%s run -ub %u", ub_above || ctx_above ? ", or" : ";", largest);
+        advice += buf;
+    } else {
+        advice += "; no -ub fits as loaded";
+    }
+    return advice;
+}
+#endif
+
+// The context's oneDNN Graph attention scratch against what the load planned: the ONEDNN zone holds the Graph room the
+// load sized for the context it was told; the part of this context's scratch above that room is served outside the
+// arena (the DIRECT path draws raw device memory, not a zone), and it must leave the card its driver headroom beside
+// the hold's worst-case spill. A context that would not is refused here, by name, instead of aborting at its first
+// oversized attention. Only the part above the room is refused: a context whose scratch outgrows the zone but fits
+// outside the arena runs, served by the DIRECT path, at most the cap outstanding. It is asked before the dense scratch
+// is re-planned, and it has no side effect beyond the free-memory reading the non-FA check also takes, so a probe asks
+// it too and the micro-batch ladder sees the same verdict.
+static bool ggml_sycl_check_onednn_graph_scratch(int                               device,
+                                                 const ggml_sycl::placement_plan & plan,
+                                                 bool                              flash_attn_enabled,
+                                                 bool                              probe_mode,
+                                                 const ggml_sycl_hold_fit_query &  hold_query) {
+#if GGML_SYCL_DNNL
+    if (!flash_attn_enabled || !ggml_sycl::onednn_graph_allocator_enabled()) {
+        return true;
+    }
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (!cache || !cache->arena_active()) {
+        return true;
+    }
+    size_t free_mem = 0, total_mem = 0;
+    ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
+    if (total_mem == 0) {
+        return true;
+    }
+    // The free memory the non-FA check compares its demand with: the ledger's figure the hold-spill fit judges its own
+    // spill with, not a bare driver reading.
+    const size_t free_outside =
+        ggml_sycl::unified_cache_hold_free_before(device, hold_query.owner, free_mem, hold_query.rung_live);
+    const size_t cap        = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(device);
+    // The Graph room, the part of the zone no other planned consumer may take: the zone less the most the pair
+    // admission lets the primitive-API pair grow to (max(its plan, capacity - floor)), not less the pair's live plan.
+    // A pair admitted later into the slack is not given back, so a room counted above the bound could be taken from
+    // under this context. Unplanned draws (the primitives' user scratchpads, the pair's growth step) can still crowd a
+    // Graph request onto the DIRECT path; they are not counted here.
+    size_t       graph_room = 0;
+    if (!ggml_sycl::unified_cache_get_onednn_graph_room(device, &graph_room)) {
+        return true;
+    }
+    const size_t   hold_spill = ggml_sycl_planned_scratch_hold_spill_bound(hold_query);
+    const uint32_t n_ubatch   = plan.context_n_ubatch;
+    const uint32_t n_ctx      = plan.context_n_ctx;
+    const size_t   demand     = ggml_sycl::zone_onednn_graph_scratch_floor_bytes(
+        plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, n_ubatch, n_ctx, cap);
+    const uint32_t largest = ggml_sycl::zone_onednn_graph_fit_largest_ub(
+        plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, n_ubatch, n_ctx, cap, graph_room,
+        free_outside, kSyclArenaMinExternalHeadroomBytes, hold_spill);
+    if (largest == n_ubatch) {
+        return true;
+    }
+    const double mb             = 1024.0 * 1024.0;
+    // A cap of 0 is no cap: the demand is the unbounded formula, and the refusal says nothing of a cap.
+    char         cap_clause[64] = "";
+    if (cap != 0) {
+        snprintf(cap_clause, sizeof(cap_clause), ", bounded by the %.1f MB DIRECT cap", cap / mb);
+    }
+    const std::string advice = ggml_sycl_onednn_graph_scratch_advice(
+        n_ubatch, n_ctx, largest, ggml_sycl::unified_cache_get_planned_onednn_graph_scratch_shape(device));
+    GGML_SYCL_RUNTIME_TXN_REFUSAL(
+        probe_mode,
+        "[SYCL-PLAN] runtime context update rejected: the oneDNN Graph attention scratch at n_ubatch=%u n_ctx=%u "
+        "(%.1f MB%s) exceeds the %.1f MB of the ONEDNN zone no other planned consumer may take (the zone less the "
+        "most the primitive-API pair may grow to), and the %.1f MB above it, with the hold's %.1f MB worst-case "
+        "spill, would leave device %d under the %.1f MB driver headroom (%.1f MB free); %s\n",
+        n_ubatch, n_ctx, demand / mb, cap_clause, graph_room / mb,
+        ggml_sycl::zone_onednn_graph_uncovered_bytes(demand, graph_room) / mb, hold_spill / mb, device,
+        kSyclArenaMinExternalHeadroomBytes / mb, free_outside / mb, advice.c_str());
+    return false;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(plan);
+    GGML_UNUSED(flash_attn_enabled);
+    GGML_UNUSED(probe_mode);
+    GGML_UNUSED(hold_query);
+    return true;
+#endif
 }
 
 // llama.cpp-ibj0: the PP MoE oneDNN scratch ring is sized at model load
@@ -21686,6 +21871,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     next_plan.planner_kv_unified = kv_unified;
     next_plan.planner_swa_full   = swa_full;
     next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
+    // Keeps the published plan's context shape equal to the context's own (next_kv_info.n_ctx_is_runtime is set
+    // above) rather than the load's it was copied from: the oneDNN Graph scratch check below sizes this context's
+    // scratch from it.
+    const ggml_sycl::zone_context_shape context_shape = ggml_sycl::zone_plan_context_shape(
+        next_kv_info.n_ctx_is_runtime, next_plan.planner_n_ctx, next_kv_info.n_ctx_context, next_plan.planner_n_ubatch,
+        next_kv_info.n_ubatch_context);
+    next_plan.context_n_ctx    = context_shape.n_ctx;
+    next_plan.context_n_ubatch = context_shape.n_ubatch;
 
     // The immutable Q1_0/NVFP4 host recipes' CPU workspace is one micro-batch of tokens: this context's, by the rule
     // the load sized it with. The load sizes it at its own planning micro-batch, and the executor refuses a recipe
@@ -22291,6 +22484,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                                             flash_attn_enabled,
                                             /*allow_replan=*/!probe_mode, probe_mode, &hold_query)) {
         return refuse("non-FA attention scratch exceeds the device's outside-arena headroom");
+    }
+    if (!ggml_sycl_check_onednn_graph_scratch(ctx->device, next_plan, flash_attn_enabled, probe_mode, hold_query)) {
+        return refuse("oneDNN Graph attention scratch exceeds the ONEDNN zone and the device's outside-arena headroom");
     }
 
     // llama.cpp-kpjw: the dense MMQ/MMVQ Q8_1 src1 buffer and the dense f16 dequant buffers are planned per

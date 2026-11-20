@@ -709,8 +709,9 @@ struct placement_kv_info {
     uint32_t          n_head_all_max   = 0;
     bool              n_ctx_is_runtime = false;
     // llama.cpp-8ecj: the context the model opens with, from ggml_sycl_tensor_inventory::n_ctx_context: the caller's
-    // request (llama.cpp-ak0p). n_ctx above stays the load's own planning shape; this one only sizes the KV room the
-    // planner holds ahead of the routed experts. 0 = no request reached the load: no room is held.
+    // request (llama.cpp-ak0p). n_ctx above stays the load's own planning shape; this one sizes the KV room the planner
+    // holds ahead of the routed experts, and the plan's context shape (placement_plan::context_n_ctx), which the oneDNN
+    // Graph scratch floor is sized for. 0 = no request reached the load: no room is held, and the floor takes n_ctx.
     uint32_t              n_ctx_context    = 0;
     // llama.cpp-7fmt: n_ctx_context is the model's default context (the training context, which a caller that names
     // no n_ctx creates) rather than one the caller named; from ggml_sycl_tensor_inventory::n_ctx_context_is_default.
@@ -777,7 +778,8 @@ struct placement_kv_info {
     std::vector<uint32_t> layer_idx_k_width;
 
     // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
-    // above stays the load's planning shape.
+    // above stays the load's planning shape. When it is non-zero it is also the plan's context micro-batch
+    // (placement_plan::context_n_ubatch, which the oneDNN Graph scratch floor is sized for), held to the context.
     uint32_t                           n_ubatch_context = 0;
     // The RUNTIME zone room the PP MoE oneDNN scratch ring of that micro-batch needs above the default ring's zone. The
     // backend fills it on the single-device path before each plan (unified_cache_explicit_ubatch_room()); it is invalid
@@ -1191,6 +1193,12 @@ struct placement_plan {
     std::vector<uint32_t>                      layer_idx_k_width;
     uint32_t                     planner_n_ctx            = 0;
     uint32_t                     planner_n_ubatch         = 0;
+    // The context shape the per-context scratch is sized for: at load the context the model opens with (the one the
+    // caller named, or the model's default) and the micro-batch the caller named, each else the planning shape above,
+    // the micro-batch held to the context (unified_cache_plan_onednn_graph_scratch_shape(), the shape the oneDNN Graph
+    // scratch floor is published with); at a context transaction the context's own (zone_plan_context_shape()).
+    uint32_t                                   context_n_ctx            = 0;
+    uint32_t                                   context_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
     // llama.cpp-3aos: mirrors placement_kv_info::kv_unified -- see that
     // field's comment. Default false matches llama_cparams::kv_unified's
@@ -2894,7 +2902,7 @@ void   unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t we
 size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id);
 size_t unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
 
-// llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
+// The SDPA shape (max query-head count per attention
 // window class, the SWA window itself, ubatch size, context length) recorded
 // alongside the scratchpad bytes above, feeding
 // onednn_graph_scratch_zone_floor_bytes_swa()'s shape-derived floor (see
@@ -2903,7 +2911,7 @@ size_t unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
 // min(n_ctx, n_swa + n_ubatch) for SWA layers -- a ubatch of n_ubatch
 // queries against an n_swa-key sliding window spans n_swa + n_ubatch keys
 // in total, GPU-verified -- not a single n_head x n_ctx term for every
-// layer (correction on the ticket, llama.cpp-o3a0, after an earlier
+// layer (an earlier
 // version of this fix assumed every oneDNN-served layer's window was
 // n_ctx). All-zero means "never planned for this device".
 struct onednn_graph_scratch_planned_shape {
@@ -2921,6 +2929,21 @@ void                               unified_cache_set_planned_onednn_graph_scratc
                                                                                         uint32_t n_ubatch,
                                                                                         uint32_t n_ctx);
 onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratch_shape(int device_id);
+
+// The one definition of the Graph scratch shape a load plans: the heads and the window from `kv_info`, and the context
+// shape zone_plan_context_shape_for_envelope() gives from `kv_info` and the envelope's micro-batch. The shape sizes the
+// ONEDNN zone the plan packs weights against, so a single-device stage publishes it before it sizes the zones, and the
+// plan publishes it again from the same inputs; both plan builders take their context fields from it.
+onednn_graph_scratch_planned_shape unified_cache_plan_onednn_graph_scratch_shape(
+    const placement_kv_info &            kv_info,
+    const ggml_sycl_placement_envelope * envelope);
+// Records unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope) for `device_id` and returns it. The backend
+// writes the planned shape nowhere else but the dry run, which puts back the value it read before it planned; a test
+// may call the setter directly to stage a shape.
+onednn_graph_scratch_planned_shape unified_cache_publish_planned_onednn_graph_scratch_shape(
+    int                                  device_id,
+    const placement_kv_info &            kv_info,
+    const ggml_sycl_placement_envelope * envelope);
 
 // llama.cpp-oyfl: the non-flash-attention batched mul_mat scratch floor.
 //
@@ -3134,12 +3157,14 @@ void ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(bool force);
 size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx);
 // llama.cpp-o3a0: host-testable wrapper around the window-aware
 // onednn_graph_scratch_zone_floor_bytes_swa(), same internal-linkage/
-// memoization caveats as the wrapper above.
+// memoization caveats as the wrapper above. `direct_cap` bounds the floor as the zone's own reading does; 0 is no
+// cap known, the formula.
 size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
                                                                 uint32_t n_head_swa_max,
                                                                 uint32_t n_swa,
                                                                 uint32_t n_ubatch,
-                                                                uint32_t n_ctx);
+                                                                uint32_t n_ctx,
+                                                                size_t   direct_cap);
 #endif
 void     unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
                                                          size_t   weight_slot_bytes,
@@ -3264,12 +3289,18 @@ struct planner_published_terms {
 
 // The device-wide terms a model load publishes for a device as it plans, with the planners' (planner): the PP pipeline
 // scratch; the PP MoE oneDNN ring's slots and depth, which of its slots the KV zone holds, and the row bytes, expert
-// counts and micro-batch it is re-planned from; and the oneDNN scratchpad pair with its stored sum, which the pair's
-// reserve raises on its own. Each model on the device plans with these, and every load overwrites them, so a load that
-// fails puts back what it published (load_published_record). The terms keyed by the load's owner are not here (they
-// leave with their owner, unified_cache_drop_planned_load_terms), nor is the compute term's micro-batch, which is
-// sticky by design and which every load records at the same planning value. Each setter stores what its getter reads,
-// so a restore is exact. The terms fall in groups (load_published_group), each the terms one publisher writes together,
+// counts and micro-batch it is re-planned from; the oneDNN scratchpad pair with its stored sum, which the pair's
+// reserve raises on its own; and the zone plan (the pair plan and the Graph floor the zone ensure stores on the
+// device's cache, unified_cache::onednn_zone_plan_), which the pair bound and the Graph room
+// a context check reads are derived from. Each model on the device plans with these, and every load overwrites them,
+// so a load that fails puts back what it published (load_published_record). The terms keyed by the load's owner are
+// not here (they leave with their owner, unified_cache_drop_planned_load_terms), nor is the compute term's
+// micro-batch, which is sticky by design and which every load records at the same planning value, nor the DIRECT
+// Graph-scratch cap's budget snapshot, which describes the arena as it stands: a failed load that rebuilt the arena
+// leaves the rebuilt arena in place, and the snapshot it stored at that rebuild is the one that arena's cap is derived
+// from. Each setter stores what its getter reads, so a restore is exact, but for the zone plan: it describes a
+// zone the failed load may have changed, so it goes back as zone_onednn_plan_keep_short of the prior plan over the
+// zone as it is then. The terms fall in groups (load_published_group), each the terms one publisher writes together,
 // and a restore puts back whole groups, so no group holds part of one publisher's terms and part of another's.
 enum load_published_group : uint32_t {
     LOAD_PUBLISHED_GROUP_PIPELINE    = 1u << 0,  // the PP pipeline scratch
@@ -3281,7 +3312,8 @@ enum load_published_group : uint32_t {
     LOAD_PUBLISHED_GROUP_NONFA       = 1u << 6,  // the planners' non-FA attention scratch shape
     LOAD_PUBLISHED_GROUP_CONTROL     = 1u << 7,  // the planners' MoE CONTROL requirement
     LOAD_PUBLISHED_GROUP_SCATTER     = 1u << 8,  // the planners' MoE host scatter scratch
-    LOAD_PUBLISHED_GROUP_ALL         = (1u << 9) - 1,
+    LOAD_PUBLISHED_GROUP_ZONE_PLAN   = 1u << 9,  // the plan the device's cache stores for its ONEDNN zone
+    LOAD_PUBLISHED_GROUP_ALL         = (1u << 10) - 1,
 };
 
 struct load_published_terms {
@@ -3300,6 +3332,7 @@ struct load_published_terms {
     size_t                  onednn_weights        = 0;
     size_t                  onednn_activations    = 0;
     size_t                  onednn_stored         = 0;
+    zone_onednn_plan        onednn_zone_plan{};
     planner_published_terms planner{};
 
     static load_published_terms snapshot(int device);
@@ -3316,9 +3349,11 @@ struct load_published_terms {
 // the stored sum. `prior` is what each group held before this load wrote it, or what another publisher left in it
 // since; `written` is what each group held when this load last looked. note() takes one planner pass of the load: the
 // terms when it started and when it ended, both read under the inventory lock that every publisher but the reserve
-// holds, so only the pass wrote between them. restore() puts a group back only while it still holds `written`, and the
-// sum by compare-exchange, so a raise outside that lock is kept. A publisher that writes exactly what the load
-// published cannot be told from the load, and its group goes back with the load's.
+// holds, so only the pass wrote between them. restore() puts a group back only while it still holds `written`, the sum
+// by compare-exchange, so a raise outside that lock is kept, and the zone plan by a test and store on the device's
+// cache under that cache's zone-plan mutex (unified_cache::onednn_zone_plan_put_back), which the pair's reserve also
+// writes through. A publisher that writes exactly what the load published cannot be told from the load, and its group
+// goes back with the load's.
 struct load_published_record {
     load_published_terms prior{};
     load_published_terms written{};
@@ -5004,7 +5039,14 @@ class unified_cache {
     // A rebuild whose teardown refuses is refused too, and no arena is
     // reserved after it; while a refused teardown has left the arena closed,
     // every call refuses for it, whatever the zones hold.
-    bool ensure_planned_arena_zones(zone_arena_refusal * refusal = nullptr);
+    // A rebuild that live allocations block keeps the zones as they are when
+    // the oneDNN Graph scratch floor is all they lack
+    // (zone_arena_shortfall_is_reservation_only): the call returns true and
+    // describes the ONEDNN zone by what it holds (zone_onednn_plan_keep_short),
+    // unless `options` asks to release a PP MoE ring that alone holds the
+    // arena first (zone_arena_ensure_options::ring_release_first).
+    bool ensure_planned_arena_zones(zone_arena_refusal *              refusal = nullptr,
+                                    const zone_arena_ensure_options & options = {});
 
     // Is arena active?
     bool arena_active() const { return zone_backed(); }
@@ -5047,6 +5089,16 @@ class unified_cache {
     size_t zone_used(vram_zone_id zone) const;
     size_t zone_available(vram_zone_id zone) const;
     size_t zone_largest_free(vram_zone_id zone) const;
+    // The bytes of the oneDNN weights and activations scratch pair that lie inside the arena, which a kept ONEDNN zone
+    // must go on holding, and which a failed load's restore of the zone's snapshot keeps room for. A buffer allocated
+    // outside the arena takes none of the zone. Takes no lock.
+    size_t arena_held_onednn_pair_bytes();
+    // The plan this cache stored for its own ONEDNN zone (onednn_zone_plan_ below; the default plan while none is
+    // stored). A reader that holds only a device id asks that device's existing cache. Takes onednn_zone_plan_mutex_
+    // alone.
+    zone_onednn_plan onednn_zone_plan_load() const;
+    // A failed load's restore (load_published_record::restore); see the definition. Takes onednn_zone_plan_mutex_.
+    void             onednn_zone_plan_put_back(const zone_onednn_plan & written, const zone_onednn_plan & prior);
     // Both free-space figures of one zone, read together under its allocator group's mutex: the
     // allocators' figures are only coherent under it (zone_available and zone_largest_free read
     // them bare), with the zone's capacity and used bytes read at the same instant. For a zone with its
@@ -6324,6 +6376,46 @@ class unified_cache {
     // alone.
     void arena_count_scratch_holders(zone_arena_holders & holders);
 
+    // The load transaction whose keep of a short ONEDNN zone last warned on this device (zone_kept_onednn_warn_due). An
+    // exchange, so two ensures of one load racing on the device warn once between them.
+    std::atomic<uint64_t> onednn_zone_kept_warn_txn_{ 0 };
+
+    // The plan this cache's ONEDNN zone was sized from (zone_onednn_plan says what it holds and why it is kept apart
+    // from the planner's live figures). ensure_planned_arena_zones() writes it when it keeps or builds this cache's
+    // zone, and onednn_zone_plan_put_back() when a failed load's restore puts it back. The pair reserve reads it, and
+    // every reader of the pair bound reads it from the cache whose zone capacity it reads. It lives on the cache that
+    // owns the zone, so a zone is never judged by a plan another cache stored: a second cache on one device (an arena
+    // reserved by hand) has its own.
+    //
+    // No plan stored: a cache holds the default plan (every figure zero) until ensure_planned_arena_zones() sizes
+    // its zone, and that stores a plan whenever it builds or keeps one, so a zone with no plan stored was reserved by a
+    // direct arena_reserve() call, which only tests make. A pair in that zone is bounded by the zone's capacity alone
+    // (zone_onednn_pp_pair_bound of a zero plan and a zero floor is the capacity, as for a stored plan with neither a
+    // pair nor a floor), and its first reservation is the pair as asked (no planned pair for
+    // zone_onednn_scratch_reserve_target). That is safe: nothing planned a Graph SDPA floor into the zone, so there is
+    // no floor for the bound to keep free, and a Graph scratch the pair leaves no room for takes the DIRECT path under
+    // its cap, as one that misses any full ONEDNN zone does.
+    //
+    // onednn_zone_plan_mutex_ guards the plan alone. Each of the five accessors (the load and the put-back declared
+    // above, the three below) takes it alone and calls only the pure rules of zone-sizing.hpp while it holds it, so it
+    // is a leaf: nothing is taken under it, and it may be taken under any lock.
+    mutable std::mutex onednn_zone_plan_mutex_;
+    zone_onednn_plan   onednn_zone_plan_{};
+
+    // Stores `plan` as the zone plan: the zone was rebuilt for it. Takes onednn_zone_plan_mutex_ alone.
+    void onednn_zone_plan_store(const zone_onednn_plan & plan);
+    // Keeps the larger plan (zone_onednn_plan_keep) as the zone plan, in ONE critical section: the zone was found
+    // sufficient for `plan` and kept as built. Takes onednn_zone_plan_mutex_ alone.
+    void onednn_zone_plan_keep_and_store(const zone_onednn_plan & plan);
+    // Whether a rebuild that something live blocks is short of the oneDNN Graph floor alone, and when it is and `store`
+    // is true, the keep of a short zone; see the definition. Takes onednn_zone_plan_mutex_ alone.
+    bool onednn_zone_plan_keep_short_and_store(const zone_onednn_plan & live,
+                                               const zone_arena_sizes & have,
+                                               const zone_arena_sizes & need,
+                                               size_t                   held_pair_bytes,
+                                               bool                     store,
+                                               zone_onednn_plan *       kept);
+
     // Per-physical-chunk TLSF allocators for the WEIGHT zone in N-chunk mode.
     // A weight tensor must not span a chunk boundary (each chunk is its own
     // sycl::malloc_device USM allocation), so we use one TLSF allocator per
@@ -6542,6 +6634,12 @@ class unified_cache {
     // and friends, always under that mutex) do not share a lock, so a plain
     // size_t here would be a data race.
     std::atomic<size_t> onednn_graph_scratch_direct_cap_plan_snapshot_bytes_{ 0 };
+
+    // Stores the snapshot above for zones kept as they are: the lower of the one held and available_budget() now, 0
+    // being unset (zone_graph_direct_cap_snapshot_kept). The cap sizes the oneDNN Graph floor, so a snapshot that rose
+    // across tenants while the arena is kept would grow the floor of a zone that already serves the shape (with the
+    // DIRECT path) and ask for a rebuild. Only a rebuild stores the current budget outright.
+    void onednn_graph_direct_cap_snapshot_keep();
 
     // llama.cpp-0oxf: these three were previously
     // function-local `static` variables inside their respective member
@@ -8938,11 +9036,19 @@ size_t compute_moe_effective_weight_bytes(size_t total_weight_bytes,
 bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, size_t activations_size);
 
 // llama.cpp-8ony: the most an op's oneDNN PP scratch pair may be for the ONEDNN zone on `device_id` to count it as
-// planned (zone_onednn_pp_pair_bound over the zone's capacity and the zone-plan snapshot ensure_planned_arena_zones
-// stores: the pair's plan and the Graph SDPA floor the zone was sized from, as one figure). False (and *bound
-// untouched) when there is no cache or no active arena, i.e. no zone exists to plan against. This is the one source
-// for "does an op's pair fit what was planned" (zone_onednn_pp_scratch_planned).
+// planned (zone_onednn_pp_pair_bound over the zone's capacity and the zone plan ensure_planned_arena_zones stored on
+// the same cache: the pair's plan and the Graph SDPA floor the zone was sized from, as one figure; see
+// unified_cache::onednn_zone_plan_). False (and *bound untouched) when there is no cache or no active arena, i.e. no
+// zone exists to plan against. This is the one source for "does an op's pair fit what was planned"
+// (zone_onednn_pp_scratch_planned).
 bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound);
+
+// The ONEDNN zone's oneDNN Graph room on `device_id`: the part of the zone no other planned consumer may take, the
+// capacity less unified_cache_get_onednn_pp_pair_bound()'s bound over that same capacity. Both come from ONE capacity
+// read, so an ensure that rebuilds the zone between two reads cannot pair one capacity with another's bound, and the
+// plan comes from the cache whose capacity is read. False (and *room untouched) when there is no cache or no active
+// arena, as for the bound.
+bool unified_cache_get_onednn_graph_room(int device_id, size_t * room);
 
 // llama.cpp-8ony: whether the oneDNN PP scratch may supply a dense op's f16 copies for a weight of `type`
 // (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH, and the default type set when it is unset). ONE answer for the op arm,
@@ -9170,7 +9276,9 @@ bool unified_cache_copy_from_host_async(int                              device_
 // Must be called BEFORE S1-PRELOAD to guarantee VRAM availability.
 bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes);
 // unified_cache::ensure_planned_arena_zones() on the device's cache; a device with no cache is a NO_CACHE refusal.
-bool unified_cache_ensure_planned_arena_zones(int device_id, zone_arena_refusal * refusal = nullptr);
+bool unified_cache_ensure_planned_arena_zones(int                               device_id,
+                                              zone_arena_refusal *              refusal = nullptr,
+                                              const zone_arena_ensure_options & options = {});
 
 #if GGML_SYCL_DNNL
 // llama.cpp-0oxf: external entry point for reclaiming (real release) every

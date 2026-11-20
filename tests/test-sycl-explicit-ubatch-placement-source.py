@@ -290,7 +290,8 @@ RESERVED_RULE = ("const size_t planned = requirement > floor_bytes ? requirement
                  "*out = (planned + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1); return true;")
 ARENA_RESERVE_SIG = "bool unified_cache::arena_reserve(sycl::queue & queue,"
 ARENA_RESERVE_CALL = "if (!zone_runtime_reserved_bytes(0, runtime_bytes, &runtime_bytes)) {"
-ENSURE_SIG = "bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal)"
+ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
+              "const zone_arena_ensure_options & options)")
 ENSURE_CALL = ("if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch) || "
                "!zone_runtime_reserved_bytes(runtime_floor, planned_runtime_scratch, &runtime_zone)) {")
 ROOM_ZONE_SIG = "static bool pp_moe_onednn_runtime_zone_bytes(const pp_moe_onednn_explicit_ubatch_inputs & in,"
@@ -330,7 +331,8 @@ LAMBDA_ROOM = ("if (with_room) { ggml_sycl_fill_explicit_ubatch_room(ctx->device
 FIRST_PLAN = "plan_candidate = plan_single_device(true);"
 GROW_BRANCH = "if (plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::GROW_ZONE) {"
 GROW_PUBLISH = ("bool placed = ggml_sycl_publish_load_ubatch_scratch(ctx->device, explicit_n_ubatch) && "
-                "ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device);")
+                "ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, nullptr, "
+                "ggml_sycl_load_arena_options());")
 GROW_REPLAN = ("if (placed) { plan_candidate = plan_single_device(true); placed = "
                "plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE; }")
 GROW_FALLBACK = ("if (!placed) { "

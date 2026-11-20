@@ -2075,6 +2075,135 @@ int main() {
               "a saturated plan never wraps into a kept zone");
     }
 
+    // ---- Case 24f: the context shape a plan sizes the per-context scratch for. At load it is the context the model
+    // opens with (the caller's, or the model's default) and the micro-batch the caller named, each else the load's
+    // planning shape; at a context transaction it is the context's own.
+    {
+        using ggml_sycl::zone_plan_context_shape;
+        ggml_sycl::zone_context_shape s = zone_plan_context_shape(false, 512, 4096, 512, 2048);
+        CHECK(s.n_ctx == 4096 && s.n_ubatch == 2048, "a load the caller named a shape for: that shape");
+        s = zone_plan_context_shape(false, 512, 0, 512, 0);
+        CHECK(s.n_ctx == 512 && s.n_ubatch == 512, "a load with no shape named: the planning shape");
+        s = zone_plan_context_shape(false, 512, 4096, 512, 0);
+        CHECK(s.n_ctx == 4096 && s.n_ubatch == 512, "a context with no micro-batch named: the planning micro-batch");
+        s = zone_plan_context_shape(true, 8192, 4096, 1024, 2048);
+        CHECK(s.n_ctx == 8192 && s.n_ubatch == 1024, "a context transaction: the context's own shape");
+        s = zone_plan_context_shape(false, 512, 256, 512, 2048);
+        CHECK(s.n_ubatch == 256, "a micro-batch is never above its context");
+        s = zone_plan_context_shape(false, 0, 0, 512, 0);
+        CHECK(s.n_ctx == 0 && s.n_ubatch == 512, "no context at all: the micro-batch is not clamped to 0");
+        s = zone_plan_context_shape(false, 512, 0, 512, 2048);
+        CHECK(s.n_ctx == 512 && s.n_ubatch == 512, "a named micro-batch with no context named: the planning context");
+
+        // Before a plan exists the planning micro-batch is the planner's own choice: the envelope's when it names
+        // one, else the model's. The shape published before the zones are sized must be the one the plan records.
+        CHECK(ggml_sycl::zone_planning_n_ubatch(8, 512) == 8, "the planning micro-batch: the envelope's when named");
+        CHECK(ggml_sycl::zone_planning_n_ubatch(0, 512) == 512, "the planning micro-batch: else the model's");
+        using ggml_sycl::zone_plan_context_shape_for_envelope;
+        s = zone_plan_context_shape_for_envelope(false, 512, 0, 8, 512, 0);
+        CHECK(s.n_ctx == 512 && s.n_ubatch == 8, "an envelope micro-batch with none named: the envelope's wins");
+        s = zone_plan_context_shape_for_envelope(false, 512, 0, 0, 512, 0);
+        CHECK(s.n_ubatch == 512, "no envelope micro-batch: the model's");
+        s = zone_plan_context_shape_for_envelope(false, 512, 4096, 8, 512, 2048);
+        CHECK(s.n_ctx == 4096 && s.n_ubatch == 2048, "a named micro-batch wins over the envelope's");
+    }
+
+    // ---- Case 24g: the oneDNN Graph floor, bounded by the dispatcher's chunk budget. Each execute is split to half
+    // the DIRECT cap, so a full chunk and the last one of a split execute fit under the cap together (unless one query
+    // row alone exceeds half of it, when the chunks are one row each): the floor does not hold more.
+    {
+        const size_t MiB = 1024 * 1024;
+        using ggml_sycl::zone_onednn_graph_scratch_floor_bytes;
+        // 512 x 512, 16 heads: 16 * 512 * 512 * 4 * 3 / 2 = 24 MiB, under the 64 MiB minimum
+        CHECK(zone_onednn_graph_scratch_floor_bytes(16, 0, 0, 512, 512, 1024 * MiB) == 64 * MiB, "the minimum");
+        // 2048 x 4096, 16 heads: 768 MiB, under a 1 GiB cap
+        CHECK(zone_onednn_graph_scratch_floor_bytes(16, 0, 0, 2048, 4096, 1024 * MiB) == 768 * MiB, "the formula");
+        // 2048 x 32768, 32 heads: 12 GiB, bounded by the cap
+        CHECK(zone_onednn_graph_scratch_floor_bytes(32, 0, 0, 2048, 32768, 1024 * MiB) == 1024 * MiB, "the cap");
+        CHECK(zone_onednn_graph_scratch_floor_bytes(32, 0, 0, 2048, 32768, 0) == size_t(12) * 1024 * MiB,
+              "no cap known: the formula");
+        // The cap bounds the formula, not the minimum.
+        CHECK(zone_onednn_graph_scratch_floor_bytes(32, 0, 0, 2048, 32768, 32 * MiB) == 64 * MiB,
+              "a cap below the minimum: the minimum");
+        // SWA window: min(n_ctx, n_swa + n_ubatch)
+        CHECK(zone_onednn_graph_scratch_floor_bytes(0, 8, 512, 2048, 32768, 1024 * MiB) == 8 * 2560 * 2048 * 6,
+              "the window, not the context, for SWA heads");
+        CHECK(zone_onednn_graph_scratch_floor_bytes(0, 0, 0, 2048, 4096, 1024 * MiB) == 64 * MiB, "no eligible head");
+    }
+
+    // ---- Case 24h: a context's oneDNN Graph scratch above the zone the load planned. The part above the zone's
+    // Graph room is served outside the arena and must leave the card its headroom; otherwise the refusal names the
+    // largest power-of-two micro-batch whose part fits.
+    {
+        const size_t MiB = 1024 * 1024;
+        using ggml_sycl::zone_onednn_graph_fit_largest_ub;
+        using ggml_sycl::zone_onednn_graph_uncovered_bytes;
+        CHECK(zone_onednn_graph_uncovered_bytes(768 * MiB, 1024 * MiB) == 0, "inside the zone: nothing uncovered");
+        CHECK(zone_onednn_graph_uncovered_bytes(768 * MiB, 512 * MiB) == 256 * MiB, "the part above the room");
+        // 16 heads, n_ctx 4096, a 1 GiB cap, 192 MiB of Graph room (planned at ubatch 512), 600 MiB free outside the
+        // arena, 256 MiB headroom, no hold spill. 2048: 768 MiB, 576 uncovered, refused; 1024: 384 MiB, 192 uncovered,
+        // 408 left: fits.
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
+                  1024,
+              "the refusal at 2048 names 1024");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 1024, 4096, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
+                  1024,
+              "a micro-batch that fits is returned unchanged");
+        // 1500: 562.5 MiB, 370.5 uncovered, 229.5 left: refused; the rung below it is 1024, which fits.
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 1500, 4096, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB, 0) ==
+                  1024,
+              "a micro-batch that is not a power of two names the power of two below it");
+        // With no Graph room every rung draws at least the 64 MiB minimum outside the arena.
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 0, 200 * MiB, 256 * MiB, 0) == 0,
+              "a card already under the headroom, no room: nothing named");
+        // A scratch the room holds draws nothing outside the arena, so the card's free memory and the hold's spill
+        // (which the hold check judges on its own) do not refuse it: 768 MiB at 2048 inside 1024 MiB of room.
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 1024 * MiB, 200 * MiB, 256 * MiB, 0) ==
+                  2048,
+              "a scratch inside the room fits on a card under the headroom");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 1024 * MiB, 200 * MiB, 256 * MiB,
+                                               300 * MiB) == 2048,
+              "a scratch inside the room fits whatever the hold's spill");
+        // The cap binds: 32 heads at n_ctx 32768 and 512 rows model 3 GiB, bounded by the 1 GiB cap, and the load
+        // planned the room at that same bound, so the demand equals the room and nothing is drawn outside the arena.
+        CHECK(zone_onednn_graph_fit_largest_ub(32, 0, 0, 512, 32768, 1024 * MiB, 1024 * MiB, 200 * MiB, 256 * MiB, 0) ==
+                  512,
+              "a demand the cap bounds to the room fits on a card under the headroom");
+        // 192 MiB of room on a card under the headroom: 2048 and 1024 draw outside the arena and are refused; 512
+        // (192 MiB) lies inside the room and is named.
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 192 * MiB, 200 * MiB, 256 * MiB, 0) ==
+                  512,
+              "a card under the headroom still gets the largest rung inside the room named");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB,
+                                               200 * MiB) == 512,
+              "the hold's spill is charged beside the uncovered part");
+        // 32 at 64 MiB with 300 MiB of spill leaves 236 of 600: no rung fits.
+        CHECK(
+            zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 300 * MiB) == 0,
+            "no rung fits: nothing named");
+        // The smallest rung and below it, with no room: 32 and 16 draw the 64 MiB minimum outside the arena, which
+        // leaves 536 of 600 MiB (fits) and 236 of 300 MiB (refused, and no smaller rung is tried).
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 32, 4096, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 0) == 32,
+              "a micro-batch of 32 that fits is returned unchanged");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 32, 4096, 1024 * MiB, 0, 300 * MiB, 256 * MiB, 0) == 0,
+              "a micro-batch of 32 that does not fit: nothing named");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 16, 4096, 1024 * MiB, 0, 600 * MiB, 256 * MiB, 0) == 16,
+              "a micro-batch below 32 that fits is returned unchanged");
+        CHECK(zone_onednn_graph_fit_largest_ub(16, 0, 0, 16, 4096, 1024 * MiB, 0, 300 * MiB, 256 * MiB, 0) == 0,
+              "a micro-batch below 32 that does not fit: nothing named, no rung above it");
+        // A 2^k+1 boundary. 32 heads, n_ctx 32768: 6 MiB a row. 65: 390 MiB, which leaves 250 of 640 (refused); the
+        // rung below it is 64 (384 MiB, leaves exactly the 256 MiB headroom).
+        CHECK(zone_onednn_graph_fit_largest_ub(32, 0, 0, 65, 32768, 1024 * MiB, 0, 640 * MiB, 256 * MiB, 0) == 64,
+              "65 when only 64 fits names 64");
+        // A sliding-window shape: 16 window heads, n_swa 1024, n_ctx 32768, no full-context heads. A window head sees
+        // n_swa + n_ubatch keys: 2048 gives 16 * 3072 * 2048 f32 * 3/2 = 576 MiB, 384 above the 192 MiB room, which
+        // leaves 216 of 600 (refused); 1024 gives 16 * 2048 * 1024 f32 * 3/2 = 192 MiB, inside the room. A window of
+        // n_swa alone would put 2048 at 192 MiB (fits), and of n_ctx at the 1 GiB cap for 1024 (refused).
+        CHECK(zone_onednn_graph_fit_largest_ub(0, 16, 1024, 2048, 32768, 1024 * MiB, 192 * MiB, 600 * MiB, 256 * MiB,
+                                               0) == 1024,
+              "a sliding-window shape is sized from its window, n_swa + n_ubatch keys");
+    }
+
     // ---- Case 24i: the -ub a hold-spill refusal names is never below a rung the zone was planned to serve. The B50 /
     // GPT-OSS 20B MXFP4 context at -ub 1024: a planned dense scratch of about 1108 MiB of f16 dequant weight plus
     // 9 KiB per token (1117.1 MiB at 1024, 1112.6 MiB at 512), one 808 MiB compute buffer at 1024 held outside the
@@ -3015,6 +3144,176 @@ int main() {
                   "point at and are held until the process exits. Load this model in a new process before any "
                   "other on device 1"),
               "leases beside the ring alone are not named with the new-process remedy");
+    }
+
+    // ---- Case 41: a rebuild something live blocks keeps a short ONEDNN zone when the Graph floor is what it lacks
+    // The ONEDNN zone holds the primitive-API pair, which has no DIRECT fallback, and the oneDNN Graph scratch floor,
+    // which is a reservation: what the zone cannot hold of it goes to the DIRECT path under its cap. So a second load
+    // whose Graph floor needs a larger zone than the live arena has keeps that zone when SCRATCH and RUNTIME hold their
+    // needs and the zone still holds the pair. The kept zone is described by a floor of what it holds beyond the pair,
+    // so the pair bound over it is the capacity less that stored floor, never below the kept pair, and the Graph room a
+    // context check reads is the stored floor.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_arena_shortfall_is_reservation_only;
+        using ggml_sycl::zone_arena_sizes;
+        using ggml_sycl::zone_onednn_kept_pair_bytes;
+        using ggml_sycl::zone_onednn_plan_keep_short;
+
+        const zone_arena_sizes have = { 512 * MiB, 400 * MiB, 2048 * MiB };
+        zone_arena_sizes       need = have;
+        need.onednn                 = 1100 * MiB;
+        CHECK(zone_arena_shortfall_is_reservation_only(have, need, 300 * MiB),
+              "a shortfall of the ONEDNN zone alone, with the pair inside the zone, was not kept");
+        CHECK(zone_arena_shortfall_is_reservation_only(have, need, 400 * MiB),
+              "a zone that holds exactly the pair was not kept");
+        CHECK(!zone_arena_shortfall_is_reservation_only(have, need, 400 * MiB + 1),
+              "a zone below the pair it must hold was kept: the pair has no DIRECT fallback");
+        zone_arena_sizes scratch_short = need;
+        scratch_short.scratch          = have.scratch + 1;
+        CHECK(!zone_arena_shortfall_is_reservation_only(have, scratch_short, 300 * MiB),
+              "a SCRATCH shortfall was kept");
+        zone_arena_sizes runtime_short = need;
+        runtime_short.runtime          = have.runtime + 1;
+        CHECK(!zone_arena_shortfall_is_reservation_only(have, runtime_short, 300 * MiB),
+              "a RUNTIME shortfall was kept");
+        CHECK(!zone_arena_shortfall_is_reservation_only(have, have, 300 * MiB),
+              "zones that hold every need were taken for a keep, though nothing is short");
+        zone_arena_sizes onednn_equal = need;
+        onednn_equal.onednn           = have.onednn;
+        CHECK(!zone_arena_shortfall_is_reservation_only(have, onednn_equal, 300 * MiB),
+              "an ONEDNN zone holding exactly its need was taken for a keep");
+
+        // The first model's zone: a 200 MiB pair and a 128 MiB floor. The second plans a 300 MiB pair (its own halves)
+        // and a 1 GiB floor in the 400 MiB zone that stays.
+        const zone_onednn_plan held = { 200 * MiB, 128 * MiB, 150 * MiB, 50 * MiB };
+        const zone_onednn_plan live = { 300 * MiB, 1024 * MiB, 200 * MiB, 100 * MiB };
+        const zone_onednn_plan kept = zone_onednn_plan_keep_short(held, live, 400 * MiB, 0);
+        CHECK(kept.bare_bytes == 300 * MiB && kept.weights_bytes == 200 * MiB && kept.activations_bytes == 100 * MiB,
+              "the kept zone is not described by the larger plan's whole pair");
+        CHECK(kept.graph_floor_bytes == 100 * MiB, "the kept floor is not the zone less the pair plan");
+        CHECK(zone_onednn_kept_pair_bytes(kept, 0) == 300 * MiB, "with no pair held, the pair plan is not kept");
+
+        // A pair already held above the plan (two plans' halves merged): the floor gives way to it, so the bound over
+        // the stored snapshot is the held pair, and the pair stays admitted.
+        const zone_onednn_plan merged = zone_onednn_plan_keep_short(held, live, 400 * MiB, 350 * MiB);
+        CHECK(zone_onednn_kept_pair_bytes(merged, 350 * MiB) == 350 * MiB, "a held pair above the plan was not kept");
+        CHECK(merged.graph_floor_bytes == 50 * MiB, "the kept floor overlaps the pair already held");
+        const size_t bound =
+            ggml_sycl::zone_onednn_pp_pair_bound(400 * MiB, merged.bare_bytes, merged.graph_floor_bytes);
+        CHECK(bound == 350 * MiB, "the pair bound over the kept snapshot fell below the pair already held");
+        CHECK(400 * MiB - bound == merged.graph_floor_bytes,
+              "the Graph room a context check reads over the kept snapshot is not the kept floor");
+        CHECK(ggml_sycl::zone_onednn_graph_uncovered_bytes(80 * MiB, 400 * MiB - bound) == 30 * MiB,
+              "a context's Graph scratch beyond the kept room is not the part the room cannot hold");
+
+        // The runtime context's Graph scratch check over a kept zone (Case 24h's fit, with its room read as the
+        // accessor reads it: the capacity less the pair bound over the stored snapshot). The 400 MiB zone kept for
+        // the 300 MiB pair leaves 100 MiB. 16 heads at n_ctx 4096 under a 1 GiB cap: 384 KiB a row. With 600 MiB free
+        // outside the arena and 256 MiB of headroom, 2048 (768 MiB, 668 above the room) is refused and 1024 (384 MiB,
+        // 284 above, 316 left) named; on a card under the headroom only 256 (96 MiB, inside the room) is.
+        const size_t kept_room =
+            400 * MiB - ggml_sycl::zone_onednn_pp_pair_bound(400 * MiB, kept.bare_bytes, kept.graph_floor_bytes);
+        CHECK(kept_room == 100 * MiB, "the Graph room the context check reads over a kept zone is not the kept floor");
+        CHECK(ggml_sycl::zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, kept_room, 600 * MiB,
+                                                          256 * MiB, 0) == 1024,
+              "a context's Graph scratch beyond the kept room is not refused by the context check with 1024 named");
+        CHECK(ggml_sycl::zone_onednn_graph_fit_largest_ub(16, 0, 0, 2048, 4096, 1024 * MiB, kept_room, 200 * MiB,
+                                                          256 * MiB, 0) == 256,
+              "on a card under the headroom the kept room does not serve the rung it holds");
+
+        // zone_onednn_plan_keep's maximum floor is what the keep must not store: its bound would fall to the bare plan
+        // and the 350 MiB pair already held would exceed it.
+        const zone_onednn_plan maxed = ggml_sycl::zone_onednn_plan_keep(held, live);
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(400 * MiB, maxed.bare_bytes, maxed.graph_floor_bytes) < 350 * MiB,
+              "sanity: the maximum floor's bound admits the held pair, so this case proves nothing");
+
+        // The pair fills the zone: no Graph room, all Graph scratch on the DIRECT path.
+        const zone_onednn_plan full = zone_onednn_plan_keep_short(held, live, 300 * MiB, 0);
+        CHECK(full.graph_floor_bytes == 0, "a zone the pair fills was given a Graph floor");
+        const zone_onednn_plan over = zone_onednn_plan_keep_short(held, live, 250 * MiB, 0);
+        CHECK(over.graph_floor_bytes == 0, "a pair above the zone did not leave the floor at 0");
+
+        // A zone with room beyond both plans' floors stores no floor above what a plan asked for.
+        const zone_onednn_plan small_held = { 50 * MiB, 64 * MiB, 40 * MiB, 10 * MiB };
+        const zone_onednn_plan small_live = { 60 * MiB, 64 * MiB, 50 * MiB, 10 * MiB };
+        const zone_onednn_plan slack      = zone_onednn_plan_keep_short(small_held, small_live, 300 * MiB, 0);
+        CHECK(slack.graph_floor_bytes == 64 * MiB, "the kept floor rose above the larger of the plans' floors");
+
+        // A tie keeps the held pair, as zone_onednn_plan_keep does.
+        const zone_onednn_plan tie_live = { 200 * MiB, 1024 * MiB, 100 * MiB, 100 * MiB };
+        const zone_onednn_plan tie      = zone_onednn_plan_keep_short(held, tie_live, 400 * MiB, 0);
+        CHECK(tie.weights_bytes == 150 * MiB && tie.activations_bytes == 50 * MiB && tie.graph_floor_bytes == 200 * MiB,
+              "a tie did not keep the held pair, or its floor is not the zone less that pair");
+    }
+
+    // ---- Case 42: the DIRECT Graph-scratch cap's budget snapshot does not rise while the arena is kept -------------
+    // The cap bounds the Graph floor, so a snapshot that rose with the budget (another tenant leaving) would raise the
+    // floor of a zone nothing rebuilt, and a keep would be taken where a sufficient zone stood.
+    {
+        constexpr size_t GiB = 1024ull * 1024ull * 1024ull;
+        using ggml_sycl::zone_graph_direct_cap_snapshot_kept;
+        CHECK(zone_graph_direct_cap_snapshot_kept(0, 6 * GiB) == 6 * GiB, "an unset snapshot did not take the figure");
+        CHECK(zone_graph_direct_cap_snapshot_kept(8 * GiB, 6 * GiB) == 6 * GiB, "a smaller budget was not taken");
+        CHECK(zone_graph_direct_cap_snapshot_kept(6 * GiB, 8 * GiB) == 6 * GiB, "the snapshot rose while kept");
+        CHECK(zone_graph_direct_cap_snapshot_kept(6 * GiB, 6 * GiB) == 6 * GiB, "an equal budget changed the snapshot");
+    }
+
+    // ---- Case 43: a kept zone warns once per load and device, and at every keep outside a load ------------------
+    {
+        using ggml_sycl::zone_kept_onednn_warn_due;
+        CHECK(zone_kept_onednn_warn_due(0, 7), "a load's first keep did not warn");
+        CHECK(!zone_kept_onednn_warn_due(7, 7), "a load's second keep warned again");
+        CHECK(zone_kept_onednn_warn_due(7, 8), "the next load's keep did not warn");
+        CHECK(zone_kept_onednn_warn_due(0, 0) && zone_kept_onednn_warn_due(7, 0),
+              "a keep outside a staged load did not warn");
+    }
+
+    // ---- Case 44: a failed load puts the stored zone plan back as the zone holds it now ----------------------------
+    // The restore stores zone_onednn_plan_keep_short(prior, prior, capacity now, held pair now): the prior plan exactly
+    // while the zone still holds it, and a smaller Graph floor when a pair reserved in between under the failed load's
+    // wider bound, or a smaller zone, leaves less room. In each outcome the pair bound over the stored plan is at least
+    // the held pair, and the Graph room a context check reads (capacity less that bound) is the stored floor.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_onednn_plan;
+        using ggml_sycl::zone_onednn_plan_keep_short;
+        using ggml_sycl::zone_onednn_plan_same;
+        using ggml_sycl::zone_onednn_pp_pair_bound;
+        const zone_onednn_plan prior{ 200 * MiB, 300 * MiB, 150 * MiB, 50 * MiB };
+        const auto             room_over = [](const zone_onednn_plan & p, size_t capacity) {
+            return capacity - zone_onednn_pp_pair_bound(capacity, p.bare_bytes, p.graph_floor_bytes);
+        };
+
+        CHECK(zone_onednn_plan_same(prior, prior), "a plan does not compare the same as itself");
+        for (int field = 0; field < 4; ++field) {
+            zone_onednn_plan other = prior;
+            size_t * const   f[]   = { &other.bare_bytes, &other.graph_floor_bytes, &other.weights_bytes,
+                                       &other.activations_bytes };
+            *f[field] += MiB;
+            CHECK(!zone_onednn_plan_same(prior, other), "plans that differ in one field compare the same");
+        }
+
+        // The zone still holds the prior plan: 600 MiB less the 200 MiB pair leaves room for its 300 MiB floor.
+        const zone_onednn_plan holds = zone_onednn_plan_keep_short(prior, prior, 600 * MiB, 100 * MiB);
+        CHECK(zone_onednn_plan_same(holds, prior),
+              "a zone that still holds the prior plan did not get it back exactly");
+        CHECK(room_over(holds, 600 * MiB) == 300 * MiB, "the Graph room over the prior plan is not its floor");
+
+        // A 360 MiB pair was reserved under the failed load's wider bound, above the prior plan's 300 MiB bound.
+        const zone_onednn_plan crowded = zone_onednn_plan_keep_short(prior, prior, 600 * MiB, 360 * MiB);
+        CHECK(crowded.bare_bytes == prior.bare_bytes && crowded.weights_bytes == prior.weights_bytes &&
+                  crowded.activations_bytes == prior.activations_bytes,
+              "a held pair above the prior bound changed the prior pair plan");
+        CHECK(crowded.graph_floor_bytes == 240 * MiB, "the floor beside a 360 MiB held pair is not 240 MiB");
+        CHECK(zone_onednn_pp_pair_bound(600 * MiB, crowded.bare_bytes, crowded.graph_floor_bytes) >= 360 * MiB,
+              "the held pair is above the bound over the restored plan");
+        CHECK(room_over(crowded, 600 * MiB) == 240 * MiB, "the Graph room beside the held pair is not the floor");
+
+        // The zone was rebuilt to 400 MiB, below the prior plan's 500 MiB.
+        const zone_onednn_plan smaller = zone_onednn_plan_keep_short(prior, prior, 400 * MiB, 0);
+        CHECK(smaller.graph_floor_bytes == 200 * MiB, "the floor in a 400 MiB zone is not 200 MiB");
+        CHECK(room_over(smaller, 400 * MiB) == 200 * MiB, "the Graph room in the smaller zone is not the floor");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
