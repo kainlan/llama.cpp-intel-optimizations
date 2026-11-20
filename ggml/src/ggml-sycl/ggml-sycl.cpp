@@ -89854,6 +89854,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     layout_mode route_layout = src0_layout;
     if (ne12 != 1) {
         route_layout = retained_prompt_layout;
+        if (has_override && !accepted_layout_override) {
+            // The prompt requested its batch at the override as adjusted for this tensor, exact (no row-count
+            // rewrite), so it routes there; the decode arm below names its own fallback for the same override.
+            GGML_LOG_WARN("[MoE] Override layout=%d unsupported for %s; prompt routes at layout=%d\n",
+                          (int) override_layout, src0->name ? src0->name : "?", (int) route_layout);
+        }
     } else {
         if (use_expert_cache) {
             if (accepted_layout_override) {
@@ -93594,31 +93600,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
 #if GGML_SYCL_DNNL
         const bool pp_mxfp4_soa_f16_env_enabled = ggml_sycl_moe_pp_onednn_f16_enabled();
-        // llama.cpp-sr83 (C3, Option T): gate/up plan XMX_TILED by default;
-        // the batched lambda now repacks that layout too
-        // (repack_mxfp4_xmx_tiled_to_woq), so it must be admitted as a
-        // candidate the same as SOA, for gate and up only: the executor takes
-        // XMX_TILED for those roles alone, so down's tiled layout (planned
-        // under GGML_SYCL_MOE_DOWN_XMX_TILED) is not admitted here --
-        // ggml_sycl_moe_pp_onednn_batched_claims_tensor
-        // enforces the same GATE/UP-only restriction independently. Also
-        // gated on ggml_sycl_moe_pp_woq_enabled() (fix cycle, defect 1):
-        // the f16 arm has no tiled-aware dequant, and this candidate check
-        // must stay consistent with the claims predicate the other three
-        // call sites use, or this lambda could be entered for an op the
-        // outer dispatch did not actually steer here for.
-        const bool pp_mxfp4_soa_or_tiled_route =
-            route_layout == GGML_LAYOUT_SOA ||
-            (route_layout == GGML_LAYOUT_XMX_TILED && (pp_role == MOE_TENSOR_GATE || pp_role == MOE_TENSOR_UP) &&
-             ggml_sycl_moe_pp_woq_enabled());
-        const bool pp_mxfp4_soa_f16_candidate = pp_mxfp4_soa_f16_env_enabled && src0->type == GGML_TYPE_MXFP4 &&
-                                                pp_mxfp4_soa_or_tiled_route && src1->type == GGML_TYPE_F32 &&
+        // Two candidates, one per oneDNN prompt executor, and neither reads the other.
+        // pp_mxfp4_soa_f16_candidate readies the per-expert loop's MXFP4 f16 staging: it claims the planned oneDNN
+        // scratch slot and allocates the f16 weight and activation staging for the f16 arm. That arm's only dequant
+        // reads SOA bytes, so it takes only an expert whose bytes are SOA, and the staging is readied only for an op
+        // routed SOA: an op routed in any other layout (gate and up planned XMX_TILED included) would claim and
+        // allocate staging no expert of it can use.
+        const bool pp_mxfp4_soa_f16_candidate   = pp_mxfp4_soa_f16_env_enabled && src0->type == GGML_TYPE_MXFP4 &&
+                                                route_layout == GGML_LAYOUT_SOA && src1->type == GGML_TYPE_F32 &&
                                                 dst->type == GGML_TYPE_F32;
-        // llama.cpp-348c: the batched executor's own candidate gate asks the claim predicate's table, on the layout
-        // this tensor is routed in, for every expert type; pp_mxfp4_soa_f16_candidate above stays the MXFP4 staging
-        // fallback's. XMX_TILED stays gate/up only: the executor takes it for gate and up alone, though down plans it
-        // under GGML_SYCL_MOE_DOWN_XMX_TILED. GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the executor off through the same
-        // table, and the executor reports it as route-off before it asks this.
+        // pp_batched_candidate gates the batched executor. It asks the claim predicate's table, on the layout this
+        // tensor is routed in, for every expert type. The executor repacks XMX_TILED itself, so it takes that layout,
+        // for gate and up alone, though down plans it under GGML_SYCL_MOE_DOWN_XMX_TILED.
+        // GGML_SYCL_MOE_PP_ONEDNN_F16=0 turns the executor off through the same table, and the executor reports it as
+        // route-off before it asks this.
         const bool pp_batched_candidate =
             ggml_sycl_moe_pp_batched_takes_layout(src0->type, route_layout) &&
             (route_layout != GGML_LAYOUT_XMX_TILED || pp_role == MOE_TENSOR_GATE || pp_role == MOE_TENSOR_UP) &&
@@ -95589,8 +95584,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             ggml_sycl::mem_handle expert_gpu_lease{};
             // The layout of the bytes expert_gpu_lease holds. The slice storage installed from that lease and the
             // layout forced on the matmul below both read this one variable, so the kernel is chosen for the
-            // layout the operand is in. A local prompt expert takes it from its route, whose lease the resolver
-            // checked to resolve at that layout.
+            // layout the operand is in. Only a local expert reaches those consumers (any other route continues or
+            // throws before them, as does an expert left without a pointer), and it takes the layout from its route,
+            // whose lease the resolver checked to resolve at that layout; the initial value is never read.
             layout_mode           expert_layout = route_layout;
 
             if (ne12 != 1) {
