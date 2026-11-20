@@ -20950,10 +20950,12 @@ static bool ggml_sycl_check_onednn_graph_scratch(int                            
 // from the plan's operands at next_plan.context_n_ubatch and never below the published plan's figure: every context of
 // this model shares that plan, and nothing here knows which of them are still live. A real transaction raises the
 // device's published bound to it and, when the SCRATCH zone is smaller than the bound now published, asks for the
-// arena's zones again. That ask is best-effort, as the non-FA re-plan's is: a zone that live allocations keep short of
-// the bound stays as it is and says so once (unified_cache::ensure_planned_arena_zones), since the ops it cannot place
-// are served outside the arena. False only when the arena's teardown left it closed to new allocations. A probe sizes
-// the figure and changes nothing else.
+// arena's zones again. That ask is best-effort, as the non-FA re-plan's is: the ensure holds the zone to the budget
+// quarter and the arena reserve's room, and a zone that live allocations keep short of the bound stays as it is; each
+// says so once (unified_cache::ensure_planned_arena_zones). Neither refuses, since the ops the zone cannot place take
+// the miss path: raw device memory while the card has room outside the arena, else the dispatch refuses the buffer by
+// name (q8-scratch-alloc) and the op takes its fallback. False only when the arena's teardown left it closed to new
+// allocations. A probe sizes the figure and changes nothing else.
 static bool ggml_sycl_replan_moe_mmvq_scratch(int                               device,
                                               const ggml_sycl::placement_plan & current,
                                               ggml_sycl::placement_plan &       next_plan,
@@ -91698,10 +91700,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 retained_decode_partition_stats main_route_stats{
                     std::vector<size_t>(static_cast<size_t>(std::max(1, n_gpu_devs)), 0), 0
                 };
-                auto &                                route_dev_counts            = main_route_stats.device_counts;
-                auto &                                route_host_count            = main_route_stats.host_count;
-                size_t                                route_unavailable_count     = 0;
-                size_t                                route_layout_mismatch_count = 0;
+                auto &              route_dev_counts            = main_route_stats.device_counts;
+                auto &              route_host_count            = main_route_stats.host_count;
+                size_t              route_unavailable_count     = 0;
+                size_t              route_layout_mismatch_count = 0;
+
                 const ggml_sycl::moe_resolved_batch & main_batch =
                     ne12 == 1 ? retained_decode_batch_result.batch : retained_prompt_batch_result.batch;
                 const size_t selected_occurrences = static_cast<size_t>(ids->ne[1] * n_ids);

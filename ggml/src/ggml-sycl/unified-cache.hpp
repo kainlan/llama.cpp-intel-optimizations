@@ -6406,12 +6406,24 @@ class unified_cache {
     std::atomic<uint64_t> onednn_zone_kept_warn_txn_{ 0 };
 
     // The largest SCRATCH figure a keep of a short SCRATCH zone has warned about on this device, 0 for none
-    // (zone_kept_scratch_warn_due). Raised by compare-exchange, so two ensures that keep the zone short of one figure
+    // (zone_scratch_warn_due). Raised by compare-exchange, so two ensures that keep the zone short of one figure
     // warn once between them.
     std::atomic<size_t> scratch_zone_kept_warn_bytes_{ 0 };
 
     // Logs the WARN of a call that kept the SCRATCH zone of `kept_bytes` short of `plan`, when one is due.
     void scratch_zone_kept_warn(int dev_id, const zone_scratch_plan & plan, size_t kept_bytes);
+
+    // The largest MoE batched MMVQ bound a clamp of the SCRATCH zone has warned about on this device, 0 for none
+    // (zone_scratch_warn_due), raised the same way.
+    std::atomic<size_t> scratch_zone_clamp_warn_bytes_{ 0 };
+
+    // Logs the WARN of a plan whose limit (plan.clamp: the budget quarter `budget_cap_bytes`, or the reserve's room
+    // `room_bytes` above plan.required) held the SCRATCH zone below the bound of `bound_bytes`, when one is due.
+    void scratch_zone_clamp_warn(int                       dev_id,
+                                 const zone_scratch_plan & plan,
+                                 size_t                    bound_bytes,
+                                 size_t                    budget_cap_bytes,
+                                 size_t                    room_bytes);
 
     // The plan this cache's ONEDNN zone was sized from (zone_onednn_plan says what it holds and why it is kept apart
     // from the planner's live figures). ensure_planned_arena_zones() writes it when it keeps or builds this cache's

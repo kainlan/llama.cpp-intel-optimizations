@@ -7666,19 +7666,51 @@ static const char * arena_teardown_cause_name(zone_arena_teardown_refusal cause)
     return "no cause recorded";
 }
 
-void unified_cache::scratch_zone_kept_warn(int dev_id, const zone_scratch_plan & plan, size_t kept_bytes) {
-    size_t latched = scratch_zone_kept_warn_bytes_.load(std::memory_order_relaxed);
+// Whether a SCRATCH WARN latched on `latch` is due for `bytes` (zone_scratch_warn_due), latching it if so. A
+// compare-exchange, so two ensures racing on one figure warn once between them.
+static bool scratch_zone_warn_latch(std::atomic<size_t> & latch, size_t bytes) {
+    size_t latched = latch.load(std::memory_order_relaxed);
     do {
-        if (!zone_kept_scratch_warn_due(latched, plan.wanted)) {
-            return;
+        if (!zone_scratch_warn_due(latched, bytes)) {
+            return false;
         }
-    } while (!scratch_zone_kept_warn_bytes_.compare_exchange_weak(latched, plan.wanted, std::memory_order_relaxed));
+    } while (!latch.compare_exchange_weak(latched, bytes, std::memory_order_relaxed));
+    return true;
+}
+
+void unified_cache::scratch_zone_kept_warn(int dev_id, const zone_scratch_plan & plan, size_t kept_bytes) {
+    if (!scratch_zone_warn_latch(scratch_zone_kept_warn_bytes_, plan.wanted)) {
+        return;
+    }
     GGML_LOG_WARN(
         "[VRAM-ARENA] device %d keeps its SCRATCH zone of %.1f MB: the MoE batched MMVQ scratch bound asks for a "
         "%.1f MB zone (the zone must hold %.1f MB without it), and live allocations block the rebuild. Expert ops "
-        "whose scratch the zone cannot place are served from device memory outside the arena; the zone's use line "
-        "at teardown counts them as misses\n",
+        "whose scratch the zone cannot place take the miss path: device memory outside the arena while the card has "
+        "room for it, else the dispatch refuses the buffer by name (q8-scratch-alloc) and the op takes its fallback; "
+        "the zone's use line at teardown counts them as misses\n",
         dev_id, kept_bytes / (1024.0 * 1024.0), plan.wanted / (1024.0 * 1024.0), plan.required / (1024.0 * 1024.0));
+}
+
+void unified_cache::scratch_zone_clamp_warn(int                       dev_id,
+                                            const zone_scratch_plan & plan,
+                                            size_t                    bound_bytes,
+                                            size_t                    budget_cap_bytes,
+                                            size_t                    room_bytes) {
+    if (!scratch_zone_warn_latch(scratch_zone_clamp_warn_bytes_, bound_bytes)) {
+        return;
+    }
+    const bool   room     = plan.clamp == zone_scratch_clamp::ROOM;
+    const size_t accepted = room_bytes > SIZE_MAX - plan.required ? SIZE_MAX : plan.required + room_bytes;
+    GGML_LOG_WARN(
+        "[VRAM-ARENA] device %d sizes its SCRATCH zone at %.1f MB, short of the %.1f MB MoE batched MMVQ scratch "
+        "bound: %s (%.1f MB; a quarter of the available budget is %.1f MB, the arena's reserve accepts a %.1f MB "
+        "zone, and the zone must hold %.1f MB without the bound). Expert ops whose scratch the zone cannot place take "
+        "the miss path: device memory outside the arena while the card has room for it, else the dispatch refuses the "
+        "buffer by name (q8-scratch-alloc) and the op takes its fallback\n",
+        dev_id, plan.wanted / (1024.0 * 1024.0), bound_bytes / (1024.0 * 1024.0),
+        room ? "the room the arena's reserve accepts holds it" : "a quarter of the available budget holds it",
+        (room ? accepted : budget_cap_bytes) / (1024.0 * 1024.0), budget_cap_bytes / (1024.0 * 1024.0),
+        accepted / (1024.0 * 1024.0), plan.required / (1024.0 * 1024.0));
 }
 
 bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *              refusal,
@@ -7697,10 +7729,15 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         safe_max_alloc = max_alloc;
     }
 
-    // The zone is sized by the one function the model-load reservation and the
-    // chunk cap's probe set also call, so the three cannot disagree.
+    // The zone starts from the default the model-load reservation and the chunk cap's minimum probe also read
+    // (ggml_sycl_compute_arena_bytes), so the three agree on that default. This ensure alone raises the zone above it,
+    // by the non-FA attention estimate and the MoE batched MMVQ bound below: with GGML_SYCL_COMPUTE_ARENA_MB=0 the
+    // reservation and the probe count no SCRATCH, while this zone still holds the non-FA floor and a MoE model's bound.
     size_t scratch_zone  = ggml_sycl_compute_arena_bytes(dev_id);
     size_t scratch_nonfa = 0;
+    // A quarter of the available budget: the most of it a SCRATCH raise for a consumer with a fallback may claim, so
+    // that it cannot starve the WEIGHT zone. The non-FA raise and the MoE bound are both held to this one figure.
+    const size_t scratch_budget_cap = available_budget() / 4;
     // llama.cpp-oyfl: raise the SCRATCH zone for the non-FA batched mul_mat
     // floor the same way onednn_zone is raised below for its own planned
     // estimate. Best-effort and, for the standard model-load flow, NOT
@@ -7746,8 +7783,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         if (nonfa_override_active || nonfa_shape_known || scratch_zone < kNonfaAttnScratchFloorBytes) {
             size_t planned_nonfa_attn_scratch = unified_cache_nonfa_attn_scratch_demand_bytes(
                 nonfa_shape.n_head, nonfa_shape.n_ubatch, nonfa_shape.n_ctx);
-            const size_t nonfa_budget_cap = available_budget() / 4;
-            if (planned_nonfa_attn_scratch > nonfa_budget_cap) {
+            if (planned_nonfa_attn_scratch > scratch_budget_cap) {
                 // Per-instance once-latch, mirroring onednn_zone_clamp_warned_
                 // -- a function-local static here
                 // would share one latch across every device's unified_cache
@@ -7759,9 +7795,9 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                         "budget -- clamping to %.1f MB (the runtime-context-update refusal in ggml-sycl.cpp "
                         "still checks the unclamped demand against whatever this zone ends up) (only logged "
                         "once)\n",
-                        planned_nonfa_attn_scratch / (1024.0 * 1024.0), nonfa_budget_cap / (1024.0 * 1024.0));
+                        planned_nonfa_attn_scratch / (1024.0 * 1024.0), scratch_budget_cap / (1024.0 * 1024.0));
                 }
-                planned_nonfa_attn_scratch = nonfa_budget_cap;
+                planned_nonfa_attn_scratch = scratch_budget_cap;
             }
             if (planned_nonfa_attn_scratch > scratch_zone) {
                 // "(planned)": this is ensure_planned_arena_zones()'s own
@@ -7802,20 +7838,6 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             }
         }
     }
-    // The MoE batched MMVQ scratch bound raises the zone on top of what it must hold (zone_scratch_zone_plan says why
-    // the bound is every expert op's buffers at once). Unlike the non-FA scratch, a request of those ops the zone
-    // cannot place has somewhere to go, so a rebuild that something live blocks keeps a zone short of the bound alone
-    // (below) rather than refuse.
-    const zone_scratch_plan scratch_plan =
-        zone_scratch_zone_plan(scratch_zone, scratch_nonfa, unified_cache_get_planned_moe_mmvq_scratch_bytes(dev_id));
-    if (scratch_plan.wanted > scratch_plan.required) {
-        GGML_LOG_INFO(
-            "[UNIFIED-CACHE] SCRATCH zone planned at %.1f MB for the MoE batched MMVQ scratch bound (the zone "
-            "must hold %.1f MB without it)\n",
-            scratch_plan.wanted / (1024.0 * 1024.0), scratch_plan.required / (1024.0 * 1024.0));
-    }
-    scratch_zone = scratch_plan.wanted;
-
     size_t       onednn_zone         = 256 * 1024 * 1024;
     // This sizes the REAL physical ONEDNN zone, which has to hold both the
     // primitive-API pair and the Graph-scratch allocator's floor. The pair's
@@ -7919,6 +7941,36 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             unified_cache_get_planned_state_term_bytes(dev_id) / (1024.0 * 1024.0));
     }
 
+    // The MoE batched MMVQ scratch bound raises the zone on top of what it must hold (zone_scratch_zone_plan says why
+    // the bound is every expert op's buffers at once). Unlike the non-FA scratch, a request of those ops the zone
+    // cannot place has a miss path, so the bound never makes the load refuse: it is held to the quarter of the budget
+    // the non-FA raise is held to, and to the room the arena's reserve accepts beside the ONEDNN and RUNTIME zones
+    // sized above (zone_arena_scratch_room, from the arguments the reserve below is called with). A rebuild that
+    // something live blocks keeps a zone short of the bound alone (below) rather than refuse.
+    const size_t scratch_required   = zone_scratch_required_bytes(scratch_zone, scratch_nonfa);
+    size_t       scratch_other_tail = 0;
+    size_t       scratch_room       = 0;
+    if (zone_runtime_reserved_bytes(0, runtime_zone, &scratch_other_tail) &&
+        scratch_other_tail <= SIZE_MAX - zone_arena_zone_bytes(onednn_zone)) {
+        scratch_other_tail += zone_arena_zone_bytes(onednn_zone);
+        scratch_room =
+            zone_arena_scratch_room(zone_arena_reserve_shape_of(budget_, device_total_vram_, max_alloc, safe_max_alloc),
+                                    scratch_other_tail, scratch_required);
+    }
+    const size_t            moe_mmvq_bound = unified_cache_get_planned_moe_mmvq_scratch_bytes(dev_id);
+    const zone_scratch_plan scratch_plan =
+        zone_scratch_zone_plan(scratch_zone, scratch_nonfa, moe_mmvq_bound, scratch_budget_cap, scratch_room);
+    if (scratch_plan.wanted > scratch_plan.required) {
+        GGML_LOG_INFO(
+            "[UNIFIED-CACHE] SCRATCH zone planned at %.1f MB for the MoE batched MMVQ scratch bound (the zone "
+            "must hold %.1f MB without it)\n",
+            scratch_plan.wanted / (1024.0 * 1024.0), scratch_plan.required / (1024.0 * 1024.0));
+    }
+    if (scratch_plan.clamp != zone_scratch_clamp::NONE) {
+        scratch_zone_clamp_warn(dev_id, scratch_plan, moe_mmvq_bound, scratch_budget_cap, scratch_room);
+    }
+    scratch_zone = scratch_plan.wanted;
+
     auto bind_compute_arena = [&]() {
         const auto & cz_info = get_zone(vram_zone_id::SCRATCH);
         compute_arena_owner_ = {};
@@ -7932,6 +7984,20 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         if (layout_pool_) {
             layout_pool_->set_arena(this);
         }
+    };
+
+    // An arena kept as it was built: its compute zone is bound again when nothing holds it bound. The DIRECT
+    // Graph-scratch cap (onednn_graph_scratch_direct_cap_bytes()) is a fraction of the budget this arena was planned
+    // with, not of the live budget, which shrinks as the arena's own zones consume it; the zones are kept as they are,
+    // so the snapshot does not rise (onednn_graph_direct_cap_snapshot_keep). Each caller then stores the ONEDNN plan
+    // its keep describes.
+    const auto keep_arena_as_built = [&]() {
+        if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
+            bind_compute_arena();
+        }
+#if GGML_SYCL_DNNL
+        onednn_graph_direct_cap_snapshot_keep();
+#endif
     };
 
     // A refused teardown names its cause in the refusal and on its own ERROR line, with what it left: an arena closed
@@ -7970,15 +8036,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                                       zone_capacity(vram_zone_id::ONEDNN) >= onednn_zone &&
                                       zone_capacity(vram_zone_id::RUNTIME) >= runtime_zone;
         if (zones_sufficient) {
-            if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
-                bind_compute_arena();
-            }
-#if GGML_SYCL_DNNL
-            // The DIRECT Graph-scratch cap (onednn_graph_scratch_direct_cap_bytes()) is a fraction of the budget this
-            // arena was planned with, not of the live budget, which shrinks as the arena's own zones consume it. The
-            // zones are kept as they are here, so the snapshot does not rise (onednn_graph_direct_cap_snapshot_keep).
-            onednn_graph_direct_cap_snapshot_keep();
-#endif
+            keep_arena_as_built();
             // The zone is kept as it was built, so it stays described by the larger plan it was built from (its whole
             // pair, with the Graph floor's own maximum): a later, smaller plan (a draft model beside the target) must
             // not shrink it.
@@ -8032,12 +8090,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             }
             scratch_zone = scratch_kept;
             if (others_hold) {
-                if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
-                    bind_compute_arena();
-                }
-#if GGML_SYCL_DNNL
-                onednn_graph_direct_cap_snapshot_keep();
-#endif
+                keep_arena_as_built();
                 onednn_zone_plan_keep_and_store(live_plan);
                 scratch_zone_kept_warn(dev_id, scratch_plan, scratch_kept);
                 return true;
@@ -8055,12 +8108,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             const bool             reservation_only =
                 onednn_zone_plan_keep_short_and_store(live_plan, arena_zones, need, held_pair, !defer_keep, &kept);
             if (reservation_only && !defer_keep) {
-                if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
-                    bind_compute_arena();
-                }
-#if GGML_SYCL_DNNL
-                onednn_graph_direct_cap_snapshot_keep();
-#endif
+                keep_arena_as_built();
                 // When the WARN is due: see zone_kept_onednn_warn_due. The room is the kept floor: the pair bound over
                 // the stored snapshot leaves exactly that.
                 const uint64_t latched_txn = onednn_zone_kept_warn_txn_.exchange(options.load_txn);
@@ -8231,7 +8279,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
     bind_compute_arena();
 #if GGML_SYCL_DNNL
     // The zones were rebuilt for this plan, so the DIRECT cap's snapshot is the budget it was planned with, whether
-    // that is above or below the one held (see the "zones_sufficient" branch above for why it is a snapshot).
+    // that is above or below the one held (see keep_arena_as_built above for why it is a snapshot).
     onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
     onednn_zone_plan_store(live_plan);
@@ -30314,9 +30362,10 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     arena_queue_ = &queue;
 
     // Align zone sizes to the arena's grain. The RUNTIME zone is rounded by the function every RUNTIME plan counts on,
-    // with no floor: the callers apply it.
-    scratch_bytes = (scratch_bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
-    onednn_bytes  = (onednn_bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+    // with no floor: the callers apply it. The sizes and the checks on the tail below are zone-sizing.hpp's (its
+    // "arena reserve's checks" section), so the SCRATCH zone's room is planned from the tests made here.
+    scratch_bytes = zone_arena_zone_bytes(scratch_bytes);
+    onednn_bytes  = zone_arena_zone_bytes(onednn_bytes);
     if (!zone_runtime_reserved_bytes(0, runtime_bytes, &runtime_bytes)) {
         GGML_LOG_ERROR("[VRAM-ARENA] RUNTIME zone of %zu bytes cannot be rounded to the arena's grain\n",
                        runtime_bytes);
@@ -30338,10 +30387,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // try_single_chunk) and N-chunk piece sizing -- a single chunk allocated
     // near the raw limit leaves the driver without command-buffer/kernel
     // working memory (llama.cpp-seno).
-    size_t per_chunk_cap = max_alloc_size;
-    if (safe_max_alloc_size > 0) {
-        per_chunk_cap = per_chunk_cap > 0 ? std::min(per_chunk_cap, safe_max_alloc_size) : safe_max_alloc_size;
-    }
+    const size_t per_chunk_cap = zone_arena_per_chunk_cap(max_alloc_size, safe_max_alloc_size);
 
     // llama.cpp-o3h1: budget_bytes arrives HERE already fully headroom-adjusted
     // by the single budget authority (compute_vram_budget_authority(),
@@ -30374,8 +30420,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // end of the arena.  If alloc_size is not rounded down first,
     // RUNTIME/ONEDNN/SCRATCH suballocations inherit a misaligned base pointer
     // even though each zone size is aligned.
-    constexpr size_t k_arena_size_alignment = 2ull * 1024ull * 1024ull;
-    alloc_size                              = (alloc_size / k_arena_size_alignment) * k_arena_size_alignment;
+    alloc_size = zone_arena_round_alloc_bytes(alloc_size);
 
     // Minimum shared (KV+WEIGHT) zone that is worth carving out.  Below this
     // the arena is useless for weight/KV storage and only aliases the tail
@@ -30383,7 +30428,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // caller falls back to per-entry allocation via the existing path at
     // unified_cache::unified_cache() (log line "[VRAM-ARENA] Failed on
     // device %d, falling back to per-entry allocation").
-    constexpr size_t k_min_shared_bytes = 16ull * 1024ull * 1024ull;  // 16 MB
+    constexpr size_t k_min_shared_bytes = k_zone_arena_min_shared_bytes;  // 16 MB
 
     // Use a single chunk only when it is within the runtime's SAFE per-chunk
     // cap (per_chunk_cap = min(max_alloc_size, safe_max_alloc_size) when a
@@ -30397,7 +30442,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // not at reserve (llama.cpp-dp5i c-ni04, falsified and confirmed in
     // c-gkai; fix: llama.cpp-seno). That window now correctly goes N-chunk
     // instead.
-    const bool try_single_chunk = max_alloc_size == 0 || alloc_size <= per_chunk_cap;
+    const bool try_single_chunk = zone_arena_single_chunk_tried(alloc_size, max_alloc_size, per_chunk_cap);
     if (!try_single_chunk) {
         GGML_LOG_INFO(
             "[VRAM-ARENA] Arena %.1f MB exceeds safe per-allocation cap %.1f MB "
@@ -30406,7 +30451,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     }
     if (try_single_chunk) {
         const size_t tail_bytes = onednn_bytes + runtime_bytes + scratch_bytes;
-        if (alloc_size < tail_bytes + k_min_shared_bytes) {
+        if (!zone_arena_chunk_holds_tail(alloc_size, tail_bytes)) {
             GGML_LOG_WARN(
                 "[VRAM-ARENA] Insufficient budget for single-chunk arena: "
                 "%.1f MB < tail %.1f MB + min shared %.1f MB; refusing reservation\n",
@@ -30524,8 +30569,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // tail_bytes + k_min_shared_bytes (so KV has a sane carve-out).  If the
     // total budget is smaller than that, refuse — single-chunk path would
     // already have caught this case via its own min-shared check.
-    const size_t tail_chunk_min = tail_bytes + k_min_shared_bytes;
-    if (per_chunk_cap < tail_chunk_min) {
+    if (!zone_arena_chunk_holds_tail(per_chunk_cap, tail_bytes)) {
         GGML_LOG_WARN(
             "[VRAM-ARENA] Per-chunk cap %.1f MB too small to hold tail zones (%.1f MB) + min KV (%.1f MB); "
             "refusing reservation\n",
@@ -30537,14 +30581,9 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // KV reserve.  Weight storage is usually the dominant model-load consumer;
     // giving the tail chunk the full per-allocation cap can strand most VRAM in
     // KV space and leave the WEIGHT zone too small even when the model fits.
-    constexpr size_t k_min_tail_kv_reserve = 128ull * 1024ull * 1024ull;
-    constexpr size_t k_max_tail_kv_reserve = 512ull * 1024ull * 1024ull;
-    const size_t     proportional_kv       = std::max<size_t>(alloc_size / 128, k_min_shared_bytes);
-    const size_t tail_kv_reserve = std::min(k_max_tail_kv_reserve, std::max(k_min_tail_kv_reserve, proportional_kv));
-    size_t       last_chunk_size = tail_bytes + tail_kv_reserve;
-    last_chunk_size              = std::min(last_chunk_size, per_chunk_cap);
-    last_chunk_size              = std::min(last_chunk_size, alloc_size);
-    if (last_chunk_size < tail_chunk_min) {
+    const size_t tail_kv_reserve = zone_arena_tail_kv_reserve(alloc_size);
+    const size_t last_chunk_size = zone_arena_tail_chunk_bytes(alloc_size, per_chunk_cap, tail_bytes, tail_kv_reserve);
+    if (!zone_arena_chunk_holds_tail(last_chunk_size, tail_bytes)) {
         GGML_LOG_WARN(
             "[VRAM-ARENA] Insufficient budget for N-chunk arena: total %.1f MB < tail %.1f MB + min KV %.1f MB; "
             "refusing reservation\n",
@@ -30562,7 +30601,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             alloc_size / (1024.0 * 1024.0));
         return false;
     }
-    if (weight_total < k_min_shared_bytes) {
+    if (!zone_arena_weight_chunks_fit(alloc_size, last_chunk_size)) {
         GGML_LOG_WARN(
             "[VRAM-ARENA] Insufficient budget for N-chunk arena: weight total %.1f MB < min %.1f MB; "
             "refusing reservation\n",
@@ -30635,7 +30674,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // Logical-offset layout (cumulative across chunks; offset_to_ptr/ptr_to_offset translate):
     //   [WEIGHT (chunks 0..N-2, weight_total bytes)]
     //   [KV (head of last chunk, up to last_chunk_size - tail_bytes bytes;
-    //        0 if tail consumes the chunk — guarded above by tail_chunk_min)]
+    //        never below k_min_shared_bytes -- guarded above by zone_arena_chunk_holds_tail)]
     //   [ONEDNN] [RUNTIME] [SCRATCH] (tail of last chunk)
     auto & wz = arena_zones_[static_cast<int>(vram_zone_id::WEIGHT)];
     wz.start  = 0;
@@ -35068,6 +35107,8 @@ static size_t zone_onednn_reorder_bytes(const placement_tensor_info & item) {
 static_assert(k_zone_mmq_src1_row_padding == MATRIX_ROW_PADDING, "zone-sizing.hpp Q8_1 row padding drifted");
 static_assert(k_zone_mmq_src1_block_elems == QK8_1, "zone-sizing.hpp Q8_1 block width drifted");
 static_assert(k_zone_mmq_src1_block_bytes == sizeof(block_q8_1), "zone-sizing.hpp Q8_1 block size drifted");
+static_assert(static_cast<size_t>(k_zone_mxfp4_moe_group_rows) == GGML_SYCL_MXFP4_MOE_XMX_N,
+              "zone-sizing.hpp MXFP4 group rows drifted");
 static_assert(k_zone_dequant_f16_elem_bytes == sizeof(sycl::half), "zone-sizing.hpp f16 element size drifted");
 
 bool onednn_pp_unified_scratch_enabled(ggml_type type) {
@@ -36140,7 +36181,8 @@ bool placement_moe_host_recipe_workspace_bytes_at(const std::vector<moe_host_rec
 // One operand per expert weight that mmvq_moe_batched_dispatch can run: an expert stack by the planner's own role
 // function, of a type the batched kernels admit. The type test is load-bearing as well as exact: an NVFP4 model's F32
 // per-expert scales (ffn_down_exps.scale, ffn_down_exps.input_scale) carry the role's name too. Down reads one
-// activation row per routed slot; gate, up and fused gate_up read one row a token.
+// activation row per routed slot; gate, up and fused gate_up read one row a token. An MXFP4 stack names its expert
+// count (ne2), which its grouped dispatch sizes its tables by (zone_moe_mmvq_operand::grouped_experts).
 static std::vector<zone_moe_mmvq_operand> moe_mmvq_scratch_operands(
     const std::vector<placement_tensor_info> & tensor_inventory) {
     std::vector<zone_moe_mmvq_operand> ops;
@@ -36150,7 +36192,8 @@ static std::vector<zone_moe_mmvq_operand> moe_mmvq_scratch_operands(
             !moe_mmvq_batched_dispatch_supports_type(item.type)) {
             continue;
         }
-        ops.push_back({ item.ne[0], role == expert_tensor_role::DOWN || role == expert_tensor_role::CHUNK_DOWN });
+        ops.push_back({ item.ne[0], role == expert_tensor_role::DOWN || role == expert_tensor_role::CHUNK_DOWN,
+                        item.type == GGML_TYPE_MXFP4 ? item.ne[2] : 0 });
     }
     return ops;
 }
@@ -36363,9 +36406,12 @@ static void populate_host_zone_sizing(placement_plan &                          
     //    activations and an ids table in the device SCRATCH zone until a thread that waits on the op's completion
     //    event releases them, and no later op's allocation waits for that release, so the zone is sized for every
     //    op's buffers at once (zone_scratch_zone_plan), at the micro-batch the context runs. The bound is published
-    //    for the ensure that sizes the zone. A request the zone cannot place still falls through to raw device
-    //    memory, and the zone's use line at cache teardown counts it as a miss. A load plans twice, from the file's
-    //    weights and then from the tensors it created, so the line names the tensor count of the plan it describes.
+    //    for the ensure that sizes the zone, which holds it to the budget quarter and the arena reserve's room and
+    //    states the zone it sizes; this line states only the bound, so the two cannot disagree. A request the zone
+    //    cannot place is a miss, served from raw device memory while the card has room outside the arena and
+    //    otherwise refused by name, and the zone's use line at cache teardown counts it. A load plans twice, from the
+    //    file's weights and then from the tensors it created, so the line names the tensor count of the plan it
+    //    describes.
     plan.moe_mmvq_scratch_ops.clear();
     plan.moe_mmvq_scratch_n_expert_used = 0;
     plan.moe_mmvq_scratch_bytes         = 0;
@@ -36387,16 +36433,12 @@ static void populate_host_zone_sizing(placement_plan &                          
                 n_ops, plan.moe_mmvq_scratch_n_ubatch);
         } else if (n_ops != 0) {
             plan.moe_mmvq_scratch_bytes = mmvq_scratch.graph;
-            const size_t zone_default   = ggml_sycl_compute_arena_bytes(plan.device_id);
             GGML_LOG_WARN(
                 "[SYCL-PLAN] MoE batched MMVQ scratch, plan of %zu tensors: %zu expert op(s) at n_ubatch=%u, depth %zu "
                 "(every op: no op's allocation waits for an earlier op's release), %.2f MB, the largest op %.2f MB; "
-                "the SCRATCH zone is sized from %.2f MB, the larger of that and its %.1f MB default (a larger non-FA "
-                "attention raise sizes it instead)\n",
+                "the arena's ensure sizes the SCRATCH zone for this bound and states what it holds of it\n",
                 tensor_inventory.size(), n_ops, plan.moe_mmvq_scratch_n_ubatch, n_ops,
-                mmvq_scratch.graph / (1024.0 * 1024.0), mmvq_scratch.per_op / (1024.0 * 1024.0),
-                zone_scratch_zone_plan(zone_default, 0, mmvq_scratch.graph).wanted / (1024.0 * 1024.0),
-                zone_default / (1024.0 * 1024.0));
+                mmvq_scratch.graph / (1024.0 * 1024.0), mmvq_scratch.per_op / (1024.0 * 1024.0));
         }
     }
     if (plan.devices.empty()) {
