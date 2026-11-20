@@ -433,6 +433,13 @@ llama_build_and_test(test-archs-table.cpp)
 llama_build_and_test(test-sycl-moe-mmvq-tables.cpp)
 set_tests_properties(test-sycl-moe-mmvq-tables PROPERTIES LABELS "sycl;moe;source;hostonly")
 
+# Host-only gate for the column-split form of the Q8_0 matvec: which shapes take it (few rows, long rows) on the two
+# cards' compute-unit counts, and that its chunks read every quant of a row exactly once. Unguarded for the same reason
+# as the table gate above: mmvq-launch-geometry.hpp includes nothing, so this needs no oneAPI and no GPU.
+llama_build_and_test(test-sycl-mmvq-column-split-rule.cpp)
+set_tests_properties(test-sycl-mmvq-column-split-rule PROPERTIES LABELS "sycl;mmvq;hostonly")
+target_include_directories(test-sycl-mmvq-column-split-rule PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
 # MoE route-table stamp: pure invalidation-decision logic (perf-recovery epic,
 # track B, llama.cpp-s6ac). No device or oneDNN dependency in the tested
 # portion -- see ggml-sycl/moe-route-table.hpp. The header's only backend
