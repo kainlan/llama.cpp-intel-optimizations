@@ -1566,9 +1566,13 @@ struct onednn_pp_scratch_guard {
 // DIRECT path is itself an unplanned device allocation. A pair is never refused below the plan (a clamped zone still
 // holds it), so a small model whose head is larger than its largest layer pair keeps its route.
 static bool ggml_sycl_onednn_pp_scratch_planned_bytes(int device, size_t weights_bytes, size_t activations_bytes) {
-    size_t     pair_bound   = 0;
-    const bool arena_active = ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound);
-    return ggml_sycl::zone_onednn_pp_scratch_planned(arena_active, pair_bound, weights_bytes, activations_bytes);
+    size_t     pair_bound          = 0;
+    size_t     planned_weights     = 0;
+    size_t     planned_activations = 0;
+    const bool arena_active =
+        ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound, &planned_weights, &planned_activations);
+    return ggml_sycl::zone_onednn_pp_scratch_planned(arena_active, pair_bound, planned_weights, planned_activations,
+                                                     weights_bytes, activations_bytes);
 }
 
 static bool acquire_onednn_pp_scratch(int                       device_id,
@@ -38716,11 +38720,14 @@ static bool ggml_sycl_onednn_pp_scratch_supplies(int                 device,
     if (pp_candidate_out) {
         *pp_candidate_out = pp_candidate;
     }
-    size_t     pair_bound   = 0;
-    const bool arena_active = ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound);
+    size_t     pair_bound          = 0;
+    size_t     planned_weights     = 0;
+    size_t     planned_activations = 0;
+    const bool arena_active =
+        ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound, &planned_weights, &planned_activations);
     return ggml_sycl::zone_onednn_pp_scratch_supplies(
         pp_candidate, ggml_sycl::onednn_pp_unified_scratch_enabled(src0->type), arena_active, pair_bound,
-        w_elems * elem_bytes, a_elems * elem_bytes);
+        planned_weights, planned_activations, w_elems * elem_bytes, a_elems * elem_bytes);
 }
 
 static moe_route_capability ggml_sycl_moe_query_route_capability(

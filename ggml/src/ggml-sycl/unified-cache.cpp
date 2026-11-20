@@ -25184,13 +25184,24 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
 // zone was not rebuilt for. Not covered: a growth step still needs the superseded pair and the new one in the zone
 // at once (see the note in reserve_onednn_scratch), so a pair inside the bound can still fall through to the
 // unplanned direct allocation while its predecessor drains.
-bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound) {
+bool unified_cache_get_onednn_pp_pair_bound(int      device_id,
+                                            size_t * bound,
+                                            size_t * planned_weights,
+                                            size_t * planned_activations) {
     unified_cache * cache = get_existing_unified_cache_for_device(device_id);
     if (!cache || !cache->arena_active()) {
         return false;
     }
+    // One read: the bound and the planned halves describe the same stored plan.
+    const zone_onednn_plan zone_plan = cache->onednn_zone_plan_load();
     if (bound) {
-        *bound = onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), cache->zone_capacity(vram_zone_id::ONEDNN));
+        *bound = onednn_pp_pair_bound_for(zone_plan, cache->zone_capacity(vram_zone_id::ONEDNN));
+    }
+    if (planned_weights) {
+        *planned_weights = zone_plan.weights_bytes;
+    }
+    if (planned_activations) {
+        *planned_activations = zone_plan.activations_bytes;
     }
     return true;
 }

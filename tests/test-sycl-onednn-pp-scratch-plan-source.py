@@ -330,14 +330,16 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     pure = function_body(
         zone_sizing, r"size_t zone_onednn_pp_pair_bound\([^)]*\)\s*\{")
     pair_bound = function_body(
-        cache, r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\)\s*\{")
+        cache, r"bool unified_cache_get_onednn_pp_pair_bound\(int\s+device_id,\s*size_t \* bound,\s*"
+               r"size_t \* planned_weights,\s*size_t \* planned_activations\)\s*\{")
     bound_for = function_body(
         cache, r"static size_t onednn_pp_pair_bound_for\(const zone_onednn_plan & plan, size_t capacity_bytes\)\s*\{")
     results["anchor: the pure pair bound exists"] = pure is not None
     results["anchor: the pair-bound accessor is defined"] = pair_bound is not None
     results["anchor: the shared bound helper is defined"] = bound_for is not None
     results["the pair-bound accessor is declared"] = \
-        re.search(r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\);", cache_hpp) is not None
+        re.search(r"bool unified_cache_get_onednn_pp_pair_bound\(int\s+device_id,\s*size_t \* bound,\s*"
+                  r"size_t \* planned_weights,\s*size_t \* planned_activations\);", cache_hpp) is not None
     if pure is not None:
         pure_norm = re.sub(r"\s+", " ", pure)
         results["the pure bound subtracts the floor from the capacity"] = \
@@ -350,9 +352,16 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
         results["the accessor reads the arena's real ONEDNN zone capacity"] = \
             "vram_zone_id::ONEDNN" in pair_bound and "arena_active()" in pair_bound
         results["the accessor answers through the shared bound helper"] = "onednn_pp_pair_bound_for(" in pair_bound
-        # The plan is the one stored on the cache whose ONEDNN capacity the accessor bounds, never another cache's.
+        # The plan is the one stored on the cache whose ONEDNN capacity the accessor bounds, never another cache's,
+        # read once: the bound and the planned halves it reports describe the same plan.
+        pair_bound_norm = " ".join(pair_bound.split())
         results["the accessor bounds by its own cache's plan"] = \
-            "onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), cache->zone_capacity(" in pair_bound
+            "const zone_onednn_plan zone_plan = cache->onednn_zone_plan_load();" in pair_bound_norm and \
+            "onednn_pp_pair_bound_for(zone_plan, cache->zone_capacity(" in pair_bound_norm
+        results["the accessor reports the planned halves from the read its bound comes from"] = \
+            pair_bound.count("onednn_zone_plan_load(") == 1 and \
+            "*planned_weights = zone_plan.weights_bytes;" in pair_bound_norm and \
+            "*planned_activations = zone_plan.activations_bytes;" in pair_bound_norm
     if bound_for is not None:
         results["the helper reads the stored plan's bare plan and floor together"] = \
             "plan.bare_bytes" in bound_for and "plan.graph_floor_bytes" in bound_for
@@ -831,8 +840,18 @@ if args.self_test and not failed:
          (backend, mutate_in_func(cache, bound_sig, "plan.bare_bytes", "0"), cache_hpp)),
         ("accessor bounds by another cache's plan", "the accessor bounds by its own cache's plan",
          (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
-                                  "onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(),",
-                                  "onednn_pp_pair_bound_for(get_unified_cache_for_device(0)->onednn_zone_plan_load(),"),
+                                  "zone_plan = cache->onednn_zone_plan_load();",
+                                  "zone_plan = get_unified_cache_for_device(0)->onednn_zone_plan_load();"),
+          cache_hpp)),
+        ("accessor reads the halves from a second load",
+         "the accessor reports the planned halves from the read its bound comes from",
+         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
+                                  "*planned_weights = zone_plan.weights_bytes;",
+                                  "*planned_weights = cache->onednn_zone_plan_load().weights_bytes;"),
+          cache_hpp)),
+        ("accessor drops the activations half", "the accessor reports the planned halves from the read its bound comes from",
+         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
+                                  "*planned_activations = zone_plan.activations_bytes;", "*planned_activations = 0;"),
           cache_hpp)),
         ("kept-zone exit describes the zone by the live plan", "the kept-zone exit stores the larger of the held and live plan, in one critical section",
          (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(live_plan)",

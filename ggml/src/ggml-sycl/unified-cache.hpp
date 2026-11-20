@@ -9201,10 +9201,15 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
 // llama.cpp-8ony: the most an op's oneDNN PP scratch pair may be for the ONEDNN zone on `device_id` to count it as
 // planned (zone_onednn_pp_pair_bound over the zone's capacity and the zone plan ensure_planned_arena_zones stored on
 // the same cache: the pair's plan and the Graph SDPA floor the zone was sized from, as one figure; see
-// unified_cache::onednn_zone_plan_). False (and *bound untouched) when there is no cache or no active arena, i.e. no
-// zone exists to plan against. This is the one source for "does an op's pair fit what was planned"
+// unified_cache::onednn_zone_plan_). `planned_weights` and `planned_activations` receive the two halves of that same
+// stored plan, from the one read the bound is computed from, so an admission never pairs one plan's bound with another
+// plan's halves. Each out-pointer may be null. False (and every out untouched) when there is no cache or no active
+// arena, i.e. no zone exists to plan against. This is the one source for "does an op's pair fit what was planned"
 // (zone_onednn_pp_scratch_planned).
-bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound);
+bool unified_cache_get_onednn_pp_pair_bound(int      device_id,
+                                            size_t * bound,
+                                            size_t * planned_weights,
+                                            size_t * planned_activations);
 
 // The ONEDNN zone's oneDNN Graph room on `device_id`: the part of the zone no other planned consumer may take, the
 // capacity less unified_cache_get_onednn_pp_pair_bound()'s bound over that same capacity. Both come from ONE capacity

@@ -467,9 +467,12 @@ bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool
 // pair must fit the bound the zone was planned to hold (sum <= `pair_bound_bytes`, overflow-checked: a wrapped sum
 // compares as small). `pair_bound_bytes` is zone_onednn_pp_pair_bound over the zone's capacity, NOT the capacity
 // itself: a caller passing the raw capacity would admit a pair that takes the bytes reserved for the Graph SDPA
-// scratch. Pure.
+// scratch. `planned_weights_bytes` and `planned_activations_bytes` are the two halves of the pair plan stored with
+// that bound (zone_onednn_plan), 0, 0 for none. Pure.
 bool zone_onednn_pp_scratch_planned(bool   arena_active,
                                     size_t pair_bound_bytes,
+                                    size_t planned_weights_bytes,
+                                    size_t planned_activations_bytes,
                                     size_t weights_bytes,
                                     size_t activations_bytes);
 
@@ -585,6 +588,8 @@ bool zone_onednn_pp_scratch_supplies(bool   pp_candidate,
                                      bool   type_enabled,
                                      bool   arena_active,
                                      size_t pair_bound_bytes,
+                                     size_t planned_weights_bytes,
+                                     size_t planned_activations_bytes,
                                      size_t weights_bytes,
                                      size_t activations_bytes);
 

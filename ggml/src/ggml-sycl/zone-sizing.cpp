@@ -529,8 +529,12 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
 
 bool zone_onednn_pp_scratch_planned(bool   arena_active,
                                     size_t pair_bound_bytes,
+                                    size_t planned_weights_bytes,
+                                    size_t planned_activations_bytes,
                                     size_t weights_bytes,
                                     size_t activations_bytes) {
+    (void) planned_weights_bytes;
+    (void) planned_activations_bytes;
     if (!arena_active) {
         return true;
     }
@@ -610,10 +614,13 @@ bool zone_onednn_pp_scratch_supplies(bool   pp_candidate,
                                      bool   type_enabled,
                                      bool   arena_active,
                                      size_t pair_bound_bytes,
+                                     size_t planned_weights_bytes,
+                                     size_t planned_activations_bytes,
                                      size_t weights_bytes,
                                      size_t activations_bytes) {
     return pp_candidate && type_enabled &&
-           zone_onednn_pp_scratch_planned(arena_active, pair_bound_bytes, weights_bytes, activations_bytes);
+           zone_onednn_pp_scratch_planned(arena_active, pair_bound_bytes, planned_weights_bytes,
+                                          planned_activations_bytes, weights_bytes, activations_bytes);
 }
 
 bool zone_unified_pp_draws_dequant(bool primary_unified,
