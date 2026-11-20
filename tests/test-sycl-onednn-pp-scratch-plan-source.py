@@ -46,6 +46,14 @@ ggml_sycl_tensor_info::get_rows_only, is copied into the inventory the planner s
 classifier; test-zone-sizing Case 14j proves the classifier, this gate proves the producer, the carrier and the
 plumbing.
 
+The planned pair's activations half is n_ubatch rows of the widest f16 row of the weights the scratch takes, at the
+micro-batch the Graph floor sharing the zone is sized at. It was the largest eligible weight AS STORED, a placeholder:
+Qwen3.8 at -ub 2048 asks 40.0 MB against 31.9 MB, the pair could not merge inside its bound once the zone was exactly
+pair + floor, and every op of a layer replaced the held pair. Both formula sites (the inventory intake, which sizes the
+zone, and the plan's host zone sizing, which reports it) plan through one definition
+(unified_cache_plan_onednn_pp_pair); this gate fails when either goes back to the placeholder or when they stop
+sharing it. test-zone-sizing Case 14m proves the arithmetic.
+
 Run with --self-test to prove every check fires against a mutant of the thing it forbids.
 """
 import argparse
@@ -226,8 +234,9 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
         results["the adapter marks the unified-kernel types for the conditional dequant plan"] = \
             "unified_kernel_serves_type(" in adapter and "dequant_f16_if_unsupplied_weight_bytes" in adapter and \
             "dequant_f16_if_unsupplied_src1_bytes_per_token" in adapter
+        # The assignment itself: the activations-row mark below asks the same function for its own gate.
         results["the adapter hands the classifier the type/env enablement, not its own copy"] = \
-            "pp_scratch_type_enabled" in adapter and "onednn_pp_unified_scratch_enabled(" in adapter
+            re.search(r"desc\.pp_scratch_type_enabled\s*=\s*onednn_pp_unified_scratch_enabled\(", adapter) is not None
         results["the adapter excludes expert stacks from the conditional mark too"] = \
             adapter.count("expert_tensor_role_from_tensor_name(") >= 3
     SUPPLIES = "ggml_sycl_onednn_pp_scratch_supplies("
@@ -396,7 +405,65 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
             "g_planned_onednn_pair_activations_bytes" in pair_reader
     results["the inventory planner stores the pair's two halves, not only their sum"] = \
         re.search(r"unified_cache_set_planned_onednn_scratchpad_pair\(\s*ctx->device,\s*"
-                  r"inventory_maxima\.onednn_reorder,\s*inventory_maxima\.onednn_eligible\)", backend) is not None
+                  r"pair\.weights_bytes,\s*pair\.activations_bytes\)", backend) is not None
+
+    # ---- the planned pair's activations half is a micro-batch times the scratch's widest row ----
+    # It was the largest eligible weight AS STORED (onednn_eligible), a placeholder: at -ub 2048 on Qwen3.8 the ops ask
+    # 40.0 MB against 31.9 MB, the pair could not merge inside its bound, and every op of a layer replaced the held
+    # pair.
+    # Both formula sites (the inventory intake, which sizes the zone, and the plan's host zone sizing, which reports
+    # it) plan through ONE definition; the pure arithmetic is test-zone-sizing Case 14m.
+    pair_def = function_body(cache, r"zone_onednn_pp_pair unified_cache_plan_onednn_pp_pair\([^)]*\)\s*\{")
+    intake = function_body(backend, r"static void populate_inventory_globals\([^)]*\)\s*\{")
+    host_sizing = function_body(cache, r"static void populate_host_zone_sizing\([^)]*\)\s*\{")
+    pure_pair = function_body(zone_sizing, r"zone_onednn_pp_pair zone_onednn_pp_pair_plan\([^)]*\)\s*\{")
+    results["anchor: the one pair definition exists"] = pair_def is not None
+    results["anchor: the inventory intake exists"] = intake is not None
+    results["anchor: the host zone sizing exists"] = host_sizing is not None
+    results["anchor: the pure pair plan exists"] = pure_pair is not None
+    if pair_def is not None:
+        pair_norm = " ".join(pair_def.split())
+        results["the one pair definition sizes the activations half from the scratch's row"] = \
+            "zone_onednn_pp_pair_plan(maxima.onednn_reorder, maxima.onednn_pp_src1_bytes_per_token," in pair_norm
+        results["the one pair definition takes the Graph shape's micro-batch"] = \
+            "placement_load_n_ubatch(unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope).n_ubatch)" in \
+            pair_norm
+    if pure_pair is not None:
+        results["the pure pair plan multiplies the row by the micro-batch, overflow-checked"] = \
+            "src1_bytes_per_token * n_ubatch" in pure_pair and "SIZE_MAX / n_ubatch" in pure_pair and \
+            "SIZE_MAX - activations" in pure_pair
+    if intake is not None:
+        intake_norm = " ".join(intake.split())
+        plan_at = intake_norm.find("unified_cache_plan_onednn_pp_pair(inventory_maxima, g_placement_kv_info,")
+        set_at = intake_norm.find("unified_cache_set_planned_onednn_scratchpad_pair(ctx->device, pair.weights_bytes,")
+        fill_at = intake_norm.find("ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);")
+        results["the inventory intake plans the pair through the one definition"] = 0 <= plan_at < set_at
+        results["the inventory intake plans the pair once the KV inputs give the context shape"] = \
+            0 <= fill_at < plan_at
+    if host_sizing is not None:
+        host_norm = " ".join(host_sizing.split())
+        results["the host zone sizing plans the pair through the one definition"] = \
+            "unified_cache_plan_onednn_pp_pair(zone_maxima, kv_info, envelope)" in host_norm and \
+            "plan.onednn_scratchpad_bytes = onednn_pair.weights_bytes + onednn_pair.activations_bytes;" in host_norm
+    results["no formula site reads the stored-weight placeholder"] = \
+        all(body is not None and "onednn_eligible" not in body for body in (pair_def, intake, host_sizing))
+    # The zone is sized from the pair the intake publishes; a second publisher with its own formula is a second site.
+    results["the pair is published from the one definition only"] = \
+        len(re.findall(r"\bunified_cache_set_planned_onednn_scratchpad_pair\s*\(", backend)) == 1
+    maxima_fn = function_body(zone_sizing, r"path_scoped_maxima zone_scoped_maxima\([^)]*\)\s*\{")
+    if maxima_fn is not None:
+        rows_at = maxima_fn.find("if (tensor.get_rows_only)")
+        row_gate = re.search(r"if \(onednn_eligible\) \{\s*maxima\.onednn_pp_src1_bytes_per_token\s*=", maxima_fn)
+        results["the classifier takes the scratch's row only inside the eligible set, after the gather exclusion"] = \
+            row_gate is not None and 0 <= rows_at < row_gate.start() and \
+            maxima_fn.count("onednn_pp_src1_bytes_per_token") == 3
+    if adapter is not None:
+        adapter_norm = " ".join(adapter.split())
+        results["the adapter marks the scratch's row for the types acquire and the PP admission take"] = \
+            "if (quantized && !is_expert && onednn_pp_unified_scratch_enabled(item.type) && " \
+            "ggml_sycl_onednn_pp_type_admitted(item.type)) { size_t src1_bytes = 0; if " \
+            "(zone_dequant_f16_src1_bytes_per_token(" in adapter_norm and \
+            "desc.onednn_pp_src1_bytes_per_token = src1_bytes;" in adapter_norm
     for name, body in (("by-bytes core", bytes_helper),):
         results["the %s reads the pair bound, not the raw capacity" % name] = \
             "unified_cache_get_onednn_pp_pair_bound(" in body and "unified_cache_get_onednn_zone_capacity(" not in body
@@ -614,6 +681,11 @@ if args.self_test and not failed:
     ensure_sig = r"bool unified_cache::ensure_planned_arena_zones\("
     reserve_sig = r"bool unified_cache::reserve_onednn_scratch\("
     route_a_sig = r"static bool ggml_sycl_mul_mat_unified_pp_dequant_route\("
+    intake_sig = r"static void populate_inventory_globals\("
+    host_sizing_sig = r"static void populate_host_zone_sizing\("
+    pair_def_sig = r"zone_onednn_pp_pair unified_cache_plan_onednn_pp_pair\([^)]*\)\s*\{"
+    pure_pair_sig = r"zone_onednn_pp_pair zone_onednn_pp_pair_plan\([^)]*\)\s*\{"
+    maxima_sig = r"path_scoped_maxima zone_scoped_maxima\("
     SUPPLIES_NAME = "ggml_sycl_onednn_pp_scratch_supplies("
     mutants = [
         ("op arm ignores the shared question", "the op arm's candidate asks the shared supplies helper with its column tile",
@@ -919,6 +991,68 @@ if args.self_test and not failed:
           cache_hpp)),
         ("accessor undeclared", "the pair-bound accessor is declared",
          (backend, cache, mutate(cache_hpp, "unified_cache_get_onednn_pp_pair_bound(", "unified_cache_get_XXXX("))),
+        # ---- the planned pair's activations half ----
+        ("intake publishes the placeholder again",
+         "the inventory planner stores the pair's two halves, not only their sum",
+         (mutate_in_func(backend, intake_sig, "pair.activations_bytes);", "inventory_maxima.onednn_eligible);"),
+          cache, cache_hpp)),
+        ("intake reads the placeholder", "no formula site reads the stored-weight placeholder",
+         (mutate_in_func(backend, intake_sig, "pair.activations_bytes);", "inventory_maxima.onednn_eligible);"),
+          cache, cache_hpp)),
+        ("intake keeps its own formula", "the inventory intake plans the pair through the one definition",
+         (mutate_in_func(backend, intake_sig, "ggml_sycl::unified_cache_plan_onednn_pp_pair(inventory_maxima,",
+                         "h_own_pair(inventory_maxima,"), cache, cache_hpp)),
+        ("intake plans before the context shape",
+         "the inventory intake plans the pair once the KV inputs give the context shape",
+         (mutate_in_func(backend, intake_sig, "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);",
+                         "(void) 0;"), cache, cache_hpp)),
+        ("host sizing goes back to the placeholder", "the host zone sizing plans the pair through the one definition",
+         (backend, mutate_in_func(cache, host_sizing_sig, "onednn_pair.weights_bytes + onednn_pair.activations_bytes;",
+                                  "zone_maxima.onednn_reorder + zone_maxima.onednn_eligible;"), cache_hpp)),
+        ("host sizing reads the placeholder", "no formula site reads the stored-weight placeholder",
+         (backend, mutate_in_func(cache, host_sizing_sig, "onednn_pair.weights_bytes + onednn_pair.activations_bytes;",
+                                  "zone_maxima.onednn_reorder + zone_maxima.onednn_eligible;"), cache_hpp)),
+        ("the two sites differ", "the host zone sizing plans the pair through the one definition",
+         (backend, mutate_in_func(cache, host_sizing_sig,
+                                  "unified_cache_plan_onednn_pp_pair(zone_maxima, kv_info, envelope)",
+                                  "zone_onednn_pp_pair_plan(zone_maxima.onednn_reorder, "
+                                  "zone_maxima.onednn_pp_src1_bytes_per_token, plan.planner_n_ubatch)"), cache_hpp)),
+        ("a second pair publisher", "the pair is published from the one definition only",
+         (backend + "\nstatic void h2() { ggml_sycl::unified_cache_set_planned_onednn_scratchpad_pair(0, 1, 2); }\n",
+          cache, cache_hpp)),
+        ("definition reads the placeholder row",
+         "the one pair definition sizes the activations half from the scratch's row",
+         (backend, mutate_in_func(cache, pair_def_sig, "maxima.onednn_pp_src1_bytes_per_token",
+                                  "maxima.onednn_eligible"), cache_hpp)),
+        ("definition reads the placeholder", "no formula site reads the stored-weight placeholder",
+         (backend, mutate_in_func(cache, pair_def_sig, "maxima.onednn_pp_src1_bytes_per_token",
+                                  "maxima.onednn_eligible"), cache_hpp)),
+        ("definition takes another micro-batch", "the one pair definition takes the Graph shape's micro-batch",
+         (backend, mutate_in_func(cache, pair_def_sig,
+                                  "unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope).n_ubatch",
+                                  "kv_info.n_ubatch"), cache_hpp)),
+        ("pure plan drops the micro-batch",
+         "the pure pair plan multiplies the row by the micro-batch, overflow-checked",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, pure_pair_sig, "src1_bytes_per_token * n_ubatch", "src1_bytes_per_token"))),
+        ("pure plan wraps the sum", "the pure pair plan multiplies the row by the micro-batch, overflow-checked",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, pure_pair_sig, "SIZE_MAX - activations", "SIZE_MAX"))),
+        ("classifier takes every row",
+         "the classifier takes the scratch's row only inside the eligible set, after the gather exclusion",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, maxima_sig,
+                         "if (onednn_eligible) {\n            maxima.onednn_pp_src1_bytes_per_token",
+                         "if (true) {\n            maxima.onednn_pp_src1_bytes_per_token"))),
+        ("adapter marks every type",
+         "the adapter marks the scratch's row for the types acquire and the PP admission take",
+         (backend, mutate_in_func(cache, adapter_sig, "!is_expert && onednn_pp_unified_scratch_enabled(item.type) &&",
+                                  "!is_expert &&"), cache_hpp)),
+        ("adapter marks expert rows",
+         "the adapter marks the scratch's row for the types acquire and the PP admission take",
+         (backend, mutate_in_func(cache, adapter_sig,
+                                  "if (quantized && !is_expert && onednn_pp_unified_scratch_enabled(",
+                                  "if (quantized && onednn_pp_unified_scratch_enabled("), cache_hpp)),
     ]
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)
