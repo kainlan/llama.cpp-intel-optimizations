@@ -30,9 +30,17 @@ plans (a load_published_record per device, kept for the one open load transactio
 effects restores them for that transaction, and load_end forgets them once the load committed. Every device-wide
 unified_cache_set_planned_* call on the load's publish path (ggml_sycl_inventory_publish_planner_inputs,
 populate_inventory_globals, ggml_sycl_publish_load_ubatch_scratch), and each planner term, is restored by
-load_published_record::restore; the oneDNN pair's setter by the halves' store and the sum's compare-exchange.
+load_published_terms::restore, the one list of the terms' setters, which load_published_record::restore calls for
+every group but the sum and the zone plan; the oneDNN pair's setter by the halves' store and the sum's own store.
 Owner-keyed terms leave with their owner instead, and the compute term's micro-batch is sticky by design
 (EXEMPT_SETTERS).
+
+The terms are one struct, and nothing about them is kept in a second list. Each group of the load_published_group enum
+has an arm in load_published_terms::restore, in take_groups and in differing, and LOAD_PUBLISHED_GROUP_ALL is every
+group; each member of the struct (and of the planner's terms it holds) is read by its snapshot, written by its restore
+and compared by differing. Every planned-term setter the cache's header declares is a member's (it is called by the
+restore, or writes members whose setters the restore calls), or is in NOT_LOAD_PUBLISHED with the reason it is not
+one, so a new device-wide setter fails here until it is either.
 
 The restore puts back only what still holds the load's value. A runtime context transaction of a live model publishes
 some of the same terms while the load runs, and the oneDNN pair's reserve raises the stored sum. Both planner entries
@@ -54,6 +62,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SYCL = ROOT / "ggml/src/ggml-sycl"
 GS = (SYCL / "ggml-sycl.cpp").read_text()
 UC = (SYCL / "unified-cache.cpp").read_text()
+UH = (SYCL / "unified-cache.hpp").read_text()
 ZS = (SYCL / "zone-sizing.cpp").read_text()
 
 _LEXEME_RE = re.compile(
@@ -251,6 +260,11 @@ COMMIT_CLEANUP = "if (result.cleanup_required) {"
 COMMITTED = "if (result.committed) {"
 RESTORE_SIG = "static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept"
 RECORD_RESTORE_SIG = "void load_published_record::restore(int device) const noexcept"
+TERMS_RESTORE_SIG = "void load_published_terms::restore(int device, uint32_t groups) const noexcept"
+TERMS_SNAPSHOT_SIG = "load_published_terms load_published_terms::snapshot(int device)"
+DIFFERING_SIG = "uint32_t load_published_terms::differing(const load_published_terms & other) const"
+TAKE_GROUPS_SIG = "void load_published_terms::take_groups(const load_published_terms & from, uint32_t groups)"
+PLANNER_SNAPSHOT_SIG = "planner_published_terms planner_published_terms::snapshot(int device)"
 RECORD_NOTE_SIG = ("void load_published_record::note(const load_published_terms & before, "
                    "const load_published_terms & after)")
 PUBLISH_SIGS = (
@@ -300,17 +314,22 @@ PLANNER_SETTERS = {
     "unified_cache_set_planned_moe_control_requirement",
     "unified_cache_set_planned_moe_host_scatter_scratch_bytes",
 }
-# The pair's setter stores the halves and then their total as the sum. The record puts the halves back on their own and
-# the sum by compare-exchange, so a reserve's raise of the sum survives; together those restore what the setter wrote.
-HALVES = "unified_cache_store_planned_onednn_pair_halves(device, prior.onednn_weights, prior.onednn_activations);"
+# The pair's setter stores the halves and then their total as the sum. The terms' restore stores each under its own
+# group: the halves on their own and the sum by its own setter, so the record can leave the sum out of what it puts back
+# through the terms and put it back by compare-exchange instead, which keeps a reserve's raise.
+HALVES = "unified_cache_store_planned_onednn_pair_halves(device, onednn_weights, onednn_activations);"
+SUM_STORE = "unified_cache_set_planned_onednn_scratchpad_bytes(device, onednn_stored);"
 SUM_CAS = "g_planned_onednn_scratchpad_bytes[device].compare_exchange_strong(published, prior.onednn_stored,"
 PAIR_SETTER = "unified_cache_set_planned_onednn_scratchpad_pair"
+# The record puts every group back through the terms' own restore but the two another writer moves outside the
+# inventory lock: the sum, which the pair's reserve raises, and the zone plan, which the reserve also writes through.
+PRIOR_RESTORE = "prior.restore(device, back & ~(LOAD_PUBLISHED_GROUP_ONEDNN_SUM | LOAD_PUBLISHED_GROUP_ZONE_PLAN));"
 
 
-def record_restored_setters(uc: str) -> set:
-    body = fn_body(code(uc), RECORD_RESTORE_SIG)
+def terms_restored_setters(uc: str) -> set:
+    body = fn_body(code(uc), TERMS_RESTORE_SIG)
     restored = set(SETTER_RE.findall(body))
-    if HALVES in body and SUM_CAS in body:
+    if HALVES in body and SUM_STORE in body:
         restored.add(PAIR_SETTER)
     return restored
 
@@ -319,11 +338,13 @@ def claim_failed_load_restores(gs: str, uc: str) -> bool:
     c = code(gs)
     stage = fn_body(c, STAGE_SIG)
     load_end = fn_body(c, LOAD_END_SIG)
-    restored = record_restored_setters(uc)
+    record = fn_body(code(uc), RECORD_RESTORE_SIG)
+    restored = terms_restored_setters(uc)
     setters = publish_path_setters(gs)
     return (ordered(stage, CAPTURE, STAGE_LOOP)
             and restored_outside_every_try(c)
             and ordered(load_end, COMMIT_CLEANUP, FORGET, COMMITTED)
+            and PRIOR_RESTORE in record and SUM_CAS in record
             and PUBLISH_SETTERS_TODAY <= setters and setters <= restored and PLANNER_SETTERS <= restored)
 
 
@@ -345,27 +366,64 @@ NOTE_SUM = "written.onednn_stored = after.onednn_weights + after.onednn_activati
 # A group goes back only while it holds what the load published and differs from what it held before.
 HELD = ("const uint32_t back = ~load_published_terms::snapshot(device).differing(written) & "
         "prior.differing(written);")
-GROUP_SETTERS = (
+# The groups, read from the enum: each LOAD_PUBLISHED_GROUP_<name> = 1u << <bit>, bits 0 up without a gap, and
+# LOAD_PUBLISHED_GROUP_ALL the mask of all of them. A group added to the enum is checked below without an edit here.
+GROUP_RE = re.compile(r"\b(LOAD_PUBLISHED_GROUP_\w+) = 1u << (\d+),")
+GROUP_ALL_RE = re.compile(r"\bLOAD_PUBLISHED_GROUP_ALL = \(1u << (\d+)\) - 1,")
+# What each of today's groups is known to store, so an arm that stores the wrong group's term fails too. The zone plan's
+# store is on the device's existing cache.
+KNOWN_GROUP_STORES = (
     ("LOAD_PUBLISHED_GROUP_PIPELINE", "unified_cache_set_planned_pp_pipeline_scratch_bytes("),
     ("LOAD_PUBLISHED_GROUP_RING", "unified_cache_set_planned_pp_moe_onednn_scratch("),
     ("LOAD_PUBLISHED_GROUP_RING", "unified_cache_set_planned_pp_moe_onednn_kv_zone_slots("),
     ("LOAD_PUBLISHED_GROUP_RING", "unified_cache_set_planned_pp_moe_onednn_n_ubatch("),
     ("LOAD_PUBLISHED_GROUP_RING_ROWS", "unified_cache_set_planned_pp_moe_onednn_row_bytes("),
     ("LOAD_PUBLISHED_GROUP_ONEDNN_PAIR", "unified_cache_store_planned_onednn_pair_halves("),
+    ("LOAD_PUBLISHED_GROUP_ONEDNN_SUM", "unified_cache_set_planned_onednn_scratchpad_bytes("),
     ("LOAD_PUBLISHED_GROUP_GRAPH", "unified_cache_set_planned_onednn_graph_scratch_shape("),
     ("LOAD_PUBLISHED_GROUP_NONFA", "unified_cache_set_planned_nonfa_attn_scratch_shape("),
     ("LOAD_PUBLISHED_GROUP_CONTROL", "unified_cache_set_planned_moe_control_requirement("),
     ("LOAD_PUBLISHED_GROUP_SCATTER", "unified_cache_set_planned_moe_host_scatter_scratch_bytes("),
-    ("LOAD_PUBLISHED_GROUP_ZONE_PLAN", "onednn_zone_plan_put_back("),
+    ("LOAD_PUBLISHED_GROUP_ZONE_PLAN", "cache->onednn_zone_plan_store(onednn_zone_plan);"),
 )
-# The sum is never stored plainly: a plain store would put back over a reserve's raise.
+CALL_RE = re.compile(r"\b\w+\(")
+# The record's zone-plan arm: the plan goes back by a test against what this load left in it.
+ZONE_PLAN_ARM = "if (back & LOAD_PUBLISHED_GROUP_ZONE_PLAN) {"
+PUT_BACK = "onednn_zone_plan_put_back("
+# The sum is never stored plainly by the record: a plain store would put back over a reserve's raise.
 SUM_PLAIN = ("unified_cache_set_planned_onednn_scratchpad_bytes(", PAIR_SETTER + "(",
              "g_planned_onednn_scratchpad_bytes[device].store(")
 
 
-def guarded(body: str, group: str, setter: str) -> bool:
-    k = body.find("if (back & " + group + ") {")
-    return k != -1 and setter in block_at(body, k) and body.count(setter) == 1
+def published_groups(uh: str) -> list:
+    """The load_published_group enum's groups in bit order; [] when a bit is skipped or repeated, or when
+    LOAD_PUBLISHED_GROUP_ALL is not the mask of every one of them."""
+    c = code(uh)
+    found = GROUP_RE.findall(c)
+    bits = [int(b) for _, b in found]
+    every = GROUP_ALL_RE.search(c)
+    if not found or bits != list(range(len(found))) or not every or int(every.group(1)) != len(found):
+        return []
+    return [g for g, _ in found]
+
+
+def group_arm(body: str, group: str) -> str:
+    k = body.find("if (groups & " + group + ") {")
+    return block_at(body, k) if k != -1 else ""
+
+
+def claim_every_group_has_its_arms(uh: str, uc: str) -> bool:
+    """Each enum group has an arm in the terms' restore that stores something, an arm in take_groups, and a bit in
+    differing; each store known for a group is in that group's arm and in no other arm."""
+    u = code(uc)
+    groups = published_groups(uh)
+    terms = fn_body(u, TERMS_RESTORE_SIG)
+    take = fn_body(u, TAKE_GROUPS_SIG)
+    differing = fn_body(u, DIFFERING_SIG)
+    return (bool(groups)
+            and all(CALL_RE.search(group_arm(terms, g)) and group_arm(take, g) and (", " + g + ")") in differing
+                    for g in groups)
+            and all(g in groups and s in group_arm(terms, g) and terms.count(s) == 1 for g, s in KNOWN_GROUP_STORES))
 
 
 def claim_restore_keeps_a_later_publish(gs: str, uc: str) -> bool:
@@ -374,13 +432,119 @@ def claim_restore_keeps_a_later_publish(gs: str, uc: str) -> bool:
     note = fn_body(u, RECORD_NOTE_SIG)
     restore = fn_body(u, RECORD_RESTORE_SIG)
     entries = [fn_body(c, sig) for sig in (EARLY_SIG, LATE_SIG)]
+    zone_arm = block_at(restore, restore.find(ZONE_PLAN_ARM)) if ZONE_PLAN_ARM in restore else ""
     return (all(ordered(e, IMPL_LOCK, PASS, IMPL_POPULATE) and e.count(PASS) == 1 for e in entries)
             and PASS_NOTE in fn_body(c, PASS_END_SIG)
             and ordered(fn_body(c, RESTORE_SIG), *RESTORE_LOCKS)
             and NOTE_OTHER in note and NOTE_SUM in note
-            and ordered(restore, HELD, *(s for _, s in GROUP_SETTERS))
-            and all(guarded(restore, g, s) for g, s in GROUP_SETTERS)
-            and SUM_CAS in restore and not any(p in restore for p in SUM_PLAIN))
+            and ordered(restore, HELD, PRIOR_RESTORE, ZONE_PLAN_ARM, SUM_CAS)
+            and restore.count("prior.restore(") == 1 and PUT_BACK in zone_arm and restore.count(PUT_BACK) == 1
+            and not any(p in restore for p in SUM_PLAIN))
+
+
+# ---- the terms are one struct: every member and every setter is accounted for ----
+
+TERMS_STRUCT = "struct load_published_terms"
+PLANNER_STRUCT = "struct planner_published_terms"
+MEMBER_RE = re.compile(r"[\w:<>]+ (\w+)(?: = [^;]+|\{\})?")
+
+
+def data_members(uh: str, struct: str) -> list:
+    """The data members a struct declares, in order: each declaration in its body that has no parameter list."""
+    body = fn_body(code(uh), struct)[1:-1]
+    members = []
+    for stmt in body.split(";"):
+        stmt = stmt.strip()
+        m = MEMBER_RE.fullmatch(stmt) if stmt and "(" not in stmt else None
+        if m:
+            members.append(m.group(1))
+    return members
+
+
+def claim_every_member_is_read_written_and_compared(uh: str, uc: str) -> bool:
+    """Each member of load_published_terms is read by the snapshot, compared by differing, taken by take_groups and
+    stored by the restore, and so is each member of the planner's terms it holds."""
+    u = code(uc)
+    snapshot = fn_body(u, TERMS_SNAPSHOT_SIG)
+    differing = fn_body(u, DIFFERING_SIG)
+    take = fn_body(u, TAKE_GROUPS_SIG)
+    restore = fn_body(u, TERMS_RESTORE_SIG)
+    planner_snapshot = fn_body(u, PLANNER_SNAPSHOT_SIG)
+    terms = data_members(uh, TERMS_STRUCT)
+    planner = data_members(uh, PLANNER_STRUCT)
+    if len(terms) < 17 or len(planner) < 4 or "planner" not in terms:
+        return False
+
+    def has(text: str, pattern: str) -> bool:
+        # Whole names: ring_output must not pass on ring_output_row.
+        return re.search(pattern, text) is not None
+
+    for m in terms:
+        if m == "planner":
+            continue
+        if not (has(snapshot, rf"\bterms\.{m} = ") and has(differing, rf"\bother\.{m}\b")
+                and has(take, rf"\b{m} = from\.{m};") and has(restore, rf"\b{m}\b")):
+            return False
+    for m in planner:
+        if not (has(planner_snapshot, rf"\bterms\.{m} = ") and has(differing, rf"\bb\.{m}\b")
+                and has(take, rf"\bplanner\.{m} = from\.planner\.{m};") and has(restore, rf"\bplanner\.{m}\b")):
+            return False
+    return "terms.planner = planner_published_terms::snapshot(device);" in snapshot
+
+
+# Every planned-term setter the cache declares or defines (its header, and the cache's own file for a file-local one),
+# by the verb that writes a planned figure.
+DECLARED_SETTER_RE = re.compile(r"\b(unified_cache_(?:set|raise|publish|store|add|put)_planned_\w+)\(")
+# The named exclusion table: each declared setter that writes no member of load_published_terms, and why.
+NOT_LOAD_PUBLISHED = {
+    "unified_cache_set_planned_load_term":
+        "owner-keyed: the compute and state terms' common store; an owner's terms leave with it",
+    "unified_cache_set_planned_mmq_src1_scratch":
+        "owner-keyed: an owner's inputs leave with it (unified_cache_drop_planned_load_terms)",
+    "unified_cache_set_planned_dequant_f16_scratch":
+        "owner-keyed: an owner's inputs leave with it (unified_cache_drop_planned_load_terms)",
+    "unified_cache_set_planned_compute_term":
+        "owner-keyed: an owner's term leaves with it (unified_cache_drop_planned_load_terms)",
+    "unified_cache_set_planned_state_term":
+        "owner-keyed: an owner's term leaves with it (unified_cache_drop_planned_load_terms)",
+    "unified_cache_set_planned_compute_term_n_ubatch":
+        "sticky by design: a record no live term uses is harmless, and each load records its own before it plans",
+    "unified_cache_set_planned_scratch_hold":
+        "context-keyed: a backend context publishes the hold and its teardown releases its own",
+}
+# A declared setter the restore does not call because it writes members the restore stores through their own setters:
+# its definition calls each of these, and the terms' restore calls each of them too.
+WRITES_THROUGH = {
+    PAIR_SETTER: ("unified_cache_store_planned_onednn_pair_halves(", "unified_cache_set_planned_onednn_scratchpad_bytes("),
+    "unified_cache_publish_planned_onednn_graph_scratch_shape": ("unified_cache_set_planned_onednn_graph_scratch_shape(",),
+}
+
+
+def definition_body(text: str, name: str) -> str:
+    """The body of the function `name` defines in `text` (as code()): a return type, the name, its parameter list,
+    then '{'. A call is never preceded by a bare type name and a space."""
+    m = re.search(rf"\b\w+ {re.escape(name)}\([^;{{}}]*\)\s*\{{", text)
+    return block_at(text, m.end() - 1) if m else ""
+
+
+def classified_setters(uh: str, uc: str) -> tuple:
+    """(declared, members, excluded): every planned-term setter the cache declares or defines, those that write
+    load_published_terms members, and those the exclusion table names."""
+    u = code(uc)
+    declared = set(DECLARED_SETTER_RE.findall(code(uh))) | set(DECLARED_SETTER_RE.findall(u))
+    restore = fn_body(u, TERMS_RESTORE_SIG)
+    members = set(DECLARED_SETTER_RE.findall(restore))
+    for setter, parts in WRITES_THROUGH.items():
+        body = definition_body(u, setter)
+        if all(p in body and p in restore for p in parts):
+            members.add(setter)
+    return declared, members, set(NOT_LOAD_PUBLISHED)
+
+
+def claim_every_planned_setter_is_a_member_or_excluded(uh: str, uc: str) -> bool:
+    declared, members, excluded = classified_setters(uh, uc)
+    return (len(declared) >= 18 and declared <= members | excluded and not members & excluded
+            and excluded <= declared and set(WRITES_THROUGH) <= members)
 
 
 # ---- the claims, and a witness per claim ----
@@ -549,13 +713,24 @@ def test_witness_capture_after_the_first_device():
 
 
 def test_witness_restore_drops_the_slot_zones():
-    m = mutate_in(UC, RECORD_RESTORE_SIG, "unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(", "(void) (")
+    m = mutate_in(UC, TERMS_RESTORE_SIG, "unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(", "(void) (")
     assert not claim_failed_load_restores(GS, m)
 
 
 def test_witness_restore_drops_a_planner_term():
-    m = mutate_in(UC, RECORD_RESTORE_SIG, "unified_cache_set_planned_moe_host_scatter_scratch_bytes(", "(void) (")
+    m = mutate_in(UC, TERMS_RESTORE_SIG, "unified_cache_set_planned_moe_host_scatter_scratch_bytes(", "(void) (")
     assert not claim_failed_load_restores(GS, m)
+
+
+def test_witness_record_restores_nothing_through_the_terms():
+    m = mutate_in(UC, RECORD_RESTORE_SIG, PRIOR_RESTORE, "")
+    assert not claim_failed_load_restores(GS, m)
+
+
+def test_witness_terms_restore_stores_the_pair_and_not_its_halves():
+    # The pair's setter stores the sum too, so the halves' group would write over the sum's.
+    m = mutate_in(UC, TERMS_RESTORE_SIG, HALVES, PAIR_SETTER + "(device, onednn_weights, onednn_activations);")
+    assert not claim_every_group_has_its_arms(UH, m)
 
 
 def test_witness_restore_drops_the_sum():
@@ -628,14 +803,124 @@ def test_witness_restore_puts_back_every_group():
 
 
 def test_witness_restore_puts_back_the_ring_unguarded():
-    m = mutate_in(UC, RECORD_RESTORE_SIG, "if (back & LOAD_PUBLISHED_GROUP_RING) {", "{")
-    assert not claim_restore_keeps_a_later_publish(GS, m)
+    m = mutate_in(UC, TERMS_RESTORE_SIG, "if (groups & LOAD_PUBLISHED_GROUP_RING) {", "{")
+    assert not claim_every_group_has_its_arms(UH, m)
 
 
 def test_witness_restore_stores_the_sum_plainly():
     m = mutate_in(UC, RECORD_RESTORE_SIG, SUM_CAS, "unified_cache_set_planned_onednn_scratchpad_bytes(device, "
                   "prior.onednn_stored); (void) (published,")
     assert not claim_restore_keeps_a_later_publish(GS, m)
+
+
+def test_witness_record_puts_the_sum_back_through_the_terms():
+    m = mutate_in(UC, RECORD_RESTORE_SIG, PRIOR_RESTORE,
+                  "prior.restore(device, back & ~LOAD_PUBLISHED_GROUP_ZONE_PLAN);")
+    assert not claim_restore_keeps_a_later_publish(GS, m)
+
+
+def test_witness_record_stores_the_zone_plan_raw():
+    m = mutate_in(UC, RECORD_RESTORE_SIG, PRIOR_RESTORE,
+                  "prior.restore(device, back & ~LOAD_PUBLISHED_GROUP_ONEDNN_SUM);")
+    assert not claim_restore_keeps_a_later_publish(GS, m)
+
+
+# ---- the terms are one struct: its groups, its members and every setter ----
+
+
+def test_every_group_has_its_arms():
+    assert claim_every_group_has_its_arms(UH, UC), (
+        "a load_published_group lacks an arm: each LOAD_PUBLISHED_GROUP_<name> (bits 0 up, ALL their mask) must have "
+        "an arm in load_published_terms::restore that stores its terms, one in take_groups and a bit in differing, and "
+        "each known store must sit in its own group's arm alone")
+
+
+def test_witness_enum_gains_a_group_with_no_arms():
+    m = code(UH).replace("LOAD_PUBLISHED_GROUP_ALL = (1u << 10) - 1,",
+                         "LOAD_PUBLISHED_GROUP_MMVQ = 1u << 10, LOAD_PUBLISHED_GROUP_ALL = (1u << 11) - 1,", 1)
+    assert m != code(UH)
+    assert not claim_every_group_has_its_arms(m, UC)
+
+
+def test_witness_all_misses_a_group():
+    m = code(UH).replace("LOAD_PUBLISHED_GROUP_ALL = (1u << 10) - 1,", "LOAD_PUBLISHED_GROUP_ALL = (1u << 9) - 1,", 1)
+    assert m != code(UH)
+    assert not claim_every_group_has_its_arms(m, UC)
+
+
+def test_witness_take_groups_drops_an_arm():
+    m = mutate_in(UC, TAKE_GROUPS_SIG, "if (groups & LOAD_PUBLISHED_GROUP_SCATTER) {", "{")
+    assert not claim_every_group_has_its_arms(UH, m)
+
+
+def test_witness_differing_drops_a_group():
+    m = mutate_in(UC, DIFFERING_SIG, ", LOAD_PUBLISHED_GROUP_SCATTER)", ", 0u)")
+    assert not claim_every_group_has_its_arms(UH, m)
+
+
+def test_witness_restore_stores_a_term_under_another_group():
+    m = mutate_in(UC, TERMS_RESTORE_SIG, "if (groups & LOAD_PUBLISHED_GROUP_SCATTER) {",
+                  "if (groups & LOAD_PUBLISHED_GROUP_CONTROL) {")
+    assert not claim_every_group_has_its_arms(UH, m)
+
+
+def test_every_member_is_read_written_and_compared():
+    assert claim_every_member_is_read_written_and_compared(UH, UC), (
+        "a member of load_published_terms (or of the planner's terms it holds) is missing from the snapshot, "
+        "differing, take_groups or the restore")
+
+
+def test_witness_struct_gains_a_member_no_one_reads():
+    m = code(UH).replace("size_t onednn_stored = 0;", "size_t onednn_stored = 0; size_t moe_mmvq = 0;", 1)
+    assert m != code(UH)
+    assert not claim_every_member_is_read_written_and_compared(m, UC)
+
+
+def test_witness_differing_ignores_a_member():
+    m = mutate_in(UC, DIFFERING_SIG, "|| ring_output_in_kv != other.ring_output_in_kv", "")
+    assert not claim_every_member_is_read_written_and_compared(UH, m)
+
+
+def test_witness_take_groups_skips_a_member():
+    m = mutate_in(UC, TAKE_GROUPS_SIG, "ring_n_expert_used = from.ring_n_expert_used;", "")
+    assert not claim_every_member_is_read_written_and_compared(UH, m)
+
+
+def test_witness_restore_skips_a_planner_member():
+    m = mutate_in(UC, TERMS_RESTORE_SIG, "planner.scatter", "0")
+    assert not claim_every_member_is_read_written_and_compared(UH, m)
+
+
+def test_every_planned_setter_is_a_member_or_excluded():
+    declared, members, excluded = classified_setters(UH, UC)
+    assert claim_every_planned_setter_is_a_member_or_excluded(UH, UC), (
+        "a planned-term setter is neither restored by load_published_terms::restore nor named in NOT_LOAD_PUBLISHED: "
+        f"unclassified {sorted(declared - members - excluded)}, both {sorted(members & excluded)}, "
+        f"stale exclusions {sorted(excluded - declared)}")
+
+
+def test_witness_an_mmvq_setter_outside_the_struct():
+    decl = ("void unified_cache_set_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes); "
+            "void unified_cache_raise_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes); "
+            "size_t unified_cache_get_planned_moe_mmvq_scratch_bytes(int device_id);")
+    anchor = "size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);"
+    m = code(UH).replace(anchor, anchor + " " + decl, 1)
+    assert m != code(UH)
+    assert not claim_every_planned_setter_is_a_member_or_excluded(m, UC)
+
+
+def test_witness_exclusion_names_a_setter_that_is_gone():
+    m = code(UH).replace("unified_cache_set_planned_scratch_hold(", "unified_cache_hold_planned_scratch(")
+    u = code(UC).replace("unified_cache_set_planned_scratch_hold(", "unified_cache_hold_planned_scratch(")
+    assert m != code(UH)
+    assert not claim_every_planned_setter_is_a_member_or_excluded(m, u)
+
+
+def test_witness_restore_stops_storing_the_graph_shape():
+    # The publish of the shape writes through the shape's setter; with that setter gone from the restore, neither is a
+    # member.
+    m = mutate_in(UC, TERMS_RESTORE_SIG, "unified_cache_set_planned_onednn_graph_scratch_shape(", "(void) (")
+    assert not claim_every_planned_setter_is_a_member_or_excluded(UH, m)
 
 
 # ---- a failed load puts back the two-card MoE flag its planner set ----

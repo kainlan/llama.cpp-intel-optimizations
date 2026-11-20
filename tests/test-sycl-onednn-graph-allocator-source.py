@@ -1841,11 +1841,13 @@ DRY_RUN_PLANS_SIG = "static std::vector<ggml_sycl::placement_plan> ggml_sycl_pla
 DRY_RUN_RESTORE_SIG = "~ggml_sycl_plan_dry_run_saved_state()"
 DRY_RUN_PLANNER_RESTORE = "s.planner.restore(d);"
 # The two restores that put a snapshot of the published terms back: the planner terms' own (the dry run's saved state
-# and the load stage's discarded-plan fallback restore through it) and a failed load's record, which puts each group
-# back from the snapshot taken before the load wrote it.
+# and the load stage's discarded-plan fallback restore through it) and the load's terms' own, through which a failed
+# load's record puts each group back from the snapshot taken before the load wrote it.
 PLANNER_RESTORE_SIG = "void planner_published_terms::restore(int device) const {"
+TERMS_RESTORE_SIG = "void load_published_terms::restore(int device, uint32_t groups) const noexcept {"
+TERMS_GRAPH_BINDING = "const onednn_graph_scratch_planned_shape & graph = planner.graph;"
 RECORD_RESTORE_SIG = "void load_published_record::restore(int device) const noexcept {"
-RECORD_GRAPH_BINDING = "const onednn_graph_scratch_planned_shape & graph = prior.planner.graph;"
+RECORD_PRIOR_RESTORE = "prior.restore(device, back & ~("
 BUILDER_SHAPE_RE = re.compile(
     rf"const onednn_graph_scratch_planned_shape (\w+) = {GRAPH_SHAPE_PLAN}\( ?kv_info, envelope ?\);"
 )
@@ -1979,14 +1981,17 @@ def _restore_puts_back_the_snapshot(cache: str, sig: str, binding: str = "") -> 
 
 
 def _every_writer_goes_through_the_publish(cache: str, sycl: str) -> bool:
-    """The setter is called only by the publish and by the two restores of a snapshot it read; the dry run restores
-    through the planner terms' restore, and the plan's write (populate_host_zone_sizing) is one publish call over the
-    kv_info and envelope the plan was built from."""
-    if _setter_calls_outside(cache, (GRAPH_SHAPE_PUBLISH_SIG, PLANNER_RESTORE_SIG, RECORD_RESTORE_SIG)) != 0:
+    """The setter is called only by the publish and by the two restores of a snapshot it read; a failed load's record
+    restores through the load's terms' restore of what it held before (`prior`), the dry run through the planner
+    terms' restore, and the plan's write (populate_host_zone_sizing) is one publish call over the kv_info and envelope
+    the plan was built from."""
+    if _setter_calls_outside(cache, (GRAPH_SHAPE_PUBLISH_SIG, PLANNER_RESTORE_SIG, TERMS_RESTORE_SIG)) != 0:
         return False
     if not _restore_puts_back_the_snapshot(cache, PLANNER_RESTORE_SIG):
         return False
-    if not _restore_puts_back_the_snapshot(cache, RECORD_RESTORE_SIG, RECORD_GRAPH_BINDING):
+    if not _restore_puts_back_the_snapshot(cache, TERMS_RESTORE_SIG, TERMS_GRAPH_BINDING):
+        return False
+    if not _has_function(cache, RECORD_RESTORE_SIG) or RECORD_PRIOR_RESTORE not in _body_of(cache, RECORD_RESTORE_SIG):
         return False
     if _setter_calls_outside(sycl, ()) != 0:
         return False
@@ -2189,8 +2194,8 @@ def test_graph_shape_checks_have_bounded_mutation_witnesses() -> None:
     mutant = _mutate_in_function(cache, POPULATE_HOST_ZONE_SIZING_SIG, old, new)
     _assert_only_check_fails(mutant, sycl, "writers", "the plan writing the shape from its own fields")
 
-    mutant = _mutate_in_function(cache, RECORD_RESTORE_SIG, RECORD_GRAPH_BINDING,
-                                 RECORD_GRAPH_BINDING.replace("prior.planner.graph", "written.planner.graph"))
+    mutant = _mutate_in_function(cache, RECORD_RESTORE_SIG, RECORD_PRIOR_RESTORE,
+                                 RECORD_PRIOR_RESTORE.replace("prior.restore(", "written.restore("))
     _assert_only_check_fails(mutant, sycl, "writers", "a failed load's restore putting back the shape it wrote")
 
     mutant = _mutate_in_function(sycl, DRY_RUN_RESTORE_SIG, DRY_RUN_PLANNER_RESTORE, "")
@@ -2280,7 +2285,7 @@ TERMS_SNAPSHOT_SIG = "load_published_terms load_published_terms::snapshot(int de
 TERMS_DIFFERING_SIG = "uint32_t load_published_terms::differing(const load_published_terms & other) const {"
 PLANNER_SNAPSHOT_SIG = "planner_published_terms planner_published_terms::snapshot(int device) {"
 GRAPH_GROUP = "LOAD_PUBLISHED_GROUP_GRAPH"
-RECORD_GRAPH_GUARD = f"if (back & {GRAPH_GROUP})"
+TERMS_GRAPH_GUARD = f"if (groups & {GRAPH_GROUP})"
 
 
 def _every_planner_entry_opens_the_pass_before_the_stage(sycl: str) -> bool:
@@ -2310,10 +2315,17 @@ def _discarded_plan_snapshot_follows_the_entry_ensure(sycl: str) -> bool:
 
 def _load_record_restores_the_graph_shape(cache: str) -> bool:
     """The load's terms hold the planner's (whose snapshot reads the Graph shape), a change of any of its five fields
-    marks the Graph group, and the record's restore puts the shape back under that group."""
-    for sig in (TERMS_SNAPSHOT_SIG, TERMS_DIFFERING_SIG, PLANNER_SNAPSHOT_SIG, RECORD_RESTORE_SIG):
+    marks the Graph group, the terms' restore stores the shape under that group, and the record's restore puts its
+    prior back through it without leaving that group out."""
+    for sig in (TERMS_SNAPSHOT_SIG, TERMS_DIFFERING_SIG, PLANNER_SNAPSHOT_SIG, TERMS_RESTORE_SIG, RECORD_RESTORE_SIG):
         if not _has_function(cache, sig):
             return False
+    record = _body_of(cache, RECORD_RESTORE_SIG)
+    if record.count(RECORD_PRIOR_RESTORE) != 1:
+        return False
+    mask_at = record.index(RECORD_PRIOR_RESTORE) + len(RECORD_PRIOR_RESTORE)
+    if GRAPH_GROUP in record[mask_at : record.find(");", mask_at)]:
+        return False
     if "terms.planner = planner_published_terms::snapshot(device);" not in _body_of(cache, TERMS_SNAPSHOT_SIG):
         return False
     planner = _body_of(cache, PLANNER_SNAPSHOT_SIG)
@@ -2323,11 +2335,11 @@ def _load_record_restores_the_graph_shape(cache: str) -> bool:
     m = re.search(rf"bit\(((?:(?!bit\()[^;])*?), {GRAPH_GROUP}\)", differing)  # the Graph group's own bit() only
     if not m or any(f"a.graph.{field} != b.graph.{field}" not in m.group(1) for field in GRAPH_SHAPE_FIELDS):
         return False
-    restore = _body_of(cache, RECORD_RESTORE_SIG)
-    if restore.count(RECORD_GRAPH_GUARD) != 1:
+    restore = _body_of(cache, TERMS_RESTORE_SIG)
+    if restore.count(TERMS_GRAPH_GUARD) != 1:
         return False
-    guard_at = restore.index(RECORD_GRAPH_GUARD)
-    guarded = extract_function_body(restore[guard_at:], RECORD_GRAPH_GUARD)
+    guard_at = restore.index(TERMS_GRAPH_GUARD)
+    guarded = extract_function_body(restore[guard_at:], TERMS_GRAPH_GUARD)
     return GRAPH_SHAPE_SETTER in guarded
 
 
@@ -2352,7 +2364,8 @@ def test_a_refused_load_puts_the_graph_shape_back() -> None:
     )
     assert results["record"], (
         f"the load's terms must snapshot the Graph shape through the planner's terms, mark {GRAPH_GROUP} when any of "
-        f"its fields changes, and the record's restore must put it back under {RECORD_GRAPH_GUARD}"
+        f"its fields changes, the terms' restore must store it under {TERMS_GRAPH_GUARD}, and the record's restore "
+        "must put its prior back through that restore without leaving the Graph group out"
     )
 
 
@@ -2377,8 +2390,12 @@ def test_graph_shape_restore_checks_have_bounded_mutation_witnesses() -> None:
     mutant = _mutate_in_function(cache, TERMS_DIFFERING_SIG, "a.graph.n_ctx != b.graph.n_ctx", "false")
     _assert_only_restore_check_fails(mutant, sycl, "record", "a context change not marking the Graph group")
 
-    mutant = _mutate_in_function(cache, RECORD_RESTORE_SIG, RECORD_GRAPH_GUARD, "if (false)")
+    mutant = _mutate_in_function(cache, TERMS_RESTORE_SIG, TERMS_GRAPH_GUARD, "if (false)")
     _assert_only_restore_check_fails(mutant, sycl, "record", "a failed load's restore leaving the Graph shape it wrote")
+
+    mutant = _mutate_in_function(cache, RECORD_RESTORE_SIG, RECORD_PRIOR_RESTORE,
+                                 f"{RECORD_PRIOR_RESTORE}{GRAPH_GROUP} | ")
+    _assert_only_restore_check_fails(mutant, sycl, "record", "a failed load's record leaving the Graph group out")
 
 
 # The planning micro-batch rule (the envelope's micro-batch when it names one, the model's otherwise) has one

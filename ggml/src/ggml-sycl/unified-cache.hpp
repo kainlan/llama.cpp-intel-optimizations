@@ -3341,6 +3341,12 @@ struct load_published_terms {
     // Takes the terms of `groups` from `from`. Not named copy: a `.copy(` member call reads as a queue shortcut to the
     // window-path launch census.
     void                        take_groups(const load_published_terms & from, uint32_t groups);
+    // Stores the terms of `groups` as the device's published terms, each group through its own setters: the one list
+    // of what a load publishes. A failed load's record puts groups back through it, and the last release of a device
+    // stores a default-constructed set through it, which is what a device no load has planned on reads. The zone plan
+    // is stored as given, onto the device's existing cache; a caller that puts a plan back over a zone that may have
+    // changed since leaves that group out and uses unified_cache::onednn_zone_plan_put_back.
+    void                        restore(int device, uint32_t groups = LOAD_PUBLISHED_GROUP_ALL) const noexcept;
 };
 
 // One device's terms for one load transaction, kept so that a load that fails puts back what it published and nothing
@@ -5101,6 +5107,9 @@ class unified_cache {
     zone_onednn_plan onednn_zone_plan_load() const;
     // A failed load's restore (load_published_record::restore); see the definition. Takes onednn_zone_plan_mutex_.
     void             onednn_zone_plan_put_back(const zone_onednn_plan & written, const zone_onednn_plan & prior);
+    // Stores `plan` as the zone plan: the zone was rebuilt for it, or the published terms' restore stores it with the
+    // device's other terms (load_published_terms::restore). Takes onednn_zone_plan_mutex_ alone.
+    void             onednn_zone_plan_store(const zone_onednn_plan & plan);
     // Both free-space figures of one zone, read together under its allocator group's mutex: the
     // allocators' figures are only coherent under it (zone_available and zone_largest_free read
     // them bare), with the zone's capacity and used bytes read at the same instant. For a zone with its
@@ -6406,14 +6415,12 @@ class unified_cache {
     // no floor for the bound to keep free, and a Graph scratch the pair leaves no room for takes the DIRECT path under
     // its cap, as one that misses any full ONEDNN zone does.
     //
-    // onednn_zone_plan_mutex_ guards the plan alone. Each of the five accessors (the load and the put-back declared
-    // above, the three below) takes it alone and calls only the pure rules of zone-sizing.hpp while it holds it, so it
-    // is a leaf: nothing is taken under it, and it may be taken under any lock.
+    // onednn_zone_plan_mutex_ guards the plan alone. Each of the five accessors (the load, the put-back and the store
+    // declared above, the two below) takes it alone and calls only the pure rules of zone-sizing.hpp while it holds it,
+    // so it is a leaf: nothing is taken under it, and it may be taken under any lock.
     mutable std::mutex onednn_zone_plan_mutex_;
     zone_onednn_plan   onednn_zone_plan_{};
 
-    // Stores `plan` as the zone plan: the zone was rebuilt for it. Takes onednn_zone_plan_mutex_ alone.
-    void onednn_zone_plan_store(const zone_onednn_plan & plan);
     // Keeps the larger plan (zone_onednn_plan_keep) as the zone plan, in ONE critical section: the zone was found
     // sufficient for `plan` and kept as built. Takes onednn_zone_plan_mutex_ alone.
     void onednn_zone_plan_keep_and_store(const zone_onednn_plan & plan);

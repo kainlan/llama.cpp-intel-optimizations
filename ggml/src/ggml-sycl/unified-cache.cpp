@@ -3845,6 +3845,53 @@ void load_published_terms::take_groups(const load_published_terms & from, uint32
     }
 }
 
+void load_published_terms::restore(int device, uint32_t groups) const noexcept {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_PIPELINE) {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, pp_pipeline);
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_RING) {
+        unified_cache_set_planned_pp_moe_onednn_scratch(device, ring_weight, ring_activation, ring_output, ring_depth);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, ring_activation_in_kv, ring_output_in_kv);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, ring_n_ubatch);
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_RING_ROWS) {
+        unified_cache_set_planned_pp_moe_onednn_row_bytes(device, ring_activation_row, ring_output_row, ring_n_expert,
+                                                          ring_n_expert_used);
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_ONEDNN_PAIR) {
+        // The halves alone: the pair's setter would also store their total over the sum, which is a group of its own.
+        unified_cache_store_planned_onednn_pair_halves(device, onednn_weights, onednn_activations);
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_ONEDNN_SUM) {
+        unified_cache_set_planned_onednn_scratchpad_bytes(device, onednn_stored);
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_GRAPH) {
+        const onednn_graph_scratch_planned_shape & graph = planner.graph;
+        unified_cache_set_planned_onednn_graph_scratch_shape(device, graph.n_head_ctx_max, graph.n_head_swa_max,
+                                                             graph.n_swa, graph.n_ubatch, graph.n_ctx);
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_NONFA) {
+        const nonfa_attn_scratch_planned_shape & nonfa = planner.nonfa;
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_CONTROL) {
+        unified_cache_set_planned_moe_control_requirement(device, planner.control);
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_SCATTER) {
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, planner.scatter);
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_ZONE_PLAN) {
+        // The plan lives on the cache that owns the zone; a device with no cache has no zone and reads the default.
+        unified_cache * const cache = get_existing_unified_cache_for_device(device);
+        if (cache != nullptr) {
+            cache->onednn_zone_plan_store(onednn_zone_plan);
+        }
+    }
+}
+
 void load_published_record::note(const load_published_terms & before, const load_published_terms & after) {
     // A group that changed since this load last looked was written by another publisher: what it wrote is what the
     // restore puts back if this pass wrote over it.
@@ -3863,39 +3910,10 @@ void load_published_record::restore(int device) const noexcept {
     // The groups that hold what this load published and held something else before it: each goes back whole, and
     // every other group keeps what holds it now.
     const uint32_t back = ~load_published_terms::snapshot(device).differing(written) & prior.differing(written);
-    if (back & LOAD_PUBLISHED_GROUP_PIPELINE) {
-        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, prior.pp_pipeline);
-    }
-    if (back & LOAD_PUBLISHED_GROUP_RING) {
-        unified_cache_set_planned_pp_moe_onednn_scratch(device, prior.ring_weight, prior.ring_activation,
-                                                        prior.ring_output, prior.ring_depth);
-        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, prior.ring_activation_in_kv,
-                                                              prior.ring_output_in_kv);
-        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, prior.ring_n_ubatch);
-    }
-    if (back & LOAD_PUBLISHED_GROUP_RING_ROWS) {
-        unified_cache_set_planned_pp_moe_onednn_row_bytes(device, prior.ring_activation_row, prior.ring_output_row,
-                                                          prior.ring_n_expert, prior.ring_n_expert_used);
-    }
-    if (back & LOAD_PUBLISHED_GROUP_ONEDNN_PAIR) {
-        // The halves alone: the pair's setter would also store their total over the sum, which goes back below.
-        unified_cache_store_planned_onednn_pair_halves(device, prior.onednn_weights, prior.onednn_activations);
-    }
-    if (back & LOAD_PUBLISHED_GROUP_GRAPH) {
-        const onednn_graph_scratch_planned_shape & graph = prior.planner.graph;
-        unified_cache_set_planned_onednn_graph_scratch_shape(device, graph.n_head_ctx_max, graph.n_head_swa_max,
-                                                             graph.n_swa, graph.n_ubatch, graph.n_ctx);
-    }
-    if (back & LOAD_PUBLISHED_GROUP_NONFA) {
-        const nonfa_attn_scratch_planned_shape & nonfa = prior.planner.nonfa;
-        unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
-    }
-    if (back & LOAD_PUBLISHED_GROUP_CONTROL) {
-        unified_cache_set_planned_moe_control_requirement(device, prior.planner.control);
-    }
-    if (back & LOAD_PUBLISHED_GROUP_SCATTER) {
-        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, prior.planner.scatter);
-    }
+    // Every group goes back through the terms' own restore but the two another writer moves outside the inventory
+    // lock: the sum, which the pair's reserve raises, and the zone plan, which that reserve's zone ensure also writes.
+    // Each goes back below by a test against what this load left in it.
+    prior.restore(device, back & ~(LOAD_PUBLISHED_GROUP_ONEDNN_SUM | LOAD_PUBLISHED_GROUP_ZONE_PLAN));
     if (back & LOAD_PUBLISHED_GROUP_ZONE_PLAN) {
         // The zone the snapshot describes is read as it is now: a failed load does not shrink a zone it grew, and a
         // pair reserved since under its bound stays where it is. The plan goes back on the cache the snapshot read it
