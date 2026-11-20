@@ -28,6 +28,8 @@ gate holds those by text:
       chunk-0 sub-group adds the partials in chunk order and the fused addend once; the sub-group's slot (its index,
       chunk and row) is derived once, in mmvq_column_split_slot_locate; each split kernel locates its slot through the
       one and ends in the other, with no return, barrier or dst write of its own;
+  P1  padded rows read nothing: in both split kernels the walk sits inside `if (row < nrows) {`, which opens right
+      after the partial sum and closes before the finish helper;
   K2  the row forms still walk what they walked: the SOA row kernel's block loop, and the coalesced row kernel's
       every-tile loop through the shared per-tile body;
   E1  no host wait and no new dependency in either launcher: both forms go through the one ggml_sycl_profile_submit
@@ -153,6 +155,23 @@ def check_launcher(launcher: str, pin: str, step_decl: str, split_kernel_call: s
         pin,
         "the split branch does not launch the split kernel and return before the row form",
     )
+    # One float of row_partials per sub-group stays in bounds only while the accessor's size, the work-group's items
+    # and the kernel's required sub-group size agree.
+    need(
+        ordered(
+            branch,
+            "constexpr int subgroups = ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;",
+            "constexpr size_t split_workgroup_items = (size_t) subgroups * WARP_SIZE;",
+            "static_assert(split_workgroup_items / WARP_SIZE == (size_t) ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS,",
+            "const sycl::range<3> split_global(1, 1, (size_t) workgroups * split_workgroup_items);",
+            "const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);",
+            "sycl::local_accessor<float, 1> row_partials(sycl::range<1>(subgroups), cgh);",
+            "sycl::nd_range<3>(split_global, split_workgroup),",
+            "[=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] { " + split_kernel_call,
+        ),
+        pin,
+        "the split launch does not tie the partials' size, the work-group's items and the sub-group size together",
+    )
     need(row_kernel_call in launcher[row_at:], pin, "the row-form launch no longer calls the row kernel")
     need("chunks_out" in launcher and "*chunks_out = chunks;" in launcher, pin, "the launcher does not report chunks")
     # E1: one submit wrapper per form, on the caller's stream, no wait, no dependency.
@@ -196,6 +215,30 @@ def check_finish_row(finish: str, slot: str) -> None:
         "K1",
         "a sub-group's slot is not chunk sg_id % chunks of row sg_id / chunks of its work-group's rows",
     )
+
+
+def brace_close(text: str, open_at: int) -> int:
+    depth = 0
+    for k in range(open_at, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return k
+    return -1
+
+
+def check_guarded_walk(kernel: str, walk: str, what: str) -> None:
+    guard = "float partial_sum = 0.0f; if (row < nrows) {"
+    at = kernel.find(guard)
+    need(at >= 0, "P1", f"the {what} split kernel does not open the row guard right after its partial sum")
+    open_at = at + len(guard) - 1
+    close_at = brace_close(kernel, open_at)
+    walk_at = kernel.find(walk)
+    finish_at = kernel.find(FINISH_CALL)
+    need(open_at < walk_at < close_at < finish_at, "P1",
+         f"the {what} split kernel's walk is not inside the row guard, before the finish helper")
 
 
 def check_split_kernel(kernel: str) -> None:
@@ -298,6 +341,10 @@ def check(mmvq_raw: str, header_raw: str) -> None:
     check_split_kernel(soa_split)
     check_split_kernel(coalesced_split)
 
+    # P1 ---------------------------------------------------------------------------------------------------------------
+    check_guarded_walk(soa_split, "for (int i = ggml_sycl::mmvq_column_split_first_block(", "SOA")
+    check_guarded_walk(coalesced_split, "for (int tile = ggml_sycl::mmvq_column_split_first_step(chunk);", "coalesced")
+
     # K2 ---------------------------------------------------------------------------------------------------------------
     need(
         "for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; "
@@ -398,6 +445,24 @@ MUTANTS = [
     ("the SOA block walk stops going through the shared step walk", "W1", "header",
      [("    return mmvq_column_split_first_step(chunk) * blocks_per_step + lane_block;",
        "    return chunk * blocks_per_step + lane_block;")]),
+    ("the SOA split walk is hoisted out of the row guard", "P1", "mmvq",
+     [("    float partial_sum = 0.0f;\n    if (row < nrows) {\n        const int block_stride",
+       "    float partial_sum = 0.0f;\n    {\n        const int block_stride"),
+      ("q8_1_ds_ptr, iqs);\n            }\n        }\n    }\n\n    mmvq_column_split_finish_row(",
+       "q8_1_ds_ptr, iqs);\n            }\n        }\n    }\n    if (row < nrows) {\n    }\n\n"
+       "    mmvq_column_split_finish_row(")]),
+    ("the coalesced split walk runs for padded rows too", "P1", "mmvq",
+     [("    float partial_sum = 0.0f;\n    if (row < nrows) {\n        // The shared step walk",
+       "    float partial_sum = 0.0f;\n    if (row < nrows) {\n    }\n    {\n        // The shared step walk")]),
+    ("the SOA split launch drops the required sub-group size", "D1", "mmvq",
+     [("[=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {\n"
+       "                        mul_mat_vec_q_reorder_column_split<",
+       "[=](sycl::nd_item<3> nd_item) {\n                        mul_mat_vec_q_reorder_column_split<")]),
+    ("the coalesced split accessor is sized by chunks, not sub-groups", "D2", "mmvq",
+     [("                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(subgroups), cgh);\n"
+       "                cgh.parallel_for<mmvq_coalesced_column_split_kernel_name",
+       "                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(chunks), cgh);\n"
+       "                cgh.parallel_for<mmvq_coalesced_column_split_kernel_name")]),
     ("the coalesced row form skips its first tile", "K2", "mmvq",
      [("    for (int tile = 0; tile < tiles_per_row; tile++) {\n        mmvq_q8_0_coalesced_accumulate_tile(",
        "    for (int tile = 1; tile < tiles_per_row; tile++) {\n        mmvq_q8_0_coalesced_accumulate_tile(")]),
@@ -407,12 +472,12 @@ MUTANTS = [
        "                                                                fused_add_nb0, fused_add_row_base);\n"
        "                    });\n            });\n        });\n        stream->wait();\n        return;\n")]),
     ("the SOA split branch allocates a device scratch", "A1", "mmvq",
-     [("        const sycl::range<3> split_workgroup(1, 1, (size_t) subgroups * WARP_SIZE);\n\n"
+     [("        const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);\n\n"
        "        (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {\n"
        "            return profiled_queue.submit([&](sycl::handler & cgh) {\n"
        "                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(subgroups), cgh);\n"
        "                cgh.parallel_for<mmvq_reorder_column_split_kernel_name",
-       "        const sycl::range<3> split_workgroup(1, 1, (size_t) subgroups * WARP_SIZE);\n"
+       "        const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);\n"
        "        float * scratch = sycl::malloc_device<float>(16, *stream);\n\n"
        "        (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {\n"
        "            return profiled_queue.submit([&](sycl::handler & cgh) {\n"

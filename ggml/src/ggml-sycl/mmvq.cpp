@@ -3777,10 +3777,16 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
     if (chunks > 1) {
         // Column-split form: the row form's work-group of 16 sub-groups, 16 / chunks rows per work-group, one SLM
         // float per sub-group for the row partials. Same queue, same submit wrapper, no dependency added.
-        constexpr int        subgroups  = ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;
+        // row_partials has one float per sub-group, so it is in bounds only while three things agree: the
+        // accessor's `subgroups` floats, a work-group of `subgroups * WARP_SIZE` items, and the kernel's
+        // reqd_sub_group_size(WARP_SIZE), which makes those items exactly `subgroups` sub-groups.
+        constexpr int    subgroups             = ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;
+        constexpr size_t split_workgroup_items = (size_t) subgroups * WARP_SIZE;
+        static_assert(split_workgroup_items / WARP_SIZE == (size_t) ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS,
+                      "the row partials hold one float per sub-group of the split work-group");
         const int            workgroups = ggml_sycl::mmvq_column_split_workgroups(nrows, chunks);
-        const sycl::range<3> split_global(1, 1, (size_t) workgroups * subgroups * WARP_SIZE);
-        const sycl::range<3> split_workgroup(1, 1, (size_t) subgroups * WARP_SIZE);
+        const sycl::range<3> split_global(1, 1, (size_t) workgroups * split_workgroup_items);
+        const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);
 
         (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
             return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -4509,10 +4515,16 @@ static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
 
     if (chunks > 1) {
         // Column-split form, the same geometry as the SOA one: 16 sub-groups per work-group, 16 / chunks rows each.
-        constexpr int        subgroups  = ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;
+        // row_partials has one float per sub-group, so it is in bounds only while three things agree: the
+        // accessor's `subgroups` floats, a work-group of `subgroups * WARP_SIZE` items, and the kernel's
+        // reqd_sub_group_size(WARP_SIZE), which makes those items exactly `subgroups` sub-groups.
+        constexpr int    subgroups             = ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;
+        constexpr size_t split_workgroup_items = (size_t) subgroups * WARP_SIZE;
+        static_assert(split_workgroup_items / WARP_SIZE == (size_t) ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS,
+                      "the row partials hold one float per sub-group of the split work-group");
         const int            workgroups = ggml_sycl::mmvq_column_split_workgroups(nrows, chunks);
-        const sycl::range<3> split_global(1, 1, (size_t) workgroups * subgroups * WARP_SIZE);
-        const sycl::range<3> split_workgroup(1, 1, (size_t) subgroups * WARP_SIZE);
+        const sycl::range<3> split_global(1, 1, (size_t) workgroups * split_workgroup_items);
+        const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);
 
         (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
             return profiled_queue.submit([&](sycl::handler & cgh) {
