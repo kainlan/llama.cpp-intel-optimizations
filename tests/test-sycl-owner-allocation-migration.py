@@ -1654,20 +1654,6 @@ with gate('moe-metadata'):
     assert "g_expert_groups.swap(new_expert_groups)" in metadata
     print("PASS moe-metadata-atomic-publication-source-gate")
 
-with gate('moe-paired-snapshot'):
-    # Reader side of the same contract. The writer publishing both registries under
-    # one scoped_lock buys nothing if a reader that consults BOTH within one logical
-    # operation acquires them separately: it can pair one model's metadata with the
-    # next model's groups, and expert_group_key carries no model identity to catch it.
-    # Such a reader copies both under one scoped_lock and asks about residency on its
-    # copy, so is_expert_resident must keep a lock-free overload: re-entering the group
-    # lock would read a newer epoch than the metadata it holds, and deadlock outright
-    # under the held scoped_lock (shared_mutex is not recursive).
-    assert "static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tensor_group> & groups" in RUNTIME
-    resident = region(RUNTIME, "static bool is_expert_resident(int block_id",
-                      "// Forward declarations (defined later in file).")
-    assert "return is_expert_resident_in(g_expert_groups, block_id, expert_id, device_id)" in resident
-    print("PASS moe-registry-paired-snapshot-reader-source-gate")
 # HM Task 2 (llama.cpp-81gt): CACHE_BACKING classification must be unforgeable.
 # `alloc_constraints.cache_backing` was a public caller-writable bool, so any
 # caller could mint the ownership class that shutdown exempts from destructive

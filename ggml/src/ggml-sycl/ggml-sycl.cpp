@@ -4223,19 +4223,11 @@ static ggml_sycl::moe_discovery_registry g_moe_discovery_registry(g_moe_live_dis
 // Checks the unified cache for ALL 3 tensors (gate, up, down) across multiple
 // layout modes (SOA, COALESCED, AOS, XMX_TILED).
 // Returns true only if all 3 tensors that have been registered are found.
-// Residency against a caller-held group view. Callers touching only the group
-// registry use the locking wrapper below. A caller that also reads the expert
-// metadata in the same operation must copy both registries under one
-// scoped_lock and pass its copy of the groups here: re-entering the group lock
-// would read a possibly newer epoch than the metadata it already holds, and
-// doing so under a held scoped_lock would deadlock on a non-recursive
-// shared_mutex.
-static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tensor_group> & groups,
-                                  int                                                      block_id,
-                                  int                                                      expert_id,
-                                  int                                                      device_id) {
-    auto it = groups.find(expert_group_key(block_id, expert_id));
-    if (it == groups.end()) {
+// Holds the group registry's shared lock for the whole check.
+static bool is_expert_resident(int block_id, int expert_id, int device_id) {
+    std::shared_lock<std::shared_mutex> lock(g_expert_groups_mutex);
+    auto                                it = g_expert_groups.find(expert_group_key(block_id, expert_id));
+    if (it == g_expert_groups.end()) {
         return false;
     }
 
@@ -4245,7 +4237,7 @@ static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tenso
         return false;
     }
 
-    // Try multiple layouts — prestage may use SOA, COALESCED, XMX_TILED, or AOS
+    // An expert is cached in whichever of these layouts its load chose.
     static const ggml_layout_mode layouts[] = { GGML_LAYOUT_SOA,        GGML_LAYOUT_COALESCED, GGML_LAYOUT_MXFP4_I8,
                                                 GGML_LAYOUT_MXFP4_DPAS, GGML_LAYOUT_XMX_TILED, GGML_LAYOUT_AOS };
 
@@ -4290,11 +4282,6 @@ static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tenso
 
     // At least one role must be registered
     return grp.has_gate || grp.has_up || grp.has_down;
-}
-
-static bool is_expert_resident(int block_id, int expert_id, int device_id) {
-    std::shared_lock<std::shared_mutex> lock(g_expert_groups_mutex);
-    return is_expert_resident_in(g_expert_groups, block_id, expert_id, device_id);
 }
 
 // Forward declarations (defined later in file).

@@ -92,6 +92,8 @@ REMOVED_WORDS = (
     # The LRU+LFU access score, which nothing read after eviction moved to tier then last access.
     "compute_score",
     "DECAY_ALPHA",
+    # The lock-free residency overload, kept for a paired-registry reader that the prestage was and nothing else is.
+    "is_expert_resident_in",
 )
 REMOVED_TAGS = ("[MOE-WARMUP]", "[MOE-GATE-NORM]", "[MOE-RERANK]", "[ADAPTIVE-PRESTAGE]")
 
