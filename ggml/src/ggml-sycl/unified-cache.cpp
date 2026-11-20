@@ -14397,8 +14397,8 @@ static int eviction_tier(const unified_cache_entry & entry) {
     // -1: host-resident (already slow, evict first to reclaim tracking)
     // Derived from alloc_category_priority (lower priority number = higher VRAM
     // priority = harder to evict = HIGHER eviction tier).
-    //   MoE experts: category priority 2 → inverted base 2 → tiers 4-5 (cold/hot)
-    //   Dense weights: category priority 1 → inverted base 3 → tiers 6-7 (cold/hot)
+    //   MoE experts: category priority 3 → inverted 1 → base 2 → tiers 2-3 (cold/hot)
+    //   Dense weights: category priority 2 → inverted 2 → base 4 → tiers 4-5 (cold/hot)
     // Hot entries get +1 within their category to resist eviction.
     if (entry.host_resident) {
         return -1;  // Host-resident entries evict first (they're already slow)
