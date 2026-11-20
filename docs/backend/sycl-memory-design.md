@@ -2918,7 +2918,14 @@ take part of the room: the per-op primitive user scratchpads
 (`allocate_onednn_scratchpad()`, `common.hpp`), which also prefer the ONEDNN
 zone, and the pair's growth step, which holds the superseded pair and the new
 one in the zone at once while the old one drains. A Graph request they crowd
-out goes DIRECT; the check does not count them.
+out goes DIRECT; the check does not count them. The growth step is reached
+only with a stored plan whose halves do not fit the pair bound (not a state
+the arena builds from a consistent plan: it floors the zone at the bare
+plan), with no planned pair stored, against a pair held from an earlier
+stored plan of a zone that was kept, or when two admitted ops exceed the
+plan in different halves of a zone with slack: the
+admission refuses an op whose per-half maximum with the planned pair leaves
+the bound (`zone_onednn_pp_scratch_planned`).
 
 **Design choice: refuse only when the part above the zone does not fit
 outside the arena.** Refusing every context whose Graph scratch exceeds the
@@ -4274,19 +4281,34 @@ recovery path: it measures the driver's working set and sizes the headroom from 
      already takes when the load is told the context, so the pair is planned at
      it before the entry ensure and a re-publish would write the same value.
      A context that later runs a wider micro-batch than the load planned cannot
-     grow the zone. An op whose own pair exceeds the pair bound is refused at
-     acquire and draws the dequant buffers. An op whose own pair fits is
-     reserved (`zone_onednn_scratch_reserve_target`) at the first of three
-     targets that fits the bound:
-     1. the per-component maximum of the planned, held and requested pairs
-        (the zone has slack above the plan);
-     2. else the per-component maximum of the held and requested pairs;
-     3. else the request as asked.
-
-     The first two never shrink a half, so a later op the new pair covers
-     reuses it. The third replaces the held pair with the request, which can
-     shrink the other half, so a later op that asks for more of that half
-     replaces it again.
+     grow the zone. The admission (`zone_onednn_pp_scratch_planned`, which the
+     op arm, `acquire_onednn_pp_scratch` and the graph-entry walk all ask)
+     supplies an op only when its own pair fits the pair bound AND, whenever
+     the planned pair itself fits the bound, its per-half maximum with the
+     planned pair fits too. A planned (60, 40) MB pair at a 100 MB bound admits
+     (6.2, 40) and refuses (0.1, 80), which fits the bound alone. A refused op
+     draws the planned dequant buffers, which the walk sizes for it at graph
+     entry. An admitted op is reserved (`zone_onednn_scratch_reserve_target`)
+     at the per-component maximum of the planned, held and requested pairs,
+     which never shrinks a half, so the held pair is not replaced inside a
+     graph (test-zone-sizing Case 14n), except in the cases below. With a
+     stored plan whose halves do not fit the pair bound the request alone is
+     the rule; that is not a state the arena builds from a consistent plan,
+     since it floors the zone at the bare plan. There, with no planned pair
+     stored, against a pair held from an earlier stored plan of a zone that
+     was kept, or when two admitted ops exceed the plan in different halves
+     of a zone with slack above the plan, the target falls back to the
+     held-and-requested merge and then to the request as asked, which
+     replaces the held pair. The kept-zone case: a context holds (60, 40); a
+     draft model's plan (100, 10) is kept because its bare plan is larger, so
+     the bound becomes 110; its op (100, 10) is admitted, but
+     max(held, planned) is (100, 40) = 140, so it is reserved as asked. From
+     then on the holding context's own (60, 40) ops merge with the kept pair
+     to (100, 40) = 140, exceed the bound of 110 and are refused at
+     admission; on the routes that draw them they draw the f16 dequant
+     buffers, which the graph-entry walk grows in the RUNTIME zone past their
+     plan (pair-eligible weights get no dequant plan), and a graph is refused
+     if RUNTIME cannot hold that growth.
 
    Until 2026-11-20 this half was `onednn_eligible`, the largest eligible weight
    *as stored*: a placeholder with no relation to a micro-batch. It covered
@@ -4297,7 +4319,10 @@ recovery path: it measures the driver's working set and sizes the headroom from 
    did not fit it, and `zone_onednn_scratch_reserve_target` replaced the held
    pair on nearly every op; the event-deferred releases of the superseded
    blocks filled the zone inside one graph (pp2048 373.81 → 241 t/s,
-   `llama.cpp-hv5c`). **Do not substitute `onednn_reorder` for this half either**:
+   `llama.cpp-hv5c`). The admission then still let through any op whose own
+   pair fit the bound, so an op above a planned half replaced the held pair
+   the same way; since 2026-11-20 it is refused unless it merges with the
+   planned pair (`llama.cpp-w7sa`). **Do not substitute `onednn_reorder` for this half either**:
    it would over-provision ~78% on Mistral and push models past the floor.
 
    This replaces the earlier defect (`llama.cpp-2wgg`, fixed): the weights half

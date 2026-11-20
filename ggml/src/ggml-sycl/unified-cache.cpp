@@ -25181,16 +25181,32 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
 // slack nobody else planned for, so a pair inside it cannot push the Graph SDPA scratch onto its DIRECT path (an
 // unplanned device allocation); a pair above it would. The bound never falls below the plan (a clamped zone holds the
 // plan), nor above the capacity. No figure is read live or recomputed here: both are overwritten by later plans the
-// zone was not rebuilt for. Not covered: a growth step still needs the superseded pair and the new one in the zone
-// at once (see the note in reserve_onednn_scratch), so a pair inside the bound can still fall through to the
-// unplanned direct allocation while its predecessor drains.
-bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound) {
+// zone was not rebuilt for. The planned halves let the admission refuse an op whose per-half maximum with the planned
+// pair leaves the bound (zone_onednn_pp_scratch_planned), the one kind of op that made the reserve replace its held
+// pair. Not covered: where a growth step is still reached (a stored plan whose halves do not fit the bound, which the
+// arena does not build from a consistent plan since it floors the zone at the bare plan; no planned pair stored; a
+// pair held from an earlier stored plan of a zone that was kept; or two admitted ops above the plan in different
+// halves of a zone with slack; see zone_onednn_scratch_reserve_target), it needs the superseded pair and the new one
+// in the zone at once (see the note in reserve_onednn_scratch), so a pair inside the bound can still fall through to
+// the unplanned direct allocation while its predecessor drains.
+bool unified_cache_get_onednn_pp_pair_bound(int      device_id,
+                                            size_t * bound,
+                                            size_t * planned_weights,
+                                            size_t * planned_activations) {
     unified_cache * cache = get_existing_unified_cache_for_device(device_id);
     if (!cache || !cache->arena_active()) {
         return false;
     }
+    // One read: the bound and the planned halves describe the same stored plan.
+    const zone_onednn_plan zone_plan = cache->onednn_zone_plan_load();
     if (bound) {
-        *bound = onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), cache->zone_capacity(vram_zone_id::ONEDNN));
+        *bound = onednn_pp_pair_bound_for(zone_plan, cache->zone_capacity(vram_zone_id::ONEDNN));
+    }
+    if (planned_weights) {
+        *planned_weights = zone_plan.weights_bytes;
+    }
+    if (planned_activations) {
+        *planned_activations = zone_plan.activations_bytes;
     }
     return true;
 }
