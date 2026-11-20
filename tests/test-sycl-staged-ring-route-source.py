@@ -61,9 +61,14 @@ What this gate pins:
     end_prompt, before end_prompt's early return, and under the same guard a second line naming each refusal's cause
     and detail when it refused any;
   - the two executors that cannot read a staged slot refuse a staged batch by name: the non-hybrid retained prompt
-    per-expert path, which multiplies each expert at the tensor's route_layout from route.ptr, throws a fallback error
-    directly after the batched executor's try, before its scratch setup claims, allocates or can abort, and before its
-    first route; try_xmx_sorted_moe rejects it at its head, before it uploads anything;
+    per-expert path, which multiplies each expert at its own resolved layout through ggml_sycl_mul_mat (a path that
+    can reach oneDNN, while a slot's reuse is ordered only for a plain kernel on the submit queue), throws a fallback
+    error directly after the batched executor's try, before its scratch setup claims, allocates or can abort, and
+    before its first route; try_xmx_sorted_moe rejects it at its head, before it uploads anything;
+  - that per-expert path reads each expert at the layout its route resolved, one variable taken from the route
+    (route.actual_layout) beside the route's lease: the multiply's forced layout and the slice storage installed from
+    the lease both read it, never the op's route_layout, and the mxfp4 f16 arm, whose only dequant reads SOA, takes
+    only an expert whose bytes are SOA;
   - a staged slot's raw pointer does not outlive the ring that holds it, since a raw pointer must not outlive its
     owning handle (llama.cpp-o9uw, c-8jtz): the upload records the payload slot it gives a staged pointer, keyed by
     the weight extra's cache identity and holding no device pointer, the phase counts every ring release in teardown,
@@ -1531,7 +1536,7 @@ PER_EXPERT_STEPS = (
     "std::vector<ggml_sycl::mem_handle> pp_gpu_leases;",
     "moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));",
     "expert_ptr = route.ptr;",
-    "ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &route_layout);",
+    "ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &expert_layout);",
 )
 XMX_REJECT = "auto reject_xmx = [&](const char * reason) -> bool {"
 XMX_REFUSE = "if (ggml_sycl::moe_batch_names_staged_ring(batch)) { return reject_xmx(\"staged-ring\"); }"
@@ -1543,10 +1548,11 @@ XMX_STEPS = (
 
 
 def claim_staged_batch_refused_by_name(sycl: str) -> bool:
-    """The non-hybrid retained prompt per-expert path multiplies each expert at the tensor's route_layout from
-    route.ptr, which a staged slot (holding its entry's layout) does not match: a batch naming a staged slot throws a
-    fallback error directly after the batched executor's try, before the path's scratch setup claims the oneDNN
-    scratch slot, allocates its staging or aborts on a failed allocation, and before its first route.
+    """The non-hybrid retained prompt per-expert path multiplies each expert at its own resolved layout through
+    ggml_sycl_mul_mat, which can reach oneDNN, while a staged slot's reuse is ordered only for a plain kernel on the
+    submit queue: a batch naming a staged slot throws a fallback error directly after the batched executor's try,
+    before the path's scratch setup claims the oneDNN scratch slot, allocates its staging or aborts on a failed
+    allocation, and before its first route and its multiply.
     try_xmx_sorted_moe reads each expert through a payload with no staged slot: it rejects such a batch at its head,
     before the policy check and before any upload, instead of through the payload's missing entry."""
     n = norm(sycl)
@@ -1588,6 +1594,62 @@ def test_staged_batch_refused_by_name_mutants():
     assert x.count(XMX_REFUSE + " ") == 1 and x.count(after_upload) == 1
     moved = x.replace(XMX_REFUSE + " ", "", 1).replace(after_upload, after_upload + " " + XMX_REFUSE, 1)
     assert not c(n.replace(x, moved, 1))
+
+
+# ---- the per-expert path reads each expert at its resolved layout ----------------------------------------------------
+
+# Its initial value is not pinned: only a local expert reaches a consumer, and it has taken the route's layout by then.
+EXPERT_LAYOUT_DECL = "layout_mode expert_layout"
+EXPERT_LAYOUT_FROM_ROUTE = ("expert_ptr = route.ptr; expert_gpu_lease = std::move(route.lease); "
+                            "expert_layout = route.actual_layout;")
+EXPERT_F16_GATE = "num_src1_rows >= 1 && expert_layout == GGML_LAYOUT_SOA;"
+EXPERT_MULTIPLY = "ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &expert_layout);"
+ROUTE_MULTIPLY = "ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row, &route_layout);"
+EXPERT_INSTALL = ("install_expert_slice_storage(const_cast<void *>(expert_ptr), static_cast<int>(i02), expert_layout, "
+                  "&expert_gpu_lease);")
+
+
+def claim_per_expert_reads_resolved_layout(sycl: str) -> bool:
+    """A prompt's route_layout is the layout its retained batch was requested at, and one expert can resolve to
+    another (a host-recipe or staged operand is AOS, the resolver can fall back to a secondary layout). So the
+    per-expert path, after the staged refusal, takes each local expert's layout from its route beside the route's
+    lease, into one variable that the multiply's forced layout and the slice storage installed from the lease both
+    read: the kernel is chosen for the layout the bytes are in. No per-expert multiply forces route_layout. The mxfp4
+    f16 arm's only dequant reads SOA, so it takes only an expert whose bytes are SOA, never one whose layout merely
+    equals the route's."""
+    n = norm(sycl)
+    mmid = body(n, MMID_SIG)
+    # The multiply is counted, not ordered: it sits in the dispatch_f32_batches lambda, whose place in the text is
+    # where the lambda is defined, not when it runs.
+    return (mmid.count(EXPERT_LAYOUT_FROM_ROUTE) == 1 and mmid.count(EXPERT_MULTIPLY) == 1
+            and mmid.count(EXPERT_INSTALL) == 1 and mmid.count(ROUTE_MULTIPLY) == 0
+            and ordered(mmid, PER_EXPERT_REFUSE, EXPERT_LAYOUT_DECL, EXPERT_LAYOUT_FROM_ROUTE, EXPERT_F16_GATE,
+                        EXPERT_INSTALL))
+
+
+def test_per_expert_reads_resolved_layout():
+    mmid = body(norm(SYCL), MMID_SIG)
+    assert claim_per_expert_reads_resolved_layout(SYCL), first_missing(
+        "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id",
+        mmid,
+        PER_EXPERT_REFUSE, EXPERT_LAYOUT_DECL, EXPERT_LAYOUT_FROM_ROUTE, EXPERT_F16_GATE, EXPERT_INSTALL,
+        signature=MMID_SIG) + f" (per-expert multiply with &expert_layout: {mmid.count(EXPERT_MULTIPLY)}, with " \
+        f"&route_layout: {mmid.count(ROUTE_MULTIPLY)})"
+
+
+def test_per_expert_reads_resolved_layout_mutants():
+    c = claim_per_expert_reads_resolved_layout
+    # The multiply forces the op's route layout again over an expert resolved at another one.
+    assert not c(mutate(SYCL, EXPERT_MULTIPLY, ROUTE_MULTIPLY))
+    # The slice storage is installed at the route layout while the multiply reads the expert's.
+    assert not c(mutate(SYCL, EXPERT_INSTALL, EXPERT_INSTALL.replace(" expert_layout,", " route_layout,")))
+    # The expert's layout is never taken from its route, so it stays the route layout.
+    assert not c(mutate(SYCL, EXPERT_LAYOUT_FROM_ROUTE,
+                        EXPERT_LAYOUT_FROM_ROUTE.replace(" expert_layout = route.actual_layout;", "")))
+    # The f16 arm takes an expert whose layout equals the route's, though its dequant reads only SOA.
+    assert not c(mutate(SYCL, EXPERT_F16_GATE, "num_src1_rows >= 1 && expert_layout == route_layout;"))
+    # The f16 arm takes every expert.
+    assert not c(mutate(SYCL, EXPERT_F16_GATE, "num_src1_rows >= 1;"))
 
 
 # ---- ordering: one barrier, no host waits ----------------------------------------------------------------------------
