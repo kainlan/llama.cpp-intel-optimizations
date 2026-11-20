@@ -4,9 +4,9 @@ A load that names a micro-batch above its planning shape first plans with the ro
 ring needs. When the arena cannot grow for that room, the load falls back to its planning shape: it publishes the ring
 and the dense scratch at that shape again, sizes the zones, and plans without the room. The plan tried with the room is
 discarded, but while it was computed the planner published terms of its own (the MoE host scatter scratch for the
-experts it moved to host, the MoE CONTROL requirement, the oneDNN Graph and non-FA attention scratch shapes). The
-fallback used to size the zones with those terms still published, so it asked a zone that could not grow for more than
-the zone held, and the load aborted.
+experts it moved to host, the MoE CONTROL requirement, the oneDNN Graph and non-FA attention scratch shapes, and the
+MoE batched MMVQ scratch bound, which raises the SCRATCH zone). The fallback used to size the zones with those terms
+still published, so it asked a zone that could not grow for more than the zone held, and the load aborted.
 
 These checks pin the fix:
 
@@ -233,6 +233,7 @@ PLANNER_TERMS_TODAY = {
     "moe_control_requirement",
     "onednn_graph_scratch_shape",
     "nonfa_attn_scratch_shape",
+    "moe_mmvq_scratch_bytes",
 }
 
 
@@ -399,6 +400,21 @@ def test_witness_restore_writes_a_constant():
         RESTORE_SIG,
         "unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);",
         "unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 0);",
+    )
+    assert not claim_helper_restores_every_planner_term(m, UCH, GS)
+
+
+def test_witness_restore_leaves_the_moe_mmvq_bound_published():
+    m = mutate_in(UC, RESTORE_SIG, "unified_cache_set_planned_moe_mmvq_scratch_bytes(device, moe_mmvq);", "")
+    assert not claim_helper_restores_every_planner_term(m, UCH, GS)
+
+
+def test_witness_snapshot_never_reads_the_moe_mmvq_bound():
+    m = mutate_in(
+        UC,
+        SNAPSHOT_SIG,
+        "terms.moe_mmvq = unified_cache_get_planned_moe_mmvq_scratch_bytes(device);",
+        "terms.moe_mmvq = 0;",
     )
     assert not claim_helper_restores_every_planner_term(m, UCH, GS)
 

@@ -292,10 +292,9 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
 // records the same limit (llama.cpp-dkw0). This executor's per-expert call passes only the element count. No plan
 // reaches the case either: the planner materializes an expert COALESCED only for MXFP4 without XMX
 // (layout_policy::get_optimal), and MXFP4's f16 arm admits SOA alone.
-// Q1_0 and NVFP4 have converters but are left out, because they run on a device only through their direct kernel
-// (moe_type_needs_direct_kernel, moe-resolved-batch.hpp): validate_moe_execution_recipe and
-// choose_moe_batch_executor refuse any other device recipe for them, so this executor would never be allowed to run
-// them. The float types need no dequant and keep their own routes.
+// Q1_0 and NVFP4 have converters but are left out: they run on a device through their MMVQ id kernel (the dispatch
+// table above), and listing them here also needs test-moe-pp-batched-dequant to run them against the CPU, as it runs
+// every listed type. The float types need no dequant and keep their own routes.
 // IQ1_S, IQ1_M and IQ4_XS are in although they have no MMVQ id kernel: the f16 arm needs only the dequant,
 // so for IQ4_XS this executor is the only device route for prompts (decode stays refused).
 // test-moe-pp-batched-dequant runs every listed type on a device except IQ1_S, IQ2_XXS and IQ2_XS, which need an

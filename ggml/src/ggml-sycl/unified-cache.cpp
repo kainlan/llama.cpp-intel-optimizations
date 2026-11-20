@@ -25,6 +25,7 @@
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
 #include "moe-host-scatter.hpp"
+#include "moe-mmvq-tables.hpp"
 #include "moe-resolved-batch.hpp"
 #include "moe-stream-plan.hpp"
 #include "onednn-woq.hpp"
@@ -2806,6 +2807,34 @@ size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id) {
     return g_planned_moe_host_scatter_bytes[device_id].load(std::memory_order_acquire);
 }
 
+// The MoE batched MMVQ scratch bound the SCRATCH zone is sized to hold; see the declaration.
+static std::atomic<size_t> g_planned_moe_mmvq_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
+
+void unified_cache_set_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_moe_mmvq_scratch_bytes[device_id].store(bytes, std::memory_order_release);
+}
+
+size_t unified_cache_raise_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    std::atomic<size_t> & term = g_planned_moe_mmvq_scratch_bytes[device_id];
+    size_t                held = term.load(std::memory_order_acquire);
+    while (held < bytes && !term.compare_exchange_weak(held, bytes, std::memory_order_acq_rel)) {
+    }
+    return std::max(held, bytes);
+}
+
+size_t unified_cache_get_planned_moe_mmvq_scratch_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_moe_mmvq_scratch_bytes[device_id].load(std::memory_order_acquire);
+}
+
 void unified_cache_set_planned_moe_control_requirement(int device_id, const moe_control_requirement & requirement) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return;
@@ -3723,10 +3752,11 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
 
 planner_published_terms planner_published_terms::snapshot(int device) {
     planner_published_terms terms;
-    terms.graph   = unified_cache_get_planned_onednn_graph_scratch_shape(device);
-    terms.nonfa   = unified_cache_get_planned_nonfa_attn_scratch_shape(device);
-    terms.control = unified_cache_get_planned_moe_control_requirement(device);
-    terms.scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device);
+    terms.graph    = unified_cache_get_planned_onednn_graph_scratch_shape(device);
+    terms.nonfa    = unified_cache_get_planned_nonfa_attn_scratch_shape(device);
+    terms.control  = unified_cache_get_planned_moe_control_requirement(device);
+    terms.scatter  = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device);
+    terms.moe_mmvq = unified_cache_get_planned_moe_mmvq_scratch_bytes(device);
     return terms;
 }
 
@@ -3736,6 +3766,7 @@ void planner_published_terms::restore(int device) const {
     unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
     unified_cache_set_planned_moe_control_requirement(device, control);
     unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);
+    unified_cache_set_planned_moe_mmvq_scratch_bytes(device, moe_mmvq);
 }
 
 // The oneDNN scratchpad pair's two halves, without the sum the pair's setter stores after them: a failed load's restore
@@ -3799,7 +3830,8 @@ uint32_t load_published_terms::differing(const load_published_terms & other) con
                LOAD_PUBLISHED_GROUP_NONFA) |
            bit(a.control.bytes != b.control.bytes || a.control.valid != b.control.valid, LOAD_PUBLISHED_GROUP_CONTROL) |
            bit(a.scatter != b.scatter, LOAD_PUBLISHED_GROUP_SCATTER) |
-           bit(!zone_onednn_plan_same(onednn_zone_plan, other.onednn_zone_plan), LOAD_PUBLISHED_GROUP_ZONE_PLAN);
+           bit(!zone_onednn_plan_same(onednn_zone_plan, other.onednn_zone_plan), LOAD_PUBLISHED_GROUP_ZONE_PLAN) |
+           bit(a.moe_mmvq != b.moe_mmvq, LOAD_PUBLISHED_GROUP_MOE_MMVQ);
 }
 
 void load_published_terms::take_groups(const load_published_terms & from, uint32_t groups) {
@@ -3842,6 +3874,9 @@ void load_published_terms::take_groups(const load_published_terms & from, uint32
     }
     if (groups & LOAD_PUBLISHED_GROUP_ZONE_PLAN) {
         onednn_zone_plan = from.onednn_zone_plan;
+    }
+    if (groups & LOAD_PUBLISHED_GROUP_MOE_MMVQ) {
+        planner.moe_mmvq = from.planner.moe_mmvq;
     }
 }
 
@@ -3904,6 +3939,9 @@ void load_published_record::restore(int device) const noexcept {
         if (cache != nullptr) {
             cache->onednn_zone_plan_put_back(written.onednn_zone_plan, prior.onednn_zone_plan);
         }
+    }
+    if (back & LOAD_PUBLISHED_GROUP_MOE_MMVQ) {
+        unified_cache_set_planned_moe_mmvq_scratch_bytes(device, prior.planner.moe_mmvq);
     }
     // The sum goes back from what this load published to what it held before, in one compare-exchange: the pair's
     // reserve raises it outside the inventory lock, and a raise since this load published it is kept.
@@ -7637,6 +7675,44 @@ static const char * arena_teardown_cause_name(zone_arena_teardown_refusal cause)
     return "no cause recorded";
 }
 
+// Whether a SCRATCH WARN latched on `latch` is due for `bytes` (zone_scratch_warn_due), latching it if so. A
+// compare-exchange, so two ensures racing on one figure warn once between them.
+static bool scratch_zone_warn_latch(std::atomic<size_t> & latch, size_t bytes) {
+    size_t latched = latch.load(std::memory_order_relaxed);
+    do {
+        if (!zone_scratch_warn_due(latched, bytes)) {
+            return false;
+        }
+    } while (!latch.compare_exchange_weak(latched, bytes, std::memory_order_relaxed));
+    return true;
+}
+
+void unified_cache::scratch_zone_kept_warn(int dev_id, const zone_scratch_plan & plan, size_t kept_bytes) {
+    if (!scratch_zone_warn_latch(scratch_zone_kept_warn_bytes_, plan.wanted)) {
+        return;
+    }
+    GGML_LOG_WARN(
+        "[VRAM-ARENA] device %d keeps its SCRATCH zone of %.1f MB: the MoE batched MMVQ scratch bound asks for a "
+        "%.1f MB zone (the zone must hold %.1f MB without it), and live allocations block the rebuild. %s. The zone's "
+        "use line at teardown counts each such request as a miss\n",
+        dev_id, kept_bytes / (1024.0 * 1024.0), plan.wanted / (1024.0 * 1024.0), plan.required / (1024.0 * 1024.0),
+        k_zone_scratch_miss_path_text);
+}
+
+void unified_cache::scratch_zone_clamp_warn(int                       dev_id,
+                                            const zone_scratch_plan & plan,
+                                            size_t                    bound_bytes,
+                                            size_t                    budget_cap_bytes,
+                                            size_t                    room_bytes,
+                                            bool                      reserve_accepts) {
+    if (!scratch_zone_warn_latch(scratch_zone_clamp_warn_bytes_, bound_bytes)) {
+        return;
+    }
+    const std::string line =
+        zone_scratch_clamp_text(dev_id, plan, bound_bytes, budget_cap_bytes, room_bytes, reserve_accepts);
+    GGML_LOG_WARN("%s\n", line.c_str());
+}
+
 bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *              refusal,
                                                const zone_arena_ensure_options & options) {
     if (!vram_arena_enabled()) {
@@ -7653,9 +7729,15 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         safe_max_alloc = max_alloc;
     }
 
-    // The zone is sized by the one function the model-load reservation and the
-    // chunk cap's probe set also call, so the three cannot disagree.
-    size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);
+    // The zone starts from the default the model-load reservation and the chunk cap's minimum probe also read
+    // (ggml_sycl_compute_arena_bytes), so the three agree on that default. This ensure alone raises the zone above it,
+    // by the non-FA attention estimate and the MoE batched MMVQ bound below: with GGML_SYCL_COMPUTE_ARENA_MB=0 the
+    // reservation and the probe count no SCRATCH, while this zone still holds the non-FA floor and a MoE model's bound.
+    size_t scratch_zone  = ggml_sycl_compute_arena_bytes(dev_id);
+    size_t scratch_nonfa = 0;
+    // A quarter of the available budget: the most of it a SCRATCH raise for a consumer with a fallback may claim, so
+    // that it cannot starve the WEIGHT zone. The non-FA raise and the MoE bound are both held to this one figure.
+    const size_t scratch_budget_cap = available_budget() / 4;
     // llama.cpp-oyfl: raise the SCRATCH zone for the non-FA batched mul_mat
     // floor the same way onednn_zone is raised below for its own planned
     // estimate. Best-effort and, for the standard model-load flow, NOT
@@ -7701,8 +7783,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         if (nonfa_override_active || nonfa_shape_known || scratch_zone < kNonfaAttnScratchFloorBytes) {
             size_t planned_nonfa_attn_scratch = unified_cache_nonfa_attn_scratch_demand_bytes(
                 nonfa_shape.n_head, nonfa_shape.n_ubatch, nonfa_shape.n_ctx);
-            const size_t nonfa_budget_cap = available_budget() / 4;
-            if (planned_nonfa_attn_scratch > nonfa_budget_cap) {
+            if (planned_nonfa_attn_scratch > scratch_budget_cap) {
                 // Per-instance once-latch, mirroring onednn_zone_clamp_warned_
                 // -- a function-local static here
                 // would share one latch across every device's unified_cache
@@ -7714,9 +7795,9 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                         "budget -- clamping to %.1f MB (the runtime-context-update refusal in ggml-sycl.cpp "
                         "still checks the unclamped demand against whatever this zone ends up) (only logged "
                         "once)\n",
-                        planned_nonfa_attn_scratch / (1024.0 * 1024.0), nonfa_budget_cap / (1024.0 * 1024.0));
+                        planned_nonfa_attn_scratch / (1024.0 * 1024.0), scratch_budget_cap / (1024.0 * 1024.0));
                 }
-                planned_nonfa_attn_scratch = nonfa_budget_cap;
+                planned_nonfa_attn_scratch = scratch_budget_cap;
             }
             if (planned_nonfa_attn_scratch > scratch_zone) {
                 // "(planned)": this is ensure_planned_arena_zones()'s own
@@ -7753,11 +7834,10 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                         planned_nonfa_attn_scratch / (1024.0 * 1024.0),
                         kNonfaAttnScratchFloorBytes / (1024.0 * 1024.0));
                 }
-                scratch_zone = planned_nonfa_attn_scratch;
+                scratch_nonfa = planned_nonfa_attn_scratch;
             }
         }
     }
-
     size_t       onednn_zone         = 256 * 1024 * 1024;
     // This sizes the REAL physical ONEDNN zone, which has to hold both the
     // primitive-API pair and the Graph-scratch allocator's floor. The pair's
@@ -7861,6 +7941,43 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             unified_cache_get_planned_state_term_bytes(dev_id) / (1024.0 * 1024.0));
     }
 
+    // The MoE batched MMVQ scratch bound raises the zone's plan on top of what it must hold (zone_scratch_zone_plan
+    // says why the bound is every expert op's buffers at once, and what a miss costs each expert type). Unlike the
+    // non-FA scratch, a request of those ops the zone cannot place has a miss path, so the bound never makes the load
+    // refuse: it is held to the quarter of the budget the non-FA raise is held to, and to the room the arena's reserve
+    // accepts beside the ONEDNN and RUNTIME zones sized above (zone_arena_scratch_room, from the arguments the reserve
+    // below is called with). The plan, and the INFO and WARN lines that state it, are what this call asks for: an
+    // arena kept as it was built below may hold more. A rebuild that something live blocks keeps a zone short of the
+    // bound alone (below) rather than refuse. A room of 0 is also the room of a zone the reserve refuses outright,
+    // which the clamp WARN must not call accepted, so whether the reserve accepts the zone it must hold is read beside
+    // the room.
+    const size_t scratch_required   = zone_scratch_required_bytes(scratch_zone, scratch_nonfa);
+    size_t       scratch_other_tail = 0;
+    size_t       scratch_room       = 0;
+    bool         scratch_accepted   = false;
+    if (zone_runtime_reserved_bytes(0, runtime_zone, &scratch_other_tail) &&
+        scratch_other_tail <= SIZE_MAX - zone_arena_zone_bytes(onednn_zone)) {
+        scratch_other_tail += zone_arena_zone_bytes(onednn_zone);
+        const zone_arena_reserve_shape scratch_shape =
+            zone_arena_reserve_shape_of(budget_, device_total_vram_, max_alloc, safe_max_alloc);
+        scratch_room     = zone_arena_scratch_room(scratch_shape, scratch_other_tail, scratch_required);
+        scratch_accepted = zone_arena_scratch_accepts(scratch_shape, scratch_other_tail, scratch_required);
+    }
+    const size_t            moe_mmvq_bound = unified_cache_get_planned_moe_mmvq_scratch_bytes(dev_id);
+    const zone_scratch_plan scratch_plan =
+        zone_scratch_zone_plan(scratch_zone, scratch_nonfa, moe_mmvq_bound, scratch_budget_cap, scratch_room);
+    if (scratch_plan.wanted > scratch_plan.required) {
+        GGML_LOG_INFO(
+            "[UNIFIED-CACHE] SCRATCH zone planned at %.1f MB for the MoE batched MMVQ scratch bound (the zone "
+            "must hold %.1f MB without it)\n",
+            scratch_plan.wanted / (1024.0 * 1024.0), scratch_plan.required / (1024.0 * 1024.0));
+    }
+    if (scratch_plan.clamp != zone_scratch_clamp::NONE) {
+        scratch_zone_clamp_warn(dev_id, scratch_plan, moe_mmvq_bound, scratch_budget_cap, scratch_room,
+                                scratch_accepted);
+    }
+    scratch_zone = scratch_plan.wanted;
+
     auto bind_compute_arena = [&]() {
         const auto & cz_info = get_zone(vram_zone_id::SCRATCH);
         compute_arena_owner_ = {};
@@ -7874,6 +7991,20 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         if (layout_pool_) {
             layout_pool_->set_arena(this);
         }
+    };
+
+    // An arena kept as it was built: its compute zone is bound again when nothing holds it bound. The DIRECT
+    // Graph-scratch cap (onednn_graph_scratch_direct_cap_bytes()) is a fraction of the budget this arena was planned
+    // with, not of the live budget, which shrinks as the arena's own zones consume it; the zones are kept as they are,
+    // so the snapshot does not rise (onednn_graph_direct_cap_snapshot_keep). Each caller then stores the ONEDNN plan
+    // its keep describes.
+    const auto keep_arena_as_built = [&]() {
+        if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
+            bind_compute_arena();
+        }
+#if GGML_SYCL_DNNL
+        onednn_graph_direct_cap_snapshot_keep();
+#endif
     };
 
     // A refused teardown names its cause in the refusal and on its own ERROR line, with what it left: a partly freed
@@ -7913,15 +8044,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                                       zone_capacity(vram_zone_id::ONEDNN) >= onednn_zone &&
                                       zone_capacity(vram_zone_id::RUNTIME) >= runtime_zone;
         if (zones_sufficient) {
-            if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
-                bind_compute_arena();
-            }
-#if GGML_SYCL_DNNL
-            // The DIRECT Graph-scratch cap (onednn_graph_scratch_direct_cap_bytes()) is a fraction of the budget this
-            // arena was planned with, not of the live budget, which shrinks as the arena's own zones consume it. The
-            // zones are kept as they are here, so the snapshot does not rise (onednn_graph_direct_cap_snapshot_keep).
-            onednn_graph_direct_cap_snapshot_keep();
-#endif
+            keep_arena_as_built();
             // The zone is kept as it was built, so it stays described by the larger plan it was built from (its whole
             // pair, with the Graph floor's own maximum): a later, smaller plan (a draft model beside the target) must
             // not shrink it.
@@ -7953,6 +8076,34 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         holders.live_zone_bytes = live_zone_bytes;
         holders.chunk_leases    = chunk_leases;
         arena_count_scratch_holders(holders);
+        // A rebuild that something live blocks keeps a SCRATCH zone that holds what it must and is short of the MoE
+        // batched MMVQ bound alone (zone_scratch_kept_bytes), so the zones are asked for no more SCRATCH than they
+        // hold. When the other zones hold their plan the arena is kept as it is; otherwise the keep of a short ONEDNN
+        // zone below decides. A ring that alone holds the arena keeps nothing yet (see
+        // zone_arena_ensure_options::ring_release_first): the call refuses with keep_deferred set, the caller releases
+        // the ring, and the rebuild that follows sizes the zone whole.
+        const size_t scratch_kept = zone_scratch_kept_bytes(scratch_plan, arena_zones.scratch);
+        if (scratch_kept < scratch_zone && !zone_arena_rebuild_allowed(holders)) {
+            const bool others_hold = arena_zones.onednn >= onednn_zone && arena_zones.runtime >= runtime_zone;
+            if (others_hold && options.ring_release_first && zone_arena_only_ring_holds(true, holders)) {
+                if (refusal != nullptr) {
+                    refusal->reason        = zone_arena_refusal_reason::REBUILD_HELD;
+                    refusal->device        = dev_id;
+                    refusal->need          = { scratch_zone, onednn_zone, runtime_zone };
+                    refusal->have          = arena_zones;
+                    refusal->holders       = holders;
+                    refusal->keep_deferred = true;
+                }
+                return false;
+            }
+            scratch_zone = scratch_kept;
+            if (others_hold) {
+                keep_arena_as_built();
+                onednn_zone_plan_keep_and_store(live_plan);
+                scratch_zone_kept_warn(dev_id, scratch_plan, scratch_kept);
+                return true;
+            }
+        }
         if (!zone_arena_rebuild_allowed(holders)) {
             // Keeping the zones as they are answers a rebuild something live blocks when the oneDNN Graph floor is all
             // they lack: the floor is a reservation, served on the DIRECT path under its cap beyond what the zone
@@ -7965,12 +8116,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             const bool             reservation_only =
                 onednn_zone_plan_keep_short_and_store(live_plan, arena_zones, need, held_pair, !defer_keep, &kept);
             if (reservation_only && !defer_keep) {
-                if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
-                    bind_compute_arena();
-                }
-#if GGML_SYCL_DNNL
-                onednn_graph_direct_cap_snapshot_keep();
-#endif
+                keep_arena_as_built();
                 // When the WARN is due: see zone_kept_onednn_warn_due. The room is the kept floor: the pair bound over
                 // the stored snapshot leaves exactly that.
                 const uint64_t latched_txn = onednn_zone_kept_warn_txn_.exchange(options.load_txn);
@@ -7982,6 +8128,9 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                         "whose Graph scratch does not fit is refused by name\n",
                         dev_id, arena_zones.onednn / (1024.0 * 1024.0), live_plan.graph_floor_bytes / (1024.0 * 1024.0),
                         onednn_zone / (1024.0 * 1024.0), kept.graph_floor_bytes / (1024.0 * 1024.0));
+                }
+                if (scratch_zone < scratch_plan.wanted) {
+                    scratch_zone_kept_warn(dev_id, scratch_plan, scratch_zone);
                 }
                 return true;
             }
@@ -8124,7 +8273,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
     bind_compute_arena();
 #if GGML_SYCL_DNNL
     // The zones were rebuilt for this plan, so the DIRECT cap's snapshot is the budget it was planned with, whether
-    // that is above or below the one held (see the "zones_sufficient" branch above for why it is a snapshot).
+    // that is above or below the one held (see keep_arena_as_built above for why it is a snapshot).
     onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
     onednn_zone_plan_store(live_plan);
@@ -8205,6 +8354,23 @@ bool unified_cache::shutdown_resources() {
                     ggml_sycl::zone_sizing_observation_count("onednn"),
                     ggml_sycl::zone_sizing_underestimate_count("onednn"));
     (void) ggml_sycl::zone_sizing_log_underestimate_summary();
+
+    // The SCRATCH zone's use, in the same "silent unless used" form as the oneDNN Graph high-water line below: how much
+    // of the zone was in use at once, in how many allocations, and how many requests it could not place and sent to raw
+    // device memory. WARN because INFO is dropped at default verbosity. Ahead of the early returns below for the same
+    // reason as that line, so a process-exit teardown still reports.
+    {
+        zone_scratch_use scratch_use;
+        {
+            std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(vram_zone_id::SCRATCH));
+            scratch_use = scratch_zone_use_;
+        }
+        if (scratch_use.requests != 0 || scratch_use.misses != 0) {
+            const std::string line = zone_scratch_use_text(scratch_use, ggml_sycl_get_device_id_from_queue(queue_),
+                                                           arena_zones_[static_cast<int>(vram_zone_id::SCRATCH)].size);
+            GGML_LOG_WARN("%s\n", line.c_str());
+        }
+    }
 
 #if GGML_SYCL_DNNL
     // llama.cpp-gwno: same "silent unless interesting" convention as the zone
@@ -14271,9 +14437,9 @@ void unified_cache::remove(const ggml_sycl_cache_id & key_id,
 
 // NOTE: mark_reordered/is_reordered removed - reorder state tracked in tensor->extra->optimized_feature
 
-void unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {
+bool unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {
     if (!key_id.valid) {
-        return;
+        return false;
     }
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     const unified_cache_key direct_key = make_direct_stage_key(cache_entry_type::DENSE_WEIGHT, key_id, layout);
@@ -14281,7 +14447,7 @@ void unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layo
     if (entry_it == entries_.end()) {
         auto id_it = id_to_key_.find(key_id);
         if (id_it == id_to_key_.end()) {
-            return;
+            return false;
         }
         entry_it = entries_.find(id_it->second);
     }
@@ -14295,11 +14461,14 @@ void unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layo
                 (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
                 (int) entry_it->second.layout, (int) layout);
         }
+        const bool was_pinned   = entry_it->second.pinned;
         entry_it->second.pinned = true;
-        GGML_SYCL_DEBUG("[UNIFIED-CACHE] pin model=%llu name_hash=0x%llx layout=%d\n",
+        GGML_SYCL_DEBUG("[UNIFIED-CACHE] pin model=%llu name_hash=0x%llx layout=%d was_pinned=%d\n",
                         (unsigned long long) key_id.model_id, (unsigned long long) key_id.name_hash,
-                        (int) entry_it->second.layout);
+                        (int) entry_it->second.layout, was_pinned ? 1 : 0);
+        return !was_pinned;
     }
+    return false;
 }
 
 void unified_cache::unpin(const ggml_sycl_cache_id &   key_id,
@@ -23975,8 +24144,13 @@ prestage_result prestage_routed_experts(void *          queue_ptr,
         for (ggml_layout_mode layout : pin_layouts) {
             const ggml_sycl_cache_id layout_key = detail::layout_specific_moe_expert_cache_key(key, layout);
             if (cache->get(layout_key, layout)) {
-                cache->pin(layout_key, layout);
-                result.pins.push_back({ layout_key, layout });
+                // The receipt is what the op's exit unpins, and a pin is a flag, so it lists only a pin this call
+                // set: an entry pinned before (bulk expert staging creates its entries pinned, the popularity pass
+                // pins experts on the card) keeps its pin after the release. The op's own leases, not the pin, keep
+                // the memory of an entry it uses until its work completes.
+                if (cache->pin(layout_key, layout)) {
+                    result.pins.push_back({ layout_key, layout });
+                }
                 device_resolved = true;
                 break;
             }
@@ -30182,12 +30356,22 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     arena_queue_ = &queue;
 
     // Align zone sizes to the arena's grain. The RUNTIME zone is rounded by the function every RUNTIME plan counts on,
-    // with no floor: the callers apply it.
-    scratch_bytes = (scratch_bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
-    onednn_bytes  = (onednn_bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+    // with no floor: the callers apply it. The sizes, the tail's sum and the checks on the tail below are
+    // zone-sizing.hpp's (its "arena reserve's checks" section), so the SCRATCH zone's room is planned from the tests
+    // made here. The tail is summed once, by zone_arena_tail_bytes, and a sum that wraps is refused before either
+    // layout reads it; zone_arena_chunk_holds_tail then refuses a tail whose sum with the 16 MiB shared-zone minimum
+    // wraps. A wrapped sum at either point would pass the chunk checks and carve a corrupt layout.
+    scratch_bytes = zone_arena_zone_bytes(scratch_bytes);
+    onednn_bytes  = zone_arena_zone_bytes(onednn_bytes);
     if (!zone_runtime_reserved_bytes(0, runtime_bytes, &runtime_bytes)) {
         GGML_LOG_ERROR("[VRAM-ARENA] RUNTIME zone of %zu bytes cannot be rounded to the arena's grain\n",
                        runtime_bytes);
+        return false;
+    }
+    size_t tail_bytes = 0;
+    if (!zone_arena_tail_bytes({ onednn_bytes, runtime_bytes, scratch_bytes }, &tail_bytes)) {
+        GGML_LOG_ERROR("[VRAM-ARENA] Tail zones ONEDNN %zu + RUNTIME %zu + SCRATCH %zu bytes sum past SIZE_MAX\n",
+                       onednn_bytes, runtime_bytes, scratch_bytes);
         return false;
     }
 
@@ -30206,10 +30390,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // try_single_chunk) and N-chunk piece sizing -- a single chunk allocated
     // near the raw limit leaves the driver without command-buffer/kernel
     // working memory (llama.cpp-seno).
-    size_t per_chunk_cap = max_alloc_size;
-    if (safe_max_alloc_size > 0) {
-        per_chunk_cap = per_chunk_cap > 0 ? std::min(per_chunk_cap, safe_max_alloc_size) : safe_max_alloc_size;
-    }
+    const size_t per_chunk_cap = zone_arena_per_chunk_cap(max_alloc_size, safe_max_alloc_size);
 
     // llama.cpp-o3h1: budget_bytes arrives HERE already fully headroom-adjusted
     // by the single budget authority (compute_vram_budget_authority(),
@@ -30242,8 +30423,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // end of the arena.  If alloc_size is not rounded down first,
     // RUNTIME/ONEDNN/SCRATCH suballocations inherit a misaligned base pointer
     // even though each zone size is aligned.
-    constexpr size_t k_arena_size_alignment = 2ull * 1024ull * 1024ull;
-    alloc_size                              = (alloc_size / k_arena_size_alignment) * k_arena_size_alignment;
+    alloc_size = zone_arena_round_alloc_bytes(alloc_size);
 
     // Minimum shared (KV+WEIGHT) zone that is worth carving out.  Below this
     // the arena is useless for weight/KV storage and only aliases the tail
@@ -30251,7 +30431,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // caller falls back to per-entry allocation via the existing path at
     // unified_cache::unified_cache() (log line "[VRAM-ARENA] Failed on
     // device %d, falling back to per-entry allocation").
-    constexpr size_t k_min_shared_bytes = 16ull * 1024ull * 1024ull;  // 16 MB
+    constexpr size_t k_min_shared_bytes = k_zone_arena_min_shared_bytes;  // 16 MB
 
     // Use a single chunk only when it is within the runtime's SAFE per-chunk
     // cap (per_chunk_cap = min(max_alloc_size, safe_max_alloc_size) when a
@@ -30265,7 +30445,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // not at reserve (llama.cpp-dp5i c-ni04, falsified and confirmed in
     // c-gkai; fix: llama.cpp-seno). That window now correctly goes N-chunk
     // instead.
-    const bool try_single_chunk = max_alloc_size == 0 || alloc_size <= per_chunk_cap;
+    const bool try_single_chunk = zone_arena_single_chunk_tried(alloc_size, max_alloc_size, per_chunk_cap);
     if (!try_single_chunk) {
         GGML_LOG_INFO(
             "[VRAM-ARENA] Arena %.1f MB exceeds safe per-allocation cap %.1f MB "
@@ -30273,8 +30453,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             alloc_size / (1024.0 * 1024.0), per_chunk_cap / (1024.0 * 1024.0), max_alloc_size / (1024.0 * 1024.0));
     }
     if (try_single_chunk) {
-        const size_t tail_bytes = onednn_bytes + runtime_bytes + scratch_bytes;
-        if (alloc_size < tail_bytes + k_min_shared_bytes) {
+        if (!zone_arena_chunk_holds_tail(alloc_size, tail_bytes)) {
             GGML_LOG_WARN(
                 "[VRAM-ARENA] Insufficient budget for single-chunk arena: "
                 "%.1f MB < tail %.1f MB + min shared %.1f MB; refusing reservation\n",
@@ -30310,8 +30489,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             // Invariant: alloc_size >= tail_bytes + k_min_shared_bytes
             // (verified above) so shared_bytes > 0 here — there is no
             // silent zero-sized KV+WEIGHT zone.
-            const size_t tail_bytes_final = onednn_bytes + runtime_bytes + scratch_bytes;
-            const size_t shared_bytes     = alloc_size - tail_bytes_final;
+            const size_t shared_bytes = alloc_size - tail_bytes;
 
             auto & kz = arena_zones_[static_cast<int>(vram_zone_id::KV)];
             kz.start  = 0;
@@ -30386,14 +30564,12 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // Rationale for "tail-last": logical offset 0 maps to chunks[0] (the
     // first weight chunk), preserving the single-chunk invariant that the
     // WEIGHT zone starts at offset 0 from the layout pool's perspective.
-    const size_t tail_bytes = onednn_bytes + runtime_bytes + scratch_bytes;
 
     // Pick the last (tail) chunk size: at most per_chunk_cap, at least
     // tail_bytes + k_min_shared_bytes (so KV has a sane carve-out).  If the
     // total budget is smaller than that, refuse — single-chunk path would
     // already have caught this case via its own min-shared check.
-    const size_t tail_chunk_min = tail_bytes + k_min_shared_bytes;
-    if (per_chunk_cap < tail_chunk_min) {
+    if (!zone_arena_chunk_holds_tail(per_chunk_cap, tail_bytes)) {
         GGML_LOG_WARN(
             "[VRAM-ARENA] Per-chunk cap %.1f MB too small to hold tail zones (%.1f MB) + min KV (%.1f MB); "
             "refusing reservation\n",
@@ -30405,14 +30581,9 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // KV reserve.  Weight storage is usually the dominant model-load consumer;
     // giving the tail chunk the full per-allocation cap can strand most VRAM in
     // KV space and leave the WEIGHT zone too small even when the model fits.
-    constexpr size_t k_min_tail_kv_reserve = 128ull * 1024ull * 1024ull;
-    constexpr size_t k_max_tail_kv_reserve = 512ull * 1024ull * 1024ull;
-    const size_t     proportional_kv       = std::max<size_t>(alloc_size / 128, k_min_shared_bytes);
-    const size_t tail_kv_reserve = std::min(k_max_tail_kv_reserve, std::max(k_min_tail_kv_reserve, proportional_kv));
-    size_t       last_chunk_size = tail_bytes + tail_kv_reserve;
-    last_chunk_size              = std::min(last_chunk_size, per_chunk_cap);
-    last_chunk_size              = std::min(last_chunk_size, alloc_size);
-    if (last_chunk_size < tail_chunk_min) {
+    const size_t tail_kv_reserve = zone_arena_tail_kv_reserve(alloc_size);
+    const size_t last_chunk_size = zone_arena_tail_chunk_bytes(alloc_size, per_chunk_cap, tail_bytes, tail_kv_reserve);
+    if (!zone_arena_chunk_holds_tail(last_chunk_size, tail_bytes)) {
         GGML_LOG_WARN(
             "[VRAM-ARENA] Insufficient budget for N-chunk arena: total %.1f MB < tail %.1f MB + min KV %.1f MB; "
             "refusing reservation\n",
@@ -30430,7 +30601,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             alloc_size / (1024.0 * 1024.0));
         return false;
     }
-    if (weight_total < k_min_shared_bytes) {
+    if (!zone_arena_weight_chunks_fit(alloc_size, last_chunk_size)) {
         GGML_LOG_WARN(
             "[VRAM-ARENA] Insufficient budget for N-chunk arena: weight total %.1f MB < min %.1f MB; "
             "refusing reservation\n",
@@ -30503,7 +30674,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // Logical-offset layout (cumulative across chunks; offset_to_ptr/ptr_to_offset translate):
     //   [WEIGHT (chunks 0..N-2, weight_total bytes)]
     //   [KV (head of last chunk, up to last_chunk_size - tail_bytes bytes;
-    //        0 if tail consumes the chunk — guarded above by tail_chunk_min)]
+    //        never below k_min_shared_bytes -- guarded above by zone_arena_chunk_holds_tail)]
     //   [ONEDNN] [RUNTIME] [SCRATCH] (tail of last chunk)
     auto & wz = arena_zones_[static_cast<int>(vram_zone_id::WEIGHT)];
     wz.start  = 0;
@@ -30804,7 +30975,17 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
     // Physical group lock is common to logical sharers.
     std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
     allocator_group & group = arena_allocator_groups_[arena_allocator_group_index(zone)];
-    if (group.state != allocator_group_state::OPEN || !arena_zone_open(zone)) return nullptr;
+
+    // The SCRATCH zone's use is counted here, under the group lock this call holds: each placement, and each request
+    // the zone cannot place, which unified_allocate then sends to raw device memory. The lock covers the zone's used
+    // bytes and its group's live allocations, so a placement reads both as this call left them.
+    const bool scratch = zone == vram_zone_id::SCRATCH;
+    if (group.state != allocator_group_state::OPEN || !arena_zone_open(zone)) {
+        if (scratch) {
+            zone_scratch_use_note_miss(scratch_zone_use_, size);
+        }
+        return nullptr;
+    }
 
     // TLSF returns OFFSET into the managed region; convert to device pointer. In a single-chunk arena WEIGHT
     // allocates from KV's allocator, whose used() is both zones' bytes: the zone's counter takes this call's delta.
@@ -30834,8 +31015,14 @@ void * unified_cache::zone_alloc(vram_zone_id                         zone,
             zone_used_free(*alloc, offset, z.used);
             return nullptr;
         }
+        if (scratch) {
+            zone_scratch_use_note_alloc(scratch_zone_use_, size, zone_count, group.allocations.size());
+        }
         if (exact) *exact = committed;
         return ptr;
+    }
+    if (scratch) {
+        zone_scratch_use_note_miss(scratch_zone_use_, size);
     }
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
@@ -32858,8 +33045,9 @@ static std::vector<placement_tensor_info> placement_tensor_inventory_from_pairs(
 }
 
 static void copy_tensor_info_to_entry(placement_entry & entry, const placement_tensor_info & tensor) {
-    entry.name = tensor.name;
-    entry.type = tensor.type;
+    entry.name          = tensor.name;
+    entry.type          = tensor.type;
+    entry.get_rows_only = tensor.get_rows_only;
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         entry.ne[i] = tensor.ne[i];
     }
@@ -35162,10 +35350,13 @@ static size_t zone_onednn_reorder_bytes(const placement_tensor_info & item) {
 }
 
 // The pure Q8_1 src1 arithmetic in zone-sizing.hpp restates three backend constants because that TU
-// links nothing; pin each to its source so the planner cannot drift from the dispatch's required_size.
+// links nothing; pin each to its source so the planner cannot drift from the dispatch's required_size. The
+// block pair also sizes the MoE batched MMVQ scratch (zone_moe_mmvq_op_bytes), which pads K to QK8_1 only.
 static_assert(k_zone_mmq_src1_row_padding == MATRIX_ROW_PADDING, "zone-sizing.hpp Q8_1 row padding drifted");
 static_assert(k_zone_mmq_src1_block_elems == QK8_1, "zone-sizing.hpp Q8_1 block width drifted");
 static_assert(k_zone_mmq_src1_block_bytes == sizeof(block_q8_1), "zone-sizing.hpp Q8_1 block size drifted");
+static_assert(static_cast<size_t>(k_zone_mxfp4_moe_group_rows) == GGML_SYCL_MXFP4_MOE_XMX_N,
+              "zone-sizing.hpp MXFP4 group rows drifted");
 static_assert(k_zone_dequant_f16_elem_bytes == sizeof(sycl::half), "zone-sizing.hpp f16 element size drifted");
 
 bool onednn_pp_unified_scratch_enabled(ggml_type type) {
@@ -35199,8 +35390,8 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         desc.get_rows_only = item.get_rows_only;
         // llama.cpp-479i: Q8_1 bytes a dense quantized MUL_MAT quantizes its activations into, per
         // token. Operand-ness is decided HERE, where the traits and the name are, not in the pure
-        // classifier: a quantized weight that is not an expert stack (MUL_MAT_ID keeps its own
-        // moe_q8 workspace). Experts are recognised by the planner's own role function, the same
+        // classifier: a quantized weight that is not an expert stack (MUL_MAT_ID quantizes into
+        // per-op buffers of its own). Experts are recognised by the planner's own role function, the same
         // authority plan_moe_mmid_workspaces uses -- NOT by ne[2] > 1, which also matches dense 3-D
         // operands such as the MLA wk_b / wv_b (llama.cpp-8xbt). A mis-prediction is survivable:
         // ggml_sycl_mmq_src1_ensure_for_graph() ensures max(plan, demand) for every device that has a
@@ -36235,6 +36426,26 @@ bool placement_moe_host_recipe_workspace_bytes_at(const std::vector<moe_host_rec
     return true;
 }
 
+// One operand per expert weight that mmvq_moe_batched_dispatch can run: an expert stack by the planner's own role
+// function, of a type the batched kernels admit. The type test is load-bearing as well as exact: an NVFP4 model's F32
+// per-expert scales (ffn_down_exps.scale, ffn_down_exps.input_scale) carry the role's name too. Down reads one
+// activation row per routed slot; gate, up and fused gate_up read one row a token. An MXFP4 stack names its expert
+// count (ne2), which its grouped dispatch sizes its tables by (zone_moe_mmvq_operand::grouped_experts).
+static std::vector<zone_moe_mmvq_operand> moe_mmvq_scratch_operands(
+    const std::vector<placement_tensor_info> & tensor_inventory) {
+    std::vector<zone_moe_mmvq_operand> ops;
+    for (const auto & item : tensor_inventory) {
+        const expert_tensor_role role = expert_tensor_role_from_tensor_name(item.name.c_str());
+        if (!item.has_shape() || role == expert_tensor_role::UNKNOWN ||
+            !moe_mmvq_batched_dispatch_supports_type(item.type)) {
+            continue;
+        }
+        ops.push_back({ item.ne[0], role == expert_tensor_role::DOWN || role == expert_tensor_role::CHUNK_DOWN,
+                        item.type == GGML_TYPE_MXFP4 ? item.ne[2] : 0 });
+    }
+    return ops;
+}
+
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
@@ -36439,18 +36650,51 @@ static void populate_host_zone_sizing(placement_plan &                          
     //    is correct -- see path_scoped_maxima::onednn_reorder in zone-sizing.hpp.
     plan.onednn_reorder_bytes = zone_maxima.onednn_reorder;
 
-    // 2. MoE Q8_1 workspace: n_expert_used activation rows quantized to Q8_1 for batched dispatch.
-    //    Coarse heuristic: estimate Q8_1 workspace from weight tensor size.
-    //    The actual Q8_1 row size depends on the activation K dimension (ne10),
-    //    not weight bytes. This over-estimates because quantized weight bytes
-    //    exceed the raw K dimension, making the sizing conservative.
-    //    1.1x headroom covers QK8_1 alignment padding.  Zero for dense models.
+    // 2. MoE batched MMVQ scratch: each MUL_MAT_ID op that mmvq_moe_batched_dispatch runs holds a Q8_1 copy of its
+    //    activations and an ids table (and, grouped on the device, its grouping tables) in the device SCRATCH zone
+    //    until a thread that waits on the op's completion event releases them, and no later op's allocation waits for
+    //    that release, so the bound counts every op's buffers at once (zone_scratch_zone_plan), at the micro-batch the
+    //    context runs. The bound is published for the ensure that plans the zone, which holds it to the budget quarter
+    //    and the arena reserve's room and states the zone it plans; this line states only the bound, so the two cannot
+    //    disagree. A request the zone cannot place is a miss, served from raw device memory while the card has room
+    //    outside the arena and otherwise refused by name (zone_scratch_zone_plan says what that refusal costs each
+    //    expert type), and the zone's use line at cache teardown counts it. A load plans twice, from the file's weights
+    //    and then from the tensors it created, so the line names the tensor count of the plan it describes.
+    plan.moe_mmvq_scratch_ops.clear();
+    plan.moe_mmvq_scratch_n_expert_used = 0;
+    plan.moe_mmvq_scratch_bytes         = 0;
+    plan.moe_mmvq_scratch_n_ubatch      = 0;
     if (n_experts > 0 && n_expert_used > 0) {
-        const size_t expert_ffn_bytes = plan.max_tensor_bytes / static_cast<size_t>(n_experts);
-        const size_t q8_1_row_bytes   = static_cast<size_t>(static_cast<double>(expert_ffn_bytes) * 1.1);
-        plan.moe_q8_workspace_bytes   = static_cast<size_t>(n_expert_used) * q8_1_row_bytes;
+        plan.moe_mmvq_scratch_ops           = moe_mmvq_scratch_operands(tensor_inventory);
+        plan.moe_mmvq_scratch_n_expert_used = n_expert_used;
+        plan.moe_mmvq_scratch_n_ubatch =
+            plan.context_n_ubatch != 0 ? plan.context_n_ubatch : placement_load_n_ubatch(plan.planner_n_ubatch);
+        const size_t          n_ops = plan.moe_mmvq_scratch_ops.size();
+        zone_moe_mmvq_scratch mmvq_scratch;
+        // Every input is positive here (the guard, the micro-batch, the inventory's shapes), so a false answer is an
+        // overflow, and an overflowed bound is no size to reserve.
+        if (!zone_moe_mmvq_scratch_bytes(plan.moe_mmvq_scratch_ops, plan.moe_mmvq_scratch_n_ubatch, n_expert_used,
+                                         &mmvq_scratch)) {
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] MoE batched MMVQ scratch overflows: %zu expert op(s) at n_ubatch=%u; the SCRATCH zone is "
+                "not raised for it\n",
+                n_ops, plan.moe_mmvq_scratch_n_ubatch);
+        } else if (n_ops != 0) {
+            plan.moe_mmvq_scratch_bytes = mmvq_scratch.graph;
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] MoE batched MMVQ scratch, plan of %zu tensors: %zu expert op(s) at n_ubatch=%u, depth %zu "
+                "(every op: no op's allocation waits for an earlier op's release), %.2f MB, the largest op %.2f MB; "
+                "the arena's ensure plans the SCRATCH zone for this bound and states the zone it plans\n",
+                tensor_inventory.size(), n_ops, plan.moe_mmvq_scratch_n_ubatch, n_ops,
+                mmvq_scratch.graph / (1024.0 * 1024.0), mmvq_scratch.per_op / (1024.0 * 1024.0));
+        }
+    }
+    if (plan.devices.empty()) {
+        unified_cache_set_planned_moe_mmvq_scratch_bytes(plan.device_id, plan.moe_mmvq_scratch_bytes);
     } else {
-        plan.moe_q8_workspace_bytes = 0;
+        for (int device : plan.devices) {
+            unified_cache_set_planned_moe_mmvq_scratch_bytes(device, plan.moe_mmvq_scratch_bytes);
+        }
     }
 
     // 3. Expert bias D2H + MoE routing buffers: computed from MoE layer count.

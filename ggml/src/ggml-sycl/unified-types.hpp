@@ -59,8 +59,9 @@ inline bool mmq_capable_type(ggml_type type) {
 }
 
 // The types SYCL executes as a dense MUL_MAT operand: the allowlist behind supports_op for MUL_MAT (and the dense
-// ADD_ID operand). Read by ggml_sycl_mul_mat_type_supported (ggml-sycl.cpp) and by the zone planner, which must not
-// reserve a dequant copy for a type SYCL refuses (NVFP4, Q1_0: they run on ggml-cpu; Q2_0 left that
+// ADD_ID operand). Read by ggml_sycl_mul_mat_type_supported (ggml-sycl.cpp), by the CPU-work predicate there (a
+// planned dense weight of a type this list refuses is CPU work wherever it sits) and by the zone planner, which
+// must not reserve a dequant copy for a type SYCL refuses (NVFP4, Q1_0: they run on ggml-cpu; Q2_0 left that
 // group when it gained its kernels, llama.cpp-s36q phase 4). MUL_MAT_ID deliberately
 // does not use this list: its admission keys on the MMID coverage tables (supports_op in ggml-sycl.cpp).
 inline bool dense_mul_mat_type_supported(ggml_type type) {

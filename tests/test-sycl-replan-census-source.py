@@ -833,8 +833,8 @@ def gate31_owner(files, bad):
                            re.sub(r"(?:ggml_sycl::)?$", "", before) + "") and \
                 not re.search(r"(?:switch\s*\(\s*|ready_or_throw\s*\(\s*|queue_status\s*=\s*)(?:ggml_sycl::)?\s*$", before):
             bad("gate 31 (owner): a call of %s in %s is not consumed by a switch, ready_or_throw or an explicit status" % (ENSURE, fn))
-    if total != 6:
-        bad("gate 31 (owner): %s has %d callers (the census is six)" % (ENSURE, total))
+    if total != 5:
+        bad("gate 31 (owner): %s has %d callers (the census is five)" % (ENSURE, total))
     # mul_mat_id reads the owner from its own context, once
     mm = func_bodies(c, "ggml_sycl_mul_mat_id")
     if len(mm) != 1 or not re.search(r"\bmmid_owner_bound\s*=\s*ggml_sycl_execution_current_owner\s*\(\s*&ctx\s*,\s*mmid_owner\s*\)",

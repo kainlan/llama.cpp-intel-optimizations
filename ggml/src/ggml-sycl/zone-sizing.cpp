@@ -291,6 +291,175 @@ bool zone_mmq_src1_scratch_bytes(size_t bytes_per_token, uint32_t n_ubatch, size
     return true;
 }
 
+// `bytes` as the SCRATCH zone's allocator places them, into *out: rounded up to its block grain. False, with *out
+// untouched, for a size within one grain of SIZE_MAX, which tlsf_allocator::round_request refuses too.
+static bool zone_scratch_block_bytes(size_t bytes, size_t * out) {
+    if (bytes > SIZE_MAX - k_zone_arena_alignment) {
+        return false;
+    }
+    *out = (bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+    return true;
+}
+
+bool zone_moe_mmvq_op_bytes(const zone_moe_mmvq_operand & op, int64_t n_tokens, int64_t n_expert_used, size_t * out) {
+    if (!out) {
+        return false;
+    }
+    *out = 0;
+    if (op.k <= 0 || op.grouped_experts < 0 || n_tokens <= 0 || n_expert_used <= 0) {
+        return false;
+    }
+    *out = SIZE_MAX;  // every return below is an overflow
+
+    // GGML_PAD(ne10, QK8_1) / QK8_1 blocks of sizeof(block_q8_1) bytes: the dispatch's q8_1_row_size.
+    const int64_t block  = k_zone_mmq_src1_block_elems;
+    const size_t  blocks = static_cast<size_t>(op.k / block + (op.k % block != 0 ? 1 : 0));
+    const size_t  tokens = static_cast<size_t>(n_tokens);
+    const size_t  slots  = static_cast<size_t>(n_expert_used);
+    if (blocks > SIZE_MAX / k_zone_mmq_src1_block_bytes || tokens > SIZE_MAX / slots) {
+        return false;
+    }
+    const size_t row         = blocks * k_zone_mmq_src1_block_bytes;
+    const size_t token_slots = tokens * slots;  // the dispatch's total_batches
+    const size_t rows        = op.row_per_slot ? token_slots : tokens;
+    if (rows > SIZE_MAX / row || token_slots > SIZE_MAX / sizeof(int32_t)) {
+        return false;
+    }
+
+    // Each buffer is a block of its own, placed in whole grains; the op holds their sum.
+    size_t     total = 0;
+    const auto place = [&](size_t bytes) {
+        size_t placed = 0;
+        if (!zone_scratch_block_bytes(bytes, &placed) || placed > SIZE_MAX - total) {
+            return false;
+        }
+        total += placed;
+        return true;
+    };
+    if (!place(rows * row) || !place(token_slots * sizeof(int32_t))) {
+        return false;
+    }
+
+    // The grouped tables, six buffers of int32: experts, offsets (experts + 1), rows (total_batches), chunk groups and
+    // chunk starts (max_chunks each: every expert's rows cut into chunks of k_zone_mxfp4_moe_group_rows), and the
+    // counter.
+    if (op.grouped_experts > 0) {
+        const size_t i32             = sizeof(int32_t);
+        const size_t experts         = static_cast<size_t>(op.grouped_experts);
+        const size_t group_rows      = static_cast<size_t>(k_zone_mxfp4_moe_group_rows);
+        const size_t chunks_a_expert = token_slots / group_rows + (token_slots % group_rows != 0 ? 1 : 0);
+        if (experts >= SIZE_MAX / i32 || chunks_a_expert > SIZE_MAX / i32 / experts) {
+            return false;
+        }
+        const size_t max_chunks = experts * chunks_a_expert;
+        if (!place(experts * i32) || !place((experts + 1) * i32) || !place(token_slots * i32) ||
+            !place(max_chunks * i32) || !place(max_chunks * i32) || !place(i32)) {
+            return false;
+        }
+    }
+    *out = total;
+    return true;
+}
+
+bool zone_moe_mmvq_scratch_bytes(const std::vector<zone_moe_mmvq_operand> & ops,
+                                 int64_t                                    n_tokens,
+                                 int64_t                                    n_expert_used,
+                                 zone_moe_mmvq_scratch *                    out) {
+    if (!out) {
+        return false;
+    }
+    *out = {};
+    if (n_tokens <= 0 || n_expert_used <= 0 ||
+        std::any_of(ops.begin(), ops.end(),
+                    [](const zone_moe_mmvq_operand & op) { return op.k <= 0 || op.grouped_experts < 0; })) {
+        return false;
+    }
+    bool exact = true;
+    for (const zone_moe_mmvq_operand & op : ops) {
+        size_t bytes = 0;
+        exact        = zone_moe_mmvq_op_bytes(op, n_tokens, n_expert_used, &bytes) && exact;
+        out->per_op  = std::max(out->per_op, bytes);
+        if (bytes > SIZE_MAX - out->graph) {
+            out->graph = SIZE_MAX;
+            exact      = false;
+        } else {
+            out->graph += bytes;
+        }
+    }
+    return exact;
+}
+
+size_t zone_scratch_required_bytes(size_t default_bytes, size_t nonfa_bytes) {
+    return std::max(default_bytes, nonfa_bytes);
+}
+
+zone_scratch_plan zone_scratch_zone_plan(size_t default_bytes,
+                                         size_t nonfa_bytes,
+                                         size_t moe_mmvq_bytes,
+                                         size_t budget_cap_bytes,
+                                         size_t room_bytes) {
+    zone_scratch_plan plan;
+    plan.required         = zone_scratch_required_bytes(default_bytes, nonfa_bytes);
+    // The room is on top of what the zone must hold; SIZE_MAX, no limit, saturates.
+    const size_t room_cap = room_bytes > SIZE_MAX - plan.required ? SIZE_MAX : plan.required + room_bytes;
+    const size_t limit    = std::min(budget_cap_bytes, room_cap);
+    plan.wanted           = std::max(plan.required, std::min(moe_mmvq_bytes, limit));
+    if (moe_mmvq_bytes > plan.required && moe_mmvq_bytes > limit) {
+        plan.clamp = room_cap <= budget_cap_bytes ? zone_scratch_clamp::ROOM : zone_scratch_clamp::BUDGET;
+    }
+    return plan;
+}
+
+size_t zone_scratch_kept_bytes(const zone_scratch_plan & plan, size_t capacity_bytes) {
+    if (capacity_bytes >= plan.wanted || capacity_bytes < plan.required) {
+        return plan.wanted;
+    }
+    return capacity_bytes;
+}
+
+bool zone_scratch_warn_due(size_t latched_bytes, size_t bytes) {
+    return bytes > latched_bytes;
+}
+
+std::string zone_scratch_clamp_text(int                       device,
+                                    const zone_scratch_plan & plan,
+                                    size_t                    bound_bytes,
+                                    size_t                    budget_cap_bytes,
+                                    size_t                    room_bytes,
+                                    bool                      reserve_accepts) {
+    if (plan.clamp == zone_scratch_clamp::NONE) {
+        return {};
+    }
+    constexpr double MiB = 1024.0 * 1024.0;
+    char             part[512];
+    std::snprintf(part, sizeof(part),
+                  "[VRAM-ARENA] device %d plans its SCRATCH zone at %.1f MB, short of the %.1f MB MoE batched MMVQ "
+                  "scratch bound: ",
+                  device, plan.wanted / MiB, bound_bytes / MiB);
+    std::string text = part;
+    if (!reserve_accepts) {
+        // The room is 0 here, and plan.required plus it is a zone the reserve refuses: name no zone it accepts.
+        std::snprintf(part, sizeof(part),
+                      "the arena's reserve refuses even the %.1f MB zone the plan must hold, so the bound adds nothing "
+                      "to it (a quarter of the available budget is %.1f MB)",
+                      plan.required / MiB, budget_cap_bytes / MiB);
+    } else {
+        const bool   room     = plan.clamp == zone_scratch_clamp::ROOM;
+        const size_t accepted = room_bytes > SIZE_MAX - plan.required ? SIZE_MAX : plan.required + room_bytes;
+        std::snprintf(
+            part, sizeof(part),
+            "%s (%.1f MB; a quarter of the available budget is %.1f MB, the arena's reserve accepts a %.1f MB "
+            "zone, and the zone must hold %.1f MB without the bound)",
+            room ? "the room the arena's reserve accepts holds it" : "a quarter of the available budget holds it",
+            (room ? accepted : budget_cap_bytes) / MiB, budget_cap_bytes / MiB, accepted / MiB, plan.required / MiB);
+    }
+    text += part;
+    text += ". ";
+    text += k_zone_scratch_miss_path_text;
+    text += ". The bound follows the micro-batch, so a smaller -ub lowers it";
+    return text;
+}
+
 bool zone_dequant_f16_weight_bytes(int64_t ne0, int64_t ne1, size_t * out) {
     if (!out || ne0 <= 0 || ne1 <= 0) {
         return false;
@@ -507,6 +676,127 @@ bool zone_runtime_kept_above_plan(size_t live_zone_bytes, size_t floor_bytes, si
     // The reserved zone already carries the arena's rounding, so every byte above it was grown.
     size_t reserved = 0;
     return zone_runtime_reserved_bytes(floor_bytes, requirement, &reserved) && live_zone_bytes > reserved;
+}
+
+size_t zone_arena_zone_bytes(size_t bytes) {
+    return (bytes + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1);
+}
+
+size_t zone_arena_round_alloc_bytes(size_t bytes) {
+    return (bytes / k_zone_arena_size_alignment) * k_zone_arena_size_alignment;
+}
+
+size_t zone_arena_per_chunk_cap(size_t max_alloc_size, size_t safe_max_alloc_size) {
+    if (safe_max_alloc_size == 0) {
+        return max_alloc_size;
+    }
+    return max_alloc_size > 0 ? std::min(max_alloc_size, safe_max_alloc_size) : safe_max_alloc_size;
+}
+
+bool zone_arena_single_chunk_tried(size_t alloc_bytes, size_t max_alloc_size, size_t per_chunk_cap) {
+    return max_alloc_size == 0 || alloc_bytes <= per_chunk_cap;
+}
+
+size_t zone_arena_tail_kv_reserve(size_t alloc_bytes) {
+    constexpr size_t k_min_tail_kv_reserve = 128ull * 1024ull * 1024ull;
+    constexpr size_t k_max_tail_kv_reserve = 512ull * 1024ull * 1024ull;
+    const size_t     proportional_kv       = std::max<size_t>(alloc_bytes / 128, k_zone_arena_min_shared_bytes);
+    return std::min(k_max_tail_kv_reserve, std::max(k_min_tail_kv_reserve, proportional_kv));
+}
+
+size_t zone_arena_tail_chunk_bytes(size_t alloc_bytes,
+                                   size_t per_chunk_cap,
+                                   size_t tail_bytes,
+                                   size_t tail_kv_reserve) {
+    const size_t wanted = tail_kv_reserve > SIZE_MAX - tail_bytes ? SIZE_MAX : tail_bytes + tail_kv_reserve;
+    return std::min({ wanted, per_chunk_cap, alloc_bytes });
+}
+
+bool zone_arena_tail_bytes(std::initializer_list<size_t> zones, size_t * out) {
+    size_t sum = 0;
+    for (const size_t zone : zones) {
+        if (zone > SIZE_MAX - sum) {
+            return false;
+        }
+        sum += zone;
+    }
+    *out = sum;
+    return true;
+}
+
+bool zone_arena_chunk_holds_tail(size_t chunk_bytes, size_t tail_bytes) {
+    return tail_bytes <= SIZE_MAX - k_zone_arena_min_shared_bytes &&
+           chunk_bytes >= tail_bytes + k_zone_arena_min_shared_bytes;
+}
+
+bool zone_arena_weight_chunks_fit(size_t alloc_bytes, size_t tail_chunk_bytes) {
+    return tail_chunk_bytes <= alloc_bytes && alloc_bytes - tail_chunk_bytes >= k_zone_arena_min_shared_bytes;
+}
+
+zone_arena_reserve_shape zone_arena_reserve_shape_of(size_t budget_bytes,
+                                                     size_t device_total_vram,
+                                                     size_t max_alloc_size,
+                                                     size_t safe_max_alloc_size) {
+    zone_arena_reserve_shape shape;
+    const size_t arena  = device_total_vram > 0 && budget_bytes > device_total_vram ? device_total_vram : budget_bytes;
+    shape.alloc_bytes   = zone_arena_round_alloc_bytes(arena);
+    shape.per_chunk_cap = zone_arena_per_chunk_cap(max_alloc_size, safe_max_alloc_size);
+    shape.single_chunk  = zone_arena_single_chunk_tried(shape.alloc_bytes, max_alloc_size, shape.per_chunk_cap);
+    shape.tail_kv_reserve = zone_arena_tail_kv_reserve(shape.alloc_bytes);
+    return shape;
+}
+
+bool zone_arena_single_chunk_accepts(const zone_arena_reserve_shape & shape, size_t tail_bytes) {
+    return shape.single_chunk && zone_arena_chunk_holds_tail(shape.alloc_bytes, tail_bytes);
+}
+
+bool zone_arena_n_chunk_accepts(const zone_arena_reserve_shape & shape, size_t tail_bytes) {
+    const size_t tail_chunk =
+        zone_arena_tail_chunk_bytes(shape.alloc_bytes, shape.per_chunk_cap, tail_bytes, shape.tail_kv_reserve);
+    return zone_arena_chunk_holds_tail(tail_chunk, tail_bytes) &&
+           zone_arena_weight_chunks_fit(shape.alloc_bytes, tail_chunk);
+}
+
+// The tail the reserve sums for a SCRATCH zone of `scratch_bytes` beside `other_tail_bytes`, into *tail. False when
+// the zone's rounding or the sum wraps: no zone the reserve could carve.
+static bool zone_arena_scratch_tail(size_t other_tail_bytes, size_t scratch_bytes, size_t * tail) {
+    const size_t scratch = zone_arena_zone_bytes(scratch_bytes);
+    return scratch >= scratch_bytes && zone_arena_tail_bytes({ other_tail_bytes, scratch }, tail);
+}
+
+bool zone_arena_scratch_accepts(const zone_arena_reserve_shape & shape, size_t other_tail_bytes, size_t scratch_bytes) {
+    size_t base = 0;
+    return zone_arena_scratch_tail(other_tail_bytes, scratch_bytes, &base) &&
+           (zone_arena_single_chunk_accepts(shape, base) || zone_arena_n_chunk_accepts(shape, base));
+}
+
+size_t zone_arena_scratch_room(const zone_arena_reserve_shape & shape, size_t other_tail_bytes, size_t scratch_bytes) {
+    size_t base = 0;
+    if (!zone_arena_scratch_tail(other_tail_bytes, scratch_bytes, &base)) {
+        return 0;
+    }
+    const bool   single  = zone_arena_single_chunk_accepts(shape, base);
+    const bool   n_chunk = zone_arena_n_chunk_accepts(shape, base);
+    if (!single && !n_chunk) {
+        return 0;
+    }
+    // Each check fails only as the tail grows, so the tails that keep every check passing are those up to one largest.
+    const auto passes = [&](size_t tail) {
+        return (!single || zone_arena_single_chunk_accepts(shape, tail)) &&
+               (!n_chunk || zone_arena_n_chunk_accepts(shape, tail));
+    };
+    // Every passing tail lies inside the arena (base passed one check, so base < alloc), which bounds the search.
+    size_t lo = 0;
+    size_t hi = (shape.alloc_bytes - base) / k_zone_arena_alignment;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo + 1) / 2;
+        if (passes(base + mid * k_zone_arena_alignment)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo * k_zone_arena_alignment;
 }
 
 bool zone_runtime_requirement(const zone_runtime_terms & terms, size_t * out) {
@@ -745,6 +1035,38 @@ static std::string zone_arena_teardown_text(zone_arena_teardown_refusal cause, i
                   "Load this model in a new process",
                   device);
     return text + closed;
+}
+
+void zone_scratch_use_note_alloc(zone_scratch_use & use, size_t request_bytes, size_t used_bytes, size_t live) {
+    use.requests += use.requests < SIZE_MAX ? 1 : 0;
+    use.largest_request_bytes = std::max(use.largest_request_bytes, request_bytes);
+    if (used_bytes > use.high_water_bytes) {
+        use.high_water_bytes   = used_bytes;
+        use.live_at_high_water = live;
+    }
+}
+
+void zone_scratch_use_note_miss(zone_scratch_use & use, size_t request_bytes) {
+    use.misses += use.misses < SIZE_MAX ? 1 : 0;
+    use.miss_bytes         = request_bytes > SIZE_MAX - use.miss_bytes ? SIZE_MAX : use.miss_bytes + request_bytes;
+    use.largest_miss_bytes = std::max(use.largest_miss_bytes, request_bytes);
+}
+
+std::string zone_scratch_use_text(const zone_scratch_use & use, int device, size_t capacity_bytes) {
+    if (use.requests == 0 && use.misses == 0) {
+        return {};
+    }
+    constexpr double mib = 1024.0 * 1024.0;
+    char             line[512];
+    std::snprintf(line, sizeof(line),
+                  "[UNIFIED-CACHE] SCRATCH zone use: device=%d high-water=%.2f MB of %.2f MB with %zu allocations "
+                  "live, largest request=%.2f MB, requests placed=%zu; zone misses (placements the zone refused, "
+                  "each spilled to raw device memory or refused by its caller): requests=%zu bytes=%.2f MB "
+                  "largest=%.2f MB",
+                  device, use.high_water_bytes / mib, capacity_bytes / mib, use.live_at_high_water,
+                  use.largest_request_bytes / mib, use.requests, use.misses, use.miss_bytes / mib,
+                  use.largest_miss_bytes / mib);
+    return line;
 }
 
 std::string zone_arena_refusal_text(const zone_arena_refusal & refusal) {

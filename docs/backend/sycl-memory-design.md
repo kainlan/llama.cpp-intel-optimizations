@@ -2387,13 +2387,136 @@ by 32×.
 comment — an unjustified `any_tensor` reintroduces exactly the over-provision
 this exists to remove.
 
-Two consumers stay on the model-wide class, and both comments say why:
-`moe_q8_workspace_bytes` is derived as `max_tensor_bytes / n_experts` and is
-therefore already a per-expert figure, and `s1_per_inflight_bytes` backs the S1
-preload, which streams every tensor bound for a device, the embeddings
-included. Narrowing that second one to a per-layer maximum would be this bug in
-reverse. It leaves out only the one class the next paragraph describes, a
-gather-only table the plan keeps on the host, which S1 never streams.
+One consumer stays on the model-wide class, and its comment says why:
+`s1_per_inflight_bytes` backs the S1 preload, which streams every tensor bound
+for a device, the embeddings included. Narrowing it to a per-layer maximum
+would be this bug in reverse. It leaves out only the one class the next
+paragraph describes, a gather-only table the plan keeps on the host, which S1
+never streams.
+
+The MoE batched MMVQ scratch is a planned term of the device SCRATCH zone,
+`placement_plan::moe_mmvq_scratch_bytes`. Each MUL_MAT_ID op that
+`mmvq_moe_batched_dispatch` runs takes two buffers from that zone: a Q8_1 copy
+of its activations (K padded to `QK8_1`; one row a token for gate, up and fused
+gate_up, one row a routed slot for down) and an ids table (`n_tokens *
+n_expert_used` int32). An MXFP4 op whose rows the dispatch groups on the device
+also takes its grouping tables from the zone, per op: E expert ids, E + 1
+offsets, one row entry a routed slot, two tables of E * ceil(slots / 16) chunks
+and a counter, all int32 (`mmvq.cpp`, `mmvq_moe_*_device_grouped_*`), so the
+bound counts them for every MXFP4 expert stack. The host-grouped XMX-tiled
+path's tables are not counted: they are cached on the weight
+(`moe_grouped_scratch`, allocated `persistent`), outside the zone. The dispatch
+hands every such buffer to `retain_handles_until_event`
+(`mem-handle.cpp`), whose detached drain thread drops them once the op's
+completion event fires. Nothing makes a later op wait for that release: no
+allocation waits on an earlier op's event, the zone's allocator reclaims
+nothing when it is asked for room, and the host waits a prompt does run (the
+routing-ids snapshot, once per ids tensor per graph; the scheduler's split
+syncs) order device work, not the drain. Gate, up and down of one layer even
+share one ids snapshot with no wait between them. So nothing bounds how many
+ops hold their scratch at once, and the bound is every expert op's buffers
+together (`zone_moe_mmvq_scratch_bytes`'s `graph` sum) at the micro-batch the
+context runs. A measured high-water of one op's demand is the drain winning a
+race, not a depth to plan on, and no host wait is added to force a depth of one
+(every wait is event-chained). Each buffer is counted as the zone's allocator
+places it (`zone_moe_mmvq_op_bytes`, test-zone-sizing Case 46): its request
+rounded up to the 256-byte block grain, `k_zone_arena_alignment`, which
+`unified-cache.cpp` asserts equals `tlsf_allocator::block_grain`. Every request
+here asks an alignment of at most that grain, so `round_request` rounds by it. A
+placed block costs nothing beyond the rounding: the allocator keeps its metadata
+in host memory, so no header sits in the zone, and it splits a free block only
+where a whole grain is left, which in a zone reserved in whole grains leaves
+every block exactly its rounded request. The bound counts bytes, not where they
+land, so a zone whose free bytes lie in pieces smaller than a buffer can still
+miss it.
+
+The zone is planned for the whole bound where it can be, because a request the
+zone cannot place is a miss: an allocation no plan counted. While the card has
+room outside the arena it is served from raw device memory there; on a card
+with no headroom the allocation fails and the dispatch refuses the buffer by
+name (`q8-scratch-alloc`, `ids-scratch-alloc`, `device-group-alloc`). What
+happens next depends on the expert type:
+
+- Q1_0 and NVFP4 have one executor on the card, this dispatch, in AOS layout
+  (`moe-mmvq-tables.hpp` admits them in no other layout, and `ggml-sycl.cpp`
+  gives the direct recipe only to the private route-testing build). The
+  planner route ends the op with a named refusal
+  (`ggml_sycl_moe_q1_nvfp4_refusal_text`, thrown as `ggml_sycl_fallback_error`),
+  and the graph compute returns `GGML_STATUS_FAILED`
+  (test-moe-q1-nvfp4-dispatch-refusal).
+- Every other type the dispatch admits takes another route: the planner
+  route's per-entry dispatch, or the route the batched dispatch was tried ahead
+  of (decode-direct, hybrid decode, MXFP4 grouped down, planned PP).
+
+The rule, `zone_scratch_zone_plan` (test-zone-sizing Cases 47 to 49): what the
+zone must hold (`required`) is the larger of its default
+(`GGML_SYCL_COMPUTE_ARENA_MB`, 512 MiB) and the non-FA attention raise, which
+has no miss path; the zone is planned at the larger of that and the bound held
+to two limits, `wanted = max(required, min(bound, quarter, required + room))`:
+
+- `quarter` is a quarter of the available budget, the one figure the ensure
+  also clamps the non-FA raise to, so that no SCRATCH raise for a consumer with
+  a fallback starves the WEIGHT zone;
+- `room` (`zone_arena_scratch_room`) is the most the arena's reserve accepts on
+  top of `required` with the ONEDNN and RUNTIME zones as planned: every
+  single-chunk and N-chunk check the reserve passes with `required` still
+  passes. Without it the bound could make the reserve refuse a load the zone
+  without it would have reserved (`RESERVE_FAILED`): a single chunk with no
+  16 MiB left beside the tail, a tail plus 16 MiB that the per-chunk cap
+  cannot hold, or weight chunks below 16 MiB. `arena_reserve` makes each of
+  those checks through the zone-sizing functions the room is built from, so
+  the two cannot disagree. It sums the tail once, with the same
+  `zone_arena_tail_bytes` the room sums its tails with, and refuses a sum that
+  wraps before either layout reads it.
+
+Both limits apply to every expert type, the two with no fallback included. The
+bound is a worst case, every expert op's buffers live at once, and far from
+what a run holds: on the Qwen3.6-35B-A3B NVFP4 vehicle at 2048 rows the zone's
+use line measured a high-water of 9.06 MB, one op's two buffers live, in a
+727.5 MB zone. Refusing a load because the arena cannot hold that bound would
+refuse a model that runs. A clamped zone still holds the quarter or the room,
+and only a true miss beyond it, on a card with no room outside the arena, costs
+anything: the dispatch refuses the buffer late and by name, a refusal that
+never aborts and that for Q1_0 or NVFP4 is a failed compute. The route an op of
+another type falls to then makes its own allocations.
+
+Either limit can hold the zone below the bound; the ensure then logs one WARN
+per bound figure, the line `zone_scratch_clamp_text` builds (test-zone-sizing
+Case 50): the zone it plans, the bound, the limit that held it with the quarter
+and the largest zone the reserve accepts, what the zone must hold, the miss
+path (`k_zone_scratch_miss_path_text`, which the kept zone's WARN shares), and
+what a user can do: the bound follows the micro-batch, so a smaller `-ub`
+lowers it. A room of 0 is also what a zone the reserve refuses outright gets,
+so the ensure asks `zone_arena_scratch_accepts` at `required` as well; when the
+reserve refuses even that zone, the line says so instead of naming a zone it
+accepts. The planner computes the bound at the context's micro-batch (the
+load's planning micro-batch until a context names one) and publishes it, and
+its plan line states only the bound: the ensure, which sees both limits, states
+the zone it plans. The runtime context transaction re-sizes the bound at the
+context's micro-batch, raises the published bound and asks for the zones again
+when the zone is smaller. A context never lowers the published bound, but each load's
+plan publishes its own figure (the late pass, another model's load, a non-MoE
+model's 0), and a rebuild with nothing live sizes the zone to the plan as it
+stands, smaller than before if the plan is: the zone is never shrunk while
+anything is live. A rebuild that live allocations block keeps a zone that holds
+what it must without the bound (`zone_scratch_kept_bytes`) and says so once per
+wanted size at WARN. That is never a refusal and never a reset of a zone with
+live handles: a request the kept zone cannot place takes the miss path above,
+and the zone's use line at cache teardown (`zone_scratch_use_text`) counts it
+as a miss, a placement the zone refused that its caller spilled to raw device
+memory or refused (`reserve_persistent_scratch` and `unified_cache::arena_alloc`
+refuse rather than spill), so a miss count above zero is how an under-sized
+zone shows. On Qwen3.6-35B-A3B
+NVFP4 one layer's three expert ops take 9312 bytes a row (gate 2336, up 2336,
+down 4640) at a row count that is a multiple of 8, where every ids table is
+whole grains and the rounding adds nothing: over 40 layers that is 181.9 MiB
+at 512 rows, below the default, and 727.5 MiB at 2048 rows (41 layers, the
+early plan's: 186.4 and 745.7 MiB). The bound passes the default between 1441
+and 1442 rows (536770560 and 537139200 bytes, rounding included). A load plans
+twice, from the file's tensors (the MTP block's experts included) and then from
+the tensors it created, so each plan's line names its tensor count. The term this replaces, `moe_q8_workspace_bytes`
+(`max_tensor_bytes / n_experts * 1.1 * n_expert_used`), had no reader and is
+gone.
 
 The host STAGING and SCRATCH zones, which hold only copies, leave out exactly
 one class: a tensor the loader marked gather-only (`get_rows_only`) that has at
@@ -3383,7 +3506,10 @@ nothing about it. The line offers no smaller `-c`
 or `-ub`: the load plans its zones at its fixed planning shape, ubatch 512 with
 an `n_ctx` of one ubatch for the planner's terms, and the RUNTIME zone's
 compute term is the one the load measured at `n_ctx_train` and ubatch 512
-(below), so neither flag is the term that grew. Any term can be the one:
+(below), so neither flag is the term that grew. The SCRATCH zone's MoE batched
+MMVQ bound does follow the context's micro-batch, but it is held to what the
+reserve accepts and a zone short of it alone is kept, so it never refuses a
+load. Any term can be the one:
 whatever holds the arena keeps the zones at the size an earlier load gave them,
 and the device-wide terms the load publishes from its inventory before the
 entry check (the PP MoE ring, the PP pipeline scratch) are this load's alone.
