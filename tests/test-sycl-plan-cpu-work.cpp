@@ -2,13 +2,15 @@
 // CPU-activation buft selection.
 //
 // The CPU backend's compute buffer gets the dedicated activation buft only when
-// the placement plan leaves some of the graph to the CPU. The predicate must say
-// exactly what supports_op says when it declines an op because its data is
-// host-planned, or because the device has no dense MUL_MAT kernel for a planned
-// weight's type -- if it says "no CPU work" while supports_op hands the CPU an
-// op, a CPU-produced activation reaches a SYCL op raw (the 38af defect); if it
-// says "CPU work" for a full-offload plan, the run gets split-copy names and
-// loses command-graph replay.
+// the placement plan leaves some of the graph to the CPU. The predicate covers
+// the declines supports_op makes from what the plan carries: an op whose data
+// is host-planned, and a dense MUL_MAT whose weight type supports_op's MUL_MAT
+// allowlist refuses. supports_op's shape declines (they read the activation,
+// which the plan does not carry) and its op-kind declines (a GET_ROWS type
+// with no SYCL gather kernel, for one) are outside it. Within that scope, if it
+// says "no CPU work" while supports_op hands the CPU an op, a CPU-produced
+// activation reaches a SYCL op raw; if it says "CPU work" for a full-offload
+// plan, the run gets split-copy names and loses command-graph replay.
 //
 // Host-only: synthetic plans, a pure plan -> verdict seam, no queue, no device,
 // no model. Safe at any parallelism and NOT a member of the GPU-allocating
@@ -101,14 +103,26 @@ const char * cpu_work_reason(placement_plan plan) {
     return ggml_sycl::test_plan_cpu_work_reason(plan);
 }
 
+// A helper that matches no entry leaves the plan unchanged, so a case expecting "none" would pass without
+// testing anything. A name no entry carries (a rename in the plans above) therefore fails on its own.
+void require_named(int matched, const char * name) {
+    if (matched == 0) {
+        std::printf("  FAIL: (precondition) no plan entry is named %s\n", name);
+        ++failures;
+    }
+}
+
 // The loader's facts for one entry, as copy_tensor_info_to_entry() carries them from the inventory.
 placement_plan & set_weight(placement_plan & plan, const char * name, ggml_type type, bool get_rows_only = false) {
+    int matched = 0;
     for (auto & e : plan.entries) {
         if (e.name == name) {
             e.type          = type;
             e.get_rows_only = get_rows_only;
+            ++matched;
         }
     }
+    require_named(matched, name);
     return plan;
 }
 
@@ -132,12 +146,15 @@ placement_plan nvfp4_moe_full_offload_plan() {
 }
 
 placement_plan & entry_off_device(placement_plan & plan, const char * name) {
+    int matched = 0;
     for (auto & e : plan.entries) {
         if (e.name == name) {
             e.on_device     = false;
             e.target_device = -1;
+            ++matched;
         }
     }
+    require_named(matched, name);
     return plan;
 }
 
@@ -315,6 +332,19 @@ int main() {
     }
     {
         auto plan = full_offload_plan();
+        set_weight(plan, "blk.0.attn_q.weight", GGML_TYPE_TQ2_0);
+        expect_reason(cpu_work_reason(std::move(plan)), "dense-type", "a TQ2_0 attn_q in a device-planned layer");
+    }
+    {
+        // On several devices the residency clause reads target_device, and full_offload_plan() gives the head
+        // target_device 0, a GPU, so only the type clause sees that the CPU runs its MUL_MAT.
+        auto plan = full_offload_plan(/*multi_device=*/true);
+        set_weight(plan, "output.weight", GGML_TYPE_NVFP4);
+        expect_reason(cpu_work_reason(std::move(plan)), "dense-type",
+                      "multi-device: an NVFP4 output head whose target_device is a GPU");
+    }
+    {
+        auto plan = full_offload_plan();
         set_weight(plan, "blk.0.attn_q.weight", GGML_TYPE_Q4_0);
         expect_reason(cpu_work_reason(std::move(plan)), nullptr, "a Q4_0 attn_q: the device has its kernel");
     }
@@ -326,7 +356,8 @@ int main() {
     expect_reason(cpu_work_reason(full_offload_plan()), nullptr,
                   "every type unknown (GGML_TYPE_COUNT): no data, no verdict");
     {
-        // The pair that pins the carrier: the same NVFP4 entry, gather-only or not.
+        // The pair that pins the predicate's use of get_rows_only: the same NVFP4 entry, gather-only or not. The
+        // copy that fills the field from the inventory is pinned by tests/test-sycl-cpu-activation-buft-source.py.
         auto plan = full_offload_plan();
         set_weight(plan, "token_embd.weight", GGML_TYPE_NVFP4, /*get_rows_only=*/true);
         expect_reason(cpu_work_reason(std::move(plan)), nullptr,
