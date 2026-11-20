@@ -8413,6 +8413,9 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     int     n_moe_layers        = 0;
     int     n_experts_per_layer = 0;
     int     n_experts_used      = 0;  // top-K from ids tensor
+    // Highest block number of an expert tensor + 1, for the routed-expert counts. The table is sized from the graph
+    // this init sees: a block the graph did not hold falls into out_of_range, which the summary line prints.
+    int     n_route_blocks      = 0;
     size_t  expert_weight_bytes = 0;
     // (D, K, N) over the nodes registered below, those whose src0 has storage: D = max top-K x tokens, K = max ne00,
     // N = max ne01, for n_embd and the secondary staging buffer. What the plan walk shares with it is the fold
@@ -8475,6 +8478,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             expert_weight_bytes = nb02;
         }
         n_moe_layers++;
+        n_route_blocks = std::max(n_route_blocks, ggml_sycl_tp_extract_layer_number(src0->name) + 1);
 
         // Register each expert's pointer + tensor info for eager upload.
         // IMPORTANT: the tensor storage pointer may be a device VRAM pointer (not CPU-accessible)
@@ -8593,6 +8597,12 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
 
     // Initialize warmup profiling for popularity-aware placement
     g_moe_warmup.init(n_moe_layers, n_experts_per_layer);
+
+    // A fresh routed-expert table for this model, sized from its own blocks and experts: the counts of an earlier
+    // model in this process stay with the records that were counting into them. This init runs again until it
+    // succeeds and after a model-owner switch, and each run installs a fresh table: a record built before the run
+    // keeps counting into the table it holds, which is no longer the one the report reads.
+    (void) ggml_sycl::moe_route_counts_install(device, n_route_blocks, n_experts_per_layer);
 
     // Initialize adaptive prestage background thread (if enabled via env var)
     g_adaptive_prestage.init();
@@ -85938,7 +85948,42 @@ struct moe_hybrid_decode_record {
     std::vector<ggml_sycl::mem_handle> lease;             // every expert's route lease
     sycl::event                        ready;             // one barrier over the leases' producer events
     bool                               has_ready = false;
+    // The routed-expert counts of this tensor's block: set on the block's counting tensor only (its gate tensor, or its
+    // fused gate/up tensor), so a (token, expert) pair counts once and not for each of gate, up and down. The record
+    // holds the table, so a job still running on the CPU pool when a later model installs its own table counts into
+    // the one it was built for.
+    int                                          route_block = -1;  // blk.N, -1 when this tensor does not count
+    std::shared_ptr<ggml_sycl::moe_route_counts> route_counts;
 };
+
+// The one tensor of a block whose op counts the routed experts: its gate tensor, or its fused gate/up tensor when the
+// pack stores the two as one (moe_classify_tensor knows only the separate names, and other code keys off it, so the
+// fused spelling is named here). Gate, up and down of a block route the same ids, so counting on one of them counts a
+// (token, expert) pair once per block.
+static bool ggml_sycl_moe_route_counts_tensor(const char * name) {
+    return name != nullptr &&
+           (moe_classify_tensor(name) == MOE_TENSOR_GATE || std::strstr(name, "ffn_gate_up_exps") != nullptr);
+}
+
+// Counts the experts a prompt op routed, from its host ids snapshot (the ids tensor's n_used ids per token),
+// into the model's table: the block's counting tensor's op only, as the hybrid decode route counts. A prompt op reads
+// its ids on this thread already, so this adds increments and no wait.
+static void ggml_sycl_moe_route_counts_add_prompt(int device, const ggml_tensor * src0, const int32_t * ids, size_t n) {
+    if (!src0 || !ggml_sycl_moe_route_counts_tensor(src0->name)) {
+        return;
+    }
+    const std::shared_ptr<ggml_sycl::moe_route_counts> table = ggml_sycl::moe_route_counts_current(device);
+    if (!table) {
+        return;
+    }
+    const int block = ggml_sycl_tp_extract_layer_number(src0->name);
+    if (block < 0) {
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        table->add_prompt(block, ids[i]);
+    }
+}
 
 static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_decode_record &     record,
                                                               std::vector<ggml_sycl::mem_handle> & out) {
@@ -86067,6 +86112,10 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     record->layer       = parse_layer_id_from_name(src0->name);
     record->cache_layer = moe_cache_layer_id(src0->name);
     record->all_host    = all_host;
+    if (ggml_sycl_moe_route_counts_tensor(src0->name)) {
+        record->route_block  = ggml_sycl_tp_extract_layer_number(src0->name);
+        record->route_counts = ggml_sycl::moe_route_counts_current(device);
+    }
     record->host_weight.assign(record->n_as, nullptr);
     record->lease.resize(record->n_as);
     std::vector<const void *> device_weight(record->n_as, nullptr);
@@ -86113,10 +86162,14 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
         }
         record->lease[e] = operand.lease();
     }
-    const bool any_host = std::find_if(record->host_weight.begin(), record->host_weight.end(),
-                                       [](const void * w) { return w != nullptr; }) != record->host_weight.end();
+    const size_t n_host   = static_cast<size_t>(std::count_if(record->host_weight.begin(), record->host_weight.end(),
+                                                              [](const void * w) { return w != nullptr; }));
+    const bool   any_host = n_host > 0;
     if ((!all_host && !substitute) || !any_host) {
         return refuse(any_host ? "no device expert pointer stands in for the host slots" : "no expert runs on the CPU");
+    }
+    if (record->route_counts) {
+        record->route_counts->set_block_resident(record->route_block, static_cast<int>(record->n_as - n_host));
     }
 
     sycl::queue & queue = *ctx.stream();
@@ -86140,9 +86193,7 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
         GGML_LOG_INFO(
             "[MOE-ROUTE] hybrid decode record tensor=%s device=%d all_host=%d layout=%s experts=%zu host=%zu\n",
-            src0->name, device, all_host ? 1 : 0, ggml_sycl_layout_mode_name(layout), record->n_as,
-            static_cast<size_t>(std::count_if(record->host_weight.begin(), record->host_weight.end(),
-                                              [](const void * w) { return w != nullptr; })));
+            src0->name, device, all_host ? 1 : 0, ggml_sycl_layout_mode_name(layout), record->n_as, n_host);
     }
     *out = std::move(record);
     return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE;
@@ -86498,6 +86549,18 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
         }
         if (predictor) {
             predictor->record_actual(seq_layer, std::vector<int>(ids_rows, ids_rows + n_ids));
+        }
+        // The routed experts of this block, counted on the gate op only and before moe_host_slots_from_ids below,
+        // which overwrites ids_rows with its flags. An id outside the record's experts is left for that call to
+        // abort on.
+        if (record->route_counts && record->route_block >= 0) {
+            for (int64_t k = 0; k < n_ids; ++k) {
+                const int32_t e = ids_rows[k];
+                if (e >= 0 && static_cast<size_t>(e) < record->n_as) {
+                    record->route_counts->add_decode(record->route_block, e,
+                                                     record->host_weight[static_cast<size_t>(e)] == nullptr);
+                }
+            }
         }
         std::vector<ggml_sycl::moe_host_slot> host_slots;
         host_slots.reserve(static_cast<size_t>(n_ids));
@@ -87040,6 +87103,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             ++g_mxfp4_pp_batched_profile.host_admit_snapshot_calls;
         }
 #endif
+        ggml_sycl_moe_route_counts_add_prompt(ctx.device, src0, prompt_ids_snapshot.data(), prompt_ids_snapshot.size());
         // The prompt stream (llama.cpp-xod7, llama.cpp-9433): weighs and decides this layer at its first op. The ring
         // stages only the executor's windows of a layer the executor claims, from the executor's phase loop
         // (moe_stream_phase::window_begin, llama.cpp-8epx). The payload release follows begin_layer, the one point in
@@ -100048,6 +100112,7 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
             auto & stats = ggml_sycl::get_moe_dispatch_stats(d);
             if (stats.total_experts_dispatched.load(std::memory_order_relaxed) > 0) {
                 stats.print_summary("FINAL");
+                ggml_sycl::moe_route_counts_report_final(d, stats.total_tokens.load(std::memory_order_relaxed));
             }
         }
     }
