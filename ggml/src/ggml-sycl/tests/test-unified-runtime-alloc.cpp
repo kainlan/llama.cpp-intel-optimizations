@@ -1641,6 +1641,49 @@ static bool independent_exact_token_defers_owned_release(sycl::queue & q) {
     return true;
 }
 
+// A cache whose arena is reserved by hand stores no ONEDNN zone plan (only ensure_planned_arena_zones() stores one), so
+// its zone is bounded by its capacity alone and a pair that fits the zone is served. The device's own cache, built by
+// the earlier cases, holds the plan its ensure stored, whose Graph floor can exceed this 8 MiB zone; judged by that
+// plan, as a plan stored per device judged it, the zone's pair bound came out 0 and every pair was refused. A note
+// says whether that plan was there to be misread, and so whether the run shows anything about where the plan lives.
+static bool hand_built_arena_is_judged_by_its_own_zone_plan(sycl::queue & q) {
+    TEST_BEGIN("hand_built_arena_is_judged_by_its_own_zone_plan");
+    constexpr size_t mib          = 1024ull * 1024ull;
+    const size_t     max_alloc    = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    unified_cache *  device_cache = get_unified_cache(q);
+    TEST_ASSERT(device_cache != nullptr, "no cache for the test device");
+    const zone_onednn_plan device_plan = device_cache->onednn_zone_plan_load();
+
+    unified_cache cache(q, 64ull * mib, 0, 0, 0);
+    if (cache.arena_active()) {
+        // The constructor's own ensure built the zones (a small GGML_SYCL_COMPUTE_ARENA_MB), so they carry its plan and
+        // none can be reserved by hand over them.
+        fprintf(stderr, "(the constructor built the arena; no hand-built zone) ");
+        TEST_PASS();
+        return true;
+    }
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        fprintf(stderr, "(arena reservation failed; no hand-built zone) ");
+        TEST_PASS();
+        return true;
+    }
+    const size_t zone = cache.zone_capacity(vram_zone_id::ONEDNN);
+    TEST_ASSERT(zone_onednn_plan_same(cache.onednn_zone_plan_load(), zone_onednn_plan()),
+                "a hand-built arena holds a zone plan nothing stored for it");
+    if (zone_onednn_pp_pair_bound(zone, device_plan.bare_bytes, device_plan.graph_floor_bytes) < 2ull * mib) {
+        fprintf(stderr, "(the device cache's plan, Graph floor %.1f MB, would bound this %.1f MB zone below the pair) ",
+                device_plan.graph_floor_bytes / (1024.0 * 1024.0), zone / (1024.0 * 1024.0));
+    } else {
+        fprintf(stderr,
+                "(the device cache's plan leaves this zone room for the pair; this run shows nothing about where "
+                "the plan lives) ");
+    }
+    TEST_ASSERT(cache.reserve_onednn_scratch(1ull * mib, 1ull * mib), "a pair fitting the hand-built zone was refused");
+    TEST_ASSERT(cache.shutdown_resources(), "arena shutdown did not release every self-owned allocation");
+    TEST_PASS();
+    return true;
+}
+
 static bool arena_owned_shutdown_and_lifecycle_serialization(sycl::queue & q) {
     TEST_BEGIN("arena_owned_shutdown_and_lifecycle_serialization");
     constexpr size_t mib = 1024ull * 1024ull;
@@ -2459,6 +2502,7 @@ int main(int argc, char ** argv) {
     ok &= host_zone_grow_serves_oversize_contiguous_alloc(q);
     ok &= host_zone_reset_trims_released_offload_pool_slots(q);
     ok &= independent_exact_token_defers_owned_release(q);
+    ok &= hand_built_arena_is_judged_by_its_own_zone_plan(q);
     ok &= arena_owned_shutdown_and_lifecycle_serialization(q);
     ok &= arena_shutdown_drains_dma_and_bcs(q);
     ok &= exact_scratch_shutdown_record_survives_for_retry(q);

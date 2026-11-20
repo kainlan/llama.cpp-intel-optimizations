@@ -887,62 +887,44 @@ static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_D
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_pair_weights_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_pair_activations_bytes[GGML_SYCL_MAX_DEVICES]{};
-// llama.cpp-8ony: the two figures the current ONEDNN zone was sized from -- the pair's own plan and the Graph SDPA
-// floor that shares the zone -- kept together as ONE snapshot, written by unified_cache::ensure_planned_arena_zones
-// when it keeps or builds the zone, and by onednn_zone_plan_put_back when a failed load's restore puts it back. The
-// planner's live figures are overwritten by every model's plan (and the pair's upward by reserve), and the SDPA shape
-// the floor derives from is rewritten by runtime plans the zone was not rebuilt for, so neither can describe a zone
-// that was built earlier: a draft model loaded beside the target would hand a bound derived from the draft's figures
-// to the target's zone.
-static std::mutex            g_onednn_zone_plan_mutex;
-static zone_onednn_plan      g_onednn_zone_plan[GGML_SYCL_MAX_DEVICES]{};
 
-static void onednn_zone_plan_store(int device_id, const zone_onednn_plan & plan) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
-    g_onednn_zone_plan[device_id] = plan;
+// The accessors of the plan an ONEDNN zone was sized from, which lives on the cache that owns the zone
+// (unified_cache::onednn_zone_plan_; its declaration says why it is kept and what a zone with none stored is bounded
+// by). Each takes onednn_zone_plan_mutex_ alone and calls only the pure rules of zone-sizing.hpp while it holds it.
+
+void unified_cache::onednn_zone_plan_store(const zone_onednn_plan & plan) {
+    std::lock_guard<std::mutex> lock(onednn_zone_plan_mutex_);
+    onednn_zone_plan_ = plan;
 }
 
-static zone_onednn_plan onednn_zone_plan_load(int device_id) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return zone_onednn_plan();
-    }
-    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
-    return g_onednn_zone_plan[device_id];
+zone_onednn_plan unified_cache::onednn_zone_plan_load() const {
+    std::lock_guard<std::mutex> lock(onednn_zone_plan_mutex_);
+    return onednn_zone_plan_;
 }
 
-// Keep the larger plan (zone_onednn_plan_keep) as the stored snapshot, in ONE critical section. A load, a keep and a
-// store taken separately would let two contexts planning on one device each read the same snapshot and the later store
-// drop the other's larger figure. Takes the mutex itself, so it must not call the accessors above.
-static void onednn_zone_plan_keep_and_store(int device_id, const zone_onednn_plan & plan) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
-    g_onednn_zone_plan[device_id] = zone_onednn_plan_keep(g_onednn_zone_plan[device_id], plan);
+// Keep the larger plan (zone_onednn_plan_keep) as the stored one, in ONE critical section. A load, a keep and a store
+// taken separately would let two contexts planning on one device each read the same plan and the later store drop the
+// other's larger figure. Takes the mutex itself, so it must not call the accessors above.
+void unified_cache::onednn_zone_plan_keep_and_store(const zone_onednn_plan & plan) {
+    std::lock_guard<std::mutex> lock(onednn_zone_plan_mutex_);
+    onednn_zone_plan_ = zone_onednn_plan_keep(onednn_zone_plan_, plan);
 }
 
 // Whether a rebuild that something live blocks is short of the oneDNN Graph floor alone
 // (zone_arena_shortfall_is_reservation_only, over the pair zone_onednn_plan_keep_short keeps room for), and when it is
-// and `store` is true, the keep: the snapshot becomes zone_onednn_plan_keep_short over the one held, the live plan, the
+// and `store` is true, the keep: the plan becomes zone_onednn_plan_keep_short over the one held, the live plan, the
 // ONEDNN zone's capacity and the pair held in it. One critical section, as in onednn_zone_plan_keep_and_store, so two
-// callers keeping on one device cannot each read the same snapshot and drop the other's figure. `kept` receives the
-// snapshot whether or not it is stored. Takes the mutex itself, so it must not call the accessors above.
-static bool onednn_zone_plan_keep_short_and_store(int                      device_id,
-                                                  const zone_onednn_plan & live,
-                                                  const zone_arena_sizes & have,
-                                                  const zone_arena_sizes & need,
-                                                  size_t                   held_pair_bytes,
-                                                  bool                     store,
-                                                  zone_onednn_plan *       kept) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
+// callers keeping on one cache cannot each read the same plan and drop the other's figure. `kept` receives the plan
+// whether or not it is stored. Takes the mutex itself, so it must not call the accessors above.
+bool unified_cache::onednn_zone_plan_keep_short_and_store(const zone_onednn_plan & live,
+                                                          const zone_arena_sizes & have,
+                                                          const zone_arena_sizes & need,
+                                                          size_t                   held_pair_bytes,
+                                                          bool                     store,
+                                                          zone_onednn_plan *       kept) {
+    std::lock_guard<std::mutex> lock(onednn_zone_plan_mutex_);
     const zone_onednn_plan      short_plan =
-        zone_onednn_plan_keep_short(g_onednn_zone_plan[device_id], live, have.onednn, held_pair_bytes);
+        zone_onednn_plan_keep_short(onednn_zone_plan_, live, have.onednn, held_pair_bytes);
     if (kept != nullptr) {
         *kept = short_plan;
     }
@@ -951,41 +933,47 @@ static bool onednn_zone_plan_keep_short_and_store(int                      devic
         return false;
     }
     if (store) {
-        g_onednn_zone_plan[device_id] = short_plan;
+        onednn_zone_plan_ = short_plan;
     }
     return true;
 }
 
-// A failed load's restore of the snapshot: while it still holds `written`, what the load left in it, it becomes
-// zone_onednn_plan_keep_short(prior, prior, ...) over the ONEDNN zone's capacity and the pair held in it now. That is
-// `prior` exactly while the zone still holds it, and a smaller Graph floor when the zone was rebuilt smaller or a pair
-// was reserved under the failed load's wider bound in between: `prior` stored raw would then describe a room the zone
-// does not have, or a bound below a pair already held. The test and the store are one critical section, as in
-// onednn_zone_plan_keep_and_store, because the oneDNN pair's reserve asks for the zones without the inventory lock the
-// restore holds. Takes the mutex itself, so it must not call the accessors above.
-static void onednn_zone_plan_put_back(int                      device_id,
-                                      const zone_onednn_plan & written,
-                                      const zone_onednn_plan & prior,
-                                      size_t                   capacity_bytes,
-                                      size_t                   held_pair_bytes) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return;
+// A failed load's restore of the plan: while it still holds `written`, what the load left in it, it becomes
+// zone_onednn_plan_keep_short(prior, prior, ...) over this cache's ONEDNN zone capacity and the pair held in it now.
+// That is `prior` exactly while the zone still holds it, and a smaller Graph floor when the zone was rebuilt smaller or
+// a pair was reserved under the failed load's wider bound in between: `prior` stored raw would then describe a room the
+// zone does not have, or a bound below a pair already held. The zone is read from this cache, so the plan is never
+// clamped to another cache's zone; both reads take no lock and come before the mutex, which stays a leaf. The test and
+// the store are one critical section, as in onednn_zone_plan_keep_and_store, because the oneDNN pair's reserve asks
+// for the zones without the inventory lock the restore holds. Takes the mutex itself, so it must not call the
+// accessors above.
+void unified_cache::onednn_zone_plan_put_back(const zone_onednn_plan & written, const zone_onednn_plan & prior) {
+    const size_t                capacity = zone_capacity(vram_zone_id::ONEDNN);
+    const size_t                held     = arena_held_onednn_pair_bytes();
+    std::lock_guard<std::mutex> lock(onednn_zone_plan_mutex_);
+    if (zone_onednn_plan_same(onednn_zone_plan_, written)) {
+        onednn_zone_plan_ = zone_onednn_plan_keep_short(prior, prior, capacity, held);
     }
-    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
-    if (zone_onednn_plan_same(g_onednn_zone_plan[device_id], written)) {
-        g_onednn_zone_plan[device_id] = zone_onednn_plan_keep_short(prior, prior, capacity_bytes, held_pair_bytes);
-    }
+}
+
+// The plan device_id's existing cache stored, for a reader that holds a device id and no cache: the published-terms
+// snapshot and a plan's Graph-floor line. The default plan while the device has no cache; none is created here. Locks,
+// one after the other and never both: g_cache_rw_mutex, shared, for the lookup, released; then that cache's
+// onednn_zone_plan_mutex_. Cache creation holds g_cache_rw_mutex exclusively while the constructor sizes its zones, so
+// the zone sizing never calls this: it reads and writes its own cache's plan through the members above.
+static zone_onednn_plan onednn_zone_plan_load_of_device(int device_id) {
+    const unified_cache * const cache = get_existing_unified_cache_for_device(device_id);
+    return cache != nullptr ? cache->onednn_zone_plan_load() : zone_onednn_plan();
 }
 
 #if GGML_SYCL_DNNL
 // What a line that prints the Graph floor the planned shape asks for (`formula_bytes`) adds when the ONEDNN zone's
-// stored snapshot on `device_id` holds less Graph room than that: the stored figure, so the line does not claim the
-// zone holds the formula floor. A zone kept short stores the room it holds beyond its pair
-// (zone_onednn_plan_keep_short). The snapshot is read as it stands when the line prints, which for a plan's floor line
-// can be before that load's zones are ensured (a multi-device plan sizes them after it plans). Empty while no snapshot
-// is stored, or when the stored floor is not below the formula's.
-static std::string onednn_zone_plan_short_text(int device_id, size_t formula_bytes) {
-    const zone_onednn_plan stored = onednn_zone_plan_load(device_id);
+// stored plan (`stored`) holds less Graph room than that: the stored figure, so the line does not claim the zone holds
+// the formula floor. A zone kept short stores the room it holds beyond its pair (zone_onednn_plan_keep_short). The
+// caller reads the plan as it stands when the line prints, which for a plan's floor line can be before that load's
+// zones are ensured (a multi-device plan sizes them after it plans). Empty while no plan is stored, or when the stored
+// floor is not below the formula's.
+static std::string onednn_zone_plan_short_text(const zone_onednn_plan & stored, size_t formula_bytes) {
     if (zone_onednn_plan_same(stored, zone_onednn_plan()) || stored.graph_floor_bytes >= formula_bytes) {
         return std::string();
     }
@@ -996,15 +984,12 @@ static std::string onednn_zone_plan_short_text(int device_id, size_t formula_byt
 }
 #endif
 
-// The most an op's f16 pair may be for the ONEDNN zone of capacity `capacity_bytes` on `device_id` to count it as
-// planned (zone_onednn_pp_pair_bound over the snapshot above). The one source for the admission accessor and for the
-// reserve's own merge and refusal, so the two cannot disagree about what the zone was planned to hold.
+// The most an op's f16 pair may be for the ONEDNN zone of capacity `capacity_bytes`, sized from `plan`, to count it as
+// planned (zone_onednn_pp_pair_bound). The one source for the admission accessor and for the reserve's own merge and
+// refusal, which all pass the plan stored on the cache whose zone they ask about, so they cannot disagree about what
+// the zone was planned to hold.
 static size_t onednn_pp_pair_bound_for(const zone_onednn_plan & plan, size_t capacity_bytes) {
     return zone_onednn_pp_pair_bound(capacity_bytes, plan.bare_bytes, plan.graph_floor_bytes);
-}
-
-static size_t onednn_pp_pair_bound_for(int device_id, size_t capacity_bytes) {
-    return onednn_pp_pair_bound_for(onednn_zone_plan_load(device_id), capacity_bytes);
 }
 // llama.cpp-479i: planned bytes of the per-context dense MMQ/MMVQ Q8_1 src1 buffer
 // (n_ubatch * bytes-per-token from the inventory, 256-aligned), folded into the
@@ -3808,7 +3793,7 @@ load_published_terms load_published_terms::snapshot(int device) {
     terms.onednn_weights        = g_planned_onednn_pair_weights_bytes[device].load(std::memory_order_acquire);
     terms.onednn_activations    = g_planned_onednn_pair_activations_bytes[device].load(std::memory_order_acquire);
     terms.onednn_stored         = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device);
-    terms.onednn_zone_plan      = onednn_zone_plan_load(device);
+    terms.onednn_zone_plan      = onednn_zone_plan_load_of_device(device);
     terms.planner               = planner_published_terms::snapshot(device);
     return terms;
 }
@@ -3943,11 +3928,12 @@ void load_published_record::restore(int device) const noexcept {
     }
     if (back & LOAD_PUBLISHED_GROUP_ZONE_PLAN) {
         // The zone the snapshot describes is read as it is now: a failed load does not shrink a zone it grew, and a
-        // pair reserved since under its bound stays where it is.
-        unified_cache * const cache    = get_existing_unified_cache_for_device(device);
-        const size_t          capacity = cache != nullptr ? cache->zone_capacity(vram_zone_id::ONEDNN) : 0;
-        const size_t          held     = cache != nullptr ? cache->arena_held_onednn_pair_bytes() : 0;
-        onednn_zone_plan_put_back(device, written.onednn_zone_plan, prior.onednn_zone_plan, capacity, held);
+        // pair reserved since under its bound stays where it is. The plan goes back on the cache the snapshot read it
+        // from; a device whose cache is gone has no zone and no plan to put back.
+        unified_cache * const cache = get_existing_unified_cache_for_device(device);
+        if (cache != nullptr) {
+            cache->onednn_zone_plan_put_back(written.onednn_zone_plan, prior.onednn_zone_plan);
+        }
     }
     if (back & LOAD_PUBLISHED_GROUP_MOE_MMVQ) {
         unified_cache_set_planned_moe_mmvq_scratch_bytes(device, prior.planner.moe_mmvq);
@@ -7996,7 +7982,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             // The zone is kept as it was built, so it stays described by the larger plan it was built from (its whole
             // pair, with the Graph floor's own maximum): a later, smaller plan (a draft model beside the target) must
             // not shrink it.
-            onednn_zone_plan_keep_and_store(dev_id, live_plan);
+            onednn_zone_plan_keep_and_store(live_plan);
             return true;
         }
         arena_zones = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN),
@@ -8052,7 +8038,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
 #if GGML_SYCL_DNNL
                 onednn_graph_direct_cap_snapshot_keep();
 #endif
-                onednn_zone_plan_keep_and_store(dev_id, live_plan);
+                onednn_zone_plan_keep_and_store(live_plan);
                 scratch_zone_kept_warn(dev_id, scratch_plan, scratch_kept);
                 return true;
             }
@@ -8066,8 +8052,8 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             const bool             defer_keep = options.ring_release_first && zone_arena_only_ring_holds(true, holders);
             const size_t           held_pair  = arena_held_onednn_pair_bytes();
             zone_onednn_plan       kept;
-            const bool reservation_only = onednn_zone_plan_keep_short_and_store(dev_id, live_plan, arena_zones, need,
-                                                                                held_pair, !defer_keep, &kept);
+            const bool             reservation_only =
+                onednn_zone_plan_keep_short_and_store(live_plan, arena_zones, need, held_pair, !defer_keep, &kept);
             if (reservation_only && !defer_keep) {
                 if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
                     bind_compute_arena();
@@ -8248,7 +8234,7 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
     // that is above or below the one held (see the "zones_sufficient" branch above for why it is a snapshot).
     onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
-    onednn_zone_plan_store(dev_id, live_plan);
+    onednn_zone_plan_store(live_plan);
     return true;
 }
 
@@ -16457,7 +16443,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
             zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
             zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0), formula_floor / (1024.0 * 1024.0),
             shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa, shape.n_ubatch, shape.n_ctx,
-            onednn_zone_plan_short_text(req.device, formula_floor).c_str());
+            onednn_zone_plan_short_text(onednn_zone_plan_load(), formula_floor).c_str());
         if (g_onednn_graph_scratch_test_suppress_abort.load(std::memory_order_acquire)) {
             // Test build only (see the hooks declared in unified-cache.hpp):
             // report "this would have aborted" instead of actually aborting,
@@ -24360,11 +24346,10 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         const size_t held_a   = onednn_activations_scratch_ ? onednn_activations_scratch_size_ : 0;
         // Bounded by the pair bound, not the raw capacity: two ops that each fit the bound can merge, per component,
         // into a pair above it, and a held pair above it eats the bytes reserved for the Graph SDPA scratch. The
-        // first reservation is the pair the zone was planned for, from the same stored snapshot as the bound: a
-        // pair that starts at the first op's size and grows stepwise needs the superseded block and the new one in
-        // the zone at once, which a zone sized for one pair plus the Graph floor cannot hold.
-        const int              bound_dev = ggml_sycl_get_device_id_from_queue(queue_);
-        const zone_onednn_plan zone_plan = arena_on ? onednn_zone_plan_load(bound_dev) : zone_onednn_plan();
+        // first reservation is the pair the zone was planned for, from the same plan as the bound, the one this cache
+        // stored for its own zone: a pair that starts at the first op's size and grows stepwise needs the superseded
+        // block and the new one in the zone at once, which a zone sized for one pair plus the Graph floor cannot hold.
+        const zone_onednn_plan zone_plan = arena_on ? onednn_zone_plan_load() : zone_onednn_plan();
         const size_t           pair_bound =
             arena_on ? onednn_pp_pair_bound_for(zone_plan, zone_capacity(vram_zone_id::ONEDNN)) : 0;
         zone_onednn_scratch_reserve_target(arena_on, pair_bound, held_w, held_a, zone_plan.weights_bytes,
@@ -24525,8 +24510,8 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         }
         // A pair above the bound fits the zone but is not planned into it: it would take the bytes reserved for the
         // Graph SDPA scratch. acquire_onednn_pp_scratch asks the same bound before it asks for a reserve, so only a
-        // caller that skipped that question gets here.
-        const size_t pair_bound_now = onednn_pp_pair_bound_for(ggml_sycl_get_device_id_from_queue(queue_), zone_cap);
+        // caller that skipped that question gets here. The bound is over this cache's own plan for this zone.
+        const size_t pair_bound_now = onednn_pp_pair_bound_for(onednn_zone_plan_load(), zone_cap);
         if (total_needed <= zone_cap && total_needed > pair_bound_now) {
             GGML_LOG_ERROR(
                 "[UNIFIED-CACHE] refusing oneDNN scratch request %.1f MB (weights %.1f MB + activations %.1f MB): "
@@ -25223,8 +25208,9 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
 }
 
 // llama.cpp-8ony: the most an op's f16 pair may be for the ONEDNN zone to count it as planned, from the zone the arena
-// was built with and the snapshot of the two figures it was sized from (the pair's own plan and the Graph SDPA floor,
-// stored by the zone sizing when it kept or built the zone; see onednn_pp_pair_bound_for). Capacity minus the floor is
+// was built with and the two figures it was sized from (the pair's own plan and the Graph SDPA floor, stored on the
+// same cache by its zone sizing when it kept or built the zone; see unified_cache::onednn_zone_plan_ for a zone with
+// none stored, and onednn_pp_pair_bound_for). Capacity minus the floor is
 // slack nobody else planned for, so a pair inside it cannot push the Graph SDPA scratch onto its DIRECT path (an
 // unplanned device allocation); a pair above it would. The bound never falls below the plan (a clamped zone holds the
 // plan), nor above the capacity. No figure is read live or recomputed here: both are overwritten by later plans the
@@ -25237,7 +25223,7 @@ bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound) {
         return false;
     }
     if (bound) {
-        *bound = onednn_pp_pair_bound_for(device_id, cache->zone_capacity(vram_zone_id::ONEDNN));
+        *bound = onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), cache->zone_capacity(vram_zone_id::ONEDNN));
     }
     return true;
 }
@@ -25250,7 +25236,7 @@ bool unified_cache_get_onednn_graph_room(int device_id, size_t * room) {
     if (room) {
         // One capacity read for both terms: the bound is computed for the capacity it is subtracted from.
         const size_t capacity = cache->zone_capacity(vram_zone_id::ONEDNN);
-        const size_t bound    = onednn_pp_pair_bound_for(device_id, capacity);
+        const size_t bound    = onednn_pp_pair_bound_for(cache->onednn_zone_plan_load(), capacity);
         *room                 = capacity > bound ? capacity - bound : 0;
     }
     return true;
@@ -36759,7 +36745,8 @@ static void populate_host_zone_sizing(placement_plan &                          
         // narrowing apply here" -- e.g. gemma4 should show n_head_ctx_max=0
         // n_head_swa_max=8 n_swa=512 (its real GGUF attention.sliding_window;
         // GPU-verified on the B50) and a 64 MiB floor, not 192 MB.
-        // The floor is the shape's; a zone stored short of it is named after the shape, as the snapshot stands now.
+        // The floor is the shape's; a zone stored short of it is named after the shape, from the plan the device's
+        // cache stores for its zone now.
         const size_t graph_floor = onednn_graph_scratch_zone_floor_bytes_swa(
             graph_shape.n_head_ctx_max, graph_shape.n_head_swa_max, graph_shape.n_swa, graph_shape.n_ubatch,
             graph_shape.n_ctx, unified_cache_onednn_graph_scratch_direct_cap_bytes(plan.device_id));
@@ -36767,7 +36754,8 @@ static void populate_host_zone_sizing(placement_plan &                          
             "[SYCL-PLAN] oneDNN Graph-scratch zone floor: %.1f MB (n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u "
             "n_ubatch=%u n_ctx=%u)%s\n",
             graph_floor / (1024.0 * 1024.0), graph_shape.n_head_ctx_max, graph_shape.n_head_swa_max, graph_shape.n_swa,
-            graph_shape.n_ubatch, graph_shape.n_ctx, onednn_zone_plan_short_text(plan.device_id, graph_floor).c_str());
+            graph_shape.n_ubatch, graph_shape.n_ctx,
+            onednn_zone_plan_short_text(onednn_zone_plan_load_of_device(plan.device_id), graph_floor).c_str());
     }
 #endif
 

@@ -3217,6 +3217,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-unified-cache-unpin-event PROPERTIES
         LABELS "sycl;cache;mem-handle"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        SKIP_RETURN_CODE 77
         TIMEOUT 600
     )
 
@@ -3497,6 +3498,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-zone-reset-live-refusal PROPERTIES
         LABELS "sycl;lease;bugfix"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        SKIP_RETURN_CODE 77
         TIMEOUT 300
     )
 
@@ -3519,6 +3521,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-compute-buffer-kv-zone PROPERTIES
         LABELS "sycl;mem-handle;bugfix"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        SKIP_RETURN_CODE 77
         TIMEOUT 300
     )
 
@@ -3542,6 +3545,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-optional-layout-yield PROPERTIES
         LABELS "sycl;cache;lease"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        SKIP_RETURN_CODE 77
         TIMEOUT 300
     )
 
@@ -3563,6 +3567,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-moe-stream-ring-room PROPERTIES
         LABELS "sycl;cache;moe"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        SKIP_RETURN_CODE 77
         TIMEOUT 300
     )
 
@@ -3640,9 +3645,10 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     #    benchmark card) when unset; the setenv only fires when nothing is set,
     #    so pinning level_zero:1 here defeats it. Same trap as
     #    test-unified-cache-bugs.
-    #  - It loads models (OOM-hazard family): RUN_SERIAL, never looped, and
-    #    LABELS avoid the residency/mem-handle/cache denylist substrings per
-    #    rule 2 so the -j 1 throttled sweep can see it. Exits 77 on no-device.
+    #  - It allocates weights through real device caches and backend buffers
+    #    (OOM-hazard family): RUN_SERIAL, never looped, and LABELS carry
+    #    "cache", so it runs by name or in the serial cache|mem-handle pass and
+    #    never in the throttled sweep. Exits 77 on no-device.
     add_executable(test-layout-cache test-layout-cache.cpp)
     target_link_libraries(test-layout-cache PRIVATE ggml-sycl-private-fixtures)
     target_include_directories(test-layout-cache PRIVATE
@@ -3654,7 +3660,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_link_options(test-layout-cache PRIVATE "-fsycl")
     add_test(NAME test-layout-cache COMMAND $<TARGET_FILE:test-layout-cache>)
     set_tests_properties(test-layout-cache PROPERTIES
-        LABELS "sycl;layout;model-load;gpu-serial"
+        LABELS "sycl;layout;cache;model-load;gpu-serial"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
@@ -4714,6 +4720,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for the tiered KV buffer owning the tensor extras its init_tensor makes for its own K and V tensors:
+# both base-tensor branches record the extra they make in the buffer's list, and the free releases that list before
+# the vmem pool and the layer owners go. Host-only, reads the sources as text; the device case is the extra-release
+# case of test-sycl-kv-view-extra-reuse. Same registration shape as the gate above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kv-owned-extras-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-owned-extras-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Source gate for keeping the zones when a rebuild something live blocks lacks only the oneDNN Graph floor, and for a
 # failed load's put-back of the zone plan; the pin's docstring lists every check. Host-only, reads the sources as text.
 # Same registration shape as the gate above.
@@ -4816,6 +4834,18 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-device-caches-exit-order-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-caches-exit-order-source.py
+        LABEL "sycl;python;source-assert;mutation;hostonly"
+        TIMEOUT 120)
+endif()
+
+# Source gate for tests that skip themselves without GGML_USE_SYCL: every target compiling one receives the define,
+# the skip exits 77, and every registration of it reads 77 as a skip. A target that missed the define compiled only
+# its skip stub, and a stub that returned 0 read as a pass. Host-only, reads CMake and source text; each check is
+# proven against its mutant.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-guarded-tests-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-guarded-tests-source.py
         LABEL "sycl;python;source-assert;mutation;hostonly"
         TIMEOUT 120)
 endif()

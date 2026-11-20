@@ -13339,8 +13339,10 @@ struct ggml_sycl_load_published_pass {
 // failed stage skips it and no catch handler is added for it. No caller of the abort holds the inventory lock: the
 // abort takes it itself, to reset the load's scratch state. Its setters are plain stores, but for the zone plan's: that
 // arm looks the device's cache up under the cache map's shared lock, released when the lookup returns, reads the zone's
-// capacity and held pair without a lock, and stores the plan under the zone-plan mutex. Both are taken after the two
-// locks above and held for that step alone.
+// capacity and held pair without a lock, and stores the plan on that cache under its zone-plan mutex. Both are taken
+// after the two locks above and held for that step alone. Every snapshot of the terms (the capture, both reads of a
+// pass, the restore's own) reads the zone plan the same way: the device's existing cache is looked up under the map's
+// shared lock, then its plan read under its zone-plan mutex, one after the other, after the entry's mutex.
 static void ggml_sycl_load_published_terms_restore(uint64_t txn) noexcept {
     std::lock_guard                        inventory(g_tensor_inventory_mutex);
     ggml_sycl_load_published_terms_saved & saved = ggml_sycl_load_published_terms_store();
@@ -50339,6 +50341,16 @@ struct tiered_kv_buffer_context {
     // key that stops recurring keeps its ~277 KB extra alive until buffer
     // teardown -- bounded, but the bound scales with n_stream.
     std::vector<kv_view_extra_entry> view_extras;
+
+    // The extras init_tensor made for this buffer's own K and V tensors (its vmem and per-layer remap branches), one
+    // record per extra it made and only those. The buffer owns them. Each one's data handle is, when the layer is an
+    // arena chunk sub-allocation, a chunk lease (site tensor_extra) on that chunk; otherwise a direct handle (a vmem,
+    // host-pinned or other non-arena layer). tiered_kv_buffer_free releases every record before the layer owners and
+    // the vmem pool go, so no handle outlives the bytes it views. A tensor's ->extra is a view of one of these, never
+    // the record. Nothing else releases them: every other path that can reach one of these tensors sets an extra only
+    // when the tensor has none, and every other holder takes its own retain_extra_gpu(). A view tensor's extra is kept
+    // in view_extras instead.
+    std::vector<ggml_tensor_extra_gpu *> owned_extras;
 };
 
 static bool tiered_kv_layer_is_arena_kv(const kv_layer_alloc & la) {
@@ -50362,6 +50374,27 @@ static void tiered_kv_buffer_release_view_extras(tiered_kv_buffer_context * ctx)
     ctx->view_extras.clear();
 }
 
+// The extra of one of this buffer's own K or V tensors. It is made and recorded only when the tensor has none, so an
+// init_tensor that runs again for the same tensor reuses the extra it already has and records nothing twice.
+static ggml_tensor_extra_gpu * tiered_kv_buffer_own_extra(tiered_kv_buffer_context * ctx, ggml_tensor * tensor) {
+    if (tensor->extra == nullptr) {
+        std::unique_ptr<ggml_tensor_extra_gpu> extra(new ggml_tensor_extra_gpu{});
+        ctx->owned_extras.push_back(extra.get());
+        tensor->extra = extra.release();
+    }
+    return static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+}
+
+// Releases the extras this buffer's init_tensor made for its own K and V tensors. Like the view extras above, it never
+// touches a tensor: the ggml_context that owns them may already be gone. Each tensor's ->extra dangles from here on,
+// and nothing reads it (llama's KV cache frees its buffer and then the context that holds the tensors).
+static void tiered_kv_buffer_release_owned_extras(tiered_kv_buffer_context * ctx) {
+    for (ggml_tensor_extra_gpu * extra : ctx->owned_extras) {
+        release_extra_gpu(extra);
+    }
+    ctx->owned_extras.clear();
+}
+
 static void tiered_kv_buffer_free(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<tiered_kv_buffer_context *>(buffer->context);
     ggml_sycl_set_device(ctx->device);
@@ -50371,6 +50404,9 @@ static void tiered_kv_buffer_free(ggml_backend_buffer_t buffer) {
     // used to be called once per exit) cannot change behavior, and a future
     // early return added above the vmem branch can no longer skip it.
     tiered_kv_buffer_release_view_extras(ctx);
+    // The base tensors' extras go here too, for the same two exits, and before the vmem pool is destroyed and the
+    // layer owners are cleared: each extra's data handle views a layer's bytes, so it drops before those bytes do.
+    tiered_kv_buffer_release_owned_extras(ctx);
 
     // P9: If vmem pool is active, destroy it (unmaps all physical pages + frees virtual range).
     // Per-layer allocs from vmem are sub-ranges of the virtual address space and must NOT
@@ -50555,10 +50591,7 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
     // P9: When vmem is active, alloc_base IS the vmem virtual range — tensor
     // data pointers are already correct.  Just set data_device for the fast path.
     if (ctx->vmem_pool && ctx->vmem_pool->active()) {
-        if (!tensor->extra) {
-            tensor->extra = new ggml_tensor_extra_gpu{};
-        }
-        auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+        auto * extra = tiered_kv_buffer_own_extra(ctx, tensor);
         extra->set_data_device(ctx->device, tensor->data);
         return GGML_STATUS_SUCCESS;
     }
@@ -50618,10 +50651,7 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
             // Set the smart handle for both device and host-pinned KV layers so
             // SET_ROWS and attention dispatch can route by actual residency.
             {
-                if (!tensor->extra) {
-                    tensor->extra = new ggml_tensor_extra_gpu{};
-                }
-                auto *    extra       = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+                auto *    extra       = tiered_kv_buffer_own_extra(ctx, tensor);
                 const int handle_slot = la.on_device && la.owner_device >= 0 ? la.owner_device : ctx->device;
                 extra->set_data_device(handle_slot, tensor->data, GGML_LAYOUT_AOS, la.on_device);
             }

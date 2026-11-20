@@ -9,6 +9,8 @@
 // 5. Indexed sampling (batched logits with arbitrary indices)
 // 6. Token retrieval
 
+#include "test-skip.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -568,6 +570,6 @@ int main() {
 #else
 int main() {
     printf("Multi-sequence sampler tests require SYCL build (-DGGML_USE_SYCL)\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #endif
