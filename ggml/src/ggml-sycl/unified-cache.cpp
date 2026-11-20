@@ -3925,6 +3925,9 @@ void load_published_terms::restore(int device, uint32_t groups) const noexcept {
             cache->onednn_zone_plan_store(onednn_zone_plan);
         }
     }
+    if (groups & LOAD_PUBLISHED_GROUP_MOE_MMVQ) {
+        unified_cache_set_planned_moe_mmvq_scratch_bytes(device, planner.moe_mmvq);
+    }
 }
 
 void load_published_record::note(const load_published_terms & before, const load_published_terms & after) {
@@ -3957,9 +3960,6 @@ void load_published_record::restore(int device) const noexcept {
         if (cache != nullptr) {
             cache->onednn_zone_plan_put_back(written.onednn_zone_plan, prior.onednn_zone_plan);
         }
-    }
-    if (back & LOAD_PUBLISHED_GROUP_MOE_MMVQ) {
-        unified_cache_set_planned_moe_mmvq_scratch_bytes(device, prior.planner.moe_mmvq);
     }
     // The sum goes back from what this load published to what it held before, in one compare-exchange: the pair's
     // reserve raises it outside the inventory lock, and a raise since this load published it is kept.

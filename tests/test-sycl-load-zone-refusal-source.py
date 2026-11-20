@@ -526,6 +526,14 @@ WRITES_THROUGH = {
     PAIR_SETTER: ("unified_cache_store_planned_onednn_pair_halves(", "unified_cache_set_planned_onednn_scratchpad_bytes("),
     "unified_cache_publish_planned_onednn_graph_scratch_shape": ("unified_cache_set_planned_onednn_graph_scratch_shape(",),
 }
+# A declared setter that only raises a member, as a live context's transaction does under the inventory lock after the
+# load that published it: it writes the store the member's own setter writes, and the terms' restore calls that setter.
+# A raise since the load published leaves the group differing from what the load wrote, so a failed load's record keeps
+# it, and the last release stores the default through the same setter.
+RAISES = {
+    "unified_cache_raise_planned_moe_mmvq_scratch_bytes": "unified_cache_set_planned_moe_mmvq_scratch_bytes",
+}
+STORE_RE = re.compile(r"\b(g_planned_\w+)\[device_id\]")
 
 
 def definition_body(text: str, name: str) -> str:
@@ -546,13 +554,24 @@ def classified_setters(uh: str, uc: str) -> tuple:
         body = definition_body(u, setter)
         if all(p in body and p in restore for p in parts):
             members.add(setter)
+    for raiser, setter in RAISES.items():
+        stores = set(STORE_RE.findall(definition_body(u, raiser)))
+        if stores and stores == set(STORE_RE.findall(definition_body(u, setter))) and setter + "(" in restore:
+            members.add(raiser)
     return declared, members, set(NOT_LOAD_PUBLISHED)
 
 
 def claim_every_planned_setter_is_a_member_or_excluded(uh: str, uc: str) -> bool:
     declared, members, excluded = classified_setters(uh, uc)
     return (len(declared) >= 18 and declared <= members | excluded and not members & excluded
-            and excluded <= declared and set(WRITES_THROUGH) <= members)
+            and excluded <= declared and set(WRITES_THROUGH) <= members and set(RAISES) <= members)
+
+
+def claim_the_record_stores_through_the_terms_alone(uc: str) -> bool:
+    """The record stores no term through a setter of its own: each group it puts back with a plain store goes through
+    the terms' restore, the one list of what a load publishes."""
+    record = fn_body(code(uc), RECORD_RESTORE_SIG)
+    return PRIOR_RESTORE in record and not DECLARED_SETTER_RE.search(record)
 
 
 # ---- the claims, and a witness per claim ----
@@ -763,7 +782,7 @@ def test_witness_terms_restore_stores_the_pair_and_not_its_halves():
 
 
 def test_witness_restore_drops_the_moe_mmvq_bound():
-    m = mutate_in(UC, RECORD_RESTORE_SIG, "unified_cache_set_planned_moe_mmvq_scratch_bytes(", "(void) (")
+    m = mutate_in(UC, TERMS_RESTORE_SIG, "unified_cache_set_planned_moe_mmvq_scratch_bytes(", "(void) (")
     assert not claim_failed_load_restores(GS, m)
 
 
@@ -842,8 +861,8 @@ def test_witness_restore_puts_back_the_ring_unguarded():
 
 
 def test_witness_restore_puts_back_the_moe_mmvq_bound_unguarded():
-    m = mutate_in(UC, RECORD_RESTORE_SIG, "if (back & LOAD_PUBLISHED_GROUP_MOE_MMVQ) {", "{")
-    assert not claim_restore_keeps_a_later_publish(GS, m)
+    m = mutate_in(UC, TERMS_RESTORE_SIG, "if (groups & LOAD_PUBLISHED_GROUP_MOE_MMVQ) {", "{")
+    assert not claim_every_group_has_its_arms(UH, m)
 
 
 def test_witness_restore_stores_the_sum_plainly():
@@ -875,14 +894,14 @@ def test_every_group_has_its_arms():
 
 
 def test_witness_enum_gains_a_group_with_no_arms():
-    m = code(UH).replace("LOAD_PUBLISHED_GROUP_ALL = (1u << 10) - 1,",
-                         "LOAD_PUBLISHED_GROUP_MMVQ = 1u << 10, LOAD_PUBLISHED_GROUP_ALL = (1u << 11) - 1,", 1)
+    m = code(UH).replace("LOAD_PUBLISHED_GROUP_ALL = (1u << 11) - 1,",
+                         "LOAD_PUBLISHED_GROUP_LATER = 1u << 11, LOAD_PUBLISHED_GROUP_ALL = (1u << 12) - 1,", 1)
     assert m != code(UH)
     assert not claim_every_group_has_its_arms(m, UC)
 
 
 def test_witness_all_misses_a_group():
-    m = code(UH).replace("LOAD_PUBLISHED_GROUP_ALL = (1u << 10) - 1,", "LOAD_PUBLISHED_GROUP_ALL = (1u << 9) - 1,", 1)
+    m = code(UH).replace("LOAD_PUBLISHED_GROUP_ALL = (1u << 11) - 1,", "LOAD_PUBLISHED_GROUP_ALL = (1u << 10) - 1,", 1)
     assert m != code(UH)
     assert not claim_every_group_has_its_arms(m, UC)
 
@@ -910,7 +929,7 @@ def test_every_member_is_read_written_and_compared():
 
 
 def test_witness_struct_gains_a_member_no_one_reads():
-    m = code(UH).replace("size_t onednn_stored = 0;", "size_t onednn_stored = 0; size_t moe_mmvq = 0;", 1)
+    m = code(UH).replace("size_t onednn_stored = 0;", "size_t onednn_stored = 0; size_t later_term = 0;", 1)
     assert m != code(UH)
     assert not claim_every_member_is_read_written_and_compared(m, UC)
 
@@ -938,14 +957,39 @@ def test_every_planned_setter_is_a_member_or_excluded():
         f"stale exclusions {sorted(excluded - declared)}")
 
 
-def test_witness_an_mmvq_setter_outside_the_struct():
-    decl = ("void unified_cache_set_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes); "
-            "void unified_cache_raise_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes); "
-            "size_t unified_cache_get_planned_moe_mmvq_scratch_bytes(int device_id);")
+def test_witness_a_setter_outside_the_struct():
+    decl = ("void unified_cache_set_planned_later_scratch_bytes(int device_id, size_t bytes); "
+            "size_t unified_cache_get_planned_later_scratch_bytes(int device_id);")
     anchor = "size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);"
     m = code(UH).replace(anchor, anchor + " " + decl, 1)
     assert m != code(UH)
     assert not claim_every_planned_setter_is_a_member_or_excluded(m, UC)
+
+
+def test_witness_restore_stops_storing_the_moe_mmvq_bound():
+    # The bound's setter and its raise both leave the members: the raise is one only through the setter the restore
+    # calls.
+    m = mutate_in(UC, TERMS_RESTORE_SIG, "unified_cache_set_planned_moe_mmvq_scratch_bytes(", "(void) (")
+    assert not claim_every_planned_setter_is_a_member_or_excluded(UH, m)
+
+
+def test_witness_raise_writes_another_store():
+    m = mutate_in(UC, "size_t unified_cache_raise_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes)",
+                  "g_planned_moe_mmvq_scratch_bytes[device_id]", "g_planned_moe_host_scatter_bytes[device_id]")
+    assert not claim_every_planned_setter_is_a_member_or_excluded(UH, m)
+
+
+def test_the_record_stores_through_the_terms_alone():
+    assert claim_the_record_stores_through_the_terms_alone(UC), (
+        "load_published_record::restore stores a term through a setter of its own: each group it puts back with a "
+        "plain store must go through load_published_terms::restore, the one list of what a load publishes")
+
+
+def test_witness_record_restores_the_moe_mmvq_bound_itself():
+    arm = ("if (back & LOAD_PUBLISHED_GROUP_MOE_MMVQ) { "
+           "unified_cache_set_planned_moe_mmvq_scratch_bytes(device, prior.planner.moe_mmvq); }")
+    m = mutate_in(UC, RECORD_RESTORE_SIG, PRIOR_RESTORE, PRIOR_RESTORE + " " + arm)
+    assert not claim_the_record_stores_through_the_terms_alone(m)
 
 
 def test_witness_exclusion_names_a_setter_that_is_gone():

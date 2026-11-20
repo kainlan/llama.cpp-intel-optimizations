@@ -2762,6 +2762,7 @@ static bool fresh_published_terms_are_the_default(int device) {
     unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
     unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ mib, true });
     unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 8192);
+    unified_cache_set_planned_moe_mmvq_scratch_bytes(device, 16 * mib);
     const uint32_t published = load_published_terms::snapshot(device).differing(start);
     start.restore(device);
     const uint32_t restored = load_published_terms::snapshot(device).differing(start);
