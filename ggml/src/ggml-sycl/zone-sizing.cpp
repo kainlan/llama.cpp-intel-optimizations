@@ -712,6 +712,18 @@ size_t zone_arena_tail_chunk_bytes(size_t alloc_bytes,
     return std::min({ wanted, per_chunk_cap, alloc_bytes });
 }
 
+bool zone_arena_tail_bytes(std::initializer_list<size_t> zones, size_t * out) {
+    size_t sum = 0;
+    for (const size_t zone : zones) {
+        if (zone > SIZE_MAX - sum) {
+            return false;
+        }
+        sum += zone;
+    }
+    *out = sum;
+    return true;
+}
+
 bool zone_arena_chunk_holds_tail(size_t chunk_bytes, size_t tail_bytes) {
     return tail_bytes <= SIZE_MAX - k_zone_arena_min_shared_bytes &&
            chunk_bytes >= tail_bytes + k_zone_arena_min_shared_bytes;
@@ -749,11 +761,7 @@ bool zone_arena_n_chunk_accepts(const zone_arena_reserve_shape & shape, size_t t
 // the zone's rounding or the sum wraps: no zone the reserve could carve.
 static bool zone_arena_scratch_tail(size_t other_tail_bytes, size_t scratch_bytes, size_t * tail) {
     const size_t scratch = zone_arena_zone_bytes(scratch_bytes);
-    if (scratch < scratch_bytes || other_tail_bytes > SIZE_MAX - scratch) {
-        return false;
-    }
-    *tail = other_tail_bytes + scratch;
-    return true;
+    return scratch >= scratch_bytes && zone_arena_tail_bytes({ other_tail_bytes, scratch }, tail);
 }
 
 bool zone_arena_scratch_accepts(const zone_arena_reserve_shape & shape, size_t other_tail_bytes, size_t scratch_bytes) {

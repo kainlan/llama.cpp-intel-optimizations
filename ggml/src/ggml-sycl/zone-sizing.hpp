@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -314,7 +315,7 @@ bool zone_moe_mmvq_scratch_bytes(const std::vector<zone_moe_mmvq_operand> & ops,
 //     and the graph compute returns GGML_STATUS_FAILED; test-moe-q1-nvfp4-dispatch-refusal holds it to that.
 //   - Every other type the dispatch admits (moe-mmvq-tables.hpp) takes another route: the planner route's per-entry
 //     dispatch, or the route the batched one was tried ahead of (decode-direct, hybrid decode, MXFP4 grouped down,
-//     legacy and planned PP).
+//     planned PP).
 // The zone is planned for the whole bound where it can be, under two limits, for every type alike:
 //   - `budget_cap_bytes`, the quarter of the available budget the non-FA raise is clamped to, keeps the bound from
 //     starving the WEIGHT zone;
@@ -325,7 +326,9 @@ bool zone_moe_mmvq_scratch_bytes(const std::vector<zone_moe_mmvq_operand> & ops,
 // Qwen3.6-35B-A3B NVFP4 vehicle at 2048 rows the zone's use line measured a high-water of 9.06 MB (one op's two
 // buffers live) in a 727.5 MB zone. A load refused for a bound the arena cannot hold would refuse a model that runs.
 // A clamped zone still holds the quarter or the room, and only a true miss beyond it on a card with no room outside
-// the arena costs anything: late, by name, and for a type with no fallback a failed compute, never an abort.
+// the arena costs anything: the dispatch refuses the buffer late and by name, a refusal that never aborts and that
+// for a type with no fallback is a failed compute. The route an op of another type falls to then makes its own
+// allocations.
 // SIZE_MAX for either limit is no limit, for a caller with no budget or no reserve to answer to. `clamp` names the
 // limit that held the zone below the bound. A zone that live allocations keep below the bound misses the same way, so
 // it is kept rather than refused. Pure.
@@ -686,6 +689,12 @@ bool zone_arena_single_chunk_tried(size_t alloc_bytes, size_t max_alloc_size, si
 // The KV share an N-chunk arena's tail chunk keeps beside the tail: a 128th of the arena, at least the least shared
 // zone, held between 128 and 512 MiB.
 size_t zone_arena_tail_kv_reserve(size_t alloc_bytes);
+
+// The tail into *out: the sum of `zones`, the ONEDNN, RUNTIME and SCRATCH zones as the reserve rounds them, given one
+// by one or with some already summed. False, with *out untouched, when the sum wraps, a tail no chunk holds:
+// arena_reserve refuses that tail before any check reads it, and zone_arena_scratch_room and
+// zone_arena_scratch_accepts sum the tails they test the same way.
+bool zone_arena_tail_bytes(std::initializer_list<size_t> zones, size_t * out);
 
 // The N-chunk arena's tail chunk: the tail and its KV share, no larger than the per-chunk cap or the arena.
 // Saturating.

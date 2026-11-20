@@ -3648,6 +3648,7 @@ int main() {
         using ggml_sycl::zone_arena_scratch_room;
         using ggml_sycl::zone_arena_single_chunk_accepts;
         using ggml_sycl::zone_arena_single_chunk_tried;
+        using ggml_sycl::zone_arena_tail_bytes;
         using ggml_sycl::zone_arena_tail_chunk_bytes;
         using ggml_sycl::zone_arena_tail_kv_reserve;
         using ggml_sycl::zone_arena_weight_chunks_fit;
@@ -3675,6 +3676,22 @@ int main() {
         CHECK(zone_arena_tail_kv_reserve(1 * GiB) == 128 * MiB, "a small arena's KV share is not 128 MiB");
         CHECK(zone_arena_tail_kv_reserve(32 * GiB) == 256 * MiB, "a 32 GiB arena's KV share is not a 128th");
         CHECK(zone_arena_tail_kv_reserve(128 * GiB) == 512 * MiB, "a large arena's KV share is not 512 MiB");
+
+        // The tail's sum refuses a wrap at either add and holds a sum of exactly SIZE_MAX, leaving *out alone when it
+        // refuses.
+        size_t tail_sum = 7;
+        CHECK(zone_arena_tail_bytes({ 256, 512, 1024 }, &tail_sum) && tail_sum == 1792,
+              "the tail is not its zones' sum");
+        tail_sum = 7;
+        CHECK(!zone_arena_tail_bytes({ SIZE_MAX, 1, 0 }, &tail_sum) && tail_sum == 7,
+              "a wrap on the first add was a tail");
+        CHECK(!zone_arena_tail_bytes({ SIZE_MAX - 1, 1, 1 }, &tail_sum) && tail_sum == 7,
+              "a wrap on the second add was a tail");
+        CHECK(zone_arena_tail_bytes({ SIZE_MAX - 2, 1, 1 }, &tail_sum) && tail_sum == SIZE_MAX,
+              "a tail of exactly SIZE_MAX was refused");
+        CHECK(zone_arena_tail_bytes({ SIZE_MAX - 256, 256 }, &tail_sum) && tail_sum == SIZE_MAX &&
+                  !zone_arena_tail_bytes({ SIZE_MAX - 255, 256 }, &tail_sum),
+              "a two-zone tail did not refuse exactly at the wrap");
         CHECK(zone_arena_tail_chunk_bytes(12 * GiB, 1459 * MiB, 1280 * MiB, 128 * MiB) == 1408 * MiB,
               "the tail chunk is not the tail and its KV share");
         CHECK(zone_arena_tail_chunk_bytes(12 * GiB, 1459 * MiB, 1400 * MiB, 128 * MiB) == 1459 * MiB,
