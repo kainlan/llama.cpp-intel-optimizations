@@ -2547,12 +2547,13 @@ This is the trap most likely to waste a future change:
 - `plan.onednn_scratchpad_bytes`, set in `populate_host_zone_sizing`, is the
   plan-level figure and the one the `[SYCL-PLAN]` line reports. **It does not
   size the VRAM ONEDNN zone.**
-- `g_tensor_inventory_onednn_scratchpad_bytes`, set in
-  `populate_inventory_globals` (`ggml/src/ggml-sycl/ggml-sycl.cpp`), is what
-  actually sizes it: it flows through
-  `unified_cache_set_planned_onednn_scratchpad_bytes` into
-  `g_planned_onednn_scratchpad_bytes[device]`, which `ensure_planned_arena_zones`
-  reads when it lays out the arena.
+- The pair published in `populate_inventory_globals`
+  (`ggml/src/ggml-sycl/ggml-sycl.cpp`) is what actually sizes it:
+  `unified_cache_set_planned_onednn_scratchpad_pair` stores the two halves
+  and writes their sum into `g_planned_onednn_scratchpad_bytes[device]`, which
+  `ensure_planned_arena_zones` reads when it lays out the arena. The global
+  `g_tensor_inventory_onednn_scratchpad_bytes` beside it holds the same sum
+  for the `[SYCL-PLAN] inventory oneDNN scratchpad` log line only.
 
 Both narrow through the same `unified_cache_adapt_zone_inventory` +
 `zone_scoped_maxima` pair, and both take the pair from ONE definition,
@@ -4192,11 +4193,19 @@ recovery path: it measures the driver's working set and sizes the headroom from 
      already takes when the load is told the context, so the pair is planned at
      it before the entry ensure and a re-publish would write the same value.
      A context that later runs a wider micro-batch than the load planned cannot
-     grow the zone, with two outcomes. An op whose own pair exceeds the pair
-     bound is refused at acquire and draws the dequant buffers. An op whose own
-     pair fits the bound, but whose merge with the planned weights half does
-     not, is reserved as asked and replaces the held pair
-     (`zone_onednn_scratch_reserve_target`).
+     grow the zone. An op whose own pair exceeds the pair bound is refused at
+     acquire and draws the dequant buffers. An op whose own pair fits is
+     reserved (`zone_onednn_scratch_reserve_target`) at the first of three
+     targets that fits the bound:
+     1. the per-component maximum of the planned, held and requested pairs
+        (the zone has slack above the plan);
+     2. else the per-component maximum of the held and requested pairs;
+     3. else the request as asked.
+
+     The first two never shrink a half, so a later op the new pair covers
+     reuses it. The third replaces the held pair with the request, which can
+     shrink the other half, so a later op that asks for more of that half
+     replaces it again.
 
    Until 2026-11-20 this half was `onednn_eligible`, the largest eligible weight
    *as stored*: a placeholder with no relation to a micro-batch. It covered

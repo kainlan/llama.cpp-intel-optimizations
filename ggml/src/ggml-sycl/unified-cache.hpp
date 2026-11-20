@@ -2986,9 +2986,8 @@ zone_onednn_pp_pair unified_cache_plan_onednn_pp_pair(const path_scoped_maxima &
 // The KQV call's staged operand is kq_soft_max, shaped
 // [n_kv, n_ubatch, n_head] -- at long context this dominates the KQ call's
 // staged Q operand ([head_dim, n_ubatch, n_head]), so the formula keeps only
-// this term, the same simplification the oneDNN activations-half placeholder
-// documented in docs/backend/sycl-memory-design.md's "Known limits" already
-// accepts. n_ctx stands in for n_kv the same way the oneDNN floor above uses
+// this term, accepting an under-count at a short context, where the Q operand
+// can be the larger and both are small. n_ctx stands in for n_kv the same way the oneDNN floor above uses
 // it for ne11: the planned/runtime context length is the worst-case n_kv a
 // layer's attention will ever see, and it is what every call site has on
 // hand. All-zero means "never planned for this device".

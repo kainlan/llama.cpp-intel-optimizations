@@ -17751,11 +17751,9 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         g_tensor_inventory_total_size += info.size;
         max_tensor_bytes = std::max(max_tensor_bytes, info.size);
     }
-    // This — not plan.onednn_scratchpad_bytes — is what actually sizes the VRAM
-    // ONEDNN zone: it lands in g_planned_onednn_scratchpad_bytes[device] and is
-    // read back by ensure_planned_arena_zones. So it must be narrowed by the
-    // same structural classifier the plan uses, or the zone keeps paying for the
-    // vocabulary embedding / LM head, which no oneDNN matmul reorder ever sees.
+    // The maxima go through the same structural classifier the plan uses, or the
+    // zone keeps paying for the vocabulary embedding / LM head, which no oneDNN
+    // matmul reorder ever sees.
     // g_tensor_inventory_detail carries type and ne under the same validity
     // condition zone-sizing's has_shape() tests, so the classifier applies to it
     // directly.
