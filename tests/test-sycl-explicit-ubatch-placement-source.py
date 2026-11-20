@@ -47,7 +47,8 @@ What this gate pins:
   of a process never prints it;
 - the RUNTIME zone is one reservation: the arena's reserve, the zone the cache plans, the explicit micro-batch's room,
   the check for a grown zone and its WARN all ask zone_runtime_reserved_bytes() (the larger of the floor and the
-  requirement, rounded up to the arena's 256-byte grain, checked), so none of them can round apart from the others;
+  requirement, rounded up to the arena's 256-byte grain, checked), so none of them can round apart from the others,
+  and the SCRATCH zone's room counts the RUNTIME zone in its tail through the same helper, as the reserve rounds it;
   the cache asserts that grain is the zone allocator's block grain, so the two spellings cannot drift.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
@@ -294,6 +295,8 @@ ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal
               "const zone_arena_ensure_options & options)")
 ENSURE_CALL = ("if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch) || "
                "!zone_runtime_reserved_bytes(runtime_floor, planned_runtime_scratch, &runtime_zone)) {")
+# The RUNTIME zone as arena_reserve rounds it (no floor), in the tail the SCRATCH zone's room is computed beside.
+ENSURE_ROOM_CALL = "if (zone_runtime_reserved_bytes(0, runtime_zone, &scratch_other_tail) &&"
 ROOM_ZONE_SIG = "static bool pp_moe_onednn_runtime_zone_bytes(const pp_moe_onednn_explicit_ubatch_inputs & in,"
 ROOM_ZONE_CALL = ("return zone_runtime_reserved_bytes(in.runtime_floor_bytes, "
                   "in.runtime_fixed_bytes + dense_bytes + ring_bytes, out);")
@@ -543,9 +546,10 @@ def claim_runtime_zone_is_one_reservation(zone_hpp: str, zone_cpp: str, cache_cp
                                           sycl_cpp: str) -> bool:
     """The RUNTIME zone is reserved, planned, planned against and compared through one checked helper: the arena's
     reserve, the zone ensure_planned_arena_zones() plans, the explicit micro-batch's room, the grown-zone rule and its
-    WARN each call zone_runtime_reserved_bytes(), and none of them rounds the zone itself. The helper takes the larger
-    of the floor and the requirement and rounds it up to the arena's named grain with the addition checked, and the
-    cache asserts the grain is the zone allocator's block grain."""
+    WARN each call zone_runtime_reserved_bytes(), and none of them rounds the zone itself. The ensure asks it a second
+    time, for the RUNTIME zone as the reserve rounds it, which the SCRATCH zone's room counts in the tail. The helper
+    takes the larger of the floor and the requirement and rounds it up to the arena's named grain with the addition
+    checked, and the cache asserts the grain is the zone allocator's block grain."""
     hpp = norm(zone_hpp)
     cache = norm(cache_cpp)
     reserve = body(cache, ARENA_RESERVE_SIG)
@@ -553,10 +557,11 @@ def claim_runtime_zone_is_one_reservation(zone_hpp: str, zone_cpp: str, cache_cp
     room = body(norm(admission_cpp), ROOM_ZONE_SIG)
     rule = body(norm(zone_cpp), KEPT_RULE_SIG)
     kept = body(norm(sycl_cpp), KEPT_SIG)
-    sites = (reserve, ensure, room, rule, kept)
+    sites = (reserve, room, rule, kept)
     return (ARENA_ALIGNMENT in hpp and cache.count(ARENA_GRAIN_ASSERT) == 1
             and RESERVED_RULE in body(hpp, RESERVED_SIG)
             and all(site.count("zone_runtime_reserved_bytes(") == 1 for site in sites)
+            and ensure.count("zone_runtime_reserved_bytes(") == 2 and ENSURE_ROOM_CALL in ensure
             and ARENA_RESERVE_CALL in reserve and "runtime_bytes = (runtime_bytes +" not in reserve
             and ENSURE_CALL in ensure and "runtime_zone = planned_runtime_scratch;" not in ensure
             and ROOM_ZONE_CALL in room and "align" not in room
@@ -1176,6 +1181,12 @@ def test_mutant_ensure_plans_the_unrounded_requirement_fails():
     inlined = ("if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch)) {")
     assert not claim_runtime_zone_is_one_reservation(
         ZONE_HPP, ZONE_CPP, _once(CACHE_CPP, ENSURE_CALL, inlined), ADMISSION_CPP, SYCL_CPP)
+
+
+def test_mutant_scratch_room_rounds_the_runtime_zone_itself_fails():
+    inlined = "if ((scratch_other_tail = (runtime_zone + 255) & ~size_t(255), true) &&"
+    assert not claim_runtime_zone_is_one_reservation(
+        ZONE_HPP, ZONE_CPP, _once(CACHE_CPP, ENSURE_ROOM_CALL, inlined), ADMISSION_CPP, SYCL_CPP)
 
 
 def test_mutant_room_rounds_the_zone_itself_fails():
