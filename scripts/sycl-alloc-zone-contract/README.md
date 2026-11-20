@@ -158,10 +158,10 @@ pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause
   design appendix at master `2c4f5e45d`, because the appendix is not in the repository. The design in force is rev 4.19z, whose
   appendix header still reads 4.16; the file's `_doc` therefore says 4.16, and the generator run against the rev 4.19z design
   reproduces the committed file byte for byte. Its input is that design, not the tree, so the file is a record of the
-  census at `2c4f5e45d` and does not follow later code: the `site` and `function` columns describe that master, and a row
-  may name a function the tree has since removed (row 43, `arena_device_alloc`; row 126,
-  `unified_cache::reserve_reorder_temp`). Clause (m) judges a row by its zone, code and term, and names the function only
-  in its messages; such a row stays until the design's table changes. Regenerate it, never hand-edit it (the generator
+  census at `2c4f5e45d` and does not follow later code: the `site` and `function` columns describe that master, and a
+  row may name a function the tree has since removed (row 43, `arena_device_alloc`; row 126,
+  `unified_cache::reserve_reorder_temp`). Clause (m) judges a row by its zone, code and term, and names the function
+  only in its messages; such a row stays until the design's table changes. Regenerate it, never hand-edit it (the generator
   reads the `row`, `site`, `function`, `zone`, `code`, `core` and `term` columns of the table whose header starts
   `| # | site (master`):
   `python3 scripts/sycl-alloc-zone-contract/gen-appendix-rows.py --design <design.md> --master 2c4f5e45d --rev 4.16`. A missing or
