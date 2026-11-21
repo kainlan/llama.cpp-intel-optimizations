@@ -1657,3 +1657,37 @@ written. See the 2026-07-25 comment on `llama.cpp-po3nd.2`. Re-read the gate fro
 Active regression-hunt state (commit deltas, suspect changes) lives in the
 codescout task tracker. Find it with `task_search` (pass `semantic=false` — the
 semantic path times out on this store); there is no single standing task id.
+
+## 2026-11-21 upstream sync (19bc41dbb): first measurements and one open regression
+
+Tree `278a6e4a3` (merge of ggml-org/master `19bc41dbb` into `a450d2c81`), driver 26.44, `llama-bench -fa 1 -v`, one
+model load per command, pinned selector, under `GPU.lock`. Another session ran about 32 compiler processes during the
+runs, so absolute figures carry the "builders" invalid bit; the B70 and B50 Mistral prompt-processing figures still sit
+at or above the table above. Mistral gate and GPT-OSS gate pass on both cards (`scripts/sycl-canonical-gates.sh`).
+
+| model | card | pp512 | pp2048 (ub 2048) | tg128 |
+|---|---|---:|---:|---:|
+| Mistral 7B Q4_0 | B70 | 3228.8 ± 26.8 | 4228.8 ± 8.5 | 109.2 ± 0.9 (`-p 0 -r 8`); 92.3 ± 7.7 in the mixed run |
+| Mistral 7B Q4_0 | B50 | 1329.0 ± 3.5 | 1636.7 ± 2.3 | 44.1 ± 1.7 |
+| GPT-OSS 20B MXFP4 | B70 | 1628.9 ± 36.8 | 1180.9 ± 146.2 | 36.4 ± 3.8 (mixed run); 51.2 ± 1.2 (`-p 0`, tiny context, not comparable) |
+| GPT-OSS 20B MXFP4 | B50 | 552, 497, 448 at **ub 256** | context refused | **no row: the tg128 context is refused** |
+
+**B50 GPT-OSS (open).** Paired ABBA against `a450d2c81` (pre-merge, own worktree, `-p 512 -n 128 -r 3`):
+
+| arm | n_ubatch chosen | pp512 | tg128 | worst case at ub 512 | compute probe at n_ctx 131072 |
+|---|---:|---:|---:|---:|---:|
+| pre-merge, run 1 / 2 | 256 | 455.7 ± 110.7 / 423.0 ± 208.2 | 34.8 ± 0.4 / 34.6 ± 0.3 | 1445.1 MB | 404.0 MiB |
+| merged, run 1 / 2 | 256 | 552.0 ± 5.2 / 424.9 ± 219.5 | none (refused) | 1522.8 MB | 543.3 MiB |
+
+- The drop from `n_ubatch` 512 to 256 on this card is **not** from the merge: the pre-merge fork does it too (the card
+  has about 1.6 GB free for compute after the planned zones). The B50 GPT-OSS figures near 870 pp512 above were measured
+  at ub 512 on an earlier tree and no longer describe HEAD.
+- What the merge adds: the load-time compute probe (`stage=probe`, n_ctx 131072, ub 512, same graph shape, 93 splits)
+  measures 543.3 MiB on SYCL0 instead of 404.0 MiB (+139.3 MiB); the real context grows 5.62 MiB on SYCL0 and on the
+  host (one F32 `[2880, 512]` tensor each). The RUNTIME zone rises 1919 -> 2059 MB, the weight zone shrinks, and 8 MoE
+  expert layers (100.9 MB) are placed on the host that were all on the device before. At ub 128 the context then needs
+  1198.9 MB with 167.7 MB free, under the 256 MB driver headroom, and creation fails (the pre-merge tree creates it and
+  decodes at 34.7 t/s).
+- Not the cause: `LLAMA_KV_ROWS_DISABLE=1` and `LLAMA_GRAPH_REUSE_DISABLE=1` (probe stays 543.3 MiB; `kv_unified=0`).
+  Candidates still to test: the activation tensors kept alive by upstream's MTP/DFlash hidden-state reads
+  (a8fad21e9, 2cbca389f) and anything that scales with n_ctx in the measure graph.
