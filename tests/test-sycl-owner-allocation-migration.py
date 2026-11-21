@@ -841,7 +841,8 @@ with gate('futile-context-direct'):
     for scan in scans:
         assert futile.end() < compute.index(scan) < graph_branch, scan
     # The signature hash and the exec-graph key are first computed inside the graph branch, never on the way to it.
-    for call in ("ggml_sycl_graph_signature(cgraph)", "sycl_exec_graph_make_key("):
+    # The compute takes its signature through the decode prologue memo's wrapper, which runs the full walk.
+    for call in ("graph_prologue_memo_signature(", "ggml_sycl_graph_signature(cgraph)", "sycl_exec_graph_make_key("):
         assert graph_branch < compute.index(call, futile.end()), call
     # Every scan between the decision and the graph branch is skipped for a futile context: either it needs
     # use_sycl_graph, or it is guarded on the flag itself.

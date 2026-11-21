@@ -19,6 +19,7 @@
 #include "fallback-error.hpp"
 #include "ggml-sycl.h"
 #include "graph-prestage-decline-memo.hpp"
+#include "graph-prologue-memo.hpp"
 #include "graph-safe-memcpy-width.hpp"
 #include "graph-segment-cache.hpp"
 #include "kv-offload.hpp"
@@ -6361,6 +6362,9 @@ inline void * ggml_sycl_runtime_scratch_ensure(ggml_sycl::mem_handle & backing,
 // Kernel name of the marker that gates the release of a staging buffer a size change displaced.
 struct graph_input_staging_retire_marker {};
 
+// The decode prologue memo a backend context keeps (graph-prologue-memo.hpp).
+using ggml_sycl_prologue_memo = ggml_sycl::graph_prologue_memo::memo<ggml_tensor, ggml_backend_buffer_t>;
+
 struct ggml_backend_sycl_context {
     // Retained by MMID queue capabilities so an exact queue binding cannot
     // outlive the backend context that selected it.
@@ -7008,6 +7012,8 @@ struct ggml_backend_sycl_context {
     // each keyed split. Sparing the keyed slots at the prompt-path calls would save the re-record only where no
     // phase-change clear_active retires them anyway; that needs a measurement before it is worth the extra state.
     bool invalidate_moe_segments() {
+        // Every retire of recorded work drops the decode prologue memo as well, before a failure below can return.
+        prologue_memo.clear();
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
             moe_graphs_disabled = true;
             return false;
@@ -8131,6 +8137,10 @@ struct ggml_backend_sycl_context {
     graph_prestage_decline_memo prestage_decline_memo;
     // Bumped once per ggml_backend_sycl_graph_compute call; the decline memo counts a token once by it.
     uint64_t                    graph_compute_seq = 0;
+    // The signature, slot key and prestage effect list of the keyed decode graph this context last computed, served
+    // again while llama hands it the same graph (GGML_SYCL_GRAPH_PROLOGUE_MEMO). A member, so it dies with the
+    // context; invalidate_moe_segments() clears it.
+    ggml_sycl_prologue_memo     prologue_memo;
 
     // Flag to disable graphs when weight streaming is active
     bool                                                    weight_streaming_graphs_disabled = false;

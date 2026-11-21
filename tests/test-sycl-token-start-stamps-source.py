@@ -233,14 +233,17 @@ def check_sites(code: str) -> None:
     if not re.match(close + r"bool\s+graph_executed\s*=\s*false\s*;", after[0]) or not re.search(
             r"\}\s*\}\s*if\s*\(\s*" + FLAG_GUARD + r"\s*\)\s*\{\s*$", before[0]):
         fail("G", "BOUNDARY_DONE is not stamped right after the graph-boundary block, before `bool graph_executed`")
-    if not re.match(close + r"const\s+uint64_t\s+graph_hash\s*=\s*ggml_sycl_graph_signature\s*\(\s*cgraph\s*\)\s*;"
+    # The signature and the slot key go through the decode prologue memo's wrappers, which run the full walks when
+    # the memo is off or misses; the stamps bracket the wrapper call, so a hit shows as a shorter p_sig / p_key.
+    if not re.match(close + r"const\s+uint64_t\s+graph_hash\s*=\s*graph_prologue_memo_signature\s*\(\s*sycl_ctx\s*,"
+                    r"\s*cgraph\s*,\s*cached_is_decode\s*\)\s*;"
                     r"\s*if\s*\(\s*" + FLAG_GUARD + r"\s*\)\s*\{\s*moe_token_stamps_note_step\s*\(\s*MOE_TOKEN_STEP_SIG_END",
                     after[1]):
-        fail("G", "SIG_BEGIN and SIG_END do not bracket `graph_hash = ggml_sycl_graph_signature(cgraph)` alone")
-    if not re.match(close + r"const\s+gsc::key\s+slot_key\s*=\s*moe_segment_slot_key\s*\([^;]*;"
+        fail("G", "SIG_BEGIN and SIG_END do not bracket `graph_hash = graph_prologue_memo_signature(...)` alone")
+    if not re.match(close + r"const\s+gsc::key\s+slot_key\s*=\s*graph_prologue_memo_slot_key\s*\([^;]*;"
                     r"\s*if\s*\(\s*" + FLAG_GUARD + r"\s*\)\s*\{\s*moe_token_stamps_note_step\s*\(\s*MOE_TOKEN_STEP_KEY_END",
                     after[3]):
-        fail("G", "KEY_BEGIN and KEY_END do not bracket `slot_key = moe_segment_slot_key(...)` alone")
+        fail("G", "KEY_BEGIN and KEY_END do not bracket `slot_key = graph_prologue_memo_slot_key(...)` alone")
     if not re.search(r"else\s+if\s*\(\s*slot_action\s*==\s*gsc::action::REPLAY\s*\)\s*\{\s*if\s*\(\s*" + FLAG_GUARD
                      + r"\s*\)\s*\{\s*$", before[5]):
         fail("G", "PRESTAGE_END is not the first statement of the slot REPLAY branch (reached only after the prestage)")
@@ -612,10 +615,14 @@ def mutants(code: str, doc: str):
     yield "the signature stamps swapped", "G", sub1(
         swapped, step % "TMP", "moe_token_stamps_note_step(MOE_TOKEN_STEP_SIG_END);"), doc
     yield "the signature end stamp moved past its consumer", "G", sub1(
-        code, r"(const uint64_t graph_hash = ggml_sycl_graph_signature\(cgraph\);)(\s*if \(" + G + r"\) \{\s*"
-        + step % "SIG_END" + r"\s*\})(\s*sycl_ctx->cached_graph_sig\s*= graph_hash;)", r"\1\3\2"), doc
+        code, r"(const uint64_t graph_hash = graph_prologue_memo_signature\(sycl_ctx, cgraph, cached_is_decode\);)"
+        r"(\s*if \(" + G + r"\) \{\s*" + step % "SIG_END" + r"\s*\})(\s*sycl_ctx->cached_graph_sig\s*= graph_hash;)",
+        r"\1\3\2"), doc
+    yield "the signature stamps around the full walk, not the memo", "G", sub1(
+        code, r"graph_prologue_memo_signature\(sycl_ctx, cgraph, cached_is_decode\)",
+        "ggml_sycl_graph_signature(cgraph)"), doc
     yield "the key stamps around nothing", "G", sub1(
-        code, r"(const gsc::key\s+slot_key\s*=\s*moe_segment_slot_key\()", r"int g_gap = 0; \1"), doc
+        code, r"(const gsc::key\s+slot_key\s*=\s*graph_prologue_memo_slot_key\()", r"int g_gap = 0; \1"), doc
     yield "the prestage stamp before the prestage", "G", sub1(
         code, r"(\}\s*else if \(slot_action == gsc::action::REPLAY\) \{\s*)(if \(" + G + r"\) \{\s*" + step % "PRESTAGE_END"
         + r"\s*\})", r"\1 int g_gap = 0; \2"), doc
