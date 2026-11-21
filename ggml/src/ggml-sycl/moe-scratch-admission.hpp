@@ -202,12 +202,15 @@ inline bool pp_moe_onednn_reserve_if_admitted(const pp_moe_onednn_scratch_shape 
 // that fits the RUNTIME zone competes with none of them.
 //
 // Each KV-zone slot is one allocation, so free space in pieces cannot hold it.
-// The whole KV-zone part must fit the zone's largest free block. That is an
-// estimate: the allocator reports the head of its largest size class, not a
-// scanned maximum, and with two or more KV-zone slots the later allocations
-// can still miss. It covers the single-allocation case; for the rest, a failed
-// reserve refuses the ring, which the automatic -ub ladder treats as its
-// ceiling, keeping its last accepted size.
+// The whole KV-zone part must fit the zone's largest free block. The allocator
+// reports that block's exact size, and the slots fit it together whenever their
+// sum does: each is a multiple of the allocator's grain, a slot placed in that
+// block is carved from its front and leaves the rest whole behind it, and a slot
+// placed elsewhere leaves it untouched. The check is still not a guarantee,
+// because the zone can change between the read and the reserve: another KV-zone
+// tenant can allocate in between, and the read is not taken under the zone's
+// allocator lock. A failed reserve refuses the ring, which the automatic -ub
+// ladder treats as its ceiling, keeping its last accepted size.
 //
 // The KV-zone part is charged to the plan's VRAM, so it must also fit what the
 // plan's VRAM budget leaves on the device once KV and the MMID pools are
