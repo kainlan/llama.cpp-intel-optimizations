@@ -174,6 +174,7 @@ texts = {
     "weight_zone_terms_fn": function_window(
         cache_cpp,
         "host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan) {"),
+    "swap_headroom_hold_fn": function_window(cache_cpp, "static void placement_plan_hold_moe_swap_host_headroom("),
     "charge_host_weight_fn": function_window(
         cache_hpp, "void charge_host_weight(placement_host_backing backing, size_t bytes) noexcept {"),
     "uncharge_host_weight_fn": function_window(
@@ -446,17 +447,28 @@ def witness_c_headroom(t):
 # plan already knows).
 # Any write to the zone size counts, compound ones included (`*= k_..._ratio`
 # after the terms assignment would otherwise pass); `==` comparisons do not.
+# The zone has two writers, and both write the terms' total(): the sizing in
+# populate_host_zone_sizing(), and the spread plan's swap-headroom hold, which
+# sets the swap_headroom term and writes the total again (a `base + bytes`
+# there would be a second formula for the same zone). The planner file holds
+# no other write.
 WEIGHT_ZONE_WRITE_RE = re.compile(r"host_zone_weight_bytes\s*[-+*/]?=(?!=)")
+HOLD_ZONE_FROM_TERMS_RE = re.compile(
+    r"plan\.host_zone_weight_bytes\s*=\s*placement_plan_host_weight_zone_terms\(plan\)\.total\(\);")
 
 
 def check_c2_weight_zone_is_terms(t):
     fn = t["populate_zone_sizing_fn"]
     terms_fn = t["weight_zone_terms_fn"]
+    hold_fn = t["swap_headroom_hold_fn"]
     return (
-        bool(fn) and bool(terms_fn)
+        bool(fn) and bool(terms_fn) and bool(hold_fn)
         and "placement_plan_host_weight_zone_terms(plan)" in fn
         and WEIGHT_ZONE_FROM_TERMS in fn
         and len(WEIGHT_ZONE_WRITE_RE.findall(fn)) == 1
+        and len(WEIGHT_ZONE_WRITE_RE.findall(hold_fn)) == 1
+        and len(HOLD_ZONE_FROM_TERMS_RE.findall(hold_fn)) == 1
+        and len(WEIGHT_ZONE_WRITE_RE.findall(t["cache_cpp"])) == 2
         and "_ratio" not in fn
         and "_ratio" not in terms_fn
     )
@@ -466,6 +478,13 @@ def witness_c2_weight_zone_is_terms(t):
     t["populate_zone_sizing_fn"] = t["populate_zone_sizing_fn"].replace(
         WEIGHT_ZONE_FROM_TERMS,
         "plan.host_zone_weight_bytes = static_cast<size_t>(plan.weight_host_bytes * k_weight_headroom_ratio);")
+    return t
+
+
+def witness_c2_hold_adds_its_own_bytes(t):
+    # The hold's zone as the base it read plus its own bytes, a second formula beside the terms' total().
+    t["swap_headroom_hold_fn"] = HOLD_ZONE_FROM_TERMS_RE.sub(
+        "plan.host_zone_weight_bytes = base + plan.moe_swap_host_headroom_bytes;", t["swap_headroom_hold_fn"])
     return t
 
 
@@ -634,6 +653,8 @@ checks = [
      check_c_headroom, witness_c_headroom),
     ("C2: WEIGHT zone is the sum of its named terms, not a ratio",
      check_c2_weight_zone_is_terms, witness_c2_weight_zone_is_terms),
+    ("C2: the swap-headroom hold writes the WEIGHT zone as its terms' total(), the planner's only other writer",
+     check_c2_weight_zone_is_terms, witness_c2_hold_adds_its_own_bytes),
     ("C3: the WEIGHT-term walk and charge_host_weight ask one backing predicate",
      check_c3_one_backing_predicate, witness_c3_one_backing_predicate),
     ("D: pre-zone runtime chunk growth WARNs with running total vs budget",
