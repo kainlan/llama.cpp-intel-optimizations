@@ -339,7 +339,7 @@ VALIDATE = ("const ggml_sycl::moe_expert_move_check check = ggml_sycl::moe_exper
 # body assigns gives the same answer again with nothing changed, so it belongs in the transaction's final list.
 TRANSIENT_REFUSALS = (
     "load effect unavailable",  # the load this thread is bound to commits or is abandoned
-    "plan not coherent",  # the plan publication in flight completes
+    "plan not coherent",  # a publication completes whose plan uses the card, giving its cache the plan
     "device entry exists",  # finalize_retired_entries_locked reaps the retired entry once it drains
     "copy submit failed",  # the runtime threw on a copy or fill submit
     "entry changed",  # the host copy changed between the check and the publish
@@ -348,7 +348,7 @@ TRANSIENT_REFUSALS = (
 # The same for the loan's cache body, which an evict runs: each clears by itself, so an evict meets it BUSY.
 LOAN_TRANSIENT_REFUSALS = (
     "load effect unavailable",  # the load this thread is bound to commits or is abandoned
-    "plan not coherent",  # the plan publication in flight completes
+    "plan not coherent",  # a publication completes whose plan uses the card, giving its cache the plan
     "storage still referenced",  # the retention an in-flight copy keeps on the owner is released
     "host entry retiring",  # finalize_retired_entries_locked reaps the retired host entry an admit or a refill left
     "copy submit failed",  # the runtime threw on a copy submit

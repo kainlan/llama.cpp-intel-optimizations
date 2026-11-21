@@ -209,12 +209,13 @@
 //                           block's resident count unchanged, and once the evicted entries are reaped the WEIGHT zone
 //                           has the room it had before the call.
 //   evict_and_admit_cycles_return_the_room
-//                           Four evict and admit cycles of one triplet. Right after the first evict an admit is BUSY
-//                           "device entry exists"; after each cycle's reaping the WEIGHT zone and the WEIGHT host zone
-//                           are where they started, and the bytes at the end are the originals. The control, in every
-//                           cycle: right after the evict the WEIGHT host zone holds the three pinned copies on top of
-//                           where it started, and once the device entries are reaped the WEIGHT zone has their room on
-//                           top of where it started.
+//                           Four evict and admit cycles of one triplet while a second triplet stays on the device, so
+//                           the plan keeps using the card and its cache keeps the plan after every accepted evict and
+//                           admit. Right after the first evict an admit is BUSY "device entry exists"; after each
+//                           cycle's reaping the WEIGHT zone and the WEIGHT host zone are where they started, and the
+//                           bytes at the end are the originals. The control, in every cycle: right after the evict the
+//                           WEIGHT host zone holds the three pinned copies on top of where it started, and once the
+//                           device entries are reaped the WEIGHT zone has their room on top of where it started.
 //   evict_refusal_leaves_the_admit_list_alone
 //                           An evict of a host triplet is REFUSED "not on device" in its list while the admit beside it
 //                           moves: accepted with that refusal as the reason, none evicted, one admitted.

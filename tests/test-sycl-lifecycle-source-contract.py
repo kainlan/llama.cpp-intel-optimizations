@@ -544,6 +544,10 @@ OWNING_READER_SITES = {
         # coherent read that decides only the message.
         "if (cache_placement_coherence(cache).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {": 1,
         "coherent_cache_placement_plan_owner(cache)->entries.size());": 1,
+        # The expert evict device cases check, after each accepted evict and admit, that the device's cache holds the
+        # published plan, since every copy to the device refuses without it: one coherent read that decides only the
+        # case's verdict.
+        "return cache_placement_coherence(fx.cache).coherence == placement_cache_coherence::MATCH;": 1,
     }),
     "ggml/src/ggml-sycl/mmvq.cpp": Counter({
         "const auto plan_owner = ggml_sycl::coherent_cache_placement_plan_owner(route_cache);": 1,

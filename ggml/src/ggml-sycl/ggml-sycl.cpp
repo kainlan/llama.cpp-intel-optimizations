@@ -21441,7 +21441,9 @@ static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_refill_sele
 // in flight, a retired entry not yet reaped (a host one gives "host entry retiring"), storage a retention still
 // holds, a submit, an allocation or a registration that threw, an entry changed between the check and the publish.
 // Transient does not promise that the refusal clears: a host WEIGHT zone smaller than one triplet refuses every evict
-// "host pinned pool exhausted", so a caller that retries a transient refusal must bound its retries.
+// "host pinned pool exhausted", and a card the published plan does not use holds no plan, so its cache refuses every
+// copy to it "plan not coherent" until a plan uses the card again. A caller that retries a transient refusal must
+// bound its retries.
 static bool ggml_sycl_expert_move_refusal_is_final(const char * reason) {
     static const char * const final_reasons[] = {
         "invalid arguments", "invalid member",       "device storage not owned",
@@ -23771,11 +23773,22 @@ int test_evict_host_entries(const test_loan_fixture & fx, int layer, int expert)
     return n;
 }
 
+// Whether the device's cache holds the plan the process published, which every copy to the device checks first ("plan
+// not coherent" otherwise). A publication gives a cache the plan only while the plan uses its card, so a move that
+// leaves the card with nothing in the plan leaves its cache without one.
+bool test_move_cache_coherent(const test_loan_fixture & fx) {
+    return cache_placement_coherence(fx.cache).coherence == placement_cache_coherence::MATCH;
+}
+
 // An evicted triplet: each member on the host in the published plan, planned for no device with the pinned copy the
-// evict minted as its host bytes, each member resolving to a pinned host copy of its original bytes under its own host
-// entry (read once the copy's ready event completes, while the entry still carries one), and each extra naming that
-// host copy and no device copy.
+// evict minted as its host bytes, the device's cache holding that plan, each member resolving to a pinned host copy of
+// its original bytes under its own host entry (read once the copy's ready event completes, while the entry still
+// carries one), and each extra naming that host copy and no device copy.
 std::string test_evict_landed(const test_loan_fixture & fx, int layer, int expert) {
+    if (!test_move_cache_coherent(fx)) {
+        return test_loan_fail("after layer %d expert %d's evict the device's cache does not hold the published plan",
+                              layer, expert);
+    }
     const auto now = ::ggml_sycl_global_plan_snapshot();
     for (int s = 0; s < 3; ++s) {
         const placement_entry * e =
@@ -27003,7 +27016,12 @@ std::string test_expert_evict_and_admit_swap_in_one_call() {
 
 std::string test_expert_evict_and_admit_cycles_return_the_room() {
     // Four cycles of one triplet: evicted, then admitted back once the deferred-free pass has reaped its device
-    // entries. Right after the first evict an admit is BUSY "device entry exists": the retired entries are still in
+    // entries, while a second triplet stays on the device. The fixture's plan holds expert entries only, so the
+    // resident triplets are all that makes it use the card, and a publication gives the card's cache the plan only
+    // while the plan uses the card: with no triplet left there, every copy back would be refused "plan not
+    // coherent". In a model's plan a card that runs a block also holds that block's dense weights, so its evicts do
+    // not take the card out of the plan. After every accepted evict and admit the cache holds the published
+    // plan. Right after the first evict an admit is BUSY "device entry exists": the retired entries are still in
     // the cache. After each cycle, once its host entries are reaped too, the WEIGHT zone and the WEIGHT host zone are
     // where they started, so no cycle keeps storage on either side; at the end the triplet's bytes are the originals.
     // The control, in every cycle: right after the evict, before any reap, the WEIGHT host zone holds the three pinned
@@ -27016,17 +27034,17 @@ std::string test_expert_evict_and_admit_cycles_return_the_room() {
     // bytes, so the two are equal by construction; the entries were staged and are admitted at the staged size, each a
     // multiple of that block size. A cycle starts with the WEIGHT zone at least where it started, which the previous
     // cycle's last check holds, so the reaped room's bound holds in every cycle.
-    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x6576637408ull);
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637408ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
     }
     if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * test_loan_expert_bytes())) {
         return "no WEIGHT zone could be reserved";
     }
-    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
         return why;
     }
-    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
     if (!drain_retained_handles(true, 5000)) {
         return "the retained store did not drain before the cycles";
     }
@@ -27045,6 +27063,9 @@ std::string test_expert_evict_and_admit_cycles_return_the_room() {
         ::ggml_sycl_txn_result         code = test_named_move(fx, { 0, 0 }, test_no_triplet, evicted);
         if (code != ::ggml_sycl_txn_result::ACCEPTED || evicted.n_evicted != 1) {
             return test_loan_fail("cycle %d's evict answered %s", c, test_admit_answer(code, evicted).c_str());
+        }
+        if (!test_move_cache_coherent(fx)) {
+            return test_loan_fail("after cycle %d's evict the device's cache does not hold the published plan", c);
         }
         if (fx.cache->host_zone_used(host_zone_id::WEIGHT) < host_before + 3 * copy_bytes) {
             return test_loan_fail(
@@ -27076,6 +27097,9 @@ std::string test_expert_evict_and_admit_cycles_return_the_room() {
         code = test_named_move(fx, test_no_triplet, { 0, 0 }, admitted);
         if (code != ::ggml_sycl_txn_result::ACCEPTED || admitted.n_admitted != 1) {
             return test_loan_fail("cycle %d's admit answered %s", c, test_admit_answer(code, admitted).c_str());
+        }
+        if (!test_move_cache_coherent(fx)) {
+            return test_loan_fail("after cycle %d's admit the device's cache does not hold the published plan", c);
         }
         if (!fx.reclaim_until([&] {
                 return test_evict_host_entries(fx, 0, 0) == 0 &&

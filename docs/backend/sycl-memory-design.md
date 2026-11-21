@@ -362,6 +362,15 @@ returns their room to the WEIGHT zone. So an admit in the same call never gets
 an evict's room: in a full zone the admit is BUSY "WEIGHT zone full" beside the
 evict that moved, and moves at a later boundary, after the pass.
 
+A move to the device needs a card the published plan uses. A publication gives a
+card's cache the plan only while the plan places something there (an entry, a
+layer, the KV or a layer block) and leaves every other card's cache without one,
+and a copy to a card whose cache holds no plan is refused "plan not coherent",
+BUSY, until a plan uses the card again. In a model's plan a card that runs a
+block holds that block's dense weights, so evicts there never take the card out
+of the plan. A card that holds nothing of the model but experts would leave the
+plan with its last evict, and no admit could bring those experts back.
+
 An expert's size is a fact of its tensor, never of a cache entry: the
 transaction reads the tensor's bytes per expert (`nb[2]`), its type and its
 width, and hands the three to the cache. The device copy is minted from the
