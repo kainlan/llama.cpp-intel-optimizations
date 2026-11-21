@@ -426,6 +426,17 @@ minted, and the plan the transaction publishes leaves it on the host; when no
 triplet fits, nothing is published. The caller retries at a later boundary.
 Planned headroom in the zone is the planner's job, not the transaction's.
 
+Every copy a move publishes belongs to the models that owned the entry it
+replaces. Only a model load's end tags an entry with its owners
+(`owner_mask`, `owner_tagged`), and a model teardown never reclaims an untagged
+entry, so a copy published after the load would otherwise outlive its model in
+the WEIGHT zone or the pinned host zone. One helper, `inherit_entry_ownership`,
+copies the owners and any pending load: an admit's or a refill's device entry
+takes them from the host copy it withdraws, under the locks that re-check that
+copy; a loan's or an evict's host copy takes them from the device entry the
+loan retired, which the loan holds in place until its registrations return
+(`register_host_expert_owned`'s `moved_from`).
+
 **The swap driver** (`GGML_SYCL_MOE_SWAP=1`, opt-in) is the named move's one
 production caller. At each synchronize after a graph, behind the refill, it asks
 the swap policy (`moe-swap-policy.hpp`) which resident triplet of a block leaves
