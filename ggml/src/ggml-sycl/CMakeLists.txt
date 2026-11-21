@@ -7652,6 +7652,18 @@ set_tests_properties(graph-prestage-decline-memo PROPERTIES
     TIMEOUT 60
 )
 
+# Test: the per-context decode prologue memo (signature, slot key, prestage effect list) of a graph llama reuses.
+# Host-only, same arrangement: graph-prologue-memo.hpp and graph-segment-cache.hpp include no SYCL header.
+add_executable(test-graph-prologue-memo
+    tests/test-graph-prologue-memo.cpp
+)
+target_include_directories(test-graph-prologue-memo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME graph-prologue-memo COMMAND test-graph-prologue-memo)
+set_tests_properties(graph-prologue-memo PROPERTIES
+    LABELS "sycl;graph;host;tdd"
+    TIMEOUT 60
+)
+
 # Test: SYCL GET_ROWS Q4_K element decode against ggml's reference, plus the support predicate
 # (llama.cpp-qhfp). Host-only: get-rows-kquant.hpp and get-rows-support.hpp include no SYCL header, so the
 # device kernel's decode function runs here unchanged. ggml-base supplies the reference quantiser.
