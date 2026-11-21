@@ -6,10 +6,10 @@
 //
 // The fill, which is the materializer. Each of these per-type switches carries
 // exactly this table's types (tests/test-sycl-soa-reorder-types-source.py holds all
-// six to it):
+// five to it):
 //   - reorder_aos_to_soa_device, reorder_rows_to_soa, reorder_data_internal_,
-//     ggml_sycl_reorder_weight_gpu, ggml_sycl_reorder_weight_cpu and
-//     ggml_sycl_reorder_expected_size (ggml-sycl.cpp).
+//     ggml_sycl_reorder_weight_cpu and ggml_sycl_reorder_expected_size
+//     (ggml-sycl.cpp).
 //
 // The readers, which ask the table instead of keeping a chain:
 //   - ggml_sycl_layout_supports_soa (ggml-sycl.cpp), which the runtime's
@@ -24,7 +24,7 @@
 // clamped them to AOS. The loaded layout is the answer, so the planner must not
 // plan a layout the fill cannot materialize.
 //
-// Adding a type here is a claim that ALL SIX fill switches have its kernel; the gate
+// Adding a type here is a claim that ALL FIVE fill switches have its kernel; the gate
 // checks that they do.
 //
 // ggml_sycl_supports_reorder_mmvq (ggml-sycl.cpp) is deliberately NOT a reader: it

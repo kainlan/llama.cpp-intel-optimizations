@@ -209,11 +209,8 @@ is untagged because it is materialized by
 (`ggml-sycl.cpp`, `#if SYCL_XMX_MOE_AVAILABLE`), called via
 `ggml_sycl_materialize_moe_phase_layouts()` from the graph-compute path that
 scans `cgraph` nodes for `GGML_OP_MUL_MAT_ID` (near the `refresh_moe_after_pp`
-PP→TG transition) — a **runtime** path, not a model-load call site. (NOT
-`moe_prestage_popular_experts()`, which stages exclusively with
-`GGML_LAYOUT_SOA`/`GGML_LAYOUT_AOS` and only ever *looks up* `XMX_TILED` via a
-`pin_layouts[]` array to pin an already-existing entry — it creates nothing in
-that layout.) The bulk-XMX branch calls
+PP→TG transition) — a **runtime** path, not a model-load call site. The
+bulk-XMX branch calls
 `unified_cache_direct_stage_expert_tensor()` with `target_layout ==
 GGML_LAYOUT_XMX_TILED`, which reaches `unified_cache::direct_stage_expert_tensor()`
 (`unified-cache.cpp:4390`). That function calls `acquire_bound_load_effect()`
@@ -1520,8 +1517,8 @@ in-flight allocation would be affected.
 
 The per-device cache lives for the process; nothing in it stays sized for a
 model once no model is live. After the last model's release, and after a failed
-load's abort with no model live, each cache releases the PP MoE oneDNN ring, the
-oneDNN scratchpad pair and the reorder temp. An arena nothing holds is released,
+load's abort with no model live, each cache releases the PP MoE oneDNN ring and
+the oneDNN scratchpad pair. An arena nothing holds is released,
 its device memory goes back to the card, and the next load's start reserves the
 early arena from start values; the end of a refused load reserves nothing. A
 cache that gave everything back has its published planning terms put back to

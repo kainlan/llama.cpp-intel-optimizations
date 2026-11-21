@@ -39,14 +39,6 @@
 
 namespace ggml_sycl {
 
-// SOA-correct expert caching via unified cache.
-// Looks up expert metadata, performs AOS->SOA layout conversion, and uploads
-// to VRAM on the specified device using direct_stage_expert().
-// Returns device pointer if expert was successfully cached in SOA layout.
-// Returns nullptr if caching failed (no metadata, VRAM full, etc.).
-// Thread-safe: acquires g_moe_expert_meta_mutex and unified cache locks internally.
-void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id);
-
 // Value-owned description of one expert staging operation. Metadata is copied
 // under the model registry lock; source_owner pins the canonical AOS entry and
 // deps carries any publication event that must precede the reorder submission.
@@ -95,11 +87,6 @@ sycl::event fill_reordered_host(sycl::queue &                    queue,
                                 size_t                           src_size,
                                 const void *                     ctx,
                                 const std::vector<sycl::event> & deps);
-
-// Look up expert frequency from epoch counters (recorded during MoE warmup/re-ranking).
-// Maps hash-based layer_id -> sequential index, then reads atomic epoch_counts.
-// Returns 0 if the expert has no recorded frequency (unknown layer or expert).
-uint32_t get_expert_frequency(int layer_hash, int expert_id);
 
 // Tracks a single in-flight async DMA prefetch operation.
 // The event is from direct_stage_expert() and completes when H2D DMA +
@@ -224,11 +211,6 @@ class ExpertPrefetcher {
     int completed_count() const;
 
     bool is_active() const { return is_initialized(); }
-
-    // Pre-fill the cache with popular experts at model init time.
-    // Called from moe_hybrid_init_once() after Phase 2.
-    // Routes through unified cache (no private pool).
-    void preload_experts(int layer_idx, const std::vector<int> & expert_ids);
 
   private:
     std::shared_ptr<sycl::queue>
@@ -363,8 +345,10 @@ class ExpertPredictor {
     // Checked by ExpertPrefetcher to short-circuit hint().
     bool is_prefetch_disabled() const;
 
-    // Get frequency ranking for a layer: sorted (expert_id, count) pairs,
-    // most-activated first. Used for popularity-based prestage ordering.
+    // Frequency ranking for a layer from the counts record_actual() keeps: sorted
+    // (expert_id, count) pairs, most-activated first. No backend code reads it; the
+    // predictor guard test calls it as one of the accessors that must take mutex_
+    // before the init guard.
     std::vector<std::pair<int, uint32_t>> get_frequency_ranking(int layer_idx) const;
 
   private:

@@ -237,7 +237,8 @@ OF_DEVICE_READ = "return cache != nullptr ? cache->onednn_zone_plan_load() : zon
 RESERVE_SIG = "bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activations_size) {"
 RESERVE_FIRST = "const zone_onednn_plan zone_plan = arena_on ? onednn_zone_plan_load() : zone_onednn_plan();"
 RESERVE_REFUSAL = "const size_t pair_bound_now = onednn_pp_pair_bound_for(onednn_zone_plan_load(), zone_cap);"
-PAIR_BOUND_SIG = "bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound) {"
+PAIR_BOUND_SIG = ("bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound, size_t * planned_weights, "
+                  "size_t * planned_activations) {")
 ROOM_SIG = "bool unified_cache_get_onednn_graph_room(int device_id, size_t * room) {"
 BOUND_FN = "onednn_pp_pair_bound_for"
 # The first argument every use of the bound helper may pass: its own parameter at the definition, the reserve's loaded
@@ -670,8 +671,8 @@ def test_witnesses():
                          "zone_cap)"), GS, "readers")
     # The pair-bound accessor reading a plan through a second lookup, which can find another cache than the one
     # whose capacity it reads.
-    only_fails(mutate_in(UC, PAIR_BOUND_SIG, "cache->onednn_zone_plan_load(), cache->zone_capacity",
-                         f"{OF_DEVICE_FN}(device_id), cache->zone_capacity"), GS, "readers")
+    only_fails(mutate_in(UC, PAIR_BOUND_SIG, "zone_plan = cache->onednn_zone_plan_load();",
+                         f"zone_plan = {OF_DEVICE_FN}(device_id);"), GS, "readers")
     # The Graph-room accessor the same way.
     only_fails(mutate_in(UC, ROOM_SIG, "cache->onednn_zone_plan_load(), capacity",
                          f"{OF_DEVICE_FN}(device_id), capacity"), GS, "readers")

@@ -466,7 +466,7 @@ def nodelete_moe_state_reset_ok(source, wrapper_source):
     it does NOT prove every reader of g_moe_expert_meta/g_expert_groups is
     gated on g_moe_hybrid_init_success[d] -- it is not; the read sites at
     ggml-sycl.cpp:3729, 3807, 4063, 5138, 5521, 5625, 6580, 6910, 6990, 7017
-    and 7409 (moe_snapshot_registries, is_expert_resident, and the direct
+    and 7409 (is_expert_resident, and the direct
     iterations/uses of g_moe_expert_meta/g_expert_groups) take only the
     registries' own mutexes and read unconditionally, and
     g_moe_hybrid_init_success[dev] only gates whether moe_hybrid_init_once()
@@ -492,7 +492,6 @@ def nodelete_moe_state_reset_ok(source, wrapper_source):
         and "g_expert_groups.swap(new_expert_groups);" in init_once_body
         and "intentionally survive" in source
         and "g_expert_popularity.clear()" in source
-        and "g_adaptive_prestage.reset_after_stop()" in source
         and "g_expert_predictors[d].reset()" in source
         and "ggml_sycl_reset_moe_module_state();\n    if (!ggml_sycl::shutdown_unified_cache())" in source
         and "NODELETE reload retained model-bound MoE state" in wrapper_source
@@ -617,6 +616,12 @@ def _owning_reader_sites():
 # llama.cpp-kjef: the auto-ubatch fit's ring term (ggml_sycl_hold_ring_uncovered) reads the published plan once,
 # `const auto current`, to size the prefill ring the way the stream phase does; it reads the same snapshot the expert
 # loan transaction reads, so no new reader kind, and the statement count under that name moves 4 -> 5.
+# The legacy expert prestage left with the name-hash expert ranking, and six of these statements with it: its
+# per-expert plan check and plan read, its secondary-device loop's three plan reads and its runtime switch's check.
+# The MoE reorder temp buffer's reservation, which only that prestage read, took four more: its multi-card
+# condition's two global-plan checks and two global-plan reads. The single-expert SOA upload, reachable only from an
+# init-time preload nothing called, took three cache-plan statements: its plan check, its plan-and-name check and
+# its per-expert device check.
 # The per-tensor MoE expert preload that nothing called is gone, and its two cache plan reads (the non-empty test
 # before its loop and the expert placement lookup inside it) with it; the live preload keeps its own.
 INTERNAL_WRAPPER_SITES = {
@@ -636,8 +641,6 @@ INTERNAL_WRAPPER_SITES = {
         "const auto plan_owner = ggml_sycl_cache_plan_owner(plan_cache);": 4,
         "const auto plan_owner = ggml_sycl_cache_plan_owner(route_cache);": 1,
         "const auto plan_ref_owner = ggml_sycl_cache_plan_owner(plan_cache);": 1,
-        "const auto pp_owner = ggml_sycl_cache_plan_owner(cache);": 1,
-        "const auto sec_plan = ggml_sycl_cache_plan_owner(sec_cache);": 1,
         "const bool active_plan = plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty();": 1,
         "const bool has_placement_plan = route_cache && !ggml_sycl_cache_plan_owner(route_cache)->entries.empty();": 1,
         "const bool have_plan = !ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty();": 2,
@@ -649,20 +652,15 @@ INTERNAL_WRAPPER_SITES = {
         "ggml_sycl_cache_plan_owner(cache)->count_planned_experts(src0->name, n_experts, device);": 1,
         "ggml_sycl_cache_plan_owner(cache)->is_on_device(dense_name, device);": 1,
         "ggml_sycl_configure_host_zones_for_plan(cache, ggml_sycl_cache_plan_owner(cache));": 1,
-        "if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(meta.tensor_name, expert_idx, device_id)) {": 1,
         "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty() || tensor->name[0] == '\\0') {": 1,
         "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 16,
         "if (!cgraph || !cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 2,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() &&": 2,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !dense_name.empty()) {": 2,
-        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !meta.tensor_name.empty()) {": 1,
-        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 3,
         "if (!route_cache || ggml_sycl_cache_plan_owner(route_cache)->entries.empty()) {": 1,
-        "if (!sec_cache || ggml_sycl_cache_plan_owner(sec_cache)->entries.empty()) {": 1,
         "if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 4,
         "if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() && src0->name && src0->name[0] != '\\0') {": 1,
         "if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {": 3,
-        "if (sec_budgets[i].cache && ggml_sycl_cache_plan_owner(sec_budgets[i].cache)->entries.empty()) {": 1,
         "in.has_placement_plan = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();": 1,
         "plan_cache_hybrid && !ggml_sycl_cache_plan_owner(plan_cache_hybrid)->entries.empty();": 1,
         "return !ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_cache_plan_owner(cache)), current_device);": 1,
@@ -680,14 +678,12 @@ INTERNAL_WRAPPER_SITES = {
         "stream_plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;": 1,
     }),
     "ggml_sycl_global_plan_owner": Counter({
-        "!ggml_sycl_placement_plan_uses_device((*ggml_sycl_global_plan_owner()), d)) {": 1,
         "!ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_global_plan_owner()), current_device);": 1,
         "const auto plan_owner = ggml_sycl_global_plan_owner();": 2,
         # The hold-spill fit (ggml_sycl_hold_spill_fit) reads the published plan once for the explicit micro-batch it
         # placed, whose RUNTIME zone holds the planned compute term: the fit credits a buffer no larger at that rung.
         "const auto room_plan = ggml_sycl_global_plan_owner();": 1,
         "ggml_sycl_placement_plan_moe_needs_other_device((*ggml_sycl_global_plan_owner()), ctx.device);": 1,
-        "ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner())))) {": 1,
         "ggml_sycl_placement_plan_needs_secondary_devices((*ggml_sycl_global_plan_owner()));": 1,
         "ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_global_plan_owner()), current_device);": 1,
         "plan_known && ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner()));": 1,
@@ -756,12 +752,10 @@ INTERNAL_WRAPPER_SITES = {
     }),
     "ggml_sycl_has_global_plan": Counter({
         "((ggml_sycl_has_global_plan() || ggml_sycl_planner_authoritative_residency_active(sycl_ctx->device)) &&": 1,
-        "(ggml_sycl_has_global_plan() &&": 1,
         "const bool has_host_inputs = ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph);": 1,
         "const bool plan_known = ggml_sycl_has_global_plan();": 1,
         "gpu_prefix_end < 0 && !(ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph)) &&": 1,
         "if (!ggml_sycl_has_global_plan() || !plan_owner->has_dense_entry(tensor_name)) {": 1,
-        "if (ggml_sycl_has_global_plan() &&": 1,
         "if (ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph) &&": 1,
         "if (ggml_sycl_has_global_plan() || has_runtime_plan() || g_moe_multi_gpu_active.load(std::memory_order_acquire)) {": 1,
         "if (ggml_sycl_has_global_plan()) {": 2,
@@ -1140,7 +1134,7 @@ checks = {
     and re.search(r"\bggml_sycl::mem_handle\s+host_owner\s*;.*?(?<![\w.>])host_owner\s*=\s*"
                   r"ggml_sycl_host_expert_alloc\s*\(\s*device\s*,\s*expert_size\s*\)\s*;", preload_body,
                   re.S) is not None,
-    "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
+    "cache reuse stamps exact bound transaction": "void * unified_cache::try_get_cached_with_event(" in cache_cpp
     and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
     and "stamp_pending_owner(entry_it->second, load_effect_guard)" in cache_cpp
     and "stamp_pending_owner(it->second, load_effect_guard)" in cache_cpp

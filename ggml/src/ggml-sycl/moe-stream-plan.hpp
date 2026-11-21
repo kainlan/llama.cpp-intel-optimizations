@@ -1291,9 +1291,9 @@ class moe_stream_phase {
 
 namespace detail {
 
-// True iff a SOA-to-AOS inverse of ggml_sycl_reorder_weight_gpu (the load fill's reorder, ggml-sycl.cpp) exists for
-// `type`. None exists yet: that function only runs AOS to SOA, so v1 lends AOS-layout entries only. Add a case here
-// when an inverse kernel lands.
+// True iff a SOA-to-AOS inverse of the load fill's reorder (reorder_aos_to_soa_device, ggml-sycl.cpp) exists for
+// `type`. None exists yet: the fill only runs AOS to SOA, so v1 lends AOS-layout entries only. Add a case here when an
+// inverse kernel lands.
 static inline bool moe_loan_soa_inverse_exists(ggml_type type) {
     (void) type;
     return false;

@@ -727,16 +727,19 @@ int main() {
         const size_t attn_w      = 23592960;    // 2880 x 4096 x 2
         const size_t attn_a      = 2949120;     // 512 x 2880 x 2
 
-        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, zone_256mib, attn_w, attn_a),
+        // No planned pair (0, 0): the request alone is held against the bound (Case 14n has the planned pair).
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, zone_256mib, 0, 0, attn_w, attn_a),
               "a per-layer attention weight fits the 256 MiB ONEDNN zone");
-        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, zone_256mib, head_w, head_a),
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, zone_256mib, 0, 0, head_w, head_a),
               "the LM head does not fit the ONEDNN zone, so it is not planned there");
-        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(false, 0, head_w, head_a),
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(false, 0, 0, 0, head_w, head_a),
               "with no arena there is no zone to disagree with: the unified-cache path serves it");
-        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, 100, 60, 40), "a pair that exactly fills the zone fits");
-        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 100, 60, 41), "one byte over the zone does not fit");
-        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 0, 1, 1), "an empty zone holds nothing");
-        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, SIZE_MAX, SIZE_MAX, 2),
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, 100, 0, 0, 60, 40),
+              "a pair that exactly fills the zone fits");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 100, 0, 0, 60, 41),
+              "one byte over the zone does not fit");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 0, 0, 0, 1, 1), "an empty zone holds nothing");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, SIZE_MAX, 0, 0, SIZE_MAX, 2),
               "an overflowing pair is refused, not wrapped into a small sum");
     }
 
@@ -788,17 +791,21 @@ int main() {
         CHECK(ggml_sycl::zone_onednn_pp_scratch_type_enabled(1, false), "=1 enables a K-quant type too");
         CHECK(ggml_sycl::zone_onednn_pp_scratch_type_enabled(1, true), "=1 keeps the default types on");
 
-        CHECK(ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, zone_256mib, attn_w, attn_a),
+        // The planned pair is the attention op's own (Case 14n covers an op above the planned pair in one half).
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, zone_256mib, attn_w, attn_a, attn_w, attn_a),
               "an admitted, enabled, planned op is supplied by the scratch");
-        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, false, true, zone_256mib, attn_w, attn_a),
-              "an op whose type is not enabled is NOT supplied, so the walk must size its planned dequant buffers");
-        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, false, false, 0, attn_w, attn_a),
+        CHECK(
+            !ggml_sycl::zone_onednn_pp_scratch_supplies(true, false, true, zone_256mib, attn_w, attn_a, attn_w, attn_a),
+            "an op whose type is not enabled is NOT supplied, so the walk must size its planned dequant buffers");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, false, false, 0, 0, 0, attn_w, attn_a),
               "type refusal holds with no arena too");
-        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(false, true, true, zone_256mib, attn_w, attn_a),
-              "an op that fails the PP admission is not supplied");
-        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, zone_256mib, 1158266880, 1474560),
+        CHECK(
+            !ggml_sycl::zone_onednn_pp_scratch_supplies(false, true, true, zone_256mib, attn_w, attn_a, attn_w, attn_a),
+            "an op that fails the PP admission is not supplied");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, zone_256mib, attn_w, attn_a, 1158266880,
+                                                          1474560),
               "an enabled op whose pair is over the zone is not supplied");
-        CHECK(ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, 100, 60, 40),
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, 100, 60, 40, 60, 40),
               "a pair that exactly fills the zone is supplied");
     }
 
@@ -845,7 +852,7 @@ int main() {
         {
             const size_t bound = ggml_sycl::zone_onednn_pp_pair_bound(256 * mib, 2 * mib, 10 * mib);
             CHECK(bound == 246 * mib, "small model: the bound is capacity minus the floor, well above the plan");
-            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 18 * mib, 1 * mib),
+            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 1 * mib, 1 * mib, 18 * mib, 1 * mib),
                   "small model: a 19 MB head pair fits the slack, so it stays supplied by the scratch");
         }
         // (b) the Mistral head window: plan 143.5 MB, floor ~33 MB, capacity 256 MiB, head pair 266 MB.
@@ -854,9 +861,11 @@ int main() {
             const size_t floor = 34603008;   // 33 MiB
             const size_t bound = ggml_sycl::zone_onednn_pp_pair_bound(256 * mib, plan, floor);
             CHECK(bound == 256 * mib - floor, "Mistral: the bound is capacity minus the floor");
-            CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 262144000, 4194304),
+            const size_t plan_w = 117440512;      // the planned weights half (14336 x 4096 x f16)
+            const size_t plan_a = plan - plan_w;  // the planned activations half
+            CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, plan_w, plan_a, 262144000, 4194304),
                   "Mistral: a 266 MB head pair would eat the Graph SDPA floor, so it is not supplied");
-            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 117440512, 4194304),
+            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, plan_w, plan_a, 117440512, 4194304),
                   "Mistral: a per-layer pair (the plan's own op) is still supplied");
         }
         // (c) a clamped zone: capacity - floor falls under the plan, so the bound is exactly the plan.
@@ -1246,16 +1255,19 @@ int main() {
                                                           crossed.activations_bytes, 50 * mib, 5 * mib, &cw, &ca);
             CHECK(cw == 100 * mib && ca == 10 * mib,
                   "the kept plan's first reservation is its planned pair, which a bound equal to the bare plan holds");
-            // An op of the OTHER plan, whose pair the kept one is not: the halves it needs are not the kept pair's,
-            // so the kept pair is replaced by the request as asked. That is a regrow, but only for an op the kept plan
-            // never provisioned. The superseded reservation's release is event-deferred, so the old and new blocks can
-            // briefly both be in the zone, and a failed zone allocation falls back to the unified-cache direct path;
-            // the request fits the bound alone, which is what acquire admitted it against.
+            // An op of the OTHER plan, whose pair the kept one is not: (10, 100) fits the bound alone, but its per-half
+            // merge with the kept planned pair is (100, 100), above it. The admission refuses it, so it draws the
+            // planned dequant buffers and never reaches the reserve: the reserve would replace the kept pair with the
+            // request as asked, and the superseded reservation's release is event-deferred, so the old and new blocks
+            // would both be in the zone.
+            CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, crossed.bare_bytes, crossed.weights_bytes,
+                                                             crossed.activations_bytes, 10 * mib, 100 * mib),
+                  "a crossed request the kept pair cannot merge with is refused at admission");
             size_t xw = 0, xa = 0;
             ggml_sycl::zone_onednn_scratch_reserve_target(true, crossed.bare_bytes, cw, ca, crossed.weights_bytes,
                                                           crossed.activations_bytes, 10 * mib, 100 * mib, &xw, &xa);
             CHECK(xw == 10 * mib && xa == 100 * mib,
-                  "a crossed request the kept pair does not hold is used as asked, not merged above the bound");
+                  "were it reserved, a crossed request would be used as asked, not merged above the bound");
             CHECK(xw + xa <= crossed.bare_bytes, "the crossed request stays within the bound");
 
             zone_onednn_plan big_plan;
@@ -1311,11 +1323,11 @@ int main() {
         CHECK(w == 120 * mib && a == plan_a, "a request above the plan in one half still grows that half");
         ggml_sycl::zone_onednn_scratch_reserve_target(true, 100 * mib, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib, &w,
                                                       &a);
-        CHECK(w == 40 * mib && a == 10 * mib, "a zone clamped below its plan reserves what is asked, not the plan");
+        CHECK(w == 40 * mib && a == 10 * mib, "a stored plan whose halves do not fit the bound reserves the request");
         ggml_sycl::zone_onednn_scratch_reserve_target(true, 100 * mib, 60 * mib, 5 * mib, plan_w, plan_a, 50 * mib,
                                                       12 * mib, &w, &a);
         CHECK(w == 60 * mib && a == 12 * mib,
-              "a clamped zone still never shrinks what is held: the held-and-requested merge, without the plan");
+              "a stored plan whose halves do not fit the bound never shrinks what is held: held-and-requested merge");
         ggml_sycl::zone_onednn_scratch_reserve_target(false, 0, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib, &w, &a);
         CHECK(w == 40 * mib && a == 10 * mib, "without an arena there is no planned pair to reserve");
         ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib,
@@ -1410,7 +1422,9 @@ int main() {
         CHECK(bound == 100 * mib, "a zone of exactly pair + floor bounds the pair at its plan");
         size_t held_w = 0, held_a = 0;
         for (const auto & r : requests) {
-            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, r[0], r[1]), "every request is admitted");
+            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, at_2048.weights_bytes,
+                                                            at_2048.activations_bytes, r[0], r[1]),
+                  "every request is admitted");
             size_t w = 0, a = 0;
             ggml_sycl::zone_onednn_scratch_reserve_target(true, bound, held_w, held_a, at_2048.weights_bytes,
                                                           at_2048.activations_bytes, r[0], r[1], &w, &a);
@@ -1438,6 +1452,132 @@ int main() {
             held_a = a;
         }
         CHECK(replaced == 4, "the placeholder plan replaces the pair four times in the five-op layer");
+    }
+
+    // ---- Case 14n: admission refuses an op whose per-half merge with the planned pair leaves the bound -------------
+    // The pair plan is (60, 40) MiB and the zone is exactly pair + Graph floor, so the bound is 100 MiB. A context that
+    // runs a wider micro-batch than the load planned asks (0.1, 80) MiB: that fits the bound alone, but its per-half
+    // maximum with the planned pair is (60, 80) = 140 MiB. Admitted on the request alone, the reserve could merge it
+    // with neither the planned nor the held pair and replaced the held pair with the request as asked; the superseded
+    // pair's release is event-deferred, so each replacement inside one graph left two blocks in the ONEDNN zone.
+    // Refused by the predicate the graph-entry walk asks too, the op draws the planned dequant buffers the walk sizes
+    // for it, and the held pair stays.
+    {
+        const size_t mib    = 1024u * 1024u;
+        const size_t plan_w = 60 * mib;
+        const size_t plan_a = 40 * mib;
+        const size_t bound  = 100 * mib;
+
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, plan_w, plan_a, mib / 10, 80 * mib),
+              "(0.1, 80) fits the bound alone but cannot merge with the planned (60, 40): refused");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, plan_w, plan_a, 62 * mib / 10, 40 * mib),
+              "(6.2, 40) merges into the planned (60, 40): admitted");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, bound, plan_w, plan_a, mib / 10, 80 * mib),
+              "the verdict the op arm and the walk share refuses it too, so the walk sizes its dequant buffers");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, bound, plan_w, plan_a, 62 * mib / 10,
+                                                         40 * mib),
+              "and supplies the op that merges");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, plan_w, plan_a, 10 * mib, plan_a + 1),
+              "one byte above the planned activations half is refused although the request alone is 50 MiB");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, plan_w, plan_a, plan_w + 1, 1 * mib),
+              "one byte above the planned weights half is refused too");
+
+        // A zone with slack above the plan: a half may grow past its plan while the merge still fits the bound.
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, 120 * mib, plan_w, plan_a, 10 * mib, 60 * mib),
+              "slack: (10, 60) merges to (60, 60), exactly the 120 MiB bound: admitted");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 120 * mib, plan_w, plan_a, 10 * mib, 60 * mib + 1),
+              "slack: one byte past the bound in the merge is refused although the request alone is 70 MiB");
+
+        // A stored plan whose halves do not fit the bound keeps the request-only rule: no request can merge with a
+        // pair the zone cannot hold. The arena floors the zone at the bare plan, so only an inconsistent stored plan
+        // reaches this.
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, 80 * mib, plan_w, plan_a, 10 * mib, 70 * mib),
+              "stored plan whose halves do not fit the bound: a request that fits the bound alone is admitted");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 80 * mib, plan_w, plan_a, 10 * mib, 70 * mib + 1),
+              "stored plan whose halves do not fit the bound: a request above the bound alone is refused");
+        // No planned pair, and no arena.
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 0, 0, mib / 10, 80 * mib),
+              "no planned pair: the request alone is held against the bound");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(false, 0, plan_w, plan_a, mib / 10, 80 * mib),
+              "no arena: there is no zone to plan against");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, SIZE_MAX, SIZE_MAX - 10, 5, 1, 20),
+              "a merged sum that overflows is refused, not wrapped into a small one");
+
+        // For every admitted request the reserve target is the per-half maximum of the planned pair, the held pair and
+        // the request, never the request as asked. The held pair is what the first admitted request reserved. In a
+        // zone of exactly pair + floor nothing admitted exceeds the plan, so the target is the planned pair itself.
+        // With slack, two admitted requests that exceed the plan in DIFFERENT halves can still fail to merge: that is
+        // the one reach of the "as asked" target in a zone that holds its plan, counted here and shown below.
+        const size_t step = 5 * mib;
+        const size_t top  = 120 * mib;
+        for (const size_t zone_bound : { bound, 120 * mib }) {
+            size_t admitted   = 0;
+            size_t refused    = 0;  // fits the bound alone, refused because it cannot merge with the plan
+            size_t crossed    = 0;
+            bool   first_ok   = true;
+            bool   later_ok   = true;
+            bool   planned_ok = true;
+            for (size_t w1 = 0; w1 <= top; w1 += step) {
+                for (size_t a1 = 0; a1 <= top; a1 += step) {
+                    if (!ggml_sycl::zone_onednn_pp_scratch_planned(true, zone_bound, plan_w, plan_a, w1, a1)) {
+                        refused += w1 + a1 <= zone_bound ? 1 : 0;
+                        continue;
+                    }
+                    ++admitted;
+                    size_t held_w = 0, held_a = 0;
+                    ggml_sycl::zone_onednn_scratch_reserve_target(true, zone_bound, 0, 0, plan_w, plan_a, w1, a1,
+                                                                  &held_w, &held_a);
+                    first_ok   = first_ok && held_w == std::max(plan_w, w1) && held_a == std::max(plan_a, a1);
+                    planned_ok = planned_ok && (zone_bound != bound || (held_w == plan_w && held_a == plan_a));
+                    for (size_t w2 = 0; w2 <= top; w2 += step) {
+                        for (size_t a2 = 0; a2 <= top; a2 += step) {
+                            if (!ggml_sycl::zone_onednn_pp_scratch_planned(true, zone_bound, plan_w, plan_a, w2, a2)) {
+                                continue;
+                            }
+                            if ((w1 > plan_w && a2 > plan_a) || (a1 > plan_a && w2 > plan_w)) {
+                                ++crossed;
+                                continue;
+                            }
+                            size_t w = 0, a = 0;
+                            ggml_sycl::zone_onednn_scratch_reserve_target(true, zone_bound, held_w, held_a, plan_w,
+                                                                          plan_a, w2, a2, &w, &a);
+                            later_ok = later_ok && w == std::max({ plan_w, held_w, w2 }) &&
+                                       a == std::max({ plan_a, held_a, a2 });
+                        }
+                    }
+                }
+            }
+            CHECK(first_ok, "the first reservation of an admitted request is max(planned, request) per half");
+            CHECK(later_ok,
+                  "a later admitted request is reserved at max(planned, held, request) per half, never as asked");
+            CHECK(planned_ok, "with the zone exactly pair + floor every admitted request is held as the planned pair");
+            CHECK(admitted > 0, "the sweep admits requests");
+            CHECK(refused > 0, "the sweep reaches requests that fit the bound alone and cannot merge with the plan");
+            if (zone_bound == bound) {
+                CHECK(crossed == 0,
+                      "with no slack nothing admitted exceeds the plan, so no two admitted requests cross");
+            } else {
+                CHECK(crossed > 0, "with slack two admitted requests can exceed the plan in different halves");
+            }
+        }
+
+        // The cross, explicitly: planned (60, 40) at a 120 MiB bound. A head-shaped op (75, 10) is admitted (merge
+        // (75, 40) = 115) and held as (75, 40); a wider-micro-batch op (10, 55) is admitted (merge (60, 55) = 115), but
+        // (75, 55) = 130 is above the bound: the target is the request as asked, which replaces the held pair.
+        {
+            const size_t slack_bound = 120 * mib;
+            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, slack_bound, plan_w, plan_a, 75 * mib, 10 * mib) &&
+                      ggml_sycl::zone_onednn_pp_scratch_planned(true, slack_bound, plan_w, plan_a, 10 * mib, 55 * mib),
+                  "both crossing ops are admitted on their own");
+            size_t hw = 0, ha = 0, w = 0, a = 0;
+            ggml_sycl::zone_onednn_scratch_reserve_target(true, slack_bound, 0, 0, plan_w, plan_a, 75 * mib, 10 * mib,
+                                                          &hw, &ha);
+            CHECK(hw == 75 * mib && ha == plan_a, "the head-shaped op holds (75, 40)");
+            ggml_sycl::zone_onednn_scratch_reserve_target(true, slack_bound, hw, ha, plan_w, plan_a, 10 * mib, 55 * mib,
+                                                          &w, &a);
+            CHECK(w == 10 * mib && a == 55 * mib,
+                  "the crossing op is reserved as asked: the one reach of that target in a zone holding its plan");
+        }
     }
 
     // ---- Case 14: the planned dense scratch is ONE reservation that follows the runtime n_ubatch (llama.cpp-kpjw) --

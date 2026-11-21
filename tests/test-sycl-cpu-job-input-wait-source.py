@@ -1290,12 +1290,14 @@ def mutants() -> list:
         # The decode route's resolve step runs on the pool worker after the prologue and before the job signals: a
         # status query or a wait there can take the driver's device lock behind this very job.
         ("W6", "backend", "the decode resolve step queries an event's status",
-         sub(r"(\n(\s*)if \(record_warmup\) \{\n\s*g_moe_warmup\.record\()",
+         sub(r"(\n(\s*)if \(predictor\) \{\n\s*predictor->record_actual\(seq_layer,)",
              r"\n\2(void) record->ready.get_info<command_execution_status>();\1")),
         ("W6", "backend", "the decode resolve step waits an event",
-         sub(r"(\n(\s*)if \(record_warmup\) \{\n\s*g_moe_warmup\.record\()", r"\n\2record->ready.wait();\1")),
+         sub(r"(\n(\s*)if \(predictor\) \{\n\s*predictor->record_actual\(seq_layer,)",
+             r"\n\2record->ready.wait();\1")),
         ("W6", "backend", "the decode resolve step calls Level Zero",
-         sub(r"(\n(\s*)if \(record_warmup\) \{\n\s*g_moe_warmup\.record\()", r"\n\2(void) zeEventQueryStatus(nullptr);\1")),
+         sub(r"(\n(\s*)if \(predictor\) \{\n\s*predictor->record_actual\(seq_layer,)",
+             r"\n\2(void) zeEventQueryStatus(nullptr);\1")),
         # The decode route's site stays as it is, so the scan is not vacuous; a second site hands over a resolve step
         # through a receiver that is a call.
         ("W6", "backend", "a resolve step handed to submit_batch on a call expression queries the driver",

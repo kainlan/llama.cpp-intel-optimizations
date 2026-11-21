@@ -253,21 +253,6 @@ def test_moe_metadata_registry_is_value_only_and_consumers_retain_sources() -> N
     for witness in ("cache->resolve_expert(req)", "resolved.lifetime",
                     "has_stable_owner_identity()", "out.handle.resolve"):
         assert witness in resolver, witness
-    prestage = function(source, "static void moe_prestage_popular_experts")
-    # The metadata copy is now half of a PAIRED snapshot: prestage consults the
-    # group registry repeatedly further down, and taking the two registries under
-    # separate locks would let a concurrent moe_hybrid_init_once pair this model's
-    # metadata with the next model's groups. So the property is stronger than a
-    # plain copy -- prestage must not reach the live global at all.
-    assert "moe_snapshot_registries()" in prestage
-    assert "expert_meta = registries.meta" in prestage
-    assert "g_moe_expert_meta" not in prestage
-    snapshot = function(source, "static moe_registry_snapshot moe_snapshot_registries")
-    assert "std::scoped_lock" in snapshot
-    assert "lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" in snapshot
-    assert re.search(r"snapshot\.meta\s*=\s*g_moe_expert_meta\s*;", snapshot)
-    assert re.search(r"snapshot\.groups\s*=\s*g_expert_groups\s*;", snapshot)
-    assert "source_leases.push_back(std::move(source))" in prestage
     materialize = function(source, "static bool ggml_sycl_materialize_planned_expert_layout")
     assert "meta_value = m" in materialize
     assert "ggml_sycl_resolve_moe_meta_source(*meta, device)" in materialize

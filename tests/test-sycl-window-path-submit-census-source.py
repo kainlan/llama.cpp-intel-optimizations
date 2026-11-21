@@ -563,11 +563,6 @@ ALLOW: dict[str, tuple[int, str]] = {
         (1, MARKER + "joins the transient MoE pointer table's dependencies into one event"),
     "submit:ggml-sycl.cpp:moe_cpu_job_join_on_queue":
         (1, host_task("joins a host expert job back onto the device queue")),
-    "submit:ggml-sycl.cpp:reorder_mxfp4_gpu": (1, WEIGHT_LAYOUT),
-    "submit:ggml-sycl.cpp:reorder_q4_0_gpu": (1, WEIGHT_LAYOUT),
-    "submit:ggml-sycl.cpp:reorder_q4_k_gpu": (1, WEIGHT_LAYOUT),
-    "submit:ggml-sycl.cpp:reorder_q6_k_gpu": (1, WEIGHT_LAYOUT),
-    "submit:ggml-sycl.cpp:reorder_q8_0_gpu": (1, WEIGHT_LAYOUT),
     "submit:ggml-sycl.cpp:sycl_reorder_parallel_for": (1, WEIGHT_LAYOUT),
     "submit:ggml-sycl.cpp:test_expert_admit_completes_a_block_read_through_its_table": (1, TEST_ENTRY),
     "submit:ggml-sycl.cpp:test_expert_admit_completes_a_block_the_direct_route_serves": (1, TEST_ENTRY),

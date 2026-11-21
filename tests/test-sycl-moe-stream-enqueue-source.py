@@ -197,7 +197,11 @@ SNAPSHOT = "prompt_ids_snapshot = prompt_ids_entry.host_ids;"
 HYBRID_WITH_PLAN = "const bool moe_hybrid_with_plan ="
 
 COPY_DECL = "copied = mem_copy_async("
-REORDER_CALL = "ggml_sycl_reorder_weight_gpu("
+# The backend's AOS-to-SOA fills. reorder_rows_to_soa is declared in common.hpp and so callable from the phase source;
+# the others are file-local to ggml-sycl.cpp today. A call of any of them in the phase would be a reorder submission.
+REORDER_FILLS = ("reorder_rows_to_soa", "reorder_aos_to_soa_device", "reorder_data_internal_",
+                 "ggml_sycl_reorder_weight_cpu")
+REORDER_RE = re.compile(r"\b(?:" + "|".join(REORDER_FILLS) + r")\s*\(")
 RETAIN = "retain_handles_until_event({ aos, host }, copied);"
 TABLE_WRITE = "table_[key] = { aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"
 ABORT = 'GGML_ABORT("[MOE-EXEC] stream enqueue failed: %s", e.what());'
@@ -313,10 +317,10 @@ def test_copy_mutants():
 def claim_window_copy_is_the_only_submission(phase: str) -> bool:
     """W2 (Task 2b of llama.cpp-a2xb): the executor's dequant kernel reads every window matrix in place as AOS, so
     stage_window submits exactly one thing per matrix, its copy: no reorder and no kernel of its own. The phase submits
-    no reorder anywhere: the SOA staging that ggml_sycl_reorder_weight_gpu served is retired."""
+    no reorder anywhere: it calls none of the backend's AOS-to-SOA fills (REORDER_FILLS)."""
     n = norm(phase)
     s = body(n, STAGE_SIG)
-    return (bool(s) and s.count("mem_copy_async(") == 1 and REORDER_CALL not in n
+    return (bool(s) and s.count("mem_copy_async(") == 1 and not REORDER_RE.search(n)
             and ".submit(" not in s and "->submit(" not in s)
 
 
@@ -334,8 +338,8 @@ def test_window_copy_only_mutants():
     # A second copy of the matrix.
     second_copy = " (void) mem_copy_async(aos, host, item.src_bytes, cache.get_bcs_queue(), { copied });"
     assert not c(mutate(PHASE, RETAIN, RETAIN + second_copy))
-    # The SOA reorder back, on the compute queue behind the copy.
-    reorder = " (void) ggml_sycl_reorder_weight_gpu(*ccs_, aos, item.type, { copied });"
+    # An SOA reorder of the landed slot, through the one fill the phase source can reach.
+    reorder = " (void) reorder_rows_to_soa(static_cast<uint8_t *>(aos), item.type, 0, 0, item.src_bytes, ccs_);"
     assert not c(mutate(PHASE, RETAIN, RETAIN + reorder))
     # A kernel of the stage's own.
     assert not c(mutate(PHASE, RETAIN, RETAIN + " ccs_->submit([&](sycl::handler & h) { (void) h; });"))
@@ -2453,42 +2457,38 @@ def test_context_mutants():
     assert not claim_context_owns_and_ends_the_phase(COMMON, late)
 
 
-REORDER_DEF = "sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue,"
-LOAD_FILL = "ggml_sycl_reorder_weight_gpu(queue, static_cast<const uint8_t *>(temp_vram),"
-
-
+REORDER_DEF = "static sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue,"
 REORDER_DECL = ("sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue, const uint8_t * aos_device, "
                 "uint8_t * soa_device, ggml_type type, int64_t ncols, int64_t nrows, size_t src_bytes, "
                 "const std::vector<sycl::event> & deps);")
+REORDER_NAME = "ggml_sycl_reorder_weight_gpu"
 
 
-def claim_reorder_is_the_load_fills_own(sycl: str, hpp: str) -> bool:
-    """The load path's reorder dispatch is a static function of ggml-sycl.cpp, defined once and called once, by the
-    load-time fill, and moe-stream-plan.hpp names it nowhere outside comments: the SOA staging that shared it is
-    retired, and the ring copies AOS and reorders nothing (test_window_copy_is_the_only_submission)."""
-    n = norm(sycl)
-    return (n.count("static " + REORDER_DEF) == 1 and n.count(REORDER_DEF) == 1
-            and n.count(REORDER_CALL) == 2 and n.count(LOAD_FILL) == 1 and REORDER_CALL not in norm(hpp))
+def claim_no_gpu_reorder_dispatch(sycl: str, hpp: str) -> bool:
+    """No GPU-side AOS-to-SOA reorder dispatch is left: ggml-sycl.cpp neither defines nor calls it, and
+    moe-stream-plan.hpp declares it nowhere. Its one caller was the removed MoE prestage's fill; the weight-load fill
+    reorders through reorder_aos_to_soa_device, and the ring copies AOS and reorders nothing
+    (test_window_copy_is_the_only_submission)."""
+    return REORDER_NAME not in norm(sycl) and REORDER_NAME not in norm(hpp)
 
 
-def test_reorder_is_the_load_fills_own():
-    assert claim_reorder_is_the_load_fills_own(SYCL, PLAN_HPP), first_missing(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the reorder is also searched for in "
-        "moe-stream-plan.hpp, where it must be absent)",
-        norm(SYCL),
-        "static " + REORDER_DEF, REORDER_CALL, LOAD_FILL)
+def test_no_gpu_reorder_dispatch():
+    assert claim_no_gpu_reorder_dispatch(SYCL, PLAN_HPP), (
+        f"{REORDER_NAME} is back in ggml/src/ggml-sycl/ggml-sycl.cpp or moe-stream-plan.hpp")
 
 
-def test_reorder_load_fill_mutants():
-    c = claim_reorder_is_the_load_fills_own
+def test_no_gpu_reorder_dispatch_mutants():
+    c = claim_no_gpu_reorder_dispatch
     # The stream header declares it again.
     assert not c(SYCL, mutate(PLAN_HPP, "namespace ggml_sycl {", REORDER_DECL + " namespace ggml_sycl {"))
-    # The definition is external again.
-    assert not c(mutate(SYCL, "static " + REORDER_DEF, REORDER_DEF), PLAN_HPP)
-    # A second caller.
-    assert not c(mutate(SYCL, LOAD_FILL, REORDER_CALL + "q2, a, s, t, c, r, b, d); " + LOAD_FILL), PLAN_HPP)
-    # The load-time fill moved off the dispatch.
-    assert not c(mutate(SYCL, LOAD_FILL, "other_reorder(queue, static_cast<const uint8_t *>(temp_vram),"), PLAN_HPP)
+    # The backend defines it again.
+    assert not c(mutate(SYCL, "static bool ggml_sycl_graph_has_host_inputs(",
+                        REORDER_DEF + " const uint8_t * a, uint8_t * s, ggml_type t, int64_t c, int64_t r, size_t b, "
+                        "const std::vector<sycl::event> & d); static bool ggml_sycl_graph_has_host_inputs("), PLAN_HPP)
+    # A call comes back.
+    assert not c(mutate(SYCL, "static bool ggml_sycl_graph_has_host_inputs(",
+                        "static void f(sycl::queue & q) { (void) " + REORDER_NAME + "(q, nullptr, nullptr, "
+                        "GGML_TYPE_Q4_0, 0, 0, 0, {}); } static bool ggml_sycl_graph_has_host_inputs("), PLAN_HPP)
 
 
 # ---- the trace -------------------------------------------------------------------------------------------------------

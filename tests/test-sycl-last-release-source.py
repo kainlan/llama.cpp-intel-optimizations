@@ -19,8 +19,8 @@ two-card flag only when it holds no arena. A step that asked no cache leaves tha
 asked one only once the scope let it, before it asks.
 
 The cache member it calls, unified_cache::release_for_no_live_model, is noexcept and catches. In order: it returns when
-a model is live; waits once for one barrier over the cache's queues; releases the PP MoE oneDNN ring, the oneDNN
-scratchpad pair and the reorder temp buffer; drains the queued frees through the existing drain, once; reads the
+a model is live; waits once for one barrier over the cache's queues; releases the PP MoE oneDNN ring and the oneDNN
+scratchpad pair; drains the queued frees through the existing drain, once; reads the
 arena's holders; unbinds the compute arena; tears the arena down; and only then marks the cache released. Each release
 that refuses stops it with a line that names the refusal. A held arena is an ERROR with the holders named for a model
 release; one WARN line at a failed load's abort (the failed model's buffers still hold it then); and at a load's start,
@@ -163,7 +163,6 @@ MEMBER_SIG = ("unified_cache_last_release unified_cache::release_for_no_live_mod
 MEMBER_DECL = ("unified_cache_last_release release_for_no_live_model(const char * site, "
                "unified_cache_release_cause cause) noexcept;")
 PAIR_SIG = "bool unified_cache::release_onednn_scratch_pair()"
-REORDER_SIG = "void unified_cache::release_reorder_temp()"
 RESERVE_SIG = "bool unified_cache::reserve_released_arena(zone_arena_refusal * refusal)"
 ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
               "const zone_arena_ensure_options & options)")
@@ -219,7 +218,6 @@ MEMBER_ORDER = (
     "submit_barrier_all().wait();",
     "if (!release_pp_moe_onednn_scratch_ring()) {",
     "if (!release_onednn_scratch_pair()) {",
-    "release_reorder_temp();",
     "process_deferred_frees_public();",
     "zone_arena_holders holders = arena_read_holders(live_zone_used);",
     "if (!zone_arena_rebuild_allowed(holders)) {",
@@ -239,7 +237,6 @@ RESERVERS = (
     "unified_alloc",
     "unified_allocate",
     "reserve_onednn_scratch",
-    "reserve_reorder_temp",
 )
 # What the cache member must never do over what still holds the arena: it names it and keeps it.
 FORCERS = ("zone_reclaim(", "zone_settle(", "zone_reset", "arena_reset(", "evict", "reap", "arena_abandon")
@@ -448,8 +445,7 @@ def check_pair(uc: str) -> list:
 
 def check_no_abort(gs: str, uc: str) -> list:
     out = []
-    for text, sig in ((gs, STEP_SIG), (gs, START_SIG), (uc, MEMBER_SIG), (uc, PAIR_SIG), (uc, REORDER_SIG),
-                      (uc, RESERVE_SIG)):
+    for text, sig in ((gs, STEP_SIG), (gs, START_SIG), (uc, MEMBER_SIG), (uc, PAIR_SIG), (uc, RESERVE_SIG)):
         body = fn_body(text, sig)
         if not body:
             out.append(f"missing: {sig}")
@@ -669,8 +665,8 @@ def test_witness_step_runs_at_static_destruction():
 
 def test_witness_member_releases_before_the_barrier():
     m = mutate_in(UC, MEMBER_SIG, "submit_barrier_all().wait();", "")
-    assert check_member(mutate_in(m, MEMBER_SIG, "release_reorder_temp();",
-                                  "release_reorder_temp(); submit_barrier_all().wait();"), UH)
+    assert check_member(mutate_in(m, MEMBER_SIG, "process_deferred_frees_public();",
+                                  "submit_barrier_all().wait(); process_deferred_frees_public();"), UH)
 
 
 def test_witness_member_drains_after_the_teardown():
@@ -681,8 +677,8 @@ def test_witness_member_drains_after_the_teardown():
 
 
 def test_witness_member_waits_twice():
-    assert check_member(mutate_in(UC, MEMBER_SIG, "release_reorder_temp();",
-                                  "release_reorder_temp(); queue_.wait();"), UH)
+    assert check_member(mutate_in(UC, MEMBER_SIG, "process_deferred_frees_public();",
+                                  "process_deferred_frees_public(); queue_.wait();"), UH)
 
 
 def test_witness_member_reserves_after_the_teardown():

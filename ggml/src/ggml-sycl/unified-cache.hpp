@@ -3560,17 +3560,6 @@ inline int64_t expert_group_key(int block_id, int expert_id) {
     return (static_cast<int64_t>(block_id) << 16) | static_cast<int64_t>(expert_id & 0xFFFF);
 }
 
-// Data needed to stage one tensor of an expert group.
-// fill_fn/fill_ctx allow per-tensor reorder (GPU or CPU).
-// When fill_fn is nullptr, a raw DMA memcpy is used.
-struct staging_tensor_data {
-    const void * src_ptr   = nullptr;  // host-accessible source data (AOS)
-    size_t       src_size  = 0;        // source bytes (AOS)
-    size_t       dst_size  = 0;        // destination bytes (SOA)
-    int          layer_id  = -1;
-    int          expert_id = -1;
-};
-
 // Cache entry readiness
 enum class cache_entry_state {
     READY,
@@ -3885,10 +3874,10 @@ struct expert_resolve_result {
 // which check the unified cache directly.
 
 // Get popularity rank for a specific expert (0 = most popular, -1 = unranked).
-// Called by cache eviction scoring to boost popular experts.
+// Keyed by block number; the placement planner orders expert triplets by it.
 int get_expert_popularity_rank(int layer_id, int expert_id);
 
-// Set popularity rank for a specific expert (called after warmup profiling).
+// Set popularity rank for a specific expert, keyed by block number.
 void set_expert_popularity_rank(int layer_id, int expert_id, int rank);
 
 // Returns true if any popularity ranks have been set.
@@ -4013,7 +4002,6 @@ struct unified_cache_entry {
     ggml_layout_mode      layout;           // Target layout for this entry
     int64_t               onednn_pack_m;    // M dimension used for ONEDNN_PACKED/ONEDNN_WOQ (0 when unused)
     cache_layout_xmx_info xmx_info;         // XMX metadata (when applicable)
-    uint32_t              access_count;     // Access frequency for LFU
     int64_t               last_access;      // Timestamp for recency
     bool                  pinned;           // Protected from eviction
     bool                  hot;              // Hot-set hint for MoE experts
@@ -4182,11 +4170,11 @@ enum class unified_cache_last_release {
 // 1. Single memory budget - avoids OOM from competing caches
 // 2. Type-aware eviction - dense weights and experts have equal priority
 // 3. Automatic partitioning - no manual budget splitting needed
-// 4. LFU+LRU hybrid eviction - keeps frequently used entries
+// 4. Tier-then-LRU eviction - evict_one takes the lowest eviction tier, then the least recently used entry
 //
 // Usage:
 // - call ensure_cached() for any weight (dense or expert)
-// - cache automatically evicts lowest-scoring entries when full
+// - cache automatically evicts by tier, then least recent access, when full
 // - for MoE: call with layer_id and expert_id
 // - for dense: call with layer_id=-1, expert_id=-1
 class unified_cache {
@@ -4759,7 +4747,7 @@ class unified_cache {
     // Get device pointer, waiting for IN_PROGRESS entries to complete.
     // Fast path for cache lookup using shared_lock (reader-writer lock).
     // Returns device_ptr if entry exists, is READY, and layout matches.
-    // Otherwise returns nullptr. Does not update LRU/LFU stats.
+    // Otherwise returns nullptr. Does not update the entry's last access.
     void * try_get_cached_fast(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout);
 
     // Like try_get_cached_fast, but also returns device_ptr for IN_PROGRESS
@@ -4782,39 +4770,6 @@ class unified_cache {
                 ggml_layout_mode           layout);
 
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not in cache
-
-    // === Atomic Expert Group Staging/Eviction ===
-    // All 3 tensors (gate, up, down) stage or evict together -- never partial.
-
-    // Stage all 3 tensors for an expert atomically.
-    // If VRAM is insufficient, evicts cold expert groups first.
-    // If any allocation fails after eviction, rolls back partial allocations.
-    // Each staging_tensor_data provides source pointer and sizes.
-    // Each cache_layout_request provides fill_fn/fill_ctx for reorder.
-    // When request pointers are non-null, fill_fn is called per tensor.
-    // When null, raw DMA memcpy via get_dma_queue() is used.
-    // Returns true if all 3 tensors were staged successfully.
-    bool stage_expert_group(int                          block_id,
-                            int                          expert_id,
-                            const expert_tensor_group &  keys,
-                            const staging_tensor_data &  gate_data,
-                            const staging_tensor_data &  up_data,
-                            const staging_tensor_data &  down_data,
-                            ggml_layout_mode             layout,
-                            const cache_layout_request * gate_req = nullptr,
-                            const cache_layout_request * up_req   = nullptr,
-                            const cache_layout_request * down_req = nullptr);
-
-    // Evict all 3 tensors for an expert atomically.
-    // Removes gate, up, and down from the cache together.
-    void evict_expert_group(const expert_tensor_group & keys, ggml_layout_mode layout);
-
-    // Evict the coldest expert group to free VRAM.
-    // Uses combined access frequency across all 3 tensors as coldness metric.
-    // expert_groups: the global registry mapping (block,expert) -> keys.
-    // Returns bytes freed, or 0 if no evictable expert group was found.
-    size_t evict_coldest_expert_group(const std::unordered_map<int64_t, expert_tensor_group> & expert_groups,
-                                      ggml_layout_mode                                         layout);
 
     // === Pinning for Graphs ===
 
@@ -4901,8 +4856,9 @@ class unified_cache {
     // Drain pending deferred frees at safe sync points (public accessor).
     // NEVER call during graph_compute — sycl::free() unmaps GPU page table
     // entries while in-flight kernels may still reference those addresses.
-    // The ONLY safe time is after queue.wait() in ggml_backend_sycl_synchronize()
-    // or during prestage yield loops (outside graph_compute_impl).
+    // Call it only outside graph_compute_impl, after the queues that could
+    // still read the freed memory have drained (for example after queue.wait()
+    // in ggml_backend_sycl_synchronize()).
     void process_deferred_frees_public();
 
     // Check if there are any pending deferred frees (device or host)
@@ -5094,8 +5050,7 @@ class unified_cache {
 
     void set_into_empty_foreign_key(uint64_t key) { into_empty_foreign_key_.store(key, std::memory_order_release); }
 
-    // Access the internal SYCL queue (for deferred free of temp allocations
-    // made on this queue's context, e.g. GPU-side reorder temp buffers).
+    // The queue the cache was built on (queue_), which the cache's own allocations and copies use.
     sycl::queue & get_queue() { return queue_; }
 
     // Memset/memcpy operations that dispatch to GPU or CPU based on handle location.
@@ -5264,12 +5219,12 @@ class unified_cache {
 
     // The release of the last model: with no model live, it gives back what this cache sized for one, so the next load
     // plans and builds as a first load does. In order: it waits once for the device work submitted before it, releases
-    // the PP MoE oneDNN ring, the oneDNN scratchpad pair, the MoE reorder temp buffer and the pooled oneDNN Graph
-    // scratch, drains the queued frees, then tears the arena down, which hands its memory back to the device. It stops
-    // at the first thing that holds on, with an ERROR line that names it (a WARN for what a failed load's own buffers
-    // hold at its abort, and at a load's start, LOAD_START, a WARN that names the holders, since one still there once
-    // the failed model is freed is a leak), and releases nothing after it; nothing is reaped, evicted or reset over a
-    // live handle. An arena a failed load's buffers hold at its abort (LOAD_ABORTED) marks the release deferred
+    // the PP MoE oneDNN ring, the oneDNN scratchpad pair and the pooled oneDNN Graph scratch, drains the queued frees,
+    // then tears the arena down, which hands its memory back to the device. It stops at the first thing that holds on,
+    // with an ERROR line that names it (a WARN for what a failed load's own buffers hold at its abort, and at a load's
+    // start, LOAD_START, a WARN that names the holders, since one still there once the failed model is freed is a
+    // leak), and releases nothing after it; nothing is reaped, evicted or reset over a live handle. An arena a failed
+    // load's buffers hold at its abort (LOAD_ABORTED) marks the release deferred
     // (last_release_deferred); the start never sets that mark, and only a release that empties the cache clears it.
     // The next load's start reserves the arena of a cache it emptied again (reserve_released_arena). It reserves
     // nothing itself and never throws: an exception ends it with an ERROR naming `site`.
@@ -5750,19 +5705,6 @@ class unified_cache {
     void release_pp_moe_onednn_scratch_slot(uint32_t slot, uint64_t generation);
     bool get_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
 
-    // === GPU Reorder Temp Buffer ===
-    // Pre-allocated device VRAM buffer reused by GPU-side AOS→SOA reorder.
-    // Avoids per-expert sycl::malloc_device that fails when VRAM is tight.
-
-    // Reserve the reorder temp buffer. Call once before weight loading begins.
-    // size_bytes: largest expert tensor size (AOS bytes) with margin.
-    bool reserve_reorder_temp(size_t size_bytes);
-
-    // Get pointer and size of the pre-allocated reorder temp buffer.
-    void * get_reorder_temp_buffer() const { return reorder_temp_buffer_; }
-
-    size_t get_reorder_temp_size() const { return reorder_temp_size_; }
-
     // === Persistent Scratch Buffers ===
     // Named scratch buffers for persistent kernels (TG optimization).
     // Unlike oneDNN scratch which is shared, these are dedicated per named buffer.
@@ -6201,10 +6143,6 @@ class unified_cache {
         std::equal_to<unified_cache_key>,
         detail::cache_guard_allocator<std::pair<const unified_cache_key, unified_cache_entry>>>;
 
-    // Compute eviction score: higher = more valuable (keep longer)
-    // score = access_count * exp(-decay * age)
-    float compute_score(const unified_cache_entry & entry) const;
-
     // Copy data from mmap to device via staging. Returns event for the last transfer.
     sycl::event copy_to_device(void * dst, const void * src, size_t size);
     sycl::event copy_to_device_async(void *                           dst,
@@ -6522,8 +6460,6 @@ class unified_cache {
     // the pair. The fields are emptied under onednn_scratch_mutex_ and the blocks freed after it is released, so no
     // other lock is taken under it. A caller first waits for the device work that read the pair.
     bool              release_onednn_scratch_pair();
-    // The MoE reorder temp buffer's release for the last model; the next model's MoE init reserves it again.
-    void              release_reorder_temp();
     // Binds the compute arena to the SCRATCH zone, or unbinds it before the zones go.
     void              compute_arena_bind();
     void              compute_arena_unbind();
@@ -6706,13 +6642,6 @@ class unified_cache {
     size_t                         dma_buffer_count_   = 0;
     size_t                         dma_reserved_bytes_ = 0;
     std::mutex                     dma_staging_mutex_;
-
-    // Reusable temp VRAM buffer for GPU-side AOS→SOA reorder during MoE prestage.
-    // Pre-allocated at cache init to avoid per-expert malloc_device that fails
-    // when VRAM is full after S1-PRELOAD fills it with dense weights.
-    void *     reorder_temp_buffer_ = nullptr;
-    size_t     reorder_temp_size_   = 0;
-    mem_handle reorder_temp_owner_;
 
     // OneDNN FP16 scratch buffers for prompt processing.
     // Pre-allocated to avoid per-op allocations that cause OOM with large contexts.
@@ -7591,8 +7520,6 @@ class unified_cache {
     // Stats
     mutable std::atomic<size_t> hits_{ 0 };
     mutable std::atomic<size_t> misses_{ 0 };
-
-    static constexpr float DECAY_ALPHA = 0.01f;
 
     mutable std::shared_mutex           rw_mutex_;
     mutable std::condition_variable_any entry_cv_;
@@ -8779,7 +8706,7 @@ enum class alloc_category : uint8_t {
 // 0 = compute scratch (pre-reserved arena, must stay in VRAM for FP16 attention)
 // 1 = KV cache (hot tokens, latency-critical)
 // 2 = attention weights / control buffers (used every token)
-// 3 = MoE expert cache (evictable via LRU/frequency)
+// 3 = MoE expert cache (evicted before weights; within a tier, least recently used first)
 // 4 = staging buffers (always host-ok)
 int alloc_category_priority(alloc_category cat);
 
@@ -9232,10 +9159,15 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
 // llama.cpp-8ony: the most an op's oneDNN PP scratch pair may be for the ONEDNN zone on `device_id` to count it as
 // planned (zone_onednn_pp_pair_bound over the zone's capacity and the zone plan ensure_planned_arena_zones stored on
 // the same cache: the pair's plan and the Graph SDPA floor the zone was sized from, as one figure; see
-// unified_cache::onednn_zone_plan_). False (and *bound untouched) when there is no cache or no active arena, i.e. no
-// zone exists to plan against. This is the one source for "does an op's pair fit what was planned"
+// unified_cache::onednn_zone_plan_). `planned_weights` and `planned_activations` receive the two halves of that same
+// stored plan, from the one read the bound is computed from, so an admission never pairs one plan's bound with another
+// plan's halves. Each out-pointer may be null. False (and every out untouched) when there is no cache or no active
+// arena, i.e. no zone exists to plan against. This is the one source for "does an op's pair fit what was planned"
 // (zone_onednn_pp_scratch_planned).
-bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound);
+bool unified_cache_get_onednn_pp_pair_bound(int      device_id,
+                                            size_t * bound,
+                                            size_t * planned_weights,
+                                            size_t * planned_activations);
 
 // The ONEDNN zone's oneDNN Graph room on `device_id`: the part of the zone no other planned consumer may take, the
 // capacity less unified_cache_get_onednn_pp_pair_bound()'s bound over that same capacity. Both come from ONE capacity
@@ -10315,7 +10247,7 @@ size_t ggml_sycl_compute_arena_bytes(int device);
 
 // (ExpertPlacementTable removed — the cache IS the placement.
 //  Use is_expert_resident() / get_expert_device_ptr() for residency,
-//  get_expert_popularity_rank() for eviction scoring.)
+//  get_expert_popularity_rank() for the planner's expert order.)
 
 }  // namespace ggml_sycl
 
