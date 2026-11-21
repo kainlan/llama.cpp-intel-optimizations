@@ -1142,11 +1142,14 @@ def claim_refill_warn_formats(sycl: str) -> bool:
             and not any("g_sycl_expert_loan_busy_streak" in b for b in refill_bodies("", sycl)[1:]))
 
 
-FINAL_REASONS = ("invalid member", "not lent", "not on host", "layout", "not a lent copy", "host copy not pinned",
-                 "host copy not published", "host copy size", "device storage size")
+FINAL_REASONS = ("invalid arguments", "invalid member", "device storage not owned", "not lent", "not on host", "layout",
+                 "not a lent copy", "host copy not pinned", "host copy not published", "host copy size",
+                 "device storage size")
 # Where the shared cache body returns each: a refusal the refill and the admit name differently is one ternary.
 FINAL_REFUSALS = {
+    "invalid arguments": 'out.reason = "invalid arguments";',
     "invalid member": 'refusal = "invalid member";',
+    "device storage not owned": 'refusal = "device storage not owned";',
     "not lent": 'refusal = admit ? "not on host" : "not lent";',
     "not on host": 'refusal = admit ? "not on host" : "not lent";',
     "layout": 'refusal = "layout";',

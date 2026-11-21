@@ -43,7 +43,12 @@ staged size. What this gate pins:
   A9  a named move WARNs nothing (its refusals skip the loan's WARN, its result line is DEBUG), and nothing but the
       private test fixtures calls the entry;
   A10 the named selection takes the published plan's verdict (moe_expert_move_validate) and moves only the triplets it
-      lets through.
+      lets through;
+  A11 every refusal the cache's shared body assigns is classed exactly once: final (in the transaction's final list,
+      ggml_sycl_expert_refill_refusal_is_final) or transient (in this pin's TRANSIENT_REFUSALS, each with the path
+      that clears it), and each classified reason is one the body assigns. A refusal is final when the same inputs
+      give it again with nothing changed, so a renamed or new refusal cannot be retried at every decode graph
+      unclassified.
 
 Checks run on comment-stripped, whitespace-normalized text. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it and is reported if it survives, if another pin
@@ -260,6 +265,21 @@ NAMED_DEBUG = 'GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u triplets, %zu
 ENTRY_NAME = "ggml_sycl_expert_move_transaction_run("
 
 VALIDATE = "const ggml_sycl::moe_expert_move_check check = ggml_sycl::moe_expert_move_validate(plan, device, {}, admit);"
+
+# The cache's refusals that clear by themselves, each with the path that clears it. Every other refusal the shared
+# body assigns gives the same answer again with nothing changed, so it belongs in the transaction's final list.
+TRANSIENT_REFUSALS = (
+    "load effect unavailable",  # the load this thread is bound to commits or is abandoned
+    "plan not coherent",  # the plan publication in flight completes
+    "device entry exists",  # finalize_retired_entries_locked reaps the retired entry once it drains
+    "copy submit failed",  # the runtime threw on a copy or fill submit
+    "entry changed",  # the host copy changed between the check and the publish
+    "publication failed",  # an allocation under the cache lock threw
+)
+SUCCESS_REASON = "OK"
+_REASON_ASSIGN_RE = re.compile(r"\b(?:refusal|out\.reason) = ([^;]*);")
+_LITERAL_RE = re.compile(r'"((?:\\.|[^"\\])*)"')
+_FINAL_LIST_RE = re.compile(r"final_reasons\[\] = \{([^}]*)\}")
 VERDICT = ("if (check.admit[i]) { moves[i].code = ggml_sycl_txn_result::REFUSED; moves[i].reason = check.admit[i]; "
            "continue; }")
 SELECT_CALL = "named ? ggml_sycl_expert_named_select(*current->plan, device, *named_moves, named_place) :"
@@ -405,6 +425,23 @@ def check(raw: dict[str, str]) -> None:
     if select.count(VALIDATE) != 1 or select.count(VERDICT) != 1 or txn.count(SELECT_CALL) != 1:
         fail("A10", "the named selection does not take the published plan's verdict on each triplet")
 
+    # A11 --------------------------------------------------------------------------------------------------------------
+    assigned = [lit for rhs in _REASON_ASSIGN_RE.findall(copy) for lit in _LITERAL_RE.findall(rhs)]
+    listed = _FINAL_LIST_RE.search(final)
+    finals = _LITERAL_RE.findall(listed.group(1)) if listed else []
+    if not finals or assigned.count(SUCCESS_REASON) != 1:
+        fail("A11", "the final refusal list or the cache body's reason assignments are not where this pin reads them")
+    refusals = [r for r in assigned if r != SUCCESS_REASON]
+    for reason in refusals:
+        if reason in finals and reason in TRANSIENT_REFUSALS:
+            fail("A11", f'the cache refusal "{reason}" is both final and transient')
+        if reason not in finals and reason not in TRANSIENT_REFUSALS:
+            fail("A11", f'the cache refusal "{reason}" is neither final nor transient, so a refill retries it at '
+                        "every decode graph unclassified")
+    for reason in list(finals) + list(TRANSIENT_REFUSALS):
+        if reason not in refusals:
+            fail("A11", f'"{reason}" is classified, but the cache body assigns no such refusal')
+
 
 def mutate(raw: dict[str, str], edits: list[tuple[str, str, str, str]]) -> dict[str, str]:
     """Apply (file, signature, old, new) edits. With a signature the anchor must appear exactly once inside that body
@@ -545,6 +582,14 @@ def self_test(raw: dict[str, str]) -> int:
                                              "    (void) ggml_sycl_expert_move_transaction_run(d, {}, nullptr, nullptr);"
                                              "\n}\n\n" + ENTRY_SIG)])
     expect_fail("verdict-ignored", "A10", [("sycl", SELECT_SIG, "if (check.admit[i]) {", "if (false) {")])
+    expect_fail("final-refusal-misspelled-in-cache", "A11", [("cache", COPY_SIG, 'refusal = "device storage not owned";',
+                                                              'refusal = "device storage not own";')])
+    expect_fail("final-refusal-misspelled-in-list", "A11", [("sycl", FINAL_SIG, '"device storage not owned",',
+                                                             '"device storage not ownd",')])
+    expect_fail("transient-refusal-misspelled", "A11", [("cache", COPY_SIG, 'out.reason = "copy submit failed";',
+                                                         'out.reason = "copy submit faild";')])
+    expect_fail("transient-refusal-made-final", "A11", [("sycl", FINAL_SIG, '"invalid arguments",',
+                                                         '"invalid arguments", "entry changed",')])
 
     try:
         mutate(raw, [("sycl", "", "this anchor is in no source", "x")])

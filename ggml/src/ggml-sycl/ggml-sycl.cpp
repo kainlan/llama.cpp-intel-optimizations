@@ -23409,21 +23409,23 @@ static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_refill_sele
     return keys;
 }
 
-// A refill or admit refusal a later boundary would meet again: the host copy is not one the direction copies from (a
-// loan's for a refill, whole pinned storage in a host zone for an admit), or is gone, or holds fewer bytes than the
-// expert's tensor says one expert has, or the device storage's size is not the one the direction requires. A refill
-// drops such a triplet from the ledger rather than retrying it at every decode graph, and a named move answers it
-// REFUSED; any other refusal is transient (BUSY for a named move) and the triplet is tried again at the next boundary.
+// A refill or admit refusal is final when the same inputs give it again with nothing changed, so a later boundary
+// would meet it again: the arguments or a member are malformed; the device storage is not VRAM of the cache's card
+// owned outside the cache, which the WEIGHT zone allocator the transaction mints from never changes (a full zone stops
+// the transaction before the cache is asked); the host copy is not one the direction copies from (a loan's for a
+// refill, whole pinned storage in a host zone for an admit), or is gone, or holds fewer bytes than the expert's tensor
+// says one expert has; or the device storage's size is not the one the direction requires. A refill drops such a
+// triplet from the ledger rather than retrying it at every decode graph, and a named move answers it REFUSED. Every
+// other refusal clears by itself, so it is transient (BUSY for a named move) and the triplet is tried again at the
+// next boundary: a load or a plan publication in flight, a retired device entry not yet reaped, a submit or an
+// allocation that threw, a host copy changed between the check and the publish.
 static bool ggml_sycl_expert_refill_refusal_is_final(const char * reason) {
-    static const char * const final_reasons[] = { "invalid member",
-                                                  "not lent",
-                                                  "not on host",
-                                                  "layout",
-                                                  "not a lent copy",
-                                                  "host copy not pinned",
-                                                  "host copy not published",
-                                                  "host copy size",
-                                                  "device storage size" };
+    static const char * const final_reasons[] = {
+        "invalid arguments", "invalid member",       "device storage not owned",
+        "not lent",          "not on host",          "layout",
+        "not a lent copy",   "host copy not pinned", "host copy not published",
+        "host copy size",    "device storage size"
+    };
     for (const char * final_reason : final_reasons) {
         if (std::strcmp(reason, final_reason) == 0) {
             return true;
