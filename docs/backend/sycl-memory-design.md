@@ -434,11 +434,17 @@ named move (`moe-swap-driver.hpp` holds the rules, as a pure function of what th
 caller reads). One boundary sends one transaction at most: the evicts, and at the
 next boundary their admits, since an evict's device room comes back only when a
 deferred-free pass reaps the entries it retired. The evict batch is trimmed to
-the host zone's free bytes, read without a wait. The driver waits for nothing and
-holds no lock across the policy step; it runs only while no graph computes on any
-device, and never once graphs have run on two threads at once. Its state is one
+the room the host zone can hand out without growing
+(`unified_cache::host_zone_no_growth_room`, read without a wait), the same figure
+the evict's mint is refused past. The driver waits for nothing and holds no lock
+across the policy step. On entry it checks once that no graph computes on any
+device and none is in flight; the named move checks again only on its own entry.
+Once two graph computes have overlapped, a latch nothing clears
+(`g_sycl_graph_multithreaded`) turns every later boundary off. Its state is one
 instance per device, keyed on the route table it reads, since that table is one
-per device and shared by every context on the card.
+per device and shared by every context on the card. A transaction that throws
+leaves its batch unsettled in that state, and the next boundary settles each move
+from the plan the move published before it rethrew.
 
 A round is not free. Each accepted transaction publishes a plan, and a published
 plan bumps the exec-graph epoch. A context reads the epoch at its next graph
