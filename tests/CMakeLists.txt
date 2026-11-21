@@ -1020,6 +1020,14 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-swap-policy-source.py --self-test)
     set_tests_properties(test-sycl-moe-swap-policy-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+    # Every dnnl::primitive_attr the backend builds goes through the one helper that asks oneDNN for a deterministic
+    # implementation, behind one default-ON switch read once (GGML_SYCL_ONEDNN_DETERMINISTIC). Without it identical
+    # inputs gave different bits run to run. Run WITH --self-test so each mutant is caught by the pin it names. Text
+    # only: no device, no model. TIMEOUT: the 22-mutant self-test took 11 s wall.
+    add_test(NAME test-sycl-onednn-deterministic-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-onednn-deterministic-source.py --self-test)
+    set_tests_properties(test-sycl-onednn-deterministic-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # The legacy expert ranking is gone: no warmup profile, gate-norm placement, periodic rerank, runtime or adaptive
     # prestage, hash-keyed rank or eviction frequency term is left in the backend, while the planner's block-keyed rank
     # API and its one writer stay, and the down-I8 hot set ranks by usage score and that rank alone. Run WITH

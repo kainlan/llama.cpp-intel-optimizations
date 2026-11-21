@@ -30,6 +30,31 @@ struct ggml_backend_sycl_context;
     return scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0;
 }
 
+// Without the deterministic attribute oneDNN may pick an implementation whose order of summation depends on how its
+// work is scheduled, so identical inputs give different bits from one run to the next and greedy decoding parts where
+// two candidates nearly tie. GGML_SYCL_ONEDNN_DETERMINISTIC=0 drops the attribute, so its cost can be measured by
+// flipping a variable on one binary. Read once. The name is spelled once, here, for the accessor and its
+// sycl_env_settings[] row in ggml_check_sycl().
+static constexpr const char * GGML_SYCL_ONEDNN_DETERMINISTIC_ENV = "GGML_SYCL_ONEDNN_DETERMINISTIC";
+
+inline bool ggml_sycl_onednn_deterministic_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv(GGML_SYCL_ONEDNN_DETERMINISTIC_ENV);
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Every dnnl::primitive_attr the backend constructs is handed to this in the statement right after its construction,
+// before any primitive descriptor is built from it. The weight prepack and its size query build descriptors too: they
+// must carry the same attribute as the primitive that executes, or the packed layout could differ from the one it
+// expects.
+inline void ggml_sycl_dnnl_attr_set_reproducible(dnnl::primitive_attr & attr) {
+    if (ggml_sycl_onednn_deterministic_enabled()) {
+        attr.set_deterministic(true);
+    }
+}
+
 //
 // DnnlSoftmaxWrapper - Softmax primitive using oneDNN
 //
@@ -68,6 +93,7 @@ public:
         auto dst_md = dnnl::memory::desc(dims, data_type, tag::ab);
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
         auto softmax_pd = dnnl::softmax_forward::primitive_desc(
@@ -187,6 +213,7 @@ public:
         auto md = dnnl::memory::desc(dims, data_type, tag::a);
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
         alg algorithm = to_dnnl_algorithm(operation);
@@ -288,6 +315,7 @@ public:
         auto dst_md = dnnl::memory::desc(src0_dims, data_type, tag::ab);
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
         alg algorithm = to_dnnl_algorithm(operation);
