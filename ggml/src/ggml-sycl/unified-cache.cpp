@@ -36186,7 +36186,7 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
 // A spread plan's swap headroom in the host WEIGHT zone. A swap copies a device triplet to the host before the host
 // triplet that takes its slot leaves, so every device expert slot can need one extra triplet on the host at once: the
 // room is planned for as many triplets as the device holds slots. Each is sized at the largest device triplet's bound,
-// its members' device charge, which is at least the copy a loan mints at the cache entry's size, plus one TLSF grain
+// its members' device charge, at least the copy a loan or an evict mints at the cache entry's size, plus one TLSF grain
 // per member, as tlsf_bound counts a block. The room is the zone's swap_headroom term, written into the zone as its
 // terms' total(), and is held only within the rooms the host plan keeps after its lazy tables (host_plan_room_rule),
 // so it displaces nothing at load: a plan that cannot afford every triplet holds the most it can, none included, and
