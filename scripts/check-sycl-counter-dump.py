@@ -400,7 +400,8 @@ def function_body_range(text, name):
 
 
 # What may follow a definition's parameter list: the body, or a qualifier, a trailing return type or a constructor's
-# initializer list. A call (`if (!f(x)) {`, `f(x) && g`, `return f(x);`) is followed by none of these.
+# initializer list (read only up to its first brace: function_text stops at the first `{`, so a braced initializer such
+# as `: m{1}` cuts the text short). A call (`if (!f(x)) {`, `f(x) && g`, `return f(x);`) is followed by none of these.
 # A definition with anything else there (an attribute macro, `= default`, a `requires` clause, `volatile`) is not
 # found, and that fails by name ("not found"): extend this list for it, never loosen the scan.
 DEFINITION_TAIL = re.compile(r"\s*(?:\{|const\b|noexcept\b|override\b|final\b|try\b|->|:(?!:))")
@@ -952,31 +953,24 @@ def scanner_fixture():
             fails.append(f"H13 scanner fixture: `{text}` classified compiled={got}, expected {expect}")
     cases = len(want)
 
-    # function_text reads the definition, never a call that precedes it and ends in `{`.
-    calls_first = "\n".join([
-        "void user() {",
-        "    if (!target(a, b)) {",
-        "        call_body_marker();",
-        "    }",
-        "    while (target(a, b) && more) { loop_marker(); }",
-        "    ok = target(a, b);",
-        "    if (cond ? target(a, b) : other) {",
-        "        cond_body_marker();",
-        "    }",
-        "    while (target(a, b)->ready) {",
-        "        arrow_body_marker();",
-        "    }",
-        "}",
-        "bool target(int a, int b) const noexcept {",
-        "    definition_marker();",
-        "}",
-    ])
-    body = function_text(calls_first, "target")
-    for needle, expect in (("definition_marker", True), ("call_body_marker", False), ("loop_marker", False),
-                           ("cond_body_marker", False), ("arrow_body_marker", False)):
-        cases += 1
-        if body is None or (needle in body) != expect:
-            fails.append(f"H13 scanner fixture: function_text(`target`) {'lost' if expect else 'read'} `{needle}`")
+    # function_text reads the definition, never a call that precedes it and ends in `{`. Each shape is its own text,
+    # the call first and the real definition after it, because function_text returns at the first accepted match and
+    # one text holding several shapes would only ever exercise the first wrong one. Every assertion below can fail.
+    definition = "bool target(int a, int b) const noexcept {\n    definition_marker();\n}\n"
+    call_shapes = (
+        ("an if-call", "if (!target(a, b)) {"),
+        ("a while-call with &&", "while (target(a, b) && more) {"),
+        ("a ternary inside an if", "if (cond ? target(a, b) : other) {"),
+        ("an arrow inside a while", "while (target(a, b)->ready) {"),
+    )
+    for shape, head in call_shapes:
+        call = "void user() {\n    " + head + "\n        call_marker();\n    }\n}\n"
+        body = function_text(call + definition, "target")
+        for needle, expect in (("definition_marker", True), ("call_marker", False)):
+            cases += 1
+            if body is None or (needle in body) != expect:
+                fails.append(f"H13 scanner fixture: function_text(`target`) after {shape} {'lost' if expect else 'read'} "
+                             f"`{needle}`")
     cases += 1
     if function_text("void user() {\n    if (!target(a)) {\n        x();\n    }\n}\n", "target") is not None:
         fails.append("H13 scanner fixture: function_text(`target`) found a definition where there is only a call")
