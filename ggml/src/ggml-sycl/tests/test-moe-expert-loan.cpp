@@ -156,9 +156,10 @@
 //                           host entries are gone and the zone uses what it did before they were pinned.
 //   admit_completes_a_block_read_through_its_table
 //                           The admit of a block's only host triplet leaves every expert of the block on the device.
-//                           The three pointer tables built right after it, with no wait, for a ubatch routing that
-//                           expert each chain a ready event and name the admitted device copy, and a kernel behind
-//                           each upload on the same stream reads the original bytes through the table.
+//                           The three selected-ids pointer tables ggml_sycl_update_moe_ptr_table builds right after
+//                           it, with no wait, for a ubatch routing that expert each chain a ready event and name the
+//                           admitted device copy, and a kernel behind each upload on the same stream reads the
+//                           original bytes through the table.
 //   admit_reads_the_tensor_bytes_from_a_longer_host_copy
 //                           Each host copy is one staged tail longer than the Q4_0 expert, its tail 0x5a. The admit
 //                           mints the tensor's staged size, not the longer copy's, admits three of them, records the
@@ -168,6 +169,11 @@
 //                           The resolver reports a tensor 4 KiB longer per expert than the host copies. The cache
 //                           refuses the triplet REFUSED "host copy size", nothing is published, the triplet stays on
 //                           the host with its entries and records, and the minted storage's room comes back.
+//   admit_completes_a_block_the_direct_route_serves
+//                           With the tensors bound Q4_0 and the device info narrowed to device 0, the decode direct
+//                           route (ggml_sycl_moe_decode_direct_table) refuses the block while expert 1 is on the host.
+//                           After the admit it decides again and serves each tensor from AOS, its table names the
+//                           admitted device copy, and a kernel behind the upload reads the bytes through the table.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -257,6 +263,8 @@ int main() {
                    ggml_sycl::test_expert_admit_reads_the_tensor_bytes_from_a_longer_host_copy);
     ok &= run_case("admit_refuses_a_host_copy_shorter_than_the_tensor",
                    ggml_sycl::test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor);
+    ok &= run_case("admit_completes_a_block_the_direct_route_serves",
+                   ggml_sycl::test_expert_admit_completes_a_block_the_direct_route_serves);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;

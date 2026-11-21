@@ -676,7 +676,8 @@ std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pin
 // member served from a file mapping refuses its triplet and leaves it as it was, while a triplet named after it moves;
 // a loan outstanding and a WEIGHT zone with room for one member are BUSY and leave no state; the host zone gets the
 // moved copies' bytes back once their retired entries go; and the admit that completes a block is read from the card
-// through the pointer table built right after it, behind the copy's ready event.
+// through the selected-ids pointer table built right after it, behind the copy's ready event, and through the decode
+// direct route's table, which refused the block before the admit and serves it after.
 std::string test_expert_admit_zero_fills_a_padded_tail();
 std::string test_expert_admit_refuses_a_file_mapped_member();
 std::string test_expert_admit_is_busy_while_lent_or_the_zone_is_full();
@@ -687,6 +688,7 @@ std::string test_expert_admit_completes_a_block_read_through_its_table();
 // than the expert is refused "host copy size" and leaves the triplet as it was.
 std::string test_expert_admit_reads_the_tensor_bytes_from_a_longer_host_copy();
 std::string test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor();
+std::string test_expert_admit_completes_a_block_the_direct_route_serves();
 #endif
 
 }  // namespace ggml_sycl

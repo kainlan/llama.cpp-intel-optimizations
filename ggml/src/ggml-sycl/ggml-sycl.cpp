@@ -24637,6 +24637,12 @@ static void ggml_sycl_expert_refill_log_report() {
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+// The decode direct route, defined with the MUL_MAT_ID routes below. A case reads its table after a named admit.
+static const void * const * ggml_sycl_moe_decode_direct_table(ggml_backend_sycl_context & ctx,
+                                                              const ggml_tensor *         src0,
+                                                              int64_t                     selected_rows,
+                                                              layout_mode *               layout_out);
+
 // The loan transaction on synthetic MoE tensors whose experts are staged directly, so no model fixture is needed
 // (llama.cpp-mwmr). Each case returns an empty string on a pass and otherwise names the first assertion that failed.
 namespace ggml_sycl {
@@ -27977,9 +27983,10 @@ std::string test_expert_admit_returns_the_host_zone_bytes() {
 
 std::string test_expert_admit_completes_a_block_read_through_its_table() {
     // The admit that brings a block's last host triplet onto the device leaves the whole block resident, and the first
-    // MUL_MAT_ID after it serves the admitted expert from the card: the pointer table it builds names each admitted
-    // device copy, its upload is ordered on the copy's ready event, and a kernel behind the upload on the same
-    // in-order stream reads the original bytes through the table. Nothing between the admit and that kernel waits.
+    // MUL_MAT_ID after it serves the admitted expert from the card: the selected-ids pointer table it builds
+    // (ggml_sycl_update_moe_ptr_table) names each admitted device copy, its upload is ordered on the copy's ready
+    // event, and a kernel behind the upload on the same in-order stream reads the original bytes through the table.
+    // Nothing between the admit and that kernel waits. The decode direct route's table is the next case's.
     test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x61646d7405ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
@@ -28240,6 +28247,110 @@ std::string test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor() {
     if (!fx.reclaim_until([&] { return fx.cache->zone_available(vram_zone_id::WEIGHT) >= room; })) {
         return test_loan_fail("the refused admit kept %zu of the WEIGHT zone's %zu bytes of room",
                               room - fx.cache->zone_available(vram_zone_id::WEIGHT), room);
+    }
+    return {};
+}
+
+std::string test_expert_admit_completes_a_block_the_direct_route_serves() {
+    // The decode direct route serves a batch-1 MUL_MAT_ID from one table covering every expert of the tensor on the
+    // device, and refuses while any of them is on the host. It refuses the block while expert 1 is on the host. The
+    // admit remembers each device copy, which bumps the tensor's storage generation, so the route decides again: its
+    // table then names each admitted device copy, and a kernel behind the table's upload reads the bytes through it.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x61646d7408ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    if (std::string why = fx.pin_host_triplet(0, 1); !why.empty()) {
+        return why;
+    }
+
+    // The route takes only layouts the batched decode kernel reads, which f32 rows are not, so the layer's tensors are
+    // bound as Q4_0 over the fixture's records: on AOS the route sizes an expert by nb[2], the fixture's, and nothing
+    // here reads a byte as a quantized block. The route serves a single routable device and this run may see both
+    // cards, so its calls run with the device info narrowed to device 0, which holds everything here.
+    ggml_tensor tensors[3];
+    for (int s = 0; s < 3; ++s) {
+        fx.bind_tensor(tensors[s], 0, s);
+        tensors[s].type = GGML_TYPE_Q4_0;
+    }
+    ggml_sycl_device_info one_card = ggml_sycl_info();
+    one_card.device_count          = 1;
+    one_card.total_gpu_count       = 1;
+    ggml_backend_sycl_context ctx(fx.device);
+    {
+        test_sycl_info_override_guard single_card(one_card);
+        for (int s = 0; s < 3; ++s) {
+            layout_mode layout = GGML_LAYOUT_AOS;
+            if (::ggml_sycl_moe_decode_direct_table(ctx, &tensors[s], /*selected_rows=*/1, &layout)) {
+                return test_loan_fail("the direct route served slot %d while expert 1 was on the host", s);
+            }
+        }
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_move_request        request;
+    request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_moved != 1 ||
+        !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the admit that completes the block answered " + test_admit_answer(code, result);
+    }
+
+    const void * const * tables[3] = { nullptr, nullptr, nullptr };
+    {
+        test_sycl_info_override_guard single_card(one_card);
+        for (int s = 0; s < 3; ++s) {
+            layout_mode layout = GGML_LAYOUT_SOA;
+            tables[s]          = ::ggml_sycl_moe_decode_direct_table(ctx, &tensors[s], /*selected_rows=*/1, &layout);
+            if (!tables[s] || layout != GGML_LAYOUT_AOS) {
+                return test_loan_fail("the direct route did not serve slot %d from its AOS copies after the admit", s);
+            }
+        }
+    }
+    for (int s = 0; s < 3; ++s) {
+        const expert_resolve_result resolved = fx.resolve(0, s, 1);
+        if (!resolved || resolved.location != cache_location::DEVICE ||
+            fx.extras[s]->weight_ext->moe_expert_ptr_payload[fx.device][1] != resolved.ptr) {
+            return test_loan_fail("slot %d's direct table does not name the admitted device copy", s);
+        }
+    }
+
+    // The read: one kernel per table, behind the table's upload on the context's in-order stream, copying expert 1's
+    // bytes through the table's own entry.
+    mem_handle      out = ::ggml_sycl_device_expert_alloc(fx.device, 3 * bytes);
+    uint8_t * const dst = out.valid() ? static_cast<uint8_t *>(out.resolve(fx.device).ptr) : nullptr;
+    if (!dst) {
+        return "no WEIGHT zone room for the read's output";
+    }
+    for (int s = 0; s < 3; ++s) {
+        const void * const * table    = tables[s];
+        uint8_t * const      slot_out = dst + static_cast<size_t>(s) * bytes;
+        ctx.stream()->submit([&](sycl::handler & h) {
+            h.parallel_for(sycl::range<1>(bytes), [=](sycl::id<1> i) {
+                const size_t k = i[0];
+                slot_out[k]    = static_cast<const uint8_t *>(table[1])[k];
+            });
+        });
+    }
+    mem_handle readback = ::ggml_sycl_host_expert_alloc(fx.device, 3 * bytes);
+    if (!readback.valid()) {
+        return "no pinned host storage for the readback";
+    }
+    mem_copy_async(readback, out, 3 * bytes, *ctx.stream()).wait_and_throw();
+    const uint8_t * copy = static_cast<const uint8_t *>(readback.resolve().ptr);
+    for (int s = 0; s < 3; ++s) {
+        if (std::memcmp(copy + static_cast<size_t>(s) * bytes, fx.bytes[fx.index(0, s, 1)].data(), bytes) != 0) {
+            return test_loan_fail("slot %d's bytes read through the direct table differ from the original", s);
+        }
     }
     return {};
 }

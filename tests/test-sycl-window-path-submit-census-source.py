@@ -570,6 +570,7 @@ ALLOW: dict[str, tuple[int, str]] = {
     "submit:ggml-sycl.cpp:reorder_q8_0_gpu": (1, WEIGHT_LAYOUT),
     "submit:ggml-sycl.cpp:sycl_reorder_parallel_for": (1, WEIGHT_LAYOUT),
     "submit:ggml-sycl.cpp:test_expert_admit_completes_a_block_read_through_its_table": (1, TEST_ENTRY),
+    "submit:ggml-sycl.cpp:test_expert_admit_completes_a_block_the_direct_route_serves": (1, TEST_ENTRY),
     "submit:ggml-sycl.cpp:test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing": (1, TEST_ENTRY),
     "submit:ggml-sycl.cpp:try_xmx_sorted_moe": (3, MOE_XMX_SORT),
     "submit:mem-ops.cpp:mem_copy_ptr_async":
