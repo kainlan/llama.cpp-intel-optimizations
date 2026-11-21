@@ -849,7 +849,7 @@ REFILL_FLAG = "const bool refill = direction == ggml_sycl_expert_txn_direction::
 REFILL_CALL = "cache->refill_lent_triplet(triplet.members, record)"
 # Each triplet's kind picks the cache body that moves it and the words its refusals use; the call's direction picks
 # the kind of every triplet it prepares.
-KIND_ENUM = "enum class ggml_sycl_expert_move_kind { LOAN, REFILL, ADMIT, };"
+KIND_ENUM = "enum class ggml_sycl_expert_move_kind { LOAN, REFILL, ADMIT, EVICT, };"
 KIND_OF_CALL = ("const ggml_sycl_expert_move_kind kind = refill ? ggml_sycl_expert_move_kind::REFILL : named ? "
                 "ggml_sycl_expert_move_kind::ADMIT : ggml_sycl_expert_move_kind::LOAN;")
 KIND_TO_DEVICE = "const bool to_device = ggml_sycl_expert_move_to_device(triplet.kind);"
@@ -1011,13 +1011,16 @@ FORGET_HOST = ("(void) triplet.extras[r]->forget_moe_storage_handle_on_device(tr
                "GGML_LAYOUT_AOS, ggml_sycl::mem_handle::HOST_DEVICE);")
 # A move to the device drops the host copy's records; a loan drops the device copy's views and records.
 FORGET_BY_DIRECTION = ("if (to_device) { for (int r = 0; r < 3; ++r) { " + FORGET_HOST + " } } else {")
-# Each lent triplet's device bytes sit beside it in the ledger and move with it; a named move keeps no ledger.
+# Each lent triplet's device bytes sit beside it in the ledger and move with it; a named move keeps no ledger,
+# its admits and evicts alike marked moved with their device bytes for the caller's sums.
 POP_READMITTED = ("switch (triplet.kind) { case ggml_sycl_expert_move_kind::LOAN: "
                   "ledger.triplets.push_back({ placed[0], placed[1], placed[2] }); "
                   "ledger.triplet_bytes.push_back(ggml_sycl::moe_expert_triplet_dst_bytes(*next_plan, placed)); break; "
                   "case ggml_sycl_expert_move_kind::REFILL: ledger.triplets.pop_back(); "
                   "ledger.triplet_bytes.pop_back(); break; "
-                  "case ggml_sycl_expert_move_kind::ADMIT: (*named_moves)[triplet.named].moved = true; break; }")
+                  "case ggml_sycl_expert_move_kind::ADMIT: case ggml_sycl_expert_move_kind::EVICT: "
+                  "(*named_moves)[triplet.named].moved = true; "
+                  "(*named_moves)[triplet.named].device_bytes = record.device_bytes; break; }")
 
 
 def claim_refill_flips_back_and_forgets_the_host_copy(sycl: str) -> bool:

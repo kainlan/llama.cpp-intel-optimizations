@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Source contract: the named expert move's ADMIT direction (ggml-sycl.cpp, unified-cache.cpp, weight-row-padding.hpp).
+"""Source contract: the named expert move, its ADMIT and EVICT directions (ggml-sycl.cpp, unified-cache.cpp,
+weight-row-padding.hpp, common.hpp, moe-decode-hostpath.hpp).
 
 Host-only: reads sources, builds nothing, loads no model and touches no device. The behaviour is the private-fixture
 device cases in sycl-moe-expert-loan (lead-run); this gate pins what an edit could undo while those still pass, or what
 they cannot see.
 
-A boundary driver names expert triplets to admit: each moves from its pinned host copy to the device on its own, and
-all that move are published in one plan. The entry ggml_sycl_expert_move_transaction_run runs the plan transaction's
-one body (ggml_sycl_expert_txn_run) in the NAMED direction; the cache copies each triplet in
-unified_cache::admit_host_triplet, the refill's body (copy_host_triplet_to_device) with the admit's source rule and
-staged size. What this gate pins:
+A boundary driver names expert triplets to evict and to admit: each moves on its own, an evict from the device to
+pinned host storage and an admit from its pinned host copy to the device, and all that move are published in one plan.
+The entry ggml_sycl_expert_move_transaction_run runs the plan transaction's one body (ggml_sycl_expert_txn_run) in the
+NAMED direction, the evicts first; the cache copies each admitted triplet in unified_cache::admit_host_triplet, the
+refill's body (copy_host_triplet_to_device) with the admit's source rule and staged size, and each evicted one in
+unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
 
   A0  the bodies it reads exist, so no pin below passes on an empty string;
   A1  nothing on the admit's path waits or asks an event's status: no .wait(, wait_and_throw(, get_info<,
@@ -47,11 +49,28 @@ staged size. What this gate pins:
       private test fixtures calls the entry;
   A10 the named selection takes the published plan's verdict (moe_expert_move_validate) and moves only the triplets it
       lets through;
-  A11 every refusal the cache's shared body assigns is classed exactly once: final (in the transaction's final list,
-      ggml_sycl_expert_move_refusal_is_final) or transient (in this pin's TRANSIENT_REFUSALS, each with the path
-      that clears it), and each classified reason is one the body assigns. A refusal is final when the same inputs
-      give it again with nothing changed, so a renamed or new refusal cannot be retried at every decode graph
-      unclassified.
+  A11 every refusal either cache body assigns, the copy to the device and the loan's copy to the host, is classed
+      exactly once: final (in the transaction's one final list, ggml_sycl_expert_move_refusal_is_final) or transient
+      (in this pin's TRANSIENT_REFUSALS for the copy to the device and LOAN_TRANSIENT_REFUSALS for the copy to the
+      host, each with the path that clears it), and each classified reason is one a body assigns. A refusal is final
+      when the same inputs give it again with nothing changed, so a renamed or new refusal cannot be retried at every
+      decode graph, or answered BUSY to a named move at every boundary, unclassified;
+  E1  an evict list joins the request: the entry puts the evicts first in the one list the body runs, each marked as
+      a move to the host, and the named selection judges the evicts and the admits together, each triplet by its own
+      list's verdict;
+  E2  a named triplet's kind follows its list, EVICT for the evict list; an evict is a move to the host (the
+      direction helper names only REFILL and ADMIT as moves to the device), so the preparation mints pinned storage
+      at the tensor's bytes and the move statement hands it to the loan's cache body; its texts are a named move's,
+      and an exhausted pinned pool is BUSY for an evict while it stays REFUSED for a loan;
+  E3  an evict's record path moves the tensor's storage generation: the to-host branch drops the extra's views of
+      the withdrawn entry (a dropped storage record or table slot bumps the generation) and forgets its device record
+      before it remembers the host copy (every remember bumps it), and the decode direct route keys its stamp on that
+      generation, so a route that served the block from a full-coverage table decides again and never serves it from
+      the old table, which points at retired storage;
+  E4  a cache refusal of a named triplet, admit or evict, refuses that triplet alone, classified, and the next one
+      moves; it never ends the list;
+  E5  each moved outcome records the device storage it took or gives back, and the entry sums the counts and the
+      bytes per direction, each outcome back in its own list; the DEBUG line names both directions.
 
 Checks run on comment-stripped, whitespace-normalized text. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it and is reported if it survives, if another pin
@@ -59,7 +78,8 @@ catches it first, or if its anchor no longer matches exactly once in the body it
 also proves that last report fires. ctest registers it with --self-test.
 
 WHAT THIS DOES NOT PROVE. It reads text. That the copy and the fill run in that order on the device, that the tail
-reads back zero and that a kernel reads the admitted bytes through the direct route are the device cases' job.
+reads back zero, that a kernel reads the admitted bytes through the direct route, that an evicted block is no longer
+served from its old table and that an evict's room comes back only after the reap are the device cases' job.
 """
 
 from __future__ import annotations
@@ -73,6 +93,8 @@ FILES = {
     "sycl": ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp",
     "cache": ROOT / "ggml/src/ggml-sycl/unified-cache.cpp",
     "pad": ROOT / "ggml/src/ggml-sycl/weight-row-padding.hpp",
+    "common": ROOT / "ggml/src/ggml-sycl/common.hpp",
+    "hostpath": ROOT / "ggml/src/ggml-sycl/moe-decode-hostpath.hpp",
 }
 
 _LEXEME_RE = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.DOTALL)
@@ -113,11 +135,23 @@ def norm(text: str) -> str:
 
 def body_span(text: str, signature: str) -> tuple[int, int]:
     """The [start, end) span of the brace-balanced body of the first definition starting with `signature`, string
-    and character literals skipped while balancing; (-1, -1) when there is none."""
+    and character literals skipped while balancing; (-1, -1) when there is none. A declaration, whose parameter list
+    closes on a semicolon, is passed over: the decode direct route is declared early for the test cases that read it."""
     at = text.find(signature)
-    if at < 0:
-        return -1, -1
-    return block_span(text, text.find("{", at + len(signature)))
+    while at >= 0:
+        if signature.endswith("("):
+            depth = 0
+            close = -1
+            for i in range(at + len(signature) - 1, len(text)):
+                depth += {"(": 1, ")": -1}.get(text[i], 0)
+                if depth == 0:
+                    close = i
+                    break
+            if close >= 0 and text[close + 1:close + 200].lstrip().startswith(";"):
+                at = text.find(signature, close)
+                continue
+        return block_span(text, text.find("{", at + len(signature)))
+    return -1, -1
 
 
 def block_span(text: str, open_at: int) -> tuple[int, int]:
@@ -185,6 +219,13 @@ ADMIT_SIG = "bool unified_cache::admit_host_triplet("
 REFILL_SIG = "bool unified_cache::refill_lent_triplet("
 STAGED_SIG = "inline size_t staged_expert_bytes("
 PREP_SIG = "static const char * ggml_sycl_expert_prepare_triplet("
+LOAN_SIG = "bool unified_cache::loan_expert_triplet("
+DIRECTION_SIG = "static bool ggml_sycl_expert_move_to_device("
+TEXTS_SIG = "static ggml_sycl_expert_move_texts ggml_sycl_expert_move_texts_of("
+DROP_SIG = "static void ggml_sycl_drop_lent_expert_views("
+RECORD_SIG = "bool remember_moe_storage_handle("
+ROUTE_SIG = "static const void * const * ggml_sycl_moe_decode_direct_table("
+STAMP_SIG = "inline bool moe_decode_direct_stamp_current("
 
 # --- needles (normalized) -------------------------------------------------------------------------------------------
 
@@ -248,19 +289,22 @@ NAMED_CALL = ("const ggml_sycl_txn_result code = ggml_sycl_expert_txn_run(ggml_s
               "device, moves.size(), 0, false, resolver, &answer, false, &moves);")
 
 RESERVE_GUARD = "if (!refill && !named) { ledger.triplets.reserve("
+# A named triplet, admit or evict, records only its outcome: that it moved and the device storage it took or gives
+# back. Only a loan appends to the ledger and only a refill pops it.
 MOVED_BRANCH = ("switch (triplet.kind) { case ggml_sycl_expert_move_kind::LOAN: ledger.triplets.push_back({ placed[0], "
                 "placed[1], placed[2] }); ledger.triplet_bytes.push_back(ggml_sycl::moe_expert_triplet_dst_bytes("
                 "*next_plan, placed)); break; case ggml_sycl_expert_move_kind::REFILL: ledger.triplets.pop_back(); "
                 "ledger.triplet_bytes.pop_back(); break; case ggml_sycl_expert_move_kind::ADMIT: "
-                "(*named_moves)[triplet.named].moved = true; break; }")
+                "case ggml_sycl_expert_move_kind::EVICT: (*named_moves)[triplet.named].moved = true; "
+                "(*named_moves)[triplet.named].device_bytes = record.device_bytes; break; }")
 TAIL_GUARD = "if (!named) { if (!refill && lent != 0) { ledger.refill_armed = false; }"
 TAIL_WRITES = ("ledger.refill_armed = false;", "g_sycl_expert_lent_count[device].store(",
                "g_sycl_expert_lent_bytes[device].store(", "g_sycl_expert_readmitted_total[device].fetch_add(",
                "g_sycl_expert_lent_total[device].fetch_add(", "result.n_remaining =")
 CURSOR = "if (triplet.kind == ggml_sycl_expert_move_kind::REFILL && (!ledger.refill_armed ||"
-NAMED_CACHE_REFUSAL = ("if (!loaned && admit) { refuse_named(triplet.named, "
-                       "ggml_sycl_expert_move_refusal_is_final(record.reason) ? ggml_sycl_txn_result::REFUSED : "
-                       "ggml_sycl_txn_result::BUSY, record.reason); continue; }")
+NAMED_REFUSE = ("refuse_named(triplet.named, ggml_sycl_expert_move_refusal_is_final(record.reason) ? "
+                "ggml_sycl_txn_result::REFUSED : ggml_sycl_txn_result::BUSY, record.reason); continue; }")
+NAMED_CACHE_REFUSAL = "if (!loaned && (admit || evict)) { " + NAMED_REFUSE
 DROP_GUARD = ("if (triplet.kind == ggml_sycl_expert_move_kind::REFILL) { transient = "
               "!ggml_sycl_expert_move_refusal_is_final(stop); if (!transient) { drop_back(stop); } }")
 
@@ -274,10 +318,12 @@ PINNED_CHECK = ("if (e.location != cache_location::HOST_PINNED || !e.host_reside
                 '{ refusal = admit ? "host copy not pinned" : "not a lent copy"; break; }')
 
 REFUSE_GATE = "if (!probe_mode && !refill && !named && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {"
-NAMED_DEBUG = 'GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u triplets, %zu MiB admitted (%s)\\n"'
+NAMED_DEBUG = ('GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) '
+               '(%s)\\n"')
 ENTRY_NAME = "ggml_sycl_expert_move_transaction_run("
 
-VALIDATE = "const ggml_sycl::moe_expert_move_check check = ggml_sycl::moe_expert_move_validate(plan, device, {}, admit);"
+VALIDATE = ("const ggml_sycl::moe_expert_move_check check = ggml_sycl::moe_expert_move_validate(plan, device, evict, "
+            "admit);")
 
 # The cache's refusals that clear by themselves, each with the path that clears it. Every other refusal the shared
 # body assigns gives the same answer again with nothing changed, so it belongs in the transaction's final list.
@@ -289,13 +335,58 @@ TRANSIENT_REFUSALS = (
     "entry changed",  # the host copy changed between the check and the publish
     "publication failed",  # an allocation under the cache lock threw
 )
+# The same for the loan's cache body, which an evict runs: each clears by itself, so an evict meets it BUSY.
+LOAN_TRANSIENT_REFUSALS = (
+    "load effect unavailable",  # the load this thread is bound to commits or is abandoned
+    "plan not coherent",  # the plan publication in flight completes
+    "storage still referenced",  # the retention an in-flight copy keeps on the owner is released
+    "host entry exists",  # finalize_retired_entries_locked reaps the retired host entry an admit or a refill left
+    "copy submit failed",  # the runtime threw on a copy submit
+    "entry changed",  # the device entry changed between the check and the retire
+    "host registration failed",  # an allocation under the cache lock threw
+)
 SUCCESS_REASON = "OK"
 _REASON_ASSIGN_RE = re.compile(r"\b(?:refusal|out\.reason) = ([^;]*);")
 _LITERAL_RE = re.compile(r'"((?:\\.|[^"\\])*)"')
 _FINAL_LIST_RE = re.compile(r"final_reasons\[\] = \{([^}]*)\}")
-VERDICT = ("if (check.admit[i]) { moves[i].code = ggml_sycl_txn_result::REFUSED; moves[i].reason = check.admit[i]; "
-           "continue; }")
+# Each named triplet takes its own list's verdict: the plan judged the evicts and the admits in two lists.
+VERDICT = ("const char * verdict = moves[i].to_device ? check.admit[n_admit++] : check.evict[n_evict++]; "
+           "if (verdict) { moves[i].code = ggml_sycl_txn_result::REFUSED; moves[i].reason = verdict; continue; }")
 SELECT_CALL = "named ? ggml_sycl_expert_named_select(*current->plan, device, *named_moves, named_place) :"
+
+# E1: one list, the evicts first, each marked by its direction; the selection splits it back for the plan's verdict.
+ENTRY_ORDER = ("moves[i].to_device = i >= n_evict; "
+               "moves[i].triplet = i < n_evict ? request.evict[i] : request.admit[i - n_evict];")
+SELECT_SPLIT = ("for (const ggml_sycl_expert_move_outcome & m : moves) { "
+                "(m.to_device ? admit : evict).push_back(m.triplet); }")
+# E2: the kind of a named triplet, the direction an evict takes, its texts and its full pool.
+NAMED_PLACE = "triplet.named = named ? named_place[t] : 0;"
+PREP_KIND = "triplet.kind = named && !(*named_moves)[triplet.named].to_device ? ggml_sycl_expert_move_kind::EVICT : kind;"
+TO_DEVICE_KINDS = "return kind == ggml_sycl_expert_move_kind::REFILL || kind == ggml_sycl_expert_move_kind::ADMIT;"
+EVICT_TEXTS = ('case ggml_sycl_expert_move_kind::EVICT: return { "no tensor for a named expert", "not resident", '
+               '"exception while moving", "named move" };')
+EVICT_POOL_BUSY = ('if (!storage.valid()) { *transient = out.kind == ggml_sycl_expert_move_kind::EVICT; '
+                   'return "host pinned pool exhausted"; }')
+LEND_CALL = "cache->loan_expert_triplet(triplet.members, record)"
+# E3: the to-host branch, a loan's and an evict's, and the generation every step of it moves.
+TO_HOST_BRANCH = ("} else { for (int r = 0; r < 3; ++r) { const ggml_sycl::expert_placement_key & k = "
+                  "triplet.members[r].placement; ggml_tensor_extra_gpu * extra = triplet.extras[r]; "
+                  "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views); "
+                  "(void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device); } }")
+DROP_BUMP = "if (stored) { ++w.moe_expert_storage_generation; }"
+DROP_STORED = ("stored = list.size() != before;", "stored = true;")
+RECORD_BUMPS = ("existing = std::move(record); ++moe_expert_storage_generation; return true;",
+                "records.push_back(std::move(record)); ++moe_expert_storage_generation; return true;")
+ROUTE_GENERATION = "const uint64_t storage_generation = extra->weight().moe_expert_storage_generation;"
+ROUTE_STAMP = ("if (ggml_sycl::moe_decode_direct_stamp_current(stamp, replan_epoch, storage_generation, "
+               "selected_rows)) {")
+STAMP_COMPARES = "s.expert_storage_generation == expert_storage_generation"
+# E5: the entry splits the outcomes back per direction and sums each direction on its own.
+ENTRY_SPLIT = ("if (m.moved && m.to_device) { ++r.n_admitted; r.bytes_admitted += m.device_bytes; } "
+               "else if (m.moved) { ++r.n_evicted; r.bytes_evicted += m.device_bytes; } "
+               "(m.to_device ? r.admitted : r.evicted).push_back(m);")
+BODY_SPLIT = ("if (m.to_device) { result.bytes_readmitted += m.device_bytes; } "
+              "else { result.bytes_freed += m.device_bytes; ++n_evicted; }")
 
 
 def _private_testing_lines(raw: str) -> list[bool]:
@@ -330,11 +421,21 @@ def check(raw: dict[str, str]) -> None:
     staged = body(pad, STAGED_SIG)
     final = body(sycl, FINAL_SIG)
     prep = body(sycl, PREP_SIG)
+    common = norm(raw["common"])
+    loan = body(cache, LOAN_SIG)
+    direction = body(sycl, DIRECTION_SIG)
+    texts = body(sycl, TEXTS_SIG)
+    drop = body(sycl, DROP_SIG)
+    record = body(common, RECORD_SIG)
+    route = body(sycl, ROUTE_SIG)
+    stamp = body(norm(raw["hostpath"]), STAMP_SIG)
 
     # A0 ---------------------------------------------------------------------------------------------------------------
     named = {"transaction body": txn, "entry": entry, "named selection": select, "named stop": stop,
              "registered resolver": resolve, "cache shared body": copy, "cache admit": admit, "cache refill": refill,
-             "staged-size helper": staged, "final refusal list": final, "triplet preparation": prep}
+             "staged-size helper": staged, "final refusal list": final, "triplet preparation": prep,
+             "cache loan": loan, "direction helper": direction, "kind texts": texts, "view drop": drop,
+             "record remember": record, "decode direct route": route, "route stamp": stamp}
     for name, text in named.items():
         if not text:
             fail("A0", f"the {name} is missing, so every pin reading it would pass on nothing")
@@ -420,7 +521,7 @@ def check(raw: dict[str, str]) -> None:
     guarded = txn[start:end] if start >= 0 else ""
     if txn.count(TAIL_GUARD) != 1 or not all(guarded.count(w) == 1 for w in TAIL_WRITES):
         fail("A7", "the ledger's cursor, mirrors or totals are written outside the guard that keeps a named move out")
-    if txn.count(DROP_GUARD) != 1 or not ordered(txn, ADMIT_CALL, NAMED_CACHE_REFUSAL, DROP_GUARD):
+    if txn.count(DROP_GUARD) != 1 or not ordered(txn, ADMIT_CALL, NAMED_REFUSE, DROP_GUARD):
         fail("A7", "a cache refusal of a named triplet can reach the ledger drop")
 
     # A8 ---------------------------------------------------------------------------------------------------------------
@@ -445,21 +546,64 @@ def check(raw: dict[str, str]) -> None:
         fail("A10", "the named selection does not take the published plan's verdict on each triplet")
 
     # A11 --------------------------------------------------------------------------------------------------------------
-    assigned = [lit for rhs in _REASON_ASSIGN_RE.findall(copy) for lit in _LITERAL_RE.findall(rhs)]
     listed = _FINAL_LIST_RE.search(final)
     finals = _LITERAL_RE.findall(listed.group(1)) if listed else []
-    if not finals or assigned.count(SUCCESS_REASON) != 1:
-        fail("A11", "the final refusal list or the cache body's reason assignments are not where this pin reads them")
-    refusals = [r for r in assigned if r != SUCCESS_REASON]
-    for reason in refusals:
-        if reason in finals and reason in TRANSIENT_REFUSALS:
-            fail("A11", f'the cache refusal "{reason}" is both final and transient')
-        if reason not in finals and reason not in TRANSIENT_REFUSALS:
-            fail("A11", f'the cache refusal "{reason}" is neither final nor transient, so a refill retries it at '
-                        "every decode graph unclassified")
-    for reason in list(finals) + list(TRANSIENT_REFUSALS):
-        if reason not in refusals:
-            fail("A11", f'"{reason}" is classified, but the cache body assigns no such refusal')
+    assigned_by = {}
+    for name, text, transients in (("copy to the device", copy, TRANSIENT_REFUSALS),
+                                   ("loan's copy to the host", loan, LOAN_TRANSIENT_REFUSALS)):
+        assigned = [lit for rhs in _REASON_ASSIGN_RE.findall(text) for lit in _LITERAL_RE.findall(rhs)]
+        if not finals or assigned.count(SUCCESS_REASON) != 1:
+            fail("A11", f"the final refusal list or the {name}'s reason assignments are not where this pin reads them")
+        refusals = [r for r in assigned if r != SUCCESS_REASON]
+        assigned_by[name] = refusals
+        for reason in refusals:
+            if reason in finals and reason in transients:
+                fail("A11", f'the {name}\'s refusal "{reason}" is both final and transient')
+            if reason not in finals and reason not in transients:
+                fail("A11", f'the {name}\'s refusal "{reason}" is neither final nor transient, so it is retried at '
+                            "every boundary unclassified")
+        for reason in transients:
+            if reason not in refusals:
+                fail("A11", f'"{reason}" is classified transient, but the {name} assigns no such refusal')
+    for reason in finals:
+        if not any(reason in refusals for refusals in assigned_by.values()):
+            fail("A11", f'"{reason}" is classified final, but no cache body assigns such a refusal')
+
+    # E1 ---------------------------------------------------------------------------------------------------------------
+    if entry.count(ENTRY_ORDER) != 1 or select.count(SELECT_SPLIT) != 1 or not ordered(select, SELECT_SPLIT, VALIDATE,
+                                                                                         VERDICT):
+        fail("E1", "the evicts are not put first in the one list, or not judged with the admits by their own verdicts")
+
+    # E2 ---------------------------------------------------------------------------------------------------------------
+    if txn.count(PREP_KIND) != 1 or not ordered(txn, NAMED_PLACE, PREP_KIND, PREP_CALL):
+        fail("E2", "a named triplet's kind does not follow its list before it is prepared")
+    if direction.count(TO_DEVICE_KINDS) != 1 or "EVICT" in direction or ADMIT_CALL not in txn or LEND_CALL not in txn:
+        fail("E2", "an evict is not a move to the host through the loan's cache body")
+    if texts.count(EVICT_TEXTS) != 1:
+        fail("E2", "an evict does not answer with a named move's texts and the loan's no-source refusal")
+    if prep.count(EVICT_POOL_BUSY) != 1 or not ordered(prep, HOST_MINT, EVICT_POOL_BUSY):
+        fail("E2", "an evict's exhausted pinned pool is not BUSY, or a loan's is not REFUSED")
+
+    # E3 ---------------------------------------------------------------------------------------------------------------
+    if txn.count(TO_HOST_BRANCH) != 1 or not ordered(txn, ADMIT_CALL, TO_HOST_BRANCH, REMEMBER):
+        fail("E3", "an evict does not drop the extra's views and its device record before it remembers the host copy")
+    if drop.count(DROP_BUMP) != 1 or not all(drop.count(s) == 1 for s in DROP_STORED) or not ordered(
+            drop, *DROP_STORED, DROP_BUMP):
+        fail("E3", "a dropped storage record or table slot does not move the tensor's storage generation")
+    if not all(record.count(b) == 1 for b in RECORD_BUMPS):
+        fail("E3", "remembering the host copy does not move the tensor's storage generation")
+    if (route.count(ROUTE_GENERATION) != 1 or not ordered(route, ROUTE_GENERATION, ROUTE_STAMP)
+            or STAMP_COMPARES not in stamp):
+        fail("E3", "the decode direct route does not key its stamp on the tensor's storage generation, so it could "
+                   "serve an evicted block from its old table")
+
+    # E4 ---------------------------------------------------------------------------------------------------------------
+    if txn.count(NAMED_CACHE_REFUSAL) != 1 or not ordered(txn, ADMIT_CALL, NAMED_CACHE_REFUSAL, "if (!loaned) {"):
+        fail("E4", "a cache refusal of a named triplet, admit or evict, does not refuse that triplet alone")
+
+    # E5 ---------------------------------------------------------------------------------------------------------------
+    if entry.count(ENTRY_SPLIT) != 1 or txn.count(BODY_SPLIT) != 1 or not ordered(txn, BODY_SPLIT, NAMED_DEBUG):
+        fail("E5", "the outcomes' counts and bytes are not summed per direction, each outcome in its own list")
 
 
 def mutate(raw: dict[str, str], edits: list[tuple[str, str, str, str]]) -> dict[str, str]:
@@ -541,9 +685,9 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("host-copy-at-entry-size", "A4",
                 [("sycl", PREP_SIG, "ggml_sycl_host_expert_alloc(device, target.logical_bytes)",
                   "ggml_sycl_host_expert_alloc(device, cache.loan_copy_bytes(target.key))")])
-    expect_fail("transaction-sizes-a-copy", "A4", [("sycl", TXN_SIG, "        triplet.kind  = kind;",
-                                                    "        triplet.kind  = kind;\n        (void) staged_expert_bytes("
-                                                    "GGML_LAYOUT_AOS, GGML_TYPE_COUNT, 0, 0);")])
+    expect_fail("transaction-sizes-a-copy", "A4", [("sycl", TXN_SIG, "        triplet.named = named ? named_place[t] : 0;",
+                                                    "        triplet.named = named ? named_place[t] : 0;\n        (void) "
+                                                    "staged_expert_bytes(GGML_LAYOUT_AOS, GGML_TYPE_COUNT, 0, 0);")])
     expect_fail("cache-checks-host-size", "A4", [("cache", COPY_SIG,
                                                   "staged_expert_bytes(e.layout, members[i].type, members[i].ncols, "
                                                   "logical)",
@@ -598,11 +742,18 @@ def self_test(raw: dict[str, str]) -> int:
                                            "    lock.unlock();\n    warn_dropped();\n    if (!swapped) {")])
     expect_fail("named-reserves-ledger", "A7", [("sycl", TXN_SIG, "if (!refill && !named) {", "if (!refill) {")])
     expect_fail("named-appends-to-ledger", "A7", [("sycl", TXN_SIG,
-                                                   "case ggml_sycl_expert_move_kind::ADMIT:\n"
+                                                   "case ggml_sycl_expert_move_kind::EVICT:\n"
                                                    "                    (*named_moves)[",
-                                                   "case ggml_sycl_expert_move_kind::ADMIT:\n"
+                                                   "case ggml_sycl_expert_move_kind::EVICT:\n"
                                                    "                    ledger.triplets.push_back({ placed[0], placed[1], "
                                                    "placed[2] });\n                    (*named_moves)[")])
+    expect_fail("evict-joins-the-loans-case", "A7", [("sycl", TXN_SIG,
+                                                      "                case ggml_sycl_expert_move_kind::ADMIT:\n"
+                                                      "                case ggml_sycl_expert_move_kind::EVICT:\n",
+                                                      "                case ggml_sycl_expert_move_kind::ADMIT:\n")]
+                + [("sycl", TXN_SIG, "                case ggml_sycl_expert_move_kind::LOAN:\n",
+                    "                case ggml_sycl_expert_move_kind::LOAN:\n"
+                    "                case ggml_sycl_expert_move_kind::EVICT:\n")])
     expect_fail("named-refusal-dropped", "A7", [("sycl", TXN_SIG,
                                                  "if (triplet.kind == ggml_sycl_expert_move_kind::REFILL) {\n"
                                                  "                    transient",
@@ -624,7 +775,7 @@ def self_test(raw: dict[str, str]) -> int:
                                              "static void ggml_sycl_admit_everything(int d) {\n"
                                              "    (void) ggml_sycl_expert_move_transaction_run(d, {}, nullptr, nullptr);"
                                              "\n}\n\n" + ENTRY_SIG)])
-    expect_fail("verdict-ignored", "A10", [("sycl", SELECT_SIG, "if (check.admit[i]) {", "if (false) {")])
+    expect_fail("verdict-ignored", "A10", [("sycl", SELECT_SIG, "if (verdict) {", "if (false) {")])
     expect_fail("final-refusal-misspelled-in-cache", "A11", [("cache", COPY_SIG, 'refusal = "device storage not owned";',
                                                               'refusal = "device storage not own";')])
     expect_fail("final-refusal-misspelled-in-list", "A11", [("sycl", FINAL_SIG, '"device storage not owned",',
@@ -633,6 +784,45 @@ def self_test(raw: dict[str, str]) -> int:
                                                          'out.reason = "copy submit faild";')])
     expect_fail("transient-refusal-made-final", "A11", [("sycl", FINAL_SIG, '"invalid arguments",',
                                                          '"invalid arguments", "entry changed",')])
+    expect_fail("loan-refusal-unclassified", "A11", [("cache", LOAN_SIG, 'refusal = "shared storage";',
+                                                      'refusal = "shared storage held";')])
+    expect_fail("loan-transient-made-final", "A11", [("sycl", FINAL_SIG, '"invalid arguments",',
+                                                      '"invalid arguments", "storage still referenced",')])
+    expect_fail("loan-final-dropped-from-the-list", "A11", [("sycl", FINAL_SIG, '"shared storage",', "")])
+    expect_fail("admits-first", "E1", [("sycl", ENTRY_SIG, "moves[i].to_device = i >= n_evict;",
+                                        "moves[i].to_device = i < request.admit.size();")])
+    expect_fail("evicts-judged-as-admits", "E1", [("sycl", SELECT_SIG, "(m.to_device ? admit : evict).push_back(",
+                                                   "admit.push_back(")])
+    expect_fail("evict-kind-never-set", "E2", [("sycl", TXN_SIG, "? ggml_sycl_expert_move_kind::EVICT : kind;",
+                                                "? ggml_sycl_expert_move_kind::ADMIT : kind;")])
+    expect_fail("evict-copied-to-device", "E2", [("sycl", DIRECTION_SIG, "kind == ggml_sycl_expert_move_kind::ADMIT;",
+                                                  "kind == ggml_sycl_expert_move_kind::ADMIT ||\n"
+                                                  "           kind == ggml_sycl_expert_move_kind::EVICT;")])
+    expect_fail("evict-texts-missing", "E2", [("sycl", TEXTS_SIG, '"not resident", "exception while moving"',
+                                               '"not on host", "exception while moving"')])
+    expect_fail("evict-pool-full-refused", "E2", [("sycl", PREP_SIG,
+                                                   "*transient = out.kind == ggml_sycl_expert_move_kind::EVICT;",
+                                                   "*transient = false;")])
+    expect_fail("evict-keeps-device-views", "E3", [("sycl", TXN_SIG,
+                                                    "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, "
+                                                    "record.device_keys[r], lent_views);", "")])
+    expect_fail("drop-keeps-generation", "E3", [("sycl", DROP_SIG, "++w.moe_expert_storage_generation;", "")])
+    expect_fail("remember-keeps-generation", "E3", [("common", RECORD_SIG,
+                                                     "records.push_back(std::move(record));\n"
+                                                     "        ++moe_expert_storage_generation;",
+                                                     "records.push_back(std::move(record));")])
+    expect_fail("route-ignores-generation", "E3", [("sycl", ROUTE_SIG, "(stamp, replan_epoch, storage_generation, "
+                                                    "selected_rows)) {",
+                                                    "(stamp, replan_epoch, stamp.expert_storage_generation, "
+                                                    "selected_rows)) {")])
+    expect_fail("stamp-ignores-generation", "E3", [("hostpath", STAMP_SIG,
+                                                    "s.expert_storage_generation == expert_storage_generation && ", "")])
+    expect_fail("evict-refusal-ends-the-list", "E4", [("sycl", TXN_SIG, "if (!loaned && (admit || evict)) {",
+                                                       "if (!loaned && admit) {")])
+    expect_fail("evict-bytes-counted-as-admitted", "E5", [("sycl", ENTRY_SIG, "r.bytes_evicted += m.device_bytes;",
+                                                           "r.bytes_admitted += m.device_bytes;")])
+    expect_fail("body-sums-both-directions", "E5", [("sycl", TXN_SIG, "result.bytes_freed += m.device_bytes;",
+                                                     "result.bytes_readmitted += m.device_bytes;")])
 
     try:
         mutate(raw, [("sycl", "", "this anchor is in no source", "x")])
@@ -664,8 +854,8 @@ def main(argv: list[str]) -> int:
     except ContractError as e:
         print(e)
         return 1
-    print("PASS: the named move's admit waits for nothing, mints the staged size behind no lock, fills the tail before "
-          "it publishes once, and leaves the ledger alone")
+    print("PASS: the named move waits for nothing, mints behind no lock, fills an admit's tail before it publishes "
+          "once, moves an evict to the host with the generation bumped, and leaves the ledger alone")
     return 0
 
 

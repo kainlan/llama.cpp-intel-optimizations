@@ -201,6 +201,22 @@ void test_net_count_per_block() {
     CHECK(refused.net_by_layer.empty());
 }
 
+// An evict-only call: the transaction reads each evict's answer at its naming's index, so an answer stays there
+// whatever was refused before it, and only the movable triplet counts, its block reading -1 alone.
+void test_evict_only_answers_in_order() {
+    const placement_plan        plan = make_plan();
+    const moe_expert_move_check c    = validate(plan, { tr(1, 2), tr(0, 4), tr(1, 0), tr(1, 0) }, {});
+    CHECK(c.evict.size() == 4 && c.admit.empty());
+    if (c.evict.size() == 4) {
+        CHECK(reason_is(c.evict[0], "not on device"));
+        CHECK(reason_is(c.evict[1], "wrong device"));
+        CHECK(c.evict[2] == nullptr);
+        CHECK(reason_is(c.evict[3], "duplicate triplet"));
+    }
+    const std::vector<std::pair<int, int>> want = { std::make_pair(1, -1) };
+    CHECK(c.net_by_layer == want);
+}
+
 }  // namespace
 
 int main() {
@@ -211,6 +227,7 @@ int main() {
     test_soa_member_refused();
     test_duplicate_keys_refused();
     test_net_count_per_block();
+    test_evict_only_answers_in_order();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-expert-move-validate: %d failure(s)\n", failures);
