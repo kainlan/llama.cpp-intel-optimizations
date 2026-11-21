@@ -72,4 +72,111 @@ inline bool mmvq_launch_covers_rows(const int padded_rows, const int rows) {
     return padded_rows >= rows;
 }
 
+// ---------------------------------------------------------------------------
+// Column-split form of the Q8_0 matvec (SOA and coalesced layouts).
+//
+// The row form above is parallel over rows only: one sub-group per output row,
+// walking the whole row in steps of `blocks_per_step` blocks (8 for the SOA
+// kernel: vdr 2 ints x 32 lanes / 8 ints per block; one 32-block tile for the
+// coalesced kernel). A matrix with few rows and long rows therefore runs on a
+// handful of sub-groups while the card idles: 4 x 10240 is four sub-groups of
+// 40 steps each.
+//
+// The column-split form keeps the row form's work-group (16 sub-groups) and
+// gives each row `chunks` of them. Chunk c walks the row form's steps c,
+// c + chunks, c + 2 * chunks, ... (`mmvq_column_split_first_step` and
+// `mmvq_column_split_step_stride`, which both kernels call, so the host test
+// sweeps the walk the kernels take). Each sub-group reduces its lanes as the
+// row form does, the partials meet in the work-group's local memory (a
+// work-group runs on one Xe-core), and one sub-group per row adds them in
+// chunk order. A work-group holds 16 / chunks rows.
+//
+// When it is chosen (`mmvq_column_split_chunks`), from the launch geometry and
+// one device fact, never from a tensor or model name:
+//   * rows < compute_units. The row form gives each row one sub-group, a
+//     sub-group runs as one hardware thread on one execution unit, and SYCL's
+//     max_compute_units is the execution-unit count on these cards (256 on the
+//     Arc Pro B70, 128 on the B50). With fewer rows than that, the row form
+//     cannot give every execution unit even one thread; with at least that
+//     many it can, and it is kept unchanged.
+//   * at least two of the row form's steps per row, so every chunk owns at
+//     least one step; fewer would only add idle sub-groups and a barrier.
+// The chunk count is then the largest power of two that is at most 16 (the
+// work-group's sub-groups, so a row never spans two work-groups) and at most
+// the row's step count. Powers of two divide 16, so the rows per work-group
+// are a whole number.
+//
+// Like the padding above, this is pure arithmetic with no SYCL dependency so
+// tests/test-sycl-mmvq-column-split-rule.cpp can hold it on a host.
+
+// The sub-groups of a column-split work-group: the row form's work-group, the
+// size these launches are already known to run with.
+constexpr int MMVQ_COLUMN_SPLIT_SUBGROUPS = 16;
+
+// The row form's sub-group steps over one row: ceil(blocks / step).
+inline int mmvq_column_split_steps(const int blocks_per_row, const int blocks_per_step) {
+    if (blocks_per_row <= 0 || blocks_per_step <= 0) {
+        return 0;
+    }
+    return (blocks_per_row + blocks_per_step - 1) / blocks_per_step;
+}
+
+// The dispatch rule. Returns 1 for the row form, otherwise the chunks per row.
+// `compute_units` <= 0 (the device did not say) keeps the row form.
+inline int mmvq_column_split_chunks(const int rows,
+                                    const int blocks_per_row,
+                                    const int blocks_per_step,
+                                    const int compute_units) {
+    if (rows <= 0 || compute_units <= 0 || rows >= compute_units) {
+        return 1;
+    }
+    const int steps  = mmvq_column_split_steps(blocks_per_row, blocks_per_step);
+    int       chunks = 1;
+    while (chunks * 2 <= MMVQ_COLUMN_SPLIT_SUBGROUPS && chunks * 2 <= steps) {
+        chunks *= 2;
+    }
+    return chunks;
+}
+
+inline int mmvq_column_split_rows_per_workgroup(const int chunks) {
+    return chunks > 0 ? MMVQ_COLUMN_SPLIT_SUBGROUPS / chunks : 0;
+}
+
+// Whole work-groups covering `rows`; the last may hold padded rows, which the
+// kernel computes nothing for and never writes.
+inline int mmvq_column_split_workgroups(const int rows, const int chunks) {
+    const int rows_per_workgroup = mmvq_column_split_rows_per_workgroup(chunks);
+    if (rows <= 0 || rows_per_workgroup <= 0) {
+        return 0;
+    }
+    return (rows + rows_per_workgroup - 1) / rows_per_workgroup;
+}
+
+// The walk, in the row form's steps: chunk `chunk` of `chunks` takes steps
+// first_step(chunk), then every step_stride(chunks) further. The coalesced
+// kernel walks these directly, its step being one tile (so the walk is over
+// tile indices and needs no tile-size or sub-group-size relation); the SOA
+// kernel walks them through the block forms below. With one chunk this is the
+// row form's walk, every step in order.
+inline int mmvq_column_split_first_step(const int chunk) {
+    return chunk;
+}
+
+inline int mmvq_column_split_step_stride(const int chunks) {
+    return chunks;
+}
+
+// The SOA kernel's form of the walk, in blocks: the first block a lane of
+// chunk `chunk` reads, where `lane_block` is the lane's block within one step
+// (lane / 4). With one chunk this is the row form's own start.
+inline int mmvq_column_split_first_block(const int chunk, const int lane_block, const int blocks_per_step) {
+    return mmvq_column_split_first_step(chunk) * blocks_per_step + lane_block;
+}
+
+// The distance between a chunk's consecutive blocks. With one chunk this is
+// the row form's own stride, one step.
+inline int mmvq_column_split_block_stride(const int chunks, const int blocks_per_step) {
+    return mmvq_column_split_step_stride(chunks) * blocks_per_step;
+}
+
 }  // namespace ggml_sycl
