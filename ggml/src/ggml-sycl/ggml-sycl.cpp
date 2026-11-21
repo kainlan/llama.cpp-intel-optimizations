@@ -139,6 +139,7 @@
 #include "ggml-sycl/orchestrator.hpp"
 #include "ggml-sycl/pool-legacy-release.hpp"
 #include "ggml-sycl/presets.hpp"
+#include "ggml-sycl/prestage-class.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/residency-probe.hpp"
@@ -116813,20 +116814,6 @@ static bool graph_tensor_is_input(const ggml_tensor * tensor) {
     return false;
 }
 
-// What a graph prestage does with one source tensor. The first three classes
-// are decided without copying; COPY is the only class whose bytes the
-// predicate reports. INPUT and KV_HOST are not counted but still reach the
-// prestage's copy path: INPUT has its own stable staging, and a KV-host source
-// is staged as before.
-enum class ggml_sycl_prestage_class {
-    CONTROL,
-    WEIGHT,
-    DEVICE,
-    INPUT,
-    KV_HOST,
-    COPY,
-};
-
 // The buffer type `tensor`'s bytes live in. A view lives in its source's buffer.
 static ggml_backend_buffer_type_t ggml_sycl_prestage_source_buft(const ggml_tensor * tensor) {
     if (!tensor) {
@@ -116837,25 +116824,55 @@ static ggml_backend_buffer_type_t ggml_sycl_prestage_source_buft(const ggml_tens
     return buf ? buf->buft : nullptr;
 }
 
-// Requires tensor->data: a tensor with no storage yet has nothing to classify.
+// The nodes of one graph, collected on first use. Only a host op output that no earlier class claims asks
+// (ggml_sycl_prestage_facts_of), so a graph whose intermediates and inputs live on the device never builds it.
+struct ggml_sycl_graph_node_set {
+    // `cgraph` is non-null: the pre-stage and the refresh return on a null graph before they construct one.
+    explicit ggml_sycl_graph_node_set(const ggml_cgraph * cgraph) : cgraph(cgraph) {}
+
+    bool contains(const ggml_tensor * tensor) {
+        if (!built) {
+            built = true;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                nodes.insert(cgraph->nodes[i]);
+            }
+        }
+        return nodes.find(tensor) != nodes.end();
+    }
+
+  private:
+    const ggml_cgraph *                     cgraph = nullptr;
+    bool                                    built  = false;
+    std::unordered_set<const ggml_tensor *> nodes;
+};
+
+// Requires tensor->data: a tensor with no storage yet has nothing to classify. `graph_nodes` is the graph being
+// staged. Without one the producer of a host op output is unknown, and the fact says "this graph's own": that keeps
+// it COPY, the class it had before host op outputs could be inputs, and the bytes predicate counts it either way.
+static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of(const ggml_tensor *        tensor,
+                                                            ggml_backend_buffer_type_t src_buft,
+                                                            ggml_sycl_graph_node_set * graph_nodes) {
+    ggml_sycl_prestage_facts facts;
+    facts.is_control        = ggml_sycl_tensor_uses_cross_device_control_storage(tensor);
+    facts.is_weight         = ggml_sycl_tensor_is_weight(tensor);
+    facts.is_device         = ggml_sycl_get_alloc_type(tensor->data) == sycl::usm::alloc::device;
+    facts.is_input          = graph_tensor_is_input(tensor);
+    facts.is_kv_host        = src_buft && src_buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name;
+    facts.root_is_op_output = ggml_sycl_prestage_root_is_op_output(tensor);
+    // The rule reads the graph-node fact only for a host op output no earlier class claims; asking for any other
+    // tensor would build the node set for every device intermediate of every walk.
+    const bool reaches_rule = facts.root_is_op_output && !facts.is_control && !facts.is_weight && !facts.is_device &&
+                              !facts.is_input && !facts.is_kv_host;
+    facts.root_is_graph_node =
+        reaches_rule && (!graph_nodes || graph_nodes->contains(ggml_sycl_prestage_view_root(tensor)));
+    return facts;
+}
+
+// The rule is ggml_sycl_prestage_class_of (prestage-class.hpp).
 static ggml_sycl_prestage_class ggml_sycl_prestage_classify(const ggml_tensor *        tensor,
-                                                            ggml_backend_buffer_type_t src_buft) {
-    if (ggml_sycl_tensor_uses_cross_device_control_storage(tensor)) {
-        return ggml_sycl_prestage_class::CONTROL;
-    }
-    if (ggml_sycl_tensor_is_weight(tensor)) {
-        return ggml_sycl_prestage_class::WEIGHT;
-    }
-    if (ggml_sycl_get_alloc_type(tensor->data) == sycl::usm::alloc::device) {
-        return ggml_sycl_prestage_class::DEVICE;
-    }
-    if (graph_tensor_is_input(tensor)) {
-        return ggml_sycl_prestage_class::INPUT;
-    }
-    if (src_buft && src_buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name) {
-        return ggml_sycl_prestage_class::KV_HOST;
-    }
-    return ggml_sycl_prestage_class::COPY;
+                                                            ggml_backend_buffer_type_t src_buft,
+                                                            ggml_sycl_graph_node_set * graph_nodes) {
+    return ggml_sycl_prestage_class_of(ggml_sycl_prestage_facts_of(tensor, src_buft, graph_nodes));
 }
 
 size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
@@ -116867,7 +116884,10 @@ size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
     if (!tensor || !tensor->data) {
         return 0;
     }
-    return ggml_sycl_prestage_classify(tensor, src_buft) == ggml_sycl_prestage_class::COPY ? ggml_nbytes(tensor) : 0;
+    // No graph in hand: ggml_sycl_prestage_reports_bytes gives the same answer for a host op output whichever graph
+    // produced it.
+    const bool reported = ggml_sycl_prestage_reports_bytes(ggml_sycl_prestage_facts_of(tensor, src_buft, nullptr));
+    return reported ? ggml_nbytes(tensor) : 0;
 }
 
 thread_local int g_ggml_sycl_device_dispatch_depth = 0;
@@ -117050,6 +117070,9 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context *             
     // Filled only on a recording pass; an empty set allocates nothing.
     std::unordered_set<const ggml_tensor *> recorded;
 
+    // A host op output this graph produces is not another split's input (ggml_sycl_prestage_class_of).
+    ggml_sycl_graph_node_set graph_nodes(cgraph);
+
     // The stage action for a tensor that needs a device copy: the INPUT arm, or the unified cache with the staging
     // cache behind it. A recording pass lists each tensor the first time it gets here, before the action runs, so a
     // replay of the list runs the same actions in the same order with the same failure handling.
@@ -117155,7 +117178,7 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context *             
         }
 
         const ggml_sycl_prestage_class source_class =
-            ggml_sycl_prestage_classify(tensor, ggml_sycl_prestage_source_buft(tensor));
+            ggml_sycl_prestage_classify(tensor, ggml_sycl_prestage_source_buft(tensor), &graph_nodes);
 
         // Handle weight tensors specially in tiered mode
         if (source_class == ggml_sycl_prestage_class::WEIGHT) {
@@ -117488,6 +117511,9 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
     std::unordered_set<graph_input_tensor_key, graph_input_tensor_key_hash> seen_inputs;
     ctx->cached_input_tensors.clear();
 
+    // As in the pre-stage: an op output this graph produces is not an input to refresh.
+    ggml_sycl_graph_node_set graph_nodes(cgraph);
+
     auto make_input_tensor_key = [&](const ggml_tensor * tensor, graph_input_tensor_key * out_key) -> bool {
         if (!tensor || ctx->device < 0 || !out_key) {
             return false;
@@ -117544,7 +117570,11 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
         if (ggml_nbytes(tensor) == 0) {
             return;
         }
-        if (!graph_tensor_is_input(tensor)) {
+        // A host-resident op output the pre-stage stages as an INPUT is refreshed like one: a replay that does not run
+        // the pre-stage first would otherwise read the bytes of the token that recorded it.
+        if (!(graph_tensor_is_input(tensor) ||
+              ggml_sycl_prestage_classify(tensor, ggml_sycl_prestage_source_buft(tensor), &graph_nodes) ==
+                  ggml_sycl_prestage_class::INPUT)) {
             if (dkw0_input_list_on && dkw0_skipped_seen.insert(tensor).second) {
                 fprintf(stderr,
                         "[DKW0-INPUT-LIST] SKIPPED name=%s tensor=%p op=%s type=%d ne=[%lld,%lld,%lld,%lld] "

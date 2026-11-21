@@ -1,0 +1,98 @@
+//
+// MIT license
+// Copyright (C) 2024-2026 Intel Corporation
+// SPDX-License-Identifier: MIT
+//
+
+// What a graph prestage does with one source tensor.
+//
+// The rule is a pure function of facts the backend gathers (ggml_sycl_prestage_facts_of in ggml-sycl.cpp), so it can
+// be unit-tested on a host with no GPU, no SYCL runtime and no backend library
+// (tests/test-sycl-prestage-class.cpp). The backend does not carry a second copy of it.
+
+#pragma once
+
+#include "ggml.h"
+
+// The first three classes are decided without copying. INPUT has its own stable staging, and a KV-host source is
+// staged as before. Which classes ggml_sycl_prestage_needs_device_copy counts is ggml_sycl_prestage_reports_bytes.
+enum class ggml_sycl_prestage_class {
+    CONTROL,
+    WEIGHT,
+    DEVICE,
+    INPUT,
+    KV_HOST,
+    COPY,
+};
+
+struct ggml_sycl_prestage_facts {
+    bool is_control         = false;  // cross-device control storage
+    bool is_weight          = false;
+    bool is_device          = false;  // device USM
+    bool is_input           = false;  // the tensor, or a tensor it views, carries GGML_TENSOR_FLAG_INPUT
+    bool is_kv_host         = false;  // its bytes live in the KV-host buft
+    bool root_is_op_output  = false;  // ggml_sycl_prestage_root_is_op_output
+    bool root_is_graph_node = false;  // the view root is a node of the graph being staged (asked only when the
+                                      // rule reads it: a host op output no earlier class claims)
+};
+
+// The tensor whose storage `tensor` views, or `tensor` itself.
+static inline const ggml_tensor * ggml_sycl_prestage_view_root(const ggml_tensor * tensor) {
+    if (!tensor) {
+        return nullptr;
+    }
+    while (tensor->view_src) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
+// True when an op wrote the tensor's bytes: its view root is not a leaf. The root decides, because a view's own op is
+// GGML_OP_VIEW whether it views a leaf or an op output.
+static inline bool ggml_sycl_prestage_root_is_op_output(const ggml_tensor * tensor) {
+    const ggml_tensor * root = ggml_sycl_prestage_view_root(tensor);
+    return root && root->op != GGML_OP_NONE;
+}
+
+// A host-resident op output that no earlier class claims, and that the graph being staged does not produce, is another
+// split's per-token activation: the CPU computed it into a host compute buffer the SYCL backend accepts in place, so
+// the scheduler made no device copy. It is staged as an INPUT, to a stable buffer re-copied on every call.
+//
+// An op output this graph produces stays COPY. When the backend's own compute buffer is host memory
+// (GGML_SYCL_HOST_COMPUTE=1) every intermediate is a host op output; staging them as inputs would copy each one before
+// its producer has run, and a consumer that looks staging up by name while recording would bake that stale copy.
+//
+// The rule sits after KV_HOST so that KV state never becomes per-call staging, whatever the root of a KV write is.
+static inline ggml_sycl_prestage_class ggml_sycl_prestage_class_of(const ggml_sycl_prestage_facts & facts) {
+    if (facts.is_control) {
+        return ggml_sycl_prestage_class::CONTROL;
+    }
+    if (facts.is_weight) {
+        return ggml_sycl_prestage_class::WEIGHT;
+    }
+    if (facts.is_device) {
+        return ggml_sycl_prestage_class::DEVICE;
+    }
+    if (facts.is_input) {
+        return ggml_sycl_prestage_class::INPUT;
+    }
+    if (facts.is_kv_host) {
+        return ggml_sycl_prestage_class::KV_HOST;
+    }
+    if (facts.root_is_op_output && !facts.root_is_graph_node) {
+        return ggml_sycl_prestage_class::INPUT;
+    }
+    return ggml_sycl_prestage_class::COPY;
+}
+
+// Whether ggml_sycl_prestage_needs_device_copy reports the tensor's bytes: a COPY source, or a host op output another
+// split produced. Ordinary kernels read both from host memory in place (only consumers that look staging up use the
+// staged copy), so a resolver host return of either is a host read the counter must see. A flagged INPUT is not
+// counted: its host storage is the stable buffer set_tensor writes and the replay refresh re-copies.
+//
+// The answer does not depend on root_is_graph_node: a host op output is COPY when the graph produces it and INPUT
+// when it does not, and both are counted. That is what lets a caller with no graph in hand use it.
+static inline bool ggml_sycl_prestage_reports_bytes(const ggml_sycl_prestage_facts & facts) {
+    const ggml_sycl_prestage_class c = ggml_sycl_prestage_class_of(facts);
+    return c == ggml_sycl_prestage_class::COPY || (c == ggml_sycl_prestage_class::INPUT && !facts.is_input);
+}

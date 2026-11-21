@@ -726,9 +726,14 @@ static bool llama_context_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
 // op consumes -- the backend's plan has CPU work, or this is a partial offload
 // (n_gpu_layers does not cover every layer and the output) -- it gets the
 // dedicated activation buft instead, so the scheduler copies those activations to
-// the device. With no CPU work every input is read out of the host buft in place,
-// and the dedicated identity would only add split-copy names to the graph (the
-// dkw0 replay-futility detector disables command-graph replay on a '#' name).
+// the device. With no CPU work the host buft stays: the dedicated identity would
+// add split-copy names to the graph (the dkw0 replay-futility detector disables
+// command-graph replay on a '#' name). The SYCL split then reads the CPU inputs
+// from the host buft in place, and the SYCL graph pre-stage stages each one to the
+// device. An in-place SYCL op never takes such an input's memory (ggml-alloc keeps
+// a node in the buffer it was assigned). If the CPU still runs an op the SYCL
+// backend does not support, the scheduler makes no copy of its output either; the
+// pre-stage stages it as a graph input too, so the graph records.
 //
 // The answer depends on the placement plan, which the auto-ubatch resyncs
 // re-publish after the constructor enumerates the backends, so sched_reserve()

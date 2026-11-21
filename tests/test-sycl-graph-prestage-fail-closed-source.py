@@ -70,6 +70,21 @@ reuse. A staging failure is also not permanent for a signature: the memo forgets
 skipped tokens, so a transient failure (a staging allocation) recovers while a structural one (a
 host-resident input) re-declines at the cost of one pass.
 
+A host-resident op output is a graph input too. When the plan has no CPU work, the CPU backend computes
+into the generic host buft, and the scheduler makes no device copy of an activation it produces (an op the SYCL
+backend does not support): a SYCL split reads it in host memory. Classed COPY, the cache arm would refuse it and the
+graph would never be recorded. The class rule lives in prestage-class.hpp
+(ggml_sycl_prestage_class_of, unit-tested by test-sycl-prestage-class); the checks below pin that the backend asks it
+instead of carrying a second copy, that the rule reads the VIEW ROOT's op (a view's own op is GGML_OP_VIEW), that the
+flag still precedes KV_HOST and KV_HOST precedes the op-output rule (KV state is never per-call staging), and that the
+replay refresh discovers these tensors as it discovers flagged inputs, since a replay that skips the pre-stage would
+otherwise leave their staging at the recorded token's bytes.
+The rule is "another split's activation": an op output the graph being staged produces stays COPY. With
+GGML_SYCL_HOST_COMPUTE=1 every intermediate of the SYCL graph is a host op output; staging those as inputs would copy
+each one before its producer ran, and GET_ROWS, which looks staging up by name while recording, would bake that copy.
+So the pre-stage and the refresh pass the graph's node set, and a caller with none (the bytes predicate behind the
+resolver host-return counter) reports bytes for COPY and for a host op output alike, never for a flagged INPUT.
+
 Run with --self-test to prove every check fires against a mutant of the thing it forbids.
 """
 import argparse
@@ -84,6 +99,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--common", default=str(sycl / "common.hpp"))
 parser.add_argument("--memo", default=str(sycl / "graph-prestage-decline-memo.hpp"))
+parser.add_argument("--prestage-class", default=str(sycl / "prestage-class.hpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -248,8 +264,10 @@ def entry_blocks_graphs(compute):
     return reason
 
 
-def evaluate(backend, common, memo_hdr):
+def evaluate(backend, common, memo_hdr, class_hdr=None):
     results = {}
+    if class_hdr is None:
+        class_hdr = CLASS_HDR
 
     prestage = function_body(backend, r"static bool graph_prestage_leaf_tensors\([^)]*\)\s*\{")
     refresh = function_body(backend, r"static void graph_refresh_input_tensors\([^)]*\)\s*\{")
@@ -271,11 +289,62 @@ def evaluate(backend, common, memo_hdr):
     # Pre-stage decides INPUT through the shared classifier (llama.cpp-zhcn's prestage predicate), which asks the
     # view-aware test; the flag-only test must be gone from both.
     classify = function_body(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{") or ""
+    facts_fn = function_body(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{") or ""
     results["pre-stage asks the view-aware INPUT test"] = \
-        "ggml_sycl_prestage_classify(" in prestage and "graph_tensor_is_input(tensor)" in classify
+        "ggml_sycl_prestage_classify(" in prestage and "graph_tensor_is_input(tensor)" in facts_fn
     results["pre-stage has no flag-only INPUT test left"] = \
-        "flags & GGML_TENSOR_FLAG_INPUT" not in prestage and "flags & GGML_TENSOR_FLAG_INPUT" not in classify
+        "flags & GGML_TENSOR_FLAG_INPUT" not in prestage and "flags & GGML_TENSOR_FLAG_INPUT" not in classify and \
+        "flags & GGML_TENSOR_FLAG_INPUT" not in facts_fn
+    # A host-resident op output is another split's per-token activation. The backend gathers the facts and asks the
+    # shared rule; it returns no class of its own.
+    results["classify asks the shared class rule, with the view root's op as a fact"] = \
+        re.search(r"return\s+ggml_sycl_prestage_class_of\(ggml_sycl_prestage_facts_of\(", classify) is not None and \
+        "ggml_sycl_prestage_root_is_op_output(tensor)" in facts_fn and \
+        re.search(r"return\s+ggml_sycl_prestage_class::", classify + facts_fn) is None
+    # Without a node set the producer is unknown, and the fact says "this graph's own": the conservative answer (COPY,
+    # the class every host op output had before), which the bytes predicate does not depend on.
+    results["the graph-node fact asks the graph's node set, and a caller with none gets this graph's own"] = \
+        re.search(r"const bool reaches_rule\s*=\s*facts\.root_is_op_output\s*&&\s*!facts\.is_control\s*&&\s*"
+                  r"!facts\.is_weight\s*&&\s*!facts\.is_device\s*&&\s*!facts\.is_input\s*&&\s*!facts\.is_kv_host\s*;\s*"
+                  r"facts\.root_is_graph_node\s*=\s*reaches_rule\s*&&\s*"
+                  r"\(\s*!graph_nodes\s*\|\|\s*graph_nodes->contains\(ggml_sycl_prestage_view_root\(tensor\)\)\s*\)\s*;",
+                  facts_fn) is not None
+    node_set = function_body(backend, r"bool\s+contains\(const ggml_tensor \* tensor\)\s*\{") or ""
+    results["the node set holds the graph's nodes"] = \
+        re.search(r"for\s*\(int i = 0; i < cgraph->n_nodes; i\+\+\)\s*\{\s*nodes\.insert\(cgraph->nodes\[i\]\);\s*\}", node_set) is not None
+    results["the pre-stage classifies against the node set of the graph it stages"] = \
+        re.search(r"ggml_sycl_graph_node_set\s+graph_nodes\(cgraph\);", prestage) is not None and \
+        re.search(r"ggml_sycl_prestage_classify\(tensor,\s*ggml_sycl_prestage_source_buft\(tensor\),\s*&graph_nodes\)", prestage) is not None
+    needs_copy = function_body(backend, r"size_t ggml_sycl_prestage_needs_device_copy\([^)]*\)\s*\{") or ""
+    reports = function_body(class_hdr, r"bool\s+ggml_sycl_prestage_reports_bytes\([^)]*\)\s*\{") or ""
+    results["the bytes predicate counts COPY and a host op output, never a flagged INPUT"] = \
+        re.search(r"ggml_sycl_prestage_reports_bytes\(ggml_sycl_prestage_facts_of\(tensor,\s*src_buft,\s*nullptr\)\)",
+                  needs_copy) is not None and \
+        re.search(r"return\s+c\s*==\s*ggml_sycl_prestage_class::COPY\s*\|\|\s*"
+                  r"\(c\s*==\s*ggml_sycl_prestage_class::INPUT\s*&&\s*!facts\.is_input\);", reports) is not None
+    class_of = function_body(class_hdr, r"ggml_sycl_prestage_class\s+ggml_sycl_prestage_class_of\([^)]*\)\s*\{") or ""
+    results["the class rule: CONTROL, WEIGHT, DEVICE, the INPUT flag, KV_HOST, a host op output as INPUT, else COPY"] = \
+        re.fullmatch(r"\{\s*"
+                     r"if\s*\(facts\.is_control\)\s*\{\s*return ggml_sycl_prestage_class::CONTROL;\s*\}\s*"
+                     r"if\s*\(facts\.is_weight\)\s*\{\s*return ggml_sycl_prestage_class::WEIGHT;\s*\}\s*"
+                     r"if\s*\(facts\.is_device\)\s*\{\s*return ggml_sycl_prestage_class::DEVICE;\s*\}\s*"
+                     r"if\s*\(facts\.is_input\)\s*\{\s*return ggml_sycl_prestage_class::INPUT;\s*\}\s*"
+                     r"if\s*\(facts\.is_kv_host\)\s*\{\s*return ggml_sycl_prestage_class::KV_HOST;\s*\}\s*"
+                     r"if\s*\(facts\.root_is_op_output\s*&&\s*!facts\.root_is_graph_node\)\s*\{\s*"
+                     r"return ggml_sycl_prestage_class::INPUT;\s*\}\s*"
+                     r"return ggml_sycl_prestage_class::COPY;\s*\}", class_of) is not None
+    view_root = function_body(class_hdr, r"ggml_tensor\s*\*\s*ggml_sycl_prestage_view_root\([^)]*\)\s*\{") or ""
+    root_walk = function_body(class_hdr, r"bool\s+ggml_sycl_prestage_root_is_op_output\([^)]*\)\s*\{") or ""
+    results["the op-output fact reads the view root's op, not the view's"] = \
+        re.search(r"while\s*\(\s*tensor->view_src\s*\)\s*\{\s*tensor\s*=\s*tensor->view_src;\s*\}\s*return tensor;", view_root) is not None \
+        and re.search(r"const ggml_tensor \*\s*root\s*=\s*ggml_sycl_prestage_view_root\(tensor\);\s*"
+                      r"return\s+root\s*&&\s*root->op\s*!=\s*GGML_OP_NONE;", root_walk) is not None
     results["refresh discovery asks the view-aware INPUT test"] = "graph_tensor_is_input(" in refresh
+    results["refresh discovery also takes the host op outputs the pre-stage stages as INPUT"] = \
+        re.search(r"ggml_sycl_graph_node_set\s+graph_nodes\(cgraph\);", refresh) is not None and \
+        re.search(r"graph_tensor_is_input\(tensor\)\s*\|\|\s*"
+                  r"ggml_sycl_prestage_classify\(tensor,\s*ggml_sycl_prestage_source_buft\(tensor\),\s*&graph_nodes\)\s*==\s*"
+                  r"ggml_sycl_prestage_class::INPUT", refresh) is not None
     results["refresh discovery has no flag-only INPUT test left"] = "flags & GGML_TENSOR_FLAG_INPUT" not in refresh
     # A zero-byte tensor has nothing to stage; reporting it as a failure is what made fail-closed unusable. The test
     # returns from stage_tensor before its first stage action (stage_effect holds the actions that can fail).
@@ -654,6 +723,7 @@ def run(label, sources, expect_fail=None):
 
 backend, common = read(args.backend), read(args.common)
 memo_hdr = read(args.memo) if Path(args.memo).exists() else ""
+CLASS_HDR = read(args.prestage_class) if Path(args.prestage_class).exists() else ""
 failed = run("tree", (backend, common, memo_hdr))
 
 if args.self_test:
@@ -841,8 +911,53 @@ if args.self_test:
          (mutate_in_func(backend, r"graph_prestage_decline_memo::dense_split_key\(key\)\)\)\s*\{[^}]*\}\s*if \(st\.graphs\.size\(\) != ranges_\.size\(\)\) \{",
                          "ctx_.input_tensors_cached = false;", "(void) 0;"), common, mem_)),
         ("flag-only INPUT test in pre-stage", "pre-stage has no flag-only INPUT test left",
-         (mutate_in_func(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{", "graph_tensor_is_input(tensor)",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{", "graph_tensor_is_input(tensor)",
                          "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),
+        ("classify returns a class of its own", "classify asks the shared class rule, with the view root's op as a fact",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{",
+                         "return ggml_sycl_prestage_class_of(", "if (facts.is_kv_host) { return ggml_sycl_prestage_class::KV_HOST; }\n    return ggml_sycl_prestage_class_of("),
+          common, mem_)),
+        ("classify drops the op-output fact", "classify asks the shared class rule, with the view root's op as a fact",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{",
+                         "ggml_sycl_prestage_root_is_op_output(tensor)", "false"), common, mem_)),
+        ("the graph-node fact is dropped", "the graph-node fact asks the graph's node set, and a caller with none gets this graph's own",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{",
+                         "graph_nodes->contains(ggml_sycl_prestage_view_root(tensor))", "false"), common, mem_)),
+        ("a caller with no node set gets another split's activation", "the graph-node fact asks the graph's node set, and a caller with none gets this graph's own",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{", "(!graph_nodes ||", "(graph_nodes &&"), common, mem_)),
+        ("every op output asks the node set", "the graph-node fact asks the graph's node set, and a caller with none gets this graph's own",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{", "!facts.is_device &&", ""),
+          common, mem_)),
+        ("the node set is empty", "the node set holds the graph's nodes",
+         (mutate_in_func(backend, r"bool\s+contains\(const ggml_tensor \* tensor\)\s*\{", "nodes.insert(cgraph->nodes[i]);", "(void) i;"),
+          common, mem_)),
+        ("the pre-stage classifies without the node set", "the pre-stage classifies against the node set of the graph it stages",
+         (mutate_in_func(backend, pre_sig, "ggml_sycl_prestage_source_buft(tensor), &graph_nodes)", "ggml_sycl_prestage_source_buft(tensor), nullptr)"),
+          common, mem_)),
+        ("the bytes predicate counts COPY only", "the bytes predicate counts COPY and a host op output, never a flagged INPUT",
+         (backend, common, mem_, mutate(CLASS_HDR, " || (c == ggml_sycl_prestage_class::INPUT && !facts.is_input)", ""))),
+        ("the bytes predicate counts a flagged INPUT", "the bytes predicate counts COPY and a host op output, never a flagged INPUT",
+         (backend, common, mem_, mutate(CLASS_HDR, "(c == ggml_sycl_prestage_class::INPUT && !facts.is_input)", "c == ggml_sycl_prestage_class::INPUT"))),
+        ("the bytes predicate asks the class alone", "the bytes predicate counts COPY and a host op output, never a flagged INPUT",
+         (mutate_in_func(backend, r"size_t ggml_sycl_prestage_needs_device_copy\([^)]*\)\s*\{",
+                         "ggml_sycl_prestage_reports_bytes(ggml_sycl_prestage_facts_of(tensor, src_buft, nullptr))",
+                         "ggml_sycl_prestage_classify(tensor, src_buft, nullptr) == ggml_sycl_prestage_class::COPY"), common, mem_)),
+        ("a graph's own op output is staged as an input", "the class rule: CONTROL, WEIGHT, DEVICE, the INPUT flag, KV_HOST, a host op output as INPUT, else COPY",
+         (backend, common, mem_, mutate(CLASS_HDR, "facts.root_is_op_output && !facts.root_is_graph_node", "facts.root_is_op_output"))),
+        ("the op-output fact reads the tensor, not the root", "the op-output fact reads the view root's op, not the view's",
+         (backend, common, mem_, mutate(CLASS_HDR, "return root && root->op != GGML_OP_NONE;", "return tensor && tensor->op != GGML_OP_NONE;"))),
+        ("the op-output rule moves ahead of KV_HOST", "the class rule: CONTROL, WEIGHT, DEVICE, the INPUT flag, KV_HOST, a host op output as INPUT, else COPY",
+         (backend, common, mem_,
+          re.sub(r"(if \(facts\.is_kv_host\) \{\s*return ggml_sycl_prestage_class::KV_HOST;\s*\})(\s*)"
+                 r"(if \(facts\.root_is_op_output && !facts\.root_is_graph_node\) \{\s*return ggml_sycl_prestage_class::INPUT;\s*\})",
+                 r"\3\2\1", CLASS_HDR, count=1))),
+        ("a host op output is copied", "the class rule: CONTROL, WEIGHT, DEVICE, the INPUT flag, KV_HOST, a host op output as INPUT, else COPY",
+         (backend, common, mem_, mutate(CLASS_HDR, "if (facts.root_is_op_output && !facts.root_is_graph_node) {", "if (false) {"))),
+        ("the op-output fact reads the view's own op", "the op-output fact reads the view root's op, not the view's",
+         (backend, common, mem_, mutate(CLASS_HDR, "tensor = tensor->view_src;", "break;"))),
+        ("refresh discovery skips host op outputs", "refresh discovery also takes the host op outputs the pre-stage stages as INPUT",
+         (mutate_in_func(backend, ref_sig, "graph_tensor_is_input(tensor) ||", "graph_tensor_is_input(tensor) || false &&"),
+          common, mem_)),
         ("flag-only INPUT test in refresh", "refresh discovery has no flag-only INPUT test left",
          (mutate_in_func(backend, ref_sig, "graph_tensor_is_input(tensor)",
                          "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),

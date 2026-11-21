@@ -5034,11 +5034,14 @@ inline void ggml_sycl_refresh_cached_input_ptr(void *       dst,
 // Defined in ggml-sycl.cpp to avoid inlining a 100-line function.
 void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device);
 
-// Bytes a graph prestage copies to `device` for `tensor`, or 0 when it makes no
-// copy: weights, control-vector storage, device USM, INPUT tensors (their own
-// stable staging) and anything in the KV-host buft count 0. `src_buft` is the
-// buffer type the tensor lives in. The prestage and the resolver counter below
-// both read this one predicate.
+// Bytes of `tensor` that ordinary device kernels read from host memory in place,
+// or 0: weights, control-vector storage, device USM, flagged INPUT tensors and
+// anything in the KV-host buft count 0. A COPY source counts, and so does a
+// host-resident op output, which the prestage stages as an INPUT when another
+// split produced it but which only staging-aware consumers read from there
+// (ggml_sycl_prestage_reports_bytes in prestage-class.hpp). `src_buft` is the
+// buffer type the tensor lives in. The resolver counter below and the GRAPH-STAGE
+// cohort read this predicate; the prestage reads the same class rule.
 size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
                                             ggml_backend_buffer_type_t src_buft,
                                             int                        device);
