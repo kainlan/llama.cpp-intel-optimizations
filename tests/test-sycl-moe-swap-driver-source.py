@@ -622,9 +622,8 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", WARN_SIG, "GGML_LOG_WARN(", "GGML_LOG_INFO(")])
     expect_fail("refusal-not-logged", "D12", [("sycl", CALLER_SIG, "ggml_sycl_moe_swap_warn_refusal(inst, device, m);", "")])
     expect_fail("warned-set-cleared-elsewhere", "D12",
-                [("sycl", "", "    ggml_sycl_moe_swap_fold(inst);\n    if (inst.driver->stats.boundaries",
-                  "    inst.refusals_warned_evict.clear();\n    ggml_sycl_moe_swap_fold(inst);\n"
-                  "    if (inst.driver->stats.boundaries")])
+                [("sycl", REPORT_SIG, "ggml_sycl_moe_swap_fold(inst);",
+                  "inst.refusals_warned_evict.clear();\n    ggml_sycl_moe_swap_fold(inst);")])
     expect_fail("cache-spells-the-refusal", "D13",
                 [("cache", LOAN_SIG, "refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;", 'refusal = "shared storage";')])
     expect_fail("latch-compares-a-literal", "D13",
