@@ -25,18 +25,27 @@ THE CONTRACT.  With comments blanked, in ggml-sycl.cpp:
           GGML_SYCL variable);
        e. ggml_backend_sycl_get_tensor_async: moe_token_stamps_note_d2h, on `traced`, after the copy returns (the
           staged logits wait has returned by then).
+  G2. The prologue is partitioned by six steps, MOE_TOKEN_STEP_BOUNDARY_DONE, SIG_BEGIN, SIG_END, KEY_BEGIN, KEY_END
+      and PRESTAGE_END, each the sole statement of an `if (moe_hostpath_waits_enabled())` block, in that order in the
+      file: BOUNDARY_DONE right after the graph-boundary block, SIG_BEGIN and SIG_END around the signature call alone,
+      KEY_BEGIN and KEY_END around the slot key call alone, PRESTAGE_END first in the slot REPLAY branch (reached only
+      after the prestage succeeded).
   N. No stamp helper waits, queries an event, allocates or locks: the bodies of the stamp helpers hold no wait, no
      event query, no allocator, no container growth, no lock, and no sycl:: call.
   B. The per-block buffer is a fixed-size array in a record that lives in static thread-local storage, and the
      writer checks its bound.
   K. One clock: the stamps read ggml_sycl::cpu_expert_pool_trace_now_ns(), the job stamps' clock, and no other.
   V. One switch: GGML_SYCL_MOE_IDS_COPY_TRACE is read at the three sites it was read at (the cached flag, the cached
-     level, and the lazy tracer elsewhere), and no new getenv appears in the stamp code.
+     level, and the lazy tracer elsewhere), and no new getenv appears in the stamp block, which ends at the first
+     function after it, moe_hostpath_waits_ready (a read after that is not the block's).
   L. The lines.  [MOE-TOKEN-START] is printed once, from the readback's token-line block, and
      [MOE-TOKEN-ENQUEUE] once, inside `if (enqueue_lines)`, which the readback sets to
      `moe_hostpath_trace_level() >= 2`.  Their field lists parse: a synthetic
      line made from each format string is parsed back by this pin's parser with the fields it names, signed times in
      microseconds, "-" for a stamp not taken.  prologue is replay_begin - gc_enter, ple_misses is rows - hits.
+     The seven p_ fields follow prologue in the order p_boundary, p_checks, p_sig, p_prealloc, p_key, p_prestage,
+     p_inputs, each the difference of two consecutive step stamps (the first from gc_enter, the last to
+     replay_begin), so they sum to prologue.
   D. docs/backend/sycl-env-vars.md names both lines and every field of the first.
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real sources and requires each to FAIL, then
@@ -60,14 +69,17 @@ ENV_NAME = "GGML_SYCL_MOE_IDS_COPY_TRACE"
 # How many times the backend reads the variable: the cached flag, the cached level, and the lazy tracer's own read.
 ENV_READS = 3
 
-TOKEN_FIELDS = ("token", "t0", "gc_enter", "replay_begin", "replay_end", "gc_return", "prologue", "enqueue",
+PROLOGUE_PARTS = ("p_boundary", "p_checks", "p_sig", "p_prealloc", "p_key", "p_prestage", "p_inputs")
+TOKEN_FIELDS = ("token", "t0", "gc_enter", "replay_begin", "replay_end", "gc_return", "prologue") + PROLOGUE_PARTS + (
+                "enqueue",
                 "ple_begin", "ple_end", "ple_busy", "ple_calls", "ple_rows", "ple_hits", "ple_misses", "ple_reads",
                 "logits_ret", "logits_staged", "logits_calls", "events", "events_dropped")
 ENQUEUE_FIELDS = ("token", "i", "kind", "node", "layer", "t")
 
 # The helpers whose bodies must hold no wait, no event query, no allocation and no lock.
 HELPERS = ("moe_token_stamps_current", "moe_token_stamps_enter", "moe_token_stamps_note_replay",
-           "moe_token_stamps_note_replay_end", "moe_token_stamps_note_return", "moe_token_stamps_enqueue_target",
+           "moe_token_stamps_note_step", "moe_token_stamps_span", "moe_token_stamps_note_replay_end",
+           "moe_token_stamps_note_return", "moe_token_stamps_enqueue_target",
            "moe_token_stamps_layer_of", "moe_token_stamps_note_enqueue",
            "moe_token_stamps_note_ple", "moe_token_stamps_note_d2h", "moe_token_stamps_rel",
            "moe_token_stamps_print")
@@ -205,6 +217,34 @@ def check_sites(code: str) -> None:
     if sites[0].start() < code.index("static ggml_status ggml_backend_sycl_graph_compute_unchecked"):
         fail("G", "the return stamp is outside ggml_backend_sycl_graph_compute_unchecked")
 
+    # b4. the six prologue steps, in order, each the sole statement of a flag-guarded block at its place.
+    steps = guarded_call(code, "moe_token_stamps_note_step", FLAG_GUARD, "G", "prologue steps", expect=6)
+    names = [re.match(r"\s*(\w+)", code[m.end() :]).group(1) for m in steps]
+    want = ["MOE_TOKEN_STEP_" + n for n in ("BOUNDARY_DONE", "SIG_BEGIN", "SIG_END", "KEY_BEGIN", "KEY_END",
+                                          "PRESTAGE_END")]
+    if names != want:
+        fail("G", f"the prologue steps are stamped as {names}, want {want} in that order")
+    entry_at = code.index("static ggml_status ggml_backend_sycl_graph_compute_unchecked")
+    if any(m.start() < entry_at for m in steps):
+        fail("G", "a prologue step is stamped outside ggml_backend_sycl_graph_compute_unchecked")
+    after = [code[m.end() : m.end() + 500] for m in steps]
+    before = [code[max(0, m.start() - 600) : m.start()] for m in steps]
+    close = r"[^;]*;\s*\}\s*"
+    if not re.match(close + r"bool\s+graph_executed\s*=\s*false\s*;", after[0]) or not re.search(
+            r"\}\s*\}\s*if\s*\(\s*" + FLAG_GUARD + r"\s*\)\s*\{\s*$", before[0]):
+        fail("G", "BOUNDARY_DONE is not stamped right after the graph-boundary block, before `bool graph_executed`")
+    if not re.match(close + r"const\s+uint64_t\s+graph_hash\s*=\s*ggml_sycl_graph_signature\s*\(\s*cgraph\s*\)\s*;"
+                    r"\s*if\s*\(\s*" + FLAG_GUARD + r"\s*\)\s*\{\s*moe_token_stamps_note_step\s*\(\s*MOE_TOKEN_STEP_SIG_END",
+                    after[1]):
+        fail("G", "SIG_BEGIN and SIG_END do not bracket `graph_hash = ggml_sycl_graph_signature(cgraph)` alone")
+    if not re.match(close + r"const\s+gsc::key\s+slot_key\s*=\s*moe_segment_slot_key\s*\([^;]*;"
+                    r"\s*if\s*\(\s*" + FLAG_GUARD + r"\s*\)\s*\{\s*moe_token_stamps_note_step\s*\(\s*MOE_TOKEN_STEP_KEY_END",
+                    after[3]):
+        fail("G", "KEY_BEGIN and KEY_END do not bracket `slot_key = moe_segment_slot_key(...)` alone")
+    if not re.search(r"else\s+if\s*\(\s*slot_action\s*==\s*gsc::action::REPLAY\s*\)\s*\{\s*if\s*\(\s*" + FLAG_GUARD
+                     + r"\s*\)\s*\{\s*$", before[5]):
+        fail("G", "PRESTAGE_END is not the first statement of the slot REPLAY branch (reached only after the prestage)")
+
     # c. the per-block enqueue stamps, in the replay loop.
     replay = body_of(code, r"\bstatic\s+void\s+moe_graph_replay_segment_slot\s*\([^)]*\)\s*\{", "G")
     if not re.search(r"moe_token_stamps\s*\*\s*const\s+enqueue_stamps\s*=\s*moe_token_stamps_enqueue_target\s*\(\s*\)\s*;",
@@ -281,7 +321,8 @@ def check_clock(code: str) -> None:
         body = body_of(code, def_sig(name), "K")
         if re.search(r"steady_clock|high_resolution_clock|system_clock|clock_gettime|rdtsc", body):
             fail("K", f"{name} reads a clock of its own")
-    for name in ("moe_token_stamps_enter", "moe_token_stamps_note_replay", "moe_token_stamps_note_replay_end",
+    for name in ("moe_token_stamps_enter", "moe_token_stamps_note_step", "moe_token_stamps_note_replay",
+                 "moe_token_stamps_note_replay_end",
                  "moe_token_stamps_note_return", "moe_token_stamps_note_enqueue", "moe_token_stamps_note_d2h"):
         if "ggml_sycl::cpu_expert_pool_trace_now_ns()" not in body_of(code, def_sig(name), "K"):
             fail("K", f"{name} does not read the job stamps' clock, ggml_sycl::cpu_expert_pool_trace_now_ns()")
@@ -294,9 +335,11 @@ def check_switch(code: str) -> None:
     stamp_region = re.search(r"constexpr\s+int\s+MOE_TOKEN_ENQUEUE_EVENTS", code)
     if not stamp_region:
         fail("V", "no stamp block")
-    block = code[stamp_region.start() : stamp_region.start() + 30000]
-    end = block.find("// Adds one op's source ready-event counts")
-    block = block[: end if end > 0 else len(block)]
+    # The block ends at the first function after it, found in the comment-blanked code by its signature.
+    end = code.find("static void moe_hostpath_waits_ready", stamp_region.start())
+    if end < 0:
+        fail("V", "the stamp block's end anchor, static void moe_hostpath_waits_ready, is not found")
+    block = code[stamp_region.start() : end]
     if re.search(r"\bgetenv\b", block):
         fail("V", "the stamp block reads an environment variable")
 
@@ -346,7 +389,8 @@ def parse_line(line: str, tag: str, fields: tuple[str, ...], times: tuple[str, .
 
 SAMPLES = {
     "token": "7", "t0": "job", "gc_enter": "-10532us", "replay_begin": "-9400us", "replay_end": "-2000us",
-    "gc_return": "36000us", "prologue": "1132us", "enqueue": "7400us",
+    "gc_return": "36000us", "prologue": "1132us", "enqueue": "7400us", "p_boundary": "100us", "p_checks": "200us",
+    "p_sig": "300us", "p_prealloc": "50us", "p_key": "250us", "p_prestage": "100us", "p_inputs": "132us",
     "ple_begin": "-12000us", "ple_end": "-11000us", "ple_busy": "1000", "ple_calls": "1", "ple_rows": "16",
     "ple_hits": "2", "ple_misses": "14", "ple_reads": "14", "logits_ret": "38000us", "logits_staged": "1",
     "logits_calls": "1", "events": "3", "events_dropped": "0",
@@ -379,13 +423,15 @@ def check_lines(code: str) -> None:
     try:
         got = parse_line(line, "MOE-TOKEN-START", TOKEN_FIELDS,
                          ("gc_enter", "replay_begin", "replay_end", "gc_return", "prologue", "enqueue",
-                          "ple_begin", "ple_end", "ple_busy", "logits_ret"),
+                          "ple_begin", "ple_end", "ple_busy", "logits_ret") + PROLOGUE_PARTS,
                          ("token", "ple_calls", "ple_rows", "ple_hits", "ple_misses", "ple_reads", "logits_staged",
                           "logits_calls", "events", "events_dropped"))
     except ValueError as exc:
         fail("L", f"the [MOE-TOKEN-START] format does not parse: {exc}")
     if got["prologue"] != got["replay_begin"] - got["gc_enter"]:
         fail("L", "the synthetic prologue is not replay_begin - gc_enter")
+    if sum(got[k] for k in PROLOGUE_PARTS) != got["prologue"]:
+        fail("L", "the synthetic prologue parts do not sum to prologue")
     if got["enqueue"] != got["replay_end"] - got["replay_begin"]:
         fail("L", "the synthetic enqueue is not replay_end - replay_begin")
     # A stamp not taken parses as None.
@@ -406,6 +452,17 @@ def check_lines(code: str) -> None:
     printer = body_of(code, def_sig("moe_token_stamps_print"), "L")
     if not re.search(r"rec\.t_replay_ns\s*-\s*rec\.t_gc_enter_ns", printer):
         fail("L", "prologue is not computed from t_replay_ns - t_gc_enter_ns")
+    args = re.findall(r"p_span\[(\d)\]", printer)
+    if args[-7:] != [str(i) for i in range(7)]:
+        fail("L", "the prologue parts are not printed from p_span[0..6] in order")
+    chain = (r"int64_t\s+from_ns\s*=\s*rec\.t_gc_enter_ns\s*;"
+             r"\s*for\s*\(\s*int\s+s\s*=\s*0\s*;\s*s\s*<\s*MOE_TOKEN_STEP_COUNT"
+             r"[^}]*moe_token_stamps_span\s*\(\s*p_span\s*\[\s*s\s*\][^;]*"
+             r"from_ns\s*,\s*rec\.t_step_ns\s*\[\s*s\s*\]\s*\)\s*;"
+             r"\s*from_ns\s*=\s*rec\.t_step_ns\s*\[\s*s\s*\]\s*;")
+    if not re.search(chain, printer) or not re.search(
+            r"moe_token_stamps_span\s*\(\s*p_span\s*\[\s*MOE_TOKEN_STEP_COUNT\s*\][^;]*rec\.t_replay_ns\s*\)", printer):
+        fail("L", "the parts are not the steps' consecutive differences from the entry to the replay begin")
     if not re.search(r"rec\.t_replay_end_ns\s*-\s*rec\.t_replay_ns", printer):
         fail("L", "enqueue is not computed from t_replay_end_ns - t_replay_ns")
     if not re.search(r"rec\.ple_rows\s*>\s*rec\.ple_hits\s*\?\s*rec\.ple_rows\s*-\s*rec\.ple_hits", printer):
@@ -457,7 +514,7 @@ def load() -> tuple[str, str]:
 
 def sub1(text: str, old: str, new: str) -> str:
     """Replaces the first `old` (a regex) and fails the self-test if there is none to replace."""
-    out, n = re.subn(old, lambda _m: new, text, count=1, flags=re.S)
+    out, n = re.subn(old, lambda m: m.expand(new), text, count=1, flags=re.S)
     if n != 1:
         raise RuntimeError(f"mutant anchor not found: {old!r}")
     return out
@@ -546,6 +603,46 @@ def mutants(code: str, doc: str):
         r"(\s*moe_hostpath_trace_level\(\) >= 2\);)", r"0,\1"), doc
     yield "the record not marked by a readback", "L", sub1(
         code, r"g_moe_token_stamp_ring\.slot\[g_moe_token_stamp_ring\.cur\]\.readbacks_seen = true;", ""), doc
+    step = r"moe_token_stamps_note_step\(MOE_TOKEN_STEP_%s\);"
+    for which in ("BOUNDARY_DONE", "SIG_BEGIN", "KEY_END", "PRESTAGE_END"):
+        yield f"the {which} step unguarded", "G", sub1(
+            code, r"if\s*\(\s*" + G + r"\s*\)\s*\{\s*(" + step % which + r")\s*\}", r"\1"), doc
+    swapped = sub1(code, step % "SIG_BEGIN", "moe_token_stamps_note_step(MOE_TOKEN_STEP_TMP);")
+    swapped = sub1(swapped, step % "SIG_END", "moe_token_stamps_note_step(MOE_TOKEN_STEP_SIG_BEGIN);")
+    yield "the signature stamps swapped", "G", sub1(
+        swapped, step % "TMP", "moe_token_stamps_note_step(MOE_TOKEN_STEP_SIG_END);"), doc
+    yield "the signature end stamp moved past its consumer", "G", sub1(
+        code, r"(const uint64_t graph_hash = ggml_sycl_graph_signature\(cgraph\);)(\s*if \(" + G + r"\) \{\s*"
+        + step % "SIG_END" + r"\s*\})(\s*sycl_ctx->cached_graph_sig\s*= graph_hash;)", r"\1\3\2"), doc
+    yield "the key stamps around nothing", "G", sub1(
+        code, r"(const gsc::key\s+slot_key\s*=\s*moe_segment_slot_key\()", r"int g_gap = 0; \1"), doc
+    yield "the prestage stamp before the prestage", "G", sub1(
+        code, r"(\}\s*else if \(slot_action == gsc::action::REPLAY\) \{\s*)(if \(" + G + r"\) \{\s*" + step % "PRESTAGE_END"
+        + r"\s*\})", r"\1 int g_gap = 0; \2"), doc
+    yield "the step helper does not read the step's slot", "N", sub1(
+        code, r"static void moe_token_stamps_note_step\(int step\) \{",
+        "static void moe_token_stamps_note_step(int step) {\n    sycl::queue().wait();"), doc
+    yield "the step helper reads another clock", "K", sub1(
+        code, r"static void moe_token_stamps_note_step\(int step\) \{",
+        "static void moe_token_stamps_note_step(int step) {\n    const auto bad = std::chrono::steady_clock::now();"), doc
+    yield "a part dropped from the start line", "L", sub1(code, r"p_key=%s ", ""), doc
+    yield "the parts out of order in the format", "L", sub1(
+        code, r"p_sig=%s p_prealloc=%s ", "p_prealloc=%s p_sig=%s "), doc
+    yield "the parts' arguments swapped", "L", sub1(
+        code, r"(p_span\[2\],\s*)(p_span\[3\],)", r"\2 \1"), doc
+    yield "the last part not closed at the replay begin", "L", sub1(
+        code, r"(moe_token_stamps_span\(p_span\[MOE_TOKEN_STEP_COUNT\][^;]*)rec\.t_replay_ns\)", r"\1rec.t_return_ns)"), doc
+    yield "the parts' base not the entry", "L", sub1(
+        code, r"from_ns\s*=\s*rec\.t_gc_enter_ns;", "from_ns = rec.t_replay_ns;"), doc
+    # The next two pair the block-end anchor: a read after the block is another code's business, one inside it is not.
+    other_read = '\nstatic const char * g_other = std::getenv("GGML_SYCL_X");\n'
+    yield "a getenv after the stamp block (must not fail V)", None, code + other_read, doc
+    yield "a getenv inside the stamp block", "V", sub1(
+        code, r"static moe_token_pending g_moe_token_pending;",
+        "static moe_token_pending g_moe_token_pending;" + other_read), doc
+    yield "the block's end anchor gone", "V", sub1(
+        code, r"static void moe_hostpath_waits_ready", "static void moe_hostpath_other"), doc
+    yield "doc silent on a part", "D", code, doc.replace("p_prestage=", "p_pre=")
     yield "doc silent on the enqueue line", "D", code, doc.replace("[MOE-TOKEN-ENQUEUE]", "[x]")
     yield "doc silent on a field", "D", code, doc.replace("ple_misses=", "ple_m=")
 
@@ -562,12 +659,17 @@ def self_test() -> int:
         try:
             gate(c, d)
         except ContractError as exc:
+            if pin is None:
+                print(f"FAIL: benign mutant {name!r} failed: {exc}")
+                bad += 1
+                continue
             if f"[pin {pin}]" not in str(exc):
                 print(f"FAIL: mutant {name!r} was caught by another pin: {exc}")
                 bad += 1
             continue
-        print(f"FAIL: mutant not caught: {name}")
-        bad += 1
+        if pin is not None:
+            print(f"FAIL: mutant not caught: {name}")
+            bad += 1
     if bad:
         return 1
     print("test-sycl-token-start-stamps-source: self-test ok")

@@ -28663,11 +28663,11 @@ struct moe_hostpath_wait_context {
 // ---------------------------------------------------------------------------
 // Token-start stamps for a replayed MoE decode token, under the same switch.  The per-job stamps start at the
 // token's first job submit, but the device idles before it while the host prepares the token (llama's inputs,
-// including the PLE storage gather), runs the backend's prologue and enqueues the device blocks that come before the
-// first host expert.  These stamps split that time.  They read the job stamps' clock, cpu_expert_pool_trace_now_ns,
-// and are kept raw: the print subtracts the token's first job submit, so a stamp taken before it prints negative.
-// Off, a stamp site costs one test of the cached flag: no clock is read and nothing is written.  On, a stamp adds no
-// wait, no event query and no copy, and writes only into the fixed records below.
+// including the per-layer-embedding (PLE) storage gather), runs the backend's prologue and enqueues the device
+// blocks that come before the first host expert.  These stamps split that time.  They read the job stamps' clock,
+// cpu_expert_pool_trace_now_ns, and are kept raw: the print subtracts the token's first job submit, so a stamp taken
+// before it prints negative.  Off, a stamp site costs one test of the cached flag: no clock is read and nothing is
+// written.  On, a stamp adds no wait, no event query and no copy, and writes only into the fixed records below.
 // A record belongs to one graph compute and prints with the line of the token that compute ran, at the next token's
 // first expert-id readback like the rest of that line, so two records alternate.  A compute that made no readback
 // reuses its record instead of taking the other one, so it cannot push out a token not yet printed.  The storage
@@ -28676,6 +28676,19 @@ struct moe_hostpath_wait_context {
 // that entry closes.
 // ---------------------------------------------------------------------------
 constexpr int MOE_TOKEN_ENQUEUE_EVENTS = 256;
+
+// The steps that partition the prologue, in the order a replaying token passes them: the end of the graph-boundary
+// actions, the graph signature (begin and end), the segment slot key (begin and end), and the return of the input
+// prestage.  Each is a raw clock reading in the record, 0 when not reached.
+enum moe_token_prologue_step {
+    MOE_TOKEN_STEP_BOUNDARY_DONE = 0,
+    MOE_TOKEN_STEP_SIG_BEGIN,
+    MOE_TOKEN_STEP_SIG_END,
+    MOE_TOKEN_STEP_KEY_BEGIN,
+    MOE_TOKEN_STEP_KEY_END,
+    MOE_TOKEN_STEP_PRESTAGE_END,
+    MOE_TOKEN_STEP_COUNT,
+};
 
 enum moe_token_enqueue_kind {
     MOE_TOKEN_ENQUEUE_SEGMENT = 0,
@@ -28692,10 +28705,10 @@ struct moe_token_enqueue_event {
 
 // A graph compute's stamps.  `valid` is set by the compute's entry and `readbacks_seen` by an expert-id readback
 // during the compute.  The times are raw clock readings, 0 for a stamp not taken: the backend's entry, just before
-// and just after the segment slot replay (0 when the compute replayed no slot), the compute's final return, the
-// first storage gather's start and the last one's return since the previous entry with their summed time, and the
-// last staged readback after the compute.  A gather read counts the waiters submitted for the misses: rows of one
-// block share a read.
+// and just after the segment slot replay (0 when the compute replayed no slot), the compute's final return, the six
+// prologue steps (0 when the compute did not reach them), the first storage gather's start and the last one's return
+// since the previous entry with their summed time, and the last staged readback after the compute.  A gather read
+// counts the waiters submitted for the misses: rows of one block share a read.
 struct moe_token_stamps {
     bool                    valid               = false;
     bool                    readbacks_seen      = false;
@@ -28718,6 +28731,8 @@ struct moe_token_stamps {
     int                     events_dropped      = 0;
     int                     last_boundary_layer = -2;
     moe_token_enqueue_event events[MOE_TOKEN_ENQUEUE_EVENTS];
+
+    int64_t t_step_ns[MOE_TOKEN_STEP_COUNT] = {};
 };
 
 struct moe_token_stamp_ring {
@@ -28764,12 +28779,15 @@ static void moe_token_stamps_enter() {
         ring.cur ^= 1;
     }
 
-    moe_token_stamps & rec  = ring.slot[ring.cur];
-    rec.valid               = true;
-    rec.readbacks_seen      = false;
-    rec.printed             = false;
-    rec.t_gc_enter_ns       = now_ns;
-    rec.t_replay_ns         = 0;
+    moe_token_stamps & rec = ring.slot[ring.cur];
+    rec.valid              = true;
+    rec.readbacks_seen     = false;
+    rec.printed            = false;
+    rec.t_gc_enter_ns      = now_ns;
+    rec.t_replay_ns        = 0;
+    for (int64_t & t_step : rec.t_step_ns) {
+        t_step = 0;
+    }
     rec.t_replay_end_ns     = 0;
     rec.t_return_ns         = 0;
     rec.t_ple_begin_ns      = p.t_ple_begin_ns.exchange(0, std::memory_order_relaxed);
@@ -28790,6 +28808,11 @@ static void moe_token_stamps_enter() {
 // Just before the segment slot replay call: this minus the entry is the prologue the replay path pays.
 static void moe_token_stamps_note_replay() {
     moe_token_stamps_current().t_replay_ns = ggml_sycl::cpu_expert_pool_trace_now_ns();
+}
+
+// A prologue step reached (see moe_token_prologue_step).
+static void moe_token_stamps_note_step(int step) {
+    moe_token_stamps_current().t_step_ns[step] = ggml_sycl::cpu_expert_pool_trace_now_ns();
 }
 
 // Just after the segment slot replay call returned: this minus the replay's start is the host's whole enqueue time.
@@ -28875,6 +28898,15 @@ static void moe_token_stamps_rel(char * out, size_t cap, int64_t t_ns, int64_t t
     }
 }
 
+// The time from one stamp to a later one in us, or "-" when either was not taken.
+static void moe_token_stamps_span(char * out, size_t cap, int64_t from_ns, int64_t to_ns) {
+    if (from_ns == 0 || to_ns == 0) {
+        snprintf(out, cap, "-");
+    } else {
+        snprintf(out, cap, "%.0fus", (double) (to_ns - from_ns) / 1000.0);
+    }
+}
+
 // The token's start line, and with `enqueue_lines` its enqueue lines, from the record of the compute that ran it.
 // Every time is in us after the token's first job submit (t0=job), or after the backend entry when the token has no
 // job (t0=entry); a stamp not taken reads "-".
@@ -28890,6 +28922,7 @@ static void moe_token_stamps_print(uint64_t token, moe_token_stamps & rec, int64
     char          replay_end[24];
     char          gc_return[24];
     char          prologue[24];
+    char          p_span[MOE_TOKEN_STEP_COUNT + 1][24];
     char          enqueue[24];
     char          ple_begin[24];
     char          ple_end[24];
@@ -28906,6 +28939,13 @@ static void moe_token_stamps_print(uint64_t token, moe_token_stamps & rec, int64
     } else {
         snprintf(prologue, sizeof(prologue), "-");
     }
+    // The seven parts of the prologue: entry to each step in turn, then the last step to the replay.
+    int64_t from_ns = rec.t_gc_enter_ns;
+    for (int s = 0; s < MOE_TOKEN_STEP_COUNT; ++s) {
+        moe_token_stamps_span(p_span[s], sizeof(p_span[s]), from_ns, rec.t_step_ns[s]);
+        from_ns = rec.t_step_ns[s];
+    }
+    moe_token_stamps_span(p_span[MOE_TOKEN_STEP_COUNT], sizeof(p_span[MOE_TOKEN_STEP_COUNT]), from_ns, rec.t_replay_ns);
     if (rec.t_replay_ns != 0 && rec.t_replay_end_ns != 0) {
         snprintf(enqueue, sizeof(enqueue), "%.0fus", (double) (rec.t_replay_end_ns - rec.t_replay_ns) / 1000.0);
     } else {
@@ -28914,14 +28954,16 @@ static void moe_token_stamps_print(uint64_t token, moe_token_stamps & rec, int64
     const uint64_t ple_misses = rec.ple_rows > rec.ple_hits ? rec.ple_rows - rec.ple_hits : 0;
     GGML_LOG_WARN(
         "[MOE-TOKEN-START] token=%llu t0=%s gc_enter=%s replay_begin=%s replay_end=%s gc_return=%s prologue=%s "
+        "p_boundary=%s p_checks=%s p_sig=%s p_prealloc=%s p_key=%s p_prestage=%s p_inputs=%s "
         "enqueue=%s ple_begin=%s ple_end=%s "
         "ple_busy=%.0fus ple_calls=%llu ple_rows=%llu ple_hits=%llu ple_misses=%llu ple_reads=%llu "
         "logits_ret=%s logits_staged=%llu logits_calls=%llu events=%d events_dropped=%d\n",
         (unsigned long long) token, job_t0_ns != 0 ? "job" : "entry", gc_enter, replay, replay_end, gc_return, prologue,
-        enqueue, ple_begin, ple_end, (double) rec.ple_busy_ns / 1000.0, (unsigned long long) rec.ple_calls,
-        (unsigned long long) rec.ple_rows, (unsigned long long) rec.ple_hits, (unsigned long long) ple_misses,
-        (unsigned long long) rec.ple_reads, logits_ret, (unsigned long long) rec.logits_staged,
-        (unsigned long long) rec.logits_calls, rec.n_events, rec.events_dropped);
+        p_span[0], p_span[1], p_span[2], p_span[3], p_span[4], p_span[5], p_span[6], enqueue, ple_begin, ple_end,
+        (double) rec.ple_busy_ns / 1000.0, (unsigned long long) rec.ple_calls, (unsigned long long) rec.ple_rows,
+        (unsigned long long) rec.ple_hits, (unsigned long long) ple_misses, (unsigned long long) rec.ple_reads,
+        logits_ret, (unsigned long long) rec.logits_staged, (unsigned long long) rec.logits_calls, rec.n_events,
+        rec.events_dropped);
     if (enqueue_lines) {
         for (int i = 0; i < rec.n_events; ++i) {
             const moe_token_enqueue_event & ev = rec.events[i];
@@ -121689,6 +121731,10 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
             ggml_sycl_graph_boundary_reset_arenas(sycl_ctx, !g_ggml_sycl_graph_recording);
         }
     }
+    // After the whole block, so the stamp is taken whether or not any boundary action ran.
+    if (moe_hostpath_waits_enabled()) {
+        moe_token_stamps_note_step(MOE_TOKEN_STEP_BOUNDARY_DONE);
+    }
 
     bool graph_executed = false;
 
@@ -123013,7 +123059,13 @@ normal_dispatch:
         // shapes or op_params; replaying the previous executable graph in that
         // case corrupts outputs.
         GGML_SYCL_DEBUG("[DEBUG] About to call ggml_sycl_graph_signature cgraph=%p\n", (void *) cgraph);
-        const uint64_t graph_hash          = ggml_sycl_graph_signature(cgraph);
+        if (moe_hostpath_waits_enabled()) {
+            moe_token_stamps_note_step(MOE_TOKEN_STEP_SIG_BEGIN);
+        }
+        const uint64_t graph_hash = ggml_sycl_graph_signature(cgraph);
+        if (moe_hostpath_waits_enabled()) {
+            moe_token_stamps_note_step(MOE_TOKEN_STEP_SIG_END);
+        }
         sycl_ctx->cached_graph_sig         = graph_hash;
         sycl_ctx->cached_graph_sig_n_nodes = cgraph->n_nodes;
         GGML_SYCL_DEBUG("[DEBUG] graph_hash=%lu\n", graph_hash);
@@ -123514,8 +123566,14 @@ normal_dispatch:
 
                 if (moe_segment_keyed) {
                     // Per-split slot (llama.cpp-7pm2): warm up, record, then replay under this split's own key.
-                    namespace gsc                 = ggml_sycl::graph_segment_cache;
-                    const gsc::key    slot_key    = moe_segment_slot_key(sycl_ctx, cgraph, graph_hash, is_decode_phase);
+                    namespace gsc = ggml_sycl::graph_segment_cache;
+                    if (moe_hostpath_waits_enabled()) {
+                        moe_token_stamps_note_step(MOE_TOKEN_STEP_KEY_BEGIN);
+                    }
+                    const gsc::key slot_key = moe_segment_slot_key(sycl_ctx, cgraph, graph_hash, is_decode_phase);
+                    if (moe_hostpath_waits_enabled()) {
+                        moe_token_stamps_note_step(MOE_TOKEN_STEP_KEY_END);
+                    }
                     const gsc::action slot_action = sycl_ctx->moe_segment_slots.begin(slot_key);
                     moe_segment_slots_report(sycl_ctx);
                     // Slots the cache evicted or churned are destroyed only after the queue drains.
@@ -123537,6 +123595,10 @@ normal_dispatch:
                         // slot stays, and a later token that stages its inputs uses it.
                         compute_impl_unlocked();
                     } else if (slot_action == gsc::action::REPLAY) {
+                        // Reached only when the prestage above succeeded, so this is its return on a replaying token.
+                        if (moe_hostpath_waits_enabled()) {
+                            moe_token_stamps_note_step(MOE_TOKEN_STEP_PRESTAGE_END);
+                        }
                         const auto * slot = sycl_ctx->moe_segment_slots.payload(slot_key);
                         if (!slot) {
                             // The gateway swapped an input's staging buffer and retired every slot after begin().
