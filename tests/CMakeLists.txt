@@ -1020,6 +1020,15 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-swap-policy-source.py --self-test)
     set_tests_properties(test-sycl-moe-swap-policy-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+    # The legacy expert ranking is gone: no warmup profile, gate-norm placement, periodic rerank, runtime or adaptive
+    # prestage, hash-keyed rank or eviction frequency term is left in the backend, while the planner's block-keyed rank
+    # API and its one writer stay, and the down-I8 hot set ranks by usage score and that rank alone. Run WITH
+    # --self-test so each mutant is caught by the pin it names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-legacy-ranking-removed-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-legacy-ranking-removed-source.py
+            --self-test)
+    set_tests_properties(test-sycl-moe-legacy-ranking-removed-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # llama.cpp-36j0 Task 4: the MoE executor knobs' literals, log formats, env-report rows and teardown summary.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-exec-knobs-source
@@ -4509,9 +4518,9 @@ endif()
 
 # llama.cpp-76os: source gate -- the SOA-reorder type table
 # (ggml/src/ggml-sycl/soa-reorder-types.hpp) is the one list of types whose
-# AOS->SOA reorder exists. The six per-type fill switches (reorder_aos_to_soa_device,
-# reorder_rows_to_soa, reorder_data_internal_, ggml_sycl_reorder_weight_gpu,
-# ggml_sycl_reorder_weight_cpu, ggml_sycl_reorder_expected_size) must carry exactly
+# AOS->SOA reorder exists. The five per-type fill switches (reorder_aos_to_soa_device,
+# reorder_rows_to_soa, reorder_data_internal_, ggml_sycl_reorder_weight_cpu,
+# ggml_sycl_reorder_expected_size) must carry exactly
 # its types; the runtime clamp, reorder_tensor_to_soa, the partial-row fill and
 # layout_policy::get_optimal (the planner's layout source) must read it; and a chain
 # comparing against all five types is flagged. Host-only, reads the sources as text.
@@ -4803,7 +4812,7 @@ endif()
 
 # Source gate for the release of the last model: the model release hook and a failed load's abort each end in the one
 # step, which with no model live has the cache of each device the scheduler sees give back what it sized for a model
-# (the ring, the oneDNN pair, the reorder temp buffer, the arena) in a fixed order, names what holds on and reserves
+# (the ring, the oneDNN pair, the arena) in a fixed order, names what holds on and reserves
 # nothing, then puts the device's published terms back to their start through the one list; the next load's start
 # reserves the early arena again and refuses the load by name when it cannot. Host-only, reads the sources as text.
 # Same registration shape as test-sycl-load-zone-refusal-source above.

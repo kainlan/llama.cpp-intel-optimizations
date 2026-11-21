@@ -482,37 +482,6 @@ void ExpertPrefetcher::gc_completed() {
 }
 
 // ============================================================================
-// Pre-load popular experts into VRAM via unified cache at model init time
-// ============================================================================
-
-void ExpertPrefetcher::preload_experts(int layer_idx, const std::vector<int> & expert_ids) {
-    if (!is_initialized() || prefetch_disabled_) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!initialized_.load(std::memory_order_relaxed) || !dma_queue_) {
-        return;
-    }
-
-    int preloaded = 0;
-    for (int eid : expert_ids) {
-        // Use SOA-correct caching via unified cache (same as hint_locked).
-        // This fixes the pre-existing bug where raw memcpy copied AOS layout
-        // to VRAM but MMVQ kernels expect SOA layout.
-        void * ptr = moe_expert_ensure_soa_cached(layer_idx, eid, device_id_);
-        if (ptr) {
-            preloaded++;
-        }
-    }
-
-    if (preloaded > 0) {
-        GGML_LOG_INFO("[SYCL] Preloaded %d experts for layer %d into VRAM (SOA via unified cache)\n", preloaded,
-                      layer_idx);
-    }
-}
-
-// ============================================================================
 // ExpertPredictor: pre-attention expert prediction
 // ============================================================================
 

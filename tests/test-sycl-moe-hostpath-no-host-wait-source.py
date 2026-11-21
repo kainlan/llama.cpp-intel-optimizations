@@ -283,11 +283,6 @@ BOUNDARY = {
         "the multi-GPU scatter pipeline, behind ggml_sycl_pipeline_moe_enabled(), which returns false, and "
         "g_moe_multi_gpu_active"
     ),
-    "moe_prestage_popular_experts": (
-        "the placement prestage: g_prestage_completed latches it to one pass per model load, and it is a "
-        "no-op when a placement plan exists unless GGML_SYCL_LEGACY_PRESTAGE=1.  It is also the only "
-        "waiting callee of moe_periodic_rerank, which the scan does follow"
-    ),
     "ggml_sycl_info": "the device-info singleton: a function-local static, initialised once per process",
     "ggml_sycl_upload_moe_transient_ptr_table": (
         "the GPU expert route's pointer table, outside this ticket's host path.  Its queue waits are the zero "
@@ -1259,13 +1254,10 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     deep = ("    moe_precomputed_skip_key key{};\n"
             "    return ggml_sycl_make_moe_precomputed_skip_key(tensor, device, &key)")
     sub("N1", "wait two calls below a scanned helper", deep, "    g_pending_scatter.future.wait();\n" + deep)
-    sub("N2", "BOUNDARY entry no longer reached", "moe_prestage_popular_experts();",
-        "moe_prestage_popular_experts_retired();", count=-1)
-    sub("N2", "BOUNDARY entry no longer defined", "static void moe_prestage_popular_experts() {",
-        "static void moe_prestage_popular_experts_v2() {")
-    # moe_periodic_rerank left BOUNDARY: the scan follows it, so a wait in its own body is caught.
-    sub("N1", "wait in the rerank the scan follows", "    int ranks_changed = 0;\n",
-        "    g_pending_scatter.future.wait();\n    int ranks_changed = 0;\n")
+    sub("N2", "BOUNDARY entry no longer reached", "pipeline_scatter_start_async(ctx.device);",
+        "pipeline_scatter_start_async_retired(ctx.device);", count=-1)
+    sub("N2", "BOUNDARY entry no longer defined", "static void pipeline_scatter_start_async(int device) {",
+        "static void pipeline_scatter_start_async_v2(int device) {")
     fill = "    if (zero_init) {\n        ggml_sycl::mem_fill(handle, 0, bytes, q);\n    }\n"
     sub("N2", "KNOWN_WAITS entry matches nothing", fill, "")
     sub("N1", "second fill beside the known one", "    *out = std::move(handle);\n    return true;\n}\n",

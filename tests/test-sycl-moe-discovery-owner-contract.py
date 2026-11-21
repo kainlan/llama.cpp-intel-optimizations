@@ -260,14 +260,16 @@ ABSENCE_MUTANTS = {
         "        if (result.committed) {",
         "        ggml_sycl_reset_moe_module_state();\n        if (result.committed) {"),
     "the all-owner sweep exists only in module shutdown": (
-        "    g_adaptive_prestage.reset_after_stop();",
-        "    g_moe_discovery_registry.release_all_for_module_shutdown();\n    g_adaptive_prestage.reset_after_stop();"),
+        "    g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);",
+        "    g_moe_discovery_registry.release_all_for_module_shutdown();\n"
+        "    g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);"),
     "no integration site discards the transition result": (
         "        ggml_sycl_release_model_slot_resources(owner);",
         "        (void) g_moe_discovery_registry.activate(moe_owner);\n        ggml_sycl_release_model_slot_resources(owner);"),
     "module shutdown reuses the owner path's clear list": (
-        "    g_adaptive_prestage.reset_after_stop();",
-        "    g_moe_hybrid_init_done.store(false, std::memory_order_relaxed);\n    g_adaptive_prestage.reset_after_stop();"),
+        "    g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);",
+        "    g_moe_hybrid_init_done.store(false, std::memory_order_relaxed);\n"
+        "    g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);"),
 }
 
 
