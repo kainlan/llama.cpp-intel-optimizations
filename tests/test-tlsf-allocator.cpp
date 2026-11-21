@@ -1483,9 +1483,7 @@ static void test_allocate_class_walk_finds_block_behind_head() {
     REQUIRE(tlsf_allocator::round_request(TRIPLET_LARGE, 256) == TRIPLET_LARGE_ROUNDED);
     tlsf_allocator   t(TRIPLET_SMALL + 256 + TRIPLET_LARGE_ROUNDED + 256);
     const class_pair p = class_pair_setup(t, TRIPLET_SMALL, TRIPLET_LARGE_ROUNDED);
-    // Positive control: largest_free_block() reads the head of the highest
-    // non-empty class, so this shows the smaller block is the head.
-    REQUIRE(t.largest_free_block() == TRIPLET_SMALL && "the smaller block heads the class");
+    REQUIRE(t.largest_free_block() == TRIPLET_LARGE_ROUNDED && "the fitting block is free, behind the head");
     const size_t used = t.used();
     const size_t got  = t.allocate(TRIPLET_LARGE);
     REQUIRE(got == p.behind_offset && "the request takes the fitting block behind the smaller head");
@@ -1499,7 +1497,7 @@ static void test_allocate_class_walk_finds_block_behind_head() {
 static void test_allocate_class_walk_takes_smallest_fit() {
     tlsf_allocator   t(TRIPLET_LARGE_ROUNDED + 256 + TRIPLET_SMALL + 256);
     const class_pair p = class_pair_setup(t, TRIPLET_LARGE_ROUNDED, TRIPLET_SMALL);
-    REQUIRE(t.largest_free_block() == TRIPLET_LARGE_ROUNDED && "the larger block heads the class");
+    REQUIRE(t.largest_free_block() == TRIPLET_LARGE_ROUNDED && "the larger block is free, at the head");
     REQUIRE(t.allocate(TRIPLET_SMALL) == p.behind_offset && "the exact-size block behind the head is taken");
     REQUIRE(t.allocate(TRIPLET_LARGE) == p.head_offset && "the larger request still finds its block");
     REQUIRE(t.available() == 0);
@@ -1524,6 +1522,24 @@ static void test_allocate_class_walk_refuses_when_none_fits() {
             "both blocks are still free and still whole");
     REQUIRE(t.check_invariants());
     std::cout << "test_allocate_class_walk_refuses_when_none_fits: PASSED\n";
+}
+
+// largest_free_block() is the largest block of the top class, not its head:
+// the head is smaller, the larger block sits behind it, and a smaller block
+// in a lower class changes nothing.
+static void test_largest_free_block_walks_top_class() {
+    tlsf_allocator t(4096 + 256 + TRIPLET_SMALL + 256 + TRIPLET_LARGE_ROUNDED + 256);
+    const size_t   low = t.allocate(4096);
+    REQUIRE(low != SIZE_MAX && t.allocate(256) != SIZE_MAX);
+    const class_pair p = class_pair_setup(t, TRIPLET_SMALL, TRIPLET_LARGE_ROUNDED);
+    t.free(low);
+    REQUIRE(t.check_invariants());
+    REQUIRE(t.largest_free_block() == TRIPLET_LARGE_ROUNDED && "the block behind the top class's head is the largest");
+    // The answer is a size allocate() honours, with the head still smaller.
+    REQUIRE(t.allocate(t.largest_free_block()) == p.behind_offset);
+    REQUIRE(t.largest_free_block() == TRIPLET_SMALL && "the head is now the only block of the top class");
+    REQUIRE(t.check_invariants());
+    std::cout << "test_largest_free_block_walks_top_class: PASSED\n";
 }
 
 // A replay of expert triplets in a pool sized for exactly n of them: allocate
@@ -1724,6 +1740,7 @@ int main() {
     test_allocate_class_walk_finds_block_behind_head();
     test_allocate_class_walk_takes_smallest_fit();
     test_allocate_class_walk_refuses_when_none_fits();
+    test_largest_free_block_walks_top_class();
     test_allocate_class_walk_triplet_replay();
     test_allocate_refuses_only_without_a_fitting_block();
 

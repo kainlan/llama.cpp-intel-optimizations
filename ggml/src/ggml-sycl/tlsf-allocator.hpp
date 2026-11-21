@@ -106,9 +106,9 @@ class tlsf_allocator {
     // around allocate() and free() -- in the unified cache that is
     // unified_cache::arena_allocator_group_mutex(zone) (llama.cpp-044k).
     //
-    // gap_below() and frontier_walk() are EXACT: they read the physical block
-    // list.  largest_free_block() is not (it reports the head of the highest
-    // size class), so a fit decision should use these, not that.
+    // gap_below() and frontier_walk() read the physical block list, so they
+    // say WHERE a block fits.  largest_free_block() is exact too, but only
+    // says how large the largest free block is, not where it lies.
     // ------------------------------------------------------------------
     static constexpr size_t no_anchor = SIZE_MAX;
 
@@ -166,7 +166,7 @@ class tlsf_allocator {
     // Query methods
     size_t used() const;                // Bytes currently allocated
     size_t available() const;           // Bytes available for allocation
-    size_t largest_free_block() const;  // Size of largest contiguous free block
+    size_t largest_free_block() const;  // Size of largest contiguous free block (walks the top class)
 
     // ------------------------------------------------------------------
     // Whole-TLSF block census (llama.cpp-moua L4 1b).
@@ -441,6 +441,9 @@ class tlsf_allocator {
             fl = (int) (sizeof(size_t) * 8 - 1 - __builtin_clzll(size)) - FL_OFFSET;
             sl = (int) ((size >> (fl + FL_OFFSET - SL_BITS)) - SL_COUNT);
             if (fl >= FL_COUNT) {
+                // This last class has no upper bound, so find_suitable()'s head there is not checked against the
+                // request.  Safe while no request exceeds the class floor, 2^35 * 31/16 bytes (about 62 GiB), which is
+                // larger than any device zone on these cards: every block in the class is at least the floor.
                 fl = FL_COUNT - 1;
                 sl = SL_COUNT - 1;
             }
@@ -817,16 +820,22 @@ inline size_t tlsf_allocator::available() const {
 }
 
 inline size_t tlsf_allocator::largest_free_block() const {
-    // Find highest set bit in fl_bitmap to get largest FL class
+    // Every block of the highest non-empty class is larger than every block of
+    // a lower class, so that class alone holds the largest free block.  Its
+    // head need not be the largest: a class holds a range of sizes, and a
+    // larger block can sit behind a smaller head, so the head alone would
+    // understate it and a gate reading it would refuse requests allocate()
+    // places.  Cost: one walk of the top class's list, no other class.
     if (fl_bitmap_ == 0) {
         return 0;
     }
-    int fl       = (int) (sizeof(uint32_t) * 8 - 1 - __builtin_clz(fl_bitmap_));
-    // Find highest set bit in sl_bitmap for that FL class
-    int sl       = (int) (sizeof(uint32_t) * 8 - 1 - __builtin_clz(sl_bitmap_[fl]));
-    // The head of that list is the largest (approximately)
-    int block_id = free_lists_[fl][sl];
-    return block_id >= 0 ? blocks_[block_id].size : 0;
+    const int fl      = (int) (sizeof(uint32_t) * 8 - 1 - __builtin_clz(fl_bitmap_));
+    const int sl      = (int) (sizeof(uint32_t) * 8 - 1 - __builtin_clz(sl_bitmap_[fl]));
+    size_t    largest = 0;
+    for (int id = free_lists_[fl][sl]; id >= 0; id = blocks_[id].next_free) {
+        largest = std::max(largest, blocks_[id].size);
+    }
+    return largest;
 }
 
 // ------------------------------------------------------------------
