@@ -679,7 +679,8 @@ static void test_the_summary_lines_name_every_figure() {
     CHECK(contains(faults, "refused: host copy not pinned x1"));
     CHECK(contains(faults, "busy: WEIGHT zone full x4"));
     CHECK(contains(faults, "dropped pending: WEIGHT zone full x1"));
-    CHECK(contains(faults, "settled from the plan after a throw: 0 batches (0 moves moved)"));
+    CHECK(contains(faults,
+                   "settled from the plan after a throw: 0 batches (0 moves moved); unsettled at report: 0 moves"));
     CHECK(!contains(faults, "no single-row decode graph"));
 }
 
@@ -735,6 +736,8 @@ static void test_an_evict_batch_that_threw_is_settled_from_the_next_view() {
     CHECK(r.d.unsettled.size() == 3);
     CHECK(r.d.pending.empty());
     CHECK(r.d.stats.evicts == 0 && r.d.stats.transactions_evict == 0);
+    CHECK(r.d.stats.unsettled_moves == 3);
+    CHECK(contains(ggml_sycl::moe_swap_driver_summary_faults(r.d.stats, 0), "unsettled at report: 3 moves"));
     if (r.calls.size() != 1 || r.last().size() != 3) {
         return;
     }
@@ -755,7 +758,8 @@ static void test_an_evict_batch_that_threw_is_settled_from_the_next_view() {
     }
     CHECK(r.d.pending.empty() && r.d.stats.admits == 1);
     const std::string faults = ggml_sycl::moe_swap_driver_summary_faults(r.d.stats, 0);
-    CHECK(contains(faults, "settled from the plan after a throw: 1 batches (1 moves moved)"));
+    CHECK(contains(faults,
+                   "settled from the plan after a throw: 1 batches (1 moves moved); unsettled at report: 0 moves"));
     CHECK(contains(faults, "busy: transaction threw before it answered x2"));
 }
 
@@ -782,7 +786,64 @@ static void test_an_admit_batch_that_threw_is_settled_from_the_next_view() {
     }
     CHECK(r.d.unsettled.empty() && r.d.pending.empty());
     CHECK(r.d.stats.admits == 2 && r.d.stats.transactions_admit == 2);
-    CHECK(r.d.stats.busy.empty());
+    CHECK(reasons(r.d.stats.busy, ggml_sycl::MOE_SWAP_UNSETTLED_REASON) == 2);  // each admit the throw was sent
+    CHECK(r.d.stats.dropped.empty());
+}
+
+// A pending admit whose every transaction throws is BUSY at each throw and its streak advances: once the streak
+// reaches the drop bound, the settle that finds it not moved drops it, counted once, and it becomes a restore.
+static void test_an_admit_whose_every_transaction_throws_is_dropped() {
+    rig r(1, 8, 4);
+    r.decode[r.index(0, 5)] = 10;
+    r.to_period();  // token 4: evicts 0
+    CHECK(r.d.pending.size() == 1);
+    for (int i = 0; i < ggml_sycl::MOE_SWAP_PENDING_DROP_STREAK; ++i) {
+        r.throw_after = 0;
+        r.boundary();  // tokens 5 to 8: the admit of 5 is sent and the transaction throws
+    }
+    CHECK(r.throws == ggml_sycl::MOE_SWAP_PENDING_DROP_STREAK);
+    CHECK(r.d.stats.dropped.empty());
+    CHECK(r.d.unsettled.size() == 1);
+    if (r.d.unsettled.size() == 1) {
+        CHECK(r.d.unsettled[0].pair.busy_streak == ggml_sycl::MOE_SWAP_PENDING_DROP_STREAK);
+    }
+    r.throw_after = 0;
+    r.boundary();  // token 9: the settle drops the admit; its restore is sent and throws too
+    CHECK(reasons(r.d.stats.dropped, ggml_sycl::MOE_SWAP_UNSETTLED_REASON) == 1);
+    CHECK(reasons(r.d.stats.busy, ggml_sycl::MOE_SWAP_UNSETTLED_REASON) == 5);
+    CHECK(r.calls.size() == 6 && r.last().size() == 1);
+    if (r.calls.size() == 6 && r.last().size() == 1) {
+        CHECK(r.last()[0].kind == MOE_SWAP_MOVE_ADMIT && r.last()[0].expert == 0);  // the restore
+    }
+    CHECK(r.d.unsettled.size() == 1);
+    if (r.d.unsettled.size() == 1) {
+        CHECK(r.d.unsettled[0].pair.restore && r.d.unsettled[0].pair.busy_streak == 1);
+    }
+}
+
+// A boundary with loans outstanding settles nothing, since a loan publishes lent triplets off the card; the next
+// boundary without loans settles the batch.
+static void test_a_thrown_batch_is_not_settled_while_loans_are_outstanding() {
+    rig r(1, 16, 8);
+    r.decode[r.index(0, 8)] = 40;
+    r.decode[r.index(0, 9)] = 30;
+    r.throw_after           = 1;
+    r.to_period();  // token 4: two evicts, the transaction throws after the first
+    CHECK(r.throws == 1 && r.d.unsettled.size() == 2);
+    if (r.calls.size() != 1 || r.last().size() != 2) {
+        return;
+    }
+    const int unmoved = r.last()[1].expert;
+
+    r.cell(r.view.resident, 0, unmoved) = 0;  // lent to a prompt ring, as the loan's publication shows it
+    CHECK(r.boundary(1, false, 0.0, /*loans=*/true) == MOE_SWAP_DRIVER_HELD);
+    CHECK(r.d.unsettled.size() == 2 && r.d.stats.settled_batches == 0);
+    CHECK(r.d.pending.empty() && r.d.stats.evicts == 0);
+    r.cell(r.view.resident, 0, unmoved) = 1;  // the loan came back
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);
+    CHECK(r.d.unsettled.empty() && r.d.stats.settled_batches == 1 && r.d.stats.settled_moved == 1);
+    CHECK(r.d.stats.evicts == 1);
+    CHECK(reasons(r.d.stats.busy, ggml_sycl::MOE_SWAP_UNSETTLED_REASON) == 1);
 }
 
 // A replaced route table under the same load and shape takes what the old driver has in flight, and the new driver
@@ -805,6 +866,25 @@ static void test_a_replaced_table_carries_or_drops_what_is_in_flight() {
         CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);
         CHECK(r.last().size() == 2 && r.last()[0].kind == MOE_SWAP_MOVE_ADMIT);
         CHECK(r.d.pending.empty() && r.d.stats.admits == 2);
+    }
+    {
+        // Every list in flight moves: the latches, the open slots and an unsettled batch with the pending admits.
+        moe_swap_driver_state       from(2, 8);
+        moe_swap_driver_state       to(2, 8);
+        ggml_sycl::moe_swap_pending p;
+        p.block = 0;
+        from.pending.push_back(p);
+        ggml_sycl::moe_swap_unsettled u;
+        u.kind       = MOE_SWAP_MOVE_EVICT;
+        u.pair.block = 1;
+        from.unsettled.push_back(u);
+        from.stats.unsettled_moves = 1;
+        from.latched[1]            = 1;
+        from.open_slots[0]         = 2;
+        CHECK(ggml_sycl::moe_swap_driver_carry(from, to));
+        CHECK(to.pending.size() == 1 && to.unsettled.size() == 1 && to.latched[1] == 1 && to.open_slots[0] == 2);
+        CHECK(from.pending.empty() && from.unsettled.empty() && from.latched[1] == 0 && from.open_slots[0] == 0);
+        CHECK(to.stats.unsettled_moves == 1 && from.stats.unsettled_moves == 0);
     }
     {
         moe_swap_driver_state       d(2, 8);
@@ -907,6 +987,8 @@ int main() {
     test_the_counts_go_into_the_drivers_own_arrays();
     test_an_evict_batch_that_threw_is_settled_from_the_next_view();
     test_an_admit_batch_that_threw_is_settled_from_the_next_view();
+    test_an_admit_whose_every_transaction_throws_is_dropped();
+    test_a_thrown_batch_is_not_settled_while_loans_are_outstanding();
     test_a_replaced_table_carries_or_drops_what_is_in_flight();
     test_a_prompt_batch_with_room_for_no_pair_spends_the_prompt_boundary();
     test_the_boundary_reads_each_blocks_admissible_count();

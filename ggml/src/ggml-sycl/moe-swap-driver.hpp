@@ -20,9 +20,12 @@
 //     the block would meet (moe_swap_move::latches_block: the caller sets it for a device copy that shares a bulk
 //     tensor's storage). Any other final refusal drops that proposal alone, counted by its reason.
 //   - A transaction that throws leaves its batch unsettled: the moves it was sent wait in the state, and the next
-//     boundary, before anything else, settles each from the view it is handed, since the published plan is the
-//     record of what moved. A triplet that is where its move takes it moved; an evict that did not move is dropped
-//     (BUSY, MOE_SWAP_UNSETTLED_REASON), and an admit that did not move stays pending.
+//     boundary with no loans outstanding, before anything else, settles each from the view it is handed, since the
+//     published plan is the record of what moved (a loan publishes lent triplets off the card, so a boundary with
+//     loans outstanding settles nothing). A triplet that is where its move takes it moved; an evict that did not move
+//     is dropped (BUSY, MOE_SWAP_UNSETTLED_REASON), and an admit that did not move stays pending. A throw counts as a
+//     BUSY answer, MOE_SWAP_UNSETTLED_REASON, for each pending admit it was sent, and advances its streak, so an
+//     admit whose every transaction throws is dropped under the streak rule like any other.
 //   - With loans outstanding nothing is sent: the loan's ring owns the room, and the policy is held in flight.
 //   - The batch is trimmed to the host room, hottest first: an evict takes pinned host room for its three copies,
 //     which it may not grow (the host zone was sized by the plan). What does not fit is deferred and counted apart
@@ -211,6 +214,7 @@ struct moe_swap_driver_stats {
     uint64_t                           boundaries_after_prompt  = 0;  // boundaries the caller saw a prompt graph before
     uint64_t                           settled_batches          = 0;  // batches whose transaction threw, settled later
     uint64_t                           settled_moved            = 0;  // their moves the next view showed had moved
+    uint64_t                           unsettled_moves          = 0;  // moves of a thrown batch not settled yet
     uint32_t                           pending_high_water       = 0;
     const char *                       off_reason               = nullptr;
     std::vector<moe_swap_reason_count> refused;
@@ -318,6 +322,19 @@ inline bool moe_swap_pending_give_up(moe_swap_driver_state & d, moe_swap_pending
     return true;
 }
 
+// A BUSY answer for pending admit `p`: its streak counts settled boundaries in a row with one reason, and an unsettled
+// boundary starts it over.
+inline void moe_swap_pending_note_busy(moe_swap_pending & p, const char * reason, bool cache_settled) {
+    if (!cache_settled) {
+        p.busy_streak = 0;
+    } else if (moe_swap_same_text(p.busy_reason, reason)) {
+        ++p.busy_streak;
+    } else {
+        p.busy_streak = 1;
+    }
+    p.busy_reason = reason;
+}
+
 inline void moe_swap_off(moe_swap_driver_state & d, const char * reason) {
     ++d.stats.boundaries_off;
     d.stats.off_reason = reason;
@@ -326,15 +343,22 @@ inline void moe_swap_off(moe_swap_driver_state & d, const char * reason) {
 // The batch of a transaction that threw, settled from `view`, the published plan the boundary reads: a triplet moved
 // when it is where its move takes it. A moved evict leaves its admit pending, and an evict that did not move is
 // dropped (BUSY, MOE_SWAP_UNSETTLED_REASON; the policy may propose it again). A moved admit leaves pending, and one
-// that did not move goes back to pending with its streak as it was, for this boundary to send again. The outcome list
-// that carried the bytes was lost with the throw, so settled moves add none. Returns whether anything had moved.
+// that did not move goes back to pending with its streak as the throw left it, for this boundary to send again,
+// unless that streak reached MOE_SWAP_PENDING_DROP_STREAK: then it is dropped as a BUSY admit is. The outcome list
+// that carried the bytes was lost with the throw, so settled moves add none. The batch leaves the state before any
+// entry is settled, so an allocation that throws part way never settles an entry twice. Returns whether anything had
+// moved.
 inline bool moe_swap_settle(moe_swap_driver_state & d, const moe_swap_plan_view & view) {
     moe_swap_driver_stats & st          = d.stats;
     const size_t            ne          = static_cast<size_t>(d.policy.n_experts);
     bool                    evict_moved = false;
     bool                    admit_moved = false;
+    d.pending.reserve(d.pending.size() + d.unsettled.size());
+    std::vector<moe_swap_unsettled> batch;
+    batch.swap(d.unsettled);
+    st.unsettled_moves = 0;
     ++st.settled_batches;
-    for (const moe_swap_unsettled & u : d.unsettled) {
+    for (const moe_swap_unsettled & u : batch) {
         const moe_swap_pending & p = u.pair;
         if (u.kind == MOE_SWAP_MOVE_EVICT) {
             if (view.resident[static_cast<size_t>(p.block) * ne + static_cast<size_t>(p.evict_expert)] == 0) {
@@ -357,11 +381,18 @@ inline bool moe_swap_settle(moe_swap_driver_state & d, const moe_swap_plan_view 
                 ++st.admits;
                 st.prompt_admits += p.prompt ? 1 : 0;
             }
+        } else if (p.busy_streak >= MOE_SWAP_PENDING_DROP_STREAK) {
+            moe_swap_count_reason(st.dropped, p.busy_reason);
+            moe_swap_pending q = p;
+            if (moe_swap_pending_give_up(d, q)) {
+                d.pending.push_back(q);
+            }
         } else {
             d.pending.push_back(p);
         }
     }
-    d.unsettled.clear();
+    batch.clear();
+    d.unsettled.swap(batch);  // empty, with the capacity kept for the next throw
     st.transactions_evict += evict_moved ? 1 : 0;
     st.transactions_admit += admit_moved ? 1 : 0;
     st.pending_high_water = std::max(st.pending_high_water, static_cast<uint32_t>(d.pending.size()));
@@ -372,7 +403,9 @@ inline bool moe_swap_settle(moe_swap_driver_state & d, const moe_swap_plan_view 
 
 // The route table was replaced while the load the driver ran under stays: `to`, the new table's driver, takes what
 // `from` has in flight (pending admits, an unsettled batch, latches and open slots), so nothing it moved is forgotten.
-// The policy's usage starts over with the new table's counters. False, with nothing moved, when the shapes differ.
+// The policy's usage starts over with the new table's counters. `to` must be freshly constructed, with nothing of its
+// own in flight: the lists are exchanged, so whatever `to` held would land in `from`. False, with nothing moved, when
+// the shapes differ.
 inline bool moe_swap_driver_carry(moe_swap_driver_state & from, moe_swap_driver_state & to) {
     if (from.policy.n_blocks != to.policy.n_blocks || from.policy.n_experts != to.policy.n_experts) {
         return false;
@@ -382,12 +415,15 @@ inline bool moe_swap_driver_carry(moe_swap_driver_state & from, moe_swap_driver_
     to.latched.swap(from.latched);
     to.open_slots.swap(from.open_slots);
     to.stats.pending_high_water = static_cast<uint32_t>(to.pending.size());
+    to.stats.unsettled_moves    = to.unsettled.size();
+    from.stats.unsettled_moves  = 0;
     return true;
 }
 
 // The route table was replaced under another load, or with another shape: what `d` has in flight will not land, and
 // each such move counts as an open slot in d's figures before its report prints. A pending admit is one; so is each
-// move of an unsettled batch, an evict among them counted though it may not have moved, since no view settles it now.
+// move of an unsettled batch, since no view settles it now: an evict among them is counted though it may not have
+// moved, and an admit though it may have, so the count can be high by the moves the throw had already made.
 // Returns how many were counted.
 inline uint64_t moe_swap_driver_drop_in_flight(moe_swap_driver_state & d) {
     const uint64_t n = static_cast<uint64_t>(d.pending.size()) + static_cast<uint64_t>(d.unsettled.size());
@@ -399,6 +435,7 @@ inline uint64_t moe_swap_driver_drop_in_flight(moe_swap_driver_state & d) {
     }
     d.pending.clear();
     d.unsettled.clear();
+    d.stats.unsettled_moves = 0;
     return n;
 }
 
@@ -427,8 +464,9 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
         moe_swap_detail::moe_swap_off(d, "plan view does not match the route table");
         return MOE_SWAP_DRIVER_OFF;
     }
-    // Before anything is decided: a batch whose transaction threw is settled from this view.
-    if (!d.unsettled.empty() && moe_swap_detail::moe_swap_settle(d, view)) {
+    // Before anything is decided: a batch whose transaction threw is settled from this view, unless loans are
+    // outstanding, since a loan's publication shows lent triplets off the card whether a move took them or not.
+    if (!d.unsettled.empty() && !c.loans_outstanding && moe_swap_detail::moe_swap_settle(d, view)) {
         after_move = true;
     }
     st.graphs_after_move += after_move ? graphs : 0;
@@ -492,15 +530,20 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
             m.expert = p.restore ? p.evict_expert : p.admit_expert;
             d.batch.push_back(m);
         }
-        // Reserved before the call, so holding the batch after a throw allocates nothing.
+        // Reserved before the call, so holding the batch after a throw does not grow the list.
         d.unsettled.reserve(d.pending.size());
         try {
             txn(d.batch);
         } catch (...) {
-            for (const moe_swap_pending & p : d.pending) {
+            // Each admit sent is BUSY for the throw, and its streak advances, so admits whose every transaction
+            // throws are dropped under the streak rule (at the settle that finds them not moved).
+            for (moe_swap_pending & p : d.pending) {
+                moe_swap_detail::moe_swap_count_reason(st.busy, MOE_SWAP_UNSETTLED_REASON);
+                moe_swap_detail::moe_swap_pending_note_busy(p, MOE_SWAP_UNSETTLED_REASON, c.cache_settled);
                 d.unsettled.push_back({ MOE_SWAP_MOVE_ADMIT, p });
             }
             d.pending.clear();
+            st.unsettled_moves = d.unsettled.size();
             throw;
         }
         size_t kept = 0;
@@ -522,15 +565,8 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
                 }
             } else if (m.outcome == MOE_SWAP_MOVE_BUSY) {
                 moe_swap_detail::moe_swap_count_reason(st.busy, m.reason);
-                if (!c.cache_settled) {
-                    p.busy_streak = 0;
-                } else if (moe_swap_detail::moe_swap_same_text(p.busy_reason, m.reason)) {
-                    ++p.busy_streak;
-                } else {
-                    p.busy_streak = 1;
-                }
-                p.busy_reason = m.reason;
-                stay          = true;
+                moe_swap_detail::moe_swap_pending_note_busy(p, m.reason, c.cache_settled);
+                stay = true;
                 if (p.busy_streak >= MOE_SWAP_PENDING_DROP_STREAK) {
                     moe_swap_detail::moe_swap_count_reason(st.dropped, m.reason);
                     stay = moe_swap_detail::moe_swap_pending_give_up(d, p);
@@ -587,7 +623,7 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
         return MOE_SWAP_DRIVER_IDLE;
     }
     if (prompt && keep < n) {
-        moe_swap_prompt_boundary_defer(d.policy);  // part moved: the next boundary takes the rest
+        moe_swap_prompt_boundary_defer(d.policy);  // part fits: the next boundary takes the rest
     }
 
     d.batch.clear();
@@ -598,7 +634,7 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
         m.expert = d.proposals[i].evict_expert;
         d.batch.push_back(m);
     }
-    // Reserved before the call, so holding the batch after a throw allocates nothing.
+    // Reserved before the call, so holding the batch after a throw does not grow the list.
     d.unsettled.reserve(keep);
     try {
         txn(d.batch);
@@ -612,6 +648,7 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
             u.pair.prompt       = prompt;
             d.unsettled.push_back(u);
         }
+        st.unsettled_moves = d.unsettled.size();
         throw;
     }
     for (size_t i = 0; i < keep; ++i) {
@@ -714,8 +751,10 @@ inline std::string moe_swap_driver_summary_faults(const moe_swap_driver_stats & 
                   (ull) st.transactions_admit, (ull) st.decode_graphs, (ull) st.open_slots, (ull) st.deferred_room,
                   room, (ull) st.boundaries_no_admissible, (ull) st.file_mapped_passed, off);
     char tail[256];
-    std::snprintf(tail, sizeof(tail), "; settled from the plan after a throw: %llu batches (%llu moves moved)",
-                  (ull) st.settled_batches, (ull) st.settled_moved);
+    std::snprintf(tail, sizeof(tail),
+                  "; settled from the plan after a throw: %llu batches (%llu moves moved); unsettled at report: %llu "
+                  "moves",
+                  (ull) st.settled_batches, (ull) st.settled_moved, (ull) st.unsettled_moves);
     std::string out = std::string(head) + tail + "; refused: " + moe_swap_detail::moe_swap_reason_list(st.refused) +
                       "; busy: " + moe_swap_detail::moe_swap_reason_list(st.busy) +
                       "; dropped pending: " + moe_swap_detail::moe_swap_reason_list(st.dropped);

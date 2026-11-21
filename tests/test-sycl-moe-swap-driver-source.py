@@ -24,7 +24,8 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       accessor after the parse, so the non-default report says what is in effect;
   D7  each summary line reaches the log at WARN: every summary call is an argument of GGML_LOG_WARN, and both exist;
       the second line names the accepted transactions, evicts and admits apart, beside the decode graphs, and the
-      step counts each direction's accepted transaction once (each one can cost a context what it recorded);
+      step counts each direction's accepted transaction once (each one can cost a context what it recorded); the
+      second line also names the moves of a thrown batch still unsettled at the report, a count each throw sets;
   D8  the driver header is plain host code: it includes the policy header and a short list of standard headers, and
       keeps no state outside the caller's struct (no static, thread_local, extern, mutable or volatile, no inline
       variable, no atomic or lock), and reaches no device, cache, log or environment;
@@ -48,7 +49,11 @@ a unit test cannot show is where the driver runs and what it does not do there. 
   D15 the evict batch's room and the evict mint's cap are one figure: the driver's room callback returns
       unified_cache::host_zone_no_growth_room for the WEIGHT zone, the mint refuses a no-growth request past that
       same accessor, and the accessor is the zone's capacity capped at its reserved figure, less what it holds,
-      never below zero.
+      never below zero;
+  D16 a replaced route table's driver hands over what is in flight only under the load the instance last saw: the
+      caller carries only when the snapshot's model and load ids both match, otherwise drops the moves as open slots
+      and forces the old driver's report when it dropped any, and the report prints when forced even if an earlier
+      one covered every boundary.
 
 Checks run on comment-stripped text, string literals kept. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
@@ -107,6 +112,13 @@ FAULTS_FIELDS = ("accepted transactions %llu (evict %llu, admit %llu) over %llu 
                  "(ull) (st.transactions_evict + st.transactions_admit), (ull) st.transactions_evict,",
                  "(ull) st.transactions_admit, (ull) st.decode_graphs,")
 TXN_COUNTS = ("++st.transactions_evict;", "++st.transactions_admit;")
+UNSETTLED_FIELDS = ("unsettled at report: %llu", "(ull) st.unsettled_moves)")
+UNSETTLED_SET = "st.unsettled_moves = d.unsettled.size();"
+SAME_LOAD = "const bool same_load = snap && snap->model_id == inst.model_id && snap->load_txn_id == inst.load_txn_id;"
+CARRY_GATE = ("if (!same_load || !ggml_sycl::moe_swap_driver_carry(*inst.driver, *fresh)) { "
+              "dropped = ggml_sycl::moe_swap_driver_drop_in_flight(*inst.driver); }")
+FORCED_REPORT = "ggml_sycl_moe_swap_report(inst, device, dropped != 0);"
+REPORT_FORCE = "if (!force && inst.driver->stats.boundaries == inst.reported) { return; }"
 EVICT_MINT = re.compile(r"if\s*\(\s*out\.kind\s*==\s*ggml_sycl_expert_move_kind::EVICT\s*\)\s*\{\s*"
                         r"storage\s*=\s*ggml_sycl_host_expert_alloc_no_growth\(\s*device\s*,\s*target\.logical_bytes\s*\)"
                         r"\s*;\s*\}\s*else\s*\{\s*storage\s*=\s*ggml_sycl_host_expert_alloc\(\s*device\s*,\s*"
@@ -382,6 +394,8 @@ def check(raw: dict[str, str]) -> None:
                    "beside the decode graphs")
     if any(driver.count(c) != 1 for c in TXN_COUNTS):
         fail("D7", "the step does not count each direction's accepted transaction exactly once")
+    if not all(f in faults for f in UNSETTLED_FIELDS) or norm(driver).count(UNSETTLED_SET) != 2:
+        fail("D7", "the second summary line does not name the moves left unsettled, set at each throw")
 
     # D8 ---------------------------------------------------------------------------------------------------------------
     includes = INCLUDE.findall(driver)
@@ -470,6 +484,14 @@ def check(raw: dict[str, str]) -> None:
         fail("D15", "the evict batch's room is not the WEIGHT zone's no-growth room")
     if norm(cache).count(MINT_CAP) != 1:
         fail("D15", "the evict mint's no-growth cap is not the cache's no-growth room")
+    # D16 --------------------------------------------------------------------------------------------------------------
+    replaced = norm(caller)
+    if replaced.count(SAME_LOAD) != 1 or replaced.count(CARRY_GATE) != 1 or replaced.count(FORCED_REPORT) != 1:
+        fail("D16", "a replaced table's driver is carried other than under the same model and load, or its report is "
+                    "not forced when moves were dropped")
+    if norm(body(sycl, REPORT_SIG)).count(REPORT_FORCE) != 1:
+        fail("D16", "a forced report still waits for a boundary the last report did not cover")
+
     accessor_room = norm(body(cache, NO_GROWTH_ROOM_SIG))
     if not accessor_room or not all(f in accessor_room for f in NO_GROWTH_ROOM_FIELDS):
         fail("D15", "the no-growth room is not capacity capped at the reserved figure, less what is used, never below 0")
@@ -581,6 +603,20 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("summary-drops-the-admits", "D7",
                 [("driver", FAULTS_SIG, "(ull) st.transactions_admit, (ull) st.decode_graphs,", "(ull) st.decode_graphs,")])
     expect_fail("step-forgets-the-evict-transaction", "D7", [("driver", "", "++st.transactions_evict;", "")])
+    expect_fail("unsettled-not-reported", "D7",
+                [("driver", FAULTS_SIG, "(ull) st.settled_moved, (ull) st.unsettled_moves)",
+                  "(ull) st.settled_moved, 0ull)")])
+    expect_fail("admit-throw-leaves-the-count", "D7",
+                [("driver", STEP_SIG, "d.pending.clear();\n            st.unsettled_moves = d.unsettled.size();",
+                  "d.pending.clear();")])
+    expect_fail("carry-ignores-the-load", "D16",
+                [("sycl", CALLER_SIG, "snap->model_id == inst.model_id && snap->load_txn_id == inst.load_txn_id",
+                  "snap->model_id == inst.model_id")])
+    expect_fail("carry-without-the-gate", "D16",
+                [("sycl", CALLER_SIG, "if (!same_load || !ggml_sycl::moe_swap_driver_carry(",
+                  "if (!ggml_sycl::moe_swap_driver_carry(")])
+    expect_fail("drop-report-not-forced", "D16", [("sycl", CALLER_SIG, "/*force=*/dropped != 0", "/*force=*/false")])
+    expect_fail("report-ignores-force", "D16", [("sycl", REPORT_SIG, "if (!force && inst.driver", "if (inst.driver")])
     expect_fail("header-includes-the-cache", "D8",
                 [("driver", "", "#include \"moe-swap-policy.hpp\"",
                   "#include \"moe-swap-policy.hpp\"\n#include \"unified-cache.hpp\"")])

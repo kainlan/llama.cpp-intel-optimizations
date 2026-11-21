@@ -443,8 +443,10 @@ Once two graph computes have overlapped, a latch nothing clears
 (`g_sycl_graph_multithreaded`) turns every later boundary off. Its state is one
 instance per device, keyed on the route table it reads, since that table is one
 per device and shared by every context on the card. A transaction that throws
-leaves its batch unsettled in that state, and the next boundary settles each move
-from the plan the move published before it rethrew.
+leaves its batch unsettled in that state, and the next boundary with no loans
+outstanding settles each move from the plan the move published before it
+rethrew; a loan's publication shows lent triplets off the card, so a boundary
+with loans outstanding settles nothing.
 
 A round is not free. Each accepted transaction publishes a plan, and a published
 plan bumps the exec-graph epoch. A context reads the epoch at its next graph
