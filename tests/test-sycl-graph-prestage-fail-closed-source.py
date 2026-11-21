@@ -70,7 +70,7 @@ reuse. A staging failure is also not permanent for a signature: the memo forgets
 skipped tokens, so a transient failure (a staging allocation) recovers while a structural one (a
 host-resident input) re-declines at the cost of one pass.
 
-A host-resident op output is a graph input too (llama.cpp-34pj). Under spread expert placement the plan has no CPU
+A host-resident op output is a graph input too. Under spread expert placement the plan has no CPU
 work, so the CPU backend computes into the generic host buft, and the scheduler makes no device copy of an activation
 it produces: Qwen's mask ADD (`node_6686`) reached a SYCL split in host memory, the pre-stage classed it COPY, the
 cache arm refused it, and the decode graph was never recorded. The class rule lives in prestage-class.hpp
@@ -288,8 +288,8 @@ def evaluate(backend, common, memo_hdr, class_hdr=None):
         "ggml_sycl_prestage_classify(" in prestage and "graph_tensor_is_input(tensor)" in classify
     results["pre-stage has no flag-only INPUT test left"] = \
         "flags & GGML_TENSOR_FLAG_INPUT" not in prestage and "flags & GGML_TENSOR_FLAG_INPUT" not in classify
-    # A host-resident op output is another split's per-token activation (llama.cpp-34pj). The backend gathers the facts
-    # and asks the shared rule; it returns no class of its own.
+    # A host-resident op output is another split's per-token activation. The backend gathers the facts and asks the
+    # shared rule; it returns no class of its own.
     results["classify asks the shared class rule, with the view root's op as a fact"] = \
         "ggml_sycl_prestage_class_of(" in classify and \
         "ggml_sycl_prestage_root_is_op_output(tensor)" in classify and \
