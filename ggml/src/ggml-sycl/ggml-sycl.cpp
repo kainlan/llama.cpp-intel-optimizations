@@ -28258,7 +28258,8 @@ std::string test_expert_admit_completes_a_block_the_direct_route_serves() {
     // The decode direct route serves a batch-1 MUL_MAT_ID from one table covering every expert of the tensor on the
     // device, and refuses while any of them is on the host. It refuses the block while expert 1 is on the host. The
     // admit remembers each device copy, which bumps the tensor's storage generation, so the route decides again: its
-    // table then names each admitted device copy, and a kernel behind the table's upload reads the bytes through it.
+    // table then names each admitted device copy, its upload counts the admitted copy's ready event among those it
+    // waits for, and a kernel behind the table's upload reads the bytes through it.
     test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x61646d7408ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
@@ -28308,14 +28309,35 @@ std::string test_expert_admit_completes_a_block_the_direct_route_serves() {
         return "the admit that completes the block answered " + test_admit_answer(code, result);
     }
 
+    // The ordering. The copy has long finished by the time a kernel reads it, so the bytes alone cannot show that the
+    // table's upload is behind it. The route's upload counts one dependency for each expert record in its table that
+    // carries a ready event. Expert 0's record, read by the resolver the route uses, gives the count it alone adds;
+    // the admitted record carries the copy and fill's event, so the upload must count exactly one more.
     const void * const * tables[3] = { nullptr, nullptr, nullptr };
     {
         test_sycl_info_override_guard single_card(one_card);
         for (int s = 0; s < 3; ++s) {
+            const size_t expert_bytes = ::ggml_sycl_moe_expert_layout_bytes(&tensors[s], GGML_LAYOUT_AOS, fx.device);
+            ggml_tensor_extra_gpu::resolved_moe_expert_storage_record expert0{};
+            ggml_tensor_extra_gpu::resolved_moe_expert_storage_record admitted{};
+            if (!fx.extras[s]->resolve_moe_storage_record(0, GGML_LAYOUT_AOS, fx.device, expert_bytes, &expert0) ||
+                !fx.extras[s]->resolve_moe_storage_record(1, GGML_LAYOUT_AOS, fx.device, expert_bytes, &admitted) ||
+                !admitted.has_ready_event) {
+                return test_loan_fail("slot %d's admitted device record does not resolve with a ready event", s);
+            }
+            const uint64_t expert0_alone = expert0.has_ready_event ? 1 : 0;
+            g_test_moe_ptr_table_ready_event_deps.store(0, std::memory_order_relaxed);
             layout_mode layout = GGML_LAYOUT_SOA;
             tables[s]          = ::ggml_sycl_moe_decode_direct_table(ctx, &tensors[s], /*selected_rows=*/1, &layout);
             if (!tables[s] || layout != GGML_LAYOUT_AOS) {
                 return test_loan_fail("the direct route did not serve slot %d from its AOS copies after the admit", s);
+            }
+            const uint64_t chained = g_test_moe_ptr_table_ready_event_deps.load(std::memory_order_relaxed);
+            if (chained != expert0_alone + 1) {
+                return test_loan_fail(
+                    "slot %d's direct table upload chained %llu ready events where expert 0 alone "
+                    "chains %llu: the admitted copy's was not counted once",
+                    s, static_cast<unsigned long long>(chained), static_cast<unsigned long long>(expert0_alone));
             }
         }
     }
