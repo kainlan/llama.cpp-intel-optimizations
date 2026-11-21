@@ -105,6 +105,26 @@ static void test_view_chain_reaches_the_root() {
           "view-chain: a chain of views over a leaf is not an op output, although every link is an op");
 }
 
+static void test_input_flag_reaches_views() {
+    // ggml_view_tensor() does not copy flags: the INPUT flag sits on the root, and every view of it is that input.
+    ggml_tensor leaf  = tensor_with_op(GGML_OP_NONE);
+    ggml_tensor view1 = tensor_with_op(GGML_OP_VIEW);
+    ggml_tensor view2 = tensor_with_op(GGML_OP_RESHAPE);
+    view1.view_src    = &leaf;
+    view2.view_src    = &view1;
+    check(!ggml_sycl_prestage_is_input(nullptr), "input-flag: no tensor is no input");
+    check(!ggml_sycl_prestage_is_input(&view2), "input-flag: views of an unflagged leaf are not inputs");
+
+    leaf.flags = GGML_TENSOR_FLAG_INPUT;
+    check(ggml_sycl_prestage_is_input(&leaf), "input-flag: the flagged leaf is an input");
+    check(ggml_sycl_prestage_is_input(&view2), "input-flag: a view two links from the flagged leaf is an input");
+
+    leaf.flags  = 0;
+    view1.flags = GGML_TENSOR_FLAG_INPUT;
+    check(ggml_sycl_prestage_is_input(&view2), "input-flag: a flag on a middle link counts for the views above it");
+    check(!ggml_sycl_prestage_is_input(&leaf), "input-flag: a flag on a view does not reach its root");
+}
+
 static void test_kv_write_is_not_an_activation() {
     // A KV write's result is an op that views the cache, a leaf. The root decides, so it never takes the op-output
     // rule, in the KV-host buft or anywhere else.
@@ -224,6 +244,7 @@ int main() {
         { "view-of-op-output-is-input",     test_view_of_op_output_is_input     },
         { "graph-own-op-output-stays-copy", test_graph_own_op_output_stays_copy },
         { "view-chain-reaches-the-root",    test_view_chain_reaches_the_root    },
+        { "input-flag-reaches-views",       test_input_flag_reaches_views       },
         { "kv-write-is-not-an-activation",  test_kv_write_is_not_an_activation  },
         { "reported-bytes",                 test_reported_bytes                 },
         { "leaf-without-flag-stays-copy",   test_leaf_without_flag_stays_copy   },

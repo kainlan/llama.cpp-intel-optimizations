@@ -17,7 +17,8 @@ cannot reach without a GPU:
   - a hit keeps the staging handle in the op's terminal owners (`stage`) and
     does not set staged_raw_host, whose end-of-op wait is the drain removed;
   - a miss while recording still throws, with the message unchanged;
-  - the helper answers only while this thread records.
+  - the helper answers only while this thread records, and asks the pre-stage's
+    shared INPUT rule rather than a copy that could drift from it.
 """
 
 from __future__ import annotations
@@ -139,6 +140,8 @@ def main() -> int:
 
     if "ggml_sycl_graph_recording_this_thread()" not in helper:
         failures.append("the helper must answer only while this thread records")
+    if "ggml_sycl_prestage_is_input(tensor)" not in helper or "GGML_TENSOR_FLAG_INPUT" in helper:
+        failures.append("the helper must ask the pre-stage's shared INPUT rule (prestage-class.hpp), not a copy of it")
     if "graph_input_stage_lookup(" not in helper:
         failures.append("the helper must look the copy up in the context's input staging")
 

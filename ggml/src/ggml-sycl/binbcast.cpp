@@ -3,6 +3,7 @@
 #include "dnnl-ops.hpp"
 #include "ggml.h"
 #include "mem-ops.hpp"
+#include "prestage-class.hpp"
 #include "sycl-kernel-profiler.hpp"
 
 #include <cmath>
@@ -433,19 +434,18 @@ static void * ggml_sycl_binbcast_graph_input_staged_ptr(ggml_backend_sycl_contex
     if (!ggml_sycl_graph_recording_this_thread() || tensor == nullptr || tensor->name[0] == '\0' || span_bytes == 0) {
         return nullptr;
     }
-    // Only a flagged graph input or a view of one: the pre-stage's own INPUT test (graph_tensor_is_input). A host op
-    // output from another split is staged as an input too, but this op cannot tell it from an output this graph
-    // produces, whose staging entry would predate its producer, so that case keeps failing closed.
-    bool is_input = false;
-    for (const ggml_tensor * t = tensor; t != nullptr && !is_input; t = t->view_src) {
-        is_input = (t->flags & GGML_TENSOR_FLAG_INPUT) != 0;
-    }
-    if (!is_input) {
+    // Only a flagged graph input or a view of one, by the pre-stage's own INPUT rule, so this never accepts a tensor
+    // the pre-stage does not stage and refresh. A host op output from another split is staged as an input too, but
+    // this op cannot tell it from an output this graph produces, whose staging entry would predate its producer, so
+    // that case keeps failing closed.
+    if (!ggml_sycl_prestage_is_input(tensor)) {
         return nullptr;
     }
-    // The pre-stage stages each source under the tensor pointer it meets, views included, copying ggml_nbytes(tensor)
-    // from that tensor's own data, so the copy starts where this kernel's addressing starts. The entry's capacity may
-    // exceed what was copied this token (a reused, larger buffer), so the span must also fit the copied bytes.
+    // The pre-stage stages a source under the tensor pointer it meets, copying ggml_nbytes(tensor) from that tensor's
+    // own data, so the copy starts where this kernel's addressing starts. It stages a storage range once per pass,
+    // keyed by (cache id, device, view offset), so a second tensor over the same range gets no entry of its own: the
+    // lookup then misses and this op fails closed, which costs speed, not correctness. The entry's capacity may exceed
+    // what was copied this token (a reused, larger buffer), so the span must also fit the copied bytes.
     if (span_bytes > ggml_nbytes(tensor)) {
         return nullptr;
     }
