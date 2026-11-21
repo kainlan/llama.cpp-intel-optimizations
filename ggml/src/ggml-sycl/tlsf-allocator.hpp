@@ -4,8 +4,10 @@
 //
 // TLSF (Two-Level Segregated Fit) sub-allocator for VRAM arena zones.
 //
-// Provides O(1) guaranteed alloc/free with zero writes to the managed
-// memory region. All metadata is stored in host memory (block_meta vector
+// Provides O(1) free, and O(1) allocation whenever a size class above the
+// request's own holds a block (otherwise allocation walks the request's own
+// class list, see allocate()), with zero writes to the managed memory
+// region. All metadata is stored in host memory (block_meta vector
 // + bitmaps). The allocator returns OFFSETS into the managed region;
 // callers convert offsets to device pointers via arena_base + offset.
 //
@@ -73,7 +75,9 @@ class tlsf_allocator {
     // (256 bytes for GPU alignment).
     tlsf_allocator(size_t size);
 
-    // O(1) allocation. Returns OFFSET into the managed region.
+    // O(1) allocation when a class above the request's own holds a block;
+    // otherwise a walk of the request's own class. Returns OFFSET into the
+    // managed region.
     // Returns SIZE_MAX on failure.
     // Caller computes device_ptr = arena_base + offset.
     // alignment must be a power of 2 and <= MIN_BLOCK_SIZE (256); every
@@ -665,7 +669,8 @@ inline int tlsf_allocator::alloc_block_id() {
 }
 
 // ------------------------------------------------------------------
-// allocate: O(1) via bitmap search, returns offset (SIZE_MAX on failure)
+// allocate: O(1) via bitmap search, else a walk of the request's own class;
+// returns offset (SIZE_MAX on failure)
 // ------------------------------------------------------------------
 inline size_t tlsf_allocator::allocate(size_t size, size_t alignment, uint8_t tag) {
     // Every block offset must stay a multiple of MIN_BLOCK_SIZE.  The pool's
@@ -688,16 +693,30 @@ inline size_t tlsf_allocator::allocate(size_t size, size_t alignment, uint8_t ta
 
     int block_id = find_suitable(fl, sl);
     if (block_id < 0) {
-        // mapping_search rounds the size UP to guarantee all blocks in the
-        // returned SL class are >= size. When the block sits exactly at an SL
-        // boundary this rounding pushes into the next (empty) SL class. Fall
-        // back to the exact (non-rounding) mapping. find_suitable searches from
-        // (fl, sl) upward so blocks in higher SL classes are included.
-        // Guard: the first block returned may be in a lower SL sub-class whose
-        // size is in [lower_bound, size), so verify before committing.
+        // mapping_search rounds the size UP to the next class, every block of
+        // which is >= size, so a miss there means no class above the request's
+        // own holds a block.  The request's own class holds sizes in
+        // [lower_bound, upper), and a block in it may still fit, behind a
+        // smaller head (two sizes rounding into one class, like an expert
+        // triplet's 921600- and 921856-byte members), so its head alone is not
+        // enough.  Take the SMALLEST block >= size, not the first: when the
+        // freed holes are exactly the sizes about to be re-requested, a first
+        // fit puts a smaller request into a larger request's hole, leaves a
+        // sliver, and refuses the larger request later.
+        // The walk runs only when no larger class has a block, and it stops
+        // early on an exact-size match; the rounded search above stays O(1).
         mapping(adjusted, fl, sl);
-        block_id = find_suitable(fl, sl);
-        if (block_id < 0 || blocks_[block_id].size < size) {
+        block_id = -1;
+        for (int id = free_lists_[fl][sl]; id >= 0; id = blocks_[id].next_free) {
+            const size_t id_size = blocks_[id].size;
+            if (id_size >= size && (block_id < 0 || id_size < blocks_[block_id].size)) {
+                block_id = id;
+                if (id_size == size) {
+                    break;
+                }
+            }
+        }
+        if (block_id < 0) {
             return SIZE_MAX;
         }
     }
