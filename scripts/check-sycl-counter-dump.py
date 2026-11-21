@@ -399,14 +399,25 @@ def function_body_range(text, name):
     return line_of(text, m.start()), line_of(text, i)
 
 
+# What may follow a definition's parameter list: the body, or a qualifier, a trailing return type or a constructor's
+# initializer list. A call (`if (!f(x)) {`, `f(x) && g`, `return f(x);`) is followed by none of these.
+DEFINITION_TAIL = re.compile(r"\s*(?:\{|const\b|noexcept\b|override\b|final\b|try\b|->|:(?!:))")
+
+
 def function_text(text, qualified_name):
-    """The text of the function definition `qualified_name(...) ... { ... }`, or None."""
+    """The text of the function definition `qualified_name(...) ... { ... }`, or None.
+
+    A call whose condition ends in `{` (`if (!name(...)) {`) is not a definition: its if-body must not be read as the
+    function's body, or a note the real definition holds would look lost.
+    """
     for m in re.finditer(r"\b" + re.escape(qualified_name) + r"\s*\(", text):
         i = m.end()
         depth = 1
         while i < len(text) and depth:
             depth += {"(": 1, ")": -1}.get(text[i], 0)
             i += 1
+        if not DEFINITION_TAIL.match(text, i):
+            continue
         j = i
         while j < len(text) and text[j] not in "{;":
             j += 1
@@ -798,9 +809,13 @@ def check(files, cmake):
         if "weight_vram_bytes" in le:
             fails.append("H13 M-4: unified_cache_dump_capture_load_end reads weight_vram_bytes, a second "
                          "meaning for weight_planned_device_bytes")
+    # The runtime reach counter asks the plan's own predicate: expert_on_device per expert, or
+    # count_experts_on_device, the plan's residency summary, whose contract is "how many experts expert_on_device
+    # holds for" (unified-cache.hpp). Both are the plan's answer; a hand-written derivation is neither.
     gc = function_text(stripped.get("ggml-sycl.cpp", ""), "ggml_sycl_moe_plan_gpu_expert_count")
-    if gc is None or "expert_on_device(" not in gc:
-        fails.append("H13 M-5: ggml_sycl_moe_plan_gpu_expert_count does not use expert_on_device")
+    if gc is None or not re.search(r"\b(?:count_experts_on_device|expert_on_device)\s*\(", gc):
+        fails.append("H13 M-5: ggml_sycl_moe_plan_gpu_expert_count does not use expert_on_device or "
+                     "count_experts_on_device")
 
     # The interim keys of onednn_graph_route_declined.
     key_re = re.compile(r"dump_counter_add_key\s*\(\s*dump_counter::" + ROUTE_COUNTER + r"\s*,[^;]*?\"(\w+)\"",
@@ -926,7 +941,30 @@ def scanner_fixture():
         got = flags[lines.index(text)][0]
         if got != expect:
             fails.append(f"H13 scanner fixture: `{text}` classified compiled={got}, expected {expect}")
-    return fails, len(want)
+    cases = len(want)
+
+    # function_text reads the definition, never a call that precedes it and ends in `{`.
+    calls_first = "\n".join([
+        "void user() {",
+        "    if (!target(a, b)) {",
+        "        call_body_marker();",
+        "    }",
+        "    while (target(a, b) && more) { loop_marker(); }",
+        "    ok = target(a, b);",
+        "}",
+        "bool target(int a, int b) const noexcept {",
+        "    definition_marker();",
+        "}",
+    ])
+    body = function_text(calls_first, "target")
+    for needle, expect in (("definition_marker", True), ("call_body_marker", False), ("loop_marker", False)):
+        cases += 1
+        if body is None or (needle in body) != expect:
+            fails.append(f"H13 scanner fixture: function_text(`target`) {'lost' if expect else 'read'} `{needle}`")
+    cases += 1
+    if function_text("void user() {\n    if (!target(a)) {\n        x();\n    }\n}\n", "target") is not None:
+        fails.append("H13 scanner fixture: function_text(`target`) found a definition where there is only a call")
+    return fails, cases
 
 
 def wrap_in_macro(text, start_line, end_line, negate=False):
@@ -1331,6 +1369,13 @@ def mutation_matrix(files, cmake):
                                                                 "any = e == 0;", 1)
     muts.append(("zero-tensor report re-derives on-device by hand",
                  "H13 M-5: unified_cache_dump_capture_load_end does not use expert_on_device", f, cmake))
+    f = clone()
+    f["ggml-sycl.cpp"] = re.sub(r"(\*count\s*=\s*)plan->count_experts_on_device\(", r"\1hand_derived_count(",
+                                files["ggml-sycl.cpp"], count=1)
+    assert f["ggml-sycl.cpp"] != files["ggml-sycl.cpp"], "mutant anchor missing: plan->count_experts_on_device"
+    muts.append(("reach counter re-derives the GPU expert count by hand",
+                 "H13 M-5: ggml_sycl_moe_plan_gpu_expert_count does not use expert_on_device or count_experts_on_device",
+                 f, cmake))
     f = clone()
     f["unified-cache.cpp"] = files["unified-cache.cpp"].replace("host = plan.weight_host_bytes;",
                                                                 "host = plan.weight_host_bytes;\n                planned = plan.weight_vram_bytes;", 1)
