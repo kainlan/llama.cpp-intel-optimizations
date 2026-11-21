@@ -32,8 +32,9 @@ attribute object the backend builds carries it, so this gate holds that, and hol
       it off.
 
 The scan covers every .cpp/.hpp/.h under ggml/src/ggml-sycl except its tests/ directory, plus the standalone oneDNN
-benchmark tests/bench-dnnl-ops.cpp there, which includes dnnl-deterministic.hpp so that it times the implementation
-the backend runs.
+benchmark tests/bench-dnnl-ops.cpp there and the three oneDNN probes under the top-level tests/ (PROBES). Each includes
+dnnl-deterministic.hpp: a benchmark must time, and a probe must ask oneDNN about, the primitive production builds, and
+an attribute without the deterministic setting describes another primitive.
 
 Checks run on comment-blanked text. NOT VACUOUS: --self-test runs the gate on in-memory mutants of the real sources.
 Each mutant names the pin that must catch it, and is reported if it survives, if a different pin catches it, or if its
@@ -56,6 +57,10 @@ DOCS = ROOT / "docs/backend/sycl-env-vars.md"
 DNNL_OPS = "ggml/src/ggml-sycl/dnnl-ops.hpp"
 HDR = "ggml/src/ggml-sycl/dnnl-deterministic.hpp"
 BENCH = "ggml/src/ggml-sycl/tests/bench-dnnl-ops.cpp"
+PROBE_WOQ = "tests/test-onednn-woq-mxfp4.cpp"
+PROBE_INT8 = "tests/test-sycl-onednn-int8-grouped-probe.cpp"
+PROBE_FEAS = "tests/test-sycl-onednn-mxfp4-feasibility.cpp"
+PROBES = (PROBE_WOQ, PROBE_INT8, PROBE_FEAS)
 GGML_SYCL = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 DOCS_KEY = "docs/backend/sycl-env-vars.md"
 
@@ -333,6 +338,8 @@ def load() -> dict[str, str]:
         if rel.startswith("ggml/src/ggml-sycl/tests/") and rel != BENCH:
             continue
         raws[rel] = path.read_text(errors="replace")
+    for rel in PROBES:
+        raws[rel] = (ROOT / rel).read_text(errors="replace")
     raws[DOCS_KEY] = DOCS.read_text()
     return raws
 
@@ -432,6 +439,18 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    dnnl::primitive_attr attr;\n    ggml_sycl_dnnl_attr_set_reproducible(attr);\n"
                   "    auto binary_pd",
                   "    dnnl::primitive_attr attr;\n    auto binary_pd")])
+    # Each probe asks oneDNN with the production attribute.
+    expect_fail("probe-woq-attr-without-helper", "D3", PROBE_WOQ,
+                [("    dnnl::primitive_attr attr;\n    ggml_sycl_dnnl_attr_set_reproducible(attr);\n"
+                  "    attr.set_scales(DNNL_ARG_SRC,",
+                  "    dnnl::primitive_attr attr;\n    attr.set_scales(DNNL_ARG_SRC,")])
+    expect_fail("probe-int8-attr-without-helper", "D3", PROBE_INT8,
+                [("    dnnl::primitive_attr attr;\n    ggml_sycl_dnnl_attr_set_reproducible(attr);\n",
+                  "    dnnl::primitive_attr attr;\n")])
+    expect_fail("probe-feasibility-pd-without-attr", "D5", PROBE_FEAS,
+                [("    const dnnl::memory::desc b_md({ k, n }, dnnl::memory::data_type::f4_e2m1,",
+                  "    const auto bare_pd = dnnl::matmul::primitive_desc(eng, a_md, b_md, c_md);\n"
+                  "    const dnnl::memory::desc b_md({ k, n }, dnnl::memory::data_type::f4_e2m1,")])
     expect_fail("bench-pd-without-attr", "D5", BENCH,
                 [("dst_md, eps, flags::use_scale, attr);", "dst_md, eps, flags::use_scale);")])
     # (b) the helper stops asking for determinism.
