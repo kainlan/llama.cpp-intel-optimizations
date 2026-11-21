@@ -401,6 +401,8 @@ def function_body_range(text, name):
 
 # What may follow a definition's parameter list: the body, or a qualifier, a trailing return type or a constructor's
 # initializer list. A call (`if (!f(x)) {`, `f(x) && g`, `return f(x);`) is followed by none of these.
+# A definition with anything else there (an attribute macro, `= default`, a `requires` clause, `volatile`) is not
+# found, and that fails by name ("not found"): extend this list for it, never loosen the scan.
 DEFINITION_TAIL = re.compile(r"\s*(?:\{|const\b|noexcept\b|override\b|final\b|try\b|->|:(?!:))")
 
 
@@ -408,7 +410,10 @@ def function_text(text, qualified_name):
     """The text of the function definition `qualified_name(...) ... { ... }`, or None.
 
     A call whose condition ends in `{` (`if (!name(...)) {`) is not a definition: its if-body must not be read as the
-    function's body, or a note the real definition holds would look lost.
+    function's body, or a note the real definition holds would look lost. Two checks keep a call out: what follows the
+    parameter list must be able to follow a definition's (DEFINITION_TAIL), and the text up to the `{` or `;` that
+    ends the signature must not close a parenthesis it did not open (`if (c ? name(a) : b) {`, `while (name(a)->ok) {`):
+    a definition never does, so a match that does sits inside an enclosing expression.
     """
     for m in re.finditer(r"\b" + re.escape(qualified_name) + r"\s*\(", text):
         i = m.end()
@@ -419,8 +424,12 @@ def function_text(text, qualified_name):
         if not DEFINITION_TAIL.match(text, i):
             continue
         j = i
-        while j < len(text) and text[j] not in "{;":
+        open_parens = 0
+        while j < len(text) and text[j] not in "{;" and open_parens >= 0:
+            open_parens += {"(": 1, ")": -1}.get(text[j], 0)
             j += 1
+        if open_parens < 0:
+            continue
         if j < len(text) and text[j] == "{":
             depth = 0
             k = j
@@ -951,13 +960,20 @@ def scanner_fixture():
         "    }",
         "    while (target(a, b) && more) { loop_marker(); }",
         "    ok = target(a, b);",
+        "    if (cond ? target(a, b) : other) {",
+        "        cond_body_marker();",
+        "    }",
+        "    while (target(a, b)->ready) {",
+        "        arrow_body_marker();",
+        "    }",
         "}",
         "bool target(int a, int b) const noexcept {",
         "    definition_marker();",
         "}",
     ])
     body = function_text(calls_first, "target")
-    for needle, expect in (("definition_marker", True), ("call_body_marker", False), ("loop_marker", False)):
+    for needle, expect in (("definition_marker", True), ("call_body_marker", False), ("loop_marker", False),
+                           ("cond_body_marker", False), ("arrow_body_marker", False)):
         cases += 1
         if body is None or (needle in body) != expect:
             fails.append(f"H13 scanner fixture: function_text(`target`) {'lost' if expect else 'read'} `{needle}`")
