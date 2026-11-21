@@ -6,8 +6,10 @@
 // The case this exists for: under spread expert placement the plan has no CPU work, the CPU backend's compute buffer
 // is the generic host buft, and the scheduler makes no device copy of an activation the CPU produces. Qwen's mask ADD
 // is such an activation: a SYCL split reads it from host memory. Classed COPY, the prestage's cache arm refused it and
-// the decode graph was never recorded. An op output in host memory is another split's per-token activation, so it
-// takes the INPUT arm (stable staging, re-copied on every call) unless an earlier class claims it.
+// the decode graph was never recorded. An op output in host memory that the graph being staged does not produce is
+// another split's per-token activation, so it takes the INPUT arm (stable staging, re-copied on every call) unless an
+// earlier class claims it. An op output the graph produces itself (every intermediate, when the backend computes into
+// host memory) stays COPY.
 
 #include "prestage-class.hpp"
 
@@ -77,6 +79,80 @@ static void test_view_of_op_output_is_input() {
     check_class(f, ggml_sycl_prestage_class::INPUT, "view-of-op-output-is-input");
 }
 
+static void test_graph_own_op_output_stays_copy() {
+    // With the backend's compute buffer in host memory every intermediate is a host op output. Staged as an input, it
+    // would be copied before its producer ran.
+    ggml_sycl_prestage_facts f = host_activation();
+    f.root_is_graph_node       = true;
+    check_class(f, ggml_sycl_prestage_class::COPY, "graph-own-op-output-stays-copy");
+}
+
+static void test_view_chain_reaches_the_root() {
+    ggml_tensor add   = tensor_with_op(GGML_OP_ADD);
+    ggml_tensor view1 = tensor_with_op(GGML_OP_VIEW);
+    ggml_tensor view2 = tensor_with_op(GGML_OP_RESHAPE);
+    ggml_tensor view3 = tensor_with_op(GGML_OP_PERMUTE);
+    view1.view_src    = &add;
+    view2.view_src    = &view1;
+    view3.view_src    = &view2;
+    check(ggml_sycl_prestage_view_root(&view3) == &add, "view-chain: three views resolve to the ADD output");
+    check(ggml_sycl_prestage_root_is_op_output(&view3), "view-chain: the end of the chain is an op output");
+
+    ggml_tensor leaf = tensor_with_op(GGML_OP_NONE);
+    view1.view_src   = &leaf;
+    check(ggml_sycl_prestage_view_root(&view3) == &leaf, "view-chain: three views resolve to the leaf");
+    check(!ggml_sycl_prestage_root_is_op_output(&view3),
+          "view-chain: a chain of views over a leaf is not an op output, although every link is an op");
+}
+
+static void test_kv_write_is_not_an_activation() {
+    // A KV write's result is an op that views the cache, a leaf. The root decides, so it never takes the op-output
+    // rule, in the KV-host buft or anywhere else.
+    ggml_tensor   kv_leaf  = tensor_with_op(GGML_OP_NONE);
+    const ggml_op writes[] = { GGML_OP_SET_ROWS, GGML_OP_CPY };
+    for (ggml_op op : writes) {
+        ggml_tensor write = tensor_with_op(op);
+        write.view_src    = &kv_leaf;
+        check(!ggml_sycl_prestage_root_is_op_output(&write), "kv-write: the cache root is a leaf");
+
+        ggml_sycl_prestage_facts f{};
+        f.root_is_op_output = ggml_sycl_prestage_root_is_op_output(&write);
+        f.is_kv_host        = true;
+        check_class(f, ggml_sycl_prestage_class::KV_HOST, "kv-write-in-kv-host-stays-kv-host");
+        f.is_kv_host = false;
+        check_class(f, ggml_sycl_prestage_class::COPY, "kv-write-elsewhere-stays-copy");
+    }
+}
+
+static void test_reported_bytes() {
+    // The resolver host-return counter reads these bytes: a source an ordinary kernel reads from host memory in place.
+    ggml_sycl_prestage_facts f{};
+    check(ggml_sycl_prestage_reports_bytes(f), "reports-bytes: a COPY source");
+
+    f = host_activation();
+    check(ggml_sycl_prestage_reports_bytes(f), "reports-bytes: a host op output from another split");
+    f.root_is_graph_node = true;
+    check(ggml_sycl_prestage_reports_bytes(f),
+          "reports-bytes: a host op output this graph produces (also the answer when the graph is unknown)");
+
+    f          = host_activation();
+    f.is_input = true;
+    check(!ggml_sycl_prestage_reports_bytes(f), "reports-bytes: never a flagged INPUT, op output or not");
+
+    f            = ggml_sycl_prestage_facts{};
+    f.is_kv_host = true;
+    check(!ggml_sycl_prestage_reports_bytes(f), "reports-bytes: not a KV-host source");
+    f           = host_activation();
+    f.is_weight = true;
+    check(!ggml_sycl_prestage_reports_bytes(f), "reports-bytes: not a weight");
+    f           = host_activation();
+    f.is_device = true;
+    check(!ggml_sycl_prestage_reports_bytes(f), "reports-bytes: not device USM");
+    f            = host_activation();
+    f.is_control = true;
+    check(!ggml_sycl_prestage_reports_bytes(f), "reports-bytes: not control storage");
+}
+
 static void test_leaf_without_flag_stays_copy() {
     ggml_tensor leaf = tensor_with_op(GGML_OP_NONE);
     ggml_tensor view = tensor_with_op(GGML_OP_VIEW);
@@ -144,14 +220,18 @@ int main() {
     };
 
     const test_case cases[] = {
-        { "host-op-output-is-input",      test_host_op_output_is_input      },
-        { "view-of-op-output-is-input",   test_view_of_op_output_is_input   },
-        { "leaf-without-flag-stays-copy", test_leaf_without_flag_stays_copy },
-        { "flagged-input-is-input",       test_flagged_input_is_input       },
-        { "kv-host-stays-kv-host",        test_kv_host_stays_kv_host        },
-        { "weight-stays-weight",          test_weight_stays_weight          },
-        { "device-stays-device",          test_device_stays_device          },
-        { "control-comes-first",          test_control_comes_first          },
+        { "host-op-output-is-input",        test_host_op_output_is_input        },
+        { "view-of-op-output-is-input",     test_view_of_op_output_is_input     },
+        { "graph-own-op-output-stays-copy", test_graph_own_op_output_stays_copy },
+        { "view-chain-reaches-the-root",    test_view_chain_reaches_the_root    },
+        { "kv-write-is-not-an-activation",  test_kv_write_is_not_an_activation  },
+        { "reported-bytes",                 test_reported_bytes                 },
+        { "leaf-without-flag-stays-copy",   test_leaf_without_flag_stays_copy   },
+        { "flagged-input-is-input",         test_flagged_input_is_input         },
+        { "kv-host-stays-kv-host",          test_kv_host_stays_kv_host          },
+        { "weight-stays-weight",            test_weight_stays_weight            },
+        { "device-stays-device",            test_device_stays_device            },
+        { "control-comes-first",            test_control_comes_first            },
     };
 
     int failed = 0;
