@@ -27763,15 +27763,17 @@ std::string test_expert_evict_without_host_room_is_busy_and_keeps_the_zone() {
 }
 
 // The model the ownership cases claim their entries for: a slot no live model holds, so the release that ends each
-// case reclaims only what the case claimed.
-constexpr uint32_t test_move_owner_slot = 31;
+// case reclaims only what the case claimed. A function, not a constant, so it adds no static storage.
+constexpr uint32_t test_move_owner_slot() {
+    return 31;
+}
 
 // Each of layer 0's `experts`, its three entries, device or host, claimed as a model load claims what it staged:
 // marked pending under txn, then owned by test_move_owner_slot when the load ends. Each must have one entry to mark,
 // and the load's end must tag exactly them.
 std::string test_move_claim(test_loan_fixture & fx, uint64_t txn, const std::vector<int> & experts) {
-    if ((fx.cache->live_model_mask() & (1u << test_move_owner_slot)) != 0) {
-        return test_loan_fail("model slot %u is live before the case claims it", test_move_owner_slot);
+    if ((fx.cache->live_model_mask() & (1u << test_move_owner_slot())) != 0) {
+        return test_loan_fail("model slot %u is live before the case claims it", test_move_owner_slot());
     }
     const size_t tagged_before = fx.cache->owner_tagged_entry_count();
     for (const int e : experts) {
@@ -27781,7 +27783,7 @@ std::string test_move_claim(test_loan_fixture & fx, uint64_t txn, const std::vec
             }
         }
     }
-    fx.cache->note_model_load_end(test_move_owner_slot, txn);
+    fx.cache->note_model_load_end(test_move_owner_slot(), txn);
     const size_t tagged = fx.cache->owner_tagged_entry_count() - tagged_before;
     if (tagged != 3 * experts.size()) {
         return test_loan_fail("the load's end tagged %zu entries, not the %zu claimed", tagged, 3 * experts.size());
@@ -27796,7 +27798,7 @@ void test_move_release(test_loan_fixture & fx) {
     fx.queue->wait();
     (void) drain_retained_handles(true, 5000);
     fx.cache->process_deferred_frees_public();
-    (void) fx.cache->release_model_slot(test_move_owner_slot);
+    (void) fx.cache->release_model_slot(test_move_owner_slot());
 }
 
 std::string test_expert_admit_belongs_to_the_host_copys_model() {
