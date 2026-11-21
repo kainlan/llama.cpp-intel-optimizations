@@ -200,7 +200,7 @@ def check_launcher(launcher: str, pin: str, step_decl: str, split_kernel_call: s
 
 
 def check_finish_row(finish: str, slot: str) -> None:
-    barrier = "nd_item.barrier(sycl::access::fence_space::local_space);"
+    barrier = "sycl::group_barrier(nd_item.get_group());"
     need(
         ordered(
             finish,
@@ -486,8 +486,13 @@ MUTANTS = [
        "    const int tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);\n\n"
        "    const uint8_t *     x_qs")]),
     ("the finish helper loses its barrier", "K1", "mmvq",
-     [("        row_partials[slot.sg_id] = sum;\n    }\n    nd_item.barrier(sycl::access::fence_space::local_space);\n",
+     [("        row_partials[slot.sg_id] = sum;\n    }\n"
+       "    // A work-group's fence scope is the work-group, which covers row_partials in local memory.\n"
+       "    sycl::group_barrier(nd_item.get_group());\n",
        "        row_partials[slot.sg_id] = sum;\n    }\n")]),
+    ("the finish helper fences only its sub-group", "K1", "mmvq",
+     [("    sycl::group_barrier(nd_item.get_group());\n\n    if (slot.chunk == 0",
+       "    sycl::group_barrier(nd_item.get_sub_group());\n\n    if (slot.chunk == 0")]),
     ("the finish helper drops the fused addend", "K1", "mmvq",
      [("        dst[slot.row] =\n            row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, "
        "fused_add_row_base + slot.row);",

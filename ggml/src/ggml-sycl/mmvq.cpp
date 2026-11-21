@@ -2425,7 +2425,8 @@ static __dpct_inline__ void mmvq_column_split_finish_row(const sycl::nd_item<3> 
     if (sg.leader()) {
         row_partials[slot.sg_id] = sum;
     }
-    nd_item.barrier(sycl::access::fence_space::local_space);
+    // A work-group's fence scope is the work-group, which covers row_partials in local memory.
+    sycl::group_barrier(nd_item.get_group());
 
     if (slot.chunk == 0 && slot.row < nrows && sg.leader()) {
         float row_sum = 0.0f;
