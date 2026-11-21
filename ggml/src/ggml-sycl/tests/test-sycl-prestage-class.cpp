@@ -3,10 +3,10 @@
 // Host-only: no SYCL queue, no device, no model. The rule is a pure function of facts the backend gathers, and the
 // view-root walk reads only ggml_tensor fields, so both are tested here on synthetic tensors.
 //
-// The case this exists for: under spread expert placement the plan has no CPU work, the CPU backend's compute buffer
-// is the generic host buft, and the scheduler makes no device copy of an activation the CPU produces. Qwen's mask ADD
-// is such an activation: a SYCL split reads it from host memory. Classed COPY, the prestage's cache arm refused it and
-// the decode graph was never recorded. An op output in host memory that the graph being staged does not produce is
+// The case this exists for: when the plan has no CPU work, the CPU backend's compute buffer is the generic host buft,
+// and the scheduler makes no device copy of an activation the CPU produces (an op the SYCL backend does not support).
+// A SYCL split then reads it from host memory. Classed COPY, the prestage's cache arm would refuse it and the graph
+// would never be recorded. An op output in host memory that the graph being staged does not produce is
 // another split's per-token activation, so it takes the INPUT arm (stable staging, re-copied on every call) unless an
 // earlier class claims it. An op output the graph produces itself (every intermediate, when the backend computes into
 // host memory) stays COPY.

@@ -70,10 +70,10 @@ reuse. A staging failure is also not permanent for a signature: the memo forgets
 skipped tokens, so a transient failure (a staging allocation) recovers while a structural one (a
 host-resident input) re-declines at the cost of one pass.
 
-A host-resident op output is a graph input too. Under spread expert placement the plan has no CPU
-work, so the CPU backend computes into the generic host buft, and the scheduler makes no device copy of an activation
-it produces: Qwen's mask ADD (`node_6686`) reached a SYCL split in host memory, the pre-stage classed it COPY, the
-cache arm refused it, and the decode graph was never recorded. The class rule lives in prestage-class.hpp
+A host-resident op output is a graph input too. When the plan has no CPU work, the CPU backend computes
+into the generic host buft, and the scheduler makes no device copy of an activation it produces (an op the SYCL
+backend does not support): a SYCL split reads it in host memory. Classed COPY, the cache arm would refuse it and the
+graph would never be recorded. The class rule lives in prestage-class.hpp
 (ggml_sycl_prestage_class_of, unit-tested by test-sycl-prestage-class); the checks below pin that the backend asks it
 instead of carrying a second copy, that the rule reads the VIEW ROOT's op (a view's own op is GGML_OP_VIEW), that the
 flag still precedes KV_HOST and KV_HOST precedes the op-output rule (KV state is never per-call staging), and that the
