@@ -641,10 +641,11 @@ std::string test_expert_refill_cancelled_by_a_loan();
 std::string test_expert_refill_runs_once_per_decode_graph();
 std::string test_expert_refill_drops_an_unpreparable_triplet();
 std::string test_expert_refill_moves_two_triplets_per_call();
-// The loan and the refill size their copies from the cache entry, which can exceed the plan's dst_size by the tail
-// S1-PRELOAD pads, and a host copy smaller than its entry is still refused (llama.cpp-pu8v).
-std::string test_expert_loan_sizes_its_copies_from_the_entry();
-// With no entry to size a copy from, a loan stops "not resident" and a refill "not lent", the latter only at the
+// The loan and the refill size their copies from the tensor, never from a padded cache entry: the loan's host copy
+// holds the expert's own bytes, and the refill's device copy is the staged size with its tail zero-filled. Host
+// storage that cannot hold the bytes, and an expert longer than its device entry, are refused.
+std::string test_expert_loan_and_refill_size_from_the_tensor();
+// With no entry to copy from, a loan stops "not resident" and a refill "not lent", the latter only at the
 // ledger's back, and either moves and publishes nothing (llama.cpp-pu8v).
 std::string test_expert_loan_and_refill_stop_on_a_missing_entry();
 // A loan leaves no lease on a withdrawn device entry in the pointer tables a prompt graph's preload built, and marks
@@ -671,6 +672,43 @@ std::string test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph();
 // On a plan that maps files, a loan publishes its lent members PINNED, the pinned copy it made, and a refill publishes
 // them FILE_MAPPED again; on a plan that maps nothing they read PINNED throughout.
 std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned();
+// The named move's admit, on the same fixture with each host triplet copied to the pinned pool as S1-PRELOAD copies
+// one. A padded width's tail reads zero in storage poisoned before the admit, and the payload is the expert's bytes; a
+// member served from a file mapping refuses its triplet and leaves it as it was, while a triplet named after it moves;
+// a loan outstanding and a WEIGHT zone with room for one member are BUSY and leave no state; the host zone gets the
+// moved copies' bytes back once their retired entries go; and the admit that completes a block is read from the card
+// through the selected-ids pointer table built right after it, behind the copy's ready event, and through the decode
+// direct route's table, which refused the block before the admit and serves it after.
+std::string test_expert_admit_zero_fills_a_padded_tail();
+std::string test_expert_admit_refuses_a_file_mapped_member();
+std::string test_expert_admit_is_busy_while_lent_or_the_zone_is_full();
+std::string test_expert_admit_returns_the_host_zone_bytes();
+std::string test_expert_admit_completes_a_block_read_through_its_table();
+// An admit sizes from the tensor, never the host copy: from a host copy longer than the expert it copies only the
+// tensor's bytes, mints their staged size, zero-fills the tail and records the tensor's bytes; a host copy shorter
+// than the expert is refused "host copy size" and leaves the triplet as it was.
+std::string test_expert_admit_reads_the_tensor_bytes_from_a_longer_host_copy();
+std::string test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor();
+std::string test_expert_admit_completes_a_block_the_direct_route_serves();
+// The named move's evict, on the same fixture. A resident triplet moves to pinned host storage through the loan's
+// cache body, writes no ledger, so the refill never re-admits it, and its device entries go only when a deferred-free
+// pass reaps them. A bulk-staged triplet is REFUSED "shared storage" while one staged per expert moves in the same
+// call; right after an admit, or with a loan outstanding, an evict is BUSY and changes nothing; a swap keeps the
+// block's resident count and, once reaped, the zone's room; evict and admit cycles keep no storage on either side, and
+// each cycle's evict shows its copies in the host zone and its reaped room in the WEIGHT zone; a refused evict leaves
+// the admit beside it to move; an evict's device room is never an admit's in the same call; and an evict out of a
+// block the decode direct route served moves the tensor's storage generation, so the route refuses the block instead
+// of its old table.
+std::string test_expert_evict_moves_a_resident_triplet();
+std::string test_expert_evict_is_not_refilled();
+std::string test_expert_evict_refuses_shared_storage();
+std::string test_expert_evict_is_busy_right_after_an_admit();
+std::string test_expert_evict_is_busy_while_lent();
+std::string test_expert_evict_and_admit_swap_in_one_call();
+std::string test_expert_evict_and_admit_cycles_return_the_room();
+std::string test_expert_evict_refusal_leaves_the_admit_list_alone();
+std::string test_expert_evict_room_is_not_an_admit_in_the_same_call();
+std::string test_expert_evict_takes_a_block_off_the_direct_route();
 #endif
 
 }  // namespace ggml_sycl
